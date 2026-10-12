@@ -634,6 +634,45 @@ pub(crate) fn project_cell_press(tab: &mut DocTab, row: usize, col: usize, shift
     complete_project(tab, true);
 }
 
+/// A right press on column `col`'s heading (#1208), before its menu opens:
+/// it commits an open cell edit as any press does (a refused commit keeps
+/// the edit and its status, and is `false`), then selects the column over
+/// every shown task, as Project does. The cursor is the column's first
+/// shown task, the active cell, and the anchor its last, so Copy, Cut and
+/// Paste take the range as they take any other. One shown task is no range
+/// (the cursor cell is the selection); with no task the cursor goes to the
+/// entry row. The column is revealed as a cell press reveals it; the table
+/// does not scroll to a row.
+pub(crate) fn project_column_select(tab: &mut DocTab, col: usize) -> bool {
+    flush_level_pass(tab);
+    if !commit_project_cell(tab) {
+        return false;
+    }
+    let Surface::Project(v) = &mut tab.surface else {
+        return false;
+    };
+    let col = col.min(COLUMN_COUNT - 1);
+    v.drag_made_range = false;
+    v.row_drag = false;
+    v.row_header = false;
+    let rows = v.ed.visible_rows();
+    match (rows.first().copied(), rows.last().copied()) {
+        (Some(first), Some(last)) => {
+            let last_uid = v.ed.project().tasks[last].uid;
+            v.select_row(first);
+            v.anchor = Some((last_uid, col));
+        }
+        _ => {
+            v.anchor = None;
+            v.enter_entry_row();
+        }
+    }
+    v.col = col;
+    v.reveal_col();
+    complete_project(tab, false);
+    true
+}
+
 /// The pointer entering cell (`row`, `col`) with the left button held: the
 /// press's drag. The range grows to the rectangle between the press and this
 /// cell; rows are task indices as for [`project_cell_press`]. The entry row

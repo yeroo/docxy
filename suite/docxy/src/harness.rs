@@ -827,6 +827,9 @@ pub enum Region {
     Gantt,
     /// Visible part of a task bar, addressed by displayed task ID.
     Bar(i32),
+    /// Visible part of a Project entry-table column heading, by column index
+    /// (named by its heading, e.g. `project-heading:Duration`; #1208).
+    ProjectHeading(usize),
     /// The Project table's horizontal scrollbar strip.
     ProjectHbarTable,
     /// The Project chart's horizontal scrollbar strip.
@@ -865,7 +868,8 @@ pub enum Region {
 const QAT_REGIONS: [&str; 4] = ["qat-undo", "qat-redo", "qat-undo-arrow", "qat-redo-arrow"];
 
 /// Parse a region name: `window`, `grid`, `chart-panel`, `cell:B3`,
-/// `cell:A1:C5`, `chart:0`, `gantt`, `bar:3`, `project-hbar-table`,
+/// `cell:A1:C5`, `chart:0`, `gantt`, `bar:3`, `project-heading:Duration`,
+/// `project-hbar-table`,
 /// `project-hbar-chart`, `project-vbar`, `project-timeline`, `project-split`,
 /// `gallery`, `tab-chip:0`, `filter-button:B`, `backstage-content`,
 /// `backstage-rail`, `ribbon-launch:Number`, `qat-undo`, `qat-redo`,
@@ -970,6 +974,12 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
                 .map_err(|_| format!("'{a}' is not a task ID"))?;
             Ok(Region::Bar(id))
         }
+        "project-heading" => {
+            let a = arg
+                .filter(|a| !a.is_empty())
+                .ok_or("'project-heading' needs a column, e.g. project-heading:Duration")?;
+            project_column(a).map(Region::ProjectHeading)
+        }
         "filter-button" => {
             let a = arg
                 .filter(|a| !a.is_empty())
@@ -990,9 +1000,17 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
             Ok(Region::Chart(i))
         }
         other => Err(format!(
-            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, ribbon-launch:Number, filter-button:B)"
+            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-heading:Duration, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, ribbon-launch:Number, filter-button:B)"
         )),
     }
+}
+
+/// A Project entry-table column by its heading, in any case.
+fn project_column(name: &str) -> Result<usize, String> {
+    crate::COLUMNS
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case(name.trim()))
+        .ok_or_else(|| format!("no Project column '{name}' ({})", crate::COLUMNS.join(", ")))
 }
 
 /// The name a region reports itself under — [`parse_region`]'s inverse, so a
@@ -1012,6 +1030,10 @@ pub fn region_name(region: Region) -> String {
         Region::Chart(i) => format!("chart:{i}"),
         Region::Gantt => "gantt".into(),
         Region::Bar(id) => format!("bar:{id}"),
+        Region::ProjectHeading(c) => format!(
+            "project-heading:{}",
+            crate::COLUMNS.get(c).copied().unwrap_or_default()
+        ),
         Region::ProjectHbarTable => "project-hbar-table".into(),
         Region::ProjectHbarChart => "project-hbar-chart".into(),
         Region::ProjectVbar => "project-vbar".into(),
@@ -2811,8 +2833,8 @@ fn menu_point(
 }
 
 /// `menu-open`: open the menu on `target` through the opener its pointer
-/// gesture uses. Targets without a menu yet are refused by name, never
-/// mapped to another menu.
+/// gesture uses. An unknown target is refused by name, never mapped to
+/// another menu.
 fn menu_open(
     app: &mut crate::Docxy,
     target: &Json,
@@ -2945,6 +2967,27 @@ fn menu_open(
                     .center();
                 app.open_bar_menu(row, at, window, cx)
             }
+            // A right-click on a heading of the Project's entry table
+            // (#1208), by the heading's name. It presses where the pointer
+            // would, so a heading scrolled out of the table's view is
+            // refused as one no pointer can press.
+            "column" => {
+                let name = fields[0]
+                    .1
+                    .as_str()
+                    .ok_or("'column' must be a column name")?;
+                let col = project_column(name)?;
+                if !matches!(
+                    app.tabs.get(app.active).map(|t| &t.surface),
+                    Some(crate::Surface::Project(_))
+                ) {
+                    return Err("a column menu needs a Project tab".into());
+                }
+                let at = app
+                    .region_bounds_live(Region::ProjectHeading(col), window)?
+                    .center();
+                app.open_column_menu(col, at, window, cx)
+            }
             "ribbon" => {
                 let path: Vec<&str> = fields[0]
                     .1
@@ -2994,7 +3037,7 @@ fn menu_open(
                 }
             }
             other => Err(format!(
-                "menu target '{other}' is not supported yet (document, cell, pick-list, flash-fill, ribbon-bar, row, bar, ribbon, grid and qat are)"
+                "no menu target '{other}' (document, cell, pick-list, flash-fill, ribbon-bar, row, bar, column, ribbon, grid and qat)"
             )),
         },
         _ => Err(r#"'target' must be "document" or one key such as {"row": uid}"#.into()),
@@ -8695,6 +8738,9 @@ mod tests {
             Region::Chart(3),
             Region::Gantt,
             Region::Bar(3),
+            Region::ProjectHeading(0),
+            Region::ProjectHeading(3),
+            Region::ProjectHeading(7),
             Region::ProjectHbarTable,
             Region::ProjectHbarChart,
             Region::ProjectVbar,
@@ -8720,6 +8766,25 @@ mod tests {
         assert_eq!(region_name(Region::Cells(2, 1, 2, 1)), "cell:B3");
         assert_eq!(region_name(Region::Cells(0, 0, 4, 2)), "cell:A1:C5");
         assert!(parse_region("gantt:1").is_err());
+        // #1208: a heading is named by its column, in any case, spaces and all.
+        assert_eq!(
+            parse_region("project-heading:duration"),
+            Ok(Region::ProjectHeading(3))
+        );
+        assert_eq!(
+            region_name(Region::ProjectHeading(3)),
+            "project-heading:Duration"
+        );
+        assert_eq!(
+            parse_region("project-heading:Resource Names"),
+            Ok(Region::ProjectHeading(7))
+        );
+        assert!(
+            parse_region("project-heading:Nope")
+                .unwrap_err()
+                .contains("no Project column 'Nope' (ID, Task Mode, Name, Duration")
+        );
+        assert!(parse_region("project-heading").is_err());
         assert!(parse_region("project-vbar:1").is_err());
         assert!(parse_region("project-timeline:1").is_err());
         assert!(parse_region("project-split:1").is_err());

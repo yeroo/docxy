@@ -23,6 +23,9 @@ pub(crate) enum MenuTarget {
     Row(Option<i32>),
     /// A task's Gantt bar context menu (#1207), by the task's uid.
     Bar(i32),
+    /// A Project entry-table column heading's context menu (#1208), by
+    /// column index (see `COLUMNS`).
+    Column(usize),
     /// A ribbon split button's drop-down: tab, group and the primary's label
     /// (and its id, which the drawn arrow knows it by; not reported).
     Ribbon {
@@ -101,6 +104,10 @@ impl MenuTarget {
                 uid.map_or(Json::Null, |u| Json::Num(u as f64)),
             )]),
             Self::Bar(uid) => Json::obj(vec![("bar", Json::Num(*uid as f64))]),
+            Self::Column(c) => Json::obj(vec![(
+                "column",
+                Json::Str(crate::COLUMNS.get(*c).copied().unwrap_or_default().into()),
+            )]),
             Self::Ribbon {
                 tab, group, label, ..
             } => Json::obj(vec![(
@@ -361,19 +368,25 @@ pub(crate) fn read_json(menu: Option<&Menu>) -> Json {
 
 /// Whether an open menu still fits what it was opened on, before an item
 /// runs: a row or bar menu's task must still be the one selected on the active
-/// Project, and the document menu is never run on a Project. `project` is
-/// the active tab's selected task (`Some(None)` on the entry row), or `None`
-/// off a Project. Whatever moves on from a menu closes it; this is the
+/// Project, a column menu's column the cursor's, and the document menu is
+/// never run on a Project. `project` is the active tab's selected task
+/// (`None` on the entry row) and cursor column, or `None` off a Project. Whatever moves on from a menu closes it; this is the
 /// check that an item never runs against a state it was not built for.
 pub(crate) fn target_stands(
     target: &MenuTarget,
-    project: Option<Option<i32>>,
+    project: Option<(Option<i32>, usize)>,
 ) -> Result<(), String> {
-    match (target, project) {
+    let selected = project.map(|(uid, _)| uid);
+    match (target, selected) {
         (MenuTarget::Row(uid), Some(selected)) if selected == *uid => Ok(()),
         (MenuTarget::Row(_), _) => Err("the row menu's task is no longer the selected one".into()),
         (MenuTarget::Bar(uid), Some(Some(selected))) if selected == *uid => Ok(()),
         (MenuTarget::Bar(_), _) => Err("the bar menu's task is no longer the selected one".into()),
+        (MenuTarget::Column(c), _) => match project {
+            Some((_, col)) if col == *c => Ok(()),
+            Some(_) => Err("the column menu's column is no longer the selected one".into()),
+            None => Err("the column menu runs on a Project tab".into()),
+        },
         (MenuTarget::Document, Some(_)) => {
             Err("the document menu does not run on a Project tab".into())
         }
@@ -953,6 +966,10 @@ mod tests {
             MenuTarget::Bar(2).to_json(),
             Json::obj(vec![("bar", Json::Num(2.))])
         );
+        assert_eq!(
+            MenuTarget::Column(3).to_json(),
+            Json::obj(vec![("column", Json::Str("Duration".into()))])
+        );
     }
 
     #[test]
@@ -1114,9 +1131,11 @@ mod tests {
 
     #[test]
     fn an_item_runs_only_against_the_target_its_menu_was_built_for() {
+        // The active Project's selected task, its cursor in column 0.
+        let on = |uid: Option<i32>| Some((uid, 0));
         let row = MenuTarget::Row(Some(3));
-        assert_eq!(target_stands(&row, Some(Some(3))), Ok(()));
-        for moved in [Some(Some(5)), Some(None), None] {
+        assert_eq!(target_stands(&row, on(Some(3))), Ok(()));
+        for moved in [on(Some(5)), on(None), None] {
             assert!(
                 target_stands(&row, moved)
                     .unwrap_err()
@@ -1124,31 +1143,46 @@ mod tests {
             );
         }
         let entry = MenuTarget::Row(None);
-        assert_eq!(target_stands(&entry, Some(None)), Ok(()));
+        assert_eq!(target_stands(&entry, on(None)), Ok(()));
         // A bar menu (#1207) has a task, never the entry row.
         let bar = MenuTarget::Bar(2);
-        assert_eq!(target_stands(&bar, Some(Some(2))), Ok(()));
-        for moved in [Some(Some(3)), Some(None), None] {
+        assert_eq!(target_stands(&bar, on(Some(2))), Ok(()));
+        for moved in [on(Some(3)), on(None), None] {
             assert!(
                 target_stands(&bar, moved)
                     .unwrap_err()
                     .contains("the bar menu's task is no longer the selected one")
             );
         }
-        assert!(target_stands(&entry, Some(Some(1))).is_err());
+        assert!(target_stands(&entry, on(Some(1))).is_err());
+        // A column menu (#1208) stands while the cursor is in its column,
+        // on any row (the entry row of an empty plan too).
+        let column = MenuTarget::Column(3);
+        assert_eq!(target_stands(&column, Some((Some(1), 3))), Ok(()));
+        assert_eq!(target_stands(&column, Some((None, 3))), Ok(()));
+        assert!(
+            target_stands(&column, Some((Some(1), 2)))
+                .unwrap_err()
+                .contains("the column menu's column is no longer the selected one")
+        );
+        assert!(
+            target_stands(&column, None)
+                .unwrap_err()
+                .contains("runs on a Project tab")
+        );
         assert_eq!(target_stands(&MenuTarget::Document, None), Ok(()));
-        assert!(target_stands(&MenuTarget::Document, Some(None)).is_err());
+        assert!(target_stands(&MenuTarget::Document, on(None)).is_err());
         let ribbon = MenuTarget::Ribbon {
             id: "pr-baseline".into(),
             tab: "Project".into(),
             group: "Schedule".into(),
             label: "Set Baseline".into(),
         };
-        assert_eq!(target_stands(&ribbon, Some(Some(1))), Ok(()));
+        assert_eq!(target_stands(&ribbon, on(Some(1))), Ok(()));
         assert_eq!(target_stands(&ribbon, None), Ok(()));
         let grid = MenuTarget::Grid(GridMenu::FillOptions);
         assert_eq!(target_stands(&grid, None), Ok(()));
-        assert!(target_stands(&grid, Some(None)).is_err());
+        assert!(target_stands(&grid, on(None)).is_err());
         assert_eq!(
             grid.to_json().get("grid").and_then(Json::as_str),
             Some("fill-options")
@@ -1199,7 +1233,7 @@ mod tests {
         assert!(split_arrow_opens("pr-baseline", Some(&undo), None));
         assert_eq!(undo.to_json().to_string(), r#"{"qat":"qat-undo"}"#);
         assert!(
-            target_stands(&undo, Some(None)).is_err(),
+            target_stands(&undo, Some((None, 0))).is_err(),
             "never on a Project"
         );
         assert!(target_stands(&undo, None).is_ok());
@@ -1216,7 +1250,7 @@ mod tests {
         assert!(split_arrow_opens(QAT_UNDO_ID, Some(&redo), None));
         assert_eq!(redo.to_json().to_string(), r#"{"qat":"qat-redo"}"#);
         assert!(
-            target_stands(&redo, Some(None)).is_err(),
+            target_stands(&redo, Some((None, 0))).is_err(),
             "never on a Project"
         );
         assert!(target_stands(&redo, None).is_ok());
@@ -1347,7 +1381,7 @@ mod tests {
             MenuTarget::RibbonBar.to_json(),
             Json::Str("ribbon-bar".into())
         );
-        assert!(target_stands(&MenuTarget::RibbonBar, Some(Some(1))).is_ok());
+        assert!(target_stands(&MenuTarget::RibbonBar, Some((Some(1), 0))).is_ok());
         assert!(target_stands(&MenuTarget::RibbonBar, None).is_ok());
     }
 }
