@@ -27,6 +27,14 @@ Every editable input in the suite is typed into with real keys by a case:
   types into it (#1200 sheet, #1201 document, #1202 Backstage, #1203 Project,
   #1204 terminal). Nothing finds a new one automatically: add it there in the
   change that adds it.
+- **The sheet's inputs** (#1200) are typed into by the hand-written
+  `uiharness/cases/sheet-inputs-typing.uit` (not `inputs-typing-*`, which the
+  catalogue owns): the formula bar, the in-cell editor, the Name Box, the Find
+  bar's Find and Replace fields, and Home's Font and Font Size boxes. Each is
+  focused by `pointer-click {"input":id}` (the in-cell editor by a double-click
+  on the cell) and read by `field-read {"input":id}`; each test opens its own
+  copy and checks one step against what Excel does. The Find bar's Replace and
+  All buttons have no key, so those steps click them for real.
 - **A field broken today** is listed in `uiharness/cases/expected-failures.txt`
   with its own issue, per failing step, so the sweep stays green and any new
   failure fails CI. Remove the entry in the change that fixes it.
