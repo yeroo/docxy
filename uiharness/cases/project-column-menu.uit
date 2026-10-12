@@ -1,0 +1,163 @@
+# #1208: a heading of the Project entry table has its own context menu.
+# A right press on it selects the column over the shown tasks, as Project
+# does, and opens Project's column menu (CUS-035). `menu-open {"column":
+# name}` calls the opener the heading's right press calls; `pointer-click`
+# with `"button":"right"` on `project-heading:<name>` presses the heading.
+
+# `gantt-bar-uids.xml` has Alpha (2 days), Beta (a milestone) and Gamma
+# (1 day), in that order.
+
+test a heading's menu is Project's and selects its column
+  open copy:../fixtures/gantt-bar-uids.xml
+  click C3
+  assert selected_name is Gamma
+  # The heading is pressed where the frame on screen drew it: draw one first.
+  shot window
+  call menu-open {"target":{"column":"duration"}}
+  assert reply.open is true
+  assert reply.target.column is Duration
+  assert menu.target.column is Duration
+  # The column over every shown task, its first task the active cell.
+  assert cell is Duration
+  assert cell_row is 0
+  assert selected_name is Alpha
+  assert selection is 3
+  assert reply.items.0.label is Cut
+  assert reply.items.0.enabled is true
+  assert reply.items.1.label is Copy
+  assert reply.items.1.enabled is true
+  assert reply.items.2.label is Paste
+  assert reply.items.2.enabled is true
+  assert reply.items.3.label is Paste Special...
+  assert reply.items.3.enabled is false
+  assert reply.items.4.separator is true
+  assert reply.items.5.label is Wrap Text
+  assert reply.items.5.enabled is false
+  assert reply.items.6.label is Insert Column
+  assert reply.items.6.enabled is false
+  assert reply.items.7.label is Hide Column
+  assert reply.items.7.enabled is false
+  assert reply.items.8.separator is true
+  assert reply.items.9.label is Font...
+  assert reply.items.9.enabled is false
+  assert reply.items.10.label is Text Styles...
+  assert reply.items.10.enabled is false
+  assert reply.items.11.label is Field Settings
+  assert reply.items.11.enabled is false
+  assert reply.items.12.label is Custom Fields
+  assert reply.items.12.enabled is false
+  # Data Type is disabled for a fixed-type field, which every Entry column is.
+  assert reply.items.13.label is Data Type
+  assert reply.items.13.enabled is false
+  call-error menu-click {"label":"Hide Column"} => menu item 'Hide Column' is disabled
+  call-error menu-click {"label":"Delete Task"} => no menu item 'Delete Task'
+  # Esc closes the menu and leaves the column selected.
+  key escape
+  assert menu is nothing
+  assert selection is 3
+  assert cell is Duration
+
+test the column menu's Copy, Paste and Cut are the table's over the column
+  open copy:../fixtures/gantt-bar-uids.xml
+  shot window
+  # Copy the durations: one line per task. A uit value is one line, so the
+  # text is pinned by pasting it over the names.
+  call menu-open {"target":{"column":"Duration"}}
+  call menu-click {"label":"Copy"}
+  assert menu is nothing
+  call clipboard {"action":"read"}
+  assert reply.text is not nothing
+  call menu-open {"target":{"column":"Name"}}
+  call menu-click {"label":"Paste"}
+  call task.list {}
+  assert reply.tasks.0.name is 2d
+  assert reply.tasks.1.name is 0
+  assert reply.tasks.2.name is 1d
+  assert reply.tasks.0.duration_days is 2
+  key ctrl+z
+  # Plain text pastes from the column's top cell down.
+  call clipboard {"action":"write","text":"X\nY\n"}
+  call menu-open {"target":{"column":"Name"}}
+  call menu-click {"label":"Paste"}
+  call task.list {}
+  assert reply.tasks.0.name is X
+  assert reply.tasks.1.name is Y
+  assert reply.tasks.2.name is Gamma
+  assert tasks is 3
+  # Cut over a column that cannot clear copies it and says so.
+  call menu-open {"target":{"column":"Duration"}}
+  call menu-click {"label":"Cut"}
+  assert status is Selection copied; its columns can't be cut
+  call task.list {}
+  assert reply.tasks.0.duration_days is 2
+  call menu-open {"target":{"column":"ID"}}
+  call menu-click {"label":"Cut"}
+  assert status is Selection copied; its columns can't be cut
+  # Over Name it clears every name, as one undo step.
+  call menu-open {"target":{"column":"Name"}}
+  call menu-click {"label":"Cut"}
+  call task.list {}
+  assert reply.tasks.0.name is ""
+  assert reply.tasks.1.name is ""
+  assert reply.tasks.2.name is ""
+  key ctrl+z
+  call task.list {}
+  assert reply.tasks.0.name is X
+  assert reply.tasks.2.name is Gamma
+
+test a right-click on a heading opens its menu
+  open copy:../fixtures/gantt-bar-uids.xml
+  click C3
+  shot window
+  call pointer-click {"region":"project-heading:Name","button":"right"}
+  assert menu.target.column is Name
+  assert cell is Name
+  assert selected_name is Alpha
+  assert selection is 3
+  call menu-read {}
+  assert reply.items.0.label is Cut
+  key escape
+  # Start runs past the table's right edge: the press lands on what the
+  # table shows of it.
+  call pointer-click {"region":"project-heading:Start","button":"right"}
+  assert menu.target.column is Start
+  assert cell is Start
+  key escape
+  assert menu is nothing
+
+test the heading's press commits an open cell edit first
+  open copy:../fixtures/gantt-bar-uids.xml
+  shot window
+  click C2
+  type Renamed
+  assert cell_edit is Renamed
+  call menu-open {"target":{"column":"Duration"}}
+  assert cell_edit is none
+  assert cell C2 is Renamed
+  assert menu.target.column is Duration
+  key escape
+  # A commit the plan refuses keeps the edit and its status, and opens no
+  # menu.
+  click D2
+  type invalid
+  call-error menu-open {"target":{"column":"Name"}} => the open cell edit did not commit
+  assert cell_edit is invalid
+  assert menu is nothing
+  assert cell is Duration
+  key escape
+  assert cell_edit is none
+
+test a column menu is refused, by name, where no heading can be pressed
+  open copy:../fixtures/gantt-bar-uids.xml
+  shot window
+  call-error menu-open {"target":{"column":"Nope"}} => no Project column 'Nope' (ID, Task Mode, Name, Duration, Start, Finish, Predecessors, Resource Names)
+  call-error menu-open {"target":{"column":3}} => 'column' must be a column name
+  call-error pointer-click {"region":"project-heading:Nope","button":"right"} => no Project column 'Nope'
+  assert menu is nothing
+  # A heading scrolled out of the narrowed table has nothing to press.
+  call pointer-drag {"from":"project-split","to":"cell:B1"}
+  shot window
+  call-error menu-open {"target":{"column":"Resource Names"}} => the Resource Names heading is outside the table viewport
+  assert menu is nothing
+  open copy:../fixtures/basic.docx
+  call-error menu-open {"target":{"column":"Duration"}} => a column menu needs a Project tab
