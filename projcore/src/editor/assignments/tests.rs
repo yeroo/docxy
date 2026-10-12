@@ -988,3 +988,101 @@ fn rejected_progress_edits_leave_the_editor_untouched() {
     };
     assert_untouched(&mut ed, |ed| ed.set_assignment(1, late));
 }
+
+#[test]
+fn an_actuals_edit_drops_the_old_actual_and_remaining_spread_and_keeps_baselines() {
+    let kinds = |ed: &Editor| -> Vec<u8> {
+        let a = get(ed, 1);
+        a.timephased_data.iter().map(|t| t.kind).collect()
+    };
+    let mut ed = tracked(None, |p| {
+        p.assignments[0].actual_work_min = Some(DAY);
+        p.assignments[0].timephased_data = [
+            TimephasedValue::REMAINING_WORK,
+            TimephasedValue::ACTUAL_WORK,
+            TimephasedValue::ACTUAL_OVERTIME_WORK,
+            TimephasedValue::BASELINE_WORK,
+            TimephasedValue::ACTUAL_COST,
+        ]
+        .into_iter()
+        .map(|kind| TimephasedValue {
+            kind,
+            ..TimephasedValue::default()
+        })
+        .collect();
+    });
+    // The actual it has is no change, and keeps every record.
+    ed.set_assignment(1, actual(DAY)).unwrap();
+    assert_eq!(kinds(&ed), [1, 2, 3, 4, 6]);
+    // The actual overtime (none) did not change, so its spread stays.
+    ed.set_assignment(1, actual(2 * DAY)).unwrap();
+    assert_eq!(kinds(&ed), [3, 4]);
+}
+
+#[test]
+fn later_edits_price_the_actual_cost_again() {
+    // Start accrual: the actual cost is the whole cost, which a work edit
+    // doubles.
+    let mut ed = tracked(None, |p| p.resources[0].accrue_at = Some(AccrueAt::Start));
+    ed.set_assignment(1, actual(2 * DAY)).unwrap();
+    assert_eq!(money_text(&get(&ed, 1).actual_cost), Some("200000"));
+    ed.set_assignment(1, work(10 * DAY)).unwrap();
+    assert_eq!(cost(&ed, 1), 4000.0);
+    assert_eq!(money_text(&get(&ed, 1).actual_cost), Some("400000"));
+    // Prorated: a rate table change prices the 16 hours done at $80.
+    let mut ed = tracked(None, |_| {});
+    ed.set_assignment(1, actual(2 * DAY)).unwrap();
+    ed.set_assignment(1, table(1)).unwrap();
+    assert_eq!(cost(&ed, 1), 3200.0);
+    assert_eq!(money_text(&get(&ed, 1).actual_cost), Some("128000"));
+    assert_eq!(money_text(&get(&ed, 1).remaining_cost), Some("192000"));
+}
+
+#[test]
+fn a_rate_table_with_the_actual_it_has_prices_the_done_work_again() {
+    let mut ed = tracked(None, |_| {});
+    ed.set_assignment(1, actual(5 * DAY)).unwrap();
+    let patch = AssignmentPatch {
+        rate_table: Some(1),
+        actual_work_min: Some(5 * DAY),
+        ..AssignmentPatch::default()
+    };
+    assert_one_step(&mut ed, |ed| ed.set_assignment(1, patch).unwrap());
+    let a = get(&ed, 1);
+    assert_eq!(cost(&ed, 1), 3200.0);
+    assert_eq!(money_text(&a.actual_cost), Some("320000"));
+    assert_eq!(money_text(&a.remaining_cost), Some("0"));
+}
+
+#[test]
+fn actual_overtime_never_passes_the_new_actual_work() {
+    // An imported assignment: 10h done, 2h of it overtime.
+    let imported = |p: &mut Project| {
+        p.resources[0].overtime_rate = Rate::parse("75");
+        let a = &mut p.assignments[0];
+        a.overtime_work_min = Some(120);
+        a.actual_work_min = Some(600);
+        a.actual_overtime_work_min = Some(120);
+        a.actual_overtime_cost = Rate::parse("15000");
+        a.timephased_data = vec![TimephasedValue {
+            kind: TimephasedValue::ACTUAL_OVERTIME_WORK,
+            ..TimephasedValue::default()
+        }];
+    };
+    let mut ed = tracked(None, imported);
+    ed.set_assignment(1, actual(60)).unwrap();
+    let a = get(&ed, 1);
+    assert_eq!(a.actual_overtime_work_min, Some(60));
+    assert_eq!(money_text(&a.actual_overtime_cost), Some("7500"));
+    assert_eq!(a.remaining_overtime_work_min, Some(60));
+    assert!(a.timephased_data.is_empty());
+    ed.set_assignment(1, actual(0)).unwrap();
+    let a = get(&ed, 1);
+    assert_eq!(a.actual_overtime_work_min, Some(0));
+    assert_eq!(money_text(&a.actual_overtime_cost), Some("0"));
+    assert_eq!(a.remaining_overtime_work_min, Some(120));
+    // Within the new actual, it stays.
+    let mut ed = tracked(None, imported);
+    ed.set_assignment(1, actual(DAY)).unwrap();
+    assert_eq!(get(&ed, 1).actual_overtime_work_min, Some(120));
+}

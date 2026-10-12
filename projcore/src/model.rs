@@ -925,6 +925,12 @@ pub struct TimephasedValue {
 impl TimephasedValue {
     /// `Type` 1: the assignment's planned (remaining) work.
     pub const REMAINING_WORK: u8 = 1;
+    /// `Type` 2, 3 and 6: the assignment's actual work, actual overtime work
+    /// and actual cost (MSPDI `TimephasedDataType`: AssignmentActualWork,
+    /// AssignmentActualOvertimeWork, AssignmentActualCost).
+    pub const ACTUAL_WORK: u8 = 2;
+    pub const ACTUAL_OVERTIME_WORK: u8 = 3;
+    pub const ACTUAL_COST: u8 = 6;
     /// `Type` 4 and 5: the assignment's Baseline (slot 0) work and cost.
     /// Baseline1..10 have their own codes from 16 up.
     pub const BASELINE_WORK: u8 = 4;

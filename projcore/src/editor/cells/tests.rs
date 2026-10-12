@@ -344,13 +344,15 @@ fn resource_names_edits_keep_assignment_progress() {
             cost: tracked[0].cost.clone(),
             remaining_cost: tracked[0].remaining_cost.clone(),
             percent_work_complete: tracked[0].percent_work_complete,
+            actual_cost: tracked[0].actual_cost.clone(),
             ..alice.clone()
         },
         tracked[0]
     );
     // Its % work complete follows the new work (#1180): the actual now
-    // covers all of it.
+    // covers all of it, and so its actual cost is its whole cost.
     assert_eq!(alice.percent_work_complete, Some(100));
+    assert_eq!(money(&alice.actual_cost), Some("0".into()));
     assert_eq!(ed.proj.assignments[1], tracked[1]);
 }
 
@@ -2847,13 +2849,16 @@ fn a_duration_change_rescales_assignment_work_and_keeps_progress() {
                 remaining_work_min: was.remaining_work_min,
                 remaining_cost: was.remaining_cost.clone(),
                 percent_work_complete: was.percent_work_complete,
+                actual_cost: was.actual_cost.clone(),
                 ..a.clone()
             },
             was
         );
     }
-    // The % work complete follows the doubled work (#1180).
+    // The % work complete follows the doubled work, and the actual cost is
+    // priced again, at the (absent) rates (#1180).
     assert_eq!(after[0].percent_work_complete, Some(25));
+    assert_eq!(after[0].actual_cost.as_ref().map(Rate::as_str), Some("0"));
     assert_eq!(after[2], before[2]);
 
     // A save writes the new Work.

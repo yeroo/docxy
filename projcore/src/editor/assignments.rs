@@ -269,9 +269,11 @@ impl Editor {
     /// actual work, or the percent of the final work given instead. Actual
     /// work above zero sets the actual start to the assignment's start if it
     /// has none, the whole work also the actual finish to its finish, and
-    /// zero clears both; the actual cost follows the resource's accrual
-    /// ([`crate::assign::actual_cost`]), and the refresh derives the
-    /// remaining work and cost and the % work complete. Overtime is not
+    /// zero clears both; actual overtime above the new actual is cut to it,
+    /// and the timephased actual and remaining work and actual cost go. The
+    /// refresh then derives the actual cost by the resource's accrual
+    /// ([`crate::assign::actual_cost`]), the remaining work and cost and the
+    /// % work complete. Overtime is not
     /// scheduled and a contour keeps the work, units and duration (the
     /// assignment spans its task), but a contour or an actual start or
     /// finish ends a delayed assignment's extension of its task
@@ -458,7 +460,7 @@ impl Editor {
         if percent.is_some_and(|p| p > 0) && a.work_min <= 0 {
             return Err(NO_WORK_PERCENT.into());
         }
-        let (start, finish, cost) = if done > 0 {
+        let (start, finish) = if done > 0 {
             let (start, finish) = a
                 .start
                 .zip(a.finish)
@@ -466,24 +468,34 @@ impl Editor {
                 .ok_or_else(|| format!("task {} is not scheduled", a.task_uid))?;
             let start = a.actual_start.unwrap_or(start);
             let actual_finish = (done >= a.work_min).then(|| a.actual_finish.unwrap_or(finish));
-            let cost = crate::assign::actual_cost(&self.proj, a, done, (start, finish));
-            (Some(start), actual_finish, cost)
+            (Some(start), actual_finish)
         } else {
-            let never = DateTime::from_minutes(0);
-            let cost = crate::assign::actual_cost(&self.proj, a, 0, (never, never));
-            (None, None, cost)
+            (None, None)
         };
-        // An actual cost it cannot price (no resource) stays as it was.
-        let cost = cost.or_else(|| a.actual_cost.clone());
+        // Actual overtime is part of the actual work.
+        let overtime = a.actual_overtime_work_min.map(|o| o.min(done));
         let mut assignments = self.proj.assignments.clone();
         let a = assignments
             .iter_mut()
             .find(|a| a.uid == uid)
             .expect("checked");
+        // The spread of the old actuals and of the work left described them;
+        // the baselines stay.
+        let stale = |kind: u8| {
+            matches!(
+                kind,
+                TimephasedValue::REMAINING_WORK
+                    | TimephasedValue::ACTUAL_WORK
+                    | TimephasedValue::ACTUAL_COST
+            ) || (kind == TimephasedValue::ACTUAL_OVERTIME_WORK
+                && overtime != a.actual_overtime_work_min)
+        };
+        a.timephased_data.retain(|t| !stale(t.kind));
         a.actual_work_min = Some(done);
         a.actual_start = start;
         a.actual_finish = finish;
-        a.actual_cost = cost;
+        a.actual_overtime_work_min = overtime;
+        // The refresh prices the actual cost, and the actual overtime's.
         self.commit_assignments(i, self.proj.resources.clone(), assignments)
     }
 
