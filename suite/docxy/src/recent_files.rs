@@ -3,11 +3,13 @@
 //! Backstage's Open page shows them and the harness reads them
 //! (`recent-files`).
 //!
-//! A record is a path, spelled as a person would type it: never `\\?\`
-//! (Windows' canonical form), which [`plain`] strips. Two spellings of one
-//! file are one record: they are compared by their canonical path when the
-//! comparison is made, so a file that no longer exists still compares by the
-//! spelling it was stored with.
+//! A record is one spelling of a file, made once when it is recorded
+//! ([`spelling`]): absolute, canonical when the file exists, and never `\\?\`
+//! (Windows' canonical form), which [`plain`] strips. A relative path from
+//! the command line is stored absolute, so another working directory next
+//! session still finds it. Stored records are compared with that spelling as
+//! text ([`same`]), never by asking the file system about each one: a record
+//! on an offline share must not stall every open and Save As.
 //!
 //! The list lives in its own `recent.json`, not in `session.json`: every
 //! window rewrites the session wholesale (#587), and a list kept there would
@@ -58,6 +60,26 @@ fn key(path: &Path) -> PathBuf {
     crate::canonical(path)
 }
 
+/// The one spelling `path` is stored and compared by: its canonical path,
+/// or when that cannot be read (the file is gone) its absolute path; in
+/// either case without `\\?\`.
+pub(crate) fn spelling(path: &Path) -> String {
+    let full = std::fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_path_buf());
+    plain(&full).to_string_lossy().into_owned()
+}
+
+/// Whether two stored spellings name one file: as text, ignoring case on
+/// Windows, whose file names do.
+fn same(a: &str, b: &str) -> bool {
+    if cfg!(windows) {
+        a.to_lowercase() == b.to_lowercase()
+    } else {
+        a == b
+    }
+}
+
 impl RecentStore {
     /// The store under `root`, or an empty one when there is none or it
     /// cannot be read.
@@ -86,17 +108,22 @@ impl RecentStore {
     /// Make `path` the newest file. A record of the same file, however it
     /// was spelled, is dropped; past [`MAX_RECENT`] the oldest go.
     pub(crate) fn push(&mut self, path: &Path) {
-        self.remove(path);
-        self.files
-            .insert(0, plain(path).to_string_lossy().into_owned());
+        let spelled = spelling(path);
+        self.remove_spelled(&spelled);
+        self.files.insert(0, spelled);
         self.files.truncate(MAX_RECENT);
     }
 
     /// Drop `path`'s record, however it was spelled; whether there was one.
     pub(crate) fn remove(&mut self, path: &Path) -> bool {
-        let key = key(path);
+        self.remove_spelled(&spelling(path))
+    }
+
+    /// Drop the record stored as `spelled`. The records are compared as
+    /// text: no file system call per record.
+    fn remove_spelled(&mut self, spelled: &str) -> bool {
         let before = self.files.len();
-        self.files.retain(|f| crate::canonical(Path::new(f)) != key);
+        self.files.retain(|f| !same(f, spelled));
         self.files.len() != before
     }
 }
@@ -171,6 +198,11 @@ mod tests {
         }
     }
 
+    /// How `path` is stored: the expected value of a record.
+    fn stored(path: &Path) -> PathBuf {
+        PathBuf::from(spelling(path))
+    }
+
     #[test]
     fn a_file_added_again_moves_to_the_top_once() {
         let dir = Scratch::new("top");
@@ -179,9 +211,51 @@ mod tests {
         let mut store = RecentStore::default();
         store.push(&a);
         store.push(&b);
-        assert_eq!(store.files(), vec![b.clone(), a.clone()]);
+        assert_eq!(store.files(), vec![stored(&b), stored(&a)]);
         store.push(&a);
-        assert_eq!(store.files(), vec![a, b]);
+        assert_eq!(store.files(), vec![stored(&a), stored(&b)]);
+    }
+
+    /// m1 (#1194 r1): `docxy report.docx` from a shell keeps the path
+    /// relative; the record is absolute, so another working directory next
+    /// session still finds the file.
+    #[test]
+    fn a_relative_path_is_stored_absolute() {
+        let mut store = RecentStore::default();
+        store.push(Path::new("recent-relative-missing.docx"));
+        let kept = store.files();
+        assert!(kept[0].is_absolute(), "{}", kept[0].display());
+        assert_eq!(
+            kept[0],
+            std::env::current_dir()
+                .unwrap()
+                .join("recent-relative-missing.docx")
+        );
+        assert!(store.remove(Path::new("recent-relative-missing.docx")));
+    }
+
+    /// m4 (#1194 r1): records are compared as text, so a record whose file
+    /// cannot be reached (another drive, an offline share) is matched by its
+    /// spelling and never looked up.
+    #[test]
+    fn records_are_compared_as_text() {
+        let mut store = RecentStore::default();
+        store.files = vec![
+            r"\\offline-server\share\plan.yppx".into(),
+            "/nowhere/at/all/a.docx".into(),
+        ];
+        let dir = Scratch::new("text");
+        let a = dir.file("a.docx");
+        store.push(&a);
+        assert_eq!(store.files().len(), 3);
+        assert!(store.remove_spelled(r"\\offline-server\share\plan.yppx"));
+        assert!(store.remove_spelled("/nowhere/at/all/a.docx"));
+        assert_eq!(store.files(), vec![stored(&a)]);
+        if cfg!(windows) {
+            // Windows file names ignore case, and so does the list.
+            let upper = store.files[0].to_uppercase();
+            assert!(store.remove_spelled(&upper));
+        }
     }
 
     #[test]
@@ -196,8 +270,8 @@ mod tests {
         }
         let kept = store.files();
         assert_eq!(kept.len(), MAX_RECENT);
-        assert_eq!(kept[0], files[MAX_RECENT + 2]);
-        assert_eq!(kept[MAX_RECENT - 1], files[3]);
+        assert_eq!(kept[0], stored(&files[MAX_RECENT + 2]));
+        assert_eq!(kept[MAX_RECENT - 1], stored(&files[3]));
     }
 
     #[test]
@@ -240,9 +314,12 @@ mod tests {
             plain(Path::new("/home/a.docx")),
             PathBuf::from("/home/a.docx")
         );
-        let mut store = RecentStore::default();
-        store.push(Path::new(r"\\?\Q:\nowhere\a.docx"));
-        assert_eq!(store.files, vec![r"Q:\nowhere\a.docx".to_string()]);
+        // Only Windows reads `\\?\Q:\…` as an absolute path to keep.
+        if cfg!(windows) {
+            let mut store = RecentStore::default();
+            store.push(Path::new(r"\\?\Q:\nowhere\a.docx"));
+            assert_eq!(store.files, vec![r"Q:\nowhere\a.docx".to_string()]);
+        }
     }
 
     #[test]
@@ -252,9 +329,9 @@ mod tests {
         let b = dir.file("b.xlsx");
         note(&dir.0, &a).unwrap();
         note(&dir.0, &b).unwrap();
-        assert_eq!(list(&dir.0), vec![b.clone(), a.clone()]);
+        assert_eq!(list(&dir.0), vec![stored(&b), stored(&a)]);
         forget(&dir.0, &b).unwrap();
-        assert_eq!(list(&dir.0), vec![a]);
+        assert_eq!(list(&dir.0), vec![stored(&a)]);
     }
 
     #[test]
@@ -267,7 +344,7 @@ mod tests {
         // Recording over a malformed store replaces it with a valid one.
         let a = dir.file("a.docx");
         note(&dir.0, &a).unwrap();
-        assert_eq!(list(&dir.0), vec![a]);
+        assert_eq!(list(&dir.0), vec![stored(&a)]);
     }
 
     #[test]
