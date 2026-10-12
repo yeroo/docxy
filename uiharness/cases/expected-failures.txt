@@ -113,3 +113,9 @@ doc-inputs-typing.uit | document comment-editor: edits | #1362
 doc-inputs-typing.uit | document comment-editor: select-all replaces | #1362
 doc-inputs-typing.uit | document comment-editor: copies | #1362
 doc-inputs-typing.uit | document comment-editor: pastes | #1362
+
+# File > Info has no Properties (Title, Tags, Author) to type into: the
+# press answers that the property does not exist (#1202 found it).
+backstage-inputs-typing.uit | backstage info-title: focus by click | #1364 | error
+backstage-inputs-typing.uit | backstage info-tags: focus by click | #1364 | error
+backstage-inputs-typing.uit | backstage info-author: focus by click | #1364 | error

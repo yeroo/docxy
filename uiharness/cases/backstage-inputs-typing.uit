@@ -1,0 +1,220 @@
+# Backstage's inputs and the renames, typed into with real keys only
+# (#1202, the Backstage-and-renames slice of #1029). Written by hand, not
+# generated: the dialog catalogue's `inputs-typing-*.uit` own that prefix.
+#
+# The one rename the suite has is the sheet tab's: a double-click on the
+# active sheet's tab opens it inline, Enter renames the sheet and Escape
+# leaves it. Neither the document tab nor the title bar renames. The rename
+# is focused by `pointer-click {"input":"sheet-tab-rename"}`, which
+# double-clicks the active tab's name, and keys go by `real-key` and
+# `real-type` only; `open` and `click <cell>` are setup. A test is one step,
+# named `rename sheet-tab-rename: <step>`; each opens its own copy of
+# basic.xlsx (one sheet, Sheet1, so its tab carries no ×) and first presses
+# Escape, which closes a Find bar an earlier test left open (the bar is the
+# window's, not the tab's). Expected values follow Excel, which selects the
+# whole name when the rename opens: `types` checks that typing replaces it,
+# and every later step first clears it with six Backspaces (Excel's first
+# deletes the selected name, the rest nothing), so each fails for its own
+# step only.
+#
+# Backstage's own fields are not typed into here. Save As's file name (File >
+# Save As, F12, Export > Change File Type) is the OS's file dialog, which a
+# harness instance never opens: qa/inputs-typing.md has it as a manual case.
+# File > Info has no Title, Tags or Author yet (#1364): each test below opens
+# the Info page and fails at the press, so it is listed `| error` until the
+# Properties land with their full set of steps. Settings' typed values are
+# the User name and Custom Lists dialogs, which the dialog catalogue lists
+# and `inputs-typing-doc-app.uit` and `inputs-typing-sheet-data.uit` type
+# into, entering from Backstage (the #1027 path).
+# The steps that fail today are in expected-failures.txt. See
+# qa/inputs-typing.md.
+
+# ---- The sheet tab's rename: a double-click on the active tab opens it.
+
+test rename sheet-tab-rename: focus by click
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  assert sheet is Sheet1
+  call field-read {"input":"sheet-tab-rename"}
+  assert reply.focused is false
+  assert reply.value is Sheet1
+  call pointer-click {"input":"sheet-tab-rename"}
+  assert reply.clicks is 2
+  call field-read {"input":"sheet-tab-rename"}
+  assert reply.focused is true
+  assert reply.value is Sheet1
+  call real-key {"key":"escape"}
+
+test rename sheet-tab-rename: types
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-tab-rename"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"sheet-tab-rename"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test rename sheet-tab-rename: edits
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-tab-rename"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"sheet-tab-rename"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"input":"sheet-tab-rename"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"sheet-tab-rename"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"sheet-tab-rename"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"sheet-tab-rename"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test rename sheet-tab-rename: select-all replaces
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-tab-rename"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"sheet-tab-rename"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"sheet-tab-rename"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test rename sheet-tab-rename: copies
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"input":"sheet-tab-rename"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test rename sheet-tab-rename: pastes
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"input":"sheet-tab-rename"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"sheet-tab-rename"}
+  assert reply.focused is true
+  assert reply.value is Pasted
+  assert reply.caret is 6
+  call real-key {"key":"escape"}
+
+test rename sheet-tab-rename: Enter renames the sheet
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  assert dirty is false
+  call pointer-click {"input":"sheet-tab-rename"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-type {"text":"Ab1"}
+  call real-key {"key":"enter"}
+  call field-read {"input":"sheet-tab-rename"}
+  assert reply.focused is false
+  assert sheet is Ab1
+  assert dirty is true
+
+test rename sheet-tab-rename: Escape cancels
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-tab-rename"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call real-type {"text":"Ab1"}
+  call real-key {"key":"escape"}
+  call field-read {"input":"sheet-tab-rename"}
+  assert reply.focused is false
+  assert reply.value is Sheet1
+  assert sheet is Sheet1
+  assert dirty is false
+
+# ---- File > Info's properties: none exist yet (#1364).
+
+test backstage info-title: focus by click
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call backstage-layout {}
+  assert reply.page is info
+  call pointer-click {"input":"info-title"}
+  call field-read {"input":"info-title"}
+  assert reply.focused is true
+
+test backstage info-tags: focus by click
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call backstage-layout {}
+  assert reply.page is info
+  call pointer-click {"input":"info-tags"}
+  call field-read {"input":"info-tags"}
+  assert reply.focused is true
+
+test backstage info-author: focus by click
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call backstage-layout {}
+  assert reply.page is info
+  call pointer-click {"input":"info-author"}
+  call field-read {"input":"info-author"}
+  assert reply.focused is true
