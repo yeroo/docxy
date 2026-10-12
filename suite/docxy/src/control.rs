@@ -567,7 +567,36 @@ impl Docxy {
         if let Err(e) = crate::close::close_prompt_refusal(&self.tabs, verb) {
             return Some(Err(e));
         }
+        // A plan opened or saved under a new name here is a recent file
+        // (#1194), as through the Backstage: `project_verb` is GPUI-free and
+        // never records, so the paths it may rebind are compared after it.
+        let before: Vec<Option<std::path::PathBuf>> = if verb == "proj.save" {
+            self.tabs.iter().map(|t| t.path.clone()).collect()
+        } else {
+            Vec::new()
+        };
         let outcome = project_verb(&mut self.tabs, self.active, verb, args)?;
+        if let Ok((_, effect)) = &outcome {
+            let recorded: Vec<std::path::PathBuf> = match verb {
+                "proj.open" => effect
+                    .focus
+                    .and_then(|i| self.tabs.get(i))
+                    .and_then(records_open)
+                    .into_iter()
+                    .collect(),
+                _ => before
+                    .iter()
+                    .zip(&self.tabs)
+                    .filter(|(prev, t)| {
+                        crate::recent_files::path_changed(prev.as_deref(), t.path.as_deref())
+                    })
+                    .filter_map(|(_, t)| t.path.clone())
+                    .collect(),
+            };
+            for path in recorded {
+                self.note_recent(&path);
+            }
+        }
         Some(outcome.map(|(result, effect)| {
             // What drops the tab's dialogs (an edit, a reload, a save) or
             // moves the focus drops an open menu too (#397).

@@ -74,6 +74,7 @@ mod page_flow;
 mod page_number;
 mod page_setup;
 mod project;
+mod recent_files;
 mod recover;
 #[cfg(test)]
 mod ribbon_export;
@@ -4741,6 +4742,10 @@ struct Docxy {
     /// Why the last Clear failed, shown under the backstage row until the
     /// backstage reopens or a Clear succeeds (#895).
     trusted_error: Option<String>,
+    /// The Backstage Open page's Recent list (#1194), re-read when the
+    /// backstage opens and after this window records or removes a file:
+    /// never per frame.
+    recent_files: Vec<PathBuf>,
     /// When the hot-exit state was last written by any `persist`, or an
     /// AutoRecover tick last found nothing to write: the timer's clock. A
     /// `Cell` because `persist` takes `&self`.
@@ -7532,6 +7537,26 @@ fn effective_mode(path: &std::path::Path, mode: OpenMode) -> OpenMode {
         (false, true, mode) => mode,
         (false, false, OpenMode::RecoverText) => OpenMode::RecoverText,
         (false, false, _) => OpenMode::Normal,
+    }
+}
+
+/// The file an open leaves a tab bound to, which becomes the newest recent
+/// file (#1194): none for an untitled tab (a template opens untitled, as a
+/// new document from it does in Word) or one whose load failed (Word lists
+/// no file it could not open).
+fn records_open(tab: &DocTab) -> Option<PathBuf> {
+    tab.path.clone().filter(|_| !tab.load_failed)
+}
+
+/// The kind of tab `path` opens as: the Recent list's glyph and the
+/// harness's `kind`.
+fn path_kind(path: &std::path::Path) -> Kind {
+    if is_project_path(path) {
+        Kind::Project
+    } else if is_sheet_path(path) {
+        Kind::Xlsx
+    } else {
+        Kind::Docx
     }
 }
 
@@ -11725,6 +11750,7 @@ impl Docxy {
             drafts: Vec::new(),
             trusted_count: 0,
             trusted_error: None,
+            recent_files: Vec::new(),
             last_persist: std::cell::Cell::new(std::time::Instant::now()),
             applied: None,
             os_appearance: gpui::WindowAppearance::Light,
@@ -11942,6 +11968,7 @@ impl Docxy {
         self.refresh_drafts(cx);
         self.trusted_count = trusted::count(&config_root());
         self.trusted_error = None;
+        self.recent_files = recent_files::list(&config_root());
         cx.notify();
     }
 
@@ -12455,7 +12482,7 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.open_path(path, OpenMode::ReadOnly, Reopen::Ask) {
+        match self.open_path_recording(path, OpenMode::ReadOnly, Reopen::Ask, false) {
             Ok(true) => {
                 if self.tabs.get(self.active).is_some_and(draft_loaded) {
                     self.set_status(DRAFT_OPENED);
@@ -15446,6 +15473,7 @@ impl Docxy {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
+        let prev = tab.path.clone();
         let decision = save_decision(tab, self.harness, explicit_save_as);
         match decision {
             SaveDecision::InPlace(path) => {
@@ -15471,6 +15499,7 @@ impl Docxy {
                     "This project could not be loaded and cannot be saved".into()
             }
         }
+        self.note_recent_if_moved(prev);
         self.backstage = false;
         self.bs_new = false;
         self.bs_export = false;
@@ -19721,7 +19750,9 @@ impl Docxy {
                 },
             },
         };
+        let prev = self.tabs[self.active].path.clone();
         let saved = save_doc_tab(&mut self.tabs[self.active], target);
+        self.note_recent_if_moved(prev);
         self.backstage = false;
         self.bs_new = false;
         self.bs_export = false;
@@ -19740,6 +19771,7 @@ impl Docxy {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
+        let prev = tab.path.clone();
         let start = doc_import::save_start_dir_of(tab);
         let pick = |suggested| {
             macos_menu::native_modal(|| {
@@ -19765,6 +19797,7 @@ impl Docxy {
         }) {
             return self.refocus(window, cx);
         }
+        self.note_recent_if_moved(prev);
         self.backstage = false;
         self.bs_new = false;
         self.bs_export = false;
@@ -19786,7 +19819,9 @@ impl Docxy {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return false;
         };
+        let prev = tab.path.clone();
         let saved = save_sheet_to(tab, target);
+        self.note_recent_if_moved(prev);
         self.backstage = false;
         self.bs_new = false;
         self.bs_export = false;
@@ -19810,7 +19845,9 @@ impl Docxy {
             self.refocus(window, cx);
             return Err(self.tabs[self.active].status.to_string());
         }
+        let prev = self.tabs[self.active].path.clone();
         let result = apply_save(&mut self.tabs[self.active], target);
+        self.note_recent_if_moved(prev);
         self.backstage = false;
         self.bs_new = false;
         self.bs_export = false;
@@ -19952,11 +19989,26 @@ impl Docxy {
     /// `Ok(true)` when a file was loaded, `Ok(false)` when an open tab was
     /// only focused or asked about. `Err` only when Open as Copy could not
     /// write the copy; nothing opens.
+    ///
+    /// The tab it leaves bound to a file is the newest recent file (#1194),
+    /// unless its load failed; a reopen that only asks records nothing.
     fn open_path(
         &mut self,
         path: &std::path::Path,
         mode: OpenMode,
         reopen: Reopen,
+    ) -> Result<bool, String> {
+        self.open_path_recording(path, mode, reopen, true)
+    }
+
+    /// [`Self::open_path`], recording the file in the recent list only with
+    /// `recent`: a kept AutoRecover draft is not a file the person opened.
+    fn open_path_recording(
+        &mut self,
+        path: &std::path::Path,
+        mode: OpenMode,
+        reopen: Reopen,
+        recent: bool,
     ) -> Result<bool, String> {
         self.project_prompt_cancel();
         let path = path.to_path_buf();
@@ -19973,15 +20025,19 @@ impl Docxy {
         let trusted = trusted::TrustStore::load(&config_root());
         let Some(i) = open else {
             let tab = tab_from_path_mode(&path, mode, &trusted)?;
+            let opened = records_open(&tab).filter(|_| recent);
             self.cancel_highlight_mode();
             self.tabs.push(tab);
             self.active = self.tabs.len() - 1;
+            if let Some(p) = opened {
+                self.note_recent(&p);
+            }
             return Ok(true);
         };
         self.cancel_highlight_mode();
         self.active = i;
         let tab = &self.tabs[i];
-        Ok(match reopen_step(reopen, tab.dirty, tab.access, mode) {
+        let loaded = match reopen_step(reopen, tab.dirty, tab.access, mode) {
             ReopenStep::Reload => {
                 self.tabs[i] = tab_from_path_mode(&path, mode, &trusted)?;
                 // Nor a flyout opened on the document it replaces (#1020).
@@ -19992,10 +20048,58 @@ impl Docxy {
             }
             ReopenStep::Ask => {
                 self.tabs[i].dialogs.push(reopen_dialog(&path, mode));
-                false
+                return Ok(false);
             }
             ReopenStep::Focus => false,
-        })
+        };
+        if let Some(p) = records_open(&self.tabs[i]).filter(|_| recent) {
+            self.note_recent(&p);
+        }
+        Ok(loaded)
+    }
+
+    /// Record `path` as the newest recent file (#1194) and re-read the
+    /// Backstage's list. A store that cannot be written is not worth a
+    /// status: the list just misses the file.
+    fn note_recent(&mut self, path: &std::path::Path) {
+        let root = config_root();
+        let _ = recent_files::note(&root, path);
+        self.recent_files = recent_files::list(&root);
+    }
+
+    /// After a save of the active tab, which was bound to `prev`: a Save As
+    /// or a first save records the tab's new file; a Save in place does not
+    /// (#1194). Only `impl Docxy` records, never the free writers, which unit
+    /// tests call with no `DOCXY_CONFIG_DIR`.
+    fn note_recent_if_moved(&mut self, prev: Option<PathBuf>) {
+        let new = self.tabs.get(self.active).and_then(|t| t.path.clone());
+        if recent_files::path_changed(prev.as_deref(), new.as_deref())
+            && let Some(p) = new
+        {
+            self.note_recent(&p);
+        }
+    }
+
+    /// A click on a Recent row (#1194), and the harness's `recent-open`. A
+    /// file that still exists opens as Open does and the Backstage closes;
+    /// one that no longer exists leaves the list, the status says so, and
+    /// the Backstage stays.
+    fn open_recent(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        let root = config_root();
+        if !path.exists() {
+            let _ = recent_files::forget(&root, path);
+            self.recent_files = recent_files::list(&root);
+            self.set_status(recent_files::missing_status(path));
+            cx.notify();
+            return;
+        }
+        if let Err(e) = self.open_path(path, OpenMode::Normal, Reopen::Ask) {
+            self.set_status(e);
+        }
+        self.backstage = false;
+        self.drop_grid_state();
+        self.persist(cx);
+        cx.notify();
     }
 
     /// Open files passed on the command line (e.g. double-clicking a .docx/.xlsx
@@ -32349,23 +32453,41 @@ impl Docxy {
                     )
                 })
                 .unwrap_or_else(|| ("—".into(), "".into()));
+            // Recent files (#1194), newest first. The row keeps the file's
+            // path, not its index: the list can change before the click.
             let recents: Vec<AnyElement> = self
-                .tabs
+                .recent_files
                 .iter()
                 .enumerate()
-                .map(|(i, t)| {
-                    div()
+                .map(|(i, path)| {
+                    let folder = path
+                        .parent()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    let target = path.clone();
+                    h_flex()
                         .id(("recent", i))
+                        .gap_2()
                         .px_3()
                         .py_1p5()
                         .cursor_pointer()
                         .rounded_sm()
                         .text_color(fg)
                         .hover(|d| d.bg(sidebar))
-                        .child(format!("{} {}", t.kind.glyph(), t.title))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.backstage = false;
-                            this.select_tab(i, window, cx);
+                        .min_w_0()
+                        .child(div().flex_shrink_0().child(path_kind(path).glyph()))
+                        .child(div().flex_shrink_0().child(file_name(path)))
+                        // A long folder ends in an ellipsis, not past the page.
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(12.))
+                                .text_color(dim)
+                                .child(folder),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_recent(&target, cx);
                         }))
                         .into_any_element()
                 })
@@ -32496,7 +32618,25 @@ impl Docxy {
                             }))
                     }),
                 ))
-                .child(v_flex().gap_0p5().children(recents))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(rgb(BRAND))
+                        .mt_4()
+                        .child("Recent"),
+                )
+                .map(|d| {
+                    if recents.is_empty() {
+                        d.child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(dim)
+                                .child("No recent files"),
+                        )
+                    } else {
+                        d.child(v_flex().gap_0p5().children(recents))
+                    }
+                })
                 .when(show_recover, |d| {
                     d.child(
                         div()
