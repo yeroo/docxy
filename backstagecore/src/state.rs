@@ -489,6 +489,24 @@ impl Backstage {
         self.info_sel = row;
     }
 
+    /// Save As's file-name field, for `field-read` (#1204): its text and
+    /// caret while Save As is on screen, whether it has the keyboard, and
+    /// where its text starts as last drawn (`name_x0`, inside the box's
+    /// border and leading space, on the box's middle row).
+    pub fn save_as_name_field(&self) -> ctlcore::field::Field {
+        if self.item != Item::SaveAs {
+            return ctlcore::field::Field::closed();
+        }
+        ctlcore::field::Field {
+            value: Some(self.name_input.clone()),
+            focused: self.pane == Pane::SaveAs && self.name_focus,
+            caret: Some(self.name_cursor),
+            selection: None,
+            at: Some((self.layout.name_x0, self.layout.name_top + 1)),
+            kind: None,
+        }
+    }
+
     /// The menu items, in display order.
     pub fn items(&self) -> &[Item] {
         &self.items

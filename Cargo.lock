@@ -74,6 +74,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "backstagecore"
 version = "0.1.0"
 dependencies = [
+ "ctlcore",
  "ratatui",
  "unicode-width 0.2.0",
 ]
@@ -1791,6 +1792,7 @@ version = "0.5.0"
 dependencies = [
  "ctlcore",
  "gridcore",
+ "libc",
  "opccore",
  "windows 0.62.2",
  "x11rb",
