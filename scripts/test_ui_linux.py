@@ -147,6 +147,8 @@ class Teardown(unittest.TestCase):
         self.wrapper = None
         self._write_tool('fake-xvfb', XVFB)
         self._write_tool('fake-openbox', OPENBOX)
+        self._write_tool('fake-openbox-flaky', OPENBOX_FLAKY)
+        self._write_tool('fake-openbox-dead', OPENBOX_DEAD)
         self._write_tool('xprop', XPROP)
         env = os.environ.copy()
         env['PATH'] = str(self.bin) + os.pathsep + env['PATH']
@@ -251,14 +253,6 @@ class Teardown(unittest.TestCase):
         self._pid('child.pid')
         self.assertEqual(wrapper.wait(timeout=20), 7)
         self._assert_all_gone()
-
-
-@unittest.skipUnless(sys.platform.startswith('linux'), 'ui-linux.py is Linux-only')
-class OpenboxRetry(Teardown):
-    def setUp(self):
-        super().setUp()
-        self._write_tool('fake-openbox-flaky', OPENBOX_FLAKY)
-        self._write_tool('fake-openbox-dead', OPENBOX_DEAD)
 
     def test_openbox_exit_before_ready_is_retried_once(self):
         wrapper = self._start(self._write_child('child.py', CHILD_EXIT7),
