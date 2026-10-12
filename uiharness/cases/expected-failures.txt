@@ -119,3 +119,12 @@ doc-inputs-typing.uit | document comment-editor: pastes | #1362
 backstage-inputs-typing.uit | backstage info-title: focus by click | #1364 | error
 backstage-inputs-typing.uit | backstage info-tags: focus by click | #1364 | error
 backstage-inputs-typing.uit | backstage info-author: focus by click | #1364 | error
+
+# The sheet tab's rename is append-only: the name is not selected on open,
+# no caret, so Home, End, Left, Right and Delete do nothing, and Ctrl+A/C/V
+# do nothing (#1202 found it).
+backstage-inputs-typing.uit | rename sheet-tab-rename: types | #1365
+backstage-inputs-typing.uit | rename sheet-tab-rename: edits | #1365
+backstage-inputs-typing.uit | rename sheet-tab-rename: select-all replaces | #1365
+backstage-inputs-typing.uit | rename sheet-tab-rename: copies | #1365
+backstage-inputs-typing.uit | rename sheet-tab-rename: pastes | #1365
