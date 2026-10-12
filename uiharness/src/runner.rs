@@ -788,9 +788,6 @@ pub fn copy_fixture(
 mod tests {
     use super::*;
 
-    /// FIX r5 of #1149: a failed `reply.` assert shows the whole reply, so a
-    /// `pointer-click`'s press point is in the transcript; a state assert,
-    /// which reads the app's state, does not print it all.
     /// FIX r5 of #1149: `{verb.path}` reads that verb's last reply; a plain
     /// value is itself, and a missing verb or field is an error, not a match.
     #[test]
@@ -814,6 +811,9 @@ mod tests {
         assert!(e.contains("must name a verb and a field"), "{e}");
     }
 
+    /// FIX r5 of #1149: a failed `reply.` assert shows the whole reply, so a
+    /// `pointer-click`'s press point is in the transcript; a state assert,
+    /// which reads the app's state, does not print it all.
     #[test]
     fn a_failed_reply_assert_prints_the_reply() {
         let reply = Json::obj(vec![
