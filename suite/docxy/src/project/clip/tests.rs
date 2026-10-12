@@ -696,6 +696,42 @@ fn delete_after_an_id_click_then_shift_down_clears_cells() {
 }
 
 #[test]
+fn delete_after_an_id_click_then_a_drag_onto_an_id_cell_clears_cells() {
+    let mut t = tab();
+    // A plain press after the ID click re-anchors: the drag ends on an ID
+    // cell with the range across every column, the row-header shape, but it
+    // was not made on the ID cells — Delete clears it and keeps the tasks.
+    crate::project_cell_press(&mut t, 0, COL_ID, false);
+    crate::project_cell_release(&mut t);
+    crate::project_cell_press(&mut t, 1, COL_RESOURCES, false);
+    crate::project_cell_drag_over(&mut t, 0, COL_ID);
+    crate::project_cell_release(&mut t);
+    assert_eq!(v(&t).col, COL_ID, "the cursor ended on the ID column");
+    press_delete(&mut t);
+    assert_eq!(tasks(&t).len(), 2, "no task is deleted");
+    assert_eq!(tasks(&t)[0].1, "", "Name cleared");
+    assert_eq!(tasks(&t)[1].1, "", "Name cleared");
+    assert!(t.dialogs.top().is_none(), "no delete question ever opens");
+}
+
+#[test]
+fn delete_after_an_id_click_then_a_shift_click_clears_cells() {
+    let mut t = tab();
+    // The Shift press re-anchors from the cursor: the range spans every
+    // column again, but a row-header selection is only the ID press's own —
+    // Delete clears it and keeps the tasks.
+    crate::project_cell_press(&mut t, 0, COL_ID, false);
+    crate::project_cell_release(&mut t);
+    crate::project_cell_press(&mut t, 1, COL_RESOURCES, true);
+    crate::project_cell_release(&mut t);
+    press_delete(&mut t);
+    assert_eq!(tasks(&t).len(), 2, "no task is deleted");
+    assert_eq!(tasks(&t)[0].1, "", "Name cleared");
+    assert_eq!(tasks(&t)[1].1, "", "Name cleared");
+    assert!(t.dialogs.top().is_none(), "no delete question ever opens");
+}
+
+#[test]
 fn delete_over_a_range_with_no_clearable_column_changes_nothing() {
     let mut t = tab();
     select_range(&mut t, COL_DURATION, 1, COL_DURATION);
@@ -711,9 +747,8 @@ fn delete_over_a_range_with_no_clearable_column_changes_nothing() {
 #[test]
 fn delete_over_a_range_never_deletes_a_task_across_the_id_column() {
     let mut t = tab();
-    // ID..Predecessors spans the ID column without being the whole row (the
-    // Resource Names column is not covered), so Delete clears the range
-    // instead of deleting the cursor's task.
+    // ID..Predecessors, grown with the keyboard rather than by an ID press:
+    // Delete clears its cells and deletes no task.
     select_range(&mut t, COL_ID, 1, COL_PREDECESSORS);
     let depth = v(&t).ed.undo_depth();
     press_delete(&mut t);
