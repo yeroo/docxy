@@ -52,7 +52,7 @@
 //! | `row.insert` / `row.delete` | `{at,count?,sheet?}` | `{inserted\|deleted}` |
 //! | `col.insert` / `col.delete` | `{at,count?,sheet?}` | `{inserted\|deleted}` |
 //! | `cell.format` | `{range,patch,sheet?}` | `{formatted}` — one undo group; `patch` keys: `numFmt`/`bold`/`italic`/`fontColor`/`fillColor`/`align` (≥1 required) |
-//! | `col.width` | `{col,width,sheet?}` | `{col,width}` — NOT on the undo stack (mirrors the TUI's F7/F8, which mutate directly) |
+//! | `col.width` | `{col,width,sheet?}` | `{col,width}` — NOT on the undo stack (mirrors the TUI's F7/F8, which mutate directly); a protected sheet is refused |
 //! | `page.setup` | `{sheet?\|sheets?, …fields}` | the sheet's page layout. Settable fields: `margins:{left,right,top,bottom,header,footer}` (inches), `paperSize`, `orientation`, `scale`, `fitToPage`, `fitToWidth`, `fitToHeight` (0 = Automatic), `firstPageNumber` (`null` = Auto), `pageOrder`, `blackAndWhite`, `draft`, `cellComments`, `errors`, `gridLines`, `headings`, `horizontalCentered`, `verticalCentered`, `differentOddEven`, `differentFirst`, `scaleWithDoc`, `alignWithMargins`. Reply-only: `headers:{oddHeader…firstFooter}` (stored codes; set with `page.header`), `printArea` (`print-area.*`), `printTitles:{rows,cols}` (`print-titles.set`), `rowBreaks`, `colBreaks` (`page-break.*`). Any settable field given sets it (+ `changed`): a fit count turns `fitToPage` on and `scale` turns it off unless `fitToPage` is given; scale outside 10–400 is refused. With `sheets`, the first sheet's page setup is then copied to the others (grouped sheets: not print areas, titles or header pictures). One undo step |
 //! | `page.header` | `{sheet?, kind?:odd\|even\|first, part?:header\|footer, left?, center?, right?}` | `{stored, left, center, right, changed}` — sections in the editor's form (`&[Page]`, `&[Pages]`, `&[Date]`, `&[Time]`, `&[Path]`, `&[File]`, `&[Tab]`), stored as Excel's codes; with none of left/center/right it only reads; a section over 255 characters is refused; `&[Picture]` only where the section already has a picture; `&L`, `&C` or `&R` inside a section is refused (a literal ampersand is `&&`). One undo step |
 //! | `print-area.set` / `print-area.add` | `{range, sheet?}` | `{printArea, changed}` — `range` is `A1:C10`, `A1:C10,E1:F5`, `A:C` or `1:5`; add appends to the sheet's print area. One undo step |
@@ -1959,7 +1959,8 @@ fn col_arg(args: &Json) -> Result<u32, String> {
 /// Set one column's display width — directly, like the TUI's own F7/F8
 /// width-adjust keys, which mutate `Sheet::set_col_width` without pushing
 /// onto the undo stack (empirically: no `self.undo.push` on that path in
-/// `main.rs`). This verb mirrors that: NOT on the undo/redo stack.
+/// `main.rs`). This verb mirrors that: NOT on the undo/redo stack. A
+/// protected sheet is refused, as F7/F8 refuse it (#1351, #1353).
 fn col_width(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
     let col = col_arg(args)?;
@@ -1969,6 +1970,9 @@ fn col_width(app: &mut App, args: &Json) -> Result<Json, String> {
         .ok_or("col.width needs a 'width' number")?;
     if !(width.is_finite() && width > 0.0) {
         return Err("col.width: 'width' must be positive".to_string());
+    }
+    if app.pkg.workbook.sheets[si].is_protected() {
+        return Err("col.width: the sheet is protected".into());
     }
     app.pkg.workbook.sheets[si].set_col_width(col, width);
     app.modified = true;
@@ -5487,6 +5491,52 @@ mod tests {
         .unwrap();
         assert_eq!(a.undo.len(), undo_depth_before);
         assert!(a.modified);
+    }
+
+    /// #1353: a protected sheet refuses col.width the way range.flash-fill
+    /// does: an error, the width and `modified` untouched.
+    #[test]
+    fn col_width_is_refused_on_a_protected_sheet() {
+        let mut a = app();
+        let w = a.pkg.workbook.sheets[0].col_width(0);
+        a.pkg.workbook.sheets[0].set_protected(true);
+        a.modified = false;
+        let err = dispatch(
+            &mut a,
+            "col.width",
+            &Json::obj(vec![
+                ("col", Json::Str("A".into())),
+                ("width", Json::Num(20.0)),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(err, "col.width: the sheet is protected");
+        assert_eq!(a.pkg.workbook.sheets[0].col_width(0), w);
+        assert!(!a.modified);
+    }
+
+    /// #1353: the refusal is per target sheet, as flash-fill's `si` — an
+    /// unprotected sheet named by `sheet` succeeds while the active one is
+    /// protected.
+    #[test]
+    fn col_width_on_an_unprotected_sheet_is_allowed_while_the_active_one_is_protected() {
+        let mut a = app();
+        a.pkg.add_sheet("Beta");
+        a.sheet = 0;
+        let w0 = a.pkg.workbook.sheets[0].col_width(0);
+        a.pkg.workbook.sheets[0].set_protected(true);
+        dispatch(
+            &mut a,
+            "col.width",
+            &Json::obj(vec![
+                ("col", Json::Str("A".into())),
+                ("width", Json::Num(20.0)),
+                ("sheet", Json::Num(1.0)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(a.pkg.workbook.sheets[1].col_width(0), 20.0);
+        assert_eq!(a.pkg.workbook.sheets[0].col_width(0), w0);
     }
 
     // -----------------------------------------------------------------
