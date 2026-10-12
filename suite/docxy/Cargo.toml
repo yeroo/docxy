@@ -45,6 +45,9 @@ dirs = "5"
 # GPUI's default windows-manifest feature already selects that assembly.
 rfd = { version = "0.15", features = ["common-controls-v6"] }
 rust-embed = "8"
+# Grapheme-cluster boundaries for caret moves and deletion in dialog fields
+# (dialog.rs, dialog_host.rs); the terminal docxy crate uses it the same way.
+unicode-segmentation = "1.13"
 
 # The plain AppKit menu bar a native dialog runs under (#1071, macos_menu.rs),
 # and the RTF a copy adds to the pasteboard (#1074, rich_clip.rs).

@@ -761,6 +761,66 @@ fn paste_inserts_at_the_caret_by_characters() {
     assert_eq!(s.top().unwrap().caret_at(), 3);
 }
 
+/// Backspace removes a whole grapheme cluster, not one scalar: an NFD name
+/// keeps no dangling letter, and a skin-tone emoji and a ZWJ family each go
+/// at once (#1035).
+#[test]
+fn backspace_removes_a_whole_grapheme_cluster() {
+    let mut s = focused_on_name();
+    let d = s.top_dialog_mut().unwrap();
+    d.select_all();
+    d.insert_text("Jose\u{301}").unwrap();
+    d.backspace().unwrap();
+    assert_eq!(text(&s, "name"), "Jos", "the accent stays with its letter");
+    let d = s.top_dialog_mut().unwrap();
+    d.select_all();
+    d.insert_text("a\u{1F44D}\u{1F3FD}").unwrap();
+    d.backspace().unwrap();
+    assert_eq!(text(&s, "name"), "a", "the skin tone stays with the hand");
+    let d = s.top_dialog_mut().unwrap();
+    d.select_all();
+    d.insert_text("a\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}")
+        .unwrap();
+    d.backspace().unwrap();
+    assert_eq!(text(&s, "name"), "a", "the whole family goes at once");
+}
+
+/// Left/Right and Delete step over a grapheme cluster: a flag is two scalars
+/// but one cluster, so the caret lands on 1 and 3, never inside it (#1035).
+#[test]
+fn delete_and_arrows_step_over_a_flag() {
+    let mut s = focused_on_name();
+    let d = s.top_dialog_mut().unwrap();
+    d.select_all();
+    d.insert_text("a\u{1F1EB}\u{1F1F7}b").unwrap();
+    let d = s.top_dialog_mut().unwrap();
+    d.move_caret_edge(false, false);
+    assert_eq!(d.caret_at(), 0);
+    d.move_caret(true, false);
+    assert_eq!(d.caret_at(), 1);
+    d.move_caret(true, false);
+    assert_eq!(d.caret_at(), 3, "over the flag, not into it");
+    d.move_caret(false, false);
+    assert_eq!(d.caret_at(), 1);
+    d.delete().unwrap();
+    assert_eq!(text(&s, "name"), "ab");
+}
+
+/// Shift+arrows extend the selection by whole clusters: the accented "e" of
+/// "Jose\u{301}" selects as one unit (#1035).
+#[test]
+fn shift_arrows_select_whole_clusters() {
+    let mut s = focused_on_name();
+    let d = s.top_dialog_mut().unwrap();
+    d.select_all();
+    d.insert_text("Jose\u{301}").unwrap();
+    let d = s.top_dialog_mut().unwrap();
+    d.move_caret_edge(true, false);
+    d.move_caret(false, true);
+    assert_eq!(d.selection(), Some((3, 5)));
+    assert_eq!(d.selected_text().as_deref(), Some("e\u{301}"));
+}
+
 /// Ctrl+C copies the selected characters of the focused field, and nothing
 /// without a selection (#1029).
 #[test]
