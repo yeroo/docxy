@@ -508,9 +508,10 @@ whole row, like Project's row header) selects too, and any other key, click
 or command clears it. Delete over a range clears whichever of Name,
 Predecessors and Resource Names the range covers, for every non-blank task
 in it, as one undo step — what Ctrl+X does, without the clipboard — and
-never deletes a task; a whole-row selection (an ID click, or a range across
-every column) is the row header's: Delete deletes the cursor's task as
-before. With no range, Delete still acts on the cursor's cell only (#1260).
+never deletes a task; a row selection made on the ID cells (a click or a
+drag there) is the row header's: Delete deletes the cursor's task as before;
+any other range, even across every column, only clears cells. With no range,
+Delete still acts on the cursor's cell only (#1260).
 Ctrl+C copies the range as TSV — one line per shown
 row, each field a cell's edit text with tabs and line breaks inside a field
 turned to spaces — and Ctrl+X copies it, then clears whichever of Name,

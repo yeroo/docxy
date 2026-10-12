@@ -173,6 +173,9 @@ impl ProjectView {
         if !matches!(key, "up" | "down" | "left" | "right" | "home" | "end") {
             return false;
         }
+        // A Shift key reshapes whatever the ID press selected: it is a cell
+        // range now, not the row header's.
+        self.row_header = false;
         if self.on_entry_row() {
             return true;
         }
@@ -589,6 +592,7 @@ pub(crate) fn project_cell_press(tab: &mut DocTab, row: usize, col: usize, shift
             if let Some(cursor) = v.selected_uid() {
                 v.anchor = Some((cursor, v.col));
             }
+            v.row_header = false;
             v.select_row(row);
             v.col = col;
             v.drag_made_range = v.anchor.is_some();
@@ -597,6 +601,7 @@ pub(crate) fn project_cell_press(tab: &mut DocTab, row: usize, col: usize, shift
             // Extending onto the entry row selects nothing; the old anchor
             // does not survive either.
             v.anchor = None;
+            v.row_header = false;
             v.enter_entry_row();
             v.col = col;
             v.drag_made_range = false;
@@ -604,6 +609,7 @@ pub(crate) fn project_cell_press(tab: &mut DocTab, row: usize, col: usize, shift
         (false, Some(uid)) if col == COL_ID => {
             v.anchor = Some((uid, COLUMN_COUNT - 1));
             v.row_drag = true;
+            v.row_header = true;
             v.select_row(row);
             v.col = COL_ID;
             v.drag_made_range = true;
@@ -614,6 +620,7 @@ pub(crate) fn project_cell_press(tab: &mut DocTab, row: usize, col: usize, shift
             // the cursor, which is no range at all.
             v.anchor = uid.map(|uid| (uid, col));
             v.row_drag = false;
+            v.row_header = false;
             if uid.is_some() {
                 v.select_row(row);
             } else {
