@@ -12103,17 +12103,31 @@ impl Docxy {
         // character ⌥ made on macOS reaches it as plain typing, since a field
         // swallows ⌥ keys (#1162); Windows' AltGr text comes by WM_CHAR.
         let stroke = text_input::dialog_stroke(ev, text_input::MACOS);
-        if self.dialog_takes_key(
+        self.modal_takes_stroke(
             &stroke.key,
             stroke.key_char.as_deref(),
             stroke.modifiers,
             window,
             cx,
-        ) {
+        )
+    }
+
+    /// `modal_takes_key` for a key already resolved to (key, typed text,
+    /// modifiers): what the action-bound Tab and Shift+Tab use, since gpui
+    /// hands them no `KeyDownEvent` (#1037).
+    fn modal_takes_stroke(
+        &mut self,
+        key: &str,
+        typed: Option<&str>,
+        m: Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.dialog_takes_key(key, typed, m, window, cx) {
             return true;
         }
         if self.tab_more_open {
-            if ev.keystroke.key == "escape" {
+            if key == "escape" {
                 self.tab_more_close(cx);
             }
             return true; // the modal list owns keys; do not edit the surface below
@@ -22457,11 +22471,9 @@ impl Docxy {
     /// Insert a tab at the caret (bound to the Tab key via an action, since gpui
     /// swallows Tab for focus traversal before on_key_down sees it).
     fn tab_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // An open dialog takes Tab too; see `modal_takes_key`.
-        if self.dialog_takes_key("tab", None, Modifiers::default(), window, cx) {
-            return;
-        }
-        if self.tab_more_open {
+        // An open dialog or the more-tabs list takes Tab too; see
+        // `modal_takes_key`.
+        if self.modal_takes_stroke("tab", None, Modifiers::default(), window, cx) {
             return;
         }
         // File (backstage) covers the window; Tab there edits nothing under it.
@@ -22583,10 +22595,7 @@ impl Docxy {
             shift: true,
             ..Modifiers::default()
         };
-        if self.dialog_takes_key("tab", None, shift, window, cx) {
-            return;
-        }
-        if self.tab_more_open {
+        if self.modal_takes_stroke("tab", None, shift, window, cx) {
             return;
         }
         // File (backstage) covers the window; Tab there edits nothing under it.
@@ -33170,66 +33179,20 @@ impl Docxy {
         // it (#1028): a page taller than the window scrolls instead of being
         // clipped. The pane takes its natural height inside, so the
         // container's `max_offset` is the overflow the harness reports.
-        let rail_col = div()
-            .id("backstage-rail")
-            .relative()
-            .w(px(220.))
-            .h_full()
-            .min_h(px(0.))
-            .flex_shrink_0()
-            .bg(sidebar)
-            .child(probe(&self.probes, "backstage-rail"))
-            .child(
-                div()
-                    .id("backstage-rail-scroll")
-                    .size_full()
-                    .min_h(px(0.))
-                    .overflow_y_scroll()
-                    .track_scroll(&self.bs_rail_scroll)
-                    .child(rail),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .right_0()
-                    .bottom_0()
-                    .w(px(12.))
-                    .child(
-                        gpui_component::scroll::Scrollbar::vertical(&self.bs_rail_scroll)
-                            .scrollbar_show(gpui_component::scroll::ScrollbarShow::Always),
-                    ),
-            );
-        let content_col = div()
-            .id("backstage-content")
-            .relative()
-            .flex_1()
-            .h_full()
-            .min_h(px(0.))
-            .min_w(px(0.))
-            .bg(bg)
-            .child(probe(&self.probes, "backstage-content"))
-            .child(
-                div()
-                    .id("backstage-content-scroll")
-                    .size_full()
-                    .min_h(px(0.))
-                    .overflow_y_scroll()
-                    .track_scroll(&self.bs_scroll)
-                    .child(pane),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .right_0()
-                    .bottom_0()
-                    .w(px(12.))
-                    .child(
-                        gpui_component::scroll::Scrollbar::vertical(&self.bs_scroll)
-                            .scrollbar_show(gpui_component::scroll::ScrollbarShow::Always),
-                    ),
-            );
+        let rail_col = self.backstage_scroll_column(
+            div().w(px(220.)).flex_shrink_0().bg(sidebar),
+            "backstage-rail",
+            "backstage-rail-scroll",
+            &self.bs_rail_scroll,
+            rail,
+        );
+        let content_col = self.backstage_scroll_column(
+            div().flex_1().min_w(px(0.)).bg(bg),
+            "backstage-content",
+            "backstage-content-scroll",
+            &self.bs_scroll,
+            pane,
+        );
         h_flex()
             .size_full()
             .min_h(px(0.))
@@ -33237,6 +33200,47 @@ impl Docxy {
             .child(rail_col)
             .child(content_col)
             .into_any_element()
+    }
+
+    /// One Backstage column (#1028): `col`'s size and background, a scroll
+    /// container tracking `handle` around `child`, and an always-shown 12px
+    /// scrollbar over its right edge. `id` names the column and its probe;
+    /// `scroll_id` names the scroll container (by convention `{id}-scroll`,
+    /// which the harness's regions rely on).
+    fn backstage_scroll_column(
+        &self,
+        col: Div,
+        id: &'static str,
+        scroll_id: &'static str,
+        handle: &ScrollHandle,
+        child: impl IntoElement,
+    ) -> Stateful<Div> {
+        col.id(id)
+            .relative()
+            .h_full()
+            .min_h(px(0.))
+            .child(probe(&self.probes, id))
+            .child(
+                div()
+                    .id(scroll_id)
+                    .size_full()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .track_scroll(handle)
+                    .child(child),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .w(px(12.))
+                    .child(
+                        gpui_component::scroll::Scrollbar::vertical(handle)
+                            .scrollbar_show(gpui_component::scroll::ScrollbarShow::Always),
+                    ),
+            )
     }
 }
 

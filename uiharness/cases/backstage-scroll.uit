@@ -108,6 +108,20 @@ test keys pressed in the Backstage do not reach the hidden tab
   assert dialog is none
   assert title is basic.docx
 
+# Tab and Shift+Tab are action-bound (#1037): they reach `tab_key` and
+# `shift_tab_key`, not `on_key`, and on the File screen they edit nothing
+# under it, like every other key there (#1027). `assert dirty` proves the
+# document stayed untouched; `page is open` proves the screen is still up.
+test Tab and Shift+Tab on the File screen edit nothing
+  open ../fixtures/basic.docx
+  call backstage {"action":"open"}
+  shot window
+  key tab
+  key shift+tab
+  assert dirty is false
+  call backstage-layout {}
+  assert reply.page is open
+
 # The window cannot be shorter than 420 (`window_min_size`), and the rail's
 # items (Account included) overflow that, so the rail must scroll: it is not at
 # its end until the wheel takes it there.
