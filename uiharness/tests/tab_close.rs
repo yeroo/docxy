@@ -50,9 +50,9 @@ fn tab_close_driver_preserves_work_and_persists_removals() {
     let sandbox = run.dir().join("sandbox");
     let exe = launch::find_suite(None).unwrap();
     let app = launch::launch(&exe, &sandbox).unwrap();
-    let driver = Driver::connect(&app.ctl_dir(), None).unwrap();
+    let mut driver = Driver::connect(&app.ctl_dir(), None).unwrap();
     let script = parse_script(include_str!("../cases/tab-close.uit")).unwrap();
-    let outcome = Runner::new(&driver, &run, root.join("cases"), &sandbox).run_script(&script);
+    let outcome = Runner::new(&mut driver, &run, root.join("cases"), &sandbox).run_script(&script);
     println!("{}", outcome.report());
     assert!(outcome.passed(), "{}", outcome.report());
     assert!(
