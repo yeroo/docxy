@@ -1559,8 +1559,10 @@ types into it. The sheet's are typed into by the hand-written
 `doc-inputs-typing.uit` (#1201), in the same one-input-one-step shape, and
 the sheet tab's rename by `backstage-inputs-typing.uit` (#1202), which also
 pins why Backstage's own are not typed into: Save As's file name is the OS's
-file dialog, and File > Info has no properties yet (#1364). See
-`qa/inputs-typing.md`.
+file dialog, and File > Info has no properties yet (#1364). Project's grid
+cell editor and Task > Information...'s constraint prompt are typed into by
+`project-inputs-typing.uit` (#1203); the suite has no Task Information
+dialog yet (#1368). See `qa/inputs-typing.md`.
 
 ## The isolation guarantee
 
