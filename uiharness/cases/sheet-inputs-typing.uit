@@ -569,6 +569,9 @@ test sheet sheet-find: Escape closes the bar
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-find"}
   call real-type {"text":"West"}
+  call field-read {"input":"sheet-find"}
+  assert reply.focused is true
+  assert reply.value is exactly West
   call real-key {"key":"escape"}
   assert find_open is false
   assert sel is E1
@@ -791,6 +794,9 @@ test sheet sheet-replace: Escape closes the bar
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
   call real-type {"text":"Ab1"}
+  call field-read {"input":"sheet-replace"}
+  assert reply.focused is true
+  assert reply.value is exactly Ab1
   call real-key {"key":"escape"}
   assert find_open is false
   assert dirty is false

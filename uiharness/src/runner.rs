@@ -406,10 +406,7 @@ impl<'a> Runner<'a> {
                 } else {
                     fail(
                         out,
-                        format!(
-                            "expected: {key} is {}{value}\nobserved: {key} is {got}",
-                            if *negated { "not " } else { "" }
-                        ),
+                        mismatch_text(key, *negated, *exact, value, &got, false),
                     )
                 }
             }
@@ -427,15 +424,7 @@ impl<'a> Runner<'a> {
                     } else {
                         fail(
                             out,
-                            format!(
-                                "expected: {cell} is {}{value}\nobserved: {cell} is {}",
-                                if *negated { "not " } else { "" },
-                                if got.is_empty() {
-                                    "empty".to_string()
-                                } else {
-                                    got
-                                }
-                            ),
+                            mismatch_text(cell, *negated, *exact, value, &got, true),
                         )
                     }
                 }
@@ -647,6 +636,27 @@ pub fn value_matches(observed: &str, expected: &str, negated: bool) -> bool {
     same != negated
 }
 
+/// What a failed `<subject> is [not] [exactly] <value>` reports. An exact
+/// one (#1200) quotes both values, so a case or a space that differs shows;
+/// otherwise a cell's empty text reads `empty`, as a case writes it.
+pub fn mismatch_text(
+    subject: &str,
+    negated: bool,
+    exact: bool,
+    expected: &str,
+    got: &str,
+    cell: bool,
+) -> String {
+    let not = if negated { "not " } else { "" };
+    if exact {
+        return format!(
+            "expected: {subject} is {not}exactly {expected:?}\nobserved: {subject} is {got:?}"
+        );
+    }
+    let got = if cell && got.is_empty() { "empty" } else { got };
+    format!("expected: {subject} is {not}{expected}\nobserved: {subject} is {got}")
+}
+
 /// [`value_matches`], or with `exact` (`is exactly`, #1200) the text as
 /// written: case, surrounding spaces and all, with no word for `null`.
 pub fn value_matches_as(observed: &str, expected: &str, negated: bool, exact: bool) -> bool {
@@ -808,6 +818,27 @@ mod tests {
         assert!(
             value_matches_as("ab1", "Ab1", false, false),
             "not exact folds case"
+        );
+    }
+
+    /// #1200 r2: an exact mismatch says `exactly` and quotes both sides.
+    #[test]
+    fn an_exact_mismatch_quotes_both_values() {
+        assert_eq!(
+            mismatch_text("reply.value", false, true, "Ab1 ", "ab1", false),
+            "expected: reply.value is exactly \"Ab1 \"\nobserved: reply.value is \"ab1\""
+        );
+        assert_eq!(
+            mismatch_text("E1", true, true, "x", "", true),
+            "expected: E1 is not exactly \"x\"\nobserved: E1 is \"\""
+        );
+        assert_eq!(
+            mismatch_text("E1", false, false, "x", "", true),
+            "expected: E1 is x\nobserved: E1 is empty"
+        );
+        assert_eq!(
+            mismatch_text("sel", true, false, "A1", "A1", false),
+            "expected: sel is not A1\nobserved: sel is A1"
         );
     }
 
