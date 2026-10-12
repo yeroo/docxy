@@ -413,11 +413,13 @@ pub struct Task {
     /// Project commitment type, 0..=2.
     pub commitment_type: Option<i32>,
     /// Work (minutes), Cost and OverAllocated as Project last calculated
-    /// them. docxy never computes them whole: they stay as read until an edit
-    /// changes the task's assignments (or a subtask's), or moves a subtask
-    /// in or out of the task in the outline; then totals move by the change
-    /// in assignment totals and the moved task's own fixed cost, with work
-    /// counting work resources only (`assign::refresh`). An absent one stays absent.
+    /// them. They stay as read until an edit changes the task's assignments
+    /// (or a subtask's), or moves a subtask in or out of the task in the
+    /// outline; then totals move by the change in assignment totals and the
+    /// moved task's own fixed cost, with work counting work resources only
+    /// (`assign::refresh`). docxy computes one whole only to fill an absent
+    /// one such an edit moves (a cost only when every cost in it is known);
+    /// one no edit moves stays absent.
     pub work_min: Option<i64>,
     pub cost: Option<Rate>,
     /// This task's own fixed cost in hundredths; summary fixed costs are

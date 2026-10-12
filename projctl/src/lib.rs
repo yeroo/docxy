@@ -2054,6 +2054,34 @@ mod tests {
     }
 
     #[test]
+    fn task_add_then_assign_fills_task_work_and_cost() {
+        use projcore::model::TaskType;
+        let mut ed = staffed(TaskType::FixedUnits, false);
+        let get = r#"{"uid":2,"fields":["Work","Cost"]}"#;
+        let added = run(&mut ed, "task.add", r#"{"name":"New","duration":"5d"}"#).unwrap();
+        assert_eq!(num(&added, "uid"), 2.0);
+        let task = run(&mut ed, "task.get", get).unwrap();
+        assert_eq!(field(&task, "Work").1, &Json::Null);
+        assert_eq!(field(&task, "Cost").1, &Json::Null);
+
+        let ann = run(&mut ed, "assign.add", r#"{"task":2,"resource":"Ann"}"#).unwrap();
+        let task = run(&mut ed, "task.get", get).unwrap();
+        assert_eq!(field(&task, "Work"), ("40 hrs", &Json::Num(2400.0)));
+        assert_eq!(field(&task, "Cost"), ("$2,000.00", &Json::Num(2000.0)));
+
+        // Filled totals move by delta from then on, down to zero.
+        let del = format!(r#"{{"uid":{}}}"#, num(&ann, "uid"));
+        run(&mut ed, "assign.del", &del).unwrap();
+        let task = run(&mut ed, "task.get", get).unwrap();
+        assert_eq!(field(&task, "Work"), ("0 hrs", &Json::Num(0.0)));
+        assert_eq!(field(&task, "Cost"), ("$0.00", &Json::Num(0.0)));
+        // Task 1, untouched, keeps its stored zero totals.
+        let one = run(&mut ed, "task.get", r#"{"uid":1,"fields":["Work","Cost"]}"#).unwrap();
+        assert_eq!(field(&one, "Work"), ("0 hrs", &Json::Num(0.0)));
+        assert_eq!(field(&one, "Cost"), ("$0.00", &Json::Num(0.0)));
+    }
+
+    #[test]
     fn an_assignment_reads_its_custom_fields() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <Project xmlns="http://schemas.microsoft.com/project">
