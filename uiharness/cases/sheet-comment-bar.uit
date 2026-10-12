@@ -51,3 +51,58 @@ test enter still writes to the anchor
   key enter
   assert comment_edit is null
   assert comment is Kept
+
+# A drag's press leaves the bar: the harness drag verb runs grid_press_cell
+# and never cell_click, so the press-time leave is the only one.
+test a drag leaves the bar on the press
+  open copy:../fixtures/basic.xlsx
+  click A1
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  type X
+  drag B2 -> D5
+  assert comment_cell is null
+  click A1
+  assert comment is X
+
+test a right-click leaves the bar before the cell menu
+  open copy:../fixtures/basic.xlsx
+  click A1
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  type R
+  call menu-open {"target":{"cell":"C5"}}
+  assert comment_cell is null
+  key escape
+  click A1
+  assert comment is R
+
+test next comment leaves the bar before moving
+  open copy:../fixtures/basic.xlsx
+  click A1
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  type N
+  call ribbon-click {"tab":"Review","command":"Next"}
+  assert comment_cell is null
+  assert sel is A1
+  assert comment is N
+
+# Go To is a move that leaves the bar open: the selection goes to C9 while
+# the anchor stays A1, and the later click's leave still writes the note to
+# the anchor, not the live selection.
+test go to moves the selection but the note lands on the anchor
+  open copy:../fixtures/basic.xlsx
+  click A1
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  type G
+  call menu-open {"target":{"ribbon":["Home","Editing","Find & Select"]}}
+  call menu-click {"label":"Go To…"}
+  assert dialog is goto
+  call dialog-set {"control":"reference","value":"C9"}
+  call dialog-click {"button":"OK"}
+  assert sel is C9
+  assert comment_cell is A1
+  assert comment_edit is G
+  click C5
+  assert comment_cell is null
+  assert comment is null
+  click A1
+  assert comment is G
