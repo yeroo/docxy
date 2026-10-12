@@ -37796,8 +37796,15 @@ fn sheet_el(
                 .child(div().w(px(1.)).h(px(12.)).bg(hsla_u(BRAND)));
         } else {
             let ent_sel = ent.clone();
+            // The active tab's name is probed where `pointer-click {"input":
+            // "sheet-tab-rename"}` double-clicks it (#1202): on the name, clear
+            // of the × beside it.
+            let mut name = div().child(SharedString::from(s.name.clone()));
+            if active {
+                name = name.relative().child(probe(probes, "sheet-tab-name"));
+            }
             tab = tab
-                .child(div().child(SharedString::from(s.name.clone())))
+                .child(name)
                 .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                     // Double-click renames; single-click selects.
                     let dbl = ev.click_count >= 2;

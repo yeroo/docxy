@@ -9,12 +9,16 @@
 //! `uiharness/cases/sheet-inputs-typing.uit`. So are the document's
 //! (#1201): the Find bar's Find and Replace fields, Home's Font and Font
 //! Size boxes and the comment editor, for
-//! `uiharness/cases/doc-inputs-typing.uit`.
+//! `uiharness/cases/doc-inputs-typing.uit`. So is the sheet tab's inline
+//! rename (#1202), for `uiharness/cases/backstage-inputs-typing.uit`, which
+//! also pins why Backstage's are not typed into: Save As's file name is the
+//! OS's file dialog, and File > Info has no properties yet (#1364).
 //! Unlike the dialog catalogue, nothing finds a new input added outside
 //! this list: it is kept by review (`qa/inputs-typing.md`). The sheet's Name
 //! Box is display-only today (#1200 lists what it lacks), the suite has no
-//! Styles gallery search or tab rename, and Settings' only typed values are
-//! in the User name dialog, which the catalogue lists.
+//! Styles gallery search and no document tab or title-bar rename, and
+//! Settings' only typed values are in the User name and Custom Lists
+//! dialogs, which the catalogue lists.
 
 use ctlcore::json::Json;
 use gpui::{Pixels, Point};
@@ -41,6 +45,17 @@ impl Surface {
     }
 }
 
+/// Whether the harness can reach an input at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reach {
+    /// Drawn by the suite, where `pointer-click` can press it.
+    Harness,
+    /// The OS draws it, in a dialog a harness instance never opens: why.
+    Native(&'static str),
+    /// The suite does not have it yet: the issue that adds it.
+    Missing(u32),
+}
+
 /// One input.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Input {
@@ -51,6 +66,7 @@ pub(crate) struct Input {
     pub surface: Surface,
     /// The issue that types into it with real keys.
     pub covered_by: u32,
+    pub reach: Reach,
 }
 
 const SHEET: u32 = 1200;
@@ -65,8 +81,26 @@ const fn input(id: &'static str, name: &'static str, surface: Surface, covered_b
         name,
         surface,
         covered_by,
+        reach: Reach::Harness,
     }
 }
+
+/// A Backstage input the harness cannot reach, and why.
+const fn unreachable_input(id: &'static str, name: &'static str, reach: Reach) -> Input {
+    Input {
+        reach,
+        ..input(id, name, Surface::Backstage, BACKSTAGE)
+    }
+}
+
+/// Backstage > Save As, F12, Export > Change File Type and the first Save of
+/// a new document all open `rfd`'s file dialog, which a harness instance
+/// refuses: its modal loop stops the control pipe.
+const SAVE_AS_NATIVE: &str = "Save As's file name is the OS's file dialog, \
+     which a harness instance never opens; see qa/inputs-typing.md";
+
+/// The issue that adds File > Info's properties.
+const INFO_PROPERTIES: u32 = 1364;
 
 static REGISTRY: &[Input] = &[
     input("formula-bar", "the formula bar", Surface::Sheet, SHEET),
@@ -122,28 +156,30 @@ static REGISTRY: &[Input] = &[
     ),
     input("comment-editor", "the comment editor", Surface::Doc, DOC),
     input(
+        "sheet-tab-rename",
+        "the sheet tab's inline rename",
+        Surface::Sheet,
+        BACKSTAGE,
+    ),
+    unreachable_input(
         "save-as-name",
         "Save As's file name",
-        Surface::Backstage,
-        BACKSTAGE,
+        Reach::Native(SAVE_AS_NATIVE),
     ),
-    input(
+    unreachable_input(
         "info-title",
         "Info's Title property",
-        Surface::Backstage,
-        BACKSTAGE,
+        Reach::Missing(INFO_PROPERTIES),
     ),
-    input(
+    unreachable_input(
         "info-tags",
         "Info's Tags property",
-        Surface::Backstage,
-        BACKSTAGE,
+        Reach::Missing(INFO_PROPERTIES),
     ),
-    input(
+    unreachable_input(
         "info-author",
         "Info's Author property",
-        Surface::Backstage,
-        BACKSTAGE,
+        Reach::Missing(INFO_PROPERTIES),
     ),
     input(
         "project-cell",
@@ -187,8 +223,8 @@ pub(crate) fn registry() -> &'static [Input] {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Press {
     pub at: Point<Pixels>,
-    /// A double-click: the in-cell editor opens on one, as it does for a
-    /// person.
+    /// A double-click: the in-cell editor and the sheet tab's rename open on
+    /// one, as they do for a person.
     pub double: bool,
 }
 
@@ -198,6 +234,19 @@ fn find(id: &str) -> Result<&'static Input, String> {
         let ids: Vec<&str> = registry().iter().map(|i| i.id).collect();
         format!("unknown input '{id}'; inputs: {}", ids.join(", "))
     })
+}
+
+/// Why the harness cannot reach `i`, if it cannot: the OS draws it, or the
+/// suite does not have it yet.
+fn unreachable(i: &Input) -> Option<String> {
+    match i.reach {
+        Reach::Harness => None,
+        Reach::Native(why) => Some(why.into()),
+        Reach::Missing(issue) => Some(format!(
+            "File > Info has no {} yet, see #{issue}",
+            i.name.trim_start_matches("Info's ")
+        )),
+    }
 }
 
 /// The answer for an input whose slice has not landed.
@@ -221,6 +270,7 @@ fn sheet_probe(id: &str) -> Option<&'static str> {
         "sheet-replace" => Some("sf-r"),
         "sheet-font" => Some("sheet-combo:font-name"),
         "sheet-font-size" => Some("sheet-combo:font-size"),
+        "sheet-tab-rename" => Some("sheet-tab-name"),
         _ => None,
     }
 }
@@ -240,11 +290,16 @@ fn doc_probe(id: &str) -> Option<&'static str> {
 /// Where `pointer-click {"input":id}` presses, from the frame on screen.
 /// A sheet input is pressed here: the in-cell editor is a double-click on
 /// the active cell, which opens it, refused while an entry is open, where a
-/// click on the cell would commit it. A document input goes to
-/// [`press_doc`]. Backstage, Project and terminal inputs answer which issue
+/// click on the cell would commit it; the sheet tab's rename is a
+/// double-click on the active tab's name, refused while a rename is open. A
+/// document input goes to [`press_doc`]. A Backstage input says why the
+/// harness cannot reach it; Project and terminal inputs answer which issue
 /// makes them targetable.
 pub(crate) fn press(app: &crate::Docxy, id: &str) -> Result<Press, String> {
     let i = find(id)?;
+    if let Some(why) = unreachable(i) {
+        return Err(why);
+    }
     match i.surface {
         Surface::Sheet => {}
         Surface::Doc => return press_doc(app, i),
@@ -263,6 +318,11 @@ pub(crate) fn press(app: &crate::Docxy, id: &str) -> Result<Press, String> {
             double: true,
         });
     };
+    // A double-click opens the rename, as it does for a person.
+    let rename = id == "sheet-tab-rename";
+    if rename && app.sheet_rename.is_some() {
+        return Err("the sheet tab's rename is already open".into());
+    }
     let bounds = app.probes.borrow().on_screen(probe);
     let b = bounds.ok_or_else(|| match id {
         "sheet-find" | "sheet-replace" => {
@@ -275,7 +335,7 @@ pub(crate) fn press(app: &crate::Docxy, id: &str) -> Result<Press, String> {
     })?;
     Ok(Press {
         at: b.center(),
-        double: false,
+        double: rename,
     })
 }
 
@@ -304,16 +364,22 @@ fn press_doc(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
 }
 
 /// `field-read {"input":id}`: a sheet input as it is edited and drawn (a
-/// document input goes to [`read_doc`]; Backstage, Project and terminal
-/// inputs answer which issue makes them readable), in the shape of a dialog
+/// document input goes to [`read_doc`]; a Backstage input says why the
+/// harness cannot reach it, and Project and terminal inputs answer which
+/// issue makes them readable), in the shape of a dialog
 /// field's (`value`, `focused`, `caret` and `selection` in chars, `null`
 /// while it has no focus). The formula bar and the in-cell
 /// editor are one buffer, so both are focused while a cell is being edited:
-/// nothing records which one the edit began in. The Find bar's fields append
-/// and pop only, so a focused one's caret is its end. The Name Box and the
-/// Font combos never take the focus today: they read what they draw.
+/// nothing records which one the edit began in. The Find bar's fields and
+/// the sheet tab's rename append and pop only, so a focused one's caret is
+/// its end; the rename reads the active sheet's name while it is closed. The
+/// Name Box and the Font combos never take the focus today: they read what
+/// they draw.
 pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
     let i = find(id)?;
+    if let Some(why) = unreachable(i) {
+        return Err(why);
+    }
     match i.surface {
         Surface::Sheet => {}
         Surface::Doc => return read_doc(app, i),
@@ -375,6 +441,23 @@ pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
             let value = combo_value(cmd).ok_or_else(|| format!("no combo '{cmd}'"))?;
             (Json::Str(value.into()), false, Json::Null, Json::Null)
         }
+        "sheet-tab-rename" => match &app.sheet_rename {
+            Some((_, buf)) => (
+                Json::Str(buf.clone()),
+                true,
+                num(buf.chars().count()),
+                Json::Null,
+            ),
+            None => {
+                let name = v.pkg.workbook.sheets.get(v.active).map(|s| s.name.clone());
+                (
+                    name.map_or(Json::Null, Json::Str),
+                    false,
+                    Json::Null,
+                    Json::Null,
+                )
+            }
+        },
         _ => return Err(not_covered(i)),
     };
     Ok(field_json(id, value, focused, caret, selection))
@@ -470,7 +553,9 @@ mod tests {
                 i.id,
                 i.covered_by
             );
+            // A rename is #1202's, wherever it is drawn.
             let want = match i.surface {
+                _ if i.id == "sheet-tab-rename" => BACKSTAGE,
                 Surface::Sheet => SHEET,
                 Surface::Doc => DOC,
                 Surface::Backstage => BACKSTAGE,
@@ -499,11 +584,46 @@ mod tests {
                 "sheet-find",
                 "sheet-replace",
                 "sheet-font",
-                "sheet-font-size"
+                "sheet-font-size",
+                "sheet-tab-rename"
             ]
         );
         for id in sheet {
             assert_eq!(sheet_probe(id).is_none(), id == "cell-editor", "{id}");
+        }
+    }
+
+    /// #1202: Backstage's inputs say why the harness cannot type into them,
+    /// and every other input is one it can reach.
+    #[test]
+    fn unreachable_inputs_say_why() {
+        let why = |id: &str| unreachable(find(id).unwrap());
+        assert_eq!(
+            why("save-as-name").as_deref(),
+            Some(
+                "Save As's file name is the OS's file dialog, which a harness \
+                 instance never opens; see qa/inputs-typing.md"
+            )
+        );
+        assert_eq!(
+            why("info-title").as_deref(),
+            Some("File > Info has no Title property yet, see #1364")
+        );
+        assert_eq!(
+            why("info-tags").as_deref(),
+            Some("File > Info has no Tags property yet, see #1364")
+        );
+        assert_eq!(
+            why("info-author").as_deref(),
+            Some("File > Info has no Author property yet, see #1364")
+        );
+        for i in registry() {
+            assert_eq!(
+                why(i.id).is_some(),
+                i.surface == Surface::Backstage,
+                "{}",
+                i.id
+            );
         }
     }
 
