@@ -19,3 +19,57 @@ doc-rulers.uit | ruler positions follow the document geometry at 100 and 200 per
 inputs-typing-sheet-data.uit | sheet text-to-columns/breaks: OK applies | #1205
 inputs-typing-sheet-data.uit | sheet text-to-columns/formats: OK applies | #1205
 inputs-typing-sheet-data.uit | sheet text-to-columns/destination: OK applies | #1205
+
+# The cell entry (formula bar and in-cell editor alike) has no text
+# selection: Ctrl+A ends the entry and selects the used range, so Ctrl+C
+# then copies the cells, not the typed text (#1200 found it).
+sheet-inputs-typing.uit | sheet formula-bar: select-all replaces | #1340
+sheet-inputs-typing.uit | sheet cell-editor: select-all replaces | #1340
+sheet-inputs-typing.uit | sheet formula-bar: copies | #1340
+sheet-inputs-typing.uit | sheet cell-editor: copies | #1340
+
+# Ctrl+V while editing a cell runs the sheet's Paste, which ends the entry
+# and pastes into the cells, instead of inserting at the caret (#1200).
+sheet-inputs-typing.uit | sheet formula-bar: pastes | #1341
+sheet-inputs-typing.uit | sheet cell-editor: pastes | #1341
+
+# The sheet Find bar's fields are append-only: no caret, so Home, End,
+# Left, Right and Delete do nothing, and Ctrl+A/C/V are ignored (#1200).
+sheet-inputs-typing.uit | sheet sheet-find: edits | #1342
+sheet-inputs-typing.uit | sheet sheet-replace: edits | #1342
+sheet-inputs-typing.uit | sheet sheet-find: select-all replaces | #1342
+sheet-inputs-typing.uit | sheet sheet-replace: select-all replaces | #1342
+sheet-inputs-typing.uit | sheet sheet-find: copies | #1342
+sheet-inputs-typing.uit | sheet sheet-replace: copies | #1342
+sheet-inputs-typing.uit | sheet sheet-find: pastes | #1342
+sheet-inputs-typing.uit | sheet sheet-replace: pastes | #1342
+
+# The Name Box is display-only: a click takes no focus, and what is typed
+# goes into the active cell (#1200).
+sheet-inputs-typing.uit | sheet name-box: focus by click | #1343
+sheet-inputs-typing.uit | sheet name-box: types | #1343
+sheet-inputs-typing.uit | sheet name-box: edits | #1343
+sheet-inputs-typing.uit | sheet name-box: select-all replaces | #1343
+sheet-inputs-typing.uit | sheet name-box: copies | #1343
+sheet-inputs-typing.uit | sheet name-box: pastes | #1343
+sheet-inputs-typing.uit | sheet name-box: Enter goes to the reference | #1343
+sheet-inputs-typing.uit | sheet name-box: Escape cancels | #1343
+
+# Home's Font and Font Size boxes are inert (SheetAct::Todo, a fixed
+# value): a click takes no focus, and what is typed goes into the cell (#1200).
+sheet-inputs-typing.uit | sheet sheet-font: focus by click | #1344
+sheet-inputs-typing.uit | sheet sheet-font: types | #1344
+sheet-inputs-typing.uit | sheet sheet-font: edits | #1344
+sheet-inputs-typing.uit | sheet sheet-font: select-all replaces | #1344
+sheet-inputs-typing.uit | sheet sheet-font: copies | #1344
+sheet-inputs-typing.uit | sheet sheet-font: pastes | #1344
+sheet-inputs-typing.uit | sheet sheet-font: Enter formats the selection | #1344
+sheet-inputs-typing.uit | sheet sheet-font: Escape cancels | #1344
+sheet-inputs-typing.uit | sheet sheet-font-size: focus by click | #1344
+sheet-inputs-typing.uit | sheet sheet-font-size: types | #1344
+sheet-inputs-typing.uit | sheet sheet-font-size: edits | #1344
+sheet-inputs-typing.uit | sheet sheet-font-size: select-all replaces | #1344
+sheet-inputs-typing.uit | sheet sheet-font-size: copies | #1344
+sheet-inputs-typing.uit | sheet sheet-font-size: pastes | #1344
+sheet-inputs-typing.uit | sheet sheet-font-size: Enter formats the selection | #1344
+sheet-inputs-typing.uit | sheet sheet-font-size: Escape cancels | #1344
