@@ -29562,9 +29562,7 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         let col = self
-            .press_project(window, cx, |tab| {
-                crate::project_column_select(tab, col);
-            })?
+            .press_project(window, cx, |tab| crate::project_column_select(tab, col))?
             .col;
         self.open_menu(menu::MenuTarget::Column(col), at, project_column_menu(), cx);
         Ok(())

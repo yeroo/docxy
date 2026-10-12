@@ -636,20 +636,20 @@ pub(crate) fn project_cell_press(tab: &mut DocTab, row: usize, col: usize, shift
 
 /// A right press on column `col`'s heading (#1208), before its menu opens:
 /// it commits an open cell edit as any press does (a refused commit keeps
-/// the edit and its status, and is `false`), then selects the column over
+/// the edit and its status, and selects nothing), then selects the column over
 /// every shown task, as Project does. The cursor is the column's first
 /// shown task, the active cell, and the anchor its last, so Copy, Cut and
 /// Paste take the range as they take any other. One shown task is no range
 /// (the cursor cell is the selection); with no task the cursor goes to the
 /// entry row. The column is revealed as a cell press reveals it; the table
 /// does not scroll to a row.
-pub(crate) fn project_column_select(tab: &mut DocTab, col: usize) -> bool {
+pub(crate) fn project_column_select(tab: &mut DocTab, col: usize) {
     flush_level_pass(tab);
     if !commit_project_cell(tab) {
-        return false;
+        return;
     }
     let Surface::Project(v) = &mut tab.surface else {
-        return false;
+        return;
     };
     let col = col.min(COLUMN_COUNT - 1);
     v.drag_made_range = false;
@@ -670,7 +670,6 @@ pub(crate) fn project_column_select(tab: &mut DocTab, col: usize) -> bool {
     v.col = col;
     v.reveal_col();
     complete_project(tab, false);
-    true
 }
 
 /// The pointer entering cell (`row`, `col`) with the left button held: the
