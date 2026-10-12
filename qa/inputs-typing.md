@@ -43,6 +43,16 @@ Every editable input in the suite is typed into with real keys by a case:
   one step against what Word does, except that Enter in the Replace field
   replaces, as the bar says. The suite has no Styles gallery search to type
   into.
+- **Backstage and renames** (#1202) are in the hand-written
+  `uiharness/cases/backstage-inputs-typing.uit`. The one rename the suite has
+  is the sheet tab's (`sheet-tab-rename`): a double-click on the active tab's
+  name opens it, and each test opens its own copy of `basic.xlsx` and checks
+  one step against what Excel does. The document tab and the title bar do not
+  rename. Save As's file name is the OS's file dialog, which a harness instance
+  never opens: it is the manual case below. File > Info has no Title, Tags or
+  Author yet (#1364), so each one's test fails at the press. Settings' typed
+  values are the User name and Custom Lists dialogs, which the catalogue
+  covers from Backstage (the #1027 path).
 - **A field broken today** is listed in `uiharness/cases/expected-failures.txt`
   with its own issue, per failing step, so the sweep stays green and any new
   failure fails CI. Remove the entry in the change that fixes it.
@@ -78,6 +88,18 @@ clipboard; Enter applies and the dialog reopens on the typed margins.
 2. Press Escape; reopen.
 
 **Expect:** each tab's fields take the keys; Escape discards everything typed.
+
+### Save As's file name
+
+1. In the document, File › Save As…. In the OS's dialog, type `Ab1 copy`
+   into the file name; Backspace, Home, Ctrl+A and type a name; press Enter.
+2. Press F12, then press Escape in the dialog.
+3. File › Export › Change File Type, pick a type; type a name; press Enter.
+
+**Expect:** the name field edits as it does in any other app; Enter saves
+under the typed name (the title bar shows it, and the file is on disk);
+Escape closes the dialog and leaves the Backstage page and the document as
+they were.
 
 **Fails when:** a dialog field ignores typed keys, the clipboard chords, or
 Enter and Escape, from any of the paths above.
