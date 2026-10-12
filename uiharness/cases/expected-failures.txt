@@ -122,3 +122,15 @@ backstage-inputs-typing.uit | rename sheet-tab-rename: edits | #1365
 backstage-inputs-typing.uit | rename sheet-tab-rename: select-all replaces | #1365
 backstage-inputs-typing.uit | rename sheet-tab-rename: copies | #1365
 backstage-inputs-typing.uit | rename sheet-tab-rename: pastes | #1365
+
+# The Project cell editor has no selection: Ctrl+A is ignored, so typing
+# after it appends instead of replacing (#1203 found it).
+project-inputs-typing.uit | project project-cell: select-all replaces | #1369
+
+# Project's prompt bar (Task > Information...'s constraint prompt, and every
+# other prompt kind) is append-only: no caret, so Home, End, Left, Right and
+# Delete do nothing, and Ctrl+A/C/V are ignored (#1203 found it).
+project-inputs-typing.uit | project task-info: edits | #1370
+project-inputs-typing.uit | project task-info: select-all replaces | #1370
+project-inputs-typing.uit | project task-info: copies | #1370
+project-inputs-typing.uit | project task-info: pastes | #1370
