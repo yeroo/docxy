@@ -238,10 +238,11 @@ fn doc_probe(id: &str) -> Option<&'static str> {
 }
 
 /// Where `pointer-click {"input":id}` presses, from the frame on screen.
-/// The in-cell editor is a double-click on the active cell, which opens it;
-/// it is refused while an entry is open, where a click on the cell would
-/// commit it. Inputs of other surfaces answer which issue makes them
-/// targetable.
+/// A sheet input is pressed here: the in-cell editor is a double-click on
+/// the active cell, which opens it, refused while an entry is open, where a
+/// click on the cell would commit it. A document input goes to
+/// [`press_doc`]. Backstage, Project and terminal inputs answer which issue
+/// makes them targetable.
 pub(crate) fn press(app: &crate::Docxy, id: &str) -> Result<Press, String> {
     let i = find(id)?;
     match i.surface {
@@ -302,9 +303,11 @@ fn press_doc(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
     })
 }
 
-/// `field-read {"input":id}`: a sheet input as it is edited and drawn, in the
-/// shape of a dialog field's (`value`, `focused`, `caret` and `selection` in
-/// chars, `null` while it has no focus). The formula bar and the in-cell
+/// `field-read {"input":id}`: a sheet input as it is edited and drawn (a
+/// document input goes to [`read_doc`]; Backstage, Project and terminal
+/// inputs answer which issue makes them readable), in the shape of a dialog
+/// field's (`value`, `focused`, `caret` and `selection` in chars, `null`
+/// while it has no focus). The formula bar and the in-cell
 /// editor are one buffer, so both are focused while a cell is being edited:
 /// nothing records which one the edit began in. The Find bar's fields append
 /// and pop only, so a focused one's caret is its end. The Name Box and the
@@ -380,8 +383,11 @@ pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
 /// `field-read {"input":id}` for a document input, in the sheet inputs'
 /// shape. The Find bar's fields and the comment editor append and pop only,
 /// so a focused one's caret is its end; the Find bar is the window's, shared
-/// with the sheet's, so it reads only while a document is active. The Font
-/// boxes never take the focus today: they read what they draw.
+/// with the sheet's, so it reads only while a document is active. Ctrl+F
+/// opens the Find bar under an open comment bar, but `on_key` gives the
+/// comment bar the keys first, so a Find field is focused only while no
+/// comment is being typed. The Font boxes never take the focus today: they
+/// read what they draw.
 fn read_doc(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
     crate::harness::active_doc(app)?;
     let end_if = |text: &str, focused: bool| {
@@ -398,7 +404,7 @@ fn read_doc(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
             } else {
                 (&app.replace_text, crate::FindField::Replace)
             };
-            let focused = app.find_open && app.find_field == field;
+            let focused = app.find_open && !app.comment_open && app.find_field == field;
             (Json::Str(text.clone()), focused, end_if(text, focused))
         }
         "doc-font" | "doc-font-size" => {

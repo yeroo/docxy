@@ -6,7 +6,8 @@
 # `inputs-typing-*.uit` own that prefix.
 #
 # `real-key` and `real-type` go through the window's own input path, and an
-# input is focused by `pointer-click {"input":id}` or by Tab. `open`,
+# input is focused by `pointer-click {"input":id}` or by Tab, but the
+# comment editor, which Review > New Comment opens focused. `open`,
 # `selection-set` and `ribbon-click` (Review > New Comment) are setup only,
 # and the checks after may use handler verbs. A test is one input and one
 # step, named `document <input>: <step>`; each opens its own copy of
@@ -711,12 +712,11 @@ test document doc-font-size: Escape cancels
 # ---- The comment editor: Review > New Comment on `before` opens it,
 # focused. Enter adds the comment, Escape drops it. It has no Tab stop.
 
-test document comment-editor: focus by click
+test document comment-editor: New Comment focuses it
   open copy:../fixtures/doc-table.docx
   call real-key {"key":"escape"}
   call selection-set {"start":0,"end":6}
   call ribbon-click {"tab":"Review","command":"New Comment"}
-  call pointer-click {"input":"comment-editor"}
   call field-read {"input":"comment-editor"}
   assert reply.focused is true
   assert reply.value is exactly ""
@@ -836,3 +836,20 @@ test document comment-editor: Escape cancels
   assert dirty is false
   call comments {}
   assert reply.comments is []
+
+test document comment-editor: keeps the keys over Ctrl+F
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  call real-key {"key":"ctrl+f"}
+  call real-type {"text":"Ab"}
+  call field-read {"input":"comment-editor"}
+  assert reply.focused is true
+  assert reply.value is exactly Ab
+  call field-read {"input":"doc-find"}
+  assert reply.focused is false
+  call field-read {"input":"doc-replace"}
+  assert reply.focused is false
+  call real-key {"key":"escape"}
+  call real-key {"key":"escape"}
