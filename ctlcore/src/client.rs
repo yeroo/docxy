@@ -99,33 +99,70 @@ impl Client {
     /// `Err` carrying either a transport failure or the server's own
     /// `{ok:false,error}` message.
     pub fn call(&self, verb: &str, args: Json) -> Result<Json, String> {
-        let mut stream =
-            TcpStream::connect_timeout(&self.instance.addr(), Duration::from_millis(500))
-                .map_err(|e| format!("connect failed: {e}"))?;
-        stream.set_read_timeout(Some(READ_TIMEOUT)).ok();
+        self.connect()?.call(verb, args)
+    }
 
+    /// A connection kept open for many calls. The server reads one request
+    /// per line until the client closes, so a caller that calls in a tight
+    /// loop (the UI harness polling a terminal editor's counters, #1204)
+    /// uses one socket rather than one per call, which on Windows ran the
+    /// ephemeral ports out within a few thousand calls.
+    pub fn connect(&self) -> Result<Conn, String> {
+        let stream = TcpStream::connect_timeout(&self.instance.addr(), Duration::from_millis(500))
+            .map_err(|e| format!("connect failed: {e}"))?;
+        stream.set_read_timeout(Some(READ_TIMEOUT)).ok();
+        let reader = BufReader::new(
+            stream
+                .try_clone()
+                .map_err(|e| format!("connect failed: {e}"))?,
+        );
+        Ok(Conn {
+            reader,
+            writer: stream,
+            token: self.instance.token.clone(),
+        })
+    }
+}
+
+/// One open connection to a control server; see [`Client::connect`].
+pub struct Conn {
+    reader: BufReader<TcpStream>,
+    writer: TcpStream,
+    token: String,
+}
+
+impl Conn {
+    /// [`Client::call`] on this connection.
+    pub fn call(&mut self, verb: &str, args: Json) -> Result<Json, String> {
         let mut line = Json::obj(vec![
-            ("token", Json::Str(self.instance.token.clone())),
+            ("token", Json::Str(self.token.clone())),
             ("verb", Json::Str(verb.to_string())),
             ("args", args),
         ])
         .to_string();
         line.push('\n');
-        stream
+        self.writer
             .write_all(line.as_bytes())
             .map_err(|e| format!("write failed: {e}"))?;
-        stream.flush().ok();
+        self.writer.flush().ok();
 
-        let mut reader = BufReader::new(stream);
         let mut resp = String::new();
-        reader.read_line(&mut resp).map_err(|e| match e.kind() {
-            // A read timeout surfaces as WouldBlock on Unix and TimedOut on Windows; the
-            // raw text ("Resource temporarily unavailable") hides that the server was slow.
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
-                format!("no reply within {}s to `{verb}`", READ_TIMEOUT.as_secs())
-            }
-            _ => format!("read failed: {e}"),
-        })?;
+        let n = self
+            .reader
+            .read_line(&mut resp)
+            .map_err(|e| match e.kind() {
+                // A read timeout surfaces as WouldBlock on Unix and TimedOut on Windows; the
+                // raw text ("Resource temporarily unavailable") hides that the server was slow.
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                    format!("no reply within {}s to `{verb}`", READ_TIMEOUT.as_secs())
+                }
+                _ => format!("read failed: {e}"),
+            })?;
+        if n == 0 {
+            return Err(format!(
+                "the server closed the connection before replying to `{verb}`"
+            ));
+        }
         let j = Json::parse(resp.trim()).map_err(|e| format!("bad response: {e}"))?;
         if j.get("ok").and_then(Json::as_bool) == Some(true) {
             Ok(j.get("result").cloned().unwrap_or(Json::Null))
@@ -365,6 +402,44 @@ mod tests {
         std::fs::remove_dir(a).unwrap();
         std::fs::remove_dir(b).unwrap();
         std::fs::remove_dir(root).unwrap();
+    }
+
+    /// One connection answers many calls, in order (#1204).
+    #[test]
+    fn one_connection_carries_many_calls() {
+        let dir = std::env::temp_dir().join(format!("ctlcore_conn_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (server, rx) = serve(&dir, "docxy-conn-test").unwrap();
+        std::thread::spawn(move || {
+            for req in rx {
+                let n = req.args.get("n").cloned().unwrap_or(Json::Null);
+                if req.verb == "echo" {
+                    req.reply_ok(n);
+                } else {
+                    let msg = format!("unknown verb '{}'", req.verb);
+                    req.reply_err(msg);
+                }
+            }
+        });
+        let client = discover_live(&dir).remove(0).client();
+        let mut conn = client.connect().unwrap();
+        for i in 0..50 {
+            let got = conn
+                .call("echo", Json::obj(vec![("n", Json::Num(f64::from(i)))]))
+                .unwrap();
+            assert_eq!(got.as_f64(), Some(f64::from(i)));
+        }
+        assert_eq!(
+            conn.call("nope", Json::Null).unwrap_err(),
+            "unknown verb 'nope'",
+            "a refusal leaves the connection usable"
+        );
+        assert!(
+            conn.call("echo", Json::obj(vec![("n", Json::Num(1.0))]))
+                .is_ok()
+        );
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -32,6 +32,7 @@
 //! answers the client with a generic error, so a client never hangs.
 
 pub mod client;
+pub mod field;
 pub mod json;
 pub mod mcp;
 

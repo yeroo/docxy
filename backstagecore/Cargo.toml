@@ -4,5 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# `Field`, what `field-read` reports of Save As's file name (#1204).
+# Dependency-free.
+ctlcore = { version = "0.5.0", path = "../ctlcore" }
 ratatui = "0.29"
 unicode-width = "0.2"

@@ -63,6 +63,22 @@ def script_cases(text):
     return names
 
 
+def script_editor(text):
+    """The terminal editor a script drives, or None for the suite (#1204).
+
+    A terminal script's first line (comments and blank lines aside) is
+    `terminal <docxy|xlsxy|yppxy> [args...]`, as uiharness's parser reads it.
+    """
+    for raw in text.splitlines():
+        words = strip_comment(raw).split()
+        if not words:
+            continue
+        if words[0].lower() == 'terminal' and len(words) > 1:
+            return words[1]
+        return None
+    return None
+
+
 @dataclass(frozen=True)
 class Entry:
     script: str
@@ -325,6 +341,9 @@ def main(argv=None):
                         help='scripts to run (default: every uiharness/cases/*.uit)')
     parser.add_argument('--suite', type=Path, default=REPO / 'suite/target/release/suite')
     parser.add_argument('--uiharness', type=Path, default=REPO / 'target/release/uiharness')
+    parser.add_argument('--term-bin', type=Path,
+                        help='where the terminal editors (docxy, xlsxy, yppxy) are built '
+                             '(default: beside --uiharness)')
     parser.add_argument('--run', type=Path,
                         help='run directory (default: uiharness-runs/sweep-<timestamp>)')
     parser.add_argument('--expected', type=Path, default=EXPECTED)
@@ -335,10 +354,9 @@ def main(argv=None):
     # #975: uiharness resolves relative paths inconsistently, so hand it none.
     suite = args.suite.resolve()
     uiharness = args.uiharness.resolve()
-    for exe, build in ((suite, 'cargo build --release --manifest-path suite/Cargo.toml'),
-                       (uiharness, 'cargo build --release -p uiharness')):
-        if not exe.is_file():
-            parser.error(f'{exe} is missing; build it with: {build}')
+    term_bin = (args.term_bin or uiharness.parent).resolve()
+    if not uiharness.is_file():
+        parser.error(f'{uiharness} is missing; build it with: cargo build --release -p uiharness')
 
     # The list is checked against every script, even on a subset run, so a
     # stale entry is caught whichever scripts someone happens to run.
@@ -357,6 +375,20 @@ def main(argv=None):
             parser.error(f'two scripts are named {path.stem}; their run directories would clash')
         declared[path] = script_cases(path.read_text(encoding='utf-8'))
 
+    # The suite is needed only by suite scripts, and each terminal editor only
+    # by the scripts that drive it (#1204).
+    editors = {script_editor(p.read_text(encoding='utf-8')) for p in scripts}
+    needed = []
+    if None in editors:
+        needed.append((suite, 'cargo build --release --manifest-path suite/Cargo.toml'))
+    exe_suffix = '.exe' if sys.platform == 'win32' else ''
+    for app in sorted(e for e in editors if e):
+        needed.append((term_bin / f'{app}{exe_suffix}',
+                       'cargo build --release -p docxy -p xlsxy -p yppxy'))
+    for exe, build in needed:
+        if not exe.is_file():
+            parser.error(f'{exe} is missing; build it with: {build}')
+
     stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
     run = (args.run or REPO / 'uiharness-runs' / f'sweep-{stamp}').resolve()
     if run.exists() and any(run.iterdir()):
@@ -372,7 +404,7 @@ def main(argv=None):
         print(f'[{i}/{len(scripts)}] {path.stem} ... ', end='', flush=True)
         cmd = [sys.executable, str(UI_LINUX), '--logs', str(out / 'x11'), '--',
                str(uiharness), 'run', str(path), '--suite', str(suite),
-               '--run', str(out / 'harness')]
+               '--term-bin', str(term_bin), '--run', str(out / 'harness')]
         began = time.monotonic()
         try:
             code, timed_out = run_one(cmd, out / 'transcript.txt', args.timeout)

@@ -53,6 +53,7 @@
 //! | `doc.page-color` | `{color:"#RRGGBB"\|"none"}` | `{pageColor, changed}` — a package edit with no undo step; refuses Markdown |
 //! | `doc.watermark` | `{text, layout?, font?, color?}` or `{remove:true}` | `{watermark, changed}` — the header parts are package edits and the new header references one undo step; refuses Markdown |
 //! | `doc.page-borders` | `{border:"none"\|"box"\|"shadow", color?}` | `{pageBorders, changed}` — every section as one undo step; refuses Markdown |
+//! | `field-read` | `{input?}` | a text prompt (`docxy-find`, `docxy-replace`, `docxy-comment`, `docxy-compare-original`, `docxy-compare-revised`, `docxy-vim-command`, `docxy-save-as`): `{input, value, focused, caret, selection, at, kind, keys, clicks, frames, dirty}`; with no `input`, the counters and the ids (`ctlcore::field`, #1204) |
 
 use crate::{
     App, DocFormat, box_page_borders, property_scope_name, protection::MutationKind,
@@ -104,6 +105,20 @@ pub(crate) fn mutation_kind_for_verb(verb: &str) -> Option<MutationKind> {
         _ => return None,
     })
 }
+
+/// docxy's text prompts, as `field-read {"input":id}` names them (#1204):
+/// the Find bar's two fields, the new comment's text, Compare's two paths,
+/// the vim `:` line and Backstage Save As's file name. The suite's input
+/// registry lists the same ids.
+pub(crate) const INPUTS: &[&str] = &[
+    "docxy-find",
+    "docxy-replace",
+    "docxy-comment",
+    "docxy-compare-original",
+    "docxy-compare-revised",
+    "docxy-vim-command",
+    "docxy-save-as",
+];
 
 /// `app-info`: the build this binary is (see the `buildinfo` crate), as JSON.
 fn app_info() -> Result<Json, String> {
@@ -180,6 +195,9 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
             Ok(path_info(app))
         }
         "doc.compare" => compare(app, args),
+        "field-read" => ctlcore::field::reply(args, INPUTS, app.counts, app.modified, |id| {
+            app.input_field(id)
+        }),
         other => Err(format!("unknown verb '{other}'")),
     };
     // Any successful control interaction repaints the view; the edit verbs
@@ -2529,6 +2547,7 @@ mod tests {
 
         for verb in [
             "doc.path",
+            "field-read",
             "doc.edit-anyway",
             "doc.outline",
             "doc.read",
@@ -4220,5 +4239,137 @@ mod tests {
             json(CompareSkip::ParagraphMark { index: 2 }),
             r#"{"kind":"paragraph-mark","index":2}"#
         );
+    }
+
+    /// `field-read` for each prompt, closed and then open and drawn, typed
+    /// into with the keys a person presses (#1204).
+    #[test]
+    fn field_read_reports_each_prompt_closed_and_open() {
+        use crossterm_keys::*;
+        let read = |app: &mut App, id: &str| {
+            dispatch(
+                app,
+                "field-read",
+                &Json::obj(vec![("input", Json::Str(id.into()))]),
+            )
+            .unwrap()
+        };
+        let draw = |app: &mut App| {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+            term.draw(|f| app.draw(f)).unwrap();
+        };
+        let mut app = app_with(&["alpha beta"]);
+        draw(&mut app);
+        for id in INPUTS {
+            let r = read(&mut app, id);
+            assert_eq!(r.get("value"), Some(&Json::Null), "{id}: {r}");
+            assert_eq!(
+                r.get("focused").and_then(Json::as_bool),
+                Some(false),
+                "{id}"
+            );
+            assert_eq!(r.get("at"), Some(&Json::Null), "{id}");
+        }
+        let all = dispatch(&mut app, "field-read", &Json::obj(vec![])).unwrap();
+        assert_eq!(
+            all.get("inputs")
+                .and_then(Json::as_array)
+                .map(<[Json]>::len),
+            Some(INPUTS.len())
+        );
+        assert_eq!(all.get_usize("frames"), Some(1));
+        assert!(
+            dispatch(
+                &mut app,
+                "field-read",
+                &Json::obj(vec![("input", Json::Str("x".into()))])
+            )
+            .unwrap_err()
+            .contains("docxy-save-as")
+        );
+
+        // The Find bar: Ctrl+F, then type; it sits on the status line.
+        press(&mut app, ctrl('f'));
+        for c in "be".chars() {
+            press(&mut app, ch(c));
+        }
+        draw(&mut app);
+        let r = read(&mut app, "docxy-find");
+        assert_eq!(r.get_str("value"), Some("be"), "{r}");
+        assert_eq!(r.get_usize("caret"), Some(2));
+        assert_eq!(r.get("focused").and_then(Json::as_bool), Some(true));
+        let at = r.get("at").unwrap();
+        assert_eq!(at.get_usize("col"), Some(" Find: ".len()), "{r}");
+        assert_eq!(at.get_usize("row"), Some(39), "the last row");
+        // Tab moves to Replace, which then has the keyboard.
+        press(&mut app, key(KeyCode::Tab));
+        press(&mut app, ch('X'));
+        draw(&mut app);
+        let r = read(&mut app, "docxy-replace");
+        assert_eq!(r.get_str("value"), Some("X"), "{r}");
+        assert_eq!(r.get("focused").and_then(Json::as_bool), Some(true));
+        assert_eq!(
+            r.get("at").and_then(|a| a.get_usize("col")),
+            Some(" Replace: be → ".chars().count()),
+            "{r}"
+        );
+        assert_eq!(
+            read(&mut app, "docxy-find")
+                .get("focused")
+                .and_then(Json::as_bool),
+            Some(false)
+        );
+        press(&mut app, key(KeyCode::Esc));
+
+        // Compare: two paths; an unsaved document leaves the original empty
+        // and focused. Tab moves to the revised path, a row under it.
+        app.open_compare_dialog();
+        press(&mut app, ch('o'));
+        press(&mut app, key(KeyCode::Tab));
+        press(&mut app, ch('r'));
+        draw(&mut app);
+        let r = read(&mut app, "docxy-compare-revised");
+        assert_eq!(r.get_str("value"), Some("r"), "{r}");
+        assert_eq!(r.get("focused").and_then(Json::as_bool), Some(true), "{r}");
+        let o = read(&mut app, "docxy-compare-original");
+        assert_eq!(o.get_str("value"), Some("o"), "{o}");
+        assert_eq!(o.get("focused").and_then(Json::as_bool), Some(false), "{o}");
+        assert_eq!(
+            o.get("at").and_then(|a| a.get_usize("row")).map(|r| r + 1),
+            r.get("at").and_then(|a| a.get_usize("row")),
+            "the revised path is the row under the original: {o} {r}"
+        );
+        press(&mut app, key(KeyCode::Esc));
+
+        // Backstage Save As: its name field, with a real caret.
+        app.open_backstage();
+        app.backstage.as_mut().unwrap().item = backstagecore::Item::SaveAs;
+        draw(&mut app);
+        let r = read(&mut app, "docxy-save-as");
+        assert!(r.get_str("value").is_some(), "{r}");
+        assert!(r.get("at").is_some_and(|a| *a != Json::Null), "{r}");
+
+        // The counters: ten key presses, no click.
+        let all = dispatch(&mut app, "field-read", &Json::obj(vec![])).unwrap();
+        assert_eq!(all.get_usize("keys"), Some(10), "{all}");
+        assert_eq!(all.get_usize("clicks"), Some(0), "{all}");
+    }
+
+    /// Keys as crossterm hands them to `handle_event`.
+    mod crossterm_keys {
+        pub use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        pub fn key(code: KeyCode) -> KeyEvent {
+            KeyEvent::new(code, KeyModifiers::NONE)
+        }
+        pub fn ch(c: char) -> KeyEvent {
+            key(KeyCode::Char(c))
+        }
+        pub fn ctrl(c: char) -> KeyEvent {
+            KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+        }
+        pub fn press(app: &mut crate::App, k: KeyEvent) {
+            crate::handle_event(app, ratatui::crossterm::event::Event::Key(k));
+        }
     }
 }

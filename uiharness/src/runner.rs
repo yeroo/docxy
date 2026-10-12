@@ -29,7 +29,7 @@
 //! comparisons a case turns on are unit tests rather than something only a
 //! window can exercise.
 
-use crate::driver::Driver;
+use crate::driver::{Driver, Shot};
 use crate::expect::{BorderExpect, check_border_clipped};
 use crate::image::Image;
 use crate::probe::ProbeOpts;
@@ -137,10 +137,58 @@ impl ScriptOutcome {
     }
 }
 
+/// What a script runs against: the suite's harness instance ([`Driver`]), or
+/// a terminal editor in a pseudo-terminal ([`crate::term::Terminal`], #1204).
+pub trait Target {
+    /// Send a verb.
+    fn call(&mut self, verb: &str, args: Json) -> Result<Json, String>;
+    /// A region's pixels.
+    fn shot(&mut self, region: &str) -> Result<Shot, String>;
+    /// Open a file, already resolved and copied.
+    fn open(&mut self, path: &Path) -> Result<(), String>;
+}
+
+impl Target for Driver {
+    fn call(&mut self, verb: &str, args: Json) -> Result<Json, String> {
+        Driver::call(self, verb, args)
+    }
+
+    fn shot(&mut self, region: &str) -> Result<Shot, String> {
+        Driver::shot(self, region)
+    }
+
+    fn open(&mut self, path: &Path) -> Result<(), String> {
+        Driver::call(
+            self,
+            "open",
+            Json::obj(vec![("path", Json::Str(path_arg(path)))]),
+        )
+        .map(|_| ())
+    }
+}
+
+/// A terminal editor is started afresh on the file by each `open`; it has no
+/// pictures to take (a terminal script never asks: the parser refuses).
+impl Target for crate::term::Terminal {
+    fn call(&mut self, verb: &str, args: Json) -> Result<Json, String> {
+        crate::term::Terminal::call(self, verb, args)
+    }
+
+    fn shot(&mut self, region: &str) -> Result<Shot, String> {
+        Err(format!(
+            "a terminal editor has no region '{region}' to photograph"
+        ))
+    }
+
+    fn open(&mut self, path: &Path) -> Result<(), String> {
+        crate::term::Terminal::open(self, path)
+    }
+}
+
 /// What a run needs besides the script: somewhere to file evidence, and where
 /// a relative `open` path is relative to.
 pub struct Runner<'a> {
-    driver: &'a Driver,
+    driver: &'a mut dyn Target,
     run: &'a Run,
     /// The script's own directory. A case's fixture path is resolved against
     /// this rather than the working directory, so `uiharness run` from anywhere
@@ -158,7 +206,7 @@ pub struct Runner<'a> {
 
 impl<'a> Runner<'a> {
     pub fn new(
-        driver: &'a Driver,
+        driver: &'a mut dyn Target,
         run: &'a Run,
         base: impl Into<PathBuf>,
         sandbox: impl Into<PathBuf>,
@@ -263,11 +311,9 @@ impl<'a> Runner<'a> {
                 // Canonicalized, so the app resolves the same file this side
                 // checked rather than one relative to its own directory.
                 let full = full.canonicalize().unwrap_or(full);
-                match self.driver.call(
-                    "open",
-                    Json::obj(vec![("path", Json::Str(path_arg(&full)))]),
-                ) {
-                    Ok(_) => out,
+                let full = PathBuf::from(path_arg(&full));
+                match self.driver.open(&full) {
+                    Ok(()) => out,
                     Err(e) => err(out, e),
                 }
             }
@@ -535,12 +581,12 @@ impl<'a> Runner<'a> {
     }
 
     /// The app's state reply, for a state assertion.
-    fn state(&self) -> Result<Json, String> {
+    fn state(&mut self) -> Result<Json, String> {
         self.driver.call("selection", Json::Obj(Vec::new()))
     }
 
     /// What a cell shows.
-    fn cell_text(&self, cell: &str) -> Result<String, String> {
+    fn cell_text(&mut self, cell: &str) -> Result<String, String> {
         let j = self.driver.call(
             "cell",
             Json::obj(vec![("cell", Json::Str(cell.to_string()))]),

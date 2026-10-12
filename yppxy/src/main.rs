@@ -378,6 +378,7 @@ fn window_title(path: &Option<String>, dirty: bool) -> String {
 
 // ---- app state --------------------------------------------------------------
 
+#[derive(Debug)]
 enum PromptKind {
     Rename,
     Duration,
@@ -424,6 +425,11 @@ struct App {
     ribbon: Ribbon,
     rfocus: ribbon::Focus,
     backstage: Option<Backstage>,
+    /// Key presses, clicks and frames handled so far, for `field-read`
+    /// (#1204).
+    counts: ctlcore::field::InputCounts,
+    /// Where the prompt's text starts, as the last frame drew it (#1204).
+    prompt_at: Option<(u16, u16)>,
     light: bool,
     /// When launched with no file, a welcome/start screen overlays everything
     /// until the user picks New/Open/Quit.
@@ -475,6 +481,8 @@ impl App {
             ribbon: Ribbon::new(),
             rfocus: ribbon::Focus::None,
             backstage: None,
+            counts: Default::default(),
+            prompt_at: None,
             light: load_theme_pref(),
             start_screen,
             start: backstage::Start::new(
@@ -1383,8 +1391,16 @@ fn run_tui(proj: Project, path: Option<String>, vim: bool) -> io::Result<()> {
         };
         while let Some(msg) = next.take() {
             match msg {
-                Msg::Term(Event::Key(k)) if k.kind == KeyEventKind::Press => on_key(&mut app, k),
-                Msg::Term(Event::Mouse(m)) => on_mouse(&mut app, m),
+                Msg::Term(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+                    app.counts.keys += 1;
+                    on_key(&mut app, k)
+                }
+                Msg::Term(Event::Mouse(m)) => {
+                    if matches!(m.kind, MouseEventKind::Down(_)) {
+                        app.counts.clicks += 1;
+                    }
+                    on_mouse(&mut app, m)
+                }
                 Msg::Term(_) => {}
                 Msg::Ctl(req) => match control::dispatch(&mut app, &req.verb, &req.args) {
                     Ok(result) => req.reply_ok(result),
@@ -1778,7 +1794,15 @@ fn step_ribbon(app: &mut App, dir: ribbon::Dir) {
 
 // ---- drawing ----------------------------------------------------------------
 
+/// Draw a frame, counting it and recording where the prompt was drawn
+/// (`field-read`, #1204).
 fn draw(f: &mut Frame, app: &mut App) {
+    app.counts.frames += 1;
+    app.prompt_at = None;
+    draw_screen(f, app);
+}
+
+fn draw_screen(f: &mut Frame, app: &mut App) {
     let area = f.area();
     // A confirmation modal owns the whole screen — no content behind it.
     if let Some(c) = app.confirm.as_mut() {
@@ -2329,7 +2353,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_prompt(f: &mut Frame, area: Rect, app: &App) {
+fn draw_prompt(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(p) = &app.prompt else { return };
     let w = area.width.clamp(20, 60);
     let x = (area.width.saturating_sub(w)) / 2;
@@ -2341,11 +2365,11 @@ fn draw_prompt(f: &mut Frame, area: Rect, app: &App) {
         height: 3,
     };
     f.render_widget(Clear, rect);
+    // Inside the border, past the label: where the typed text starts.
+    let label = format!(" {}: ", p.label);
+    let text_x = rect.x + 1 + Line::from(label.as_str()).width() as u16;
     let content = Line::from(vec![
-        Span::styled(
-            format!(" {}: ", p.label),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(p.buf.clone()),
         Span::styled("▏", Style::default().fg(Color::Gray)),
     ]);
@@ -2357,6 +2381,35 @@ fn draw_prompt(f: &mut Frame, area: Rect, app: &App) {
         ),
         rect,
     );
+    app.prompt_at = Some((text_x, rect.y + 1));
+}
+
+impl App {
+    /// A prompt field, as `field-read {"input":id}` reports it (#1204): the
+    /// prompt every command shares (Rename, Duration, Find, the vim `:` line,
+    /// Save As on a new project and the rest; its `kind` says which is
+    /// open), and Backstage Save As's file name. The prompt only appends and
+    /// pops, so its caret is its end.
+    fn input_field(&self, id: &str) -> ctlcore::field::Field {
+        use ctlcore::field::Field;
+        match id {
+            "yppxy-prompt" => match &self.prompt {
+                Some(p) => {
+                    let kind = format!("{:?}", p.kind);
+                    let kind = kind.split('(').next().unwrap_or_default().to_string();
+                    Field::append_only(&p.buf, true)
+                        .kind(kind)
+                        .at(self.prompt_at)
+                }
+                None => Field::closed(),
+            },
+            "yppxy-save-as" => self
+                .backstage
+                .as_ref()
+                .map_or_else(Field::closed, |b| b.save_as_name_field()),
+            _ => Field::closed(),
+        }
+    }
 }
 
 // ---- small helpers ----------------------------------------------------------

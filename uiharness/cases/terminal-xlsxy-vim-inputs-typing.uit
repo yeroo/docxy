@@ -1,0 +1,76 @@
+terminal xlsxy --vim
+# xlsxy's vim `:` command line typed into with real keys (#1204): the
+# `--vim` half of terminal-xlsxy-inputs-typing.uit, which says how these
+# cases run. Expected values follow Vim's command line.
+
+# ---- The vim `:` command line, which follows Vim rather than Office: it
+# has no select-all, copy or paste steps (Ctrl+A and Ctrl+V mean other
+# things in Vim). Enter runs the command: `:w` saves.
+test xlsxy xlsxy-vim-command: focus
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":":"}
+  call field-read {"input":"xlsxy-vim-command"}
+  assert reply.focused is true
+  assert reply.at is not null
+  assert reply.value is exactly ""
+  assert reply.caret is 0
+
+test xlsxy xlsxy-vim-command: focus by click
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":":"}
+  call pointer-click {"input":"xlsxy-vim-command"}
+  call field-read {"input":"xlsxy-vim-command"}
+  assert reply.focused is true
+
+test xlsxy xlsxy-vim-command: types
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":":"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"xlsxy-vim-command"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+
+test xlsxy xlsxy-vim-command: edits
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":":"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"xlsxy-vim-command"}
+  assert reply.value is exactly abc
+  call real-key {"key":"home"}
+  call field-read {"input":"xlsxy-vim-command"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"xlsxy-vim-command"}
+  assert reply.value is exactly ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"xlsxy-vim-command"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"xlsxy-vim-command"}
+  assert reply.value is exactly aXc
+  assert reply.caret is 2
+
+test xlsxy xlsxy-vim-command: Enter commits
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"x"}
+  call real-key {"key":":"}
+  call real-type {"text":"w"}
+  call real-key {"key":"enter"}
+  call field-read {"input":"xlsxy-vim-command"}
+  assert reply.value is null
+  call wb.path {}
+  assert reply.modified is false
+
+test xlsxy xlsxy-vim-command: Escape cancels
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":":"}
+  call real-type {"text":"q"}
+  call real-key {"key":"escape"}
+  call field-read {"input":"xlsxy-vim-command"}
+  assert reply.value is null
+  call field-read {}
+  assert reply.frames is not 0

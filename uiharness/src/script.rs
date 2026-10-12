@@ -51,6 +51,16 @@
 //! | `shot <region>` | files a PNG of the region |
 //! | `assert …` | see below |
 //!
+//! ## Terminal scripts (#1204)
+//!
+//! A script whose first line is `terminal <docxy|xlsxy|yppxy> [args…]`
+//! drives that terminal editor in a pseudo-terminal ([`crate::term`]): each
+//! `open` starts the editor on the file, `call real-key`, `real-type` and
+//! `pointer-click` write real key and mouse bytes into its terminal, and every
+//! other `call` is the editor's own control verb. Its steps are `open`,
+//! `call`, `call-error` and `assert reply.<path>`; anything that reads the
+//! suite's window or state is refused here.
+//!
 //! ## Assertions
 //!
 //! | Assertion | Reads |
@@ -71,11 +81,15 @@
 //! regression got through.
 
 use crate::expect::{BorderExpect, parse_border};
+pub use crate::term::TerminalSpec;
 use ctlcore::json::Json;
 
 /// One parsed script.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Script {
+    /// `terminal <app> [args…]`: the script drives that terminal editor in a
+    /// pseudo-terminal ([`crate::term`]) rather than the suite (#1204).
+    pub terminal: Option<TerminalSpec>,
     pub cases: Vec<Case>,
 }
 
@@ -252,6 +266,7 @@ pub fn duplicate_case(scripts: &[(String, &Script)]) -> Option<String> {
 /// in a border assertion such as `#2f6fdb`.
 pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
     let mut cases: Vec<Case> = Vec::new();
+    let mut terminal: Option<TerminalSpec> = None;
     for (i, raw) in text.lines().enumerate() {
         let line = i + 1;
         let (head, rest) = split_word(raw.trim());
@@ -278,6 +293,17 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
             split_word(&stripped)
         };
         let (head, rest) = (head.to_string(), rest.to_string());
+
+        if head.eq_ignore_ascii_case("terminal") {
+            if !cases.is_empty() || terminal.is_some() {
+                return Err(err(
+                    line,
+                    "'terminal' is the script's first line, and there is one",
+                ));
+            }
+            terminal = Some(parse_terminal(&rest, line)?);
+            continue;
+        }
 
         if head.eq_ignore_ascii_case("test") {
             let name = rest.trim();
@@ -325,7 +351,56 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
     if let Some(c) = cases.iter().find(|c| c.steps.is_empty()) {
         return Err(err(c.line, format!("the case '{}' has no steps", c.name)));
     }
-    Ok(Script { cases })
+    if terminal.is_some() {
+        for step in cases.iter().flat_map(|c| &c.steps) {
+            if !terminal_step(&step.action) {
+                return Err(err(
+                    step.line,
+                    format!(
+                        "'{}' needs the suite; a terminal script's steps are {TERMINAL_STEP_WORDS}",
+                        step.source
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(Script { terminal, cases })
+}
+
+/// What a terminal script may do: open a file (which starts the editor on
+/// it), send verbs, and assert on their replies. Everything else reads the
+/// suite's window or state.
+const TERMINAL_STEP_WORDS: &str = "open, call, call-error and assert reply.<path> is …";
+
+fn terminal_step(action: &Action) -> bool {
+    match action {
+        Action::Open(_)
+        | Action::OpenCopy(_)
+        | Action::OpenCopyAs { .. }
+        | Action::Call { .. }
+        | Action::CallError { .. } => true,
+        Action::Assert(Assertion::State { key, .. }) => key.starts_with("reply."),
+        _ => false,
+    }
+}
+
+/// `terminal <app> [args…]`.
+fn parse_terminal(rest: &str, line: usize) -> Result<TerminalSpec, ScriptError> {
+    let mut words = rest.split_whitespace();
+    let apps = crate::term::APPS.join(", ");
+    let app = words
+        .next()
+        .ok_or_else(|| err(line, format!("'terminal' needs an editor: {apps}")))?;
+    if !crate::term::APPS.contains(&app) {
+        return Err(err(
+            line,
+            format!("'{app}' is not a terminal editor; they are {apps}"),
+        ));
+    }
+    Ok(TerminalSpec {
+        app: app.to_string(),
+        args: words.map(String::from).collect(),
+    })
 }
 
 /// One step's line, past its first word.
@@ -1562,5 +1637,74 @@ test Smoke-Case
         assert!(validate_region("ribbon-group").is_err());
         assert!(validate_region("ribbon-group:x").is_err());
         assert!(validate_region("ribbon-launch").is_err());
+    }
+
+    #[test]
+    fn a_terminal_script_names_its_editor_and_keeps_to_its_steps() {
+        let s = parse_script(
+            "# a comment first
+terminal docxy --vim
+test t
+  open copy:a.docx
+               call real-key {\"key\":\"ctrl+f\"}
+  assert reply.value is x
+",
+        )
+        .unwrap();
+        assert_eq!(
+            s.terminal,
+            Some(TerminalSpec {
+                app: "docxy".into(),
+                args: vec!["--vim".into()]
+            })
+        );
+        assert_eq!(s.cases[0].steps.len(), 3);
+        assert_eq!(parse_script(VALID).unwrap().terminal, None);
+
+        let refused = |text: &str| parse_script(text).unwrap_err().to_string();
+        assert!(
+            refused(
+                "terminal
+test t
+  open a
+"
+            )
+            .contains("needs an editor")
+        );
+        assert!(
+            refused(
+                "terminal vim
+test t
+  open a
+"
+            )
+            .contains("not a terminal editor")
+        );
+        assert!(
+            refused(
+                "test t
+  open a
+terminal docxy
+"
+            )
+            .contains("first line"),
+            "a terminal line after a case"
+        );
+        for step in [
+            "click A1",
+            "shot grid",
+            "assert dirty is true",
+            "type abc",
+            "key enter",
+        ] {
+            let e = refused(&format!(
+                "terminal xlsxy
+test t
+  open a
+  {step}
+"
+            ));
+            assert!(e.contains("needs the suite"), "{step}: {e}");
+        }
     }
 }

@@ -134,3 +134,69 @@ project-inputs-typing.uit | project task-info: edits | #1370
 project-inputs-typing.uit | project task-info: select-all replaces | #1370
 project-inputs-typing.uit | project task-info: copies | #1370
 project-inputs-typing.uit | project task-info: pastes | #1370
+
+# docxy's prompts are append-only: no caret, so Home, End, Left, Right and
+# Delete do nothing (the Find bar's two fields, the new comment's text,
+# Compare's two paths and the vim `:` line; #1204 found it).
+terminal-docxy-inputs-typing.uit | docxy docxy-find: edits | #1372
+terminal-docxy-inputs-typing.uit | docxy docxy-replace: edits | #1372
+terminal-docxy-inputs-typing.uit | docxy docxy-comment: edits | #1372
+terminal-docxy-inputs-typing.uit | docxy docxy-compare-original: edits | #1372
+terminal-docxy-inputs-typing.uit | docxy docxy-compare-revised: edits | #1372
+terminal-docxy-vim-inputs-typing.uit | docxy docxy-vim-command: edits | #1372
+
+# xlsxy's vim `:` command line is append-only: no caret (#1204).
+terminal-xlsxy-vim-inputs-typing.uit | xlsxy xlsxy-vim-command: edits | #1373
+
+# yppxy's prompt (every kind) is append-only: no caret (#1204).
+terminal-yppxy-inputs-typing.uit | yppxy yppxy-prompt: edits | #1374
+
+# In docxy's Find bar in Replace mode Ctrl+A is Replace All: it edits the
+# document instead of selecting the field's text (#1204).
+terminal-docxy-inputs-typing.uit | docxy docxy-replace: select-all replaces | #1375
+
+# Ctrl+A selects nothing in the terminal editors' prompts, so typing after
+# it appends instead of replacing (#1204).
+terminal-docxy-inputs-typing.uit | docxy docxy-find: select-all replaces | #1376
+terminal-docxy-inputs-typing.uit | docxy docxy-comment: select-all replaces | #1376
+terminal-docxy-inputs-typing.uit | docxy docxy-compare-original: select-all replaces | #1376
+terminal-docxy-inputs-typing.uit | docxy docxy-compare-revised: select-all replaces | #1376
+terminal-docxy-inputs-typing.uit | docxy docxy-save-as: select-all replaces | #1376
+terminal-xlsxy-inputs-typing.uit | xlsxy xlsxy-prompt: select-all replaces | #1376
+terminal-xlsxy-inputs-typing.uit | xlsxy xlsxy-cell: select-all replaces | #1376
+terminal-xlsxy-inputs-typing.uit | xlsxy xlsxy-save-as: select-all replaces | #1376
+terminal-yppxy-inputs-typing.uit | yppxy yppxy-prompt: select-all replaces | #1376
+terminal-yppxy-inputs-typing.uit | yppxy yppxy-save-as: select-all replaces | #1376
+
+# Ctrl+C and Ctrl+V do nothing in these terminal prompts: no copy or paste
+# (#1204).
+terminal-docxy-inputs-typing.uit | docxy docxy-find: copies | #1377
+terminal-docxy-inputs-typing.uit | docxy docxy-find: pastes | #1377
+terminal-docxy-inputs-typing.uit | docxy docxy-replace: copies | #1377
+terminal-docxy-inputs-typing.uit | docxy docxy-replace: pastes | #1377
+terminal-docxy-inputs-typing.uit | docxy docxy-compare-original: copies | #1377
+terminal-docxy-inputs-typing.uit | docxy docxy-compare-original: pastes | #1377
+terminal-docxy-inputs-typing.uit | docxy docxy-compare-revised: copies | #1377
+terminal-docxy-inputs-typing.uit | docxy docxy-compare-revised: pastes | #1377
+terminal-xlsxy-inputs-typing.uit | xlsxy xlsxy-prompt: copies | #1377
+terminal-xlsxy-inputs-typing.uit | xlsxy xlsxy-prompt: pastes | #1377
+terminal-xlsxy-inputs-typing.uit | xlsxy xlsxy-cell: copies | #1377
+terminal-xlsxy-inputs-typing.uit | xlsxy xlsxy-cell: pastes | #1377
+
+# A Ctrl chord types its bare letter (Ctrl+C types c, Ctrl+V types v) in
+# docxy's new comment, yppxy's prompt and Backstage Save As's file name in
+# all three editors (#1204).
+terminal-docxy-inputs-typing.uit | docxy docxy-comment: copies | #1378
+terminal-docxy-inputs-typing.uit | docxy docxy-comment: pastes | #1378
+terminal-docxy-inputs-typing.uit | docxy docxy-save-as: copies | #1378
+terminal-docxy-inputs-typing.uit | docxy docxy-save-as: pastes | #1378
+terminal-xlsxy-inputs-typing.uit | xlsxy xlsxy-save-as: copies | #1378
+terminal-xlsxy-inputs-typing.uit | xlsxy xlsxy-save-as: pastes | #1378
+terminal-yppxy-inputs-typing.uit | yppxy yppxy-prompt: copies | #1378
+terminal-yppxy-inputs-typing.uit | yppxy yppxy-prompt: pastes | #1378
+terminal-yppxy-inputs-typing.uit | yppxy yppxy-save-as: copies | #1378
+terminal-yppxy-inputs-typing.uit | yppxy yppxy-save-as: pastes | #1378
+
+# A click on a docxy Find bar field does not move the focus to it (#1204).
+terminal-docxy-inputs-typing.uit | docxy docxy-find: focus by click | #1379
+terminal-docxy-inputs-typing.uit | docxy docxy-replace: focus by click | #1379

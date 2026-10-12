@@ -76,6 +76,7 @@
 //! | `wb.save` | — | `{path, …}`; a failed write errors with `save failed: …` (the status-bar text) and the workbook stays modified |
 //! | `wb.reload` | — | `{path, …}` |
 //! | `wb.open` | `{path}` | `{path, …}` |
+//! | `field-read` | `{input?}` | a text prompt (`xlsxy-prompt`, `xlsxy-cell`, `xlsxy-vim-command`, `xlsxy-save-as`): `{input, value, focused, caret, selection, at, kind, keys, clicks, frames, dirty}`; with no `input`, the counters and the ids (`ctlcore::field`, #1204) |
 //!
 //! `cell.get`'s reply additively gains a `format` object — present only when
 //! the cell's style differs from the default in at least one of the six
@@ -191,6 +192,17 @@ fn app_info() -> Result<Json, String> {
     Json::parse(&buildinfo::get(env!("CARGO_PKG_VERSION")).json())
 }
 
+/// xlsxy's text prompts, as `field-read {"input":id}` names them (#1204):
+/// the minibuffer (Rename Sheet, Find, Go To, Save As by F12 and the rest),
+/// the cell editor, the vim `:` line and Backstage Save As's file name. The
+/// suite's input registry lists the same ids.
+pub(crate) const INPUTS: &[&str] = &[
+    "xlsxy-prompt",
+    "xlsxy-cell",
+    "xlsxy-vim-command",
+    "xlsxy-save-as",
+];
+
 /// Route one control verb against the live workbook, returning the JSON result
 /// or an error message.
 pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> {
@@ -278,6 +290,9 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
             app.open_without_wizard(&p)?;
             Ok(path_info(app))
         }
+        "field-read" => ctlcore::field::reply(args, INPUTS, app.counts, app.modified, |id| {
+            app.input_field(id)
+        }),
         other => Err(format!("unknown verb '{other}'")),
     };
     if out.is_ok() {
@@ -7564,5 +7579,87 @@ mod consolidate_tests {
             &a.pkg.workbook.sheets
         ));
         assert_eq!(a.undo.len(), undo_len);
+    }
+}
+
+#[cfg(test)]
+mod field_read_tests {
+    use super::*;
+    use gridcore::xlsx::new_xlsx;
+    use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    fn press(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+        crate::handle_event(app, Event::Key(KeyEvent::new(code, mods)));
+    }
+
+    fn draw(app: &mut App) {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::draw(app, f)).unwrap();
+    }
+
+    fn read(app: &mut App, id: &str) -> Json {
+        dispatch(
+            app,
+            "field-read",
+            &Json::obj(vec![("input", Json::Str(id.into()))]),
+        )
+        .unwrap()
+    }
+
+    /// `field-read` for each prompt, closed and then open and drawn, typed
+    /// into with the keys a person presses (#1204).
+    #[test]
+    fn field_read_reports_each_prompt_closed_and_open() {
+        let mut app = App::new(new_xlsx(), "Book.xlsx");
+        app.os_clip = None;
+        draw(&mut app);
+        for id in INPUTS {
+            let r = read(&mut app, id);
+            assert_eq!(r.get("value"), Some(&Json::Null), "{id}: {r}");
+            assert_eq!(r.get("at"), Some(&Json::Null), "{id}: {r}");
+        }
+        assert!(
+            dispatch(
+                &mut app,
+                "field-read",
+                &Json::obj(vec![("input", Json::Str("x".into()))])
+            )
+            .unwrap_err()
+            .contains("xlsxy-save-as")
+        );
+
+        // Shift+F2 renames the sheet in the minibuffer, prefilled.
+        press(&mut app, KeyCode::F(2), KeyModifiers::SHIFT);
+        press(&mut app, KeyCode::Char('X'), KeyModifiers::SHIFT);
+        draw(&mut app);
+        let r = read(&mut app, "xlsxy-prompt");
+        assert_eq!(r.get_str("value"), Some("Sheet1X"), "{r}");
+        assert_eq!(r.get_usize("caret"), Some(7));
+        assert_eq!(r.get_str("kind"), Some("RenameSheet"));
+        assert_eq!(r.get("focused").and_then(Json::as_bool), Some(true));
+        assert_eq!(
+            r.get("at").and_then(|a| a.get_usize("row")),
+            Some(39),
+            "{r}"
+        );
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        // F2 opens the cell editor in Edit mode, where Left moves the caret
+        // (in Enter mode it would commit); its text is in the formula bar.
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        draw(&mut app);
+        let r = read(&mut app, "xlsxy-cell");
+        assert_eq!(r.get_str("value"), Some("ab"), "{r}");
+        assert_eq!(r.get_usize("caret"), Some(1), "{r}");
+        assert_eq!(r.get("focused").and_then(Json::as_bool), Some(true));
+        assert!(r.get("at").is_some_and(|a| *a != Json::Null), "{r}");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        let all = dispatch(&mut app, "field-read", &Json::obj(vec![])).unwrap();
+        assert_eq!(all.get_usize("keys"), Some(8), "{all}");
+        assert_eq!(all.get_usize("frames"), Some(3), "{all}");
     }
 }

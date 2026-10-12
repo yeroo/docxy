@@ -67,6 +67,13 @@ options for run:
                                 run (earlier files' instances always shut down;
                                 run a failing file alone with --keep to inspect it)
   --desktop NAME                start the suite on a separate Win32 desktop (never shown)
+  --term-bin DIR                where a terminal script's editor (docxy, xlsxy, yppxy)
+                                is built (default: the directory uiharness runs from)
+
+A script whose first line is `terminal <docxy|xlsxy|yppxy> [args...]` drives
+that terminal editor in a pseudo-terminal instead of the suite: each `open`
+starts it on the file, and real-key, real-type and pointer-click write real
+key and mouse bytes into its terminal (#1204).
 
 regions:
   window  title-tabs  tab-prev  tab-next  tab-more  tab-more-item:0
@@ -112,6 +119,7 @@ struct Args {
     out: Option<PathBuf>,
     suite: Option<PathBuf>,
     sandbox: Option<PathBuf>,
+    term_bin: Option<PathBuf>,
     keep: bool,
     help: bool,
     rest: Vec<String>,
@@ -135,6 +143,7 @@ where
         out: None,
         suite: None,
         sandbox: None,
+        term_bin: None,
         keep: false,
         help: false,
         rest: Vec::new(),
@@ -155,6 +164,7 @@ where
             "--out" => a.out = Some(PathBuf::from(value("--out")?)),
             "--suite" => a.suite = Some(PathBuf::from(value("--suite")?)),
             "--sandbox" => a.sandbox = Some(PathBuf::from(value("--sandbox")?)),
+            "--term-bin" => a.term_bin = Some(PathBuf::from(value("--term-bin")?)),
             "--keep" => a.keep = true,
             "-h" | "--help" => a.help = true,
             other if other.starts_with("--") => {
@@ -356,7 +366,18 @@ fn run_scripts(a: &Args) -> Result<String, String> {
         ));
     }
 
-    let exe = uiharness::launch::find_suite(a.suite.as_deref())?;
+    // The suite is only looked for when a script drives it: a run of
+    // terminal scripts needs the terminal editors instead.
+    let exe = if scripts.iter().any(|(_, _, s)| s.terminal.is_none()) {
+        Some(uiharness::launch::find_suite(a.suite.as_deref())?)
+    } else {
+        None
+    };
+    for (_, _, s) in &scripts {
+        if let Some(t) = &s.terminal {
+            uiharness::term::find_editor(&t.app, a.term_bin.as_deref())?;
+        }
+    }
     let run = Run::create(&a.run_dir).map_err(|e| format!("{}: {e}", a.run_dir.display()))?;
     // ⚠️ The default sandbox must be one no other run can name, because the app
     // persists into it: `quit` writes `session.json` plus a hot sidecar holding
@@ -395,7 +416,10 @@ fn run_scripts(a: &Args) -> Result<String, String> {
     // `target/release/suite.exe` can quietly answer for the debug build someone
     // just made — a green run about code that was never built. Naming the file
     // is what makes that visible instead of mystifying.
-    let mut out = format!("suite:    {}\n", exe.display());
+    let mut out = match &exe {
+        Some(exe) => format!("suite:    {}\n", exe.display()),
+        None => String::new(),
+    };
     let mut all_passed = true;
     for (i, (path, base, script)) in scripts.iter().enumerate() {
         let sandbox = match &a.sandbox {
@@ -405,26 +429,51 @@ fn run_scripts(a: &Args) -> Result<String, String> {
                 .join(format!("sandbox-{}-{stamp}-{i}", std::process::id())),
         };
         out.push_str(&format!("{}\n", path.display()));
+        // A terminal script starts its editor at each `open`, in a
+        // pseudo-terminal; there is no suite to launch or keep.
+        if let Some(spec) = &script.terminal {
+            let editor = match uiharness::term::find_editor(&spec.app, a.term_bin.as_deref()) {
+                Ok(e) => e,
+                Err(e) => {
+                    all_passed = false;
+                    out.push_str(&format!("  ERROR {e}\n"));
+                    break;
+                }
+            };
+            out.push_str(&format!("terminal: {}\n", editor.display()));
+            let mut term = uiharness::term::Terminal::new(spec.clone(), editor, sandbox.clone());
+            let outcome =
+                uiharness::Runner::new(&mut term, &run, base, &sandbox).run_script(script);
+            term.stop();
+            all_passed &= outcome.passed();
+            out.push_str(&outcome.report());
+            out.push_str(&format!("sandbox:  {}\n", sandbox.display()));
+            continue;
+        }
+        let Some(exe) = &exe else {
+            unreachable!("the suite was found above for every suite script");
+        };
         // A launch or connect failure stops the run rather than skipping to
         // the next file: the harness or the app is broken, not a case, and
         // the remaining files would hit the same wall. The error lands under
         // this file's path and the transcripts collected so far — the driven
         // binary, earlier files' reports — are still reported below.
-        let (app, driver) = match launch_one(&exe, &sandbox, desk.as_ref(), a.instance.as_deref()) {
-            Ok(launched) => launched,
-            Err(e) => {
-                all_passed = false;
-                let mut lines = e.lines();
-                if let Some(first) = lines.next() {
-                    out.push_str(&format!("  ERROR {first}\n"));
+        let (app, mut driver) =
+            match launch_one(exe, &sandbox, desk.as_ref(), a.instance.as_deref()) {
+                Ok(launched) => launched,
+                Err(e) => {
+                    all_passed = false;
+                    let mut lines = e.lines();
+                    if let Some(first) = lines.next() {
+                        out.push_str(&format!("  ERROR {first}\n"));
+                    }
+                    for l in lines {
+                        out.push_str(&format!("        {l}\n"));
+                    }
+                    break;
                 }
-                for l in lines {
-                    out.push_str(&format!("        {l}\n"));
-                }
-                break;
-            }
-        };
-        let outcome = uiharness::Runner::new(&driver, &run, base, &sandbox).run_script(script);
+            };
+        let outcome = uiharness::Runner::new(&mut driver, &run, base, &sandbox).run_script(script);
         all_passed &= outcome.passed();
         out.push_str(&outcome.report());
         out.push_str(&format!("sandbox:  {}\n", sandbox.display()));

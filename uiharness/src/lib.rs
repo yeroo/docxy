@@ -37,6 +37,9 @@
 //! - [`launch`] — starting a sandboxed instance and stopping it again.
 //! - [`runner`] — running a parsed script against one.
 //! - [`run`] — where a run's evidence is filed.
+//! - [`pty`], [`termkeys`], [`term`] — a terminal editor (docxy, xlsxy,
+//!   yppxy) run in a pseudo-terminal and typed into with real key bytes
+//!   (#1204).
 
 pub mod capture;
 pub mod deflate;
@@ -47,9 +50,12 @@ pub mod image;
 pub mod launch;
 pub mod png;
 pub mod probe;
+pub mod pty;
 pub mod run;
 pub mod runner;
 pub mod script;
+pub mod term;
+pub mod termkeys;
 
 pub use driver::{Driver, RegionRect, Shot, control_dir};
 pub use expect::{BorderCheck, BorderExpect, ExpectKind, check_border_clipped, parse_border};

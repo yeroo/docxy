@@ -16,7 +16,12 @@
 //! Project's (#1203): the grid's inline cell editor and Task >
 //! Information...'s constraint prompt, for
 //! `uiharness/cases/project-inputs-typing.uit`; the suite has no Task
-//! Information dialog yet (#1368).
+//! Information dialog yet (#1368). The terminal editors' prompts (#1204)
+//! are listed too, one id per field: docxy, xlsxy and yppxy are other
+//! programs, so the suite's verbs only name the case that types into each,
+//! `uiharness/cases/terminal-<app>-inputs-typing.uit`, which runs the editor
+//! in a pseudo-terminal and reads the field with the editor's own
+//! `field-read`; a test here fails when an id is missing from its case.
 //! Unlike the dialog catalogue, nothing finds a new input added outside
 //! this list: it is kept by review (`qa/inputs-typing.md`). The sheet's Name
 //! Box is display-only today (#1200 lists what it lacks), the suite has no
@@ -87,6 +92,37 @@ const fn input(id: &'static str, name: &'static str, surface: Surface, covered_b
         covered_by,
         reach: Reach::Harness,
     }
+}
+
+/// A terminal editor's prompt (#1204).
+const fn terminal(id: &'static str, name: &'static str) -> Input {
+    input(id, name, Surface::Terminal, TERMINAL)
+}
+
+/// What the suite's `pointer-click` and `field-read` answer for a terminal
+/// editor's input: the editor is another program, typed into in a
+/// pseudo-terminal by its own case, which reads it with the editor's own
+/// `field-read`.
+fn terminal_case(i: &Input) -> String {
+    let (app, file) = terminal_case_file(i.id);
+    format!(
+        "input '{}' ({}) is in the {app} terminal editor, not the suite: \
+         uiharness/cases/{file} types into it in a pseudo-terminal and reads \
+         it with {app}'s own field-read",
+        i.id, i.name
+    )
+}
+
+/// The editor a terminal input is in, and the case that types into it: the
+/// vim `:` lines need `--vim`, so they have cases of their own.
+fn terminal_case_file(id: &str) -> (&str, String) {
+    let app = id.split('-').next().unwrap_or_default();
+    let vim = if id.ends_with("-vim-command") {
+        "-vim"
+    } else {
+        ""
+    };
+    (app, format!("terminal-{app}{vim}-inputs-typing.uit"))
 }
 
 /// A Backstage input the harness cannot reach, and why.
@@ -201,24 +237,25 @@ static REGISTRY: &[Input] = &[
         Surface::Project,
         PROJECT,
     ),
-    input(
-        "docxy-prompt",
-        "the docxy terminal editor's prompts",
-        Surface::Terminal,
-        TERMINAL,
-    ),
-    input(
-        "xlsxy-prompt",
-        "the xlsxy terminal editor's prompts",
-        Surface::Terminal,
-        TERMINAL,
-    ),
-    input(
-        "yppxy-prompt",
-        "the yppxy terminal editor's prompts",
-        Surface::Terminal,
-        TERMINAL,
-    ),
+    // The terminal editors' prompts (#1204): typed into through a
+    // pseudo-terminal by uiharness/cases/terminal-<app>-inputs-typing.uit,
+    // read by each editor's own `field-read`. A prompt several commands
+    // share is one input: xlsxy's minibuffer (Rename Sheet, Find, Go To,
+    // F12's Save As, ...) and yppxy's prompt (Rename, Duration, Find, its
+    // vim `:` line, ...).
+    terminal("docxy-find", "docxy's Find bar: Find field"),
+    terminal("docxy-replace", "docxy's Find bar: Replace field"),
+    terminal("docxy-comment", "docxy's new comment text"),
+    terminal("docxy-compare-original", "docxy's Compare: original path"),
+    terminal("docxy-compare-revised", "docxy's Compare: revised path"),
+    terminal("docxy-vim-command", "docxy's vim : command line"),
+    terminal("docxy-save-as", "docxy's Backstage Save As file name"),
+    terminal("xlsxy-prompt", "xlsxy's minibuffer prompt"),
+    terminal("xlsxy-cell", "xlsxy's cell editor"),
+    terminal("xlsxy-vim-command", "xlsxy's vim : command line"),
+    terminal("xlsxy-save-as", "xlsxy's Backstage Save As file name"),
+    terminal("yppxy-prompt", "yppxy's prompt"),
+    terminal("yppxy-save-as", "yppxy's Backstage Save As file name"),
 ];
 
 /// The registry.
@@ -302,7 +339,7 @@ fn doc_probe(id: &str) -> Option<&'static str> {
 /// double-click on the active tab's name, refused while a rename is open. A
 /// document input goes to [`press_doc`]. A Backstage input says why the
 /// harness cannot reach it; a Project input goes to [`press_project`].
-/// Terminal inputs answer which issue makes them targetable.
+/// A terminal editor's input names the case that types into it.
 pub(crate) fn press(app: &crate::Docxy, id: &str) -> Result<Press, String> {
     let i = find(id)?;
     if let Some(why) = unreachable(i) {
@@ -312,6 +349,7 @@ pub(crate) fn press(app: &crate::Docxy, id: &str) -> Result<Press, String> {
         Surface::Sheet => {}
         Surface::Doc => return press_doc(app, i),
         Surface::Project => return press_project(app, i),
+        Surface::Terminal => return Err(terminal_case(i)),
         _ => return Err(not_covered(i)),
     }
     let v = crate::harness::sheet(app)?;
@@ -375,7 +413,7 @@ fn press_doc(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
 /// `field-read {"input":id}`: a sheet input as it is edited and drawn (a
 /// document input goes to [`read_doc`] and a Project input to
 /// [`read_project`]; a Backstage input says why the harness cannot reach
-/// it, and terminal inputs answer which issue makes them readable), in the
+/// it, and a terminal editor's input names the case that reads it), in the
 /// shape of a dialog
 /// field's (`value`, `focused`, `caret` and `selection` in chars, `null`
 /// while it has no focus). The formula bar and the in-cell
@@ -394,6 +432,7 @@ pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
         Surface::Sheet => {}
         Surface::Doc => return read_doc(app, i),
         Surface::Project => return read_project(app, i),
+        Surface::Terminal => return Err(terminal_case(i)),
         _ => return Err(not_covered(i)),
     }
     let v = crate::harness::sheet(app)?;
@@ -825,5 +864,62 @@ mod tests {
         assert_eq!(combo_value("font-name"), Some("Calibri"));
         assert_eq!(combo_value("font-size"), Some("11"));
         assert_eq!(combo_value("bold"), None);
+    }
+
+    /// #1204: every terminal editor's input is typed into by its case, and
+    /// the suite's verbs name that case.
+    #[test]
+    fn every_terminal_input_is_typed_into_by_its_case() {
+        let cases = [
+            (
+                "terminal-docxy-inputs-typing.uit",
+                include_str!("../../../uiharness/cases/terminal-docxy-inputs-typing.uit"),
+            ),
+            (
+                "terminal-docxy-vim-inputs-typing.uit",
+                include_str!("../../../uiharness/cases/terminal-docxy-vim-inputs-typing.uit"),
+            ),
+            (
+                "terminal-xlsxy-inputs-typing.uit",
+                include_str!("../../../uiharness/cases/terminal-xlsxy-inputs-typing.uit"),
+            ),
+            (
+                "terminal-xlsxy-vim-inputs-typing.uit",
+                include_str!("../../../uiharness/cases/terminal-xlsxy-vim-inputs-typing.uit"),
+            ),
+            (
+                "terminal-yppxy-inputs-typing.uit",
+                include_str!("../../../uiharness/cases/terminal-yppxy-inputs-typing.uit"),
+            ),
+        ];
+        let terminal: Vec<&Input> = registry()
+            .iter()
+            .filter(|i| i.surface == Surface::Terminal)
+            .collect();
+        assert_eq!(terminal.len(), 13);
+        for i in terminal {
+            let (app, file) = terminal_case_file(i.id);
+            let (_, case) = cases
+                .iter()
+                .find(|(f, _)| *f == file)
+                .unwrap_or_else(|| panic!("{}: no case {file}", i.id));
+            let vim = if file.contains("-vim-") { " --vim" } else { "" };
+            assert_eq!(
+                case.lines().next(),
+                Some(&format!("terminal {app}{vim}")[..]),
+                "{file} drives {app}"
+            );
+            assert!(
+                case.contains(&format!("{{\"input\":\"{}\"}}", i.id)),
+                "{}: {file} never reads it",
+                i.id
+            );
+            assert!(
+                case.contains(&format!("test {app} {}: ", i.id)),
+                "{}: {file} has no test for it",
+                i.id
+            );
+            assert!(terminal_case(i).contains(&file), "{}", terminal_case(i));
+        }
     }
 }
