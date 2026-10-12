@@ -20,6 +20,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use ctlcore::json::Json;
+use unicode_segmentation::UnicodeSegmentation;
 
 pub(crate) mod catalog;
 pub(crate) use catalog::DialogId;
@@ -768,6 +769,34 @@ impl std::fmt::Debug for Reaction {
     }
 }
 
+/// The grapheme-cluster boundary before `at` (a character index): the
+/// largest boundary strictly less than `at`, or 0. A caret stranded inside
+/// a cluster lands on the cluster's near side.
+fn prev_stop(text: &str, at: usize) -> usize {
+    let mut stop = 0;
+    for g in text.graphemes(true) {
+        let next = stop + g.chars().count();
+        if next >= at {
+            break;
+        }
+        stop = next;
+    }
+    stop
+}
+
+/// The grapheme-cluster boundary after `at` (a character index): the
+/// smallest boundary strictly greater than `at`, or the character count.
+fn next_stop(text: &str, at: usize) -> usize {
+    let mut stop = 0;
+    for g in text.graphemes(true) {
+        stop += g.chars().count();
+        if stop > at {
+            return stop;
+        }
+    }
+    stop
+}
+
 impl Dialog {
     /// A message box: a title, a message and buttons. The first button is the
     /// default, as in Office's message boxes.
@@ -1141,16 +1170,18 @@ impl Dialog {
     }
 
     /// Backspace in the focused field: the selection, else the character
-    /// before the caret.
+    /// (grapheme cluster) before the caret.
     pub fn backspace(&mut self) -> Result<(), String> {
-        let (from, to) = self.edit_range(|c| (c.saturating_sub(1), c));
+        let text = self.focused_text().unwrap_or_default();
+        let (from, to) = self.edit_range(|c| (prev_stop(&text, c), c));
         self.replace_range(from, to, "")
     }
 
-    /// Delete in the focused field: the selection, else the character after
-    /// the caret.
+    /// Delete in the focused field: the selection, else the character
+    /// (grapheme cluster) after the caret.
     pub fn delete(&mut self) -> Result<(), String> {
-        let (from, to) = self.edit_range(|c| (c, c + 1));
+        let text = self.focused_text().unwrap_or_default();
+        let (from, to) = self.edit_range(|c| (c, next_stop(&text, c)));
         self.replace_range(from, to, "")
     }
 
@@ -1166,20 +1197,20 @@ impl Dialog {
         self.anchor = anchor.filter(|_| extend);
     }
 
-    /// Left or Right: one character, or to the selection's edge when one is
-    /// made and `extend` is off.
+    /// Left or Right: one character (grapheme cluster), or to the selection's
+    /// edge when one is made and `extend` is off.
     pub fn move_caret(&mut self, right: bool, extend: bool) {
         let at = self.caret_at();
-        let len = self.focused_text().map_or(0, |t| t.chars().count());
+        let text = self.focused_text().unwrap_or_default();
         if !extend {
             if let Some((from, to)) = self.selection() {
                 return self.move_caret_to(if right { to } else { from }, false);
             }
         }
         let to = if right {
-            (at + 1).min(len)
+            next_stop(&text, at)
         } else {
-            at.saturating_sub(1)
+            prev_stop(&text, at)
         };
         self.move_caret_to(to, extend);
     }

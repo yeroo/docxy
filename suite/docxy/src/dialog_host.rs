@@ -4,6 +4,7 @@
 //! buttons call the same [`dialog_click`].
 use super::*;
 use crate::dialog::{self, ControlKind, Dialog, DialogOwner, DialogStack, NONE_OPEN};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Apply an accepted dialog to what it belongs to. An error refuses the
 /// press and leaves the dialog open. `Ok(true)` when it changed a document
@@ -899,19 +900,21 @@ impl Docxy {
 /// the box's border, so the one-pixel border is already outside it.
 const FIELD_INSET: f32 = 4.;
 
-/// The character gap nearest to `x` pixels along `text`, whose prefixes
+/// The character gap nearest to `x` pixels along `text` (a gap is between
+/// characters, i.e. grapheme clusters, never inside one), whose prefixes
 /// measure as `width` says.
 fn char_at_x(text: &str, x: f32, width: impl Fn(&str) -> f32) -> usize {
-    let ends: Vec<usize> = text.char_indices().map(|(i, c)| i + c.len_utf8()).collect();
+    let mut at = 0;
     let mut prev = 0.0;
-    for (n, &end) in ends.iter().enumerate() {
-        let w = width(&text[..end]);
+    for (i, g) in text.grapheme_indices(true) {
+        let w = width(&text[..i + g.len()]);
         if x < (prev + w) / 2.0 {
-            return n;
+            return at;
         }
         prev = w;
+        at += g.chars().count();
     }
-    ends.len()
+    at
 }
 
 /// The caret of a focused text field: a thin bar between two characters.
@@ -1270,6 +1273,19 @@ mod tests {
             2,
             "one character past a wide one"
         );
+    }
+
+    /// A click never lands the caret inside a grapheme cluster: with
+    /// "e\u{301}" 20px wide at 10px per character, a gap inside it (1) is
+    /// never returned; x falls to the cluster's near or far side (#1035).
+    #[test]
+    fn a_click_never_lands_inside_a_cluster() {
+        // Every character 10px wide.
+        let w = |s: &str| s.chars().count() as f32 * 10.0;
+        assert_eq!(char_at_x("e\u{301}x", 9.0, w), 0);
+        assert_eq!(char_at_x("e\u{301}x", 11.0, w), 2);
+        assert_eq!(char_at_x("e\u{301}x", 24.0, w), 2);
+        assert_eq!(char_at_x("e\u{301}x", 26.0, w), 3);
     }
 
     /// An app-level dialog stays the one shown when a tab becomes active

@@ -130,6 +130,18 @@ mod tests {
         assert!(!stack.is_open());
     }
 
+    /// Backspace on an NFD name removes the whole last cluster, so OK stores
+    /// no dangling letter (#1035).
+    #[test]
+    fn backspace_on_an_nfd_name_stores_no_dangling_letter() {
+        let mut stack = opened("Jose\u{301}", "JD");
+        stack.top_dialog_mut().unwrap().backspace().unwrap();
+        let (done, accepted) = click(&mut stack, "OK").expect("ours");
+        done.unwrap();
+        assert_eq!(accepted, Some(("Jos".into(), "JD".into())));
+        assert!(!stack.is_open());
+    }
+
     #[test]
     fn cancel_closes_and_keeps_nothing() {
         let mut stack = opened("Jane Doe", "JD");
