@@ -413,10 +413,14 @@ Styles..., Font..., Fill Down, Clear Contents and Add to Timeline
 are drawn greyed until they exist. Right-clicking a task's Gantt bar (or
 milestone diamond) selects the task and opens Project's bar menu (#1207):
 Information..., Notes... and Hyperlink... run the row menu's commands, and
-Format Bar Styles..., Format Bar... and Add to Timeline are drawn greyed. A
-column header has no menu yet (the ribbon's right-click opens Collapse the
-Ribbon, #590), and the document's Bold / Italic menu never opens
-on a Project. docxy's extras have no ribbon
+Format Bar Styles..., Format Bar... and Add to Timeline are drawn greyed.
+Right-clicking a column heading of the entry table selects that column over
+the shown tasks and opens Project's column menu (#1208): Cut, Copy and Paste
+run the table's own clipboard commands over the column, and Paste Special...,
+Wrap Text, Insert Column, Hide Column, Font..., Text Styles..., Field
+Settings, Custom Fields and Data Type are drawn greyed. The ribbon's
+right-click opens Collapse the Ribbon (#590), and the document's Bold /
+Italic menu never opens on a Project. docxy's extras have no ribbon
 button: rename and set durations in the cells (yppxy: Enter/F2 and `d`),
 delete a task with Delete on its ID or the row menu's Delete Task (yppxy `x`), clear resources with Delete
 on Resource Names (yppxy: Assign with an empty name), export with Ctrl+E or

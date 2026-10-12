@@ -53,7 +53,6 @@ test a task row's menu is Project's and Insert Task puts a blank row above
 test the document's Bold menu never opens on a Project, and Esc closes the row menu
   open ../fixtures/gantt-summary.xml
   call-error menu-open {"target":"document"} => does not open on a Project tab
-  call-error menu-open {"target":{"column":"Duration"}} => menu target 'column' is not supported yet
   call-error menu-open {"target":{"cell":"C3"}} => the cell menu opens on a sheet tab
   call-error menu-open {"target":{"row":99}} => no task with uid 99
   call menu-open {"target":{"row":1}}

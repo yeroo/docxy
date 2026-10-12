@@ -826,6 +826,40 @@ pub(crate) fn project_bar_menu(v: &ProjectView) -> Vec<crate::menu::MenuItem> {
     ]
 }
 
+/// A column heading's context menu (#1208), in Project's order (CUS-035).
+/// The heading's press selected the column, so Cut, Copy and Paste are the
+/// table's own commands over that selection, as Ctrl+X, Ctrl+C and Ctrl+V
+/// run them. The column formatting and field items have no dialog or
+/// command yet, so they are drawn disabled; Data Type is disabled in
+/// Project for a field with a fixed type, which every Entry column is.
+pub(crate) fn project_column_menu() -> Vec<crate::menu::MenuItem> {
+    use crate::menu::{
+        Entry,
+        MenuItem::{Item, Separator},
+    };
+    use ProjectAct::*;
+    let item = |id, label, icon, act: ProjectAct| {
+        Item(Entry::new(id, label, icon, Act::Project(act), true))
+    };
+    let none = |id, label| Item(Entry::unavailable(id, label));
+    vec![
+        item("cm-cut", "Cut", "cut", Cut),
+        item("cm-copy", "Copy", "copy", Copy),
+        item("cm-paste", "Paste", "paste", Paste),
+        none("cm-paste-special", "Paste Special..."),
+        Separator,
+        none("cm-wrap", "Wrap Text"),
+        none("cm-insert-column", "Insert Column"),
+        none("cm-hide-column", "Hide Column"),
+        Separator,
+        none("cm-font", "Font..."),
+        none("cm-text-styles", "Text Styles..."),
+        none("cm-field-settings", "Field Settings"),
+        none("cm-custom-fields", "Custom Fields"),
+        none("cm-data-type", "Data Type"),
+    ]
+}
+
 fn selected_task_inactive(v: &ProjectView) -> bool {
     v.selected_uid()
         .and_then(|uid| v.ed.project().tasks.iter().position(|t| t.uid == uid))

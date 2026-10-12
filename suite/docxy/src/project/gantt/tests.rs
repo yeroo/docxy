@@ -460,6 +460,45 @@ fn regions_use_body_origin_clip_both_axes_and_reject_hidden_bars() {
     }
 }
 
+/// #1208: a heading is its probe, clipped to the table pane's columns; the
+/// heading row is above the body, so it is not clipped to the body's rows.
+#[test]
+fn a_heading_region_clips_to_the_table_pane_only_across() {
+    let mut v = ProjectView::new(editor(vec![task(1, 2, 1)]).project().clone(), false);
+    v.layout(800.);
+    let table_w = v.table_w;
+    let mut probes = Probes {
+        last: vec![("project-body".into(), rect(10., 80., 800., 400.))],
+        ..Probes::default()
+    };
+    let heading = |probes: &Probes| {
+        project_region(&v, probes, harness::Region::ProjectHeading(3), Probes::get)
+    };
+    assert!(heading(&probes).unwrap_err().contains("not been laid out"));
+    probes
+        .last
+        .push(("project-heading:3".into(), rect(200., 58., 70., 22.)));
+    assert_eq!(heading(&probes).unwrap(), rect(200., 58., 70., 22.));
+    // Part scrolled under the chart: the visible part.
+    probes.last[1].1 = rect(10. + table_w - 20., 58., 70., 22.);
+    assert_eq!(
+        heading(&probes).unwrap(),
+        rect(10. + table_w - 20., 58., 20., 22.)
+    );
+    // Wholly scrolled out, either side.
+    for r in [
+        rect(10. + table_w, 58., 70., 22.),
+        rect(-70., 58., 70., 22.),
+    ] {
+        probes.last[1].1 = r;
+        assert!(
+            heading(&probes)
+                .unwrap_err()
+                .contains("the Duration heading is outside the table viewport")
+        );
+    }
+}
+
 #[test]
 fn scrollbar_regions_are_their_probed_strips() {
     let mut v = ProjectView::new(editor(vec![task(1, 2, 1)]).project().clone(), false);

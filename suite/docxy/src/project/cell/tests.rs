@@ -2218,3 +2218,144 @@ fn ctrl_delete_on_dates_of_summary_and_blank_rows() {
     assert_eq!(v(&t).ed.project(), &before);
     assert!(!v(&t).ed.dirty());
 }
+
+// ---- Column heading press (#1208) --------------------------------------------
+
+#[test]
+fn a_heading_press_selects_the_column_over_the_shown_tasks() {
+    let mut t = tab();
+    vm(&mut t).ed.select(2);
+    vm(&mut t).col = COL_NAME;
+    project_column_select(&mut t, COL_DURATION);
+    // The cursor, the active cell, is the column's first task; the anchor
+    // is its last.
+    assert_eq!(
+        (v(&t).ed.selected_uid(), v(&t).col, v(&t).anchor),
+        (Some(10), COL_DURATION, Some((30, COL_DURATION)))
+    );
+    assert!(!v(&t).row_header && !v(&t).row_drag && !v(&t).drag_made_range);
+    assert_eq!(
+        sel(&t),
+        Some((vec![10, 20, 30], COL_DURATION, COL_DURATION))
+    );
+    // Copy takes the column's cells, one line per shown task.
+    assert_eq!(crate::project_copy_text(v(&t)), "1d\n1d\n1d\n");
+    // Cut over a column that cannot clear only copies, and says so.
+    crate::project_cut(&mut t);
+    assert_eq!(
+        t.status.as_ref(),
+        "Selection copied; its columns can't be cut"
+    );
+    assert_eq!(v(&t).ed.undo_depth(), 0);
+    // Over Name, it clears the names as one undo step.
+    project_column_select(&mut t, COL_NAME);
+    crate::project_cut(&mut t);
+    assert!(v(&t).ed.project().tasks.iter().all(|t| t.name.is_empty()));
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    // Paste writes from the column's top cell down.
+    project_column_select(&mut t, COL_NAME);
+    crate::paste_project_text(&mut t, "X\nY\n");
+    let names: Vec<_> = v(&t)
+        .ed
+        .project()
+        .tasks
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    assert_eq!(names, ["X", "Y", ""]);
+}
+
+#[test]
+fn a_heading_press_selects_only_the_shown_rows() {
+    let mut t = tab();
+    vm(&mut t).ed.indent(20, 1).unwrap();
+    toggle_project_collapse(&mut t, 10);
+    project_column_select(&mut t, COL_NAME);
+    assert_eq!(sel(&t), Some((vec![10, 30], COL_NAME, COL_NAME)));
+    assert_eq!(crate::project_copy_text(v(&t)), "Task 1\nTask 3\n");
+}
+
+#[test]
+fn a_heading_press_on_one_task_selects_its_cell() {
+    let mut t = tab();
+    vm(&mut t).ed.delete_task(30).unwrap();
+    vm(&mut t).ed.delete_task(20).unwrap();
+    project_column_select(&mut t, COL_ID);
+    // The anchor is the cursor: no range, the cursor cell is the selection,
+    // so Cut takes the single-cell branch.
+    assert_eq!((v(&t).ed.selected_uid(), v(&t).col), (Some(10), COL_ID));
+    assert_eq!(sel(&t), None);
+    crate::project_cut(&mut t);
+    assert_eq!(t.status.as_ref(), "ID can't be cut");
+    project_column_select(&mut t, COL_NAME);
+    assert_eq!(crate::project_copy_text(v(&t)), "Task 1");
+    crate::project_cut(&mut t);
+    assert_eq!(v(&t).ed.project().task(10).unwrap().name, "");
+}
+
+#[test]
+fn a_heading_press_on_an_empty_plan_goes_to_the_entry_row() {
+    let mut t = tab();
+    for uid in [30, 20, 10] {
+        vm(&mut t).ed.delete_task(uid).unwrap();
+    }
+    let before = v(&t).ed.project().clone();
+    project_column_select(&mut t, COL_DURATION);
+    assert!(v(&t).on_entry_row());
+    assert_eq!((v(&t).anchor, v(&t).col), (None, COL_DURATION));
+    assert_eq!(crate::project_copy_text(v(&t)), "");
+    crate::project_cut(&mut t);
+    assert_eq!(v(&t).ed.project(), &before);
+}
+
+#[test]
+fn a_refused_commit_keeps_the_edit_and_selects_nothing() {
+    let mut t = tab();
+    vm(&mut t).ed.select(1);
+    edit(&mut t, COL_DURATION, "invalid");
+    project_column_select(&mut t, COL_NAME);
+    assert_eq!(v(&t).cell.as_ref().unwrap().buf, "invalid");
+    assert_eq!(
+        (v(&t).ed.selected_uid(), v(&t).col, v(&t).anchor),
+        (Some(20), COL_DURATION, None)
+    );
+    // A commit that takes goes on to select the column.
+    let mut t = tab();
+    edit(&mut t, COL_NAME, "Named");
+    project_column_select(&mut t, COL_DURATION);
+    assert!(v(&t).cell.is_none());
+    assert_eq!(v(&t).ed.project().task(10).unwrap().name, "Named");
+    assert_eq!(
+        sel(&t),
+        Some((vec![10, 20, 30], COL_DURATION, COL_DURATION))
+    );
+}
+
+#[test]
+fn a_heading_press_reveals_its_column_but_scrolls_no_row_into_view() {
+    let mut t = tab();
+    vm(&mut t).ed.select(2);
+    vm(&mut t).col = COL_ID;
+    // Nothing queued yet.
+    let take_reveal = |t: &DocTab| {
+        v(t).scroll
+            .0
+            .borrow_mut()
+            .deferred_scroll_to_item
+            .take()
+            .map(|request| request.item_index)
+    };
+    take_reveal(&t);
+    assert_eq!(v(&t).table_x.get(), 0.);
+    // Resource Names lies past the default table width: the press reveals
+    // it across, as a cell press does, but the cursor's move to the first
+    // task queues no row reveal, so the table stays where it was scrolled.
+    project_column_select(&mut t, COL_RESOURCES);
+    assert_eq!(v(&t).ed.selected_uid(), Some(10));
+    assert!(v(&t).table_x.get() > 0.);
+    assert_eq!(take_reveal(&t), None);
+    // A cell press, by contrast, reveals its row.
+    project_cell_press(&mut t, 2, COL_ID, false);
+    assert_eq!(take_reveal(&t), Some(2));
+    assert_eq!(v(&t).table_x.get(), 0.);
+}

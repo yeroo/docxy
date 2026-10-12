@@ -524,6 +524,22 @@ fn project_region(
             .ok_or_else(|| "the split bar has not been laid out".into());
     }
     let body = lookup(probes, "project-body").ok_or("the Project body has not been laid out")?;
+    if let harness::Region::ProjectHeading(col) = region {
+        let heading = lookup(probes, &format!("project-heading:{col}"))
+            .ok_or("the entry table's headings have not been laid out")?;
+        // The heading row sits above the body: clip to the table pane's
+        // columns only.
+        let table = Bounds {
+            origin: point(body.origin.x, heading.origin.y),
+            size: size(px(v.table_w), heading.size.height),
+        };
+        return intersect(heading, table).ok_or_else(|| {
+            format!(
+                "the {} heading is outside the table viewport",
+                COLUMNS[col.min(COLUMN_COUNT - 1)]
+            )
+        });
+    }
     let viewport =
         gantt_viewport(body, v.table_w, v.gantt_w).ok_or("the Gantt viewport is empty")?;
     match region {
@@ -993,19 +1009,41 @@ const fn sum_widths() -> f32 {
     total
 }
 
-fn row_cells(values: [String; COLUMN_COUNT], indent: f32) -> impl IntoElement {
+/// The entry table's headings, in the rows' column widths and padding. A
+/// right press on one selects its column and opens the column's menu
+/// (#1208).
+fn heading_cells(
+    index: usize,
+    probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
+    cx: &mut Context<Docxy>,
+) -> impl IntoElement {
     h_flex()
         .h(px(ROW_H))
         .items_center()
-        .children(values.into_iter().enumerate().map(|(i, value)| {
+        .children(COLUMNS.iter().enumerate().map(|(col, name)| {
             div()
-                .w(px(WIDTHS[i]))
+                .id(("project-heading", col))
+                .relative()
+                .h_full()
+                .flex()
+                .items_center()
+                .w(px(WIDTHS[col]))
                 .flex_none()
                 .px_2()
                 .overflow_hidden()
                 .whitespace_nowrap()
-                .when(i == COL_NAME, |d| d.pl(px(8. + indent)))
-                .child(value)
+                .when(col == COL_NAME, |d| d.pl(px(8.)))
+                .child(probe(probes, format!("project-heading:{col}")))
+                .child(*name)
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        if this.active == index {
+                            let _ = this.open_column_menu(col, ev.position, window, cx);
+                        }
+                    }),
+                )
         }))
 }
 
@@ -1281,11 +1319,7 @@ pub(super) fn project_el(
                         .flex_none()
                         .bg(pal.panel)
                         .font_weight(FontWeight::BOLD)
-                        .child(pane(
-                            table_w,
-                            table_x,
-                            row_cells(COLUMNS.map(str::to_string), 0.),
-                        ))
+                        .child(pane(table_w, table_x, heading_cells(index, probes, cx)))
                         .child(chart_pane(
                             gantt_w,
                             gantt_x,

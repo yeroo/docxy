@@ -104,7 +104,6 @@ test a bar menu is refused, by name, where there is no bar to right-click
   click A1
   key alt+shift+-
   call-error menu-open {"target":{"bar":2}} => hidden under a collapsed summary
-  call-error menu-open {"target":{"column":"Duration"}} => menu target 'column' is not supported yet
   open copy:../fixtures/basic.docx
   call-error menu-open {"target":{"bar":2}} => a bar menu needs a Project tab
 

@@ -14445,6 +14445,7 @@ impl Docxy {
             .ok_or_else(|| format!("{} is not visible", harness::region_name(region))),
             Region::Gantt
             | Region::Bar(_)
+            | Region::ProjectHeading(_)
             | Region::ProjectHbarTable
             | Region::ProjectHbarChart
             | Region::ProjectVbar
@@ -29405,11 +29406,12 @@ impl Docxy {
         self.menu.take().is_some()
     }
 
-    /// The active tab's selected task (`Some(None)` on the entry row), or
-    /// `None` off a Project, for checking a menu still fits its target.
-    fn project_selection(&self) -> Option<Option<i32>> {
+    /// The active tab's selected task (`None` on the entry row) and cursor
+    /// column, or `None` off a Project, for checking a menu still fits its
+    /// target.
+    fn project_selection(&self) -> Option<(Option<i32>, usize)> {
         match self.tabs.get(self.active).map(|t| &t.surface) {
-            Some(Surface::Project(v)) => Some(v.selected_uid()),
+            Some(Surface::Project(v)) => Some((v.selected_uid(), v.col)),
             _ => None,
         }
     }
@@ -29547,6 +29549,25 @@ impl Docxy {
         Ok(())
     }
 
+    /// A right-click on a heading of a Project's entry table (column `col`),
+    /// and `menu-open {"column"}` (#1208). The press selects the column over
+    /// the shown tasks, committing an open cell edit, then the column's menu
+    /// opens. A commit the plan refuses keeps the edit and its status, and no
+    /// menu opens.
+    pub(crate) fn open_column_menu(
+        &mut self,
+        col: usize,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let col = self
+            .press_project(window, cx, |tab| crate::project_column_select(tab, col))?
+            .col;
+        self.open_menu(menu::MenuTarget::Column(col), at, project_column_menu(), cx);
+        Ok(())
+    }
+
     /// The press a row or bar menu opens with: select row `row` of the
     /// active Project as a left click does (on column `col`, if any),
     /// committing an open cell edit, and refocus. A commit the plan refuses
@@ -29558,16 +29579,34 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<&ProjectView, String> {
+        self.press_project(window, cx, |tab| {
+            if let Surface::Project(v) = &mut tab.surface {
+                // The menu acts on the row under the pointer: a stale drag
+                // flag must not swallow this click and leave the cursor on an
+                // older row.
+                v.drag_made_range = false;
+            }
+            crate::project_row_click(tab, row, col, false);
+        })
+    }
+
+    /// The press a Project menu opens with: `press` on the active Project
+    /// tab (it commits an open cell edit as a click does), then refocus. A
+    /// commit the plan refuses keeps the edit and its status, and is the
+    /// error.
+    fn press_project(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        press: impl FnOnce(&mut DocTab),
+    ) -> Result<&ProjectView, String> {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return Err("no tab is open".into());
         };
-        let Surface::Project(v) = &mut tab.surface else {
+        if !matches!(tab.surface, Surface::Project(_)) {
             return Err("the active tab is not a Project".into());
-        };
-        // The menu acts on the row under the pointer: a stale drag flag must
-        // not swallow this click and leave the cursor on an older row.
-        v.drag_made_range = false;
-        crate::project_row_click(tab, row, col, false);
+        }
+        press(tab);
         let committed = match &tab.surface {
             Surface::Project(v) if v.cell.is_some() => {
                 Err(format!("the open cell edit did not commit: {}", tab.status))

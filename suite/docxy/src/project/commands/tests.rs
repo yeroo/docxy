@@ -3888,6 +3888,78 @@ fn the_bar_menu_lists_projects_items_in_order() {
     assert!(items(&t).iter().all(|(_, enabled, _)| !enabled));
 }
 
+/// #1208: a column heading's context menu is Project's (CUS-035), in
+/// Project's order; Cut, Copy and Paste run the table's clipboard commands,
+/// as the row menu's do, and the rest have no command yet.
+#[test]
+fn the_column_menu_lists_projects_items_in_order() {
+    use crate::menu::MenuItem;
+    let items: Vec<_> = project_column_menu()
+        .into_iter()
+        .map(|item| match item {
+            MenuItem::Item(e) => (e.label, e.enabled, e.act),
+            MenuItem::Separator => ("-".into(), false, None),
+            other => panic!("the column menu draws no {other:?}"),
+        })
+        .collect();
+    let labels: Vec<_> = items.iter().map(|(l, ..)| l.as_str()).collect();
+    assert_eq!(
+        labels,
+        [
+            "Cut",
+            "Copy",
+            "Paste",
+            "Paste Special...",
+            "-",
+            "Wrap Text",
+            "Insert Column",
+            "Hide Column",
+            "-",
+            "Font...",
+            "Text Styles...",
+            "Field Settings",
+            "Custom Fields",
+            "Data Type",
+        ]
+    );
+    let enabled: Vec<_> = items
+        .iter()
+        .filter(|(_, enabled, _)| *enabled)
+        .map(|(label, _, act)| (label.as_str(), *act))
+        .collect();
+    assert_eq!(
+        enabled,
+        [
+            ("Cut", Some(Act::Project(ProjectAct::Cut))),
+            ("Copy", Some(Act::Project(ProjectAct::Copy))),
+            ("Paste", Some(Act::Project(ProjectAct::Paste))),
+        ]
+    );
+    let t = tab();
+    for label in ["Cut", "Copy", "Paste"] {
+        assert!(
+            enabled_items(&t).contains(&label.to_string()),
+            "the row menu runs {label} too"
+        );
+    }
+    // An item with no command is never enabled, and every icon loads.
+    for item in project_column_menu() {
+        if let MenuItem::Item(e) = item {
+            assert!(e.act.is_some() || !e.enabled, "{}", e.label);
+            assert!(e.submenu.is_empty(), "{} opens no submenu", e.label);
+            assert!(
+                e.icon.is_empty()
+                    || Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("assets/icons")
+                        .join(format!("{}.svg", e.icon))
+                        .exists(),
+                "{}",
+                e.icon
+            );
+        }
+    }
+}
+
 /// #418: the row menu's Hyperlink... opens the prompt on a task row only,
 /// like Information....
 #[test]
