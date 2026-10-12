@@ -5079,8 +5079,14 @@ impl App {
     // --- cell formatting -----------------------------------------------------
 
     /// Apply `f` to the selection as one undoable edit, show `label`, and
-    /// keep both for F4 / Ctrl+Y to repeat (#1169).
+    /// keep both for F4 / Ctrl+Y to repeat (#1169). On a protected sheet it
+    /// is refused with the protected status, and not remembered.
     fn apply_format(&mut self, label: impl Into<String>, f: impl Fn(&mut Xf) + 'static) {
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return;
+        }
         let f: FormatFn = std::rc::Rc::new(f);
         let label = label.into();
         self.format_selection(&*f);
@@ -5155,11 +5161,17 @@ impl App {
     }
 
     /// Repeat the last formatting change on the selection: one undo step,
-    /// which clears the redo stack. False when nothing is remembered.
+    /// which clears the redo stack. On a protected sheet it is refused (true,
+    /// with the protected status). False when nothing is remembered.
     fn repeat_format(&mut self) -> bool {
         let Some((f, label)) = self.last_format.clone() else {
             return false;
         };
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return true;
+        }
         self.format_selection(&*f);
         self.status = Some(label);
         true
@@ -5167,7 +5179,9 @@ impl App {
 
     /// Excel's one Redo/Repeat command, on F4 and Ctrl+Y alike (#1169): a
     /// pending redo is redone (and selects what it redoes); with nothing to
-    /// redo the last format is repeated on the selection.
+    /// redo the last format is repeated on the selection — except on a
+    /// protected sheet, where the repeat is refused while a pending redo
+    /// still redoes.
     fn redo_or_repeat(&mut self) {
         if !self.redo.is_empty() {
             self.redo();
@@ -22476,6 +22490,86 @@ mod tests {
         assert_eq!(app.undo.len(), 0);
         assert!(!xf_at(&app, 2, 2).bold);
         assert_eq!(app.status.as_deref(), Some("Can't repeat"));
+    }
+
+    #[test]
+    fn formatting_a_protected_sheet_is_refused() {
+        // Protected directly (not toggle_protection) so nothing is modified yet.
+        let mut app = repeat_app();
+        app.pkg.workbook.sheets[0].set_protected(true);
+        let undo_len = app.undo.len();
+        // Ctrl+B.
+        chord(&mut app, 'b');
+        assert!(!xf_at(&app, 0, 0).bold);
+        assert_eq!(app.undo.len(), undo_len);
+        assert!(!app.modified);
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+        // The ribbon's Bold.
+        app.ribbon_act(ribbon::Act::Bold);
+        assert!(!xf_at(&app, 0, 0).bold);
+        assert_eq!(app.undo.len(), undo_len);
+        assert!(!app.modified);
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+        // The Format Cells dialog (Font section, Bold).
+        app.open_format_dialog();
+        let d = app.format_dialog.as_mut().unwrap();
+        d.section = 1;
+        d.sel = 0;
+        app.apply_format_dialog();
+        assert!(!xf_at(&app, 0, 0).bold);
+        assert_eq!(app.undo.len(), undo_len);
+        assert!(!app.modified);
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+    }
+
+    #[test]
+    fn repeat_on_a_protected_sheet_is_refused_but_a_redo_still_runs() {
+        // The refusal half: F4 and Ctrl+Y with a remembered format and an
+        // empty redo stack change nothing and say so (not "Can't repeat").
+        for (key, m) in [
+            (KeyCode::F(4), KeyModifiers::NONE),
+            (KeyCode::Char('y'), KeyModifiers::CONTROL),
+        ] {
+            let mut app = repeat_app();
+            chord(&mut app, 'b'); // A1: Bold, remembered
+            app.toggle_protection();
+            let undo_len = app.undo.len();
+            go(&mut app, 1, 2); // C2
+            press_mod(&mut app, key, m);
+            assert!(!xf_at(&app, 1, 2).bold, "{key:?}: refused on C2");
+            assert_eq!(app.undo.len(), undo_len, "{key:?}: no undo step");
+            assert!(app.redo.is_empty(), "{key:?}");
+            assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS), "{key:?}");
+        }
+        // The redo half: a pending redo still runs on a protected sheet.
+        let mut app = repeat_app();
+        chord(&mut app, 'b'); // A1
+        go(&mut app, 2, 2); // C3
+        press(&mut app, KeyCode::F(4)); // repeats Bold on C3
+        assert!(xf_at(&app, 2, 2).bold);
+        chord(&mut app, 'z'); // undo C3: a redo is now pending
+        assert!(!xf_at(&app, 2, 2).bold);
+        // Direct, not toggle_protection: structural would clear the redo stack.
+        app.pkg.workbook.sheets[0].set_protected(true);
+        go(&mut app, 3, 2); // C4
+        press(&mut app, KeyCode::F(4));
+        assert!(xf_at(&app, 2, 2).bold, "the redo puts C3's bold back");
+        assert!(!xf_at(&app, 3, 2).bold, "C4 stays plain");
+        assert_eq!(app.status.as_deref(), Some("Redid"));
+    }
+
+    #[test]
+    fn a_format_refused_on_a_protected_sheet_is_not_remembered() {
+        let mut app = repeat_app();
+        chord(&mut app, 'b'); // A1: Bold remembered
+        app.pkg.workbook.sheets[0].set_protected(true);
+        chord(&mut app, 'i'); // refused: must not replace the remembered Bold
+        app.pkg.workbook.sheets[0].set_protected(false);
+        go(&mut app, 1, 1); // B2
+        press(&mut app, KeyCode::F(4));
+        assert!(xf_at(&app, 1, 1).bold, "the remembered Bold repeats");
+        assert!(!xf_at(&app, 1, 1).italic, "the refused Italic does not");
+        assert_eq!(app.status.as_deref(), Some("Bold"));
     }
 
     #[test]
