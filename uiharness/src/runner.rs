@@ -376,6 +376,7 @@ impl<'a> Runner<'a> {
             Assertion::State {
                 key,
                 negated,
+                exact,
                 value,
             } => {
                 let path = key.strip_prefix("reply.").unwrap_or(key);
@@ -400,7 +401,7 @@ impl<'a> Runner<'a> {
                     );
                 };
                 let got = scalar_text(got);
-                if value_matches(&got, value, *negated) {
+                if value_matches_as(&got, value, *negated, *exact) {
                     out
                 } else {
                     fail(
@@ -416,11 +417,12 @@ impl<'a> Runner<'a> {
             Assertion::Cell {
                 cell,
                 negated,
+                exact,
                 value,
             } => match self.cell_text(cell) {
                 Err(e) => err(out, e),
                 Ok(got) => {
-                    if value_matches(&got, value, *negated) {
+                    if value_matches_as(&got, value, *negated, *exact) {
                         out
                     } else {
                         fail(
@@ -645,6 +647,16 @@ pub fn value_matches(observed: &str, expected: &str, negated: bool) -> bool {
     same != negated
 }
 
+/// [`value_matches`], or with `exact` (`is exactly`, #1200) the text as
+/// written: case, surrounding spaces and all, with no word for `null`.
+pub fn value_matches_as(observed: &str, expected: &str, negated: bool, exact: bool) -> bool {
+    if exact {
+        (observed == expected) != negated
+    } else {
+        value_matches(observed, expected, negated)
+    }
+}
+
 /// Whether the app is drawing, or is armed to draw, a fill preview.
 ///
 /// Both keys, not one. A sweep that armed the fill handle shows in `filling`
@@ -780,6 +792,23 @@ mod tests {
         assert!(!value_matches("true", "false", false));
         assert!(value_matches("true", "false", true), "negation flips it");
         assert!(!value_matches("true", "true", true));
+    }
+
+    /// #1200: `is exactly` tells a lost Shift and a dropped space apart.
+    #[test]
+    fn an_exact_value_matches_only_as_written() {
+        assert!(value_matches_as("Ab1 ", "Ab1 ", false, true));
+        assert!(!value_matches_as("ab1 ", "Ab1 ", false, true));
+        assert!(!value_matches_as("Ab1", "Ab1 ", false, true));
+        assert!(
+            value_matches_as("ab1", "Ab1", true, true),
+            "negation flips it"
+        );
+        assert!(!value_matches_as("null", "nothing", false, true));
+        assert!(
+            value_matches_as("ab1", "Ab1", false, false),
+            "not exact folds case"
+        );
     }
 
     /// `null` has three spellings because all three turn up in a case, and a
