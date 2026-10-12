@@ -1491,9 +1491,13 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             ClearCell => {
                 // Over a range: clear its Name, Predecessors and Resource
                 // Names cells, as Cut does, without the clipboard; never
-                // delete a task. The range is consumed either way, so read
-                // it before the anchor goes.
-                let sel = v.selection();
+                // delete a task. A whole-row selection is the row header's
+                // (an ID click, or a range across every column): Delete
+                // deletes the cursor's task, as before. The range is
+                // consumed either way, so read it before the anchor goes.
+                let sel = v
+                    .selection()
+                    .filter(|s| !(*s.cols.start() == COL_ID && *s.cols.end() == COLUMN_COUNT - 1));
                 v.anchor = None;
                 if let Some(sel) = sel {
                     let cols = range_clear_cols(&sel);

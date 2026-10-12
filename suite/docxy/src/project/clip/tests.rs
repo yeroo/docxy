@@ -588,8 +588,8 @@ fn delete_after_shift_home_clears_the_row_and_keeps_the_task() {
     let mut t = tab();
     at(&mut t, 0, COL_NAME);
     shift_key(&mut t, "home");
-    // The range is the row's ID..Name span with the cursor on its ID column:
-    // today's code would delete this task.
+    // The range is the row's ID..Name span with the cursor on its ID column,
+    // where a single-cell Delete would delete the task.
     let sel = v(&t).selection().unwrap();
     assert_eq!(*sel.cols.start(), COL_ID);
     assert_eq!(v(&t).col, COL_ID);
@@ -597,6 +597,23 @@ fn delete_after_shift_home_clears_the_row_and_keeps_the_task() {
     assert_eq!(tasks(&t).len(), 2, "the task is not deleted");
     assert_eq!(tasks(&t)[0].1, "", "its Name cleared");
     assert!(t.dialogs.top().is_none(), "no summary question opens");
+    assert_eq!(sel_count(&t), None, "the delete consumed the range");
+}
+
+#[test]
+fn delete_after_an_id_click_deletes_the_task() {
+    let mut t = tab();
+    // A click on the ID cell selects the whole row, as the row header does:
+    // Delete deletes the cursor's task, not the row's cells.
+    crate::project_cell_press(&mut t, 0, COL_ID, false);
+    crate::project_cell_release(&mut t);
+    assert!(
+        v(&t).selection().is_some(),
+        "an ID click selects the whole row"
+    );
+    press_delete(&mut t);
+    assert_eq!(tasks(&t).len(), 1, "the cursor's task is deleted");
+    assert!(v(&t).ed.project().task(1).is_none());
     assert_eq!(sel_count(&t), None, "the delete consumed the range");
 }
 
@@ -616,10 +633,10 @@ fn delete_over_a_range_with_no_clearable_column_changes_nothing() {
 #[test]
 fn delete_over_a_range_never_deletes_a_task_across_the_id_column() {
     let mut t = tab();
-    // Whole rows: an ID-press drag over both tasks.
-    crate::project_cell_press(&mut t, 0, COL_ID, false);
-    crate::project_cell_drag_over(&mut t, 1, COL_ID);
-    crate::project_cell_release(&mut t);
+    // ID..Predecessors spans the ID column without being the whole row (the
+    // Resource Names column is not covered), so Delete clears the range
+    // instead of deleting the cursor's task.
+    select_range(&mut t, COL_ID, 1, COL_PREDECESSORS);
     let depth = v(&t).ed.undo_depth();
     press_delete(&mut t);
     assert_eq!(tasks(&t).len(), 2, "both tasks survive their ID cells");

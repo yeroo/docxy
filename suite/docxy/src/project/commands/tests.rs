@@ -3878,6 +3878,27 @@ fn delete_task_deletes_from_any_column_and_asks_for_a_summary() {
     assert_eq!(v(&t).ed.project(), &before);
 }
 
+#[test]
+fn delete_after_an_id_click_on_a_summary_asks() {
+    // An ID click selects the whole row, as the row header does: over that
+    // selection Delete keeps asking for a summary, as it did before #1260.
+    let mut t = summary_tab();
+    let before = v(&t).ed.project().clone();
+    project_cell_press(&mut t, 0, COL_ID, false);
+    project_cell_release(&mut t);
+    assert!(
+        v(&t).selection().is_some(),
+        "an ID click selects the whole row"
+    );
+    assert_eq!(
+        project_input(&mut t, "delete", None, Modifiers::default()),
+        Some(ProjectAct::ClearCell)
+    );
+    apply_project_act(&mut t, ProjectAct::ClearCell);
+    assert_eq!(t.dialogs.top_id(), "delete-summary");
+    assert_eq!(v(&t).ed.project(), &before, "nothing is deleted yet");
+}
+
 /// #397: Set Baseline is a split button: the primary sets the baseline, its
 /// menu offers Set Baseline... and Clear Baseline..., and the letters B and
 /// L still reach both from the keyboard.
