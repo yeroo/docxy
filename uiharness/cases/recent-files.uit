@@ -1,0 +1,40 @@
+# #1194: File › Open lists the recent files, newest first, and a click on a
+# row opens it. Every case in the run shares one store, so the lists are read
+# by position and name, never by count. The relaunch and the missing-file row
+# are uiharness/tests/recent_files.rs.
+test the newest file is first and a reopened one moves to the top once
+  open copy:"../fixtures/basic.docx" as recent-a.docx
+  open copy:"../fixtures/basic.xlsx" as recent-b.xlsx
+  open copy:"../fixtures/gantt-summary.xml" as recent-e.xml
+  call recent-files {}
+  assert reply.files.0.name is recent-e.xml
+  assert reply.files.0.kind is project
+  assert reply.files.0.exists is true
+  assert reply.files.1.name is recent-b.xlsx
+  assert reply.files.1.kind is xlsx
+  assert reply.files.2.name is recent-a.docx
+  assert reply.files.2.kind is docx
+  call backstage {"action":"open"}
+  shot window
+  call recent-open {"index":2}
+  assert title is recent-a.docx
+  call backstage {"action":"read"}
+  assert reply.open is false
+  call recent-files {}
+  assert reply.files.0.name is recent-a.docx
+  assert reply.files.1.name is recent-e.xml
+  assert reply.files.2.name is recent-b.xlsx
+
+test a save under a new name puts the new file on top
+  open copy:"../fixtures/basic.docx" as recent-c.docx
+  type x
+  call save-as {"path":"recent-c-renamed.docx"}
+  call recent-files {}
+  assert reply.files.0.name is recent-c-renamed.docx
+  assert reply.files.1.name is recent-c.docx
+
+test a Recent row is clicked only on the File screen
+  open copy:"../fixtures/basic.docx" as recent-d.docx
+  call-error recent-open {"index":0} => the File screen is not open (backstage open)
+  call backstage {"action":"open"}
+  call-error recent-open {"index":999} => no recent file 999

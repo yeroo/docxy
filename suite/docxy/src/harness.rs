@@ -2956,6 +2956,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "autocorrect"
             | "trusted-clear"
             | "open-draft"
+            | "recent-open"
             | "dialog-set"
             | "dialog-tab"
             | "dialog-click"
@@ -3474,6 +3475,25 @@ fn kind_name(kind: crate::Kind) -> &'static str {
 }
 
 /// `tab-list`: every open tab, in strip order, and which one is active.
+/// `recent-files`'s reply (#1194): each file newest first, with its name,
+/// the kind of tab it opens as, and whether it still exists.
+fn recent_files_json(files: &[std::path::PathBuf]) -> Json {
+    let files = files
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            Json::obj(vec![
+                ("index", Json::Num(i as f64)),
+                ("path", Json::Str(p.to_string_lossy().into_owned())),
+                ("name", Json::Str(crate::file_name(p))),
+                ("kind", Json::Str(kind_name(crate::path_kind(p)).into())),
+                ("exists", Json::Bool(p.exists())),
+            ])
+        })
+        .collect();
+    Json::obj(vec![("files", Json::Arr(files))])
+}
+
 fn tab_list(tabs: &[crate::DocTab], active: usize, os_title: Option<&str>) -> Json {
     let window_title = crate::doc_name::window_title(tabs.get(active).map(|t| t.title.as_ref()));
     let tabs = tabs
@@ -4765,6 +4785,24 @@ fn dispatch_verb(
             }
             Done::ok(backstage_layout_json(app))
         }
+        // The recent files (#1194), read from the store as it is now, not
+        // from the Backstage's copy: what the next Backstage will show.
+        "recent-files" => Done::ok(recent_files_json(&crate::recent_files::list(
+            &crate::config_root(),
+        ))),
+        // A click on the Open page's Recent row `index` (#1194), counted in
+        // the store as it is now; the click itself carries the row's path.
+        "recent-open" => {
+            if !app.backstage {
+                return Err("the File screen is not open (backstage open)".into());
+            }
+            app.refuse_under_dialog()?;
+            let i = arg_usize(args, "index")?;
+            let files = crate::recent_files::list(&crate::config_root());
+            let path = files.get(i).ok_or(format!("no recent file {i}"))?;
+            app.open_recent(path, cx);
+            Done::ok(state(app, window, cx))
+        }
         "pointer-drag" => {
             app.refuse_under_dialog()?;
             let from_name = arg_str(args, "from")?;
@@ -5818,6 +5856,42 @@ mod tests {
         assert_eq!(instance_name_for(false, None, 42), "suite-42");
     }
 
+    /// #1194: `recent-files` lists each file newest first, with its index,
+    /// name, the kind of tab it opens as, and whether it still exists.
+    #[test]
+    fn recent_files_reports_each_file_in_order() {
+        let dir = std::env::temp_dir().join(format!("docxy-recent-json-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("Budget.xlsx");
+        std::fs::write(&book, b"x").unwrap();
+        let gone = dir.join("Letter.docx");
+        let plan = dir.join("Plan.yppx");
+        let reply = recent_files_json(&[book.clone(), gone, plan]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let files = match reply.get("files") {
+            Some(Json::Arr(files)) => files.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(files.len(), 3);
+        let field = |i: usize, k: &str| files[i].get(k).cloned().unwrap();
+        assert_eq!(field(0, "index"), Json::Num(0.));
+        assert_eq!(
+            field(0, "path"),
+            Json::Str(book.to_string_lossy().into_owned())
+        );
+        assert_eq!(field(0, "name"), Json::Str("Budget.xlsx".into()));
+        assert_eq!(field(0, "kind"), Json::Str("xlsx".into()));
+        assert_eq!(field(0, "exists"), Json::Bool(true));
+        assert_eq!(field(1, "index"), Json::Num(1.));
+        assert_eq!(field(1, "kind"), Json::Str("docx".into()));
+        assert_eq!(field(1, "exists"), Json::Bool(false));
+        assert_eq!(field(2, "kind"), Json::Str("project".into()));
+        assert_eq!(
+            recent_files_json(&[]),
+            Json::obj(vec![("files", Json::Arr(vec![]))])
+        );
+    }
+
     /// `tab-list` over one tab of every kind: a blank plan has no path, an
     /// .mpp is imported, and `active` and `dirty` are each tab's own.
     #[test]
@@ -6676,6 +6750,7 @@ mod tests {
             "close-window",
             "window-new",
             "window-select",
+            "recent-open",
             "selection-set",
             "doc-click",
             "open",
@@ -6717,6 +6792,7 @@ mod tests {
             "pointer-drag",
             "pointer-wheel",
             "backstage-layout",
+            "recent-files",
         ] {
             assert!(!closes_menu(verb, &Json::obj(vec![])), "{verb}");
         }
