@@ -55,6 +55,16 @@ Every editable input in the suite is typed into with real keys by a case:
   set of steps when it adds the Properties. Settings' typed
   values are the User name and Custom Lists dialogs, which the catalogue
   covers from Backstage (the #1027 path).
+- **Project's inputs** (#1203) are in the hand-written
+  `uiharness/cases/project-inputs-typing.uit`: the grid's inline cell editor
+  (`project-cell`), which a double-click on the cursor's cell opens, and
+  Task > Information... (`task-info`), which opens the prompt bar's
+  Constraint prompt by its KeyTips, Alt, T, C. Each test opens its own copy
+  of `project-clipboard.xml` and checks one step against what Project does;
+  Enter sets the task's name or constraint. The suite has no Task Information
+  dialog yet (#1368); when it lands, the catalogue lists it. The bar's other
+  prompts (Notes, Hyperlink, Assign, Move, Predecessor, Find) are the same
+  field, so they are not typed into again.
 - **A field broken today** is listed in `uiharness/cases/expected-failures.txt`
   with its own issue, per failing step, so the sweep stays green and any new
   failure fails CI. Remove the entry in the change that fixes it.

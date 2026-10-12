@@ -12,7 +12,11 @@
 //! `uiharness/cases/doc-inputs-typing.uit`. So is the sheet tab's inline
 //! rename (#1202), for `uiharness/cases/backstage-inputs-typing.uit`, which
 //! also pins why Backstage's are not typed into: Save As's file name is the
-//! OS's file dialog, and File > Info has no properties yet (#1364).
+//! OS's file dialog, and File > Info has no properties yet (#1364). So are
+//! Project's (#1203): the grid's inline cell editor and Task >
+//! Information...'s constraint prompt, for
+//! `uiharness/cases/project-inputs-typing.uit`; the suite has no Task
+//! Information dialog yet (#1368).
 //! Unlike the dialog catalogue, nothing finds a new input added outside
 //! this list: it is kept by review (`qa/inputs-typing.md`). The sheet's Name
 //! Box is display-only today (#1200 lists what it lacks), the suite has no
@@ -187,9 +191,13 @@ static REGISTRY: &[Input] = &[
         Surface::Project,
         PROJECT,
     ),
+    // Task > Information... opens the prompt bar's Constraint prompt: the
+    // suite has no Task Information dialog yet (#1368). The bar's other
+    // prompts (Notes, Hyperlink, Assign, Move, Predecessor, Find) are the
+    // same field on the same key path, so they are not inputs of their own.
     input(
         "task-info",
-        "Task Information's fields",
+        "Task > Information...'s constraint prompt",
         Surface::Project,
         PROJECT,
     ),
@@ -293,8 +301,8 @@ fn doc_probe(id: &str) -> Option<&'static str> {
 /// click on the cell would commit it; the sheet tab's rename is a
 /// double-click on the active tab's name, refused while a rename is open. A
 /// document input goes to [`press_doc`]. A Backstage input says why the
-/// harness cannot reach it; Project and terminal inputs answer which issue
-/// makes them targetable.
+/// harness cannot reach it; a Project input goes to [`press_project`].
+/// Terminal inputs answer which issue makes them targetable.
 pub(crate) fn press(app: &crate::Docxy, id: &str) -> Result<Press, String> {
     let i = find(id)?;
     if let Some(why) = unreachable(i) {
@@ -303,6 +311,7 @@ pub(crate) fn press(app: &crate::Docxy, id: &str) -> Result<Press, String> {
     match i.surface {
         Surface::Sheet => {}
         Surface::Doc => return press_doc(app, i),
+        Surface::Project => return press_project(app, i),
         _ => return Err(not_covered(i)),
     }
     let v = crate::harness::sheet(app)?;
@@ -364,9 +373,10 @@ fn press_doc(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
 }
 
 /// `field-read {"input":id}`: a sheet input as it is edited and drawn (a
-/// document input goes to [`read_doc`]; a Backstage input says why the
-/// harness cannot reach it, and Project and terminal inputs answer which
-/// issue makes them readable), in the shape of a dialog
+/// document input goes to [`read_doc`] and a Project input to
+/// [`read_project`]; a Backstage input says why the harness cannot reach
+/// it, and terminal inputs answer which issue makes them readable), in the
+/// shape of a dialog
 /// field's (`value`, `focused`, `caret` and `selection` in chars, `null`
 /// while it has no focus). The formula bar and the in-cell
 /// editor are one buffer, so both are focused while a cell is being edited:
@@ -383,6 +393,7 @@ pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
     match i.surface {
         Surface::Sheet => {}
         Surface::Doc => return read_doc(app, i),
+        Surface::Project => return read_project(app, i),
         _ => return Err(not_covered(i)),
     }
     let v = crate::harness::sheet(app)?;
@@ -510,6 +521,114 @@ fn read_doc(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
         _ => return Err(not_covered(i)),
     };
     Ok(field_json(i.id, value, focused, caret, Json::Null))
+}
+
+/// A Project input, pressed where it is drawn. The cell editor is a
+/// double-click on the cursor's cell, which opens it as it does for a
+/// person, resolved as `click C<n>` resolves it (clipped to the table's
+/// viewport); it is refused while a cell edit is open, where a click commits
+/// it, and while a prompt is open, where `open_cell` opens nothing. The
+/// constraint prompt is a click on its field, refused while it is closed
+/// and while another prompt holds the bar.
+fn press_project(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
+    let v = crate::harness::project(app)?;
+    let double = project_double(i.id).ok_or_else(|| not_covered(i))?;
+    let b = match i.id {
+        "project-cell" => {
+            if v.cell.is_some() {
+                return Err(
+                    "a Project cell edit is already open; a click on a cell commits it".into(),
+                );
+            }
+            if let Some(p) = &v.prompt {
+                return Err(format!(
+                    "the {} prompt is open; a double-click opens no cell under it",
+                    p.kind.name()
+                ));
+            }
+            let (r, c) = (v.display_row() as u32, v.col as u32);
+            app.project_region_bounds(
+                crate::harness::Region::Cells(r, c, r, c),
+                crate::Probes::on_screen,
+            )?
+        }
+        "task-info" => {
+            match &v.prompt {
+                Some(p) if p.kind == crate::PromptKind::Constraint => {}
+                Some(p) => {
+                    return Err(format!(
+                        "the open prompt is {}, not Task > Information...'s constraint",
+                        p.kind.name()
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "{} is not drawn: Task > Information... first",
+                        i.name
+                    ));
+                }
+            }
+            let bounds = app.probes.borrow().on_screen("project-prompt-field");
+            bounds.ok_or_else(|| format!("{} is not drawn", i.name))?
+        }
+        _ => return Err(not_covered(i)),
+    };
+    Ok(Press {
+        at: b.center(),
+        double,
+    })
+}
+
+/// Whether `pointer-click` double-clicks a Project input: the cell editor
+/// opens on a double-click, the prompt's field takes one click.
+fn project_double(id: &str) -> Option<bool> {
+    match id {
+        "project-cell" => Some(true),
+        "task-info" => Some(false),
+        _ => None,
+    }
+}
+
+/// `field-read {"input":id}` for a Project input, in the sheet inputs'
+/// shape. The cell editor's caret is a byte offset, read in chars; it has
+/// no selection. Idle, it reads the text the cursor's cell would open with
+/// (none on the entry row). The constraint prompt appends and pops only, so
+/// a focused one's caret is its end; another prompt kind is not it.
+fn read_project(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
+    let v = crate::harness::project(app)?;
+    let (value, focused, caret) = match i.id {
+        "project-cell" => match &v.cell {
+            Some(c) => (
+                Json::Str(c.buf.clone()),
+                true,
+                Json::Num(char_caret(&c.buf, c.caret) as f64),
+            ),
+            None => {
+                let text =
+                    v.ed.project()
+                        .tasks
+                        .get(v.cursor_row())
+                        .map(|t| crate::cell_edit_text(&v.ed, t, v.col));
+                (text.map_or(Json::Null, Json::Str), false, Json::Null)
+            }
+        },
+        "task-info" => match &v.prompt {
+            Some(p) if p.kind == crate::PromptKind::Constraint => (
+                Json::Str(p.buf.clone()),
+                true,
+                Json::Num(p.buf.chars().count() as f64),
+            ),
+            _ => (Json::Null, false, Json::Null),
+        },
+        _ => return Err(not_covered(i)),
+    };
+    Ok(field_json(i.id, value, focused, caret, Json::Null))
+}
+
+/// A byte offset into `buf` as the chars before it, the unit `field-read`
+/// reports.
+fn char_caret(buf: &str, byte: usize) -> usize {
+    buf.char_indices().take_while(|&(i, _)| i < byte).count()
 }
 
 /// The reply both surfaces' `field-read {"input":id}` give.
@@ -648,6 +767,32 @@ mod tests {
         for id in doc {
             assert!(doc_probe(id).is_some(), "{id}");
         }
+    }
+
+    /// #1203: both Project inputs are pressed where they are drawn: the
+    /// cursor's cell and the prompt bar's field.
+    #[test]
+    fn every_project_input_has_a_target() {
+        let project: Vec<&str> = registry()
+            .iter()
+            .filter(|i| i.surface == Surface::Project)
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(project, ["project-cell", "task-info"]);
+        for id in project {
+            assert_eq!(project_double(id), Some(id == "project-cell"), "{id}");
+        }
+    }
+
+    /// The Project cell editor's caret is a byte offset; `field-read`
+    /// reports chars, as every other input does.
+    #[test]
+    fn the_project_cell_caret_reads_in_chars() {
+        assert_eq!(char_caret("€1", "€1".len()), 2);
+        assert_eq!(char_caret("€1", "€".len()), 1);
+        assert_eq!(char_caret("€1", 0), 0);
+        assert_eq!(char_caret("Ab1 ", 4), 4);
+        assert_eq!(char_caret("ab", 9), 2);
     }
 
     /// The document Font boxes read what `combo_box` draws: the caret run's
