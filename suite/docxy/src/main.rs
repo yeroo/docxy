@@ -29502,27 +29502,9 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        let Some(tab) = self.tabs.get_mut(self.active) else {
-            return Err("no tab is open".into());
-        };
-        let Surface::Project(v) = &mut tab.surface else {
-            return Err("the active tab is not a Project".into());
-        };
-        // The menu acts on the row under the pointer: a stale drag flag must
-        // not swallow this click and leave the cursor on an older row.
-        v.drag_made_range = false;
-        crate::project_row_click(tab, row, col, false);
-        let Surface::Project(v) = &tab.surface else {
-            return Err("the active tab is not a Project".into());
-        };
-        if v.cell.is_some() {
-            let status = tab.status.to_string();
-            self.refocus(window, cx);
-            return Err(format!("the open cell edit did not commit: {status}"));
-        }
+        let v = self.press_project_row(row, col, window, cx)?;
         let target = menu::MenuTarget::Row(v.selected_uid());
         let items = project_row_menu(v);
-        self.refocus(window, cx);
         self.open_menu(target, at, items, cx);
         Ok(())
     }
@@ -29539,15 +29521,12 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        let Some(tab) = self.tabs.get_mut(self.active) else {
-            return Err("no tab is open".into());
-        };
-        let Surface::Project(v) = &mut tab.surface else {
-            return Err("the active tab is not a Project".into());
-        };
         let bar_uid = |v: &ProjectView| {
             let task = v.ed.project().tasks.get(row)?;
             (!task.is_null && gantt_bar(&v.ed, task, v.scale).is_some()).then_some(task.uid)
+        };
+        let Some(Surface::Project(v)) = self.tabs.get(self.active).map(|t| &t.surface) else {
+            return Err("the active tab is not a Project".into());
         };
         let Some(uid) = bar_uid(v) else {
             return Err(match v.ed.project().tasks.get(row) {
@@ -29555,28 +29534,53 @@ impl Docxy {
                 None => "no task at that row has a bar".into(),
             });
         };
-        v.drag_made_range = false;
-        crate::project_row_click(tab, row, None, false);
-        let Surface::Project(v) = &tab.surface else {
-            return Err("the active tab is not a Project".into());
-        };
-        if v.cell.is_some() {
-            let status = tab.status.to_string();
-            self.refocus(window, cx);
-            return Err(format!("the open cell edit did not commit: {status}"));
-        }
+        let v = self.press_project_row(row, None, window, cx)?;
         // The commit may have changed the plan: the menu is for the task
         // whose bar was pressed, and only while it still has one.
         if v.selected_uid() != Some(uid) || bar_uid(v) != Some(uid) {
-            self.refocus(window, cx);
             return Err(format!(
                 "task uid {uid} has no bar after the edit committed"
             ));
         }
         let items = project_bar_menu(v);
-        self.refocus(window, cx);
         self.open_menu(menu::MenuTarget::Bar(uid), at, items, cx);
         Ok(())
+    }
+
+    /// The press a row or bar menu opens with: select row `row` of the
+    /// active Project as a left click does (on column `col`, if any),
+    /// committing an open cell edit, and refocus. A commit the plan refuses
+    /// keeps the edit and its status, and is the error.
+    fn press_project_row(
+        &mut self,
+        row: usize,
+        col: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<&ProjectView, String> {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return Err("no tab is open".into());
+        };
+        let Surface::Project(v) = &mut tab.surface else {
+            return Err("the active tab is not a Project".into());
+        };
+        // The menu acts on the row under the pointer: a stale drag flag must
+        // not swallow this click and leave the cursor on an older row.
+        v.drag_made_range = false;
+        crate::project_row_click(tab, row, col, false);
+        let committed = match &tab.surface {
+            Surface::Project(v) if v.cell.is_some() => {
+                Err(format!("the open cell edit did not commit: {}", tab.status))
+            }
+            Surface::Project(_) => Ok(()),
+            _ => Err("the active tab is not a Project".into()),
+        };
+        self.refocus(window, cx);
+        committed?;
+        match self.tabs.get(self.active).map(|t| &t.surface) {
+            Some(Surface::Project(v)) => Ok(v),
+            _ => Err("the active tab is not a Project".into()),
+        }
     }
 
     /// A split button's arrow half, and `menu-open {"ribbon"}`: its drop-down,
