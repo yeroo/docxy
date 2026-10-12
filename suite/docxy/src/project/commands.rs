@@ -2214,6 +2214,7 @@ impl Docxy {
                 )
                 .child(
                     h_flex()
+                        .relative()
                         .min_w(px(180.))
                         .max_w(px(500.))
                         .h(px(24.))
@@ -2223,6 +2224,7 @@ impl Docxy {
                         .border_1()
                         .border_color(hsla_u(BRAND))
                         .text_color(pal.fg)
+                        .child(probe(&self.probes, "project-prompt-field"))
                         .child(prompt.buf.clone())
                         .child(div().w(px(1.5)).h(px(14.)).bg(hsla_u(BRAND))),
                 )

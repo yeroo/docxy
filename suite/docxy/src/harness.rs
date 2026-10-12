@@ -3212,6 +3212,14 @@ fn rtf_bold_text(clip: &docxcore::editor::Clip) -> String {
         .join("\n")
 }
 
+/// The active Project plan, or the refusal a Project input needs.
+pub(crate) fn project(app: &crate::Docxy) -> Result<&crate::ProjectView, String> {
+    match app.tabs.get(app.active).map(|t| &t.surface) {
+        Some(crate::Surface::Project(v)) => Ok(v),
+        _ => Err("the active tab is not a Project plan".into()),
+    }
+}
+
 /// The active spreadsheet, or the refusal every cell verb needs.
 pub(crate) fn sheet(app: &crate::Docxy) -> Result<&SheetView, String> {
     app.active_sheet()
