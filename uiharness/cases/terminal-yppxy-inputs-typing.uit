@@ -1,0 +1,251 @@
+terminal yppxy
+# yppxy's text prompts typed into with real keys (#1204), as
+# terminal-docxy-inputs-typing.uit describes. Expected values follow
+# Project. The steps that fail today are in expected-failures.txt.
+
+# ---- The prompt every command shares: the typing steps use Duration (d),
+# which opens empty; Rename (F2), prefilled with the task's name, is what
+# Enter and Escape commit or cancel. Find, the vim `:` line, Save As on a
+# new project and the rest are the same field on the same key path.
+# Pastes copies the first task (Ctrl+C on its row) first.
+test yppxy yppxy-prompt: focus
+  open copy:../fixtures/project-clipboard.xml
+  call real-key {"key":"d"}
+  call field-read {"input":"yppxy-prompt"}
+  assert reply.focused is true
+  assert reply.at is not null
+  assert reply.value is exactly ""
+  assert reply.caret is 0
+
+test yppxy yppxy-prompt: focus by click
+  open copy:../fixtures/project-clipboard.xml
+  call real-key {"key":"d"}
+  call pointer-click {"input":"yppxy-prompt"}
+  call field-read {"input":"yppxy-prompt"}
+  assert reply.focused is true
+
+test yppxy yppxy-prompt: types
+  open copy:../fixtures/project-clipboard.xml
+  call real-key {"key":"d"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"yppxy-prompt"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+
+test yppxy yppxy-prompt: edits
+  open copy:../fixtures/project-clipboard.xml
+  call real-key {"key":"d"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"yppxy-prompt"}
+  assert reply.value is exactly abc
+  call real-key {"key":"home"}
+  call field-read {"input":"yppxy-prompt"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"yppxy-prompt"}
+  assert reply.value is exactly ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"yppxy-prompt"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"yppxy-prompt"}
+  assert reply.value is exactly aXc
+  assert reply.caret is 2
+
+test yppxy yppxy-prompt: select-all replaces
+  open copy:../fixtures/project-clipboard.xml
+  call real-key {"key":"d"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"yppxy-prompt"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"yppxy-prompt"}
+  assert reply.value is exactly X
+
+test yppxy yppxy-prompt: copies
+  open copy:../fixtures/project-clipboard.xml
+  call real-key {"key":"d"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":10}
+  call field-read {"input":"yppxy-prompt"}
+  assert reply.value is exactly ""
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"yppxy-prompt"}
+  assert reply.value is exactly abcd
+
+test yppxy yppxy-prompt: pastes
+  open copy:../fixtures/project-clipboard.xml
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"d"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"yppxy-prompt"}
+  assert reply.focused is true
+  assert reply.value is exactly A
+  assert reply.caret is 1
+
+test yppxy yppxy-prompt: Enter commits
+  open copy:../fixtures/project-clipboard.xml
+  call real-key {"key":"f2"}
+  call real-type {"text":"X"}
+  call field-read {"input":"yppxy-prompt"}
+  assert reply.kind is Rename
+  call real-key {"key":"enter"}
+  call task.get {"uid":1}
+  assert reply.name is exactly {field-read.value}
+  call proj.path {}
+  assert reply.modified is true
+
+test yppxy yppxy-prompt: Escape cancels
+  open copy:../fixtures/project-clipboard.xml
+  call real-key {"key":"f2"}
+  call real-type {"text":"X"}
+  call real-key {"key":"escape"}
+  call field-read {"input":"yppxy-prompt"}
+  assert reply.value is null
+  call task.get {"uid":1}
+  assert reply.name is exactly A
+  call proj.path {}
+  assert reply.modified is false
+
+
+# ---- Backstage Save As's file name (Alt+F, Down x3, Enter), prefilled.
+# The typing steps first empty it with Backspace (40 presses). Enter saves
+# into the plan's folder: proj.open of the new name there takes it (a file
+# that is not there leaves the open plan and its path alone).
+test yppxy yppxy-save-as: focus
+  open copy:../fixtures/project-clipboard.xml
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call field-read {"input":"yppxy-save-as"}
+  assert reply.focused is true
+  assert reply.at is not null
+  assert reply.value is not null
+  assert reply.selection is null
+
+test yppxy yppxy-save-as: focus by click
+  open copy:../fixtures/project-clipboard.xml
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"tab"}
+  call pointer-click {"input":"yppxy-save-as"}
+  call field-read {"input":"yppxy-save-as"}
+  assert reply.focused is true
+
+test yppxy yppxy-save-as: types
+  open copy:../fixtures/project-clipboard.xml
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"backspace","times":40}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"yppxy-save-as"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+
+test yppxy yppxy-save-as: edits
+  open copy:../fixtures/project-clipboard.xml
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"backspace","times":40}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"yppxy-save-as"}
+  assert reply.value is exactly abc
+  call real-key {"key":"home"}
+  call field-read {"input":"yppxy-save-as"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"yppxy-save-as"}
+  assert reply.value is exactly ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"yppxy-save-as"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"yppxy-save-as"}
+  assert reply.value is exactly aXc
+  assert reply.caret is 2
+
+test yppxy yppxy-save-as: select-all replaces
+  open copy:../fixtures/project-clipboard.xml
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"backspace","times":40}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"yppxy-save-as"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"yppxy-save-as"}
+  assert reply.value is exactly X
+
+test yppxy yppxy-save-as: copies
+  open copy:../fixtures/project-clipboard.xml
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"backspace","times":40}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":10}
+  call field-read {"input":"yppxy-save-as"}
+  assert reply.value is exactly ""
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"yppxy-save-as"}
+  assert reply.value is exactly abcd
+
+test yppxy yppxy-save-as: pastes
+  open copy:../fixtures/project-clipboard.xml
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"backspace","times":40}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"yppxy-save-as"}
+  assert reply.focused is true
+  assert reply.value is exactly A
+  assert reply.caret is 1
+
+test yppxy yppxy-save-as: Enter commits
+  open copy:../fixtures/project-clipboard.xml
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"backspace","times":40}
+  call real-type {"text":"saved-copy.xml"}
+  call real-key {"key":"enter"}
+  call proj.path {}
+  assert reply.modified is false
+  call proj.open {"path":"saved-copy.xml"}
+  assert reply.path is exactly saved-copy.xml
+  assert reply.tasks is 2
+
+test yppxy yppxy-save-as: Escape cancels
+  open copy:../fixtures/project-clipboard.xml
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"backspace","times":40}
+  call real-type {"text":"saved-copy.xml"}
+  call real-key {"key":"escape"}
+  call proj.open {"path":"saved-copy.xml"}
+  assert reply.path is not saved-copy.xml

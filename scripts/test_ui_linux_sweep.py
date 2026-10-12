@@ -72,6 +72,17 @@ class ScriptCases(unittest.TestCase):
         self.assertEqual(sweep.script_cases(text), [
             'plain name', 'indented and shouted', 'non-breaking space', '"quoted # kept" tail'])
 
+    def test_reads_the_terminal_editor_a_script_drives(self):
+        self.assertEqual(sweep.script_editor('# note\n\nterminal docxy --vim\ntest t\n'), 'docxy')
+        self.assertEqual(sweep.script_editor('terminal yppxy # the plan\n'), 'yppxy')
+        self.assertIsNone(sweep.script_editor('test t\n  open x.xlsx\n'))
+        self.assertIsNone(sweep.script_editor('test t\nterminal docxy\n'),
+                          'only the first line names an editor')
+        self.assertIsNone(sweep.script_editor('terminal\n'))
+        committed = {p.name: sweep.script_editor(p.read_text(encoding='utf-8'))
+                     for p in sweep.CASES.glob('terminal-*.uit')}
+        self.assertEqual(sorted(set(committed.values())), ['docxy', 'xlsxy', 'yppxy'])
+
     def test_every_committed_script_declares_cases(self):
         for path in sorted(sweep.CASES.glob('*.uit')):
             self.assertTrue(sweep.script_cases(path.read_text(encoding='utf-8')), path.name)

@@ -65,6 +65,22 @@ Every editable input in the suite is typed into with real keys by a case:
   dialog yet (#1368); when it lands, the catalogue lists it. The bar's other
   prompts (Notes, Hyperlink, Assign, Move, Predecessor, Find) are the same
   field, so they are not typed into again.
+- **The terminal editors' prompts** (#1204) are typed into by the
+  hand-written `uiharness/cases/terminal-docxy-inputs-typing.uit`,
+  `terminal-xlsxy-inputs-typing.uit` and `terminal-yppxy-inputs-typing.uit`
+  (with `terminal-docxy-vim-inputs-typing.uit` and
+  `terminal-xlsxy-vim-inputs-typing.uit` for the `--vim` command lines). Their
+  first line runs the editor itself in a pseudo-terminal, and every key is
+  the bytes a terminal sends for it; each test starts the editor on its own
+  copy of a fixture and reads the field with the editor's own `field-read`.
+  One id per field: docxy's Find and Replace fields, new comment text,
+  Compare's two paths, vim `:` line and Backstage Save As name; xlsxy's
+  minibuffer (every prompt kind, F12's Save As among them), cell editor, vim
+  `:` line and Backstage Save As name; yppxy's prompt (every kind, its vim
+  `:` line among them) and Backstage Save As name. Expected values follow
+  Word, Excel and Project, and Vim for the `:` lines (no select-all, copy or
+  paste steps there). xlsxy's dialog text fields are a follow-up of their
+  own. See `docs/ui-test-harness.md`, "Terminal editors".
 - **A field broken today** is listed in `uiharness/cases/expected-failures.txt`
   with its own issue, per failing step, so the sweep stays green and any new
   failure fails CI. Remove the entry in the change that fixes it.

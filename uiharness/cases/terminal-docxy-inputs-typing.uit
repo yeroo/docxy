@@ -1,0 +1,874 @@
+terminal docxy
+# docxy's text prompts typed into with real keys (#1204, the terminal
+# editors' slice of #1029). Written by hand, not generated: the dialog
+# catalogue's `inputs-typing-*.uit` own that prefix.
+#
+# The first line runs docxy itself in a pseudo-terminal (uiharness/src/term.rs):
+# each `open` starts it afresh on its own copy of the fixture, `real-key` and
+# `real-type` write the bytes a terminal sends for each key, and
+# `pointer-click {"input":id}` writes a mouse click where the field is drawn.
+# Every other `call` is docxy's own control verb, used only to read results;
+# `field-read` reads a prompt as it was last drawn. A test is one input and
+# one step, named `docxy <input>: <step>`. Expected values follow Word. The
+# steps that fail today are in expected-failures.txt. See
+# qa/inputs-typing.md.
+#
+# The vim `:` command line needs `--vim`, so it is typed into by
+# terminal-docxy-vim-inputs-typing.uit. The terminal cases do not sandbox
+# the OS clipboard: Ctrl+C in the document writes it.
+
+# ---- The Find bar's Find field: Ctrl+F opens it, empty, on the status line.
+# Enter is Find Next and changes nothing; no verb reports the selection it
+# moves, so Enter commits checks the bar stays open on its text with the
+# document untouched, as Word's Find does.
+test docxy docxy-find: focus
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"ctrl+f"}
+  call field-read {"input":"docxy-find"}
+  assert reply.focused is true
+  assert reply.at is not null
+  assert reply.value is exactly ""
+  assert reply.caret is 0
+
+test docxy docxy-find: focus by click
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"ctrl+f"}
+  call real-key {"key":"tab"}
+  call pointer-click {"input":"docxy-find"}
+  call field-read {"input":"docxy-find"}
+  assert reply.focused is true
+
+test docxy docxy-find: types
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"ctrl+f"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"docxy-find"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+
+test docxy docxy-find: edits
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"ctrl+f"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"docxy-find"}
+  assert reply.value is exactly abc
+  call real-key {"key":"home"}
+  call field-read {"input":"docxy-find"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"docxy-find"}
+  assert reply.value is exactly ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"docxy-find"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"docxy-find"}
+  assert reply.value is exactly aXc
+  assert reply.caret is 2
+
+test docxy docxy-find: select-all replaces
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"ctrl+f"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"docxy-find"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"docxy-find"}
+  assert reply.value is exactly X
+
+test docxy docxy-find: copies
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"ctrl+f"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":10}
+  call field-read {"input":"docxy-find"}
+  assert reply.value is exactly ""
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"docxy-find"}
+  assert reply.value is exactly abcd
+
+test docxy docxy-find: pastes
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"shift+end"}
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"ctrl+f"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"docxy-find"}
+  assert reply.focused is true
+  assert reply.value is exactly One
+  assert reply.caret is 3
+
+test docxy docxy-find: Enter commits
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"ctrl+f"}
+  call real-type {"text":"Two"}
+  call real-key {"key":"enter"}
+  call field-read {"input":"docxy-find"}
+  assert reply.focused is true
+  assert reply.value is exactly Two
+  call doc.path {}
+  assert reply.modified is false
+
+test docxy docxy-find: Escape cancels
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"ctrl+f"}
+  call real-type {"text":"Two"}
+  call real-key {"key":"escape"}
+  call field-read {"input":"docxy-find"}
+  assert reply.value is null
+  assert reply.focused is false
+  call doc.path {}
+  assert reply.modified is false
+
+
+# ---- The Find bar's Replace field: Ctrl+H opens the bar, Tab moves to
+# Replace. In the bar Ctrl+A is Replace All today, so select-all replaces
+# also checks the document did not change.
+test docxy docxy-replace: focus
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"ctrl+h"}
+  call real-key {"key":"tab"}
+  call field-read {"input":"docxy-replace"}
+  assert reply.focused is true
+  assert reply.at is not null
+  assert reply.value is exactly ""
+  assert reply.caret is 0
+
+test docxy docxy-replace: focus by click
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"ctrl+h"}
+  call real-key {"key":"tab"}
+  call real-key {"key":"tab"}
+  call pointer-click {"input":"docxy-replace"}
+  call field-read {"input":"docxy-replace"}
+  assert reply.focused is true
+
+test docxy docxy-replace: types
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"ctrl+h"}
+  call real-key {"key":"tab"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"docxy-replace"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+
+test docxy docxy-replace: edits
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"ctrl+h"}
+  call real-key {"key":"tab"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"docxy-replace"}
+  assert reply.value is exactly abc
+  call real-key {"key":"home"}
+  call field-read {"input":"docxy-replace"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"docxy-replace"}
+  assert reply.value is exactly ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"docxy-replace"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"docxy-replace"}
+  assert reply.value is exactly aXc
+  assert reply.caret is 2
+
+test docxy docxy-replace: select-all replaces
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"ctrl+h"}
+  call real-key {"key":"tab"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"docxy-replace"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"docxy-replace"}
+  assert reply.value is exactly X
+  call doc.path {}
+  assert reply.modified is false
+
+test docxy docxy-replace: copies
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"ctrl+h"}
+  call real-key {"key":"tab"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":10}
+  call field-read {"input":"docxy-replace"}
+  assert reply.value is exactly ""
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"docxy-replace"}
+  assert reply.value is exactly abcd
+
+test docxy docxy-replace: pastes
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"shift+end"}
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"ctrl+h"}
+  call real-key {"key":"tab"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"docxy-replace"}
+  assert reply.focused is true
+  assert reply.value is exactly One
+  assert reply.caret is 3
+
+test docxy docxy-replace: Enter commits
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"ctrl+h"}
+  call real-type {"text":"Two"}
+  call real-key {"key":"tab"}
+  call real-type {"text":"2"}
+  call real-key {"key":"enter"}
+  call doc.read {}
+  assert reply.blocks.1.text is exactly 2
+  call doc.path {}
+  assert reply.modified is true
+
+test docxy docxy-replace: Escape cancels
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"ctrl+h"}
+  call real-type {"text":"Two"}
+  call real-key {"key":"tab"}
+  call real-type {"text":"2"}
+  call real-key {"key":"escape"}
+  call field-read {"input":"docxy-replace"}
+  assert reply.value is null
+  call doc.read {}
+  assert reply.blocks.1.text is exactly Two
+  call doc.path {}
+  assert reply.modified is false
+
+test docxy docxy-replace: Tab
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"ctrl+h"}
+  call real-type {"text":"Tw"}
+  call real-key {"key":"tab"}
+  call field-read {"input":"docxy-replace"}
+  assert reply.focused is true
+  call field-read {"input":"docxy-find"}
+  assert reply.focused is false
+  call real-key {"key":"tab"}
+  call field-read {"input":"docxy-find"}
+  assert reply.focused is true
+  assert reply.value is exactly Tw
+
+
+# ---- A new comment's text: select "One" (Shift+Right three times), then
+# Review > New by its keys (F9, Right x4, Down, Enter). It is typed on the
+# status line.
+test docxy docxy-comment: focus
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"shift+right","times":3}
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"enter"}
+  call field-read {"input":"docxy-comment"}
+  assert reply.focused is true
+  assert reply.at is not null
+  assert reply.value is exactly ""
+  assert reply.caret is 0
+
+test docxy docxy-comment: focus by click
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"shift+right","times":3}
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"enter"}
+  call pointer-click {"input":"docxy-comment"}
+  call field-read {"input":"docxy-comment"}
+  assert reply.focused is true
+
+test docxy docxy-comment: types
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"shift+right","times":3}
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"docxy-comment"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+
+test docxy docxy-comment: edits
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"shift+right","times":3}
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"docxy-comment"}
+  assert reply.value is exactly abc
+  call real-key {"key":"home"}
+  call field-read {"input":"docxy-comment"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"docxy-comment"}
+  assert reply.value is exactly ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"docxy-comment"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"docxy-comment"}
+  assert reply.value is exactly aXc
+  assert reply.caret is 2
+
+test docxy docxy-comment: select-all replaces
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"shift+right","times":3}
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"docxy-comment"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"docxy-comment"}
+  assert reply.value is exactly X
+
+test docxy docxy-comment: copies
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"shift+right","times":3}
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":10}
+  call field-read {"input":"docxy-comment"}
+  assert reply.value is exactly ""
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"docxy-comment"}
+  assert reply.value is exactly abcd
+
+test docxy docxy-comment: pastes
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"shift+end"}
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"home"}
+  call real-key {"key":"shift+right","times":3}
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"enter"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"docxy-comment"}
+  assert reply.focused is true
+  assert reply.value is exactly One
+  assert reply.caret is 3
+
+test docxy docxy-comment: Enter commits
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"shift+right","times":3}
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"Ab1"}
+  call real-key {"key":"enter"}
+  call doc.comments {}
+  assert reply.comments.0.text is exactly Ab1
+  assert reply.comments.0.anchor is exactly One
+  call doc.path {}
+  assert reply.modified is true
+
+test docxy docxy-comment: Escape cancels
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"shift+right","times":3}
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"Ab1"}
+  call real-key {"key":"escape"}
+  call field-read {"input":"docxy-comment"}
+  assert reply.value is null
+  call doc.comments {}
+  assert reply.comments is []
+  call doc.path {}
+  assert reply.modified is false
+
+
+# ---- Review > Compare's two paths (F9, Right x4, Down, Right x9, Enter).
+# The open document is a saved .docx, so Original opens on its path and
+# Revised, empty, has the keyboard; Shift+Tab moves to Original. The
+# typing steps first empty Original with Backspace (260 presses, a
+# path's most). Enter compares the open file with itself, typed as a
+# path relative to its folder (the editor's working directory): a new
+# Compare Result document opens.
+test docxy docxy-compare-original: focus
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"right","times":9}
+  call real-key {"key":"enter"}
+  call real-key {"key":"shift+tab"}
+  call field-read {"input":"docxy-compare-original"}
+  assert reply.focused is true
+  assert reply.at is not null
+  assert reply.value is not null
+  assert reply.selection is null
+
+test docxy docxy-compare-original: focus by click
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"right","times":9}
+  call real-key {"key":"enter"}
+  call real-key {"key":"shift+tab"}
+  call real-key {"key":"tab"}
+  call pointer-click {"input":"docxy-compare-original"}
+  call field-read {"input":"docxy-compare-original"}
+  assert reply.focused is true
+
+test docxy docxy-compare-original: types
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"right","times":9}
+  call real-key {"key":"enter"}
+  call real-key {"key":"shift+tab"}
+  call real-key {"key":"backspace","times":260}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"docxy-compare-original"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+
+test docxy docxy-compare-original: edits
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"right","times":9}
+  call real-key {"key":"enter"}
+  call real-key {"key":"shift+tab"}
+  call real-key {"key":"backspace","times":260}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"docxy-compare-original"}
+  assert reply.value is exactly abc
+  call real-key {"key":"home"}
+  call field-read {"input":"docxy-compare-original"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"docxy-compare-original"}
+  assert reply.value is exactly ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"docxy-compare-original"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"docxy-compare-original"}
+  assert reply.value is exactly aXc
+  assert reply.caret is 2
+
+test docxy docxy-compare-original: select-all replaces
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"right","times":9}
+  call real-key {"key":"enter"}
+  call real-key {"key":"shift+tab"}
+  call real-key {"key":"backspace","times":260}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"docxy-compare-original"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"docxy-compare-original"}
+  assert reply.value is exactly X
+
+test docxy docxy-compare-original: copies
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"right","times":9}
+  call real-key {"key":"enter"}
+  call real-key {"key":"shift+tab"}
+  call real-key {"key":"backspace","times":260}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":10}
+  call field-read {"input":"docxy-compare-original"}
+  assert reply.value is exactly ""
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"docxy-compare-original"}
+  assert reply.value is exactly abcd
+
+test docxy docxy-compare-original: pastes
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"shift+end"}
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"right","times":9}
+  call real-key {"key":"enter"}
+  call real-key {"key":"shift+tab"}
+  call real-key {"key":"backspace","times":260}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"docxy-compare-original"}
+  assert reply.focused is true
+  assert reply.value is exactly One
+  assert reply.caret is 3
+
+test docxy docxy-compare-original: Enter commits
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"right","times":9}
+  call real-key {"key":"enter"}
+  call real-type {"text":"header-inherit.docx"}
+  call real-key {"key":"enter"}
+  call doc.path {}
+  assert reply.path is exactly Compare Result 1.docx
+
+test docxy docxy-compare-original: Escape cancels
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"right","times":9}
+  call real-key {"key":"enter"}
+  call real-key {"key":"shift+tab"}
+  call real-type {"text":"x"}
+  call real-key {"key":"escape"}
+  call field-read {"input":"docxy-compare-original"}
+  assert reply.value is null
+  call doc.path {}
+  assert reply.path is not Compare Result 1.docx
+  assert reply.modified is false
+
+test docxy docxy-compare-original: Tab
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"right","times":9}
+  call real-key {"key":"enter"}
+  call field-read {"input":"docxy-compare-revised"}
+  assert reply.focused is true
+  call real-key {"key":"shift+tab"}
+  call field-read {"input":"docxy-compare-original"}
+  assert reply.focused is true
+  call field-read {"input":"docxy-compare-revised"}
+  assert reply.focused is false
+  call real-key {"key":"tab"}
+  call field-read {"input":"docxy-compare-revised"}
+  assert reply.focused is true
+
+
+test docxy docxy-compare-revised: focus
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"right","times":9}
+  call real-key {"key":"enter"}
+  call field-read {"input":"docxy-compare-revised"}
+  assert reply.focused is true
+  assert reply.at is not null
+  assert reply.value is exactly ""
+  assert reply.caret is 0
+
+test docxy docxy-compare-revised: focus by click
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"right","times":9}
+  call real-key {"key":"enter"}
+  call real-key {"key":"shift+tab"}
+  call pointer-click {"input":"docxy-compare-revised"}
+  call field-read {"input":"docxy-compare-revised"}
+  assert reply.focused is true
+
+test docxy docxy-compare-revised: types
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"right","times":9}
+  call real-key {"key":"enter"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"docxy-compare-revised"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+
+test docxy docxy-compare-revised: edits
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"right","times":9}
+  call real-key {"key":"enter"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"docxy-compare-revised"}
+  assert reply.value is exactly abc
+  call real-key {"key":"home"}
+  call field-read {"input":"docxy-compare-revised"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"docxy-compare-revised"}
+  assert reply.value is exactly ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"docxy-compare-revised"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"docxy-compare-revised"}
+  assert reply.value is exactly aXc
+  assert reply.caret is 2
+
+test docxy docxy-compare-revised: select-all replaces
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"right","times":9}
+  call real-key {"key":"enter"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"docxy-compare-revised"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"docxy-compare-revised"}
+  assert reply.value is exactly X
+
+test docxy docxy-compare-revised: copies
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"right","times":9}
+  call real-key {"key":"enter"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":10}
+  call field-read {"input":"docxy-compare-revised"}
+  assert reply.value is exactly ""
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"docxy-compare-revised"}
+  assert reply.value is exactly abcd
+
+test docxy docxy-compare-revised: pastes
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"shift+end"}
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"right","times":9}
+  call real-key {"key":"enter"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"docxy-compare-revised"}
+  assert reply.focused is true
+  assert reply.value is exactly One
+  assert reply.caret is 3
+
+test docxy docxy-compare-revised: Enter commits
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"right","times":9}
+  call real-key {"key":"enter"}
+  call real-type {"text":"header-inherit.docx"}
+  call real-key {"key":"enter"}
+  call doc.path {}
+  assert reply.path is exactly Compare Result 1.docx
+
+test docxy docxy-compare-revised: Escape cancels
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"f9"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"down"}
+  call real-key {"key":"right","times":9}
+  call real-key {"key":"enter"}
+  call real-type {"text":"header-inherit.docx"}
+  call real-key {"key":"escape"}
+  call field-read {"input":"docxy-compare-revised"}
+  assert reply.value is null
+  call doc.path {}
+  assert reply.path is not Compare Result 1.docx
+  assert reply.modified is false
+
+
+# ---- Backstage Save As's file name (Alt+F, Down x3 to Save As, Enter),
+# prefilled with the file's name and the caret at its end. The typing
+# steps first empty it with Backspace (40 presses). Enter saves into the
+# file's folder; opening the new name there by doc.open proves it was
+# written.
+test docxy docxy-save-as: focus
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call field-read {"input":"docxy-save-as"}
+  assert reply.focused is true
+  assert reply.at is not null
+  assert reply.value is not null
+  assert reply.selection is null
+
+test docxy docxy-save-as: focus by click
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"tab"}
+  call pointer-click {"input":"docxy-save-as"}
+  call field-read {"input":"docxy-save-as"}
+  assert reply.focused is true
+
+test docxy docxy-save-as: types
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"backspace","times":40}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"docxy-save-as"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+
+test docxy docxy-save-as: edits
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"backspace","times":40}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"docxy-save-as"}
+  assert reply.value is exactly abc
+  call real-key {"key":"home"}
+  call field-read {"input":"docxy-save-as"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"docxy-save-as"}
+  assert reply.value is exactly ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"docxy-save-as"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"docxy-save-as"}
+  assert reply.value is exactly aXc
+  assert reply.caret is 2
+
+test docxy docxy-save-as: select-all replaces
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"backspace","times":40}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"docxy-save-as"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"docxy-save-as"}
+  assert reply.value is exactly X
+
+test docxy docxy-save-as: copies
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"backspace","times":40}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":10}
+  call field-read {"input":"docxy-save-as"}
+  assert reply.value is exactly ""
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"docxy-save-as"}
+  assert reply.value is exactly abcd
+
+test docxy docxy-save-as: pastes
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"shift+end"}
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"backspace","times":40}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"docxy-save-as"}
+  assert reply.focused is true
+  assert reply.value is exactly One
+  assert reply.caret is 3
+
+test docxy docxy-save-as: Enter commits
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"backspace","times":40}
+  call real-type {"text":"saved-copy.docx"}
+  call real-key {"key":"enter"}
+  call doc.path {}
+  assert reply.modified is false
+  call doc.open {"path":"saved-copy.docx"}
+  assert reply.blocks is 3
+
+test docxy docxy-save-as: Escape cancels
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"backspace","times":40}
+  call real-type {"text":"saved-copy.docx"}
+  call real-key {"key":"escape"}
+  call-error doc.open {"path":"saved-copy.docx"} => saved-copy.docx

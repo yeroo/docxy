@@ -1,0 +1,377 @@
+terminal xlsxy
+# xlsxy's text prompts typed into with real keys (#1204), as
+# terminal-docxy-inputs-typing.uit describes. Expected values follow Excel.
+# The steps that fail today are in expected-failures.txt. The vim `:`
+# command line is in terminal-xlsxy-vim-inputs-typing.uit.
+#
+# xlsxy's dialog text fields (the data form, Data Validation, Consolidate's
+# reference, Text Import, the filter's search) are not typed into here: they
+# are the terminal's dialogs, a follow-up of their own.
+
+# ---- The minibuffer every prompt shares: the typing steps use Go To
+# (Ctrl+G), which opens empty; Rename Sheet (Shift+F2), prefilled with the
+# sheet's name, is what Enter and Escape commit or cancel. Find, F12's
+# Save As and the rest are the same field on the same key path.
+test xlsxy xlsxy-prompt: focus
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"ctrl+g"}
+  call field-read {"input":"xlsxy-prompt"}
+  assert reply.focused is true
+  assert reply.at is not null
+  assert reply.value is exactly ""
+  assert reply.caret is 0
+
+test xlsxy xlsxy-prompt: focus by click
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"ctrl+g"}
+  call pointer-click {"input":"xlsxy-prompt"}
+  call field-read {"input":"xlsxy-prompt"}
+  assert reply.focused is true
+
+test xlsxy xlsxy-prompt: types
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"ctrl+g"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"xlsxy-prompt"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+
+test xlsxy xlsxy-prompt: edits
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"ctrl+g"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"xlsxy-prompt"}
+  assert reply.value is exactly abc
+  call real-key {"key":"home"}
+  call field-read {"input":"xlsxy-prompt"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"xlsxy-prompt"}
+  assert reply.value is exactly ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"xlsxy-prompt"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"xlsxy-prompt"}
+  assert reply.value is exactly aXc
+  assert reply.caret is 2
+
+test xlsxy xlsxy-prompt: select-all replaces
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"ctrl+g"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"xlsxy-prompt"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"xlsxy-prompt"}
+  assert reply.value is exactly X
+
+test xlsxy xlsxy-prompt: copies
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"ctrl+g"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":10}
+  call field-read {"input":"xlsxy-prompt"}
+  assert reply.value is exactly ""
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"xlsxy-prompt"}
+  assert reply.value is exactly abcd
+
+test xlsxy xlsxy-prompt: pastes
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"down"}
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"up"}
+  call real-key {"key":"ctrl+g"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"xlsxy-prompt"}
+  assert reply.focused is true
+  assert reply.value is exactly North
+  assert reply.caret is 5
+
+test xlsxy xlsxy-prompt: Enter commits
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"shift+f2"}
+  call real-type {"text":"X"}
+  call field-read {"input":"xlsxy-prompt"}
+  assert reply.kind is RenameSheet
+  call real-key {"key":"enter"}
+  call sheet.list {}
+  assert reply.sheets.0.name is exactly {field-read.value}
+  call wb.path {}
+  assert reply.modified is true
+
+test xlsxy xlsxy-prompt: Escape cancels
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"shift+f2"}
+  call real-type {"text":"X"}
+  call real-key {"key":"escape"}
+  call field-read {"input":"xlsxy-prompt"}
+  assert reply.value is null
+  call sheet.list {}
+  assert reply.sheets.0.name is exactly Sheet1
+  call wb.path {}
+  assert reply.modified is false
+
+
+# ---- The cell editor, in the formula bar: Right x4 to the empty E1, F2
+# (Edit mode, where the arrows move the caret as in Excel).
+test xlsxy xlsxy-cell: focus
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"f2"}
+  call field-read {"input":"xlsxy-cell"}
+  assert reply.focused is true
+  assert reply.at is not null
+  assert reply.value is exactly ""
+  assert reply.caret is 0
+
+test xlsxy xlsxy-cell: focus by click
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"f2"}
+  call pointer-click {"input":"xlsxy-cell"}
+  call field-read {"input":"xlsxy-cell"}
+  assert reply.focused is true
+
+test xlsxy xlsxy-cell: types
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"f2"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"xlsxy-cell"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+
+test xlsxy xlsxy-cell: edits
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"f2"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"xlsxy-cell"}
+  assert reply.value is exactly abc
+  call real-key {"key":"home"}
+  call field-read {"input":"xlsxy-cell"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"xlsxy-cell"}
+  assert reply.value is exactly ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"xlsxy-cell"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"xlsxy-cell"}
+  assert reply.value is exactly aXc
+  assert reply.caret is 2
+
+test xlsxy xlsxy-cell: select-all replaces
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"f2"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"xlsxy-cell"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"xlsxy-cell"}
+  assert reply.value is exactly X
+
+test xlsxy xlsxy-cell: copies
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"f2"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":10}
+  call field-read {"input":"xlsxy-cell"}
+  assert reply.value is exactly ""
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"xlsxy-cell"}
+  assert reply.value is exactly abcd
+
+test xlsxy xlsxy-cell: pastes
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"down"}
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"up"}
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"f2"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"xlsxy-cell"}
+  assert reply.focused is true
+  assert reply.value is exactly North
+  assert reply.caret is 5
+
+test xlsxy xlsxy-cell: Enter commits
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"f2"}
+  call real-type {"text":"Ab1"}
+  call real-key {"key":"enter"}
+  call cell.get {"ref":"E1"}
+  assert reply.text is exactly Ab1
+  call wb.path {}
+  assert reply.modified is true
+
+test xlsxy xlsxy-cell: Escape cancels
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"right","times":4}
+  call real-key {"key":"f2"}
+  call real-type {"text":"Ab1"}
+  call real-key {"key":"escape"}
+  call field-read {"input":"xlsxy-cell"}
+  assert reply.value is null
+  call cell.get {"ref":"E1"}
+  assert reply.text is exactly ""
+  call wb.path {}
+  assert reply.modified is false
+
+
+# ---- Backstage Save As's file name (Alt+F, Down x3, Enter), prefilled.
+# The typing steps first empty it with Backspace (40 presses). F12 opens
+# the minibuffer's Save As instead: that is xlsxy-prompt. Enter saves into
+# the workbook's folder, where wb.open of the new name then succeeds.
+test xlsxy xlsxy-save-as: focus
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call field-read {"input":"xlsxy-save-as"}
+  assert reply.focused is true
+  assert reply.at is not null
+  assert reply.value is not null
+  assert reply.selection is null
+
+test xlsxy xlsxy-save-as: focus by click
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"tab"}
+  call pointer-click {"input":"xlsxy-save-as"}
+  call field-read {"input":"xlsxy-save-as"}
+  assert reply.focused is true
+
+test xlsxy xlsxy-save-as: types
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"backspace","times":40}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"xlsxy-save-as"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+
+test xlsxy xlsxy-save-as: edits
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"backspace","times":40}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"xlsxy-save-as"}
+  assert reply.value is exactly abc
+  call real-key {"key":"home"}
+  call field-read {"input":"xlsxy-save-as"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"xlsxy-save-as"}
+  assert reply.value is exactly ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"xlsxy-save-as"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"xlsxy-save-as"}
+  assert reply.value is exactly aXc
+  assert reply.caret is 2
+
+test xlsxy xlsxy-save-as: select-all replaces
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"backspace","times":40}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"xlsxy-save-as"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"xlsxy-save-as"}
+  assert reply.value is exactly X
+
+test xlsxy xlsxy-save-as: copies
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"backspace","times":40}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":10}
+  call field-read {"input":"xlsxy-save-as"}
+  assert reply.value is exactly ""
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"xlsxy-save-as"}
+  assert reply.value is exactly abcd
+
+test xlsxy xlsxy-save-as: pastes
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"down"}
+  call real-key {"key":"ctrl+c"}
+  call real-key {"key":"up"}
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"backspace","times":40}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"xlsxy-save-as"}
+  assert reply.focused is true
+  assert reply.value is exactly North
+  assert reply.caret is 5
+
+test xlsxy xlsxy-save-as: Enter commits
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"backspace","times":40}
+  call real-type {"text":"saved-copy.xlsx"}
+  call real-key {"key":"enter"}
+  call wb.path {}
+  assert reply.modified is false
+  call wb.open {"path":"saved-copy.xlsx"}
+  assert reply.sheets is 1
+
+test xlsxy xlsxy-save-as: Escape cancels
+  open copy:../fixtures/basic.xlsx
+  call real-key {"key":"alt+f"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"enter"}
+  call real-key {"key":"backspace","times":40}
+  call real-type {"text":"saved-copy.xlsx"}
+  call real-key {"key":"escape"}
+  call-error wb.open {"path":"saved-copy.xlsx"} => (os error 2)

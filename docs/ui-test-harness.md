@@ -483,7 +483,7 @@ footer editor; `selection-set` refuses while it is open.
 | `window-select {window}` | switch the harness to the window with this registry id; every verb after this acts on that window, and reads like `tab-list` and `state` describe it. EVERY newly opened window becomes the selection — a ribbon New Window, Shift+F11 on a Project tab, or `window-new` — and closing the selected window falls back to the most recently opened survivor. Clicking a window with the mouse never moves the selection. The rich document clip, the grid clip and the Office Clipboard are per window: a paste into another window pastes the clipboard's RTF, else its plain text, like a paste from another application (a harness run shares the private clipboard, text and RTF, run-wide) |
 | `window-arrange {}` | the View › Window › Arrange All command: resize every window to an equal vertical strip of the calling window's display, left to right in creation order, and reply `{arranged:N}`. gpui at the suite's pinned revision has no cross-platform way to MOVE a window, so positions stay: Arrange All resizes, it does not tile |
 | `tab-select {"tab":"schedule"}` | make a tab active as clicking its chip does, and reply with the state. `tab` is an index or a case-insensitive title/path substring over **all** tabs, the rule the `proj.*` verbs use; a miss (`no tab matches 'x'`), an ambiguous match (`several tabs match 'x' (2, 3)`) and an index past the end (`no tab at index 9`) are refused. The Backstage stays as it was, as it does for a chip click |
-| `pointer-click {"region":"tab-chip:1"}` | dispatch a real hover-press-release at the region's centre through gpui's own hit testing (or `{"at":"fill-handle"}`: the active selection's handle point; or `{"at":"user-name-row"}`: Backstage's User name... row, #1027; or `{"at":"custom-lists-row"}`: its Edit Custom Lists… row, #1029; or `{"at":"sheet-replace-button"}` / `{"at":"sheet-replace-all-button"}`: the sheet Find bar's Replace and All buttons, which no key presses, #1200; or `{"at":"doc-replace-button"}` / `{"at":"doc-replace-all-button"}`: the document Find bar's, #1201); replies `{x, y, item}` where `item` is the more-tabs list index under the point, or -1 off the list. Refuses under a dialog, except the dialog forms, which reply `{x, y}`: `{"dialog-field":"user-name","x":N}` (#1027) clicks the open dialog's text field `N` pixels in from its left edge (its middle without `x`); `{"dialog-tab":"Margins"}`, `{"dialog-button":"Options..."}` and `{"dialog-control":"equal"}` (#1029) click the middle of a tab, a button (by its label as drawn, `&` optional) or a whole control row (a checkbox, a dropdown). `{"input":"formula-bar"}` (#1029) is for the inputs outside the dialogs (`suite/docxy/src/inputs.rs`) and replies `{x, y, clicks}`: the sheet's (#1200) are pressed where they are drawn (`formula-bar`, `name-box`, `sheet-find` and `sheet-replace` with the Find bar open, `sheet-font` and `sheet-font-size` on the Home tab), and `cell-editor` is a double-click on the active cell, which opens its editor as it does for a person (refused while an entry is already open: a click on its cell would commit it); the document's (#1201) are pressed where they are drawn too (`doc-find` and `doc-replace` with the Find bar open, `doc-font` and `doc-font-size` on the Home tab, `comment-editor` while a new comment is being typed), refused while the active tab is not a document; `sheet-tab-rename` (#1202) double-clicks the active sheet tab's name, which opens its rename (refused while one is open); Project's (#1203), refused while the active tab is not a Project plan: `project-cell` double-clicks the cursor's cell, resolved and clipped to the table's viewport as `click C<n>` is, which opens its editor (refused while a cell edit is open, where a click commits it, or while a prompt is open, where no cell opens), and `task-info` clicks the field of Task > Information...'s Constraint prompt (refused while no prompt is open, or while another prompt kind is); refused under a dialog. Backstage's inputs answer why the harness cannot reach them (`save-as-name` is the OS's file dialog; `info-title`, `info-tags` and `info-author` do not exist yet, #1364), and the terminal inputs are not targetable yet, each answering which issue makes it so. A press reaches an open menu's own item or backdrop, so it does not pre-close menus |
+| `pointer-click {"region":"tab-chip:1"}` | dispatch a real hover-press-release at the region's centre through gpui's own hit testing (or `{"at":"fill-handle"}`: the active selection's handle point; or `{"at":"user-name-row"}`: Backstage's User name... row, #1027; or `{"at":"custom-lists-row"}`: its Edit Custom Lists… row, #1029; or `{"at":"sheet-replace-button"}` / `{"at":"sheet-replace-all-button"}`: the sheet Find bar's Replace and All buttons, which no key presses, #1200; or `{"at":"doc-replace-button"}` / `{"at":"doc-replace-all-button"}`: the document Find bar's, #1201); replies `{x, y, item}` where `item` is the more-tabs list index under the point, or -1 off the list. Refuses under a dialog, except the dialog forms, which reply `{x, y}`: `{"dialog-field":"user-name","x":N}` (#1027) clicks the open dialog's text field `N` pixels in from its left edge (its middle without `x`); `{"dialog-tab":"Margins"}`, `{"dialog-button":"Options..."}` and `{"dialog-control":"equal"}` (#1029) click the middle of a tab, a button (by its label as drawn, `&` optional) or a whole control row (a checkbox, a dropdown). `{"input":"formula-bar"}` (#1029) is for the inputs outside the dialogs (`suite/docxy/src/inputs.rs`) and replies `{x, y, clicks}`: the sheet's (#1200) are pressed where they are drawn (`formula-bar`, `name-box`, `sheet-find` and `sheet-replace` with the Find bar open, `sheet-font` and `sheet-font-size` on the Home tab), and `cell-editor` is a double-click on the active cell, which opens its editor as it does for a person (refused while an entry is already open: a click on its cell would commit it); the document's (#1201) are pressed where they are drawn too (`doc-find` and `doc-replace` with the Find bar open, `doc-font` and `doc-font-size` on the Home tab, `comment-editor` while a new comment is being typed), refused while the active tab is not a document; `sheet-tab-rename` (#1202) double-clicks the active sheet tab's name, which opens its rename (refused while one is open); Project's (#1203), refused while the active tab is not a Project plan: `project-cell` double-clicks the cursor's cell, resolved and clipped to the table's viewport as `click C<n>` is, which opens its editor (refused while a cell edit is open, where a click commits it, or while a prompt is open, where no cell opens), and `task-info` clicks the field of Task > Information...'s Constraint prompt (refused while no prompt is open, or while another prompt kind is); refused under a dialog. Backstage's inputs answer why the harness cannot reach them (`save-as-name` is the OS's file dialog; `info-title`, `info-tags` and `info-author` do not exist yet, #1364), and a terminal editor's input (`docxy-find`, `xlsxy-prompt`, …, #1204) names the `terminal-<app>-inputs-typing.uit` case that types into it in a pseudo-terminal. A press reaches an open menu's own item or backdrop, so it does not pre-close menus |
 | `field-read {"dialog-field":"top"}` | one field of the open dialog as it is edited and drawn (#1029), on any of its tabs: `{name, kind, value, focused, caret, selection, index, items, tab, on_page, enabled, visible}`. `caret` (a character index) and `selection` (`[from, to]`) come from the state the overlay draws the field from, and are `null` unless the field has the focus; `index` is a dropdown's, radio group's or list's chosen item and `items` how many it has. `{"input":"formula-bar"}` (#1200) reads a sheet input of `inputs.rs` instead (exactly one of the two): `{input, value, focused, caret, selection}`, in characters. The formula bar and the in-cell editor are one entry, so both are `focused` while a cell is edited (nothing records which one it began in), and `selection` is an AutoComplete proposal's suffix; idle, the bar's `value` is what it draws (a formula with its `=`, else the cell's text) and the editor's `null`. The Find bar's fields only append and pop, so a focused one's caret is its end. The Name Box and the Font boxes cannot take the focus today and read what they draw. A document input (#1201) reads the same way, only while a document is active: the Find bar's fields (shared with the sheet's) and the comment editor append and pop only, so a focused one's caret is its end, and the Font boxes read what they draw for the caret's run. `sheet-tab-rename` (#1202) appends and pops only too, so an open rename's caret is its end; closed, its `value` is the active sheet's name. A Project input (#1203) reads only while a Project plan is active: an open `project-cell` reads its buffer with the caret in characters (the editor keeps bytes) and `selection` always `null`, as the editor has none; idle, its `value` is the text the cursor's cell would open with (`null` on the entry row). `task-info` reads `null` and unfocused unless the Constraint prompt is open; an open one appends and pops only, so its caret is its end |
 | `dialog-catalog-check {}` | hold the open dialog's editable controls (text, number, date, duration, checkbox, radio, dropdown, check list) on every tab, as name, kind and tab in order, to its entry in `suite/docxy/src/dialog/catalog/entries.rs` (#1029). Replies `{id, key, fields}`; a difference is the error, listing both |
 | `fill-handle-into {"probe":"tab-more-item:*","except":["tab-more-item:23"],"inset":4,"within":"A1:T30"}` | select a cell of `within` whose fill-handle point (its bottom-right corner, where `pointer-click {"at":"fill-handle"}` presses) lies inside a probe's drawn bounds inset by `inset` logical pixels on every edge, edges included (#1149). `probe` names one probe, or ends in `*` for every drawn probe it starts, less those in `except`; of several fits, the one nearest its probe's centre. A wildcard lets a case aim at whichever more-tabs item a row line crosses: items and rows differ in height, so one item's inset band can miss every row line. Only cells fully on screen count, and `within` caps the search at 4000 cells, so a case can `snapshot` them all. The selection is set as a click's would be, without a click: an open list stays open and the grid does not scroll. It draws first, like the pointer verbs. Replies `{cell, x, y, probe, item}`, `item` being the more-tabs item under the point as `pointer-click` reports it. With no fit it is refused, giving the probe's bounds raw and inset (a wildcard's: the item nearest a handle) and the nearest cell's handle point and distance |
@@ -1562,7 +1562,89 @@ pins why Backstage's own are not typed into: Save As's file name is the OS's
 file dialog, and File > Info has no properties yet (#1364). Project's grid
 cell editor and Task > Information...'s constraint prompt are typed into by
 `project-inputs-typing.uit` (#1203); the suite has no Task Information
-dialog yet (#1368). See `qa/inputs-typing.md`.
+dialog yet (#1368). The terminal editors' prompts are typed into by the
+`terminal-*-inputs-typing.uit` cases (#1204), which run the editor itself;
+see [Terminal editors](#terminal-editors-terminal-uit-1204). See
+`qa/inputs-typing.md`.
+
+## Terminal editors (`terminal-*.uit`, #1204)
+
+docxy, xlsxy and yppxy are terminal programs, so a person types into them
+through a terminal. A script whose first line (comments aside) is
+
+```text
+terminal <docxy|xlsxy|yppxy> [args...]
+```
+
+is run by the harness against that editor instead of the suite
+(`uiharness/src/term.rs`). Each `open` (`open copy:` included) starts the
+editor afresh on the file, with the header's args before it, in a
+pseudo-terminal of 120x40 (`uiharness/src/pty.rs`: a ConPTY on Windows,
+`openpty` on Linux and macOS). Its working directory is the file's folder,
+so a case can type a path relative to it. Its config roots (`APPDATA`,
+`LOCALAPPDATA`, `XDG_*`, `HOME`, `USERPROFILE`) point into the run's
+sandbox, the agwinterm variables are dropped (#697) and `TERM` is
+`xterm-256color`. The harness then connects to the control server every
+editor serves, at `<sandbox>/term-<n>/{appdata,config}/<app>/ctl/`, and
+keeps that one connection open for the session (`ctlcore::client::Conn`).
+
+The host handles three verbs itself; every other `call` is the editor's own
+verb, which a case uses only to read results:
+
+| Verb | Does |
+|---|---|
+| `real-key {"key":k}` / `{"keys":[…], "times":n}` | writes each key's terminal bytes (`uiharness/src/termkeys.rs`) one key at a time, and after each waits until the editor has handled one more key press and drawn a frame after it; replies `{keys}` |
+| `real-type {"text":…}` | the same, one key per character (`\n` is Enter, `\t` Tab) |
+| `pointer-click {"input":id}` | reads where the field was drawn (`field-read`'s `at`) and writes a left press and release there in the SGR mouse encoding, waiting for the click as for a key; replies `{input, col, row, clicks}`. A field not on screen is an `ERROR` |
+
+What each editor answers to `field-read` is `ctlcore::field`: with
+`{"input":id}`, the field's `value`, `focused`, `caret` and `selection` in
+chars (`null` while it is not open), `at` (`{col,row}` of its first
+character as last drawn), `kind` (which prompt of a shared field is open),
+and the counters below; with no `input`, the counters and the editor's
+input ids. `keys`, `clicks` and `frames` count the key presses, mouse
+button-downs and frames the event loop has handled; `dirty` is the
+document's unsaved state.
+
+**Which bytes.** On unix the bytes are an xterm's (`0x01`-`0x1A` Ctrl+letter,
+`0x7F` Backspace, `ESC [ 1 ; 2 C` Shift+Right, `ESC x` Alt+x). On Windows
+crossterm reads console input records, and plain bytes leave conhost to
+guess (is `0x08` Backspace or Ctrl+H? is a lone `ESC` the Escape key?), so
+the harness writes what Windows Terminal writes, win32-input-mode
+(`ESC [ Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`, once down and once up), which
+conhost turns into exactly that key. A Ctrl+letter record carries the
+letter, not its control code: given a control code, crossterm asks the
+foreground window's keyboard layout which letter the key is, and with a
+Cyrillic layout in front Ctrl+F arrived as Ctrl+'а'.
+
+**Waiting.** A key's wait is on the editor's own counters: the step polls
+`field-read` until `keys` has moved, then until `frames` has moved past
+that, so the next read sees what the screen shows. A key the editor never
+handles is an `ERROR` naming it, after 10 s; one the terminal turned into
+more than one press is an `ERROR` too.
+
+**The start-up query.** docxy and xlsxy ask the terminal at start which
+image protocol it speaks (ratatui-image's `Picker::from_query_stdio`). Its
+reader thread reads stdin until it sees the answer to `ESC [ 5 n`, and when
+nobody answers it outlives its 1-second timeout and swallows typed keys. The
+thread draining the terminal's output therefore answers `ESC [ 5 n` with
+`ESC [ 0 n` and `ESC [ c` with `ESC [ ? 6 2 c` as they appear (on Windows,
+conhost answers what it understands itself and passes on only the rest).
+
+**What a terminal script may do.** `open`, `call`, `call-error` and
+`assert reply.<path> is …`; a step that needs the suite's window or state
+(`click`, `shot`, `assert border`, a state key) is refused when the script
+is parsed. A script runs one command line, so the vim `:` lines, which need
+`--vim`, have scripts of their own (`terminal-docxy-vim-inputs-typing.uit`).
+
+**Binaries.** `uiharness run` finds the editor beside itself (the
+workspace's `target/<profile>/`); `--term-bin DIR` names another directory.
+`scripts/ui-linux-sweep.py` asks for the suite only when a suite script
+runs and for each editor only when a script drives it, and the
+`ui-sweep-linux` job builds them beside uiharness.
+
+**The clipboard is not sandboxed.** The editors write the OS clipboard (Ctrl+C
+in a document does), so a local run can replace what is on it.
 
 ## The isolation guarantee
 
