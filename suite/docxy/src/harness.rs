@@ -3126,7 +3126,7 @@ fn rtf_bold_text(clip: &docxcore::editor::Clip) -> String {
 }
 
 /// The active spreadsheet, or the refusal every cell verb needs.
-fn sheet(app: &crate::Docxy) -> Result<&SheetView, String> {
+pub(crate) fn sheet(app: &crate::Docxy) -> Result<&SheetView, String> {
     app.active_sheet()
         .ok_or_else(|| "the active tab is not a spreadsheet".to_string())
 }

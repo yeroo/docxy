@@ -216,27 +216,27 @@ fn sheet_probe(id: &str) -> Option<&'static str> {
     }
 }
 
-/// The active sheet, or why there is none to press or read.
-fn sheet(app: &crate::Docxy) -> Result<&crate::SheetView, String> {
-    app.active_sheet()
-        .ok_or_else(|| "the active tab is not a spreadsheet".to_string())
-}
-
 /// Where `pointer-click {"input":id}` presses, from the frame on screen.
-/// The in-cell editor is the active cell: a double-click opens it, and with
-/// one open a single click places its caret. Inputs of other surfaces answer
-/// which issue makes them targetable.
+/// The in-cell editor is a double-click on the active cell, which opens it;
+/// it is refused while an entry is open, where a click on the cell would
+/// commit it. Inputs of other surfaces answer which issue makes them
+/// targetable.
 pub(crate) fn press(app: &crate::Docxy, id: &str) -> Result<Press, String> {
     let i = find(id)?;
     if i.surface != Surface::Sheet {
         return Err(not_covered(i));
     }
-    let v = sheet(app)?;
+    let v = crate::harness::sheet(app)?;
     let Some(probe) = sheet_probe(id) else {
+        if v.editing.is_some() {
+            return Err(
+                "the in-cell editor is already open; a click on its cell commits it".into(),
+            );
+        }
         let b = app.cells_bounds(v.sel, v.sel)?;
         return Ok(Press {
             at: b.center(),
-            double: v.editing.is_none(),
+            double: true,
         });
     };
     let bounds = app.probes.borrow().on_screen(probe);
@@ -267,7 +267,7 @@ pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
     if i.surface != Surface::Sheet {
         return Err(not_covered(i));
     }
-    let v = sheet(app)?;
+    let v = crate::harness::sheet(app)?;
     let num = |n: usize| Json::Num(n as f64);
     let (value, focused, caret, selection) = match id {
         "formula-bar" | "cell-editor" => match &v.editing {
@@ -284,10 +284,10 @@ pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
                     sel.unwrap_or(Json::Null),
                 )
             }
-            // Idle, the bar shows the active cell's entry; the cell editor
-            // has none.
+            // Idle, the bar shows the active cell's formula or text; the
+            // cell editor has none.
             None if id == "formula-bar" => (
-                Json::Str(v.edit_string(v.sel.0, v.sel.1)),
+                Json::Str(crate::fx_bar_text(v)),
                 false,
                 Json::Null,
                 Json::Null,

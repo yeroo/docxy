@@ -7958,6 +7958,19 @@ fn name_box_text(view: &SheetView) -> String {
     }
 }
 
+/// What the formula bar shows for the active cell while no entry is open: a
+/// formula with its `=`, else the cell's text. Drawn and read by
+/// `field-read` (#1200) alike.
+fn fx_bar_text(view: &SheetView) -> String {
+    let (r, c) = view.sel;
+    match view.sheet().cell(r, c) {
+        Some(cell) if cell.formula.is_some() => {
+            format!("={}", cell.formula.as_deref().unwrap_or_default())
+        }
+        _ => view.cell_text(r, c),
+    }
+}
+
 /// The formula bar's height in px: one line, or about four with
 /// Ctrl+Shift+U (#672).
 fn fx_bar_height(expanded: bool) -> f32 {
@@ -37086,7 +37099,6 @@ fn sheet_el(
     cx: &mut Context<Docxy>,
 ) -> AnyElement {
     let sh = view.sheet();
-    let (sr, sc) = view.sel;
     let (max_r, max_c) = view.extent();
     // Frozen columns (freeze panes, cols axis): pinned at the left, always shown.
     let (frz_r, frz_c) = sh.freeze;
@@ -37116,15 +37128,9 @@ fn sheet_el(
     let editing = view.editing.clone();
     // ---- formula / reference bar ----
     let sel_ref = name_box_text(view);
-    let sel_full = if let Some(buf) = &editing {
-        buf.clone()
-    } else {
-        match sh.cell(sr, sc) {
-            Some(c) if c.formula.is_some() => {
-                format!("={}", c.formula.as_deref().unwrap_or_default())
-            }
-            _ => view.cell_text(sr, sc),
-        }
+    let sel_full = match &editing {
+        Some(buf) => buf.clone(),
+        None => fx_bar_text(view),
     };
     let sel_content = sel_full.replace('\n', LINE_FEED_GLYPH);
     let expanded = ov.fx_expanded;

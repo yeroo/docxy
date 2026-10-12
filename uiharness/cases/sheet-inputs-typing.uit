@@ -34,10 +34,11 @@ test sheet formula-bar: types
   click E1
   call real-key {"key":"escape"}
   call pointer-click {"input":"formula-bar"}
+  assert app_state is Edit
   call real-type {"text":"Ab1 "}
   call field-read {"input":"formula-bar"}
   assert reply.focused is true
-  assert reply.value is Ab1
+  assert reply.value is exactly "Ab1 "
   assert reply.caret is 4
   call real-key {"key":"escape"}
 
@@ -46,6 +47,7 @@ test sheet formula-bar: edits
   click E1
   call real-key {"key":"escape"}
   call pointer-click {"input":"formula-bar"}
+  assert app_state is Edit
   call real-type {"text":"abcd"}
   call real-key {"key":"backspace"}
   call field-read {"input":"formula-bar"}
@@ -72,6 +74,7 @@ test sheet formula-bar: select-all replaces
   click E1
   call real-key {"key":"escape"}
   call pointer-click {"input":"formula-bar"}
+  assert app_state is Edit
   call real-type {"text":"abcd"}
   call real-key {"key":"ctrl+a"}
   call field-read {"input":"formula-bar"}
@@ -88,6 +91,7 @@ test sheet formula-bar: copies
   call real-key {"key":"escape"}
   call clipboard {"action":"write","text":"before"}
   call pointer-click {"input":"formula-bar"}
+  assert app_state is Edit
   call real-type {"text":"abcd"}
   call real-key {"key":"ctrl+a"}
   call real-key {"key":"ctrl+c"}
@@ -101,6 +105,7 @@ test sheet formula-bar: pastes
   call real-key {"key":"escape"}
   call clipboard {"action":"write","text":"Pasted"}
   call pointer-click {"input":"formula-bar"}
+  assert app_state is Edit
   call real-key {"key":"ctrl+v"}
   call field-read {"input":"formula-bar"}
   assert reply.focused is true
@@ -114,10 +119,11 @@ test sheet formula-bar: Enter commits
   call real-key {"key":"escape"}
   assert dirty is false
   call pointer-click {"input":"formula-bar"}
+  assert app_state is Edit
   call real-type {"text":"Ab1"}
   call real-key {"key":"enter"}
   assert editing is false
-  assert cell E1 is Ab1
+  assert cell E1 is exactly Ab1
   assert sel is E2
   assert dirty is true
 
@@ -126,6 +132,7 @@ test sheet formula-bar: Escape cancels
   click E1
   call real-key {"key":"escape"}
   call pointer-click {"input":"formula-bar"}
+  assert app_state is Edit
   call real-type {"text":"Ab1"}
   call real-key {"key":"escape"}
   assert editing is false
@@ -155,10 +162,11 @@ test sheet cell-editor: types
   click E1
   call real-key {"key":"escape"}
   call pointer-click {"input":"cell-editor"}
+  assert app_state is Edit
   call real-type {"text":"Ab1 "}
   call field-read {"input":"cell-editor"}
   assert reply.focused is true
-  assert reply.value is Ab1
+  assert reply.value is exactly "Ab1 "
   assert reply.caret is 4
   call real-key {"key":"escape"}
 
@@ -167,6 +175,7 @@ test sheet cell-editor: edits
   click E1
   call real-key {"key":"escape"}
   call pointer-click {"input":"cell-editor"}
+  assert app_state is Edit
   call real-type {"text":"abcd"}
   call real-key {"key":"backspace"}
   call field-read {"input":"cell-editor"}
@@ -193,6 +202,7 @@ test sheet cell-editor: select-all replaces
   click E1
   call real-key {"key":"escape"}
   call pointer-click {"input":"cell-editor"}
+  assert app_state is Edit
   call real-type {"text":"abcd"}
   call real-key {"key":"ctrl+a"}
   call field-read {"input":"cell-editor"}
@@ -209,6 +219,7 @@ test sheet cell-editor: copies
   call real-key {"key":"escape"}
   call clipboard {"action":"write","text":"before"}
   call pointer-click {"input":"cell-editor"}
+  assert app_state is Edit
   call real-type {"text":"abcd"}
   call real-key {"key":"ctrl+a"}
   call real-key {"key":"ctrl+c"}
@@ -222,6 +233,7 @@ test sheet cell-editor: pastes
   call real-key {"key":"escape"}
   call clipboard {"action":"write","text":"Pasted"}
   call pointer-click {"input":"cell-editor"}
+  assert app_state is Edit
   call real-key {"key":"ctrl+v"}
   call field-read {"input":"cell-editor"}
   assert reply.focused is true
@@ -235,10 +247,11 @@ test sheet cell-editor: Enter commits
   call real-key {"key":"escape"}
   assert dirty is false
   call pointer-click {"input":"cell-editor"}
+  assert app_state is Edit
   call real-type {"text":"Ab1"}
   call real-key {"key":"enter"}
   assert editing is false
-  assert cell E1 is Ab1
+  assert cell E1 is exactly Ab1
   assert sel is E2
   assert dirty is true
 
@@ -247,6 +260,7 @@ test sheet cell-editor: Escape cancels
   click E1
   call real-key {"key":"escape"}
   call pointer-click {"input":"cell-editor"}
+  assert app_state is Edit
   call real-type {"text":"Ab1"}
   call real-key {"key":"escape"}
   assert editing is false
@@ -277,7 +291,7 @@ test sheet name-box: types
   call real-type {"text":"Ab1 "}
   call field-read {"input":"name-box"}
   assert reply.focused is true
-  assert reply.value is Ab1
+  assert reply.value is exactly "Ab1 "
   assert reply.caret is 4
   call real-key {"key":"escape"}
 
@@ -415,7 +429,7 @@ test sheet sheet-find: types
   call real-type {"text":"Ab1 "}
   call field-read {"input":"sheet-find"}
   assert reply.focused is true
-  assert reply.value is Ab1
+  assert reply.value is exactly "Ab1 "
   assert reply.caret is 4
   call real-key {"key":"escape"}
 
@@ -593,7 +607,7 @@ test sheet sheet-replace: types
   call real-type {"text":"Ab1 "}
   call field-read {"input":"sheet-replace"}
   assert reply.focused is true
-  assert reply.value is Ab1
+  assert reply.value is exactly "Ab1 "
   assert reply.caret is 4
   call real-key {"key":"escape"}
 
@@ -758,10 +772,10 @@ test sheet sheet-replace: All rewrites every match
   call pointer-click {"input":"sheet-find"}
   call real-type {"text":"th"}
   call pointer-click {"input":"sheet-replace"}
-  call real-type {"text":"TH"}
+  call real-type {"text":"XY"}
   call pointer-click {"at":"sheet-replace-all-button"}
-  assert cell A2 is NorTH
-  assert cell A3 is SouTH
+  assert cell A2 is exactly NorXY
+  assert cell A3 is exactly SouXY
   assert dirty is true
   call real-key {"key":"escape"}
 
@@ -806,7 +820,7 @@ test sheet sheet-font: types
   call real-type {"text":"Ab1 "}
   call field-read {"input":"sheet-font"}
   assert reply.focused is true
-  assert reply.value is Ab1
+  assert reply.value is exactly "Ab1 "
   assert reply.caret is 4
   call real-key {"key":"escape"}
 
@@ -926,7 +940,7 @@ test sheet sheet-font-size: types
   call real-type {"text":"Ab1 "}
   call field-read {"input":"sheet-font-size"}
   assert reply.focused is true
-  assert reply.value is Ab1
+  assert reply.value is exactly "Ab1 "
   assert reply.caret is 4
   call real-key {"key":"escape"}
 
