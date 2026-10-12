@@ -76,21 +76,26 @@ fn the_recent_list_survives_a_relaunch_and_drops_a_missing_file() {
         .filter(|t| t.starts_with("recent-"))
         .collect();
     assert_eq!(titles, ["recent-a.docx", "recent-b.xlsx"], "{tabs}");
-    let b_tab = tabs
-        .get("tabs")
-        .and_then(Json::as_array)
-        .unwrap()
-        .iter()
-        .position(|t| t.get_str("title") == Some("recent-b.xlsx"))
-        .unwrap();
     assert_eq!(
         names(&driver),
         ["recent-a.docx", "recent-b.xlsx"],
         "the list survives, and restoring the tabs recorded nothing"
     );
 
-    // B's file is gone: its row leaves the list, and nothing opens.
-    call(&driver, "close-tab", &[("index", Json::Num(b_tab as f64))]);
+    // B's file is gone: its row leaves the list, and nothing opens. With
+    // no tab open, so the message cannot be a tab's status (#1194 r1 m3).
+    loop {
+        let tabs = call(&driver, "tab-list", &[]);
+        if tabs
+            .get("tabs")
+            .and_then(Json::as_array)
+            .unwrap()
+            .is_empty()
+        {
+            break;
+        }
+        call(&driver, "close-tab", &[("index", Json::Num(0.))]);
+    }
     std::fs::remove_file(&b).unwrap();
     call(
         &driver,
@@ -98,11 +103,13 @@ fn the_recent_list_survives_a_relaunch_and_drops_a_missing_file() {
         &[("action", Json::Str("open".into()))],
     );
     let before = call(&driver, "tab-list", &[]);
-    let state = call(&driver, "recent-open", &[("index", Json::Num(1.))]);
+    call(&driver, "recent-open", &[("index", Json::Num(1.))]);
+    // The message is the Recent list's own, under its heading.
+    let recent = call(&driver, "recent-files", &[]);
     assert_eq!(
-        state.get_str("status"),
+        recent.get_str("message"),
         Some("\"recent-b.xlsx\" could not be found, so it was removed from the recent list"),
-        "{state}"
+        "{recent}"
     );
     assert_eq!(names(&driver), ["recent-a.docx"]);
     assert_eq!(call(&driver, "tab-list", &[]), before, "nothing opened");
@@ -116,5 +123,18 @@ fn the_recent_list_survives_a_relaunch_and_drops_a_missing_file() {
         Some(&Json::Bool(true)),
         "{backstage}"
     );
+    // Reopening the File screen clears it.
+    call(
+        &driver,
+        "backstage",
+        &[("action", Json::Str("close".into()))],
+    );
+    call(
+        &driver,
+        "backstage",
+        &[("action", Json::Str("open".into()))],
+    );
+    let recent = call(&driver, "recent-files", &[]);
+    assert_eq!(recent.get("message"), Some(&Json::Null), "{recent}");
     app.shutdown(Some(&driver));
 }

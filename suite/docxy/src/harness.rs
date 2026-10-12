@@ -3474,10 +3474,10 @@ fn kind_name(kind: crate::Kind) -> &'static str {
     }
 }
 
-/// `tab-list`: every open tab, in strip order, and which one is active.
 /// `recent-files`'s reply (#1194): each file newest first, with its name,
-/// the kind of tab it opens as, and whether it still exists.
-fn recent_files_json(files: &[std::path::PathBuf]) -> Json {
+/// the kind of tab it opens as, and whether it still exists; and the
+/// message the Recent list shows under its heading, or null.
+fn recent_files_json(files: &[std::path::PathBuf], message: Option<&str>) -> Json {
     let files = files
         .iter()
         .enumerate()
@@ -3491,9 +3491,13 @@ fn recent_files_json(files: &[std::path::PathBuf]) -> Json {
             ])
         })
         .collect();
-    Json::obj(vec![("files", Json::Arr(files))])
+    Json::obj(vec![
+        ("files", Json::Arr(files)),
+        ("message", str_or_null(message.map(str::to_owned))),
+    ])
 }
 
+/// `tab-list`: every open tab, in strip order, and which one is active.
 fn tab_list(tabs: &[crate::DocTab], active: usize, os_title: Option<&str>) -> Json {
     let window_title = crate::doc_name::window_title(tabs.get(active).map(|t| t.title.as_ref()));
     let tabs = tabs
@@ -4787,9 +4791,10 @@ fn dispatch_verb(
         }
         // The recent files (#1194), read from the store as it is now, not
         // from the Backstage's copy: what the next Backstage will show.
-        "recent-files" => Done::ok(recent_files_json(&crate::recent_files::list(
-            &crate::config_root(),
-        ))),
+        "recent-files" => Done::ok(recent_files_json(
+            &crate::recent_files::list(&crate::config_root()),
+            app.recent_message.as_deref(),
+        )),
         // A click on the Open page's Recent row `index` (#1194), counted in
         // the store as it is now; the click itself carries the row's path.
         "recent-open" => {
@@ -5866,7 +5871,7 @@ mod tests {
         std::fs::write(&book, b"x").unwrap();
         let gone = dir.join("Letter.docx");
         let plan = dir.join("Plan.yppx");
-        let reply = recent_files_json(&[book.clone(), gone, plan]);
+        let reply = recent_files_json(&[book.clone(), gone, plan], None);
         let _ = std::fs::remove_dir_all(&dir);
         let files = match reply.get("files") {
             Some(Json::Arr(files)) => files.clone(),
@@ -5886,9 +5891,13 @@ mod tests {
         assert_eq!(field(1, "kind"), Json::Str("docx".into()));
         assert_eq!(field(1, "exists"), Json::Bool(false));
         assert_eq!(field(2, "kind"), Json::Str("project".into()));
+        assert_eq!(reply.get("message"), Some(&Json::Null));
         assert_eq!(
-            recent_files_json(&[]),
-            Json::obj(vec![("files", Json::Arr(vec![]))])
+            recent_files_json(&[], Some("gone")),
+            Json::obj(vec![
+                ("files", Json::Arr(vec![])),
+                ("message", Json::Str("gone".into()))
+            ])
         );
     }
 

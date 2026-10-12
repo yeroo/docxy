@@ -4746,6 +4746,10 @@ struct Docxy {
     /// backstage opens and after this window records or removes a file:
     /// never per frame.
     recent_files: Vec<PathBuf>,
+    /// What the last Recent row click could not do (a file that is gone),
+    /// shown under the Recent heading until the backstage reopens: the tab
+    /// status is hidden behind the backstage, and there may be no tab.
+    recent_message: Option<String>,
     /// When the hot-exit state was last written by any `persist`, or an
     /// AutoRecover tick last found nothing to write: the timer's clock. A
     /// `Cell` because `persist` takes `&self`.
@@ -11751,6 +11755,7 @@ impl Docxy {
             trusted_count: 0,
             trusted_error: None,
             recent_files: Vec::new(),
+            recent_message: None,
             last_persist: std::cell::Cell::new(std::time::Instant::now()),
             applied: None,
             os_appearance: gpui::WindowAppearance::Light,
@@ -11969,6 +11974,7 @@ impl Docxy {
         self.trusted_count = trusted::count(&config_root());
         self.trusted_error = None;
         self.recent_files = recent_files::list(&config_root());
+        self.recent_message = None;
         cx.notify();
     }
 
@@ -20089,7 +20095,7 @@ impl Docxy {
         if !path.exists() {
             let _ = recent_files::forget(&root, path);
             self.recent_files = recent_files::list(&root);
-            self.set_status(recent_files::missing_status(path));
+            self.recent_message = Some(recent_files::missing_status(path));
             cx.notify();
             return;
         }
@@ -32625,6 +32631,9 @@ impl Docxy {
                         .mt_4()
                         .child("Recent"),
                 )
+                .when_some(self.recent_message.clone(), |d, m| {
+                    d.child(div().text_size(px(12.)).text_color(fg).child(m))
+                })
                 .map(|d| {
                     if recents.is_empty() {
                         d.child(
