@@ -32918,7 +32918,8 @@ impl Docxy {
     /// One Backstage column (#1028): `col`'s size and background, a scroll
     /// container tracking `handle` around `child`, and an always-shown 12px
     /// scrollbar over its right edge. `id` names the column and its probe;
-    /// the scroll container is `{id}-scroll`.
+    /// `scroll_id` names the scroll container (by convention `{id}-scroll`,
+    /// which the harness's regions rely on).
     fn backstage_scroll_column(
         &self,
         col: Div,
