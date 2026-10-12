@@ -667,11 +667,12 @@ pub(crate) fn gantt_format_tab() -> rs::Tab<Act> {
 /// Whether a command act drops the entry-table range selection: every act
 /// clears it except the ones that keep or consume it — Copy keeps the
 /// highlight, Cut and Paste clear it when they run, Link and Unlink act on
-/// it. The rule lives here, one place, so keys, the ribbon, the QAT and
-/// Backstage cannot drift apart.
+/// it, and Delete clears the range's cells and consumes it. The rule lives
+/// here, one place, so keys, the ribbon, the QAT and Backstage cannot drift
+/// apart.
 pub(crate) fn project_act_clears_range(act: ProjectAct) -> bool {
     use ProjectAct::*;
-    !matches!(act, Copy | Cut | Paste | AddLink | UnlinkTasks)
+    !matches!(act, Copy | Cut | Paste | AddLink | UnlinkTasks | ClearCell)
 }
 
 /// Whether an in-cell cut may empty the buffer: the read-back clipboard
@@ -1460,8 +1461,9 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
     v.cancel_prompt();
     // A command acts on the cursor: the range does not survive it. (Copy,
     // Cut and Paste are handled by the host before they reach here; Cut and
-    // Paste clear the range themselves, and Link/Unlink below are exempt in
-    // [`project_act_clears_range`], which the host-side dispatch also uses.)
+    // Paste clear the range themselves, and Link/Unlink and Delete below are
+    // exempt in [`project_act_clears_range`], which the host-side dispatch
+    // also uses.)
     if project_act_clears_range(act) {
         v.anchor = None;
     }
@@ -1487,7 +1489,20 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                 v.select_row(at);
             }
             ClearCell => {
-                if let Some(uid) = v.selected_uid() {
+                // Over a range: clear its Name, Predecessors and Resource
+                // Names cells, as Cut does, without the clipboard; never
+                // delete a task. The range is consumed either way, so read
+                // it before the anchor goes.
+                let sel = v.selection();
+                v.anchor = None;
+                if let Some(sel) = sel {
+                    let cols = range_clear_cols(&sel);
+                    if cols.is_empty() {
+                        status = Some("Selection's columns can't be cleared".into());
+                    } else {
+                        status = clear_range_cells(&mut v.ed, &sel, &cols)?;
+                    }
+                } else if let Some(uid) = v.selected_uid() {
                     match v.col {
                         COL_ID => {
                             dialog = delete_selected_task(v)?;
