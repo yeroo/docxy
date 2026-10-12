@@ -206,7 +206,9 @@ pub(crate) fn commit_comment_buffer(
     true
 }
 
-/// The exit path's comment commit. A CHANGED buffer commits to the bar's
+/// The comment bar's leave commit (`Docxy::sheet_comment_bar_leave`: a cell
+/// press or click, a right-click, Previous/Next Comment, a row/column
+/// insert/delete, or the exit path). A CHANGED buffer commits to the bar's
 /// cell — the one the bar opened on, as Enter, Save and the bar's own label
 /// target it — whatever the selection did meanwhile. `seed` — the raw text
 /// the bar opened with — serves only the skip decision, so an untouched bar

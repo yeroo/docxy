@@ -14051,10 +14051,11 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // `grid_press_cell` commits an open bar on the press, but the pointer
-        // never reaches it on frozen sheets (`cell_at` refuses them) — the
-        // cell's own click always runs, so it leaves the bar too (a no-op
-        // when the press already closed it).
+        // `grid_press_cell` leaves the bar on the press, but the pointer
+        // never reaches it on sheets with frozen rows (`cell_at` refuses
+        // them); a click on the cell still runs here, so it leaves the bar
+        // too (a no-op when the press already closed it). A drag fires no
+        // click: there the press's leave is the only one.
         self.sheet_comment_bar_leave();
         if shift {
             self.extend_to(r, c, cx)
@@ -16386,6 +16387,8 @@ impl Docxy {
         let Some(text) = self.sheet_comment_edit.clone() else {
             return;
         };
+        // The seed and anchor open with the buffer (sheet_new_comment): both
+        // fallbacks are unreachable.
         let seed = self
             .sheet_comment_seed
             .clone()
