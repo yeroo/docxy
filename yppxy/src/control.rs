@@ -48,14 +48,14 @@ fn app_info() -> Result<Json, String> {
     Json::parse(&buildinfo::get(env!("CARGO_PKG_VERSION")).json())
 }
 
-/// Route one control verb against the live project, returning the JSON result
-/// or an error message.
 /// yppxy's text prompts, as `field-read {"input":id}` names them (#1204):
 /// the prompt every command shares (its vim `:` line and Ctrl+S Save As
 /// included) and Backstage Save As's file name. The suite's input registry
 /// lists the same ids.
 pub(crate) const INPUTS: &[&str] = &["yppxy-prompt", "yppxy-save-as"];
 
+/// Route one control verb against the live project, returning the JSON result
+/// or an error message.
 pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> {
     let out = match verb {
         "proj.path" => Ok(path_info(app)),

@@ -130,12 +130,14 @@ test docxy docxy-find: Escape cancels
   assert reply.modified is false
 
 
-# ---- The Find bar's Replace field: Ctrl+H opens the bar, Tab moves to
-# Replace. In the bar Ctrl+A is Replace All today, so select-all replaces
-# also checks the document did not change.
+# ---- The Find bar's Replace field: Ctrl+H opens the bar, the steps find
+# "Two" (which the document holds) and Tab to Replace. In Replace mode
+# Ctrl+A is Replace All today, so select-all replaces also checks the
+# document did not change: Replace All would have edited "Two".
 test docxy docxy-replace: focus
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"ctrl+h"}
+  call real-type {"text":"Two"}
   call real-key {"key":"tab"}
   call field-read {"input":"docxy-replace"}
   assert reply.focused is true
@@ -146,6 +148,7 @@ test docxy docxy-replace: focus
 test docxy docxy-replace: focus by click
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"ctrl+h"}
+  call real-type {"text":"Two"}
   call real-key {"key":"tab"}
   call real-key {"key":"tab"}
   call pointer-click {"input":"docxy-replace"}
@@ -155,6 +158,7 @@ test docxy docxy-replace: focus by click
 test docxy docxy-replace: types
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"ctrl+h"}
+  call real-type {"text":"Two"}
   call real-key {"key":"tab"}
   call real-type {"text":"Ab1 "}
   call field-read {"input":"docxy-replace"}
@@ -165,6 +169,7 @@ test docxy docxy-replace: types
 test docxy docxy-replace: edits
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"ctrl+h"}
+  call real-type {"text":"Two"}
   call real-key {"key":"tab"}
   call real-type {"text":"abcd"}
   call real-key {"key":"backspace"}
@@ -189,6 +194,7 @@ test docxy docxy-replace: edits
 test docxy docxy-replace: select-all replaces
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"ctrl+h"}
+  call real-type {"text":"Two"}
   call real-key {"key":"tab"}
   call real-type {"text":"abcd"}
   call real-key {"key":"ctrl+a"}
@@ -204,6 +210,7 @@ test docxy docxy-replace: select-all replaces
 test docxy docxy-replace: copies
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"ctrl+h"}
+  call real-type {"text":"Two"}
   call real-key {"key":"tab"}
   call real-type {"text":"abcd"}
   call real-key {"key":"ctrl+a"}
@@ -221,6 +228,7 @@ test docxy docxy-replace: pastes
   call real-key {"key":"shift+end"}
   call real-key {"key":"ctrl+c"}
   call real-key {"key":"ctrl+h"}
+  call real-type {"text":"Two"}
   call real-key {"key":"tab"}
   call real-key {"key":"ctrl+v"}
   call field-read {"input":"docxy-replace"}
@@ -559,6 +567,9 @@ test docxy docxy-compare-original: Enter commits
   call real-key {"key":"right","times":9}
   call real-key {"key":"enter"}
   call real-type {"text":"header-inherit.docx"}
+  call real-key {"key":"shift+tab"}
+  call field-read {"input":"docxy-compare-original"}
+  assert reply.focused is true
   call real-key {"key":"enter"}
   call doc.path {}
   assert reply.path is exactly Compare Result 1.docx

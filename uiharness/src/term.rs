@@ -255,10 +255,6 @@ impl Terminal {
         }
     }
 
-    pub fn exe(&self) -> &Path {
-        &self.exe
-    }
-
     /// Stop the running editor, if one is.
     pub fn stop(&mut self) {
         if let Some(mut s) = self.session.take() {

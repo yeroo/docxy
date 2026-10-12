@@ -95,10 +95,31 @@ mod sys {
     use windows::core::{PCWSTR, PWSTR};
 
     /// The pseudo-console handle, closed once.
+    /// The pseudo-console, closed when dropped: by `Pty`'s drop after the
+    /// child is killed, or by `spawn` when a step after its creation fails.
     struct Console(HPCON);
     // SAFETY: an HPCON is an opaque kernel object handle; closing it from
     // another thread is what `Drop` below does, once.
     unsafe impl Send for Console {}
+
+    impl Drop for Console {
+        fn drop(&mut self) {
+            // ⚠️ Before Windows 11 24H2, `ClosePseudoConsole` blocks until the
+            // output pipe has been drained, and the thread draining it may be
+            // the one waiting on us (or, in a failed `spawn`, its read end is
+            // about to close). Closed off this thread, so a hang there costs
+            // a parked thread, never the run.
+            struct Closing(HPCON);
+            // SAFETY: as for `Console`; the handle only crosses to be closed.
+            unsafe impl Send for Closing {}
+            let hpc = Closing(self.0);
+            std::thread::spawn(move || {
+                let hpc = hpc;
+                // SAFETY: the handle is ours, and this drop runs once.
+                unsafe { ClosePseudoConsole(hpc.0) };
+            });
+        }
+    }
 
     pub struct Pty {
         console: Option<Console>,
@@ -315,17 +336,10 @@ mod sys {
 
     impl Drop for Pty {
         fn drop(&mut self) {
+            // Kill, keep draining (the reader's thread), then close the
+            // pseudo-console: `Console`'s drop does that off this thread.
             self.kill();
-            // ⚠️ Before Windows 11 24H2, `ClosePseudoConsole` blocks until
-            // the output pipe has been drained, and the drain thread may be
-            // the one waiting on us. Closed off this thread, so a hang there
-            // costs a parked thread, never the run.
-            if let Some(console) = self.console.take() {
-                std::thread::spawn(move || {
-                    // SAFETY: the handle is ours and closed exactly once.
-                    unsafe { ClosePseudoConsole(console.0) };
-                });
-            }
+            drop(self.console.take());
             // SAFETY: owned, closed once.
             unsafe {
                 let _ = CloseHandle(self.process);

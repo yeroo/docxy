@@ -417,11 +417,7 @@ fn run_scripts(a: &Args) -> Result<String, String> {
     // just made — a green run about code that was never built. Naming the file
     // is what makes that visible instead of mystifying.
     let mut out = match &exe {
-        Some(exe) => format!(
-            "suite:    {}
-",
-            exe.display()
-        ),
+        Some(exe) => format!("suite:    {}\n", exe.display()),
         None => String::new(),
     };
     let mut all_passed = true;
@@ -432,11 +428,7 @@ fn run_scripts(a: &Args) -> Result<String, String> {
                 .dir()
                 .join(format!("sandbox-{}-{stamp}-{i}", std::process::id())),
         };
-        out.push_str(&format!(
-            "{}
-",
-            path.display()
-        ));
+        out.push_str(&format!("{}\n", path.display()));
         // A terminal script starts its editor at each `open`, in a
         // pseudo-terminal; there is no suite to launch or keep.
         if let Some(spec) = &script.terminal {
@@ -444,29 +436,18 @@ fn run_scripts(a: &Args) -> Result<String, String> {
                 Ok(e) => e,
                 Err(e) => {
                     all_passed = false;
-                    out.push_str(&format!(
-                        "  ERROR {e}
-"
-                    ));
+                    out.push_str(&format!("  ERROR {e}\n"));
                     break;
                 }
             };
-            out.push_str(&format!(
-                "terminal: {}
-",
-                editor.display()
-            ));
+            out.push_str(&format!("terminal: {}\n", editor.display()));
             let mut term = uiharness::term::Terminal::new(spec.clone(), editor, sandbox.clone());
             let outcome =
                 uiharness::Runner::new(&mut term, &run, base, &sandbox).run_script(script);
             term.stop();
             all_passed &= outcome.passed();
             out.push_str(&outcome.report());
-            out.push_str(&format!(
-                "sandbox:  {}
-",
-                sandbox.display()
-            ));
+            out.push_str(&format!("sandbox:  {}\n", sandbox.display()));
             continue;
         }
         let Some(exe) = &exe else {

@@ -192,8 +192,6 @@ fn app_info() -> Result<Json, String> {
     Json::parse(&buildinfo::get(env!("CARGO_PKG_VERSION")).json())
 }
 
-/// Route one control verb against the live workbook, returning the JSON result
-/// or an error message.
 /// xlsxy's text prompts, as `field-read {"input":id}` names them (#1204):
 /// the minibuffer (Rename Sheet, Find, Go To, Save As by F12 and the rest),
 /// the cell editor, the vim `:` line and Backstage Save As's file name. The
@@ -205,6 +203,8 @@ pub(crate) const INPUTS: &[&str] = &[
     "xlsxy-save-as",
 ];
 
+/// Route one control verb against the live workbook, returning the JSON result
+/// or an error message.
 pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> {
     let out = match verb {
         "wb.path" => Ok(path_info(app)),
