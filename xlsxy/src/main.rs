@@ -8406,7 +8406,13 @@ impl App {
     /// Insert a chart from the selection: the first non-numeric column is the
     /// category axis, each numeric column a series. Anchored just right of the
     /// selection and wired via SheetPackage::add_chart (renders + persists).
+    /// A protected sheet refuses, as Fill does (#1353).
     fn insert_chart(&mut self, kind: &str) {
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return;
+        }
         let (r1, c1, r2, c2) = self.iter_selection();
         // Same reader the desktop suite uses: header row names the series, the
         // first non-numeric column supplies the labels.
@@ -17030,6 +17036,70 @@ mod tests {
             DrawingKind::Chart(cd) => assert_eq!(cd.kind, "column"),
             _ => panic!("expected a chart drawing"),
         }
+    }
+
+    /// #1353: a protected sheet refuses Insert chart: no drawing, the undo
+    /// and redo stacks keep their entries, `modified` stays false, and the
+    /// saved file carries no drawing.
+    #[test]
+    fn insert_chart_is_refused_on_a_protected_sheet() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        {
+            let sh = &mut app.pkg.workbook.sheets[0];
+            sh.set_cell(0, 0, Cell::text("Item"));
+            sh.set_cell(0, 1, Cell::text("Qty"));
+            sh.set_cell(1, 0, Cell::text("A"));
+            sh.set_cell(1, 1, Cell::number(3.0));
+            sh.set_cell(2, 0, Cell::text("B"));
+            sh.set_cell(2, 1, Cell::number(5.0));
+        }
+        app.rebuild_engine();
+        app.cur = (0, 0);
+        app.anchor = Some((2, 1)); // select A1:B3
+        // An undoable edit first, so a wrongful undo.clear() in the refusal
+        // would be caught.
+        app.toggle_wrap();
+        assert!(!app.undo.is_empty());
+        app.modified = false;
+        let undo_len = app.undo.len();
+        let redo_len = app.redo.len();
+        app.pkg.workbook.sheets[0].set_protected(true);
+        app.insert_chart("column");
+
+        assert!(app.pkg.workbook.sheets[0].drawings.is_empty());
+        assert_eq!(app.undo.len(), undo_len);
+        assert_eq!(app.redo.len(), redo_len);
+        assert!(!app.modified);
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+        let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        assert!(re.workbook.sheets[0].drawings.is_empty());
+    }
+
+    /// #1353: the ribbon's Insert chart is refused the same way on a
+    /// protected sheet.
+    #[test]
+    fn ribbon_insert_chart_is_refused_on_a_protected_sheet() {
+        use gridcore::sheet::Cell;
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        {
+            let sh = &mut app.pkg.workbook.sheets[0];
+            sh.set_cell(0, 0, Cell::text("Item"));
+            sh.set_cell(0, 1, Cell::text("Qty"));
+            sh.set_cell(1, 0, Cell::text("A"));
+            sh.set_cell(1, 1, Cell::number(3.0));
+            sh.set_cell(2, 0, Cell::text("B"));
+            sh.set_cell(2, 1, Cell::number(5.0));
+        }
+        app.rebuild_engine();
+        app.cur = (0, 0);
+        app.anchor = Some((2, 1)); // select A1:B3
+        app.pkg.workbook.sheets[0].set_protected(true);
+        app.ribbon_act(ribbon::Act::InsertChart("column"));
+
+        assert!(app.pkg.workbook.sheets[0].drawings.is_empty());
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
     }
 
     #[test]
