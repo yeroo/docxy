@@ -21,6 +21,8 @@ pub(crate) enum MenuTarget {
 
     /// A Project task row's context menu; `None` is the entry row.
     Row(Option<i32>),
+    /// A task's Gantt bar context menu (#1207), by the task's uid.
+    Bar(i32),
     /// A ribbon split button's drop-down: tab, group and the primary's label
     /// (and its id, which the drawn arrow knows it by; not reported).
     Ribbon {
@@ -98,6 +100,7 @@ impl MenuTarget {
                 "row",
                 uid.map_or(Json::Null, |u| Json::Num(u as f64)),
             )]),
+            Self::Bar(uid) => Json::obj(vec![("bar", Json::Num(*uid as f64))]),
             Self::Ribbon {
                 tab, group, label, ..
             } => Json::obj(vec![(
@@ -357,7 +360,7 @@ pub(crate) fn read_json(menu: Option<&Menu>) -> Json {
 }
 
 /// Whether an open menu still fits what it was opened on, before an item
-/// runs: a row menu's task must still be the one selected on the active
+/// runs: a row or bar menu's task must still be the one selected on the active
 /// Project, and the document menu is never run on a Project. `project` is
 /// the active tab's selected task (`Some(None)` on the entry row), or `None`
 /// off a Project. Whatever moves on from a menu closes it; this is the
@@ -369,6 +372,8 @@ pub(crate) fn target_stands(
     match (target, project) {
         (MenuTarget::Row(uid), Some(selected)) if selected == *uid => Ok(()),
         (MenuTarget::Row(_), _) => Err("the row menu's task is no longer the selected one".into()),
+        (MenuTarget::Bar(uid), Some(Some(selected))) if selected == *uid => Ok(()),
+        (MenuTarget::Bar(_), _) => Err("the bar menu's task is no longer the selected one".into()),
         (MenuTarget::Document, Some(_)) => {
             Err("the document menu does not run on a Project tab".into())
         }
@@ -944,6 +949,10 @@ mod tests {
             MenuTarget::Row(None).to_json().get("row"),
             Some(&Json::Null)
         );
+        assert_eq!(
+            MenuTarget::Bar(2).to_json(),
+            Json::obj(vec![("bar", Json::Num(2.))])
+        );
     }
 
     #[test]
@@ -1116,6 +1125,16 @@ mod tests {
         }
         let entry = MenuTarget::Row(None);
         assert_eq!(target_stands(&entry, Some(None)), Ok(()));
+        // A bar menu (#1207) has a task, never the entry row.
+        let bar = MenuTarget::Bar(2);
+        assert_eq!(target_stands(&bar, Some(Some(2))), Ok(()));
+        for moved in [Some(Some(3)), Some(None), None] {
+            assert!(
+                target_stands(&bar, moved)
+                    .unwrap_err()
+                    .contains("the bar menu's task is no longer the selected one")
+            );
+        }
         assert!(target_stands(&entry, Some(Some(1))).is_err());
         assert_eq!(target_stands(&MenuTarget::Document, None), Ok(()));
         assert!(target_stands(&MenuTarget::Document, Some(None)).is_err());

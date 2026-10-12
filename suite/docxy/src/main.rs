@@ -29527,6 +29527,58 @@ impl Docxy {
         Ok(())
     }
 
+    /// A right-click on a task's Gantt bar (task `row` in task order), and
+    /// `menu-open {"bar"}` (#1207). As on the table, the press selects the
+    /// row, committing an open cell edit, then the bar's menu opens for it.
+    /// A row with no bar is refused before anything is selected; a commit
+    /// the plan refuses keeps the edit and its status, and no menu opens.
+    pub(crate) fn open_bar_menu(
+        &mut self,
+        row: usize,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return Err("no tab is open".into());
+        };
+        let Surface::Project(v) = &mut tab.surface else {
+            return Err("the active tab is not a Project".into());
+        };
+        let bar_uid = |v: &ProjectView| {
+            let task = v.ed.project().tasks.get(row)?;
+            (!task.is_null && gantt_bar(&v.ed, task, v.scale).is_some()).then_some(task.uid)
+        };
+        let Some(uid) = bar_uid(v) else {
+            return Err(match v.ed.project().tasks.get(row) {
+                Some(t) => format!("task uid {} has no bar", t.uid),
+                None => "no task at that row has a bar".into(),
+            });
+        };
+        v.drag_made_range = false;
+        crate::project_row_click(tab, row, None, false);
+        let Surface::Project(v) = &tab.surface else {
+            return Err("the active tab is not a Project".into());
+        };
+        if v.cell.is_some() {
+            let status = tab.status.to_string();
+            self.refocus(window, cx);
+            return Err(format!("the open cell edit did not commit: {status}"));
+        }
+        // The commit may have changed the plan: the menu is for the task
+        // whose bar was pressed, and only while it still has one.
+        if v.selected_uid() != Some(uid) || bar_uid(v) != Some(uid) {
+            self.refocus(window, cx);
+            return Err(format!(
+                "task uid {uid} has no bar after the edit committed"
+            ));
+        }
+        let items = project_bar_menu(v);
+        self.refocus(window, cx);
+        self.open_menu(menu::MenuTarget::Bar(uid), at, items, cx);
+        Ok(())
+    }
+
     /// A split button's arrow half, and `menu-open {"ribbon"}`: its drop-down,
     /// found by the primary command's id on the ribbon the active tab shows.
     pub(crate) fn open_split_menu(

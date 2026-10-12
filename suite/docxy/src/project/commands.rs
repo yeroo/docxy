@@ -794,6 +794,38 @@ pub(crate) fn project_row_menu(v: &ProjectView) -> Vec<crate::menu::MenuItem> {
     ]
 }
 
+/// A Gantt bar's context menu (#1207), in Project's order: its bar
+/// formatting first, then the task items the row menu also has, which run
+/// the same commands. Project's mini toolbar on the bar (CUS-142) and the
+/// Format Bar and Bar Styles dialogs (CUS-141) are not built, so their items
+/// are drawn disabled. A bar is only drawn for a real task, but the items
+/// still follow the selection, as the row menu's do.
+pub(crate) fn project_bar_menu(v: &ProjectView) -> Vec<crate::menu::MenuItem> {
+    use crate::menu::{
+        Entry,
+        MenuItem::{Item, Separator},
+    };
+    use ProjectAct::*;
+    let task = v
+        .selected_uid()
+        .and_then(|uid| v.ed.project().task(uid))
+        .is_some_and(|t| !t.is_null);
+    let item = |id, label, icon, act: ProjectAct| {
+        Item(Entry::new(id, label, icon, Act::Project(act), task))
+    };
+    let none = |id, label| Item(Entry::unavailable(id, label));
+    vec![
+        none("bm-bar-styles", "Format Bar Styles..."),
+        none("bm-format-bar", "Format Bar..."),
+        Separator,
+        item("bm-info", "Information...", "print-layout", Constraint),
+        item("bm-notes", "Notes...", "comment", Notes),
+        none("bm-timeline", "Add to Timeline"),
+        Separator,
+        item("bm-hyperlink", "Hyperlink...", "", Hyperlink),
+    ]
+}
+
 fn selected_task_inactive(v: &ProjectView) -> bool {
     v.selected_uid()
         .and_then(|uid| v.ed.project().tasks.iter().position(|t| t.uid == uid))
