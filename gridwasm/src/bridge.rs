@@ -2282,7 +2282,8 @@ impl Session {
     /// chains a working redo (apply it again to get back to the new width).
     /// `col` echoes NUMERICALLY (0-based), matching Task 3's locked
     /// reply-shape decision — there is no paired ref-style field here to
-    /// carry a letter form. Mirrors xlsxy control.rs's `col_width`.
+    /// carry a letter form. Mirrors xlsxy control.rs's `col_width`, except
+    /// that it does not refuse a protected sheet yet (#1353).
     fn ctl_col_width(&mut self, args: &json::Json) -> Result<String, String> {
         let si = self.ctl_sheet_arg(args)?;
         let col = ctl_col_arg(args)?;

@@ -878,7 +878,7 @@ name and defaults to the active sheet):
 | `cell.set` | `{ref, text, sheet?}` | `{ref, value, text, …}` — typed the way the grid types it: leading `=` is a formula, validated + recalculated; numbers, currency, percents, fractions, dates and times are recognised (a General cell takes the matching number format); a Text-formatted cell keeps the text as typed; a leading `'` stores the rest as text with `quotePrefix`; more than 32,767 characters is refused and the cell is left as it was; an edit that would change part of a legacy CSE array (not its anchor) is refused with `cell.set: You can't change part of an array.` and nothing changes |
 | `range.clear` | `{range, sheet?}` | `{cleared}`; a clear that would change part of a legacy CSE array (not its anchor) is refused with `range.clear: You can't change part of an array.` and nothing changes |
 | `cell.format` | `{range, patch, sheet?}` | `{formatted}` — cell count; ONE undo group over every cell in `range` |
-| `col.width` | `{col, width, sheet?}` | `{col, width}` — `col` accepts a letter or a 0-based index; the reply always echoes the **numeric** index |
+| `col.width` | `{col, width, sheet?}` | `{col, width}` — `col` accepts a letter or a 0-based index; the reply always echoes the **numeric** index; a protected sheet is refused (`col.width: the sheet is protected`) — terminal xlsxy only; a VS Code or JetBrains tab does not check protection yet |
 | `find` | `{query, sheet?}` | `{query, count, matches:[…]}` |
 | `wb.recalc` | — | `{recalculated:true}` |
 | `wb.properties` | — | **Terminal xlsxy only for now** (a VS Code or JetBrains tab answers `unknown verb`). `{title, tags, categories, subject, comments, company, manager, hyperlinkBase, author, lastModifiedBy, created, modified, custom:[{name, type, value}]}` — the document properties File › Info shows; an absent one is `null`; a custom `type` is `text`/`number`/`bool`/`date`/`other` (a variant type xlsxy does not model, its raw XML as `value`) |
@@ -976,7 +976,8 @@ a known key → a key-specific message (e.g. `"bad numFmt code '<code>'"`,
 `"bad color '<value>' (want \"#RRGGBB\")"`). A rejected patch applies
 nothing. `col.width`'s `width` is a fractional **number** (Excel
 column-width units, e.g. `20.5`), not an integer; a non-positive width
-errors `"col.width: 'width' must be positive"`.
+errors `"col.width: 'width' must be positive"`. In terminal xlsxy, a
+protected target sheet errors `"col.width: the sheet is protected"`.
 
 `col.width`'s undo behavior differs from `cell.format`'s: `cell.format` lands
 on the same true undo-stack group `range.set` uses (one undo step, all

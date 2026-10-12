@@ -17057,10 +17057,13 @@ mod tests {
         app.rebuild_engine();
         app.cur = (0, 0);
         app.anchor = Some((2, 1)); // select A1:B3
-        // An undoable edit first, so a wrongful undo.clear() in the refusal
-        // would be caught.
+        // Undoable edits, then an undo, so a wrongful undo.clear() or
+        // redo.clear() in the refusal would be caught.
         app.toggle_wrap();
+        app.toggle_wrap();
+        app.undo();
         assert!(!app.undo.is_empty());
+        assert!(!app.redo.is_empty());
         app.modified = false;
         let undo_len = app.undo.len();
         let redo_len = app.redo.len();
