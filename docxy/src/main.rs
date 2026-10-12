@@ -4123,10 +4123,12 @@ impl App {
         self.commit_hf_edit(true)
     }
 
-    /// [`App::leave_hf_edit`], reporting a commit that failed: the Err is
-    /// the status bar's text. On Err the edit stays open with its content,
-    /// so it can be fixed and retried or copied out; leaving it with the
-    /// failed content unchanged discards it (#1308).
+    /// Close the header/footer edit, committing it (splice back into the
+    /// part and update the print-layout source) when `commit`; the Err is
+    /// the status bar's text. On Err the edit stays open with its content
+    /// and `failed` set, so it can be fixed and retried or copied out;
+    /// only [`App::leave_hf_edit`] discards an edit unchanged since a
+    /// failed commit (#1308).
     fn commit_hf_edit(&mut self, commit: bool) -> Result<(), String> {
         let Some(hf) = self.hf_edit.take() else {
             return Ok(());
@@ -4182,7 +4184,7 @@ impl App {
                 }
                 Err(why) => {
                     let msg = format!(
-                        "Couldn't write the {what} edit to {}: {why}. Esc again discards it.",
+                        "Couldn't write the {what} edit to {}: {why}. Leave it unchanged (Esc) to discard it.",
                         hf.part
                     );
                     self.status = Some(msg.clone());
@@ -6393,7 +6395,9 @@ impl App {
             self.dirty = true;
             return false;
         }
-        // Header/footer focus-edit: Esc / F6 / F7 returns to the body (committing).
+        // Header/footer focus-edit: Esc / F6 / F7 leaves it via
+        // [`App::leave_hf_edit`]: committing it, staying open on a failed
+        // commit, or discarding one unchanged since a failure.
         if self.hf_edit.is_some()
             && matches!(key.code, KeyCode::Esc | KeyCode::F(6) | KeyCode::F(7))
         {
@@ -11287,7 +11291,10 @@ mod tests {
         assert!(!app.modified);
         assert!(!app.page_view);
         let status = app.status.clone().unwrap_or_default();
-        assert!(status.ends_with("Esc again discards it."), "{status}");
+        assert!(
+            status.ends_with("Leave it unchanged (Esc) to discard it."),
+            "{status}"
+        );
     }
 
     /// #1308: leaving the failed edit with its content unchanged since the
@@ -11350,6 +11357,34 @@ mod tests {
         assert!(
             app.editor.doc.body == header_link_body("https://b.example/"),
             "the editor still holds the link"
+        );
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.hf_edit.is_none());
+        assert_eq!(app.status.as_deref(), Some("Discarded the header edit."));
+    }
+
+    /// #1308: a commit that mints link rel ids and only then fails (the
+    /// part's wrapper is gone) still leaves the open edit's link without
+    /// an id: the write must never hand the editor's own blocks to
+    /// link_part_hyperlinks.
+    #[test]
+    fn failed_header_commit_after_minting_link_ids_keeps_the_edit_unlinked() {
+        let (mut app, part) = app_with_header_part(|_| b"<junk/>".to_vec());
+        app.run_act(ribbon::Act::EditHeader);
+        app.editor.doc.body = header_link_body("https://a.example/");
+        let remembered = app.editor.doc.body.clone();
+        app.on_key(key(KeyCode::F(6)));
+        let hf = app.hf_edit.as_ref().expect("the failed edit stays open");
+        assert!(hf.is_header);
+        assert!(
+            app.editor.doc.body == remembered,
+            "the minted rel id must not reach the open editor"
+        );
+        assert_eq!(app.pkg.part(&part).unwrap(), b"<junk/>", "part untouched");
+        let rels_name = part.replace("word/", "word/_rels/") + ".rels";
+        assert!(
+            app.pkg.part(&rels_name).is_none(),
+            "no rels part may be created by a failed commit"
         );
         app.on_key(key(KeyCode::Esc));
         assert!(app.hf_edit.is_none());
