@@ -113,5 +113,10 @@ test a bar scrolled out of the chart's view has no menu
   key alt+right alt+right alt+right alt+right
   # The refusal reads the frame on screen, as a pointer would: draw it.
   shot window
-  call-error menu-open {"target":{"bar":1}} => bar is outside the Gantt viewport
+  call-error menu-open {"target":{"bar":1}} => task uid 1: task 1 bar is outside the Gantt viewport
   assert menu is nothing
+  # The refusal names the uid it was given, then the region's ID.
+  open copy:../fixtures/gantt-bar-uids.xml
+  key alt+right alt+right alt+right alt+right
+  shot window
+  call-error menu-open {"target":{"bar":3}} => task uid 3: task 1 bar is outside the Gantt viewport

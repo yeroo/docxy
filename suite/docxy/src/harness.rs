@@ -2938,8 +2938,10 @@ fn menu_open(
                 if task.is_null || crate::gantt_bar(&v.ed, task, v.scale).is_none() {
                     return Err(format!("task uid {uid} has no bar"));
                 }
+                // The region names the task by ID; the target is by uid.
                 let at = app
-                    .region_bounds_live(Region::Bar(task.id), window)?
+                    .region_bounds_live(Region::Bar(task.id), window)
+                    .map_err(|e| format!("task uid {uid}: {e}"))?
                     .center();
                 app.open_bar_menu(row, at, window, cx)
             }
