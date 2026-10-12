@@ -525,14 +525,15 @@ fn read_doc(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
 
 /// A Project input, pressed where it is drawn. The cell editor is a
 /// double-click on the cursor's cell, which opens it as it does for a
-/// person; it is refused while a cell edit is open, where a click commits
+/// person, resolved as `click C<n>` resolves it (clipped to the table's
+/// viewport); it is refused while a cell edit is open, where a click commits
 /// it, and while a prompt is open, where `open_cell` opens nothing. The
 /// constraint prompt is a click on its field, refused while it is closed
 /// and while another prompt holds the bar.
 fn press_project(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
     let v = crate::harness::project(app)?;
     let double = project_double(i.id).ok_or_else(|| not_covered(i))?;
-    let probe = match i.id {
+    let b = match i.id {
         "project-cell" => {
             if v.cell.is_some() {
                 return Err(
@@ -545,12 +546,11 @@ fn press_project(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
                     p.kind.name()
                 ));
             }
-            let row =
-                v.ed.project()
-                    .tasks
-                    .get(v.cursor_row())
-                    .map_or_else(|| "entry".to_string(), |t| t.id.to_string());
-            format!("project-cell:{row}:{}", v.col)
+            let (r, c) = (v.display_row() as u32, v.col as u32);
+            app.project_region_bounds(
+                crate::harness::Region::Cells(r, c, r, c),
+                crate::Probes::on_screen,
+            )?
         }
         "task-info" => {
             match &v.prompt {
@@ -568,12 +568,11 @@ fn press_project(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
                     ));
                 }
             }
-            "project-prompt-field".to_string()
+            let bounds = app.probes.borrow().on_screen("project-prompt-field");
+            bounds.ok_or_else(|| format!("{} is not drawn", i.name))?
         }
         _ => return Err(not_covered(i)),
     };
-    let bounds = app.probes.borrow().on_screen(&probe);
-    let b = bounds.ok_or_else(|| format!("{} is not drawn ({probe})", i.name))?;
     Ok(Press {
         at: b.center(),
         double,

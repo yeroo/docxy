@@ -168,6 +168,20 @@ test project project-cell: Escape cancels
   assert selected_row is 1
   assert dirty is false
 
+# The split bar dragged left narrows the table: the Name cell's middle is
+# past its edge, so the press lands on what the table shows of it, as
+# `click C1` does, not on the split bar or the chart.
+test project project-cell: focus by click in a narrowed table
+  open copy:../fixtures/project-clipboard.xml
+  call pointer-drag {"from":"project-split","to":"cell:B1"}
+  click C1
+  assert cell_edit is none
+  call pointer-click {"input":"project-cell"}
+  assert reply.clicks is 2
+  assert cell_edit is A
+  assert cell is Name
+  call real-key {"key":"escape"}
+
 test project project-cell: a click is refused while a cell is open
   open copy:../fixtures/project-clipboard.xml
   click C1
