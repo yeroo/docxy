@@ -5184,8 +5184,14 @@ impl App {
     }
 
     /// Set (or clear) an explicit height in points for every row in the
-    /// selection. "auto"/"0"/empty clears it so the row auto-fits.
+    /// selection. "auto"/"0"/empty clears it so the row auto-fits. A protected
+    /// sheet refuses, as Fill does (#1351).
     fn commit_row_height(&mut self, text: &str) {
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return;
+        }
         let t = text.trim();
         let pts = if t.is_empty() || t.eq_ignore_ascii_case("auto") {
             None
@@ -6044,7 +6050,14 @@ impl App {
             FillColor => self.open_picker(PickKind::FillColor),
             MergeCenter => self.merge_toggle(),
             WrapText => self.toggle_wrap(),
-            RowHeight => self.open_prompt(PromptKind::RowHeight),
+            RowHeight => {
+                if self.protected() {
+                    self.status =
+                        Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+                } else {
+                    self.open_prompt(PromptKind::RowHeight);
+                }
+            }
             CondFormat => self.open_prompt(PromptKind::CondFormat),
             DataValidation => self.open_validation_dialog(),
             CircleInvalid => self.circle_invalid(),
@@ -8347,8 +8360,14 @@ impl App {
 
     /// Merge & Center the selection (or unmerge if its top-left is already a merge
     /// origin). Centres the anchor cell; renders via the merge-aware grid draw.
+    /// A protected sheet refuses, as Fill does (#1351).
     fn merge_toggle(&mut self) {
         use gridcore::sheet::Align;
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return;
+        }
         let (r1, c1, r2, c2) = self.selection(); // raw: merging blank cells is valid
         let s = self.sheet;
         self.structural(move |wb| {
@@ -11301,6 +11320,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::F(2) => app.start_edit(None),
         KeyCode::F(7) | KeyCode::F(8) => {
+            if app.protected() {
+                app.status =
+                    Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+                return false;
+            }
             let col = app.cur.1;
             let w = app.sheet().col_width(col);
             let nw = if key.code == KeyCode::F(7) {
@@ -15789,6 +15813,104 @@ mod tests {
         app.anchor = None;
         app.merge_toggle();
         assert!(app.pkg.workbook.sheets[0].merges.is_empty());
+    }
+
+    /// #1351: Merge & Center refuses a protected sheet: no merge, no anchor
+    /// restyle, no undo step.
+    #[test]
+    fn merge_and_center_is_refused_on_a_protected_sheet() {
+        use gridcore::sheet::Align;
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0].set_cell(0, 0, Cell::text("Title"));
+        app.cur = (0, 0);
+        app.anchor = Some((0, 2)); // A1:C1
+        let style = app.sheet().cell(0, 0).unwrap().style;
+        let undo_len = app.undo.len();
+        app.pkg.workbook.sheets[0].set_protected(true);
+        app.merge_toggle();
+        assert!(app.pkg.workbook.sheets[0].merges.is_empty());
+        let c = app.sheet().cell(0, 0).unwrap();
+        assert_eq!(c.style, style);
+        assert_ne!(app.pkg.workbook.styles.xf(c.style).align, Align::Center);
+        assert_eq!(app.undo.len(), undo_len);
+        assert!(!app.modified);
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+    }
+
+    /// #1351: Merge & Center on a protected sheet does not unmerge either.
+    #[test]
+    fn merge_and_center_does_not_unmerge_a_protected_sheet() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0].merges.push((0, 0, 0, 2));
+        app.cur = (0, 0);
+        app.anchor = None;
+        let undo_len = app.undo.len();
+        app.pkg.workbook.sheets[0].set_protected(true);
+        app.merge_toggle();
+        assert_eq!(app.pkg.workbook.sheets[0].merges, vec![(0, 0, 0, 2)]);
+        assert_eq!(app.undo.len(), undo_len);
+        assert!(!app.modified);
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+    }
+
+    /// #1351: Row Height refuses a protected sheet for "45", "auto" and even
+    /// invalid text; the saved file keeps the prior heights.
+    #[test]
+    fn row_height_is_refused_on_a_protected_sheet() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0].set_row_height(1, Some(20.0));
+        app.cur = (1, 0);
+        app.anchor = Some((2, 0)); // rows 1..=2
+        let undo_len = app.undo.len();
+        app.pkg.workbook.sheets[0].set_protected(true);
+        for t in ["45", "auto", "abc"] {
+            app.commit_row_height(t);
+            assert_eq!(app.pkg.workbook.sheets[0].row_height(1), Some(20.0), "{t}");
+            assert_eq!(app.pkg.workbook.sheets[0].row_height(2), None, "{t}");
+            assert_eq!(app.undo.len(), undo_len, "{t}");
+            assert!(!app.modified, "{t}");
+            assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS), "{t}");
+        }
+        let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        assert_eq!(re.workbook.sheets[0].row_height(1), Some(20.0));
+        assert_eq!(re.workbook.sheets[0].row_height(2), None);
+    }
+
+    /// #1351: the ribbon's Row Height opens no prompt on a protected sheet
+    /// (and still opens one when the sheet is unprotected).
+    #[test]
+    fn ribbon_row_height_opens_no_prompt_on_a_protected_sheet() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0].set_protected(true);
+        app.ribbon_act(ribbon::Act::RowHeight);
+        assert!(app.prompt.is_none());
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.ribbon_act(ribbon::Act::RowHeight);
+        assert!(app.prompt.is_some());
+    }
+
+    /// #1351: F7/F8 refuse a protected sheet: the column width and the
+    /// modified flag stay put.
+    #[test]
+    fn column_width_keys_are_refused_on_a_protected_sheet() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        let w = app.sheet().col_width(0);
+        app.pkg.workbook.sheets[0].set_protected(true);
+        app.cur = (0, 0);
+        for key in [KeyCode::F(7), KeyCode::F(8), KeyCode::F(8)] {
+            press(&mut app, key);
+            assert_eq!(app.sheet().col_width(0), w, "{key:?}");
+            assert!(!app.modified, "{key:?}");
+            assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS), "{key:?}");
+        }
     }
 
     #[test]
