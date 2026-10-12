@@ -73,3 +73,43 @@ sheet-inputs-typing.uit | sheet sheet-font-size: copies | #1344
 sheet-inputs-typing.uit | sheet sheet-font-size: pastes | #1344
 sheet-inputs-typing.uit | sheet sheet-font-size: Enter formats the selection | #1344
 sheet-inputs-typing.uit | sheet sheet-font-size: Escape cancels | #1344
+
+# The document Find bar's fields are append-only (find_key): no caret, so
+# Home, End, Left, Right and Delete do nothing, and Ctrl+A/C/V are ignored
+# (#1201 found it).
+doc-inputs-typing.uit | document doc-find: edits | #1360
+doc-inputs-typing.uit | document doc-replace: edits | #1360
+doc-inputs-typing.uit | document doc-find: select-all replaces | #1360
+doc-inputs-typing.uit | document doc-replace: select-all replaces | #1360
+doc-inputs-typing.uit | document doc-find: copies | #1360
+doc-inputs-typing.uit | document doc-replace: copies | #1360
+doc-inputs-typing.uit | document doc-find: pastes | #1360
+doc-inputs-typing.uit | document doc-replace: pastes | #1360
+
+# Home's Font and Font Size boxes (document) are not text boxes: a click opens
+# the font or size chip picker, nothing takes the focus, and what is typed
+# edits the document; Enter applies nothing (#1201 found it).
+doc-inputs-typing.uit | document doc-font: focus by click | #1361
+doc-inputs-typing.uit | document doc-font: types | #1361
+doc-inputs-typing.uit | document doc-font: edits | #1361
+doc-inputs-typing.uit | document doc-font: select-all replaces | #1361
+doc-inputs-typing.uit | document doc-font: copies | #1361
+doc-inputs-typing.uit | document doc-font: pastes | #1361
+doc-inputs-typing.uit | document doc-font: Enter formats the selection | #1361
+doc-inputs-typing.uit | document doc-font: Escape cancels | #1361
+doc-inputs-typing.uit | document doc-font-size: focus by click | #1361
+doc-inputs-typing.uit | document doc-font-size: types | #1361
+doc-inputs-typing.uit | document doc-font-size: edits | #1361
+doc-inputs-typing.uit | document doc-font-size: select-all replaces | #1361
+doc-inputs-typing.uit | document doc-font-size: copies | #1361
+doc-inputs-typing.uit | document doc-font-size: pastes | #1361
+doc-inputs-typing.uit | document doc-font-size: Enter formats the selection | #1361
+doc-inputs-typing.uit | document doc-font-size: Escape cancels | #1361
+
+# The comment editor is append-only (comment_key): no caret, so Home, End,
+# Left, Right and Delete do nothing, and Ctrl+A/C/V are ignored (#1201 found
+# it).
+doc-inputs-typing.uit | document comment-editor: edits | #1362
+doc-inputs-typing.uit | document comment-editor: select-all replaces | #1362
+doc-inputs-typing.uit | document comment-editor: copies | #1362
+doc-inputs-typing.uit | document comment-editor: pastes | #1362

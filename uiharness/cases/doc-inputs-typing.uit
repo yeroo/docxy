@@ -1,0 +1,838 @@
+# The document's inputs outside the dialogs, typed into with real keys
+# only (#1201, the document slice of #1029): the Find bar's Find and
+# Replace fields, the Home ribbon's Font and Font Size boxes and the comment
+# editor. The suite has no Styles gallery search, so there is none to type
+# into. Written by hand, not generated: the dialog catalogue's
+# `inputs-typing-*.uit` own that prefix.
+#
+# `real-key` and `real-type` go through the window's own input path, and an
+# input is focused by `pointer-click {"input":id}` or by Tab. `open`,
+# `selection-set` and `ribbon-click` (Review > New Comment) are setup only,
+# and the checks after may use handler verbs. A test is one input and one
+# step, named `document <input>: <step>`; each opens its own copy of
+# doc-table.docx (`before`, a table row `cell A` | `cell B`, `after`), so a
+# key that lands in the document does not leak into the next test, and
+# first presses Escape, which closes a Find bar or comment bar an earlier
+# test left open (both are the window's, not the tab's). Expected values
+# follow Word, except that Enter in the Replace field replaces the current
+# match, as this bar says it does (`replace_one`), where Word's Replace
+# dialog's default button is Find Next. The steps that fail today are in
+# expected-failures.txt. See qa/inputs-typing.md.
+
+# ---- The Find bar's Find field: typing finds as it goes; Enter selects
+# the next match.
+
+test document doc-find: focus by click
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  assert find_open is true
+  call pointer-click {"input":"doc-replace"}
+  call pointer-click {"input":"doc-find"}
+  call field-read {"input":"doc-find"}
+  assert reply.focused is true
+  assert reply.value is exactly ""
+  assert reply.caret is 0
+  call field-read {"input":"doc-replace"}
+  assert reply.focused is false
+  call real-key {"key":"escape"}
+
+test document doc-find: types
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"doc-find"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test document doc-find: edits
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"doc-find"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"input":"doc-find"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"doc-find"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"doc-find"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"doc-find"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test document doc-find: select-all replaces
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"doc-find"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"doc-find"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test document doc-find: copies
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  assert find_open is true
+  call clipboard {"action":"write","text":"old"}
+  call pointer-click {"input":"doc-find"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test document doc-find: pastes
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  assert find_open is true
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"doc-find"}
+  assert reply.focused is true
+  assert reply.value is Pasted
+  assert reply.caret is 6
+  call real-key {"key":"escape"}
+
+test document doc-find: focus by Tab
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  assert find_open is true
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"tab"}
+  call field-read {"input":"doc-find"}
+  assert reply.focused is true
+  call field-read {"input":"doc-replace"}
+  assert reply.focused is false
+  call real-key {"key":"escape"}
+
+test document doc-find: Enter selects the next match
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-type {"text":"cell"}
+  assert sel.start is 7
+  assert sel.end is 11
+  call real-key {"key":"enter"}
+  assert find_open is true
+  assert sel.start is 14
+  assert sel.end is 18
+  assert dirty is false
+  call real-key {"key":"escape"}
+
+test document doc-find: Escape closes the bar
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-type {"text":"cell"}
+  call field-read {"input":"doc-find"}
+  assert reply.focused is true
+  assert reply.value is exactly cell
+  call real-key {"key":"escape"}
+  assert find_open is false
+  assert dirty is false
+  call field-read {"input":"doc-find"}
+  assert reply.focused is false
+
+# ---- The Find bar's Replace field: Enter, Replace and All rewrite the
+# document's matches of `cell`.
+
+test document doc-replace: focus by click
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call pointer-click {"input":"doc-replace"}
+  call field-read {"input":"doc-replace"}
+  assert reply.focused is true
+  assert reply.value is exactly ""
+  assert reply.caret is 0
+  call field-read {"input":"doc-find"}
+  assert reply.focused is false
+  call real-key {"key":"escape"}
+
+test document doc-replace: types
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  assert find_open is true
+  call pointer-click {"input":"doc-replace"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"doc-replace"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test document doc-replace: edits
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  assert find_open is true
+  call pointer-click {"input":"doc-replace"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"doc-replace"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"input":"doc-replace"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"doc-replace"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"doc-replace"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"doc-replace"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test document doc-replace: select-all replaces
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  assert find_open is true
+  call pointer-click {"input":"doc-replace"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"doc-replace"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"doc-replace"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test document doc-replace: copies
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  assert find_open is true
+  call clipboard {"action":"write","text":"old"}
+  call pointer-click {"input":"doc-replace"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test document doc-replace: pastes
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  assert find_open is true
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"doc-replace"}
+  assert reply.focused is true
+  assert reply.value is Pasted
+  assert reply.caret is 6
+  call real-key {"key":"escape"}
+
+test document doc-replace: focus by Tab
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"tab"}
+  call field-read {"input":"doc-replace"}
+  assert reply.focused is true
+  call field-read {"input":"doc-find"}
+  assert reply.focused is false
+  call real-key {"key":"escape"}
+
+test document doc-replace: Enter replaces the current match
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-type {"text":"cell"}
+  call pointer-click {"input":"doc-replace"}
+  call real-type {"text":"X"}
+  assert dirty is false
+  call real-key {"key":"enter"}
+  assert dirty is true
+  call selection-set {"start":7,"end":7}
+  assert table.cells is [[["X A"],["cell B"]]]
+  call real-key {"key":"escape"}
+
+test document doc-replace: Replace rewrites one match
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-type {"text":"cell"}
+  call pointer-click {"input":"doc-replace"}
+  call real-type {"text":"X"}
+  assert dirty is false
+  call pointer-click {"at":"doc-replace-button"}
+  assert dirty is true
+  call selection-set {"start":7,"end":7}
+  assert table.cells is [[["X A"],["cell B"]]]
+  call real-key {"key":"escape"}
+
+test document doc-replace: All rewrites every match
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-type {"text":"cell"}
+  call pointer-click {"input":"doc-replace"}
+  call real-type {"text":"X"}
+  assert dirty is false
+  call pointer-click {"at":"doc-replace-all-button"}
+  assert dirty is true
+  call selection-set {"start":7,"end":7}
+  assert table.cells is [[["X A"],["X B"]]]
+  call real-key {"key":"escape"}
+
+test document doc-replace: Escape closes the bar
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  assert find_open is true
+  call pointer-click {"input":"doc-replace"}
+  call real-type {"text":"Ab1"}
+  call field-read {"input":"doc-replace"}
+  assert reply.focused is true
+  assert reply.value is exactly Ab1
+  call real-key {"key":"escape"}
+  assert find_open is false
+  assert dirty is false
+  call field-read {"input":"doc-replace"}
+  assert reply.focused is false
+
+# ---- Home > Font and Font Size: a click selects the box's text, Enter
+# formats the selection (`before`) with what was typed, Escape gives the
+# value back. doc-table.docx's runs set no font or size, so the boxes
+# show Word's defaults, Calibri and 11: hence [0,7] and [0,2].
+
+test document doc-font: focus by click
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font"}
+  call field-read {"input":"doc-font"}
+  assert reply.focused is true
+  assert reply.value is Calibri
+  assert reply.selection is [0,7]
+  call real-key {"key":"escape"}
+
+test document doc-font: types
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"doc-font"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test document doc-font: edits
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"doc-font"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"input":"doc-font"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"doc-font"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"doc-font"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"doc-font"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test document doc-font: select-all replaces
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"doc-font"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"doc-font"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test document doc-font: copies
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call clipboard {"action":"write","text":"old"}
+  call pointer-click {"input":"doc-font"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test document doc-font: pastes
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"input":"doc-font"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"doc-font"}
+  assert reply.focused is true
+  assert reply.value is Pasted
+  assert reply.caret is 6
+  call real-key {"key":"escape"}
+
+test document doc-font: Enter formats the selection
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font"}
+  call real-type {"text":"Arial"}
+  call real-key {"key":"enter"}
+  assert dirty is true
+  call selection-set {"start":0,"end":6}
+  call field-read {"input":"doc-font"}
+  assert reply.value is Arial
+  assert run.font is Arial
+  call real-key {"key":"escape"}
+
+test document doc-font: Escape cancels
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font"}
+  call real-type {"text":"Arial"}
+  call field-read {"input":"doc-font"}
+  assert reply.focused is true
+  assert reply.value is Arial
+  call real-key {"key":"escape"}
+  assert dirty is false
+  call field-read {"input":"doc-font"}
+  assert reply.focused is false
+  assert reply.value is Calibri
+
+test document doc-font-size: focus by click
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font-size"}
+  call field-read {"input":"doc-font-size"}
+  assert reply.focused is true
+  assert reply.value is 11
+  assert reply.selection is [0,2]
+  call real-key {"key":"escape"}
+
+test document doc-font-size: types
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font-size"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"doc-font-size"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test document doc-font-size: edits
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font-size"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"doc-font-size"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"input":"doc-font-size"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"doc-font-size"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"doc-font-size"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"doc-font-size"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test document doc-font-size: select-all replaces
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font-size"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"doc-font-size"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"doc-font-size"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test document doc-font-size: copies
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call clipboard {"action":"write","text":"old"}
+  call pointer-click {"input":"doc-font-size"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test document doc-font-size: pastes
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"input":"doc-font-size"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"doc-font-size"}
+  assert reply.focused is true
+  assert reply.value is Pasted
+  assert reply.caret is 6
+  call real-key {"key":"escape"}
+
+test document doc-font-size: Enter formats the selection
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font-size"}
+  call real-type {"text":"14"}
+  call real-key {"key":"enter"}
+  assert dirty is true
+  call selection-set {"start":0,"end":6}
+  call field-read {"input":"doc-font-size"}
+  assert reply.value is 14
+  assert run.size_half_pts is 28
+  call real-key {"key":"escape"}
+
+test document doc-font-size: Escape cancels
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font-size"}
+  call real-type {"text":"14"}
+  call field-read {"input":"doc-font-size"}
+  assert reply.focused is true
+  assert reply.value is 14
+  call real-key {"key":"escape"}
+  assert dirty is false
+  call field-read {"input":"doc-font-size"}
+  assert reply.focused is false
+  assert reply.value is 11
+
+# ---- The comment editor: Review > New Comment on `before` opens it,
+# focused. Enter adds the comment, Escape drops it. It has no Tab stop.
+
+test document comment-editor: focus by click
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  call pointer-click {"input":"comment-editor"}
+  call field-read {"input":"comment-editor"}
+  assert reply.focused is true
+  assert reply.value is exactly ""
+  assert reply.caret is 0
+  call real-key {"key":"escape"}
+
+test document comment-editor: types
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  call pointer-click {"input":"comment-editor"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"comment-editor"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test document comment-editor: edits
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  call pointer-click {"input":"comment-editor"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"comment-editor"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"input":"comment-editor"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"comment-editor"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"comment-editor"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"comment-editor"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test document comment-editor: select-all replaces
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  call pointer-click {"input":"comment-editor"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"comment-editor"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"comment-editor"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test document comment-editor: copies
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  call clipboard {"action":"write","text":"old"}
+  call pointer-click {"input":"comment-editor"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test document comment-editor: pastes
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"input":"comment-editor"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"comment-editor"}
+  assert reply.focused is true
+  assert reply.value is Pasted
+  assert reply.caret is 6
+  call real-key {"key":"escape"}
+
+test document comment-editor: Enter adds the comment
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  call pointer-click {"input":"comment-editor"}
+  call real-type {"text":"Ab1"}
+  call real-key {"key":"enter"}
+  call field-read {"input":"comment-editor"}
+  assert reply.focused is false
+  assert dirty is true
+  call comments {}
+  assert reply.comments.0.text is exactly Ab1
+
+test document comment-editor: Escape cancels
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  call pointer-click {"input":"comment-editor"}
+  call real-type {"text":"Ab1"}
+  call field-read {"input":"comment-editor"}
+  assert reply.value is exactly Ab1
+  call real-key {"key":"escape"}
+  call field-read {"input":"comment-editor"}
+  assert reply.focused is false
+  assert dirty is false
+  call comments {}
+  assert reply.comments is []
