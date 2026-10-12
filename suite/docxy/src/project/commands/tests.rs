@@ -3807,6 +3807,87 @@ fn the_row_menu_enables_by_the_row_under_the_cursor() {
     assert!(row_menu(&t).iter().all(|(_, _, checked)| !checked));
 }
 
+/// #1207: a Gantt bar's context menu is Project's, in Project's order, and
+/// its task items are the row menu's: same ids' commands, same rules.
+#[test]
+fn the_bar_menu_lists_projects_items_in_order() {
+    use crate::menu::MenuItem;
+    let mut t = tab();
+    let items = |t: &DocTab| {
+        project_bar_menu(v(t))
+            .into_iter()
+            .map(|item| match item {
+                MenuItem::Item(e) => (e.label, e.enabled, e.act),
+                MenuItem::Separator => ("-".into(), false, None),
+                other => panic!("the bar menu draws no {other:?}"),
+            })
+            .collect::<Vec<_>>()
+    };
+    let labels: Vec<_> = items(&t).into_iter().map(|(l, ..)| l).collect();
+    assert_eq!(
+        labels,
+        [
+            "Format Bar Styles...",
+            "Format Bar...",
+            "-",
+            "Information...",
+            "Notes...",
+            "Add to Timeline",
+            "-",
+            "Hyperlink...",
+        ]
+    );
+    // On a real task, the items with a command run the row menu's.
+    let enabled: Vec<_> = items(&t)
+        .into_iter()
+        .filter(|(_, enabled, _)| *enabled)
+        .map(|(label, _, act)| (label, act))
+        .collect();
+    assert_eq!(
+        enabled,
+        [
+            (
+                "Information...".to_string(),
+                Some(Act::Project(ProjectAct::Constraint))
+            ),
+            (
+                "Notes...".to_string(),
+                Some(Act::Project(ProjectAct::Notes))
+            ),
+            (
+                "Hyperlink...".to_string(),
+                Some(Act::Project(ProjectAct::Hyperlink))
+            ),
+        ]
+    );
+    for label in ["Information...", "Notes...", "Hyperlink..."] {
+        assert!(
+            enabled_items(&t).contains(&label.to_string()),
+            "the row menu runs {label} too"
+        );
+    }
+    // An item with no command is never enabled, and every icon loads.
+    for item in project_bar_menu(v(&t)) {
+        if let MenuItem::Item(e) = item {
+            assert!(e.act.is_some() || !e.enabled, "{}", e.label);
+            assert!(
+                e.icon.is_empty()
+                    || Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("assets/icons")
+                        .join(format!("{}.svg", e.icon))
+                        .exists(),
+                "{}",
+                e.icon
+            );
+        }
+    }
+    // Off a real task (a blank row has no bar to press, but the items
+    // follow the selection all the same) nothing runs.
+    let i = vm(&mut t).ed.insert_blank_row(Some(1)).unwrap();
+    vm(&mut t).ed.select(i);
+    assert!(items(&t).iter().all(|(_, enabled, _)| !enabled));
+}
+
 /// #418: the row menu's Hyperlink... opens the prompt on a task row only,
 /// like Information....
 #[test]

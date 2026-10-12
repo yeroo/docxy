@@ -406,12 +406,16 @@ pub(crate) fn gantt_header(
         )
 }
 
+/// One row's Gantt strip. `on_right` is the bar's own right-press (#1207):
+/// it is attached to the drawn bar (or milestone diamond) only, so a press
+/// on the chart beside it is not the bar's.
 pub(crate) fn gantt_strip(
     bar: Option<GanttBar>,
     id: i32,
     scale: GanttScale,
     pal: Pal,
     probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
+    on_right: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let strip = div().relative().w(px(scale.width())).h(px(ROW_H));
     let Some(bar) = bar else {
@@ -459,7 +463,6 @@ pub(crate) fn gantt_strip(
                 .size(px(14.))
                 .child(milestone_diamond(color, true))
                 .child(marker)
-                .into_any_element()
         } else {
             span(
                 bar.start,
@@ -474,9 +477,8 @@ pub(crate) fn gantt_strip(
                 true,
             )
             .child(marker)
-            .into_any_element()
         };
-        return strip.child(outline);
+        return strip.child(outline.on_mouse_down(MouseButton::Right, on_right));
     }
     // A manual summary's rollup: a thin bar above its own. Its warning marks
     // the part past its finish, else its own finish day (an overrun within
@@ -507,8 +509,7 @@ pub(crate) fn gantt_strip(
             hsla_u(bar_kind_color(bar.kind)),
             false,
         )
-        .child(marker)
-        .into_any_element(),
+        .child(marker),
         BarKind::Summary => div()
             .absolute()
             .left(px(bar.start as f32 * DAY_W))
@@ -539,18 +540,16 @@ pub(crate) fn gantt_strip(
                     .h_full()
                     .bg(hsla_u(bar_kind_color(bar.kind))),
             )
-            .child(marker)
-            .into_any_element(),
+            .child(marker),
         BarKind::Milestone => div()
             .absolute()
             .left(px(bar.start as f32 * DAY_W + 4.))
             .top(px(5.))
             .size(px(14.))
             .child(milestone_diamond(bar_kind_color(bar.kind), false))
-            .child(marker)
-            .into_any_element(),
+            .child(marker),
     };
-    strip.child(element)
+    strip.child(element.on_mouse_down(MouseButton::Right, on_right))
 }
 
 fn milestone_diamond(color: u32, hollow: bool) -> impl IntoElement {

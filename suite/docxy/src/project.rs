@@ -1374,8 +1374,8 @@ pub(super) fn project_el(
                                                     })
                                                     .when(i == cursor_row, |d| d.bg(pal.sel))
                                                     // The row's menu opens on its table,
-                                                    // past the cells too; the chart has
-                                                    // its own (bar) menu, not yet drawn.
+                                                    // past the cells too; the chart's bars
+                                                    // open their own (#1207).
                                                     .child(
                                                         div()
                                                             .flex_none()
@@ -1429,6 +1429,25 @@ pub(super) fn project_el(
                                                             scale,
                                                             pal,
                                                             &row_probes,
+                                                            // A right-press on the bar
+                                                            // selects its row and opens
+                                                            // the bar's menu.
+                                                            cx.listener(
+                                                                move |this,
+                                                                      ev: &MouseDownEvent,
+                                                                      window,
+                                                                      cx| {
+                                                                    cx.stop_propagation();
+                                                                    if this.active == index {
+                                                                        let _ = this.open_bar_menu(
+                                                                            i,
+                                                                            ev.position,
+                                                                            window,
+                                                                            cx,
+                                                                        );
+                                                                    }
+                                                                },
+                                                            ),
                                                         ),
                                                     ))
                                                     .on_click(cx.listener(

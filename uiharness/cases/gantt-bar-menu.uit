@@ -1,0 +1,122 @@
+# #1207: a task's Gantt bar has its own context menu. `menu-open {"bar": uid}`
+# calls the opener the bar's right-press calls; `pointer-click` with
+# `"button":"right"` presses the bar itself.
+
+# `gantt-bar-uids.xml` crosses each task's uid and ID (Alpha is uid 3, ID 1;
+# Beta, a milestone, uid 1, ID 2; Gamma uid 2, ID 3), so a target or region
+# read the other way round selects the wrong task.
+
+test a bar's menu is Project's and opens for that task by uid
+  open copy:../fixtures/gantt-bar-uids.xml
+  assert selected_name is Alpha
+  # The bar is pressed where the frame on screen drew it: draw one first.
+  shot window
+  call menu-open {"target":{"bar":2}}
+  assert reply.open is true
+  assert reply.target.bar is 2
+  assert selected_name is Gamma
+  assert menu.target.bar is 2
+  assert reply.items.0.label is Format Bar Styles...
+  assert reply.items.0.enabled is false
+  assert reply.items.1.label is Format Bar...
+  assert reply.items.1.enabled is false
+  assert reply.items.2.separator is true
+  assert reply.items.3.label is Information...
+  assert reply.items.3.enabled is true
+  assert reply.items.4.label is Notes...
+  assert reply.items.4.enabled is true
+  assert reply.items.5.label is Add to Timeline
+  assert reply.items.5.enabled is false
+  assert reply.items.6.separator is true
+  assert reply.items.7.label is Hyperlink...
+  assert reply.items.7.enabled is true
+  shot window
+  call-error menu-click {"label":"Format Bar..."} => menu item 'Format Bar...' is disabled
+  call-error menu-click {"label":"Delete Task"} => no menu item 'Delete Task'
+  call menu-click {"label":"Notes..."}
+  assert menu is nothing
+  assert prompt is notes:
+  assert selected_name is Gamma
+  key escape
+  assert prompt is none
+  call menu-open {"target":{"bar":1}}
+  assert selected_name is Beta
+  call menu-click {"label":"Information..."}
+  assert prompt is constraint:
+  assert selected_name is Beta
+  key escape
+  call menu-open {"target":{"bar":3}}
+  assert selected_name is Alpha
+  key escape
+  assert menu is nothing
+  assert selected_name is Alpha
+  assert tasks is 3
+
+test a right-click on a bar opens its menu, and on the table the row's
+  open copy:../fixtures/gantt-bar-uids.xml
+  shot window
+  # Gamma (uid 2) is drawn as bar:3.
+  call pointer-click {"region":"bar:3","button":"right"}
+  assert menu.target.bar is 2
+  assert selected_name is Gamma
+  call menu-read {}
+  assert reply.items.0.label is Format Bar Styles...
+  key escape
+  assert menu is nothing
+  # Beta's milestone diamond (uid 1, bar:2).
+  call pointer-click {"region":"bar:2","button":"right"}
+  assert menu.target.bar is 1
+  assert selected_name is Beta
+  key escape
+  # An inactive task's outlined bar (Alpha, uid 3, bar:1).
+  call menu-open {"target":{"row":3}}
+  call menu-click {"label":"Inactivate Task"}
+  call pointer-click {"region":"bar:1","button":"right"}
+  assert menu.target.bar is 3
+  assert selected_name is Alpha
+  key escape
+  # The table's cells keep the row's menu: row 2 is Beta, uid 1.
+  call pointer-click {"region":"cell:C2","button":"right"}
+  assert menu.target.row is 1
+  assert selected_name is Beta
+  key escape
+  # A left click on a bar opens nothing.
+  call pointer-click {"region":"bar:3"}
+  assert menu is nothing
+  call-error pointer-click {"at":"fill-handle","button":"right"} => a right-click names a 'region'
+  call-error pointer-click {"region":"bar:3","button":"middle"} => 'button' must be "left" or "right"
+
+test a bar menu is refused, by name, where there is no bar to right-click
+  open copy:../fixtures/gantt-summary.xml
+  call menu-open {"target":{"row":2}}
+  call menu-click {"label":"Insert Task"}
+  call rows {}
+  assert reply.rows.1.kind is blank
+  click C4
+  assert selected_name is Task 3
+  call-error menu-open {"target":{"bar":99}} => no task with uid 99
+  call-error menu-open {"target":{"bar":"x"}} => 'bar' must be a task uid
+  # The blank row has no bar; the refusal moves nothing.
+  call-error menu-open {"target":{"bar":4}} => task uid 4 has no bar
+  assert selected_name is Task 3
+  assert menu is nothing
+  # A task under a collapsed summary has no bar drawn.
+  click A1
+  key alt+shift+-
+  call-error menu-open {"target":{"bar":2}} => hidden under a collapsed summary
+  call-error menu-open {"target":{"column":"Duration"}} => menu target 'column' is not supported yet
+  open copy:../fixtures/basic.docx
+  call-error menu-open {"target":{"bar":2}} => a bar menu needs a Project tab
+
+test a bar scrolled out of the chart's view has no menu
+  open ../fixtures/gantt-scroll.xml
+  key alt+right alt+right alt+right alt+right
+  # The refusal reads the frame on screen, as a pointer would: draw it.
+  shot window
+  call-error menu-open {"target":{"bar":1}} => task uid 1: task 1 bar is outside the Gantt viewport
+  assert menu is nothing
+  # The refusal names the uid it was given, then the region's ID.
+  open copy:../fixtures/gantt-bar-uids.xml
+  key alt+right alt+right alt+right alt+right
+  shot window
+  call-error menu-open {"target":{"bar":3}} => task uid 3: task 1 bar is outside the Gantt viewport

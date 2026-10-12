@@ -29502,6 +29502,62 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        let v = self.press_project_row(row, col, window, cx)?;
+        let target = menu::MenuTarget::Row(v.selected_uid());
+        let items = project_row_menu(v);
+        self.open_menu(target, at, items, cx);
+        Ok(())
+    }
+
+    /// A right-click on a task's Gantt bar (task `row` in task order), and
+    /// `menu-open {"bar"}` (#1207). As on the table, the press selects the
+    /// row, committing an open cell edit, then the bar's menu opens for it.
+    /// A row with no bar is refused before anything is selected; a commit
+    /// the plan refuses keeps the edit and its status, and no menu opens.
+    pub(crate) fn open_bar_menu(
+        &mut self,
+        row: usize,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let bar_uid = |v: &ProjectView| {
+            let task = v.ed.project().tasks.get(row)?;
+            (!task.is_null && gantt_bar(&v.ed, task, v.scale).is_some()).then_some(task.uid)
+        };
+        let Some(Surface::Project(v)) = self.tabs.get(self.active).map(|t| &t.surface) else {
+            return Err("the active tab is not a Project".into());
+        };
+        let Some(uid) = bar_uid(v) else {
+            return Err(match v.ed.project().tasks.get(row) {
+                Some(t) => format!("task uid {} has no bar", t.uid),
+                None => "no task at that row has a bar".into(),
+            });
+        };
+        let v = self.press_project_row(row, None, window, cx)?;
+        // The commit may have changed the plan: the menu is for the task
+        // whose bar was pressed, and only while it still has one.
+        if v.selected_uid() != Some(uid) || bar_uid(v) != Some(uid) {
+            return Err(format!(
+                "task uid {uid} has no bar after the edit committed"
+            ));
+        }
+        let items = project_bar_menu(v);
+        self.open_menu(menu::MenuTarget::Bar(uid), at, items, cx);
+        Ok(())
+    }
+
+    /// The press a row or bar menu opens with: select row `row` of the
+    /// active Project as a left click does (on column `col`, if any),
+    /// committing an open cell edit, and refocus. A commit the plan refuses
+    /// keeps the edit and its status, and is the error.
+    fn press_project_row(
+        &mut self,
+        row: usize,
+        col: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<&ProjectView, String> {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return Err("no tab is open".into());
         };
@@ -29512,19 +29568,19 @@ impl Docxy {
         // not swallow this click and leave the cursor on an older row.
         v.drag_made_range = false;
         crate::project_row_click(tab, row, col, false);
-        let Surface::Project(v) = &tab.surface else {
-            return Err("the active tab is not a Project".into());
+        let committed = match &tab.surface {
+            Surface::Project(v) if v.cell.is_some() => {
+                Err(format!("the open cell edit did not commit: {}", tab.status))
+            }
+            Surface::Project(_) => Ok(()),
+            _ => Err("the active tab is not a Project".into()),
         };
-        if v.cell.is_some() {
-            let status = tab.status.to_string();
-            self.refocus(window, cx);
-            return Err(format!("the open cell edit did not commit: {status}"));
-        }
-        let target = menu::MenuTarget::Row(v.selected_uid());
-        let items = project_row_menu(v);
         self.refocus(window, cx);
-        self.open_menu(target, at, items, cx);
-        Ok(())
+        committed?;
+        match self.tabs.get(self.active).map(|t| &t.surface) {
+            Some(Surface::Project(v)) => Ok(v),
+            _ => Err("the active tab is not a Project".into()),
+        }
     }
 
     /// A split button's arrow half, and `menu-open {"ribbon"}`: its drop-down,

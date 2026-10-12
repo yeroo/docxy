@@ -1147,8 +1147,12 @@ fn mouse_down(p: Point<Pixels>) -> PlatformInput {
 
 /// The `n`th press of a multi-click at `p`, as the platform counts it.
 fn mouse_down_n(p: Point<Pixels>, n: usize) -> PlatformInput {
+    button_down(p, n, MouseButton::Left)
+}
+
+fn button_down(p: Point<Pixels>, n: usize, button: MouseButton) -> PlatformInput {
     PlatformInput::MouseDown(MouseDownEvent {
-        button: MouseButton::Left,
+        button,
         position: p,
         modifiers: Modifiers::default(),
         click_count: n,
@@ -1161,8 +1165,12 @@ fn mouse_up(p: Point<Pixels>) -> PlatformInput {
 }
 
 fn mouse_up_n(p: Point<Pixels>, n: usize) -> PlatformInput {
+    button_up(p, n, MouseButton::Left)
+}
+
+fn button_up(p: Point<Pixels>, n: usize, button: MouseButton) -> PlatformInput {
     PlatformInput::MouseUp(MouseUpEvent {
-        button: MouseButton::Left,
+        button,
         position: p,
         modifiers: Modifiers::default(),
         click_count: n,
@@ -1171,7 +1179,16 @@ fn mouse_up_n(p: Point<Pixels>, n: usize) -> PlatformInput {
 
 /// The hover-press-release a `pointer-click` dispatches at `p`.
 fn click_events(p: Point<Pixels>) -> Vec<PlatformInput> {
-    vec![mouse_move(p, None), mouse_down(p), mouse_up(p)]
+    click_events_with(p, MouseButton::Left)
+}
+
+/// The same with `button` pressed: a right-click opens a context menu.
+fn click_events_with(p: Point<Pixels>, button: MouseButton) -> Vec<PlatformInput> {
+    vec![
+        mouse_move(p, None),
+        button_down(p, 1, button),
+        button_up(p, 1, button),
+    ]
 }
 
 /// A double-click at `p`: the second press and release count 2, which is
@@ -1385,6 +1402,21 @@ fn one_pointer_target(args: &Json) -> Result<(), String> {
             "pointer-click takes one target, not {}",
             named.join(" and ")
         )),
+    }
+}
+
+/// `pointer-click`'s optional `"button"` (#1207): `"left"` (the default) or
+/// `"right"`. A right-click names a `region`, where a context menu opens;
+/// the dialog, input and `at` targets are left-click only.
+fn pointer_button(args: &Json) -> Result<MouseButton, String> {
+    let Some(b) = args.get("button") else {
+        return Ok(MouseButton::Left);
+    };
+    match b.as_str() {
+        Some("left") => Ok(MouseButton::Left),
+        Some("right") if args.get("region").is_some() => Ok(MouseButton::Right),
+        Some("right") => Err("a right-click names a 'region'".into()),
+        _ => Err(r#"'button' must be "left" or "right""#.into()),
     }
 }
 
@@ -2883,6 +2915,36 @@ fn menu_open(
                 let at = menu_point(app, window, Some(&probe), |b| b.center());
                 app.open_row_menu(row, None, at, window, cx)
             }
+            // A right-click on a task's Gantt bar (#1207), by the task's
+            // uid. It presses where the pointer would, so a bar out of the
+            // chart's view is refused as one no pointer can press.
+            "bar" => {
+                let uid = fields[0].1.as_i64().ok_or("'bar' must be a task uid")?;
+                let Some(crate::Surface::Project(v)) = app.tabs.get(app.active).map(|t| &t.surface)
+                else {
+                    return Err("a bar menu needs a Project tab".into());
+                };
+                let tasks = &v.ed.project().tasks;
+                let row = tasks
+                    .iter()
+                    .position(|t| i64::from(t.uid) == uid)
+                    .ok_or_else(|| format!("no task with uid {uid}"))?;
+                if !v.ed.visible_rows().contains(&row) {
+                    return Err(format!(
+                        "task {uid} is hidden under a collapsed summary; there is no bar to right-click"
+                    ));
+                }
+                let task = &tasks[row];
+                if task.is_null || crate::gantt_bar(&v.ed, task, v.scale).is_none() {
+                    return Err(format!("task uid {uid} has no bar"));
+                }
+                // The region names the task by ID; the target is by uid.
+                let at = app
+                    .region_bounds_live(Region::Bar(task.id), window)
+                    .map_err(|e| format!("task uid {uid}: {e}"))?
+                    .center();
+                app.open_bar_menu(row, at, window, cx)
+            }
             "ribbon" => {
                 let path: Vec<&str> = fields[0]
                     .1
@@ -2932,7 +2994,7 @@ fn menu_open(
                 }
             }
             other => Err(format!(
-                "menu target '{other}' is not supported yet (document, cell, pick-list, flash-fill, ribbon-bar, row, ribbon, grid and qat are)"
+                "menu target '{other}' is not supported yet (document, cell, pick-list, flash-fill, ribbon-bar, row, bar, ribbon, grid and qat are)"
             )),
         },
         _ => Err(r#"'target' must be "document" or one key such as {"row": uid}"#.into()),
@@ -4770,6 +4832,7 @@ fn dispatch_verb(
         // fill-handle case: which more-tabs item the point landed on.
         "pointer-click" => {
             one_pointer_target(args)?;
+            let button = pointer_button(args)?;
             // A field of the open dialog: where a person clicks it, a number
             // of pixels `x` in from its left edge (its middle without one).
             // A tab, a button or a whole control row of the open dialog
@@ -4897,7 +4960,7 @@ fn dispatch_verb(
                     Json::Num(item_at_point(&app.probes.borrow(), p) as f64),
                 ),
             ]))?;
-            done.input = click_events(p);
+            done.input = click_events_with(p, button);
             Ok(done)
         }
         // Select the cell whose fill-handle point lies inside a probe's drawn
@@ -8484,6 +8547,61 @@ mod tests {
             Err("pointer-click takes one target, not dialog-field and dialog-tab".into())
         );
         assert!(one_pointer_target(&j(r#"{"region":"grid","input":"formula-bar"}"#)).is_err());
+    }
+
+    /// #1207: `pointer-click` presses the left button unless told the right
+    /// one, and only a region takes a right-click.
+    #[test]
+    fn pointer_click_button_is_left_unless_right_on_a_region() {
+        let j = |s: &str| Json::parse(s).unwrap();
+        assert_eq!(
+            pointer_button(&j(r#"{"region":"bar:2"}"#)),
+            Ok(MouseButton::Left)
+        );
+        assert_eq!(
+            pointer_button(&j(r#"{"region":"bar:2","button":"left"}"#)),
+            Ok(MouseButton::Left)
+        );
+        assert_eq!(
+            pointer_button(&j(r#"{"region":"bar:2","button":"right"}"#)),
+            Ok(MouseButton::Right)
+        );
+        for bad in [
+            r#"{"region":"bar:2","button":"middle"}"#,
+            r#"{"region":"bar:2","button":2}"#,
+        ] {
+            assert_eq!(
+                pointer_button(&j(bad)),
+                Err(r#"'button' must be "left" or "right""#.into()),
+                "{bad}"
+            );
+        }
+        for not_region in [
+            r#"{"at":"fill-handle","button":"right"}"#,
+            r#"{"dialog-tab":"Margins","button":"right"}"#,
+            r#"{"input":"formula-bar","button":"right"}"#,
+        ] {
+            assert_eq!(
+                pointer_button(&j(not_region)),
+                Err("a right-click names a 'region'".into()),
+                "{not_region}"
+            );
+        }
+        let events = click_events_with(point(px(3.), px(4.)), MouseButton::Right);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                PlatformInput::MouseMove(_),
+                PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Right,
+                    ..
+                }),
+                PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Right,
+                    ..
+                }),
+            ]
+        ));
     }
 
     /// `pointer-click`'s `x` is optional, and a present one must be a number.
