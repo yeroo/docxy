@@ -1491,6 +1491,12 @@ struct App {
     comment_active: bool,
     /// While entering a new comment's text (the draft body).
     comment_input: Option<String>,
+    /// Key presses, clicks and frames handled so far, for `field-read`
+    /// (#1204).
+    counts: ctlcore::field::InputCounts,
+    /// Where each prompt field's text starts, as this frame drew it: the
+    /// `field-read` input id and the cell (#1204).
+    drawn_fields: Vec<(&'static str, (u16, u16))>,
     /// First comment row shown in the panel (scroll offset).
     comments_scroll: usize,
     /// The comments panel rect (set by draw() for wheel hit-testing).
@@ -1702,6 +1708,8 @@ impl App {
             comment_sel: 0,
             comment_active: false,
             comment_input: None,
+            counts: Default::default(),
+            drawn_fields: Vec::new(),
             comments_scroll: 0,
             comments_rect: Rect::default(),
             notes,
@@ -6690,7 +6698,67 @@ impl App {
         false
     }
 
+    /// Draw a frame, counting it and recording where the prompts were drawn
+    /// (`field-read`, #1204).
     fn draw(&mut self, f: &mut Frame) {
+        self.counts.frames += 1;
+        self.drawn_fields.clear();
+        self.draw_screen(f);
+    }
+
+    /// Where `id`'s text starts, as the last frame drew it.
+    fn drawn_at(&self, id: &str) -> Option<(u16, u16)> {
+        self.drawn_fields
+            .iter()
+            .find(|(i, _)| *i == id)
+            .map(|(_, at)| *at)
+    }
+
+    /// A prompt field, as `field-read {"input":id}` reports it (#1204).
+    /// docxy's prompts only append and pop, so the caret is their end; the
+    /// Backstage Save As name is backstagecore's, with a real caret.
+    fn input_field(&self, id: &str) -> ctlcore::field::Field {
+        use ctlcore::field::Field;
+        let field = match id {
+            "docxy-find" => self.find.as_ref().map(|f| {
+                Field::append_only(
+                    &f.query,
+                    !(f.replacement.is_some() && f.editing_replacement),
+                )
+            }),
+            "docxy-replace" => self.find.as_ref().and_then(|f| {
+                f.replacement
+                    .as_ref()
+                    .map(|r| Field::append_only(r, f.editing_replacement))
+            }),
+            "docxy-comment" => self
+                .comment_input
+                .as_ref()
+                .map(|c| Field::append_only(c, true)),
+            "docxy-compare-original" | "docxy-compare-revised" => {
+                self.compare_dialog.as_ref().map(|d| {
+                    let i = usize::from(id == "docxy-compare-revised");
+                    let value = if i == 0 { &d.original } else { &d.revised };
+                    Field::append_only(value, d.field == i)
+                })
+            }
+            "docxy-vim-command" => self
+                .vim
+                .as_ref()
+                .and_then(|v| v.cmdline.as_ref())
+                .map(|c| Field::append_only(c, true)),
+            "docxy-save-as" => {
+                return self
+                    .backstage
+                    .as_ref()
+                    .map_or_else(Field::closed, |b| b.save_as_name_field());
+            }
+            _ => None,
+        };
+        field.map_or_else(Field::closed, |f| f.at(self.drawn_at(id)))
+    }
+
+    fn draw_screen(&mut self, f: &mut Frame) {
         // The welcome screen overlays everything when launched with no file.
         if self.start_screen {
             f.render_widget(Clear, f.area());
@@ -7124,6 +7192,27 @@ impl App {
                 ),
             }
         };
+        // Where each prompt's text starts on the status line, for a click on
+        // it (`field-read`'s `at`).
+        let col = |prefix: &str| status.x + RLine::from(prefix).width() as u16;
+        let mut at = |id: &'static str, prefix: &str| {
+            self.drawn_fields.push((id, (col(prefix), status.y)));
+        };
+        if self.comment_input.is_some() {
+            at("docxy-comment", " New comment: ");
+        } else if self.pending_link.is_some() {
+        } else if let Some(f) = &self.find {
+            match &f.replacement {
+                None => at("docxy-find", " Find: "),
+                Some(_) => {
+                    at("docxy-find", " Replace: ");
+                    let qc = if f.editing_replacement { "" } else { "▏" };
+                    at("docxy-replace", &format!(" Replace: {}{qc} → ", f.query));
+                }
+            }
+        } else if self.vim.as_ref().is_some_and(|v| v.cmdline.is_some()) {
+            at("docxy-vim-command", ":");
+        }
         let status_widget =
             Paragraph::new(status_text).style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_widget(status_widget, status);
@@ -7482,6 +7571,9 @@ impl App {
             let style = if on { on_style } else { Style::default() };
             f.render_widget(Paragraph::new(text).style(style), r);
             self.cd_rows.push(r);
+            // The path starts past the leading space and the 10-wide label.
+            let id = ["docxy-compare-original", "docxy-compare-revised"][i];
+            self.drawn_fields.push((id, (r.x + 11, r.y)));
         }
         f.render_widget(
             Paragraph::new("Tab field · type a .docx path · Enter compare")
@@ -8428,8 +8520,14 @@ fn splice_hf(original: &str, blocks: &[Block], tag: &str) -> Option<String> {
 /// Dispatch one terminal event. Returns true if the app should quit.
 fn handle_event(app: &mut App, ev: Event) -> bool {
     match ev {
-        Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(k),
+        Event::Key(k) if k.kind == KeyEventKind::Press => {
+            app.counts.keys += 1;
+            app.on_key(k)
+        }
         Event::Mouse(m) => {
+            if matches!(m.kind, MouseEventKind::Down(_)) {
+                app.counts.clicks += 1;
+            }
             app.on_mouse(m);
             app.quit_requested // a clicked File ▸ Exit quits
         }
