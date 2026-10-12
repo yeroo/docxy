@@ -239,6 +239,42 @@ pub(crate) fn paste_project_rows(tab: &mut DocTab, clip: &ProjectRowsClip) {
     }
 }
 
+/// The columns a range Cut or Delete clears: Name, Predecessors and
+/// Resource Names, those of them the range covers.
+pub(crate) fn range_clear_cols(sel: &Selection) -> Vec<usize> {
+    sel.cols
+        .clone()
+        .filter(|c| matches!(*c, COL_NAME | COL_PREDECESSORS | COL_RESOURCES))
+        .collect()
+}
+
+/// Clear `cols` for every non-blank task of `sel` as one undo step; a field
+/// that cannot clear cancels the whole batch, naming the cell. Returns the
+/// last status a cleared cell gave.
+pub(crate) fn clear_range_cells(
+    ed: &mut ProjectEditor,
+    sel: &Selection,
+    cols: &[usize],
+) -> Result<Option<String>, String> {
+    ed.batch(|ed| {
+        let mut status = None;
+        for &uid in &sel.uids {
+            let Some(task) = ed.project().task(uid) else {
+                continue;
+            };
+            if task.is_null {
+                continue;
+            }
+            for col in cols {
+                let applied = apply_cell(ed, uid, *col, "")
+                    .map_err(|e| cell_error(ed, Some(uid), *col, e))?;
+                status = applied.or(status);
+            }
+        }
+        Ok(status)
+    })
+}
+
 /// Clear the copied cells after the host copied them. A range: whichever of
 /// Name, Predecessors and Resource Names the range covers clear for every
 /// task in it, as one undo step (other columns keep their value, Cut never
@@ -253,32 +289,11 @@ pub(crate) fn project_cut(tab: &mut DocTab) {
         return;
     };
     if let Some(sel) = v.selection() {
-        let cut_cols: Vec<usize> = sel
-            .cols
-            .clone()
-            .filter(|c| matches!(*c, COL_NAME | COL_PREDECESSORS | COL_RESOURCES))
-            .collect();
+        let cut_cols = range_clear_cols(&sel);
         if cut_cols.is_empty() {
             tab.status = "Selection copied; its columns can't be cut".into();
         } else {
-            let result = v.ed.batch(|ed| {
-                let mut status = None;
-                for &uid in &sel.uids {
-                    let Some(task) = ed.project().task(uid) else {
-                        continue;
-                    };
-                    if task.is_null {
-                        continue;
-                    }
-                    for col in &cut_cols {
-                        let applied = apply_cell(ed, uid, *col, "")
-                            .map_err(|e| cell_error(ed, Some(uid), *col, e))?;
-                        status = applied.or(status);
-                    }
-                }
-                Ok(status)
-            });
-            match result {
+            match clear_range_cells(&mut v.ed, &sel, &cut_cols) {
                 Ok(Some(status)) => tab.status = status.into(),
                 Ok(None) => {}
                 Err(status) => tab.status = status.into(),

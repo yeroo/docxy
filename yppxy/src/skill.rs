@@ -58,11 +58,32 @@ use its tools:
 - `yppxy_unlink` `{uid, pred}`
 - `yppxy_find` `{query}` — tasks by name substring
 - `yppxy_save` `{path?}`
+- `yppxy_assign_list` `{uid?, resource?, fields?}` — resource assignments:
+  every one, or those of task `uid` and/or `resource` (a resource uid, or a
+  name ignoring ASCII case). Each has its own `uid`, `task`, `resource`,
+  `resource_name`, `units` (a fraction, 1.0 = 100%), `work_hours`, `cost`,
+  `rate_table`, actual, remaining and baseline values, `start`/`finish`
+- `yppxy_assign_get` `{uid, fields?}` — one assignment by its own uid
+- `yppxy_assign_fields` — every assignment field name their `fields` can read.
+  A field's `value` gives work and delay in minutes, unlike `work_hours`,
+  `delay_hours` and the `work`/`delay` arguments, which are hours
+- `yppxy_assign_add` `{task, resource, units?, work?, fields?}` — assign a
+  resource (uid, or name: a new name becomes a work resource; one that is a
+  number or contains a comma is refused) to task `task`
+- `yppxy_assign_set` `{uid, units?, work?, overtime_work?, contour?,
+  rate_table?, delay?, actual_work? | percent_work_complete?, fields?}` —
+  units as `0.5` or `"50%"`, work, overtime, actual work and delay as hours or
+  `"40h"`/`"5d"`, the contour by name (`"Back Loaded"`) or code 0..7, the rate
+  table `"A"`..`"E"`, the percent 0..100 or `"50%"`; the task reschedules by
+  its type. Overtime is priced, not scheduled; actual work derives remaining
+  work, cost and % work complete but not the task's own progress
+- `yppxy_assign_del` `{uid}` — the reply is `{deleted, task}`
 
-Tasks are addressed by **uid** (stable). When several yppxy editors are open,
-pass `target` (a substring of the pane id; `yppxy_list` shows them). Typical
-flow: `yppxy_tasks` to see the plan, then `yppxy_set`/`yppxy_add`/`yppxy_link`,
-then `yppxy_save`.
+Assignments are addressed by their own uid, from `yppxy_assign_list` (whose
+`uid` filter is a task's). Tasks are addressed by **uid** (stable). When
+several yppxy editors are open, pass `target` (a substring of the pane id;
+`yppxy_list` shows them). Typical flow: `yppxy_tasks` to see the plan, then
+`yppxy_set`/`yppxy_add`/`yppxy_link`, then `yppxy_save`.
 
 ## Fallback: the control pipe
 Without MCP, talk to yppxy directly over loopback TCP + newline-delimited JSON.
@@ -85,9 +106,11 @@ Assignments are addressed by their own UID, as `assign.list {uid?, resource?}`
 reports it. `assign.add {task, resource, units?, work?}` takes a resource uid or
 name (a new name becomes a work resource; one that is a number or contains a
 comma is refused, so pass a uid as a number); `assign.set {uid, units?, work?,
-rate_table?, delay?}` takes units as `0.5` or `"50%"`, work and delay as hours or
-`"40h"`/`"5d"`, the rate table as `"A"`..`"E"`, and reschedules the task by its
-type. Each assignment reports `units`, `work_hours`, `cost`, `rate_table`,
+overtime_work?, contour?, rate_table?, delay?, actual_work? |
+percent_work_complete?}` takes units as `0.5` or `"50%"`, work, overtime,
+actual work and delay as hours or `"40h"`/`"5d"`, the contour as a name or code
+0..7, the rate table as `"A"`..`"E"`, the percent as 0..100 or `"50%"`, and
+reschedules the task by its type. Each assignment reports `units`, `work_hours`, `cost`, `rate_table`,
 overtime, actual, remaining and baseline values, and its own `start`/`finish`;
 `fields` reads Project's assignment fields (`assign.fields` lists them).
 
@@ -130,6 +153,7 @@ mod tests {
             "outline_number",
             "assign.set",
             "assign.fields",
+            "yppxy_assign_set",
         ] {
             assert!(SKILL_MD.contains(needle), "skill missing {needle}");
         }

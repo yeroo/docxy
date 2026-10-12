@@ -1068,8 +1068,11 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
 }
 
 fn print_usage() {
-    eprintln!(
-        "Xlsxy — terminal .xlsx spreadsheet editor with a real calc engine\n\n\
+    eprintln!("{USAGE}");
+}
+
+/// `--help`'s text, with the editor's keys.
+const USAGE: &str = "Xlsxy — terminal .xlsx spreadsheet editor with a real calc engine\n\n\
          USAGE:\n  \
            xlsxy                            new workbook (or the first workbook in XLSTART)\n  \
            xlsxy <file.xlsx>                open a workbook\n  \
@@ -1092,8 +1095,9 @@ fn print_usage() {
            arrows / PgUp / PgDn move   (Ctrl-arrows jump to data edge)\n  \
            Shift + move select a range   (stats appear in the status bar)\n  \
            Ctrl-C copy   Ctrl-X cut   Ctrl-V paste (relative refs translate)\n  \
-           Ctrl-Z undo   Ctrl-Y redo   Ctrl-S save   Ctrl-N new   Ctrl-Q quit\n  \
-           Ctrl-PgUp/PgDn or click tabs to switch sheets\n  \
+           Ctrl-Z undo   Ctrl-S save   Ctrl-N new   Ctrl-Q quit\n  \
+           F4 / Ctrl-Y redo or repeat (the last format, with nothing to redo)\n  \
+           Ctrl-PgUp/PgDn or click tabs to switch sheets   Shift-F4 sheet list\n  \
            Ctrl-D/Ctrl-R fill down/right   Ctrl-F find (F3 next)\n  \
            F5 insert rows  Shift-F5 delete rows  F6/Shift-F6 same for columns\n  \
            Shift-Space whole rows · Ctrl-Shift-= / Ctrl-- insert / delete the\n  \
@@ -1105,9 +1109,7 @@ fn print_usage() {
            Alt-↓ elsewhere: pick from the column's entries (or a formula's names)\n  \
            Ctrl-E Flash Fill · Ctrl-Z while typing takes back an AutoCorrect\n  \
            a formula's name list: ↑/↓ choose, Tab insert, Esc close\n  \
-           mouse: click to move · drag to select · double-click to edit · wheel to scroll"
-    );
-}
+           mouse: click to move · drag to select · double-click to edit · wheel to scroll";
 
 thread_local! {
     /// `wb.clock`'s fixed date (a serial), standing in for the local clock
@@ -1888,6 +1890,10 @@ const NUMFMT_OPTIONS: &[(&str, Option<&str>)] = &[
 /// An (r, g, b) color.
 type Rgb = (u8, u8, u8);
 
+/// A formatting change as applied to each cell's `Xf`: kept so F4 / Ctrl+Y
+/// can repeat it (#1169).
+type FormatFn = std::rc::Rc<dyn Fn(&mut Xf)>;
+
 /// Color palette offered by the font/fill pickers: (label, rgb).
 const COLOR_OPTIONS: &[(&str, Option<Rgb>)] = &[
     ("Automatic", None),
@@ -2058,6 +2064,10 @@ struct App {
     status: Option<String>,
     undo: Vec<UndoAction>,
     redo: Vec<UndoAction>,
+    /// The last formatting change and its status label, which F4 / Ctrl+Y
+    /// repeat on the selection when nothing is left to redo (#1169). A cell
+    /// entry never replaces it.
+    last_format: Option<(FormatFn, String)>,
     /// Steps ever pushed onto `undo`; unlike `undo.len()` it still moves at
     /// [`UNDO_CAP`], so [`App::with_rules`] can tell a step was recorded.
     undo_pushes: u64,
@@ -2231,6 +2241,7 @@ impl App {
             circle_warning_pending: false,
             undo: Vec::new(),
             redo: Vec::new(),
+            last_format: None,
             undo_pushes: 0,
             undo_target: None,
             clip: None,
@@ -2332,13 +2343,13 @@ impl App {
     /// The selection intersected with the sheet's used range, so operations
     /// that iterate every coordinate (copy, clear) never walk the full
     /// 1,048,576 × 16,384 grid when the user selects whole rows/columns or
-    /// the entire sheet. Falls back to the cursor cell when the selection
-    /// covers only empty area (nothing to iterate).
+    /// the entire sheet. Falls back to the selection's top-left corner when
+    /// the selection starts past the data (nothing to iterate).
     fn iter_selection(&self) -> (u32, u32, u32, u32) {
         let (r1, c1, r2, c2) = self.selection();
         let (used_r, used_c) = self.sheet().used_size();
         if used_r == 0 || used_c == 0 || r1 >= used_r || c1 >= used_c {
-            return (r1, c1, r1, c1); // just the anchor corner
+            return (r1, c1, r1, c1); // just the selection's top-left corner
         }
         (r1, c1, r2.min(used_r - 1), c2.min(used_c - 1))
     }
@@ -5067,9 +5078,25 @@ impl App {
 
     // --- cell formatting -----------------------------------------------------
 
+    /// Apply `f` to the selection as one undoable edit, show `label`, and
+    /// keep both for F4 / Ctrl+Y to repeat (#1169). On a protected sheet it
+    /// is refused with the protected status, and not remembered.
+    fn apply_format(&mut self, label: impl Into<String>, f: impl Fn(&mut Xf) + 'static) {
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return;
+        }
+        let f: FormatFn = std::rc::Rc::new(f);
+        let label = label.into();
+        self.format_selection(&*f);
+        self.status = Some(label.clone());
+        self.last_format = Some((f, label));
+    }
+
     /// Apply `f` to the `Xf` of every cell in the selection (interning the
     /// result so styles aren't duplicated), as one undoable edit.
-    fn apply_format(&mut self, f: impl Fn(&mut Xf)) {
+    fn format_selection(&mut self, f: &dyn Fn(&mut Xf)) {
         let (r1, c1, r2, c2) = self.iter_selection();
         let snapshot: Vec<(u32, u32, u32)> = {
             let sheet = self.sheet();
@@ -5092,30 +5119,93 @@ impl App {
         self.apply_styles_on(self.sheet, styles);
     }
 
+    /// A toggle resolved against the active cell, as Excel does: ON for the
+    /// whole selection when the active cell is off, else OFF. The setter is
+    /// what F4 repeats, so a repeat sets rather than flips (#1169).
+    fn toggle_setter(
+        &self,
+        get: fn(&Xf) -> bool,
+        set: fn(&mut Xf, bool),
+    ) -> impl Fn(&mut Xf) + 'static {
+        // The active cell, when the selection's formatted part holds it;
+        // else that part's top-left corner, so a toggle always reads a cell
+        // it writes and can turn back off.
+        let (r1, c1, r2, c2) = self.iter_selection();
+        let (r, c) = match self.cur {
+            (r, c) if (r1..=r2).contains(&r) && (c1..=c2).contains(&c) => (r, c),
+            _ => (r1, c1),
+        };
+        let style = self.sheet().cell(r, c).map_or(0, |cl| cl.style);
+        let on = !get(&self.pkg.workbook.styles.xf(style));
+        move |x| set(x, on)
+    }
+
     fn toggle_bold(&mut self) {
-        self.apply_format(|x| x.bold = !x.bold);
-        self.status = Some("Bold".to_string());
+        let f = self.toggle_setter(|x| x.bold, |x, on| x.bold = on);
+        self.apply_format("Bold", f);
     }
 
     fn toggle_italic(&mut self) {
-        self.apply_format(|x| x.italic = !x.italic);
-        self.status = Some("Italic".to_string());
+        let f = self.toggle_setter(|x| x.italic, |x, on| x.italic = on);
+        self.apply_format("Italic", f);
     }
 
     fn set_align(&mut self, a: Align) {
-        self.apply_format(move |x| x.align = a);
+        let label = match a {
+            Align::Left => "Align left",
+            Align::Center => "Align center",
+            Align::Right => "Align right",
+            _ => "Align",
+        };
+        self.apply_format(label, move |x| x.align = a);
+    }
+
+    /// Repeat the last formatting change on the selection: one undo step,
+    /// which clears the redo stack. On a protected sheet it is refused (true,
+    /// with the protected status). False when nothing is remembered.
+    fn repeat_format(&mut self) -> bool {
+        let Some((f, label)) = self.last_format.clone() else {
+            return false;
+        };
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return true;
+        }
+        self.format_selection(&*f);
+        self.status = Some(label);
+        true
+    }
+
+    /// Excel's one Redo/Repeat command, on F4 and Ctrl+Y alike (#1169): a
+    /// pending redo is redone (and selects what it redoes); with nothing to
+    /// redo the last format is repeated on the selection — except on a
+    /// protected sheet, where the repeat is refused while a pending redo
+    /// still redoes.
+    fn redo_or_repeat(&mut self) {
+        if !self.redo.is_empty() {
+            self.redo();
+        } else if !self.repeat_format() {
+            self.status = Some("Can't repeat".to_string());
+        }
     }
 
     /// Toggle Wrap Text on the selection. Wrapped cells render across multiple
     /// lines (the row grows to fit); Excel auto-fits the row height on open.
     fn toggle_wrap(&mut self) {
-        self.apply_format(|x| x.wrap = !x.wrap);
-        self.status = Some("Wrap text".to_string());
+        let f = self.toggle_setter(|x| x.wrap, |x, on| x.wrap = on);
+        self.apply_format("Wrap text", f);
     }
 
     /// Set (or clear) an explicit height in points for every row in the
-    /// selection. "auto"/"0"/empty clears it so the row auto-fits.
+    /// selection. "auto"/"0"/empty clears it so the row auto-fits. A protected
+    /// sheet refuses, as Fill does (#1351).
     fn commit_row_height(&mut self, text: &str) {
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return;
+        }
         let t = text.trim();
         let pts = if t.is_empty() || t.eq_ignore_ascii_case("auto") {
             None
@@ -5176,18 +5266,17 @@ impl App {
             PickKind::NumberFormat => {
                 let (label, code) = NUMFMT_OPTIONS[p.sel];
                 let code = code.map(str::to_string);
-                self.apply_format(move |x| x.set_code(code.clone()));
-                self.status = Some(format!("Number format: {label}"));
+                self.apply_format(format!("Number format: {label}"), move |x| {
+                    x.set_code(code.clone())
+                });
             }
             PickKind::FontColor => {
                 let (label, rgb) = COLOR_OPTIONS[p.sel];
-                self.apply_format(move |x| x.color = rgb);
-                self.status = Some(format!("Font color: {label}"));
+                self.apply_format(format!("Font color: {label}"), move |x| x.color = rgb);
             }
             PickKind::FillColor => {
                 let (label, rgb) = COLOR_OPTIONS[p.sel];
-                self.apply_format(move |x| x.fill = rgb);
-                self.status = Some(format!("Fill color: {label}"));
+                self.apply_format(format!("Fill color: {label}"), move |x| x.fill = rgb);
             }
         }
     }
@@ -5246,30 +5335,29 @@ impl App {
             0 => {
                 let (label, code) = NUMFMT_OPTIONS[sel];
                 let code = code.map(str::to_string);
-                self.apply_format(move |x| x.set_code(code.clone()));
-                self.status = Some(format!("Number format: {label}"));
+                self.apply_format(format!("Number format: {label}"), move |x| {
+                    x.set_code(code.clone())
+                });
             }
             1 => match sel {
                 0 => self.toggle_bold(),
                 1 => self.toggle_italic(),
                 _ => {
                     let (label, rgb) = COLOR_OPTIONS[sel - 2];
-                    self.apply_format(move |x| x.color = rgb);
-                    self.status = Some(format!("Font color: {label}"));
+                    self.apply_format(format!("Font color: {label}"), move |x| x.color = rgb);
                 }
             },
             2 => {
                 let (label, rgb) = COLOR_OPTIONS[sel];
-                self.apply_format(move |x| x.fill = rgb);
-                self.status = Some(format!("Fill: {label}"));
+                self.apply_format(format!("Fill: {label}"), move |x| x.fill = rgb);
             }
             3 => {
                 let a = [Align::Left, Align::Center, Align::Right][sel];
                 self.set_align(a);
             }
             4 => {
-                self.apply_format(|x| x.border = !x.border);
-                self.status = Some("Toggled box border".into());
+                let f = self.toggle_setter(|x| x.border, |x, on| x.border = on);
+                self.apply_format("Toggled box border", f);
             }
             _ => {}
         }
@@ -5976,7 +6064,14 @@ impl App {
             FillColor => self.open_picker(PickKind::FillColor),
             MergeCenter => self.merge_toggle(),
             WrapText => self.toggle_wrap(),
-            RowHeight => self.open_prompt(PromptKind::RowHeight),
+            RowHeight => {
+                if self.protected() {
+                    self.status =
+                        Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+                } else {
+                    self.open_prompt(PromptKind::RowHeight);
+                }
+            }
             CondFormat => self.open_prompt(PromptKind::CondFormat),
             DataValidation => self.open_validation_dialog(),
             CircleInvalid => self.circle_invalid(),
@@ -6592,6 +6687,7 @@ impl App {
         self.edit = None;
         self.undo.clear();
         self.redo.clear();
+        self.last_format = None;
         self.comment_sel = 0;
     }
 
@@ -8278,8 +8374,14 @@ impl App {
 
     /// Merge & Center the selection (or unmerge if its top-left is already a merge
     /// origin). Centres the anchor cell; renders via the merge-aware grid draw.
+    /// A protected sheet refuses, as Fill does (#1351).
     fn merge_toggle(&mut self) {
         use gridcore::sheet::Align;
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return;
+        }
         let (r1, c1, r2, c2) = self.selection(); // raw: merging blank cells is valid
         let s = self.sheet;
         self.structural(move |wb| {
@@ -11092,7 +11194,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('s') | KeyCode::Char('S') if ctrl => app.save(),
         KeyCode::Char('n') | KeyCode::Char('N') if ctrl => app.request_discard(Next::New),
         KeyCode::Char('z') | KeyCode::Char('Z') if ctrl => app.undo(),
-        KeyCode::Char('y') | KeyCode::Char('Y') if ctrl => app.redo(),
+        KeyCode::Char('y') | KeyCode::Char('Y') if ctrl => app.redo_or_repeat(),
         KeyCode::Char('c') | KeyCode::Char('C') if ctrl => app.copy(false),
         KeyCode::Char('x') | KeyCode::Char('X') if ctrl => app.copy(true),
         // Ctrl+Alt+V, when the terminal reports it: Paste Special (#669).
@@ -11122,7 +11224,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 app.open_prompt(PromptKind::Find);
             }
         }
-        KeyCode::F(4) => app.open_sheet_picker(),
+        // F4 is Excel's Redo/Repeat (#1169); the sheet list moved to Shift+F4.
+        KeyCode::F(4) if shift => app.open_sheet_picker(),
+        KeyCode::F(4) => app.redo_or_repeat(),
         // Plain F9 opens the ribbon (handled earlier); Shift+F9 forces recalc.
         KeyCode::F(9) => app.recalc_and_refresh(),
         KeyCode::Char('p') | KeyCode::Char('P') if ctrl => app.open_pivot_editor(),
@@ -11230,6 +11334,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::F(2) => app.start_edit(None),
         KeyCode::F(7) | KeyCode::F(8) => {
+            if app.protected() {
+                app.status =
+                    Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+                return false;
+            }
             let col = app.cur.1;
             let w = app.sheet().col_width(col);
             let nw = if key.code == KeyCode::F(7) {
@@ -15718,6 +15827,104 @@ mod tests {
         app.anchor = None;
         app.merge_toggle();
         assert!(app.pkg.workbook.sheets[0].merges.is_empty());
+    }
+
+    /// #1351: Merge & Center refuses a protected sheet: no merge, no anchor
+    /// restyle, no undo step.
+    #[test]
+    fn merge_and_center_is_refused_on_a_protected_sheet() {
+        use gridcore::sheet::Align;
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0].set_cell(0, 0, Cell::text("Title"));
+        app.cur = (0, 0);
+        app.anchor = Some((0, 2)); // A1:C1
+        let style = app.sheet().cell(0, 0).unwrap().style;
+        let undo_len = app.undo.len();
+        app.pkg.workbook.sheets[0].set_protected(true);
+        app.merge_toggle();
+        assert!(app.pkg.workbook.sheets[0].merges.is_empty());
+        let c = app.sheet().cell(0, 0).unwrap();
+        assert_eq!(c.style, style);
+        assert_ne!(app.pkg.workbook.styles.xf(c.style).align, Align::Center);
+        assert_eq!(app.undo.len(), undo_len);
+        assert!(!app.modified);
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+    }
+
+    /// #1351: Merge & Center on a protected sheet does not unmerge either.
+    #[test]
+    fn merge_and_center_does_not_unmerge_a_protected_sheet() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0].merges.push((0, 0, 0, 2));
+        app.cur = (0, 0);
+        app.anchor = None;
+        let undo_len = app.undo.len();
+        app.pkg.workbook.sheets[0].set_protected(true);
+        app.merge_toggle();
+        assert_eq!(app.pkg.workbook.sheets[0].merges, vec![(0, 0, 0, 2)]);
+        assert_eq!(app.undo.len(), undo_len);
+        assert!(!app.modified);
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+    }
+
+    /// #1351: Row Height refuses a protected sheet for "45", "auto" and even
+    /// invalid text; the saved file keeps the prior heights.
+    #[test]
+    fn row_height_is_refused_on_a_protected_sheet() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0].set_row_height(1, Some(20.0));
+        app.cur = (1, 0);
+        app.anchor = Some((2, 0)); // rows 1..=2
+        let undo_len = app.undo.len();
+        app.pkg.workbook.sheets[0].set_protected(true);
+        for t in ["45", "auto", "abc"] {
+            app.commit_row_height(t);
+            assert_eq!(app.pkg.workbook.sheets[0].row_height(1), Some(20.0), "{t}");
+            assert_eq!(app.pkg.workbook.sheets[0].row_height(2), None, "{t}");
+            assert_eq!(app.undo.len(), undo_len, "{t}");
+            assert!(!app.modified, "{t}");
+            assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS), "{t}");
+        }
+        let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        assert_eq!(re.workbook.sheets[0].row_height(1), Some(20.0));
+        assert_eq!(re.workbook.sheets[0].row_height(2), None);
+    }
+
+    /// #1351: the ribbon's Row Height opens no prompt on a protected sheet
+    /// (and still opens one when the sheet is unprotected).
+    #[test]
+    fn ribbon_row_height_opens_no_prompt_on_a_protected_sheet() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0].set_protected(true);
+        app.ribbon_act(ribbon::Act::RowHeight);
+        assert!(app.prompt.is_none());
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.ribbon_act(ribbon::Act::RowHeight);
+        assert!(app.prompt.is_some());
+    }
+
+    /// #1351: F7/F8 refuse a protected sheet: the column width and the
+    /// modified flag stay put.
+    #[test]
+    fn column_width_keys_are_refused_on_a_protected_sheet() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        let w = app.sheet().col_width(0);
+        app.pkg.workbook.sheets[0].set_protected(true);
+        app.cur = (0, 0);
+        for key in [KeyCode::F(7), KeyCode::F(8), KeyCode::F(8)] {
+            press(&mut app, key);
+            assert_eq!(app.sheet().col_width(0), w, "{key:?}");
+            assert!(!app.modified, "{key:?}");
+            assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS), "{key:?}");
+        }
     }
 
     #[test]
@@ -22195,6 +22402,311 @@ mod tests {
         away(&mut app);
         app.undo();
         assert_eq!((app.cur, app.anchor), ((8, 5), None));
+    }
+
+    // --- F4 / Ctrl+Y Redo/Repeat (#1169) ----------------------------------
+
+    fn repeat_app() -> App {
+        let mut app = App::new(new_xlsx(), "repeat.xlsx");
+        app.os_clip = None;
+        app
+    }
+
+    fn xf_at(app: &App, r: u32, c: u32) -> Xf {
+        let style = app.sheet().cell(r, c).map_or(0, |cl| cl.style);
+        app.pkg.workbook.styles.xf(style)
+    }
+
+    fn go(app: &mut App, r: u32, c: u32) {
+        app.cur = (r, c);
+        app.anchor = None;
+    }
+
+    #[test]
+    fn ctrl_y_and_f4_repeat_the_last_format_with_nothing_to_redo() {
+        for (key, m) in [
+            (KeyCode::Char('y'), KeyModifiers::CONTROL),
+            (KeyCode::F(4), KeyModifiers::NONE),
+        ] {
+            let mut app = repeat_app();
+            chord(&mut app, 'b');
+            assert!(xf_at(&app, 0, 0).bold);
+            go(&mut app, 1, 2); // C2
+            let steps = app.undo.len();
+            press_mod(&mut app, key, m);
+            assert!(xf_at(&app, 1, 2).bold, "{key:?} repeats Bold on C2");
+            assert_eq!(app.undo.len(), steps + 1, "{key:?}: one undo step");
+            assert!(app.redo.is_empty());
+            assert_eq!(app.status.as_deref(), Some("Bold"));
+            chord(&mut app, 'z');
+            assert!(!xf_at(&app, 1, 2).bold, "{key:?}: undo un-bolds C2");
+            assert!(xf_at(&app, 0, 0).bold, "{key:?}: and only C2");
+        }
+    }
+
+    #[test]
+    fn a_pending_redo_wins_over_repeat_and_selects_what_it_redoes() {
+        let mut app = repeat_app();
+        chord(&mut app, 'b'); // A1
+        go(&mut app, 2, 2); // C3
+        press(&mut app, KeyCode::F(4));
+        assert!(xf_at(&app, 2, 2).bold);
+        chord(&mut app, 'z');
+        assert!(!xf_at(&app, 2, 2).bold);
+        go(&mut app, 3, 2); // C4
+        press(&mut app, KeyCode::F(4));
+        assert!(xf_at(&app, 2, 2).bold, "the redo puts C3's bold back");
+        assert!(!xf_at(&app, 3, 2).bold, "and does not repeat on C4");
+        assert_eq!(app.cur, (2, 2), "the redo selects C3");
+        assert_eq!(app.status.as_deref(), Some("Redid"));
+        go(&mut app, 3, 2);
+        press(&mut app, KeyCode::F(4));
+        assert!(xf_at(&app, 3, 2).bold, "nothing left to redo: repeat");
+    }
+
+    #[test]
+    fn repeating_a_toggle_sets_it_rather_than_flipping() {
+        let mut app = repeat_app();
+        go(&mut app, 0, 1);
+        chord(&mut app, 'b'); // B1 bold
+        go(&mut app, 0, 0);
+        chord(&mut app, 'b'); // A1 bold: the remembered toggle is "bold ON"
+        go(&mut app, 0, 1);
+        let steps = app.undo.len();
+        press(&mut app, KeyCode::F(4));
+        assert_eq!(app.undo.len(), steps + 1, "F4 repeated");
+        assert!(xf_at(&app, 0, 1).bold, "B1 stays bold");
+    }
+
+    #[test]
+    fn bold_on_a_mixed_selection_follows_the_active_cell() {
+        let mut app = repeat_app();
+        go(&mut app, 1, 0);
+        chord(&mut app, 'b'); // A2 bold, A1 plain
+        press_mod(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert_eq!((app.cur, app.anchor), ((0, 0), Some((1, 0))));
+        chord(&mut app, 'b');
+        assert!(xf_at(&app, 0, 0).bold, "A1, the active cell, turns bold");
+        assert!(xf_at(&app, 1, 0).bold, "and so does A2: not flipped off");
+        chord(&mut app, 'b');
+        assert!(!xf_at(&app, 0, 0).bold && !xf_at(&app, 1, 0).bold);
+    }
+
+    #[test]
+    fn a_toggle_whose_cursor_is_past_the_data_still_turns_off() {
+        // A1:A3 bold data; the selection runs on to A5, past the data, so
+        // only A1:A3 are written and the toggle must read one of them.
+        let mut app = repeat_app();
+        for _ in 0..3 {
+            type_text(&mut app, "1");
+            press(&mut app, KeyCode::Enter);
+        }
+        app.anchor = Some((0, 0));
+        app.cur = (2, 0);
+        chord(&mut app, 'b');
+        assert!((0..3).all(|r| xf_at(&app, r, 0).bold));
+        go(&mut app, 0, 0);
+        for _ in 0..4 {
+            press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        }
+        assert_eq!((app.cur, app.anchor), ((4, 0), Some((0, 0))));
+        chord(&mut app, 'b');
+        assert!((0..3).all(|r| !xf_at(&app, r, 0).bold), "un-bolded");
+        chord(&mut app, 'b');
+        assert!((0..3).all(|r| xf_at(&app, r, 0).bold), "bold again");
+        // An empty sheet formats only the corner: A1, read from A1.
+        let mut app = repeat_app();
+        press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        assert_eq!(app.cur, (2, 0));
+        chord(&mut app, 'b');
+        assert!(xf_at(&app, 0, 0).bold, "first press bolds A1");
+        chord(&mut app, 'b');
+        assert!(!xf_at(&app, 0, 0).bold, "second press un-bolds it");
+    }
+
+    #[test]
+    fn a_cell_entry_is_not_repeated_and_keeps_the_last_format() {
+        let mut app = repeat_app();
+        chord(&mut app, 'b'); // A1
+        go(&mut app, 1, 4); // E2
+        type_text(&mut app, "x");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(value_at(&app, 1, 4), CellValue::Text("x".into()));
+        assert_eq!(app.cur, (2, 4), "Enter moved to E3");
+        press(&mut app, KeyCode::F(4));
+        assert!(xf_at(&app, 2, 4).bold, "F4 repeats Bold on E3");
+        assert!(!xf_at(&app, 1, 4).bold, "the entry cell is untouched");
+        assert_eq!(
+            value_at(&app, 2, 4),
+            CellValue::Empty,
+            "nothing typed into E3"
+        );
+    }
+
+    #[test]
+    fn a_format_dialog_fill_is_repeated() {
+        let mut app = repeat_app();
+        chord(&mut app, '1');
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right); // Fill
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down); // Red
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.format_dialog.is_none());
+        let red = COLOR_OPTIONS[3].1;
+        assert_eq!(xf_at(&app, 0, 0).fill, red);
+        go(&mut app, 4, 3);
+        press(&mut app, KeyCode::F(4));
+        assert_eq!(xf_at(&app, 4, 3).fill, red, "F4 repeats the fill");
+        assert_eq!(app.status.as_deref(), Some("Fill: Red"));
+    }
+
+    #[test]
+    fn picker_align_and_border_formats_are_repeated() {
+        let mut app = repeat_app();
+        app.format_picker = Some(FormatPicker {
+            kind: PickKind::FontColor,
+            sel: 3,
+        });
+        app.apply_picker();
+        go(&mut app, 0, 1);
+        press(&mut app, KeyCode::F(4));
+        assert_eq!(xf_at(&app, 0, 1).color, COLOR_OPTIONS[3].1, "font colour");
+        app.set_align(Align::Center);
+        go(&mut app, 0, 2);
+        chord(&mut app, 'y');
+        assert_eq!(xf_at(&app, 0, 2).align, Align::Center, "align");
+        app.format_dialog = Some(FormatDialog { section: 4, sel: 0 });
+        app.apply_format_dialog();
+        app.format_dialog = None;
+        assert!(xf_at(&app, 0, 2).border);
+        go(&mut app, 0, 3);
+        press(&mut app, KeyCode::F(4));
+        assert!(xf_at(&app, 0, 3).border, "border, set");
+        press(&mut app, KeyCode::F(4));
+        assert!(xf_at(&app, 0, 3).border, "repeated again it stays on");
+    }
+
+    #[test]
+    fn redo_or_repeat_with_nothing_to_do_changes_nothing() {
+        for (key, m) in [
+            (KeyCode::Char('y'), KeyModifiers::CONTROL),
+            (KeyCode::F(4), KeyModifiers::NONE),
+        ] {
+            let mut app = repeat_app();
+            press_mod(&mut app, key, m);
+            assert_eq!((app.undo.len(), app.redo.len()), (0, 0), "{key:?}");
+            assert!(!app.modified, "{key:?}");
+            assert_eq!(app.status.as_deref(), Some("Can't repeat"), "{key:?}");
+            assert!(app.sheet_picker.is_none(), "{key:?}");
+        }
+        // A new workbook forgets the last format with the rest of the history.
+        let mut app = repeat_app();
+        chord(&mut app, 'b');
+        app.new_workbook();
+        go(&mut app, 2, 2);
+        press(&mut app, KeyCode::F(4));
+        assert_eq!(app.undo.len(), 0);
+        assert!(!xf_at(&app, 2, 2).bold);
+        assert_eq!(app.status.as_deref(), Some("Can't repeat"));
+    }
+
+    #[test]
+    fn formatting_a_protected_sheet_is_refused() {
+        // Protected directly (not toggle_protection) so nothing is modified yet.
+        let mut app = repeat_app();
+        app.pkg.workbook.sheets[0].set_protected(true);
+        let undo_len = app.undo.len();
+        // Ctrl+B.
+        chord(&mut app, 'b');
+        assert!(!xf_at(&app, 0, 0).bold);
+        assert_eq!(app.undo.len(), undo_len);
+        assert!(!app.modified);
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+        // The ribbon's Bold.
+        app.ribbon_act(ribbon::Act::Bold);
+        assert!(!xf_at(&app, 0, 0).bold);
+        assert_eq!(app.undo.len(), undo_len);
+        assert!(!app.modified);
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+        // The Format Cells dialog (Font section, Bold).
+        app.open_format_dialog();
+        let d = app.format_dialog.as_mut().unwrap();
+        d.section = 1;
+        d.sel = 0;
+        app.apply_format_dialog();
+        assert!(!xf_at(&app, 0, 0).bold);
+        assert_eq!(app.undo.len(), undo_len);
+        assert!(!app.modified);
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+    }
+
+    #[test]
+    fn repeat_on_a_protected_sheet_is_refused_but_a_redo_still_runs() {
+        // The refusal half: F4 and Ctrl+Y with a remembered format and an
+        // empty redo stack change nothing and say so (not "Can't repeat").
+        for (key, m) in [
+            (KeyCode::F(4), KeyModifiers::NONE),
+            (KeyCode::Char('y'), KeyModifiers::CONTROL),
+        ] {
+            let mut app = repeat_app();
+            chord(&mut app, 'b'); // A1: Bold, remembered
+            app.toggle_protection();
+            let undo_len = app.undo.len();
+            go(&mut app, 1, 2); // C2
+            press_mod(&mut app, key, m);
+            assert!(!xf_at(&app, 1, 2).bold, "{key:?}: refused on C2");
+            assert_eq!(app.undo.len(), undo_len, "{key:?}: no undo step");
+            assert!(app.redo.is_empty(), "{key:?}");
+            assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS), "{key:?}");
+        }
+        // The redo half: a pending redo still runs on a protected sheet.
+        let mut app = repeat_app();
+        chord(&mut app, 'b'); // A1
+        go(&mut app, 2, 2); // C3
+        press(&mut app, KeyCode::F(4)); // repeats Bold on C3
+        assert!(xf_at(&app, 2, 2).bold);
+        chord(&mut app, 'z'); // undo C3: a redo is now pending
+        assert!(!xf_at(&app, 2, 2).bold);
+        // Direct, not toggle_protection: structural would clear the redo stack.
+        app.pkg.workbook.sheets[0].set_protected(true);
+        go(&mut app, 3, 2); // C4
+        press(&mut app, KeyCode::F(4));
+        assert!(xf_at(&app, 2, 2).bold, "the redo puts C3's bold back");
+        assert!(!xf_at(&app, 3, 2).bold, "C4 stays plain");
+        assert_eq!(app.status.as_deref(), Some("Redid"));
+    }
+
+    #[test]
+    fn a_format_refused_on_a_protected_sheet_is_not_remembered() {
+        let mut app = repeat_app();
+        chord(&mut app, 'b'); // A1: Bold remembered
+        app.pkg.workbook.sheets[0].set_protected(true);
+        chord(&mut app, 'i'); // refused: must not replace the remembered Bold
+        app.pkg.workbook.sheets[0].set_protected(false);
+        go(&mut app, 1, 1); // B2
+        press(&mut app, KeyCode::F(4));
+        assert!(xf_at(&app, 1, 1).bold, "the remembered Bold repeats");
+        assert!(!xf_at(&app, 1, 1).italic, "the refused Italic does not");
+        assert_eq!(app.status.as_deref(), Some("Bold"));
+    }
+
+    #[test]
+    fn shift_f4_opens_the_sheet_picker_and_f4_does_not() {
+        let mut app = repeat_app();
+        app.add_sheet_auto(); // the picker needs a second sheet
+        assert_eq!(app.pkg.workbook.sheets.len(), 2);
+        press(&mut app, KeyCode::F(4));
+        assert!(app.sheet_picker.is_none(), "plain F4 is Redo/Repeat");
+        press_mod(&mut app, KeyCode::F(4), KeyModifiers::SHIFT);
+        assert_eq!(app.sheet_picker, Some(app.sheet));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.sheet_picker.is_none());
+        assert!(USAGE.contains("F4 / Ctrl-Y redo or repeat"));
+        assert!(USAGE.contains("Shift-F4 sheet list"));
     }
 }
 

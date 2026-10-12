@@ -28,7 +28,7 @@
 //! | `assign.get` | `{uid, fields?}` | one assignment (by its own uid) |
 //! | `assign.fields` | — | `{count, fields:[name…]}`: the assignment field names `fields` can read |
 //! | `assign.add` | `{task, resource, units?, work?, fields?}` | the new assignment (`resource` a uid, or a name; a new name is staged as a work resource; a new name that is a number or contains a comma is refused: pass a uid as a number) |
-//! | `assign.set` | `{uid, units?, work?, rate_table?, delay?, fields?}` | the updated assignment, after its task is rescheduled |
+//! | `assign.set` | `{uid, units?, work?, overtime_work?, contour?, rate_table?, delay?, actual_work? \| percent_work_complete?, fields?}` | the updated assignment, after its task is rescheduled |
 //! | `assign.del` | `{uid}` | `{deleted, task}` |
 //!
 //! `fields` is a list of Project field names (`["% Complete", "Baseline1
@@ -54,12 +54,25 @@
 //! Project's name (`Flat`), `start`/`finish` its own dates. The assign verbs
 //! take `fields` too, with Project's assignment field names (see
 //! `projcore::editor::fields::assignment`; units read as a number). Arguments:
-//! `units` a number or a percent string (`"50%"`); `work` and `delay` a
-//! number of hours or a duration (`"40h"`, `"5d"`); `rate_table` `"A"`..`"E"`.
+//! `units` a number or a percent string (`"50%"`); `work`, `overtime_work`,
+//! `actual_work` and `delay` a number of hours or a duration (`"40h"`,
+//! `"5d"`); `rate_table` `"A"`..`"E"`; `contour` Project's name (`"Back
+//! Loaded"`, ASCII case ignored) or its code 0 (Flat) to 7 (Turtle), never
+//! Contoured; `percent_work_complete` a whole number 0 to 100 or `"50%"`,
+//! instead of `actual_work`.
 //! The task is rescheduled by its type, as in Project: a units edit on a
 //! Fixed Units task keeps the work and moves the duration; on Fixed Duration
 //! the work follows the units, and units given together with work are
-//! recomputed from the work. Every argument is checked before the edit, so
+//! recomputed from the work. Overtime (a work resource's, at most the work;
+//! a work edit clears it, so given together it applies after the work) is
+//! priced at the overtime rate but not scheduled. A contour keeps the work,
+//! units and duration and the assignment spans its task. Actual work (at
+//! most the work, applied last) sets the actual start, at the whole work
+//! the actual finish too, prices the actual cost by the resource's accrual,
+//! and derives the remaining work and cost and % work complete; task
+//! progress (its actual dates, % complete) is not derived from it. A
+//! contour or an actual start ends a delayed assignment's extension of its
+//! task past its duration. Every argument is checked before the edit, so
 //! a rejected call leaves the editor untouched.
 //!
 //! `path_info` provides the common `proj.path` fields. File verbs (`proj.save`,
@@ -686,6 +699,48 @@ fn rate_table_arg(args: &Json) -> Result<Option<u8>, String> {
     }
 }
 
+/// `contour` as a work contour code: Project's name, ASCII case ignored,
+/// or the code itself. Contoured reads as 8, which the editor refuses with
+/// its reason.
+fn contour_arg(args: &Json) -> Result<Option<u8>, String> {
+    let Some(c) = args.get("contour") else {
+        return Ok(None);
+    };
+    let code = match c.as_str().map(str::trim) {
+        Some(name) => name.parse::<u8>().ok().or_else(|| {
+            (0..=8).find(|&code| work_contour_name(Some(code)).eq_ignore_ascii_case(name))
+        }),
+        None => c.as_i64().and_then(|n| u8::try_from(n).ok()),
+    };
+    code.map(Some).ok_or_else(|| {
+        "couldn't read 'contour' (a name such as \"Back Loaded\", or 0 to 7)".to_string()
+    })
+}
+
+/// `key` as a whole percent, 0 to 100: a number or a percent string
+/// (`"50%"`).
+fn percent_arg(args: &Json, key: &str) -> Result<Option<u8>, String> {
+    let Some(v) = args.get(key) else {
+        return Ok(None);
+    };
+    let n = match v.as_str() {
+        Some(text) => {
+            let text = text.trim();
+            let text = text.strip_suffix('%').map_or(text, str::trim_end);
+            text.parse::<f64>().ok()
+        }
+        None => v.as_f64(),
+    };
+    let n = n
+        .filter(|n| n.is_finite() && n.fract() == 0.0)
+        .ok_or_else(|| format!("couldn't read '{key}' (a whole percent such as 50 or \"50%\")"))?;
+    if (0.0..=100.0).contains(&n) {
+        Ok(Some(n as u8))
+    } else {
+        Err(format!("'{key}' must be 0 to 100, not {n}"))
+    }
+}
+
 fn assign_list(ed: &Editor, args: &Json) -> Result<Json, String> {
     let asked = fields_of(args, AssignmentField::parse)?;
     let task = args.get("uid").map(|_| uid_arg(args, "uid")).transpose()?;
@@ -747,6 +802,10 @@ fn assign_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         work_min: hours_arg(ed, args, "work")?,
         rate_table: rate_table_arg(args)?,
         delay_min: hours_arg(ed, args, "delay")?,
+        overtime_work_min: hours_arg(ed, args, "overtime_work")?,
+        work_contour: contour_arg(args)?,
+        actual_work_min: hours_arg(ed, args, "actual_work")?,
+        percent_work_complete: percent_arg(args, "percent_work_complete")?,
     };
     ed.set_assignment(uid, patch)?;
     assignment_reply(ed, uid, asked.as_deref())
@@ -1890,6 +1949,96 @@ mod tests {
     }
 
     #[test]
+    fn contour_and_percent_arguments_read_names_codes_and_percents() {
+        let contour = |json: &str| contour_arg(&Json::parse(json).unwrap());
+        for (json, code) in [
+            (r#"{"contour":"Back Loaded"}"#, 1),
+            (r#"{"contour":" turtle "}"#, 7),
+            (r#"{"contour":"FLAT"}"#, 0),
+            (r#"{"contour":"Contoured"}"#, 8),
+            (r#"{"contour":6}"#, 6),
+            (r#"{"contour":"3"}"#, 3),
+        ] {
+            assert_eq!(contour(json), Ok(Some(code)), "{json}");
+        }
+        for json in [
+            r#"{"contour":"Wavy"}"#,
+            r#"{"contour":1.5}"#,
+            r#"{"contour":-1}"#,
+            r#"{"contour":true}"#,
+        ] {
+            assert!(contour(json).is_err(), "{json}");
+        }
+        assert_eq!(contour("{}"), Ok(None));
+        let pct = |json: &str| percent_arg(&Json::parse(json).unwrap(), "p");
+        for (json, p) in [
+            (r#"{"p":50}"#, 50),
+            (r#"{"p":"50%"}"#, 50),
+            (r#"{"p":" 100 % "}"#, 100),
+            (r#"{"p":0}"#, 0),
+        ] {
+            assert_eq!(pct(json), Ok(Some(p)), "{json}");
+        }
+        assert_eq!(
+            pct(r#"{"p":101}"#),
+            Err("'p' must be 0 to 100, not 101".into())
+        );
+        for json in [r#"{"p":50.5}"#, r#"{"p":"half"}"#, r#"{"p":-1}"#] {
+            assert!(pct(json).is_err(), "{json}");
+        }
+    }
+
+    #[test]
+    fn assign_set_takes_overtime_a_contour_and_actuals() {
+        use projcore::model::TaskType;
+        let mut p = staffed(TaskType::FixedUnits, false).project().clone();
+        p.resources[0].overtime_rate = Rate::parse("75");
+        let mut ed = Editor::new(p);
+        let ann = run(&mut ed, "assign.add", r#"{"task":1,"resource":1}"#).unwrap();
+        let uid = num(&ann, "uid");
+        let mut set = |args: &str| {
+            let args = format!(r#"{{"uid":{uid},{args}}}"#);
+            run(&mut ed, "assign.set", &args).unwrap()
+        };
+        // 32h at $50 and 8h at $75.
+        let ann = set(r#""overtime_work":8"#);
+        assert_eq!(
+            (
+                num(&ann, "overtime_work_hours"),
+                num(&ann, "regular_work_hours"),
+                num(&ann, "cost")
+            ),
+            (8.0, 32.0, 2200.0)
+        );
+        let ann = set(r#""contour":"back loaded""#);
+        assert_eq!(ann.get_str("contour"), Some("Back Loaded"));
+        let ann = set(r#""contour":6"#);
+        assert_eq!(ann.get_str("contour"), Some("Bell"));
+        // 16 of the 40 hours, all regular, at $50.
+        let ann = set(r#""actual_work":"2d""#);
+        assert_eq!(
+            (
+                num(&ann, "actual_work_hours"),
+                num(&ann, "remaining_work_hours"),
+                num(&ann, "percent_work_complete"),
+                num(&ann, "actual_cost"),
+                num(&ann, "remaining_cost")
+            ),
+            (16.0, 24.0, 40.0, 800.0, 1400.0)
+        );
+        let ann = set(r#""percent_work_complete":"100%""#);
+        assert_eq!(
+            (
+                num(&ann, "actual_work_hours"),
+                num(&ann, "percent_work_complete"),
+                num(&ann, "actual_cost"),
+                num(&ann, "remaining_cost")
+            ),
+            (40.0, 100.0, 2200.0, 0.0)
+        );
+    }
+
+    #[test]
     fn a_units_edit_on_fixed_units_keeps_work_and_moves_the_duration() {
         use projcore::model::TaskType;
         let mut ed = staffed(TaskType::FixedUnits, false);
@@ -1902,6 +2051,73 @@ mod tests {
         let task = run(&mut ed, "task.get", r#"{"uid":1,"fields":["Work"]}"#).unwrap();
         assert_eq!(num(&task, "duration_days"), 10.0);
         assert_eq!(field(&task, "Work"), ("40 hrs", &Json::Num(2400.0)));
+    }
+
+    #[test]
+    fn task_add_then_assign_fills_task_work_and_cost() {
+        use projcore::model::TaskType;
+        let mut ed = staffed(TaskType::FixedUnits, false);
+        let get = r#"{"uid":2,"fields":["Work","Cost"]}"#;
+        let added = run(&mut ed, "task.add", r#"{"name":"New","duration":"5d"}"#).unwrap();
+        assert_eq!(num(&added, "uid"), 2.0);
+        let task = run(&mut ed, "task.get", get).unwrap();
+        assert_eq!(field(&task, "Work").1, &Json::Null);
+        assert_eq!(field(&task, "Cost").1, &Json::Null);
+
+        let ann = run(&mut ed, "assign.add", r#"{"task":2,"resource":"Ann"}"#).unwrap();
+        let task = run(&mut ed, "task.get", get).unwrap();
+        assert_eq!(field(&task, "Work"), ("40 hrs", &Json::Num(2400.0)));
+        assert_eq!(field(&task, "Cost"), ("$2,000.00", &Json::Num(2000.0)));
+
+        // Filled totals move by delta from then on, down to zero.
+        let del = format!(r#"{{"uid":{}}}"#, num(&ann, "uid"));
+        run(&mut ed, "assign.del", &del).unwrap();
+        let task = run(&mut ed, "task.get", get).unwrap();
+        assert_eq!(field(&task, "Work"), ("0 hrs", &Json::Num(0.0)));
+        assert_eq!(field(&task, "Cost"), ("$0.00", &Json::Num(0.0)));
+        // Task 1, untouched, keeps its stored zero totals.
+        let one = run(&mut ed, "task.get", r#"{"uid":1,"fields":["Work","Cost"]}"#).unwrap();
+        assert_eq!(field(&one, "Work"), ("0 hrs", &Json::Num(0.0)));
+        assert_eq!(field(&one, "Cost"), ("$0.00", &Json::Num(0.0)));
+    }
+
+    #[test]
+    fn an_assignment_reads_its_custom_fields() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Project xmlns="http://schemas.microsoft.com/project">
+  <StartDate>2026-03-02T08:00:00</StartDate>
+  <ExtendedAttributes>
+    <ExtendedAttribute><FieldID>188743731</FieldID><FieldName>Text1</FieldName>
+      <SecondaryPID>255868938</SecondaryPID></ExtendedAttribute>
+    <ExtendedAttribute><FieldID>255869002</FieldID><FieldName>Number1</FieldName></ExtendedAttribute>
+  </ExtendedAttributes>
+  <Tasks>
+    <Task><UID>1</UID><ID>1</ID><Name>Build</Name><OutlineLevel>1</OutlineLevel>
+      <Duration>PT16H0M0S</Duration></Task>
+  </Tasks>
+  <Resources>
+    <Resource><UID>1</UID><ID>1</ID><Name>Ann</Name><Type>1</Type></Resource>
+  </Resources>
+  <Assignments>
+    <Assignment><UID>7</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID><Units>1</Units>
+      <Work>PT16H0M0S</Work>
+      <ExtendedAttribute><FieldID>255868938</FieldID><Value>Civil</Value></ExtendedAttribute>
+      <ExtendedAttribute><FieldID>255869002</FieldID><Value>12.5</Value></ExtendedAttribute>
+    </Assignment>
+  </Assignments>
+</Project>"#;
+        let mut ed = Editor::new(projcore::mspdi::read_mspdi(xml).unwrap());
+        let a = run(
+            &mut ed,
+            "assign.get",
+            r#"{"uid":7,"fields":["Text1","number1","Flag1"]}"#,
+        )
+        .unwrap();
+        assert_eq!(field(&a, "Text1"), ("Civil", &Json::Str("Civil".into())));
+        assert_eq!(field(&a, "number1"), ("12.5", &Json::Num(12.5)));
+        assert_eq!(field(&a, "Flag1"), ("No", &Json::Bool(false)));
+        let err = run(&mut ed, "assign.get", r#"{"uid":7,"fields":["Text31"]}"#).unwrap_err();
+        assert_eq!(err, "unknown assignment field 'Text31'");
     }
 
     #[test]
@@ -1980,6 +2196,15 @@ mod tests {
             panic!()
         };
         assert_eq!(read.len(), listed.len());
+        // Peak and the budget derive (#1179): the units, and 0 without a budget.
+        let fields = all.get("fields").unwrap();
+        for (name, value) in [("Peak", 1.0), ("Budget Work", 0.0), ("Budget Cost", 0.0)] {
+            assert_eq!(
+                fields.get(name).unwrap().get("value"),
+                Some(&Json::Num(value)),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -2100,6 +2325,45 @@ mod tests {
             (
                 "assign.set",
                 format!(r#"{{"uid":{uid},"units":2,"fields":["Nope"]}}"#),
+            ),
+            (
+                "assign.set",
+                format!(r#"{{"uid":{uid},"overtime_work":"lots"}}"#),
+            ),
+            (
+                "assign.set",
+                format!(r#"{{"uid":{uid},"overtime_work":-1}}"#),
+            ),
+            (
+                "assign.set",
+                format!(r#"{{"uid":{uid},"overtime_work":1000}}"#),
+            ),
+            ("assign.set", format!(r#"{{"uid":{uid},"contour":"Wavy"}}"#)),
+            (
+                "assign.set",
+                format!(r#"{{"uid":{uid},"contour":"Contoured"}}"#),
+            ),
+            ("assign.set", format!(r#"{{"uid":{uid},"contour":1.5}}"#)),
+            ("assign.set", format!(r#"{{"uid":{uid},"actual_work":-1}}"#)),
+            (
+                "assign.set",
+                format!(r#"{{"uid":{uid},"actual_work":1000}}"#),
+            ),
+            (
+                "assign.set",
+                format!(r#"{{"uid":{uid},"percent_work_complete":50.5}}"#),
+            ),
+            (
+                "assign.set",
+                format!(r#"{{"uid":{uid},"percent_work_complete":"half"}}"#),
+            ),
+            (
+                "assign.set",
+                format!(r#"{{"uid":{uid},"percent_work_complete":101}}"#),
+            ),
+            (
+                "assign.set",
+                format!(r#"{{"uid":{uid},"actual_work":1,"percent_work_complete":10}}"#),
             ),
             ("assign.del", r#"{"uid":99}"#.to_string()),
             ("assign.get", r#"{"uid":99}"#.to_string()),

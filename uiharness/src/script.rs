@@ -57,9 +57,9 @@
 //! |---|---|
 //! | `border A1:C5 solid teal` | the pixels ([`crate::expect`]) |
 //! | `no border H20 teal` | the pixels |
-//! | `<key> is [not] <value>` | one key of the app's state reply |
+//! | `<key> is [not] [exactly] <value>` | one key of the app's state reply |
 //! | `<key> is [not] {<verb>.<path>}` | that key against a field of the verb's last reply in the case |
-//! | `cell B2 is [not] <text>` | what that cell shows |
+//! | `cell B2 is [not] [exactly] <text>` | what that cell shows |
 //! | `no fill preview` | `filling` and `fill_preview` together |
 //! | `cells unchanged` | every cell of the last `snapshot` |
 //!
@@ -158,12 +158,15 @@ pub enum Assertion {
     State {
         key: String,
         negated: bool,
+        /// `is exactly`: compared as written, case and spaces included.
+        exact: bool,
         value: String,
     },
     /// What a cell shows.
     Cell {
         cell: String,
         negated: bool,
+        exact: bool,
         value: String,
     },
     /// No fill is armed and none is previewed.
@@ -603,26 +606,29 @@ fn parse_assertion(text: &str, line: usize) -> Result<Assertion, ScriptError> {
     {
         let (cell, rest) = split_word(rest.trim());
         let cell = validate_cell(cell).map_err(|e| err(line, e))?;
-        let (negated, value) = parse_is(rest, line, t)?;
+        let (negated, exact, value) = parse_is(rest, line, t)?;
         return Ok(Assertion::Cell {
             cell,
             negated,
+            exact,
             value,
         });
     }
     if subject.is_empty() {
         return Err(err(line, format!("'{t}' is not an expectation")));
     }
-    let (negated, value) = parse_is(rest, line, t)?;
+    let (negated, exact, value) = parse_is(rest, line, t)?;
     Ok(Assertion::State {
         key: subject.to_string(),
         negated,
+        exact,
         value,
     })
 }
 
-/// The `is [not] <value>` tail the state and cell assertions share.
-fn parse_is(rest: &str, line: usize, whole: &str) -> Result<(bool, String), ScriptError> {
+/// The `is [not] [exactly] <value>` tail the state and cell assertions
+/// share: (negated, exact, value).
+fn parse_is(rest: &str, line: usize, whole: &str) -> Result<(bool, bool, String), ScriptError> {
     let (word, rest) = split_word(rest.trim());
     if !word.eq_ignore_ascii_case("is") {
         return Err(err(
@@ -640,13 +646,20 @@ fn parse_is(rest: &str, line: usize, whole: &str) -> Result<(bool, String), Scri
         negated = true;
         value = after_not.trim();
     }
+    // `exactly` compares the text as written (#1200): `Ab1` is not `ab1`.
+    let mut exact = false;
+    let (maybe_exactly, after_exactly) = split_word(value);
+    if maybe_exactly.eq_ignore_ascii_case("exactly") && !after_exactly.trim().is_empty() {
+        exact = true;
+        value = after_exactly.trim();
+    }
     if value.is_empty() {
         return Err(err(
             line,
             format!("'{whole}' does not say what to expect after 'is'"),
         ));
     }
-    Ok((negated, unquote(value).to_string()))
+    Ok((negated, exact, unquote(value).to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -654,7 +667,7 @@ fn parse_is(rest: &str, line: usize, whole: &str) -> Result<(bool, String), Scri
 // ---------------------------------------------------------------------------
 
 /// The region names, for an error message. Mirrors `harness::parse_region`.
-pub const REGION_WORDS: &str = "window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, filter-button:B";
+pub const REGION_WORDS: &str = "window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, ribbon-launch:Number, filter-button:B";
 
 /// A region name a script may use, normalized to the form the app's `rect`
 /// verb takes (`A1:C5` becomes `cell:A1:C5`).
@@ -731,6 +744,11 @@ pub fn validate_region(name: &str) -> Result<String, String> {
                 .ok_or("'ribbon-group' needs a group index")?;
             a.parse::<usize>()
                 .map_err(|_| "'ribbon-group' needs a numeric index")?;
+            Ok(full.clone())
+        }
+        "ribbon-launch" => {
+            arg.filter(|a| !a.is_empty())
+                .ok_or("'ribbon-launch' needs a group title, e.g. ribbon-launch:Number")?;
             Ok(full.clone())
         }
         "filter-button" => {
@@ -959,6 +977,7 @@ test a pointed range dashes
             Action::Assert(Assertion::State {
                 key: "range".to_string(),
                 negated: false,
+                exact: false,
                 value: "A1:C5".to_string()
             })
         );
@@ -1051,6 +1070,7 @@ test a pointed range dashes
             Assertion::State {
                 key: "cell".into(),
                 negated: false,
+                exact: false,
                 value: "Duration".into()
             }
         );
@@ -1059,6 +1079,7 @@ test a pointed range dashes
             Assertion::Cell {
                 cell: "C2".into(),
                 negated: false,
+                exact: false,
                 value: "3d".into()
             }
         );
@@ -1387,6 +1408,7 @@ test Smoke-Case
             Action::Assert(Assertion::State {
                 key: "editing".to_string(),
                 negated: true,
+                exact: false,
                 value: "true".to_string()
             })
         );
@@ -1395,7 +1417,44 @@ test Smoke-Case
             Action::Assert(Assertion::Cell {
                 cell: "B2".to_string(),
                 negated: true,
+                exact: false,
                 value: "12".to_string()
+            })
+        );
+    }
+
+    /// #1200: `is exactly` compares as written; a lone `exactly` is a value.
+    #[test]
+    fn an_exact_assertion_parses_and_a_lone_exactly_is_a_value() {
+        let s = parse_script(
+            "test t\n  assert edit is exactly \"Ab1 \"\n  assert cell A1 is not exactly ab\n  assert edit is exactly\n",
+        )
+        .unwrap();
+        assert_eq!(
+            s.cases[0].steps[0].action,
+            Action::Assert(Assertion::State {
+                key: "edit".to_string(),
+                negated: false,
+                exact: true,
+                value: "Ab1 ".to_string()
+            })
+        );
+        assert_eq!(
+            s.cases[0].steps[1].action,
+            Action::Assert(Assertion::Cell {
+                cell: "A1".to_string(),
+                negated: true,
+                exact: true,
+                value: "ab".to_string()
+            })
+        );
+        assert_eq!(
+            s.cases[0].steps[2].action,
+            Action::Assert(Assertion::State {
+                key: "edit".to_string(),
+                negated: false,
+                exact: false,
+                value: "exactly".to_string()
             })
         );
     }
@@ -1410,6 +1469,7 @@ test Smoke-Case
             Action::Assert(Assertion::Cell {
                 cell: "A1".to_string(),
                 negated: false,
+                exact: false,
                 value: "North West".to_string()
             })
         );
@@ -1483,6 +1543,7 @@ test Smoke-Case
             ("ribbon", "ribbon"),
             ("ribbon-flyout", "ribbon-flyout"),
             ("ribbon-group:6", "ribbon-group:6"),
+            ("ribbon-launch:Number", "ribbon-launch:Number"),
             ("filter-button:B", "filter-button:B"),
         ] {
             assert_eq!(validate_region(written).unwrap(), normalized, "{written}");
@@ -1500,5 +1561,6 @@ test Smoke-Case
         assert!(validate_region("galery").is_err());
         assert!(validate_region("ribbon-group").is_err());
         assert!(validate_region("ribbon-group:x").is_err());
+        assert!(validate_region("ribbon-launch").is_err());
     }
 }

@@ -452,8 +452,9 @@ impl Docxy {
         self.redo_only = false;
     }
 
-    /// Whether a menu-only item may run: not under an open dialog, which
-    /// covers the window, nor an open menu, as a click there could not.
+    /// Whether a menu-only item may run: not under an open dialog (Format
+    /// Cells among them, #1161), which covers the window, nor an open menu,
+    /// as a click there could not.
     fn menu_click_allowed(&self) -> bool {
         self.refuse_under_dialog().is_ok() && self.menu.is_none()
     }
@@ -1099,6 +1100,17 @@ mod tests {
         for chord in ["cmd-b", "cmd-y", "ctrl-f", "alt-cmd-f", "cmd-shift-c"] {
             assert_eq!(chord_role(&key(chord)), None, "{chord}");
         }
+    }
+
+    #[test]
+    fn cmd_1_is_not_a_menu_bar_chord() {
+        // ⌘1 is the sheet's Format Cells (#1164): no menu item owns it, so
+        // it reaches `on_key`, which reads Cmd as Ctrl, and `sheet_key`.
+        assert_eq!(chord_role(&key("cmd-1")), None);
+        assert_eq!(
+            crate::text_input::route(&key("cmd-1"), false, true, true),
+            crate::text_input::Route::AppPropagate
+        );
     }
 
     #[test]

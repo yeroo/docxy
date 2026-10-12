@@ -139,6 +139,11 @@ pub(crate) enum DialogOwner {
     /// The alert a typed entry that breaks its cell's rule raises (#687); its
     /// presses are handled in `sheet_validation::alert_click`.
     DataValidationAlert,
+    /// Excel's Format Cells (#1165) over the selection of `sheet`. OK
+    /// applies in `sheet_format_cells::click`.
+    FormatCells {
+        sheet: usize,
+    },
     /// A filter button's drop-down on absolute column `col` of `sheet`'s
     /// AutoFilter (#690); its buttons apply in `sheet_filter::click`.
     FilterMenu {

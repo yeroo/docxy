@@ -1,0 +1,780 @@
+# GENERATED from suite/docxy/src/dialog/catalog/entries.rs by
+# `UPDATE_INPUTS_TYPING=1 cargo test --manifest-path suite/Cargo.toml
+# inputs_typing_case_is_current`; do not edit by hand (#1029).
+#
+# Every editable field of every sheet dialog, typed into with real keys
+# only: `real-key` and `real-type` go through the window's own input
+# path, and the field is focused by a real click or by Tab. A test is
+# one field and one step, named `<surface> <dialog>/<field>: <step>`.
+# See qa/inputs-typing.md.
+
+test sheet format-cells: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet format-cells/category: focus by click
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Number"}
+  call pointer-click {"dialog-control":"category"}
+  call field-read {"dialog-field":"category"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet format-cells/category: Up and Down step
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Number"}
+  call real-key {"key":"tab","to-field":"category"}
+  call field-read {"dialog-field":"category"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"category"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"category"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"category"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet format-cells/decimals: focus by click
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Number"}
+  call pointer-click {"dialog-field":"decimals"}
+  call field-read {"dialog-field":"decimals"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet format-cells/decimals: focus by Tab
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Number"}
+  call real-key {"key":"tab","to-field":"decimals"}
+  call field-read {"dialog-field":"decimals"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet format-cells/decimals: types
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Number"}
+  call pointer-click {"dialog-field":"decimals"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"3"}
+  call field-read {"dialog-field":"decimals"}
+  assert reply.value is 3
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test sheet format-cells/decimals: edits
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Number"}
+  call pointer-click {"dialog-field":"decimals"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"decimals"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"decimals"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"decimals"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"decimals"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"decimals"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet format-cells/decimals: select-all replaces
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Number"}
+  call pointer-click {"dialog-field":"decimals"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"decimals"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"decimals"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test sheet format-cells/decimals: pastes
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Number"}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"decimals"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"decimals"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test sheet format-cells/decimals: copies
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Number"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"decimals"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test sheet format-cells/decimals: OK applies
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Number"}
+  call pointer-click {"dialog-field":"decimals"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"3"}
+  call real-key {"key":"enter"}
+  assert dialog is not format-cells
+  call cell {"cell":"B2"}
+  assert reply.text is 10.000
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Number"}
+  call field-read {"dialog-field":"decimals"}
+  assert reply.value is 3
+  call real-key {"key":"escape"}
+
+test sheet format-cells/decimals: Escape cancels
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Number"}
+  call pointer-click {"dialog-field":"decimals"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not format-cells
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Number"}
+  call field-read {"dialog-field":"decimals"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test sheet format-cells/decimals: refuses invalid
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Number"}
+  call pointer-click {"dialog-field":"decimals"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"3"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"decimals"}
+  assert reply.value is 3
+  call real-key {"key":"escape"}
+
+test sheet format-cells/symbol: focus by click
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-tab":"Number"}
+  call pointer-click {"dialog-control":"symbol"}
+  call field-read {"dialog-field":"symbol"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet format-cells/symbol: Up and Down step
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-tab":"Number"}
+  call real-key {"key":"tab","to-field":"symbol"}
+  call field-read {"dialog-field":"symbol"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"symbol"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"symbol"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"symbol"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet format-cells/negative: focus by click
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Number"}
+  call pointer-click {"dialog-control":"negative"}
+  call field-read {"dialog-field":"negative"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet format-cells/negative: Up and Down step
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-tab":"Number"}
+  call real-key {"key":"tab","to-field":"negative"}
+  call field-read {"dialog-field":"negative"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"negative"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"negative"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"negative"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet format-cells/date-type: focus by click
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":4}
+  call pointer-click {"dialog-tab":"Number"}
+  call pointer-click {"dialog-control":"date-type"}
+  call field-read {"dialog-field":"date-type"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet format-cells/date-type: Up and Down step
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":4}
+  call pointer-click {"dialog-tab":"Number"}
+  call real-key {"key":"tab","to-field":"date-type"}
+  call field-read {"dialog-field":"date-type"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"date-type"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"date-type"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"date-type"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet format-cells/time-type: focus by click
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":5}
+  call pointer-click {"dialog-tab":"Number"}
+  call pointer-click {"dialog-control":"time-type"}
+  call field-read {"dialog-field":"time-type"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet format-cells/time-type: Up and Down step
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":5}
+  call pointer-click {"dialog-tab":"Number"}
+  call real-key {"key":"tab","to-field":"time-type"}
+  call field-read {"dialog-field":"time-type"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"time-type"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"time-type"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"time-type"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet format-cells/fraction-type: focus by click
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":7}
+  call pointer-click {"dialog-tab":"Number"}
+  call pointer-click {"dialog-control":"fraction-type"}
+  call field-read {"dialog-field":"fraction-type"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet format-cells/fraction-type: Up and Down step
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":7}
+  call pointer-click {"dialog-tab":"Number"}
+  call real-key {"key":"tab","to-field":"fraction-type"}
+  call field-read {"dialog-field":"fraction-type"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"fraction-type"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"fraction-type"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"fraction-type"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet format-cells/code: focus by click
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-tab":"Number"}
+  call pointer-click {"dialog-field":"code"}
+  call field-read {"dialog-field":"code"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet format-cells/code: focus by Tab
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-tab":"Number"}
+  call real-key {"key":"tab","to-field":"code"}
+  call field-read {"dialog-field":"code"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet format-cells/code: types
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-tab":"Number"}
+  call pointer-click {"dialog-field":"code"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"0.000"}
+  call field-read {"dialog-field":"code"}
+  assert reply.value is 0.000
+  assert reply.caret is 5
+  call real-key {"key":"escape"}
+
+test sheet format-cells/code: edits
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-tab":"Number"}
+  call pointer-click {"dialog-field":"code"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"code"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"code"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"code"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"code"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"code"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet format-cells/code: select-all replaces
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-tab":"Number"}
+  call pointer-click {"dialog-field":"code"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"code"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"code"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet format-cells/code: pastes
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-tab":"Number"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"code"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"code"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test sheet format-cells/code: copies
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-tab":"Number"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"code"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet format-cells/code: OK applies
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-tab":"Number"}
+  call pointer-click {"dialog-field":"code"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"0.000"}
+  call real-key {"key":"enter"}
+  assert dialog is not format-cells
+  call cell {"cell":"B2"}
+  assert reply.text is 10.000
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-tab":"Number"}
+  call field-read {"dialog-field":"code"}
+  assert reply.value is 0.000
+  call real-key {"key":"escape"}
+
+test sheet format-cells/code: Escape cancels
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-tab":"Number"}
+  call pointer-click {"dialog-field":"code"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not format-cells
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-tab":"Number"}
+  call field-read {"dialog-field":"code"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test sheet format-cells/codes: focus by click
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-tab":"Number"}
+  call pointer-click {"dialog-control":"codes"}
+  call field-read {"dialog-field":"codes"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet format-cells/codes: Up and Down step
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down","times":10}
+  call pointer-click {"dialog-tab":"Number"}
+  call real-key {"key":"tab","to-field":"codes"}
+  call field-read {"dialog-field":"codes"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"codes"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"codes"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"codes"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet format-cells/horizontal: focus by click
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Alignment"}
+  call pointer-click {"dialog-control":"horizontal"}
+  call field-read {"dialog-field":"horizontal"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet format-cells/horizontal: Up and Down step
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Alignment"}
+  call real-key {"key":"tab","to-field":"horizontal"}
+  call field-read {"dialog-field":"horizontal"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"horizontal"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"horizontal"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"horizontal"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet format-cells/color: focus by click
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Font"}
+  call pointer-click {"dialog-control":"color"}
+  call field-read {"dialog-field":"color"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet format-cells/color: Up and Down step
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Font"}
+  call real-key {"key":"tab","to-field":"color"}
+  call field-read {"dialog-field":"color"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"color"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"color"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"color"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test sheet format-cells/fill: focus by click
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Fill"}
+  call pointer-click {"dialog-control":"fill"}
+  call field-read {"dialog-field":"fill"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet format-cells/fill: Up and Down step
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert dialog is format-cells
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Fill"}
+  call real-key {"key":"tab","to-field":"fill"}
+  call field-read {"dialog-field":"fill"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"fill"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"fill"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"fill"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}

@@ -235,11 +235,9 @@ pub enum FormatValue {
 /// when explicitly reset to their default). `numFmt` still only round-trips
 /// when [`Xf::code`] carries the raw format string (as it does for anything
 /// [`apply_patch_to_xf`] itself wrote, or that the loader mapped via
-/// `crate::numfmt::builtin_code`); a cell whose non-General `numfmt`
-/// classification came from a built-in format id with no stored code string
-/// (outside `builtin_code`'s table) has no wire-representable `numFmt` and
-/// is silently skipped — a known, narrower, pre-existing gap, unrelated to
-/// this rule.
+/// `crate::numfmt::builtin_code`); every non-General builtin id now carries
+/// its code (#1279), so a code-less non-General xf can only come from an
+/// [`Xf`] built without [`Xf::set_code`], which is silently skipped.
 pub fn xf_format_fields(xf: &Xf) -> Vec<(&'static str, FormatValue)> {
     let default = Xf::default();
     let mut out = Vec::new();

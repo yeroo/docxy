@@ -54,6 +54,13 @@ const TEXT_WATERMARK: &[&str] = pick!("kind", 1);
 const CUSTOM_LABEL: &[&str] = pick!("product", 10);
 const RECORDS_FROM: &[&str] = pick!("records", 2);
 const WHOLE_NUMBER: &[&str] = pick!("allow", 1);
+// Format Cells' categories, from General (#1165).
+const NUMBER_CATEGORY: &[&str] = pick!("category", 1);
+const CURRENCY_CATEGORY: &[&str] = pick!("category", 2);
+const DATE_CATEGORY: &[&str] = pick!("category", 4);
+const TIME_CATEGORY: &[&str] = pick!("category", 5);
+const FRACTION_CATEGORY: &[&str] = pick!("category", 7);
+const CUSTOM_CATEGORY: &[&str] = pick!("category", 10);
 const WHOLE_NUMBER_MAX: &[&str] = &[
     r#"call real-key {"key":"tab","to-field":"allow"}"#,
     r#"call real-key {"key":"down"}"#,
@@ -99,6 +106,8 @@ const SORT_LIST: &str = "its list is read only with Order: Custom List... chosen
 // What OK shows.
 const ENVELOPE_ADDED: &str = "assert status is Envelope added: Size 10 (4 1/8 x 9 1/2 in)";
 const VALIDATION_APPLIED: &str = "assert status is Data validation applied";
+// B2 holds 10: three decimal places show it as 10.000.
+const B2_THREE_PLACES: &[&str] = &[r#"call cell {"cell":"B2"}"#, "assert reply.text is 10.000"];
 
 dialogs! {
     // ---- Word: Layout, Header & Footer, Insert -----------------------------
@@ -1109,6 +1118,42 @@ dialogs! {
             "key enter",
         ],
         fields: &[],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
+    FORMAT_CELLS = "format-cells" {
+        surface: Surface::Sheet,
+        file: "sheet-format",
+        fixture: XLSX,
+        open: &["click B2", r#"call ribbon-click {"tab":"Home","command":"Format"}"#],
+        fields: &[
+            dropdown("category").on("Number"),
+            Field::number("decimals", "3")
+                .on("Number")
+                .prep(NUMBER_CATEGORY)
+                .applied(B2_THREE_PLACES)
+                .kept("3"),
+            checkbox("thousands").on("Number"),
+            dropdown("symbol").on("Number").prep(CURRENCY_CATEGORY),
+            dropdown("negative").on("Number").prep(NUMBER_CATEGORY),
+            dropdown("date-type").on("Number").prep(DATE_CATEGORY),
+            dropdown("time-type").on("Number").prep(TIME_CATEGORY),
+            dropdown("fraction-type").on("Number").prep(FRACTION_CATEGORY),
+            Field::text("code")
+                .on("Number")
+                .sample("0.000")
+                .prep(CUSTOM_CATEGORY)
+                .applied(B2_THREE_PLACES)
+                .kept("0.000"),
+            dropdown("codes").on("Number").prep(CUSTOM_CATEGORY),
+            dropdown("horizontal").on("Alignment"),
+            checkbox("bold").on("Font"),
+            checkbox("italic").on("Font"),
+            dropdown("color").on("Font"),
+            dropdown("fill").on("Fill"),
+            checkbox("outline").on("Border"),
+        ],
         reopen: &[],
         accept_closes: true,
         unreachable: None,

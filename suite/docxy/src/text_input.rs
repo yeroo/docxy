@@ -51,6 +51,18 @@
 //! handler never accepts text input there ([`accepts_text_input`]), so the
 //! Windows IME stays off as it was.
 //!
+//! A replayed ⌥ key still carries ⌥. On macOS the document and the find bar
+//! type its character, but a dialog field swallows ⌥ keys, so the dialog is
+//! handed the plain typed key ⌥ made instead ([`modifier_char`], #1162). A
+//! Windows AltGr key (Ctrl+Alt) is swallowed there too, and its key-down
+//! cannot tell a character from an AltGr dead key, so under a dialog its
+//! debt is the dialog's ([`dialog_altgr`]): the WM_CHAR, which an AltGr dead
+//! key never sends, types the character while a dialog is open, and nothing
+//! once none is. Under load that WM_CHAR may land after keys typed after it
+//! ("a", AltGr+Q, "b" giving "ab@"), or in the next field after a Tab, as
+//! packet text may. (Only AltGr dead keys compose there: a plain dead key's
+//! accent is still typed into a dialog field.)
+//!
 //! Linux registers no handler: it would hand it every unhandled printable
 //! key, which `on_key` has already typed. Off macOS the root also leaves
 //! every key propagating, as it always has: on Windows a handled key-down is
@@ -235,6 +247,41 @@ pub(crate) fn char_stroke(c: char) -> Option<Keystroke> {
     })
 }
 
+/// The plain typed key a macOS key-down stands for when ⌥ made its
+/// character (#1162): ⌥ with no ⌃, ⌘ or Fn, as AppKit's commit of the key's
+/// own text replays it. `None` for any other key, and for every key off
+/// macOS: Windows' AltGr text reaches a dialog by its WM_CHAR instead
+/// ([`dialog_altgr`]). A dialog field types what this returns; `edit_key`
+/// swallows every other ⌥ key.
+pub(crate) fn modifier_char(ev: &KeyDownEvent, macos: bool) -> Option<Keystroke> {
+    let m = &ev.keystroke.modifiers;
+    if !(macos && m.alt && !m.control && !m.platform && !m.function) {
+        return None;
+    }
+    let mut chars = ev.keystroke.key_char.as_deref()?.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => char_stroke(c),
+        _ => None,
+    }
+}
+
+/// The keystroke an open dialog takes for a key-down: [`modifier_char`]'s
+/// plain typed key, else the key-down's own (#1162).
+pub(crate) fn dialog_stroke(ev: &KeyDownEvent, macos: bool) -> Keystroke {
+    modifier_char(ev, macos).unwrap_or_else(|| ev.keystroke.clone())
+}
+
+/// Whether a Windows key-down is AltGr under an open dialog (#1162):
+/// Ctrl+Alt that gpui flags as changing the character. The dialog swallows
+/// it, as it does every Alt key, and the key-down cannot tell a character
+/// from an AltGr dead key (whose accent then joins the next letter). So it
+/// owes no WM_CHAR ([`ImeState::typed_key`]), and the WM_CHAR, which only
+/// a character sends, types the character into the dialog.
+pub(crate) fn dialog_altgr(ev: &KeyDownEvent, dialog_open: bool) -> bool {
+    let m = &ev.keystroke.modifiers;
+    dialog_open && m.control && m.alt && !m.platform && ev.prefer_character_input
+}
+
 fn typed(keystroke: Keystroke) -> KeyDownEvent {
     KeyDownEvent {
         keystroke,
@@ -256,6 +303,9 @@ struct Debt {
     at: Instant,
     /// [`may_not_come`]: a newer debt's match drops it.
     may_not_come: bool,
+    /// An AltGr key a dialog swallowed ([`dialog_altgr`]): its WM_CHAR types
+    /// the character while a dialog is open, and nothing once none is.
+    dialog: bool,
 }
 
 /// The composition in progress and the key AppKit has been handed, and on
@@ -286,9 +336,22 @@ impl ImeState {
         self.pending = None;
     }
 
-    /// Windows: a key-down `on_key` typed at `now`; its WM_CHAR is on the
-    /// way, maybe behind the WM_CHARs of keys before it.
+    /// [`ImeState::typed_key`] with no dialog open.
+    #[cfg(test)]
     pub(crate) fn key_down(&mut self, ev: &KeyDownEvent, now: Instant) {
+        self.owe(ev, now, false);
+    }
+
+    /// Windows: a key-down `on_key` typed at `now`, `dialog_open` when it
+    /// was; its WM_CHAR is on the way, maybe behind the WM_CHARs of keys
+    /// before it. AltGr under a dialog, which `on_key` did not type
+    /// ([`dialog_altgr`]), owes the dialog: its WM_CHAR types the character
+    /// only while a dialog is still open.
+    pub(crate) fn typed_key(&mut self, ev: &KeyDownEvent, now: Instant, dialog_open: bool) {
+        self.owe(ev, now, dialog_altgr(ev, dialog_open));
+    }
+
+    fn owe(&mut self, ev: &KeyDownEvent, now: Instant, dialog: bool) {
         self.lapse(now);
         if let Some(text) = owed_text(ev) {
             if self.owed.len() == WM_CHAR_MAX_DEBTS {
@@ -298,6 +361,7 @@ impl ImeState {
                 text,
                 at: now,
                 may_not_come: may_not_come(ev),
+                dialog,
             });
         }
     }
@@ -315,9 +379,15 @@ impl ImeState {
     /// changes, and none is dropped: the character may be a packet's, ahead
     /// of the WM_CHARs older debts still wait for (an older AltGr debt among
     /// them). A character no debt starts with (a packet's) is typed and
-    /// leaves the debts as they are. Empty text (an IME message gpui
-    /// forwards) changes nothing.
-    pub(crate) fn char_message(&mut self, text: &str, now: Instant) -> Vec<KeyDownEvent> {
+    /// leaves the debts as they are. A character that pays a dialog's
+    /// AltGr debt is typed when `dialog_open`, else dropped (#1162). Empty
+    /// text (an IME message gpui forwards) changes nothing.
+    pub(crate) fn char_message(
+        &mut self,
+        text: &str,
+        now: Instant,
+        dialog_open: bool,
+    ) -> Vec<KeyDownEvent> {
         self.lapse(now);
         let mut keys = Vec::new();
         for c in text.chars() {
@@ -331,9 +401,12 @@ impl ImeState {
                 keys.extend(char_stroke(c).map(typed));
                 continue;
             };
-            let debt = &mut self.owed[i].text;
-            debt.drain(..c.len_utf8());
-            if debt.is_empty() {
+            let debt = &mut self.owed[i];
+            if debt.dialog && dialog_open {
+                keys.extend(char_stroke(c).map(typed));
+            }
+            debt.text.drain(..c.len_utf8());
+            if debt.text.is_empty() {
                 self.owed.remove(i);
             }
         }
@@ -414,10 +487,13 @@ impl Docxy {
             }
             Route::AppPropagate => {
                 self.ime.forget_key();
+                // Whether a dialog took the key is decided before on_key,
+                // which may close it.
+                let dialog_open = self.dialog_open();
                 self.on_key(ev, window, cx);
                 // After on_key, which may run long (a save): the debt's
                 // keeping time starts once the key is typed.
-                self.ime.key_down(ev, Instant::now());
+                self.ime.typed_key(ev, Instant::now(), dialog_open);
             }
             Route::MenuBar => self.ime.forget_key(),
         }
@@ -433,15 +509,21 @@ impl Docxy {
     /// typed only while the app takes it; under KeyTips or a menu its
     /// letters would be commands.
     pub(crate) fn windows_char(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let keys = self.ime.char_message(text, Instant::now());
+        let keys = self
+            .ime
+            .char_message(text, Instant::now(), self.dialog_open());
         if !keys.is_empty() && self.takes_text() {
             self.type_committed(keys, window, cx);
         }
     }
 
+    fn dialog_open(&self) -> bool {
+        self.active_dialogs().is_some_and(|d| d.is_open())
+    }
+
     fn takes_text(&self) -> bool {
         takes_text(
-            self.active_dialogs().is_some_and(|d| d.is_open()),
+            self.dialog_open(),
             self.keytips != crate::KeyTip::Off,
             self.menu.is_some(),
         )
@@ -895,6 +977,169 @@ mod tests {
         }
     }
 
+    /// An AltGr key-down as gpui reports it on Windows: Ctrl+Alt changed
+    /// ToUnicode's character.
+    fn altgr(key: &str, key_char: &str) -> KeyDownEvent {
+        KeyDownEvent {
+            prefer_character_input: true,
+            ..typed(stroke(key, Some(key_char), ctrl_alt()))
+        }
+    }
+
+    /// macOS (#1162): an ⌥ key with one printable character is the plain
+    /// typed key for that character, Shift kept for an upper-case one, and
+    /// ⌥Space's no-break space is a character, not Space.
+    #[test]
+    fn an_option_character_is_a_plain_typed_key_on_macos() {
+        let alt_shift = Modifiers {
+            shift: true,
+            ..alt()
+        };
+        for (k, want) in [
+            (stroke("g", Some("©"), alt()), plain("©", "©")),
+            (stroke("2", Some("™"), alt()), plain("™", "™")),
+            (stroke("`", Some("`"), alt()), plain("`", "`")),
+            (stroke("2", Some("€"), alt_shift), plain("€", "€")),
+            (
+                stroke("space", Some("\u{a0}"), alt()),
+                plain("\u{a0}", "\u{a0}"),
+            ),
+        ] {
+            assert_eq!(modifier_char(&typed(k.clone()), true), Some(want), "{k}");
+        }
+        let a_acute = modifier_char(&typed(stroke("y", Some("Á"), alt_shift)), true);
+        assert_eq!(a_acute, char_stroke('Á'));
+        assert_eq!(a_acute.and_then(|k| k.key_char).as_deref(), Some("Á"));
+    }
+
+    /// Windows (#1162): under a dialog an AltGr key, character or dead key
+    /// alike, owes the dialog, so the WM_CHAR a character sends types it
+    /// once while a dialog is open and a dead key's accent joins the next
+    /// letter as it should.
+    #[test]
+    fn altgr_under_a_dialog_is_typed_by_its_wm_char() {
+        let at = t0();
+        let mut ime = ImeState::default();
+        assert!(dialog_altgr(&altgr("e", "€"), true));
+        ime.typed_key(&altgr("e", "€"), at, true);
+        assert_eq!(ime.owed(), 1);
+        assert_eq!(key_chars(&ime.char_message("€", at, true)), ["€"]);
+        assert_eq!(ime.owed(), 0);
+        // AltGr+4 dead "~" sends WM_DEADCHAR; N then owes and pays "ñ".
+        let tilde = dead("4", "~", ctrl_alt());
+        assert!(dialog_altgr(&tilde, true));
+        ime.typed_key(&tilde, at, true);
+        ime.typed_key(&typed(plain("n", "ñ")), at, true);
+        assert!(ime.char_message("ñ", at, true).is_empty());
+        // The dead key's debt waits out the keep time, as in the document.
+        assert_eq!(ime.owed(), 1);
+        assert!(ime.char_message("x", ms(at, 61_000), true).len() == 1);
+        assert_eq!(ime.owed(), 0);
+        // With no dialog, the document's AltGr debt is kept as before.
+        assert!(!dialog_altgr(&altgr("e", "€"), false));
+        ime.typed_key(&altgr("e", "€"), at, false);
+        assert!(ime.char_message("€", at, true).is_empty());
+        assert_eq!(ime.owed(), 0);
+    }
+
+    /// Windows (#1162): an AltGr WM_CHAR that comes after the dialog closed
+    /// (gpui drained the Enter first) types nothing into the surface below,
+    /// and pays its debt. A packet with the debt's character pays it while
+    /// the dialog is open and is typed once; the key's own WM_CHAR then is
+    /// too, so both come out.
+    #[test]
+    fn a_late_altgr_wm_char_types_nothing_once_the_dialog_closed() {
+        let at = t0();
+        let mut ime = ImeState::default();
+        ime.typed_key(&altgr("q", "@"), at, true);
+        ime.typed_key(
+            &typed(stroke("enter", Some("\r"), Modifiers::default())),
+            at,
+            true,
+        );
+        assert!(ime.char_message("@", at, false).is_empty());
+        assert_eq!(ime.owed(), 0);
+        ime.typed_key(&altgr("q", "@"), at, true);
+        assert_eq!(key_chars(&ime.char_message("@", at, true)), ["@"]);
+        assert_eq!(key_chars(&ime.char_message("@", at, true)), ["@"]);
+        assert_eq!(ime.owed(), 0);
+    }
+
+    /// Only AltGr owes the dialog (#1162): plain keys, plain Alt
+    /// (WM_SYSCHAR), Ctrl+Alt that changed nothing and a Win chord keep
+    /// their debts, so their WM_CHAR is still not typed again.
+    #[test]
+    fn other_keys_under_a_dialog_keep_their_debts() {
+        let win_altgr = KeyDownEvent {
+            keystroke: stroke(
+                "e",
+                Some("€"),
+                Modifiers {
+                    platform: true,
+                    ..ctrl_alt()
+                },
+            ),
+            ..altgr("e", "€")
+        };
+        for (ev, wm_char) in [
+            (typed(plain("a", "a")), "a"),
+            (typed(stroke("g", Some("g"), alt())), "g"),
+            (dead("g", "g", alt()), "g"),
+            (typed(stroke("e", Some("€"), ctrl_alt())), "€"),
+            (dead("´", "´", Modifiers::default()), "´"),
+            (win_altgr, "€"),
+        ] {
+            assert!(!dialog_altgr(&ev, true), "{}", ev.keystroke);
+            let mut a = ImeState::default();
+            let mut b = ImeState::default();
+            a.typed_key(&ev, t0(), true);
+            b.key_down(&ev, t0());
+            assert_eq!(a.owed(), b.owed(), "{}", ev.keystroke);
+            assert_eq!(
+                key_chars(&a.char_message(wm_char, t0(), true)),
+                key_chars(&b.char_message(wm_char, t0(), true)),
+                "{}",
+                ev.keystroke
+            );
+        }
+    }
+
+    /// Keys whose modifiers made no character stay as they are (#1162):
+    /// ⌥ arrows, ⌥⌫ and ⌥Enter; ⌃⌥ and ⌘⌥ chords on macOS; and every key
+    /// off macOS, Windows' AltGr included (its WM_CHAR types it).
+    #[test]
+    fn keys_whose_modifiers_made_no_character_are_not_text() {
+        let fn_alt = Modifiers {
+            function: true,
+            ..alt()
+        };
+        let cmd_alt = Modifiers {
+            platform: true,
+            ..alt()
+        };
+        let mac = [
+            stroke("left", None, fn_alt),
+            stroke("backspace", Some("\u{8}"), alt()),
+            stroke("enter", Some("\r"), alt()),
+            stroke("g", Some("©"), ctrl_alt()),
+            stroke("g", Some("©"), cmd_alt),
+            stroke("g", Some("©"), fn_alt),
+            stroke("g", Some("g"), Modifiers::default()),
+            stroke("e", Some("´x"), alt()),
+            stroke("e", None, alt()),
+        ];
+        for k in &mac {
+            assert_eq!(modifier_char(&typed(k.clone()), true), None, "{k}");
+        }
+        for ev in [
+            typed(stroke("g", Some("©"), alt())),
+            typed(stroke("g", Some("g"), alt())),
+            altgr("e", "€"),
+        ] {
+            assert_eq!(modifier_char(&ev, false), None, "{}", ev.keystroke);
+        }
+    }
+
     /// A dead key's key-down as gpui reports it: ToUnicode was negative.
     fn dead(key: &str, key_char: &str, modifiers: Modifiers) -> KeyDownEvent {
         KeyDownEvent {
@@ -918,15 +1163,15 @@ mod tests {
         let mut ime = ImeState::default();
         let at = t0();
         ime.key_down(&typed(plain("a", "a")), at);
-        assert!(ime.char_message("a", ms(at, 1)).is_empty());
+        assert!(ime.char_message("a", ms(at, 1), false).is_empty());
         assert_eq!(ime.owed(), 0);
         // SendInput's KEYEVENTF_UNICODE: WM_CHAR alone.
-        assert_eq!(key_chars(&ime.char_message("Z", ms(at, 2))), ["Z"]);
-        assert_eq!(key_chars(&ime.char_message("é", ms(at, 3))), ["é"]);
+        assert_eq!(key_chars(&ime.char_message("Z", ms(at, 2), false)), ["Z"]);
+        assert_eq!(key_chars(&ime.char_message("é", ms(at, 3), false)), ["é"]);
         // A key's twin, then a packet.
         ime.key_down(&typed(plain("b", "b")), ms(at, 4));
-        assert!(ime.char_message("b", ms(at, 5)).is_empty());
-        assert_eq!(key_chars(&ime.char_message("é", ms(at, 6))), ["é"]);
+        assert!(ime.char_message("b", ms(at, 5), false).is_empty());
+        assert_eq!(key_chars(&ime.char_message("é", ms(at, 6), false)), ["é"]);
     }
 
     /// A WM_CHAR held behind a stall still finds its debt, up to
@@ -936,7 +1181,7 @@ mod tests {
         let mut ime = ImeState::default();
         let at = t0();
         ime.key_down(&typed(plain("a", "a")), at);
-        assert!(ime.char_message("a", ms(at, 1500)).is_empty());
+        assert!(ime.char_message("a", ms(at, 1500), false).is_empty());
         assert_eq!(ime.owed(), 0);
     }
 
@@ -949,9 +1194,9 @@ mod tests {
         ime.key_down(&typed(plain("a", "a")), at);
         ime.key_down(&typed(plain("b", "b")), ms(at, 1));
         assert_eq!(ime.owed(), 2);
-        assert!(ime.char_message("a", ms(at, 20)).is_empty());
-        assert!(ime.char_message("b", ms(at, 20)).is_empty());
-        assert_eq!(key_chars(&ime.char_message("é", ms(at, 21))), ["é"]);
+        assert!(ime.char_message("a", ms(at, 20), false).is_empty());
+        assert!(ime.char_message("b", ms(at, 20), false).is_empty());
+        assert_eq!(key_chars(&ime.char_message("é", ms(at, 21), false)), ["é"]);
     }
 
     /// The review's "éb": a packet é queued before a typed B, both
@@ -962,8 +1207,8 @@ mod tests {
         let mut ime = ImeState::default();
         let at = t0();
         ime.key_down(&typed(plain("b", "b")), at);
-        assert_eq!(key_chars(&ime.char_message("é", at)), ["é"]);
-        assert!(ime.char_message("b", at).is_empty());
+        assert_eq!(key_chars(&ime.char_message("é", at, false)), ["é"]);
+        assert!(ime.char_message("b", at, false).is_empty());
         assert_eq!(ime.owed(), 0);
     }
 
@@ -979,7 +1224,7 @@ mod tests {
         let mut typed_chars = Vec::new();
         for c in ["e", "t", "h", "e"] {
             typed_chars.extend(
-                key_chars(&ime.char_message(c, at))
+                key_chars(&ime.char_message(c, at, false))
                     .into_iter()
                     .map(str::to_string),
             );
@@ -993,7 +1238,7 @@ mod tests {
         let mut typed_chars = Vec::new();
         for c in ["b", "a", "b"] {
             typed_chars.extend(
-                key_chars(&ime.char_message(c, at))
+                key_chars(&ime.char_message(c, at, false))
                     .into_iter()
                     .map(str::to_string),
             );
@@ -1015,11 +1260,11 @@ mod tests {
             ime.key_down(&typed(plain(c, c)), at);
         }
         for c in &letters {
-            assert!(ime.char_message(c, at).is_empty(), "{c}");
+            assert!(ime.char_message(c, at, false).is_empty(), "{c}");
         }
         assert_eq!(ime.owed(), 0);
         ime.key_down(&typed(plain("a", "a")), at);
-        assert!(ime.char_message("a", ms(at, 10_000)).is_empty());
+        assert!(ime.char_message("a", ms(at, 10_000), false).is_empty());
     }
 
     /// An AltGr dead key then a letter it does not combine with: the
@@ -1033,12 +1278,12 @@ mod tests {
         assert!(may_not_come(&tilde));
         ime.key_down(&tilde, at);
         ime.key_down(&typed(plain("x", "~x")), at);
-        assert!(ime.char_message("~", at).is_empty());
-        assert!(ime.char_message("x", at).is_empty());
+        assert!(ime.char_message("~", at, false).is_empty());
+        assert!(ime.char_message("x", at, false).is_empty());
         // The dead key's accent waits out the keep time.
         assert_eq!(ime.owed(), 1);
         let later = at + WM_CHAR_KEEP + Duration::from_millis(1);
-        assert_eq!(key_chars(&ime.char_message("~", later)), ["~"]);
+        assert_eq!(key_chars(&ime.char_message("~", later, false)), ["~"]);
     }
 
     /// A packet "b" queued ahead of an AltGr € and a typed B: no match
@@ -1053,7 +1298,7 @@ mod tests {
         let mut typed_chars = Vec::new();
         for c in ["b", "€", "b"] {
             typed_chars.extend(
-                key_chars(&ime.char_message(c, at))
+                key_chars(&ime.char_message(c, at, false))
                     .into_iter()
                     .map(str::to_string),
             );
@@ -1073,13 +1318,13 @@ mod tests {
         ime.key_down(&acute, at);
         assert_eq!(ime.owed(), 0);
         ime.key_down(&typed(plain("e", "é")), ms(at, 100));
-        assert!(ime.char_message("é", ms(at, 101)).is_empty());
+        assert!(ime.char_message("é", ms(at, 101), false).is_empty());
         assert_eq!(ime.owed(), 0);
-        assert_eq!(key_chars(&ime.char_message("é", ms(at, 102))), ["é"]);
+        assert_eq!(key_chars(&ime.char_message("é", ms(at, 102), false)), ["é"]);
         // Typing on after it is typed once.
         for c in ["a", "b", "c"] {
             ime.key_down(&typed(plain(c, c)), ms(at, 103));
-            assert!(ime.char_message(c, ms(at, 104)).is_empty(), "{c}");
+            assert!(ime.char_message(c, ms(at, 104), false).is_empty(), "{c}");
         }
     }
 
@@ -1094,10 +1339,10 @@ mod tests {
         assert_eq!(owed_text(&tilde).as_deref(), Some("~"));
         ime.key_down(&tilde, at);
         ime.key_down(&typed(plain("n", "ñ")), at);
-        assert!(ime.char_message("ñ", at).is_empty());
+        assert!(ime.char_message("ñ", at, false).is_empty());
         assert_eq!(ime.owed(), 1);
         let later = at + WM_CHAR_KEEP + Duration::from_millis(1);
-        assert_eq!(key_chars(&ime.char_message("~", later)), ["~"]);
+        assert_eq!(key_chars(&ime.char_message("~", later, false)), ["~"]);
     }
 
     /// An unmatched debt goes after `WM_CHAR_KEEP`, and typing after it is
@@ -1114,9 +1359,9 @@ mod tests {
         }
         assert_eq!(ime.owed(), 3);
         for c in ["a", "b", "c"] {
-            assert!(ime.char_message(c, later).is_empty(), "{c}");
+            assert!(ime.char_message(c, later, false).is_empty(), "{c}");
         }
-        assert_eq!(key_chars(&ime.char_message("~", later)), ["~"]);
+        assert_eq!(key_chars(&ime.char_message("~", later, false)), ["~"]);
     }
 
     /// Debts are bounded where no WM_CHAR ever pays them (Linux, macOS).
@@ -1136,14 +1381,14 @@ mod tests {
     fn a_non_bmp_packet_is_one_typed_key() {
         let mut ime = ImeState::default();
         let at = t0();
-        let keys = ime.char_message("😀", at);
+        let keys = ime.char_message("😀", at, false);
         assert_eq!(key_chars(&keys), ["😀"]);
         assert_eq!(keys[0].keystroke.key, "😀");
         // And a key typing one owes one character, not two UTF-16 units.
         ime.key_down(&typed(plain("😀", "😀")), at);
         assert_eq!(ime.owed(), 1);
-        assert!(ime.char_message("😀", at).is_empty());
-        assert_eq!(key_chars(&ime.char_message("x", at)), ["x"]);
+        assert!(ime.char_message("😀", at, false).is_empty());
+        assert_eq!(key_chars(&ime.char_message("x", at, false)), ["x"]);
     }
 
     /// Keys that make no WM_CHAR owe nothing, so a packet after them types:
@@ -1170,13 +1415,13 @@ mod tests {
             assert_eq!(owed_text(&typed(k.clone())), None, "{k}");
             let mut ime = ImeState::default();
             ime.key_down(&typed(k.clone()), t0());
-            assert_eq!(key_chars(&ime.char_message("f", t0())), ["f"], "{k}");
+            assert_eq!(key_chars(&ime.char_message("f", t0(), false)), ["f"], "{k}");
         }
         let win_y = stroke("y", Some("y"), win);
         assert_eq!(owed_text(&typed(win_y.clone())).as_deref(), Some("y"));
         let mut ime = ImeState::default();
         ime.key_down(&typed(win_y), t0());
-        assert!(ime.char_message("y", t0()).is_empty());
+        assert!(ime.char_message("y", t0(), false).is_empty());
     }
 
     /// AltGr is Ctrl+Alt on Windows and its character comes as WM_CHAR, so
@@ -1187,7 +1432,7 @@ mod tests {
         let euro = stroke("e", Some("€"), ctrl_alt());
         assert_eq!(owed_text(&typed(euro.clone())).as_deref(), Some("€"));
         ime.key_down(&typed(euro), t0());
-        assert!(ime.char_message("€", t0()).is_empty());
+        assert!(ime.char_message("€", t0(), false).is_empty());
         assert_eq!(ime.owed(), 0);
     }
 
@@ -1200,12 +1445,12 @@ mod tests {
         ime.key_down(&dead("´", "´", Modifiers::default()), at);
         ime.key_down(&typed(plain("x", "´x")), at);
         assert_eq!(ime.owed(), 2);
-        assert!(ime.char_message("´", at).is_empty());
-        assert!(ime.char_message("x", at).is_empty());
+        assert!(ime.char_message("´", at, false).is_empty());
+        assert!(ime.char_message("x", at, false).is_empty());
         assert_eq!(ime.owed(), 0);
-        assert_eq!(key_chars(&ime.char_message("y", at)), ["y"]);
+        assert_eq!(key_chars(&ime.char_message("y", at, false)), ["y"]);
         ime.key_down(&typed(plain("a", "a")), at);
-        assert_eq!(key_chars(&ime.char_message("aé", at)), ["é"]);
+        assert_eq!(key_chars(&ime.char_message("aé", at, false)), ["é"]);
     }
 
     /// gpui forwards an IME message with no text as an empty commit: it
@@ -1214,11 +1459,11 @@ mod tests {
     fn an_empty_wm_char_changes_nothing() {
         let mut ime = ImeState::default();
         ime.key_down(&typed(plain("a", "a")), t0());
-        assert!(ime.char_message("", t0()).is_empty());
+        assert!(ime.char_message("", t0(), false).is_empty());
         assert_eq!(ime.owed(), 1);
-        assert!(ime.char_message("a", t0()).is_empty());
+        assert!(ime.char_message("a", t0(), false).is_empty());
         // Control characters are never typed.
-        assert!(ime.char_message("\u{8}", t0()).is_empty());
+        assert!(ime.char_message("\u{8}", t0(), false).is_empty());
     }
 
     /// The handler turns gpui's input method on only on macOS: the Windows

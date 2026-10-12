@@ -1,0 +1,189 @@
+# Home › Cells › Format opens the Format Cells dialog over the sheet (#1161,
+# #1165). While it is open it owns every key, as every dialog does (#393): Esc
+# cancels it, Return is its OK, and nothing else reaches the grid behind it. The keys
+# are real (`real-key`/`real-type`), so they take the window's own input path,
+# the one a person's keyboard takes. Run with:
+#
+#   cargo run -p uiharness -- run uiharness/cases/sheet-format-cells-keys.uit
+#
+# J1 is clear of the fixture's data (A1:C5) and its chart (B9:H21).
+
+test esc closes format cells
+  open copy:../fixtures/basic.xlsx
+  click J1
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert format_cells_open is true
+  call real-key {"key":"escape"}
+  assert format_cells_open is false
+  assert sel is J1
+  assert editing is false
+
+test return is format cells ok and moves nothing
+  open copy:../fixtures/basic.xlsx
+  click J1
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert format_cells_open is true
+  call real-key {"key":"enter"}
+  assert format_cells_open is false
+  assert sel is J1
+  assert editing is false
+
+test typing under format cells edits no cell
+  open copy:../fixtures/basic.xlsx
+  click J1
+  call ribbon-click {"tab":"Home","command":"Format"}
+  call real-type {"text":"zz"}
+  assert format_cells_open is true
+  assert editing is false
+  assert sel is J1
+  assert cell J1 is nothing
+  assert cell J2 is nothing
+  call real-key {"key":"escape"}
+  assert format_cells_open is false
+  assert editing is false
+  assert cell J1 is nothing
+
+test keys under format cells change nothing behind it
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type x
+  key enter
+  click J1
+  assert cell J1 is x
+  call ribbon-click {"tab":"Home","command":"Format"}
+  assert format_cells_open is true
+  call real-key {"key":"ctrl+z"}
+  assert cell J1 is x
+  call real-key {"key":"down"}
+  call real-key {"key":"right"}
+  assert sel is J1
+  call real-key {"key":"tab"}
+  assert sel is J1
+  call real-key {"key":"shift+tab"}
+  assert sel is J1
+  call real-key {"key":"delete"}
+  assert cell J1 is x
+  call real-key {"key":"backspace"}
+  assert editing is false
+  assert cell J1 is x
+  # Ctrl+1 under the dialog keeps it open. A leaked Ctrl+1 would only find
+  # it up, so this cannot show the key is swallowed: the dialog takes every
+  # key (#393), and `sheet_format_cells`' `opening_again_keeps_one_dialog`
+  # shows another open leaves the one dialog (#1164, #1165).
+  call real-key {"key":"ctrl+1"}
+  assert format_cells_open is true
+  assert cell J1 is x
+  call real-key {"key":"f10"}
+  assert keytips_up is false
+  call real-key {"key":"alt"}
+  assert keytips_up is false
+  assert cell J1 is x
+  assert sel is J1
+  assert editing is false
+  assert format_cells_open is true
+  call real-key {"key":"escape"}
+  assert format_cells_open is false
+  assert cell J1 is x
+
+test format cells keys work again once it is closed
+  open copy:../fixtures/basic.xlsx
+  click J1
+  call ribbon-click {"tab":"Home","command":"Format"}
+  call real-key {"key":"escape"}
+  call real-key {"key":"down"}
+  assert sel is J2
+  call real-type {"text":"zz"}
+  assert editing is true
+
+# Ctrl+1 opens Format Cells as in Excel (#1164); ⌘1 is the same key on a Mac,
+# where `on_key` reads ⌘ as Ctrl (a unit test pins that no menu takes ⌘1).
+
+test ctrl+1 opens format cells
+  open copy:../fixtures/basic.xlsx
+  click J1
+  assert format_cells_open is false
+  call real-key {"key":"ctrl+1"}
+  assert format_cells_open is true
+  call real-key {"key":"escape"}
+  assert format_cells_open is false
+  assert sel is J1
+  assert editing is false
+  assert cell J1 is nothing
+
+test ctrl+shift+1 ctrl+alt+1 and a plain 1 do not open format cells
+  open copy:../fixtures/basic.xlsx
+  click J1
+  call real-key {"key":"ctrl+shift+1"}
+  assert format_cells_open is false
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+alt+1"}
+  assert format_cells_open is false
+  assert cell J1 is nothing
+  call real-key {"key":"escape"}
+  assert editing is false
+  call real-type {"text":"1"}
+  assert format_cells_open is false
+  assert editing is true
+  call real-key {"key":"enter"}
+  assert cell J1 is 1
+
+test ctrl+1 while editing opens format cells and keeps the entry
+  open copy:../fixtures/basic.xlsx
+  click J1
+  call real-type {"text":"ab"}
+  assert editing is true
+  call real-key {"key":"ctrl+1"}
+  assert format_cells_open is true
+  assert editing is true
+  call real-key {"key":"escape"}
+  assert format_cells_open is false
+  assert editing is true
+  call real-key {"key":"enter"}
+  assert editing is false
+  assert cell J1 is ab
+
+# OK while the cell is being edited formats the cell and keeps the entry,
+# which Enter then writes in the new format (#1165).
+
+test format cells ok while editing formats the entry
+  open copy:../fixtures/basic.xlsx
+  click J1
+  call real-type {"text":"7"}
+  assert editing is true
+  call real-key {"key":"ctrl+1"}
+  assert format_cells_open is true
+  call real-key {"key":"tab","to-field":"category"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"decimals"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1"}
+  call real-key {"key":"enter"}
+  assert format_cells_open is false
+  assert editing is true
+  call real-key {"key":"enter"}
+  assert editing is false
+  call cell {"cell":"J1"}
+  assert reply.text is 7.0
+
+# The Home tab's Font, Alignment and Number launchers (↘) open it too, by a
+# real click on the launcher.
+
+test the home font alignment and number launchers open format cells
+  open copy:../fixtures/basic.xlsx
+  click J1
+  assert ribbon_tab is Home
+  call pointer-click {"region":"ribbon-launch:Number"}
+  assert format_cells_open is true
+  call real-key {"key":"escape"}
+  assert format_cells_open is false
+  call pointer-click {"region":"ribbon-launch:Font"}
+  assert format_cells_open is true
+  call real-key {"key":"escape"}
+  assert format_cells_open is false
+  call pointer-click {"region":"ribbon-launch:Alignment"}
+  assert format_cells_open is true
+  call real-key {"key":"escape"}
+  assert format_cells_open is false
+  assert sel is J1
+  assert cell J1 is nothing
+  call-error pointer-click {"region":"ribbon-launch:Styles"} => the ribbon group Styles draws no launcher

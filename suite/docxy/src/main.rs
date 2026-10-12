@@ -74,6 +74,7 @@ mod page_flow;
 mod page_number;
 mod page_setup;
 mod project;
+mod recent_files;
 mod recover;
 #[cfg(test)]
 mod ribbon_export;
@@ -102,6 +103,7 @@ mod sheet_fill;
 mod sheet_fill_tests;
 mod sheet_filter;
 mod sheet_flashfill;
+mod sheet_format_cells;
 mod sheet_goto;
 mod sheet_menus;
 #[cfg(test)]
@@ -926,6 +928,14 @@ fn numfmt_category(code: Option<&str>) -> &'static str {
             "Time"
         }
         "@" => "Text",
+        "\"$\"#,##0_);\\(\"$\"#,##0\\)"
+        | "\"$\"#,##0_);[Red]\\(\"$\"#,##0\\)"
+        | "\"$\"#,##0.00_);\\(\"$\"#,##0.00\\)"
+        | "\"$\"#,##0.00_);[Red]\\(\"$\"#,##0.00\\)" => "Currency",
+        "_(* #,##0_);_(* \\(#,##0\\);_(* \"-\"_);_(@_)"
+        | "_(\"$\"* #,##0_);_(\"$\"* \\(#,##0\\);_(\"$\"* \"-\"_);_(@_)"
+        | "_(* #,##0.00_);_(* \\(#,##0.00\\);_(* \"-\"??_);_(@_)"
+        | "_(\"$\"* #,##0.00_);_(\"$\"* \\(#,##0.00\\);_(\"$\"* \"-\"??_);_(@_)" => "Accounting",
         _ => "Custom",
     }
 }
@@ -1667,6 +1677,13 @@ fn stamp_edit_opts(tabs: &mut [DocTab], opts: EditOptions) {
 /// Is this Ctrl+Shift+U, which expands the sheet formula bar (#672)?
 fn fx_toggle_key(ctrl: bool, shift: bool, key: &str) -> bool {
     ctrl && shift && key.eq_ignore_ascii_case("u")
+}
+
+/// Is this Ctrl+1 (⌘1 on a Mac), which opens Format Cells (#1164)? Not with
+/// Shift, Excel's number-format row, nor with Alt: AltGr is Ctrl+Alt on
+/// Windows, and its `1` is a character.
+fn format_cells_key(key: &str, ctrl: bool, shift: bool, alt: bool) -> bool {
+    ctrl && !shift && !alt && key == "1"
 }
 
 /// The sheet a tab holds, with the app's Editing options stamped on it: what
@@ -4810,6 +4827,14 @@ struct Docxy {
     /// Why the last Clear failed, shown under the backstage row until the
     /// backstage reopens or a Clear succeeds (#895).
     trusted_error: Option<String>,
+    /// The Backstage Open page's Recent list (#1194), re-read when the
+    /// backstage opens and after this window records or removes a file:
+    /// never per frame.
+    recent_files: Vec<PathBuf>,
+    /// What the last Recent row click could not do (a file that is gone),
+    /// shown under the Recent heading until the backstage reopens: the tab
+    /// status is hidden behind the backstage, and there may be no tab.
+    recent_message: Option<String>,
     /// When the hot-exit state was last written by any `persist`, or an
     /// AutoRecover tick last found nothing to write: the timer's clock. A
     /// `Cell` because `persist` takes `&self`.
@@ -4846,6 +4871,10 @@ struct Docxy {
     /// not saved; No Markup and Original refuse edits.
     markup: docxcore::markup::MarkupView,
     comment_text: String,
+    /// The document the comment entry bar or a ruler drag was started on
+    /// (#1286), named as `selected_comment` names it: a change of active
+    /// tab to any other document cancels both (`drop_grid_state`).
+    doc_entry_tab: Option<close::TabId>,
     // Show formatting marks (¶, tab arrows) — View ▸ Show/Hide.
     show_marks: bool,
     // Comments review side panel (View / Review ▸ Comments).
@@ -4983,16 +5012,16 @@ struct Docxy {
     // buffer opens, cleared with it.
     sheet_comment_seed: Option<String>,
     // The cell (sheet index, row, col) the bar opened on: the label, Enter,
-    // Save and the exit commit all target it, so a click that moves the
-    // selection while the bar is open does not move the note. Set with the
-    // seed, cleared with it.
+    // Save and the exit commit all target it. A cell click, right-click,
+    // Previous/Next Comment or a row/column insert/delete commits a changed
+    // buffer to it and closes the bar first; the anchor still matters for
+    // moves that leave the bar open (header clicks, the Name Box, Go To) and
+    // for the exit commit. Set with the seed, cleared with it.
     sheet_comment_cell: Option<(usize, u32, u32)>,
     // Whether the data-validation list dropdown is open on the selected cell.
     sheet_dv_open: bool,
     // Whether the Number-group format picker strip is open.
     sheet_numfmt_open: bool,
-    // Whether the consolidated Format Cells panel is open.
-    sheet_fmt_open: bool,
     // In-progress conditional-formatting rule entry (the value buffer, e.g. ">500").
     sheet_cf_edit: Option<String>,
     // In-progress row-height entry (points, or "auto").
@@ -7600,6 +7629,26 @@ fn effective_mode(path: &std::path::Path, mode: OpenMode) -> OpenMode {
     }
 }
 
+/// The file an open leaves a tab bound to, which becomes the newest recent
+/// file (#1194): none for an untitled tab (a template opens untitled, as a
+/// new document from it does in Word) or one whose load failed (Word lists
+/// no file it could not open).
+fn records_open(tab: &DocTab) -> Option<PathBuf> {
+    tab.path.clone().filter(|_| !tab.load_failed)
+}
+
+/// The kind of tab `path` opens as: the Recent list's glyph and the
+/// harness's `kind`.
+fn path_kind(path: &std::path::Path) -> Kind {
+    if is_project_path(path) {
+        Kind::Project
+    } else if is_sheet_path(path) {
+        Kind::Xlsx
+    } else {
+        Kind::Docx
+    }
+}
+
 /// A document tab for `path` opened in `mode`: Recover Text from Any File
 /// (#633) opens its recovered text; every other mode opens it as usual. A
 /// downloaded document opens in Protected View, as a workbook does (#610),
@@ -7919,6 +7968,7 @@ fn fx_edit_row(
     sel_from: Option<usize>,
     expanded: bool,
     ent: &Entity<Docxy>,
+    probe: AnyElement,
 ) -> AnyElement {
     let cc = caret.min(text.chars().count());
     let bar = || div().w(px(1.5)).h(px(13.)).bg(hsla_u(BRAND)).flex_none();
@@ -7946,7 +7996,7 @@ fn fx_edit_row(
             }
             col = col.child(row);
         }
-        return col.into_any_element();
+        return col.relative().child(probe).into_any_element();
     }
     let mut row = h_flex().flex_1().h_full().items_center();
     let mut placed = false;
@@ -7970,7 +8020,7 @@ fn fx_edit_row(
     if !placed {
         row = row.child(bar());
     }
-    row.into_any_element()
+    row.relative().child(probe).into_any_element()
 }
 
 /// The wash an AutoComplete proposal's suffix is drawn in: selected text.
@@ -7978,6 +8028,31 @@ fn proposal_bg() -> Hsla {
     Hsla {
         a: 0.25,
         ..hsla_u(BRAND)
+    }
+}
+
+/// What the Name Box at the formula bar's left shows: the selected range, or
+/// the active cell. Drawn and read by `field-read` (#1200) alike.
+fn name_box_text(view: &SheetView) -> String {
+    use gridcore::sheet::cell_name;
+    if view.has_range() {
+        let (r0, c0, r1, c1) = view.range();
+        format!("{}:{}", cell_name(r0, c0), cell_name(r1, c1))
+    } else {
+        cell_name(view.sel.0, view.sel.1)
+    }
+}
+
+/// What the formula bar shows for the active cell while no entry is open: a
+/// formula with its `=`, else the cell's text. Drawn and read by
+/// `field-read` (#1200) alike.
+fn fx_bar_text(view: &SheetView) -> String {
+    let (r, c) = view.sel;
+    match view.sheet().cell(r, c) {
+        Some(cell) if cell.formula.is_some() => {
+            format!("={}", cell.formula.as_deref().unwrap_or_default())
+        }
+        _ => view.cell_text(r, c),
     }
 }
 
@@ -11790,6 +11865,8 @@ impl Docxy {
             drafts: Vec::new(),
             trusted_count: 0,
             trusted_error: None,
+            recent_files: Vec::new(),
+            recent_message: None,
             last_persist: std::cell::Cell::new(std::time::Instant::now()),
             applied: None,
             os_appearance: gpui::WindowAppearance::Light,
@@ -11806,6 +11883,7 @@ impl Docxy {
             selected_comment: None,
             markup: Default::default(),
             comment_text: String::new(),
+            doc_entry_tab: None,
             show_marks: false,
             show_comments: false,
             show_nav: false,
@@ -11863,7 +11941,6 @@ impl Docxy {
             sheet_comment_cell: None,
             sheet_dv_open: false,
             sheet_numfmt_open: false,
-            sheet_fmt_open: false,
             sheet_cf_edit: None,
             sheet_rowh_edit: None,
             bar_field: None,
@@ -12007,12 +12084,14 @@ impl Docxy {
         self.refresh_drafts(cx);
         self.trusted_count = trusted::count(&config_root());
         self.trusted_error = None;
+        self.recent_files = recent_files::list(&config_root());
+        self.recent_message = None;
         cx.notify();
     }
 
-    /// A dialog or the more-tabs list owns the key before any surface sees
-    /// it (#393): true when one took it. (An open menu is `on_key`'s next
-    /// check, `menu_key`.)
+    /// A dialog (Format Cells among them, #1161, #1165) or the more-tabs list
+    /// owns the key before any surface sees it (#393): true when one took it.
+    /// (An open menu is `on_key`'s next check, `menu_key`.)
     fn modal_takes_key(
         &mut self,
         ev: &KeyDownEvent,
@@ -12020,11 +12099,14 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) -> bool {
         // An open dialog takes every key first (#393): nothing under it, not
-        // the tab list, KeyTips or a Project shortcut, may see one.
+        // the tab list, KeyTips or a Project shortcut, may see one. A
+        // character ⌥ made on macOS reaches it as plain typing, since a field
+        // swallows ⌥ keys (#1162); Windows' AltGr text comes by WM_CHAR.
+        let stroke = text_input::dialog_stroke(ev, text_input::MACOS);
         if self.dialog_takes_key(
-            &ev.keystroke.key,
-            ev.keystroke.key_char.as_deref(),
-            ev.keystroke.modifiers,
+            &stroke.key,
+            stroke.key_char.as_deref(),
+            stroke.modifiers,
             window,
             cx,
         ) {
@@ -12540,7 +12622,7 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.open_path(path, OpenMode::ReadOnly, Reopen::Ask) {
+        match self.open_path_recording(path, OpenMode::ReadOnly, Reopen::Ask, false) {
             Ok(true) => {
                 if self.tabs.get(self.active).is_some_and(draft_loaded) {
                     self.set_status(DRAFT_OPENED);
@@ -13249,6 +13331,13 @@ impl Docxy {
         chart_panel_shown(self.panel_chart, self.chart_count())
     }
 
+    /// The active tab as a [`close::TabId`], as `selected_comment` keeps it.
+    fn active_tab_id(&self) -> Option<close::TabId> {
+        self.tabs
+            .get(self.active)
+            .map(|t| (t.title.clone(), t.path.clone()))
+    }
+
     /// Everything the UI holds that points INTO one grid: the chart selection
     /// and panel field, the open entry bar, a fill drag, a formula's pick. The
     /// moment the grid under them changes — another sheet, another tab, a sheet
@@ -13272,6 +13361,18 @@ impl Docxy {
         // A drag by the selection's border, or a drop waiting on its menu or
         // question, belongs to the grid it started on (#707 r2 M4).
         self.drops.clear();
+        // The comment entry bar and a ruler drag belong to the document
+        // they started on. Carried into another tab, Enter would comment
+        // on its selection and the drag would apply the old document's
+        // geometry to its paragraph (#1286). A click on the tab already
+        // in front, or the close of a background tab, keeps them.
+        if self.doc_entry_tab.is_some() && self.doc_entry_tab != self.active_tab_id() {
+            self.comment_open = false;
+            self.comment_text.clear();
+            self.ruler_drag = None;
+            self.ruler_guide = None;
+            self.doc_entry_tab = None;
+        }
     }
 
     /// A right-button release anywhere in the window. Over the grid its own
@@ -14108,6 +14209,7 @@ impl Docxy {
     /// reproduced this body instead of calling it would keep passing after this
     /// one changed.
     fn grid_press_cell(&mut self, cell: (u32, u32), ctrl: bool, _cx: &mut Context<Self>) {
+        self.sheet_comment_bar_leave();
         self.drag_ctrl = ctrl;
         if self.formula_pick_active() {
             // Anchor the reference on the pressed cell, with the buffer as it
@@ -14140,6 +14242,12 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // `grid_press_cell` leaves the bar on the press, but the pointer
+        // never reaches it on sheets with frozen rows (`cell_at` refuses
+        // them); a click on the cell still runs here, so it leaves the bar
+        // too (a no-op when the press already closed it). A drag fires no
+        // click: there the press's leave is the only one.
+        self.sheet_comment_bar_leave();
         if shift {
             self.extend_to(r, c, cx)
         } else if ctrl && !self.formula_pick_active() && !self.range_field_active() {
@@ -14190,6 +14298,7 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.sheet_comment_bar_leave();
         let inside = self.active_sheet().is_some_and(|v| {
             let (r1, c1, r2, c2) = sel_range(v.sel, v.anchor);
             (r1..=r2).contains(&r) && (c1..=c2).contains(&c)
@@ -14324,6 +14433,11 @@ impl Docxy {
                 .ok_or_else(|| "the ribbon's groups are not shown".to_string()),
             Region::RibbonFlyout => lookup(&self.probes.borrow(), "ribbon-flyout")
                 .ok_or_else(|| "no ribbon flyout is open".to_string()),
+            Region::RibbonLaunch(title) => lookup(
+                &self.probes.borrow(),
+                &harness::region_name(region),
+            )
+            .ok_or_else(|| format!("the ribbon group {title}'s launcher is not drawn")),
             Region::RibbonGroup(i) => {
                 let now = self.ribbon_fit_now(window);
                 let title = now
@@ -15513,6 +15627,7 @@ impl Docxy {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
+        let prev = tab.path.clone();
         let decision = save_decision(tab, self.harness, explicit_save_as);
         match decision {
             SaveDecision::InPlace(path) => {
@@ -15538,6 +15653,7 @@ impl Docxy {
                     "This project could not be loaded and cannot be saved".into()
             }
         }
+        self.note_recent_if_moved(prev);
         self.backstage = false;
         self.bs_new = false;
         self.bs_export = false;
@@ -16494,9 +16610,11 @@ impl Docxy {
     /// Open the comment entry bar for the selected cell, seeded with its
     /// existing comment text (so New Comment doubles as Edit). The bar
     /// remembers the cell it opened on — the anchor — alongside the seed:
-    /// the selection moves freely while the bar is open, and the label,
-    /// Enter and an exit commit all target the anchor, not the live
-    /// selection.
+    /// the label, Enter and an exit commit all target the anchor, not the
+    /// live selection, and a cell click, right-click, Previous/Next Comment
+    /// or a row/column insert/delete commits a changed buffer to the anchor
+    /// and closes the bar first. Selection moves that leave the bar open
+    /// (header clicks, the Name Box, Go To) still never move the note.
     fn sheet_new_comment(&mut self, cx: &mut Context<Self>) {
         if let Some(v) = self.active_sheet() {
             let cell = (v.active, v.sel.0, v.sel.1);
@@ -16514,6 +16632,37 @@ impl Docxy {
         self.sheet_comment_edit = None;
         self.sheet_comment_seed = None;
         self.sheet_comment_cell = None;
+    }
+
+    /// Leave the comment bar as Excel leaves a note being edited when the
+    /// selection moves or rows/columns shift: a changed buffer commits to the
+    /// anchor cell (the exit commit's rules — an untouched bar, or one whose
+    /// text the anchor's note already holds, writes nothing), then the bar
+    /// closes. No-op when the bar is closed. A cell click, right-click,
+    /// Previous/Next Comment and a row/column insert/delete all leave it;
+    /// the window-close exit commit (`commit_dialog_buffers_for_exit`) is
+    /// this same leave.
+    pub(crate) fn sheet_comment_bar_leave(&mut self) {
+        let Some(text) = self.sheet_comment_edit.clone() else {
+            return;
+        };
+        // The seed and anchor open with the buffer (sheet_new_comment): both
+        // fallbacks are unreachable.
+        let seed = self
+            .sheet_comment_seed
+            .clone()
+            .unwrap_or_else(|| self.selected_comment().unwrap_or_default());
+        let cell = self
+            .sheet_comment_cell
+            .or_else(|| self.active_sheet().map(|v| (v.active, v.sel.0, v.sel.1)));
+        self.sheet_comment_bar_close();
+        let Some(cell) = cell else {
+            return;
+        };
+        let author = self.comment_author();
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            crate::close::commit_comment_buffer_for_exit(t, cell, &seed, &author, &text);
+        }
     }
 
     /// Route a keystroke into the conditional-format entry bar; Enter applies the
@@ -16676,6 +16825,7 @@ impl Docxy {
 
     /// Move the selection to the next / previous commented cell (row-major).
     fn sheet_comment_nav(&mut self, forward: bool, cx: &mut Context<Self>) {
+        self.sheet_comment_bar_leave();
         if let Some(v) = self.active_sheet_mut() {
             let mut cells: Vec<(u32, u32)> = v
                 .pkg
@@ -16887,6 +17037,7 @@ impl Docxy {
     /// Insert/delete every row or column the selection touches (Home ▸
     /// Cells), then rebuild the recalc engine so shifted formulas re-evaluate.
     fn sheet_structural(&mut self, op: StructOp, cx: &mut Context<Self>) {
+        self.sheet_comment_bar_leave();
         if self
             .active_sheet_mut()
             .is_some_and(|v| v.structural_edit(op))
@@ -18272,6 +18423,17 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// Home › Cells › Format, Ctrl+1 and the Home launchers: Format Cells
+    /// over the selection (#1165). Another press leaves the one that is up.
+    fn sheet_format_cells(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            if let Err(e) = sheet_format_cells::open(tab) {
+                tab.status = e.into();
+            }
+        }
+        cx.notify();
+    }
+
     /// Data › Data Validation: the dialog over the selection (#689).
     fn sheet_data_validation(&mut self, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
@@ -18584,10 +18746,7 @@ impl Docxy {
                 }
                 cx.notify();
             }
-            SheetAct::FormatCells => {
-                self.sheet_fmt_open = true;
-                cx.notify();
-            }
+            SheetAct::FormatCells => self.sheet_format_cells(cx),
             SheetAct::Merge => self.sheet_merge_toggle(cx),
             SheetAct::WrapText => self.sheet_toggle_wrap(cx),
             SheetAct::RowHeight => {
@@ -18951,6 +19110,7 @@ impl Docxy {
             // rest of the block acts on the document or the window, not on
             // the selection.
             if matches!(key, "c" | "x" | "v" | "a" | "b" | "i")
+                || format_cells_key(key, ctrl, shift, alt)
                 || (shift && matches!(key, "p" | "k"))
             {
                 self.chart_hand_back(cx);
@@ -18975,6 +19135,10 @@ impl Docxy {
                 "y" => self.sheet_redo_or_repeat(cx),
                 "b" => return self.run_sheet_act(SheetAct::Bold, window, cx),
                 "i" => return self.run_sheet_act(SheetAct::Italic, window, cx),
+                // Format Cells (#1164), Home › Cells › Format's own act.
+                "1" if format_cells_key(key, ctrl, shift, alt) => {
+                    return self.run_sheet_act(SheetAct::FormatCells, window, cx);
+                }
                 // Insert a PivotTable for the selection (also on the Insert ribbon).
                 "p" if shift => return self.run_sheet_act(SheetAct::InsertPivot, window, cx),
                 // Insert a chart of the selection (also on the Insert ribbon).
@@ -19817,7 +19981,9 @@ impl Docxy {
                 },
             },
         };
+        let prev = self.tabs[self.active].path.clone();
         let saved = save_doc_tab(&mut self.tabs[self.active], target);
+        self.note_recent_if_moved(prev);
         self.backstage = false;
         self.bs_new = false;
         self.bs_export = false;
@@ -19836,6 +20002,7 @@ impl Docxy {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
+        let prev = tab.path.clone();
         let start = doc_import::save_start_dir_of(tab);
         let pick = |suggested| {
             macos_menu::native_modal(|| {
@@ -19861,6 +20028,7 @@ impl Docxy {
         }) {
             return self.refocus(window, cx);
         }
+        self.note_recent_if_moved(prev);
         self.backstage = false;
         self.bs_new = false;
         self.bs_export = false;
@@ -19882,7 +20050,9 @@ impl Docxy {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return false;
         };
+        let prev = tab.path.clone();
         let saved = save_sheet_to(tab, target);
+        self.note_recent_if_moved(prev);
         self.backstage = false;
         self.bs_new = false;
         self.bs_export = false;
@@ -19906,7 +20076,9 @@ impl Docxy {
             self.refocus(window, cx);
             return Err(self.tabs[self.active].status.to_string());
         }
+        let prev = self.tabs[self.active].path.clone();
         let result = apply_save(&mut self.tabs[self.active], target);
+        self.note_recent_if_moved(prev);
         self.backstage = false;
         self.bs_new = false;
         self.bs_export = false;
@@ -20048,11 +20220,26 @@ impl Docxy {
     /// `Ok(true)` when a file was loaded, `Ok(false)` when an open tab was
     /// only focused or asked about. `Err` only when Open as Copy could not
     /// write the copy; nothing opens.
+    ///
+    /// The tab it leaves bound to a file is the newest recent file (#1194),
+    /// unless its load failed; a reopen that only asks records nothing.
     fn open_path(
         &mut self,
         path: &std::path::Path,
         mode: OpenMode,
         reopen: Reopen,
+    ) -> Result<bool, String> {
+        self.open_path_recording(path, mode, reopen, true)
+    }
+
+    /// [`Self::open_path`], recording the file in the recent list only with
+    /// `recent`: a kept AutoRecover draft is not a file the person opened.
+    fn open_path_recording(
+        &mut self,
+        path: &std::path::Path,
+        mode: OpenMode,
+        reopen: Reopen,
+        recent: bool,
     ) -> Result<bool, String> {
         self.project_prompt_cancel();
         let path = path.to_path_buf();
@@ -20069,15 +20256,19 @@ impl Docxy {
         let trusted = trusted::TrustStore::load(&config_root());
         let Some(i) = open else {
             let tab = tab_from_path_mode(&path, mode, &trusted)?;
+            let opened = records_open(&tab).filter(|_| recent);
             self.cancel_highlight_mode();
             self.tabs.push(tab);
             self.active = self.tabs.len() - 1;
+            if let Some(p) = opened {
+                self.note_recent(&p);
+            }
             return Ok(true);
         };
         self.cancel_highlight_mode();
         self.active = i;
         let tab = &self.tabs[i];
-        Ok(match reopen_step(reopen, tab.dirty, tab.access, mode) {
+        let loaded = match reopen_step(reopen, tab.dirty, tab.access, mode) {
             ReopenStep::Reload => {
                 self.tabs[i] = tab_from_path_mode(&path, mode, &trusted)?;
                 // Nor a flyout opened on the document it replaces (#1020).
@@ -20088,10 +20279,58 @@ impl Docxy {
             }
             ReopenStep::Ask => {
                 self.tabs[i].dialogs.push(reopen_dialog(&path, mode));
-                false
+                return Ok(false);
             }
             ReopenStep::Focus => false,
-        })
+        };
+        if let Some(p) = records_open(&self.tabs[i]).filter(|_| recent) {
+            self.note_recent(&p);
+        }
+        Ok(loaded)
+    }
+
+    /// Record `path` as the newest recent file (#1194) and re-read the
+    /// Backstage's list. A store that cannot be written is not worth a
+    /// status: the list just misses the file.
+    fn note_recent(&mut self, path: &std::path::Path) {
+        let root = config_root();
+        let _ = recent_files::note(&root, path);
+        self.recent_files = recent_files::list(&root);
+    }
+
+    /// After a save of the active tab, which was bound to `prev`: a Save As
+    /// or a first save records the tab's new file; a Save in place does not
+    /// (#1194). Only `impl Docxy` records, never the free writers, which unit
+    /// tests call with no `DOCXY_CONFIG_DIR`.
+    fn note_recent_if_moved(&mut self, prev: Option<PathBuf>) {
+        let new = self.tabs.get(self.active).and_then(|t| t.path.clone());
+        if recent_files::path_changed(prev.as_deref(), new.as_deref())
+            && let Some(p) = new
+        {
+            self.note_recent(&p);
+        }
+    }
+
+    /// A click on a Recent row (#1194), and the harness's `recent-open`. A
+    /// file that still exists opens as Open does and the Backstage closes;
+    /// one that no longer exists leaves the list, the status says so, and
+    /// the Backstage stays.
+    fn open_recent(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        let root = config_root();
+        if !path.exists() {
+            let _ = recent_files::forget(&root, path);
+            self.recent_files = recent_files::list(&root);
+            self.recent_message = Some(recent_files::missing_status(path));
+            cx.notify();
+            return;
+        }
+        if let Err(e) = self.open_path(path, OpenMode::Normal, Reopen::Ask) {
+            self.set_status(e);
+        }
+        self.backstage = false;
+        self.drop_grid_state();
+        self.persist(cx);
+        cx.notify();
     }
 
     /// Open files passed on the command line (e.g. double-clicking a .docx/.xlsx
@@ -20960,6 +21199,7 @@ impl Docxy {
             return self.refocus(window, cx);
         }
         self.comment_open = true;
+        self.doc_entry_tab = self.active_tab_id();
         self.comment_text.clear();
         self.picker = None;
         self.find_open = false;
@@ -21061,6 +21301,7 @@ impl Docxy {
             page_right: g.page_right,
             sect_checkpointed: false,
         });
+        self.doc_entry_tab = self.active_tab_id();
         self.ruler_guide = Some(x); // guide starts under the pointer
         cx.notify();
     }
@@ -25155,7 +25396,7 @@ fn redo_or_repeat(ed: &mut Editor, rec: &mut Option<RepeatRecord>) -> bool {
         Repeat::Break(kind) => ed.insert_break(kind),
         Repeat::Act(act) => apply_doc_act(ed, act),
     }
-    if !ed.undo_serial().is_some_and(|s| s > since) {
+    if ed.undo_serial().is_none_or(|s| s <= since) {
         return false;
     }
     if let Some(name) = r.what.step_name() {
@@ -25180,7 +25421,7 @@ fn note_edit(ed: &mut Editor, rec: &mut Option<RepeatRecord>, since: u64, what: 
         *rec = RepeatRecord::now(what, ed);
         return rec.is_some();
     }
-    if !ed.undo_serial().is_some_and(|s| s > since) {
+    if ed.undo_serial().is_none_or(|s| s <= since) {
         return false;
     }
     if let Some(name) = what.step_name() {
@@ -26999,8 +27240,10 @@ pub(crate) struct RibbonFlyout {
 }
 
 /// The prefix a flyout's copy of a group puts on its `ribbon-group:`,
-/// `ribbon-title:` and `ribbon-content:` probes, so `ribbon-layout` measures
-/// only the groups drawn in the ribbon itself.
+/// `ribbon-title:`, `ribbon-content:` and `ribbon-launch:` probes, so
+/// `ribbon-layout` measures only the groups drawn in the ribbon itself, and
+/// the harness's `ribbon-launch:<group>` region finds only a launcher drawn
+/// there (#1164).
 const FLYOUT_PROBE_PREFIX: &str = "ribbon-flyout:";
 
 /// The ribbon's width: the window's, less the client-side decorations' shadow
@@ -27401,6 +27644,24 @@ mod highlight_rgb_tests {
 const COLOR_SWATCHES: &[u32] = &[
     0x000000, 0x404040, 0x808080, 0xBFBFBF, 0xFFFFFF, 0xC00000, 0xFF0000, 0xFFC000, 0xFFFF00,
     0x92D050, 0x00B050, 0x00B0F0, 0x0070C0, 0x002060, 0x7030A0,
+];
+/// Excel's names for [`COLOR_SWATCHES`], in order: Format Cells lists them.
+const COLOR_NAMES: [&str; 15] = [
+    "Black",
+    "Dark Gray",
+    "Gray",
+    "Light Gray",
+    "White",
+    "Dark Red",
+    "Red",
+    "Orange",
+    "Yellow",
+    "Light Green",
+    "Green",
+    "Light Blue",
+    "Blue",
+    "Dark Blue",
+    "Purple",
 ];
 /// Highlight swatches (Word highlight names). `None` = no highlight (clear).
 const HIGHLIGHT_SWATCHES: &[&str] = &[
@@ -30534,6 +30795,7 @@ impl Docxy {
     /// A combo-box display (font name/size) — inert for now.
     fn sheet_combo(
         &self,
+        id: &'static str,
         value: &'static str,
         wide: bool,
         act: SheetAct,
@@ -30548,6 +30810,9 @@ impl Docxy {
             .gap_1()
             .w(px(if wide { 108. } else { 50. }))
             .h(px(22.))
+            .relative()
+            // Where `pointer-click {"input":…}` finds it (#1200).
+            .child(probe(&self.probes, format!("sheet-combo:{id}")))
             .px_1p5()
             .rounded(px(3.))
             .border_1()
@@ -30689,242 +30954,6 @@ impl Docxy {
             );
         }
         row.into_any_element()
-    }
-
-    /// The consolidated "Format Cells" modal — one place for Number, Font, Fill,
-    /// Alignment and Border, applied live to the selection via the existing xf
-    /// helpers. A backdrop dismisses it.
-    fn sheet_format_panel(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        use gridcore::sheet::Align;
-        let xf = self.active_xf();
-        let cur_fmt = self.active_numfmt_name();
-        let heading = |t: &str| {
-            div()
-                .text_size(px(10.))
-                .font_weight(FontWeight::BOLD)
-                .text_color(pal.dim)
-                .child(t.to_string())
-        };
-
-        // Number formats.
-        let mut number = h_flex().flex_wrap().gap_1();
-        for (label, code) in NUM_FORMATS {
-            let active = label == cur_fmt;
-            number = number.child(
-                div()
-                    .id(ElementId::Name(format!("fmt-nf-{label}").into()))
-                    .px_2()
-                    .py(px(3.))
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .text_size(px(11.))
-                    .bg(if active { hsla_u(BRAND) } else { pal.panel })
-                    .text_color(if active { hsla_u(0xffffff) } else { pal.fg })
-                    .border_1()
-                    .border_color(pal.border)
-                    .hover(|d| d.border_color(hsla_u(BRAND)))
-                    .child(label)
-                    .on_click(
-                        cx.listener(move |this, _, _w, cx| this.sheet_apply_numfmt(code, cx)),
-                    ),
-            );
-        }
-
-        // Toggle button (Bold/Italic/Align/Border).
-        let tbtn = |id: &str, label: &str, active: bool| {
-            div()
-                .id(ElementId::Name(format!("fmt-{id}").into()))
-                .px_2p5()
-                .py(px(3.))
-                .rounded_sm()
-                .cursor_pointer()
-                .text_size(px(12.))
-                .bg(if active { hsla_u(BRAND) } else { pal.panel })
-                .text_color(if active { hsla_u(0xffffff) } else { pal.fg })
-                .border_1()
-                .border_color(pal.border)
-                .hover(|d| d.border_color(hsla_u(BRAND)))
-                .child(label.to_string())
-        };
-        let font_row = h_flex()
-            .gap_1p5()
-            .child(
-                tbtn("bold", "B", xf.bold)
-                    .on_click(cx.listener(|this, _, _w, cx| this.sheet_toggle_bold(cx))),
-            )
-            .child(
-                tbtn("italic", "I", xf.italic)
-                    .on_click(cx.listener(|this, _, _w, cx| this.sheet_toggle_italic(cx))),
-            );
-        let align_row = h_flex()
-            .gap_1p5()
-            .child(
-                tbtn("al", "Left", xf.align == Align::Left)
-                    .on_click(cx.listener(|this, _, _w, cx| this.sheet_align(Align::Left, cx))),
-            )
-            .child(
-                tbtn("ac", "Center", xf.align == Align::Center)
-                    .on_click(cx.listener(|this, _, _w, cx| this.sheet_align(Align::Center, cx))),
-            )
-            .child(
-                tbtn("ar", "Right", xf.align == Align::Right)
-                    .on_click(cx.listener(|this, _, _w, cx| this.sheet_align(Align::Right, cx))),
-            );
-        let border_row = h_flex().child(
-            tbtn("border", "Box border", xf.border)
-                .on_click(cx.listener(|this, _, _w, cx| this.sheet_toggle_border(cx))),
-        );
-
-        // Colour swatch row for a given picker (with a leading "None").
-        let swatches = |pick: SheetPick, cur: Option<(u8, u8, u8)>, cx: &mut Context<Self>| {
-            let mut row = h_flex().flex_wrap().gap_1();
-            let none_sel = cur.is_none();
-            row = row.child(
-                div()
-                    .id(ElementId::Name(
-                        format!("fmt-c-none-{}", pick == SheetPick::Fill).into(),
-                    ))
-                    .px_1p5()
-                    .py(px(1.))
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .text_size(px(10.))
-                    .border_1()
-                    .border_color(if none_sel { hsla_u(BRAND) } else { pal.border })
-                    .text_color(pal.fg)
-                    .child("None")
-                    .on_click(
-                        cx.listener(move |this, _, _w, cx| this.sheet_apply_color(pick, None, cx)),
-                    ),
-            );
-            for &c in COLOR_SWATCHES {
-                let rgb = (
-                    ((c >> 16) & 0xff) as u8,
-                    ((c >> 8) & 0xff) as u8,
-                    (c & 0xff) as u8,
-                );
-                let sel = cur == Some(rgb);
-                row = row.child(
-                    div()
-                        .id(ElementId::Name(
-                            format!("fmt-c-{}-{c:06x}", pick == SheetPick::Fill).into(),
-                        ))
-                        .size(px(18.))
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .bg(hsla_u(c))
-                        .border_1()
-                        .border_color(if sel { hsla_u(BRAND) } else { hsla_u(0x9a9a9a) })
-                        .on_click(cx.listener(move |this, _, _w, cx| {
-                            this.sheet_apply_color(pick, Some(rgb), cx)
-                        })),
-                );
-            }
-            row
-        };
-        let font_colors = swatches(SheetPick::Font, xf.color, cx);
-        let fill_colors = swatches(SheetPick::Fill, xf.fill, cx);
-
-        let card = v_flex()
-            .w(px(420.))
-            .gap_3()
-            .p_4()
-            .bg(pal.panel)
-            .border_1()
-            .border_color(pal.border)
-            .rounded(px(8.))
-            .shadow_lg()
-            .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(15.))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(pal.fg)
-                            .child("Format Cells"),
-                    )
-                    .child(
-                        div()
-                            .id("fmt-close")
-                            .px_2()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .text_size(px(15.))
-                            .text_color(pal.dim)
-                            .hover(|d| d.text_color(pal.fg))
-                            .child("\u{00d7}")
-                            .on_click(cx.listener(|this, _, _w, cx| {
-                                this.sheet_fmt_open = false;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(v_flex().gap_1().child(heading("NUMBER")).child(number))
-            .child(
-                v_flex().gap_1().child(heading("FONT")).child(
-                    h_flex()
-                        .gap_3()
-                        .items_center()
-                        .child(font_row)
-                        .child(font_colors),
-                ),
-            )
-            .child(v_flex().gap_1().child(heading("FILL")).child(fill_colors))
-            .child(
-                v_flex()
-                    .gap_1()
-                    .child(heading("ALIGNMENT"))
-                    .child(align_row),
-            )
-            .child(v_flex().gap_1().child(heading("BORDER")).child(border_row))
-            .child(
-                h_flex().justify_end().child(
-                    div()
-                        .id("fmt-done")
-                        .px_3()
-                        .py(px(4.))
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .text_size(px(12.))
-                        .bg(hsla_u(BRAND))
-                        .text_color(hsla_u(0xffffff))
-                        .child("Done")
-                        .on_click(cx.listener(|this, _, _w, cx| {
-                            this.sheet_fmt_open = false;
-                            cx.notify();
-                        })),
-                ),
-            );
-
-        // Backdrop (click to dismiss) + centred card.
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(Hsla {
-                h: 0.,
-                s: 0.,
-                l: 0.,
-                a: 0.35,
-            })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _w, cx| {
-                    this.sheet_fmt_open = false;
-                    cx.notify();
-                }),
-            )
-            .child(
-                // Stop the card's own clicks from dismissing.
-                div()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(card),
-            )
-            .into_any_element()
     }
 
     /// The swatch strip shown under the ribbon while a sheet colour picker is open;
@@ -31307,10 +31336,14 @@ impl Docxy {
     fn sheet_find_bar(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let qf = self.find_field == FindField::Query;
         let rf = self.find_field == FindField::Replace;
+        // Each field and button is probed under its own id, where the
+        // harness's `pointer-click` finds it (#1200).
         let field = |id: &'static str, val: &str, focused: bool, ph: &'static str| {
             let empty = val.is_empty();
             div()
                 .id(id)
+                .relative()
+                .child(probe(&self.probes, id))
                 .flex()
                 .items_center()
                 .min_w(px(150.))
@@ -31339,6 +31372,8 @@ impl Docxy {
         let btn = |id: &'static str, label: SharedString| {
             div()
                 .id(id)
+                .relative()
+                .child(probe(&self.probes, id))
                 .px_2()
                 .h(px(24.))
                 .flex()
@@ -31584,6 +31619,10 @@ impl Docxy {
                         d.child(
                             div()
                                 .id(SharedString::from(format!("sheet-launch-{}", g.title)))
+                                .child(probe(
+                                    &self.probes,
+                                    format!("{prefix}ribbon-launch:{}", g.title),
+                                ))
                                 .text_size(px(9.))
                                 .text_color(pal.dim)
                                 .when(launch.is_some(), |d| {
@@ -31677,7 +31716,7 @@ impl Docxy {
                 self.sheet_ib(icon, c.act, sheet_ribbon::act_on(c.act, xf), pal, cx)
             }
             Shape::Glyph(glyph) => self.sheet_gb(glyph, c.act, pal, cx),
-            Shape::Combo { value, wide } => self.sheet_combo(value, wide, c.act, pal, cx),
+            Shape::Combo { value, wide } => self.sheet_combo(c.id, value, wide, c.act, pal, cx),
             Shape::NumFmt => self.sheet_numfmt_combo(pal, cx),
             Shape::Split { icon, menu } => v_flex()
                 .h_full()
@@ -32743,23 +32782,41 @@ impl Docxy {
                     )
                 })
                 .unwrap_or_else(|| ("—".into(), "".into()));
+            // Recent files (#1194), newest first. The row keeps the file's
+            // path, not its index: the list can change before the click.
             let recents: Vec<AnyElement> = self
-                .tabs
+                .recent_files
                 .iter()
                 .enumerate()
-                .map(|(i, t)| {
-                    div()
+                .map(|(i, path)| {
+                    let folder = path
+                        .parent()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    let target = path.clone();
+                    h_flex()
                         .id(("recent", i))
+                        .gap_2()
                         .px_3()
                         .py_1p5()
                         .cursor_pointer()
                         .rounded_sm()
                         .text_color(fg)
                         .hover(|d| d.bg(sidebar))
-                        .child(format!("{} {}", t.kind.glyph(), t.title))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.backstage = false;
-                            this.select_tab(i, window, cx);
+                        .min_w_0()
+                        .child(div().flex_shrink_0().child(path_kind(path).glyph()))
+                        .child(div().flex_shrink_0().child(file_name(path)))
+                        // A long folder ends in an ellipsis, not past the page.
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(12.))
+                                .text_color(dim)
+                                .child(folder),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_recent(&target, cx);
                         }))
                         .into_any_element()
                 })
@@ -32890,7 +32947,28 @@ impl Docxy {
                             }))
                     }),
                 ))
-                .child(v_flex().gap_0p5().children(recents))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(rgb(BRAND))
+                        .mt_4()
+                        .child("Recent"),
+                )
+                .when_some(self.recent_message.clone(), |d, m| {
+                    d.child(div().text_size(px(12.)).text_color(fg).child(m))
+                })
+                .map(|d| {
+                    if recents.is_empty() {
+                        d.child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(dim)
+                                .child("No recent files"),
+                        )
+                    } else {
+                        d.child(v_flex().gap_0p5().children(recents))
+                    }
+                })
                 .when(show_recover, |d| {
                     d.child(
                         div()
@@ -33845,8 +33923,6 @@ impl Render for Docxy {
             .map(|p| self.sheet_picker_bar(p, pal, cx));
         let sheet_numfmt_bar = (self.active_is_sheet() && self.sheet_numfmt_open)
             .then(|| self.sheet_numfmt_bar(pal, cx));
-        let sheet_fmt_panel = (self.active_is_sheet() && self.sheet_fmt_open)
-            .then(|| self.sheet_format_panel(pal, cx));
         let sheet_find =
             (self.active_is_sheet() && self.find_open).then(|| self.sheet_find_bar(pal, cx));
         let sheet_comment = self
@@ -34788,7 +34864,6 @@ impl Render for Docxy {
             // Under the menu: a menu opened from the flyout draws over it.
             .when_some(ribbon_flyout, |d, f| d.child(f))
             .when_some(context_menu, |d, m| d.child(m))
-            .when_some(sheet_fmt_panel, |d, p| d.child(p))
             .when_some(tab_popup, |d, popup| d.child(popup))
             .when_some(dialog, |d, dialog| d.child(dialog))
             // A vertical guide line down the page while a ruler marker is dragged.
@@ -37315,9 +37390,7 @@ fn sheet_el(
     probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
     cx: &mut Context<Docxy>,
 ) -> AnyElement {
-    use gridcore::sheet::cell_name;
     let sh = view.sheet();
-    let (sr, sc) = view.sel;
     let (max_r, max_c) = view.extent();
     // Frozen columns (freeze panes, cols axis): pinned at the left, always shown.
     let (frz_r, frz_c) = sh.freeze;
@@ -37346,20 +37419,10 @@ fn sheet_el(
 
     let editing = view.editing.clone();
     // ---- formula / reference bar ----
-    let sel_ref = if view.has_range() {
-        format!("{}:{}", cell_name(r0, c0), cell_name(r1, c1))
-    } else {
-        cell_name(sr, sc)
-    };
-    let sel_full = if let Some(buf) = &editing {
-        buf.clone()
-    } else {
-        match sh.cell(sr, sc) {
-            Some(c) if c.formula.is_some() => {
-                format!("={}", c.formula.as_deref().unwrap_or_default())
-            }
-            _ => view.cell_text(sr, sc),
-        }
+    let sel_ref = name_box_text(view);
+    let sel_full = match &editing {
+        Some(buf) => buf.clone(),
+        None => fx_bar_text(view),
     };
     let sel_content = sel_full.replace('\n', LINE_FEED_GLYPH);
     let expanded = ov.fx_expanded;
@@ -37385,7 +37448,9 @@ fn sheet_el(
                 .border_color(gridline)
                 .text_size(px(12.))
                 .text_color(hsla_u(0x333333))
-                .child(SharedString::from(sel_ref)),
+                .relative()
+                .child(SharedString::from(sel_ref))
+                .child(probe(probes, "name-box")),
         )
         .child(
             div()
@@ -37403,12 +37468,15 @@ fn sheet_el(
                 view.edit_proposal.as_ref().map(|p| p.0),
                 expanded,
                 ent,
+                probe(probes, "fx-edit"),
             )
         } else {
             // Not editing: clicking the bar starts editing the selected cell.
             let ent_fx = ent.clone();
             div()
                 .id("fx-edit")
+                .relative()
+                .child(probe(probes, "fx-edit"))
                 .flex_1()
                 .h_full()
                 .flex()

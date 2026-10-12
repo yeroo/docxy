@@ -2422,8 +2422,20 @@ mod tests {
             ed.set_resources(1, &["Bob".into()]).unwrap();
             let before = ed.project().task(1).unwrap().clone();
 
+            // The task keeps all but its work totals, which follow its
+            // assignments.
+            let kept = |ed: &Editor, work| {
+                let totals = Task {
+                    work_min: Some(work),
+                    remaining_work_min: Some(work),
+                    ..before.clone()
+                };
+                assert_eq!(ed.project().task(1).unwrap(), &totals);
+            };
+            assert_eq!(before.work_min, Some(480));
+
             ed.set_resources(1, &["Bob[50%]".into()]).unwrap();
-            assert_eq!(ed.project().task(1).unwrap(), &before);
+            kept(&ed, 240);
             let bob = ed
                 .project()
                 .assignments
@@ -2439,7 +2451,7 @@ mod tests {
             );
             ed.set_resources(1, &["Bob[50%]".into(), "Alice".into()])
                 .unwrap();
-            assert_eq!(ed.project().task(1).unwrap(), &before);
+            kept(&ed, 720);
             let mut work: Vec<_> = ed
                 .project()
                 .assignments

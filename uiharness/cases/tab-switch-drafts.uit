@@ -1,0 +1,48 @@
+# A comment draft belongs to the document it was started on (#1286): a tab
+# switch cancels it, so typed keys reach the new tab's document and Enter
+# never comments on that tab's selection. A fresh instance starts with the
+# one sample.docx tab; the case swaps it for basic.docx and a new document.
+
+test a tab switch cancels a comment draft
+  call close-tab {}
+  assert tabs is 0
+  open copy:../fixtures/basic.docx
+  key ctrl+n
+  assert tabs is 2
+  assert tab is 1
+  type world
+  key shift+home
+  key ctrl+f6
+  assert tab is 0
+  type hello
+  key shift+home
+  call ribbon-click {"tab":"Review","command":"newcomment"}
+  type Draft
+  key ctrl+f6
+  assert tab is 1
+  key end
+  type !
+  assert text is world!
+  key enter
+  call comments {}
+  assert reply.comments is []
+  key ctrl+f6
+  assert tab is 0
+  call comments {}
+  assert reply.comments is []
+
+test a click on the tab in front or closing another tab keeps a comment draft
+  assert tabs is 2
+  assert tab is 0
+  type more
+  key shift+home
+  call ribbon-click {"tab":"Review","command":"newcomment"}
+  type Kept
+  call pointer-click {"region":"tab-chip:0"}
+  assert tab is 0
+  call close-tab {"index":1,"answer":"discard"}
+  assert tabs is 1
+  assert tab is 0
+  key enter
+  call comments {}
+  assert reply.comments.0.text is Kept

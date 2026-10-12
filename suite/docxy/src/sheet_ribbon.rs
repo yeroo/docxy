@@ -421,7 +421,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                 title: "Font",
                 priority: 80,
                 launcher: true,
-                launch: None,
+                launch: Some(SheetAct::FormatCells),
                 body: rows(&[
                     &[
                         combo("font-name", "Font", "Calibri", true),
@@ -463,7 +463,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                 title: "Alignment",
                 priority: 70,
                 launcher: true,
-                launch: None,
+                launch: Some(SheetAct::FormatCells),
                 body: rows(&[
                     &[
                         glyph("top-align", "Top Align", "\u{2580}", SheetAct::Todo),
@@ -495,7 +495,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                 title: "Number",
                 priority: 60,
                 launcher: true,
-                launch: None,
+                launch: Some(SheetAct::FormatCells),
                 body: rows(&[
                     &[cmd(
                         "number-format",
@@ -1584,7 +1584,7 @@ pub(crate) fn resolve_on(
     let buttons: Vec<&'static SheetCmd> = all
         .iter()
         .copied()
-        .filter(|c| !tab.menu_owner(c).is_some())
+        .filter(|c| tab.menu_owner(c).is_none())
         .collect();
     let mut matches = tier_matches(&buttons, query, &toggled);
     if matches.is_empty() {
@@ -1635,7 +1635,7 @@ mod tests {
                 for c in tab
                     .commands()
                     .into_iter()
-                    .filter(|c| !tab.menu_owner(c).is_some())
+                    .filter(|c| tab.menu_owner(c).is_none())
                 {
                     assert!(
                         seen.insert(c.label(toggled)),
@@ -1899,6 +1899,30 @@ mod tests {
                 ("Scale to Fit", true, dialog(SetupTab::Page)),
                 ("Sheet Options", true, dialog(SetupTab::Sheet)),
                 ("Arrange", false, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn home_font_alignment_number_launchers_open_format_cells() {
+        // As in Excel, the Font, Alignment and Number launchers open Format
+        // Cells (#1164); Clipboard's opens the Office Clipboard.
+        let launched: Vec<_> = tab_def(RibbonTab::Home)
+            .groups
+            .iter()
+            .map(|g| (g.title, g.launcher, g.launch))
+            .collect();
+        let fmt = Some(SheetAct::FormatCells);
+        assert_eq!(
+            launched,
+            [
+                ("Clipboard", true, Some(SheetAct::OfficeClipboard)),
+                ("Font", true, fmt),
+                ("Alignment", true, fmt),
+                ("Number", true, fmt),
+                ("Styles", false, None),
+                ("Cells", false, None),
+                ("Editing", false, None),
             ]
         );
     }

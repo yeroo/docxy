@@ -821,6 +821,9 @@ struct HfEdit {
     is_header: bool,
     part: String,
     saved_page_view: bool,
+    /// The blocks whose commit last failed: leaving with these unchanged
+    /// discards the edit (#1308).
+    failed: Option<Vec<Block>>,
 }
 
 /// A comment whose record follows its markers ([`App::tracked_comments`]).
@@ -2342,9 +2345,7 @@ impl App {
                 self.dirty = true;
             }
             EditDocument => {
-                if self.hf_edit.is_some() {
-                    self.exit_hf_edit(true);
-                }
+                let _ = self.leave_hf_edit();
             }
             EditHeader => self.enter_hf_edit(true),
             EditFooter => self.enter_hf_edit(false),
@@ -4040,8 +4041,8 @@ impl App {
         if !self.mutation_allowed(protection::MutationKind::Content) {
             return;
         }
-        if self.hf_edit.is_some() {
-            self.exit_hf_edit(true);
+        if self.leave_hf_edit().is_err() {
+            return;
         }
         self.sync_page_parts();
         let what = if is_header { "header" } else { "footer" };
@@ -4094,6 +4095,7 @@ impl App {
             is_header,
             part,
             saved_page_view,
+            failed: None,
         });
         if self.status.is_none() {
             self.status = Some(format!("Editing {what} — Esc/F6/F7 to return"));
@@ -4101,33 +4103,52 @@ impl App {
         self.dirty = true;
     }
 
-    /// Return from header/footer editing, committing the edits (splice back into
-    /// the part and update the print-layout source) when `commit`.
-    fn exit_hf_edit(&mut self, commit: bool) {
-        let _ = self.commit_hf_edit(commit);
+    /// Leave header/footer editing. When the edit's last commit failed and
+    /// its content is unchanged since, the edit can never be written: it is
+    /// discarded and the status says so. Otherwise the edit is committed;
+    /// the Err is the failed commit's status text.
+    fn leave_hf_edit(&mut self) -> Result<(), String> {
+        let Some(hf) = &self.hf_edit else {
+            return Ok(());
+        };
+        if let Some(failed) = &hf.failed
+            && self.editor.doc.body == *failed
+        {
+            let what = if hf.is_header { "header" } else { "footer" };
+            let _ = self.commit_hf_edit(false);
+            self.status = Some(format!("Discarded the {what} edit."));
+            self.dirty = true;
+            return Ok(());
+        }
+        self.commit_hf_edit(true)
     }
 
-    /// [`App::exit_hf_edit`], reporting a commit that failed: the Err is the
-    /// status bar's text. Editing is left either way, so on Err the edit is
-    /// already discarded and cannot be retried (#1223).
+    /// Close the header/footer edit, committing it (splice back into the
+    /// part and update the print-layout source) when `commit`; the Err is
+    /// the status bar's text. On Err the edit stays open with its content
+    /// and `failed` set, so it can be fixed and retried or copied out;
+    /// only [`App::leave_hf_edit`] discards an edit unchanged since a
+    /// failed commit (#1308).
     fn commit_hf_edit(&mut self, commit: bool) -> Result<(), String> {
         let Some(hf) = self.hf_edit.take() else {
             return Ok(());
         };
-        let mut outcome = Ok(());
         let edited = std::mem::replace(&mut self.editor, hf.body);
-        let blocks = edited.doc.body;
         let changed = if hf.is_header {
-            self.headers.default.as_ref() != &blocks
+            self.headers.default.as_ref() != &edited.doc.body
         } else {
-            self.footers.default.as_ref() != &blocks
+            self.footers.default.as_ref() != &edited.doc.body
         };
         if commit && changed {
             let tag = if hf.is_header { "w:hdr" } else { "w:ftr" };
             // Links need relationships in the part's own rels; they are
             // computed first (the ids go into the XML) but written only with it.
             let what = if hf.is_header { "header" } else { "footer" };
-            let mut blocks = blocks;
+            // The write works on a copy: link_part_hyperlinks mutates the
+            // blocks (rel ids), and a failed attempt must not change the
+            // open editor's content.
+            let failed = edited.doc.body.clone();
+            let mut blocks = failed.clone();
             let written = self
                 .pkg
                 .link_part_hyperlinks(&hf.part, &mut blocks)
@@ -4162,9 +4183,24 @@ impl App {
                     self.modified = true;
                 }
                 Err(why) => {
-                    let msg = format!("Couldn't write the {what} edit to {}: {why}.", hf.part);
+                    let msg = format!(
+                        "Couldn't write the {what} edit to {}: {why}. Leave it unchanged (Esc) to discard it.",
+                        hf.part
+                    );
                     self.status = Some(msg.clone());
-                    outcome = Err(msg);
+                    // The edit is still open: give the body editor back and
+                    // keep the failed content, so it can be fixed and
+                    // retried or copied out.
+                    let body = std::mem::replace(&mut self.editor, edited);
+                    self.hf_edit = Some(HfEdit {
+                        body,
+                        is_header: hf.is_header,
+                        part: hf.part,
+                        saved_page_view: hf.saved_page_view,
+                        failed: Some(failed),
+                    });
+                    self.dirty = true;
+                    return Err(msg);
                 }
             }
         }
@@ -4173,7 +4209,7 @@ impl App {
         // discarded edit: the panel follows (#971).
         self.sync_tracked_comments();
         self.dirty = true;
-        outcome
+        Ok(())
     }
 
     /// Run a package edit of the final section's `w:sectPr` against the body
@@ -4347,8 +4383,8 @@ impl App {
         if self.format != DocFormat::Markdown || self.md_source == source {
             return;
         }
-        if self.hf_edit.is_some() {
-            self.exit_hf_edit(true);
+        if self.commit_hf_edit(true).is_err() {
+            return;
         }
         let doc = if source {
             // Render the live document to Markdown, then edit it as literal lines.
@@ -4726,7 +4762,8 @@ impl App {
     ) -> Result<CompareSummary, String> {
         // Leave header/footer editing first: committing makes its edits count
         // as unsaved, and its swapped-out body must not outlive the document.
-        self.exit_hf_edit(true);
+        // A failed commit stops the compare (#1239).
+        self.commit_hf_edit(true)?;
         if self.modified && !discard {
             return Err("unsaved changes; save or reload first".to_string());
         }
@@ -4786,7 +4823,9 @@ impl App {
             return;
         }
         self.compare_dialog = None;
-        self.exit_hf_edit(true);
+        if self.commit_hf_edit(true).is_err() {
+            return;
+        }
         if self.modified {
             self.confirm = Some(
                 backstage::Confirm::new(
@@ -5154,10 +5193,15 @@ impl App {
     /// header/footer edit first so its editor cannot write a header part
     /// back over a watermark and the section edits hit the body editor.
     fn apply_design_pick(&mut self, kind: PickerKind, item: &str) {
+        // A failed header/footer commit stops the pick; its error stays the
+        // status, which the arms below would overwrite (#1239).
+        if self.commit_hf_edit(true).is_err() {
+            return;
+        }
         match kind {
             PickerKind::PageColor => {
                 let rgb = PAGE_COLORS.iter().find(|c| c.0 == item).map(|c| c.1);
-                self.set_page_color(rgb);
+                let _ = self.set_page_color(rgb);
                 self.status = Some(match rgb {
                     Some(_) => format!("Page color: {item}"),
                     None => "Page color: No Color".to_string(),
@@ -5180,7 +5224,7 @@ impl App {
             }
             PickerKind::PageBorders => {
                 let pb = (item != "None").then(|| box_page_borders(item == "Shadow", None));
-                self.set_page_borders(pb.as_ref());
+                let _ = self.set_page_borders(pb.as_ref());
                 // after_edit clears the status: report the pick after it.
                 self.status = Some(format!("Page borders: {item}"));
             }
@@ -5191,11 +5235,10 @@ impl App {
 
     /// Set or remove the page colour (Design ▸ Page Color): the package's
     /// `w:background` and `w:displayBackgroundShape`. A package edit with no
-    /// undo. Returns whether anything changed.
-    pub(crate) fn set_page_color(&mut self, rgb: Option<u32>) -> bool {
-        if self.hf_edit.is_some() {
-            self.exit_hf_edit(true);
-        }
+    /// undo. Returns whether anything changed. Errs, changing nothing, when
+    /// an open header/footer edit cannot be committed (#1239).
+    pub(crate) fn set_page_color(&mut self, rgb: Option<u32>) -> Result<bool, String> {
+        self.commit_hf_edit(true)?;
         let bg = rgb.map(|color| PageBackground {
             color,
             gradient: None,
@@ -5204,7 +5247,7 @@ impl App {
         if changed {
             self.modified = true;
         }
-        changed
+        Ok(changed)
     }
 
     /// Write or remove the text watermark in every shown header (Design ▸
@@ -5213,14 +5256,13 @@ impl App {
     /// a watermark was requested but the document cannot take a header. An
     /// Err may follow a partial edit (the removed watermark's header parts
     /// and section references are already gone) — the Err carries `changed`
-    /// so callers can report whether one happened.
+    /// so callers can report whether one happened. Errs, changing nothing,
+    /// when an open header/footer edit cannot be committed (#1239).
     pub(crate) fn set_text_watermark(
         &mut self,
         spec: Option<&TextWatermarkSpec>,
     ) -> Result<bool, (bool, String)> {
-        if self.hf_edit.is_some() {
-            self.exit_hf_edit(true);
-        }
+        self.commit_hf_edit(true).map_err(|msg| (false, msg))?;
         let mut sects = self.editor.sections();
         let before = sects.clone();
         let parts = self.pkg.set_text_watermark(spec, &mut sects);
@@ -5252,11 +5294,10 @@ impl App {
     }
 
     /// Write or remove page borders on every section (Design ▸ Page Borders)
-    /// as one undo step. Returns whether anything changed.
-    pub(crate) fn set_page_borders(&mut self, pb: Option<&PageBorders>) -> bool {
-        if self.hf_edit.is_some() {
-            self.exit_hf_edit(true);
-        }
+    /// as one undo step. Returns whether anything changed. Errs, changing
+    /// nothing, when an open header/footer edit cannot be committed (#1239).
+    pub(crate) fn set_page_borders(&mut self, pb: Option<&PageBorders>) -> Result<bool, String> {
+        self.commit_hf_edit(true)?;
         let n = self.editor.sections().len();
         let changed = self
             .editor
@@ -5266,7 +5307,7 @@ impl App {
         if changed {
             self.after_edit();
         }
-        changed
+        Ok(changed)
     }
 
     fn picker_key(&mut self, key: KeyEvent) -> bool {
@@ -6354,11 +6395,13 @@ impl App {
             self.dirty = true;
             return false;
         }
-        // Header/footer focus-edit: Esc / F6 / F7 returns to the body (committing).
+        // Header/footer focus-edit: Esc / F6 / F7 leaves it via
+        // [`App::leave_hf_edit`]: committing it, staying open on a failed
+        // commit, or discarding one unchanged since a failure.
         if self.hf_edit.is_some()
             && matches!(key.code, KeyCode::Esc | KeyCode::F(6) | KeyCode::F(7))
         {
-            self.exit_hf_edit(true);
+            let _ = self.leave_hf_edit();
             return false;
         }
         if self.find.is_some() {
@@ -8845,7 +8888,7 @@ mod tests {
     #[test]
     fn page_color_paints_the_print_layout_sheet() {
         let mut app = app_with(&["body"]);
-        assert!(app.set_page_color(Some(0xFF0000)));
+        assert_eq!(app.set_page_color(Some(0xFF0000)), Ok(true));
         app.page_view = true; // light_page stays false: the dark terminal theme
         app.dirty = true;
         let mut term = Terminal::new(TestBackend::new(100, 70)).unwrap();
@@ -8878,7 +8921,7 @@ mod tests {
     #[test]
     fn page_color_light_sheet_uses_dark_ink() {
         let mut app = app_with(&["body"]);
-        assert!(app.set_page_color(Some(0xFFFF00)));
+        assert_eq!(app.set_page_color(Some(0xFFFF00)), Ok(true));
         app.page_view = true;
         app.light_page = true;
         app.dirty = true;
@@ -8901,7 +8944,7 @@ mod tests {
     #[test]
     fn page_color_not_painted_outside_print_layout() {
         let mut app = app_with(&["body"]);
-        assert!(app.set_page_color(Some(0xFF0000)));
+        assert_eq!(app.set_page_color(Some(0xFF0000)), Ok(true));
         app.page_view = false; // Read Mode: continuous, no page frame
         app.dirty = true;
         let mut term = Terminal::new(TestBackend::new(100, 70)).unwrap();
@@ -8924,7 +8967,7 @@ mod tests {
         picked.run_act(ribbon::Act::PageColor);
         pick(&mut picked, PickerKind::PageColor, "Red");
         let mut direct = app_with(&["body"]);
-        assert!(direct.set_page_color(Some(0xFF0000)));
+        assert_eq!(direct.set_page_color(Some(0xFF0000)), Ok(true));
         for part in ["word/document.xml", "word/settings.xml"] {
             assert_eq!(
                 picked.pkg.part_text(part),
@@ -10902,7 +10945,7 @@ mod tests {
         app.editor.select_all();
         app.on_key(key(KeyCode::Char('x')));
         app.on_key(key(KeyCode::F(6)));
-        assert!(app.hf_edit.is_none());
+        assert!(app.hf_edit.is_some(), "the failed edit stays open");
         assert_eq!(app.pkg.part(&part).unwrap(), b"<junk/>", "part untouched");
         assert_eq!(
             app.headers.default, before,
@@ -11032,7 +11075,7 @@ mod tests {
         assert_eq!(app.status.as_deref(), Some(err.as_str()));
         assert!(!path.exists(), "nothing written");
         assert!(!app.modified);
-        assert!(app.hf_edit.is_none());
+        assert!(app.hf_edit.is_some(), "the failed edit stays open");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -11058,6 +11101,296 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1239: a Design pick with an open header edit that cannot be committed
+    /// stops: the commit's error stays the status and the pick's edit does
+    /// not land.
+    #[test]
+    fn design_picks_keep_a_failed_header_commit_status() {
+        for (kind, item) in [
+            (PickerKind::PageColor, PAGE_COLORS[1].0),
+            (PickerKind::Watermark, WATERMARK_PRESETS[0].0),
+            (PickerKind::PageBorders, "Box"),
+        ] {
+            let mut app = app_in_failing_header_edit();
+            app.apply_design_pick(kind, item);
+            let status = app.status.clone().unwrap_or_default();
+            assert!(
+                status.contains("Couldn't write the header edit"),
+                "{kind:?}: {status}"
+            );
+            assert!(
+                app.pkg.page_background().is_none(),
+                "{kind:?}: the page background must stay unset"
+            );
+            assert!(
+                app.pkg
+                    .shown_text_watermarks(&app.editor.sections())
+                    .is_empty(),
+                "{kind:?}: no watermark may be added"
+            );
+            assert!(
+                app.editor
+                    .sections()
+                    .iter()
+                    .all(|s| !s.contains("<w:pgBorders")),
+                "{kind:?}: no page borders may be added"
+            );
+            assert!(!app.modified, "{kind:?}");
+        }
+    }
+
+    /// #1239: Compare stops on a failed header/footer commit: the error is
+    /// answered, the open document is not replaced, and run_compare's status
+    /// keeps the reason.
+    #[test]
+    fn compare_with_failed_header_commit_keeps_the_document() {
+        let (dir, original, revised) = compare_fixture("hf-fail");
+        let mut app = app_in_failing_header_edit();
+        let err = match app.compare_paths(&original, &revised, true) {
+            Err(err) => err,
+            Ok(_) => panic!("a failed header commit must stop the compare"),
+        };
+        assert!(err.contains("Couldn't write the header edit"), "{err}");
+        assert_eq!(app.path, "test.docx");
+
+        let mut app = app_in_failing_header_edit();
+        app.run_compare(&original, &revised, true);
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("Couldn't write the header edit"),
+            "{status}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1239: submitting the Compare dialog with a failing header commit
+    /// closes the dialog but opens no confirm, keeps the document, and the
+    /// commit's error stays the status.
+    #[test]
+    fn compare_dialog_keeps_a_failed_header_commit_status() {
+        let (dir, original, revised) = compare_fixture("hf-fail-dialog");
+        let mut app = app_in_failing_header_edit();
+        app.compare_dialog = Some(CompareDialog {
+            original,
+            revised,
+            field: 1,
+        });
+        app.submit_compare_dialog();
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("Couldn't write the header edit"),
+            "{status}"
+        );
+        assert!(app.confirm.is_none());
+        assert_eq!(app.path, "test.docx");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1239: switching a Markdown file to source view stops on a failed
+    /// header commit: the view stays as it was and the error stays the
+    /// status.
+    #[test]
+    fn md_source_switch_keeps_a_failed_header_commit_status() {
+        let mut app = app_in_failing_header_edit();
+        app.format = DocFormat::Markdown;
+        app.md_source = false;
+        app.set_md_source(true);
+        assert!(!app.md_source, "the view must not switch");
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("Couldn't write the header edit"),
+            "{status}"
+        );
+    }
+
+    /// #1239: the Design setters answer the failed header commit's error and
+    /// change nothing.
+    #[test]
+    fn design_setters_err_on_a_failed_header_commit() {
+        let mut app = app_in_failing_header_edit();
+        let err = app.set_page_color(Some(0xFF0000)).unwrap_err();
+        assert!(err.contains("Couldn't write the header edit"), "{err}");
+        assert!(
+            app.pkg.page_background().is_none(),
+            "the page background must stay unset"
+        );
+
+        let mut app = app_in_failing_header_edit();
+        let err = app
+            .set_page_borders(Some(&box_page_borders(false, None)))
+            .unwrap_err();
+        assert!(err.contains("Couldn't write the header edit"), "{err}");
+        assert!(
+            app.editor
+                .sections()
+                .iter()
+                .all(|s| !s.contains("<w:pgBorders")),
+            "no page borders may be added"
+        );
+
+        let mut app = app_in_failing_header_edit();
+        let (changed, msg) = app
+            .set_text_watermark(Some(&TextWatermarkSpec::preset("X", true)))
+            .unwrap_err();
+        assert!(!changed, "a failed commit changes nothing");
+        assert!(msg.contains("Couldn't write the header edit"), "{msg}");
+        assert!(
+            app.pkg
+                .shown_text_watermarks(&app.editor.sections())
+                .is_empty(),
+            "no watermark may be added"
+        );
+    }
+
+    /// #1308 p1: switching header -> footer when the header commit fails
+    /// stops on the failure: the header edit stays open, the error stays
+    /// the status, and no footer part is created.
+    #[test]
+    fn enter_footer_stops_on_a_failed_header_commit() {
+        let mut app = app_in_failing_header_edit();
+        let footer_before = app.footer_part.clone();
+        app.run_act(ribbon::Act::EditFooter);
+        let hf = app.hf_edit.as_ref().expect("the header edit stays open");
+        assert!(hf.is_header, "still the header edit");
+        assert_eq!(app.footer_part, footer_before, "no footer part created");
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("Couldn't write the header edit"),
+            "{status}"
+        );
+        assert!(!status.contains("Created a footer"), "{status}");
+    }
+
+    /// #1308 p2: a failed commit keeps the header edit open, exactly as
+    /// edited (no rel id written into it): the user can fix it and retry,
+    /// or copy the text out.
+    #[test]
+    fn failed_header_commit_keeps_the_edit_open() {
+        let mut app = app_in_failing_header_edit();
+        let part = app.header_part.clone().expect("header part");
+        let rels_name = part.replace("word/", "word/_rels/") + ".rels";
+        let blocks = app.editor.doc.body.clone();
+        let part_before = app.pkg.part(&part).unwrap().to_vec();
+        let rels_before = app.pkg.part(&rels_name).unwrap().to_vec();
+        let shown_before = app.headers.default.clone();
+
+        app.on_key(key(KeyCode::F(6)));
+        let hf = app.hf_edit.as_ref().expect("the failed edit stays open");
+        assert!(hf.is_header);
+        assert!(
+            app.editor.doc.body == blocks,
+            "the editor keeps the edit, no rel id written into it"
+        );
+        assert_eq!(app.pkg.part(&part).unwrap(), part_before, "part untouched");
+        assert_eq!(
+            app.pkg.part(&rels_name).unwrap(),
+            rels_before,
+            "rels untouched"
+        );
+        assert_eq!(app.headers.default, shown_before);
+        assert!(!app.modified);
+        assert!(!app.page_view);
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.ends_with("Leave it unchanged (Esc) to discard it."),
+            "{status}"
+        );
+    }
+
+    /// #1308: leaving the failed edit with its content unchanged since the
+    /// failure discards it — the way out of an edit that can never be
+    /// written — and says so.
+    #[test]
+    fn leaving_a_failed_header_edit_unchanged_discards_it() {
+        let mut app = app_in_failing_header_edit();
+        let part = app.header_part.clone().expect("header part");
+        let part_before = app.pkg.part(&part).unwrap().to_vec();
+        app.on_key(key(KeyCode::F(6)));
+        assert!(app.hf_edit.is_some());
+
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.hf_edit.is_none());
+        assert_eq!(first_line(&app), "body", "the body editor is back");
+        assert_eq!(app.status.as_deref(), Some("Discarded the header edit."));
+        assert_eq!(app.pkg.part(&part).unwrap(), part_before, "part untouched");
+        assert!(!app.modified);
+    }
+
+    /// #1308: after a failure, changing the edit and leaving retries the
+    /// commit; the recovered edit survives the save.
+    #[test]
+    fn a_fixed_header_edit_retries_and_commits() {
+        let mut app = app_in_failing_header_edit();
+        let part = app.header_part.clone().expect("header part");
+        app.on_key(key(KeyCode::F(6)));
+        assert!(app.hf_edit.is_some(), "the failure keeps the edit open");
+
+        app.editor.doc.body = vec![Block::Paragraph(MPara {
+            props: ParProps::default(),
+            content: vec![Inline::Run(Run {
+                text: "Fixed".to_string(),
+                props: RunProps::default(),
+            })],
+        })];
+        app.on_key(key(KeyCode::F(6)));
+        assert!(app.hf_edit.is_none(), "the retried commit lands");
+        assert!(app.modified);
+        let xml = app.pkg.part_text(&part).expect("header part text");
+        assert!(xml.contains(">Fixed<"), "{xml}");
+
+        let path = save_to_temp(&mut app, "hf-fix-retry");
+        let header = saved_header(&app, &path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert!(header.contains("Fixed"), "{header}");
+    }
+
+    /// #1308: a failed save keeps the failed edit open for a retry, like
+    /// every other direct commit_hf_edit caller; leaving it unchanged then
+    /// discards it.
+    #[test]
+    fn failed_save_keeps_the_header_edit_for_retry() {
+        let mut app = app_in_failing_header_edit();
+        let err = app.try_save().unwrap_err();
+        assert!(err.contains("Couldn't write the header edit"), "{err}");
+        let hf = app.hf_edit.as_ref().expect("the failed edit stays open");
+        assert!(hf.is_header);
+        assert!(
+            app.editor.doc.body == header_link_body("https://b.example/"),
+            "the editor still holds the link"
+        );
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.hf_edit.is_none());
+        assert_eq!(app.status.as_deref(), Some("Discarded the header edit."));
+    }
+
+    /// #1308: a commit that mints link rel ids and only then fails (the
+    /// part's wrapper is gone) still leaves the open edit's link without
+    /// an id: the write must never hand the editor's own blocks to
+    /// link_part_hyperlinks.
+    #[test]
+    fn failed_header_commit_after_minting_link_ids_keeps_the_edit_unlinked() {
+        let (mut app, part) = app_with_header_part(|_| b"<junk/>".to_vec());
+        app.run_act(ribbon::Act::EditHeader);
+        app.editor.doc.body = header_link_body("https://a.example/");
+        let remembered = app.editor.doc.body.clone();
+        app.on_key(key(KeyCode::F(6)));
+        let hf = app.hf_edit.as_ref().expect("the failed edit stays open");
+        assert!(hf.is_header);
+        assert!(
+            app.editor.doc.body == remembered,
+            "the minted rel id must not reach the open editor"
+        );
+        assert_eq!(app.pkg.part(&part).unwrap(), b"<junk/>", "part untouched");
+        let rels_name = part.replace("word/", "word/_rels/") + ".rels";
+        assert!(
+            app.pkg.part(&rels_name).is_none(),
+            "no rels part may be created by a failed commit"
+        );
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.hf_edit.is_none());
+        assert_eq!(app.status.as_deref(), Some("Discarded the header edit."));
+    }
+
     #[test]
     fn header_edit_link_with_unreadable_header_rels_writes_nothing() {
         // A first link creates the header's rels, which then turn unreadable.
@@ -11076,7 +11409,7 @@ mod tests {
         app.run_act(ribbon::Act::EditHeader);
         app.editor.doc.body = header_link_body("https://b.example/");
         app.on_key(key(KeyCode::F(6)));
-        assert!(app.hf_edit.is_none());
+        assert!(app.hf_edit.is_some(), "the failed edit stays open");
         assert_eq!(
             app.pkg.part(&part).unwrap(),
             header_before,
@@ -12973,7 +13306,7 @@ mod tests {
     fn header_comment_discarded_on_exit_is_not_listed() {
         let mut app = app_with(&["The quick brown fox."]);
         header_comment(&mut app, "Colour?");
-        app.exit_hf_edit(false);
+        let _ = app.commit_hf_edit(false);
         assert!(app.comments.is_empty(), "the panel drops it");
         let path = save_to_temp(&mut app, "cmt-hf-discard");
         let (_, comments) = saved_parts(&path);

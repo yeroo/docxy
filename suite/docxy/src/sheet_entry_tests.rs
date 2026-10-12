@@ -1904,6 +1904,29 @@ fn ctrl_shift_u_is_the_formula_bar_key_even_in_protected_view() {
     assert!(!open_mode::protected_allows_key("u", true, true, false));
 }
 
+#[test]
+fn ctrl_1_opens_format_cells_but_not_its_shift_or_altgr_twins() {
+    // `on_key` folds ⌘ into `ctrl`, so this is ⌘1 on a Mac too (#1164).
+    assert!(format_cells_key("1", true, false, false));
+    assert!(!format_cells_key("1", true, true, false), "Ctrl+Shift+1");
+    assert!(
+        !format_cells_key("!", true, true, false),
+        "Ctrl+Shift+1 as its character"
+    );
+    assert!(
+        !format_cells_key("1", true, false, true),
+        "Ctrl+Alt+1 is AltGr on Windows"
+    );
+    assert!(
+        !format_cells_key("1", false, false, false),
+        "a plain 1 types"
+    );
+    assert!(!format_cells_key("1", false, false, true), "Alt+1");
+    assert!(!format_cells_key("2", true, false, false));
+    // Protected View refuses it before `sheet_key`'s chords.
+    assert!(!open_mode::protected_allows_key("1", true, false, false));
+}
+
 /// One A to Z level on column `col`.
 fn by(col: u32) -> [gridcore::edit::SortLevel; 1] {
     [gridcore::edit::SortLevel {

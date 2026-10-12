@@ -4,8 +4,12 @@
 //! quantity the assignment does not have (its text is what Project shows for
 //! it, `0 hrs`, `$0.00`, `0%`). Work shows in hours (a material's as its
 //! quantity and label), money as currency units, the delay in working days.
-//! Peak and the budget fields read their stored values; nothing computes them
-//! yet.
+//! Peak reads like Units: the stored peak while no edit has touched the
+//! units, else the units (`assign::peak_units`). The budget fields read their
+//! stored values, else 0, as Project writes for every assignment but a budget
+//! resource's on the project summary. The custom fields (Text1-30, Number1-20, Cost1-10, Flag1-20,
+//! Date/Start/Finish/Duration1-10, #1178) follow the built-ins and read as
+//! the task registry's do (see `custom`).
 use super::*;
 use crate::editor::cells::{format_quantity, format_units, shown_label};
 
@@ -36,6 +40,8 @@ pub enum AssignmentField {
     Peak,
     BudgetWork,
     BudgetCost,
+    /// A custom field, `Text1` for `Custom(Text, 1)`.
+    Custom(CustomKind, u8),
 }
 
 const NAMES: &[(AssignmentField, &str)] = &[
@@ -66,17 +72,24 @@ const NAMES: &[(AssignmentField, &str)] = &[
 ];
 
 impl AssignmentField {
-    /// Every readable field, in registry order.
+    /// Every readable field, in registry order: the built-ins, then the
+    /// custom fields in the task registry's family order.
     pub fn all() -> Vec<AssignmentField> {
-        NAMES.iter().map(|&(f, _)| f).collect()
+        let customs = CUSTOM_KINDS
+            .iter()
+            .flat_map(|&(kind, _, max)| (1..=max).map(move |n| AssignmentField::Custom(kind, n)));
+        NAMES.iter().map(|&(f, _)| f).chain(customs).collect()
     }
 
-    /// Project's name for the field (`% Work Complete`).
-    pub fn name(self) -> &'static str {
+    /// Project's name for the field (`% Work Complete`, `Text1`).
+    pub fn name(self) -> String {
+        if let AssignmentField::Custom(kind, n) = self {
+            return Field::Custom(kind, n).name();
+        }
         NAMES
             .iter()
             .find(|(f, _)| *f == self)
-            .map_or("", |(_, name)| name)
+            .map_or_else(String::new, |(_, name)| (*name).to_string())
     }
 
     /// The field with this name, trimmed and matched without regard to ASCII
@@ -94,7 +107,7 @@ impl AssignmentField {
 pub fn assignment_field_names() -> Vec<String> {
     AssignmentField::all()
         .into_iter()
-        .map(|f| f.name().to_string())
+        .map(AssignmentField::name)
         .collect()
 }
 
@@ -153,18 +166,7 @@ pub fn read_assignment_field(ed: &Editor, a: &Assignment, field: AssignmentField
         },
         AssignmentField::TaskName => optional_text(task.map(|t| t.name.as_str())),
         AssignmentField::ResourceName => optional_text(resource.map(|r| r.name.as_str())),
-        AssignmentField::Units => match resource.map(|r| r.kind) {
-            Some(ResourceType::Cost) => FieldRead::new("", FieldValue::Null),
-            Some(ResourceType::Material) => {
-                let qty = format_quantity(a.units);
-                let text = match material.and_then(shown_label) {
-                    Some(label) => format!("{qty} {label}"),
-                    None => qty,
-                };
-                FieldRead::new(text, FieldValue::Number(a.units))
-            }
-            _ => FieldRead::new(format_units(a.units), FieldValue::Number(a.units)),
-        },
+        AssignmentField::Units => units(resource, a.units),
         AssignmentField::Work => work(Some(a.work_min)),
         AssignmentField::RegularWork => work(a.regular_work_min),
         AssignmentField::OvertimeWork => work(a.overtime_work_min),
@@ -181,15 +183,30 @@ pub fn read_assignment_field(ed: &Editor, a: &Assignment, field: AssignmentField
         AssignmentField::Delay => duration(proj, Some(a.delay_min()), DurationUnit::DAYS),
         AssignmentField::CostRateTable => text(rate_table_letter(a.cost_rate_table).to_string()),
         AssignmentField::WorkContour => text(work_contour_name(a.work_contour)),
-        AssignmentField::Peak => {
-            let peak = a.peak_units.as_ref().and_then(Rate::to_f64);
-            FieldRead::new(
-                format_units(peak.unwrap_or(0.0)),
-                peak.map_or(FieldValue::Null, FieldValue::Number),
-            )
+        AssignmentField::Peak => match crate::assign::peak_units(a) {
+            Some(peak) => units(resource, peak),
+            None => FieldRead::new(units(resource, 0.0).text, FieldValue::Null),
+        },
+        AssignmentField::BudgetWork => work(Some(a.budget_work_min.unwrap_or(0))),
+        AssignmentField::BudgetCost => money_value(Some(hundredths(a.budget_cost.as_ref()))),
+        AssignmentField::Custom(kind, n) => custom::read_assignment(proj, a, kind, n),
+    }
+}
+
+/// Units as Project shows them for the assignment's resource: a material's
+/// as its quantity and label, a cost resource's as nothing, else a percent.
+fn units(resource: Option<&Resource>, units: f64) -> FieldRead {
+    match resource {
+        Some(r) if r.kind == ResourceType::Cost => FieldRead::new("", FieldValue::Null),
+        Some(r) if r.kind == ResourceType::Material => {
+            let qty = format_quantity(units);
+            let text = match shown_label(r) {
+                Some(label) => format!("{qty} {label}"),
+                None => qty,
+            };
+            FieldRead::new(text, FieldValue::Number(units))
         }
-        AssignmentField::BudgetWork => work(a.budget_work_min),
-        AssignmentField::BudgetCost => money(a.budget_cost.as_ref()),
+        _ => FieldRead::new(format_units(units), FieldValue::Number(units)),
     }
 }
 

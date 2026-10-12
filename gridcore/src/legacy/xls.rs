@@ -1640,4 +1640,40 @@ pub(crate) mod tests {
             CellValue::Number(100.0)
         );
     }
+
+    /// The oracle for `builtin_code`'s table (#1279): Excel's own .xls
+    /// writes builtins 5-8 and 41-44 as explicit FORMAT records, and the
+    /// strings there are the codes the table must carry.
+    #[test]
+    fn xls_builtin_format_records_match_builtin_code() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../corpus/legacy/oracle-basic.xls"
+        );
+        // A missing corpus file is a failure, never a skip.
+        let data = std::fs::read(path).unwrap();
+        let cfb = opccore::cfb::Cfb::open(&data).unwrap();
+        let stream = ["Workbook", "Book"]
+            .iter()
+            .find_map(|n| cfb.read_stream(n))
+            .unwrap();
+        let mut codes = std::collections::HashMap::new();
+        for r in records(&stream) {
+            if r.ty == 0x041E {
+                let mut c = Cur::new(&r);
+                let id = c.u16().unwrap();
+                codes.insert(id, c.xl_string().unwrap());
+            }
+        }
+        for id in [5u16, 6, 7, 8, 41, 42, 43, 44] {
+            let recorded = codes
+                .get(&id)
+                .unwrap_or_else(|| panic!("oracle-basic.xls has no FORMAT record for ifmt {id}"));
+            assert_eq!(
+                Some(recorded.as_str()),
+                crate::numfmt::builtin_code(u32::from(id)),
+                "ifmt {id}"
+            );
+        }
+    }
 }

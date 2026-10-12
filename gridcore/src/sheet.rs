@@ -2324,13 +2324,17 @@ pub fn classify_builtin(id: u32) -> NumFmt {
             decimals: 2,
             thousands: false,
         },
-        3 | 37 | 38 => NumFmt::Number {
+        3 | 5 | 6 | 37 | 38 | 41 | 42 => NumFmt::Number {
             decimals: 0,
             thousands: true,
         },
-        4 | 39 | 40 | 44 => NumFmt::Number {
+        4 | 7 | 8 | 39 | 40 | 43 | 44 => NumFmt::Number {
             decimals: 2,
             thousands: true,
+        },
+        12 | 13 => NumFmt::Number {
+            decimals: 0,
+            thousands: false,
         },
         9 => NumFmt::Percent { decimals: 0 },
         10 => NumFmt::Percent { decimals: 2 },
@@ -3344,6 +3348,18 @@ mod tests {
                 thousands: false
             }
         );
+    }
+
+    /// #1279: the loader fills `Xf::numfmt` from `classify_builtin` and
+    /// `Xf::code` from `builtin_code`, and the entry rules read both — the
+    /// two must never disagree for a builtin id.
+    #[test]
+    fn classify_builtin_matches_its_code() {
+        for id in 0..=49u32 {
+            if let Some(code) = crate::numfmt::builtin_code(id) {
+                assert_eq!(classify_builtin(id), classify_format_code(code), "id {id}");
+            }
+        }
     }
 
     #[test]

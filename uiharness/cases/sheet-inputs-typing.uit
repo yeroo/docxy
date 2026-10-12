@@ -1,0 +1,1048 @@
+# The sheet's inputs outside the dialogs, typed into with real keys only
+# (#1200, the sheet slice of #1029): the formula bar, the in-cell editor,
+# the Name Box, the Find bar's Find and Replace fields and the Home ribbon's
+# Font and Font Size boxes. Written by hand, not generated: the dialog
+# catalogue's `inputs-typing-*.uit` own that prefix.
+#
+# `real-key` and `real-type` go through the window's own input path, and an
+# input is focused by `pointer-click {"input":id}` (a double-click on the
+# active cell for the in-cell editor) or by Tab. `open` and `click <cell>`
+# are setup only. A test is one input and one step, named
+# `sheet <input>: <step>`; each opens its own copy and first presses Escape,
+# which closes a Find bar an earlier test left open (the bar is the
+# window's, not the tab's). Expected values follow Excel. The steps that
+# fail today are in expected-failures.txt. See qa/inputs-typing.md.
+
+# ---- The formula bar: a click opens an Edit-mode entry on the active cell.
+
+test sheet formula-bar: focus by click
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  click A1
+  assert editing is false
+  call pointer-click {"input":"formula-bar"}
+  call field-read {"input":"formula-bar"}
+  assert reply.focused is true
+  assert reply.value is Region
+  assert editing is true
+  assert edit is Region
+  call real-key {"key":"escape"}
+
+test sheet formula-bar: types
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"formula-bar"}
+  assert app_state is Edit
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"formula-bar"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test sheet formula-bar: edits
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"formula-bar"}
+  assert app_state is Edit
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"formula-bar"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"input":"formula-bar"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"formula-bar"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"formula-bar"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"formula-bar"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet formula-bar: select-all replaces
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"formula-bar"}
+  assert app_state is Edit
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"formula-bar"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"formula-bar"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet formula-bar: copies
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"input":"formula-bar"}
+  assert app_state is Edit
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet formula-bar: pastes
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"input":"formula-bar"}
+  assert app_state is Edit
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"formula-bar"}
+  assert reply.focused is true
+  assert reply.value is Pasted
+  assert reply.caret is 6
+  call real-key {"key":"escape"}
+
+test sheet formula-bar: Enter commits
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  assert dirty is false
+  call pointer-click {"input":"formula-bar"}
+  assert app_state is Edit
+  call real-type {"text":"Ab1"}
+  call real-key {"key":"enter"}
+  assert editing is false
+  assert cell E1 is exactly Ab1
+  assert sel is E2
+  assert dirty is true
+
+test sheet formula-bar: Escape cancels
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"formula-bar"}
+  assert app_state is Edit
+  call real-type {"text":"Ab1"}
+  call real-key {"key":"escape"}
+  assert editing is false
+  assert cell E1 is empty
+  assert sel is E1
+  assert dirty is false
+
+# ---- The in-cell editor: a double-click on the cell opens it.
+
+test sheet cell-editor: focus by click
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  click A1
+  assert editing is false
+  call pointer-click {"input":"cell-editor"}
+  assert reply.clicks is 2
+  call field-read {"input":"cell-editor"}
+  assert reply.focused is true
+  assert reply.value is Region
+  assert editing is true
+  assert sel is A1
+  call real-key {"key":"escape"}
+
+test sheet cell-editor: types
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"cell-editor"}
+  assert app_state is Edit
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"cell-editor"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test sheet cell-editor: edits
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"cell-editor"}
+  assert app_state is Edit
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"cell-editor"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"input":"cell-editor"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"cell-editor"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"cell-editor"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"cell-editor"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet cell-editor: select-all replaces
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"cell-editor"}
+  assert app_state is Edit
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"cell-editor"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"cell-editor"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet cell-editor: copies
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"input":"cell-editor"}
+  assert app_state is Edit
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet cell-editor: pastes
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"input":"cell-editor"}
+  assert app_state is Edit
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"cell-editor"}
+  assert reply.focused is true
+  assert reply.value is Pasted
+  assert reply.caret is 6
+  call real-key {"key":"escape"}
+
+test sheet cell-editor: Enter commits
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  assert dirty is false
+  call pointer-click {"input":"cell-editor"}
+  assert app_state is Edit
+  call real-type {"text":"Ab1"}
+  call real-key {"key":"enter"}
+  assert editing is false
+  assert cell E1 is exactly Ab1
+  assert sel is E2
+  assert dirty is true
+
+test sheet cell-editor: Escape cancels
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"cell-editor"}
+  assert app_state is Edit
+  call real-type {"text":"Ab1"}
+  call real-key {"key":"escape"}
+  assert editing is false
+  assert cell E1 is empty
+  assert sel is E1
+  assert dirty is false
+
+# ---- The Name Box: a click selects the reference it shows, Enter goes
+# to what was typed and Escape gives the reference back. Nothing typed
+# into it reaches the cell.
+
+test sheet name-box: focus by click
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"name-box"}
+  call field-read {"input":"name-box"}
+  assert reply.focused is true
+  assert reply.value is E1
+  assert reply.selection is [0,2]
+  call real-key {"key":"escape"}
+
+test sheet name-box: types
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"name-box"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"name-box"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test sheet name-box: edits
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"name-box"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"name-box"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"input":"name-box"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"name-box"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"name-box"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"name-box"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet name-box: select-all replaces
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"name-box"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"name-box"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"name-box"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet name-box: copies
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"input":"name-box"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet name-box: pastes
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"input":"name-box"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"name-box"}
+  assert reply.focused is true
+  assert reply.value is Pasted
+  assert reply.caret is 6
+  call real-key {"key":"escape"}
+
+test sheet name-box: Enter goes to the reference
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"name-box"}
+  call real-type {"text":"C3"}
+  call real-key {"key":"enter"}
+  assert sel is C3
+  assert editing is false
+  assert cell E1 is empty
+  call field-read {"input":"name-box"}
+  assert reply.focused is false
+  assert reply.value is C3
+
+test sheet name-box: Escape cancels
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"name-box"}
+  call real-type {"text":"C3"}
+  call field-read {"input":"name-box"}
+  assert reply.focused is true
+  assert reply.value is C3
+  call real-key {"key":"escape"}
+  assert sel is E1
+  assert editing is false
+  assert cell E1 is empty
+  call field-read {"input":"name-box"}
+  assert reply.focused is false
+  assert reply.value is E1
+
+# ---- The Find bar (Ctrl+F): Find what and Replace with. Tab moves between
+# them; Enter finds the next match from either, Escape closes the bar;
+# its Replace and All buttons have no key, so a real click presses them.
+
+test sheet sheet-find: focus by click
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call pointer-click {"input":"sheet-find"}
+  call field-read {"input":"sheet-find"}
+  assert reply.focused is true
+  call field-read {"input":"sheet-replace"}
+  assert reply.focused is false
+  call real-key {"key":"escape"}
+
+test sheet sheet-find: types
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-find"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"sheet-find"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test sheet sheet-find: edits
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-find"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"sheet-find"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"input":"sheet-find"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"sheet-find"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"sheet-find"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"sheet-find"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet sheet-find: select-all replaces
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-find"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"sheet-find"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"sheet-find"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet sheet-find: copies
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"input":"sheet-find"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet sheet-find: pastes
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"sheet-find"}
+  assert reply.focused is true
+  assert reply.value is Pasted
+  assert reply.caret is 6
+  call real-key {"key":"escape"}
+
+test sheet sheet-find: focus by Tab
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"tab"}
+  call field-read {"input":"sheet-find"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet sheet-find: Enter finds the next match
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-find"}
+  call real-type {"text":"West"}
+  call real-key {"key":"enter"}
+  assert sel is A5
+  assert find_open is true
+  call real-key {"key":"escape"}
+
+test sheet sheet-find: Escape closes the bar
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-find"}
+  call real-type {"text":"West"}
+  call field-read {"input":"sheet-find"}
+  assert reply.focused is true
+  assert reply.value is exactly West
+  call real-key {"key":"escape"}
+  assert find_open is false
+  assert sel is E1
+  call field-read {"input":"sheet-find"}
+  assert reply.focused is false
+
+test sheet sheet-replace: focus by click
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-find"}
+  call pointer-click {"input":"sheet-replace"}
+  call field-read {"input":"sheet-replace"}
+  assert reply.focused is true
+  call field-read {"input":"sheet-find"}
+  assert reply.focused is false
+  call real-key {"key":"escape"}
+
+test sheet sheet-replace: types
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"sheet-replace"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test sheet sheet-replace: edits
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"sheet-replace"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"input":"sheet-replace"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"sheet-replace"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"sheet-replace"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"sheet-replace"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet sheet-replace: select-all replaces
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"sheet-replace"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"sheet-replace"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet sheet-replace: copies
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"input":"sheet-replace"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet sheet-replace: pastes
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"sheet-replace"}
+  assert reply.focused is true
+  assert reply.value is Pasted
+  assert reply.caret is 6
+  call real-key {"key":"escape"}
+
+test sheet sheet-replace: focus by Tab
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"tab"}
+  call field-read {"input":"sheet-replace"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet sheet-replace: Enter finds the next match
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-find"}
+  call real-type {"text":"West"}
+  call pointer-click {"input":"sheet-replace"}
+  call real-type {"text":"Ab1"}
+  call real-key {"key":"enter"}
+  assert sel is A5
+  assert cell A5 is West
+  call real-key {"key":"escape"}
+
+test sheet sheet-replace: Replace rewrites the found cell
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  assert dirty is false
+  call pointer-click {"input":"sheet-find"}
+  call real-type {"text":"North"}
+  call pointer-click {"input":"sheet-replace"}
+  call real-type {"text":"Nord"}
+  call pointer-click {"at":"sheet-replace-button"}
+  assert sel is A2
+  call pointer-click {"at":"sheet-replace-button"}
+  assert cell A2 is Nord
+  assert dirty is true
+  call real-key {"key":"escape"}
+
+test sheet sheet-replace: All rewrites every match
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-find"}
+  call real-type {"text":"th"}
+  call pointer-click {"input":"sheet-replace"}
+  call real-type {"text":"XY"}
+  call pointer-click {"at":"sheet-replace-all-button"}
+  assert cell A2 is exactly NorXY
+  assert cell A3 is exactly SouXY
+  assert dirty is true
+  call real-key {"key":"escape"}
+
+test sheet sheet-replace: Escape closes the bar
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-type {"text":"Ab1"}
+  call field-read {"input":"sheet-replace"}
+  assert reply.focused is true
+  assert reply.value is exactly Ab1
+  call real-key {"key":"escape"}
+  assert find_open is false
+  assert dirty is false
+  call field-read {"input":"sheet-replace"}
+  assert reply.focused is false
+
+# ---- Home › Font and Font Size: a click selects the box's text, Enter
+# formats the selection with what was typed, Escape gives the value back.
+# Nothing typed into them reaches the cell.
+
+test sheet sheet-font: focus by click
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-font"}
+  call field-read {"input":"sheet-font"}
+  assert reply.focused is true
+  assert reply.value is Calibri
+  assert reply.selection is [0,7]
+  call real-key {"key":"escape"}
+
+test sheet sheet-font: types
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-font"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"sheet-font"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test sheet sheet-font: edits
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-font"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"sheet-font"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"input":"sheet-font"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"sheet-font"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"sheet-font"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"sheet-font"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet sheet-font: select-all replaces
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-font"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"sheet-font"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"sheet-font"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet sheet-font: copies
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"input":"sheet-font"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet sheet-font: pastes
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"input":"sheet-font"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"sheet-font"}
+  assert reply.focused is true
+  assert reply.value is Pasted
+  assert reply.caret is 6
+  call real-key {"key":"escape"}
+
+test sheet sheet-font: Enter formats the selection
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-font"}
+  call real-type {"text":"Arial"}
+  call real-key {"key":"enter"}
+  assert dirty is true
+  assert cell E1 is empty
+  click A1
+  click E1
+  call field-read {"input":"sheet-font"}
+  assert reply.value is Arial
+
+test sheet sheet-font: Escape cancels
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-font"}
+  call real-type {"text":"Arial"}
+  call field-read {"input":"sheet-font"}
+  assert reply.focused is true
+  assert reply.value is Arial
+  call real-key {"key":"escape"}
+  assert dirty is false
+  assert cell E1 is empty
+  call field-read {"input":"sheet-font"}
+  assert reply.focused is false
+  assert reply.value is Calibri
+
+test sheet sheet-font-size: focus by click
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-font-size"}
+  call field-read {"input":"sheet-font-size"}
+  assert reply.focused is true
+  assert reply.value is 11
+  assert reply.selection is [0,2]
+  call real-key {"key":"escape"}
+
+test sheet sheet-font-size: types
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-font-size"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"sheet-font-size"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test sheet sheet-font-size: edits
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-font-size"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"sheet-font-size"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"input":"sheet-font-size"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"sheet-font-size"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"sheet-font-size"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"sheet-font-size"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet sheet-font-size: select-all replaces
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-font-size"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"sheet-font-size"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"sheet-font-size"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test sheet sheet-font-size: copies
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"input":"sheet-font-size"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test sheet sheet-font-size: pastes
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"input":"sheet-font-size"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"sheet-font-size"}
+  assert reply.focused is true
+  assert reply.value is Pasted
+  assert reply.caret is 6
+  call real-key {"key":"escape"}
+
+test sheet sheet-font-size: Enter formats the selection
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-font-size"}
+  call real-type {"text":"14"}
+  call real-key {"key":"enter"}
+  assert dirty is true
+  assert cell E1 is empty
+  click A1
+  click E1
+  call field-read {"input":"sheet-font-size"}
+  assert reply.value is 14
+
+test sheet sheet-font-size: Escape cancels
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-font-size"}
+  call real-type {"text":"14"}
+  call field-read {"input":"sheet-font-size"}
+  assert reply.focused is true
+  assert reply.value is 14
+  call real-key {"key":"escape"}
+  assert dirty is false
+  assert cell E1 is empty
+  call field-read {"input":"sheet-font-size"}
+  assert reply.focused is false
+  assert reply.value is 11

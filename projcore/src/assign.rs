@@ -82,6 +82,20 @@ pub(crate) fn contoured(a: &Assignment) -> bool {
     !matches!(a.work_contour, None | Some(0))
 }
 
+/// The assignment's Peak: the most units it works at. A stored `PeakUnits`
+/// is Project's own, which may reflect timephased edits this model does not
+/// make, and it lasts only while no edit has touched the units (every rule
+/// that changes the rate clears it). Otherwise the model's own: a flat
+/// assignment works at exactly its units and a contoured one's units are its
+/// peak, so its units. A material's is its quantity; what a cost resource
+/// shows is the caller's (it has no units).
+pub(crate) fn peak_units(a: &Assignment) -> Option<f64> {
+    a.peak_units
+        .as_ref()
+        .and_then(Rate::to_f64)
+        .or(Some(a.units).filter(|u| u.is_finite()))
+}
+
 /// Whether an assignment's work is working time: a work resource's, or one
 /// without a resource (Project's unassigned -65535). A material's work is a
 /// quantity and a cost resource has none, so a task's Work leaves them out.
@@ -283,6 +297,89 @@ pub fn assignment_cost(
     money(hundredths)
 }
 
+/// The overtime rate (currency per hour) that prices a work resource's
+/// overtime on the assignment: its rate table's row in effect at `start`, as
+/// [`assignment_cost`] prices it. `None` for any other resource, or none.
+fn overtime_rate(proj: &Project, a: &Assignment, start: DateTime) -> Option<f64> {
+    let r = proj.resources.iter().find(|r| r.uid == a.resource_uid)?;
+    if r.kind != ResourceType::Work {
+        return None;
+    }
+    let rows = rate_rows(r, a.cost_rate_table.unwrap_or(0));
+    Some(value(row_at(&rows, start).overtime))
+}
+
+/// An assignment's % work complete from its work and actual work: 0 only
+/// with no actual work, 100 only when the actual reaches the work, else
+/// rounded into 1..=99.
+pub(crate) fn work_percent(work_min: i64, actual_min: i64) -> u8 {
+    if actual_min <= 0 {
+        0
+    } else if actual_min >= work_min {
+        100
+    } else {
+        let pct = (actual_min as f64 * 100.0 / work_min as f64).round();
+        pct.clamp(1.0, 99.0) as u8
+    }
+}
+
+/// What the first `actual_min` minutes of the assignment's work cost, its
+/// work running over `(start, finish)` and costing `cost` in all. Done work
+/// (the actual reaches the work, and is some work or has an actual finish)
+/// is its whole cost; work not begun (no actual and no actual start) costs
+/// nothing. Between, its resource's `AccrueAt` decides: Start puts the whole
+/// cost into the actual cost, End none of it, and Prorated (the default)
+/// prices the actual part: the share of the span's working time the actual
+/// work covers, from the start, with the actual overtime (never more than
+/// the actual) at the overtime rate and the cost per use once. `None`,
+/// leaving the stored actual cost, for a cost resource and when there is no
+/// such resource.
+pub(crate) fn actual_cost(
+    proj: &Project,
+    a: &Assignment,
+    actual_min: i64,
+    (start, finish): (DateTime, DateTime),
+    cost: Option<&Rate>,
+) -> Option<Rate> {
+    let r = proj.resources.iter().find(|r| r.uid == a.resource_uid)?;
+    if r.kind == ResourceType::Cost {
+        return None;
+    }
+    let none = || money(0.0);
+    if actual_min >= a.work_min && (actual_min > 0 || a.actual_finish.is_some()) {
+        return cost.cloned();
+    }
+    if actual_min <= 0 && a.actual_start.is_none() {
+        return none();
+    }
+    match r.accrue_at {
+        Some(AccrueAt::Start) => cost.cloned(),
+        Some(AccrueAt::End) => none(),
+        _ => {
+            let cal = match proj.task(a.task_uid) {
+                Some(task) => task_calendar(proj, task),
+                None => WorkCalendar::weekly(Calendar::standard_week()),
+            };
+            let total = working_minutes_on(&cal, start, finish);
+            let share = if a.work_min > 0 {
+                actual_min.max(0) as f64 / a.work_min as f64
+            } else {
+                0.0
+            };
+            let part = (total as f64 * share).round() as i64;
+            let end = advance(&cal, start, part, true)?.max(start);
+            let mut done = a.clone();
+            done.work_min = actual_min.max(0);
+            done.overtime_work_min = Some(
+                a.actual_overtime_work_min
+                    .unwrap_or(0)
+                    .clamp(0, actual_min.max(0)),
+            );
+            assignment_cost(proj, &done, (start, end))
+        }
+    }
+}
+
 // ---- refresh after an edit ----------------------------------------------------
 
 /// Whether anything an assignment's derived fields are computed from differs
@@ -358,6 +455,8 @@ struct TaskTotals {
     remaining_overtime_work: i64,
     overtime_cost: f64,
     remaining_overtime_cost: f64,
+    actual_work: i64,
+    actual_cost: f64,
 }
 
 impl TaskTotals {
@@ -371,6 +470,8 @@ impl TaskTotals {
             remaining_overtime_work: self.remaining_overtime_work - before.remaining_overtime_work,
             overtime_cost: self.overtime_cost - before.overtime_cost,
             remaining_overtime_cost: self.remaining_overtime_cost - before.remaining_overtime_cost,
+            actual_work: self.actual_work - before.actual_work,
+            actual_cost: self.actual_cost - before.actual_cost,
         }
     }
 
@@ -384,6 +485,8 @@ impl TaskTotals {
         self.remaining_overtime_work += sign * other.remaining_overtime_work;
         self.overtime_cost += f * other.overtime_cost;
         self.remaining_overtime_cost += f * other.remaining_overtime_cost;
+        self.actual_work += sign * other.actual_work;
+        self.actual_cost += f * other.actual_cost;
     }
 }
 
@@ -401,13 +504,20 @@ fn totals<'a>(assignments: impl Iterator<Item = &'a Assignment>) -> Totals {
 /// The task's own contribution to stored totals: its assignments and fixed
 /// cost, with work counting only assignments whose work is time ([`is_work`]).
 fn task_totals(p: &Project, uid: i32) -> TaskTotals {
-    let mine = p.assignments.iter().filter(|a| a.task_uid == uid);
+    let mine: Vec<&Assignment> = p.assignments.iter().filter(|a| a.task_uid == uid).collect();
+    own_totals(p, p.task(uid), &mine)
+}
+
+/// [`task_totals`] for `task` with its assignments `mine`.
+fn own_totals(p: &Project, task: Option<&Task>, mine: &[&Assignment]) -> TaskTotals {
+    let mine = mine.iter().copied();
     let (_, cost, _, remaining_cost) = totals(mine.clone());
     let overtime_cost: f64 = mine.clone().map(|a| value(a.overtime_cost.as_ref())).sum();
     let remaining_overtime_cost: f64 = mine
         .clone()
         .map(|a| value(a.remaining_overtime_cost.as_ref()))
         .sum();
+    let actual_cost: f64 = mine.clone().map(|a| value(a.actual_cost.as_ref())).sum();
     let work_assignments: Vec<_> = mine.filter(|a| is_work(&p.resources, a)).collect();
     let (work, _, remaining, _) = totals(work_assignments.iter().copied());
     let overtime_work = work_assignments
@@ -418,7 +528,11 @@ fn task_totals(p: &Project, uid: i32) -> TaskTotals {
         .iter()
         .map(|a| a.remaining_overtime_work_min.unwrap_or(0))
         .sum();
-    let (fixed, fixed_remaining) = p.task(uid).map_or((0.0, 0.0), |t| {
+    let actual_work = work_assignments
+        .iter()
+        .map(|a| a.actual_work_min.unwrap_or(0))
+        .sum();
+    let (fixed, fixed_remaining) = task.map_or((0.0, 0.0), |t| {
         let amount = value(t.fixed_cost.as_ref());
         let pct = t.percent_complete.unwrap_or(0).min(100);
         let share = match t.fixed_cost_accrual {
@@ -439,6 +553,8 @@ fn task_totals(p: &Project, uid: i32) -> TaskTotals {
         remaining_overtime_work,
         overtime_cost,
         remaining_overtime_cost,
+        actual_work,
+        actual_cost,
     }
 }
 
@@ -490,6 +606,30 @@ impl OutlineIndex {
     }
 }
 
+/// Each task's whole contribution, its own ([`task_totals`]) and every
+/// outline descendant's, and whether every assignment counted in it has a
+/// known cost.
+fn rollups(p: &Project, index: &OutlineIndex) -> HashMap<i32, (TaskTotals, bool)> {
+    let mut mine: HashMap<i32, Vec<&Assignment>> = HashMap::new();
+    for a in &p.assignments {
+        mine.entry(a.task_uid).or_default().push(a);
+    }
+    let mut rolled: HashMap<i32, (TaskTotals, bool)> = HashMap::new();
+    for (&uid, &i) in &index.positions {
+        let assignments = mine.get(&uid).map(Vec::as_slice).unwrap_or(&[]);
+        let own = own_totals(p, Some(&p.tasks[i]), assignments);
+        let known = assignments.iter().all(|a| a.cost.is_some());
+        for target in std::iter::once(uid).chain(index.ancestors(uid).iter().copied()) {
+            let entry = rolled
+                .entry(target)
+                .or_insert((TaskTotals::default(), true));
+            entry.0.add_scaled(own, 1);
+            entry.1 &= known;
+        }
+    }
+    rolled
+}
+
 /// Refresh what an edit made stale. `prev` and `prev_sched` are the model and
 /// schedule before the edit; `proj` is the edited model and `sched` its
 /// schedule. Every field it writes is derived from the edit's inputs, from
@@ -502,17 +642,33 @@ impl OutlineIndex {
 ///   [`inputs_changed`]), gets its `Start`/`Finish` from [`assignment_span`]
 ///   and its `Cost` from [`assignment_cost`] (a cost it cannot price stays),
 ///   `RegularWork` = work − overtime, `RemainingWork` = work − actual work and
-///   `RemainingCost` = cost − actual cost. Its planned-work spread (Type 1)
+///   `ActualCost` from its actual work ([`actual_cost`]; one it cannot price
+///   stays, and so does every one when the plan's actual costs are entered
+///   by hand, [`Project::editable_actual_costs`]), `RemainingCost` = cost − actual cost, and `PercentWorkComplete`
+///   from its actual work when it has one ([`work_percent`]). A work
+///   resource's assignment with `OvertimeWork` gets `RemainingOvertimeWork` =
+///   overtime − actual overtime, and `OvertimeCost`, `RemainingOvertimeCost`
+///   and (with `ActualOvertimeWork`) `ActualOvertimeCost` at the overtime
+///   rate in effect at its start. Its planned-work spread (Type 1)
 ///   is dropped when its dates or work moved.
 /// - A task moves its stored `Work`, `Cost`, `RemainingWork`, `RemainingCost`,
 ///   `OvertimeWork`, `RemainingOvertimeWork`, `OvertimeCost` and
 ///   `RemainingOvertimeCost` by changes in its own contribution (work and
 ///   overtime work counting work resources only), and `RegularWork` by the work change
-///   less the overtime change. Its outline summaries move by the same deltas;
+///   less the overtime change; `ActualWork` (work resources) and `ActualCost`
+///   move by their assignments' changes, and `PercentWorkComplete` follows
+///   when its work or actual work moved and both are stored. Its outline summaries move by the same deltas;
 ///   a task moved in the outline takes its assignments and its own fixed cost
-///   from its old summaries to its new ones. An absent total stays absent.
+///   from its old summaries to its new ones. An absent `Work`, `Cost`,
+///   `RemainingWork` or `RemainingCost` the edit moves is filled with the
+///   task's whole contribution and its outline descendants' (a cost one
+///   only when every assignment counted in it has a known cost); any other
+///   absent total, and one the edit does not move, stays absent.
 /// - A resource whose assignments changed (added, removed or refreshed) gets
-///   its work, cost and remaining totals and its `Start`/`Finish` from them.
+///   its work, cost and remaining totals and its `Start`/`Finish` from them,
+///   and its actual work, % work complete, actual cost, overtime cost and
+///   remaining overtime where it or one of those assignments has them (a
+///   cost total only when every assignment's cost is known).
 pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project, sched: &Schedule) {
     let calendar_changed: HashSet<i32> = proj
         .assignments
@@ -538,7 +694,21 @@ pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project,
             continue;
         }
         let span = assignment_span(proj, sched, a);
-        let cost = span.and_then(|span| assignment_cost(proj, a, span));
+        // A cost it cannot price (a cost resource's, entered by hand, or one
+        // without a resource) stays as it was, even where a work edit
+        // cleared it.
+        let cost = span
+            .and_then(|span| assignment_cost(proj, a, span))
+            .or_else(|| a.cost.clone())
+            .or_else(|| was.and_then(|b| b.cost.clone()));
+        // The actual part of that cost, unless actual costs are entered by
+        // hand; one it cannot price stays.
+        let actual = a
+            .actual_work_min
+            .zip(span)
+            .filter(|_| !proj.editable_actual_costs())
+            .and_then(|(actual, span)| actual_cost(proj, a, actual, span, cost.as_ref()));
+        let overtime_rate = span.and_then(|(start, _)| overtime_rate(proj, a, start));
         let a = &mut proj.assignments[k];
         refreshed.insert(a.uid);
         if let Some((start, finish)) = span {
@@ -553,18 +723,35 @@ pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project,
             a.timephased_data
                 .retain(|t| t.kind != TimephasedValue::REMAINING_WORK);
         }
-        // A cost it cannot price (a cost resource's, entered by hand, or one
-        // without a resource) stays as it was, even where a work edit
-        // cleared it.
-        a.cost = cost
-            .or_else(|| a.cost.clone())
-            .or_else(|| was.and_then(|b| b.cost.clone()));
+        a.cost = cost;
+        a.actual_cost = actual.or(a.actual_cost.take());
         let overtime = a.overtime_work_min.unwrap_or(0).max(0);
         a.regular_work_min = Some((a.work_min - overtime).max(0));
         a.remaining_work_min = Some((a.work_min - a.actual_work_min.unwrap_or(0)).max(0));
         if let Some(cost) = &a.cost {
             let left = value(Some(cost)) - value(a.actual_cost.as_ref());
             a.remaining_cost = money(left.max(0.0));
+        }
+        // A work resource's overtime is priced as its cost prices it.
+        let priced = |min: i64, rate: f64| money(min as f64 / 60.0 * rate * 100.0);
+        if let (Some(overtime), Some(rate)) = (a.overtime_work_min, overtime_rate) {
+            let overtime = overtime.max(0);
+            let left = (overtime - a.actual_overtime_work_min.unwrap_or(0)).max(0);
+            a.overtime_cost = priced(overtime, rate);
+            a.remaining_overtime_work_min = Some(left);
+            a.remaining_overtime_cost = priced(left, rate);
+        }
+        if let (Some(done), Some(rate)) = (a.actual_overtime_work_min, overtime_rate) {
+            a.actual_overtime_cost = priced(done.max(0), rate);
+        }
+        if let Some(actual) = a.actual_work_min {
+            // A finished assignment without work is all done.
+            let finished = a.actual_finish.is_some() && actual >= a.work_min;
+            a.percent_work_complete = Some(if finished {
+                100
+            } else {
+                work_percent(a.work_min, actual)
+            });
         }
     }
 
@@ -626,27 +813,57 @@ pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project,
             }
         }
     }
+    // An absent Work, Cost, RemainingWork or RemainingCost the edit moves is
+    // filled with the task's whole rollup, built only when one is needed.
+    let fills = proj.tasks.iter().any(|t| {
+        let (Some(delta), Some(was)) = (moved.get(&t.uid), prev_index.task(prev, t.uid)) else {
+            return false;
+        };
+        (delta.work != 0 && was.work_min.is_none())
+            || (delta.remaining_work != 0 && was.remaining_work_min.is_none())
+            || (delta.cost != 0.0 && was.cost.is_none())
+            || (delta.remaining_cost != 0.0 && was.remaining_cost.is_none())
+    });
+    let rolled = if fills {
+        rollups(proj, &now_index)
+    } else {
+        HashMap::new()
+    };
     for t in &mut proj.tasks {
         let (Some(&delta), Some(was)) = (moved.get(&t.uid), prev_index.task(prev, t.uid)) else {
             continue;
         };
+        let full = rolled.get(&t.uid).map(|&(totals, _)| totals);
+        // A total over a cost nobody knows would be invented.
+        let full_cost = rolled
+            .get(&t.uid)
+            .filter(|&&(_, known)| known)
+            .map(|&(totals, _)| totals);
+        let moved_or_full = |was: Option<&Rate>, delta: f64, full: Option<f64>| match was {
+            Some(c) => money(value(Some(c)) + delta),
+            None => full.and_then(money),
+        };
         if delta.work != 0 {
-            t.work_min = was.work_min.map(|w| w + delta.work);
+            t.work_min = match was.work_min {
+                Some(w) => Some(w + delta.work),
+                None => full.map(|f| f.work),
+            };
         }
         if delta.remaining_work != 0 {
-            t.remaining_work_min = was.remaining_work_min.map(|w| w + delta.remaining_work);
+            t.remaining_work_min = match was.remaining_work_min {
+                Some(w) => Some(w + delta.remaining_work),
+                None => full.map(|f| f.remaining_work),
+            };
         }
         if delta.cost != 0.0 {
-            t.cost = was
-                .cost
-                .as_ref()
-                .and_then(|c| money(value(Some(c)) + delta.cost));
+            t.cost = moved_or_full(was.cost.as_ref(), delta.cost, full_cost.map(|f| f.cost));
         }
         if delta.remaining_cost != 0.0 {
-            t.remaining_cost = was
-                .remaining_cost
-                .as_ref()
-                .and_then(|c| money(value(Some(c)) + delta.remaining_cost));
+            t.remaining_cost = moved_or_full(
+                was.remaining_cost.as_ref(),
+                delta.remaining_cost,
+                full_cost.map(|f| f.remaining_cost),
+            );
         }
         if delta.overtime_work != 0 {
             t.overtime_work_min = was.overtime_work_min.map(|w| w + delta.overtime_work);
@@ -671,6 +888,20 @@ pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project,
         let regular_delta = delta.work - delta.overtime_work;
         if regular_delta != 0 {
             t.regular_work_min = was.regular_work_min.map(|w| w + regular_delta);
+        }
+        if delta.actual_work != 0 {
+            t.actual_work_min = was.actual_work_min.map(|w| w + delta.actual_work);
+        }
+        if delta.actual_cost != 0.0 {
+            t.actual_cost = was
+                .actual_cost
+                .as_ref()
+                .and_then(|c| money(value(Some(c)) + delta.actual_cost));
+        }
+        if delta.work != 0 || delta.actual_work != 0 {
+            if let (Some(work), Some(actual)) = (t.work_min, t.actual_work_min) {
+                t.percent_work_complete = Some(work_percent(work, actual));
+            }
         }
     }
 
@@ -707,10 +938,43 @@ pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project,
         r.overtime_work_min = Some(overtime);
         r.regular_work_min = Some((work - overtime).max(0));
         r.remaining_work_min = Some(remaining);
+        // The progress and overtime totals are set only where the resource
+        // or one of its assignments has them, so an untracked plan gains
+        // none.
+        let tracked =
+            |had: bool, field: fn(&Assignment) -> bool| had || mine.iter().any(|a| field(a));
+        if tracked(r.actual_work_min.is_some(), |a| a.actual_work_min.is_some()) {
+            let actual = mine.iter().map(|a| a.actual_work_min.unwrap_or(0)).sum();
+            r.actual_work_min = Some(actual);
+            r.percent_work_complete = Some(work_percent(work, actual));
+        }
+        if tracked(r.remaining_overtime_work_min.is_some(), |a| {
+            a.remaining_overtime_work_min.is_some()
+        }) {
+            r.remaining_overtime_work_min = Some(
+                mine.iter()
+                    .map(|a| a.remaining_overtime_work_min.unwrap_or(0))
+                    .sum(),
+            );
+        }
         // A total over a cost nobody knows would be invented.
         if mine.iter().all(|a| a.cost.is_some()) {
             r.cost = money(cost);
             r.remaining_cost = money(remaining_c);
+            let sum = |field: fn(&Assignment) -> Option<&Rate>| {
+                money(mine.iter().map(|a| value(field(a))).sum())
+            };
+            if tracked(r.actual_cost.is_some(), |a| a.actual_cost.is_some()) {
+                r.actual_cost = sum(|a| a.actual_cost.as_ref());
+            }
+            if tracked(r.overtime_cost.is_some(), |a| a.overtime_cost.is_some()) {
+                r.overtime_cost = sum(|a| a.overtime_cost.as_ref());
+            }
+            if tracked(r.remaining_overtime_cost.is_some(), |a| {
+                a.remaining_overtime_cost.is_some()
+            }) {
+                r.remaining_overtime_cost = sum(|a| a.remaining_overtime_cost.as_ref());
+            }
         }
         r.start = mine.iter().filter_map(|a| a.start).min();
         r.finish = mine.iter().filter_map(|a| a.finish).max();
@@ -883,6 +1147,140 @@ mod tests {
             assert_eq!(t.remaining_overtime_work_min, None);
             assert_eq!(t.overtime_cost, None);
             assert_eq!(t.remaining_overtime_cost, None);
+        }
+    }
+
+    /// Project summary 0 over summary 1 over leaves 2 (no assignments) and
+    /// 3 (an 8-hour assignment at $50/h with 2 hours done, and a $10 fixed
+    /// cost). Only leaf 3 stores its totals.
+    fn rollup_plan() -> Project {
+        let mut p = plan(at(2, 8), 1);
+        let task = |uid, outline_level, summary| Task {
+            uid,
+            id: uid,
+            outline_level,
+            summary,
+            name: format!("T{uid}"),
+            duration_min: 480,
+            ..Task::default()
+        };
+        p.tasks = vec![
+            task(0, 0, true),
+            task(1, 1, true),
+            task(2, 2, false),
+            Task {
+                fixed_cost: Rate::parse("1000"),
+                work_min: Some(480),
+                remaining_work_min: Some(360),
+                cost: Rate::parse("41000"),
+                remaining_cost: Rate::parse("31000"),
+                ..task(3, 2, false)
+            },
+        ];
+        p.resources = vec![
+            resource(1, ResourceType::Work, "50", "0"),
+            resource(2, ResourceType::Cost, "0", "0"),
+        ];
+        p.assignments = vec![Assignment {
+            task_uid: 3,
+            actual_work_min: Some(120),
+            remaining_work_min: Some(360),
+            cost: Rate::parse("40000"),
+            actual_cost: Rate::parse("10000"),
+            remaining_cost: Rate::parse("30000"),
+            ..assignment(1, 1, 1.0, 8)
+        }];
+        p
+    }
+
+    /// Work, remaining work, cost and remaining cost of task `uid`.
+    fn stored(p: &Project, uid: i32) -> (Option<i64>, Option<i64>, Option<&str>, Option<&str>) {
+        let t = p.task(uid).unwrap();
+        (
+            t.work_min,
+            t.remaining_work_min,
+            t.cost.as_ref().map(Rate::as_str),
+            t.remaining_cost.as_ref().map(Rate::as_str),
+        )
+    }
+
+    #[test]
+    fn refresh_fills_absent_task_totals_from_the_whole_rollup() {
+        let prev = rollup_plan();
+        let mut next = prev.clone();
+        next.assignments.push(Assignment {
+            task_uid: 2,
+            ..assignment(2, 1, 1.0, 8)
+        });
+        let sched = schedule(&prev);
+        refresh(&prev, &sched, &mut next, &sched);
+        assert_eq!(
+            stored(&next, 2),
+            (Some(480), Some(480), Some("40000"), Some("40000"))
+        );
+        // The summaries add leaf 3's untouched assignment and fixed cost.
+        for uid in [0, 1] {
+            assert_eq!(
+                stored(&next, uid),
+                (Some(960), Some(840), Some("81000"), Some("71000"))
+            );
+        }
+        assert_eq!(stored(&next, 3), stored(&prev, 3));
+
+        // A second run on the same edit changes nothing.
+        let mut again = next.clone();
+        refresh(&prev, &sched, &mut again, &sched);
+        assert_eq!(again, next);
+
+        // Filled totals then move by delta, down to zero.
+        let mut dropped = next.clone();
+        dropped.assignments.retain(|a| a.uid != 2);
+        refresh(&next, &sched, &mut dropped, &sched);
+        assert_eq!(
+            stored(&dropped, 2),
+            (Some(0), Some(0), Some("0"), Some("0"))
+        );
+        assert_eq!(
+            stored(&dropped, 1),
+            (Some(480), Some(360), Some("41000"), Some("31000"))
+        );
+    }
+
+    #[test]
+    fn refresh_fills_no_cost_over_an_unknown_one() {
+        let prev = rollup_plan();
+        let mut next = prev.clone();
+        next.assignments.push(Assignment {
+            task_uid: 2,
+            ..assignment(2, 1, 1.0, 8)
+        });
+        // A cost resource's assignment nobody priced.
+        next.assignments.push(Assignment {
+            task_uid: 2,
+            ..assignment(3, 2, 1.0, 0)
+        });
+        let sched = schedule(&prev);
+        refresh(&prev, &sched, &mut next, &sched);
+        assert_eq!(next.assignments[2].cost, None);
+        assert_eq!(stored(&next, 2), (Some(480), Some(480), None, None));
+        assert_eq!(stored(&next, 1), (Some(960), Some(840), None, None));
+        assert_eq!(stored(&next, 3), stored(&prev, 3));
+    }
+
+    #[test]
+    fn refresh_fills_nothing_an_edit_does_not_move() {
+        let mut prev = rollup_plan();
+        prev.assignments.push(Assignment {
+            task_uid: 2,
+            cost: Rate::parse("40000"),
+            ..assignment(2, 1, 1.0, 8)
+        });
+        let mut next = prev.clone();
+        next.tasks[2].name = "Renamed".into();
+        let sched = schedule(&prev);
+        refresh(&prev, &sched, &mut next, &sched);
+        for uid in [0, 1, 2] {
+            assert_eq!(stored(&next, uid), (None, None, None, None));
         }
     }
 
@@ -1161,5 +1559,70 @@ mod tests {
             cost(&proj, &assignment(1, 1, 1.0, 1)).as_deref(),
             Some("3333")
         );
+    }
+
+    #[test]
+    fn refresh_rolls_actuals_to_ancestors_and_keeps_a_percent_nothing_moved() {
+        let mut prev = plan(at(2, 8), 1);
+        let task = |uid, outline, summary, actual, actual_cost: &str, pct| Task {
+            uid,
+            id: uid,
+            outline_level: outline,
+            summary,
+            name: format!("T{uid}"),
+            duration_min: 480,
+            work_min: Some(480),
+            actual_work_min: Some(actual),
+            actual_cost: Rate::parse(actual_cost),
+            percent_work_complete: Some(pct),
+            ..Task::default()
+        };
+        prev.tasks = vec![
+            task(1, 1, true, 100, "1000", 21),
+            task(2, 2, false, 0, "", 0),
+        ];
+        prev.resources = vec![resource(1, ResourceType::Work, "50", "0")];
+        prev.assignments = vec![Assignment {
+            task_uid: 2,
+            ..assignment(1, 1, 1.0, 8)
+        }];
+        let mut next = prev.clone();
+        next.assignments[0].actual_work_min = Some(120);
+        next.assignments[0].actual_cost = Rate::parse("10000");
+        let sched = schedule(&prev);
+        refresh(&prev, &sched, &mut next, &sched);
+        assert_eq!(next.assignments[0].percent_work_complete, Some(25));
+        let leaf = next.task(2).unwrap();
+        // An absent actual cost stays absent.
+        assert_eq!(
+            (
+                leaf.actual_work_min,
+                leaf.actual_cost.clone(),
+                leaf.percent_work_complete
+            ),
+            (Some(120), None, Some(25))
+        );
+        let summary = next.task(1).unwrap();
+        assert_eq!(summary.actual_work_min, Some(220));
+        assert_eq!(
+            summary.actual_cost.as_ref().map(Rate::as_str),
+            Some("11000")
+        );
+        // 220 of 480 minutes.
+        assert_eq!(summary.percent_work_complete, Some(46));
+        let resource = &next.resources[0];
+        assert_eq!(
+            (resource.actual_work_min, resource.percent_work_complete),
+            (Some(120), Some(25))
+        );
+
+        // An edit that moves neither work nor actual work keeps a task's
+        // stored percent, though its assignment is refreshed.
+        let mut prev = next.clone();
+        prev.tasks[0].percent_work_complete = Some(7);
+        let mut next = prev.clone();
+        next.assignments[0].cost_rate_table = Some(1);
+        refresh(&prev, &sched, &mut next, &sched);
+        assert_eq!(next.task(1).unwrap().percent_work_complete, Some(7));
     }
 }

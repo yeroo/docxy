@@ -8,7 +8,9 @@
 //! in. Every edit here is one undo step on the editor's document, which is
 //! what the page view and Save read.
 
-use super::{Caret, EditKind, Editor, resolve_para, split_paragraph_content, tab_props_at};
+use super::{
+    Caret, EditKind, Editor, resolve_para, spans_containers, split_paragraph_content, tab_props_at,
+};
 use crate::model::{Block, BreakKind, Inline, Paragraph, SectionProperties};
 use crate::sect::{SectionSetup, SectionStart};
 
@@ -196,9 +198,7 @@ impl Editor {
         }
         self.break_point()?;
         let (lo, hi) = self.selection_range().expect("checked above");
-        let same_container = hi.path.len() == lo.path.len()
-            && hi.path[..hi.path.len() - 1] == lo.path[..lo.path.len() - 1];
-        if !same_container {
+        if spans_containers(&lo, &hi) {
             return Err("A section break cannot replace a selection that spans a table".into());
         }
         self.one_step("Section break", |e| {
@@ -336,9 +336,7 @@ impl Editor {
     /// typing at the caret would, except next to a hyperlink, and text typed
     /// after it keeps that formatting (#279).
     pub fn insert_break(&mut self, kind: BreakKind) {
-        if self.has_selection() {
-            self.delete_selection();
-        }
+        self.delete_selection_to_replace();
         let props = resolve_para(&self.doc.body, &self.caret.path)
             .map(|p| tab_props_at(&p.content, self.caret.offset))
             .unwrap_or_default();

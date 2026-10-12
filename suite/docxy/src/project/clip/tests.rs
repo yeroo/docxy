@@ -537,6 +537,241 @@ fn cut_a_range_skips_a_blank_row_and_clears_the_rest() {
     assert_eq!(tasks(&t)[0].1, "", "the named rows cleared");
 }
 
+// ---- Delete over a range (#1260) --------------------------------------------
+
+/// Delete by the real key route: `project_input` maps it, then the act runs.
+fn press_delete(t: &mut DocTab) {
+    assert_eq!(
+        project_input(t, "delete", None, Modifiers::default()),
+        Some(ProjectAct::ClearCell)
+    );
+    apply_project_act(t, ProjectAct::ClearCell);
+}
+
+#[test]
+fn delete_over_a_range_clears_name_predecessors_resources_in_one_undo_step() {
+    let mut t = tab();
+    apply_cell(&mut vm(&mut t).ed, 2, COL_PREDECESSORS, "1").unwrap();
+    vm(&mut t).ed.assign_resource(2, "Alice").unwrap();
+    select_range(&mut t, COL_NAME, 1, COL_RESOURCES);
+    let depth = v(&t).ed.undo_depth();
+    press_delete(&mut t);
+    assert_eq!(
+        v(&t).ed.undo_depth(),
+        depth + 1,
+        "the whole clear is one step"
+    );
+    let names: Vec<_> = tasks(&t).into_iter().map(|t| t.1).collect();
+    assert_eq!(names, ["", ""], "both names cleared");
+    for uid in [1, 2] {
+        let task = v(&t).ed.project().task(uid).unwrap();
+        assert!(task.predecessors.is_empty(), "{uid}: predecessors cleared");
+        assert!(
+            project_row(&v(&t).ed, task)[COL_RESOURCES].is_empty(),
+            "{uid}: resource names cleared"
+        );
+    }
+    // Durations in the range survived.
+    assert_eq!(tasks(&t)[0].2, 960);
+    assert_eq!(sel_count(&t), None, "the delete consumed the range");
+    apply_project_act(&mut t, ProjectAct::Undo);
+    let names: Vec<_> = tasks(&t).into_iter().map(|t| t.1).collect();
+    assert_eq!(names, ["A", "B"], "one undo restores every cleared cell");
+    assert!(
+        !v(&t).ed.project().task(2).unwrap().predecessors.is_empty(),
+        "the predecessor link is back"
+    );
+}
+
+#[test]
+fn delete_after_shift_home_clears_the_row_and_keeps_the_task() {
+    let mut t = tab();
+    at(&mut t, 0, COL_NAME);
+    shift_key(&mut t, "home");
+    // The range is the row's ID..Name span with the cursor on its ID column,
+    // where a single-cell Delete would delete the task.
+    let sel = v(&t).selection().unwrap();
+    assert_eq!(*sel.cols.start(), COL_ID);
+    assert_eq!(v(&t).col, COL_ID);
+    press_delete(&mut t);
+    assert_eq!(tasks(&t).len(), 2, "the task is not deleted");
+    assert_eq!(tasks(&t)[0].1, "", "its Name cleared");
+    assert!(t.dialogs.top().is_none(), "no summary question opens");
+    assert_eq!(sel_count(&t), None, "the delete consumed the range");
+}
+
+#[test]
+fn delete_after_an_id_click_deletes_the_task() {
+    let mut t = tab();
+    // A click on the ID cell selects the whole row, as the row header does:
+    // Delete deletes the cursor's task, not the row's cells.
+    crate::project_cell_press(&mut t, 0, COL_ID, false);
+    crate::project_cell_release(&mut t);
+    assert!(
+        v(&t).selection().is_some(),
+        "an ID click selects the whole row"
+    );
+    press_delete(&mut t);
+    assert_eq!(tasks(&t).len(), 1, "the cursor's task is deleted");
+    assert!(v(&t).ed.project().task(1).is_none());
+    assert_eq!(sel_count(&t), None, "the delete consumed the range");
+}
+
+#[test]
+fn delete_after_shift_home_from_the_last_column_keeps_the_task() {
+    let mut t = tab();
+    at(&mut t, 0, COL_RESOURCES);
+    shift_key(&mut t, "home");
+    // The cursor on the ID column, the range spanning every column: the same
+    // rectangle an ID press makes, but made with the keyboard — it is a cell
+    // range, so Delete clears it and never deletes the task.
+    assert_eq!(v(&t).col, COL_ID);
+    let sel = v(&t).selection().unwrap();
+    assert_eq!(*sel.cols.start(), COL_ID);
+    assert_eq!(*sel.cols.end(), COLUMN_COUNT - 1);
+    press_delete(&mut t);
+    assert_eq!(tasks(&t).len(), 2, "the task is not deleted");
+    assert_eq!(tasks(&t)[0].1, "", "its Name cleared");
+    assert!(t.dialogs.top().is_none(), "no summary question opens");
+    assert_eq!(sel_count(&t), None, "the delete consumed the range");
+}
+
+#[test]
+fn delete_over_a_full_width_range_from_the_id_column_clears_every_row() {
+    let mut t = tab();
+    // ID..Resources across both rows: every column, but the range was grown
+    // with the keyboard, not made on the ID cells — Delete clears it.
+    select_range(&mut t, COL_ID, 1, COL_RESOURCES);
+    assert_eq!(v(&t).col, COL_RESOURCES);
+    let depth = v(&t).ed.undo_depth();
+    press_delete(&mut t);
+    assert_eq!(tasks(&t).len(), 2, "both tasks remain");
+    assert_eq!(tasks(&t)[0].1, "", "Name cleared");
+    assert_eq!(tasks(&t)[1].1, "", "Name cleared");
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+    assert!(t.dialogs.top().is_none(), "no delete question ever opens");
+}
+
+#[test]
+fn delete_over_a_range_with_the_cursor_on_id_keeps_the_tasks() {
+    let mut t = tab();
+    at(&mut t, 1, COL_PREDECESSORS);
+    shift_key(&mut t, "up");
+    shift_key(&mut t, "home");
+    // Two rows, ID..Predecessors, the cursor on row 0's ID column: the
+    // cursor's column is no reason to delete.
+    press_delete(&mut t);
+    assert_eq!(tasks(&t).len(), 2, "both tasks remain");
+    assert_eq!(tasks(&t)[0].1, "", "Name cleared");
+    assert_eq!(tasks(&t)[1].1, "", "Name cleared");
+    assert!(t.dialogs.top().is_none(), "no delete question ever opens");
+}
+
+#[test]
+fn delete_over_an_id_only_range_changes_nothing() {
+    let mut t = tab();
+    at(&mut t, 0, COL_ID);
+    shift_key(&mut t, "down");
+    let depth = v(&t).ed.undo_depth();
+    press_delete(&mut t);
+    assert_eq!(tasks(&t).len(), 2, "no task is deleted");
+    assert_eq!(t.status.as_ref(), "Selection's columns can't be cleared");
+    assert_eq!(v(&t).ed.undo_depth(), depth, "nothing was cleared");
+    assert_eq!(sel_count(&t), None, "the delete consumed the range");
+}
+
+#[test]
+fn delete_after_an_id_click_then_shift_down_clears_cells() {
+    let mut t = tab();
+    // The keyboard reshaped the row-header selection: it is a cell range
+    // again, so Delete clears it and keeps the tasks.
+    crate::project_cell_press(&mut t, 0, COL_ID, false);
+    crate::project_cell_release(&mut t);
+    shift_key(&mut t, "down");
+    press_delete(&mut t);
+    assert_eq!(tasks(&t).len(), 2, "no task is deleted");
+    assert_eq!(tasks(&t)[0].1, "", "Name cleared");
+    assert_eq!(tasks(&t)[1].1, "", "Name cleared");
+    assert!(t.dialogs.top().is_none(), "no delete question ever opens");
+}
+
+#[test]
+fn delete_after_an_id_click_then_a_drag_onto_an_id_cell_clears_cells() {
+    let mut t = tab();
+    // A plain press after the ID click re-anchors: the drag ends on an ID
+    // cell with the range across every column, the row-header shape, but it
+    // was not made on the ID cells — Delete clears it and keeps the tasks.
+    crate::project_cell_press(&mut t, 0, COL_ID, false);
+    crate::project_cell_release(&mut t);
+    crate::project_cell_press(&mut t, 1, COL_RESOURCES, false);
+    crate::project_cell_drag_over(&mut t, 0, COL_ID);
+    crate::project_cell_release(&mut t);
+    assert_eq!(v(&t).col, COL_ID, "the cursor ended on the ID column");
+    press_delete(&mut t);
+    assert_eq!(tasks(&t).len(), 2, "no task is deleted");
+    assert_eq!(tasks(&t)[0].1, "", "Name cleared");
+    assert_eq!(tasks(&t)[1].1, "", "Name cleared");
+    assert!(t.dialogs.top().is_none(), "no delete question ever opens");
+}
+
+#[test]
+fn delete_after_an_id_click_then_a_shift_click_clears_cells() {
+    let mut t = tab();
+    // The Shift press re-anchors from the cursor: the range spans every
+    // column again, but a row-header selection is only the ID press's own —
+    // Delete clears it and keeps the tasks.
+    crate::project_cell_press(&mut t, 0, COL_ID, false);
+    crate::project_cell_release(&mut t);
+    crate::project_cell_press(&mut t, 1, COL_RESOURCES, true);
+    crate::project_cell_release(&mut t);
+    press_delete(&mut t);
+    assert_eq!(tasks(&t).len(), 2, "no task is deleted");
+    assert_eq!(tasks(&t)[0].1, "", "Name cleared");
+    assert_eq!(tasks(&t)[1].1, "", "Name cleared");
+    assert!(t.dialogs.top().is_none(), "no delete question ever opens");
+}
+
+#[test]
+fn delete_over_a_range_with_no_clearable_column_changes_nothing() {
+    let mut t = tab();
+    select_range(&mut t, COL_DURATION, 1, COL_DURATION);
+    let depth = v(&t).ed.undo_depth();
+    press_delete(&mut t);
+    assert_eq!(t.status.as_ref(), "Selection's columns can't be cleared");
+    assert_eq!(v(&t).ed.undo_depth(), depth, "nothing was cleared");
+    assert_eq!(tasks(&t)[0].2, 960);
+    assert_eq!(tasks(&t)[1].2, 960);
+    assert_eq!(sel_count(&t), None, "the delete consumed the range");
+}
+
+#[test]
+fn delete_over_a_range_never_deletes_a_task_across_the_id_column() {
+    let mut t = tab();
+    // ID..Predecessors, grown with the keyboard rather than by an ID press:
+    // Delete clears its cells and deletes no task.
+    select_range(&mut t, COL_ID, 1, COL_PREDECESSORS);
+    let depth = v(&t).ed.undo_depth();
+    press_delete(&mut t);
+    assert_eq!(tasks(&t).len(), 2, "both tasks survive their ID cells");
+    assert_eq!(tasks(&t)[0].1, "", "Name cleared");
+    assert_eq!(tasks(&t)[1].1, "", "Name cleared");
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+    assert!(t.dialogs.top().is_none(), "no delete question ever opens");
+}
+
+#[test]
+fn delete_over_a_range_skips_a_blank_row() {
+    let mut t = tab();
+    let row = vm(&mut t).ed.insert_blank_row(None).unwrap();
+    assert_eq!(row, 2);
+    select_range(&mut t, COL_NAME, 2, COL_NAME);
+    press_delete(&mut t);
+    let task = &v(&t).ed.project().tasks[2];
+    assert!(task.is_null, "a blank row stays blank");
+    assert_eq!(tasks(&t)[0].1, "", "the named rows cleared");
+    assert_eq!(tasks(&t)[1].1, "", "the named rows cleared");
+}
+
 #[test]
 fn paste_with_a_range_goes_to_its_top_left_and_clears_it() {
     let mut t = tab();

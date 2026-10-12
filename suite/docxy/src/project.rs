@@ -84,6 +84,11 @@ pub(super) struct ProjectView {
     /// A press on a task's ID cell: the range stays whole rows (the anchor's
     /// and the cursor's columns are pinned) while the drag moves over rows.
     pub row_drag: bool,
+    /// The range was made by a press on a task's ID cell (Project's row
+    /// header), and nothing has reshaped it since: Delete over it deletes
+    /// the cursor's task rather than clearing cells (#1260). Only meaningful
+    /// while `anchor` is set.
+    pub row_header: bool,
     /// A left press on a cell that has not seen its release yet; `drag_over`
     /// extends the range only while this is set. The window-level mouse-up
     /// clears it, like the sheet's `grid_release`.
@@ -124,6 +129,7 @@ impl ProjectView {
             scheduled: None,
             anchor: None,
             row_drag: false,
+            row_header: false,
             dragging: false,
             drag_made_range: false,
         }

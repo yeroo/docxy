@@ -86,6 +86,8 @@ fn apply_dialog(
         DialogOwner::DataValidation { .. } | DialogOwner::DataValidationAlert => {
             Err("data validation applies through the Data tab".into())
         }
+        // Handled in `sheet_format_cells::click`, before this.
+        DialogOwner::FormatCells { .. } => Err("Format Cells applies through its OK".into()),
         // Handled in `sheet_filter::click` and `sheet_sort::click`, before this.
         DialogOwner::FilterMenu { .. }
         | DialogOwner::CustomFilter { .. }
@@ -227,6 +229,10 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String>
         return done;
     }
     if let Some(done) = crate::sheet_validation::click(tab, button) {
+        return done;
+    }
+    // Format Cells (#1165).
+    if let Some(done) = crate::sheet_format_cells::click(tab, button) {
         return done;
     }
     // The filter drop-down and its dialogs (#690), and the sorts (#691).
@@ -926,6 +932,7 @@ fn on_widget(
 mod tests {
     use super::*;
     use crate::dialog::{Button, ButtonRole, Control, Value};
+    use crate::text_input::ImeState;
     use core::prelude::v1::test;
 
     /// A document tab with a two-field form open: Top (a number) and Note.
@@ -1033,6 +1040,158 @@ mod tests {
             control: true,
             ..Modifiers::default()
         }
+    }
+
+    /// A platform key-down as `Docxy::modal_takes_key` hands it to the
+    /// dialog: on macOS the plain typed key when ⌥ made its character.
+    fn platform_key(t: &mut DocTab, ev: &KeyDownEvent, macos: bool) -> bool {
+        let k = crate::text_input::dialog_stroke(ev, macos);
+        dialog_key(t, &k.key, k.key_char.as_deref(), k.modifiers)
+    }
+
+    /// A Windows key-down as `Docxy::route_key` takes it: the dialog's key,
+    /// then the WM_CHAR debt, decided by whether the dialog was open; then
+    /// its WM_CHAR `wm_char`, if one comes at once.
+    fn windows_key(t: &mut DocTab, ime: &mut ImeState, ev: &KeyDownEvent, wm_char: Option<&str>) {
+        let open = t.dialogs.is_open();
+        assert!(platform_key(t, ev, false));
+        ime.typed_key(ev, std::time::Instant::now(), open);
+        if let Some(text) = wm_char {
+            windows_char(t, ime, text);
+        }
+    }
+
+    /// A WM_CHAR as `Docxy::windows_char` takes it: the keys it types go to
+    /// the dialog; with none open, the count of keys for the surface below.
+    fn windows_char(t: &mut DocTab, ime: &mut ImeState, text: &str) -> usize {
+        let open = t.dialogs.is_open();
+        let keys = ime.char_message(text, std::time::Instant::now(), open);
+        for k in &keys {
+            assert!(platform_key(t, k, false));
+        }
+        if open { 0 } else { keys.len() }
+    }
+
+    fn key_down(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: Keystroke {
+                modifiers,
+                key: key.into(),
+                key_char: key_char.map(Into::into),
+            },
+            is_held: false,
+            prefer_character_input: false,
+        }
+    }
+
+    /// The issue's keys on macOS (#1162): ⌥G, ⌥2 and ABC-India's ⌥` type
+    /// their characters into a dialog field, as in the document. ⌥ keys
+    /// with no character of their own, and ⌘⌥ or ⌃⌥ chords, still edit
+    /// nothing.
+    #[test]
+    fn option_characters_type_into_a_dialog_field_on_macos() {
+        let mut t = tab_with_form();
+        assert!(key(&mut t, "tab", None));
+        assert!(key(&mut t, "tab", None));
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        };
+        let alt_shift = Modifiers { shift: true, ..alt };
+        let plain = Modifiers::default();
+        for ev in [
+            key_down("`", Some("`"), plain),
+            key_down("space", Some(" "), plain),
+            key_down("x", Some("x"), plain),
+            key_down("g", Some("©"), alt),
+            key_down("2", Some("™"), alt),
+            key_down("`", Some("`"), alt),
+            key_down("y", Some("Á"), alt_shift),
+            key_down("y", Some("y"), plain),
+        ] {
+            assert!(platform_key(&mut t, &ev, true));
+        }
+        assert_eq!(value(&t, "note"), Value::Text("` x©™`Áy".into()));
+        let swallowed = [
+            key_down("backspace", Some("\u{8}"), alt),
+            key_down(
+                "left",
+                None,
+                Modifiers {
+                    function: true,
+                    ..alt
+                },
+            ),
+            key_down(
+                "g",
+                Some("©"),
+                Modifiers {
+                    platform: true,
+                    ..alt
+                },
+            ),
+            key_down(
+                "g",
+                Some("©"),
+                Modifiers {
+                    control: true,
+                    ..alt
+                },
+            ),
+        ];
+        for ev in &swallowed {
+            assert!(platform_key(&mut t, ev, true));
+        }
+        assert_eq!(value(&t, "note"), Value::Text("` x©™`Áy".into()));
+        // Off macOS an Alt key-down is no text.
+        assert!(platform_key(&mut t, &key_down("g", Some("©"), alt), false));
+        assert_eq!(value(&t, "note"), Value::Text("` x©™`Áy".into()));
+    }
+
+    /// Windows AltGr (#1162): the character's WM_CHAR types it into a
+    /// dialog field once; an AltGr dead key, which sends no WM_CHAR, types
+    /// nothing and its accent joins the next letter ("ñ", not "~ñ"); plain
+    /// Alt (WM_SYSCHAR, no WM_CHAR) edits nothing.
+    #[test]
+    fn altgr_characters_type_into_a_dialog_field_on_windows() {
+        let mut t = tab_with_form();
+        assert!(key(&mut t, "tab", None));
+        assert!(key(&mut t, "tab", None));
+        let mut ime = ImeState::default();
+        let ctrl_alt = Modifiers {
+            control: true,
+            alt: true,
+            ..Modifiers::default()
+        };
+        let altgr = |key: &str, ch: &str| KeyDownEvent {
+            prefer_character_input: true,
+            ..key_down(key, Some(ch), ctrl_alt)
+        };
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        };
+        windows_key(&mut t, &mut ime, &altgr("q", "@"), Some("@"));
+        windows_key(&mut t, &mut ime, &altgr("e", "€"), Some("€"));
+        windows_key(&mut t, &mut ime, &altgr("4", "~"), None);
+        assert_eq!(value(&t, "note"), Value::Text("@€".into()));
+        let n = key_down("n", Some("ñ"), Modifiers::default());
+        windows_key(&mut t, &mut ime, &n, Some("ñ"));
+        windows_key(&mut t, &mut ime, &key_down("g", Some("g"), alt), None);
+        assert_eq!(value(&t, "note"), Value::Text("@€ñ".into()));
+        // AltGr+Q, then Enter closes the dialog before the "@" WM_CHAR comes
+        // (gpui drained input alone): the "@" reaches nothing below.
+        windows_key(&mut t, &mut ime, &altgr("q", "@"), None);
+        windows_key(
+            &mut t,
+            &mut ime,
+            &key_down("enter", None, Modifiers::default()),
+            None,
+        );
+        assert!(!t.dialogs.is_open());
+        assert_eq!(windows_char(&mut t, &mut ime, "@"), 0);
+        // The tilde dead key's debt alone is left, to lapse.
+        assert_eq!(ime.owed(), 1);
     }
 
     /// Ctrl+A selects the field's text and typing replaces it; Ctrl+V pastes

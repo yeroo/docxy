@@ -406,6 +406,14 @@ pub struct Editor {
     pending: Option<PendingFormat>,
 }
 
+/// Whether `lo` and `hi` sit in different containers (a body paragraph and
+/// a table cell, say): a selection between them `delete_selection` cannot
+/// delete.
+fn spans_containers(lo: &Caret, hi: &Caret) -> bool {
+    !(lo.path.len() == hi.path.len()
+        && lo.path[..lo.path.len() - 1] == hi.path[..hi.path.len() - 1])
+}
+
 impl Editor {
     pub fn new(mut doc: Document) -> Self {
         doc.initialize_revision_targets();
@@ -932,9 +940,7 @@ impl Editor {
             self.insert_newline();
             return;
         }
-        if self.has_selection() {
-            self.delete_selection();
-        }
+        self.delete_selection_to_replace();
         // Typing over a selection is one step, as in Word: the step the
         // deletion pushed (its snapshot is the state before it) becomes the
         // typing step, and the characters coalesce into it.
@@ -1017,9 +1023,7 @@ impl Editor {
     /// `tab_props_at`).
     pub fn insert_tab(&mut self) {
         let pending = self.pending_format().cloned();
-        if self.has_selection() {
-            self.delete_selection();
-        }
+        self.delete_selection_to_replace();
         let mut props = resolve_para(&self.doc.body, &self.caret.path)
             .map(|p| tab_props_at(&p.content, self.caret.offset))
             .unwrap_or_default();
@@ -1589,10 +1593,7 @@ impl Editor {
             return true;
         }
 
-        // Same container (siblings)? Compare the parent path.
-        let same_container = lo.path.len() == hi.path.len()
-            && lo.path[..lo.path.len() - 1] == hi.path[..hi.path.len() - 1];
-        if !same_container {
+        if spans_containers(&lo, &hi) {
             self.anchor = None;
             self.caret = lo; // cross-container: collapse (rare)
             return false;
@@ -1676,6 +1677,21 @@ impl Editor {
         true
     }
 
+    /// Delete the selection that the edit after it replaces. Over a selection
+    /// `delete_selection` cannot delete (one spanning containers, such as body
+    /// text into a table cell) it only collapses the caret, with no step of its
+    /// own; the step is taken first here, so undoing the edit selects it again,
+    /// as `insert_newline` does (#751, #1285).
+    fn delete_selection_to_replace(&mut self) {
+        let Some((lo, hi)) = self.selection_range() else {
+            return;
+        };
+        if self.cell_range().is_none() && spans_containers(&lo, &hi) {
+            self.checkpoint(EditKind::Structural);
+        }
+        self.delete_selection();
+    }
+
     /// Select the whole document.
     pub fn select_all(&mut self) {
         let paths = all_paragraph_paths(&self.doc.body);
@@ -1740,9 +1756,7 @@ impl Editor {
             return;
         }
         self.drop_collapsed_anchor();
-        if self.has_selection() {
-            self.delete_selection();
-        }
+        self.delete_selection_to_replace();
         self.checkpoint(EditKind::Structural);
         self.paste_at_caret(clip);
         self.settle_revisions();
@@ -2441,7 +2455,7 @@ impl Editor {
             };
             return;
         }
-        self.delete_selection();
+        self.delete_selection_to_replace();
         self.insert_str(text);
     }
 
@@ -5329,6 +5343,190 @@ mod tests {
             "undo restores the cross-container selection"
         );
         assert!(!ed.undo(), "one Enter over a selection is one step");
+    }
+
+    /// #1285: typing over a selection that spans a body paragraph into a
+    /// table cell replaces it at the low end in one `Typing` step; undo
+    /// restores the text and the selection — the step is taken before the
+    /// cross-container collapse, as `insert_newline` does (#751).
+    #[test]
+    fn typing_over_cross_container_selection_is_one_undo_step_1285() {
+        let mut ed = Editor::new(table_doc());
+        let before = ed.doc.clone();
+        ed.caret = Caret::top(0, 4); // in "before"
+        ed.anchor = Some(Caret::at(vec![1, 0, 0, 0], 1)); // in cell "A"
+        let sel_caret = ed.caret.clone();
+        let sel_anchor = ed.anchor.clone().unwrap();
+        ed.insert_char('x');
+        assert!(!ed.has_selection());
+        assert_eq!(top_text(&ed), vec!["befoxre", "after"]);
+        assert_eq!(ed.undo_names(), vec!["Typing \"x\""]);
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before);
+        assert_eq!(ed.caret, sel_caret);
+        assert_eq!(ed.anchor, Some(sel_anchor));
+        assert!(!ed.undo());
+        assert!(ed.redo());
+        assert_eq!(top_text(&ed), vec!["befoxre", "after"]);
+    }
+
+    /// #1285: Tab over a cross-container selection inserts at its low end;
+    /// undoing every step restores the document and the selection.
+    #[test]
+    fn tab_over_cross_container_selection_undo_restores_it_1285() {
+        let mut ed = Editor::new(table_doc());
+        let before = ed.doc.clone();
+        ed.caret = Caret::top(0, 4); // in "before"
+        ed.anchor = Some(Caret::at(vec![1, 0, 0, 0], 1)); // in cell "A"
+        let sel_caret = ed.caret.clone();
+        let sel_anchor = ed.anchor.clone().unwrap();
+        ed.insert_tab();
+        assert_ne!(ed.doc, before);
+        assert!(!ed.has_selection());
+        while ed.undo() {}
+        assert_eq!(ed.doc, before);
+        assert_eq!(ed.caret, sel_caret);
+        assert_eq!(ed.anchor, Some(sel_anchor));
+    }
+
+    /// #1285: paste over a cross-container selection inserts at its low end;
+    /// undoing every step restores the document and the selection.
+    #[test]
+    fn paste_over_cross_container_selection_undo_restores_it_1285() {
+        let r = |s: &str| {
+            Inline::Run(Run {
+                text: s.to_string(),
+                props: RunProps::default(),
+            })
+        };
+        let clip = Clip {
+            paras: vec![vec![r("Z")]],
+        };
+        let mut ed = Editor::new(table_doc());
+        let before = ed.doc.clone();
+        ed.caret = Caret::top(0, 4); // in "before"
+        ed.anchor = Some(Caret::at(vec![1, 0, 0, 0], 1)); // in cell "A"
+        let sel_caret = ed.caret.clone();
+        let sel_anchor = ed.anchor.clone().unwrap();
+        ed.paste(&clip);
+        assert!(!ed.has_selection());
+        assert_eq!(top_text(&ed), vec!["befoZre", "after"]);
+        while ed.undo() {}
+        assert_eq!(ed.doc, before);
+        assert_eq!(ed.caret, sel_caret);
+        assert_eq!(ed.anchor, Some(sel_anchor));
+    }
+
+    /// #1285: a page break over a cross-container selection inserts at its
+    /// low end; undoing every step restores the document and the selection.
+    #[test]
+    fn break_over_cross_container_selection_undo_restores_it_1285() {
+        let mut ed = Editor::new(table_doc());
+        let before = ed.doc.clone();
+        ed.caret = Caret::top(0, 4); // in "before"
+        ed.anchor = Some(Caret::at(vec![1, 0, 0, 0], 1)); // in cell "A"
+        let sel_caret = ed.caret.clone();
+        let sel_anchor = ed.anchor.clone().unwrap();
+        ed.insert_break(BreakKind::Page);
+        assert_ne!(ed.doc, before);
+        assert!(!ed.has_selection());
+        while ed.undo() {}
+        assert_eq!(ed.doc, before);
+        assert_eq!(ed.caret, sel_caret);
+        assert_eq!(ed.anchor, Some(sel_anchor));
+    }
+
+    /// #1285: Blank Page over a cross-container selection inserts at its low
+    /// end; undoing every step restores the document and the selection.
+    #[test]
+    fn blank_page_over_cross_container_selection_undo_restores_it_1285() {
+        let mut ed = Editor::new(table_doc());
+        let before = ed.doc.clone();
+        ed.caret = Caret::top(0, 4); // in "before"
+        ed.anchor = Some(Caret::at(vec![1, 0, 0, 0], 1)); // in cell "A"
+        let sel_caret = ed.caret.clone();
+        let sel_anchor = ed.anchor.clone().unwrap();
+        ed.insert_blank_page();
+        assert_ne!(ed.doc, before);
+        assert!(!ed.has_selection());
+        while ed.undo() {}
+        assert_eq!(ed.doc, before);
+        assert_eq!(ed.caret, sel_caret);
+        assert_eq!(ed.anchor, Some(sel_anchor));
+    }
+
+    /// #1285: replace-current over a cross-container selection types at its
+    /// low end; undoing every step restores the document and the selection.
+    #[test]
+    fn replace_over_cross_container_selection_undo_restores_it_1285() {
+        let mut ed = Editor::new(table_doc());
+        let before = ed.doc.clone();
+        ed.caret = Caret::top(0, 4); // in "before"
+        ed.anchor = Some(Caret::at(vec![1, 0, 0, 0], 1)); // in cell "A"
+        let sel_caret = ed.caret.clone();
+        let sel_anchor = ed.anchor.clone().unwrap();
+        ed.replace_current_with("zz");
+        assert!(!ed.has_selection());
+        assert_eq!(top_text(&ed), vec!["befozzre", "after"]);
+        while ed.undo() {}
+        assert_eq!(ed.doc, before);
+        assert_eq!(ed.caret, sel_caret);
+        assert_eq!(ed.anchor, Some(sel_anchor));
+    }
+
+    /// #1285: Backspace, Delete and Cut over a selection `delete_selection`
+    /// cannot delete still take no undo step — the fallback collapses and
+    /// deletes nothing, and no edit means no step.
+    #[test]
+    fn delete_over_cross_container_selection_takes_no_step_1285() {
+        for key in ["backspace", "delete_forward", "cut"] {
+            let mut ed = Editor::new(table_doc());
+            let before = ed.doc.clone();
+            ed.caret = Caret::top(0, 4); // in "before"
+            ed.anchor = Some(Caret::at(vec![1, 0, 0, 0], 1)); // in cell "A"
+            match key {
+                "backspace" => ed.backspace(),
+                "delete_forward" => ed.delete_forward(),
+                _ => {
+                    ed.cut();
+                }
+            }
+            assert!(!ed.has_selection(), "{key}");
+            assert_eq!(ed.doc, before, "{key}");
+            assert!(!ed.undo(), "{key}: no undo step");
+        }
+    }
+
+    /// #1285: the helper adds no step for a selection `delete_selection` can
+    /// delete — sibling paragraphs here: typing stays one `Typing` step and
+    /// undo re-selects, as over a selection within one paragraph.
+    #[test]
+    fn typing_over_sibling_paragraph_selection_is_one_undo_step_1285() {
+        let mut ed = Editor::new(doc(&["one", "two"]));
+        let before = ed.doc.clone();
+        ed.anchor = Some(Caret::top(0, 1));
+        ed.caret = Caret::top(1, 2);
+        ed.insert_char('x');
+        assert_eq!(top_text(&ed), vec!["oxo"]);
+        assert_eq!(ed.undo_names(), vec!["Typing \"x\""]);
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before);
+        assert!(ed.has_selection());
+        assert!(!ed.undo());
+    }
+
+    /// #1285: the helper adds no step over a cell range either: `clear_cells`
+    /// takes the only step, typing renames it, exactly as without the helper.
+    #[test]
+    fn typing_over_cell_range_takes_no_extra_step_1285() {
+        let mut ed = Editor::new(table_doc());
+        ed.anchor = Some(Caret::at(vec![1, 0, 0, 0], 0)); // cell A
+        ed.caret = Caret::at(vec![1, 0, 1, 0], 1); // cell B
+        assert!(ed.cell_range().is_some(), "a cell rectangle");
+        ed.insert_char('x');
+        assert_eq!(ed.undo_names(), vec!["Typing \"x\""]);
+        assert!(ed.undo());
+        assert!(!ed.undo(), "no extra step from the helper");
     }
 
     /// #751: a click's collapsed anchor is no selection; Enter still just

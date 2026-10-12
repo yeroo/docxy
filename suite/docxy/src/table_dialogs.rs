@@ -26,6 +26,9 @@ fn form(id: DialogId, title: &str, owner: DialogOwner, controls: Vec<Control>) -
     d.controls = controls;
     d.buttons = ok_cancel();
     d.mark_opened();
+    // The first control has the focus, as in Word, so the first keys edit
+    // it at once instead of going nowhere (#1163).
+    d.focus_step(false);
     d
 }
 
@@ -479,5 +482,59 @@ mod tests {
         set(&mut d, "sep", Json::Str("Other:".into()));
         set(&mut d, "other", Json::Str("ab".into()));
         assert!(apply_table_to_text(&mut ed, &d).is_err());
+    }
+
+    fn focused(d: &Dialog) -> Option<&'static str> {
+        d.focused().map(|c| c.name)
+    }
+
+    /// Insert Table opens with Number of columns focused: Backspace and `3`
+    /// through the dialog's own key path make it 3, and Enter inserts a
+    /// three-column table (#1163). Before, no control had the focus and the
+    /// keys went nowhere.
+    #[test]
+    fn insert_table_opens_with_columns_focused() {
+        use crate::dialog_host::dialog_key;
+        use gpui::Modifiers;
+        let d = insert_table_dialog(&Editor::new(Document {
+            body: vec![Block::Paragraph(Paragraph::default())],
+        }))
+        .unwrap();
+        assert_eq!(focused(&d), Some("cols"));
+        let mut t = crate::tab_from_path(
+            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../uiharness/fixtures/basic.docx"),
+        );
+        t.dialogs.push(d);
+        let plain = Modifiers::default();
+        assert!(dialog_key(&mut t, "backspace", None, plain));
+        assert!(dialog_key(&mut t, "3", Some("3"), plain));
+        assert_eq!(text(t.dialogs.top().unwrap(), "cols"), "3");
+        // Tab order is unchanged; it just starts at Number of columns.
+        assert!(dialog_key(&mut t, "tab", None, plain));
+        assert_eq!(focused(t.dialogs.top().unwrap()), Some("rows"));
+        assert!(dialog_key(&mut t, "enter", None, plain));
+        assert!(!t.dialogs.is_open(), "Enter pressed OK");
+        let crate::Surface::Doc(ed) = &t.surface else {
+            panic!("a document tab");
+        };
+        let at = ed.table_selection().expect("the caret is in the new table");
+        let tbl = ed.table(&at.table).unwrap();
+        assert_eq!((tbl.rows.len(), tbl.rows[0].cells.len()), (2, 3));
+    }
+
+    /// Every other table dialog opens with its first control focused too
+    /// (#1163), as Word opens them.
+    #[test]
+    fn table_dialogs_open_focused() {
+        let ed = doc_with_table(2, 2);
+        assert_eq!(focused(&delete_cells_dialog(&ed).unwrap()), Some("shift"));
+        assert_eq!(focused(&split_cells_dialog(&ed).unwrap()), Some("cols"));
+        assert_eq!(focused(&sort_dialog(&ed).unwrap()), Some("sort1"));
+        assert_eq!(focused(&table_to_text_dialog(&ed).unwrap()), Some("sep"));
+        let mut ed = doc_with_table(2, 2);
+        let d = table_to_text_dialog(&ed).unwrap();
+        apply_table_to_text(&mut ed, &d).unwrap();
+        assert_eq!(focused(&text_to_table_dialog(&ed).unwrap()), Some("cols"));
     }
 }

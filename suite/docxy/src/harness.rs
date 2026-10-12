@@ -846,6 +846,9 @@ pub enum Region {
     /// Group `.0` of the ribbon tab shown, as drawn: in place, or its
     /// collapsed button (#1020).
     RibbonGroup(usize),
+    /// The dialog launcher (↘) of the sheet ribbon group titled `.0`, in
+    /// place on the tab shown (#1164).
+    RibbonLaunch(&'static str),
     /// The AutoFilter button on column `.0`'s header cell (#690).
     FilterButton(u32),
     /// The File screen's scrolling content pane (#1028).
@@ -865,8 +868,8 @@ const QAT_REGIONS: [&str; 4] = ["qat-undo", "qat-redo", "qat-undo-arrow", "qat-r
 /// `cell:A1:C5`, `chart:0`, `gantt`, `bar:3`, `project-hbar-table`,
 /// `project-hbar-chart`, `project-vbar`, `project-timeline`, `project-split`,
 /// `gallery`, `tab-chip:0`, `filter-button:B`, `backstage-content`,
-/// `backstage-rail`, `qat-undo`, `qat-redo`, `qat-undo-arrow`,
-/// `qat-redo-arrow`.
+/// `backstage-rail`, `ribbon-launch:Number`, `qat-undo`, `qat-redo`,
+/// `qat-undo-arrow`, `qat-redo-arrow`.
 ///
 /// `cell:` takes a range as readily as a single cell, so an assertion about a
 /// selection border names the selection rather than its two corners.
@@ -923,6 +926,23 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
                 .map_err(|_| "'ribbon-group' needs a numeric index".to_string())?;
             Ok(Region::RibbonGroup(i))
         }
+        "ribbon-launch" => {
+            let a = arg
+                .filter(|a| !a.is_empty())
+                .ok_or("'ribbon-launch' needs a group title, e.g. ribbon-launch:Number")?;
+            let group = crate::sheet_ribbon::SHEET_RIBBON
+                .iter()
+                .flat_map(|t| t.groups.iter())
+                .find(|g| g.title.eq_ignore_ascii_case(a))
+                .ok_or_else(|| format!("no sheet ribbon group is titled '{a}'"))?;
+            if !group.launcher {
+                return Err(format!(
+                    "the ribbon group {} draws no launcher",
+                    group.title
+                ));
+            }
+            Ok(Region::RibbonLaunch(group.title))
+        }
         "backstage-content" if arg.is_none() => Ok(Region::BackstageContent),
         "backstage-rail" if arg.is_none() => Ok(Region::BackstageRail),
         "window" | "grid" | "chart-panel" | "title-tabs" | "tab-prev" | "tab-next" | "tab-more"
@@ -970,7 +990,7 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
             Ok(Region::Chart(i))
         }
         other => Err(format!(
-            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, filter-button:B)"
+            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, ribbon-launch:Number, filter-button:B)"
         )),
     }
 }
@@ -1001,6 +1021,7 @@ pub fn region_name(region: Region) -> String {
         Region::Ribbon => "ribbon".into(),
         Region::RibbonFlyout => "ribbon-flyout".into(),
         Region::RibbonGroup(i) => format!("ribbon-group:{i}"),
+        Region::RibbonLaunch(title) => format!("ribbon-launch:{title}"),
         Region::BackstageContent => "backstage-content".into(),
         Region::BackstageRail => "backstage-rail".into(),
         Region::Qat(name) => name.into(),
@@ -1121,27 +1142,48 @@ fn mouse_move(p: Point<Pixels>, pressed: Option<MouseButton>) -> PlatformInput {
 }
 
 fn mouse_down(p: Point<Pixels>) -> PlatformInput {
+    mouse_down_n(p, 1)
+}
+
+/// The `n`th press of a multi-click at `p`, as the platform counts it.
+fn mouse_down_n(p: Point<Pixels>, n: usize) -> PlatformInput {
     PlatformInput::MouseDown(MouseDownEvent {
         button: MouseButton::Left,
         position: p,
         modifiers: Modifiers::default(),
-        click_count: 1,
+        click_count: n,
         first_mouse: false,
     })
 }
 
 fn mouse_up(p: Point<Pixels>) -> PlatformInput {
+    mouse_up_n(p, 1)
+}
+
+fn mouse_up_n(p: Point<Pixels>, n: usize) -> PlatformInput {
     PlatformInput::MouseUp(MouseUpEvent {
         button: MouseButton::Left,
         position: p,
         modifiers: Modifiers::default(),
-        click_count: 1,
+        click_count: n,
     })
 }
 
 /// The hover-press-release a `pointer-click` dispatches at `p`.
 fn click_events(p: Point<Pixels>) -> Vec<PlatformInput> {
     vec![mouse_move(p, None), mouse_down(p), mouse_up(p)]
+}
+
+/// A double-click at `p`: the second press and release count 2, which is
+/// what a handler's `click_count` reads (#1200).
+fn double_click_events(p: Point<Pixels>) -> Vec<PlatformInput> {
+    vec![
+        mouse_move(p, None),
+        mouse_down_n(p, 1),
+        mouse_up_n(p, 1),
+        mouse_down_n(p, 2),
+        mouse_up_n(p, 2),
+    ]
 }
 
 /// The wheel notch a `pointer-wheel` dispatches at `p`: the pointer moves
@@ -3022,6 +3064,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "autocorrect"
             | "trusted-clear"
             | "open-draft"
+            | "recent-open"
             | "dialog-set"
             | "dialog-tab"
             | "dialog-click"
@@ -3170,7 +3213,7 @@ fn rtf_bold_text(clip: &docxcore::editor::Clip) -> String {
 }
 
 /// The active spreadsheet, or the refusal every cell verb needs.
-fn sheet(app: &crate::Docxy) -> Result<&SheetView, String> {
+pub(crate) fn sheet(app: &crate::Docxy) -> Result<&SheetView, String> {
     app.active_sheet()
         .ok_or_else(|| "the active tab is not a spreadsheet".to_string())
 }
@@ -3407,6 +3450,14 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
             ),
             // The sheet comment editor New Comment opens, and its text.
             ("comment_edit", str_or_null(app.sheet_comment_edit.clone())),
+            // The cell the comment editor writes to — its anchor — as an A1
+            // name (null while the bar is closed).
+            (
+                "comment_cell",
+                str_or_null(app.sheet_comment_cell.map(|(_, r, c)| a1((r, c)))),
+            ),
+            // The comment text on the selected cell, if it has one.
+            ("comment", str_or_null(app.selected_comment())),
         ]);
         // The option buttons a fill or a paste leaves (#668, #669), and
         // the Office Clipboard's count.
@@ -3452,6 +3503,17 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
         ("find_open", Json::Bool(app.find_open)),
         ("find_query", Json::Str(app.find_query.clone())),
         ("replace_text", Json::Str(app.replace_text.clone())),
+        // Format Cells is the active tab's top dialog (#1161, #1165).
+        (
+            "format_cells_open",
+            Json::Bool(
+                app.active_dialogs()
+                    .and_then(|s| s.top())
+                    .is_some_and(|d| d.id == crate::dialog::catalog::FORMAT_CELLS),
+            ),
+        ),
+        // The Alt / F10 access-key overlay, at either level.
+        ("keytips_up", Json::Bool(app.keytips != crate::KeyTip::Off)),
         // The input handler's marked text (#1072), typed nowhere yet.
         (
             "ime_marked",
@@ -3518,6 +3580,29 @@ fn kind_name(kind: crate::Kind) -> &'static str {
         crate::Kind::Project => "project",
         crate::Kind::Look => "mail",
     }
+}
+
+/// `recent-files`'s reply (#1194): each file newest first, with its name,
+/// the kind of tab it opens as, and whether it still exists; and the
+/// message the Recent list shows under its heading, or null.
+fn recent_files_json(files: &[std::path::PathBuf], message: Option<&str>) -> Json {
+    let files = files
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            Json::obj(vec![
+                ("index", Json::Num(i as f64)),
+                ("path", Json::Str(p.to_string_lossy().into_owned())),
+                ("name", Json::Str(crate::file_name(p))),
+                ("kind", Json::Str(kind_name(crate::path_kind(p)).into())),
+                ("exists", Json::Bool(p.exists())),
+            ])
+        })
+        .collect();
+    Json::obj(vec![
+        ("files", Json::Arr(files)),
+        ("message", str_or_null(message.map(str::to_owned))),
+    ])
 }
 
 /// `tab-list`: every open tab, in strip order, and which one is active.
@@ -3941,7 +4026,19 @@ fn dispatch_verb(
         "dialog-read" => Done::ok(app.active_dialogs_mut().to_json()),
         // One field of the open dialog as it is edited and drawn: its text,
         // focus, caret and selection (#1029).
+        // A sheet input outside the dialogs (#1200), or the open dialog's
+        // field: exactly one of the two.
         "field-read" => {
+            match (args.get("input"), args.get("dialog-field")) {
+                (Some(_), Some(_)) => {
+                    return Err("field-read takes 'input' or 'dialog-field', not both".into());
+                }
+                (Some(input), None) => {
+                    let id = input.as_str().ok_or("'input' must be an input id")?;
+                    return Done::ok(crate::inputs::read(app, id)?);
+                }
+                _ => {}
+            }
             let name = arg_str(args, "dialog-field")?;
             let top = app
                 .active_dialogs()
@@ -4224,15 +4321,15 @@ fn dispatch_verb(
             let measured = crate::ribbon_layout::measure(&probes.last);
             // A tab with no groups has nothing to wait for.
             let drawn = crate::ribbon_layout::shown_tab(&probes.last) == Some(name.as_str());
-            if !titles.is_empty()
-                && !(drawn
+            if !(titles.is_empty()
+                || (drawn
                     && crate::ribbon_layout::is_frame_of(&measured, &titles)
                     && crate::ribbon_layout::frame_matches(&probes.last, &fits)
                     && crate::ribbon_layout::drawn_matches(
                         probes.fit_last.as_ref(),
                         now.width,
                         &fits,
-                    ))
+                    )))
             {
                 cx.notify();
                 return Done::ok(crate::ribbon_layout::unsettled_json(&name));
@@ -4689,15 +4786,24 @@ fn dispatch_verb(
                 done.input = click_events(p);
                 return Ok(done);
             }
-            // A registered input outside the dialogs (#1029).
+            // A registered input outside the dialogs (#1029): where it is
+            // drawn, or a double-click on the active cell for the in-cell
+            // editor (#1200).
             if let Some(input) = args.get("input") {
                 let id = input.as_str().ok_or("'input' must be an input id")?;
-                let p = crate::inputs::point(app, id)?;
+                app.refuse_under_dialog()?;
+                let press = crate::inputs::press(app, id)?;
+                let p = press.at;
                 let mut done = Done::ok(Json::obj(vec![
                     ("x", Json::Num(f64::from(p.x))),
                     ("y", Json::Num(f64::from(p.y))),
+                    ("clicks", Json::Num(if press.double { 2.0 } else { 1.0 })),
                 ]))?;
-                done.input = click_events(p);
+                done.input = if press.double {
+                    double_click_events(p)
+                } else {
+                    click_events(p)
+                };
                 return Ok(done);
             }
             if let Some(field) = args.get("dialog-field") {
@@ -4736,9 +4842,23 @@ fn dispatch_verb(
                             "the Edit Custom Lists row is not drawn: open File (backstage) first",
                         )?
                         .center(),
+                    // The sheet Find bar's Replace and All buttons (#1200),
+                    // which no key presses.
+                    Some(at @ ("sheet-replace-button" | "sheet-replace-all-button")) => {
+                        let probe = if at == "sheet-replace-button" {
+                            "sf-rep"
+                        } else {
+                            "sf-all"
+                        };
+                        app.probes
+                            .borrow()
+                            .on_screen(probe)
+                            .ok_or("the Find bar is not drawn: open it first (Ctrl+F)")?
+                            .center()
+                    }
                     Some(other) => {
                         return Err(format!(
-                            "unknown pointer target '{other}' (fill-handle, user-name-row, custom-lists-row)"
+                            "unknown pointer target '{other}' (fill-handle, user-name-row, custom-lists-row, sheet-replace-button, sheet-replace-all-button)"
                         ));
                     }
                     None => return Err("'at' must be a string".into()),
@@ -4956,6 +5076,25 @@ fn dispatch_verb(
                 return Err("the File screen is not open (backstage open)".into());
             }
             Done::ok(backstage_layout_json(app))
+        }
+        // The recent files (#1194), read from the store as it is now, not
+        // from the Backstage's copy: what the next Backstage will show.
+        "recent-files" => Done::ok(recent_files_json(
+            &crate::recent_files::list(&crate::config_root()),
+            app.recent_message.as_deref(),
+        )),
+        // A click on the Open page's Recent row `index` (#1194), counted in
+        // the store as it is now; the click itself carries the row's path.
+        "recent-open" => {
+            if !app.backstage {
+                return Err("the File screen is not open (backstage open)".into());
+            }
+            app.refuse_under_dialog()?;
+            let i = arg_usize(args, "index")?;
+            let files = crate::recent_files::list(&crate::config_root());
+            let path = files.get(i).ok_or(format!("no recent file {i}"))?;
+            app.open_recent(path, cx);
+            Done::ok(state(app, window, cx))
         }
         "pointer-drag" => {
             app.refuse_under_dialog()?;
@@ -6010,6 +6149,46 @@ mod tests {
         assert_eq!(instance_name_for(false, None, 42), "suite-42");
     }
 
+    /// #1194: `recent-files` lists each file newest first, with its index,
+    /// name, the kind of tab it opens as, and whether it still exists.
+    #[test]
+    fn recent_files_reports_each_file_in_order() {
+        let dir = std::env::temp_dir().join(format!("docxy-recent-json-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("Budget.xlsx");
+        std::fs::write(&book, b"x").unwrap();
+        let gone = dir.join("Letter.docx");
+        let plan = dir.join("Plan.yppx");
+        let reply = recent_files_json(&[book.clone(), gone, plan], None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let files = match reply.get("files") {
+            Some(Json::Arr(files)) => files.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(files.len(), 3);
+        let field = |i: usize, k: &str| files[i].get(k).cloned().unwrap();
+        assert_eq!(field(0, "index"), Json::Num(0.));
+        assert_eq!(
+            field(0, "path"),
+            Json::Str(book.to_string_lossy().into_owned())
+        );
+        assert_eq!(field(0, "name"), Json::Str("Budget.xlsx".into()));
+        assert_eq!(field(0, "kind"), Json::Str("xlsx".into()));
+        assert_eq!(field(0, "exists"), Json::Bool(true));
+        assert_eq!(field(1, "index"), Json::Num(1.));
+        assert_eq!(field(1, "kind"), Json::Str("docx".into()));
+        assert_eq!(field(1, "exists"), Json::Bool(false));
+        assert_eq!(field(2, "kind"), Json::Str("project".into()));
+        assert_eq!(reply.get("message"), Some(&Json::Null));
+        assert_eq!(
+            recent_files_json(&[], Some("gone")),
+            Json::obj(vec![
+                ("files", Json::Arr(vec![])),
+                ("message", Json::Str("gone".into()))
+            ])
+        );
+    }
+
     /// `tab-list` over one tab of every kind: a blank plan has no path, an
     /// .mpp is imported, and `active` and `dirty` are each tab's own.
     #[test]
@@ -6905,6 +7084,7 @@ mod tests {
             "close-window",
             "window-new",
             "window-select",
+            "recent-open",
             "selection-set",
             "doc-click",
             "open",
@@ -6947,6 +7127,7 @@ mod tests {
             "pointer-wheel",
             "fill-handle-into",
             "backstage-layout",
+            "recent-files",
         ] {
             assert!(!closes_menu(verb, &Json::obj(vec![])), "{verb}");
         }
@@ -8382,6 +8563,8 @@ mod tests {
             Region::Ribbon,
             Region::RibbonFlyout,
             Region::RibbonGroup(6),
+            Region::RibbonLaunch("Number"),
+            Region::RibbonLaunch("Page Setup"),
             Region::BackstageContent,
             Region::BackstageRail,
             Region::FilterButton(1),
@@ -8403,6 +8586,15 @@ mod tests {
         assert!(parse_region("bar:").is_err());
         assert!(parse_region("tab-chip").is_err());
         assert!(parse_region("tab-chip:x").is_err());
+        // A launcher is named by its group's title, as drawn (#1164).
+        assert_eq!(
+            parse_region("ribbon-launch:number"),
+            Ok(Region::RibbonLaunch("Number"))
+        );
+        assert!(parse_region("ribbon-launch").is_err());
+        assert!(parse_region("ribbon-launch:Nope").is_err());
+        let e = parse_region("ribbon-launch:Styles").unwrap_err();
+        assert!(e.contains("draws no launcher"), "{e}");
     }
 
     /// #545: the drag arms once a pressed move lands more than 2px from the

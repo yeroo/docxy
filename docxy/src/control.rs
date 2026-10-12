@@ -1090,7 +1090,7 @@ fn page_color(app: &mut App, args: &Json) -> Result<Json, String> {
     } else {
         Some(parse_rgb(color)?)
     };
-    let changed = app.set_page_color(rgb);
+    let changed = app.set_page_color(rgb)?;
     if changed {
         ctlcore::signal_activity();
     }
@@ -1185,7 +1185,7 @@ fn page_borders(app: &mut App, args: &Json) -> Result<Json, String> {
         None => None,
     };
     let pb = (border != "none").then(|| box_page_borders(border == "shadow", color));
-    let changed = app.set_page_borders(pb.as_ref());
+    let changed = app.set_page_borders(pb.as_ref())?;
     if changed {
         ctlcore::signal_activity();
     }
@@ -2750,6 +2750,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1239: the Design control verbs answer a failed header/footer
+    /// commit's error instead of ok:true, and change nothing.
+    #[test]
+    fn design_verbs_report_a_failed_header_commit() {
+        for (verb, verb_args) in [
+            (
+                "doc.page-color",
+                args(vec![("color", Json::Str("#FF0000".to_string()))]),
+            ),
+            (
+                "doc.page-borders",
+                args(vec![("border", Json::Str("box".to_string()))]),
+            ),
+            (
+                "doc.watermark",
+                args(vec![("text", Json::Str("X".to_string()))]),
+            ),
+        ] {
+            let mut app = crate::tests::app_in_failing_header_edit();
+            let err = dispatch(&mut app, verb, &verb_args).unwrap_err();
+            assert!(
+                err.contains("Couldn't write the header edit"),
+                "{verb}: {err}"
+            );
+        }
+    }
+
     /// #729: an html document whose bundle HTML is gone answers Err instead
     /// of ok:true, and stays modified.
     #[test]
@@ -4137,6 +4164,39 @@ mod tests {
         )
         .unwrap_err();
         assert!(missing.contains("'revised'"), "{missing}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1239: doc.compare answers a failed header/footer commit's error
+    /// instead of comparing, and leaves the open document alone.
+    #[test]
+    fn doc_compare_reports_a_failed_header_commit() {
+        let dir = std::env::temp_dir().join(format!(
+            "docxy-control-compare-hf-fail-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, text: &str| {
+            let path = dir.join(name);
+            std::fs::write(
+                &path,
+                docxcore::package::save_package(&new_package(doc_with(&[text]))),
+            )
+            .unwrap();
+            path.display().to_string()
+        };
+        let original = write("orig.docx", "The cat sat on the mat.");
+        let revised = write("rev.docx", "The black cat sat on a mat.");
+        let compare_args = args(vec![
+            ("original", Json::Str(original)),
+            ("revised", Json::Str(revised)),
+        ]);
+
+        let mut app = crate::tests::app_in_failing_header_edit();
+        let err = dispatch(&mut app, "doc.compare", &compare_args).unwrap_err();
+        assert!(err.contains("Couldn't write the header edit"), "{err}");
+        assert_eq!(app.path, "test.docx");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

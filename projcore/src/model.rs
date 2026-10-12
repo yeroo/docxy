@@ -413,11 +413,13 @@ pub struct Task {
     /// Project commitment type, 0..=2.
     pub commitment_type: Option<i32>,
     /// Work (minutes), Cost and OverAllocated as Project last calculated
-    /// them. docxy never computes them whole: they stay as read until an edit
-    /// changes the task's assignments (or a subtask's), or moves a subtask
-    /// in or out of the task in the outline; then totals move by the change
-    /// in assignment totals and the moved task's own fixed cost, with work
-    /// counting work resources only (`assign::refresh`). An absent one stays absent.
+    /// them. They stay as read until an edit changes the task's assignments
+    /// (or a subtask's), or moves a subtask in or out of the task in the
+    /// outline; then totals move by the change in assignment totals and the
+    /// moved task's own fixed cost, with work counting work resources only
+    /// (`assign::refresh`). docxy computes one whole only to fill an absent
+    /// one such an edit moves (a cost only when every cost in it is known);
+    /// one no edit moves stays absent.
     pub work_min: Option<i64>,
     pub cost: Option<Rate>,
     /// This task's own fixed cost in hundredths; summary fixed costs are
@@ -428,8 +430,10 @@ pub struct Task {
     pub over_allocated: Option<bool>,
     // Recorded progress, kept as read so a save writes it back. docxy neither
     // computes nor reconciles it: edits leave it as read, except that
-    // `remaining_work_min`, `remaining_cost`, regular work and overtime totals
-    // move with assignment deltas as `work_min` and `cost` do. The scheduler
+    // `remaining_work_min` and `remaining_cost` move with assignment deltas
+    // and, absent, are filled from the rollup when an edit moves them, as
+    // `work_min` and `cost` are; regular work and overtime totals only move
+    // by delta, and an absent one stays absent. The scheduler
     // reads a leaf's actual dates, `Stop`/`Resume` and durations through
     // [`Task::tracked`].
     // Durations and work are whole minutes, rounded from the source.
@@ -925,6 +929,12 @@ pub struct TimephasedValue {
 impl TimephasedValue {
     /// `Type` 1: the assignment's planned (remaining) work.
     pub const REMAINING_WORK: u8 = 1;
+    /// `Type` 2, 3 and 6: the assignment's actual work, actual overtime work
+    /// and actual cost (MSPDI `TimephasedDataType`: AssignmentActualWork,
+    /// AssignmentActualOvertimeWork, AssignmentActualCost).
+    pub const ACTUAL_WORK: u8 = 2;
+    pub const ACTUAL_OVERTIME_WORK: u8 = 3;
+    pub const ACTUAL_COST: u8 = 6;
     /// `Type` 4 and 5: the assignment's Baseline (slot 0) work and cost.
     /// Baseline1..10 have their own codes from 16 up.
     pub const BASELINE_WORK: u8 = 4;
@@ -1828,6 +1838,18 @@ impl Project {
     /// Project's default is no.
     pub fn multiple_critical_paths(&self) -> bool {
         self.multiple_critical_paths.unwrap_or(false)
+    }
+
+    /// Whether actual costs are entered by hand (`EditableActualCosts`, that
+    /// is "Actual costs are always calculated by Project" turned off), so an
+    /// edit keeps an assignment's stored actual cost. Read from the stored
+    /// option, which a save writes back as read; absent or unreadable is
+    /// Project's default, no.
+    pub fn editable_actual_costs(&self) -> bool {
+        matches!(
+            self.option("EditableActualCosts").map(str::trim),
+            Some("1" | "true" | "True")
+        )
     }
 
     /// Whether this row has outline children, independently of its stored flag.
