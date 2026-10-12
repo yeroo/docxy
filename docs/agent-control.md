@@ -180,9 +180,10 @@ work.
   finish stays when a later work edit raises the work past the actual.
 - A delayed assignment whose work runs past its task's duration extends the
   task; an actual start or finish, or a contour, ends that extension, so the
-  task returns to its duration. `assign.del
-{uid}` replies `{deleted, task}`; an effort-driven task keeps its work across
-the assignments left. Each edit is one undo step, a value the assignment
+  task returns to its duration.
+
+`assign.del {uid}` replies `{deleted, task}`; an effort-driven task keeps its
+work across the assignments left. Each edit is one undo step, a value the assignment
 already has records none, and every argument is checked first, so a rejected
 call leaves the plan untouched. The assign verbs take `fields` with Project's
 assignment field names (`assign.fields` lists them: Unique ID, Task ID, Task
