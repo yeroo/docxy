@@ -62,6 +62,37 @@ while True:
     time.sleep(3600)
 """
 
+# First launch dies with the issue's display-open error; a retry succeeds.
+OPENBOX_FLAKY = """\
+import os
+import time
+from pathlib import Path
+
+FAKE = Path(os.environ['FAKE_DIR'])
+with (FAKE / 'wm.launches').open('a') as launches:
+    launches.write('launch\\n')
+if len((FAKE / 'wm.launches').read_text().splitlines()) == 1:
+    print('Openbox-Message: Failed to open the display from the DISPLAY environment variable.')
+    raise SystemExit(1)
+pid = FAKE / 'wm.pid.tmp'
+pid.write_text(str(os.getpid()))
+os.replace(pid, FAKE / 'wm.pid')
+while True:
+    time.sleep(3600)
+"""
+
+# Every launch dies with the issue's display-open error.
+OPENBOX_DEAD = """\
+import os
+from pathlib import Path
+
+FAKE = Path(os.environ['FAKE_DIR'])
+with (FAKE / 'wm.launches').open('a') as launches:
+    launches.write('launch\\n')
+print('Openbox-Message: Failed to open the display from the DISPLAY environment variable.')
+raise SystemExit(1)
+"""
+
 XPROP = """\
 print('_NET_SUPPORTING_WM_CHECK(WINDOW): window id # 0x1')
 """
@@ -132,13 +163,13 @@ class Teardown(unittest.TestCase):
         path.write_text(textwrap.dedent(body))
         return path
 
-    def _start(self, child):
+    def _start(self, child, wm='fake-openbox', stderr=subprocess.DEVNULL):
         self.wrapper = subprocess.Popen(
             [sys.executable, str(WRAPPER), '--xvfb', str(self.bin / 'fake-xvfb'),
-             '--wm', str(self.bin / 'fake-openbox'), '--logs', str(self.logs),
+             '--wm', str(self.bin / wm), '--logs', str(self.logs),
              '--', sys.executable, str(child)],
             env=self.env, start_new_session=True,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stdout=subprocess.DEVNULL, stderr=stderr)
         return self.wrapper
 
     def _pid(self, name):
@@ -220,6 +251,43 @@ class Teardown(unittest.TestCase):
         self._pid('child.pid')
         self.assertEqual(wrapper.wait(timeout=20), 7)
         self._assert_all_gone()
+
+
+@unittest.skipUnless(sys.platform.startswith('linux'), 'ui-linux.py is Linux-only')
+class OpenboxRetry(Teardown):
+    def setUp(self):
+        super().setUp()
+        self._write_tool('fake-openbox-flaky', OPENBOX_FLAKY)
+        self._write_tool('fake-openbox-dead', OPENBOX_DEAD)
+
+    def test_openbox_exit_before_ready_is_retried_once(self):
+        wrapper = self._start(self._write_child('child.py', CHILD_EXIT7),
+                              wm='fake-openbox-flaky', stderr=subprocess.PIPE)
+        self._pid('xvfb.pid')
+        self._pid('wm.pid')  # only written on the good second launch
+        _, err = wrapper.communicate(timeout=20)
+        self.assertEqual(wrapper.returncode, 7)
+        launches = (self.fake / 'wm.launches').read_text().splitlines()
+        self.assertEqual(launches, ['launch', 'launch'])
+        retry = 'ui-linux: Openbox exited before becoming ready (exit 1); retrying once'
+        self.assertEqual(err.decode().count(retry), 1)
+        log = (self.logs / 'openbox.log').read_text()
+        first = log.index('Failed to open the display')
+        sep = log.index('--- ui-linux: Openbox attempt 2 ---')
+        self.assertLess(first, sep)
+        self._assert_all_gone()
+
+    def test_openbox_exiting_twice_fails_and_stops_xvfb(self):
+        wrapper = self._start(self._write_child('child.py', CHILD_EXIT7),
+                              wm='fake-openbox-dead', stderr=subprocess.PIPE)
+        xvfb_pid = self._pid('xvfb.pid')
+        _, err = wrapper.communicate(timeout=20)
+        self.assertEqual(wrapper.returncode, 1)
+        launches = (self.fake / 'wm.launches').read_text().splitlines()
+        self.assertEqual(launches, ['launch', 'launch'])
+        self.assertFalse((self.fake / 'child.pid').exists())
+        self.assertIn('Openbox exited before becoming ready after a retry', err.decode())
+        self._wait_for(lambda: self._gone(xvfb_pid), f'pid {xvfb_pid} to exit')
 
 
 @unittest.skipUnless(sys.platform.startswith('linux'), 'ui-linux.py is Linux-only')
