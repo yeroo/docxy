@@ -173,9 +173,10 @@ work.
   to the assignment's start, at the whole work its actual finish too, and 0
   clears both. The actual cost follows the resource's accrual (Start: the
   whole cost once work has begun; End: none until it is done; Prorated: the
-  share worked), and remaining work, remaining cost and % work complete are
-  derived, as are the task's and resource's actual work, actual cost and %
-  work complete where the plan stores them. The task's own progress (its
+  share worked; a plan whose actual costs are entered by hand,
+  `EditableActualCosts`, keeps the stored one), and remaining work, remaining
+  cost and % work complete are derived, as are the task's and resource's
+  actual work, actual cost and % work complete where the plan stores them. The task's own progress (its
   actual start and finish, % complete) is not derived from it, and an actual
   finish stays when a later work edit raises the work past the actual.
 - A delayed assignment whose work runs past its task's duration extends the

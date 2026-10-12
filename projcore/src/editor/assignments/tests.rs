@@ -1086,3 +1086,95 @@ fn actual_overtime_never_passes_the_new_actual_work() {
     ed.set_assignment(1, actual(DAY)).unwrap();
     assert_eq!(get(&ed, 1).actual_overtime_work_min, Some(120));
 }
+
+#[test]
+fn actual_costs_entered_by_hand_stay_through_edits_and_a_save() {
+    let mut ed = tracked(None, |p| {
+        p.options.push(("EditableActualCosts".into(), "1".into()));
+        p.assignments[0].actual_work_min = Some(2 * DAY);
+        p.assignments[0].actual_start = Some(at(5, 8));
+        p.assignments[0].actual_cost = Rate::parse("12345");
+    });
+    assert!(ed.proj.editable_actual_costs());
+    ed.set_assignment(1, table(1)).unwrap();
+    assert_eq!(cost(&ed, 1), 3200.0);
+    assert_eq!(money_text(&get(&ed, 1).actual_cost), Some("12345"));
+    ed.set_assignment(1, actual(3 * DAY)).unwrap();
+    assert_eq!(money_text(&get(&ed, 1).actual_cost), Some("12345"));
+    let back = crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(&ed.proj)).unwrap();
+    assert!(back.editable_actual_costs());
+    // Absent, or anything else, is Project's default: calculated.
+    for text in [None, Some("0"), Some("maybe")] {
+        let mut proj = Project::default();
+        if let Some(text) = text {
+            proj.options
+                .push(("EditableActualCosts".into(), text.into()));
+        }
+        assert!(!proj.editable_actual_costs(), "{text:?}");
+    }
+}
+
+#[test]
+fn a_finished_assignment_without_work_has_its_whole_cost_as_actual() {
+    // A milestone's assignment: no work, $50 per use, finished.
+    let mut ed = tracked(None, |p| {
+        p.resources[0].cost_per_use = Rate::parse("5000");
+        p.resources[0].rates[0].cost_per_use = Rate::parse("5000");
+        let a = &mut p.assignments[0];
+        a.work_min = 0;
+        a.actual_work_min = Some(0);
+        a.actual_start = Some(at(5, 8));
+        a.actual_finish = Some(at(5, 8));
+    });
+    ed.set_assignment(1, table(1)).unwrap();
+    let a = get(&ed, 1);
+    assert_eq!(money_text(&a.cost), Some("5000"));
+    assert_eq!(money_text(&a.actual_cost), Some("5000"));
+    assert_eq!(money_text(&a.remaining_cost), Some("0"));
+    assert_eq!(a.percent_work_complete, Some(100));
+}
+
+#[test]
+fn an_actual_start_begins_a_start_accrual_without_actual_work() {
+    let mut ed = tracked(None, |p| {
+        p.resources[0].accrue_at = Some(AccrueAt::Start);
+        p.assignments[0].actual_work_min = Some(0);
+        p.assignments[0].actual_start = Some(at(5, 8));
+    });
+    ed.set_assignment(1, table(1)).unwrap();
+    let a = get(&ed, 1);
+    assert_eq!(money_text(&a.actual_cost), Some("320000"));
+    assert_eq!(a.percent_work_complete, Some(0));
+}
+
+#[test]
+fn an_unchanged_actual_beside_a_work_edit_keeps_the_actuals_spread() {
+    let mut ed = tracked(None, |p| {
+        p.assignments[0].actual_work_min = Some(2 * DAY);
+        p.assignments[0].actual_start = Some(at(5, 8));
+        p.assignments[0].timephased_data = [
+            TimephasedValue::REMAINING_WORK,
+            TimephasedValue::ACTUAL_WORK,
+            TimephasedValue::ACTUAL_COST,
+        ]
+        .into_iter()
+        .map(|kind| TimephasedValue {
+            kind,
+            ..TimephasedValue::default()
+        })
+        .collect();
+    });
+    let patch = AssignmentPatch {
+        work_min: Some(6 * DAY),
+        actual_work_min: Some(2 * DAY),
+        ..AssignmentPatch::default()
+    };
+    ed.set_assignment(1, patch).unwrap();
+    let a = get(&ed, 1);
+    let kinds: Vec<u8> = a.timephased_data.iter().map(|t| t.kind).collect();
+    assert_eq!(kinds, [2, 6]);
+    assert_eq!(
+        (a.work_min, a.actual_work_min, a.percent_work_complete),
+        (6 * DAY, Some(2 * DAY), Some(33))
+    );
+}

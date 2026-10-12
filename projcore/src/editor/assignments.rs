@@ -479,16 +479,15 @@ impl Editor {
             .iter_mut()
             .find(|a| a.uid == uid)
             .expect("checked");
-        // The spread of the old actuals and of the work left described them;
-        // the baselines stay.
-        let stale = |kind: u8| {
-            matches!(
-                kind,
-                TimephasedValue::REMAINING_WORK
-                    | TimephasedValue::ACTUAL_WORK
-                    | TimephasedValue::ACTUAL_COST
-            ) || (kind == TimephasedValue::ACTUAL_OVERTIME_WORK
-                && overtime != a.actual_overtime_work_min)
+        // The spread of the work left described the old actual, and the
+        // actuals' spread the old actual (an actual given beside a work edit
+        // may be the one it has); the baselines stay.
+        let actual_moved = done != a.actual_work_min.unwrap_or(0);
+        let stale = |kind: u8| match kind {
+            TimephasedValue::REMAINING_WORK => true,
+            TimephasedValue::ACTUAL_WORK | TimephasedValue::ACTUAL_COST => actual_moved,
+            TimephasedValue::ACTUAL_OVERTIME_WORK => overtime != a.actual_overtime_work_min,
+            _ => false,
         };
         a.timephased_data.retain(|t| !stale(t.kind));
         a.actual_work_min = Some(done);

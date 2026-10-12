@@ -324,33 +324,36 @@ pub(crate) fn work_percent(work_min: i64, actual_min: i64) -> u8 {
 }
 
 /// What the first `actual_min` minutes of the assignment's work cost, its
-/// work running over `(start, finish)`, by its resource's `AccrueAt`: Start
-/// puts its whole `Cost` into the actual cost once work has begun, End only
-/// once the work is done, and Prorated (the default) prices the actual part:
-/// the share of the span's working time the actual work covers, from the
-/// start, with the actual overtime (never more than the actual) at the
-/// overtime rate and the cost per use once. Work done is its whole cost
-/// under every accrual. `None`, leaving the stored actual cost, for a cost
-/// resource and when there is no such resource.
+/// work running over `(start, finish)` and costing `cost` in all. Done work
+/// (the actual reaches the work, and is some work or has an actual finish)
+/// is its whole cost; work not begun (no actual and no actual start) costs
+/// nothing. Between, its resource's `AccrueAt` decides: Start puts the whole
+/// cost into the actual cost, End none of it, and Prorated (the default)
+/// prices the actual part: the share of the span's working time the actual
+/// work covers, from the start, with the actual overtime (never more than
+/// the actual) at the overtime rate and the cost per use once. `None`,
+/// leaving the stored actual cost, for a cost resource and when there is no
+/// such resource.
 pub(crate) fn actual_cost(
     proj: &Project,
     a: &Assignment,
     actual_min: i64,
     (start, finish): (DateTime, DateTime),
+    cost: Option<&Rate>,
 ) -> Option<Rate> {
     let r = proj.resources.iter().find(|r| r.uid == a.resource_uid)?;
     if r.kind == ResourceType::Cost {
         return None;
     }
     let none = || money(0.0);
-    if actual_min <= 0 {
+    if actual_min >= a.work_min && (actual_min > 0 || a.actual_finish.is_some()) {
+        return cost.cloned();
+    }
+    if actual_min <= 0 && a.actual_start.is_none() {
         return none();
     }
-    if actual_min >= a.work_min {
-        return a.cost.clone();
-    }
     match r.accrue_at {
-        Some(AccrueAt::Start) => a.cost.clone(),
+        Some(AccrueAt::Start) => cost.cloned(),
         Some(AccrueAt::End) => none(),
         _ => {
             let cal = match proj.task(a.task_uid) {
@@ -358,12 +361,20 @@ pub(crate) fn actual_cost(
                 None => WorkCalendar::weekly(Calendar::standard_week()),
             };
             let total = working_minutes_on(&cal, start, finish);
-            let part = (total as f64 * actual_min as f64 / a.work_min as f64).round() as i64;
+            let share = if a.work_min > 0 {
+                actual_min.max(0) as f64 / a.work_min as f64
+            } else {
+                0.0
+            };
+            let part = (total as f64 * share).round() as i64;
             let end = advance(&cal, start, part, true)?.max(start);
             let mut done = a.clone();
-            done.work_min = actual_min;
-            done.overtime_work_min =
-                Some(a.actual_overtime_work_min.unwrap_or(0).clamp(0, actual_min));
+            done.work_min = actual_min.max(0);
+            done.overtime_work_min = Some(
+                a.actual_overtime_work_min
+                    .unwrap_or(0)
+                    .clamp(0, actual_min.max(0)),
+            );
             assignment_cost(proj, &done, (start, end))
         }
     }
@@ -602,7 +613,8 @@ impl OutlineIndex {
 ///   and its `Cost` from [`assignment_cost`] (a cost it cannot price stays),
 ///   `RegularWork` = work − overtime, `RemainingWork` = work − actual work and
 ///   `ActualCost` from its actual work ([`actual_cost`]; one it cannot price
-///   stays), `RemainingCost` = cost − actual cost, and `PercentWorkComplete`
+///   stays, and so does every one when the plan's actual costs are entered
+///   by hand, [`Project::editable_actual_costs`]), `RemainingCost` = cost − actual cost, and `PercentWorkComplete`
 ///   from its actual work when it has one ([`work_percent`]). A work
 ///   resource's assignment with `OvertimeWork` gets `RemainingOvertimeWork` =
 ///   overtime − actual overtime, and `OvertimeCost`, `RemainingOvertimeCost`
@@ -648,11 +660,23 @@ pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project,
             continue;
         }
         let span = assignment_span(proj, sched, a);
-        let cost = span.and_then(|span| assignment_cost(proj, a, span));
+        // A cost it cannot price (a cost resource's, entered by hand, or one
+        // without a resource) stays as it was, even where a work edit
+        // cleared it.
+        let cost = span
+            .and_then(|span| assignment_cost(proj, a, span))
+            .or_else(|| a.cost.clone())
+            .or_else(|| was.and_then(|b| b.cost.clone()));
+        // The actual part of that cost, unless actual costs are entered by
+        // hand; one it cannot price stays.
+        let actual = a
+            .actual_work_min
+            .zip(span)
+            .filter(|_| !proj.editable_actual_costs())
+            .and_then(|(actual, span)| actual_cost(proj, a, actual, span, cost.as_ref()));
         let overtime_rate = span.and_then(|(start, _)| overtime_rate(proj, a, start));
         let a = &mut proj.assignments[k];
         refreshed.insert(a.uid);
-        let old_actual_cost = a.actual_cost.clone();
         if let Some((start, finish)) = span {
             a.start = Some(start);
             a.finish = Some(finish);
@@ -665,20 +689,8 @@ pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project,
             a.timephased_data
                 .retain(|t| t.kind != TimephasedValue::REMAINING_WORK);
         }
-        // A cost it cannot price (a cost resource's, entered by hand, or one
-        // without a resource) stays as it was, even where a work edit
-        // cleared it.
-        a.cost = cost
-            .or_else(|| a.cost.clone())
-            .or_else(|| was.and_then(|b| b.cost.clone()));
-        // The actual part of the cost just priced; one it cannot price stays.
-        let a = &proj.assignments[k];
-        let actual = a
-            .actual_work_min
-            .zip(span)
-            .and_then(|(actual, span)| actual_cost(proj, a, actual, span));
-        let a = &mut proj.assignments[k];
-        a.actual_cost = actual.or(old_actual_cost);
+        a.cost = cost;
+        a.actual_cost = actual.or(a.actual_cost.take());
         let overtime = a.overtime_work_min.unwrap_or(0).max(0);
         a.regular_work_min = Some((a.work_min - overtime).max(0));
         a.remaining_work_min = Some((a.work_min - a.actual_work_min.unwrap_or(0)).max(0));
@@ -699,7 +711,13 @@ pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project,
             a.actual_overtime_cost = priced(done.max(0), rate);
         }
         if let Some(actual) = a.actual_work_min {
-            a.percent_work_complete = Some(work_percent(a.work_min, actual));
+            // A finished assignment without work is all done.
+            let finished = a.actual_finish.is_some() && actual >= a.work_min;
+            a.percent_work_complete = Some(if finished {
+                100
+            } else {
+                work_percent(a.work_min, actual)
+            });
         }
     }
 

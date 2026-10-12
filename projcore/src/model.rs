@@ -1836,6 +1836,18 @@ impl Project {
         self.multiple_critical_paths.unwrap_or(false)
     }
 
+    /// Whether actual costs are entered by hand (`EditableActualCosts`, that
+    /// is "Actual costs are always calculated by Project" turned off), so an
+    /// edit keeps an assignment's stored actual cost. Read from the stored
+    /// option, which a save writes back as read; absent or unreadable is
+    /// Project's default, no.
+    pub fn editable_actual_costs(&self) -> bool {
+        matches!(
+            self.option("EditableActualCosts").map(str::trim),
+            Some("1" | "true" | "True")
+        )
+    }
+
     /// Whether this row has outline children, independently of its stored flag.
     /// Blank rows are outside the outline: one is never a summary, and the
     /// next non-blank row decides whether the row above it is.
