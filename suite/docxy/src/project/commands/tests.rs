@@ -176,18 +176,25 @@ fn ribbon_inventory_keys_tips_and_assets_are_complete() {
                     Control::Large(c) | Control::Toggle(c) => vec![(c, false)],
                     Control::Column(c) => c.iter().map(|c| (c, false)).collect(),
                     // A split's menu may repeat its primary (Set Baseline...):
-                    // the same command under the same letter, not a second one.
-                    Control::Split { primary, menu } => [(primary, false)]
-                        .into_iter()
-                        .chain(menu.iter().map(|c| {
-                            let again = matches!(
-                                (c.act, primary.act),
-                                (Act::Project(a), Act::Project(b)) if a == b
-                            );
-                            assert!(!again || c.key_tip == primary.key_tip, "{}", c.id);
-                            (c, again)
-                        }))
-                        .collect(),
+                    // the same command, not a second one. Its items' letters
+                    // are their own menu's, as a drop-down's are (#1212).
+                    Control::Split { primary, menu } => {
+                        let mut menu_keys = vec![];
+                        for c in menu {
+                            let Act::Project(act) = c.act else {
+                                panic!("wrong action")
+                            };
+                            if c.act != primary.act {
+                                acts.push(act);
+                            }
+                            assert!(!c.key_tip.is_empty() && !menu_keys.contains(&c.key_tip));
+                            menu_keys.push(c.key_tip);
+                        }
+                        [(primary, false)]
+                            .into_iter()
+                            .chain(menu.iter().map(|c| (c, true)))
+                            .collect()
+                    }
                     // A View Reports menu (#1123): the button, then its items,
                     // whose letters are their own menu's.
                     Control::Dropdown { cmd, items } => {
@@ -347,14 +354,14 @@ fn project_instruction_paths_exist() {
     for t in &tabs {
         for g in &t.groups {
             for control in &g.items {
-                // A dropdown item's KeyTip is its menu's letter, then its own.
+                // A dropdown or split item's KeyTip is its menu's letter,
+                // then its own (#1212).
                 let cmds: Vec<(_, Option<&str>)> = match control {
                     Control::Large(c) | Control::Toggle(c) => vec![(c, None)],
                     Control::Column(c) => c.iter().map(|c| (c, None)).collect(),
-                    Control::Split { primary, menu } => [primary]
+                    Control::Split { primary, menu } => [(primary, None)]
                         .into_iter()
-                        .chain(menu)
-                        .map(|c| (c, None))
+                        .chain(menu.iter().map(|c| (c, Some(primary.key_tip))))
                         .collect(),
                     Control::Dropdown { cmd, items } => [(cmd, None)]
                         .into_iter()
@@ -548,6 +555,15 @@ fn project_instruction_paths_exist() {
         assert_eq!(*found_tip, tip, "{path} screentip");
         assert!(matches!(found, Act::Project(a) if *a == act), "{path}");
         let t = tabs.iter().find(|t| t.name == tab).unwrap();
+        // A split's own letter opens its menu and runs nothing (#1212).
+        if let Some(id) = tab_keytip_split(t, key) {
+            assert!(
+                split_primary(t, id).is_some_and(|c| c.label == label),
+                "{path}"
+            );
+            assert!(keytip_path(t, key).is_none(), "{path} KeyTip {key}");
+            continue;
+        }
         assert!(
             matches!(keytip_path(t, key), Some(Act::Project(a)) if a == act),
             "{path} KeyTip {key}"
@@ -579,21 +595,41 @@ fn project_instruction_paths_exist() {
     );
 }
 
-/// The command a KeyTip path on `t` reaches: one letter, or a menu's letter
-/// and then its item's (`D P`).
-fn keytip_path(t: &rs::Tab<Act>, key: &str) -> Option<Act> {
-    let Some((menu, item)) = key.split_once(' ') else {
-        return tab_keytip_cmd(t, key);
-    };
-    let opener = tab_keytip_cmd(t, menu)?;
+/// The split button on `t` whose primary is `id`.
+fn split_primary<'a>(t: &'a rs::Tab<Act>, id: &str) -> Option<&'a rs::Cmd<Act>> {
     t.groups
         .iter()
         .flat_map(|g| &g.items)
         .find_map(|c| match c {
-            Control::Dropdown { cmd, items } if cmd.act == opener => items
-                .iter()
-                .find(|i| i.key_tip.eq_ignore_ascii_case(item))
-                .map(|i| i.act),
+            Control::Split { primary, .. } if primary.id == id => Some(primary),
+            _ => None,
+        })
+}
+
+/// The command a KeyTip path on `t` reaches: one letter, or a menu's letter
+/// and then its item's (`D P`), a drop-down's or a split's (`B L`, #1212).
+fn keytip_path(t: &rs::Tab<Act>, key: &str) -> Option<Act> {
+    let Some((menu, item)) = key.split_once(' ') else {
+        return tab_keytip_cmd(t, key);
+    };
+    let pick = |items: &[rs::Cmd<Act>]| {
+        items
+            .iter()
+            .find(|i| i.key_tip.eq_ignore_ascii_case(item))
+            .map(|i| i.act)
+    };
+    let split = tab_keytip_split(t, menu);
+    let opener = if split.is_none() {
+        tab_keytip_cmd(t, menu)
+    } else {
+        None
+    };
+    t.groups
+        .iter()
+        .flat_map(|g| &g.items)
+        .find_map(|c| match c {
+            Control::Split { primary, menu } if split == Some(primary.id) => pick(menu),
+            Control::Dropdown { cmd, items } if opener == Some(cmd.act) => pick(items),
             _ => None,
         })
 }
@@ -4053,8 +4089,8 @@ fn delete_after_an_id_click_on_a_summary_asks() {
 }
 
 /// #397: Set Baseline is a split button: the primary sets the baseline, its
-/// menu offers Set Baseline... and Clear Baseline..., and the letters B and
-/// L still reach both from the keyboard.
+/// menu offers Set Baseline... and Clear Baseline.... From the keyboard,
+/// Alt, P, B opens the menu, and its letters B and L pick the item (#1212).
 #[test]
 fn set_baseline_is_a_split_with_clear_baseline_in_its_menu() {
     let r = project_ribbon();
@@ -4087,14 +4123,15 @@ fn set_baseline_is_a_split_with_clear_baseline_in_its_menu() {
     );
     // Clear Baseline no longer sits beside it.
     assert_eq!(schedule.items.len(), 2, "Calculate Project and the split");
-    assert!(matches!(
-        tab_keytip_cmd(project, "B"),
-        Some(Act::Project(ProjectAct::Baseline))
-    ));
-    assert!(matches!(
-        tab_keytip_cmd(project, "L"),
-        Some(Act::Project(ProjectAct::ClearBaseline))
-    ));
+    // B opens the menu and runs nothing; L is the menu's letter, no tab's.
+    assert_eq!(tab_keytip_split(project, "b"), Some("pr-baseline"));
+    assert!(tab_keytip_cmd(project, "B").is_none());
+    assert!(tab_keytip_split(project, "L").is_none());
+    assert!(tab_keytip_cmd(project, "L").is_none());
+    assert!(!tab_keytip_starts(project, "L"));
+    let shortcuts: Vec<_> = menu.iter().map(|c| c.tip.shortcut).collect();
+    assert_eq!(shortcuts, ["Alt, P, B, B", "Alt, P, B, L"]);
+    assert_eq!(primary.tip.shortcut, "Alt, P, B");
 }
 
 // ---- Range Link / Unlink (#558, over a #560 selection) ----------------------

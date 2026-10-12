@@ -526,8 +526,9 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                     // A split button: the upper half sets the baseline at
                     // once, the arrow opens Set Baseline... / Clear
                     // Baseline... (#397). Project 2024 draws a menu button
-                    // here, with no one-press half; the one press is kept
-                    // so Alt, P, B still sets the baseline.
+                    // here, with no one-press half; the mouse keeps the one
+                    // press. Alt, P, B opens the menu, and its own letters
+                    // B and L pick the item (#1212).
                     Control::Split {
                         primary: cmd(
                             "pr-baseline",
@@ -544,7 +545,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                                 "Set Baseline...",
                                 "Set Baseline",
                                 Baseline,
-                                "Alt, P, B",
+                                "Alt, P, B, B",
                                 "B",
                             ),
                             cmds(
@@ -553,7 +554,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                                 "Clear Baseline...",
                                 "Clear Baseline",
                                 ClearBaseline,
-                                "Alt, P, L",
+                                "Alt, P, B, L",
                                 "L",
                             ),
                         ],
