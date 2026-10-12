@@ -504,7 +504,13 @@ fn totals<'a>(assignments: impl Iterator<Item = &'a Assignment>) -> Totals {
 /// The task's own contribution to stored totals: its assignments and fixed
 /// cost, with work counting only assignments whose work is time ([`is_work`]).
 fn task_totals(p: &Project, uid: i32) -> TaskTotals {
-    let mine = p.assignments.iter().filter(|a| a.task_uid == uid);
+    let mine: Vec<&Assignment> = p.assignments.iter().filter(|a| a.task_uid == uid).collect();
+    own_totals(p, p.task(uid), &mine)
+}
+
+/// [`task_totals`] for `task` with its assignments `mine`.
+fn own_totals(p: &Project, task: Option<&Task>, mine: &[&Assignment]) -> TaskTotals {
+    let mine = mine.iter().copied();
     let (_, cost, _, remaining_cost) = totals(mine.clone());
     let overtime_cost: f64 = mine.clone().map(|a| value(a.overtime_cost.as_ref())).sum();
     let remaining_overtime_cost: f64 = mine
@@ -526,7 +532,7 @@ fn task_totals(p: &Project, uid: i32) -> TaskTotals {
         .iter()
         .map(|a| a.actual_work_min.unwrap_or(0))
         .sum();
-    let (fixed, fixed_remaining) = p.task(uid).map_or((0.0, 0.0), |t| {
+    let (fixed, fixed_remaining) = task.map_or((0.0, 0.0), |t| {
         let amount = value(t.fixed_cost.as_ref());
         let pct = t.percent_complete.unwrap_or(0).min(100);
         let share = match t.fixed_cost_accrual {
@@ -600,6 +606,30 @@ impl OutlineIndex {
     }
 }
 
+/// Each task's whole contribution, its own ([`task_totals`]) and every
+/// outline descendant's, and whether every assignment counted in it has a
+/// known cost.
+fn rollups(p: &Project, index: &OutlineIndex) -> HashMap<i32, (TaskTotals, bool)> {
+    let mut mine: HashMap<i32, Vec<&Assignment>> = HashMap::new();
+    for a in &p.assignments {
+        mine.entry(a.task_uid).or_default().push(a);
+    }
+    let mut rolled: HashMap<i32, (TaskTotals, bool)> = HashMap::new();
+    for (&uid, &i) in &index.positions {
+        let assignments = mine.get(&uid).map(Vec::as_slice).unwrap_or(&[]);
+        let own = own_totals(p, Some(&p.tasks[i]), assignments);
+        let known = assignments.iter().all(|a| a.cost.is_some());
+        for target in std::iter::once(uid).chain(index.ancestors(uid).iter().copied()) {
+            let entry = rolled
+                .entry(target)
+                .or_insert((TaskTotals::default(), true));
+            entry.0.add_scaled(own, 1);
+            entry.1 &= known;
+        }
+    }
+    rolled
+}
+
 /// Refresh what an edit made stale. `prev` and `prev_sched` are the model and
 /// schedule before the edit; `proj` is the edited model and `sched` its
 /// schedule. Every field it writes is derived from the edit's inputs, from
@@ -629,7 +659,11 @@ impl OutlineIndex {
 ///   move by their assignments' changes, and `PercentWorkComplete` follows
 ///   when its work or actual work moved and both are stored. Its outline summaries move by the same deltas;
 ///   a task moved in the outline takes its assignments and its own fixed cost
-///   from its old summaries to its new ones. An absent total stays absent.
+///   from its old summaries to its new ones. An absent `Work`, `Cost`,
+///   `RemainingWork` or `RemainingCost` the edit moves is filled with the
+///   task's whole contribution and its outline descendants' (a cost one
+///   only when every assignment counted in it has a known cost); any other
+///   absent total, and one the edit does not move, stays absent.
 /// - A resource whose assignments changed (added, removed or refreshed) gets
 ///   its work, cost and remaining totals and its `Start`/`Finish` from them,
 ///   and its actual work, % work complete, actual cost, overtime cost and
@@ -779,27 +813,57 @@ pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project,
             }
         }
     }
+    // An absent Work, Cost, RemainingWork or RemainingCost the edit moves is
+    // filled with the task's whole rollup, built only when one is needed.
+    let fills = proj.tasks.iter().any(|t| {
+        let (Some(delta), Some(was)) = (moved.get(&t.uid), prev_index.task(prev, t.uid)) else {
+            return false;
+        };
+        (delta.work != 0 && was.work_min.is_none())
+            || (delta.remaining_work != 0 && was.remaining_work_min.is_none())
+            || (delta.cost != 0.0 && was.cost.is_none())
+            || (delta.remaining_cost != 0.0 && was.remaining_cost.is_none())
+    });
+    let rolled = if fills {
+        rollups(proj, &now_index)
+    } else {
+        HashMap::new()
+    };
     for t in &mut proj.tasks {
         let (Some(&delta), Some(was)) = (moved.get(&t.uid), prev_index.task(prev, t.uid)) else {
             continue;
         };
+        let full = rolled.get(&t.uid).map(|&(totals, _)| totals);
+        // A total over a cost nobody knows would be invented.
+        let full_cost = rolled
+            .get(&t.uid)
+            .filter(|&&(_, known)| known)
+            .map(|&(totals, _)| totals);
+        let moved_or_full = |was: Option<&Rate>, delta: f64, full: Option<f64>| match was {
+            Some(c) => money(value(Some(c)) + delta),
+            None => full.and_then(money),
+        };
         if delta.work != 0 {
-            t.work_min = was.work_min.map(|w| w + delta.work);
+            t.work_min = match was.work_min {
+                Some(w) => Some(w + delta.work),
+                None => full.map(|f| f.work),
+            };
         }
         if delta.remaining_work != 0 {
-            t.remaining_work_min = was.remaining_work_min.map(|w| w + delta.remaining_work);
+            t.remaining_work_min = match was.remaining_work_min {
+                Some(w) => Some(w + delta.remaining_work),
+                None => full.map(|f| f.remaining_work),
+            };
         }
         if delta.cost != 0.0 {
-            t.cost = was
-                .cost
-                .as_ref()
-                .and_then(|c| money(value(Some(c)) + delta.cost));
+            t.cost = moved_or_full(was.cost.as_ref(), delta.cost, full_cost.map(|f| f.cost));
         }
         if delta.remaining_cost != 0.0 {
-            t.remaining_cost = was
-                .remaining_cost
-                .as_ref()
-                .and_then(|c| money(value(Some(c)) + delta.remaining_cost));
+            t.remaining_cost = moved_or_full(
+                was.remaining_cost.as_ref(),
+                delta.remaining_cost,
+                full_cost.map(|f| f.remaining_cost),
+            );
         }
         if delta.overtime_work != 0 {
             t.overtime_work_min = was.overtime_work_min.map(|w| w + delta.overtime_work);
@@ -1083,6 +1147,140 @@ mod tests {
             assert_eq!(t.remaining_overtime_work_min, None);
             assert_eq!(t.overtime_cost, None);
             assert_eq!(t.remaining_overtime_cost, None);
+        }
+    }
+
+    /// Project summary 0 over summary 1 over leaves 2 (no assignments) and
+    /// 3 (an 8-hour assignment at $50/h with 2 hours done, and a $10 fixed
+    /// cost). Only leaf 3 stores its totals.
+    fn rollup_plan() -> Project {
+        let mut p = plan(at(2, 8), 1);
+        let task = |uid, outline_level, summary| Task {
+            uid,
+            id: uid,
+            outline_level,
+            summary,
+            name: format!("T{uid}"),
+            duration_min: 480,
+            ..Task::default()
+        };
+        p.tasks = vec![
+            task(0, 0, true),
+            task(1, 1, true),
+            task(2, 2, false),
+            Task {
+                fixed_cost: Rate::parse("1000"),
+                work_min: Some(480),
+                remaining_work_min: Some(360),
+                cost: Rate::parse("41000"),
+                remaining_cost: Rate::parse("31000"),
+                ..task(3, 2, false)
+            },
+        ];
+        p.resources = vec![
+            resource(1, ResourceType::Work, "50", "0"),
+            resource(2, ResourceType::Cost, "0", "0"),
+        ];
+        p.assignments = vec![Assignment {
+            task_uid: 3,
+            actual_work_min: Some(120),
+            remaining_work_min: Some(360),
+            cost: Rate::parse("40000"),
+            actual_cost: Rate::parse("10000"),
+            remaining_cost: Rate::parse("30000"),
+            ..assignment(1, 1, 1.0, 8)
+        }];
+        p
+    }
+
+    /// Work, remaining work, cost and remaining cost of task `uid`.
+    fn stored(p: &Project, uid: i32) -> (Option<i64>, Option<i64>, Option<&str>, Option<&str>) {
+        let t = p.task(uid).unwrap();
+        (
+            t.work_min,
+            t.remaining_work_min,
+            t.cost.as_ref().map(Rate::as_str),
+            t.remaining_cost.as_ref().map(Rate::as_str),
+        )
+    }
+
+    #[test]
+    fn refresh_fills_absent_task_totals_from_the_whole_rollup() {
+        let prev = rollup_plan();
+        let mut next = prev.clone();
+        next.assignments.push(Assignment {
+            task_uid: 2,
+            ..assignment(2, 1, 1.0, 8)
+        });
+        let sched = schedule(&prev);
+        refresh(&prev, &sched, &mut next, &sched);
+        assert_eq!(
+            stored(&next, 2),
+            (Some(480), Some(480), Some("40000"), Some("40000"))
+        );
+        // The summaries add leaf 3's untouched assignment and fixed cost.
+        for uid in [0, 1] {
+            assert_eq!(
+                stored(&next, uid),
+                (Some(960), Some(840), Some("81000"), Some("71000"))
+            );
+        }
+        assert_eq!(stored(&next, 3), stored(&prev, 3));
+
+        // A second run on the same edit changes nothing.
+        let mut again = next.clone();
+        refresh(&prev, &sched, &mut again, &sched);
+        assert_eq!(again, next);
+
+        // Filled totals then move by delta, down to zero.
+        let mut dropped = next.clone();
+        dropped.assignments.retain(|a| a.uid != 2);
+        refresh(&next, &sched, &mut dropped, &sched);
+        assert_eq!(
+            stored(&dropped, 2),
+            (Some(0), Some(0), Some("0"), Some("0"))
+        );
+        assert_eq!(
+            stored(&dropped, 1),
+            (Some(480), Some(360), Some("41000"), Some("31000"))
+        );
+    }
+
+    #[test]
+    fn refresh_fills_no_cost_over_an_unknown_one() {
+        let prev = rollup_plan();
+        let mut next = prev.clone();
+        next.assignments.push(Assignment {
+            task_uid: 2,
+            ..assignment(2, 1, 1.0, 8)
+        });
+        // A cost resource's assignment nobody priced.
+        next.assignments.push(Assignment {
+            task_uid: 2,
+            ..assignment(3, 2, 1.0, 0)
+        });
+        let sched = schedule(&prev);
+        refresh(&prev, &sched, &mut next, &sched);
+        assert_eq!(next.assignments[2].cost, None);
+        assert_eq!(stored(&next, 2), (Some(480), Some(480), None, None));
+        assert_eq!(stored(&next, 1), (Some(960), Some(840), None, None));
+        assert_eq!(stored(&next, 3), stored(&prev, 3));
+    }
+
+    #[test]
+    fn refresh_fills_nothing_an_edit_does_not_move() {
+        let mut prev = rollup_plan();
+        prev.assignments.push(Assignment {
+            task_uid: 2,
+            cost: Rate::parse("40000"),
+            ..assignment(2, 1, 1.0, 8)
+        });
+        let mut next = prev.clone();
+        next.tasks[2].name = "Renamed".into();
+        let sched = schedule(&prev);
+        refresh(&prev, &sched, &mut next, &sched);
+        for uid in [0, 1, 2] {
+            assert_eq!(stored(&next, uid), (None, None, None, None));
         }
     }
 

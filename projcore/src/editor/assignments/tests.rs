@@ -36,7 +36,7 @@ fn plan(kind: Option<TaskType>, effort_driven: bool, assignments: Vec<Assignment
                 duration_min: 5 * DAY,
                 task_type: kind,
                 effort_driven: Some(effort_driven),
-                // The refresh moves stored totals; it never fills absent ones.
+                // Stored totals, so the refresh moves them by delta.
                 work_min: Some(0),
                 cost: Rate::parse("0"),
                 ..Task::default()
