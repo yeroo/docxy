@@ -60,3 +60,9 @@ htmlbundle = { version = "0.5.0", path = "../htmlbundle" }
 # plain `cargo install docxy` needs no wasm toolchain; opening and saving an
 # existing .docx.html works either way.
 html-export = []
+
+[dev-dependencies]
+# `tests/pty_first_key.rs` runs the editor in a pseudo-terminal the way the
+# UI harness's terminal cases do (#1204). Path-only, so `cargo publish`
+# drops it.
+uiharness = { path = "../uiharness" }

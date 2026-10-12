@@ -448,6 +448,7 @@ dependencies = [
  "ratatui",
  "ratatui-image",
  "ribboncore",
+ "uiharness",
  "unicode-bidi",
  "unicode-segmentation",
  "unicode-width 0.2.0",
@@ -2461,6 +2462,7 @@ dependencies = [
  "ratatui",
  "ratatui-image",
  "ribboncore",
+ "uiharness",
  "unicode-width 0.2.0",
 ]
 
