@@ -6,7 +6,10 @@
 //! #1029 types into it. Until that slice lands, `pointer-click` names it.
 //! The sheet's inputs are covered (#1200): `pointer-click` presses them where
 //! they are drawn and `field-read {"input":id}` reads them, for
-//! `uiharness/cases/sheet-inputs-typing.uit`.
+//! `uiharness/cases/sheet-inputs-typing.uit`. So are the document's
+//! (#1201): the Find bar's Find and Replace fields, Home's Font and Font
+//! Size boxes and the comment editor, for
+//! `uiharness/cases/doc-inputs-typing.uit`.
 //! Unlike the dialog catalogue, nothing finds a new input added outside
 //! this list: it is kept by review (`qa/inputs-typing.md`). The sheet's Name
 //! Box is display-only today (#1200 lists what it lacks), the suite has no
@@ -95,7 +98,13 @@ static REGISTRY: &[Input] = &[
     ),
     input(
         "doc-find",
-        "the Find bar / Find & Replace (document)",
+        "the Find bar's Find field (document)",
+        Surface::Doc,
+        DOC,
+    ),
+    input(
+        "doc-replace",
+        "the Find bar's Replace field (document)",
         Surface::Doc,
         DOC,
     ),
@@ -216,15 +225,30 @@ fn sheet_probe(id: &str) -> Option<&'static str> {
     }
 }
 
+/// The probe a document input is drawn under.
+fn doc_probe(id: &str) -> Option<&'static str> {
+    match id {
+        "doc-find" => Some("df-q"),
+        "doc-replace" => Some("df-r"),
+        "doc-font" => Some("doc-combo:fontname"),
+        "doc-font-size" => Some("doc-combo:fontsize"),
+        "comment-editor" => Some("comment-edit"),
+        _ => None,
+    }
+}
+
 /// Where `pointer-click {"input":id}` presses, from the frame on screen.
-/// The in-cell editor is a double-click on the active cell, which opens it;
-/// it is refused while an entry is open, where a click on the cell would
-/// commit it. Inputs of other surfaces answer which issue makes them
-/// targetable.
+/// A sheet input is pressed here: the in-cell editor is a double-click on
+/// the active cell, which opens it, refused while an entry is open, where a
+/// click on the cell would commit it. A document input goes to
+/// [`press_doc`]. Backstage, Project and terminal inputs answer which issue
+/// makes them targetable.
 pub(crate) fn press(app: &crate::Docxy, id: &str) -> Result<Press, String> {
     let i = find(id)?;
-    if i.surface != Surface::Sheet {
-        return Err(not_covered(i));
+    match i.surface {
+        Surface::Sheet => {}
+        Surface::Doc => return press_doc(app, i),
+        _ => return Err(not_covered(i)),
     }
     let v = crate::harness::sheet(app)?;
     let Some(probe) = sheet_probe(id) else {
@@ -255,17 +279,45 @@ pub(crate) fn press(app: &crate::Docxy, id: &str) -> Result<Press, String> {
     })
 }
 
-/// `field-read {"input":id}`: a sheet input as it is edited and drawn, in the
-/// shape of a dialog field's (`value`, `focused`, `caret` and `selection` in
-/// chars, `null` while it has no focus). The formula bar and the in-cell
+/// A document input, pressed where it is drawn.
+fn press_doc(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
+    crate::harness::active_doc(app)?;
+    let probe = doc_probe(i.id).ok_or_else(|| not_covered(i))?;
+    let bounds = app.probes.borrow().on_screen(probe);
+    let b = bounds.ok_or_else(|| match i.id {
+        "doc-find" | "doc-replace" => {
+            format!("{} is not drawn: open the Find bar first (Ctrl+F)", i.name)
+        }
+        "doc-font" | "doc-font-size" => {
+            format!("{} is not drawn: show the Home ribbon tab first", i.name)
+        }
+        "comment-editor" => format!(
+            "{} is not drawn: select text, then Review > New Comment",
+            i.name
+        ),
+        _ => format!("{} is not drawn", i.name),
+    })?;
+    Ok(Press {
+        at: b.center(),
+        double: false,
+    })
+}
+
+/// `field-read {"input":id}`: a sheet input as it is edited and drawn (a
+/// document input goes to [`read_doc`]; Backstage, Project and terminal
+/// inputs answer which issue makes them readable), in the shape of a dialog
+/// field's (`value`, `focused`, `caret` and `selection` in chars, `null`
+/// while it has no focus). The formula bar and the in-cell
 /// editor are one buffer, so both are focused while a cell is being edited:
 /// nothing records which one the edit began in. The Find bar's fields append
 /// and pop only, so a focused one's caret is its end. The Name Box and the
 /// Font combos never take the focus today: they read what they draw.
 pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
     let i = find(id)?;
-    if i.surface != Surface::Sheet {
-        return Err(not_covered(i));
+    match i.surface {
+        Surface::Sheet => {}
+        Surface::Doc => return read_doc(app, i),
+        _ => return Err(not_covered(i)),
     }
     let v = crate::harness::sheet(app)?;
     let num = |n: usize| Json::Num(n as f64);
@@ -325,13 +377,67 @@ pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
         }
         _ => return Err(not_covered(i)),
     };
-    Ok(Json::obj(vec![
+    Ok(field_json(id, value, focused, caret, selection))
+}
+
+/// `field-read {"input":id}` for a document input, in the sheet inputs'
+/// shape. The Find bar's fields and the comment editor append and pop only,
+/// so a focused one's caret is its end; the Find bar is the window's, shared
+/// with the sheet's, so it reads only while a document is active. Ctrl+F
+/// opens the Find bar under an open comment bar, but `on_key` gives the
+/// comment bar the keys first, so a Find field is focused only while no
+/// comment is being typed. The Font boxes never take the focus today: they
+/// read what they draw.
+fn read_doc(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
+    crate::harness::active_doc(app)?;
+    let end_if = |text: &str, focused: bool| {
+        if focused {
+            Json::Num(text.chars().count() as f64)
+        } else {
+            Json::Null
+        }
+    };
+    let (value, focused, caret) = match i.id {
+        "doc-find" | "doc-replace" => {
+            let (text, field) = if i.id == "doc-find" {
+                (&app.find_query, crate::FindField::Query)
+            } else {
+                (&app.replace_text, crate::FindField::Replace)
+            };
+            let focused = app.find_open && !app.comment_open && app.find_field == field;
+            (Json::Str(text.clone()), focused, end_if(text, focused))
+        }
+        "doc-font" | "doc-font-size" => {
+            let cmd = if i.id == "doc-font" {
+                "fontname"
+            } else {
+                "fontsize"
+            };
+            let value = crate::doc_combo_value(cmd, app.caret_run_props());
+            (Json::Str(value), false, Json::Null)
+        }
+        "comment-editor" => {
+            let focused = app.comment_open;
+            (
+                Json::Str(app.comment_text.clone()),
+                focused,
+                end_if(&app.comment_text, focused),
+            )
+        }
+        _ => return Err(not_covered(i)),
+    };
+    Ok(field_json(i.id, value, focused, caret, Json::Null))
+}
+
+/// The reply both surfaces' `field-read {"input":id}` give.
+fn field_json(id: &str, value: Json, focused: bool, caret: Json, selection: Json) -> Json {
+    Json::obj(vec![
         ("input", Json::Str(id.into())),
         ("value", value),
         ("focused", Json::Bool(focused)),
         ("caret", caret),
         ("selection", selection),
-    ]))
+    ])
 }
 
 /// The value a sheet ribbon combo draws.
@@ -399,6 +505,53 @@ mod tests {
         for id in sheet {
             assert_eq!(sheet_probe(id).is_none(), id == "cell-editor", "{id}");
         }
+    }
+
+    /// #1201: every document input is pressed where it is drawn.
+    #[test]
+    fn every_doc_input_has_a_target() {
+        let doc: Vec<&str> = registry()
+            .iter()
+            .filter(|i| i.surface == Surface::Doc)
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(
+            doc,
+            [
+                "doc-find",
+                "doc-replace",
+                "doc-font",
+                "doc-font-size",
+                "comment-editor"
+            ]
+        );
+        for id in doc {
+            assert!(doc_probe(id).is_some(), "{id}");
+        }
+    }
+
+    /// The document Font boxes read what `combo_box` draws: the caret run's
+    /// family and size, else Calibri 11.
+    #[test]
+    fn the_doc_font_boxes_read_their_drawn_values() {
+        use docxcore::model::RunProps;
+        assert_eq!(crate::doc_combo_value("fontname", None), "Calibri");
+        assert_eq!(crate::doc_combo_value("fontsize", None), "11");
+        let props = RunProps {
+            font: Some("Aptos".into()),
+            size_half_pts: Some(21),
+            ..RunProps::default()
+        };
+        assert_eq!(
+            crate::doc_combo_value("fontname", Some(props.clone())),
+            "Aptos"
+        );
+        assert_eq!(crate::doc_combo_value("fontsize", Some(props)), "10.5");
+        let whole = RunProps {
+            size_half_pts: Some(24),
+            ..RunProps::default()
+        };
+        assert_eq!(crate::doc_combo_value("fontsize", Some(whole)), "12");
     }
 
     /// The Font combos read the value the ribbon table draws.
