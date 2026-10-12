@@ -1705,7 +1705,7 @@ enum UndoAction {
 }
 
 /// What the minibuffer prompt is collecting.
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 enum PromptKind {
     Find,
     SaveAs,
@@ -2110,6 +2110,12 @@ struct App {
     comment_sel: usize,
     // The File backstage (folder browser / preview / info / save-as).
     backstage: Option<backstage::Backstage>,
+    /// Key presses, clicks and frames handled so far, for `field-read`
+    /// (#1204).
+    counts: ctlcore::field::InputCounts,
+    /// Where each prompt field's text starts, as this frame drew it: the
+    /// `field-read` input id and the cell (#1204).
+    drawn_fields: Vec<(&'static str, (u16, u16))>,
     // The welcome screen shown when launched with no file.
     start_screen: bool,
     start: backstage::Start,
@@ -2266,6 +2272,8 @@ impl App {
             last_click: None,
             comment_sel: 0,
             backstage: None,
+            counts: Default::default(),
+            drawn_fields: Vec::new(),
             start_screen: false,
             start: backstage::Start::new(
                 "xlsxy",
@@ -9269,7 +9277,15 @@ const HDR_CUR: Style = Style::new()
     .bg(Color::DarkGray)
     .add_modifier(Modifier::BOLD);
 
+/// Draw a frame, counting it and recording where the prompts were drawn
+/// (`field-read`, #1204).
 fn draw(app: &mut App, f: &mut Frame) {
+    app.counts.frames += 1;
+    app.drawn_fields.clear();
+    draw_screen(app, f);
+}
+
+fn draw_screen(app: &mut App, f: &mut Frame) {
     let area = f.area();
     if area.height < 8 || area.width < 12 {
         return;
@@ -9501,6 +9517,10 @@ fn draw(app: &mut App, f: &mut Frame) {
         spans.push(RSpan::raw(after));
     } else {
         spans.push(RSpan::raw(content));
+    }
+    if app.edit.is_some() {
+        let col = formula_bar.x + RLine::from(format!(" {name:<8}│ ")).width() as u16;
+        app.drawn_fields.push(("xlsxy-cell", (col, formula_bar.y)));
     }
     let bar = Paragraph::new(RLine::from(spans));
     let bar = if app.fx_expanded {
@@ -9833,6 +9853,13 @@ fn draw(app: &mut App, f: &mut Frame) {
     f.render_widget(Paragraph::new(tabs_line_ui), tabs_line);
 
     // --- hints / status ---------------------------------------------------------
+    if let Some(p) = &app.prompt {
+        let col = hint_line.x + RLine::from(p.label).width() as u16;
+        app.drawn_fields.push(("xlsxy-prompt", (col, hint_line.y)));
+    } else if app.vim.as_ref().is_some_and(|v| v.cmdline.is_some()) {
+        app.drawn_fields
+            .push(("xlsxy-vim-command", (hint_line.x + 1, hint_line.y)));
+    }
     if let Some(p) = &app.prompt {
         // Minibuffer with a visible cursor block.
         let chars: Vec<char> = p.text.chars().collect();
@@ -10849,8 +10876,69 @@ fn run_control(
     result
 }
 
+impl App {
+    /// Where `id`'s text starts, as the last frame drew it.
+    fn drawn_at(&self, id: &str) -> Option<(u16, u16)> {
+        self.drawn_fields
+            .iter()
+            .find(|(i, _)| *i == id)
+            .map(|(_, at)| *at)
+    }
+
+    /// A prompt field, as `field-read {"input":id}` reports it (#1204): the
+    /// minibuffer every prompt shares (its `kind` says which is open), the
+    /// cell editor, the vim `:` line and Backstage Save As's file name.
+    fn input_field(&self, id: &str) -> ctlcore::field::Field {
+        use ctlcore::field::Field;
+        let field = match id {
+            "xlsxy-prompt" => self.prompt.as_ref().map(|p| {
+                Field {
+                    value: Some(p.text.clone()),
+                    focused: true,
+                    caret: Some(p.cursor),
+                    ..Field::default()
+                }
+                .kind(format!("{:?}", p.kind))
+            }),
+            "xlsxy-cell" => self.edit.as_ref().map(|e| {
+                let len = e.text.chars().count();
+                let selection = if e.select_all && len > 0 {
+                    Some((0, len))
+                } else {
+                    e.proposal.as_ref().map(|(from, _)| (*from, len))
+                };
+                Field {
+                    value: Some(e.text.clone()),
+                    focused: self.prompt.is_none(),
+                    caret: Some(e.cursor),
+                    selection,
+                    ..Field::default()
+                }
+            }),
+            "xlsxy-vim-command" => self
+                .vim
+                .as_ref()
+                .and_then(|v| v.cmdline.as_ref())
+                .map(|c| Field::append_only(c, self.prompt.is_none())),
+            "xlsxy-save-as" => {
+                return self
+                    .backstage
+                    .as_ref()
+                    .map_or_else(Field::closed, |b| b.save_as_name_field());
+            }
+            _ => None,
+        };
+        field.map_or_else(Field::closed, |f| f.at(self.drawn_at(id)))
+    }
+}
+
 /// Returns true when the app should exit.
 fn handle_event(app: &mut App, ev: Event) -> bool {
+    match &ev {
+        Event::Key(key) if key.kind != KeyEventKind::Release => app.counts.keys += 1,
+        Event::Mouse(m) if matches!(m.kind, MouseEventKind::Down(_)) => app.counts.clicks += 1,
+        _ => {}
+    }
     let quit = match ev {
         Event::Key(key) => handle_key(app, key),
         Event::Mouse(m) => handle_mouse(app, m),
