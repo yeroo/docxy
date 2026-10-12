@@ -110,20 +110,34 @@ def main():
             if not display.isdecimal() or xvfb.poll() is not None:
                 raise RuntimeError('Xvfb did not start')
             env['DISPLAY'] = ':' + display
-            wm = subprocess.Popen([args.wm, '--sm-disable'], env=env,
-                                  stdout=wlog, stderr=subprocess.STDOUT,
-                                  start_new_session=True)
-            deadline = time.monotonic() + 10
-            while True:
-                if wm.poll() is not None:
-                    raise RuntimeError('Openbox exited before becoming ready')
-                prop = subprocess.run([xprop, '-root', '_NET_SUPPORTING_WM_CHECK'],
-                                      env=env, capture_output=True, text=True, timeout=2)
-                if prop.returncode == 0 and 'window id # 0x' in prop.stdout:
+            became_ready = False
+            for attempt in (1, 2):
+                wm = subprocess.Popen([args.wm, '--sm-disable'], env=env,
+                                      stdout=wlog, stderr=subprocess.STDOUT,
+                                      start_new_session=True)
+                deadline = time.monotonic() + 10
+                while True:
+                    if wm.poll() is not None:
+                        if attempt == 2:
+                            raise RuntimeError(
+                                'Openbox exited before becoming ready after a retry')
+                        print(f'ui-linux: Openbox exited before becoming ready '
+                              f'(exit {wm.returncode}); retrying once',
+                              file=sys.stderr, flush=True)
+                        wlog.write(b'--- ui-linux: Openbox attempt 2 ---\n')
+                        wlog.flush()
+                        time.sleep(0.5)
+                        break
+                    prop = subprocess.run([xprop, '-root', '_NET_SUPPORTING_WM_CHECK'],
+                                          env=env, capture_output=True, text=True, timeout=2)
+                    if prop.returncode == 0 and 'window id # 0x' in prop.stdout:
+                        became_ready = True
+                        break
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError('Openbox did not register as the window manager')
+                    time.sleep(0.05)
+                if became_ready:
                     break
-                if time.monotonic() >= deadline:
-                    raise RuntimeError('Openbox did not register as the window manager')
-                time.sleep(0.05)
             print(f'Private X11 display {env["DISPLAY"]}; logs: {logs}', flush=True)
             child = subprocess.Popen(command, env=env, start_new_session=True)
             code = child.wait()
