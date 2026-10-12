@@ -223,8 +223,8 @@ pub(crate) fn registry() -> &'static [Input] {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Press {
     pub at: Point<Pixels>,
-    /// A double-click: the in-cell editor opens on one, as it does for a
-    /// person.
+    /// A double-click: the in-cell editor and the sheet tab's rename open on
+    /// one, as they do for a person.
     pub double: bool,
 }
 

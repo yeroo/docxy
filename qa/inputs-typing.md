@@ -50,7 +50,9 @@ Every editable input in the suite is typed into with real keys by a case:
   one step against what Excel does. The document tab and the title bar do not
   rename. Save As's file name is the OS's file dialog, which a harness instance
   never opens: it is the manual case below. File > Info has no Title, Tags or
-  Author yet (#1364), so each one's test fails at the press. Settings' typed
+  Author yet (#1364): the case pins what `pointer-click` and `field-read`
+  answer for each, and for Save As, and #1364 replaces those with the full
+  set of steps when it adds the Properties. Settings' typed
   values are the User name and Custom Lists dialogs, which the catalogue
   covers from Backstage (the #1027 path).
 - **A field broken today** is listed in `uiharness/cases/expected-failures.txt`

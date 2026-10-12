@@ -20,9 +20,10 @@
 # Backstage's own fields are not typed into here. Save As's file name (File >
 # Save As, F12, Export > Change File Type) is the OS's file dialog, which a
 # harness instance never opens: qa/inputs-typing.md has it as a manual case.
-# File > Info has no Title, Tags or Author yet (#1364): each test below opens
-# the Info page and fails at the press, so it is listed `| error` until the
-# Properties land with their full set of steps. Settings' typed values are
+# File > Info has no Title, Tags or Author yet (#1364). The tests below pin
+# what pointer-click and field-read answer for each of these, on the Info
+# page; when #1364 adds the Properties, each one's answer test becomes the
+# full set of steps above. Settings' typed values are
 # the User name and Custom Lists dialogs, which the dialog catalogue lists
 # and `inputs-typing-doc-app.uit` and `inputs-typing-sheet-data.uit` type
 # into, entering from Backstage (the #1027 path).
@@ -187,34 +188,37 @@ test rename sheet-tab-rename: Escape cancels
   assert sheet is Sheet1
   assert dirty is false
 
-# ---- File > Info's properties: none exist yet (#1364).
+# ---- Backstage's inputs the harness cannot reach: each says why.
 
-test backstage info-title: focus by click
+test backstage save-as-name: says it is the OS's file dialog
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call-error pointer-click {"input":"save-as-name"} => Save As's file name is the OS's file dialog, which a harness instance never opens
+  call-error field-read {"input":"save-as-name"} => Save As's file name is the OS's file dialog, which a harness instance never opens
+
+test backstage info-title: says File > Info has no Title yet
   open copy:../fixtures/basic.docx
   call backstage {"action":"open"}
   call backstage-page {"page":"info"}
   call backstage-layout {}
   assert reply.page is info
-  call pointer-click {"input":"info-title"}
-  call field-read {"input":"info-title"}
-  assert reply.focused is true
+  call-error pointer-click {"input":"info-title"} => File > Info has no Title property yet, see #1364
+  call-error field-read {"input":"info-title"} => File > Info has no Title property yet, see #1364
 
-test backstage info-tags: focus by click
+test backstage info-tags: says File > Info has no Tags yet
   open copy:../fixtures/basic.docx
   call backstage {"action":"open"}
   call backstage-page {"page":"info"}
   call backstage-layout {}
   assert reply.page is info
-  call pointer-click {"input":"info-tags"}
-  call field-read {"input":"info-tags"}
-  assert reply.focused is true
+  call-error pointer-click {"input":"info-tags"} => File > Info has no Tags property yet, see #1364
+  call-error field-read {"input":"info-tags"} => File > Info has no Tags property yet, see #1364
 
-test backstage info-author: focus by click
+test backstage info-author: says File > Info has no Author yet
   open copy:../fixtures/basic.docx
   call backstage {"action":"open"}
   call backstage-page {"page":"info"}
   call backstage-layout {}
   assert reply.page is info
-  call pointer-click {"input":"info-author"}
-  call field-read {"input":"info-author"}
-  assert reply.focused is true
+  call-error pointer-click {"input":"info-author"} => File > Info has no Author property yet, see #1364
+  call-error field-read {"input":"info-author"} => File > Info has no Author property yet, see #1364
