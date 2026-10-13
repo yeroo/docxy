@@ -535,11 +535,12 @@ fn own_totals(p: &Project, task: Option<&Task>, mine: &[&Assignment]) -> TaskTot
     let (fixed, fixed_remaining) = task.map_or((0.0, 0.0), |t| {
         let amount = value(t.fixed_cost.as_ref());
         let pct = t.percent_complete.unwrap_or(0).min(100);
-        let share = match t.fixed_cost_accrual {
-            Some(AccrueAt::Start) => f64::from(pct == 0),
-            Some(AccrueAt::End) => f64::from(pct < 100),
-            // Invalid and absent use the Prorated default from CST-082.
-            _ => f64::from(100 - pct) / 100.0,
+        // An absent accrual is the plan's DefaultFixedCostAccrual, else the
+        // Prorated default from CST-082; an explicit Invalid is Prorated.
+        let share = match t.fixed_cost_accrual_or(p.default_fixed_cost_accrual()) {
+            AccrueAt::Start => f64::from(pct == 0),
+            AccrueAt::End => f64::from(pct < 100),
+            AccrueAt::Prorated | AccrueAt::Invalid => f64::from(100 - pct) / 100.0,
         };
         // Stored costs are whole hundredths. Avoid writing negative zero.
         (amount, (amount * share).round() + 0.0)
