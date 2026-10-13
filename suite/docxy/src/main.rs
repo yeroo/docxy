@@ -4658,10 +4658,11 @@ struct DocTab {
     /// How this tab may use its file (#610): opened read-only, repaired, or
     /// in Protected View. Only a workbook tab ever sets any of it.
     access: open_mode::Access,
-    /// The hot-exit sidecar the last persist wrote while this tab was
-    /// unsaved; `None` when that persist found it clean or could not write it
-    /// (#613). Don't Save keeps a copy of it as the tab's draft. A `RefCell`
-    /// because `persist` takes `&self`.
+    /// The sidecar holding this tab's unsaved work as of the last persist
+    /// (#613): the one it wrote or, when it could write none, the one before
+    /// it (or the one the tab was restored from, #1224); `None` when that
+    /// persist found it clean. Don't Save keeps a copy of it as the tab's
+    /// draft. A `RefCell` because `persist` takes `&self`.
     last_hot: std::cell::RefCell<Option<PathBuf>>,
     /// This document's mail merge (#628): its type, recipient list and
     /// preview state.
@@ -4839,6 +4840,11 @@ struct Docxy {
     /// AutoRecover tick last found nothing to write: the timer's clock. A
     /// `Cell` because `persist` takes `&self`.
     last_persist: std::cell::Cell<std::time::Instant>,
+    /// What this window's persist wrote before the window was registered
+    /// (the startup write, `win_id` 0): registration hands it to the
+    /// registry, so the next window's write appends it rather than an empty
+    /// snapshot and its prune keeps these sidecars (#1224).
+    unregistered_own: std::cell::RefCell<Vec<PersistTab>>,
     applied: Option<ThemeMode>,
     /// The OS appearance Auto follows: seeded when the window opens, updated
     /// by gpui's appearance observer (#1075).
@@ -10676,14 +10682,15 @@ fn write_session(
 
 /// [`write_session`], keeping what `mode` says of each tab.
 ///
-/// The session is the commit point (#1224): each sidecar goes to a fresh
-/// name no session references ([`write_sidecars`]), `session.json` then
-/// replaces the old one, and only once it has are the sidecars it no longer
-/// names deleted ([`prune_sidecars`]). Killed anywhere in between, the
-/// session on disk pairs every tab with its own content: the old one until
-/// the replace, the new one after. Both go through `write_atomic`, so a kill
-/// mid-write leaves the previous file whole rather than a truncated
-/// `session.json` that restores no tabs.
+/// The session is the commit point (#1224): each sidecar written goes to a
+/// fresh name no session references ([`write_sidecars`]; an unsaved tab
+/// with no new copy keeps naming its last one), `session.json` then
+/// replaces the old one, and only once it has are the sidecars neither it
+/// nor the session it replaced names deleted ([`prune_sidecars`]). Killed
+/// anywhere in between, the session on disk pairs every tab with its own
+/// content: the old one until the replace, the new one after. Both go
+/// through `write_atomic`, so a kill mid-write leaves the previous file
+/// whole rather than a truncated `session.json` that restores no tabs.
 fn write_session_with(
     root: &std::path::Path,
     tabs: &[DocTab],
@@ -10698,7 +10705,8 @@ fn write_session_with(
     // two windows never share a sidecar name at any tab count.
     hot_seq: usize,
 ) -> Vec<PersistTab> {
-    let own = write_sidecars(root, tabs, mode, extra, hot_seq);
+    let replaced = session_tabs_on_disk(root);
+    let own = write_sidecars(root, tabs, mode, &replaced, extra, hot_seq);
     let session = Session {
         tabs: own.iter().cloned().chain(extra.iter().cloned()).collect(),
         active,
@@ -10716,29 +10724,36 @@ fn write_session_with(
         user_initials: prefs.user_initials,
     };
     if write_session_json(root, &session) {
-        prune_sidecars(&hot_dir_in(root), &session);
+        prune_sidecars(&hot_dir_in(root), &session, &replaced);
     }
     own
 }
 
+/// The tabs of the session on disk under `root`; none when it is missing
+/// or unreadable.
+fn session_tabs_on_disk(root: &std::path::Path) -> Vec<PersistTab> {
+    std::fs::read(session_path_in(root))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Session>(&bytes).ok())
+        .map(|s| s.tabs)
+        .unwrap_or_default()
+}
+
 /// The first phase of [`write_session_with`]: each kept tab's sidecar,
-/// written under a name neither the session on disk nor `extra` (another
-/// window) references, so no sidecar a restore could still read is ever
-/// overwritten. What this window's tabs persist as, in tab order.
+/// written under a name neither the session on disk (`on_disk`) nor
+/// `extra` (another window) references, so no sidecar a restore could
+/// still read is ever overwritten. What this window's tabs persist as, in
+/// tab order.
 fn write_sidecars(
     root: &std::path::Path,
     tabs: &[DocTab],
     mode: SessionWrite,
+    on_disk: &[PersistTab],
     extra: &[PersistTab],
     hot_seq: usize,
 ) -> Vec<PersistTab> {
     let hd = hot_dir_in(root);
     let _ = std::fs::create_dir_all(&hd);
-    let on_disk = std::fs::read(session_path_in(root))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Session>(&bytes).ok())
-        .map(|s| s.tabs)
-        .unwrap_or_default();
     let taken = hot_names(on_disk.iter().chain(extra));
     tabs.iter()
         .enumerate()
@@ -10764,8 +10779,9 @@ fn write_sidecars(
                     .filter(|p| p.exists())
                     .map(|p| p.display().to_string());
             }
-            // Every kept tab is written to a fresh name in this one call, so
-            // the path names this tab's content until the next persist.
+            // A kept tab's sidecar is the fresh one written above, or the
+            // last one carried forward: either way this tab's own content
+            // until the next persist.
             *t.last_hot.borrow_mut() = persisted
                 .hot
                 .as_ref()
@@ -10802,13 +10818,16 @@ fn hot_names<'a>(
 }
 
 /// The last phase of [`write_session_with`], once `session` is on disk:
-/// delete every sidecar in `hd` it does not name (a closed tab's, one a
-/// later write replaced, one a write killed before its session left, a
-/// name from an older build). Only regular files named `tab-…` go; a file
-/// that cannot be deleted now (held open elsewhere) is tried again at the
-/// next write.
-fn prune_sidecars(hd: &std::path::Path, session: &Session) {
-    let keep = hot_names(session.tabs.iter());
+/// delete every sidecar in `hd` that neither it nor the session it
+/// `replaced` names (a closed tab's, one a later write replaced, one a
+/// write killed before its session left, a name from an older build).
+/// Keeping the replaced session's for one more write means a window whose
+/// registry snapshot is stale costs a file kept a write longer, never a
+/// sidecar its next write still needs. Only regular files named `tab-…` go;
+/// a file that cannot be deleted now (held open elsewhere) is tried again
+/// at the next write.
+fn prune_sidecars(hd: &std::path::Path, session: &Session, replaced: &[PersistTab]) {
+    let keep = hot_names(session.tabs.iter().chain(replaced));
     let Ok(entries) = std::fs::read_dir(hd) else {
         return;
     };
@@ -10824,17 +10843,20 @@ fn prune_sidecars(hd: &std::path::Path, session: &Session) {
     }
 }
 
-/// Whether tab `t` restores from its file alone with nothing lost (#1224):
-/// clean, with a file that holds everything the tab does. Not a tab whose
-/// file failed to load, nor a converted or Word 97-2003 one (its sidecar is
-/// what rollback restores, #633, and a fresh import need not match), nor one
-/// bound to a type that keeps less than the tab (Markdown, plain text, RTF,
-/// HTML; a project's MSPDI XML or imported file).
+/// Whether an AutoRecover tick may keep tab `t` as its file alone (#1224):
+/// clean, and bound to a file that is there and of a type that keeps
+/// everything the tab holds. Whether the file is unchanged since is not
+/// checked. Not a tab whose file failed to load, nor a converted or Word
+/// 97-2003 one (its sidecar is what rollback restores, #633, and a fresh
+/// import need not match), nor one bound to a type that keeps less than
+/// the tab (Markdown, plain text, RTF, HTML; a project's MSPDI XML or
+/// imported file).
 fn reopens_from_file(t: &DocTab) -> bool {
     let Some(path) = t.path.as_deref() else {
         return false;
     };
     if t.dirty
+        || !path.exists()
         || t.load_failed
         || t.pending_conversion
         || t.access.converted.is_some()
@@ -10945,8 +10967,8 @@ mod session_union_tests {
     }
 
     /// The same tabs written twice write the same session but for the
-    /// sidecar names: each write takes fresh ones (#1224) and the first
-    /// write's are gone once the second session is on disk.
+    /// sidecar names: each write takes fresh ones (#1224), and the first
+    /// write's go at the write after the one that replaced their session.
     #[test]
     fn a_rewrite_changes_only_the_sidecar_names() {
         let root = fresh_root("single");
@@ -10969,6 +10991,10 @@ mod session_union_tests {
             assert!(!a.contains(h), "a fresh name: {a:?} {b:?}");
             assert!(std::path::Path::new(h).exists());
         }
+        // The session the second write replaced named the first write's
+        // sidecars, so they go at the write after it.
+        assert!(a.iter().all(|h| std::path::Path::new(h).exists()));
+        write_session_with(&root, &tabs, 0, prefs(), SessionWrite::All, &[], 0);
         assert!(
             a.iter().all(|h| !std::path::Path::new(h).exists()),
             "pruned"
@@ -12059,6 +12085,7 @@ impl Docxy {
             recent_files: Vec::new(),
             recent_message: None,
             last_persist: std::cell::Cell::new(std::time::Instant::now()),
+            unregistered_own: Default::default(),
             applied: None,
             os_appearance: gpui::WindowAppearance::Light,
             find_open: false,
@@ -12162,7 +12189,11 @@ impl Docxy {
             &windows::others_persisted(cx, self.win_id),
             windows::seq_of(cx, self.win_id),
         );
-        windows::set_persisted(cx, self.win_id, own);
+        if self.win_id == 0 {
+            *self.unregistered_own.borrow_mut() = own;
+        } else {
+            windows::set_persisted(cx, self.win_id, own);
+        }
         // Any write restarts the AutoRecover clock: the copy is fresh.
         self.last_persist.set(std::time::Instant::now());
     }
@@ -39170,7 +39201,11 @@ fn open_docxy_window(
         Ok(handle) => {
             let any_handle: AnyWindowHandle = handle.into();
             let id = windows::register(cx, &view, any_handle);
-            view.update(cx, |this, _| this.win_id = id);
+            let own = view.update(cx, |this, _| {
+                this.win_id = id;
+                this.unregistered_own.take()
+            });
+            windows::set_persisted(cx, id, own);
             Ok((any_handle, view, id))
         }
         Err(e) => Err((e.to_string(), view)),

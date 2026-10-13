@@ -2024,8 +2024,13 @@ fn a_tick_keeps_a_clean_tab_with_a_file_as_that_file_alone() {
 
     // Every other write still keeps every tab's content.
     write_session(&root.0, &tabs, 0, prefs(), &[], 0);
-    assert!(root.session().tabs.iter().all(|t| t.hot.is_some()));
-    assert_eq!(hot_files(&root).len(), 7);
+    let session = root.session();
+    assert!(session.tabs.iter().all(|t| t.hot.is_some()));
+    let on_disk = hot_files(&root);
+    assert!(
+        root_hot_names(&session).iter().all(|n| on_disk.contains(n)),
+        "{on_disk:?}"
+    );
 }
 
 #[test]
@@ -2043,9 +2048,14 @@ fn a_tick_keeps_the_sidecar_of_a_tab_a_reload_would_not_give_back() {
     text.path = Some(root.0.join("x.txt"));
     let mut rtf = tab_from_path(&doc);
     rtf.path = Some(root.0.join("x.rtf"));
+    for p in ["x.txt", "x.rtf"] {
+        std::fs::write(root.0.join(p), b"exported").unwrap();
+    }
     let mut dirty = tab_from_path(&doc);
     dirty.dirty = true;
-    let tabs = [converted, imported, failed, text, rtf, dirty];
+    let mut gone = tab_from_path(&doc);
+    gone.path = Some(root.0.join("moved-away.docx"));
+    let tabs = [converted, imported, failed, text, rtf, dirty, gone];
     assert!(tabs.iter().all(|t| !reopens_from_file(t)));
     assert!(reopens_from_file(&tab_from_path(&doc)));
 }
@@ -2072,7 +2082,7 @@ fn killed_before_the_session_is_replaced_the_old_one_still_pairs_each_tab() {
         .collect();
 
     tabs.remove(0);
-    let new = write_sidecars(&root.0, &tabs, SessionWrite::All, &[], 0);
+    let new = write_sidecars(&root.0, &tabs, SessionWrite::All, &old.tabs, &[], 0);
 
     let new_hot = new[0].hot.clone().unwrap();
     assert!(
@@ -2115,20 +2125,91 @@ fn a_committed_session_prunes_the_sidecars_it_no_longer_names() {
     extra.hot = Some(other.display().to_string());
 
     tabs.remove(0);
+    write_session(&root.0, &tabs, 0, prefs(), std::slice::from_ref(&extra), 0);
+    // The session just replaced still names Alpha's and Beta's: they stay
+    // one write longer. The legacy name no session names is gone.
+    assert!(!hd.join("tab-0.docx").exists());
+    for t in &old.tabs {
+        assert!(std::path::Path::new(t.hot.as_deref().unwrap()).exists());
+    }
     write_session(&root.0, &tabs, 0, prefs(), &[extra], 0);
     let session = root.session();
     assert_eq!(session.tabs.len(), 2);
     let beta = std::path::Path::new(session.tabs[0].hot.as_deref().unwrap());
-    let mut want = vec![
-        beta.file_name().unwrap().to_string_lossy().into_owned(),
-        "readme.txt".to_string(),
-        "tab-w1-0-7.docx".to_string(),
-    ];
+    let previous = root_hot_names(&old);
+    let mut want: Vec<String> = hot_files(&root)
+        .into_iter()
+        .filter(|n| n.starts_with("tab-0-"))
+        .collect();
+    assert_eq!(want.len(), 2, "Beta's last two copies: {want:?}");
+    assert!(want.iter().all(|n| !previous.contains(n)), "{want:?}");
+    want.extend(["readme.txt".to_string(), "tab-w1-0-7.docx".to_string()]);
     want.sort();
     assert_eq!(hot_files(&root), want);
+    assert!(beta.exists());
     for t in &old.tabs {
         assert!(!std::path::Path::new(t.hot.as_deref().unwrap()).exists());
     }
+}
+
+/// The file names of the sidecars `session` names.
+fn root_hot_names(session: &Session) -> Vec<String> {
+    session
+        .tabs
+        .iter()
+        .filter_map(|t| t.hot.as_deref())
+        .map(|h| {
+            std::path::Path::new(h)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
+/// New Window right after startup (#1224 r2): the new window commits a
+/// session before the first window's registry snapshot holds anything, so
+/// the session it writes names none of the first window's sidecars. The
+/// first window's unsaved placeholder, whose unreadable sidecar is the only
+/// copy of its work, keeps that sidecar through both writes.
+#[test]
+fn a_window_written_before_its_neighbour_is_known_keeps_its_sidecars() {
+    let root = Root::new("stale-snapshot");
+    let hd = hot_dir_in(&root.0);
+    std::fs::create_dir_all(&hd).unwrap();
+    let sidecar = hd.join("tab-0-1.xlsx");
+    std::fs::write(&sidecar, b"not a workbook").unwrap();
+    let mut entry = persist_tab_meta(&tab(Kind::Xlsx));
+    entry.path = None;
+    entry.dirty = true;
+    entry.hot = Some(sidecar.display().to_string());
+    let first = vec![
+        restore_tab(&entry),
+        untitled(
+            "Document1",
+            "work
+",
+        ),
+    ];
+    // The startup write, as window 0.
+    write_session(&root.0, &first, 0, prefs(), &[], 0);
+    // The new window persists first, appending an empty snapshot.
+    let moved = vec![untitled(
+        "Moved", "moved
+",
+    )];
+    let snap = write_session(&root.0, &moved, 0, prefs(), &[], 1);
+    assert!(sidecar.exists(), "named by the session it replaced");
+    // Then the first window, appending the new window's snapshot.
+    write_session(&root.0, &first, 0, prefs(), &snap, 0);
+    let session = root.session();
+    assert_eq!(session.tabs.len(), 3);
+    assert_eq!(
+        session.tabs[0].hot.as_deref(),
+        Some(sidecar.display().to_string().as_str())
+    );
+    assert_eq!(std::fs::read(&sidecar).unwrap(), b"not a workbook");
 }
 
 /// A write that makes no new copy of an unsaved tab (a full disk, a tab
