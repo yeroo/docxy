@@ -34869,6 +34869,10 @@ impl Render for Docxy {
         // Reset every frame: a frame that draws no preview (another tab, a
         // sheet) reports none.
         *self.drawn_preview.borrow_mut() = None;
+        // A live preview (#764) is one-shot: once a frame finds it stale or
+        // its control gone, it is dropped, never drawn again when the
+        // control comes back with no tile or cell hovered.
+        self.drop_stale_preview(window);
         let content: AnyElement = match self.tabs.get(self.active) {
             Some(tab) => match &tab.surface {
                 Surface::Doc(editor) => {

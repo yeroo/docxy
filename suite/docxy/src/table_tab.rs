@@ -1494,11 +1494,24 @@ impl Docxy {
         }
     }
 
+    /// Drop the live preview once [`Self::shown_preview`] rejects it. The
+    /// render calls it each frame, so a preview whose control was hidden
+    /// by a path that fires no leave (Esc closing the flyout, Ctrl+F1, a
+    /// KeyTips tab switch) is gone, not drawn again when the control comes
+    /// back with nothing hovered.
+    pub(crate) fn drop_stale_preview(&mut self, window: &Window) {
+        if self.doc_preview.is_some() && self.shown_preview(window).is_none() {
+            self.doc_preview = None;
+        }
+    }
+
     /// The live preview to draw in place of the active document this
     /// frame, if any: still current ([`DocPreview::current`]), still
     /// allowed, and its control still on screen (the grid's menu open on
-    /// that cell; the Table Styles gallery showing). Correctness rests on
-    /// this check, not on every path that hides the control clearing it.
+    /// that cell; the Table Styles gallery showing). A preview it rejects is
+    /// dropped by the next frame ([`Self::drop_stale_preview`]), so
+    /// correctness rests on this check, not on every path that hides the
+    /// control clearing it.
     pub(crate) fn shown_preview(&self, window: &Window) -> Option<&DocPreview> {
         let p = self.doc_preview.as_ref()?;
         let tab = self.tabs.get(self.active)?;
@@ -1545,7 +1558,8 @@ impl Docxy {
         let Some(i) = now.titles.iter().position(|t| *t == STYLES_GROUP) else {
             return false;
         };
-        if now.fit.in_flyout(i) || now.fit.in_overflow(i) {
+        // Collapsed or in the chevron: reached through its flyout only.
+        if now.fit.in_flyout(i) {
             self.ribbon_flyout.is_some_and(|f| {
                 f.target == FlyoutTarget::Group(STYLES_GROUP) && self.flyout_still_fits(f, window)
             })

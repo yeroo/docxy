@@ -320,6 +320,17 @@ test hovering a table style previews it on the caret's table (764)
   assert table.cell is 1
   shot window
   assert preview is null
+  # Another ribbon tab hides the gallery with no leave; back on Table
+  # Design, nothing is hovered and nothing is previewed.
+  call gallery-hover {"gallery":"tablestyles","item":"Grid Table 4 Accent 1"}
+  shot window
+  assert preview.kind is style
+  call ribbon-layout {"tab":"Home"}
+  shot window
+  assert preview is null
+  call ribbon-layout {"tab":"Table Design"}
+  shot window
+  assert preview is null
   # A click applies the hovered style; the drawn table is then the real one.
   call gallery-hover {"gallery":"tablestyles","item":"Grid Table 4 Accent 1"}
   call ribbon-click {"tab":"Table Design","command":"tablestyles:Grid Table 4 Accent 1"}
@@ -361,6 +372,18 @@ test the table styles gallery previews from its narrow-window flyout (764 1020)
   assert preview.kind is style
   assert preview.style is GridTable4-Accent1
   call ribbon-flyout {"action":"close"}
+  shot window
+  assert preview is null
+  # Escape closes the flyout with no leave from the tile: the preview is
+  # gone for good, not drawn again when the flyout reopens.
+  call ribbon-flyout {"action":"open","group":"Table Styles"}
+  call gallery-hover {"gallery":"tablestyles","item":"Grid Table 4 Accent 1"}
+  shot window
+  assert preview.kind is style
+  key escape
+  shot window
+  assert preview is null
+  call ribbon-flyout {"action":"open","group":"Table Styles"}
   shot window
   assert preview is null
 
