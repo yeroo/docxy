@@ -2827,30 +2827,41 @@ fn parse_row(p: &mut XmlParser, rels: &Relationships) -> Row {
         element_attrs: element_attrs(p),
         ..Row::default()
     };
+    let mut pending = Vec::new();
     parse_cells_into(
         p,
         rels,
         &mut row.cells,
         &mut row.raw_props,
         &mut row.property_change,
+        &mut pending,
     );
+    row.raw_end = pending;
     row
 }
 
 /// Collect the cells of a row (or a `<w:sdtContent>` within it), unwrapping
 /// cell-level content controls (`<w:sdt>` wrapping a `<w:tc>`). Row-level
-/// properties (`w:trPr`/`w:tblPrEx`) are captured verbatim into `raw`.
+/// properties (`w:trPr`/`w:tblPrEx`) are captured verbatim into `raw`. Any
+/// other row-level child (a comment range end between cells, a bookmark, …)
+/// is captured verbatim into `pending`, which the next cell takes as its
+/// `raw_before` (#1215). `w:customXml` is still skipped: it can wrap cells.
 fn parse_cells_into(
     p: &mut XmlParser,
     rels: &Relationships,
     cells: &mut Vec<Cell>,
     raw: &mut Vec<String>,
     property_change: &mut Option<PropertyChange>,
+    pending: &mut Vec<String>,
 ) {
     loop {
         match p.next() {
             Event::Start => match p.name() {
-                "w:tc" => cells.push(parse_cell(p, rels)),
+                "w:tc" => {
+                    let mut cell = parse_cell(p, rels);
+                    cell.raw_before = std::mem::take(pending);
+                    cells.push(cell);
+                }
                 "w:trPr" => {
                     let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
                     p.skip_element();
@@ -2861,8 +2872,9 @@ fn parse_cells_into(
                     *property_change = change;
                 }
                 "w:tblPrEx" => capture_element(p, raw),
-                "w:sdt" => parse_sdt_cells(p, rels, cells, raw, property_change),
-                _ => p.skip_element(),
+                "w:sdt" => parse_sdt_cells(p, rels, cells, raw, property_change, pending),
+                "w:customXml" => p.skip_element(),
+                _ => capture_element(p, pending),
             },
             Event::End | Event::Eof => break,
             Event::Text => {}
@@ -2883,6 +2895,7 @@ fn parse_sdt_cells(
     cells: &mut Vec<Cell>,
     raw: &mut Vec<String>,
     property_change: &mut Option<PropertyChange>,
+    pending: &mut Vec<String>,
 ) {
     let (sdt_start, bindings) = (p.start_pos(), rebuilt_bindings(p));
     let first = cells.len();
@@ -2894,7 +2907,7 @@ fn parse_sdt_cells(
                 open = Some(declare_rebuilt(p.raw_slice(sdt_start, p.pos()), &bindings));
                 // A self-closing `<w:sdtContent/>` ends at once, holding no cell.
                 let content = p.pos();
-                parse_cells_into(p, rels, cells, raw, property_change);
+                parse_cells_into(p, rels, cells, raw, property_change, pending);
                 // The suffix starts at this content's own end tag.
                 let tail = p.raw_slice(content, p.pos());
                 close = tail.rfind("</").map(|at| content + at);

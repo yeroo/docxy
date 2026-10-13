@@ -369,6 +369,12 @@ fn strip_marker_xml(raw: &str) -> String {
 /// their content on save). A container holding one keeps all but the
 /// marker; nothing that holds text is dropped.
 fn strip_ids(blocks: &mut Vec<Block>) {
+    /// Strip the markers from a raw XML entry; whether anything is left to
+    /// keep (an emptied entry is dropped).
+    fn strip_raw(raw: &mut String) -> bool {
+        *raw = strip_marker_xml(raw);
+        !raw.trim().is_empty()
+    }
     /// Whether anything was dropped or changed.
     fn inlines(items: &mut Vec<Inline>) -> bool {
         let mut changed = false;
@@ -413,10 +419,7 @@ fn strip_ids(blocks: &mut Vec<Block>) {
         changed
     }
     blocks.retain_mut(|b| match b {
-        Block::Raw(raw) => {
-            *raw = strip_marker_xml(raw);
-            !raw.trim().is_empty()
-        }
+        Block::Raw(raw) => strip_raw(raw),
         _ => true,
     });
     for b in blocks {
@@ -427,16 +430,16 @@ fn strip_ids(blocks: &mut Vec<Block>) {
             Block::Table(t) => {
                 // Bookmarks and comment ranges between rows.
                 t.row_boundaries.retain_mut(|b| match &mut b.kind {
-                    crate::model::TableRowBoundaryKind::Raw(raw) => {
-                        *raw = strip_marker_xml(raw);
-                        !raw.trim().is_empty()
-                    }
+                    crate::model::TableRowBoundaryKind::Raw(raw) => strip_raw(raw),
                     _ => true,
                 });
+                // And between cells (#1215).
                 for row in &mut t.rows {
                     for cell in &mut row.cells {
+                        cell.raw_before.retain_mut(strip_raw);
                         strip_ids(&mut cell.blocks);
                     }
+                    row.raw_end.retain_mut(strip_raw);
                 }
             }
             Block::SectionProperties(_) | Block::Raw(_) => {}
@@ -799,6 +802,46 @@ mod tests {
             1,
             "{xml}"
         );
+        assert!(xml.contains("Amy"), "{xml}");
+    }
+
+    /// #1215: a comment range ending between two cells of a row is kept
+    /// in the first copy only, and an emptied entry goes.
+    #[test]
+    fn row_level_markers_only_in_the_first_copy() {
+        let r = people();
+        let xml = format!(
+            "<w:document xmlns:w=\"{W}\"><w:body><w:tbl><w:tblGrid><w:gridCol w:w=\"100\"/><w:gridCol w:w=\"100\"/></w:tblGrid>\
+             <w:tr><w:bookmarkStart w:id=\"41\" w:name=\"cell\"/>\
+             <w:tc><w:p><w:fldSimple w:instr=\" MERGEFIELD First \"><w:r><w:t>f</w:t></w:r></w:fldSimple></w:p></w:tc>\
+             <w:commentRangeEnd w:id=\"42\"/><w:tc><w:p/></w:tc><w:bookmarkEnd w:id=\"41\"/></w:tr>\
+             </w:tbl><w:p/></w:body></w:document>"
+        );
+        let doc = crate::load::parse_document_xml(&xml, &Default::default());
+        let out = merge_package(&new_package(doc), &r, &opts(&r, MainDocType::Letters)).unwrap();
+        let tables: Vec<&crate::model::Table> = out
+            .document
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Table(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert!(tables.len() > 1, "one table per record");
+        for t in &tables[1..] {
+            let row = &t.rows[0];
+            assert!(row.raw_end.is_empty(), "{row:?}");
+            assert!(row.cells.iter().all(|c| c.raw_before.is_empty()), "{row:?}");
+        }
+        let xml = crate::serialize::document_to_xml(&out.document);
+        for marker in [
+            "<w:bookmarkStart w:id=\"41\"",
+            "<w:bookmarkEnd w:id=\"41\"",
+            "<w:commentRangeEnd w:id=\"42\"",
+        ] {
+            assert_eq!(xml.matches(marker).count(), 1, "{marker}: {xml}");
+        }
         assert!(xml.contains("Amy"), "{xml}");
     }
 
