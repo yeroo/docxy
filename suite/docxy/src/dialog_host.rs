@@ -76,7 +76,7 @@ fn apply_dialog(
         // Handled in `Docxy::paste_dialog_click`, before this.
         DialogOwner::PasteSpecial { .. } => Err("Paste Special applies through Paste".into()),
         // Handled in `Docxy::doc_paste_dialog_click`, before this.
-        DialogOwner::DocPasteSpecial { .. } => Err("Paste Special applies through Paste".into()),
+        DialogOwner::DocPasteSpecial => Err("Paste Special applies through Paste".into()),
         // Handled in `Docxy::drop_dialog_click`, before this.
         DialogOwner::DropReplace => Err("the drop applies through the grid".into()),
         // Handled in `Docxy::fill_dialog_click`, before this.
@@ -193,7 +193,7 @@ pub(crate) fn presses_through_app(owner: &DialogOwner) -> bool {
                 | DialogOwner::JustifyOverflow
                 | DialogOwner::CustomLists
                 | DialogOwner::PasteSpecial { .. }
-                | DialogOwner::DocPasteSpecial { .. }
+                | DialogOwner::DocPasteSpecial
                 | DialogOwner::DropReplace
                 | DialogOwner::GoTo
                 | DialogOwner::GoToSpecial

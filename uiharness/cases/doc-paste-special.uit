@@ -11,6 +11,11 @@ test paste special with nothing on the clipboard opens nothing
   assert dialog is none
   assert status is There is nothing to paste
   assert text is hello
+  # Keep Text Only says why it pastes nothing (#753 r1).
+  call menu-open {"target":"document"}
+  call menu-click {"label":"Keep Text Only"}
+  assert status is There is no text to paste
+  assert text is hello
 
 test the paste button's menu holds the document's paste choices
   open copy:../fixtures/basic.docx

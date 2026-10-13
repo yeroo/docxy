@@ -14,6 +14,9 @@ use gpui::{Context, Window};
 pub(crate) const FORMATTED: &str = "Formatted Text (RTF)";
 pub(crate) const UNFORMATTED: &str = "Unformatted Text";
 
+/// Keep Text Only's status when the clipboard holds no text.
+const NO_TEXT: &str = "There is no text to paste";
+
 /// Whether the clipboard holds a formatted source: the document's own copy
 /// while it is still what the clipboard holds, or an RTF the importer reads.
 fn rich_source(ours: Option<&DocClip>, now: &ClipRead, rtf: Option<&[u8]>) -> bool {
@@ -34,24 +37,28 @@ fn text_only_text(ours: Option<&DocClip>, now: &ClipRead, rtf: Option<&[u8]>) ->
 }
 
 /// The "As" list: only the formats the clipboard holds, as Word's is.
-fn as_items(rich: bool) -> Vec<String> {
+/// `rich` when a formatted source is there, `text` when there is text (an
+/// image-only copy of ours has none). Empty when there is nothing to paste.
+fn as_items(rich: bool, text: bool) -> Vec<String> {
     let mut items = Vec::new();
     if rich {
         items.push(FORMATTED.to_string());
     }
-    items.push(UNFORMATTED.to_string());
+    if text {
+        items.push(UNFORMATTED.to_string());
+    }
     items
 }
 
-/// Paste Special… in a document: the "As" radio, OK and Cancel. `rich`
-/// when a formatted source is on the clipboard, which is then the choice.
-pub(crate) fn doc_paste_special_dialog(rich: bool) -> Dialog {
+/// Paste Special… in a document: the "As" radio over `items` (from
+/// [`as_items`], the first chosen), OK and Cancel.
+pub(crate) fn doc_paste_special_dialog(items: Vec<String>) -> Dialog {
     let mut d = Dialog::message(
         catalog::DOC_PASTE_SPECIAL,
         "Paste Special",
         String::new(),
         &[("OK", ButtonRole::Accept), ("Cancel", ButtonRole::Cancel)],
-        DialogOwner::DocPasteSpecial { rich },
+        DialogOwner::DocPasteSpecial,
     );
     d.text = None;
     d.buttons = d
@@ -63,7 +70,7 @@ pub(crate) fn doc_paste_special_dialog(rich: bool) -> Dialog {
         })
         .collect();
     let mut how = Control::new("as", "As", ControlKind::Radio, Value::Choice(Some(0)));
-    how.items = as_items(rich);
+    how.items = items;
     d.controls = vec![how];
     d.mark_opened();
     d
@@ -98,7 +105,11 @@ impl Docxy {
         let rtf = self.clipboard_read_rtf();
         match text_only_text(self.clip.as_ref(), &now, rtf.as_deref()) {
             Some(text) => self.with_editor(window, cx, |e| e.paste_text_only(&text)),
-            None => self.refocus(window, cx),
+            // Nothing, or only an image: said, not silently nothing (#753 r1).
+            None => {
+                self.set_status(NO_TEXT);
+                self.refocus(window, cx);
+            }
         }
     }
 
@@ -111,13 +122,16 @@ impl Docxy {
         let now = self.clipboard_read(cx);
         let rtf = self.clipboard_read_rtf();
         let ours = self.clip.as_ref();
-        if doc_paste_clip(ours, &now, rtf.as_deref()).is_none() {
+        let items = as_items(
+            rich_source(ours, &now, rtf.as_deref()),
+            text_only_text(ours, &now, rtf.as_deref()).is_some(),
+        );
+        if items.is_empty() {
             self.set_status("There is nothing to paste");
             return cx.notify();
         }
-        let rich = rich_source(ours, &now, rtf.as_deref());
         if let Some(tab) = self.tabs.get_mut(self.active) {
-            tab.dialogs.push(doc_paste_special_dialog(rich));
+            tab.dialogs.push(doc_paste_special_dialog(items));
         }
         cx.notify();
     }
@@ -131,7 +145,7 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) -> Option<Result<(), String>> {
         let top = self.tabs.get(self.active)?.dialogs.top()?;
-        if !matches!(top.owner, DialogOwner::DocPasteSpecial { .. }) || !presses_ok(top, button) {
+        if !matches!(top.owner, DialogOwner::DocPasteSpecial) || !presses_ok(top, button) {
             return None;
         }
         let text_only = takes_text_only(top);
@@ -207,10 +221,10 @@ mod tests {
     /// source Formatted Text is not there to choose.
     #[test]
     fn the_as_list_offers_only_what_the_clipboard_holds_753() {
-        let rich = doc_paste_special_dialog(true);
+        let rich = doc_paste_special_dialog(as_items(true, true));
         assert_eq!(rich.controls[0].items, [FORMATTED, UNFORMATTED]);
         assert!(!takes_text_only(&rich), "Formatted Text is the choice");
-        let mut plain = doc_paste_special_dialog(false);
+        let mut plain = doc_paste_special_dialog(as_items(false, true));
         assert_eq!(plain.controls[0].items, [UNFORMATTED]);
         assert!(takes_text_only(&plain));
         let err = plain
@@ -222,5 +236,25 @@ mod tests {
         assert!(err.contains("has no item"), "{err}");
         assert_eq!(plain.id, catalog::DOC_PASTE_SPECIAL);
         assert_eq!(plain.title, "Paste Special");
+        assert!(as_items(false, false).is_empty(), "nothing to paste");
+    }
+
+    /// Our copy of only an image: its text is empty and the clipboard holds
+    /// no text, so the clip is still ours and pastes, but there is no text
+    /// for Unformatted Text or Keep Text Only (#753 r1).
+    #[test]
+    fn an_image_only_copy_offers_only_formatted_text_753() {
+        let image_only = DocClip {
+            clip: Clip::default(),
+            text: String::new(),
+        };
+        let now = ClipRead::NotText;
+        assert!(rich_source(Some(&image_only), &now, None));
+        assert_eq!(text_only_text(Some(&image_only), &now, None), None);
+        let items = as_items(
+            rich_source(Some(&image_only), &now, None),
+            text_only_text(Some(&image_only), &now, None).is_some(),
+        );
+        assert_eq!(items, [FORMATTED]);
     }
 }
