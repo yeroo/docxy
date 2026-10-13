@@ -172,17 +172,21 @@ struct Snapshot {
     /// The formatting toggled at the caret, so undoing or redoing a Bold
     /// at an insertion point switches it back off or on (#854).
     pending: Option<PendingFormat>,
+    /// The place after an inserted object, so whatever state undo or redo
+    /// brings back has its own (#768).
+    after_object: Option<AfterObject>,
 }
 
 /// The content index text typed at `caret` goes in at, just after the
-/// inlines [`Editor::insert_object`] put there, while the last step is the
-/// one that put them or a formatting toggle at the caret after it
-/// (`serials`): undoing the typing, or undoing or redoing a toggle, brings
-/// it back with the document as it was then.
+/// inlines [`Editor::insert_object`] put there, while `serial` is the last
+/// step: the insert's, or a formatting toggle's at the caret after it. It
+/// is kept and restored exactly as the pending format is (every undo step
+/// holds the one before it), so the state undo or redo brings back has the
+/// place it had.
 #[derive(Clone, Debug)]
 struct AfterObject {
     caret: Caret,
-    serials: Vec<Option<u64>>,
+    serial: Option<u64>,
     index: usize,
 }
 
@@ -543,6 +547,7 @@ impl Editor {
             name: StepName::Unnamed(EditKind::Structural),
             serial: 0,
             pending: self.pending.clone(),
+            after_object: self.after_object.clone(),
         }
     }
 
@@ -730,6 +735,7 @@ impl Editor {
             self.anchor = prev.anchor;
             self.review_target = prev.review_target;
             self.pending = prev.pending;
+            self.after_object = prev.after_object;
             self.last = EditKind::None;
             self.refresh_merge_preview();
             true
@@ -746,6 +752,7 @@ impl Editor {
             self.anchor = next.anchor;
             self.review_target = next.review_target;
             self.pending = next.pending;
+            self.after_object = next.after_object;
             self.last = EditKind::None;
             self.refresh_merge_preview();
             true
@@ -2027,7 +2034,8 @@ impl Editor {
     /// join the run before an object that takes no caret offset, or the
     /// content of a control that ends at the caret. That holds as
     /// [`Editor::pending_format`] does: until the caret moves, a selection
-    /// is made, or another step is pushed.
+    /// is made, or a step other than a formatting toggle at the caret is
+    /// pushed; undo and redo bring back the place each state had.
     pub fn insert_object(&mut self, inlines: Vec<Inline>) {
         self.paste(&Clip {
             paras: vec![inlines.clone()],
@@ -2052,7 +2060,7 @@ impl Editor {
         }
         self.after_object = index.map(|index| AfterObject {
             caret: self.caret.clone(),
-            serials: vec![self.undo_serial()],
+            serial: self.undo_serial(),
             index,
         });
     }
@@ -2063,9 +2071,7 @@ impl Editor {
         self.after_object
             .as_ref()
             .filter(|a| {
-                a.caret == self.caret
-                    && a.serials.contains(&self.undo_serial())
-                    && !self.has_selection()
+                a.caret == self.caret && a.serial == self.undo_serial() && !self.has_selection()
             })
             .map(|a| a.index)
     }
@@ -2491,11 +2497,12 @@ impl Editor {
         let after_object = self.typing_after_object().is_some();
         // The step holds the state before the toggle, pending format and all.
         self.checkpoint(EditKind::Structural);
-        // Text typed after an object it toggles at still goes after it (#768).
+        // Text typed after an object it toggles at still goes after it
+        // (#768); the toggle's step holds the place as it was, for its undo.
         if after_object {
             let serial = self.undo_serial();
             if let Some(a) = self.after_object.as_mut() {
-                a.serials.push(serial);
+                a.serial = serial;
             }
         }
         let pending = PendingFormat {
@@ -5166,6 +5173,59 @@ mod tests {
         ed.caret.offset = 0;
         ed.insert_str("My ");
         assert_eq!(texts(&ed), ["My Company", "[PTAB]"]);
+        // FIX r5 M1: a second insert does not take the first one's place
+        // away for good: undoing it brings the first back.
+        let start = || {
+            let mut ed = selected(vec![run("Company", RunProps::default())], 7, 7);
+            ed.anchor = None;
+            ed.insert_object(vec![Inline::Raw(PTAB.into())]);
+            ed
+        };
+        let mut ed = start();
+        ed.insert_object(vec![Inline::Raw(PICTURE.into())]);
+        assert!(ed.undo());
+        ed.insert_char('x');
+        assert_eq!(texts(&ed), ["Company", "[PTAB]", "x"]);
+        // Ptab, typing, a control, undo twice: after the tab again; then
+        // each redo brings back its own state's place.
+        let control = || {
+            crate::sdt::core_property_control(
+                crate::sdt::CoreProp::Title,
+                "R",
+                1,
+                &RunProps::default(),
+            )
+        };
+        let mut ed = start();
+        ed.insert_str("ab");
+        ed.insert_object(control());
+        assert!(ed.undo());
+        assert!(ed.undo());
+        assert_eq!(texts(&ed), ["Company", "[PTAB]"]);
+        ed.insert_char('x');
+        assert_eq!(texts(&ed), ["Company", "[PTAB]", "x"]);
+        let mut ed = start();
+        ed.insert_str("ab");
+        ed.insert_object(control());
+        assert!(ed.undo());
+        assert!(ed.undo());
+        assert!(ed.redo());
+        assert!(ed.redo());
+        ed.insert_char('x');
+        assert_eq!(
+            texts(&ed),
+            ["Company", "[PTAB]", "ab", "[SDT", "R", "]", "x"]
+        );
+        // A redo of the typing alone: typing joins it, past the tab.
+        let mut ed = start();
+        ed.insert_str("ab");
+        ed.insert_object(control());
+        assert!(ed.undo());
+        assert!(ed.undo());
+        assert!(ed.redo());
+        ed.insert_char('c');
+        assert_eq!(texts(&ed), ["Company", "[PTAB]", "abc"]);
+
         // FIX r4 M1: Bold toggled at the caret keeps it; the text is bold.
         let mut ed = selected(vec![run("Company", RunProps::default())], 7, 7);
         ed.anchor = None;
