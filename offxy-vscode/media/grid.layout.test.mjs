@@ -347,4 +347,23 @@ assert.equal(editMsgCount(), editsBeforeCut + 1, 'Cut over a non-blank cell must
 const afterCut = ctlCellGet('B2');
 assert.equal(afterCut.text, '', 'Cut must have cleared B2');
 
-console.log('grid layout OK: headers/cells aligned; full-viewport gridlines; click round-trip exact; scroll clears the header band; toolbar wired without disturbing selection; edits counter (not a verb regex) gates {type:"edit"}');
+// ---- 6. circular references show in the tab strip (#759) ------------------
+// Type =A1 into A1 through the formula bar: the tab strip names the circle
+// until an edit breaks it.
+const circularNote = () =>
+  byId.get('tabs').children.find((c) => (c.className || '').includes('circular'));
+function typeInFormulaBar(text) {
+  const fsrc = byId.get('fsrc');
+  fsrc.value = text;
+  fsrc.fire('keydown', { key: 'Enter', preventDefault() {}, stopPropagation() {} });
+}
+wrap.fire('keydown', { key: 'Home', ctrlKey: true, metaKey: false, shiftKey: false, preventDefault() {} });
+assert.equal(byId.get('cellref').textContent, 'A1', 'back on A1 for the circle check');
+assert.equal(circularNote(), undefined, 'no circle, no note');
+typeInFormulaBar('=A1');
+assert.equal(circularNote()?.textContent, 'Circular References: A1',
+  'a formula that reads its own cell names it in the tab strip');
+typeInFormulaBar('name');
+assert.equal(circularNote(), undefined, 'breaking the circle clears the note');
+
+console.log('grid layout OK: headers/cells aligned; full-viewport gridlines; click round-trip exact; scroll clears the header band; toolbar wired without disturbing selection; edits counter (not a verb regex) gates {type:"edit"}; circular references noted in the tab strip');
