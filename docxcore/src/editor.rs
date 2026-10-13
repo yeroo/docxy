@@ -437,6 +437,28 @@ impl Editor {
         }
     }
 
+    /// A copy to draw, not to edit (#764): the document, caret, selection
+    /// and display state, with no undo or redo history. A host runs an edit
+    /// on it to show the result (Word's live preview) and drops it; the
+    /// original is never touched.
+    pub fn preview_copy(&self) -> Editor {
+        Editor {
+            doc: self.doc.clone(),
+            caret: self.caret.clone(),
+            anchor: self.anchor.clone(),
+            undo: VecDeque::new(),
+            redo: Vec::new(),
+            history_budget: self.history_budget,
+            grouping: None,
+            last: EditKind::None,
+            review_target: self.review_target,
+            merge_preview: self.merge_preview.clone(),
+            merge_previewed: self.merge_previewed,
+            track: self.track.clone(),
+            pending: self.pending.clone(),
+        }
+    }
+
     /// Show a mail-merge record in the merge fields (Preview Results), or
     /// their placeholders again with `None`. Display only: no undo step, and
     /// `raw` (what is saved) never changes.
@@ -4803,6 +4825,31 @@ mod tests {
         ed.anchor = Some(Caret::at(vec![0], start));
         ed.caret = Caret::at(vec![0], end);
         ed
+    }
+
+    /// A preview copy shows the document as it is and edits apart from it
+    /// (#764): the original keeps its document and its history.
+    #[test]
+    fn preview_copy_edits_apart_from_the_original_764() {
+        let mut ed = selected(vec![run("Hello", RunProps::default())], 1, 3);
+        ed.set_track_changes(Some(TrackAuthor {
+            author: "Ann".into(),
+            clock: || "2026-10-13T00:00:00Z".into(),
+        }));
+        ed.insert_str("!");
+        let before = ed.doc.clone();
+        let mut copy = ed.preview_copy();
+        assert_eq!(copy.doc, ed.doc);
+        assert_eq!(copy.caret, ed.caret);
+        assert_eq!(copy.anchor, ed.anchor);
+        assert_eq!(copy.track_author(), Some("Ann"));
+        assert!(!copy.undo(), "a preview copy has no history");
+        copy.insert_table(2, 3, crate::table::AutoFit::Default)
+            .unwrap();
+        assert_ne!(copy.doc, ed.doc);
+        assert_eq!(ed.doc, before);
+        assert!(ed.undo(), "the original keeps its own step");
+        assert!(!ed.undo());
     }
 
     /// Formatting a selection formats the tabs in it too (a tab is a run in
