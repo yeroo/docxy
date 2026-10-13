@@ -1160,6 +1160,12 @@ impl Session {
         // `edits` field's doc comment on `Session`.
         out.push_str(",\"edits\":");
         out.push_str(&self.edits.to_string());
+        // The status bar's persistent note while a circle exists (none with
+        // iterative calculation on): not the one-shot `err`.
+        if let Some(r) = gridcore::circular::first_circular_ref(&self.engine, wb, self.active) {
+            out.push_str(",\"circular\":");
+            json::push_str(&mut out, &r);
+        }
         if let Some(e) = self.err.take() {
             out.push_str(",\"err\":");
             json::push_str(&mut out, &e);
@@ -3081,6 +3087,30 @@ mod tests {
         assert!(v.contains("3.75"), "formula not recalculated: {v}");
         assert!(v.contains("\"dirty\":false"), "{v}");
         assert!(v.contains("\"cur\":{\"ref\":\"A1\""), "{v}");
+    }
+
+    #[test]
+    fn view_json_reports_circular_refs() {
+        // #759: the first circular ref, while circles are shown.
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        assert!(!s.view_json(None).contains("\"circular\""));
+        s.dispatch("set	0	4	=E1+1");
+        let v = s.view_json(None);
+        assert!(v.contains("\"circular\":\"E1\""), "{v}");
+        assert!(!v.contains("\"err\""), "{v}");
+        s.dispatch("set	0	4	1");
+        assert!(!s.view_json(None).contains("\"circular\""));
+
+        // A workbook opened with a circle names it; with iteration on, not.
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(1, 2, Cell::formula("C2*2"));
+        let mut s = Session::open(&save_xlsx(&pkg)).expect("open");
+        let v = s.view_json(None);
+        assert!(v.contains("\"circular\":\"C2\""), "{v}");
+        // The model's `iterate` is read from `<calcPr>` on open (saving does
+        // not write one the model set), so set it on the open session.
+        s.pkg.workbook.iterate = Some((100, 0.001));
+        assert!(!s.view_json(None).contains("\"circular\""));
     }
 
     #[test]
