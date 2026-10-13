@@ -10675,6 +10675,18 @@ enum SessionWrite<'a> {
     Tick,
 }
 
+impl SessionWrite<'_> {
+    /// The mode's name in the harness write log (#1226): fixed words, never
+    /// the indices `Forget` carries.
+    fn log_name(&self) -> &'static str {
+        match self {
+            SessionWrite::All => "All",
+            SessionWrite::Forget(_) => "Forget",
+            SessionWrite::Tick => "Tick",
+        }
+    }
+}
+
 /// Write every tab's hot sidecar, then `session.json`, under `root`.
 #[cfg(test)]
 fn write_session(
@@ -10986,6 +10998,13 @@ mod session_union_tests {
         DocTab, EditOptions, Kind, Prefs, Session, SessionWrite, ThemePref, sample_doc,
         session_path_in, write_session_with,
     };
+
+    #[test]
+    fn the_harness_log_names_a_write_mode_without_its_indices() {
+        assert_eq!(SessionWrite::All.log_name(), "All");
+        assert_eq!(SessionWrite::Forget(&[0, 2]).log_name(), "Forget");
+        assert_eq!(SessionWrite::Tick.log_name(), "Tick");
+    }
 
     fn prefs() -> Prefs {
         Prefs {
@@ -12302,6 +12321,7 @@ impl Docxy {
     /// names this window's sidecars by its registry seq, then stores this
     /// window's own tabs (never the union) for the others to append.
     fn persist_to(&self, root: &std::path::Path, mode: SessionWrite, cx: &mut App) {
+        recover::harness_note(self.harness, root, &format!("persist {}", mode.log_name()));
         let own = write_session_with(
             root,
             &self.tabs,
@@ -12407,7 +12427,9 @@ impl Docxy {
     /// the next launch does not report a crash. It must come after the final
     /// persist, or a kill in between would lose edits without being reported.
     fn mark_clean_exit(&self) {
-        recover::clear_running(&config_root());
+        let root = config_root();
+        recover::harness_note(self.harness, &root, "clear-running");
+        recover::clear_running(&root);
     }
 
     fn set_autorecover_minutes(&mut self, minutes: u32, cx: &mut Context<Self>) {
