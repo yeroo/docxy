@@ -614,12 +614,15 @@ pub struct DocProps {
 }
 
 /// What a field needs beyond its own instruction: the current clock (for DATE/
-/// TIME), the document properties, and the file name.
+/// TIME), the document properties, and the file name and full path.
 #[derive(Clone, Debug, Default)]
 pub struct FieldContext {
     pub now: Option<DateTime>,
     pub props: DocProps,
     pub filename: String,
+    /// The file's full path, for `FILENAME \p`; empty for a document never
+    /// saved, which shows `filename` instead, as Word shows the title.
+    pub path: String,
 }
 
 /// Like [`eval_field`], but also resolves fields that need outside context — the
@@ -656,6 +659,9 @@ pub fn eval_field_ctx(instr: &str, ctx: &FieldContext) -> Option<String> {
         "COMMENTS" => nonempty(&ctx.props.comments)?,
         "LASTSAVEDBY" => nonempty(&ctx.props.last_saved_by)?,
         "REVNUM" => nonempty(&ctx.props.revision)?,
+        "FILENAME" if switches.iter().any(|(c, _)| *c == 'p') => {
+            nonempty(&ctx.path).or_else(|| nonempty(&ctx.filename))?
+        }
         "FILENAME" => nonempty(&ctx.filename)?,
         _ => return None,
     };
@@ -691,7 +697,8 @@ const WEEKDAYS: [&str; 7] = [
 
 /// Format a date-time against a Word `\@` picture (case-sensitive: `M`=month,
 /// `m`=minute). Supports yyyy/yy, MMMM/MMM/MM/M, dddd/ddd/dd/d, HH/H, hh/h, mm/m,
-/// ss/s, AM/PM (and am/pm), `'literal'` text, and other characters as literals.
+/// ss/s, AM/PM (and am/pm, which Word shows in capitals too), `'literal'`
+/// text, and other characters as literals.
 fn format_date(dt: &DateTime, pic: &str) -> String {
     let chars: Vec<char> = pic.chars().collect();
     let mut out = String::new();
@@ -769,10 +776,8 @@ fn format_date(dt: &DateTime, pic: &str) -> String {
             ("ss", format!("{:02}", dt.sec))
         } else if starts(i, "s") {
             ("s", dt.sec.to_string())
-        } else if starts(i, "AM/PM") {
+        } else if starts(i, "AM/PM") || starts(i, "am/pm") {
             ("AM/PM", if dt.hour < 12 { "AM" } else { "PM" }.to_string())
-        } else if starts(i, "am/pm") {
-            ("am/pm", if dt.hour < 12 { "am" } else { "pm" }.to_string())
         } else {
             out.push(chars[i]);
             i += 1;
@@ -1139,6 +1144,50 @@ mod tests {
         );
         // no clock → the cached value stands
         assert_eq!(eval_field_ctx(" DATE ", &FieldContext::default()), None);
+    }
+
+    /// Word shows `am/pm` in capitals, as `AM/PM` (#768): its Date and Time
+    /// dialog lists `h:mm am/pm` as "2:05 PM".
+    #[test]
+    fn lower_case_am_pm_shows_in_capitals() {
+        assert_eq!(
+            format_date(&at(2026, 6, 23, 14, 5, 9), "h:mm am/pm"),
+            "2:05 PM"
+        );
+        assert_eq!(
+            format_date(&at(2026, 6, 23, 9, 5, 9), "h:mm:ss am/pm"),
+            "9:05:09 AM"
+        );
+        assert_eq!(
+            format_date(&at(2026, 6, 23, 0, 0, 0), "MMM. d, yy"),
+            "Jun. 23, 26"
+        );
+    }
+
+    /// `FILENAME \p` is the full path; a document never saved shows its name.
+    #[test]
+    fn filename_p_is_the_full_path() {
+        let ctx = FieldContext {
+            filename: "Report.docx".into(),
+            path: r"C:\Docs\Report.docx".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            eval_field_ctx(" FILENAME ", &ctx).as_deref(),
+            Some("Report.docx")
+        );
+        assert_eq!(
+            eval_field_ctx(r" FILENAME \p ", &ctx).as_deref(),
+            Some(r"C:\Docs\Report.docx")
+        );
+        let unsaved = FieldContext {
+            filename: "Document1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            eval_field_ctx(r" FILENAME \p ", &unsaved).as_deref(),
+            Some("Document1")
+        );
     }
 
     #[test]

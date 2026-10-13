@@ -1629,6 +1629,7 @@ impl App {
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_default(),
+            path: path.to_string(),
         };
         let mut doc = pkg.document.clone();
         if protection::authorize(&doc_protection, protection::MutationKind::Content).is_ok() {
