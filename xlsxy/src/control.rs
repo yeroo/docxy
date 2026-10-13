@@ -1603,7 +1603,8 @@ fn wb_consolidate(app: &mut App, args: &Json) -> Result<Json, String> {
 
 /// Import CSV text as a brand-new sheet (never overwrites an existing one —
 /// name collisions are deduplicated), converted exactly as opening a `.csv`
-/// converts it (`csv_to_pkg`), but into a sheet of the *live* workbook.
+/// converts it (`gridcore::textio::csv_parse`, then `text_to_pkg`'s
+/// import), but into a sheet of the *live* workbook.
 fn sheet_import_csv(app: &mut App, args: &Json) -> Result<Json, String> {
     let text = args
         .get_str("text")

@@ -135,6 +135,11 @@ pub(crate) fn print_pdf(
     Ok((bytes, pages.pages.len() as u32))
 }
 
+/// "s" after a count other than one (`3 pages`, `1 page`).
+fn plural(n: u32) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
 /// `--pdf`: the active sheet printed to `out`, never over the workbook or
 /// its import source. A sheet with nothing to print writes no file.
 fn export_pdf_headless(
@@ -607,7 +612,10 @@ fn main() -> ExitCode {
         // A .txt/.prn in the editor opens the Text Import Wizard over a new
         // workbook (`run_tui` gets it as `wizard`).
         Some(input)
-            if is_text_import(input) && parsed.recalc_out.is_none() && parsed.csv_out.is_none() =>
+            if is_text_import(input)
+                && parsed.recalc_out.is_none()
+                && parsed.csv_out.is_none()
+                && parsed.pdf_out.is_none() =>
         {
             (new_xlsx(), "untitled.xlsx".to_string(), None, None, None)
         }
@@ -642,7 +650,11 @@ fn main() -> ExitCode {
                 Ok((pkg, _)) => (
                     pkg,
                     template_binding(input)
-                        .filter(|_| parsed.recalc_out.is_none() && parsed.csv_out.is_none())
+                        .filter(|_| {
+                            parsed.recalc_out.is_none()
+                                && parsed.csv_out.is_none()
+                                && parsed.pdf_out.is_none()
+                        })
                         .unwrap_or_else(|| input.clone()),
                     None,
                     None,
@@ -681,9 +693,13 @@ fn main() -> ExitCode {
             eprintln!("error: {}", read_only_refusal(input));
             return ExitCode::from(2);
         }
-        // Only a workbook package is written: an .xls, .xlsb, .ods, .xml (or
-        // any type Save As refuses) would get .xlsx bytes under its name.
-        if let Some(t) = unwritable_type(&out) {
+        // Only a workbook package is written: an .xls, .xlsb, .ods, .xml, a
+        // text type's .csv/.txt/.prn/.htm or a .pdf (any type that is not a
+        // package) would get .xlsx bytes under its name.
+        let not_package = type_for_path(&out)
+            .map(|t| &SAVE_TYPES[t])
+            .filter(|t| save_kind(t) != SaveKind::Package);
+        if let Some(t) = not_package {
             eprintln!(
                 "error: cannot save as .{} ({}): write .xlsx instead",
                 t.ext, t.label
@@ -864,10 +880,11 @@ struct Loaded {
 
 /// The text type an opened `.csv` (`csv`) or `.txt` is saved back as,
 /// chosen so a save loses nothing the open read (#761): the bytes were read
-/// as `origin`, and `plain` when they are all ASCII (no byte-order mark).
-/// Windows-1252, MS-DOS (437) and Macintosh (10000) text keep their code
-/// page; anything else that a 1252 type can't hold becomes CSV UTF-8 or
-/// Unicode Text.
+/// as `origin`, and `plain` when they are all ASCII (no byte-order mark),
+/// which counts only for an ASCII-compatible origin. Windows-1252, MS-DOS
+/// (437) and Macintosh (10000) text keep their code page, UTF-16 always
+/// keeps a Unicode type; anything else that a 1252 type can't hold becomes
+/// CSV UTF-8 or Unicode Text.
 fn bind_text_type(csv: bool, origin: Origin, plain: bool) -> usize {
     let label = match (csv, origin) {
         (true, Origin::CodePage(437)) => "CSV (MS-DOS)",
@@ -876,6 +893,10 @@ fn bind_text_type(csv: bool, origin: Origin, plain: bool) -> usize {
         (false, Origin::CodePage(10000)) => "Text (Macintosh)",
         (true, Origin::Windows1252) => "CSV (Comma delimited)",
         (false, Origin::Windows1252) => "Text (Tab delimited)",
+        // UTF-16 bytes below 0x80 are no ASCII text (BOM-less Cyrillic is
+        // all of them): a UTF-16 source keeps a Unicode type.
+        (true, Origin::Utf16Le | Origin::Utf16Be) => "CSV UTF-8 (Comma delimited)",
+        (false, Origin::Utf16Le | Origin::Utf16Be) => "Unicode Text",
         (true, _) if plain => "CSV (Comma delimited)",
         (false, _) if plain => "Text (Tab delimited)",
         (true, _) => "CSV UTF-8 (Comma delimited)",
@@ -893,8 +914,9 @@ fn save_type_at(label: &str) -> usize {
 }
 
 /// Whether `path` is a `.csv` or `.txt`: opened bound to itself as text
-/// ([`bind_text_type`]), where a `.tsv` or `.prn` (no Save As type writes
-/// those) imports bound to a new `.xlsx`.
+/// ([`bind_text_type`]), where a `.tsv` or `.prn` imports bound to a new
+/// `.xlsx` (no Save As type writes a `.tsv`, and Formatted Text, which
+/// writes a `.prn`, cannot be read back).
 fn binds_as_text(path: &str) -> Option<bool> {
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".csv") {
@@ -1043,15 +1065,6 @@ fn parse_table_col(s: &str) -> Option<(String, String)> {
         s[..open].trim().to_string(),
         s[open + 1..close].trim().to_string(),
     ))
-}
-
-/// Import CSV text as a fresh one-sheet workbook, as Excel opens a `.csv`: a
-/// `sep=` first line names the delimiter (else a `.tsv` is tab-delimited and
-/// a `.csv` sniffed), and every field converts as if typed into its cell.
-#[cfg(test)]
-fn csv_to_pkg(text: &str, sheet_name: &str, tab: bool, open: &TextOpen) -> SheetPackage {
-    let (opts, body) = gridcore::textio::csv_parse(text, tab);
-    text_to_pkg(body, sheet_name, &opts, open)
 }
 
 /// The file name without its extension (a new sheet's name).
@@ -2138,8 +2151,9 @@ struct App {
     /// The template this workbook was started from, until this session first
     /// writes it (to `Budget1.xlsx` from `Budget.xltx`, or a Save As name).
     template: Option<String>,
-    /// An import (a `.csv`/`.tsv`/`.txt`/`.prn` or an `.xls`/`.xlsb`/`.ods`)
-    /// this session has not written yet: its binding was free when it
+    /// An import (a `.tsv`/`.prn` or an `.xls`/`.xlsb`/`.ods`; an opened
+    /// `.csv`/`.txt` is bound to itself instead) this session has not
+    /// written yet: its binding was free when it
     /// opened, and the first save rechecks it.
     import_unsaved: bool,
     sheet: usize,
@@ -6813,26 +6827,13 @@ impl App {
     /// Print the current sheet to a `.pdf` next to the workbook. A sheet with
     /// nothing to print says so and writes nothing.
     fn export_pdf(&mut self) {
-        let job = gridcore::print::paginate::Job::new(
-            gridcore::print::paginate::What::ActiveSheets(vec![self.sheet]),
-        );
         let out = match self.path.rsplit_once('.') {
             Some((base, _)) => format!("{base}.pdf"),
             None => format!("{}.pdf", self.path),
         };
-        self.status = Some(match print_pdf(&self.pkg.workbook, &job, &self.path) {
-            Err(e) => e.to_string(),
-            Ok((pdf, pages)) => {
-                // Through the App's guarded write, like every App write (#882).
-                let source = export_source(&self.path, self.import_source.as_deref(), &out);
-                match self.write_export(Some(Path::new(source)), Path::new(&out), &pdf) {
-                    Ok(()) => format!(
-                        "Exported {out} ({pages} page{})",
-                        if pages == 1 { "" } else { "s" }
-                    ),
-                    Err(e) => format!("Export failed: {e}"),
-                }
-            }
+        self.status = Some(match self.write_sheet_pdf(&out, "Export failed") {
+            Ok(pages) => format!("Exported {out} ({pages} page{})", plural(pages)),
+            Err(msg) => msg,
         });
         self.backstage = None;
     }
@@ -6840,29 +6841,28 @@ impl App {
     /// Save As PDF (#761): the active sheet printed to `out`, as Excel
     /// publishes one. The workbook stays bound to its own file and type, and
     /// keeps its modified state; a sheet with nothing to print says so and
-    /// writes nothing. Never over the workbook, its import source or the
-    /// read-only file.
+    /// writes nothing.
     fn save_pdf(&mut self, out: String) {
-        if let Err(msg) = self.refuse_read_only(&out) {
-            self.status = Some(msg);
-            return;
-        }
+        self.status = Some(match self.write_sheet_pdf(&out, "save failed") {
+            Ok(pages) => format!("Saved {out} as PDF ({pages} page{})", plural(pages)),
+            Err(msg) => msg,
+        });
+    }
+
+    /// The active sheet printed to `out`: its page count, or the status
+    /// to show (nothing to print, or the failed write after `failed: `).
+    /// Through the App's guarded write, like every App write (#882): never
+    /// over the workbook, its import source or the read-only file.
+    fn write_sheet_pdf(&self, out: &str, failed: &str) -> Result<u32, String> {
         let job = gridcore::print::paginate::Job::new(
             gridcore::print::paginate::What::ActiveSheets(vec![self.sheet]),
         );
-        self.status = Some(match print_pdf(&self.pkg.workbook, &job, &self.path) {
-            Err(e) => e.to_string(),
-            Ok((pdf, pages)) => {
-                let source = export_source(&self.path, self.import_source.as_deref(), &out);
-                match self.write_export(Some(Path::new(source)), Path::new(&out), &pdf) {
-                    Ok(()) => format!(
-                        "Saved {out} as PDF ({pages} page{})",
-                        if pages == 1 { "" } else { "s" }
-                    ),
-                    Err(e) => format!("save failed: {e}"),
-                }
-            }
-        });
+        let (pdf, pages) =
+            print_pdf(&self.pkg.workbook, &job, &self.path).map_err(|e| e.to_string())?;
+        let source = export_source(&self.path, self.import_source.as_deref(), out);
+        self.write_export(Some(Path::new(source)), Path::new(out), &pdf)
+            .map_err(|e| format!("{failed}: {e}"))?;
+        Ok(pages)
     }
 
     /// Export the current sheet to a `.csv` (CSV UTF-8) next to the workbook.
@@ -12028,6 +12028,13 @@ mod tests {
     use gridcore::edit::parse_input;
     use gridcore::xlsx::{load_xlsx, save_xlsx};
 
+    /// CSV text as a fresh one-sheet workbook, as opening a `.csv` reads it
+    /// (`gridcore::textio::csv_parse`, then [`text_to_pkg`]).
+    fn csv_to_pkg(text: &str, sheet_name: &str, tab: bool, open: &TextOpen) -> SheetPackage {
+        let (opts, body) = gridcore::textio::csv_parse(text, tab);
+        text_to_pkg(body, sheet_name, &opts, open)
+    }
+
     #[test]
     fn backstage_info_shows_the_build_line() {
         let app = App::new(new_xlsx(), "untitled.xlsx");
@@ -12373,10 +12380,14 @@ mod tests {
         let dos = dir.join("dos.txt");
         std::fs::write(&dos, b"Z\x81rich\n").unwrap();
         app.open_workbook(dos.to_str().unwrap());
-        app.text_dialog
-            .as_mut()
-            .unwrap()
-            .set_origin(Origin::CodePage(437));
+        // File origin is step 1's third field; one past Automatic is 437.
+        for key in [KeyCode::Down, KeyCode::Down, KeyCode::Right] {
+            app.text_dialog_key(key);
+        }
+        assert_eq!(
+            app.text_dialog.as_ref().unwrap().origin,
+            Origin::CodePage(437)
+        );
         app.finish_text_dialog();
         assert_eq!(
             app.sheet().cell(0, 0).unwrap().value,
@@ -12389,6 +12400,54 @@ mod tests {
         assert_eq!(
             app.sheet().cell(0, 0).unwrap().value,
             CellValue::Text("Z\u{fc}rich".into())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #761 r1 M1: UTF-16 bytes all below 0x80 (BOM-less Cyrillic) are no
+    /// ASCII text, so a UTF-16 source keeps a Unicode type and its save
+    /// round-trips instead of writing `?`s in 1252.
+    #[test]
+    fn bomless_utf16_wizard_txt_binds_unicode_text() {
+        let label = |csv, origin| SAVE_TYPES[bind_text_type(csv, origin, true)].label;
+        assert_eq!(label(false, Origin::Utf16Le), "Unicode Text");
+        assert_eq!(label(false, Origin::Utf16Be), "Unicode Text");
+        assert_eq!(label(true, Origin::Utf16Le), "CSV UTF-8 (Comma delimited)");
+        assert_eq!(label(true, Origin::Utf16Be), "CSV UTF-8 (Comma delimited)");
+        let dir = tmp("txt-bind-utf16");
+        let txt = dir.join("ru.txt");
+        let word = "\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}";
+        let bytes: Vec<u8> = word.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert!(bytes.is_ascii());
+        std::fs::write(&txt, &bytes).unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.os_clip = None;
+        app.open_workbook(txt.to_str().unwrap());
+        // File origin, then Right past 437, 850, 852, 866, 874 to 1200.
+        app.text_dialog_key(KeyCode::Down);
+        app.text_dialog_key(KeyCode::Down);
+        for _ in 0..6 {
+            app.text_dialog_key(KeyCode::Right);
+        }
+        assert_eq!(app.text_dialog.as_ref().unwrap().origin, Origin::Utf16Le);
+        app.finish_text_dialog();
+        assert_eq!(
+            app.sheet().cell(0, 0).unwrap().value,
+            CellValue::Text(word.into())
+        );
+        assert_eq!(bound_label(&app), Some("Unicode Text"));
+        app.save();
+        let mut want = vec![0xFF, 0xFE];
+        want.extend(
+            format!("{word}\r\n")
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        );
+        assert_eq!(std::fs::read(&txt).unwrap(), want);
+        app.reload().unwrap();
+        assert_eq!(
+            app.sheet().cell(0, 0).unwrap().value,
+            CellValue::Text(word.into())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

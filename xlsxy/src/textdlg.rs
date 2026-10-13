@@ -281,8 +281,7 @@ impl TextDialog {
         self.columns[col] = f;
     }
 
-    /// Read the import under `origin`, as the File origin field does.
-    pub fn set_origin(&mut self, origin: Origin) {
+    fn set_origin(&mut self, origin: Origin) {
         self.origin = origin;
         if let Purpose::Import { bytes, .. } = &self.purpose {
             self.text = decode(bytes, origin);
