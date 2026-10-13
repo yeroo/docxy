@@ -838,3 +838,29 @@ fn a_tracked_selection_in_a_text_box_skips_a_box_nested_in_it() {
     );
     assert!(!xml(&ed).contains(">inner</w:delText>"), "{}", xml(&ed));
 }
+
+/// A copy over a tracked deletion leaves the deleted text out, so the text it
+/// puts on the clipboard (what Keep Text Only pastes, #753) never brings it
+/// back as live text.
+#[test]
+fn a_copy_over_a_tracked_deletion_leaves_the_deleted_text_out_753() {
+    let mut ed = editor();
+    select(&mut ed, 4, 8); // "two "
+    ed.delete_selection();
+    ed.set_track_changes(None);
+    select(&mut ed, 0, 10);
+    let clip = ed.copy().expect("a selection");
+    assert_eq!(clip.to_text(), "One three.");
+}
+
+/// Keep Text Only (#753) is recorded as a paste is: one tracked insertion,
+/// and the text reads as pasted once accepted.
+#[test]
+fn paste_text_only_records_an_insertion_753() {
+    let mut ed = editor();
+    at(&mut ed, 4);
+    ed.paste_text_only("new ");
+    assert_eq!(kinds(&ed.doc), [RevisionKind::Insert]);
+    assert_eq!(text(&ed), "One new two three.");
+    assert!(xml(&ed).contains("<w:ins "));
+}
