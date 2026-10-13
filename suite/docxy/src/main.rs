@@ -29013,8 +29013,15 @@ fn flat_inlines(content: &[Inline]) -> Vec<(Cow<'_, Inline>, bool)> {
     out
 }
 
-/// The runs under a tracked change, drawn as plain text with no caret mapping.
-fn emit_revision_text(out: &mut Vec<AnyElement>, content: &[Inline], base: f32, pal: Pal) {
+/// The runs under a tracked change, drawn as plain text with no caret mapping;
+/// in a table cell, over its style's run formatting (#765).
+fn emit_revision_text(
+    out: &mut Vec<AnyElement>,
+    content: &[Inline],
+    base: f32,
+    pal: Pal,
+    cell_run: Option<&docxcore::table_styles::RunLook>,
+) {
     for inline in content {
         match inline {
             Inline::Run(r) => {
@@ -29022,7 +29029,16 @@ fn emit_revision_text(out: &mut Vec<AnyElement>, content: &[Inline], base: f32, 
                 // The caret never lands in revision text (caret is None), so
                 // the bar height is unused; 19 keeps the signature honest.
                 emit_run(
-                    out, &r.text, &r.props, base, false, &mut idx, &mut caret, None, None, pal,
+                    out,
+                    &r.text,
+                    &shown_in(cell_run, r),
+                    base,
+                    false,
+                    &mut idx,
+                    &mut caret,
+                    None,
+                    None,
+                    pal,
                     19.0,
                 );
             }
@@ -29030,15 +29046,37 @@ fn emit_revision_text(out: &mut Vec<AnyElement>, content: &[Inline], base: f32, 
                 for r in &h.runs {
                     let (mut idx, mut caret) = (0, None);
                     emit_run(
-                        out, &r.text, &r.props, base, true, &mut idx, &mut caret, None, None, pal,
+                        out,
+                        &r.text,
+                        &shown_in(cell_run, r),
+                        base,
+                        true,
+                        &mut idx,
+                        &mut caret,
+                        None,
+                        None,
+                        pal,
                         19.0,
                     );
                 }
-                emit_revision_text(out, &h.content, base, pal);
+                emit_revision_text(out, &h.content, base, pal, cell_run);
             }
-            Inline::Revision { content, .. } => emit_revision_text(out, content, base, pal),
+            Inline::Revision { content, .. } => {
+                emit_revision_text(out, content, base, pal, cell_run)
+            }
             _ => {}
         }
+    }
+}
+
+/// A run's formatting as drawn: in a table cell, over its style's (#765).
+fn shown_in<'r>(
+    cell_run: Option<&docxcore::table_styles::RunLook>,
+    r: &'r docxcore::model::Run,
+) -> Cow<'r, RunProps> {
+    match cell_run {
+        Some(look) => Cow::Owned(look.under(&r.props)),
+        None => Cow::Borrowed(&r.props),
     }
 }
 
@@ -29209,16 +29247,6 @@ fn paragraph_el(
     // Only paragraphs that actually contain a tab need per-run width measurement.
     let has_tab = items.iter().any(|(i, _)| matches!(**i, Inline::Tab(_)));
     let m = meas.filter(|_| has_tab);
-    // A run's formatting as drawn: in a table cell, over its style's (#765).
-    fn shown_in<'r>(
-        cell_run: Option<&docxcore::table_styles::RunLook>,
-        r: &'r docxcore::model::Run,
-    ) -> Cow<'r, RunProps> {
-        match cell_run {
-            Some(look) => Cow::Owned(look.under(&r.props)),
-            None => Cow::Borrowed(&r.props),
-        }
-    }
     // Width of a run's text at its effective size (matching emit_words' sizing).
     let run_w = |r: &docxcore::model::Run| -> f32 {
         match m {
@@ -29341,7 +29369,7 @@ fn paragraph_el(
                 // A tracked change is shown, not edited here: its text takes no
                 // caret offsets (the engine counts it as none), and carries the
                 // underline / strike cue the loader gave its runs.
-                emit_revision_text(&mut spans, content, base, pal);
+                emit_revision_text(&mut spans, content, base, pal, cell_run);
             }
             Inline::Raw(xml) => {
                 // Comment reference → a small badge; other raw XML (range markers,
@@ -29599,24 +29627,33 @@ enum TableClick {
     Column(usize),
 }
 
+/// The palette a cell's text draws in (see [`design_tab::cell_ink`]): its
+/// ink, and chips and hover washes that read under it.
+fn cell_pal(pal: Pal, fill: Option<u32>) -> Pal {
+    match design_tab::cell_ink(fill) {
+        Some(ink) => {
+            let chip = Hsla {
+                a: ink.chip.1,
+                ..hsla_u(ink.chip.0)
+            };
+            Pal {
+                fg: hsla_u(ink.fg),
+                dim: hsla_u(ink.dim),
+                panel: chip,
+                hover: chip,
+                ..pal
+            }
+        }
+        None => pal,
+    }
+}
+
 /// Draw a table: cells sized from the grid, spans and vertical merges laid
 /// out, fills, borders (per side and colour), diagonals and vertical
 /// alignment from `table_view::layout`, the selected cells highlighted, and
 /// dashed gridlines on borderless edges when View Gridlines is on. The left
 /// edge of a cell, the strip left of a row and the strip above the first row
 /// select a cell, row or column.
-/// The palette a cell's text draws in (see [`design_tab::cell_ink`]).
-fn cell_pal(pal: Pal, fill: Option<u32>) -> Pal {
-    match design_tab::cell_ink(fill) {
-        Some((fg, dim)) => Pal {
-            fg: hsla_u(fg),
-            dim: hsla_u(dim),
-            ..pal
-        },
-        None => pal,
-    }
-}
-
 fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
     use docxcore::table_props::VAlign;
     let style = docxcore::table::table_props(t)
@@ -29703,19 +29740,23 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
             // One absolutely placed strip per stroke of each side, so each
             // side keeps its own colour and thickness and a double line
             // draws as two (#765).
+            let strokes = cb.strokes_at(zoom);
             let side = |which: u8, l: Option<table_view::Line>| -> Vec<AnyElement> {
-                let placed = |d: Div, inset: Pixels, thick: Pixels| match which {
-                    0 => d.top(inset).left_0().right_0().h(thick),
-                    1 => d.bottom(inset).left_0().right_0().h(thick),
-                    2 => d.top_0().bottom_0().left(inset).w(thick),
-                    _ => d.top_0().bottom_0().right(inset).w(thick),
+                let placed = |d: Div, s: table_view::Stroke| {
+                    let (inset, thick) = (px(s.inset), px(s.thick));
+                    let (start, end) = (px(s.start), px(s.end));
+                    match which {
+                        0 => d.top(inset).left(start).right(end).h(thick),
+                        1 => d.bottom(inset).left(start).right(end).h(thick),
+                        2 => d.top(start).bottom(end).left(inset).w(thick),
+                        _ => d.top(start).bottom(end).right(inset).w(thick),
+                    }
                 };
                 match l {
-                    Some(l) => l
-                        .strokes_at(zoom)
-                        .into_iter()
-                        .map(|(inset, thick)| {
-                            placed(div().absolute(), px(inset), px(thick))
+                    Some(l) => strokes[usize::from(which)]
+                        .iter()
+                        .map(|&s| {
+                            placed(div().absolute(), s)
                                 .bg(l.color.map_or(fg, hsla_u))
                                 .into_any_element()
                         })
@@ -29723,7 +29764,13 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
                     // The cell beside draws this edge.
                     None if cb.neighbour_draws[usize::from(which)] => Vec::new(),
                     None if ctx.tbl.gridlines => {
-                        let d = placed(div().absolute(), px(0.), px(0.))
+                        let none = table_view::Stroke {
+                            inset: 0.,
+                            thick: 0.,
+                            start: 0.,
+                            end: 0.,
+                        };
+                        let d = placed(div().absolute(), none)
                             .border_dashed()
                             .border_color(grid_color);
                         let d = match which {
@@ -29788,6 +29835,21 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
                 .w(w(cb.width))
                 .px(px(7.2 * zoom))
                 .py_0p5()
+                // A thick compound band reaching past the padding pushes the
+                // text in, so its lines never paint over it (#765).
+                .map(|d| {
+                    let band = |k: usize| {
+                        strokes[k]
+                            .iter()
+                            .map(|s| s.inset + s.thick)
+                            .fold(0.0, f32::max)
+                    };
+                    let (h, v) = (7.2 * zoom, 2.0);
+                    d.when(band(0) > v, |d| d.pt(px(band(0))))
+                        .when(band(1) > v, |d| d.pb(px(band(1))))
+                        .when(band(2) > h, |d| d.pl(px(band(2))))
+                        .when(band(3) > h, |d| d.pr(px(band(3))))
+                })
                 .when_some(cb.fill, |d, f| d.bg(hsla_u(f)))
                 .map(|d| match cb.valign {
                     VAlign::Top => d.justify_start(),

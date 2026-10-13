@@ -111,6 +111,46 @@ pub struct CellBox {
     pub run: RunLook,
 }
 
+/// One drawn stroke of a cell's side, in px at the drawn zoom (#765).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Stroke {
+    /// From the cell's edge to the stroke.
+    pub inset: f32,
+    pub thick: f32,
+    /// Where it stops short of the side's two ends (top or left first), so
+    /// a compound frame's inner lines meet at the corners, not cross.
+    pub start: f32,
+    pub end: f32,
+}
+
+impl CellBox {
+    /// The strokes of each side (top, bottom, left, right) at `zoom`. A
+    /// side's k-th stroke from the edge ends at the k-th stroke of the side
+    /// it meets, when that side has one, as the PDF export frames a page.
+    pub fn strokes_at(&self, zoom: f32) -> [Vec<Stroke>; 4] {
+        let at = |l: Option<Line>| l.map(|l| l.strokes_at(zoom)).unwrap_or_default();
+        let sides = [at(self.top), at(self.bottom), at(self.left), at(self.right)];
+        let meet = |side: &[(f32, f32)], k: usize| side.get(k).map_or(0.0, |&(inset, _)| inset);
+        let mut out: [Vec<Stroke>; 4] = Default::default();
+        for (which, own) in sides.iter().enumerate() {
+            // A horizontal side meets the left and right ones; a vertical
+            // side the top and bottom ones.
+            let (a, b) = if which < 2 { (2, 3) } else { (0, 1) };
+            out[which] = own
+                .iter()
+                .enumerate()
+                .map(|(k, &(inset, thick))| Stroke {
+                    inset,
+                    thick,
+                    start: meet(&sides[a], k),
+                    end: meet(&sides[b], k),
+                })
+                .collect();
+        }
+        out
+    }
+}
+
 /// One row: the width skipped before its first cell (`w:gridBefore`), then
 /// its cells.
 #[derive(Debug, Clone, PartialEq)]
@@ -206,11 +246,14 @@ pub fn layout(t: &Table, style: Option<&TableStyle>) -> Vec<RowBox> {
 
 /// Give each edge two cells share one owner (#765): each cell draws its sides
 /// inside its own box, so both drawing it would double every inside line.
-/// Side by side, the cells are next to each other in a row; one above the
-/// other, the cell above covers the same grid columns. The wider line wins,
-/// else the left or upper cell's; an edge neither cell draws is left to the
-/// left or upper cell's gridline. Cells above that only partly overlap
-/// (ragged rows) each keep their own edges.
+/// Side by side, the cells are next to each other in a row. One above the
+/// other, a cell faces the run of cells across the edge that exactly covers
+/// its grid columns (one cell, or several narrower ones). A line wins over a
+/// narrower one, else the left or upper cell's does; an edge neither cell
+/// draws is left to the left or upper cell's gridline. When the wide cell's
+/// line loses to one of the narrow cells', the narrow cells draw the edge,
+/// each with the wide cell's line where that one wins. Cells across the edge
+/// that only partly overlap (a staircase) each keep their own edges.
 fn share_edges(rows: &mut [RowBox]) {
     const TOP: usize = 0;
     const BOTTOM: usize = 1;
@@ -240,24 +283,69 @@ fn share_edges(rows: &mut [RowBox]) {
     }
     for r in 1..rows.len() {
         let (above, below) = rows.split_at_mut(r);
-        for b in &mut below[0].cells {
-            // A merge's continued part has no top edge to share.
-            if b.continues {
-                continue;
+        let (above, below) = (&mut above[r - 1].cells, &mut below[0].cells);
+        // The cells of `cells` that exactly cover `wide`'s grid columns.
+        fn tiling(cells: &[CellBox], wide: &CellBox) -> Option<Vec<usize>> {
+            let end = wide.start + wide.span;
+            let ks: Vec<usize> = (0..cells.len())
+                .filter(|&k| cells[k].start >= wide.start && cells[k].start + cells[k].span <= end)
+                .collect();
+            let mut at = wide.start;
+            for &k in &ks {
+                if cells[k].start != at {
+                    return None;
+                }
+                at += cells[k].span;
             }
-            let Some(a) = above[r - 1]
-                .cells
-                .iter_mut()
-                .find(|a| a.start == b.start && a.span == b.span)
-            else {
+            (at == end && !ks.is_empty()).then_some(ks)
+        }
+        // One cell above over the cells below that cover it, then one cell
+        // below under several above (one-to-one pairs are taken first).
+        for ai in 0..above.len() {
+            let Some(bs) = tiling(below, &above[ai]) else {
                 continue;
             };
-            if later_wins(a.bottom, b.top) {
-                a.bottom = None;
-                a.neighbour_draws[BOTTOM] = true;
+            // A merge's continued part has no top edge to share.
+            if bs.iter().any(|&k| below[k].continues) {
+                continue;
+            }
+            let wide = above[ai].bottom;
+            if bs.iter().all(|&k| !later_wins(wide, below[k].top)) {
+                for &k in &bs {
+                    below[k].top = None;
+                    below[k].neighbour_draws[TOP] = true;
+                }
             } else {
-                b.top = None;
-                b.neighbour_draws[TOP] = true;
+                for &k in &bs {
+                    if !later_wins(wide, below[k].top) {
+                        below[k].top = wide;
+                    }
+                }
+                above[ai].bottom = None;
+                above[ai].neighbour_draws[BOTTOM] = true;
+            }
+        }
+        for bi in 0..below.len() {
+            if below[bi].continues {
+                continue;
+            }
+            let Some(as_) = tiling(above, &below[bi]).filter(|v| v.len() > 1) else {
+                continue;
+            };
+            let wide = below[bi].top;
+            if as_.iter().all(|&k| later_wins(above[k].bottom, wide)) {
+                for &k in &as_ {
+                    above[k].bottom = None;
+                    above[k].neighbour_draws[BOTTOM] = true;
+                }
+            } else {
+                for &k in &as_ {
+                    if later_wins(above[k].bottom, wide) {
+                        above[k].bottom = wide;
+                    }
+                }
+                below[bi].top = None;
+                below[bi].neighbour_draws[TOP] = true;
             }
         }
     }
@@ -510,6 +598,78 @@ mod tests {
     }
 
     #[test]
+    fn a_wide_cell_shares_its_edge_with_the_cells_that_cover_it_765() {
+        let grid = lookup_style(None, "TableGrid");
+        // A two-column header over two cells, and two cells over a wide
+        // last row.
+        let mut t = new_table(3, 2, 9000, AutoFit::Default);
+        t.rows[0].cells.remove(1);
+        t.rows[0].cells[0].grid_span = 2;
+        t.rows[2].cells.remove(1);
+        t.rows[2].cells[0].grid_span = 2;
+        let rows = layout(&t, grid.as_ref());
+        // The header draws the edge once; the cells under it leave it.
+        assert!(rows[0].cells[0].bottom.is_some());
+        for c in &rows[1].cells {
+            assert!(c.top.is_none() && c.neighbour_draws[0]);
+        }
+        // The upper cells draw the edge over the wide last row.
+        for c in &rows[1].cells {
+            assert!(c.bottom.is_some() && !c.neighbour_draws[1]);
+        }
+        assert!(rows[2].cells[0].top.is_none() && rows[2].cells[0].neighbour_draws[0]);
+
+        // A wider line under the header wins its part of the edge; the
+        // other part takes the header's line.
+        edit_cell_props(&mut t.rows[1].cells[1], |p| {
+            p.set("<w:tcBorders><w:top w:val=\"double\" w:sz=\"12\" w:color=\"FF0000\"/></w:tcBorders>")
+        });
+        let rows = layout(&t, grid.as_ref());
+        assert!(rows[0].cells[0].bottom.is_none() && rows[0].cells[0].neighbour_draws[1]);
+        assert_eq!(rows[1].cells[1].top.map(|l| l.color), Some(Some(0xFF0000)));
+        let header = layout(&t, grid.as_ref())[0].cells[0].left;
+        assert_eq!(rows[1].cells[0].top, header, "the header's single line");
+    }
+
+    #[test]
+    fn a_double_frames_inner_lines_meet_at_the_corners_765() {
+        let mut t = new_table(1, 1, 9000, AutoFit::Default);
+        edit_table_props(&mut t, |p| {
+            p.set(
+                "<w:tblBorders><w:top w:val=\"double\" w:sz=\"4\"/><w:left w:val=\"double\" w:sz=\"4\"/>                 <w:bottom w:val=\"single\" w:sz=\"4\"/><w:right w:val=\"double\" w:sz=\"4\"/></w:tblBorders>",
+            )
+        });
+        let rows = layout(&t, None);
+        let [top, bottom, left, right] = rows[0].cells[0].strokes_at(1.0);
+        // The outer top line runs edge to edge; the inner one stops at the
+        // left and right sides' inner lines.
+        assert_eq!(
+            top[0],
+            Stroke {
+                inset: 0.0,
+                thick: 1.0,
+                start: 0.0,
+                end: 0.0
+            }
+        );
+        assert_eq!(
+            top[1],
+            Stroke {
+                inset: 2.0,
+                thick: 1.0,
+                start: 2.0,
+                end: 2.0
+            }
+        );
+        // The inner left line stops at the top's inner line; the bottom has
+        // a single line, so it runs to the bottom edge.
+        assert_eq!((left[1].start, left[1].end), (2.0, 0.0));
+        assert_eq!((right[1].start, right[1].end), (2.0, 0.0));
+        assert_eq!(bottom.len(), 1);
+        assert_eq!((bottom[0].start, bottom[0].end), (0.0, 0.0));
+    }
+
+    #[test]
     fn a_style_header_is_bold_white_and_a_band_takes_its_fills_ink_765() {
         use docxcore::model::RunProps;
         let mut t = new_table(3, 2, 9000, AutoFit::Default);
@@ -536,8 +696,8 @@ mod tests {
         let band = &rows[1].cells[1];
         assert_eq!(band.run.under(&RunProps::default()).color, None);
         assert_eq!(
-            crate::design_tab::cell_ink(band.fill),
-            Some((0x202020, 0x808080))
+            crate::design_tab::cell_ink(band.fill).map(|i| i.fg),
+            Some(0x202020)
         );
     }
 }
