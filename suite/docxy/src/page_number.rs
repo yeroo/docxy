@@ -5,7 +5,9 @@
 //! A number placed at the top or bottom of the page is Word's own shape: a
 //! `docPartObj` content control (`Page Numbers (Top of Page)` / `(Bottom of
 //! Page)`) around one paragraph in the caret section's header or footer (see
-//! [`docxcore::hf`]). Choosing another design replaces it, so a section never
+//! [`docxcore::hf`]). A Page Margins number (#767) is the same control
+//! (`Page Numbers (Margins)`) in the header, its paragraph framed in the
+//! side margin. Choosing another design replaces it, so a section never
 //! holds two, and Remove Page Numbers removes exactly those controls, ours
 //! and Word's, leaving `PAGE` fields typed into the body or a header alone.
 use super::*;
@@ -13,7 +15,10 @@ use crate::dialog::catalog;
 use crate::dialog::{Control, ControlKind, Dialog, DialogOwner, Value};
 use crate::hf_tab::{HfAct, reopen, resolved_part, rewrite_part, set_content, target, target_for};
 use crate::page_setup::{choice, chosen, ok_cancel, text_of};
-use docxcore::hf::{PAGE_NUMBER_DESIGNS, page_number_sdt_xml, remove_page_numbers};
+use docxcore::hf::{
+    PAGE_MARGIN_DESIGNS, PAGE_NUMBER_DESIGNS, margin_number_sdt_xml, page_number_sdt_xml,
+    remove_page_numbers,
+};
 use docxcore::sect::PageNumberFormat;
 
 /// A Page Number menu command.
@@ -22,6 +27,10 @@ pub(crate) enum PnAct {
     /// A Top of Page (`top`) or Bottom of Page design, by index.
     Place {
         top: bool,
+        design: usize,
+    },
+    /// A Page Margins design, by index: the number in the side margin.
+    Margin {
         design: usize,
     },
     /// A Current Position design: the number at the caret, unmarked.
@@ -46,6 +55,15 @@ fn place_id(top: bool, design: usize) -> &'static str {
     if top { TOP[design] } else { BOTTOM[design] }
 }
 
+fn margin_id(design: usize) -> &'static str {
+    [
+        "pn-margins-1",
+        "pn-margins-2",
+        "pn-margins-3",
+        "pn-margins-4",
+    ][design]
+}
+
 /// The drop-down's commands for `ribbon-read` and `ribbon-click`: each
 /// gallery item named with its gallery ("Bottom of Page: Plain Number 2"),
 /// then Format Page Numbers... and Remove Page Numbers.
@@ -62,6 +80,12 @@ pub(crate) fn ribbon_items() -> Vec<rs::Cmd<Act>> {
         "Bottom of Page: Plain Number 3",
         "Bottom of Page: Page X of Y",
     ];
+    const MARGINS: [&str; 4] = [
+        "Page Margins: Plain Number, Left",
+        "Page Margins: Plain Number, Right",
+        "Page Margins: Large, Left",
+        "Page Margins: Large, Right",
+    ];
     const CURRENT_IDS: [(&str, &str); 2] = [
         ("pn-current-1", "Current Position: Plain Number"),
         ("pn-current-xy", "Current Position: Page X of Y"),
@@ -76,6 +100,14 @@ pub(crate) fn ribbon_items() -> Vec<rs::Cmd<Act>> {
                 pn(PnAct::Place { top, design }),
             ));
         }
+    }
+    for (design, label) in MARGINS.into_iter().enumerate() {
+        out.push(rs::cmd(
+            margin_id(design),
+            "page-number",
+            label,
+            pn(PnAct::Margin { design }),
+        ));
     }
     for (design, (id, label)) in CURRENT_IDS.into_iter().enumerate() {
         out.push(rs::cmd(
@@ -125,6 +157,19 @@ pub(crate) fn menu_items(_tab: Option<&DocTab>) -> Vec<menu::MenuItem> {
             })
             .collect()
     };
+    let margins = PAGE_MARGIN_DESIGNS
+        .iter()
+        .enumerate()
+        .map(|(design, d)| {
+            MenuItem::Item(Entry::new(
+                margin_id(design),
+                d.name,
+                "",
+                pn(PnAct::Margin { design }),
+                true,
+            ))
+        })
+        .collect();
     let current = CURRENT
         .iter()
         .enumerate()
@@ -145,9 +190,7 @@ pub(crate) fn menu_items(_tab: Option<&DocTab>) -> Vec<menu::MenuItem> {
     vec![
         gallery("pn-top", "Top of Page", placed(true)),
         gallery("pn-bottom", "Bottom of Page", placed(false)),
-        // Word's side-margin designs need a floating frame the suite cannot
-        // place yet: listed for order parity, unavailable.
-        MenuItem::Item(Entry::unavailable("pn-margins", "Page Margins")),
+        gallery("pn-margins", "Page Margins", margins),
         gallery("pn-current", "Current Position", current),
         MenuItem::Separator,
         MenuItem::Item(Entry::new(
@@ -204,12 +247,44 @@ fn blank(blocks: &[Block]) -> bool {
 /// it), then open that area for editing. The variant is the edited one when
 /// that area is open, else the default one.
 pub(crate) fn place(tab: &mut DocTab, top: bool, design: usize) -> Result<(), String> {
+    let d = PAGE_NUMBER_DESIGNS.get(design).ok_or("no such design")?;
+    put(tab, top, |_, _| page_number_sdt_xml(d, top, sdt_id()))?;
+    let gallery = if top { "Top of Page" } else { "Bottom of Page" };
+    tab.status = format!("Page number: {gallery}, {}", d.name).into();
+    Ok(())
+}
+
+/// Page Margins: put the design in the target section's header, framed in
+/// its left or right margin and as wide as it, replacing any number placed
+/// in that section's header or footer, then open the header.
+pub(crate) fn place_margin(tab: &mut DocTab, design: usize) -> Result<(), String> {
+    let d = PAGE_MARGIN_DESIGNS.get(design).ok_or("no such design")?;
+    put(tab, true, |tab, section| {
+        let sections = match &tab.surface {
+            Surface::Doc(ed) => ed.sections(),
+            _ => Vec::new(),
+        };
+        let raw = sections.get(section).map_or("", String::as_str);
+        let m = docxcore::sect::SectionSetup::parse(raw).margins;
+        let margin = if d.right { m.right } else { m.left };
+        margin_number_sdt_xml(d, margin.saturating_abs(), sdt_id())
+    })?;
+    tab.status = format!("Page number: Page Margins, {}", d.name).into();
+    Ok(())
+}
+
+/// Put a placed number, made by `number` for the target section, first in
+/// that section's header (`is_header`) or last in its footer, after
+/// removing every placed number from both areas of that section variant.
+fn put(
+    tab: &mut DocTab,
+    is_header: bool,
+    number: impl FnOnce(&DocTab, usize) -> String,
+) -> Result<(), String> {
     if tab.pkg.is_none() || !matches!(tab.surface, Surface::Doc(_)) {
         return Err("Page numbers need a .docx (not a Markdown document)".into());
     }
-    let d = PAGE_NUMBER_DESIGNS.get(design).ok_or("no such design")?;
     flush_hf_tab(tab);
-    let is_header = top;
     let (section, variant) = target_for(tab, is_header);
     if let Some(other) = resolved_part(tab, section, !is_header, variant) {
         strip_part(tab, &other, !is_header);
@@ -229,8 +304,8 @@ pub(crate) fn place(tab: &mut DocTab, top: bool, design: usize) -> Result<(), St
         }
         _ => String::new(),
     };
-    let number = page_number_sdt_xml(d, top, sdt_id());
-    let inner = if top {
+    let number = number(tab, section);
+    let inner = if is_header {
         format!("{number}{rest}")
     } else {
         format!("{rest}{number}")
@@ -240,8 +315,6 @@ pub(crate) fn place(tab: &mut DocTab, top: bool, design: usize) -> Result<(), St
     }
     set_content(tab, section, is_header, variant, &inner)?;
     reopen(tab, section, is_header, variant);
-    let gallery = if top { "Top of Page" } else { "Bottom of Page" };
-    tab.status = format!("Page number: {gallery}, {}", d.name).into();
     Ok(())
 }
 
@@ -515,10 +588,15 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) {
         match act {
-            PnAct::Place { top, design } => {
+            PnAct::Place { .. } | PnAct::Margin { .. } => {
                 let was_open = self.hf_active();
                 if let Some(tab) = self.tabs.get_mut(self.active) {
-                    if let Err(e) = place(tab, top, design) {
+                    let placed = match act {
+                        PnAct::Place { top, design } => place(tab, top, design),
+                        PnAct::Margin { design } => place_margin(tab, design),
+                        _ => Ok(()),
+                    };
+                    if let Err(e) = placed {
                         tab.status = e.into();
                     }
                 }
