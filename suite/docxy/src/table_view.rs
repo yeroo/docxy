@@ -47,6 +47,9 @@ pub struct CellBox {
     pub width: u32,
     /// A `continue` part of a vertical merge: drawn empty, no top edge.
     pub continues: bool,
+    /// The first part of a vertical merge: its content runs on down over
+    /// the merged rows.
+    pub merges_down: bool,
     pub fill: Option<u32>,
     pub top: Option<Line>,
     pub left: Option<Line>,
@@ -71,12 +74,19 @@ pub struct RowBox {
 /// A row's `w:trHeight`: twips, and whether its rule is exact. An auto rule
 /// or a zero height sets none.
 fn row_height(row: &docxcore::model::Row) -> Option<(u32, bool)> {
-    let p = docxcore::table_props::row_trpr(&row.raw_props);
-    let h: u32 = p.attr("w:trHeight", "w:val")?.parse().ok()?;
-    match p.attr("w:trHeight", "w:hRule").as_deref() {
-        Some("auto") => None,
-        _ if h == 0 => None,
-        rule => Some((h, rule == Some("exact"))),
+    match docxcore::table_props::row_height(&row.raw_props)? {
+        (_, Some(rule)) if rule == "auto" => None,
+        (0, _) => None,
+        (h, rule) => Some((h, rule.as_deref() == Some("exact"))),
+    }
+}
+
+impl RowBox {
+    /// Whether a cell of this row is cut off at the row's edge: in an exact
+    /// height row, except a cell whose merge runs on down, whose content
+    /// belongs to the rows below too.
+    pub fn clips(&self, cell: &CellBox) -> bool {
+        matches!(self.height, Some((_, true))) && !cell.merges_down
     }
 }
 
@@ -114,6 +124,7 @@ pub fn layout(t: &Table, style: Option<&TableStyle>) -> Vec<RowBox> {
                         span: n,
                         width: span_w(s, n),
                         continues,
+                        merges_down: !continues && continued_below,
                         fill: look.fill.as_deref().and_then(crate::hex_rgb),
                         top: if continues { None } else { line(&look.top) },
                         left: line(&look.left),
@@ -185,6 +196,26 @@ mod tests {
             layout(&new_table(1, 1, 9000, AutoFit::Default), None)[0].height,
             None
         );
+    }
+
+    #[test]
+    fn an_exact_row_clips_its_cells_but_not_a_merge_running_down() {
+        let mut t = new_table(2, 2, 9000, AutoFit::Default);
+        t.rows[0].raw_props =
+            vec!["<w:trPr><w:trHeight w:val=\"400\" w:hRule=\"exact\"/></w:trPr>".into()];
+        t.rows[0].cells[0].v_merge = VMerge::Restart;
+        t.rows[1].cells[0].v_merge = VMerge::Continue;
+        let rows = layout(&t, None);
+        assert!(!rows[0].clips(&rows[0].cells[0]), "the merge runs on down");
+        assert!(rows[0].clips(&rows[0].cells[1]));
+        assert!(
+            !rows[1].clips(&rows[1].cells[1]),
+            "an unset height clips nothing"
+        );
+        // An at-least row grows instead.
+        t.rows[0].raw_props = vec!["<w:trPr><w:trHeight w:val=\"400\"/></w:trPr>".into()];
+        let rows = layout(&t, None);
+        assert!(!rows[0].clips(&rows[0].cells[1]));
     }
 
     #[test]

@@ -956,11 +956,20 @@ impl Docxy {
         if self.draw_tool().is_none() || covered || !self.on_page(at) {
             return false;
         }
+        // With a header or footer open, only its area takes the pen.
+        let story = self
+            .draw_geom
+            .borrow()
+            .on_screen()
+            .story_at(self.hf_active(), at);
+        let Some(hf) = story else {
+            return false;
+        };
         self.mini_bar = None;
         self.draw_drag = Some(Drag {
             from: at,
             to: at,
-            hf: self.hf_active(),
+            hf,
         });
         true
     }

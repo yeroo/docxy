@@ -75,12 +75,12 @@ pub struct Drag {
 }
 
 /// One table row as laid out: window px, and its cells as
-/// `(first grid column, span, a vertical-merge continuation)`.
+/// `(first grid column, span)`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowGeom {
     pub top: f32,
     pub bottom: f32,
-    pub cells: Vec<(usize, usize, bool)>,
+    pub cells: Vec<(usize, usize)>,
 }
 
 /// One table as laid out.
@@ -100,11 +100,11 @@ pub struct TableGeom {
 
 impl TableGeom {
     fn px(&self, tw: u32) -> f32 {
-        self.left + tw as f32 * self.zoom / 15.0
+        self.left + crate::tw_px(tw as i32, self.zoom)
     }
 
     fn tw(&self, x: f32) -> u32 {
-        ((x - self.left).max(0.0) * 15.0 / self.zoom).round() as u32
+        crate::px_tw((x - self.left).max(0.0), self.zoom).max(0) as u32
     }
 
     fn top(&self) -> f32 {
@@ -157,9 +157,25 @@ pub struct ParaGeom {
 pub struct Frame {
     pub tables: Vec<TableGeom>,
     pub paras: Vec<ParaGeom>,
+    /// The open header's or footer's area, `(x, y, w, h)`, on its edit page.
+    pub hf_regions: Vec<(f32, f32, f32, f32)>,
 }
 
 impl Frame {
+    /// The story a press at `at` draws in: the body, or with a header or
+    /// footer open (`hf_open`), that header or footer when the press is in
+    /// its area, and none elsewhere (the body takes no edit then, as it
+    /// takes no click).
+    pub fn story_at(&self, hf_open: bool, (x, y): (f32, f32)) -> Option<bool> {
+        if !hf_open {
+            return Some(false);
+        }
+        self.hf_regions
+            .iter()
+            .any(|&(rx, ry, rw, rh)| x >= rx && x < rx + rw && y >= ry && y < ry + rh)
+            .then_some(true)
+    }
+
     /// The innermost table of the story holding `at` (grown by `by` px).
     fn table_at(&self, hf: bool, at: (f32, f32), by: f32) -> Option<&TableGeom> {
         self.tables
@@ -209,7 +225,7 @@ impl DrawGeom {
     /// The frame on screen: `next`, or the one before when nothing has been
     /// recorded since the rotation.
     pub fn on_screen(&self) -> &Frame {
-        if self.next.tables.is_empty() && self.next.paras.is_empty() {
+        if self.next == Frame::default() {
             &self.last
         } else {
             &self.next
@@ -245,6 +261,11 @@ impl DrawGeom {
 
     pub fn para(&mut self, p: ParaGeom) {
         self.next.paras.push(p);
+    }
+
+    /// The open header's or footer's area was laid out.
+    pub fn hf_region(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        self.next.hf_regions.push((x, y, w, h));
     }
 }
 
@@ -316,7 +337,7 @@ fn pen(frame: &Frame, hf: bool, from: (f32, f32), to: (f32, f32), zoom: f32) -> 
         if dx < MIN_RECT || dy < MIN_RECT {
             return Gesture::Nothing;
         }
-        let tw = |p: f32| (p * 15.0 / zoom.max(f32::EPSILON)).round() as u32;
+        let tw = |p: f32| crate::px_tw(p, zoom.max(f32::EPSILON)).max(0) as u32;
         return Gesture::NewTable {
             w_tw: tw(dx),
             h_tw: tw(dy),
@@ -341,7 +362,7 @@ fn pen(frame: &Frame, hf: bool, from: (f32, f32), to: (f32, f32), zoom: f32) -> 
         let Some(row) = t.row_at(y) else {
             return Gesture::Nothing;
         };
-        let at = ((y - t.rows[row].top) * 15.0 / t.zoom).round() as u32;
+        let at = crate::px_tw(y - t.rows[row].top, t.zoom).max(0) as u32;
         return Gesture::Line {
             table,
             line: DrawnLine::Across { row, x0, x1, at },
@@ -396,7 +417,7 @@ fn eraser(frame: &Frame, hf: bool, at: (f32, f32)) -> Gesture {
         edge,
     };
     if let Some(r) = t.row_at(y.clamp(t.top(), t.bottom() - 0.01)) {
-        for &(s, n, _) in &t.rows[r].cells {
+        for &(s, n) in &t.rows[r].cells {
             for col in [s, s + n] {
                 if let Some(&b) = t.grid.get(col) {
                     near.push((
@@ -439,12 +460,12 @@ mod tests {
                 RowGeom {
                     top: 100.0,
                     bottom: 130.0,
-                    cells: vec![(0, 1, false), (1, 1, false)],
+                    cells: vec![(0, 1), (1, 1)],
                 },
                 RowGeom {
                     top: 130.0,
                     bottom: 160.0,
-                    cells: vec![(0, 1, false), (1, 1, false)],
+                    cells: vec![(0, 1), (1, 1)],
                 },
             ],
             zoom: 1.0,
@@ -454,6 +475,7 @@ mod tests {
     fn frame(tables: Vec<TableGeom>) -> Frame {
         Frame {
             tables,
+            hf_regions: Vec::new(),
             paras: vec![
                 ParaGeom {
                     hf: false,
@@ -641,7 +663,7 @@ mod tests {
             rows: vec![RowGeom {
                 top: 105.0,
                 bottom: 125.0,
-                cells: vec![(0, 1, false), (1, 1, false)],
+                cells: vec![(0, 1), (1, 1)],
             }],
             ..two_by_two()
         };
@@ -692,6 +714,32 @@ mod tests {
         // In a cell's middle, far from every line.
         assert_eq!(er((100.0, 115.0)), Gesture::Nothing);
         assert_eq!(er((400.0, 400.0)), Gesture::Nothing);
+    }
+
+    #[test]
+    fn with_a_header_open_only_its_area_takes_the_pen() {
+        let mut f = frame(vec![two_by_two()]);
+        f.hf_regions.push((50.0, 10.0, 600.0, 40.0));
+        f.paras.push(ParaGeom {
+            hf: true,
+            block: 0,
+            x: 50.0,
+            y: 20.0,
+            w: 600.0,
+            h: 20.0,
+        });
+        // No header open: the body, wherever.
+        assert_eq!(f.story_at(false, (100.0, 30.0)), Some(false));
+        // Open: its area is the header's; the body takes nothing.
+        assert_eq!(f.story_at(true, (100.0, 30.0)), Some(true));
+        assert_eq!(f.story_at(true, (100.0, 300.0)), None);
+        assert_eq!(f.story_at(true, (80.0, 110.0)), None, "a body table");
+        // In the header, a new table goes after the header's paragraph.
+        assert_eq!(f.para_for(true, (100.0, 45.0)), Some(0));
+        assert!(matches!(
+            classify(&f, true, Tool::Pen, (80.0, 12.0), (200.0, 48.0), 1.0),
+            Gesture::NewTable { .. }
+        ));
     }
 
     #[test]

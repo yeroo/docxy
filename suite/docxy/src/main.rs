@@ -29596,11 +29596,7 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
                 .map(|rb| table_draw::RowGeom {
                     top: 0.0,
                     bottom: 0.0,
-                    cells: rb
-                        .cells
-                        .iter()
-                        .map(|cb| (cb.start, cb.span, cb.continues))
-                        .collect(),
+                    cells: rb.cells.iter().map(|cb| (cb.start, cb.span)).collect(),
                 })
                 .collect(),
             zoom: ctx.zoom,
@@ -29630,6 +29626,10 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
     for (ri, rb) in boxes.iter().enumerate() {
         let row = &t.rows[ri];
         let mut cells: Vec<AnyElement> = Vec::new();
+        // Strips placed on the row, not in a cell, so an exact-height
+        // row's clipped cell never hides them: (x twips, width twips, column).
+        let mut column_strips: Vec<(u32, u32, usize)> = Vec::new();
+        let mut x_tw = rb.before;
         if rb.before > 0 {
             cells.push(div().flex_none().w(w(rb.before)).into_any_element());
         }
@@ -29719,6 +29719,8 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
                 a: 0.25,
                 ..ctx.pal.sel
             };
+            column_strips.push((x_tw, cb.width, cb.start));
+            x_tw += cb.width;
             let mut el = v_flex()
                 .relative()
                 .flex_none()
@@ -29736,7 +29738,8 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
                 .children(diagonals)
                 .when(is_selected, |d| {
                     d.child(div().absolute().size_full().top_0().left_0().bg(sel_bg))
-                });
+                })
+                .when(rb.clips(cb), |d| d.overflow_hidden());
             if selects {
                 // The cell's left edge selects the cell.
                 el = el.child(
@@ -29749,19 +29752,6 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
                         .cursor_pointer()
                         .on_mouse_down(MouseButton::Left, click(TableClick::Cell(ri, cb.cell))),
                 );
-                // The strip above the first row selects the column.
-                if ri == 0 {
-                    el = el.child(
-                        div()
-                            .absolute()
-                            .top(px(-6.))
-                            .left_0()
-                            .right_0()
-                            .h(px(6.))
-                            .cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, click(TableClick::Column(cb.start))),
-                    );
-                }
             }
             cells.push(el.into_any_element());
         }
@@ -29771,7 +29761,7 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
             .flex_row()
             .items_stretch()
             .map(|d| match rb.height {
-                Some((h, true)) => d.h(w(h)).overflow_hidden(),
+                Some((h, true)) => d.h(w(h)),
                 Some((h, false)) => d.min_h(w(h)),
                 None => d,
             })
@@ -29792,6 +29782,21 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
                 .left_0()
                 .size_full(),
             );
+        }
+        if selects && ri == 0 {
+            // The strip above the first row selects the column.
+            for (x, width, col) in column_strips {
+                row_el = row_el.child(
+                    div()
+                        .absolute()
+                        .top(px(-6.))
+                        .left(w(x))
+                        .w(w(width))
+                        .h(px(6.))
+                        .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, click(TableClick::Column(col))),
+                );
+            }
         }
         if selects {
             // The selection bar left of the row selects the row.
@@ -35299,8 +35304,30 @@ impl Render for Docxy {
                                     .pr(tw(sb.right))
                                     .bg(hdr_bg)
                                     .children(hdr_children);
+                                // A table pen (#763) draws into the open header or
+                                // footer only from inside its area.
+                                let hf_region = || {
+                                    tbl.draw.clone().map(|geom| {
+                                        gpui::canvas(
+                                            move |b: Bounds<Pixels>, _, _| {
+                                                geom.borrow_mut().hf_region(
+                                                    b.origin.x.into(),
+                                                    b.origin.y.into(),
+                                                    b.size.width.into(),
+                                                    b.size.height.into(),
+                                                );
+                                            },
+                                            |_, _, _, _| {},
+                                        )
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .size_full()
+                                    })
+                                };
                                 if edit_hdr_here {
                                     header = header
+                                        .when_some(hf_region(), |d, c| d.child(c))
                                         .border_b_1()
                                         .border_dashed()
                                         .border_color(hsla_u(0x5b8bd6))
@@ -35320,6 +35347,7 @@ impl Render for Docxy {
                                     .children(ftr_children);
                                 if edit_ftr_here {
                                     footer = footer
+                                        .when_some(hf_region(), |d, c| d.child(c))
                                         .border_t_1()
                                         .border_dashed()
                                         .border_color(hsla_u(0x5b8bd6))

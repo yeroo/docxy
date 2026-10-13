@@ -1839,10 +1839,8 @@ fn table_state(editor: &Editor) -> Json {
                 t.rows
                     .iter()
                     .map(|row| {
-                        docxcore::table_props::row_trpr(&row.raw_props)
-                            .attr("w:trHeight", "w:val")
-                            .and_then(|v| v.parse::<f64>().ok())
-                            .map_or(Json::Null, Json::Num)
+                        docxcore::table_props::row_height(&row.raw_props)
+                            .map_or(Json::Null, |(h, _)| Json::Num(h as f64))
                     })
                     .collect(),
             ),
@@ -1878,10 +1876,10 @@ fn row_vmerge(row: &docxcore::model::Row) -> Json {
     )
 }
 
-/// `table-draw`'s `from` and `to` as window points (see the verb).
 /// A window point, px.
 type WinPoint = (f32, f32);
 
+/// `table-draw`'s `from` and `to` as window points (see the verb).
 fn table_draw_points(app: &crate::Docxy, args: &Json) -> Result<(WinPoint, WinPoint), String> {
     let point = |key: &str| -> Result<(f32, f32), String> {
         let a = args
@@ -1915,7 +1913,7 @@ fn table_draw_points(app: &crate::Docxy, args: &Json) -> Result<(WinPoint, WinPo
                 )?;
             let top = t.rows.first().map_or(0.0, |r| r.top);
             let bottom = t.rows.last().map_or(0.0, |r| r.bottom);
-            let w = t.grid.last().copied().unwrap_or(0) as f32 * t.zoom / 15.0;
+            let w = crate::tw_px(t.grid.last().copied().unwrap_or(0) as i32, t.zoom);
             (t.left, top, w, bottom - top)
         }
         "page" => {
