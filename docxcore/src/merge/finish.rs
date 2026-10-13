@@ -369,6 +369,12 @@ fn strip_marker_xml(raw: &str) -> String {
 /// their content on save). A container holding one keeps all but the
 /// marker; nothing that holds text is dropped.
 fn strip_ids(blocks: &mut Vec<Block>) {
+    /// Strip the markers from a raw XML entry; whether anything is left to
+    /// keep (an emptied entry is dropped).
+    fn strip_raw(raw: &mut String) -> bool {
+        *raw = strip_marker_xml(raw);
+        !raw.trim().is_empty()
+    }
     /// Whether anything was dropped or changed.
     fn inlines(items: &mut Vec<Inline>) -> bool {
         let mut changed = false;
@@ -413,10 +419,7 @@ fn strip_ids(blocks: &mut Vec<Block>) {
         changed
     }
     blocks.retain_mut(|b| match b {
-        Block::Raw(raw) => {
-            *raw = strip_marker_xml(raw);
-            !raw.trim().is_empty()
-        }
+        Block::Raw(raw) => strip_raw(raw),
         _ => true,
     });
     for b in blocks {
@@ -427,23 +430,16 @@ fn strip_ids(blocks: &mut Vec<Block>) {
             Block::Table(t) => {
                 // Bookmarks and comment ranges between rows.
                 t.row_boundaries.retain_mut(|b| match &mut b.kind {
-                    crate::model::TableRowBoundaryKind::Raw(raw) => {
-                        *raw = strip_marker_xml(raw);
-                        !raw.trim().is_empty()
-                    }
+                    crate::model::TableRowBoundaryKind::Raw(raw) => strip_raw(raw),
                     _ => true,
                 });
                 // And between cells (#1215).
-                let strip = |raw: &mut String| {
-                    *raw = strip_marker_xml(raw);
-                    !raw.trim().is_empty()
-                };
                 for row in &mut t.rows {
                     for cell in &mut row.cells {
-                        cell.raw_before.retain_mut(strip);
+                        cell.raw_before.retain_mut(strip_raw);
                         strip_ids(&mut cell.blocks);
                     }
-                    row.raw_end.retain_mut(strip);
+                    row.raw_end.retain_mut(strip_raw);
                 }
             }
             Block::SectionProperties(_) | Block::Raw(_) => {}
