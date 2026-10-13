@@ -29739,7 +29739,7 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
                 .when(is_selected, |d| {
                     d.child(div().absolute().size_full().top_0().left_0().bg(sel_bg))
                 })
-                .when(rb.clips(cb), |d| d.overflow_hidden());
+                .when(rb.exact(), |d| d.overflow_hidden());
             if selects {
                 // The cell's left edge selects the cell.
                 el = el.child(
@@ -29761,8 +29761,8 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
             .flex_row()
             .items_stretch()
             .map(|d| match rb.height {
-                Some((h, true)) => d.h(w(h)),
-                Some((h, false)) => d.min_h(w(h)),
+                Some((h, _)) if rb.exact() => d.h(w(h)),
+                Some((h, _)) => d.min_h(w(h)),
                 None => d,
             })
             .children(cells);
@@ -35706,7 +35706,7 @@ impl Render for Docxy {
                     if phase == DispatchPhase::Capture
                         && ev.button == MouseButton::Left
                         && down.update(cx, |this, cx| {
-                            let took = this.draw_press(at(ev.position));
+                            let took = this.draw_press(at(ev.position)).is_ok();
                             if took {
                                 cx.notify();
                             }
@@ -35843,13 +35843,15 @@ impl Render for Docxy {
             .when_some(ruler, |d, r| d.child(r))
             .child(body)
             .child(status)
+            // Under every overlay: the pen's crosshair and preview are the
+            // page's, and what is drawn over the page keeps its own cursor.
+            .when_some(self.draw_overlay(), |d, o| d.child(o))
             .when_some(mini_bar, |d, m| d.child(m))
             // Under the menu: a menu opened from the flyout draws over it.
             .when_some(ribbon_flyout, |d, f| d.child(f))
             .when_some(context_menu, |d, m| d.child(m))
             .when_some(tab_popup, |d, popup| d.child(popup))
             .when_some(dialog, |d, dialog| d.child(dialog))
-            .when_some(self.draw_overlay(), |d, o| d.child(o))
             // A vertical guide line down the page while a ruler marker is dragged.
             .when_some(self.ruler_guide, |d, gx| {
                 d.child(

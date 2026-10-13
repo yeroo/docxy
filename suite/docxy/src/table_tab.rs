@@ -891,6 +891,9 @@ impl Docxy {
         self.cancel_pointer_modes();
         self.table_draw = mode;
         self.draw_drag = None;
+        // The pen makes no selection, so no mini toolbar comes up over the
+        // page while it is on.
+        self.mini_bar = None;
         let on = DrawMode::click(&mut self.table_draw, tool, self.active);
         self.set_status(if on { tool.status() } else { DRAW_OFF });
         self.refocus(window, cx);
@@ -944,17 +947,31 @@ impl Docxy {
             .collect()
     }
 
-    /// A left press with a pen on: true when it lands on the page and starts
-    /// a gesture, which the press then belongs to alone. Under a dialog or a
-    /// menu, or off the page, the press is left to the rest of the window.
-    pub(crate) fn draw_press(&mut self, at: (f32, f32)) -> bool {
-        let covered = self.menu.is_some()
-            || self
+    /// A left press with a pen on: `Ok` when it lands on the page and starts
+    /// a gesture, which the press then belongs to alone. Under anything drawn
+    /// over the page (a menu, the ribbon flyout, the tab popup, a dialog, the
+    /// File view), off the page, or with a header or footer open, outside
+    /// its area, the press is left to the rest of the window, and the reason
+    /// says which.
+    pub(crate) fn draw_press(&mut self, at: (f32, f32)) -> Result<(), &'static str> {
+        if self.draw_tool().is_none() {
+            return Err(table_draw::NO_PEN);
+        }
+        let overlays = table_draw::Overlays {
+            menu: self.menu.is_some(),
+            ribbon_flyout: self.ribbon_flyout.is_some(),
+            tab_popup: self.tab_more_open,
+            dialog: self
                 .tabs
                 .get(self.active)
-                .is_none_or(|t| t.dialogs.is_open());
-        if self.draw_tool().is_none() || covered || !self.on_page(at) {
-            return false;
+                .is_none_or(|t| t.dialogs.is_open()),
+            backstage: self.backstage,
+        };
+        if overlays.cover_page() {
+            return Err(table_draw::COVERED);
+        }
+        if !self.on_page(at) {
+            return Err(table_draw::OFF_PAGE);
         }
         // With a header or footer open, only its area takes the pen.
         let story = self
@@ -962,16 +979,14 @@ impl Docxy {
             .borrow()
             .on_screen()
             .story_at(self.hf_active(), at);
-        let Some(hf) = story else {
-            return false;
-        };
+        let hf = story.ok_or(table_draw::OUTSIDE_HF)?;
         self.mini_bar = None;
         self.draw_drag = Some(Drag {
             from: at,
             to: at,
             hf,
         });
-        true
+        Ok(())
     }
 
     /// The pointer moved during a pen gesture: the preview follows it.
@@ -1000,7 +1015,8 @@ impl Docxy {
 
     /// Read the gesture `d` on the frame on screen and run it: the edit on
     /// the edited story, its status text or its refusal on the status line.
-    /// The mode stays on, as in Word, until Esc.
+    /// A gesture leaves the mode on, as in Word; a refusal in Protected View
+    /// or a final document ends it.
     pub(crate) fn draw_gesture(
         &mut self,
         d: Drag,
@@ -1099,25 +1115,20 @@ impl Docxy {
 const DRAW_OFF: &str = "Drawing off";
 
 /// Run a pen gesture on `ed`, one undo step; a new table goes after the
-/// top-level paragraph `para` (the one the rectangle was drawn from), so a
-/// drawn table never splits a paragraph.
+/// top-level paragraph `para` (the one the rectangle was drawn from), never
+/// inside or before it, so it never splits a paragraph or joins a table.
 fn draw_on(ed: &mut Editor, gesture: Gesture, para: Option<usize>) -> Result<String, String> {
     let mut result = Ok(String::new());
     match gesture {
         Gesture::Nothing => {}
         Gesture::Refused(why) => result = Err(why.to_string()),
-        Gesture::NewTable { w_tw, h_tw } => {
-            if let Some((b, Block::Paragraph(p))) =
-                para.and_then(|b| Some((b, ed.doc.body.get(b)?)))
-            {
-                let end = docxcore::editor::para_text_len(p);
-                ed.anchor = None;
-                ed.caret = Caret::at(vec![b], end);
-            }
-            ed.one_step("Draw Table", |e| {
-                result = e.draw_table(w_tw, h_tw).map(|()| "Table drawn".into());
-            });
-        }
+        Gesture::NewTable { w_tw, h_tw } => ed.one_step("Draw Table", |e| {
+            let drawn = match para {
+                Some(b) => e.draw_table_after(&[b], w_tw, h_tw),
+                None => e.draw_table(w_tw, h_tw),
+            };
+            result = drawn.map(|()| "Table drawn".into());
+        }),
         Gesture::Line { table, line } => ed.one_step("Draw Table", |e| {
             result = e
                 .draw_table_line(&table, line)

@@ -4692,9 +4692,7 @@ fn dispatch_verb(
             refuse_under_cover(app)?;
             let (from, to) = table_draw_points(app, args)?;
             app.draw_tool().ok_or("no table pen is on")?;
-            if !app.draw_press(from) {
-                return Err("the press is not on the page".into());
-            }
+            app.draw_press(from)?;
             app.draw_move(to);
             let drag = app.draw_drag.take().ok_or("the gesture did not start")?;
             let status = app.draw_gesture(drag, window, cx)?;

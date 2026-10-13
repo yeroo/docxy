@@ -82,11 +82,13 @@ fn row_height(row: &docxcore::model::Row) -> Option<(u32, bool)> {
 }
 
 impl RowBox {
-    /// Whether a cell of this row is cut off at the row's edge: in an exact
-    /// height row, except a cell whose merge runs on down, whose content
-    /// belongs to the rows below too.
-    pub fn clips(&self, cell: &CellBox) -> bool {
-        matches!(self.height, Some((_, true))) && !cell.merges_down
+    /// Whether the row is drawn at exactly its set height, its cells cut off
+    /// at its edges. A row starting a vertical merge grows to fit instead,
+    /// as every row did before the view drew heights: the merged cell's
+    /// content is drawn in this row alone, and one row's exact height would
+    /// cut it off or spill it over the rows around.
+    pub fn exact(&self) -> bool {
+        matches!(self.height, Some((_, true))) && !self.cells.iter().any(|c| c.merges_down)
     }
 }
 
@@ -199,23 +201,29 @@ mod tests {
     }
 
     #[test]
-    fn an_exact_row_clips_its_cells_but_not_a_merge_running_down() {
-        let mut t = new_table(2, 2, 9000, AutoFit::Default);
-        t.rows[0].raw_props =
-            vec!["<w:trPr><w:trHeight w:val=\"400\" w:hRule=\"exact\"/></w:trPr>".into()];
+    fn an_exact_row_is_exact_unless_a_merge_starts_in_it() {
+        let exact = "<w:trPr><w:trHeight w:val=\"400\" w:hRule=\"exact\"/></w:trPr>";
+        let mut t = new_table(3, 2, 9000, AutoFit::Default);
+        for row in &mut t.rows {
+            row.raw_props = vec![exact.into()];
+        }
+        let rows = layout(&t, None);
+        assert!(rows.iter().all(RowBox::exact));
+        // A merge from row 0 down over row 1: row 0 grows to fit; row 1,
+        // which only continues it, stays exact.
         t.rows[0].cells[0].v_merge = VMerge::Restart;
         t.rows[1].cells[0].v_merge = VMerge::Continue;
         let rows = layout(&t, None);
-        assert!(!rows[0].clips(&rows[0].cells[0]), "the merge runs on down");
-        assert!(rows[0].clips(&rows[0].cells[1]));
-        assert!(
-            !rows[1].clips(&rows[1].cells[1]),
-            "an unset height clips nothing"
-        );
-        // An at-least row grows instead.
-        t.rows[0].raw_props = vec!["<w:trPr><w:trHeight w:val=\"400\"/></w:trPr>".into()];
+        assert!(rows[0].cells[0].merges_down);
+        assert!(!rows[0].exact(), "the merge's first row grows");
+        assert!(rows[1].exact());
+        assert!(rows[2].exact());
+        // An at-least row or an unset height is never exact.
+        t.rows[2].raw_props = vec!["<w:trPr><w:trHeight w:val=\"400\"/></w:trPr>".into()];
+        t.rows[1].raw_props.clear();
         let rows = layout(&t, None);
-        assert!(!rows[0].clips(&rows[0].cells[1]));
+        assert!(!rows[1].exact());
+        assert!(!rows[2].exact());
     }
 
     #[test]

@@ -74,6 +74,29 @@ pub struct Drag {
     pub hf: bool,
 }
 
+/// What the window draws over the page: while any of it is up, a press goes
+/// to it, not to the pen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Overlays {
+    pub menu: bool,
+    pub ribbon_flyout: bool,
+    pub tab_popup: bool,
+    pub dialog: bool,
+    pub backstage: bool,
+}
+
+impl Overlays {
+    pub fn cover_page(self) -> bool {
+        self.menu || self.ribbon_flyout || self.tab_popup || self.dialog || self.backstage
+    }
+}
+
+/// Why a press did not start a pen gesture.
+pub const NO_PEN: &str = "no table pen is on";
+pub const COVERED: &str = "a menu, popup or dialog covers the page";
+pub const OFF_PAGE: &str = "the press is not on the page";
+pub const OUTSIDE_HF: &str = "the press is outside the open header/footer";
+
 /// One table row as laid out: window px, and its cells as
 /// `(first grid column, span)`.
 #[derive(Clone, Debug, PartialEq)]
@@ -290,7 +313,7 @@ pub fn preview(d: Drag, in_table: bool) -> ((f32, f32), (f32, f32)) {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Gesture {
     /// A one-cell table of this size (twips), after the paragraph under the
-    /// press.
+    /// press (or the last one above it): never inside or before it.
     NewTable {
         w_tw: u32,
         h_tw: u32,
@@ -519,6 +542,35 @@ mod tests {
         });
         assert!(DrawMode::click(&mut m, Tool::Pen, 0));
         assert_eq!(m.map(|m| m.tab), Some(0));
+    }
+
+    #[test]
+    fn every_overlay_covers_the_page() {
+        assert!(!Overlays::default().cover_page());
+        for o in [
+            Overlays {
+                menu: true,
+                ..Default::default()
+            },
+            Overlays {
+                ribbon_flyout: true,
+                ..Default::default()
+            },
+            Overlays {
+                tab_popup: true,
+                ..Default::default()
+            },
+            Overlays {
+                dialog: true,
+                ..Default::default()
+            },
+            Overlays {
+                backstage: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(o.cover_page(), "{o:?}");
+        }
     }
 
     #[test]

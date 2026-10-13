@@ -445,11 +445,16 @@ table as the frame on screen drew it, or with `"frac": true`, fractions of
 its width and height. The pens read the geometry a frame drew with the pen
 on, so settle one (`shot window`) after turning a pen on and after each edit.
 A rectangle off every table draws a one-cell table after the paragraph it
-starts on; a drag inside a table draws a vertical line, a line across a row or
-one on a row boundary; the eraser takes the line nearest the press. The reply
-is `{status, state}`; a refused gesture (the outer border, cells that do not
-line up) is an error with the reason, and a click that draws nothing replies
-with an empty `status`. `word-tables-draw.uit` drives it.
+starts on (or the last one above it), never inside or before it, and a
+paragraph always follows the table; a drag inside a table draws a vertical
+line, a line across a row or one on a row boundary; the eraser takes the line
+nearest the press. The reply is `{status, state}`; a refused gesture (the
+outer border, cells that do not line up) is an error with the reason, and a
+click that draws nothing replies with an empty `status`. A press the pen does
+not take is an error too: `the press is not on the page`, `a menu, popup or
+dialog covers the page`, or, with a header or footer open, `the press is
+outside the open header/footer` (the pen draws into the open header or footer
+only from inside its area). `word-tables-draw.uit` drives it.
 
 `ruler` reports the last painted ruler geometry in logical pixels rounded to
 0.1: `first_offset`, `left_offset`, and `right_offset` are marker distances from

@@ -111,3 +111,23 @@ test a pen ends with another command, a tab switch or typing (763)
   assert view.draw is pen
   type x
   assert view.draw is null
+
+test a table drawn under a table goes after the paragraph between them (763)
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call table-grid {"cols":2,"rows":2,"click":true}
+  assert table.rows is 2
+  call ribbon-click {"tab":"Table Layout","command":"draw-table"}
+  assert view.draw is pen
+  shot window
+  # Below the table and its empty paragraph.
+  call table-draw {"from":[40,200],"to":[240,260]}
+  assert reply.status is Table drawn
+  assert table.rows is 1
+  assert table.columns is 1
+  # Left from the new table's cell is the paragraph, not the first table.
+  key escape
+  key left
+  assert table is null
+  key left
+  assert table.rows is 2
