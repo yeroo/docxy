@@ -622,24 +622,8 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) {
         match act {
-            PnAct::Place { .. } | PnAct::Margin { .. } => {
-                let was_open = self.hf_active();
-                if let Some(tab) = self.tabs.get_mut(self.active) {
-                    let placed = match act {
-                        PnAct::Place { top, design } => place(tab, top, design),
-                        PnAct::Margin { design } => place_margin(tab, design),
-                        _ => Ok(()),
-                    };
-                    if let Err(e) = placed {
-                        tab.status = e.into();
-                    }
-                }
-                if !was_open && self.hf_active() {
-                    self.page_view = true;
-                    self.ribbon_tab = RibbonTab::HeaderFooter;
-                }
-                self.scroll_to_hf();
-            }
+            PnAct::Place { top, design } => self.place_number(|tab| place(tab, top, design)),
+            PnAct::Margin { design } => self.place_number(|tab| place_margin(tab, design)),
             PnAct::Current { design } => {
                 if CURRENT[design].1 {
                     self.insert_page_x_of_y(window, cx);
@@ -666,6 +650,23 @@ impl Docxy {
             }
         }
         self.refocus(window, cx);
+    }
+
+    /// Place a number in the active tab's header or footer with `put`,
+    /// then show the area it opened: Print Layout, the contextual tab and a
+    /// scroll to it.
+    fn place_number(&mut self, put: impl FnOnce(&mut DocTab) -> Result<(), String>) {
+        let was_open = self.hf_active();
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            if let Err(e) = put(tab) {
+                tab.status = e.into();
+            }
+        }
+        if !was_open && self.hf_active() {
+            self.page_view = true;
+            self.ribbon_tab = RibbonTab::HeaderFooter;
+        }
+        self.scroll_to_hf();
     }
 
     /// Current Position › Page X of Y: "Page {PAGE} of {NUMPAGES}" at the caret.

@@ -849,6 +849,25 @@ fn emit_band<'b>(
     (band, groups)
 }
 
+/// A frame's content width in twips as this exporter draws it, for a frame
+/// with no `w` (Word sizes it to its content): the longest line's printed
+/// characters plus one, at the monospace advance of each paragraph's size.
+fn content_w(g: &crate::frame::FrameGroup, opts: &PdfOptions) -> i32 {
+    if g.frame.w.is_some_and(|w| w > 0) {
+        return 0; // frame_rect takes `w`.
+    }
+    g.paras
+        .iter()
+        .map(|(_, p)| {
+            let size = heading_size(p, opts.base_font_size);
+            let segs = flatten_segments(p, p.props.heading_level.is_some(), &opts.styles);
+            let chars = segs.iter().map(|s| s.cells.len()).max().unwrap_or(0) + 1;
+            (chars as f32 * 0.6 * size * 20.0).ceil() as i32
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// Lay out each frame's paragraphs, stacked, at its rectangle on the page
 /// ([`crate::frame::frame_rect`]); `page_h` turns its top-down twips into
 /// the PDF's bottom-up points.
@@ -861,7 +880,7 @@ fn emit_frames(
     let mut out = BandFlow::new(0.0, 0.0, 0.0);
     let pt = |t: i32| t as f32 / 20.0;
     for g in groups {
-        let r = crate::frame::frame_rect(g.frame, geom, g.content_w(), g.content_h());
+        let r = crate::frame::frame_rect(g.frame, geom, content_w(g, opts), g.content_h());
         let mut one = BandFlow::new(pt(r.x), pt(r.w), page_h - pt(r.y));
         for (_, p) in &g.paras {
             emit_paragraph(&mut one, p, opts);
@@ -3139,6 +3158,32 @@ mod tests {
             "the number {ny} on the footer's line {fy}"
         );
         assert!(close(fx, 72.0) && nx > 500.0, "right of the margin: {nx}");
+    }
+
+    /// A frame with no `w` is as wide as its text: one line, flush right
+    /// against the margin when it says `xAlign="right"`.
+    #[test]
+    fn a_frame_with_no_width_fits_its_text_on_one_line() {
+        let xml = r#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:pPr><w:framePr w:wrap="around" w:hAnchor="margin" w:vAnchor="page" w:xAlign="right" w:y="7200"/></w:pPr><w:r><w:t>CONFIDENTIAL DRAFT</w:t></w:r></w:p><w:p/></w:hdr>"#;
+        let header = crate::load::parse_header_footer(xml, &Default::default());
+        let opts = with_parts(&[("rH", "header1.xml", header)]);
+        let d = three_pages(
+            r#"<w:sectPr><w:headerReference w:type="default" r:id="rH"/><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:bottom="1440" w:left="1440" w:right="1440" w:header="720" w:footer="720"/></w:sectPr>"#,
+        );
+        let page = &pages_of(&d, &opts)[0];
+        let line: Vec<_> = page
+            .texts
+            .iter()
+            .filter(|(_, _, t)| t.contains("CONFIDENTIAL") || t.contains("DRAFT"))
+            .collect();
+        let ys: Vec<f32> = line.iter().map(|(_, y, _)| *y).collect();
+        assert!(ys.iter().all(|y| close(*y, ys[0])), "one line: {line:?}");
+        // Ends at the right margin (540 pt), not wrapped and not at the left.
+        let (x, _, t) = line[0];
+        let size = opts.base_font_size;
+        let end = x + t.chars().count() as f32 * 0.6 * size;
+        assert!(*x > 300.0, "right-aligned: {line:?}");
+        assert!(end <= 540.5 && end > 540.0 - 0.6 * size * 2.0, "end {end}");
     }
 
     /// Enter in a framed number makes two paragraphs with the same frame:

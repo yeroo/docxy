@@ -4212,8 +4212,9 @@ fn dispatch_verb(
         }
         // Header/footer editing state (#641): which area of which section and
         // variant, its labels, and the contextual tab's Options and Position.
-        // `margin_frames`: where Print Layout drew framed header/footer
-        // paragraphs, a Page Margins number's (#767), from the last frame.
+        // `margin_frames`: where Print Layout drew the frames of framed
+        // header/footer paragraphs, a Page Margins number's (#767), from the
+        // last frame.
         "hf-state" => {
             let mut state = crate::hf_tab::hf_state(app.tabs.get(app.active));
             if let Json::Obj(fields) = &mut state {
@@ -4221,8 +4222,8 @@ fn dispatch_verb(
             }
             Done::ok(state)
         }
-        // A real double-click at the middle of a framed header/footer
-        // paragraph Print Layout drew (#767), by its index in
+        // A real double-click at the middle of a frame of header/footer
+        // paragraphs Print Layout drew (#767), by its index in
         // `hf-state.margin_frames`: through gpui's hit testing, so it shows
         // what the frame and the page under it do with it.
         "frame-double-click" => {

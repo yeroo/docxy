@@ -64,21 +64,6 @@ impl FrameGroup<'_> {
     pub fn content_h(&self) -> i32 {
         self.paras.iter().map(|(_, p)| line_height(p)).sum()
     }
-
-    /// The widest paragraph's estimated width, for a frame with no `w`
-    /// (Word sizes it to its content): half an em per character at the
-    /// paragraph's largest size, plus a character of slack.
-    pub fn content_w(&self) -> i32 {
-        self.paras
-            .iter()
-            .map(|(_, p)| {
-                // line_height is 1.2 em; half an em per character.
-                let half_em = line_height(p) * 5 / 12;
-                (p.plain_text().chars().count() as i32 + 1) * half_em
-            })
-            .max()
-            .unwrap_or(0)
-    }
 }
 
 /// A header or footer's blocks split into those its band flows (with the
@@ -123,12 +108,15 @@ pub fn line_height(p: &Paragraph) -> i32 {
 }
 
 /// The frame's rectangle on the page described by `g`, holding content
-/// `content_w` wide and `content_h` tall (see [`FrameGroup::content_w`]).
+/// `content_w` wide and `content_h` tall (see [`FrameGroup::content_h`]).
+/// The width is the caller's: each renderer measures its own text, so a
+/// frame with no `w` fits the way that renderer draws it.
 ///
 /// - Width: `w`, else the content's, at most the text width (the page less
 ///   its side margins).
-/// - Height: `h` when `hRule="exact"`, at least `h` when `atLeast`, else
-///   (`auto`, the default) the content's.
+/// - Height: `h` when `hRule="exact"`; the content's when `auto`; at least
+///   `h` when `atLeast` or, as Word and LibreOffice read it, when `h` is set
+///   with no `hRule`; the content's with no `h`.
 /// - Horizontal: measured from the page (`hAnchor="page"`), else from the
 ///   margins (`margin`, `text`, `column` and none: the suite's header and
 ///   footer bands are one column). `xAlign` wins over `x`, as the schema
@@ -147,8 +135,8 @@ pub fn frame_rect(f: &FramePr, g: &FrameGeom, content_w: i32, content_h: i32) ->
     let set_h = f.h.filter(|h| *h > 0);
     let h = match (f.h_rule.as_deref(), set_h) {
         (Some("exact"), Some(h)) => h,
-        (Some("atLeast"), Some(h)) => h.max(content_h),
-        _ => content_h,
+        (Some("auto"), _) | (_, None) => content_h,
+        (_, Some(h)) => h.max(content_h),
     }
     .max(1);
     let (ax, aw) = match f.h_anchor.as_deref() {
@@ -334,6 +322,13 @@ mod tests {
         let wide = frame_rect(&f, &G, 99_999, 264);
         assert_eq!(wide.w, 12240 - 1800 - 1080, "at most the text width");
         f.h = Some(400);
+        assert_eq!(
+            frame_rect(&f, &G, 0, 264).h,
+            400,
+            "h with no rule: at least"
+        );
+        assert_eq!(frame_rect(&f, &G, 0, 900).h, 900);
+        f.h_rule = Some("auto".into());
         assert_eq!(frame_rect(&f, &G, 0, 264).h, 264, "auto ignores h");
         f.h_rule = Some("atLeast".into());
         assert_eq!(frame_rect(&f, &G, 0, 264).h, 400);
@@ -446,8 +441,6 @@ mod tests {
             vec![vec![0, 1, 2], vec![3], vec![5]]
         );
         assert_eq!(groups[0].content_h(), 3 * 264);
-        // Empty paragraphs: one character of slack, half an em at 11 pt.
-        assert_eq!(groups[0].content_w(), 110);
         assert_eq!(groups[1].frame, &other);
     }
 }

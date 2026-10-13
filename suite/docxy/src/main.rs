@@ -5956,7 +5956,8 @@ struct RulerProbe {
     viewport: Option<ScreenRect>,
     draft_column: Option<ScreenRect>,
     pages: Vec<Option<ScreenRect>>,
-    /// Each framed header/footer paragraph drawn in Print Layout (#767).
+    /// Each frame of framed header/footer paragraphs drawn in Print
+    /// Layout (#767), one per frame group.
     frames: Vec<FrameProbe>,
     contents: Vec<Option<ScreenRect>>,
     ranges: Vec<Vec<(usize, usize)>>,
@@ -5966,7 +5967,8 @@ struct RulerProbe {
     painted: Option<HRulerGeom>,
 }
 
-/// A framed header/footer paragraph as Print Layout drew it (#767).
+/// A frame of framed header/footer paragraphs (one group: adjacent
+/// paragraphs with the same `w:framePr`) as Print Layout drew it (#767).
 #[derive(Clone, Copy, Debug)]
 struct FrameProbe {
     page: usize,
@@ -5996,20 +5998,14 @@ fn ruler_probe_el(
 }
 
 impl Docxy {
-    /// `hf-state`'s `margin_frames` (#767): each framed header/footer
-    /// paragraph the last Print Layout frame drew, in inches from its page
-    /// sheet's top-left corner: `page` (0-based, as `page-double-click`),
-    /// `area` (`header`/`footer`), `x`, `y`, `w`, `h`, the sheet's `page_w`,
-    /// and `side`: `left` or `right` when the frame lies wholly in that side
-    /// margin, else `text`.
-    /// The window point at the middle of the `index`th framed paragraph
-    /// the last Print Layout frame drew (`margin_frames`' order), if it lies
-    /// in the document's viewport.
+    /// The window point at the middle of the `index`th frame the last
+    /// Print Layout frame drew (`margin_frames`' order), if it lies in the
+    /// document's viewport.
     pub(crate) fn margin_frame_point(&self, index: usize) -> Result<(f32, f32), String> {
         let probe = self.ruler_probe.borrow();
         let f = probe.frames.get(index).ok_or_else(|| {
             format!(
-                "no framed paragraph {index} drawn ({} drawn): switch to Print Layout and shot first",
+                "no frame {index} drawn ({} drawn): switch to Print Layout and shot first",
                 probe.frames.len()
             )
         })?;
@@ -6019,12 +6015,19 @@ impl Docxy {
             .is_some_and(|v| x >= v.x && x < v.x + v.w && y >= v.y && y < v.y + v.h);
         if !seen {
             return Err(format!(
-                "framed paragraph {index} is not on screen (its middle is at {x}, {y})"
+                "frame {index} is not on screen (its middle is at {x}, {y})"
             ));
         }
         Ok((x, y))
     }
 
+    /// `hf-state`'s `margin_frames` (#767): each frame of framed
+    /// header/footer paragraphs the last Print Layout frame drew (one entry
+    /// per frame: adjacent paragraphs with the same `w:framePr` share one),
+    /// in inches from its page sheet's top-left corner: `page` (0-based, as
+    /// `page-double-click`), `area` (`header`/`footer`), `x`, `y`, `w`, `h`,
+    /// the sheet's `page_w`, and `side`: `left` or `right` when the frame
+    /// lies wholly in that side margin, else `text`.
     pub(crate) fn margin_frames(&self) -> ctlcore::json::Json {
         use ctlcore::json::Json;
         let probe = self.ruler_probe.borrow();
@@ -28918,7 +28921,6 @@ fn parse_hf_part(pkg: &Package, part_name: &str) -> Vec<Block> {
     docxcore::load::parse_header_footer(&String::from_utf8_lossy(xml), &rels)
 }
 
-/// Render header/footer blocks read-only (no caret, no click) for the page margins.
 /// A header or footer's band flow, read-only: its paragraphs, less the
 /// framed ones, which Print Layout draws at their frame.
 fn hf_els(blocks: &[Block], pal: Pal, meas: &Measurer, hf_width: f32) -> Vec<AnyElement> {
@@ -28930,6 +28932,48 @@ fn hf_els(blocks: &[Block], pal: Pal, meas: &Measurer, hf_width: f32) -> Vec<Any
             _ => None,
         })
         .collect()
+}
+
+/// A field's text size, px: its result's, as a run is drawn
+/// (`emit_words`), else `base`. The substring test keeps the parse off
+/// most fields, which this runs per field per frame.
+fn field_size(raw: &str, base: f32) -> f32 {
+    raw.contains("<w:sz ")
+        .then(|| docxcore::load::field_result_props(raw).size_half_pts)
+        .flatten()
+        .map_or(base, |h| h as f32 / 2.0 * 1.333)
+}
+
+/// A frame group's content width in twips, measured as `hf_para_el` draws
+/// it (zoom 1: 1 px = 15 twips), for a frame with no `w` (Word sizes it to
+/// its content): the widest paragraph, plus a space of slack.
+fn frame_content_w(g: &docxcore::frame::FrameGroup, meas: &Measurer) -> i32 {
+    if g.frame.w.is_some_and(|w| w > 0) {
+        return 0; // frame_rect takes `w`.
+    }
+    let base = 14.5;
+    let para_w = |p: &Paragraph| -> f32 {
+        let inlines: f32 = p
+            .content
+            .iter()
+            .map(|i| match i {
+                Inline::Run(r) => {
+                    let sz = r
+                        .props
+                        .size_half_pts
+                        .map_or(base, |h| h as f32 / 2.0 * 1.333);
+                    meas.width(&r.text, sz, r.props.bold, r.props.italic)
+                }
+                Inline::Field { raw, text } => {
+                    meas.width(text, field_size(raw, base), false, false)
+                }
+                other => meas.width(&other.text(), base, false, false),
+            })
+            .sum();
+        inlines + meas.width(" ", base, false, false)
+    };
+    let px = g.paras.iter().map(|(_, p)| para_w(p)).fold(0.0, f32::max);
+    (px * 15.0).ceil() as i32
 }
 
 /// One read-only header/footer paragraph at `width` px.
@@ -29355,11 +29399,11 @@ fn paragraph_el(
     let inline_w = |it: &Inline| -> f32 {
         match it {
             Inline::Run(r) => run_w(r),
-            Inline::Field { text, .. } => m
+            Inline::Field { raw, text } => m
                 .map(|m| {
                     m.width(
                         if text.is_empty() { "[field]" } else { text },
-                        base,
+                        field_size(raw, base),
                         false,
                         false,
                     )
@@ -29516,13 +29560,7 @@ fn paragraph_el(
                         } else {
                             pal.panel
                         })
-                        // At its result's size, as a run is drawn (`emit_words`);
-                        // the substring test keeps the parse off most fields.
-                        .text_size(px(raw
-                            .contains("<w:sz ")
-                            .then(|| docxcore::load::field_result_props(raw).size_half_pts)
-                            .flatten()
-                            .map_or(base, |h| h as f32 / 2.0 * 1.333)))
+                        .text_size(px(field_size(raw, base)))
                         .text_color(pal.fg)
                         .child(SharedString::from(shown))
                         .when_some(click.filter(|_| width == 1), |d, c| {
@@ -35662,7 +35700,7 @@ impl Render for Docxy {
                                         let r = docxcore::frame::frame_rect(
                                             g.frame,
                                             &geom,
-                                            g.content_w(),
+                                            frame_content_w(g, &measurer),
                                             g.content_h(),
                                         );
                                         let width = zoom * r.w.max(0) as f32 / 15.0;
