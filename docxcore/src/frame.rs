@@ -47,10 +47,13 @@ pub fn placed_frame(b: &Block) -> Option<&FramePr> {
     }
 }
 
+/// Blocks or paragraphs, each with its block index.
+pub type Indexed<'a, T> = Vec<(usize, &'a T)>;
+
 /// A header or footer's blocks split into those its band flows (with the
 /// content-control boundaries) and the framed paragraphs drawn at their
 /// frame, each with its block index (an editor path).
-pub fn split_framed(blocks: &[Block]) -> (Vec<(usize, &Block)>, Vec<(usize, &Paragraph)>) {
+pub fn split_framed(blocks: &[Block]) -> (Indexed<'_, Block>, Indexed<'_, Paragraph>) {
     let mut flow = Vec::new();
     let mut framed = Vec::new();
     for (i, b) in blocks.iter().enumerate() {
@@ -325,7 +328,6 @@ mod tests {
                 ..Default::default()
             },
             content: vec![Inline::Raw("<w:r><w:pict/></w:r>".into())],
-            ..Default::default()
         });
         let blocks = vec![
             Block::Raw("<w:sdt><w:sdtPr/><w:sdtContent>".into()),
