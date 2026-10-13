@@ -28928,56 +28928,91 @@ fn hf_els(blocks: &[Block], pal: Pal, meas: &Measurer, hf_width: f32) -> Vec<Any
         .0
         .into_iter()
         .filter_map(|(_, b)| match b {
-            Block::Paragraph(p) => Some(hf_para_el(p, pal, meas, hf_width)),
+            Block::Paragraph(p) => Some(hf_para_el(p, pal, meas, hf_width, 1.0)),
             _ => None,
         })
         .collect()
 }
 
-/// A field's text size, px: its result's, as a run is drawn
-/// (`emit_words`), else `base`. The substring test keeps the parse off
-/// most fields, which this runs per field per frame.
-fn field_size(raw: &str, base: f32) -> f32 {
+/// A field's text size, px at `zoom`: its result's, else `base` (already
+/// zoomed). The substring test keeps the parse off most fields, which this
+/// runs per field per frame.
+fn field_size(raw: &str, base: f32, zoom: f32) -> f32 {
     raw.contains("<w:sz ")
         .then(|| docxcore::load::field_result_props(raw).size_half_pts)
         .flatten()
-        .map_or(base, |h| h as f32 / 2.0 * 1.333)
+        .map_or(base, |h| zoom * h as f32 / 2.0 * 1.333)
 }
 
 /// A frame group's content width in twips, measured as `hf_para_el` draws
-/// it (zoom 1: 1 px = 15 twips), for a frame with no `w` (Word sizes it to
-/// its content): the widest paragraph, plus a space of slack.
-fn frame_content_w(g: &docxcore::frame::FrameGroup, meas: &Measurer) -> i32 {
+/// it at `zoom` (1 px = 15 / zoom twips), for a frame with no `w` (Word sizes
+/// it to its content): the widest paragraph, plus a space of slack.
+fn frame_content_w(g: &docxcore::frame::FrameGroup, meas: &Measurer, zoom: f32) -> i32 {
     if g.frame.w.is_some_and(|w| w > 0) {
         return 0; // frame_rect takes `w`.
     }
-    let base = 14.5;
     let para_w = |p: &Paragraph| -> f32 {
-        let inlines: f32 = p
-            .content
+        let base = para_base(p, zoom);
+        let items: f32 = flat_inlines(&p.content)
             .iter()
-            .map(|i| match i {
-                Inline::Run(r) => {
-                    let sz = r
-                        .props
-                        .size_half_pts
-                        .map_or(base, |h| h as f32 / 2.0 * 1.333);
-                    meas.width(&r.text, sz, r.props.bold, r.props.italic)
-                }
-                Inline::Field { raw, text } => {
-                    meas.width(text, field_size(raw, base), false, false)
-                }
-                other => meas.width(&other.text(), base, false, false),
-            })
+            .map(|(i, _)| inline_width(i, base, zoom, meas, None))
             .sum();
-        inlines + meas.width(" ", base, false, false)
+        items + meas.width(" ", base, false, false)
     };
     let px = g.paras.iter().map(|(_, p)| para_w(p)).fold(0.0, f32::max);
-    (px * 15.0).ceil() as i32
+    (px * 15.0 / zoom.max(0.01)).ceil() as i32
 }
 
-/// One read-only header/footer paragraph at `width` px.
-fn hf_para_el(p: &Paragraph, pal: Pal, meas: &Measurer, width: f32) -> AnyElement {
+/// A paragraph's base text size, px at `zoom`: its heading level's, else
+/// body text's (`paragraph_el` draws at it).
+fn para_base(p: &Paragraph, zoom: f32) -> f32 {
+    zoom * match p.props.heading_level {
+        Some(1) => 26.0,
+        Some(2) => 22.0,
+        Some(3) => 19.0,
+        Some(4) => 17.0,
+        Some(_) => 15.0,
+        None => 14.5,
+    }
+}
+
+/// The drawn width (px) of one inline of a paragraph whose base size is
+/// `base`, as `paragraph_el` draws it; inlines with no measured text are
+/// 0. Tab segments and frames with no `w` both use it.
+fn inline_width(
+    it: &Inline,
+    base: f32,
+    zoom: f32,
+    m: &Measurer,
+    cell_run: Option<&docxcore::table_styles::RunLook>,
+) -> f32 {
+    match it {
+        Inline::Run(r) => {
+            let props = shown_in(cell_run, r);
+            let sz = props
+                .size_half_pts
+                .map(|h| h as f32 / 2.0 * 1.333)
+                .unwrap_or(base);
+            m.width(&r.text, sz, props.bold, props.italic)
+        }
+        // Its shown text (`[field]` when it has none) and its 2 px padding
+        // each side.
+        Inline::Field { raw, text } => {
+            m.width(
+                if text.is_empty() { "[field]" } else { text },
+                field_size(raw, base, zoom),
+                false,
+                false,
+            ) + 4.0
+        }
+        Inline::FootnoteRef { id, .. } => m.width(&id.to_string(), base * 0.72, false, false),
+        _ => 0.0,
+    }
+}
+
+/// One read-only header/footer paragraph at `width` px, drawn at `zoom`
+/// (the band draws at 1; a frame at the view's zoom, as its box is).
+fn hf_para_el(p: &Paragraph, pal: Pal, meas: &Measurer, width: f32, zoom: f32) -> AnyElement {
     paragraph_el(
         p,
         None,
@@ -28985,7 +29020,7 @@ fn hf_para_el(p: &Paragraph, pal: Pal, meas: &Measurer, width: f32) -> AnyElemen
         None,
         None,
         false,
-        1.0,
+        zoom,
         pal,
         Some(meas),
         Some(width),
@@ -29326,15 +29361,7 @@ fn paragraph_el(
     cell_run: Option<&docxcore::table_styles::RunLook>,
 ) -> AnyElement {
     use docxcore::model::TabAlign;
-    let base = zoom
-        * match p.props.heading_level {
-            Some(1) => 26.0,
-            Some(2) => 22.0,
-            Some(3) => 19.0,
-            Some(4) => 17.0,
-            Some(_) => 15.0,
-            None => 14.5,
-        };
+    let base = para_base(p, zoom);
     let is_heading = p.props.heading_level.is_some();
     let mut spans: Vec<AnyElement> = Vec::new();
     let mut idx = 0usize;
@@ -29396,25 +29423,8 @@ fn paragraph_el(
     };
     // The rendered width of a single inline (for tracking x and looking ahead to
     // size centre/right tabs). Inlines with no measurable text contribute 0.
-    let inline_w = |it: &Inline| -> f32 {
-        match it {
-            Inline::Run(r) => run_w(r),
-            Inline::Field { raw, text } => m
-                .map(|m| {
-                    m.width(
-                        if text.is_empty() { "[field]" } else { text },
-                        field_size(raw, base),
-                        false,
-                        false,
-                    )
-                })
-                .unwrap_or(0.0),
-            Inline::FootnoteRef { id, .. } => m
-                .map(|m| m.width(&id.to_string(), base * 0.72, false, false))
-                .unwrap_or(0.0),
-            _ => 0.0,
-        }
-    };
+    let inline_w =
+        |it: &Inline| -> f32 { m.map_or(0.0, |m| inline_width(it, base, zoom, m, cell_run)) };
     // Total width of content from index `from` up to the next tab / break / end —
     // the segment a centre/right tab must position.
     let seg_width = |from: usize| -> f32 {
@@ -29560,7 +29570,7 @@ fn paragraph_el(
                         } else {
                             pal.panel
                         })
-                        .text_size(px(field_size(raw, base)))
+                        .text_size(px(field_size(raw, base, zoom)))
                         .text_color(pal.fg)
                         .child(SharedString::from(shown))
                         .when_some(click.filter(|_| width == 1), |d, c| {
@@ -35700,7 +35710,7 @@ impl Render for Docxy {
                                         let r = docxcore::frame::frame_rect(
                                             g.frame,
                                             &geom,
-                                            frame_content_w(g, &measurer),
+                                            frame_content_w(g, &measurer, zoom),
                                             g.content_h(),
                                         );
                                         let width = zoom * r.w.max(0) as f32 / 15.0;
@@ -35717,7 +35727,9 @@ impl Render for Docxy {
                                                         ..ctx
                                                     },
                                                 ),
-                                                None => hf_para_el(p, doc_pal, &measurer, width),
+                                                None => {
+                                                    hf_para_el(p, doc_pal, &measurer, width, zoom)
+                                                }
                                             }
                                         });
                                         let exact = g.frame.h_rule.as_deref() == Some("exact");
