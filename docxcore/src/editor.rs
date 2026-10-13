@@ -1638,7 +1638,16 @@ impl Editor {
     /// containers (e.g. body into a table cell) just collapses to the start.
     ///
     /// Over a cell range it empties the selected cells, as Word's Delete does.
+    ///
+    /// A picture or alignment tab the delete spans goes with it (#768).
     pub fn delete_selection(&mut self) -> bool {
+        self.delete_selection_with(true)
+    }
+
+    /// [`Editor::delete_selection`]; `drop_objects` false keeps the pictures
+    /// and alignment tabs it spans, which a cut does: its clip does not carry
+    /// them (they take no offset), so a paste could not bring them back.
+    fn delete_selection_with(&mut self, drop_objects: bool) -> bool {
         if let Some(range) = self.cell_range() {
             return self.clear_cells(&range);
         }
@@ -1651,9 +1660,9 @@ impl Editor {
         if lo.path == hi.path {
             self.checkpoint(EditKind::Structural);
             self.anchor = None;
-            if self.track.is_none() {
+            if drop_objects && self.track.is_none() {
                 if let Some(p) = para_mut(&mut self.doc.body, &lo.path) {
-                    drop_spanned_objects(&mut p.content, lo.offset, hi.offset);
+                    drop_spanned_objects(&mut p.content, lo.offset, hi.offset, false, false);
                 }
             }
             for _ in lo.offset..hi.offset {
@@ -1698,7 +1707,9 @@ impl Editor {
             // Truncate the first paragraph at lo.offset.
             if let Some(Block::Paragraph(p)) = cont.get_mut(li) {
                 let len: usize = p.content.iter().map(inline_len).sum();
-                drop_spanned_objects(&mut p.content, lo.offset, usize::MAX);
+                if drop_objects {
+                    drop_spanned_objects(&mut p.content, lo.offset, len, false, true);
+                }
                 for _ in lo.offset..len {
                     content_delete(&mut p.content, lo.offset);
                 }
@@ -1706,7 +1717,9 @@ impl Editor {
             // Take the remainder of the last paragraph (after hi.offset),
             // and its props for the section mark it may carry.
             let (remainder, last_props) = if let Some(Block::Paragraph(p)) = cont.get_mut(hii) {
-                drop_spanned_objects(&mut p.content, 0, hi.offset);
+                if drop_objects {
+                    drop_spanned_objects(&mut p.content, 0, hi.offset, true, false);
+                }
                 for _ in 0..hi.offset {
                     content_delete(&mut p.content, 0);
                 }
@@ -1816,7 +1829,7 @@ impl Editor {
     /// Cut: copy the selection, then delete it.
     pub fn cut(&mut self) -> Option<Clip> {
         let clip = self.copy()?;
-        self.delete_selection();
+        self.delete_selection_with(false);
         Some(clip)
     }
 
@@ -3659,13 +3672,26 @@ fn is_spanned_object(raw: &str) -> bool {
     raw.starts_with("<w:r") && (raw.contains("<w:drawing") || raw.contains("<w:ptab"))
 }
 
-/// Remove the drawing and positional-tab runs a delete of `lo..hi` (caret
-/// offsets; `hi` past the end means to the end) spans: those strictly
-/// inside it, and one at an edge of the paragraph the range reaches (a
-/// picture first on its line goes with a delete from its start).
-fn drop_spanned_objects(content: &mut Vec<Inline>, lo: usize, hi: usize) {
+/// Remove the drawing and positional-tab runs a delete spans in one
+/// paragraph: `lo..hi` in its caret offsets, `from_before` when the delete
+/// starts in an earlier paragraph (`lo` is then 0) and `to_after` when it
+/// goes on into a later one (`hi` is then its end). An object strictly
+/// inside the range goes, the paragraph marks the range takes counting as
+/// inside it; one at the paragraph's start or end goes only when the range
+/// covers the whole paragraph. So retyping the first or last word of
+/// `[LOGO]Page 1` keeps the logo, as in Word.
+fn drop_spanned_objects(
+    content: &mut Vec<Inline>,
+    lo: usize,
+    hi: usize,
+    from_before: bool,
+    to_after: bool,
+) {
     let len: usize = content.iter().map(inline_len).sum();
-    if lo >= hi {
+    let lo_v = if from_before { -1 } else { lo as i64 };
+    let hi_v = if to_after { len as i64 + 1 } else { hi as i64 };
+    let whole = (from_before || lo == 0) && (to_after || hi >= len);
+    if lo_v >= hi_v && !whole {
         return;
     }
     let mut at = 0;
@@ -3675,9 +3701,10 @@ fn drop_spanned_objects(content: &mut Vec<Inline>, lo: usize, hi: usize) {
         let Inline::Raw(raw) = i else {
             return true;
         };
-        let after_lo = p > lo || lo == 0;
-        let before_hi = p < hi || hi >= len;
-        !(is_spanned_object(raw) && after_lo && before_hi)
+        let pv = p as i64;
+        let inside = pv > lo_v && pv < hi_v;
+        let edge = whole && (p == 0 || p == len);
+        !(is_spanned_object(raw) && (inside || edge))
     });
 }
 
@@ -4921,13 +4948,72 @@ mod tests {
         let mut ed = selected(content(), 0, 4);
         assert!(ed.delete_selection());
         assert_eq!(raws(&ed, 0), [BOOKMARK]);
-        // Selecting only the text before it, or after it, keeps it.
+        // Selecting only the text before it, or after it, keeps it; the
+        // first word does not take the picture before it (FIX r1 m4).
         let mut ed = selected(content(), 0, 2);
         ed.delete_selection();
-        assert_eq!(raws(&ed, 0), [PTAB, BOOKMARK]);
+        assert_eq!(raws(&ed, 0), [PICTURE, PTAB, BOOKMARK]);
         let mut ed = selected(content(), 2, 4);
         ed.delete_selection();
         assert_eq!(raws(&ed, 0), [PICTURE, PTAB, BOOKMARK]);
+    }
+
+    /// Typing over the first word of `[LOGO][PTAB]Page 1` keeps both, as in
+    /// Word; an object at the end goes only with the whole paragraph.
+    #[test]
+    fn objects_at_a_paragraphs_edges_go_only_with_all_of_it_768() {
+        let leading = || {
+            vec![
+                Inline::Raw(PICTURE.into()),
+                Inline::Raw(PTAB.into()),
+                run("Page 1", RunProps::default()),
+            ]
+        };
+        let mut ed = selected(leading(), 0, 4);
+        ed.insert_str("Side");
+        assert_eq!(raws(&ed, 0), [PICTURE, PTAB]);
+        assert_eq!(etext(&ed), "Side 1");
+        let mut ed = selected(leading(), 0, 6);
+        ed.delete_selection();
+        assert!(raws(&ed, 0).is_empty());
+        // A trailing one: kept by a delete of the last word, taken by one of
+        // the whole paragraph.
+        let trailing = || {
+            vec![
+                run("ab cd", RunProps::default()),
+                Inline::Raw(PTAB.into()),
+                Inline::Raw(PICTURE.into()),
+            ]
+        };
+        let mut ed = selected(trailing(), 3, 5);
+        ed.delete_selection();
+        assert_eq!(raws(&ed, 0), [PTAB, PICTURE]);
+        assert_eq!(etext(&ed), "ab ");
+        let mut ed = selected(trailing(), 0, 5);
+        ed.delete_selection();
+        assert!(raws(&ed, 0).is_empty());
+    }
+
+    /// FIX r1 M2: a cut leaves the pictures and alignment tabs it spans,
+    /// which its clip cannot carry; the paste brings back the text only.
+    #[test]
+    fn a_cut_keeps_the_objects_its_clip_does_not_carry_768() {
+        let mut ed = selected(
+            vec![
+                Inline::Raw(PICTURE.into()),
+                run("ab", RunProps::default()),
+                Inline::Raw(PTAB.into()),
+                run("cd", RunProps::default()),
+            ],
+            0,
+            4,
+        );
+        let clip = ed.cut().unwrap();
+        assert_eq!(raws(&ed, 0), [PICTURE, PTAB]);
+        assert_eq!(etext(&ed), "");
+        ed.paste(&clip);
+        assert_eq!(etext(&ed), "abcd");
+        assert_eq!(raws(&ed, 0), [PICTURE, PTAB]);
     }
 
     /// The same over paragraphs: the first's tail and the last's head go.
@@ -4964,6 +5050,29 @@ mod tests {
         assert_eq!(ed.doc.body.len(), 1);
         assert_eq!(raws(&ed, 0), [PICTURE, PICTURE]);
         assert_eq!(etext(&ed), "ag");
+
+        // FIX r1 M3: `Company¶[LOGO]`, everything selected: the logo, a
+        // paragraph of its own (no offsets), goes too; a delete that ends at
+        // the start of `[LOGO]Text` keeps it.
+        let two = |last: Vec<Inline>| {
+            let mut ed = Editor::new(Document {
+                body: vec![para(vec![run("Company", RunProps::default())]), para(last)],
+            });
+            ed.anchor = Some(Caret::at(vec![0], 0));
+            ed.caret = Caret::at(vec![1], 0);
+            ed
+        };
+        let mut ed = two(vec![Inline::Raw(PICTURE.into())]);
+        assert!(ed.delete_selection());
+        assert_eq!(ed.doc.body.len(), 1);
+        assert!(raws(&ed, 0).is_empty());
+        let mut ed = two(vec![
+            Inline::Raw(PICTURE.into()),
+            run("Text", RunProps::default()),
+        ]);
+        assert!(ed.delete_selection());
+        assert_eq!(raws(&ed, 0), [PICTURE]);
+        assert_eq!(etext(&ed), "Text");
     }
 
     /// A preview copy shows the document as it is and edits apart from it
