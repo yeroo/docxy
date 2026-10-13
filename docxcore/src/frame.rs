@@ -318,6 +318,15 @@ mod tests {
             drop_cap: Some("none".into()),
             ..frame(Some("page"), Some("page"))
         };
+        // A letterhead logo: a framed paragraph holding a picture.
+        let logo = Block::Paragraph(Paragraph {
+            props: ParProps {
+                frame: Some(frame(Some("page"), Some("page"))),
+                ..Default::default()
+            },
+            content: vec![Inline::Raw("<w:r><w:pict/></w:r>".into())],
+            ..Default::default()
+        });
         let blocks = vec![
             Block::Raw("<w:sdt><w:sdtPr/><w:sdtContent>".into()),
             para(Some(frame(Some("page"), Some("page")))),
@@ -325,6 +334,7 @@ mod tests {
             para(None),
             para(Some(drop_cap)),
             para(Some(not_drop)),
+            logo,
         ];
         let (flow, framed) = split_framed(&blocks);
         assert_eq!(
@@ -333,7 +343,7 @@ mod tests {
         );
         assert_eq!(
             framed.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
-            vec![1, 5]
+            vec![1, 5, 6]
         );
     }
 }
