@@ -5025,6 +5025,11 @@ struct Docxy {
     view_gridlines: bool,
     /// The Insert > Table grid cell under the pointer: (columns, rows).
     table_grid_hover: Option<(usize, usize)>,
+    /// The live preview (#764) a hovered grid cell or Table Styles tile
+    /// built; drawn while `shown_preview` says it is current.
+    doc_preview: Option<table_tab::DocPreview>,
+    /// What the last frame drew in place of the document, for the harness.
+    drawn_preview: std::cell::RefCell<Option<table_tab::DrawnPreview>>,
     // In-progress drag of a ruler marker.
     ruler_drag: Option<RulerDrag>,
     // The tab-stop type placed when clicking the ruler (cycled via the corner box).
@@ -12411,6 +12416,8 @@ impl Docxy {
             show_ruler: false,
             view_gridlines: true,
             table_grid_hover: None,
+            doc_preview: None,
+            drawn_preview: Default::default(),
             ruler_drag: None,
             ruler_tab: docxcore::model::TabAlign::Left,
             ruler_probe: std::rc::Rc::new(std::cell::RefCell::new(RulerProbe::default())),
@@ -19972,6 +19979,8 @@ impl Docxy {
         // mode (#623).
         self.close_menu();
         self.cancel_pointer_modes();
+        // A live preview (#764) is of the document it was built on.
+        self.doc_preview = None;
         if i < self.tabs.len() {
             self.active = i;
             // A converted tab restored from the session converts as it comes
@@ -30115,8 +30124,10 @@ impl Docxy {
     /// (another tab, the backstage, a command run, a pointer verb) closes it,
     /// so an item is never clicked against a state it was not built for.
     pub(crate) fn close_menu(&mut self) -> bool {
-        // The Insert > Table grid forgets the pointer with its menu.
+        // The Insert > Table grid forgets the pointer with its menu, and its
+        // live preview (#764) goes with it.
         self.table_grid_hover = None;
+        self.drop_doc_preview(table_tab::PreviewKind::is_grid);
         self.menu.take().is_some()
     }
 
@@ -30941,8 +30952,10 @@ impl Docxy {
     }
 
     fn dispatch_act(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
-        // A command run from anywhere ends an open menu's moment (#397).
+        // A command run from anywhere ends an open menu's moment (#397), and
+        // a live preview (#764): a tile's click applies what it previewed.
         self.close_menu();
+        self.doc_preview = None;
         // Protected View (#633): the ribbon is hidden, but shortcuts, KeyTips,
         // context menus and the harness's `ribbon-click` still come here.
         // Resolve and Delete all hold no text of the view: only Protected View
@@ -34853,13 +34866,26 @@ impl Render for Docxy {
 
         // Text measurer for tab-stop positioning (shared across the document).
         let measurer = Measurer::new(window);
+        // Reset every frame: a frame that draws no preview (another tab, a
+        // sheet) reports none.
+        *self.drawn_preview.borrow_mut() = None;
         let content: AnyElement = match self.tabs.get(self.active) {
             Some(tab) => match &tab.surface {
                 Surface::Doc(editor) => {
+                    // A live preview (#764) is drawn in place of the editor:
+                    // everything below reads it. It is a picture, so it takes
+                    // no caret, selection or clicks (`active`).
+                    let preview = self.shown_preview(window);
+                    let previewing = preview.is_some();
+                    let editor = preview.map_or(editor, |p| &p.editor);
+                    if let Some(p) = preview {
+                        *self.drawn_preview.borrow_mut() =
+                            Some(table_tab::DrawnPreview::of(p, None));
+                    }
                     // Display for Review: the document, or a clone shown as No
                     // Markup / Original / Simple; never saved.
                     let shown = editor.doc.markup_view(self.markup);
-                    let spans = if self.markup.is_editable() {
+                    let spans = if self.markup.is_editable() && !previewing {
                         editor.selection_spans()
                     } else {
                         Vec::new()
@@ -34902,7 +34928,7 @@ impl Render for Docxy {
                         pal: doc_pal,
                         marks: self.show_marks,
                         zoom: self.zoom,
-                        active: hf.is_none() && self.markup.is_editable(),
+                        active: hf.is_none() && self.markup.is_editable() && !previewing,
                         meas: &measurer,
                         hf_width: None,
                         tbl: &tbl,
@@ -34927,6 +34953,9 @@ impl Render for Docxy {
                         // exporter is the oracle; page_flow documents the rules).
                         let pf = tab_page_flow(tab, body);
                         let pages = pf.ranges();
+                        if let Some(d) = self.drawn_preview.borrow_mut().as_mut() {
+                            d.pages = Some(pages.len());
+                        }
                         {
                             let mut probe = self.ruler_probe.borrow_mut();
                             probe.pages = vec![None; pages.len()];
