@@ -111,7 +111,8 @@ parse reads as its raw text and `null`.
   and for Status when the plan has no StatusDate or CurrentDate (or the task
   no start), which then reads `""` and `null`. Fields
   with a Project default read the default: Active Yes, Priority 500, Type and
-  Effort Driven the plan's new-task defaults, Fixed Cost Accrual Prorated.
+  Effort Driven the plan's new-task defaults, Fixed Cost Accrual the plan's
+  DefaultFixedCostAccrual, else Prorated (an explicit Invalid reads Prorated).
 - Variances follow the live schedule, not the values a file stores. They
   measure the scheduled (unleveled) dates, which a save writes and Set
   Baseline records; while leveling is on, the grid's Start and Finish can
