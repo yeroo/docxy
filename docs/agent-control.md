@@ -97,7 +97,7 @@ parse reads as its raw text and `null`.
 - `text` is what the sheet shows, in Project's spellings, which the harness
   `cell` verb also returns: `0 days`, `1 day`, `-1 day`, `1.25 days`,
   `2 wks`, `2 edays`, `4 hrs` (work is always hours), `$1,400.00`,
-  `($40,000.00)`, `50%`, `Yes`/`No`. Dates show `Mon 3/2/26`, or `NA` when
+  `($40,000.00)` (in the plan's currency), `50%`, `Yes`/`No`. Dates show `Mon 3/2/26`, or `NA` when
   unset. A date cell's edit and copy text stays strict ISO `YYYY-MM-DD`
   (`2026-03-02`), so a typed or pasted value parses.
 - `value` is what lies underneath: dates `YYYY-MM-DD HH:MM`; durations, work

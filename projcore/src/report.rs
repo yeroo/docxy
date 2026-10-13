@@ -18,7 +18,7 @@
 
 use crate::datetime::DateTime;
 use crate::editor::{
-    BaselinePart, Editor, Field, FieldReader, FieldValue, format_money, format_project_date,
+    BaselinePart, Currency, Editor, Field, FieldReader, FieldValue, format_project_date,
     format_work, two_decimals,
 };
 use crate::gantt::{heading_text, table_cell};
@@ -118,6 +118,7 @@ pub fn render(ed: &Editor, kind: ReportKind) -> String {
         ed,
         proj,
         fields: FieldReader::new(ed),
+        currency: Currency::of(proj),
         active: proj.effective_activity(),
     };
     match kind {
@@ -141,6 +142,8 @@ struct Report<'a> {
     ed: &'a Editor,
     proj: &'a Project,
     fields: FieldReader<'a>,
+    /// The plan's currency, for the totals the report sums itself.
+    currency: Currency,
     /// Each row's effective activity: a task under an inactive summary is
     /// dormant whatever its own flag says.
     active: Vec<bool>,
@@ -219,7 +222,7 @@ impl Report<'_> {
                 .filter_map(|t| t.fixed_cost.as_ref().and_then(|c| c.to_f64()))
                 .sum::<f64>()
                 / 100.0;
-            return format_money(units);
+            return self.currency.format(units);
         }
         if let Some(sum) = self.project_summary() {
             return self.fields.read(sum, field).text;
@@ -234,7 +237,7 @@ impl Report<'_> {
         }
         match field {
             Field::Work | Field::ActualWork | Field::RemainingWork => format_work(minutes),
-            _ => format_money(money),
+            _ => self.currency.format(money),
         }
     }
 
@@ -472,7 +475,7 @@ impl Report<'_> {
             rows.push(
                 [resource_name(r), type_name(r).into()]
                     .into_iter()
-                    .chain(costs.map(format_money))
+                    .chain(costs.map(|c| self.currency.format(c)))
                     .collect(),
             );
         }
@@ -483,7 +486,7 @@ impl Report<'_> {
         rows.push(
             ["**Total**".to_string(), String::new()]
                 .into_iter()
-                .chain(sums.map(format_money))
+                .chain(sums.map(|c| self.currency.format(c)))
                 .collect(),
         );
         table(

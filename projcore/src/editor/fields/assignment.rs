@@ -173,10 +173,10 @@ pub fn read_assignment_field(ed: &Editor, a: &Assignment, field: AssignmentField
         AssignmentField::ActualWork => work(a.actual_work_min),
         AssignmentField::RemainingWork => work(a.remaining_work_min),
         AssignmentField::BaselineWork => work(baseline.and_then(|b| b.work_min)),
-        AssignmentField::Cost => money(a.cost.as_ref()),
-        AssignmentField::ActualCost => money(a.actual_cost.as_ref()),
-        AssignmentField::RemainingCost => money(a.remaining_cost.as_ref()),
-        AssignmentField::BaselineCost => money(baseline.and_then(|b| b.cost.as_ref())),
+        AssignmentField::Cost => money(proj, a.cost.as_ref()),
+        AssignmentField::ActualCost => money(proj, a.actual_cost.as_ref()),
+        AssignmentField::RemainingCost => money(proj, a.remaining_cost.as_ref()),
+        AssignmentField::BaselineCost => money(proj, baseline.and_then(|b| b.cost.as_ref())),
         AssignmentField::PercentWorkComplete => percent(a.percent_work_complete),
         AssignmentField::Start => date(assignment_dates(ed, a).map(|(s, _)| s)),
         AssignmentField::Finish => date(assignment_dates(ed, a).map(|(_, f)| f)),
@@ -188,7 +188,7 @@ pub fn read_assignment_field(ed: &Editor, a: &Assignment, field: AssignmentField
             None => FieldRead::new(units(resource, 0.0).text, FieldValue::Null),
         },
         AssignmentField::BudgetWork => work(Some(a.budget_work_min.unwrap_or(0))),
-        AssignmentField::BudgetCost => money_value(Some(hundredths(a.budget_cost.as_ref()))),
+        AssignmentField::BudgetCost => money_value(proj, Some(hundredths(a.budget_cost.as_ref()))),
         AssignmentField::Custom(kind, n) => custom::read_assignment(proj, a, kind, n),
     }
 }
