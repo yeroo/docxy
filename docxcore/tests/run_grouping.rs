@@ -253,6 +253,37 @@ fn enter_in_a_marked_run_keeps_one_marker() {
 }
 
 #[test]
+fn a_tab_or_line_break_in_a_marked_run_keeps_one_marker() {
+    for offset in [0, 1, 6] {
+        let mut ed = Editor::new(load(MARKED));
+        ed.set_caret(Caret::top(0, offset));
+        ed.insert_tab();
+        assert_eq!(markers(&ed.doc), 1, "tab at {offset}");
+
+        let mut ed = Editor::new(load(MARKED));
+        ed.set_caret(Caret::top(0, offset));
+        ed.insert_line_break();
+        assert_eq!(markers(&ed.doc), 1, "line break at {offset}");
+    }
+}
+
+#[test]
+fn a_field_made_from_the_caret_formatting_has_no_marker() {
+    // Insert Field builds raw `w:fldSimple` XML from `caret_props`, where no
+    // later edit could clear a marker.
+    for offset in [0, 1] {
+        let mut ed = Editor::new(load(MARKED));
+        ed.set_caret(Caret::top(0, offset));
+        let props = ed.caret_props();
+        assert!(!props.shape.page_break_before, "caret at {offset}");
+        let Inline::Field { raw, .. } = docxcore::field::fld_simple("PAGE", "1", &props) else {
+            panic!("a field")
+        };
+        assert!(!raw.contains("lastRenderedPageBreak"), "{raw}");
+    }
+}
+
+#[test]
 fn typing_after_a_marked_tab_keeps_one_marker() {
     let mut ed = Editor::new(load(
         "<w:p><w:r><w:t>a</w:t><w:lastRenderedPageBreak/><w:tab/></w:r></w:p>",

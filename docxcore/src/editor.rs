@@ -3416,7 +3416,7 @@ fn sdt_typing_props(content: &[Inline], at: usize) -> RunProps {
     }
     source_before(content, at)
         .or_else(|| source_from(content, at))
-        .cloned()
+        .map(RunProps::continued)
         .unwrap_or_default()
 }
 
@@ -4256,7 +4256,13 @@ fn title_case(s: &str) -> String {
 }
 
 /// Run properties that `content_insert` will give a character at this caret.
+/// What is made from them (a tab, a break, a field) is new, so a
+/// `w:lastRenderedPageBreak` stays with the text they came from (#1216).
 fn run_props_at(content: &[Inline], offset: usize) -> RunProps {
+    source_props_at(content, offset).continued()
+}
+
+fn source_props_at(content: &[Inline], offset: usize) -> RunProps {
     // Typing into an emptied content control takes the control's formatting.
     if let Some(at) = empty_sdt_at(content, offset) {
         return sdt_typing_props(content, at);
@@ -4283,7 +4289,7 @@ fn run_props_at(content: &[Inline], offset: usize) -> RunProps {
                     .map(|r| r.props.clone())
                     .unwrap_or_default()
             }
-            LinkPart::Content(local) => run_props_at(&h.content, local),
+            LinkPart::Content(local) => source_props_at(&h.content, local),
         },
         _ => typing_props(content, i, local),
     }
@@ -4297,9 +4303,9 @@ fn tab_props_at(content: &[Inline], offset: usize) -> RunProps {
     match locate(content, offset) {
         // A tab into an emptied content control goes inside it, as typing.
         _ if empty_sdt_at(content, offset).is_some() => run_props_at(content, offset),
-        Some((i, _)) if matches!(content[i], Inline::Hyperlink(_)) => {
-            source_before(content, i).cloned().unwrap_or_default()
-        }
+        Some((i, _)) if matches!(content[i], Inline::Hyperlink(_)) => source_before(content, i)
+            .map(RunProps::continued)
+            .unwrap_or_default(),
         _ => run_props_at(content, offset),
     }
 }
