@@ -319,6 +319,14 @@ pub(crate) fn page_ink(sheet: u32) -> (u32, u32) {
     }
 }
 
+/// The ink automatic text in a table cell draws in (#765): on a fill, the
+/// ink Word draws on it, dark on a light fill and light on a dark one, as
+/// [`page_ink`] does on a page colour; `None` without one (the surrounding
+/// ink).
+pub(crate) fn cell_ink(fill: Option<u32>) -> Option<(u32, u32)> {
+    fill.map(page_ink)
+}
+
 /// Whether a Design command's choice is the current one, for the check mark.
 pub(crate) fn design_checked(tab: &DocTab, act: DesignAct) -> bool {
     match act {

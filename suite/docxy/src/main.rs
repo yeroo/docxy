@@ -7008,6 +7008,9 @@ struct RenderCtx<'a> {
     cell_range: Option<&'a docxcore::editor::CellRange>,
     /// Mailings ▸ Highlight Merge Fields is on: merge fields draw shaded.
     merge_hl: bool,
+    /// In a table cell: its table style's run formatting, laid below each
+    /// run's own (#765). A nested table sets its own.
+    cell_run: Option<&'a docxcore::table_styles::RunLook>,
 }
 
 /// What drawing a table needs beyond the table: the package's styles part
@@ -28854,6 +28857,7 @@ fn hf_els(blocks: &[Block], pal: Pal, meas: &Measurer, hf_width: f32) -> Vec<Any
                 // Header/footer text is never line-numbered (#746).
                 None,
                 None,
+                None,
             )),
             _ => None,
         })
@@ -29148,6 +29152,7 @@ fn paragraph_el(
     merge_hl: bool,
     lines: Option<LineSlot>,
     overlay: Option<AnyElement>,
+    cell_run: Option<&docxcore::table_styles::RunLook>,
 ) -> AnyElement {
     use docxcore::model::TabAlign;
     let base = zoom
@@ -29204,16 +29209,26 @@ fn paragraph_el(
     // Only paragraphs that actually contain a tab need per-run width measurement.
     let has_tab = items.iter().any(|(i, _)| matches!(**i, Inline::Tab(_)));
     let m = meas.filter(|_| has_tab);
+    // A run's formatting as drawn: in a table cell, over its style's (#765).
+    fn shown_in<'r>(
+        cell_run: Option<&docxcore::table_styles::RunLook>,
+        r: &'r docxcore::model::Run,
+    ) -> Cow<'r, RunProps> {
+        match cell_run {
+            Some(look) => Cow::Owned(look.under(&r.props)),
+            None => Cow::Borrowed(&r.props),
+        }
+    }
     // Width of a run's text at its effective size (matching emit_words' sizing).
     let run_w = |r: &docxcore::model::Run| -> f32 {
         match m {
             Some(m) => {
-                let sz = r
-                    .props
+                let props = shown_in(cell_run, r);
+                let sz = props
                     .size_half_pts
                     .map(|h| h as f32 / 2.0 * 1.333)
                     .unwrap_or(base);
-                m.width(&r.text, sz, r.props.bold, r.props.italic)
+                m.width(&r.text, sz, props.bold, props.italic)
             }
             None => 0.0,
         }
@@ -29286,8 +29301,17 @@ fn paragraph_el(
         match inline {
             Inline::Run(r) => {
                 emit_run(
-                    &mut spans, &r.text, &r.props, base, in_link, &mut idx, &mut caret, sel, click,
-                    pal, caret_h,
+                    &mut spans,
+                    &r.text,
+                    &shown_in(cell_run, r),
+                    base,
+                    in_link,
+                    &mut idx,
+                    &mut caret,
+                    sel,
+                    click,
+                    pal,
+                    caret_h,
                 );
                 x += run_w(r);
             }
@@ -29581,6 +29605,18 @@ enum TableClick {
 /// dashed gridlines on borderless edges when View Gridlines is on. The left
 /// edge of a cell, the strip left of a row and the strip above the first row
 /// select a cell, row or column.
+/// The palette a cell's text draws in (see [`design_tab::cell_ink`]).
+fn cell_pal(pal: Pal, fill: Option<u32>) -> Pal {
+    match design_tab::cell_ink(fill) {
+        Some((fg, dim)) => Pal {
+            fg: hsla_u(fg),
+            dim: hsla_u(dim),
+            ..pal
+        },
+        None => pal,
+    }
+}
+
 fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
     use docxcore::table_props::VAlign;
     let style = docxcore::table::table_props(t)
@@ -29644,6 +29680,13 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
         }
         for cb in &rb.cells {
             let cell = &row.cells[cb.cell];
+            // The cell's text: over its style's run formatting, and in ink
+            // that reads on its fill (#765).
+            let cell_ctx = RenderCtx {
+                pal: cell_pal(ctx.pal, cb.fill),
+                cell_run: Some(&cb.run),
+                ..ctx
+            };
             let inner: Vec<AnyElement> = if cb.continues {
                 Vec::new()
             } else {
@@ -29653,7 +29696,7 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
                     .map(|(k, b)| {
                         let mut cp = path.to_vec();
                         cp.extend_from_slice(&[ri, cb.cell, k]);
-                        block_el(b, cp, None, ctx)
+                        block_el(b, cp, None, cell_ctx)
                     })
                     .collect()
             };
@@ -29908,6 +29951,7 @@ fn block_el_numbered(
                 ctx.merge_hl,
                 lines,
                 overlay,
+                ctx.cell_run,
             )
         }
         Block::Table(t) => table_el(t, &path, ctx),
@@ -34946,6 +34990,7 @@ impl Render for Docxy {
                         tbl: &tbl,
                         cell_range: body_range.as_ref(),
                         merge_hl: tab.mail.highlight,
+                        cell_run: None,
                     };
                     let body = &shown.body;
                     if self.page_view {
@@ -35186,6 +35231,7 @@ impl Render for Docxy {
                                     tbl: &tbl,
                                     cell_range: hf_range.as_ref(),
                                     merge_hl: tab.mail.highlight,
+                                    cell_run: None,
                                 });
                                 // One region's margin content for this page: the live
                                 // editor blocks (editable on the edit page, read-only on

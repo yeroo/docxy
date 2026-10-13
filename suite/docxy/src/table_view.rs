@@ -8,7 +8,7 @@ use docxcore::border_style::BorderStyle;
 use docxcore::model::{Table, VMerge};
 use docxcore::table::{GridMap, cell_props, usable_grid};
 use docxcore::table_props::{BorderLine, VAlign};
-use docxcore::table_styles::{CellLook, TableStyle, resolve};
+use docxcore::table_styles::{CellLook, RunLook, TableStyle, resolve};
 
 /// A drawn border line.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -107,6 +107,8 @@ pub struct CellBox {
     /// edge they share (#765), so this side draws nothing, not even a
     /// gridline.
     pub neighbour_draws: [bool; 4],
+    /// The table style's run formatting for the cell's text (#765).
+    pub run: RunLook,
 }
 
 /// One row: the width skipped before its first cell (`w:gridBefore`), then
@@ -192,6 +194,7 @@ pub fn layout(t: &Table, style: Option<&TableStyle>) -> Vec<RowBox> {
                             .attr("w:vAlign", "w:val")
                             .map_or(VAlign::Top, |v| VAlign::parse(&v)),
                         neighbour_draws: [false; 4],
+                        run: look.run.clone(),
                     }
                 })
                 .collect(),
@@ -504,5 +507,37 @@ mod tests {
         assert!(rows[1].cells[0].bottom.is_some());
         assert!(rows[2].cells[0].top.is_none());
         assert!(rows[2].cells[0].neighbour_draws[0]);
+    }
+
+    #[test]
+    fn a_style_header_is_bold_white_and_a_band_takes_its_fills_ink_765() {
+        use docxcore::model::RunProps;
+        let mut t = new_table(3, 2, 9000, AutoFit::Default);
+        edit_table_props(&mut t, |p| {
+            p.remove("w:tblBorders");
+            p.set("<w:tblStyle w:val=\"GridTable5Dark-Accent1\"/>");
+            p.set(&TblLook::default().to_xml());
+        });
+        let rows = layout(&t, lookup_style(None, "GridTable5Dark-Accent1").as_ref());
+        // The header: the style's white, bold, whatever the ink.
+        let run = rows[0].cells[1].run.under(&RunProps::default());
+        assert!(run.bold);
+        assert_eq!(run.color.as_deref(), Some("FFFFFF"));
+        // A direct colour still wins there.
+        let red = RunProps {
+            color: Some("FF0000".into()),
+            ..RunProps::default()
+        };
+        assert_eq!(
+            rows[0].cells[1].run.under(&red).color.as_deref(),
+            Some("FF0000")
+        );
+        // A band cell: no style colour, so its text takes the fill's ink.
+        let band = &rows[1].cells[1];
+        assert_eq!(band.run.under(&RunProps::default()).color, None);
+        assert_eq!(
+            crate::design_tab::cell_ink(band.fill),
+            Some((0x202020, 0x808080))
+        );
     }
 }
