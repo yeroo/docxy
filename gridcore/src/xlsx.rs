@@ -724,8 +724,13 @@ fn parse_table_xml(xml: &str, sheet_idx: usize, part: &str) -> Option<Table> {
     // being read.
     let mut calculated: Vec<Option<String>> = Vec::new();
     let mut in_calc = false;
+    let mut cr = false;
     loop {
-        match p.next() {
+        let ev = p.next();
+        if ev != Event::Text {
+            cr = false;
+        }
+        match ev {
             Event::Start => match local(p.name()) {
                 "table" => {
                     name = decode(p.attr("displayName"));
@@ -755,7 +760,7 @@ fn parse_table_xml(xml: &str, sheet_idx: usize, part: &str) -> Option<Table> {
             },
             Event::Text if in_calc => {
                 if let Some(Some(f)) = calculated.last_mut() {
-                    push_text(&p, f);
+                    push_text(&p, f, &mut cr);
                 }
             }
             Event::End if local(p.name()) == "calculatedColumnFormula" => in_calc = false,
@@ -893,9 +898,14 @@ fn rich_error_codes(
     // rdrichvalue.xml: each value's structure and positional values.
     let mut values: Vec<(usize, Vec<String>)> = Vec::new();
     let mut in_v = false;
+    let mut cr = false;
     let mut p = XmlParser::new(rich_values);
     loop {
-        match p.next() {
+        let ev = p.next();
+        if ev != Event::Text {
+            cr = false;
+        }
+        match ev {
             Event::Start => match local(p.name()) {
                 "rv" => values.push((p.attr("s").parse().unwrap_or(usize::MAX), Vec::new())),
                 "v" => {
@@ -908,7 +918,7 @@ fn rich_error_codes(
             },
             Event::Text if in_v => {
                 if let Some(v) = values.last_mut().and_then(|(_, vs)| vs.last_mut()) {
-                    XmlParser::append_decoded(p.text(), v);
+                    push_text(&p, v, &mut cr);
                 }
             }
             Event::End if local(p.name()) == "v" => in_v = false,
@@ -1016,8 +1026,13 @@ fn parse_workbook_xml(
     let mut names = Vec::new();
     let mut p = XmlParser::new(xml);
     let mut cur_name: Option<(String, Option<usize>, String)> = None;
+    let mut cr = false;
     loop {
-        match p.next() {
+        let ev = p.next();
+        if ev != Event::Text {
+            cr = false;
+        }
+        match ev {
             Event::Start => match local(p.name()) {
                 "sheet" => {
                     let name = decode(p.attr("name"));
@@ -1059,7 +1074,7 @@ fn parse_workbook_xml(
             },
             Event::Text => {
                 if let Some((_, _, f)) = &mut cur_name {
-                    XmlParser::append_decoded(p.text(), f);
+                    push_text(&p, f, &mut cr);
                 }
             }
             Event::End => {
@@ -1142,6 +1157,8 @@ fn parse_shared_strings(xml: &str) -> Vec<String> {
 struct TextRun {
     text: String,
     preserve: bool,
+    /// The last piece ended in a raw CR ([`push_text`]).
+    cr: bool,
 }
 
 impl TextRun {
@@ -1150,13 +1167,14 @@ impl TextRun {
         TextRun {
             text: String::new(),
             preserve: p.xml_space_preserve(),
+            cr: false,
         }
     }
 
     /// One piece of its character data (entities and CDATA arrive apart; a
     /// CDATA section is literal text, so `&amp;` in it stays as written).
     fn push(&mut self, p: &XmlParser) {
-        push_text(p, &mut self.text);
+        push_text(p, &mut self.text, &mut self.cr);
     }
 
     /// At `</t>`: append the text as read to `out`.
@@ -2520,8 +2538,14 @@ fn parse_cell_body(
     let mut in_v = false;
     let mut in_f = false;
     let mut is_run: Option<TextRun> = None;
+    // A `<v>` or `<f>` piece ended in a raw CR ([`push_text`]).
+    let mut cr = false;
     while depth > 0 {
-        match p.next() {
+        let ev = p.next();
+        if ev != Event::Text {
+            cr = false;
+        }
+        match ev {
             Event::Start => {
                 depth += 1;
                 match local(p.name()) {
@@ -2572,11 +2596,11 @@ fn parse_cell_body(
             Event::Text => {
                 if in_v {
                     if let Some(s) = &mut v_text {
-                        XmlParser::append_decoded(p.text(), s);
+                        push_text(p, s, &mut cr);
                     }
                 } else if in_f {
                     if let Some(s) = &mut formula {
-                        XmlParser::append_decoded(p.text(), s);
+                        push_text(p, s, &mut cr);
                     }
                 } else if let Some(run) = &mut is_run {
                     run.push(p);
@@ -3074,9 +3098,14 @@ fn remove_macro_names(
                 let scope = p.attr("localSheetId").parse::<usize>().ok();
                 let mut text = String::new();
                 let mut depth = 0usize;
+                let mut cr = false;
                 let end = loop {
-                    match p.next() {
-                        Event::Text => XmlParser::append_decoded(p.text(), &mut text),
+                    let ev = p.next();
+                    if ev != Event::Text {
+                        cr = false;
+                    }
+                    match ev {
+                        Event::Text => push_text(&p, &mut text, &mut cr),
                         Event::Start => depth += 1,
                         Event::End if depth > 0 => depth -= 1,
                         Event::End => break Some(p.pos()),
@@ -6235,9 +6264,14 @@ fn patch_defined_name(
     let mut text = String::new();
     let mut depth = 0usize;
     let mut nested = false;
+    let mut cr = false;
     let body_end = loop {
-        match p.next() {
-            Event::Text => XmlParser::append_decoded(p.text(), &mut text),
+        let ev = p.next();
+        if ev != Event::Text {
+            cr = false;
+        }
+        match ev {
+            Event::Text => push_text(p, &mut text, &mut cr),
             Event::Start => {
                 depth += 1;
                 nested = true;
@@ -7075,12 +7109,38 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
     }
 }
 
-/// A text event's content: CDATA as it stands, other text decoded.
-fn push_text(p: &XmlParser, out: &mut String) {
+/// A text event's content: CDATA as it stands, other text decoded, and
+/// either way with its line ends as XML 1.0 §2.11 has a parser read them
+/// before anything else: CR LF and a lone CR are LF, while a `&#13;`
+/// reference stays a real CR (#761). `cr` is whether the previous piece of
+/// the same text (a CDATA section or a comment splits it into pieces) ended
+/// in a raw CR, so an LF opening this piece ends no second line. Start it
+/// false at each tag.
+fn push_text(p: &XmlParser, out: &mut String, cr: &mut bool) {
+    let raw = p.text();
+    if raw.is_empty() {
+        return;
+    }
+    let raw = match std::mem::take(cr) {
+        true => raw.strip_prefix('\n').unwrap_or(raw),
+        false => raw,
+    };
+    *cr = raw.ends_with('\r');
+    let raw = normalise_eol(raw);
     if p.is_cdata() {
-        out.push_str(p.text());
+        out.push_str(&raw);
     } else {
-        XmlParser::append_decoded(p.text(), out);
+        XmlParser::append_decoded(&raw, out);
+    }
+}
+
+/// Raw XML character data with CR LF and each lone CR read as LF (XML 1.0
+/// §2.11), before any reference in it is expanded.
+pub(crate) fn normalise_eol(raw: &str) -> std::borrow::Cow<'_, str> {
+    if raw.contains('\r') {
+        raw.replace("\r\n", "\n").replace('\r', "\n").into()
+    } else {
+        raw.into()
     }
 }
 
@@ -7089,11 +7149,12 @@ fn push_text(p: &XmlParser, out: &mut String) {
 fn element_text(el: &str) -> String {
     let mut p = XmlParser::new(el);
     let mut out = String::new();
+    let mut cr = false;
     loop {
         match p.next() {
-            Event::Text => push_text(&p, &mut out),
+            Event::Text => push_text(&p, &mut out, &mut cr),
             Event::Eof => return out,
-            _ => {}
+            _ => cr = false,
         }
     }
 }
@@ -11131,6 +11192,85 @@ mod tests {
         let sst = part_text(&re, "xl/sharedStrings.xml");
         assert_eq!(sst.matches("> </t>").count(), 1, "{sst}");
         assert!(sst.contains(r#"<t xml:space="preserve"> </t>"#), "{sst}");
+    }
+
+    /// #761: XML 1.0 §2.11 reads CR LF and a lone CR in the raw XML as LF
+    /// (openpyxl on Windows writes os.linesep inside cell text), in a shared
+    /// string, an inline string and a `t="str"` formula's cached result.
+    #[test]
+    fn load_normalises_crlf_in_cell_text() {
+        let sst = "<si><t>a\r\nb</t></si><si><r><t>c\rd</t></r><r><t>e\r\n</t></r></si>";
+        assert_eq!(
+            parse_shared_strings(&format!("<sst>{sst}</sst>")),
+            ["a\nb", "c\nde"]
+        );
+        let rows = "<row r=\"1\">\
+            <c r=\"A1\" t=\"s\"><v>0</v></c>\
+            <c r=\"B1\" t=\"inlineStr\"><is><t>a\rb</t></is></c>\
+            <c r=\"C1\" t=\"str\"><f>\"a\"&amp;CHAR(10)&amp;\"b\"</f><v>a\r\nb</v></c>\
+            <c r=\"D1\" t=\"inlineStr\"><is><t xml:space=\"preserve\">a\r\n\r\nb\r</t></is></c>\
+            </row>";
+        let pkg = load_xlsx(&whitespace_xlsx(rows, sst)).unwrap();
+        let s = &pkg.workbook.sheets[0];
+        let value = |col| s.cell(0, col).map(|c| c.value.clone());
+        assert_eq!(value(0), Some(CellValue::Text("a\nb".into())));
+        assert_eq!(value(1), Some(CellValue::Text("a\nb".into())));
+        assert_eq!(value(2), Some(CellValue::Text("a\nb".into())));
+        assert_eq!(value(3), Some(CellValue::Text("a\n\nb\n".into())));
+    }
+
+    /// #761: a CR written as a reference is a real CR. §2.11 normalises the
+    /// raw text before references expand, so `&#13;` then a raw LF is CR LF.
+    #[test]
+    fn char_ref_cr_survives_load() {
+        let sst = "<si><t>a&#13;b</t></si><si><t>a&#xD;b</t></si><si><t>a&#13;\nb</t></si>";
+        assert_eq!(
+            parse_shared_strings(&format!("<sst>{sst}</sst>")),
+            ["a\rb", "a\rb", "a\r\nb"]
+        );
+        let rows = "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>a&#13;\r\nb</t></is></c></row>";
+        let pkg = load_xlsx(&whitespace_xlsx(rows, "")).unwrap();
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(0, 0).unwrap().value,
+            CellValue::Text("a\r\nb".into())
+        );
+    }
+
+    /// #761: a CR ending one piece of a text and an LF opening the next (a
+    /// CDATA section or a comment between them) are one line end, while a CR
+    /// and an LF in two runs are two.
+    #[test]
+    fn cr_lf_split_across_cdata_is_one_lf() {
+        let sst = "<si><t xml:space=\"preserve\">a\r<![CDATA[\nb]]></t></si>\
+            <si><t xml:space=\"preserve\"><![CDATA[a\r]]>\nb</t></si>\
+            <si><t xml:space=\"preserve\">a\r<!-- x -->\nb</t></si>\
+            <si><t xml:space=\"preserve\">a\r<![CDATA[]]>\nb</t></si>\
+            <si><r><t xml:space=\"preserve\">a\r</t></r><r><t xml:space=\"preserve\">\nb</t></r></si>";
+        assert_eq!(
+            parse_shared_strings(&format!("<sst>{sst}</sst>")),
+            ["a\nb", "a\nb", "a\nb", "a\nb", "a\n\nb"]
+        );
+    }
+
+    /// #761: a shared string read with its CR LF as LF is still found at its
+    /// own index on save, so an edit elsewhere appends nothing for it and
+    /// the loaded entry stays as written.
+    #[test]
+    fn crlf_shared_string_keeps_its_index_on_save() {
+        let sst = "<si><t>a\r\nb</t></si>";
+        let rows = "<row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c></row>";
+        let mut pkg = load_xlsx(&whitespace_xlsx(rows, sst)).unwrap();
+        pkg.workbook.sheets[0].set_cell(1, 0, crate::sheet::Cell::number(5.0));
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let shared = part_text(&re, "xl/sharedStrings.xml");
+        assert_eq!(shared.matches("<si>").count(), 1, "{shared}");
+        assert!(shared.contains("<si><t>a\r\nb</t></si>"), "{shared}");
+        let sheet = part_text(&re, "xl/worksheets/sheet1.xml");
+        assert!(sheet.contains(r#"<c r="A1" t="s"><v>0</v></c>"#), "{sheet}");
+        assert_eq!(
+            re.workbook.sheets[0].cell(0, 0).unwrap().value,
+            CellValue::Text("a\nb".into())
+        );
     }
 
     fn part_text(pkg: &SheetPackage, name: &str) -> String {
