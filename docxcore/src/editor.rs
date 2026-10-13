@@ -530,6 +530,8 @@ impl Editor {
     }
 
     fn push_undo(&mut self, mut snapshot: Snapshot) {
+        // A preview copy takes no snapshot ([`Editor::grouped`]); should a
+        // path push one anyway, it still keeps no step and issues no serial.
         if self.display_only {
             return;
         }
@@ -662,10 +664,10 @@ impl Editor {
         self.name_command(since, name);
     }
 
-    /// Inside [`Editor::one_step`] with its step taken: an edit takes no
-    /// snapshot at all.
+    /// Inside [`Editor::one_step`] with its step taken, or a preview copy
+    /// that keeps no history (#764): an edit takes no snapshot at all.
     fn grouped(&self) -> bool {
-        self.grouping == Some(true)
+        self.display_only || self.grouping == Some(true)
     }
 
     /// The state before a transaction that pushes its step only if it
@@ -4855,6 +4857,7 @@ mod tests {
         assert_eq!(copy.track_author(), Some("Ann"));
         assert!(!copy.undo(), "a preview copy has no history");
         let serial = undo_serial_counter();
+        let taken = SNAPSHOTS_TAKEN.with(|n| n.get());
         copy.insert_table(2, 3, crate::table::AutoFit::Default)
             .unwrap();
         assert_ne!(copy.doc, ed.doc);
@@ -4865,6 +4868,11 @@ mod tests {
         copy.set_table_style("GridTable4-Accent1").unwrap();
         assert_ne!(copy.doc, tabled);
         assert_eq!(undo_serial_counter(), serial);
+        assert_eq!(
+            SNAPSHOTS_TAKEN.with(|n| n.get()),
+            taken,
+            "nor take a snapshot to throw away"
+        );
         assert!(!copy.undo(), "and keep no history");
         assert_eq!(ed.doc, before);
         assert!(ed.undo(), "the original keeps its own step");
