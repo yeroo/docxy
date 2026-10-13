@@ -74,7 +74,15 @@ test('every ribbon tab matches the suite snapshot: groups, acts and icons', asyn
       await page.locator(`#rb-${c.primary.id}-menu`).click();
       const items = await page.locator(`#popup-${c.primary.id} [role="menuitem"]`).allTextContents();
       expect(items, `${tab.name}/${c.primary.id}`).toEqual(c.menu.map((m) => m.label));
+      // A second press on the arrow closes its menu (#753 r2).
+      await page.locator(`#rb-${c.primary.id}-menu`).click();
+      await expect(page.locator(`#popup-${c.primary.id}`)).toHaveCount(0);
+      // Enter on the focused arrow opens it too.
+      await page.locator(`#rb-${c.primary.id}-menu`).focus();
+      await page.keyboard.press('Enter');
+      await expect(page.locator(`#popup-${c.primary.id}`)).toHaveCount(1);
       await page.keyboard.press('Escape');
+      await expect(page.locator(`#popup-${c.primary.id}`)).toHaveCount(0);
     }
   }
   const qat = await page.locator('.qat-btn').evaluateAll((bs) => bs.map((b) => b.id));

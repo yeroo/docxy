@@ -547,12 +547,25 @@
 
   // A split button's arrow: opens its menu under it.
   function splitArrow(c) {
+    var popupId = 'popup-' + c.primary.id;
+    var toggle = function () {
+      if (popupEl && popupEl.id === popupId) hidePopup();
+      else openSplitMenu(c, b);
+    };
     var b = h('button', {
       class: 'rb split-arrow', id: 'rb-' + c.primary.id + '-menu',
       'aria-label': c.primary.label + ' options', 'aria-haspopup': 'menu',
-      onmousedown: keepFocus,
-      onclick: function () { if (popupEl) hidePopup(); else openSplitMenu(c, b); },
-      text: '▾',
+      // Decided on the press, before the document's press closes any popup:
+      // a second press on the arrow closes its own menu (#753 r2).
+      onmousedown: function (e) {
+        keepFocus(e);
+        e.stopPropagation();
+        hideTip();
+        toggle();
+      },
+      // Enter or Space on the focused arrow (a click with no press).
+      onclick: function (e) { if (e.detail === 0) toggle(); },
+      text: '\u25BE',
     });
     b._tip = { title: c.primary.label + ' options', body: '', shortcut: '' };
     return b;
