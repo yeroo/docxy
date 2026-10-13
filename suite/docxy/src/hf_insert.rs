@@ -258,8 +258,7 @@ pub(crate) fn property_control(tab: &DocTab, prop: CoreProp) -> Vec<Inline> {
         .as_ref()
         .and_then(|p| p.part_text("docProps/core.xml"))
         .unwrap_or_default();
-    let props = docxcore::field::parse_core_props(&core);
-    let value = prop.value(&props, &core);
+    let value = prop.value(&docxcore::field::parse_core_props(&core));
     let xmls = story_xmls(tab);
     let id = docxcore::sdt::next_control_id(xmls.iter().map(String::as_str));
     let run_props = tab_edit_target_ref(tab)

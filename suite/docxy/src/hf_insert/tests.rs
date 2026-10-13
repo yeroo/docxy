@@ -557,6 +557,34 @@ fn an_alignment_tab_places_the_text_after_it() {
     );
 }
 
+/// FIX r2 M1: the pagination estimate counts an inline picture's frame, so
+/// a body paragraph holding a 4" tall picture takes at least 4" (384 px at
+/// zoom 1), and an anchored picture adds nothing.
+#[test]
+fn a_tall_inline_picture_counts_in_the_blocks_height() {
+    let para = |content: Vec<Inline>| {
+        Block::Paragraph(docxcore::model::Paragraph {
+            props: Default::default(),
+            content,
+        })
+    };
+    let text_only = crate::block_height_est(&para(vec![]), 600.0);
+    let picture = docxcore::image::inline_picture_run("rId1", 914_400 * 6, 914_400 * 4, 1, "a.png");
+    let tall = crate::block_height_est(&para(vec![Inline::Raw(picture)]), 600.0);
+    assert!(tall >= 384.0, "{tall}");
+    assert!(tall > text_only + 300.0, "{tall} vs {text_only}");
+    let small = docxcore::image::inline_picture_run("rId1", 9525, 9525, 1, "a.png");
+    assert_eq!(
+        crate::block_height_est(&para(vec![Inline::Raw(small)]), 600.0),
+        text_only
+    );
+    let anchored = "<w:r><w:drawing><wp:anchor><wp:extent cx=\"9144000\" cy=\"9144000\"/></wp:anchor></w:drawing></w:r>";
+    assert_eq!(
+        crate::block_height_est(&para(vec![Inline::Raw(anchored.into())]), 600.0),
+        text_only
+    );
+}
+
 /// Criterion 7: Online Pictures offers a file; its From a File... closes
 /// it and runs Pictures..., Cancel only closes it.
 #[test]

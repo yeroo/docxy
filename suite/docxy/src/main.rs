@@ -29150,7 +29150,19 @@ fn block_height_est(b: &Block, content_w: f32) -> f32 {
                 .filter(|i| matches!(i, Inline::Break(..)))
                 .count() as f32;
             let lines = (chars / cpl).ceil().max(1.0) + breaks;
+            // An inline picture is drawn as a frame of its size (#768): each
+            // one taller than a line makes its line that much taller.
+            let pictures: f32 = p
+                .content
+                .iter()
+                .filter_map(|i| match i {
+                    Inline::Raw(raw) => docxcore::image::inline_extent(raw),
+                    _ => None,
+                })
+                .map(|(cx, cy)| (picture_frame_px(cx, cy, 1.0).1 - lh).max(0.0))
+                .sum();
             lines * lh
+                + pictures
                 + if p.props.heading_level.is_some() {
                     base
                 } else {
@@ -29521,7 +29533,8 @@ fn paragraph_el(
         }
     };
     // The rendered width of a single inline (for tracking x and looking ahead to
-    // size centre/right tabs). Inlines with no measurable text contribute 0.
+    // size centre/right tabs). An inline picture counts its frame's width;
+    // other inlines with no measurable text contribute 0.
     let inline_w =
         |it: &Inline| -> f32 { m.map_or(0.0, |m| inline_width(it, base, zoom, m, cell_run)) };
     // Total width of content from index `from` up to the next tab, alignment
