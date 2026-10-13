@@ -55,8 +55,8 @@ fn two_windows_restore_into_one_on_relaunch() {
     assert_eq!(wrote.get("wrote"), Some(&Json::Bool(true)), "{wrote}");
 
     // The one session holds BOTH windows' tabs, under distinct sidecar names:
-    // the first window keeps `tab-{i}`, a secondary window namespaces its own
-    // by registry seq (`tab-w{seq}-{i}`), so the files never collide.
+    // the first window's are `tab-{i}-{n}`, a secondary window namespaces its
+    // own by registry seq (`tab-w{seq}-{i}-{n}`), so the files never collide.
     let session =
         Json::parse(&std::fs::read_to_string(sandbox.join("docxy/session.json")).unwrap()).unwrap();
     let tabs = session.get("tabs").and_then(Json::as_array).unwrap();
@@ -70,8 +70,13 @@ fn two_windows_restore_into_one_on_relaunch() {
     };
     let hot1 = hot("sample.docx");
     let hot2 = hot("basic.docx");
-    assert!(hot1.ends_with("tab-0.docx"), "{hot1}");
-    assert!(hot2.ends_with("tab-w1-0.docx"), "{hot2}");
+    let named = |hot: &str, stem: &str| {
+        PathBuf::from(hot)
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with(stem))
+    };
+    assert!(named(&hot1, "tab-0-"), "{hot1}");
+    assert!(named(&hot2, "tab-w1-0-"), "{hot2}");
     assert!(PathBuf::from(&hot1).exists(), "{hot1}");
     assert!(PathBuf::from(&hot2).exists(), "{hot2}");
 

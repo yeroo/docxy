@@ -173,8 +173,10 @@ pub(crate) fn draft_file_name(title: &str, secs: u64) -> String {
 
 /// Keep a copy of `sidecar` (a tab's last AutoRecover copy) as the draft of
 /// the workbook titled `title`, and return where it went. The sidecar is
-/// copied, never moved: the next persist rewrites it for whichever tab then
-/// has its index. A name already taken gets `-2`, `-3`, … before `.xlsx`.
+/// copied, never moved: a later persist deletes it once neither the
+/// session nor the one it replaced names it (#1224), so copy before
+/// persisting.
+/// A name already taken gets `-2`, `-3`, … before `.xlsx`.
 pub(crate) fn keep_draft(
     root: &Path,
     title: &str,

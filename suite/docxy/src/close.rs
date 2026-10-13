@@ -803,8 +803,8 @@ impl Docxy {
             self.active = i;
             self.drop_grid_state();
         }
-        // Kept before removal: the sidecar is rewritten for whichever tab
-        // takes this index at the persist below.
+        // Kept before removal: a later persist deletes the sidecar once
+        // no session on disk names it (#1224).
         let mut draft_error = None;
         if let Some(kept) = keep_closed_draft(
             &config_root(),
@@ -1120,12 +1120,12 @@ impl Docxy {
             );
         }
         let forget = forget_on_quit(&mut self.tabs, &mut self.active, discards);
-        let own = write_session_forgetting(
+        let own = write_session_with(
             &root,
             &self.tabs,
             self.active,
             self.prefs(),
-            &forget,
+            SessionWrite::Forget(&forget),
             &windows::others_persisted(cx, self.win_id),
             windows::seq_of(cx, self.win_id),
         );
