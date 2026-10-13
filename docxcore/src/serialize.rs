@@ -1327,6 +1327,23 @@ pub(crate) fn run_xml(r: &Run) -> String {
     s
 }
 
+/// A run holding one positional tab (`w:ptab`, Insert Alignment Tab, #768)
+/// in `props`: `alignment` left/center/right, `relative_to` margin/indent,
+/// `leader` none/dot/hyphen/underscore/middleDot.
+pub fn ptab_run_xml(props: &RunProps, alignment: &str, relative_to: &str, leader: &str) -> String {
+    let mut s = String::new();
+    write_run_start(&mut s, props);
+    write_rpr(&mut s, props);
+    s.push_str("<w:ptab w:relativeTo=\"");
+    esc_attr(relative_to, &mut s);
+    s.push_str("\" w:alignment=\"");
+    esc_attr(alignment, &mut s);
+    s.push_str("\" w:leader=\"");
+    esc_attr(leader, &mut s);
+    s.push_str("\"/></w:r>");
+    s
+}
+
 /// `<w:r …>` with the run's loaded start-tag attributes.
 fn write_run_start(s: &mut String, props: &RunProps) {
     s.push_str("<w:r");
@@ -2040,6 +2057,34 @@ mod row_raw_tests;
 mod tests {
     use super::*;
     use crate::load::{Relationships, parse_document_xml, parse_rels_xml};
+
+    /// #768: an alignment tab's run, in the caret's formatting, loads back
+    /// as the same raw run and saves unchanged.
+    #[test]
+    fn a_ptab_run_round_trips() {
+        let props = RunProps {
+            bold: true,
+            ..Default::default()
+        };
+        let xml = ptab_run_xml(&props, "right", "margin", "dot");
+        assert_eq!(
+            xml,
+            "<w:r><w:rPr><w:b/></w:rPr><w:ptab w:relativeTo=\"margin\" w:alignment=\"right\" w:leader=\"dot\"/></w:r>"
+        );
+        let doc = format!(
+            "<w:document xmlns:w=\"w\"><w:body><w:p><w:r><w:t>a</w:t></w:r>{xml}<w:r><w:t>b</w:t></w:r></w:p></w:body></w:document>"
+        );
+        let loaded = parse_document_xml(&doc, &Relationships::default());
+        let Block::Paragraph(p) = &loaded.body[0] else {
+            panic!("a paragraph");
+        };
+        assert!(
+            p.content.contains(&Inline::Raw(xml.clone())),
+            "{:?}",
+            p.content
+        );
+        assert!(blocks_to_xml(&loaded.body).contains(&xml));
+    }
 
     /// `doc` saved and loaded again. The loaded copy's shadows (its modeled
     /// properties' verbatim elements, #1063) are cleared: a document built in

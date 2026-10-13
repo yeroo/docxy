@@ -525,6 +525,28 @@ fn copy_reports_text_without_mutating() {
     assert_eq!(para_text(&all_paragraphs(&s)[0]), "Hello");
 }
 
+/// #768 r2: a cut's plain-text copy cannot carry a picture, so the cut
+/// leaves it in the document.
+#[test]
+fn a_cut_keeps_a_picture_its_copy_cannot_carry() {
+    let picture = docxcore::image::inline_picture_run("rId9", 9525, 9525, 1, "a.png");
+    let body = format!("<w:p>{picture}<w:r><w:t>ab</w:t></w:r></w:p>");
+    let mut s = open(&docx_from_body(&body));
+    s.exec_json("select\t0\t0\t0\t2");
+    let r = parse(&s.exec_json("cut"));
+    assert_eq!(r.get_str("copied"), Some("ab"));
+    let Block::Paragraph(p) = &s.editor.doc.body[0] else {
+        panic!("a paragraph");
+    };
+    assert!(
+        p.content
+            .iter()
+            .any(|i| matches!(i, Inline::Raw(r) if r.contains("<w:drawing"))),
+        "{:?}",
+        p.content
+    );
+}
+
 #[test]
 fn read_only_documents_refuse_the_new_verbs() {
     let mut s = open(&protected_docx());

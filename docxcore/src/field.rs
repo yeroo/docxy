@@ -609,17 +609,24 @@ pub struct DocProps {
     pub comments: String,
     pub last_saved_by: String,
     pub revision: String,
+    /// `cp:category` and `cp:contentStatus`, which only the Document Property
+    /// controls show (#768).
+    pub category: String,
+    pub content_status: String,
     pub created: Option<DateTime>,
     pub modified: Option<DateTime>,
 }
 
 /// What a field needs beyond its own instruction: the current clock (for DATE/
-/// TIME), the document properties, and the file name.
+/// TIME), the document properties, and the file name and full path.
 #[derive(Clone, Debug, Default)]
 pub struct FieldContext {
     pub now: Option<DateTime>,
     pub props: DocProps,
     pub filename: String,
+    /// The file's full path, for `FILENAME \p`; empty for a document never
+    /// saved, which shows `filename` instead, as Word shows the title.
+    pub path: String,
 }
 
 /// Like [`eval_field`], but also resolves fields that need outside context — the
@@ -656,6 +663,9 @@ pub fn eval_field_ctx(instr: &str, ctx: &FieldContext) -> Option<String> {
         "COMMENTS" => nonempty(&ctx.props.comments)?,
         "LASTSAVEDBY" => nonempty(&ctx.props.last_saved_by)?,
         "REVNUM" => nonempty(&ctx.props.revision)?,
+        "FILENAME" if switches.iter().any(|(c, _)| *c == 'p') => {
+            nonempty(&ctx.path).or_else(|| nonempty(&ctx.filename))?
+        }
         "FILENAME" => nonempty(&ctx.filename)?,
         _ => return None,
     };
@@ -691,7 +701,8 @@ const WEEKDAYS: [&str; 7] = [
 
 /// Format a date-time against a Word `\@` picture (case-sensitive: `M`=month,
 /// `m`=minute). Supports yyyy/yy, MMMM/MMM/MM/M, dddd/ddd/dd/d, HH/H, hh/h, mm/m,
-/// ss/s, AM/PM (and am/pm), `'literal'` text, and other characters as literals.
+/// ss/s, AM/PM (and am/pm, which Word shows in capitals too), `'literal'`
+/// text, and other characters as literals.
 fn format_date(dt: &DateTime, pic: &str) -> String {
     let chars: Vec<char> = pic.chars().collect();
     let mut out = String::new();
@@ -769,10 +780,8 @@ fn format_date(dt: &DateTime, pic: &str) -> String {
             ("ss", format!("{:02}", dt.sec))
         } else if starts(i, "s") {
             ("s", dt.sec.to_string())
-        } else if starts(i, "AM/PM") {
+        } else if starts(i, "AM/PM") || starts(i, "am/pm") {
             ("AM/PM", if dt.hour < 12 { "AM" } else { "PM" }.to_string())
-        } else if starts(i, "am/pm") {
-            ("am/pm", if dt.hour < 12 { "am" } else { "pm" }.to_string())
         } else {
             out.push(chars[i]);
             i += 1;
@@ -827,31 +836,45 @@ pub fn civil_from_unix(secs: i64) -> DateTime {
 
 /// Parse `docProps/core.xml` into [`DocProps`].
 pub fn parse_core_props(xml: &str) -> DocProps {
-    let tag = |name: &str| -> String {
-        let open = format!("<{name}");
-        let Some(s) = xml.find(&open) else {
-            return String::new();
-        };
-        let Some(gt) = xml[s..].find('>').map(|e| s + e + 1) else {
-            return String::new();
-        };
-        let close = format!("</{name}>");
-        let Some(e) = xml[gt..].find(&close).map(|e| gt + e) else {
-            return String::new();
-        };
-        xml_unescape(&xml[gt..e])
-    };
     DocProps {
-        author: tag("dc:creator"),
-        title: tag("dc:title"),
-        subject: tag("dc:subject"),
-        keywords: tag("cp:keywords"),
-        comments: tag("dc:description"),
-        last_saved_by: tag("cp:lastModifiedBy"),
-        revision: tag("cp:revision"),
-        created: parse_iso(&tag("dcterms:created")),
-        modified: parse_iso(&tag("dcterms:modified")),
+        author: core_element(xml, "dc:creator"),
+        title: core_element(xml, "dc:title"),
+        subject: core_element(xml, "dc:subject"),
+        keywords: core_element(xml, "cp:keywords"),
+        comments: core_element(xml, "dc:description"),
+        last_saved_by: core_element(xml, "cp:lastModifiedBy"),
+        revision: core_element(xml, "cp:revision"),
+        category: core_element(xml, "cp:category"),
+        content_status: core_element(xml, "cp:contentStatus"),
+        created: parse_iso(&core_element(xml, "dcterms:created")),
+        modified: parse_iso(&core_element(xml, "dcterms:modified")),
     }
+}
+
+/// The text of the first `<name …>…</name>` in `xml`, unescaped: a longer
+/// name that `name` begins (`<cp:categoryX>`) is not it, and a self-closing
+/// `<name/>` is empty. Empty when there is none.
+fn core_element(xml: &str, name: &str) -> String {
+    let open = format!("<{name}");
+    let mut from = 0;
+    while let Some(at) = xml[from..].find(&open).map(|i| from + i) {
+        from = at + open.len();
+        if !xml[from..].starts_with(['>', '/', ' ', '\t', '\r', '\n']) {
+            continue;
+        }
+        let Some(gt) = xml[from..].find('>').map(|e| from + e + 1) else {
+            break;
+        };
+        if xml[..gt].ends_with("/>") {
+            return String::new();
+        }
+        let close = format!("</{name}>");
+        return xml[gt..]
+            .find(&close)
+            .map(|e| xml_unescape(&xml[gt..gt + e]))
+            .unwrap_or_default();
+    }
+    String::new()
 }
 
 /// Parse an ISO-8601 timestamp like `2007-11-05T14:54:00Z` (the value is in UTC;
@@ -1139,6 +1162,50 @@ mod tests {
         );
         // no clock → the cached value stands
         assert_eq!(eval_field_ctx(" DATE ", &FieldContext::default()), None);
+    }
+
+    /// Word shows `am/pm` in capitals, as `AM/PM` (#768): its Date and Time
+    /// dialog lists `h:mm am/pm` as "2:05 PM".
+    #[test]
+    fn lower_case_am_pm_shows_in_capitals() {
+        assert_eq!(
+            format_date(&at(2026, 6, 23, 14, 5, 9), "h:mm am/pm"),
+            "2:05 PM"
+        );
+        assert_eq!(
+            format_date(&at(2026, 6, 23, 9, 5, 9), "h:mm:ss am/pm"),
+            "9:05:09 AM"
+        );
+        assert_eq!(
+            format_date(&at(2026, 6, 23, 0, 0, 0), "MMM. d, yy"),
+            "Jun. 23, 26"
+        );
+    }
+
+    /// `FILENAME \p` is the full path; a document never saved shows its name.
+    #[test]
+    fn filename_p_is_the_full_path() {
+        let ctx = FieldContext {
+            filename: "Report.docx".into(),
+            path: r"C:\Docs\Report.docx".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            eval_field_ctx(" FILENAME ", &ctx).as_deref(),
+            Some("Report.docx")
+        );
+        assert_eq!(
+            eval_field_ctx(r" FILENAME \p ", &ctx).as_deref(),
+            Some(r"C:\Docs\Report.docx")
+        );
+        let unsaved = FieldContext {
+            filename: "Document1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            eval_field_ctx(r" FILENAME \p ", &unsaved).as_deref(),
+            Some("Document1")
+        );
     }
 
     #[test]

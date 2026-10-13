@@ -3295,6 +3295,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "new-from-template"
             | "convert"
             | "mail-attach"
+            | "hf-insert-picture"
             | "select-chart"
             | "focus-field"
             | "ribbon-click"
@@ -5522,6 +5523,37 @@ fn dispatch_verb(
                 ),
                 ("status", Json::Str(tab.status.to_string())),
             ]))
+        }
+
+        // Header & Footer › Pictures... without the native file dialog
+        // (#768): the path goes to the same insert the dialog's answer
+        // feeds, at the caret of the open header or footer. A relative path
+        // resolves against the tab's folder.
+        "hf-insert-picture" => {
+            app.refuse_under_dialog()?;
+            let raw = match args.get("path") {
+                Some(Json::Str(path)) => path.as_str(),
+                Some(_) => return Err("'path' must be a string".into()),
+                None => return Err("hf-insert-picture needs a 'path'".into()),
+            };
+            let tab = app.tabs.get(app.active).ok_or("no tab is open")?;
+            if tab.hf_edit.is_none() {
+                return Err("hf-insert-picture needs a header or footer open".into());
+            }
+            let path = match tab.path.as_deref().and_then(Path::parent) {
+                Some(base) if Path::new(raw).is_relative() => base.join(raw),
+                _ => PathBuf::from(raw),
+            };
+            let inserted = app.insert_hf_picture(&path, window, cx);
+            let status = app
+                .tabs
+                .get(app.active)
+                .map(|t| t.status.to_string())
+                .unwrap_or_default();
+            if !inserted {
+                return Err(status);
+            }
+            Done::ok(Json::obj(vec![("status", Json::Str(status))]))
         }
 
         // File > New's Personal templates (#636): a new, untitled document

@@ -49,6 +49,12 @@ pub(crate) enum DialogOwner {
     PageNumberFormat {
         section: usize,
     },
+    /// The Header & Footer tab's Date and Time and Alignment Tab dialogs
+    /// (#768), for the edited story's caret, and Online Pictures, whose
+    /// From a File... runs Pictures... (`Docxy::online_pictures_click`).
+    HfDateTime,
+    HfAlignmentTab,
+    HfOnlinePictures,
     /// The table dialogs (#646, #647), for the edited story's caret or
     /// selection.
     InsertTable,

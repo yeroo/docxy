@@ -2245,16 +2245,7 @@ impl Package {
         // Unused word/media/imageN.<ext> part name — N unique across ALL media
         // parts regardless of extension, so a PNG + SVG pair minted together
         // (the mermaid embed case) never collide on the same N.
-        let mut max_n = 0u32;
-        for (name, _) in &self.parts {
-            if let Some(rest) = name.strip_prefix("word/media/image") {
-                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if let Ok(n) = digits.parse::<u32>() {
-                    max_n = max_n.max(n);
-                }
-            }
-        }
-        let n = max_n + 1;
+        let n = self.unused_media_number();
         let target = format!("image{n}.{ext}");
         let part_name = format!("word/media/{target}");
         self.parts.push((part_name, bytes.to_vec()));
@@ -2300,6 +2291,109 @@ impl Package {
         self.set_part(rels_name, new_rels.into_bytes());
 
         rid
+    }
+
+    /// Add `bytes` (a picture of `kind`, from [`crate::image::sniff`]) as a
+    /// new `word/media/imageN.<ext>` part related from `part`'s own
+    /// relationships (`word/_rels/header1.xml.rels` for a header, #768),
+    /// created when it has none, with a content-type `Default` for the
+    /// extension unless one is declared (in any letter case). The new
+    /// relationship id, for `<a:blip r:embed="…">`; `None` when `part` is
+    /// not in the package or its rels or content types are unreadable.
+    pub fn add_part_image(
+        &mut self,
+        part: &str,
+        bytes: &[u8],
+        kind: &crate::image::ImageInfo,
+    ) -> Option<String> {
+        const IMAGE_REL: &str =
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
+        self.part(part)?;
+        let rels_name = part_rels_name(part)?;
+        let existing = self.part(&rels_name);
+        let had_rels = existing.is_some();
+        let rels_text = match existing {
+            Some(bytes) => decode_xml_part(bytes)?.into_owned(),
+            None => format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"{PACKAGE_RELATIONSHIPS_NS}\"></Relationships>"
+            ),
+        };
+        let ct_bytes = self.part("[Content_Types].xml")?;
+        let ct = decode_xml_part(ct_bytes)?.into_owned();
+        let declared = start_tags(&ct, "Default").into_iter().any(|(_, el)| {
+            xml_attr_value(el, "Extension").is_some_and(|e| e.eq_ignore_ascii_case(kind.ext))
+        });
+        let ct_updated = if declared {
+            None
+        } else {
+            let default = format!(
+                "<Default Extension=\"{}\" ContentType=\"{}\"/>",
+                kind.ext, kind.content_type
+            );
+            Some(encode_like(
+                ct_bytes,
+                &append_to_root(&ct, "Types", &default)?,
+            ))
+        };
+
+        let n = self.unused_media_number();
+        let target = format!("image{n}.{}", kind.ext);
+        // The target is relative to the part's folder; every story part
+        // lives in `word/`, beside `media/`.
+        let rel_target = match part.strip_prefix("word/") {
+            Some(name) if !name.contains('/') => format!("media/{target}"),
+            _ => format!("/word/media/{target}"),
+        };
+        let mut num = next_rid_num(&rels_text);
+        let rels = parse_rels_xml(&rels_text);
+        while rels.target(&format!("rId{num}")).is_some() {
+            num += 1;
+        }
+        let rid = format!("rId{num}");
+        let rel = format!(
+            "<Relationship Id=\"{rid}\" Type=\"{IMAGE_REL}\" Target=\"{}\"/>",
+            esc_xml_attr(&rel_target)
+        );
+        let rels_updated = append_relationships(&rels_text, &rel)?;
+        let rels_bytes = match existing {
+            Some(bytes) => encode_like(bytes, &rels_updated),
+            None => rels_updated.into_bytes(),
+        };
+
+        self.parts
+            .push((format!("word/media/{target}"), bytes.to_vec()));
+        if let Some(ct) = ct_updated {
+            self.set_part("[Content_Types].xml", ct);
+        }
+        let content_types = if had_rels {
+            None
+        } else {
+            self.content_types_with_rels_default()
+        };
+        self.apply_part_rels(PartRelsUpdate {
+            rels_name,
+            rels: rels_bytes,
+            content_types,
+        });
+        Some(rid)
+    }
+
+    /// N for a new `word/media/imageN.*` part: one past the largest in use,
+    /// whatever its extension; past `u32::MAX`, the smallest N not in use.
+    fn unused_media_number(&self) -> u32 {
+        let used: std::collections::BTreeSet<u32> = self
+            .parts
+            .iter()
+            .filter_map(|(name, _)| {
+                let rest = name.strip_prefix("word/media/image")?;
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                digits.parse::<u32>().ok()
+            })
+            .collect();
+        match used.last().copied().unwrap_or(0).checked_add(1) {
+            Some(n) => n,
+            None => (1..).find(|n| !used.contains(n)).unwrap_or(1),
+        }
     }
 
     /// Page size/margins from the captured (final) `sectPr` (US Letter default).
@@ -5940,6 +6034,77 @@ mod tests {
             "new relationship missing from freshly-created rels part: {rels_xml}"
         );
         assert!(pkg.part("word/media/image1.png").is_some());
+    }
+
+    /// #768: a picture in a header is related from the header's own rels,
+    /// created when it has none, never from `document.xml.rels`; a JPEG
+    /// declares `image/jpeg` once, whatever letter case a Default has.
+    #[test]
+    fn add_part_image_relates_from_the_parts_own_rels() {
+        let mut pkg = new_package(Document { body: vec![] });
+        let (_, header) = pkg.create_hf_part(true, "<w:p/>").unwrap();
+        let doc_rels = pkg.part("word/_rels/document.xml.rels").unwrap().to_vec();
+        let jpeg = crate::image::ImageInfo {
+            ext: "jpeg",
+            content_type: "image/jpeg",
+            width: 4,
+            height: 3,
+        };
+        let rid = pkg.add_part_image(&header, b"JPEGBYTES", &jpeg).unwrap();
+        let rels_name = part_rels_name(&header).unwrap();
+        let rels = String::from_utf8(pkg.part(&rels_name).unwrap().to_vec()).unwrap();
+        let target = parse_rels_xml(&rels).target(&rid).unwrap().to_string();
+        assert_eq!(target, "media/image1.jpeg");
+        assert_eq!(pkg.part("word/media/image1.jpeg").unwrap(), b"JPEGBYTES");
+        assert!(rels.contains("/relationships/image\""), "{rels}");
+        assert_eq!(
+            pkg.part("word/_rels/document.xml.rels").unwrap(),
+            &doc_rels[..],
+            "the body's rels are untouched"
+        );
+        let ct = String::from_utf8(pkg.part("[Content_Types].xml").unwrap().to_vec()).unwrap();
+        assert!(
+            ct.contains(r#"<Default Extension="jpeg" ContentType="image/jpeg"/>"#),
+            "{ct}"
+        );
+
+        // A second picture: a new part and id, and no second Default, even
+        // against an upper-case one.
+        let ct = ct.replace(r#"Extension="jpeg""#, r#"Extension="JPEG""#);
+        pkg.set_part("[Content_Types].xml", ct.into_bytes());
+        let rid2 = pkg.add_part_image(&header, b"MORE", &jpeg).unwrap();
+        assert_ne!(rid, rid2);
+        assert_eq!(pkg.part("word/media/image2.jpeg").unwrap(), b"MORE");
+        let ct = String::from_utf8(pkg.part("[Content_Types].xml").unwrap().to_vec()).unwrap();
+        assert_eq!(
+            ct.to_ascii_lowercase()
+                .matches(r#"extension="jpeg""#)
+                .count(),
+            1
+        );
+
+        // It survives a save and a load, related from the header.
+        let saved = load_package(&save_package(&pkg)).unwrap();
+        let rels = String::from_utf8(saved.part(&rels_name).unwrap().to_vec()).unwrap();
+        assert_eq!(
+            parse_rels_xml(&rels).target(&rid2),
+            Some("media/image2.jpeg")
+        );
+        assert_eq!(saved.part("word/media/image2.jpeg").unwrap(), b"MORE");
+
+        // No such part: nothing is added.
+        let before = pkg.parts.len();
+        assert_eq!(pkg.add_part_image("word/header9.xml", b"x", &jpeg), None);
+        assert_eq!(pkg.parts.len(), before);
+
+        // FIX r2 m5: the largest N in use is not followed by an overflow;
+        // the smallest free N is taken, for either way of adding media.
+        pkg.parts
+            .push(("word/media/image4294967295.png".into(), b"x".to_vec()));
+        pkg.add_part_image(&header, b"NEXT", &jpeg).unwrap();
+        assert_eq!(pkg.part("word/media/image3.jpeg").unwrap(), b"NEXT");
+        pkg.add_media_part(b"PNG", "png");
+        assert_eq!(pkg.part("word/media/image4.png").unwrap(), b"PNG");
     }
 
     #[test]

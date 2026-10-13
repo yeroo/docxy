@@ -7060,6 +7060,96 @@ test doc hf-distance/distance: refuses invalid
   assert reply.value is 0.75
   call real-key {"key":"escape"}
 
+test doc hf-date-time: matches the catalogue
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"Edit Header"}
+  call ribbon-click {"tab":"Header & Footer","command":"hf-datetime"}
+  assert dialog is hf-date-time
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc hf-date-time/formats: focus by click
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"Edit Header"}
+  call ribbon-click {"tab":"Header & Footer","command":"hf-datetime"}
+  assert dialog is hf-date-time
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"formats"}
+  call field-read {"dialog-field":"formats"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc hf-date-time/formats: Up and Down step
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"Edit Header"}
+  call ribbon-click {"tab":"Header & Footer","command":"hf-datetime"}
+  assert dialog is hf-date-time
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"formats"}
+  call field-read {"dialog-field":"formats"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"formats"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"formats"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"formats"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc hf-alignment-tab: matches the catalogue
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"Edit Header"}
+  call ribbon-click {"tab":"Header & Footer","command":"hf-align-tab"}
+  assert dialog is hf-alignment-tab
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc hf-alignment-tab/relative: focus by click
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"Edit Header"}
+  call ribbon-click {"tab":"Header & Footer","command":"hf-align-tab"}
+  assert dialog is hf-alignment-tab
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"relative"}
+  call field-read {"dialog-field":"relative"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc hf-alignment-tab/relative: Up and Down step
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"Edit Header"}
+  call ribbon-click {"tab":"Header & Footer","command":"hf-align-tab"}
+  assert dialog is hf-alignment-tab
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"relative"}
+  call field-read {"dialog-field":"relative"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"relative"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"relative"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"relative"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc hf-online-pictures: matches the catalogue
+  open ../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"Edit Header"}
+  call ribbon-click {"tab":"Header & Footer","command":"hf-online-pictures"}
+  assert dialog is hf-online-pictures
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
 test doc page-number-format: matches the catalogue
   open ../fixtures/basic.docx
   call ribbon-click {"tab":"Insert","command":"pn-format"}

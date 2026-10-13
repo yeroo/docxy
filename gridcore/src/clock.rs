@@ -40,9 +40,10 @@ fn shift_serial(serial: f64, offset_minutes: i64) -> f64 {
 }
 
 /// Minutes the local zone is ahead of UTC (local = UTC + this) now: the
-/// daylight bias applies while daylight time is in effect.
+/// daylight bias applies while daylight time is in effect. The suite's
+/// Word fields read their local clock from it too (#768).
 #[cfg(windows)]
-fn local_offset_minutes() -> i64 {
+pub fn local_offset_minutes() -> i64 {
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct SystemTime16 {
@@ -94,7 +95,7 @@ fn local_offset_minutes() -> i64 {
 /// Minutes the local zone is ahead of UTC now, from the C library's
 /// `localtime_r` (which honours `TZ` and the zone database).
 #[cfg(all(unix, target_pointer_width = "64"))]
-fn local_offset_minutes() -> i64 {
+pub fn local_offset_minutes() -> i64 {
     // The leading fields of `struct tm` as glibc, musl, macOS and the BSDs
     // lay them out: nine `int`s, then `tm_gmtoff` and `tm_zone`. The
     // trailing padding covers any extra fields a libc adds after those.
@@ -133,7 +134,7 @@ fn local_offset_minutes() -> i64 {
 }
 
 #[cfg(not(any(windows, all(unix, target_pointer_width = "64"))))]
-fn local_offset_minutes() -> i64 {
+pub fn local_offset_minutes() -> i64 {
     0
 }
 

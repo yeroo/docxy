@@ -2,10 +2,12 @@
 //! footer is being edited, and the Insert tab's Header and Footer menus.
 //!
 //! Groups, in Word's order: Header & Footer (the Header, Footer and Page
-//! Number menus), Insert, Navigation (Go to Header/Footer, Previous, Next,
-//! Link to Previous), Options (Different First Page, Different Odd & Even
-//! Pages, Show Document Text), Position (Header from Top, Footer from Bottom)
-//! and Close.
+//! Number menus), Insert (Date & Time..., Document Info, Quick Parts,
+//! Pictures..., Online Pictures..., #768: see [`crate::hf_insert`]),
+//! Navigation (Go to Header/Footer, Previous, Next, Link to Previous), Options
+//! (Different First Page, Different Odd & Even Pages, Show Document Text),
+//! Position (Header from Top, Footer from Bottom, Insert Alignment Tab) and
+//! Close.
 //!
 //! Every command acts on the section and variant being edited
 //! ([`HfEdit::section`]), else the body caret's section. Section edits (link
@@ -21,6 +23,7 @@ use crate::hf::PageSlot;
 use crate::page_flow;
 use crate::page_setup::{ok_cancel, text_of, twips_of};
 use ctlcore::json::Json;
+use docxcore::sdt::CoreProp;
 use docxcore::sect::{TWIPS_PER_INCH, hf_reference, set_hf_reference};
 
 /// The namespaces header/footer content the editor writes uses.
@@ -58,6 +61,20 @@ pub(crate) enum HfAct {
     Close,
     /// A Page Number menu command (#650).
     PageNumber(crate::page_number::PnAct),
+    /// Date & Time...: the Date and Time dialog (#768).
+    DateTime,
+    /// Document Info › File Name (`false`) or File Path (`true`): a
+    /// `FILENAME` field.
+    FileName(bool),
+    /// A document property control: Document Info › Author and Document
+    /// Title, and Document Property › in both menus.
+    Property(CoreProp),
+    /// Pictures...: a picture from a file.
+    Pictures,
+    /// Online Pictures...: its dialog, which offers a file instead.
+    OnlinePictures,
+    /// Insert Alignment Tab: the Alignment Tab dialog.
+    AlignmentTab,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -67,6 +84,8 @@ pub(crate) enum HfMenu {
     PageNumber,
     HeaderFromTop,
     FooterFromBottom,
+    DocumentInfo,
+    QuickParts,
 }
 
 /// A design of the Header and Footer galleries: its name and paragraphs.
@@ -92,12 +111,44 @@ pub(crate) const DESIGNS: [Design; 2] = [
 const DISTANCES: [i32; 5] = [0, 432, 720, 1080, 1440];
 
 /// Button ids, shared by the tab, the menus and the Insert tab.
-const MENU_IDS: [(HfMenu, &str); 5] = [
+const MENU_IDS: [(HfMenu, &str); 7] = [
     (HfMenu::Header, "hf-header"),
     (HfMenu::Footer, "hf-footer"),
     (HfMenu::PageNumber, "hf-pagenum"),
     (HfMenu::HeaderFromTop, "hf-top"),
     (HfMenu::FooterFromBottom, "hf-bottom"),
+    (HfMenu::DocumentInfo, "hf-docinfo"),
+    (HfMenu::QuickParts, "hf-quickparts"),
+];
+
+/// Document Property ›'s items' ids in each menu, in [`CoreProp::ALL`]'s
+/// order, and the labels the ribbon's flat item list gives them.
+const INFO_PROP_IDS: [&str; 7] = [
+    "hf-info-prop-author",
+    "hf-info-prop-category",
+    "hf-info-prop-comments",
+    "hf-info-prop-keywords",
+    "hf-info-prop-status",
+    "hf-info-prop-subject",
+    "hf-info-prop-title",
+];
+const QP_PROP_IDS: [&str; 7] = [
+    "hf-qp-prop-author",
+    "hf-qp-prop-category",
+    "hf-qp-prop-comments",
+    "hf-qp-prop-keywords",
+    "hf-qp-prop-status",
+    "hf-qp-prop-subject",
+    "hf-qp-prop-title",
+];
+const PROP_ITEM_LABELS: [&str; 7] = [
+    "Document Property: Author",
+    "Document Property: Category",
+    "Document Property: Comments",
+    "Document Property: Keywords",
+    "Document Property: Status",
+    "Document Property: Subject",
+    "Document Property: Title",
 ];
 
 /// The menu a button or box opens, by its id.
@@ -217,6 +268,67 @@ pub(crate) fn hf_dropdowns() -> Vec<Control<Act>> {
     ]
 }
 
+/// Document Info's commands before Document Property › (Word's order).
+fn doc_info_head() -> [rs::Cmd<Act>; 4] {
+    [
+        rs::cmd(
+            "hf-info-author",
+            "",
+            "Author",
+            hf(HfAct::Property(CoreProp::Author)),
+        ),
+        rs::cmd(
+            "hf-info-filename",
+            "",
+            "File Name",
+            hf(HfAct::FileName(false)),
+        ),
+        rs::cmd(
+            "hf-info-filepath",
+            "",
+            "File Path",
+            hf(HfAct::FileName(true)),
+        ),
+        rs::cmd(
+            "hf-info-title",
+            "",
+            "Document Title",
+            hf(HfAct::Property(CoreProp::Title)),
+        ),
+    ]
+}
+
+/// Document Property ›'s commands with `ids`, under `labels`.
+fn property_cmds(ids: &[&'static str; 7], labels: &[&'static str; 7]) -> Vec<rs::Cmd<Act>> {
+    CoreProp::ALL
+        .iter()
+        .zip(ids.iter().zip(labels))
+        .map(|(p, (id, label))| rs::cmd(id, "", label, hf(HfAct::Property(*p))))
+        .collect()
+}
+
+/// The Document Info drop-down's items, flat: Document Property ›'s each
+/// named "Document Property: …" (the menu nests them).
+fn doc_info_cmds() -> Vec<rs::Cmd<Act>> {
+    let mut out: Vec<rs::Cmd<Act>> = doc_info_head().into();
+    out.extend(property_cmds(&INFO_PROP_IDS, &PROP_ITEM_LABELS));
+    out.push(rs::cmd(
+        "hf-info-field",
+        "case",
+        "Field...",
+        Act::InsertField,
+    ));
+    out
+}
+
+/// The Quick Parts drop-down's items, flat; AutoText and the Building
+/// Blocks commands have no command behind them (see [`menu_items`]).
+fn quick_parts_cmds() -> Vec<rs::Cmd<Act>> {
+    let mut out = property_cmds(&QP_PROP_IDS, &PROP_ITEM_LABELS);
+    out.push(rs::cmd("hf-qp-field", "case", "Field...", Act::InsertField));
+    out
+}
+
 /// The contextual Header & Footer tab.
 pub(crate) fn hf_tab() -> rs::Tab<Act> {
     rs::tab(
@@ -227,9 +339,76 @@ pub(crate) fn hf_tab() -> rs::Tab<Act> {
             rs::group(
                 "Insert",
                 20,
-                vec![Control::Large(
-                    cmdt("hf-field", "case", "Field", Act::InsertField, "").key("Q"),
-                )],
+                vec![
+                    Control::Large(
+                        cmdt(
+                            "hf-datetime",
+                            "mail-update",
+                            "Date & Time...",
+                            hf(HfAct::DateTime),
+                            "",
+                        )
+                        .tip(
+                            "Insert Date and Time",
+                            "Add the current date or time to the header or footer.",
+                            "",
+                        )
+                        .key("D"),
+                    ),
+                    Control::Dropdown {
+                        cmd: cmdt(
+                            "hf-docinfo",
+                            "info",
+                            "Document Info",
+                            hf(HfAct::Menu(HfMenu::DocumentInfo)),
+                            "",
+                        )
+                        .tip(
+                            "Document Info",
+                            "Insert the author, file name, file path or title.",
+                            "",
+                        )
+                        .key("I"),
+                        items: doc_info_cmds(),
+                    },
+                    Control::Dropdown {
+                        cmd: cmdt(
+                            "hf-quickparts",
+                            "case",
+                            "Quick Parts",
+                            hf(HfAct::Menu(HfMenu::QuickParts)),
+                            "",
+                        )
+                        .tip(
+                            "Explore Quick Parts",
+                            "Insert a document property or a field.",
+                            "",
+                        )
+                        .key("Q"),
+                        items: quick_parts_cmds(),
+                    },
+                    Control::Large(
+                        cmdt(
+                            "hf-pictures",
+                            "image",
+                            "Pictures...",
+                            hf(HfAct::Pictures),
+                            "",
+                        )
+                        .tip("This Device...", "Insert a picture from a file.", "")
+                        .key("PI"),
+                    ),
+                    Control::Large(
+                        cmdt(
+                            "hf-online-pictures",
+                            "image",
+                            "Online Pictures...",
+                            hf(HfAct::OnlinePictures),
+                            "",
+                        )
+                        .key("F"),
+                    ),
+                ],
             ),
             rs::group(
                 "Navigation",
@@ -328,6 +507,21 @@ pub(crate) fn hf_tab() -> rs::Tab<Act> {
                         .key("PF"),
                         wide: false,
                     }],
+                    vec![rs::Cell::Btn(
+                        cmdt(
+                            "hf-align-tab",
+                            "align-right",
+                            "Insert Alignment Tab",
+                            hf(HfAct::AlignmentTab),
+                            "",
+                        )
+                        .tip(
+                            "Insert Alignment Tab",
+                            "Align the text after it left, centered or right, against the margin or the indent.",
+                            "",
+                        )
+                        .key("B"),
+                    )],
                 ])],
             ),
             rs::group(
@@ -392,7 +586,60 @@ pub(crate) fn menu_items(tab: Option<&DocTab>, menu: HfMenu) -> Vec<menu::MenuIt
             )));
             items
         }
+        HfMenu::DocumentInfo => {
+            let mut items: Vec<menu::MenuItem> = doc_info_head().into_iter().map(entry).collect();
+            items.push(property_menu("hf-info-prop", &INFO_PROP_IDS));
+            items.push(field_item("hf-info-field"));
+            items
+        }
+        // AutoText and the Building Blocks commands are drawn for Word's
+        // order with no command behind them: docxy has no building blocks
+        // (a glossary document) yet.
+        HfMenu::QuickParts => vec![
+            menu::MenuItem::Item(menu::Entry::unavailable("hf-qp-autotext", "AutoText")),
+            property_menu("hf-qp-prop", &QP_PROP_IDS),
+            field_item("hf-qp-field"),
+            menu::MenuItem::Separator,
+            menu::MenuItem::Item(menu::Entry::unavailable(
+                "hf-qp-organizer",
+                "Building Blocks Organizer...",
+            )),
+            menu::MenuItem::Item(menu::Entry::unavailable(
+                "hf-qp-save",
+                "Save Selection to Quick Part Gallery...",
+            )),
+        ],
     }
+}
+
+/// Document Property ›: the core properties, by `ids`.
+fn property_menu(id: &str, ids: &[&str; 7]) -> menu::MenuItem {
+    let mut e = menu::Entry::unavailable(id, "Document Property");
+    e.enabled = true;
+    e.submenu = CoreProp::ALL
+        .iter()
+        .zip(ids)
+        .map(|(p, id)| {
+            menu::MenuItem::Item(menu::Entry::new(
+                id,
+                p.label(),
+                "",
+                hf(HfAct::Property(*p)),
+                true,
+            ))
+        })
+        .collect();
+    menu::MenuItem::Item(e)
+}
+
+fn field_item(id: &str) -> menu::MenuItem {
+    menu::MenuItem::Item(menu::Entry::new(
+        id,
+        "Field...",
+        "case",
+        Act::InsertField,
+        true,
+    ))
 }
 
 /// The section and variant the header/footer commands act on: the edited
@@ -845,7 +1092,16 @@ pub(crate) fn hf_apply(tab: &mut DocTab, act: HfAct) -> Result<(), String> {
             };
             tab.status = format!("{name}: {}\"", crate::page_setup::inches(twips)).into();
         }
-        HfAct::Menu(_) | HfAct::CustomDistance(_) | HfAct::Close | HfAct::PageNumber(_) => {}
+        HfAct::Menu(_)
+        | HfAct::CustomDistance(_)
+        | HfAct::Close
+        | HfAct::PageNumber(_)
+        | HfAct::DateTime
+        | HfAct::FileName(_)
+        | HfAct::Property(_)
+        | HfAct::Pictures
+        | HfAct::OnlinePictures
+        | HfAct::AlignmentTab => {}
     }
     Ok(())
 }
@@ -984,6 +1240,12 @@ impl Docxy {
                 }
             }
             HfAct::PageNumber(pn) => return self.page_number_act(pn, window, cx),
+            HfAct::DateTime
+            | HfAct::FileName(_)
+            | HfAct::Property(_)
+            | HfAct::Pictures
+            | HfAct::OnlinePictures
+            | HfAct::AlignmentTab => return self.hf_insert_act(act, window, cx),
             _ => {
                 let was_open = self.hf_active();
                 if let Some(tab) = self.tabs.get_mut(self.active) {
