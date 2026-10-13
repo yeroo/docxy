@@ -434,6 +434,29 @@ pointer over that cell, `{}` moves it off the grid, and `{"cols": c, "rows": r,
 refused unless the Insert > Table menu is open (`ribbon-click
 {"tab":"Insert","command":"table"}` opens it). `word-tables.uit` drives it.
 
+Hovering a grid cell or a Table Styles tile draws a live preview (#764): the
+document as the click would leave it, drawn in place of the real one, which
+is not changed (no undo step, not dirty). `state.preview` is what the last
+frame drew in place of the document, or null: `{"kind": "grid", "cols": c,
+"rows": r, ...}` or `{"kind": "style", ...}`, with `tables` (the drawn
+document's tables, nested ones too), `style` (the drawn caret table's style)
+and `pages` (the pages drawn; null in Draft). A verb only marks the view
+dirty, so settle a frame with `shot window` before reading it. A preview is
+drawn only while it is current: no edit and no caret or selection move since
+the hover, the grid's menu open on that cell or the gallery showing, and none
+while a header or footer is being edited, in Protected View or a final
+document, in Display for Review's No Markup or Original, or with a table pen
+on.
+
+`gallery-hover {"gallery": "tablestyles", "item": "<label>"}` moves the
+pointer onto that Table Styles tile (the labels `ribbon-click
+tablestyles:<label>` takes), and `{"gallery": "tablestyles"}` off the
+gallery, through the handler the drawn tiles call. It is refused unless the
+gallery shows: the Table Design tab current (`ribbon-layout {"tab": "Table
+Design"}` shows it) with the group drawn in place, or its flyout open
+(`ribbon-flyout {"action": "open", "group": "Table Styles"}`) in a narrow
+window. The reply is `{state}`.
+
 `table-draw {"from": [x, y], "to": [x, y]}` is a table pen gesture (#763): a
 press at `from`, a drag to `to` and the release, through the handlers a mouse
 gesture runs, with Draw Table or the Eraser on (Insert > Table > Draw Table,

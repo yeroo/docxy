@@ -531,7 +531,7 @@ pub(crate) fn table_design_tab() -> rs::Tab<Act> {
                 ],
             ),
             rs::group(
-                "Table Styles",
+                STYLES_GROUP,
                 40,
                 vec![
                     Control::Gallery(rs::Gallery {
@@ -843,6 +843,10 @@ impl Docxy {
         }
         if self.table_grid_hover != at {
             self.table_grid_hover = at;
+            match at {
+                Some((cols, rows)) => self.set_doc_preview(PreviewKind::Grid { cols, rows }),
+                None => self.drop_grid_preview(),
+            }
             cx.notify();
         }
         Ok(())
@@ -858,8 +862,8 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         self.table_grid_hover(Some((cols, rows)), cx)?;
+        // Closing the menu forgets the hover and drops its preview.
         self.close_menu();
-        self.table_grid_hover = None;
         self.insert_table(rows, cols, docxcore::table::AutoFit::Default, window, cx);
         Ok(())
     }
@@ -1292,6 +1296,22 @@ impl Docxy {
                         let label = it.label;
                         move |w, cx| Tooltip::new(label).build(w, cx)
                     })
+                    .on_hover(cx.listener(move |this, over: &bool, _, cx| {
+                        let Act::Table(TableAct::Style(i)) = act else {
+                            return;
+                        };
+                        if *over {
+                            this.table_style_hover(Some(i), cx);
+                        } else if this
+                            .doc_preview
+                            .as_ref()
+                            .is_some_and(|p| p.kind == PreviewKind::Style(i))
+                        {
+                            // Leaving this tile; another one may already have
+                            // taken the preview.
+                            this.table_style_hover(None, cx);
+                        }
+                    }))
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.dispatch(act, window, cx)),
                     )
@@ -1312,6 +1332,256 @@ impl Docxy {
             .bg(hsla_u(0xFAFAFA))
             .children(tiles)
             .into_any_element()
+    }
+}
+
+/// The Table Design group that holds the Table Styles gallery.
+const STYLES_GROUP: &str = "Table Styles";
+
+/// What a live preview (#764) shows: the table the Insert > Table grid's
+/// hovered cell would insert, or the caret's table in a hovered Table
+/// Styles tile's style (`BUILTIN[i]`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum PreviewKind {
+    Grid { cols: usize, rows: usize },
+    Style(usize),
+}
+
+/// A live preview (#764): the document as a hovered command would leave
+/// it, drawn in place of the real one and never saved. It holds the
+/// document it was built from (the tab, the edit generation, the caret and
+/// selection), and is drawn only while that is still what the tab shows.
+pub(crate) struct DocPreview {
+    pub(crate) tab: usize,
+    /// How many documents the window had, as `RibbonFlyout` keeps it: a
+    /// close shifts the indexes, and another document can take `tab`'s.
+    pub(crate) docs: usize,
+    pub(crate) generation: u64,
+    pub(crate) caret: docxcore::editor::Caret,
+    pub(crate) anchor: Option<docxcore::editor::Caret>,
+    pub(crate) kind: PreviewKind,
+    pub(crate) editor: Editor,
+}
+
+impl DocPreview {
+    /// Whether this preview still shows `ed`, tab `active` of `docs`'s
+    /// editor, at edit generation `generation`: built from that tab, with no
+    /// edit since, the
+    /// caret and selection where they were, and the hovered control
+    /// `showing`. A caret moved by a key while the pointer rests on a tile
+    /// would otherwise draw the old table restyled.
+    pub(crate) fn current(
+        &self,
+        (active, docs): (usize, usize),
+        ed: &Editor,
+        generation: u64,
+        showing: bool,
+    ) -> bool {
+        showing
+            && self.tab == active
+            && self.docs == docs
+            && self.generation == generation
+            && self.caret == ed.caret
+            && self.anchor == ed.anchor
+    }
+}
+
+/// What the frame drew in place of the document (#764), for the harness's
+/// `state.preview`: the preview's kind, its tables (nested ones too), the
+/// caret table's style, and the pages (Print Layout only).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DrawnPreview {
+    pub(crate) kind: PreviewKind,
+    pub(crate) tables: usize,
+    pub(crate) style: Option<String>,
+    pub(crate) pages: Option<usize>,
+}
+
+impl DrawnPreview {
+    /// What drawing `p` shows; the Print Layout path adds its pages.
+    pub(crate) fn of(p: &DocPreview) -> Self {
+        DrawnPreview {
+            kind: p.kind,
+            tables: count_tables(&p.editor.doc.body),
+            style: p.editor.table_style(),
+            pages: None,
+        }
+    }
+}
+
+/// The tables in `blocks`, nested ones included.
+pub(crate) fn count_tables(blocks: &[Block]) -> usize {
+    blocks
+        .iter()
+        .map(|b| match b {
+            Block::Table(t) => {
+                1 + t
+                    .rows
+                    .iter()
+                    .flat_map(|r| &r.cells)
+                    .map(|c| count_tables(&c.blocks))
+                    .sum::<usize>()
+            }
+            _ => 0,
+        })
+        .sum()
+}
+
+/// `target` as `kind`'s command would leave it, on a copy: the real editor
+/// is only read. `None` when the command would be refused there, so a
+/// refused preview draws nothing different.
+pub(crate) fn build_preview(target: &Editor, kind: PreviewKind) -> Option<Editor> {
+    let mut ed = target.preview_copy();
+    match kind {
+        PreviewKind::Grid { cols, rows } => ed
+            .insert_table(rows, cols, docxcore::table::AutoFit::Default)
+            .ok()?,
+        PreviewKind::Style(i) => ed.set_table_style(BUILTIN.get(i)?.id).ok()?,
+    }
+    Some(ed)
+}
+
+/// Whether tab `tab` takes a live preview: a document's body, not a header
+/// or footer being edited (drawn by its own path), not Protected View or a
+/// final document, not a Display for Review view that shows text other
+/// than the document's (`view_only`, where the command is refused), and no
+/// table pen on (`pen`: the pens read the geometry the frame drew).
+pub(crate) fn preview_allowed(tab: &DocTab, view_only: bool, pen: bool) -> bool {
+    matches!(tab.surface, Surface::Doc(_))
+        && tab.hf_edit.is_none()
+        && !tab.access.locked()
+        && !view_only
+        && !pen
+}
+
+impl Docxy {
+    /// Show `kind`'s live preview in the active document, or none where
+    /// its command would be refused. Built once here, on a hover change,
+    /// never per frame.
+    fn set_doc_preview(&mut self, kind: PreviewKind) {
+        self.doc_preview = self.doc_preview_of(kind);
+    }
+
+    fn doc_preview_of(&self, kind: PreviewKind) -> Option<DocPreview> {
+        let tab = self.tabs.get(self.active)?;
+        if !preview_allowed(tab, self.view_only_active(), self.draw_tool().is_some()) {
+            return None;
+        }
+        let Surface::Doc(ed) = &tab.surface else {
+            return None;
+        };
+        Some(DocPreview {
+            tab: self.active,
+            docs: self.tabs.len(),
+            generation: edit_generation(),
+            caret: ed.caret.clone(),
+            anchor: ed.anchor.clone(),
+            kind,
+            editor: build_preview(ed, kind)?,
+        })
+    }
+
+    /// Drop the live preview when it is the Insert > Table grid's; a Table
+    /// Styles one belongs to the ribbon, not to the menu.
+    pub(crate) fn drop_grid_preview(&mut self) {
+        if self
+            .doc_preview
+            .as_ref()
+            .is_some_and(|p| matches!(p.kind, PreviewKind::Grid { .. }))
+        {
+            self.doc_preview = None;
+        }
+    }
+
+    /// Drop the live preview once [`Self::shown_preview`] rejects it. The
+    /// render calls it each frame, so a preview whose control was hidden
+    /// by a path that fires no leave (Esc closing the flyout, Ctrl+F1, a
+    /// KeyTips tab switch) is gone, not drawn again when the control comes
+    /// back with nothing hovered.
+    pub(crate) fn drop_stale_preview(&mut self, window: &Window) {
+        if self.doc_preview.is_some() && self.shown_preview(window).is_none() {
+            self.doc_preview = None;
+        }
+    }
+
+    /// The live preview to draw in place of the active document this
+    /// frame, if any: still current ([`DocPreview::current`]), still
+    /// allowed, and its control still on screen (the grid's menu open on
+    /// that cell; the Table Styles gallery showing). A preview it rejects is
+    /// dropped by the next frame ([`Self::drop_stale_preview`]), so
+    /// correctness rests on this check, not on every path that hides the
+    /// control clearing it.
+    pub(crate) fn shown_preview(&self, window: &Window) -> Option<&DocPreview> {
+        let p = self.doc_preview.as_ref()?;
+        let tab = self.tabs.get(self.active)?;
+        let Surface::Doc(ed) = &tab.surface else {
+            return None;
+        };
+        if !preview_allowed(tab, self.view_only_active(), self.draw_tool().is_some()) {
+            return None;
+        }
+        let showing = match p.kind {
+            PreviewKind::Grid { cols, rows } => {
+                self.table_grid_open().is_ok() && self.table_grid_hover == Some((cols, rows))
+            }
+            PreviewKind::Style(_) => self.table_styles_showing(window),
+        };
+        p.current(
+            (self.active, self.tabs.len()),
+            ed,
+            edit_generation(),
+            showing,
+        )
+        .then_some(p)
+    }
+
+    /// Whether the Table Styles gallery is on screen: the Table Design tab
+    /// shows (the caret in a body table, the ribbon body drawn), and its
+    /// group is drawn in place, or collapsed (#1020) with its flyout open.
+    /// It reads the ribbon fit the frame draws from (`ribbon_fit_now`).
+    pub(crate) fn table_styles_showing(&self, window: &Window) -> bool {
+        if self.backstage || self.ribbon_body_hidden() || !self.ribbon_is_model() {
+            return false;
+        }
+        let tab = valid_ribbon_tab(
+            self.ribbon_kind(),
+            self.ribbon_tab,
+            self.caret_in_table(),
+            self.project_gantt_showing(),
+            self.hf_active(),
+        );
+        if tab != RibbonTab::TableDesign {
+            return false;
+        }
+        let now = self.ribbon_fit_now(window);
+        let Some(i) = now.titles.iter().position(|t| *t == STYLES_GROUP) else {
+            return false;
+        };
+        // Collapsed or in the chevron: reached through its flyout only.
+        if now.fit.in_flyout(i) {
+            self.ribbon_flyout.is_some_and(|f| {
+                f.target == FlyoutTarget::Group(STYLES_GROUP) && self.flyout_still_fits(f, window)
+            })
+        } else {
+            true
+        }
+    }
+
+    /// The pointer over Table Styles tile `BUILTIN[i]` (`None`: off the
+    /// gallery): the caret's table is previewed in that style (#764).
+    pub(crate) fn table_style_hover(&mut self, at: Option<usize>, cx: &mut Context<Self>) {
+        let now = self.doc_preview.as_ref().map(|p| p.kind);
+        match at {
+            Some(i) if now != Some(PreviewKind::Style(i)) => {
+                self.set_doc_preview(PreviewKind::Style(i));
+                cx.notify();
+            }
+            None if matches!(now, Some(PreviewKind::Style(_))) => {
+                self.doc_preview = None;
+                cx.notify();
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1575,5 +1845,109 @@ mod tests {
         );
         assert_eq!(grid_header(None), "Insert Table");
         assert_eq!(grid_header(Some((4, 3))), "4x3 Table");
+    }
+
+    /// A grid preview (#764) is the table the click would insert, built on
+    /// a copy: the real editor keeps its document and its history.
+    #[test]
+    fn a_grid_preview_inserts_on_a_copy_764() {
+        let mut ed = Editor::new(Document {
+            body: vec![Block::Paragraph(Paragraph::default())],
+        });
+        ed.insert_str("x");
+        let before = ed.doc.clone();
+        let p = build_preview(&ed, PreviewKind::Grid { cols: 3, rows: 2 }).unwrap();
+        assert_eq!(count_tables(&p.doc.body), count_tables(&ed.doc.body) + 1);
+        let t = p.table_at_caret().unwrap();
+        let t = p.table(&t.table).unwrap();
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[0].cells.len(), 3);
+        assert_eq!(ed.doc, before);
+        assert!(ed.undo(), "the typing is still the newest step");
+        assert!(!ed.undo());
+        assert!(build_preview(&ed, PreviewKind::Grid { cols: 0, rows: 2 }).is_none());
+        // No undo serial is issued: Repeat (F4) and the typing run read it.
+        let serial = docxcore::editor::undo_serial_counter();
+        build_preview(&ed, PreviewKind::Grid { cols: 3, rows: 2 }).unwrap();
+        build_preview(&ed_in_table(), PreviewKind::Style(7)).unwrap();
+        assert_eq!(docxcore::editor::undo_serial_counter(), serial);
+        assert!(build_preview(&ed, PreviewKind::Grid { cols: 2, rows: 0 }).is_none());
+    }
+
+    #[test]
+    fn a_style_preview_restyles_the_caret_table_on_a_copy_764() {
+        let ed = ed_in_table();
+        let before = ed.doc.clone();
+        let p = build_preview(&ed, PreviewKind::Style(7)).unwrap();
+        assert_eq!(p.table_style().as_deref(), Some(BUILTIN[7].id));
+        assert_eq!(ed.doc, before);
+        assert_ne!(ed.table_style().as_deref(), Some(BUILTIN[7].id));
+        // Outside a table the command is refused, and so is the preview.
+        let plain = Editor::new(Document {
+            body: vec![Block::Paragraph(Paragraph::default())],
+        });
+        assert!(build_preview(&plain, PreviewKind::Style(7)).is_none());
+        assert!(build_preview(&ed, PreviewKind::Style(BUILTIN.len())).is_none());
+    }
+
+    /// A preview is dropped once the document it was built on changes: an
+    /// edit (the generation), a caret or selection move, another tab, a
+    /// closed tab, or its control gone from the screen (#764).
+    #[test]
+    fn a_preview_is_current_only_over_the_document_it_was_built_on_764() {
+        let ed = ed_in_table();
+        let p = DocPreview {
+            tab: 1,
+            docs: 2,
+            generation: 5,
+            caret: ed.caret.clone(),
+            anchor: ed.anchor.clone(),
+            kind: PreviewKind::Style(7),
+            editor: build_preview(&ed, PreviewKind::Style(7)).unwrap(),
+        };
+        assert!(p.current((1, 2), &ed, 5, true));
+        assert!(!p.current((1, 2), &ed, 6, true), "an edit since");
+        assert!(!p.current((0, 2), &ed, 5, true), "another tab");
+        assert!(!p.current((1, 1), &ed, 5, true), "a tab closed");
+        assert!(!p.current((1, 2), &ed, 5, false), "not showing");
+        let mut moved = ed.preview_copy();
+        moved.caret = Caret::at(vec![0, 1, 1, 0], 0);
+        assert!(!p.current((1, 2), &moved, 5, true), "the caret moved");
+        let mut selected = ed.preview_copy();
+        selected.anchor = Some(Caret::at(vec![0, 1, 1, 0], 0));
+        assert!(!p.current((1, 2), &selected, 5, true), "a selection made");
+    }
+
+    #[test]
+    fn a_preview_is_not_built_where_the_command_is_refused_764() {
+        let mut t = blank_docx_tab("Preview");
+        assert!(preview_allowed(&t, false, false));
+        assert!(!preview_allowed(&t, true, false), "No Markup / Original");
+        assert!(!preview_allowed(&t, false, true), "a table pen on");
+        t.access.protected = true;
+        assert!(!preview_allowed(&t, false, false), "Protected View");
+        t.access.protected = false;
+        t.access.marked_final = true;
+        assert!(!preview_allowed(&t, false, false), "marked as final");
+        t.access.marked_final = false;
+        t.hf_edit = Some(HfEdit {
+            editor: Editor::new(empty_doc()),
+            part_name: "word/header1.xml".into(),
+            is_header: true,
+            section: 0,
+            variant: docxcore::package::HeaderVariant::Default,
+            show_text: true,
+        });
+        assert!(!preview_allowed(&t, false, false), "a header being edited");
+    }
+
+    #[test]
+    fn count_tables_counts_nested_tables_764() {
+        let mut outer = new_table(1, 1, 9000, AutoFit::Default);
+        outer.rows[0].cells[0]
+            .blocks
+            .push(Block::Table(new_table(1, 1, 4000, AutoFit::Default)));
+        let body = vec![Block::Table(outer), Block::Paragraph(Paragraph::default())];
+        assert_eq!(count_tables(&body), 2);
     }
 }
