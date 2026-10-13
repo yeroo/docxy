@@ -61,12 +61,37 @@ impl Editor {
     /// Insert Table places one, with its row at least `height` twips high
     /// when that is above [`DRAW_MIN_HEIGHT`]. One undo step.
     pub fn draw_table(&mut self, width: u32, height: u32) -> Result<(), String> {
+        let table = self.drawn_table(width, height);
+        self.insert_built_table(table, false)
+    }
+
+    /// [`Editor::draw_table`] after the paragraph at `para`, never inside or
+    /// before it, however short it is: a gesture's table goes after the
+    /// paragraph it was drawn from, and a paragraph always follows it, so it
+    /// never joins a table before or after.
+    pub fn draw_table_after(
+        &mut self,
+        para: &[usize],
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        if super::resolve_para(&self.doc.body, para).is_none() {
+            return Err("there is no paragraph there".into());
+        }
+        self.caret = super::Caret::at(para.to_vec(), 0);
+        let table = self.drawn_table(width, height);
+        self.insert_built_table(table, true)
+    }
+
+    /// The one-cell table a rectangle `width`×`height` twips draws at the
+    /// caret.
+    fn drawn_table(&self, width: u32, height: u32) -> Table {
         let w = width.clamp(DRAW_MIN_WIDTH, width_at(self).max(DRAW_MIN_WIDTH));
         let mut table = new_table(1, 1, w, AutoFit::Fixed(Some(w)));
         if height > DRAW_MIN_HEIGHT {
             set_row_height(&mut table.rows[0], height, Some("atLeast"));
         }
-        self.insert_built_table(table)
+        table
     }
 
     /// Draw a line across the table at `table` with the pen: the cells it
@@ -393,6 +418,40 @@ mod tests {
         };
         assert_eq!(bt.grid, vec![3000]);
         assert_eq!(row_height(&bt.rows[0]).map(|h| h.0), Some(1200));
+    }
+
+    #[test]
+    fn a_table_drawn_after_an_empty_paragraph_never_joins_the_table_before() {
+        // [table][empty paragraph]: the drawn table goes after the paragraph,
+        // and a paragraph follows it.
+        let mut doc = grid_doc(1, 1);
+        doc.body[1] = para("");
+        let mut ed = Editor::new(doc);
+        ed.draw_table_after(&[1], 3000, 0).unwrap();
+        let kinds: Vec<&str> = ed
+            .doc
+            .body
+            .iter()
+            .map(|b| match b {
+                Block::Table(_) => "table",
+                Block::Paragraph(_) => "para",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["table", "para", "table", "para"]);
+        assert_eq!(ed.caret.path, vec![2, 0, 0, 0]);
+        // After a paragraph with text too, and never splitting it.
+        let mut ed = Editor::new(Document {
+            body: vec![para("hello"), para("world")],
+        });
+        ed.caret = Caret::at(vec![1], 2);
+        ed.draw_table_after(&[0], 3000, 0).unwrap();
+        assert!(matches!(ed.doc.body[1], Block::Table(_)));
+        assert_eq!(ed.doc.body.len(), 3, "world follows; nothing split");
+        assert!(ed.undo());
+        assert!(!ed.undo(), "one undo step");
+        assert!(ed.draw_table_after(&[7], 3000, 0).is_err());
+        assert!(!ed.undo());
     }
 
     #[test]

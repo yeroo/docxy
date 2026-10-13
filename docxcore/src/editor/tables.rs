@@ -484,13 +484,14 @@ impl Editor {
             return Err("a table needs at least one row and one column".into());
         }
         let table = new_table(rows, cols, width_at(self), fit);
-        self.insert_built_table(table)
+        self.insert_built_table(table, false)
     }
 
     /// Put `table` at the caret as [`Editor::insert_table`] does: the
     /// paragraph split, nesting, the following paragraph, placeholders,
-    /// revisions and the caret in the first cell. One undo step.
-    pub(super) fn insert_built_table(&mut self, table: Table) -> Result<(), String> {
+    /// revisions and the caret in the first cell. With `after`, it goes after
+    /// the caret's paragraph wherever the caret is in it. One undo step.
+    pub(super) fn insert_built_table(&mut self, table: Table, after: bool) -> Result<(), String> {
         let path = self.caret.path.clone();
         let Some(len) = resolve_para(&self.doc.body, &path).map(para_text_len) else {
             return Err("the caret is not in a paragraph".into());
@@ -504,7 +505,9 @@ impl Editor {
         let Some((cont, idx)) = container_mut(&mut self.doc.body, &path) else {
             return Err("the caret is not in a paragraph".into());
         };
-        let at = if off == 0 {
+        let at = if after {
+            idx + 1
+        } else if off == 0 {
             idx
         } else if off == len {
             idx + 1
