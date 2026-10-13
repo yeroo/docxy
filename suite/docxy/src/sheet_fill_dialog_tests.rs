@@ -386,3 +386,68 @@ fn custom_lists_import_keeps_a_cell_whole() {
         vec![vec!["Smith, John".to_string(), "Doe, Jane".into()]]
     );
 }
+
+/// Press Series › AutoFill's OK over `area` (#759).
+fn autofill_series(t: &mut DocTab, area: &str) {
+    let (a, b) = area.split_once(':').unwrap();
+    let v = view(t);
+    v.anchor = at(a);
+    v.sel = at(b);
+    t.dialogs.push(series_dialog(t).unwrap());
+    let arg =
+        ctlcore::json::Json::obj(vec![("value", ctlcore::json::Json::Str("AutoFill".into()))]);
+    t.dialogs
+        .top_dialog_mut()
+        .unwrap()
+        .set("type", &arg)
+        .unwrap();
+    assert_eq!(series_click(t, "OK", &[]), Some(Ok(())));
+}
+
+#[test]
+fn a_series_that_closes_a_circle_warns() {
+    // #759: AutoFill copies `=$A$3+1` down onto A3, which then reads itself.
+    let mut t = tab();
+    put(view(&mut t), "A1", Cell::formula("$A$3+1"));
+    t.status = "before".into();
+    autofill_series(&mut t, "A1:A3");
+    assert!(t.dirty);
+    assert_eq!(
+        view(&mut t)
+            .sheet()
+            .cell(2, 0)
+            .and_then(|c| c.formula.clone())
+            .as_deref(),
+        Some("$A$3+1")
+    );
+    assert_eq!(t.status.as_ref(), gridcore::circular::CIRCULAR_WARNING);
+}
+
+#[test]
+fn a_series_that_breaks_a_circle_leaves_the_next_one_new() {
+    // #759: the count the view keeps follows the Series down, so a circle
+    // made after it warns.
+    let mut t = tab();
+    put(view(&mut t), "A3", Cell::formula("A3+1"));
+    t.sheet_edited();
+    assert_eq!(t.status.as_ref(), gridcore::circular::CIRCULAR_WARNING);
+    put(view(&mut t), "A1", Cell::formula("B1"));
+    t.status = "before".into();
+    autofill_series(&mut t, "A1:A3");
+    assert_eq!(
+        view(&mut t)
+            .sheet()
+            .cell(2, 0)
+            .and_then(|c| c.formula.clone())
+            .as_deref(),
+        Some("B3")
+    );
+    assert_eq!(
+        t.status.as_ref(),
+        "before",
+        "breaking a circle does not warn"
+    );
+    put(view(&mut t), "C5", Cell::formula("C5*2"));
+    t.sheet_edited();
+    assert_eq!(t.status.as_ref(), gridcore::circular::CIRCULAR_WARNING);
+}

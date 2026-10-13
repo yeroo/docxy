@@ -276,6 +276,9 @@ fn commit_changed_cell(tab: &mut DocTab) -> Result<(), String> {
             crate::bump_edit_generation();
             v.anchor = v.sel;
             v.clear_areas();
+            // Keep the view's circle count current (#759); Save's own status
+            // follows.
+            tab.warn_new_circles(None);
         }
     }
     Ok(())

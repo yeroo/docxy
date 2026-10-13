@@ -162,3 +162,15 @@ fn iterative_book_shows_no_circle() {
     assert_eq!(t.status.as_ref(), "loaded — 1 sheet");
     assert_eq!(note(&mut t), None);
 }
+
+#[test]
+fn replace_all_that_closes_a_circle_keeps_its_count() {
+    // #759: Replace All says how many it replaced, then warns.
+    let mut pkg = blank();
+    pkg.workbook.sheets[0].set_cell(0, 0, Cell::formula("B1+1"));
+    let book = Book::new(&pkg);
+    let mut t = book.open();
+    replace_all_in(&mut t, "B1", "A1");
+    assert_eq!(t.status.as_ref(), format!("replaced 1. {CIRCULAR_WARNING}"));
+    assert_eq!(note(&mut t).as_deref(), Some("Circular References: A1"));
+}

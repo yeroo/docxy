@@ -540,10 +540,42 @@ pub(crate) fn justify_click(tab: &mut DocTab, button: &str) -> Option<Result<(),
     };
     let done = v.justify(true).map(|changed| {
         if changed {
-            tab.dirty = true;
+            tab.sheet_edited();
         }
     });
     Some(done)
+}
+
+/// A press on the Series dialog: OK fills the selection with `lists` as
+/// AutoFill's custom lists.
+pub(crate) fn series_click(
+    tab: &mut DocTab,
+    button: &str,
+    lists: &[Vec<String>],
+) -> Option<Result<(), String>> {
+    let top = tab.dialogs.top()?;
+    if top.owner != DialogOwner::Series || !presses(top, button, "OK") {
+        return None;
+    }
+    let spec = match staged_series(top) {
+        Ok(s) => s,
+        Err(e) => return Some(Err(e)),
+    };
+    let Surface::Sheet(v) = &mut tab.surface else {
+        return Some(Err("Series needs a spreadsheet".into()));
+    };
+    match v.fill_series(&spec, lists) {
+        Ok(n) => {
+            tab.dialogs.pop();
+            if n > 0 {
+                // A series rebases formulas, so it can close (or break) a
+                // circle (#759).
+                tab.sheet_edited();
+            }
+            Some(Ok(()))
+        }
+        Err(e) => Some(Err(e)),
+    }
 }
 
 impl Docxy {
@@ -570,28 +602,8 @@ impl Docxy {
         if let Some(done) = justify_click(tab, button) {
             return Some(done);
         }
-        let top = tab.dialogs.top()?;
-        if top.owner != DialogOwner::Series || !presses(top, button, "OK") {
-            return None;
-        }
-        let spec = match staged_series(top) {
-            Ok(s) => s,
-            Err(e) => return Some(Err(e)),
-        };
-        let Surface::Sheet(v) = &mut tab.surface else {
-            return Some(Err("Series needs a spreadsheet".into()));
-        };
         let lists = self.custom_lists.clone();
-        match v.fill_series(&spec, &lists) {
-            Ok(n) => {
-                tab.dialogs.pop();
-                if n > 0 {
-                    tab.dirty = true;
-                }
-                Some(Ok(()))
-            }
-            Err(e) => Some(Err(e)),
-        }
+        series_click(tab, button, &lists)
     }
 
     /// Open the Series dialog, the Justify question when Justify overflows,
@@ -611,7 +623,7 @@ impl Docxy {
                     return;
                 };
                 match v.justify(false) {
-                    Ok(true) => tab.dirty = true,
+                    Ok(true) => tab.sheet_edited(),
                     Ok(false) => tab.status = "Nothing to justify".into(),
                     Err(e) if e == JUSTIFY_OVERFLOW => tab.dialogs.push(justify_question()),
                     Err(e) => tab.status = e.into(),

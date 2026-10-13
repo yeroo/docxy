@@ -4739,12 +4739,19 @@ impl DocTab {
     /// Protected View that means a gate before it leaked: the edit is rolled
     /// back instead ([`protected_rollback`]), so the tab never turns dirty.
     fn sheet_edited(&mut self) {
+        self.sheet_edited_since(None);
+    }
+
+    /// [`DocTab::sheet_edited`] for an edit whose command set its own status
+    /// since `before` ("replaced 3"): a new circle's warning goes after it
+    /// ([`DocTab::warn_new_circles`]).
+    fn sheet_edited_since(&mut self, before: Option<&SharedString>) {
         if self.access.protected {
             protected_rollback(self);
             return;
         }
         self.set_dirty();
-        self.warn_new_circles(None);
+        self.warn_new_circles(before);
         // An edit may have made a circled value valid (Delete, a fill, a sort).
         if let Surface::Sheet(v) = &mut self.surface {
             v.prune_circles();
@@ -8205,6 +8212,19 @@ pub(crate) fn sheet_app_state(v: &SheetView) -> AppState {
         (Some(_), EditMode::Enter) => AppState::Enter,
         (Some(_), EditMode::Edit) => AppState::Edit,
     }
+}
+
+/// Replace All's edit on a sheet tab: one undo step, the count in the
+/// status, and a new circle's warning after it (#759).
+fn replace_all_in(t: &mut DocTab, q: &str, rep: &str) {
+    let Surface::Sheet(v) = &mut t.surface else {
+        return;
+    };
+    let before = t.status.clone();
+    v.push_undo(SheetStep::Named("Replace"));
+    let n = v.replace_all_cells(q, rep);
+    t.status = format!("replaced {n}").into();
+    t.sheet_edited_since(Some(&before));
 }
 
 /// Excel's status-bar note while a circular reference exists, naming the
@@ -16156,6 +16176,23 @@ impl Docxy {
         }
     }
 
+    /// [`Docxy::mark_sheet_dirty`] for a command that may set its own status
+    /// first; `before` is the status when it began
+    /// ([`DocTab::sheet_edited_since`]).
+    fn mark_sheet_dirty_since(&mut self, before: &SharedString) {
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            t.sheet_edited_since(Some(before));
+        }
+    }
+
+    /// The active tab's status line, for [`Docxy::mark_sheet_dirty_since`].
+    fn active_status(&self) -> SharedString {
+        self.tabs
+            .get(self.active)
+            .map(|t| t.status.clone())
+            .unwrap_or_default()
+    }
+
     /// Whether Protected View (#610, #633) or a final document (#617) hides the
     /// active document or workbook's ribbon commands.
     fn ribbon_locked(&self) -> bool {
@@ -16811,6 +16848,7 @@ impl Docxy {
     /// clipboard still holds a clip whose copy mode is over. Whether it
     /// pasted.
     fn sheet_paste(&mut self, cx: &mut Context<Self>) -> bool {
+        let before = self.active_status();
         if self.sheet_protected() || self.protected_refused(cx) {
             return false;
         }
@@ -16865,7 +16903,9 @@ impl Docxy {
                 self.grid_clip_spend();
             }
             if landed {
-                self.mark_sheet_dirty();
+                // A paste's note ("pasted as a copy") stays, the warning of
+                // a circle it made after it.
+                self.mark_sheet_dirty_since(&before);
             }
             cx.notify();
             return landed;
@@ -17835,14 +17875,9 @@ impl Docxy {
             self.sheet_entry_refused(cx);
             return;
         }
-        self.sheet_snapshot(SheetStep::Named("Replace"));
-        let n = self
-            .active_sheet_mut()
-            .map_or(0, |v| v.replace_all_cells(&q, &rep));
         if let Some(t) = self.tabs.get_mut(self.active) {
-            t.status = format!("replaced {n}").into();
+            replace_all_in(t, &q, &rep);
         }
-        self.mark_sheet_dirty();
         cx.notify();
     }
 
