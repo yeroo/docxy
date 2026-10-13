@@ -821,12 +821,46 @@ fn page_break_before(p: &Paragraph, styles: &StyleSheet) -> bool {
 
 fn emit_blocks(flow: &mut dyn Flow, blocks: &[Block], opts: &PdfOptions) {
     for block in blocks {
-        match block {
-            Block::Paragraph(p) => emit_paragraph(flow, p, opts),
-            Block::Table(t) => emit_table(flow, t, opts),
-            Block::SectionProperties(_) | Block::Raw(_) => {}
-        }
+        emit_block(flow, block, opts);
     }
+}
+
+fn emit_block(flow: &mut dyn Flow, block: &Block, opts: &PdfOptions) {
+    match block {
+        Block::Paragraph(p) => emit_paragraph(flow, p, opts),
+        Block::Table(t) => emit_table(flow, t, opts),
+        Block::SectionProperties(_) | Block::Raw(_) => {}
+    }
+}
+
+/// A header or footer band: its blocks flow down from `top` at `x`/`width`,
+/// except framed paragraphs (a Page Margins number, #767), each laid out at
+/// its own frame's rectangle on the page ([`crate::frame::frame_rect`]).
+fn emit_band(
+    blocks: &[Block],
+    (x, width, top): (f32, f32, f32),
+    geom: &crate::frame::FrameGeom,
+    page_h: f32,
+    opts: &PdfOptions,
+) -> (BandFlow, BandFlow) {
+    let (flow, framed) = crate::frame::split_framed(blocks);
+    let mut band = BandFlow::new(x, width, top);
+    for (_, b) in flow {
+        emit_block(&mut band, b, opts);
+    }
+    let mut frames = BandFlow::new(x, width, top);
+    for (_, p) in framed {
+        let Some(f) = p.props.frame.as_ref() else {
+            continue;
+        };
+        let r = crate::frame::frame_rect(f, geom, crate::frame::line_height(p));
+        let pt = |t: i32| t as f32 / 20.0;
+        let mut one = BandFlow::new(pt(r.x), pt(r.w), page_h - pt(r.y));
+        emit_paragraph(&mut one, p, opts);
+        frames.frags.append(&mut one.frags);
+        frames.links.append(&mut one.links);
+    }
+    (band, frames)
 }
 
 fn emit_paragraph(flow: &mut dyn Flow, p: &Paragraph, opts: &PdfOptions) {
@@ -1165,19 +1199,40 @@ impl<'a> Pager<'a> {
         let mut body_bottom = s.bottom;
         let mut hf_frags = Vec::new();
         let mut hf_links = Vec::new();
+        let twips = |pt: f32| (pt * 20.0).round() as i32;
+        let geom = |band_top: f32| crate::frame::FrameGeom {
+            page_w: twips(s.w),
+            page_h: twips(s.h),
+            left: twips(left),
+            right: twips(right),
+            top: twips(s.top_margin(opts)),
+            bottom: twips(s.bottom),
+            band_top: twips(band_top),
+            even,
+        };
         if let Some(blocks) = part_blocks(parts.and_then(|p| p.headers[variant.index()].as_ref())) {
-            let mut band = BandFlow::new(left, width, s.h - s.header);
-            emit_blocks(&mut band, blocks, opts);
+            let (mut band, mut frames) = emit_band(
+                blocks,
+                (left, width, s.h - s.header),
+                &geom(s.header),
+                s.h,
+                opts,
+            );
             // A tall header pushes the body down.
             body_top = body_top.min(band.low - opts.base_font_size * 0.4);
             hf_frags.append(&mut band.frags);
             hf_links.append(&mut band.links);
+            hf_frags.append(&mut frames.frags);
+            hf_links.append(&mut frames.links);
         }
         if let Some(blocks) = part_blocks(parts.and_then(|p| p.footers[variant.index()].as_ref())) {
             // Lay out from 0, then lift so the last baseline sits at the footer
-            // distance from the bottom edge.
-            let mut band = BandFlow::new(left, width, 0.0);
-            emit_blocks(&mut band, blocks, opts);
+            // distance from the bottom edge. Framed paragraphs sit at their
+            // frame, measured from the page, and are not lifted.
+            let (mut band, mut frames) =
+                emit_band(blocks, (left, width, 0.0), &geom(s.h - s.footer), s.h, opts);
+            hf_frags.append(&mut frames.frags);
+            hf_links.append(&mut frames.links);
             let dy = s.footer - band.low;
             for f in &mut band.frags {
                 f.y += dy;
@@ -3018,6 +3073,44 @@ mod tests {
         Inline::Raw(format!(
             r#"<w:r><w:instrText xml:space="preserve">{text}</w:instrText></w:r>"#
         ))
+    }
+
+    /// Insert › Page Number › Page Margins (#767): the number is drawn in
+    /// the side margin, centred down the page, with the page's own value, on
+    /// odd and even pages, and the header's other text stays in the band.
+    #[test]
+    fn a_margin_page_number_is_drawn_in_the_side_margin() {
+        for design in &crate::hf::PAGE_MARGIN_DESIGNS {
+            let xml = format!(
+                r#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t>HDR</w:t></w:r></w:p>{}</w:hdr>"#,
+                crate::hf::margin_number_sdt_xml(design, 1440, 5)
+            );
+            let header = crate::load::parse_header_footer(&xml, &Default::default());
+            let opts = with_parts(&[("rH", "header1.xml", header)]);
+            let d = three_pages(
+                r#"<w:sectPr><w:headerReference w:type="default" r:id="rH"/><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:bottom="1440" w:left="1440" w:right="1440" w:header="720" w:footer="720"/></w:sectPr>"#,
+            );
+            let pages = pages_of(&d, &opts);
+            assert_eq!(pages.len(), 3);
+            for (i, page) in pages.iter().enumerate().take(2) {
+                let number = (i + 1).to_string();
+                let &(x, y, _) = page
+                    .texts
+                    .iter()
+                    .find(|(_, _, t)| *t == number)
+                    .unwrap_or_else(|| panic!("{number} not on page: {:?}", page.texts));
+                if design.right {
+                    assert!(x > 612.0 - 72.0 && x < 612.0, "{}: x {x}", design.name);
+                } else {
+                    assert!(x > 0.0 && x < 72.0, "{}: x {x}", design.name);
+                }
+                // Centred down the page (the frame's top half holds the line).
+                assert!((300.0..420.0).contains(&y), "{}: y {y}", design.name);
+                // The rest of the header stays in its band.
+                let (hx, hy) = page.at("HDR");
+                assert!(close(hx, 72.0) && close(hy, 792.0 - 36.0 - LH), "{hy}");
+            }
+        }
     }
 
     #[test]
