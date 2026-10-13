@@ -1812,11 +1812,13 @@ fn write_row(s: &mut String, row: &Row) {
     // Cell-level content controls around the cells. An edit can leave a
     // close with nothing open or an open never closed: the first is dropped
     // and the second closed at the row's end, so the row stays well-formed.
+    // Row-level markers go where they were between the cells (#1215).
     let mut open_controls = Vec::new();
     for cell in &row.cells {
         for raw in &cell.sdt_open {
             open_controls.push(write_sdt_open(s, raw, false));
         }
+        s.extend(cell.raw_before.iter().map(String::as_str));
         write_cell(s, cell);
         for raw in &cell.sdt_close {
             if let Some(content_needs_close) = open_controls.pop() {
@@ -1824,6 +1826,7 @@ fn write_row(s: &mut String, row: &Row) {
             }
         }
     }
+    s.extend(row.raw_end.iter().map(String::as_str));
     while let Some(content_needs_close) = open_controls.pop() {
         write_sdt_close(s, "", content_needs_close);
     }
@@ -1912,6 +1915,9 @@ fn write_cell(s: &mut String, cell: &Cell) {
 
 #[cfg(test)]
 mod cell_sdt_tests;
+
+#[cfg(test)]
+mod row_raw_tests;
 
 #[cfg(test)]
 mod tests {

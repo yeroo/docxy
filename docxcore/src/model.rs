@@ -952,6 +952,12 @@ pub struct Cell {
     /// The `</w:sdtContent>`…`</w:sdt>` suffixes of the cell-level controls
     /// closing right after this cell, innermost first.
     pub sdt_close: Vec<String>,
+    /// Row-level children other than cells that come right before this
+    /// cell, verbatim in source order: a `w:commentRangeEnd` between two
+    /// cells, a bookmark, a proofing or permission mark (#1215). Written
+    /// after this cell's `sdt_open`, so one inside a cell-level control's
+    /// content stays inside it; one right before the control moves in.
+    pub raw_before: Vec<String>,
 }
 
 impl Default for Cell {
@@ -965,6 +971,7 @@ impl Default for Cell {
             unsupported_revisions: Vec::new(),
             sdt_open: Vec::new(),
             sdt_close: Vec::new(),
+            raw_before: Vec::new(),
         }
     }
 }
@@ -980,6 +987,11 @@ pub struct Row {
     pub property_change: Option<PropertyChange>,
     /// The `w:tr` start tag's attributes (`w:rsidR`, `w:rsidTr`, `w14:paraId`, …).
     pub element_attrs: ElementAttrs,
+    /// Row-level children other than cells after the last cell (or in a
+    /// row with none), verbatim in source order ([`Cell::raw_before`]).
+    /// One after the last cell inside a cell-level control's content is
+    /// written after the control closes.
+    pub raw_end: Vec<String>,
 }
 
 impl Row {
@@ -987,9 +999,17 @@ impl Row {
     /// they were: a control opening and closing on the removed cell goes with
     /// it, one it opened now opens on the next cell, and one it closed now
     /// closes on the previous cell. So deleting the second cell of a control
-    /// over two cells does not stretch the control over the third.
+    /// over two cells does not stretch the control over the third. The
+    /// row-level markers before it stay between its neighbours: they now
+    /// come before the next cell, or at the row's end.
     pub fn remove_cell(&mut self, i: usize) -> Cell {
         let mut cell = self.cells.remove(i);
+        let before = std::mem::take(&mut cell.raw_before);
+        let after = match self.cells.get_mut(i) {
+            Some(next) => &mut next.raw_before,
+            None => &mut self.raw_end,
+        };
+        after.splice(0..0, before);
         let opens = std::mem::take(&mut cell.sdt_open);
         let closes = std::mem::take(&mut cell.sdt_close);
         // Its closes end its own innermost opens first.

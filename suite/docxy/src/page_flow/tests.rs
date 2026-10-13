@@ -651,14 +651,8 @@ fn zero_height_blocks_keep_the_column_empty() {
     // fresh sheet — instead of being placed mid-column on the full sheet,
     // where it would overrun the end. The wrapper stays in its (heightless)
     // band on the first sheet; every block stays in exactly one range.
-    let rows: Vec<docxcore::model::Row> = (0..30)
-        .map(|_| docxcore::model::Row {
-            cells: vec![],
-            raw_props: vec![],
-            property_change: None,
-            element_attrs: Default::default(),
-        })
-        .collect();
+    let rows: Vec<docxcore::model::Row> =
+        (0..30).map(|_| docxcore::model::Row::default()).collect();
     let cont = letter(r#"<w:type w:val="continuous"/>"#);
     let body = vec![
         body_blocks(&para("One", Some(&letter("")))).remove(0),
@@ -692,14 +686,8 @@ fn fresh_sheet_zero_height_lead_keeps_the_oversize_exception() {
     // so the table stays on the first sheet with the wrapper riding its
     // column. (With `idx == col_start` as the emptiness test the table
     // would move to a second sheet.)
-    let rows: Vec<docxcore::model::Row> = (0..30)
-        .map(|_| docxcore::model::Row {
-            cells: vec![],
-            raw_props: vec![],
-            property_change: None,
-            element_attrs: Default::default(),
-        })
-        .collect();
+    let rows: Vec<docxcore::model::Row> =
+        (0..30).map(|_| docxcore::model::Row::default()).collect();
     let sect = letter("");
     let body = vec![
         Block::Raw(String::new()),

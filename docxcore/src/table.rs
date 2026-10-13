@@ -288,6 +288,8 @@ pub fn template_cell(cell: &Cell) -> Cell {
         unsupported_revisions: Vec::new(),
         sdt_open: Vec::new(),
         sdt_close: Vec::new(),
+        // A new cell never repeats the template's markers (#1215).
+        raw_before: Vec::new(),
     };
     set_cell_props(&mut out, &props);
     out
@@ -317,6 +319,7 @@ pub fn template_row(row: &Row) -> Row {
         property_change: None,
         // The template's rsids; a repeated `w14:paraId` is dropped on save.
         element_attrs: row.element_attrs.clone(),
+        raw_end: Vec::new(),
     }
 }
 
