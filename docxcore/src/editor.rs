@@ -3416,7 +3416,7 @@ fn sdt_typing_props(content: &[Inline], at: usize) -> RunProps {
     }
     source_before(content, at)
         .or_else(|| source_from(content, at))
-        .cloned()
+        .map(RunProps::continued)
         .unwrap_or_default()
 }
 
@@ -3551,17 +3551,19 @@ fn source_from(content: &[Inline], i: usize) -> Option<&RunProps> {
 ///   the nearest source before, then after, it.
 fn typing_props(content: &[Inline], i: usize, local: usize) -> RunProps {
     if local == 0 {
-        return source_from(content, i).cloned().unwrap_or_default();
+        return source_from(content, i)
+            .map(RunProps::continued)
+            .unwrap_or_default();
     }
     if let Inline::Tab(props) | Inline::Break(_, props) = &content[i] {
-        return props.clone();
+        return props.continued();
     }
     content
         .get(i + 1)
         .and_then(source_props)
         .or_else(|| source_before(content, i))
         .or_else(|| source_from(content, i + 1))
-        .cloned()
+        .map(RunProps::continued)
         .unwrap_or_default()
 }
 
@@ -3569,7 +3571,7 @@ fn typing_props(content: &[Inline], i: usize, local: usize) -> RunProps {
 /// last inline is not a run.
 fn end_props(content: &[Inline]) -> RunProps {
     source_before(content, content.len())
-        .cloned()
+        .map(RunProps::continued)
         .unwrap_or_default()
 }
 
@@ -3659,7 +3661,7 @@ fn split_content(content: &mut Vec<Inline>, o: usize) -> Vec<Inline> {
                     let text = r.text.split_off(b);
                     Inline::Run(Run {
                         text,
-                        props: r.props.clone(),
+                        props: r.props.continued(),
                     })
                 }
                 Inline::Hyperlink(h) => Inline::Hyperlink(split_link(h, local)),
@@ -3986,7 +3988,7 @@ fn split_runs(runs: &mut Vec<Run>, o: usize) -> Vec<Run> {
             }
             let b = char_byte(&runs[i].text, local);
             let text = runs[i].text.split_off(b);
-            let props = runs[i].props.clone();
+            let props = runs[i].props.continued();
             let mut rest = runs.split_off(i + 1);
             rest.insert(0, Run { text, props });
             return rest;
@@ -4088,17 +4090,26 @@ fn split_run_with(
     let b2 = char_byte(&r.text, oe);
     let (left, mid, right) = (&r.text[..b1], &r.text[b1..b2], &r.text[b2..]);
     let mut out = Vec::new();
+    // Only the first piece keeps a `w:lastRenderedPageBreak` (#1216).
+    let continued = r.props.continued();
     if !left.is_empty() {
         out.push(Run {
             text: left.to_string(),
             props: r.props.clone(),
         });
     }
-    out.push(mid_fn(mid, &r.props));
+    out.push(mid_fn(
+        mid,
+        if left.is_empty() {
+            &r.props
+        } else {
+            &continued
+        },
+    ));
     if !right.is_empty() {
         out.push(Run {
             text: right.to_string(),
-            props: r.props.clone(),
+            props: continued,
         });
     }
     out
@@ -4245,7 +4256,13 @@ fn title_case(s: &str) -> String {
 }
 
 /// Run properties that `content_insert` will give a character at this caret.
+/// What is made from them (a tab, a break, a field) is new, so a
+/// `w:lastRenderedPageBreak` stays with the text they came from (#1216).
 fn run_props_at(content: &[Inline], offset: usize) -> RunProps {
+    source_props_at(content, offset).continued()
+}
+
+fn source_props_at(content: &[Inline], offset: usize) -> RunProps {
     // Typing into an emptied content control takes the control's formatting.
     if let Some(at) = empty_sdt_at(content, offset) {
         return sdt_typing_props(content, at);
@@ -4272,7 +4289,7 @@ fn run_props_at(content: &[Inline], offset: usize) -> RunProps {
                     .map(|r| r.props.clone())
                     .unwrap_or_default()
             }
-            LinkPart::Content(local) => run_props_at(&h.content, local),
+            LinkPart::Content(local) => source_props_at(&h.content, local),
         },
         _ => typing_props(content, i, local),
     }
@@ -4286,9 +4303,9 @@ fn tab_props_at(content: &[Inline], offset: usize) -> RunProps {
     match locate(content, offset) {
         // A tab into an emptied content control goes inside it, as typing.
         _ if empty_sdt_at(content, offset).is_some() => run_props_at(content, offset),
-        Some((i, _)) if matches!(content[i], Inline::Hyperlink(_)) => {
-            source_before(content, i).cloned().unwrap_or_default()
-        }
+        Some((i, _)) if matches!(content[i], Inline::Hyperlink(_)) => source_before(content, i)
+            .map(RunProps::continued)
+            .unwrap_or_default(),
         _ => run_props_at(content, offset),
     }
 }

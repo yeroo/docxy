@@ -1966,6 +1966,17 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
     // as one `w:r` again (#1101).
     let mut after_text = false;
     let mut after_hyphen = false;
+    // A `w:lastRenderedPageBreak` waiting for the child it stands before.
+    // It ends a text or hyphen join like any element, so its place survives.
+    let mut page_break = false;
+    // The properties of the next inline pushed: `out` holds this `w:r`
+    // only, so every inline after its first continues it (#1216).
+    let shaped = |props: &RunProps, out: &Vec<Inline>, page_break: &mut bool| {
+        let mut props = props.clone();
+        props.shape.joins_prev = !out.is_empty();
+        props.shape.page_break_before = std::mem::take(page_break);
+        props
+    };
     loop {
         let (was_text, was_hyphen) = (after_text, after_hyphen);
         after_text = false;
@@ -1990,7 +2001,7 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
                     }
                     out.push(Inline::Run(Run {
                         text,
-                        props: props.clone(),
+                        props: shaped(&props, out, &mut page_break),
                     }));
                 }
                 // Held in the text as U+2011 / U+00AD; the run's
@@ -2016,12 +2027,13 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
                         text: ch.to_string(),
                         props: RunProps {
                             hyphen_elements: true,
-                            ..props.clone()
+                            ..shaped(&props, out, &mut page_break)
                         },
                     }));
                 }
                 "w:cr" => {
-                    out.push(Inline::Break(BreakKind::Line, props.clone()));
+                    let props = shaped(&props, out, &mut page_break);
+                    out.push(Inline::Break(BreakKind::Line, props));
                     p.skip_element();
                 }
                 "w:br" => {
@@ -2039,11 +2051,19 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
                         (_, Some(clear)) => BreakKind::Clear(clear),
                         _ => BreakKind::Line,
                     };
-                    out.push(Inline::Break(kind, props.clone()));
+                    let mut props = shaped(&props, out, &mut page_break);
+                    props.shape.br_type_explicit = p.attr("w:type") == "textWrapping";
+                    out.push(Inline::Break(kind, props));
                     p.skip_element();
                 }
                 "w:tab" => {
-                    out.push(Inline::Tab(props.clone()));
+                    out.push(Inline::Tab(shaped(&props, out, &mut page_break)));
+                    p.skip_element();
+                }
+                // Word's layout hint, kept on the child after it (#1216). One
+                // with no modeled child after it is dropped.
+                "w:lastRenderedPageBreak" => {
+                    page_break = true;
                     p.skip_element();
                 }
                 "w:drawing"

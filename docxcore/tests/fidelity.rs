@@ -55,68 +55,22 @@ const CLASSES: &[LossClass] = &[
     },
     LossClass {
         name: "run and paragraph content restructured on save (runs merged or split, \
-               lastRenderedPageBreak, special characters)",
+               special characters)",
         issue: "#1069",
         matches: |e| e.part == "word/document.xml" && e.path.starts_with("/w:document/w:body/"),
     },
 ];
 
-/// Run-property findings that are no property loss: a run split by #1069 (a
-/// `w:tab` split off its text, a dropped `w:lastRenderedPageBreak`) makes the comparator pair a run with a different
-/// one, so intact properties read as lost, changed or added. Checked per file
-/// when #1063 was fixed: every character's run properties and run attributes
-/// are the same in the original and the saved file. Listed entry by entry (file,
-/// kind, index-free path under `/w:document/w:body`), so the list cannot claim
-/// a loss in a file or at a path it does not name; such a loss is classed by
-/// the rules below like any other.
-const MISALIGNED_RUNS: &[(&str, &[(Kind, &str)])] = &[
-    (
-        "ext:Normalize/complex0.docx",
-        &[(Kind::LostElement, "/w:p/w:r/w:rPr")],
-    ),
-    (
-        "ext:bookmark/bookmark.docx",
-        &[
-            (Kind::LostElement, "/w:p/w:r/w:rPr"),
-            (Kind::LostElement, "/w:p/w:r/w:rPr/w:vertAlign"),
-        ],
-    ),
-    (
-        "ext:complex0.docx",
-        &[(Kind::LostElement, "/w:p/w:r/w:rPr")],
-    ),
-    (
-        "ext:complexDocx/complex0.docx",
-        &[(Kind::LostElement, "/w:p/w:r/w:rPr")],
-    ),
-    (
-        "ext:footer & header/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx",
-        &[
-            (Kind::LostElement, "/w:p/w:r/w:rPr/w:color"),
-            (Kind::LostElement, "/w:p/w:r/w:rPr/w:i"),
-            (Kind::LostElement, "/w:p/w:r/w:rPr/w:lang"),
-            (Kind::ExtraElement, "/w:p/w:r/w:rPr/w:b"),
-            (Kind::ExtraElement, "/w:p/w:r/w:rPr/w:lang"),
-        ],
-    ),
-    (
-        "ext:mixed features/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx",
-        &[
-            (Kind::LostElement, "/w:p/w:r/w:rPr/w:color"),
-            (Kind::LostElement, "/w:p/w:r/w:rPr/w:i"),
-            (Kind::LostElement, "/w:p/w:r/w:rPr/w:lang"),
-            (Kind::ExtraElement, "/w:p/w:r/w:rPr/w:b"),
-            (Kind::ExtraElement, "/w:p/w:r/w:rPr/w:lang"),
-        ],
-    ),
-    (
-        "ext:table/2007.docx",
-        &[
-            (Kind::LostElement, "/w:p/w:r/w:rPr/w:spacing"),
-            (Kind::ExtraElement, "/w:p/w:r/w:rPr/w:spacing"),
-        ],
-    ),
-];
+/// Run-property findings that are no property loss: a run split by #1069
+/// makes the comparator pair a run with a different one, so intact
+/// properties read as lost, changed or added. Each entry is checked per
+/// file: every character's run properties and run attributes the same in the
+/// original and the saved file. Listed entry by entry (file, kind,
+/// index-free path under `/w:document/w:body`), so the list cannot claim a
+/// loss in a file or at a path it does not name; such a loss is classed by
+/// the rules below like any other. Empty since #1216 keeps a `w:r`'s
+/// children together, which ended every such split in the corpus.
+const MISALIGNED_RUNS: &[(&str, &[(Kind, &str)])] = &[];
 
 /// Whether `e` is one of [`MISALIGNED_RUNS`]; the #1069 class then claims it.
 fn misaligned_runs(e: &Entry) -> bool {

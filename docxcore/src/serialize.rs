@@ -278,8 +278,11 @@ fn write_inlines_tracking_inserts(s: &mut String, content: &[Inline]) {
     let mut i = 0;
     while i < content.len() {
         let Some(meta) = tracked_insert_of(&content[i]) else {
-            write_inline(s, &content[i]);
-            i += 1;
+            let end = (i..content.len())
+                .find(|&j| tracked_insert_of(&content[j]).is_some())
+                .unwrap_or(content.len());
+            write_items(s, content[i..end].iter().map(Item::of), RunTextKind::Normal);
+            i = end;
             continue;
         };
         s.push_str("<w:ins");
@@ -304,10 +307,15 @@ fn write_inlines_tracking_inserts(s: &mut String, content: &[Inline]) {
             s.push('"');
         }
         s.push('>');
+        let start = i;
         while i < content.len() && tracked_insert_of(&content[i]).is_some_and(|m| same(m, meta)) {
-            write_inline(s, &content[i]);
             i += 1;
         }
+        write_items(
+            s,
+            content[start..i].iter().map(Item::of),
+            RunTextKind::Normal,
+        );
         s.push_str("</w:ins>");
     }
 }
@@ -1005,8 +1013,131 @@ enum RunTextKind {
 /// An inline container's children (a link's or a changed revision's), with
 /// their smart-tag boundaries balanced.
 fn write_inline_seq(s: &mut String, content: &[Inline], text_kind: RunTextKind) {
-    for item in balanced_smart_tags(content).iter() {
-        write_inline_with_text_kind(s, item, text_kind);
+    write_items(
+        s,
+        balanced_smart_tags(content).iter().map(Item::of),
+        text_kind,
+    );
+}
+
+/// A run-like inline: what one child (or, for text, children) of a `w:r`
+/// came from.
+#[derive(Clone, Copy)]
+enum Piece<'a> {
+    Run(&'a Run),
+    Tab(&'a RunProps),
+    Break(BreakKind, &'a RunProps),
+}
+
+impl Piece<'_> {
+    fn props(&self) -> &RunProps {
+        match self {
+            Piece::Run(r) => &r.props,
+            Piece::Tab(props) | Piece::Break(_, props) => props,
+        }
+    }
+
+    /// Whether this piece goes in the `w:r` that `first` opened: it came
+    /// from that `w:r` and still has exactly its properties (#1216). How a
+    /// Run writes its hyphens is its own, so `hyphen_elements` is ignored.
+    fn continues(&self, first: &RunProps) -> bool {
+        let next = self.props();
+        if !next.shape.joins_prev {
+            return false;
+        }
+        let bare = |p: &RunProps| RunProps {
+            shape: RunShape::default(),
+            hyphen_elements: false,
+            ..p.clone()
+        };
+        crate::model::strictly_equal(&bare(first), &bare(next))
+    }
+}
+
+/// One item of an inline sequence to write.
+enum Item<'a> {
+    Piece(Piece<'a>),
+    Other(&'a Inline),
+}
+
+impl<'a> Item<'a> {
+    fn of(inline: &'a Inline) -> Self {
+        match inline {
+            Inline::Run(r) => Item::Piece(Piece::Run(r)),
+            Inline::Tab(props) => Item::Piece(Piece::Tab(props)),
+            Inline::Break(kind, props) => Item::Piece(Piece::Break(*kind, props)),
+            other => Item::Other(other),
+        }
+    }
+}
+
+/// `items` in order, the pieces that shared a `w:r` written as that one
+/// `w:r` again (#1216).
+fn write_items<'a>(
+    s: &mut String,
+    items: impl IntoIterator<Item = Item<'a>>,
+    text_kind: RunTextKind,
+) {
+    let mut group: Vec<Piece<'a>> = Vec::new();
+    for item in items {
+        match item {
+            Item::Piece(piece) => {
+                if group
+                    .first()
+                    .is_some_and(|first| !piece.continues(first.props()))
+                {
+                    write_run_group(s, &std::mem::take(&mut group), text_kind);
+                }
+                group.push(piece);
+            }
+            Item::Other(inline) => {
+                write_run_group(s, &std::mem::take(&mut group), text_kind);
+                write_inline_with_text_kind(s, inline, text_kind);
+            }
+        }
+    }
+    write_run_group(s, &group, text_kind);
+}
+
+/// One `w:r` holding `pieces` (none: nothing), with the first's start tag
+/// and properties.
+fn write_run_group(s: &mut String, pieces: &[Piece], text_kind: RunTextKind) {
+    let Some(first) = pieces.first() else {
+        return;
+    };
+    write_run_start(s, first.props());
+    write_rpr(s, first.props());
+    for piece in pieces {
+        if piece.props().shape.page_break_before {
+            s.push_str("<w:lastRenderedPageBreak/>");
+        }
+        match piece {
+            Piece::Run(r) => write_run_children(s, r, text_kind),
+            Piece::Tab(_) => s.push_str("<w:tab/>"),
+            Piece::Break(kind, props) => write_break(s, *kind, props),
+        }
+    }
+    s.push_str("</w:r>");
+}
+
+fn write_break(s: &mut String, kind: BreakKind, props: &RunProps) {
+    // `textWrapping` is the default type: written only when the source had it.
+    let wrapping = if props.shape.br_type_explicit {
+        " w:type=\"textWrapping\""
+    } else {
+        ""
+    };
+    match kind {
+        BreakKind::Line => {
+            s.push_str("<w:br");
+            s.push_str(wrapping);
+            s.push_str("/>");
+        }
+        BreakKind::Page => s.push_str("<w:br w:type=\"page\"/>"),
+        BreakKind::Column => s.push_str("<w:br w:type=\"column\"/>"),
+        BreakKind::Clear(clear) => {
+            s.push_str(&format!("<w:br{wrapping} w:clear=\"{}\"/>", clear.val()))
+        }
     }
 }
 
@@ -1061,30 +1192,12 @@ fn balanced_smart_tags(content: &[Inline]) -> std::borrow::Cow<'_, [Inline]> {
     std::borrow::Cow::Owned(out)
 }
 
-fn write_inline(s: &mut String, item: &Inline) {
-    write_inline_with_text_kind(s, item, RunTextKind::Normal);
-}
-
+/// An inline that is not run-like: run-like ones go through [`write_items`],
+/// which groups them (#1216).
 fn write_inline_with_text_kind(s: &mut String, item: &Inline, text_kind: RunTextKind) {
     match item {
-        Inline::Run(r) => write_run(s, r, text_kind),
-        Inline::Tab(props) => {
-            write_run_start(s, props);
-            write_rpr(s, props);
-            s.push_str("<w:tab/></w:r>");
-        }
-        Inline::Break(kind, props) => {
-            write_run_start(s, props);
-            write_rpr(s, props);
-            match kind {
-                BreakKind::Line => s.push_str("<w:br/>"),
-                BreakKind::Page => s.push_str("<w:br w:type=\"page\"/>"),
-                BreakKind::Column => s.push_str("<w:br w:type=\"column\"/>"),
-                BreakKind::Clear(clear) => {
-                    s.push_str(&format!("<w:br w:clear=\"{}\"/>", clear.val()))
-                }
-            }
-            s.push_str("</w:r>");
+        Inline::Run(_) | Inline::Tab(_) | Inline::Break(..) => {
+            unreachable!("run-like inlines are written by write_items")
         }
         Inline::Hyperlink(h) => {
             if let Some(raw) = &h.raw
@@ -1110,10 +1223,7 @@ fn write_inline_with_text_kind(s: &mut String, item: &Inline, text_kind: RunText
                 } else {
                     s.push_str("<w:hyperlink>");
                 }
-                for run in &h.runs {
-                    write_run(s, run, text_kind);
-                }
-                write_inline_seq(s, &h.content, text_kind);
+                write_link_items(s, h, text_kind);
                 s.push_str("</w:hyperlink>");
                 return;
             }
@@ -1129,10 +1239,7 @@ fn write_inline_with_text_kind(s: &mut String, item: &Inline, text_kind: RunText
                 s.push('"');
             }
             s.push('>');
-            for r in &h.runs {
-                write_run(s, r, text_kind);
-            }
-            write_inline_seq(s, &h.content, text_kind);
+            write_link_items(s, h, text_kind);
             s.push_str("</w:hyperlink>");
         }
         Inline::SmartArt { raw, .. } => s.push_str(raw),
@@ -1173,6 +1280,14 @@ fn write_inline_with_text_kind(s: &mut String, item: &Inline, text_kind: RunText
         }
         Inline::Raw(raw) => s.push_str(raw),
     }
+}
+
+/// A link's runs and then its other content, as one sequence: a run and the
+/// tab after it may share a `w:r` (#1216).
+fn write_link_items(s: &mut String, h: &Hyperlink, text_kind: RunTextKind) {
+    let content = balanced_smart_tags(&h.content);
+    let runs = h.runs.iter().map(|r| Item::Piece(Piece::Run(r)));
+    write_items(s, runs.chain(content.iter().map(Item::of)), text_kind);
 }
 
 fn write_changed_revision(s: &mut String, kind: RevisionKind, raw: &str, content: &[Inline]) {
@@ -1220,8 +1335,11 @@ fn write_run_start(s: &mut String, props: &RunProps) {
 }
 
 fn write_run(s: &mut String, r: &Run, text_kind: RunTextKind) {
-    write_run_start(s, &r.props);
-    write_rpr(s, &r.props);
+    write_run_group(s, &[Piece::Run(r)], text_kind);
+}
+
+/// A Run's text, as the `w:t` (and hyphen) children of its `w:r`.
+fn write_run_children(s: &mut String, r: &Run, text_kind: RunTextKind) {
     if r.props.hyphen_elements {
         // U+2011 / U+00AD came from `w:noBreakHyphen` / `w:softHyphen` and go
         // back as them, between the text pieces, with no empty `w:t` (#1101).
@@ -1248,7 +1366,6 @@ fn write_run(s: &mut String, r: &Run, text_kind: RunTextKind) {
     } else {
         write_run_text(s, &r.text, text_kind);
     }
-    s.push_str("</w:r>");
 }
 
 fn write_run_text(s: &mut String, text: &str, text_kind: RunTextKind) {
