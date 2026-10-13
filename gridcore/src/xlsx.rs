@@ -726,11 +726,7 @@ fn parse_table_xml(xml: &str, sheet_idx: usize, part: &str) -> Option<Table> {
     let mut in_calc = false;
     let mut cr = false;
     loop {
-        let ev = p.next();
-        if ev != Event::Text {
-            cr = false;
-        }
-        match ev {
+        match next_text_event(&mut p, &mut cr) {
             Event::Start => match local(p.name()) {
                 "table" => {
                     name = decode(p.attr("displayName"));
@@ -901,11 +897,7 @@ fn rich_error_codes(
     let mut cr = false;
     let mut p = XmlParser::new(rich_values);
     loop {
-        let ev = p.next();
-        if ev != Event::Text {
-            cr = false;
-        }
-        match ev {
+        match next_text_event(&mut p, &mut cr) {
             Event::Start => match local(p.name()) {
                 "rv" => values.push((p.attr("s").parse().unwrap_or(usize::MAX), Vec::new())),
                 "v" => {
@@ -1028,11 +1020,7 @@ fn parse_workbook_xml(
     let mut cur_name: Option<(String, Option<usize>, String)> = None;
     let mut cr = false;
     loop {
-        let ev = p.next();
-        if ev != Event::Text {
-            cr = false;
-        }
-        match ev {
+        match next_text_event(&mut p, &mut cr) {
             Event::Start => match local(p.name()) {
                 "sheet" => {
                     let name = decode(p.attr("name"));
@@ -2541,11 +2529,7 @@ fn parse_cell_body(
     // A `<v>` or `<f>` piece ended in a raw CR ([`push_text`]).
     let mut cr = false;
     while depth > 0 {
-        let ev = p.next();
-        if ev != Event::Text {
-            cr = false;
-        }
-        match ev {
+        match next_text_event(p, &mut cr) {
             Event::Start => {
                 depth += 1;
                 match local(p.name()) {
@@ -3100,11 +3084,7 @@ fn remove_macro_names(
                 let mut depth = 0usize;
                 let mut cr = false;
                 let end = loop {
-                    let ev = p.next();
-                    if ev != Event::Text {
-                        cr = false;
-                    }
-                    match ev {
+                    match next_text_event(&mut p, &mut cr) {
                         Event::Text => push_text(&p, &mut text, &mut cr),
                         Event::Start => depth += 1,
                         Event::End if depth > 0 => depth -= 1,
@@ -6266,11 +6246,7 @@ fn patch_defined_name(
     let mut nested = false;
     let mut cr = false;
     let body_end = loop {
-        let ev = p.next();
-        if ev != Event::Text {
-            cr = false;
-        }
-        match ev {
+        match next_text_event(p, &mut cr) {
             Event::Text => push_text(p, &mut text, &mut cr),
             Event::Start => {
                 depth += 1;
@@ -7151,12 +7127,22 @@ fn element_text(el: &str) -> String {
     let mut out = String::new();
     let mut cr = false;
     loop {
-        match p.next() {
+        match next_text_event(&mut p, &mut cr) {
             Event::Text => push_text(&p, &mut out, &mut cr),
             Event::Eof => return out,
-            _ => cr = false,
+            _ => {}
         }
     }
+}
+
+/// The parser's next event, with [`push_text`]'s `cr` cleared at anything
+/// but text: a tag ends the text a raw CR ended.
+fn next_text_event(p: &mut XmlParser, cr: &mut bool) -> Event {
+    let ev = p.next();
+    if ev != Event::Text {
+        *cr = false;
+    }
+    ev
 }
 
 /// Give each `tableColumn` of a table part (in the model's column order, as

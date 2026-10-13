@@ -288,9 +288,8 @@ impl Origin {
     /// automatic choice, then by code page number.
     pub fn all() -> Vec<Origin> {
         let mut out = vec![Origin::Auto];
-        let mut pages: Vec<(u16, Origin)> = CODE_PAGE_LABELS
-            .iter()
-            .map(|&(page, _)| (page, Origin::CodePage(page)))
+        let mut pages: Vec<(u16, Origin)> = crate::codepage::pages()
+            .map(|page| (page, Origin::CodePage(page)))
             .collect();
         pages.extend([
             (1200, Origin::Utf16Le),
@@ -1446,6 +1445,23 @@ mod tests {
             Origin::CodePage(10000).label(),
             "10000 : Western European (Mac)"
         );
+    }
+
+    /// #761 r1: every code page with a table has Excel's label, and every
+    /// labelled page has a table.
+    #[test]
+    fn every_code_page_has_a_label_and_a_table() {
+        for page in crate::codepage::pages() {
+            assert!(
+                CODE_PAGE_LABELS
+                    .iter()
+                    .any(|&(p, l)| p == page && !l.is_empty()),
+                "{page} has no label"
+            );
+        }
+        for &(page, _) in CODE_PAGE_LABELS {
+            assert!(crate::codepage::known(page), "{page} has no table");
+        }
     }
 
     /// #761: the CSV open's reader, shared by xlsxy and gridwasm: `sep=`
