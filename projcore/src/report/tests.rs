@@ -484,3 +484,59 @@ fn an_active_summary_of_dormant_tasks_does_not_stretch_the_overview() {
         "{md}"
     );
 }
+
+/// `p` in euros after the amount with a space, the way Project writes it
+/// (#579).
+fn in_euros(mut p: Project) -> Project {
+    p.options.extend(
+        [
+            ("CurrencySymbol", "€"),
+            ("CurrencyDigits", "2"),
+            ("CurrencySymbolPosition", "3"),
+        ]
+        .map(|(n, v)| (n.to_string(), v.to_string())),
+    );
+    p
+}
+
+#[test]
+fn cost_reports_follow_the_plans_currency() {
+    let md = render_of(in_euros(costed()), ReportKind::TaskCostOverview);
+    let rows_ = rows(&md, "");
+    assert_eq!(
+        rows_[1][4], "600.00 €",
+        "Design's Cost, read by the registry"
+    );
+    // Fixed Cost's total, which the report sums itself.
+    assert_eq!(rows_[5][1], "500.00 €");
+    assert_eq!(rows_[5][4], "1,550.00 €");
+    // Without a summary row, the money total is a sum too.
+    let md = render_of(in_euros(costed_without_root()), ReportKind::ProjectOverview);
+    assert_eq!(rows(&md, "")[0][4], "1,500.00 €");
+    // The resource cost table and its total.
+    let md = render_of(in_euros(costed()), ReportKind::ResourceCostOverview);
+    let rows_ = rows(&md, "");
+    assert!(rows_.iter().flatten().all(|c| !c.contains('$')), "{md}");
+    assert_eq!(rows_.last().unwrap()[4], "1,123.45 €", "{md}");
+}
+
+#[test]
+fn a_currency_symbol_with_a_pipe_keeps_the_tables_cells() {
+    let mut p = costed();
+    p.options.push(("CurrencySymbol".into(), "|$".into()));
+    let md = render_of(p.clone(), ReportKind::TaskCostOverview);
+    let total = rows(&md, "").pop().unwrap();
+    // Every column of the Task Cost table: no cell split at the symbol.
+    assert_eq!(total.len(), 7, "{md}");
+    assert_eq!(total[1], r"\|$500.00", "the Fixed Cost sum");
+    assert_eq!(total[4], r"\|$1,550.00", "the summary row's Cost");
+    let md = render_of(p.clone(), ReportKind::ResourceCostOverview);
+    let total = rows(&md, "").pop().unwrap();
+    assert_eq!(total.len(), 5, "{md}");
+    assert_eq!(total[4], r"\|$1,123.45");
+    p.tasks.remove(0);
+    let md = render_of(p, ReportKind::ProjectOverview);
+    let overview = &rows(&md, "")[0];
+    assert_eq!(overview.len(), 5, "{md}");
+    assert_eq!(overview[4], r"\|$1,500.00", "the summed Cost");
+}

@@ -97,7 +97,7 @@ parse reads as its raw text and `null`.
 - `text` is what the sheet shows, in Project's spellings, which the harness
   `cell` verb also returns: `0 days`, `1 day`, `-1 day`, `1.25 days`,
   `2 wks`, `2 edays`, `4 hrs` (work is always hours), `$1,400.00`,
-  `($40,000.00)`, `50%`, `Yes`/`No`. Dates show `Mon 3/2/26`, or `NA` when
+  `($40,000.00)` (in the plan's currency), `50%`, `Yes`/`No`. Dates show `Mon 3/2/26`, or `NA` when
   unset. A date cell's edit and copy text stays strict ISO `YYYY-MM-DD`
   (`2026-03-02`), so a typed or pasted value parses.
 - `value` is what lies underneath: dates `YYYY-MM-DD HH:MM`; durations, work
@@ -111,7 +111,8 @@ parse reads as its raw text and `null`.
   and for Status when the plan has no StatusDate or CurrentDate (or the task
   no start), which then reads `""` and `null`. Fields
   with a Project default read the default: Active Yes, Priority 500, Type and
-  Effort Driven the plan's new-task defaults, Fixed Cost Accrual Prorated.
+  Effort Driven the plan's new-task defaults, Fixed Cost Accrual the plan's
+  DefaultFixedCostAccrual, else Prorated (an explicit Invalid reads Prorated).
 - Variances follow the live schedule, not the values a file stores. They
   measure the scheduled (unleveled) dates, which a save writes and Set
   Baseline records; while leveling is on, the grid's Start and Finish can

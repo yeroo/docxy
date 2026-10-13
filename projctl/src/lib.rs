@@ -36,7 +36,8 @@
 //! that reply with a task (`task.set`, `task.add`, `link.add`, `link.del`)
 //! take it too, and check it before they edit anything. Each task
 //! then carries `fields: {"<name as asked>": {text, value}}`: `text` as the
-//! sheet shows it (`1 day`, `4 hrs`, `$1,400.00`, `Mon 3/2/26`, `NA`),
+//! sheet shows it (`1 day`, `4 hrs`, `$1,400.00` in the plan's currency,
+//! `Mon 3/2/26`, `NA`),
 //! `value` underneath: dates
 //! `YYYY-MM-DD HH:MM`, durations, work and slack signed minutes, money a
 //! number, percents integers, flags booleans, enums and text strings, and
@@ -1725,6 +1726,27 @@ mod tests {
         assert_eq!(
             field(&r, "Notes"),
             ("Kickoff Monday", &Json::Str("Kickoff Monday".into()))
+        );
+    }
+
+    #[test]
+    fn task_get_money_text_follows_the_plans_currency() {
+        // #579: the text is in the plan's currency; the value stays units.
+        let xml = "<Project><CurrencySymbol>€</CurrencySymbol>            <CurrencyDigits>2</CurrencyDigits>            <CurrencySymbolPosition>3</CurrencySymbolPosition><Tasks>            <Task><UID>1</UID><ID>1</ID><Name>A</Name><OutlineLevel>1</OutlineLevel>            <Duration>PT8H0M0S</Duration><Cost>140000</Cost>            <FixedCost>-4000000</FixedCost></Task></Tasks></Project>";
+        let mut ed = Editor::new(projcore::mspdi::read_mspdi(xml).unwrap());
+        let r = call(
+            &mut ed,
+            "task.get",
+            vec![
+                ("uid", Json::Num(1.0)),
+                ("fields", names(&["Cost", "Fixed Cost"])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(field(&r, "Cost"), ("1,400.00 €", &Json::Num(1400.0)));
+        assert_eq!(
+            field(&r, "Fixed Cost"),
+            ("(40,000.00 €)", &Json::Num(-40000.0))
         );
     }
 

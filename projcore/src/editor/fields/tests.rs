@@ -462,11 +462,11 @@ fn durations_use_project_spellings() {
 
 #[test]
 fn money_percent_and_dates_use_project_spellings() {
-    assert_eq!(format_money(1400.0), "$1,400.00");
-    assert_eq!(format_money(-40000.0), "($40,000.00)");
-    assert_eq!(format_money(0.0), "$0.00");
-    assert_eq!(format_money(1234567.891), "$1,234,567.89");
-    assert_eq!(format_money(0.5), "$0.50");
+    assert_eq!(Currency::default().format(1400.0), "$1,400.00");
+    assert_eq!(Currency::default().format(-40000.0), "($40,000.00)");
+    assert_eq!(Currency::default().format(0.0), "$0.00");
+    assert_eq!(Currency::default().format(1234567.891), "$1,234,567.89");
+    assert_eq!(Currency::default().format(0.5), "$0.50");
     assert_eq!(format_date_field(Some(at(5, 8))), "2026-01-05");
     assert_eq!(format_date_field(None), "NA");
 }
@@ -1789,4 +1789,198 @@ fn custom_field_first_value_wins_and_blank_row_is_empty() {
     p.tasks = vec![blank];
     let ed = Editor::new(p);
     assert_eq!(tv(&ed, 2, "Text1"), (s(""), FieldValue::Null));
+}
+
+// ---- the plan's currency and fixed cost accrual (#579) ----
+
+fn currency(symbol: &str, digits: u8, position: SymbolPosition) -> Currency {
+    Currency {
+        symbol: symbol.into(),
+        digits,
+        position,
+    }
+}
+
+#[test]
+fn currency_formats_by_position_and_digits() {
+    use SymbolPosition::*;
+    for (position, positive, negative) in [
+        (Before, "€1,400.00", "(€40,000.00)"),
+        (After, "1,400.00€", "(40,000.00€)"),
+        (BeforeSpaced, "€ 1,400.00", "(€ 40,000.00)"),
+        (AfterSpaced, "1,400.00 €", "(40,000.00 €)"),
+    ] {
+        let c = currency("€", 2, position);
+        assert_eq!(c.format(1400.0), positive, "{position:?}");
+        assert_eq!(c.format(-40000.0), negative, "{position:?}");
+        assert_eq!(
+            c.format(0.0),
+            positive.replace("1,400", "0"),
+            "{position:?}"
+        );
+    }
+    let dollars = |digits| currency("$", digits, Before);
+    assert_eq!(dollars(0).format(1400.0), "$1,400");
+    assert_eq!(dollars(3).format(1400.0), "$1,400.000");
+    assert_eq!(dollars(4).format(-0.5), "($0.5000)");
+    assert_eq!(dollars(2).format(1234567.891), "$1,234,567.89");
+    assert_eq!(dollars(0).format(1234567.891), "$1,234,568");
+    assert_eq!(dollars(3).format(0.0125), "$0.013");
+    // A negative that rounds to zero shows no parentheses.
+    assert_eq!(dollars(0).format(-0.4), "$0");
+    // Past 2^53 scaled units, 3 and 4 digits pad whole hundredths rather
+    // than show the f64's invented digits.
+    let big = 999_999_999_999_999.0 / 100.0;
+    assert_eq!(dollars(4).format(big), "$9,999,999,999,999.9900");
+    assert_eq!(dollars(3).format(-big), "($9,999,999,999,999.990)");
+    assert_eq!(dollars(2).format(big), "$9,999,999,999,999.99");
+    assert_eq!(dollars(0).format(big), "$10,000,000,000,000");
+}
+
+#[test]
+fn currency_options_are_lenient() {
+    let of = |options: &[(&str, &str)]| {
+        let mut p = untitled_project();
+        p.options
+            .extend(options.iter().map(|(n, v)| (n.to_string(), v.to_string())));
+        Currency::of(&p)
+    };
+    assert_eq!(of(&[]), Currency::default());
+    assert_eq!(of(&[]).format(-40000.0), "($40,000.00)");
+    for digits in ["x", "", "5", "-1", "2.5", "300"] {
+        assert_eq!(of(&[("CurrencyDigits", digits)]).digits, 2, "{digits:?}");
+    }
+    assert_eq!(of(&[("CurrencyDigits", " 0 ")]).digits, 0);
+    for position in ["x", "4", "-1", ""] {
+        assert_eq!(
+            of(&[("CurrencySymbolPosition", position)]).position,
+            SymbolPosition::Before,
+            "{position:?}"
+        );
+    }
+    // A stated but empty symbol is no symbol, not `$`.
+    let bare = of(&[("CurrencySymbol", ""), ("CurrencySymbolPosition", "3")]);
+    assert_eq!(bare.format(1400.0), "1,400.00");
+    assert_eq!(bare.format(-1.0), "(1.00)");
+    assert_eq!(of(&[("CurrencySymbol", "Kč")]).format(1.0), "Kč1.00");
+}
+
+/// A plan in euros after the amount with a space, as an MSPDI file states it.
+const EURO_PLAN: &str = "<Project>\
+    <CurrencySymbol>€</CurrencySymbol><CurrencyDigits>2</CurrencyDigits>\
+    <CurrencySymbolPosition>3</CurrencySymbolPosition>\
+    <DefaultFixedCostAccrual>1</DefaultFixedCostAccrual>\
+    <ExtendedAttributes>\
+    <ExtendedAttribute><FieldID>188743786</FieldID><FieldName>Cost1</FieldName></ExtendedAttribute>\
+    </ExtendedAttributes>\
+    <Tasks>\
+    <Task><UID>1</UID><ID>1</ID><Name>Pour</Name><OutlineLevel>1</OutlineLevel>\
+    <Duration>PT8H0M0S</Duration><Cost>140000</Cost><FixedCost>-4000000</FixedCost>\
+    <ExtendedAttribute><FieldID>188743786</FieldID><Value>12550</Value></ExtendedAttribute>\
+    <Baseline><Number>0</Number><Cost>100000</Cost></Baseline></Task>\
+    <Task><UID>2</UID><ID>2</ID><Name>Cure</Name><OutlineLevel>1</OutlineLevel>\
+    <Duration>PT8H0M0S</Duration><FixedCost>20000</FixedCost>    <FixedCostAccrual>3</FixedCostAccrual></Task>\
+    <Task><UID>3</UID><ID>3</ID><Name>Strip</Name><OutlineLevel>1</OutlineLevel>\
+    <Duration>PT8H0M0S</Duration><FixedCostAccrual>4</FixedCostAccrual></Task>\
+    </Tasks>\
+    <Resources><Resource><UID>1</UID><ID>1</ID><Name>Crew</Name></Resource></Resources>\
+    <Assignments><Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>\
+    <Cost>50000</Cost><BudgetCost>250</BudgetCost></Assignment></Assignments>\
+    </Project>";
+
+#[test]
+fn money_fields_follow_plan_currency() {
+    let ed = Editor::new(crate::mspdi::read_mspdi(EURO_PLAN).unwrap());
+    for (uid, name, text, value) in [
+        (1, "Cost", "1,400.00 €", FieldValue::Money(1400.0)),
+        (
+            1,
+            "Fixed Cost",
+            "(40,000.00 €)",
+            FieldValue::Money(-40000.0),
+        ),
+        (1, "Baseline Cost", "1,000.00 €", FieldValue::Money(1000.0)),
+        (1, "Cost Variance", "400.00 €", FieldValue::Money(400.0)),
+        (1, "Cost1", "125.50 €", FieldValue::Money(125.5)),
+        (1, "Cost2", "0.00 €", FieldValue::Null),
+        (2, "Cost", "0.00 €", FieldValue::Null),
+        (2, "Actual Cost", "0.00 €", FieldValue::Null),
+        (2, "Remaining Cost", "0.00 €", FieldValue::Null),
+        (2, "Baseline10 Cost", "0.00 €", FieldValue::Null),
+    ] {
+        let r = read(&ed, uid, name);
+        assert_eq!((r.text.as_str(), &r.value), (text, &value), "{uid} {name}");
+    }
+    let a = &ed.project().assignments[0];
+    let field = |f| assignment::read_assignment_field(&ed, a, f).text;
+    assert_eq!(field(assignment::AssignmentField::Cost), "500.00 €");
+    assert_eq!(field(assignment::AssignmentField::BudgetCost), "2.50 €");
+    assert_eq!(field(assignment::AssignmentField::BaselineCost), "0.00 €");
+}
+
+#[test]
+fn fixed_cost_accrual_defaults_to_plan() {
+    let ed = Editor::new(crate::mspdi::read_mspdi(EURO_PLAN).unwrap());
+    // No accrual of its own: the plan's Start. Its own Prorated wins, and
+    // an explicit Invalid still reads Prorated.
+    for (uid, text) in [(1, "Start"), (2, "Prorated"), (3, "Prorated")] {
+        let r = read(&ed, uid, "Fixed Cost Accrual");
+        assert_eq!(r.text, text, "{uid}");
+        assert_eq!(r.value, FieldValue::Text(text.into()), "{uid}");
+    }
+    for (default, text) in [
+        (Some("2"), "End"),
+        (Some("3"), "Prorated"),
+        (Some("4"), "Prorated"),
+        (Some("junk"), "Prorated"),
+        (None, "Prorated"),
+    ] {
+        let mut p = untitled_project();
+        p.options
+            .extend(default.map(|d| ("DefaultFixedCostAccrual".into(), d.into())));
+        p.tasks = vec![task(1, "Pour", 480)];
+        assert_eq!(
+            read(&Editor::new(p), 1, "Fixed Cost Accrual").text,
+            text,
+            "{default:?}"
+        );
+    }
+}
+
+#[test]
+fn currency_options_survive_save() {
+    let mut ed = Editor::new(crate::mspdi::read_mspdi(EURO_PLAN).unwrap());
+    // An edit that refreshes costs: task 2 goes under task 1.
+    ed.indent(2, 1).unwrap();
+    // The refresh ran: Pour is now a summary and took Cure's fixed cost.
+    let pour = ed.project().task(1).unwrap();
+    assert!(pour.summary);
+    assert_eq!(pour.cost.as_ref().map(Rate::as_str), Some("160000"));
+    let xml = crate::mspdi::write_mspdi(ed.project());
+    for element in [
+        "<CurrencySymbol>€</CurrencySymbol>",
+        "<CurrencyDigits>2</CurrencyDigits>",
+        "<CurrencySymbolPosition>3</CurrencySymbolPosition>",
+        "<DefaultFixedCostAccrual>1</DefaultFixedCostAccrual>",
+    ] {
+        assert_eq!(xml.matches(element).count(), 1, "{element}\n{xml}");
+    }
+    // Task 1 had no accrual and still saves none; 2 and 3 keep theirs.
+    assert_eq!(xml.matches("<FixedCostAccrual>").count(), 2, "{xml}");
+    let back = crate::mspdi::read_mspdi(&xml).unwrap();
+    assert_eq!(back.task(1).unwrap().fixed_cost_accrual, None);
+    assert_eq!(Currency::of(&back), Currency::of(ed.project()));
+}
+
+#[test]
+fn a_huge_cost_reads_whole_hundredths_at_four_digits() {
+    let mut p = untitled_project();
+    p.options.push(("CurrencyDigits".into(), "4".into()));
+    p.extended_attribute_definitions = vec![custom_def("555000003", "Cost1")];
+    let mut t = task(1, "Pour", 480);
+    t.extended_attributes = vec![custom_value("555000003", "999999999999999")];
+    p.tasks = vec![t];
+    let r = read(&Editor::new(p), 1, "Cost1");
+    assert_eq!(r.text, "$9,999,999,999,999.9900");
+    assert_eq!(r.value, FieldValue::Money(9_999_999_999_999.99));
 }

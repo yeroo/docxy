@@ -96,7 +96,7 @@ fn unset(proj: &Project, kind: CustomKind) -> FieldRead {
     match kind {
         CustomKind::Text => FieldRead::new("", FieldValue::Null),
         CustomKind::Number => FieldRead::new("0", FieldValue::Null),
-        CustomKind::Cost => FieldRead::new(format_money(0.0), FieldValue::Null),
+        CustomKind::Cost => FieldRead::new(Currency::of(proj).format(0.0), FieldValue::Null),
         CustomKind::Flag => flag(false),
         CustomKind::Date | CustomKind::Start | CustomKind::Finish => {
             FieldRead::new("NA", FieldValue::Null)
@@ -135,16 +135,17 @@ fn value_read(
             None => FieldRead::new(raw, FieldValue::Null),
         },
         // MSPDI stores every cost in hundredths, like the built-in costs. A
-        // finite but huge value would saturate `format_money`'s i128 cents,
-        // so the text could disagree with the value; past $10 trillion
-        // (1e15 hundredths) read it as unparseable.
+        // finite but huge value would saturate `Currency::format`'s i128
+        // scaled units, so the text could disagree with the value; past 10
+        // trillion currency units (1e15 hundredths, below 2^53, so each whole
+        // hundredth up to it is exact) read it as unparseable.
         CustomKind::Cost => match raw
             .trim()
             .parse::<f64>()
             .ok()
             .filter(|n| n.is_finite() && n.abs() <= 1e15)
         {
-            Some(hundredths) => money_value(Some(hundredths)),
+            Some(hundredths) => money_value(proj, Some(hundredths)),
             None => FieldRead::new(raw, FieldValue::Null),
         },
         CustomKind::Flag => {

@@ -561,6 +561,53 @@ fn fixed_cost_remaining_share_follows_accrual_and_percent_complete() {
 }
 
 #[test]
+fn fixed_cost_without_accrual_follows_the_plans_default() {
+    // #579: an absent task accrual is the plan's DefaultFixedCostAccrual; the
+    // task's own value still wins, and an Invalid or unparsable default (or
+    // an explicit Invalid on the task) keeps Prorated.
+    for (default, accrual, percent, expected) in [
+        (Some("1"), None, 0, "101"),
+        (Some("1"), None, 50, "0"),
+        (Some("2"), None, 50, "101"),
+        (Some("2"), None, 100, "0"),
+        (Some(" 1 "), None, 50, "0"),
+        (Some("1"), Some(AccrueAt::Prorated), 50, "51"),
+        (Some("1"), Some(AccrueAt::Invalid), 50, "51"),
+        (Some("2"), Some(AccrueAt::Start), 50, "0"),
+        (Some("4"), None, 50, "51"),
+        (Some("x"), None, 50, "51"),
+        (None, None, 50, "51"),
+    ] {
+        let mut root = task(0, 0);
+        root.outline_level = 0;
+        root.cost = Rate::parse("101");
+        root.remaining_cost = Rate::parse(expected);
+        let mut summary = task(2, 0);
+        summary.cost = Rate::parse("0");
+        summary.remaining_cost = Rate::parse("0");
+        let mut leaf = task(1, 1);
+        leaf.fixed_cost = Rate::parse("101");
+        leaf.fixed_cost_accrual = accrual;
+        leaf.percent_complete = Some(percent);
+        leaf.cost = Rate::parse("101");
+        leaf.remaining_cost = Rate::parse(expected);
+        let mut ed = Editor::new(Project {
+            tasks: vec![root, summary, leaf],
+            options: default
+                .map(|d| ("DefaultFixedCostAccrual".to_string(), d.to_string()))
+                .into_iter()
+                .collect(),
+            ..Project::default()
+        });
+        ed.indent(1, 1).unwrap();
+        let summary = ed.project().task(2).unwrap();
+        let case = format!("{default:?} {accrual:?} {percent}");
+        assert_eq!(text(&summary.cost), Some("101"), "{case}");
+        assert_eq!(text(&summary.remaining_cost), Some(expected), "{case}");
+    }
+}
+
+#[test]
 fn a_units_edit_keeps_a_cost_resources_cost() {
     // Summary 3 over task 1, which carries a $500 Pool (cost resource) charge.
     let mut ed = staffed();

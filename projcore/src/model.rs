@@ -480,6 +480,17 @@ pub struct Task {
 }
 
 impl Task {
+    /// How the task's fixed cost accrues: its own `FixedCostAccrual`, else
+    /// `default` (the plan's, [`Project::default_fixed_cost_accrual`]). An
+    /// explicit Invalid accrues Prorated, whatever the default.
+    pub fn fixed_cost_accrual_or(&self, default: AccrueAt) -> AccrueAt {
+        match self.fixed_cost_accrual {
+            Some(AccrueAt::Invalid) => AccrueAt::Prorated,
+            Some(at) => at,
+            None => default,
+        }
+    }
+
     /// A placeholder for a leaf task in another project, not local work.
     pub fn is_external_leaf(&self) -> bool {
         self.external_task == Some(true) && !self.summary && !self.is_null
@@ -1787,6 +1798,20 @@ impl Project {
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
+    }
+
+    /// How a task with no `FixedCostAccrual` of its own accrues its fixed
+    /// cost: the `DefaultFixedCostAccrual` option, else Prorated (also for
+    /// an Invalid or unparsable default).
+    pub fn default_fixed_cost_accrual(&self) -> AccrueAt {
+        match self
+            .option("DefaultFixedCostAccrual")
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .and_then(AccrueAt::from_code)
+        {
+            Some(at @ (AccrueAt::Start | AccrueAt::End)) => at,
+            _ => AccrueAt::Prorated,
+        }
     }
 
     /// The date Status is measured at: the `StatusDate` header option, else

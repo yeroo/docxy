@@ -38,8 +38,9 @@ use its tools:
   editing tools) reads any Project field by name, e.g. `["% Complete", "Actual
   Start", "Baseline Finish", "Finish Variance", "Total Slack", "Cost"]`, as
   `fields: {name: {text, value}}`: `text` as the sheet shows it (`2 days`,
-  `$1,400.00`, `NA`), `value` underneath (dates `YYYY-MM-DD HH:MM`; durations,
-  work and slack in minutes; money a number; `null` when unset). An unknown
+  `$1,400.00` in the plan's currency, `NA`), `value` underneath (dates
+  `YYYY-MM-DD HH:MM`; durations, work and slack in minutes; money a number;
+  `null` when unset). An unknown
   name fails the call, before any edit
 - `yppxy_fields` — every field name `fields` can read
 - `yppxy_set` `{uid, name?, duration?, level?, manual?}` — edit a task (duration like

@@ -3,7 +3,8 @@
 //! same registry, so a column and a field read of it cannot disagree.
 //!
 //! `text` uses Project's US spellings (`1 day`, `4 hrs`, `$1,400.00`,
-//! `($40,000.00)`, `50%`, `Yes`). Dates show `Mon 3/2/26`, `NA` when unset;
+//! `($40,000.00)`, `50%`, `Yes`), money in the plan's currency
+//! ([`Currency`]). Dates show `Mon 3/2/26`, `NA` when unset;
 //! a date cell's edit and copy keep the strict ISO `YYYY-MM-DD` so a pasted
 //! value still parses.
 //!
@@ -17,8 +18,9 @@
 //! it (`0%`, `0 days`, `0 hrs`, `$0.00`), empty for Status. Fields with a
 //! Project default read that
 //! default in both: Active (Yes), Priority (500), Effort Driven and Type (the
-//! plan's defaults for new tasks), Fixed Cost Accrual (Prorated, as costs
-//! accrue when it is absent or Invalid), Constraint Type (As Soon As
+//! plan's defaults for new tasks), Fixed Cost Accrual (when absent, the
+//! plan's DefaultFixedCostAccrual, else Prorated; an Invalid one reads
+//! Prorated, as costs accrue), Constraint Type (As Soon As
 //! Possible), Leveling Delay (0 edays). WBS is the stored code, else the outline
 //! number; a structural edit renumbers a stored code that equals the task's
 //! outline number (treated as generated) and keeps one that differs from it.
@@ -408,15 +410,17 @@ impl<'a> FieldReader<'a> {
             Field::Work => work(task.work_min),
             Field::ActualWork => work(task.actual_work_min),
             Field::RemainingWork => work(task.remaining_work_min),
-            Field::Cost => money(task.cost.as_ref()),
-            Field::ActualCost => money(task.actual_cost.as_ref()),
-            Field::RemainingCost => money(task.remaining_cost.as_ref()),
-            Field::FixedCost => money(task.fixed_cost.as_ref()),
-            Field::FixedCostAccrual => text(match task.fixed_cost_accrual {
-                Some(AccrueAt::Start) => "Start",
-                Some(AccrueAt::End) => "End",
-                Some(AccrueAt::Prorated | AccrueAt::Invalid) | None => "Prorated",
-            }),
+            Field::Cost => money(proj, task.cost.as_ref()),
+            Field::ActualCost => money(proj, task.actual_cost.as_ref()),
+            Field::RemainingCost => money(proj, task.remaining_cost.as_ref()),
+            Field::FixedCost => money(proj, task.fixed_cost.as_ref()),
+            Field::FixedCostAccrual => text(
+                match task.fixed_cost_accrual_or(proj.default_fixed_cost_accrual()) {
+                    AccrueAt::Start => "Start",
+                    AccrueAt::End => "End",
+                    AccrueAt::Prorated | AccrueAt::Invalid => "Prorated",
+                },
+            ),
             Field::Baseline(n, part) => {
                 let b = task.baseline(n);
                 match part {
@@ -438,7 +442,7 @@ impl<'a> FieldReader<'a> {
                         }
                     }
                     BaselinePart::Work => work(b.and_then(|b| b.work_min)),
-                    BaselinePart::Cost => money(b.and_then(|b| b.cost.as_ref())),
+                    BaselinePart::Cost => money(proj, b.and_then(|b| b.cost.as_ref())),
                 }
             }
             // Variances measure the schedule a save writes (and Set Baseline
@@ -475,7 +479,7 @@ impl<'a> FieldReader<'a> {
             Field::CostVariance => {
                 let current = hundredths(task.cost.as_ref());
                 let base = hundredths(baseline.and_then(|b| b.cost.as_ref()));
-                money_value(Some(current - base))
+                money_value(proj, Some(current - base))
             }
             Field::TotalSlack => duration(proj, result.map(|r| r.total_slack_min), working),
             Field::FreeSlack => duration(proj, result.map(|r| r.free_slack_min), working),
@@ -671,15 +675,16 @@ fn hundredths(rate: Option<&Rate>) -> f64 {
     rate.and_then(Rate::to_f64).unwrap_or(0.0)
 }
 
-fn money(rate: Option<&Rate>) -> FieldRead {
-    money_value(rate.map(|r| hundredths(Some(r))))
+fn money(proj: &Project, rate: Option<&Rate>) -> FieldRead {
+    money_value(proj, rate.map(|r| hundredths(Some(r))))
 }
 
-/// Money from hundredths, as MSPDI stores every task cost.
-fn money_value(hundredths: Option<f64>) -> FieldRead {
+/// Money from hundredths, as MSPDI stores every task cost, shown in the
+/// plan's currency.
+fn money_value(proj: &Project, hundredths: Option<f64>) -> FieldRead {
     let units = hundredths.map(|h| h / 100.0);
     FieldRead::new(
-        format_money(units.unwrap_or(0.0)),
+        Currency::of(proj).format(units.unwrap_or(0.0)),
         units.map_or(FieldValue::Null, FieldValue::Money),
     )
 }
@@ -834,27 +839,6 @@ pub(crate) fn format_work(min: i64) -> String {
     format!("{number} {}", if one { "hr" } else { "hrs" })
 }
 
-/// Money as Project shows it in US currency: `$1,400.00`, `($40,000.00)`,
-/// `$0.00`.
-pub(crate) fn format_money(units: f64) -> String {
-    let cents = (units * 100.0).round() as i128;
-    let abs = cents.unsigned_abs();
-    let whole = (abs / 100).to_string();
-    let mut grouped = String::new();
-    for (i, c) in whole.chars().enumerate() {
-        if i > 0 && (whole.len() - i).is_multiple_of(3) {
-            grouped.push(',');
-        }
-        grouped.push(c);
-    }
-    let shown = format!("${grouped}.{:02}", abs % 100);
-    if cents < 0 {
-        format!("({shown})")
-    } else {
-        shown
-    }
-}
-
 /// A date as strict ISO `YYYY-MM-DD`, or `NA` when unset: the edit and copy
 /// text of a date cell (`parse_cell_date` accepts nothing else) and the form
 /// status messages and the project range line spell a date in.
@@ -885,7 +869,10 @@ pub fn format_project_date(dt: DateTime) -> String {
 }
 
 pub(super) mod assignment;
+mod currency;
 mod custom;
+
+pub use currency::{Currency, SymbolPosition};
 
 #[cfg(test)]
 mod tests;
