@@ -175,12 +175,14 @@ struct Snapshot {
 }
 
 /// The content index text typed at `caret` goes in at, just after the
-/// inlines [`Editor::insert_object`] put there, while the step that put
-/// them (`serial`) is still the last.
+/// inlines [`Editor::insert_object`] put there, while the last step is the
+/// one that put them or a formatting toggle at the caret after it
+/// (`serials`): undoing the typing, or undoing or redoing a toggle, brings
+/// it back with the document as it was then.
 #[derive(Clone, Debug)]
 struct AfterObject {
     caret: Caret,
-    serial: Option<u64>,
+    serials: Vec<Option<u64>>,
     index: usize,
 }
 
@@ -989,7 +991,6 @@ impl Editor {
         let after_object = self
             .typing_after_object()
             .map(|at| (at, self.typing_props_here(pending.as_ref())));
-        self.after_object = None;
         let pushed_before = undo_serial_counter();
         if ch == '\n' {
             // A newline over a selection is one step: `insert_newline`
@@ -2051,7 +2052,7 @@ impl Editor {
         }
         self.after_object = index.map(|index| AfterObject {
             caret: self.caret.clone(),
-            serial: self.undo_serial(),
+            serials: vec![self.undo_serial()],
             index,
         });
     }
@@ -2062,7 +2063,9 @@ impl Editor {
         self.after_object
             .as_ref()
             .filter(|a| {
-                a.caret == self.caret && a.serial == self.undo_serial() && !self.has_selection()
+                a.caret == self.caret
+                    && a.serials.contains(&self.undo_serial())
+                    && !self.has_selection()
             })
             .map(|a| a.index)
     }
@@ -2485,8 +2488,16 @@ impl Editor {
         let value = !prop.get()(&self.caret_props());
         let mut toggles = self.pending_format().map(|p| p.toggles).unwrap_or_default();
         toggles[prop as usize] = Some(value);
+        let after_object = self.typing_after_object().is_some();
         // The step holds the state before the toggle, pending format and all.
         self.checkpoint(EditKind::Structural);
+        // Text typed after an object it toggles at still goes after it (#768).
+        if after_object {
+            let serial = self.undo_serial();
+            if let Some(a) = self.after_object.as_mut() {
+                a.serials.push(serial);
+            }
+        }
         let pending = PendingFormat {
             caret: self.caret.clone(),
             serial: self.undo_serial(),
@@ -5107,8 +5118,25 @@ mod tests {
         assert_eq!(texts(&ed), ["Company", "[PTAB]", "Page 1"]);
         assert!(ed.undo());
         assert_eq!(texts(&ed), ["Company", "[PTAB]"]);
+        // FIX r4 M2: the undone typing's place is after the tab again.
+        ed.insert_char('x');
+        assert_eq!(texts(&ed), ["Company", "[PTAB]", "x"]);
+        assert!(ed.undo());
+        assert_eq!(texts(&ed), ["Company", "[PTAB]"]);
+        // A redo is the typing again, after which typing joins its run.
+        assert!(ed.redo());
+        assert_eq!(texts(&ed), ["Company", "[PTAB]", "x"]);
+        ed.insert_char('y');
+        assert_eq!(texts(&ed), ["Company", "[PTAB]", "xy"]);
+        assert!(ed.undo());
+        assert!(ed.undo());
+        assert_eq!(texts(&ed), ["Company", "[PTAB]"]);
         assert!(ed.undo());
         assert_eq!(texts(&ed), ["Company"]);
+        // Undone, the object's place is gone: typing at the end of
+        // `Company` joins it.
+        ed.insert_char('!');
+        assert_eq!(texts(&ed), ["Company!"]);
 
         // A picture, then text.
         let mut ed = selected(vec![run("ab", RunProps::default())], 2, 2);
@@ -5138,13 +5166,31 @@ mod tests {
         ed.caret.offset = 0;
         ed.insert_str("My ");
         assert_eq!(texts(&ed), ["My Company", "[PTAB]"]);
-        // Another edit before the typing ends it too.
+        // FIX r4 M1: Bold toggled at the caret keeps it; the text is bold.
         let mut ed = selected(vec![run("Company", RunProps::default())], 7, 7);
         ed.anchor = None;
         ed.insert_object(vec![Inline::Raw(PTAB.into())]);
         ed.toggle_bold();
+        ed.toggle_italic();
         ed.insert_char('!');
-        assert_eq!(texts(&ed), ["Company", "!", "[PTAB]"]);
+        assert_eq!(texts(&ed), ["Company", "[PTAB]", "!"]);
+        let Inline::Run(r) = &first_para(&ed).content[2] else {
+            panic!("a run");
+        };
+        assert!(r.props.bold && r.props.italic);
+        // Undoing the typing and the italic: still after the tab.
+        assert!(ed.undo());
+        assert!(ed.undo());
+        ed.insert_char('?');
+        assert_eq!(texts(&ed), ["Company", "[PTAB]", "?"]);
+        // Another edit before the typing (a paragraph's spacing, the caret
+        // where it was) ends it: the usual rule.
+        let mut ed = selected(vec![run("Company", RunProps::default())], 7, 7);
+        ed.anchor = None;
+        ed.insert_object(vec![Inline::Raw(PTAB.into())]);
+        ed.set_space_after(Some(240));
+        ed.insert_char('!');
+        assert_eq!(texts(&ed), ["Company!", "[PTAB]"]);
     }
 
     /// FIX r1 M2: a cut leaves the pictures and alignment tabs it spans,
