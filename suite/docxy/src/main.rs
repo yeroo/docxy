@@ -27555,6 +27555,27 @@ fn menu_button_label(text: &str, size: f32, fg: Hsla) -> Div {
     label
 }
 
+/// A split button's lower half: a one-line label with the drop-down mark on
+/// a line of its own under it, as Word draws Paste, so the split is no wider
+/// than its label (#753); a two-line label as [`menu_button_label`] draws
+/// it. `ribbon_fit::split_label_w` is its width.
+fn split_button_label(text: &str, size: f32, fg: Hsla) -> Div {
+    if label_lines(text).len() > 1 {
+        return menu_button_label(text, size, fg);
+    }
+    let line = |t: String| {
+        div()
+            .whitespace_nowrap()
+            .text_size(px(size))
+            .text_color(fg)
+            .child(SharedString::from(t))
+    };
+    v_flex()
+        .items_center()
+        .child(line(text.to_string()))
+        .child(line("▾".to_string()))
+}
+
 /// The press that opens a ribbon button's menu (`id`: a split button's
 /// primary, or a drop-down), or shuts it when it is the one open, whichever
 /// of this handler and the menu backdrop's runs first.
@@ -32790,7 +32811,7 @@ impl Docxy {
             .rounded_b(px(4.))
             .cursor_pointer()
             .hover(|d| d.bg(pal.hover))
-            .child(menu_button_label(cmd.label, 11., fg))
+            .child(split_button_label(cmd.label, 11., fg))
             .on_mouse_down(MouseButton::Left, menu_toggle(primary_id, cx));
         div()
             .id(SharedString::from(format!("{}-split", cmd.id)))

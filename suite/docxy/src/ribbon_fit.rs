@@ -168,6 +168,15 @@ fn lines_w(text: &str, size: f32, tw: TextWidth) -> f32 {
         .fold(0.0, f32::max)
 }
 
+/// `split_button_label`'s width: a one-line label over the drop-down mark,
+/// else [`menu_label_w`] (#753).
+pub(crate) fn split_label_w(text: &str, size: f32, tw: TextWidth) -> f32 {
+    if crate::label_lines(text).len() > 1 {
+        return menu_label_w(text, size, tw);
+    }
+    tw(text, size).max(tw("\u{25BE}", size))
+}
+
 /// `menu_button_label`'s width: the label's lines at `size` px, the last
 /// with " ▾".
 pub(crate) fn menu_label_w(text: &str, size: f32, tw: TextWidth) -> f32 {
@@ -285,9 +294,8 @@ pub(crate) fn model_control_w<A>(
         Control::Large(cmd) => 16.0 + lines_w(cmd.label, 11.0, tw).max(26.0),
         // `split_btn` and `dropdown_btn`: `px_1` around the icon or the
         // drop-down label.
-        Control::Split { primary: cmd, .. } | Control::Dropdown { cmd, .. } => {
-            8.0 + menu_label_w(cmd.label, 11.0, tw).max(26.0)
-        }
+        Control::Split { primary: cmd, .. } => 8.0 + split_label_w(cmd.label, 11.0, tw).max(26.0),
+        Control::Dropdown { cmd, .. } => 8.0 + menu_label_w(cmd.label, 11.0, tw).max(26.0),
         // Columns of at most three buttons, `gap_1` apart.
         Control::Column(cmds) => {
             let cols: Vec<f32> = cmds
@@ -507,6 +515,29 @@ mod tests {
 
     fn off(_: crate::SheetAct) -> bool {
         false
+    }
+
+    /// #753: Paste became a split, whose drop-down mark goes on a line of
+    /// its own under a one-line label, as Word draws it, so Home's Clipboard
+    /// group is no wider than with the large button it replaced and the
+    /// groups after it keep their room. A two-line label keeps the mark on
+    /// its last line.
+    #[test]
+    fn a_one_line_split_is_no_wider_than_a_large_button_753() {
+        let paste = || rs::cmd("paste", "paste", "Paste", Act::Paste);
+        let split = Control::Split {
+            primary: paste(),
+            menu: vec![rs::cmd("k", "paste", "Keep Text Only", Act::PasteTextOnly)],
+        };
+        let large = Control::Large(paste());
+        assert!(
+            model_control_w(&split, false, None, &tw) <= model_control_w(&large, false, None, &tw)
+        );
+        assert_eq!(split_label_w("Paste", 11.0, &tw), tw("Paste", 11.0));
+        assert_eq!(
+            split_label_w("Set Baseline", 11.0, &tw),
+            menu_label_w("Set Baseline", 11.0, &tw)
+        );
     }
 
     /// #1020 r2: a command whose label reads differently while its state is
