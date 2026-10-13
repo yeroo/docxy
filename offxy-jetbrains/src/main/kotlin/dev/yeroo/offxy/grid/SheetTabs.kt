@@ -6,6 +6,7 @@ import java.awt.FlowLayout
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import javax.swing.JButton
+import javax.swing.JLabel
 import javax.swing.JPanel
 import javax.swing.JToggleButton
 
@@ -44,6 +45,12 @@ class SheetTabs(
             onMutate("sheet\tadd\tSheet${view.sheets.size + 1}")
         }
         component.add(add)
+        view.circularNote?.let {
+            val note = JLabel(it)
+            note.foreground = JBUI.CurrentTheme.Focus.warningColor(true)
+            note.border = JBUI.Borders.emptyLeft(8)
+            component.add(note)
+        }
         component.revalidate()
         component.repaint()
     }
