@@ -18,8 +18,8 @@
           "launcher": null,
           "items": [
             {
-              "kind": "large",
-              "cmd": {
+              "kind": "split",
+              "primary": {
                 "id": "paste",
                 "label": "Paste",
                 "icon": "paste",
@@ -30,7 +30,45 @@
                   "body": "",
                   "shortcut": "Ctrl+V"
                 }
-              }
+              },
+              "menu": [
+                {
+                  "id": "paste-keep-source",
+                  "label": "Keep Source Formatting",
+                  "icon": "paste",
+                  "act": "PasteKeepSource",
+                  "keyTip": "K",
+                  "tip": {
+                    "title": "Keep Source Formatting",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "paste-text-only",
+                  "label": "Keep Text Only",
+                  "icon": "paste",
+                  "act": "PasteTextOnly",
+                  "keyTip": "T",
+                  "tip": {
+                    "title": "Keep Text Only",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "paste-special",
+                  "label": "Paste Special…",
+                  "icon": "paste",
+                  "act": "PasteSpecial",
+                  "keyTip": "S",
+                  "tip": {
+                    "title": "Paste Special…",
+                    "body": "",
+                    "shortcut": "Ctrl+Alt+V"
+                  }
+                }
+              ]
             },
             {
               "kind": "column",

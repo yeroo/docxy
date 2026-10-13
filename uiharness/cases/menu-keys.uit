@@ -15,10 +15,11 @@ test right enters a submenu and left and escape back out of it
   assert reply.open is true
   assert reply.depth is 0
   assert reply.highlight is nothing
-  # Cut(0), Copy(1), Paste(2), Filter(4): Down steps over the separator.
-  key down down down down
+  # Cut(0), Copy(1), Paste(2), Paste Special(3), Filter(5): Down steps
+  # over the separator.
+  key down down down down down
   call menu-read {}
-  assert reply.highlight is 4
+  assert reply.highlight is 5
   key right
   call menu-read {}
   assert reply.depth is 1
@@ -28,7 +29,7 @@ test right enters a submenu and left and escape back out of it
   key left
   call menu-read {}
   assert reply.depth is 0
-  assert reply.highlight is 4
+  assert reply.highlight is 5
   # Esc in a submenu backs out one level; at the top level it closes.
   key right
   call menu-read {}
@@ -74,8 +75,9 @@ test the space bar closes the menu like any other non-character key
 test a modifier chord is no menu key and closes it
   open ../fixtures/basic.xlsx
   call menu-open {"target":{"cell":"C3"}}
-  # Cut(0), Copy(1), Paste(2), Filter(4): Down steps over the separator.
-  key down down down down
+  # Cut(0), Copy(1), Paste(2), Paste Special(3), Filter(5): Down steps
+  # over the separator.
+  key down down down down down
   # Ctrl+Right would enter Filter's submenu if chords were menu keys.
   key ctrl+right
   assert menu is nothing

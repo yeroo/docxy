@@ -1,0 +1,168 @@
+# #753: a document's paste choices. Home > Paste is a split button whose
+# menu, and the document's context menu, hold Keep Source Formatting, Keep
+# Text Only and Paste Special…; Ctrl+Alt+V opens Paste Special.
+
+# Keep this case first: the cases share one app, and only here is nothing
+# copied yet.
+test paste special with nothing on the clipboard opens nothing
+  open copy:../fixtures/basic.docx
+  type hello
+  key ctrl+alt+v
+  assert dialog is none
+  assert status is There is nothing to paste
+  assert text is hello
+  # Keep Text Only says why it pastes nothing (#753 r1).
+  call menu-open {"target":"document"}
+  call menu-click {"label":"Keep Text Only"}
+  assert status is There is no text to paste
+  assert text is hello
+
+test the paste button's menu holds the document's paste choices
+  open copy:../fixtures/basic.docx
+  type hello
+  call menu-open {"target":{"ribbon":["Home","Clipboard","Paste"]}}
+  assert reply.items.0.label is Keep Source Formatting
+  assert reply.items.0.key_tip is K
+  assert reply.items.1.label is Keep Text Only
+  assert reply.items.1.key_tip is T
+  assert reply.items.2.label is Paste Special…
+  assert reply.items.2.key_tip is S
+  key escape
+  assert menu is nothing
+
+test keep text only pastes the text with the caret's formatting
+  open copy:../fixtures/basic.docx
+  type hello world
+  call selection-set {"start":0,"end":5}
+  call ribbon-click {"tab":"Home","command":"Bold"}
+  key ctrl+c
+  key end
+  call menu-open {"target":{"ribbon":["Home","Clipboard","Paste"]}}
+  call menu-click {"label":"Keep Text Only"}
+  assert text is hello worldhello
+  call selection-set {"start":13,"end":13}
+  assert run.bold is false
+  # One undo step takes the whole paste back.
+  key ctrl+z
+  assert text is hello world
+
+test keep text only inside italic text pastes italic
+  open copy:../fixtures/basic.docx
+  type hello world
+  call selection-set {"start":0,"end":5}
+  call ribbon-click {"tab":"Home","command":"Bold"}
+  key ctrl+c
+  call selection-set {"start":6,"end":11}
+  call ribbon-click {"tab":"Home","command":"Italic"}
+  call selection-set {"start":8,"end":8}
+  call menu-open {"target":"document"}
+  call menu-click {"label":"Keep Text Only"}
+  assert text is hello wohellorld
+  call selection-set {"start":11,"end":11}
+  assert run.italic is true
+  assert run.bold is false
+
+test keep source formatting pastes what paste pastes
+  open copy:../fixtures/basic.docx
+  type hello world
+  call selection-set {"start":0,"end":5}
+  call ribbon-click {"tab":"Home","command":"Bold"}
+  key ctrl+c
+  key end
+  call menu-open {"target":"document"}
+  assert reply.items.3.id is cm-paste-keep-source
+  assert reply.items.4.id is cm-paste-text-only
+  assert reply.items.5.id is cm-paste-special
+  call menu-click {"label":"Keep Source Formatting"}
+  assert text is hello worldhello
+  call selection-set {"start":13,"end":13}
+  assert run.bold is true
+
+test ctrl+alt+v opens paste special instead of pasting
+  open copy:../fixtures/basic.docx
+  type hello world
+  call selection-set {"start":0,"end":5}
+  call ribbon-click {"tab":"Home","command":"Bold"}
+  key ctrl+c
+  key end
+  key ctrl+alt+v
+  assert dialog is doc-paste-special
+  assert text is hello world
+  call dialog-read {}
+  assert reply.title is Paste Special
+  assert reply.controls.0.items.0 is Formatted Text (RTF)
+  assert reply.controls.0.items.1 is Unformatted Text
+  call dialog-set {"control":"as","value":"Unformatted Text"}
+  call dialog-click {"button":"OK"}
+  assert dialog is none
+  assert text is hello worldhello
+  call selection-set {"start":13,"end":13}
+  assert run.bold is false
+
+test paste special's formatted text keeps the source formatting
+  open copy:../fixtures/basic.docx
+  type hello world
+  call selection-set {"start":0,"end":5}
+  call ribbon-click {"tab":"Home","command":"Bold"}
+  key ctrl+c
+  key end
+  call menu-open {"target":{"ribbon":["Home","Clipboard","Paste"]}}
+  call menu-click {"label":"Paste Special…"}
+  assert dialog is doc-paste-special
+  call dialog-click {"button":"OK"}
+  assert text is hello worldhello
+  call selection-set {"start":13,"end":13}
+  assert run.bold is true
+
+test paste special offers only unformatted text for another app's text
+  open copy:../fixtures/basic.docx
+  call clipboard {"action":"write","text":"plain"}
+  call menu-open {"target":"document"}
+  call menu-click {"label":"Paste Special…"}
+  assert dialog is doc-paste-special
+  call dialog-read {}
+  assert reply.controls.0.items.0 is Unformatted Text
+  call-error dialog-set {"control":"as","value":"Formatted Text (RTF)"} => has no item
+  call dialog-click {"button":"Cancel"}
+  assert dialog is none
+  assert text is nothing
+  key ctrl+alt+v
+  call dialog-click {"button":"OK"}
+  assert text is plain
+
+test a view-only document refuses the paste choices
+  open copy:../fixtures/basic.docx
+  type hello
+  call clipboard {"action":"write","text":"x"}
+  call ribbon-click {"tab":"Review","command":"markupnone"}
+  key ctrl+alt+v
+  assert dialog is none
+  assert status is Edit blocked: Display for Review is No Markup or Original; switch to All Markup or Simple Markup to edit.
+  call menu-open {"target":"document"}
+  call menu-click {"label":"Keep Text Only"}
+  call menu-open {"target":"document"}
+  call menu-click {"label":"Keep Source Formatting"}
+  call ribbon-click {"tab":"Review","command":"markupall"}
+  assert text is hello
+
+test keep text only is a tracked insertion while tracking
+  open copy:../fixtures/basic.docx
+  type hello
+  call clipboard {"action":"write","text":" there"}
+  call ribbon-click {"tab":"Review","command":"tracktoggle"}
+  call menu-open {"target":"document"}
+  call menu-click {"label":"Keep Text Only"}
+  assert text is hello there
+  call inspect {}
+  assert reply.revisions.found is true
+
+test the cell menu opens paste special
+  open ../fixtures/basic.xlsx
+  click B2
+  key ctrl+c
+  call menu-open {"target":{"cell":"E2"}}
+  assert reply.items.3.id is cm-paste-special
+  call menu-click {"label":"Paste Special…"}
+  assert dialog is paste-special
+  call real-key {"key":"escape"}
+  assert dialog is none

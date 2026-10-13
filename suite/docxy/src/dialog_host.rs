@@ -75,6 +75,8 @@ fn apply_dialog(
         }
         // Handled in `Docxy::paste_dialog_click`, before this.
         DialogOwner::PasteSpecial { .. } => Err("Paste Special applies through Paste".into()),
+        // Handled in `Docxy::doc_paste_dialog_click`, before this.
+        DialogOwner::DocPasteSpecial => Err("Paste Special applies through Paste".into()),
         // Handled in `Docxy::drop_dialog_click`, before this.
         DialogOwner::DropReplace => Err("the drop applies through the grid".into()),
         // Handled in `Docxy::fill_dialog_click`, before this.
@@ -191,6 +193,7 @@ pub(crate) fn presses_through_app(owner: &DialogOwner) -> bool {
                 | DialogOwner::JustifyOverflow
                 | DialogOwner::CustomLists
                 | DialogOwner::PasteSpecial { .. }
+                | DialogOwner::DocPasteSpecial
                 | DialogOwner::DropReplace
                 | DialogOwner::GoTo
                 | DialogOwner::GoToSpecial
@@ -457,6 +460,10 @@ impl Docxy {
         }
         // And the copy Paste Special pastes (#669).
         if let Some(done) = self.paste_dialog_click(button) {
+            return done;
+        }
+        // And a document's, which pastes what the clipboard holds (#753).
+        if let Some(done) = self.doc_paste_dialog_click(button, window, cx) {
             return done;
         }
         // And a drop by the selection's border waiting on its question (#670).

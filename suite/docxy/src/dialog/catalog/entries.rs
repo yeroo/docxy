@@ -1079,6 +1079,17 @@ dialogs! {
         accept_closes: true,
         unreachable: None,
     }
+    // A copy first, so the "As" list holds both formats (#753).
+    DOC_PASTE_SPECIAL = "doc-paste-special" {
+        surface: Surface::Doc,
+        file: "doc-home",
+        fixture: "copy:../fixtures/basic.docx",
+        open: &["type copied", "key ctrl+a", "key ctrl+c", "key ctrl+alt+v"],
+        fields: &[radio("as")],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
     DATA_VALIDATION = "data-validation" {
         surface: Surface::Sheet,
         file: "sheet-data",

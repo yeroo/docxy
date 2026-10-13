@@ -19,8 +19,8 @@ function expected(tab) {
     for (const c of g.items) {
       if (c.cmd) cmd(c.cmd);
       (c.cmds || []).forEach(cmd);
+      // A split's menu is not on the ribbon: its arrow opens it (#753).
       if (c.primary) cmd(c.primary);
-      (c.menu || []).forEach(cmd);
       (c.rows || []).forEach((row) => row.forEach((cell) => cmd(cell.cmd)));
       (c.kind === 'gallery' ? c.items : []).forEach((it) => acts.push(it.act));
     }
@@ -65,6 +65,24 @@ test('every ribbon tab matches the suite snapshot: groups, acts and icons', asyn
     for (const [id, icon] of want.cmds) {
       if (got.combos.includes(id)) continue;
       expect(got.icons[id], `${tab.name}/${id} icon`).toBe(iconPaths(snapshot.icons[icon]));
+    }
+  }
+  // Each split's arrow opens its menu, listing the snapshot's items.
+  for (const tab of snapshot.tabs.filter((t) => t.kind === 'ribbon')) {
+    for (const c of tab.groups.flatMap((g) => g.items).filter((c) => c.kind === 'split')) {
+      await page.locator(`.rtab[data-tab="${tab.name}"]`).click();
+      await page.locator(`#rb-${c.primary.id}-menu`).click();
+      const items = await page.locator(`#popup-${c.primary.id} [role="menuitem"]`).allTextContents();
+      expect(items, `${tab.name}/${c.primary.id}`).toEqual(c.menu.map((m) => m.label));
+      // A second press on the arrow closes its menu (#753 r2).
+      await page.locator(`#rb-${c.primary.id}-menu`).click();
+      await expect(page.locator(`#popup-${c.primary.id}`)).toHaveCount(0);
+      // Enter on the focused arrow opens it too.
+      await page.locator(`#rb-${c.primary.id}-menu`).focus();
+      await page.keyboard.press('Enter');
+      await expect(page.locator(`#popup-${c.primary.id}`)).toHaveCount(1);
+      await page.keyboard.press('Escape');
+      await expect(page.locator(`#popup-${c.primary.id}`)).toHaveCount(0);
     }
   }
   const qat = await page.locator('.qat-btn').evaluateAll((bs) => bs.map((b) => b.id));

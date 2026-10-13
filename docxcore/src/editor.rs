@@ -968,12 +968,7 @@ impl Editor {
         if ch == LINE_BREAK {
             // A break is an inline of its own, formatted as typing here
             // would be (see `insert_break`), and part of the typing step.
-            let mut props = resolve_para(&self.doc.body, &self.caret.path)
-                .map(|p| tab_props_at(&p.content, off))
-                .unwrap_or_default();
-            if let Some(pending) = &pending {
-                pending.apply(&mut props);
-            }
+            let props = self.typing_props_here(pending.as_ref());
             self.paste_at_caret(&Clip {
                 paras: vec![vec![Inline::Break(BreakKind::Line, props)]],
             });
@@ -1024,14 +1019,48 @@ impl Editor {
     pub fn insert_tab(&mut self) {
         let pending = self.pending_format().cloned();
         self.delete_selection_to_replace();
+        let props = self.typing_props_here(pending.as_ref());
+        self.paste(&Clip {
+            paras: vec![vec![Inline::Tab(props)]],
+        });
+    }
+
+    /// What an inline inserted at the caret takes, as typing there would:
+    /// [`tab_props_at`] with `pending`, the format toggled at the caret (read
+    /// by the caller before an edit leaves it behind), applied.
+    fn typing_props_here(&self, pending: Option<&PendingFormat>) -> RunProps {
         let mut props = resolve_para(&self.doc.body, &self.caret.path)
             .map(|p| tab_props_at(&p.content, self.caret.offset))
             .unwrap_or_default();
-        if let Some(pending) = &pending {
+        if let Some(pending) = pending {
             pending.apply(&mut props);
         }
-        self.paste(&Clip {
-            paras: vec![vec![Inline::Tab(props)]],
+        props
+    }
+
+    /// Paste Special's Keep Text Only (#753): paste `text` (newlines split
+    /// paragraphs, tabs become tab inlines) with the formatting typing at the
+    /// caret would give, as [`Editor::insert_tab`] takes it, never the
+    /// source's. One undo step "Paste": it replaces the selection and is
+    /// recorded as a tracked insertion when tracking, as [`Editor::paste`] is.
+    pub fn paste_text_only(&mut self, text: &str) {
+        let mut clip = Clip::from_text(text);
+        if clip.paras.len() == 1 && clip.paras[0].is_empty() {
+            return;
+        }
+        self.drop_collapsed_anchor();
+        let pending = self.pending_format().cloned();
+        self.one_step("Paste", |ed| {
+            ed.delete_selection_to_replace();
+            let props = ed.typing_props_here(pending.as_ref());
+            for inline in clip.paras.iter_mut().flatten() {
+                match inline {
+                    Inline::Run(r) => r.props = props.clone(),
+                    Inline::Tab(p) => *p = props.clone(),
+                    _ => {}
+                }
+            }
+            ed.paste(&clip);
         });
     }
 
@@ -6462,6 +6491,136 @@ mod tests {
         );
         // The tab counts as one caret position and the caret advanced past it.
         assert_eq!(ed.caret.offset, 2);
+    }
+
+    fn italic() -> RunProps {
+        RunProps {
+            italic: true,
+            ..Default::default()
+        }
+    }
+
+    /// Every run and tab in the paragraph at `path`, with its props.
+    fn pieces(ed: &Editor, i: usize) -> Vec<(String, RunProps)> {
+        let Block::Paragraph(p) = &ed.doc.body[i] else {
+            panic!("not a paragraph")
+        };
+        p.content
+            .iter()
+            .filter_map(|inline| match inline {
+                Inline::Run(r) => Some((r.text.clone(), r.props.clone())),
+                Inline::Tab(props) => Some(("\t".into(), props.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Keep Text Only (#753) takes the caret's formatting: in plain text
+    /// the pasted text is plain, inside italic text it is italic.
+    #[test]
+    fn paste_text_only_takes_the_caret_formatting_753() {
+        let mut ed = selected(vec![run("ab", RunProps::default())], 1, 1);
+        ed.paste_text_only("xy");
+        assert_eq!(first_para(&ed).plain_text(), "axyb");
+        assert!(pieces(&ed, 0).iter().all(|(_, p)| !p.bold && !p.italic));
+
+        let mut ed = selected(
+            vec![run("pl ", RunProps::default()), run("ital", italic())],
+            5,
+            5,
+        );
+        ed.paste_text_only("xy");
+        assert_eq!(first_para(&ed).plain_text(), "pl itxyal");
+        for (text, props) in pieces(&ed, 0) {
+            if text.contains('x') {
+                assert!(props.italic && !props.bold, "{text:?}: {props:?}");
+            }
+        }
+    }
+
+    /// A format toggled at the caret before the paste applies to it, as it
+    /// would to typing there.
+    #[test]
+    fn paste_text_only_takes_a_pending_format_753() {
+        let mut ed = selected(vec![run("ab", RunProps::default())], 1, 1);
+        ed.anchor = None;
+        ed.toggle_bold();
+        ed.paste_text_only("x");
+        let x = pieces(&ed, 0)
+            .into_iter()
+            .find(|(t, _)| t.contains('x'))
+            .expect("pasted run");
+        assert!(x.1.bold, "{x:?}");
+    }
+
+    /// Newlines split paragraphs and tabs become tab inlines, each formatted
+    /// as the caret is.
+    #[test]
+    fn paste_text_only_splits_paragraphs_and_makes_tabs_753() {
+        let mut ed = selected(vec![run("[]", italic())], 1, 1);
+        ed.anchor = None;
+        ed.paste_text_only("a\tb\r\nc");
+        assert_eq!(ed.doc.body.len(), 2);
+        let first = pieces(&ed, 0);
+        assert!(
+            first.iter().any(|(t, p)| t == "\t" && p.italic),
+            "{first:?}"
+        );
+        assert!(first.iter().all(|(_, p)| p.italic), "{first:?}");
+        let Block::Paragraph(p0) = &ed.doc.body[0] else {
+            panic!()
+        };
+        let Block::Paragraph(p1) = &ed.doc.body[1] else {
+            panic!()
+        };
+        assert_eq!(p0.plain_text(), "[a\tb");
+        assert_eq!(p1.plain_text(), "c]");
+        assert!(pieces(&ed, 1).iter().all(|(_, p)| p.italic));
+    }
+
+    /// Over a selection it replaces it, takes what typing there would take,
+    /// and the whole paste is one undo step named Paste.
+    #[test]
+    fn paste_text_only_replaces_a_selection_in_one_step_753() {
+        let content = vec![
+            run("a ", RunProps::default()),
+            run("BOLD", bold()),
+            run(" z", RunProps::default()),
+        ];
+        let mut typed = selected(content.clone(), 2, 6);
+        typed.insert_char('x');
+        let want = pieces(&typed, 0)
+            .into_iter()
+            .find(|(t, _)| t.contains('x'))
+            .expect("typed run")
+            .1;
+
+        let mut ed = selected(content, 2, 6);
+        let before = ed.doc.clone();
+        ed.paste_text_only("x\ny");
+        assert_eq!(ed.doc.body.len(), 2);
+        let Block::Paragraph(p0) = &ed.doc.body[0] else {
+            panic!()
+        };
+        assert_eq!(p0.plain_text(), "a x");
+        let x = pieces(&ed, 0)
+            .into_iter()
+            .find(|(t, _)| t.contains('x'))
+            .expect("pasted run");
+        assert_eq!(x.1.bold, want.bold);
+        assert_eq!(ed.undo_names(), vec!["Paste"]);
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before);
+        assert!(!ed.undo(), "one step");
+    }
+
+    /// Nothing to paste changes nothing, not even a selection.
+    #[test]
+    fn paste_text_only_of_nothing_keeps_the_selection_753() {
+        let mut ed = selected(vec![run("abc", RunProps::default())], 0, 2);
+        ed.paste_text_only("");
+        assert_eq!(first_para(&ed).plain_text(), "abc");
+        assert!(ed.has_selection());
     }
 
     #[test]

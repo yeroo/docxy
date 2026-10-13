@@ -555,6 +555,28 @@ pub(crate) fn document_menu() -> Vec<MenuItem> {
         Item(Entry::new("cm-cut", "Cut", "cut", Act::Cut, true)),
         Item(Entry::new("cm-copy", "Copy", "copy", Act::Copy, true)),
         Item(Entry::new("cm-paste", "Paste", "paste", Act::Paste, true)),
+        // Word's paste choices (#753).
+        Item(Entry::new(
+            "cm-paste-keep-source",
+            "Keep Source Formatting",
+            "paste",
+            Act::PasteKeepSource,
+            true,
+        )),
+        Item(Entry::new(
+            "cm-paste-text-only",
+            "Keep Text Only",
+            "paste",
+            Act::PasteTextOnly,
+            true,
+        )),
+        Item(Entry::new(
+            "cm-paste-special",
+            "Paste Special\u{2026}",
+            "paste",
+            Act::PasteSpecial,
+            true,
+        )),
         Separator,
         Item(Entry::new("cm-bold", "Bold", "bold", Act::Bold, true)),
         Item(Entry::new(
@@ -625,6 +647,14 @@ pub(crate) fn cell_menu() -> Vec<MenuItem> {
             "Paste",
             "paste",
             Act::Sheet(S::Paste),
+            true,
+        )),
+        // Ctrl+Alt+V's dialog, as the ribbon's Paste Special\u{2026} (#753).
+        Item(Entry::new(
+            "cm-paste-special",
+            "Paste Special\u{2026}",
+            "paste",
+            Act::Sheet(S::PasteSpecial),
             true,
         )),
         Separator,
@@ -860,7 +890,7 @@ mod tests {
         }
         let mut seen = 0;
         walk(&cell_menu(), &mut seen);
-        assert_eq!(seen, 16);
+        assert_eq!(seen, 17);
     }
 
     #[test]
@@ -1332,7 +1362,7 @@ mod tests {
         );
         // Separators are not counted.
         let doc = document_menu();
-        let path = resolve_index(&doc, 3).unwrap();
+        let path = resolve_index(&doc, 6).unwrap();
         assert_eq!(entry_at(&doc, &path).unwrap().label, "Bold");
     }
 
@@ -1344,6 +1374,9 @@ mod tests {
                 "Cut",
                 "Copy",
                 "Paste",
+                "Keep Source Formatting",
+                "Keep Text Only",
+                "Paste Special…",
                 "-",
                 "Bold",
                 "Italic",
