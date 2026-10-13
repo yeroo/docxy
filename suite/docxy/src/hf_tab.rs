@@ -13,9 +13,12 @@
 //! ([`HfEdit::section`]), else the body caret's section. Section edits (link
 //! changes, created references, titlePg, distances) are one step on the body
 //! editor's undo stack; while a header is open, Ctrl+Z undoes typing in it,
-//! and the body's steps undo after leaving it. Part contents (a design, a
-//! removal, a copy made by unlinking) live in the package and are not undone;
-//! an unreferenced part left behind is harmless.
+//! and the body's steps undo after leaving it. Different Odd & Even Pages is
+//! the document's setting, kept on the body editor too (#770): clearing it
+//! drops every section's even references in the same step. Part contents (a
+//! design, a removal, a copy made by unlinking, a cleared even header) live
+//! in the package and are not undone; an unreferenced part left behind is
+//! harmless.
 use super::*;
 use crate::dialog::catalog;
 use crate::dialog::{Control as Field, ControlKind, Dialog, DialogOwner, Value};
@@ -1056,10 +1059,30 @@ pub(crate) fn hf_apply(tab: &mut DocTab, act: HfAct) -> Result<(), String> {
             }
         }
         HfAct::DifferentOddEven => {
-            let pkg = tab.pkg.as_mut().ok_or("no package")?;
-            let on = !pkg.has_even_odd();
-            pkg.set_even_odd(on);
+            tab.pkg.as_ref().ok_or("no package")?;
+            let Surface::Doc(ed) = &mut tab.surface else {
+                return Err("no document".into());
+            };
+            let on = !ed.settings().even_and_odd_headers;
+            // Clearing it discards the even header and footer of every
+            // section (the setting is the document's), keeping the odd ones:
+            // turned on again, the even pages start empty (PAG-070).
+            ed.one_step("Different Odd & Even Pages", |ed| {
+                ed.set_even_and_odd_headers(on);
+                if !on {
+                    let all: Vec<usize> = (0..ed.sections().len()).collect();
+                    ed.edit_sections(&all, |raw| {
+                        let raw = set_hf_reference(raw, true, "even", None);
+                        set_hf_reference(&raw, false, "even", None)
+                    });
+                }
+            });
             tab.set_dirty();
+            tab.status = format!(
+                "Different Odd & Even Pages: {}",
+                if on { "on" } else { "off" }
+            )
+            .into();
             if !on && variant == HeaderVariant::Even {
                 reopen(tab, section, is_header_now, HeaderVariant::Default);
             }
