@@ -1123,12 +1123,14 @@ impl Docxy {
             );
         }
         let forget = forget_on_quit(&mut self.tabs, &mut self.active, discards);
+        let mode = SessionWrite::Forget(&forget);
+        recover::harness_note(self.harness, &root, &format!("persist {}", mode.log_name()));
         let own = write_session_with(
             &root,
             &self.tabs,
             self.active,
             self.prefs(),
-            SessionWrite::Forget(&forget),
+            mode,
             &windows::others_persisted(cx, self.win_id),
             windows::seq_of(cx, self.win_id),
         );

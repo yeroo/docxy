@@ -51,6 +51,37 @@ pub(crate) fn clear_running(root: &Path) {
     let _ = std::fs::remove_file(marker_path(root));
 }
 
+/// Where a harness run records its session writes and marker clears
+/// ([`harness_note`]), under the same root as the marker.
+pub(crate) fn harness_log_path(root: &Path) -> PathBuf {
+    root.join("docxy").join("harness-writes.log")
+}
+
+/// Append `line` to [`harness_log_path`] when `harness` is on, and do nothing
+/// otherwise (#1226). An accepted window close ends the process, so no verb
+/// can report what it wrote: this log is how a test sees that the close
+/// persisted once (`persist All`) and only then cleared the marker
+/// (`clear-running`). Writes made before the view's harness flag is set
+/// (its construction) are not recorded, so a test compares line counts
+/// around the step it drives rather than reading the whole file.
+pub(crate) fn harness_note(harness: bool, root: &Path, line: &str) {
+    if !harness {
+        return;
+    }
+    use std::io::Write;
+    let p = harness_log_path(root);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(p)
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 /// The setting after `minutes` in [`CHOICES`], wrapping; a value not in the
 /// list (a hand-edited session) goes to the first choice above it.
 pub(crate) fn next_choice(minutes: u32) -> u32 {
@@ -284,6 +315,24 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn the_harness_log_records_lines_only_in_a_harness_run() {
+        let root = Scratch::new();
+        harness_note(false, &root.0, "persist All");
+        assert!(
+            !harness_log_path(&root.0).exists(),
+            "a shipped run writes no log"
+        );
+        harness_note(true, &root.0, "persist All");
+        harness_note(true, &root.0, "clear-running");
+        assert_eq!(
+            std::fs::read_to_string(harness_log_path(&root.0)).unwrap(),
+            "persist All
+clear-running
+"
+        );
     }
 
     #[test]

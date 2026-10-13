@@ -188,8 +188,11 @@ jobs:
         run: cargo clippy --manifest-path suite/Cargo.toml --all-targets --locked -- -D warnings
       - name: Test
         run: xvfb-run -a cargo test --manifest-path suite/Cargo.toml --locked
-      - name: Linux window capture
-        run: python3 scripts/ui-linux.py -- cargo test -p uiharness --locked --test linux_capture -- --ignored
+      # window_close (#1226) closes the suite's window through X11 and drives the
+      # debug suite the Test step left in suite/target/debug (docxy's integration
+      # tests build the binary).
+      - name: Linux window capture and close
+        run: python3 scripts/ui-linux.py -- cargo test -p uiharness --locked --test linux_capture --test window_close -- --ignored
 
   ui-sweep-linux:
     name: ui sweep (linux)
