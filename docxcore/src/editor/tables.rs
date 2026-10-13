@@ -505,32 +505,40 @@ impl Editor {
         let Some((cont, idx)) = container_mut(&mut self.doc.body, &path) else {
             return Err("the caret is not in a paragraph".into());
         };
-        let at = if after {
-            idx + 1
-        } else if off == 0 {
+        let at = if !after && off == 0 {
             idx
-        } else if off == len {
-            idx + 1
         } else {
             let Some(Block::Paragraph(p)) = cont.get_mut(idx) else {
                 return Err("the caret is not in a paragraph".into());
             };
-            let right = split_paragraph_content(&mut p.content, off);
-            let props = p.props.clone();
-            // The section break ends the section after the split, so it (and
-            // its tracked change) moves with the paragraph's second half. A
-            // tracked pPrChange stays on both halves, as every split does (#801).
-            p.props.section_break = None;
-            p.props.section_property_change = None;
-            // So does a tracked change of the paragraph mark.
-            crate::review::clear_mark_revisions(&mut p.props);
-            cont.insert(
-                idx + 1,
-                Block::Paragraph(Paragraph {
-                    props,
-                    content: right,
-                }),
-            );
+            // After the paragraph (its end, or `after`): a paragraph ending
+            // its section hands the break to an empty paragraph after the
+            // table, so the table stays in the section, which still ends
+            // right after it. Mid-paragraph: the second half follows.
+            let ends_section = p.props.section_break.is_some();
+            let right = if !after && off < len {
+                Some(split_paragraph_content(&mut p.content, off))
+            } else {
+                ends_section.then(Vec::new)
+            };
+            if let Some(right) = right {
+                let props = p.props.clone();
+                // The section break ends the section after the split, so it
+                // (and its tracked change) moves with the paragraph's second
+                // half. A tracked pPrChange stays on both halves, as every
+                // split does (#801).
+                p.props.section_break = None;
+                p.props.section_property_change = None;
+                // So does a tracked change of the paragraph mark.
+                crate::review::clear_mark_revisions(&mut p.props);
+                cont.insert(
+                    idx + 1,
+                    Block::Paragraph(Paragraph {
+                        props,
+                        content: right,
+                    }),
+                );
+            }
             idx + 1
         };
         cont.insert(at, Block::Table(table));
@@ -594,6 +602,27 @@ pub(crate) mod tests {
 
     fn reload(ed: &Editor) -> Document {
         parse_document_xml(&document_to_xml(&ed.doc), &Relationships::default())
+    }
+
+    #[test]
+    fn insert_table_at_the_end_of_a_section_ending_paragraph_stays_in_its_section() {
+        let mut first = para("one");
+        if let Block::Paragraph(p) = &mut first {
+            p.props.section_break = Some("<w:sectPr/>".into());
+        }
+        let mut ed = Editor::new(Document {
+            body: vec![first, para("two")],
+        });
+        ed.caret = Caret::at(vec![0], 3);
+        ed.insert_table(1, 2, AutoFit::Default).unwrap();
+        let body = &ed.doc.body;
+        assert!(matches!(&body[0], Block::Paragraph(p) if p.props.section_break.is_none()));
+        assert!(matches!(body[1], Block::Table(_)));
+        assert!(
+            matches!(&body[2], Block::Paragraph(p) if p.props.section_break.is_some() && p.content.is_empty())
+        );
+        assert_eq!(ed.section_of_block(1), ed.section_of_block(0));
+        assert_eq!(ed.sections().len(), 2);
     }
 
     #[test]

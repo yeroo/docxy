@@ -455,6 +455,47 @@ mod tests {
     }
 
     #[test]
+    fn a_table_drawn_after_a_section_ending_paragraph_stays_in_its_section() {
+        // Section 1 ends with paragraph 0 (narrow); section 2 follows.
+        let narrow = "<w:sectPr><w:pgSz w:w=\"6000\" w:h=\"15840\"/>\
+            <w:pgMar w:top=\"1440\" w:right=\"1000\" w:bottom=\"1440\" w:left=\"1000\"/></w:sectPr>";
+        for text in ["", "one"] {
+            let mut first = para(text);
+            if let Block::Paragraph(p) = &mut first {
+                p.props.section_break = Some(narrow.into());
+            }
+            let original = Document {
+                body: vec![first, para("two")],
+            };
+            let mut ed = Editor::new(original.clone());
+            let sections = ed.sections().len();
+            ed.draw_table_after(&[0], 9000, 0).unwrap();
+            let body = &ed.doc.body;
+            let Block::Paragraph(p0) = &body[0] else {
+                panic!("{text:?}: the paragraph stays first")
+            };
+            assert_eq!(p0.props.section_break, None, "{text:?}");
+            assert_eq!(body[0].plain_text(), text);
+            let Block::Table(tb) = &body[1] else {
+                panic!("{text:?}: the table follows the paragraph")
+            };
+            let Block::Paragraph(p2) = &body[2] else {
+                panic!("{text:?}: a paragraph follows the table")
+            };
+            assert_eq!(p2.props.section_break.as_deref(), Some(narrow), "{text:?}");
+            assert!(p2.content.is_empty());
+            assert_eq!(ed.sections().len(), sections, "{text:?}: no section added");
+            assert_eq!(ed.section_of_block(1), ed.section_of_block(0), "{text:?}");
+            assert_ne!(ed.section_of_block(3), ed.section_of_block(1), "{text:?}");
+            // The width clamps to the first section's text width.
+            assert_eq!(tb.grid, vec![4000], "{text:?}");
+            assert!(ed.undo());
+            assert!(!ed.undo(), "{text:?}: one undo step");
+            assert_eq!(ed.doc, original, "{text:?}: undo restores it exactly");
+        }
+    }
+
+    #[test]
     fn draw_table_clamps_its_size() {
         let mut ed = Editor::new(Document {
             body: vec![para("")],
