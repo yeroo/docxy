@@ -968,12 +968,7 @@ impl Editor {
         if ch == LINE_BREAK {
             // A break is an inline of its own, formatted as typing here
             // would be (see `insert_break`), and part of the typing step.
-            let mut props = resolve_para(&self.doc.body, &self.caret.path)
-                .map(|p| tab_props_at(&p.content, off))
-                .unwrap_or_default();
-            if let Some(pending) = &pending {
-                pending.apply(&mut props);
-            }
+            let props = self.typing_props_here(pending.as_ref());
             self.paste_at_caret(&Clip {
                 paras: vec![vec![Inline::Break(BreakKind::Line, props)]],
             });
@@ -1024,15 +1019,23 @@ impl Editor {
     pub fn insert_tab(&mut self) {
         let pending = self.pending_format().cloned();
         self.delete_selection_to_replace();
-        let mut props = resolve_para(&self.doc.body, &self.caret.path)
-            .map(|p| tab_props_at(&p.content, self.caret.offset))
-            .unwrap_or_default();
-        if let Some(pending) = &pending {
-            pending.apply(&mut props);
-        }
+        let props = self.typing_props_here(pending.as_ref());
         self.paste(&Clip {
             paras: vec![vec![Inline::Tab(props)]],
         });
+    }
+
+    /// What an inline inserted at the caret takes, as typing there would:
+    /// [`tab_props_at`] with `pending`, the format toggled at the caret (read
+    /// by the caller before an edit leaves it behind), applied.
+    fn typing_props_here(&self, pending: Option<&PendingFormat>) -> RunProps {
+        let mut props = resolve_para(&self.doc.body, &self.caret.path)
+            .map(|p| tab_props_at(&p.content, self.caret.offset))
+            .unwrap_or_default();
+        if let Some(pending) = pending {
+            pending.apply(&mut props);
+        }
+        props
     }
 
     /// Paste Special's Keep Text Only (#753): paste `text` (newlines split
@@ -1049,12 +1052,7 @@ impl Editor {
         let pending = self.pending_format().cloned();
         self.one_step("Paste", |ed| {
             ed.delete_selection_to_replace();
-            let mut props = resolve_para(&ed.doc.body, &ed.caret.path)
-                .map(|p| tab_props_at(&p.content, ed.caret.offset))
-                .unwrap_or_default();
-            if let Some(pending) = &pending {
-                pending.apply(&mut props);
-            }
+            let props = ed.typing_props_here(pending.as_ref());
             for inline in clip.paras.iter_mut().flatten() {
                 match inline {
                     Inline::Run(r) => r.props = props.clone(),
