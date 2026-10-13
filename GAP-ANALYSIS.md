@@ -64,11 +64,13 @@ loss outside its shrink-only baseline. Where the losses described above stand:
   border width, `jc="distribute"`, underline style): #1068. An unedited
   property is now written as loaded, so the gate's unedited saves no longer
   hit it. An edited property is still generated from the supported set;
-- run content restructured (runs merged or split, `lastRenderedPageBreak`,
-  row-level `sdt`): #1069, which now holds every remaining docx entry. That
-  includes intact run properties that read as lost because a split run makes
-  the comparator pair different runs
-  (`MISALIGNED_RUNS` in `docxcore/tests/fidelity.rs`).
+- run content restructured: #1069, which now holds only an empty `w:r` (no
+  children) that the loader drops (`pict+pict.docx`). A `w:r`'s children
+  saved as one `w:r` each, the dropped `lastRenderedPageBreak` and the
+  explicit `w:br` type were fixed in #1216, and row-level `sdt` in #1215.
+  `MISALIGNED_RUNS` in `docxcore/tests/fidelity.rs`, for intact run
+  properties that read as lost when a split run misaligns the comparator,
+  is empty since #1216.
 
 A save with no edits writes the original parts back
 (`save_package_preserving_document`), and the gate holds that path

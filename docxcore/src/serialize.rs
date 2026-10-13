@@ -1192,10 +1192,12 @@ fn balanced_smart_tags(content: &[Inline]) -> std::borrow::Cow<'_, [Inline]> {
     std::borrow::Cow::Owned(out)
 }
 
+/// An inline that is not run-like: run-like ones go through [`write_items`],
+/// which groups them (#1216).
 fn write_inline_with_text_kind(s: &mut String, item: &Inline, text_kind: RunTextKind) {
     match item {
         Inline::Run(_) | Inline::Tab(_) | Inline::Break(..) => {
-            write_items(s, [Item::of(item)], text_kind)
+            unreachable!("run-like inlines are written by write_items")
         }
         Inline::Hyperlink(h) => {
             if let Some(raw) = &h.raw
