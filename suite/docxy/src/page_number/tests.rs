@@ -211,6 +211,70 @@ fn a_margin_number_goes_in_the_header_and_replaces_any_other() {
     ));
 }
 
+/// r1 M3: a margin number in a blank header leaves the header a paragraph
+/// of its own in the band, and the caret goes there, not into the number.
+#[test]
+fn a_margin_number_in_a_blank_header_keeps_a_band_paragraph_for_the_caret() {
+    let mut t = three_sections("margins-blank", false);
+    caret_in(&mut t, 0);
+    place_margin(&mut t, 0).unwrap();
+    let h = t.hf_edit.as_ref().unwrap();
+    let body = &h.editor.doc.body;
+    let at = h.editor.caret.path[0];
+    assert!(matches!(body[at], Block::Paragraph(_)));
+    assert!(
+        docxcore::frame::placed_frame(&body[at]).is_none(),
+        "the caret is in the band, not the number: {body:?}"
+    );
+    assert!(body[at].plain_text().is_empty());
+    let pkg = saved(&mut t);
+    let header = saved_blocks(&pkg, 0, true);
+    assert_eq!(galleries(&header), ["Page Numbers (Margins)"]);
+    let band: Vec<_> = docxcore::frame::split_framed(&header)
+        .0
+        .into_iter()
+        .filter(|(_, b)| matches!(b, Block::Paragraph(_)))
+        .collect();
+    assert_eq!(band.len(), 1, "{header:?}");
+    // Not before the number: placed again, still one band paragraph.
+    place_margin(&mut t, 1).unwrap();
+    let pkg = saved(&mut t);
+    let header = saved_blocks(&pkg, 0, true);
+    let paras = header
+        .iter()
+        .filter(|b| matches!(b, Block::Paragraph(_)))
+        .count();
+    assert_eq!(paras, 2, "the number and one band paragraph: {header:?}");
+}
+
+/// r1 m2: with mirror margins the frame takes the narrower side margin,
+/// since the margins swap on even pages.
+#[test]
+fn with_mirror_margins_the_frame_fits_the_narrower_margin() {
+    let mut t = three_sections("margins-mirror", true);
+    ed_mut(&mut t).edit_sections(&[0], |raw| {
+        raw.replace(
+            "w:right=\"1440\" w:bottom=\"1440\" w:left=\"1440\"",
+            "w:right=\"720\" w:bottom=\"1440\" w:left=\"2160\"",
+        )
+    });
+    let width = |t: &mut DocTab| {
+        let pkg = saved(t);
+        saved_blocks(&pkg, 0, true)
+            .iter()
+            .find_map(|b| docxcore::frame::placed_frame(b).and_then(|f| f.w))
+            .unwrap()
+    };
+    caret_in(&mut t, 0);
+    place_margin(&mut t, 0).unwrap();
+    assert_eq!(width(&mut t), 2160, "left design, left margin");
+    t.pkg.as_mut().unwrap().set_mirror_margins(true);
+    place_margin(&mut t, 0).unwrap();
+    assert_eq!(width(&mut t), 720, "mirrored: the narrower");
+    place_margin(&mut t, 1).unwrap();
+    assert_eq!(width(&mut t), 720);
+}
+
 #[test]
 fn placing_in_a_document_without_a_footer_creates_one_from_section_one() {
     let mut t = three_sections("place-new", false);

@@ -248,7 +248,9 @@ fn blank(blocks: &[Block]) -> bool {
 /// that area is open, else the default one.
 pub(crate) fn place(tab: &mut DocTab, top: bool, design: usize) -> Result<(), String> {
     let d = PAGE_NUMBER_DESIGNS.get(design).ok_or("no such design")?;
-    put(tab, top, |_, _| page_number_sdt_xml(d, top, sdt_id()))?;
+    put(tab, top, false, |_, _| {
+        page_number_sdt_xml(d, top, sdt_id())
+    })?;
     let gallery = if top { "Top of Page" } else { "Bottom of Page" };
     tab.status = format!("Page number: {gallery}, {}", d.name).into();
     Ok(())
@@ -256,18 +258,27 @@ pub(crate) fn place(tab: &mut DocTab, top: bool, design: usize) -> Result<(), St
 
 /// Page Margins: put the design in the target section's header, framed in
 /// its left or right margin and as wide as it, replacing any number placed
-/// in that section's header or footer, then open the header.
+/// in that section's header or footer, then open the header with the caret
+/// in its text, not in the number. With mirror margins the left and right
+/// margins swap on even pages, so the frame takes the narrower of the two
+/// and fits the margin on every page.
 pub(crate) fn place_margin(tab: &mut DocTab, design: usize) -> Result<(), String> {
     let d = PAGE_MARGIN_DESIGNS.get(design).ok_or("no such design")?;
-    put(tab, true, |tab, section| {
+    let mirrored = tab.pkg.as_ref().is_some_and(|p| p.has_mirror_margins());
+    put(tab, true, true, |tab, section| {
         let sections = match &tab.surface {
             Surface::Doc(ed) => ed.sections(),
             _ => Vec::new(),
         };
         let raw = sections.get(section).map_or("", String::as_str);
         let m = docxcore::sect::SectionSetup::parse(raw).margins;
-        let margin = if d.right { m.right } else { m.left };
-        margin_number_sdt_xml(d, margin.saturating_abs(), sdt_id())
+        let (left, right) = (m.left.saturating_abs(), m.right.saturating_abs());
+        let margin = match (mirrored, d.right) {
+            (true, _) => left.min(right),
+            (false, true) => right,
+            (false, false) => left,
+        };
+        margin_number_sdt_xml(d, margin, sdt_id())
     })?;
     tab.status = format!("Page number: Page Margins, {}", d.name).into();
     Ok(())
@@ -276,9 +287,12 @@ pub(crate) fn place_margin(tab: &mut DocTab, design: usize) -> Result<(), String
 /// Put a placed number, made by `number` for the target section, first in
 /// that section's header (`is_header`) or last in its footer, after
 /// removing every placed number from both areas of that section variant.
+/// A `framed` number is drawn out of the band, so the area keeps a
+/// paragraph of its own in the band, where the caret goes.
 fn put(
     tab: &mut DocTab,
     is_header: bool,
+    framed: bool,
     number: impl FnOnce(&DocTab, usize) -> String,
 ) -> Result<(), String> {
     if tab.pkg.is_none() || !matches!(tab.surface, Surface::Doc(_)) {
@@ -305,6 +319,12 @@ fn put(
         _ => String::new(),
     };
     let number = number(tab, section);
+    let style = if is_header { "Header" } else { "Footer" };
+    let rest = if framed && rest.is_empty() {
+        format!("<w:p><w:pPr><w:pStyle w:val=\"{style}\"/></w:pPr></w:p>")
+    } else {
+        rest
+    };
     let inner = if is_header {
         format!("{number}{rest}")
     } else {
@@ -315,6 +335,20 @@ fn put(
     }
     set_content(tab, section, is_header, variant, &inner)?;
     reopen(tab, section, is_header, variant);
+    if framed {
+        if let Some(h) = tab.hf_edit.as_mut() {
+            let body = &h.editor.doc.body;
+            if let Some(i) = body.iter().position(|b| {
+                matches!(b, Block::Paragraph(_)) && docxcore::frame::placed_frame(b).is_none()
+            }) {
+                h.editor.anchor = None;
+                h.editor.caret = docxcore::editor::Caret {
+                    path: vec![i],
+                    offset: 0,
+                };
+            }
+        }
+    }
     Ok(())
 }
 
