@@ -306,6 +306,13 @@ fn close_step(tab: &mut DocTab, answer: Option<CloseAnswer>) -> CloseStep {
     }
 }
 
+/// Whether a close prompt for `tab` would go unseen: under a dialog of its
+/// own, or under the app's (Document Recovery, #1225), which is shown over
+/// every tab's. Either is closed first, so the close or quit stops there.
+pub(crate) fn prompt_hidden(tab: &DocTab, app_dialogs: &crate::dialog::DialogStack) -> bool {
+    tab.dialogs.is_open() || app_dialogs.is_open()
+}
+
 /// What a tab with a dialog open says when it is asked to close: the
 /// dialog is staged work of its own, so it is closed first.
 pub(crate) const CLOSE_DIALOG_FIRST: &str = "Close the open dialog first";
@@ -1147,7 +1154,7 @@ impl Docxy {
         let next = next_to_ask(&self.tabs, &self.quit_discards);
         match next {
             None => self.finish_quit(window, cx),
-            Some(i) if self.tabs[i].dialogs.is_open() => {
+            Some(i) if prompt_hidden(&self.tabs[i], &self.app_dialogs) => {
                 self.quit_cancelled(cx);
                 self.refuse_close_under_dialog(i, window, cx);
             }

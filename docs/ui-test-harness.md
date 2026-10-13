@@ -601,9 +601,16 @@ anything was unsaved and so written to the hot-exit sidecars and
 `session.json`. It flushes an open header/footer but leaves sheet and Project
 cell editors open. A run leaves `<config>/docxy/running` behind until a clean
 exit (window close or `quit`) removes it; a relaunch that finds it labels its
-dirty restored tabs `recovered — AutoRecover copy …`. The ignored desktop test
+dirty restored tabs `recovered — AutoRecover copy …`. When any such tab's file
+still exists, the relaunch then opens Document Recovery (#1225) after any
+command-line files have opened: `dialog-read` shows id `document-recovery` with
+one `documents` CheckList, an item per such tab, all checked. Verbs a person
+could not reach under a dialog are refused until `dialog-click` presses OK or
+Cancel. Cancel, or OK with every item checked, keeps every recovered copy; on
+OK, an unchecked item's tab reopens its original with status `original opened —
+the AutoRecover copy was discarded`. The ignored desktop test
 `uiharness/tests/autorecover.rs` kills an instance after a tick and checks the
-relaunch.
+relaunch, Document Recovery included.
 
 `call keep-drafts {"on":bool}` sets Settings' "Keep the last AutoRecovered
 version if I close without saving" (#613, on by default). With it and

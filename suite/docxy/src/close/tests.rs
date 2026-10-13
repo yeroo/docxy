@@ -4089,3 +4089,19 @@ fn a_workbook_whose_draft_cannot_be_kept_keeps_its_copy() {
         t.status
     );
 }
+
+/// A close or quit that would ask about a tab while Document Recovery is
+/// open stops instead: the prompt would sit under it, unseen (#1225 r2 m1).
+#[test]
+fn a_close_prompt_under_document_recovery_is_refused() {
+    let root = Root::new("recovery-quit");
+    let (_, t) = edited_doc(&root, "original.docx", "recover me");
+    let mut tabs = vec![t];
+    let (restored, recovered) = recovery_restore(&root, &mut tabs);
+    let mut app = crate::dialog::DialogStack::default();
+    assert!(!prompt_hidden(&restored[0], &app));
+    app.push(crate::doc_recovery::dialog(&recovery_items(
+        &recovered, &restored,
+    )));
+    assert!(prompt_hidden(&restored[0], &app));
+}
