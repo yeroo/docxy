@@ -2684,7 +2684,7 @@ pub fn format_with(xf: &Xf, value: &CellValue, date1904: bool) -> String {
 /// quoted field). The file's encoding (Excel's UTF-8 BOM) is the writer's:
 /// see [`crate::textio::encode`].
 pub fn sheet_to_csv(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
-    crate::textio::sheet_text(sheet, styles, date1904, ',')
+    crate::textio::sheet_text(sheet, styles, date1904, ',', "\r\n")
 }
 
 #[cfg(test)]
