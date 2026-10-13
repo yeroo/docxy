@@ -4212,7 +4212,32 @@ fn dispatch_verb(
         }
         // Header/footer editing state (#641): which area of which section and
         // variant, its labels, and the contextual tab's Options and Position.
-        "hf-state" => Done::ok(crate::hf_tab::hf_state(app.tabs.get(app.active))),
+        // `margin_frames`: where Print Layout drew the frames of framed
+        // header/footer paragraphs, a Page Margins number's (#767), from the
+        // last frame.
+        "hf-state" => {
+            let mut state = crate::hf_tab::hf_state(app.tabs.get(app.active));
+            if let Json::Obj(fields) = &mut state {
+                fields.push(("margin_frames".into(), app.margin_frames()));
+            }
+            Done::ok(state)
+        }
+        // A real double-click at the middle of a frame of header/footer
+        // paragraphs Print Layout drew (#767), by its index in
+        // `hf-state.margin_frames`: through gpui's hit testing, so it shows
+        // what the frame and the page under it do with it.
+        "frame-double-click" => {
+            app.refuse_under_dialog()?;
+            app.close_menu();
+            let index = arg_usize(args, "index")?;
+            let (x, y) = app.margin_frame_point(index)?;
+            let mut done = Done::ok(Json::obj(vec![
+                ("x", Json::Num(f64::from(x))),
+                ("y", Json::Num(f64::from(y))),
+            ]))?;
+            done.input = double_click_events(point(px(x), px(y)));
+            Ok(done)
+        }
         // A pointer double-click on a print-layout page's header, footer or
         // body area (0-based `page`), through the handler the page draws.
         "page-double-click" => {

@@ -821,12 +821,74 @@ fn page_break_before(p: &Paragraph, styles: &StyleSheet) -> bool {
 
 fn emit_blocks(flow: &mut dyn Flow, blocks: &[Block], opts: &PdfOptions) {
     for block in blocks {
-        match block {
-            Block::Paragraph(p) => emit_paragraph(flow, p, opts),
-            Block::Table(t) => emit_table(flow, t, opts),
-            Block::SectionProperties(_) | Block::Raw(_) => {}
-        }
+        emit_block(flow, block, opts);
     }
+}
+
+fn emit_block(flow: &mut dyn Flow, block: &Block, opts: &PdfOptions) {
+    match block {
+        Block::Paragraph(p) => emit_paragraph(flow, p, opts),
+        Block::Table(t) => emit_table(flow, t, opts),
+        Block::SectionProperties(_) | Block::Raw(_) => {}
+    }
+}
+
+/// A header or footer band: its blocks flow down from `top` at `x`/`width`,
+/// except framed paragraphs (a Page Margins number, #767), returned for
+/// [`emit_frames`] to place once the band's top is known.
+fn emit_band<'b>(
+    blocks: &'b [Block],
+    (x, width, top): (f32, f32, f32),
+    opts: &PdfOptions,
+) -> (BandFlow, Vec<crate::frame::FrameGroup<'b>>) {
+    let (flow, groups) = crate::frame::split_framed(blocks);
+    let mut band = BandFlow::new(x, width, top);
+    for (_, b) in flow {
+        emit_block(&mut band, b, opts);
+    }
+    (band, groups)
+}
+
+/// A frame's content width in twips as this exporter draws it, for a frame
+/// with no `w` (Word sizes it to its content): the longest line's printed
+/// characters plus one, at the monospace advance of each paragraph's size.
+fn content_w(g: &crate::frame::FrameGroup, opts: &PdfOptions) -> i32 {
+    if g.frame.w.is_some_and(|w| w > 0) {
+        return 0; // frame_rect takes `w`.
+    }
+    g.paras
+        .iter()
+        .map(|(_, p)| {
+            let size = heading_size(p, opts.base_font_size);
+            let segs = flatten_segments(p, p.props.heading_level.is_some(), &opts.styles);
+            let chars = segs.iter().map(|s| s.cells.len()).max().unwrap_or(0) + 1;
+            (chars as f32 * 0.6 * size * 20.0).ceil() as i32
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Lay out each frame's paragraphs, stacked, at its rectangle on the page
+/// ([`crate::frame::frame_rect`]); `page_h` turns its top-down twips into
+/// the PDF's bottom-up points.
+fn emit_frames(
+    groups: &[crate::frame::FrameGroup],
+    geom: &crate::frame::FrameGeom,
+    page_h: f32,
+    opts: &PdfOptions,
+) -> BandFlow {
+    let mut out = BandFlow::new(0.0, 0.0, 0.0);
+    let pt = |t: i32| t as f32 / 20.0;
+    for g in groups {
+        let r = crate::frame::frame_rect(g.frame, geom, content_w(g, opts), g.content_h());
+        let mut one = BandFlow::new(pt(r.x), pt(r.w), page_h - pt(r.y));
+        for (_, p) in &g.paras {
+            emit_paragraph(&mut one, p, opts);
+        }
+        out.frags.append(&mut one.frags);
+        out.links.append(&mut one.links);
+    }
+    out
 }
 
 fn emit_paragraph(flow: &mut dyn Flow, p: &Paragraph, opts: &PdfOptions) {
@@ -1165,19 +1227,37 @@ impl<'a> Pager<'a> {
         let mut body_bottom = s.bottom;
         let mut hf_frags = Vec::new();
         let mut hf_links = Vec::new();
+        let twips = |pt: f32| (pt * 20.0).round() as i32;
+        let geom = |band_top: f32| crate::frame::FrameGeom {
+            page_w: twips(s.w),
+            page_h: twips(s.h),
+            left: twips(left),
+            right: twips(right),
+            top: twips(s.top_margin(opts)),
+            bottom: twips(s.bottom),
+            band_top: twips(band_top),
+            even,
+        };
         if let Some(blocks) = part_blocks(parts.and_then(|p| p.headers[variant.index()].as_ref())) {
-            let mut band = BandFlow::new(left, width, s.h - s.header);
-            emit_blocks(&mut band, blocks, opts);
+            let (mut band, groups) = emit_band(blocks, (left, width, s.h - s.header), opts);
+            let mut frames = emit_frames(&groups, &geom(s.header), s.h, opts);
             // A tall header pushes the body down.
             body_top = body_top.min(band.low - opts.base_font_size * 0.4);
             hf_frags.append(&mut band.frags);
             hf_links.append(&mut band.links);
+            hf_frags.append(&mut frames.frags);
+            hf_links.append(&mut frames.links);
         }
         if let Some(blocks) = part_blocks(parts.and_then(|p| p.footers[variant.index()].as_ref())) {
             // Lay out from 0, then lift so the last baseline sits at the footer
-            // distance from the bottom edge.
-            let mut band = BandFlow::new(left, width, 0.0);
-            emit_blocks(&mut band, blocks, opts);
+            // distance from the bottom edge. Framed paragraphs sit at their
+            // frame, measured from the page (or from the lifted flow's top,
+            // at least a line above the footer distance), and are not lifted.
+            let (mut band, groups) = emit_band(blocks, (left, width, 0.0), opts);
+            let flow_top = s.footer + (-band.low).max(opts.base_font_size * 1.2);
+            let mut frames = emit_frames(&groups, &geom(s.h - flow_top), s.h, opts);
+            hf_frags.append(&mut frames.frags);
+            hf_links.append(&mut frames.links);
             let dy = s.footer - band.low;
             for f in &mut band.frags {
                 f.y += dy;
@@ -3018,6 +3098,118 @@ mod tests {
         Inline::Raw(format!(
             r#"<w:r><w:instrText xml:space="preserve">{text}</w:instrText></w:r>"#
         ))
+    }
+
+    /// Insert › Page Number › Page Margins (#767): the number is drawn in
+    /// the side margin, centred down the page, with the page's own value, on
+    /// odd and even pages, and the header's other text stays in the band.
+    #[test]
+    fn a_margin_page_number_is_drawn_in_the_side_margin() {
+        for design in &crate::hf::PAGE_MARGIN_DESIGNS {
+            let xml = format!(
+                r#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t>HDR</w:t></w:r></w:p>{}</w:hdr>"#,
+                crate::hf::margin_number_sdt_xml(design, 1440, 5)
+            );
+            let header = crate::load::parse_header_footer(&xml, &Default::default());
+            let opts = with_parts(&[("rH", "header1.xml", header)]);
+            let d = three_pages(
+                r#"<w:sectPr><w:headerReference w:type="default" r:id="rH"/><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:bottom="1440" w:left="1440" w:right="1440" w:header="720" w:footer="720"/></w:sectPr>"#,
+            );
+            let pages = pages_of(&d, &opts);
+            assert_eq!(pages.len(), 3);
+            for (i, page) in pages.iter().enumerate().take(2) {
+                let number = (i + 1).to_string();
+                let &(x, y, _) = page
+                    .texts
+                    .iter()
+                    .find(|(_, _, t)| *t == number)
+                    .unwrap_or_else(|| panic!("{number} not on page: {:?}", page.texts));
+                if design.right {
+                    assert!(x > 612.0 - 72.0 && x < 612.0, "{}: x {x}", design.name);
+                } else {
+                    assert!(x > 0.0 && x < 72.0, "{}: x {x}", design.name);
+                }
+                // Centred down the page (the frame's top half holds the line).
+                assert!((300.0..420.0).contains(&y), "{}: y {y}", design.name);
+                // The rest of the header stays in its band.
+                let (hx, hy) = page.at("HDR");
+                assert!(close(hx, 72.0) && close(hy, 792.0 - 36.0 - LH), "{hy}");
+            }
+        }
+    }
+
+    /// An old Word footer number: a frame anchored to the text, right of
+    /// the margin, one twip down. It sits on the footer's lines, at the right.
+    #[test]
+    fn a_text_anchored_footer_frame_sits_on_the_footer_lines() {
+        let xml = r#"<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:pPr><w:framePr w:wrap="around" w:vAnchor="text" w:hAnchor="margin" w:xAlign="right" w:y="1"/></w:pPr><w:r><w:t>77</w:t></w:r></w:p><w:p><w:r><w:t>FTR</w:t></w:r></w:p></w:ftr>"#;
+        let footer = crate::load::parse_header_footer(xml, &Default::default());
+        let opts = with_parts(&[("rF", "footer1.xml", footer)]);
+        let d = three_pages(
+            r#"<w:sectPr><w:footerReference w:type="default" r:id="rF"/><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:bottom="1440" w:left="1440" w:right="1440" w:header="720" w:footer="720"/></w:sectPr>"#,
+        );
+        let page = &pages_of(&d, &opts)[0];
+        let (fx, fy) = page.at("FTR");
+        let (nx, ny) = page.at("77");
+        assert!(close(fy, 36.0), "the footer line: {fy}");
+        // y="1" is a twip (0.05 pt) below the flow's top.
+        assert!(
+            (ny - fy).abs() < 0.5,
+            "the number {ny} on the footer's line {fy}"
+        );
+        assert!(close(fx, 72.0) && nx > 500.0, "right of the margin: {nx}");
+    }
+
+    /// A frame with no `w` is as wide as its text: one line, flush right
+    /// against the margin when it says `xAlign="right"`.
+    #[test]
+    fn a_frame_with_no_width_fits_its_text_on_one_line() {
+        let xml = r#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:pPr><w:framePr w:wrap="around" w:hAnchor="margin" w:vAnchor="page" w:xAlign="right" w:y="7200"/></w:pPr><w:r><w:t>CONFIDENTIAL DRAFT</w:t></w:r></w:p><w:p/></w:hdr>"#;
+        let header = crate::load::parse_header_footer(xml, &Default::default());
+        let opts = with_parts(&[("rH", "header1.xml", header)]);
+        let d = three_pages(
+            r#"<w:sectPr><w:headerReference w:type="default" r:id="rH"/><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:bottom="1440" w:left="1440" w:right="1440" w:header="720" w:footer="720"/></w:sectPr>"#,
+        );
+        let page = &pages_of(&d, &opts)[0];
+        let line: Vec<_> = page
+            .texts
+            .iter()
+            .filter(|(_, _, t)| t.contains("CONFIDENTIAL") || t.contains("DRAFT"))
+            .collect();
+        let ys: Vec<f32> = line.iter().map(|(_, y, _)| *y).collect();
+        assert!(ys.iter().all(|y| close(*y, ys[0])), "one line: {line:?}");
+        // Ends at the right margin (540 pt), not wrapped and not at the left.
+        let (x, _, t) = line[0];
+        let size = opts.base_font_size;
+        let end = x + t.chars().count() as f32 * 0.6 * size;
+        assert!(*x > 300.0, "right-aligned: {line:?}");
+        assert!(end <= 540.5 && end > 540.0 - 0.6 * size * 2.0, "end {end}");
+    }
+
+    /// Enter in a framed number makes two paragraphs with the same frame:
+    /// they stack in it, the second below the first, not over it.
+    #[test]
+    fn adjacent_framed_paragraphs_stack_in_one_frame() {
+        let framed = |t: &str| {
+            format!(
+                r#"<w:p><w:pPr><w:framePr w:w="1440" w:hAnchor="page" w:vAnchor="page" w:x="0" w:y="7200"/></w:pPr><w:r><w:t>{t}</w:t></w:r></w:p>"#
+            )
+        };
+        let xml = format!(
+            r#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{}{}<w:p/></w:hdr>"#,
+            framed("one"),
+            framed("two")
+        );
+        let header = crate::load::parse_header_footer(&xml, &Default::default());
+        let opts = with_parts(&[("rH", "header1.xml", header)]);
+        let d =
+            three_pages(r#"<w:sectPr><w:headerReference w:type="default" r:id="rH"/></w:sectPr>"#);
+        let page = &pages_of(&d, &opts)[0];
+        let (x1, y1) = page.at("one");
+        let (x2, y2) = page.at("two");
+        assert!(close(x1, x2) && x1 < 72.0, "{x1} {x2}");
+        assert!(y2 < y1 - 10.0, "two {y2} below one {y1}");
+        assert!(close(y1, 792.0 - 360.0 - LH), "at the frame's top: {y1}");
     }
 
     #[test]

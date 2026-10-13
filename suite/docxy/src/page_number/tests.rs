@@ -82,10 +82,25 @@ fn the_menu_lists_words_galleries_then_format_and_remove() {
     let menu::MenuItem::Item(margins) = &items[2] else {
         panic!()
     };
-    assert!(!margins.enabled, "Page Margins is not available yet");
+    // #767: Page Margins is a live gallery.
+    assert!(margins.enabled);
+    assert_eq!(
+        labels(&margins.submenu),
+        [
+            "Plain Number, Left",
+            "Plain Number, Right",
+            "Large, Left",
+            "Large, Right"
+        ]
+    );
+    assert!(margins.submenu.iter().all(|i| matches!(i,
+        menu::MenuItem::Item(e) if e.enabled && e.id.starts_with("pn-margins-"))));
     // Every design can also be clicked by name on the ribbon.
     let ribbon: Vec<&str> = ribbon_items().iter().map(|c| c.label).collect();
     assert!(ribbon.contains(&"Bottom of Page: Plain Number 2"));
+    for d in &PAGE_MARGIN_DESIGNS {
+        assert!(ribbon.contains(&format!("Page Margins: {}", d.name).as_str()));
+    }
     assert!(ribbon.contains(&"Remove Page Numbers"));
 }
 
@@ -122,6 +137,142 @@ fn a_second_design_replaces_the_first_and_moving_it_leaves_one() {
         saved_hf(&pkg, 0, true).ends_with("Header A"),
         "number first"
     );
+}
+
+/// The placed numbers' galleries in a section's saved header or footer.
+fn galleries(blocks: &[Block]) -> Vec<String> {
+    let xml = docxcore::serialize::blocks_to_xml(blocks);
+    xml.split("w:docPartGallery w:val=\"")
+        .skip(1)
+        .map(|s| s[..s.find('"').unwrap()].to_string())
+        .collect()
+}
+
+/// #767: a Page Margins design puts one framed number in the section's
+/// header, as wide as its margin; another design (any gallery) replaces
+/// it, and a margin design replaces a number at the top or bottom.
+#[test]
+fn a_margin_number_goes_in_the_header_and_replaces_any_other() {
+    let mut t = three_sections("margins", true);
+    caret_in(&mut t, 0);
+    place(&mut t, false, 1).unwrap();
+    place_margin(&mut t, 1).unwrap();
+    let h = t.hf_edit.as_ref().unwrap();
+    assert_eq!((h.section, h.is_header), (0, true), "the header is open");
+    let pkg = saved(&mut t);
+    let header = saved_blocks(&pkg, 0, true);
+    let footer = saved_blocks(&pkg, 0, false);
+    assert_eq!(galleries(&header), ["Page Numbers (Margins)"]);
+    assert!(galleries(&footer).is_empty(), "the footer's number went");
+    assert_eq!(saved_hf(&pkg, 0, false), "Footer A");
+    assert_eq!(page_fields(&header), 1);
+    // Framed against the right page edge, as wide as the right margin.
+    let frame = header
+        .iter()
+        .find_map(|b| docxcore::frame::placed_frame(b).cloned())
+        .expect("a framed paragraph");
+    let sect = docxcore::sect::SectionSetup::parse(&saved_sections(&pkg)[0]);
+    assert_eq!(frame.x_align.as_deref(), Some("right"));
+    assert_eq!(frame.h_anchor.as_deref(), Some("page"));
+    assert_eq!(frame.w, Some(sect.margins.right.max(360)));
+    // The header's own text stays, after the number.
+    assert!(saved_hf(&pkg, 0, true).ends_with("Header A"));
+    // Another margin design: still one.
+    place_margin(&mut t, 2).unwrap();
+    let pkg = saved(&mut t);
+    let header = saved_blocks(&pkg, 0, true);
+    assert_eq!(galleries(&header), ["Page Numbers (Margins)"]);
+    assert_eq!(page_fields(&header), 1, "one number, not two");
+    // Bottom of Page takes it out of the header.
+    place(&mut t, false, 0).unwrap();
+    let pkg = saved(&mut t);
+    assert!(galleries(&saved_blocks(&pkg, 0, true)).is_empty());
+    assert_eq!(page_fields(&saved_blocks(&pkg, 0, true)), 0);
+    assert_eq!(
+        galleries(&saved_blocks(&pkg, 0, false)),
+        ["Page Numbers (Bottom of Page)"]
+    );
+    // And Top of Page replaces a margin number in the same header.
+    place_margin(&mut t, 0).unwrap();
+    place(&mut t, true, 1).unwrap();
+    let pkg = saved(&mut t);
+    let header = saved_blocks(&pkg, 0, true);
+    assert_eq!(galleries(&header), ["Page Numbers (Top of Page)"]);
+    assert!(!docxcore::serialize::blocks_to_xml(&header).contains("w:framePr"));
+    assert!(galleries(&saved_blocks(&pkg, 0, false)).is_empty());
+    // Remove Page Numbers takes a margin number.
+    place_margin(&mut t, 3).unwrap();
+    assert!(remove_all(&mut t).unwrap());
+    let pkg = saved(&mut t);
+    assert_eq!(page_fields(&saved_blocks(&pkg, 0, true)), 0);
+    assert_eq!(saved_hf(&pkg, 0, true), "Header A");
+    assert!(!has_page_number(
+        &t.hf_edit.as_ref().unwrap().editor.doc.body
+    ));
+}
+
+/// r1 M3: a margin number in a blank header leaves the header a paragraph
+/// of its own in the band, and the caret goes there, not into the number.
+#[test]
+fn a_margin_number_in_a_blank_header_keeps_a_band_paragraph_for_the_caret() {
+    let mut t = three_sections("margins-blank", false);
+    caret_in(&mut t, 0);
+    place_margin(&mut t, 0).unwrap();
+    let h = t.hf_edit.as_ref().unwrap();
+    let body = &h.editor.doc.body;
+    let at = h.editor.caret.path[0];
+    assert!(matches!(body[at], Block::Paragraph(_)));
+    assert!(
+        docxcore::frame::placed_frame(&body[at]).is_none(),
+        "the caret is in the band, not the number: {body:?}"
+    );
+    assert!(body[at].plain_text().is_empty());
+    let pkg = saved(&mut t);
+    let header = saved_blocks(&pkg, 0, true);
+    assert_eq!(galleries(&header), ["Page Numbers (Margins)"]);
+    let band: Vec<_> = docxcore::frame::split_framed(&header)
+        .0
+        .into_iter()
+        .filter(|(_, b)| matches!(b, Block::Paragraph(_)))
+        .collect();
+    assert_eq!(band.len(), 1, "{header:?}");
+    // Not before the number: placed again, still one band paragraph.
+    place_margin(&mut t, 1).unwrap();
+    let pkg = saved(&mut t);
+    let header = saved_blocks(&pkg, 0, true);
+    let paras = header
+        .iter()
+        .filter(|b| matches!(b, Block::Paragraph(_)))
+        .count();
+    assert_eq!(paras, 2, "the number and one band paragraph: {header:?}");
+}
+
+/// r1 m2: with mirror margins the frame takes the narrower side margin,
+/// since the margins swap on even pages.
+#[test]
+fn with_mirror_margins_the_frame_fits_the_narrower_margin() {
+    let mut t = three_sections("margins-mirror", true);
+    ed_mut(&mut t).edit_sections(&[0], |raw| {
+        raw.replace(
+            "w:right=\"1440\" w:bottom=\"1440\" w:left=\"1440\"",
+            "w:right=\"720\" w:bottom=\"1440\" w:left=\"2160\"",
+        )
+    });
+    let width = |t: &mut DocTab| {
+        let pkg = saved(t);
+        saved_blocks(&pkg, 0, true)
+            .iter()
+            .find_map(|b| docxcore::frame::placed_frame(b).and_then(|f| f.w))
+            .unwrap()
+    };
+    caret_in(&mut t, 0);
+    place_margin(&mut t, 0).unwrap();
+    assert_eq!(width(&mut t), 2160, "left design, left margin");
+    t.pkg.as_mut().unwrap().set_mirror_margins(true);
+    place_margin(&mut t, 0).unwrap();
+    assert_eq!(width(&mut t), 720, "mirrored: the narrower");
+    place_margin(&mut t, 1).unwrap();
+    assert_eq!(width(&mut t), 720);
 }
 
 #[test]

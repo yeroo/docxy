@@ -1,9 +1,9 @@
 //! Header and footer content helpers: the page numbers Insert › Page Number
-//! places (#650).
+//! places (#650, #767).
 //!
 //! Word marks a placed page number by wrapping its paragraph in a block content
-//! control whose `w:docPartGallery` is `Page Numbers (Top of Page)` or
-//! `Page Numbers (Bottom of Page)`. The loader keeps a block `w:sdt` as two
+//! control whose `w:docPartGallery` is `Page Numbers (Top of Page)`,
+//! `Page Numbers (Bottom of Page)` or `Page Numbers (Margins)`. The loader keeps a block `w:sdt` as two
 //! `Block::Raw` boundaries around normally parsed, editable paragraphs (see
 //! `load::parse_sdt_block`), so the same shape serves ours and Word's: Remove
 //! Page Numbers finds either, and never touches a `PAGE` field typed by hand.
@@ -92,6 +92,80 @@ pub fn page_number_sdt_xml(design: &PageNumberDesign, top: bool, sdt_id: u32) ->
          <w:sdtEndPr/><w:sdtContent><w:p><w:pPr><w:pStyle w:val=\"{style}\"/>{jc}</w:pPr>\
          {body}</w:p></w:sdtContent></w:sdt>",
         page_number_gallery(top)
+    )
+}
+
+/// The gallery value Word writes for a number in the side margin.
+pub const MARGINS_GALLERY: &str = "Page Numbers (Margins)";
+
+/// One design of the Page Margins gallery (#767): the number in a frame in
+/// the left or right side margin, centred down the page. Text only (the
+/// suite draws no shapes), so these are ours, not Word's shaped designs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarginDesign {
+    pub name: &'static str,
+    /// In the right margin; else the left one.
+    pub right: bool,
+    /// `w:sz` of the number in half-points, if not the style's.
+    pub size_half_pts: Option<u32>,
+}
+
+/// The Page Margins designs, in menu order.
+pub const PAGE_MARGIN_DESIGNS: [MarginDesign; 4] = [
+    MarginDesign {
+        name: "Plain Number, Left",
+        right: false,
+        size_half_pts: None,
+    },
+    MarginDesign {
+        name: "Plain Number, Right",
+        right: true,
+        size_half_pts: None,
+    },
+    MarginDesign {
+        name: "Large, Left",
+        right: false,
+        size_half_pts: Some(56),
+    },
+    MarginDesign {
+        name: "Large, Right",
+        right: true,
+        size_half_pts: Some(56),
+    },
+];
+
+/// The narrowest frame a margin number gets, twips: a section whose side
+/// margin is smaller still gets a frame this wide, over its text.
+pub const MIN_MARGIN_FRAME: i32 = 360;
+
+/// The block XML of a number placed in the side margin: Word's
+/// `docPartObj` control (`Page Numbers (Margins)`) around one centred
+/// `Header` paragraph framed against the page's left or right edge
+/// (`xAlign`, not an absolute `x`, so a header part shared by a section of
+/// another width or orientation still lands at that page's edge), as wide as
+/// `margin` (the target section's side margin, `w:pgMar` left or right
+/// without the gutter: the gutter widens the text's offset, not the frame),
+/// and centred down the page. The frame's exact height lets the view centre
+/// it before laying it out.
+pub fn margin_number_sdt_xml(design: &MarginDesign, margin: i32, sdt_id: u32) -> String {
+    let w = margin.max(MIN_MARGIN_FRAME);
+    let (h, rpr) = match design.size_half_pts {
+        Some(sz) => (
+            840,
+            format!("<w:rPr><w:sz w:val=\"{sz}\"/><w:szCs w:val=\"{sz}\"/></w:rPr>"),
+        ),
+        None => (560, String::new()),
+    };
+    let side = if design.right { "right" } else { "left" };
+    format!(
+        "<w:sdt><w:sdtPr><w:id w:val=\"{sdt_id}\"/><w:docPartObj>\
+         <w:docPartGallery w:val=\"{MARGINS_GALLERY}\"/><w:docPartUnique/></w:docPartObj></w:sdtPr>\
+         <w:sdtEndPr/><w:sdtContent><w:p><w:pPr><w:pStyle w:val=\"Header\"/>\
+         <w:framePr w:w=\"{w}\" w:h=\"{h}\" w:hRule=\"exact\" w:wrap=\"around\" \
+         w:vAnchor=\"page\" w:hAnchor=\"page\" w:xAlign=\"{side}\" w:yAlign=\"center\"/>\
+         <w:jc w:val=\"center\"/></w:pPr>\
+         <w:fldSimple w:instr=\" PAGE \"><w:r>{rpr}<w:t xml:space=\"preserve\">1</w:t></w:r></w:fldSimple>\
+         </w:p></w:sdtContent></w:sdt>"
     )
 }
 
@@ -455,6 +529,68 @@ mod tests {
         assert_eq!(balance_sdt_boundaries(&mut b), vec![3, 5]);
         assert_eq!(b, vec![open(), p(), close(), p(), open(), p(), close()]);
         assert!(balance_sdt_boundaries(&mut b).is_empty());
+    }
+
+    #[test]
+    fn a_margin_number_is_a_framed_header_paragraph_at_the_page_edge() {
+        for (i, design) in PAGE_MARGIN_DESIGNS.iter().enumerate() {
+            let xml = margin_number_sdt_xml(design, 1800, 9);
+            assert!(xml.contains("w:val=\"Page Numbers (Margins)\""), "{xml}");
+            assert!(xml.contains("<w:docPartUnique/>"));
+            // No source indentation saved into documents.
+            assert!(!xml.contains("  "), "{xml}");
+            let b = blocks(&xml);
+            assert_eq!(b.len(), 3, "{i}");
+            assert!(is_page_number_open(&b[0]));
+            let Block::Paragraph(p) = &b[1] else {
+                panic!("{:?}", b[1])
+            };
+            assert_eq!(p.props.style_id.as_deref(), Some("Header"));
+            assert_eq!(p.plain_text(), "1");
+            let f = p.props.frame.as_ref().expect("framePr");
+            assert_eq!(f.h_anchor.as_deref(), Some("page"));
+            assert_eq!(f.v_anchor.as_deref(), Some("page"));
+            assert_eq!(f.y_align.as_deref(), Some("center"));
+            assert_eq!(
+                f.x_align.as_deref(),
+                Some(if design.right { "right" } else { "left" })
+            );
+            assert_eq!(f.x, None, "no absolute x");
+            assert_eq!(f.w, Some(1800));
+            assert_eq!(f.h_rule.as_deref(), Some("exact"));
+            assert!(f.h.is_some_and(|h| h > crate::frame::line_height(p)));
+            // It saves as it loaded.
+            let out = crate::serialize::blocks_to_xml(&b);
+            assert_eq!(blocks(&out), b, "{out}");
+        }
+        // A tiny margin still gets a usable frame.
+        let xml = margin_number_sdt_xml(&PAGE_MARGIN_DESIGNS[0], 100, 9);
+        let b = blocks(&xml);
+        let Block::Paragraph(p) = &b[1] else { panic!() };
+        assert_eq!(p.props.frame.as_ref().unwrap().w, Some(MIN_MARGIN_FRAME));
+        // Large carries its size on the number.
+        let b = blocks(&margin_number_sdt_xml(&PAGE_MARGIN_DESIGNS[2], 1440, 9));
+        let Block::Paragraph(p) = &b[1] else { panic!() };
+        assert_eq!(crate::frame::line_height(p), 56 * 12);
+    }
+
+    /// What Word writes for a Page Margins design (a text box in the header,
+    /// trimmed): Remove Page Numbers takes it too.
+    #[test]
+    fn word_and_our_margin_numbers_are_removed() {
+        let word = "<w:sdt><w:sdtPr><w:id w:val=\"-90\"/><w:docPartObj>\
+            <w:docPartGallery w:val=\"Page Numbers (Margins)\"/><w:docPartUnique/>\
+            </w:docPartObj></w:sdtPr><w:sdtContent><w:p><w:pPr><w:pStyle w:val=\"Header\"/></w:pPr>\
+            <w:r><w:t>shape</w:t></w:r></w:p></w:sdtContent></w:sdt>";
+        let ours = margin_number_sdt_xml(&PAGE_MARGIN_DESIGNS[1], 1440, 4);
+        for sdt in [word.to_string(), ours] {
+            let mut b = blocks(&format!("{HAND_TYPED}{sdt}"));
+            assert!(remove_page_numbers(&mut b), "{sdt}");
+            let xml = crate::serialize::blocks_to_xml(&b);
+            assert!(!xml.contains("w:sdt"), "{xml}");
+            assert!(!xml.contains("w:framePr"), "{xml}");
+            assert_eq!(b.len(), 1);
+        }
     }
 
     #[test]

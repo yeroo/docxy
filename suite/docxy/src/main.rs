@@ -5956,12 +5956,26 @@ struct RulerProbe {
     viewport: Option<ScreenRect>,
     draft_column: Option<ScreenRect>,
     pages: Vec<Option<ScreenRect>>,
+    /// Each frame of framed header/footer paragraphs drawn in Print
+    /// Layout (#767), one per frame group.
+    frames: Vec<FrameProbe>,
     contents: Vec<Option<ScreenRect>>,
     ranges: Vec<Vec<(usize, usize)>>,
     caret_block: Option<usize>,
     pointer: Option<(f32, f32)>,
     draft: bool,
     painted: Option<HRulerGeom>,
+}
+
+/// A frame of framed header/footer paragraphs (one group: adjacent
+/// paragraphs with the same `w:framePr`) as Print Layout drew it (#767).
+#[derive(Clone, Copy, Debug)]
+struct FrameProbe {
+    page: usize,
+    header: bool,
+    rect: ScreenRect,
+    /// Its page's left and right margins, px.
+    margins: (f32, f32),
 }
 
 fn ruler_probe_el(
@@ -5981,6 +5995,76 @@ fn ruler_probe_el(
     .right_0()
     .bottom_0()
     .into_any_element()
+}
+
+impl Docxy {
+    /// The window point at the middle of the `index`th frame the last
+    /// Print Layout frame drew (`margin_frames`' order), if it lies in the
+    /// document's viewport.
+    pub(crate) fn margin_frame_point(&self, index: usize) -> Result<(f32, f32), String> {
+        let probe = self.ruler_probe.borrow();
+        let f = probe.frames.get(index).ok_or_else(|| {
+            format!(
+                "no frame {index} drawn ({} drawn): switch to Print Layout and shot first",
+                probe.frames.len()
+            )
+        })?;
+        let (x, y) = (f.rect.x + f.rect.w / 2.0, f.rect.y + f.rect.h / 2.0);
+        let seen = probe
+            .viewport
+            .is_some_and(|v| x >= v.x && x < v.x + v.w && y >= v.y && y < v.y + v.h);
+        if !seen {
+            return Err(format!(
+                "frame {index} is not on screen (its middle is at {x}, {y})"
+            ));
+        }
+        Ok((x, y))
+    }
+
+    /// `hf-state`'s `margin_frames` (#767): each frame of framed
+    /// header/footer paragraphs the last Print Layout frame drew (one entry
+    /// per frame: adjacent paragraphs with the same `w:framePr` share one),
+    /// in inches from its page sheet's top-left corner: `page` (0-based, as
+    /// `page-double-click`), `area` (`header`/`footer`), `x`, `y`, `w`, `h`,
+    /// the sheet's `page_w`, and `side`: `left` or `right` when the frame
+    /// lies wholly in that side margin, else `text`.
+    pub(crate) fn margin_frames(&self) -> ctlcore::json::Json {
+        use ctlcore::json::Json;
+        let probe = self.ruler_probe.borrow();
+        let inch = 96.0 * self.zoom;
+        let r = |v: f32| Json::Num(((v / inch) * 1000.0).round() as f64 / 1000.0);
+        Json::Arr(
+            probe
+                .frames
+                .iter()
+                .filter_map(|f| {
+                    let sheet = probe.pages.get(f.page).copied().flatten()?;
+                    let (x, w) = (f.rect.x - sheet.x, f.rect.w);
+                    // Half a pixel of slack for rounding.
+                    let side = if x >= -0.5 && x + w <= f.margins.0 + 0.5 {
+                        "left"
+                    } else if x >= sheet.w - f.margins.1 - 0.5 && x + w <= sheet.w + 0.5 {
+                        "right"
+                    } else {
+                        "text"
+                    };
+                    Some(Json::obj(vec![
+                        ("page", Json::Num(f.page as f64)),
+                        (
+                            "area",
+                            Json::Str(if f.header { "header" } else { "footer" }.into()),
+                        ),
+                        ("x", r(x)),
+                        ("y", r(f.rect.y - sheet.y)),
+                        ("w", r(w)),
+                        ("h", r(f.rect.h)),
+                        ("page_w", r(sheet.w)),
+                        ("side", Json::Str(side.into())),
+                    ]))
+                })
+                .collect(),
+        )
+    }
 }
 
 fn ruler_scroll_view(
@@ -28837,31 +28921,115 @@ fn parse_hf_part(pkg: &Package, part_name: &str) -> Vec<Block> {
     docxcore::load::parse_header_footer(&String::from_utf8_lossy(xml), &rels)
 }
 
-/// Render header/footer blocks read-only (no caret, no click) for the page margins.
+/// A header or footer's band flow, read-only: its paragraphs, less the
+/// framed ones, which Print Layout draws at their frame.
 fn hf_els(blocks: &[Block], pal: Pal, meas: &Measurer, hf_width: f32) -> Vec<AnyElement> {
-    blocks
-        .iter()
-        .filter_map(|b| match b {
-            Block::Paragraph(p) => Some(paragraph_el(
-                p,
-                None,
-                None,
-                None,
-                None,
-                false,
-                1.0,
-                pal,
-                Some(meas),
-                Some(hf_width),
-                false,
-                // Header/footer text is never line-numbered (#746).
-                None,
-                None,
-                None,
-            )),
+    docxcore::frame::split_framed(blocks)
+        .0
+        .into_iter()
+        .filter_map(|(_, b)| match b {
+            Block::Paragraph(p) => Some(hf_para_el(p, pal, meas, hf_width, 1.0)),
             _ => None,
         })
         .collect()
+}
+
+/// A field's text size, px at `zoom`: its result's, else `base` (already
+/// zoomed). The substring test keeps the parse off most fields, which this
+/// runs per field per frame.
+fn field_size(raw: &str, base: f32, zoom: f32) -> f32 {
+    raw.contains("<w:sz ")
+        .then(|| docxcore::load::field_result_props(raw).size_half_pts)
+        .flatten()
+        .map_or(base, |h| zoom * h as f32 / 2.0 * 1.333)
+}
+
+/// A frame group's content width in twips, measured as `hf_para_el` draws
+/// it at `zoom` (1 px = 15 / zoom twips), for a frame with no `w` (Word sizes
+/// it to its content): the widest paragraph, plus a space of slack.
+fn frame_content_w(g: &docxcore::frame::FrameGroup, meas: &Measurer, zoom: f32) -> i32 {
+    if g.frame.w.is_some_and(|w| w > 0) {
+        return 0; // frame_rect takes `w`.
+    }
+    let para_w = |p: &Paragraph| -> f32 {
+        let base = para_base(p, zoom);
+        let items: f32 = flat_inlines(&p.content)
+            .iter()
+            .map(|(i, _)| inline_width(i, base, zoom, meas, None))
+            .sum();
+        items + meas.width(" ", base, false, false)
+    };
+    let px = g.paras.iter().map(|(_, p)| para_w(p)).fold(0.0, f32::max);
+    (px * 15.0 / zoom.max(0.01)).ceil() as i32
+}
+
+/// A paragraph's base text size, px at `zoom`: its heading level's, else
+/// body text's (`paragraph_el` draws at it).
+fn para_base(p: &Paragraph, zoom: f32) -> f32 {
+    zoom * match p.props.heading_level {
+        Some(1) => 26.0,
+        Some(2) => 22.0,
+        Some(3) => 19.0,
+        Some(4) => 17.0,
+        Some(_) => 15.0,
+        None => 14.5,
+    }
+}
+
+/// The drawn width (px) of one inline of a paragraph whose base size is
+/// `base`, as `paragraph_el` draws it; inlines with no measured text are
+/// 0. Tab segments and frames with no `w` both use it.
+fn inline_width(
+    it: &Inline,
+    base: f32,
+    zoom: f32,
+    m: &Measurer,
+    cell_run: Option<&docxcore::table_styles::RunLook>,
+) -> f32 {
+    match it {
+        Inline::Run(r) => {
+            let props = shown_in(cell_run, r);
+            let sz = props
+                .size_half_pts
+                .map(|h| h as f32 / 2.0 * 1.333)
+                .unwrap_or(base);
+            m.width(&r.text, sz, props.bold, props.italic)
+        }
+        // Its shown text (`[field]` when it has none) and its 2 px padding
+        // each side.
+        Inline::Field { raw, text } => {
+            m.width(
+                if text.is_empty() { "[field]" } else { text },
+                field_size(raw, base, zoom),
+                false,
+                false,
+            ) + 4.0
+        }
+        Inline::FootnoteRef { id, .. } => m.width(&id.to_string(), base * 0.72, false, false),
+        _ => 0.0,
+    }
+}
+
+/// One read-only header/footer paragraph at `width` px, drawn at `zoom`
+/// (the band draws at 1; a frame at the view's zoom, as its box is).
+fn hf_para_el(p: &Paragraph, pal: Pal, meas: &Measurer, width: f32, zoom: f32) -> AnyElement {
+    paragraph_el(
+        p,
+        None,
+        None,
+        None,
+        None,
+        false,
+        zoom,
+        pal,
+        Some(meas),
+        Some(width),
+        false,
+        // Header/footer text is never line-numbered (#746).
+        None,
+        None,
+        None,
+    )
 }
 
 /// Rough rendered height (px) of a block, for paginating Print Layout. Text is
@@ -29193,15 +29361,7 @@ fn paragraph_el(
     cell_run: Option<&docxcore::table_styles::RunLook>,
 ) -> AnyElement {
     use docxcore::model::TabAlign;
-    let base = zoom
-        * match p.props.heading_level {
-            Some(1) => 26.0,
-            Some(2) => 22.0,
-            Some(3) => 19.0,
-            Some(4) => 17.0,
-            Some(_) => 15.0,
-            None => 14.5,
-        };
+    let base = para_base(p, zoom);
     let is_heading = p.props.heading_level.is_some();
     let mut spans: Vec<AnyElement> = Vec::new();
     let mut idx = 0usize;
@@ -29263,25 +29423,8 @@ fn paragraph_el(
     };
     // The rendered width of a single inline (for tracking x and looking ahead to
     // size centre/right tabs). Inlines with no measurable text contribute 0.
-    let inline_w = |it: &Inline| -> f32 {
-        match it {
-            Inline::Run(r) => run_w(r),
-            Inline::Field { text, .. } => m
-                .map(|m| {
-                    m.width(
-                        if text.is_empty() { "[field]" } else { text },
-                        base,
-                        false,
-                        false,
-                    )
-                })
-                .unwrap_or(0.0),
-            Inline::FootnoteRef { id, .. } => m
-                .map(|m| m.width(&id.to_string(), base * 0.72, false, false))
-                .unwrap_or(0.0),
-            _ => 0.0,
-        }
-    };
+    let inline_w =
+        |it: &Inline| -> f32 { m.map_or(0.0, |m| inline_width(it, base, zoom, m, cell_run)) };
     // Total width of content from index `from` up to the next tab / break / end —
     // the segment a centre/right tab must position.
     let seg_width = |from: usize| -> f32 {
@@ -29427,7 +29570,7 @@ fn paragraph_el(
                         } else {
                             pal.panel
                         })
-                        .text_size(px(base))
+                        .text_size(px(field_size(raw, base, zoom)))
                         .text_color(pal.fg)
                         .child(SharedString::from(shown))
                         .when_some(click.filter(|_| width == 1), |d, c| {
@@ -35078,6 +35221,7 @@ impl Render for Docxy {
                         {
                             let mut probe = self.ruler_probe.borrow_mut();
                             probe.pages = vec![None; pages.len()];
+                            probe.frames.clear();
                             probe.contents = vec![None; pages.len()];
                             probe.ranges = pages.clone();
                             probe.caret_block = editor.caret.path.first().copied();
@@ -35303,16 +35447,15 @@ impl Render for Docxy {
                                     if let (Some(h), Some(ep)) = (hf, edit_page) {
                                         if h.is_header == is_h {
                                             if pi == ep {
-                                                return h
-                                                    .editor
-                                                    .doc
-                                                    .body
-                                                    .iter()
-                                                    .enumerate()
-                                                    .map(|(i, b)| {
-                                                        block_el(b, vec![i], None, hf_ctx.unwrap())
-                                                    })
-                                                    .collect();
+                                                return docxcore::frame::split_framed(
+                                                    &h.editor.doc.body,
+                                                )
+                                                .0
+                                                .into_iter()
+                                                .map(|(i, b)| {
+                                                    block_el(b, vec![i], None, hf_ctx.unwrap())
+                                                })
+                                                .collect();
                                             }
                                             if page_part(pi, is_h) == Some(h.part_name.as_str()) {
                                                 return hf_els(
@@ -35506,10 +35649,135 @@ impl Render for Docxy {
                                         .on_mouse_down(MouseButton::Left, dbl(PageArea::Footer));
                                 }
                                 let page = page_base.child(header).child(mid).child(footer);
+                                // A header or footer's framed paragraphs (a Page
+                                // Margins number, #767) at their frame on the
+                                // sheet (`docxcore::frame`, as the PDF export
+                                // places them): editable on the edit page, and
+                                // double-clicked open elsewhere like their area.
+                                let mut frame_els: Vec<AnyElement> = Vec::new();
+                                for is_h in [true, false] {
+                                    let edited = hf.filter(|h| {
+                                        h.is_header == is_h
+                                            && edit_page.is_some_and(|ep| {
+                                                pi == ep
+                                                    || page_part(pi, is_h)
+                                                        == Some(h.part_name.as_str())
+                                            })
+                                    });
+                                    let editable = edited.is_some() && Some(pi) == edit_page;
+                                    let blocks = match edited {
+                                        Some(h) => h.editor.doc.body.as_slice(),
+                                        None => page_blocks(pi, is_h),
+                                    };
+                                    let (flow, groups) = docxcore::frame::split_framed(blocks);
+                                    if groups.is_empty() {
+                                        continue;
+                                    }
+                                    // A footer's flow ends at the footer distance;
+                                    // its top (what `vAnchor="text"` measures
+                                    // from) is the estimated flow height, at least
+                                    // a line, above it (the export measures it).
+                                    let band_top = if is_h {
+                                        page_dist(pi, true)
+                                    } else {
+                                        let flow_h = flow
+                                            .iter()
+                                            .map(|(_, b)| block_height_est(b, hf_w / zoom) * 15.0)
+                                            .sum::<f32>()
+                                            as i32;
+                                        sb.h - page_dist(pi, false) - flow_h.max(264)
+                                    };
+                                    let geom = docxcore::frame::FrameGeom {
+                                        page_w: sb.w,
+                                        page_h: sb.h,
+                                        left: sb.left,
+                                        right: sb.right,
+                                        top: sb.top,
+                                        bottom: sb.bottom,
+                                        band_top,
+                                        even: (pi + 1).is_multiple_of(2),
+                                    };
+                                    let margins = (
+                                        zoom * sb.left as f32 / 15.0,
+                                        zoom * sb.right as f32 / 15.0,
+                                    );
+                                    let area = if is_h {
+                                        PageArea::Header
+                                    } else {
+                                        PageArea::Footer
+                                    };
+                                    for g in &groups {
+                                        let r = docxcore::frame::frame_rect(
+                                            g.frame,
+                                            &geom,
+                                            frame_content_w(g, &measurer, zoom),
+                                            g.content_h(),
+                                        );
+                                        let width = zoom * r.w.max(0) as f32 / 15.0;
+                                        // One frame, its paragraphs stacked; editable
+                                        // ones keep their block paths.
+                                        let paras = g.paras.iter().map(|&(i, p)| {
+                                            match hf_ctx.filter(|_| editable) {
+                                                Some(ctx) => block_el(
+                                                    &blocks[i],
+                                                    vec![i],
+                                                    None,
+                                                    RenderCtx {
+                                                        hf_width: Some(width),
+                                                        ..ctx
+                                                    },
+                                                ),
+                                                None => {
+                                                    hf_para_el(p, doc_pal, &measurer, width, zoom)
+                                                }
+                                            }
+                                        });
+                                        let exact = g.frame.h_rule.as_deref() == Some("exact");
+                                        let open = dbl(area);
+                                        frame_els.push(
+                                            v_flex()
+                                                .absolute()
+                                                .left(px(zoom * r.x as f32 / 15.0))
+                                                .top(px(zoom * r.y as f32 / 15.0))
+                                                .w(px(width))
+                                                .when(exact, |d| d.h(tw(r.h)))
+                                                .when(!exact, |d| d.min_h(tw(r.h)))
+                                                .text_color(doc_pal.fg)
+                                                // A press on a frame never reaches the
+                                                // page under it, whose body area would
+                                                // close the open header or footer: an
+                                                // editable frame keeps it to its text,
+                                                // a read-only one opens its area.
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    move |ev: &MouseDownEvent, window, cx| {
+                                                        cx.stop_propagation();
+                                                        if !editable {
+                                                            open(ev, window, cx);
+                                                        }
+                                                    },
+                                                )
+                                                .children(paras)
+                                                .child(ruler_probe_el(
+                                                    &self.ruler_probe,
+                                                    move |state, rect| {
+                                                        state.frames.push(FrameProbe {
+                                                            page: pi,
+                                                            header: is_h,
+                                                            rect,
+                                                            margins,
+                                                        })
+                                                    },
+                                                ))
+                                                .into_any_element(),
+                                        );
+                                    }
+                                }
                                 div()
                                     .relative()
                                     .w(tw(sb.w))
                                     .child(page)
+                                    .children(frame_els)
                                     .child(ruler_probe_el(&self.ruler_probe, move |state, rect| {
                                         if let Some(slot) = state.pages.get_mut(pi) {
                                             *slot = Some(rect);
@@ -35556,6 +35824,7 @@ impl Render for Docxy {
                         {
                             let mut probe = self.ruler_probe.borrow_mut();
                             probe.pages.clear();
+                            probe.frames.clear();
                             probe.contents.clear();
                             probe.ranges.clear();
                             probe.caret_block = editor.caret.path.first().copied();

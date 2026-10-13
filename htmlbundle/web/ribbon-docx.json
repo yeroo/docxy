@@ -1111,6 +1111,54 @@
                   }
                 },
                 {
+                  "id": "pn-margins-1",
+                  "label": "Page Margins: Plain Number, Left",
+                  "icon": "page-number",
+                  "act": "Hf(PageNumber(Margin { design: 0 }))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "pn-margins-2",
+                  "label": "Page Margins: Plain Number, Right",
+                  "icon": "page-number",
+                  "act": "Hf(PageNumber(Margin { design: 1 }))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "pn-margins-3",
+                  "label": "Page Margins: Large, Left",
+                  "icon": "page-number",
+                  "act": "Hf(PageNumber(Margin { design: 2 }))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "pn-margins-4",
+                  "label": "Page Margins: Large, Right",
+                  "icon": "page-number",
+                  "act": "Hf(PageNumber(Margin { design: 3 }))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
                   "id": "pn-current-1",
                   "label": "Current Position: Plain Number",
                   "icon": "page-number",
