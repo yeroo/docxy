@@ -331,6 +331,17 @@ test hovering a table style previews it on the caret's table (764)
   call ribbon-layout {"tab":"Table Design"}
   shot window
   assert preview is null
+  # So does File: the backstage frame drops it, and back from it nothing
+  # is previewed.
+  call gallery-hover {"gallery":"tablestyles","item":"Grid Table 4 Accent 1"}
+  shot window
+  assert preview.kind is style
+  call backstage {"action":"open"}
+  shot window
+  assert preview is null
+  call backstage {"action":"close"}
+  shot window
+  assert preview is null
   # A click applies the hovered style; the drawn table is then the real one.
   call gallery-hover {"gallery":"tablestyles","item":"Grid Table 4 Accent 1"}
   call ribbon-click {"tab":"Table Design","command":"tablestyles:Grid Table 4 Accent 1"}

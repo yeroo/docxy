@@ -34360,6 +34360,13 @@ impl Render for Docxy {
         // entries cannot survive — a chart that was deleted simply does not
         // record itself again.
         self.frame = self.frame.wrapping_add(1);
+        // The live preview (#764), first, before any early return (the
+        // backstage): every frame reports what it draws in place of the
+        // document, none unless it draws one, and a preview found stale or
+        // its control gone is dropped for good, never drawn again when the
+        // control comes back with no tile or cell hovered.
+        *self.drawn_preview.borrow_mut() = None;
+        self.drop_stale_preview(window);
         self.schedule_project_passes(window, cx);
         // The last backstop of Protected View (#633), or of a document marked
         // as final (#617): an edit that reached a locked document by a way no gate or `mark_dirty` covers (one of
@@ -34866,13 +34873,6 @@ impl Render for Docxy {
 
         // Text measurer for tab-stop positioning (shared across the document).
         let measurer = Measurer::new(window);
-        // Reset every frame: a frame that draws no preview (another tab, a
-        // sheet) reports none.
-        *self.drawn_preview.borrow_mut() = None;
-        // A live preview (#764) is one-shot: once a frame finds it stale or
-        // its control gone, it is dropped, never drawn again when the
-        // control comes back with no tile or cell hovered.
-        self.drop_stale_preview(window);
         let content: AnyElement = match self.tabs.get(self.active) {
             Some(tab) => match &tab.surface {
                 Surface::Doc(editor) => {
