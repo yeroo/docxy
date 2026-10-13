@@ -221,6 +221,45 @@ dialogs! {
         accept_closes: true,
         unreachable: None,
     }
+    HF_DATE_TIME = "hf-date-time" {
+        surface: Surface::Doc,
+        file: "doc-layout",
+        fixture: DOCX,
+        open: &[
+            r#"call ribbon-click {"tab":"Insert","command":"Edit Header"}"#,
+            r#"call ribbon-click {"tab":"Header & Footer","command":"hf-datetime"}"#,
+        ],
+        fields: &[dropdown("formats"), checkbox("update")],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
+    HF_ALIGNMENT_TAB = "hf-alignment-tab" {
+        surface: Surface::Doc,
+        file: "doc-layout",
+        fixture: DOCX,
+        open: &[
+            r#"call ribbon-click {"tab":"Insert","command":"Edit Header"}"#,
+            r#"call ribbon-click {"tab":"Header & Footer","command":"hf-align-tab"}"#,
+        ],
+        fields: &[radio("alignment"), dropdown("relative"), radio("leader")],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
+    HF_ONLINE_PICTURES = "hf-online-pictures" {
+        surface: Surface::Doc,
+        file: "doc-layout",
+        fixture: DOCX,
+        open: &[
+            r#"call ribbon-click {"tab":"Insert","command":"Edit Header"}"#,
+            r#"call ribbon-click {"tab":"Header & Footer","command":"hf-online-pictures"}"#,
+        ],
+        fields: &[],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
     PAGE_NUMBER_FORMAT = "page-number-format" {
         surface: Surface::Doc,
         file: "doc-layout",

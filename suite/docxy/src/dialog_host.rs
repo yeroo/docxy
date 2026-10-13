@@ -65,6 +65,20 @@ fn apply_dialog(
             };
             crate::page_number::apply_format(ed, dialog, section)
         }
+        DialogOwner::HfDateTime | DialogOwner::HfAlignmentTab => {
+            // At the caret of the open header or footer, else the body.
+            let ed = match (hf, surface) {
+                (Some(ed), _) => ed,
+                (None, Surface::Doc(ed)) => ed,
+                _ => return Err("this dialog belongs to a document".into()),
+            };
+            match dialog.owner {
+                DialogOwner::HfDateTime => crate::hf_insert::apply_date_time(ed, dialog),
+                _ => crate::hf_insert::apply_alignment_tab(ed, dialog),
+            }
+        }
+        // Handled in `Docxy::online_pictures_click`, before this.
+        DialogOwner::HfOnlinePictures => Err("Online Pictures applies through Pictures...".into()),
         // Their presses are handled in `ttc_dialog::click`, before this.
         DialogOwner::TextToColumns { .. } | DialogOwner::TextToColumnsReplace => {
             Err("Text to Columns applies through its own wizard".into())
@@ -197,6 +211,7 @@ pub(crate) fn presses_through_app(owner: &DialogOwner) -> bool {
                 | DialogOwner::DropReplace
                 | DialogOwner::GoTo
                 | DialogOwner::GoToSpecial
+                | DialogOwner::HfOnlinePictures
         )
 }
 
@@ -477,6 +492,10 @@ impl Docxy {
         }
         // And a drop by the selection's border waiting on its question (#670).
         if let Some(done) = self.drop_dialog_click(button) {
+            return done;
+        }
+        // Online Pictures' From a File... opens the native file dialog (#768).
+        if let Some(done) = self.online_pictures_click(button, window, cx) {
             return done;
         }
         let reopen = reopen_on_top(self.tabs.get(self.active));

@@ -48,6 +48,9 @@ rust-embed = "8"
 # Grapheme-cluster boundaries for caret moves and deletion in dialog fields
 # (dialog.rs, dialog_host.rs); the terminal docxy crate uses it the same way.
 unicode-segmentation = "1.13"
+# The local clock DATE/TIME fields and Insert Date and Time show (#768); docxcore
+# stays dependency-free. Already in the lock through gpui's dependencies.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # The plain AppKit menu bar a native dialog runs under (#1071, macos_menu.rs),
 # and the RTF a copy adds to the pasteboard (#1074, rich_clip.rs).

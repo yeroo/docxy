@@ -57,6 +57,7 @@ mod file_keys;
 mod harness;
 mod help_tab;
 mod hf;
+mod hf_insert;
 mod hf_tab;
 mod hl_mode;
 mod html_bundle;
@@ -11599,6 +11600,42 @@ fn review_identity(user_name: &str, user_initials: &str) -> (String, String) {
     (name, initials)
 }
 
+/// The civil time `utc_secs` (Unix seconds) shows on a clock `offset_secs`
+/// ahead of UTC.
+pub(crate) fn now_local(utc_secs: i64, offset_secs: i64) -> docxcore::field::DateTime {
+    docxcore::field::civil_from_unix(utc_secs + offset_secs)
+}
+
+/// Now on the local clock, which DATE and TIME fields and Insert Date and
+/// Time show, as Word does (#768).
+pub(crate) fn local_clock() -> docxcore::field::DateTime {
+    let now = chrono::Local::now();
+    now_local(now.timestamp(), i64::from(now.offset().local_minus_utc()))
+}
+
+/// What a field inserted into `tab` evaluates against: the local clock, the
+/// document's core properties (`docProps/core.xml`), its title as the file
+/// name and its path. A document with no author keeps showing "docxy".
+pub(crate) fn tab_field_context(tab: Option<&DocTab>) -> docxcore::field::FieldContext {
+    let mut props = tab
+        .and_then(|t| t.pkg.as_ref())
+        .and_then(|p| p.part_text("docProps/core.xml"))
+        .map(|xml| docxcore::field::parse_core_props(&xml))
+        .unwrap_or_default();
+    if props.author.trim().is_empty() {
+        props.author = "docxy".to_string();
+    }
+    docxcore::field::FieldContext {
+        now: Some(local_clock()),
+        props,
+        filename: tab.map(|t| t.title.to_string()).unwrap_or_default(),
+        path: tab
+            .and_then(|t| t.path.as_ref())
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+    }
+}
+
 /// Now as a UTC ISO-8601 `w:date` (`YYYY-MM-DDTHH:MM:SSZ`).
 fn utc_now_iso() -> String {
     let secs = std::time::SystemTime::now()
@@ -21471,22 +21508,7 @@ impl Docxy {
 
     /// Field evaluation context: the current clock, author and file name.
     fn field_context(&self) -> docxcore::field::FieldContext {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|d| docxcore::field::civil_from_unix(d.as_secs() as i64));
-        let filename = self
-            .tabs
-            .get(self.active)
-            .map(|t| t.title.to_string())
-            .unwrap_or_default();
-        let mut props = docxcore::field::DocProps::default();
-        props.author = "docxy".to_string();
-        docxcore::field::FieldContext {
-            now,
-            props,
-            filename,
-        }
+        tab_field_context(self.tabs.get(self.active))
     }
 
     /// Insert a field (`<w:fldSimple>`) with its computed value at the caret.
@@ -28979,6 +29001,74 @@ fn para_base(p: &Paragraph, zoom: f32) -> f32 {
 /// The drawn width (px) of one inline of a paragraph whose base size is
 /// `base`, as `paragraph_el` draws it; inlines with no measured text are
 /// 0. Tab segments and frames with no `w` both use it.
+/// An alignment tab (`w:ptab`, #768): where it aligns the text after it,
+/// and whether it measures from the paragraph's indents rather than the
+/// margins.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Ptab {
+    align: docxcore::model::TabAlign,
+    indent: bool,
+}
+
+/// The alignment tab a raw run holds, if it holds one.
+fn ptab_of(it: &Inline) -> Option<Ptab> {
+    use docxcore::model::TabAlign;
+    let Inline::Raw(raw) = it else {
+        return None;
+    };
+    if !raw.starts_with("<w:r") {
+        return None;
+    }
+    let at = raw.find("<w:ptab")?;
+    let end = at + raw[at..].find('>')?;
+    let el = &raw[at..end];
+    let align = match docxcore::load::xml_attr_value(el, "w:alignment").as_deref() {
+        Some("center") => TabAlign::Center,
+        Some("right") => TabAlign::Right,
+        _ => TabAlign::Left,
+    };
+    let indent = docxcore::load::xml_attr_value(el, "w:relativeTo").as_deref() == Some("indent");
+    Some(Ptab { align, indent })
+}
+
+/// Where an alignment tab's stop is, in px from the left margin, on a line
+/// `width` px wide whose paragraph is indented `left` and `right` px. A
+/// right stop sits a few px inside the edge, as the implicit header stops
+/// do, so the segment ending there does not wrap the row.
+fn ptab_stop(p: Ptab, width: f32, left: f32, right: f32) -> f32 {
+    use docxcore::model::TabAlign;
+    let (lo, hi) = if p.indent {
+        (left, (width - right).max(left))
+    } else {
+        (0.0, width)
+    };
+    match p.align {
+        TabAlign::Left => lo,
+        TabAlign::Center => (lo + hi) / 2.0,
+        _ => (hi - 4.0).max(lo),
+    }
+}
+
+/// The space an alignment tab at `xm` (px from the margin) leaves so the
+/// segment after it, `seg` px wide, starts at, centres on or ends at
+/// `stop`; none when the text has already passed it (it does not wrap).
+fn ptab_gap(align: docxcore::model::TabAlign, stop: f32, xm: f32, seg: f32) -> f32 {
+    use docxcore::model::TabAlign;
+    match align {
+        TabAlign::Center => stop - seg / 2.0 - xm,
+        TabAlign::Right => stop - seg - xm,
+        _ => stop - xm,
+    }
+    .max(0.0)
+}
+
+/// An inline picture's frame in px at `zoom`, from its extent in EMUs
+/// (9525 per px at 96 dpi), at least 1 px each way.
+fn picture_frame_px(cx: i64, cy: i64, zoom: f32) -> (f32, f32) {
+    let px_of = |emu: i64| (emu as f32 / 9525.0 * zoom).max(1.0);
+    (px_of(cx), px_of(cy))
+}
+
 fn inline_width(
     it: &Inline,
     base: f32,
@@ -29006,6 +29096,8 @@ fn inline_width(
             ) + 4.0
         }
         Inline::FootnoteRef { id, .. } => m.width(&id.to_string(), base * 0.72, false, false),
+        Inline::Raw(raw) => docxcore::image::inline_extent(raw)
+            .map_or(0.0, |(cx, cy)| picture_frame_px(cx, cy, zoom).0),
         _ => 0.0,
     }
 }
@@ -29404,8 +29496,11 @@ fn paragraph_el(
     // Hyperlinks opened up into their pieces, so text, tabs and breaks inside a
     // link take caret offsets exactly as the editor counts them.
     let items = flat_inlines(&p.content);
-    // Only paragraphs that actually contain a tab need per-run width measurement.
-    let has_tab = items.iter().any(|(i, _)| matches!(**i, Inline::Tab(_)));
+    // Only paragraphs that actually contain a tab (or an alignment tab, #768)
+    // need per-run width measurement.
+    let has_tab = items
+        .iter()
+        .any(|(i, _)| matches!(**i, Inline::Tab(_)) || ptab_of(i).is_some());
     let m = meas.filter(|_| has_tab);
     // Width of a run's text at its effective size (matching emit_words' sizing).
     let run_w = |r: &docxcore::model::Run| -> f32 {
@@ -29425,13 +29520,15 @@ fn paragraph_el(
     // size centre/right tabs). Inlines with no measurable text contribute 0.
     let inline_w =
         |it: &Inline| -> f32 { m.map_or(0.0, |m| inline_width(it, base, zoom, m, cell_run)) };
-    // Total width of content from index `from` up to the next tab / break / end —
-    // the segment a centre/right tab must position.
+    // Total width of content from index `from` up to the next tab, alignment
+    // tab, break or end — the segment a centre/right tab must position.
     let seg_width = |from: usize| -> f32 {
         items[from..]
             .iter()
             .map(|(it, _)| &**it)
-            .take_while(|it| !matches!(it, Inline::Tab(_) | Inline::Break(..)))
+            .take_while(|it| {
+                !matches!(it, Inline::Tab(_) | Inline::Break(..)) && ptab_of(it).is_none()
+            })
             .map(&inline_w)
             .sum()
     };
@@ -29515,6 +29612,33 @@ fn paragraph_el(
                 emit_revision_text(&mut spans, content, base, pal, cell_run);
             }
             Inline::Raw(xml) => {
+                // An alignment tab (#768) places the text after it against the
+                // line's margin or indent, where the line's width is known (a
+                // header or footer); it takes no caret offset.
+                if let (Some(ptab), Some(w)) = (ptab_of(inline), hf_width) {
+                    let stop =
+                        ptab_stop(ptab, w, tw_px(indent.left, zoom), tw_px(indent.right, zoom));
+                    let gap = ptab_gap(ptab.align, stop, pad_l + x, seg_width(i + 1));
+                    if gap > 0.0 {
+                        spans.push(div().flex_none().w(px(gap)).h(px(1.)).into_any_element());
+                        x += gap;
+                    }
+                }
+                // An inline picture (#768): a frame of its size, drawn in the
+                // line; the picture itself is not drawn here yet.
+                if let Some((cx_emu, cy_emu)) = docxcore::image::inline_extent(xml) {
+                    let (w, h) = picture_frame_px(cx_emu, cy_emu, zoom);
+                    spans.push(
+                        div()
+                            .flex_none()
+                            .w(px(w))
+                            .h(px(h))
+                            .border_1()
+                            .border_color(pal.dim)
+                            .into_any_element(),
+                    );
+                    x += w;
+                }
                 // Comment reference → a small badge; other raw XML (range markers,
                 // bookmarks, …) is invisible content and renders nothing.
                 if xml.contains("commentReference") {
