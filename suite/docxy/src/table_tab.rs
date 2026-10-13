@@ -9,6 +9,7 @@
 //! Also here: the Insert > Table drop-down (the columns × rows hover grid and
 //! its items), the one menu a table command set shares with the Insert tab.
 use super::*;
+use crate::table_draw::{self, Drag, DrawMode, ERASER_STATUS, Gesture, PEN_STATUS, Tool};
 use docxcore::editor::{AutoFitKind, BorderCmd};
 use docxcore::table_props::{TblLook, VAlign};
 use docxcore::table_styles::BUILTIN;
@@ -28,6 +29,10 @@ pub(crate) enum TableAct {
     // ---- Layout ----
     Select(SelectWhat),
     ViewGridlines,
+    /// Draw > Draw Table (and Insert > Table > Draw Table): the pen (#763).
+    DrawTable,
+    /// Draw > Eraser: erasing a line merges the cells on either side (#763).
+    Eraser,
     InsertAbove,
     InsertBelow,
     InsertLeft,
@@ -275,6 +280,25 @@ pub(crate) fn table_layout_tab() -> rs::Tab<Act> {
                         )
                         .key("TG"),
                     ]),
+                ],
+            ),
+            rs::group(
+                "Draw",
+                20,
+                vec![
+                    Control::Large(
+                        cmdt(
+                            "draw-table",
+                            "table-draw",
+                            "Draw Table",
+                            t(T::DrawTable),
+                            "",
+                        )
+                        .key("N"),
+                    ),
+                    Control::Large(
+                        cmdt("eraser", "table-eraser", "Eraser", t(T::Eraser), "").key("E"),
+                    ),
                 ],
             ),
             rs::group(
@@ -578,7 +602,13 @@ pub(crate) fn insert_table_menu(has_selection: bool) -> Vec<menu::MenuItem> {
             t(TableAct::InsertTable),
             true,
         )),
-        MenuItem::Item(Entry::unavailable("draw-table", "Draw Table")),
+        MenuItem::Item(Entry::new(
+            "draw-table",
+            "Draw Table",
+            "table-draw",
+            t(TableAct::DrawTable),
+            true,
+        )),
         MenuItem::Item(Entry::new(
             "convert-text-to-table",
             "Convert Text to Table...",
@@ -608,18 +638,27 @@ pub(crate) fn table_enabled(ed: Option<&Editor>, act: TableAct) -> bool {
     };
     match act {
         T::Unavailable => false,
-        T::InsertTable => true,
+        T::InsertTable | T::DrawTable => true,
         T::TextToTable => ed.has_selection() && ed.cell_range().is_none(),
         T::MergeCells => ed.cell_range().is_some(),
         _ => ed.in_table(),
     }
 }
 
-/// Whether a table command shows checked.
-pub(crate) fn table_checked(ed: Option<&Editor>, gridlines: bool, act: TableAct) -> bool {
+/// Whether a table command shows checked. `draw` is the pen on in the
+/// active tab, if any.
+pub(crate) fn table_checked(
+    ed: Option<&Editor>,
+    gridlines: bool,
+    draw: Option<Tool>,
+    act: TableAct,
+) -> bool {
     use TableAct as T;
-    if act == T::ViewGridlines {
-        return gridlines;
+    match act {
+        T::ViewGridlines => return gridlines,
+        T::DrawTable => return draw == Some(Tool::Pen),
+        T::Eraser => return draw == Some(Tool::Eraser),
+        _ => {}
     }
     let Some(ed) = ed.filter(|e| e.in_table()) else {
         return false;
@@ -682,6 +721,8 @@ pub(crate) fn table_apply(ed: &mut Editor, act: TableAct) -> Result<String, Stri
         }
         T::Borders(b) => ed.apply_borders(b).and(Ok(b.label().to_string())),
         T::ViewGridlines
+        | T::DrawTable
+        | T::Eraser
         | T::DeleteCells
         | T::SplitCells
         | T::Sort
@@ -727,6 +768,8 @@ impl Docxy {
                 return self.refocus(window, cx);
             }
             T::Unavailable => return self.refocus(window, cx),
+            T::DrawTable => return self.draw_toggle(Tool::Pen, window, cx),
+            T::Eraser => return self.draw_toggle(Tool::Eraser, window, cx),
             T::DeleteCells => Some(crate::table_dialogs::delete_cells_dialog as DialogBuilder),
             T::SplitCells => Some(crate::table_dialogs::split_cells_dialog as DialogBuilder),
             T::Sort => Some(crate::table_dialogs::sort_dialog as DialogBuilder),
@@ -831,6 +874,253 @@ impl Docxy {
             Err("the Insert > Table menu is not open".into())
         }
     }
+}
+
+impl Docxy {
+    /// The table pen on in the active tab (#763), if any.
+    pub(crate) fn draw_tool(&self) -> Option<Tool> {
+        self.table_draw
+            .filter(|m| m.tab == self.active)
+            .map(|m| m.tool)
+    }
+
+    /// A click on Draw Table or Eraser: that pen on, or off when it was on.
+    /// A pen replaces the highlighter (#623).
+    fn draw_toggle(&mut self, tool: Tool, window: &mut Window, cx: &mut Context<Self>) {
+        let mode = self.table_draw.take();
+        self.cancel_pointer_modes();
+        self.table_draw = mode;
+        self.draw_drag = None;
+        let on = DrawMode::click(&mut self.table_draw, tool, self.active);
+        self.set_status(if on { tool.status() } else { DRAW_OFF });
+        self.refocus(window, cx);
+    }
+
+    /// End the table pens, whatever ended them, and take their status text
+    /// off the tab they were on. True when a pen was on for the active tab.
+    pub(crate) fn cancel_draw_mode(&mut self) -> bool {
+        self.draw_drag = None;
+        let Some(m) = self.table_draw.take() else {
+            return false;
+        };
+        if let Some(t) = self.tabs.get_mut(m.tab) {
+            if t.status == PEN_STATUS || t.status == ERASER_STATUS {
+                t.status = DRAW_OFF.into();
+            }
+        }
+        m.tab == self.active
+    }
+
+    /// Whether a window point is on the document's pages as the frame on
+    /// screen laid them out: Print Layout's sheets, or Draft's whole view.
+    fn on_page(&self, (x, y): (f32, f32)) -> bool {
+        self.page_rects().iter().any(|r| r.contains(x, y))
+    }
+
+    /// The pages' rects on screen (clipped to the view): Print Layout's
+    /// sheets, or Draft's view, which is all page.
+    pub(crate) fn page_rects(&self) -> Vec<ScreenRect> {
+        let probe = self.ruler_probe.borrow();
+        let Some(view) = probe.viewport else {
+            return Vec::new();
+        };
+        if probe.draft {
+            return vec![view];
+        }
+        probe
+            .pages
+            .iter()
+            .flatten()
+            .filter(|r| r.intersects(&view))
+            .map(|r| {
+                let (x, y) = (r.x.max(view.x), r.y.max(view.y));
+                ScreenRect {
+                    x,
+                    y,
+                    w: (r.x + r.w).min(view.x + view.w) - x,
+                    h: (r.y + r.h).min(view.y + view.h) - y,
+                }
+            })
+            .collect()
+    }
+
+    /// A left press with a pen on: true when it lands on the page and starts
+    /// a gesture, which the press then belongs to alone. Under a dialog or a
+    /// menu, or off the page, the press is left to the rest of the window.
+    pub(crate) fn draw_press(&mut self, at: (f32, f32)) -> bool {
+        let covered = self.menu.is_some()
+            || self
+                .tabs
+                .get(self.active)
+                .is_none_or(|t| t.dialogs.is_open());
+        if self.draw_tool().is_none() || covered || !self.on_page(at) {
+            return false;
+        }
+        self.mini_bar = None;
+        self.draw_drag = Some(Drag {
+            from: at,
+            to: at,
+            hf: self.hf_active(),
+        });
+        true
+    }
+
+    /// The pointer moved during a pen gesture: the preview follows it.
+    pub(crate) fn draw_move(&mut self, at: (f32, f32)) -> bool {
+        let Some(d) = self.draw_drag.as_mut() else {
+            return false;
+        };
+        d.to = at;
+        true
+    }
+
+    /// The release that ends a pen gesture: read it and run it.
+    pub(crate) fn draw_release(
+        &mut self,
+        at: (f32, f32),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(mut d) = self.draw_drag.take() else {
+            return false;
+        };
+        d.to = at;
+        let _ = self.draw_gesture(d, window, cx);
+        true
+    }
+
+    /// Read the gesture `d` on the frame on screen and run it: the edit on
+    /// the edited story, its status text or its refusal on the status line.
+    /// The mode stays on, as in Word, until Esc.
+    pub(crate) fn draw_gesture(
+        &mut self,
+        d: Drag,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<String, String> {
+        let tool = self.draw_tool().ok_or("no table pen is on")?;
+        let (gesture, para) = {
+            let geom = self.draw_geom.borrow();
+            let frame = geom.on_screen();
+            let g = table_draw::classify(frame, d.hf, tool, d.from, d.to, self.zoom);
+            (g, frame.para_for(d.hf, d.from))
+        };
+        if matches!(gesture, Gesture::Nothing) {
+            cx.notify();
+            return Ok(String::new());
+        }
+        if self.protected_refused(cx) {
+            self.cancel_draw_mode();
+            let why = self.tabs.get(self.active).map(|t| t.status.to_string());
+            self.refocus(window, cx);
+            return Err(why.unwrap_or_default());
+        }
+        let result = match self.edit_target() {
+            Some(ed) => draw_on(ed, gesture, para),
+            None => Err("no document is open".into()),
+        };
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            match &result {
+                Ok(status) => {
+                    tab.set_dirty();
+                    tab.status = status.clone().into();
+                }
+                Err(e) => tab.status = e.clone().into(),
+            }
+        }
+        self.refocus(window, cx);
+        result
+    }
+}
+
+impl Docxy {
+    /// With a table pen on (#763): a crosshair over the pages, and while a
+    /// gesture is drawn, its dashed preview: the rectangle of a new table, or
+    /// the line along the drag's main axis inside a table.
+    pub(crate) fn draw_overlay(&self) -> Option<AnyElement> {
+        let tool = self.draw_tool()?;
+        let pages: Vec<Bounds<Pixels>> = self
+            .page_rects()
+            .iter()
+            .map(|r| Bounds::new(point(px(r.x), px(r.y)), size(px(r.w), px(r.h))))
+            .collect();
+        let preview = self.draw_drag.filter(|_| tool == Tool::Pen).map(|d| {
+            let in_table = self
+                .draw_geom
+                .borrow()
+                .on_screen()
+                .tables
+                .iter()
+                .any(|t| t.hf == d.hf && t.holds(d.from, 0.0));
+            table_draw::preview(d, in_table)
+        });
+        let ink = hsla_u(BRAND);
+        Some(
+            canvas(
+                move |_, window, _| {
+                    pages
+                        .iter()
+                        .map(|b| window.insert_hitbox(*b, HitboxBehavior::Normal))
+                        .collect::<Vec<_>>()
+                },
+                move |_, hitboxes, window, _| {
+                    for h in &hitboxes {
+                        window.set_cursor_style(CursorStyle::Crosshair, h);
+                    }
+                    let Some(((x0, y0), (x1, y1))) = preview else {
+                        return;
+                    };
+                    let b = Bounds::new(
+                        point(px(x0.min(x1)), px(y0.min(y1))),
+                        size(px((x1 - x0).abs().max(1.0)), px((y1 - y0).abs().max(1.0))),
+                    );
+                    window.paint_quad(gpui::outline(b, ink, gpui::BorderStyle::Dashed));
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .into_any_element(),
+        )
+    }
+}
+
+/// The status line after a pen is put away.
+const DRAW_OFF: &str = "Drawing off";
+
+/// Run a pen gesture on `ed`, one undo step; a new table goes after the
+/// top-level paragraph `para` (the one the rectangle was drawn from), so a
+/// drawn table never splits a paragraph.
+fn draw_on(ed: &mut Editor, gesture: Gesture, para: Option<usize>) -> Result<String, String> {
+    let mut result = Ok(String::new());
+    match gesture {
+        Gesture::Nothing => {}
+        Gesture::Refused(why) => result = Err(why.to_string()),
+        Gesture::NewTable { w_tw, h_tw } => {
+            if let Some((b, Block::Paragraph(p))) =
+                para.and_then(|b| Some((b, ed.doc.body.get(b)?)))
+            {
+                let end = docxcore::editor::para_text_len(p);
+                ed.anchor = None;
+                ed.caret = Caret::at(vec![b], end);
+            }
+            ed.one_step("Draw Table", |e| {
+                result = e.draw_table(w_tw, h_tw).map(|()| "Table drawn".into());
+            });
+        }
+        Gesture::Line { table, line } => ed.one_step("Draw Table", |e| {
+            result = e
+                .draw_table_line(&table, line)
+                .map(|()| "Line drawn".into());
+        }),
+        Gesture::Erase { table, edge } => ed.one_step("Eraser", |e| {
+            result = e
+                .erase_table_line(&table, edge)
+                .map(|()| "Line erased".into());
+        }),
+    }
+    result
 }
 
 impl Docxy {
@@ -1051,6 +1341,7 @@ mod tests {
             groups,
             [
                 "Table",
+                "Draw",
                 "Rows & Columns",
                 "Merge",
                 "Cell Size",
@@ -1065,6 +1356,8 @@ mod tests {
             "select-row",
             "select-table",
             "gridlines",
+            "draw-table",
+            "eraser",
             "delete-cells",
             "insert-above",
             "insert-right",
@@ -1142,44 +1435,80 @@ mod tests {
         let mut ed = ed_in_table();
         let s = table_apply(&mut ed, TableAct::Style(7)).unwrap();
         assert_eq!(s, "Table style: Grid Table 4 Accent 1");
-        assert!(table_checked(Some(&ed), true, TableAct::Style(7)));
-        assert!(!table_checked(Some(&ed), true, TableAct::Style(0)));
+        assert!(table_checked(Some(&ed), true, None, TableAct::Style(7)));
+        assert!(!table_checked(Some(&ed), true, None, TableAct::Style(0)));
         assert!(table_checked(
             Some(&ed),
             true,
+            None,
             TableAct::Look(LookFlag::HeaderRow)
         ));
         table_apply(&mut ed, TableAct::Look(LookFlag::HeaderRow)).unwrap();
         assert!(!table_checked(
             Some(&ed),
             true,
+            None,
             TableAct::Look(LookFlag::HeaderRow)
         ));
         table_apply(&mut ed, TableAct::Align(VAlign::Bottom, Align::Right)).unwrap();
         assert!(table_checked(
             Some(&ed),
             true,
+            None,
             TableAct::Align(VAlign::Bottom, Align::Right)
         ));
         table_apply(&mut ed, TableAct::Shading(Some(0xFF0000))).unwrap();
         assert!(table_checked(
             Some(&ed),
             true,
+            None,
             TableAct::Shading(Some(0xFF0000))
         ));
         assert!(table_checked(
             Some(&ed),
             false,
+            None,
             TableAct::Borders(BorderCmd::All)
         ));
         table_apply(&mut ed, TableAct::Borders(BorderCmd::All)).unwrap();
         assert!(!table_checked(
             Some(&ed),
             false,
+            None,
             TableAct::Borders(BorderCmd::All)
         ));
-        assert!(table_checked(Some(&ed), true, TableAct::ViewGridlines));
-        assert!(!table_checked(Some(&ed), false, TableAct::ViewGridlines));
+        assert!(table_checked(
+            Some(&ed),
+            true,
+            None,
+            TableAct::ViewGridlines
+        ));
+        assert!(!table_checked(
+            Some(&ed),
+            false,
+            None,
+            TableAct::ViewGridlines
+        ));
+        // The pens show checked while their mode is on, in a table or not.
+        assert!(table_checked(
+            None,
+            false,
+            Some(Tool::Pen),
+            TableAct::DrawTable
+        ));
+        assert!(!table_checked(
+            None,
+            false,
+            Some(Tool::Pen),
+            TableAct::Eraser
+        ));
+        assert!(table_checked(
+            None,
+            false,
+            Some(Tool::Eraser),
+            TableAct::Eraser
+        ));
+        assert!(!table_checked(Some(&ed), false, None, TableAct::DrawTable));
         table_apply(&mut ed, TableAct::InsertBelow).unwrap();
         assert_eq!(ed.table(&[0]).unwrap().rows.len(), 3);
         assert!(table_apply(&mut ed, TableAct::MergeCells).is_err());
@@ -1203,7 +1532,7 @@ mod tests {
             labels,
             [
                 ("Insert Table...".to_string(), true),
-                ("Draw Table".to_string(), false),
+                ("Draw Table".to_string(), true),
                 ("Convert Text to Table...".to_string(), false),
                 ("Excel Spreadsheet".to_string(), false),
                 ("Quick Tables".to_string(), false),

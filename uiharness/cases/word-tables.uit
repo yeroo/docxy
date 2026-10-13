@@ -48,7 +48,7 @@ test insert table grid reads columns by rows and inserts that table (646)
   assert reply.items.0.table_grid.rows is 8
   assert reply.items.2.label is Insert Table...
   assert reply.items.3.label is Draw Table
-  assert reply.items.3.enabled is false
+  assert reply.items.3.enabled is true
   assert reply.items.4.label is Convert Text to Table...
   assert reply.items.4.enabled is false
   call table-grid {"cols":4,"rows":3}

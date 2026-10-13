@@ -129,6 +129,7 @@ mod sheet_undo_sel_tests;
 mod sheet_validation;
 mod style_gallery;
 mod table_dialogs;
+mod table_draw;
 mod table_tab;
 mod table_view;
 mod tabstrip;
@@ -5040,6 +5041,11 @@ struct Docxy {
     placeholder_click: bool,
     /// Word's highlighting mode (#623): a drag highlights what it crosses.
     hl_mode: Option<hl_mode::HlMode>,
+    /// The table pen or eraser (#763), and the drag it is drawing.
+    table_draw: Option<table_draw::DrawMode>,
+    draw_drag: Option<table_draw::Drag>,
+    /// The tables and paragraphs the frame on screen laid out, for the pens.
+    draw_geom: std::rc::Rc<std::cell::RefCell<table_draw::DrawGeom>>,
     /// The last highlight colour chosen; the mode starts with it.
     hl_last: String,
     // A spreadsheet drag-select is in progress (left button held over cells).
@@ -7008,6 +7014,9 @@ struct TableCtx<'a> {
         std::collections::HashMap<String, Option<docxcore::table_styles::TableStyle>>,
     >,
     gridlines: bool,
+    /// While a table pen is on (#763): where the tables and top-level
+    /// paragraphs this frame lays out are recorded.
+    draw: Option<std::rc::Rc<std::cell::RefCell<table_draw::DrawGeom>>>,
 }
 
 impl<'a> TableCtx<'a> {
@@ -7018,6 +7027,7 @@ impl<'a> TableCtx<'a> {
                 .and_then(|b| std::str::from_utf8(b).ok()),
             cache: Default::default(),
             gridlines,
+            draw: None,
         }
     }
 
@@ -12410,6 +12420,9 @@ impl Docxy {
             selecting: false,
             placeholder_click: false,
             hl_mode: None,
+            table_draw: None,
+            draw_drag: None,
+            draw_geom: Default::default(),
             hl_last: hl_mode::DEFAULT_COLOUR.to_string(),
             sheet_dragging: false,
             sheet_fill: None,
@@ -13376,7 +13389,7 @@ impl Docxy {
             tabs.push(blank_docx_tab(&title));
         } else {
             let previous_active = self.active;
-            self.cancel_highlight_mode();
+            self.cancel_pointer_modes();
             let moved = crate::close::remove_tab(&mut self.tabs, &mut self.active, i);
             // The grid clipboard's clip names the workbook it came from: if
             // that workbook is the tab leaving, the clip's source is gone
@@ -13877,7 +13890,7 @@ impl Docxy {
     /// goes through here.
     fn drop_grid_state(&mut self) {
         // The highlighting mode belongs to the tab it started on (#623).
-        self.cancel_highlight_mode();
+        self.cancel_pointer_modes();
         self.chart_drop_selection();
         self.bar_close();
         // The bars that act on Enter point into the grid too: a rename names
@@ -19958,7 +19971,7 @@ impl Docxy {
         // A menu belongs to the tab it opened on, and so does the highlighting
         // mode (#623).
         self.close_menu();
-        self.cancel_highlight_mode();
+        self.cancel_pointer_modes();
         if i < self.tabs.len() {
             self.active = i;
             // A converted tab restored from the session converts as it comes
@@ -20802,7 +20815,7 @@ impl Docxy {
         let Some(i) = open else {
             let tab = tab_from_path_mode(&path, mode, &trusted)?;
             let opened = records_open(&tab).filter(|_| recent);
-            self.cancel_highlight_mode();
+            self.cancel_pointer_modes();
             self.tabs.push(tab);
             self.active = self.tabs.len() - 1;
             if let Some(p) = opened {
@@ -20810,7 +20823,7 @@ impl Docxy {
             }
             return Ok(true);
         };
-        self.cancel_highlight_mode();
+        self.cancel_pointer_modes();
         self.active = i;
         let tab = &self.tabs[i];
         let loaded = match reopen_step(reopen, tab.dirty, tab.access, mode) {
@@ -21123,7 +21136,7 @@ impl Docxy {
     /// clipboard holds (formatting intact), else the clipboard's RTF, else
     /// its text ([`doc_paste_clip`]).
     fn do_paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.cancel_highlight_mode();
+        self.cancel_pointer_modes();
         if self.protected_refused(cx) {
             return self.refocus(window, cx);
         }
@@ -21287,6 +21300,8 @@ impl Docxy {
     /// the highlighting mode, a quick second click latches it, a later one
     /// ends it; with a selection it opens the swatch picker as before.
     fn highlight_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The highlighter replaces a table pen (#763).
+        self.cancel_draw_mode();
         let has_sel = self.doc_has_selection();
         let was_on = self.hl_mode.is_some();
         let tab = self.active;
@@ -21313,24 +21328,26 @@ impl Docxy {
         }
     }
 
-    /// End the highlighting mode, whatever ended it, and take its status
-    /// text off the tab it started on. True when it was on for the active tab.
-    fn cancel_highlight_mode(&mut self) -> bool {
+    /// End the pointer modes, the highlighting mode (#623) and the table
+    /// pens (#763), whatever ended them, and take their status text off the
+    /// tab each started on. True when one was on for the active tab.
+    fn cancel_pointer_modes(&mut self) -> bool {
+        let draw = self.cancel_draw_mode();
         let Some(m) = self.hl_mode.take() else {
-            return false;
+            return draw;
         };
         if let Some(t) = self.tabs.get_mut(m.tab) {
             if t.status == HL_MODE_STATUS {
                 t.status = "Highlighting off".into();
             }
         }
-        m.tab == self.active
+        m.tab == self.active || draw
     }
 
     /// A drag-selection came up: in highlighting mode, paint what it crossed.
     fn highlight_drag_end(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.hl_mode.as_ref().is_some_and(|m| m.tab != self.active) {
-            self.cancel_highlight_mode();
+            self.cancel_pointer_modes();
         }
         let selected = self.doc_has_selection();
         if let Some(colour) = hl_mode::HlMode::drag_end(&mut self.hl_mode, selected) {
@@ -23053,7 +23070,7 @@ impl Docxy {
             return;
         }
         self.mini_bar = None;
-        self.cancel_highlight_mode();
+        self.cancel_pointer_modes();
         // On a sheet, Tab commits the edit and advances one cell to the right.
         if self.active_is_sheet() {
             // A Chart-panel range field swallows Tab the same way it swallows
@@ -23165,7 +23182,7 @@ impl Docxy {
             return;
         }
         self.mini_bar = None;
-        self.cancel_highlight_mode();
+        self.cancel_pointer_modes();
         // On a sheet, Shift+Tab commits and moves one cell to the left.
         if self.active_is_sheet() {
             // Same as Tab above: the field has the keyboard first, then
@@ -23214,12 +23231,12 @@ impl Docxy {
             cx.notify();
             return;
         }
-        // The highlighting mode (#623) ends on Esc, which it consumes, and on
-        // any other key but a bare modifier. KeyTips, the find bar and the
-        // comment bar take their keys (Esc included) first; the KeyTips' Alt
-        // leaves the mode be.
+        // The highlighting mode (#623) and the table pens (#763) end on Esc,
+        // which they consume, and on any other key but a bare modifier.
+        // KeyTips, the find bar and the comment bar take their keys (Esc
+        // included) first; the KeyTips' Alt leaves the modes be.
         let hl_key = ev.keystroke.key.as_str();
-        if self.hl_mode.is_some()
+        if (self.hl_mode.is_some() || self.table_draw.is_some())
             && self.keytips == KeyTip::Off
             && !self.find_open
             && !self.comment_open
@@ -23229,8 +23246,8 @@ impl Docxy {
             )
         {
             if hl_key != "escape" {
-                self.cancel_highlight_mode();
-            } else if self.cancel_highlight_mode() {
+                self.cancel_pointer_modes();
+            } else if self.cancel_pointer_modes() {
                 cx.notify();
                 return;
             }
@@ -23286,7 +23303,7 @@ impl Docxy {
             // The highlighting-mode check above skipped this key because the
             // KeyTips were up; the find and comment bars still take their keys.
             if !self.find_open && !self.comment_open {
-                self.cancel_highlight_mode();
+                self.cancel_pointer_modes();
             }
         }
         // KeyTips (Alt / F10 access keys): toggle the overlay; while it's showing,
@@ -28827,6 +28844,7 @@ fn hf_els(blocks: &[Block], pal: Pal, meas: &Measurer, hf_width: f32) -> Vec<Any
                 false,
                 // Header/footer text is never line-numbered (#746).
                 None,
+                None,
             )),
             _ => None,
         })
@@ -29120,6 +29138,7 @@ fn paragraph_el(
     hf_width: Option<f32>,
     merge_hl: bool,
     lines: Option<LineSlot>,
+    overlay: Option<AnyElement>,
 ) -> AnyElement {
     use docxcore::model::TabAlign;
     let base = zoom
@@ -29532,6 +29551,7 @@ fn paragraph_el(
                 .child(line_number_canvas(slot, base, line_h, pad, zoom, pal)),
             None => row.children(spans),
         })
+        .when_some(overlay, |d, o| d.relative().child(o))
         .into_any_element()
 }
 
@@ -29558,6 +29578,37 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
         .attr("w:tblStyle", "w:val")
         .and_then(|id| ctx.tbl.style(&id));
     let boxes = table_view::layout(t, style.as_ref());
+    // A table pen is on (#763): record where this table and its rows lie.
+    let hf = ctx.hf_width.is_some();
+    let drawing = ctx.tbl.draw.clone();
+    if let Some(geom) = &drawing {
+        let mut grid = vec![0];
+        for w in docxcore::table::usable_grid(t) {
+            grid.push(grid.last().copied().unwrap_or(0) + w);
+        }
+        geom.borrow_mut().table(table_draw::TableGeom {
+            hf,
+            path: path.to_vec(),
+            left: 0.0,
+            grid,
+            rows: boxes
+                .iter()
+                .map(|rb| table_draw::RowGeom {
+                    top: 0.0,
+                    bottom: 0.0,
+                    cells: rb
+                        .cells
+                        .iter()
+                        .map(|cb| (cb.start, cb.span, cb.continues))
+                        .collect(),
+                })
+                .collect(),
+            zoom: ctx.zoom,
+        });
+    }
+    // The selection strips stop their press: with a pen on, the press is
+    // the pen's.
+    let selects = ctx.active && drawing.is_none();
     let selected: Vec<(usize, usize)> = ctx
         .cell_range
         .filter(|r| r.table.as_slice() == path)
@@ -29686,7 +29737,7 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
                 .when(is_selected, |d| {
                     d.child(div().absolute().size_full().top_0().left_0().bg(sel_bg))
                 });
-            if ctx.active {
+            if selects {
                 // The cell's left edge selects the cell.
                 el = el.child(
                     div()
@@ -29719,8 +29770,30 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
             .flex()
             .flex_row()
             .items_stretch()
+            .map(|d| match rb.height {
+                Some((h, true)) => d.h(w(h)).overflow_hidden(),
+                Some((h, false)) => d.min_h(w(h)),
+                None => d,
+            })
             .children(cells);
-        if ctx.active {
+        if let Some(geom) = drawing.clone() {
+            let path = path.to_vec();
+            row_el = row_el.child(
+                canvas(
+                    move |b, _, _| {
+                        let (x, y): (f32, f32) = (b.origin.x.into(), b.origin.y.into());
+                        let h: f32 = b.size.height.into();
+                        geom.borrow_mut().row(hf, &path, ri, x, y, y + h);
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            );
+        }
+        if selects {
             // The selection bar left of the row selects the row.
             row_el = row_el.child(
                 div()
@@ -29769,6 +29842,35 @@ fn block_el_numbered(
                 ent: ctx.ent,
                 path: &path,
             });
+            // A table pen is on (#763): record where a top-level paragraph
+            // lies, so a table drawn from it goes after it.
+            let overlay = match (&ctx.tbl.draw, path.as_slice()) {
+                (Some(geom), &[block]) => {
+                    let geom = geom.clone();
+                    let hf = ctx.hf_width.is_some();
+                    Some(
+                        canvas(
+                            move |b, _, _| {
+                                geom.borrow_mut().para(table_draw::ParaGeom {
+                                    hf,
+                                    block,
+                                    x: b.origin.x.into(),
+                                    y: b.origin.y.into(),
+                                    w: b.size.width.into(),
+                                    h: b.size.height.into(),
+                                });
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .into_any_element(),
+                    )
+                }
+                _ => None,
+            };
             paragraph_el(
                 p,
                 caret,
@@ -29782,6 +29884,7 @@ fn block_el_numbered(
                 ctx.hf_width,
                 ctx.merge_hl,
                 lines,
+                overlay,
             )
         }
         Block::Table(t) => table_el(t, &path, ctx),
@@ -30847,12 +30950,14 @@ impl Docxy {
         if refused {
             return self.refocus(window, cx);
         }
-        // Every command ends the highlighting mode (#623) except the Text
-        // highlight button, which handles its own click, and the view-only
-        // toggles listed here; a new command ends it unless listed.
+        // Every command ends the highlighting mode (#623) and the table pens
+        // (#763) except the Text highlight button and the pens' buttons,
+        // which handle their own clicks, and the view-only toggles listed
+        // here; a new command ends them unless listed.
         if !matches!(
             act,
             Act::Highlight
+                | Act::Table(table_tab::TableAct::DrawTable | table_tab::TableAct::Eraser)
                 | Act::ShowHide
                 | Act::ToggleNav
                 | Act::NewWindow
@@ -30866,7 +30971,7 @@ impl Docxy {
                 | Act::PrintLayout
                 | Act::Help(_)
         ) {
-            self.cancel_highlight_mode();
+            self.cancel_pointer_modes();
         }
         // A document edit is its own undo step, named for the Undo drop-down
         // (#619) and kept for Repeat (#618) when it can be repeated.
@@ -33124,9 +33229,12 @@ impl Docxy {
                 .tabs
                 .get(self.active)
                 .is_some_and(|t| mailings_tab::mail_checked(&t.mail, act)),
-            Table(act) => {
-                table_tab::table_checked(self.edit_target_ref(), self.view_gridlines, act)
-            }
+            Table(act) => table_tab::table_checked(
+                self.edit_target_ref(),
+                self.view_gridlines,
+                self.draw_tool(),
+                act,
+            ),
             _ => false,
         }
     }
@@ -34117,7 +34225,7 @@ impl Docxy {
         }
         self.flush_project_passes(cx);
         self.close_menu();
-        self.cancel_highlight_mode();
+        self.cancel_pointer_modes();
         self.tab_more_open = false;
         if tabstrip::move_index(&mut self.tabs, &mut self.active, from, to) {
             // The Info page's result is keyed by tab index (#627).
@@ -34249,6 +34357,7 @@ impl Render for Docxy {
         if let Some(t) = self.tabs.get_mut(self.active) {
             finish_pending_conversion(t);
         }
+        self.draw_geom.borrow_mut().rotate();
         {
             let mut p = self.probes.borrow_mut();
             p.last = std::mem::take(&mut p.next);
@@ -34775,7 +34884,10 @@ impl Render for Docxy {
                     // While a header/footer is being edited the body is inactive
                     // (no caret, clicks inert) so it visually recedes.
                     let hf = tab.hf_edit.as_ref();
-                    let tbl = TableCtx::new(tab.pkg.as_ref(), self.view_gridlines);
+                    let mut tbl = TableCtx::new(tab.pkg.as_ref(), self.view_gridlines);
+                    if self.draw_tool().is_some() {
+                        tbl.draw = Some(self.draw_geom.clone());
+                    }
                     let body_range = editor.cell_range();
                     let ctx = RenderCtx {
                         caret_path: &editor.caret.path,
@@ -35553,9 +35665,52 @@ impl Render for Docxy {
         // the release that ends it must reach it wherever it lives.
         let released = cx.entity();
         let pressed = cx.entity();
+        let pen = cx.entity();
         let gesture_listeners = canvas(
             |_b, _w, _a| {},
             move |_b, _s, window: &mut Window, _cx: &mut App| {
+                // A table pen (#763) takes a press on the page before anything
+                // under it does (no selection, no cell or row strip), and the
+                // moves and the release of the gesture it starts.
+                let (down, moved, up) = (pen.clone(), pen.clone(), pen.clone());
+                let at = |p: Point<Pixels>| -> (f32, f32) { (p.x.into(), p.y.into()) };
+                window.on_mouse_event(move |ev: &MouseDownEvent, phase, _window, cx| {
+                    if phase == DispatchPhase::Capture
+                        && ev.button == MouseButton::Left
+                        && down.update(cx, |this, cx| {
+                            let took = this.draw_press(at(ev.position));
+                            if took {
+                                cx.notify();
+                            }
+                            took
+                        })
+                    {
+                        cx.stop_propagation();
+                    }
+                });
+                window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _window, cx| {
+                    if phase == DispatchPhase::Capture
+                        && moved.update(cx, |this, cx| {
+                            let took = this.draw_move(at(ev.position));
+                            if took {
+                                cx.notify();
+                            }
+                            took
+                        })
+                    {
+                        cx.stop_propagation();
+                    }
+                });
+                window.on_mouse_event(move |ev: &MouseUpEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Capture
+                        && ev.button == MouseButton::Left
+                        && up.update(cx, |this, cx| {
+                            this.draw_release(at(ev.position), window, cx)
+                        })
+                    {
+                        cx.stop_propagation();
+                    }
+                });
                 window.on_mouse_event(move |ev: &MouseUpEvent, phase, _window, cx| {
                     if phase == DispatchPhase::Capture && ev.button == MouseButton::Left {
                         released.update(cx, |this, _cx| {
@@ -35666,6 +35821,7 @@ impl Render for Docxy {
             .when_some(context_menu, |d, m| d.child(m))
             .when_some(tab_popup, |d, popup| d.child(popup))
             .when_some(dialog, |d, dialog| d.child(dialog))
+            .when_some(self.draw_overlay(), |d, o| d.child(o))
             // A vertical guide line down the page while a ruler marker is dragged.
             .when_some(self.ruler_guide, |d, gx| {
                 d.child(

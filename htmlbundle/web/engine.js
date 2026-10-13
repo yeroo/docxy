@@ -530,6 +530,8 @@
     'Table(DeleteTable)': NOT_YET,
     'Table(DistributeColumns)': NOT_YET,
     'Table(DistributeRows)': NOT_YET,
+    'Table(DrawTable)': NOT_YET,
+    'Table(Eraser)': NOT_YET,
     'Table(InsertAbove)': NOT_YET,
     'Table(InsertBelow)': NOT_YET,
     'Table(InsertLeft)': NOT_YET,

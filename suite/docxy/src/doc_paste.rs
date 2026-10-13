@@ -97,7 +97,7 @@ impl Docxy {
     /// Keep Text Only: the clipboard's text, formatted as typing at the
     /// caret would be, as one undo step "Paste".
     pub(crate) fn do_paste_text_only(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.cancel_highlight_mode();
+        self.cancel_pointer_modes();
         if self.protected_refused(cx) {
             return self.refocus(window, cx);
         }

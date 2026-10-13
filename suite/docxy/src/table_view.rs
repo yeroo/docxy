@@ -63,6 +63,21 @@ pub struct CellBox {
 pub struct RowBox {
     pub before: u32,
     pub cells: Vec<CellBox>,
+    /// `w:trHeight` in twips, and whether it is exact (else at least): a
+    /// drawn table's row keeps the height drawn (#763).
+    pub height: Option<(u32, bool)>,
+}
+
+/// A row's `w:trHeight`: twips, and whether its rule is exact. An auto rule
+/// or a zero height sets none.
+fn row_height(row: &docxcore::model::Row) -> Option<(u32, bool)> {
+    let p = docxcore::table_props::row_trpr(&row.raw_props);
+    let h: u32 = p.attr("w:trHeight", "w:val")?.parse().ok()?;
+    match p.attr("w:trHeight", "w:hRule").as_deref() {
+        Some("auto") => None,
+        _ if h == 0 => None,
+        rule => Some((h, rule == Some("exact"))),
+    }
 }
 
 /// Lay out `t` with its table style (if any).
@@ -78,6 +93,7 @@ pub fn layout(t: &Table, style: Option<&TableStyle>) -> Vec<RowBox> {
         .enumerate()
         .map(|(r, rm)| RowBox {
             before: span_w(0, rm.before),
+            height: row_height(&t.rows[r]),
             cells: rm
                 .cells
                 .iter()
@@ -142,6 +158,33 @@ mod tests {
         );
         assert_eq!(rows[1].before, 1000);
         assert_eq!(rows[1].cells[0].start, 1);
+    }
+
+    #[test]
+    fn a_rows_set_height_is_kept_with_its_rule() {
+        let mut t = new_table(4, 1, 9000, AutoFit::Default);
+        for (row, xml) in t.rows.iter_mut().zip([
+            "<w:trHeight w:val=\"1200\" w:hRule=\"atLeast\"/>",
+            "<w:trHeight w:val=\"600\" w:hRule=\"exact\"/>",
+            "<w:trHeight w:val=\"600\" w:hRule=\"auto\"/>",
+            "<w:trHeight w:val=\"700\"/>",
+        ]) {
+            row.raw_props = vec![format!("<w:trPr>{xml}</w:trPr>")];
+        }
+        let heights: Vec<_> = layout(&t, None).iter().map(|r| r.height).collect();
+        assert_eq!(
+            heights,
+            [
+                Some((1200, false)),
+                Some((600, true)),
+                None,
+                Some((700, false))
+            ]
+        );
+        assert_eq!(
+            layout(&new_table(1, 1, 9000, AutoFit::Default), None)[0].height,
+            None
+        );
     }
 
     #[test]
