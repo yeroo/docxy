@@ -158,7 +158,14 @@ pub fn margin_number_sdt_xml(design: &MarginDesign, margin: i32, sdt_id: u32) ->
     };
     let side = if design.right { "right" } else { "left" };
     format!(
-        "<w:sdt><w:sdtPr><w:id w:val=\"{sdt_id}\"/><w:docPartObj>         <w:docPartGallery w:val=\"{MARGINS_GALLERY}\"/><w:docPartUnique/></w:docPartObj></w:sdtPr>         <w:sdtEndPr/><w:sdtContent><w:p><w:pPr><w:pStyle w:val=\"Header\"/>         <w:framePr w:w=\"{w}\" w:h=\"{h}\" w:hRule=\"exact\" w:wrap=\"around\"          w:vAnchor=\"page\" w:hAnchor=\"page\" w:xAlign=\"{side}\" w:yAlign=\"center\"/>         <w:jc w:val=\"center\"/></w:pPr>         <w:fldSimple w:instr=\" PAGE \"><w:r>{rpr}<w:t xml:space=\"preserve\">1</w:t></w:r></w:fldSimple>         </w:p></w:sdtContent></w:sdt>"
+        "<w:sdt><w:sdtPr><w:id w:val=\"{sdt_id}\"/><w:docPartObj>\
+         <w:docPartGallery w:val=\"{MARGINS_GALLERY}\"/><w:docPartUnique/></w:docPartObj></w:sdtPr>\
+         <w:sdtEndPr/><w:sdtContent><w:p><w:pPr><w:pStyle w:val=\"Header\"/>\
+         <w:framePr w:w=\"{w}\" w:h=\"{h}\" w:hRule=\"exact\" w:wrap=\"around\" \
+         w:vAnchor=\"page\" w:hAnchor=\"page\" w:xAlign=\"{side}\" w:yAlign=\"center\"/>\
+         <w:jc w:val=\"center\"/></w:pPr>\
+         <w:fldSimple w:instr=\" PAGE \"><w:r>{rpr}<w:t xml:space=\"preserve\">1</w:t></w:r></w:fldSimple>\
+         </w:p></w:sdtContent></w:sdt>"
     )
 }
 
@@ -530,6 +537,8 @@ mod tests {
             let xml = margin_number_sdt_xml(design, 1800, 9);
             assert!(xml.contains("w:val=\"Page Numbers (Margins)\""), "{xml}");
             assert!(xml.contains("<w:docPartUnique/>"));
+            // No source indentation saved into documents.
+            assert!(!xml.contains("  "), "{xml}");
             let b = blocks(&xml);
             assert_eq!(b.len(), 3, "{i}");
             assert!(is_page_number_open(&b[0]));
@@ -569,7 +578,10 @@ mod tests {
     /// trimmed): Remove Page Numbers takes it too.
     #[test]
     fn word_and_our_margin_numbers_are_removed() {
-        let word = "<w:sdt><w:sdtPr><w:id w:val=\"-90\"/><w:docPartObj>            <w:docPartGallery w:val=\"Page Numbers (Margins)\"/><w:docPartUnique/>            </w:docPartObj></w:sdtPr><w:sdtContent><w:p><w:pPr><w:pStyle w:val=\"Header\"/></w:pPr>            <w:r><w:t>shape</w:t></w:r></w:p></w:sdtContent></w:sdt>";
+        let word = "<w:sdt><w:sdtPr><w:id w:val=\"-90\"/><w:docPartObj>\
+            <w:docPartGallery w:val=\"Page Numbers (Margins)\"/><w:docPartUnique/>\
+            </w:docPartObj></w:sdtPr><w:sdtContent><w:p><w:pPr><w:pStyle w:val=\"Header\"/></w:pPr>\
+            <w:r><w:t>shape</w:t></w:r></w:p></w:sdtContent></w:sdt>";
         let ours = margin_number_sdt_xml(&PAGE_MARGIN_DESIGNS[1], 1440, 4);
         for sdt in [word.to_string(), ours] {
             let mut b = blocks(&format!("{HAND_TYPED}{sdt}"));

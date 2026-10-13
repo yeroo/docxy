@@ -118,6 +118,24 @@ test Page Margins draws one number in the side margin of every page showing the 
   assert reply.page_numbers is 0
   assert reply.text is Header A
   call ribbon-click {"tab":"Header & Footer","command":"Page Margins: Plain Number, Right"}
+  # A double-click on the editable number keeps the header open (it never
+  # reaches the body under it, which would close the header).
+  shot window
+  call frame-double-click {"index":0}
+  shot window
+  call hf-state {}
+  assert reply.editing is true
+  assert reply.kind is header
+  # With the footer open the header's number is read-only: a double-click
+  # opens the header, and the header stays open.
+  call ribbon-click {"tab":"Header & Footer","command":"Go to Footer"}
+  shot window
+  call frame-double-click {"index":0}
+  shot window
+  call hf-state {}
+  assert reply.editing is true
+  assert reply.kind is header
+  assert reply.section is 1
   call ribbon-click {"tab":"Header & Footer","command":"Remove Page Numbers"}
   call hf-state {}
   assert reply.page_numbers is 0

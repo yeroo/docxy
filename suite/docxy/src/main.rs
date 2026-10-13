@@ -6002,6 +6002,29 @@ impl Docxy {
     /// `area` (`header`/`footer`), `x`, `y`, `w`, `h`, the sheet's `page_w`,
     /// and `side`: `left` or `right` when the frame lies wholly in that side
     /// margin, else `text`.
+    /// The window point at the middle of the `index`th framed paragraph
+    /// the last Print Layout frame drew (`margin_frames`' order), if it lies
+    /// in the document's viewport.
+    pub(crate) fn margin_frame_point(&self, index: usize) -> Result<(f32, f32), String> {
+        let probe = self.ruler_probe.borrow();
+        let f = probe.frames.get(index).ok_or_else(|| {
+            format!(
+                "no framed paragraph {index} drawn ({} drawn): switch to Print Layout and shot first",
+                probe.frames.len()
+            )
+        })?;
+        let (x, y) = (f.rect.x + f.rect.w / 2.0, f.rect.y + f.rect.h / 2.0);
+        let seen = probe
+            .viewport
+            .is_some_and(|v| x >= v.x && x < v.x + v.w && y >= v.y && y < v.y + v.h);
+        if !seen {
+            return Err(format!(
+                "framed paragraph {index} is not on screen (its middle is at {x}, {y})"
+            ));
+        }
+        Ok((x, y))
+    }
+
     pub(crate) fn margin_frames(&self) -> ctlcore::json::Json {
         use ctlcore::json::Json;
         let probe = self.ruler_probe.borrow();
@@ -28897,7 +28920,7 @@ fn parse_hf_part(pkg: &Package, part_name: &str) -> Vec<Block> {
 
 /// Render header/footer blocks read-only (no caret, no click) for the page margins.
 /// A header or footer's band flow, read-only: its paragraphs, less the
-/// framed ones drawn at their frame (`hf_frame_els`).
+/// framed ones, which Print Layout draws at their frame.
 fn hf_els(blocks: &[Block], pal: Pal, meas: &Measurer, hf_width: f32) -> Vec<AnyElement> {
     docxcore::frame::split_framed(blocks)
         .0
@@ -35585,21 +35608,6 @@ impl Render for Docxy {
                                 // double-clicked open elsewhere like their area.
                                 let mut frame_els: Vec<AnyElement> = Vec::new();
                                 for is_h in [true, false] {
-                                    let band_top = if is_h {
-                                        page_dist(pi, true)
-                                    } else {
-                                        sb.h - page_dist(pi, false)
-                                    };
-                                    let geom = docxcore::frame::FrameGeom {
-                                        page_w: sb.w,
-                                        page_h: sb.h,
-                                        left: sb.left,
-                                        right: sb.right,
-                                        top: sb.top,
-                                        bottom: sb.bottom,
-                                        band_top,
-                                        even: (pi + 1).is_multiple_of(2),
-                                    };
                                     let edited = hf.filter(|h| {
                                         h.is_header == is_h
                                             && edit_page.is_some_and(|ep| {
@@ -35613,49 +35621,93 @@ impl Render for Docxy {
                                         Some(h) => h.editor.doc.body.as_slice(),
                                         None => page_blocks(pi, is_h),
                                     };
-                                    for (i, p) in docxcore::frame::split_framed(blocks).1 {
-                                        let Some(f) = p.props.frame.as_ref() else {
-                                            continue;
-                                        };
+                                    let (flow, groups) = docxcore::frame::split_framed(blocks);
+                                    if groups.is_empty() {
+                                        continue;
+                                    }
+                                    // A footer's flow ends at the footer distance;
+                                    // its top (what `vAnchor="text"` measures
+                                    // from) is the estimated flow height, at least
+                                    // a line, above it (the export measures it).
+                                    let band_top = if is_h {
+                                        page_dist(pi, true)
+                                    } else {
+                                        let flow_h = flow
+                                            .iter()
+                                            .map(|(_, b)| block_height_est(b, hf_w / zoom) * 15.0)
+                                            .sum::<f32>()
+                                            as i32;
+                                        sb.h - page_dist(pi, false) - flow_h.max(264)
+                                    };
+                                    let geom = docxcore::frame::FrameGeom {
+                                        page_w: sb.w,
+                                        page_h: sb.h,
+                                        left: sb.left,
+                                        right: sb.right,
+                                        top: sb.top,
+                                        bottom: sb.bottom,
+                                        band_top,
+                                        even: (pi + 1).is_multiple_of(2),
+                                    };
+                                    let margins = (
+                                        zoom * sb.left as f32 / 15.0,
+                                        zoom * sb.right as f32 / 15.0,
+                                    );
+                                    let area = if is_h {
+                                        PageArea::Header
+                                    } else {
+                                        PageArea::Footer
+                                    };
+                                    for g in &groups {
                                         let r = docxcore::frame::frame_rect(
-                                            f,
+                                            g.frame,
                                             &geom,
-                                            docxcore::frame::line_height(p),
+                                            g.content_w(),
+                                            g.content_h(),
                                         );
                                         let width = zoom * r.w.max(0) as f32 / 15.0;
-                                        let margins = (
-                                            zoom * sb.left as f32 / 15.0,
-                                            zoom * sb.right as f32 / 15.0,
-                                        );
-                                        let el = match hf_ctx.filter(|_| editable) {
-                                            Some(ctx) => block_el(
-                                                &blocks[i],
-                                                vec![i],
-                                                None,
-                                                RenderCtx {
-                                                    hf_width: Some(width),
-                                                    ..ctx
-                                                },
-                                            ),
-                                            None => hf_para_el(p, doc_pal, &measurer, width),
-                                        };
-                                        let area = if is_h {
-                                            PageArea::Header
-                                        } else {
-                                            PageArea::Footer
-                                        };
+                                        // One frame, its paragraphs stacked; editable
+                                        // ones keep their block paths.
+                                        let paras = g.paras.iter().map(|&(i, p)| {
+                                            match hf_ctx.filter(|_| editable) {
+                                                Some(ctx) => block_el(
+                                                    &blocks[i],
+                                                    vec![i],
+                                                    None,
+                                                    RenderCtx {
+                                                        hf_width: Some(width),
+                                                        ..ctx
+                                                    },
+                                                ),
+                                                None => hf_para_el(p, doc_pal, &measurer, width),
+                                            }
+                                        });
+                                        let exact = g.frame.h_rule.as_deref() == Some("exact");
+                                        let open = dbl(area);
                                         frame_els.push(
-                                            div()
+                                            v_flex()
                                                 .absolute()
                                                 .left(px(zoom * r.x as f32 / 15.0))
                                                 .top(px(zoom * r.y as f32 / 15.0))
                                                 .w(px(width))
-                                                .h(tw(r.h))
+                                                .when(exact, |d| d.h(tw(r.h)))
+                                                .when(!exact, |d| d.min_h(tw(r.h)))
                                                 .text_color(doc_pal.fg)
-                                                .when(!editable, |d| {
-                                                    d.on_mouse_down(MouseButton::Left, dbl(area))
-                                                })
-                                                .child(el)
+                                                // A press on a frame never reaches the
+                                                // page under it, whose body area would
+                                                // close the open header or footer: an
+                                                // editable frame keeps it to its text,
+                                                // a read-only one opens its area.
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    move |ev: &MouseDownEvent, window, cx| {
+                                                        cx.stop_propagation();
+                                                        if !editable {
+                                                            open(ev, window, cx);
+                                                        }
+                                                    },
+                                                )
+                                                .children(paras)
                                                 .child(ruler_probe_el(
                                                     &self.ruler_probe,
                                                     move |state, rect| {

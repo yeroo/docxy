@@ -1,7 +1,9 @@
 //! Where a header or footer's framed paragraph (`w:framePr`) sits on its page
 //! (#767): Insert › Page Number › Page Margins places the number in one, and
 //! the Print Layout view and the PDF export both draw it from [`frame_rect`],
-//! out of the header/footer band's flow ([`split_framed`]).
+//! out of the header/footer band's flow ([`split_framed`]). Adjacent
+//! paragraphs with the same frame share it, stacked, as Word draws them (a
+//! letterhead's address lines, or Enter in a framed number).
 //!
 //! All values are twips (1/1440 inch), measured down and right from the
 //! page's top-left corner.
@@ -20,7 +22,8 @@ pub struct FrameGeom {
     pub top: i32,
     pub bottom: i32,
     /// Where the band holding the paragraph starts its flow: the header
-    /// distance in a header, the footer's top in a footer. `vAnchor="text"`
+    /// distance in a header; in a footer, the top of its flow (the footer
+    /// distance less the flow's height, at least one line). `vAnchor="text"`
     /// measures from it.
     pub band_top: i32,
     /// An even page: `inside` is the right side there, `outside` the left.
@@ -47,22 +50,59 @@ pub fn placed_frame(b: &Block) -> Option<&FramePr> {
     }
 }
 
-/// Blocks or paragraphs, each with its block index.
-pub type Indexed<'a, T> = Vec<(usize, &'a T)>;
+/// One frame and the paragraphs stacked in it, each with its block index
+/// (an editor path): a run of adjacent paragraphs whose `w:framePr` is the
+/// same.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameGroup<'a> {
+    pub frame: &'a FramePr,
+    pub paras: Vec<(usize, &'a Paragraph)>,
+}
+
+impl FrameGroup<'_> {
+    /// The stacked paragraphs' height: one [`line_height`] each.
+    pub fn content_h(&self) -> i32 {
+        self.paras.iter().map(|(_, p)| line_height(p)).sum()
+    }
+
+    /// The widest paragraph's estimated width, for a frame with no `w`
+    /// (Word sizes it to its content): half an em per character at the
+    /// paragraph's largest size, plus a character of slack.
+    pub fn content_w(&self) -> i32 {
+        self.paras
+            .iter()
+            .map(|(_, p)| {
+                // line_height is 1.2 em; half an em per character.
+                let half_em = line_height(p) * 5 / 12;
+                (p.plain_text().chars().count() as i32 + 1) * half_em
+            })
+            .max()
+            .unwrap_or(0)
+    }
+}
 
 /// A header or footer's blocks split into those its band flows (with the
-/// content-control boundaries) and the framed paragraphs drawn at their
-/// frame, each with its block index (an editor path).
-pub fn split_framed(blocks: &[Block]) -> (Indexed<'_, Block>, Indexed<'_, Paragraph>) {
+/// content-control boundaries), each with its block index, and the frames
+/// drawn out of the flow.
+pub fn split_framed(blocks: &[Block]) -> (Vec<(usize, &Block)>, Vec<FrameGroup<'_>>) {
     let mut flow = Vec::new();
-    let mut framed = Vec::new();
+    let mut groups: Vec<FrameGroup> = Vec::new();
     for (i, b) in blocks.iter().enumerate() {
-        match b {
-            Block::Paragraph(p) if placed_frame(b).is_some() => framed.push((i, p)),
-            _ => flow.push((i, b)),
+        let (Some(frame), Block::Paragraph(p)) = (placed_frame(b), b) else {
+            flow.push((i, b));
+            continue;
+        };
+        match groups.last_mut() {
+            Some(g) if g.frame == frame && g.paras.last().is_some_and(|(j, _)| j + 1 == i) => {
+                g.paras.push((i, p))
+            }
+            _ => groups.push(FrameGroup {
+                frame,
+                paras: vec![(i, p)],
+            }),
         }
     }
-    (flow, framed)
+    (flow, groups)
 }
 
 /// One line of a paragraph with no frame height: 1.2 x its largest run or
@@ -82,11 +122,13 @@ pub fn line_height(p: &Paragraph) -> i32 {
     (half_pts as i32) * 12
 }
 
-/// The frame's rectangle on the page described by `g`. `line_h` is the
-/// height used when the frame sets none (see [`line_height`]).
+/// The frame's rectangle on the page described by `g`, holding content
+/// `content_w` wide and `content_h` tall (see [`FrameGroup::content_w`]).
 ///
-/// - Width: `w`, else the text width (the page less its side margins).
-/// - Height: `h` (exact or at least), else `line_h`.
+/// - Width: `w`, else the content's, at most the text width (the page less
+///   its side margins).
+/// - Height: `h` when `hRule="exact"`, at least `h` when `atLeast`, else
+///   (`auto`, the default) the content's.
 /// - Horizontal: measured from the page (`hAnchor="page"`), else from the
 ///   margins (`margin`, `text`, `column` and none: the suite's header and
 ///   footer bands are one column). `xAlign` wins over `x`, as the schema
@@ -97,10 +139,18 @@ pub fn line_height(p: &Paragraph) -> i32 {
 ///   the band's flow start (`text` and none). `yAlign` wins over `y`;
 ///   `inside` is top, `outside` bottom, `inline` the anchor's top; with
 ///   neither the frame sits at the anchor's top.
-pub fn frame_rect(f: &FramePr, g: &FrameGeom, line_h: i32) -> FrameRect {
+pub fn frame_rect(f: &FramePr, g: &FrameGeom, content_w: i32, content_h: i32) -> FrameRect {
     let text_w = (g.page_w - g.left - g.right).max(1);
-    let w = f.w.filter(|w| *w > 0).unwrap_or(text_w);
-    let h = f.h.filter(|h| *h > 0).unwrap_or(line_h).max(1);
+    let w =
+        f.w.filter(|w| *w > 0)
+            .unwrap_or_else(|| content_w.clamp(1, text_w));
+    let set_h = f.h.filter(|h| *h > 0);
+    let h = match (f.h_rule.as_deref(), set_h) {
+        (Some("exact"), Some(h)) => h,
+        (Some("atLeast"), Some(h)) => h.max(content_h),
+        _ => content_h,
+    }
+    .max(1);
     let (ax, aw) = match f.h_anchor.as_deref() {
         Some("page") => (0, g.page_w),
         _ => (g.left, text_w),
@@ -158,6 +208,7 @@ mod tests {
         FramePr {
             w: Some(600),
             h: Some(400),
+            h_rule: Some("exact".into()),
             h_anchor: h_anchor.map(str::to_string),
             v_anchor: v_anchor.map(str::to_string),
             ..Default::default()
@@ -165,11 +216,11 @@ mod tests {
     }
 
     fn x_of(f: &FramePr, g: &FrameGeom) -> i32 {
-        frame_rect(f, g, 0).x
+        frame_rect(f, g, 0, 0).x
     }
 
     fn y_of(f: &FramePr) -> i32 {
-        frame_rect(f, &G, 0).y
+        frame_rect(f, &G, 0, 0).y
     }
 
     #[test]
@@ -272,14 +323,23 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_width_takes_the_text_width_and_a_missing_height_one_line() {
-        let f = FramePr {
+    fn a_missing_width_takes_the_contents_and_the_height_follows_h_rule() {
+        let mut f = FramePr {
             h_anchor: Some("margin".into()),
             ..Default::default()
         };
-        let r = frame_rect(&f, &G, 264);
-        assert_eq!(r.w, 12240 - 1800 - 1080);
-        assert_eq!(r.h, 264);
+        let r = frame_rect(&f, &G, 500, 264);
+        assert_eq!(r.w, 500, "no w: the content's");
+        assert_eq!(r.h, 264, "no h: the content's");
+        let wide = frame_rect(&f, &G, 99_999, 264);
+        assert_eq!(wide.w, 12240 - 1800 - 1080, "at most the text width");
+        f.h = Some(400);
+        assert_eq!(frame_rect(&f, &G, 0, 264).h, 264, "auto ignores h");
+        f.h_rule = Some("atLeast".into());
+        assert_eq!(frame_rect(&f, &G, 0, 264).h, 400);
+        assert_eq!(frame_rect(&f, &G, 0, 900).h, 900, "at least grows");
+        f.h_rule = Some("exact".into());
+        assert_eq!(frame_rect(&f, &G, 0, 900).h, 400);
     }
 
     #[test]
@@ -338,14 +398,56 @@ mod tests {
             para(Some(not_drop)),
             logo,
         ];
-        let (flow, framed) = split_framed(&blocks);
+        let (flow, groups) = split_framed(&blocks);
         assert_eq!(
             flow.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
             vec![0, 2, 3, 4]
         );
+        // 5 and 6 are adjacent but framed differently (5 says dropCap none).
+        let paras = |g: &FrameGroup| g.paras.iter().map(|(i, _)| *i).collect::<Vec<_>>();
         assert_eq!(
-            framed.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
-            vec![1, 5, 6]
+            groups.iter().map(paras).collect::<Vec<_>>(),
+            vec![vec![1], vec![5], vec![6]]
         );
+    }
+
+    /// A letterhead address, one framed paragraph per line, and a framed
+    /// number split by Enter: adjacent equal frames are one frame; the same
+    /// frame after an unframed paragraph is another.
+    #[test]
+    fn adjacent_equal_frames_share_one() {
+        let f = frame(Some("page"), Some("page"));
+        let para = |frame: Option<&FramePr>| {
+            Block::Paragraph(Paragraph {
+                props: ParProps {
+                    frame: frame.cloned(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+        };
+        let other = FramePr {
+            x: Some(1),
+            ..f.clone()
+        };
+        let blocks = vec![
+            para(Some(&f)),
+            para(Some(&f)),
+            para(Some(&f)),
+            para(Some(&other)),
+            para(None),
+            para(Some(&f)),
+        ];
+        let (flow, groups) = split_framed(&blocks);
+        assert_eq!(flow.len(), 1);
+        let paras = |g: &FrameGroup| g.paras.iter().map(|(i, _)| *i).collect::<Vec<_>>();
+        assert_eq!(
+            groups.iter().map(paras).collect::<Vec<_>>(),
+            vec![vec![0, 1, 2], vec![3], vec![5]]
+        );
+        assert_eq!(groups[0].content_h(), 3 * 264);
+        // Empty paragraphs: one character of slack, half an em at 11 pt.
+        assert_eq!(groups[0].content_w(), 110);
+        assert_eq!(groups[1].frame, &other);
     }
 }
