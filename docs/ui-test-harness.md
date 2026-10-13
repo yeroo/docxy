@@ -1392,7 +1392,7 @@ cursor is on; a summary asks first, in the `delete-summary` dialog.
   Header & Footer and on the contextual Header & Footer tab. Header and Footer
   list the `Built-in` designs (Blank, Blank (Three Columns)), then Edit and
   Remove. Page Number lists Top of Page, Bottom of Page, Page Margins
-  (`enabled: false`) and Current Position, each available one opening a
+  (#767) and Current Position, each opening a
   submenu of designs (`menu-click {"path": ["Bottom of Page", "Plain Number
   2"]}`; the pointer opens a submenu in the menu's place), then Format Page
   Numbers... (the `page-number-format` dialog) and Remove Page Numbers. The contextual tab's
@@ -1493,7 +1493,7 @@ While a header or footer is open, the contextual **Header & Footer** tab shows
 
 | Verb | Args | Reply |
 |---|---|---|
-| `hf-state` | `{}` | `{editing}`, and while editing `kind` (`header`/`footer`), `section` (1-based), `variant` (`default`/`first`/`even`), `label` (Word's tab label: `Header -Section 2-`, `First Page Footer`, `Odd Page Header`, …), `same_as_previous`, `part`, `text` (its paragraphs, one per line), `show_document_text` and `page_numbers` (placed page numbers in it); always `different_first_page`, `different_odd_even`, `header_from_top` and `footer_from_bottom` (inches) for the target section |
+| `hf-state` | `{}` | `{editing}`, and while editing `kind` (`header`/`footer`), `section` (1-based), `variant` (`default`/`first`/`even`), `label` (Word's tab label: `Header -Section 2-`, `First Page Footer`, `Odd Page Header`, …), `same_as_previous`, `part`, `text` (its paragraphs, one per line), `show_document_text` and `page_numbers` (placed page numbers in it); always `different_first_page`, `different_odd_even`, `header_from_top` and `footer_from_bottom` (inches) for the target section, and `margin_frames`: each framed header/footer paragraph (a Page Margins number, #767) the last Print Layout frame drew, page by page, header first, with `page` (0-based), `area`, `x`, `y`, `w`, `h` and `page_w` in inches from the sheet's top-left corner, and `side` (`left` or `right` when it lies wholly in that side margin, else `text`). It reads probes, so `shot` first after a verb that moves it |
 | `page-double-click` | `{page, area}`: 0-based print-layout page, `header`, `footer` or `body` | `hf-state` after the page's own double-click handler: a header or footer area edits that page's section and variant, the body leaves header/footer editing (a single click in the body no longer does) |
 
 `page-double-click` refuses under a dialog and for a page the document does not

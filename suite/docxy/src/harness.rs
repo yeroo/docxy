@@ -4212,7 +4212,15 @@ fn dispatch_verb(
         }
         // Header/footer editing state (#641): which area of which section and
         // variant, its labels, and the contextual tab's Options and Position.
-        "hf-state" => Done::ok(crate::hf_tab::hf_state(app.tabs.get(app.active))),
+        // `margin_frames`: where Print Layout drew framed header/footer
+        // paragraphs, a Page Margins number's (#767), from the last frame.
+        "hf-state" => {
+            let mut state = crate::hf_tab::hf_state(app.tabs.get(app.active));
+            if let Json::Obj(fields) = &mut state {
+                fields.push(("margin_frames".into(), app.margin_frames()));
+            }
+            Done::ok(state)
+        }
         // A pointer double-click on a print-layout page's header, footer or
         // body area (0-based `page`), through the handler the page draws.
         "page-double-click" => {
