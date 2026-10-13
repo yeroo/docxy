@@ -6,8 +6,8 @@ use super::{Capture, How, Image, is_blank};
 use crate::image::RectPx;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    AtomEnum, ConnectionExt, Format, ImageFormat, ImageOrder, MapState, VisualClass, Visualtype,
-    Window, WindowClass,
+    AtomEnum, ConnectionExt, Format, ImageFormat, ImageOrder, MapState, Screen, VisualClass,
+    Visualid, Visualtype, Window, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 
@@ -17,7 +17,7 @@ fn error(e: impl std::fmt::Display) -> String {
     format!("X11 capture: {e}")
 }
 
-fn atom(conn: &RustConnection, name: &[u8]) -> Result<u32, String> {
+pub(crate) fn atom(conn: &RustConnection, name: &[u8]) -> Result<u32, String> {
     Ok(conn
         .intern_atom(false, name)
         .map_err(error)?
@@ -140,21 +140,30 @@ fn unobscured(
     Ok(())
 }
 
-/// Capture the largest mapped client owned by the harness PID. EWMH's client
-/// list survives reparenting; PID matching keeps unrelated apps out of evidence.
-pub fn capture_pid(pid: u32) -> Result<Capture, String> {
+/// Connect to `DISPLAY`, or say why a harness cannot.
+pub(crate) fn connect() -> Result<RustConnection, String> {
     let (conn, _) = x11rb::connect(None).map_err(|e| error(format!(
         "cannot connect to DISPLAY ({e}); run through scripts/ui-linux.py (native Wayland capture is not supported)"
     )))?;
-    let clients_atom = atom(&conn, b"_NET_CLIENT_LIST")?;
-    let pid_atom = atom(&conn, b"_NET_WM_PID")?;
+    Ok(conn)
+}
+
+/// The largest mapped client owned by `pid`, with its screen and visual.
+/// EWMH's client list survives reparenting, so this is the client window
+/// itself, never the window manager's frame.
+pub(crate) fn client_of_pid(
+    conn: &RustConnection,
+    pid: u32,
+) -> Result<(Window, &Screen, Visualid), String> {
+    let clients_atom = atom(conn, b"_NET_CLIENT_LIST")?;
+    let pid_atom = atom(conn, b"_NET_WM_PID")?;
     let mut best = None;
     let mut best_area = 0;
     for screen in &conn.setup().roots {
-        let clients = property(&conn, screen.root, clients_atom, AtomEnum::WINDOW)?;
+        let clients = property(conn, screen.root, clients_atom, AtomEnum::WINDOW)?;
         for window in clients {
             // A client may disappear between reading the list and its properties.
-            let Ok(owners) = property(&conn, window, pid_atom, AtomEnum::CARDINAL) else {
+            let Ok(owners) = property(conn, window, pid_atom, AtomEnum::CARDINAL) else {
                 continue;
             };
             if owners.first().copied() != Some(pid) {
@@ -167,7 +176,7 @@ pub fn capture_pid(pid: u32) -> Result<Capture, String> {
             if attrs.map_state != MapState::VIEWABLE || attrs.class != WindowClass::INPUT_OUTPUT {
                 continue;
             }
-            let r = rect(&conn, window, screen.root)?;
+            let r = rect(conn, window, screen.root)?;
             let area = u64::from(r.w) * u64::from(r.h);
             if area > best_area {
                 best_area = area;
@@ -175,9 +184,16 @@ pub fn capture_pid(pid: u32) -> Result<Capture, String> {
             }
         }
     }
-    let (window, screen, visual_id) = best.ok_or_else(|| error(format!(
+    best.ok_or_else(|| error(format!(
         "process {pid} has no mapped X11 client in _NET_CLIENT_LIST; use an X11 window manager (scripts/ui-linux.py). Native Wayland windows cannot be captured this way"
-    )))?;
+    )))
+}
+
+/// Capture the largest mapped client owned by the harness PID. PID matching
+/// keeps unrelated apps out of evidence.
+pub fn capture_pid(pid: u32) -> Result<Capture, String> {
+    let conn = connect()?;
+    let (window, screen, visual_id) = client_of_pid(&conn, pid)?;
     let before = rect(&conn, window, screen.root)?;
     if before.x < 0
         || before.y < 0

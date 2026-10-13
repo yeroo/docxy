@@ -167,11 +167,11 @@ impl Proc {
         }
     }
 
-    /// Whether it has gone, and a word about how. The string is what
+    /// Whether it has gone, and how: its status's Display is what
     /// [`Launched::exited`] puts after the exe path.
-    fn try_wait(&mut self) -> std::io::Result<Option<String>> {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         match self {
-            Proc::Std(child) => Ok(child.try_wait()?.map(|s| s.to_string())),
+            Proc::Std(child) => child.try_wait(),
             #[cfg(windows)]
             Proc::Raw { process, .. } => {
                 use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
@@ -193,7 +193,8 @@ impl Proc {
                 let mut code = 0u32;
                 unsafe { GetExitCodeProcess(process.0, &mut code) }
                     .map_err(|e| std::io::Error::other(format!("GetExitCodeProcess: {e}")))?;
-                Ok(Some(format!("exit code: {code}")))
+                use std::os::windows::process::ExitStatusExt;
+                Ok(Some(std::process::ExitStatus::from_raw(code)))
             }
         }
     }
@@ -302,6 +303,30 @@ impl Launched {
             }
         }
         msg
+    }
+
+    /// Wait up to `timeout` for it to exit by itself (#1226: a window closed
+    /// through the OS ends the run), and say how. `Err` when it is still
+    /// running at the deadline, which leaves it to the drop guard.
+    pub fn wait_exit(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<std::process::ExitStatus, String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match self.proc_.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {}
+                Err(e) => return Err(format!("{}: {e}", self.exe.display())),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "{} still running after {timeout:?}",
+                    self.exe.display()
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     /// Take charge of a suite started some other way — a test that must spawn
