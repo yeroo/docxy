@@ -16,7 +16,7 @@
 //! ([`count_unremovable_hidden_runs`]) but not removed, since that would
 //! mean editing run XML the model doesn't hold.
 
-use crate::model::{Block, Document, Inline, Run, RunProps};
+use crate::model::{Block, Document, Inline, Run, RunProps, Table, TableRowBoundaryKind};
 use crate::package::Package;
 use crate::xml::{Event, XmlParser};
 use std::ops::Range;
@@ -222,12 +222,18 @@ fn count_blocks(blocks: &[Block], target: Target) -> usize {
         .iter()
         .map(|b| match b {
             Block::Paragraph(p) => count_inlines(&p.content, target),
-            Block::Table(t) => t
-                .rows
-                .iter()
-                .flat_map(|row| &row.cells)
-                .map(|cell| count_blocks(&cell.blocks, target))
-                .sum(),
+            Block::Table(t) => {
+                let cells: usize = t
+                    .rows
+                    .iter()
+                    .flat_map(|row| &row.cells)
+                    .map(|cell| count_blocks(&cell.blocks, target))
+                    .sum();
+                cells
+                    + table_raws(t)
+                        .map(|raw| count_in_raw(raw, target))
+                        .sum::<usize>()
+            }
             Block::Raw(raw) => count_in_raw(raw, target),
             Block::SectionProperties(_) => 0,
         })
@@ -312,6 +318,9 @@ fn remove_blocks(blocks: &mut [Block], target: Target) -> usize {
                 for cell in t.rows.iter_mut().flat_map(|row| &mut row.cells) {
                     removed += remove_blocks(&mut cell.blocks, target);
                 }
+                if let Target::CommentMarkers(id) = target {
+                    removed += remove_table_raw_markers(t, id);
+                }
             }
             // A body-level range marker (one before a table) is a raw block.
             // An emptied block stays, as an empty one, so the block paths
@@ -332,6 +341,53 @@ fn remove_blocks(blocks: &mut [Block], target: Target) -> usize {
             }
             Block::SectionProperties(_) => {}
         }
+    }
+    removed
+}
+
+/// A table's own raw XML outside its cells' blocks: the children between
+/// rows ([`TableRowBoundaryKind::Raw`]) and the row-level ones between cells
+/// ([`Cell::raw_before`], [`Row::raw_end`]), where a comment range can start
+/// or end (#1215).
+///
+/// [`TableRowBoundaryKind::Raw`]: crate::model::TableRowBoundaryKind::Raw
+/// [`Cell::raw_before`]: crate::model::Cell::raw_before
+/// [`Row::raw_end`]: crate::model::Row::raw_end
+fn table_raws(t: &Table) -> impl Iterator<Item = &String> {
+    let between_rows = t.row_boundaries.iter().filter_map(|b| match &b.kind {
+        TableRowBoundaryKind::Raw(raw) => Some(raw),
+        _ => None,
+    });
+    let in_rows = t.rows.iter().flat_map(|row| {
+        row.cells
+            .iter()
+            .flat_map(|cell| &cell.raw_before)
+            .chain(&row.raw_end)
+    });
+    between_rows.chain(in_rows)
+}
+
+/// Remove the comment markers (of `id`, or all) from [`table_raws`],
+/// dropping an entry left empty. Returns how many.
+fn remove_table_raw_markers(t: &mut Table, id: Option<&str>) -> usize {
+    let mut removed = 0;
+    let mut strip = |raw: &mut String| {
+        let (out, n) = strip_markers(raw, id);
+        if n > 0 {
+            *raw = out;
+            removed += n;
+        }
+        !raw.trim().is_empty()
+    };
+    t.row_boundaries.retain_mut(|b| match &mut b.kind {
+        TableRowBoundaryKind::Raw(raw) => strip(raw),
+        _ => true,
+    });
+    for row in &mut t.rows {
+        for cell in &mut row.cells {
+            cell.raw_before.retain_mut(&mut strip);
+        }
+        row.raw_end.retain_mut(&mut strip);
     }
     removed
 }
@@ -573,6 +629,9 @@ fn marker_ids_in_blocks(blocks: &[Block], ids: &mut std::collections::BTreeSet<S
                 for cell in t.rows.iter().flat_map(|row| &row.cells) {
                     marker_ids_in_blocks(&cell.blocks, ids);
                 }
+                for raw in table_raws(t) {
+                    marker_ids_in_xml(raw, ids);
+                }
             }
             Block::Raw(raw) => marker_ids_in_xml(raw, ids),
             Block::SectionProperties(_) => {}
@@ -784,6 +843,46 @@ mod tests {
         let ids: Vec<String> = comment_marker_ids(&doc).into_iter().collect();
         assert_eq!(ids, ["1", "10", "4"]);
         assert!(comment_marker_ids(&parse("<w:p><w:r><w:t>x</w:t></w:r></w:p>")).is_empty());
+    }
+
+    /// #1215: a comment range can end between two cells of a row (Word's
+    /// TableComments files), or start between two rows.
+    #[test]
+    fn row_level_and_between_row_comment_markers_are_found_and_removed() {
+        let cell = |t: &str| format!("<w:tc><w:p><w:r><w:t>{t}</w:t></w:r></w:p></w:tc>");
+        let body = format!(
+            "<w:tbl><w:commentRangeStart w:id=\"3\"/>\
+             <w:tr>{}<w:commentRangeEnd w:id=\"0\"/><w:commentRangeEnd w:id=\"2\"/>{}</w:tr>\
+             <w:tr>{}<w:commentRangeEnd w:id=\"3\"/></w:tr></w:tbl>",
+            cell("a"),
+            cell("b"),
+            cell("c"),
+        );
+        let mut doc = parse(&body);
+        let ids: Vec<String> = comment_marker_ids(&doc).into_iter().collect();
+        assert_eq!(ids, ["0", "2", "3"]);
+        assert!(has_comment_markers(&doc));
+
+        assert_eq!(remove_comment_markers(&mut doc, "0"), 1);
+        let ids: Vec<String> = comment_marker_ids(&doc).into_iter().collect();
+        assert_eq!(ids, ["2", "3"]);
+        let xml = document_to_xml(&doc);
+        assert!(!xml.contains("w:id=\"0\""), "{xml}");
+        assert!(xml.contains("<w:commentRangeEnd w:id=\"2\"/>"), "{xml}");
+
+        assert_eq!(remove_comment_markers(&mut doc, "3"), 2);
+        assert_eq!(remove_all_comment_markers(&mut doc), 1);
+        assert!(!has_comment_markers(&doc));
+        let Block::Table(t) = &doc.body[0] else {
+            panic!("a table");
+        };
+        // Emptied entries go; the cells stay.
+        assert!(t.row_boundaries.is_empty());
+        assert!(t.rows.iter().all(|r| r.raw_end.is_empty()));
+        assert!(t.rows[0].cells[1].raw_before.is_empty());
+        assert_eq!(t.rows[0].cells.len(), 2);
+        let xml = document_to_xml(&doc);
+        assert!(!xml.contains("comment"), "{xml}");
     }
 
     const VISIBLE: &str = "<w:r><w:t>keep</w:t></w:r>";
