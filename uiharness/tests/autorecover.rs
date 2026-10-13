@@ -103,15 +103,39 @@ fn a_killed_instance_relaunches_with_the_autorecover_copy() {
         "the original is untouched"
     );
 
-    // Crash again with the copy still unsaved, and this time uncheck it:
-    // OK reopens the original as last saved (#1225).
+    // Crash again with the copy still unsaved, and relaunch as a double
+    // click on another file does: the dialog opens after that file, over
+    // every tab, and nothing reaches a tab under it (#1225 r1 M1). This time
+    // uncheck it: OK reopens the original as last saved.
     let tick = call(&driver, "autorecover-now", &[]);
     assert_eq!(tick.get("wrote"), Some(&Json::Bool(true)), "{tick}");
     drop(driver);
     drop(app);
-    let app = launch::launch(&exe, &sandbox).unwrap();
+    let other = sandbox.join("other.docx");
+    std::fs::copy(root.join("fixtures/basic.docx"), &other).unwrap();
+    let sandbox_abs = std::path::absolute(&sandbox).unwrap();
+    let child = launch::command(&exe, &sandbox_abs, std::env::vars_os())
+        .arg(&other)
+        .spawn()
+        .unwrap();
+    let app = uiharness::launch::Launched::adopt(child, &exe, &sandbox_abs);
     let driver = Driver::connect(&app.ctl_dir(), None).unwrap();
     assert_recovery_offered(&driver);
+    let list = call(&driver, "tab-list", &[]);
+    let (Some(Json::Num(active)), Some(Json::Arr(tabs))) = (list.get("active"), list.get("tabs"))
+    else {
+        panic!("{list}")
+    };
+    assert_eq!(
+        tabs[*active as usize].get_str("title"),
+        Some("other.docx"),
+        "the startup file opened under the dialog: {list}"
+    );
+    let refused = driver.call(
+        "tab-select",
+        Json::obj(vec![("tab", Json::Str("basic".into()))]),
+    );
+    assert!(refused.is_err(), "{refused:?}");
     call(
         &driver,
         "dialog-set",

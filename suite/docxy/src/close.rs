@@ -46,7 +46,7 @@ impl CloseStep {
 /// write while it was unsaved (`last_hot`). A window close comes here only
 /// for a tab answered Don't Save in its per-document questions (#630); a
 /// silent one keeps every tab as a tab (hot exit).
-pub(crate) fn should_keep_draft(
+fn should_keep_draft(
     kind: Kind,
     minutes: u32,
     keep: bool,
@@ -56,25 +56,21 @@ pub(crate) fn should_keep_draft(
     discarded && kind == Kind::Xlsx && minutes > 0 && keep && last_hot.is_some()
 }
 
-/// Keep `tab`'s draft under `root` when [`should_keep_draft`] says so:
-/// `None` when it does not, else where the draft went or why it was not kept.
-fn keep_closed_draft(
+/// Keep `tab`'s draft under `root` when [`should_keep_draft`] says so, the
+/// tab `discarded` (a Don't Save close, or Document Recovery's original,
+/// #1225): `None` when it does not, else where the draft went or why it was
+/// not kept.
+pub(crate) fn keep_closed_draft(
     root: &std::path::Path,
     tab: &DocTab,
-    step: &CloseStep,
+    discarded: bool,
     minutes: u32,
     keep: bool,
     now: std::time::SystemTime,
 ) -> Option<Result<PathBuf, String>> {
     let last_hot = tab.last_hot.borrow();
     let sidecar = last_hot.as_deref();
-    if !should_keep_draft(
-        tab.kind,
-        minutes,
-        keep,
-        *step == CloseStep::Discard,
-        sidecar,
-    ) {
+    if !should_keep_draft(tab.kind, minutes, keep, discarded, sidecar) {
         return None;
     }
     sidecar.map(|s| recover::keep_draft(root, &tab.title, s, now))
@@ -809,7 +805,7 @@ impl Docxy {
         if let Some(kept) = keep_closed_draft(
             &config_root(),
             &self.tabs[i],
-            &step,
+            step == CloseStep::Discard,
             self.autorecover_minutes,
             self.keep_drafts,
             std::time::SystemTime::now(),
@@ -1113,7 +1109,7 @@ impl Docxy {
             let _ = keep_closed_draft(
                 &root,
                 &self.tabs[i],
-                &CloseStep::Discard,
+                true,
                 self.autorecover_minutes,
                 self.keep_drafts,
                 now,

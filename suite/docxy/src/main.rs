@@ -4751,6 +4751,9 @@ struct Docxy {
     /// The tabs Document Recovery's items stand for, by index and path, while
     /// it is open (#1225).
     recovery: Vec<(usize, PathBuf)>,
+    /// The tabs restore labelled recovered, until the window opens and
+    /// Document Recovery is offered over them (#1225).
+    recovery_pending: Vec<doc_recovery::Recovered>,
     bs_new: bool,
     /// Vertical scroll of the backstage's content pane and of its rail
     /// (#1028). The content one is reset when the page changes.
@@ -12138,8 +12141,9 @@ impl Docxy {
         sheet_autocorrect::stamp_autocorrect(&mut this.tabs, &this.autocorrect);
         this.user_name = session.user_name;
         this.user_initials = session.user_initials;
-        // After a crash, offer each recovered document's original (#1225).
-        this.open_document_recovery(&recovered, now);
+        // After a crash, each recovered document's original is offered once
+        // the startup files are open (#1225).
+        this.recovery_pending = recovered;
         // win_id is 0 until the window registers: the write below behaves
         // exactly like the single-window write this was (no union, base 0).
         this.persist_to(&root, SessionWrite::All, cx);
@@ -12170,6 +12174,7 @@ impl Docxy {
             backstage: false,
             app_dialogs: dialog::DialogStack::default(),
             recovery: Vec::new(),
+            recovery_pending: Vec::new(),
             bs_new: false,
             bs_export: false,
             bs_templates: Vec::new(),
@@ -39250,6 +39255,13 @@ fn open_docxy_window(
                     this.open_args(startup_files, read_only, cx)
                 });
             }
+            // Then Document Recovery after a crash (#1225), over whatever
+            // they opened: on the app's stack, so it covers every tab, and
+            // after them, so their own questions stay on their tabs.
+            view.update(cx, |this, cx| {
+                this.open_document_recovery();
+                cx.notify();
+            });
             // Hot-exit: capture the latest (possibly unsaved) content when
             // the window is closed, so a restart restores exactly what was
             // open. By default closing is silent; with "ask before closing"

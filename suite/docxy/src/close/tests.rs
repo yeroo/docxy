@@ -2428,7 +2428,7 @@ fn dont_save_keeps_the_last_autorecover_copy_as_a_read_only_draft() {
     let step = close_step(&mut tabs[0], Some(CloseAnswer::Discard));
     assert_eq!(step, CloseStep::Discard);
     let now = std::time::SystemTime::now();
-    let draft = keep_closed_draft(&root.0, &tabs[0], &step, 1, true, now)
+    let draft = keep_closed_draft(&root.0, &tabs[0], step == CloseStep::Discard, 1, true, now)
         .unwrap()
         .unwrap();
     let drafts = recover::list_drafts(&root.0, now, &[]);
@@ -2454,18 +2454,24 @@ fn no_draft_without_a_write_while_unsaved_or_without_discard() {
     let mut t = tab(Kind::Xlsx);
     commit_a1(&mut t, "Never written");
     let step = close_step(&mut t, Some(CloseAnswer::Discard));
-    assert_eq!(keep_closed_draft(&root.0, &t, &step, 1, true, now), None);
+    assert_eq!(
+        keep_closed_draft(&root.0, &t, step == CloseStep::Discard, 1, true, now),
+        None
+    );
     // Written while unsaved, but the answer was Cancel.
     let tabs = vec![t];
     write_session(&root.0, &tabs, 0, prefs(), &[], 0);
     let mut t = tabs.into_iter().next().unwrap();
     let step = close_step(&mut t, Some(CloseAnswer::Cancel));
-    assert_eq!(keep_closed_draft(&root.0, &t, &step, 1, true, now), None);
+    assert_eq!(
+        keep_closed_draft(&root.0, &t, step == CloseStep::Discard, 1, true, now),
+        None
+    );
     // A clean tab is removed without a draft.
     let mut clean = tab(Kind::Xlsx);
     let step = close_step(&mut clean, None);
     assert_eq!(
-        keep_closed_draft(&root.0, &clean, &step, 1, true, now),
+        keep_closed_draft(&root.0, &clean, step == CloseStep::Discard, 1, true, now),
         None
     );
     assert_eq!(recover::list_drafts(&root.0, now, &[]), vec![]);
@@ -3853,6 +3859,19 @@ fn a_crash_restore_lists_recovered_documents_with_an_original() {
         &crate::trusted::TrustStore::default(),
     );
     assert!(clean.is_empty());
+}
+
+/// The startup files open before the dialog (#1225 r1 M1): one that
+/// reloaded a recovered tab leaves nothing to offer for it.
+#[test]
+fn a_tab_a_startup_file_reloaded_is_not_listed() {
+    let root = Root::new("recovery-startup-reload");
+    let (original, t) = edited_doc(&root, "original.docx", "recover me");
+    let mut tabs = vec![t];
+    let (mut restored, recovered) = recovery_restore(&root, &mut tabs);
+    assert_eq!(recovery_items(&recovered, &restored).len(), 1);
+    restored[0] = tab_from_path(&original);
+    assert!(recovery_items(&recovered, &restored).is_empty());
 }
 
 #[test]

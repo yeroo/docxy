@@ -4,9 +4,10 @@
 //! Restore already reopens every unsaved tab from its AutoRecover copy
 //! ([`crate::restore_session_noting`]). This dialog lists the ones that have
 //! an original on disk, all checked: a checked one keeps its recovered
-//! changes, an unchecked one is replaced by its file as last saved. A modal
-//! on the active tab's stack, so `dialog-set` and `dialog-click` drive it;
-//! its OK is the app's, as the user name's is ([`crate::user_name`]).
+//! changes, an unchecked one is replaced by its file as last saved. It is
+//! the app's dialog, on the app's own stack, so it covers every tab and
+//! survives a tab replaced under it; `dialog-set` and `dialog-click` drive
+//! it, and its OK is the app's, as the user name's is ([`crate::user_name`]).
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -39,7 +40,9 @@ pub(crate) const ORIGINAL_OPENED: &str = "original opened — the AutoRecover co
 
 /// The recovered tabs the dialog offers, in tab order: those with a file
 /// that still exists. An untitled one has no original to go back to, and a
-/// missing one none to open; both keep the recovered status.
+/// missing one none to open; both keep the recovered status. So is a tab no
+/// longer unsaved on that file: the startup files open before the dialog,
+/// and one of them may have reloaded it.
 pub(crate) fn candidates(
     recovered: &[Recovered],
     tabs: &[DocTab],
@@ -49,7 +52,9 @@ pub(crate) fn candidates(
         .iter()
         .filter_map(|r| {
             let path = r.path.clone().filter(|p| p.exists())?;
-            let tab = tabs.get(r.index)?;
+            let tab = tabs
+                .get(r.index)
+                .filter(|t| t.dirty && t.path.as_deref() == Some(path.as_path()))?;
             let folder = path
                 .parent()
                 .map(|p| p.display().to_string())
@@ -94,7 +99,7 @@ pub(crate) fn dialog(items: &[Candidate]) -> Dialog {
     d.controls = vec![list];
     d.buttons = ok_cancel();
     d.mark_opened();
-    // The list has the focus, so Space toggles its first item at once.
+    // The list, the only control, has the focus.
     d.focus_step(false);
     d
 }
@@ -201,28 +206,25 @@ pub(crate) fn apply(
         };
         // Kept before the tab goes: the persist after this deletes the
         // sidecar once no session names it (#1224).
-        let sidecar = tab.last_hot.borrow().clone();
-        if crate::close::should_keep_draft(
-            tab.kind,
+        let kept = crate::close::keep_closed_draft(
+            drafts.root,
+            tab,
+            true,
             drafts.minutes,
             drafts.keep,
-            true,
-            sidecar.as_deref(),
-        ) {
-            let s = sidecar
-                .as_deref()
-                .expect("should_keep_draft needs a sidecar");
-            match crate::recover::keep_draft(drafts.root, &tab.title, s, drafts.now) {
-                Ok(_) => out.drafts_kept = true,
-                // Discarding the copy now would lose its only one.
-                Err(e) => {
-                    tab.status = format!(
-                        "recovered — the original was not opened: {e}; this is the \
-                         AutoRecover copy: Save to keep it"
-                    )
-                    .into();
-                    continue;
-                }
+            drafts.now,
+        );
+        match kept {
+            None => {}
+            Some(Ok(_)) => out.drafts_kept = true,
+            // Discarding the copy now would lose its only one.
+            Some(Err(e)) => {
+                tab.status = format!(
+                    "recovered — the original was not opened: {e}; this is the \
+                     AutoRecover copy: Save to keep it"
+                )
+                .into();
+                continue;
             }
         }
         fresh.status = ORIGINAL_OPENED.into();
@@ -233,19 +235,21 @@ pub(crate) fn apply(
 }
 
 impl Docxy {
-    /// After a crash: open the dialog on the active tab's stack over the
-    /// recovered tabs that have an original, if any do.
-    pub(crate) fn open_document_recovery(&mut self, recovered: &[Recovered], now: SystemTime) {
-        let items = candidates(recovered, &self.tabs, now);
+    /// After a crash, once the startup files are open: open the dialog on
+    /// the app's stack over the recovered tabs restore noted that still have
+    /// an original, if any do. Only the first call of a run does anything.
+    pub(crate) fn open_document_recovery(&mut self) {
+        let recovered = std::mem::take(&mut self.recovery_pending);
+        let items = candidates(&recovered, &self.tabs, SystemTime::now());
         if items.is_empty() {
             return;
         }
-        let d = dialog(&items);
-        self.active_dialogs_mut().push(d);
+        self.app_dialogs.push(dialog(&items));
         self.recovery = items.into_iter().map(|c| (c.index, c.path)).collect();
     }
 
-    /// [`click`] on the active stack; an OK replaces the unchecked tabs by
+    /// [`click`] on the shown stack (the app's, while this is open); an OK
+    /// replaces the unchecked tabs by
     /// their originals and persists the session, which then no longer names
     /// their AutoRecover copies.
     pub(crate) fn document_recovery_click(
