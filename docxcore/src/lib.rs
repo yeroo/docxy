@@ -23,6 +23,7 @@ pub use opccore::{inflate, xml, zip, zipwrite};
 
 pub mod agent;
 pub mod autocorrect;
+pub mod border_style;
 pub mod chart;
 pub mod clip_rtf;
 pub mod comments;
