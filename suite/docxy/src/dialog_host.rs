@@ -211,9 +211,9 @@ fn reopen_on_top(tab: Option<&DocTab>) -> bool {
 /// a new circular reference (Consolidate's links, Subtotal, a sort, a typed
 /// entry the validation alert lets in) warns after the dialog's own status.
 pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String> {
-    let before = tab.status.clone();
+    let begun = tab.circle_cmd_begin();
     let done = dialog_press(tab, button);
-    tab.warn_new_circles(Some(&before));
+    tab.circle_cmd_end(begun);
     done
 }
 

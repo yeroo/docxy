@@ -174,3 +174,74 @@ fn replace_all_that_closes_a_circle_keeps_its_count() {
     assert_eq!(t.status.as_ref(), format!("replaced 1. {CIRCULAR_WARNING}"));
     assert_eq!(note(&mut t).as_deref(), Some("Circular References: A1"));
 }
+
+#[test]
+fn a_command_that_says_the_same_words_again_keeps_them() {
+    // #759 r2: the second Replace All also says "replaced 1"; it is still
+    // that command's own status, with the warning after it.
+    let mut pkg = blank();
+    pkg.workbook.sheets[0].set_cell(0, 0, Cell::formula("B1+1"));
+    pkg.workbook.sheets[0].set_cell(4, 4, Cell::text("X"));
+    let book = Book::new(&pkg);
+    let mut t = book.open();
+    replace_all_in(&mut t, "X", "Y");
+    assert_eq!(t.status.as_ref(), "replaced 1");
+    replace_all_in(&mut t, "B1", "A1");
+    assert_eq!(t.status.as_ref(), format!("replaced 1. {CIRCULAR_WARNING}"));
+}
+
+#[test]
+fn an_entry_a_command_commits_first_warns_after_the_commands_status() {
+    // #759 r2: a ribbon act commits the open entry, then runs: the
+    // circle the entry made is warned about after the act's own status.
+    // `Docxy::run_sheet_act` wraps the act as one command (it needs a
+    // window); this is that nesting: the act's commit, then Sort A to Z,
+    // which `sheet_data_cmd` runs as a command of its own.
+    let mut pkg = blank();
+    for (r, n) in [3.0, 1.0, 2.0].into_iter().enumerate() {
+        pkg.workbook.sheets[0].set_cell(r as u32, 1, Cell::number(n));
+    }
+    let book = Book::new(&pkg);
+    let mut t = book.open();
+    let act = t.circle_cmd_begin();
+    let v = view(&mut t);
+    v.sel = (5, 3);
+    v.anchor = (5, 3);
+    v.begin_cell_edit(Some(String::new()));
+    for ch in "=D6".chars() {
+        v.edit_type(&ch.to_string());
+    }
+    assert_eq!(v.close_editor_for_act(), Some(true));
+    t.sheet_edited();
+    let v = view(&mut t);
+    v.sel = (0, 1);
+    v.anchor = (0, 1);
+    let data = t.circle_cmd_begin();
+    crate::sheet_sort::quick(&mut t, true).unwrap();
+    t.circle_cmd_end(data);
+    t.circle_cmd_end(act);
+    let status = t.status.to_string();
+    assert!(status.starts_with("Sorted 3 rows. "), "{status}");
+    assert!(status.ends_with(CIRCULAR_WARNING), "{status}");
+}
+
+#[test]
+fn an_entry_save_commits_warns_after_saves_status() {
+    // #759 r2: Ctrl+S with `=A1` still in A1's editor commits it, then
+    // saves: the warning follows Save's status.
+    let book = Book::new(&blank());
+    let mut t = book.open();
+    let v = view(&mut t);
+    v.begin_cell_edit(Some(String::new()));
+    for ch in "=A1".chars() {
+        v.edit_type(&ch.to_string());
+    }
+    assert!(save_sheet_tab(&mut t, true, false, |_| None, |_| true));
+    let status = t.status.to_string();
+    assert!(status.starts_with("saved"), "{status}");
+    assert!(
+        status.ends_with(&format!(". {CIRCULAR_WARNING}")),
+        "{status}"
+    );
+    assert_eq!(note(&mut t).as_deref(), Some("Circular References: A1"));
+}
