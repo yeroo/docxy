@@ -743,3 +743,22 @@ fn clearing_odd_even_in_an_even_header_reopens_the_odd_one() {
     assert!(crate::hf::open(&mut t, 0, true, HeaderVariant::Even));
     assert_eq!(edited_text(&t), "typed Even A");
 }
+
+/// #770 r1: a settings part the toggle cannot change (here undecodable, so
+/// the checkbox reads off) refuses the click with nothing changed: no undo
+/// step and the even references kept.
+#[test]
+fn odd_even_refuses_a_settings_part_it_cannot_change() {
+    let mut t = odd_even("odd-even-unreadable");
+    let pkg = t.pkg.as_mut().unwrap();
+    assert!(pkg.set_part(
+        "word/settings.xml",
+        b"<w:settings xmlns:w=\"w\"><w:evenAndOddHeaders/>\xff</w:settings>".to_vec(),
+    ));
+    assert!(!hf_checked(&t, HfAct::DifferentOddEven));
+    let err = hf_apply(&mut t, HfAct::DifferentOddEven).unwrap_err();
+    assert!(err.starts_with("Could not change"), "{err}");
+    assert!(!hf_checked(&t, HfAct::DifferentOddEven));
+    assert!(ed(&t).undo_names().is_empty());
+    assert_eq!(even_refs(&ed(&t).sections()), LOADED_EVEN);
+}

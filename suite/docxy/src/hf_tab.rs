@@ -1059,11 +1059,22 @@ pub(crate) fn hf_apply(tab: &mut DocTab, act: HfAct) -> Result<(), String> {
             }
         }
         HfAct::DifferentOddEven => {
-            tab.pkg.as_ref().ok_or("no package")?;
+            // The package's setting is what the checkbox shows. It is written
+            // first: a settings part it cannot change (unreadable, or a root
+            // it does not recognise) refuses the click with nothing changed,
+            // rather than leave the editor's setting apart from the file's.
+            let pkg = tab.pkg.as_mut().ok_or("no package")?;
+            let on = !pkg.has_even_odd();
+            pkg.set_even_odd(on);
+            if pkg.has_even_odd() != on {
+                return Err(
+                    "Could not change Different Odd & Even Pages: the document's settings part is unreadable"
+                        .into(),
+                );
+            }
             let Surface::Doc(ed) = &mut tab.surface else {
                 return Err("no document".into());
             };
-            let on = !ed.settings().even_and_odd_headers;
             // Clearing it discards the even header and footer of every
             // section (the setting is the document's), keeping the odd ones:
             // turned on again, the even pages start empty (PAG-070).
