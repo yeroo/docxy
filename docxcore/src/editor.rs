@@ -1651,6 +1651,11 @@ impl Editor {
         if lo.path == hi.path {
             self.checkpoint(EditKind::Structural);
             self.anchor = None;
+            if self.track.is_none() {
+                if let Some(p) = para_mut(&mut self.doc.body, &lo.path) {
+                    drop_spanned_objects(&mut p.content, lo.offset, hi.offset);
+                }
+            }
             for _ in lo.offset..hi.offset {
                 self.delete_char_at(&lo.path, lo.offset);
             }
@@ -1693,6 +1698,7 @@ impl Editor {
             // Truncate the first paragraph at lo.offset.
             if let Some(Block::Paragraph(p)) = cont.get_mut(li) {
                 let len: usize = p.content.iter().map(inline_len).sum();
+                drop_spanned_objects(&mut p.content, lo.offset, usize::MAX);
                 for _ in lo.offset..len {
                     content_delete(&mut p.content, lo.offset);
                 }
@@ -1700,6 +1706,7 @@ impl Editor {
             // Take the remainder of the last paragraph (after hi.offset),
             // and its props for the section mark it may carry.
             let (remainder, last_props) = if let Some(Block::Paragraph(p)) = cont.get_mut(hii) {
+                drop_spanned_objects(&mut p.content, 0, hi.offset);
                 for _ in 0..hi.offset {
                     content_delete(&mut p.content, 0);
                 }
@@ -3643,6 +3650,37 @@ fn end_props(content: &[Inline]) -> RunProps {
         .unwrap_or_default()
 }
 
+/// Whether `raw` is a run holding a drawing or a positional tab (#768):
+/// zero-width in the editor, yet something a person put there, which a
+/// delete over it removes, as Word deletes the character it is. Other
+/// zero-width XML (bookmarks, content-control boundaries, comment ranges)
+/// stays.
+fn is_spanned_object(raw: &str) -> bool {
+    raw.starts_with("<w:r") && (raw.contains("<w:drawing") || raw.contains("<w:ptab"))
+}
+
+/// Remove the drawing and positional-tab runs a delete of `lo..hi` (caret
+/// offsets; `hi` past the end means to the end) spans: those strictly
+/// inside it, and one at an edge of the paragraph the range reaches (a
+/// picture first on its line goes with a delete from its start).
+fn drop_spanned_objects(content: &mut Vec<Inline>, lo: usize, hi: usize) {
+    let len: usize = content.iter().map(inline_len).sum();
+    if lo >= hi {
+        return;
+    }
+    let mut at = 0;
+    content.retain(|i| {
+        let p = at;
+        at += inline_len(i);
+        let Inline::Raw(raw) = i else {
+            return true;
+        };
+        let after_lo = p > lo || lo == 0;
+        let before_hi = p < hi || hi >= len;
+        !(is_spanned_object(raw) && after_lo && before_hi)
+    });
+}
+
 fn content_delete(content: &mut Vec<Inline>, idx: usize) {
     let mut acc = 0;
     for i in 0..content.len() {
@@ -4837,6 +4875,95 @@ mod tests {
         ed.anchor = Some(Caret::at(vec![0], start));
         ed.caret = Caret::at(vec![0], end);
         ed
+    }
+
+    const PTAB: &str =
+        "<w:r><w:ptab w:relativeTo=\"margin\" w:alignment=\"right\" w:leader=\"none\"/></w:r>";
+    const PICTURE: &str = "<w:r><w:drawing><wp:inline/></w:drawing></w:r>";
+    const BOOKMARK: &str = "<w:bookmarkStart w:id=\"0\" w:name=\"b\"/>";
+
+    fn raws(ed: &Editor, para: usize) -> Vec<String> {
+        let Block::Paragraph(p) = &ed.doc.body[para] else {
+            panic!("expected a paragraph");
+        };
+        p.content
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Raw(r) => Some(r.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #768: a picture or an alignment tab takes no caret offset, yet a
+    /// delete over it removes it, as Word deletes the character it is; a
+    /// bookmark there stays.
+    #[test]
+    fn a_delete_over_a_picture_or_ptab_removes_it_768() {
+        let content = || {
+            vec![
+                Inline::Raw(PICTURE.into()),
+                run("ab", RunProps::default()),
+                Inline::Raw(PTAB.into()),
+                Inline::Raw(BOOKMARK.into()),
+                run("cd", RunProps::default()),
+            ]
+        };
+        // Inside the range: "b|ptab|c".
+        let mut ed = selected(content(), 1, 3);
+        assert!(ed.delete_selection());
+        assert_eq!(raws(&ed, 0), [PICTURE, BOOKMARK]);
+        assert_eq!(etext(&ed), "ad");
+        // Undo brings it back.
+        assert!(ed.undo());
+        assert_eq!(raws(&ed, 0), [PICTURE, PTAB, BOOKMARK]);
+        // The whole line, a picture first on it included.
+        let mut ed = selected(content(), 0, 4);
+        assert!(ed.delete_selection());
+        assert_eq!(raws(&ed, 0), [BOOKMARK]);
+        // Selecting only the text before it, or after it, keeps it.
+        let mut ed = selected(content(), 0, 2);
+        ed.delete_selection();
+        assert_eq!(raws(&ed, 0), [PTAB, BOOKMARK]);
+        let mut ed = selected(content(), 2, 4);
+        ed.delete_selection();
+        assert_eq!(raws(&ed, 0), [PICTURE, PTAB, BOOKMARK]);
+    }
+
+    /// The same over paragraphs: the first's tail and the last's head go.
+    #[test]
+    fn a_delete_across_paragraphs_removes_the_objects_it_spans_768() {
+        let para = |content| {
+            Block::Paragraph(Paragraph {
+                props: ParProps::default(),
+                content,
+            })
+        };
+        let mut ed = Editor::new(Document {
+            body: vec![
+                para(vec![
+                    Inline::Raw(PICTURE.into()),
+                    run("ab", RunProps::default()),
+                    Inline::Raw(PTAB.into()),
+                ]),
+                para(vec![
+                    run("cd", RunProps::default()),
+                    Inline::Raw(PTAB.into()),
+                ]),
+                para(vec![
+                    Inline::Raw(PTAB.into()),
+                    run("ef", RunProps::default()),
+                    Inline::Raw(PICTURE.into()),
+                    run("g", RunProps::default()),
+                ]),
+            ],
+        });
+        ed.anchor = Some(Caret::at(vec![0], 1));
+        ed.caret = Caret::at(vec![2], 2);
+        assert!(ed.delete_selection());
+        assert_eq!(ed.doc.body.len(), 1);
+        assert_eq!(raws(&ed, 0), [PICTURE, PICTURE]);
+        assert_eq!(etext(&ed), "ag");
     }
 
     /// A preview copy shows the document as it is and edits apart from it
