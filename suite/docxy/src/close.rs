@@ -46,7 +46,7 @@ impl CloseStep {
 /// write while it was unsaved (`last_hot`). A window close comes here only
 /// for a tab answered Don't Save in its per-document questions (#630); a
 /// silent one keeps every tab as a tab (hot exit).
-fn should_keep_draft(
+pub(crate) fn should_keep_draft(
     kind: Kind,
     minutes: u32,
     keep: bool,

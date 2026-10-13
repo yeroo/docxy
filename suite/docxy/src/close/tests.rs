@@ -3729,3 +3729,344 @@ fn a_tab_stamp_changes_with_an_edit_only() {
     assert!(commit_project_cell(&mut project));
     assert_ne!(tab_stamp(&project), before);
 }
+
+// ---- Document Recovery (#1225) --------------------------------------------
+
+/// A crashed relaunch of `tabs` written to `root`: the restored tabs and the
+/// ones restore labelled as AutoRecover copies.
+fn recovery_restore(
+    root: &Root,
+    tabs: &mut [DocTab],
+) -> (Vec<DocTab>, Vec<crate::doc_recovery::Recovered>) {
+    assert!(autorecover_prepare(tabs));
+    write_session(&root.0, tabs, 0, prefs(), &[], 0);
+    restore_session_noting(
+        &root.session(),
+        true,
+        std::time::SystemTime::now(),
+        &crate::trusted::TrustStore::default(),
+    )
+}
+
+/// A document tab on a copy of basic.docx at `root/name`, with an unsaved
+/// `edit`.
+fn edited_doc(root: &Root, name: &str, edit: &str) -> (PathBuf, DocTab) {
+    let original = root.0.join(name);
+    basic_docx_at(&original);
+    let mut t = tab_from_path(&original);
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!("{}", t.status)
+    };
+    ed.insert_str(edit);
+    t.dirty = true;
+    (original, t)
+}
+
+/// A workbook tab on `path`, opened in `mode`, with an unsaved value in A1.
+fn edited_book(path: &std::path::Path, mode: OpenMode) -> DocTab {
+    let mut t = tab_from_path_mode(
+        &path.to_path_buf(),
+        mode,
+        &crate::trusted::TrustStore::default(),
+    )
+    .unwrap();
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!("{}", t.status)
+    };
+    v.sel = (0, 0);
+    v.anchor = (0, 0);
+    v.begin_cell_edit(Some("recovered 42".into()));
+    assert!(v.commit_edit());
+    t.dirty = true;
+    t
+}
+
+fn a1(t: &DocTab) -> String {
+    let Surface::Sheet(v) = &t.surface else {
+        panic!("not a sheet: {}", t.status)
+    };
+    v.edit_string(0, 0)
+}
+
+fn drafts_at(root: &Root, keep: bool) -> crate::doc_recovery::Drafts<'_> {
+    crate::doc_recovery::Drafts {
+        root: &root.0,
+        minutes: 10,
+        keep,
+        now: std::time::SystemTime::now(),
+    }
+}
+
+fn chosen(items: &[crate::doc_recovery::Candidate]) -> Vec<(usize, PathBuf)> {
+    items.iter().map(|c| (c.index, c.path.clone())).collect()
+}
+
+/// [`crate::doc_recovery::apply`] with no trusted files.
+fn recover_apply(
+    tabs: &mut [DocTab],
+    items: &[crate::doc_recovery::Candidate],
+    keep: &[bool],
+    drafts: &crate::doc_recovery::Drafts,
+) -> crate::doc_recovery::Applied {
+    crate::doc_recovery::apply(
+        tabs,
+        &chosen(items),
+        keep,
+        &crate::trusted::TrustStore::default(),
+        drafts,
+    )
+}
+
+fn recovery_items(
+    recovered: &[crate::doc_recovery::Recovered],
+    tabs: &[DocTab],
+) -> Vec<crate::doc_recovery::Candidate> {
+    crate::doc_recovery::candidates(recovered, tabs, std::time::SystemTime::now())
+}
+
+#[test]
+fn a_crash_restore_lists_recovered_documents_with_an_original() {
+    let root = Root::new("recovery-list");
+    let (original, t) = edited_doc(&root, "original.docx", "recover me");
+    let mut tabs = vec![tab(Kind::Docx), t];
+    let (restored, recovered) = recovery_restore(&root, &mut tabs);
+    let items = recovery_items(&recovered, &restored);
+    assert_eq!(items.len(), 1, "only the unsaved tab: {items:?}");
+    assert_eq!(items[0].index, 1);
+    assert_eq!(items[0].path, original);
+    let label = &items[0].label;
+    assert!(label.starts_with("original.docx — "), "{label}");
+    assert!(
+        label.contains(&root.0.display().to_string()),
+        "names the folder: {label}"
+    );
+    assert!(
+        label.ends_with("AutoRecover copy from less than a minute ago"),
+        "{label}"
+    );
+
+    // A clean exit restores the same tabs but recovers none: no dialog.
+    let (_, clean) = restore_session_noting(
+        &root.session(),
+        false,
+        std::time::SystemTime::now(),
+        &crate::trusted::TrustStore::default(),
+    );
+    assert!(clean.is_empty());
+}
+
+#[test]
+fn untitled_and_missing_originals_are_not_listed() {
+    let root = Root::new("recovery-unlisted");
+    let mut untitled = sample_doc().into_tab(Kind::Docx, "Document1".into(), None, false);
+    let Surface::Doc(ed) = &mut untitled.surface else {
+        panic!()
+    };
+    ed.insert_str("never saved");
+    untitled.dirty = true;
+    let (gone, t) = edited_doc(&root, "gone.docx", "orphan");
+    let mut tabs = vec![untitled, t];
+    assert!(autorecover_prepare(&mut tabs));
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
+    std::fs::remove_file(&gone).unwrap();
+    let (restored, recovered) = restore_session_noting(
+        &root.session(),
+        true,
+        std::time::SystemTime::now(),
+        &crate::trusted::TrustStore::default(),
+    );
+    assert_eq!(recovered.len(), 2, "both are AutoRecover copies");
+    let items = recovery_items(&recovered, &restored);
+    assert!(items.is_empty(), "{items:?}");
+    for t in &restored {
+        assert!(t.status.starts_with("recovered"), "{}", t.status);
+    }
+}
+
+#[test]
+fn unchecking_a_document_reopens_its_original() {
+    let root = Root::new("recovery-original");
+    let (original, t) = edited_doc(&root, "original.docx", "recover me");
+    let before = std::fs::read(&original).unwrap();
+    let mut tabs = vec![t];
+    let (mut restored, recovered) = recovery_restore(&root, &mut tabs);
+    let old_hot = root.session().tabs[0].hot.clone().expect("a sidecar");
+    let items = recovery_items(&recovered, &restored);
+    let applied = recover_apply(&mut restored, &items, &[false], &drafts_at(&root, true));
+    assert_eq!(applied.replaced, [0]);
+    assert!(!applied.drafts_kept, "a document keeps no draft");
+    let t = &restored[0];
+    assert!(!doc_text(t).contains("recover me"), "{}", doc_text(t));
+    assert!(!t.dirty);
+    assert_eq!(t.path.as_deref(), Some(original.as_path()));
+    assert_eq!(t.status.as_ref(), crate::doc_recovery::ORIGINAL_OPENED);
+    assert_eq!(std::fs::read(&original).unwrap(), before);
+
+    // The session written next no longer names the discarded copy.
+    write_session(&root.0, &restored, 0, prefs(), &[], 0);
+    let session = root.session();
+    assert!(!session.tabs[0].dirty);
+    assert_ne!(session.tabs[0].hot.as_deref(), Some(old_hot.as_str()));
+}
+
+#[test]
+fn checked_documents_keep_the_recovered_copy() {
+    let root = Root::new("recovery-keep");
+    let (_, t) = edited_doc(&root, "original.docx", "recover me");
+    let mut tabs = vec![t];
+    let (mut restored, recovered) = recovery_restore(&root, &mut tabs);
+    let status = restored[0].status.clone();
+    let items = recovery_items(&recovered, &restored);
+    let applied = recover_apply(&mut restored, &items, &[true], &drafts_at(&root, true));
+    assert_eq!(applied, Default::default());
+    assert!(doc_text(&restored[0]).contains("recover me"));
+    assert!(restored[0].dirty);
+    assert_eq!(restored[0].status, status);
+}
+
+#[test]
+fn a_tab_no_longer_dirty_or_with_another_path_is_skipped() {
+    let root = Root::new("recovery-skip");
+    let (_, a) = edited_doc(&root, "a.docx", "edit a");
+    let (_, b) = edited_doc(&root, "b.docx", "edit b");
+    let mut tabs = vec![a, b];
+    let (mut restored, recovered) = recovery_restore(&root, &mut tabs);
+    let items = recovery_items(&recovered, &restored);
+    assert_eq!(items.len(), 2);
+    // Saved meanwhile, and another file now in the other's place.
+    restored[0].dirty = false;
+    restored[1].path = Some(root.0.join("elsewhere.docx"));
+    let applied = recover_apply(
+        &mut restored,
+        &items,
+        &[false, false],
+        &drafts_at(&root, true),
+    );
+    assert!(applied.replaced.is_empty());
+    assert!(doc_text(&restored[0]).contains("edit a"));
+    assert!(doc_text(&restored[1]).contains("edit b"));
+}
+
+#[test]
+fn two_tabs_on_one_file_are_two_items() {
+    let root = Root::new("recovery-twice");
+    let (original, a) = edited_doc(&root, "shared.docx", "first window");
+    let mut b = tab_from_path(&original);
+    let Surface::Doc(ed) = &mut b.surface else {
+        panic!()
+    };
+    ed.insert_str("second window");
+    b.dirty = true;
+    let mut tabs = vec![a, b];
+    let (mut restored, recovered) = recovery_restore(&root, &mut tabs);
+    let items = recovery_items(&recovered, &restored);
+    assert_eq!(items.len(), 2, "{items:?}");
+    let applied = recover_apply(
+        &mut restored,
+        &items,
+        &[true, false],
+        &drafts_at(&root, true),
+    );
+    assert_eq!(applied.replaced, [1]);
+    assert!(doc_text(&restored[0]).contains("first window"));
+    assert!(restored[0].dirty);
+    assert!(!doc_text(&restored[1]).contains("second window"));
+    assert!(!restored[1].dirty);
+}
+
+#[test]
+fn an_unreadable_original_keeps_the_recovered_copy() {
+    let root = Root::new("recovery-unreadable");
+    let (doc, d) = edited_doc(&root, "original.docx", "recover me");
+    let book = root.0.join("book.xlsx");
+    basic_xlsx_at(&book);
+    let w = edited_book(&book, OpenMode::Normal);
+    let mut tabs = vec![d, w];
+    let (mut restored, recovered) = recovery_restore(&root, &mut tabs);
+    let items = recovery_items(&recovered, &restored);
+    assert_eq!(items.len(), 2);
+    // Both originals turn unreadable after the crash.
+    std::fs::write(&doc, b"not a zip").unwrap();
+    std::fs::write(&book, b"not a zip").unwrap();
+    let applied = recover_apply(
+        &mut restored,
+        &items,
+        &[false, false],
+        &drafts_at(&root, true),
+    );
+    assert!(applied.replaced.is_empty(), "{applied:?}");
+    assert!(!applied.drafts_kept, "nothing was discarded");
+    assert!(doc_text(&restored[0]).contains("recover me"));
+    assert_eq!(a1(&restored[1]), "recovered 42");
+    for t in &restored {
+        assert!(t.dirty);
+        assert!(
+            t.status
+                .starts_with("recovered — the original could not be opened"),
+            "{}",
+            t.status
+        );
+    }
+}
+
+#[test]
+fn a_repaired_workbook_reopens_in_repair_mode() {
+    let root = Root::new("recovery-repaired");
+    let scratch = crate::open_mode_tests::Scratch::new();
+    let damaged = crate::open_mode_tests::damaged_book(&scratch, "damaged.xlsx");
+    let w = edited_book(&damaged, OpenMode::Repair);
+    assert!(w.access.repaired);
+    let mut tabs = vec![w];
+    let (mut restored, recovered) = recovery_restore(&root, &mut tabs);
+    assert!(restored[0].access.repaired);
+    let items = recovery_items(&recovered, &restored);
+    let applied = recover_apply(&mut restored, &items, &[false], &drafts_at(&root, false));
+    assert_eq!(applied.replaced, [0], "{}", restored[0].status);
+    let t = &restored[0];
+    assert!(t.access.repaired);
+    assert_ne!(a1(t), "recovered 42");
+    assert!(!t.dirty);
+}
+
+#[test]
+fn a_discarded_workbook_keeps_its_draft() {
+    for keep in [true, false] {
+        let root = Root::new(&format!("recovery-draft-{keep}"));
+        let book = root.0.join("book.xlsx");
+        basic_xlsx_at(&book);
+        let mut tabs = vec![edited_book(&book, OpenMode::Normal)];
+        let (mut restored, recovered) = recovery_restore(&root, &mut tabs);
+        let items = recovery_items(&recovered, &restored);
+        let applied = recover_apply(&mut restored, &items, &[false], &drafts_at(&root, keep));
+        assert_eq!(applied.replaced, [0]);
+        assert_eq!(applied.drafts_kept, keep);
+        let drafts = crate::recover::list_drafts(&root.0, std::time::SystemTime::now(), &[]);
+        assert_eq!(drafts.len(), usize::from(keep), "keep={keep}: {drafts:?}");
+        assert_ne!(a1(&restored[0]), "recovered 42");
+    }
+}
+
+#[test]
+fn a_workbook_whose_draft_cannot_be_kept_keeps_its_copy() {
+    let root = Root::new("recovery-draft-error");
+    let book = root.0.join("book.xlsx");
+    basic_xlsx_at(&book);
+    let mut tabs = vec![edited_book(&book, OpenMode::Normal)];
+    let (mut restored, recovered) = recovery_restore(&root, &mut tabs);
+    // A file where the drafts folder goes: the draft cannot be written.
+    let dir = crate::recover::drafts_dir(&root.0);
+    std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+    std::fs::write(&dir, b"in the way").unwrap();
+    let items = recovery_items(&recovered, &restored);
+    let applied = recover_apply(&mut restored, &items, &[false], &drafts_at(&root, true));
+    assert!(applied.replaced.is_empty());
+    let t = &restored[0];
+    assert_eq!(a1(t), "recovered 42");
+    assert!(t.dirty);
+    assert!(
+        t.status
+            .starts_with("recovered — the original was not opened: draft not kept"),
+        "{}",
+        t.status
+    );
+}

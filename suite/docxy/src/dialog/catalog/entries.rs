@@ -769,6 +769,18 @@ dialogs! {
         accept_closes: true,
         unreachable: None,
     }
+    DOCUMENT_RECOVERY = "document-recovery" {
+        surface: Surface::Doc,
+        file: "doc-app",
+        fixture: DOCX,
+        open: &[],
+        fields: &[Field::other("documents", ControlKind::CheckList)],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: Some(
+            "it opens only on the relaunch after a crash, which a case cannot cause; uiharness/tests/autorecover.rs covers it",
+        ),
+    }
     ABOUT = "about" {
         surface: Surface::Doc,
         file: "doc-app",
