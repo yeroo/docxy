@@ -384,7 +384,8 @@ indent/outdent; Alt+Right/Left pan the Gantt and Alt+Home / Alt+End move it
 to the project start / finish, as in Project;
 Ctrl+Shift+L toggles leveling. Ctrl+F2 links the selected task (it opens
 the Predecessor prompt, as Task › Schedule › Link Tasks does) and
-Ctrl+Shift+F2 removes its links, as Project does. Ctrl+F, F3, Ctrl+Z/Y/S/E
+Ctrl+Shift+F2 removes its links, as Project does. Ctrl+D fills the selected
+range down (the row menu's Fill Down, #1213). Ctrl+F, F3, Ctrl+Z/Y/S/E
 retain find, repeat find,
 undo/redo, save, and export. The former bare-letter commands are available on
 the ribbon; letters now start cell edits.
@@ -405,13 +406,20 @@ keyboard Alt, P, B opens that menu, and B or L picks the item (#1212). Project
 one press.
 
 Right-clicking a task row's table cells selects the row and opens Project's
-row menu, in Project's order (#397): Cut, Copy, Paste, Scroll to Task, Insert
+row menu, in Project's order (#397); a right-click inside the selected range
+keeps the range and the cursor instead, and the menu's task items still act
+on the clicked row (#1213). Cut, Copy, Paste, Scroll to Task, Insert
 Task (a blank row above), Delete Task (the task whatever column the cursor is
 on; a summary asks first), Inactivate Task, Manually / Auto Schedule, Assign
 Resources... and Information... run their commands, and Hyperlink... opens the
-hyperlink prompt (below); Notes... opens the notes prompt (below); Paste Special..., Text
-Styles..., Font..., Fill Down, Clear Contents and Add to Timeline
-are drawn greyed until they exist. Right-clicking a task's Gantt bar (or
+hyperlink prompt (below); Notes... opens the notes prompt (below). Fill Down
+(also Ctrl+D) gives every shown row below the range's top row that row's value
+in each range column but ID, as one undo step, and keeps the range; a value
+that cannot apply cancels the whole fill, naming the cell. Clear Contents
+clears Name, Predecessors and Resource Names of the range or the cursor cell
+(all three on the ID column or a row-header range); it never deletes a task
+or resets another field. Paste Special..., Text Styles..., Font... and Add to
+Timeline are drawn greyed until they exist. Right-clicking a task's Gantt bar (or
 milestone diamond) selects the task and opens Project's bar menu (#1207):
 Information..., Notes... and Hyperlink... run the row menu's commands, and
 Format Bar Styles..., Format Bar... and Add to Timeline are drawn greyed.

@@ -29427,18 +29427,18 @@ impl Docxy {
     /// The active tab's selected task (`None` on the entry row) and cursor
     /// column, or `None` off a Project, for checking a menu still fits its
     /// target.
+    fn project_selection(&self) -> Option<(Option<i32>, usize)> {
+        match self.tabs.get(self.active).map(|t| &t.surface) {
+            Some(Surface::Project(v)) => Some((v.selected_uid(), v.col)),
+            _ => None,
+        }
+    }
+
     /// Whether the active Project's selected range holds task `uid`'s row.
     fn project_range_has(&self, uid: i32) -> bool {
         match self.tabs.get(self.active).map(|t| &t.surface) {
             Some(Surface::Project(v)) => v.selection().is_some_and(|s| s.uids.contains(&uid)),
             _ => false,
-        }
-    }
-
-    fn project_selection(&self) -> Option<(Option<i32>, usize)> {
-        match self.tabs.get(self.active).map(|t| &t.surface) {
-            Some(Surface::Project(v)) => Some((v.selected_uid(), v.col)),
-            _ => None,
         }
     }
 
@@ -29523,8 +29523,9 @@ impl Docxy {
     /// unless it lands inside the selected range, which it keeps with the
     /// cursor (#1213); then the row's menu opens for the clicked row either
     /// way. Over a kept range its task items select the clicked row before
-    /// they run (`menu_activate`); its range items act on the range. A commit the plan refuses keeps the
-    /// edit and its status, and no menu opens.
+    /// they run (`menu_activate`); its range items act on the range. A
+    /// commit the plan refuses keeps the edit and its status, and no menu
+    /// opens.
     pub(crate) fn open_row_menu(
         &mut self,
         row: usize,

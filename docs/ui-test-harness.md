@@ -1311,9 +1311,10 @@ range, as Cut, Copy and Paste do. The rest follow the row: Scroll to Task,
 Inactivate Task, Manually/Auto Schedule, Assign Resources..., Information...
 and Notes... need a real task, Delete Task any task row (a blank one too), and
 Cut, Copy, Paste and Insert Task any row, the entry row included. `checked`
-is the ribbon's pressed state (Inactivate Task, the task's mode). Delete Task
-deletes the selected task whatever column the cursor is on; a summary asks
-first, in the `delete-summary` dialog.
+is the clicked row's task state (Inactivate Task, its mode): the ribbon's
+pressed state, except over a kept range, where the cursor may be on another
+row. Delete Task deletes the row the menu was opened on, whatever column the
+cursor is on; a summary asks first, in the `delete-summary` dialog.
 
 - **the Header, Footer and Page Number drop-downs** (#641, #650), on Insert ›
   Header & Footer and on the contextual Header & Footer tab. Header and Footer
