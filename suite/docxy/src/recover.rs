@@ -112,7 +112,16 @@ pub(crate) fn reach<T>(attempt: Option<T>, alive: impl FnOnce() -> bool) -> Reac
 /// The age is relative ("12 min ago") rather than a clock time: the suite has
 /// no local-time-zone conversion, and a UTC clock time would read as wrong.
 pub(crate) fn recovered_status(saved: Option<SystemTime>, now: SystemTime) -> String {
-    let when = match saved.and_then(|s| now.duration_since(s).ok()) {
+    let when = recovered_age(saved, now);
+    format!(
+        "recovered — AutoRecover copy {when}; Save to keep it, or close without saving to discard"
+    )
+}
+
+/// How old an AutoRecover copy saved at `saved` is, as [`recovered_status`]
+/// and the Document Recovery list (#1225) say it: "from 12 min ago".
+pub(crate) fn recovered_age(saved: Option<SystemTime>, now: SystemTime) -> String {
+    match saved.and_then(|s| now.duration_since(s).ok()) {
         Some(age) if age < Duration::from_secs(60) => "from less than a minute ago".into(),
         Some(age) if age < Duration::from_secs(2 * 3600) => {
             format!("from {} min ago", age.as_secs() / 60)
@@ -122,10 +131,7 @@ pub(crate) fn recovered_status(saved: Option<SystemTime>, now: SystemTime) -> St
         }
         Some(age) => format!("from {} days ago", age.as_secs() / 86_400),
         None => "from the last session".into(),
-    };
-    format!(
-        "recovered — AutoRecover copy {when}; Save to keep it, or close without saving to discard"
-    )
+    }
 }
 
 /// Excel keeps an unsaved workbook's draft for four days.
@@ -340,6 +346,19 @@ mod tests {
         assert_eq!(next_choice(7), 10, "an odd hand-edited value moves up");
         assert_eq!(choice_label(0), "Off");
         assert_eq!(choice_label(10), "every 10 minutes");
+    }
+
+    #[test]
+    fn the_recovered_age_is_the_phrase_the_status_uses() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let saved = Some(now - Duration::from_secs(3 * 3600));
+        assert_eq!(recovered_age(saved, now), "from 3 h ago");
+        assert!(recovered_status(saved, now).contains("AutoRecover copy from 3 h ago;"));
+        assert_eq!(
+            recovered_age(Some(now - Duration::from_secs(3 * 86_400)), now),
+            "from 3 days ago"
+        );
+        assert_eq!(recovered_age(None, now), "from the last session");
     }
 
     #[test]
