@@ -445,8 +445,9 @@ table as the frame on screen drew it, or with `"frac": true`, fractions of
 its width and height. The pens read the geometry a frame drew with the pen
 on, so settle one (`shot window`) after turning a pen on and after each edit.
 A rectangle off every table draws a one-cell table after the paragraph it
-starts on (or the last one above it), never inside or before it, and a
-paragraph always follows the table; a drag inside a table draws a vertical
+starts on (or the last one above it on its page; above a page's first
+paragraph, before that one), never inside a paragraph or on an earlier page,
+and a paragraph always follows the table; a drag inside a table draws a vertical
 line, a line across a row or one on a row boundary; the eraser takes the line
 nearest the press. The reply is `{status, state}`; a refused gesture (the
 outer border, cells that do not line up) is an error with the reason, and a

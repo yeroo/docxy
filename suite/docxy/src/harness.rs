@@ -4689,6 +4689,7 @@ fn dispatch_verb(
         // after turning a pen on: the pens read the geometry it drew.
         // The press's own checks give the refusals (`draw_press`).
         "table-draw" => {
+            app.draw_tool().ok_or(crate::table_draw::NO_PEN)?;
             let (from, to) = table_draw_points(app, args)?;
             app.draw_press(from)?;
             app.draw_move(to);

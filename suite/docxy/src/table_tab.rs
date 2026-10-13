@@ -9,7 +9,9 @@
 //! Also here: the Insert > Table drop-down (the columns × rows hover grid and
 //! its items), the one menu a table command set shares with the Insert tab.
 use super::*;
-use crate::table_draw::{self, Drag, DrawMode, ERASER_STATUS, Gesture, PEN_STATUS, Tool};
+use crate::table_draw::{
+    self, Drag, DrawMode, ERASER_STATUS, Gesture, PEN_STATUS, ParaPlace, Tool,
+};
 use docxcore::editor::{AutoFitKind, BorderCmd};
 use docxcore::table_props::{TblLook, VAlign};
 use docxcore::table_styles::BUILTIN;
@@ -1028,7 +1030,15 @@ impl Docxy {
             let geom = self.draw_geom.borrow();
             let frame = geom.on_screen();
             let g = table_draw::classify(frame, d.hf, tool, d.from, d.to, self.zoom);
-            (g, frame.para_for(d.hf, d.from))
+            let pages: Vec<(f32, f32)> = self
+                .ruler_probe
+                .borrow()
+                .pages
+                .iter()
+                .flatten()
+                .map(|r| (r.y, r.y + r.h))
+                .collect();
+            (g, frame.para_for(d.hf, d.from, &pages))
         };
         if matches!(gesture, Gesture::Nothing) {
             cx.notify();
@@ -1111,21 +1121,26 @@ impl Docxy {
     }
 }
 
+/// A rectangle drawn on a page with no paragraph of its own to place it by.
+const NO_PARAGRAPH: &str = "there is no paragraph on this page to draw the table by";
+
 /// The status line after a pen is put away.
 const DRAW_OFF: &str = "Drawing off";
 
 /// Run a pen gesture on `ed`, one undo step; a new table goes after the
-/// top-level paragraph `para` (the one the rectangle was drawn from), never
-/// inside or before it, so it never splits a paragraph or joins a table.
-fn draw_on(ed: &mut Editor, gesture: Gesture, para: Option<usize>) -> Result<String, String> {
+/// top-level paragraph the rectangle was drawn from (or before the first
+/// paragraph of its page, drawn above it), never inside one, so it never
+/// splits a paragraph or joins a table (`para`, from `Frame::para_for`).
+fn draw_on(ed: &mut Editor, gesture: Gesture, para: Option<ParaPlace>) -> Result<String, String> {
     let mut result = Ok(String::new());
     match gesture {
         Gesture::Nothing => {}
         Gesture::Refused(why) => result = Err(why.to_string()),
         Gesture::NewTable { w_tw, h_tw } => ed.one_step("Draw Table", |e| {
             let drawn = match para {
-                Some(b) => e.draw_table_after(&[b], w_tw, h_tw),
-                None => e.draw_table(w_tw, h_tw),
+                Some(ParaPlace::After(b)) => e.draw_table_after(&[b], w_tw, h_tw),
+                Some(ParaPlace::Before(b)) => e.draw_table_before(&[b], w_tw, h_tw),
+                None => Err(NO_PARAGRAPH.into()),
             };
             result = drawn.map(|()| "Table drawn".into());
         }),

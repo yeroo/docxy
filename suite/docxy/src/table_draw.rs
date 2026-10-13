@@ -207,27 +207,57 @@ impl Frame {
             .max_by_key(|t| t.path.len())
     }
 
-    /// The top-level paragraph a new table drawn from `at` goes after: the
-    /// one under it, else the last one above it (in its column), else the
-    /// first one.
-    pub fn para_for(&self, hf: bool, (x, y): (f32, f32)) -> Option<usize> {
-        let paras = || self.paras.iter().filter(|p| p.hf == hf);
+    /// Where a new table drawn from `at` goes, among the top-level
+    /// paragraphs on the press's page (`pages`: each sheet's top and bottom;
+    /// none in Draft, which is one page): after the one under the press,
+    /// else after the last one above it (in its column, then in any), else
+    /// before the page's first. Never on an earlier page, which may be
+    /// another section's.
+    pub fn para_for(
+        &self,
+        hf: bool,
+        (x, y): (f32, f32),
+        pages: &[(f32, f32)],
+    ) -> Option<ParaPlace> {
+        let page_of = |y: f32| {
+            pages
+                .iter()
+                .position(|&(top, bottom)| y >= top && y < bottom)
+        };
+        let here = page_of(y);
+        let paras = || {
+            self.paras
+                .iter()
+                .filter(move |p| p.hf == hf && (pages.is_empty() || page_of(p.y) == here))
+        };
         let across = |p: &&ParaGeom| x >= p.x && x < p.x + p.w;
+        let last_above = |p: &&ParaGeom| p.y <= y;
         paras()
             .find(|p| across(p) && y >= p.y && y < p.y + p.h)
             .or_else(|| {
                 paras()
-                    .filter(|p| across(p) && p.y <= y)
+                    .filter(|p| across(p) && last_above(p))
                     .max_by(|a, b| a.y.total_cmp(&b.y))
             })
             .or_else(|| {
                 paras()
-                    .filter(|p| p.y <= y)
+                    .filter(last_above)
                     .max_by(|a, b| a.y.total_cmp(&b.y))
             })
-            .or_else(|| paras().min_by_key(|p| p.block))
-            .map(|p| p.block)
+            .map(|p| ParaPlace::After(p.block))
+            .or_else(|| {
+                paras()
+                    .min_by(|a, b| a.y.total_cmp(&b.y))
+                    .map(|p| ParaPlace::Before(p.block))
+            })
     }
+}
+
+/// Where a drawn table goes: after or before a top-level paragraph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParaPlace {
+    After(usize),
+    Before(usize),
 }
 
 /// The geometry of the frame on screen. The view rotates it as a frame
@@ -312,8 +342,9 @@ pub fn preview(d: Drag, in_table: bool) -> ((f32, f32), (f32, f32)) {
 /// What a pen or eraser gesture does.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Gesture {
-    /// A one-cell table of this size (twips), after the paragraph under the
-    /// press (or the last one above it): never inside or before it.
+    /// A one-cell table of this size (twips), placed by `Frame::para_for`:
+    /// after the paragraph under the press or the last one above it on its
+    /// page, or before the page's first, never inside a paragraph.
     NewTable {
         w_tw: u32,
         h_tw: u32,
@@ -817,7 +848,10 @@ mod tests {
         assert_eq!(f.story_at(true, (100.0, 300.0)), None);
         assert_eq!(f.story_at(true, (80.0, 110.0)), None, "a body table");
         // In the header, a new table goes after the header's paragraph.
-        assert_eq!(f.para_for(true, (100.0, 45.0)), Some(0));
+        assert_eq!(
+            f.para_for(true, (100.0, 45.0), &[]),
+            Some(ParaPlace::After(0))
+        );
         assert!(matches!(
             classify(&f, true, Tool::Pen, (80.0, 12.0), (200.0, 48.0), 1.0),
             Gesture::NewTable { .. }
@@ -827,11 +861,44 @@ mod tests {
     #[test]
     fn a_new_table_goes_after_the_paragraph_under_or_above_the_press() {
         let f = frame(vec![two_by_two()]);
-        assert_eq!(f.para_for(false, (100.0, 65.0)), Some(0));
-        assert_eq!(f.para_for(false, (100.0, 170.0)), Some(0), "above it");
-        assert_eq!(f.para_for(false, (100.0, 500.0)), Some(2));
-        assert_eq!(f.para_for(false, (100.0, 10.0)), Some(0), "the first");
-        assert_eq!(f.para_for(true, (100.0, 65.0)), None);
+        use ParaPlace::{After, Before};
+        assert_eq!(f.para_for(false, (100.0, 65.0), &[]), Some(After(0)));
+        assert_eq!(
+            f.para_for(false, (100.0, 170.0), &[]),
+            Some(After(0)),
+            "above it"
+        );
+        assert_eq!(f.para_for(false, (100.0, 500.0), &[]), Some(After(2)));
+        assert_eq!(
+            f.para_for(false, (100.0, 10.0), &[]),
+            Some(Before(0)),
+            "the first"
+        );
+        assert_eq!(f.para_for(true, (100.0, 65.0), &[]), None);
+    }
+
+    #[test]
+    fn a_new_table_never_goes_to_an_earlier_page() {
+        use ParaPlace::{After, Before};
+        // Page 1 spans y 0..300 (paragraphs 0 and 2), page 2 y 320..620
+        // (paragraph 5, from y 400).
+        let mut f = frame(vec![two_by_two()]);
+        f.paras.push(ParaGeom {
+            hf: false,
+            block: 5,
+            x: 50.0,
+            y: 400.0,
+            w: 600.0,
+            h: 20.0,
+        });
+        let pages = [(0.0, 300.0), (320.0, 620.0)];
+        // Page 2's top margin: before its first paragraph, not after page 1's
+        // last.
+        assert_eq!(f.para_for(false, (100.0, 340.0), &pages), Some(Before(5)));
+        assert_eq!(f.para_for(false, (100.0, 450.0), &pages), Some(After(5)));
+        assert_eq!(f.para_for(false, (100.0, 250.0), &pages), Some(After(2)));
+        // A page with no paragraph of its own takes none.
+        assert_eq!(f.para_for(false, (100.0, 700.0), &[(650.0, 950.0)]), None);
     }
 
     #[test]

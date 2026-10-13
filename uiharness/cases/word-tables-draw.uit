@@ -100,7 +100,8 @@ test the eraser merges the cells on either side of a line (763)
   assert table.vmerge.0.2 is none
 
 test a pen ends with another command, a tab switch or typing (763)
-  open copy:../fixtures/basic.docx
+  # A document no other case here opens, so its tab is found by name.
+  open copy:../fixtures/rulers.docx
   call ribbon-click {"tab":"Insert","command":"table"}
   call menu-click {"label":"Draw Table"}
   assert view.draw is pen
@@ -111,6 +112,15 @@ test a pen ends with another command, a tab switch or typing (763)
   assert view.draw is pen
   type x
   assert view.draw is null
+  # Another tab, then back: the pen stays put away.
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Draw Table"}
+  assert view.draw is pen
+  call tab-select {"tab":0}
+  assert view.draw is null
+  call tab-select {"tab":"rulers.docx"}
+  assert view.draw is null
+  call-error table-draw {"in":"table","from":[1,1],"to":[50,1]} => no table pen is on
 
 test a table drawn under a table goes after the paragraph between them (763)
   open copy:../fixtures/basic.docx
