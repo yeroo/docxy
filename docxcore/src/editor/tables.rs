@@ -83,6 +83,17 @@ enum TabTarget {
     Stay,
 }
 
+/// Where [`Editor::insert_built_table`] puts a table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Place<'a> {
+    /// At the caret, as Insert Table does.
+    Caret,
+    /// After the paragraph at this path, wherever the caret is.
+    After(&'a [usize]),
+    /// Before the paragraph at this path.
+    Before(&'a [usize]),
+}
+
 /// Every table a path passes through, outermost first.
 pub(crate) fn table_steps(body: &[Block], path: &[usize]) -> Vec<TablePos> {
     let mut out = Vec::new();
@@ -484,19 +495,31 @@ impl Editor {
             return Err("a table needs at least one row and one column".into());
         }
         let table = new_table(rows, cols, width_at(self), fit);
-        self.insert_built_table(table, false)
+        self.insert_built_table(table, Place::Caret)
     }
 
-    /// Put `table` at the caret as [`Editor::insert_table`] does: the
-    /// paragraph split, nesting, the following paragraph, placeholders,
-    /// revisions and the caret in the first cell. With `after`, it goes after
-    /// the caret's paragraph wherever the caret is in it. One undo step.
-    pub(super) fn insert_built_table(&mut self, table: Table, after: bool) -> Result<(), String> {
-        let path = self.caret.path.clone();
-        let Some(len) = resolve_para(&self.doc.body, &path).map(para_text_len) else {
-            return Err("the caret is not in a paragraph".into());
+    /// Put `table` where `place` says, as [`Editor::insert_table`] puts one
+    /// at the caret: the paragraph split, nesting, the following paragraph,
+    /// placeholders, revisions and the caret in the first cell. One undo
+    /// step, taken before anything moves, so undo puts the caret and the
+    /// selection back as they were.
+    pub(super) fn insert_built_table(&mut self, table: Table, place: Place) -> Result<(), String> {
+        let path = match place {
+            Place::Caret => self.caret.path.clone(),
+            Place::After(p) | Place::Before(p) => p.to_vec(),
         };
-        let off = self.caret.offset.min(len);
+        let Some(len) = resolve_para(&self.doc.body, &path).map(para_text_len) else {
+            return Err(match place {
+                Place::Caret => "the caret is not in a paragraph",
+                _ => "there is no paragraph there",
+            }
+            .into());
+        };
+        let (off, after) = match place {
+            Place::Caret => (self.caret.offset.min(len), false),
+            Place::After(_) => (len, true),
+            Place::Before(_) => (0, false),
+        };
         self.checkpoint(EditKind::Structural);
         self.anchor = None;
         // A table going into a placeholder is content: it shows no longer.

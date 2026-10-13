@@ -10,7 +10,7 @@
 
 use super::Editor;
 use super::table_layout::{After, add_rows_below, merge_range, set_dxa_width};
-use super::tables::{CellRange, width_at};
+use super::tables::{CellRange, Place, width_at, width_at_path};
 use crate::model::{Row, Table, VMerge};
 use crate::table::{
     AutoFit, GridMap, grid_xs, new_table, normalize_vmerge, refine_grid, repair_grid, template_cell,
@@ -61,8 +61,8 @@ impl Editor {
     /// Insert Table places one, with its row at least `height` twips high
     /// when that is above [`DRAW_MIN_HEIGHT`]. One undo step.
     pub fn draw_table(&mut self, width: u32, height: u32) -> Result<(), String> {
-        let table = self.drawn_table(width, height);
-        self.insert_built_table(table, false)
+        let table = self.drawn_table(width_at(self), width, height);
+        self.insert_built_table(table, Place::Caret)
     }
 
     /// [`Editor::draw_table`] after the paragraph at `para`, never inside or
@@ -75,18 +75,26 @@ impl Editor {
         width: u32,
         height: u32,
     ) -> Result<(), String> {
-        if super::resolve_para(&self.doc.body, para).is_none() {
-            return Err("there is no paragraph there".into());
-        }
-        self.caret = super::Caret::at(para.to_vec(), 0);
-        let table = self.drawn_table(width, height);
-        self.insert_built_table(table, true)
+        let table = self.drawn_table(width_at_path(self, para), width, height);
+        self.insert_built_table(table, Place::After(para))
     }
 
-    /// The one-cell table a rectangle `width`×`height` twips draws at the
-    /// caret.
-    fn drawn_table(&self, width: u32, height: u32) -> Table {
-        let w = width.clamp(DRAW_MIN_WIDTH, width_at(self).max(DRAW_MIN_WIDTH));
+    /// [`Editor::draw_table`] before the paragraph at `para`: a rectangle
+    /// drawn above a page's first paragraph.
+    pub fn draw_table_before(
+        &mut self,
+        para: &[usize],
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        let table = self.drawn_table(width_at_path(self, para), width, height);
+        self.insert_built_table(table, Place::Before(para))
+    }
+
+    /// The one-cell table a rectangle `width`×`height` twips draws where the
+    /// text is `room` twips wide.
+    fn drawn_table(&self, room: u32, width: u32, height: u32) -> Table {
+        let w = width.clamp(DRAW_MIN_WIDTH, room.max(DRAW_MIN_WIDTH));
         let mut table = new_table(1, 1, w, AutoFit::Fixed(Some(w)));
         if height > DRAW_MIN_HEIGHT {
             set_row_height(&mut table.rows[0], height, Some("atLeast"));
@@ -444,11 +452,15 @@ mod tests {
         let mut ed = Editor::new(Document {
             body: vec![para("hello"), para("world")],
         });
-        ed.caret = Caret::at(vec![1], 2);
+        // A selection in "world": undo puts it back as it was.
+        ed.anchor = Some(Caret::at(vec![1], 1));
+        ed.caret = Caret::at(vec![1], 4);
         ed.draw_table_after(&[0], 3000, 0).unwrap();
         assert!(matches!(ed.doc.body[1], Block::Table(_)));
         assert_eq!(ed.doc.body.len(), 3, "world follows; nothing split");
         assert!(ed.undo());
+        assert_eq!(ed.caret, Caret::at(vec![1], 4), "undo restores the caret");
+        assert_eq!(ed.anchor, Some(Caret::at(vec![1], 1)), "and the anchor");
         assert!(!ed.undo(), "one undo step");
         assert!(ed.draw_table_after(&[7], 3000, 0).is_err());
         assert!(!ed.undo());
@@ -493,6 +505,28 @@ mod tests {
             assert!(!ed.undo(), "{text:?}: one undo step");
             assert_eq!(ed.doc, original, "{text:?}: undo restores it exactly");
         }
+    }
+
+    #[test]
+    fn a_table_drawn_before_a_paragraph_goes_before_it_whole() {
+        let mut ed = Editor::new(Document {
+            body: vec![para("one"), para("two")],
+        });
+        ed.caret = Caret::at(vec![0], 2);
+        ed.draw_table_before(&[1], 3000, 600).unwrap();
+        let kinds: Vec<bool> = ed
+            .doc
+            .body
+            .iter()
+            .map(|b| matches!(b, Block::Table(_)))
+            .collect();
+        assert_eq!(kinds, [false, true, false]);
+        assert_eq!(ed.doc.body[2].plain_text(), "two", "nothing split");
+        assert_eq!(ed.caret.path, vec![1, 0, 0, 0]);
+        assert!(ed.undo());
+        assert_eq!(ed.caret, Caret::at(vec![0], 2));
+        assert!(!ed.undo());
+        assert!(ed.draw_table_before(&[9], 3000, 600).is_err());
     }
 
     #[test]
