@@ -845,7 +845,7 @@ impl Docxy {
             self.table_grid_hover = at;
             match at {
                 Some((cols, rows)) => self.set_doc_preview(PreviewKind::Grid { cols, rows }),
-                None => self.drop_doc_preview(PreviewKind::is_grid),
+                None => self.drop_grid_preview(),
             }
             cx.notify();
         }
@@ -1347,12 +1347,6 @@ pub(crate) enum PreviewKind {
     Style(usize),
 }
 
-impl PreviewKind {
-    pub(crate) fn is_grid(self) -> bool {
-        matches!(self, PreviewKind::Grid { .. })
-    }
-}
-
 /// A live preview (#764): the document as a hovered command would leave
 /// it, drawn in place of the real one and never saved. It holds the
 /// document it was built from (the tab, the edit generation, the caret and
@@ -1487,9 +1481,14 @@ impl Docxy {
         })
     }
 
-    /// Drop the live preview when `kind` holds for its kind.
-    pub(crate) fn drop_doc_preview(&mut self, kind: impl Fn(PreviewKind) -> bool) {
-        if self.doc_preview.as_ref().is_some_and(|p| kind(p.kind)) {
+    /// Drop the live preview when it is the Insert > Table grid's; a Table
+    /// Styles one belongs to the ribbon, not to the menu.
+    pub(crate) fn drop_grid_preview(&mut self) {
+        if self
+            .doc_preview
+            .as_ref()
+            .is_some_and(|p| matches!(p.kind, PreviewKind::Grid { .. }))
+        {
             self.doc_preview = None;
         }
     }

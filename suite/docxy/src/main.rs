@@ -30127,7 +30127,7 @@ impl Docxy {
         // The Insert > Table grid forgets the pointer with its menu, and its
         // live preview (#764) goes with it.
         self.table_grid_hover = None;
-        self.drop_doc_preview(table_tab::PreviewKind::is_grid);
+        self.drop_grid_preview();
         self.menu.take().is_some()
     }
 
