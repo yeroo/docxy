@@ -276,6 +276,9 @@ fn commit_changed_cell(tab: &mut DocTab) -> Result<(), String> {
             crate::bump_edit_generation();
             v.anchor = v.sel;
             v.clear_areas();
+            // A circle the entry made is warned about after Save's own
+            // status (#759).
+            tab.note_new_circles();
         }
     }
     Ok(())

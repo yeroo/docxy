@@ -207,8 +207,17 @@ fn reopen_on_top(tab: Option<&DocTab>) -> bool {
         .is_some_and(|d| matches!(d.owner, DialogOwner::Reopen { .. }))
 }
 
-/// Press a button on the tab's top dialog, by its label.
+/// Press a button on the tab's top dialog, by its label. A press that made
+/// a new circular reference (Consolidate's links, Subtotal, a sort, a typed
+/// entry the validation alert lets in) warns after the dialog's own status.
 pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String> {
+    let begun = tab.circle_cmd_begin();
+    let done = dialog_press(tab, button);
+    tab.circle_cmd_end(begun);
+    done
+}
+
+fn dialog_press(tab: &mut DocTab, button: &str) -> Result<(), String> {
     // A levelling pass asked for first runs first, as before any edit.
     flush_level_pass(tab);
     // Text to Columns asks its own question before it applies.

@@ -16,7 +16,8 @@ data class GridCell(
  * Parsed gridwasm viewport JSON (see `gridwasm::Session::view_json`): sheet
  * list, used extent, visible column widths, the window's non-blank cells,
  * selection, active-cell state, dirty flag, the `edits` mutation counter,
- * and the one-shot `err`/`copied` fields.
+ * the first circular reference while circles are shown (`circular`), and
+ * the one-shot `err`/`copied` fields.
  *
  * The window coordinates themselves are NOT echoed — the host remembers what
  * it requested.
@@ -36,6 +37,7 @@ class GridViewModel(json: String) {
     val curAlign: Char
     val dirty: Boolean
     val edits: Long
+    val circular: String?
     val err: String?
     val copied: String?
 
@@ -87,9 +89,13 @@ class GridViewModel(json: String) {
 
         dirty = root["dirty"] == true
         edits = root["edits"] as? Long ?: 0L
+        circular = root["circular"] as? String
         err = root["err"] as? String
         copied = root["copied"] as? String
     }
+
+    /** Excel's status-bar note while a circular reference exists, or null. */
+    val circularNote: String? get() = circular?.let { "Circular References: $it" }
 
     /** The active cell (from `cur.ref`), 0-based. */
     val curR: Int get() = refToRc(curRef).first

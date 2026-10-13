@@ -36,6 +36,7 @@ mod validationdlg;
 use backstage::BackstageHost as _;
 
 use gridcore::autocorrect::{AutoCorrect, Correction};
+use gridcore::circular::CIRCULAR_WARNING;
 use gridcore::comments::Comment;
 use gridcore::docprops::{CustomProperty, CustomValue, DocProperties};
 use gridcore::edit::{FillDir, fill_changes, replace_all_in_sheet};
@@ -1831,9 +1832,6 @@ struct FormatDialog {
 const WRITE_REFUSED: &str =
     "Can't add that here: this sheet's XML is damaged where it would go (nothing changed)";
 
-/// Excel's warning when an edit creates a circular reference.
-const CIRCULAR_WARNING: &str = "There are one or more circular references where a formula refers to its own cell either directly or indirectly. This might cause them to calculate incorrectly.";
-
 /// The Format Cells section tabs.
 const FMT_SECTIONS: &[&str] = &["Number", "Font", "Fill", "Align", "Border"];
 
@@ -2222,7 +2220,7 @@ impl App {
         let comments = pkg.comments();
         // Excel warns about a workbook's circular references when it opens
         // (not when iterative calculation is on: the circles are intended).
-        let status = (pkg.workbook.iterate.is_none() && !engine.circular_refs().is_empty())
+        let status = gridcore::circular::circles_shown(&engine, &pkg.workbook)
             .then(|| CIRCULAR_WARNING.to_string());
         // A workbook opens on the sheet it was saved on.
         let pkg_active_tab = pkg
@@ -3057,7 +3055,7 @@ impl App {
     /// enables iterative calculation, where Excel treats them as intended.
     /// `wb.path.circular` lists them either way.
     fn circles_shown(&self) -> bool {
-        self.pkg.workbook.iterate.is_none() && !self.engine.circular_refs().is_empty()
+        gridcore::circular::circles_shown(&self.engine, &self.pkg.workbook)
     }
 
     /// Add a cell or structural edit's pending circle warning to the status
@@ -3075,27 +3073,7 @@ impl App {
     /// The cells on circular references as A1 refs: bare on the active
     /// sheet, `Sheet!A1` elsewhere. Active-sheet cells come first.
     pub(crate) fn circular_refs(&self) -> Vec<String> {
-        let refs = self.engine.circular_refs();
-        let name = |&(s, r, c): &(usize, u32, u32)| {
-            if s == self.sheet {
-                cell_name(r, c)
-            } else {
-                let sheet = self
-                    .pkg
-                    .workbook
-                    .sheets
-                    .get(s)
-                    .map(|sh| sh.name.as_str())
-                    .unwrap_or_default();
-                format!(
-                    "{}!{}",
-                    gridcore::sheet::quote_sheet_name(sheet),
-                    cell_name(r, c)
-                )
-            }
-        };
-        let (here, elsewhere): (Vec<_>, Vec<_>) = refs.iter().partition(|k| k.0 == self.sheet);
-        here.iter().chain(elsewhere.iter()).map(name).collect()
+        gridcore::circular::circular_ref_names(&self.engine, &self.pkg.workbook, self.sheet)
     }
 
     /// Snapshot-run-snapshot for an edit to page layout (page setup, print
@@ -9831,7 +9809,9 @@ fn draw_screen(app: &mut App, f: &mut Frame) {
     }
     // Excel's persistent status-bar note while any circle exists (none with
     // iterative calculation on).
-    if let Some(first) = app.circular_refs().first().filter(|_| app.circles_shown()) {
+    if let Some(first) =
+        gridcore::circular::first_circular_ref(&app.engine, &app.pkg.workbook, app.sheet)
+    {
         tab_spans_ui.push(RSpan::styled(
             format!(" Circular References: {first} "),
             Style::new().fg(Color::Black).bg(Color::Yellow),
@@ -15786,6 +15766,43 @@ mod tests {
         click(&mut app, g.x + 1, col_line);
         assert!(!app.sheet().col_hidden(1));
     }
+    #[test]
+    fn filter_survives_save_and_reopen() {
+        // #759: the in-app filter saves its `<autoFilter>`, so the rows it hid
+        // reopen filter-hidden, not hidden by hand.
+        use gridcore::sheet::Cell;
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        {
+            let sh = &mut app.pkg.workbook.sheets[0];
+            sh.set_cell(0, 0, Cell::text("Item"));
+            sh.set_cell(0, 1, Cell::text("Qty"));
+            for (i, (name, qty)) in [("A", 300.0), ("B", 50.0), ("C", 900.0)].iter().enumerate() {
+                sh.set_cell(i as u32 + 1, 0, Cell::text(name));
+                sh.set_cell(i as u32 + 1, 1, Cell::number(*qty));
+            }
+        }
+        app.rebuild_engine();
+        app.cur = (1, 1);
+        app.anchor = None;
+        app.ribbon_act(ribbon::Act::Filter);
+        // Qty's drop-down › Number Filters, then the condition.
+        app.cur = (0, 1);
+        assert!(app.open_filter_picker());
+        app.filter_picker.as_mut().unwrap().sel = 3;
+        app.filter_picker_key(KeyCode::Enter);
+        app.prompt = None;
+        app.commit_custom_filter(">100");
+        assert!(app.sheet().row_filtered(2));
+
+        let saved = load_xlsx(&app.package_bytes()).unwrap();
+        let ws = String::from_utf8_lossy(saved.part("xl/worksheets/sheet1.xml").unwrap());
+        assert!(ws.contains("<autoFilter ref=\"A1:B4\">"), "{ws}");
+        let sh = &saved.workbook.sheets[0];
+        assert!(sh.row_hidden(2) && sh.row_filtered(2));
+        assert!(!sh.row_hidden(1) && !sh.row_hidden(3));
+    }
+
     #[test]
     fn filter_commands_hide_rows_as_filtered() {
         use gridcore::sheet::{Cell, CellValue};

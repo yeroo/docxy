@@ -290,6 +290,14 @@
       requestView();
     });
     bar.appendChild(add);
+    // Excel's status-bar note while a circular reference exists (the wasm
+    // side leaves `circular` out with iterative calculation on).
+    if (view.circular) {
+      const note = document.createElement('span');
+      note.className = 'circular';
+      note.textContent = 'Circular References: ' + view.circular;
+      bar.appendChild(note);
+    }
     $('tabs').replaceChildren(bar);
   }
 

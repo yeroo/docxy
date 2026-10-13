@@ -448,6 +448,36 @@ mod tests {
     }
 
     #[test]
+    fn consolidate_links_that_make_a_circle_warn() {
+        // #759: East's A reads the Summary cell that links back to it, so
+        // OK's links close a circle: the warning follows OK's own status.
+        let mut t = book();
+        view(&mut t).pkg.workbook.sheets[0].set_cell(1, 1, Cell::formula("Summary!C2"));
+        let v = view(&mut t);
+        v.engine = crate::sheet_engine(&v.pkg.workbook);
+        v.engine.recalc_all(&mut v.pkg.workbook);
+        t.status = "before".into();
+        open(&mut t);
+        add(&mut t, "East!A1:B3");
+        add(&mut t, "West!A1:B3");
+        set(&mut t, "top", Json::Bool(true));
+        set(&mut t, "left", Json::Bool(true));
+        set(&mut t, "links", Json::Bool(true));
+        press(&mut t, "OK").unwrap();
+        let s = &view(&mut t).pkg.workbook.sheets[2];
+        assert_eq!(
+            s.cell(1, 2).and_then(|c| c.formula.clone()).as_deref(),
+            Some("East!$B$2")
+        );
+        let status = t.status.to_string();
+        assert!(status.starts_with("Consolidated into "), "{status}");
+        assert!(
+            status.ends_with(&format!(". {}", gridcore::circular::CIRCULAR_WARNING)),
+            "{status}"
+        );
+    }
+
+    #[test]
     fn consolidate_ok_writes_and_is_one_undo_step() {
         let mut t = book();
         open(&mut t);

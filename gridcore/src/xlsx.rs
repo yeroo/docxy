@@ -13090,6 +13090,36 @@ b",
         assert_eq!(got, vec![CellValue::Number(870.0)]);
     }
 
+    #[test]
+    fn rehidden_filtered_row_counts_as_hand_hidden() {
+        // #759: a filtered row unhid and hidden again, by hand or by an
+        // outline collapse, counts in SUBTOTAL(9) and not in SUBTOTAL(109).
+        // East filters out Bob (row 3), Di (5), Fa (7), Hu (9); Ed is hand-hidden.
+        let formulas = r#"<row r="1"><c r="A1"><f>SUBTOTAL(9,Sheet1!C2:C9)</f><v>0</v></c><c r="B1"><f>SUBTOTAL(109,Sheet1!C2:C9)</f><v>0</v></c></row>"#;
+        let mut pkg = load_xlsx(&filter_fixture(EAST_FILTER, formulas, false)).unwrap();
+        let got = recalc_values(&mut pkg, 1, &["A1", "B1"]);
+        assert_eq!(
+            got,
+            vec![CellValue::Number(850.0), CellValue::Number(690.0)]
+        );
+        let s = &mut pkg.workbook.sheets[0];
+        // Bob (20): unhidden, then hidden by hand.
+        s.set_row_hidden(2, false);
+        s.set_row_hidden(2, true);
+        assert!(s.row_hidden(2) && !s.row_filtered(2));
+        // Di (80): unhidden, then hidden by collapsing an outline group.
+        s.set_row_hidden(4, false);
+        crate::outline::group(s, crate::outline::Axis::Rows, 4, 4).unwrap();
+        let g = crate::outline::groups(s, crate::outline::Axis::Rows);
+        crate::outline::collapse_group(s, crate::outline::Axis::Rows, &g[0]);
+        assert!(s.row_hidden(4) && !s.row_filtered(4));
+        let got = recalc_values(&mut pkg, 1, &["A1", "B1"]);
+        assert_eq!(
+            got,
+            vec![CellValue::Number(950.0), CellValue::Number(690.0)]
+        );
+    }
+
     /// Rows 1..=n with A holding 3, 9, 1, 7, 5, 2, 8 (the first `n`), and
     /// `anchor` appended to row 1.
     fn sort_anchor_rows(n: usize, anchor: &str) -> String {

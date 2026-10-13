@@ -193,6 +193,16 @@ impl Engine {
         self.circular.iter().copied().collect()
     }
 
+    /// [`Engine::circular_refs`] without collecting them.
+    pub fn circular_keys(&self) -> impl Iterator<Item = Key> + Clone + '_ {
+        self.circular.iter().copied()
+    }
+
+    /// Whether any cell is on a circular reference.
+    pub fn has_circles(&self) -> bool {
+        !self.circular.is_empty()
+    }
+
     /// Is this cell's formula beyond the engine (kept on its cached value)?
     pub fn is_unsupported(&self, key: Key) -> bool {
         self.unsupported.contains(&key)
