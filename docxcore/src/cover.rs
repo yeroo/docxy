@@ -435,39 +435,9 @@ pub fn typed_placeholders(blocks: &[Block]) -> Typed {
         .collect()
 }
 
-/// Every content control `w:id` in `xml` (a part, or serialized blocks).
-pub fn sdt_ids(xml: &str) -> Vec<i64> {
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some(at) = rest.find("<w:id ") {
-        rest = &rest[at..];
-        let end = rest.find('>').unwrap_or(rest.len());
-        if let Some(v) = crate::load::xml_attr_value(&rest[..end], "w:val") {
-            // Word's ids are signed 32-bit; anything else cannot meet ours.
-            if let Ok(n) = v.trim().parse::<i32>() {
-                out.push(i64::from(n));
-            }
-        }
-        rest = &rest[end..];
-    }
-    out
-}
-
-/// `n` content-control ids none of `used` holds: the ones after the largest,
-/// else (that would pass Word's signed 32-bit range) the smallest free
-/// positive ones.
-pub fn free_sdt_ids(used: &[i64], n: usize) -> Vec<i64> {
-    let max = used.iter().copied().max().unwrap_or(0).max(0);
-    let count = i64::try_from(n).unwrap_or(i64::MAX);
-    if max
-        .checked_add(count)
-        .is_some_and(|last| last <= i64::from(i32::MAX))
-    {
-        return (1..=count).map(|k| max + k).collect();
-    }
-    let taken: std::collections::HashSet<i64> = used.iter().copied().collect();
-    (1..).filter(|k| !taken.contains(k)).take(n).collect()
-}
+/// The content-control id allocator, shared with the document property
+/// controls (#768).
+pub use crate::sdt::{free_sdt_ids, sdt_ids};
 
 #[cfg(test)]
 pub(crate) mod tests;

@@ -80,34 +80,46 @@ impl CoreProp {
     }
 }
 
-/// The next free content-control id over every story's XML in `xmls`: one
-/// past the largest magnitude of any `w:id` a control there has, Word's
-/// negative ids included (Word keeps them unique
-/// across the document and its headers and footers). The id is an
-/// `xsd:int`: past `i32::MAX`, the smallest positive id not in use.
-pub fn next_control_id<'a>(xmls: impl IntoIterator<Item = &'a str>) -> i64 {
-    let mut used = std::collections::BTreeSet::new();
-    for xml in xmls {
-        let mut from = 0;
-        while let Some(at) = xml[from..].find("<w:id ").map(|i| from + i) {
-            from = at + 6;
-            let end = xml[at..].find('>').map_or(xml.len(), |e| at + e);
-            if let Some(v) = crate::load::xml_attr_value(&xml[at..end], "w:val") {
-                used.insert(v.trim().parse::<i64>().unwrap_or(0));
+/// Every content control `w:id` in `xml` (a part, or serialized blocks).
+pub fn sdt_ids(xml: &str) -> Vec<i64> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(at) = rest.find("<w:id ") {
+        rest = &rest[at..];
+        let end = rest.find('>').unwrap_or(rest.len());
+        if let Some(v) = crate::load::xml_attr_value(&rest[..end], "w:val") {
+            // Word's ids are signed 32-bit; anything else cannot meet ours.
+            if let Ok(n) = v.trim().parse::<i32>() {
+                out.push(i64::from(n));
             }
         }
+        rest = &rest[end..];
     }
-    let next = used
-        .iter()
-        .map(|v| v.unsigned_abs())
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .filter(|n| *n <= i32::MAX as u64);
-    match next {
-        Some(n) => n as i64,
-        None => (1..).find(|i| !used.contains(i)).unwrap_or(1),
+    out
+}
+
+/// `n` content-control ids none of `used` holds: the ones after the largest,
+/// else (that would pass Word's signed 32-bit range) the smallest free
+/// positive ones.
+pub fn free_sdt_ids(used: &[i64], n: usize) -> Vec<i64> {
+    let max = used.iter().copied().max().unwrap_or(0).max(0);
+    let count = i64::try_from(n).unwrap_or(i64::MAX);
+    if max
+        .checked_add(count)
+        .is_some_and(|last| last <= i64::from(i32::MAX))
+    {
+        return (1..=count).map(|k| max + k).collect();
     }
+    let taken: std::collections::HashSet<i64> = used.iter().copied().collect();
+    (1..).filter(|k| !taken.contains(k)).take(n).collect()
+}
+
+/// A content-control id no control in any story's XML in `xmls` has (Word
+/// keeps them unique across the document and its headers and footers):
+/// [`free_sdt_ids`] over their [`sdt_ids`].
+pub fn next_control_id<'a>(xmls: impl IntoIterator<Item = &'a str>) -> i64 {
+    let used: Vec<i64> = xmls.into_iter().flat_map(sdt_ids).collect();
+    free_sdt_ids(&used, 1).first().copied().unwrap_or(1)
 }
 
 /// An inline document property control for `prop`, bound to it, with
@@ -229,11 +241,11 @@ mod tests {
     }
 
     #[test]
-    fn control_ids_are_one_past_the_largest_magnitude() {
+    fn control_ids_are_one_past_the_largest_in_any_story() {
         assert_eq!(next_control_id([]), 1);
         let a = "<w:sdtPr><w:id w:val=\"-1311087653\"/></w:sdtPr>";
         let b = "<w:sdtPr><w:id w:val=\"12\"/></w:sdtPr><w:footnote w:id=\"99999999999\"/>";
-        assert_eq!(next_control_id([a, b]), 1_311_087_654);
+        assert_eq!(next_control_id([a, b]), 13);
         let full = "<w:id w:val=\"2147483647\"/><w:id w:val=\"1\"/>";
         assert_eq!(next_control_id([full]), 2);
         // FIX r2 m3: the i64 extremes neither overflow nor become the id.

@@ -1629,7 +1629,9 @@ impl App {
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_default(),
-            path: path.to_string(),
+            // FILENAME \p shows the full path, whatever path the app was given.
+            path: std::path::absolute(path)
+                .map_or_else(|_| path.to_string(), |p| p.display().to_string()),
         };
         let mut doc = pkg.document.clone();
         if protection::authorize(&doc_protection, protection::MutationKind::Content).is_ok() {
