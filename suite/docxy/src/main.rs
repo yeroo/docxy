@@ -29511,7 +29511,8 @@ impl Docxy {
 
     /// A right-click on a Project row's table (row `row` in task order; past
     /// the last task, the entry row), and `menu-open {"row"}`. The press
-    /// selects the row as a left click does, committing an open cell edit;
+    /// selects the row as a left click does, committing an open cell edit,
+    /// unless it lands inside the selected range, which it keeps (#1213);
     /// then the row's menu opens for it. A commit the plan refuses keeps the
     /// edit and its status, and no menu opens.
     pub(crate) fn open_row_menu(
@@ -29522,7 +29523,7 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        let v = self.press_project_row(row, col, window, cx)?;
+        let v = self.press_project_row(row, col, true, window, cx)?;
         let target = menu::MenuTarget::Row(v.selected_uid());
         let items = project_row_menu(v);
         self.open_menu(target, at, items, cx);
@@ -29554,7 +29555,7 @@ impl Docxy {
                 None => "no task at that row has a bar".into(),
             });
         };
-        let v = self.press_project_row(row, None, window, cx)?;
+        let v = self.press_project_row(row, None, false, window, cx)?;
         // The commit may have changed the plan: the menu is for the task
         // whose bar was pressed, and only while it still has one.
         if v.selected_uid() != Some(uid) || bar_uid(v) != Some(uid) {
@@ -29588,12 +29589,14 @@ impl Docxy {
 
     /// The press a row or bar menu opens with: select row `row` of the
     /// active Project as a left click does (on column `col`, if any),
-    /// committing an open cell edit, and refocus. A commit the plan refuses
-    /// keeps the edit and its status, and is the error.
+    /// committing an open cell edit, and refocus; a row menu's press inside
+    /// the selected range keeps it (`project_row_menu_press`). A commit the
+    /// plan refuses keeps the edit and its status, and is the error.
     fn press_project_row(
         &mut self,
         row: usize,
         col: Option<usize>,
+        keep_range: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<&ProjectView, String> {
@@ -29604,7 +29607,11 @@ impl Docxy {
                 // older row.
                 v.drag_made_range = false;
             }
-            crate::project_row_click(tab, row, col, false);
+            if keep_range {
+                crate::project_row_menu_press(tab, row, col);
+            } else {
+                crate::project_row_click(tab, row, col, false);
+            }
         })
     }
 

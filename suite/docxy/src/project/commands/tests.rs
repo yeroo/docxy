@@ -3821,19 +3821,27 @@ fn the_row_menu_enables_by_the_row_under_the_cursor() {
         "Manually Schedule",
         "Auto Schedule",
         "Assign Resources...",
+        "Clear Contents",
         "Information...",
         "Notes...",
         "Hyperlink...",
     ];
     assert_eq!(enabled_items(&t), all_task);
-    // A blank row can be inserted above and deleted, not scheduled.
+    // A blank row can be inserted above, deleted and cleared, not scheduled.
     let blank = v(&t).ed.project().tasks.len();
     vm(&mut t).ed.insert_blank_row(None).unwrap();
     vm(&mut t).ed.select(blank);
     assert!(v(&t).selected_uid().is_some());
     assert_eq!(
         enabled_items(&t),
-        ["Cut", "Copy", "Paste", "Insert Task", "Delete Task"]
+        [
+            "Cut",
+            "Copy",
+            "Paste",
+            "Insert Task",
+            "Delete Task",
+            "Clear Contents"
+        ]
     );
     // The entry row has no task to delete.
     vm(&mut t).enter_entry_row();
@@ -4472,4 +4480,308 @@ fn a_placeholder_has_no_state() {
     let mut t = crate::blank_docx_tab("p");
     t.surface = Surface::Placeholder;
     assert_eq!(tab_app_state(&t, false), None);
+}
+
+/// Three tasks, First (1 day), Second (2 days) and Third (3 days), the
+/// cursor on First's Name.
+fn fill_tab() -> DocTab {
+    let mut t = new_project_tab("Project1");
+    for (name, duration) in [("First", 480), ("Second", 960), ("Third", 1440)] {
+        vm(&mut t).ed.add_task(None, name, duration, false).unwrap();
+    }
+    let p = v(&t).ed.project().clone();
+    t.surface = Surface::Project(ProjectView::new(p, false));
+    vm(&mut t).ed.select(0);
+    vm(&mut t).col = COL_NAME;
+    t
+}
+
+/// A range from (`from_row`, `from_col`) to the cursor at (`to_row`,
+/// `to_col`), rows in task order, as Shift+arrows make it.
+fn range(t: &mut DocTab, from_row: usize, from_col: usize, to_row: usize, to_col: usize) {
+    let v = vm(t);
+    v.entry = false;
+    v.anchor = Some((v.ed.project().tasks[from_row].uid, from_col));
+    v.row_header = false;
+    v.ed.select(to_row);
+    v.col = to_col;
+}
+
+fn names(t: &DocTab) -> Vec<String> {
+    v(t).ed
+        .project()
+        .tasks
+        .iter()
+        .map(|t| t.name.clone())
+        .collect()
+}
+
+fn durations(t: &DocTab) -> Vec<i64> {
+    v(t).ed
+        .project()
+        .tasks
+        .iter()
+        .map(|t| t.duration_min)
+        .collect()
+}
+
+/// #1213: Fill Down needs a range of two shown rows over a column other than
+/// ID; Clear Contents follows the row, as Delete Task does.
+#[test]
+fn row_menu_fill_down_needs_a_range() {
+    let mut t = fill_tab();
+    let enabled = |t: &DocTab, label: &str| enabled_items(t).contains(&label.to_string());
+    assert!(!enabled(&t, "Fill Down"), "no range");
+    range(&mut t, 0, COL_NAME, 0, COL_DURATION);
+    assert!(!enabled(&t, "Fill Down"), "one row");
+    range(&mut t, 0, COL_NAME, 1, COL_NAME);
+    assert!(enabled(&t, "Fill Down"), "two rows");
+    range(&mut t, 0, COL_ID, 2, COL_ID);
+    assert!(!enabled(&t, "Fill Down"), "the ID column alone");
+    assert!(enabled(&t, "Clear Contents"), "a task row");
+    vm(&mut t).anchor = None;
+    let blank = vm(&mut t).ed.insert_blank_row(None).unwrap();
+    vm(&mut t).ed.select(blank);
+    assert!(enabled(&t, "Clear Contents"), "a blank row");
+    vm(&mut t).enter_entry_row();
+    assert!(!enabled(&t, "Clear Contents"), "the entry row");
+    // The items with no command yet stay drawn disabled.
+    for label in [
+        "Paste Special...",
+        "Text Styles...",
+        "Font...",
+        "Add to Timeline",
+    ] {
+        let (_, on, _) = row_menu(&t).into_iter().find(|(l, ..)| l == label).unwrap();
+        assert!(!on, "{label}");
+    }
+}
+
+/// #1213: each column takes the top row's value, as one undo step, and the
+/// range and the cursor stay.
+#[test]
+fn fill_down_copies_top_row_per_column() {
+    let mut t = fill_tab();
+    range(&mut t, 0, COL_NAME, 2, COL_DURATION);
+    let before = v(&t).selection().unwrap();
+    let cursor = v(&t).selected_uid();
+    let depth = v(&t).ed.undo_depth();
+    apply_project_act(&mut t, ProjectAct::FillDown);
+    assert_eq!(names(&t), ["First", "First", "First"]);
+    assert_eq!(durations(&t), [480, 480, 480]);
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1, "one undo step");
+    let after = v(&t).selection().expect("the range stays");
+    assert_eq!((after.uids, after.cols), (before.uids, before.cols));
+    assert_eq!(v(&t).selected_uid(), cursor, "the cursor stays");
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(names(&t), ["First", "Second", "Third"]);
+    assert_eq!(durations(&t), [480, 960, 1440]);
+    apply_project_act(&mut t, ProjectAct::Redo);
+    assert_eq!(names(&t), ["First", "First", "First"]);
+    assert_eq!(durations(&t), [480, 480, 480]);
+}
+
+/// #1213: a value filled into a blank row makes it a task, as typing does.
+#[test]
+fn fill_down_into_blank_row_makes_a_task() {
+    let mut t = fill_tab();
+    let blank = vm(&mut t).ed.insert_blank_row(None).unwrap();
+    range(&mut t, 2, COL_NAME, blank, COL_DURATION);
+    apply_project_act(&mut t, ProjectAct::FillDown);
+    let task = &v(&t).ed.project().tasks[blank];
+    assert!(!task.is_null, "{}", t.status);
+    assert_eq!((task.name.as_str(), task.duration_min), ("Third", 1440));
+}
+
+/// #1213: a field that cannot take the value cancels the whole fill and
+/// names the cell, as paste does.
+#[test]
+fn fill_down_failure_cancels_naming_the_cell() {
+    let mut t = fill_tab();
+    // Third under Second: Second is a summary, its Duration read-only.
+    let third = v(&t).ed.project().tasks[2].uid;
+    vm(&mut t).ed.indent(third, 1).unwrap();
+    let (names_before, durations_before) = (names(&t), durations(&t));
+    let depth = v(&t).ed.undo_depth();
+    range(&mut t, 0, COL_NAME, 2, COL_DURATION);
+    apply_project_act(&mut t, ProjectAct::FillDown);
+    assert!(t.status.starts_with("Task 2 Duration: "), "{}", t.status);
+    assert_eq!(names(&t), names_before, "nothing changed");
+    assert_eq!(durations(&t), durations_before, "nothing changed");
+    assert_eq!(v(&t).ed.undo_depth(), depth);
+}
+
+/// #1213: a summary at the top fills its subtasks with the values it had
+/// before the fill, though filling them changes its own.
+#[test]
+fn fill_down_from_a_summary_top() {
+    let mut t = fill_tab();
+    let tasks = &v(&t).ed.project().tasks;
+    let (second, third) = (tasks[1].uid, tasks[2].uid);
+    vm(&mut t).ed.indent(second, 1).unwrap();
+    vm(&mut t).ed.indent(third, 1).unwrap();
+    // Second (1 day), then Third (3 days): First spans 4 days.
+    apply_cell(&mut vm(&mut t).ed, second, COL_DURATION, "1d").unwrap();
+    apply_cell(&mut vm(&mut t).ed, third, COL_PREDECESSORS, "2").unwrap();
+    assert!(v(&t).ed.project().tasks[0].summary);
+    // The Duration cells as drawn: a summary's is its subtasks' span.
+    let shown = |t: &DocTab| {
+        let ed = &v(t).ed;
+        let tasks = &ed.project().tasks;
+        tasks
+            .iter()
+            .map(|task| cell_edit_text(ed, task, COL_DURATION))
+            .collect::<Vec<_>>()
+    };
+    let top = shown(&t)[0].clone();
+    assert_eq!(durations(&t)[1..], [480, 1440]);
+    range(&mut t, 0, COL_NAME, 2, COL_DURATION);
+    apply_project_act(&mut t, ProjectAct::FillDown);
+    assert_eq!(names(&t), ["First", "First", "First"], "{}", t.status);
+    // Four days each, the span before the fill, not the span after Second
+    // filled (which a value read row by row would have given Third).
+    assert_eq!(durations(&t)[1..], [1920, 1920]);
+    let after = shown(&t);
+    assert_eq!((&after[1], &after[2]), (&top, &top));
+    assert_ne!(after[0], top, "the summary grew as its subtasks filled");
+}
+
+/// #1213: Ctrl+D is Fill Down, and the range reaches it.
+#[test]
+fn ctrl_d_is_fill_down() {
+    let mut t = fill_tab();
+    range(&mut t, 0, COL_NAME, 1, COL_NAME);
+    key(&mut t, "d", Some("d"), ctrl());
+    assert_eq!(names(&t), ["First", "First", "Third"], "{}", t.status);
+    assert!(v(&t).selection().is_some(), "the range stays");
+}
+
+/// #1213: in an open cell edit, Ctrl+D stays with the cell.
+#[test]
+fn ctrl_d_in_open_cell_does_not_fill() {
+    let mut t = fill_tab();
+    range(&mut t, 0, COL_NAME, 1, COL_NAME);
+    key(&mut t, "f2", None, Modifiers::default());
+    assert!(v(&t).cell.is_some());
+    key(&mut t, "d", Some("d"), ctrl());
+    assert!(v(&t).cell.is_some(), "the edit stays open");
+    assert_eq!(names(&t), ["First", "Second", "Third"]);
+}
+
+/// #1213: Fill Down's refusals say why.
+#[test]
+fn fill_down_without_a_range_says_so() {
+    let mut t = fill_tab();
+    apply_project_act(&mut t, ProjectAct::FillDown);
+    assert_eq!(t.status.as_ref(), "Select cells below to fill down");
+    range(&mut t, 0, COL_NAME, 0, COL_DURATION);
+    apply_project_act(&mut t, ProjectAct::FillDown);
+    assert_eq!(t.status.as_ref(), "Select cells below to fill down");
+    range(&mut t, 0, COL_ID, 2, COL_ID);
+    apply_project_act(&mut t, ProjectAct::FillDown);
+    assert_eq!(t.status.as_ref(), "Selection's columns can't be filled");
+    assert_eq!(names(&t), ["First", "Second", "Third"]);
+}
+
+/// #1213: Clear Contents is Delete's clear without its deletion.
+#[test]
+fn clear_contents_never_deletes() {
+    let mut t = fill_tab();
+    let uids: Vec<i32> = v(&t).ed.project().tasks.iter().map(|t| t.uid).collect();
+    for &uid in &uids[1..] {
+        apply_cell(&mut vm(&mut t).ed, uid, COL_PREDECESSORS, "1").unwrap();
+        apply_cell(&mut vm(&mut t).ed, uid, COL_RESOURCES, "Ann").unwrap();
+    }
+    let fields = |t: &DocTab, row: usize| {
+        let task = &v(t).ed.project().tasks[row];
+        [COL_NAME, COL_PREDECESSORS, COL_RESOURCES].map(|c| cell_edit_text(&v(t).ed, task, c))
+    };
+    assert_eq!(fields(&t, 1), ["Second", "1", "Ann"]);
+    // On the ID column, without a range: the row's three fields.
+    vm(&mut t).ed.select(1);
+    vm(&mut t).col = COL_ID;
+    apply_project_act(&mut t, ProjectAct::ClearContents);
+    assert_eq!(v(&t).ed.project().tasks.len(), 3, "{}", t.status);
+    assert!(t.dialogs.top().is_none(), "no delete question");
+    assert_eq!(fields(&t, 1), ["", "", ""]);
+    assert_eq!(fields(&t, 2), ["Third", "1", "Ann"]);
+    // A row-header range: every row's three fields, as one undo step, and
+    // the range is consumed.
+    {
+        let v = vm(&mut t);
+        v.anchor = Some((uids[0], COLUMN_COUNT - 1));
+        v.row_header = true;
+        v.ed.select(2);
+        v.col = COL_ID;
+    }
+    let depth = v(&t).ed.undo_depth();
+    apply_project_act(&mut t, ProjectAct::ClearContents);
+    assert_eq!(v(&t).ed.project().tasks.len(), 3);
+    for row in 0..3 {
+        assert_eq!(fields(&t, row), ["", "", ""], "row {row}");
+    }
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+    assert!(v(&t).selection().is_none(), "the range is consumed");
+    // A column that cannot clear says so.
+    vm(&mut t).col = COL_DURATION;
+    apply_project_act(&mut t, ProjectAct::ClearContents);
+    assert_eq!(t.status.as_ref(), "Duration can't be cleared");
+    // A blank row: nothing to clear.
+    let blank = vm(&mut t).ed.insert_blank_row(None).unwrap();
+    vm(&mut t).ed.select(blank);
+    vm(&mut t).col = COL_NAME;
+    t.status = "x".into();
+    apply_project_act(&mut t, ProjectAct::ClearContents);
+    assert_eq!(t.status.as_ref(), "Ready");
+    assert!(v(&t).ed.project().tasks[blank].is_null);
+}
+
+/// The range as (uids, cols), comparable.
+fn sel_of(t: &DocTab) -> Option<(Vec<i32>, std::ops::RangeInclusive<usize>)> {
+    v(t).selection().map(|s| (s.uids, s.cols))
+}
+
+/// #1213: a right-click inside the range keeps it and the cursor, so the
+/// row menu's Fill Down and Clear Contents act on it.
+#[test]
+fn row_menu_press_inside_keeps_the_range() {
+    let mut t = fill_tab();
+    range(&mut t, 0, COL_NAME, 2, COL_DURATION);
+    let before = sel_of(&t);
+    assert!(before.is_some());
+    project_row_menu_press(&mut t, 1, Some(COL_NAME));
+    assert_eq!(sel_of(&t), before);
+    assert_eq!((v(&t).cursor_row(), v(&t).col), (2, COL_DURATION));
+    // No column (the harness, a press past the cells) is the cursor's.
+    project_row_menu_press(&mut t, 0, None);
+    assert_eq!(sel_of(&t), before);
+}
+
+/// #1213: outside the range, a right-click is a left click: the range goes
+/// and the clicked cell is selected.
+#[test]
+fn row_menu_press_outside_drops_it() {
+    let mut t = fill_tab();
+    range(&mut t, 0, COL_NAME, 1, COL_DURATION);
+    project_row_menu_press(&mut t, 2, Some(COL_NAME));
+    assert_eq!(sel_of(&t), None, "another row");
+    assert_eq!((v(&t).cursor_row(), v(&t).col), (2, COL_NAME));
+    range(&mut t, 0, COL_NAME, 1, COL_DURATION);
+    project_row_menu_press(&mut t, 1, Some(COL_START));
+    assert_eq!(sel_of(&t), None, "another column");
+    assert_eq!((v(&t).cursor_row(), v(&t).col), (1, COL_START));
+}
+
+/// #1213: with a cell edit open the press is a left click, which commits.
+#[test]
+fn row_menu_press_with_open_cell_commits() {
+    let mut t = fill_tab();
+    vm(&mut t).ed.select(1);
+    vm(&mut t).open_cell(Some("Renamed")).unwrap();
+    // No range sits beside an open edit; one forced here is not kept.
+    range(&mut t, 0, COL_NAME, 1, COL_NAME);
+    project_row_menu_press(&mut t, 1, Some(COL_NAME));
+    assert!(v(&t).cell.is_none(), "the edit committed: {}", t.status);
+    assert_eq!(names(&t)[1], "Renamed");
+    assert_eq!(sel_of(&t), None);
 }

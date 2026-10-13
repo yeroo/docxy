@@ -381,13 +381,7 @@ pub(crate) fn paste_project_text(tab: &mut DocTab, text: &str) {
                 Some(&uid) => {
                     let blank = ed.project().task(uid).is_some_and(|t| t.is_null);
                     for (col, field) in fields {
-                        let clears = matches!(col, COL_NAME | COL_PREDECESSORS | COL_RESOURCES);
-                        if field.is_empty() && (blank || !clears) {
-                            continue;
-                        }
-                        let applied = apply_cell(ed, uid, col, field)
-                            .map_err(|e| cell_error(ed, Some(uid), col, e))?;
-                        status = applied.or(status);
+                        status = apply_field(ed, uid, col, field, blank)?.or(status);
                     }
                 }
                 None => {
@@ -434,6 +428,85 @@ pub(crate) fn paste_project_text(tab: &mut DocTab, text: &str) {
         }
         Err(e) => tab.status = e.into(),
     }
+}
+
+/// One pasted or filled field on an existing row: an empty `field` clears
+/// Name, Predecessors or Resource Names of a task and is skipped elsewhere
+/// (and on a blank row, which it would not make a task); anything else
+/// applies as typing it would, so a blank row becomes a task. `blank` is
+/// whether the row was blank before its first field applied: the caller
+/// reads it once per row. A field that cannot apply is the error, naming
+/// the cell.
+fn apply_field(
+    ed: &mut ProjectEditor,
+    uid: i32,
+    col: usize,
+    field: &str,
+    blank: bool,
+) -> Result<Option<String>, String> {
+    let clears = matches!(col, COL_NAME | COL_PREDECESSORS | COL_RESOURCES);
+    if field.is_empty() && (blank || !clears) {
+        return Ok(None);
+    }
+    apply_cell(ed, uid, col, field).map_err(|e| cell_error(ed, Some(uid), col, e))
+}
+
+/// The columns Fill Down fills: the range's, but never ID.
+pub(crate) fn fill_cols(sel: &Selection) -> impl Iterator<Item = usize> {
+    sel.cols.clone().filter(|&c| c != COL_ID)
+}
+
+/// Whether Fill Down has something to fill: a range of two or more shown
+/// rows over a column other than ID.
+pub(crate) fn fill_down_enabled(v: &ProjectView) -> bool {
+    v.selection()
+        .is_some_and(|sel| sel.uids.len() >= 2 && fill_cols(&sel).next().is_some())
+}
+
+/// Fill Down over `sel`, as one undo step: every row below the top takes the
+/// top row's value in each of the range's columns but ID, by the paste's
+/// rule for one field ([`apply_field`]). The top's value is what a copy of
+/// that cell gives ([`cell_edit_text`], a blank row's shown text). Only shown
+/// rows are in a range, so the rows a collapsed summary hides are not filled.
+/// Every top value is read before anything is written: a summary's own
+/// values change as its subtasks below it fill. A field that cannot apply
+/// cancels the whole fill, naming the cell. Returns the last status a filled
+/// cell gave.
+pub(crate) fn fill_down_cells(
+    ed: &mut ProjectEditor,
+    sel: &Selection,
+) -> Result<Option<String>, String> {
+    let Some((&top, below)) = sel.uids.split_first() else {
+        return Ok(None);
+    };
+    let task = ed
+        .project()
+        .task(top)
+        .ok_or("The range's top row no longer exists")?;
+    let shown = project_row(ed, task);
+    let values: Vec<(usize, String)> = fill_cols(sel)
+        .map(|col| {
+            let text = if task.is_null {
+                shown[col].clone()
+            } else {
+                cell_edit_text(ed, task, col)
+            };
+            (col, text)
+        })
+        .collect();
+    ed.batch(|ed| {
+        let mut status = None;
+        for &uid in below {
+            let Some(task) = ed.project().task(uid) else {
+                continue;
+            };
+            let blank = task.is_null;
+            for (col, value) in &values {
+                status = apply_field(ed, uid, *col, value, blank)?.or(status);
+            }
+        }
+        Ok(status)
+    })
 }
 
 /// A paste or range-cut error, naming the cell: `Task 2 Duration: …`, or

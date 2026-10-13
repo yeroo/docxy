@@ -68,6 +68,15 @@ pub(crate) enum ProjectAct {
     /// Ctrl+Delete: clear the active cell, or reset it to its default; never
     /// deletes the task.
     ResetCell,
+    /// Ctrl+D and a task row's context menu › Fill Down: each column of the
+    /// range but ID takes its top row's value into every shown row below it,
+    /// as one undo step; the range stays. See `clip.rs`.
+    FillDown,
+    /// A task row's context menu › Clear Contents: Delete's clear without
+    /// its deletion. Name, Predecessors and Resource Names clear (all three
+    /// on the ID column or a row-header range); never resets another field
+    /// to a default and never deletes the task.
+    ClearContents,
     /// A task row's context menu › Delete Task: the selected task, whatever
     /// column the cursor is on; a summary asks first, as Delete on its ID does.
     DeleteTask,
@@ -670,10 +679,14 @@ pub(crate) fn gantt_format_tab() -> rs::Tab<Act> {
 /// highlight, Cut and Paste clear it when they run, Link and Unlink act on
 /// it, and Delete clears the range's cells and consumes it. The rule lives
 /// here, one place, so keys, the ribbon, the QAT and Backstage cannot drift
-/// apart.
+/// apart. Fill Down fills the range and keeps it; Clear Contents clears it
+/// and consumes it, as Delete does.
 pub(crate) fn project_act_clears_range(act: ProjectAct) -> bool {
     use ProjectAct::*;
-    !matches!(act, Copy | Cut | Paste | AddLink | UnlinkTasks | ClearCell)
+    !matches!(
+        act,
+        Copy | Cut | Paste | AddLink | UnlinkTasks | ClearCell | FillDown | ClearContents
+    )
 }
 
 /// Whether an in-cell cut may empty the buffer: the read-back clipboard
@@ -776,8 +789,21 @@ pub(crate) fn project_row_menu(v: &ProjectView) -> Vec<crate::menu::MenuItem> {
         none("rm-text-styles", "Text Styles..."),
         none("rm-font", "Font..."),
         Separator,
-        none("rm-fill-down", "Fill Down"),
-        none("rm-clear", "Clear Contents"),
+        // No fill icon in the set yet; the item still runs its command.
+        item(
+            "rm-fill-down",
+            "Fill Down",
+            "",
+            FillDown,
+            fill_down_enabled(v),
+        ),
+        item(
+            "rm-clear",
+            "Clear Contents",
+            "clear-format",
+            ClearContents,
+            row,
+        ),
         Separator,
         item(
             "rm-info",
@@ -1024,6 +1050,8 @@ pub(crate) fn key_act(key: &str, m: Modifiers) -> Option<ProjectAct> {
             "c" if !m.shift => Some(Copy),
             "x" if !m.shift => Some(Cut),
             "v" if !m.shift => Some(Paste),
+            // Project's Fill Down over the selected cells.
+            "d" if !m.shift => Some(FillDown),
             "delete" if !m.shift => Some(ResetCell),
             _ => None,
         };
@@ -1594,6 +1622,55 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                 if let Some(uid) = v.selected_uid() {
                     status = reset_cell(&mut v.ed, uid, v.col)?;
                 }
+            }
+            FillDown => {
+                // The range stays: a second Fill Down or a Copy acts on it.
+                let applied = match v.selection() {
+                    Some(sel) if sel.uids.len() >= 2 => {
+                        if fill_cols(&sel).next().is_none() {
+                            "Selection's columns can't be filled".into()
+                        } else {
+                            fill_down_cells(&mut v.ed, &sel)?.unwrap_or_else(|| "Ready".into())
+                        }
+                    }
+                    _ => "Select cells below to fill down".into(),
+                };
+                status = Some(applied);
+            }
+            ClearContents => {
+                // Delete's clear without its deletion. A row-header range
+                // spans every column, so it clears all three fields. The
+                // range is consumed, as Delete consumes it.
+                let sel = v.selection();
+                v.anchor = None;
+                let cleared = if let Some(sel) = sel {
+                    let cols = range_clear_cols(&sel);
+                    if cols.is_empty() {
+                        Some("Selection's columns can't be cleared".into())
+                    } else {
+                        clear_range_cells(&mut v.ed, &sel, &cols)?
+                    }
+                } else if let Some(uid) = v.selected_uid() {
+                    let blank = v.ed.project().task(uid).ok_or("No task selected")?.is_null;
+                    match v.col {
+                        _ if blank => None,
+                        COL_ID => {
+                            let row = Selection {
+                                uids: vec![uid],
+                                cols: COL_ID..=COL_ID,
+                            };
+                            let cols = [COL_NAME, COL_PREDECESSORS, COL_RESOURCES];
+                            clear_range_cells(&mut v.ed, &row, &cols)?
+                        }
+                        COL_NAME | COL_PREDECESSORS | COL_RESOURCES => {
+                            apply_cell(&mut v.ed, uid, v.col, "")?
+                        }
+                        _ => Some(format!("{} can't be cleared", COLUMNS[v.col])),
+                    }
+                } else {
+                    None
+                };
+                status = Some(cleared.unwrap_or_else(|| "Ready".into()));
             }
             Milestone => {
                 if let Some(uid) = v.selected_uid() {
