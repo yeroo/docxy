@@ -9,7 +9,7 @@
 
 use crate::sheet::{cell_name, parse_col};
 use crate::xlsx::{
-    SheetPackage, add_content_type_override, add_rel, add_workbook_rel, parse_rels,
+    SheetPackage, add_content_type_override, add_rel, add_workbook_rel, normalise_eol, parse_rels,
     put_worksheet_child, remove_worksheet_singleton, resolve_relative, worksheet_child_span,
 };
 
@@ -61,7 +61,8 @@ fn unescape(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
-/// Concatenated, decoded text of every `<t>…</t>` inside `frag`.
+/// Concatenated, decoded text of every `<t>…</t>` inside `frag`, its line
+/// ends read as LF (XML 1.0 §2.11).
 fn collect_t(frag: &str) -> String {
     let mut out = String::new();
     let mut rest = frag;
@@ -88,7 +89,7 @@ fn collect_t(frag: &str) -> String {
             Some(c) => body_start + c,
             None => break,
         };
-        out.push_str(&unescape(&rest[body_start..close]));
+        out.push_str(&unescape(&normalise_eol(&rest[body_start..close])));
         rest = &rest[close + 4..];
     }
     out
@@ -251,7 +252,7 @@ fn parse_threaded(xml: &str, sheet: usize, persons: &[(String, String)], out: &m
         let text = el
             .find("<text>")
             .and_then(|s| el[s + 6..].find("</text>").map(|e| &el[s + 6..s + 6 + e]))
-            .map(unescape)
+            .map(|t| unescape(&normalise_eol(t)))
             .unwrap_or_default();
         out.push(Comment {
             sheet,
@@ -931,6 +932,8 @@ mod tests {
             collect_t("<text><r><t>Hello</t></r><r><t> world</t></r></text>"),
             "Hello world"
         );
+        // #761: a note's CR LF or lone CR is a line break, read as LF.
+        assert_eq!(collect_t("<text><r><t>a\r\nb\rc</t></r></text>"), "a\nb\nc");
         assert_eq!(ref_to_rc("C3"), Some((2, 2)));
     }
 

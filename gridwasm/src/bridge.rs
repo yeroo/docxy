@@ -2760,11 +2760,23 @@ impl Session {
         let text = args
             .get_str("text")
             .ok_or("sheet.import-csv needs 'text'")?;
-        let frame = Frame::from_csv(text);
+        // Read as xlsxy's `sheet.import-csv` and a `.csv` open read it
+        // (#761): a `sep=` first line names the delimiter, and each field
+        // converts as if typed, a year-less date taking the host's clock.
+        let (opts, body) = gridcore::textio::csv_parse(text, false);
         let requested = args.get_str("name").unwrap_or("Sheet");
         let name = ctl_unique_sheet_name(&self.pkg.workbook, requested);
         let idx = self.pkg.add_sheet(&name);
-        frame.write_to_sheet(&mut self.pkg.workbook.sheets[idx]);
+        let ctx = gridcore::entry::entry_ctx(&self.pkg.workbook, self.engine.clock);
+        let wb = &mut self.pkg.workbook;
+        gridcore::textio::import_text(
+            &mut wb.sheets[idx],
+            &mut wb.styles,
+            body,
+            &opts,
+            &gridcore::textio::AutoConvert::default(),
+            &ctx,
+        );
         let (rows, cols) = self.pkg.workbook.sheets[idx].used_size();
         self.undo.clear();
         self.redo.clear();
@@ -6325,6 +6337,39 @@ mod tests {
         assert!(
             v.contains("\"src\":\"hello\""),
             "sheet.import-csv must clear existing undo history: {v}"
+        );
+    }
+
+    /// #761: `sheet.import-csv` reads as xlsxy's does: `sep=` names the
+    /// delimiter and is no row, and fields convert as typed (a leading-zero
+    /// number, a date with a date format, E notation), a year-less date
+    /// taking the host's clock.
+    #[test]
+    fn wasm_import_csv_converts_like_xlsxy() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        // 2026-10-13: a year-less 3/4 is in 2026.
+        s.dispatch("clock\t46308");
+        let out = s.ctl(
+            r#"{"verb":"sheet.import-csv","args":{"text":"sep=;\nid;when;amt;day\n007;1/2/2024;1E3;3/4\n","name":"T"}}"#,
+        );
+        assert!(
+            out.contains("\"rows\":2") && out.contains("\"cols\":4"),
+            "{out}"
+        );
+        let wb = &s.pkg.workbook;
+        let sheet = &wb.sheets[1];
+        let value = |r, c| sheet.cell(r, c).map(|cell| cell.value.clone());
+        assert_eq!(value(0, 0), Some(CellValue::Text("id".into())));
+        assert_eq!(value(1, 0), Some(CellValue::Number(7.0)));
+        assert_eq!(value(1, 1), Some(CellValue::Number(45293.0)));
+        assert_eq!(value(1, 2), Some(CellValue::Number(1000.0)));
+        assert_eq!(value(1, 3), Some(CellValue::Number(46085.0)));
+        let date = wb.styles.xf(sheet.cell(1, 1).unwrap().style);
+        assert_eq!(
+            date.numfmt,
+            gridcore::sheet::NumFmt::Date,
+            "{:?}",
+            date.code
         );
     }
 

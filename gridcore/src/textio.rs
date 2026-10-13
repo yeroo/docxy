@@ -256,27 +256,133 @@ pub enum Origin {
     Auto,
     Utf8,
     Utf16Le,
+    Utf16Be,
     Windows1252,
+    /// Another single-byte code page [`crate::codepage`] knows (never 1252,
+    /// which is [`Origin::Windows1252`]).
+    CodePage(u16),
 }
 
+/// Excel's name for each code page the File origin list offers.
+const CODE_PAGE_LABELS: &[(u16, &str)] = &[
+    (437, "OEM United States"),
+    (850, "Western European (DOS)"),
+    (852, "Central European (DOS)"),
+    (866, "Cyrillic (DOS)"),
+    (874, "Thai (Windows)"),
+    (1250, "Central European (Windows)"),
+    (1251, "Cyrillic (Windows)"),
+    (1253, "Greek (Windows)"),
+    (1254, "Turkish (Windows)"),
+    (1255, "Hebrew (Windows)"),
+    (1256, "Arabic (Windows)"),
+    (1257, "Baltic (Windows)"),
+    (1258, "Vietnamese (Windows)"),
+    (10000, "Western European (Mac)"),
+    (28591, "Western European (ISO)"),
+    (28605, "Latin 9 (ISO)"),
+];
+
 impl Origin {
-    pub fn parse(s: &str) -> Option<Origin> {
-        Some(match s.trim().to_ascii_lowercase().as_str() {
-            "auto" | "" => Origin::Auto,
-            "utf-8" | "utf8" | "65001" => Origin::Utf8,
-            "utf-16" | "utf-16le" | "utf16" | "unicode" | "1200" => Origin::Utf16Le,
-            "windows-1252" | "1252" | "cp1252" | "ansi" => Origin::Windows1252,
+    /// Every origin the wizard's File origin list offers, in its order: the
+    /// automatic choice, then by code page number.
+    pub fn all() -> Vec<Origin> {
+        let mut out = vec![Origin::Auto];
+        let mut pages: Vec<(u16, Origin)> = crate::codepage::pages()
+            .map(|page| (page, Origin::CodePage(page)))
+            .collect();
+        pages.extend([
+            (1200, Origin::Utf16Le),
+            (1201, Origin::Utf16Be),
+            (1252, Origin::Windows1252),
+            (65001, Origin::Utf8),
+        ]);
+        pages.sort_by_key(|&(page, _)| page);
+        out.extend(pages.into_iter().map(|(_, o)| o));
+        out
+    }
+
+    /// The origin of code page `page`, when it is one here.
+    pub fn from_code_page(page: u16) -> Option<Origin> {
+        Some(match page {
+            65001 => Origin::Utf8,
+            1200 => Origin::Utf16Le,
+            1201 => Origin::Utf16Be,
+            1252 => Origin::Windows1252,
+            _ if crate::codepage::known(page) => Origin::CodePage(page),
             _ => return None,
         })
     }
 
-    pub fn name(self) -> &'static str {
+    /// The code page number (`None` for [`Origin::Auto`]).
+    pub fn code_page(self) -> Option<u16> {
+        Some(match self {
+            Origin::Auto => return None,
+            Origin::Utf8 => 65001,
+            Origin::Utf16Le => 1200,
+            Origin::Utf16Be => 1201,
+            Origin::Windows1252 => 1252,
+            Origin::CodePage(page) => page,
+        })
+    }
+
+    /// The origin `s` names: the machine name [`Origin::name`] gives, the
+    /// bare code page number, or a common alias (`cp437`, `ibm437`, `mac`,
+    /// `latin1`, …).
+    pub fn parse(s: &str) -> Option<Origin> {
+        let s = s.trim().to_ascii_lowercase();
+        let page: u16 = match s.as_str() {
+            "auto" | "" => return Some(Origin::Auto),
+            "utf-8" | "utf8" => 65001,
+            "utf-16" | "utf-16le" | "utf16" | "unicode" => 1200,
+            "utf-16be" | "utf16be" | "unicodefffe" => 1201,
+            "windows-1252" | "cp1252" | "ansi" => 1252,
+            "macintosh" | "mac" | "macroman" | "mac-roman" | "x-mac-roman" | "mac_roman" => 10000,
+            "iso-8859-1" | "iso8859-1" | "latin1" | "latin-1" | "l1" => 28591,
+            "iso-8859-15" | "iso8859-15" | "latin9" | "latin-9" | "l9" => 28605,
+            "cp437" | "ibm437" | "oem" | "dos" | "us-ascii-dos" => 437,
+            _ => {
+                let num = ["windows-", "cp", "ibm", "x-cp"]
+                    .iter()
+                    .find_map(|p| s.strip_prefix(p))
+                    .unwrap_or(&s);
+                num.parse().ok()?
+            }
+        };
+        Origin::from_code_page(page)
+    }
+
+    /// The machine name: what [`Origin::parse`] reads back.
+    pub fn name(self) -> String {
         match self {
-            Origin::Auto => "auto",
-            Origin::Utf8 => "utf-8",
-            Origin::Utf16Le => "utf-16le",
-            Origin::Windows1252 => "windows-1252",
+            Origin::Auto => "auto".into(),
+            Origin::Utf8 => "utf-8".into(),
+            Origin::Utf16Le => "utf-16le".into(),
+            Origin::Utf16Be => "utf-16be".into(),
+            Origin::Windows1252 => "windows-1252".into(),
+            Origin::CodePage(10000) => "macintosh".into(),
+            Origin::CodePage(28591) => "iso-8859-1".into(),
+            Origin::CodePage(28605) => "iso-8859-15".into(),
+            Origin::CodePage(page) if page < 1000 => format!("cp{page}"),
+            Origin::CodePage(page) => format!("windows-{page}"),
         }
+    }
+
+    /// As the wizard's File origin list shows it: `1251 : Cyrillic
+    /// (Windows)`.
+    pub fn label(self) -> String {
+        let text = match self {
+            Origin::Auto => return "Automatic (byte-order mark, else UTF-8, else 1252)".into(),
+            Origin::Utf8 => "Unicode (UTF-8)",
+            Origin::Utf16Le => "Unicode",
+            Origin::Utf16Be => "Unicode (Big-Endian)",
+            Origin::Windows1252 => "Western European (Windows)",
+            Origin::CodePage(page) => CODE_PAGE_LABELS
+                .iter()
+                .find(|(p, _)| *p == page)
+                .map_or("", |(_, l)| l),
+        };
+        format!("{} : {text}", self.code_page().unwrap_or(0))
     }
 }
 
@@ -307,10 +413,15 @@ fn cp1252_byte(c: char) -> Option<u8> {
         .map(|i| 0x80 + i as u8)
 }
 
-fn utf16le(bytes: &[u8]) -> String {
-    let units = bytes
-        .chunks(2)
-        .map(|p| u16::from_le_bytes([p[0], p.get(1).copied().unwrap_or(0)]));
+fn utf16(bytes: &[u8], big_endian: bool) -> String {
+    let units = bytes.chunks(2).map(|p| {
+        let pair = [p[0], p.get(1).copied().unwrap_or(0)];
+        if big_endian {
+            u16::from_be_bytes(pair)
+        } else {
+            u16::from_le_bytes(pair)
+        }
+    });
     char::decode_utf16(units)
         .map(|r| r.unwrap_or('\u{FFFD}'))
         .collect()
@@ -318,22 +429,36 @@ fn utf16le(bytes: &[u8]) -> String {
 
 /// Bytes read from a text file, as text; a byte-order mark is dropped.
 pub fn decode(bytes: &[u8], origin: Origin) -> String {
+    decode_with(bytes, origin).0
+}
+
+/// [`decode`], and the origin the bytes were read as: [`Origin::Auto`]
+/// resolved to the one it chose (UTF-8, UTF-16 LE or BE, or Windows-1252),
+/// any other origin as given.
+pub fn decode_with(bytes: &[u8], origin: Origin) -> (String, Origin) {
     let utf8_bom = bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
-    let utf16_bom = bytes.starts_with(&[0xFF, 0xFE]);
-    match origin {
-        Origin::Auto if utf8_bom => String::from_utf8_lossy(&bytes[3..]).into_owned(),
-        Origin::Auto if utf16_bom => utf16le(&bytes[2..]),
-        Origin::Auto => match std::str::from_utf8(bytes) {
-            Ok(s) => s.to_string(),
-            Err(_) => bytes.iter().map(|&b| cp1252_char(b)).collect(),
-        },
+    let le_bom = bytes.starts_with(&[0xFF, 0xFE]);
+    let be_bom = bytes.starts_with(&[0xFE, 0xFF]);
+    let origin = match origin {
+        Origin::Auto if utf8_bom => Origin::Utf8,
+        Origin::Auto if le_bom => Origin::Utf16Le,
+        Origin::Auto if be_bom => Origin::Utf16Be,
+        Origin::Auto if std::str::from_utf8(bytes).is_ok() => Origin::Utf8,
+        Origin::Auto => Origin::Windows1252,
+        o => o,
+    };
+    let text = match origin {
         Origin::Utf8 => {
             let body = if utf8_bom { &bytes[3..] } else { bytes };
             String::from_utf8_lossy(body).into_owned()
         }
-        Origin::Utf16Le => utf16le(if utf16_bom { &bytes[2..] } else { bytes }),
-        Origin::Windows1252 => bytes.iter().map(|&b| cp1252_char(b)).collect(),
-    }
+        Origin::Utf16Le => utf16(if le_bom { &bytes[2..] } else { bytes }, false),
+        Origin::Utf16Be => utf16(if be_bom { &bytes[2..] } else { bytes }, true),
+        Origin::CodePage(page) => crate::codepage::decode(bytes, page)
+            .unwrap_or_else(|| bytes.iter().map(|&b| cp1252_char(b)).collect()),
+        Origin::Windows1252 | Origin::Auto => bytes.iter().map(|&b| cp1252_char(b)).collect(),
+    };
+    (text, origin)
 }
 
 /// A CSV's `sep=<c>` first line: the delimiter it names and the text after
@@ -354,6 +479,36 @@ pub fn csv_directive(text: &str) -> (Option<char>, &str) {
         }
     }
     (None, text)
+}
+
+/// How a CSV reads, as Excel opens one: a `sep=` first line names the
+/// delimiter (and is dropped), else a tab-delimited file (`tab`, a `.tsv`)
+/// splits at tabs and any other is sniffed. Returns the options and the text
+/// after any directive.
+pub fn csv_parse(text: &str, tab: bool) -> (TextParse, &str) {
+    let (directive, body) = csv_directive(text);
+    let delim = directive.unwrap_or_else(|| {
+        if tab {
+            '\t'
+        } else {
+            crate::frame::sniff_delimiter(body)
+        }
+    });
+    (TextParse::csv(delim), body)
+}
+
+/// `text` split under `opts` and converted into `sheet` from A1, each field
+/// as if typed into its cell. Returns (rows, cols).
+pub fn import_text(
+    sheet: &mut Sheet,
+    styles: &mut Styles,
+    text: &str,
+    opts: &TextParse,
+    auto: &AutoConvert,
+    ctx: &EntryCtx,
+) -> (u32, u32) {
+    let records = split_text(text, opts);
+    import_records(sheet, styles, 0, 0, &records, opts, auto, ctx)
 }
 
 // ---------------------------------------------------------------------------
@@ -854,6 +1009,9 @@ pub enum Encoding {
     Windows1252,
     /// Unicode Text: `FF FE`, then UTF-16 LE.
     Utf16LeBom,
+    /// Text and CSV (Macintosh) in 10000, (MS-DOS) in 437: another single-byte
+    /// code page [`crate::codepage`] knows, a character outside it as `?`.
+    CodePage(u16),
 }
 
 pub fn encode(text: &str, encoding: Encoding) -> Vec<u8> {
@@ -874,6 +1032,20 @@ pub fn encode(text: &str, encoding: Encoding) -> Vec<u8> {
             }
             out
         }
+        Encoding::CodePage(page) => crate::codepage::encode(text, page)
+            .unwrap_or_else(|| encode(text, Encoding::Windows1252)),
+    }
+}
+
+impl Encoding {
+    /// The origin a file written in this encoding reads back as.
+    pub fn origin(self) -> Origin {
+        match self {
+            Encoding::Utf8Bom => Origin::Utf8,
+            Encoding::Windows1252 => Origin::Windows1252,
+            Encoding::Utf16LeBom => Origin::Utf16Le,
+            Encoding::CodePage(page) => Origin::from_code_page(page).unwrap_or(Origin::Windows1252),
+        }
     }
 }
 
@@ -889,9 +1061,16 @@ fn shown(cell: &Cell, styles: &Styles, date1904: bool) -> String {
 }
 
 /// A sheet as delimited text, as Excel writes it: display values, a field
-/// holding the delimiter, a quote or a line break in double quotes, CR LF
-/// after every record (the used range's full width), LF inside a field.
-pub fn sheet_text(sheet: &Sheet, styles: &Styles, date1904: bool, delim: char) -> String {
+/// holding the delimiter, a quote or a line break in double quotes, `eol`
+/// after every record (the used range's full width: CR LF, or CR for the
+/// Macintosh types), LF inside a field.
+pub fn sheet_text(
+    sheet: &Sheet,
+    styles: &Styles,
+    date1904: bool,
+    delim: char,
+    eol: &str,
+) -> String {
     let (rows, cols) = sheet.used_size();
     let mut out = String::new();
     for r in 0..rows {
@@ -910,7 +1089,7 @@ pub fn sheet_text(sheet: &Sheet, styles: &Styles, date1904: bool, delim: char) -
                 }
             }
         }
-        out.push_str("\r\n");
+        out.push_str(eol);
     }
     out
 }
@@ -1207,6 +1386,141 @@ mod tests {
         assert_eq!(decode(b"a\x00b\x00", Origin::Utf16Le), "ab");
     }
 
+    /// #761: `decode_with` says what Auto chose, and a `FE FF` mark is
+    /// UTF-16 BE (it read as 1252 before).
+    #[test]
+    fn decode_with_resolves_auto_and_reads_utf16_be() {
+        let auto = |b: &[u8]| decode_with(b, Origin::Auto);
+        assert_eq!(auto(b"plain"), ("plain".into(), Origin::Utf8));
+        assert_eq!(auto(b"\xEF\xBB\xBFa"), ("a".into(), Origin::Utf8));
+        assert_eq!(auto(b"Z\xFCrich"), ("Zürich".into(), Origin::Windows1252));
+        assert_eq!(auto(b"\xFF\xFEa\x00"), ("a".into(), Origin::Utf16Le));
+        assert_eq!(
+            auto(b"\xFE\xFF\x00a\x00\xFC"),
+            ("aü".into(), Origin::Utf16Be)
+        );
+        assert_eq!(decode(b"\x00A", Origin::Utf16Be), "A");
+        assert_eq!(
+            decode_with(b"\x80\xB0", Origin::CodePage(437)),
+            ("Ç░".into(), Origin::CodePage(437))
+        );
+        assert_eq!(decode(b"\xC0", Origin::CodePage(1251)), "А");
+        assert_eq!(decode(b"\xDB", Origin::CodePage(10000)), "€");
+    }
+
+    /// #761: the File origin takes a code page's number, its machine name or
+    /// a common alias, and the list shows Excel's labels.
+    #[test]
+    fn origins_parse_name_and_label_as_excel_lists_them() {
+        for (s, want) in [
+            ("437", Origin::CodePage(437)),
+            ("cp437", Origin::CodePage(437)),
+            ("IBM437", Origin::CodePage(437)),
+            ("windows-1251", Origin::CodePage(1251)),
+            ("1251", Origin::CodePage(1251)),
+            ("mac", Origin::CodePage(10000)),
+            ("macintosh", Origin::CodePage(10000)),
+            ("latin1", Origin::CodePage(28591)),
+            ("iso-8859-15", Origin::CodePage(28605)),
+            ("1201", Origin::Utf16Be),
+            ("utf-16be", Origin::Utf16Be),
+            ("1252", Origin::Windows1252),
+            ("65001", Origin::Utf8),
+            ("auto", Origin::Auto),
+        ] {
+            assert_eq!(Origin::parse(s), Some(want), "{s}");
+        }
+        assert_eq!(Origin::parse("932"), None, "DBCS pages are not read yet");
+        assert_eq!(Origin::parse("cp99999"), None);
+        for o in Origin::all() {
+            assert_eq!(Origin::parse(&o.name()), Some(o), "{}", o.name());
+        }
+        assert_eq!(Origin::all().len(), 21);
+        assert_eq!(Origin::CodePage(437).label(), "437 : OEM United States");
+        assert_eq!(Origin::CodePage(1251).label(), "1251 : Cyrillic (Windows)");
+        assert_eq!(Origin::Utf8.label(), "65001 : Unicode (UTF-8)");
+        assert_eq!(Origin::Utf16Le.label(), "1200 : Unicode");
+        assert_eq!(Origin::Utf16Be.label(), "1201 : Unicode (Big-Endian)");
+        assert_eq!(
+            Origin::CodePage(10000).label(),
+            "10000 : Western European (Mac)"
+        );
+    }
+
+    /// #761 r1: every code page with a table has Excel's label, and every
+    /// labelled page has a table.
+    #[test]
+    fn every_code_page_has_a_label_and_a_table() {
+        for page in crate::codepage::pages() {
+            assert!(
+                CODE_PAGE_LABELS
+                    .iter()
+                    .any(|&(p, l)| p == page && !l.is_empty()),
+                "{page} has no label"
+            );
+        }
+        for &(page, _) in CODE_PAGE_LABELS {
+            assert!(crate::codepage::known(page), "{page} has no table");
+        }
+    }
+
+    /// #761: the CSV open's reader, shared by xlsxy and gridwasm: `sep=`
+    /// names the delimiter and is not a row, and fields convert as typed.
+    #[test]
+    fn csv_parse_and_import_text_convert_as_a_csv_open_does() {
+        let (opts, body) = csv_parse("sep=;\nid;when;amt\n007;1/2/2024;1E3\n", false);
+        assert_eq!(opts.column(0), ColFormat::General);
+        assert_eq!(body, "id;when;amt\n007;1/2/2024;1E3\n");
+        let mut sheet = Sheet::default();
+        let mut styles = Styles::default();
+        let ctx = EntryCtx {
+            date1904: false,
+            today: None,
+            fixed_decimal: None,
+        };
+        let size = import_text(
+            &mut sheet,
+            &mut styles,
+            body,
+            &opts,
+            &AutoConvert::default(),
+            &ctx,
+        );
+        assert_eq!(size, (2, 3));
+        assert_eq!(
+            sheet.cell(0, 1).unwrap().value,
+            CellValue::Text("when".into())
+        );
+        assert_eq!(sheet.cell(1, 0).unwrap().value, CellValue::Number(7.0));
+        assert_eq!(sheet.cell(1, 1).unwrap().value, CellValue::Number(45293.0));
+        let date = styles.xf(sheet.cell(1, 1).unwrap().style);
+        assert_eq!(date.numfmt, NumFmt::Date, "{:?}", date.code);
+        assert_eq!(sheet.cell(1, 2).unwrap().value, CellValue::Number(1000.0));
+        assert_eq!(csv_parse("a\tb", true).0, TextParse::csv('\t'));
+        assert_eq!(csv_parse("a;b;c\n", false).0, TextParse::csv(';'));
+    }
+
+    /// #761: the Macintosh types end records with CR and write Mac Roman;
+    /// the MS-DOS types keep CR LF and write 437.
+    #[test]
+    fn mac_and_dos_text_use_their_code_pages_and_record_ends() {
+        let s = sheet_of(&[&["Ä", "é"], &["x", "y"]]);
+        let mac = sheet_text(&s, &Styles::default(), false, '\t', "\r");
+        assert_eq!(mac, "Ä\té\rx\ty\r");
+        assert_eq!(
+            encode(&mac, Encoding::CodePage(10000)),
+            b"\x80\t\x8E\rx\ty\r"
+        );
+        let dos = sheet_text(&s, &Styles::default(), false, ',', "\r\n");
+        assert_eq!(
+            encode(&dos, Encoding::CodePage(437)),
+            b"\x8E,\x82\r\nx,y\r\n"
+        );
+        assert_eq!(encode("中", Encoding::CodePage(437)), b"?");
+        assert_eq!(Encoding::CodePage(437).origin(), Origin::CodePage(437));
+        assert_eq!(Encoding::Utf16LeBom.origin(), Origin::Utf16Le);
+    }
+
     #[test]
     fn a_sep_first_line_sets_the_delimiter_and_is_dropped() {
         assert_eq!(csv_directive("sep=;\r\na;b\r\n"), (Some(';'), "a;b\r\n"));
@@ -1379,7 +1693,7 @@ mod tests {
         // A cell loaded with a CR LF (openpyxl on Windows writes one into
         // the XML) is still written with a bare LF.
         let s = sheet_of(&[&["Name", "Note"], &["Zürich", "line1\r\nline2"]]);
-        let text = sheet_text(&s, &Styles::default(), false, ',');
+        let text = sheet_text(&s, &Styles::default(), false, ',', "\r\n");
         assert_eq!(text, "Name,Note\r\nZürich,\"line1\nline2\"\r\n");
         let mut want = vec![0xEF, 0xBB, 0xBF];
         want.extend_from_slice("Name,Note\r\nZürich,\"line1\nline2\"\r\n".as_bytes());
@@ -1387,7 +1701,7 @@ mod tests {
         // Quotes, delimiters, a lone CR, and padding to the used width.
         let s = sheet_of(&[&["a\"b", "c,d", "e\rf"], &["x", "", ""]]);
         assert_eq!(
-            sheet_text(&s, &Styles::default(), false, ','),
+            sheet_text(&s, &Styles::default(), false, ',', "\r\n"),
             "\"a\"\"b\",\"c,d\",\"e\nf\"\r\nx,,\r\n"
         );
     }
@@ -1396,7 +1710,7 @@ mod tests {
     fn tab_text_quotes_only_what_needs_it() {
         let s = sheet_of(&[&["a,b", "c\td"]]);
         assert_eq!(
-            sheet_text(&s, &Styles::default(), false, '\t'),
+            sheet_text(&s, &Styles::default(), false, '\t', "\r\n"),
             "a,b\t\"c\td\"\r\n"
         );
     }

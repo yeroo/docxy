@@ -25,6 +25,8 @@
 //!   (powers `TEXT()` and cell display).
 //! - [`mod@format`] — `cell.format` patch parsing/application and its `Xf`
 //!   read-back mapping, shared by every host's agent-facing format verb.
+//! - [`codepage`] — the single-byte code pages text files are read and
+//!   written in, beyond Windows-1252.
 //! - [`textio`] — delimited/fixed-width text in and out (CSV open, the Text
 //!   Import Wizard, Text to Columns, Save As text types).
 //! - [`xlsx`] — `.xlsx` bytes ⇄ [`sheet::Workbook`] with part preservation.
@@ -42,6 +44,7 @@ pub mod autocorrect;
 pub mod cf;
 pub mod circular;
 pub mod clock;
+pub mod codepage;
 pub mod comments;
 pub mod docprops;
 pub mod drawing;

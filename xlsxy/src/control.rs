@@ -1170,7 +1170,10 @@ fn unique_sheet_name(wb: &gridcore::sheet::Workbook, base: &str) -> String {
 /// `semicolon`, `comma`, `space` or any single character), `consecutive`,
 /// `qualifier` (`"`, `'` or `none`), `breaks` (fixed-width positions),
 /// `start_row` (1-based), `origin` (`auto`, `utf-8`, `utf-16le`,
-/// `windows-1252`), `columns` (`general`, `text`, `date:dmy`…, `skip`),
+/// `utf-16be`, `windows-1252`, or another code page by number or name, as
+/// [`gridcore::textio::Origin::parse`] reads it: `437`, `cp437`,
+/// `windows-1251`, `macintosh`, `iso-8859-15`, …), `columns` (`general`,
+/// `text`, `date:dmy`…, `skip`),
 /// `decimal`, `thousands` (one character each) and `trailing_minus`.
 fn text_options(
     args: &Json,
@@ -1600,12 +1603,13 @@ fn wb_consolidate(app: &mut App, args: &Json) -> Result<Json, String> {
 
 /// Import CSV text as a brand-new sheet (never overwrites an existing one —
 /// name collisions are deduplicated), converted exactly as opening a `.csv`
-/// converts it (`csv_to_pkg`), but into a sheet of the *live* workbook.
+/// converts it (`gridcore::textio::csv_parse`, then `text_to_pkg`'s
+/// import), but into a sheet of the *live* workbook.
 fn sheet_import_csv(app: &mut App, args: &Json) -> Result<Json, String> {
     let text = args
         .get_str("text")
         .ok_or("sheet.import-csv needs 'text'")?;
-    let (opts, body) = super::csv_parse(text, false);
+    let (opts, body) = gridcore::textio::csv_parse(text, false);
     import_new_sheet(app, args, body, &opts)
 }
 
@@ -3740,6 +3744,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #761: `origin` takes the File origin's code pages by number or name.
+    #[test]
+    fn sheet_import_text_reads_code_page_origins() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-import-cp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = app();
+        for (origin, bytes, want) in [
+            ("1251", &b"\xC0\xE1\n"[..], "\u{410}\u{431}"),
+            ("cp437", &b"Z\x81r\n"[..], "Z\u{fc}r"),
+            ("macintosh", &b"\xDB5\n"[..], "\u{20ac}5"),
+            ("utf-16be", &b"\xFE\xFF\x00a\x00\xFC"[..], "a\u{fc}"),
+        ] {
+            let path = dir.join("cp.txt");
+            std::fs::write(&path, bytes).unwrap();
+            let r = dispatch(
+                &mut a,
+                "sheet.import-text",
+                &Json::obj(vec![
+                    ("path", Json::Str(path.to_str().unwrap().into())),
+                    ("options", opts(vec![("origin", Json::Str(origin.into()))])),
+                ]),
+            )
+            .unwrap();
+            let sh = &a.pkg.workbook.sheets[r.get_usize("sheet").unwrap()];
+            assert_eq!(
+                sh.cell(0, 0).unwrap().value,
+                CellValue::Text(want.into()),
+                "{origin}"
+            );
+        }
+        let bad = dispatch(
+            &mut a,
+            "sheet.import-text",
+            &Json::obj(vec![
+                ("text", Json::Str("a".into())),
+                ("options", opts(vec![("origin", Json::Str("932".into()))])),
+            ]),
+        );
+        assert!(bad.unwrap_err().contains("unknown origin"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #692: the verb converts one column, refusing to overwrite data unless
     /// told to, as one undo step.
     #[test]
@@ -4205,7 +4251,13 @@ mod tests {
         .unwrap();
         assert!(a.text_dialog.is_none());
         assert_eq!(get_value(&a, "B1"), CellValue::Number(1.0));
-        assert_eq!(std::path::Path::new(&a.path), path.with_extension("xlsx"));
+        // #761: a `.txt` stays bound to itself, as Text (Tab delimited).
+        assert_eq!(std::path::Path::new(&a.path), path);
+        assert!(a.import_source.is_none());
+        assert_eq!(
+            a.text_type.map(|t| crate::SAVE_TYPES[t].label),
+            Some("Text (Tab delimited)")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

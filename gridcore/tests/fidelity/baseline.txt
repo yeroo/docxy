@@ -3241,9 +3241,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	c
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E98/formula-text
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	changed-value	/cells/E99/formula-text
 
-# cell values changed: a cached string's literal CR LF, which XML reads as LF, is written back with the CR escaped (tdf169326: the reader skips XML line-end normalization); a cell past the last column (XFE1) lands on XFC1 (too-many-cols-rows): one entry per cell (#1091)
-ext:libreoffice/sc/qa/unit/data/xlsx/tdf169326_ignore_line_breaks_in_referenced_cells.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/B2/value
-
 # the dimension is recomputed from the cells the model keeps (a source dimension covering dropped empty cells, or a wrong one, changes) (#1096)
 ext:libreoffice/chart2/qa/extras/data/xlsx/chart.xlsx	xl/worksheets/sheet1.xml	changed-value	/worksheet/dimension/@ref
 ext:libreoffice/chart2/qa/extras/data/xlsx/tdf100084.xlsx	xl/worksheets/Sheet1.xml	changed-value	/worksheet/dimension/@ref

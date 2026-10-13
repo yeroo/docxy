@@ -77,6 +77,9 @@ pub(crate) fn verb_for(name: &str) -> Option<&'static str> {
         "xlsxy_export_pdf" => "wb.export-pdf",
         "xlsxy_flash_fill" => "range.flash-fill",
         "xlsxy_autocorrect" => "app.autocorrect",
+        "xlsxy_import_text" => "sheet.import-text",
+        "xlsxy_text_to_columns" => "range.text-to-columns",
+        "xlsxy_options" => "app.options",
         _ => return None,
     })
 }
@@ -995,8 +998,128 @@ fn tool_defs() -> Json {
             ],
             &[],
         ),
+        tool(
+            "xlsxy_import_text",
+            "Import delimited or fixed-width text as a brand-new sheet, as the Text Import Wizard reads it (never overwrites an existing sheet; name collisions are deduplicated). Give text, or the path of a text file. Returns the sheet, its name, rows and cols.",
+            vec![
+                ("text", prop("string", "The text to import.")),
+                (
+                    "path",
+                    prop(
+                        "string",
+                        "A text file to import instead of text, decoded under options.origin.",
+                    ),
+                ),
+                ("options", prop("object", TEXT_OPTIONS_DESC)),
+                (
+                    "name",
+                    prop(
+                        "string",
+                        "Requested sheet name (default: \"Sheet\", deduplicated).",
+                    ),
+                ),
+                target(),
+            ],
+            &[],
+        ),
+        tool(
+            "xlsxy_text_to_columns",
+            "Data > Text to Columns on one column: split its cells under options into dest and the columns to its right. Refuses with Excel's question when that overwrites cells holding data, unless replace is true. One undo step; returns the rows converted.",
+            vec![
+                (
+                    "range",
+                    prop("string", "The one column to split, e.g. \"A1:A20\"."),
+                ),
+                ("options", prop("object", TEXT_OPTIONS_DESC)),
+                (
+                    "dest",
+                    prop(
+                        "string",
+                        "The destination's top-left cell (default: the range's first cell).",
+                    ),
+                ),
+                (
+                    "replace",
+                    prop(
+                        "boolean",
+                        "Overwrite destination cells that hold data (default: false, refused).",
+                    ),
+                ),
+                sheet(),
+                target(),
+            ],
+            &["range"],
+        ),
+        tool(
+            "xlsxy_options",
+            "Read or change File > Options: Data's Automatic Data Conversion (followed by the next .csv/text open and imports) and Advanced's Editing options. With no arguments, returns them all. Every given key is checked before any is set; saved with the app's preferences.",
+            vec![
+                (
+                    "convert_leading_zeros",
+                    prop(
+                        "boolean",
+                        "Remove leading zeros and convert to a number (007 -> 7).",
+                    ),
+                ),
+                (
+                    "convert_long_numbers",
+                    prop(
+                        "boolean",
+                        "Keep the first 15 digits of a long number (else it stays text).",
+                    ),
+                ),
+                (
+                    "convert_e_notation",
+                    prop("boolean", "Convert digits around an E to a number (1E3)."),
+                ),
+                (
+                    "convert_dates",
+                    prop(
+                        "boolean",
+                        "Convert continuous letters and numbers to a date (1/2).",
+                    ),
+                ),
+                (
+                    "edit_fixed_decimal",
+                    prop(
+                        "boolean",
+                        "Automatically insert a decimal point into numbers typed into the grid.",
+                    ),
+                ),
+                (
+                    "edit_fixed_decimal_places",
+                    prop("number", "Its places, a whole number from -300 to 300."),
+                ),
+                (
+                    "edit_move_after_enter",
+                    prop("boolean", "After pressing Enter, move the selection."),
+                ),
+                (
+                    "edit_move_direction",
+                    prop("string", "Its direction: down, right, up or left."),
+                ),
+                (
+                    "edit_in_cell",
+                    prop("boolean", "Allow editing directly in cells."),
+                ),
+                (
+                    "edit_autocomplete",
+                    prop("boolean", "Enable AutoComplete for cell values."),
+                ),
+                (
+                    "edit_formula_autocomplete",
+                    prop("boolean", "Formula AutoComplete."),
+                ),
+                target(),
+            ],
+            &[],
+        ),
     ])
 }
+
+/// The Text Import Wizard's choices, as `sheet.import-text` and
+/// `range.text-to-columns` take them.
+const TEXT_OPTIONS_DESC: &str = "The Text Import Wizard's choices (each optional): kind (delimited|fixed), delimiters (array of tab, semicolon, comma, space or a single character), consecutive (boolean), qualifier (\", ' or none), breaks (array of fixed-width positions), start_row (1-based), origin (auto, utf-8, utf-16le, utf-16be, windows-1252, or a code page by number or name such as 437, 1251, macintosh), columns (array of general, text, date:mdy/dmy/ymd/myd/dym/ydm or skip), decimal and thousands (one character each), trailing_minus (boolean).";
 
 #[cfg(test)]
 mod tests {
@@ -1117,12 +1240,16 @@ mod tests {
             // #712: Flash Fill and AutoCorrect.
             "xlsxy_flash_fill",
             "xlsxy_autocorrect",
+            // #761: #704's text import, Text to Columns and File > Options.
+            "xlsxy_import_text",
+            "xlsxy_text_to_columns",
+            "xlsxy_options",
         ];
         let save_pos = names.iter().position(|n| *n == "xlsxy_save").unwrap();
         assert_eq!(
             &names[save_pos + 1..],
             &expected_tail,
-            "wave-1/wave-2/wave-3/#600/#612/#712 tools must be appended right after xlsxy_save, in this order"
+            "wave-1/wave-2/wave-3/#600/#612/#712/#761 tools must be appended right after xlsxy_save, in this order"
         );
         for t in tools {
             assert_eq!(
@@ -1148,6 +1275,9 @@ mod tests {
                 .to_string()
         };
         assert_eq!(required_of("xlsxy_comments"), "[]");
+        assert_eq!(required_of("xlsxy_import_text"), "[]");
+        assert_eq!(required_of("xlsxy_text_to_columns"), "[\"range\"]");
+        assert_eq!(required_of("xlsxy_options"), "[]");
         assert_eq!(required_of("xlsxy_comment_add"), "[\"ref\",\"text\"]");
         assert_eq!(required_of("xlsxy_comment_remove"), "[\"ref\"]");
         assert_eq!(required_of("xlsxy_range_set"), "[\"start\",\"rows\"]");
@@ -1380,6 +1510,9 @@ mod tests {
         ("xlsxy_export_pdf", "wb.export-pdf"),
         ("xlsxy_flash_fill", "range.flash-fill"),
         ("xlsxy_autocorrect", "app.autocorrect"),
+        ("xlsxy_import_text", "sheet.import-text"),
+        ("xlsxy_text_to_columns", "range.text-to-columns"),
+        ("xlsxy_options", "app.options"),
     ];
     /// Tools handled specially in `do_tool` (not simple verb forwards), so
     /// `verb_for` deliberately returns `None` for them.

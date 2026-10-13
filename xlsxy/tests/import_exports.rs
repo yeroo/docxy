@@ -34,7 +34,10 @@ fn run(source: &Path, mode: &str, target: &Path) -> Output {
 fn csv_and_recalc_refuse_the_actual_csv_or_tsv_input() {
     let dir = Dir::new("import-guard");
     for (extension, bytes) in [
+        // A `.csv` and `.txt` are bound to themselves as text (#761): the
+        // guard is the workbook's own path now, not an import source.
         ("csv", "first;second\n1;2\n"),
+        ("txt", "first\tsecond\n1\t2\n"),
         ("tsv", "first\tsecond\n1\t2\n"),
     ] {
         let source = dir.0.join(format!("input.{extension}"));
@@ -42,16 +45,28 @@ fn csv_and_recalc_refuse_the_actual_csv_or_tsv_input() {
         let alternate_spelling = dir.0.join(format!("./input.{extension}"));
         let hard_link = dir.0.join(format!("alias.{extension}"));
         std::fs::hard_link(&source, &hard_link).unwrap();
+        // A link named as a workbook: `--recalc` takes the name, so only
+        // the source guard stops it.
+        let workbook_link = dir.0.join(format!("alias-{extension}.xlsx"));
+        std::fs::hard_link(&source, &workbook_link).unwrap();
         for mode in ["--csv", "--recalc"] {
-            for alias in [&alternate_spelling, &hard_link] {
+            for alias in [&alternate_spelling, &hard_link, &workbook_link] {
                 let result = run(&source, mode, alias);
                 assert!(
                     !result.status.success(),
                     "{extension} {mode} unexpectedly succeeded"
                 );
+                // `--recalc` to a text name is refused by its type first
+                // (#761 r1); either way nothing is written.
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                let by_type = mode == "--recalc"
+                    && alias != &workbook_link
+                    && extension != "tsv"
+                    && stderr.contains("write .xlsx instead");
                 assert!(
-                    String::from_utf8_lossy(&result.stderr)
-                        .contains("cannot overwrite the source document")
+                    by_type || stderr.contains("cannot overwrite the source document"),
+                    "{extension} {mode} {}: {stderr}",
+                    alias.display()
                 );
                 assert_eq!(std::fs::read(&source).unwrap(), bytes.as_bytes());
                 assert_eq!(std::fs::read(alias).unwrap(), bytes.as_bytes());
@@ -100,10 +115,11 @@ fn csv_export_of_a_template_refuses_the_template_itself() {
 #[test]
 fn imported_export_protects_rebound_workbook_and_recalc_still_saves_xlsx_in_place() {
     let dir = Dir::new("rebound-guard");
-    let source = dir.0.join("input.csv");
+    // A `.tsv` import (a `.csv` is bound to itself as text since #761).
+    let source = dir.0.join("input.tsv");
     let binding = dir.0.join("input.xlsx");
     let alias = dir.0.join("binding-alias.csv");
-    std::fs::write(&source, b"first,second\n1,2\n").unwrap();
+    std::fs::write(&source, b"first\tsecond\n1\t2\n").unwrap();
     let result = run(&source, "--recalc", &binding);
     assert!(
         result.status.success(),
@@ -112,7 +128,7 @@ fn imported_export_protects_rebound_workbook_and_recalc_still_saves_xlsx_in_plac
     );
     let workbook = std::fs::read(&binding).unwrap();
     assert!(gridcore::xlsx::load_xlsx(&workbook).is_ok());
-    // input.xlsx is taken now, so the CSV binds to input1.xlsx (#876); an
+    // input.xlsx is taken now, so the TSV binds to input1.xlsx (#876); an
     // export still never replaces input.xlsx, by its name or a link.
     std::fs::hard_link(&binding, &alias).unwrap();
     for out in [&alias, &binding] {
@@ -393,6 +409,44 @@ fn a_text_file_converts_headlessly_with_the_wizard_defaults() {
     );
 }
 
+/// #761 r1: `--pdf` of a .txt imports it with the wizard's defaults and
+/// prints its content (it printed an empty new workbook before), and of a
+/// template never writes over the template.
+#[test]
+fn a_text_file_and_a_template_print_headlessly() {
+    let dir = Dir::new("txt-pdf");
+    let source = dir.0.join("in.txt");
+    std::fs::write(&source, "name\tqty\r\nPen\t4\r\n").unwrap();
+    let out = dir.0.join("out.pdf");
+    let result = run(&source, "--pdf", &out);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let pdf = String::from_utf8_lossy(&std::fs::read(&out).unwrap()).into_owned();
+    assert!(pdf.contains("(Pen) Tj"), "{pdf}");
+
+    use gridcore::xlsx::{SpreadsheetKind, load_xlsx, save_xlsx, save_xlsx_as};
+    let mut book = gridcore::xlsx::new_xlsx();
+    book.workbook.sheets[0].set_cell(0, 0, gridcore::sheet::Cell::text("Budget"));
+    let template = dir.0.join("Budget.xltx");
+    let bytes = save_xlsx_as(
+        &load_xlsx(&save_xlsx(&book)).unwrap(),
+        SpreadsheetKind::Template,
+    );
+    std::fs::write(&template, &bytes).unwrap();
+    let result = run(&template, "--pdf", &template);
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("cannot overwrite the source document"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(std::fs::read(&template).unwrap(), bytes);
+    assert!(!dir.0.join("Budget1.xlsx").exists());
+}
+
 fn corpus(dir: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -441,6 +495,12 @@ fn recalc_refuses_to_write_types_it_cannot_save() {
         ("xlsb", "Excel Binary Workbook"),
         ("ods", "OpenDocument Spreadsheet"),
         ("xml", "XML Data"),
+        // #761 r1: nor a text type, a Web Page or a PDF.
+        ("csv", "CSV UTF-8 (Comma delimited)"),
+        ("txt", "Text (Tab delimited)"),
+        ("prn", "Formatted Text (Space delimited)"),
+        ("htm", "Web Page"),
+        ("pdf", "PDF"),
     ] {
         let out = dir.0.join(format!("out.{ext}"));
         let result = run(&source, "--recalc", &out);
