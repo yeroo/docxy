@@ -4,6 +4,7 @@
 //! docxcore's table-style resolver. Pure, so it is tested without a window;
 //! `table_el` in main.rs turns it into elements.
 
+use docxcore::border_style::BorderStyle;
 use docxcore::model::{Table, VMerge};
 use docxcore::table::{GridMap, cell_props, usable_grid};
 use docxcore::table_props::{BorderLine, VAlign};
@@ -14,8 +15,15 @@ use docxcore::table_styles::{CellLook, TableStyle, resolve};
 pub struct Line {
     /// `0xRRGGBB`, `None` for automatic (the text colour).
     pub color: Option<u32>,
-    /// Thickness in px at 100% zoom.
+    /// The band its strokes cover, in px at 100% zoom.
     pub width: f32,
+    /// Its solid strokes (#765), innermost first: each one's width and the
+    /// distance of its centre line from the first one's, in px at 100% zoom.
+    /// A double or triple line has two or three, a thin-thick one two of
+    /// unequal widths; every other style one, drawn solid (dashes, dots and
+    /// art are not drawn).
+    strokes: [(f32, f32); 3],
+    count: usize,
 }
 
 impl Line {
@@ -23,15 +31,52 @@ impl Line {
         if !l.visible() {
             return None;
         }
+        let style = BorderStyle::parse(&l.val)?;
         // `w:sz` is eighths of a point; a point is 4/3 px.
-        let mut width = (l.sz as f32 / 8.0 * 4.0 / 3.0).max(1.0);
-        if l.val == "double" {
-            width = width.max(3.0);
-        }
+        let w = l.sz as f32 / 8.0 * 4.0 / 3.0;
+        let mut strokes = [(0.0, 0.0); 3];
+        let all = style.strokes(w);
+        let count = all.len().min(3);
+        strokes[..count].copy_from_slice(&all[..count]);
         Some(Line {
             color: crate::hex_rgb(&l.color),
-            width,
+            width: style.total(w),
+            strokes,
+            count,
         })
+    }
+
+    /// The strokes at `zoom`, outermost first: each one's distance in px
+    /// from the cell's edge, and its width. A stroke and a gap are each at
+    /// least a pixel, so a hairline double still shows two lines.
+    pub fn strokes_at(&self, zoom: f32) -> Vec<(f32, f32)> {
+        let src = &self.strokes[..self.count];
+        let mut inner_first = Vec::with_capacity(src.len());
+        let mut at = 0.0;
+        for (k, &(w, d)) in src.iter().enumerate() {
+            if k > 0 {
+                let (pw, pd) = src[k - 1];
+                at += ((d - pd - pw / 2.0 - w / 2.0) * zoom).max(1.0);
+            }
+            let width = (w * zoom).max(1.0);
+            inner_first.push((at, width));
+            at += width;
+        }
+        // The innermost stroke is the one furthest from the edge.
+        inner_first
+            .into_iter()
+            .rev()
+            .map(|(from_inner, width)| (at - from_inner - width, width))
+            .collect()
+    }
+
+    /// The width a single-stroke drawing (a diagonal) uses: its widest
+    /// stroke, in px at 100% zoom.
+    pub fn stroke_width(&self) -> f32 {
+        self.strokes[..self.count]
+            .iter()
+            .map(|&(w, _)| w)
+            .fold(0.0, f32::max)
     }
 }
 
@@ -58,6 +103,10 @@ pub struct CellBox {
     pub diag_down: Option<Line>,
     pub diag_up: Option<Line>,
     pub valign: VAlign,
+    /// Top, bottom, left, right: whether the cell beside this one draws the
+    /// edge they share (#765), so this side draws nothing, not even a
+    /// gridline.
+    pub neighbour_draws: [bool; 4],
 }
 
 /// One row: the width skipped before its first cell (`w:gridBefore`), then
@@ -100,7 +149,8 @@ pub fn layout(t: &Table, style: Option<&TableStyle>) -> Vec<RowBox> {
     let widths = usable_grid(t);
     let span_w = |s: usize, n: usize| widths.iter().skip(s).take(n).sum::<u32>();
     let looks = resolve(t, style);
-    map.rows
+    let mut rows: Vec<RowBox> = map
+        .rows
         .iter()
         .enumerate()
         .map(|(r, rm)| RowBox {
@@ -141,11 +191,73 @@ pub fn layout(t: &Table, style: Option<&TableStyle>) -> Vec<RowBox> {
                         valign: cell_props(cell)
                             .attr("w:vAlign", "w:val")
                             .map_or(VAlign::Top, |v| VAlign::parse(&v)),
+                        neighbour_draws: [false; 4],
                     }
                 })
                 .collect(),
         })
-        .collect()
+        .collect();
+    share_edges(&mut rows);
+    rows
+}
+
+/// Give each edge two cells share one owner (#765): each cell draws its sides
+/// inside its own box, so both drawing it would double every inside line.
+/// Side by side, the cells are next to each other in a row; one above the
+/// other, the cell above covers the same grid columns. The wider line wins,
+/// else the left or upper cell's; an edge neither cell draws is left to the
+/// left or upper cell's gridline. Cells above that only partly overlap
+/// (ragged rows) each keep their own edges.
+fn share_edges(rows: &mut [RowBox]) {
+    const TOP: usize = 0;
+    const BOTTOM: usize = 1;
+    const LEFT: usize = 2;
+    const RIGHT: usize = 3;
+    // Whether `later` takes the edge from `earlier`: only a wider line.
+    let later_wins = |earlier: Option<Line>, later: Option<Line>| match (earlier, later) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(e), Some(l)) => l.width > e.width,
+    };
+    for row in rows.iter_mut() {
+        for k in 1..row.cells.len() {
+            let (before, after) = row.cells.split_at_mut(k);
+            let (a, b) = (&mut before[k - 1], &mut after[0]);
+            if a.start + a.span != b.start {
+                continue;
+            }
+            if later_wins(a.right, b.left) {
+                a.right = None;
+                a.neighbour_draws[RIGHT] = true;
+            } else {
+                b.left = None;
+                b.neighbour_draws[LEFT] = true;
+            }
+        }
+    }
+    for r in 1..rows.len() {
+        let (above, below) = rows.split_at_mut(r);
+        for b in &mut below[0].cells {
+            // A merge's continued part has no top edge to share.
+            if b.continues {
+                continue;
+            }
+            let Some(a) = above[r - 1]
+                .cells
+                .iter_mut()
+                .find(|a| a.start == b.start && a.span == b.span)
+            else {
+                continue;
+            };
+            if later_wins(a.bottom, b.top) {
+                a.bottom = None;
+                a.neighbour_draws[BOTTOM] = true;
+            } else {
+                b.top = None;
+                b.neighbour_draws[TOP] = true;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -276,13 +388,9 @@ mod tests {
         assert_eq!(rows[1].cells[0].fill, Some(0xD9E2F3), "banded row");
         let c = &rows[1].cells[1];
         assert_eq!(c.fill, Some(0x00FF00));
-        assert_eq!(
-            c.right,
-            Some(Line {
-                color: Some(0xFF0000),
-                width: 16.0 / 6.0
-            })
-        );
+        let right = c.right.expect("a right edge");
+        assert_eq!(right.color, Some(0xFF0000));
+        assert_eq!(right.width, 16.0 / 6.0);
         assert_eq!(c.diag_up.map(|l| l.color), Some(None));
         assert_eq!(c.valign, VAlign::Bottom);
         assert_eq!(rows[2].cells[0].fill, None, "second band has no fill");
@@ -297,5 +405,104 @@ mod tests {
         let rows = layout(&t, lookup_style(None, "TableGrid").as_ref());
         assert!(rows[0].cells[0].top.is_none());
         assert!(rows[0].cells[0].left.is_some());
+    }
+
+    fn line(val: &str, sz: u32) -> Line {
+        Line::of(&BorderLine {
+            val: val.into(),
+            sz,
+            color: "auto".into(),
+        })
+        .expect("a visible line")
+    }
+
+    #[test]
+    fn compound_borders_draw_their_strokes_apart_765() {
+        // Single: one stroke, a hairline at least a pixel.
+        assert_eq!(line("single", 4).strokes_at(1.0), [(0.0, 1.0)]);
+        assert_eq!(line("single", 12).strokes_at(1.0), [(0.0, 2.0)]);
+        // A half-point double at 100%: two 1px lines a pixel apart.
+        assert_eq!(line("double", 4).strokes_at(1.0), [(0.0, 1.0), (2.0, 1.0)]);
+        // 1.5pt (2px) at 200%: 4px lines, 4px gaps.
+        assert_eq!(
+            line("triple", 12).strokes_at(2.0),
+            [(0.0, 4.0), (8.0, 4.0), (16.0, 4.0)]
+        );
+        // Thin-thick, the thin line inner: outermost (thick) first.
+        let tt = line("thinThickSmallGap", 18);
+        assert_eq!(tt.strokes_at(1.0), [(0.0, 3.0), (4.0, 1.0)]);
+        // The band is the style's whole width, as the PDF export draws it.
+        assert_eq!(line("double", 12).width, 6.0);
+        assert_eq!(line("double", 12).stroke_width(), 2.0);
+        assert_eq!(tt.stroke_width(), 3.0);
+    }
+
+    #[test]
+    fn an_inside_edge_is_drawn_by_one_cell_765() {
+        let grid = lookup_style(None, "TableGrid");
+        let t = new_table(2, 2, 9000, AutoFit::Default);
+        let rows = layout(&t, grid.as_ref());
+        // Across: the left cell draws the edge, the right one leaves it.
+        assert!(rows[0].cells[0].right.is_some());
+        assert!(rows[0].cells[1].left.is_none());
+        assert!(rows[0].cells[1].neighbour_draws[2]);
+        assert!(!rows[0].cells[0].neighbour_draws[3]);
+        // Down: the upper cell draws it.
+        assert!(rows[0].cells[1].bottom.is_some());
+        assert!(rows[1].cells[1].top.is_none());
+        assert!(rows[1].cells[1].neighbour_draws[0]);
+        // The outer edges stay.
+        assert!(rows[0].cells[0].left.is_some() && rows[0].cells[1].right.is_some());
+        assert!(rows[0].cells[0].top.is_some() && rows[1].cells[0].bottom.is_some());
+    }
+
+    #[test]
+    fn the_wider_line_wins_a_shared_edge_765() {
+        let mut t = new_table(1, 2, 9000, AutoFit::Default);
+        edit_cell_props(&mut t.rows[0].cells[1], |p| {
+            p.set("<w:tcBorders><w:left w:val=\"double\" w:sz=\"4\" w:color=\"FF0000\"/></w:tcBorders>")
+        });
+        let rows = layout(&t, lookup_style(None, "TableGrid").as_ref());
+        assert!(rows[0].cells[0].right.is_none());
+        assert!(rows[0].cells[0].neighbour_draws[3]);
+        assert_eq!(rows[0].cells[1].left.map(|l| l.color), Some(Some(0xFF0000)));
+        // A gridline edge (no line either side) is the left cell's alone.
+        let rows = layout(&new_table(1, 2, 9000, AutoFit::Default), None);
+        assert!(!rows[0].cells[0].neighbour_draws[3]);
+        assert!(rows[0].cells[1].neighbour_draws[2]);
+    }
+
+    #[test]
+    fn ragged_rows_and_merges_share_only_matching_edges_765() {
+        let grid = lookup_style(None, "TableGrid");
+        let mut t = new_table(3, 2, 9000, AutoFit::Default);
+        // Row 1 starts a grid column in: its one cell spans column 1 only.
+        t.rows[1].cells.remove(0);
+        t.rows[1].raw_props = vec!["<w:trPr><w:gridBefore w:val=\"1\"/></w:trPr>".into()];
+        // Row 2's first cell spans both columns.
+        t.rows[2].cells.remove(1);
+        t.rows[2].cells[0].grid_span = 2;
+        let rows = layout(&t, grid.as_ref());
+        // Row 1's cell has no left neighbour, and sits under row 0's second.
+        assert!(rows[1].cells[0].left.is_some());
+        assert!(rows[1].cells[0].top.is_none());
+        assert!(rows[0].cells[1].bottom.is_some());
+        // Row 0's first cell has nothing matching below it: its bottom stays.
+        assert!(rows[0].cells[0].bottom.is_some());
+        // Row 2's wide cell matches nothing above: both edges stay.
+        assert!(rows[1].cells[0].bottom.is_some());
+        assert!(rows[2].cells[0].top.is_some());
+
+        // A vertical merge: its continued part shares no top edge, and the
+        // row under the merge takes its top from the merge's last part.
+        let mut t = new_table(3, 1, 9000, AutoFit::Default);
+        t.rows[0].cells[0].v_merge = VMerge::Restart;
+        t.rows[1].cells[0].v_merge = VMerge::Continue;
+        let rows = layout(&t, grid.as_ref());
+        assert!(rows[1].cells[0].top.is_none());
+        assert!(!rows[1].cells[0].neighbour_draws[0]);
+        assert!(rows[1].cells[0].bottom.is_some());
+        assert!(rows[2].cells[0].top.is_none());
+        assert!(rows[2].cells[0].neighbour_draws[0]);
     }
 }

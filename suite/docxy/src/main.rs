@@ -29657,23 +29657,30 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
                     })
                     .collect()
             };
-            // One absolutely placed line per side, so each side keeps its own
-            // colour and thickness.
-            let side = |which: u8, l: Option<table_view::Line>| -> Option<AnyElement> {
-                let placed = |d: Div, thick: Pixels| match which {
-                    0 => d.top_0().left_0().right_0().h(thick),
-                    1 => d.bottom_0().left_0().right_0().h(thick),
-                    2 => d.top_0().bottom_0().left_0().w(thick),
-                    _ => d.top_0().bottom_0().right_0().w(thick),
+            // One absolutely placed strip per stroke of each side, so each
+            // side keeps its own colour and thickness and a double line
+            // draws as two (#765).
+            let side = |which: u8, l: Option<table_view::Line>| -> Vec<AnyElement> {
+                let placed = |d: Div, inset: Pixels, thick: Pixels| match which {
+                    0 => d.top(inset).left_0().right_0().h(thick),
+                    1 => d.bottom(inset).left_0().right_0().h(thick),
+                    2 => d.top_0().bottom_0().left(inset).w(thick),
+                    _ => d.top_0().bottom_0().right(inset).w(thick),
                 };
                 match l {
-                    Some(l) => Some(
-                        placed(div().absolute(), px((l.width * zoom).max(1.0)))
-                            .bg(l.color.map_or(fg, hsla_u))
-                            .into_any_element(),
-                    ),
+                    Some(l) => l
+                        .strokes_at(zoom)
+                        .into_iter()
+                        .map(|(inset, thick)| {
+                            placed(div().absolute(), px(inset), px(thick))
+                                .bg(l.color.map_or(fg, hsla_u))
+                                .into_any_element()
+                        })
+                        .collect(),
+                    // The cell beside draws this edge.
+                    None if cb.neighbour_draws[usize::from(which)] => Vec::new(),
                     None if ctx.tbl.gridlines => {
-                        let d = placed(div().absolute(), px(0.))
+                        let d = placed(div().absolute(), px(0.), px(0.))
                             .border_dashed()
                             .border_color(grid_color);
                         let d = match which {
@@ -29682,9 +29689,9 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
                             2 => d.border_l_1(),
                             _ => d.border_r_1(),
                         };
-                        Some(d.into_any_element())
+                        vec![d.into_any_element()]
                     }
-                    None => None,
+                    None => Vec::new(),
                 }
             };
             let edges: Vec<AnyElement> = [
@@ -29708,7 +29715,9 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
                             (up, point(x1, o.y), point(o.x, y1)),
                         ] {
                             let Some(l) = l else { continue };
-                            let mut pb = PathBuilder::stroke(px((l.width * zoom).max(1.0)));
+                            // A diagonal is one stroke whatever its style.
+                            let mut pb =
+                                PathBuilder::stroke(px((l.stroke_width() * zoom).max(1.0)));
                             pb.move_to(from);
                             pb.line_to(to);
                             if let Ok(path) = pb.build() {
