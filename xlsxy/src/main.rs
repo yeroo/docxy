@@ -458,23 +458,21 @@ fn type_for_path(path: &str) -> Option<usize> {
     SAVE_TYPES.iter().position(|t| t.ext == ext)
 }
 
-/// `path`'s save type when a save can't write a workbook under it: an
-/// `.xls`, `.xlsb`, `.ods` (no writer), an `.xml` (needs XML maps), a
-/// `.pdf` (a publish, never the workbook's own file), and so on. `None`
-/// for a type it writes, and for no or an unknown extension.
+/// `path`'s save type when a workbook package can't be written under it:
+/// any type that is not a package, so an `.xls`, `.xlsb`, `.ods` (no
+/// writer), an `.xml` (needs XML maps), a text type's `.csv`/`.txt`/`.prn`,
+/// a Web Page's `.htm` or a `.pdf`. `None` for a package type, and for no or
+/// an unknown extension.
 fn unwritable_type(path: &str) -> Option<&'static backstage::SaveType> {
     let t = &SAVE_TYPES[type_for_path(path)?];
-    matches!(
-        save_kind(t),
-        SaveKind::Unsupported | SaveKind::XmlData | SaveKind::Pdf
-    )
-    .then_some(t)
+    (save_kind(t) != SaveKind::Package).then_some(t)
 }
 
 /// The path a new workbook opened on the missing `path` is bound to:
-/// `path` itself, unless a save can't write its type (`xlsxy new.xls`),
-/// when it is [`import_binding`]'s `.xlsx`, as Excel starts a new workbook
-/// as one. A save then never writes `.xlsx` bytes under an `.xls` name.
+/// `path` itself, unless its type is not a package (`xlsxy new.xls`,
+/// `new.htm`), when it is [`import_binding`]'s `.xlsx`, as Excel starts a
+/// new workbook as one. A save then never writes `.xlsx` bytes under an
+/// `.xls` or `.htm` name.
 fn missing_binding(path: &str) -> String {
     match unwritable_type(path) {
         Some(_) => import_binding(path),
@@ -696,10 +694,7 @@ fn main() -> ExitCode {
         // Only a workbook package is written: an .xls, .xlsb, .ods, .xml, a
         // text type's .csv/.txt/.prn/.htm or a .pdf (any type that is not a
         // package) would get .xlsx bytes under its name.
-        let not_package = type_for_path(&out)
-            .map(|t| &SAVE_TYPES[t])
-            .filter(|t| save_kind(t) != SaveKind::Package);
-        if let Some(t) = not_package {
+        if let Some(t) = unwritable_type(&out) {
             eprintln!(
                 "error: cannot save as .{} ({}): write .xlsx instead",
                 t.ext, t.label
@@ -787,13 +782,13 @@ fn main() -> ExitCode {
         pkg,
         &path,
         import_source.map(|s| (s, format)),
+        text,
         template,
         welcome,
         wizard,
         TuiFlags {
             vim: parsed.vim,
             read_only,
-            text,
         },
     ) {
         Ok(()) => ExitCode::SUCCESS,
@@ -11858,14 +11853,14 @@ struct TuiFlags {
     vim: bool,
     /// `--read-only`: the input file, opened read-only (#882).
     read_only: Option<String>,
-    /// The `.csv`/`.txt` input, bound to itself as text (#761).
-    text: Option<TextBound>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_tui(
     pkg: SheetPackage,
     path: &str,
     import: Option<(String, Option<SourceFormat>)>,
+    text: Option<TextBound>,
     template: Option<String>,
     welcome: bool,
     wizard: Option<String>,
@@ -11888,7 +11883,7 @@ fn run_tui(
     app.xlstart = xlstart_dir();
     let format = import.as_ref().and_then(|(_, f)| *f);
     app.import_source = import.map(|(s, _)| s);
-    app.bind_text(flags.text.clone());
+    app.bind_text(text);
     app.note_import(format);
     if let Some(template) = template {
         app.note_template(&template);
@@ -12582,6 +12577,10 @@ mod tests {
         let dir = tmp("missing-pdf");
         let at = |name: &str| dir.join(name).to_string_lossy().into_owned();
         assert_eq!(missing_binding(&at("new.pdf")), at("new.xlsx"));
+        // #761 r2: nor a Web Page, whose Ctrl+S wrote a package under .htm.
+        for name in ["new.htm", "new.html", "new.mht"] {
+            assert_eq!(missing_binding(&at(name)), at("new.xlsx"), "{name}");
+        }
         let mut app = App::new(new_xlsx(), &at("book.xlsx"));
         app.text_type = Some(save_type_at("PDF"));
         app.path = at("book.pdf");
