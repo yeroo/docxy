@@ -2173,9 +2173,18 @@ impl App {
                 self.status = Some("Inserted page break".to_string());
             }
             InsertTable => {
-                self.insert_table(2, 2);
-                self.after_edit();
-                self.status = Some("Inserted 2×2 table".to_string());
+                // At the caret, as one undo step: the paragraph splits around
+                // the table and a cell's caret nests it (#765).
+                let fit = docxcore::table::AutoFit::Default;
+                match self.editor.insert_table(2, 2, fit) {
+                    Ok(()) => {
+                        self.editor.clear_selection();
+                        self.clear_visual_hint();
+                        self.after_edit();
+                        self.status = Some("Inserted 2×2 table".to_string());
+                    }
+                    Err(e) => self.status = Some(e),
+                }
             }
             Columns => {
                 let next = self.edit_final_sect_pr(true, |pkg| {
@@ -4660,31 +4669,6 @@ impl App {
     }
 
     /// Build a simple field (`<w:fldSimple>`) inline with its computed value.
-    /// Insert a bordered `rows`×`cols` table just after the caret's block, with
-    /// the caret landing in the first cell.
-    fn insert_table(&mut self, rows: usize, cols: usize) {
-        let table = docxcore::table::new_table(
-            rows,
-            cols,
-            docxcore::table::DEFAULT_TEXT_WIDTH,
-            docxcore::table::AutoFit::Default,
-        );
-        let body = &mut self.editor.doc.body;
-        let at = self
-            .editor
-            .caret
-            .path
-            .first()
-            .copied()
-            .unwrap_or(0)
-            .min(body.len().saturating_sub(1));
-        let pos = (at + 1).min(body.len());
-        body.insert(pos, Block::Table(table));
-        self.editor.clear_selection();
-        self.editor.set_caret(Caret::at(vec![pos, 0, 0, 0], 0));
-        self.clear_visual_hint();
-    }
-
     fn build_field(&self, kind: FieldKind) -> Inline {
         let text = self.field_value(kind);
         docxcore::field::fld_simple(kind.instr(), &text, &self.editor.caret_props())
@@ -15670,6 +15654,45 @@ mod tests {
             .expect("no table inserted");
         assert_eq!(t.rows.len(), 2);
         assert_eq!(t.rows[0].cells.len(), 2);
+    }
+
+    #[test]
+    fn insert_table_splits_the_paragraph_at_the_caret_as_one_undo_step_765() {
+        let mut app = app_with(&["abcd"]);
+        app.editor.set_caret(Caret::at(vec![0], 2));
+        app.run_act(ribbon::Act::InsertTable);
+        assert_eq!(app.editor.doc.body[0].plain_text(), "ab");
+        assert!(matches!(app.editor.doc.body[1], Block::Table(_)));
+        assert_eq!(app.editor.doc.body[2].plain_text(), "cd");
+        assert_eq!(app.editor.caret, Caret::at(vec![1, 0, 0, 0], 0));
+        assert!(app.modified);
+        assert!(app.editor.undo());
+        assert_eq!(body_paragraphs(&app), ["abcd"]);
+        assert!(
+            app.editor
+                .doc
+                .body
+                .iter()
+                .all(|b| !matches!(b, Block::Table(_)))
+        );
+    }
+
+    #[test]
+    fn insert_table_at_a_paragraph_start_goes_before_it_765() {
+        let mut app = app_with(&["text"]);
+        app.run_act(ribbon::Act::InsertTable);
+        assert!(matches!(app.editor.doc.body[0], Block::Table(_)));
+        assert_eq!(app.editor.doc.body[1].plain_text(), "text");
+    }
+
+    #[test]
+    fn insert_table_is_refused_under_read_only_protection_765() {
+        let mut app = app_with(&["abcd"]);
+        app.editor.set_caret(Caret::at(vec![0], 2));
+        protect(&mut app, ProtectionEditMode::ReadOnly, false);
+        app.run_act(ribbon::Act::InsertTable);
+        assert_eq!(body_paragraphs(&app), ["abcd"]);
+        assert!(!app.modified);
     }
 
     #[test]

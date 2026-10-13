@@ -323,7 +323,7 @@ fn toggle_attr(val: &str) -> bool {
     !val.is_empty() && toggle(val)
 }
 
-fn toggle(val: &str) -> bool {
+pub(crate) fn toggle(val: &str) -> bool {
     !(val == "0" || val == "false" || val == "off" || val == "none")
 }
 
@@ -353,7 +353,7 @@ fn raw_toggle(raw_props: &[String], local: &str) -> Option<bool> {
     })
 }
 
-fn has_raw_child(raw_props: &[String], local: &str) -> bool {
+pub(crate) fn has_raw_child(raw_props: &[String], local: &str) -> bool {
     raw_props.iter().any(|raw| {
         let mut parser = XmlParser::new(raw);
         parser.next() == Event::Start

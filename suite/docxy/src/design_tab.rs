@@ -319,6 +319,34 @@ pub(crate) fn page_ink(sheet: u32) -> (u32, u32) {
     }
 }
 
+/// How a table cell's text draws on its fill (#765).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CellInk {
+    /// The text and dimmed-text colours.
+    pub fg: u32,
+    pub dim: u32,
+    /// A chip behind text (a field's value, a placeholder) and a hover
+    /// wash: `(colour, alpha)` laid over the fill, so the chip reads against
+    /// the fill and the ink reads on the chip.
+    pub chip: (u32, f32),
+}
+
+/// The ink a table cell's automatic text draws in (#765): on a fill, the
+/// ink Word draws on it, dark on a light fill and light on a dark one, as
+/// [`page_ink`] does on a page colour, with chips that shade the fill
+/// darker under either; `None` without a fill (the surrounding ink).
+pub(crate) fn cell_ink(fill: Option<u32>) -> Option<CellInk> {
+    let (fg, dim) = page_ink(fill?);
+    // Light ink is on a dark fill: a deeper shade keeps it readable; dark
+    // ink on a light fill takes a faint one, as Print Layout's chips do.
+    let light = fg > 0x808080;
+    Some(CellInk {
+        fg,
+        dim,
+        chip: (0x000000, if light { 0.3 } else { 0.06 }),
+    })
+}
+
 /// Whether a Design command's choice is the current one, for the check mark.
 pub(crate) fn design_checked(tab: &DocTab, act: DesignAct) -> bool {
     match act {

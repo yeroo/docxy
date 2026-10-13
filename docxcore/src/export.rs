@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::border_style::BorderStyle;
 use crate::field::{FieldEvent, field_events};
 use crate::load::{Relationships, xml_attr_value};
 use crate::model::*;
@@ -188,66 +189,6 @@ struct BorderSide {
     space: f32,
     color: (f32, f32, f32),
     style: BorderStyle,
-}
-
-/// How a border side is stroked (`w:val`, ECMA-376 §17.18.2).
-#[derive(Debug, Clone, PartialEq)]
-enum BorderStyle {
-    /// One solid line: `single`, `thick`, and the styles drawn as it for now
-    /// (`wave`, `doubleWave`, `dashDotStroked`, the 3-D styles).
-    Single,
-    /// Parallel solid lines, innermost first: whether each is thin (a third of
-    /// the side's width), and the gap between them in widths of the thin line
-    /// (or of the line, when none is thin).
-    Lines { thin: Vec<bool>, gap: f32 },
-    /// A dash array in multiples of the line width.
-    Dashes(Vec<f32>),
-    /// An art border (`apples`, `basicBlackDots`, …): a dashed band, since
-    /// the artwork isn't drawn.
-    Art,
-}
-
-impl BorderStyle {
-    /// The style for `w:val`; `None` for no border.
-    fn parse(val: &str) -> Option<BorderStyle> {
-        let lines = |thin: &[bool], gap: f32| BorderStyle::Lines {
-            thin: thin.to_vec(),
-            gap,
-        };
-        Some(match val {
-            "none" | "nil" => return None,
-            "single" | "thick" | "wave" | "doubleWave" | "dashDotStroked" | "threeDEmboss"
-            | "threeDEngrave" | "outset" | "inset" => BorderStyle::Single,
-            // Gaps of one line width.
-            "double" => lines(&[false, false], 1.0),
-            "triple" => lines(&[false, false, false], 1.0),
-            "dotted" => BorderStyle::Dashes(vec![1.0, 1.0]),
-            "dashed" => BorderStyle::Dashes(vec![3.0, 2.0]),
-            "dashSmallGap" => BorderStyle::Dashes(vec![3.0, 1.0]),
-            "dotDash" => BorderStyle::Dashes(vec![3.0, 2.0, 1.0, 2.0]),
-            "dotDotDash" => BorderStyle::Dashes(vec![3.0, 2.0, 1.0, 2.0, 1.0, 2.0]),
-            // Our convention: the first-named line is the inner one (nearer the
-            // text); the gap is 1, 2 or 3 thin widths.
-            _ => {
-                let (kind, gap) = if let Some(k) = val.strip_suffix("SmallGap") {
-                    (k, 1.0)
-                } else if let Some(k) = val.strip_suffix("MediumGap") {
-                    (k, 2.0)
-                } else if let Some(k) = val.strip_suffix("LargeGap") {
-                    (k, 3.0)
-                } else {
-                    return Some(BorderStyle::Art);
-                };
-                match kind {
-                    "thinThick" => lines(&[true, false], gap),
-                    "thickThin" => lines(&[false, true], gap),
-                    "thinThickThin" => lines(&[true, false, true], gap),
-                    "thickThinThick" => lines(&[false, true, false], gap),
-                    _ => BorderStyle::Art,
-                }
-            }
-        })
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1593,26 +1534,7 @@ fn border_rules(
                 (vec![(w, 0.0)], pattern.iter().map(|k| k * w).collect())
             }
             BorderStyle::Art => (vec![(w, 0.0)], vec![w, w]),
-            BorderStyle::Lines { thin, gap } => {
-                let thin_w = (w / 3.0).max(0.25);
-                let widths: Vec<f32> = thin.iter().map(|&t| if t { thin_w } else { w }).collect();
-                // Double and triple lines are spaced by their own width; the
-                // thin-thick families by thin widths.
-                let gap = if thin.iter().any(|&t| t) {
-                    gap * thin_w
-                } else {
-                    gap * w
-                };
-                let mut d = 0.0;
-                let mut out = Vec::new();
-                for (k, &sw) in widths.iter().enumerate() {
-                    if k > 0 {
-                        d += widths[k - 1] / 2.0 + gap + sw / 2.0;
-                    }
-                    out.push((sw, d));
-                }
-                (out, Vec::new())
-            }
+            lines @ BorderStyle::Lines { .. } => (lines.strokes(w), Vec::new()),
         };
         for (width, d) in strokes {
             // Along the frame inflated by `d`, so the corners stay closed: a

@@ -324,3 +324,18 @@ fn without_a_package_page_color_and_watermark_explain_and_borders_follow_the_kin
     assert!(!design_enabled(Some(&t), DesignAct::PageBorders));
     assert!(design_enabled(Some(&t), DesignAct::PageColor(None)));
 }
+
+#[test]
+fn automatic_cell_text_takes_ink_that_reads_on_the_fill_765() {
+    // A dark fill (a style's accent header): light ink, on chips that shade
+    // the fill deeper (a light panel would hide light text).
+    let dark = cell_ink(Some(0x4472C4)).unwrap();
+    assert_eq!((dark.fg, dark.dim), (0xF2F2F2, 0xB0B0B0));
+    assert_eq!(dark.chip, (0x000000, 0.3));
+    // A light fill (a band): dark ink, even under a dark theme.
+    let light = cell_ink(Some(0xD9E2F3)).unwrap();
+    assert_eq!((light.fg, light.dim), (0x202020, 0x808080));
+    assert_eq!(light.chip, (0x000000, 0.06));
+    // No fill: the surrounding ink.
+    assert_eq!(cell_ink(None), None);
+}
