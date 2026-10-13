@@ -369,6 +369,10 @@ fn pen(frame: &Frame, hf: bool, from: (f32, f32), to: (f32, f32), zoom: f32) -> 
     let table = t.path.clone();
     if dx >= dy {
         let y = (from.1 + to.1) / 2.0;
+        // On the table's top or bottom border: there is a line there already.
+        if (y - t.top()).abs() <= SNAP || (y - t.bottom()).abs() <= SNAP {
+            return Gesture::Nothing;
+        }
         let (x0, x1) = (t.tw(from.0.min(to.0)), t.tw(from.0.max(to.0)));
         let under = t.rows[..t.rows.len() - 1]
             .iter()
@@ -672,6 +676,7 @@ mod tests {
         );
         // Onto the outer border: nothing.
         assert_eq!(pen_on(&f, (52.0, 102.0), (52.0, 158.0)), Gesture::Nothing);
+        assert_eq!(pen_on(&f, (247.0, 102.0), (247.0, 158.0)), Gesture::Nothing);
     }
 
     #[test]
@@ -703,6 +708,31 @@ mod tests {
                 }
             }
         );
+    }
+
+    #[test]
+    fn a_horizontal_drag_on_the_top_or_bottom_border_draws_nothing() {
+        let f = frame(vec![two_by_two()]);
+        // The top border is at y 100, the bottom at 160; within the snap of
+        // either is on it.
+        for y in [100.0, 103.0, 157.0, 160.0] {
+            assert_eq!(pen_on(&f, (55.0, y), (140.0, y)), Gesture::Nothing, "{y}");
+        }
+        // Just past the snap, inside the first or last row: across it.
+        assert!(matches!(
+            pen_on(&f, (55.0, 105.0), (140.0, 105.0)),
+            Gesture::Line {
+                line: DrawnLine::Across { row: 0, .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            pen_on(&f, (55.0, 155.0), (140.0, 155.0)),
+            Gesture::Line {
+                line: DrawnLine::Across { row: 1, .. },
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -1023,7 +1023,7 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<String, String> {
-        let tool = self.draw_tool().ok_or("no table pen is on")?;
+        let tool = self.draw_tool().ok_or(table_draw::NO_PEN)?;
         let (gesture, para) = {
             let geom = self.draw_geom.borrow();
             let frame = geom.on_screen();

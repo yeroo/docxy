@@ -4687,11 +4687,9 @@ fn dispatch_verb(
         // default), px from the top-left of page `page`'s text area (1-based,
         // default 1; in Draft, its text column from the top of the view). Settle a frame (`shot window`)
         // after turning a pen on: the pens read the geometry it drew.
+        // The press's own checks give the refusals (`draw_press`).
         "table-draw" => {
-            app.refuse_under_dialog()?;
-            refuse_under_cover(app)?;
             let (from, to) = table_draw_points(app, args)?;
-            app.draw_tool().ok_or("no table pen is on")?;
             app.draw_press(from)?;
             app.draw_move(to);
             let drag = app.draw_drag.take().ok_or("the gesture did not start")?;
