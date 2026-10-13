@@ -17,6 +17,8 @@
 //! - [`formula`] — lexer/parser/AST/serializer + evaluator for the formula
 //!   language.
 //! - [`engine`] — dependency-graph recalculation over a workbook.
+//! - [`circular`] — circular references as hosts surface them: Excel's
+//!   warning, when it shows, and the status bar's cell names.
 //! - [`edit`] — structural edits (insert/delete rows & columns, renames)
 //!   with workbook-wide reference rewriting.
 //! - [`numfmt`] — the number-format runtime: real rendering of format codes
@@ -38,6 +40,7 @@
 
 pub mod autocorrect;
 pub mod cf;
+pub mod circular;
 pub mod clock;
 pub mod comments;
 pub mod docprops;
