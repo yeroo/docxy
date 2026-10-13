@@ -13,7 +13,7 @@ use crate::table::{
     AutoFit, GridMap, edit_cell_props, edit_table_props, grid_xs, new_table, normalize_vmerge,
     refine_grid, repair_grid, set_row_skips, template_cell, template_row,
 };
-use crate::table_props::{VAlign, row_trpr, set_row_trpr, width_of};
+use crate::table_props::{VAlign, row_height, set_row_height, width_of};
 
 /// Delete Cells... choices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -618,22 +618,13 @@ impl Editor {
             };
             let h = rows
                 .clone()
-                .filter_map(|i| {
-                    row_trpr(&t.rows[i].raw_props)
-                        .attr("w:trHeight", "w:val")
-                        .and_then(|v| v.parse::<u32>().ok())
-                })
+                .filter_map(|i| row_height(&t.rows[i].raw_props).map(|(h, _)| h))
                 .max()
                 .ok_or("the rows have no set height to distribute")?;
             for i in rows {
-                let mut p = row_trpr(&t.rows[i].raw_props);
                 // A row's height rule (exact or at least) is kept.
-                let rule = p
-                    .attr("w:trHeight", "w:hRule")
-                    .map(|r| format!(" w:hRule=\"{r}\""))
-                    .unwrap_or_default();
-                p.set(&format!("<w:trHeight w:val=\"{h}\"{rule}/>"));
-                set_row_trpr(&mut t.rows[i].raw_props, &p);
+                let rule = row_height(&t.rows[i].raw_props).and_then(|(_, r)| r);
+                set_row_height(&mut t.rows[i].raw_props, h, rule.as_deref());
             }
             Ok(After::Stay)
         })
@@ -1453,6 +1444,7 @@ mod tests {
     use crate::model::{Document, TableRowBoundary};
     use crate::serialize::document_to_xml;
     use crate::table::cell_props;
+    use crate::table_props::row_trpr;
 
     fn at(r: usize, c: usize) -> Caret {
         Caret::at(vec![0, r, c, 0], 0)

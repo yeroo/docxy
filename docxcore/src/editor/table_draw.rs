@@ -15,7 +15,7 @@ use crate::model::{Row, Table, VMerge};
 use crate::table::{
     AutoFit, GridMap, grid_xs, new_table, normalize_vmerge, refine_grid, repair_grid, template_cell,
 };
-use crate::table_props::{row_trpr, set_row_trpr};
+use crate::table_props;
 
 /// The narrowest table Draw Table makes, in twips.
 pub const DRAW_MIN_WIDTH: u32 = 360;
@@ -64,7 +64,7 @@ impl Editor {
         let w = width.clamp(DRAW_MIN_WIDTH, width_at(self).max(DRAW_MIN_WIDTH));
         let mut table = new_table(1, 1, w, AutoFit::Fixed(Some(w)));
         if height > DRAW_MIN_HEIGHT {
-            set_row_height(&mut table.rows[0], height, None);
+            set_row_height(&mut table.rows[0], height, Some("atLeast"));
         }
         self.insert_built_table(table)
     }
@@ -92,20 +92,12 @@ impl Editor {
     }
 }
 
-/// A row's `w:trHeight`: its value and its rule, when set.
 fn row_height(row: &Row) -> Option<(u32, Option<String>)> {
-    let p = row_trpr(&row.raw_props);
-    let h = p.attr("w:trHeight", "w:val")?.parse().ok()?;
-    Some((h, p.attr("w:trHeight", "w:hRule")))
+    table_props::row_height(&row.raw_props)
 }
 
 fn set_row_height(row: &mut Row, h: u32, rule: Option<&str>) {
-    let mut p = row_trpr(&row.raw_props);
-    let rule = rule
-        .map(|r| format!(" w:hRule=\"{r}\""))
-        .unwrap_or_else(|| " w:hRule=\"atLeast\"".to_string());
-    p.set(&format!("<w:trHeight w:val=\"{h}\"{rule}/>"));
-    set_row_trpr(&mut row.raw_props, &p);
+    table_props::set_row_height(&mut row.raw_props, h, rule);
 }
 
 /// The cells of row `row` a horizontal line from `x0` to `x1` crosses: those

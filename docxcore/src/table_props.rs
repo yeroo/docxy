@@ -560,9 +560,38 @@ pub fn set_row_trpr(raw_props: &mut Vec<String>, trpr: &PropsXml) {
     }
 }
 
+/// A row's `w:trHeight`: its value in twips and its `w:hRule`, when set.
+pub fn row_height(raw_props: &[String]) -> Option<(u32, Option<String>)> {
+    let p = row_trpr(raw_props);
+    let h = p.attr("w:trHeight", "w:val")?.parse().ok()?;
+    Some((h, p.attr("w:trHeight", "w:hRule")))
+}
+
+/// Set a row's `w:trHeight` to `h` twips with the rule `rule`; no rule
+/// writes none (Word reads that as "at least").
+pub fn set_row_height(raw_props: &mut Vec<String>, h: u32, rule: Option<&str>) {
+    let mut p = row_trpr(raw_props);
+    let rule = rule
+        .map(|r| format!(" w:hRule=\"{r}\""))
+        .unwrap_or_default();
+    p.set(&format!("<w:trHeight w:val=\"{h}\"{rule}/>"));
+    set_row_trpr(raw_props, &p);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_height_reads_and_writes_the_rule_as_given() {
+        let mut raw = vec!["<w:trPr><w:cantSplit/></w:trPr>".to_string()];
+        assert_eq!(row_height(&raw), None);
+        set_row_height(&mut raw, 700, None);
+        assert_eq!(row_height(&raw), Some((700, None)));
+        assert!(raw[0].contains("<w:cantSplit/>"));
+        set_row_height(&mut raw, 400, Some("exact"));
+        assert_eq!(row_height(&raw), Some((400, Some("exact".into()))));
+    }
 
     #[test]
     fn set_inserts_in_schema_order_and_keeps_unknown_children() {
