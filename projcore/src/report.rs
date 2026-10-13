@@ -186,6 +186,12 @@ impl Report<'_> {
         table_cell(&self.fields.read(task, field).text).unwrap_or_default()
     }
 
+    /// Money the report sums itself, in the plan's currency, as a table
+    /// cell: the symbol is the plan's text, so it may hold a `|`.
+    fn money(&self, units: f64) -> String {
+        table_cell(&self.currency.format(units)).unwrap_or_default()
+    }
+
     /// A task's name cell, bold for a summary.
     fn name(&self, task: &Task) -> String {
         let name = table_cell(&task.name).unwrap_or_else(|| format!("Task {}", task.id));
@@ -222,10 +228,10 @@ impl Report<'_> {
                 .filter_map(|t| t.fixed_cost.as_ref().and_then(|c| c.to_f64()))
                 .sum::<f64>()
                 / 100.0;
-            return self.currency.format(units);
+            return self.money(units);
         }
         if let Some(sum) = self.project_summary() {
-            return self.fields.read(sum, field).text;
+            return self.text(sum, field);
         }
         let (mut money, mut minutes) = (0.0, 0);
         for t in self.tasks().filter(|t| t.outline_level == 1) {
@@ -237,7 +243,7 @@ impl Report<'_> {
         }
         match field {
             Field::Work | Field::ActualWork | Field::RemainingWork => format_work(minutes),
-            _ => self.currency.format(money),
+            _ => self.money(money),
         }
     }
 
@@ -475,7 +481,7 @@ impl Report<'_> {
             rows.push(
                 [resource_name(r), type_name(r).into()]
                     .into_iter()
-                    .chain(costs.map(|c| self.currency.format(c)))
+                    .chain(costs.map(|c| self.money(c)))
                     .collect(),
             );
         }
@@ -486,7 +492,7 @@ impl Report<'_> {
         rows.push(
             ["**Total**".to_string(), String::new()]
                 .into_iter()
-                .chain(sums.map(|c| self.currency.format(c)))
+                .chain(sums.map(|c| self.money(c)))
                 .collect(),
         );
         table(

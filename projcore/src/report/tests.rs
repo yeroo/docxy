@@ -519,3 +519,24 @@ fn cost_reports_follow_the_plans_currency() {
     assert!(rows_.iter().flatten().all(|c| !c.contains('$')), "{md}");
     assert_eq!(rows_.last().unwrap()[4], "1,123.45 €", "{md}");
 }
+
+#[test]
+fn a_currency_symbol_with_a_pipe_keeps_the_tables_cells() {
+    let mut p = costed();
+    p.options.push(("CurrencySymbol".into(), "|$".into()));
+    let md = render_of(p.clone(), ReportKind::TaskCostOverview);
+    let total = rows(&md, "").pop().unwrap();
+    // Every column of the Task Cost table: no cell split at the symbol.
+    assert_eq!(total.len(), 7, "{md}");
+    assert_eq!(total[1], r"\|$500.00", "the Fixed Cost sum");
+    assert_eq!(total[4], r"\|$1,550.00", "the summary row's Cost");
+    let md = render_of(p.clone(), ReportKind::ResourceCostOverview);
+    let total = rows(&md, "").pop().unwrap();
+    assert_eq!(total.len(), 5, "{md}");
+    assert_eq!(total[4], r"\|$1,123.45");
+    p.tasks.remove(0);
+    let md = render_of(p, ReportKind::ProjectOverview);
+    let overview = &rows(&md, "")[0];
+    assert_eq!(overview.len(), 5, "{md}");
+    assert_eq!(overview[4], r"\|$1,500.00", "the summed Cost");
+}
