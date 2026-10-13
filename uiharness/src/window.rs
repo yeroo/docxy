@@ -35,12 +35,15 @@ pub fn request_close(pid: u32) -> Result<(), String> {
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::{ConnectionExt, EventMask};
 
-    let conn = connect()?;
-    let (window, _, _) = client_of_pid(&conn, pid)?;
-    let protocols = atom(&conn, b"WM_PROTOCOLS")?;
-    let delete = atom(&conn, b"WM_DELETE_WINDOW")?;
-    let event = delete_window_event(window, protocols, delete);
     let fail = |e: &dyn std::fmt::Display| format!("X11 close of process {pid}'s window: {e}");
+    // The lookup is capture's, whose errors name the capture: a failed close
+    // says it is the close.
+    let lookup = |e: String| fail(&e.strip_prefix("X11 capture: ").unwrap_or(&e));
+    let conn = connect().map_err(lookup)?;
+    let (window, _, _) = client_of_pid(&conn, pid).map_err(lookup)?;
+    let protocols = atom(&conn, b"WM_PROTOCOLS").map_err(lookup)?;
+    let delete = atom(&conn, b"WM_DELETE_WINDOW").map_err(lookup)?;
+    let event = delete_window_event(window, protocols, delete);
     conn.send_event(false, window, EventMask::NO_EVENT, event)
         .map_err(|e| fail(&e))?
         .check()
