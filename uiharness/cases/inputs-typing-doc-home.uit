@@ -1,0 +1,19 @@
+# GENERATED from suite/docxy/src/dialog/catalog/entries.rs by
+# `UPDATE_INPUTS_TYPING=1 cargo test --manifest-path suite/Cargo.toml
+# inputs_typing_case_is_current`; do not edit by hand (#1029).
+#
+# Every editable field of every doc dialog, typed into with real keys
+# only: `real-key` and `real-type` go through the window's own input
+# path, and the field is focused by a real click or by Tab. A test is
+# one field and one step, named `<surface> <dialog>/<field>: <step>`.
+# See qa/inputs-typing.md.
+
+test doc doc-paste-special: matches the catalogue
+  open copy:../fixtures/basic.docx
+  type copied
+  key ctrl+a
+  key ctrl+c
+  key ctrl+alt+v
+  assert dialog is doc-paste-special
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}

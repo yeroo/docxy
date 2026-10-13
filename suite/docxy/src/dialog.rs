@@ -207,6 +207,12 @@ pub(crate) enum DialogOwner {
     PasteSpecial {
         clip: bool,
     },
+    /// A document's Paste Special… (#753); `rich` when a formatted source
+    /// (the document's own copy, or another app's RTF) is on the clipboard.
+    /// Applied by `Docxy::doc_paste_dialog_click`.
+    DocPasteSpecial {
+        rich: bool,
+    },
     /// "There's already data here. Do you want to replace it?" before a
     /// drop by the selection's border (#670), applied by
     /// `Docxy::drop_dialog_click`.

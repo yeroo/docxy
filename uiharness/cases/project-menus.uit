@@ -125,8 +125,11 @@ test the document menu opens on a document through the right-click's opener
   call menu-open {"target":"document"}
   assert reply.target is document
   assert reply.items.0.label is Cut
-  assert reply.items.4.label is Bold
-  assert reply.items.8.label is New Comment
+  assert reply.items.3.label is Keep Source Formatting
+  assert reply.items.4.label is Keep Text Only
+  assert reply.items.5.label is Paste Special…
+  assert reply.items.7.label is Bold
+  assert reply.items.11.label is New Comment
   assert menu.target is document
   key escape
   assert menu is nothing

@@ -461,6 +461,8 @@
     Cut: { ui: 'cut' },
     Copy: { ui: 'copy' },
     Paste: { ui: 'paste' },
+    // Paste's menu (#753): Keep Source Formatting is Paste itself.
+    PasteKeepSource: { ui: 'paste' },
     Find: { ui: 'find' },
     FontName: { ui: 'picker', picker: 'font' },
     FontSize: { ui: 'picker', picker: 'size' },
@@ -482,6 +484,9 @@
   var NOT_YET = 'Not available in the browser yet — open the file in docxy';
   var BROWSER_UNSUPPORTED = {
     InsertTable: NOT_YET,
+    // Paste's menu (#753): the page pastes only the browser's text.
+    PasteTextOnly: NOT_YET,
+    PasteSpecial: NOT_YET,
     PageBreak: NOT_YET,
     // Insert > Pages: Cover Page and Blank Page (#652).
     BlankPage: NOT_YET,

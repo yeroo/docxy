@@ -46,6 +46,7 @@ mod doc_import;
 #[cfg(test)]
 mod doc_import_tests;
 mod doc_name;
+mod doc_paste;
 #[cfg(test)]
 mod doc_protected_tests;
 mod doc_recovery;
@@ -23194,6 +23195,10 @@ impl Docxy {
         if self.find_open {
             return self.find_key(ev, shift, key.as_str(), window, cx);
         }
+        // Ctrl+Alt+V: Paste Special… (#753), not the Ctrl+V below.
+        if ctrl && m.alt && key == "v" {
+            return self.dispatch(Act::PasteSpecial, window, cx);
+        }
         if ctrl {
             match key.as_str() {
                 "s" => return self.save_active(window, cx),
@@ -25549,13 +25554,14 @@ fn apply_doc_act(e: &mut Editor, act: Act) {
         Title => e.set_para_style(Some("Title")),
         Subtitle => e.set_para_style(Some("Subtitle")),
         ClearFmt => e.clear_run_formatting(),
-        Project(_) | Sheet(_) | Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find
-        | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments
-        | ResolveComment | DeleteAllComments | Markup(_) | ToggleTrack | ToggleNav | NewWindow
-        | ArrangeAll | DarkMode | AutoHideRibbon | InsertField | PageBreak | BlankPage
-        | Cover(_) | ToggleNotes | InsertTable | InsertSymbol | InsertEquation | LineSpacing
-        | Hf(_) | Design(_) | Layout(_) | Mail(_) | Help(_) | Table(_) | PrintLayout
-        | ToggleRuler | UndoTo(_) | RedoTo(_) => {}
+        Project(_) | Sheet(_) | Cut | Copy | Paste | PasteKeepSource | PasteTextOnly
+        | PasteSpecial | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName
+        | FontSize | NewComment | ShowHide | ToggleComments | ResolveComment
+        | DeleteAllComments | Markup(_) | ToggleTrack | ToggleNav | NewWindow | ArrangeAll
+        | DarkMode | AutoHideRibbon | InsertField | PageBreak | BlankPage | Cover(_)
+        | ToggleNotes | InsertTable | InsertSymbol | InsertEquation | LineSpacing | Hf(_)
+        | Design(_) | Layout(_) | Mail(_) | Help(_) | Table(_) | PrintLayout | ToggleRuler
+        | UndoTo(_) | RedoTo(_) => {}
     }
 }
 
@@ -26745,6 +26751,12 @@ enum Act {
     Cut,
     Copy,
     Paste,
+    /// Paste's menu (#753): Keep Source Formatting is Paste itself, Keep
+    /// Text Only pastes the clipboard's text as typing at the caret would
+    /// format it, and Paste Special\u{2026} opens the document's dialog.
+    PasteKeepSource,
+    PasteTextOnly,
+    PasteSpecial,
     Normal,
     H1,
     H2,
@@ -26902,7 +26914,37 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                     "Clipboard",
                     50,
                     vec![
-                        Control::Large(cmdt("paste", "paste", "Paste", Paste, "Ctrl+V").key("V")),
+                        // Its arrow holds Word's document paste choices (#753):
+                        // Alt, H, V opens it, as in Word.
+                        Control::Split {
+                            primary: cmdt("paste", "paste", "Paste", Paste, "Ctrl+V").key("V"),
+                            menu: vec![
+                                cmdt(
+                                    "paste-keep-source",
+                                    "paste",
+                                    "Keep Source Formatting",
+                                    PasteKeepSource,
+                                    "",
+                                )
+                                .key("K"),
+                                cmdt(
+                                    "paste-text-only",
+                                    "paste",
+                                    "Keep Text Only",
+                                    PasteTextOnly,
+                                    "",
+                                )
+                                .key("T"),
+                                cmdt(
+                                    "paste-special",
+                                    "paste",
+                                    "Paste Special\u{2026}",
+                                    PasteSpecial,
+                                    "Ctrl+Alt+V",
+                                )
+                                .key("S"),
+                            ],
+                        },
                         rs::column(vec![
                             cmdt("cut", "cut", "Cut", Cut, "Ctrl+X").key("X"),
                             cmdt("copy", "copy", "Copy", Copy, "Ctrl+C").key("C"),
@@ -30658,7 +30700,9 @@ impl Docxy {
             Help(a) => self.help_act(a, window, cx),
             Cut => self.do_copy(true, window, cx),
             Copy => self.do_copy(false, window, cx),
-            Paste => self.do_paste(window, cx),
+            Paste | PasteKeepSource => self.do_paste(window, cx),
+            PasteTextOnly => self.do_paste_text_only(window, cx),
+            PasteSpecial => self.open_doc_paste_special(cx),
             LaunchFont => self.launch_msg("Font — advanced dialog coming soon", window, cx),
             LaunchParagraph => {
                 self.launch_msg("Paragraph — advanced dialog coming soon", window, cx)
