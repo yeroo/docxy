@@ -10752,7 +10752,18 @@ fn write_sidecars(
                 *t.last_hot.borrow_mut() = None;
                 return forgotten(persist_tab_meta(t));
             }
-            let persisted = persist_tab_avoiding(&hd, &taken, hot_seq, i, t);
+            let mut persisted = persist_tab_avoiding(&hd, &taken, hot_seq, i, t);
+            if persisted.hot.is_none() && t.dirty {
+                // No new copy (a full disk, a placeholder): the last one is
+                // still the unsaved work, so the session goes on naming it
+                // and the prune keeps it.
+                persisted.hot = t
+                    .last_hot
+                    .borrow()
+                    .as_ref()
+                    .filter(|p| p.exists())
+                    .map(|p| p.display().to_string());
+            }
             // Every kept tab is written to a fresh name in this one call, so
             // the path names this tab's content until the next persist.
             *t.last_hot.borrow_mut() = persisted
@@ -11330,6 +11341,17 @@ fn restore_tab(t: &PersistTab) -> DocTab {
 /// (#882): restore can take protection away from a file trusted since,
 /// never add it.
 fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab, bool) {
+    let (tab, from_hot) = restore_tab_content(t, trusted);
+    // A tab restored unsaved names the sidecar it was persisted with, even
+    // one it could not read (#1224): a persist that writes no newer copy of
+    // it keeps that one, which is still the only copy of the work.
+    if tab.dirty {
+        *tab.last_hot.borrow_mut() = t.hot.as_ref().map(PathBuf::from).filter(|p| p.exists());
+    }
+    (tab, from_hot)
+}
+
+fn restore_tab_content(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab, bool) {
     if t.kind == Kind::Project {
         // Every fallback in `restore_project_tab` (sidecar missing or
         // unreadable) comes back clean, so dirty means the sidecar loaded.

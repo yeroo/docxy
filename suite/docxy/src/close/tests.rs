@@ -2131,6 +2131,55 @@ fn a_committed_session_prunes_the_sidecars_it_no_longer_names() {
     }
 }
 
+/// A write that makes no new copy of an unsaved tab (a full disk, a tab
+/// that is a placeholder now) keeps naming its last one, so the prune
+/// keeps the only copy of the work.
+#[test]
+fn an_unsaved_tab_without_a_new_copy_keeps_its_last_sidecar() {
+    let root = Root::new("keep-last");
+    let mut tabs = vec![tab(Kind::Xlsx)];
+    commit_a1(&mut tabs[0], "Only copy");
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
+    let last = tabs[0].last_hot.borrow().clone().unwrap();
+    let bytes = std::fs::read(&last).unwrap();
+
+    tabs[0].surface = Surface::Placeholder;
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
+    let session = root.session();
+    assert_eq!(
+        session.tabs[0].hot.as_deref(),
+        Some(last.display().to_string().as_str())
+    );
+    assert_eq!(std::fs::read(&last).unwrap(), bytes, "kept as it was");
+    assert_eq!(tabs[0].last_hot.borrow().as_deref(), Some(last.as_path()));
+}
+
+/// The startup write after a restore whose unsaved workbook's sidecar could
+/// not be read keeps that sidecar: it is still the only copy of the work.
+#[test]
+fn an_unreadable_sidecar_restored_unsaved_survives_the_startup_write() {
+    let root = Root::new("keep-unreadable");
+    let hd = hot_dir_in(&root.0);
+    std::fs::create_dir_all(&hd).unwrap();
+    let sidecar = hd.join("tab-0-1.xlsx");
+    std::fs::write(&sidecar, b"not a workbook").unwrap();
+    let mut entry = persist_tab_meta(&tab(Kind::Xlsx));
+    entry.path = None;
+    entry.dirty = true;
+    entry.hot = Some(sidecar.display().to_string());
+    let (restored, from_hot) = restore_tab_sourced(&entry, &crate::trusted::TrustStore::default());
+    assert!(!from_hot);
+    assert!(restored.dirty);
+    assert!(matches!(restored.surface, Surface::Placeholder));
+
+    write_session(&root.0, &[restored], 0, prefs(), &[], 0);
+    assert_eq!(
+        root.session().tabs[0].hot.as_deref(),
+        Some(sidecar.display().to_string().as_str())
+    );
+    assert_eq!(std::fs::read(&sidecar).unwrap(), b"not a workbook");
+}
+
 #[test]
 fn nothing_is_pruned_when_the_session_cannot_be_written() {
     let root = Root::new("no-prune");
