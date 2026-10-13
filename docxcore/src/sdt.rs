@@ -127,7 +127,8 @@ fn unescape(s: &str) -> String {
 }
 
 /// The next free content-control id over every story's XML in `xmls`: one
-/// past the largest `w:id` any control there has (Word keeps them unique
+/// past the largest magnitude of any `w:id` a control there has, Word's
+/// negative ids included (Word keeps them unique
 /// across the document and its headers and footers). The id is an
 /// `xsd:int`: past `i32::MAX`, the smallest positive id not in use.
 pub fn next_control_id<'a>(xmls: impl IntoIterator<Item = &'a str>) -> i64 {

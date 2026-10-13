@@ -39,33 +39,45 @@ pub fn sniff(bytes: &[u8]) -> Option<ImageInfo> {
 /// EMUs per pixel at 96 dpi.
 pub const EMU_PER_PX: i64 = 9525;
 
+/// The largest extent DrawingML allows (`ST_PositiveCoordinate`), in EMUs.
+pub const MAX_EMU: i64 = 27_273_042_316_900;
+
 /// A picture's inline size in EMUs: its pixels at 96 dpi, scaled down to
-/// `max_cx` (the text width) when wider, keeping its aspect.
+/// `max_cx` (the text width) when wider, keeping its aspect, each side
+/// within 1..=[`MAX_EMU`] whatever size the header claims.
 pub fn extent_emu(info: &ImageInfo, max_cx: Option<i64>) -> (i64, i64) {
-    let cx = i64::from(info.width) * EMU_PER_PX;
-    let cy = i64::from(info.height) * EMU_PER_PX;
-    match max_cx {
-        Some(max) if max > 0 && cx > max => (max, (cy * max / cx).max(1)),
+    let cx = i128::from(info.width) * i128::from(EMU_PER_PX);
+    let cy = i128::from(info.height) * i128::from(EMU_PER_PX);
+    let (cx, cy) = match max_cx {
+        Some(max) if max > 0 && cx > i128::from(max) => {
+            (i128::from(max), cy * i128::from(max) / cx)
+        }
         _ => (cx, cy),
-    }
+    };
+    let clamp = |v: i128| v.clamp(1, i128::from(MAX_EMU)) as i64;
+    (clamp(cx), clamp(cy))
 }
 
-/// The next free drawing-object id (`wp:docPr`'s `id`) over every story's
-/// XML in `xmls`: one past the largest, as Word keeps them unique across a
-/// document and its headers and footers.
+/// The next free drawing-object id (`wp:docPr`'s `id`, an unsigned int)
+/// over every story's XML in `xmls`: one past the largest, as Word keeps
+/// them unique across a document and its headers and footers; past
+/// `u32::MAX`, the smallest id not in use.
 pub fn next_drawing_id<'a>(xmls: impl IntoIterator<Item = &'a str>) -> u32 {
-    let mut max = 0u32;
+    let mut used = std::collections::BTreeSet::new();
     for xml in xmls {
         let mut from = 0;
         while let Some(at) = xml[from..].find("docPr ").map(|i| from + i) {
             from = at + 6;
             let end = xml[at..].find('>').map_or(xml.len(), |e| at + e);
             if let Some(id) = crate::load::xml_attr_value(&xml[at..end], "id") {
-                max = max.max(id.trim().parse().unwrap_or(0));
+                used.insert(id.trim().parse::<u32>().unwrap_or(0));
             }
         }
     }
-    max + 1
+    match used.last().copied().unwrap_or(0).checked_add(1) {
+        Some(next) => next,
+        None => (1..).find(|i| !used.contains(i)).unwrap_or(1),
+    }
 }
 
 /// A run holding an inline picture: the media part `rid` names, `cx` x `cy`
@@ -233,6 +245,27 @@ mod tests {
         assert_eq!(extent_emu(&i, None), (200 * 9525, 100 * 9525));
         assert_eq!(extent_emu(&i, Some(10_000_000)), (200 * 9525, 100 * 9525));
         assert_eq!(extent_emu(&i, Some(952_500)), (952_500, 476_250));
+        // FIX r1 M1: a header claiming a vast size neither overflows nor
+        // writes an extent DrawingML refuses.
+        let vast = ImageInfo {
+            width: 10,
+            height: u32::MAX,
+            ..i
+        };
+        assert_eq!(extent_emu(&vast, Some(952_500)), (95_250, MAX_EMU));
+        let wide = ImageInfo {
+            width: u32::MAX,
+            height: u32::MAX,
+            ..i
+        };
+        assert_eq!(extent_emu(&wide, Some(5_943_600)), (5_943_600, 5_943_600));
+        assert_eq!(extent_emu(&wide, None), (MAX_EMU, MAX_EMU));
+        let thin = ImageInfo {
+            width: u32::MAX,
+            height: 1,
+            ..i
+        };
+        assert_eq!(extent_emu(&thin, Some(100)), (100, 1));
     }
 
     #[test]
@@ -241,6 +274,9 @@ mod tests {
         let body = r#"<w:p><wp:docPr id="7" name="Picture 7"/><wp:docPr name="x" id='12'/></w:p>"#;
         let header = inline_picture_run("rId1", 1, 1, 30, "a.png");
         assert_eq!(next_drawing_id([body, header.as_str()]), 31);
+        // FIX r1 M1: the largest id in use is not followed by an overflow.
+        let full = r#"<wp:docPr id="4294967295"/><wp:docPr id="1"/><wp:docPr id="2"/>"#;
+        assert_eq!(next_drawing_id([full]), 3);
     }
 
     #[test]
