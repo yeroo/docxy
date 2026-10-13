@@ -406,6 +406,9 @@ pub struct Editor {
     /// Formatting toggled at the caret, for the next character typed (#854);
     /// see [`Editor::pending_format`] for while it holds.
     pending: Option<PendingFormat>,
+    /// A [`Editor::preview_copy`]: its edits keep no history and issue no
+    /// undo serial, which hosts read as "an edit happened" (#764).
+    display_only: bool,
 }
 
 /// Whether `lo` and `hi` sit in different containers (a body paragraph and
@@ -434,13 +437,16 @@ impl Editor {
             merge_previewed: false,
             track: None,
             pending: None,
+            display_only: false,
         }
     }
 
     /// A copy to draw, not to edit (#764): the document, caret, selection
     /// and display state, with no undo or redo history. A host runs an edit
     /// on it to show the result (Word's live preview) and drops it; the
-    /// original is never touched.
+    /// original is never touched. Its edits push no undo step and issue no
+    /// undo serial ([`undo_serial_counter`]), so a host's Repeat record and
+    /// typing run go on as if nothing happened.
     pub fn preview_copy(&self) -> Editor {
         Editor {
             doc: self.doc.clone(),
@@ -456,6 +462,7 @@ impl Editor {
             merge_previewed: self.merge_previewed,
             track: self.track.clone(),
             pending: self.pending.clone(),
+            display_only: true,
         }
     }
 
@@ -523,6 +530,9 @@ impl Editor {
     }
 
     fn push_undo(&mut self, mut snapshot: Snapshot) {
+        if self.display_only {
+            return;
+        }
         match self.grouping {
             Some(true) => return,
             Some(false) => self.grouping = Some(true),
@@ -4844,9 +4854,18 @@ mod tests {
         assert_eq!(copy.anchor, ed.anchor);
         assert_eq!(copy.track_author(), Some("Ann"));
         assert!(!copy.undo(), "a preview copy has no history");
+        let serial = undo_serial_counter();
         copy.insert_table(2, 3, crate::table::AutoFit::Default)
             .unwrap();
         assert_ne!(copy.doc, ed.doc);
+        // Its edits issue no serial: a host's Repeat record and typing run
+        // see no edit.
+        assert_eq!(undo_serial_counter(), serial);
+        let tabled = copy.doc.clone();
+        copy.set_table_style("GridTable4-Accent1").unwrap();
+        assert_ne!(copy.doc, tabled);
+        assert_eq!(undo_serial_counter(), serial);
+        assert!(!copy.undo(), "and keep no history");
         assert_eq!(ed.doc, before);
         assert!(ed.undo(), "the original keeps its own step");
         assert!(!ed.undo());
