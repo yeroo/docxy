@@ -136,6 +136,39 @@ test('every act in the suite ribbon is wired or listed as unsupported', () => {
   assert.deepEqual(stale, []);
 });
 
+// The commands app.js `control()` draws with a `data-keytip` on a tab: a
+// split draws only its primary (its menu opens from the arrow), a drop-down
+// only its button.
+function drawnKeytips(tab) {
+  const tips = [];
+  const cmd = (c) => { if (c.keyTip) tips.push(`${c.keyTip.toUpperCase()} ${c.id}`); };
+  tab.groups.forEach((g) => g.items.forEach((c) => {
+    if (c.kind === 'split') cmd(c.primary);
+    else if (c.cmd) cmd(c.cmd);
+    (c.cmds || []).forEach(cmd);
+    (c.rows || []).forEach((row) => row.forEach((cell) => cmd(cell.cmd)));
+  }));
+  return tips;
+}
+
+// `keytipKey` runs the first button whose key tip matches: a second command
+// with the same letter on a tab could never be reached (#753 r1).
+test('the command key tips drawn on each tab are unique', () => {
+  const tabs = snapshot.tabs.filter((t) => t.kind === 'ribbon').concat(snapshot.contextual);
+  for (const tab of tabs) {
+    const seen = new Map();
+    for (const tip of drawnKeytips(tab)) {
+      const [key, id] = tip.split(' ');
+      assert.ok(!seen.has(key), `${tab.name}: ${key} is both ${seen.get(key)} and ${id}`);
+      seen.set(key, id);
+    }
+  }
+  // The Paste split's menu letters stay out of Home's layer.
+  const home = drawnKeytips(snapshot.tabs.find((t) => t.name === 'Home'));
+  assert.ok(home.includes('V paste'));
+  assert.ok(!home.some((t) => t.endsWith('paste-keep-source') || t.endsWith('paste-special')));
+});
+
 test('every icon the ribbon and QAT use is in the snapshot', () => {
   const used = new Set(snapshot.qat.map((q) => q.icon));
   const walk = (v) => {

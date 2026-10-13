@@ -132,6 +132,10 @@ svg.icon * { fill: currentColor; }
 .icon-only .rb.small .label { display: none; }
 .icon-only .rb.small { padding: 0 4px; }
 .col { display: flex; flex-direction: column; gap: 1px; }
+.split { display: flex; flex-direction: column; align-items: center; }
+.split .rb.large { height: 58px; }
+.rb.split-arrow { width: 58px; height: 14px; justify-content: center; padding: 0; font-size: 9px; color: var(--dim); }
+.popup .item.unsupported { opacity: 0.4; }
 .rows { display: flex; flex-direction: column; gap: 4px; }
 .row { display: flex; gap: 1px; align-items: center; }
 .combo {

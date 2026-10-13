@@ -545,6 +545,19 @@
     return b;
   }
 
+  // A split button's arrow: opens its menu under it.
+  function splitArrow(c) {
+    var b = h('button', {
+      class: 'rb split-arrow', id: 'rb-' + c.primary.id + '-menu',
+      'aria-label': c.primary.label + ' options', 'aria-haspopup': 'menu',
+      onmousedown: keepFocus,
+      onclick: function () { if (popupEl) hidePopup(); else openSplitMenu(c, b); },
+      text: '▾',
+    });
+    b._tip = { title: c.primary.label + ' options', body: '', shortcut: '' };
+    return b;
+  }
+
   // A combo or drop-down button follows the same rule as `cmdButton`: an act
   // the browser cannot run yet is drawn dimmed, says why, and does nothing.
   function comboBox(cmd, wide) {
@@ -571,9 +584,11 @@
       case 'toggle': return cmdButton(c.cmd, 'icon');
       case 'column':
         return h('div', { class: 'col' }, c.cmds.map(function (x) { return cmdButton(x, 'small'); }));
+      // The primary is a large button; its menu opens from the arrow under
+      // it, as the suite's split does, so the menu's key tips (#753: Paste's
+      // K, T and S) never join the tab's own.
       case 'split':
-        return h('div', { class: 'col' }, [cmdButton(c.primary, 'large')].concat(
-          c.menu.map(function (x) { return cmdButton(x, 'small'); })));
+        return h('div', { class: 'split' }, [cmdButton(c.primary, 'large'), splitArrow(c)]);
       case 'dropdown':
         return h('div', { class: 'col' }, [comboBox(c.cmd, true)]);
       case 'rows':
@@ -901,6 +916,28 @@
     popupEl = h('div', { class: 'popup', id: 'popup-' + kind, role: 'menu' }, kids);
     document.body.appendChild(popupEl);
     var r = (anchor || el.ribbon).getBoundingClientRect();
+    popupEl.style.left = Math.max(4, Math.min(r.left, window.innerWidth - popupEl.offsetWidth - 8)) + 'px';
+    popupEl.style.top = (r.bottom + 2) + 'px';
+  }
+
+  // A split button's menu: its items, each dimmed with its reason when the
+  // browser cannot run it.
+  function openSplitMenu(c, anchor) {
+    hidePopup();
+    var kids = c.menu.map(function (x) {
+      var unsupported = !actEnabled(x.act);
+      var b = h('button', {
+        class: 'item' + (unsupported ? ' unsupported' : ''), id: 'menu-' + x.id, text: x.label,
+        role: 'menuitem', 'aria-disabled': unsupported ? 'true' : null,
+        title: unsupported ? (E.BROWSER_UNSUPPORTED[x.act] || 'Not available in the browser') : null,
+        onmousedown: keepFocus,
+        onclick: function () { if (!unsupported) runAct(x.act, b); },
+      });
+      return b;
+    });
+    popupEl = h('div', { class: 'popup', id: 'popup-' + c.primary.id, role: 'menu' }, kids);
+    document.body.appendChild(popupEl);
+    var r = anchor.getBoundingClientRect();
     popupEl.style.left = Math.max(4, Math.min(r.left, window.innerWidth - popupEl.offsetWidth - 8)) + 'px';
     popupEl.style.top = (r.bottom + 2) + 'px';
   }
