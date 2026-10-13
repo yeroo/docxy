@@ -14,7 +14,7 @@
 use super::*;
 use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
-use crate::page_setup::{choice, chosen, ok_cancel};
+use crate::page_setup::{choice, chosen, ok_cancel, text_of};
 use docxcore::field::{DateTime, FieldContext};
 use docxcore::sdt::CoreProp;
 use hf_tab::HfAct;
@@ -101,22 +101,18 @@ pub(crate) fn date_time_dialog(now: &DateTime) -> Dialog {
 pub(crate) fn apply_date_time(ed: &mut Editor, d: &Dialog) -> Result<bool, String> {
     let i = chosen(d, "formats").ok_or("Choose a format")?;
     let picture = DATE_FORMATS.get(i).ok_or("Choose a format")?;
-    let text = d
-        .controls
-        .iter()
-        .find(|c| c.name == "formats")
-        .and_then(|c| c.items.get(i))
-        .cloned()
-        .unwrap_or_default();
+    let text = text_of(d, "formats");
     let props = ed.caret_props();
     let inline = if d.value("update") == Some(&Value::Bool(true)) {
         docxcore::field::fld_simple(&date_instr(picture), &text, &props)
     } else {
         Inline::Run(docxcore::model::Run { text, props })
     };
-    ed.break_undo_group();
-    ed.paste(&Clip {
-        paras: vec![vec![inline]],
+    // One step, a selection it replaces included.
+    ed.one_step("Insert Date and Time", |e| {
+        e.paste(&Clip {
+            paras: vec![vec![inline]],
+        })
     });
     Ok(true)
 }
@@ -195,9 +191,11 @@ pub(crate) fn ptab_xml(d: &Dialog, props: &docxcore::model::RunProps) -> String 
 /// OK on Alignment Tab: the tab at the caret, in the caret's formatting.
 pub(crate) fn apply_alignment_tab(ed: &mut Editor, d: &Dialog) -> Result<bool, String> {
     let run = ptab_xml(d, &ed.caret_props());
-    ed.break_undo_group();
-    // Text typed next goes after the tab, as in Word.
-    ed.insert_object(vec![Inline::Raw(run)]);
+    // One step, a selection it replaces included; text typed next goes
+    // after the tab, as in Word.
+    ed.one_step("Insert Alignment Tab", |e| {
+        e.insert_object(vec![Inline::Raw(run)])
+    });
     Ok(true)
 }
 
@@ -298,8 +296,9 @@ pub(crate) fn insert_picture(tab: &mut DocTab, path: &Path) -> Result<String, St
         .ok_or("Could not add the picture to the header or footer part")?;
     let run = docxcore::image::inline_picture_run(&rid, cx, cy, id, &name);
     let ed = &mut tab.hf_edit.as_mut().expect("checked above").editor;
-    ed.break_undo_group();
-    ed.insert_object(vec![Inline::Raw(run)]);
+    ed.one_step("Insert Picture", |e| {
+        e.insert_object(vec![Inline::Raw(run)])
+    });
     tab.mark_dirty();
     Ok(format!("Inserted picture {name}"))
 }
@@ -340,7 +339,9 @@ impl Docxy {
                 };
                 let control = property_control(tab, prop);
                 // Text typed next goes after the control, not into it.
-                return self.with_editor(window, cx, |e| e.insert_object(control));
+                return self.with_editor(window, cx, |e| {
+                    e.one_step("Insert Document Property", |e| e.insert_object(control))
+                });
             }
             HfAct::Pictures => return self.pick_hf_picture(window, cx),
             _ => {}

@@ -574,6 +574,64 @@ fn typing_after_an_inserted_object_goes_after_it_in_the_header() {
     assert!(xml.contains(">My Header A</w:t>"), "{xml}");
 }
 
+/// FIX r6 m1: an insert over a selection is one undo step; text typed right
+/// after an Alignment Tab that replaced a selection still goes after it.
+#[test]
+fn an_insert_over_a_selection_is_one_undo_step() {
+    // Select `Header`, Date & Time OK: one Undo restores `Header A`.
+    let mut t = header_tab("one-step-date");
+    let ed = hf_ed(&mut t);
+    ed.anchor = Some(docxcore::editor::Caret::at(vec![0], 0));
+    ed.caret = docxcore::editor::Caret::at(vec![0], 6);
+    let mut d = date_time_dialog(&tuesday());
+    set_choice(&mut d, "formats", 4);
+    t.dialogs.push(d);
+    crate::dialog_host::dialog_click(&mut t, "OK").unwrap();
+    assert_eq!(crate::hf::tests::edited_text(&t), "2026-06-23 A");
+    assert!(hf_ed(&mut t).undo());
+    assert_eq!(crate::hf::tests::edited_text(&t), "Header A");
+
+    // Select ` A`, Insert Alignment Tab, type: after the tab; one Undo for
+    // the typing, one for the tab and the replaced text.
+    let mut t = header_tab("one-step-ptab");
+    let ed = hf_ed(&mut t);
+    ed.anchor = Some(docxcore::editor::Caret::at(vec![0], 6));
+    ed.caret = docxcore::editor::Caret::at(vec![0], 8);
+    t.dialogs.push(alignment_tab_dialog());
+    crate::dialog_host::dialog_click(&mut t, "OK").unwrap();
+    hf_ed(&mut t).insert_str("Page 1");
+    let ed = hf_ed(&mut t);
+    let Block::Paragraph(p) = &ed.doc.body[0] else {
+        panic!("a paragraph");
+    };
+    let shape: Vec<String> = p
+        .content
+        .iter()
+        .map(|i| match i {
+            Inline::Run(r) => r.text.clone(),
+            Inline::Raw(r) if r.contains("<w:ptab") => "[PTAB]".into(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(shape, ["Header", "[PTAB]", "Page 1"]);
+    assert!(ed.undo());
+    assert!(ed.undo());
+    assert_eq!(crate::hf::tests::edited_text(&t), "Header A");
+
+    // A picture over a selection: one step too.
+    let dir = tmp_dir("one-step-picture");
+    let png = png_file(&dir, "logo.png", 10, 10);
+    let mut t = header_tab("one-step-picture");
+    let ed = hf_ed(&mut t);
+    ed.anchor = Some(docxcore::editor::Caret::at(vec![0], 0));
+    ed.caret = docxcore::editor::Caret::at(vec![0], 6);
+    insert_picture(&mut t, &png).unwrap();
+    assert_eq!(crate::hf::tests::edited_text(&t), " A");
+    assert!(hf_ed(&mut t).undo());
+    assert_eq!(crate::hf::tests::edited_text(&t), "Header A");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Criterion 8's layout: the segment after a right alignment tab ends at
 /// the right margin; a centre one centres it; a passed stop adds nothing.
 #[test]

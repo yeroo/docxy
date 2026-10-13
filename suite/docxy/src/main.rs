@@ -29065,7 +29065,7 @@ fn ptab_gap(align: docxcore::model::TabAlign, stop: f32, xm: f32, seg: f32) -> f
 /// An inline picture's frame in px at `zoom`, from its extent in EMUs
 /// (9525 per px at 96 dpi), at least 1 px each way.
 fn picture_frame_px(cx: i64, cy: i64, zoom: f32) -> (f32, f32) {
-    let px_of = |emu: i64| (emu as f32 / 9525.0 * zoom).max(1.0);
+    let px_of = |emu: i64| (emu as f32 / docxcore::image::EMU_PER_PX as f32 * zoom).max(1.0);
     (px_of(cx), px_of(cy))
 }
 
