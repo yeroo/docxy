@@ -270,3 +270,29 @@ test Fill Down and Clear Contents on a row's menu act on the range a right-click
   call menu-open {"target":{"row":2}}
   assert selection is none
   assert selected_name is B
+
+test a row menu over a kept range is the clicked row's: its task items act on that row (#1213 r1)
+  open copy:../fixtures/gantt-summary.xml
+  call click-cell {"cell":"C2"}
+  key shift+down
+  assert selection is 2
+  assert selected_name is Task 3
+  call menu-open {"target":{"row":2}}
+  assert reply.target.row is 2
+  assert selection is 2
+  assert selected_name is Task 3
+  call menu-click {"label":"Delete Task"}
+  assert tasks is 2
+  assert dialog is none
+  call task.list {}
+  assert reply.tasks.0.name is Task 1
+  assert reply.tasks.1.name is Task 3
+  key ctrl+z
+  assert tasks is 3
+  call click-cell {"cell":"C2"}
+  key shift+down
+  call menu-open {"target":{"row":2}}
+  call menu-click {"label":"Notes..."}
+  assert selected_name is Task 2
+  assert prompt is notes:
+  assert selection is none

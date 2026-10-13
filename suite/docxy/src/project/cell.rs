@@ -535,12 +535,14 @@ pub(crate) fn project_row_click(tab: &mut DocTab, row: usize, col: Option<usize>
 /// The press a right-click on a table row makes before the row's menu opens
 /// (row `row` in task order, column `col`; `None` keeps the cursor's column,
 /// as a click does). Inside the selected range it keeps the range and the
-/// cursor, as Project and the sheet's cell menu do, so Fill Down and Clear
-/// Contents act on it; a levelling pass asked for first still runs first.
+/// cursor, as Project and the sheet's cell menu do, so the menu's range
+/// items (Cut, Copy, Paste, Fill Down, Clear Contents) act on it; a
+/// levelling pass asked for first still runs first. The menu's task items
+/// are still the clicked row's: the host selects that row before one runs.
 /// Anywhere else (no range, outside it, or with a cell edit open, which no
 /// range sits beside) it is a left click: the edit commits and the clicked
-/// cell is selected.
-pub(crate) fn project_row_menu_press(tab: &mut DocTab, row: usize, col: Option<usize>) {
+/// cell is selected. Returns whether the range was kept.
+pub(crate) fn project_row_menu_press(tab: &mut DocTab, row: usize, col: Option<usize>) -> bool {
     let inside = match &tab.surface {
         Surface::Project(v) => {
             v.cell.is_none()
@@ -556,6 +558,7 @@ pub(crate) fn project_row_menu_press(tab: &mut DocTab, row: usize, col: Option<u
     } else {
         project_row_click(tab, row, col, false);
     }
+    inside
 }
 
 /// The window-level release applies to EVERY Project tab: a gesture can

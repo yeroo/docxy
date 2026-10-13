@@ -3732,7 +3732,7 @@ fn status_items_are_the_state_the_mode_and_the_message_in_order() {
 /// The row menu's items as (label, enabled, checked); separators as `-`.
 fn row_menu(t: &DocTab) -> Vec<(String, bool, bool)> {
     use crate::menu::MenuItem;
-    project_row_menu(v(t))
+    project_row_menu(v(t), v(t).selected_uid())
         .into_iter()
         .map(|item| match item {
             MenuItem::Item(e) => (e.label, e.enabled, e.checked),
@@ -3789,7 +3789,7 @@ fn the_row_menu_lists_projects_items_in_order() {
         ]
     );
     // Every drawn icon is one the window can load.
-    for item in project_row_menu(v(&t)) {
+    for item in project_row_menu(v(&t), v(&t).selected_uid()) {
         if let crate::menu::MenuItem::Item(e) = item {
             assert!(
                 e.icon.is_empty()
@@ -4755,6 +4755,31 @@ fn row_menu_press_inside_keeps_the_range() {
     // No column (the harness, a press past the cells) is the cursor's.
     project_row_menu_press(&mut t, 0, None);
     assert_eq!(sel_of(&t), before);
+}
+
+/// #1213 r1: over a kept range the menu is the clicked row's, not the
+/// cursor's: its ticks are that task's mode.
+#[test]
+fn row_menu_over_a_kept_range_is_the_clicked_rows() {
+    let mut t = fill_tab();
+    let first = v(&t).ed.project().tasks[0].uid;
+    vm(&mut t).ed.set_manual(first, true).unwrap();
+    range(&mut t, 0, COL_NAME, 2, COL_NAME);
+    assert!(project_row_menu_press(&mut t, 0, Some(COL_NAME)), "kept");
+    assert_eq!(v(&t).cursor_row(), 2, "the cursor stays on Third");
+    let ticks = |clicked| {
+        project_row_menu(v(&t), clicked)
+            .into_iter()
+            .filter_map(|item| match item {
+                crate::menu::MenuItem::Item(e) if e.checked => Some(e.label),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ticks(Some(first)), ["Manually Schedule"]);
+    assert_eq!(ticks(v(&t).selected_uid()), ["Auto Schedule"]);
+    // Outside the range the press is a click: nothing is kept.
+    assert!(!project_row_menu_press(&mut t, 2, Some(COL_START)));
 }
 
 /// #1213: outside the range, a right-click is a left click: the range goes

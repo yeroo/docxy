@@ -704,16 +704,22 @@ pub(crate) fn cell_cut_write_took(now: &ClipRead, wrote: &str) -> bool {
 
 /// A Project command's checked state on the ribbon.
 pub(crate) fn project_act_active(v: &ProjectView, act: ProjectAct) -> bool {
+    task_act_active(v, act, v.selected_uid())
+}
+
+/// [`project_act_active`] with the task-following states (Inactivate, the
+/// task mode) read from task `uid` rather than the selected one: the row
+/// menu's row (#1213).
+fn task_act_active(v: &ProjectView, act: ProjectAct, uid: Option<i32>) -> bool {
     match act {
         ProjectAct::LevelAll => v.ed.leveled(),
         ProjectAct::Timeline => v.timeline,
         ProjectAct::CriticalTasks => v.show_critical,
         ProjectAct::BaselineBars => v.show_baseline,
-        ProjectAct::Inactivate => selected_task_inactive(v),
+        ProjectAct::Inactivate => task_inactive(v, uid),
         // The selected task's mode, as Project highlights it; none on the
         // entry row or a blank row.
-        ProjectAct::ManuallySchedule | ProjectAct::AutoSchedule => v
-            .selected_uid()
+        ProjectAct::ManuallySchedule | ProjectAct::AutoSchedule => uid
             .and_then(|uid| v.ed.project().task(uid))
             .is_some_and(|t| !t.is_null && t.manual == (act == ProjectAct::ManuallySchedule)),
         _ => false,
@@ -722,16 +728,24 @@ pub(crate) fn project_act_active(v: &ProjectView, act: ProjectAct) -> bool {
 
 /// A task row's context menu, in the order Project's Gantt Chart table draws
 /// it (#397). An item with no command here is drawn disabled, so the order
-/// stays Project's. The rest follow the row the cursor is on: `task` is a
-/// real task (not a blank row), `row` any task row, blank ones included
-/// (not the entry row, which has no task to delete).
-pub(crate) fn project_row_menu(v: &ProjectView) -> Vec<crate::menu::MenuItem> {
+/// stays Project's. The task items follow the row `clicked` (its uid, `None`
+/// for the entry row): `task` is a real task (not a blank row), `row` any
+/// task row, blank ones included (not the entry row, which has no task to
+/// delete). That is the cursor's row, except after a right-click inside the
+/// selected range, which keeps the range and the cursor (#1213): the task
+/// items still act on the clicked row (the host selects it before one runs),
+/// while the range items (Cut, Copy, Paste, Fill Down, Clear Contents)
+/// follow the range and the cursor.
+pub(crate) fn project_row_menu(
+    v: &ProjectView,
+    clicked: Option<i32>,
+) -> Vec<crate::menu::MenuItem> {
     use crate::menu::{
         Entry,
         MenuItem::{Item, Separator},
     };
     use ProjectAct::*;
-    let uid = v.selected_uid();
+    let uid = clicked;
     let row = uid.is_some();
     let task = uid
         .and_then(|uid| v.ed.project().task(uid))
@@ -742,7 +756,7 @@ pub(crate) fn project_row_menu(v: &ProjectView) -> Vec<crate::menu::MenuItem> {
     let toggle = |id, label, icon, act: ProjectAct| {
         Item(
             Entry::new(id, label, icon, Act::Project(act), task)
-                .checked(task && project_act_active(v, act)),
+                .checked(task && task_act_active(v, act, uid)),
         )
     };
     let none = |id, label| Item(Entry::unavailable(id, label));
@@ -802,7 +816,7 @@ pub(crate) fn project_row_menu(v: &ProjectView) -> Vec<crate::menu::MenuItem> {
             "Clear Contents",
             "clear-format",
             ClearContents,
-            row,
+            v.selected_uid().is_some(),
         ),
         Separator,
         item(
@@ -888,8 +902,11 @@ pub(crate) fn project_column_menu() -> Vec<crate::menu::MenuItem> {
 }
 
 fn selected_task_inactive(v: &ProjectView) -> bool {
-    v.selected_uid()
-        .and_then(|uid| v.ed.project().tasks.iter().position(|t| t.uid == uid))
+    task_inactive(v, v.selected_uid())
+}
+
+fn task_inactive(v: &ProjectView, uid: Option<i32>) -> bool {
+    uid.and_then(|uid| v.ed.project().tasks.iter().position(|t| t.uid == uid))
         .is_some_and(|i| inactive_row(v.ed.project(), i))
 }
 
