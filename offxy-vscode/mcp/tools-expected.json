@@ -2179,5 +2179,129 @@
       },
       "required": []
     }
+  },
+  {
+    "name": "xlsxy_import_text",
+    "description": "Import delimited or fixed-width text as a brand-new sheet, as the Text Import Wizard reads it (never overwrites an existing sheet; name collisions are deduplicated). Give text, or the path of a text file. Returns the sheet, its name, rows and cols.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "description": "The text to import."
+        },
+        "path": {
+          "type": "string",
+          "description": "A text file to import instead of text, decoded under options.origin."
+        },
+        "options": {
+          "type": "object",
+          "description": "The Text Import Wizard's choices (each optional): kind (delimited|fixed), delimiters (array of tab, semicolon, comma, space or a single character), consecutive (boolean), qualifier (\", ' or none), breaks (array of fixed-width positions), start_row (1-based), origin (auto, utf-8, utf-16le, utf-16be, windows-1252, or a code page by number or name such as 437, 1251, macintosh), columns (array of general, text, date:mdy/dmy/ymd/myd/dym/ydm or skip), decimal and thousands (one character each), trailing_minus (boolean)."
+        },
+        "name": {
+          "type": "string",
+          "description": "Requested sheet name (default: \"Sheet\", deduplicated)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "xlsxy_text_to_columns",
+    "description": "Data > Text to Columns on one column: split its cells under options into dest and the columns to its right. Refuses with Excel's question when that overwrites cells holding data, unless replace is true. One undo step; returns the rows converted.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "range": {
+          "type": "string",
+          "description": "The one column to split, e.g. \"A1:A20\"."
+        },
+        "options": {
+          "type": "object",
+          "description": "The Text Import Wizard's choices (each optional): kind (delimited|fixed), delimiters (array of tab, semicolon, comma, space or a single character), consecutive (boolean), qualifier (\", ' or none), breaks (array of fixed-width positions), start_row (1-based), origin (auto, utf-8, utf-16le, utf-16be, windows-1252, or a code page by number or name such as 437, 1251, macintosh), columns (array of general, text, date:mdy/dmy/ymd/myd/dym/ydm or skip), decimal and thousands (one character each), trailing_minus (boolean)."
+        },
+        "dest": {
+          "type": "string",
+          "description": "The destination's top-left cell (default: the range's first cell)."
+        },
+        "replace": {
+          "type": "boolean",
+          "description": "Overwrite destination cells that hold data (default: false, refused)."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "range"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_options",
+    "description": "Read or change File > Options: Data's Automatic Data Conversion (followed by the next .csv/text open and imports) and Advanced's Editing options. With no arguments, returns them all. Every given key is checked before any is set; saved with the app's preferences.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "convert_leading_zeros": {
+          "type": "boolean",
+          "description": "Remove leading zeros and convert to a number (007 -> 7)."
+        },
+        "convert_long_numbers": {
+          "type": "boolean",
+          "description": "Keep the first 15 digits of a long number (else it stays text)."
+        },
+        "convert_e_notation": {
+          "type": "boolean",
+          "description": "Convert digits around an E to a number (1E3)."
+        },
+        "convert_dates": {
+          "type": "boolean",
+          "description": "Convert continuous letters and numbers to a date (1/2)."
+        },
+        "edit_fixed_decimal": {
+          "type": "boolean",
+          "description": "Automatically insert a decimal point into numbers typed into the grid."
+        },
+        "edit_fixed_decimal_places": {
+          "type": "number",
+          "description": "Its places, a whole number from -300 to 300."
+        },
+        "edit_move_after_enter": {
+          "type": "boolean",
+          "description": "After pressing Enter, move the selection."
+        },
+        "edit_move_direction": {
+          "type": "string",
+          "description": "Its direction: down, right, up or left."
+        },
+        "edit_in_cell": {
+          "type": "boolean",
+          "description": "Allow editing directly in cells."
+        },
+        "edit_autocomplete": {
+          "type": "boolean",
+          "description": "Enable AutoComplete for cell values."
+        },
+        "edit_formula_autocomplete": {
+          "type": "boolean",
+          "description": "Formula AutoComplete."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
   }
 ]

@@ -1055,8 +1055,9 @@ MCP: `claude mcp add xlsxy -- xlsxy --mcp` → `xlsxy_list`, `xlsxy_new`,
 `xlsxy_page_header`, `xlsxy_print_area_set`, `xlsxy_print_area_add`,
 `xlsxy_print_area_clear`, `xlsxy_print_titles`, `xlsxy_page_break_insert`,
 `xlsxy_page_break_remove`, `xlsxy_page_break_reset`, `xlsxy_print_pages`,
-`xlsxy_export_pdf`, `xlsxy_flash_fill`, `xlsxy_autocorrect` (48 total;
-docxy's 40 + xlsxy's 48 = **88 tools** total across both apps).
+`xlsxy_export_pdf`, `xlsxy_flash_fill`, `xlsxy_autocorrect`,
+`xlsxy_import_text`, `xlsxy_text_to_columns`, `xlsxy_options` (51 total;
+docxy's 40 + xlsxy's 51 = **91 tools** total across both apps).
 Skill: `xlsxy install skill`.
 
 **yppxy** (project schedule; tasks addressed by UID, durations like `3d`/`4h`):

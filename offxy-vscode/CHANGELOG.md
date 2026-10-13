@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **New: text import, Text to Columns and options over MCP (#761).**
+  `xlsxy_import_text` imports delimited or fixed-width text into a new sheet
+  as the Text Import Wizard reads it (any File origin, including the new
+  code pages), `xlsxy_text_to_columns` runs Data › Text to Columns on a
+  column, and `xlsxy_options` reads and sets File › Options' Automatic Data
+  Conversion and editing options, of a terminal `xlsxy`, growing the
+  combined Offxy surface from 88 to **91 tools** (40 docxy + 51 xlsxy). A
+  VS Code spreadsheet tab does not answer them yet.
+- **`xlsxy_import_csv` in a spreadsheet tab reads CSV as Excel opens it
+  (#761).** A `sep=` first line names the delimiter instead of becoming a
+  row, and fields convert as if typed (leading zeros, dates with a date
+  format, E notation), as a terminal `xlsxy` already did.
 - **New: Flash Fill and AutoCorrect over MCP (#712).** `xlsxy_flash_fill`
   fills a column from the examples typed at its top (Data › Flash Fill) and
   `xlsxy_autocorrect` reads and edits AutoCorrect's switches, replace list
