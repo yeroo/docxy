@@ -531,7 +531,7 @@ pub(crate) fn table_design_tab() -> rs::Tab<Act> {
                 ],
             ),
             rs::group(
-                "Table Styles",
+                STYLES_GROUP,
                 40,
                 vec![
                     Control::Gallery(rs::Gallery {
@@ -844,7 +844,7 @@ impl Docxy {
         if self.table_grid_hover != at {
             self.table_grid_hover = at;
             match at {
-                Some((cols, rows)) => self.set_doc_preview(Some(PreviewKind::Grid { cols, rows })),
+                Some((cols, rows)) => self.set_doc_preview(PreviewKind::Grid { cols, rows }),
                 None => self.drop_doc_preview(PreviewKind::is_grid),
             }
             cx.notify();
@@ -862,9 +862,8 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         self.table_grid_hover(Some((cols, rows)), cx)?;
+        // Closing the menu forgets the hover and drops its preview.
         self.close_menu();
-        self.table_grid_hover = None;
-        self.drop_doc_preview(PreviewKind::is_grid);
         self.insert_table(rows, cols, docxcore::table::AutoFit::Default, window, cx);
         Ok(())
     }
@@ -1405,12 +1404,13 @@ pub(crate) struct DrawnPreview {
 }
 
 impl DrawnPreview {
-    pub(crate) fn of(p: &DocPreview, pages: Option<usize>) -> Self {
+    /// What drawing `p` shows; the Print Layout path adds its pages.
+    pub(crate) fn of(p: &DocPreview) -> Self {
         DrawnPreview {
             kind: p.kind,
             tables: count_tables(&p.editor.doc.body),
             style: p.editor.table_style(),
-            pages,
+            pages: None,
         }
     }
 }
@@ -1461,30 +1461,30 @@ pub(crate) fn preview_allowed(tab: &DocTab, view_only: bool, pen: bool) -> bool 
 }
 
 impl Docxy {
-    /// Show `kind`'s live preview in the active document, or none. Built
-    /// once here, on a hover change, never per frame.
-    fn set_doc_preview(&mut self, kind: Option<PreviewKind>) {
-        let pen = self.draw_tool().is_some();
-        let view_only = self.view_only_active();
-        let active = self.active;
-        self.doc_preview = kind.and_then(|kind| {
-            let tab = self.tabs.get(active)?;
-            if !preview_allowed(tab, view_only, pen) {
-                return None;
-            }
-            let Surface::Doc(ed) = &tab.surface else {
-                return None;
-            };
-            Some(DocPreview {
-                tab: active,
-                docs: self.tabs.len(),
-                generation: edit_generation(),
-                caret: ed.caret.clone(),
-                anchor: ed.anchor.clone(),
-                kind,
-                editor: build_preview(ed, kind)?,
-            })
-        });
+    /// Show `kind`'s live preview in the active document, or none where
+    /// its command would be refused. Built once here, on a hover change,
+    /// never per frame.
+    fn set_doc_preview(&mut self, kind: PreviewKind) {
+        self.doc_preview = self.doc_preview_of(kind);
+    }
+
+    fn doc_preview_of(&self, kind: PreviewKind) -> Option<DocPreview> {
+        let tab = self.tabs.get(self.active)?;
+        if !preview_allowed(tab, self.view_only_active(), self.draw_tool().is_some()) {
+            return None;
+        }
+        let Surface::Doc(ed) = &tab.surface else {
+            return None;
+        };
+        Some(DocPreview {
+            tab: self.active,
+            docs: self.tabs.len(),
+            generation: edit_generation(),
+            caret: ed.caret.clone(),
+            anchor: ed.anchor.clone(),
+            kind,
+            editor: build_preview(ed, kind)?,
+        })
     }
 
     /// Drop the live preview when `kind` holds for its kind.
@@ -1560,7 +1560,7 @@ impl Docxy {
         let now = self.doc_preview.as_ref().map(|p| p.kind);
         match at {
             Some(i) if now != Some(PreviewKind::Style(i)) => {
-                self.set_doc_preview(Some(PreviewKind::Style(i)));
+                self.set_doc_preview(PreviewKind::Style(i));
                 cx.notify();
             }
             None if matches!(now, Some(PreviewKind::Style(_))) => {
@@ -1853,6 +1853,11 @@ mod tests {
         assert!(ed.undo(), "the typing is still the newest step");
         assert!(!ed.undo());
         assert!(build_preview(&ed, PreviewKind::Grid { cols: 0, rows: 2 }).is_none());
+        // No undo serial is issued: Repeat (F4) and the typing run read it.
+        let serial = docxcore::editor::undo_serial_counter();
+        build_preview(&ed, PreviewKind::Grid { cols: 3, rows: 2 }).unwrap();
+        build_preview(&ed_in_table(), PreviewKind::Style(7)).unwrap();
+        assert_eq!(docxcore::editor::undo_serial_counter(), serial);
         assert!(build_preview(&ed, PreviewKind::Grid { cols: 2, rows: 0 }).is_none());
     }
 

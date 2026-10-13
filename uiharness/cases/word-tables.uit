@@ -373,3 +373,23 @@ test no document preview while a header is being edited (764)
   assert reply.header is 3x2 Table
   shot window
   assert preview is null
+
+test a grid hover leaves repeat as it was (764)
+  open copy:../fixtures/basic.docx
+  type ab cd
+  call selection-set {"start":0,"end":2}
+  key ctrl+b
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call table-grid {"cols":3,"rows":2}
+  shot window
+  assert preview.kind is grid
+  call table-grid {}
+  call menu-close {}
+  # The hover built its preview on a copy and issued no undo serial, so
+  # Repeat still repeats the bold.
+  call ribbon-read {}
+  assert reply.qat.1.tip.title is Repeat (Ctrl+Y)
+  call selection-set {"start":3,"end":5}
+  key f4
+  call selection-set {"start":4,"end":4}
+  assert run.bold is true

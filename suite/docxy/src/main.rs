@@ -34879,8 +34879,7 @@ impl Render for Docxy {
                     let previewing = preview.is_some();
                     let editor = preview.map_or(editor, |p| &p.editor);
                     if let Some(p) = preview {
-                        *self.drawn_preview.borrow_mut() =
-                            Some(table_tab::DrawnPreview::of(p, None));
+                        *self.drawn_preview.borrow_mut() = Some(table_tab::DrawnPreview::of(p));
                     }
                     // Display for Review: the document, or a clone shown as No
                     // Markup / Original / Simple; never saved.

@@ -445,7 +445,8 @@ dirty, so settle a frame with `shot window` before reading it. A preview is
 drawn only while it is current: no edit and no caret or selection move since
 the hover, the grid's menu open on that cell or the gallery showing, and none
 while a header or footer is being edited, in Protected View or a final
-document, or with a table pen on.
+document, in Display for Review's No Markup or Original, or with a table pen
+on.
 
 `gallery-hover {"gallery": "tablestyles", "item": "<label>"}` moves the
 pointer onto that Table Styles tile (the labels `ribbon-click
