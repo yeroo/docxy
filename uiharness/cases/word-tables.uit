@@ -206,3 +206,170 @@ test design tab styles, options, shading and borders (648)
   key ctrl+z ctrl+z
   call ribbon-read {}
   assert reply.tabs.9.groups.2.commands.6.checked is true
+
+# Live preview (#764): hovering a grid cell or a Table Styles tile draws the
+# document as the click would leave it, without changing it. `preview` is
+# what the last frame drew in place of the document (`shot window` settles
+# one); the document, its undo and `dirty` stay as they were.
+test hovering the insert table grid previews the table in the document (764)
+  open copy:../fixtures/basic.docx
+  # Print Layout is a window setting: on here, off again at the end.
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is print
+  call ribbon-click {"tab":"Insert","command":"table"}
+  shot window
+  assert preview is null
+  call table-grid {"cols":3,"rows":2}
+  shot window
+  assert preview.kind is grid
+  assert preview.cols is 3
+  assert preview.rows is 2
+  assert preview.tables is 1
+  assert preview.pages is 1
+  assert table is null
+  assert dirty is false
+  call table-grid {"cols":4,"rows":3}
+  shot window
+  assert preview.cols is 4
+  assert preview.rows is 3
+  call table-grid {}
+  shot window
+  assert preview is null
+  assert table is null
+  assert dirty is false
+  # Escape closes the menu, and the preview goes with it.
+  call table-grid {"cols":2,"rows":2}
+  shot window
+  assert preview.kind is grid
+  key escape
+  shot window
+  assert menu is null
+  assert preview is null
+  assert dirty is false
+  # A click inserts what was previewed; what is drawn is then the real table.
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call table-grid {"cols":3,"rows":2}
+  call table-grid {"cols":3,"rows":2,"click":true}
+  shot window
+  assert preview is null
+  assert table.columns is 3
+  assert table.rows is 2
+  key ctrl+z
+  assert table is null
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is web
+
+test the insert table grid preview draws in draft view too (764)
+  open copy:../fixtures/basic.docx
+  assert view.layout is web
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call table-grid {"cols":5,"rows":4}
+  shot window
+  assert preview.kind is grid
+  assert preview.tables is 1
+  assert preview.pages is null
+  call menu-close {}
+  shot window
+  assert preview is null
+
+test a tall grid preview flows onto another page the document does not have (764)
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is print
+  # Near the foot of the one page: an 8-row table no longer fits on it.
+  key ctrl+end
+  key enter enter enter enter enter enter enter enter enter enter enter enter enter enter enter enter enter enter enter enter enter enter enter enter enter enter enter enter enter enter
+  call status-read {}
+  assert reply.items.2.text is 1 page · 0 words
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call table-grid {"cols":3,"rows":8}
+  shot window
+  assert preview.pages is 2
+  # The document itself still has one page.
+  call status-read {}
+  assert reply.items.2.text is 1 page · 0 words
+  call menu-close {}
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is web
+
+test hovering a table style previews it on the caret's table (764)
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call table-grid {"cols":3,"rows":3,"click":true}
+  call ribbon-click {"tab":"Table Design","command":"tablestyles:Grid Table 1 Light"}
+  key ctrl+s
+  assert dirty is false
+  call gallery-hover {"gallery":"tablestyles","item":"Grid Table 4 Accent 1"}
+  shot window
+  assert preview.kind is style
+  assert preview.style is GridTable4-Accent1
+  assert preview.tables is 1
+  assert table.style is GridTable1Light
+  assert dirty is false
+  call gallery-hover {"gallery":"tablestyles"}
+  shot window
+  assert preview is null
+  assert table.style is GridTable1Light
+  assert dirty is false
+  # A caret moved by a key while the pointer rests on a tile drops the
+  # preview: it was of the table where the caret was.
+  call gallery-hover {"gallery":"tablestyles","item":"Grid Table 4 Accent 1"}
+  shot window
+  assert preview.kind is style
+  key tab
+  assert table.cell is 1
+  shot window
+  assert preview is null
+  # A click applies the hovered style; the drawn table is then the real one.
+  call gallery-hover {"gallery":"tablestyles","item":"Grid Table 4 Accent 1"}
+  call ribbon-click {"tab":"Table Design","command":"tablestyles:Grid Table 4 Accent 1"}
+  shot window
+  assert preview is null
+  assert table.style is GridTable4-Accent1
+  assert dirty is true
+  key ctrl+z
+  assert table.style is GridTable1Light
+  # Out of the table the gallery is gone: no hover there.
+  key ctrl+end
+  call-error gallery-hover {"gallery":"tablestyles","item":"Grid Table 4 Accent 1"} => is not showing
+
+test an edit while hovering a table style drops the preview (764)
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call table-grid {"cols":2,"rows":2,"click":true}
+  call ribbon-layout {"tab":"Table Design"}
+  call gallery-hover {"gallery":"tablestyles","item":"Grid Table 4 Accent 1"}
+  shot window
+  assert preview.kind is style
+  type z
+  shot window
+  assert preview is null
+  assert table.cells.0.0.0 is z
+
+test the table styles gallery previews from its narrow-window flyout (764 1020)
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call table-grid {"cols":2,"rows":2,"click":true}
+  call window-size {"w":460,"h":800}
+  call ribbon-layout {"tab":"Table Design"}
+  shot window
+  call-error gallery-hover {"gallery":"tablestyles","item":"Grid Table 4 Accent 1"} => is not showing
+  call ribbon-flyout {"action":"open","group":"Table Styles"}
+  assert reply.open is true
+  call gallery-hover {"gallery":"tablestyles","item":"Grid Table 4 Accent 1"}
+  shot window
+  assert preview.kind is style
+  assert preview.style is GridTable4-Accent1
+  call ribbon-flyout {"action":"close"}
+  shot window
+  assert preview is null
+
+test no document preview while a header is being edited (764)
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"Edit Header"}
+  assert hf_edit is true
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call table-grid {"cols":3,"rows":2}
+  assert reply.header is 3x2 Table
+  shot window
+  assert preview is null

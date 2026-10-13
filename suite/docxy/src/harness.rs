@@ -1771,6 +1771,27 @@ fn doc_state(editor: &Editor, flags: &ViewFlags) -> Json {
     ])
 }
 
+/// `state.preview` (#764): what a frame drew in place of the document.
+fn preview_json(drawn: Option<&crate::table_tab::DrawnPreview>) -> Json {
+    use crate::table_tab::PreviewKind;
+    let Some(d) = drawn else {
+        return Json::Null;
+    };
+    let mut out = match d.kind {
+        PreviewKind::Grid { cols, rows } => vec![
+            ("kind", Json::Str("grid".into())),
+            ("cols", Json::Num(cols as f64)),
+            ("rows", Json::Num(rows as f64)),
+        ],
+        PreviewKind::Style(_) => vec![("kind", Json::Str("style".into()))],
+    };
+    out.push(("tables", Json::Num(d.tables as f64)));
+    out.push(("style", d.style.clone().map_or(Json::Null, Json::Str)));
+    // Pages are drawn in Print Layout only: null in Draft.
+    out.push(("pages", d.pages.map_or(Json::Null, |p| Json::Num(p as f64))));
+    Json::obj(out)
+}
+
 /// The caret's innermost table (#705), or null: its row count, the caret's
 /// row and cell, its style and style options, the caret cell's shading and
 /// text direction, the cell-range selection when it lies in this table, and
@@ -3554,6 +3575,9 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
             "dirty",
             Json::Bool(app.tabs.get(app.active).is_some_and(|t| t.dirty)),
         ),
+        // The live preview (#764) the last frame drew in place of the
+        // document, or null: settle a frame (`shot window`) after a hover.
+        ("preview", preview_json(app.drawn_preview.borrow().as_ref())),
         // The active tab's caption and open mode (#610).
         (
             "caption",
@@ -4678,6 +4702,32 @@ fn dispatch_verb(
                 ("header", Json::Str(header)),
                 ("state", state(app, window, cx)),
             ]))
+        }
+        // A Table Styles tile under the pointer (#764): `{"gallery":
+        // "tablestyles", "item": "<label>"}` moves the pointer onto that
+        // tile, `{"gallery": "tablestyles"}` off the gallery, through the
+        // handler the drawn tiles call. Refused unless the gallery shows.
+        "gallery-hover" => {
+            app.refuse_under_dialog()?;
+            if arg_str(args, "gallery")? != "tablestyles" {
+                return Err("gallery-hover knows the 'tablestyles' gallery".into());
+            }
+            if !app.table_styles_showing(window) {
+                return Err("the Table Styles gallery is not showing".into());
+            }
+            let at = match args.get("item") {
+                None => None,
+                Some(_) => {
+                    let label = arg_str(args, "item")?;
+                    let command = format!("tablestyles:{label}");
+                    match resolve_ribbon_command(app, crate::table_tab::DESIGN_TAB, &command)? {
+                        crate::Act::Table(crate::table_tab::TableAct::Style(i)) => Some(i),
+                        _ => return Err(format!("no Table Styles item {label}")),
+                    }
+                }
+            };
+            app.table_style_hover(at, cx);
+            Done::ok(Json::obj(vec![("state", state(app, window, cx))]))
         }
         // A table pen gesture (#763): a press at `from`, a drag to `to` and the
         // release, through the same handlers a mouse gesture runs. With
