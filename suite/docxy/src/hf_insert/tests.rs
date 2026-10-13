@@ -518,6 +518,62 @@ fn the_alignment_tab_dialog_inserts_a_ptab() {
     );
 }
 
+/// FIX r3 M1/M2: text typed right after Insert Alignment Tab, a picture or a
+/// property control goes after it, as in Word, through the paths the tab
+/// uses; a caret move between them falls back to the usual rule.
+#[test]
+fn typing_after_an_inserted_object_goes_after_it_in_the_header() {
+    let at = |xml: &str, s: &str| xml.find(s).unwrap_or_else(|| panic!("{s} in {xml}"));
+    // `Header A`, Insert Alignment Tab (Right), `Page 1`.
+    let mut t = header_tab("type-after-ptab");
+    hf_ed(&mut t).caret.offset = 8;
+    let mut d = alignment_tab_dialog();
+    set_choice(&mut d, "alignment", 2);
+    t.dialogs.push(d);
+    crate::dialog_host::dialog_click(&mut t, "OK").unwrap();
+    hf_ed(&mut t).insert_str("Page 1");
+    let (_, xml) = saved_header(&mut t);
+    assert!(at(&xml, ">Header A</w:t>") < at(&xml, "<w:ptab "));
+    assert!(at(&xml, "<w:ptab ") < at(&xml, ">Page 1</w:t>"), "{xml}");
+
+    // A picture, then `x`.
+    let dir = tmp_dir("type-after-picture");
+    let png = png_file(&dir, "logo.png", 10, 10);
+    let mut t = header_tab("type-after-picture");
+    hf_ed(&mut t).caret.offset = 8;
+    insert_picture(&mut t, &png).unwrap();
+    hf_ed(&mut t).insert_char('x');
+    let (_, xml) = saved_header(&mut t);
+    assert!(at(&xml, ">Header A</w:t>") < at(&xml, "<w:drawing>"));
+    assert!(at(&xml, "</w:drawing>") < at(&xml, ">x</w:t>"), "{xml}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The Title control, then ` - draft`: after its close, its content as
+    // core.xml has it.
+    let mut t = with_core("type-after-control", "Ann", "Quarterly Report");
+    open_header(&mut t);
+    hf_ed(&mut t).caret.offset = 8;
+    let control = property_control(&t, CoreProp::Title);
+    hf_ed(&mut t).insert_object(control);
+    hf_ed(&mut t).insert_str(" - draft");
+    let (_, xml) = saved_header(&mut t);
+    assert!(
+        xml.contains(">Quarterly Report</w:t></w:r></w:sdtContent></w:sdt>"),
+        "{xml}"
+    );
+    assert!(at(&xml, "</w:sdt>") < at(&xml, "> - draft</w:t>"), "{xml}");
+
+    // A caret move in between: the text goes where the caret went.
+    let mut t = header_tab("type-after-move");
+    hf_ed(&mut t).caret.offset = 8;
+    t.dialogs.push(alignment_tab_dialog());
+    crate::dialog_host::dialog_click(&mut t, "OK").unwrap();
+    hf_ed(&mut t).caret.offset = 0;
+    hf_ed(&mut t).insert_str("My ");
+    let (_, xml) = saved_header(&mut t);
+    assert!(xml.contains(">My Header A</w:t>"), "{xml}");
+}
+
 /// Criterion 8's layout: the segment after a right alignment tab ends at
 /// the right margin; a centre one centres it; a passed stop adds nothing.
 #[test]

@@ -196,9 +196,8 @@ pub(crate) fn ptab_xml(d: &Dialog, props: &docxcore::model::RunProps) -> String 
 pub(crate) fn apply_alignment_tab(ed: &mut Editor, d: &Dialog) -> Result<bool, String> {
     let run = ptab_xml(d, &ed.caret_props());
     ed.break_undo_group();
-    ed.paste(&Clip {
-        paras: vec![vec![Inline::Raw(run)]],
-    });
+    // Text typed next goes after the tab, as in Word.
+    ed.insert_object(vec![Inline::Raw(run)]);
     Ok(true)
 }
 
@@ -300,9 +299,7 @@ pub(crate) fn insert_picture(tab: &mut DocTab, path: &Path) -> Result<String, St
     let run = docxcore::image::inline_picture_run(&rid, cx, cy, id, &name);
     let ed = &mut tab.hf_edit.as_mut().expect("checked above").editor;
     ed.break_undo_group();
-    ed.paste(&Clip {
-        paras: vec![vec![Inline::Raw(run)]],
-    });
+    ed.insert_object(vec![Inline::Raw(run)]);
     tab.mark_dirty();
     Ok(format!("Inserted picture {name}"))
 }
@@ -342,11 +339,8 @@ impl Docxy {
                     return;
                 };
                 let control = property_control(tab, prop);
-                return self.with_editor(window, cx, |e| {
-                    e.paste(&Clip {
-                        paras: vec![control],
-                    })
-                });
+                // Text typed next goes after the control, not into it.
+                return self.with_editor(window, cx, |e| e.insert_object(control));
             }
             HfAct::Pictures => return self.pick_hf_picture(window, cx),
             _ => {}

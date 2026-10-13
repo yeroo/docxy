@@ -174,6 +174,16 @@ struct Snapshot {
     pending: Option<PendingFormat>,
 }
 
+/// The content index text typed at `caret` goes in at, just after the
+/// inlines [`Editor::insert_object`] put there, while the step that put
+/// them (`serial`) is still the last.
+#[derive(Clone, Debug)]
+struct AfterObject {
+    caret: Caret,
+    serial: Option<u64>,
+    index: usize,
+}
+
 /// Formatting toggled at an insertion point (Ctrl+B with nothing
 /// selected, #854): what the next character typed there takes, as Word
 /// does, set over the props the character would get anyway.
@@ -406,6 +416,9 @@ pub struct Editor {
     /// Formatting toggled at the caret, for the next character typed (#854);
     /// see [`Editor::pending_format`] for while it holds.
     pending: Option<PendingFormat>,
+    /// Where text typed next goes after [`Editor::insert_object`] (#768);
+    /// see [`Editor::typing_after_object`] for while it holds.
+    after_object: Option<AfterObject>,
     /// A [`Editor::preview_copy`]: its edits keep no history and issue no
     /// undo serial, which hosts read as "an edit happened" (#764).
     display_only: bool,
@@ -437,6 +450,7 @@ impl Editor {
             merge_previewed: false,
             track: None,
             pending: None,
+            after_object: None,
             display_only: false,
         }
     }
@@ -462,6 +476,7 @@ impl Editor {
             merge_previewed: self.merge_previewed,
             track: self.track.clone(),
             pending: self.pending.clone(),
+            after_object: self.after_object.clone(),
             display_only: true,
         }
     }
@@ -969,6 +984,12 @@ impl Editor {
         // step keeps it, so undoing the typing brings it back); text typed
         // after this character takes the character's own props.
         let pending = self.pending_format().cloned();
+        // Read before the typing step is pushed, too: after an inserted
+        // object, the character starts a run of its own past it (#768).
+        let after_object = self
+            .typing_after_object()
+            .map(|at| (at, self.typing_props_here(pending.as_ref())));
+        self.after_object = None;
         let pushed_before = undo_serial_counter();
         if ch == '\n' {
             // A newline over a selection is one step: `insert_newline`
@@ -1013,7 +1034,16 @@ impl Editor {
                 return;
             }
         } else if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
-            content_insert(&mut p.content, off, ch);
+            match after_object {
+                Some((at, props)) if at <= p.content.len() => p.content.insert(
+                    at,
+                    Inline::Run(Run {
+                        text: ch.to_string(),
+                        props,
+                    }),
+                ),
+                _ => content_insert(&mut p.content, off, ch),
+            }
             // The toggles go on before the change is recorded, which may
             // set the props of a tracked insertion over them.
             if let Some(pending) = &pending {
@@ -1988,6 +2018,53 @@ impl Editor {
         self.pending.as_ref().filter(|p| {
             p.caret == self.caret && p.serial == self.undo_serial() && !self.has_selection()
         })
+    }
+
+    /// Insert `inlines`, one paragraph's worth (a picture or alignment tab
+    /// run, a content control), at the caret as a paste does (#768). Text
+    /// typed next goes after them, as in Word, where it would otherwise
+    /// join the run before an object that takes no caret offset, or the
+    /// content of a control that ends at the caret. That holds as
+    /// [`Editor::pending_format`] does: until the caret moves, a selection
+    /// is made, or another step is pushed.
+    pub fn insert_object(&mut self, inlines: Vec<Inline>) {
+        self.paste(&Clip {
+            paras: vec![inlines.clone()],
+        });
+        let n = inlines.len();
+        let Some(p) = resolve_para(&self.doc.body, &self.caret.path) else {
+            return;
+        };
+        // The inserted inlines are the ones ending at the caret (a tracked
+        // insertion records them otherwise, and typing then goes as usual).
+        let mut acc = 0;
+        let mut index = None;
+        for i in 0..p.content.len() {
+            let end = acc + p.content[i..].iter().take(n).map(inline_len).sum::<usize>();
+            if i + n <= p.content.len()
+                && end == self.caret.offset
+                && p.content[i..i + n] == inlines[..]
+            {
+                index = Some(i + n);
+            }
+            acc += inline_len(&p.content[i]);
+        }
+        self.after_object = index.map(|index| AfterObject {
+            caret: self.caret.clone(),
+            serial: self.undo_serial(),
+            index,
+        });
+    }
+
+    /// The content index a character typed now goes in at, while the
+    /// object [`Editor::insert_object`] put at the caret still holds it.
+    fn typing_after_object(&self) -> Option<usize> {
+        self.after_object
+            .as_ref()
+            .filter(|a| {
+                a.caret == self.caret && a.serial == self.undo_serial() && !self.has_selection()
+            })
+            .map(|a| a.index)
     }
 
     /// Paragraph properties of the paragraph at the caret.
@@ -5001,6 +5078,73 @@ mod tests {
         let mut ed = selected(trailing(), 0, 5);
         ed.delete_selection();
         assert!(raws(&ed, 0).is_empty());
+    }
+
+    /// FIX r3 M1/M2: text typed right after an inserted object goes after
+    /// it, as in Word: past an alignment tab, past a picture, and past a
+    /// content control's close rather than into its content. Undo takes the
+    /// typing back, then the object.
+    #[test]
+    fn typing_after_an_inserted_object_goes_after_it_768() {
+        let mut ed = selected(vec![run("Company", RunProps::default())], 7, 7);
+        ed.anchor = None;
+        ed.insert_object(vec![Inline::Raw(PTAB.into())]);
+        ed.insert_str("Page 1");
+        let texts = |ed: &Editor| -> Vec<String> {
+            first_para(ed)
+                .content
+                .iter()
+                .map(|i| match i {
+                    Inline::Run(r) => r.text.clone(),
+                    Inline::Raw(r) if r.contains("<w:ptab") => "[PTAB]".into(),
+                    Inline::Raw(r) if r.contains("<w:drawing") => "[PIC]".into(),
+                    Inline::Raw(r) if r.starts_with("<w:sdt>") => "[SDT".into(),
+                    Inline::Raw(_) => "]".into(),
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(texts(&ed), ["Company", "[PTAB]", "Page 1"]);
+        assert!(ed.undo());
+        assert_eq!(texts(&ed), ["Company", "[PTAB]"]);
+        assert!(ed.undo());
+        assert_eq!(texts(&ed), ["Company"]);
+
+        // A picture, then text.
+        let mut ed = selected(vec![run("ab", RunProps::default())], 2, 2);
+        ed.anchor = None;
+        ed.insert_object(vec![Inline::Raw(PICTURE.into())]);
+        ed.insert_char('x');
+        assert_eq!(texts(&ed), ["ab", "[PIC]", "x"]);
+
+        // A control: the typing goes after its close, its content unchanged.
+        let mut ed = selected(vec![run("T: ", RunProps::default())], 3, 3);
+        ed.anchor = None;
+        let control = crate::sdt::core_property_control(
+            crate::sdt::CoreProp::Title,
+            "Report",
+            1,
+            &RunProps::default(),
+        );
+        ed.insert_object(control);
+        ed.insert_str(" - draft");
+        assert_eq!(texts(&ed), ["T: ", "[SDT", "Report", "]", " - draft"]);
+
+        // A caret move between them falls back to the usual rule: the text
+        // goes where the caret went.
+        let mut ed = selected(vec![run("Company", RunProps::default())], 7, 7);
+        ed.anchor = None;
+        ed.insert_object(vec![Inline::Raw(PTAB.into())]);
+        ed.caret.offset = 0;
+        ed.insert_str("My ");
+        assert_eq!(texts(&ed), ["My Company", "[PTAB]"]);
+        // Another edit before the typing ends it too.
+        let mut ed = selected(vec![run("Company", RunProps::default())], 7, 7);
+        ed.anchor = None;
+        ed.insert_object(vec![Inline::Raw(PTAB.into())]);
+        ed.toggle_bold();
+        ed.insert_char('!');
+        assert_eq!(texts(&ed), ["Company", "!", "[PTAB]"]);
     }
 
     /// FIX r1 M2: a cut leaves the pictures and alignment tabs it spans,
