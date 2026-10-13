@@ -55,7 +55,7 @@ use gridcore::sheet::{
     Align, Cell, CellValue, MAX_COLS, MAX_ROWS, NumFmt, Sheet, Xf, cell_name, col_name,
     date_unrepresentable, format_with, sheet_to_csv,
 };
-use gridcore::textio::{AutoConvert, TextParse};
+use gridcore::textio::{AutoConvert, Origin, TextParse};
 use gridcore::xlsx::{SheetPackage, SpreadsheetKind, new_xlsx, save_xlsx_for_path};
 
 use ratatui::backend::CrosstermBackend;
@@ -384,10 +384,11 @@ const SAVE_TYPES: [backstage::SaveType; 29] = [
 enum SaveKind {
     /// The workbook package (`.xlsx`, `.xlsm`, `.xltx`, `.xltm`).
     Package,
-    /// The active sheet as delimited text.
+    /// The active sheet as delimited text, `eol` after each record.
     Text {
         delim: char,
         encoding: gridcore::textio::Encoding,
+        eol: &'static str,
     },
     /// Formatted Text (Space delimited).
     Prn,
@@ -395,6 +396,9 @@ enum SaveKind {
     WebPage,
     /// XML Data: needs the workbook's XML maps.
     XmlData,
+    /// PDF: the active sheet printed, as Excel publishes it; the workbook
+    /// stays bound to its own file and type.
+    Pdf,
     /// Listed as Excel lists it, but not written.
     Unsupported,
 }
@@ -406,26 +410,38 @@ fn save_kind(t: &backstage::SaveType) -> SaveKind {
         | "Excel Macro-Enabled Workbook"
         | "Excel Template"
         | "Excel Macro-Enabled Template" => SaveKind::Package,
-        "CSV UTF-8 (Comma delimited)" => SaveKind::Text {
-            delim: ',',
-            encoding: Encoding::Utf8Bom,
-        },
-        "CSV (Comma delimited)" => SaveKind::Text {
-            delim: ',',
-            encoding: Encoding::Windows1252,
-        },
-        "Text (Tab delimited)" => SaveKind::Text {
+        "CSV UTF-8 (Comma delimited)" => text(',', Encoding::Utf8Bom),
+        "CSV (Comma delimited)" => text(',', Encoding::Windows1252),
+        "Text (Tab delimited)" => text('\t', Encoding::Windows1252),
+        "Unicode Text" => text('\t', Encoding::Utf16LeBom),
+        // Excel's Macintosh types are Mac Roman with CR record ends, its
+        // MS-DOS types code page 437 with CR LF (#761).
+        "Text (Macintosh)" => SaveKind::Text {
             delim: '\t',
-            encoding: Encoding::Windows1252,
+            encoding: Encoding::CodePage(10000),
+            eol: "\r",
         },
-        "Unicode Text" => SaveKind::Text {
-            delim: '\t',
-            encoding: Encoding::Utf16LeBom,
+        "CSV (Macintosh)" => SaveKind::Text {
+            delim: ',',
+            encoding: Encoding::CodePage(10000),
+            eol: "\r",
         },
+        "Text (MS-DOS)" => text('\t', Encoding::CodePage(437)),
+        "CSV (MS-DOS)" => text(',', Encoding::CodePage(437)),
         "Formatted Text (Space delimited)" => SaveKind::Prn,
         "Web Page" => SaveKind::WebPage,
         "XML Data" => SaveKind::XmlData,
+        "PDF" => SaveKind::Pdf,
         _ => SaveKind::Unsupported,
+    }
+}
+
+/// A delimited text type with CR LF record ends.
+fn text(delim: char, encoding: gridcore::textio::Encoding) -> SaveKind {
+    SaveKind::Text {
+        delim,
+        encoding,
+        eol: "\r\n",
     }
 }
 
@@ -438,11 +454,16 @@ fn type_for_path(path: &str) -> Option<usize> {
 }
 
 /// `path`'s save type when a save can't write a workbook under it: an
-/// `.xls`, `.xlsb`, `.ods` (no writer), an `.xml` (needs XML maps), and so
-/// on. `None` for a type it writes, and for no or an unknown extension.
+/// `.xls`, `.xlsb`, `.ods` (no writer), an `.xml` (needs XML maps), a
+/// `.pdf` (a publish, never the workbook's own file), and so on. `None`
+/// for a type it writes, and for no or an unknown extension.
 fn unwritable_type(path: &str) -> Option<&'static backstage::SaveType> {
     let t = &SAVE_TYPES[type_for_path(path)?];
-    matches!(save_kind(t), SaveKind::Unsupported | SaveKind::XmlData).then_some(t)
+    matches!(
+        save_kind(t),
+        SaveKind::Unsupported | SaveKind::XmlData | SaveKind::Pdf
+    )
+    .then_some(t)
 }
 
 /// The path a new workbook opened on the missing `path` is bound to:
@@ -582,21 +603,22 @@ fn main() -> ExitCode {
         }
     }
 
-    let (pkg, path, import_source, format) = match parsed.inputs.first() {
+    let (pkg, path, import_source, format, text) = match parsed.inputs.first() {
         // A .txt/.prn in the editor opens the Text Import Wizard over a new
         // workbook (`run_tui` gets it as `wizard`).
         Some(input)
             if is_text_import(input) && parsed.recalc_out.is_none() && parsed.csv_out.is_none() =>
         {
-            (new_xlsx(), "untitled.xlsx".to_string(), None, None)
+            (new_xlsx(), "untitled.xlsx".to_string(), None, None, None)
         }
         // CSV/TSV, and a .txt/.prn in a headless run (the wizard's
-        // defaults), import as a one-sheet workbook. Ctrl-S then writes
-        // .xlsx: the path is rebound to a free name so a spreadsheet never
-        // lands in a text file or on an existing workbook.
+        // defaults), import as a one-sheet workbook. A .csv or .txt stays
+        // bound to itself as text (#761); a .tsv or .prn is rebound to a free
+        // .xlsx so a spreadsheet never lands in a text file or on an
+        // existing workbook.
         Some(input) if is_delimited(input) || is_text_import(input) => {
             match load_workbook(input, &TextOpen::from_prefs()) {
-                Ok(loaded) => loaded,
+                Ok(l) => (l.pkg, l.path, l.import_source, l.format, l.text),
                 Err(e) => {
                     eprintln!("error: cannot read {input}: {e}");
                     return ExitCode::FAILURE;
@@ -612,6 +634,7 @@ fn main() -> ExitCode {
                     import_binding(input),
                     Some(input.clone()),
                     Some(format),
+                    None,
                 ),
                 // A template opens in the editor as a new workbook from it. A
                 // headless run keeps the template as its source, so the
@@ -623,6 +646,7 @@ fn main() -> ExitCode {
                         .unwrap_or_else(|| input.clone()),
                     None,
                     None,
+                    None,
                 ),
                 Err(e) => {
                     eprintln!("error: {input}: {e}");
@@ -632,7 +656,7 @@ fn main() -> ExitCode {
             // A nonexistent path opens a new workbook bound to it, or to a
             // free .xlsx when a save can't write its type (`new.xls`).
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                (new_xlsx(), missing_binding(input), None, None)
+                (new_xlsx(), missing_binding(input), None, None, None)
             }
             Err(e) => {
                 eprintln!("error: cannot read {input}: {e}");
@@ -644,7 +668,7 @@ fn main() -> ExitCode {
                 eprintln!("error: headless modes (--recalc/--csv/--pdf) require an input file");
                 return ExitCode::from(2);
             }
-            (new_xlsx(), "untitled.xlsx".to_string(), None, None)
+            (new_xlsx(), "untitled.xlsx".to_string(), None, None, None)
         }
     };
 
@@ -697,9 +721,11 @@ fn main() -> ExitCode {
         }
         let bytes = save_xlsx_for_path(&pkg, &out);
         // Recalculation is an in-place save for .xlsx, but a conversion for
-        // CSV/TSV input. Never replace the imported text file with an XLSX.
+        // CSV/TSV input. Never replace the imported text file with an XLSX,
+        // nor the .csv/.txt a text open is bound to.
+        let text_source = text.as_ref().map(|_| path.as_str());
         if let Err(e) = export_atomic(
-            import_source.as_deref().map(Path::new),
+            import_source.as_deref().or(text_source).map(Path::new),
             Path::new(&out),
             &bytes,
         ) {
@@ -751,6 +777,7 @@ fn main() -> ExitCode {
         TuiFlags {
             vim: parsed.vim,
             read_only,
+            text,
         },
     ) {
         Ok(()) => ExitCode::SUCCESS,
@@ -811,58 +838,136 @@ fn auto_convert_from_prefs(text: &str) -> AutoConvert {
     auto
 }
 
-/// Load a workbook from disk, returning the package, its save path, the
-/// imported file's path when it was an import, and the format of an
-/// imported `.xls`/`.xlsb`/`.ods` (`None` for everything else). An `.xlsx`
-/// (or other package) loads as it is; a `.csv`/`.tsv` imports as one sheet
-/// as Excel opens it (`sep=`, typed-entry conversion); a `.txt`/`.prn`
-/// imports with the Text Import Wizard's defaults (the editor shows the
-/// wizard instead, see `App::open_workbook`). An `.xls`, `.xlsb` or `.ods`
-/// (read by its bytes, whatever its name) imports through
-/// `gridcore::legacy`. Every import, text or workbook, is bound to
-/// [`import_binding`]: `<name>.xlsx`, or the next free numbered name. A
-/// template (`.xltx`, `.xltm`) opens as a new workbook from it, as Excel
-/// starts one: bound to [`template_binding`], so a save never writes the
-/// template itself.
-fn load_workbook(
-    path: &str,
-    open: &TextOpen,
-) -> Result<(SheetPackage, String, Option<String>, Option<SourceFormat>), String> {
-    if is_text_import(path) {
-        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-        let text = gridcore::textio::decode(&bytes, gridcore::textio::Origin::Auto);
-        return Ok((
-            text_to_pkg(&text, &file_stem(path), &TextParse::default(), open),
-            import_binding(path),
-            Some(path.to_string()),
-            None,
-        ));
-    }
-    if is_delimited(path) {
-        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-        let text = gridcore::textio::decode(&bytes, gridcore::textio::Origin::Auto);
-        let tab = path.to_ascii_lowercase().ends_with(".tsv");
-        let stem = file_stem(path);
-        Ok((
-            csv_to_pkg(&text, &stem, tab, open),
-            import_binding(path),
-            Some(path.to_string()),
-            None,
-        ))
+/// A text file a workbook is bound to as text (#761): the Save As type Ctrl+S
+/// writes it back as, and how it was read, which a reload reads it with
+/// again until a save writes it in the type's own way.
+#[derive(Clone, Debug, PartialEq)]
+struct TextBound {
+    /// An index into [`SAVE_TYPES`].
+    ty: usize,
+    parse: TextParse,
+    origin: Origin,
+}
+
+/// A workbook loaded from disk.
+struct Loaded {
+    pkg: SheetPackage,
+    /// Where a save writes it.
+    path: String,
+    /// The imported file, when it was an import bound to a new `.xlsx`.
+    import_source: Option<String>,
+    /// The format an imported `.xls`/`.xlsb`/`.ods` was read as.
+    format: Option<SourceFormat>,
+    /// An opened `.csv` or `.txt`, bound to itself as text.
+    text: Option<TextBound>,
+}
+
+/// The text type an opened `.csv` (`csv`) or `.txt` is saved back as,
+/// chosen so a save loses nothing the open read (#761): the bytes were read
+/// as `origin`, and `plain` when they are all ASCII (no byte-order mark).
+/// Windows-1252, MS-DOS (437) and Macintosh (10000) text keep their code
+/// page; anything else that a 1252 type can't hold becomes CSV UTF-8 or
+/// Unicode Text.
+fn bind_text_type(csv: bool, origin: Origin, plain: bool) -> usize {
+    let label = match (csv, origin) {
+        (true, Origin::CodePage(437)) => "CSV (MS-DOS)",
+        (true, Origin::CodePage(10000)) => "CSV (Macintosh)",
+        (false, Origin::CodePage(437)) => "Text (MS-DOS)",
+        (false, Origin::CodePage(10000)) => "Text (Macintosh)",
+        (true, Origin::Windows1252) => "CSV (Comma delimited)",
+        (false, Origin::Windows1252) => "Text (Tab delimited)",
+        (true, _) if plain => "CSV (Comma delimited)",
+        (false, _) if plain => "Text (Tab delimited)",
+        (true, _) => "CSV UTF-8 (Comma delimited)",
+        (false, _) => "Unicode Text",
+    };
+    save_type_at(label)
+}
+
+/// The index of the Save As type named `label`.
+fn save_type_at(label: &str) -> usize {
+    SAVE_TYPES
+        .iter()
+        .position(|t| t.label == label)
+        .expect("a listed Save As type")
+}
+
+/// Whether `path` is a `.csv` or `.txt`: opened bound to itself as text
+/// ([`bind_text_type`]), where a `.tsv` or `.prn` (no Save As type writes
+/// those) imports bound to a new `.xlsx`.
+fn binds_as_text(path: &str) -> Option<bool> {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".csv") {
+        Some(true)
+    } else if lower.ends_with(".txt") {
+        Some(false)
     } else {
-        let data = std::fs::read(path).map_err(|e| e.to_string())?;
-        let (pkg, format) = open_any(&data).map_err(|e| e.to_string())?;
-        if format.is_import() {
-            return Ok((
-                pkg,
-                import_binding(path),
-                Some(path.to_string()),
-                Some(format),
-            ));
-        }
-        let save = template_binding(path).unwrap_or_else(|| path.to_string());
-        Ok((pkg, save, None, None))
+        None
     }
+}
+
+/// Load a workbook from disk. An `.xlsx` (or other package) loads as it is.
+/// A `.csv`/`.tsv` imports as one sheet as Excel opens it (`sep=`,
+/// typed-entry conversion); a `.txt`/`.prn` imports with the Text Import
+/// Wizard's defaults (the editor shows the wizard instead, see
+/// `App::open_workbook`). A `.csv` or `.txt` stays bound to itself as text,
+/// as Excel keeps it (#761); a `.tsv` or `.prn` is an import bound to
+/// [`import_binding`]: `<name>.xlsx`, or the next free numbered name. An
+/// `.xls`, `.xlsb` or `.ods` (read by its bytes, whatever its name) imports
+/// through `gridcore::legacy` and is bound the same way. A template
+/// (`.xltx`, `.xltm`) opens as a new workbook from it, as Excel starts one:
+/// bound to [`template_binding`], so a save never writes the template
+/// itself.
+fn load_workbook(path: &str, open: &TextOpen) -> Result<Loaded, String> {
+    if is_text_import(path) || is_delimited(path) {
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        let (text, origin) = gridcore::textio::decode_with(&bytes, Origin::Auto);
+        let (parse, body) = if is_text_import(path) {
+            (TextParse::default(), text.as_str())
+        } else {
+            gridcore::textio::csv_parse(&text, path.to_ascii_lowercase().ends_with(".tsv"))
+        };
+        let pkg = text_to_pkg(body, &file_stem(path), &parse, open);
+        return Ok(match binds_as_text(path) {
+            Some(csv) => Loaded {
+                pkg,
+                path: path.to_string(),
+                import_source: None,
+                format: None,
+                text: Some(TextBound {
+                    ty: bind_text_type(csv, origin, bytes.is_ascii()),
+                    parse,
+                    origin,
+                }),
+            },
+            None => Loaded {
+                pkg,
+                path: import_binding(path),
+                import_source: Some(path.to_string()),
+                format: None,
+                text: None,
+            },
+        });
+    }
+    let data = std::fs::read(path).map_err(|e| e.to_string())?;
+    let (pkg, format) = open_any(&data).map_err(|e| e.to_string())?;
+    if format.is_import() {
+        return Ok(Loaded {
+            pkg,
+            path: import_binding(path),
+            import_source: Some(path.to_string()),
+            format: Some(format),
+            text: None,
+        });
+    }
+    let save = template_binding(path).unwrap_or_else(|| path.to_string());
+    Ok(Loaded {
+        pkg,
+        path: save,
+        import_source: None,
+        format: None,
+        text: None,
+    })
 }
 
 /// The `.xlsx` an imported workbook is bound to: `book.xls` gives
@@ -943,8 +1048,9 @@ fn parse_table_col(s: &str) -> Option<(String, String)> {
 /// Import CSV text as a fresh one-sheet workbook, as Excel opens a `.csv`: a
 /// `sep=` first line names the delimiter (else a `.tsv` is tab-delimited and
 /// a `.csv` sniffed), and every field converts as if typed into its cell.
+#[cfg(test)]
 fn csv_to_pkg(text: &str, sheet_name: &str, tab: bool, open: &TextOpen) -> SheetPackage {
-    let (opts, body) = csv_parse(text, tab);
+    let (opts, body) = gridcore::textio::csv_parse(text, tab);
     text_to_pkg(body, sheet_name, &opts, open)
 }
 
@@ -972,21 +1078,6 @@ fn text_to_pkg(text: &str, sheet_name: &str, opts: &TextParse, open: &TextOpen) 
     pkg
 }
 
-/// How a CSV reads: a `sep=` first line names the delimiter (and is
-/// dropped), else a `.tsv` is tab-delimited and a `.csv` sniffed. Returns
-/// the options and the text after any directive.
-fn csv_parse(text: &str, tab: bool) -> (TextParse, &str) {
-    let (directive, body) = gridcore::textio::csv_directive(text);
-    let delim = directive.unwrap_or_else(|| {
-        if tab {
-            '\t'
-        } else {
-            gridcore::frame::sniff_delimiter(body)
-        }
-    });
-    (TextParse::csv(delim), body)
-}
-
 /// Text converted into `sheet` (of a workbook in the 1904 date system when
 /// `date1904`) from A1 under `opts`. Returns (rows, cols).
 fn import_text(
@@ -997,13 +1088,12 @@ fn import_text(
     open: &TextOpen,
     date1904: bool,
 ) -> (u32, u32) {
-    let records = gridcore::textio::split_text(text, opts);
     let ctx = gridcore::entry::EntryCtx {
         date1904,
         today: open.today,
         fixed_decimal: None,
     };
-    gridcore::textio::import_records(sheet, styles, 0, 0, &records, opts, &open.auto, &ctx)
+    gridcore::textio::import_text(sheet, styles, text, opts, &open.auto, &ctx)
 }
 
 struct Parsed {
@@ -1156,8 +1246,8 @@ fn iso_now() -> String {
 /// Render the first sheet of a workbook (or a CSV) as preview text lines,
 /// bounded so a huge file can't stall the browser.
 fn preview_lines(path: &str, width: usize) -> Vec<String> {
-    let (pkg, ..) = match load_workbook(path, &TextOpen::from_prefs()) {
-        Ok(x) => x,
+    let pkg = match load_workbook(path, &TextOpen::from_prefs()) {
+        Ok(l) => l.pkg,
         Err(e) => return vec![format!("(cannot preview: {e})")],
     };
     let sheet = &pkg.workbook.sheets[0];
@@ -2127,8 +2217,12 @@ struct App {
     /// Data ▸ Form…, while open: modal over everything.
     data_form: Option<dataform::DataForm>,
     /// The text Save As type (index into [`SAVE_TYPES`]) the workbook was
-    /// last saved as; Ctrl+S keeps writing it while the path has its extension.
+    /// last saved as, or an opened `.csv`/`.txt` is bound to (#761); Ctrl+S
+    /// keeps writing it while the path has its extension.
     text_type: Option<usize>,
+    /// How the bound text file reads back: the options and origin its open
+    /// read it with, until a save writes it as `text_type` (#761).
+    text_read: Option<(TextParse, Origin)>,
     // View preferences (persisted to a config file).
     formula_view: bool,
     light_theme: bool,
@@ -2297,6 +2391,7 @@ impl App {
             outline_dialog: None,
             data_form: None,
             text_type: None,
+            text_read: None,
             formula_view: false,
             light_theme: false,
             auto_hide_ribbon: false,
@@ -4643,6 +4738,7 @@ impl App {
             Ok(()) => {
                 self.modified = false;
                 self.text_type = None;
+                self.text_read = None;
                 self.template = None;
                 self.import_unsaved = false;
                 self.status = Some(match taken {
@@ -4703,8 +4799,12 @@ impl App {
         let sheet = &wb.sheets[self.sheet.min(wb.sheets.len() - 1)];
         let mut extra: Vec<(std::path::PathBuf, String)> = Vec::new();
         let bytes = match save_kind(&ty) {
-            SaveKind::Text { delim, encoding } => gridcore::textio::encode(
-                &gridcore::textio::sheet_text(sheet, &wb.styles, wb.date1904, delim),
+            SaveKind::Text {
+                delim,
+                encoding,
+                eol,
+            } => gridcore::textio::encode(
+                &gridcore::textio::sheet_text(sheet, &wb.styles, wb.date1904, delim, eol),
                 encoding,
             ),
             SaveKind::Prn => gridcore::textio::encode(
@@ -4745,6 +4845,13 @@ impl App {
         match written {
             Ok(()) => {
                 self.modified = true;
+                // The file is now as this type writes it, and reads back so.
+                self.text_read = match save_kind(&ty) {
+                    SaveKind::Text {
+                        delim, encoding, ..
+                    } => Some((TextParse::csv(delim), encoding.origin())),
+                    _ => None,
+                };
                 self.status = Some(if many {
                     format!(
                         "Saved only the active sheet \"{sheet_name}\" to {} as {}: the selected \
@@ -4782,6 +4889,7 @@ impl App {
                     self.text_type = previous;
                 }
             }
+            SaveKind::Pdf => self.save_pdf(path),
             SaveKind::XmlData if self.pkg.part("xl/xmlMaps.xml").is_none() => {
                 self.status = Some(
                     "Cannot save XML data because the workbook does not contain any XML \
@@ -6398,12 +6506,12 @@ impl App {
             return;
         }
         match load_workbook(path, &self.text_open()) {
-            Ok((pkg, p, import_source, format)) => {
+            Ok(l) => {
                 // A person's Open that loads ends read-only (#882), the
                 // read-only file's own included.
                 self.read_only = None;
-                self.install_workbook(pkg, p, import_source);
-                self.note_import(format);
+                self.install_workbook(l.pkg, l.path, l.import_source, l.text);
+                self.note_import(l.format);
                 self.note_template(path);
             }
             Err(e) => self.status = Some(format!("Open failed: {e}")),
@@ -6433,8 +6541,15 @@ impl App {
         }
     }
 
-    /// Make `pkg` (loaded from, and to be saved to, `p`) the open workbook.
-    fn install_workbook(&mut self, pkg: SheetPackage, p: String, import_source: Option<String>) {
+    /// Make `pkg` (loaded from, and to be saved to, `p`) the open workbook,
+    /// bound to `p` as text when `text` says how (#761).
+    fn install_workbook(
+        &mut self,
+        pkg: SheetPackage,
+        p: String,
+        import_source: Option<String>,
+        text: Option<TextBound>,
+    ) {
         let (rels, meas) = pkg
             .part(MODEL_PART)
             .map(|b| parse_model_part(&String::from_utf8_lossy(b)))
@@ -6448,6 +6563,7 @@ impl App {
         self.forget_clip();
         self.path = p;
         self.import_source = import_source;
+        self.bind_text(text);
         self.template = None;
         self.import_unsaved = false;
         self.model_rels = rels;
@@ -6464,24 +6580,30 @@ impl App {
         });
     }
 
+    /// Bind the workbook to its file as text (`None`: as a workbook).
+    fn bind_text(&mut self, text: Option<TextBound>) {
+        self.text_type = text.as_ref().map(|t| t.ty);
+        self.text_read = text.map(|t| (t.parse, t.origin));
+    }
+
     /// Open `path` without a dialog, as the control surface does: a
     /// `.txt`/`.prn` is imported with the Text Import Wizard's defaults
     /// (`sheet.import-text` takes other options) instead of showing it.
     /// A load that fails is the error (the verb reports it).
     fn open_without_wizard(&mut self, path: &str) -> Result<(), String> {
-        let (pkg, save, source, format) = load_workbook(path, &self.text_open())?;
-        self.install_workbook(pkg, save, source);
-        self.note_import(format);
+        let l = load_workbook(path, &self.text_open())?;
+        self.install_workbook(l.pkg, l.path, l.import_source, l.text);
+        self.note_import(l.format);
         self.note_template(path);
         Ok(())
     }
 
     /// Re-read the file the workbook is bound to, dropping unsaved edits. A
-    /// workbook saved as CSV, Text (Tab delimited) or Unicode Text stays bound
-    /// to that file and type (it is re-imported from it), so a later save
-    /// writes the text file again rather than a `<name>.xlsx` beside it.
-    /// Formatted Text and Web Page cannot be read back, so reload refuses
-    /// them and changes nothing.
+    /// workbook saved as CSV, Text (Tab delimited) or Unicode Text, or an
+    /// opened `.csv`/`.txt`, stays bound to that file and type (it is
+    /// re-imported from it), so a later save writes the text file again
+    /// rather than a `<name>.xlsx` beside it. Formatted Text and Web Page
+    /// cannot be read back, so reload refuses them and changes nothing.
     fn reload(&mut self) -> Result<(), String> {
         let path = self.path.clone();
         // A workbook started from a template has no file of its own until
@@ -6494,32 +6616,43 @@ impl App {
         let Some(t) = self.bound_text_type() else {
             return self.open_without_wizard(&path);
         };
-        let SaveKind::Text { delim, encoding } = save_kind(&SAVE_TYPES[t]) else {
+        let SaveKind::Text {
+            delim, encoding, ..
+        } = save_kind(&SAVE_TYPES[t])
+        else {
             return Err(format!(
                 "{} cannot be read back; reload is not available for this file",
                 SAVE_TYPES[t].label
             ));
         };
-        // Read back with the delimiter it was written with, never a sniffed
-        // one: a first row with as many `;` as `,` must not re-split.
-        // And in the encoding it was written in: a 1252 `é` must not be
-        // read as UTF-8.
-        let origin = match encoding {
-            gridcore::textio::Encoding::Windows1252 => gridcore::textio::Origin::Windows1252,
-            gridcore::textio::Encoding::Utf8Bom => gridcore::textio::Origin::Utf8,
-            gridcore::textio::Encoding::Utf16LeBom => gridcore::textio::Origin::Utf16Le,
-        };
+        // Read back as the file was last read or written, never sniffed: a
+        // file this session wrote with the delimiter and in the encoding it
+        // wrote (a first row with as many `;` as `,` must not re-split, a
+        // 1252 `é` must not be read as UTF-8), and an opened one not yet
+        // saved as its open read it (its `;`, its wizard choices; #761).
+        let (parse, origin) = self
+            .text_read
+            .clone()
+            .unwrap_or_else(|| (TextParse::csv(delim), encoding.origin()));
         let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
         let text = gridcore::textio::decode(&bytes, origin);
-        let pkg = text_to_pkg(
-            &text,
-            &file_stem(&path),
-            &TextParse::csv(delim),
-            &self.text_open(),
-        );
+        // A `sep=` line is the CSV open's own (its `parse` already says ';').
+        let body = match binds_as_text(&path) {
+            Some(true) => gridcore::textio::csv_directive(&text).1,
+            _ => text.as_str(),
+        };
+        let pkg = text_to_pkg(body, &file_stem(&path), &parse, &self.text_open());
         // The text file is the save target itself, not a source to guard.
-        self.install_workbook(pkg, path, None);
-        self.text_type = Some(t);
+        self.install_workbook(
+            pkg,
+            path,
+            None,
+            Some(TextBound {
+                ty: t,
+                parse,
+                origin,
+            }),
+        );
         Ok(())
     }
 
@@ -6552,7 +6685,7 @@ impl App {
                 .and_then(|data| open_any(&data).map_err(|e| e.to_string()))
             {
                 Ok((pkg, _)) => {
-                    self.install_workbook(pkg, "untitled.xlsx".to_string(), None);
+                    self.install_workbook(pkg, "untitled.xlsx".to_string(), None, None);
                     self.read_only = None;
                     self.status = Some(format!("New workbook from {name}"));
                     return;
@@ -6702,6 +6835,34 @@ impl App {
             }
         });
         self.backstage = None;
+    }
+
+    /// Save As PDF (#761): the active sheet printed to `out`, as Excel
+    /// publishes one. The workbook stays bound to its own file and type, and
+    /// keeps its modified state; a sheet with nothing to print says so and
+    /// writes nothing. Never over the workbook, its import source or the
+    /// read-only file.
+    fn save_pdf(&mut self, out: String) {
+        if let Err(msg) = self.refuse_read_only(&out) {
+            self.status = Some(msg);
+            return;
+        }
+        let job = gridcore::print::paginate::Job::new(
+            gridcore::print::paginate::What::ActiveSheets(vec![self.sheet]),
+        );
+        self.status = Some(match print_pdf(&self.pkg.workbook, &job, &self.path) {
+            Err(e) => e.to_string(),
+            Ok((pdf, pages)) => {
+                let source = export_source(&self.path, self.import_source.as_deref(), &out);
+                match self.write_export(Some(Path::new(source)), Path::new(&out), &pdf) {
+                    Ok(()) => format!(
+                        "Saved {out} as PDF ({pages} page{})",
+                        if pages == 1 { "" } else { "s" }
+                    ),
+                    Err(e) => format!("save failed: {e}"),
+                }
+            }
+        });
     }
 
     /// Export the current sheet to a `.csv` (CSV UTF-8) next to the workbook.
@@ -7247,8 +7408,24 @@ impl App {
                 if !std::mem::take(&mut self.startup_import) {
                     self.read_only = None;
                 }
-                self.install_workbook(pkg, import_binding(path), Some(path.clone()));
-                self.import_unsaved = true;
+                // A `.txt` stays bound to itself as text, saved back in a
+                // type that keeps what the wizard read (#761); a `.prn` is
+                // an import bound to a new `.xlsx`.
+                match binds_as_text(path) {
+                    Some(csv) => {
+                        let origin = d.resolved_origin();
+                        let text = TextBound {
+                            ty: bind_text_type(csv, origin, d.plain_ascii()),
+                            parse: opts,
+                            origin,
+                        };
+                        self.install_workbook(pkg, path.clone(), None, Some(text));
+                    }
+                    None => {
+                        self.install_workbook(pkg, import_binding(path), Some(path.clone()), None);
+                        self.import_unsaved = true;
+                    }
+                }
             }
             textdlg::Purpose::Columns { src, .. } => {
                 let Some(dest) = parse_a1(&d.dest) else {
@@ -11681,6 +11858,8 @@ struct TuiFlags {
     vim: bool,
     /// `--read-only`: the input file, opened read-only (#882).
     read_only: Option<String>,
+    /// The `.csv`/`.txt` input, bound to itself as text (#761).
+    text: Option<TextBound>,
 }
 
 fn run_tui(
@@ -11709,6 +11888,7 @@ fn run_tui(
     app.xlstart = xlstart_dir();
     let format = import.as_ref().and_then(|(_, f)| *f);
     app.import_source = import.map(|(s, _)| s);
+    app.bind_text(flags.text.clone());
     app.note_import(format);
     if let Some(template) = template {
         app.note_template(&template);
@@ -11993,6 +12173,361 @@ mod tests {
         app.os_clip = None;
         app.sheet = data;
         app
+    }
+
+    /// The label of the type the workbook is bound to as text.
+    fn bound_label(app: &App) -> Option<&'static str> {
+        app.bound_text_type().map(|t| SAVE_TYPES[t].label)
+    }
+
+    /// #761: the type an opened `.csv`/`.txt` saves back as keeps what the
+    /// open read.
+    #[test]
+    fn bind_text_type_keeps_what_the_open_read() {
+        let label = |csv, origin, plain| SAVE_TYPES[bind_text_type(csv, origin, plain)].label;
+        for (csv, origin, plain, want) in [
+            (true, Origin::Utf8, true, "CSV (Comma delimited)"),
+            (true, Origin::Utf8, false, "CSV UTF-8 (Comma delimited)"),
+            (true, Origin::Windows1252, false, "CSV (Comma delimited)"),
+            (true, Origin::CodePage(437), false, "CSV (MS-DOS)"),
+            (true, Origin::CodePage(10000), false, "CSV (Macintosh)"),
+            (
+                true,
+                Origin::CodePage(1251),
+                false,
+                "CSV UTF-8 (Comma delimited)",
+            ),
+            (true, Origin::Utf16Le, false, "CSV UTF-8 (Comma delimited)"),
+            (true, Origin::Utf16Be, false, "CSV UTF-8 (Comma delimited)"),
+            (true, Origin::CodePage(1251), true, "CSV (Comma delimited)"),
+            (false, Origin::Utf8, true, "Text (Tab delimited)"),
+            (false, Origin::Utf8, false, "Unicode Text"),
+            (false, Origin::Windows1252, false, "Text (Tab delimited)"),
+            (false, Origin::CodePage(437), false, "Text (MS-DOS)"),
+            (false, Origin::CodePage(10000), false, "Text (Macintosh)"),
+            (false, Origin::CodePage(866), false, "Unicode Text"),
+            (false, Origin::Utf16Le, false, "Unicode Text"),
+        ] {
+            assert_eq!(label(csv, origin, plain), want, "{csv} {origin:?} {plain}");
+        }
+    }
+
+    /// #761: an opened CSV stays bound to itself: Ctrl+S writes the CSV
+    /// again, with Excel's possible-data-loss note, and never an `.xlsx`
+    /// beside it; Save As `.xlsx` then binds the workbook.
+    #[test]
+    fn opened_csv_saves_back_to_itself() {
+        let dir = tmp("csv-bind");
+        let csv = dir.join("data.csv");
+        std::fs::write(&csv, "id,amt\n1,2\n").unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.os_clip = None;
+        app.open_workbook(csv.to_str().unwrap());
+        assert_eq!(Path::new(&app.path), csv);
+        assert!(app.import_source.is_none());
+        assert_eq!(bound_label(&app), Some("CSV (Comma delimited)"));
+        app.pkg.workbook.sheets[0].set_cell(1, 1, gridcore::sheet::Cell::number(5.0));
+        app.save();
+        assert_eq!(std::fs::read(&csv).unwrap(), b"id,amt\r\n1,5\r\n");
+        let status = app.status.clone().unwrap();
+        assert!(status.contains("possible data loss"), "{status}");
+        assert!(!dir.join("data.xlsx").exists());
+        assert!(!dir.join("data1.xlsx").exists());
+        // Save As a workbook binds it, as before.
+        app.request_save_as(dir.join("data.xlsx").to_string_lossy().into_owned());
+        assert_eq!(Path::new(&app.path), dir.join("data.xlsx"));
+        assert_eq!(app.text_type, None);
+        assert_eq!(app.text_read, None);
+        assert!(
+            std::fs::read(dir.join("data.xlsx"))
+                .unwrap()
+                .starts_with(b"PK")
+        );
+        assert_eq!(std::fs::read(&csv).unwrap(), b"id,amt\r\n1,5\r\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #761: a CSV read as UTF-8 holding more than ASCII is saved back as
+    /// CSV UTF-8; one read as Windows-1252 keeps its code page.
+    #[test]
+    fn utf8_csv_binds_csv_utf8() {
+        let dir = tmp("csv-bind-utf8");
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.os_clip = None;
+        let utf8 = dir.join("utf8.csv");
+        std::fs::write(&utf8, "city\nZ\u{fc}rich \u{4E2D}\n").unwrap();
+        app.open_workbook(utf8.to_str().unwrap());
+        assert_eq!(bound_label(&app), Some("CSV UTF-8 (Comma delimited)"));
+        app.save();
+        let mut want = b"\xEF\xBB\xBF".to_vec();
+        want.extend_from_slice("city\r\nZ\u{fc}rich \u{4E2D}\r\n".as_bytes());
+        assert_eq!(std::fs::read(&utf8).unwrap(), want);
+        let bom = dir.join("bom.csv");
+        std::fs::write(&bom, b"\xEF\xBB\xBFcity\n").unwrap();
+        app.open_workbook(bom.to_str().unwrap());
+        assert_eq!(bound_label(&app), Some("CSV UTF-8 (Comma delimited)"));
+        let ansi = dir.join("ansi.csv");
+        std::fs::write(&ansi, b"city\nZ\xFCrich\n").unwrap();
+        app.open_workbook(ansi.to_str().unwrap());
+        assert_eq!(bound_label(&app), Some("CSV (Comma delimited)"));
+        app.save();
+        assert_eq!(std::fs::read(&ansi).unwrap(), b"city\r\nZ\xFCrich\r\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #761: a `;` CSV (sniffed, or named by `sep=`) saves back
+    /// comma-delimited and without its `sep=` line, as Excel en-US writes.
+    #[test]
+    fn semicolon_csv_saves_back_comma_delimited() {
+        let dir = tmp("csv-bind-semi");
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.os_clip = None;
+        for body in ["a;b;c\n1;2;3\n", "sep=;\na;b;c\n1;2;3\n"] {
+            let csv = dir.join("semi.csv");
+            std::fs::write(&csv, body).unwrap();
+            app.open_workbook(csv.to_str().unwrap());
+            app.save();
+            assert_eq!(
+                std::fs::read(&csv).unwrap(),
+                b"a,b,c\r\n1,2,3\r\n",
+                "{body}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #761: reloading an opened CSV not saved yet reads it as its open did:
+    /// a `;` one keeps its columns.
+    #[test]
+    fn reload_keeps_semicolon_csv_columns() {
+        let dir = tmp("csv-reload-semi");
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.os_clip = None;
+        for body in ["a;b;c\n1;2;3\n", "sep=;\na;b;c\n1;2;3\n"] {
+            let csv = dir.join("semi.csv");
+            std::fs::write(&csv, body).unwrap();
+            app.open_workbook(csv.to_str().unwrap());
+            app.pkg.workbook.sheets[0].set_cell(0, 0, gridcore::sheet::Cell::text("edited"));
+            app.reload().unwrap();
+            let sh = app.sheet();
+            for (c, want) in ["a", "b", "c"].into_iter().enumerate() {
+                assert_eq!(
+                    sh.cell(0, c as u32).unwrap().value,
+                    CellValue::Text(want.into()),
+                    "{body}"
+                );
+            }
+            assert_eq!(sh.cell(1, 2).unwrap().value, CellValue::Number(3.0));
+            assert_eq!(bound_label(&app), Some("CSV (Comma delimited)"));
+            // Once saved, it reads back as written.
+            app.save();
+            app.reload().unwrap();
+            assert_eq!(
+                app.sheet().cell(0, 2).unwrap().value,
+                CellValue::Text("c".into())
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #761: a `.txt` the wizard read with a comma and from row 2 is
+    /// reloaded with those choices, and binds as text.
+    #[test]
+    fn reload_keeps_wizard_txt_choices() {
+        let dir = tmp("txt-reload-wizard");
+        let txt = dir.join("notes.txt");
+        std::fs::write(&txt, "title\nx,y\n1,2\n").unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.os_clip = None;
+        app.open_workbook(txt.to_str().unwrap());
+        let d = app.text_dialog.as_mut().unwrap();
+        d.delims = gridcore::textio::Delimiters::only(',');
+        d.start_row = 2;
+        app.finish_text_dialog();
+        assert_eq!(Path::new(&app.path), txt);
+        assert_eq!(bound_label(&app), Some("Text (Tab delimited)"));
+        let check = |app: &App| {
+            let sh = app.sheet();
+            assert_eq!(sh.cell(0, 0).unwrap().value, CellValue::Text("x".into()));
+            assert_eq!(sh.cell(0, 1).unwrap().value, CellValue::Text("y".into()));
+            assert_eq!(sh.cell(1, 1).unwrap().value, CellValue::Number(2.0));
+        };
+        check(&app);
+        app.reload().unwrap();
+        check(&app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #761: a `.txt` the wizard read as UTF-16 or MS-DOS 437 binds to the
+    /// type that writes it back so.
+    #[test]
+    fn txt_binds_to_the_type_of_its_origin() {
+        let dir = tmp("txt-bind");
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.os_clip = None;
+        let wide = dir.join("wide.txt");
+        std::fs::write(&wide, b"\xFF\xFEa\x00\t\x00\xFC\x00").unwrap();
+        app.open_workbook(wide.to_str().unwrap());
+        app.finish_text_dialog();
+        assert_eq!(bound_label(&app), Some("Unicode Text"));
+        let dos = dir.join("dos.txt");
+        std::fs::write(&dos, b"Z\x81rich\n").unwrap();
+        app.open_workbook(dos.to_str().unwrap());
+        app.text_dialog
+            .as_mut()
+            .unwrap()
+            .set_origin(Origin::CodePage(437));
+        app.finish_text_dialog();
+        assert_eq!(
+            app.sheet().cell(0, 0).unwrap().value,
+            CellValue::Text("Z\u{fc}rich".into())
+        );
+        assert_eq!(bound_label(&app), Some("Text (MS-DOS)"));
+        app.save();
+        assert_eq!(std::fs::read(&dos).unwrap(), b"Z\x81rich\r\n");
+        app.reload().unwrap();
+        assert_eq!(
+            app.sheet().cell(0, 0).unwrap().value,
+            CellValue::Text("Z\u{fc}rich".into())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #761: an opened CSV of a multi-sheet workbook writes only the active
+    /// sheet, with the multi-sheet warning.
+    #[test]
+    fn opened_csv_with_more_sheets_saves_only_the_active_one() {
+        let dir = tmp("csv-bind-many");
+        let csv = dir.join("data.csv");
+        std::fs::write(&csv, "a\n1\n").unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.os_clip = None;
+        app.open_workbook(csv.to_str().unwrap());
+        let extra = app.pkg.add_sheet("More");
+        app.pkg.workbook.sheets[extra].set_cell(0, 0, gridcore::sheet::Cell::text("other"));
+        app.save();
+        assert_eq!(std::fs::read(&csv).unwrap(), b"a\r\n1\r\n");
+        assert!(app.status.as_deref().unwrap().contains("multiple sheets"));
+        assert!(app.modified, "closing still asks");
+        assert!(!dir.join("data.xlsx").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #761: Save As Text/CSV (Macintosh) writes Mac Roman with CR record
+    /// ends, (MS-DOS) code page 437 with CR LF; each reloads as written.
+    #[test]
+    fn save_as_mac_text_uses_cr_and_mac_roman() {
+        let dir = tmp("save-mac-dos");
+        let mut app = two_sheet_app(&dir);
+        for (label, file, want) in [
+            (
+                "Text (Macintosh)",
+                "mac.txt",
+                &b"Name\tNote\rZ\x9Frich\t\"line1\nline2\"\r"[..],
+            ),
+            (
+                "CSV (Macintosh)",
+                "mac.csv",
+                &b"Name,Note\rZ\x9Frich,\"line1\nline2\"\r"[..],
+            ),
+            (
+                "Text (MS-DOS)",
+                "dos.txt",
+                &b"Name\tNote\r\nZ\x81rich\t\"line1\nline2\"\r\n"[..],
+            ),
+            (
+                "CSV (MS-DOS)",
+                "dos.csv",
+                &b"Name,Note\r\nZ\x81rich,\"line1\nline2\"\r\n"[..],
+            ),
+        ] {
+            let mut app = two_sheet_app(&dir);
+            let out = dir.join(file);
+            app.save_as_type(out.to_string_lossy().into_owned(), save_type_at(label));
+            assert_eq!(std::fs::read(&out).unwrap(), want, "{label}");
+            assert_eq!(bound_label(&app), Some(label));
+            app.reload().unwrap();
+            let sh = app.sheet();
+            assert_eq!(
+                sh.cell(1, 0).unwrap().value,
+                CellValue::Text("Z\u{fc}rich".into()),
+                "{label}"
+            );
+            assert_eq!(
+                sh.cell(1, 1).unwrap().value,
+                CellValue::Text("line1\nline2".into()),
+                "{label}"
+            );
+            assert_eq!(bound_label(&app), Some(label));
+        }
+        app.request_save_as(dir.join("again.txt").to_string_lossy().into_owned());
+        assert_eq!(bound_label(&app), Some("Text (Tab delimited)"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #761: Save As PDF prints the active sheet and publishes it; the
+    /// workbook stays bound to its own file and type, as modified as it was.
+    #[test]
+    fn save_as_pdf_keeps_binding() {
+        let dir = tmp("save-pdf");
+        let mut app = two_sheet_app(&dir);
+        app.modified = true;
+        app.import_source = Some(dir.join("from.tsv").to_string_lossy().into_owned());
+        app.import_unsaved = true;
+        let before = (app.path.clone(), app.text_type, app.import_source.clone());
+        let out = dir.join("book.pdf");
+        app.request_save_as(out.to_string_lossy().into_owned());
+        let pdf = std::fs::read(&out).unwrap();
+        assert!(pdf.starts_with(b"%PDF-"));
+        assert!(String::from_utf8_lossy(&pdf).contains("(Name) Tj"));
+        assert_eq!(
+            app.status.as_deref(),
+            Some(format!("Saved {} as PDF (1 page)", out.display()).as_str())
+        );
+        assert_eq!(
+            (app.path.clone(), app.text_type, app.import_source.clone()),
+            before
+        );
+        assert!(app.modified);
+        assert!(app.import_unsaved);
+        assert!(!dir.join("book.xlsx").exists());
+        // Nothing to print: Excel's message, and no file.
+        let mut empty = App::new(new_xlsx(), dir.join("empty.xlsx").to_str().unwrap());
+        empty.os_clip = None;
+        let none = dir.join("empty.pdf");
+        empty.save_as_type(none.to_string_lossy().into_owned(), save_type_at("PDF"));
+        assert_eq!(
+            empty.status.as_deref(),
+            Some("We didn't find anything to print.")
+        );
+        assert!(!none.exists());
+        // Types still not written keep their refusal.
+        empty.save_as_type(
+            dir.join("x.xps").to_string_lossy().into_owned(),
+            save_type_at("XPS Document"),
+        );
+        assert!(
+            empty
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("cannot save as XPS Document")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #761: `xlsxy new.pdf` on a missing path is a new workbook bound to a
+    /// free `.xlsx`, so Ctrl+S never writes a workbook under a `.pdf` name.
+    #[test]
+    fn missing_pdf_path_binds_xlsx() {
+        let dir = tmp("missing-pdf");
+        let at = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        assert_eq!(missing_binding(&at("new.pdf")), at("new.xlsx"));
+        let mut app = App::new(new_xlsx(), &at("book.xlsx"));
+        app.text_type = Some(save_type_at("PDF"));
+        app.path = at("book.pdf");
+        assert_eq!(app.bound_text_type(), None, "PDF is never a bound type");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn tmp(name: &str) -> std::path::PathBuf {
@@ -12716,29 +13251,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #876: a CSV/TSV or text import binds as an `.xls` does: to
+    /// #876: a TSV or `.prn` import binds as an `.xls` does: to
     /// `<stem>.xlsx` when it is free, else the next free numbered name, so
-    /// Ctrl+S leaves an existing workbook alone.
+    /// Ctrl+S leaves an existing workbook alone. (A `.csv` or `.txt` is
+    /// bound to itself as text since #761.)
     #[test]
     fn csv_import_never_binds_over_an_existing_xlsx() {
         let dir = tmp("csv-import-free");
         let opts = TextOpen::from_prefs();
-        for ext in ["csv", "tsv", "txt", "prn"] {
+        for ext in ["tsv", "prn"] {
             let source = dir.join(format!("{ext}book.{ext}"));
             std::fs::write(&source, "a,b\n1,2\n").unwrap();
-            let (_, bound, from, _) = load_workbook(source.to_str().unwrap(), &opts).unwrap();
-            assert_eq!(Path::new(&bound), source.with_extension("xlsx"), "{ext}");
-            assert_eq!(from.as_deref(), source.to_str());
+            let l = load_workbook(source.to_str().unwrap(), &opts).unwrap();
+            assert_eq!(Path::new(&l.path), source.with_extension("xlsx"), "{ext}");
+            assert_eq!(l.import_source.as_deref(), source.to_str());
+            assert!(l.text.is_none(), "{ext}");
             std::fs::write(source.with_extension("xlsx"), b"taken").unwrap();
-            let (_, bound, _, _) = load_workbook(source.to_str().unwrap(), &opts).unwrap();
+            let l = load_workbook(source.to_str().unwrap(), &opts).unwrap();
             assert_eq!(
-                bound,
+                l.path,
                 format!("{}1.xlsx", source.with_extension("").display())
             );
         }
 
-        let source = dir.join("book.csv");
-        std::fs::write(&source, "a,b\n1,2\n").unwrap();
+        let source = dir.join("book.tsv");
+        std::fs::write(&source, "a\tb\n1\t2\n").unwrap();
         let existing = dir.join("book.xlsx");
         std::fs::write(&existing, b"the user's own book").unwrap();
         let mut app = App::new(new_xlsx(), "untitled.xlsx");
@@ -12751,13 +13288,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #876: a CSV import rechecks its binding at the first save, as an
+    /// #876: a TSV import rechecks its binding at the first save, as an
     /// `.xls` import does: a `<stem>.xlsx` made after the open is kept.
     #[test]
     fn a_csv_import_rechecks_its_binding_at_the_first_save() {
         let dir = tmp("csv-import-late");
-        let source = dir.join("late.csv");
-        std::fs::write(&source, "a,b\n1,2\n").unwrap();
+        let source = dir.join("late.tsv");
+        std::fs::write(&source, "a\tb\n1\t2\n").unwrap();
         let mut app = App::new(new_xlsx(), "untitled.xlsx");
         app.open_workbook(source.to_str().unwrap());
         let plain = dir.join("late.xlsx");
@@ -12769,12 +13306,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #876: the Text Import Wizard's Finish binds the import to a free
-    /// name too.
+    /// #876: the Text Import Wizard's Finish binds a `.prn` import to a
+    /// free name too (a `.txt` is bound to itself since #761).
     #[test]
     fn text_wizard_import_binds_to_a_free_name() {
         let dir = tmp("text-wizard-free");
-        let source = dir.join("notes.txt");
+        let source = dir.join("notes.prn");
         std::fs::write(&source, "a\tb\n1\t2\n").unwrap();
         let existing = dir.join("notes.xlsx");
         std::fs::write(&existing, b"the user's own notes").unwrap();
@@ -12991,28 +13528,34 @@ mod tests {
     fn imported_csv_stays_protected_until_successful_save_as_or_new() {
         let dir = std::env::temp_dir().join(format!("xlsxy-import-source-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let source = dir.join("import.csv");
-        let bytes = b"first;second\n1;2\n";
+        // A `.tsv` (a `.csv` is bound to itself since #761).
+        let source = dir.join("import.tsv");
+        let bytes = b"first\tsecond\n1\t2\n";
         std::fs::write(&source, bytes).unwrap();
         let mut app = App::new(new_xlsx(), "untitled.xlsx");
         app.open_workbook(source.to_str().unwrap());
         assert_eq!(app.import_source.as_deref(), source.to_str());
         let binding = source.with_extension("xlsx");
         assert_eq!(Path::new(&app.path), binding);
-        app.export_csv();
-        assert_eq!(
-            app.status.as_deref(),
-            Some("Export failed: cannot overwrite the source document")
-        );
-        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        // An export to the source is guarded by the import source, not the
+        // workbook's own (`.xlsx`) path.
+        let guard = |app: &App| {
+            export_source(
+                &app.path,
+                app.import_source.as_deref(),
+                source.to_str().unwrap(),
+            )
+            .to_string()
+        };
+        assert_eq!(Path::new(&guard(&app)), source);
         app.open_workbook(dir.join("missing.xlsx").to_str().unwrap());
         assert_eq!(app.import_source.as_deref(), source.to_str());
         app.save();
         assert!(load_xlsx(&std::fs::read(&binding).unwrap()).is_ok());
         assert_eq!(app.import_source.as_deref(), source.to_str());
-        app.export_csv();
-        assert!(app.status.as_deref().unwrap().contains("cannot overwrite"));
-        app.commit_save_as(dir.clone(), "./import.csv".into());
+        assert_eq!(Path::new(&guard(&app)), source);
+        app.commit_save_as(dir.clone(), "./import.tsv".into());
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
         assert_eq!(Path::new(&app.path), binding);
         assert_eq!(app.import_source.as_deref(), source.to_str());
         app.commit_save_as(dir.join("missing-parent"), "failed.xlsx".into());
@@ -15107,8 +15650,13 @@ mod tests {
         d.thousands = '.';
         app.text_dialog_key(KeyCode::Enter);
         assert!(app.text_dialog.is_none());
-        assert_eq!(Path::new(&app.path), path.with_extension("xlsx"));
-        assert_eq!(app.import_source.as_deref(), path.to_str());
+        // #761: the `.txt` stays bound to itself, as Text (Tab delimited).
+        assert_eq!(Path::new(&app.path), path);
+        assert!(app.import_source.is_none());
+        assert_eq!(
+            app.bound_text_type().map(|t| SAVE_TYPES[t].label),
+            Some("Text (Tab delimited)")
+        );
         let sh = app.sheet();
         assert_eq!(
             sh.cell(0, 0).unwrap().value,
@@ -19293,18 +19841,35 @@ mod tests {
     #[test]
     fn read_only_import_saves_its_new_binding() {
         let dir = macro_dir("ro-import");
-        let csv = dir.join("data.csv");
-        std::fs::write(&csv, "1,2\n").unwrap();
-        let (pkg, path, source, _) =
-            load_workbook(csv.to_str().unwrap(), &TextOpen::from_prefs()).unwrap();
-        let mut app = App::new(pkg, &path);
+        let csv = dir.join("data.tsv");
+        std::fs::write(&csv, "1\t2\n").unwrap();
+        let l = load_workbook(csv.to_str().unwrap(), &TextOpen::from_prefs()).unwrap();
+        let mut app = App::new(l.pkg, &l.path);
         app.os_clip = None;
-        app.import_source = source;
+        app.import_source = l.import_source;
         app.set_read_only(csv.to_str().unwrap());
         assert!(!app.bound_read_only());
         assert!(app.save_current().is_ok());
         assert!(Path::new(&app.path).exists());
+        assert_eq!(std::fs::read_to_string(&csv).unwrap(), "1\t2\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #761: a read-only `.csv` is bound to itself, so Save is refused as
+    /// for any read-only file, and the file is left as it was.
+    #[test]
+    fn read_only_csv_refuses_save() {
+        let dir = macro_dir("ro-csv");
+        let csv = dir.join("data.csv");
+        std::fs::write(&csv, "1,2\n").unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.os_clip = None;
+        app.open_workbook(csv.to_str().unwrap());
+        app.set_read_only(csv.to_str().unwrap());
+        assert!(app.bound_read_only());
+        assert!(app.save_current().is_err());
         assert_eq!(std::fs::read_to_string(&csv).unwrap(), "1,2\n");
+        assert!(!dir.join("data.xlsx").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -19445,11 +20010,9 @@ mod tests {
         let csv = dir.join("data.csv");
         std::fs::write(&csv, "1,2\n").unwrap();
         let before = std::fs::read(&csv).unwrap();
-        let (pkg, path, source, _) =
-            load_workbook(csv.to_str().unwrap(), &TextOpen::from_prefs()).unwrap();
-        let mut app = App::new(pkg, &path);
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
         app.os_clip = None;
-        app.import_source = source;
+        app.open_workbook(csv.to_str().unwrap());
         app.set_read_only(csv.to_str().unwrap());
         app.request_save_as(dir.join("data.xlsx").to_string_lossy().into_owned());
         assert_eq!(Path::new(&app.path), dir.join("data.xlsx"));

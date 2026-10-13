@@ -474,9 +474,10 @@ The strategic piece: **conformance is measured, not claimed.**
   columns transitively (star schema, `RELATED`-style blanks for unmatched
   keys); `model_pivot` groups by any related column and evaluates measures
   per group with **filter context** propagated through the relationships.
-  xlsxy opens `.csv` files directly (imported as a workbook, saved as
-  `.xlsx`), and `.xls`/`.xlsb`/`.ods` the same way (values, formulas, number
-  formats and names; not other formatting). The TUI surface shipped: `Ctrl-M` opens the model view (tables,
+  xlsxy opens `.csv` files directly (imported as a workbook and, as in
+  Excel, saved back to the `.csv` as text; a `.tsv` is saved as `.xlsx`),
+  and `.xls`/`.xlsb`/`.ods` as imports saved as `.xlsx` (values, formulas,
+  number formats and names; not other formatting). The TUI surface shipped: `Ctrl-M` opens the model view (tables,
   relationships, measures) with prompt-driven editing — `r` relates
   `Sales[PID] = Products[ID]` (validated against the live tables), `m`
   defines `Total = SUM(Sales[Amount])`, `p` materializes a report

@@ -34,7 +34,10 @@ fn run(source: &Path, mode: &str, target: &Path) -> Output {
 fn csv_and_recalc_refuse_the_actual_csv_or_tsv_input() {
     let dir = Dir::new("import-guard");
     for (extension, bytes) in [
+        // A `.csv` and `.txt` are bound to themselves as text (#761): the
+        // guard is the workbook's own path now, not an import source.
         ("csv", "first;second\n1;2\n"),
+        ("txt", "first\tsecond\n1\t2\n"),
         ("tsv", "first\tsecond\n1\t2\n"),
     ] {
         let source = dir.0.join(format!("input.{extension}"));
@@ -100,10 +103,11 @@ fn csv_export_of_a_template_refuses_the_template_itself() {
 #[test]
 fn imported_export_protects_rebound_workbook_and_recalc_still_saves_xlsx_in_place() {
     let dir = Dir::new("rebound-guard");
-    let source = dir.0.join("input.csv");
+    // A `.tsv` import (a `.csv` is bound to itself as text since #761).
+    let source = dir.0.join("input.tsv");
     let binding = dir.0.join("input.xlsx");
     let alias = dir.0.join("binding-alias.csv");
-    std::fs::write(&source, b"first,second\n1,2\n").unwrap();
+    std::fs::write(&source, b"first\tsecond\n1\t2\n").unwrap();
     let result = run(&source, "--recalc", &binding);
     assert!(
         result.status.success(),
@@ -112,7 +116,7 @@ fn imported_export_protects_rebound_workbook_and_recalc_still_saves_xlsx_in_plac
     );
     let workbook = std::fs::read(&binding).unwrap();
     assert!(gridcore::xlsx::load_xlsx(&workbook).is_ok());
-    // input.xlsx is taken now, so the CSV binds to input1.xlsx (#876); an
+    // input.xlsx is taken now, so the TSV binds to input1.xlsx (#876); an
     // export still never replaces input.xlsx, by its name or a link.
     std::fs::hard_link(&binding, &alias).unwrap();
     for out in [&alias, &binding] {

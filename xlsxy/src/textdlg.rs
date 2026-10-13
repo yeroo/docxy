@@ -16,7 +16,8 @@
 
 use gridcore::edit::TtcSource;
 use gridcore::textio::{
-    ColFormat, DateOrder, Delimiters, Origin, SplitKind, TextParse, decode, split_text, split_value,
+    ColFormat, DateOrder, Delimiters, Origin, SplitKind, TextParse, decode, decode_with,
+    split_text, split_value,
 };
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyCode;
@@ -66,12 +67,6 @@ pub enum Outcome {
     Finish,
 }
 
-const ORIGINS: [Origin; 4] = [
-    Origin::Auto,
-    Origin::Utf8,
-    Origin::Utf16Le,
-    Origin::Windows1252,
-];
 const QUALIFIERS: [Option<char>; 3] = [Some('"'), Some('\''), None];
 const SEPARATORS: [char; 4] = ['.', ',', ' ', '\''];
 /// Rows the preview shows.
@@ -193,6 +188,23 @@ impl TextDialog {
         &self.text
     }
 
+    /// The origin the import's bytes are read as: the chosen one, with
+    /// Automatic resolved to what it picked (#761).
+    pub fn resolved_origin(&self) -> Origin {
+        match &self.purpose {
+            Purpose::Import { bytes, .. } => decode_with(bytes, self.origin).1,
+            Purpose::Columns { .. } => self.origin,
+        }
+    }
+
+    /// Whether the import's bytes are all ASCII (no byte-order mark).
+    pub fn plain_ascii(&self) -> bool {
+        match &self.purpose {
+            Purpose::Import { bytes, .. } => bytes.is_ascii(),
+            Purpose::Columns { .. } => true,
+        }
+    }
+
     /// The fields of the current step, top to bottom.
     pub fn fields(&self) -> Vec<Field> {
         use Field::*;
@@ -269,7 +281,8 @@ impl TextDialog {
         self.columns[col] = f;
     }
 
-    fn set_origin(&mut self, origin: Origin) {
+    /// Read the import under `origin`, as the File origin field does.
+    pub fn set_origin(&mut self, origin: Origin) {
         self.origin = origin;
         if let Purpose::Import { bytes, .. } = &self.purpose {
             self.text = decode(bytes, origin);
@@ -317,8 +330,10 @@ impl TextDialog {
                 self.typed = false;
             }
             Field::Origin => {
-                let i = ORIGINS.iter().position(|o| *o == self.origin).unwrap_or(0);
-                self.set_origin(ORIGINS[step(i, ORIGINS.len())]);
+                // Automatic, then Excel's code pages by number (#761).
+                let origins = Origin::all();
+                let i = origins.iter().position(|o| *o == self.origin).unwrap_or(0);
+                self.set_origin(origins[step(i, origins.len())]);
             }
             Field::Qualifier => {
                 let i = QUALIFIERS
@@ -460,7 +475,7 @@ impl TextDialog {
                     self.start_row.to_string()
                 }
             ),
-            Field::Origin => format!("File origin: {}", self.origin.name()),
+            Field::Origin => format!("File origin: {}", self.origin.label()),
             Field::Tab => format!("{} Tab", check(self.delims.tab)),
             Field::Semicolon => format!("{} Semicolon", check(self.delims.semicolon)),
             Field::Comma => format!("{} Comma", check(self.delims.comma)),
@@ -775,12 +790,33 @@ mod tests {
         assert_eq!(d.parse().start_row, 2);
         assert_eq!(d.preview(), [vec!["\u{fc}ber"]]);
         d.key(KeyCode::Down);
-        d.key(KeyCode::Right); // Auto -> UTF-8 (lossy)
+        d.key(KeyCode::Left); // Automatic wraps to the last, 65001 (lossy)
         assert_eq!(d.origin, Origin::Utf8);
         assert_eq!(d.preview(), [vec!["\u{fffd}ber"]]);
+        assert_eq!(
+            d.field_line(Field::Origin),
+            "File origin: 65001 : Unicode (UTF-8)"
+        );
         d.key(KeyCode::Right);
-        d.key(KeyCode::Right); // -> Windows-1252
+        d.key(KeyCode::Right); // -> 437 : OEM United States (#761)
+        assert_eq!(d.origin, Origin::CodePage(437));
+        assert_eq!(d.preview(), [vec!["\u{207f}ber"]]);
+        assert_eq!(d.resolved_origin(), Origin::CodePage(437));
+        while d.origin != Origin::Windows1252 {
+            d.key(KeyCode::Right);
+        }
         assert_eq!(d.preview(), [vec!["\u{fc}ber"]]);
+    }
+
+    /// #761: Automatic reports the origin it picked, for the binding.
+    #[test]
+    fn automatic_origin_resolves_for_the_binding() {
+        let d = TextDialog::import("in.txt".into(), b"Z\xFCrich".to_vec());
+        assert_eq!(d.resolved_origin(), Origin::Windows1252);
+        assert!(!d.plain_ascii());
+        let d = TextDialog::import("in.txt".into(), b"plain".to_vec());
+        assert_eq!(d.resolved_origin(), Origin::Utf8);
+        assert!(d.plain_ascii());
     }
 
     /// The first digit typed replaces the start row; Backspace can empty it.
