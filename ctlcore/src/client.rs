@@ -8,6 +8,7 @@ use crate::json::Json;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// A control endpoint parsed from a discovery file.
@@ -42,6 +43,7 @@ impl Instance {
     pub fn client(&self) -> Client {
         Client {
             instance: self.clone(),
+            conn: Mutex::new(None),
         }
     }
 }
@@ -84,10 +86,15 @@ pub fn discover_live(dir: &Path) -> Vec<Instance> {
 /// so this leaves room for that; a hung server still fails the call.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// A request/response client. Each [`call`](Client::call) opens a fresh
-/// short-lived connection, matching the server's one-request-per-line model.
+/// A request/response client. Its [`call`](Client::call)s share one
+/// connection, opened on the first call and kept for as long as the `Client`
+/// lives: one connection per call left a client port in TIME_WAIT per verb,
+/// and a UI harness sweep ran Windows' ephemeral ports out (#1234).
 pub struct Client {
     instance: Instance,
+    /// The cached connection; `None` before the first call and after a
+    /// transport failure. The lock also keeps one request in flight at a time.
+    conn: Mutex<Option<Conn>>,
 }
 
 impl Client {
@@ -98,15 +105,33 @@ impl Client {
     /// Send `verb` with `args`, returning the server's `result` JSON — or an
     /// `Err` carrying either a transport failure or the server's own
     /// `{ok:false,error}` message.
+    ///
+    /// A transport failure drops the cached connection, so the next call
+    /// connects afresh; the failed call is not re-sent, since the server may
+    /// already have run its verb. A refusal keeps the connection.
     pub fn call(&self, verb: &str, args: Json) -> Result<Json, String> {
-        self.connect()?.call(verb, args)
+        // The slot is only a cache, so a lock poisoned by a panicking caller
+        // is still fine to use.
+        let mut slot = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = match &mut *slot {
+            Some(conn) => conn,
+            None => slot.insert(self.connect()?),
+        };
+        match conn.exchange(verb, args) {
+            Ok(answer) => answer,
+            Err(transport) => {
+                *slot = None;
+                Err(transport)
+            }
+        }
     }
 
-    /// A connection kept open for many calls. The server reads one request
-    /// per line until the client closes, so a caller that calls in a tight
-    /// loop (the UI harness polling a terminal editor's counters, #1204)
-    /// uses one socket rather than one per call, which on Windows ran the
-    /// ephemeral ports out within a few thousand calls.
+    /// A connection of its own, kept open for many calls, separate from the
+    /// one [`call`](Client::call) caches. The server reads one request per
+    /// line until the client closes, so a caller that calls in a tight loop
+    /// (the UI harness polling a terminal editor's counters, #1204) uses one
+    /// socket rather than one per call, which on Windows ran the ephemeral
+    /// ports out within a few thousand calls.
     pub fn connect(&self) -> Result<Conn, String> {
         let stream = TcpStream::connect_timeout(&self.instance.addr(), Duration::from_millis(500))
             .map_err(|e| format!("connect failed: {e}"))?;
@@ -134,6 +159,14 @@ pub struct Conn {
 impl Conn {
     /// [`Client::call`] on this connection.
     pub fn call(&mut self, verb: &str, args: Json) -> Result<Json, String> {
+        self.exchange(verb, args)?
+    }
+
+    /// One request and its reply. The outer `Err` is a transport or protocol
+    /// failure, after which the stream can no longer be trusted (a late reply
+    /// would answer the next request); the inner one is the server's own
+    /// refusal, which leaves the connection usable.
+    fn exchange(&mut self, verb: &str, args: Json) -> Result<Result<Json, String>, String> {
         let mut line = Json::obj(vec![
             ("token", Json::Str(self.token.clone())),
             ("verb", Json::Str(verb.to_string())),
@@ -164,11 +197,11 @@ impl Conn {
             ));
         }
         let j = Json::parse(resp.trim()).map_err(|e| format!("bad response: {e}"))?;
-        if j.get("ok").and_then(Json::as_bool) == Some(true) {
+        Ok(if j.get("ok").and_then(Json::as_bool) == Some(true) {
             Ok(j.get("result").cloned().unwrap_or(Json::Null))
         } else {
             Err(j.get_str("error").unwrap_or("unknown error").to_string())
-        }
+        })
     }
 }
 
@@ -350,6 +383,8 @@ pub fn new_file(
 mod tests {
     use super::*;
     use crate::serve;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
 
     #[test]
     fn combined_sources_list_resolve_and_report_ambiguity() {
@@ -553,6 +588,141 @@ mod tests {
             .unwrap();
         assert_eq!(sent, r.get_str("path").unwrap());
         assert!(out.exists());
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stand-in control server on a loopback port that counts the
+    /// connections it accepts. It answers `echo` with its `n` and anything
+    /// else with a refusal. With `drop_first`, it answers one request on the
+    /// first connection, closes that socket and reports on the channel.
+    fn stand_in(drop_first: bool) -> (Instance, Arc<AtomicUsize>, mpsc::Receiver<()>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let (dropped_tx, dropped) = mpsc::channel();
+        let counted = accepts.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let first = counted.fetch_add(1, Ordering::SeqCst) == 0;
+                let limit = if drop_first && first { Some(1) } else { None };
+                let dropped_tx = dropped_tx.clone();
+                std::thread::spawn(move || {
+                    let mut writer = stream.try_clone().unwrap();
+                    let mut reader = BufReader::new(stream);
+                    let mut answered = 0;
+                    let mut line = String::new();
+                    while limit != Some(answered) {
+                        line.clear();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let req = Json::parse(line.trim()).unwrap();
+                        let reply = if req.get_str("verb") == Some("echo") {
+                            let n = req
+                                .get("args")
+                                .and_then(|a| a.get("n"))
+                                .cloned()
+                                .unwrap_or(Json::Null);
+                            Json::obj(vec![("ok", Json::Bool(true)), ("result", n)])
+                        } else {
+                            Json::obj(vec![
+                                ("ok", Json::Bool(false)),
+                                ("error", Json::Str("no such verb".into())),
+                            ])
+                        };
+                        writer.write_all(format!("{reply}\n").as_bytes()).unwrap();
+                        answered += 1;
+                    }
+                    drop((reader, writer));
+                    dropped_tx.send(()).ok();
+                });
+            }
+        });
+        let instance = Instance {
+            instance: "stand-in".into(),
+            port,
+            token: "t".into(),
+            pid: 0,
+        };
+        (instance, accepts, dropped)
+    }
+
+    fn echo(n: usize) -> Json {
+        Json::obj(vec![("n", Json::Num(n as f64))])
+    }
+
+    /// Every call on one `Client` goes over one connection, so a run of verbs
+    /// holds no ephemeral port per call (#1234).
+    #[test]
+    fn a_client_reuses_one_connection() {
+        let (instance, accepts, _dropped) = stand_in(false);
+        let client = instance.client();
+        for i in 0..100 {
+            assert_eq!(
+                client.call("echo", echo(i)).unwrap().as_f64(),
+                Some(i as f64)
+            );
+        }
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "100 calls, one connection"
+        );
+    }
+
+    /// A refusal is the server's answer, not a broken stream: the connection
+    /// stays cached (#1234).
+    #[test]
+    fn a_refusal_keeps_the_connection() {
+        let (instance, accepts, _dropped) = stand_in(false);
+        let client = instance.client();
+        assert!(client.call("echo", echo(1)).is_ok());
+        assert_eq!(client.call("nope", Json::Null).unwrap_err(), "no such verb");
+        assert!(client.call("echo", echo(2)).is_ok());
+        assert_eq!(accepts.load(Ordering::SeqCst), 1);
+    }
+
+    /// When the server end of the cached connection goes away, that call
+    /// fails (it is not re-sent: the verb may have run) and the next call
+    /// reconnects (#1234).
+    #[test]
+    fn a_broken_connection_fails_once_then_reconnects() {
+        let (instance, accepts, dropped) = stand_in(true);
+        let client = instance.client();
+        assert!(client.call("echo", echo(1)).is_ok());
+        dropped.recv_timeout(Duration::from_secs(5)).unwrap();
+        let err = client.call("echo", echo(2)).unwrap_err();
+        assert!(
+            err == "the server closed the connection before replying to `echo`"
+                || err.starts_with("read failed: ")
+                || err.starts_with("write failed: "),
+            "a transport failure, got: {err}"
+        );
+        assert_eq!(client.call("echo", echo(3)).unwrap().as_f64(), Some(3.0));
+        assert_eq!(accepts.load(Ordering::SeqCst), 2);
+    }
+
+    /// The issue's own load: 20,000 sequential calls on one client all
+    /// succeed. One connection per call ran Windows' ephemeral ports out with
+    /// os error 10048 (#1234).
+    #[test]
+    fn twenty_thousand_calls_on_one_client_all_succeed() {
+        let dir = std::env::temp_dir().join(format!("ctlcore_20k_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (server, rx) = serve(&dir, "docxy-20k-test").unwrap();
+        std::thread::spawn(move || {
+            for req in rx {
+                let n = req.args.get("n").cloned().unwrap_or(Json::Null);
+                req.reply_ok(n);
+            }
+        });
+        let client = discover_live(&dir).remove(0).client();
+        for i in 0..20_000 {
+            let got = client.call("echo", echo(i));
+            assert_eq!(got.map(|j| j.as_f64()), Ok(Some(i as f64)), "call {i}");
+        }
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }
