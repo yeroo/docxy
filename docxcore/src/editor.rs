@@ -175,6 +175,9 @@ struct Snapshot {
     /// The place after an inserted object, so whatever state undo or redo
     /// brings back has its own (#768).
     after_object: Option<AfterObject>,
+    /// The document-wide settings, so undoing or redoing a toggle of one
+    /// brings it back with the section edits made beside it (#770).
+    settings: DocSettings,
 }
 
 /// The content index text typed at `caret` goes in at, just after the
@@ -393,6 +396,15 @@ fn unshare_body(body: Vec<Arc<Block>>) -> Document {
     }
 }
 
+/// Document-wide settings (settings.xml) that edits change and undo
+/// restores, as the body is (#770). The host seeds them from the file and
+/// writes them back to it after every edit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DocSettings {
+    /// Different Odd & Even Pages (`w:evenAndOddHeaders`).
+    pub even_and_odd_headers: bool,
+}
+
 /// An editing session over a [`Document`].
 pub struct Editor {
     pub doc: Document,
@@ -425,6 +437,8 @@ pub struct Editor {
     /// Where text typed next goes after [`Editor::insert_object`] (#768);
     /// see [`Editor::typing_after_object`] for while it holds.
     after_object: Option<AfterObject>,
+    /// See [`Editor::settings`].
+    settings: DocSettings,
     /// A [`Editor::preview_copy`]: its edits keep no history and issue no
     /// undo serial, which hosts read as "an edit happened" (#764).
     display_only: bool,
@@ -457,6 +471,7 @@ impl Editor {
             track: None,
             pending: None,
             after_object: None,
+            settings: DocSettings::default(),
             display_only: false,
         }
     }
@@ -483,6 +498,7 @@ impl Editor {
             track: self.track.clone(),
             pending: self.pending.clone(),
             after_object: self.after_object.clone(),
+            settings: self.settings,
             display_only: true,
         }
     }
@@ -517,6 +533,27 @@ impl Editor {
         }
     }
 
+    /// The document-wide settings as edits and undo have left them (#770).
+    pub fn settings(&self) -> DocSettings {
+        self.settings
+    }
+
+    /// Take the settings the document was opened with: no undo step.
+    pub fn seed_settings(&mut self, settings: DocSettings) {
+        self.settings = settings;
+    }
+
+    /// Turn Different Odd & Even Pages on or off as an undo step (none when
+    /// it already is). Whether it changed.
+    pub fn set_even_and_odd_headers(&mut self, on: bool) -> bool {
+        if self.settings.even_and_odd_headers == on {
+            return false;
+        }
+        self.checkpoint(EditKind::Structural);
+        self.settings.even_and_odd_headers = on;
+        true
+    }
+
     /// The document to export as text (Markdown, HTML, plain text): merge
     /// fields show their placeholders, not a previewed record.
     pub fn export_doc(&self) -> std::borrow::Cow<'_, Document> {
@@ -548,6 +585,7 @@ impl Editor {
             serial: 0,
             pending: self.pending.clone(),
             after_object: self.after_object.clone(),
+            settings: self.settings,
         }
     }
 
@@ -736,6 +774,7 @@ impl Editor {
             self.review_target = prev.review_target;
             self.pending = prev.pending;
             self.after_object = prev.after_object;
+            self.settings = prev.settings;
             self.last = EditKind::None;
             self.refresh_merge_preview();
             true
@@ -753,6 +792,7 @@ impl Editor {
             self.review_target = next.review_target;
             self.pending = next.pending;
             self.after_object = next.after_object;
+            self.settings = next.settings;
             self.last = EditKind::None;
             self.refresh_merge_preview();
             true
@@ -9155,5 +9195,55 @@ mod tests {
         assert!(matches!(&p.content[1], Inline::Field { .. }));
         assert!(matches!(&p.content[2], Inline::Run(r) if r.text == "c" && r.props.bold));
         assert!(matches!(&p.content[3], Inline::Run(r) if r.text == "d" && !r.props.bold));
+    }
+
+    /// #770: Different Odd & Even Pages is an undo step of its own, and a
+    /// seed (the file's setting) takes none.
+    #[test]
+    fn even_and_odd_headers_is_an_undo_step_770() {
+        let mut ed = Editor::new(doc(&["a"]));
+        ed.seed_settings(DocSettings {
+            even_and_odd_headers: true,
+        });
+        assert!(ed.undo_names().is_empty(), "a seed takes no step");
+        assert!(!ed.set_even_and_odd_headers(true), "unchanged: no step");
+        assert!(ed.undo_names().is_empty());
+        assert!(ed.set_even_and_odd_headers(false));
+        assert!(!ed.settings().even_and_odd_headers);
+        assert!(ed.undo());
+        assert!(ed.settings().even_and_odd_headers);
+        assert!(ed.redo());
+        assert!(!ed.settings().even_and_odd_headers);
+    }
+
+    /// #770: an unrelated edit's undo keeps the seeded setting.
+    #[test]
+    fn an_unrelated_undo_keeps_the_seeded_settings_770() {
+        let mut ed = Editor::new(doc(&["a"]));
+        ed.seed_settings(DocSettings {
+            even_and_odd_headers: true,
+        });
+        ed.insert_str("x");
+        assert!(ed.undo());
+        assert!(ed.settings().even_and_odd_headers);
+    }
+
+    /// #770: the setting and a body edit made in one command undo and redo
+    /// together.
+    #[test]
+    fn a_settings_toggle_and_an_edit_are_one_step_770() {
+        let mut ed = Editor::new(doc(&["a"]));
+        ed.one_step("Different Odd & Even Pages", |ed| {
+            ed.set_even_and_odd_headers(true);
+            ed.insert_str("x");
+        });
+        assert_eq!(ed.undo_names(), vec!["Different Odd & Even Pages"]);
+        assert!(ed.undo());
+        assert!(!ed.settings().even_and_odd_headers);
+        assert_eq!(top_text(&ed), vec!["a"]);
+        assert!(!ed.undo());
+        assert!(ed.redo());
+        assert!(ed.settings().even_and_odd_headers);
+        assert_eq!(top_text(&ed), vec!["xa"]);
     }
 }
