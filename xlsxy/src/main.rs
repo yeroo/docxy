@@ -15767,6 +15767,43 @@ mod tests {
         assert!(!app.sheet().col_hidden(1));
     }
     #[test]
+    fn filter_survives_save_and_reopen() {
+        // #759: the in-app filter saves its `<autoFilter>`, so the rows it hid
+        // reopen filter-hidden, not hidden by hand.
+        use gridcore::sheet::Cell;
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        {
+            let sh = &mut app.pkg.workbook.sheets[0];
+            sh.set_cell(0, 0, Cell::text("Item"));
+            sh.set_cell(0, 1, Cell::text("Qty"));
+            for (i, (name, qty)) in [("A", 300.0), ("B", 50.0), ("C", 900.0)].iter().enumerate() {
+                sh.set_cell(i as u32 + 1, 0, Cell::text(name));
+                sh.set_cell(i as u32 + 1, 1, Cell::number(*qty));
+            }
+        }
+        app.rebuild_engine();
+        app.cur = (1, 1);
+        app.anchor = None;
+        app.ribbon_act(ribbon::Act::Filter);
+        // Qty's drop-down › Number Filters, then the condition.
+        app.cur = (0, 1);
+        assert!(app.open_filter_picker());
+        app.filter_picker.as_mut().unwrap().sel = 3;
+        app.filter_picker_key(KeyCode::Enter);
+        app.prompt = None;
+        app.commit_custom_filter(">100");
+        assert!(app.sheet().row_filtered(2));
+
+        let saved = load_xlsx(&app.package_bytes()).unwrap();
+        let ws = String::from_utf8_lossy(saved.part("xl/worksheets/sheet1.xml").unwrap());
+        assert!(ws.contains("<autoFilter ref=\"A1:B4\">"), "{ws}");
+        let sh = &saved.workbook.sheets[0];
+        assert!(sh.row_hidden(2) && sh.row_filtered(2));
+        assert!(!sh.row_hidden(1) && !sh.row_hidden(3));
+    }
+
+    #[test]
     fn filter_commands_hide_rows_as_filtered() {
         use gridcore::sheet::{Cell, CellValue};
         let mut app = App::new(new_xlsx(), "t.xlsx");
