@@ -405,7 +405,9 @@ impl Session {
                 if t.is_empty() {
                     mutated = false;
                 } else {
-                    self.editor.delete_selection();
+                    // The copy is the text: a picture or alignment tab it
+                    // cannot carry stays (#768).
+                    self.editor.delete_selection_keeping_objects();
                     copied = Some(t);
                 }
             }

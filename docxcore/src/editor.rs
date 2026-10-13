@@ -1644,9 +1644,18 @@ impl Editor {
         self.delete_selection_with(true)
     }
 
-    /// [`Editor::delete_selection`]; `drop_objects` false keeps the pictures
-    /// and alignment tabs it spans, which a cut does: its clip does not carry
-    /// them (they take no offset), so a paste could not bring them back.
+    /// [`Editor::delete_selection`] for a cut: it keeps the pictures and
+    /// alignment tabs in the paragraphs where the selection starts and
+    /// ends, which a cut's clip does not carry (they take no offset), so a
+    /// paste could not bring them back. Paragraphs wholly inside the
+    /// selection still go whole, their objects with them. A host that cuts
+    /// through its own copy (the wasm bridge's plain-text cut) calls this.
+    pub fn delete_selection_keeping_objects(&mut self) -> bool {
+        self.delete_selection_with(false)
+    }
+
+    /// [`Editor::delete_selection`]; `drop_objects` false is
+    /// [`Editor::delete_selection_keeping_objects`].
     fn delete_selection_with(&mut self, drop_objects: bool) -> bool {
         if let Some(range) = self.cell_range() {
             return self.clear_cells(&range);
@@ -1829,7 +1838,7 @@ impl Editor {
     /// Cut: copy the selection, then delete it.
     pub fn cut(&mut self) -> Option<Clip> {
         let clip = self.copy()?;
-        self.delete_selection_with(false);
+        self.delete_selection_keeping_objects();
         Some(clip)
     }
 
