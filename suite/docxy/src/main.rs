@@ -4661,8 +4661,9 @@ struct DocTab {
     /// The sidecar holding this tab's unsaved work as of the last persist
     /// (#613): the one it wrote or, when it could write none, the one before
     /// it (or the one the tab was restored from, #1224); `None` when that
-    /// persist found it clean. Don't Save keeps a copy of it as the tab's
-    /// draft. A `RefCell` because `persist` takes `&self`.
+    /// persist found it clean and not a placeholder (a placeholder keeps
+    /// the copy it could not show). Don't Save keeps a copy of it as the
+    /// tab's draft. A `RefCell` because `persist` takes `&self`.
     last_hot: std::cell::RefCell<Option<PathBuf>>,
     /// This document's mail merge (#628): its type, recipient list and
     /// preview state.
@@ -10856,9 +10857,13 @@ fn write_sidecars(
                 return forgotten(persist_tab_meta(t));
             }
             let mut persisted = persist_tab_avoiding(&hd, &taken, hot_seq, i, t);
-            if persisted.hot.is_none() && t.dirty {
+            // A placeholder holds nothing of its own, clean or not: its last
+            // copy is all there is of it.
+            let placeholder = matches!(t.surface, Surface::Placeholder);
+            if persisted.hot.is_none() && (t.dirty || placeholder) {
                 // No new copy (a full disk, a placeholder): the last one is
-                // still the unsaved work, so the session goes on naming it
+                // still the unsaved work, so the session goes on naming it,
+                // as unsaved so the next start restores it as this one did,
                 // and the prune keeps it.
                 persisted.hot = t
                     .last_hot
@@ -10866,6 +10871,7 @@ fn write_sidecars(
                     .as_ref()
                     .filter(|p| p.exists())
                     .map(|p| p.display().to_string());
+                persisted.dirty |= persisted.hot.is_some();
             }
             // A kept tab's sidecar is the fresh one written above, or the
             // last one carried forward: either way this tab's own content
@@ -10873,7 +10879,7 @@ fn write_sidecars(
             *t.last_hot.borrow_mut() = persisted
                 .hot
                 .as_ref()
-                .filter(|_| t.dirty)
+                .filter(|_| t.dirty || placeholder)
                 .map(PathBuf::from);
             persisted
         })
@@ -10934,7 +10940,7 @@ fn prune_sidecars(hd: &std::path::Path, session: &Session, replaced: &[PersistTa
 /// Whether an AutoRecover tick may keep tab `t` as its file alone (#1224):
 /// clean, and bound to a file that is there and of a type that keeps
 /// everything the tab holds. Whether the file is unchanged since is not
-/// checked. Not a tab whose file failed to load, nor a converted or Word
+/// checked. Not a placeholder or a tab whose file failed to load, nor a converted or Word
 /// 97-2003 one (its sidecar is what rollback restores, #633, and a fresh
 /// import need not match), nor one bound to a type that keeps less than
 /// the tab (Markdown, plain text, RTF, HTML; a project's MSPDI XML or
@@ -10944,6 +10950,7 @@ fn reopens_from_file(t: &DocTab) -> bool {
         return false;
     };
     if t.dirty
+        || matches!(t.surface, Surface::Placeholder)
         || !path.exists()
         || t.load_failed
         || t.pending_conversion
@@ -11456,10 +11463,11 @@ fn restore_tab(t: &PersistTab) -> DocTab {
 /// never add it.
 fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab, bool) {
     let (tab, from_hot) = restore_tab_content(t, trusted);
-    // A tab restored unsaved names the sidecar it was persisted with, even
-    // one it could not read (#1224): a persist that writes no newer copy of
-    // it keeps that one, which is still the only copy of the work.
-    if tab.dirty {
+    // A tab persisted unsaved names the sidecar it was persisted with, even
+    // one it could not read and whatever the restored tab's own flag (a
+    // project placeholder comes back clean) (#1224): a persist that writes
+    // no newer copy keeps that one, which is still the only copy of the work.
+    if t.dirty {
         *tab.last_hot.borrow_mut() = t.hot.as_ref().map(PathBuf::from).filter(|p| p.exists());
     }
     (tab, from_hot)

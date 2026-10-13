@@ -2335,6 +2335,39 @@ fn a_start_sets_an_unreadable_session_aside_with_its_sidecars() {
     );
 }
 
+/// The project twin: a never-saved project whose sidecar cannot be read
+/// restores as a CLEAN placeholder, yet its sidecar is the only copy of the
+/// work, so writes past the one-write grace keep naming it.
+#[test]
+fn an_unreadable_project_sidecar_restored_as_a_placeholder_survives_writes() {
+    let root = Root::new("keep-project");
+    let hd = hot_dir_in(&root.0);
+    std::fs::create_dir_all(&hd).unwrap();
+    let sidecar = hd.join("tab-0-1.yppx");
+    std::fs::write(&sidecar, b"not a project").unwrap();
+    let mut entry = persist_tab_meta(&tab(Kind::Project));
+    entry.path = None;
+    entry.dirty = true;
+    entry.hot = Some(sidecar.display().to_string());
+    let (restored, _) = restore_tab_sourced(&entry, &crate::trusted::TrustStore::default());
+    assert!(matches!(restored.surface, Surface::Placeholder));
+    let tabs = [restored];
+    for _ in 0..3 {
+        write_session(&root.0, &tabs, 0, prefs(), &[], 0);
+    }
+    let session = root.session();
+    assert_eq!(
+        session.tabs[0].hot.as_deref(),
+        Some(sidecar.display().to_string().as_str())
+    );
+    assert!(session.tabs[0].dirty, "restored next time as this time");
+    assert_eq!(std::fs::read(&sidecar).unwrap(), b"not a project");
+    // And the next start restores it the same way, still naming it.
+    let (again, _) = restore_tab_sourced(&session.tabs[0], &crate::trusted::TrustStore::default());
+    assert!(matches!(again.surface, Surface::Placeholder));
+    assert_eq!(again.last_hot.borrow().as_deref(), Some(sidecar.as_path()));
+}
+
 #[test]
 fn nothing_is_pruned_when_the_session_cannot_be_written() {
     let root = Root::new("no-prune");
