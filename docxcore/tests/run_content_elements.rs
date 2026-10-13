@@ -309,12 +309,18 @@ fn every_listed_run_content_element_survives_a_save() {
     }
 }
 
-/// `w:lastRenderedPageBreak` is Word's layout cache, which Word regenerates:
-/// it stays dropped on purpose.
+/// `w:lastRenderedPageBreak` is Word's layout cache. It was dropped here
+/// until #1216, which keeps it before the child it preceded (see
+/// `run_grouping.rs`); it is still no text.
 #[test]
-fn a_last_rendered_page_break_is_not_written() {
+fn a_last_rendered_page_break_is_kept_and_is_no_text() {
     let doc = load("<w:p><w:r><w:lastRenderedPageBreak/><w:t>a</w:t></w:r></w:p>");
-    assert!(!saved_para(&doc).contains("lastRenderedPageBreak"));
+    assert_eq!(para_text(&doc), "a");
+    let p = saved_para(&doc);
+    assert!(
+        p.contains("<w:r><w:lastRenderedPageBreak/><w:t xml:space=\"preserve\">a</w:t></w:r>"),
+        "{p}"
+    );
 }
 
 /// Rejecting a formatting change restores the old properties, not how the
@@ -421,8 +427,8 @@ fn a_leading_or_sole_soft_hyphen_keeps_the_start_caret_stop() {
 
 /// BackgroundReport's paragraph 122 (CI, #1101): a tab run, a
 /// `lastRenderedPageBreak` run and plain runs, then a run that starts with
-/// the hyphen. The save splits the tab run (#1069), but the hyphen run comes
-/// back exactly as it was.
+/// the hyphen. The hyphen run comes back exactly as it was, and since #1216
+/// so do the tab run and the marked run.
 #[test]
 fn a_hyphen_first_run_after_restructured_runs_saves_as_it_was() {
     const SZ: &str = "<w:rPr><w:sz w:val=\"22\"/></w:rPr>";
@@ -438,6 +444,13 @@ fn a_hyphen_first_run_after_restructured_runs_saves_as_it_was() {
     assert!(para_text(&doc).ends_with("within ITU\u{2011}T Study Group 6."));
     let p = saved_para(&doc);
     assert_eq!(p.matches("<w:noBreakHyphen/>").count(), 1, "{p}");
+    assert!(
+        p.contains(&format!(
+            "<w:r>{SZ}<w:tab/><w:t xml:space=\"preserve\">Some ITU work in its </w:t></w:r>\
+             <w:r>{SZ}<w:lastRenderedPageBreak/><w:t xml:space=\"preserve\">standardization"
+        )),
+        "{p}"
+    );
     assert!(
         p.ends_with(&format!(
             "<w:r>{SZ}<w:noBreakHyphen/><w:t xml:space=\"preserve\">T Study Group 6.</w:t></w:r></w:p>"

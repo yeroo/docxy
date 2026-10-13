@@ -71,6 +71,41 @@ pub fn strictly_equal<T: PartialEq + ?Sized>(a: &T, b: &T) -> bool {
 
 impl Eq for ElementAttrs {}
 
+/// Where a run-like inline stood inside its source `w:r`, so a save writes
+/// the run's children back together (#1216). The model keeps one inline per
+/// `w:t` / `w:tab` / `w:br`; this records which of them shared a `w:r`.
+///
+/// Like [`ElementAttrs`] it is preservation data, never formatting: equality
+/// always holds outside [`strictly_equal`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunShape {
+    /// The inline continues the `w:r` of the inline before it (it was not
+    /// that `w:r`'s first modeled child).
+    pub joins_prev: bool,
+    /// A `w:lastRenderedPageBreak` stood right before this child. Only Word's
+    /// layout hint: an edit may leave it stale, but never duplicated.
+    pub page_break_before: bool,
+    /// The `w:br` carried `w:type="textWrapping"` explicitly (the default).
+    pub br_type_explicit: bool,
+}
+
+impl PartialEq for RunShape {
+    fn eq(&self, other: &Self) -> bool {
+        !STRICT_ATTRS.with(std::cell::Cell::get)
+            || (
+                self.joins_prev,
+                self.page_break_before,
+                self.br_type_explicit,
+            ) == (
+                other.joins_prev,
+                other.page_break_before,
+                other.br_type_explicit,
+            )
+    }
+}
+
+impl Eq for RunShape {}
+
 /// Character-level formatting (a resolved `w:rPr`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RunProps {
@@ -112,6 +147,8 @@ pub struct RunProps {
     pub shadow: Vec<String>,
     /// The `w:r` start tag's attributes (`w:rsidR`, `w:rsidRPr`, …).
     pub element_attrs: ElementAttrs,
+    /// The run's place in its source `w:r` (#1216).
+    pub shape: RunShape,
     /// The run was loaded with `w:noBreakHyphen` / `w:softHyphen` content,
     /// held in `text` as U+2011 / U+00AD: a save writes those characters back
     /// as the elements. Unset, they stay literal `w:t` text (#1101). Unlike
@@ -137,6 +174,16 @@ pub struct RunProps {
 }
 
 impl RunProps {
+    /// A copy for a new inline the editor makes beside this one (a split
+    /// piece, typed text): the `w:lastRenderedPageBreak` stays with the
+    /// original only. A paste may still copy it; a duplicated layout hint is
+    /// harmless to Word, so that is not chased (#1216).
+    pub fn continued(&self) -> RunProps {
+        let mut props = self.clone();
+        props.shape.page_break_before = false;
+        props
+    }
+
     /// Call after setting `font` explicitly. The loaded `w:rFonts` keeps only
     /// what a font edit does not replace (the East Asian and complex-script
     /// slots), so the font is written from the model, without a theme font

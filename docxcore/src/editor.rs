@@ -3551,17 +3551,19 @@ fn source_from(content: &[Inline], i: usize) -> Option<&RunProps> {
 ///   the nearest source before, then after, it.
 fn typing_props(content: &[Inline], i: usize, local: usize) -> RunProps {
     if local == 0 {
-        return source_from(content, i).cloned().unwrap_or_default();
+        return source_from(content, i)
+            .map(RunProps::continued)
+            .unwrap_or_default();
     }
     if let Inline::Tab(props) | Inline::Break(_, props) = &content[i] {
-        return props.clone();
+        return props.continued();
     }
     content
         .get(i + 1)
         .and_then(source_props)
         .or_else(|| source_before(content, i))
         .or_else(|| source_from(content, i + 1))
-        .cloned()
+        .map(RunProps::continued)
         .unwrap_or_default()
 }
 
@@ -3569,7 +3571,7 @@ fn typing_props(content: &[Inline], i: usize, local: usize) -> RunProps {
 /// last inline is not a run.
 fn end_props(content: &[Inline]) -> RunProps {
     source_before(content, content.len())
-        .cloned()
+        .map(RunProps::continued)
         .unwrap_or_default()
 }
 
@@ -3659,7 +3661,7 @@ fn split_content(content: &mut Vec<Inline>, o: usize) -> Vec<Inline> {
                     let text = r.text.split_off(b);
                     Inline::Run(Run {
                         text,
-                        props: r.props.clone(),
+                        props: r.props.continued(),
                     })
                 }
                 Inline::Hyperlink(h) => Inline::Hyperlink(split_link(h, local)),
@@ -3986,7 +3988,7 @@ fn split_runs(runs: &mut Vec<Run>, o: usize) -> Vec<Run> {
             }
             let b = char_byte(&runs[i].text, local);
             let text = runs[i].text.split_off(b);
-            let props = runs[i].props.clone();
+            let props = runs[i].props.continued();
             let mut rest = runs.split_off(i + 1);
             rest.insert(0, Run { text, props });
             return rest;
@@ -4088,17 +4090,26 @@ fn split_run_with(
     let b2 = char_byte(&r.text, oe);
     let (left, mid, right) = (&r.text[..b1], &r.text[b1..b2], &r.text[b2..]);
     let mut out = Vec::new();
+    // Only the first piece keeps a `w:lastRenderedPageBreak` (#1216).
+    let continued = r.props.continued();
     if !left.is_empty() {
         out.push(Run {
             text: left.to_string(),
             props: r.props.clone(),
         });
     }
-    out.push(mid_fn(mid, &r.props));
+    out.push(mid_fn(
+        mid,
+        if left.is_empty() {
+            &r.props
+        } else {
+            &continued
+        },
+    ));
     if !right.is_empty() {
         out.push(Run {
             text: right.to_string(),
-            props: r.props.clone(),
+            props: continued,
         });
     }
     out
