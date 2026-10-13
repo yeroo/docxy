@@ -3,10 +3,12 @@
 //! that works out each cell's fill and borders from a table style, the
 //! table's `w:tblLook`, and the direct `tblBorders`/`tcBorders`/`shd`.
 //!
-//! The resolver covers fill and borders only; a style's run formatting (a
-//! bold header row, white text) is not applied.
+//! It also resolves each cell's run formatting from the style (#765): bold,
+//! italic and colour (a bold header row, white text on a dark fill), which
+//! [`RunLook::under`] lays below a run's own formatting. A style's caps, size
+//! and fonts are not resolved.
 
-use crate::model::{Block, Document, Inline, Table, VMerge};
+use crate::model::{Block, Document, Inline, RunProps, Table, VMerge};
 use crate::table::{GridMap, cell_props, table_props};
 use crate::table_props::{BORDERS_ORDER, BorderLine, Edge, PropsXml, TblLook, border_of, shd_fill};
 use crate::xml::{Event, XmlParser};
@@ -482,12 +484,95 @@ pub fn table_style_ids_in_xml(xml: &str) -> Vec<String> {
 
 // ---- resolution ----
 
-/// Fill and borders from one part of a table style.
+/// Run formatting from a table style: each property `None` where the style
+/// leaves it to the parts below.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunLook {
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+    /// `RRGGBB`; `Some(None)` for automatic.
+    pub color: Option<Option<String>>,
+}
+
+impl RunLook {
+    /// Parse a style's `w:rPr`: `w:b`, `w:i` and `w:color`'s `w:val` (a
+    /// theme colour is taken at its `w:val`).
+    fn parse(rpr: &str) -> RunLook {
+        let props = PropsXml::parse(rpr, "w:rPr", &[]);
+        let toggle = |name: &str| {
+            props.get(name).map(|_| {
+                props
+                    .attr(name, "w:val")
+                    .is_none_or(|v| crate::styles::toggle(&v))
+            })
+        };
+        RunLook {
+            bold: toggle("w:b"),
+            italic: toggle("w:i"),
+            color: props.get("w:color").map(|_| {
+                props
+                    .attr("w:color", "w:val")
+                    .filter(|v| !v.is_empty() && v != "auto")
+                    .map(|v| v.to_ascii_uppercase())
+            }),
+        }
+    }
+
+    fn overlay(&mut self, other: &RunLook) {
+        if other.bold.is_some() {
+            self.bold = other.bold;
+        }
+        if other.italic.is_some() {
+            self.italic = other.italic;
+        }
+        if other.color.is_some() {
+            self.color = other.color.clone();
+        }
+    }
+
+    /// `run`'s formatting with this look below it, as Word lays a table
+    /// style under direct formatting: the style's bold or italic shows
+    /// unless the run sets its own (`<w:b w:val="0"/>` turns it off), and
+    /// its colour unless the run has a `w:color` (an explicit `auto` too).
+    pub fn under(&self, run: &RunProps) -> RunProps {
+        use crate::styles::has_raw_child;
+        let mut out = run.clone();
+        if let Some(b) = self
+            .bold
+            .filter(|_| !run.bold && !has_raw_child(&run.raw_props, "b"))
+        {
+            out.bold = b;
+        }
+        if let Some(i) = self
+            .italic
+            .filter(|_| !run.italic && !has_raw_child(&run.raw_props, "i"))
+        {
+            out.italic = i;
+        }
+        // An explicit `auto` colour loads as no colour, its element kept in
+        // the shadow. A shadow entry is written back only while it still
+        // matches the model, so only an `auto` one counts with no colour.
+        let explicit_auto = run.shadow.iter().any(|x| {
+            crate::table_props::element_name(x) == "w:color"
+                && crate::table_props::element_attr(x, "w:val")
+                    .is_none_or(|v| v.is_empty() || v == "auto")
+        });
+        if run.color.is_none() && !explicit_auto {
+            if let Some(c) = &self.color {
+                out.color = c.clone();
+            }
+        }
+        out
+    }
+}
+
+/// Fill, borders and run formatting from one part of a table style.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StylePart {
     /// `Some(None)`: explicitly no fill.
     pub fill: Option<Option<String>>,
     pub borders: Vec<(Edge, BorderLine)>,
+    pub run: RunLook,
 }
 
 impl StylePart {
@@ -498,6 +583,7 @@ impl StylePart {
         if other.fill.is_some() {
             self.fill = other.fill.clone();
         }
+        self.run.overlay(&other.run);
         for (e, l) in &other.borders {
             self.borders.retain(|(x, _)| x != e);
             self.borders.push((*e, l.clone()));
@@ -528,8 +614,11 @@ const EDGES: [Edge; 8] = [
     Edge::DiagUp,
 ];
 
-fn read_part(tblpr: Option<&str>, tcpr: Option<&str>) -> StylePart {
-    let mut part = StylePart::default();
+fn read_part(rpr: Option<&str>, tblpr: Option<&str>, tcpr: Option<&str>) -> StylePart {
+    let mut part = StylePart {
+        run: rpr.map(RunLook::parse).unwrap_or_default(),
+        ..StylePart::default()
+    };
     for (container, name, group) in [
         (tblpr, "w:tblPr", "w:tblBorders"),
         (tcpr, "w:tcPr", "w:tcBorders"),
@@ -568,7 +657,7 @@ pub fn parse_table_style(xml: &str) -> TableStyle {
         }
     }
     s.id = p.attr("w:styleId").to_string();
-    let (mut tblpr, mut tcpr) = (None, None);
+    let (mut rpr, mut tblpr, mut tcpr) = (None, None, None);
     loop {
         match p.next() {
             Event::Start => {
@@ -593,10 +682,11 @@ pub fn parse_table_style(xml: &str) -> TableStyle {
                         s.col_band = n("w:tblStyleColBandSize").unwrap_or(1);
                     }
                     "w:tcPr" => tcpr = Some(raw),
+                    "w:rPr" => rpr = Some(raw),
                     "w:tblStylePr" => {
                         let c = PropsXml::parse(raw, "w:tblStylePr", BORDERS_ORDER);
-                        s.conds
-                            .push((kind, read_part(c.get("w:tblPr"), c.get("w:tcPr"))));
+                        let part = read_part(c.get("w:rPr"), c.get("w:tblPr"), c.get("w:tcPr"));
+                        s.conds.push((kind, part));
                     }
                     _ => {}
                 }
@@ -605,7 +695,7 @@ pub fn parse_table_style(xml: &str) -> TableStyle {
             Event::Text => {}
         }
     }
-    s.whole = read_part(tblpr, tcpr);
+    s.whole = read_part(rpr, tblpr, tcpr);
     s
 }
 
@@ -650,6 +740,8 @@ pub struct CellLook {
     pub right: Option<BorderLine>,
     pub diag_down: Option<BorderLine>,
     pub diag_up: Option<BorderLine>,
+    /// The style's run formatting for the cell's text.
+    pub run: RunLook,
 }
 
 impl CellLook {
@@ -698,6 +790,7 @@ fn apply(
     if let Some(f) = &part.fill {
         look.fill = f.clone();
     }
+    look.run.overlay(&part.run);
     let pick = |outer: bool, o: Edge, i: Edge| {
         if outer { part.edge(o) } else { part.edge(i) }
     };
@@ -736,7 +829,7 @@ pub fn resolve(table: &Table, style: Option<&TableStyle>) -> Vec<Vec<CellLook>> 
     let map = GridMap::of(table);
     let tp = table_props(table);
     let look = tp.get("w:tblLook").map(TblLook::parse).unwrap_or_default();
-    let direct = read_part(table.raw_tblpr.as_deref(), None);
+    let direct = read_part(None, table.raw_tblpr.as_deref(), None);
     let nrows = table.rows.len();
     let ncols = map.width(table);
     let whole = Region {
@@ -868,7 +961,7 @@ pub fn resolve(table: &Table, style: Option<&TableStyle>) -> Vec<Vec<CellLook>> 
                 }
             }
             apply(&mut cl, &direct, &whole, rr, cc);
-            let own = read_part(None, cell.raw_tcpr.as_deref());
+            let own = read_part(None, None, cell.raw_tcpr.as_deref());
             let own_region = Region { rows: rr, cols: cc };
             apply(&mut cl, &own, &own_region, rr, cc);
             // A direct fill of `auto` is an explicit "no fill".
@@ -1041,5 +1134,123 @@ mod tests {
             body: vec![Block::Table(outer)],
         };
         assert_eq!(referenced_table_styles(&doc), ["PlainTable1", "TableGrid"]);
+    }
+
+    #[test]
+    fn a_header_row_is_bold_and_white_from_the_style_765() {
+        let st = lookup_style(None, "GridTable4-Accent1").unwrap();
+        let l = resolve(
+            &styled(3, 2, "GridTable4-Accent1", TblLook::default()),
+            Some(&st),
+        );
+        let white = RunLook {
+            bold: Some(true),
+            italic: None,
+            color: Some(Some(WHITE.into())),
+        };
+        assert_eq!(l[0][0].run, white);
+        assert_eq!(l[0][1].run, white);
+        // The first column is bold, in the text colour.
+        assert_eq!(l[1][0].run.bold, Some(true));
+        assert_eq!(l[1][0].run.color, None);
+        assert_eq!(l[1][1].run, RunLook::default());
+
+        let look = TblLook {
+            first_row: false,
+            first_col: false,
+            ..TblLook::default()
+        };
+        let l = resolve(&styled(3, 2, "GridTable4-Accent1", look), Some(&st));
+        assert!(l.iter().flatten().all(|c| c.run == RunLook::default()));
+    }
+
+    #[test]
+    fn run_formatting_follows_the_parts_precedence_765() {
+        let st = parse_table_style(
+            "<w:style w:type=\"table\" w:styleId=\"T\">\
+             <w:rPr><w:i/><w:color w:val=\"00ff00\" w:themeColor=\"accent6\"/></w:rPr>\
+             <w:tblStylePr w:type=\"band1Horz\"><w:rPr><w:color w:val=\"0000FF\"/></w:rPr></w:tblStylePr>\
+             <w:tblStylePr w:type=\"firstRow\"><w:rPr><w:b/><w:i w:val=\"0\"/>\
+             <w:color w:val=\"auto\"/></w:rPr></w:tblStylePr>\
+             <w:tblStylePr w:type=\"firstCol\"><w:rPr><w:color w:val=\"FF0000\"/></w:rPr></w:tblStylePr>\
+             </w:style>",
+        );
+        let look = TblLook {
+            first_row: true,
+            first_col: true,
+            banded_rows: true,
+            ..TblLook::default()
+        };
+        let l = resolve(&styled(3, 2, "T", look), Some(&st));
+        // Header row over the first column: bold, upright, automatic colour.
+        assert_eq!(
+            l[0][0].run,
+            RunLook {
+                bold: Some(true),
+                italic: Some(false),
+                color: Some(None)
+            }
+        );
+        // The first column over the band.
+        assert_eq!(l[1][0].run.color, Some(Some("FF0000".into())));
+        // The band over the whole table.
+        assert_eq!(l[1][1].run.color, Some(Some("0000FF".into())));
+        assert_eq!(l[1][1].run.italic, Some(true));
+        // The whole table alone, its theme colour taken at its value.
+        assert_eq!(l[2][1].run.color, Some(Some("00FF00".into())));
+        assert_eq!(l[2][1].run.bold, None);
+    }
+
+    #[test]
+    fn direct_run_formatting_beats_the_style_765() {
+        use crate::model::RunProps;
+        let style = RunLook {
+            bold: Some(true),
+            italic: Some(true),
+            color: Some(Some(WHITE.into())),
+        };
+        // Nothing direct: the style shows.
+        let r = style.under(&RunProps::default());
+        assert!(r.bold && r.italic);
+        assert_eq!(r.color.as_deref(), Some(WHITE));
+        // An explicit off and an explicit `auto` win, as loaded from a file.
+        let doc = crate::load::parse_document_xml(
+            "<w:document><w:body><w:p><w:r><w:rPr><w:b w:val=\"0\"/>\
+             <w:color w:val=\"auto\"/></w:rPr><w:t>x</w:t></w:r></w:p></w:body></w:document>",
+            &crate::load::Relationships::default(),
+        );
+        let Some(Block::Paragraph(p)) = doc.body.first() else {
+            panic!("a paragraph")
+        };
+        let Some(Inline::Run(run)) = p.content.first() else {
+            panic!("a run")
+        };
+        let r = style.under(&run.props);
+        assert!(!r.bold, "w:b w:val=0 beats the style");
+        assert!(r.italic);
+        assert_eq!(r.color, None, "an explicit auto colour beats the style");
+        // A shadow colour the run no longer has (its colour was cleared)
+        // is not an explicit one.
+        let cleared = RunProps {
+            shadow: vec!["<w:color w:val=\"FF0000\"/>".into()],
+            ..RunProps::default()
+        };
+        assert_eq!(style.under(&cleared).color.as_deref(), Some(WHITE));
+        // A direct colour wins.
+        let red = RunProps {
+            color: Some("FF0000".into()),
+            ..RunProps::default()
+        };
+        assert_eq!(style.under(&red).color.as_deref(), Some("FF0000"));
+        // A style that turns bold off leaves a direct bold alone.
+        let off = RunLook {
+            bold: Some(false),
+            ..RunLook::default()
+        };
+        let bold = RunProps {
+            bold: true,
+            ..RunProps::default()
+        };
+        assert!(off.under(&bold).bold);
     }
 }
