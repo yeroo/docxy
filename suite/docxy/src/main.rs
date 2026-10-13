@@ -27081,9 +27081,9 @@ fn control_keytip(c: &Control<Act>, key: &str) -> Option<Act> {
     match c {
         Control::Large(cmd) | Control::Toggle(cmd) => m(cmd),
         Control::Column(cmds) => cmds.iter().find_map(m),
-        // The primary's letter, then its menu's: Office reaches a split's
-        // menu items through the menu, which has no keyboard yet (#397).
-        Control::Split { primary, menu } => m(primary).or_else(|| menu.iter().find_map(m)),
+        // A split's letter opens its menu (`tab_keytip_split`), whose items
+        // take the next letter there (#1212): it runs nothing here.
+        Control::Split { .. } => None,
         // A drop-down's letter opens its menu (the button's own command).
         Control::Dropdown { cmd, .. } => m(cmd),
         Control::Rows(rows) => rows.iter().flatten().find_map(|cell| match cell {
@@ -27108,7 +27108,8 @@ fn tab_keytip_starts(tab: &rs::Tab<Act>, typed: &str) -> bool {
                 starts(cmd)
             }
             Control::Column(cmds) => cmds.iter().any(starts),
-            Control::Split { primary, menu } => starts(primary) || menu.iter().any(starts),
+            // A split's menu letters are its menu's own (#1212).
+            Control::Split { primary, .. } => starts(primary),
             Control::Rows(rows) => rows.iter().flatten().any(|cell| match cell {
                 rs::Cell::Btn(cmd) | rs::Cell::Combo { cmd, .. } => starts(cmd),
             }),
@@ -27122,6 +27123,23 @@ fn tab_keytip_cmd(tab: &rs::Tab<Act>, key: &str) -> Option<Act> {
         .iter()
         .flat_map(|g| g.items.iter())
         .find_map(|c| control_keytip(c, key))
+}
+
+/// The split button on a tab whose KeyTip is `key`: its primary's id. The
+/// letter opens the split's menu, and the next letter picks an item there,
+/// as a drop-down's does (#1212).
+fn tab_keytip_split(tab: &rs::Tab<Act>, key: &str) -> Option<&'static str> {
+    tab.groups
+        .iter()
+        .flat_map(|g| g.items.iter())
+        .find_map(|c| match c {
+            Control::Split { primary, .. }
+                if !primary.key_tip.is_empty() && primary.key_tip.eq_ignore_ascii_case(key) =>
+            {
+                Some(primary.id)
+            }
+            _ => None,
+        })
 }
 
 /// A large menu button's label, with the drop-down mark on its last line, as
@@ -30125,14 +30143,27 @@ impl Docxy {
                 // waits for the next.
                 let typed = format!("{}{c}", self.keytip_prefix);
                 let tab = self.active_ribbon_tab_def();
+                let split = tab_keytip_split(&tab, &typed);
                 let act = tab_keytip_cmd(&tab, &typed);
-                if act.is_none() && tab_keytip_starts(&tab, &typed) {
+                if split.is_none() && act.is_none() && tab_keytip_starts(&tab, &typed) {
                     self.keytip_prefix = typed;
                     return;
                 }
                 self.keytip_prefix.clear();
                 self.keytips = KeyTip::Off;
-                if let Some(a) = act {
+                if let Some(id) = split {
+                    // A split's letter only opens its menu, as a drop-down's
+                    // does: the item's letter runs (#1212). Under the button
+                    // when it is drawn, else under the ribbon (a KeyTip that
+                    // just switched tabs).
+                    self.ribbon_flyout = None;
+                    let at = split_menu_anchor(&self.probes.borrow(), id)
+                        .unwrap_or_else(|| point(px(12.), px(140.)));
+                    if let Err(e) = self.open_split_menu(id, at, cx) {
+                        self.set_status(e);
+                    }
+                    cx.notify();
+                } else if let Some(a) = act {
                     self.dispatch(a, window, cx);
                 } else {
                     cx.notify();

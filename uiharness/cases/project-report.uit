@@ -45,7 +45,7 @@ test every View Reports menu lists its reports
 
 test a dirty plan's report leaves it dirty with its history
   open copy:../fixtures/gantt-summary.xml
-  key alt p b
+  key alt p b b
   assert dirty is true
   key alt r c r
   assert exported is gantt-summary-resource-cost-overview.md

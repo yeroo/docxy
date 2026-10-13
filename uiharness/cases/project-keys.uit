@@ -48,7 +48,7 @@ test project editing keys and prompts
   type Alice
   key enter
   assert status is Assigned Alice
-  key alt p b
+  key alt p b b
   assert status is Baseline set — baseline bars now show under the current bars
   key ctrl+shift+l
   assert status is Resource leveling ON — bars delayed to fit resource capacity

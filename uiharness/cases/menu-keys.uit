@@ -106,3 +106,44 @@ test a modified chord closes the cell menu without cutting
   call menu-open {"target":{"cell":"C3"}}
   key ctrl+x
   assert menu is nothing
+
+test a split's key tip opens its menu and the next letter picks an item
+  open ../fixtures/gantt-summary.xml
+  # Alt, P, B opens Set Baseline's menu and runs nothing yet (#1212).
+  key alt p b
+  call menu-read {}
+  assert reply.open is true
+  assert reply.depth is 0
+  assert reply.highlight is nothing
+  assert reply.target.ribbon.2 is Set Baseline
+  assert reply.items.0.key_tip is B
+  assert reply.items.1.key_tip is L
+  assert status is not Baseline set — baseline bars now show under the current bars
+  # The menu's L runs Clear Baseline... and closes it.
+  key l
+  assert menu is nothing
+  assert status is No baseline to clear
+  # Its B runs Set Baseline..., and then L clears that baseline.
+  key alt p b b
+  assert menu is nothing
+  assert status is Baseline set — baseline bars now show under the current bars
+  key alt p b l
+  assert status is Baseline cleared
+
+test escape closes a split's menu opened by its key tip
+  open ../fixtures/gantt-summary.xml
+  key alt p b
+  call menu-read {}
+  assert reply.open is true
+  key escape
+  assert menu is nothing
+  assert status is not Baseline set — baseline bars now show under the current bars
+
+test the split's menu letter is no key tip of the tab
+  open ../fixtures/gantt-summary.xml
+  # L is Set Baseline's menu letter, not the Project tab's: Alt, P, L ends
+  # the KeyTips and runs nothing (#1212).
+  key alt p l
+  assert menu is nothing
+  assert status is not No baseline to clear
+  assert status is not Baseline cleared

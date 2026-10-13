@@ -1401,6 +1401,9 @@ equal to an item's one-character key tip runs that item like Enter, and any
 other character is swallowed; a modifier chord and any other key close the
 menu and are spent, Tab included. None reaches the document or cell under it.
 A press outside the menu closes it too.
+A split button's KeyTip opens its menu with nothing highlighted, as a
+drop-down's does, and the next letter is the menu's (Alt, P, B, then B or L,
+#1212); a split's item letters are no KeyTips of the tab.
 `project-menus.uit` drives the opening and clicking; `menu-keys.uit` drives
 the keyboard.
 
