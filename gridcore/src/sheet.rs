@@ -1579,8 +1579,13 @@ impl Sheet {
     }
 
     /// Hide or unhide a row, preserving its other `<row>` attributes (e.g. `ht`).
+    /// Unhiding ends a filter's hide: a row hidden again afterwards (by hand,
+    /// by the outline) is not filtered (#759).
     pub fn set_row_hidden(&mut self, row: u32, hidden: bool) {
         self.set_row_attr(row, "hidden", hidden.then_some("1"));
+        if !hidden {
+            self.filtered_rows.remove(&row);
+        }
     }
 
     /// The row's outline (grouping) level from its `<row outlineLevel="N">`
@@ -3501,5 +3506,16 @@ mod tests {
         s.set_row_filtered(4, true);
         s.set_row_hidden(4, false);
         assert!(!s.row_filtered(4));
+    }
+
+    #[test]
+    fn filtered_mark_cleared_by_unhide_then_hide() {
+        // #759: a filtered row unhid and then hidden by hand is hand-hidden.
+        let mut s = Sheet::default();
+        s.set_row_filtered(4, true);
+        s.set_row_hidden(4, false);
+        s.set_row_hidden(4, true);
+        assert!(s.row_hidden(4) && !s.row_filtered(4));
+        assert!(s.filtered_rows.is_empty());
     }
 }
