@@ -243,3 +243,47 @@ fn empty_run_in_empty_content_control_still_takes_typing() {
         assert!(inside.contains(inner), "{inner:?}: {p}");
     }
 }
+
+#[test]
+fn empty_run_declares_a_prefix_bound_below_the_part_root() {
+    // `x` is bound on `w:body` or a `w:tc`, neither of which the save keeps.
+    let run = "<w:r><w:rPr><x:foo/></w:rPr></w:r>";
+    let para = format!("<w:p>{run}<w:r><w:t>a</w:t></w:r></w:p>");
+    for xml in [
+        format!(
+            "<w:document xmlns:w=\"{W_NS}\"><w:body xmlns:x=\"urn:x\">{para}</w:body>\
+             </w:document>"
+        ),
+        format!(
+            "<w:document xmlns:w=\"{W_NS}\"><w:body><w:tbl><w:tr><w:tc xmlns:x=\"urn:x\">\
+             {para}</w:tc></w:tr></w:tbl></w:body></w:document>"
+        ),
+    ] {
+        let doc = parse_document_xml(&xml, &Relationships::default());
+        let saved = document_to_xml(&doc);
+        let declared = "<w:r xmlns:x=\"urn:x\"><w:rPr><x:foo/></w:rPr></w:r>";
+        assert!(saved.contains(declared), "{saved}");
+
+        // It reloads as the same empty run, which the next save keeps once.
+        let again = document_to_xml(&parse_document_xml(&saved, &Relationships::default()));
+        assert_eq!(again.matches(declared).count(), 1, "{again}");
+        assert_eq!(again.matches("<x:foo/>").count(), 1, "{again}");
+    }
+}
+
+#[test]
+fn a_raw_kept_run_declares_a_prefix_bound_below_the_part_root() {
+    // The same gap in a run kept whole for a footnote reference.
+    let run = "<w:r><w:rPr><x:foo/></w:rPr><w:footnoteReference w:id=\"1\"/></w:r>";
+    let xml = format!(
+        "<w:document xmlns:w=\"{W_NS}\"><w:body xmlns:x=\"urn:x\"><w:p>{run}</w:p></w:body>\
+         </w:document>"
+    );
+    let saved = document_to_xml(&parse_document_xml(&xml, &Relationships::default()));
+    assert!(
+        saved.contains(
+            "<w:r xmlns:x=\"urn:x\"><w:rPr><x:foo/></w:rPr><w:footnoteReference w:id=\"1\"/></w:r>"
+        ),
+        "{saved}"
+    );
+}

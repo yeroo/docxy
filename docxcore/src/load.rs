@@ -1961,15 +1961,19 @@ fn parse_numpr(p: &mut XmlParser, props: &mut ParProps) {
 /// Parse a `w:r` run into `out`. A run that held a drawing, field, etc. is
 /// kept whole: SmartArt becomes a text box, anything else is preserved
 /// verbatim. So is a run that produced no inline (only a `w:rPr`, say):
-/// a zero-width Raw keeps it on save (#1217).
+/// a zero-width Raw keeps it on save (#1217). Either raw declares the
+/// prefixes it uses that a save does not keep (see [`rebuilt_bindings`]).
 fn parse_run_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {
-    let start = p.start_pos();
+    let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
     let mut tmp = Vec::new();
     if parse_run(p, &mut tmp) {
-        let raw = p.raw_slice(start, p.pos()).to_string();
+        let raw = declare_rebuilt(p.raw_slice(start, p.pos()), &bindings);
         out.push(drawing_inline(raw, rels));
     } else if tmp.is_empty() {
-        out.push(Inline::Raw(p.raw_slice(start, p.pos()).to_string()));
+        out.push(Inline::Raw(declare_rebuilt(
+            p.raw_slice(start, p.pos()),
+            &bindings,
+        )));
     } else {
         out.extend(tmp);
     }
@@ -3095,6 +3099,7 @@ mod tests {
             "<w:r><w:rPr><w:noProof/></w:rPr></w:r>",
             "<w:r>\n  <w:rPr><w:b/></w:rPr>\n</w:r>",
             "<w:r><w:lastRenderedPageBreak/></w:r>",
+            "<w:r xmlns:x=\"urn:x\"><w:rPr><x:foo/></w:rPr></w:r>",
         ] {
             assert!(is_empty_run(raw), "{raw}");
         }
