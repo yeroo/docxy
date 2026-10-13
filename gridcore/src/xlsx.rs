@@ -724,9 +724,8 @@ fn parse_table_xml(xml: &str, sheet_idx: usize, part: &str) -> Option<Table> {
     // being read.
     let mut calculated: Vec<Option<String>> = Vec::new();
     let mut in_calc = false;
-    let mut cr = false;
     loop {
-        match next_text_event(&mut p, &mut cr) {
+        match p.next() {
             Event::Start => match local(p.name()) {
                 "table" => {
                     name = decode(p.attr("displayName"));
@@ -756,7 +755,7 @@ fn parse_table_xml(xml: &str, sheet_idx: usize, part: &str) -> Option<Table> {
             },
             Event::Text if in_calc => {
                 if let Some(Some(f)) = calculated.last_mut() {
-                    push_text(&p, f, &mut cr);
+                    push_text(&p, f);
                 }
             }
             Event::End if local(p.name()) == "calculatedColumnFormula" => in_calc = false,
@@ -894,10 +893,9 @@ fn rich_error_codes(
     // rdrichvalue.xml: each value's structure and positional values.
     let mut values: Vec<(usize, Vec<String>)> = Vec::new();
     let mut in_v = false;
-    let mut cr = false;
     let mut p = XmlParser::new(rich_values);
     loop {
-        match next_text_event(&mut p, &mut cr) {
+        match p.next() {
             Event::Start => match local(p.name()) {
                 "rv" => values.push((p.attr("s").parse().unwrap_or(usize::MAX), Vec::new())),
                 "v" => {
@@ -910,7 +908,7 @@ fn rich_error_codes(
             },
             Event::Text if in_v => {
                 if let Some(v) = values.last_mut().and_then(|(_, vs)| vs.last_mut()) {
-                    push_text(&p, v, &mut cr);
+                    push_text(&p, v);
                 }
             }
             Event::End if local(p.name()) == "v" => in_v = false,
@@ -1018,9 +1016,8 @@ fn parse_workbook_xml(
     let mut names = Vec::new();
     let mut p = XmlParser::new(xml);
     let mut cur_name: Option<(String, Option<usize>, String)> = None;
-    let mut cr = false;
     loop {
-        match next_text_event(&mut p, &mut cr) {
+        match p.next() {
             Event::Start => match local(p.name()) {
                 "sheet" => {
                     let name = decode(p.attr("name"));
@@ -1062,7 +1059,7 @@ fn parse_workbook_xml(
             },
             Event::Text => {
                 if let Some((_, _, f)) = &mut cur_name {
-                    push_text(&p, f, &mut cr);
+                    push_text(&p, f);
                 }
             }
             Event::End => {
@@ -1145,8 +1142,6 @@ fn parse_shared_strings(xml: &str) -> Vec<String> {
 struct TextRun {
     text: String,
     preserve: bool,
-    /// The last piece ended in a raw CR ([`push_text`]).
-    cr: bool,
 }
 
 impl TextRun {
@@ -1155,14 +1150,13 @@ impl TextRun {
         TextRun {
             text: String::new(),
             preserve: p.xml_space_preserve(),
-            cr: false,
         }
     }
 
     /// One piece of its character data (entities and CDATA arrive apart; a
     /// CDATA section is literal text, so `&amp;` in it stays as written).
     fn push(&mut self, p: &XmlParser) {
-        push_text(p, &mut self.text, &mut self.cr);
+        push_text(p, &mut self.text);
     }
 
     /// At `</t>`: append the text as read to `out`.
@@ -2526,10 +2520,8 @@ fn parse_cell_body(
     let mut in_v = false;
     let mut in_f = false;
     let mut is_run: Option<TextRun> = None;
-    // A `<v>` or `<f>` piece ended in a raw CR ([`push_text`]).
-    let mut cr = false;
     while depth > 0 {
-        match next_text_event(p, &mut cr) {
+        match p.next() {
             Event::Start => {
                 depth += 1;
                 match local(p.name()) {
@@ -2580,11 +2572,11 @@ fn parse_cell_body(
             Event::Text => {
                 if in_v {
                     if let Some(s) = &mut v_text {
-                        push_text(p, s, &mut cr);
+                        push_text(p, s);
                     }
                 } else if in_f {
                     if let Some(s) = &mut formula {
-                        push_text(p, s, &mut cr);
+                        push_text(p, s);
                     }
                 } else if let Some(run) = &mut is_run {
                     run.push(p);
@@ -3082,10 +3074,9 @@ fn remove_macro_names(
                 let scope = p.attr("localSheetId").parse::<usize>().ok();
                 let mut text = String::new();
                 let mut depth = 0usize;
-                let mut cr = false;
                 let end = loop {
-                    match next_text_event(&mut p, &mut cr) {
-                        Event::Text => push_text(&p, &mut text, &mut cr),
+                    match p.next() {
+                        Event::Text => push_text(&p, &mut text),
                         Event::Start => depth += 1,
                         Event::End if depth > 0 => depth -= 1,
                         Event::End => break Some(p.pos()),
@@ -6244,10 +6235,9 @@ fn patch_defined_name(
     let mut text = String::new();
     let mut depth = 0usize;
     let mut nested = false;
-    let mut cr = false;
     let body_end = loop {
-        match next_text_event(p, &mut cr) {
-            Event::Text => push_text(p, &mut text, &mut cr),
+        match p.next() {
+            Event::Text => push_text(p, &mut text),
             Event::Start => {
                 depth += 1;
                 nested = true;
@@ -7088,21 +7078,11 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
 /// A text event's content: CDATA as it stands, other text decoded, and
 /// either way with its line ends as XML 1.0 §2.11 has a parser read them
 /// before anything else: CR LF and a lone CR are LF, while a `&#13;`
-/// reference stays a real CR (#761). `cr` is whether the previous piece of
-/// the same text (a CDATA section or a comment splits it into pieces) ended
-/// in a raw CR, so an LF opening this piece ends no second line. Start it
-/// false at each tag.
-fn push_text(p: &XmlParser, out: &mut String, cr: &mut bool) {
-    let raw = p.text();
-    if raw.is_empty() {
-        return;
-    }
-    let raw = match std::mem::take(cr) {
-        true => raw.strip_prefix('\n').unwrap_or(raw),
-        false => raw,
-    };
-    *cr = raw.ends_with('\r');
-    let raw = normalise_eol(raw);
+/// reference stays a real CR (#761). Each event stands alone: a raw CR LF is
+/// never split across two plain-text events, and a CR and an LF with a CDATA
+/// section or a comment between them are two line ends.
+fn push_text(p: &XmlParser, out: &mut String) {
+    let raw = normalise_eol(p.text());
     if p.is_cdata() {
         out.push_str(&raw);
     } else {
@@ -7125,24 +7105,13 @@ pub(crate) fn normalise_eol(raw: &str) -> std::borrow::Cow<'_, str> {
 fn element_text(el: &str) -> String {
     let mut p = XmlParser::new(el);
     let mut out = String::new();
-    let mut cr = false;
     loop {
-        match next_text_event(&mut p, &mut cr) {
-            Event::Text => push_text(&p, &mut out, &mut cr),
+        match p.next() {
+            Event::Text => push_text(&p, &mut out),
             Event::Eof => return out,
             _ => {}
         }
     }
-}
-
-/// The parser's next event, with [`push_text`]'s `cr` cleared at anything
-/// but text: a tag ends the text a raw CR ended.
-fn next_text_event(p: &mut XmlParser, cr: &mut bool) -> Event {
-    let ev = p.next();
-    if ev != Event::Text {
-        *cr = false;
-    }
-    ev
 }
 
 /// Give each `tableColumn` of a table part (in the model's column order, as
@@ -11222,19 +11191,21 @@ mod tests {
         );
     }
 
-    /// #761: a CR ending one piece of a text and an LF opening the next (a
-    /// CDATA section or a comment between them) are one line end, while a CR
-    /// and an LF in two runs are two.
+    /// #761 r2: §2.11 joins a CR LF only when the two are adjacent in the
+    /// raw text, so a CR and an LF with a CDATA section, a comment or a tag
+    /// between them are two line ends (MSXML reads them so), while a CR LF
+    /// inside one CDATA section is one.
     #[test]
-    fn cr_lf_split_across_cdata_is_one_lf() {
+    fn cr_and_lf_split_by_markup_are_two_line_ends() {
         let sst = "<si><t xml:space=\"preserve\">a\r<![CDATA[\nb]]></t></si>\
             <si><t xml:space=\"preserve\"><![CDATA[a\r]]>\nb</t></si>\
             <si><t xml:space=\"preserve\">a\r<!-- x -->\nb</t></si>\
             <si><t xml:space=\"preserve\">a\r<![CDATA[]]>\nb</t></si>\
-            <si><r><t xml:space=\"preserve\">a\r</t></r><r><t xml:space=\"preserve\">\nb</t></r></si>";
+            <si><r><t xml:space=\"preserve\">a\r</t></r><r><t xml:space=\"preserve\">\nb</t></r></si>\
+            <si><t xml:space=\"preserve\"><![CDATA[a\r\nb]]></t></si>";
         assert_eq!(
             parse_shared_strings(&format!("<sst>{sst}</sst>")),
-            ["a\nb", "a\nb", "a\nb", "a\nb", "a\n\nb"]
+            ["a\n\nb", "a\n\nb", "a\n\nb", "a\n\nb", "a\n\nb", "a\nb"]
         );
     }
 
