@@ -109,7 +109,10 @@ pub(crate) struct Access {
     /// A document Word marked as final (#617): no edits and no saves until
     /// Edit Anyway. The package's own mark, read at every load, never the
     /// session's: Edit Anyway removes it from the package, so the hot-exit
-    /// copy carries the answer.
+    /// copy carries the answer while one is written (every full persist, and
+    /// an AutoRecover tick for an unsaved tab). A clean tab an AutoRecover
+    /// tick kept as its file alone (#1224) and restored after a crash asks
+    /// again.
     pub(crate) marked_final: bool,
 }
 
