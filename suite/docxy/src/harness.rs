@@ -5630,7 +5630,7 @@ fn dispatch_verb(
                 }
                 "paste-special" => {
                     return Err(
-                        "clipboard does not paste special: press the app's own key (key ctrl+alt+v) or menu-click Paste Special… on the Paste gallery"
+                        "clipboard does not paste special: press the app's own key (key ctrl+alt+v) or menu-click Paste Special… on the Paste menu, in a sheet or a document"
                             .into(),
                     );
                 }

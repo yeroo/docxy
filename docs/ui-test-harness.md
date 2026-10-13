@@ -915,8 +915,8 @@ an image, whose own text is empty: its clip stays ours.
 `write` needs `text` (an empty one is such a copy) and replies the same. Copy, cut and paste are the app's own keys and
 buttons (`key ctrl+c`, `ribbon-click {"tab":"Home","command":"Copy"}`), not
 actions of this verb, which refuses them and `paste-special` (press the app's
-own key, `key ctrl+alt+v`, or the gallery's Paste Special… through
-`menu-click`). `clipboard.uit` covers these.
+own key, `key ctrl+alt+v`, or Paste Special… on the Paste menu through
+`menu-click`, in a sheet or a document). `clipboard.uit` covers these.
 
 **Paste Special, the gallery, Paste Options, the Office Clipboard (#669).**
 `key ctrl+alt+v` (or `menu-open {"target":{"ribbon":["Home","Clipboard","Paste"]}}`
@@ -933,6 +933,21 @@ split button's menu. After a copy's paste, `menu-open {"target":{"grid":
 the state says it shows), whose items paste the last paste again that way as
 one undo step. `office-clipboard` drives the Clipboard group launcher's pane;
 an item pastes as values.
+
+**A document's paste choices (#753).** In a document Home > Paste is a split
+button too: `menu-open {"target":{"ribbon":["Home","Clipboard","Paste"]}}`
+lists Keep Source Formatting (key tip K, Paste itself), Keep Text Only (T) and
+Paste Special… (S), and Alt, H, V opens that menu as in Word. The document
+context menu has the same three after Paste (`cm-paste-keep-source`,
+`cm-paste-text-only`, `cm-paste-special`). Keep Text Only pastes the
+clipboard's text with the formatting typing at the caret would take, as one
+undo step. `key ctrl+alt+v` or Paste Special… opens the `doc-paste-special`
+dialog: its `as` radio lists only what the clipboard holds, Formatted Text
+(RTF) (the document's own copy, or another app's RTF) and Unformatted Text, so
+`dialog-set` of a format that is not there is refused with `has no item`;
+`dialog-click` OK pastes. With nothing to paste no dialog opens and the status
+reads `There is nothing to paste`. The sheet's cell menu has Paste Special…
+too. `doc-paste-special.uit` covers these.
 
 **`fill-drag`.** The `drag` verb presses the grid, so it only sweeps a
 selection; `fill-drag` does what a pointer on the fill handle does:
@@ -1250,8 +1265,8 @@ Menus open today:
   each running the Data tab's matching act (Custom Sort... is Data's Sort). `menu-open
   {"target":{"ribbon":["Home","Editing","Sort & Filter"]}}` or `ribbon-click`
   on the button opens it; `ribbon-click` on an item opens it and clicks it;
-- **the document menu** (Cut, Copy, Paste, Bold, Italic, Underline, New
-  Comment): right-click a document body. It never opens on a sheet or a
+- **the document menu** (Cut, Copy, Paste, Keep Source Formatting, Keep Text
+  Only, Paste Special…, Bold, Italic, Underline, New Comment): right-click a document body. It never opens on a sheet or a
   Project, and `menu-open {"target":"document"}` refuses on both;
 - **the ribbon menu** (#590): right-click the ribbon's tab strip or body, or
   `menu-open "ribbon-bar"`. One item, Collapse the Ribbon, ticked while the
@@ -1259,7 +1274,7 @@ Menus open today:
   document, sheet and Project tabs;
 - **the cell menu** on a sheet (#690, #691): right-click a cell. A cell outside
   the selection is selected first (no link followed; while a formula or a range
-  field is pointing, nothing moves). It lists Cut, Copy, Paste, the Filter and
+  field is pointing, nothing moves). It lists Cut, Copy, Paste, Paste Special…, the Filter and
   Sort submenus, New Comment and Pick From Drop-down List..., each a sheet
   command as the ribbon runs it;
 - **the pick list** on a sheet (#665): Alt+Down, the cell menu's Pick From
@@ -1302,7 +1317,7 @@ Menus open today:
 
 | Verb | Args | Reply |
 |---|---|---|
-| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, the Filter and Sort submenus, New Comment, Pick From Drop-down List...; #690, #691, #665), `"flash-fill"` (the Flash Fill Options button's menu: Undo Flash Fill, Accept suggestions, Select all N blank cells, Select all N changed cells; an error when no fill stands, #666), `"pick-list"` (Pick From Drop-down List over the selected cell, as Alt+Down opens it: the column block's distinct text entries, sorted; an empty list is an error naming why, #665), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task; a press inside the selected range keeps the range and the cursor, and the menu is still the clicked row's: its task items select that row before they run, its range items act on the range; #1213), `{"bar": <task uid>}` (a right-click on that task's Gantt bar, pressed where the bar is drawn now; #1207), `{"column": "<heading>"}` (a right-click on that entry-table heading, any case, pressed where it is drawn now; #1208), `{"ribbon": [tab, group, command]}` (on a sheet: Paste's gallery, Fill, Clear, Find & Select, Sort & Filter), `{"grid": "fill-options" \| "paste-options"}` (the button a fill or a paste left, #707) or `{"qat": "qat-undo"}` (the Quick Access Toolbar Undo arrow on a document or sheet tab; #619, #1149), `{"qat": "qat-redo"}` (a sheet tab's Redo arrow; #1149), `"ribbon-bar"` (the ribbon's right-click menu: Collapse the Ribbon, ticked while collapsed; #590) | the menu, as `menu-read` |
+| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, Paste Special…, the Filter and Sort submenus, New Comment, Pick From Drop-down List...; #690, #691, #665), `"flash-fill"` (the Flash Fill Options button's menu: Undo Flash Fill, Accept suggestions, Select all N blank cells, Select all N changed cells; an error when no fill stands, #666), `"pick-list"` (Pick From Drop-down List over the selected cell, as Alt+Down opens it: the column block's distinct text entries, sorted; an empty list is an error naming why, #665), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task; a press inside the selected range keeps the range and the cursor, and the menu is still the clicked row's: its task items select that row before they run, its range items act on the range; #1213), `{"bar": <task uid>}` (a right-click on that task's Gantt bar, pressed where the bar is drawn now; #1207), `{"column": "<heading>"}` (a right-click on that entry-table heading, any case, pressed where it is drawn now; #1208), `{"ribbon": [tab, group, command]}` (on a sheet: Paste's gallery, Fill, Clear, Find & Select, Sort & Filter; on a document: Paste's menu, #753), `{"grid": "fill-options" \| "paste-options"}` (the button a fill or a paste left, #707) or `{"qat": "qat-undo"}` (the Quick Access Toolbar Undo arrow on a document or sheet tab; #619, #1149), `{"qat": "qat-redo"}` (a sheet tab's Redo arrow; #1149), `"ribbon-bar"` (the ribbon's right-click menu: Collapse the Ribbon, ticked while collapsed; #590) | the menu, as `menu-read` |
 | `menu-read` | `{}` | `{open: true, target, items, highlight, depth}`, or `{open: false}`; `highlight` is the index of the item Up/Down have highlighted, or null; `depth` is the submenu level the menu sits at (0 where it opened, +1 per submenu entered in its place; #591) |
 | `menu-click` | `{label}` among the top-level items, `{path: [labels]}` through submenus, or `{index}`: the top-level item at that 0-based index, separators and headings not counted, for labels that repeat | `state` after the item's handler; the menu closes first |
 | `menu-close` | `{}` | `state`, as Esc leaves it |
