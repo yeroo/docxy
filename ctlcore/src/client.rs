@@ -126,12 +126,11 @@ impl Client {
         }
     }
 
-    /// A connection of its own, kept open for many calls, separate from the
-    /// one [`call`](Client::call) caches. The server reads one request per
-    /// line until the client closes, so a caller that calls in a tight loop
-    /// (the UI harness polling a terminal editor's counters, #1204) uses one
-    /// socket rather than one per call, which on Windows ran the ephemeral
-    /// ports out within a few thousand calls.
+    /// A connection the caller owns, separate from the one
+    /// [`call`](Client::call) caches, kept open for many calls. It needs
+    /// neither this `Client` nor its lock once made, so a caller can hold it
+    /// on its own (the UI harness polling a terminal editor's counters,
+    /// #1204).
     pub fn connect(&self) -> Result<Conn, String> {
         let stream = TcpStream::connect_timeout(&self.instance.addr(), Duration::from_millis(500))
             .map_err(|e| format!("connect failed: {e}"))?;
