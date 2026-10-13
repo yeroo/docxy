@@ -77,7 +77,15 @@ impl Currency {
     /// around the whole (`$1,400.00`, `($40,000.00)`, `1,400.00 €`).
     pub fn format(&self, units: f64) -> String {
         let scale = 10i128.pow(u32::from(self.digits));
-        let scaled = (units * scale as f64).round() as i128;
+        let exact = units * scale as f64;
+        // Past 2^53 an f64 holds no whole number of 3- or 4-digit units, so
+        // scaling it invents digits (`.9904`); MSPDI stores whole hundredths,
+        // so round to those and pad with zeros instead.
+        let scaled = if self.digits > 2 && exact.abs() >= 2f64.powi(53) {
+            (units * 100.0).round() as i128 * 10i128.pow(u32::from(self.digits) - 2)
+        } else {
+            exact.round() as i128
+        };
         let abs = scaled.unsigned_abs();
         let whole = (abs / scale.unsigned_abs()).to_string();
         let mut number = String::new();

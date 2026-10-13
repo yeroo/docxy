@@ -1828,6 +1828,13 @@ fn currency_formats_by_position_and_digits() {
     assert_eq!(dollars(3).format(0.0125), "$0.013");
     // A negative that rounds to zero shows no parentheses.
     assert_eq!(dollars(0).format(-0.4), "$0");
+    // Past 2^53 scaled units, 3 and 4 digits pad whole hundredths rather
+    // than show the f64's invented digits.
+    let big = 999_999_999_999_999.0 / 100.0;
+    assert_eq!(dollars(4).format(big), "$9,999,999,999,999.9900");
+    assert_eq!(dollars(3).format(-big), "($9,999,999,999,999.990)");
+    assert_eq!(dollars(2).format(big), "$9,999,999,999,999.99");
+    assert_eq!(dollars(0).format(big), "$10,000,000,000,000");
 }
 
 #[test]
@@ -1872,7 +1879,7 @@ const EURO_PLAN: &str = "<Project>\
     <ExtendedAttribute><FieldID>188743786</FieldID><Value>12550</Value></ExtendedAttribute>\
     <Baseline><Number>0</Number><Cost>100000</Cost></Baseline></Task>\
     <Task><UID>2</UID><ID>2</ID><Name>Cure</Name><OutlineLevel>1</OutlineLevel>\
-    <Duration>PT8H0M0S</Duration><FixedCostAccrual>3</FixedCostAccrual></Task>\
+    <Duration>PT8H0M0S</Duration><FixedCost>20000</FixedCost>    <FixedCostAccrual>3</FixedCostAccrual></Task>\
     <Task><UID>3</UID><ID>3</ID><Name>Strip</Name><OutlineLevel>1</OutlineLevel>\
     <Duration>PT8H0M0S</Duration><FixedCostAccrual>4</FixedCostAccrual></Task>\
     </Tasks>\
@@ -1944,7 +1951,11 @@ fn fixed_cost_accrual_defaults_to_plan() {
 fn currency_options_survive_save() {
     let mut ed = Editor::new(crate::mspdi::read_mspdi(EURO_PLAN).unwrap());
     // An edit that refreshes costs: task 2 goes under task 1.
-    ed.indent(1, 1).unwrap();
+    ed.indent(2, 1).unwrap();
+    // The refresh ran: Pour is now a summary and took Cure's fixed cost.
+    let pour = ed.project().task(1).unwrap();
+    assert!(pour.summary);
+    assert_eq!(pour.cost.as_ref().map(Rate::as_str), Some("160000"));
     let xml = crate::mspdi::write_mspdi(ed.project());
     for element in [
         "<CurrencySymbol>€</CurrencySymbol>",
@@ -1959,4 +1970,17 @@ fn currency_options_survive_save() {
     let back = crate::mspdi::read_mspdi(&xml).unwrap();
     assert_eq!(back.task(1).unwrap().fixed_cost_accrual, None);
     assert_eq!(Currency::of(&back), Currency::of(ed.project()));
+}
+
+#[test]
+fn a_huge_cost_reads_whole_hundredths_at_four_digits() {
+    let mut p = untitled_project();
+    p.options.push(("CurrencyDigits".into(), "4".into()));
+    p.extended_attribute_definitions = vec![custom_def("555000003", "Cost1")];
+    let mut t = task(1, "Pour", 480);
+    t.extended_attributes = vec![custom_value("555000003", "999999999999999")];
+    p.tasks = vec![t];
+    let r = read(&Editor::new(p), 1, "Cost1");
+    assert_eq!(r.text, "$9,999,999,999,999.9900");
+    assert_eq!(r.value, FieldValue::Money(9_999_999_999_999.99));
 }

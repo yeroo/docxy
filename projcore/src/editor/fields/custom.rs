@@ -137,7 +137,8 @@ fn value_read(
         // MSPDI stores every cost in hundredths, like the built-in costs. A
         // finite but huge value would saturate `Currency::format`'s i128
         // scaled units, so the text could disagree with the value; past 10
-        // trillion currency units (1e15 hundredths) read it as unparseable.
+        // trillion currency units (1e15 hundredths, below 2^53, so each whole
+        // hundredth up to it is exact) read it as unparseable.
         CustomKind::Cost => match raw
             .trim()
             .parse::<f64>()
