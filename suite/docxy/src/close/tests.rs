@@ -2261,6 +2261,80 @@ fn an_unreadable_sidecar_restored_unsaved_survives_the_startup_write() {
     assert_eq!(std::fs::read(&sidecar).unwrap(), b"not a workbook");
 }
 
+/// A session on disk that cannot be parsed (a newer build's, a damaged
+/// one) may name any sidecar: a write over it prunes nothing.
+#[test]
+fn a_write_over_an_unreadable_session_prunes_nothing() {
+    let root = Root::new("unreadable-session");
+    let hd = hot_dir_in(&root.0);
+    std::fs::create_dir_all(&hd).unwrap();
+    let planted = hd.join("tab-0-1.docx");
+    std::fs::write(&planted, b"named by the unreadable session").unwrap();
+    std::fs::write(session_path_in(&root.0), b"{ not a session").unwrap();
+    let mut tabs = vec![untitled(
+        "Alpha", "alpha
+",
+    )];
+    tabs[0].dirty = true;
+    write_session(&root.0, &tabs, 0, prefs(), &[], 0);
+    assert_eq!(root.session().tabs.len(), 1, "the new session is written");
+    assert_eq!(
+        std::fs::read(&planted).unwrap(),
+        b"named by the unreadable session"
+    );
+}
+
+/// A start that cannot read the session on disk sets it aside with its
+/// sidecars before its own write replaces it, so no later write's prune,
+/// which sees only sessions it can read, deletes the work it names.
+#[test]
+fn a_start_sets_an_unreadable_session_aside_with_its_sidecars() {
+    let root = Root::new("set-aside");
+    let hd = hot_dir_in(&root.0);
+    std::fs::create_dir_all(&hd).unwrap();
+    std::fs::write(hd.join("tab-0-1.docx"), b"first window").unwrap();
+    std::fs::write(hd.join("tab-w1-0-2.xlsx"), b"second window").unwrap();
+    std::fs::write(hd.join("readme.txt"), b"not a sidecar").unwrap();
+    std::fs::write(
+        session_path_in(&root.0),
+        b"{\"tabs\":[{\"kind\":\"Future\"}]}",
+    )
+    .unwrap();
+    let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+
+    let session = startup_session(&root.0, now);
+    assert!(session.tabs.is_empty());
+    let mut tabs = vec![untitled(
+        "Alpha", "alpha
+",
+    )];
+    tabs[0].dirty = true;
+    for _ in 0..3 {
+        write_session(&root.0, &tabs, 0, prefs(), &[], 0);
+    }
+    let aside = hd.join("unread-1700000000");
+    assert_eq!(
+        std::fs::read(aside.join("session.json")).unwrap(),
+        b"{\"tabs\":[{\"kind\":\"Future\"}]}"
+    );
+    assert_eq!(
+        std::fs::read(aside.join("tab-0-1.docx")).unwrap(),
+        b"first window"
+    );
+    assert_eq!(
+        std::fs::read(aside.join("tab-w1-0-2.xlsx")).unwrap(),
+        b"second window"
+    );
+    assert!(hd.join("readme.txt").exists(), "only sidecars move");
+    // A second unreadable session the same second gets its own folder.
+    std::fs::write(session_path_in(&root.0), b"damaged").unwrap();
+    startup_session(&root.0, now);
+    assert_eq!(
+        std::fs::read(hd.join("unread-1700000000-1").join("session.json")).unwrap(),
+        b"damaged"
+    );
+}
+
 #[test]
 fn nothing_is_pruned_when_the_session_cannot_be_written() {
     let root = Root::new("no-prune");

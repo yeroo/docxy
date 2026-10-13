@@ -10706,7 +10706,14 @@ fn write_session_with(
     hot_seq: usize,
 ) -> Vec<PersistTab> {
     let replaced = session_tabs_on_disk(root);
-    let own = write_sidecars(root, tabs, mode, &replaced, extra, hot_seq);
+    let own = write_sidecars(
+        root,
+        tabs,
+        mode,
+        replaced.as_deref().unwrap_or_default(),
+        extra,
+        hot_seq,
+    );
     let session = Session {
         tabs: own.iter().cloned().chain(extra.iter().cloned()).collect(),
         active,
@@ -10723,20 +10730,101 @@ fn write_session_with(
         user_name: prefs.user_name,
         user_initials: prefs.user_initials,
     };
-    if write_session_json(root, &session) {
-        prune_sidecars(&hot_dir_in(root), &session, &replaced);
+    // A session that is there but could not be read may name any sidecar:
+    // nothing is pruned until a write can see what it replaces.
+    if let Some(replaced) = replaced.filter(|_| !prune_held(root)) {
+        if write_session_json(root, &session) {
+            prune_sidecars(&hot_dir_in(root), &session, &replaced);
+        }
+    } else {
+        write_session_json(root, &session);
     }
     own
 }
 
-/// The tabs of the session on disk under `root`; none when it is missing
-/// or unreadable.
-fn session_tabs_on_disk(root: &std::path::Path) -> Vec<PersistTab> {
-    std::fs::read(session_path_in(root))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Session>(&bytes).ok())
-        .map(|s| s.tabs)
-        .unwrap_or_default()
+/// The tabs of the session on disk under `root`: none when there is no
+/// file, `None` when one is there but cannot be read or parsed (a newer
+/// build's, a damaged one, one held open elsewhere).
+fn session_tabs_on_disk(root: &std::path::Path) -> Option<Vec<PersistTab>> {
+    match std::fs::read(session_path_in(root)) {
+        Ok(bytes) => serde_json::from_slice::<Session>(&bytes)
+            .ok()
+            .map(|s| s.tabs),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Vec::new()),
+        Err(_) => None,
+    }
+}
+
+/// The session a start restores from `root`. One that is there but cannot
+/// be read or parsed restores nothing, and this start's write replaces it,
+/// so it is set aside first with every sidecar it may name
+/// ([`set_aside_unread_session`], #1224): no later prune, which sees only
+/// the new session, may delete the unsaved work it holds.
+fn startup_session(root: &std::path::Path, now: std::time::SystemTime) -> Session {
+    let read = match std::fs::read(session_path_in(root)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Session::default(),
+        read => read.ok(),
+    };
+    if let Some(session) = read.and_then(|b| serde_json::from_slice(&b).ok()) {
+        return session;
+    }
+    if !set_aside_unread_session(root, now) {
+        hold_prune(root);
+    }
+    Session::default()
+}
+
+/// Move `root`'s unreadable `session.json` and every top-level `tab-…`
+/// sidecar into a new `hot/unread-{secs}` folder, which no prune touches,
+/// for recovery by hand or by a later build. Whether everything moved.
+fn set_aside_unread_session(root: &std::path::Path, now: std::time::SystemTime) -> bool {
+    let hd = hot_dir_in(root);
+    let secs = now
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let Some(dir) = (0..)
+        .map(|n| match n {
+            0 => hd.join(format!("unread-{secs}")),
+            n => hd.join(format!("unread-{secs}-{n}")),
+        })
+        .find(|d| std::fs::symlink_metadata(d).is_err())
+    else {
+        return false;
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let mut moved = std::fs::rename(session_path_in(root), dir.join("session.json")).is_ok();
+    if let Ok(entries) = std::fs::read_dir(&hd) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("tab-")
+                && entry.file_type().is_ok_and(|t| t.is_file())
+            {
+                moved &= std::fs::rename(entry.path(), dir.join(&name)).is_ok();
+            }
+        }
+    }
+    moved
+}
+
+/// The config roots whose sidecars no write may prune for the rest of the
+/// run: an unreadable session there could not be set aside (#1224).
+fn held_prunes() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    static HELD: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    HELD.get_or_init(Default::default)
+}
+
+fn hold_prune(root: &std::path::Path) {
+    if let Ok(mut held) = held_prunes().lock() {
+        held.insert(root.to_path_buf());
+    }
+}
+
+fn prune_held(root: &std::path::Path) -> bool {
+    held_prunes().lock().is_ok_and(|held| held.contains(root))
 }
 
 /// The first phase of [`write_session_with`]: each kept tab's sidecar,
@@ -11970,10 +12058,7 @@ mod frame_border_tests {
 impl Docxy {
     fn new(cx: &mut Context<Self>) -> Self {
         let root = config_root();
-        let session: Session = std::fs::read(session_path_in(&root))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        let session = startup_session(&root, std::time::SystemTime::now());
         set_configured_identity(&session.user_name, &session.user_initials);
         // Asked before this run writes its own marker.
         let crashed = recover::was_unclean(&root);

@@ -803,8 +803,8 @@ impl Docxy {
             self.active = i;
             self.drop_grid_state();
         }
-        // Kept before removal: the persist below deletes the sidecar
-        // once the session no longer names it (#1224).
+        // Kept before removal: a later persist deletes the sidecar once
+        // no session on disk names it (#1224).
         let mut draft_error = None;
         if let Some(kept) = keep_closed_draft(
             &config_root(),
