@@ -56,25 +56,21 @@ fn should_keep_draft(
     discarded && kind == Kind::Xlsx && minutes > 0 && keep && last_hot.is_some()
 }
 
-/// Keep `tab`'s draft under `root` when [`should_keep_draft`] says so:
-/// `None` when it does not, else where the draft went or why it was not kept.
-fn keep_closed_draft(
+/// Keep `tab`'s draft under `root` when [`should_keep_draft`] says so, the
+/// tab `discarded` (a Don't Save close, or Document Recovery's original,
+/// #1225): `None` when it does not, else where the draft went or why it was
+/// not kept.
+pub(crate) fn keep_closed_draft(
     root: &std::path::Path,
     tab: &DocTab,
-    step: &CloseStep,
+    discarded: bool,
     minutes: u32,
     keep: bool,
     now: std::time::SystemTime,
 ) -> Option<Result<PathBuf, String>> {
     let last_hot = tab.last_hot.borrow();
     let sidecar = last_hot.as_deref();
-    if !should_keep_draft(
-        tab.kind,
-        minutes,
-        keep,
-        *step == CloseStep::Discard,
-        sidecar,
-    ) {
+    if !should_keep_draft(tab.kind, minutes, keep, discarded, sidecar) {
         return None;
     }
     sidecar.map(|s| recover::keep_draft(root, &tab.title, s, now))
@@ -308,6 +304,13 @@ fn close_step(tab: &mut DocTab, answer: Option<CloseAnswer>) -> CloseStep {
         Some(CloseAnswer::Cancel) => CloseStep::Keep,
         None => CloseStep::Ask,
     }
+}
+
+/// Whether a close prompt for `tab` would go unseen: under a dialog of its
+/// own, or under the app's (Document Recovery, #1225), which is shown over
+/// every tab's. Either is closed first, so the close or quit stops there.
+pub(crate) fn prompt_hidden(tab: &DocTab, app_dialogs: &crate::dialog::DialogStack) -> bool {
+    tab.dialogs.is_open() || app_dialogs.is_open()
 }
 
 /// What a tab with a dialog open says when it is asked to close: the
@@ -809,7 +812,7 @@ impl Docxy {
         if let Some(kept) = keep_closed_draft(
             &config_root(),
             &self.tabs[i],
-            &step,
+            step == CloseStep::Discard,
             self.autorecover_minutes,
             self.keep_drafts,
             std::time::SystemTime::now(),
@@ -1113,7 +1116,7 @@ impl Docxy {
             let _ = keep_closed_draft(
                 &root,
                 &self.tabs[i],
-                &CloseStep::Discard,
+                true,
                 self.autorecover_minutes,
                 self.keep_drafts,
                 now,
@@ -1151,7 +1154,7 @@ impl Docxy {
         let next = next_to_ask(&self.tabs, &self.quit_discards);
         match next {
             None => self.finish_quit(window, cx),
-            Some(i) if self.tabs[i].dialogs.is_open() => {
+            Some(i) if prompt_hidden(&self.tabs[i], &self.app_dialogs) => {
                 self.quit_cancelled(cx);
                 self.refuse_close_under_dialog(i, window, cx);
             }

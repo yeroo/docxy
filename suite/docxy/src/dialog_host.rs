@@ -143,6 +143,8 @@ fn apply_dialog(
         DialogOwner::SaveOnClose { .. } => Err("closing a tab applies through the app".into()),
         // Handled in `user_name::click`, before this: it is the app's.
         DialogOwner::UserName => Err("the user name is an app setting".into()),
+        // Handled in `doc_recovery::click`, before this: it replaces tabs.
+        DialogOwner::DocumentRecovery => Err("document recovery applies through the app".into()),
         // Handled in `Docxy::about_click`, before this: it only copies or closes.
         DialogOwner::About => Err("the About dialog only copies or closes".into()),
         #[cfg(test)]
@@ -182,6 +184,7 @@ pub(crate) fn presses_through_app(owner: &DialogOwner) -> bool {
         || matches!(
             owner,
             DialogOwner::UserName
+                | DialogOwner::DocumentRecovery
                 | DialogOwner::About
                 | DialogOwner::SaveOnClose { .. }
                 | DialogOwner::Series
@@ -429,6 +432,10 @@ impl Docxy {
     ) -> Result<(), String> {
         // The user name is the app's setting, not the tab's (#620).
         if let Some(done) = self.user_name_click(button, cx) {
+            return done;
+        }
+        // So is Document Recovery, which replaces tabs (#1225).
+        if let Some(done) = self.document_recovery_click(button, cx) {
             return done;
         }
         // About's Copy and Close are the app's too (#1023).

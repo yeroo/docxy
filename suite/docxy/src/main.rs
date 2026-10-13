@@ -48,6 +48,7 @@ mod doc_import_tests;
 mod doc_name;
 #[cfg(test)]
 mod doc_protected_tests;
+mod doc_recovery;
 mod doc_templates;
 #[cfg(test)]
 mod doc_templates_tests;
@@ -4747,6 +4748,12 @@ struct Docxy {
     /// open, where there is no tab's stack to hold it (#1027). While one is
     /// open it is the one shown and keyed, even if a tab arrives under it.
     app_dialogs: dialog::DialogStack,
+    /// The tabs Document Recovery's items stand for, by index and path, while
+    /// it is open (#1225).
+    recovery: Vec<(usize, PathBuf)>,
+    /// The tabs restore labelled recovered, until the window opens and
+    /// Document Recovery is offered over them (#1225).
+    recovery_pending: Vec<doc_recovery::Recovered>,
     bs_new: bool,
     /// Vertical scroll of the backstage's content pane and of its rail
     /// (#1028). The content one is reset when the page changes.
@@ -11723,16 +11730,30 @@ fn restore_tab_content(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
 /// its own status (a load error included), since it holds no recovered edits.
 /// A recovered tab's `path` still names the original, which restore never
 /// writes: that waits for the user's Save.
+#[cfg(test)]
 fn restore_session(
     session: &Session,
     crashed: bool,
     now: std::time::SystemTime,
     trusted: &trusted::TrustStore,
 ) -> Vec<DocTab> {
-    session
+    restore_session_noting(session, crashed, now, trusted).0
+}
+
+/// [`restore_session`], plus the tabs it labelled as AutoRecover copies,
+/// which Document Recovery offers to swap for their originals (#1225).
+fn restore_session_noting(
+    session: &Session,
+    crashed: bool,
+    now: std::time::SystemTime,
+    trusted: &trusted::TrustStore,
+) -> (Vec<DocTab>, Vec<doc_recovery::Recovered>) {
+    let mut recovered = Vec::new();
+    let tabs = session
         .tabs
         .iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(index, t)| {
             let (mut tab, from_hot) = restore_tab_sourced(t, trusted);
             if crashed && from_hot && tab.dirty {
                 let saved = t
@@ -11741,10 +11762,16 @@ fn restore_session(
                     .and_then(|h| std::fs::metadata(h).ok())
                     .and_then(|m| m.modified().ok());
                 tab.status = recover::recovered_status(saved, now).into();
+                recovered.push(doc_recovery::Recovered {
+                    index,
+                    path: tab.path.clone(),
+                    saved,
+                });
             }
             tab
         })
-        .collect()
+        .collect();
+    (tabs, recovered)
 }
 
 /// The hot-sidecar file stem for tab `i` of the window with registry seq
@@ -12072,12 +12099,9 @@ impl Docxy {
         let crashed = recover::was_unclean(&root);
         recover::mark_running(&root);
 
-        let mut tabs = restore_session(
-            &session,
-            crashed,
-            std::time::SystemTime::now(),
-            &trusted::TrustStore::load(&root),
-        );
+        let now = std::time::SystemTime::now();
+        let (mut tabs, recovered) =
+            restore_session_noting(&session, crashed, now, &trusted::TrustStore::load(&root));
         if tabs.is_empty() {
             tabs.push(sample_doc().into_tab(Kind::Docx, "sample.docx".into(), None, false));
         }
@@ -12117,6 +12141,9 @@ impl Docxy {
         sheet_autocorrect::stamp_autocorrect(&mut this.tabs, &this.autocorrect);
         this.user_name = session.user_name;
         this.user_initials = session.user_initials;
+        // After a crash, each recovered document's original is offered once
+        // the startup files are open (#1225).
+        this.recovery_pending = recovered;
         // win_id is 0 until the window registers: the write below behaves
         // exactly like the single-window write this was (no union, base 0).
         this.persist_to(&root, SessionWrite::All, cx);
@@ -12146,6 +12173,8 @@ impl Docxy {
             ribbon_min: false,
             backstage: false,
             app_dialogs: dialog::DialogStack::default(),
+            recovery: Vec::new(),
+            recovery_pending: Vec::new(),
             bs_new: false,
             bs_export: false,
             bs_templates: Vec::new(),
@@ -39226,6 +39255,13 @@ fn open_docxy_window(
                     this.open_args(startup_files, read_only, cx)
                 });
             }
+            // Then Document Recovery after a crash (#1225), over whatever
+            // they opened: on the app's stack, so it covers every tab, and
+            // after them, so their own questions stay on their tabs.
+            view.update(cx, |this, cx| {
+                this.open_document_recovery();
+                cx.notify();
+            });
             // Hot-exit: capture the latest (possibly unsaved) content when
             // the window is closed, so a restart restores exactly what was
             // open. By default closing is silent; with "ask before closing"

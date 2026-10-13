@@ -1,6 +1,7 @@
 //! Desktop-only check of AutoRecover (#632): an unsaved edit that an
 //! AutoRecover tick wrote survives a kill, and the relaunch offers it as a
-//! recovered, unsaved copy without touching the original file.
+//! recovered, unsaved copy without touching the original file, behind
+//! Document Recovery's choice of the copy or the original (#1225).
 //! Run after building suite:
 //! cargo test -p uiharness --test autorecover -- --ignored --nocapture
 use ctlcore::json::Json;
@@ -77,14 +78,23 @@ fn a_killed_instance_relaunches_with_the_autorecover_copy() {
 
     let app = launch::launch(&exe, &sandbox).unwrap();
     let driver = Driver::connect(&app.ctl_dir(), None).unwrap();
+    // #1225: Document Recovery opens first, the recovered copy checked;
+    // Cancel keeps it, as OK with it checked would.
+    assert_recovery_offered(&driver);
+    call(
+        &driver,
+        "dialog-click",
+        &[("button", Json::Str("Cancel".into()))],
+    );
     let state = call(&driver, "tab-select", &[("tab", Json::Str("basic".into()))]);
     assert_eq!(state.get("dirty"), Some(&Json::Bool(true)), "{state}");
     let status = state.get_str("status").unwrap_or_default();
     assert!(status.starts_with("recovered"), "{state}");
+    // AutoCorrect (#667) capitalises the sentence's first letter.
     let doc = call(&driver, "doc", &[]);
     assert!(
         doc.get_str("text")
-            .is_some_and(|t| t.contains("recover me")),
+            .is_some_and(|t| t.to_lowercase().contains("recover me")),
         "{doc}"
     );
     assert_eq!(
@@ -92,7 +102,85 @@ fn a_killed_instance_relaunches_with_the_autorecover_copy() {
         before,
         "the original is untouched"
     );
+
+    // Crash again with the copy still unsaved, and relaunch as a double
+    // click on another file does: the dialog opens after that file, over
+    // every tab, and nothing reaches a tab under it (#1225 r1 M1). This time
+    // uncheck it: OK reopens the original as last saved.
+    let tick = call(&driver, "autorecover-now", &[]);
+    assert_eq!(tick.get("wrote"), Some(&Json::Bool(true)), "{tick}");
+    drop(driver);
+    drop(app);
+    let other = sandbox.join("other.docx");
+    std::fs::copy(root.join("fixtures/basic.docx"), &other).unwrap();
+    let sandbox_abs = std::path::absolute(&sandbox).unwrap();
+    let child = launch::command(&exe, &sandbox_abs, std::env::vars_os())
+        .arg(&other)
+        .spawn()
+        .unwrap();
+    let app = uiharness::launch::Launched::adopt(child, &exe, &sandbox_abs);
+    let driver = Driver::connect(&app.ctl_dir(), None).unwrap();
+    assert_recovery_offered(&driver);
+    let list = call(&driver, "tab-list", &[]);
+    let (Some(Json::Num(active)), Some(Json::Arr(tabs))) = (list.get("active"), list.get("tabs"))
+    else {
+        panic!("{list}")
+    };
+    assert_eq!(
+        tabs[*active as usize].get_str("title"),
+        Some("other.docx"),
+        "the startup file opened under the dialog: {list}"
+    );
+    let refused = driver.call(
+        "tab-select",
+        Json::obj(vec![("tab", Json::Str("basic".into()))]),
+    );
+    assert!(refused.is_err(), "{refused:?}");
+    call(
+        &driver,
+        "dialog-set",
+        &[
+            ("control", Json::Str("documents".into())),
+            ("value", Json::Bool(false)),
+        ],
+    );
+    let ok = call(
+        &driver,
+        "dialog-click",
+        &[("button", Json::Str("OK".into()))],
+    );
+    assert_eq!(
+        ok.get("dialog").and_then(|d| d.get("open")),
+        Some(&Json::Bool(false)),
+        "{ok}"
+    );
+    let state = call(&driver, "tab-select", &[("tab", Json::Str("basic".into()))]);
+    assert_eq!(state.get("dirty"), Some(&Json::Bool(false)), "{state}");
+    let status = state.get_str("status").unwrap_or_default();
+    assert!(status.starts_with("original opened"), "{state}");
+    let doc = call(&driver, "doc", &[]);
+    assert!(
+        doc.get_str("text")
+            .is_some_and(|t| !t.to_lowercase().contains("recover me")),
+        "{doc}"
+    );
+    assert_eq!(std::fs::read(&original).unwrap(), before);
     app.shutdown(Some(&driver));
+}
+
+/// The relaunch after a crash shows Document Recovery over one recovered
+/// document, checked.
+fn assert_recovery_offered(driver: &Driver) {
+    let d = call(driver, "dialog-read", &[]);
+    assert_eq!(d.get_str("id"), Some("document-recovery"), "{d}");
+    let Some(Json::Arr(controls)) = d.get("controls") else {
+        panic!("{d}")
+    };
+    assert_eq!(
+        controls[0].get("value"),
+        Some(&Json::Arr(vec![Json::Bool(true)])),
+        "{d}"
+    );
 }
 
 /// #613: Excel's "Keep the last AutoRecovered version if I close without

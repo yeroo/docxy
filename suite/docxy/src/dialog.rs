@@ -108,6 +108,9 @@ pub(crate) enum DialogOwner {
     /// Settings' User name... (#620): the reviewer name and initials new
     /// comments carry. An app setting, applied by `user_name::click`.
     UserName,
+    /// Document Recovery (#1225), after a crash: which recovered documents
+    /// keep their AutoRecover copy. The app's (`doc_recovery::click`).
+    DocumentRecovery,
     /// File > Account's About docxy suite (#1023): the build's rows, Copy and
     /// Close. Its presses are the app's (`Docxy::about_click`), before the tab's.
     About,
