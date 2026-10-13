@@ -11607,10 +11607,13 @@ pub(crate) fn now_local(utc_secs: i64, offset_secs: i64) -> docxcore::field::Dat
 }
 
 /// Now on the local clock, which DATE and TIME fields and Insert Date and
-/// Time show, as Word does (#768).
+/// Time show, as Word does (#768): the OS's zone offset, as Excel's NOW()
+/// reads it (`gridcore::clock`).
 pub(crate) fn local_clock() -> docxcore::field::DateTime {
-    let now = chrono::Local::now();
-    now_local(now.timestamp(), i64::from(now.offset().local_minus_utc()))
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    now_local(secs, gridcore::clock::local_offset_minutes() * 60)
 }
 
 /// What a field inserted into `tab` evaluates against: the local clock, the
@@ -28998,9 +29001,6 @@ fn para_base(p: &Paragraph, zoom: f32) -> f32 {
     }
 }
 
-/// The drawn width (px) of one inline of a paragraph whose base size is
-/// `base`, as `paragraph_el` draws it; inlines with no measured text are
-/// 0. Tab segments and frames with no `w` both use it.
 /// An alignment tab (`w:ptab`, #768): where it aligns the text after it,
 /// and whether it measures from the paragraph's indents rather than the
 /// margins.
@@ -29069,6 +29069,10 @@ fn picture_frame_px(cx: i64, cy: i64, zoom: f32) -> (f32, f32) {
     (px_of(cx), px_of(cy))
 }
 
+/// The drawn width (px) of one inline of a paragraph whose base size is
+/// `base`, as `paragraph_el` draws it; an inline picture counts its frame's
+/// width, and other inlines with no measured text are 0. Tab segments and
+/// frames with no `w` both use it.
 fn inline_width(
     it: &Inline,
     base: f32,

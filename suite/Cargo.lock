@@ -1575,7 +1575,6 @@ name = "docxy"
 version = "0.1.0"
 dependencies = [
  "buildinfo",
- "chrono",
  "ctlcore",
  "dirs 5.0.1",
  "docxcore",
