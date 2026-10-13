@@ -89,6 +89,8 @@ mod save_preserve_tests;
 mod sect_pr_tests;
 mod sheet_autocorrect;
 #[cfg(test)]
+mod sheet_circular_tests;
+#[cfg(test)]
 mod sheet_clip_tests;
 mod sheet_complete;
 mod sheet_consolidate;
@@ -160,6 +162,7 @@ use gpui_component::{
     tooltip::Tooltip,
     v_flex,
 };
+use gridcore::circular::CIRCULAR_WARNING;
 use gridcore::options::{EditOptions, EnterMove};
 use ribbonspec::{self as rs, Control};
 use rust_embed::RustEmbed;
@@ -784,6 +787,9 @@ struct SheetView {
     /// Circle Invalid Data's circles: (sheet, row, col). View state, never
     /// saved, and a circle goes when its cell is valid (#689).
     circles: Vec<(usize, u32, u32)>,
+    /// How many cells were on circular references when the view last
+    /// looked ([`SheetView::circles_grew`]): an edit that raises it warns.
+    circ_seen: usize,
     /// Leftmost visible column (horizontal scroll offset). Columns virtualize by
     /// offset — rendered `col0..=cend` — so columns past the viewport are
     /// reachable (raw gpui can't wrap the virtualized row list in an h-scroller).
@@ -3114,6 +3120,18 @@ impl SheetView {
         n
     }
 
+    /// Whether an edit put more cells on circular references than the view
+    /// last saw, while circles are shown (#759). The count, as xlsxy's
+    /// structural edits compare it: inserting a row above a circle moves it
+    /// without making one.
+    fn circles_grew(&mut self) -> bool {
+        let n = self.engine.circular_keys().count();
+        let grew = n > self.circ_seen
+            && gridcore::circular::circles_shown(&self.engine, &self.pkg.workbook);
+        self.circ_seen = n;
+        grew
+    }
+
     /// Clear Validation Circles.
     fn clear_circles(&mut self) {
         self.circles.clear();
@@ -4109,6 +4127,8 @@ impl SheetView {
             self.circles.clear();
         }
         self.prune_circles();
+        // An undo or redo brings circles back without making them.
+        self.circ_seen = self.engine.circular_keys().count();
     }
     /// The selection rectangle as (r0, c0, r1, c1), top-left to bottom-right:
     /// the active area of a multi-area selection.
@@ -4713,6 +4733,42 @@ impl DocTab {
     fn set_dirty(&mut self) {
         self.dirty = true;
         bump_edit_generation();
+    }
+
+    /// Every edit of a workbook ends here ([`Docxy::mark_sheet_dirty`]). In
+    /// Protected View that means a gate before it leaked: the edit is rolled
+    /// back instead ([`protected_rollback`]), so the tab never turns dirty.
+    fn sheet_edited(&mut self) {
+        if self.access.protected {
+            protected_rollback(self);
+            return;
+        }
+        self.set_dirty();
+        self.warn_new_circles(None);
+        // An edit may have made a circled value valid (Delete, a fill, a sort).
+        if let Surface::Sheet(v) = &mut self.surface {
+            v.prune_circles();
+        }
+    }
+
+    /// Excel's circular-reference warning after a sheet edit that made a
+    /// new circle (#759). An ordinary commit sets no status, so the one left
+    /// from before ("loaded — 2 sheets") gives way to the warning. A command
+    /// that set its own status since `before` ("Sorted 4 rows") keeps it,
+    /// with the warning after, as xlsxy does.
+    fn warn_new_circles(&mut self, before: Option<&SharedString>) {
+        let Surface::Sheet(v) = &mut self.surface else {
+            return;
+        };
+        if !v.circles_grew() {
+            return;
+        }
+        self.status = match before {
+            Some(b) if *b != self.status && !self.status.is_empty() => {
+                format!("{}. {CIRCULAR_WARNING}", self.status).into()
+            }
+            _ => CIRCULAR_WARNING.into(),
+        };
     }
 }
 
@@ -8151,6 +8207,13 @@ pub(crate) fn sheet_app_state(v: &SheetView) -> AppState {
     }
 }
 
+/// Excel's status-bar note while a circular reference exists, naming the
+/// first (#759); none with iterative calculation on.
+fn sheet_circular_word(v: &SheetView) -> Option<String> {
+    gridcore::circular::first_circular_ref(&v.engine, &v.pkg.workbook, v.active)
+        .map(|r| format!("Circular References: {r}"))
+}
+
 /// The words the sheet status bar shows for the Editing options in force.
 fn sheet_status_words(opts: &EditOptions) -> Vec<&'static str> {
     let mut words = Vec::new();
@@ -10359,6 +10422,7 @@ fn new_sheet_surface() -> Surface {
         dv_then: DvThen::Move(0, 0),
         tab_run: None,
         circles: Vec::new(),
+        circ_seen: engine.circular_keys().count(),
         engine,
         undo: vec![],
         redo: vec![],
@@ -10444,6 +10508,7 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                     dv_then: DvThen::Move(0, 0),
                     tab_run: None,
                     circles: Vec::new(),
+                    circ_seen: engine.circular_keys().count(),
                     engine,
                     undo: vec![],
                     redo: vec![],
@@ -10473,6 +10538,11 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                 let mut status = format!("loaded — {n} sheet{}", if n == 1 { "" } else { "s" });
                 if repair {
                     status.push_str(&repair_summary(&repairs));
+                }
+                // Excel warns about a workbook's circles when it opens (#759).
+                if gridcore::circular::circles_shown(&view.engine, &view.pkg.workbook) {
+                    status.push_str(". ");
+                    status.push_str(CIRCULAR_WARNING);
                 }
                 (Surface::Sheet(view), status.into())
             }
@@ -16079,20 +16149,10 @@ impl Docxy {
             Some(Surface::Sheet(_))
         )
     }
-    /// Every edit of a workbook ends here. In Protected View that means a
-    /// gate before it leaked: the edit is rolled back instead
-    /// ([`protected_rollback`]), so the tab never turns dirty.
+    /// Every edit of a workbook ends here ([`DocTab::sheet_edited`]).
     fn mark_sheet_dirty(&mut self) {
         if let Some(t) = self.tabs.get_mut(self.active) {
-            if t.access.protected {
-                protected_rollback(t);
-                return;
-            }
-            t.set_dirty();
-        }
-        // An edit may have made a circled value valid (Delete, a fill, a sort).
-        if let Some(v) = self.active_sheet_mut() {
-            v.prune_circles();
+            t.sheet_edited();
         }
     }
 
@@ -18989,9 +19049,11 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
+            let before = tab.status.clone();
             if let Err(e) = op(tab) {
                 tab.status = e.into();
             }
+            tab.warn_new_circles(Some(&before));
         }
         cx.notify();
     }
@@ -35278,6 +35340,9 @@ impl Render for Docxy {
                         .text_color(fg)
                         .child(w)
                 }))
+            })
+            .when_some(self.active_sheet().and_then(sheet_circular_word), |d, w| {
+                d.child(div().id("status-circular").text_color(fg).child(w))
             })
             .child(div().flex_1())
             .child(if self.active_is_sheet() {
