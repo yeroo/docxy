@@ -850,7 +850,7 @@ impl Docxy {
             // preserve the same previous tab as a clean close or Don't Save.
             // Before the removal shifts the indexes, so the status reset hits
             // the tab the highlighting mode started on (#623).
-            self.cancel_highlight_mode();
+            self.cancel_pointer_modes();
             self.active = previous_active;
             remove_tab(&mut self.tabs, &mut self.active, i);
             // The Info page's result is keyed by tab index (#627).

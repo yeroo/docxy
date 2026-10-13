@@ -47,6 +47,9 @@ pub struct CellBox {
     pub width: u32,
     /// A `continue` part of a vertical merge: drawn empty, no top edge.
     pub continues: bool,
+    /// The first part of a vertical merge: its content runs on down over
+    /// the merged rows.
+    pub merges_down: bool,
     pub fill: Option<u32>,
     pub top: Option<Line>,
     pub left: Option<Line>,
@@ -63,6 +66,30 @@ pub struct CellBox {
 pub struct RowBox {
     pub before: u32,
     pub cells: Vec<CellBox>,
+    /// `w:trHeight` in twips, and whether it is exact (else at least): a
+    /// drawn table's row keeps the height drawn (#763).
+    pub height: Option<(u32, bool)>,
+}
+
+/// A row's `w:trHeight`: twips, and whether its rule is exact. An auto rule
+/// or a zero height sets none.
+fn row_height(row: &docxcore::model::Row) -> Option<(u32, bool)> {
+    match docxcore::table_props::row_height(&row.raw_props)? {
+        (_, Some(rule)) if rule == "auto" => None,
+        (0, _) => None,
+        (h, rule) => Some((h, rule.as_deref() == Some("exact"))),
+    }
+}
+
+impl RowBox {
+    /// Whether the row is drawn at exactly its set height, its cells cut off
+    /// at its edges. A row starting a vertical merge grows to fit instead,
+    /// as every row did before the view drew heights: the merged cell's
+    /// content is drawn in this row alone, and one row's exact height would
+    /// cut it off or spill it over the rows around.
+    pub fn exact(&self) -> bool {
+        matches!(self.height, Some((_, true))) && !self.cells.iter().any(|c| c.merges_down)
+    }
 }
 
 /// Lay out `t` with its table style (if any).
@@ -78,6 +105,7 @@ pub fn layout(t: &Table, style: Option<&TableStyle>) -> Vec<RowBox> {
         .enumerate()
         .map(|(r, rm)| RowBox {
             before: span_w(0, rm.before),
+            height: row_height(&t.rows[r]),
             cells: rm
                 .cells
                 .iter()
@@ -98,6 +126,7 @@ pub fn layout(t: &Table, style: Option<&TableStyle>) -> Vec<RowBox> {
                         span: n,
                         width: span_w(s, n),
                         continues,
+                        merges_down: !continues && continued_below,
                         fill: look.fill.as_deref().and_then(crate::hex_rgb),
                         top: if continues { None } else { line(&look.top) },
                         left: line(&look.left),
@@ -142,6 +171,59 @@ mod tests {
         );
         assert_eq!(rows[1].before, 1000);
         assert_eq!(rows[1].cells[0].start, 1);
+    }
+
+    #[test]
+    fn a_rows_set_height_is_kept_with_its_rule() {
+        let mut t = new_table(4, 1, 9000, AutoFit::Default);
+        for (row, xml) in t.rows.iter_mut().zip([
+            "<w:trHeight w:val=\"1200\" w:hRule=\"atLeast\"/>",
+            "<w:trHeight w:val=\"600\" w:hRule=\"exact\"/>",
+            "<w:trHeight w:val=\"600\" w:hRule=\"auto\"/>",
+            "<w:trHeight w:val=\"700\"/>",
+        ]) {
+            row.raw_props = vec![format!("<w:trPr>{xml}</w:trPr>")];
+        }
+        let heights: Vec<_> = layout(&t, None).iter().map(|r| r.height).collect();
+        assert_eq!(
+            heights,
+            [
+                Some((1200, false)),
+                Some((600, true)),
+                None,
+                Some((700, false))
+            ]
+        );
+        assert_eq!(
+            layout(&new_table(1, 1, 9000, AutoFit::Default), None)[0].height,
+            None
+        );
+    }
+
+    #[test]
+    fn an_exact_row_is_exact_unless_a_merge_starts_in_it() {
+        let exact = "<w:trPr><w:trHeight w:val=\"400\" w:hRule=\"exact\"/></w:trPr>";
+        let mut t = new_table(3, 2, 9000, AutoFit::Default);
+        for row in &mut t.rows {
+            row.raw_props = vec![exact.into()];
+        }
+        let rows = layout(&t, None);
+        assert!(rows.iter().all(RowBox::exact));
+        // A merge from row 0 down over row 1: row 0 grows to fit; row 1,
+        // which only continues it, stays exact.
+        t.rows[0].cells[0].v_merge = VMerge::Restart;
+        t.rows[1].cells[0].v_merge = VMerge::Continue;
+        let rows = layout(&t, None);
+        assert!(rows[0].cells[0].merges_down);
+        assert!(!rows[0].exact(), "the merge's first row grows");
+        assert!(rows[1].exact());
+        assert!(rows[2].exact());
+        // An at-least row or an unset height is never exact.
+        t.rows[2].raw_props = vec!["<w:trPr><w:trHeight w:val=\"400\"/></w:trPr>".into()];
+        t.rows[1].raw_props.clear();
+        let rows = layout(&t, None);
+        assert!(!rows[1].exact());
+        assert!(!rows[2].exact());
     }
 
     #[test]

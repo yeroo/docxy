@@ -83,6 +83,17 @@ enum TabTarget {
     Stay,
 }
 
+/// Where [`Editor::insert_built_table`] puts a table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Place<'a> {
+    /// At the caret, as Insert Table does.
+    Caret,
+    /// After the paragraph at this path, wherever the caret is.
+    After(&'a [usize]),
+    /// Before the paragraph at this path.
+    Before(&'a [usize]),
+}
+
 /// Every table a path passes through, outermost first.
 pub(crate) fn table_steps(body: &[Block], path: &[usize]) -> Vec<TablePos> {
     let mut out = Vec::new();
@@ -164,7 +175,7 @@ fn paragraph_ends(blocks: &[Block], prefix: &[usize]) -> Option<(Vec<usize>, Vec
 
 /// The text width available at a caret: the innermost cell's width, else the
 /// section's text width.
-fn width_at(ed: &Editor) -> u32 {
+pub(super) fn width_at(ed: &Editor) -> u32 {
     width_at_path(ed, &ed.caret.path)
 }
 
@@ -483,12 +494,32 @@ impl Editor {
         if rows == 0 || cols == 0 {
             return Err("a table needs at least one row and one column".into());
         }
-        let path = self.caret.path.clone();
-        let Some(len) = resolve_para(&self.doc.body, &path).map(para_text_len) else {
-            return Err("the caret is not in a paragraph".into());
-        };
         let table = new_table(rows, cols, width_at(self), fit);
-        let off = self.caret.offset.min(len);
+        self.insert_built_table(table, Place::Caret)
+    }
+
+    /// Put `table` where `place` says, as [`Editor::insert_table`] puts one
+    /// at the caret: the paragraph split, nesting, the following paragraph,
+    /// placeholders, revisions and the caret in the first cell. One undo
+    /// step, taken before anything moves, so undo puts the caret and the
+    /// selection back as they were.
+    pub(super) fn insert_built_table(&mut self, table: Table, place: Place) -> Result<(), String> {
+        let path = match place {
+            Place::Caret => self.caret.path.clone(),
+            Place::After(p) | Place::Before(p) => p.to_vec(),
+        };
+        let Some(len) = resolve_para(&self.doc.body, &path).map(para_text_len) else {
+            return Err(match place {
+                Place::Caret => "the caret is not in a paragraph",
+                _ => "there is no paragraph there",
+            }
+            .into());
+        };
+        let (off, after) = match place {
+            Place::Caret => (self.caret.offset.min(len), false),
+            Place::After(_) => (len, true),
+            Place::Before(_) => (0, false),
+        };
         self.checkpoint(EditKind::Structural);
         self.anchor = None;
         // A table going into a placeholder is content: it shows no longer.
@@ -497,30 +528,40 @@ impl Editor {
         let Some((cont, idx)) = container_mut(&mut self.doc.body, &path) else {
             return Err("the caret is not in a paragraph".into());
         };
-        let at = if off == 0 {
+        let at = if !after && off == 0 {
             idx
-        } else if off == len {
-            idx + 1
         } else {
             let Some(Block::Paragraph(p)) = cont.get_mut(idx) else {
                 return Err("the caret is not in a paragraph".into());
             };
-            let right = split_paragraph_content(&mut p.content, off);
-            let props = p.props.clone();
-            // The section break ends the section after the split, so it (and
-            // its tracked change) moves with the paragraph's second half. A
-            // tracked pPrChange stays on both halves, as every split does (#801).
-            p.props.section_break = None;
-            p.props.section_property_change = None;
-            // So does a tracked change of the paragraph mark.
-            crate::review::clear_mark_revisions(&mut p.props);
-            cont.insert(
-                idx + 1,
-                Block::Paragraph(Paragraph {
-                    props,
-                    content: right,
-                }),
-            );
+            // After the paragraph (its end, or `after`): a paragraph ending
+            // its section hands the break to an empty paragraph after the
+            // table, so the table stays in the section, which still ends
+            // right after it. Mid-paragraph: the second half follows.
+            let ends_section = p.props.section_break.is_some();
+            let right = if !after && off < len {
+                Some(split_paragraph_content(&mut p.content, off))
+            } else {
+                ends_section.then(Vec::new)
+            };
+            if let Some(right) = right {
+                let props = p.props.clone();
+                // The section break ends the section after the split, so it
+                // (and its tracked change) moves with the paragraph's second
+                // half. A tracked pPrChange stays on both halves, as every
+                // split does (#801).
+                p.props.section_break = None;
+                p.props.section_property_change = None;
+                // So does a tracked change of the paragraph mark.
+                crate::review::clear_mark_revisions(&mut p.props);
+                cont.insert(
+                    idx + 1,
+                    Block::Paragraph(Paragraph {
+                        props,
+                        content: right,
+                    }),
+                );
+            }
             idx + 1
         };
         cont.insert(at, Block::Table(table));
@@ -584,6 +625,27 @@ pub(crate) mod tests {
 
     fn reload(ed: &Editor) -> Document {
         parse_document_xml(&document_to_xml(&ed.doc), &Relationships::default())
+    }
+
+    #[test]
+    fn insert_table_at_the_end_of_a_section_ending_paragraph_stays_in_its_section() {
+        let mut first = para("one");
+        if let Block::Paragraph(p) = &mut first {
+            p.props.section_break = Some("<w:sectPr/>".into());
+        }
+        let mut ed = Editor::new(Document {
+            body: vec![first, para("two")],
+        });
+        ed.caret = Caret::at(vec![0], 3);
+        ed.insert_table(1, 2, AutoFit::Default).unwrap();
+        let body = &ed.doc.body;
+        assert!(matches!(&body[0], Block::Paragraph(p) if p.props.section_break.is_none()));
+        assert!(matches!(body[1], Block::Table(_)));
+        assert!(
+            matches!(&body[2], Block::Paragraph(p) if p.props.section_break.is_some() && p.content.is_empty())
+        );
+        assert_eq!(ed.section_of_block(1), ed.section_of_block(0));
+        assert_eq!(ed.sections().len(), 2);
     }
 
     #[test]

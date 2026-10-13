@@ -1,0 +1,143 @@
+# Word tables (#763): Insert > Table > Draw Table and the table Layout tab's
+# Draw group. `table-draw` presses, drags and releases the pen through the
+# handlers a mouse gesture runs; points are px from page 1's text area, or
+# with `"in":"table"` from the caret's table (`"frac":true`: fractions of its
+# width and height). A pen reads the geometry of the frame on screen, so
+# `shot window` settles one after a pen goes on and after each edit. The
+# `table` object's `spans`, `vmerge` and `heights` give the table's shape.
+
+test draw table draws a one cell table and lines split only the cells they cross (763)
+  open copy:../fixtures/basic.docx
+  assert view.zoom is 1
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-read {}
+  assert reply.items.3.label is Draw Table
+  assert reply.items.3.enabled is true
+  call menu-click {"label":"Draw Table"}
+  assert view.draw is pen
+  shot window
+  # A click draws nothing.
+  call table-draw {"from":[40,400],"to":[41,401]}
+  assert table is null
+  # A 300×60 px rectangle: a one-cell table 4500 twips wide, 900 high.
+  call table-draw {"from":[40,400],"to":[340,460]}
+  assert reply.status is Table drawn
+  assert table.rows is 1
+  assert table.columns is 1
+  assert table.heights.0 is 900
+  assert view.draw is pen
+  shot window
+  # A line down the middle: two cells.
+  call table-draw {"in":"table","frac":true,"from":[0.5,0.05],"to":[0.5,0.95]}
+  assert reply.status is Line drawn
+  assert table.columns is 2
+  assert table.spans.0.0 is 1
+  assert table.spans.0.1 is 1
+  shot window
+  # A line across the left cell only, 40% down: the row divides there, the
+  # left cell splits and the right one merges down over both rows.
+  call table-draw {"in":"table","frac":true,"from":[0.05,0.4],"to":[0.45,0.4]}
+  assert table.rows is 2
+  assert table.heights.0 is 360
+  assert table.heights.1 is 540
+  assert table.vmerge.0.0 is none
+  assert table.vmerge.1.0 is none
+  assert table.vmerge.0.1 is restart
+  assert table.vmerge.1.1 is continue
+  shot window
+  # Esc puts the pen away.
+  key escape
+  assert view.draw is null
+  # Each drawn line is one undo step; the drawn table is one more.
+  key ctrl+z
+  assert table.rows is 1
+  assert table.columns is 2
+  key ctrl+z
+  assert table.spans.0.0 is 1
+  assert table.columns is 1
+  key ctrl+z
+  assert table is null
+
+test the eraser merges the cells on either side of a line (763)
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call table-grid {"cols":3,"rows":2,"click":true}
+  type a
+  key tab
+  type b
+  assert table.columns is 3
+  call ribbon-click {"tab":"Table Layout","command":"eraser"}
+  assert view.draw is eraser
+  shot window
+  # The line under the last column, halfway down: the two cells merge down.
+  call table-draw {"in":"table","frac":true,"from":[0.85,0.5],"to":[0.85,0.5]}
+  assert reply.status is Line erased
+  assert table.vmerge.0.2 is restart
+  assert table.vmerge.1.2 is continue
+  shot window
+  # The line between the first two cells of row 0.
+  call table-draw {"in":"table","frac":true,"from":[0.333,0.25],"to":[0.333,0.25]}
+  assert reply.status is Line erased
+  assert table.cells.0.0.0 is a
+  assert table.cells.0.0.1 is b
+  assert table.spans.0.0 is 2
+  assert table.spans.1.0 is 1
+  assert table.vmerge.0.1 is restart
+  shot window
+  # The outer border and a cell's middle erase nothing, with no undo step.
+  call-error table-draw {"in":"table","frac":true,"from":[0.0,0.25],"to":[0.0,0.25]} => the table's outer border cannot be erased
+  call table-draw {"in":"table","frac":true,"from":[0.15,0.75],"to":[0.15,0.75]}
+  assert table.spans.0.0 is 2
+  # Draw Table on the Layout tab switches to the pen; again, it ends.
+  call ribbon-click {"tab":"Table Layout","command":"draw-table"}
+  assert view.draw is pen
+  call ribbon-click {"tab":"Table Layout","command":"draw-table"}
+  assert view.draw is null
+  key ctrl+z
+  assert table.spans.0.0 is 1
+  assert table.cells.0.1.0 is b
+  key ctrl+z
+  assert table.vmerge.0.2 is none
+
+test a pen ends with another command, a tab switch or typing (763)
+  # A document no other case here opens, so its tab is found by name.
+  open copy:../fixtures/rulers.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Draw Table"}
+  assert view.draw is pen
+  call ribbon-click {"tab":"Home","command":"b"}
+  assert view.draw is null
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Draw Table"}
+  assert view.draw is pen
+  type x
+  assert view.draw is null
+  # Another tab, then back: the pen stays put away.
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Draw Table"}
+  assert view.draw is pen
+  call tab-select {"tab":0}
+  assert view.draw is null
+  call tab-select {"tab":"rulers.docx"}
+  assert view.draw is null
+  call-error table-draw {"in":"table","from":[1,1],"to":[50,1]} => no table pen is on
+
+test a table drawn under a table goes after the paragraph between them (763)
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call table-grid {"cols":2,"rows":2,"click":true}
+  assert table.rows is 2
+  call ribbon-click {"tab":"Table Layout","command":"draw-table"}
+  assert view.draw is pen
+  shot window
+  # Below the table and its empty paragraph.
+  call table-draw {"from":[40,200],"to":[240,260]}
+  assert reply.status is Table drawn
+  assert table.rows is 1
+  assert table.columns is 1
+  # Left from the new table's cell is the paragraph, not the first table.
+  key escape
+  key left
+  assert table is null
+  key left
+  assert table.rows is 2

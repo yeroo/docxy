@@ -381,7 +381,7 @@ impl Docxy {
     ) -> Result<(), String> {
         let trusted = trusted::TrustStore::load(&config_root());
         let tab = doc_templates::template_tab(path, &trusted)?;
-        self.cancel_highlight_mode();
+        self.cancel_pointer_modes();
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         self.drop_grid_state();

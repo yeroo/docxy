@@ -13,7 +13,7 @@ use crate::table::{
     AutoFit, GridMap, edit_cell_props, edit_table_props, grid_xs, new_table, normalize_vmerge,
     refine_grid, repair_grid, set_row_skips, template_cell, template_row,
 };
-use crate::table_props::{VAlign, row_trpr, set_row_trpr, width_of};
+use crate::table_props::{VAlign, row_height, set_row_height, width_of};
 
 /// Delete Cells... choices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -618,22 +618,13 @@ impl Editor {
             };
             let h = rows
                 .clone()
-                .filter_map(|i| {
-                    row_trpr(&t.rows[i].raw_props)
-                        .attr("w:trHeight", "w:val")
-                        .and_then(|v| v.parse::<u32>().ok())
-                })
+                .filter_map(|i| row_height(&t.rows[i].raw_props).map(|(h, _)| h))
                 .max()
                 .ok_or("the rows have no set height to distribute")?;
             for i in rows {
-                let mut p = row_trpr(&t.rows[i].raw_props);
                 // A row's height rule (exact or at least) is kept.
-                let rule = p
-                    .attr("w:trHeight", "w:hRule")
-                    .map(|r| format!(" w:hRule=\"{r}\""))
-                    .unwrap_or_default();
-                p.set(&format!("<w:trHeight w:val=\"{h}\"{rule}/>"));
-                set_row_trpr(&mut t.rows[i].raw_props, &p);
+                let rule = row_height(&t.rows[i].raw_props).and_then(|(_, r)| r);
+                set_row_height(&mut t.rows[i].raw_props, h, rule.as_deref());
             }
             Ok(After::Stay)
         })
@@ -1019,7 +1010,7 @@ fn remove_grid_columns(t: &mut Table, left: usize, right: usize) {
 
 /// Rewrite a cell's `w:tcW` to `width` twips when it is a fixed (`dxa`) one;
 /// an auto or percentage width is left to the layout.
-fn set_dxa_width(cell: &mut crate::model::Cell, width: u32) {
+pub(super) fn set_dxa_width(cell: &mut crate::model::Cell, width: u32) {
     edit_cell_props(cell, |p| {
         if width_of(p.get("w:tcW")).is_some_and(|(_, ty)| ty == "dxa") {
             p.set(&format!("<w:tcW w:w=\"{width}\" w:type=\"dxa\"/>"));
@@ -1028,7 +1019,7 @@ fn set_dxa_width(cell: &mut crate::model::Cell, width: u32) {
 }
 
 /// Merge the cells of `r` into one (see [`Editor::merge_cells`]).
-fn merge_range(t: &mut Table, r: &CellRange) -> Result<(), String> {
+pub(super) fn merge_range(t: &mut Table, r: &CellRange) -> Result<(), String> {
     // The merged cell's width is summed from the grid.
     repair_grid(t);
     let map = GridMap::of(t);
@@ -1207,23 +1198,54 @@ fn split_one(t: &mut Table, row: usize, x: u32, cols: usize, rows: usize) -> Res
         return Ok(());
     }
     // A single-row cell: add rows below, merging the rest of the row down.
-    let map = GridMap::of(t);
-    let mut new_row = template_row(&t.rows[row]);
-    for (ci, &(s, _)) in map.rows[row].cells.iter().enumerate() {
-        if inside(s) {
-            continue;
-        }
-        let cell = &mut t.rows[row].cells[ci];
-        if cell.v_merge == VMerge::None {
-            cell.v_merge = VMerge::Restart;
-        }
-        new_row.cells[ci].v_merge = VMerge::Continue;
+    add_rows_below(t, row, rows - 1, inside);
+    Ok(())
+}
+
+/// Add `count` rows below row `row`, splitting the cells whose first grid
+/// column `crossed` accepts (each new row gets an empty piece of them) and
+/// merging every other cell of the row down over the new rows. A crossed cell
+/// in a vertical merge keeps its part above the new rows; a merge that went on
+/// below goes on from the last new piece.
+pub(super) fn add_rows_below(
+    t: &mut Table,
+    row: usize,
+    count: usize,
+    crossed: impl Fn(usize) -> bool,
+) {
+    if count == 0 {
+        return;
     }
-    for k in 1..rows {
-        t.insert_row(row + k, new_row.clone());
+    let map = GridMap::of(t);
+    let template = template_row(&t.rows[row]);
+    let mut new_rows = vec![template; count];
+    for (ci, &(s, _)) in map.rows[row].cells.iter().enumerate() {
+        let cell = &mut t.rows[row].cells[ci];
+        let was = cell.v_merge;
+        if crossed(s) {
+            if was == VMerge::Restart {
+                cell.v_merge = VMerge::None;
+            }
+            for (k, new_row) in new_rows.iter_mut().enumerate() {
+                new_row.cells[ci].v_merge = if was != VMerge::None && k + 1 == count {
+                    VMerge::Restart
+                } else {
+                    VMerge::None
+                };
+            }
+        } else {
+            if was == VMerge::None {
+                cell.v_merge = VMerge::Restart;
+            }
+            for new_row in &mut new_rows {
+                new_row.cells[ci].v_merge = VMerge::Continue;
+            }
+        }
+    }
+    for (k, new_row) in new_rows.into_iter().enumerate() {
+        t.insert_row(row + 1 + k, new_row);
     }
     normalize_vmerge(t);
-    Ok(())
 }
 
 /// A sort key read from a cell: unparsed values sort before parsed ones.
@@ -1422,6 +1444,7 @@ mod tests {
     use crate::model::{Document, TableRowBoundary};
     use crate::serialize::document_to_xml;
     use crate::table::cell_props;
+    use crate::table_props::row_trpr;
 
     fn at(r: usize, c: usize) -> Caret {
         Caret::at(vec![0, r, c, 0], 0)

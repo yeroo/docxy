@@ -406,12 +406,16 @@ default), the caret cell's `shading` (`RRGGBB`, `null` for none) and
 `text_direction`, the cell-range selection as `range` `{top, bottom, left,
 right}` (grid columns; `null` when the selection is not across cells), and
 `cells`: per row, per cell, the cell's paragraphs as text, with a tab shown as
-`⇥` so a script can name it (`assert table.cells.0.0.1 is b⇥c`). Every field
+`⇥` so a script can name it (`assert table.cells.0.0.1 is b⇥c`). The table's
+shape (#763): `spans`, per row, each cell's grid span; `vmerge`, per row, each
+cell's vertical merge (`none`, `restart` or `continue`); and `heights`, each
+row's set height (`w:trHeight`, twips) or `null`. Every field
 describes that one table: a selection from an outer table's cell into a table
 nested in another cell reports the nested table, with `range` `null` (the
 range belongs to the outer table, which the table commands act on). `view`
-carries `gridlines`, the Table Layout tab's View Gridlines, and `display_mode`,
-Display for Review (`all`, `simple`, `none` or `original`).
+carries `gridlines`, the Table Layout tab's View Gridlines, `display_mode`,
+Display for Review (`all`, `simple`, `none` or `original`), and `draw`, the
+table pen on in the tab (#763: `pen` for Draw Table, `eraser`, or `null`).
 
 `mail` is the tab's mail merge (#628): `doc_type` (`Letters`, `E-mail
 Messages`, `Envelopes`, `Labels`, `Directory`, or `null` for a Normal Word
@@ -429,6 +433,29 @@ pointer over that cell, `{}` moves it off the grid, and `{"cols": c, "rows": r,
 `{header, state}`, where `header` reads `Insert Table` or `<c>x<r> Table`. It is
 refused unless the Insert > Table menu is open (`ribbon-click
 {"tab":"Insert","command":"table"}` opens it). `word-tables.uit` drives it.
+
+`table-draw {"from": [x, y], "to": [x, y]}` is a table pen gesture (#763): a
+press at `from`, a drag to `to` and the release, through the handlers a mouse
+gesture runs, with Draw Table or the Eraser on (Insert > Table > Draw Table,
+or the Table Layout tab's `draw-table` and `eraser`). With `"in": "page"` (the
+default), the points are px from the top-left of page `page`'s text area
+(1-based, default 1; in Draft, the text column from the top of the view).
+With `"in": "table"` they are px from the top-left of the caret's innermost
+table as the frame on screen drew it, or with `"frac": true`, fractions of
+its width and height. The pens read the geometry a frame drew with the pen
+on, so settle one (`shot window`) after turning a pen on and after each edit.
+A rectangle off every table draws a one-cell table after the paragraph it
+starts on (or the last one above it on its page; above a page's first
+paragraph, before that one), never inside a paragraph or on an earlier page,
+and a paragraph always follows the table; a drag inside a table draws a vertical
+line, a line across a row or one on a row boundary; the eraser takes the line
+nearest the press. The reply is `{status, state}`; a refused gesture (the
+outer border, cells that do not line up) is an error with the reason, and a
+click that draws nothing replies with an empty `status`. A press the pen does
+not take is an error too: `no table pen is on`, `the press is not on the
+page`, `a menu, popup or dialog covers the page`, or, with a header or footer
+open, `the press is outside the open header/footer` (the pen draws into the
+open header or footer only from inside its area). `word-tables-draw.uit` drives it.
 
 `ruler` reports the last painted ruler geometry in logical pixels rounded to
 0.1: `first_offset`, `left_offset`, and `right_offset` are marker distances from

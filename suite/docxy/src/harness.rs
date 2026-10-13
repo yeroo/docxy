@@ -1607,6 +1607,8 @@ struct ViewFlags {
     gridlines: bool,
     /// Display for Review (#625), by its control name.
     display_mode: &'static str,
+    /// The table pen on (#763): `pen` or `eraser`.
+    draw: Option<&'static str>,
 }
 
 impl ViewFlags {
@@ -1623,6 +1625,7 @@ impl ViewFlags {
             dark: app.theme_pref.resolve(app.os_appearance) == gpui_component::ThemeMode::Dark,
             gridlines: app.view_gridlines,
             display_mode: app.markup.name(),
+            draw: app.draw_tool().map(crate::table_draw::Tool::name),
         }
     }
 }
@@ -1733,6 +1736,7 @@ fn doc_state(editor: &Editor, flags: &ViewFlags) -> Json {
             Json::Str(if flags.dark { "dark" } else { "light" }.into()),
         ),
         ("gridlines", Json::Bool(flags.gridlines)),
+        ("draw", str_or_null(flags.draw.map(str::to_string))),
         ("display_mode", Json::Str(flags.display_mode.into())),
     ]);
     Json::obj(vec![
@@ -1825,7 +1829,128 @@ fn table_state(editor: &Editor) -> Json {
         ("text_direction", str_or_null(editor.cell_text_direction())),
         ("range", range),
         ("cells", Json::Arr(cells)),
+        // The table's shape (#763): each cell's grid span and vertical
+        // merge, and each row's set height (twips, or null).
+        ("spans", Json::Arr(t.rows.iter().map(row_spans).collect())),
+        ("vmerge", Json::Arr(t.rows.iter().map(row_vmerge).collect())),
+        (
+            "heights",
+            Json::Arr(
+                t.rows
+                    .iter()
+                    .map(|row| {
+                        docxcore::table_props::row_height(&row.raw_props)
+                            .map_or(Json::Null, |(h, _)| Json::Num(h as f64))
+                    })
+                    .collect(),
+            ),
+        ),
     ])
+}
+
+fn row_spans(row: &docxcore::model::Row) -> Json {
+    Json::Arr(
+        row.cells
+            .iter()
+            .map(|c| Json::Num(c.grid_span.max(1) as f64))
+            .collect(),
+    )
+}
+
+fn row_vmerge(row: &docxcore::model::Row) -> Json {
+    use docxcore::model::VMerge;
+    Json::Arr(
+        row.cells
+            .iter()
+            .map(|c| {
+                Json::Str(
+                    match c.v_merge {
+                        VMerge::None => "none",
+                        VMerge::Restart => "restart",
+                        VMerge::Continue => "continue",
+                    }
+                    .into(),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// A window point, px.
+type WinPoint = (f32, f32);
+
+/// `table-draw`'s `from` and `to` as window points (see the verb).
+fn table_draw_points(app: &crate::Docxy, args: &Json) -> Result<(WinPoint, WinPoint), String> {
+    let point = |key: &str| -> Result<(f32, f32), String> {
+        let a = args
+            .get(key)
+            .and_then(Json::as_array)
+            .filter(|a| a.len() == 2)
+            .ok_or_else(|| format!("'{key}' must be [x, y]"))?;
+        let n = |j: &Json| j.as_f64().map(|v| v as f32);
+        match (n(&a[0]), n(&a[1])) {
+            (Some(x), Some(y)) => Ok((x, y)),
+            _ => Err(format!("'{key}' must be [x, y] numbers")),
+        }
+    };
+    let frac = matches!(args.get("frac"), Some(Json::Bool(true)));
+    let (ox, oy, w, h) = match args.get_str("in").unwrap_or("page") {
+        "table" => {
+            let path = app
+                .edit_target_ref()
+                .and_then(|e| e.table_at_caret())
+                .ok_or("the caret is not in a table")?
+                .table;
+            let hf = app.hf_active();
+            let geom = app.draw_geom.borrow();
+            let t = geom
+                .on_screen()
+                .tables
+                .iter()
+                .find(|t| t.hf == hf && t.path == path)
+                .ok_or(
+                    "the table is not drawn with a pen on yet: turn a pen on and settle a frame",
+                )?;
+            let top = t.rows.first().map_or(0.0, |r| r.top);
+            let bottom = t.rows.last().map_or(0.0, |r| r.bottom);
+            let w = crate::tw_px(t.grid.last().copied().unwrap_or(0) as i32, t.zoom);
+            (t.left, top, w, bottom - top)
+        }
+        "page" => {
+            let page = args.get_usize("page").unwrap_or(1).max(1);
+            let probe = app.ruler_probe.borrow();
+            let r = if probe.draft {
+                // Draft's text column, from the top of the view.
+                let (col, view) = probe
+                    .draft_column
+                    .zip(probe.viewport)
+                    .ok_or("the view is not drawn")?;
+                crate::ScreenRect {
+                    x: col.x,
+                    y: view.y,
+                    w: col.w,
+                    h: view.h,
+                }
+            } else {
+                probe
+                    .contents
+                    .get(page - 1)
+                    .copied()
+                    .flatten()
+                    .ok_or("that page is not drawn")?
+            };
+            (r.x, r.y, r.w, r.h)
+        }
+        other => return Err(format!("'in' is table or page, not {other}")),
+    };
+    let at = |(x, y): (f32, f32)| {
+        if frac {
+            (ox + x * w, oy + y * h)
+        } else {
+            (ox + x, oy + y)
+        }
+    };
+    Ok((at(point("from")?), at(point("to")?)))
 }
 
 /// The line numbers Print Layout painted last frame (#746): one
@@ -4554,6 +4679,27 @@ fn dispatch_verb(
                 ("state", state(app, window, cx)),
             ]))
         }
+        // A table pen gesture (#763): a press at `from`, a drag to `to` and the
+        // release, through the same handlers a mouse gesture runs. With
+        // `"in":"table"` the points are px from the top-left of the caret's
+        // innermost table as the frame on screen drew it (fractions of its
+        // width and height with `"frac":true`); with `"in":"page"` (the
+        // default), px from the top-left of page `page`'s text area (1-based,
+        // default 1; in Draft, its text column from the top of the view). Settle a frame (`shot window`)
+        // after turning a pen on: the pens read the geometry it drew.
+        // The press's own checks give the refusals (`draw_press`).
+        "table-draw" => {
+            app.draw_tool().ok_or(crate::table_draw::NO_PEN)?;
+            let (from, to) = table_draw_points(app, args)?;
+            app.draw_press(from)?;
+            app.draw_move(to);
+            let drag = app.draw_drag.take().ok_or("the gesture did not start")?;
+            let status = app.draw_gesture(drag, window, cx)?;
+            Done::ok(Json::obj(vec![
+                ("status", Json::Str(status)),
+                ("state", state(app, window, cx)),
+            ]))
+        }
         "menu-click" => {
             app.refuse_under_dialog()?;
             refuse_under_cover(app)?;
@@ -6533,6 +6679,7 @@ mod tests {
             dark: true,
             gridlines: true,
             display_mode: "all",
+            draw: None,
         };
         let state = doc_state(&editor(props, run), &flags);
         assert_eq!(state.get_str("text"), Some("abc\n"));
@@ -6611,6 +6758,7 @@ mod tests {
                 dark: false,
                 gridlines: true,
                 display_mode: "all",
+                draw: None,
             },
         );
         assert_ne!(state.get("para"), defaults.get("para"));
@@ -6709,6 +6857,7 @@ mod tests {
                 dark: false,
                 gridlines: true,
                 display_mode: "all",
+                draw: None,
             },
         );
         assert_eq!(state.get("cross_story"), Some(&Json::Bool(true)));
