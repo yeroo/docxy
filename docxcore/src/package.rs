@@ -2245,16 +2245,7 @@ impl Package {
         // Unused word/media/imageN.<ext> part name — N unique across ALL media
         // parts regardless of extension, so a PNG + SVG pair minted together
         // (the mermaid embed case) never collide on the same N.
-        let mut max_n = 0u32;
-        for (name, _) in &self.parts {
-            if let Some(rest) = name.strip_prefix("word/media/image") {
-                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if let Ok(n) = digits.parse::<u32>() {
-                    max_n = max_n.max(n);
-                }
-            }
-        }
-        let n = max_n + 1;
+        let n = self.unused_media_number();
         let target = format!("image{n}.{ext}");
         let part_name = format!("word/media/{target}");
         self.parts.push((part_name, bytes.to_vec()));
@@ -2388,18 +2379,21 @@ impl Package {
     }
 
     /// N for a new `word/media/imageN.*` part: one past the largest in use,
-    /// whatever its extension.
+    /// whatever its extension; past `u32::MAX`, the smallest N not in use.
     fn unused_media_number(&self) -> u32 {
-        self.parts
+        let used: std::collections::BTreeSet<u32> = self
+            .parts
             .iter()
             .filter_map(|(name, _)| {
                 let rest = name.strip_prefix("word/media/image")?;
                 let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
                 digits.parse::<u32>().ok()
             })
-            .max()
-            .unwrap_or(0)
-            + 1
+            .collect();
+        match used.last().copied().unwrap_or(0).checked_add(1) {
+            Some(n) => n,
+            None => (1..).find(|n| !used.contains(n)).unwrap_or(1),
+        }
     }
 
     /// Page size/margins from the captured (final) `sectPr` (US Letter default).
@@ -6102,6 +6096,15 @@ mod tests {
         let before = pkg.parts.len();
         assert_eq!(pkg.add_part_image("word/header9.xml", b"x", &jpeg), None);
         assert_eq!(pkg.parts.len(), before);
+
+        // FIX r2 m5: the largest N in use is not followed by an overflow;
+        // the smallest free N is taken, for either way of adding media.
+        pkg.parts
+            .push(("word/media/image4294967295.png".into(), b"x".to_vec()));
+        pkg.add_part_image(&header, b"NEXT", &jpeg).unwrap();
+        assert_eq!(pkg.part("word/media/image3.jpeg").unwrap(), b"NEXT");
+        pkg.add_media_part(b"PNG", "png");
+        assert_eq!(pkg.part("word/media/image4.png").unwrap(), b"PNG");
     }
 
     #[test]

@@ -609,6 +609,10 @@ pub struct DocProps {
     pub comments: String,
     pub last_saved_by: String,
     pub revision: String,
+    /// `cp:category` and `cp:contentStatus`, which only the Document Property
+    /// controls show (#768).
+    pub category: String,
+    pub content_status: String,
     pub created: Option<DateTime>,
     pub modified: Option<DateTime>,
 }
@@ -832,31 +836,45 @@ pub fn civil_from_unix(secs: i64) -> DateTime {
 
 /// Parse `docProps/core.xml` into [`DocProps`].
 pub fn parse_core_props(xml: &str) -> DocProps {
-    let tag = |name: &str| -> String {
-        let open = format!("<{name}");
-        let Some(s) = xml.find(&open) else {
-            return String::new();
-        };
-        let Some(gt) = xml[s..].find('>').map(|e| s + e + 1) else {
-            return String::new();
-        };
-        let close = format!("</{name}>");
-        let Some(e) = xml[gt..].find(&close).map(|e| gt + e) else {
-            return String::new();
-        };
-        xml_unescape(&xml[gt..e])
-    };
     DocProps {
-        author: tag("dc:creator"),
-        title: tag("dc:title"),
-        subject: tag("dc:subject"),
-        keywords: tag("cp:keywords"),
-        comments: tag("dc:description"),
-        last_saved_by: tag("cp:lastModifiedBy"),
-        revision: tag("cp:revision"),
-        created: parse_iso(&tag("dcterms:created")),
-        modified: parse_iso(&tag("dcterms:modified")),
+        author: core_element(xml, "dc:creator"),
+        title: core_element(xml, "dc:title"),
+        subject: core_element(xml, "dc:subject"),
+        keywords: core_element(xml, "cp:keywords"),
+        comments: core_element(xml, "dc:description"),
+        last_saved_by: core_element(xml, "cp:lastModifiedBy"),
+        revision: core_element(xml, "cp:revision"),
+        category: core_element(xml, "cp:category"),
+        content_status: core_element(xml, "cp:contentStatus"),
+        created: parse_iso(&core_element(xml, "dcterms:created")),
+        modified: parse_iso(&core_element(xml, "dcterms:modified")),
     }
+}
+
+/// The text of the first `<name …>…</name>` in `xml`, unescaped: a longer
+/// name that `name` begins (`<cp:categoryX>`) is not it, and a self-closing
+/// `<name/>` is empty. Empty when there is none.
+fn core_element(xml: &str, name: &str) -> String {
+    let open = format!("<{name}");
+    let mut from = 0;
+    while let Some(at) = xml[from..].find(&open).map(|i| from + i) {
+        from = at + open.len();
+        if !xml[from..].starts_with(['>', '/', ' ', '\t', '\r', '\n']) {
+            continue;
+        }
+        let Some(gt) = xml[from..].find('>').map(|e| from + e + 1) else {
+            break;
+        };
+        if xml[..gt].ends_with("/>") {
+            return String::new();
+        }
+        let close = format!("</{name}>");
+        return xml[gt..]
+            .find(&close)
+            .map(|e| xml_unescape(&xml[gt..gt + e]))
+            .unwrap_or_default();
+    }
+    String::new()
 }
 
 /// Parse an ISO-8601 timestamp like `2007-11-05T14:54:00Z` (the value is in UTC;

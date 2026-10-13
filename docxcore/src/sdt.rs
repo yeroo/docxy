@@ -65,65 +65,19 @@ impl CoreProp {
         }
     }
 
-    /// The element's name in `docProps/core.xml`.
-    fn core_element(self) -> &'static str {
+    /// The property's value in `props` (read from `docProps/core.xml`).
+    pub fn value(self, props: &DocProps) -> String {
         match self {
-            Self::Author => "dc:creator",
-            Self::Category => "cp:category",
-            Self::Comments => "dc:description",
-            Self::Keywords => "cp:keywords",
-            Self::Status => "cp:contentStatus",
-            Self::Subject => "dc:subject",
-            Self::Title => "dc:title",
+            Self::Author => &props.author,
+            Self::Category => &props.category,
+            Self::Comments => &props.comments,
+            Self::Keywords => &props.keywords,
+            Self::Status => &props.content_status,
+            Self::Subject => &props.subject,
+            Self::Title => &props.title,
         }
+        .clone()
     }
-
-    /// The property's value in `props`, or, for the two [`DocProps`] does
-    /// not hold, in `core_xml` (the `docProps/core.xml` text).
-    pub fn value(self, props: &DocProps, core_xml: &str) -> String {
-        match self {
-            Self::Author => props.author.clone(),
-            Self::Comments => props.comments.clone(),
-            Self::Keywords => props.keywords.clone(),
-            Self::Subject => props.subject.clone(),
-            Self::Title => props.title.clone(),
-            Self::Category | Self::Status => element_text(core_xml, self.core_element()),
-        }
-    }
-}
-
-/// The text of the first `<name …>…</name>` in `xml`, unescaped; empty
-/// when there is none.
-fn element_text(xml: &str, name: &str) -> String {
-    let open = format!("<{name}");
-    let mut from = 0;
-    while let Some(at) = xml[from..].find(&open).map(|i| from + i) {
-        from = at + open.len();
-        // `<cp:category>` must not match `<cp:categoryX>`.
-        if !xml[from..].starts_with(['>', ' ', '\t', '\r', '\n']) {
-            continue;
-        }
-        let Some(gt) = xml[from..].find('>').map(|e| from + e + 1) else {
-            break;
-        };
-        if xml[..gt].ends_with("/>") {
-            return String::new();
-        }
-        let close = format!("</{name}>");
-        return xml[gt..]
-            .find(&close)
-            .map(|e| unescape(&xml[gt..gt + e]))
-            .unwrap_or_default();
-    }
-    String::new()
-}
-
-fn unescape(s: &str) -> String {
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
 }
 
 /// The next free content-control id over every story's XML in `xmls`: one
@@ -143,11 +97,17 @@ pub fn next_control_id<'a>(xmls: impl IntoIterator<Item = &'a str>) -> i64 {
             }
         }
     }
-    let next = used.iter().map(|v| v.abs()).max().unwrap_or(0) + 1;
-    if next <= i64::from(i32::MAX) {
-        return next;
+    let next = used
+        .iter()
+        .map(|v| v.unsigned_abs())
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .filter(|n| *n <= i32::MAX as u64);
+    match next {
+        Some(n) => n as i64,
+        None => (1..).find(|i| !used.contains(i)).unwrap_or(1),
     }
-    (1..).find(|i| !used.contains(i)).unwrap_or(1)
 }
 
 /// An inline document property control for `prop`, bound to it, with
@@ -250,15 +210,22 @@ mod tests {
 
     #[test]
     fn values_come_from_core_xml() {
+        // A longer element the name begins is not it; a self-closing one is
+        // empty.
         let core = "<cp:coreProperties xmlns:cp=\"c\" xmlns:dc=\"d\">\
-            <dc:title>Q &amp; A</dc:title><cp:category>Memo</cp:category>\
+            <dc:title>Q &amp; A</dc:title><cp:categoryX>No</cp:categoryX><cp:category>Memo</cp:category>\
             <cp:contentStatus/><dc:creator>Ann</dc:creator></cp:coreProperties>";
         let props = crate::field::parse_core_props(core);
-        assert_eq!(CoreProp::Title.value(&props, core), "Q & A");
-        assert_eq!(CoreProp::Author.value(&props, core), "Ann");
-        assert_eq!(CoreProp::Category.value(&props, core), "Memo");
-        assert_eq!(CoreProp::Status.value(&props, core), "");
-        assert_eq!(CoreProp::Subject.value(&props, core), "");
+        assert_eq!(CoreProp::Title.value(&props), "Q & A");
+        assert_eq!(CoreProp::Author.value(&props), "Ann");
+        assert_eq!(CoreProp::Category.value(&props), "Memo");
+        assert_eq!(CoreProp::Status.value(&props), "");
+        assert_eq!(CoreProp::Subject.value(&props), "");
+        let props = crate::field::parse_core_props(
+            "<x><cp:contentStatus>Final</cp:contentStatus><dc:subject/></x>",
+        );
+        assert_eq!(CoreProp::Status.value(&props), "Final");
+        assert_eq!(CoreProp::Subject.value(&props), "");
     }
 
     #[test]
@@ -269,5 +236,9 @@ mod tests {
         assert_eq!(next_control_id([a, b]), 1_311_087_654);
         let full = "<w:id w:val=\"2147483647\"/><w:id w:val=\"1\"/>";
         assert_eq!(next_control_id([full]), 2);
+        // FIX r2 m3: the i64 extremes neither overflow nor become the id.
+        let extremes = "<w:id w:val=\"9223372036854775807\"/><w:id w:val=\"-9223372036854775808\"/>\
+                        <w:id w:val=\"1\"/><w:id w:val=\"2\"/>";
+        assert_eq!(next_control_id([extremes]), 3);
     }
 }

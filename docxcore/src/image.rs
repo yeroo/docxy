@@ -102,13 +102,15 @@ pub fn inline_picture_run(rid: &str, cx: i64, cy: i64, id: u32, file_name: &str)
     )
 }
 
-/// An inline picture run's size in EMUs, from its `wp:extent`; `None` for
-/// any other XML (an anchored or floating drawing included).
+/// An inline picture run's size in EMUs, from its `wp:inline`'s
+/// `wp:extent`; `None` for any other XML (an anchored or floating drawing
+/// included, even beside an inline one's fallback).
 pub fn inline_extent(raw: &str) -> Option<(i64, i64)> {
-    if !raw.contains("<w:drawing") || !raw.contains("<wp:inline") {
+    if !raw.starts_with("<w:r") || !raw.contains("<w:drawing") || raw.contains("<wp:anchor") {
         return None;
     }
-    let at = raw.find("<wp:extent")?;
+    let inline = raw.find("<wp:inline")?;
+    let at = inline + raw[inline..].find("<wp:extent")?;
     let end = at + raw[at..].find('>')?;
     let el = &raw[at..end];
     let cx = crate::load::xml_attr_value(el, "cx")?.parse().ok()?;
@@ -293,6 +295,21 @@ mod tests {
         assert_eq!(
             inline_extent(
                 "<w:r><w:drawing><wp:anchor><wp:extent cx=\"1\" cy=\"1\"/></wp:anchor></w:drawing></w:r>"
+            ),
+            None
+        );
+        // FIX r2 M1: an anchored drawing beside an inline fallback is not an
+        // inline picture, and neither is a drawing outside a run.
+        assert_eq!(
+            inline_extent(
+                "<w:r><mc:AlternateContent><mc:Choice><w:drawing><wp:anchor><wp:extent cx=\"1\" cy=\"1\"/></wp:anchor></w:drawing></mc:Choice>\
+                 <mc:Fallback><w:drawing><wp:inline><wp:extent cx=\"2\" cy=\"2\"/></wp:inline></w:drawing></mc:Fallback></mc:AlternateContent></w:r>"
+            ),
+            None
+        );
+        assert_eq!(
+            inline_extent(
+                "<w:drawing><wp:inline><wp:extent cx=\"2\" cy=\"2\"/></wp:inline></w:drawing>"
             ),
             None
         );
