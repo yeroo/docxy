@@ -224,3 +224,75 @@ test the entry row's menu is the row menu for no task
   call menu-click {"label":"Insert Task"}
   assert tasks is 4
   call-error menu-open {"target":{"row":"x"}} => 'row' must be a task uid, or null for the entry row
+
+test Fill Down and Clear Contents on a row's menu act on the range a right-click inside keeps (#1213)
+  open copy:../fixtures/project-clipboard.xml
+  call menu-open {"target":{"row":1}}
+  assert reply.items.19.label is Fill Down
+  assert reply.items.19.enabled is false
+  assert reply.items.20.label is Clear Contents
+  assert reply.items.20.enabled is true
+  key escape
+  call click-cell {"cell":"C1"}
+  key shift+down
+  key shift+right
+  assert selection is 4
+  # A right-click inside the range keeps it, and the cursor with it.
+  call menu-open {"target":{"row":1}}
+  assert selection is 4
+  assert cell_row is 1
+  assert reply.items.19.enabled is true
+  call menu-click {"label":"Fill Down"}
+  assert selection is 4
+  call task.list {}
+  assert reply.tasks.1.name is A
+  assert tasks is 2
+  # Ctrl+Z undoes the whole fill.
+  key ctrl+z
+  call task.list {}
+  assert reply.tasks.1.name is B
+  # Clear Contents clears the range's names and deletes no task.
+  call click-cell {"cell":"C1"}
+  key shift+down
+  call menu-open {"target":{"row":2}}
+  assert selection is 2
+  call menu-click {"label":"Clear Contents"}
+  assert tasks is 2
+  assert selection is none
+  call task.list {}
+  assert reply.tasks.0.name is empty
+  assert reply.tasks.1.name is empty
+  # A right-click outside the range is a left click: the range goes.
+  key ctrl+z
+  call click-cell {"cell":"C1"}
+  key shift+right
+  assert selection is 2
+  call menu-open {"target":{"row":2}}
+  assert selection is none
+  assert selected_name is B
+
+test a row menu over a kept range is the clicked row's: its task items act on that row (#1213 r1)
+  open copy:../fixtures/gantt-summary.xml
+  call click-cell {"cell":"C2"}
+  key shift+down
+  assert selection is 2
+  assert selected_name is Task 3
+  call menu-open {"target":{"row":2}}
+  assert reply.target.row is 2
+  assert selection is 2
+  assert selected_name is Task 3
+  call menu-click {"label":"Delete Task"}
+  assert tasks is 2
+  assert dialog is none
+  call task.list {}
+  assert reply.tasks.0.name is Task 1
+  assert reply.tasks.1.name is Task 3
+  key ctrl+z
+  assert tasks is 3
+  call click-cell {"cell":"C2"}
+  key shift+down
+  call menu-open {"target":{"row":2}}
+  call menu-click {"label":"Notes..."}
+  assert selected_name is Task 2
+  assert prompt is notes:
+  assert selection is none

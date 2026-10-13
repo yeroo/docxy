@@ -29434,6 +29434,14 @@ impl Docxy {
         }
     }
 
+    /// Whether the active Project's selected range holds task `uid`'s row.
+    fn project_range_has(&self, uid: i32) -> bool {
+        match self.tabs.get(self.active).map(|t| &t.surface) {
+            Some(Surface::Project(v)) => v.selection().is_some_and(|s| s.uids.contains(&uid)),
+            _ => false,
+        }
+    }
+
     /// The Quick Access Toolbar Undo arrow, and `menu-open {"qat":
     /// "qat-undo"}`: the active document's (#619) or sheet's (#1149) undo
     /// steps, newest first. A Project tab has no list.
@@ -29511,9 +29519,13 @@ impl Docxy {
 
     /// A right-click on a Project row's table (row `row` in task order; past
     /// the last task, the entry row), and `menu-open {"row"}`. The press
-    /// selects the row as a left click does, committing an open cell edit;
-    /// then the row's menu opens for it. A commit the plan refuses keeps the
-    /// edit and its status, and no menu opens.
+    /// selects the row as a left click does, committing an open cell edit,
+    /// unless it lands inside the selected range, which it keeps with the
+    /// cursor (#1213); then the row's menu opens for the clicked row either
+    /// way. Over a kept range its task items select the clicked row before
+    /// they run (`menu_activate`); its range items act on the range. A
+    /// commit the plan refuses keeps the edit and its status, and no menu
+    /// opens.
     pub(crate) fn open_row_menu(
         &mut self,
         row: usize,
@@ -29522,9 +29534,25 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        let v = self.press_project_row(row, col, window, cx)?;
-        let target = menu::MenuTarget::Row(v.selected_uid());
-        let items = project_row_menu(v);
+        let mut kept = false;
+        let v = self.press_project(window, cx, |tab| {
+            if let Surface::Project(v) = &mut tab.surface {
+                // As in `press_project_row`: a stale drag flag must not
+                // swallow this press.
+                v.drag_made_range = false;
+            }
+            kept = crate::project_row_menu_press(tab, row, col);
+        })?;
+        // A left click leaves the clicked row selected (or the task an
+        // entry-row commit made); a kept range leaves the cursor where it
+        // was, and the menu is still the clicked row's.
+        let clicked = if kept {
+            v.ed.project().tasks.get(row).map(|t| t.uid)
+        } else {
+            v.selected_uid()
+        };
+        let target = menu::MenuTarget::Row(clicked);
+        let items = project_row_menu(v, clicked);
         self.open_menu(target, at, items, cx);
         Ok(())
     }
@@ -29586,10 +29614,11 @@ impl Docxy {
         Ok(())
     }
 
-    /// The press a row or bar menu opens with: select row `row` of the
-    /// active Project as a left click does (on column `col`, if any),
-    /// committing an open cell edit, and refocus. A commit the plan refuses
-    /// keeps the edit and its status, and is the error.
+    /// The press a bar menu opens with, and the one a row menu's task item
+    /// makes over a kept range: select row `row` of the active Project as a
+    /// left click does (on column `col`, if any), committing an open cell
+    /// edit, and refocus. A commit the plan refuses keeps the edit and its
+    /// status, and is the error.
     fn press_project_row(
         &mut self,
         row: usize,
@@ -29917,7 +29946,15 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         let menu = self.menu.as_ref().ok_or("no menu is open")?;
-        menu::target_stands(&menu.target, self.project_selection())?;
+        // A row menu opened inside the selected range kept the range and the
+        // cursor (#1213): it still stands while the range holds its row.
+        let kept_row = match menu.target {
+            menu::MenuTarget::Row(Some(uid)) if self.project_range_has(uid) => Some(uid),
+            _ => None,
+        };
+        if kept_row.is_none() {
+            menu::target_stands(&menu.target, self.project_selection())?;
+        }
         let entry = menu::entry_at(&menu.items, path).ok_or("no such menu item")?;
         if !entry.enabled {
             return Err(format!("menu item '{}' is disabled", entry.label));
@@ -29927,6 +29964,21 @@ impl Docxy {
         }
         let act = entry.act;
         self.close_menu();
+        // Its task items are the clicked row's: one that drops the range
+        // anyway first selects that row as a left click does, so it acts on
+        // the row exactly as before #1213. The range items (Cut, Copy,
+        // Paste, Fill Down, Clear Contents) run on the kept range.
+        if let (Some(uid), Some(Act::Project(a))) = (kept_row, act)
+            && project_act_clears_range(a)
+            && self.project_selection().and_then(|(sel, _)| sel) != Some(uid)
+        {
+            let row = match self.tabs.get(self.active).map(|t| &t.surface) {
+                Some(Surface::Project(v)) => v.ed.project().tasks.iter().position(|t| t.uid == uid),
+                _ => None,
+            }
+            .ok_or("the row menu's task is gone")?;
+            self.press_project_row(row, None, window, cx)?;
+        }
         match act {
             Some(act) => self.dispatch(act, window, cx),
             None => self.refocus(window, cx),
