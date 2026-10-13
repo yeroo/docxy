@@ -949,18 +949,7 @@ fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
                 let (name, start, n) = (p.name(), p.start_pos(), para.content.len());
                 match name {
                     "w:pPr" => parse_ppr(p, &mut para.props),
-                    "w:r" => {
-                        let start = p.start_pos();
-                        let mut tmp = Vec::new();
-                        if parse_run(p, &mut tmp) {
-                            // Run held a drawing/field/etc. SmartArt becomes a text box;
-                            // anything else is preserved verbatim.
-                            let raw = p.raw_slice(start, p.pos()).to_string();
-                            para.content.push(drawing_inline(raw, rels));
-                        } else {
-                            para.content.extend(tmp);
-                        }
-                    }
+                    "w:r" => parse_run_into(p, rels, &mut para.content),
                     "w:hyperlink" => parse_hyperlink_into(p, rels, &mut para.content),
                     // Tracked change: show the inserted/deleted text (instead of
                     // hiding it as opaque raw) while preserving the revision markup.
@@ -1152,10 +1141,37 @@ fn allowed_in_field(inline: &Inline) -> bool {
         Inline::Field { .. } => true,
         Inline::Raw(raw) => {
             raw.trim_start().starts_with("<w:proofErr")
+                || is_empty_run(raw)
                 || crate::hf::is_smart_tag_open(raw)
                 || crate::hf::is_smart_tag_close(raw)
         }
         _ => false,
+    }
+}
+
+/// Whether `raw` is a `w:r` that shows nothing: its element children are
+/// only `w:rPr` and `w:lastRenderedPageBreak` (or it has none). The loader
+/// keeps such a run as a zero-width Raw (#1217). A run whose children are
+/// ones the loader skips as unknown (`w:ruby`, …) is not: it may show
+/// something.
+pub(crate) fn is_empty_run(raw: &str) -> bool {
+    let mut p = XmlParser::new(raw);
+    if !matches!(p.next(), Event::Start) || p.name() != "w:r" {
+        return false;
+    }
+    loop {
+        match p.next() {
+            Event::Start => match p.name() {
+                "w:rPr" | "w:lastRenderedPageBreak" => p.skip_element(),
+                _ => return false,
+            },
+            Event::Text => {
+                if !p.text().trim().is_empty() {
+                    return false;
+                }
+            }
+            Event::End | Event::Eof => return true,
+        }
     }
 }
 
@@ -1337,16 +1353,7 @@ fn parse_inlines_with_smart_tag_pr(
             Event::Start => {
                 let (name, start, n) = (p.name(), p.start_pos(), out.len());
                 match name {
-                    "w:r" => {
-                        let start = p.start_pos();
-                        let mut tmp = Vec::new();
-                        if parse_run(p, &mut tmp) {
-                            let raw = p.raw_slice(start, p.pos()).to_string();
-                            out.push(drawing_inline(raw, rels));
-                        } else {
-                            out.extend(tmp);
-                        }
-                    }
+                    "w:r" => parse_run_into(p, rels, out),
                     "w:hyperlink" => parse_hyperlink_into(p, rels, out),
                     "w:ins" => out.push(parse_revision(p, rels, RevisionKind::Insert)),
                     "w:del" => out.push(parse_revision(p, rels, RevisionKind::Delete)),
@@ -1948,6 +1955,27 @@ fn parse_numpr(p: &mut XmlParser, props: &mut ParProps) {
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
+    }
+}
+
+/// Parse a `w:r` run into `out`. A run that held a drawing, field, etc. is
+/// kept whole: SmartArt becomes a text box, anything else is preserved
+/// verbatim. So is a run that produced no inline (only a `w:rPr`, say):
+/// a zero-width Raw keeps it on save (#1217). Either raw declares the
+/// prefixes it uses that a save does not keep (see [`rebuilt_bindings`]).
+fn parse_run_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {
+    let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
+    let mut tmp = Vec::new();
+    if parse_run(p, &mut tmp) {
+        let raw = declare_rebuilt(p.raw_slice(start, p.pos()), &bindings);
+        out.push(drawing_inline(raw, rels));
+    } else if tmp.is_empty() {
+        out.push(Inline::Raw(declare_rebuilt(
+            p.raw_slice(start, p.pos()),
+            &bindings,
+        )));
+    } else {
+        out.extend(tmp);
     }
 }
 
@@ -3060,6 +3088,31 @@ mod tests {
 
     fn doc(xml: &str) -> Document {
         parse_document_xml(xml, &Relationships::default())
+    }
+
+    #[test]
+    fn is_empty_run_accepts_only_runs_that_show_nothing() {
+        for raw in [
+            "<w:r/>",
+            "<w:r w:rsidR=\"1\"/>",
+            "<w:r></w:r>",
+            "<w:r><w:rPr><w:noProof/></w:rPr></w:r>",
+            "<w:r>\n  <w:rPr><w:b/></w:rPr>\n</w:r>",
+            "<w:r><w:lastRenderedPageBreak/></w:r>",
+            "<w:r xmlns:x=\"urn:x\"><w:rPr><x:foo/></w:rPr></w:r>",
+        ] {
+            assert!(is_empty_run(raw), "{raw}");
+        }
+        for raw in [
+            "<w:r><w:t>x</w:t></w:r>",
+            "<w:r><w:t></w:t></w:r>",
+            "<w:r><w:ruby/></w:r>",
+            "<w:r><w:pict/></w:r>",
+            "<w:proofErr w:type=\"spellStart\"/>",
+            "<w:rPr/>",
+        ] {
+            assert!(!is_empty_run(raw), "{raw}");
+        }
     }
 
     #[test]

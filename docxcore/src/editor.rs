@@ -3342,11 +3342,14 @@ fn link_part(h: &Hyperlink, local: usize) -> LinkPart {
 }
 
 /// A zero-width child that shows nothing: a bookmark, proofing or permission
-/// mark, a comment range, or a smart tag's boundary. These may leave a link
-/// whose text is all deleted.
+/// mark, a comment range, a smart tag's boundary, or an empty `w:r` (#1217).
+/// These may leave a link whose text is all deleted.
 fn is_marker(inline: &Inline) -> bool {
     if let Inline::Raw(raw) = inline {
-        if crate::hf::is_smart_tag_open(raw) || crate::hf::is_smart_tag_close(raw) {
+        if crate::hf::is_smart_tag_open(raw)
+            || crate::hf::is_smart_tag_close(raw)
+            || crate::load::is_empty_run(raw)
+        {
             return true;
         }
     }

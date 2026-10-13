@@ -64,10 +64,11 @@ loss outside its shrink-only baseline. Where the losses described above stand:
   border width, `jc="distribute"`, underline style): #1068. An unedited
   property is now written as loaded, so the gate's unedited saves no longer
   hit it. An edited property is still generated from the supported set;
-- run content restructured: #1069, which now holds only an empty `w:r` (no
-  children) that the loader drops (`pict+pict.docx`). A `w:r`'s children
-  saved as one `w:r` each, the dropped `lastRenderedPageBreak` and the
-  explicit `w:br` type were fixed in #1216, and row-level `sdt` in #1215.
+- run content restructured: #1069. That baseline class is gone. A `w:r`'s
+  children saved as one `w:r` each, the dropped `lastRenderedPageBreak` and
+  the explicit `w:br` type were fixed in #1216, row-level `sdt` in #1215,
+  and a `w:r` with no modeled content (`pict+pict.docx`), which the loader
+  dropped, in #1217.
   `MISALIGNED_RUNS` in `docxcore/tests/fidelity.rs`, for intact run
   properties that read as lost when a split run misaligns the comparator,
   is empty since #1216.
