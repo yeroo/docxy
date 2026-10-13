@@ -164,7 +164,7 @@ fn paragraph_ends(blocks: &[Block], prefix: &[usize]) -> Option<(Vec<usize>, Vec
 
 /// The text width available at a caret: the innermost cell's width, else the
 /// section's text width.
-fn width_at(ed: &Editor) -> u32 {
+pub(super) fn width_at(ed: &Editor) -> u32 {
     width_at_path(ed, &ed.caret.path)
 }
 
@@ -483,11 +483,18 @@ impl Editor {
         if rows == 0 || cols == 0 {
             return Err("a table needs at least one row and one column".into());
         }
+        let table = new_table(rows, cols, width_at(self), fit);
+        self.insert_built_table(table)
+    }
+
+    /// Put `table` at the caret as [`Editor::insert_table`] does: the
+    /// paragraph split, nesting, the following paragraph, placeholders,
+    /// revisions and the caret in the first cell. One undo step.
+    pub(super) fn insert_built_table(&mut self, table: Table) -> Result<(), String> {
         let path = self.caret.path.clone();
         let Some(len) = resolve_para(&self.doc.body, &path).map(para_text_len) else {
             return Err("the caret is not in a paragraph".into());
         };
-        let table = new_table(rows, cols, width_at(self), fit);
         let off = self.caret.offset.min(len);
         self.checkpoint(EditKind::Structural);
         self.anchor = None;
