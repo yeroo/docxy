@@ -65,18 +65,12 @@ const CLASSES: &[LossClass] = &[
         matches: |e| is_cell(e, "formula-text"),
     },
     LossClass {
-        name: "cell values changed: a cached string's literal CR LF, which XML reads \
-               as LF, is written back with the CR escaped (tdf169326: the reader skips \
-               XML line-end normalization); a cell past the last column (XFE1) lands \
-               on XFC1 (too-many-cols-rows): one entry per cell",
+        // tdf169326's cached CR LF was here until #761 read XML line ends as
+        // LF; a changed value there is now a new loss, not a known one.
+        name: "cell values changed: a cell past the last column (XFE1) lands on XFC1 \
+               (too-many-cols-rows): one entry per cell",
         issue: "#1091",
-        matches: |e| {
-            is_cell(e, "value")
-                && (e
-                    .file
-                    .ends_with("/tdf169326_ignore_line_breaks_in_referenced_cells.xlsx")
-                    || e.file.ends_with("/too-many-cols-rows.xlsx"))
-        },
+        matches: |e| is_cell(e, "value") && e.file.ends_with("/too-many-cols-rows.xlsx"),
     },
     LossClass {
         name: "the dimension is recomputed from the cells the model keeps (a source \
