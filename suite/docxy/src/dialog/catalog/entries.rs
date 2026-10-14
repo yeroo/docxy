@@ -24,6 +24,10 @@ const fn checkbox(name: &'static str) -> Field {
     Field::other(name, ControlKind::Checkbox)
 }
 
+const fn list(name: &'static str) -> Field {
+    Field::other(name, ControlKind::List)
+}
+
 /// Tab to a radio group or dropdown and step it `down` items, as a person
 /// picks a choice that shows or enables another control.
 macro_rules! pick {
@@ -102,6 +106,30 @@ const SEPARATORS: &str =
     "the separators only change how numbers parse, and the wizard's column here is text";
 const THROUGH_ADD: &str = "the value takes effect through Add, not OK";
 const SORT_LIST: &str = "its list is read only with Order: Custom List... chosen";
+const NO_NAMES: &str =
+    "basic.xlsx defines no names, and the suite cannot define one yet (Define Name is to do)";
+const MATH_READ_ONLY: &str = "Math AutoCorrect's list is shown disabled, as a reference";
+
+// Two references in Consolidate's list, added by real input, so Up and Down
+// have items to step through.
+const TWO_REFS: &[&str] = &[
+    r#"call pointer-click {"dialog-field":"reference"}"#,
+    r#"call real-type {"text":"B2:B5"}"#,
+    r#"call pointer-click {"dialog-button":"Add"}"#,
+    r#"call pointer-click {"dialog-field":"reference"}"#,
+    r#"call real-type {"text":"C2:C5"}"#,
+    r#"call pointer-click {"dialog-button":"Add"}"#,
+];
+// Two INitial CAps exceptions (the list starts empty), added by real input.
+const TWO_CAPS: &[&str] = &[
+    r#"call pointer-click {"dialog-tab":"INitial CAps"}"#,
+    r#"call pointer-click {"dialog-field":"caps-word"}"#,
+    r#"call real-type {"text":"IDs"}"#,
+    r#"call pointer-click {"dialog-button":"Add"}"#,
+    r#"call pointer-click {"dialog-field":"caps-word"}"#,
+    r#"call real-type {"text":"PCs"}"#,
+    r#"call pointer-click {"dialog-button":"Add"}"#,
+];
 
 // What OK shows.
 const ENVELOPE_ADDED: &str = "assert status is Envelope added: Size 10 (4 1/8 x 9 1/2 in)";
@@ -850,6 +878,8 @@ dialogs! {
             checkbox("ac_math_replace").on("Math AutoCorrect"),
             Field::text("replace").on("AutoCorrect").no_ok(THROUGH_ADD),
             Field::text("with").on("AutoCorrect").no_ok(THROUGH_ADD),
+            list("entries").on("AutoCorrect"),
+            list("math-entries").on("Math AutoCorrect").skip(MATH_READ_ONLY),
         ],
         reopen: &[],
         accept_closes: true,
@@ -865,7 +895,9 @@ dialogs! {
         ],
         fields: &[
             Field::text("first-word").on("First Letter").no_ok(THROUGH_ADD),
+            list("first-list").on("First Letter"),
             Field::text("caps-word").on("INitial CAps").no_ok(THROUGH_ADD),
+            list("caps-list").on("INitial CAps").prep(TWO_CAPS),
         ],
         reopen: &[],
         accept_closes: true,
@@ -930,6 +962,7 @@ dialogs! {
             Field::text("reference")
                 .sample("B2:B5")
                 .applied(&["assert cell E1 is 10", "assert cell E4 is 40"]),
+            list("refs").prep(TWO_REFS),
             checkbox("top"),
             checkbox("left"),
             checkbox("links"),
@@ -1001,6 +1034,7 @@ dialogs! {
             r#"call pointer-click {"at":"custom-lists-row"}"#,
         ],
         fields: &[
+            list("lists"),
             Field::text("entries").sample("Lo, Mid, Hi").no_ok(THROUGH_ADD),
         ],
         reopen: &[],
@@ -1023,6 +1057,7 @@ dialogs! {
         fixture: XLSX,
         open: &["key ctrl+g"],
         fields: &[
+            list("names").skip(NO_NAMES),
             Field::text("reference").sample("K3:L4").applied(&["assert range is K3:L4"]),
         ],
         reopen: &[],

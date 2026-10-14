@@ -424,13 +424,16 @@ pub(crate) fn sort_dialog(tab: &DocTab, area: Area, header: bool) -> Result<Dial
         Value::Choice(Some(0)),
     );
     orientation.items = vec!["Sort top to bottom".into(), "Sort left to right".into()];
-    // The key labels for each orientation, which the reaction swaps in.
-    let mut col_keys = Control::new("col-keys", "", ControlKind::List, Value::Choice(None));
-    col_keys.items = cols;
-    col_keys.visible = false;
-    let mut row_keys = Control::new("row-keys", "", ControlKind::List, Value::Choice(None));
-    row_keys.items = rows;
-    row_keys.visible = false;
+    // The key labels for each orientation, which the reaction swaps in: hidden
+    // stores of items, never picked from (a list would be editable, #988).
+    let store = |name, items| {
+        let mut c = Control::new(name, "", ControlKind::Label, Value::Text(String::new()));
+        c.items = items;
+        c.visible = false;
+        c
+    };
+    let col_keys = store("col-keys", cols);
+    let row_keys = store("row-keys", rows);
     controls.extend([
         Control::new(
             "headers",

@@ -151,8 +151,9 @@ impl Field {
         }
     }
 
-    /// A control with no typing: a dropdown, checkbox, radio group or check
-    /// list. Only dropdowns get cases (a click focuses, Down steps it).
+    /// A control with no typing: a dropdown, checkbox, radio group, list or
+    /// check list. Only dropdowns (a click focuses, Down steps it) and lists
+    /// (Tab focuses, Down steps it; #988) get cases.
     pub const fn other(name: &'static str, kind: ControlKind) -> Self {
         Self {
             kind,

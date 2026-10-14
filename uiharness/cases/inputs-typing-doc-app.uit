@@ -819,6 +819,39 @@ test doc autocorrect/with: Escape cancels
   assert reply.value is not Esc9
   call real-key {"key":"escape"}
 
+test doc autocorrect/entries: focus by Tab
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"AutoCorrect"}
+  call real-key {"key":"tab","to-field":"entries"}
+  call field-read {"dialog-field":"entries"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc autocorrect/entries: Up and Down step
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  assert dialog is autocorrect
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"AutoCorrect"}
+  call real-key {"key":"tab","to-field":"entries"}
+  call field-read {"dialog-field":"entries"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"entries"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"entries"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"entries"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
 test doc autocorrect-exceptions: matches the catalogue
   open ../fixtures/basic.docx
   call autocorrect {}
@@ -968,6 +1001,41 @@ test doc autocorrect-exceptions/first-word: Escape cancels
   assert reply.value is not Esc9
   call real-key {"key":"escape"}
 
+test doc autocorrect-exceptions/first-list: focus by Tab
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"First Letter"}
+  call real-key {"key":"tab","to-field":"first-list"}
+  call field-read {"dialog-field":"first-list"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc autocorrect-exceptions/first-list: Up and Down step
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"First Letter"}
+  call real-key {"key":"tab","to-field":"first-list"}
+  call field-read {"dialog-field":"first-list"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"first-list"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"first-list"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"first-list"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
 test doc autocorrect-exceptions/caps-word: focus by click
   open ../fixtures/basic.docx
   call autocorrect {}
@@ -1107,6 +1175,55 @@ test doc autocorrect-exceptions/caps-word: Escape cancels
   call pointer-click {"dialog-tab":"INitial CAps"}
   call field-read {"dialog-field":"caps-word"}
   assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test doc autocorrect-exceptions/caps-list: focus by Tab
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"INitial CAps"}
+  call pointer-click {"dialog-field":"caps-word"}
+  call real-type {"text":"IDs"}
+  call pointer-click {"dialog-button":"Add"}
+  call pointer-click {"dialog-field":"caps-word"}
+  call real-type {"text":"PCs"}
+  call pointer-click {"dialog-button":"Add"}
+  call pointer-click {"dialog-tab":"INitial CAps"}
+  call real-key {"key":"tab","to-field":"caps-list"}
+  call field-read {"dialog-field":"caps-list"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc autocorrect-exceptions/caps-list: Up and Down step
+  open ../fixtures/basic.docx
+  call autocorrect {}
+  call dialog-click {"button":"Exceptions..."}
+  assert dialog is autocorrect-exceptions
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"INitial CAps"}
+  call pointer-click {"dialog-field":"caps-word"}
+  call real-type {"text":"IDs"}
+  call pointer-click {"dialog-button":"Add"}
+  call pointer-click {"dialog-field":"caps-word"}
+  call real-type {"text":"PCs"}
+  call pointer-click {"dialog-button":"Add"}
+  call pointer-click {"dialog-tab":"INitial CAps"}
+  call real-key {"key":"tab","to-field":"caps-list"}
+  call field-read {"dialog-field":"caps-list"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"caps-list"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"caps-list"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"caps-list"}
+  assert reply.index is 1
   call real-key {"key":"escape"}
 
 test doc autocorrect-redefine: matches the catalogue

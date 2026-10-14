@@ -133,12 +133,13 @@ pub(crate) enum DialogOwner {
         c2: u32,
         header: bool,
     },
-    /// Excel's Consolidate (#694), writing at (`row`, `col`) of `sheet`.
-    /// Add, Delete and OK apply in `sheet_consolidate::click`.
+    /// Excel's Consolidate (#694), writing at `area` of `sheet`: the
+    /// selection it opened on, which limits the output when it spans more
+    /// than one cell (#988). Add, Delete and OK apply in
+    /// `sheet_consolidate::click`.
     Consolidate {
         sheet: usize,
-        row: u32,
-        col: u32,
+        area: (u32, u32, u32, u32),
     },
     /// Excel's Data Validation dialog (#689) over `range` of `sheet`. OK and
     /// Clear All apply in `sheet_validation::click`.
@@ -381,13 +382,14 @@ impl ControlKind {
             Self::Text | Self::Number | Self::Date | Self::Duration
         )
     }
-    /// A control the keyboard and pointer can edit: a list and a grid are
-    /// still read-only widgets, and a label is never edited.
+    /// A control the keyboard and pointer can edit: a grid is still a
+    /// read-only widget, and a label is never edited. A list's item is
+    /// chosen by a click or Up/Down/Home/End (#988).
     pub fn is_editable(self) -> bool {
         self.is_text()
             || matches!(
                 self,
-                Self::Checkbox | Self::Radio | Self::Dropdown | Self::CheckList
+                Self::Checkbox | Self::Radio | Self::Dropdown | Self::List | Self::CheckList
             )
     }
 }
@@ -527,7 +529,9 @@ impl Control {
     /// The control's input handler. `dialog-set` calls it, and so will a form's
     /// editable widget once one is drawn (today's overlay draws controls
     /// read-only). `args` is the verb's argument object: `value`,
-    /// or for a grid `{row, column, value}`, `{insert_row}` or `{delete_row}`.
+    /// or for a grid `{row, column, value}`, `{insert_row}` or `{delete_row}`;
+    /// a radio group, dropdown or list also takes `{index}`, which picks one
+    /// of two items that read the same.
     fn set(&mut self, args: &Json) -> Result<(), String> {
         let label = &shown(&self.label);
         if !self.visible {
@@ -558,6 +562,20 @@ impl Control {
                 Json::Bool(b) => Value::Bool(*b),
                 _ => return Err(format!("'{label}' takes true or false")),
             },
+            ControlKind::Radio | ControlKind::Dropdown | ControlKind::List
+                if args.get("index").is_some() =>
+            {
+                match args.get("index") {
+                    Some(Json::Num(n)) if n.fract() == 0.0 && *n >= 0.0 => {
+                        let i = *n as usize;
+                        if i >= self.items.len() {
+                            return Err(format!("'{label}' has no item {i}"));
+                        }
+                        Value::Choice(Some(i))
+                    }
+                    _ => return Err(format!("'{label}' takes an item index")),
+                }
+            }
             ControlKind::Radio | ControlKind::Dropdown | ControlKind::List => {
                 let want = text()?;
                 let i = self
@@ -1256,8 +1274,9 @@ impl Dialog {
     }
 
     /// A press on a control, as the pointer makes it: a field takes the
-    /// focus, a checkbox toggles, a radio picks `item`, a dropdown steps to its
-    /// next item (or picks `item`). Each change goes through `Control::set`.
+    /// focus, a checkbox toggles, a radio or list picks `item`, a dropdown
+    /// steps to its next item (or picks `item`). Each change goes through
+    /// `Control::set`.
     pub fn click_control(&mut self, index: usize, item: Option<usize>) -> Result<(), String> {
         let c = self.controls.get(index).ok_or("no such control")?;
         if !self.focusable().contains(&index) {
@@ -1283,22 +1302,28 @@ impl Dialog {
                     ]),
                 );
             }
-            (ControlKind::Radio | ControlKind::Dropdown, Value::Choice(cur)) => {
+            (
+                ControlKind::Radio | ControlKind::Dropdown | ControlKind::List,
+                Value::Choice(cur),
+            ) => {
                 let n = c.items.len().max(1);
                 let pick = match (item, c.kind) {
                     (Some(i), _) => i,
                     (None, ControlKind::Dropdown) => cur.map_or(0, |i| (i + 1) % n),
                     (None, _) => return Ok(()),
                 };
-                Json::Str(c.items.get(pick).ok_or("no such item")?.clone())
+                if pick >= c.items.len() {
+                    return Err("no such item".into());
+                }
+                return self.set_at(index, &Json::obj(vec![("index", Json::Num(pick as f64))]));
             }
             _ => return Ok(()),
         };
         self.set_at(index, &Json::obj(vec![("value", value)]))
     }
 
-    /// Up or Down on the focused radio group or dropdown: the item before or
-    /// after the chosen one.
+    /// Up or Down on the focused radio group, dropdown or list: the item
+    /// before or after the chosen one.
     pub fn step_focused(&mut self, down: bool) -> Result<(), String> {
         let Some(c) = self.focused() else {
             return Ok(());
@@ -1317,6 +1342,21 @@ impl Dialog {
         };
         let i = self.focus.unwrap_or_default();
         self.click_control(i, Some(pick))
+    }
+
+    /// Home or End on the focused list: its first or last item. `false`
+    /// (nothing done) when the focus is not on a list, whose Home and End
+    /// move a field's caret instead.
+    pub fn list_edge(&mut self, end: bool) -> Result<bool, String> {
+        let Some(c) = self.focused().filter(|c| c.kind == ControlKind::List) else {
+            return Ok(false);
+        };
+        let Some(last) = c.items.len().checked_sub(1) else {
+            return Ok(true);
+        };
+        let i = self.focus.unwrap_or_default();
+        self.click_control(i, Some(if end { last } else { 0 }))?;
+        Ok(true)
     }
 
     /// Space: toggles a focused checkbox; a field takes it as a character.

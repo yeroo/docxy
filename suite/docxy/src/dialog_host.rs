@@ -394,7 +394,9 @@ pub(crate) fn edit_key(
             Ok(())
         }
         "home" | "end" => {
-            d.move_caret_edge(key == "end", m.shift);
+            if !d.list_edge(key == "end")? {
+                d.move_caret_edge(key == "end", m.shift);
+            }
             Ok(())
         }
         "space" => d.space(),
@@ -666,8 +668,8 @@ impl Docxy {
         cx.notify();
     }
 
-    /// One control's widget: a field, checkbox, radio group or dropdown that
-    /// takes the pointer, or a list, grid or label drawn as text.
+    /// One control's widget: a field, checkbox, radio group, dropdown or list
+    /// that takes the pointer, or a grid or label drawn as text.
     fn dialog_widget(&self, d: &Dialog, i: usize, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let c = &d.controls[i];
         let focused = d.focus == Some(i) && d.focused().is_some();
@@ -820,6 +822,63 @@ impl Docxy {
                     .child(label)
                     .child(
                         div()
+                            .border_1()
+                            .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
+                            .bg(pal.panel)
+                            .child(list),
+                    )
+                    .into_any_element()
+            }
+            ControlKind::List => {
+                // One row per item, the chosen one shaded; a click chooses it
+                // (#988). Virtualised like the check list: Go To's names can
+                // run long.
+                let n = c.items.len();
+                let list = uniform_list(
+                    ("dialog-list", i),
+                    n,
+                    cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                        let Some(c) = this
+                            .active_dialogs()
+                            .and_then(|s| s.top())
+                            .and_then(|d| d.controls.get(i))
+                        else {
+                            return vec![];
+                        };
+                        let chosen = match c.value {
+                            dialog::Value::Choice(k) => k,
+                            _ => None,
+                        };
+                        let enabled = c.enabled;
+                        range
+                            .filter(|&k| k < c.items.len())
+                            .map(|k| {
+                                h_flex()
+                                    .id(("dialog-list-item", k))
+                                    .h(px(18.))
+                                    .px_1()
+                                    .when(chosen == Some(k), |r| r.bg(hsla_u(BRAND).opacity(0.35)))
+                                    .child(SharedString::from(c.items[k].clone()))
+                                    .when(enabled, |r| {
+                                        r.cursor_pointer().on_click(on_widget(cx, i, Some(k)))
+                                    })
+                                    .into_any_element()
+                            })
+                            .collect()
+                    }),
+                )
+                .h(px(18. * n.clamp(3, 8) as f32))
+                .w_full();
+                v_flex()
+                    .id(("dialog-control", i))
+                    .gap_1()
+                    .text_size(px(12.))
+                    .text_color(fg)
+                    .child(probe(&self.probes, format!("dialog-control:{}", c.name)))
+                    .child(label)
+                    .child(
+                        div()
+                            .min_w(px(160.))
                             .border_1()
                             .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
                             .bg(pal.panel)
