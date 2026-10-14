@@ -1646,9 +1646,18 @@ pub(crate) fn settings_xls_lacks(pkg: &SheetPackage) -> Vec<String> {
             match child.rank_as {
                 // Written (the sheets, the active tab, the date system,
                 // the names, iteration), or nothing a workbook shows.
+                // Nothing a person sees in the workbook: the version that
+                // saved it, function categories, the link list (formulas
+                // into another workbook are counted), the OLE size, web
+                // publishing and smart tag options, revision ids, the path
+                // it was saved at.
                 "fileVersion" | "functionGroups" | "externalReferences" | "oleSize"
-                | "fileRecoveryPr" | "webPublishing" | "smartTagPr" | "smartTagTypes"
-                | "revisionPtr" | "absPath" => {}
+                | "webPublishing" | "smartTagPr" | "smartTagTypes" | "revisionPtr" | "absPath" => {}
+                "fileRecoveryPr" => each_start(raw, &mut |n, p| {
+                    if n == "fileRecoveryPr" && off(p.attr("autoRecover")) {
+                        push("workbook options");
+                    }
+                }),
                 // The date system is written; a backup copy and hidden
                 // objects aren't.
                 "workbookPr" => each_start(raw, &mut |n, p| {
@@ -1660,6 +1669,14 @@ pub(crate) fn settings_xls_lacks(pkg: &SheetPackage) -> Vec<String> {
                     }
                     if matches!(p.attr("showObjects"), "none" | "placeholders") {
                         push("workbook window settings");
+                    }
+                    if matches!(p.attr("updateLinks"), "never" | "always")
+                        || off(p.attr("saveExternalLinkValues"))
+                    {
+                        push("external link settings");
+                    }
+                    if on(p.attr("filterPrivacy")) {
+                        push("workbook options");
                     }
                 }),
                 // The active tab is written; the window's own settings
@@ -1711,6 +1728,9 @@ pub(crate) fn settings_xls_lacks(pkg: &SheetPackage) -> Vec<String> {
                     }
                     if p.attr("refMode") == "R1C1" {
                         push("R1C1 reference style");
+                    }
+                    if off(p.attr("calcOnSave")) {
+                        push("workbook options");
                     }
                 }),
                 "sheets" => each_start(raw, &mut |n, p| {

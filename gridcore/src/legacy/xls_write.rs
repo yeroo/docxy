@@ -2723,6 +2723,23 @@ mod tests {
                 "workbook window settings",
             ),
             (r#"<calcPr refMode="R1C1"/>"#.into(), "R1C1 reference style"),
+            (
+                r#"<workbookPr updateLinks="never"/>"#.into(),
+                "external link settings",
+            ),
+            (
+                r#"<workbookPr saveExternalLinkValues="0"/>"#.into(),
+                "external link settings",
+            ),
+            (
+                r#"<workbookPr filterPrivacy="1"/>"#.into(),
+                "workbook options",
+            ),
+            (r#"<calcPr calcOnSave="0"/>"#.into(), "workbook options"),
+            (
+                r#"<fileRecoveryPr autoRecover="0"/>"#.into(),
+                "workbook options",
+            ),
         ];
         for (workbook, want) in &book_cases {
             assert_eq!(with(workbook, "", None), [*want], "{workbook}");
@@ -2747,7 +2764,10 @@ mod tests {
         // A plain view with a frozen pane, Excel's bookkeeping and the parts
         // every package has name nothing.
         let plain = with(
-            &ext(r#"<x15:workbookPr chartTrackingRefBase="1" xmlns:x15="urn:x15"/>"#),
+            &format!(
+                r#"<workbookPr updateLinks="userSet" saveExternalLinkValues="1"/><calcPr calcOnSave="1"/><fileRecoveryPr autoRecover="1"/>{}"#,
+                ext(r#"<x15:workbookPr chartTrackingRefBase="1" xmlns:x15="urn:x15"/>"#)
+            ),
             r#"<sheetViews><sheetView colorId="64" defaultGridColor="1" workbookViewId="0"><pane ySplit="1" topLeftCell="A2" state="frozen"/></sheetView></sheetViews><printOptions/><pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>"#,
             Some("xl/printerSettings/printerSettings1.bin"),
         );
