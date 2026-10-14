@@ -80,6 +80,7 @@ pub(crate) fn verb_for(name: &str) -> Option<&'static str> {
         "xlsxy_import_text" => "sheet.import-text",
         "xlsxy_text_to_columns" => "range.text-to-columns",
         "xlsxy_options" => "app.options",
+        "xlsxy_convert" => "wb.convert",
         _ => return None,
     })
 }
@@ -1114,6 +1115,13 @@ fn tool_defs() -> Json {
             ],
             &[],
         ),
+        // #874: Excel 97-2003 Compatibility Mode.
+        tool(
+            "xlsxy_convert",
+            "Convert a workbook in Compatibility Mode (an Excel 97-2003 .xls) to the current file format, as File > Info > Convert does but without its prompt: writes <name>.xlsx, deletes the .xls once that is written, and binds the workbook to the .xlsx. Returns path, compat, removed (whether the .xls was deleted) and lost (what the .xls had that the open left out).",
+            vec![target()],
+            &[],
+        ),
     ])
 }
 
@@ -1244,12 +1252,14 @@ mod tests {
             "xlsxy_import_text",
             "xlsxy_text_to_columns",
             "xlsxy_options",
+            // #874: Compatibility Mode's Convert.
+            "xlsxy_convert",
         ];
         let save_pos = names.iter().position(|n| *n == "xlsxy_save").unwrap();
         assert_eq!(
             &names[save_pos + 1..],
             &expected_tail,
-            "wave-1/wave-2/wave-3/#600/#612/#712/#761 tools must be appended right after xlsxy_save, in this order"
+            "wave-1/wave-2/wave-3/#600/#612/#712/#761/#874 tools must be appended right after xlsxy_save, in this order"
         );
         for t in tools {
             assert_eq!(
@@ -1513,6 +1523,7 @@ mod tests {
         ("xlsxy_import_text", "sheet.import-text"),
         ("xlsxy_text_to_columns", "range.text-to-columns"),
         ("xlsxy_options", "app.options"),
+        ("xlsxy_convert", "wb.convert"),
     ];
     /// Tools handled specially in `do_tool` (not simple verb forwards), so
     /// `verb_for` deliberately returns `None` for them.

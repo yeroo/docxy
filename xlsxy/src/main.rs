@@ -45,7 +45,7 @@ use gridcore::entry::{EntryCtx, entry_cell_ctx, entry_ctx, seed_text};
 use gridcore::fcomplete::Completions;
 use gridcore::formula::{qualify_sheet_in_formula, translate_formula};
 use gridcore::frame::Agg;
-use gridcore::legacy::{SourceFormat, open_workbook as open_any};
+use gridcore::legacy::{SourceFormat, open_workbook_ex as open_any};
 use gridcore::model::{
     DataModel, MODEL_PART, ModelSpec, Relationship, model_part_xml, model_pivot, parse_model_part,
 };
@@ -389,6 +389,9 @@ const SAVE_TYPES: [backstage::SaveType; 29] = [
 enum SaveKind {
     /// The workbook package (`.xlsx`, `.xlsm`, `.xltx`, `.xltm`).
     Package,
+    /// Excel 97-2003 Workbook (`.xls`, BIFF8): the workbook goes into
+    /// Compatibility Mode (#874).
+    Xls,
     /// The active sheet as delimited text, `eol` after each record.
     Text {
         delim: char,
@@ -437,6 +440,7 @@ fn save_kind(t: &backstage::SaveType) -> SaveKind {
         "Web Page" => SaveKind::WebPage,
         "XML Data" => SaveKind::XmlData,
         "PDF" => SaveKind::Pdf,
+        "Excel 97-2003 Workbook" => SaveKind::Xls,
         _ => SaveKind::Unsupported,
     }
 }
@@ -494,6 +498,27 @@ fn type_ext(path: &str) -> Option<String> {
 /// Does `path` carry type `t`'s extension (or its alias)?
 fn has_type_ext(path: &str, t: usize) -> bool {
     type_ext(path).as_deref() == SAVE_TYPES.get(t).map(|ty| ty.ext)
+}
+
+/// An `.xls` name: an Excel 97-2003 workbook, which a save writes as BIFF8.
+fn is_xls(path: &str) -> bool {
+    type_ext(path).as_deref() == Some("xls")
+}
+
+/// Whether the file `path`, read as `format`, opens in Excel's
+/// Compatibility Mode (#874): an Excel 97-2003 workbook named `.xls`, bound
+/// to itself, so a save writes it back. Any other BIFF8 file (an `.xlt`,
+/// an `.xla`, one misnamed) stays an import.
+fn opens_in_compat(path: &str, format: SourceFormat) -> bool {
+    format == SourceFormat::Xls && is_xls(path)
+}
+
+/// Whether opening `path`, read as `format`, is an import bound to a new
+/// `.xlsx`: an `.xls`, `.xlsb` or `.ods` that doesn't open in Compatibility
+/// Mode, and a workbook package named `.xls`, which would otherwise be
+/// written back as BIFF8.
+fn opens_as_import(path: &str, format: SourceFormat) -> bool {
+    (format.is_import() && !opens_in_compat(path, format)) || is_xls(path)
 }
 
 /// A `.txt` or `.prn`: opened through the Text Import Wizard.
@@ -577,7 +602,7 @@ fn main() -> ExitCode {
                 }
             };
             let pkg = match open_any(&data) {
-                Ok((p, _)) => p,
+                Ok(o) => o.pkg,
                 Err(e) => {
                     eprintln!("error: {input}: {e}");
                     return ExitCode::FAILURE;
@@ -606,6 +631,10 @@ fn main() -> ExitCode {
         }
     }
 
+    let headless =
+        parsed.recalc_out.is_some() || parsed.csv_out.is_some() || parsed.pdf_out.is_some();
+    // What a Compatibility Mode open left out of the workbook (#874).
+    let mut dropped = Vec::new();
     let (pkg, path, import_source, format, text) = match parsed.inputs.first() {
         // A .txt/.prn in the editor opens the Text Import Wizard over a new
         // workbook (`run_tui` gets it as `wizard`).
@@ -633,20 +662,27 @@ fn main() -> ExitCode {
         }
         Some(input) => match std::fs::read(input) {
             Ok(data) => match open_any(&data) {
-                // An .xls, .xlsb or .ods is an import, as a CSV is: bound to
-                // the .xlsx beside it, so a save never writes over it.
-                Ok((pkg, format)) if format.is_import() => (
-                    pkg,
+                // An Excel 97-2003 .xls opens in the editor in Compatibility
+                // Mode (#874), bound to itself: a save writes it back. A
+                // headless run keeps it an import, so it is never written.
+                Ok(o) if opens_in_compat(input, o.format) && !headless => {
+                    dropped = o.dropped;
+                    (o.pkg, input.clone(), None, Some(o.format), None)
+                }
+                // Another .xls, an .xlsb or .ods is an import, as a CSV is:
+                // bound to the .xlsx beside it, so a save never writes over it.
+                Ok(o) if opens_as_import(input, o.format) => (
+                    o.pkg,
                     import_binding(input),
                     Some(input.clone()),
-                    Some(format),
+                    Some(o.format),
                     None,
                 ),
                 // A template opens in the editor as a new workbook from it. A
                 // headless run keeps the template as its source, so the
                 // export guard still refuses to write over it.
-                Ok((pkg, _)) => (
-                    pkg,
+                Ok(o) => (
+                    o.pkg,
                     template_binding(input)
                         .filter(|_| {
                             parsed.recalc_out.is_none()
@@ -789,6 +825,7 @@ fn main() -> ExitCode {
         TuiFlags {
             vim: parsed.vim,
             read_only,
+            dropped,
         },
     ) {
         Ok(()) => ExitCode::SUCCESS,
@@ -871,6 +908,8 @@ struct Loaded {
     format: Option<SourceFormat>,
     /// An opened `.csv` or `.txt`, bound to itself as text.
     text: Option<TextBound>,
+    /// What opening an `.xls` in Compatibility Mode left out (#874).
+    dropped: Vec<String>,
 }
 
 /// The text type an opened `.csv` (`csv`) or `.txt` is saved back as,
@@ -930,8 +969,10 @@ fn binds_as_text(path: &str) -> Option<bool> {
 /// `App::open_workbook`). A `.csv` or `.txt` stays bound to itself as text,
 /// as Excel keeps it (#761); a `.tsv` or `.prn` is an import bound to
 /// [`import_binding`]: `<name>.xlsx`, or the next free numbered name. An
-/// `.xls`, `.xlsb` or `.ods` (read by its bytes, whatever its name) imports
-/// through `gridcore::legacy` and is bound the same way. A template
+/// Excel 97-2003 `.xls` opens in Compatibility Mode, bound to itself
+/// ([`opens_in_compat`], #874); any other `.xls`, `.xlsb` or `.ods` (read
+/// by its bytes, whatever its name) imports through `gridcore::legacy` and
+/// is bound the same way as a `.tsv`. A template
 /// (`.xltx`, `.xltm`) opens as a new workbook from it, as Excel starts one:
 /// bound to [`template_binding`], so a save never writes the template
 /// itself.
@@ -956,6 +997,7 @@ fn load_workbook(path: &str, open: &TextOpen) -> Result<Loaded, String> {
                     parse,
                     origin,
                 }),
+                dropped: Vec::new(),
             },
             None => Loaded {
                 pkg,
@@ -963,27 +1005,40 @@ fn load_workbook(path: &str, open: &TextOpen) -> Result<Loaded, String> {
                 import_source: Some(path.to_string()),
                 format: None,
                 text: None,
+                dropped: Vec::new(),
             },
         });
     }
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
-    let (pkg, format) = open_any(&data).map_err(|e| e.to_string())?;
-    if format.is_import() {
+    let o = open_any(&data).map_err(|e| e.to_string())?;
+    if opens_in_compat(path, o.format) {
         return Ok(Loaded {
-            pkg,
+            pkg: o.pkg,
+            path: path.to_string(),
+            import_source: None,
+            format: Some(o.format),
+            text: None,
+            dropped: o.dropped,
+        });
+    }
+    if opens_as_import(path, o.format) {
+        return Ok(Loaded {
+            pkg: o.pkg,
             path: import_binding(path),
             import_source: Some(path.to_string()),
-            format: Some(format),
+            format: Some(o.format),
             text: None,
+            dropped: Vec::new(),
         });
     }
     let save = template_binding(path).unwrap_or_else(|| path.to_string());
     Ok(Loaded {
-        pkg,
+        pkg: o.pkg,
         path: save,
         import_source: None,
         format: None,
         text: None,
+        dropped: Vec::new(),
     })
 }
 
@@ -1288,15 +1343,60 @@ fn preview_lines(path: &str, width: usize) -> Vec<String> {
 
 /// The terminal window title: `* AppName - filename` (the `* ` only when the
 /// file has unsaved changes), and Excel's ` [Read-Only]` while the file is
-/// one opened read-only (#882).
-fn window_title(app: &str, path: &str, modified: bool, read_only: bool) -> String {
+/// one opened read-only (#882) and ` [Compatibility Mode]` while it is an
+/// Excel 97-2003 workbook (#874).
+fn window_title(app: &str, path: &str, modified: bool, read_only: bool, compat: bool) -> String {
     let name = file_name_of(path);
     format!(
-        "{}{app} - {name}{}",
+        "{}{app} - {name}{}{}",
         if modified { "* " } else { "" },
-        if read_only { " [Read-Only]" } else { "" }
+        if read_only { " [Read-Only]" } else { "" },
+        if compat { " [Compatibility Mode]" } else { "" }
     )
 }
+
+/// The `.xlsx` File › Info › Convert writes for the `.xls` `path` (#874).
+fn convert_target(path: &str) -> String {
+    Path::new(path)
+        .with_extension("xlsx")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// What a save as `.xls` loses: what the open left out (`dropped`), then
+/// what the writer couldn't hold (`lost`), each once.
+fn merge_losses(dropped: &[String], lost: &[String]) -> Vec<String> {
+    let mut out = dropped.to_vec();
+    for l in lost {
+        if !out.contains(l) {
+            out.push(l.clone());
+        }
+    }
+    out
+}
+
+/// Delete the `.xls` a Convert replaced. A test can make it fail, as it
+/// does on Windows for a file another program holds open.
+fn remove_converted(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if tests::FAIL_REMOVE.with(std::cell::Cell::get) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "in use"));
+    }
+    std::fs::remove_file(path)
+}
+
+/// What [`App::convert`] did.
+#[derive(Debug)]
+struct Converted {
+    /// Whether the `.xls` was deleted.
+    removed: bool,
+    /// What the open left out, which the `.xlsx` lacks too.
+    lost: Vec<String>,
+}
+
+/// Excel 97-2003's grid (#874).
+const XLS_ROWS: u32 = 65_536;
+const XLS_COLS: u32 = 256;
 
 /// Why `--read-only` cannot open its input (#882): there is none, or it is
 /// not a file. Only an existing file can be kept from being written; a
@@ -2126,6 +2226,13 @@ enum ConfirmAction {
     Discard(Next),
     /// The data form's Delete: the record it shows.
     DataFormDelete,
+    /// Ctrl+S in Compatibility Mode, when the `.xls` can't hold everything
+    /// the workbook has (#874): the losses the prompt listed.
+    SaveCompat(Vec<String>),
+    /// Save As Excel 97-2003 Workbook, likewise: the path and the losses.
+    SaveAsCompat(String, Vec<String>),
+    /// File › Info › Convert: the `.xlsx` replaces the `.xls`.
+    Convert,
 }
 
 /// What Yes to [`ConfirmAction::Discard`] goes on to do.
@@ -2151,6 +2258,16 @@ struct App {
     /// written yet: its binding was free when it
     /// opened, and the first save rechecks it.
     import_unsaved: bool,
+    /// What the `.xls` opened in Compatibility Mode had that the import left
+    /// out (charts, comments, ...; #874), until the workbook is first
+    /// written: a save of it loses them, and says so first.
+    dropped: Vec<String>,
+    /// The losses a person said Yes to saving without this session: the
+    /// same list doesn't ask again (#874).
+    compat_accepted: Option<Vec<String>>,
+    /// What the last save of the workbook as `.xls` lost (`wb.save`'s
+    /// `lost`).
+    last_lost: Vec<String>,
     sheet: usize,
     cur: (u32, u32),
     anchor: Option<(u32, u32)>,
@@ -2337,6 +2454,9 @@ impl App {
             import_source: None,
             template: None,
             import_unsaved: false,
+            dropped: Vec::new(),
+            compat_accepted: None,
+            last_lost: Vec::new(),
             sheet: pkg_active_tab,
             cur: (0, 0),
             anchor: None,
@@ -4433,7 +4553,7 @@ impl App {
         let step = if dir < 0 { -1 } else { 1 };
         for &s in &[step, -step] {
             let mut r = from as i64;
-            while r >= 0 && r < MAX_ROWS as i64 {
+            while r >= 0 && r < self.max_rows() as i64 {
                 if !self.sheet().row_hidden(r as u32) {
                     return r as u32;
                 }
@@ -4451,7 +4571,7 @@ impl App {
         let step = if dir < 0 { -1 } else { 1 };
         for &s in &[step, -step] {
             let mut c = from as i64;
-            while c >= 0 && c < MAX_COLS as i64 {
+            while c >= 0 && c < self.max_cols() as i64 {
                 if !self.sheet().col_hidden(c as u32) {
                     return c as u32;
                 }
@@ -4470,8 +4590,8 @@ impl App {
             self.anchor = None;
         }
         let (r, c) = self.cur;
-        let nr = (r as i64 + dr).clamp(0, MAX_ROWS as i64 - 1) as u32;
-        let nc = (c as i64 + dc).clamp(0, MAX_COLS as i64 - 1) as u32;
+        let nr = (r as i64 + dr).clamp(0, self.max_rows() as i64 - 1) as u32;
+        let nc = (c as i64 + dc).clamp(0, self.max_cols() as i64 - 1) as u32;
         // Skip over rows/columns hidden by a filter or manual hide.
         self.cur = (self.visible_row(nr, dr), self.visible_col(nc, dc));
         self.ensure_visible();
@@ -4486,6 +4606,7 @@ impl App {
             self.anchor = None;
         }
         let sheet = self.sheet();
+        let (max_r, max_c) = (self.max_rows() as i64, self.max_cols() as i64);
         let (mut r, mut c) = self.cur;
         let occupied = |r: u32, c: u32| {
             sheet
@@ -4496,7 +4617,7 @@ impl App {
         let step = |r: u32, c: u32| -> Option<(u32, u32)> {
             let nr = r as i64 + dr;
             let nc = c as i64 + dc;
-            if nr < 0 || nc < 0 || nr >= MAX_ROWS as i64 || nc >= MAX_COLS as i64 {
+            if nr < 0 || nc < 0 || nr >= max_r || nc >= max_c {
                 None
             } else {
                 Some((nr as u32, nc as u32))
@@ -4546,7 +4667,7 @@ impl App {
             let mut x = 0u32;
             let mut fits = false;
             let mut col = self.left;
-            while x < avail as u32 && col < MAX_COLS {
+            while x < avail as u32 && col < self.max_cols() {
                 if col == c {
                     // The whole column must fit (or be the first shown).
                     let w = self.col_disp_width(col) as u32;
@@ -4582,6 +4703,14 @@ impl App {
     fn package_bytes(&mut self) -> Vec<u8> {
         // The workbook reopens on the sheet it is saved on.
         self.pkg.workbook.active_tab = self.sheet;
+        // An Excel 97-2003 workbook is written as one (#874), with what the
+        // file can't hold left out: the writer's losses and what the open
+        // already dropped.
+        if self.compat() {
+            let out = gridcore::legacy::write_xls(&self.pkg);
+            self.last_lost = merge_losses(&self.dropped, &out.lost);
+            return out.bytes;
+        }
         self.pkg.remove_part(MODEL_PART);
         if !self.model_rels.is_empty() || !self.model_measures.is_empty() {
             let xml = model_part_xml(&self.model_rels, &self.model_measures);
@@ -4606,7 +4735,73 @@ impl App {
         if self.ask_where_to_save_template_workbook() {
             return;
         }
+        let path = self.path.clone();
+        if let Some(lost) = self.compat_losses_to_ask(&path) {
+            self.ask_compat(lost.clone(), ConfirmAction::SaveCompat(lost));
+            return;
+        }
         let _ = self.save_current();
+    }
+
+    /// Whether the workbook is in Excel's Compatibility Mode (#874): bound
+    /// to an `.xls`, which a save writes as BIFF8. Only an Excel 97-2003
+    /// workbook opens bound to one ([`opens_in_compat`]) and only Save As
+    /// Excel 97-2003 Workbook binds one, so the path says it.
+    fn compat(&self) -> bool {
+        is_xls(&self.path)
+    }
+
+    /// The Save As type a save writes: the text type the workbook is bound
+    /// to, else the one its path's extension names, else Excel Workbook.
+    fn bound_type_label(&self) -> &'static str {
+        self.bound_text_type()
+            .or_else(|| type_for_path(&self.path))
+            .map_or("Excel Workbook", |t| SAVE_TYPES[t].label)
+    }
+
+    /// The grid's rows: Excel 97-2003's 65,536 in Compatibility Mode.
+    fn max_rows(&self) -> u32 {
+        if self.compat() { XLS_ROWS } else { MAX_ROWS }
+    }
+
+    /// The grid's columns: Excel 97-2003's 256 (A..IV) in Compatibility
+    /// Mode.
+    fn max_cols(&self) -> u32 {
+        if self.compat() { XLS_COLS } else { MAX_COLS }
+    }
+
+    /// What saving the workbook as `.xls` loses: what the open left out,
+    /// then what the writer can't hold.
+    fn compat_losses(&self) -> Vec<String> {
+        merge_losses(&self.dropped, &gridcore::legacy::write_xls(&self.pkg).lost)
+    }
+
+    /// The losses to ask about before the workbook is written to `target`:
+    /// for an `.xls`, when it loses anything the person hasn't already said
+    /// Yes to this session.
+    fn compat_losses_to_ask(&self, target: &str) -> Option<Vec<String>> {
+        if !is_xls(target) {
+            return None;
+        }
+        let lost = self.compat_losses();
+        (!lost.is_empty() && self.compat_accepted.as_ref() != Some(&lost)).then_some(lost)
+    }
+
+    /// Excel's compatibility check: the features an Excel 97-2003 file
+    /// loses, and whether to save anyway (No by default).
+    fn ask_compat(&mut self, lost: Vec<String>, action: ConfirmAction) {
+        self.confirm = Some(
+            backstage::Confirm::new(
+                format!(
+                    "The following features are not supported by Excel 97-2003 and will be \
+                     lost: {}. Save anyway?",
+                    lost.join("; ")
+                ),
+                action,
+                Color::Green,
+            )
+            .default_no(),
+        );
     }
 
     /// A workbook started from a template has no file of its own until this
@@ -4731,6 +4926,7 @@ impl App {
             }
             _ => None,
         };
+        self.last_lost.clear();
         let bytes = self.package_bytes();
         if self.pkg.always_create_backup() {
             if let Err(e) = self.write_backup(Path::new(&self.path)) {
@@ -4750,6 +4946,9 @@ impl App {
                 self.text_read = None;
                 self.template = None;
                 self.import_unsaved = false;
+                // The file the workbook is bound to no longer has what the
+                // open dropped.
+                self.dropped.clear();
                 self.status = Some(match taken {
                     Some(taken) => format!(
                         "Saved {} ({} bytes): {taken} already exists",
@@ -4892,6 +5091,7 @@ impl App {
         let ty = SAVE_TYPES[t];
         match save_kind(&ty) {
             SaveKind::Package => self.request_save_as_package(path),
+            SaveKind::Xls => self.request_save_as_xls(path),
             SaveKind::Text { .. } | SaveKind::Prn | SaveKind::WebPage => {
                 let previous = self.text_type.replace(t);
                 if !self.save_as(path) {
@@ -4957,6 +5157,104 @@ impl App {
         } else {
             self.save_as(path);
         }
+    }
+
+    /// Save As Excel 97-2003 Workbook (#874): the workbook goes into
+    /// Compatibility Mode, after Excel's compatibility check asks about
+    /// what the file can't hold.
+    fn request_save_as_xls(&mut self, path: String) {
+        if let Err(msg) = self.refuse_read_only(&path) {
+            self.status = Some(msg);
+            return;
+        }
+        match self.compat_losses_to_ask(&path) {
+            Some(lost) => self.ask_compat(lost.clone(), ConfirmAction::SaveAsCompat(path, lost)),
+            None => {
+                self.save_as(path);
+            }
+        }
+    }
+
+    /// File › Info › Convert (#874): Excel's confirmation, naming the
+    /// `.xlsx` that replaces the `.xls` (and one it overwrites), and what the
+    /// open left out of the workbook, which the `.xlsx` lacks too.
+    fn request_convert(&mut self) {
+        if !self.compat() {
+            return;
+        }
+        let target = convert_target(&self.path);
+        let mut prompt = format!(
+            "This action converts the workbook to the current file format. The original \
+             Excel 97-2003 file {} will be replaced by {}.",
+            file_name_of(&self.path),
+            file_name_of(&target)
+        );
+        if Path::new(&target).exists() {
+            prompt.push_str(&format!(
+                " The existing {} will be overwritten.",
+                file_name_of(&target)
+            ));
+        }
+        if !self.dropped.is_empty() {
+            prompt.push_str(&format!(
+                " These features of the original will be lost: {}.",
+                self.dropped.join("; ")
+            ));
+        }
+        prompt.push_str(" Continue?");
+        self.confirm = Some(
+            backstage::Confirm::new(prompt, ConfirmAction::Convert, Color::Green).default_no(),
+        );
+    }
+
+    /// Convert the workbook in Compatibility Mode to an `.xlsx` (#874), as
+    /// Excel's File › Info › Convert does: write `<name>.xlsx` (the current
+    /// workbook, unsaved edits included), and only once that is written
+    /// delete `<name>.xls`. The workbook is then bound to the `.xlsx`, out
+    /// of Compatibility Mode and clean. A file opened read-only can't be
+    /// replaced, so it is refused; a failed write deletes nothing and stays
+    /// in Compatibility Mode; a failed delete keeps the `.xlsx` and says so.
+    fn convert(&mut self) -> Result<Converted, String> {
+        if !self.compat() {
+            let msg = "the workbook is not in Compatibility Mode".to_string();
+            self.status = Some(msg.clone());
+            return Err(msg);
+        }
+        let source = self.path.clone();
+        let target = convert_target(&source);
+        if let Err(msg) = self
+            .refuse_read_only(&source)
+            .and_then(|()| self.refuse_read_only(&target))
+        {
+            self.status = Some(msg.clone());
+            return Err(msg);
+        }
+        let lost = self.dropped.clone();
+        self.path = target.clone();
+        if let Err(e) = self.save_current() {
+            self.path = source;
+            return Err(e);
+        }
+        let removed = self
+            .guard_write(Path::new(&source))
+            .and_then(|()| remove_converted(Path::new(&source)));
+        self.compat_accepted = None;
+        self.status = Some(match &removed {
+            Ok(()) => format!(
+                "Converted {} to {}",
+                file_name_of(&source),
+                file_name_of(&target)
+            ),
+            Err(e) => format!(
+                "Converted to {}; {} could not be removed: {e}",
+                file_name_of(&target),
+                file_name_of(&source)
+            ),
+        });
+        Ok(Converted {
+            removed: removed.is_ok(),
+            lost,
+        })
     }
 
     /// Yes to [`ConfirmAction::SaveWithoutMacros`]: once the file is written
@@ -6322,6 +6620,8 @@ impl App {
     /// there (the status bar is hidden under the backstage).
     fn reopen_info(&mut self, row: usize, message: Option<String>) {
         self.open_backstage();
+        // In Compatibility Mode, Convert is the page's first row.
+        let row = row + usize::from(self.compat());
         if let Some(b) = &mut self.backstage {
             b.focus_info(row);
             b.info_message = message;
@@ -6520,6 +6820,7 @@ impl App {
                 // read-only file's own included.
                 self.read_only = None;
                 self.install_workbook(l.pkg, l.path, l.import_source, l.text);
+                self.dropped = l.dropped;
                 self.note_import(l.format);
                 self.note_template(path);
             }
@@ -6529,9 +6830,26 @@ impl App {
 
     /// After an import, the first save rechecks the binding. After
     /// importing a workbook read as `format` (an `.xls`, `.xlsb` or `.ods`),
-    /// the status line names the format and the `.xlsx` a save writes.
+    /// the status line names the format and the `.xlsx` a save writes. An
+    /// `.xls` opened in Compatibility Mode (#874) says so, and names what a
+    /// save will lose that the import already left out.
     fn note_import(&mut self, format: Option<SourceFormat>) {
         self.import_unsaved = self.import_source.is_some();
+        if self.compat() {
+            let mut msg = format!(
+                "Opened {} ({}) in Compatibility Mode",
+                file_name_of(&self.path),
+                SourceFormat::Xls.label()
+            );
+            if !self.dropped.is_empty() {
+                msg.push_str(&format!(
+                    "; {} will be lost on save",
+                    self.dropped.join(", ")
+                ));
+            }
+            self.status = Some(msg);
+            return;
+        }
         if let (Some(format), Some(source)) = (format, &self.import_source) {
             self.status = Some(format!(
                 "Opened {source} ({}); saving writes {}",
@@ -6575,6 +6893,8 @@ impl App {
         self.bind_text(text);
         self.template = None;
         self.import_unsaved = false;
+        self.dropped = Vec::new();
+        self.compat_accepted = None;
         self.model_rels = rels;
         self.model_measures = meas;
         self.comments = comments;
@@ -6602,6 +6922,7 @@ impl App {
     fn open_without_wizard(&mut self, path: &str) -> Result<(), String> {
         let l = load_workbook(path, &self.text_open())?;
         self.install_workbook(l.pkg, l.path, l.import_source, l.text);
+        self.dropped = l.dropped;
         self.note_import(l.format);
         self.note_template(path);
         Ok(())
@@ -6693,8 +7014,8 @@ impl App {
                 .map_err(|e| e.to_string())
                 .and_then(|data| open_any(&data).map_err(|e| e.to_string()))
             {
-                Ok((pkg, _)) => {
-                    self.install_workbook(pkg, "untitled.xlsx".to_string(), None, None);
+                Ok(o) => {
+                    self.install_workbook(o.pkg, "untitled.xlsx".to_string(), None, None);
                     self.read_only = None;
                     self.status = Some(format!("New workbook from {name}"));
                     return;
@@ -6923,6 +7244,11 @@ impl App {
                 self.open_prompt(PromptKind::DocProperty(i as u8));
                 false
             }
+            BackstageEvent::Convert => {
+                self.backstage = None;
+                self.request_convert();
+                false
+            }
         }
     }
 
@@ -6993,10 +7319,14 @@ impl App {
         match outcome {
             backstage::ConfirmOutcome::Pending => false,
             backstage::ConfirmOutcome::Cancelled => {
-                if let Some(ConfirmAction::SaveWithoutMacros(_)) =
-                    self.confirm.take().map(|c| c.action().clone())
-                {
-                    self.status = Some("Save As cancelled — the macros are kept".into());
+                match self.confirm.take().map(|c| c.action().clone()) {
+                    Some(ConfirmAction::SaveWithoutMacros(_)) => {
+                        self.status = Some("Save As cancelled — the macros are kept".into());
+                    }
+                    Some(ConfirmAction::SaveCompat(_) | ConfirmAction::SaveAsCompat(..)) => {
+                        self.status = Some("Save cancelled: nothing was written".into());
+                    }
+                    _ => {}
                 }
                 false
             }
@@ -7022,6 +7352,20 @@ impl App {
                     }
                     ConfirmAction::DataFormDelete => {
                         self.data_form_delete();
+                        false
+                    }
+                    ConfirmAction::SaveCompat(lost) => {
+                        self.compat_accepted = Some(lost);
+                        let _ = self.save_current();
+                        false
+                    }
+                    ConfirmAction::SaveAsCompat(path, lost) => {
+                        self.compat_accepted = Some(lost);
+                        self.save_as(path);
+                        false
+                    }
+                    ConfirmAction::Convert => {
+                        let _ = self.convert();
                         false
                     }
                 }
@@ -8727,7 +9071,7 @@ impl App {
         let first = cellref.split(':').next().unwrap_or(cellref);
         match parse_a1(first) {
             Some((row, col)) => {
-                self.cur = (row.min(MAX_ROWS - 1), col.min(MAX_COLS - 1));
+                self.cur = (row.min(self.max_rows() - 1), col.min(self.max_cols() - 1));
                 self.anchor = None;
                 self.ensure_visible();
                 self.status = Some(format!("Went to {}", cell_name(self.cur.0, self.cur.1)));
@@ -9412,6 +9756,10 @@ impl backstage::BackstageHost for App {
         true
     }
 
+    fn compat_mode(&self) -> bool {
+        self.compat()
+    }
+
     fn accent(&self) -> Color {
         Color::Green
     }
@@ -9564,7 +9912,7 @@ fn draw_screen(app: &mut App, f: &mut Frame) {
         let mut x = app.gutter_w;
         let show_hidden = app.show_hidden;
         let push = |app: &mut App, col: u32, x: &mut u16| {
-            if *x >= grid.width || col >= MAX_COLS {
+            if *x >= grid.width || col >= app.max_cols() {
                 return false;
             }
             // A hidden column takes no space but keeps the scan going.
@@ -9598,7 +9946,7 @@ fn draw_screen(app: &mut App, f: &mut Frame) {
         let show_hidden = app.show_hidden;
         let vis_cols = &app.vis_cols;
         // Rows to consider: frozen (0..fr), then scrollable from the top.
-        let scroll = (app.top.max(fr)..MAX_ROWS).take(cap);
+        let scroll = (app.top.max(fr)..app.max_rows()).take(cap);
         for row in (0..fr).chain(scroll) {
             if vr.len() >= cap {
                 break;
@@ -11673,7 +12021,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
             app.top = app.top.saturating_sub(3);
         }
         MouseEventKind::ScrollDown => {
-            app.top = (app.top + 3).min(MAX_ROWS - 1);
+            app.top = (app.top + 3).min(app.max_rows() - 1);
         }
         MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
             let drag = matches!(m.kind, MouseEventKind::Drag(_));
@@ -11727,11 +12075,11 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
                 .get(vy)
                 .copied()
                 .unwrap_or_else(|| app.top + vy as u32)
-                .min(MAX_ROWS - 1);
+                .min(app.max_rows() - 1);
             let mut col = None;
             for &(cidx, x, w) in &app.vis_cols {
                 if m.column >= x && m.column < x + w {
-                    col = Some(cidx.min(MAX_COLS - 1));
+                    col = Some(cidx.min(app.max_cols() - 1));
                     break;
                 }
             }
@@ -11853,6 +12201,8 @@ struct TuiFlags {
     vim: bool,
     /// `--read-only`: the input file, opened read-only (#882).
     read_only: Option<String>,
+    /// What opening an `.xls` in Compatibility Mode left out (#874).
+    dropped: Vec<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11884,6 +12234,7 @@ fn run_tui(
     let format = import.as_ref().and_then(|(_, f)| *f);
     app.import_source = import.map(|(s, _)| s);
     app.bind_text(text);
+    app.dropped = flags.dropped;
     app.note_import(format);
     if let Some(template) = template {
         app.note_template(&template);
@@ -11966,7 +12317,13 @@ fn run_tui(
 
     let result = loop {
         // Reflect the file + unsaved state in the terminal window title.
-        let title = window_title("xlsxy", &app.path, app.modified, app.bound_read_only());
+        let title = window_title(
+            "xlsxy",
+            &app.path,
+            app.modified,
+            app.bound_read_only(),
+            app.compat(),
+        );
         if title != last_title {
             let _ = execute!(io::stdout(), SetTitle(&title));
             last_title = title;
@@ -13069,7 +13426,6 @@ mod tests {
         );
         for (label, file) in [
             ("Excel Binary Workbook", "b.xlsb"),
-            ("Excel 97-2003 Workbook", "o.xls"),
             ("OpenDocument Spreadsheet", "o.ods"),
             ("Single File Web Page", "s.mht"),
         ] {
@@ -13267,21 +13623,22 @@ mod tests {
         assert_eq!(again.auto_convert, AutoConvert::default());
     }
 
-    /// #603: an .xls, .xlsb or .ods opens as an import, as a CSV does: bound
-    /// to the .xlsx beside it, with a status line naming the format, and a
-    /// save writes that .xlsx and leaves the original alone. File › Open
-    /// lists the three types.
+    /// #603: an .xlsb or .ods opens as an import, as a CSV does: bound to
+    /// the .xlsx beside it, with a status line naming the format, and a save
+    /// writes that .xlsx and leaves the original alone. So does a BIFF8 file
+    /// that isn't named `.xls` (an `.xlt`), which no Compatibility Mode
+    /// writes back (#874). File › Open lists the three types.
     #[test]
     fn legacy_workbooks_open_as_imports_bound_to_xlsx() {
         let dir = tmp("legacy-import");
         let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/legacy");
-        for (ext, label) in [
-            ("xls", "Excel 97-2003 Workbook"),
-            ("xlsb", "Excel Binary Workbook"),
-            ("ods", "OpenDocument Spreadsheet"),
+        for (ext, label, from) in [
+            ("xlt", "Excel 97-2003 Workbook", "xls"),
+            ("xlsb", "Excel Binary Workbook", "xlsb"),
+            ("ods", "OpenDocument Spreadsheet", "ods"),
         ] {
             let source = dir.join(format!("book.{ext}"));
-            std::fs::copy(corpus.join(format!("oracle-basic.{ext}")), &source).unwrap();
+            std::fs::copy(corpus.join(format!("oracle-basic.{from}")), &source).unwrap();
             let original = std::fs::read(&source).unwrap();
             let binding = source.with_extension("xlsx");
             let mut app = App::new(new_xlsx(), "untitled.xlsx");
@@ -13347,7 +13704,7 @@ mod tests {
     }
 
     /// #876: a TSV import rechecks its binding at the first save, as an
-    /// `.xls` import does: a `<stem>.xlsx` made after the open is kept.
+    /// `.xlsb` import does: a `<stem>.xlsx` made after the open is kept.
     #[test]
     fn a_csv_import_rechecks_its_binding_at_the_first_save() {
         let dir = tmp("csv-import-late");
@@ -13412,8 +13769,8 @@ mod tests {
     fn legacy_imports_never_bind_to_an_existing_file() {
         let dir = tmp("legacy-import-free");
         let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/legacy");
-        let source = dir.join("report.xls");
-        std::fs::copy(corpus.join("oracle-basic.xls"), &source).unwrap();
+        let source = dir.join("report.xlsb");
+        std::fs::copy(corpus.join("oracle-basic.xlsb"), &source).unwrap();
         let existing = dir.join("report.xlsx");
         std::fs::write(&existing, b"the user's own report").unwrap();
         let mut app = App::new(new_xlsx(), "untitled.xlsx");
@@ -13450,8 +13807,8 @@ mod tests {
     fn an_import_rechecks_its_binding_at_the_first_save() {
         let dir = tmp("legacy-import-late");
         let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/legacy");
-        let source = dir.join("report.xls");
-        std::fs::copy(corpus.join("oracle-basic.xls"), &source).unwrap();
+        let source = dir.join("report.xlsb");
+        std::fs::copy(corpus.join("oracle-basic.xlsb"), &source).unwrap();
         let mut app = App::new(new_xlsx(), "untitled.xlsx");
         app.open_workbook(source.to_str().unwrap());
         let plain = dir.join("report.xlsx");
@@ -13485,8 +13842,8 @@ mod tests {
     fn save_as_on_an_unsaved_import_writes_the_chosen_name() {
         let dir = tmp("legacy-import-save-as");
         let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/legacy");
-        let source = dir.join("report.xls");
-        std::fs::copy(corpus.join("oracle-basic.xls"), &source).unwrap();
+        let source = dir.join("report.xlsb");
+        std::fs::copy(corpus.join("oracle-basic.xlsb"), &source).unwrap();
         let mut app = App::new(new_xlsx(), "untitled.xlsx");
         app.open_workbook(source.to_str().unwrap());
         assert!(app.import_unsaved);
@@ -13507,6 +13864,303 @@ mod tests {
         assert!(!dir.join("report.xlsx").exists());
         assert!(!dir.join("report1.xlsx").exists());
         assert!(!app.import_unsaved);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- #874: Excel 97-2003 Compatibility Mode ----
+
+    thread_local! {
+        /// Makes [`remove_converted`] fail.
+        pub(super) static FAIL_REMOVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// A corpus `.xls` copied to `dir/name` and opened.
+    fn open_xls(dir: &Path, corpus_file: &str, name: &str) -> (App, std::path::PathBuf) {
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/legacy");
+        let path = dir.join(name);
+        std::fs::copy(corpus.join(corpus_file), &path).unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.os_clip = None;
+        app.open_workbook(path.to_str().unwrap());
+        (app, path)
+    }
+
+    fn yes(app: &mut App) {
+        let action = app.confirm.as_ref().expect("a prompt").action().clone();
+        app.apply_confirm(backstage::ConfirmOutcome::Confirmed(action));
+    }
+
+    fn no(app: &mut App) {
+        assert!(app.confirm.is_some(), "a prompt");
+        app.apply_confirm(backstage::ConfirmOutcome::Cancelled);
+    }
+
+    /// An `.xls` opens in Compatibility Mode, bound to itself: the title and
+    /// status say so, and the grid ends at row 65,536 and column IV.
+    #[test]
+    fn an_xls_opens_in_compatibility_mode_bound_to_itself() {
+        let dir = tmp("compat-open");
+        let (mut app, path) = open_xls(&dir, "oracle-basic.xls", "book.xls");
+        assert_eq!(Path::new(&app.path), path);
+        assert!(app.import_source.is_none() && !app.import_unsaved);
+        assert!(app.compat());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Opened book.xls (Excel 97-2003 Workbook) in Compatibility Mode")
+        );
+        assert_eq!(
+            window_title("xlsxy", &app.path, true, false, app.compat()),
+            "* xlsxy - book.xls [Compatibility Mode]"
+        );
+        assert_eq!((app.max_rows(), app.max_cols()), (65_536, 256));
+        // Arrows, Ctrl+arrows and Go To stop at IV65536.
+        app.cur = (65_535, 255);
+        app.move_cur(1, 1, false);
+        assert_eq!(app.cur, (65_535, 255));
+        app.cur = (10, 200);
+        app.jump(1, 0, false);
+        app.jump(0, 1, false);
+        assert_eq!(app.cur, (65_535, 255));
+        app.goto("A100000");
+        assert_eq!(app.cur, (65_535, 0));
+        // The reload of the file is in Compatibility Mode again.
+        app.reload().unwrap();
+        assert!(app.compat());
+        // An .xlsx is not.
+        let mut x = App::new(new_xlsx(), dir.join("b.xlsx").to_str().unwrap());
+        assert!(!x.compat());
+        x.cur = (65_535, 255);
+        x.move_cur(1, 1, false);
+        assert_eq!(x.cur, (65_536, 256));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A workbook package named `.xls` imports to `<stem>.xlsx`, as a BIFF8
+    /// `.xlt` does: only an Excel 97-2003 `.xls` is written back.
+    #[test]
+    fn an_xlsx_named_xls_is_an_import() {
+        let dir = tmp("compat-disguised");
+        let source = dir.join("book.xls");
+        std::fs::write(&source, save_xlsx(&new_xlsx())).unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_workbook(source.to_str().unwrap());
+        assert_eq!(Path::new(&app.path), dir.join("book.xlsx"));
+        assert!(!app.compat());
+        assert_eq!(app.import_source.as_deref(), source.to_str());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Selections stay full-grid in Compatibility Mode: a whole row is still
+    /// a whole row, so Insert Sheet Rows inserts one.
+    #[test]
+    fn a_whole_row_insert_works_in_compatibility_mode() {
+        let dir = tmp("compat-row");
+        let (mut app, _) = open_xls(&dir, "oracle-basic.xls", "book.xls");
+        let below = app.sheet().cell(1, 0).cloned();
+        app.cur = (1, 3);
+        press_mod(&mut app, KeyCode::Char(' '), KeyModifiers::SHIFT);
+        assert_eq!(app.selection(), (1, 0, 1, MAX_COLS - 1));
+        press_mod(&mut app, KeyCode::Char('+'), CTRL_SHIFT);
+        assert!(app.sheet().cell(1, 0).is_none_or(|c| c.value.is_empty()));
+        assert_eq!(app.sheet().cell(2, 0).cloned(), below);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ctrl+S writes the `.xls` back as BIFF8, which reopens with the edit.
+    #[test]
+    fn ctrl_s_writes_the_xls_back() {
+        let dir = tmp("compat-save");
+        let (mut app, path) = open_xls(&dir, "oracle-basic.xls", "book.xls");
+        app.apply(vec![(0, 0, gridcore::sheet::Cell::text("edited"))]);
+        press_mod(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(app.confirm.is_none(), "{:?}", app.status);
+        assert!(!app.modified);
+        let data = std::fs::read(&path).unwrap();
+        gridcore::legacy::check_xls(&data).unwrap();
+        let (pkg, format) = gridcore::legacy::open_workbook(&data).unwrap();
+        assert_eq!(format, SourceFormat::Xls);
+        assert_eq!(
+            pkg.workbook.sheets[app.sheet].cells[&(0, 0)].value,
+            CellValue::Text("edited".into())
+        );
+        assert!(!dir.join("book.xlsx").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A save that would lose what the `.xls` can't hold asks first (No by
+    /// default), naming it: No writes nothing; Yes writes; the same list
+    /// isn't asked about again this session, a longer one is. Once written,
+    /// what the open dropped is gone from the file and no longer named.
+    #[test]
+    fn a_lossy_save_asks_first() {
+        let dir = tmp("compat-lossy");
+        let (mut app, path) = open_xls(&dir, "extra/chart-embedded.xls", "chart.xls");
+        assert_eq!(
+            app.status.as_deref(),
+            Some(
+                "Opened chart.xls (Excel 97-2003 Workbook) in Compatibility Mode; pictures, \
+                 shapes and charts will be lost on save"
+            )
+        );
+        let original = std::fs::read(&path).unwrap();
+        app.save();
+        let prompt = app.confirm.as_ref().unwrap().prompt().to_string();
+        assert_eq!(
+            prompt,
+            "The following features are not supported by Excel 97-2003 and will be lost: \
+             pictures, shapes and charts. Save anyway?"
+        );
+        assert!(!app.confirm.as_ref().unwrap().yes_selected());
+        no(&mut app);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Save cancelled: nothing was written")
+        );
+        app.save();
+        yes(&mut app);
+        assert_ne!(std::fs::read(&path).unwrap(), original);
+        assert!(app.dropped.is_empty());
+        app.save();
+        assert!(app.confirm.is_none(), "nothing left to lose");
+
+        // A loss the writer finds: asked once, then not again for the same
+        // list, and again when the list grows.
+        app.pkg.workbook.sheets[app.sheet]
+            .hyperlinks
+            .insert((0, 0), "https://example.com".into());
+        app.save();
+        assert!(
+            app.confirm
+                .as_ref()
+                .unwrap()
+                .prompt()
+                .contains("lost: hyperlinks.")
+        );
+        yes(&mut app);
+        app.save();
+        assert!(app.confirm.is_none());
+        app.pkg.workbook.sheets[app.sheet].set_row_outline(3, 1);
+        app.save();
+        assert!(
+            app.confirm
+                .as_ref()
+                .unwrap()
+                .prompt()
+                .contains("hyperlinks; outlines")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Save As Excel 97-2003 Workbook enters Compatibility Mode, after the
+    /// same check; Save As Excel Workbook leaves it.
+    #[test]
+    fn save_as_xls_enters_and_save_as_xlsx_leaves_compatibility_mode() {
+        let dir = tmp("compat-save-as");
+        let at = |l: &str| SAVE_TYPES.iter().position(|t| t.label == l).unwrap();
+        let mut app = two_sheet_app(&dir);
+        let xls = dir.join("old.xls");
+        app.save_as_type(
+            xls.to_string_lossy().into_owned(),
+            at("Excel 97-2003 Workbook"),
+        );
+        assert!(app.confirm.is_none(), "{:?}", app.status);
+        assert!(app.compat() && Path::new(&app.path) == xls);
+        assert_eq!(
+            gridcore::legacy::open_workbook(&std::fs::read(&xls).unwrap())
+                .unwrap()
+                .1,
+            SourceFormat::Xls
+        );
+        // A loss asks before Save As writes, and No writes nothing.
+        app.pkg.workbook.sheets[app.sheet]
+            .hyperlinks
+            .insert((0, 0), "https://example.com".into());
+        let other = dir.join("other.xls");
+        app.request_save_as(other.to_string_lossy().into_owned());
+        no(&mut app);
+        assert!(!other.exists());
+        let xlsx = dir.join("new.xlsx");
+        app.request_save_as(xlsx.to_string_lossy().into_owned());
+        assert!(!app.compat() && Path::new(&app.path) == xlsx);
+        assert_eq!((app.max_rows(), app.max_cols()), (MAX_ROWS, MAX_COLS));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// File › Info › Convert asks, naming the `.xlsx` (and one it
+    /// overwrites) and what the open left out; Yes writes `name.xlsx`,
+    /// deletes `name.xls`, and leaves the workbook clean on the `.xlsx`,
+    /// out of Compatibility Mode.
+    #[test]
+    fn convert_replaces_the_xls_with_an_xlsx() {
+        let dir = tmp("compat-convert");
+        let (mut app, path) = open_xls(&dir, "extra/chart-embedded.xls", "chart.xls");
+        std::fs::write(dir.join("chart.xlsx"), b"older").unwrap();
+        app.apply(vec![(0, 0, gridcore::sheet::Cell::text("unsaved edit"))]);
+        app.open_backstage();
+        assert!(backstage::BackstageHost::compat_mode(&app));
+        app.apply_backstage_event(backstage::BackstageEvent::Convert);
+        let prompt = app.confirm.as_ref().unwrap().prompt().to_string();
+        assert_eq!(
+            prompt,
+            "This action converts the workbook to the current file format. The original Excel \
+             97-2003 file chart.xls will be replaced by chart.xlsx. The existing chart.xlsx \
+             will be overwritten. These features of the original will be lost: pictures, \
+             shapes and charts. Continue?"
+        );
+        no(&mut app);
+        assert!(path.exists() && app.compat());
+        app.apply_backstage_event(backstage::BackstageEvent::Convert);
+        yes(&mut app);
+        let xlsx = dir.join("chart.xlsx");
+        assert!(!path.exists());
+        assert_eq!(Path::new(&app.path), xlsx);
+        assert!(!app.compat() && !app.modified);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Converted chart.xls to chart.xlsx")
+        );
+        let saved = load_xlsx(&std::fs::read(&xlsx).unwrap()).unwrap();
+        assert_eq!(
+            saved.workbook.sheets[0].cells[&(0, 0)].value,
+            CellValue::Text("unsaved edit".into())
+        );
+        assert!(!backstage::BackstageHost::compat_mode(&app));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Convert whose write fails deletes nothing and stays in
+    /// Compatibility Mode; one whose delete fails keeps the `.xlsx` and
+    /// says so; a file opened read-only isn't converted.
+    #[test]
+    fn convert_failures_never_lose_the_workbook() {
+        let dir = tmp("compat-convert-fail");
+        // The .xlsx can't be written: a folder holds its name.
+        let (mut app, path) = open_xls(&dir, "oracle-basic.xls", "a.xls");
+        std::fs::create_dir(dir.join("a.xlsx")).unwrap();
+        assert!(app.convert().is_err());
+        assert!(path.exists() && app.compat());
+        assert_eq!(Path::new(&app.path), path);
+        assert!(app.status.as_deref().unwrap().starts_with("save failed"));
+
+        // The .xls can't be deleted.
+        let (mut app, path) = open_xls(&dir, "oracle-basic.xls", "b.xls");
+        FAIL_REMOVE.with(|f| f.set(true));
+        let c = app.convert();
+        FAIL_REMOVE.with(|f| f.set(false));
+        assert!(!c.unwrap().removed);
+        assert!(path.exists() && dir.join("b.xlsx").exists());
+        assert_eq!(Path::new(&app.path), dir.join("b.xlsx"));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Converted to b.xlsx; b.xls could not be removed: in use")
+        );
+
+        // Opened read-only.
+        let (mut app, path) = open_xls(&dir, "oracle-basic.xls", "c.xls");
+        app.set_read_only(path.to_str().unwrap());
+        assert!(app.convert().is_err());
+        assert!(path.exists() && !dir.join("c.xlsx").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -18125,19 +18779,19 @@ mod tests {
     #[test]
     fn window_title_format() {
         assert_eq!(
-            window_title("xlsxy", "/tmp/report.xlsx", false, false),
+            window_title("xlsxy", "/tmp/report.xlsx", false, false, false),
             "xlsxy - report.xlsx"
         );
         assert_eq!(
-            window_title("xlsxy", "/tmp/report.xlsx", true, false),
+            window_title("xlsxy", "/tmp/report.xlsx", true, false, false),
             "* xlsxy - report.xlsx"
         );
         assert_eq!(
-            window_title("xlsxy", "book.xlsx", true, false),
+            window_title("xlsxy", "book.xlsx", true, false, false),
             "* xlsxy - book.xlsx"
         );
         assert_eq!(
-            window_title("xlsxy", "book.xlsx", true, true),
+            window_title("xlsxy", "book.xlsx", true, true, false),
             "* xlsxy - book.xlsx [Read-Only]"
         );
     }
@@ -19813,7 +20467,7 @@ mod tests {
         app.set_read_only(a.to_str().unwrap());
         assert!(app.bound_read_only());
         assert_eq!(
-            window_title("xlsxy", &app.path, false, app.bound_read_only()),
+            window_title("xlsxy", &app.path, false, app.bound_read_only(), false),
             "xlsxy - a.xlsx [Read-Only]"
         );
         type_into_a1(&mut app, 9.0);

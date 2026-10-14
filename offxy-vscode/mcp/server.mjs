@@ -1368,6 +1368,12 @@ function xlsxyToolDefs() {
       ]),
       [],
     ),
+    tool(
+      'xlsxy_convert',
+      'Convert a workbook in Compatibility Mode (an Excel 97-2003 .xls) to the current file format, as File > Info > Convert does but without its prompt: writes <name>.xlsx, deletes the .xls once that is written, and binds the workbook to the .xlsx. Returns path, compat, removed (whether the .xls was deleted) and lost (what the .xls had that the open left out).',
+      Object.fromEntries([target()]),
+      [],
+    ),
   ];
 }
 
@@ -1473,6 +1479,7 @@ const XLSXY_VERBS = {
   xlsxy_import_text: 'sheet.import-text',
   xlsxy_text_to_columns: 'range.text-to-columns',
   xlsxy_options: 'app.options',
+  xlsxy_convert: 'wb.convert',
 };
 
 /** Execute a tool by forwarding to the control surface. Returns the result

@@ -274,9 +274,31 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
             app.recalc_and_refresh();
             Ok(Json::obj(vec![("recalculated", Json::Bool(true))]))
         }
+        // In Compatibility Mode the save doesn't ask (#874): the reply's
+        // `lost` names what the .xls couldn't hold.
         "wb.save" => {
             app.save_current()?;
-            Ok(path_info(app))
+            let mut info = path_info(app);
+            if let Json::Obj(fields) = &mut info {
+                fields.push((
+                    "lost".to_string(),
+                    Json::Arr(app.last_lost.iter().cloned().map(Json::Str).collect()),
+                ));
+            }
+            Ok(info)
+        }
+        // File > Info > Convert without the prompt (#874).
+        "wb.convert" => {
+            let c = app.convert()?;
+            Ok(Json::obj(vec![
+                ("path", Json::Str(app.path.clone())),
+                ("compat", Json::Bool(app.compat())),
+                ("removed", Json::Bool(c.removed)),
+                (
+                    "lost",
+                    Json::Arr(c.lost.into_iter().map(Json::Str).collect()),
+                ),
+            ]))
         }
         "wb.reload" => {
             app.reload()?;
@@ -327,6 +349,10 @@ fn path_info(app: &App) -> Json {
         // Bound to the file `xlsxy --read-only` opened (#882): `wb.save`
         // is refused until a Save As to another name.
         ("read_only", Json::Bool(app.bound_read_only())),
+        // The type a save writes, and whether that is Excel 97-2003's
+        // Compatibility Mode (#874).
+        ("format", Json::Str(app.bound_type_label().to_string())),
+        ("compat", Json::Bool(app.compat())),
         ("sheets", Json::Num(wb.sheets.len() as f64)),
         ("active", Json::Num(app.sheet as f64)),
         ("active_name", Json::Str(wb.sheets[app.sheet].name.clone())),
@@ -4064,6 +4090,61 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"b\t2\r\n");
         assert_eq!(get_value(&a, "A1"), CellValue::Text("b".into()));
         assert_eq!(get_value(&a, "B1"), CellValue::Number(2.0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #874: an `.xls` in Compatibility Mode: `wb.path` says so and names
+    /// the type; `wb.save` writes it back without asking, listing what it
+    /// lost; `wb.convert` replaces it with an `.xlsx`, with no prompt.
+    #[test]
+    fn compatibility_mode_verbs() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-ctl-compat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let xls = dir.join("chart.xls");
+        let corpus =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/legacy/extra");
+        std::fs::copy(corpus.join("chart-embedded.xls"), &xls).unwrap();
+        let mut a = App::new(new_xlsx(), "untitled.xlsx");
+        dispatch(
+            &mut a,
+            "wb.open",
+            &Json::obj(vec![(
+                "path",
+                Json::Str(xls.to_string_lossy().into_owned()),
+            )]),
+        )
+        .unwrap();
+        let info = dispatch(&mut a, "wb.path", &Json::Null).unwrap();
+        assert_eq!(info.get("compat"), Some(&Json::Bool(true)));
+        assert_eq!(info.get_str("format"), Some("Excel 97-2003 Workbook"));
+
+        let saved = dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        assert!(a.confirm.is_none());
+        assert_eq!(
+            saved.get("lost").unwrap().to_string(),
+            "[\"pictures, shapes and charts\"]"
+        );
+        let data = std::fs::read(&xls).unwrap();
+        assert_eq!(
+            gridcore::legacy::open_workbook(&data).unwrap().1,
+            gridcore::legacy::SourceFormat::Xls
+        );
+        // Written once, the file has no chart to lose any more.
+        let again = dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        assert_eq!(again.get("lost").unwrap().to_string(), "[]");
+
+        let c = dispatch(&mut a, "wb.convert", &Json::Null).unwrap();
+        let xlsx = dir.join("chart.xlsx");
+        assert_eq!(c.get_str("path"), xlsx.to_str());
+        assert_eq!(c.get("compat"), Some(&Json::Bool(false)));
+        assert_eq!(c.get("removed"), Some(&Json::Bool(true)));
+        assert!(!xls.exists() && xlsx.exists());
+        let info = dispatch(&mut a, "wb.path", &Json::Null).unwrap();
+        assert_eq!(info.get("compat"), Some(&Json::Bool(false)));
+        assert_eq!(info.get_str("format"), Some("Excel Workbook"));
+        // Out of Compatibility Mode there is nothing to convert.
+        assert!(dispatch(&mut a, "wb.convert", &Json::Null).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

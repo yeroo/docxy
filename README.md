@@ -229,7 +229,12 @@ evaluate yet keep Excel's cached results and are saved untouched.
 
 ```sh
 xlsxy book.xlsx                   # open a workbook (grid, formula bar, tabs)
-xlsxy book.xls                    # also .xlsb/.ods: imports values, formulas,
+xlsxy book.xls                    # Excel 97-2003: opens in Compatibility
+                                  # Mode (65,536 x 256 grid); Ctrl+S writes
+                                  # book.xls back, first naming what it
+                                  # can't hold; File > Info > Convert
+                                  # replaces it with book.xlsx
+xlsxy book.xlsb                   # also .ods: imports values, formulas,
                                   # number formats and names (not other
                                   # formatting); Ctrl+S writes book.xlsx
                                   # (book1.xlsx, ... if that exists); the
