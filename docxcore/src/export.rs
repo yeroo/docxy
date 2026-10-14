@@ -15,8 +15,8 @@
 //! before a continuous break, vertical alignment including justified, page
 //! borders with their line styles, line numbers), the page colour, headers/
 //! footers (default/first/even, linked to the previous section) with
-//! PAGE/NUMPAGES/SECTIONPAGES fields numbered per `w:pgNumType`, and the
-//! headers' VML text watermarks. Tables are
+//! PAGE/NUMPAGES/SECTIONPAGES fields numbered per `w:pgNumType` (with its
+//! chapter-number prefix), and the headers' VML text watermarks. Tables are
 //! flattened to text rows; real bordered tables and images in PDF come in a
 //! later phase.
 
@@ -27,6 +27,7 @@ use crate::border_style::BorderStyle;
 use crate::field::{FieldEvent, field_events};
 use crate::load::{Relationships, xml_attr_value};
 use crate::model::*;
+use crate::numbering::Numbering;
 use crate::package::{HeaderVariant, Package, SectionParts, TextWatermark, section_header_parts};
 use crate::sect::LnRestart;
 use crate::styles::{PprFlag, StyleSheet};
@@ -60,6 +61,9 @@ pub struct PdfOptions {
     pub gutter_at_top: bool,
     /// The page colour (`w:background w:color` in document.xml).
     pub background: Option<(u8, u8, u8)>,
+    /// The list definitions (`word/numbering.xml`): the heading numbers a
+    /// page number's chapter prefix (`w:chapStyle`) shows.
+    pub numbering: Rc<Numbering>,
 }
 
 impl Default for PdfOptions {
@@ -79,6 +83,7 @@ impl Default for PdfOptions {
             mirror_margins: false,
             gutter_at_top: false,
             background: None,
+            numbering: Rc::new(Numbering::default()),
         }
     }
 }
@@ -132,6 +137,11 @@ impl PdfOptions {
             mirror_margins: pkg.settings_flag("w:mirrorMargins").unwrap_or(false),
             gutter_at_top: pkg.settings_flag("w:gutterAtTop").unwrap_or(false),
             background,
+            numbering: Rc::new(
+                pkg.part_text("word/numbering.xml")
+                    .map(|xml| crate::numbering::parse_numbering_xml(&xml))
+                    .unwrap_or_default(),
+            ),
             ..PdfOptions::default()
         }
     }
@@ -218,6 +228,9 @@ struct SectionLayout {
     title_pg: bool,
     num_fmt: NumFmt,
     num_start: Option<u32>,
+    /// `w:chapStyle`/`w:chapSep`: the heading level whose number prefixes
+    /// the page number, and the separator between them.
+    chapter: Option<(u8, &'static str)>,
     borders: PageBorders,
     start: SectStart,
     line_numbers: Option<LineNumbers>,
@@ -405,6 +418,7 @@ impl SectionLayout {
             title_pg: flag_on(sect, "w:titlePg"),
             num_fmt,
             num_start,
+            chapter: chapter_prefix(&crate::sect::PageNumberFormat::parse(sect)),
             borders: parse_page_borders(sect),
             start,
             line_numbers: crate::sect::SectionSetup::parse(sect)
@@ -481,6 +495,23 @@ fn parse_page_borders(sect: &str) -> PageBorders {
         });
     }
     out
+}
+
+/// A section's chapter prefix (`w:chapStyle`, `w:chapSep`): the heading
+/// level, 1 to 9 (any other is ignored), and the separator Word draws for
+/// `w:chapSep`, a hyphen when absent or unknown.
+fn chapter_prefix(format: &crate::sect::PageNumberFormat) -> Option<(u8, &'static str)> {
+    let level = u8::try_from(format.chap_style?)
+        .ok()
+        .filter(|l| (1..=9).contains(l))?;
+    let sep = match format.chap_sep.as_deref() {
+        Some("period") => ".",
+        Some("colon") => ":",
+        Some("emDash") => "\u{2014}",
+        Some("enDash") => "\u{2013}",
+        _ => "-",
+    };
+    Some((level, sep))
 }
 
 fn format_page_number(n: u32, fmt: NumFmt) -> String {
@@ -701,6 +732,9 @@ struct Page {
     members: Vec<usize>,
     /// Formatted PAGE, NUMPAGES and SECTIONPAGES values.
     values: [String; 3],
+    /// The headings whose first line is on the page, in order: (heading
+    /// level, chapter number, `None` for an unnumbered heading).
+    chapters: Vec<(u8, Option<String>)>,
 }
 
 /// One body line on a page: where it sits, and the first of its frags and
@@ -759,6 +793,9 @@ struct ParaInfo {
 trait Flow {
     /// A paragraph (or a flattened table) starts.
     fn begin_paragraph(&mut self, _info: ParaInfo) {}
+    /// Paragraph `p` starts: a body heading, numbered or not, counts for the
+    /// chapter prefix of the page its first line lands on.
+    fn chapter_heading(&mut self, _p: &Paragraph) {}
     /// Advance to the next line of height `lh`; returns the column's left x,
     /// the column's width and the line's baseline.
     fn next_line(&mut self, lh: f32) -> (f32, f32, f32);
@@ -902,6 +939,7 @@ fn emit_paragraph(flow: &mut dyn Flow, p: &Paragraph, opts: &PdfOptions) {
             PprFlag::SuppressLineNumbers,
         ),
     });
+    flow.chapter_heading(p);
     let size = heading_size(p, opts.base_font_size);
     let mut segs = flatten_segments(p, p.props.heading_level.is_some(), &opts.styles);
     if p.props.num_id.is_some() {
@@ -1105,6 +1143,13 @@ struct Pager<'a> {
     para: u32,
     numbered: bool,
     line_count: LineCount,
+    /// Each heading's chapter number, by its address in the
+    /// document laid out ([`crate::numbering::heading_numbers`]); empty when
+    /// no section shows a chapter prefix. A heading in a table cell counts
+    /// in the numbering but marks no page: tables are flattened to rows.
+    chapters: HashMap<*const Paragraph, (u8, Option<String>)>,
+    /// The heading begun, until its first line settles on a page.
+    pending_chapter: Option<(u8, Option<String>)>,
 }
 
 /// The line-number counter and where it last counted, for `w:restart`.
@@ -1119,12 +1164,18 @@ impl<'a> Pager<'a> {
     fn run(doc: &Document, opts: &'a PdfOptions) -> Vec<Page> {
         let sections = split_sections(doc, opts);
         let raws: Vec<&str> = sections.iter().map(|(_, raw)| *raw).collect();
+        let sects: Vec<SectionLayout> = raws
+            .iter()
+            .map(|raw| SectionLayout::parse(raw, opts))
+            .collect();
+        let chapters = if sects.iter().any(|s| s.chapter.is_some()) {
+            crate::numbering::heading_numbers(doc, &opts.numbering, &opts.styles)
+        } else {
+            HashMap::new()
+        };
         let mut pager = Pager {
             opts,
-            sects: raws
-                .iter()
-                .map(|raw| SectionLayout::parse(raw, opts))
-                .collect(),
+            sects,
             parts: section_header_parts(&raws, &opts.rels),
             pages: Vec::new(),
             next_number: 1,
@@ -1143,6 +1194,8 @@ impl<'a> Pager<'a> {
             para: 0,
             numbered: false,
             line_count: LineCount::default(),
+            chapters,
+            pending_chapter: None,
         };
         for (i, (range, _)) in sections.iter().enumerate() {
             pager.start_section(i);
@@ -1294,6 +1347,7 @@ impl<'a> Pager<'a> {
             multi_col: false,
             members: vec![sect],
             values: Default::default(),
+            chapters: Vec::new(),
         });
         self.start_region(sect, body_top);
     }
@@ -1480,6 +1534,31 @@ impl<'a> Pager<'a> {
         n.is_multiple_of(ln.count_by).then_some((n, ln.distance))
     }
 
+    /// Each page's chapter number, when its section shows one: that of the
+    /// first heading of the section's `w:chapStyle` level on the page, else
+    /// of the last one before it (STYLEREF's rule in a header or footer).
+    /// `None` without such a heading, or when that heading is unnumbered,
+    /// and the page shows its plain number.
+    fn page_chapters(&self) -> Vec<Option<String>> {
+        let mut last: [Option<&str>; 10] = Default::default();
+        let mut out = Vec::with_capacity(self.pages.len());
+        for page in &self.pages {
+            let chapter = self.sects[page.sect].chapter.and_then(|(level, _)| {
+                match page.chapters.iter().find(|(l, _)| *l == level) {
+                    Some((_, text)) => text.as_deref(),
+                    None => last[usize::from(level)],
+                }
+            });
+            out.push(chapter.map(str::to_string));
+            for (level, text) in &page.chapters {
+                if let Some(slot) = last.get_mut(usize::from(*level)) {
+                    *slot = text.as_deref();
+                }
+            }
+        }
+        out
+    }
+
     fn mark_low(&mut self) {
         self.region.low = self.region.low.min(self.y);
     }
@@ -1494,7 +1573,8 @@ impl<'a> Pager<'a> {
                 *per_section.entry(sect).or_default() += 1;
             }
         }
-        for page in &mut self.pages {
+        let chapters = self.page_chapters();
+        for (page, chapter) in self.pages.iter_mut().zip(chapters) {
             let s = &self.sects[page.sect];
             if !page.blank
                 && page.regions == 1
@@ -1531,8 +1611,12 @@ impl<'a> Pager<'a> {
                 ));
             }
             let section_pages = |sect: usize| per_section.get(&sect).copied().unwrap_or(1);
+            let number = format_page_number(page.number, s.num_fmt);
             page.values = [
-                format_page_number(page.number, s.num_fmt),
+                match (chapter, s.chapter) {
+                    (Some(chapter), Some((_, sep))) => format!("{chapter}{sep}{number}"),
+                    _ => number,
+                },
                 total.to_string(),
                 section_pages(page.sect).to_string(),
             ];
@@ -1639,6 +1723,11 @@ impl Flow for Pager<'_> {
         self.para += 1;
         self.numbered = info.numbered;
     }
+    fn chapter_heading(&mut self, p: &Paragraph) {
+        if let Some(chapter) = self.chapters.get(&(p as *const Paragraph)) {
+            self.pending_chapter = Some(chapter.clone());
+        }
+    }
     fn next_line(&mut self, lh: f32) -> (f32, f32, f32) {
         self.y -= lh;
         // Move on until the line fits: a continuous column set that starts low
@@ -1660,6 +1749,10 @@ impl Flow for Pager<'_> {
         let (x, w) = self.region.xs[self.region.col];
         let number = self.count_line();
         let page = self.pages.last_mut().expect("a page exists");
+        // A heading counts on the page its first line settled on.
+        if let Some(chapter) = self.pending_chapter.take() {
+            page.chapters.push(chapter);
+        }
         page.min_base = page.min_base.min(self.y);
         page.lines.push(LineRec {
             y: self.y,
@@ -4300,5 +4393,252 @@ mod tests {
         for (_, y, t) in &pages[0].texts {
             assert!(*y >= 72.0 - 0.01, "{t} at {y}");
         }
+    }
+
+    // ---- chapter-prefixed page numbers (#771) ----
+
+    /// Heading 1 numbered `%1.` through its style, as Word numbers chapters.
+    fn chapter_opts() -> PdfOptions {
+        PdfOptions {
+            styles: Rc::new(crate::styles::parse_styles_xml(
+                r#"<w:styles><w:style w:type="paragraph" w:styleId="Heading1"><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr></w:style></w:styles>"#,
+            )),
+            numbering: Rc::new(crate::numbering::parse_numbering_xml(
+                r#"<w:numbering><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:pStyle w:val="Heading1"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#,
+            )),
+            ..PdfOptions::default()
+        }
+    }
+
+    /// A Heading 1 paragraph: numbered by its style, or (`direct`) by its
+    /// own `w:numPr` under a style that numbers nothing.
+    fn chapter_heading(text: &str, direct: bool) -> Block {
+        Block::Paragraph(Paragraph {
+            props: ParProps {
+                style_id: Some(if direct { "Plain" } else { "Heading1" }.to_string()),
+                heading_level: Some(1),
+                num_id: direct.then_some(1),
+                raw_props: vec!["<w:pageBreakBefore/>".to_string()],
+                ..ParProps::default()
+            },
+            content: vec![run(text, RunProps::default())],
+        })
+    }
+
+    /// A body paragraph showing the page's PAGE value.
+    fn page_field_para() -> Block {
+        para(vec![
+            run("p ", RunProps::default()),
+            fld_simple("PAGE", "0"),
+        ])
+    }
+
+    fn chapter_sect(start: bool, style: &str, sep: &str) -> String {
+        let start = if start { r#" w:start="1""# } else { "" };
+        format!(
+            r#"<w:sectPr><w:pgNumType{start} w:chapStyle="{style}" w:chapSep="{sep}"/></w:sectPr>"#
+        )
+    }
+
+    /// A6: the chapter sections' pages draw "1-1", "1-2", then "2-1" after
+    /// the next chapter restarts the numbering; the section before them,
+    /// without a prefix, draws its plain number. Either way of numbering
+    /// the heading.
+    #[test]
+    fn chapter_page_numbers_prefix_heading_number() {
+        for direct in [false, true] {
+            let d = doc(vec![
+                page_field_para(),
+                sect_para("intro", BLANK_SECT),
+                chapter_heading("Alpha", direct),
+                page_field_para(),
+                para(vec![page_break()]),
+                page_field_para(),
+                sect_para("end one", &chapter_sect(true, "1", "hyphen")),
+                chapter_heading("Beta", direct),
+                page_field_para(),
+                trailing(&chapter_sect(true, "1", "hyphen")),
+            ]);
+            let pages = pages_of(&d, &chapter_opts());
+            assert_eq!(pages.len(), 4, "direct {direct}");
+            for (page, value) in pages.iter().zip(["1", "1-1", "1-2", "2-1"]) {
+                assert!(
+                    page.exact(value),
+                    "direct {direct}: {value} in {:?}",
+                    page.texts
+                );
+            }
+        }
+    }
+
+    /// A6's separators, each as Word names it; WinAnsi has both dashes.
+    #[test]
+    fn chapter_separators() {
+        let prefix = |sep: Option<&str>| {
+            chapter_prefix(&crate::sect::PageNumberFormat {
+                chap_style: Some(1),
+                chap_sep: sep.map(str::to_string),
+                ..Default::default()
+            })
+        };
+        assert_eq!(prefix(Some("hyphen")), Some((1, "-")));
+        assert_eq!(prefix(Some("period")), Some((1, ".")));
+        assert_eq!(prefix(Some("colon")), Some((1, ":")));
+        assert_eq!(prefix(Some("emDash")), Some((1, "\u{2014}")));
+        assert_eq!(prefix(Some("enDash")), Some((1, "\u{2013}")));
+        assert_eq!(prefix(None), Some((1, "-")));
+        for (sep, byte) in [("emDash", 0x97u8), ("enDash", 0x96), ("period", b'.')] {
+            let d = doc(vec![
+                chapter_heading("Alpha", false),
+                page_field_para(),
+                trailing(&chapter_sect(false, "1", sep)),
+            ]);
+            let pdf = to_pdf(&d, &chapter_opts());
+            let drawn = [b'(', b'1', byte, b'1', b')'];
+            assert!(pdf.windows(5).any(|w| w == drawn), "{sep}");
+        }
+    }
+
+    /// A7: no heading before or on the page, a heading without a number,
+    /// or a `w:chapStyle` outside 1-9: the plain page number.
+    #[test]
+    fn chapter_page_numbers_fall_back_without_heading() {
+        let plain_heading = Block::Paragraph(Paragraph {
+            props: ParProps {
+                style_id: Some("Plain".to_string()),
+                heading_level: Some(1),
+                ..ParProps::default()
+            },
+            content: vec![run("Unnumbered", RunProps::default())],
+        });
+        let cases = [
+            vec![
+                page_field_para(),
+                trailing(&chapter_sect(false, "1", "hyphen")),
+            ],
+            vec![
+                plain_heading,
+                page_field_para(),
+                trailing(&chapter_sect(false, "1", "hyphen")),
+            ],
+            vec![
+                chapter_heading("Alpha", false),
+                page_field_para(),
+                trailing(&chapter_sect(false, "10", "hyphen")),
+            ],
+            // Level 2 asked for, only Heading 1 numbered.
+            vec![
+                chapter_heading("Alpha", false),
+                page_field_para(),
+                trailing(&chapter_sect(false, "2", "hyphen")),
+            ],
+        ];
+        for (k, body) in cases.into_iter().enumerate() {
+            let pages = pages_of(&doc(body), &chapter_opts());
+            assert!(pages[0].exact("1"), "case {k}: {:?}", pages[0].texts);
+            assert!(!pages[0].has("-1"), "case {k}: {:?}", pages[0].texts);
+        }
+    }
+
+    /// An unnumbered chapter heading ends the previous chapter: its page and
+    /// the ones after it show plain numbers until the next numbered one
+    /// (FIX r1).
+    #[test]
+    fn an_unnumbered_chapter_heading_shows_plain_page_numbers() {
+        let mut off = chapter_heading("Appendix", false);
+        if let Block::Paragraph(p) = &mut off {
+            p.props.num_id = Some(0);
+        }
+        let d = doc(vec![
+            chapter_heading("One", false),
+            page_field_para(),
+            para(vec![page_break()]),
+            page_field_para(),
+            off,
+            page_field_para(),
+            para(vec![page_break()]),
+            page_field_para(),
+            chapter_heading("Two", false),
+            page_field_para(),
+            trailing(&chapter_sect(false, "1", "hyphen")),
+        ]);
+        let pages = pages_of(&d, &chapter_opts());
+        assert_eq!(pages.len(), 5);
+        for (page, value) in pages.iter().zip(["1-1", "1-2", "3", "4", "2-5"]) {
+            assert!(page.exact(value), "{value} in {:?}", page.texts);
+        }
+    }
+
+    /// A8: the first chapter heading on the page, else the last before it.
+    #[test]
+    fn chapter_number_uses_first_heading_on_page() {
+        let heading = |text: &str| {
+            let mut h = chapter_heading(text, false);
+            if let Block::Paragraph(p) = &mut h {
+                p.props.raw_props.clear();
+            }
+            h
+        };
+        let d = doc(vec![
+            heading("One"),
+            page_field_para(),
+            para(vec![page_break()]),
+            page_field_para(),
+            heading("Two"),
+            heading("Three"),
+            para(vec![page_break()]),
+            page_field_para(),
+            trailing(&chapter_sect(false, "1", "period")),
+        ]);
+        let pages = pages_of(&d, &chapter_opts());
+        assert_eq!(pages.len(), 3);
+        assert!(pages[0].exact("1.1"), "{:?}", pages[0].texts);
+        assert!(pages[1].exact("2.2"), "{:?}", pages[1].texts);
+        assert!(pages[2].exact("3.3"), "{:?}", pages[2].texts);
+    }
+
+    /// A heading begun at the bottom of a page whose first line moves to
+    /// the next one counts on that next page, not the one it began on.
+    #[test]
+    fn chapter_number_heading_overflowing_to_next_page() {
+        let heading = |text: &str| {
+            let mut h = chapter_heading(text, false);
+            if let Block::Paragraph(p) = &mut h {
+                p.props.raw_props.clear();
+            }
+            h
+        };
+        let mut overflowed = false;
+        for filler in 40..=100 {
+            let mut body = vec![heading("Alpha")];
+            body.extend((0..filler).map(|_| page_field_para()));
+            body.push(heading("Beta"));
+            body.push(page_field_para());
+            body.push(trailing(&chapter_sect(false, "1", "hyphen")));
+            let pages = pages_of(&doc(body), &chapter_opts());
+            let k = pages.iter().position(|p| p.has("Beta")).unwrap();
+            assert!(
+                pages[k].exact(&format!("2-{}", k + 1)),
+                "filler {filler}: {:?}",
+                pages[k].texts
+            );
+            if k >= 2 {
+                assert!(
+                    pages[k - 1].exact(&format!("1-{k}")),
+                    "filler {filler}: {:?}",
+                    pages[k - 1].texts
+                );
+                // Beta alone at the top: it did not fit on the page before.
+                overflowed |= pages[k].texts.iter().map(|t| t.1).fold(f32::MIN, f32::max)
+                    <= pages[k]
+                        .texts
+                        .iter()
+                        .find(|t| t.2.contains("Beta"))
+                        .unwrap()
+                        .1
+                        + 0.01;
+            }
+        }
+        assert!(overflowed, "some filler pushed Beta to a new page");
     }
 }

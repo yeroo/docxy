@@ -17,8 +17,9 @@
 //! the document's setting, kept on the body editor too (#770): clearing it
 //! drops every section's even references in the same step. Part contents (a
 //! design, a removal, a copy made by unlinking, a cleared even header) live
-//! in the package and are not undone; an unreferenced part left behind is
-//! harmless.
+//! in the package and are not undone; a part no section references any
+//! more stays there, so an undo finds it, and is left out of the saved file
+//! (#771).
 use super::*;
 use crate::dialog::catalog;
 use crate::dialog::{Control as Field, ControlKind, Dialog, DialogOwner, Value};

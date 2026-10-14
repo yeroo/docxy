@@ -254,7 +254,7 @@ fn element_end(xml: &str, start: usize, tag: &str) -> usize {
 /// A relationship target resolved against the directory of the part that
 /// holds it (`vbaProject.bin` from `word` is `word/vbaProject.bin`; a
 /// leading `/` is package-absolute; `..` steps up).
-fn resolve(dir: &str, target: &str) -> String {
+pub(super) fn resolve(dir: &str, target: &str) -> String {
     let mut segs: Vec<&str> = if let Some(abs) = target.strip_prefix('/') {
         return normalise(abs.split('/').collect());
     } else if dir.is_empty() {

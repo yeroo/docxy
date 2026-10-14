@@ -8,7 +8,8 @@
 
 use std::collections::HashMap;
 
-use crate::model::{Block, Document};
+use crate::model::{Block, Document, Paragraph};
+use crate::styles::StyleSheet;
 use crate::xml::{Event, XmlParser};
 
 /// A list level's number format (`w:numFmt`).
@@ -38,6 +39,8 @@ struct Level {
     fmt: NumFmt,
     text: String,
     start: i32,
+    /// `w:pStyle`: the paragraph style this level belongs to.
+    p_style: Option<String>,
 }
 
 impl Default for Level {
@@ -46,6 +49,7 @@ impl Default for Level {
             fmt: NumFmt::Decimal,
             text: "%1.".to_string(),
             start: 1,
+            p_style: None,
         }
     }
 }
@@ -93,6 +97,23 @@ impl Numbering {
         ilvl: i32,
         counters: &mut HashMap<i32, Vec<i32>>,
     ) -> Option<String> {
+        let (absn, ilvl, c) = self.count(num_id, ilvl, counters)?;
+        let level = absn.levels.get(ilvl).cloned().unwrap_or_default();
+        if level.fmt == NumFmt::Bullet {
+            return Some(bullet_for(ilvl));
+        }
+        Some(fill(absn, &level.text, c))
+    }
+
+    /// Advance list `num_id`'s counters for a paragraph at `ilvl`: that
+    /// level counts one more and every deeper level starts over. The list's
+    /// definition, the level, and its counters after the step.
+    fn count<'c>(
+        &self,
+        num_id: i32,
+        ilvl: i32,
+        counters: &'c mut HashMap<i32, Vec<i32>>,
+    ) -> Option<(&AbstractNum, usize, &'c [i32])> {
         let abs_id = *self.num_to_abstract.get(&num_id)?;
         let absn = self.abstracts.get(&abs_id)?;
         let ilvl = ilvl.max(0) as usize;
@@ -106,26 +127,63 @@ impl Numbering {
         for k in (ilvl + 1)..c.len() {
             c[k] = absn.levels.get(k).map(|l| l.start).unwrap_or(1) - 1;
         }
+        Some((absn, ilvl, c))
+    }
 
+    /// The level of list `num_id` whose `w:pStyle` names `style`.
+    fn level_of_style(&self, num_id: i32, style: &str) -> Option<i32> {
+        let absn = self.abstracts.get(self.num_to_abstract.get(&num_id)?)?;
+        let at = absn
+            .levels
+            .iter()
+            .position(|l| l.p_style.as_deref() == Some(style))?;
+        i32::try_from(at).ok()
+    }
+
+    /// The chapter number a heading at `ilvl` of `num_id` shows, for a page
+    /// number's `w:chapStyle` prefix, after counting it like [`Self::marker`]:
+    /// the level's `w:lvlText` with literal text before its first `%`
+    /// placeholder and after its last one left out (`%1.` and `Chapter %1`
+    /// give `1`, `%1.%2` gives `1.2`). That trimming is this exporter's
+    /// choice. `None` for a bullet level or one with no placeholder.
+    fn chapter(
+        &self,
+        num_id: i32,
+        ilvl: i32,
+        counters: &mut HashMap<i32, Vec<i32>>,
+    ) -> Option<String> {
+        let (absn, ilvl, c) = self.count(num_id, ilvl, counters)?;
         let level = absn.levels.get(ilvl).cloned().unwrap_or_default();
         if level.fmt == NumFmt::Bullet {
-            return Some(bullet_for(ilvl));
+            return None;
         }
-        let mut s = level.text.clone();
-        for k in 1..=9usize {
-            let pat = format!("%{k}");
-            if s.contains(&pat) {
-                let val = c.get(k - 1).copied().unwrap_or(0).max(1);
-                let fmt = absn
-                    .levels
-                    .get(k - 1)
-                    .map(|l| l.fmt)
-                    .unwrap_or(NumFmt::Decimal);
-                s = s.replace(&pat, &format_num(val, fmt));
-            }
-        }
-        Some(s)
+        let text = &level.text;
+        let marks: Vec<usize> = text
+            .match_indices('%')
+            .map(|(at, _)| at)
+            .filter(|&at| matches!(text.as_bytes().get(at + 1), Some(b'1'..=b'9')))
+            .collect();
+        let (first, last) = (*marks.first()?, *marks.last()?);
+        Some(fill(absn, &text[first..last + 2], c))
     }
+}
+
+/// `text` with each `%k` replaced by level k's counter in its format.
+fn fill(absn: &AbstractNum, text: &str, c: &[i32]) -> String {
+    let mut s = text.to_string();
+    for k in 1..=9usize {
+        let pat = format!("%{k}");
+        if s.contains(&pat) {
+            let val = c.get(k - 1).copied().unwrap_or(0).max(1);
+            let fmt = absn
+                .levels
+                .get(k - 1)
+                .map(|l| l.fmt)
+                .unwrap_or(NumFmt::Decimal);
+            s = s.replace(&pat, &format_num(val, fmt));
+        }
+    }
+    s
 }
 
 fn bullet_for(ilvl: usize) -> String {
@@ -260,6 +318,12 @@ fn parse_level(p: &mut XmlParser) -> Level {
                 match p.name() {
                     "w:start" => lvl.start = parse_int(p.attr("w:val")),
                     "w:numFmt" => lvl.fmt = parse_fmt(p.attr("w:val")),
+                    "w:pStyle" => {
+                        let v = p.attr("w:val");
+                        if !v.is_empty() {
+                            lvl.p_style = Some(v.to_string());
+                        }
+                    }
                     "w:lvlText" => {
                         let mut t = String::new();
                         XmlParser::append_decoded(p.attr("w:val"), &mut t);
@@ -334,6 +398,74 @@ fn walk(
         }
         prefix.pop();
     }
+}
+
+/// The chapter number of every heading in `doc`, for page numbers with a
+/// `w:chapStyle` prefix: `(heading level, number text)` keyed by the
+/// paragraph's address in `doc` (see [`Numbering::chapter`] for the text).
+/// An unnumbered heading is there too, with no text: it is still the
+/// chapter heading of its page, and that page shows a plain number.
+///
+/// A paragraph's numbering is its direct `w:numPr`, else its paragraph
+/// style's (through `w:basedOn`), as Word numbers its outline headings; a
+/// style that names no level takes the one whose `w:pStyle` is the style.
+/// A direct `w:numId` of 0 switches the style's numbering off. Every
+/// numbered paragraph counts, headings or not, table cells included, so a
+/// list sharing the headings' definition moves their numbers as in Word.
+/// `w:lvlOverride`/`w:startOverride` are not read, as the list markers
+/// don't read them either.
+pub(crate) fn heading_numbers(
+    doc: &Document,
+    num: &Numbering,
+    styles: &StyleSheet,
+) -> HashMap<*const Paragraph, (u8, Option<String>)> {
+    fn walk(
+        blocks: &[Block],
+        num: &Numbering,
+        styles: &StyleSheet,
+        counters: &mut HashMap<i32, Vec<i32>>,
+        out: &mut HashMap<*const Paragraph, (u8, Option<String>)>,
+    ) {
+        for block in blocks {
+            match block {
+                Block::Paragraph(p) => {
+                    let style = p.props.style_id.as_deref();
+                    let numbering = match p.props.num_id {
+                        Some(n) => Some((n, p.props.ilvl)),
+                        None => styles.style_num_pr(style).map(|(n, l)| {
+                            let l = l.or_else(|| style.and_then(|s| num.level_of_style(n, s)));
+                            (n, l.unwrap_or(0))
+                        }),
+                    }
+                    .filter(|&(n, _)| n > 0);
+                    match (p.props.heading_level, numbering) {
+                        (Some(level), Some((num_id, ilvl))) => {
+                            let text = num.chapter(num_id, ilvl, counters);
+                            out.insert(p as *const Paragraph, (level, text));
+                        }
+                        (Some(level), None) => {
+                            out.insert(p as *const Paragraph, (level, None));
+                        }
+                        (None, Some((num_id, ilvl))) => {
+                            num.count(num_id, ilvl, counters);
+                        }
+                        (None, None) => {}
+                    }
+                }
+                Block::Table(t) => {
+                    for row in &t.rows {
+                        for cell in &row.cells {
+                            walk(&cell.blocks, num, styles, counters, out);
+                        }
+                    }
+                }
+                Block::SectionProperties(_) | Block::Raw(_) => {}
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    walk(&doc.body, num, styles, &mut HashMap::new(), &mut out);
+    out
 }
 
 #[cfg(test)]
@@ -426,5 +558,155 @@ mod tests {
             body: vec![list_para(99, 0)],
         };
         assert!(compute_markers(&doc, &num).is_empty());
+    }
+
+    /// An outline list numbering Heading1 (`%1.`) and Heading2 (`%1.%2`)
+    /// through their styles, plus a "List Number" style sharing it.
+    const OUTLINE_XML: &str = r#"<w:numbering>
+        <w:abstractNum w:abstractNumId="5">
+            <w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:pStyle w:val="Heading1"/><w:lvlText w:val="%1."/></w:lvl>
+            <w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:pStyle w:val="Heading2"/><w:lvlText w:val="%1.%2"/></w:lvl>
+        </w:abstractNum>
+        <w:num w:numId="7"><w:abstractNumId w:val="5"/></w:num>
+        </w:numbering>"#;
+
+    const OUTLINE_STYLES: &str = r#"<w:styles>
+        <w:style w:type="paragraph" w:styleId="Heading1"><w:pPr><w:numPr><w:numId w:val="7"/></w:numPr></w:pPr></w:style>
+        <w:style w:type="paragraph" w:styleId="Heading2"><w:basedOn w:val="Heading1"/><w:pPr><w:numPr><w:ilvl w:val="1"/></w:numPr></w:pPr></w:style>
+        <w:style w:type="paragraph" w:styleId="ListNumber"><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr></w:pPr></w:style>
+        </w:styles>"#;
+
+    fn styled(style: &str, level: Option<u8>) -> Block {
+        Block::Paragraph(Paragraph {
+            props: ParProps {
+                style_id: Some(style.to_string()),
+                heading_level: level,
+                ..ParProps::default()
+            },
+            content: vec![],
+        })
+    }
+
+    /// The chapter numbers of `body`'s headings, in body order.
+    fn chapters(body: Vec<Block>, num_xml: &str) -> Vec<Option<(u8, Option<String>)>> {
+        let doc = Document { body };
+        let num = parse_numbering_xml(num_xml);
+        let styles = crate::styles::parse_styles_xml(OUTLINE_STYLES);
+        let map = heading_numbers(&doc, &num, &styles);
+        doc.body
+            .iter()
+            .map(|b| match b {
+                Block::Paragraph(p) => map.get(&(p as *const Paragraph)).cloned(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn ch(level: u8, text: &str) -> Option<(u8, Option<String>)> {
+        Some((level, Some(text.to_string())))
+    }
+
+    /// A heading with no number.
+    fn bare(level: u8) -> Option<(u8, Option<String>)> {
+        Some((level, None))
+    }
+
+    #[test]
+    fn heading_numbers_follow_style_num_pr() {
+        let got = chapters(
+            vec![
+                styled("Heading1", Some(1)),
+                styled("Heading2", Some(2)),
+                styled("Heading2", Some(2)),
+                styled("Heading1", Some(1)),
+                styled("Heading2", Some(2)),
+                styled("Normal", None),
+            ],
+            OUTLINE_XML,
+        );
+        assert_eq!(
+            got,
+            vec![
+                ch(1, "1"),
+                ch(2, "1.1"),
+                ch(2, "1.2"),
+                ch(1, "2"),
+                ch(2, "2.1"),
+                None
+            ]
+        );
+        // Direct numbering numbers a heading too, and the list markers
+        // still number only direct numbering.
+        let mut direct = styled("Plain", Some(1));
+        if let Block::Paragraph(p) = &mut direct {
+            p.props.num_id = Some(7);
+        }
+        assert_eq!(
+            chapters(vec![direct.clone()], OUTLINE_XML),
+            vec![ch(1, "1")]
+        );
+        let doc = Document {
+            body: vec![styled("Heading1", Some(1)), direct],
+        };
+        let markers = compute_markers(&doc, &parse_numbering_xml(OUTLINE_XML));
+        assert_eq!(markers.get(&vec![1]).map(String::as_str), Some("1."));
+        assert_eq!(markers.len(), 1);
+    }
+
+    #[test]
+    fn heading_numbers_trim_literal_text() {
+        let xml = |text: &str, fmt: &str| {
+            OUTLINE_XML
+                .replace(
+                    r#"<w:lvlText w:val="%1."/>"#,
+                    &format!(r#"<w:lvlText w:val="{text}"/>"#),
+                )
+                .replacen(
+                    r#"<w:numFmt w:val="decimal"/>"#,
+                    &format!(r#"<w:numFmt w:val="{fmt}"/>"#),
+                    1,
+                )
+        };
+        let one = || vec![styled("Heading1", Some(1))];
+        assert_eq!(
+            chapters(one(), &xml("Chapter %1", "decimal")),
+            vec![ch(1, "1")]
+        );
+        assert_eq!(
+            chapters(one(), &xml("Глава %1:", "decimal")),
+            vec![ch(1, "1")]
+        );
+        assert_eq!(
+            chapters(one(), &xml("Part %1.", "upperRoman")),
+            vec![ch(1, "I")]
+        );
+        assert_eq!(chapters(one(), &xml("No number", "decimal")), vec![bare(1)]);
+        assert_eq!(chapters(one(), &xml("\u{2022}", "bullet")), vec![bare(1)]);
+        let two = vec![styled("Heading1", Some(1)), styled("Heading2", Some(2))];
+        let nested = OUTLINE_XML.replace(r#"w:val="%1.%2""#, r#"w:val="(%1.%2)""#);
+        assert_eq!(chapters(two, &nested), vec![ch(1, "1"), ch(2, "1.1")]);
+    }
+
+    #[test]
+    fn heading_numbers_count_style_numbered_list_paragraphs() {
+        let got = chapters(
+            vec![
+                styled("ListNumber", None),
+                styled("ListNumber", None),
+                styled("Heading1", Some(1)),
+            ],
+            OUTLINE_XML,
+        );
+        assert_eq!(got, vec![None, None, ch(1, "3")]);
+    }
+
+    #[test]
+    fn heading_numbers_num_id_zero_cancels_style_numbering() {
+        let mut off = styled("Heading1", Some(1));
+        if let Block::Paragraph(p) = &mut off {
+            p.props.num_id = Some(0);
+        }
+        let got = chapters(vec![off, styled("Heading1", Some(1))], OUTLINE_XML);
+        assert_eq!(got, vec![bare(1), ch(1, "1")]);
     }
 }

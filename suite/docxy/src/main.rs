@@ -11686,13 +11686,16 @@ fn doc_to_docx_styled(
 /// part's content type says so, and a macro-free type leaves the VBA project
 /// out (see [`Package::set_main_kind`]). `None` (hot-exit, a page's
 /// payload, a name naming no Word type) keeps the type the package has.
+/// With `rebase`, also the bytes a converted tab rebases on (see
+/// [`doc_to_docx_pruning`]).
 fn doc_to_docx_for(
     doc: &Document,
     comments: &[Comment],
     base: Option<&Package>,
     kind: Option<docxcore::package::DocKind>,
-) -> (Vec<u8>, docxcore::package::KindChange) {
-    doc_to_docx_kind(doc, comments, base, false, kind)
+    rebase: bool,
+) -> (Vec<u8>, docxcore::package::KindChange, Option<Vec<u8>>) {
+    doc_to_docx_pruning(doc, comments, base, false, kind, rebase)
 }
 
 fn doc_to_docx_kind(
@@ -11702,6 +11705,22 @@ fn doc_to_docx_kind(
     converted: bool,
     kind: Option<docxcore::package::DocKind>,
 ) -> (Vec<u8>, docxcore::package::KindChange) {
+    let (bytes, change, _) = doc_to_docx_pruning(doc, comments, base, converted, kind, false);
+    (bytes, change)
+}
+
+/// [`doc_to_docx_kind`], plus (`unpruned`) the same package written before
+/// the save leaves out the header/footer parts no section references
+/// (#771): what a converted tab rebases on after its save, since its undo
+/// history survives and may bring a reference to one of them back.
+fn doc_to_docx_pruning(
+    doc: &Document,
+    comments: &[Comment],
+    base: Option<&Package>,
+    converted: bool,
+    kind: Option<docxcore::package::DocKind>,
+    unpruned: bool,
+) -> (Vec<u8>, docxcore::package::KindChange, Option<Vec<u8>>) {
     use std::collections::HashSet;
     // A body still equal to the one the base's document.xml encodes writes
     // those bytes back, as the CLI writes an unedited document's (#1107).
@@ -11712,7 +11731,9 @@ fn doc_to_docx_kind(
     let unmodified = !converted && base.is_some_and(|p| p.stores_document(doc));
     // With the original package in hand, re-serialize just document.xml back into
     // it — every other part (footnotes, headers/footers, images, themes, …) is
-    // preserved. Otherwise build a minimal package (new/empty documents).
+    // preserved, except the header/footer parts no section references any
+    // more, pruned below. Otherwise build a minimal package (new/empty
+    // documents).
     let mut pkg = match base {
         Some(p) => {
             let mut p = p.clone();
@@ -11770,13 +11791,20 @@ fn doc_to_docx_kind(
     // Only a type that disagrees is rewritten, so an unmodified save of a
     // file already of its type is still its own bytes.
     let change = kind.map(|k| pkg.set_main_kind(k)).unwrap_or_default();
-    let bytes = if unmodified {
-        // Header and footer edits still add the table styles they use.
-        docxcore::package::save_package_keeping_document(&pkg)
-    } else {
-        docxcore::package::save_package(&pkg)
+    let write = |pkg: &Package| {
+        if unmodified {
+            // Header and footer edits still add the table styles they use.
+            docxcore::package::save_package_keeping_document(pkg)
+        } else {
+            docxcore::package::save_package(pkg)
+        }
     };
-    (bytes, change)
+    let before = unpruned.then(|| write(&pkg));
+    // Header/footer parts no section references any more (Link to Previous,
+    // Remove, a cleared even header) stay in the tab's package for undo, but
+    // not in the file (#771).
+    pkg.drop_unreferenced_hf_parts(unmodified);
+    (write(&pkg), change, before)
 }
 
 /// One tab as a relaunch restores it. The app goes through
@@ -20489,15 +20517,19 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
     let kind = html_bundle::doc_target(&path, markdown);
     // A converted tab has the package its conversion wrote (#633), so it
     // saves into it like any other Word document.
+    // A converted tab also gets the bytes it rebases on (see `package`).
     let docx = |kind| {
         let live = live_comments(tab, &editor.doc);
         let base = save_base(tab, &editor.doc, &live);
-        doc_to_docx_for(&editor.doc, &live, base.as_deref(), kind)
+        let rebase = tab.access.converted.is_some();
+        doc_to_docx_for(&editor.doc, &live, base.as_deref(), kind, rebase)
     };
     // Plain Text and Rich Text number lists and resolve styles the way the
     // package defines them.
     let context = || docxcore::export_context::ExportContext::for_package(tab.pkg.as_ref());
-    // The Word package written, alone or inside a page.
+    // What a converted tab rebases on once saved: the Word package written,
+    // alone or inside a page, but with the header/footer parts the file
+    // leaves out, which the surviving undo history may reference (#771).
     let mut package: Option<Vec<u8>> = None;
     let mut macros_dropped = false;
     let bytes = match kind {
@@ -20512,13 +20544,15 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
             docxcore::export_rtf::to_rtf(&editor.export_doc(), &context()).into_bytes()
         }
         html_bundle::DocTarget::Docx(kind) => {
-            let (bytes, change) = docx(kind);
+            let (bytes, change, unpruned) = docx(kind);
             macros_dropped = change.macros_dropped;
-            package.insert(bytes).clone()
+            package = unpruned;
+            bytes
         }
         // The page's payload is a plain document, as before.
         html_bundle::DocTarget::Html => {
-            let docx = package.insert(docx(None).0).clone();
+            let (docx, _, unpruned) = docx(None);
+            package = unpruned;
             match html_bundle::bundle_bytes(&path, tab.bundle_html.as_deref(), &docx) {
                 Ok(page) => page.into_bytes(),
                 Err(e) => {
