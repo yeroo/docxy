@@ -2048,12 +2048,9 @@ fn doc_clip_ours(ours: &DocClip, now: &ClipRead, rich: bool) -> bool {
     !rich_only && clip_still_ours(&ours.text, now)
 }
 
-/// What a document paste inserts (#755, #1074): the document clip while it
-/// is ours ([`doc_clip_ours`]), else the clipboard's RTF (another app's
-/// rich copy, or ours from another window), else its text. An RTF the
-/// importer cannot read pastes the text.
 /// The plain text a document copy of `clip` writes: its text, or, for a
-/// clip of pictures alone (no text, #1242), one U+FFFC per picture, so the
+/// clip of pictures alone (no text, #1242), one U+FFFC per picture (a
+/// linked one too: with no text, every offset left is a picture), so the
 /// write takes and the clip stays ours ([`clip_still_ours`]) until the
 /// clipboard changes, and another app's image copy is not taken for it.
 /// Another app's plain paste shows the stand-in; docxy's never types it.
@@ -2065,15 +2062,17 @@ fn doc_copy_text(clip: &Clip) -> String {
     clip.paras
         .iter()
         .map(|p| {
-            p.iter()
-                .filter(|i| docxcore::editor::is_object_unit(i))
-                .map(|_| docxcore::editor::FIELD_CHAR)
-                .collect::<String>()
+            let units: usize = p.iter().map(docxcore::editor::inline_len).sum();
+            docxcore::editor::FIELD_CHAR.to_string().repeat(units)
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
+/// What a document paste inserts (#755, #1074): the document clip while it
+/// is ours ([`doc_clip_ours`]), else the clipboard's RTF (another app's
+/// rich copy, or ours from another window), else its text. An RTF the
+/// importer cannot read pastes the text.
 fn doc_paste_clip(ours: Option<&DocClip>, now: &ClipRead, rtf: Option<&[u8]>) -> Option<Clip> {
     match ours {
         Some(ours) if doc_clip_ours(ours, now, rtf.is_some()) => Some(ours.clip.clone()),
@@ -24632,6 +24631,31 @@ mod clipboard_tests {
         assert_eq!(doc_paste_clip(Some(&ours), &ClipRead::NotText, None), None);
         // A plain paste of the stand-in elsewhere in docxy types nothing.
         assert_eq!(Clip::from_text("\u{FFFC}\u{FFFC}").to_text(), "");
+        // A linked picture copied alone: the clip keeps its link, and the
+        // stand-in is still written (FIX r1).
+        let mut ed = docxcore::editor::Editor::new(docxcore::model::Document {
+            body: vec![docxcore::model::Block::Paragraph(
+                docxcore::model::Paragraph {
+                    props: Default::default(),
+                    content: vec![Inline::Hyperlink(docxcore::model::Hyperlink {
+                        target: Some("https://x.test/".into()),
+                        content: vec![picture.clone()],
+                        ..Default::default()
+                    })],
+                },
+            )],
+        });
+        ed.select_match(&docxcore::editor::Match {
+            path: vec![0],
+            start: 0,
+            end: 1,
+        });
+        let linked = ed.copy().expect("a clip");
+        assert!(
+            matches!(linked.paras[0][0], Inline::Hyperlink(_)),
+            "{linked:?}"
+        );
+        assert_eq!(doc_copy_text(&linked), "\u{FFFC}");
         // A clip with text writes its text.
         let mixed = Clip {
             paras: vec![vec![picture, Clip::from_text("ab").paras[0][0].clone()]],
@@ -29997,7 +30021,8 @@ fn paragraph_el(
             Inline::Equation { text, latex, .. } => {
                 // Math renders as its Unicode form (falling back to the LaTeX),
                 // in a faint math tint — docxy can't typeset, but the equation
-                // is visible and editable-as-text rather than a "[equation]" stub.
+                // is visible, rather than a "[equation]" stub, and edited as one
+                // unit (#1242).
                 let shown = if !text.is_empty() {
                     text.clone()
                 } else {

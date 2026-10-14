@@ -3328,7 +3328,8 @@ pub fn is_object_unit(inline: &Inline) -> bool {
 /// A paragraph's text in editor offset space: one char per offset, matching
 /// [`inline_len`] inline by inline (zero-width inlines contribute nothing, a
 /// hyperlink contributes its `runs` and then its `content` by these same rules,
-/// a tab is `'\t'`, a break is `'\n'`, a field is [`FIELD_CHAR`]).
+/// a tab is `'\t'`, a break is `'\n'`, a field, an equation or an inline
+/// picture is [`FIELD_CHAR`]).
 /// Unlike [`Paragraph::plain_text`], every char here is one the caret can
 /// reach, so offsets into it can be selected and edited.
 fn editor_text(content: &[Inline]) -> String {
@@ -3352,12 +3353,10 @@ fn push_editor_text(content: &[Inline], out: &mut String) {
                     out.push(FIELD_CHAR);
                 }
             }
-            Inline::Equation { .. } | Inline::Raw(_) if is_object_unit(inline) => {
-                out.push(FIELD_CHAR);
-            }
+            Inline::Equation { .. } => out.push(FIELD_CHAR),
+            Inline::Raw(_) if is_object_unit(inline) => out.push(FIELD_CHAR),
             Inline::SmartArt { .. }
             | Inline::Chart { .. }
-            | Inline::Equation { .. }
             | Inline::TextBox { .. }
             | Inline::Revision { .. }
             | Inline::UnsupportedRevision { .. }

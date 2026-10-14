@@ -10,9 +10,10 @@
 //!   page converts between the browser's UTF-16 offsets and these scalar
 //!   offsets;
 //! - everything else is **atomic** (`contenteditable=false` on the page) with
-//!   the width the editor gives it — one for a tab, a break or a field that
-//!   shows a result (a field is edited as one unit), zero for tracked changes,
-//!   drawings, an empty field and other anchors the editor cannot enter.
+//!   the width the editor gives it — one for a tab, a break, a field that
+//!   shows a result, an equation or an inline picture (each edited as one
+//!   unit, #1242), zero for tracked changes, floating drawings, an empty
+//!   field and other anchors the editor cannot enter.
 //!
 //! Widths come from [`docxcore::editor::inline_len`] (and paragraph lengths
 //! from `para_text_len`), the editor's own functions, so the page and the

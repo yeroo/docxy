@@ -3,8 +3,9 @@
 //! [`Editor::find_all`] searches only what the caret can reach (runs, tabs,
 //! breaks, a link's plain text), so its offsets can be selected and edited,
 //! and agents and Replace All use it. A user also sees text the editor gives
-//! no width: tracked changes, field results, footnote reference marks,
-//! equations, SmartArt. This search finds that too, but still reports editor
+//! no width or one unit: tracked changes, field results and equations (one
+//! unit each), footnote reference marks, SmartArt. This search finds that
+//! too, but still reports editor
 //! offsets, never a second offset space (the #197 rule): every displayed char
 //! carries the editor range it lives at, and a match is marked editable only
 //! when all of its chars are ones the editor can edit.
@@ -16,9 +17,11 @@ use crate::model::{Block, Inline, RevisionTarget};
 ///
 /// `editable` is true when every matched char is a run, tab or break char;
 /// then `[start, end)` is exactly the matched text and can be replaced. A
-/// read-only match covers a field's result (`[start, end)` is the field's one
-/// unit), or text the editor gives no width (a tracked change, a footnote
-/// mark, an equation, SmartArt), which has the collapsed range where that
+/// read-only match covers a field's result or an equation's text
+/// (`[start, end)` is its one unit, #1242; a multi-line equation's box lines
+/// excepted, which have the collapsed range where it starts), or text the
+/// editor gives no width (a tracked change, a footnote mark, SmartArt), which
+/// has the collapsed range where that
 /// construct sits, or a mix of these with editable text (`colo[ins u]r` for
 /// `colour`, `Body` + a field's `1` for `Body1`), whose range spans all of
 /// it. `revision` is set when any matched char is drawn from a tracked
