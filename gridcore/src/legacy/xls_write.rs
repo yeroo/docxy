@@ -1,0 +1,1824 @@
+//! The Excel 97-2003 `.xls` writer (#874): a workbook as a BIFF8 `Workbook`
+//! stream in a compound file, the inverse of [`super::xls`]. Saving a
+//! workbook in Compatibility Mode writes this.
+//!
+//! The whole file is written from the model, so it reflects every edit:
+//! sheets, cells, formulas, number formats, defined names, the date system,
+//! the formatting the model holds (fonts, fills, alignment, wrap, a thin
+//! box border, quote prefix), merged cells, column widths, row heights,
+//! hidden rows, columns and sheets, and frozen panes. The record layouts and
+//! their order follow what Excel writes (corpus/legacy's `.xls` files).
+//!
+//! What BIFF8 or this writer can't hold is left out and named in
+//! [`XlsOut::lost`]: cells past the 65,536 × 256 grid, formulas that can't
+//! be compiled ([`super::ptg_write::Why`]; the cell keeps its value), and
+//! the model features this writer has no records for (tables, conditional
+//! formatting, data validation, hyperlinks, drawings, comments, ...).
+
+use std::collections::{BTreeMap, HashMap};
+
+use crate::sheet::{Align, Cell, CellValue, Sheet, Workbook, Xf};
+use crate::xlsx::SheetPackage;
+
+use super::ptg_write::{self, Book, Compiled, Site, Tables, Why};
+
+/// A written `.xls` and what it couldn't hold.
+#[derive(Clone, Debug, Default)]
+pub struct XlsOut {
+    /// The compound file.
+    pub bytes: Vec<u8>,
+    /// What the workbook has that the file lacks, one entry per kind, in
+    /// words for a "will be lost" list ("3 formulas that refer past row
+    /// 65,536 or column IV (saved as values)"). Empty when nothing is lost.
+    pub lost: Vec<String>,
+}
+
+/// The longest record body; the rest of a longer one goes in CONTINUE
+/// records.
+const MAX_BODY: usize = 8224;
+const CONTINUE: u16 = 0x003C;
+const BOF: u16 = 0x0809;
+const EOF: u16 = 0x000A;
+/// The style XFs every BIFF8 file starts with; cell XFs follow.
+const STYLE_XFS: usize = 15;
+/// The most XF records Excel 97-2003 takes.
+const MAX_XFS: usize = 4050;
+/// The most FONT records (index 4 is never used).
+const MAX_FONTS: usize = 511;
+/// The most characters a cell's text holds.
+const MAX_TEXT: usize = 32_767;
+
+/// BIFF8's default palette: the colours of indices 8..=63.
+pub(crate) const DEFAULT_PALETTE: [(u8, u8, u8); 56] = [
+    (0x00, 0x00, 0x00),
+    (0xFF, 0xFF, 0xFF),
+    (0xFF, 0x00, 0x00),
+    (0x00, 0xFF, 0x00),
+    (0x00, 0x00, 0xFF),
+    (0xFF, 0xFF, 0x00),
+    (0xFF, 0x00, 0xFF),
+    (0x00, 0xFF, 0xFF),
+    (0x80, 0x00, 0x00),
+    (0x00, 0x80, 0x00),
+    (0x00, 0x00, 0x80),
+    (0x80, 0x80, 0x00),
+    (0x80, 0x00, 0x80),
+    (0x00, 0x80, 0x80),
+    (0xC0, 0xC0, 0xC0),
+    (0x80, 0x80, 0x80),
+    (0x99, 0x99, 0xFF),
+    (0x99, 0x33, 0x66),
+    (0xFF, 0xFF, 0xCC),
+    (0xCC, 0xFF, 0xFF),
+    (0x66, 0x00, 0x66),
+    (0xFF, 0x80, 0x80),
+    (0x00, 0x66, 0xCC),
+    (0xCC, 0xCC, 0xFF),
+    (0x00, 0x00, 0x80),
+    (0xFF, 0x00, 0xFF),
+    (0xFF, 0xFF, 0x00),
+    (0x00, 0xFF, 0xFF),
+    (0x80, 0x00, 0x80),
+    (0x80, 0x00, 0x00),
+    (0x00, 0x80, 0x80),
+    (0x00, 0x00, 0xFF),
+    (0x00, 0xCC, 0xFF),
+    (0xCC, 0xFF, 0xFF),
+    (0xCC, 0xFF, 0xCC),
+    (0xFF, 0xFF, 0x99),
+    (0x99, 0xCC, 0xFF),
+    (0xFF, 0x99, 0xCC),
+    (0xCC, 0x99, 0xFF),
+    (0xFF, 0xCC, 0x99),
+    (0x33, 0x66, 0xFF),
+    (0x33, 0xCC, 0xCC),
+    (0x99, 0xCC, 0x00),
+    (0xFF, 0xCC, 0x00),
+    (0xFF, 0x99, 0x00),
+    (0xFF, 0x66, 0x00),
+    (0x66, 0x66, 0x99),
+    (0x96, 0x96, 0x96),
+    (0x00, 0x33, 0x66),
+    (0x33, 0x99, 0x66),
+    (0x00, 0x33, 0x00),
+    (0x33, 0x33, 0x00),
+    (0x99, 0x33, 0x00),
+    (0x99, 0x33, 0x66),
+    (0x33, 0x33, 0x99),
+    (0x33, 0x33, 0x33),
+];
+
+/// The automatic (window text) colour index.
+const ICV_AUTO: u16 = 0x7FFF;
+
+/// What a save lost, counted by kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Loss {
+    Formula(Why),
+    CellsPastGrid,
+    MergesPastGrid,
+    Names,
+    LongText,
+    Xfs,
+    Fonts,
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{n} {many}")
+    }
+}
+
+impl Loss {
+    fn describe(self, n: usize) -> String {
+        let f = |what: &str| {
+            format!(
+                "{} {what} (saved as values)",
+                plural(n, "formula", "formulas")
+            )
+        };
+        match self {
+            Loss::Formula(Why::PastGrid) => f("with references past row 65,536 or column IV"),
+            Loss::Formula(Why::LongText) => f("with text longer than 255 characters"),
+            Loss::Formula(Why::Lambda) => f("with LAMBDA or LET"),
+            Loss::Formula(Why::OtherBook) => f("with references to other workbooks"),
+            Loss::Formula(Why::TooLong) => f("longer than Excel 97-2003 allows"),
+            Loss::Formula(Why::Unsupported) => f("Excel 97-2003 cannot hold"),
+            Loss::CellsPastGrid => format!(
+                "{} beyond row 65,536 or column IV",
+                plural(n, "cell", "cells")
+            ),
+            Loss::MergesPastGrid => format!(
+                "{} beyond row 65,536 or column IV",
+                plural(n, "merged range", "merged ranges")
+            ),
+            Loss::Names => format!(
+                "{} Excel 97-2003 cannot hold",
+                plural(n, "defined name", "defined names")
+            ),
+            Loss::LongText => format!(
+                "{} longer than 32,767 characters (shortened)",
+                plural(n, "cell text", "cell texts")
+            ),
+            Loss::Xfs => format!(
+                "{} past Excel 97-2003's limit of 4,000 (merged into the default)",
+                plural(n, "cell format", "cell formats")
+            ),
+            Loss::Fonts => format!(
+                "{} past Excel 97-2003's limit of 512 (merged into the default)",
+                plural(n, "font", "fonts")
+            ),
+        }
+    }
+}
+
+/// Write `pkg`'s workbook as an `.xls`.
+pub fn write_xls(pkg: &SheetPackage) -> XlsOut {
+    let wb = &pkg.workbook;
+    let mut lost: BTreeMap<Loss, usize> = BTreeMap::new();
+    let styles = StyleTable::new(wb, &mut lost);
+    let mut refs = Refs::new(pkg);
+
+    // Defined names first: their NAME records come first, so the indices
+    // formulas name them by are known before any formula is compiled.
+    let mut name_rgce: Vec<Option<Compiled>> = Vec::new();
+    for d in &wb.defined_names {
+        let c = ptg_write::compile(&d.formula, Site::Name { scope: d.scope }, &mut refs).ok();
+        if c.is_none() {
+            *lost.entry(Loss::Names).or_default() += 1;
+        }
+        name_rgce.push(c);
+    }
+
+    let mut sst = Sst::default();
+    let sheets: Vec<SheetOut> = wb
+        .sheets
+        .iter()
+        .enumerate()
+        .map(|(i, s)| sheet_records(wb, i, s, &styles, &mut refs, &mut sst, &mut lost))
+        .collect();
+
+    let mut book = Vec::new();
+    let mut ws_pos = Vec::new();
+    globals(&mut book, wb, &styles, &refs, &name_rgce, &sst, &mut ws_pos);
+    for (i, sheet) in sheets.iter().enumerate() {
+        let at = book.len() as u32;
+        // BOUNDSHEET8.lbPlyPos: where the sheet's BOF is.
+        book[ws_pos[i]..ws_pos[i] + 4].copy_from_slice(&at.to_le_bytes());
+        book.extend_from_slice(&sheet.bytes);
+    }
+    // Excel-compatible writers keep the stream out of the mini stream.
+    if book.len() < 4096 {
+        book.resize(4096, 0);
+    }
+
+    let mut out: Vec<String> = lost.into_iter().map(|(kind, n)| kind.describe(n)).collect();
+    out.extend(unsupported_features(pkg));
+    XlsOut {
+        bytes: opccore::cfb::write_cfb(&[("Workbook", book)]),
+        lost: out,
+    }
+}
+
+/// The model features this writer has no records for, in Excel's words,
+/// each named once when the workbook has any.
+fn unsupported_features(pkg: &SheetPackage) -> Vec<String> {
+    let wb = &pkg.workbook;
+    let any = |f: &dyn Fn(&Sheet) -> bool| wb.sheets.iter().any(f);
+    let default_setup = crate::print::setup::PageSetup::default();
+    let mut out: Vec<&str> = Vec::new();
+    if !wb.tables.is_empty() {
+        out.push("tables (their cells are kept as plain ranges)");
+    }
+    if any(&|s| !s.cond_formats.is_empty()) {
+        out.push("conditional formatting");
+    }
+    if any(&|s| !s.validations.is_empty()) {
+        out.push("data validation");
+    }
+    if any(&|s| !s.hyperlinks.is_empty()) {
+        out.push("hyperlinks");
+    }
+    if any(&|s| !s.drawings.is_empty()) {
+        out.push("pictures, shapes and charts");
+    }
+    if !pkg.comments().is_empty() {
+        out.push("comments");
+    }
+    if !wb.pivots.is_empty() {
+        out.push("PivotTables");
+    }
+    if any(&|s| s.auto_filter.is_some()) {
+        out.push("AutoFilter");
+    }
+    if any(&|s| s.protection.is_some()) {
+        out.push("sheet protection");
+    }
+    if any(&|s| s.page_setup != default_setup) {
+        out.push("page setup");
+    }
+    if any(&|s| !s.row_breaks.is_empty() || !s.col_breaks.is_empty()) {
+        out.push("page breaks");
+    }
+    if any(&|s| s.max_row_outline() > 0 || s.max_col_outline() > 0) {
+        out.push("outlines (grouped rows and columns)");
+    }
+    let used: std::collections::HashSet<u32> = wb
+        .sheets
+        .iter()
+        .flat_map(|s| s.cells.values().map(|c| c.style))
+        .collect();
+    if used.iter().any(|&i| {
+        let x = wb.styles.xf(i);
+        x.fill_unresolved || x.color_unresolved
+    }) {
+        out.push("theme colors");
+    }
+    let mut v: Vec<String> = out.into_iter().map(str::to_string).collect();
+    for m in pkg.macro_features() {
+        v.push(m.to_string());
+    }
+    v
+}
+
+// ---- records ----------------------------------------------------------------
+
+/// A record: id, length, body. The body must fit [`MAX_BODY`].
+fn rec(out: &mut Vec<u8>, ty: u16, body: &[u8]) {
+    debug_assert!(body.len() <= MAX_BODY, "{ty:#06x}: {}", body.len());
+    out.extend_from_slice(&ty.to_le_bytes());
+    out.extend_from_slice(&(body.len() as u16).to_le_bytes());
+    out.extend_from_slice(body);
+}
+
+/// A record whose body ends with a string's characters (`units`), split
+/// over CONTINUE records where it runs past [`MAX_BODY`]: each piece starts
+/// with the string's flags byte again. `head` (the fields before the
+/// characters, the string's count and flags included) never splits.
+fn rec_with_string(out: &mut Vec<u8>, ty: u16, head: &[u8], units: &[u16]) {
+    let high = units.iter().any(|&u| u >= 0x100);
+    let width = if high { 2 } else { 1 };
+    let mut body = head.to_vec();
+    let mut left = units;
+    let mut ty = ty;
+    loop {
+        let room = (MAX_BODY - body.len()) / width;
+        let n = room.min(left.len());
+        for &u in &left[..n] {
+            if high {
+                body.extend_from_slice(&u.to_le_bytes());
+            } else {
+                body.push(u as u8);
+            }
+        }
+        rec(out, ty, &body);
+        left = &left[n..];
+        if left.is_empty() {
+            return;
+        }
+        ty = CONTINUE;
+        body = vec![high as u8];
+    }
+}
+
+fn u16s(vals: &[u16]) -> Vec<u8> {
+    vals.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// A BOF: BIFF8, of substream type `dt`, with the build Excel 2007+ writes.
+fn bof(out: &mut Vec<u8>, dt: u16) {
+    let mut b = u16s(&[0x0600, dt, 0x4F5A, 0x07CD]);
+    b.extend_from_slice(&0x0002_00C1u32.to_le_bytes());
+    b.extend_from_slice(&0x0000_0806u32.to_le_bytes());
+    rec(out, BOF, &b);
+}
+
+/// An `XLUnicodeString` (16-bit count) as bytes.
+fn xl_string(s: &str) -> Vec<u8> {
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let mut out = (units.len() as u16).to_le_bytes().to_vec();
+    ptg_write::push_chars(&mut out, &units);
+    out
+}
+
+// ---- styles -----------------------------------------------------------------
+
+/// A FONT as the model's xf describes it.
+#[derive(Clone, Debug, PartialEq)]
+struct Font {
+    name: String,
+    /// Twips.
+    height: u16,
+    bold: bool,
+    italic: bool,
+    color: Option<(u8, u8, u8)>,
+}
+
+impl Font {
+    fn of(xf: &Xf) -> Font {
+        let mut name = xf.font_name.clone().unwrap_or_else(|| "Calibri".into());
+        // A font name is at most 31 characters in BIFF8.
+        if name.chars().count() > 31 {
+            name = name.chars().take(31).collect();
+        }
+        let size = xf.font_size.unwrap_or(11.0);
+        Font {
+            name,
+            height: (size * 20.0).round().clamp(20.0, 8191.0) as u16,
+            bold: xf.bold,
+            italic: xf.italic,
+            color: xf.color,
+        }
+    }
+}
+
+/// The workbook's FONT, FORMAT, XF and PALETTE records, and each model xf's
+/// XF index.
+struct StyleTable {
+    fonts: Vec<Font>,
+    /// (id, code) of each FORMAT a custom code needs.
+    formats: Vec<(u16, String)>,
+    /// One cell XF per model xf (or per the first [`MAX_XFS`] of them):
+    /// (font index, format id, xf).
+    xfs: Vec<(u16, u16, Xf)>,
+    /// The XF index of each model xf.
+    xf_of: Vec<u16>,
+    palette: [(u8, u8, u8); 56],
+    custom_palette: bool,
+}
+
+impl StyleTable {
+    fn new(wb: &Workbook, lost: &mut BTreeMap<Loss, usize>) -> StyleTable {
+        let model = &wb.styles.xfs;
+        let default = Font::of(&Xf::default());
+        // Fonts 0-3 are the default font, as Excel writes them; 4 is never
+        // used, so the next font is 5.
+        let mut fonts = vec![default.clone(); 4];
+        let mut formats: Vec<(u16, String)> = Vec::new();
+        let mut xfs = Vec::new();
+        let mut xf_of = Vec::new();
+        let mut colors: Vec<(u8, u8, u8)> = Vec::new();
+        let mut want = |c: Option<(u8, u8, u8)>| {
+            if let Some(c) = c {
+                if !colors.contains(&c) {
+                    colors.push(c);
+                }
+            }
+        };
+        for (i, x) in model.iter().enumerate() {
+            if STYLE_XFS + i >= MAX_XFS {
+                *lost.entry(Loss::Xfs).or_default() += 1;
+                xf_of.push(STYLE_XFS as u16);
+                continue;
+            }
+            let font = Font::of(x);
+            let ifnt = match fonts.iter().position(|f| *f == font) {
+                Some(i) => i,
+                None if fonts.len() + 1 < MAX_FONTS => {
+                    want(font.color);
+                    fonts.push(font);
+                    fonts.len() - 1
+                }
+                None => {
+                    *lost.entry(Loss::Fonts).or_default() += 1;
+                    0
+                }
+            };
+            // Index 4 doesn't exist: fonts from the 5th on are numbered one up.
+            let ifnt = if ifnt >= 4 { ifnt + 1 } else { ifnt } as u16;
+            want(x.fill);
+            let ifmt = match x.code.as_deref() {
+                None => 0,
+                Some(code) => match (0..164u16)
+                    .find(|&id| crate::numfmt::builtin_code(id as u32).is_some_and(|b| b == code))
+                {
+                    Some(id) => id,
+                    None => match formats.iter().find(|(_, c)| c == code) {
+                        Some((id, _)) => *id,
+                        None => {
+                            let id = 164 + formats.len() as u16;
+                            formats.push((id, code.to_string()));
+                            id
+                        }
+                    },
+                },
+            };
+            xf_of.push((STYLE_XFS + xfs.len()) as u16);
+            xfs.push((ifnt, ifmt, x.clone()));
+        }
+        if xfs.is_empty() {
+            xfs.push((0, 0, Xf::default()));
+        }
+        // The palette: the default one, with each colour it lacks put in a
+        // slot no needed colour uses; past 56 colours, the nearest.
+        let mut palette = DEFAULT_PALETTE;
+        let mut taken = [false; 56];
+        for c in &colors {
+            if let Some(i) = palette.iter().position(|p| p == c) {
+                taken[i] = true;
+            }
+        }
+        let mut custom_palette = false;
+        for c in &colors {
+            if palette.contains(c) {
+                continue;
+            }
+            if let Some(i) = taken.iter().position(|t| !t) {
+                palette[i] = *c;
+                taken[i] = true;
+                custom_palette = true;
+            }
+        }
+        StyleTable {
+            fonts,
+            formats,
+            xfs,
+            xf_of,
+            palette,
+            custom_palette,
+        }
+    }
+
+    /// The XF index of model xf `style`.
+    fn xf(&self, style: u32) -> u16 {
+        self.xf_of
+            .get(style as usize)
+            .copied()
+            .unwrap_or(STYLE_XFS as u16)
+    }
+
+    /// The palette index of `c`: its slot, else the nearest colour's.
+    fn icv(&self, c: (u8, u8, u8)) -> u16 {
+        let d = |p: &(u8, u8, u8)| {
+            let s = |a: u8, b: u8| (a as i32 - b as i32).pow(2);
+            s(p.0, c.0) + s(p.1, c.1) + s(p.2, c.2)
+        };
+        let i = (0..56).min_by_key(|&i| d(&self.palette[i])).unwrap_or(0);
+        8 + i as u16
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        for f in &self.fonts {
+            let mut b = Vec::new();
+            b.extend_from_slice(&f.height.to_le_bytes());
+            b.extend_from_slice(&(if f.italic { 0x0002u16 } else { 0 }).to_le_bytes());
+            let icv = f.color.map_or(ICV_AUTO, |c| self.icv(c));
+            b.extend_from_slice(&icv.to_le_bytes());
+            b.extend_from_slice(&(if f.bold { 700u16 } else { 400 }).to_le_bytes());
+            // sss, uls, bFamily, bCharSet, reserved.
+            b.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+            b.extend_from_slice(&ptg_write::short_string(&f.name).unwrap_or_else(|| vec![0, 0]));
+            rec(out, 0x0031, &b);
+        }
+        for (id, code) in &self.formats {
+            let mut b = id.to_le_bytes().to_vec();
+            b.extend_from_slice(&xl_string(code));
+            rec(out, 0x041E, &b);
+        }
+        // The style XFs, as Excel writes them: Normal and 14 copies.
+        let style = [
+            0, 0, 0, 0, 0xF5, 0xFF, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xC0, 0x20,
+        ];
+        for _ in 0..STYLE_XFS {
+            rec(out, 0x00E0, &style);
+        }
+        for (ifnt, ifmt, x) in &self.xfs {
+            rec(out, 0x00E0, &self.cell_xf(*ifnt, *ifmt, x));
+        }
+        // STYLE: Normal is built-in style 0 on XF 0.
+        rec(out, 0x0293, &[0x00, 0x80, 0x00, 0xFF]);
+        if self.custom_palette {
+            let mut b = 56u16.to_le_bytes().to_vec();
+            for &(r, g, bl) in &self.palette {
+                b.extend_from_slice(&[r, g, bl, 0]);
+            }
+            rec(out, 0x0092, &b);
+        }
+    }
+
+    fn cell_xf(&self, ifnt: u16, ifmt: u16, x: &Xf) -> [u8; 20] {
+        let mut b = [0u8; 20];
+        b[0..2].copy_from_slice(&ifnt.to_le_bytes());
+        b[2..4].copy_from_slice(&ifmt.to_le_bytes());
+        // Locked, a cell XF on the Normal style; f123Prefix for a quote prefix.
+        let flags: u16 = 0x0001 | if x.quote_prefix { 0x0008 } else { 0 };
+        b[4..6].copy_from_slice(&flags.to_le_bytes());
+        let alc = match x.align {
+            Align::General => 0,
+            Align::Left => 1,
+            Align::Center => 2,
+            Align::Right => 3,
+        };
+        // Horizontal alignment, wrap, and bottom vertical alignment (2).
+        b[6] = alc | if x.wrap { 0x08 } else { 0 } | 0x20;
+        // The attribute groups this XF sets apart from its style.
+        b[9] = 0xFC;
+        if x.border {
+            // Thin (1) on every side, in black (palette 8).
+            let dg: u32 = 0x1111 | (8 << 16) | (8 << 23);
+            b[10..14].copy_from_slice(&dg.to_le_bytes());
+            let top: u32 = 8 | (8 << 7);
+            b[14..18].copy_from_slice(&top.to_le_bytes());
+        }
+        let (fls, fore) = match x.fill {
+            Some(c) => (1u32, self.icv(c)),
+            None => (0, 0x40),
+        };
+        let b14 = u32::from_le_bytes([b[14], b[15], b[16], b[17]]) | (fls << 26);
+        b[14..18].copy_from_slice(&b14.to_le_bytes());
+        let pat: u16 = fore | (0x41 << 7);
+        b[18..20].copy_from_slice(&pat.to_le_bytes());
+        b
+    }
+}
+
+// ---- shared strings ---------------------------------------------------------
+
+#[derive(Default)]
+struct Sst {
+    strings: Vec<Vec<u16>>,
+    index: HashMap<String, u32>,
+    total: u32,
+}
+
+impl Sst {
+    fn add(&mut self, s: &str) -> u32 {
+        self.total += 1;
+        if let Some(&i) = self.index.get(s) {
+            return i;
+        }
+        let i = self.strings.len() as u32;
+        self.strings.push(s.encode_utf16().collect());
+        self.index.insert(s.to_string(), i);
+        i
+    }
+
+    /// SST with its CONTINUEs, then EXTSST; `base` is where SST starts in
+    /// the stream (EXTSST points into it).
+    fn write(&self, out: &mut Vec<u8>, base: usize) {
+        let n = self.strings.len();
+        // Strings per EXTSST bucket: at most 128 buckets.
+        let dsst = n.div_ceil(128).max(8);
+        let mut inf: Vec<(u32, u16)> = Vec::new();
+        let mut recs: Vec<(u16, Vec<u8>)> = Vec::new();
+        let mut body = Vec::new();
+        body.extend_from_slice(&self.total.to_le_bytes());
+        body.extend_from_slice(&(n as u32).to_le_bytes());
+        let mut ty = 0x00FCu16;
+        // Stream offset of the current record's header.
+        let mut at = base;
+        for (k, units) in self.strings.iter().enumerate() {
+            let high = units.iter().any(|&u| u >= 0x100);
+            let width = if high { 2 } else { 1 };
+            // A string's header (count, flags) and first character never
+            // split from each other.
+            if MAX_BODY - body.len() < 3 + width {
+                at += 4 + body.len();
+                recs.push((ty, std::mem::take(&mut body)));
+                ty = CONTINUE;
+            }
+            if k % dsst == 0 {
+                inf.push(((at + 4 + body.len()) as u32, (4 + body.len()) as u16));
+            }
+            body.extend_from_slice(&(units.len() as u16).to_le_bytes());
+            body.push(high as u8);
+            let mut left = &units[..];
+            loop {
+                let room = (MAX_BODY - body.len()) / width;
+                let take = room.min(left.len());
+                for &u in &left[..take] {
+                    if high {
+                        body.extend_from_slice(&u.to_le_bytes());
+                    } else {
+                        body.push(u as u8);
+                    }
+                }
+                left = &left[take..];
+                if left.is_empty() {
+                    break;
+                }
+                at += 4 + body.len();
+                recs.push((ty, std::mem::take(&mut body)));
+                ty = CONTINUE;
+                body.push(high as u8);
+            }
+        }
+        recs.push((ty, body));
+        for (ty, b) in &recs {
+            rec(out, *ty, b);
+        }
+        let mut b = (dsst as u16).to_le_bytes().to_vec();
+        for (ib, cb) in inf {
+            b.extend_from_slice(&ib.to_le_bytes());
+            b.extend_from_slice(&cb.to_le_bytes());
+            b.extend_from_slice(&0u16.to_le_bytes());
+        }
+        rec(out, 0x00FF, &b);
+    }
+}
+
+// ---- reference tables -------------------------------------------------------
+
+/// One NAME record.
+enum NameRec {
+    /// `Workbook::defined_names[i]`.
+    Defined(usize),
+    /// A hidden function name (`_xlfn.TEXTJOIN`, a UDF).
+    Function(String),
+    /// A name formulas use that nothing defines.
+    Placeholder(String),
+}
+
+/// A Library book an external link names: its file and sheet names.
+struct Link {
+    file: String,
+    sheets: Vec<String>,
+}
+
+/// The reference tables formulas fill: XTIs, NAMEs, external names.
+struct Refs<'a> {
+    wb: &'a Workbook,
+    xti: Vec<(Book, i16, i16)>,
+    names: Vec<NameRec>,
+    ext: Vec<(Book, Vec<String>)>,
+    /// The package's external links, `[1]` first; `None` for one that is
+    /// no Library book.
+    links: Vec<Option<Link>>,
+}
+
+impl<'a> Refs<'a> {
+    fn new(pkg: &'a SheetPackage) -> Refs<'a> {
+        Refs {
+            wb: &pkg.workbook,
+            xti: Vec::new(),
+            names: (0..pkg.workbook.defined_names.len())
+                .map(NameRec::Defined)
+                .collect(),
+            ext: Vec::new(),
+            links: external_links(pkg),
+        }
+    }
+
+    /// The books the tables use, in SUPBOOK order: this workbook, the
+    /// add-in book, then the Library books.
+    fn books(&self) -> Vec<Book> {
+        let mut v: Vec<Book> = self.xti.iter().map(|x| x.0).collect();
+        v.extend(self.ext.iter().map(|e| e.0));
+        if !self.xti.is_empty() {
+            v.push(Book::Own);
+        }
+        let rank = |b: &Book| match b {
+            Book::Own => (0, 0),
+            Book::AddIn => (1, 0),
+            Book::Lib(k) => (2, *k),
+        };
+        v.sort_by_key(rank);
+        v.dedup();
+        v
+    }
+}
+
+impl Tables for Refs<'_> {
+    fn workbook(&self) -> &Workbook {
+        self.wb
+    }
+
+    fn xti(&mut self, book: Book, first: i16, last: i16) -> u16 {
+        let e = (book, first, last);
+        match self.xti.iter().position(|x| *x == e) {
+            Some(i) => i as u16,
+            None => {
+                self.xti.push(e);
+                (self.xti.len() - 1) as u16
+            }
+        }
+    }
+
+    fn name(&mut self, name: &str, sheet: Option<usize>) -> u32 {
+        let defined = |scope: Option<usize>| {
+            self.names.iter().position(|n| match n {
+                NameRec::Defined(i) => {
+                    let d = &self.wb.defined_names[*i];
+                    d.scope == scope && d.name.eq_ignore_ascii_case(name)
+                }
+                _ => false,
+            })
+        };
+        if let Some(i) = sheet
+            .and_then(|s| defined(Some(s)))
+            .or_else(|| defined(None))
+        {
+            return i as u32 + 1;
+        }
+        let placeholder = self
+            .names
+            .iter()
+            .position(|n| matches!(n, NameRec::Placeholder(p) if p.eq_ignore_ascii_case(name)));
+        match placeholder {
+            Some(i) => i as u32 + 1,
+            None => {
+                self.names.push(NameRec::Placeholder(name.to_string()));
+                self.names.len() as u32
+            }
+        }
+    }
+
+    fn function(&mut self, name: &str) -> u32 {
+        let found = self
+            .names
+            .iter()
+            .position(|n| matches!(n, NameRec::Function(f) if f.eq_ignore_ascii_case(name)));
+        match found {
+            Some(i) => i as u32 + 1,
+            None => {
+                self.names.push(NameRec::Function(name.to_string()));
+                self.names.len() as u32
+            }
+        }
+    }
+
+    fn ext_name(&mut self, book: Book, name: &str) -> Option<u32> {
+        if let Book::Lib(k) = book {
+            self.links.get(k)?.as_ref()?;
+        }
+        let names = match self.ext.iter().position(|e| e.0 == book) {
+            Some(i) => &mut self.ext[i].1,
+            None => {
+                self.ext.push((book, Vec::new()));
+                &mut self.ext.last_mut()?.1
+            }
+        };
+        Some(
+            match names.iter().position(|n| n.eq_ignore_ascii_case(name)) {
+                Some(i) => i as u32 + 1,
+                None => {
+                    names.push(name.to_string());
+                    names.len() as u32
+                }
+            },
+        )
+    }
+}
+
+/// The package's external links in `<externalReferences>` order: the
+/// Library file each names (`xlLibrary` relationship to a plain file name),
+/// with its sheet names.
+fn external_links(pkg: &SheetPackage) -> Vec<Option<Link>> {
+    use crate::xlsx::{decode, local, parse_rels_mode};
+    use opccore::xml::{Event, XmlParser};
+    let text = |name: &str| {
+        pkg.part(name)
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+    };
+    let Some(wb_xml) = text("xl/workbook.xml") else {
+        return Vec::new();
+    };
+    let rels = text("xl/_rels/workbook.xml.rels")
+        .map(|r| parse_rels_mode(&r))
+        .unwrap_or_default();
+    let mut ids = Vec::new();
+    let mut p = XmlParser::new(&wb_xml);
+    loop {
+        match p.next() {
+            Event::Start if local(p.name()) == "externalReference" => {
+                ids.push(decode(p.attr("r:id")));
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    ids.iter()
+        .map(|id| {
+            let (_, _, target, _) = rels.iter().find(|r| &r.0 == id)?;
+            let part = format!(
+                "xl/{}",
+                target.trim_start_matches('/').trim_start_matches("xl/")
+            );
+            let xml = text(&part)?;
+            let (dir, file) = part.rsplit_once('/')?;
+            let link_rels = text(&format!("{dir}/_rels/{file}.rels"))
+                .map(|r| parse_rels_mode(&r))
+                .unwrap_or_default();
+            let lib = link_rels
+                .iter()
+                .find(|r| r.1.ends_with("/xlExternalLinkPath/xlLibrary"))?;
+            let plain = !lib.2.is_empty()
+                && !lib
+                    .2
+                    .chars()
+                    .any(|c| c < ' ' || matches!(c, '\\' | '/' | ':'));
+            if !plain {
+                return None;
+            }
+            let mut sheets = Vec::new();
+            let mut p = XmlParser::new(&xml);
+            loop {
+                match p.next() {
+                    Event::Start if local(p.name()) == "sheetName" => {
+                        sheets.push(decode(p.attr("val")));
+                    }
+                    Event::Eof => break,
+                    _ => {}
+                }
+            }
+            Some(Link {
+                file: lib.2.clone(),
+                sheets,
+            })
+        })
+        .collect()
+}
+
+/// The BIFF8 code of a built-in name (`_xlnm.Print_Area`), as the reader's
+/// table spells them.
+fn builtin_code(name: &str) -> Option<u8> {
+    let n = name.strip_prefix("_xlnm.")?;
+    let codes = [
+        "Consolidate_Area",
+        "Auto_Open",
+        "Auto_Close",
+        "Extract",
+        "Database",
+        "Criteria",
+        "Print_Area",
+        "Print_Titles",
+        "Recorder",
+        "Data_Form",
+        "Auto_Activate",
+        "Auto_Deactivate",
+        "Sheet_Title",
+        "_FilterDatabase",
+    ];
+    codes
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case(n))
+        .map(|i| i as u8)
+}
+
+// ---- globals ----------------------------------------------------------------
+
+/// The globals substream. `ws_pos` gets where each BOUNDSHEET8's
+/// `lbPlyPos` is, to patch once the sheets are placed.
+fn globals(
+    out: &mut Vec<u8>,
+    wb: &Workbook,
+    styles: &StyleTable,
+    refs: &Refs,
+    name_rgce: &[Option<Compiled>],
+    sst: &Sst,
+    ws_pos: &mut Vec<usize>,
+) {
+    bof(out, 0x0005);
+    rec(out, 0x0042, &1200u16.to_le_bytes()); // CODEPAGE: UTF-16
+    let active = wb.active_tab.min(wb.sheets.len().saturating_sub(1)) as u16;
+    let mut w1 = u16s(&[0x0168, 0x005A, 0x3FCF, 0x2A4E, 0x0038, active, 0, 1, 0x0258]);
+    w1.truncate(18);
+    rec(out, 0x003D, &w1); // WINDOW1
+    rec(out, 0x0022, &(wb.date1904 as u16).to_le_bytes()); // DATEMODE
+    rec(out, 0x000E, &1u16.to_le_bytes()); // PRECISION: as displayed off
+    styles.write(out);
+    for s in &wb.sheets {
+        ws_pos.push(out.len() + 4);
+        let mut b = 0u32.to_le_bytes().to_vec();
+        b.push(s.hidden as u8);
+        b.push(0); // a worksheet
+        b.extend_from_slice(&ptg_write::short_string(&s.name).unwrap_or_else(|| vec![0, 0]));
+        rec(out, 0x0085, &b);
+    }
+    // SUPBOOKs (each with its EXTERNNAMEs), then EXTERNSHEET.
+    let books = refs.books();
+    for book in &books {
+        match book {
+            Book::Own => rec(out, 0x01AE, &u16s(&[wb.sheets.len() as u16, 0x0401])),
+            Book::AddIn => rec(out, 0x01AE, &u16s(&[1, 0x3A01])),
+            Book::Lib(k) => {
+                let Some(Some(link)) = refs.links.get(*k) else {
+                    continue;
+                };
+                let path: Vec<u16> = format!("\u{1}\u{8}{}", link.file).encode_utf16().collect();
+                let mut b = u16s(&[link.sheets.len() as u16, path.len() as u16]);
+                ptg_write::push_chars(&mut b, &path);
+                for s in &link.sheets {
+                    b.extend_from_slice(&xl_string(s));
+                }
+                rec(out, 0x01AE, &b);
+            }
+        }
+        let names = refs
+            .ext
+            .iter()
+            .find(|e| e.0 == *book)
+            .map(|e| e.1.as_slice())
+            .unwrap_or_default();
+        for n in names {
+            let mut b = vec![0u8; 6];
+            b.extend_from_slice(&ptg_write::short_string(n).unwrap_or_else(|| vec![0, 0]));
+            match book {
+                // An add-in function: `#REF!` as its definition, as Excel
+                // writes one.
+                Book::AddIn => b.extend_from_slice(&[2, 0, 0x1C, 0x17]),
+                _ => b.extend_from_slice(&[0, 0]),
+            }
+            rec(out, 0x0023, &b);
+        }
+    }
+    if !refs.xti.is_empty() {
+        let mut b = (refs.xti.len() as u16).to_le_bytes().to_vec();
+        for &(book, first, last) in &refs.xti {
+            let i = books.iter().position(|b| *b == book).unwrap_or(0) as u16;
+            b.extend_from_slice(&u16s(&[i, first as u16, last as u16]));
+        }
+        rec_split(out, 0x0017, &b);
+    }
+    for n in &refs.names {
+        let (name, scope, flags, c) = match n {
+            NameRec::Defined(k) => {
+                let d = &wb.defined_names[*k];
+                (d.name.as_str(), d.scope, 0u16, name_rgce[*k].clone())
+            }
+            NameRec::Function(f) => (f.as_str(), None, 0x000B, None),
+            NameRec::Placeholder(p) => (p.as_str(), None, 0, None),
+        };
+        let builtin = builtin_code(name);
+        let flags = flags | if builtin.is_some() { 0x0020 } else { 0 };
+        let flags = flags | if builtin == Some(0x0D) { 0x0001 } else { 0 };
+        let units: Vec<u16> = match builtin {
+            Some(code) => vec![code as u16],
+            None => name.encode_utf16().take(255).collect(),
+        };
+        let c = match n {
+            // A hidden function name's definition is `#NAME?`, as Excel's.
+            NameRec::Function(_) => Some(Compiled {
+                rgce: vec![0x1C, 0x1D],
+                extra: Vec::new(),
+            }),
+            _ => c,
+        }
+        .unwrap_or_default();
+        let mut b = flags.to_le_bytes().to_vec();
+        b.push(0);
+        b.push(units.len() as u8);
+        b.extend_from_slice(&(c.rgce.len() as u16).to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        let itab = scope.map_or(0, |s| s as u16 + 1);
+        b.extend_from_slice(&itab.to_le_bytes());
+        b.extend_from_slice(&[0, 0, 0, 0]);
+        ptg_write::push_chars(&mut b, &units);
+        b.extend_from_slice(&c.rgce);
+        b.extend_from_slice(&c.extra);
+        rec_split(out, 0x0018, &b);
+    }
+    let base = out.len();
+    sst.write(out, base);
+    rec(out, EOF, &[]);
+}
+
+/// A record whose body may be longer than [`MAX_BODY`]: the rest in
+/// CONTINUE records.
+fn rec_split(out: &mut Vec<u8>, ty: u16, body: &[u8]) {
+    let mut chunks = body.chunks(MAX_BODY);
+    rec(out, ty, chunks.next().unwrap_or_default());
+    for c in chunks {
+        rec(out, CONTINUE, c);
+    }
+}
+
+// ---- sheets -----------------------------------------------------------------
+
+/// A range: (r1, c1, r2, c2).
+type Rect = (u32, u32, u32, u32);
+
+struct SheetOut {
+    bytes: Vec<u8>,
+}
+
+/// The `ref` of a legacy array formula's anchor (`t="array" ref="A1:B2"`).
+fn array_ref(cell: &Cell) -> Option<(u32, u32, u32, u32)> {
+    let attrs = cell.f_attrs.as_deref()?;
+    if crate::sheet::xml_attr(attrs, "t")? != "array" {
+        return None;
+    }
+    let r = crate::sheet::xml_attr(attrs, "ref")?;
+    let (a, b) = r.split_once(':').unwrap_or((r, r));
+    let (r1, c1) = crate::sheet::parse_cell_name(a)?;
+    let (r2, c2) = crate::sheet::parse_cell_name(b)?;
+    Some((r1, c1, r2, c2))
+}
+
+fn on_grid(r: u32, c: u32) -> bool {
+    r as i64 <= ptg_write::MAX_ROW && c as i64 <= ptg_write::MAX_COL
+}
+
+/// One worksheet substream.
+fn sheet_records(
+    wb: &Workbook,
+    index: usize,
+    s: &Sheet,
+    styles: &StyleTable,
+    refs: &mut Refs,
+    sst: &mut Sst,
+    lost: &mut BTreeMap<Loss, usize>,
+) -> SheetOut {
+    let mut out = Vec::new();
+    bof(&mut out, 0x0010);
+    // The grid's cells, and the array formulas whose ranges they're in.
+    let mut cells: BTreeMap<(u32, u32), &Cell> = BTreeMap::new();
+    for (&(r, c), cell) in &s.cells {
+        if on_grid(r, c) {
+            cells.insert((r, c), cell);
+        } else if cell.value != CellValue::Empty || cell.formula.is_some() {
+            *lost.entry(Loss::CellsPastGrid).or_default() += 1;
+        }
+    }
+    // Array anchors: (range, tokens). The range's other cells point at it.
+    let mut arrays: BTreeMap<(u32, u32), (Rect, Compiled)> = BTreeMap::new();
+    let mut member: HashMap<(u32, u32), (u32, u32)> = HashMap::new();
+    let mut formulas: HashMap<(u32, u32), Compiled> = HashMap::new();
+    for (&(r, c), cell) in &cells {
+        let Some(f) = cell.formula.as_deref() else {
+            continue;
+        };
+        let range = array_ref(cell).filter(|&(r1, c1, r2, c2)| {
+            (r1, c1) == (r, c) && r2 >= r1 && c2 >= c1 && on_grid(r2, c2)
+        });
+        let site = Site::Cell {
+            sheet: index,
+            row: r,
+            col: c,
+            array: range.is_some(),
+        };
+        match ptg_write::compile(f, site, refs) {
+            Ok(tokens) => match range {
+                Some(range) => {
+                    for rr in range.0..=range.2 {
+                        for cc in range.1..=range.3 {
+                            member.insert((rr, cc), (r, c));
+                        }
+                    }
+                    arrays.insert((r, c), (range, tokens));
+                }
+                None => {
+                    formulas.insert((r, c), tokens);
+                }
+            },
+            Err(why) => *lost.entry(Loss::Formula(why)).or_default() += 1,
+        }
+    }
+
+    // DIMENSIONS: the used rows and columns, one past the last.
+    let keys: Vec<(u32, u32)> = cells
+        .keys()
+        .copied()
+        .chain(member.keys().copied())
+        .collect();
+    let (r0, r1, c0, c1) = if keys.is_empty() {
+        (0, 0, 0, 0)
+    } else {
+        (
+            keys.iter().map(|k| k.0).min().unwrap_or(0),
+            keys.iter().map(|k| k.0).max().unwrap_or(0) + 1,
+            keys.iter().map(|k| k.1).min().unwrap_or(0),
+            keys.iter().map(|k| k.1).max().unwrap_or(0) + 1,
+        )
+    };
+    rec(&mut out, 0x0055, &8u16.to_le_bytes()); // DEFCOLWIDTH
+    for d in &s.col_defs {
+        if d.min as i64 > ptg_write::MAX_COL {
+            continue;
+        }
+        let last = (d.max as i64).min(ptg_write::MAX_COL) as u16;
+        let hidden = s.col_hidden(d.min);
+        if d.width.is_none() && !hidden {
+            continue;
+        }
+        let width = d.width.unwrap_or(crate::sheet::DEFAULT_COL_WIDTH);
+        let coldx = (width * 256.0).round().clamp(0.0, 65535.0) as u16;
+        let flags: u16 =
+            if hidden { 0x0001 } else { 0 } | if d.width.is_some() { 0x0002 } else { 0 };
+        let b = u16s(&[d.min as u16, last, coldx, STYLE_XFS as u16, flags, 0]);
+        rec(&mut out, 0x007D, &b);
+    }
+    let mut dim = r0.to_le_bytes().to_vec();
+    dim.extend_from_slice(&r1.to_le_bytes());
+    dim.extend_from_slice(&u16s(&[c0 as u16, c1 as u16, 0]));
+    rec(&mut out, 0x0200, &dim);
+
+    // Rows in blocks of 32: their ROW records, then their cells.
+    let mut rows: BTreeMap<u32, (u16, u16)> = BTreeMap::new();
+    for &(r, c) in &keys {
+        let e = rows.entry(r).or_insert((u16::MAX, 0));
+        e.0 = e.0.min(c as u16);
+        e.1 = e.1.max(c as u16 + 1);
+    }
+    for &r in s.row_attrs.keys() {
+        if r as i64 <= ptg_write::MAX_ROW {
+            rows.entry(r).or_insert((0, 0));
+        }
+    }
+    let row_list: Vec<u32> = rows.keys().copied().collect();
+    for block in row_list.chunks(32) {
+        for &r in block {
+            let (lo, hi) = rows[&r];
+            let lo = if lo == u16::MAX { 0 } else { lo };
+            let height = s.row_height(r);
+            let miy = height.map_or(300, |h| (h * 20.0).round().clamp(0.0, 8192.0) as u16);
+            let mut flags: u16 = 0x0100;
+            if s.row_hidden(r) {
+                flags |= 0x0020;
+            }
+            if height.is_some() {
+                flags |= 0x0040;
+            }
+            let b = u16s(&[r as u16, lo, hi, miy, 0, 0, flags, STYLE_XFS as u16]);
+            rec(&mut out, 0x0208, &b);
+        }
+        let (first, last) = (block[0], block[block.len() - 1]);
+        let in_block = |&&(r, _): &&(u32, u32)| r >= first && r <= last;
+        let mut at: Vec<(u32, u32)> = keys.iter().filter(in_block).copied().collect();
+        at.sort_unstable();
+        at.dedup();
+        for (r, c) in at {
+            let cell = cells.get(&(r, c)).copied();
+            let ixfe = styles.xf(cell.map_or(0, |x| x.style));
+            let head = u16s(&[r as u16, c as u16, ixfe]);
+            if let Some(&anchor) = member.get(&(r, c)) {
+                let value = cell.map_or(&CellValue::Empty, |x| &x.value);
+                let mut rgce = vec![0x01];
+                rgce.extend_from_slice(&u16s(&[anchor.0 as u16, anchor.1 as u16]));
+                formula_rec(&mut out, &head, value, &rgce, &[], false);
+                if anchor == (r, c) {
+                    let (range, tokens) = &arrays[&anchor];
+                    let mut b = u16s(&[range.0 as u16, range.2 as u16]);
+                    b.push(range.1 as u8);
+                    b.push(range.3 as u8);
+                    b.extend_from_slice(&0u16.to_le_bytes());
+                    b.extend_from_slice(&0u32.to_le_bytes());
+                    b.extend_from_slice(&(tokens.rgce.len() as u16).to_le_bytes());
+                    b.extend_from_slice(&tokens.rgce);
+                    b.extend_from_slice(&tokens.extra);
+                    rec(&mut out, 0x0221, &b);
+                }
+                continue;
+            }
+            let Some(cell) = cell else {
+                continue;
+            };
+            if let Some(tokens) = formulas.get(&(r, c)) {
+                let volatile = tokens.rgce.starts_with(&[0x19, 0x01]);
+                formula_rec(
+                    &mut out,
+                    &head,
+                    &cell.value,
+                    &tokens.rgce,
+                    &tokens.extra,
+                    volatile,
+                );
+                continue;
+            }
+            match &cell.value {
+                CellValue::Number(n) => match rk(*n) {
+                    Some(v) => {
+                        let mut b = head.clone();
+                        b.extend_from_slice(&v.to_le_bytes());
+                        rec(&mut out, 0x027E, &b);
+                    }
+                    None => {
+                        let mut b = head.clone();
+                        b.extend_from_slice(&n.to_le_bytes());
+                        rec(&mut out, 0x0203, &b);
+                    }
+                },
+                CellValue::Text(t) => {
+                    let text = if t.encode_utf16().count() > MAX_TEXT {
+                        *lost.entry(Loss::LongText).or_default() += 1;
+                        let units: Vec<u16> = t.encode_utf16().take(MAX_TEXT).collect();
+                        String::from_utf16_lossy(&units)
+                    } else {
+                        t.clone()
+                    };
+                    let mut b = head.clone();
+                    b.extend_from_slice(&sst.add(&text).to_le_bytes());
+                    rec(&mut out, 0x00FD, &b);
+                }
+                CellValue::Bool(v) => {
+                    let mut b = head.clone();
+                    b.extend_from_slice(&[*v as u8, 0]);
+                    rec(&mut out, 0x0205, &b);
+                }
+                CellValue::Error(e) => {
+                    let mut b = head.clone();
+                    b.extend_from_slice(&[ptg_write::error_code(e).unwrap_or(0x2A), 1]);
+                    rec(&mut out, 0x0205, &b);
+                }
+                CellValue::Empty => {
+                    if cell.style != 0 {
+                        rec(&mut out, 0x0201, &head);
+                    }
+                }
+            }
+        }
+    }
+
+    // WINDOW2: gridlines, headers, zeros, default header colour, outline
+    // symbols; the active sheet selected and shown.
+    let active = wb.active_tab.min(wb.sheets.len().saturating_sub(1)) == index;
+    let frozen = s.freeze != (0, 0)
+        && s.freeze.0 as i64 <= ptg_write::MAX_ROW
+        && s.freeze.1 as i64 <= ptg_write::MAX_COL;
+    let mut grbit: u16 = 0x00B6;
+    if frozen {
+        grbit |= 0x0108;
+    }
+    if active {
+        grbit |= 0x0600;
+    }
+    let mut w2 = u16s(&[grbit, 0, 0, 0x40, 0, 0, 0]);
+    w2.extend_from_slice(&[0, 0, 0, 0]);
+    rec(&mut out, 0x023E, &w2);
+    if frozen {
+        let (rows, cols) = (s.freeze.0 as u16, s.freeze.1 as u16);
+        let pane = match (rows > 0, cols > 0) {
+            (true, true) => 0,
+            (true, false) => 2,
+            _ => 1,
+        };
+        let mut b = u16s(&[cols, rows, rows, cols]);
+        b.extend_from_slice(&[pane, 0]);
+        rec(&mut out, 0x0041, &b);
+    }
+    let mut merges: Vec<[u16; 4]> = Vec::new();
+    for &(r1, c1, r2, c2) in &s.merges {
+        if on_grid(r2, c2) && on_grid(r1, c1) {
+            merges.push([r1 as u16, r2 as u16, c1 as u16, c2 as u16]);
+        } else {
+            *lost.entry(Loss::MergesPastGrid).or_default() += 1;
+        }
+    }
+    for chunk in merges.chunks(1026) {
+        let mut b = (chunk.len() as u16).to_le_bytes().to_vec();
+        for m in chunk {
+            b.extend_from_slice(&u16s(m));
+        }
+        rec(&mut out, 0x00E5, &b);
+    }
+    rec(&mut out, EOF, &[]);
+    SheetOut { bytes: out }
+}
+
+/// A FORMULA record (and a STRING after it for a text result): `head` is
+/// row, column and XF.
+fn formula_rec(
+    out: &mut Vec<u8>,
+    head: &[u8],
+    value: &CellValue,
+    rgce: &[u8],
+    extra: &[u8],
+    always: bool,
+) {
+    let mut b = head.to_vec();
+    let mut text: Option<&str> = None;
+    match value {
+        CellValue::Number(n) => b.extend_from_slice(&n.to_le_bytes()),
+        CellValue::Text(t) if !t.is_empty() => {
+            b.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0xFF, 0xFF]);
+            text = Some(t);
+        }
+        CellValue::Bool(v) => b.extend_from_slice(&[1, 0, *v as u8, 0, 0, 0, 0xFF, 0xFF]),
+        CellValue::Error(e) => {
+            let code = ptg_write::error_code(e).unwrap_or(0x2A);
+            b.extend_from_slice(&[2, 0, code, 0, 0, 0, 0xFF, 0xFF]);
+        }
+        // Empty text, or no value yet: the empty string.
+        _ => b.extend_from_slice(&[3, 0, 0, 0, 0, 0, 0xFF, 0xFF]),
+    }
+    b.extend_from_slice(&(if always { 0x0001u16 } else { 0 }).to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&(rgce.len() as u16).to_le_bytes());
+    b.extend_from_slice(rgce);
+    b.extend_from_slice(extra);
+    rec_split(out, 0x0006, &b);
+    if let Some(t) = text {
+        let units: Vec<u16> = t.encode_utf16().take(MAX_TEXT).collect();
+        let mut head = (units.len() as u16).to_le_bytes().to_vec();
+        head.push(units.iter().any(|&u| u >= 0x100) as u8);
+        rec_with_string(out, 0x0207, &head, &units);
+    }
+}
+
+/// `x` as an RK number, when one holds it exactly.
+fn rk(x: f64) -> Option<u32> {
+    let try_int = |v: f64, flag: u32| -> Option<u32> {
+        if v.fract() != 0.0 || !(-(1i64 << 29) as f64..(1i64 << 29) as f64).contains(&v) {
+            return None;
+        }
+        let r = ((v as i32) << 2) as u32 | 2 | flag;
+        (super::rk(r) == x).then_some(r)
+    };
+    let try_float = |v: f64, flag: u32| -> Option<u32> {
+        let bits = v.to_bits();
+        if bits & 0x3_FFFF_FFFF != 0 {
+            return None;
+        }
+        let r = (bits >> 32) as u32 | flag;
+        (super::rk(r) == x).then_some(r)
+    };
+    if x == 0.0 && x.is_sign_negative() {
+        return None;
+    }
+    try_int(x, 0)
+        .or_else(|| try_float(x, 0))
+        .or_else(|| try_int((x * 100.0).round(), 1))
+        .or_else(|| try_float(x * 100.0, 1))
+}
+
+// ---- the structural check ---------------------------------------------------
+
+/// Check that `file` (an `.xls`) keeps the rules Excel's reader holds a
+/// BIFF8 stream to, which a lenient reader would let pass: the style and
+/// cell XFs, the FONT table without index 4, BOUNDSHEET offsets at their
+/// sheets' BOFs, record lengths, shared-string indices and counts, one
+/// selected sheet, DIMENSIONS around the cells, balanced BOF/EOF. The first
+/// rule broken is the error.
+#[doc(hidden)]
+pub fn check_xls(file: &[u8]) -> Result<(), String> {
+    let cfb = opccore::cfb::Cfb::open(file)?;
+    let entry = cfb
+        .entries()
+        .into_iter()
+        .find(|e| e.name == "Workbook")
+        .ok_or("no Workbook stream")?;
+    if entry.size() < 4096 {
+        return Err(format!(
+            "Workbook stream is {} bytes, under 4096",
+            entry.size()
+        ));
+    }
+    let s = cfb
+        .read_stream("Workbook")
+        .ok_or("unreadable Workbook stream")?;
+    // (offset, type, body)
+    let mut recs: Vec<(usize, u16, &[u8])> = Vec::new();
+    let mut at = 0;
+    while at + 4 <= s.len() {
+        let ty = u16::from_le_bytes([s[at], s[at + 1]]);
+        let len = u16::from_le_bytes([s[at + 2], s[at + 3]]) as usize;
+        if ty == 0 && len == 0 {
+            // Padding after the last EOF.
+            if s[at..].iter().any(|&b| b != 0) {
+                return Err(format!("{at}: data after padding"));
+            }
+            break;
+        }
+        if len > MAX_BODY {
+            return Err(format!(
+                "{at}: record {ty:#06x} is {len} bytes, over {MAX_BODY}"
+            ));
+        }
+        let body = s
+            .get(at + 4..at + 4 + len)
+            .ok_or(format!("{at}: record runs past the stream"))?;
+        recs.push((at, ty, body));
+        at += 4 + len;
+    }
+    let u16_at = |b: &[u8], i: usize| -> Result<u16, String> {
+        b.get(i..i + 2)
+            .map(|v| u16::from_le_bytes([v[0], v[1]]))
+            .ok_or_else(|| "short record".to_string())
+    };
+    let u32_at = |b: &[u8], i: usize| -> Result<u32, String> {
+        b.get(i..i + 4)
+            .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+            .ok_or_else(|| "short record".to_string())
+    };
+    // BOF/EOF balance, and the substreams.
+    let mut depth = 0i32;
+    let mut subs: Vec<(usize, usize)> = Vec::new();
+    let mut open = 0;
+    for (i, &(_, ty, _)) in recs.iter().enumerate() {
+        if ty == BOF {
+            if depth == 0 {
+                open = i;
+            }
+            depth += 1;
+        } else if ty == EOF {
+            depth -= 1;
+            if depth < 0 {
+                return Err("EOF without BOF".into());
+            }
+            if depth == 0 {
+                subs.push((open, i));
+            }
+        }
+    }
+    if depth != 0 || subs.is_empty() {
+        return Err("BOF/EOF unbalanced".into());
+    }
+    // CONTINUE only after a record that may continue.
+    for w in recs.windows(2) {
+        if w[1].1 == CONTINUE
+            && !matches!(
+                w[0].1,
+                0x00FC | CONTINUE | 0x0006 | 0x0207 | 0x0017 | 0x0018 | 0x01AE
+            )
+        {
+            return Err(format!("{}: CONTINUE after {:#06x}", w[1].0, w[0].1));
+        }
+    }
+    let (g0, g1) = subs[0];
+    let globals = &recs[g0..=g1];
+    let of = |ty: u16| globals.iter().filter(move |r| r.1 == ty);
+    // Fonts: at least 5 (0-3, then 5 on); every XF names one.
+    let fonts = of(0x0031).count();
+    let xfs: Vec<&[u8]> = of(0x00E0).map(|r| r.2).collect();
+    if xfs.len() < STYLE_XFS + 1 {
+        return Err(format!(
+            "{} XFs: 15 style XFs and a cell XF needed",
+            xfs.len()
+        ));
+    }
+    if xfs.len() > MAX_XFS {
+        return Err(format!("{} XFs, over {MAX_XFS}", xfs.len()));
+    }
+    for (i, x) in xfs.iter().enumerate() {
+        if x.len() != 20 {
+            return Err(format!("XF {i} is {} bytes", x.len()));
+        }
+        let style = u16_at(x, 4)? & 0x0004 != 0;
+        if style != (i < STYLE_XFS) {
+            return Err(format!(
+                "XF {i}: a {} XF",
+                if style { "style" } else { "cell" }
+            ));
+        }
+        let ifnt = u16_at(x, 0)? as usize;
+        if ifnt == 4 || ifnt >= fonts + usize::from(fonts >= 4) {
+            return Err(format!("XF {i} names font {ifnt} of {fonts}"));
+        }
+    }
+    // BOUNDSHEET offsets: each a worksheet BOF.
+    let sheets: Vec<&[u8]> = of(0x0085).map(|r| r.2).collect();
+    if sheets.len() + 1 != subs.len() {
+        return Err(format!(
+            "{} BOUNDSHEETs for {} sheet substreams",
+            sheets.len(),
+            subs.len() - 1
+        ));
+    }
+    for (k, b) in sheets.iter().enumerate() {
+        let pos = u32_at(b, 0)? as usize;
+        let (start, _) = subs[k + 1];
+        if recs[start].0 != pos {
+            return Err(format!(
+                "BOUNDSHEET {k} points at {pos}, its BOF is at {}",
+                recs[start].0
+            ));
+        }
+        if u16_at(recs[start].2, 2)? != 0x0010 {
+            return Err(format!("sheet {k} is no worksheet BOF"));
+        }
+    }
+    // SST counts; each LABELSST index in range.
+    let sst_at = globals.iter().position(|r| r.1 == 0x00FC);
+    let (total, unique) = match sst_at {
+        Some(i) => (u32_at(globals[i].2, 0)?, u32_at(globals[i].2, 4)?),
+        None => (0, 0),
+    };
+    let mut labels = 0u32;
+    // Exactly one selected sheet, the WINDOW1 itabCur one.
+    let itab = of(0x003D)
+        .next()
+        .map(|r| u16_at(r.2, 10))
+        .transpose()?
+        .unwrap_or(0);
+    let mut selected = Vec::new();
+    for (k, &(start, end)) in subs.iter().skip(1).enumerate() {
+        let body = &recs[start..=end];
+        let mut cells: Vec<(u32, u32)> = Vec::new();
+        let mut dims = None;
+        let mut nested = 0;
+        for &(_, ty, b) in body.iter().skip(1) {
+            match ty {
+                BOF => nested += 1,
+                EOF if nested > 0 => nested -= 1,
+                _ if nested > 0 => {}
+                0x0200 => {
+                    dims = Some((u32_at(b, 0)?, u32_at(b, 4)?, u16_at(b, 8)?, u16_at(b, 10)?))
+                }
+                0x00FD => {
+                    labels += 1;
+                    let i = u32_at(b, 6)?;
+                    if i >= unique {
+                        return Err(format!("sheet {k}: LABELSST {i} of {unique} strings"));
+                    }
+                    cells.push((u16_at(b, 0)? as u32, u16_at(b, 2)? as u32));
+                }
+                0x0203 | 0x027E | 0x0205 | 0x0201 | 0x0006 => {
+                    let ixfe = u16_at(b, 4)? as usize;
+                    if ixfe < STYLE_XFS || ixfe >= xfs.len() {
+                        return Err(format!("sheet {k}: a cell on XF {ixfe}"));
+                    }
+                    cells.push((u16_at(b, 0)? as u32, u16_at(b, 2)? as u32));
+                }
+                0x023E if u16_at(b, 0)? & 0x0200 != 0 => selected.push(k),
+                _ => {}
+            }
+        }
+        let (r0, r1, c0, c1) = dims.ok_or(format!("sheet {k}: no DIMENSIONS"))?;
+        for (r, c) in cells {
+            if r < r0 || r >= r1 || c < c0 as u32 || c >= c1 as u32 {
+                return Err(format!("sheet {k}: cell ({r},{c}) outside DIMENSIONS"));
+            }
+        }
+    }
+    if labels != total {
+        return Err(format!(
+            "SST says {total} strings in cells, the cells have {labels}"
+        ));
+    }
+    if selected != [itab as usize] {
+        return Err(format!("selected sheets {selected:?}, WINDOW1 says {itab}"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::legacy::{SourceFormat, open_workbook};
+    use crate::sheet::Cell;
+
+    fn book(cells: &[(u32, u32, Cell)]) -> SheetPackage {
+        let mut pkg = crate::xlsx::new_xlsx_sheets(&["Sheet1".into(), "Data".into()]);
+        for (r, c, cell) in cells {
+            pkg.workbook.sheets[0].set_cell(*r, *c, cell.clone());
+        }
+        pkg
+    }
+
+    fn formula(f: &str, v: CellValue) -> Cell {
+        Cell {
+            value: v,
+            formula: Some(f.into()),
+            ..Cell::default()
+        }
+    }
+
+    /// Write, check the structure, read back.
+    fn round(pkg: &SheetPackage) -> (SheetPackage, Vec<String>) {
+        let out = write_xls(pkg);
+        check_xls(&out.bytes).unwrap();
+        let (back, format) = open_workbook(&out.bytes).unwrap();
+        assert_eq!(format, SourceFormat::Xls);
+        (back, out.lost)
+    }
+
+    #[test]
+    fn values_formulas_and_names_round_trip() {
+        let mut pkg = book(&[
+            (0, 0, Cell::number(1.5)),
+            (0, 1, Cell::number(1e100)),
+            (0, 2, Cell::number(-7.0)),
+            (0, 3, Cell::number(0.01)),
+            (1, 0, Cell::text("héllo")),
+            (1, 1, Cell::text("日本")),
+            (
+                1,
+                2,
+                Cell {
+                    value: CellValue::Bool(true),
+                    ..Cell::default()
+                },
+            ),
+            (
+                1,
+                3,
+                Cell {
+                    value: CellValue::Error("#DIV/0!".into()),
+                    ..Cell::default()
+                },
+            ),
+            (2, 0, formula("SUM(A1:D1)", CellValue::Number(-5.49))),
+            (2, 1, formula("A2&\"!\"", CellValue::Text("héllo!".into()))),
+            (
+                2,
+                2,
+                formula(
+                    "_xlfn.TEXTJOIN(\",\",TRUE,A2:B2)",
+                    CellValue::Text("x".into()),
+                ),
+            ),
+            (2, 3, formula("Data!A1*Rate", CellValue::Number(0.0))),
+            (3, 0, formula("1=1", CellValue::Bool(true))),
+            (3, 1, formula("1/0", CellValue::Error("#DIV/0!".into()))),
+            (3, 2, formula("\"\"", CellValue::Text(String::new()))),
+        ]);
+        pkg.workbook.defined_names.push(crate::sheet::DefinedName {
+            name: "Rate".into(),
+            scope: None,
+            formula: "Data!$A$1".into(),
+        });
+        pkg.workbook.date1904 = true;
+        pkg.workbook.sheets[1].hidden = true;
+        let (back, lost) = round(&pkg);
+        assert!(lost.is_empty(), "{lost:?}");
+        let wb = &back.workbook;
+        assert_eq!(wb.sheets.len(), 2);
+        assert!(wb.date1904);
+        assert_eq!(wb.defined_names.len(), 1);
+        assert_eq!(wb.defined_names[0].formula, "Data!$A$1");
+        for (&k, cell) in &pkg.workbook.sheets[0].cells {
+            let got = wb.sheets[0]
+                .cells
+                .get(&k)
+                .unwrap_or_else(|| panic!("{k:?}"));
+            assert_eq!(got.value, cell.value, "{k:?}");
+            assert_eq!(got.formula, cell.formula, "{k:?}");
+        }
+    }
+
+    #[test]
+    fn uncompilable_formulas_and_cells_past_the_grid_are_counted() {
+        let mut pkg = book(&[
+            (0, 0, formula("A1048576+1", CellValue::Number(3.0))),
+            (0, 1, formula("A1048576+2", CellValue::Number(4.0))),
+            (
+                0,
+                2,
+                formula("_xlfn.LAMBDA(_xlpm.x,_xlpm.x)(1)", CellValue::Number(1.0)),
+            ),
+            (70_000, 0, Cell::number(1.0)),
+            (0, 300, Cell::number(1.0)),
+        ]);
+        pkg.workbook.sheets[0].merges.push((0, 0, 70_000, 0));
+        let (back, lost) = round(&pkg);
+        assert_eq!(
+            lost,
+            [
+                "2 formulas with references past row 65,536 or column IV (saved as values)",
+                "1 formula with LAMBDA or LET (saved as values)",
+                "2 cells beyond row 65,536 or column IV",
+                "1 merged range beyond row 65,536 or column IV",
+            ]
+        );
+        let cells = &back.workbook.sheets[0].cells;
+        assert_eq!(cells[&(0, 0)].value, CellValue::Number(3.0));
+        assert_eq!(cells[&(0, 0)].formula, None);
+        assert_eq!(cells.len(), 3);
+    }
+
+    #[test]
+    fn model_features_without_records_are_named() {
+        let mut pkg = book(&[(0, 0, Cell::number(1.0))]);
+        assert!(write_xls(&pkg).lost.is_empty());
+        pkg.workbook.sheets[0]
+            .hyperlinks
+            .insert((0, 0), "https://example.com".into());
+        pkg.workbook.sheets[0].set_row_outline(1, 1);
+        assert_eq!(
+            write_xls(&pkg).lost,
+            ["hyperlinks", "outlines (grouped rows and columns)"]
+        );
+    }
+
+    #[test]
+    fn long_shared_strings_split_across_continue() {
+        // Strings past one record, compressed and UTF-16, crossing record
+        // boundaries mid-string and between strings.
+        let mut cells = Vec::new();
+        for i in 0..40u32 {
+            let s = if i % 3 == 0 {
+                format!("{i}:{}", "ü".repeat(700))
+            } else {
+                format!("{i}:{}", "€x".repeat(500 + i as usize))
+            };
+            cells.push((i, 0, Cell::text(&s)));
+        }
+        cells.push((40, 0, Cell::text(&"y".repeat(32_000))));
+        let pkg = book(&cells);
+        let (back, lost) = round(&pkg);
+        assert!(lost.is_empty());
+        for (&k, cell) in &pkg.workbook.sheets[0].cells {
+            assert_eq!(back.workbook.sheets[0].cells[&k].value, cell.value, "{k:?}");
+        }
+        // A long text result goes in STRING with CONTINUE.
+        let long = "€".repeat(9000);
+        let pkg = book(&[(
+            0,
+            0,
+            formula("REPT(\"€\",9000)", CellValue::Text(long.clone())),
+        )]);
+        let (back, _) = round(&pkg);
+        assert_eq!(
+            back.workbook.sheets[0].cells[&(0, 0)].value,
+            CellValue::Text(long)
+        );
+    }
+
+    #[test]
+    fn array_formulas_keep_their_range() {
+        let mut anchor = formula("A1:A2*2", CellValue::Number(2.0));
+        anchor.f_attrs = Some(" t=\"array\" ref=\"B1:B2\"".into());
+        let pkg = book(&[
+            (0, 0, Cell::number(1.0)),
+            (1, 0, Cell::number(2.0)),
+            (0, 1, anchor),
+            (1, 1, Cell::number(4.0)),
+        ]);
+        let (back, _) = round(&pkg);
+        let cells = &back.workbook.sheets[0].cells;
+        assert_eq!(cells[&(0, 1)].formula.as_deref(), Some("A1:A2*2"));
+        assert_eq!(cells[&(0, 1)].spill, Some((2, 1)));
+        assert_eq!(cells[&(1, 1)].value, CellValue::Number(4.0));
+        assert_eq!(cells[&(1, 1)].formula, None);
+    }
+
+    #[test]
+    fn rk_holds_what_it_can_exactly() {
+        for x in [0.0, 1.0, -1.0, 123.45, 0.5, 1e10, 536_870_911.0, 2.71] {
+            if let Some(r) = rk(x) {
+                assert_eq!(super::super::rk(r), x);
+            }
+        }
+        assert!(rk(1.0).is_some() && rk(123.45).is_some() && rk(0.5).is_some());
+        assert_eq!(rk(1.0 / 3.0), None);
+    }
+
+    #[test]
+    fn the_check_catches_what_excel_refuses() {
+        let pkg = book(&[(0, 0, Cell::text("a"))]);
+        let good = write_xls(&pkg).bytes;
+        check_xls(&good).unwrap();
+        let cfb = opccore::cfb::Cfb::open(&good).unwrap();
+        let stream = cfb.read_stream("Workbook").unwrap();
+        let wrap = |s: Vec<u8>| opccore::cfb::write_cfb(&[("Workbook", s)]);
+        // A BOUNDSHEET pointing one byte off.
+        let mut s = stream.clone();
+        let bs = find(&s, 0x0085);
+        s[bs + 4] = s[bs + 4].wrapping_add(1);
+        assert!(check_xls(&wrap(s)).unwrap_err().contains("BOUNDSHEET"));
+        // An SST that miscounts.
+        let mut s = stream.clone();
+        let sst = find(&s, 0x00FC);
+        s[sst + 4] = 7;
+        assert!(check_xls(&wrap(s)).unwrap_err().contains("SST"));
+        // A short stream (the mini stream).
+        let mut s = stream.clone();
+        let end = s.iter().rposition(|&b| b != 0).unwrap() + 1;
+        s.truncate(end);
+        assert!(check_xls(&wrap(s)).unwrap_err().contains("4096"));
+    }
+
+    /// The offset of the first record of type `ty`.
+    fn find(s: &[u8], ty: u16) -> usize {
+        let mut at = 0;
+        loop {
+            let t = u16::from_le_bytes([s[at], s[at + 1]]);
+            if t == ty {
+                return at;
+            }
+            at += 4 + u16::from_le_bytes([s[at + 2], s[at + 3]]) as usize;
+        }
+    }
+}

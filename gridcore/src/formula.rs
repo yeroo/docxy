@@ -6277,7 +6277,7 @@ const FUTURE_FUNCTIONS: &[&str] = &[
 
 /// The prefix a file spells function `name` with: `_xlfn.` for a future
 /// function, `_xlfn._xlws.` for the two worksheet ones, `None` for the rest.
-fn future_prefix(name: &str) -> Option<&'static str> {
+pub(crate) fn future_prefix(name: &str) -> Option<&'static str> {
     if name.eq_ignore_ascii_case("SORT") || name.eq_ignore_ascii_case("FILTER") {
         Some("_xlfn._xlws.")
     } else if FUTURE_FUNCTIONS

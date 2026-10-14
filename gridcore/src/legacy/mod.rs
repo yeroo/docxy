@@ -22,10 +22,14 @@
 mod ftab;
 mod ods;
 mod ptg;
+mod ptg_write;
 mod xls;
+mod xls_write;
 mod xlsb;
 
 use std::collections::{BTreeMap, HashMap};
+
+pub use xls_write::{XlsOut, check_xls, write_xls};
 
 use crate::sheet::{Cell, DefinedName, Xf};
 use crate::xlsx::{SheetPackage, XlsxError, load_xlsx};
