@@ -361,6 +361,10 @@ impl SegWriter<'_, '_> {
                 push_props(&mut props, &eff, &direct);
                 self.atom("field", width, text, &props);
             }
+            // One offset with no text to show still needs something drawn.
+            Inline::Equation { text, .. } if text.trim().is_empty() => {
+                self.atom("eq", width, "[equation]", "")
+            }
             Inline::Equation { text, .. } => self.atom("eq", width, text, ""),
             Inline::SmartArt { text, .. } => self.atom("art", width, &text.join(" · "), ""),
             Inline::Chart { chart, .. } => {

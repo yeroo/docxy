@@ -2148,6 +2148,13 @@ mod tests {
         );
         s.exec_json("backspace");
         assert!(!s.doc_json().contains(r#""k":"eq""#));
+        // An equation with no text to show still draws something (FIX r5).
+        let s = open("<m:oMath/>");
+        let d = s.doc_json();
+        assert!(
+            d.contains(r#"{"k":"eq","o":4,"w":1,"x":"[equation]""#),
+            "{d}"
+        );
 
         let mut s = open(
             r#"<w:r><w:drawing><wp:inline><wp:extent cx="9525" cy="9525"/></wp:inline></w:drawing></w:r>"#,

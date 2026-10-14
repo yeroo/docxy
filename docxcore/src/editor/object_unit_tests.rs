@@ -589,6 +589,13 @@ fn find_sees_a_linked_multi_line_equation_at_its_unit_1242() {
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!((found[0].start, found[0].end), (1, 2));
     assert!(!found[0].editable);
+
+    // FIX r5: an equation with no text shows, and is found, as its label.
+    let ed = Editor::new(doc(&[format!("{}<m:oMath/>{}", t("ab"), t("cd"))]));
+    assert_eq!(etext(&ed), "ab\u{FFFC}cd");
+    let found = ed.find_visible("equation", false);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!((found[0].start, found[0].end), (2, 3));
 }
 
 /// FIX r4 m1: a tracked cut of a lone equation (which stays) has nothing to

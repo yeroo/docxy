@@ -1497,7 +1497,9 @@ fn flatten_para(
     for (k, fi) in items.iter().enumerate() {
         let idx = fi.idx;
         // Block-level content nested in a link has no top-level index of its
-        // own to render from, so it stays undrawn, as before links were opened.
+        // own to render from: SmartArt, a chart or a text box stays undrawn,
+        // as before links were opened, while a one-offset equation or picture
+        // shows a label in the line (#1242).
         let nested = fi.link.is_some();
         // Inline content that lands right after a block marker starts a fresh text
         // seg, so it renders below the block (not appended to the block's marker).
@@ -1695,6 +1697,12 @@ fn flatten_para(
                     push_unit_label(&mut segs, &label, mc, sel_at(mc), fi.link.clone());
                 }
                 mc += crate::editor::inline_len(item);
+            }
+            // An equation with no text to show (empty or unreadable math) is
+            // still its one offset: a label shows it (#1242).
+            Inline::Equation { text, .. } if text.trim().is_empty() => {
+                push_unit_label(&mut segs, "[equation]", mc, sel_at(mc), fi.link.clone());
+                mc += 1;
             }
             // A decoded equation flows as text at body size, one editor
             // offset (#1242) like a field's result: every glyph carries it and
@@ -4919,6 +4927,25 @@ mod tests {
                 picture_1242(300, true),
             ]);
             assert_eq!(all_offsets_1242(&maps), vec![0, 1, 2]);
+        }
+    }
+
+    /// FIX r5: an equation with no text to show is still its one offset,
+    /// drawn as a label with a stop on each side.
+    #[test]
+    fn an_equation_with_no_text_shows_a_label_1242() {
+        for text in ["", " "] {
+            let d = doc(vec![para(vec![
+                run("ab", RunProps::default()),
+                equation_1242(text),
+                run("cd", RunProps::default()),
+            ])]);
+            let (lines, maps) = render_mapped(&d, &opts(40));
+            assert_eq!(lines[0].plain(), "ab[equation]cd");
+            assert_eq!(
+                stops_1242(&maps[0]),
+                vec![(0, 0), (1, 1), (2, 2), (3, 12), (4, 13), (5, 14)]
+            );
         }
     }
 

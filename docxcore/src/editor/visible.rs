@@ -162,7 +162,8 @@ impl Walk {
     }
 
     /// The same walk as `render.rs`'s `flat_inlines` and its inline arms:
-    /// `nested` is inside a hyperlink, where block content is not drawn.
+    /// `nested` is inside a hyperlink, where SmartArt, a chart or a text box
+    /// is not drawn, and a one-offset equation shows in the line (#1242).
     fn inlines(&mut self, content: &[Inline], nested: bool) {
         for inline in content {
             match inline {
@@ -201,6 +202,11 @@ impl Walk {
                     self.read_only(&mark, self.offset, self.offset, None);
                 }
                 // An equation is one editor unit (#1242), as a field is.
+                // With no text to show, render.rs draws a label at its unit.
+                Inline::Equation { text, .. } if text.trim().is_empty() => {
+                    self.read_only("[equation]", self.offset, self.offset + 1, None);
+                    self.offset += 1;
+                }
                 Inline::Equation { text, .. } if !text.contains('\n') => {
                     self.read_only(text, self.offset, self.offset + 1, None);
                     self.offset += 1;
