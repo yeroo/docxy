@@ -526,13 +526,13 @@ fn copy_reports_text_without_mutating() {
 }
 
 /// #768 r2: a cut's plain-text copy cannot carry a picture, so the cut
-/// leaves it in the document.
+/// leaves it in the document. The picture is offset 0 (#1242).
 #[test]
 fn a_cut_keeps_a_picture_its_copy_cannot_carry() {
     let picture = docxcore::image::inline_picture_run("rId9", 9525, 9525, 1, "a.png");
     let body = format!("<w:p>{picture}<w:r><w:t>ab</w:t></w:r></w:p>");
     let mut s = open(&docx_from_body(&body));
-    s.exec_json("select\t0\t0\t0\t2");
+    s.exec_json("select\t0\t0\t0\t3");
     let r = parse(&s.exec_json("cut"));
     assert_eq!(r.get_str("copied"), Some("ab"));
     let Block::Paragraph(p) = &s.editor.doc.body[0] else {

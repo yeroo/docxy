@@ -396,3 +396,32 @@ fn a_loose_field_showing_a_picture_is_edited_whole_1242() {
         assert!(!xml.contains(gone), "{gone} left: {xml}");
     }
 }
+
+/// A host's plain-text cut (the browser's) cannot carry an equation or an
+/// inline picture: they stay where the cut was, its text goes (#768 r2).
+#[test]
+fn a_plain_text_cut_keeps_the_objects_its_text_cannot_carry_1242() {
+    for (object, kind, text) in [(PIC, "[PIC]", "bc"), (EQ, "[EQ]", "bx+1c")] {
+        let mut ed = ed_with(object);
+        select(&mut ed, vec![0], 1, 4);
+        assert_eq!(ed.cut_text().as_deref(), Some(text));
+        assert_eq!(kinds(&ed), ["a", kind, "d"]);
+        assert!(ed.undo());
+        assert_eq!(etext(&ed), "ab\u{FFFC}cd");
+        // Across paragraphs, in the first and the last.
+        let mut ed = Editor::new(doc(&[
+            format!("{}{object}{}", t("ab"), t("cd")),
+            format!("{}{object}{}", t("ef"), t("gh")),
+        ]));
+        select(&mut ed, vec![0], 1, 0);
+        ed.caret = Caret::at(vec![1], 4);
+        assert!(ed.cut_text().is_some());
+        assert_eq!(ed.doc.body.len(), 1);
+        assert_eq!(kinds(&ed), ["a", kind, kind, "h"]);
+    }
+    // A lone picture: nothing to copy, nothing done.
+    let mut ed = ed_with(PIC);
+    select(&mut ed, vec![0], 2, 3);
+    assert_eq!(ed.cut_text(), None);
+    assert_eq!(etext(&ed), "ab\u{FFFC}cd");
+}

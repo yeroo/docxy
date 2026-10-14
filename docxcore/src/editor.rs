@@ -1756,23 +1756,27 @@ impl Editor {
     /// the marker runs of a loose field it covers go with its result, so no
     /// delete leaves a field shell or half a field (#1240).
     pub fn delete_selection(&mut self) -> bool {
-        self.delete_selection_with(true)
+        self.delete_selection_with(true, false)
     }
 
-    /// [`Editor::delete_selection`] for a cut: it keeps the pictures and
-    /// alignment tabs in the paragraphs where the selection starts and
-    /// ends, which a cut's clip does not carry (they take no offset), so a
-    /// paste could not bring them back. Paragraphs wholly inside the
-    /// selection still go whole, their objects with them. A host that cuts
-    /// through its own plain-text copy calls [`Editor::cut_text`], which
-    /// copies what this then deletes.
+    /// [`Editor::delete_selection`] for a cut: it keeps the floating
+    /// pictures and alignment tabs in the paragraphs where the selection
+    /// starts and ends, which a cut's clip does not carry (they take no
+    /// offset), so a paste could not bring them back. An inline picture or
+    /// an equation is one offset (#1242): the clip carries it, so it goes.
+    /// Paragraphs wholly inside the selection still go whole, their objects
+    /// with them. A host that cuts through its own plain-text copy calls
+    /// [`Editor::cut_text`].
     pub fn delete_selection_keeping_objects(&mut self) -> bool {
-        self.delete_selection_with(false)
+        self.delete_selection_with(false, false)
     }
 
     /// [`Editor::delete_selection`]; `drop_objects` false is
-    /// [`Editor::delete_selection_keeping_objects`].
-    fn delete_selection_with(&mut self, drop_objects: bool) -> bool {
+    /// [`Editor::delete_selection_keeping_objects`], and `keep_units` also
+    /// keeps the equations and inline pictures in the paragraphs where the
+    /// selection starts and ends ([`is_object_unit`]), for a cut whose copy
+    /// is plain text.
+    fn delete_selection_with(&mut self, drop_objects: bool, keep_units: bool) -> bool {
         if let Some(range) = self.cell_range() {
             return self.clear_cells(&range);
         }
@@ -1795,7 +1799,7 @@ impl Editor {
                     drop_spanned_objects(&mut p.content, lo.offset, hi.offset, false, false);
                 }
             }
-            self.delete_chars(&lo.path, lo.offset, hi.offset);
+            self.delete_chars(&lo.path, lo.offset, hi.offset, keep_units);
             self.caret = lo;
             return true;
         }
@@ -1813,7 +1817,7 @@ impl Editor {
         self.clear_placeholders_around(&hi.path);
         // Tracked: the text of each paragraph is recorded as deleted and the
         // paragraph marks stay (see the `track` module).
-        if self.delete_text_across_paragraphs(&lo, &hi) {
+        if self.delete_text_across_paragraphs(&lo, &hi, keep_units) {
             self.caret = lo;
             return true;
         }
@@ -1839,9 +1843,7 @@ impl Editor {
                 if drop_objects {
                     drop_spanned_objects(&mut p.content, lo.offset, len, false, true);
                 }
-                for _ in lo.offset..len {
-                    content_delete(&mut p.content, lo.offset);
-                }
+                delete_content_range(&mut p.content, lo.offset, len, keep_units);
             }
             // Take the remainder of the last paragraph (after hi.offset),
             // and its props for the section mark it may carry.
@@ -1849,9 +1851,7 @@ impl Editor {
                 if drop_objects {
                     drop_spanned_objects(&mut p.content, 0, hi.offset, true, false);
                 }
-                for _ in 0..hi.offset {
-                    content_delete(&mut p.content, 0);
-                }
+                delete_content_range(&mut p.content, 0, hi.offset, keep_units);
                 (
                     std::mem::take(&mut p.content),
                     Some(std::mem::take(&mut p.props)),
@@ -1975,7 +1975,9 @@ impl Editor {
         if text.is_empty() {
             return None;
         }
-        self.delete_selection_keeping_objects();
+        // Nor can it carry an equation or an inline picture (#1242): they
+        // stay where the cut was.
+        self.delete_selection_with(false, true);
         Some(text)
     }
 
@@ -3976,6 +3978,20 @@ fn drop_spanned_objects(
         let edge = whole && (p == 0 || p == len);
         !(is_spanned_object(raw) && (inside || edge))
     });
+}
+
+/// Delete editor offsets `from..to` of `content`, keeping the equations and
+/// inline pictures there when `keep_units` (see
+/// [`Editor::delete_selection_with`]).
+fn delete_content_range(content: &mut Vec<Inline>, from: usize, to: usize, keep_units: bool) {
+    let mut at = from;
+    for _ in from..to {
+        if keep_units && inline_covering(content, at).is_some_and(is_object_unit) {
+            at += 1;
+        } else {
+            content_delete(content, at);
+        }
+    }
 }
 
 fn content_delete(content: &mut Vec<Inline>, idx: usize) {

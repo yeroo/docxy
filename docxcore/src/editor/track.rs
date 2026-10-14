@@ -239,11 +239,22 @@ impl Editor {
 
     /// Delete editor offsets `from..to` of the paragraph at `path` with
     /// [`Editor::delete_char_at`], stepping past what stays (an equation
-    /// while tracking), so nothing after `to` is touched.
-    pub(super) fn delete_chars(&mut self, path: &[usize], from: usize, to: usize) {
+    /// while tracking, and every equation or inline picture when
+    /// `keep_units`), so nothing after `to` is touched.
+    pub(super) fn delete_chars(
+        &mut self,
+        path: &[usize],
+        from: usize,
+        to: usize,
+        keep_units: bool,
+    ) {
         let mut at = from;
         for _ in from..to {
-            if !self.delete_char_at(path, at) {
+            let kept = keep_units
+                && resolve_para(&self.doc.body, path)
+                    .and_then(|p| super::inline_covering(&p.content, at))
+                    .is_some_and(super::is_object_unit);
+            if kept || !self.delete_char_at(path, at) {
                 at += 1;
             }
         }
@@ -261,6 +272,7 @@ impl Editor {
         &mut self,
         lo: &super::Caret,
         hi: &super::Caret,
+        keep_units: bool,
     ) -> bool {
         if self.track.is_none() {
             return false;
@@ -296,7 +308,7 @@ impl Editor {
                 (false, true) => (0, hi.offset.min(len)),
                 (false, false) => (0, len),
             };
-            self.delete_chars(path, from, to);
+            self.delete_chars(path, from, to, keep_units);
         }
         true
     }
@@ -320,7 +332,7 @@ impl Editor {
             return;
         }
         let with = super::without_field_chars(with);
-        self.delete_chars(path, start, end);
+        self.delete_chars(path, start, end, false);
         let mut n = 0;
         if let Some(p) = para_mut(&mut self.doc.body, path) {
             for (k, ch) in with.chars().enumerate() {
