@@ -35,6 +35,13 @@ pub trait BackstageHost {
     fn compat_mode(&self) -> bool {
         false
     }
+    /// Whether the document is open in Protected View (a downloaded file,
+    /// #894): the Info pane then starts with a Protected View section whose
+    /// `Enable Editing` row returns [`BackstageEvent::EnableEditing`], before
+    /// the Compatibility Mode `Convert` row and the editable rows.
+    fn protected_view(&self) -> bool {
+        false
+    }
 }
 
 /// The app-level action requested by a `key`/`mouse` call on [`crate::Backstage`].
@@ -60,11 +67,15 @@ pub enum BackstageEvent {
     Exit,
     /// Enter (or a second click) on the Info pane's property row `i`: an
     /// index into [`BackstageHost::info_fields`], or `info_fields().len()`
-    /// for the custom-property row after them. The Compatibility Mode
-    /// `Convert` row isn't counted ([`BackstageEvent::Convert`]).
+    /// for the custom-property row after them. The Protected View
+    /// `Enable Editing` and Compatibility Mode `Convert` rows aren't counted
+    /// ([`BackstageEvent::EnableEditing`], [`BackstageEvent::Convert`]).
     EditInfo(usize),
     /// Enter (or a second click) on the Info pane's `Convert` row, shown
     /// while [`BackstageHost::compat_mode`]: convert the document to the
     /// current file format.
     Convert,
+    /// Enter (or a second click) on the Info pane's `Enable Editing` row,
+    /// shown while [`BackstageHost::protected_view`]: leave Protected View.
+    EnableEditing,
 }

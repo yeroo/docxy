@@ -15,7 +15,7 @@
 //!
 //! | Verb | Args | Result |
 //! |---|---|---|
-//! | `wb.path` | — | `{path, modified, sheets, active, active_name, circular}` |
+//! | `wb.path` | — | `{path, modified, read_only, protected, format, compat, sheets, active, active_name, circular}` |
 //! | `app-info` | — | the build: `{version, commit, short_commit, branch, commit_date, dirty, last_pr, issue, ahead, built_at, profile, target, host, kind, manual, summary, …}` |
 //! | `sheet.list` | — | `{active, sheets:[{index, name, rows, cols}]}` |
 //! | `sheet.read` | `{sheet?, range?}` | `{sheet, name, rows, cols, cells:[…], truncated}` |
@@ -76,6 +76,7 @@
 //! | `wb.save` | — | `{path, …}`; a failed write errors with `save failed: …` (the status-bar text) and the workbook stays modified |
 //! | `wb.reload` | — | `{path, …}` |
 //! | `wb.open` | `{path}` | `{path, …}` |
+//! | `wb.enable-editing` | — | `{path, …, protected:false}` — leaves Protected View, as the bar's Enable Editing does; an error when the workbook is not in it |
 //! | `field-read` | `{input?}` | a text prompt (`xlsxy-prompt`, `xlsxy-cell`, `xlsxy-vim-command`, `xlsxy-save-as`): `{input, value, focused, caret, selection, at, kind, keys, clicks, frames, dirty}`; with no `input`, the counters and the ids (`ctlcore::field`, #1204) |
 //!
 //! `cell.get`'s reply additively gains a `format` object — present only when
@@ -87,6 +88,14 @@
 //! `sheet.read` window can return thousands of cells, and paying six extra
 //! keys per cell there (or on the busiest mutating verb, `cell.set`) isn't
 //! worth it when nothing consumes it.
+//!
+//! ## Protected View
+//!
+//! While the workbook is in Protected View (a downloaded file, #894) only
+//! the verbs [`VERBS`] marks allowed run: reads, opening and reloading,
+//! recalculating (pivots keep their cached values), the clock, the app's own
+//! options, `field-read` and `wb.enable-editing`. Every other verb errors
+//! with the Protected View status and changes nothing.
 
 use crate::{App, comment_author, iso_now, now_serial};
 use ctlcore::json::Json;
@@ -203,9 +212,100 @@ pub(crate) const INPUTS: &[&str] = &[
     "xlsxy-save-as",
 ];
 
+/// Every verb [`dispatch`] routes, and whether it may run in Protected View
+/// (#894): it only reads the workbook, replaces it with another file's, or
+/// touches the app rather than the workbook. A test keeps this list equal
+/// to `dispatch`'s arms, so a new verb is refused there until it is
+/// classified here.
+pub(crate) const VERBS: &[(&str, bool)] = &[
+    ("wb.path", true),
+    ("sheet.list", true),
+    ("sheet.read", true),
+    ("cell.get", true),
+    ("cell.set", false),
+    ("range.clear", false),
+    ("find", true),
+    ("comment.list", true),
+    // Returns the CSV text; it writes no file.
+    ("wb.export-csv", true),
+    ("sheet.pivot", true),
+    ("formula.eval", true),
+    ("sheet.stats", true),
+    ("chart.list", true),
+    ("pivot.list", true),
+    ("pivot.create", false),
+    ("comment.add", false),
+    ("comment.remove", false),
+    ("range.set", false),
+    ("sheet.import-csv", false),
+    ("sheet.import-text", false),
+    ("range.text-to-columns", false),
+    ("app.options", true),
+    ("app-info", true),
+    ("app.autocorrect", true),
+    ("range.flash-fill", false),
+    ("wb.replace-all", false),
+    ("wb.consolidate", false),
+    ("sheet.add", false),
+    ("sheet.remove", false),
+    ("sheet.rename", false),
+    ("table.list", true),
+    ("table.rename", false),
+    ("table.resize", false),
+    ("table.convert", false),
+    ("row.insert", false),
+    ("row.delete", false),
+    ("col.insert", false),
+    ("col.delete", false),
+    ("cell.format", false),
+    ("col.width", false),
+    ("page.setup", false),
+    ("page.header", false),
+    ("print-area.set", false),
+    ("print-area.add", false),
+    ("print-area.clear", false),
+    ("print-titles.set", false),
+    ("page-break.insert", false),
+    ("page-break.remove", false),
+    ("page-break.reset", false),
+    ("print.pages", true),
+    ("wb.export-pdf", false),
+    ("filter.set", false),
+    ("filter.reapply", false),
+    ("filter.clear", false),
+    ("filter.off", false),
+    ("filter.menu", true),
+    ("filter.by-cell", false),
+    ("filter.advanced", false),
+    ("sheet.rows", true),
+    ("range.sort", false),
+    ("wb.clock", true),
+    ("wb.properties", true),
+    ("wb.set-properties", false),
+    ("wb.recalc", true),
+    ("wb.save", false),
+    ("wb.convert", false),
+    ("wb.reload", true),
+    ("wb.open", true),
+    ("wb.enable-editing", true),
+    ("field-read", true),
+];
+
+/// Whether `verb` may run in Protected View ([`VERBS`]); an unknown verb
+/// may not.
+fn allowed_in_protected_view(verb: &str) -> bool {
+    VERBS.iter().any(|&(v, ok)| v == verb && ok)
+}
+
 /// Route one control verb against the live workbook, returning the JSON result
 /// or an error message.
 pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> {
+    if app.protected_view.is_some() && !allowed_in_protected_view(verb) {
+        if !VERBS.iter().any(|&(v, _)| v == verb) {
+            return Err(format!("unknown verb '{verb}'"));
+        }
+        app.refuse_protected()?;
+    }
     let out = match verb {
         "wb.path" => Ok(path_info(app)),
         "sheet.list" => Ok(sheet_list(app)),
@@ -315,6 +415,12 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
             app.open_without_wizard(&p)?;
             Ok(path_info(app))
         }
+        // Lifts a gate the person is meant to decide (#894): no MCP tool
+        // forwards it.
+        "wb.enable-editing" => {
+            app.enable_editing()?;
+            Ok(path_info(app))
+        }
         "field-read" => ctlcore::field::reply(args, INPUTS, app.counts, app.modified, |id| {
             app.input_field(id)
         }),
@@ -352,6 +458,8 @@ fn path_info(app: &App) -> Json {
         // Bound to the file `xlsxy --read-only` opened (#882): `wb.save`
         // is refused until a Save As to another name.
         ("read_only", Json::Bool(app.bound_read_only())),
+        // In Protected View (#894): only the verbs `VERBS` allows run.
+        ("protected", Json::Bool(app.protected_view.is_some())),
         // The type a save writes, and whether that is Excel 97-2003's
         // Compatibility Mode (#874).
         ("format", Json::Str(app.bound_type_label().to_string())),

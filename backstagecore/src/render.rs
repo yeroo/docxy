@@ -400,7 +400,20 @@ fn draw_info(f: &mut Frame, area: Rect, bs: &mut Backstage, host: &dyn Backstage
     let fields = host.info_fields();
     let custom = host.info_custom_row();
     let compat = host.compat_mode();
+    let protected = host.protected_view();
     let mut scroll = 0usize;
+    if protected {
+        // Excel's Info page for a file in Protected View, its Enable Editing
+        // button the first of the rows below.
+        lines.push(RLine::raw(""));
+        lines.push(RLine::styled(
+            "  Protected View",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        lines.push(RLine::raw(
+            "  This file originated from an Internet location and might be unsafe.",
+        ));
+    }
     if compat {
         // Excel's Info page in Compatibility Mode, its Convert button the
         // first of the rows below.
@@ -417,14 +430,15 @@ fn draw_info(f: &mut Frame, area: Rect, bs: &mut Backstage, host: &dyn Backstage
             lines.push(RLine::raw(l));
         }
     }
-    if !fields.is_empty() || custom || compat {
+    if !fields.is_empty() || custom || compat || protected {
         let focus = bs.pane == Pane::Info;
         let accent = Style::default().fg(Color::Black).bg(host.accent());
         lines.push(RLine::raw(""));
         let first_row = lines.len();
-        let rows = compat
-            .then(|| "  Convert…".to_string())
+        let rows = protected
+            .then(|| "  Enable Editing".to_string())
             .into_iter()
+            .chain(compat.then(|| "  Convert…".to_string()))
             .chain(
                 fields
                     .iter()
@@ -803,6 +817,100 @@ mod tests {
         })
         .unwrap();
         assert!(!screen(&term).contains("Compatibility Mode"));
+    }
+
+    /// A host in Protected View (#894): the Info page shows the section, its
+    /// Enable Editing row first, then Convert in Compatibility Mode, then
+    /// the properties, which keep their indices.
+    #[test]
+    fn the_info_page_offers_enable_editing_in_protected_view() {
+        struct Protected;
+        impl BackstageHost for Protected {
+            fn extensions(&self) -> &'static [&'static str] {
+                &["xls"]
+            }
+            fn default_save_name(&self) -> String {
+                "book.xls".into()
+            }
+            fn preview_lines(&self, _p: &Path, _w: usize) -> Vec<String> {
+                Vec::new()
+            }
+            fn info_lines(&self) -> Vec<Line<'static>> {
+                vec![Line::raw("  File  book.xls")]
+            }
+            fn accent(&self) -> Color {
+                Color::Green
+            }
+            fn info_fields(&self) -> Vec<(String, String)> {
+                vec![("Title".into(), "Budget".into())]
+            }
+            fn compat_mode(&self) -> bool {
+                true
+            }
+            fn protected_view(&self) -> bool {
+                true
+            }
+        }
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut bs = Backstage::open(std::env::temp_dir(), &["xls"]);
+        bs.focus_info(0);
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &Protected);
+        })
+        .unwrap();
+        let text = screen(&term);
+        assert!(text.contains("Protected View"), "{text}");
+        assert!(
+            text.contains("originated from an Internet location"),
+            "{text}"
+        );
+        let top = bs.layout.info_top as usize;
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[top].contains("Enable Editing"), "{text}");
+        assert!(lines[top + 1].contains("Convert…"), "{text}");
+        assert!(
+            lines[top + 2].contains("Title             Budget"),
+            "{text}"
+        );
+        let enter = KeyEvent::from(KeyCode::Enter);
+        let down = KeyEvent::from(KeyCode::Down);
+        assert!(matches!(
+            bs.key(enter, &Protected),
+            crate::BackstageEvent::EnableEditing
+        ));
+        bs.key(down, &Protected);
+        assert!(matches!(
+            bs.key(enter, &Protected),
+            crate::BackstageEvent::Convert
+        ));
+        bs.key(down, &Protected);
+        assert!(matches!(
+            bs.key(enter, &Protected),
+            crate::BackstageEvent::EditInfo(0)
+        ));
+        // A host returning to property 0 lands past both lead rows.
+        bs.focus_info_field(0, &Protected);
+        assert_eq!(bs.info_sel, 2);
+        // A click on the Enable Editing row selects it, a second enables.
+        let y = top as u16;
+        assert!(matches!(
+            bs.mouse(30, y, &Protected),
+            crate::BackstageEvent::None
+        ));
+        assert!(matches!(
+            bs.mouse(30, y, &Protected),
+            crate::BackstageEvent::EnableEditing
+        ));
+        // Out of Protected View there is no section and no row.
+        bs.focus_info(0);
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &Editable);
+        })
+        .unwrap();
+        assert!(!screen(&term).contains("Protected View"));
     }
 
     /// More rows than the box holds: the page scrolls so the selected row

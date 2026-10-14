@@ -490,10 +490,11 @@ impl Backstage {
     }
 
     /// Show Info with property row `field` focused, as
-    /// [`crate::BackstageEvent::EditInfo`] numbers it: past the Convert row
-    /// when the host is in Compatibility Mode.
+    /// [`crate::BackstageEvent::EditInfo`] numbers it: past the Enable
+    /// Editing row in Protected View and the Convert row in Compatibility
+    /// Mode.
     pub fn focus_info_field(&mut self, field: usize, host: &dyn crate::BackstageHost) {
-        self.focus_info(field + usize::from(host.compat_mode()));
+        self.focus_info(field + crate::input::info_lead_rows(host));
     }
 
     /// Save As's file-name field, for `field-read` (#1204): its text and

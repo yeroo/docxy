@@ -663,6 +663,51 @@ fn view_groups() -> Vec<Group> {
     ]
 }
 
+/// Whether `act` may run in Protected View (#894): it only reads, copies,
+/// moves the selection or changes how the workbook is shown. Every other
+/// command would edit or write the workbook and is refused, a `Todo`
+/// included, so a command wired up later is refused until it is put here.
+pub fn allowed_in_protected_view(act: Act) -> bool {
+    use Act::*;
+    match act {
+        Copy | Find | GoTo | PrevComment | NextComment | ToggleComments | FormulaView
+        | ShowHidden | ShowObjects | ThemeToggle | AutoHideRibbon | Help | ContactSupport
+        | Feedback | About => true,
+        Cut | Paste | PasteSpecial | Undo | Redo | Replace | ClearContents | FillDown
+        | FillRight | FillUp | FillLeft | InsertRow | InsertCol | DeleteRow | DeleteCol
+        | SortAsc | SortDesc | CustomSort | AutoSum | InsertChart(_) | AddSheet | RenameSheet
+        | Save | SaveAs | Bold | Italic | AlignLeft | AlignCenter | AlignRight | WrapText
+        | RowHeight | NumberFormat | FontColor | FillColor | MergeCenter | CondFormat
+        | DataValidation | CircleInvalid | ClearCircles | Filter | ClearFilter | ReapplyFilter
+        | AdvancedFilter | FilterByCell | RemoveDuplicates | TextToColumns | FormatAsTable
+        | TableName | ResizeTable | ConvertToRange | Consolidate | Subtotal | DataForm
+        | GroupOutline | UngroupOutline | ShowDetail | HideDetail | AutoOutline | ClearOutline
+        | OutlineSettings | NewComment | NewNote | DeleteComment | ProtectSheet | FreezePanes
+        | Todo(_) => false,
+    }
+}
+
+/// Every command on the ribbon's tabs, in tab order.
+#[cfg(test)]
+pub fn all_acts() -> Vec<Act> {
+    [
+        home_groups(),
+        insert_groups(),
+        data_groups(),
+        review_groups(),
+        view_groups(),
+        help_groups(),
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(|g| g.rows.into_iter().flatten())
+    .filter_map(|seg| match seg {
+        Seg::Btn(b) => Some(b.act),
+        Seg::Gap(_) => None,
+    })
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
