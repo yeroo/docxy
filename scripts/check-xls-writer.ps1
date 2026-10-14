@@ -1,7 +1,8 @@
 # Check that Microsoft Excel opens what gridcore's .xls writer (#874) writes,
 # and computes the same values from it. For each .xls in corpus/legacy (and
 # its extra/ and addin/ folders), and each .xlsx in corpus/xlsx (a Save As
-# Excel 97-2003 Workbook from a workbook), this:
+# Excel 97-2003 Workbook from a workbook), and a synthetic .xlsx of what the
+# corpus lacks (dynamic arrays, a text legacy array, colours), this:
 #
 #   1. reads it with gridcore and writes it as .xls (the xls_roundtrip
 #      example, which also runs the writer's structural check);
@@ -74,9 +75,14 @@ function Get-Cells($wb, [bool]$formulas) {
       for ($c = 0; $c -lt $used.Columns.Count; $c++) {
         $cell = $ws.Cells.Item($r0 + $r, $c0 + $c)
         $v = $cell.Value2
-        if ($null -eq $v -and -not $cell.HasFormula) { continue }
+        # A dynamic array's spilled cells hold no formula of their own; the
+        # .xls holds the same array as a legacy one, every cell a formula.
+        $spilled = $false
+        try { $spilled = [bool]$cell.HasSpill } catch {}
+        $hasFormula = $cell.HasFormula -or $spilled
+        if ($null -eq $v -and -not $hasFormula) { continue }
         if ($v -is [double]) { $v = $v.ToString("R") }
-        $cells["$($ws.Name)!$($r0 + $r),$($c0 + $c)"] = if ($formulas) { "$($cell.HasFormula)" } else { "$v" }
+        $cells["$($ws.Name)!$($r0 + $r),$($c0 + $c)"] = if ($formulas) { "$hasFormula" } else { "$v" }
       }
     }
   }
@@ -94,10 +100,17 @@ function Compare-Cells($a, $b, $allowed) {
   $diffs
 }
 
+# What the corpus lacks, built by the example: dynamic arrays (a SEQUENCE
+# spill, SORT, FILTER), a text-valued legacy array, a custom colour and a
+# bordered cell.
+$synthetic = Join-Path $Out "synthetic.xlsx"
+& $tool --synthetic $synthetic
+if ($LASTEXITCODE -ne 0) { throw "writing $synthetic failed" }
 $files = @(Get-ChildItem (Join-Path $root "corpus\legacy\*.xls")) +
   @(Get-ChildItem (Join-Path $root "corpus\legacy\extra\*.xls")) +
   @(Get-ChildItem (Join-Path $root "corpus\legacy\addin\*.xls")) +
-  @(Get-ChildItem (Join-Path $root "corpus\xlsx\*.xlsx"))
+  @(Get-ChildItem (Join-Path $root "corpus\xlsx\*.xlsx")) +
+  @(Get-Item $synthetic)
 $failed = 0
 foreach ($src in $files) {
   $dst = Join-Path $Out "$($src.BaseName)-$($src.Extension.TrimStart('.'))-rewritten.xls"
