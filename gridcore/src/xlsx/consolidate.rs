@@ -43,10 +43,19 @@ pub(super) fn read(xml: &str) -> Option<ConsolidateSettings> {
                 }
                 "dataRef" => {
                     if p.attrs().iter().any(|a| local(a.name) == "id") {
-                        // Only an empty element can be written back as is.
-                        let raw = &part[p.start_pos()..p.pos()];
-                        if raw.ends_with("/>") {
-                            s.external.push(raw.to_string());
+                        // The whole element, through its end tag when it
+                        // has one, to be written back as is.
+                        let (start, tag_end) = (p.start_pos(), p.pos());
+                        let end = if part[..tag_end].ends_with("/>") {
+                            Some(tag_end)
+                        } else {
+                            let close = format!("</{}>", p.name());
+                            part[tag_end..]
+                                .find(&close)
+                                .map(|i| tag_end + i + close.len())
+                        };
+                        if let Some(end) = end {
+                            s.external.push(part[start..end].to_string());
                         }
                         continue;
                     }

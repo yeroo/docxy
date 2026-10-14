@@ -20336,6 +20336,16 @@ mod ct_worksheet_order_tests {
         );
         let r = String::from_utf8(re.part(rels).unwrap().to_vec()).unwrap();
         assert!(r.contains(r#"Id="rId9""#) && r.contains(target), "{r}");
+        // One written with an end tag is kept whole too.
+        let open_close = CONSOLIDATED.replace(
+            r#"<dataRef ref="A1" sheet="X" r:id="rId9"/>"#,
+            r#"<dataRef ref="A1" sheet="X" r:id="rId9"></dataRef>"#,
+        );
+        let k = loaded(&format!("{ROWS}{open_close}{MARGINS}"));
+        assert_eq!(
+            k.workbook.sheets[0].consolidate.as_ref().unwrap().external,
+            [r#"<dataRef ref="A1" sheet="X" r:id="rId9"></dataRef>"#]
+        );
         assert_eq!(
             re.workbook.sheets[0].consolidate.as_ref().unwrap().external,
             [r#"<dataRef ref="A1" sheet="X" r:id="rId9"/>"#]

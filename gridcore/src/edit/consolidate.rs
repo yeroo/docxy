@@ -194,21 +194,41 @@ pub fn parse_consolidate_ref(
     dest: usize,
     text: &str,
 ) -> Result<ConsolidateRef, ConsolidateError> {
-    let names: Vec<&str> = wb.sheets.iter().map(|s| s.name.as_str()).collect();
-    parse_consolidate_ref_in(&names, dest, text).or_else(|e| {
-        let def = consolidate_name(wb, dest, text).ok_or(e.clone())?;
-        // The definition must name its sheet: a bare area would read as
-        // being on the destination.
-        match split_ref_text(def) {
-            Some((Some(_), _)) => parse_consolidate_ref_in(&names, dest, def).map_err(|_| e),
-            _ => Err(e),
-        }
-    })
+    resolve_ref(wb, dest, text).map(|(r, _)| r)
 }
 
-/// The definition of the defined name `text` as Consolidate sees it from
-/// sheet `dest`: local to `dest`, else global. `None` when no such name.
-fn consolidate_name<'a>(wb: &'a Workbook, dest: usize, text: &str) -> Option<&'a str> {
+/// [`parse_consolidate_ref`], with the name as the list keeps it (typed,
+/// trimmed, without `=`) when `text` read as a defined name.
+fn resolve_ref(
+    wb: &Workbook,
+    dest: usize,
+    text: &str,
+) -> Result<(ConsolidateRef, Option<String>), ConsolidateError> {
+    let names: Vec<&str> = wb.sheets.iter().map(|s| s.name.as_str()).collect();
+    match parse_consolidate_ref_in(&names, dest, text) {
+        Ok(r) => Ok((r, None)),
+        Err(e) => {
+            let (name, def) = consolidate_name(wb, dest, text).ok_or(e.clone())?;
+            // The definition must name its sheet: a bare area would read as
+            // being on the destination.
+            match split_ref_text(def) {
+                Some((Some(_), _)) => parse_consolidate_ref_in(&names, dest, def)
+                    .map(|r| (r, Some(name.to_string())))
+                    .map_err(|_| e),
+                _ => Err(e),
+            }
+        }
+    }
+}
+
+/// The defined name `text` (trimmed, without `=`) and its definition, as
+/// Consolidate sees it from sheet `dest`: local to `dest`, else global.
+/// `None` when no such name.
+fn consolidate_name<'a, 't>(
+    wb: &'a Workbook,
+    dest: usize,
+    text: &'t str,
+) -> Option<(&'t str, &'a str)> {
     let t = text.trim();
     let t = t.strip_prefix('=').unwrap_or(t).trim();
     if t.is_empty() || t.contains('!') {
@@ -221,18 +241,7 @@ fn consolidate_name<'a>(wb: &'a Workbook, dest: usize, text: &str) -> Option<&'a
     };
     find(Some(dest))
         .or_else(|| find(None))
-        .map(|d| d.formula.trim())
-}
-
-/// How a reference that read as `r` is kept in the list: a defined name as
-/// typed (trimmed, without `=`), a range in its canonical spelling.
-fn kept_ref_text(wb: &Workbook, dest: usize, text: &str, r: &ConsolidateRef) -> String {
-    let names: Vec<&str> = wb.sheets.iter().map(|s| s.name.as_str()).collect();
-    if parse_consolidate_ref_in(&names, dest, text).is_ok() {
-        return format_consolidate_ref(r);
-    }
-    let t = text.trim();
-    t.strip_prefix('=').unwrap_or(t).trim().to_string()
+        .map(|d| (t, d.formula.trim()))
 }
 
 /// [`parse_consolidate_ref`] against the workbook's sheet names alone, in
@@ -443,9 +452,10 @@ pub fn consolidate(
     let mut refs: Vec<ConsolidateRef> = Vec::with_capacity(opts.refs.len());
     let mut kept: Vec<String> = Vec::with_capacity(opts.refs.len());
     for t in &opts.refs {
-        let r = parse_consolidate_ref(wb, dest, t)?;
+        // A defined name is kept as a name, a range in the list's spelling.
+        let (r, name) = resolve_ref(wb, dest, t)?;
         if !refs.contains(&r) {
-            kept.push(kept_ref_text(wb, dest, t, &r));
+            kept.push(name.unwrap_or_else(|| format_consolidate_ref(&r)));
             refs.push(r);
         }
     }
