@@ -732,9 +732,9 @@ struct Page {
     members: Vec<usize>,
     /// Formatted PAGE, NUMPAGES and SECTIONPAGES values.
     values: [String; 3],
-    /// The numbered headings whose first line is on the page, in order:
-    /// (heading level, chapter number).
-    chapters: Vec<(u8, String)>,
+    /// The headings whose first line is on the page, in order: (heading
+    /// level, chapter number, `None` for an unnumbered heading).
+    chapters: Vec<(u8, Option<String>)>,
 }
 
 /// One body line on a page: where it sits, and the first of its frags and
@@ -1143,13 +1143,13 @@ struct Pager<'a> {
     para: u32,
     numbered: bool,
     line_count: LineCount,
-    /// Each numbered heading's chapter number, by its address in the
+    /// Each heading's chapter number, by its address in the
     /// document laid out ([`crate::numbering::heading_numbers`]); empty when
     /// no section shows a chapter prefix. A heading in a table cell counts
     /// in the numbering but marks no page: tables are flattened to rows.
-    chapters: HashMap<*const Paragraph, (u8, String)>,
+    chapters: HashMap<*const Paragraph, (u8, Option<String>)>,
     /// The heading begun, until its first line settles on a page.
-    pending_chapter: Option<(u8, String)>,
+    pending_chapter: Option<(u8, Option<String>)>,
 }
 
 /// The line-number counter and where it last counted, for `w:restart`.
@@ -1534,25 +1534,25 @@ impl<'a> Pager<'a> {
         n.is_multiple_of(ln.count_by).then_some((n, ln.distance))
     }
 
-    /// Each page's chapter number, when its section shows one: the first
-    /// heading of the section's `w:chapStyle` level on the page, else the
-    /// last one before it (STYLEREF's rule in a header or footer). `None`
-    /// without such a heading, and the page shows its plain number.
+    /// Each page's chapter number, when its section shows one: that of the
+    /// first heading of the section's `w:chapStyle` level on the page, else
+    /// of the last one before it (STYLEREF's rule in a header or footer).
+    /// `None` without such a heading, or when that heading is unnumbered,
+    /// and the page shows its plain number.
     fn page_chapters(&self) -> Vec<Option<String>> {
         let mut last: [Option<&str>; 10] = Default::default();
         let mut out = Vec::with_capacity(self.pages.len());
         for page in &self.pages {
             let chapter = self.sects[page.sect].chapter.and_then(|(level, _)| {
-                page.chapters
-                    .iter()
-                    .find(|(l, _)| *l == level)
-                    .map(|(_, text)| text.as_str())
-                    .or(last[usize::from(level)])
+                match page.chapters.iter().find(|(l, _)| *l == level) {
+                    Some((_, text)) => text.as_deref(),
+                    None => last[usize::from(level)],
+                }
             });
             out.push(chapter.map(str::to_string));
             for (level, text) in &page.chapters {
                 if let Some(slot) = last.get_mut(usize::from(*level)) {
-                    *slot = Some(text);
+                    *slot = text.as_deref();
                 }
             }
         }
@@ -4537,6 +4537,35 @@ mod tests {
             let pages = pages_of(&doc(body), &chapter_opts());
             assert!(pages[0].exact("1"), "case {k}: {:?}", pages[0].texts);
             assert!(!pages[0].has("-1"), "case {k}: {:?}", pages[0].texts);
+        }
+    }
+
+    /// An unnumbered chapter heading ends the previous chapter: its page and
+    /// the ones after it show plain numbers until the next numbered one
+    /// (FIX r1).
+    #[test]
+    fn an_unnumbered_chapter_heading_shows_plain_page_numbers() {
+        let mut off = chapter_heading("Appendix", false);
+        if let Block::Paragraph(p) = &mut off {
+            p.props.num_id = Some(0);
+        }
+        let d = doc(vec![
+            chapter_heading("One", false),
+            page_field_para(),
+            para(vec![page_break()]),
+            page_field_para(),
+            off,
+            page_field_para(),
+            para(vec![page_break()]),
+            page_field_para(),
+            chapter_heading("Two", false),
+            page_field_para(),
+            trailing(&chapter_sect(false, "1", "hyphen")),
+        ]);
+        let pages = pages_of(&d, &chapter_opts());
+        assert_eq!(pages.len(), 5);
+        for (page, value) in pages.iter().zip(["1-1", "1-2", "3", "4", "2-5"]) {
+            assert!(page.exact(value), "{value} in {:?}", page.texts);
         }
     }
 

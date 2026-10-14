@@ -400,9 +400,11 @@ fn walk(
     }
 }
 
-/// The chapter number of every numbered heading in `doc`, for page numbers
-/// with a `w:chapStyle` prefix: `(heading level, number text)` keyed by the
+/// The chapter number of every heading in `doc`, for page numbers with a
+/// `w:chapStyle` prefix: `(heading level, number text)` keyed by the
 /// paragraph's address in `doc` (see [`Numbering::chapter`] for the text).
+/// An unnumbered heading is there too, with no text: it is still the
+/// chapter heading of its page, and that page shows a plain number.
 ///
 /// A paragraph's numbering is its direct `w:numPr`, else its paragraph
 /// style's (through `w:basedOn`), as Word numbers its outline headings; a
@@ -416,40 +418,38 @@ pub(crate) fn heading_numbers(
     doc: &Document,
     num: &Numbering,
     styles: &StyleSheet,
-) -> HashMap<*const Paragraph, (u8, String)> {
+) -> HashMap<*const Paragraph, (u8, Option<String>)> {
     fn walk(
         blocks: &[Block],
         num: &Numbering,
         styles: &StyleSheet,
         counters: &mut HashMap<i32, Vec<i32>>,
-        out: &mut HashMap<*const Paragraph, (u8, String)>,
+        out: &mut HashMap<*const Paragraph, (u8, Option<String>)>,
     ) {
         for block in blocks {
             match block {
                 Block::Paragraph(p) => {
                     let style = p.props.style_id.as_deref();
-                    let (num_id, ilvl) = match p.props.num_id {
-                        Some(n) => (n, p.props.ilvl),
-                        None => match styles.style_num_pr(style) {
-                            Some((n, Some(l))) => (n, l),
-                            Some((n, None)) => {
-                                (n, style.and_then(|s| num.level_of_style(n, s)).unwrap_or(0))
-                            }
-                            None => continue,
-                        },
-                    };
-                    if num_id <= 0 {
-                        continue;
+                    let numbering = match p.props.num_id {
+                        Some(n) => Some((n, p.props.ilvl)),
+                        None => styles.style_num_pr(style).map(|(n, l)| {
+                            let l = l.or_else(|| style.and_then(|s| num.level_of_style(n, s)));
+                            (n, l.unwrap_or(0))
+                        }),
                     }
-                    match p.props.heading_level {
-                        Some(level) => {
-                            if let Some(text) = num.chapter(num_id, ilvl, counters) {
-                                out.insert(p as *const Paragraph, (level, text));
-                            }
+                    .filter(|&(n, _)| n > 0);
+                    match (p.props.heading_level, numbering) {
+                        (Some(level), Some((num_id, ilvl))) => {
+                            let text = num.chapter(num_id, ilvl, counters);
+                            out.insert(p as *const Paragraph, (level, text));
                         }
-                        None => {
+                        (Some(level), None) => {
+                            out.insert(p as *const Paragraph, (level, None));
+                        }
+                        (None, Some((num_id, ilvl))) => {
                             num.count(num_id, ilvl, counters);
                         }
+                        (None, None) => {}
                     }
                 }
                 Block::Table(t) => {
@@ -588,7 +588,7 @@ mod tests {
     }
 
     /// The chapter numbers of `body`'s headings, in body order.
-    fn chapters(body: Vec<Block>, num_xml: &str) -> Vec<Option<(u8, String)>> {
+    fn chapters(body: Vec<Block>, num_xml: &str) -> Vec<Option<(u8, Option<String>)>> {
         let doc = Document { body };
         let num = parse_numbering_xml(num_xml);
         let styles = crate::styles::parse_styles_xml(OUTLINE_STYLES);
@@ -602,8 +602,13 @@ mod tests {
             .collect()
     }
 
-    fn ch(level: u8, text: &str) -> Option<(u8, String)> {
-        Some((level, text.to_string()))
+    fn ch(level: u8, text: &str) -> Option<(u8, Option<String>)> {
+        Some((level, Some(text.to_string())))
+    }
+
+    /// A heading with no number.
+    fn bare(level: u8) -> Option<(u8, Option<String>)> {
+        Some((level, None))
     }
 
     #[test]
@@ -675,8 +680,8 @@ mod tests {
             chapters(one(), &xml("Part %1.", "upperRoman")),
             vec![ch(1, "I")]
         );
-        assert_eq!(chapters(one(), &xml("No number", "decimal")), vec![None]);
-        assert_eq!(chapters(one(), &xml("\u{2022}", "bullet")), vec![None]);
+        assert_eq!(chapters(one(), &xml("No number", "decimal")), vec![bare(1)]);
+        assert_eq!(chapters(one(), &xml("\u{2022}", "bullet")), vec![bare(1)]);
         let two = vec![styled("Heading1", Some(1)), styled("Heading2", Some(2))];
         let nested = OUTLINE_XML.replace(r#"w:val="%1.%2""#, r#"w:val="(%1.%2)""#);
         assert_eq!(chapters(two, &nested), vec![ch(1, "1"), ch(2, "1.1")]);
@@ -702,6 +707,6 @@ mod tests {
             p.props.num_id = Some(0);
         }
         let got = chapters(vec![off, styled("Heading1", Some(1))], OUTLINE_XML);
-        assert_eq!(got, vec![None, ch(1, "1")]);
+        assert_eq!(got, vec![bare(1), ch(1, "1")]);
     }
 }
