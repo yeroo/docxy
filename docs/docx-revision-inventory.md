@@ -100,11 +100,12 @@ comment-marker id in the document.
   `<w:del>` with `<w:delText>`; the editor counts it as zero-width, so the caret
   steps over it, and adjacent deletions by the author merge into one.
   Deleting text inside the author's own insertion removes it outright, as Word
-  does.
+  does. Text deleted inside a hyperlink is recorded inside the link, each
+  `<w:del>` on its own side of the link's boundary (#1462).
 - **Undo** of a recorded edit restores the exact prior document in one step
   (typing coalesces into one step as it always has).
 - **Not recorded**, and edited as without tracking: paragraph marks (Enter, and
-  Backspace / Delete across a paragraph boundary), text inside a hyperlink, a
+  Backspace / Delete across a paragraph boundary), typing inside a hyperlink, a
   field or other one-unit inline, formatting, table structure and a table cell
   range's Delete. A selection across paragraphs records the deletion of its
   text in each paragraph (the paragraphs of a table between them included; the
