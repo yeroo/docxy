@@ -793,8 +793,8 @@ struct ParaInfo {
 trait Flow {
     /// A paragraph (or a flattened table) starts.
     fn begin_paragraph(&mut self, _info: ParaInfo) {}
-    /// Paragraph `p` starts: a numbered body heading counts for the chapter
-    /// prefix of the page its first line lands on.
+    /// Paragraph `p` starts: a body heading, numbered or not, counts for the
+    /// chapter prefix of the page its first line lands on.
     fn chapter_heading(&mut self, _p: &Paragraph) {}
     /// Advance to the next line of height `lh`; returns the column's left x,
     /// the column's width and the line's baseline.
