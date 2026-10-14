@@ -152,30 +152,25 @@ pub fn tiled_block(
 /// its text exactly, and a shared formula held verbatim is left alone, as an
 /// insert or delete leaves it.
 pub fn move_refs(wb: &mut Workbook, src: usize, mv: &CellMove) {
-    let held: Vec<_> = wb
-        .sheets
-        .iter_mut()
-        .map(|s| std::mem::take(&mut s.validations))
-        .collect();
-    move_refs_with(wb, src, mv, |_, _| true);
-    for (sheet, rules) in wb.sheets.iter_mut().zip(held) {
-        sheet.validations = rules;
-    }
+    move_refs_with(wb, src, mv, |_, _| true, false);
 }
 
-/// [`move_refs`], rewriting only the conditional-format and validation rules
-/// `rules` takes (given the rule's sheet and ranges): a move that leaves
-/// some rules' ranges in place (the data form's Delete) leaves their
+/// Rewrite every formula in the workbook for the move `mv` of the cells in
+/// `mv.rect` on sheet `src`, as [`move_refs`] does, but of the
+/// conditional-format rules (and, with `validations`, the validation rules)
+/// only those `rules` takes, given the rule's sheet and ranges: a move that
+/// leaves some rules' ranges in place (the data form's Delete) leaves their
 /// formulas too, so each keeps reading relative to its own range.
 pub(super) fn move_refs_with(
     wb: &mut Workbook,
     src: usize,
     mv: &CellMove,
     rules: impl Fn(usize, &[Area]) -> bool,
+    validations: bool,
 ) {
     let names: Vec<String> = wb.sheets.iter().map(|s| s.name.clone()).collect();
     let (r0, c0, r1, c1) = mv.rect;
-    rewrite_workbook_formulas(wb, rules, |e, site| {
+    rewrite_workbook_formulas(wb, rules, validations, |e, site| {
         let (sheet, cell) = (site.sheet, site.cell);
         let moved = sheet == Some(src)
             && cell.is_some_and(|(r, c)| (r0..=r1).contains(&r) && (c0..=c1).contains(&c));

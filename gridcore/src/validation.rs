@@ -1443,8 +1443,8 @@ fn pin_names(e: &Expr, wb: &Workbook, src: usize, dst: usize) -> Option<Expr> {
     })
 }
 
-/// `dv`'s settings with formulas `f1`, `f2` (written for the corner of the
-/// ranges they are added to) and no element of its own.
+/// `dv`'s settings with formulas `formula1`, `formula2` (written for the
+/// corner of the ranges they are added to) and no element of its own.
 fn with_formulas(dv: &DataValidation, formula1: String, formula2: String) -> DataValidation {
     DataValidation {
         ranges: Vec::new(),
@@ -3189,7 +3189,11 @@ mod tests {
             &[("A5", Some("Sheet2!C5>A4")), ("A6", Some("A6>Sheet2!C5"))],
         );
         // Nothing of a cut without rules is kept back.
-        assert!(!cut(&mut wb, 0, "D1", 1, "D1"));
+        let none = CellMove {
+            rect: area("D1"),
+            ..mv
+        };
+        assert!(!cut_rules(&mut wb, 0, 1, &none, false));
     }
 
     #[test]

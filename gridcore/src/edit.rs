@@ -1117,7 +1117,9 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
     // too (a list on another sheet). Only one the rename touches is
     // reprinted, so the loaded spelling stays otherwise.
     for sheet in &mut wb.sheets {
-        for_each_rule_formula(sheet, |_, src| rename_sheet_in_rule(src, &old, new_name));
+        for_each_rule_formula(sheet, true, |_, src| {
+            rename_sheet_in_rule(src, &old, new_name)
+        });
     }
     // A chart's refs name their sheet the same way, and a save writes them back
     // out as `<c:f>` — left behind, they'd point at a sheet that no longer
@@ -1723,6 +1725,7 @@ fn delete_table_columns(wb: &mut Workbook, idx: usize, shift: &EditShift) {
             rewrite_workbook_formulas(
                 wb,
                 |_, _| true,
+                true,
                 |e, site| crate::formula::delete_table_in_expr(e, &t.name, inside(site)),
             );
             wb.tables.remove(i);
@@ -1735,6 +1738,7 @@ fn delete_table_columns(wb: &mut Workbook, idx: usize, shift: &EditShift) {
         rewrite_workbook_formulas(
             wb,
             |_, _| true,
+            true,
             |e, site| {
                 crate::formula::delete_table_columns_in_expr(
                     e,
@@ -1766,14 +1770,22 @@ fn delete_table_columns(wb: &mut Workbook, idx: usize, shift: &EditShift) {
     }
 }
 
-/// Every conditional-formatting and data-validation formula on `sheet`.
-fn for_each_rule_formula(sheet: &mut Sheet, mut f: impl FnMut(&[Area], &mut String)) {
+/// Every conditional-formatting formula on `sheet`, and with `validations`
+/// every data-validation formula too.
+fn for_each_rule_formula(
+    sheet: &mut Sheet,
+    validations: bool,
+    mut f: impl FnMut(&[Area], &mut String),
+) {
     for cf in &mut sheet.cond_formats {
         for rule in &mut cf.rules {
             for src in rule.formulas_mut() {
                 f(&cf.ranges, src);
             }
         }
+    }
+    if !validations {
+        return;
     }
     for dv in &mut sheet.validations {
         f(&dv.ranges, &mut dv.formula1);
@@ -2142,6 +2154,7 @@ pub fn sync_table_headers(wb: &mut Workbook, sheet: usize, cells: &[(u32, u32)])
             rewrite_workbook_formulas(
                 wb,
                 |_, _| true,
+                true,
                 |e, site| {
                     let inside = site.inside(&t);
                     crate::formula::rename_table_columns_in_expr(e, &t.name, inside, &map)
@@ -2225,12 +2238,14 @@ impl FormulaSite<'_> {
 /// Rewrite every formula a table edit can reach (a table or column rename, a
 /// conversion, a column delete through a table): cell
 /// formulas (array formulas included), defined names, and the
-/// conditional-format and data-validation rules `rules` takes (given the
-/// rule's sheet and ranges). A formula `f` leaves unchanged keeps its text
-/// exactly; one held verbatim (a shared or data-table formula) is left alone.
+/// conditional-format rules `rules` takes (given the rule's sheet and
+/// ranges), and with `validations` the data-validation rules it takes too.
+/// A formula `f` leaves unchanged keeps its text exactly; one held verbatim
+/// (a shared or data-table formula) is left alone.
 fn rewrite_workbook_formulas(
     wb: &mut Workbook,
     rules: impl Fn(usize, &[Area]) -> bool,
+    validations: bool,
     f: impl Fn(&Expr, FormulaSite<'_>) -> Expr,
 ) {
     let at = |sheet, cell| FormulaSite {
@@ -2250,7 +2265,7 @@ fn rewrite_workbook_formulas(
                 cell.formula = Some(updated);
             }
         }
-        for_each_rule_formula(sheet, |ranges, src| {
+        for_each_rule_formula(sheet, validations, |ranges, src| {
             if !rules(s, ranges) {
                 return;
             }
@@ -2327,6 +2342,7 @@ pub fn rename_table(wb: &mut Workbook, old: &str, new: &str) -> Result<(), Strin
     rewrite_workbook_formulas(
         wb,
         |_, _| true,
+        true,
         |e, _| crate::formula::rename_tables_in_expr(e, &map),
     );
     for piv in &mut wb.pivots {
@@ -2729,6 +2745,7 @@ pub fn convert_table_to_range(wb: &mut Workbook, name: &str) -> Result<(), Strin
     rewrite_workbook_formulas(
         wb,
         |_, _| true,
+        true,
         |e, site| {
             let host = crate::formula::FormulaHost {
                 same_sheet: site.sheet == Some(t.sheet),
