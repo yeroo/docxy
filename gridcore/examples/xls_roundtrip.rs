@@ -7,8 +7,9 @@
 //!
 //! `--synthetic` writes a small `.xlsx` of what the corpus lacks, for the
 //! script to write as `.xls` and compare in Excel: dynamic arrays (a
-//! SEQUENCE spill, SORT, FILTER), a text-valued legacy array, a custom
-//! colour and a bordered cell.
+//! SEQUENCE spill, SORT, FILTER), a text-valued legacy array, a frozen
+//! legacy array a formula was typed into, a custom colour and a bordered
+//! cell.
 
 use gridcore::sheet::{Cell, Xf};
 
@@ -60,6 +61,16 @@ fn synthetic() -> gridcore::xlsx::SheetPackage {
     ] {
         engine.set_cell(wb, (0, 0, col), f(src));
     }
+    // A frozen legacy array {=A1:A3*2} over I1:I3 with `=5` typed into I2:
+    // the array keeps I1 alone, I2 its own formula.
+    let s = &mut wb.sheets[0];
+    let mut cse = f("A1:A3*2");
+    cse.value = gridcore::sheet::CellValue::Number(10.0);
+    cse.f_attrs = Some(" t=\"array\" ref=\"I1:I3\"".into());
+    s.set_cell(0, 8, cse);
+    let mut five = f("5");
+    five.value = gridcore::sheet::CellValue::Number(5.0);
+    s.set_cell(1, 8, five);
     pkg
 }
 

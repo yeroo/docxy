@@ -2,7 +2,7 @@
 # and computes the same values from it. For each .xls in corpus/legacy (and
 # its extra/ and addin/ folders), and each .xlsx in corpus/xlsx (a Save As
 # Excel 97-2003 Workbook from a workbook), and a synthetic .xlsx of what the
-# corpus lacks (dynamic arrays, a text legacy array, colours), this:
+# corpus lacks (dynamic arrays, legacy arrays, colours), this:
 #
 #   1. reads it with gridcore and writes it as .xls (the xls_roundtrip
 #      example, which also runs the writer's structural check);
@@ -101,8 +101,8 @@ function Compare-Cells($a, $b, $allowed) {
 }
 
 # What the corpus lacks, built by the example: dynamic arrays (a SEQUENCE
-# spill, SORT, FILTER), a text-valued legacy array, a custom colour and a
-# bordered cell.
+# spill, SORT, FILTER), a text-valued legacy array, a frozen legacy array a
+# formula was typed into, a custom colour and a bordered cell.
 $synthetic = Join-Path $Out "synthetic.xlsx"
 & $tool --synthetic $synthetic
 if ($LASTEXITCODE -ne 0) { throw "writing $synthetic failed" }
