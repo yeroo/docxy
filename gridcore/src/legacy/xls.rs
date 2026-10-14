@@ -313,6 +313,57 @@ struct Styles {
     codes: HashMap<u16, String>,
     /// XF index → `book.xfs` index, for the XFs made so far.
     made: HashMap<u16, u32>,
+    /// XFEXT's colours by XF index.
+    ext: HashMap<u16, XfExt>,
+}
+
+/// What an XFEXT says of an XF beyond its palette indices.
+#[derive(Default)]
+struct XfExt {
+    /// The fill's and the text's exact colours (xclrType 2), which replace
+    /// the palette's nearest.
+    fill: Option<(u8, u8, u8)>,
+    color: Option<(u8, u8, u8)>,
+    /// A theme colour other than the default text's (theme 1, no tint):
+    /// the palette's nearest is kept, the theme is lost.
+    theme: bool,
+    /// A gradient fill.
+    gradient: bool,
+}
+
+impl XfExt {
+    /// An XFEXT's ExtProp array (`cexts` of them); a malformed one ends
+    /// the read with what came before it.
+    fn read(c: &mut Cur, cexts: u16) -> XfExt {
+        let mut e = XfExt::default();
+        for _ in 0..cexts {
+            let (Some(ty), Some(cb)) = (c.u16(), c.u16()) else {
+                break;
+            };
+            let Some(body) = (cb as usize).checked_sub(4).and_then(|n| c.take(n)) else {
+                break;
+            };
+            // FullColorExt: xclrType, nTintShade, xclrValue.
+            let color = (body.len() >= 8).then(|| {
+                let kind = u16::from_le_bytes([body[0], body[1]]);
+                let tint = i16::from_le_bytes([body[2], body[3]]);
+                let value = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+                (kind, tint, value, (body[4], body[5], body[6]))
+            });
+            match (ty, color) {
+                // Cell (pattern foreground) and text colours.
+                (4 | 13, Some((kind, tint, value, rgb))) => match kind {
+                    2 if ty == 4 => e.fill = Some(rgb),
+                    2 => e.color = Some(rgb),
+                    3 if !(ty == 13 && value == 1 && tint == 0) => e.theme = true,
+                    _ => {}
+                },
+                (6, _) => e.gradient = true,
+                _ => {}
+            }
+        }
+        e
+    }
 }
 
 impl Styles {
@@ -331,7 +382,21 @@ impl Styles {
         }
         let i = match self.xfs.get(ixfe as usize) {
             Some(raw) => {
-                let xf = self.xf(raw, &mut book.dropped);
+                let mut xf = self.xf(raw, &mut book.dropped);
+                if let Some(e) = self.ext.get(&ixfe) {
+                    if xf.fill.is_some() {
+                        xf.fill = e.fill.or(xf.fill);
+                    }
+                    if let Some(c) = e.color {
+                        xf.color = (c != (0, 0, 0)).then_some(c);
+                    }
+                    if e.theme {
+                        book.dropped.insert("theme colors");
+                    }
+                    if e.gradient {
+                        book.dropped.insert("patterned fills");
+                    }
+                }
                 book.add_xf(xf)
             }
             None => 0,
@@ -442,22 +507,24 @@ impl Styles {
 const GLOBALS_KNOWN: &[u16] = &[
     // Read.
     0x000E, 0x0012, 0x0017, 0x0018, 0x0019, 0x0022, 0x0023, 0x002F, 0x0031, 0x003D, 0x0040, 0x005B,
-    0x0085, 0x008D, 0x0092, 0x00E0, 0x00FC, 0x01A9, 0x01AE, 0x01AF, 0x0293, 0x041E,
-    // CONTINUE (joined to its record), BOF.
+    0x0085, 0x008D, 0x0092, 0x00E0, 0x00FC, 0x01A9, 0x01AE, 0x01AF, 0x0293, 0x041E, 0x00DA, 0x0863,
+    0x087D, 0x088C, // CONTINUE (joined to its record), BOF.
     0x003C, 0x0809,
     // PASSWORD (PROTECT's hash; PROTECT is named), CODEPAGE, XCT and CRN
     // (another workbook's cached cells: formulas into it are counted),
-    // WRITEACCESS, COUNTRY, FNGROUPCOUNT, MMS, BOOKBOOL, INTERFACEHDR,
+    // WRITEACCESS, COUNTRY, FNGROUPCOUNT, MMS, INTERFACEHDR,
     // INTERFACEEND.
-    0x0013, 0x0042, 0x0059, 0x005A, 0x005C, 0x008C, 0x009C, 0x00C1, 0x00DA, 0x00E1, 0x00E2,
-    // MSODRAWINGGROUP and its 0x0866 continuation (the drawings are named
-    // where a sheet has them), EXTSST, TABID, USESELFS, DSF, REFRESHALL,
+    0x0013, 0x0042, 0x0059, 0x005A, 0x005C, 0x008C, 0x009C, 0x00C1, 0x00E1, 0x00E2,
+    // MSODRAWINGGROUP, and HFPICTURE with the drawing group
+    // (fIsDrawingGroup), which Excel writes beside it: the drawings, and a
+    // sheet's own header and footer pictures (its HFPICTURE), are named
+    // where a sheet has them. EXTSST, TABID, USESELFS, DSF, REFRESHALL,
     // PROT4REVPASS (PROT4REV's hash), EXCEL9FILE, RECALCID.
     0x00EB, 0x0866, 0x00FF, 0x013D, 0x0160, 0x0161, 0x01B7, 0x01BC, 0x01C0, 0x01C1,
-    // BOOKEXT, XFCRC, XFEXT (the XF's colours as themes: the XF's own
-    // are read), COMPAT12, TABLESTYLES, STYLEEXT, THEME, MTRSETTINGS,
+    // XFCRC (XFEXT's checksum), TABLESTYLES, STYLEEXT, THEME (the theme
+    // XFEXT's theme colours resolve with; those are named), MTRSETTINGS,
     // COMPRESSPICTURES, FORCEFULLCALCULATION.
-    0x0863, 0x087C, 0x087D, 0x088C, 0x088E, 0x0892, 0x0896, 0x089A, 0x089B, 0x08A3,
+    0x087C, 0x088E, 0x0892, 0x0896, 0x089A, 0x089B, 0x08A3,
 ];
 
 /// A worksheet's records, as [`GLOBALS_KNOWN`] is the globals'.
@@ -468,18 +535,17 @@ const SHEET_KNOWN: &[u16] = &[
     0x0084, 0x0099, 0x009D, 0x00A0, 0x00A1, 0x00AE, 0x00B0, 0x00BD, 0x00BE, 0x00E5, 0x00E9, 0x00EC,
     0x00FD, 0x01AA, 0x01AD, 0x01B0, 0x01B1, 0x01B2, 0x01B8, 0x01BE, 0x0201, 0x0204, 0x0205, 0x0207,
     0x0208, 0x0221, 0x0225, 0x0236, 0x023E, 0x027E, 0x04BC, 0x0862, 0x0868, 0x0872, 0x0879, 0x087A,
-    0x088B, // CONTINUE, and USERSVIEWEND (its view's BEGIN is named).
+    0x088B, 0x005F, 0x0866, 0x089C,
+    // CONTINUE, and USERSVIEWEND (its view's BEGIN is named).
     0x003C, 0x01AB,
-    // PASSWORD (PROTECT's hash), SELECTION, SAVERECALC, GUTS (the outline
-    // gutters' size), GRIDSET, OBJPROTECT and SCENPROTECT (PROTECT's
-    // parts), DBCELL, DIMENSIONS, INDEX, TXO (a note's text: notes are
-    // named).
-    0x0013, 0x001D, 0x005F, 0x0080, 0x0082, 0x0063, 0x00DD, 0x00D7, 0x0200, 0x020B, 0x01B6,
-    // FEATHDR, FEATHDR11 and LIST12 (FEAT and FEATURE11 are named), the
-    // HEADERFOOTER extension (the header and footer text is in HEADER and
-    // FOOTER), and 0x01C2, which Excel writes beside spilled dynamic
-    // arrays (the arrays are read from their ARRAY records).
-    0x0867, 0x0871, 0x0877, 0x089C, 0x01C2,
+    // PASSWORD (PROTECT's hash), SELECTION, GUTS (the outline gutters'
+    // size), GRIDSET, OBJPROTECT and SCENPROTECT (PROTECT's parts),
+    // DBCELL, DIMENSIONS, INDEX, TXO (a note's text: notes are named).
+    0x0013, 0x001D, 0x0080, 0x0082, 0x0063, 0x00DD, 0x00D7, 0x0200, 0x020B, 0x01B6,
+    // FEATHDR, FEATHDR11 and LIST12 (FEAT and FEATURE11 are named), and
+    // 0x01C2, which Excel writes beside spilled dynamic arrays (the arrays
+    // are read from their ARRAY records).
+    0x0867, 0x0871, 0x0877, 0x01C2,
 ];
 
 /// Read a BIFF8 `Workbook` stream.
@@ -530,6 +596,7 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
         palette: super::xls_write::DEFAULT_PALETTE,
         codes: HashMap::new(),
         made: HashMap::new(),
+        ext: HashMap::new(),
     };
     let mut itab_cur = 0usize;
 
@@ -620,6 +687,38 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
                 // PROT4REV: sharing with track changes protected.
                 0x01AF if c.u16()? != 0 => {
                     book.dropped.insert("workbook protection");
+                }
+                // XFEXT: an XF's exact and theme colours.
+                0x087D => {
+                    c.take(14)?;
+                    let ixfe = c.u16()?;
+                    c.u16()?;
+                    let cexts = c.u16()?;
+                    styles.ext.insert(ixfe, XfExt::read(&mut c, cexts));
+                }
+                // BOOKBOOL: external links' values not saved
+                // (fNoSaveSup), or their update not left to the prompt
+                // (grUpdateLinks).
+                0x00DA => {
+                    let f = c.u16()?;
+                    if f & 0x0001 != 0 || f & 0x0060 != 0 {
+                        book.dropped.insert("external link settings");
+                    }
+                }
+                // BOOKEXT: no AutoRecover (fDontAutoRecover), or personal
+                // information removed on save (fFilterPrivacy).
+                0x0863 => {
+                    c.take(16)?;
+                    if c.u32()? & 0x0005 != 0 {
+                        book.dropped.insert("workbook options");
+                    }
+                }
+                // COMPAT12: no Compatibility Checker on save.
+                0x088C => {
+                    c.take(12)?;
+                    if c.u32()? != 0 {
+                        book.dropped.insert("workbook options");
+                    }
                 }
                 // USERBVIEW: a custom view.
                 0x01A9 => {
@@ -1153,6 +1252,28 @@ fn read_sheet(
                 // REFMODE 0: R1C1 references.
                 0x000F if c.u16()? == 0 => {
                     book.dropped.insert("R1C1 reference style");
+                }
+                // HEADERFOOTER: different odd and even or first page
+                // headers, their text, or headers that don't scale with
+                // the document or align with its margins.
+                0x089C => {
+                    c.take(28)?;
+                    let flags = c.u16()?;
+                    let cch = [c.u16()?, c.u16()?, c.u16()?, c.u16()?];
+                    if flags & 0x0003 != 0
+                        || flags & 0x000C != 0x000C
+                        || cch.iter().any(|&n| n != 0)
+                    {
+                        book.dropped.insert("page setup");
+                    }
+                }
+                // SAVERECALC 0: no recalculation before saving.
+                0x005F if c.u16()? == 0 => {
+                    book.dropped.insert("workbook options");
+                }
+                // HFPICTURE: the sheet's header and footer pictures.
+                0x0866 => {
+                    book.dropped.insert("header and footer pictures");
                 }
                 // USERSVIEWBEGIN: a custom view's settings for the sheet.
                 0x01AA => {
@@ -2202,6 +2323,147 @@ pub(crate) mod tests {
             rec(0x0200, &[0; 14]),
         ];
         assert!(dropped(&plain_globals, &plain_sheet).is_empty());
+    }
+
+    /// XFEXT's exact colours replace the palette's nearest; a theme colour
+    /// (other than the default text's) and a gradient are named; a
+    /// malformed one is ignored (#874 r12).
+    #[test]
+    fn xfext_colours_are_carried_or_named() {
+        let color = |ty: u16, kind: u16, tint: i16, value: u32| {
+            let mut b = ty.to_le_bytes().to_vec();
+            b.extend(20u16.to_le_bytes());
+            b.extend(kind.to_le_bytes());
+            b.extend(tint.to_le_bytes());
+            b.extend(value.to_le_bytes());
+            b.extend([0; 8]);
+            b
+        };
+        let xfext = |props: &[Vec<u8>], cexts: u16| {
+            let mut b = vec![0u8; 12];
+            for v in [0u16, 1, 0, cexts] {
+                b.extend(v.to_le_bytes());
+            }
+            for p in props {
+                b.extend(p);
+            }
+            rec(0x087D, &b)
+        };
+        // XF 1: a solid fill in palette red (10), text in palette blue (12).
+        let mut xf1 = xf_rec(1, 0x20, 0, 1 << 26);
+        xf1[4 + 18] = 10;
+        xf1[4 + 19] = 0;
+        let fonts = vec![font_rec(400, 0, 0), {
+            let mut f = font_rec(400, 0, 0);
+            f[4 + 4] = 12;
+            f[4 + 5] = 0;
+            f
+        }];
+        let read_with_ext = |ext: Option<Vec<u8>>| {
+            let mut globals = fonts.clone();
+            globals.push(xf_rec(0, 0x20, 0, 0));
+            globals.push(xf1.clone());
+            globals.extend(ext);
+            let mut d = cell(0, 0, 1);
+            d.extend(1.0f64.to_le_bytes());
+            let book = read(&workbook(&globals, &[rec(0x0203, &d)])).unwrap();
+            let xf = book.xfs[data(&book)[&(0, 0)].style as usize].clone();
+            let dropped: Vec<&str> = book.dropped.iter().copied().collect();
+            (xf.fill, xf.color, dropped)
+        };
+        let red = Some((0xFF, 0, 0));
+        let blue = Some((0, 0, 0xFF));
+        assert_eq!(read_with_ext(None), (red, blue, vec![]));
+        // Exact RGB colours (LongRGBA: r, g, b, a).
+        let ext = xfext(
+            &[color(4, 2, 0, 0x00_563412), color(13, 2, 0, 0x00_ABCDEF)],
+            2,
+        );
+        assert_eq!(
+            read_with_ext(Some(ext)),
+            (Some((0x12, 0x34, 0x56)), Some((0xEF, 0xCD, 0xAB)), vec![])
+        );
+        // The default text colour (theme 1, no tint) is no loss; another
+        // theme colour is, as is a tinted one, and a gradient.
+        assert_eq!(
+            read_with_ext(Some(xfext(&[color(13, 3, 0, 1)], 1))).2,
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            read_with_ext(Some(xfext(&[color(4, 3, 0, 4)], 1))).2,
+            ["theme colors"]
+        );
+        assert_eq!(
+            read_with_ext(Some(xfext(&[color(13, 3, 0x2000, 1)], 1))).2,
+            ["theme colors"]
+        );
+        let mut gradient = 6u16.to_le_bytes().to_vec();
+        gradient.extend(8u16.to_le_bytes());
+        gradient.extend([0; 4]);
+        assert_eq!(
+            read_with_ext(Some(xfext(&[gradient], 1))).2,
+            ["patterned fills"]
+        );
+        // Malformed: a cb past the record, or more exts than it holds.
+        let mut bad = color(4, 2, 0, 0x00_563412);
+        bad[2] = 200;
+        assert_eq!(read_with_ext(Some(xfext(&[bad], 1))), (red, blue, vec![]));
+        assert_eq!(
+            read_with_ext(Some(xfext(&[color(4, 2, 0, 0x00_563412)], 5))).0,
+            Some((0x12, 0x34, 0x56))
+        );
+    }
+
+    /// Header and footer, link and workbook options (#874 r12).
+    #[test]
+    fn header_footer_and_workbook_options_are_named() {
+        let frt = |ty: u16, tail: &[u8]| {
+            let mut b = vec![0u8; 12];
+            b.extend_from_slice(tail);
+            rec(ty, &b)
+        };
+        let hf = |flags: u16, cch: [u16; 4]| {
+            let mut b = vec![0u8; 16];
+            b.extend(flags.to_le_bytes());
+            for n in cch {
+                b.extend(n.to_le_bytes());
+            }
+            frt(0x089C, &b)
+        };
+        let names = |globals: &[Vec<u8>], sheet: &[Vec<u8>]| {
+            let book = read(&workbook(globals, sheet)).unwrap();
+            assert!(book.unknown_records.is_empty());
+            book.dropped.iter().copied().collect::<Vec<_>>()
+        };
+        for (r, want) in [
+            (hf(0x000D, [0; 4]), "page setup"),
+            (hf(0x000E, [0; 4]), "page setup"),
+            (hf(0x0008, [0; 4]), "page setup"),
+            (hf(0x000C, [0, 5, 0, 0]), "page setup"),
+            (rec(0x005F, &[0, 0]), "workbook options"),
+            (frt(0x0866, &[1, 0]), "header and footer pictures"),
+        ] {
+            assert_eq!(names(&[], &[r]), [want]);
+        }
+        for (r, want) in [
+            (rec(0x00DA, &[1, 0]), "external link settings"),
+            (rec(0x00DA, &[0x20, 0]), "external link settings"),
+            (frt(0x0863, &[22, 0, 0, 0, 1, 0, 0, 0]), "workbook options"),
+            (frt(0x0863, &[22, 0, 0, 0, 4, 0, 0, 0]), "workbook options"),
+            (frt(0x088C, &[1, 0, 0, 0]), "workbook options"),
+        ] {
+            assert_eq!(names(&[r], &[]), [want]);
+        }
+        // Excel's defaults, as the corpus has them (HEADERFOOTER's high
+        // bits are left over and ignored).
+        let globals = [
+            rec(0x00DA, &[0, 0]),
+            frt(0x0863, &[22, 0, 0, 0, 0, 0, 0, 0, 2, 0]),
+            frt(0x088C, &[0; 4]),
+            frt(0x0866, &[2, 0]),
+        ];
+        let sheet = [hf(0x60CC, [0; 4]), hf(0x333C, [0; 4]), rec(0x005F, &[1, 0])];
+        assert!(names(&globals, &sheet).is_empty());
     }
 
     /// Streams and storages beside the Workbook stream are named (#874 r11).

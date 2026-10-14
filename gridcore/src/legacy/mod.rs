@@ -178,31 +178,22 @@ pub fn open_workbook_ex(data: &[u8]) -> Result<Opened, OpenError> {
             .find_map(|n| cfb.read_stream(n))
             .ok_or(OpenError::NotSpreadsheet)?;
         let mut book = xls::read(&stream)?;
-        if cfb
-            .paths()
-            .iter()
-            .any(|p| p.to_ascii_lowercase().starts_with("_vba_project_cur"))
-        {
-            book.dropped.insert("VB project");
-        }
-        // Title, author and the rest: property-set streams the import
-        // doesn't read.
-        if has("\u{5}SummaryInformation") || has("\u{5}DocumentSummaryInformation") {
-            book.dropped.insert("document properties");
-        }
-        // Every other stream and storage, by its top-level name.
+        // Every stream and storage beside the Workbook stream, by its
+        // top-level name.
         let mut other: BTreeSet<String> = BTreeSet::new();
         for path in cfb.paths() {
             let top = path.split(['/', '\\']).next().unwrap_or(&path);
             let lower = top.to_ascii_lowercase();
             match lower.as_str() {
-                "workbook"
-                | "book"
-                | "\u{5}summaryinformation"
-                | "\u{5}documentsummaryinformation"
-                | "\u{1}compobj"
-                | "\u{1}ole"
-                | "_vba_project_cur" => {}
+                "workbook" | "book" | "\u{1}compobj" | "\u{1}ole" => {}
+                // Title, author and the rest: property-set streams the
+                // import doesn't read.
+                "\u{5}summaryinformation" | "\u{5}documentsummaryinformation" => {
+                    book.dropped.insert("document properties");
+                }
+                "_vba_project_cur" => {
+                    book.dropped.insert("VB project");
+                }
                 // A PivotTable's cache.
                 "_sx_db_cur" => {
                     book.dropped.insert("PivotTables");
