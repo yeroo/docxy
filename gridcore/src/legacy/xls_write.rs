@@ -190,7 +190,8 @@ impl Loss {
 pub fn write_xls(pkg: &SheetPackage) -> XlsOut {
     let wb = &pkg.workbook;
     let mut lost: BTreeMap<Loss, usize> = BTreeMap::new();
-    let styles = StyleTable::new(wb, &loaded_extras(pkg), &mut lost);
+    let extras = loaded_extras(pkg);
+    let styles = StyleTable::new(wb, &extras, &mut lost);
     let mut refs = Refs::new(pkg);
 
     // Defined names first: their NAME records come first, so the indices
@@ -234,7 +235,7 @@ pub fn write_xls(pkg: &SheetPackage) -> XlsOut {
     }
 
     let mut out: Vec<String> = lost.into_iter().map(|(kind, n)| kind.describe(n)).collect();
-    out.extend(unsupported_features(pkg));
+    out.extend(unsupported_features(pkg, &extras));
     XlsOut {
         bytes: opccore::cfb::write_cfb(&[("Workbook", book)]),
         lost: out,
@@ -243,7 +244,7 @@ pub fn write_xls(pkg: &SheetPackage) -> XlsOut {
 
 /// The model features this writer has no records for, in Excel's words,
 /// each named once when the workbook has any.
-fn unsupported_features(pkg: &SheetPackage) -> Vec<String> {
+fn unsupported_features(pkg: &SheetPackage, extras: &[crate::xlsx::LoadedXfExtras]) -> Vec<String> {
     let wb = &pkg.workbook;
     let any = |f: &dyn Fn(&Sheet) -> bool| wb.sheets.iter().any(f);
     let mut out: Vec<&str> = Vec::new();
@@ -297,7 +298,6 @@ fn unsupported_features(pkg: &SheetPackage) -> Vec<String> {
     // What a loaded .xlsx format has beyond the model's xf (its border,
     // underline, vertical alignment, ...), which the .xlsx writer keeps
     // through `Xf::loaded_from` and this writer can't.
-    let extras = loaded_extras(pkg);
     for &i in &used {
         let Some(e) = wb
             .styles
@@ -311,6 +311,13 @@ fn unsupported_features(pkg: &SheetPackage) -> Vec<String> {
             if !out.contains(&what) {
                 out.push(what);
             }
+        }
+    }
+    // Workbook and sheet settings the .xlsx writer keeps from the loaded
+    // parts and this writer has no record for.
+    for what in crate::xlsx::settings_xls_lacks(pkg) {
+        if !out.contains(&what) {
+            out.push(what);
         }
     }
     // A column's or row's own format (`<col style>`, `<row s>`).
@@ -2505,6 +2512,128 @@ mod tests {
             .row_attrs
             .insert(0, " s=\"1\" customFormat=\"1\"".into());
         assert_eq!(write_xls(&pkg).lost, ["column and row formats"]);
+    }
+
+    /// A loaded thin box in red is written as the box, its colour named
+    /// lost, by the .xls import's rule (#874 r9).
+    #[test]
+    fn a_loaded_coloured_thin_box_is_written_and_its_colour_named() {
+        let side = |s: &str| format!(r#"<{s} style="thin"><color rgb="FFFF0000"/></{s}>"#);
+        let styles = format!(
+            r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="2"><border/><border>{}{}{}{}<diagonal/></border></borders><cellXfs count="2"><xf fontId="0" fillId="0" borderId="0"/><xf fontId="0" fillId="0" borderId="1"/></cellXfs></styleSheet>"#,
+            side("left"),
+            side("right"),
+            side("top"),
+            side("bottom")
+        );
+        let mut pkg = book(&[]);
+        pkg.set_part("xl/styles.xml", styles.into_bytes());
+        let style = pkg.workbook.styles.intern(Xf {
+            loaded_from: Some(1),
+            ..Xf::default()
+        });
+        pkg.workbook.sheets[0].set_cell(
+            0,
+            0,
+            Cell {
+                style,
+                ..Cell::number(1.0)
+            },
+        );
+        let (back, lost) = round(&pkg);
+        assert_eq!(lost, ["borders other than a thin box"]);
+        let wb = &back.workbook;
+        assert!(wb.styles.xf(wb.sheets[0].cells[&(0, 0)].style).border);
+    }
+
+    /// Workbook and sheet settings a loaded .xlsx keeps in its parts, which
+    /// the model doesn't hold, are named in the import's words (#874 r9).
+    #[test]
+    fn loaded_workbook_and_sheet_settings_are_named() {
+        let with = |workbook: &str, sheet: &str| {
+            let mut pkg = book(&[(0, 0, Cell::number(1.0))]);
+            let wb = String::from_utf8(pkg.part("xl/workbook.xml").unwrap().to_vec()).unwrap();
+            pkg.set_part(
+                "xl/workbook.xml",
+                wb.replace("</workbook>", &format!("{workbook}</workbook>"))
+                    .into_bytes(),
+            );
+            let name = pkg.sheet_parts[0].clone();
+            let ws = String::from_utf8(pkg.part(&name).unwrap().to_vec()).unwrap();
+            pkg.set_part(
+                &name,
+                ws.replacen("<sheetData", &format!("{sheet}<sheetData"), 1)
+                    .into_bytes(),
+            );
+            write_xls(&pkg).lost
+        };
+        let cases: [(&str, &str, &str); 11] = [
+            (
+                r#"<workbookProtection lockStructure="1"/>"#,
+                "",
+                "workbook protection",
+            ),
+            (
+                r#"<fileSharing readOnlyRecommended="1"/>"#,
+                "",
+                "password to modify and read-only recommendation",
+            ),
+            (
+                r#"<calcPr calcId="191029" calcMode="manual"/>"#,
+                "",
+                "manual calculation",
+            ),
+            (
+                r#"<calcPr calcMode="autoNoTable"/>"#,
+                "",
+                "automatic calculation except data tables",
+            ),
+            (
+                r#"<calcPr fullPrecision="0"/>"#,
+                "",
+                "precision as displayed",
+            ),
+            (
+                r#"<definedNames><definedName name="Secret" hidden="1">Sheet1!$A$1</definedName></definedNames>"#,
+                "",
+                "hidden defined names (saved as visible)",
+            ),
+            (
+                r#"<sheets><sheet name="X" sheetId="9" state="veryHidden" r:id="rId9"/></sheets>"#,
+                "",
+                "very hidden sheets (saved as hidden)",
+            ),
+            (
+                "",
+                r#"<sheetViews><sheetView rightToLeft="1" workbookViewId="0"/></sheetViews>"#,
+                "sheet view settings",
+            ),
+            (
+                "",
+                r#"<sheetViews><sheetView showGridLines="0" workbookViewId="0"/></sheetViews>"#,
+                "sheet view settings",
+            ),
+            (
+                "",
+                r#"<sheetViews><sheetView zoomScale="85" workbookViewId="0"/></sheetViews>"#,
+                "sheet view settings",
+            ),
+            (
+                "",
+                r#"<sheetPr><tabColor rgb="FFFF0000"/></sheetPr>"#,
+                "sheet tab colors",
+            ),
+        ];
+        for (workbook, sheet, want) in cases {
+            assert_eq!(with(workbook, sheet), [want], "{workbook}{sheet}");
+        }
+        // Their defaults, a built-in hidden name and a function's are none.
+        let plain = with(
+            r#"<workbookProtection lockStructure="0"/><calcPr calcId="191029" calcMode="auto" fullPrecision="1"/><definedNames><definedName name="_xlnm._FilterDatabase" hidden="1">Sheet1!$A$1</definedName><definedName name="F" function="1" hidden="1">Sheet1!$A$1</definedName></definedNames>"#,
+            r#"<sheetViews><sheetView zoomScale="100" showGridLines="1" workbookViewId="0"/></sheetViews>"#,
+        );
+        // (The function name is named as a macro function, not as hidden.)
+        assert_eq!(plain, ["Excel 4.0 function stored in defined names"]);
     }
 
     /// Excel's number formats by id: the fixed ones as the id alone, the

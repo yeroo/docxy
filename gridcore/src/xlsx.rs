@@ -1467,24 +1467,10 @@ pub(crate) struct LoadedXfExtras {
 /// [`LoadedXfExtras`] of each `<cellXfs>` entry of styles part `xml`, by
 /// index.
 pub(crate) fn loaded_xf_extras(xml: &str) -> Vec<LoadedXfExtras> {
-    let section = |name: &str, child: &str| -> Vec<&str> {
-        let Some(start) = xml
-            .find(&format!("<{name}"))
-            .filter(|&s| xml[s + name.len() + 1..].starts_with([' ', '>', '/', '\t', '\r', '\n']))
-        else {
-            return Vec::new();
-        };
-        let part = &xml[start..];
-        element_children(part)
-            .into_iter()
-            .filter(|(n, _, _)| n == child)
-            .map(|(_, s, e)| &part[s..e])
-            .collect()
-    };
     let (fonts, fills, borders) = (
         font_elements(xml),
-        section("fills", "fill"),
-        section("borders", "border"),
+        section_children(xml, "fills", "fill"),
+        section_children(xml, "borders", "border"),
     );
     let open = |raw: &str| raw[..raw.find('>').map_or(raw.len(), |e| e + 1)].to_string();
     let attr = |raw: &str, name: &str| tag_attr(&open(raw), name).map(str::to_string);
@@ -1534,20 +1520,36 @@ pub(crate) fn loaded_xf_extras(xml: &str) -> Vec<LoadedXfExtras> {
                 let mut sides = std::collections::HashMap::new();
                 for (name, raw) in child_elements(border) {
                     let style = attr(&raw, "style").unwrap_or_default();
-                    // A side's colour: automatic, black, or another.
+                    // A side's colour keeps in the .xls's black box, by the
+                    // .xls import's own rule; a theme colour doesn't.
                     let plain = child_elements(&raw).iter().all(|(c, r)| {
-                        c != "color"
-                            || on(attr(r, "auto"))
-                            || attr(r, "rgb").is_some_and(|v| v.ends_with("000000"))
-                            || attr(r, "indexed").is_some_and(|v| v == "8" || v == "64")
+                        let rgb = || -> Option<Option<(u8, u8, u8)>> {
+                            if on(attr(r, "auto")) {
+                                return Some(None);
+                            }
+                            if let Some(v) = attr(r, "rgb") {
+                                let v =
+                                    u32::from_str_radix(v.get(v.len().saturating_sub(6)..)?, 16)
+                                        .ok()?;
+                                return Some(Some(((v >> 16) as u8, (v >> 8) as u8, v as u8)));
+                            }
+                            if let Some(v) = attr(r, "indexed") {
+                                return Some(crate::legacy::default_icv_rgb(v.parse().ok()?));
+                            }
+                            attr(r, "theme").is_none().then_some(None)
+                        };
+                        c != "color" || rgb().is_some_and(crate::legacy::plain_border_color)
                     });
                     sides.insert(name, (style, plain));
                 }
                 let side = |n: &str| sides.get(n).cloned().unwrap_or_default();
                 let box_sides = ["left", "right", "top", "bottom"].map(side);
                 let diagonal = !side("diagonal").0.is_empty();
-                if box_sides.iter().all(|(s, plain)| s == "thin" && *plain) && !diagonal {
+                if box_sides.iter().all(|(s, _)| s == "thin") && !diagonal {
                     thin_box = true;
+                    if !box_sides.iter().all(|(_, plain)| *plain) {
+                        push("borders other than a thin box");
+                    }
                 } else if box_sides.iter().any(|(s, _)| !s.is_empty()) || diagonal {
                     push("borders other than a thin box");
                 }
@@ -1582,18 +1584,124 @@ pub(crate) fn loaded_xf_extras(xml: &str) -> Vec<LoadedXfExtras> {
 /// lives outside `<fonts>` and is not one of them). Read with the loader's
 /// parser ([`element_children`]), so comments and prefixes are no trouble.
 fn font_elements(xml: &str) -> Vec<&str> {
+    section_children(xml, "fonts", "font")
+}
+
+/// The raw `<child>` elements of the first `<section>` of `xml`, in order.
+fn section_children<'a>(xml: &'a str, section: &str, child: &str) -> Vec<&'a str> {
     let Some(start) = xml
-        .find("<fonts")
-        .filter(|&s| xml[s + 6..].starts_with([' ', '>', '/', '\t', '\r', '\n']))
+        .find(&format!("<{section}"))
+        .filter(|&s| xml[s + section.len() + 1..].starts_with([' ', '>', '/', '\t', '\r', '\n']))
     else {
         return Vec::new();
     };
-    let fonts = &xml[start..];
-    element_children(fonts)
+    let part = &xml[start..];
+    element_children(part)
         .into_iter()
-        .filter(|(name, _, _)| name == "font")
-        .map(|(_, s, e)| &fonts[s..e])
+        .filter(|(name, _, _)| name == child)
+        .map(|(_, s, e)| &part[s..e])
         .collect()
+}
+
+/// The workbook and sheet settings of `pkg`'s loaded parts that an `.xls`
+/// written from it loses, in the words the `.xls` import names them in:
+/// workbook protection, a read-only recommendation or password to modify,
+/// the calculation mode and precision, very hidden sheets, hidden defined
+/// names, and each sheet's view settings and tab colour. The model holds
+/// none of them; the `.xlsx` writer keeps them from the parts.
+pub(crate) fn settings_xls_lacks(pkg: &SheetPackage) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    let mut push = |what: &'static str| {
+        if !out.contains(&what) {
+            out.push(what);
+        }
+    };
+    let on = |v: &str| !v.is_empty() && v != "0" && v != "false";
+    let off = |v: &str| v == "0" || v == "false";
+    let text = |name: &str| {
+        pkg.part(name)
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+    };
+    if let Some(xml) = text(&workbook_part_name(&pkg.parts)) {
+        let mut p = XmlParser::new(&xml);
+        loop {
+            match p.next() {
+                Event::Start => match local(p.name()) {
+                    "workbookProtection"
+                        if ["lockStructure", "lockWindows", "lockRevision"]
+                            .iter()
+                            .any(|a| on(p.attr(a))) =>
+                    {
+                        push("workbook protection")
+                    }
+                    "fileSharing"
+                        if on(p.attr("readOnlyRecommended"))
+                            || !p.attr("reservationPassword").is_empty()
+                            || !p.attr("hashValue").is_empty() =>
+                    {
+                        push("password to modify and read-only recommendation")
+                    }
+                    "calcPr" => {
+                        match p.attr("calcMode") {
+                            "manual" => push("manual calculation"),
+                            "autoNoTable" => push("automatic calculation except data tables"),
+                            _ => {}
+                        }
+                        if off(p.attr("fullPrecision")) {
+                            push("precision as displayed");
+                        }
+                    }
+                    "sheet" if p.attr("state") == "veryHidden" => {
+                        push("very hidden sheets (saved as hidden)")
+                    }
+                    // A hidden name of its own, not a built-in one (print
+                    // area, _FilterDatabase) nor a function's.
+                    "definedName"
+                        if on(p.attr("hidden"))
+                            && !on(p.attr("function"))
+                            && !p.attr("name").starts_with("_xlnm.")
+                            && !p.attr("name").starts_with("_xlfn.") =>
+                    {
+                        push("hidden defined names (saved as visible)")
+                    }
+                    _ => {}
+                },
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+    }
+    for part in &pkg.sheet_parts {
+        let Some(xml) = text(part) else {
+            continue;
+        };
+        let mut p = XmlParser::new(&xml);
+        loop {
+            match p.next() {
+                Event::Start => match local(p.name()) {
+                    "sheetView"
+                        if on(p.attr("rightToLeft"))
+                            || on(p.attr("showFormulas"))
+                            || off(p.attr("showGridLines"))
+                            || off(p.attr("showRowColHeaders"))
+                            || off(p.attr("showZeros"))
+                            || off(p.attr("showOutlineSymbols"))
+                            || !matches!(p.attr("zoomScale"), "" | "100") =>
+                    {
+                        push("sheet view settings")
+                    }
+                    "tabColor" => push("sheet tab colors"),
+                    // The rows: no setting comes after them that this
+                    // reads.
+                    "sheetData" => break,
+                    _ => {}
+                },
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 /// The child elements of one raw element, as (local name, raw element).
