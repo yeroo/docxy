@@ -142,14 +142,25 @@ pub fn tiled_block(
 
 /// Rewrite every formula in the workbook for the cut-and-paste `mv` of the
 /// cells in `mv.rect` on sheet `src` to sheet `dst`: cell formulas on every
-/// sheet, conditional-format and validation rules, and defined names. A
-/// reference to a moved cell (a range: both corners) follows it
-/// ([`move_ref_expr`]). The moved cells' own formulas are left to the
-/// caller ([`crate::formula::move_block_formula`]); a formula the move
-/// doesn't reach keeps its text exactly, and a shared formula held verbatim
-/// is left alone, as an insert or delete leaves it.
+/// sheet, conditional-format rules, and defined names. A reference to a
+/// moved cell (a range: both corners) follows it ([`move_ref_expr`]). The
+/// moved cells' own formulas are left to the caller
+/// ([`crate::formula::move_block_formula`]), and validation rules to
+/// [`crate::validation::cut_rules`], called first: a rule's cells may lie
+/// partly inside the cut, so its formula, written once for its anchor, is
+/// rewritten part by part (#1050). A formula the move doesn't reach keeps
+/// its text exactly, and a shared formula held verbatim is left alone, as an
+/// insert or delete leaves it.
 pub fn move_refs(wb: &mut Workbook, src: usize, mv: &CellMove) {
+    let held: Vec<_> = wb
+        .sheets
+        .iter_mut()
+        .map(|s| std::mem::take(&mut s.validations))
+        .collect();
     move_refs_with(wb, src, mv, |_, _| true);
+    for (sheet, rules) in wb.sheets.iter_mut().zip(held) {
+        sheet.validations = rules;
+    }
 }
 
 /// [`move_refs`], rewriting only the conditional-format and validation rules
