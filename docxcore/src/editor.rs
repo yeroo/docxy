@@ -1977,10 +1977,12 @@ impl Editor {
     /// A host's plain-text cut (the wasm bridge's): the selection's text,
     /// then the selection deleted as [`Editor::cut`] deletes it, except
     /// that what its text cannot carry stays where the cut was: floating
-    /// pictures and alignment tabs (#768), and the equations and inline
-    /// pictures in the paragraphs where it starts and ends (#1242), whose
-    /// text it then leaves out, so a paste does not bring an equation back
-    /// as text beside the one kept. A loose field the selection cuts is
+    /// pictures and alignment tabs (#768), and equations and inline
+    /// pictures (#1242) where [`Editor::delete_keeps_equations_in`] says:
+    /// in the paragraphs where it starts and ends, every equation while
+    /// tracking, none over a cell range (which clears the cells). It leaves
+    /// out the text of the equations it keeps, so a paste does not bring
+    /// one back as text beside the one kept. A loose field the selection cuts is
     /// copied and deleted whole (#1240). `None`, and nothing done, when the
     /// selection holds no text (only kept objects, say).
     pub fn cut_text(&mut self) -> Option<String> {
@@ -1999,7 +2001,9 @@ impl Editor {
     ///
     /// While tracking, a pasted inline picture is recorded as an insertion,
     /// and an equation, which a `w:ins` cannot hold whole, is left out
-    /// (#1242): a tracked cut keeps its equations in place.
+    /// (#1242): a tracked cut keeps its equations in place. A tracked cut
+    /// of table cells clears them and carries their equations, which a
+    /// tracked paste then leaves out too: a known gap.
     pub fn paste(&mut self, clip: &Clip) {
         self.paste_clip(clip, true);
     }
@@ -2586,14 +2590,14 @@ impl Editor {
         self.selection_text_with(false)
     }
 
-    /// [`Editor::selection_text`]; `keep_units` leaves out the text of the
-    /// equations a plain-text cut keeps in place ([`Editor::cut_text`],
-    /// see [`Editor::delete_keeps_equations_in`]).
-    fn selection_text_with(&self, keep_units: bool) -> String {
+    /// [`Editor::selection_text`]; `for_plain_text_cut` leaves out the text
+    /// of the equations a plain-text cut keeps in place ([`Editor::cut_text`],
+    /// see [`Editor::delete_keeps_equations_in`]). A copy leaves out none.
+    fn selection_text_with(&self, for_plain_text_cut: bool) -> String {
         self.selection_spans()
             .iter()
             .filter_map(|(path, s, e)| {
-                let equations = !self.delete_keeps_equations_in(path, keep_units);
+                let equations = !(for_plain_text_cut && self.delete_keeps_equations_in(path, true));
                 resolve_para(&self.doc.body, path)
                     .map(|p| display_text(&p.content, *s, *e, equations))
             })
@@ -2604,10 +2608,12 @@ impl Editor {
     /// Whether deleting the selection keeps the equations in the paragraph
     /// at `path` (#1242), as [`Editor::delete_selection_with`] does: a cell
     /// range's delete keeps nothing; while tracking a delete keeps every
-    /// equation; else `keep_units` (a plain-text cut) keeps them in the
-    /// paragraphs where the selection starts and ends, and the paragraphs
-    /// between go whole. The copied text and clip follow it, so a cut
-    /// never both keeps an equation and carries it, nor drops it from both.
+    /// equation; else `keep_units` (the delete of a plain-text cut) keeps
+    /// them in the paragraphs where the selection starts and ends, and the
+    /// paragraphs between go whole. A cut's copied text and clip follow it,
+    /// so a cut never both keeps an equation of the selection's own
+    /// paragraphs and carries it, nor drops it from both (a text box's
+    /// content is another matter).
     fn delete_keeps_equations_in(&self, path: &[usize], keep_units: bool) -> bool {
         if self.cell_range().is_some() {
             return false;

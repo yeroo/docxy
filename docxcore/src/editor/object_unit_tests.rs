@@ -549,6 +549,17 @@ fn a_tracked_cut_and_paste_never_doubles_an_equation_1242() {
     assert_eq!(eqs(&ed), 2);
 }
 
+/// FIX r3: while tracking, a copy (or any reader of the selection's text)
+/// still gives an equation's text; only a plain-text cut leaves it out.
+#[test]
+fn a_tracked_copy_gives_an_equations_text_1242() {
+    let mut ed = ed_with(EQ);
+    track(&mut ed);
+    select(&mut ed, vec![0], 1, 4);
+    assert_eq!(ed.selection_text(), "bx+1c");
+    assert_eq!(ed.cut_text().as_deref(), Some("bc"));
+}
+
 /// `ab` / `c<eq>d` / `ef` and a 1×2 table whose second cell holds `x<eq>`.
 fn three_paras_and_a_table() -> Editor {
     let cell = |inner: &str| format!("<w:tc><w:p>{inner}</w:p></w:tc>");
@@ -599,7 +610,8 @@ fn a_plain_text_cut_copies_every_equation_it_removes_1242() {
 }
 
 /// FIX r2 M2: a tracked cut over a cell range clears the cells (keeping
-/// nothing), so its clip carries their equations: a paste brings them back.
+/// nothing), so its clip carries their equations: an untracked paste brings
+/// them back (a tracked paste leaves equations out, a known gap).
 #[test]
 fn a_tracked_cut_of_cells_carries_their_equations_1242() {
     let mut ed = three_paras_and_a_table();
