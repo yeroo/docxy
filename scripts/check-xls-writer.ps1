@@ -1,8 +1,9 @@
 # Check that Microsoft Excel opens what gridcore's .xls writer (#874) writes,
 # and computes the same values from it. For each .xls in corpus/legacy (and
-# its extra/ and addin/ folders), and each .xlsx in corpus/xlsx (a Save As
-# Excel 97-2003 Workbook from a workbook), and a synthetic .xlsx of what the
-# corpus lacks (dynamic arrays, legacy arrays, colours), this:
+# its extra/, addin/ and arrays/ folders), each .xlsx in corpus/xlsx and
+# corpus/legacy/arrays (a Save As Excel 97-2003 Workbook from a workbook),
+# and a synthetic .xlsx of what the corpus lacks (dynamic arrays, legacy
+# arrays, colours), this:
 #
 #   1. reads it with gridcore and writes it as .xls (the xls_roundtrip
 #      example, which also runs the writer's structural check);
@@ -49,6 +50,13 @@ $Allow = @{
   'calc-3d.xls' = @('Total!1,1', 'Total!2,1', 'Total!3,1', 'Total!4,1', 'Total!5,1', 'Total!6,1')
   # The .xlsx itself, read by Excel the same way.
   'calc-3d.xlsx' = @('Total!1,1', 'Total!2,1', 'Total!3,1', 'Total!4,1', 'Total!5,1', 'Total!6,1')
+  # Three dynamic arrays (Dyn!J1:L1: SUM(INDEX(A1:A3,{1;2})),
+  # SUM(INDEX(A1:A3,D1:D2)), SUM(VLOOKUP(A1:A3,...))) that Excel 365
+  # evaluates over arrays in the .xlsx but as a legacy one-cell array in an
+  # .xls: Excel's own array-classes-2.xls gives the same values as the
+  # rewrite (that file passes, with the same tokens), so the .xls can't hold
+  # what the .xlsx computes.
+  'array-classes-2.xlsx' = @('Dyn!1,10', 'Dyn!1,11', 'Dyn!1,12')
   # The import doesn't read another workbook's names (corpus/legacy/README.md),
   # so `SUM([1]!Prices)` and `[1]!Half*2` arrive as their values.
   'ext-name.xls' = @('Data!1,1', 'Data!2,1')
