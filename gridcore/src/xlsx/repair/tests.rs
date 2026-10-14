@@ -385,6 +385,80 @@ fn strip_removes_many_runaway_ids_in_one_pass() {
     assert_eq!(dxf_count_needed(&parts), 1_000);
 }
 
+/// #610 r4, #1233: pruning rewrites each rels part and the content types
+/// once, however many references name a dropped part: 100,000
+/// relationships and overrides naming it go, 100,000 others stay. Only the
+/// pass is timed, so CI load on the rest of a repair cannot fail it.
+#[test]
+fn prune_references_removes_many_in_one_pass() {
+    const N: usize = 100_000;
+    let mut rels = String::from(
+        "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
+    );
+    let mut want_rels = rels.clone();
+    let mut ct = String::from(
+        "<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">",
+    );
+    let mut want_ct = ct.clone();
+    for i in 0..N {
+        let keep = format!(
+            "<Relationship Id=\"rKeep{i}\" Type=\"http://example.com/other\" Target=\"sharedStrings.xml\"/>"
+        );
+        rels.push_str(&keep);
+        rels.push_str(&format!(
+            "<Relationship Id=\"rTheme{i}\" Type=\"{R}/theme\" Target=\"theme/theme1.xml\"/>"
+        ));
+        want_rels.push_str(&keep);
+        // Override part names match whatever their case.
+        let theme = if i % 2 == 0 {
+            "/xl/theme/theme1.xml"
+        } else {
+            "/XL/Theme/Theme1.xml"
+        };
+        let keep = "<Override PartName=\"/xl/sharedStrings.xml\" ContentType=\"application/xml\"/>";
+        ct.push_str(&format!(
+            "<Override PartName=\"{theme}\" ContentType=\"application/vnd.openxmlformats-officedocument.theme+xml\"/>{keep}"
+        ));
+        want_ct.push_str(keep);
+    }
+    for (xml, close) in [
+        (&mut rels, "</Relationships>"),
+        (&mut want_rels, "</Relationships>"),
+        (&mut ct, "</Types>"),
+        (&mut want_ct, "</Types>"),
+    ] {
+        xml.push_str(close);
+    }
+    let untouched = format!(
+        "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"{R}/worksheet\" Target=\"../worksheets/sheet1.xml\"/></Relationships>"
+    );
+    let mut parts = vec![
+        ("[Content_Types].xml".to_string(), ct.into_bytes()),
+        ("xl/_rels/workbook.xml.rels".to_string(), rels.into_bytes()),
+        (
+            "xl/worksheets/_rels/sheet2.xml.rels".to_string(),
+            untouched.clone().into_bytes(),
+        ),
+    ];
+    let dropped: HashSet<&str> = ["xl/theme/theme1.xml"].into_iter().collect();
+    let started = std::time::Instant::now();
+    prune_references(&mut parts, &dropped);
+    let took = started.elapsed();
+    assert!(took < crate::edit::PERF_BOUND, "prune took {took:?}");
+    let text =
+        |n: &str| String::from_utf8(parts.iter().find(|(p, _)| p == n).unwrap().1.clone()).unwrap();
+    let rels = text("xl/_rels/workbook.xml.rels");
+    assert_eq!(rels.matches("rKeep").count(), N);
+    assert!(rels == want_rels, "rels differ from the kept relationships");
+    let ct = text("[Content_Types].xml");
+    assert_eq!(ct.matches("/xl/sharedStrings.xml").count(), N);
+    assert!(
+        ct == want_ct,
+        "content types differ from the kept overrides"
+    );
+    assert_eq!(text("xl/worksheets/_rels/sheet2.xml.rels"), untouched);
+}
+
 /// `data` with the `nth` (0-based) central-directory entry named `name`
 /// made unreadable.
 fn damage_nth(data: &[u8], name: &str, nth: usize) -> Vec<u8> {
@@ -457,12 +531,15 @@ fn repair_refuses_a_damaged_name_listed_twice() {
     assert_eq!(load_xlsx_repair(&both).unwrap_err(), want);
 }
 
-/// #610 r4: dropping a part rewrites each rels part and the content types
-/// once, however many references name it: 100,000 relationships and
-/// overrides naming the damaged theme go, 100,000 others stay.
+/// #610 r4: repair drops every relationship and override naming a damaged
+/// part and keeps the others, through the whole repair and save. That each
+/// part is rewritten once, however many references name the dropped part,
+/// is timed on the pass itself in
+/// `prune_references_removes_many_in_one_pass`, where CI load on unzipping,
+/// saving and reloading cannot fail it (#1233).
 #[test]
-fn repair_prunes_many_references_in_one_pass() {
-    const N: usize = 100_000;
+fn repair_prunes_every_reference_to_a_dropped_part() {
+    const N: usize = 1_000;
     let mut parts = parts_of(&fixture());
     let edit = |parts: &mut Vec<(String, Vec<u8>)>, name: &str, close: &str, add: &str| {
         let p = parts.iter_mut().find(|(n, _)| n == name).unwrap();
@@ -490,13 +567,7 @@ fn repair_prunes_many_references_in_one_pass() {
     edit(&mut parts, "[Content_Types].xml", "</Types>", &overrides);
     let data = damage(&write_zip(&parts), "xl/theme/theme1.xml");
 
-    let started = std::time::Instant::now();
     let (_, repairs, saved) = repair_and_resave(&data);
-    let took = started.elapsed();
-    assert!(
-        took < std::time::Duration::from_secs(20),
-        "repair took {took:?}"
-    );
     assert_eq!(repairs.dropped, ["xl/theme/theme1.xml"]);
     let text = |n: &str| {
         String::from_utf8(
