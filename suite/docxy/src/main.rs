@@ -4512,7 +4512,7 @@ impl SheetView {
     /// undo step; refused whole, before anything changes, when it would
     /// change part of an array or run past the sheet's edge.
     /// `step` names the undo step (`Paste`, `Drag and Drop`).
-    pub(crate) fn paste_move(
+    fn paste_move(
         &mut self,
         clip: &GridClip,
         step: &'static str,
