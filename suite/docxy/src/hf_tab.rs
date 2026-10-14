@@ -30,8 +30,7 @@ use ctlcore::json::Json;
 use docxcore::sdt::CoreProp;
 use docxcore::sect::{TWIPS_PER_INCH, hf_reference, set_hf_reference};
 
-/// The namespaces header/footer content the editor writes uses.
-const HF_NAMESPACES: [(&str, &str); 3] = [("w", W_NS), ("r", R_NS), ("m", M_NS)];
+pub(crate) use docxcore::hf::rewrite_part;
 
 /// A Header & Footer command.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -751,63 +750,6 @@ pub(crate) fn hf_checked(tab: &DocTab, act: HfAct) -> bool {
             .is_some_and(|h| h.is_header == is_header),
         _ => false,
     }
-}
-
-/// The start of an existing header/footer part up to and including its root
-/// start tag (the XML declaration, `<w:hdr …>` with every namespace and
-/// `mc:Ignorable` it declares), and the end tag that closes it. `None` when
-/// the part holds no such root.
-fn root_of(xml: &str, is_header: bool) -> Option<(String, String)> {
-    let tag = if is_header { "w:hdr" } else { "w:ftr" };
-    let open = format!("<{tag}");
-    let mut from = 0;
-    let start = loop {
-        let at = from + xml[from..].find(&open)?;
-        let after = &xml[at + open.len()..];
-        if after.starts_with([' ', '>', '/', '\t', '\r', '\n']) {
-            break at;
-        }
-        from = at + open.len();
-    };
-    let gt = start + xml[start..].find('>')?;
-    let close = format!("</{tag}>");
-    // `<w:hdr …/>`, an empty part, opens up.
-    let end = if xml[..gt].ends_with('/') { gt - 1 } else { gt };
-    // Declare any namespace the editor's content uses that the root lacks.
-    let mut head = xml[..end].to_string();
-    let root = &xml[start..end];
-    for (prefix, ns) in HF_NAMESPACES {
-        if !root.contains(&format!("xmlns:{prefix}=")) {
-            head.push_str(&format!(" xmlns:{prefix}=\"{ns}\""));
-        }
-    }
-    head.push('>');
-    Some((head, close))
-}
-
-/// Replace an existing header/footer part's content with `inner` (block XML),
-/// keeping the part's own root start tag, so the namespaces its drawings,
-/// VML and markup-compatibility content use stay declared, plus any of
-/// `w`/`r`/`m` it lacks (the editor's content may use them). A part without
-/// a readable root gets a fresh one ([`part_xml`]).
-pub(crate) fn rewrite_part(pkg: &mut Package, part: &str, is_header: bool, inner: &str) {
-    let existing = pkg
-        .part(part)
-        .map(|b| String::from_utf8_lossy(b).into_owned());
-    let xml = match existing.as_deref().and_then(|x| root_of(x, is_header)) {
-        Some((head, tail)) => format!("{head}{inner}{tail}"),
-        None => part_xml(is_header, inner),
-    };
-    pkg.set_part(part, xml.into_bytes());
-}
-
-/// The header/footer XML a new part holds, around its block content.
-pub(crate) fn part_xml(is_header: bool, inner: &str) -> String {
-    let tag = if is_header { "w:hdr" } else { "w:ftr" };
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
-         <{tag} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\" xmlns:m=\"{M_NS}\">{inner}</{tag}>"
-    )
 }
 
 /// A design's block XML, in the Header or Footer style.

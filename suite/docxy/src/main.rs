@@ -28870,16 +28870,6 @@ fn emit_break(out: &mut Vec<AnyElement>, idx: &mut usize, caret: &mut Option<usi
     *idx += 1;
 }
 
-/// Compute the list marker text for each top-level block (`None` = not a list
-/// item). Bullets use •/◦ by level; decimal lists get real ordinals that restart
-/// per level and break whenever a non-list block interrupts the run.
-/// Extract the header (or footer) block content from a package: resolve the
-/// section's header/footerReference rId → part → parse. Empty if none.
-// OOXML namespaces used when re-serializing an edited header/footer part.
-const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-const M_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/math";
-
 /// Give a loaded body document a final `SectionProperties` when it has none
 /// (its package's captured one, else an empty `<w:sectPr></w:sectPr>`), as
 /// terminal docxy does, so every undo snapshot carries the final section it was

@@ -12,9 +12,9 @@ use crate::model::*;
 use crate::xml::{Event, XmlParser};
 use crate::zip::ZipArchive;
 
-const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-const M_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/math";
+pub(crate) const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+pub(crate) const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+pub(crate) const M_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/math";
 const MC_NS: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
 const W15_NS: &str = "http://schemas.microsoft.com/office/word/2012/wordml";
 
