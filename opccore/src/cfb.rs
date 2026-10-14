@@ -14,7 +14,8 @@
 //! storage hierarchy ([`Cfb::paths`] / [`Cfb::read_path`], e.g.
 //! `"TBkndTask/FixedData"` — how `.mpp` nests its task/resource blocks). A small
 //! v3 writer ([`write_cfb`] / [`write_cfb_tree`]) round-trip tests the reader,
-//! nesting included, without shipping a binary fixture.
+//! nesting included, without shipping a binary fixture, and wraps the `.xls`
+//! writer's `Workbook` stream.
 //!
 //! [MS-CFB]: https://learn.microsoft.com/openspecs/windows_protocols/ms-cfb/
 
@@ -22,6 +23,7 @@ const SIG: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 const ENDOFCHAIN: u32 = 0xFFFF_FFFE;
 const FREESECT: u32 = 0xFFFF_FFFF;
 const FATSECT: u32 = 0xFFFF_FFFD;
+const DIFSECT: u32 = 0xFFFF_FFFC;
 const NOSTREAM: u32 = 0xFFFF_FFFF;
 
 const DIR_ENTRY_SIZE: usize = 128;
@@ -411,9 +413,9 @@ fn utf16_name(raw: &[u8], name_len: usize) -> String {
     String::from_utf16_lossy(&units)
 }
 
-// ---- minimal v3 writer (test support) ---------------------------------------
+// ---- minimal v3 writer ------------------------------------------------------
 
-/// A node in a compound file's directory tree, for the test writer.
+/// A node in a compound file's directory tree, for the writer.
 pub enum Node<'a> {
     Stream(&'a str, Vec<u8>),
     Storage(&'a str, Vec<Node<'a>>),
@@ -486,9 +488,10 @@ pub fn write_cfb(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
 
 /// Assemble a minimal v3 compound file from a directory tree (streams and
 /// nested storages). Small streams go in the mini stream, large ones in the FAT.
-/// Intentionally minimal — an unbalanced (right-leaning) directory tree, enough
-/// to exercise the reader's navigation in tests, not a general CFB authoring
-/// tool.
+/// Minimal: an unbalanced (right-leaning) directory tree, enough to exercise
+/// the reader's navigation in tests and to hold the `.xls` writer's one
+/// `Workbook` stream, not a general CFB authoring tool. Files of any size get
+/// DIFAT sectors past the header's 109 FAT-sector pointers (~7 MB).
 pub fn write_cfb_tree(root_children: &[Node]) -> Vec<u8> {
     const SS: usize = 512;
     const CUTOFF: usize = 4096;
@@ -616,25 +619,35 @@ pub fn write_cfb_tree(root_children: &[Node]) -> Vec<u8> {
     }
     let dir_start = alloc(&dbytes, &mut sectors, &mut fat);
 
-    // 6) Reserve FAT sectors: solve for a self-consistent count.
+    // 6) Reserve FAT sectors, and past the header's 109 FAT pointers the
+    //    DIFAT sectors that list the rest: solve for a self-consistent pair
+    //    (the FAT also maps its own sectors and the DIFAT's).
     let m = sectors.len();
+    let entries_per = SS / 4;
+    let difat_for = |f: usize| f.saturating_sub(109).div_ceil(entries_per - 1);
     let mut f = 1usize;
     loop {
-        let total = m + f;
-        let need = total.div_ceil(SS / 4);
+        let total = m + f + difat_for(f);
+        let need = total.div_ceil(entries_per);
         if need <= f {
             break;
         }
         f = need;
     }
+    let d = difat_for(f);
     let fat_start = sectors.len();
     for _ in 0..f {
         sectors.push([0u8; SS]);
         fat.push(FATSECT);
     }
+    let difat_start = sectors.len();
+    for _ in 0..d {
+        sectors.push([0u8; SS]);
+        fat.push(DIFSECT);
+    }
 
-    // 7) Serialize the FAT into its sectors.
-    let entries_per = SS / 4;
+    // 7) Serialize the FAT into its sectors, and the FAT sector indices past
+    //    the header's 109 into the DIFAT chain (127 each, then the next).
     for s in 0..f {
         let mut sect = [0u8; SS];
         for i in 0..entries_per {
@@ -643,6 +656,22 @@ pub fn write_cfb_tree(root_children: &[Node]) -> Vec<u8> {
             sect[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
         sectors[fat_start + s] = sect;
+    }
+    for k in 0..d {
+        let mut sect = [0xFFu8; SS];
+        for i in 0..entries_per - 1 {
+            let fi = 109 + k * (entries_per - 1) + i;
+            if fi < f {
+                sect[i * 4..i * 4 + 4].copy_from_slice(&((fat_start + fi) as u32).to_le_bytes());
+            }
+        }
+        let next = if k + 1 < d {
+            (difat_start + k + 1) as u32
+        } else {
+            ENDOFCHAIN
+        };
+        sect[SS - 4..].copy_from_slice(&next.to_le_bytes());
+        sectors[difat_start + k] = sect;
     }
 
     // 8) Header.
@@ -658,8 +687,13 @@ pub fn write_cfb_tree(root_children: &[Node]) -> Vec<u8> {
     header[56..60].copy_from_slice(&(CUTOFF as u32).to_le_bytes()); // mini cutoff
     header[60..64].copy_from_slice(&minifat_start.to_le_bytes()); // first mini-FAT
     header[64..68].copy_from_slice(&(num_minifat as u32).to_le_bytes()); // # mini-FAT
-    header[68..72].copy_from_slice(&ENDOFCHAIN.to_le_bytes()); // first DIFAT
-    header[72..76].copy_from_slice(&0u32.to_le_bytes()); // # DIFAT sectors
+    let first_difat = if d > 0 {
+        difat_start as u32
+    } else {
+        ENDOFCHAIN
+    };
+    header[68..72].copy_from_slice(&first_difat.to_le_bytes()); // first DIFAT
+    header[72..76].copy_from_slice(&(d as u32).to_le_bytes()); // # DIFAT sectors
     // DIFAT array: the FAT sector indices, then FREESECT.
     for i in 0..109 {
         let v = if i < f {
@@ -912,5 +946,45 @@ mod tests {
         let bytes = write_cfb(&[("Big", big.clone())]);
         let cfb = Cfb::open(&bytes).unwrap();
         assert_eq!(cfb.read_stream("Big").unwrap(), big);
+    }
+
+    #[test]
+    fn write_cfb_large_stream_uses_difat() {
+        // 10 MB is ~20,500 sectors: 161 FAT sectors, 52 past the header's
+        // 109, so one DIFAT sector lists them.
+        let big: Vec<u8> = (0..10 << 20)
+            .map(|i: u32| (i * 7 + i / 513) as u8)
+            .collect();
+        let bytes = write_cfb(&[("Workbook", big.clone())]);
+        let sectors = bytes.len() / 512 - 1;
+        let num_fat = u32le(&bytes, 44) as usize;
+        let first_difat = u32le(&bytes, 68);
+        let num_difat = u32le(&bytes, 72) as usize;
+        // Checked from the header alone, not through the reader: the FAT
+        // maps every sector, and the DIFAT holds what the header can't.
+        assert_eq!(num_fat, sectors.div_ceil(128), "{sectors} sectors");
+        assert!(num_fat > 109);
+        assert_eq!(num_difat, (num_fat - 109).div_ceil(127));
+        let off = 512 + first_difat as usize * 512;
+        let listed: Vec<u32> = (0..num_fat - 109)
+            .map(|i| u32le(&bytes, off + i * 4))
+            .collect();
+        let fat0 = u32le(&bytes, 76);
+        let want: Vec<u32> = (109..num_fat as u32).map(|i| fat0 + i).collect();
+        assert_eq!(listed, want);
+        assert_eq!(u32le(&bytes, off + 508), ENDOFCHAIN);
+        // The DIFAT sector is marked DIFSECT in the FAT.
+        let fat_of = |sec: u32| {
+            let s = sec as usize / 128;
+            let fs = if s < 109 {
+                u32le(&bytes, 76 + s * 4)
+            } else {
+                listed[s - 109]
+            };
+            u32le(&bytes, 512 + fs as usize * 512 + (sec as usize % 128) * 4)
+        };
+        assert_eq!(fat_of(first_difat), DIFSECT);
+        let cfb = Cfb::open(&bytes).unwrap();
+        assert_eq!(cfb.read_stream("Workbook").unwrap(), big);
     }
 }
