@@ -1913,6 +1913,10 @@ impl GridClip {
 /// The status of a paste whose cells' data validation could not be kept.
 const NO_RULES_KEPT: &str = "Pasted without its data validation: this sheet's part can't hold it";
 
+/// A cut moved onto a sheet whose part can't hold `<dataValidations>`: the
+/// cut cells' rules stay where they were (#1050).
+const CUT_RULES_KEPT: &str = "Moved without its data validation, which stays on the cut cells: this sheet's part can't hold it";
+
 /// How a grid paste landed ([`SheetView::paste_grid_clip`]).
 #[derive(Debug, PartialEq)]
 enum GridPasted {
@@ -4407,7 +4411,7 @@ impl SheetView {
                 "The cut was pasted as a copy: its sheet is protected"
             }));
         }
-        self.paste_move(clip, PASTE).map(|()| GridPasted::Done)
+        self.paste_move(clip, PASTE)
     }
 
     /// A copy pasted over the selection: tiled over a paste area that is a
@@ -4501,11 +4505,18 @@ impl SheetView {
     /// (but for cells the paste overwrites), every reference to a moved cell
     /// follows it ([`gridcore::edit::move_refs`]), and the moved cells' own
     /// references to cells outside the cut keep reading them
-    /// ([`gridcore::formula::move_block_formula`]). One undo step; refused
-    /// whole, before anything changes, when it would change part of an array
-    /// or run past the sheet's edge.
+    /// ([`gridcore::formula::move_block_formula`]). Validation rules move
+    /// with the cells, and every other rule cell keeps checking what it
+    /// checked ([`gridcore::validation::cut_rules`]); on a sheet that can't
+    /// hold rules they stay on the cut cells, and the result says so. One
+    /// undo step; refused whole, before anything changes, when it would
+    /// change part of an array or run past the sheet's edge.
     /// `step` names the undo step (`Paste`, `Drag and Drop`).
-    fn paste_move(&mut self, clip: &GridClip, step: &'static str) -> Result<(), GridPasteError> {
+    fn paste_move(
+        &mut self,
+        clip: &GridClip,
+        step: &'static str,
+    ) -> Result<GridPasted, GridPasteError> {
         use gridcore::sheet::{Cell, MAX_COLS, MAX_ROWS, is_array_f};
         let (fr0, fc0, fr1, fc1) = clip.rect;
         let (h, w) = (fr1 - fr0 + 1, fc1 - fc0 + 1);
@@ -4573,7 +4584,10 @@ impl SheetView {
             ));
         }
         self.push_undo_block(dst, at, &block, step);
-        // References follow first, and the engine is rebuilt on them, so the
+        // Rules read the workbook before the cut, so they go first.
+        let land = self.pkg.takes_validations(dst);
+        let kept = gridcore::validation::cut_rules(&mut self.pkg.workbook, src, dst, &mv, land);
+        // References follow next, and the engine is rebuilt on them, so the
         // writes below recalculate what reads the moved cells where they land.
         gridcore::edit::move_refs(&mut self.pkg.workbook, src, &mv);
         self.engine = sheet_engine(&self.pkg.workbook);
@@ -4590,10 +4604,13 @@ impl SheetView {
         self.engine.set_cells_prechecked(wb, src, clears);
         self.engine.paste_block_prechecked(wb, dst, at, &block);
         self.engine.set_cells_prechecked(wb, src, late);
-        // A cut leaves validation where it is, on both sheets; see #1050.
         self.prune_circles();
         self.select_block(at, &block);
-        Ok(())
+        Ok(if kept {
+            GridPasted::WithoutRules(CUT_RULES_KEPT)
+        } else {
+            GridPasted::Done
+        })
     }
     /// Whether more than one cell is selected.
     fn has_range(&self) -> bool {

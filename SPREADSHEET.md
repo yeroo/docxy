@@ -156,9 +156,15 @@ worksheet XML sources.
   carries the source's rules, and the Data Validation dialog edits them. A save
   leaves an untouched `<dataValidation>` byte for byte and rewrites only the
   attributes of an edited one (`DataValidation::orig`); new rules are appended.
-  x14 (`extLst`) validations are preserved, not edited. A cut-paste leaves
-  validation where it is, on both the source and the destination (moving a
-  cut's rules is #1050).
+  x14 (`extLst`) validations are preserved, not edited. A cut-paste moves the
+  cut cells' rules with them and replaces the destination's, and every rule
+  cell on any sheet keeps checking what it checked, a reference to a cut cell
+  following it (`validation::cut_rules`, #1050): a rule is split into parts
+  in which each reference is wholly in or out of the cut, since its formula
+  is written once for its anchor. A name that binds otherwise on the
+  destination sheet is replaced by its definition (one absolute range), else
+  those cells keep the rule where they were. Moving to a sheet that can't
+  hold rules leaves them on the cut cells, and the status says so.
 - Rewrite the drawing part's anchors in place (`drawing::rewrite_anchors`) so a
   moved or deleted drawing persists. Every other byte of that part survives —
   including whole anchors for shapes and text boxes we don't model, which is

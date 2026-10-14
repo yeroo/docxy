@@ -121,7 +121,7 @@ pub fn delete_splits_array(s: &Sheet, (_, c1, bottom, c2): Area, row: u32) -> bo
 /// list's last row is left blank; cells beside the list stay where they are.
 /// A reference to a moved cell follows it, a reference to a deleted cell (a
 /// range: both corners) becomes `#REF!`, and the moved cells' own formulas
-/// move with them ([`super::move_refs`], as a cut does). A range only partly
+/// move with them ([`move_refs_with`], as a cut's do). A range only partly
 /// in the moved cells keeps its text (`SUM(B3:B4)` with row 3 deleted still
 /// reads `B3:B4`). Comments, merges, hyperlinks, and conditional-format and
 /// validation ranges don't move, so the formulas of the rules over the
@@ -148,14 +148,14 @@ pub fn delete_record(wb: &mut Workbook, sheet: usize, (_, c1, bottom, c2): Area,
                 .iter()
                 .any(|&(a, b, c, d)| a <= r2 && c >= r1 && b <= k2 && d >= k1)
     };
-    move_refs_with(wb, sheet, &gone, rules);
+    move_refs_with(wb, sheet, &gone, rules, true);
     let up = CellMove {
         rect: (row + 1, c1, bottom, c2),
         dr: -1,
         ..gone
     };
     if row < bottom {
-        move_refs_with(wb, sheet, &up, rules);
+        move_refs_with(wb, sheet, &up, rules, true);
     }
     let s = &mut wb.sheets[sheet];
     for c in c1..=c2 {

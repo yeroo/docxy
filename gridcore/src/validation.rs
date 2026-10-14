@@ -3,7 +3,7 @@
 //! Pure model work: the hosts own the alerts, the dialog and the circles.
 
 use crate::engine::{cell_value_at, eval_formula_at_clock, eval_typed_formula_at_clock};
-use crate::formula::{Value, translate_formula};
+use crate::formula::{CellMove, CellRef, Expr, Value, translate_formula};
 use crate::sheet::{
     AlertStyle, Cell, CellValue, DataValidation, MAX_COLS, MAX_ROWS, Sheet, Workbook,
 };
@@ -1283,6 +1283,432 @@ pub fn paste_rules(
     }
 }
 
+// --- a cut and paste (#1050) -------------------------------------------
+
+/// One formula of a rule as [`cut_rules`] reads it: parsed, or its text when
+/// it holds no references to follow (empty, an inline list, unparseable).
+#[derive(Clone)]
+enum RuleFormula {
+    Parsed(Expr),
+    Text(String),
+}
+
+impl RuleFormula {
+    /// A formula of a rule of kind `kind`: only a list's `"a,b"` is inline
+    /// text; a custom `"Y"=A2` has references like any other.
+    fn of(f: &str, kind: &str) -> Self {
+        if f.is_empty() || (kind == "list" && f.starts_with('"')) {
+            return RuleFormula::Text(f.to_string());
+        }
+        match crate::formula::parse(f) {
+            Ok(e) => RuleFormula::Parsed(e),
+            Err(_) => RuleFormula::Text(f.to_string()),
+        }
+    }
+
+    /// The formula as written for the cell (`dr`, `dc`) from the anchor.
+    fn at(&self, dr: i64, dc: i64) -> Self {
+        match self {
+            RuleFormula::Parsed(e) => RuleFormula::Parsed(crate::formula::translate(e, dr, dc)),
+            RuleFormula::Text(t) => RuleFormula::Text(t.clone()),
+        }
+    }
+
+    /// The formula of a cell the cut moves from `src` to `dst`
+    /// ([`crate::formula::move_block_expr`]); `None` when a name it uses
+    /// can't be carried ([`pin_names`]).
+    fn moved(&self, wb: &Workbook, (src, dst): (usize, usize), mv: &CellMove) -> Option<String> {
+        match self {
+            RuleFormula::Parsed(e) => {
+                let e = if src == dst {
+                    e.clone()
+                } else {
+                    pin_names(e, wb, src, dst)?
+                };
+                Some(crate::formula::to_string(&crate::formula::move_block_expr(
+                    &e, mv,
+                )))
+            }
+            RuleFormula::Text(t) => Some(t.clone()),
+        }
+    }
+}
+
+/// The corners of the references in `e` (a rule's formula on sheet `home`)
+/// that name a cell of sheet `src`: a range's second corner reads its
+/// first's sheet, as [`crate::formula::move_ref_expr`] does.
+fn src_corners(e: &Expr, home: &str, src: &str, out: &mut Vec<CellRef>) {
+    let mut push = |r: &CellRef, sheet: &str| {
+        if r.row >= 0 && r.col >= 0 && sheet.eq_ignore_ascii_case(src) {
+            out.push(r.clone());
+        }
+    };
+    match e {
+        Expr::Ref(r) | Expr::SpillRef(r) => push(r, r.sheet.as_deref().unwrap_or(home)),
+        Expr::Range(p, q) => {
+            let first = p.sheet.as_deref().unwrap_or(home);
+            push(p, first);
+            push(q, q.sheet.as_deref().unwrap_or(first));
+        }
+        Expr::ArrayLit(rows) => rows
+            .iter()
+            .flatten()
+            .for_each(|x| src_corners(x, home, src, out)),
+        Expr::Func(_, args) => args.iter().for_each(|x| src_corners(x, home, src, out)),
+        Expr::Call(callee, args) => {
+            src_corners(callee, home, src, out);
+            args.iter().for_each(|x| src_corners(x, home, src, out));
+        }
+        Expr::Un(_, x) => src_corners(x, home, src, out),
+        Expr::Bin(_, l, r) => {
+            src_corners(l, home, src, out);
+            src_corners(r, home, src, out);
+        }
+        _ => {}
+    }
+}
+
+/// `range` split at the row and column lines (the first row or column of a
+/// new part) that fall inside it.
+fn split_at(range: Rect, rows: &[i64], cols: &[i64]) -> Vec<Rect> {
+    let spans = |lo: u32, hi: u32, lines: &[i64]| {
+        let mut starts = vec![lo];
+        starts.extend(
+            lines
+                .iter()
+                .filter(|&&x| x > i64::from(lo) && x <= i64::from(hi))
+                .map(|&x| x as u32),
+        );
+        starts
+            .iter()
+            .enumerate()
+            .map(|(k, &s)| (s, starts.get(k + 1).map_or(hi, |&n| n - 1)))
+            .collect::<Vec<_>>()
+    };
+    let (r1, c1, r2, c2) = range;
+    let cs = spans(c1, c2, cols);
+    spans(r1, r2, rows)
+        .into_iter()
+        .flat_map(|(a, b)| cs.iter().map(move |&(c, d)| (a, c, b, d)))
+        .collect()
+}
+
+/// The defined name `name` binds to on `sheet`: one scoped to it shadows a
+/// workbook one.
+fn binding(wb: &Workbook, name: &str, sheet: usize) -> Option<usize> {
+    let find = |scope: Option<usize>| {
+        wb.defined_names
+            .iter()
+            .position(|d| d.scope == scope && d.name.eq_ignore_ascii_case(name))
+    };
+    find(Some(sheet)).or_else(|| find(None))
+}
+
+/// `e`, a formula moving from sheet `src` to `dst`, with every defined name
+/// that binds otherwise on `dst` replaced by its definition, so it keeps
+/// reading what it read (`Sheet!Name` doesn't parse). `None` when such a
+/// name's definition is not one absolute cell or range.
+fn pin_names(e: &Expr, wb: &Workbook, src: usize, dst: usize) -> Option<Expr> {
+    let recur = |x: &Expr| pin_names(x, wb, src, dst);
+    Some(match e {
+        Expr::Name(n) => {
+            let at = binding(wb, n, src);
+            if at == binding(wb, n, dst) {
+                return Some(e.clone());
+            }
+            let def = &wb.defined_names[at?];
+            let fixed = |r: &CellRef| r.abs_row && r.abs_col;
+            let ast = crate::formula::parse(def.formula.trim_start_matches('=')).ok()?;
+            match &ast {
+                Expr::Ref(r) if fixed(r) => {}
+                Expr::Range(p, q) if fixed(p) && fixed(q) => {}
+                _ => return None,
+            }
+            let home = def.scope.unwrap_or(src);
+            crate::formula::qualify_sheet_in_expr(&ast, &wb.sheets.get(home)?.name)
+        }
+        Expr::ArrayLit(rows) => Expr::ArrayLit(
+            rows.iter()
+                .map(|row| row.iter().map(recur).collect())
+                .collect::<Option<_>>()?,
+        ),
+        Expr::Func(n, args) => {
+            Expr::Func(n.clone(), args.iter().map(recur).collect::<Option<_>>()?)
+        }
+        Expr::Call(callee, args) => Expr::Call(
+            Box::new(recur(callee)?),
+            args.iter().map(recur).collect::<Option<_>>()?,
+        ),
+        Expr::Un(op, x) => Expr::Un(*op, Box::new(recur(x)?)),
+        Expr::Bin(op, l, r) => Expr::Bin(*op, Box::new(recur(l)?), Box::new(recur(r)?)),
+        other => other.clone(),
+    })
+}
+
+/// `dv`'s settings with formulas `formula1`, `formula2` (written for the
+/// corner of the ranges they are added to) and no element of its own.
+fn with_formulas(dv: &DataValidation, formula1: String, formula2: String) -> DataValidation {
+    DataValidation {
+        ranges: Vec::new(),
+        formula1,
+        formula2,
+        ix: None,
+        orig: None,
+        ..dv.clone()
+    }
+}
+
+/// A rule's parts after a cut: (sheet, rule written for the part's corner,
+/// part).
+type CutParts = Vec<(usize, DataValidation, Rect)>;
+
+/// What a cut makes of one rule.
+enum CutOutcome {
+    /// Its cells and formulas stay as they are.
+    Keep,
+    /// Its cells stay, each reading the cut the same way: the formulas,
+    /// rewritten for the anchor, go on the rule itself, which keeps its
+    /// element.
+    Rewrite(String, String),
+    /// It is taken apart into these parts.
+    Split(CutParts),
+}
+
+/// Does a rule start a formula with `"` without being a list's inline
+/// items? [`shift_formulas`] takes such a formula for an inline list and
+/// leaves it, so [`add_ranges`] can't tell its parts apart by corner.
+fn quote_led(dv: &DataValidation) -> bool {
+    dv.kind != "list" && (dv.formula1.starts_with('"') || dv.formula2.starts_with('"'))
+}
+
+/// The cut [`cut_rules`] applies: `mv` from sheet `src` to `dst`, landing on
+/// `landed` (`mv.rect` moved); `land` false keeps the cut cells' rules.
+struct Cut<'a> {
+    src: usize,
+    dst: usize,
+    mv: &'a CellMove<'a>,
+    landed: Rect,
+    land: bool,
+}
+
+/// What `cut` makes of rule `dv` on sheet `h`. `kept_back` is set when a
+/// part stays because `land` is false. See [`cut_rules`].
+fn cut_rule(
+    wb: &Workbook,
+    h: usize,
+    dv: &DataValidation,
+    cut: &Cut,
+    kept_back: &mut bool,
+) -> CutOutcome {
+    let a = anchor(dv);
+    if a.0 == u32::MAX {
+        return CutOutcome::Keep;
+    }
+    let mv = cut.mv;
+    let home = wb.sheets[h].name.as_str();
+    let fs = [
+        RuleFormula::of(&dv.formula1, &dv.kind),
+        RuleFormula::of(&dv.formula2, &dv.kind),
+    ];
+    let mut corners = Vec::new();
+    for f in &fs {
+        if let RuleFormula::Parsed(e) = f {
+            src_corners(e, home, mv.src, &mut corners);
+        }
+    }
+    let (on_src, on_dst) = (h == cut.src, h == cut.dst);
+    if !on_src && !on_dst && corners.is_empty() {
+        return CutOutcome::Keep;
+    }
+    let c = mv.rect;
+    // Where a reference starts or stops naming a cut cell, as the rule's
+    // cells read it: each part is then wholly in or out for each reference.
+    let (mut rows, mut cols) = (Vec::new(), Vec::new());
+    for r in &corners {
+        if !r.abs_row {
+            let lo = i64::from(c.0) + i64::from(a.0) - r.row;
+            rows.extend([lo, lo + i64::from(c.2 - c.0) + 1]);
+        }
+        if !r.abs_col {
+            let lo = i64::from(c.1) + i64::from(a.1) - r.col;
+            cols.extend([lo, lo + i64::from(c.3 - c.1) + 1]);
+        }
+    }
+    for (on, (r1, c1, r2, c2)) in [(on_src, c), (on_dst, cut.landed)] {
+        if on {
+            rows.extend([i64::from(r1), i64::from(r2) + 1]);
+            cols.extend([i64::from(c1), i64::from(c2) + 1]);
+        }
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    cols.sort_unstable();
+    cols.dedup();
+    // The formulas rewritten at the anchor: what every part reads when the
+    // rule's cells all stay and read the cut alike.
+    let whole = fs.clone().map(|f| match f {
+        RuleFormula::Parsed(e) => {
+            RuleFormula::Parsed(crate::formula::move_ref_expr(&e, Some(home), mv))
+        }
+        t => t,
+    });
+    let mut parts = Vec::new();
+    let mut changed = false;
+    let mut alike = true;
+    for &range in &dv.ranges {
+        for p in split_at(range, &rows, &cols) {
+            let (dr, dc) = (
+                i64::from(p.0) - i64::from(a.0),
+                i64::from(p.1) - i64::from(a.1),
+            );
+            let [f1, f2] = [fs[0].at(dr, dc), fs[1].at(dr, dc)];
+            if on_src && inside(&p, &c) {
+                // Moved with its cells: references into the cut follow, the
+                // rest keep reading their cells.
+                let moved = || {
+                    let ends = (cut.src, cut.dst);
+                    Some((f1.moved(wb, ends, mv)?, f2.moved(wb, ends, mv)?))
+                };
+                if let Some((m1, m2)) = cut.land.then(moved).flatten() {
+                    let to = |v: u32, d: i64| (i64::from(v) + d) as u32;
+                    let at = (
+                        to(p.0, mv.dr),
+                        to(p.1, mv.dc),
+                        to(p.2, mv.dr),
+                        to(p.3, mv.dc),
+                    );
+                    parts.push((cut.dst, with_formulas(dv, m1, m2), at));
+                    changed = true;
+                    alike = false;
+                    continue;
+                }
+                // Left on its cells (the destination can't hold it, or a
+                // name it uses can't be carried there): it reads as a cell
+                // outside the cut does.
+                *kept_back |= !cut.land;
+            } else if on_dst && inside(&p, &cut.landed) {
+                // The cut cells, and their rules, replace it.
+                changed = true;
+                alike = false;
+                continue;
+            }
+            let [s1, s2] = [(f1, &whole[0]), (f2, &whole[1])].map(|(f, w)| match (f, w) {
+                (RuleFormula::Parsed(e), RuleFormula::Parsed(w)) => {
+                    let m = crate::formula::move_ref_expr(&e, Some(home), mv);
+                    changed |= m != e;
+                    alike &= m == crate::formula::translate(w, dr, dc);
+                    crate::formula::to_string(&m)
+                }
+                (RuleFormula::Text(t), _) => t,
+                // `whole` is parsed where `fs` is.
+                (RuleFormula::Parsed(e), RuleFormula::Text(_)) => crate::formula::to_string(&e),
+            });
+            parts.push((h, with_formulas(dv, s1, s2), p));
+        }
+    }
+    if !changed {
+        return CutOutcome::Keep;
+    }
+    if alike {
+        // Only the text changed: rewrite it on the rule itself, leaving a
+        // formula the cut doesn't reach as it was written.
+        let text = |w: &RuleFormula, f: &RuleFormula, old: &str| match (w, f) {
+            (RuleFormula::Parsed(w), RuleFormula::Parsed(e)) if w != e => {
+                crate::formula::to_string(w)
+            }
+            _ => old.to_string(),
+        };
+        return CutOutcome::Rewrite(
+            text(&whole[0], &fs[0], &dv.formula1),
+            text(&whole[1], &fs[1], &dv.formula2),
+        );
+    }
+    CutOutcome::Split(parts)
+}
+
+/// The cut-and-paste `mv` of the cells `mv.rect` on sheet `src` to sheet
+/// `dst` (#1050), for every sheet's validation rules. It reads the workbook
+/// as it was before the cut, so it goes before [`crate::edit::move_refs`]
+/// (which leaves validation rules to it). A rule's cells inside the cut
+/// take it to where they land, its references into the cut following them
+/// and the rest reading what they read (sheet-qualified across sheets; a
+/// name that binds otherwise there replaced by its definition, else the
+/// cells keep the rule where they were). The landing cells lose the rules
+/// they had. Every other rule cell keeps its rule, a reference into the cut
+/// following the cells. A rule is split into parts in each of which every
+/// reference is wholly in or out of the cut, so each cell keeps checking
+/// what it checked. A rule the cut doesn't reach keeps its element and
+/// text. With `land` false (the destination can't hold rules) the cut
+/// cells' rules stay where they are, and the result says whether any did.
+pub fn cut_rules(wb: &mut Workbook, src: usize, dst: usize, mv: &CellMove, land: bool) -> bool {
+    let n = wb.sheets.len();
+    let (r1, c1, r2, c2) = mv.rect;
+    let shift = |v: u32, d: i64| u32::try_from(i64::from(v) + d).ok();
+    let (Some(lr1), Some(lc1), Some(lr2), Some(lc2)) = (
+        shift(r1, mv.dr),
+        shift(c1, mv.dc),
+        shift(r2, mv.dr),
+        shift(c2, mv.dc),
+    ) else {
+        return false;
+    };
+    // A cut that doesn't land whole on the grid is refused by the hosts; one
+    // pasted where it was moves nothing.
+    if src >= n || dst >= n || lr2 >= MAX_ROWS || lc2 >= MAX_COLS {
+        return false;
+    }
+    if src == dst && (mv.dr, mv.dc) == (0, 0) {
+        return false;
+    }
+    let cut = Cut {
+        src,
+        dst,
+        mv,
+        landed: (lr1, lc1, lr2, lc2),
+        land,
+    };
+    let mut kept_back = false;
+    let mut gone: Vec<(usize, usize)> = Vec::new();
+    let mut rewritten: Vec<(usize, usize, String, String)> = Vec::new();
+    let mut parts: CutParts = Vec::new();
+    for (h, sheet) in wb.sheets.iter().enumerate() {
+        for (i, dv) in sheet.validations.iter().enumerate() {
+            match cut_rule(wb, h, dv, &cut, &mut kept_back) {
+                CutOutcome::Keep => {}
+                CutOutcome::Rewrite(f1, f2) => rewritten.push((h, i, f1, f2)),
+                CutOutcome::Split(p) => {
+                    gone.push((h, i));
+                    parts.extend(p);
+                }
+            }
+        }
+    }
+    for (h, i, f1, f2) in rewritten {
+        let dv = &mut wb.sheets[h].validations[i];
+        (dv.formula1, dv.formula2) = (f1, f2);
+    }
+    for &(h, i) in gone.iter().rev() {
+        let sheet = &mut wb.sheets[h];
+        let dv = sheet.validations.remove(i);
+        sheet.dv_removed.extend(dv.ix);
+    }
+    for (h, rule, p) in parts {
+        let sheet = &mut wb.sheets[h];
+        if quote_led(&rule) {
+            // A rule of its own, joined to none (see `quote_led`).
+            if rule.is_meaningful() {
+                sheet.validations.push(DataValidation {
+                    ranges: vec![p],
+                    ..rule
+                });
+            }
+        } else {
+            add_ranges(sheet, &rule, &[p]);
+        }
+    }
+    kept_back
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2404,5 +2830,535 @@ mod tests {
         assert_eq!(labels, ["He said \"yes\"", "No"]);
         assert!(check(&mut wb, 0, 3, "He said \"yes\"").is_none());
         assert!(check(&mut wb, 0, 3, "He said yes").is_some());
+    }
+
+    // --- a cut and paste (#1050) ---------------------------------------
+
+    fn sheets(names: &[&str]) -> Workbook {
+        let mut wb = Workbook::default();
+        for n in names {
+            wb.sheets.push(Sheet {
+                name: (*n).into(),
+                ..Default::default()
+            });
+        }
+        wb
+    }
+
+    fn at(cell: &str) -> (u32, u32) {
+        crate::sheet::parse_cell_name(cell).unwrap()
+    }
+
+    fn area(text: &str) -> Rect {
+        crate::sheet::parse_range_name(text).unwrap_or_else(|| {
+            let (r, c) = at(text);
+            (r, c, r, c)
+        })
+    }
+
+    fn custom(ranges: &str, f: &str) -> DataValidation {
+        DataValidation {
+            ranges: ranges.split(' ').map(area).collect(),
+            kind: "custom".into(),
+            formula1: f.into(),
+            show_error: true,
+            ..Default::default()
+        }
+    }
+
+    /// The formula the rule covering `cell` of sheet `s` checks there.
+    fn seen(wb: &Workbook, s: usize, cell: &str) -> Option<String> {
+        let (r, c) = at(cell);
+        validation_at(&wb.sheets[s], r, c).map(|dv| as_seen_from(dv, r, c).formula1)
+    }
+
+    /// Cut `from` on sheet `src` and paste it at `to` on sheet `dst`.
+    fn cut(wb: &mut Workbook, src: usize, from: &str, dst: usize, to: &str) -> bool {
+        let rect = area(from);
+        let (r, c) = at(to);
+        let names: Vec<String> = wb.sheets.iter().map(|s| s.name.clone()).collect();
+        let mv = CellMove {
+            src: &names[src],
+            dst: &names[dst],
+            rect,
+            dr: i64::from(r) - i64::from(rect.0),
+            dc: i64::from(c) - i64::from(rect.1),
+        };
+        cut_rules(wb, src, dst, &mv, true)
+    }
+
+    fn assert_seen(wb: &Workbook, s: usize, cases: &[(&str, Option<&str>)]) {
+        for &(cell, want) in cases {
+            assert_eq!(seen(wb, s, cell).as_deref(), want, "{cell}");
+        }
+    }
+
+    #[test]
+    fn a_cut_of_part_of_a_rule_reading_the_row_above() {
+        let mut wb = sheets(&["Sheet1"]);
+        wb.sheets[0].validations.push(custom("A2:A20", "A2>A1"));
+        cut(&mut wb, 0, "A5:A10", 0, "C5");
+        assert_seen(
+            &wb,
+            0,
+            &[
+                ("C5", Some("C5>A4")),
+                ("C6", Some("C6>C5")),
+                ("C10", Some("C10>C9")),
+                ("A2", Some("A2>A1")),
+                ("A4", Some("A4>A3")),
+                ("A11", Some("A11>C10")),
+                ("A12", Some("A12>A11")),
+                ("A20", Some("A20>A19")),
+                ("A5", None),
+                ("A10", None),
+                ("C4", None),
+                ("C11", None),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_cut_of_part_of_a_rule_reading_the_row_below() {
+        let mut wb = sheets(&["Sheet1"]);
+        wb.sheets[0].validations.push(custom("A2:A20", "A2>A3"));
+        cut(&mut wb, 0, "A5:A10", 0, "C5");
+        assert_seen(
+            &wb,
+            0,
+            &[
+                ("C5", Some("C5>C6")),
+                ("C9", Some("C9>C10")),
+                ("C10", Some("C10>A11")),
+                ("A3", Some("A3>A4")),
+                ("A4", Some("A4>C5")),
+                ("A11", Some("A11>A12")),
+                ("A7", None),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_cut_of_two_cells_of_a_rule_reading_the_row_above() {
+        let mut wb = sheets(&["Sheet1"]);
+        wb.sheets[0].validations.push(custom("B2:B10", "B2>B1"));
+        cut(&mut wb, 0, "B5:B6", 0, "D5");
+        assert_seen(
+            &wb,
+            0,
+            &[
+                ("D5", Some("D5>B4")),
+                ("D6", Some("D6>D5")),
+                ("B7", Some("B7>D6")),
+                ("B8", Some("B8>B7")),
+                ("B4", Some("B4>B3")),
+                ("B5", None),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_cut_of_a_whole_row_rule_reading_its_left_neighbour() {
+        let mut wb = sheets(&["Sheet1"]);
+        wb.sheets[0].validations.push(custom("B2:C2", "B2>A2"));
+        cut(&mut wb, 0, "B2:C2", 0, "D2");
+        assert_seen(
+            &wb,
+            0,
+            &[
+                ("D2", Some("D2>A2")),
+                ("E2", Some("E2>D2")),
+                ("B2", None),
+                ("C2", None),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_cut_of_a_rule_cell_and_the_cell_it_reads() {
+        let mut wb = sheets(&["Sheet1"]);
+        wb.sheets[0].validations.push(custom("B2:B10", "B2>A2"));
+        cut(&mut wb, 0, "A5:B5", 0, "D5");
+        assert_seen(
+            &wb,
+            0,
+            &[
+                ("E5", Some("E5>D5")),
+                ("B4", Some("B4>A4")),
+                ("B6", Some("B6>A6")),
+                ("B5", None),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_cut_of_the_anchor_cell_leaves_the_rest_reading_their_own_cells() {
+        let mut wb = sheets(&["Sheet1"]);
+        wb.sheets[0].validations.push(custom("B2:B10", "B2>0"));
+        cut(&mut wb, 0, "B2", 0, "D2");
+        assert_seen(
+            &wb,
+            0,
+            &[
+                ("D2", Some("D2>0")),
+                ("B3", Some("B3>0")),
+                ("B10", Some("B10>0")),
+                ("B2", None),
+            ],
+        );
+        // Every cell still reads itself: one rule.
+        assert_eq!(wb.sheets[0].validations.len(), 1);
+    }
+
+    #[test]
+    fn an_absolute_reference_follows_the_cell_it_names() {
+        let mut wb = sheets(&["Sheet1"]);
+        wb.sheets[0].validations.push(custom("B2", "$A$2>0"));
+        cut(&mut wb, 0, "A2:B2", 0, "A3");
+        assert_seen(&wb, 0, &[("B3", Some("$A$3>0")), ("B2", None)]);
+    }
+
+    #[test]
+    fn a_cut_to_another_sheet_qualifies_what_each_side_reads() {
+        let mut wb = sheets(&["Sheet1", "Sheet2"]);
+        wb.sheets[0].validations.push(custom("A2:A10", "A2>A1"));
+        cut(&mut wb, 0, "A5", 1, "C5");
+        assert_seen(&wb, 1, &[("C5", Some("C5>Sheet1!A4")), ("C6", None)]);
+        assert_seen(
+            &wb,
+            0,
+            &[
+                ("A4", Some("A4>A3")),
+                ("A5", None),
+                ("A6", Some("A6>Sheet2!C5")),
+                ("A7", Some("A7>A6")),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_rule_on_a_third_sheet_follows_only_where_it_read_the_cut() {
+        let mut wb = sheets(&["Sheet1", "Sheet2", "Sheet3"]);
+        wb.sheets[2]
+            .validations
+            .push(custom("A1:A10", "Sheet1!A1>0"));
+        cut(&mut wb, 0, "A5:A6", 1, "C5");
+        assert_seen(
+            &wb,
+            2,
+            &[
+                ("A4", Some("Sheet1!A4>0")),
+                ("A5", Some("Sheet2!C5>0")),
+                ("A6", Some("Sheet2!C6>0")),
+                ("A7", Some("Sheet1!A7>0")),
+            ],
+        );
+    }
+
+    fn names_book() -> Workbook {
+        let mut wb = sheets(&["Sheet1", "Sheet2"]);
+        for (r, item) in ["Red", "Green", "Blue"].iter().enumerate() {
+            wb.sheets[0].cells.insert((r as u32, 0), Cell::text(item));
+        }
+        wb.sheets[1].cells.insert((0, 25), Cell::text("Other"));
+        wb.sheets[0].validations.push(DataValidation {
+            ranges: vec![area("B1:B5")],
+            kind: "list".into(),
+            formula1: "Choices".into(),
+            show_dropdown: true,
+            ..Default::default()
+        });
+        wb
+    }
+
+    fn name(wb: &mut Workbook, scope: Option<usize>, formula: &str) {
+        wb.defined_names.push(crate::sheet::DefinedName {
+            name: "Choices".into(),
+            scope,
+            formula: formula.into(),
+        });
+    }
+
+    fn labels(wb: &Workbook, s: usize, cell: &str) -> Vec<String> {
+        let (r, c) = at(cell);
+        list_choices(wb, s, r, c, None)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| c.label)
+            .collect()
+    }
+
+    #[test]
+    fn a_sheet_scoped_list_name_moved_to_another_sheet_keeps_its_items() {
+        let mut wb = names_book();
+        name(&mut wb, Some(0), "Sheet1!$A$1:$A$3");
+        cut(&mut wb, 0, "B2", 1, "C2");
+        assert_seen(&wb, 1, &[("C2", Some("Sheet1!$A$1:$A$3"))]);
+        assert_eq!(labels(&wb, 1, "C2"), ["Red", "Green", "Blue"]);
+        // The cells left keep the name.
+        assert_seen(&wb, 0, &[("B1", Some("Choices")), ("B3", Some("Choices"))]);
+    }
+
+    #[test]
+    fn a_workbook_list_name_shadowed_on_the_destination_keeps_its_items() {
+        let mut wb = names_book();
+        name(&mut wb, None, "Sheet1!$A$1:$A$3");
+        name(&mut wb, Some(1), "Sheet2!$Z$1");
+        cut(&mut wb, 0, "B2", 1, "C2");
+        assert_eq!(labels(&wb, 1, "C2"), ["Red", "Green", "Blue"]);
+    }
+
+    #[test]
+    fn a_workbook_list_name_moved_to_another_sheet_stays_a_name() {
+        let mut wb = names_book();
+        name(&mut wb, None, "Sheet1!$A$1:$A$3");
+        cut(&mut wb, 0, "B2", 1, "C2");
+        assert_seen(&wb, 1, &[("C2", Some("Choices"))]);
+        assert_eq!(labels(&wb, 1, "C2"), ["Red", "Green", "Blue"]);
+    }
+
+    #[test]
+    fn a_rule_whose_name_cannot_be_carried_stays_on_its_cells() {
+        let mut wb = names_book();
+        name(&mut wb, Some(0), "OFFSET(Sheet1!$A$1,0,0,3,1)");
+        cut(&mut wb, 0, "B2", 1, "C2");
+        assert_seen(&wb, 1, &[("C2", None)]);
+        assert_seen(&wb, 0, &[("B2", Some("Choices")), ("B5", Some("Choices"))]);
+    }
+
+    #[test]
+    fn a_name_defined_on_the_cut_cells_follows_them() {
+        let mut wb = names_book();
+        name(&mut wb, Some(0), "Sheet1!$A$1:$A$3");
+        // The list's own cells move with the rule cell.
+        cut(&mut wb, 0, "A1:B3", 1, "A1");
+        assert_seen(&wb, 1, &[("B2", Some("$A$1:$A$3"))]);
+    }
+
+    #[test]
+    fn the_landing_cells_lose_their_rules_and_rules_out_of_reach_keep_their_text() {
+        let mut wb = sheets(&["Sheet1"]);
+        wb.sheets[0].validations.push(DataValidation {
+            ix: Some(0),
+            ..custom("A1:A3", "A1>0")
+        });
+        let untouched = DataValidation {
+            ix: Some(1),
+            error: "far".into(),
+            ..custom("F1:F9", "  f1 >  0 ")
+        };
+        wb.sheets[0].validations.push(untouched.clone());
+        wb.sheets[0].validations.push(DataValidation {
+            ix: Some(2),
+            error: "landing".into(),
+            ..custom("C1:C9", "C1<5")
+        });
+        cut(&mut wb, 0, "A2", 0, "C4");
+        assert_seen(
+            &wb,
+            0,
+            &[
+                ("C4", Some("C4>0")),
+                ("C3", Some("C3<5")),
+                ("C5", Some("C5<5")),
+                ("A1", Some("A1>0")),
+                ("A3", Some("A3>0")),
+                ("A2", None),
+            ],
+        );
+        assert!(wb.sheets[0].validations.contains(&untouched));
+        let mut gone = wb.sheets[0].dv_removed.clone();
+        gone.sort_unstable();
+        assert_eq!(gone, [0, 2]);
+    }
+
+    #[test]
+    fn a_cut_overlapping_where_it_lands() {
+        let mut wb = sheets(&["Sheet1"]);
+        wb.sheets[0].validations.push(custom("A1:A5", "A1>0"));
+        wb.sheets[0].validations.push(DataValidation {
+            error: "below".into(),
+            ..custom("A6:A10", "A6<9")
+        });
+        cut(&mut wb, 0, "A1:A5", 0, "A3");
+        assert_seen(
+            &wb,
+            0,
+            &[
+                ("A1", None),
+                ("A2", None),
+                ("A3", Some("A3>0")),
+                ("A7", Some("A7>0")),
+                ("A8", Some("A8<9")),
+                ("A10", Some("A10<9")),
+            ],
+        );
+    }
+
+    #[test]
+    fn an_inline_list_moves_by_position() {
+        let mut wb = sheets(&["Sheet1"]);
+        wb.sheets[0].validations.push(DataValidation {
+            ranges: vec![area("A1:A3")],
+            kind: "list".into(),
+            formula1: "\"a,b\"".into(),
+            ..Default::default()
+        });
+        cut(&mut wb, 0, "A2", 0, "C2");
+        assert_seen(
+            &wb,
+            0,
+            &[
+                ("C2", Some("\"a,b\"")),
+                ("A1", Some("\"a,b\"")),
+                ("A3", Some("\"a,b\"")),
+                ("A2", None),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_whole_column_rule_splits_into_a_few_parts() {
+        let mut wb = sheets(&["Sheet1"]);
+        let column = format!("A2:A{MAX_ROWS}");
+        wb.sheets[0].validations.push(custom(&column, "A2>A1"));
+        let t = std::time::Instant::now();
+        cut(&mut wb, 0, "A5:A6", 0, "C5");
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+        let ranges: usize = wb.sheets[0]
+            .validations
+            .iter()
+            .map(|dv| dv.ranges.len())
+            .sum();
+        assert!(ranges <= 6, "{:?}", wb.sheets[0].validations);
+        let last = format!("A{MAX_ROWS}");
+        let above = format!("A{}", MAX_ROWS - 1);
+        assert_seen(
+            &wb,
+            0,
+            &[
+                ("C5", Some("C5>A4")),
+                ("C6", Some("C6>C5")),
+                ("A7", Some("A7>C6")),
+                ("A8", Some("A8>A7")),
+                (&last, Some(&format!("{last}>{above}"))),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_destination_that_cannot_hold_rules_leaves_the_cut_rules_in_place() {
+        let mut wb = sheets(&["Sheet1", "Sheet2"]);
+        wb.sheets[0].validations.push(custom("A2:A10", "A2>A1"));
+        let mv = CellMove {
+            src: "Sheet1",
+            dst: "Sheet2",
+            rect: area("A5"),
+            dr: 0,
+            dc: 2,
+        };
+        assert!(cut_rules(&mut wb, 0, 1, &mv, false));
+        assert!(wb.sheets[1].validations.is_empty());
+        // Left on its cell, the rule reads what a cell outside the cut does;
+        // the next cell's reference follows the value to Sheet2.
+        assert_seen(
+            &wb,
+            0,
+            &[("A5", Some("Sheet2!C5>A4")), ("A6", Some("A6>Sheet2!C5"))],
+        );
+        // Nothing of a cut without rules is kept back.
+        let none = CellMove {
+            rect: area("D1"),
+            ..mv
+        };
+        assert!(!cut_rules(&mut wb, 0, 1, &none, false));
+    }
+
+    /// Would typing 1 into `cell` of sheet 0 be refused?
+    fn refuses(wb: &mut Workbook, cell: &str) -> bool {
+        let (r, c) = at(cell);
+        let entry = entry_cell(wb, 0, r, c, "1", None).unwrap();
+        check_entry(wb, 0, r, c, &entry, None).is_some()
+    }
+
+    #[test]
+    fn a_custom_rule_led_by_a_quote_follows_its_cells() {
+        let mut wb = sheets(&["Sheet1"]);
+        for r in 1..10 {
+            let yes = if r == 4 || r == 5 { "Y" } else { "N" };
+            wb.sheets[0].cells.insert((r, 0), Cell::text(yes)); // A5, A6 "Y"
+        }
+        wb.sheets[0].validations.push(custom("B2:B10", "\"Y\"=A2"));
+        cut(&mut wb, 0, "B5", 0, "D5");
+        // D5 reads A5 (Y), as B5 did; B3 still reads A3 (N), B6 A6 (Y).
+        assert!(!refuses(&mut wb, "D5"));
+        assert!(refuses(&mut wb, "B3"));
+        assert!(!refuses(&mut wb, "B6"));
+        assert!(refuses(&mut wb, "B7"));
+        assert_seen(&wb, 0, &[("D5", Some("\"Y\"=A5")), ("B5", None)]);
+    }
+
+    #[test]
+    fn parts_of_a_quote_led_rule_reading_the_same_cell_stay_apart() {
+        let mut wb = sheets(&["Sheet1"]);
+        wb.sheets[0].cells.insert(at("A2"), Cell::text("Y"));
+        wb.sheets[0].cells.insert(at("A3"), Cell::text("N"));
+        wb.sheets[0].validations.push(custom("B2:B3", "\"Y\"=A2"));
+        // A3's value lands on A2: B2 and B3 now both read A2, written
+        // alike from different corners, which `add_ranges` would join into
+        // one rule that B3 reads as A3.
+        cut(&mut wb, 0, "A3", 0, "A2");
+        assert!(!refuses(&mut wb, "B2"));
+        assert!(!refuses(&mut wb, "B3"));
+    }
+
+    #[test]
+    fn a_rule_whose_cells_stay_keeps_its_element_and_only_its_text_changes() {
+        let mut wb = sheets(&["Sheet1", "Sheet2", "Sheet3"]);
+        let rule = DataValidation {
+            ix: Some(0),
+            ..custom("A1:A10", "Sheet1!$A$5>0")
+        };
+        wb.sheets[2].validations.push(DataValidation {
+            orig: Some(Box::new(rule.clone())),
+            ..rule
+        });
+        cut(&mut wb, 0, "A5", 0, "C5");
+        let s = &wb.sheets[2];
+        assert_eq!(s.validations.len(), 1);
+        let dv = &s.validations[0];
+        assert_eq!(dv.ix, Some(0));
+        assert!(dv.orig.is_some());
+        assert_eq!(dv.ranges, [area("A1:A10")]);
+        assert_eq!(dv.formula1, "Sheet1!$C$5>0");
+        assert!(s.dv_removed.is_empty());
+    }
+
+    #[test]
+    fn a_cut_pasted_where_it_was_changes_no_rule() {
+        let mut wb = sheets(&["Sheet1"]);
+        wb.sheets[0].validations.push(DataValidation {
+            ix: Some(3),
+            ..custom("A2:A20", "A2>A1")
+        });
+        let before = wb.sheets[0].validations.clone();
+        assert!(!cut(&mut wb, 0, "A5:A10", 0, "A5"));
+        assert_eq!(wb.sheets[0].validations, before);
+        assert!(wb.sheets[0].dv_removed.is_empty());
+    }
+
+    #[test]
+    fn move_refs_leaves_validation_rules_to_cut_rules() {
+        let mut wb = sheets(&["Sheet1"]);
+        wb.sheets[0].validations.push(custom("B2:B10", "B2>0"));
+        let mv = CellMove {
+            src: "Sheet1",
+            dst: "Sheet1",
+            rect: area("B2"),
+            dr: 0,
+            dc: 2,
+        };
+        crate::edit::move_refs(&mut wb, 0, &mv);
+        assert_eq!(wb.sheets[0].validations[0].formula1, "B2>0");
     }
 }

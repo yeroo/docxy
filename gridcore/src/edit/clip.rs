@@ -142,29 +142,35 @@ pub fn tiled_block(
 
 /// Rewrite every formula in the workbook for the cut-and-paste `mv` of the
 /// cells in `mv.rect` on sheet `src` to sheet `dst`: cell formulas on every
-/// sheet, conditional-format and validation rules, and defined names. A
-/// reference to a moved cell (a range: both corners) follows it
-/// ([`move_ref_expr`]). The moved cells' own formulas are left to the
-/// caller ([`crate::formula::move_block_formula`]); a formula the move
-/// doesn't reach keeps its text exactly, and a shared formula held verbatim
-/// is left alone, as an insert or delete leaves it.
+/// sheet, conditional-format rules, and defined names. A reference to a
+/// moved cell (a range: both corners) follows it ([`move_ref_expr`]). The
+/// moved cells' own formulas are left to the caller
+/// ([`crate::formula::move_block_formula`]), and validation rules to
+/// [`crate::validation::cut_rules`], called first: a rule's cells may lie
+/// partly inside the cut, so its formula, written once for its anchor, is
+/// rewritten part by part (#1050). A formula the move doesn't reach keeps
+/// its text exactly, and a shared formula held verbatim is left alone, as an
+/// insert or delete leaves it.
 pub fn move_refs(wb: &mut Workbook, src: usize, mv: &CellMove) {
-    move_refs_with(wb, src, mv, |_, _| true);
+    move_refs_with(wb, src, mv, |_, _| true, false);
 }
 
-/// [`move_refs`], rewriting only the conditional-format and validation rules
-/// `rules` takes (given the rule's sheet and ranges): a move that leaves
-/// some rules' ranges in place (the data form's Delete) leaves their
+/// Rewrite every formula in the workbook for the move `mv` of the cells in
+/// `mv.rect` on sheet `src`, as [`move_refs`] does, but of the
+/// conditional-format rules (and, with `validations`, the validation rules)
+/// only those `rules` takes, given the rule's sheet and ranges: a move that
+/// leaves some rules' ranges in place (the data form's Delete) leaves their
 /// formulas too, so each keeps reading relative to its own range.
 pub(super) fn move_refs_with(
     wb: &mut Workbook,
     src: usize,
     mv: &CellMove,
     rules: impl Fn(usize, &[Area]) -> bool,
+    validations: bool,
 ) {
     let names: Vec<String> = wb.sheets.iter().map(|s| s.name.clone()).collect();
     let (r0, c0, r1, c1) = mv.rect;
-    rewrite_workbook_formulas(wb, rules, |e, site| {
+    rewrite_workbook_formulas(wb, rules, validations, |e, site| {
         let (sheet, cell) = (site.sheet, site.cell);
         let moved = sheet == Some(src)
             && cell.is_some_and(|(r, c)| (r0..=r1).contains(&r) && (c0..=c1).contains(&c));
