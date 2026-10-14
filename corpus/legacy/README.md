@@ -88,12 +88,17 @@ legacy array formulas (`{=SUM(A1:A3*B1:B3)}`, `{=SUM(IF(…))}`,
 `{=INDEX(A1:A3*2,2)}`, a multi-cell `{=A1:A3*2}`), a defined name
 `Doubled = Data!$A$1:$A$3*2` and a dynamic array typed as Excel 365 does,
 which its `.xls` holds as a legacy array over the spill.
-`array-classes-2` has 37 formula shapes three ways (a plain cell formula on
+`array-classes-2` has 49 formula shapes three ways (a plain cell formula on
 sheet Cell, a legacy array on Arr, a dynamic array on Dyn) and six names
 over array expressions: values under reference parameters, forced-value
 parameters (INDEX's row, VLOOKUP's lookup value), unary minus, percent and
-comparisons inside calls. Their tokens are the oracle for the operand
-classes the writer gives in every context.
+comparisons inside calls, array arguments (LOOKUP, INDEX, IRR, TREND,
+LINEST, FREQUENCY). `array-classes-3` has the newer functions written the
+same three ways (PERCENTILE.INC and the other twins, XLOOKUP, XMATCH,
+FILTER, UNIQUE, SORT, SORTBY, IFS, SWITCH, TEXTJOIN, MAXIFS, ...), the
+Analysis ToolPak's EDATE and WEEKNUM, and XLLTWICE, which the test XLL
+registers (`scripts/xll-fixture`, built by the script). Their tokens are
+the oracle for the operand classes the writer gives in every context.
 
 ## Regenerating
 
