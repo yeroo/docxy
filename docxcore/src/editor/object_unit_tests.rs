@@ -548,3 +548,82 @@ fn a_tracked_cut_and_paste_never_doubles_an_equation_1242() {
     ed.insert_equation("y", false);
     assert_eq!(eqs(&ed), 2);
 }
+
+/// `ab` / `c<eq>d` / `ef` and a 1×2 table whose second cell holds `x<eq>`.
+fn three_paras_and_a_table() -> Editor {
+    let cell = |inner: &str| format!("<w:tc><w:p>{inner}</w:p></w:tc>");
+    Editor::new(parse_document_xml(
+        &format!(
+            "<w:document><w:body><w:p>{}</w:p><w:p>{}{EQ}{}</w:p><w:p>{}</w:p>\
+             <w:tbl><w:tr>{}{}</w:tr></w:tbl><w:p/></w:body></w:document>",
+            t("ab"),
+            t("c"),
+            t("d"),
+            t("ef"),
+            cell(&t("y")),
+            cell(&format!("{}{EQ}", t("x"))),
+        ),
+        &Relationships::default(),
+    ))
+}
+
+/// FIX r2 M1: the text of a plain-text cut leaves out exactly the equations
+/// its delete keeps, whichever spans the selection has: one in a paragraph
+/// it removes whole, or in a cell range it clears, is copied, never lost.
+#[test]
+fn a_plain_text_cut_copies_every_equation_it_removes_1242() {
+    let eqs = |ed: &Editor| saved(ed).matches("<m:oMath>").count();
+    // Ending at the start of the paragraph after the equation's: the
+    // equation's paragraph goes whole, its text copied.
+    let mut ed = three_paras_and_a_table();
+    select(&mut ed, vec![0], 1, 0);
+    ed.caret = Caret::at(vec![2], 0);
+    let text = ed.cut_text().expect("text");
+    assert!(text.contains("cx+1d"), "{text:?}");
+    assert_eq!(eqs(&ed), 1, "only the table's left");
+    // Starting at the end of the paragraph before it.
+    let mut ed = three_paras_and_a_table();
+    select(&mut ed, vec![0], 2, 0);
+    ed.caret = Caret::at(vec![2], 1);
+    let text = ed.cut_text().expect("text");
+    assert!(text.contains("cx+1d"), "{text:?}");
+    assert_eq!(eqs(&ed), 1);
+    // Over a cell range: the cells are cleared, the equation's text copied.
+    let mut ed = three_paras_and_a_table();
+    select(&mut ed, vec![3, 0, 0, 0], 0, 0);
+    ed.caret = Caret::at(vec![3, 0, 1, 0], 1);
+    assert!(ed.cell_range().is_some());
+    let text = ed.cut_text().expect("text");
+    assert!(text.contains("xx+1"), "{text:?}");
+    assert_eq!(eqs(&ed), 1, "only the paragraph's left");
+}
+
+/// FIX r2 M2: a tracked cut over a cell range clears the cells (keeping
+/// nothing), so its clip carries their equations: a paste brings them back.
+#[test]
+fn a_tracked_cut_of_cells_carries_their_equations_1242() {
+    let mut ed = three_paras_and_a_table();
+    track(&mut ed);
+    select(&mut ed, vec![3, 0, 0, 0], 0, 0);
+    ed.caret = Caret::at(vec![3, 0, 1, 0], 1);
+    let clip = ed.cut().expect("a clip");
+    assert!(
+        clip.paras
+            .iter()
+            .flatten()
+            .any(|i| matches!(i, Inline::Equation { .. })),
+        "{clip:?}"
+    );
+    // And a paragraph cut while tracking still leaves its equation out.
+    let mut ed = three_paras_and_a_table();
+    track(&mut ed);
+    select(&mut ed, vec![1], 0, 3);
+    let clip = ed.cut().expect("a clip");
+    assert!(
+        !clip
+            .paras
+            .iter()
+            .flatten()
+            .any(|i| matches!(i, Inline::Equation { .. }))
+    );
+}

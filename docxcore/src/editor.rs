@@ -1965,9 +1965,9 @@ impl Editor {
     pub fn cut(&mut self) -> Option<Clip> {
         self.widen_selection_over_loose_fields();
         let mut clip = self.copy()?;
-        // A tracked delete keeps every equation, so the clip leaves them
-        // out: a paste must not add a second (#1242).
-        if self.track.is_some() {
+        // A tracked delete keeps every equation (a cell range's aside), so
+        // the clip leaves them out: a paste must not add a second (#1242).
+        if self.delete_keeps_equations_in(&self.caret.path, false) {
             clip = without_equations(&clip);
         }
         self.delete_selection_keeping_objects();
@@ -2586,25 +2586,39 @@ impl Editor {
         self.selection_text_with(false)
     }
 
-    /// [`Editor::selection_text`]; `keeping_units` leaves out the text of
-    /// the equations a plain-text cut keeps in place ([`Editor::cut_text`]):
-    /// those in the first and last paragraphs, and while tracking every one
-    /// (a tracked delete keeps an equation).
-    fn selection_text_with(&self, keeping_units: bool) -> String {
-        let spans = self.selection_spans();
-        let last = spans.len().saturating_sub(1);
-        let tracking = self.track.is_some();
-        spans
+    /// [`Editor::selection_text`]; `keep_units` leaves out the text of the
+    /// equations a plain-text cut keeps in place ([`Editor::cut_text`],
+    /// see [`Editor::delete_keeps_equations_in`]).
+    fn selection_text_with(&self, keep_units: bool) -> String {
+        self.selection_spans()
             .iter()
-            .enumerate()
-            .filter_map(|(k, (path, s, e))| {
-                let kept = tracking || k == 0 || k == last;
-                let equations = !(keeping_units && kept);
+            .filter_map(|(path, s, e)| {
+                let equations = !self.delete_keeps_equations_in(path, keep_units);
                 resolve_para(&self.doc.body, path)
                     .map(|p| display_text(&p.content, *s, *e, equations))
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Whether deleting the selection keeps the equations in the paragraph
+    /// at `path` (#1242), as [`Editor::delete_selection_with`] does: a cell
+    /// range's delete keeps nothing; while tracking a delete keeps every
+    /// equation; else `keep_units` (a plain-text cut) keeps them in the
+    /// paragraphs where the selection starts and ends, and the paragraphs
+    /// between go whole. The copied text and clip follow it, so a cut
+    /// never both keeps an equation and carries it, nor drops it from both.
+    fn delete_keeps_equations_in(&self, path: &[usize], keep_units: bool) -> bool {
+        if self.cell_range().is_some() {
+            return false;
+        }
+        if self.track.is_some() {
+            return true;
+        }
+        keep_units
+            && self
+                .selection_range()
+                .is_some_and(|(lo, hi)| lo.path == path || hi.path == path)
     }
 
     /// Toggle a run property over the selection. The new value is "off" only if
