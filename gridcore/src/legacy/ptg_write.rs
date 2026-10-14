@@ -533,8 +533,12 @@ impl Compiler<'_> {
             Expr::Un(UnOp::Implicit, x) => {
                 self.call("_XLFN.SINGLE", std::slice::from_ref(x), cls)?;
             }
+            // A negative number literal is the number, as Excel stores it.
+            Expr::Un(UnOp::Neg, x) if matches!(**x, Expr::Num(_)) => {
+                let Expr::Num(n) = **x else { unreachable!() };
+                self.number(-n);
+            }
             Expr::Un(op, x) => {
-                // A negative number literal is the number.
                 self.operand(x, cls.operand(), prec(x) < prec(e))?;
                 self.push(&[match op {
                     UnOp::Pos => 0x12,
