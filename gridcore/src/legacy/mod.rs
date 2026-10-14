@@ -166,9 +166,41 @@ pub fn open_workbook_ex(data: &[u8]) -> Result<Opened, OpenError> {
         if has("\u{5}SummaryInformation") || has("\u{5}DocumentSummaryInformation") {
             book.dropped.insert("document properties");
         }
-        let dropped = book.dropped.iter().map(|d| d.to_string()).collect();
+        // A PivotTable's cache.
+        if cfb
+            .paths()
+            .iter()
+            .any(|p| p.to_ascii_lowercase().starts_with("_sx_db_cur"))
+        {
+            book.dropped.insert("PivotTables");
+        }
+        let mut dropped: Vec<String> = book.dropped.iter().map(|d| d.to_string()).collect();
+        let (formulas, names) = (book.unread_formulas, book.unread_names);
+        let (pkg, more_formulas, more_names) = book.build_counted();
+        let plural = |n: usize, one: &str, many: &str| {
+            if n == 1 {
+                format!("1 {one}")
+            } else {
+                format!("{n} {many}")
+            }
+        };
+        if formulas + more_formulas > 0 {
+            dropped.push(plural(
+                formulas + more_formulas,
+                "formula that refers to another workbook or can't be read (kept as its value)",
+                "formulas that refer to other workbooks or can't be read (kept as values)",
+            ));
+        }
+        if names + more_names > 0 {
+            dropped.push(plural(
+                names + more_names,
+                "defined name that can't be read",
+                "defined names that can't be read",
+            ));
+        }
+        dropped.sort();
         return Ok(Opened {
-            pkg: book.build(),
+            pkg,
             format: SourceFormat::Xls,
             dropped,
         });
@@ -269,6 +301,13 @@ pub(crate) struct BookIn {
     pub dropped: BTreeSet<&'static str>,
     /// The sheet the workbook opens on (an index into `sheets`).
     pub active: usize,
+    /// Iterative calculation: (max iterations, max change), when on.
+    pub iterate: Option<(u32, f64)>,
+    /// Formulas the reader couldn't read, kept as their values (a reference
+    /// into another workbook, a token it doesn't know).
+    pub unread_formulas: usize,
+    /// Defined names the reader couldn't read, left out.
+    pub unread_names: usize,
     pub names: Vec<DefinedName>,
     /// The external books formulas name, `[1]` first.
     pub external_links: Vec<ExternalLink>,
@@ -361,7 +400,16 @@ impl BookIn {
     /// Formula text goes through [`crate::formula::file_formula`], so it is
     /// stored as [`load_xlsx`] would store it. Sheet names are made valid
     /// for Excel ([`valid_sheet_names`]).
-    pub fn build(mut self) -> SheetPackage {
+    pub fn build(self) -> SheetPackage {
+        self.build_counted().0
+    }
+
+    /// [`BookIn::build`], with how many formulas and names the reader read
+    /// but the build couldn't keep (one naming another book's name on a
+    /// renamed sheet), on top of [`BookIn::unread_formulas`] and
+    /// [`BookIn::unread_names`].
+    pub fn build_counted(mut self) -> (SheetPackage, usize, usize) {
+        let (mut lost_formulas, mut lost_names) = (0, 0);
         if self.sheets.is_empty() {
             self.sheets.push(SheetIn {
                 name: "Sheet1".to_string(),
@@ -409,7 +457,10 @@ impl BookIn {
             let s = &mut pkg.workbook.sheets[at];
             for (key, mut cell) in sheet.cells {
                 cell.style = xf_of.get(cell.style as usize).copied().unwrap_or(0);
-                cell.formula = cell.formula.take().and_then(|f| fix(f, false));
+                if let Some(f) = cell.formula.take() {
+                    cell.formula = fix(f, false);
+                    lost_formulas += usize::from(cell.formula.is_none());
+                }
                 s.cells.insert(key, cell);
             }
             s.merges = sheet.merges;
@@ -440,14 +491,16 @@ impl BookIn {
         pkg.workbook.active_tab = self.active.min(pkg.workbook.sheets.len() - 1);
         for mut name in self.names {
             let Some(formula) = fix(name.formula, true) else {
+                lost_names += 1;
                 continue;
             };
             name.formula = formula;
             pkg.workbook.defined_names.push(name);
         }
         pkg.workbook.date1904 = self.date1904;
+        pkg.workbook.iterate = self.iterate;
         write_external_links(&mut pkg, &self.external_links);
-        pkg
+        (pkg, lost_formulas, lost_names)
     }
 }
 

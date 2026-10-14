@@ -497,6 +497,9 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
                     let state = c.u8()?;
                     let dt = c.u8()?;
                     g.sheets.push(c.short_string()?);
+                    if state & 0x03 == 2 {
+                        book.dropped.insert("very hidden sheets (saved as hidden)");
+                    }
                     plies.push((pos, dt, state & 0x03 != 0));
                 }
                 0x00FC => {
@@ -708,11 +711,15 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
             t => match imported.get(t as usize - 1).copied().flatten() {
                 Some(s) => Some(s),
                 // Scoped to a chart or macro sheet that wasn't imported.
-                None => continue,
+                None => {
+                    book.unread_names += 1;
+                    continue;
+                }
             },
         };
         let Some(formula) = ptg::decompile(Biff::V8, &n.rgce, &n.extra, Base::Cell(None), &g)
         else {
+            book.unread_names += 1;
             continue;
         };
         book.names.push(DefinedName {
@@ -749,6 +756,7 @@ fn read_sheet(
 ) -> Result<SheetIn, OpenError> {
     let mut sheet = SheetIn::default();
     let mut frozen = false;
+    let (mut iteration, mut calc_count, mut delta) = (None, None, None);
     let mut cells = BTreeMap::new();
     // Cells charged to the workbook's budget so far.
     let mut charged = 0usize;
@@ -898,10 +906,12 @@ fn read_sheet(
                             at,
                             master: (mr, mc),
                         });
-                    } else if let Some(f) =
-                        ptg::decompile(Biff::V8, rgce, extra, Base::Cell(Some(at)), g)
-                    {
-                        cells.get_mut(&at)?.formula = Some(f);
+                    } else {
+                        match ptg::decompile(Biff::V8, rgce, extra, Base::Cell(Some(at)), g) {
+                            Some(f) => cells.get_mut(&at)?.formula = Some(f),
+                            None if cells.contains_key(&at) => book.unread_formulas += 1,
+                            None => {}
+                        }
                     }
                 }
                 0x0207 => {
@@ -972,7 +982,35 @@ fn read_sheet(
                         sheet.rows.push((row as u32, height, hidden));
                     }
                 }
-                0x023E => frozen = c.u16()? & 0x0008 != 0,
+                0x023E => {
+                    let grbit = c.u16()?;
+                    frozen = grbit & 0x0008 != 0;
+                    // Gridlines hidden: a view setting the model lacks.
+                    if grbit & 0x0002 == 0 {
+                        book.dropped.insert("sheet view settings");
+                    }
+                }
+                // SCL: a zoom other than 100%.
+                0x00A0 if c.u16()? != c.u16()? => {
+                    book.dropped.insert("sheet view settings");
+                }
+                0x00B0 => {
+                    book.dropped.insert("PivotTables");
+                }
+                0x00AE => {
+                    book.dropped.insert("scenarios");
+                }
+                0x01AD => {
+                    book.dropped.insert("external data ranges");
+                }
+                // PRINTHEADERS, PRINTGRIDLINES, HCENTER, VCENTER.
+                0x002A | 0x002B | 0x0083 | 0x0084 if c.u16()? != 0 => {
+                    book.dropped.insert("page setup");
+                }
+                // Iterative calculation, the same in every sheet's block.
+                0x0011 => iteration = Some(c.u16()? != 0),
+                0x000C => calc_count = Some(c.u16()?),
+                0x0010 => delta = Some(c.f64()?),
                 0x0041 if frozen => {
                     let (x, y) = (c.u16()?, c.u16()?);
                     sheet.freeze = (y as u32, x as u32);
@@ -1022,7 +1060,11 @@ fn read_sheet(
                     // footer margins count only with the printer settings.
                     let landscape = grbit & 0x0046 == 0;
                     let set = grbit & 0x0004 == 0;
-                    if (set && (scale != 100 || !near(header, 0.3) || !near(footer, 0.3)))
+                    // Over then down, black and white, draft, comments,
+                    // a first page number.
+                    let options = grbit & 0x00B9 != 0;
+                    if (set
+                        && (scale != 100 || options || !near(header, 0.3) || !near(footer, 0.3)))
                         || landscape
                     {
                         book.dropped.insert("page setup");
@@ -1051,29 +1093,33 @@ fn read_sheet(
             // An array formula lives on its anchor; the other cells of the
             // range hold plain values, as an .xlsx keeps them.
             if p.at == p.master {
-                let Some(f) = ptg::decompile(Biff::V8, rgce, extra, Base::Cell(Some(p.at)), g)
-                else {
+                let Some(cell) = cells.get_mut(&p.at) else {
                     continue;
                 };
-                if let Some(cell) = cells.get_mut(&p.at) {
-                    set_array(cell, *range, f);
-                }
+                let kept = ptg::decompile(Biff::V8, rgce, extra, Base::Cell(Some(p.at)), g)
+                    .is_some_and(|f| set_array(cell, *range, f));
+                book.unread_formulas += usize::from(!kept);
             }
+            continue;
+        }
+        if !cells.contains_key(&p.at) {
             continue;
         }
         // A cell outside the group's stated range still takes it: writers
         // get the range wrong, and the tokens are relative to the cell.
-        let Some((_, rgce, extra)) = shared.get(&p.master) else {
-            continue;
-        };
         let base = Base::Shared(p.at.0, p.at.1);
-        if let Some(f) = ptg::decompile(Biff::V8, rgce, extra, base, g) {
-            if let Some(cell) = cells.get_mut(&p.at) {
-                cell.formula = Some(f);
-            }
+        let f = shared
+            .get(&p.master)
+            .and_then(|(_, rgce, extra)| ptg::decompile(Biff::V8, rgce, extra, base, g));
+        match (f, cells.get_mut(&p.at)) {
+            (Some(f), Some(cell)) => cell.formula = Some(f),
+            _ => book.unread_formulas += 1,
         }
     }
     sheet.cells = cells;
+    if book.sheets.is_empty() && iteration == Some(true) {
+        book.iterate = Some((calc_count.unwrap_or(100) as u32, delta.unwrap_or(0.001)));
+    }
     Ok(sheet)
 }
 
@@ -1595,6 +1641,97 @@ pub(crate) mod tests {
             book.dropped.iter().copied().collect::<Vec<_>>(),
             ["page setup"]
         );
+    }
+
+    /// A formula the reader can't read keeps its value and is counted: one
+    /// whose 3-D reference names another workbook's sheet, one with a
+    /// token it doesn't know; a defined name likewise.
+    #[test]
+    fn unread_formulas_and_names_are_counted() {
+        let other = supbook(b"other.xls", &["Data"]);
+        let xti = extern_sheet(&[(0, 0, 0)]);
+        // ptgRef3d into the external book, and ptgSxName (0x18 + 0x01), which
+        // isn't read.
+        let ext = [0x3A, 0, 0, 0, 0, 0, 0];
+        let unknown = [0x18, 0x01, 0, 0, 0, 0];
+        let mut name = 0u16.to_le_bytes().to_vec();
+        name.push(0);
+        name.push(4);
+        name.extend((ext.len() as u16).to_le_bytes());
+        name.extend([0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        name.extend(b"Ext1");
+        name.extend_from_slice(&ext);
+        let stream = workbook(
+            &[other, xti, rec(0x0018, &name)],
+            &[formula(0, 0, 5.0, &ext), formula(1, 0, 6.0, &unknown)],
+        );
+        let cfb = opccore::cfb::write_cfb(&[("Workbook", stream)]);
+        let o = crate::legacy::open_workbook_ex(&cfb).unwrap();
+        assert_eq!(
+            o.dropped,
+            [
+                "1 defined name that can't be read",
+                "2 formulas that refer to other workbooks or can't be read (kept as values)"
+            ]
+        );
+        let cells = &o.pkg.workbook.sheets[0].cells;
+        assert_eq!(cells[&(0, 0)].value, CellValue::Number(5.0));
+        assert_eq!(cells[&(0, 0)].formula, None);
+    }
+
+    /// What the model lacks of a sheet's views, PivotTables, scenarios,
+    /// external data, print options and very hidden state is named.
+    #[test]
+    fn unmodelled_sheet_records_are_dropped_by_name() {
+        let w2 = |grbit: u16| {
+            let mut b = grbit.to_le_bytes().to_vec();
+            b.extend([0; 16]);
+            rec(0x023E, &b)
+        };
+        let cases: Vec<(Vec<u8>, &str)> = vec![
+            (w2(0x06B4), "sheet view settings"),
+            (rec(0x00A0, &[3, 0, 4, 0]), "sheet view settings"),
+            (rec(0x00B0, &[0; 4]), "PivotTables"),
+            (rec(0x00AE, &[0; 4]), "scenarios"),
+            (rec(0x01AD, &[0; 4]), "external data ranges"),
+            (rec(0x002B, &[1, 0]), "page setup"),
+            (rec(0x0083, &[1, 0]), "page setup"),
+        ];
+        for (r, want) in cases {
+            let book = read(&workbook(&[], &[r])).unwrap();
+            assert_eq!(book.dropped.iter().copied().collect::<Vec<_>>(), [want]);
+        }
+        // Excel's defaults are no loss.
+        let plain = [w2(0x06B6), rec(0x00A0, &[1, 0, 1, 0]), rec(0x002B, &[0, 0])];
+        assert!(read(&workbook(&[], &plain)).unwrap().dropped.is_empty());
+        // SETUP's draft bit, with printer settings.
+        let mut setup = vec![0u8; 34];
+        setup[2] = 100;
+        setup[10] = 0x12;
+        setup[16..24].copy_from_slice(&0.3f64.to_le_bytes());
+        setup[24..32].copy_from_slice(&0.3f64.to_le_bytes());
+        let book = read(&workbook(&[], &[rec(0x00A1, &setup)])).unwrap();
+        assert_eq!(
+            book.dropped.iter().copied().collect::<Vec<_>>(),
+            ["page setup"]
+        );
+        setup[10] = 0x02;
+        assert!(
+            read(&workbook(&[], &[rec(0x00A1, &setup)]))
+                .unwrap()
+                .dropped
+                .is_empty()
+        );
+        // A very hidden sheet (BOUNDSHEET state 2).
+        let mut stream = workbook(&[], &[]);
+        let bs = stream.windows(2).position(|w| w == [0x85, 0x00]).unwrap();
+        stream[bs + 8] = 2;
+        let book = read(&stream).unwrap();
+        assert_eq!(
+            book.dropped.iter().copied().collect::<Vec<_>>(),
+            ["very hidden sheets (saved as hidden)"]
+        );
+        assert!(book.sheets[0].hidden);
     }
 
     /// An embedded chart, and a VBA project's storage beside the stream.

@@ -110,9 +110,10 @@ pub(crate) const MAX_ROW: i64 = 0xFFFF;
 pub(crate) const MAX_COL: i64 = 0xFF;
 /// The longest `rgce` Excel writes (its formula limit, in bytes).
 const MAX_RGCE: usize = 1800;
-/// The most tokens and extra data a record holds: its body's limit, 8224
-/// bytes, less the fixed fields before them (a FORMULA's 22, the most).
-const MAX_TOKENS: usize = 8224 - 22 - 4;
+/// The most tokens and extra data one record holds: its body's limit
+/// less the fixed fields before them. An ARRAY, which can't be split,
+/// has 14; a FORMULA 22, the most, so a formula fits either.
+const MAX_TOKENS: usize = super::xls_write::MAX_BODY - 22;
 /// `ptgFuncVar` counts arguments in 7 bits.
 const MAX_ARGS: usize = 127;
 
@@ -172,17 +173,17 @@ pub(crate) fn compile(src: &str, site: Site, t: &mut dyn Tables) -> Result<Compi
         Site::Name { .. } => Class::Ref,
     };
     c.expr(&e, top)?;
-    // The tokens and their extra data go in one FORMULA, ARRAY or NAME
-    // record, after its fixed fields.
-    if c.out.rgce.len() > MAX_RGCE || c.out.rgce.len() + c.out.extra.len() > MAX_TOKENS {
-        return Err(Why::TooLong);
-    }
     // Excel marks a formula with a volatile function so it recalculates
     // on every calculation: tAttrSemi first.
     if is_volatile(&e) {
         let mut rgce = vec![0x19, 0x01, 0, 0];
         rgce.extend_from_slice(&c.out.rgce);
         c.out.rgce = rgce;
+    }
+    // The tokens and their extra data go in one record after its fixed
+    // fields (a NAME's name too, which the writer checks).
+    if c.out.rgce.len() > MAX_RGCE || c.out.rgce.len() + c.out.extra.len() > MAX_TOKENS {
+        return Err(Why::TooLong);
     }
     Ok(c.out)
 }
@@ -562,22 +563,24 @@ impl Compiler<'_> {
         Ok(Some(self.t.xti(Book::Own, i as i16, i as i16)))
     }
 
-    /// A name's references are always 3-D, as Excel writes them: a name
-    /// has no sheet of its own. An unqualified one in a sheet-scoped name
-    /// is on that sheet.
-    fn name_xti(&mut self, ixti: Option<u16>) -> Option<u16> {
+    /// A name's references are always 3-D, as Excel writes them (the
+    /// corpus's TaxRate/TheData/Rate): a name has no sheet of its own. An
+    /// unqualified one in a sheet-scoped name is on that sheet; in a global
+    /// name it has no sheet to be on, and the name can't be written.
+    fn name_xti(&mut self, ixti: Option<u16>) -> Result<Option<u16>, Why> {
         match (ixti, self.site) {
-            (Some(x), _) => Some(x),
+            (Some(x), _) => Ok(Some(x)),
             (None, Site::Name { scope: Some(s) }) => {
-                Some(self.t.xti(Book::Own, s as i16, s as i16))
+                Ok(Some(self.t.xti(Book::Own, s as i16, s as i16)))
             }
-            (None, _) => None,
+            (None, Site::Name { scope: None }) => Err(Why::Unsupported),
+            (None, Site::Cell { .. }) => Ok(None),
         }
     }
 
     fn cell_ref(&mut self, r: &CellRef, cls: Class) -> Result<(), Why> {
         let ixti = self.qualifier(r.sheet.as_deref())?;
-        let ixti = self.name_xti(ixti);
+        let ixti = self.name_xti(ixti)?;
         let (row, col) = coords(r)?;
         match ixti {
             Some(x) => {
@@ -598,7 +601,7 @@ impl Compiler<'_> {
         cls: Class,
     ) -> Result<(), Why> {
         let ixti = self.qualifier(sheet)?;
-        let ixti = self.name_xti(ixti);
+        let ixti = self.name_xti(ixti)?;
         self.area_tokens(ixti, a, b, cls)
     }
 
@@ -1002,6 +1005,17 @@ pub(crate) mod tests {
         assert_eq!(round("IW1"), Err(Why::PastGrid));
         assert_eq!(round("SUM(A1:A100000)"), Err(Why::PastGrid));
         assert_eq!(round("Missing!A1"), Err(Why::OtherBook));
+        // A defined name's references are 3-D, as Excel's; an unqualified
+        // one in a global name has no sheet.
+        let mut t = T::new(&["Sheet1", "Data"]);
+        let c = compile("Data!$A$1", Site::Name { scope: None }, &mut t).unwrap();
+        assert_eq!(c.rgce[0], 0x3A);
+        let c = compile("$A$1:$B$2", Site::Name { scope: Some(1) }, &mut t).unwrap();
+        assert_eq!(c.rgce[0], 0x3B);
+        assert_eq!(
+            compile("$A$1", Site::Name { scope: None }, &mut t),
+            Err(Why::Unsupported)
+        );
     }
 
     #[test]

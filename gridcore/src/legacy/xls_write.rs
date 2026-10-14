@@ -35,7 +35,7 @@ pub struct XlsOut {
 
 /// The longest record body; the rest of a longer one goes in CONTINUE
 /// records.
-const MAX_BODY: usize = 8224;
+pub(crate) const MAX_BODY: usize = 8224;
 const CONTINUE: u16 = 0x003C;
 const BOF: u16 = 0x0809;
 const EOF: u16 = 0x000A;
@@ -185,7 +185,14 @@ pub fn write_xls(pkg: &SheetPackage) -> XlsOut {
     // formulas name them by are known before any formula is compiled.
     let mut name_rgce: Vec<Option<Compiled>> = Vec::new();
     for d in &wb.defined_names {
-        let c = ptg_write::compile(&d.formula, Site::Name { scope: d.scope }, &mut refs).ok();
+        // A NAME is one record: its 14 fixed bytes, the name (a flags byte
+        // and up to two bytes a character), the tokens and extra data.
+        let fits = |c: &Compiled| {
+            14 + 1 + 2 * d.name.encode_utf16().count() + c.rgce.len() + c.extra.len() <= MAX_BODY
+        };
+        let c = ptg_write::compile(&d.formula, Site::Name { scope: d.scope }, &mut refs)
+            .ok()
+            .filter(fits);
         if c.is_none() {
             *lost.entry(Loss::Names).or_default() += 1;
         }
@@ -1104,6 +1111,17 @@ fn sheet_records(
 ) -> SheetOut {
     let mut out = Vec::new();
     bof(&mut out, 0x0010);
+    // The calculation block: automatic, A1, and iterative calculation as
+    // the workbook has it (Excel keeps a copy in every sheet).
+    let (iterate, count, delta) = match wb.iterate {
+        Some((n, d)) => (1u16, n.min(32_767) as u16, d),
+        None => (0, 100, 0.001),
+    };
+    rec(&mut out, 0x000D, &1u16.to_le_bytes()); // CALCMODE
+    rec(&mut out, 0x000C, &count.to_le_bytes()); // CALCCOUNT
+    rec(&mut out, 0x000F, &1u16.to_le_bytes()); // REFMODE
+    rec(&mut out, 0x0011, &iterate.to_le_bytes()); // ITERATION
+    rec(&mut out, 0x0010, &delta.to_le_bytes()); // DELTA
     // The grid's cells, and the array formulas whose ranges they're in.
     let mut cells: BTreeMap<(u32, u32), &Cell> = BTreeMap::new();
     for (&(r, c), cell) in &s.cells {
@@ -1979,6 +1997,34 @@ mod tests {
         let (back, _) = round(&pkg);
         assert_eq!(back.workbook.sheets[0].freeze, (3, 0));
         assert_eq!(back.workbook.active_tab, 1);
+    }
+
+    /// A defined name whose record can't hold its name, tokens and array
+    /// constant is left out and counted, not split.
+    #[test]
+    fn a_name_too_long_for_its_record_is_counted() {
+        let mut pkg = book(&[(0, 0, Cell::number(1.0))]);
+        // ~7,800 bytes of array constant: fits a formula, not with a
+        // 255-character UTF-16 name (510 more bytes) beside it.
+        let row = vec!["\"xxxxxxxxxxxxxxxxxxxxxx\""; 30].join(",");
+        let big = format!("{{{}}}", vec![row; 10].join(";"));
+        pkg.workbook.defined_names.push(crate::sheet::DefinedName {
+            name: format!("N\u{e9}{}", "x".repeat(253)),
+            scope: None,
+            formula: big,
+        });
+        let (back, lost) = round(&pkg);
+        assert_eq!(lost, ["1 defined name Excel 97-2003 cannot hold"]);
+        assert!(back.workbook.defined_names.is_empty());
+    }
+
+    /// Iterative calculation round-trips; off stays off.
+    #[test]
+    fn iterative_calculation_round_trips() {
+        let mut pkg = book(&[(0, 0, Cell::number(1.0))]);
+        assert_eq!(round(&pkg).0.workbook.iterate, None);
+        pkg.workbook.iterate = Some((250, 0.0005));
+        assert_eq!(round(&pkg).0.workbook.iterate, Some((250, 0.0005)));
     }
 
     /// More colours than the palette has free slots never take black's:

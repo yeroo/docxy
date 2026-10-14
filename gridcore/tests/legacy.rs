@@ -718,6 +718,11 @@ const XLS_DROPPED: &[(&str, &[&str])] = &[
     ("shape-gradebook.xls", &["page setup"]),
     ("shape-salestable.xls", &["page setup"]),
     ("chart-embedded.xls", &["pictures, shapes and charts"]),
+    // `SUM([1]!Prices)` and `[1]!Half*2`, names of another workbook.
+    (
+        "ext-name.xls",
+        &["2 formulas that refer to other workbooks or can't be read (kept as values)"],
+    ),
 ];
 
 /// What writing each corpus `.xls`'s import back loses, by file; every
