@@ -1139,18 +1139,33 @@ fn sheet_records(
         let Some(f) = cell.formula.as_deref() else {
             continue;
         };
-        // A spilling formula covers its spill as it is now (its stored ref
-        // may be stale), as the .xlsx writer writes it; else the legacy
-        // array's own ref.
+        // The block an array formula covers, as the .xlsx writer decides
+        // it: a spilling formula its spill as it is now (its stored ref may
+        // be stale); a legacy CSE block its stored ref, unless other content
+        // sits in it now; any other array formula (a dynamic one that
+        // doesn't spill, a taken block) its anchor alone. A block that would
+        // overlap one already written shrinks to its anchor, and an anchor
+        // inside another's block is a plain formula.
         let spill = cell
             .spill
             .filter(|&ext| ext != (1, 1) && ext.0 > 0 && ext.1 > 0)
             .map(|(h, w)| (r, c, r + h - 1, c + w - 1));
-        let range = spill
-            .or_else(|| array_ref(cell))
-            .filter(|&(r1, c1, r2, c2)| {
-                (r1, c1) == (r, c) && r2 >= r1 && c2 >= c1 && on_grid(r2, c2)
-            });
+        let legacy = || {
+            (!cell.is_dynamic() && !crate::xlsx::block_taken(s, r, c, cell))
+                .then(|| array_ref(cell))
+                .flatten()
+        };
+        let alone = array_ref(cell).map(|_| (r, c, r, c));
+        let fits = |&(r1, c1, r2, c2): &Rect| {
+            (r1, c1) == (r, c) && r2 >= r1 && c2 >= c1 && on_grid(r2, c2)
+        };
+        let free = |&(r1, c1, r2, c2): &Rect| {
+            (r1..=r2).all(|rr| (c1..=c2).all(|cc| !member.contains_key(&(rr, cc))))
+        };
+        let range = [spill, legacy(), alone]
+            .into_iter()
+            .flatten()
+            .find(|b| fits(b) && free(b));
         let site = Site::Cell {
             sheet: index,
             row: r,
@@ -1654,6 +1669,8 @@ pub fn check_xls(file: &[u8]) -> Result<(), String> {
     for (k, &(start, end)) in subs.iter().skip(1).enumerate() {
         let body = &recs[start..=end];
         let mut cells: Vec<(u32, u32)> = Vec::new();
+        // (r1, r2, c1, c2) of each ARRAY.
+        let mut arrays: Vec<(u16, u16, u8, u8)> = Vec::new();
         let mut dims = None;
         let mut nested = 0;
         for &(_, ty, b) in body.iter().skip(1) {
@@ -1680,7 +1697,18 @@ pub fn check_xls(file: &[u8]) -> Result<(), String> {
                     cells.push((u16_at(b, 0)? as u32, u16_at(b, 2)? as u32));
                 }
                 0x023E if u16_at(b, 0)? & 0x0200 != 0 => selected.push(k),
+                0x0221 if b.len() >= 6 => {
+                    arrays.push((u16_at(b, 0)?, u16_at(b, 2)?, b[4], b[5]));
+                }
                 _ => {}
+            }
+        }
+        // ARRAY blocks never overlap.
+        for (i, x) in arrays.iter().enumerate() {
+            for y in &arrays[..i] {
+                if x.0 <= y.1 && y.0 <= x.1 && x.2 <= y.3 && y.2 <= x.3 {
+                    return Err(format!("sheet {k}: ARRAY blocks {y:?} and {x:?} overlap"));
+                }
             }
         }
         let (r0, r1, c0, c1) = dims.ok_or(format!("sheet {k}: no DIMENSIONS"))?;
@@ -1893,6 +1921,8 @@ mod tests {
     fn array_formulas_keep_their_range() {
         let mut anchor = formula("A1:A2*2", CellValue::Number(2.0));
         anchor.f_attrs = Some(" t=\"array\" ref=\"B1:B2\"".into());
+        // As the import and the engine leave an evaluated CSE block.
+        anchor.spill = Some((2, 1));
         let pkg = book(&[
             (0, 0, Cell::number(1.0)),
             (1, 0, Cell::number(2.0)),
@@ -2107,6 +2137,75 @@ mod tests {
         }
     }
 
+    /// An array's block is never written over content that isn't its own,
+    /// as the .xlsx writer decides it: a frozen CSE block with a formula
+    /// typed into it, a dynamic array that no longer spills over its stale
+    /// ref, and a stale ref overlapping another anchor's spill.
+    #[test]
+    fn array_blocks_never_take_other_content() {
+        // (a) {=A1:A3*2} in B1:B3, frozen (no spill), `=5` typed into B2.
+        let mut cse = formula("A1:A3*2", CellValue::Number(2.0));
+        cse.f_attrs = Some(" t=\"array\" ref=\"B1:B3\"".into());
+        let pkg = book(&[
+            (0, 1, cse),
+            (1, 1, formula("5", CellValue::Number(5.0))),
+            (2, 1, Cell::number(6.0)),
+        ]);
+        let (back, _) = round(&pkg);
+        let cells = &back.workbook.sheets[0].cells;
+        assert_eq!(cells[&(0, 1)].spill, Some((1, 1)));
+        assert_eq!(cells[&(1, 1)].formula.as_deref(), Some("5"));
+        assert_eq!(cells[&(2, 1)].value, CellValue::Number(6.0));
+
+        // (b) A dynamic SEQUENCE whose stale ref is A1:A3, not spilling, and
+        // `x` in A2.
+        let mut seq = formula("_xlfn.SEQUENCE(3)", CellValue::Error("#SPILL!".into()));
+        seq.f_attrs = Some(" t=\"array\" ref=\"A1:A3\"".into());
+        seq.meta.get_or_insert_default().dynamic = true;
+        let pkg = book(&[(0, 0, seq), (1, 0, Cell::text("x"))]);
+        let (back, _) = round(&pkg);
+        let cells = &back.workbook.sheets[0].cells;
+        assert_eq!(cells[&(1, 0)].value, CellValue::Text("x".into()));
+        assert_eq!(cells[&(0, 0)].spill, Some((1, 1)));
+
+        // (c) A stale ref C1:C4 overlapping B2's spill B2:D2: no overlap.
+        let mut a = formula("_xlfn.SEQUENCE(1,3)", CellValue::Number(1.0));
+        a.spill = Some((1, 3));
+        let mut b = formula("A1:A4", CellValue::Number(1.0));
+        b.f_attrs = Some(" t=\"array\" ref=\"C1:C4\"".into());
+        let pkg = book(&[
+            (1, 1, a),
+            (1, 2, Cell::number(2.0)),
+            (1, 3, Cell::number(3.0)),
+            (0, 2, b),
+        ]);
+        let out = write_xls(&pkg);
+        check_xls(&out.bytes).unwrap();
+        let (back, _) = round(&pkg);
+        let cells = &back.workbook.sheets[0].cells;
+        assert_eq!(cells[&(1, 1)].spill, Some((1, 3)));
+        assert_eq!(cells[&(0, 2)].spill, Some((1, 1)));
+        // The check refuses overlapping ARRAY blocks: B1:B2 and D1:D2,
+        // the second moved onto column B.
+        let arr = |f: &str, r: &str| {
+            let mut c = formula(f, CellValue::Number(1.0));
+            c.f_attrs = Some(format!(" t=\"array\" ref=\"{r}\""));
+            c.spill = Some((2, 1));
+            c
+        };
+        let pkg = book(&[(0, 1, arr("A1:A2", "B1:B2")), (0, 3, arr("A1:A2", "D1:D2"))]);
+        let out = write_xls(&pkg).bytes;
+        let cfb = opccore::cfb::Cfb::open(&out).unwrap();
+        let mut st = cfb.read_stream("Workbook").unwrap();
+        let first = find(&st, 0x0221);
+        let len = 4 + u16::from_le_bytes([st[first + 2], st[first + 3]]) as usize;
+        let second = first + len + find(&st[first + len..], 0x0221);
+        st[second + 8] = 1;
+        st[second + 9] = 1;
+        let bad = opccore::cfb::write_cfb(&[("Workbook", st)]);
+        assert!(check_xls(&bad).unwrap_err().contains("overlap"));
+    }
+
     /// SORT and FILTER's hidden names are spelled `_xlfn._xlws.`, as Excel
     /// stores them, and read back as SORT and FILTER.
     #[test]
@@ -2146,6 +2245,7 @@ mod tests {
     fn a_text_array_anchor_writes_array_before_string() {
         let mut anchor = formula("A1:A2&\"!\"", CellValue::Text("a!".into()));
         anchor.f_attrs = Some(" t=\"array\" ref=\"B1:B2\"".into());
+        anchor.spill = Some((2, 1));
         let pkg = book(&[
             (0, 0, Cell::text("a")),
             (1, 0, Cell::text("b")),

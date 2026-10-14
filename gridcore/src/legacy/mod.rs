@@ -913,8 +913,9 @@ impl<'a> Le<'a> {
     }
 }
 
-/// A file's number formats as its xfs use them (BIFF8 and BIFF12 alike):
-/// each xf's format id, and the file's own format codes by id.
+/// An `.xlsb`'s number formats as its xfs use them (the `.xls` reader
+/// reads whole XFs, see `xls::Styles`): each xf's format id, and the file's
+/// own format codes by id.
 #[derive(Default)]
 pub(crate) struct XfFormats {
     pub(crate) xf_fmt: Vec<u16>,
@@ -922,20 +923,25 @@ pub(crate) struct XfFormats {
 }
 
 impl XfFormats {
-    /// The `book.formats` index of xf `xf`'s number format: the file's own
-    /// code for its id, else the built-in one, else General.
+    /// The `book.xfs` index of xf `xf`'s number format alone
+    /// ([`format_code`]).
     pub(crate) fn format_of(&self, xf: u32, book: &mut BookIn) -> u32 {
         let ifmt = self.xf_fmt.get(xf as usize).copied().unwrap_or(0);
-        match self
-            .codes
-            .get(&ifmt)
-            .cloned()
-            .or_else(|| builtin_format(ifmt as u32))
-        {
+        match format_code(&self.codes, ifmt) {
             Some(code) => book.format_index(&code),
             None => 0,
         }
     }
+}
+
+/// The number format code of format id `ifmt` (BIFF8 and BIFF12 alike):
+/// the file's own code for it, else the built-in one; `None` for General.
+pub(crate) fn format_code(codes: &HashMap<u16, String>, ifmt: u16) -> Option<String> {
+    codes
+        .get(&ifmt)
+        .cloned()
+        .or_else(|| builtin_format(ifmt as u32))
+        .filter(|c| !c.eq_ignore_ascii_case("General"))
 }
 
 /// An RK number (BIFF8 and BIFF12): a 30-bit integer or the top of an
@@ -999,18 +1005,25 @@ pub(crate) const BUILTIN_NAMES: [&str; 14] = [
 ];
 
 /// The error text of a BIFF error code (shared by BIFF8 and BIFF12).
+/// BIFF's error codes and their text, both ways (the readers and the
+/// `.xls` writer).
+pub(crate) const BIFF_ERRORS: [(u8, &str); 8] = [
+    (0x00, "#NULL!"),
+    (0x07, "#DIV/0!"),
+    (0x0F, "#VALUE!"),
+    (0x17, "#REF!"),
+    (0x1D, "#NAME?"),
+    (0x24, "#NUM!"),
+    (0x2A, "#N/A"),
+    (0x2B, "#GETTING_DATA"),
+];
+
+/// The error text of a BIFF error code (`#N/A` for an unknown one).
 pub(crate) fn biff_error(code: u8) -> &'static str {
-    match code {
-        0x00 => "#NULL!",
-        0x07 => "#DIV/0!",
-        0x0F => "#VALUE!",
-        0x17 => "#REF!",
-        0x1D => "#NAME?",
-        0x24 => "#NUM!",
-        0x2A => "#N/A",
-        0x2B => "#GETTING_DATA",
-        _ => "#N/A",
-    }
+    BIFF_ERRORS
+        .iter()
+        .find(|e| e.0 == code)
+        .map_or("#N/A", |e| e.1)
 }
 
 /// The built-in number formats BIFF files leave implicit (no FORMAT record

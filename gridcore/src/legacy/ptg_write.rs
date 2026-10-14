@@ -318,18 +318,10 @@ fn returns_ref(name: &str) -> bool {
 }
 
 /// BIFF8's code of an error value.
+/// (`#SPILL!` and `#CALC!` have none.)
 pub(crate) fn error_code(e: &str) -> Option<u8> {
-    Some(match ExcelError::from_code(e)? {
-        ExcelError::Null => 0x00,
-        ExcelError::Div0 => 0x07,
-        ExcelError::Value => 0x0F,
-        ExcelError::Ref => 0x17,
-        ExcelError::Name => 0x1D,
-        ExcelError::Num => 0x24,
-        ExcelError::NA => 0x2A,
-        ExcelError::GettingData => 0x2B,
-        ExcelError::Spill | ExcelError::Calc => return None,
-    })
+    let code = ExcelError::from_code(e)?.code();
+    super::BIFF_ERRORS.iter().find(|x| x.1 == code).map(|x| x.0)
 }
 
 /// A `ShortXLUnicodeString` (8-bit count): compressed when every unit fits

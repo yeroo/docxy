@@ -3613,7 +3613,7 @@ fn sheet_data_xml(
 /// edits to part of it, so this is a frozen block content was typed into
 /// (#837/#840), a block a formula in it blocks, or content loaded that way.
 /// A styled blank isn't content.
-fn block_taken(sheet: &Sheet, row: u32, col: u32, cell: &Cell) -> bool {
+pub(crate) fn block_taken(sheet: &Sheet, row: u32, col: u32, cell: &Cell) -> bool {
     if cell.spill.is_some() {
         return false;
     }

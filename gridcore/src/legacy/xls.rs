@@ -17,8 +17,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::ftab;
 use super::ptg::{self, Base, Biff, Names};
 use super::{
-    BookIn, ExternalLink, Le, Limits, OpenError, SheetIn, biff_error, builtin_format, on_grid, rk,
-    set_array, sheet_prefix,
+    BookIn, ExternalLink, Le, Limits, OpenError, SheetIn, biff_error, on_grid, rk, set_array,
+    sheet_prefix,
 };
 use crate::sheet::{Align, Cell, CellValue, DefinedName, Xf};
 
@@ -348,13 +348,7 @@ impl Styles {
         let u16_at = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
         let u32_at = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
         let mut xf = Xf::default();
-        let ifmt = u16_at(2);
-        let code = self
-            .codes
-            .get(&ifmt)
-            .cloned()
-            .or_else(|| builtin_format(ifmt as u32))
-            .filter(|c| !c.eq_ignore_ascii_case("General"));
+        let code = super::format_code(&self.codes, u16_at(2));
         if code.is_some() {
             xf.set_code(code);
         }
@@ -991,7 +985,13 @@ fn read_sheet(
                     frozen = grbit & 0x0008 != 0;
                     // View settings the model lacks: formulas shown,
                     // gridlines, headings or zeros hidden, right to left.
-                    if grbit & 0x0001 != 0 || grbit & 0x0016 != 0x0016 || grbit & 0x0040 != 0 {
+                    // Also a non-default header colour or outline symbols
+                    // hidden.
+                    if grbit & 0x0001 != 0
+                        || grbit & 0x0016 != 0x0016
+                        || grbit & 0x0040 != 0
+                        || grbit & 0x00A0 != 0x00A0
+                    {
                         book.dropped.insert("sheet view settings");
                     }
                 }
@@ -1037,6 +1037,10 @@ fn read_sheet(
                 0x0041 if frozen => {
                     let (x, y) = (c.u16()?, c.u16()?);
                     sheet.freeze = (y as u32, x as u32);
+                }
+                // A PANE under an unfrozen WINDOW2: a split window.
+                0x0041 => {
+                    book.dropped.insert("sheet view settings");
                 }
                 0x005D | 0x00EC => {
                     book.dropped.insert("pictures, shapes and charts");
@@ -1724,6 +1728,12 @@ pub(crate) mod tests {
             (w2(0x06A6), "sheet view settings"),
             (w2(0x06B2), "sheet view settings"),
             (w2(0x06F6), "sheet view settings"),
+            (w2(0x0636), "sheet view settings"),
+            (w2(0x0696), "sheet view settings"),
+            (
+                rec(0x0041, &[0, 4, 0, 0, 0, 0, 0, 0, 3, 0]),
+                "sheet view settings",
+            ),
         ];
         for (r, want) in cases {
             let book = read(&workbook(&[], &[r])).unwrap();
