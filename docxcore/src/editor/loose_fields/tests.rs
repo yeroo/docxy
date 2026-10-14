@@ -445,8 +445,7 @@ fn tracked_delete_of_a_spanning_field_keeps_its_markers_1240() {
         author: "Ann".into(),
         clock: || "2026-10-14T00:00:00Z".into(),
     };
-    // Entries as plain runs: a tracked delete across paragraphs drops a
-    // link's text whether or not a field is around it, apart from #1240.
+    // Entries as plain runs; the TOC of links is checked after them.
     let plain_toc = || {
         doc(&[
             "<w:r><w:t>Before</w:t></w:r>".to_string(),
@@ -479,6 +478,21 @@ fn tracked_delete_of_a_spanning_field_keeps_its_markers_1240() {
     assert_markers(&ed, 1);
     let xml = saved(&ed);
     assert!(xml.contains(">Body</w:delText>"), "{xml}");
+
+    // Entries as links: their text is recorded inside the links (#1462).
+    let (mut ed, e) = toc("", true);
+    ed.set_track_changes(Some(track()));
+    ed.set_caret(e);
+    ed.backspace();
+    ed.backspace();
+    assert_markers(&ed, 1);
+    let xml = saved(&ed);
+    for text in ["Intro", "1", "Body", "2"] {
+        assert!(
+            xml.contains(&format!(">{text}</w:delText></w:r></w:del></w:hyperlink>")),
+            "{text}: {xml}"
+        );
+    }
 }
 
 #[test]
