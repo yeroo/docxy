@@ -11767,6 +11767,10 @@ fn doc_to_docx_kind(
     if comments.is_empty() {
         pkg.drop_empty_comment_parts();
     }
+    // Header/footer parts no section references any more (Link to Previous,
+    // Remove, a cleared even header) stay in the tab's package for undo, but
+    // not in the file (#771).
+    pkg.drop_unreferenced_hf_parts();
     // Only a type that disagrees is rewritten, so an unmodified save of a
     // file already of its type is still its own bytes.
     let change = kind.map(|k| pkg.set_main_kind(k)).unwrap_or_default();
