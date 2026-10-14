@@ -7072,6 +7072,10 @@ impl App {
         self.import_source = None;
         self.template = None;
         self.import_unsaved = false;
+        // Nothing of the last workbook's Compatibility Mode carries over.
+        self.dropped.clear();
+        self.compat_accepted.clear();
+        self.last_lost.clear();
         self.model_rels = Vec::new();
         self.model_measures = Vec::new();
         self.comments = Vec::new();
@@ -14132,6 +14136,35 @@ mod tests {
         assert!(
             app.compat_losses()
                 .contains(&"Data Model (relationships and measures)".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A new blank workbook (Ctrl+N) starts with nothing of the last one's
+    /// Compatibility Mode: losses accepted there ask again.
+    #[test]
+    fn a_new_workbook_forgets_accepted_losses() {
+        let dir = tmp("compat-new");
+        let (mut app, _) = open_clean_xls(&dir, "a.xls");
+        app.pkg.workbook.sheets[app.sheet]
+            .hyperlinks
+            .insert((0, 0), "https://example.com".into());
+        app.save();
+        yes(&mut app);
+        assert!(!app.compat_accepted.is_empty());
+        app.new_workbook();
+        assert!(app.compat_accepted.is_empty() && app.dropped.is_empty());
+        assert!(app.last_lost.is_empty());
+        app.pkg.workbook.sheets[app.sheet]
+            .hyperlinks
+            .insert((0, 0), "https://example.com".into());
+        app.request_save_as(dir.join("b.xls").to_string_lossy().into_owned());
+        assert!(
+            app.confirm
+                .as_ref()
+                .unwrap()
+                .prompt()
+                .contains("hyperlinks")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
