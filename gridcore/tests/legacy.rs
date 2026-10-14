@@ -823,7 +823,7 @@ fn xls_corpus_round_trips_through_the_writer() {
             ));
         }
     }
-    assert_eq!(files.len(), 22, "17 + extra + addin + arrays .xls files");
+    assert_eq!(files.len(), 23, "17 + extra + addin + arrays .xls files");
     assert!(
         errs.is_empty(),
         "{} problems:\n{}",
@@ -1121,7 +1121,8 @@ fn xls_writer_gives_formulas_excels_tokens() {
             }
         }
     }
-    assert!(compared > 300, "{compared} formulas compared");
+    println!("{compared} formulas and names compared with Excel's tokens");
+    assert!(compared > 600, "{compared} formulas compared");
     assert!(
         errs.is_empty(),
         "{} problems:\n{}",

@@ -17,9 +17,13 @@
 //!
 //! Each operand token carries the class (reference, value or array) Excel
 //! gives it, which Excel's evaluator uses: a range passed to SUM is a
-//! reference, one in SUMPRODUCT an array, one an operator consumes a value.
-//! The classes follow each function's parameter types ([`params`]), as
-//! corpus/legacy's `.xls` files show Excel writing them.
+//! reference, one in SUMPRODUCT an array, one an operator consumes a value,
+//! and in an array formula or a defined name most values are arrays. The
+//! classes come from each function's parameter conversions ([`params`]),
+//! applied top-down the way LibreOffice's `.xls` export does
+//! (`XclExpFmlaCompImpl::RecalcTokenClass`, [`Compiler::resolve`]), as
+//! corpus/legacy's `.xls` files, `arrays/` among them, show Excel writing
+//! them.
 //!
 //! Parentheses are written where the precedence needs them, as
 //! [`crate::formula::to_string`] prints them, so the text read back parses
@@ -93,8 +97,9 @@ pub(crate) struct Compiled {
 /// Where a formula is.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Site {
-    /// A cell's formula: its sheet and cell; `array` for a legacy (CSE)
-    /// array formula, whose operands are arrays.
+    /// A cell's formula: its sheet and cell; `array` for an array formula
+    /// (legacy CSE, or a dynamic array written as one), whose values are
+    /// arrays where its parameters keep their own class ([`Compiler::resolve`]).
     Cell {
         sheet: usize,
         row: u32,
@@ -134,14 +139,45 @@ impl Class {
             Class::Arr => 0x60,
         }
     }
-    /// The class a parameter of type `param` gets in context `self`: an
-    /// array context turns value parameters into array ones.
-    fn of_param(self, param: Class) -> Class {
-        match (self, param) {
-            (Class::Arr, Class::Val) => Class::Arr,
-            (_, p) => p,
-        }
-    }
+}
+
+/// How a parameter converts the class of the token in it (LibreOffice's
+/// `XclFuncParamConv`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Conv {
+    /// The token's own class (in an array formula or a name, a value
+    /// becomes an array).
+    Org,
+    /// A value: an array becomes a value.
+    Val,
+    /// An array.
+    Arr,
+    /// Repeat the enclosing conversion.
+    Rpt,
+    /// Repeat it for a reference, else the token's own class.
+    Rpx,
+    /// An operator's operand: its operator's conversion.
+    Rpo,
+}
+
+/// The conversion a token's class actually goes through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClassConv {
+    Org,
+    Val,
+    Arr,
+}
+
+/// What a token's class depends on: the conversion of the parameter it is
+/// in (and whether that is a value-type parameter, where a reference
+/// behaves like a value), and its parent token's conversions and class.
+#[derive(Clone, Copy, Debug)]
+struct Cx {
+    conv: Conv,
+    val_type: bool,
+    prev_conv: Conv,
+    prev_class: ClassConv,
+    parent_ref: bool,
 }
 
 /// Compile the formula `src` (as a cell or name stores it, without `=`) at
@@ -159,14 +195,25 @@ pub(crate) fn compile(src: &str, site: Site, t: &mut dyn Tables) -> Result<Compi
         t,
         out: Compiled::default(),
         site,
-        forced: matches!(site, Site::Cell { array: true, .. } | Site::Name { .. }),
-        depth: 0,
+        plain: matches!(site, Site::Cell { array: false, .. }),
     };
-    // A cell's formula is a value, an array formula's too (its function
-    // tokens are values: corpus/legacy/arrays); a name is a reference.
+    // A cell's formula (array or not) starts as a value-type value; a name
+    // keeps its tokens' own classes, as arrays.
     let top = match site {
-        Site::Cell { .. } => Class::Val,
-        Site::Name { .. } => Class::Ref,
+        Site::Cell { .. } => Cx {
+            conv: Conv::Val,
+            val_type: true,
+            prev_conv: Conv::Val,
+            prev_class: ClassConv::Val,
+            parent_ref: false,
+        },
+        Site::Name { .. } => Cx {
+            conv: Conv::Org,
+            val_type: false,
+            prev_conv: Conv::Org,
+            prev_class: ClassConv::Arr,
+            parent_ref: true,
+        },
     };
     c.expr(&e, top)?;
     // Excel marks a formula with a volatile function so it recalculates
@@ -249,18 +296,22 @@ fn mark_external_calls(src: &str) -> std::borrow::Cow<'_, str> {
     out.into()
 }
 
-/// A function's parameter classes, as a pattern: one letter per parameter
-/// (`R` reference, `V` value, `A` array), and after a `+` the group that
-/// repeats for the rest (`R+RV` is SUMIFS: a range, then range/criteria
-/// pairs). Functions not listed take values.
+/// A function's parameter conversions, as a pattern: one letter per
+/// parameter, and after a `+` the group that repeats for the rest (`R+RV`
+/// is SUMIFS: a range, then range/criteria pairs). The letters are
+/// LibreOffice's parameter types: `R` RO (the token's own class), `V` VR
+/// (a value, the enclosing conversion repeated), `v` VV (a value, forced),
+/// `A` an array, `X` RX (a reference repeats the enclosing conversion), `O`
+/// VO (a value, its own class), `r` RR. Functions not listed take values.
 fn params(name: &str) -> &'static str {
     match name {
         "SUM" | "AVERAGE" | "MIN" | "MAX" | "COUNT" | "COUNTA" | "PRODUCT" | "STDEV" | "STDEVP"
         | "VAR" | "VARP" | "MEDIAN" | "SUMSQ" | "AVEDEV" | "DEVSQ" | "GEOMEAN" | "HARMEAN"
         | "KURT" | "SKEW" | "MAXA" | "MINA" | "AVERAGEA" | "STDEVA" | "STDEVPA" | "VARA"
-        | "VARPA" | "AND" | "OR" | "XOR" | "CONCAT" | "COUNTBLANK" | "AREAS" | "ROW" | "COLUMN"
-        | "ROWS" | "COLUMNS" | "N" | "T" | "ISREF" | "STDEV.S" | "STDEV.P" | "VAR.S" | "VAR.P"
-        | "SINGLE" | "ANCHORARRAY" => "+R",
+        | "VARPA" | "AND" | "OR" | "XOR" | "CONCAT" | "ISREF" | "STDEV.S" | "STDEV.P" | "VAR.S"
+        | "VAR.P" => "+X",
+        "COUNTBLANK" | "AREAS" | "ROW" | "COLUMN" | "ROWS" | "COLUMNS" | "N" | "T" | "SINGLE"
+        | "ANCHORARRAY" => "+R",
         "SUMPRODUCT" | "MODE" | "MODE.SNGL" | "MODE.MULT" | "MMULT" | "MDETERM" | "MINVERSE"
         | "TRANSPOSE" | "SUMX2MY2" | "SUMX2PY2" | "SUMXMY2" | "CORREL" | "PEARSON" | "RSQ"
         | "SLOPE" | "INTERCEPT" | "STEYX" | "COVAR" | "FTEST" | "CHITEST" | "FREQUENCY" => "+A",
@@ -268,30 +319,34 @@ fn params(name: &str) -> &'static str {
         "SUMIF" | "AVERAGEIF" => "RVR",
         "COUNTIFS" => "+RV",
         "SUMIFS" | "AVERAGEIFS" | "MAXIFS" | "MINIFS" => "R+RV",
-        "VLOOKUP" | "HLOOKUP" => "VRVV",
-        "MATCH" => "VRV",
-        "LOOKUP" => "VRR",
-        "INDEX" => "RVVV",
+        "VLOOKUP" | "HLOOKUP" => "vRRv",
+        "MATCH" => "VXr",
+        "LOOKUP" => "VXX",
+        "INDEX" => "Rvvv",
         "OFFSET" => "RVVVV",
-        "CELL" => "VR",
+        "CELL" => "vR",
         "RANK" | "RANK.EQ" | "RANK.AVG" => "VRV",
-        "LARGE" | "SMALL" | "PERCENTILE" | "QUARTILE" | "IRR" => "RV",
-        "PERCENTRANK" | "MIRR" => "RVV",
-        "NPV" | "CHOOSE" | "SUBTOTAL" => "V+R",
-        "AGGREGATE" | "TEXTJOIN" => "VV+R",
-        "IF" => "VRR",
+        "LARGE" | "SMALL" | "PERCENTILE" | "QUARTILE" | "IRR" => "XV",
+        "PERCENTRANK" | "MIRR" => "XVV",
+        "NPV" => "V+X",
+        "CHOOSE" => "O+R",
+        "SUBTOTAL" => "V+R",
+        "AGGREGATE" | "TEXTJOIN" => "VV+X",
+        "IF" => "ORR",
+        "IFERROR" | "IFNA" => "OR",
         "DAVERAGE" | "DCOUNT" | "DCOUNTA" | "DGET" | "DMAX" | "DMIN" | "DPRODUCT" | "DSTDEV"
-        | "DSTDEVP" | "DSUM" | "DVAR" | "DVARP" => "RVR",
+        | "DSTDEVP" | "DSUM" | "DVAR" | "DVARP" => "RrR",
         "FORECAST" => "VAA",
         "TTEST" | "PROB" => "AAVV",
-        "TREND" | "GROWTH" => "RRRV",
-        "LINEST" | "LOGEST" => "RRVV",
+        "TREND" | "GROWTH" => "AAAV",
+        "LINEST" | "LOGEST" => "AAVV",
         _ => "+V",
     }
 }
 
-/// The class of parameter `i` in pattern `p` ([`params`]).
-fn param_class(p: &str, i: usize) -> Class {
+/// The conversion of parameter `i` in pattern `p` ([`params`]), and
+/// whether it is a value-type one.
+fn param_conv(p: &str, i: usize) -> (Conv, bool) {
     let (head, group) = p.split_once('+').unwrap_or((p, ""));
     let ch = match head.as_bytes().get(i) {
         Some(&c) => c,
@@ -300,17 +355,25 @@ fn param_class(p: &str, i: usize) -> Class {
         None => b'V',
     };
     match ch {
-        b'R' => Class::Ref,
-        b'A' => Class::Arr,
-        _ => Class::Val,
+        b'R' => (Conv::Org, false),
+        b'v' => (Conv::Val, true),
+        b'A' => (Conv::Arr, true),
+        b'X' => (Conv::Rpx, false),
+        b'O' => (Conv::Org, true),
+        b'r' => (Conv::Rpt, false),
+        _ => (Conv::Rpt, true),
     }
 }
 
-/// Functions whose result may be a reference: their token takes the class
-/// its context asks for; any other function's is a value (or an array, in
-/// an array context).
-fn returns_ref(name: &str) -> bool {
-    matches!(name, "IF" | "CHOOSE" | "INDEX" | "OFFSET" | "INDIRECT")
+/// A function token's own class: a reference for those that may return
+/// one, an array for those that return one, else a value.
+fn return_class(name: &str) -> Class {
+    match name {
+        "IF" | "CHOOSE" | "INDEX" | "OFFSET" | "INDIRECT" => Class::Ref,
+        "MMULT" | "MINVERSE" | "TRANSPOSE" | "FREQUENCY" | "LINEST" | "LOGEST" | "TREND"
+        | "GROWTH" => Class::Arr,
+        _ => Class::Val,
+    }
 }
 
 /// BIFF8's code of an error value.
@@ -348,11 +411,9 @@ struct Compiler<'a> {
     t: &'a mut dyn Tables,
     out: Compiled,
     site: Site,
-    /// An array formula or a defined name: Excel evaluates it as arrays, so
-    /// its value operands are arrays ([`Compiler::operand_class`]).
-    forced: bool,
-    /// How many function calls deep the token being written is.
-    depth: usize,
+    /// A plain cell formula, whose tokens keep their own classes where an
+    /// array formula's and a name's values become arrays.
+    plain: bool,
 }
 
 impl Compiler<'_> {
@@ -375,15 +436,67 @@ impl Compiler<'_> {
     }
 
     /// `e`, in parentheses when `paren`.
-    fn operand(&mut self, e: &Expr, cls: Class, paren: bool) -> Result<(), Why> {
-        self.expr(e, cls)?;
+    fn operand(&mut self, e: &Expr, cx: Cx, paren: bool) -> Result<(), Why> {
+        self.expr(e, cx)?;
         if paren {
             self.push(&[0x15]);
         }
         Ok(())
     }
 
-    fn expr(&mut self, e: &Expr, cls: Class) -> Result<(), Why> {
+    /// A token's class, given its own and its context: LibreOffice's
+    /// `RecalcTokenClass`. Also the conversions its own operands inherit.
+    fn resolve(&self, own: Option<Class>, cx: Cx) -> (Option<Class>, Conv, ClassConv) {
+        let mut cls = own;
+        // A reference in a value-type parameter behaves like a value.
+        if cx.val_type && cls == Some(Class::Ref) {
+            cls = Some(Class::Val);
+        }
+        let conv = if cx.conv == Conv::Rpo {
+            cx.prev_conv
+        } else {
+            cx.conv
+        };
+        let class_conv = match conv {
+            Conv::Org | Conv::Rpo => ClassConv::Org,
+            Conv::Val => ClassConv::Val,
+            Conv::Arr => ClassConv::Arr,
+            Conv::Rpt => match cx.prev_conv {
+                Conv::Org | Conv::Val | Conv::Arr if cx.parent_ref => ClassConv::Val,
+                Conv::Rpx if !cx.parent_ref => ClassConv::Org,
+                _ => cx.prev_class,
+            },
+            Conv::Rpx if cls == Some(Class::Ref) => cx.prev_class,
+            Conv::Rpx => ClassConv::Org,
+        };
+        let cls = cls.map(|c| match class_conv {
+            ClassConv::Org if !self.plain && c == Class::Val => Class::Arr,
+            ClassConv::Org => c,
+            ClassConv::Val if c == Class::Arr => Class::Val,
+            ClassConv::Val => c,
+            ClassConv::Arr => Class::Arr,
+        });
+        (cls, conv, class_conv)
+    }
+
+    /// The class a token of its own class `own` gets in `cx`.
+    fn class(&self, own: Class, cx: Cx) -> Class {
+        self.resolve(Some(own), cx).0.unwrap_or(own)
+    }
+
+    /// The context of the operands of a token resolved as `(cls, conv,
+    /// class_conv)` in a parameter `(param, val_type)`.
+    fn child(r: (Option<Class>, Conv, ClassConv), param: Conv, val_type: bool) -> Cx {
+        Cx {
+            conv: param,
+            val_type,
+            prev_conv: r.1,
+            prev_class: r.2,
+            parent_ref: r.0 == Some(Class::Ref),
+        }
+    }
+
+    fn expr(&mut self, e: &Expr, cx: Cx) -> Result<(), Why> {
         match e {
             Expr::Num(n) => self.number(*n),
             Expr::Str(s) => {
@@ -394,9 +507,9 @@ impl Compiler<'_> {
             Expr::Bool(b) => self.push(&[0x1D, *b as u8]),
             Expr::Err(x) => self.push(&[0x1C, error_code(x.code()).ok_or(Why::Unsupported)?]),
             Expr::Missing => self.push(&[0x16]),
-            Expr::Ref(r) => self.cell_ref(r, cls)?,
+            Expr::Ref(r) => self.cell_ref(r, cx)?,
             Expr::Range(a, b) => {
-                self.area(a.sheet.as_deref(), (a, b), cls)?;
+                self.area(a.sheet.as_deref(), (a, b), cx)?;
             }
             Expr::ColRange {
                 sheet,
@@ -415,7 +528,7 @@ impl Compiler<'_> {
                 let (mut a, mut b) = (r(*c1, *abs1), r(*c2, *abs2));
                 b.row = MAX_ROW;
                 a.sheet.clone_from(sheet);
-                self.area(sheet.as_deref(), (&a, &b), cls)?;
+                self.area(sheet.as_deref(), (&a, &b), cx)?;
             }
             Expr::RowRange {
                 sheet,
@@ -433,7 +546,7 @@ impl Compiler<'_> {
                 };
                 let (a, mut b) = (r(*r1, *abs1), r(*r2, *abs2));
                 b.col = MAX_COL;
-                self.area(sheet.as_deref(), (&a, &b), cls)?;
+                self.area(sheet.as_deref(), (&a, &b), cx)?;
             }
             Expr::Ref3D { first, last, a, b } => {
                 let wb = self.t.workbook();
@@ -441,7 +554,7 @@ impl Compiler<'_> {
                     return Err(Why::OtherBook);
                 };
                 let ixti = self.t.xti(Book::Own, f as i16, l as i16);
-                self.area_tokens(Some(ixti), a, b, cls)?;
+                self.area_tokens(Some(ixti), a, b, cx)?;
             }
             Expr::Structured {
                 table,
@@ -466,7 +579,7 @@ impl Compiler<'_> {
                     .resolve(*item, col1, col2, self.row())
                     .ok_or(Why::Unsupported)?;
                 let range = table_range(wb, t.sheet, self.sheet(), (r1, c1, r2, c2));
-                self.expr(&range, cls)?;
+                self.expr(&range, cx)?;
             }
             Expr::Name(n) => {
                 // A table's bare name is its data body, as the engine reads
@@ -483,21 +596,22 @@ impl Compiler<'_> {
                             .resolve(crate::formula::TableItem::Data, &None, &None, 0)
                             .ok_or(Why::Unsupported)?;
                         let range = table_range(wb, t.sheet, scope, rect);
-                        return self.expr(&range, cls);
+                        return self.expr(&range, cx);
                     }
                 }
                 let ix = self.t.name(n, scope);
+                let cls = self.class(Class::Ref, cx);
                 self.push(&[0x03 | cls.bits()]);
                 self.push(&ix.to_le_bytes());
             }
             Expr::SpillRef(r) => {
-                self.call("_XLFN.ANCHORARRAY", &[Expr::Ref(r.clone())], cls)?;
+                self.call("_XLFN.ANCHORARRAY", &[Expr::Ref(r.clone())], cx)?;
             }
-            Expr::ArrayLit(rows) => self.array(rows, cls)?,
-            Expr::Func(name, args) => self.call(name, args, cls)?,
+            Expr::ArrayLit(rows) => self.array(rows, cx)?,
+            Expr::Func(name, args) => self.call(name, args, cx)?,
             Expr::Call(..) | Expr::Lit(_) => return Err(Why::Lambda),
             Expr::Un(UnOp::Implicit, x) => {
-                self.call("_XLFN.SINGLE", std::slice::from_ref(x), cls)?;
+                self.call("_XLFN.SINGLE", std::slice::from_ref(x), cx)?;
             }
             // A negative number literal is the number, as Excel stores it.
             Expr::Un(UnOp::Neg, x) if matches!(**x, Expr::Num(_)) => {
@@ -505,7 +619,8 @@ impl Compiler<'_> {
                 self.number(-n);
             }
             Expr::Un(op, x) => {
-                self.operand(x, self.operand_class(cls), prec(x) < prec(e))?;
+                let oc = Self::child(self.resolve(None, cx), Conv::Rpo, true);
+                self.operand(x, oc, prec(x) < prec(e))?;
                 self.push(&[match op {
                     UnOp::Pos => 0x12,
                     UnOp::Neg => 0x13,
@@ -513,7 +628,7 @@ impl Compiler<'_> {
                 }]);
             }
             Expr::Bin(op, l, r) => {
-                let oc = self.operand_class(cls);
+                let oc = Self::child(self.resolve(None, cx), Conv::Rpo, true);
                 self.operand(l, oc, prec(l) < prec(e))?;
                 self.operand(r, oc, prec(r) <= prec(e))?;
                 self.push(&[match op {
@@ -572,7 +687,8 @@ impl Compiler<'_> {
         }
     }
 
-    fn cell_ref(&mut self, r: &CellRef, cls: Class) -> Result<(), Why> {
+    fn cell_ref(&mut self, r: &CellRef, cx: Cx) -> Result<(), Why> {
+        let cls = self.class(Class::Ref, cx);
         let ixti = self.qualifier(r.sheet.as_deref())?;
         let ixti = self.name_xti(ixti)?;
         let (row, col) = coords(r)?;
@@ -592,11 +708,11 @@ impl Compiler<'_> {
         &mut self,
         sheet: Option<&str>,
         (a, b): (&CellRef, &CellRef),
-        cls: Class,
+        cx: Cx,
     ) -> Result<(), Why> {
         let ixti = self.qualifier(sheet)?;
         let ixti = self.name_xti(ixti)?;
-        self.area_tokens(ixti, a, b, cls)
+        self.area_tokens(ixti, a, b, cx)
     }
 
     fn area_tokens(
@@ -604,8 +720,9 @@ impl Compiler<'_> {
         ixti: Option<u16>,
         a: &CellRef,
         b: &CellRef,
-        cls: Class,
+        cx: Cx,
     ) -> Result<(), Why> {
+        let cls = self.class(Class::Ref, cx);
         let (r1, c1) = coords(a)?;
         let (r2, c2) = coords(b)?;
         if a == b && ixti.is_some() {
@@ -630,7 +747,8 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    fn array(&mut self, rows: &[Vec<Expr>], cls: Class) -> Result<(), Why> {
+    fn array(&mut self, rows: &[Vec<Expr>], cx: Cx) -> Result<(), Why> {
+        let cls = self.class(Class::Arr, cx);
         let cols = rows.first().map_or(0, Vec::len);
         if cols == 0 || cols > 256 || rows.len() > 65536 {
             return Err(Why::Unsupported);
@@ -681,7 +799,7 @@ impl Compiler<'_> {
 
     /// A call of function `name` (as the parser spells it: upper case, no
     /// `_xlfn.`; `_XLFN.SINGLE` / `_XLFN.ANCHORARRAY` for `@` and `#`).
-    fn call(&mut self, name: &str, args: &[Expr], cls: Class) -> Result<(), Why> {
+    fn call(&mut self, name: &str, args: &[Expr], cx: Cx) -> Result<(), Why> {
         if args.len() > MAX_ARGS {
             return Err(Why::TooLong);
         }
@@ -689,13 +807,8 @@ impl Compiler<'_> {
             return Err(Why::Lambda);
         }
         let bare = name.strip_prefix("_XLFN.").unwrap_or(name);
-        let token = if returns_ref(bare) {
-            cls
-        } else if cls == Class::Arr {
-            Class::Arr
-        } else {
-            Class::Val
-        };
+        let me = self.resolve(Some(return_class(bare)), cx);
+        let token = me.0.unwrap_or(Class::Val);
         let builtin = (0..=379u16).find_map(|i| {
             let (n, argc) = ftab::lookup(i)?;
             n.eq_ignore_ascii_case(bare).then_some((i, argc))
@@ -704,13 +817,12 @@ impl Compiler<'_> {
             let p = params(bare);
             if bare == "SUM" && args.len() == 1 {
                 // Excel's one-argument SUM: tAttrSum.
-                self.depth += 1;
-                self.expr(&args[0], cls.of_param(Class::Ref))?;
-                self.depth -= 1;
+                let (conv, val) = param_conv(p, 0);
+                self.expr(&args[0], Self::child(me, conv, val))?;
                 self.push(&[0x19, 0x10, 0, 0]);
                 return Ok(());
             }
-            self.args(args, p, cls)?;
+            self.args(args, p, me)?;
             match argc {
                 Some(n) if n as usize == args.len() => {
                     self.push(&[0x01 | token.bits()]);
@@ -751,7 +863,7 @@ impl Compiler<'_> {
                 self.push(&ixti.to_le_bytes());
                 self.push(&index.to_le_bytes());
                 // An add-in's parameters are references, as for any UDF.
-                self.args(args, "+R", cls)?;
+                self.args(args, "+X", me)?;
             }
             None => {
                 // SORT and FILTER are `_xlfn._xlws.`, as a file spells them.
@@ -767,44 +879,28 @@ impl Compiler<'_> {
                 let p = if is_new_function(bare) {
                     params(bare)
                 } else {
-                    "+R"
+                    "+X"
                 };
-                self.args(args, p, cls)?;
+                self.args(args, p, me)?;
             }
         }
         self.push(&[0x02 | token.bits(), (args.len() + 1) as u8, 0xFF, 0x00]);
         Ok(())
     }
 
-    /// The arguments of a call in context `cls`, by parameter types `p`.
-    /// In an array formula or a name a value parameter is an array one, as
-    /// Excel writes them (corpus/legacy/arrays).
-    fn args(&mut self, args: &[Expr], p: &str, cls: Class) -> Result<(), Why> {
-        self.depth += 1;
+    /// The arguments of a call resolved as `me`, by parameter
+    /// conversions `p`.
+    fn args(
+        &mut self,
+        args: &[Expr],
+        p: &str,
+        me: (Option<Class>, Conv, ClassConv),
+    ) -> Result<(), Why> {
         for (i, a) in args.iter().enumerate() {
-            let param = param_class(p, i);
-            let c = if self.forced && param == Class::Val {
-                Class::Arr
-            } else {
-                cls.of_param(param)
-            };
-            self.expr(a, c)?;
+            let (conv, val) = param_conv(p, i);
+            self.expr(a, Self::child(me, conv, val))?;
         }
-        self.depth -= 1;
         Ok(())
-    }
-
-    /// The class an operator's operands get in context `cls`. Excel's
-    /// array formula `{=SUM(A1:A3*B1:B3)}` makes them arrays inside a
-    /// function call, but a multi-cell `{=A1:A3*2}` keeps them values at its
-    /// top level (each cell takes its own element); a name's are arrays.
-    fn operand_class(&self, cls: Class) -> Class {
-        let named = matches!(self.site, Site::Name { .. });
-        if cls == Class::Arr || named || (self.forced && self.depth > 0) {
-            Class::Arr
-        } else {
-            Class::Val
-        }
     }
 }
 
