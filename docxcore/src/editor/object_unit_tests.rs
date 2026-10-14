@@ -398,10 +398,13 @@ fn a_loose_field_showing_a_picture_is_edited_whole_1242() {
 }
 
 /// A host's plain-text cut (the browser's) cannot carry an equation or an
-/// inline picture: they stay where the cut was, its text goes (#768 r2).
+/// inline picture: they stay where the cut was, its text goes (#768 r2),
+/// and an equation kept gives no text (FIX r1 M3), so a paste does not
+/// bring it back as text beside it.
 #[test]
 fn a_plain_text_cut_keeps_the_objects_its_text_cannot_carry_1242() {
-    for (object, kind, text) in [(PIC, "[PIC]", "bc"), (EQ, "[EQ]", "bx+1c")] {
+    for (object, kind) in [(PIC, "[PIC]"), (EQ, "[EQ]")] {
+        let text = "bc";
         let mut ed = ed_with(object);
         select(&mut ed, vec![0], 1, 4);
         assert_eq!(ed.cut_text().as_deref(), Some(text));
@@ -419,11 +422,28 @@ fn a_plain_text_cut_keeps_the_objects_its_text_cannot_carry_1242() {
         assert_eq!(ed.doc.body.len(), 1);
         assert_eq!(kinds(&ed), ["a", kind, kind, "h"]);
     }
-    // A lone picture: nothing to copy, nothing done.
-    let mut ed = ed_with(PIC);
-    select(&mut ed, vec![0], 2, 3);
-    assert_eq!(ed.cut_text(), None);
-    assert_eq!(etext(&ed), "ab\u{FFFC}cd");
+    // A lone picture or equation: nothing to copy, nothing done.
+    for object in [PIC, EQ] {
+        let mut ed = ed_with(object);
+        select(&mut ed, vec![0], 2, 3);
+        assert_eq!(ed.cut_text(), None);
+        assert_eq!(etext(&ed), "ab\u{FFFC}cd");
+        assert!(!ed.undo(), "no step");
+    }
+    // A paragraph wholly inside the cut goes whole, its equation and the
+    // equation's text with it.
+    let mut ed = Editor::new(doc(&[t("ab"), format!("{EQ}{}", t("x")), t("cd")]));
+    select(&mut ed, vec![0], 1, 0);
+    ed.caret = Caret::at(vec![2], 1);
+    assert_eq!(ed.cut_text().as_deref(), Some("b\nx+1x\nc"));
+    assert_eq!(etext(&ed), "ad");
+    // While tracking every equation stays, so none gives text.
+    let mut ed = Editor::new(doc(&[t("ab"), format!("{EQ}{}", t("x")), t("cd")]));
+    track(&mut ed);
+    select(&mut ed, vec![0], 1, 0);
+    ed.caret = Caret::at(vec![2], 1);
+    assert_eq!(ed.cut_text().as_deref(), Some("b\nx\nc"));
+    assert!(saved(&ed).contains("<m:oMath>"));
 }
 
 /// FIX r1 M1: the text after an equation or a picture sits one offset

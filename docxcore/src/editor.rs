@@ -1965,18 +1965,20 @@ impl Editor {
     }
 
     /// A host's plain-text cut (the wasm bridge's): the selection's text,
-    /// then the selection deleted as [`Editor::cut`] deletes it, keeping
-    /// the pictures its text cannot carry (#768). A loose field the
-    /// selection cuts is copied and deleted whole (#1240). `None`, and
-    /// nothing done, when the selection holds no text.
+    /// then the selection deleted as [`Editor::cut`] deletes it, except
+    /// that what its text cannot carry stays where the cut was: floating
+    /// pictures and alignment tabs (#768), and the equations and inline
+    /// pictures in the paragraphs where it starts and ends (#1242), whose
+    /// text it then leaves out, so a paste does not bring an equation back
+    /// as text beside the one kept. A loose field the selection cuts is
+    /// copied and deleted whole (#1240). `None`, and nothing done, when the
+    /// selection holds no text (only kept objects, say).
     pub fn cut_text(&mut self) -> Option<String> {
         self.widen_selection_over_loose_fields();
-        let text = self.selection_text();
+        let text = self.selection_text_with(true);
         if text.is_empty() {
             return None;
         }
-        // Nor can it carry an equation or an inline picture (#1242): they
-        // stay where the cut was.
         self.delete_selection_with(false, true);
         Some(text)
     }
@@ -2551,12 +2553,28 @@ impl Editor {
     /// The plain text currently selected (empty if no selection). Selection
     /// offsets are editor offsets, so this slices [`editor_text`], not
     /// `plain_text` (which also holds zero-width inlines' text), except that a
-    /// selected field gives its result text, not its [`FIELD_CHAR`].
+    /// selected field or equation gives its text, not its [`FIELD_CHAR`],
+    /// and an inline picture gives none.
     pub fn selection_text(&self) -> String {
-        self.selection_spans()
+        self.selection_text_with(false)
+    }
+
+    /// [`Editor::selection_text`]; `keeping_units` leaves out the text of
+    /// the equations a plain-text cut keeps in place ([`Editor::cut_text`]):
+    /// those in the first and last paragraphs, and while tracking every one
+    /// (a tracked delete keeps an equation).
+    fn selection_text_with(&self, keeping_units: bool) -> String {
+        let spans = self.selection_spans();
+        let last = spans.len().saturating_sub(1);
+        let tracking = self.track.is_some();
+        spans
             .iter()
-            .filter_map(|(path, s, e)| {
-                resolve_para(&self.doc.body, path).map(|p| display_text(&p.content, *s, *e))
+            .enumerate()
+            .filter_map(|(k, (path, s, e))| {
+                let kept = tracking || k == 0 || k == last;
+                let equations = !(keeping_units && kept);
+                resolve_para(&self.doc.body, path)
+                    .map(|p| display_text(&p.content, *s, *e, equations))
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -3372,10 +3390,12 @@ fn inline_covering(content: &[Inline], idx: usize) -> Option<&Inline> {
 }
 
 /// The text a user sees in editor offsets `[start, end)` of `content`: the
-/// editor text, with each field's result in place of its [`FIELD_CHAR`].
-fn display_text(content: &[Inline], start: usize, end: usize) -> String {
+/// editor text, with each field's result or equation's text in place of its
+/// [`FIELD_CHAR`]; an inline picture gives none. `equations` false leaves
+/// out the equations' text too.
+fn display_text(content: &[Inline], start: usize, end: usize, equations: bool) -> String {
     let mut out = String::new();
-    push_display_text(content, start, end, &mut 0, &mut out);
+    push_display_text(content, start, end, equations, &mut 0, &mut out);
     out
 }
 
@@ -3383,6 +3403,7 @@ fn push_display_text(
     content: &[Inline],
     start: usize,
     end: usize,
+    equations: bool,
     pos: &mut usize,
     out: &mut String,
 ) {
@@ -3398,10 +3419,11 @@ fn push_display_text(
                 );
                 out.extend(runs.chars().skip(s - a).take(e.saturating_sub(s)));
                 *pos = a + runs.chars().count();
-                push_display_text(&h.content, start, end, pos, out);
+                push_display_text(&h.content, start, end, equations, pos, out);
             }
             Inline::Field { text, .. } | Inline::Equation { text, .. } if len == 1 => {
-                if start <= a && a < end {
+                let shown = equations || matches!(inline, Inline::Field { .. });
+                if shown && start <= a && a < end {
                     out.push_str(text);
                 }
                 *pos += 1;

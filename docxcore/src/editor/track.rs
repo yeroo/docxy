@@ -308,7 +308,9 @@ impl Editor {
                 (false, true) => (0, hi.offset.min(len)),
                 (false, false) => (0, len),
             };
-            self.delete_chars(path, from, to, keep_units);
+            // Kept only where the selection starts and ends, as untracked.
+            let keep = keep_units && (k == 0 || first + k == last);
+            self.delete_chars(path, from, to, keep);
         }
         true
     }
