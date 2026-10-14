@@ -233,6 +233,8 @@ class EditorView(
                     effectColor = fg(span)
                 }
                 foregroundColor = fg(span)
+                // The IDE draws its own selection above this layer.
+                if (span.field && !span.highlight) backgroundColor = FIELD
             }
             highlighters.add(
                 markup.addRangeHighlighter(
@@ -302,6 +304,8 @@ class EditorView(
     companion object {
         /** ANSI palette, light/dark aware. Scheme-derived mapping is a follow-up. */
         private val LINK = JBColor(0x2470B3, 0x589DF6)
+        /** A field's shade (#1243): Word's field grey, a dark grey on dark themes. */
+        private val FIELD = JBColor(0xD9D9D9, 0x3A3A3A)
         private val ANSI: Map<String, JBColor> = mapOf(
             "Black" to JBColor(0x000000, 0xBBBBBB),
             "Red" to JBColor(0xC91B00, 0xFF6B68),

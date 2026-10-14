@@ -9,6 +9,8 @@ data class Span(
     val strike: Boolean = false,
     val dim: Boolean = false,
     val highlight: Boolean = false,
+    /** A field's result, drawn shaded as Word does (#1243). */
+    val field: Boolean = false,
     val color: String? = null,
     val link: String? = null,
 )
@@ -68,6 +70,7 @@ class ViewModel(json: String) {
                     strike = m["s"] != null,
                     dim = m["d"] != null,
                     highlight = m["h"] != null,
+                    field = m["f"] != null,
                     color = m["c"] as? String,
                     link = m["lnk"] as? String,
                 )
@@ -155,7 +158,7 @@ class ViewModel(json: String) {
                 val start = lineStarts[i] + col
                 col += sp.text.length
                 if (sp.bold || sp.italic || sp.underline || sp.strike || sp.dim ||
-                    sp.color != null || sp.link != null
+                    sp.field || sp.color != null || sp.link != null
                 ) {
                     out.add(start until (lineStarts[i] + col) to sp)
                 }

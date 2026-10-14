@@ -31,6 +31,18 @@ class ViewModelTest {
     }
 
     @Test
+    fun fieldSpanIsAStyledRange1243() {
+        val v = ViewModel(
+            """{"lines":[{"sp":[{"t":"Body"},{"t":"12","f":1}]}],"caret":{"line":0,"col":0},""" +
+                """"selection":0,"dirty":false,"width":80,"images":[],"mermaid":[],"segs":[[[0,6]]]}""",
+        )
+        val fields = v.styledRanges().filter { it.second.field }
+        assertEquals(1, fields.size)
+        assertEquals("12", v.text.substring(fields[0].first.first, fields[0].first.last + 1))
+        assertTrue("typed text is no field", v.styledRanges().none { it.second.text == "Body" })
+    }
+
+    @Test
     fun offsetsRoundTripThroughGrid() {
         val v = render("First paragraph.\n\nSecond one here.\n")
         for (offset in intArrayOf(0, 3, v.text.length / 2, v.text.length)) {
