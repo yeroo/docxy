@@ -57,6 +57,9 @@ $Allow = @{
   # rewrite (that file passes, with the same tokens), so the .xls can't hold
   # what the .xlsx computes.
   'array-classes-2.xlsx' = @('Dyn!1,10', 'Dyn!1,11', 'Dyn!1,12')
+  # Likewise Dyn!AC1, SUM(XLOOKUP(A1:A3,A1:A3,B1:B3)), whose .xls (Excel's
+  # own array-classes-3.xls too) evaluates it as a one-cell legacy array.
+  'array-classes-3.xlsx' = @('Dyn!1,29')
   # The import doesn't read another workbook's names (corpus/legacy/README.md),
   # so `SUM([1]!Prices)` and `[1]!Half*2` arrive as their values.
   'ext-name.xls' = @('Data!1,1', 'Data!2,1')
