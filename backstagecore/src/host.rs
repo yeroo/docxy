@@ -28,6 +28,13 @@ pub trait BackstageHost {
     fn info_custom_row(&self) -> bool {
         false
     }
+    /// Whether the document is in Excel's Compatibility Mode (an Excel
+    /// 97-2003 file, #874): the Info pane then starts with a Compatibility
+    /// Mode section whose `Convert` row returns [`BackstageEvent::Convert`],
+    /// before the editable rows.
+    fn compat_mode(&self) -> bool {
+        false
+    }
 }
 
 /// The app-level action requested by a `key`/`mouse` call on [`crate::Backstage`].
@@ -54,4 +61,8 @@ pub enum BackstageEvent {
     /// Enter (or a second click) on the Info pane's row `i`: one of
     /// [`BackstageHost::info_fields`], or the custom-property row after them.
     EditInfo(usize),
+    /// Enter (or a second click) on the Info pane's `Convert` row, shown
+    /// while [`BackstageHost::compat_mode`]: convert the document to the
+    /// current file format.
+    Convert,
 }
