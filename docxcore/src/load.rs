@@ -1115,6 +1115,14 @@ impl FieldCollapse {
 /// `w:instrText` of its own. A drawing, picture or object whose text box holds
 /// a field is not: those markers belong to the text box's own paragraphs.
 fn is_field_code_run(run: &str, pushed: &[Inline]) -> bool {
+    matches!(pushed, [Inline::Raw(_)]) && is_field_code_raw(run)
+}
+
+/// Whether raw run XML holds field code of its own (a `w:fldChar` or
+/// `w:instrText`), not the markers of a text box's paragraphs inside a
+/// drawing, picture or object. The editor pairs loose fields' markers by it
+/// (#1240).
+pub(crate) fn is_field_code_raw(run: &str) -> bool {
     const CONTAINERS: [&str; 5] = [
         "<w:drawing",
         "<w:pict",
@@ -1122,8 +1130,7 @@ fn is_field_code_run(run: &str, pushed: &[Inline]) -> bool {
         "<mc:AlternateContent",
         "<w:txbxContent",
     ];
-    matches!(pushed, [Inline::Raw(_)])
-        && (run.contains("<w:fldChar") || run.contains("<w:instrText"))
+    (run.contains("<w:fldChar") || run.contains("<w:instrText"))
         && !CONTAINERS.iter().any(|c| run.contains(c))
 }
 

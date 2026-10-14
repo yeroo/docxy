@@ -19,6 +19,7 @@ mod autocorrect;
 mod cell_sdt_tests;
 mod cover;
 mod flat;
+mod loose_fields;
 mod placeholder;
 mod sections;
 mod table_design;
@@ -1336,6 +1337,10 @@ impl Editor {
             self.delete_selection();
             return;
         }
+        // After a loose field's end, even at a paragraph start (#1240).
+        if self.select_loose_field(true) {
+            return;
+        }
         if self.caret.offset > 0 {
             let off = self.caret.offset;
             if self.select_field_unit(off - 1) {
@@ -1393,6 +1398,10 @@ impl Editor {
         self.drop_collapsed_anchor();
         if self.has_selection() {
             self.delete_selection();
+            return;
+        }
+        // Before a loose field's begin, even at a paragraph end (#1240).
+        if self.select_loose_field(false) {
             return;
         }
         let off = self.caret.offset;
@@ -1738,15 +1747,20 @@ impl Editor {
         if let Some(range) = self.cell_range() {
             return self.clear_cells(&range);
         }
-        let Some((mut lo, hi)) = self.selection_range() else {
+        let Some((mut lo, mut hi)) = self.selection_range() else {
             return false;
         };
+        // A loose field the selection cuts goes whole, and the marker runs
+        // of those it covers go with their result, so no delete leaves a
+        // field shell or half a field (#1240).
+        let fields = self.widen_over_loose_fields(&mut lo, &mut hi);
         // The anchor goes after the checkpoint, so that undoing the delete
         // selects the text again, as in Word (#853).
 
         if lo.path == hi.path {
             self.checkpoint(EditKind::Structural);
             self.anchor = None;
+            self.remove_loose_fields(&lo.path, &fields);
             if drop_objects && self.track.is_none() {
                 if let Some(p) = para_mut(&mut self.doc.body, &lo.path) {
                     drop_spanned_objects(&mut p.content, lo.offset, hi.offset, false, false);
@@ -1767,6 +1781,7 @@ impl Editor {
 
         self.checkpoint(EditKind::Structural);
         self.anchor = None;
+        self.remove_loose_fields(&lo.path, &fields);
         self.clear_placeholders_around(&lo.path);
         self.clear_placeholders_around(&hi.path);
         // Tracked: the text of each paragraph is recorded as deleted and the
@@ -3691,6 +3706,32 @@ fn content_insert_with(content: &mut Vec<Inline>, o: usize, ch: char, into_empty
         }
         return;
     };
+    // Typed at a loose field's end: after its end run, not into its result
+    // (#1240). Replace's edits stay in the inline holding them.
+    let width = inline_len(&content[i]);
+    let after = if width == 0 { i } else { i + 1 };
+    if into_empty && local == width {
+        if let Some(at) = loose_fields::past_field_ends(content, after) {
+            let props = source_before(content, at)
+                .or_else(|| source_from(content, at))
+                .map(RunProps::continued)
+                .unwrap_or_default();
+            if let Some(Inline::Run(r)) = content.get_mut(at) {
+                if r.props == props {
+                    run_insert(r, 0, ch);
+                    return;
+                }
+            }
+            content.insert(
+                at,
+                Inline::Run(Run {
+                    text: ch.to_string(),
+                    props,
+                }),
+            );
+            return;
+        }
+    }
     match &mut content[i] {
         Inline::Run(r) => run_insert(r, local, ch),
         Inline::Hyperlink(h) => match link_part(h, local) {
@@ -3980,6 +4021,13 @@ fn insert_inlines(
         }
         None => {
             let mut tail = split_content(content, o);
+            // Before a loose field beginning at `o`, not into its result
+            // (#1240); the zero-width inlines at `o` stay in `content`, so
+            // after one ending there it lands as it is.
+            if let Some(k) = loose_fields::first_trailing_begin(content) {
+                let moved: Vec<Inline> = content.drain(k..).collect();
+                tail.splice(0..0, moved);
+            }
             if before_opens {
                 move_trailing_opens(content, &mut tail);
             }
