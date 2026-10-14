@@ -1255,12 +1255,20 @@ impl Package {
     /// `None` when the part is missing or unreadable.
     pub fn header_footer_blocks(&self, part: &str) -> Option<Vec<Block>> {
         let xml = self.part(part).and_then(decode_xml_part)?;
-        let rels = part_rels_name(part)
+        Some(crate::load::parse_header_footer(
+            &xml,
+            &self.part_rels(part),
+        ))
+    }
+
+    /// A part's own relationships (`word/_rels/<file>.rels`); empty when it
+    /// has none.
+    pub fn part_rels(&self, part: &str) -> Relationships {
+        part_rels_name(part)
             .and_then(|name| self.part(&name))
             .and_then(decode_xml_part)
             .map(|xml| parse_rels_xml(&xml))
-            .unwrap_or_default();
-        Some(crate::load::parse_header_footer(&xml, &rels))
+            .unwrap_or_default()
     }
 
     /// The raw bytes of a part by name.

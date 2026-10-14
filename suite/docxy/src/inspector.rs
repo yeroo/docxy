@@ -150,7 +150,7 @@ pub(crate) fn inspect_doc_tab(tab: &DocTab) -> Option<Inspection> {
         comments: live_comments(tab, doc).len(),
         comment_markers: docxcore::inspect::has_comment_markers(doc),
         revisions: doc.revisions().len(),
-        hidden: docxcore::inspect::count_hidden_runs(doc),
+        hidden: docxcore::inspect::count_hidden_runs(doc, None),
         hidden_unremovable: docxcore::inspect::count_unremovable_hidden_runs(doc),
         properties: tab
             .pkg
@@ -212,7 +212,7 @@ pub(crate) fn inspect_remove(
             (status, accepted > 0)
         }
         InspectCategory::Hidden => {
-            let removed = editor.remove_hidden_text();
+            let removed = editor.remove_hidden_text(None);
             let left = docxcore::inspect::count_unremovable_hidden_runs(&editor.doc);
             let status = if left == 0 {
                 format!("Removed all hidden text ({removed})")

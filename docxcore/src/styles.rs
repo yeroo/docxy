@@ -23,6 +23,9 @@ struct PartialRun {
     underline: Option<bool>,
     strike: Option<bool>,
     rtl: Option<bool>,
+    /// `w:vanish`: hidden text. Resolved only by
+    /// [`StyleSheet::effective_vanish`]; rendering keeps direct `vanish`.
+    vanish: Option<bool>,
     color: Option<String>,
     size: Option<u32>,
     font: Option<String>,
@@ -44,6 +47,9 @@ impl PartialRun {
         }
         if o.rtl.is_some() {
             self.rtl = o.rtl;
+        }
+        if o.vanish.is_some() {
+            self.vanish = o.vanish;
         }
         if o.color.is_some() {
             self.color = o.color.clone();
@@ -167,6 +173,35 @@ impl StyleSheet {
             style_id: direct.style_id.clone(),
             ..Default::default()
         }
+    }
+
+    /// Whether a run is hidden text (`w:vanish`) once its styles are
+    /// applied: a direct `w:vanish` decides, on or off (an off one stays in
+    /// `raw_props`); otherwise the character style, then the paragraph style
+    /// (the default one without a `w:pStyle`), then the document defaults,
+    /// each through its `basedOn` chain. The most specific setting wins: the
+    /// toggle-property XOR between a paragraph and a character style is not
+    /// applied. Rendering does not use this (see [`StyleSheet::effective_run`]).
+    pub fn effective_vanish(
+        &self,
+        para_style: Option<&str>,
+        run_style: Option<&str>,
+        direct: &RunProps,
+    ) -> bool {
+        if direct.vanish {
+            return true;
+        }
+        if has_raw_child(&direct.raw_props, "vanish") {
+            return false;
+        }
+        let mut agg = self.default_run.clone();
+        if let Some(s) = para_style.or(self.default_paragraph.as_deref()) {
+            self.fold(&mut agg, s, &mut HashSet::new());
+        }
+        if let Some(s) = run_style {
+            self.fold(&mut agg, s, &mut HashSet::new());
+        }
+        agg.vanish.unwrap_or(false)
     }
 
     /// Effective alignment: direct wins; otherwise inherit from the style chain.
@@ -503,6 +538,7 @@ fn parse_partial_rpr(p: &mut XmlParser, run: &mut PartialRun) {
                 match name {
                     "w:u" => run.underline = Some(toggle(val)),
                     "w:rtl" => run.rtl = Some(toggle(val)),
+                    "w:vanish" => run.vanish = Some(toggle(val)),
                     "w:color" => {
                         if !val.is_empty() && val != "auto" {
                             run.color = Some(val.to_ascii_uppercase());
@@ -918,5 +954,72 @@ mod tests {
             r#"<w:styles><w:style w:type="paragraph" w:styleId="Normal"><w:pPr><w:pageBreakBefore/></w:pPr></w:style></w:styles>"#,
         );
         assert!(!none.effective_ppr_flag(None, &props, PprFlag::PageBreakBefore));
+    }
+
+    /// #918: hidden text through a character style, a paragraph style (or
+    /// the default one), a `basedOn` chain or the document defaults; a direct
+    /// `w:vanish`, on or off, decides.
+    #[test]
+    fn effective_vanish_resolves_styles_and_direct_off_wins_918() {
+        let ss = parse_styles_xml(
+            r#"<w:styles>
+            <w:style w:type="character" w:styleId="Secret"><w:rPr><w:vanish/></w:rPr></w:style>
+            <w:style w:type="character" w:styleId="Shown"><w:basedOn w:val="Secret"/><w:rPr><w:vanish w:val="0"/></w:rPr></w:style>
+            <w:style w:type="paragraph" w:styleId="HiddenPara"><w:rPr><w:vanish/></w:rPr></w:style>
+            <w:style w:type="paragraph" w:styleId="Child"><w:basedOn w:val="HiddenPara"/></w:style>
+            <w:style w:type="paragraph" w:styleId="MarkOnly"><w:pPr><w:rPr><w:vanish/></w:rPr></w:pPr></w:style>
+            <w:style w:type="paragraph" w:default="1" w:styleId="Normal"/>
+        </w:styles>"#,
+        );
+        let plain = RunProps::default();
+        assert!(ss.effective_vanish(None, Some("Secret"), &plain));
+        assert!(
+            !ss.effective_vanish(None, Some("Shown"), &plain),
+            "a derived style turns it off"
+        );
+        assert!(ss.effective_vanish(Some("HiddenPara"), None, &plain));
+        assert!(
+            ss.effective_vanish(Some("Child"), None, &plain),
+            "through basedOn"
+        );
+        assert!(
+            !ss.effective_vanish(Some("Child"), Some("Shown"), &plain),
+            "the character style wins"
+        );
+        assert!(
+            !ss.effective_vanish(Some("MarkOnly"), None, &plain),
+            "the paragraph mark's only"
+        );
+        assert!(!ss.effective_vanish(None, None, &plain));
+        let off = RunProps {
+            raw_props: vec!["<w:vanish w:val=\"0\"/>".to_string()],
+            ..RunProps::default()
+        };
+        assert!(
+            !ss.effective_vanish(Some("HiddenPara"), Some("Secret"), &off),
+            "direct off wins"
+        );
+        let on = RunProps {
+            vanish: true,
+            ..RunProps::default()
+        };
+        assert!(
+            ss.effective_vanish(None, Some("Shown"), &on),
+            "direct on wins"
+        );
+        // The default paragraph style applies without a pStyle; docDefaults too.
+        let defaults = parse_styles_xml(
+            r#"<w:styles><w:docDefaults><w:rPrDefault><w:rPr><w:vanish/></w:rPr></w:rPrDefault></w:docDefaults>
+            <w:style w:type="paragraph" w:default="1" w:styleId="Normal"/>
+            <w:style w:type="paragraph" w:styleId="Visible"><w:rPr><w:vanish w:val="false"/></w:rPr></w:style></w:styles>"#,
+        );
+        assert!(defaults.effective_vanish(None, None, &plain));
+        assert!(!defaults.effective_vanish(Some("Visible"), None, &plain));
+        let normal = parse_styles_xml(
+            r#"<w:styles><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:rPr><w:vanish/></w:rPr></w:style></w:styles>"#,
+        );
+        assert!(normal.effective_vanish(None, None, &plain));
+        // Rendering still reads direct vanish only.
+        assert!(!ss.effective_run(None, Some("Secret"), &plain).vanish);
     }
 }

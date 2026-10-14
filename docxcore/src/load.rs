@@ -737,6 +737,23 @@ pub fn parse_header_footer(xml: &str, rels: &Relationships) -> Vec<Block> {
     Vec::new()
 }
 
+/// The block content of one `w:footnote` or `w:endnote` element (its own XML,
+/// from its start tag to its end tag), with `rels` its notes part's
+/// relationships. Empty when `xml` holds no such element.
+pub fn parse_note_blocks(xml: &str, rels: &Relationships) -> Vec<Block> {
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start if p.name() == "w:footnote" || p.name() == "w:endnote" => {
+                return parse_blocks_until_end(&mut p, rels);
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Vec::new()
+}
+
 /// Resolve one section header/footer's block content: scan `pkg.sect_pr()`
 /// for the `w:{kind}` reference of type `wtype` (`default`/`first`/`even`),
 /// follow it through `rels` to the target part, and parse that part's
