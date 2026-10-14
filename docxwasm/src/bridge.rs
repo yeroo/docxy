@@ -401,15 +401,10 @@ impl Session {
                 }
             }
             "cut" => {
-                let t = self.editor.selection_text();
-                if t.is_empty() {
-                    mutated = false;
-                } else {
-                    // The copy is the text: a picture or alignment tab it
-                    // cannot carry stays (#768).
-                    self.editor.delete_selection_keeping_objects();
-                    copied = Some(t);
-                }
+                // The copy is the text: a picture or alignment tab it cannot
+                // carry stays (#768); a loose field it cuts goes whole (#1240).
+                copied = self.editor.cut_text();
+                mutated = copied.is_some();
             }
             "copy" => {
                 mutated = false;

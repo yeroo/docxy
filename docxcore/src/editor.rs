@@ -19,6 +19,7 @@ mod autocorrect;
 mod cell_sdt_tests;
 mod cover;
 mod flat;
+mod loose_fields;
 mod placeholder;
 mod sections;
 mod table_design;
@@ -1336,6 +1337,10 @@ impl Editor {
             self.delete_selection();
             return;
         }
+        // After a loose field's end, even at a paragraph start (#1240).
+        if self.select_loose_field(true) {
+            return;
+        }
         if self.caret.offset > 0 {
             let off = self.caret.offset;
             if self.select_field_unit(off - 1) {
@@ -1393,6 +1398,10 @@ impl Editor {
         self.drop_collapsed_anchor();
         if self.has_selection() {
             self.delete_selection();
+            return;
+        }
+        // Before a loose field's begin, even at a paragraph end (#1240).
+        if self.select_loose_field(false) {
             return;
         }
         let off = self.caret.offset;
@@ -1717,7 +1726,10 @@ impl Editor {
     ///
     /// Over a cell range it empties the selected cells, as Word's Delete does.
     ///
-    /// A picture or alignment tab the delete spans goes with it (#768).
+    /// A picture or alignment tab the delete spans goes with it (#768). A
+    /// loose field the selection cuts (one edge inside it) goes whole, and
+    /// the marker runs of a loose field it covers go with its result, so no
+    /// delete leaves a field shell or half a field (#1240).
     pub fn delete_selection(&mut self) -> bool {
         self.delete_selection_with(true)
     }
@@ -1727,7 +1739,8 @@ impl Editor {
     /// ends, which a cut's clip does not carry (they take no offset), so a
     /// paste could not bring them back. Paragraphs wholly inside the
     /// selection still go whole, their objects with them. A host that cuts
-    /// through its own copy (the wasm bridge's plain-text cut) calls this.
+    /// through its own plain-text copy calls [`Editor::cut_text`], which
+    /// copies what this then deletes.
     pub fn delete_selection_keeping_objects(&mut self) -> bool {
         self.delete_selection_with(false)
     }
@@ -1738,15 +1751,20 @@ impl Editor {
         if let Some(range) = self.cell_range() {
             return self.clear_cells(&range);
         }
-        let Some((mut lo, hi)) = self.selection_range() else {
+        let Some((mut lo, mut hi)) = self.selection_range() else {
             return false;
         };
+        // A loose field the selection cuts goes whole, and the marker runs
+        // of those it covers go with their result, so no delete leaves a
+        // field shell or half a field (#1240).
+        let fields = self.widen_over_loose_fields(&mut lo, &mut hi);
         // The anchor goes after the checkpoint, so that undoing the delete
         // selects the text again, as in Word (#853).
 
         if lo.path == hi.path {
             self.checkpoint(EditKind::Structural);
             self.anchor = None;
+            self.remove_loose_fields(&lo.path, &fields);
             if drop_objects && self.track.is_none() {
                 if let Some(p) = para_mut(&mut self.doc.body, &lo.path) {
                     drop_spanned_objects(&mut p.content, lo.offset, hi.offset, false, false);
@@ -1767,6 +1785,7 @@ impl Editor {
 
         self.checkpoint(EditKind::Structural);
         self.anchor = None;
+        self.remove_loose_fields(&lo.path, &fields);
         self.clear_placeholders_around(&lo.path);
         self.clear_placeholders_around(&hi.path);
         // Tracked: the text of each paragraph is recorded as deleted and the
@@ -1913,11 +1932,28 @@ impl Editor {
         Some(Clip { paras })
     }
 
-    /// Cut: copy the selection, then delete it.
+    /// Cut: copy the selection, then delete it. A loose field the selection
+    /// cuts is cut whole, as the delete takes it (#1240).
     pub fn cut(&mut self) -> Option<Clip> {
+        self.widen_selection_over_loose_fields();
         let clip = self.copy()?;
         self.delete_selection_keeping_objects();
         Some(clip)
+    }
+
+    /// A host's plain-text cut (the wasm bridge's): the selection's text,
+    /// then the selection deleted as [`Editor::cut`] deletes it, keeping
+    /// the pictures its text cannot carry (#768). A loose field the
+    /// selection cuts is copied and deleted whole (#1240). `None`, and
+    /// nothing done, when the selection holds no text.
+    pub fn cut_text(&mut self) -> Option<String> {
+        self.widen_selection_over_loose_fields();
+        let text = self.selection_text();
+        if text.is_empty() {
+            return None;
+        }
+        self.delete_selection_keeping_objects();
+        Some(text)
     }
 
     /// Paste a [`Clip`] at the caret (replacing any selection). Pasting inside
@@ -1984,7 +2020,11 @@ impl Editor {
             // closed after it and open again around the last piece.
             let first_len =
                 insert_inlines(&mut p.content, off, clip.paras[0].clone(), true, in_cover);
-            let (tail, inside) = split_paragraph_at(&mut p.content, off + first_len, in_cover);
+            // A loose field beginning at the split opens after the last
+            // piece, not around the pieces after the first (#1240).
+            let begins = loose_fields::take_field_begins_at(&mut p.content, off + first_len);
+            let (mut tail, inside) = split_paragraph_at(&mut p.content, off + first_len, in_cover);
+            tail.splice(inside..inside, begins);
 
             // A middle piece pasted inside content controls is inside them
             // too: a copy of each opens and closes around it.
@@ -3653,7 +3693,9 @@ fn sdt_typing_props(content: &[Inline], at: usize) -> RunProps {
 }
 
 /// Type `ch` at caret offset `o`: into an empty content control there (see
-/// [`empty_sdt_at`]), else as [`content_insert_at`] places it.
+/// [`empty_sdt_at`]); after the end run of a loose field ending there (see
+/// `loose_fields::past_field_ends`, #1240), not into its result; else as
+/// [`content_insert_at`] places it.
 fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
     content_insert_with(content, o, ch, true);
 }
@@ -3665,8 +3707,9 @@ fn content_insert_at(content: &mut Vec<Inline>, o: usize, ch: char) {
     content_insert_with(content, o, ch, false);
 }
 
-fn content_insert_with(content: &mut Vec<Inline>, o: usize, ch: char, into_empty: bool) {
-    if let Some(at) = empty_sdt_at(content, o).filter(|_| into_empty) {
+/// [`content_insert`] when `typing`, else [`content_insert_at`].
+fn content_insert_with(content: &mut Vec<Inline>, o: usize, ch: char, typing: bool) {
+    if let Some(at) = empty_sdt_at(content, o).filter(|_| typing) {
         let props = sdt_typing_props(content, at);
         content.insert(
             at,
@@ -3691,12 +3734,38 @@ fn content_insert_with(content: &mut Vec<Inline>, o: usize, ch: char, into_empty
         }
         return;
     };
+    // Typed at a loose field's end: after its end run, not into its result
+    // (#1240). Replace's edits stay in the inline holding them.
+    let width = inline_len(&content[i]);
+    let after = if width == 0 { i } else { i + 1 };
+    if typing && local == width {
+        if let Some(at) = loose_fields::past_field_ends(content, after) {
+            let props = source_before(content, at)
+                .or_else(|| source_from(content, at))
+                .map(RunProps::continued)
+                .unwrap_or_default();
+            if let Some(Inline::Run(r)) = content.get_mut(at) {
+                if r.props == props {
+                    run_insert(r, 0, ch);
+                    return;
+                }
+            }
+            content.insert(
+                at,
+                Inline::Run(Run {
+                    text: ch.to_string(),
+                    props,
+                }),
+            );
+            return;
+        }
+    }
     match &mut content[i] {
         Inline::Run(r) => run_insert(r, local, ch),
         Inline::Hyperlink(h) => match link_part(h, local) {
             LinkPart::Runs(local) => runs_insert(&mut h.runs, local, ch),
             LinkPart::Content(local) => {
-                content_insert_with(&mut h.content, local, ch, into_empty);
+                content_insert_with(&mut h.content, local, ch, typing);
                 h.content_changed = true;
             }
         },
@@ -3980,6 +4049,13 @@ fn insert_inlines(
         }
         None => {
             let mut tail = split_content(content, o);
+            // Before a loose field beginning at `o`, not into its result
+            // (#1240); the zero-width inlines at `o` stay in `content`, so
+            // after one ending there it lands as it is.
+            if let Some(k) = loose_fields::first_trailing_begin(content) {
+                let moved: Vec<Inline> = content.drain(k..).collect();
+                tail.splice(0..0, moved);
+            }
             if before_opens {
                 move_trailing_opens(content, &mut tail);
             }

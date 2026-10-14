@@ -1115,6 +1115,14 @@ impl FieldCollapse {
 /// `w:instrText` of its own. A drawing, picture or object whose text box holds
 /// a field is not: those markers belong to the text box's own paragraphs.
 fn is_field_code_run(run: &str, pushed: &[Inline]) -> bool {
+    matches!(pushed, [Inline::Raw(_)]) && is_field_code_raw(run)
+}
+
+/// Whether raw run XML holds field code of its own (a `w:fldChar` or
+/// `w:instrText`), not the markers of a text box's paragraphs inside a
+/// drawing, picture or object. The editor pairs loose fields' markers by it
+/// (#1240).
+pub(crate) fn is_field_code_raw(run: &str) -> bool {
     const CONTAINERS: [&str; 5] = [
         "<w:drawing",
         "<w:pict",
@@ -1122,8 +1130,7 @@ fn is_field_code_run(run: &str, pushed: &[Inline]) -> bool {
         "<mc:AlternateContent",
         "<w:txbxContent",
     ];
-    matches!(pushed, [Inline::Raw(_)])
-        && (run.contains("<w:fldChar") || run.contains("<w:instrText"))
+    (run.contains("<w:fldChar") || run.contains("<w:instrText"))
         && !CONTAINERS.iter().any(|c| run.contains(c))
 }
 
@@ -1180,6 +1187,36 @@ pub(crate) fn is_empty_run(raw: &str) -> bool {
         match p.next() {
             Event::Start => match p.name() {
                 "w:rPr" | "w:lastRenderedPageBreak" => p.skip_element(),
+                _ => return false,
+            },
+            Event::Text => {
+                if !p.text().trim().is_empty() {
+                    return false;
+                }
+            }
+            Event::End | Event::Eof => return true,
+        }
+    }
+}
+
+/// Whether a field-code run holds field code and nothing else: its children
+/// are only run properties, `w:fldChar`, `w:instrText`, `w:delInstrText` and
+/// `w:lastRenderedPageBreak`. An allow-list, so a run removed with its loose
+/// field never takes anything else with it, such as text, a break, a
+/// hyphen, a positional tab or a note mark (#1240).
+pub(crate) fn holds_field_code_only(raw: &str) -> bool {
+    let mut p = XmlParser::new(raw);
+    if !matches!(p.next(), Event::Start) || p.name() != "w:r" {
+        return false;
+    }
+    loop {
+        match p.next() {
+            Event::Start => match p.name() {
+                "w:rPr"
+                | "w:fldChar"
+                | "w:instrText"
+                | "w:delInstrText"
+                | "w:lastRenderedPageBreak" => p.skip_element(),
                 _ => return false,
             },
             Event::Text => {
