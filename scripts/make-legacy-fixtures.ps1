@@ -3,8 +3,8 @@
 # legacy readers: the same workbooks as corpus/xlsx, written by Excel itself.
 #
 # Run from the repo root in Windows PowerShell:  powershell -File scripts/make-legacy-fixtures.ps1
-# (-Sections corpus,extra,addin,xll picks which parts below to rebuild; all by
-# default. xll builds a test XLL with cargo).
+# (-Sections corpus,extra,addin,xll,arrays picks which parts below to rebuild;
+# all by default. xll builds a test XLL with cargo).
 #
 # The ProgID Excel.Application may be registered to xlcomshim on a dev box, so
 # this starts EXCEL.EXE itself and binds to its running class object with
@@ -12,13 +12,13 @@
 # process stopped silently after a few files.
 param(
   [string]$Excel = "C:\Program Files\Microsoft Office\Root\Office16\EXCEL.EXE",
-  [string[]]$Sections = @('corpus', 'extra', 'addin', 'xll')
+  [string[]]$Sections = @('corpus', 'extra', 'addin', 'xll', 'arrays')
 )
 $ErrorActionPreference = 'Stop'
 # Under -File, `-Sections corpus,extra` arrives as one string 'corpus,extra'.
 $Sections = @($Sections -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-$unknown = @($Sections | Where-Object { $_ -notin @('corpus', 'extra', 'addin', 'xll') })
-if ($unknown.Count -gt 0) { throw "unknown section(s): $($unknown -join ', ') (expected corpus, extra, addin, xll)" }
+$unknown = @($Sections | Where-Object { $_ -notin @('corpus', 'extra', 'addin', 'xll', 'arrays') })
+if ($unknown.Count -gt 0) { throw "unknown section(s): $($unknown -join ', ') (expected corpus, extra, addin, xll, arrays)" }
 Add-Type -TypeDefinition @"
 using System; using System.Runtime.InteropServices;
 public static class RealCom {
@@ -206,6 +206,48 @@ try {
   $wb.SaveAs((Join-Path $addin "xll-udf.xlsx"), 51)
   $wb.SaveAs((Join-Path $addin "xll-udf.xlsb"), 50)
   Save-Xls $wb (Join-Path $addin "xll-udf.xls") $p.Id
+  $wb.Close($false)
+} finally {
+  $xl.Quit(); [Runtime.InteropServices.Marshal]::ReleaseComObject($xl) | Out-Null
+  Start-Sleep 2; if (!$p.HasExited) { $p.Kill() }
+}
+}
+
+# corpus/legacy/arrays/array-classes: array formulas, built by Excel itself so
+# its .xls is the oracle for the operand classes the .xls writer (#874) gives
+# tokens in an array context. Legacy array formulas (FormulaArray), one over
+# several cells, one in a defined name used by one, and a dynamic array typed
+# as Excel 365 does (Formula2), which the .xls holds as a legacy array. Its
+# own folder, as it has no .xlsb or .ods for the three-format test.
+if ($Sections -contains 'arrays') {
+$arrays = Join-Path $PSScriptRoot "..\corpus\legacy\arrays"
+New-Item -ItemType Directory -Force $arrays | Out-Null
+$arrays = (Resolve-Path $arrays).Path
+Remove-Item (Join-Path $arrays "array-classes.*") -ErrorAction SilentlyContinue
+$p = Start-Process $Excel -ArgumentList "/automation","-Embedding" -PassThru
+Start-Sleep -Seconds 8
+$xl = [RealCom]::Local("00024500-0000-0000-C000-000000000046")
+$xl.DisplayAlerts = $false
+try {
+  $wb = $xl.Workbooks.Add()
+  $ws = $wb.Worksheets.Item(1)
+  $ws.Name = "Data"
+  $ws.Range("A1").Value2 = 1; $ws.Range("A2").Value2 = 2; $ws.Range("A3").Value2 = 3
+  $ws.Range("B1").Value2 = 10; $ws.Range("B2").Value2 = 20; $ws.Range("B3").Value2 = 30
+  $ws.Range("C1").Value2 = "x"; $ws.Range("C2").Value2 = "y"; $ws.Range("C3").Value2 = "x"
+  $wb.Names.Add("Doubled", "=Data!`$A`$1:`$A`$3*2") | Out-Null
+  $ws.Range("E1").FormulaArray = '=SUM(A1:A3*B1:B3)'
+  $ws.Range("E2").FormulaArray = '=SUM(IF(A1:A3>1,A1:A3))'
+  $ws.Range("E3").FormulaArray = '=MAX(IF(C1:C3="x",B1:B3))'
+  $ws.Range("E4").FormulaArray = '=SUM((C1:C3="x")*B1:B3)'
+  $ws.Range("E5").FormulaArray = '=INDEX(A1:A3*2,2)'
+  $ws.Range("E6").FormulaArray = '=SUM(Doubled)'
+  $ws.Range("F1:F3").FormulaArray = '=A1:A3*2'
+  $ws.Range("G1").Formula2 = '=IF(A1:A3>1,A1:A3*2,0)'
+  $xl.Calculate()
+  $wb.CheckCompatibility = $false
+  $wb.SaveAs((Join-Path $arrays "array-classes.xlsx"), 51)
+  Save-Xls $wb (Join-Path $arrays "array-classes.xls") $p.Id
   $wb.Close($false)
 } finally {
   $xl.Quit(); [Runtime.InteropServices.Marshal]::ReleaseComObject($xl) | Out-Null

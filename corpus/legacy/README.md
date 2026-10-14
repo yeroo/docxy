@@ -81,6 +81,16 @@ the rewritten files in `scripts/check-xls-writer.ps1`, which compares their
 recalculated values with the originals'; it needs Excel, so it runs before
 a merge rather than in CI.
 
+`arrays/` holds `array-classes`, which Excel built itself
+(`scripts/make-legacy-fixtures.ps1 -Sections arrays`), saved as `.xlsx` and
+`.xls` (no `.xlsb` or `.ods`, so it sits outside the three-format test):
+legacy array formulas (`{=SUM(A1:A3*B1:B3)}`, `{=SUM(IF(…))}`,
+`{=INDEX(A1:A3*2,2)}`, a multi-cell `{=A1:A3*2}`), a defined name
+`Doubled = Data!$A$1:$A$3*2` and a dynamic array typed as Excel 365 does,
+which its `.xls` holds as a legacy array over the spill. Its tokens are the
+oracle for the operand classes the writer gives in an array context and in
+a name.
+
 ## Regenerating
 
 On Windows with Excel installed, from the repo root:
