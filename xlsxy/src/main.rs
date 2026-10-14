@@ -5209,6 +5209,15 @@ impl App {
             return;
         }
         let target = convert_target(&self.path);
+        // A file opened read-only can't be replaced: refused before the
+        // question, as `convert` would refuse it after.
+        if let Err(msg) = self
+            .refuse_read_only(&self.path)
+            .and_then(|()| self.refuse_read_only(&target))
+        {
+            self.status = Some(msg);
+            return;
+        }
         let mut prompt = format!(
             "This action converts the workbook to the current file format. The original \
              Excel 97-2003 file {} will be replaced by {}.",
@@ -9341,6 +9350,11 @@ impl App {
             // reason on the status line.
             "wq" | "x" => {
                 if self.ask_where_to_save_template_workbook() {
+                    return false;
+                }
+                // A file opened read-only is refused before any question.
+                if let Err(msg) = self.refuse_read_only(&self.path) {
+                    self.status = Some(msg);
                     return false;
                 }
                 // An .xls that would lose something asks first, as Ctrl+S
@@ -14183,6 +14197,30 @@ mod tests {
         yes(&mut app);
         assert_ne!(std::fs::read(&path).unwrap(), original);
         assert!(app.vim_run_command("wq"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `:wq`, `:x` and File › Info › Convert on an `.xls` opened read-only
+    /// say why at once, never asking about losses first (#874 r8).
+    #[test]
+    fn read_only_xls_is_refused_before_any_question() {
+        let dir = tmp("compat-read-only");
+        let (mut app, path) = open_xls(&dir, "extra/chart-embedded.xls", "chart.xls");
+        app.set_read_only(path.to_str().unwrap());
+        let original = std::fs::read(&path).unwrap();
+        let refusal = read_only_refusal(path.to_str().unwrap());
+        for cmd in ["wq", "x"] {
+            app.status = None;
+            assert!(!app.vim_run_command(cmd));
+            assert!(app.confirm.is_none(), ":{cmd} asked");
+            assert_eq!(app.status.as_deref(), Some(refusal.as_str()));
+        }
+        app.status = None;
+        app.apply_backstage_event(backstage::BackstageEvent::Convert);
+        assert!(app.confirm.is_none(), "Convert asked");
+        assert_eq!(app.status.as_deref(), Some(refusal.as_str()));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(!dir.join("chart.xlsx").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
