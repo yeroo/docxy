@@ -386,12 +386,13 @@ fn strip_removes_many_runaway_ids_in_one_pass() {
 }
 
 /// #610 r4, #1233: pruning rewrites each rels part and the content types
-/// once, however many references name a dropped part: 100,000
-/// relationships and overrides naming it go, 100,000 others stay. Only the
-/// pass is timed, so CI load on the rest of a repair cannot fail it.
+/// once, however many references name a dropped part: 300,000
+/// relationships and overrides naming it go, 300,000 others stay. Only the
+/// pass is timed, so CI load on the rest of a repair cannot fail it; the
+/// one-replace-per-hit version took minutes.
 #[test]
 fn prune_references_removes_many_in_one_pass() {
-    const N: usize = 100_000;
+    const N: usize = 300_000;
     let mut rels = String::from(
         "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
     );
@@ -536,7 +537,8 @@ fn repair_refuses_a_damaged_name_listed_twice() {
 /// part is rewritten once, however many references name the dropped part,
 /// is timed on the pass itself in
 /// `prune_references_removes_many_in_one_pass`, where CI load on unzipping,
-/// saving and reloading cannot fail it (#1233).
+/// saving and reloading cannot fail it (#1233). Only that pass is guarded
+/// at scale; the rest of a repair is checked here at 1,000 references.
 #[test]
 fn repair_prunes_every_reference_to_a_dropped_part() {
     const N: usize = 1_000;
