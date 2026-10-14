@@ -1769,9 +1769,11 @@ impl Editor {
     /// starts and ends, which a cut's clip does not carry (they take no
     /// offset), so a paste could not bring them back. An inline picture or
     /// an equation is one offset (#1242): the clip carries it, so it goes.
-    /// Paragraphs wholly inside the selection still go whole, their objects
-    /// with them. A host that cuts through its own plain-text copy calls
-    /// [`Editor::cut_text`].
+    /// While tracking, a picture is recorded as deleted and an equation
+    /// stays (a `w:del` cannot hold it whole), which the cut's clip then
+    /// leaves out. Paragraphs wholly inside the selection still go whole,
+    /// their objects with them. A host that cuts through its own plain-text
+    /// copy calls [`Editor::cut_text`].
     pub fn delete_selection_keeping_objects(&mut self) -> bool {
         self.delete_selection_with(false, false)
     }
@@ -1969,6 +1971,13 @@ impl Editor {
         // the clip leaves them out: a paste must not add a second (#1242).
         if self.delete_keeps_equations_in(&self.caret.path, false) {
             clip = without_equations(&clip);
+        }
+        // Nothing left to cut (a lone equation while tracking, which
+        // stays): no clip and no step, as `cut_text` refuses one.
+        let empty =
+            clip.paras.len() <= 1 && clip.paras.iter().flatten().all(|i| inline_len(i) == 0);
+        if empty {
+            return None;
         }
         self.delete_selection_keeping_objects();
         Some(clip)

@@ -560,6 +560,54 @@ fn a_tracked_copy_gives_an_equations_text_1242() {
     assert_eq!(ed.cut_text().as_deref(), Some("bc"));
 }
 
+/// FIX r4: Find sees a multi-line equation in a link as render.rs draws it,
+/// its lines joined in the line, at its one unit.
+#[test]
+fn find_sees_a_linked_multi_line_equation_at_its_unit_1242() {
+    let link = Inline::Hyperlink(crate::model::Hyperlink {
+        target: Some("https://x.test/".into()),
+        content: vec![Inline::Equation {
+            raw: "<m:oMath/>".into(),
+            text: "a b\nc d".into(),
+            latex: None,
+        }],
+        ..Default::default()
+    });
+    let ed = Editor::new(Document {
+        body: vec![Block::Paragraph(Paragraph {
+            props: Default::default(),
+            content: vec![
+                Inline::Run(Run {
+                    text: "x".into(),
+                    props: Default::default(),
+                }),
+                link,
+            ],
+        })],
+    });
+    let found = ed.find_visible("b c", false);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!((found[0].start, found[0].end), (1, 2));
+    assert!(!found[0].editable);
+}
+
+/// FIX r4 m1: a tracked cut of a lone equation (which stays) has nothing to
+/// cut: no clip, no step, the document as it was.
+#[test]
+fn a_tracked_cut_of_a_lone_equation_is_refused_1242() {
+    let mut ed = ed_with(EQ);
+    track(&mut ed);
+    let before = ed.doc.clone();
+    select(&mut ed, vec![0], 2, 3);
+    assert_eq!(ed.cut(), None);
+    assert_eq!(ed.doc, before);
+    assert!(!ed.undo(), "no step");
+    // With text beside it the cut goes on, the equation staying.
+    select(&mut ed, vec![0], 1, 3);
+    assert!(ed.cut().is_some());
+    assert_eq!(kinds(&ed), ["a", "del(b)", "[EQ]", "cd"]);
+}
+
 /// `ab` / `c<eq>d` / `ef` and a 1×2 table whose second cell holds `x<eq>`.
 fn three_paras_and_a_table() -> Editor {
     let cell = |inner: &str| format!("<w:tc><w:p>{inner}</w:p></w:tc>");

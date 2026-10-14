@@ -1688,6 +1688,11 @@ fn flatten_para(
                         unit: src,
                         at: mc,
                     });
+                } else if let (true, Some((pw, ph))) = (unit, raw_image_extent(raw)) {
+                    // A larger one in a link, where no block is drawn: a label
+                    // in the line, so its one offset shows (#1242).
+                    let label = format!("[image {pw}×{ph}]");
+                    push_unit_label(&mut segs, &label, mc, sel_at(mc), fi.link.clone());
                 }
                 mc += crate::editor::inline_len(item);
             }
@@ -1843,6 +1848,11 @@ fn flatten_para(
                         unit,
                         at: mc,
                     });
+                } else if let Inline::Equation { text, .. } = item {
+                    // In a link, where no block is drawn: its lines joined in
+                    // the line, so its one offset shows.
+                    let joined = text.split('\n').collect::<Vec<_>>().join(" ");
+                    push_unit_label(&mut segs, &joined, mc, sel_at(mc), fi.link.clone());
                 }
                 mc += crate::editor::inline_len(item);
             }
@@ -2629,6 +2639,48 @@ fn emit_block_item(
             }
         }
         _ => {}
+    }
+}
+
+/// Draw `label` in the line for a one-offset object that is drawn as a block
+/// elsewhere but cannot be here (in a hyperlink, #1242): every glyph carries
+/// offset `mc`, as a field's do, and it never wraps.
+fn push_unit_label(
+    segs: &mut Vec<Seg>,
+    label: &str,
+    mc: usize,
+    selected: bool,
+    link: Option<Rc<str>>,
+) {
+    if segs.last().is_some_and(|s| s.block.is_some()) {
+        segs.push(Seg {
+            glyphs: Vec::new(),
+            sep: None,
+            block: None,
+            unit: None,
+            at: mc,
+        });
+    }
+    let style = Style {
+        dim: true,
+        highlight: selected,
+        ..Style::default()
+    };
+    for ch in label.chars() {
+        let (ch, disp) = if ch == ' ' {
+            ('\u{00a0}', Some(' '))
+        } else {
+            (ch, None)
+        };
+        segs.last_mut().unwrap().glyphs.push(Glyph {
+            ch,
+            disp,
+            style: style.clone(),
+            link: link.clone(),
+            src: Some(mc),
+            dir: BidiRunDirection::Natural,
+            img: None,
+        });
     }
 }
 
@@ -4867,6 +4919,50 @@ mod tests {
                 picture_1242(300, true),
             ]);
             assert_eq!(all_offsets_1242(&maps), vec![0, 1, 2]);
+        }
+    }
+
+    /// FIX r4: a block object in a hyperlink, where no block is drawn, shows
+    /// in the line at its one offset: two stops on distinct columns, none
+    /// inside, highlighted when selected.
+    #[test]
+    fn a_block_object_in_a_link_shows_in_the_line_1242() {
+        for (object, shown) in [
+            (picture_1242(300, false), "[image 300×300]"),
+            (equation_1242("a b\nc d"), "a b c d"),
+        ] {
+            let link = Inline::Hyperlink(Hyperlink {
+                target: Some("https://x.test/".into()),
+                content: vec![object],
+                ..Hyperlink::default()
+            });
+            let d = doc(vec![para(vec![
+                run("text", RunProps::default()),
+                link,
+                run("more", RunProps::default()),
+            ])]);
+            let (lines, maps) = render_mapped(&d, &opts(60));
+            assert_eq!(lines[0].plain(), format!("text{shown}more"));
+            let w = shown.chars().count();
+            let stops = stops_1242(&maps[0]);
+            assert!(
+                stops.contains(&(4, 4)) && stops.contains(&(5, 4 + w)),
+                "{stops:?}"
+            );
+            assert!(
+                !stops.iter().any(|&(_, col)| 4 < col && col < 4 + w),
+                "no stop inside it: {stops:?}"
+            );
+            // Selecting its offset highlights it.
+            let mut o = opts(60);
+            o.selection = vec![(vec![0], 4, 5)];
+            let lit: String = render(&d, &o)[0]
+                .spans
+                .iter()
+                .filter(|s| s.style.highlight)
+                .map(|s| s.text.as_str())
+                .collect();
+            assert_eq!(lit, shown);
         }
     }
 

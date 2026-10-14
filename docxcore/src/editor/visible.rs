@@ -206,7 +206,12 @@ impl Walk {
                     self.offset += 1;
                 }
                 Inline::Equation { text, .. } => {
-                    if !nested {
+                    if nested {
+                        // In a link render.rs draws its lines joined, in the
+                        // line, at its one unit.
+                        let joined = text.split('\n').collect::<Vec<_>>().join(" ");
+                        self.read_only(&joined, self.offset, self.offset + 1, None);
+                    } else {
                         self.block(text.split('\n'));
                     }
                     self.offset += 1;
