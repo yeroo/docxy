@@ -8525,8 +8525,8 @@ impl App {
         opts.book_name = file_stem(&self.path);
         let mut out = None;
         let done = self.try_outline_edit_on(sheet, |wb| {
-            let area =
-                gridcore::edit::consolidate(wb, sheet, at, &opts).map_err(|e| e.to_string())?;
+            let area = gridcore::edit::consolidate(wb, sheet, (at.0, at.1, at.0, at.1), &opts)
+                .map_err(|e| e.to_string())?;
             out = Some(area);
             let (r1, c1, r2, c2) = area;
             Ok(format!(

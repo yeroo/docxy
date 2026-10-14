@@ -262,14 +262,15 @@ fn apply(
     }
     let snap = v.snapshot();
     let before = v.pkg.workbook.sheets.clone();
-    let (r1, c1, r2, c2) = match consolidate(&mut v.pkg.workbook, sheet, at, &opts) {
-        Ok(area) => area,
-        Err(e) => {
-            // gridcore refuses before it changes anything.
-            v.restore(snap);
-            return Err(e.to_string());
-        }
-    };
+    let (r1, c1, r2, c2) =
+        match consolidate(&mut v.pkg.workbook, sheet, (at.0, at.1, at.0, at.1), &opts) {
+            Ok(area) => area,
+            Err(e) => {
+                // gridcore refuses before it changes anything.
+                v.restore(snap);
+                return Err(e.to_string());
+            }
+        };
     tab.dialogs.pop();
     if !sheets_differ(&before, &v.pkg.workbook.sheets) {
         tab.status = "Consolidate changed nothing".into();

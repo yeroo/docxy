@@ -75,14 +75,22 @@ pub struct ConsolidateSettings {
     pub left_col: bool,
     /// "Create links to source data".
     pub links: bool,
+    /// References to other workbooks (`<dataRef r:id>`), each the element
+    /// as the file held it. They are not consolidated (#988: no external
+    /// links yet) but kept, and written after `refs` when the settings
+    /// change, so Excel's list moves them to its end.
+    pub external: Vec<String>,
 }
+
+/// The sheet-local name a consolidation keeps on its output (REF-092).
+pub const CONSOLIDATE_AREA: &str = "_xlnm.Consolidate_Area";
 
 /// What the Consolidate dialog asks.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConsolidateOptions {
     pub func: ConsolidateFunc,
     /// The source references, as typed: `Sheet!A1:D4`, `'My sheet'!$A$1:$D$4`,
-    /// or a bare range on the destination sheet.
+    /// a bare range on the destination sheet, or a defined name.
     pub refs: Vec<String>,
     pub top_row: bool,
     pub left_col: bool,
@@ -105,7 +113,8 @@ pub struct ConsolidateRef {
 pub enum ConsolidateError {
     /// The reference list is empty.
     NoRefs,
-    /// A reference does not parse or names no sheet of this workbook.
+    /// A reference does not parse, names no sheet of this workbook, or is a
+    /// defined name that is not one area on a sheet.
     BadRef(String),
     /// Links were asked for with a source on the destination sheet.
     LinksOnDestSheet,
@@ -176,14 +185,54 @@ pub(crate) fn split_ref_text(text: &str) -> Option<(Option<String>, &str)> {
 }
 
 /// Read a source reference. A bare range is on sheet `dest`; `$` anchors
-/// and a leading `=` are accepted; the sheet is matched ignoring case.
+/// and a leading `=` are accepted; the sheet is matched ignoring case. Text
+/// that is no range may be a defined name (DAT-160): one local to `dest`
+/// first, then a global one, ignoring case, whose definition is a single
+/// area on a named sheet; it reads as that area.
 pub fn parse_consolidate_ref(
     wb: &Workbook,
     dest: usize,
     text: &str,
 ) -> Result<ConsolidateRef, ConsolidateError> {
     let names: Vec<&str> = wb.sheets.iter().map(|s| s.name.as_str()).collect();
-    parse_consolidate_ref_in(&names, dest, text)
+    parse_consolidate_ref_in(&names, dest, text).or_else(|e| {
+        let def = consolidate_name(wb, dest, text).ok_or(e.clone())?;
+        // The definition must name its sheet: a bare area would read as
+        // being on the destination.
+        match split_ref_text(def) {
+            Some((Some(_), _)) => parse_consolidate_ref_in(&names, dest, def).map_err(|_| e),
+            _ => Err(e),
+        }
+    })
+}
+
+/// The definition of the defined name `text` as Consolidate sees it from
+/// sheet `dest`: local to `dest`, else global. `None` when no such name.
+fn consolidate_name<'a>(wb: &'a Workbook, dest: usize, text: &str) -> Option<&'a str> {
+    let t = text.trim();
+    let t = t.strip_prefix('=').unwrap_or(t).trim();
+    if t.is_empty() || t.contains('!') {
+        return None;
+    }
+    let find = |scope: Option<usize>| {
+        wb.defined_names
+            .iter()
+            .find(|d| d.scope == scope && d.name.eq_ignore_ascii_case(t))
+    };
+    find(Some(dest))
+        .or_else(|| find(None))
+        .map(|d| d.formula.trim())
+}
+
+/// How a reference that read as `r` is kept in the list: a defined name as
+/// typed (trimmed, without `=`), a range in its canonical spelling.
+fn kept_ref_text(wb: &Workbook, dest: usize, text: &str, r: &ConsolidateRef) -> String {
+    let names: Vec<&str> = wb.sheets.iter().map(|s| s.name.as_str()).collect();
+    if parse_consolidate_ref_in(&names, dest, text).is_ok() {
+        return format_consolidate_ref(r);
+    }
+    let t = text.trim();
+    t.strip_prefix('=').unwrap_or(t).trim().to_string()
 }
 
 /// [`parse_consolidate_ref`] against the workbook's sheet names alone, in
@@ -355,9 +404,15 @@ fn aggregate(func: ConsolidateFunc, vals: &[&CellValue]) -> Option<CellValue> {
     })
 }
 
-/// Consolidate `opts.refs` into sheet `dest` at (`row`, `col`), and keep
-/// the settings on that sheet. A reference repeated in another spelling
-/// (`East!A1:B3`, `east!$A$1:$B$3`) counts once. Refuses, changing nothing,
+/// Consolidate `opts.refs` into sheet `dest` at the top-left of `area`, and
+/// keep the settings on that sheet. A reference repeated in another
+/// spelling (`East!A1:B3`, `east!$A$1:$B$3`, or a defined name for it)
+/// counts once. A multi-cell `area` limits the output (DAT-161) in each
+/// dimension where it spans more than one cell: the categories (rows,
+/// columns) past it, with their labels, are not written. With links a
+/// category's hidden detail rows do not count against its height, so the
+/// output can run below `area`. The sheet-local name
+/// [`CONSOLIDATE_AREA`] is set to the output. Refuses, changing nothing,
 /// on an empty or bad reference list, links to a source on the destination
 /// sheet, a source overlapping the output, sources with nothing in them, or
 /// output that would run off the sheet. Returns the output area.
@@ -369,13 +424,16 @@ fn aggregate(func: ConsolidateFunc, vals: &[&CellValue]) -> Option<CellValue> {
 /// written only for source cells that hold something, so a count or an
 /// average agrees with the static result; a source cell filled in later is
 /// not picked up. A summary row below them totals them, and the detail is
-/// grouped in an outline.
+/// grouped in an outline. A re-run after a linked one also clears the
+/// grouping of the old output's rows (the old [`CONSOLIDATE_AREA`]) that
+/// the new output does not cover.
 pub fn consolidate(
     wb: &mut Workbook,
     dest: usize,
-    (row, col): (u32, u32),
+    area: Area,
     opts: &ConsolidateOptions,
 ) -> Result<Area, ConsolidateError> {
+    let (row, col, row_end, col_end) = area;
     if wb.sheets.get(dest).is_none() {
         return Err(ConsolidateError::BadRef(String::new()));
     }
@@ -383,9 +441,11 @@ pub fn consolidate(
         return Err(ConsolidateError::NoRefs);
     }
     let mut refs: Vec<ConsolidateRef> = Vec::with_capacity(opts.refs.len());
+    let mut kept: Vec<String> = Vec::with_capacity(opts.refs.len());
     for t in &opts.refs {
         let r = parse_consolidate_ref(wb, dest, t)?;
         if !refs.contains(&r) {
+            kept.push(kept_ref_text(wb, dest, t, &r));
             refs.push(r);
         }
     }
@@ -452,13 +512,24 @@ pub fn consolidate(
         return Err(ConsolidateError::Empty);
     }
 
-    // Lay the output out: the static grid, or detail and summary rows.
+    // Lay the output out: the static grid, or detail and summary rows. A
+    // selection taller (wider) than one cell keeps the categories that fit.
     let data_col = col + left + u32::from(opts.links);
     let first_row = row + top;
+    let n_rows = if row_end > row {
+        (row_end + 1).saturating_sub(first_row).min(rows.len()) as usize
+    } else {
+        rows.keys.len()
+    };
+    let n_cols = if col_end > col {
+        (col_end + 1).saturating_sub(data_col).min(cols.len())
+    } else {
+        cols.len()
+    };
     let mut plan: Vec<(u32, u32, Cell)> = Vec::new();
     let mut outline: Vec<(u32, u8, bool, bool)> = Vec::new(); // row, level, hidden, collapsed
     if opts.top_row {
-        for (j, l) in cols.labels.iter().enumerate() {
+        for (j, l) in cols.labels.iter().take(n_cols as usize).enumerate() {
             if let Some(l) = l {
                 plan.push((row, data_col + j as u32, l.clone()));
             }
@@ -466,12 +537,12 @@ pub fn consolidate(
     }
     let src_cell = |h: &Hit| wb.sheets[h.sheet].cell(h.row, h.col).expect("a hit");
     let mut cur = first_row;
-    for i in 0..rows.keys.len() {
+    for i in 0..n_rows {
         if opts.links {
             // The contributing source rows, in list order, each as many
             // detail rows as it has cells under one output column.
             let mut groups: Vec<(usize, u32)> = Vec::new();
-            for j in 0..cols.keys.len() {
+            for j in 0..n_cols as usize {
                 for h in hits.get(&(i, j)).into_iter().flatten() {
                     if !groups.contains(&(h.src, h.row)) {
                         groups.push((h.src, h.row));
@@ -481,7 +552,7 @@ pub fn consolidate(
             groups.sort_by_key(|&(src, r)| (src, r));
             let detail_first = cur;
             for &(src, srow) in &groups {
-                let mut per_col: Vec<Vec<&Hit>> = vec![Vec::new(); cols.keys.len()];
+                let mut per_col: Vec<Vec<&Hit>> = vec![Vec::new(); n_cols as usize];
                 for (j, list) in per_col.iter_mut().enumerate() {
                     list.extend(
                         hits.get(&(i, j))
@@ -514,7 +585,7 @@ pub fn consolidate(
                     plan.push((cur, col, l.clone()));
                 }
             }
-            for j in 0..cols.keys.len() {
+            for j in 0..n_cols as usize {
                 let c = data_col + j as u32;
                 let Some(first) = hits.get(&(i, j)).and_then(|v| v.first()) else {
                     continue;
@@ -537,7 +608,7 @@ pub fn consolidate(
                     plan.push((cur, col, l.clone()));
                 }
             }
-            for j in 0..cols.keys.len() {
+            for j in 0..n_cols as usize {
                 let Some(list) = hits.get(&(i, j)) else {
                     continue;
                 };
@@ -554,11 +625,18 @@ pub fn consolidate(
             cur += 1;
         }
     }
-    let last_col = u64::from(data_col) + u64::from(cols.len()) - 1;
+    // The output's last column: the data's, or (no data column fits the
+    // selection) the label or book column.
+    let last_col = (u64::from(data_col) + u64::from(n_cols)).saturating_sub(1);
+    let last_col = if col_end > col {
+        last_col.min(u64::from(col_end))
+    } else {
+        last_col
+    };
     if u64::from(cur) > u64::from(MAX_ROWS) || last_col >= u64::from(MAX_COLS) {
         return Err(ConsolidateError::OffSheet);
     }
-    let out: Area = (row, col, cur - 1, last_col as u32);
+    let out: Area = (row, col, cur.saturating_sub(1).max(row), last_col as u32);
     if refs
         .iter()
         .any(|r| r.sheet == *dest_name && super::rects_overlap(r.area, out))
@@ -567,15 +645,36 @@ pub fn consolidate(
     }
 
     // Write: clear the area (contents and row grouping), then the plan.
+    // The previous run's output, when it was linked: its rows outside the
+    // new output lose their grouping too.
+    let old_rows = wb.sheets[dest]
+        .consolidate
+        .as_ref()
+        .filter(|k| k.links)
+        .and_then(|_| crate::filter::name_area(wb, dest, CONSOLIDATE_AREA))
+        .map(|(a, _, b, _)| (a, b));
     let settings = ConsolidateSettings {
         func: opts.func,
-        refs: refs.iter().map(format_consolidate_ref).collect(),
+        refs: kept,
         top_row: opts.top_row,
         left_col: opts.left_col,
         links: opts.links,
+        external: wb.sheets[dest]
+            .consolidate
+            .as_ref()
+            .map(|k| k.external.clone())
+            .unwrap_or_default(),
     };
+    crate::filter::set_name(wb, dest, CONSOLIDATE_AREA, dest, out);
     let s: &mut Sheet = &mut wb.sheets[dest];
     let (r1, c1, r2, c2) = out;
+    if let Some((a, b)) = old_rows {
+        for r in (a..=b).filter(|r| !(r1..=r2).contains(r)) {
+            s.set_row_outline(r, 0);
+            s.set_row_hidden(r, false);
+            s.set_row_collapsed(r, false);
+        }
+    }
     let stale: Vec<(u32, u32)> = s
         .cells
         .range((r1, 0)..=(r2, u32::MAX))
@@ -709,6 +808,11 @@ mod tests {
         CellValue::Text(s.into())
     }
 
+    /// A one-cell destination.
+    fn at(r: u32, c: u32) -> Area {
+        (r, c, r, c)
+    }
+
     fn recalc(w: &mut Workbook) {
         let mut eng = Engine::new(w);
         eng.recalc_all(w);
@@ -742,7 +846,7 @@ mod tests {
             ..Workbook::default()
         };
         let o = opts(&["S1!C3:D4", "S2!A1:C3"], false, false);
-        assert_eq!(consolidate(&mut w, 2, (1, 1), &o), Ok((1, 1, 3, 3)));
+        assert_eq!(consolidate(&mut w, 2, at(1, 1), &o), Ok((1, 1, 3, 3)));
         assert_eq!(val(&w, 2, "B2"), num(11.0));
         assert_eq!(val(&w, 2, "C2"), num(22.0));
         assert_eq!(val(&w, 2, "D2"), num(30.0));
@@ -756,7 +860,7 @@ mod tests {
     fn by_category_matches_labels_case_insensitively_in_any_order() {
         let mut w = east_west();
         let o = opts(&["East!A1:C4", "West!A1:C4"], true, true);
-        assert_eq!(consolidate(&mut w, 2, (0, 0), &o), Ok((0, 0, 4, 2)));
+        assert_eq!(consolidate(&mut w, 2, at(0, 0), &o), Ok((0, 0, 4, 2)));
         // Categories in first-met order, the first meeting's spelling.
         assert_eq!(val(&w, 2, "A1"), CellValue::Empty, "the corner is blank");
         assert_eq!(val(&w, 2, "B1"), txt("Jan"));
@@ -792,7 +896,7 @@ mod tests {
             ..Workbook::default()
         };
         let o = opts(&["S1!A1:B1", "S2!A1:B2"], false, true);
-        assert_eq!(consolidate(&mut w, 2, (0, 0), &o), Ok((0, 0, 1, 1)));
+        assert_eq!(consolidate(&mut w, 2, at(0, 0), &o), Ok((0, 0, 1, 1)));
         assert_eq!(val(&w, 2, "A1"), txt("Mar"));
         assert_eq!(val(&w, 2, "B1"), num(5.0));
         assert_eq!(val(&w, 2, "A2"), txt("March"));
@@ -810,7 +914,7 @@ mod tests {
             ..Workbook::default()
         };
         let o = opts(&["S1!A1:B1", "S2!A1:B1"], false, true);
-        assert_eq!(consolidate(&mut w, 2, (0, 0), &o), Ok((0, 0, 0, 1)));
+        assert_eq!(consolidate(&mut w, 2, at(0, 0), &o), Ok((0, 0, 0, 1)));
         assert_eq!(
             val(&w, 2, "A1"),
             num(2024.0),
@@ -823,7 +927,7 @@ mod tests {
     fn top_row_only_keeps_rows_by_position() {
         let mut w = east_west();
         let o = opts(&["East!B1:C3", "West!B1:C2"], true, false);
-        assert_eq!(consolidate(&mut w, 2, (0, 0), &o), Ok((0, 0, 2, 1)));
+        assert_eq!(consolidate(&mut w, 2, at(0, 0), &o), Ok((0, 0, 2, 1)));
         assert_eq!(val(&w, 2, "A1"), txt("Jan"));
         assert_eq!(val(&w, 2, "B1"), txt("Feb"));
         // Row 1 of each: East 1/2, West Feb 10 jan 20.
@@ -863,7 +967,7 @@ mod tests {
         let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
         let mut o = opts(&refs, false, false);
         o.func = func;
-        consolidate(w, 1, (0, 0), &o).unwrap();
+        consolidate(w, 1, at(0, 0), &o).unwrap();
         val(w, 1, "A1")
     }
 
@@ -904,10 +1008,10 @@ mod tests {
         };
         let mut o = opts(&["S!A1"], false, false);
         o.func = StdDev;
-        consolidate(&mut w, 1, (0, 0), &o).unwrap();
+        consolidate(&mut w, 1, at(0, 0), &o).unwrap();
         assert_eq!(val(&w, 1, "A1"), CellValue::Error("#DIV/0!".into()));
         o.func = StdDevP;
-        consolidate(&mut w, 1, (0, 0), &o).unwrap();
+        consolidate(&mut w, 1, at(0, 0), &o).unwrap();
         assert_eq!(val(&w, 1, "A1"), num(0.0));
         // Only text: Average has no number to divide.
         let mut w = Workbook {
@@ -915,7 +1019,7 @@ mod tests {
             ..Workbook::default()
         };
         o.func = Average;
-        consolidate(&mut w, 1, (0, 0), &o).unwrap();
+        consolidate(&mut w, 1, at(0, 0), &o).unwrap();
         assert_eq!(val(&w, 1, "A1"), CellValue::Error("#DIV/0!".into()));
     }
 
@@ -923,7 +1027,7 @@ mod tests {
     fn static_output_does_not_follow_the_source() {
         let mut w = east_west();
         let o = opts(&["East!A1:C4", "West!A1:C4"], true, true);
-        consolidate(&mut w, 2, (0, 0), &o).unwrap();
+        consolidate(&mut w, 2, at(0, 0), &o).unwrap();
         assert_eq!(formula(&w, 2, "B2"), "", "a plain value");
         w.sheets[0].set_cell(1, 1, n(100.0));
         recalc(&mut w);
@@ -936,7 +1040,7 @@ mod tests {
         let mut o = opts(&["East!A1:C4", "West!A1:C4"], true, true);
         o.links = true;
         o.book_name = "Sales".into();
-        let area = consolidate(&mut w, 2, (0, 0), &o).unwrap();
+        let area = consolidate(&mut w, 2, at(0, 0), &o).unwrap();
         // Labels row, then A: 2 details + summary, B: 1 + 1, C: 2 + 1,
         // D: 1 + 1 → rows 1..=11; label, book, Jan, Feb columns.
         assert_eq!(area, (0, 0, 10, 3));
@@ -971,7 +1075,7 @@ mod tests {
         consolidate(
             &mut st,
             2,
-            (0, 0),
+            at(0, 0),
             &opts(&["East!A1:C4", "West!A1:C4"], true, true),
         )
         .unwrap();
@@ -1007,10 +1111,10 @@ mod tests {
             let mut o = opts(&["S1!A1:B1", "S2!A1:B1"], false, false);
             o.func = func;
             let mut st = base();
-            consolidate(&mut st, 2, (0, 0), &o).unwrap();
+            consolidate(&mut st, 2, at(0, 0), &o).unwrap();
             o.links = true;
             let mut w = base();
-            consolidate(&mut w, 2, (0, 0), &o).unwrap();
+            consolidate(&mut w, 2, at(0, 0), &o).unwrap();
             assert_eq!(formula(&w, 2, "C2"), "", "S2!B1 is blank: no link");
             recalc(&mut w);
             assert_eq!(val(&w, 2, "B3"), val(&st, 2, "A1"), "{func:?} A");
@@ -1038,12 +1142,12 @@ mod tests {
         let mut o = opts(&["East!A1:C4", "Summary!A1:C4"], true, true);
         o.links = true;
         assert_eq!(
-            consolidate(&mut w, 2, (10, 10), &o),
+            consolidate(&mut w, 2, at(10, 10), &o),
             Err(ConsolidateError::LinksOnDestSheet)
         );
         o.refs = vec!["East!A1:C4".into(), "A1:C4".into()];
         assert_eq!(
-            consolidate(&mut w, 2, (10, 10), &o),
+            consolidate(&mut w, 2, at(10, 10), &o),
             Err(ConsolidateError::LinksOnDestSheet),
             "a bare range is on the destination"
         );
@@ -1056,12 +1160,12 @@ mod tests {
         let before = snapshot(&w);
         let o = opts(&["East!A1:C4", "West!A1:C4"], true, true);
         assert_eq!(
-            consolidate(&mut w, 0, (2, 2), &o),
+            consolidate(&mut w, 0, at(2, 2), &o),
             Err(ConsolidateError::OverlapsDest)
         );
         assert_eq!(snapshot(&w), before);
         // Beside the sources it goes.
-        assert!(consolidate(&mut w, 0, (0, 4), &o).is_ok());
+        assert!(consolidate(&mut w, 0, at(0, 4), &o).is_ok());
     }
 
     #[test]
@@ -1070,7 +1174,7 @@ mod tests {
         let before = snapshot(&w);
         let o = |refs: &[&str]| opts(refs, false, false);
         assert_eq!(
-            consolidate(&mut w, 2, (0, 0), &o(&[])),
+            consolidate(&mut w, 2, at(0, 0), &o(&[])),
             Err(ConsolidateError::NoRefs)
         );
         for bad in [
@@ -1081,13 +1185,13 @@ mod tests {
             "'East!A1",
         ] {
             assert_eq!(
-                consolidate(&mut w, 2, (0, 0), &o(&["East!A1:C4", bad])),
+                consolidate(&mut w, 2, at(0, 0), &o(&["East!A1:C4", bad])),
                 Err(ConsolidateError::BadRef(bad.into())),
                 "{bad}"
             );
         }
         assert_eq!(
-            consolidate(&mut w, 2, (0, 0), &o(&["East!Z100:Z200"])),
+            consolidate(&mut w, 2, at(0, 0), &o(&["East!Z100:Z200"])),
             Err(ConsolidateError::Empty)
         );
         assert_eq!(snapshot(&w), before);
@@ -1116,7 +1220,7 @@ mod tests {
         let mut w = east_west();
         let mut o = opts(&["east!a1:c4", "West!A1:C4"], true, false);
         o.func = SubtotalFunc::Average;
-        consolidate(&mut w, 2, (0, 0), &o).unwrap();
+        consolidate(&mut w, 2, at(0, 0), &o).unwrap();
         assert_eq!(
             w.sheets[2].consolidate,
             Some(ConsolidateSettings {
@@ -1125,6 +1229,7 @@ mod tests {
                 top_row: true,
                 left_col: false,
                 links: false,
+                external: vec![],
             })
         );
         assert_eq!(w.sheets[0].consolidate, None);
@@ -1135,9 +1240,9 @@ mod tests {
         let mut w = east_west();
         let mut o = opts(&["East!A1:C4", "West!A1:C4"], true, true);
         o.links = true;
-        consolidate(&mut w, 2, (0, 0), &o).unwrap();
+        consolidate(&mut w, 2, at(0, 0), &o).unwrap();
         o.links = false;
-        assert_eq!(consolidate(&mut w, 2, (0, 0), &o), Ok((0, 0, 4, 2)));
+        assert_eq!(consolidate(&mut w, 2, at(0, 0), &o), Ok((0, 0, 4, 2)));
         let s = &w.sheets[2];
         assert_eq!(formula(&w, 2, "C4"), "");
         assert!((0..5).all(|r| s.row_outline(r) == 0 && !s.row_hidden(r)));
@@ -1150,10 +1255,10 @@ mod tests {
         // an undo step (and a dirty workbook) only when sheets_differ.
         let mut w = east_west();
         let o = opts(&["East!A1:C4", "West!A1:C4"], true, true);
-        consolidate(&mut w, 2, (0, 0), &o).unwrap();
+        consolidate(&mut w, 2, at(0, 0), &o).unwrap();
         let before = w.sheets.clone();
         let o = opts(&["East!A1:C4", "West!A1:C4", "East!Z90:Z99"], true, true);
-        consolidate(&mut w, 2, (0, 0), &o).unwrap();
+        consolidate(&mut w, 2, at(0, 0), &o).unwrap();
         assert_eq!(before[2].cells, w.sheets[2].cells);
         assert!(super::super::sheets_differ(&before, &w.sheets));
     }
@@ -1170,7 +1275,7 @@ mod tests {
             ..Workbook::default()
         };
         let o = opts(&["S1!A1:B1", "S2!A1:B1"], false, true);
-        assert_eq!(consolidate(&mut w, 2, (0, 0), &o), Ok((0, 0, 0, 1)));
+        assert_eq!(consolidate(&mut w, 2, at(0, 0), &o), Ok((0, 0, 0, 1)));
         assert_eq!(val(&w, 2, "B1"), num(3.0));
     }
 
@@ -1178,7 +1283,7 @@ mod tests {
     fn a_reference_repeated_in_another_spelling_counts_once() {
         let mut w = east_west();
         let o = opts(&["East!A1:C4", "east!$A$1:$C$4", "West!A1:C4"], true, true);
-        consolidate(&mut w, 2, (0, 0), &o).unwrap();
+        consolidate(&mut w, 2, at(0, 0), &o).unwrap();
         assert_eq!(val(&w, 2, "B2"), num(41.0), "East's A Jan once: 1 + 40");
         assert_eq!(
             w.sheets[2].consolidate.as_ref().unwrap().refs,
@@ -1194,6 +1299,274 @@ mod tests {
             canonical_consolidate_ref(&names, 2, " Nowhere!A1 "),
             "Nowhere!A1"
         );
+    }
+
+    fn name(w: &mut Workbook, name: &str, scope: Option<usize>, formula: &str) {
+        w.defined_names.push(crate::sheet::DefinedName {
+            name: name.into(),
+            scope,
+            formula: formula.into(),
+        });
+    }
+
+    fn kept(w: &Workbook, sheet: usize) -> Vec<String> {
+        w.sheets[sheet].consolidate.as_ref().unwrap().refs.clone()
+    }
+
+    #[test]
+    fn a_defined_name_consolidates_like_its_area() {
+        let mut w = east_west();
+        name(&mut w, "EastData", None, "East!$A$1:$C$4");
+        let o = opts(&["eastdata", "West!A1:C4"], true, true);
+        assert_eq!(consolidate(&mut w, 2, at(0, 0), &o), Ok((0, 0, 4, 2)));
+        assert_eq!(val(&w, 2, "B2"), num(41.0), "East's A Jan 1 + West's 40");
+        assert_eq!(kept(&w, 2), ["eastdata", "West!$A$1:$C$4"]);
+        // A name local to the destination wins over a global one.
+        let mut w = east_west();
+        name(&mut w, "Src", None, "West!$A$1:$C$4");
+        name(&mut w, "Src", Some(2), "East!$A$1:$C$4");
+        name(&mut w, "Src", Some(0), "West!$A$1:$C$4");
+        let o = opts(&["=Src"], true, true);
+        consolidate(&mut w, 2, at(0, 0), &o).unwrap();
+        assert_eq!(val(&w, 2, "B2"), num(1.0), "East's A Jan");
+        assert_eq!(kept(&w, 2), ["Src"]);
+        // With links, the detail formulas name cells, not the name.
+        let mut w = east_west();
+        name(&mut w, "EastData", None, "East!$A$1:$C$4");
+        let mut o = opts(&["EastData"], true, true);
+        o.links = true;
+        consolidate(&mut w, 2, at(0, 0), &o).unwrap();
+        assert_eq!(formula(&w, 2, "C2"), "East!$B$2");
+    }
+
+    #[test]
+    fn a_name_that_is_not_one_area_is_refused() {
+        let mut w = east_west();
+        name(&mut w, "Rate", None, "0.5");
+        name(&mut w, "Calc", None, "OFFSET(East!$A$1,0,0,2,2)");
+        name(&mut w, "Two", None, "East!$A$1:$B$2,West!$A$1:$B$2");
+        name(&mut w, "Gone", None, "East!#REF!");
+        name(&mut w, "Bare", None, "$A$1:$B$2");
+        name(&mut w, "Elsewhere", Some(0), "East!$A$1:$C$4");
+        let before = snapshot(&w);
+        for bad in ["Rate", "Calc", "Two", "Gone", "Bare", "Elsewhere", "Nobody"] {
+            assert_eq!(
+                consolidate(&mut w, 2, at(0, 0), &opts(&[bad], true, true)),
+                Err(ConsolidateError::BadRef(bad.into())),
+                "{bad}"
+            );
+        }
+        assert_eq!(snapshot(&w), before);
+    }
+
+    #[test]
+    fn a_name_and_its_area_count_once() {
+        let mut w = east_west();
+        name(&mut w, "EastData", None, "East!$A$1:$C$4");
+        let o = opts(&["EastData", "east!a1:c4", "West!A1:C4"], true, true);
+        consolidate(&mut w, 2, at(0, 0), &o).unwrap();
+        assert_eq!(val(&w, 2, "B2"), num(41.0));
+        assert_eq!(kept(&w, 2), ["EastData", "West!$A$1:$C$4"]);
+    }
+
+    #[test]
+    fn a_selected_range_limits_the_output() {
+        // By category: B2:C4 holds the label row and column, Jan, and the
+        // categories A and B.
+        let mut w = east_west();
+        let o = opts(&["East!A1:C4", "West!A1:C4"], true, true);
+        assert_eq!(consolidate(&mut w, 2, (1, 1, 3, 2), &o), Ok((1, 1, 3, 2)));
+        assert_eq!(val(&w, 2, "C2"), txt("Jan"));
+        assert_eq!(val(&w, 2, "D2"), CellValue::Empty, "Feb is past it");
+        assert_eq!(val(&w, 2, "B3"), txt("A"));
+        assert_eq!(val(&w, 2, "C3"), num(41.0));
+        assert_eq!(val(&w, 2, "D3"), CellValue::Empty);
+        assert_eq!(val(&w, 2, "B4"), txt("B"));
+        assert_eq!(val(&w, 2, "B5"), CellValue::Empty, "C is past it");
+        assert_eq!(val(&w, 2, "C5"), CellValue::Empty);
+        // A bigger selection writes what there is.
+        let mut w = east_west();
+        assert_eq!(consolidate(&mut w, 2, (0, 0, 20, 20), &o), Ok((0, 0, 4, 2)));
+        // By position.
+        let mut w = east_west();
+        let o = opts(&["East!B2:C4", "West!B2:C4"], false, false);
+        assert_eq!(consolidate(&mut w, 2, (0, 0, 1, 1), &o), Ok((0, 0, 1, 1)));
+        assert_eq!(val(&w, 2, "A1"), num(11.0));
+        assert_eq!(val(&w, 2, "B1"), num(22.0));
+        assert_eq!(val(&w, 2, "A2"), num(33.0));
+        assert_eq!(val(&w, 2, "A3"), CellValue::Empty);
+        assert_eq!(val(&w, 2, "C1"), CellValue::Empty);
+    }
+
+    #[test]
+    fn a_one_row_selection_limits_only_columns() {
+        let mut w = east_west();
+        let o = opts(&["East!A1:C4", "West!A1:C4"], true, true);
+        assert_eq!(consolidate(&mut w, 2, (0, 0, 0, 1), &o), Ok((0, 0, 4, 1)));
+        assert_eq!(val(&w, 2, "B1"), txt("Jan"));
+        assert_eq!(val(&w, 2, "C1"), CellValue::Empty);
+        assert_eq!(val(&w, 2, "A5"), txt("D"));
+        // A one-column selection limits only rows.
+        let mut w = east_west();
+        assert_eq!(consolidate(&mut w, 2, (0, 0, 2, 0), &o), Ok((0, 0, 2, 2)));
+        assert_eq!(val(&w, 2, "C1"), txt("Feb"));
+        assert_eq!(val(&w, 2, "A3"), txt("B"));
+        assert_eq!(val(&w, 2, "A4"), CellValue::Empty);
+    }
+
+    #[test]
+    fn a_selected_range_limits_linked_categories_not_detail_rows() {
+        let mut w = east_west();
+        let mut o = opts(&["East!A1:C4", "West!A1:C4"], true, true);
+        o.links = true;
+        // Three rows: the labels, then two categories (A with its two
+        // detail rows, B with one); three columns: label, book and Jan.
+        let out = consolidate(&mut w, 2, (0, 0, 2, 2), &o).unwrap();
+        assert_eq!(out, (0, 0, 5, 2));
+        assert_eq!(val(&w, 2, "C1"), txt("Jan"));
+        assert_eq!(val(&w, 2, "D1"), CellValue::Empty, "Feb is past it");
+        assert_eq!(formula(&w, 2, "C4"), "SUM(C2:C3)");
+        assert_eq!(formula(&w, 2, "D4"), "", "Feb is past it");
+        assert_eq!(val(&w, 2, "A6"), txt("B"));
+        assert_eq!(val(&w, 2, "A7"), CellValue::Empty, "C is past it");
+        let s = &w.sheets[2];
+        assert!((6..12).all(|r| s.row_outline(r) == 0 && !s.row_hidden(r)));
+    }
+
+    #[test]
+    fn a_source_below_a_small_selection_is_not_an_overlap() {
+        // The whole output from A1 is A1:C3, over the source at A3; the
+        // selection keeps it to A1:C2.
+        let base = || {
+            let mut w = east_west();
+            w.sheets[2] = sheet_with("Summary", &[("A3", t("A")), ("B3", n(7.0))]);
+            w
+        };
+        let o = opts(&["East!A2:C4", "Summary!A3:B3"], false, true);
+        assert_eq!(
+            consolidate(&mut base(), 2, at(0, 0), &o),
+            Err(ConsolidateError::OverlapsDest)
+        );
+        let mut w = base();
+        assert_eq!(consolidate(&mut w, 2, (0, 0, 1, 2), &o), Ok((0, 0, 1, 2)));
+        assert_eq!(val(&w, 2, "B1"), num(8.0), "A: East's 1 + 7");
+        assert_eq!(val(&w, 2, "A2"), txt("B"));
+        assert_eq!(val(&w, 2, "A3"), txt("A"), "the source stays");
+    }
+
+    fn area_name(w: &Workbook, sheet: usize) -> Option<String> {
+        w.defined_names
+            .iter()
+            .find(|d| d.scope == Some(sheet) && d.name == CONSOLIDATE_AREA)
+            .map(|d| d.formula.clone())
+    }
+
+    #[test]
+    fn consolidate_sets_the_consolidate_area_name() {
+        let mut w = east_west();
+        let o = opts(&["East!A1:C4", "West!A1:C4"], true, true);
+        consolidate(&mut w, 2, at(1, 1), &o).unwrap();
+        assert_eq!(area_name(&w, 2).as_deref(), Some("Summary!$B$2:$D$6"));
+        // A re-run updates the one name.
+        consolidate(&mut w, 2, (0, 0, 2, 2), &o).unwrap();
+        assert_eq!(area_name(&w, 2).as_deref(), Some("Summary!$A$1:$C$3"));
+        assert_eq!(w.defined_names.len(), 1);
+        // A refusal leaves it.
+        let bad = opts(&["Nowhere!A1"], true, true);
+        assert!(consolidate(&mut w, 2, at(0, 0), &bad).is_err());
+        assert_eq!(area_name(&w, 2).as_deref(), Some("Summary!$A$1:$C$3"));
+    }
+
+    #[test]
+    fn a_rerun_clears_the_old_linked_outline_outside_the_new_area() {
+        let mut w = east_west();
+        let mut o = opts(&["East!A1:C4", "West!A1:C4"], true, true);
+        o.links = true;
+        consolidate(&mut w, 2, at(0, 0), &o).unwrap();
+        assert!(w.sheets[2].row_hidden(9));
+        // Somewhere else, smaller: no row of the old output keeps its
+        // grouping.
+        o.links = false;
+        consolidate(&mut w, 2, (0, 5, 1, 7), &o).unwrap();
+        let s = &w.sheets[2];
+        assert!((0..11).all(|r| s.row_outline(r) == 0 && !s.row_hidden(r) && !s.row_collapsed(r)));
+        // After a static run, rows keep their own grouping: only a linked
+        // run groups rows.
+        let mut w = east_west();
+        let o = opts(&["East!A1:C4", "West!A1:C4"], true, true);
+        consolidate(&mut w, 2, at(0, 0), &o).unwrap();
+        w.sheets[2].set_row_outline(3, 1);
+        consolidate(&mut w, 2, (0, 5, 1, 7), &o).unwrap();
+        assert_eq!(w.sheets[2].row_outline(3), 1);
+    }
+
+    #[test]
+    fn stored_refs_follow_row_insert_and_delete() {
+        let mut w = east_west();
+        name(&mut w, "EastData", None, "East!$A$1:$C$4");
+        let o = opts(&["East!A2:C4", "West!B2:C3", "EastData"], false, false);
+        consolidate(&mut w, 2, at(0, 0), &o).unwrap();
+        super::super::insert_rows(&mut w, 0, 0, 2);
+        assert_eq!(
+            kept(&w, 2),
+            ["East!$A$4:$C$6", "West!$B$2:$C$3", "EastData"],
+            "the name stays a name: it moves itself"
+        );
+        assert_eq!(w.defined_names[0].formula, "East!$A$3:$C$6");
+        super::super::delete_cols(&mut w, 1, 0, 1);
+        assert_eq!(kept(&w, 2)[1], "West!$A$2:$B$3");
+        super::super::delete_rows(&mut w, 0, 0, 2);
+        assert_eq!(kept(&w, 2)[0], "East!$A$2:$C$4");
+        // Consolidating again from the kept list works.
+        let refs = kept(&w, 2);
+        let o = opts(
+            &refs.iter().map(String::as_str).collect::<Vec<_>>(),
+            false,
+            false,
+        );
+        assert!(consolidate(&mut w, 2, at(0, 0), &o).is_ok());
+    }
+
+    #[test]
+    fn a_deleted_source_area_reads_ref_error() {
+        let mut w = east_west();
+        let o = opts(&["East!A1:C4", "West!B2:C3"], true, true);
+        consolidate(&mut w, 2, at(0, 0), &o).unwrap();
+        super::super::delete_rows(&mut w, 1, 0, 10);
+        assert_eq!(kept(&w, 2), ["East!$A$1:$C$4", "West!#REF!"]);
+        let o = opts(&["East!A1:C4", "West!#REF!"], true, true);
+        assert_eq!(
+            consolidate(&mut w, 2, at(0, 0), &o),
+            Err(ConsolidateError::BadRef("West!#REF!".into()))
+        );
+    }
+
+    #[test]
+    fn stored_refs_follow_a_sheet_rename() {
+        let mut w = east_west();
+        let o = opts(&["East!A1:C4", "West!A1:C4"], true, true);
+        consolidate(&mut w, 2, at(0, 0), &o).unwrap();
+        super::super::rename_sheet(&mut w, 1, "West Coast");
+        assert_eq!(kept(&w, 2), ["East!$A$1:$C$4", "'West Coast'!$A$1:$C$4"]);
+        assert_eq!(area_name(&w, 2).as_deref(), Some("Summary!$A$1:$C$5"));
+        super::super::rename_sheet(&mut w, 2, "Totals");
+        assert_eq!(area_name(&w, 2).as_deref(), Some("Totals!$A$1:$C$5"));
+    }
+
+    #[test]
+    fn stored_refs_follow_a_cut_move() {
+        let mut w = east_west();
+        let o = opts(&["East!A1:C4", "West!A1:C4"], true, true);
+        consolidate(&mut w, 2, at(0, 0), &o).unwrap();
+        let mv = crate::formula::CellMove {
+            src: "West",
+            dst: "West",
+            rect: (0, 0, 3, 2),
+            dr: 10,
+            dc: 1,
+        };
+        super::super::move_refs(&mut w, 1, &mv);
+        assert_eq!(kept(&w, 2), ["East!$A$1:$C$4", "West!$B$11:$D$14"]);
     }
 
     #[test]

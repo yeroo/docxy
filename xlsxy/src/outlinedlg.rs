@@ -903,6 +903,7 @@ mod tests {
             top_row: true,
             left_col: false,
             links: true,
+            external: vec![],
         };
         let mut d = ConsolidateDialog::new(0, (3, 4), Some(&kept), Vec::new());
         assert_eq!(

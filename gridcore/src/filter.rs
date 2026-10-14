@@ -16,12 +16,12 @@ mod dates;
 mod menu;
 
 pub use advanced::{ADVANCED_OTHER_SHEET, AdvancedFilter, advanced};
-pub(crate) use apply::shown_text;
 pub use apply::{
     ByCell, FilterError, FilterOutcome, auto_filter_extend, auto_filter_off, auto_filter_on,
     auto_filter_on_range, clear, filter_by_cell, filter_range, reapply, search, set_criterion,
     status_text,
 };
+pub(crate) use apply::{name_area, set_name, shown_text};
 pub use dates::DYNAMIC_KINDS;
 pub(crate) use menu::menu_all;
 pub use menu::{
