@@ -7164,6 +7164,18 @@ fn xl_pow(a: f64, b: f64) -> Value {
     num(a.powf(b))
 }
 
+/// A text result longer than a cell holds (`entry::MAX_CELL_CHARS`, counted
+/// in UTF-16 units as Excel does) is `#VALUE!`.
+fn text_result(s: String) -> Value {
+    use crate::entry::MAX_CELL_CHARS;
+    // UTF-8 bytes are never fewer than UTF-16 units, so most strings skip the count.
+    if s.len() <= MAX_CELL_CHARS || s.encode_utf16().count() <= MAX_CELL_CHARS {
+        Value::Str(s)
+    } else {
+        Value::Err(ExcelError::Value)
+    }
+}
+
 fn bin_op(op: BinOp, l: &Value, r: &Value) -> Value {
     use std::cmp::Ordering;
     match op {
@@ -7200,7 +7212,7 @@ fn bin_op(op: BinOp, l: &Value, r: &Value) -> Value {
                 Ok(s) => s,
                 Err(e) => return Value::Err(e),
             };
-            Value::Str(a + &b)
+            text_result(a + &b)
         }
         BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
             match compare(l, r) {
@@ -8721,7 +8733,7 @@ impl<'a> Eval<'a> {
                 for a in args {
                     out.push_str(&try_text!(self.eval(a)));
                 }
-                Value::Str(out)
+                text_result(out)
             }
             "CONCAT" => {
                 let mut out = String::new();
@@ -8741,7 +8753,7 @@ impl<'a> Eval<'a> {
                         Arg::Lambda(_) => return Value::Err(ExcelError::Calc),
                     }
                 }
-                Value::Str(out)
+                text_result(out)
             }
             "TEXTJOIN" => {
                 if args.len() < 3 {
@@ -8771,7 +8783,7 @@ impl<'a> Eval<'a> {
                 if skip_empty {
                     parts.retain(|p| !p.is_empty());
                 }
-                Value::Str(parts.join(&delim))
+                text_result(parts.join(&delim))
             }
             "REPT" => {
                 if args.len() != 2 {
@@ -8779,7 +8791,9 @@ impl<'a> Eval<'a> {
                 }
                 let s = try_text!(self.eval(&args[0]));
                 let n = try_num!(self.eval(&args[1]));
-                if n < 0.0 || s.len() as f64 * n > 32_767.0 {
+                // Excel repeats the truncated count; the cap is in UTF-16 units.
+                let units = s.encode_utf16().count() as f64;
+                if n < 0.0 || units * n.trunc() > crate::entry::MAX_CELL_CHARS as f64 {
                     return Value::Err(ExcelError::Value);
                 }
                 Value::Str(s.repeat(n.trunc() as usize))
@@ -13131,6 +13145,142 @@ mod tests {
 
     fn empty() -> Grid {
         Grid::new(&[])
+    }
+
+    fn text_len(v: Value) -> usize {
+        match v {
+            Value::Str(s) => s.encode_utf16().count(),
+            v => panic!("{v:?}, expected text"),
+        }
+    }
+
+    // #972: a text result longer than a cell holds (32,767 UTF-16 units) is #VALUE!.
+    #[test]
+    fn concat_over_cell_limit_is_value_error() {
+        let g = empty();
+        let over = Value::Err(ExcelError::Value);
+        assert_eq!(eval_str("REPT(\"y\",20000)&REPT(\"y\",20000)", &g), over);
+        assert_eq!(text_len(eval_str("REPT(\"y\",32766)&\"y\"", &g)), 32_767);
+        assert_eq!(eval_str("REPT(\"y\",32767)&\"y\"", &g), over);
+    }
+
+    #[test]
+    fn concat_functions_over_cell_limit_are_value_errors() {
+        let long = Value::Str("y".repeat(16_384));
+        let g = Grid::new(&[("A1", long.clone()), ("A2", long)]);
+        let over = Value::Err(ExcelError::Value);
+        assert_eq!(
+            text_len(eval_str("CONCATENATE(REPT(\"y\",32766),\"y\")", &g)),
+            32_767
+        );
+        assert_eq!(eval_str("CONCATENATE(REPT(\"y\",32767),\"y\")", &g), over);
+        // CONCAT: scalars, a range, an array.
+        assert_eq!(
+            text_len(eval_str("CONCAT(REPT(\"y\",32766),\"y\")", &g)),
+            32_767
+        );
+        assert_eq!(eval_str("CONCAT(REPT(\"y\",32767),\"y\")", &g), over);
+        assert_eq!(
+            text_len(eval_str("CONCAT(A1,REPT(\"y\",16383))", &g)),
+            32_767
+        );
+        assert_eq!(eval_str("CONCAT(A1:A2)", &g), over);
+        assert_eq!(
+            text_len(eval_str("CONCAT({\"a\",\"b\"},REPT(\"y\",32765))", &g)),
+            32_767
+        );
+        assert_eq!(
+            eval_str("CONCAT({\"a\",\"b\"},REPT(\"y\",32766))", &g),
+            over
+        );
+        // TEXTJOIN counts its delimiters; a skipped empty adds none.
+        assert_eq!(
+            text_len(eval_str(
+                "TEXTJOIN(\",\",TRUE,REPT(\"y\",16383),REPT(\"y\",16383))",
+                &g
+            )),
+            32_767
+        );
+        assert_eq!(
+            eval_str(
+                "TEXTJOIN(\",\",TRUE,REPT(\"y\",16383),REPT(\"y\",16384))",
+                &g
+            ),
+            over
+        );
+        assert_eq!(
+            text_len(eval_str(
+                "TEXTJOIN(\",\",TRUE,REPT(\"y\",16383),\"\",REPT(\"y\",16383))",
+                &g
+            )),
+            32_767
+        );
+        assert_eq!(
+            eval_str(
+                "TEXTJOIN(\",\",FALSE,REPT(\"y\",16383),\"\",REPT(\"y\",16383))",
+                &g
+            ),
+            over
+        );
+    }
+
+    #[test]
+    fn cell_limit_counts_utf16_units() {
+        let g = empty();
+        let over = Value::Err(ExcelError::Value);
+        // U+1F600 is 2 units (4 bytes): 16,383 of them and one more unit fit.
+        assert_eq!(
+            text_len(eval_str("REPT(\"\u{1F600}\",16383)&\"a\"", &g)),
+            32_767
+        );
+        assert_eq!(
+            eval_str("REPT(\"\u{1F600}\",16383)&\"\u{1F600}\"", &g),
+            over
+        );
+        // U+00E9 is 1 unit (2 bytes): 40,001 bytes is 20,001 units, text.
+        assert_eq!(
+            text_len(eval_str("REPT(\"\u{e9}\",20000)&\"x\"", &g)),
+            20_001
+        );
+    }
+
+    #[test]
+    fn concat_over_cell_limit_per_array_element() {
+        let g = empty();
+        let ast = parse("{\"a\";\"\"}&REPT(\"y\",32767)").unwrap();
+        let mut ev = Eval::new(&g, 0, (0, 0));
+        let DynResult::Array(m) = ev.eval_dynamic(&ast) else {
+            panic!("expected an array");
+        };
+        assert_eq!(m[0][0], Value::Err(ExcelError::Value));
+        assert_eq!(text_len(m[1][0].clone()), 32_767);
+    }
+
+    #[test]
+    fn rept_counts_utf16_units_of_truncated_count() {
+        let g = empty();
+        assert_eq!(text_len(eval_str("REPT(\"\u{e9}\",20000)", &g)), 20_000);
+        assert_eq!(text_len(eval_str("REPT(\"y\",32767.5)", &g)), 32_767);
+        assert_eq!(
+            eval_str("REPT(\"y\",32768)", &g),
+            Value::Err(ExcelError::Value)
+        );
+    }
+
+    #[test]
+    fn argument_error_wins_over_cell_limit() {
+        let g = empty();
+        assert_eq!(
+            eval_str("CONCAT(REPT(\"y\",30000),REPT(\"y\",30000),1/0)", &g),
+            Value::Err(ExcelError::Div0)
+        );
+        assert_eq!(
+            eval_str(
+                "TEXTJOIN(\"\",TRUE,REPT(\"y\",30000),REPT(\"y\",30000),1/0)",
+                &g
+            ),
+            Value::Err(ExcelError::Div0)
+        );
     }
 
     #[test]
