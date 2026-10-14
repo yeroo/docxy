@@ -88,6 +88,12 @@ body {
 .u.st { text-decoration: underline line-through; }
 .dim { opacity: 0.6; }
 
+/* A field's result is shaded, as Word shades fields (#1243). Declared before
+   .sel so a selected field shows the selection instead. */
+.field {
+  background: var(--vscode-editor-inactiveSelectionBackground, rgba(128, 128, 128, 0.25));
+}
+
 .sel {
   background: var(--vscode-editor-selectionBackground);
   color: var(--vscode-editor-selectionForeground, inherit);

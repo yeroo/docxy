@@ -84,8 +84,9 @@ docx_save(handle) -> result
 The interesting logic lives in `docxwasm::bridge` as plain, natively-testable
 Rust (`cargo test -p docxwasm`); `lib.rs` is just marshalling. The **render**
 channel serializes the engine's styled lines to compact JSON
-(`{lines:[[{t,b,i,u,s,d,h,c,lnk}...]], caret, selection, dirty, width}`); colors
-map to VS Code terminal ANSI theme variables. The **command** channel is a
+(`{lines:[[{t,b,i,u,s,d,h,f,c,lnk}...]], caret, selection, dirty, width}`; `f`
+marks a field's result, drawn shaded); colors map to VS Code terminal ANSI
+theme variables. The **command** channel is a
 trivial tab-delimited string (`insert\tX`, `move\tleft\t1`, `click\t3\t5\t0`,
 `bold`, `undo`, …), so no JSON *parser* is needed on the Rust side.
 

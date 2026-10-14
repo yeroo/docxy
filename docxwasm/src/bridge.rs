@@ -238,6 +238,10 @@ impl Session {
                 if st.highlight {
                     out.push_str(",\"h\":1");
                 }
+                // A field's result: the host draws it shaded (#1243).
+                if st.field {
+                    out.push_str(",\"f\":1");
+                }
                 if let Some(c) = st.color {
                     out.push_str(",\"c\":\"");
                     out.push_str(color_name(c));
@@ -2122,6 +2126,17 @@ mod tests {
         s.exec_json("backspace");
         assert!(!s.editor.doc.plain_text().contains('1'));
         assert_eq!(s.editor.doc.plain_text().trim_end(), "Body");
+    }
+
+    #[test]
+    fn view_json_marks_a_field_span_1243() {
+        let xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:body><w:p><w:r><w:t>Body</w:t></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> PAGE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>12</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p></w:body></w:document>"#;
+        let doc = docxcore::load::parse_document_xml(xml, &Default::default());
+        let mut s = Session::open(&save_package(&new_package(doc))).expect("open");
+        let v = s.view_json(None);
+        assert!(v.contains(r#"{"t":"12","f":1}"#), "field span: {v}");
+        assert!(v.contains(r#"{"t":"Body"}"#), "typed text: {v}");
     }
 
     /// #1242: an equation or an inline picture is a one-offset atom, and

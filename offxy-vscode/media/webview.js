@@ -888,6 +888,7 @@ function buildSequenceSvg(geo) {
     if (sp.u) el.classList.add('u');
     if (sp.s) el.classList.add('st');
     if (sp.d) el.classList.add('dim');
+    if (sp.f) el.classList.add('field');
     if (sp.h) el.classList.add('sel');
     if (sp.c) el.style.color = ANSI(sp.c);
     if (sp.lnk) {
