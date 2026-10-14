@@ -313,13 +313,6 @@ fn unsupported_features(pkg: &SheetPackage, extras: &[crate::xlsx::LoadedXfExtra
             }
         }
     }
-    // Workbook and sheet settings the .xlsx writer keeps from the loaded
-    // parts and this writer has no record for.
-    for what in crate::xlsx::settings_xls_lacks(pkg) {
-        if !out.contains(&what) {
-            out.push(what);
-        }
-    }
     // A column's or row's own format (`<col style>`, `<row s>`).
     if any(&|s| {
         s.col_defs
@@ -353,6 +346,13 @@ fn unsupported_features(pkg: &SheetPackage, extras: &[crate::xlsx::LoadedXfExtra
         out.push("document properties");
     }
     let mut v: Vec<String> = out.into_iter().map(str::to_string).collect();
+    // What the .xlsx writer keeps from the loaded parts and this writer has
+    // no record for.
+    for what in crate::xlsx::settings_xls_lacks(pkg) {
+        if !v.contains(&what) {
+            v.push(what);
+        }
+    }
     for m in pkg.macro_features() {
         v.push(m.to_string());
     }
@@ -2634,6 +2634,120 @@ mod tests {
         );
         // (The function name is named as a macro function, not as hidden.)
         assert_eq!(plain, ["Excel 4.0 function stored in defined names"]);
+    }
+
+    /// Every top-level child of the workbook and worksheet parts, and every
+    /// package part, is accounted for: the ones the .xls loses are named,
+    /// by name where the import has one, else in an "other ..." entry
+    /// (#874 r10).
+    #[test]
+    fn every_loaded_element_and_part_is_written_or_named() {
+        let with = |workbook: &str, sheet: &str, part: Option<&str>| {
+            let mut pkg = book(&[(0, 0, Cell::number(1.0))]);
+            let wb = String::from_utf8(pkg.part("xl/workbook.xml").unwrap().to_vec()).unwrap();
+            pkg.set_part(
+                "xl/workbook.xml",
+                wb.replace("</workbook>", &format!("{workbook}</workbook>"))
+                    .into_bytes(),
+            );
+            let name = pkg.sheet_parts[0].clone();
+            let ws = String::from_utf8(pkg.part(&name).unwrap().to_vec()).unwrap();
+            pkg.set_part(
+                &name,
+                ws.replacen("</worksheet>", &format!("{sheet}</worksheet>"), 1)
+                    .into_bytes(),
+            );
+            if let Some(part) = part {
+                pkg.set_part(part, b"<x/>".to_vec());
+            }
+            write_xls(&pkg).lost
+        };
+        let ext = |inner: &str| format!(r#"<extLst><ext uri="{{X}}">{inner}</ext></extLst>"#);
+        let sheet_cases: Vec<(String, &str)> = vec![
+            (r#"<picture r:id="rId9"/>"#.into(), "sheet backgrounds"),
+            (r#"<scenarios><scenario name="S"/></scenarios>"#.into(), "scenarios"),
+            (r#"<customSheetViews><customSheetView guid="{G}"/></customSheetViews>"#.into(), "custom views"),
+            (r#"<protectedRanges><protectedRange name="P" sqref="A1"/></protectedRanges>"#.into(), "protected ranges"),
+            (r#"<oleObjects><oleObject progId="P" shapeId="1"/></oleObjects>"#.into(), "embedded objects and controls"),
+            (r#"<legacyDrawingHF r:id="rId9"/>"#.into(), "header and footer pictures"),
+            (ext(r#"<x14:sparklineGroups xmlns:x14="urn:x14"/>"#), "sparklines"),
+            (ext(r#"<x14:slicerList xmlns:x14="urn:x14"/>"#), "slicers"),
+            (
+                r#"<sheetViews><sheetView workbookViewId="0"><pane xSplit="2000" ySplit="1500" topLeftCell="C3"/></sheetView></sheetViews>"#.into(),
+                "sheet view settings",
+            ),
+            (
+                r#"<sheetViews><sheetView defaultGridColor="0" colorId="10" workbookViewId="0"/></sheetViews>"#.into(),
+                "sheet view settings",
+            ),
+            (r#"<webPublishItems count="1"/>"#.into(), "other sheet features (webPublishItems)"),
+            (ext(r#"<x99:future xmlns:x99="urn:x99"/>"#), "other sheet features (future)"),
+        ];
+        for (sheet, want) in &sheet_cases {
+            assert_eq!(with("", sheet, None), [*want], "{sheet}");
+        }
+        let book_cases: Vec<(String, &str)> = vec![
+            (
+                r#"<customWorkbookViews><customWorkbookView name="V"/></customWorkbookViews>"#
+                    .into(),
+                "custom views",
+            ),
+            (
+                r#"<pivotCaches><pivotCache cacheId="1" r:id="rId9"/></pivotCaches>"#.into(),
+                "PivotTables",
+            ),
+            (ext(r#"<x14:slicerCaches xmlns:x14="urn:x14"/>"#), "slicers"),
+            (
+                r#"<webPublishObjects count="1"/>"#.into(),
+                "other workbook features (webPublishObjects)",
+            ),
+        ];
+        for (workbook, want) in &book_cases {
+            assert_eq!(with(workbook, "", None), [*want], "{workbook}");
+        }
+        for (part, want) in [
+            ("customXml/item1.xml", "custom XML data"),
+            ("xl/slicers/slicer1.xml", "slicers"),
+            ("xl/timelines/timeline1.xml", "timelines"),
+            (
+                "xl/embeddings/oleObject1.bin",
+                "embedded objects and controls",
+            ),
+            ("xl/connections.xml", "external data ranges"),
+            ("xl/pivotTables/pivotTable1.xml", "PivotTables"),
+            (
+                "xl/richData/rdrichvalue.xml",
+                "other workbook content (xl/richData)",
+            ),
+        ] {
+            assert_eq!(with("", "", Some(part)), [want], "{part}");
+        }
+        // A plain view with a frozen pane, Excel's bookkeeping and the parts
+        // every package has name nothing.
+        let plain = with(
+            &ext(r#"<x15:workbookPr chartTrackingRefBase="1" xmlns:x15="urn:x15"/>"#),
+            r#"<sheetViews><sheetView colorId="64" defaultGridColor="1" workbookViewId="0"><pane ySplit="1" topLeftCell="A2" state="frozen"/></sheetView></sheetViews><printOptions/><pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>"#,
+            Some("xl/printerSettings/printerSettings1.bin"),
+        );
+        assert!(plain.is_empty(), "{plain:?}");
+    }
+
+    /// A shared string with rich text runs a cell shows is named (#874 r10).
+    #[test]
+    fn rich_shared_strings_are_named() {
+        let saved = crate::xlsx::save_xlsx(&book(&[(0, 0, Cell::text("hi"))]));
+        let pkg = crate::xlsx::load_xlsx(&saved).unwrap();
+        assert!(write_xls(&pkg).lost.is_empty());
+        let mut rich = pkg.clone();
+        let sst = "xl/sharedStrings.xml";
+        let xml = String::from_utf8(rich.part(sst).unwrap().to_vec()).unwrap();
+        let xml = xml.replace(
+            "<si><t>hi</t></si>",
+            "<si><r><rPr><b/></rPr><t>hi</t></r></si>",
+        );
+        assert!(xml.contains("<r>"), "{xml}");
+        rich.set_part(sst, xml.into_bytes());
+        assert_eq!(write_xls(&rich).lost, ["formatting within cell text"]);
     }
 
     /// Excel's number formats by id: the fixed ones as the id alone, the

@@ -4784,8 +4784,12 @@ impl App {
     /// `.xls` holds.
     fn xls_losses(&self, writer: &[String]) -> Vec<String> {
         let mut lost = merge_losses(&self.dropped, writer);
-        if !self.model_rels.is_empty() || !self.model_measures.is_empty() {
-            lost.push("Data Model (relationships and measures)".to_string());
+        // The writer names a loaded file's own Data Model parts the same way.
+        let model = "Data Model (relationships and measures)";
+        if (!self.model_rels.is_empty() || !self.model_measures.is_empty())
+            && !lost.iter().any(|l| l == model)
+        {
+            lost.push(model.to_string());
         }
         lost
     }
