@@ -1,9 +1,10 @@
 # Check that Microsoft Excel opens what gridcore's .xls writer (#874) writes,
 # and computes the same values from it. For each .xls in corpus/legacy (and
-# its extra/ and addin/ folders) this:
+# its extra/ and addin/ folders), and each .xlsx in corpus/xlsx (a Save As
+# Excel 97-2003 Workbook from a workbook), this:
 #
-#   1. reads it with gridcore and writes it back as .xls (the
-#      xls_roundtrip example, which also runs the writer's structural check);
+#   1. reads it with gridcore and writes it as .xls (the xls_roundtrip
+#      example, which also runs the writer's structural check);
 #   2. opens the original and the rewrite in Excel, side by side, with
 #      alerts off: an open that throws (a file Excel would have to repair)
 #      fails the file;
@@ -45,6 +46,8 @@ $Allow = @{
   # they give #VALUE!. The import reads them as the 3-D sum the source means,
   # which the rewrite stores, so Excel computes the sums there.
   'calc-3d.xls' = @('Total!1,1', 'Total!2,1', 'Total!3,1', 'Total!4,1', 'Total!5,1', 'Total!6,1')
+  # The .xlsx itself, read by Excel the same way.
+  'calc-3d.xlsx' = @('Total!1,1', 'Total!2,1', 'Total!3,1', 'Total!4,1', 'Total!5,1', 'Total!6,1')
   # The import doesn't read another workbook's names (corpus/legacy/README.md),
   # so `SUM([1]!Prices)` and `[1]!Half*2` arrive as their values.
   'ext-name.xls' = @('Data!1,1', 'Data!2,1')
@@ -93,10 +96,11 @@ function Compare-Cells($a, $b, $allowed) {
 
 $files = @(Get-ChildItem (Join-Path $root "corpus\legacy\*.xls")) +
   @(Get-ChildItem (Join-Path $root "corpus\legacy\extra\*.xls")) +
-  @(Get-ChildItem (Join-Path $root "corpus\legacy\addin\*.xls"))
+  @(Get-ChildItem (Join-Path $root "corpus\legacy\addin\*.xls")) +
+  @(Get-ChildItem (Join-Path $root "corpus\xlsx\*.xlsx"))
 $failed = 0
 foreach ($src in $files) {
-  $dst = Join-Path $Out "$($src.BaseName)-rewritten.xls"
+  $dst = Join-Path $Out "$($src.BaseName)-$($src.Extension.TrimStart('.'))-rewritten.xls"
   Remove-Item $dst -ErrorAction SilentlyContinue
   $lost = & $tool $src.FullName $dst 2>&1
   if ($LASTEXITCODE -ne 0) {
@@ -145,7 +149,7 @@ foreach ($src in $files) {
     if (-not $p.WaitForExit(10000)) { $p.Kill() }
   }
   if ($problems.Count -eq 0) {
-    $note = if ($lost) { " (lost: $($lost -join '; '))" } else { "" }
+    $note = if ($lost) { " ($($lost -join '; '))" } else { "" }
     Write-Output "ok   $($src.Name)$note"
   } else {
     $failed++
