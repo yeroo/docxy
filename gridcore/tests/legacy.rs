@@ -947,8 +947,11 @@ fn tokens(rgce: &[u8]) -> Option<Vec<Token>> {
     Some(out)
 }
 
+/// A formula cell: (sheet, row, col).
+type Cell3 = (usize, u16, u16);
+
 /// Tokens by (sheet, row, col).
-type FormulaTokens = std::collections::BTreeMap<(usize, u16, u16), Option<Vec<Token>>>;
+type FormulaTokens = std::collections::BTreeMap<Cell3, Option<Vec<Token>>>;
 
 /// Each worksheet formula's tokens in an `.xls`: a shared formula's from
 /// its SHRFMLA, an array formula's (on its anchor) from its ARRAY.
@@ -970,8 +973,9 @@ fn xls_formula_tokens(file: &[u8]) -> FormulaTokens {
     let u16_of = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
     let mut out = FormulaTokens::new();
     let (mut sheet, mut depth) = (0usize, 0usize);
-    let mut pending: Vec<((usize, u16, u16), (u16, u16))> = Vec::new();
-    let mut groups: std::collections::HashMap<(usize, u16, u16), Vec<u8>> = Default::default();
+    // (cell, the master its ptgExp names)
+    let mut pending: Vec<(Cell3, (u16, u16))> = Vec::new();
+    let mut groups: std::collections::HashMap<Cell3, Vec<u8>> = Default::default();
     let mut last = (0u16, 0u16);
     for (ty, b) in &recs {
         match *ty {
