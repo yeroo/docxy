@@ -21,6 +21,8 @@ mod cover;
 mod fields;
 mod flat;
 mod loose_fields;
+#[cfg(test)]
+mod object_unit_tests;
 mod placeholder;
 mod sections;
 mod table_design;
@@ -1303,20 +1305,25 @@ impl Editor {
             text,
             latex: Some(latex.to_string()),
         };
-        self.paste(&Clip {
-            paras: vec![vec![inl]],
-        });
+        // A new equation goes in while tracking too, unrecorded (a `w:ins`
+        // cannot hold one whole), as it always has.
+        self.paste_clip(
+            &Clip {
+                paras: vec![vec![inl]],
+            },
+            false,
+        );
     }
 
     /// If the character at editor offset `idx` of the caret's paragraph is a
-    /// field ([`is_field_unit`]), select it and return true: the first
-    /// Backspace or Delete next to a field selects the whole field, as in Word,
-    /// and the next press deletes it. Selecting is not an edit, so it pushes no
-    /// undo step. The caret keeps its side of the field.
+    /// field ([`is_field_unit`]) or an equation, select it and return true:
+    /// the first Backspace or Delete next to one selects all of it, as in
+    /// Word, and the next press deletes it. Selecting is not an edit, so it
+    /// pushes no undo step. The caret keeps its side of the unit.
     fn select_field_unit(&mut self, idx: usize) -> bool {
         let is_field = resolve_para(&self.doc.body, &self.caret.path)
             .and_then(|p| inline_covering(&p.content, idx))
-            .is_some_and(is_field_unit);
+            .is_some_and(|i| is_field_unit(i) || matches!(i, Inline::Equation { .. }));
         if is_field {
             let other = if self.caret.offset == idx {
                 idx + 1
@@ -1332,8 +1339,26 @@ impl Editor {
         is_field
     }
 
+    /// Whether the selection is one equation while tracking: a `w:del`
+    /// cannot record it, so Backspace and Delete leave it selected (#1242).
+    fn selects_kept_equation(&self) -> bool {
+        let Some((lo, hi)) = self.selection_range() else {
+            return false;
+        };
+        self.track.is_some()
+            && lo.path == hi.path
+            && hi.offset == lo.offset + 1
+            && resolve_para(&self.doc.body, &lo.path)
+                .and_then(|p| inline_covering(&p.content, lo.offset))
+                .is_some_and(|i| matches!(i, Inline::Equation { .. }))
+    }
+
     pub fn backspace(&mut self) {
         self.drop_collapsed_anchor();
+        if self.selects_kept_equation() {
+            self.last = EditKind::None;
+            return;
+        }
         if self.has_selection() {
             self.delete_selection();
             return;
@@ -1397,6 +1422,10 @@ impl Editor {
 
     pub fn delete_forward(&mut self) {
         self.drop_collapsed_anchor();
+        if self.selects_kept_equation() {
+            self.last = EditKind::None;
+            return;
+        }
         if self.has_selection() {
             self.delete_selection();
             return;
@@ -1732,23 +1761,29 @@ impl Editor {
     /// the marker runs of a loose field it covers go with its result, so no
     /// delete leaves a field shell or half a field (#1240).
     pub fn delete_selection(&mut self) -> bool {
-        self.delete_selection_with(true)
+        self.delete_selection_with(true, false)
     }
 
-    /// [`Editor::delete_selection`] for a cut: it keeps the pictures and
-    /// alignment tabs in the paragraphs where the selection starts and
-    /// ends, which a cut's clip does not carry (they take no offset), so a
-    /// paste could not bring them back. Paragraphs wholly inside the
-    /// selection still go whole, their objects with them. A host that cuts
-    /// through its own plain-text copy calls [`Editor::cut_text`], which
-    /// copies what this then deletes.
+    /// [`Editor::delete_selection`] for a cut: it keeps the floating
+    /// pictures and alignment tabs in the paragraphs where the selection
+    /// starts and ends, which a cut's clip does not carry (they take no
+    /// offset), so a paste could not bring them back. An inline picture or
+    /// an equation is one offset (#1242): the clip carries it, so it goes.
+    /// While tracking, a picture is recorded as deleted and an equation
+    /// stays (a `w:del` cannot hold it whole), which the cut's clip then
+    /// leaves out. Paragraphs wholly inside the selection still go whole,
+    /// their objects with them. A host that cuts through its own plain-text
+    /// copy calls [`Editor::cut_text`].
     pub fn delete_selection_keeping_objects(&mut self) -> bool {
-        self.delete_selection_with(false)
+        self.delete_selection_with(false, false)
     }
 
     /// [`Editor::delete_selection`]; `drop_objects` false is
-    /// [`Editor::delete_selection_keeping_objects`].
-    fn delete_selection_with(&mut self, drop_objects: bool) -> bool {
+    /// [`Editor::delete_selection_keeping_objects`], and `keep_units` also
+    /// keeps the equations and inline pictures in the paragraphs where the
+    /// selection starts and ends ([`is_object_unit`]), for a cut whose copy
+    /// is plain text.
+    fn delete_selection_with(&mut self, drop_objects: bool, keep_units: bool) -> bool {
         if let Some(range) = self.cell_range() {
             return self.clear_cells(&range);
         }
@@ -1771,9 +1806,7 @@ impl Editor {
                     drop_spanned_objects(&mut p.content, lo.offset, hi.offset, false, false);
                 }
             }
-            for _ in lo.offset..hi.offset {
-                self.delete_char_at(&lo.path, lo.offset);
-            }
+            self.delete_chars(&lo.path, lo.offset, hi.offset, keep_units);
             self.caret = lo;
             return true;
         }
@@ -1791,7 +1824,7 @@ impl Editor {
         self.clear_placeholders_around(&hi.path);
         // Tracked: the text of each paragraph is recorded as deleted and the
         // paragraph marks stay (see the `track` module).
-        if self.delete_text_across_paragraphs(&lo, &hi) {
+        if self.delete_text_across_paragraphs(&lo, &hi, keep_units) {
             self.caret = lo;
             return true;
         }
@@ -1817,9 +1850,7 @@ impl Editor {
                 if drop_objects {
                     drop_spanned_objects(&mut p.content, lo.offset, len, false, true);
                 }
-                for _ in lo.offset..len {
-                    content_delete(&mut p.content, lo.offset);
-                }
+                delete_content_range(&mut p.content, lo.offset, len, keep_units);
             }
             // Take the remainder of the last paragraph (after hi.offset),
             // and its props for the section mark it may carry.
@@ -1827,9 +1858,7 @@ impl Editor {
                 if drop_objects {
                     drop_spanned_objects(&mut p.content, 0, hi.offset, true, false);
                 }
-                for _ in 0..hi.offset {
-                    content_delete(&mut p.content, 0);
-                }
+                delete_content_range(&mut p.content, 0, hi.offset, keep_units);
                 (
                     std::mem::take(&mut p.content),
                     Some(std::mem::take(&mut p.props)),
@@ -1937,33 +1966,70 @@ impl Editor {
     /// cuts is cut whole, as the delete takes it (#1240).
     pub fn cut(&mut self) -> Option<Clip> {
         self.widen_selection_over_loose_fields();
-        let clip = self.copy()?;
+        let mut clip = self.copy()?;
+        // A tracked delete keeps every equation (a cell range's aside), so
+        // the clip leaves them out: a paste must not add a second (#1242).
+        if self.delete_keeps_equations_in(&self.caret.path, false) {
+            clip = without_equations(&clip);
+        }
+        // Nothing left to cut (a lone equation while tracking, which
+        // stays): no clip and no step, as `cut_text` refuses one.
+        let empty =
+            clip.paras.len() <= 1 && clip.paras.iter().flatten().all(|i| inline_len(i) == 0);
+        if empty {
+            return None;
+        }
         self.delete_selection_keeping_objects();
         Some(clip)
     }
 
     /// A host's plain-text cut (the wasm bridge's): the selection's text,
-    /// then the selection deleted as [`Editor::cut`] deletes it, keeping
-    /// the pictures its text cannot carry (#768). A loose field the
-    /// selection cuts is copied and deleted whole (#1240). `None`, and
-    /// nothing done, when the selection holds no text.
+    /// then the selection deleted as [`Editor::cut`] deletes it, except
+    /// that what its text cannot carry stays where the cut was: floating
+    /// pictures and alignment tabs (#768), and equations and inline
+    /// pictures (#1242) where [`Editor::delete_keeps_equations_in`] says:
+    /// in the paragraphs where it starts and ends, every equation while
+    /// tracking, none over a cell range (which clears the cells). It leaves
+    /// out the text of the equations it keeps, so a paste does not bring
+    /// one back as text beside the one kept. A loose field the selection cuts is
+    /// copied and deleted whole (#1240). `None`, and nothing done, when the
+    /// selection holds no text (only kept objects, say).
     pub fn cut_text(&mut self) -> Option<String> {
         self.widen_selection_over_loose_fields();
-        let text = self.selection_text();
+        let text = self.selection_text_with(true);
         if text.is_empty() {
             return None;
         }
-        self.delete_selection_keeping_objects();
+        self.delete_selection_with(false, true);
         Some(text)
     }
 
     /// Paste a [`Clip`] at the caret (replacing any selection). Pasting inside
     /// a hyperlink splits it, so the pasted content lands between two links
     /// to the same target, not inside the link (see `split_content`).
+    ///
+    /// While tracking, a pasted inline picture is recorded as an insertion,
+    /// and an equation, which a `w:ins` cannot hold whole, is left out
+    /// (#1242): a tracked cut keeps its equations in place. A tracked cut
+    /// of table cells clears them and carries their equations, which a
+    /// tracked paste then leaves out too: a known gap.
     pub fn paste(&mut self, clip: &Clip) {
+        self.paste_clip(clip, true);
+    }
+
+    /// [`Editor::paste`]; `drop_tracked_equations` false pastes equations
+    /// while tracking too (a new one from [`Editor::insert_equation`]).
+    fn paste_clip(&mut self, clip: &Clip, drop_tracked_equations: bool) {
         if clip.paras.is_empty() {
             return;
         }
+        let without;
+        let clip = if drop_tracked_equations && self.track.is_some() {
+            without = without_equations(clip);
+            &without
+        } else {
+            clip
+        };
         self.drop_collapsed_anchor();
         self.delete_selection_to_replace();
         self.checkpoint(EditKind::Structural);
@@ -2527,15 +2593,47 @@ impl Editor {
     /// The plain text currently selected (empty if no selection). Selection
     /// offsets are editor offsets, so this slices [`editor_text`], not
     /// `plain_text` (which also holds zero-width inlines' text), except that a
-    /// selected field gives its result text, not its [`FIELD_CHAR`].
+    /// selected field or equation gives its text, not its [`FIELD_CHAR`],
+    /// and an inline picture gives none.
     pub fn selection_text(&self) -> String {
+        self.selection_text_with(false)
+    }
+
+    /// [`Editor::selection_text`]; `for_plain_text_cut` leaves out the text
+    /// of the equations a plain-text cut keeps in place ([`Editor::cut_text`],
+    /// see [`Editor::delete_keeps_equations_in`]). A copy leaves out none.
+    fn selection_text_with(&self, for_plain_text_cut: bool) -> String {
         self.selection_spans()
             .iter()
             .filter_map(|(path, s, e)| {
-                resolve_para(&self.doc.body, path).map(|p| display_text(&p.content, *s, *e))
+                let equations = !(for_plain_text_cut && self.delete_keeps_equations_in(path, true));
+                resolve_para(&self.doc.body, path)
+                    .map(|p| display_text(&p.content, *s, *e, equations))
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Whether deleting the selection keeps the equations in the paragraph
+    /// at `path` (#1242), as [`Editor::delete_selection_with`] does: a cell
+    /// range's delete keeps nothing; while tracking a delete keeps every
+    /// equation; else `keep_units` (the delete of a plain-text cut) keeps
+    /// them in the paragraphs where the selection starts and ends, and the
+    /// paragraphs between go whole. A cut's copied text and clip follow it,
+    /// so a cut never both keeps an equation of the selection's own
+    /// paragraphs and carries it, nor drops it from both (a text box's
+    /// content is another matter).
+    fn delete_keeps_equations_in(&self, path: &[usize], keep_units: bool) -> bool {
+        if self.cell_range().is_some() {
+            return false;
+        }
+        if self.track.is_some() {
+            return true;
+        }
+        keep_units
+            && self
+                .selection_range()
+                .is_some_and(|(lo, hi)| lo.path == path || hi.path == path)
     }
 
     /// Toggle a run property over the selection. The new value is "off" only if
@@ -3229,22 +3327,38 @@ pub fn inline_len(i: &Inline) -> usize {
         Inline::Hyperlink(h) => link_runs_len(h) + h.content.iter().map(inline_len).sum::<usize>(),
         Inline::Tab(_) | Inline::Break(..) => 1,
         Inline::Field { text, .. } => usize::from(!text.is_empty()),
+        // An equation or an inline picture is one unit (#1242).
+        Inline::Equation { .. } => 1,
+        Inline::Raw(_) => usize::from(is_object_unit(i)),
         // Zero-length, invisible in the editor (preserved for save only).
         Inline::SmartArt { .. }
         | Inline::Chart { .. }
-        | Inline::Equation { .. }
         | Inline::TextBox { .. }
         | Inline::Revision { .. }
         | Inline::UnsupportedRevision { .. }
-        | Inline::FootnoteRef { .. }
-        | Inline::Raw(_) => 0,
+        | Inline::FootnoteRef { .. } => 0,
+    }
+}
+
+/// Whether an inline is an object the editor counts as one offset and edits
+/// as one unit, [`FIELD_CHAR`] in editor text (#1242): an equation (inline or
+/// display OMML, or a legacy Equation Editor object), or a run holding an
+/// inline (not anchored) DrawingML picture with an extent. Anchored drawings,
+/// VML pictures, positional tabs, charts, SmartArt, text boxes and anything
+/// inside a tracked change stay zero-width.
+pub fn is_object_unit(inline: &Inline) -> bool {
+    match inline {
+        Inline::Equation { .. } => true,
+        Inline::Raw(raw) => crate::image::inline_extent(raw).is_some(),
+        _ => false,
     }
 }
 
 /// A paragraph's text in editor offset space: one char per offset, matching
 /// [`inline_len`] inline by inline (zero-width inlines contribute nothing, a
 /// hyperlink contributes its `runs` and then its `content` by these same rules,
-/// a tab is `'\t'`, a break is `'\n'`, a field is [`FIELD_CHAR`]).
+/// a tab is `'\t'`, a break is `'\n'`, a field, an equation or an inline
+/// picture is [`FIELD_CHAR`]).
 /// Unlike [`Paragraph::plain_text`], every char here is one the caret can
 /// reach, so offsets into it can be selected and edited.
 fn editor_text(content: &[Inline]) -> String {
@@ -3268,9 +3382,10 @@ fn push_editor_text(content: &[Inline], out: &mut String) {
                     out.push(FIELD_CHAR);
                 }
             }
+            Inline::Equation { .. } => out.push(FIELD_CHAR),
+            Inline::Raw(_) if is_object_unit(inline) => out.push(FIELD_CHAR),
             Inline::SmartArt { .. }
             | Inline::Chart { .. }
-            | Inline::Equation { .. }
             | Inline::TextBox { .. }
             | Inline::Revision { .. }
             | Inline::UnsupportedRevision { .. }
@@ -3280,8 +3395,9 @@ fn push_editor_text(content: &[Inline], out: &mut String) {
     }
 }
 
-/// The character a field stands for in editor text ([`editor_text`], and the
-/// automation text built from it): U+FFFC OBJECT REPLACEMENT CHARACTER. It is
+/// The character a field, an equation or an inline picture stands for in
+/// editor text ([`editor_text`], and the automation text built from it):
+/// U+FFFC OBJECT REPLACEMENT CHARACTER (see [`is_object_unit`]). It is
 /// never inserted as text: typing, pasting, replacing or splicing Markdown
 /// (`agent::parse_markdown_blocks`) with it adds nothing.
 pub const FIELD_CHAR: char = '\u{FFFC}';
@@ -3329,10 +3445,12 @@ fn inline_covering(content: &[Inline], idx: usize) -> Option<&Inline> {
 }
 
 /// The text a user sees in editor offsets `[start, end)` of `content`: the
-/// editor text, with each field's result in place of its [`FIELD_CHAR`].
-fn display_text(content: &[Inline], start: usize, end: usize) -> String {
+/// editor text, with each field's result or equation's text in place of its
+/// [`FIELD_CHAR`]; an inline picture gives none. `equations` false leaves
+/// out the equations' text too.
+fn display_text(content: &[Inline], start: usize, end: usize, equations: bool) -> String {
     let mut out = String::new();
-    push_display_text(content, start, end, &mut 0, &mut out);
+    push_display_text(content, start, end, equations, &mut 0, &mut out);
     out
 }
 
@@ -3340,6 +3458,7 @@ fn push_display_text(
     content: &[Inline],
     start: usize,
     end: usize,
+    equations: bool,
     pos: &mut usize,
     out: &mut String,
 ) {
@@ -3355,14 +3474,17 @@ fn push_display_text(
                 );
                 out.extend(runs.chars().skip(s - a).take(e.saturating_sub(s)));
                 *pos = a + runs.chars().count();
-                push_display_text(&h.content, start, end, pos, out);
+                push_display_text(&h.content, start, end, equations, pos, out);
             }
-            Inline::Field { text, .. } if len == 1 => {
-                if start <= a && a < end {
+            Inline::Field { text, .. } | Inline::Equation { text, .. } if len == 1 => {
+                let shown = equations || matches!(inline, Inline::Field { .. });
+                if shown && start <= a && a < end {
                     out.push_str(text);
                 }
                 *pos += 1;
             }
+            // A picture shows no text (#1242).
+            Inline::Raw(_) if len == 1 => *pos += 1,
             _ => {
                 let t = editor_text(std::slice::from_ref(inline));
                 let (s, e) = (start.clamp(a, a + len), end.clamp(a, a + len));
@@ -3849,6 +3971,8 @@ fn source_from(content: &[Inline], i: usize) -> Option<&RunProps> {
 /// the paragraph start, of the character after it):
 /// - at the paragraph start (`local == 0`): the nearest source at or after `i`;
 /// - after a tab or a break: its own formatting (#279);
+/// - after an equation or a picture: the nearest source before it, then
+///   after it (#1242);
 /// - after a zero-width inline: the run or tab right after it; failing that,
 ///   the nearest source before, then after, it.
 fn typing_props(content: &[Inline], i: usize, local: usize) -> RunProps {
@@ -3859,6 +3983,14 @@ fn typing_props(content: &[Inline], i: usize, local: usize) -> RunProps {
     }
     if let Inline::Tab(props) | Inline::Break(_, props) = &content[i] {
         return props.continued();
+    }
+    // After an equation or a picture (#1242): the text before it, as after
+    // any character, never the object's own run properties.
+    if is_object_unit(&content[i]) {
+        return source_before(content, i)
+            .or_else(|| source_from(content, i + 1))
+            .map(RunProps::continued)
+            .unwrap_or_default();
     }
     content
         .get(i + 1)
@@ -3878,12 +4010,15 @@ fn end_props(content: &[Inline]) -> RunProps {
 }
 
 /// Whether `raw` is a run holding a drawing or a positional tab (#768):
-/// zero-width in the editor, yet something a person put there, which a
+/// zero-width in the editor (an inline picture, one offset since #1242, is
+/// deleted through its offset instead), yet something a person put there, which a
 /// delete over it removes, as Word deletes the character it is. Other
 /// zero-width XML (bookmarks, content-control boundaries, comment ranges)
 /// stays.
 fn is_spanned_object(raw: &str) -> bool {
-    raw.starts_with("<w:r") && (raw.contains("<w:drawing") || raw.contains("<w:ptab"))
+    raw.starts_with("<w:r")
+        && (raw.contains("<w:drawing") || raw.contains("<w:ptab"))
+        && crate::image::inline_extent(raw).is_none()
 }
 
 /// Remove the drawing and positional-tab runs a delete spans in one
@@ -3922,6 +4057,41 @@ fn drop_spanned_objects(
     });
 }
 
+/// `clip` without its equations, a hyperlink's included.
+fn without_equations(clip: &Clip) -> Clip {
+    fn strip(content: &mut Vec<Inline>) {
+        content.retain(|i| !matches!(i, Inline::Equation { .. }));
+        for inline in content.iter_mut() {
+            if let Inline::Hyperlink(h) = inline {
+                if h.content
+                    .iter()
+                    .any(|i| matches!(i, Inline::Equation { .. }))
+                {
+                    h.content_changed = true;
+                }
+                strip(&mut h.content);
+            }
+        }
+    }
+    let mut out = clip.clone();
+    out.paras.iter_mut().for_each(strip);
+    out
+}
+
+/// Delete editor offsets `from..to` of `content`, keeping the equations and
+/// inline pictures there when `keep_units` (see
+/// [`Editor::delete_selection_with`]).
+fn delete_content_range(content: &mut Vec<Inline>, from: usize, to: usize, keep_units: bool) {
+    let mut at = from;
+    for _ in from..to {
+        if keep_units && inline_covering(content, at).is_some_and(is_object_unit) {
+            at += 1;
+        } else {
+            content_delete(content, at);
+        }
+    }
+}
+
 fn content_delete(content: &mut Vec<Inline>, idx: usize) {
     let mut acc = 0;
     for i in 0..content.len() {
@@ -3947,9 +4117,10 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
                     }
                     // A link with no editable text left goes, as in Word. Its
                     // bookmarks and proofing marks stay where it was; anything
-                    // still showing inside it (a tracked change, a picture, an
-                    // empty field) keeps the link, zero-width. A field with a
-                    // result is editable, one offset, so its link is not empty.
+                    // still showing inside it (a tracked change, an anchored
+                    // drawing, an empty field) keeps the link, zero-width. A
+                    // field with a result, an equation or an inline picture is
+                    // one offset, so its link is not empty (#1242).
                     if h.runs.is_empty() && h.content.iter().all(is_marker) {
                         let kept = std::mem::take(&mut h.content);
                         content.splice(i..=i, kept);
@@ -4408,16 +4579,18 @@ fn range_all_have_at(
                     return false;
                 }
             }
-            // Not a formatted character: a field keeps its own result formatting.
-            Inline::Field { .. } => *pos += inline_len(inline),
+            // Not a formatted character: a field keeps its own result
+            // formatting; an equation or an inline picture is one offset of
+            // its own (#1242).
+            Inline::Field { .. } | Inline::Equation { .. } | Inline::Raw(_) => {
+                *pos += inline_len(inline)
+            }
             Inline::SmartArt { .. }
             | Inline::Chart { .. }
-            | Inline::Equation { .. }
             | Inline::TextBox { .. }
             | Inline::Revision { .. }
             | Inline::UnsupportedRevision { .. }
-            | Inline::FootnoteRef { .. }
-            | Inline::Raw(_) => {} // zero-length
+            | Inline::FootnoteRef { .. } => {} // zero-length
         }
     }
     true
@@ -5127,7 +5300,11 @@ mod tests {
 
     const PTAB: &str =
         "<w:r><w:ptab w:relativeTo=\"margin\" w:alignment=\"right\" w:leader=\"none\"/></w:r>";
-    const PICTURE: &str = "<w:r><w:drawing><wp:inline/></w:drawing></w:r>";
+    /// A floating (anchored) picture: zero-width, so #768's rule is what
+    /// deletes it. An inline one is one offset since #1242 (see
+    /// `object_unit_tests`).
+    const PICTURE: &str = "<w:r><w:drawing><wp:anchor><wp:extent cx=\"952500\" cy=\"952500\"/>\
+        </wp:anchor></w:drawing></w:r>";
     const BOOKMARK: &str = "<w:bookmarkStart w:id=\"0\" w:name=\"b\"/>";
 
     fn raws(ed: &Editor, para: usize) -> Vec<String> {

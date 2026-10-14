@@ -671,9 +671,10 @@ impl Session {
             // text, which a client can feed straight back to replace-range.
             // `start`/`end` count only editor-editable text (runs, tabs and
             // breaks, including those inside hyperlinks, and one offset per
-            // field), while `text` is `plain_text()`, which holds a field's
-            // whole result and also the text of zero-width inlines (tracked
-            // changes, footnote refs, equations, SmartArt, chart titles, text
+            // field, equation or inline picture), while `text` is
+            // `plain_text()`, which holds a field's whole result, an
+            // equation's text and also the text of zero-width inlines
+            // (tracked changes, footnote refs, SmartArt, chart titles, text
             // boxes, and tracked changes inside a hyperlink): when the
             // paragraph has any, `text[start..end]` need not be the match.
             if m.path.len() == 1 {
@@ -2121,6 +2122,49 @@ mod tests {
         s.exec_json("backspace");
         assert!(!s.editor.doc.plain_text().contains('1'));
         assert_eq!(s.editor.doc.plain_text().trim_end(), "Body");
+    }
+
+    /// #1242: an equation or an inline picture is a one-offset atom, and
+    /// Backspace after it agrees with the engine: an equation is selected
+    /// first, a picture goes at once.
+    #[test]
+    fn an_equation_or_picture_is_a_one_offset_atom_1242() {
+        let open = |object: &str| {
+            let xml = format!(
+                r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><w:body><w:p><w:r><w:t>Body</w:t></w:r>{object}<w:r><w:t>x</w:t></w:r></w:p></w:body></w:document>"#
+            );
+            let doc = docxcore::load::parse_document_xml(&xml, &Default::default());
+            Session::open(&save_package(&new_package(doc))).expect("open")
+        };
+        let mut s = open("<m:oMath><m:r><m:t>y</m:t></m:r></m:oMath>");
+        let d = s.doc_json();
+        assert!(d.contains(r#"{"k":"eq","o":4,"w":1,"#), "eq atom: {d}");
+        assert!(d.contains(r#""o":5,"w":1,"x":"x""#), "x after it: {d}");
+        s.exec_json("select\t0\t5\t0\t5");
+        let r = s.exec_json("backspace");
+        assert!(
+            r.contains(r#""caret":{"p":"0","o":5},"anchor":{"p":"0","o":4}"#),
+            "the first Backspace selects the equation: {r}"
+        );
+        s.exec_json("backspace");
+        assert!(!s.doc_json().contains(r#""k":"eq""#));
+        // An equation with no text to show still draws something (FIX r5).
+        let s = open("<m:oMath/>");
+        let d = s.doc_json();
+        assert!(
+            d.contains(r#"{"k":"eq","o":4,"w":1,"x":"[equation]""#),
+            "{d}"
+        );
+
+        let mut s = open(
+            r#"<w:r><w:drawing><wp:inline><wp:extent cx="9525" cy="9525"/></wp:inline></w:drawing></w:r>"#,
+        );
+        let d = s.doc_json();
+        assert!(d.contains(r#"{"k":"box","o":4,"w":1"#), "picture atom: {d}");
+        s.exec_json("select\t0\t5\t0\t5");
+        let r = s.exec_json("backspace");
+        assert!(r.contains(r#""caret":{"p":"0","o":4}"#), "{r}");
+        assert!(!docxcore::serialize::document_to_xml(&s.editor.doc).contains("<w:drawing"));
     }
 
     #[test]

@@ -191,14 +191,16 @@ impl Editor {
 
     /// Delete the character at editor offset `idx` of the paragraph at `path`:
     /// recorded as a tracked deletion when tracking, else removed outright.
-    pub(super) fn delete_char_at(&mut self, path: &[usize], idx: usize) {
+    /// False when it stays: an equation is not deleted while tracking
+    /// (#1242), so a loop deleting a range steps past it.
+    pub(super) fn delete_char_at(&mut self, path: &[usize], idx: usize) -> bool {
         self.clear_placeholders_around(path);
         self.clear_inline_placeholders(path, idx, idx + 1);
         let Some(author) = self.track.as_ref().map(|t| t.author.clone()) else {
             if let Some(p) = para_mut(&mut self.doc.body, path) {
                 content_delete(&mut p.content, idx);
             }
-            return;
+            return true;
         };
         // A deletion inside a link is recorded among the link's children, so a
         // simple link's `runs` move into its `content` first.
@@ -206,10 +208,11 @@ impl Editor {
             link_runs_into_content(&mut p.content, idx);
         }
         let Some(para) = resolve_para(&self.doc.body, path) else {
-            return;
+            return true;
         };
         let plan = plan_delete(&para.content, idx, &author);
         match plan {
+            Plan::Keep => return false,
             Plan::Remove => {
                 if let Some(p) = para_mut(&mut self.doc.body, path) {
                     content_delete(&mut p.content, idx);
@@ -231,6 +234,30 @@ impl Editor {
                 }
             }
         }
+        true
+    }
+
+    /// Delete editor offsets `from..to` of the paragraph at `path` with
+    /// [`Editor::delete_char_at`], stepping past what stays (an equation
+    /// while tracking, and every equation or inline picture when
+    /// `keep_units`), so nothing after `to` is touched.
+    pub(super) fn delete_chars(
+        &mut self,
+        path: &[usize],
+        from: usize,
+        to: usize,
+        keep_units: bool,
+    ) {
+        let mut at = from;
+        for _ in from..to {
+            let kept = keep_units
+                && resolve_para(&self.doc.body, path)
+                    .and_then(|p| super::inline_covering(&p.content, at))
+                    .is_some_and(super::is_object_unit);
+            if kept || !self.delete_char_at(path, at) {
+                at += 1;
+            }
+        }
     }
 
     /// Delete the text of the selection `lo..hi` as tracked deletions in every
@@ -245,6 +272,7 @@ impl Editor {
         &mut self,
         lo: &super::Caret,
         hi: &super::Caret,
+        keep_units: bool,
     ) -> bool {
         if self.track.is_none() {
             return false;
@@ -280,9 +308,9 @@ impl Editor {
                 (false, true) => (0, hi.offset.min(len)),
                 (false, false) => (0, len),
             };
-            for _ in from..to {
-                self.delete_char_at(path, from);
-            }
+            // Kept only where the selection starts and ends, as untracked.
+            let keep = keep_units && (k == 0 || first + k == last);
+            self.delete_chars(path, from, to, keep);
         }
         true
     }
@@ -306,9 +334,7 @@ impl Editor {
             return;
         }
         let with = super::without_field_chars(with);
-        for _ in start..end {
-            self.delete_char_at(path, start);
-        }
+        self.delete_chars(path, start, end, false);
         let mut n = 0;
         if let Some(p) = para_mut(&mut self.doc.body, path) {
             for (k, ch) in with.chars().enumerate() {
@@ -321,13 +347,21 @@ impl Editor {
 
     /// `clip` as it should go in: its text recorded as one tracked insertion
     /// when tracking, or with any insertion records taken off when not (a
-    /// pasted copy of recorded text is not itself recorded).
+    /// pasted copy of recorded text is not itself recorded). While tracking
+    /// an inline picture goes in a `w:ins` of its own, as Word records one
+    /// (#1242): zero-width until accepted.
     pub(super) fn clip_for_insertion(&self, clip: &super::Clip) -> super::Clip {
         let mut out = clip.clone();
         match self.fresh_revision_metadata() {
             Some(meta) => {
                 for inline in out.paras.iter_mut().flatten() {
                     with_props(inline, |props| record_insert(props, &meta));
+                }
+                // Each picture's `w:ins` has an id of its own, after the
+                // text's (which `unshare_insert_ids` then keeps clear of).
+                let mut next = meta.id.as_deref().and_then(|id| id.parse::<u64>().ok());
+                for para in out.paras.iter_mut() {
+                    record_inserted_pictures(para, &meta, &mut next);
                 }
             }
             None => {
@@ -409,6 +443,8 @@ enum Plan {
     /// Delete for real: not a plain run character, or the author's own
     /// insertion.
     Remove,
+    /// Leave it: an equation while tracking (#1242).
+    Keep,
     /// Record a deletion; `merges` when an adjacent deletion by the author
     /// takes it (no new revision, so no new id).
     Record { merges: bool },
@@ -467,6 +503,11 @@ fn plan_delete(content: &[Inline], idx: usize, author: &str) -> Plan {
                 Inline::Hyperlink(h) if h.runs.is_empty() => {
                     return plan_delete(&h.content, idx - acc, author);
                 }
+                // A picture is recorded as deleted, in a revision of its own
+                // (#1242); an equation, which a `w:del` cannot hold whole,
+                // stays.
+                Inline::Raw(_) => return Plan::Record { merges: false },
+                Inline::Equation { .. } => return Plan::Keep,
                 _ => return Plan::Remove,
             };
             if props
@@ -526,8 +567,41 @@ fn deleted_props(props: &RunProps) -> RunProps {
     p
 }
 
+/// Wrap each inline picture in `content` (a hyperlink's too) in a tracked
+/// insertion with `meta`, each with the id after `last` (the last one used).
+fn record_inserted_pictures(
+    content: &mut [Inline],
+    meta: &RevisionMetadata,
+    last: &mut Option<u64>,
+) {
+    for inline in content.iter_mut() {
+        if let Inline::Hyperlink(h) = inline {
+            if h.content.iter().any(super::is_object_unit) {
+                h.content_changed = true;
+            }
+            record_inserted_pictures(&mut h.content, meta, last);
+        } else if matches!(inline, Inline::Raw(_)) && super::is_object_unit(inline) {
+            let picture = std::mem::replace(inline, Inline::Raw(String::new()));
+            let mut meta = meta.clone();
+            if let Some(id) = last.as_mut() {
+                *id += 1;
+                meta.id = Some(id.to_string());
+            }
+            *inline = revision_wrapper(RevisionKind::Insert, meta, picture);
+        }
+    }
+}
+
 fn deletion_wrapper(meta: RevisionMetadata, inner: Inline) -> Inline {
-    let mut raw = String::from("<w:del");
+    revision_wrapper(RevisionKind::Delete, meta, inner)
+}
+
+/// A tracked change of `kind` by `meta` around `inner`.
+fn revision_wrapper(kind: RevisionKind, meta: RevisionMetadata, inner: Inline) -> Inline {
+    let mut raw = String::from(match kind {
+        RevisionKind::Insert => "<w:ins",
+        RevisionKind::Delete => "<w:del",
+    });
     for (name, value) in [
         ("w:id", &meta.id),
         ("w:author", &meta.author),
@@ -543,7 +617,7 @@ fn deletion_wrapper(meta: RevisionMetadata, inner: Inline) -> Inline {
     }
     raw.push_str("/>");
     Inline::Revision {
-        kind: RevisionKind::Delete,
+        kind,
         metadata: meta,
         raw,
         content: vec![inner],
@@ -618,12 +692,24 @@ fn record_deletion(
             pieces.push(deleted.clone());
             deleted
         }
+        // A picture (#1242): its run goes in the `w:del` as it is.
+        Inline::Raw(raw) if super::is_object_unit(&content[i]) => {
+            wrapper_at = 0;
+            let deleted = Inline::Raw(raw.clone());
+            pieces.push(deleted.clone());
+            deleted
+        }
         _ => return,
     };
     let insert = insert_id_of(&deleted).flatten();
+    let picture = matches!(deleted, Inline::Raw(_));
     pieces[wrapper_at] = deletion_wrapper(meta.unwrap_or_default(), deleted);
     content.splice(i..=i, pieces);
     let mut at = i + wrapper_at;
+    // A picture's deletion stays a revision of its own: no run joins it.
+    if picture {
+        return;
+    }
 
     // Join the author's deletion just before, and just after, into one: the
     // older wrapper stays (its id, date and place), the new text goes into it.

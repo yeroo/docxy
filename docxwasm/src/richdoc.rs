@@ -10,9 +10,10 @@
 //!   page converts between the browser's UTF-16 offsets and these scalar
 //!   offsets;
 //! - everything else is **atomic** (`contenteditable=false` on the page) with
-//!   the width the editor gives it — one for a tab, a break or a field that
-//!   shows a result (a field is edited as one unit), zero for tracked changes,
-//!   drawings, an empty field and other anchors the editor cannot enter.
+//!   the width the editor gives it — one for a tab, a break, a field that
+//!   shows a result, an equation or an inline picture (each edited as one
+//!   unit, #1242), zero for tracked changes, floating drawings, an empty
+//!   field and other anchors the editor cannot enter.
 //!
 //! Widths come from [`docxcore::editor::inline_len`] (and paragraph lengths
 //! from `para_text_len`), the editor's own functions, so the page and the
@@ -360,6 +361,10 @@ impl SegWriter<'_, '_> {
                 push_props(&mut props, &eff, &direct);
                 self.atom("field", width, text, &props);
             }
+            // One offset with no text to show still needs something drawn.
+            Inline::Equation { text, .. } if text.trim().is_empty() => {
+                self.atom("eq", width, "[equation]", "")
+            }
             Inline::Equation { text, .. } => self.atom("eq", width, text, ""),
             Inline::SmartArt { text, .. } => self.atom("art", width, &text.join(" · "), ""),
             Inline::Chart { chart, .. } => {
@@ -382,6 +387,10 @@ impl SegWriter<'_, '_> {
             Inline::Raw(xml) => {
                 if let Some(extra) = image_extra(xml, self.ctx.rels) {
                     self.atom("img", width, "", &extra);
+                } else if width == 1 {
+                    // An inline picture whose media does not resolve is still
+                    // its one offset (#1242), drawn as an empty box.
+                    self.atom("box", width, "", "");
                 } else if let Some(id) = attr(xml, "w:commentReference", "w:id") {
                     let mut extra = String::from(",\"id\":");
                     json::push_str(&mut extra, &id);

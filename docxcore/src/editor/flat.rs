@@ -168,6 +168,10 @@ fn inline_chars(inline: &Inline) -> String {
         Inline::Break(BreakKind::Column, _) => "\u{000e}".into(),
         // A field showing a result is one caret unit, edited as a whole.
         Inline::Field { text, .. } if !text.is_empty() => super::FIELD_CHAR.into(),
+        // So is an equation or an inline picture (#1242).
+        Inline::Equation { .. } | Inline::Raw(_) if super::is_object_unit(inline) => {
+            super::FIELD_CHAR.into()
+        }
         // The editor assigns zero caret units to revision wrappers and other
         // preserved inline payloads, even when they cache visible text.
         _ => String::new(),
