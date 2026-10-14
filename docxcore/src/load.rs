@@ -1137,7 +1137,7 @@ pub(crate) fn is_field_code_raw(run: &str) -> bool {
 /// Whether a field-code run holds only field code: nothing that shows (text, a
 /// tab, a break, a symbol) or anchors something (a comment or note reference),
 /// and no tracked formatting change, all of which a Field would hide.
-fn is_clean_code_run(run: &str) -> bool {
+pub(crate) fn is_clean_code_run(run: &str) -> bool {
     const OTHER: [&str; 10] = [
         "w:t",
         "w:delText",

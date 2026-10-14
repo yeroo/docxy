@@ -519,3 +519,45 @@ fn a_cut_across_one_edge_copies_the_whole_field_it_deletes_1240() {
         assert_eq!(texts(&ed), ["Before", "Intro\t1", "Body\t2", "After"]);
     }
 }
+
+/// A TOC spanning paragraphs whose `begin` and `end` runs are given.
+fn toc_with(begin: &str, end: &str) -> Editor {
+    doc(&[
+        "<w:r><w:t>Before</w:t></w:r>".to_string(),
+        format!("{begin}{TOC_INSTR}{SEP}<w:r><w:t>Intro</w:t></w:r>"),
+        "<w:r><w:t>Body</w:t></w:r>".to_string(),
+        end.to_string(),
+        "<w:r><w:t>After</w:t></w:r>".to_string(),
+    ])
+}
+
+#[test]
+fn a_marker_run_sharing_text_or_a_break_stays_as_today_1240() {
+    // r2-M1: the loader keeps a run holding a marker and something else
+    // (text, a page break) whole, as one zero-width inline. Removing it with
+    // the field would remove that too, so the field is not a unit.
+    let page_end = "<w:r><w:br w:type=\"page\"/><w:fldChar w:fldCharType=\"end\"/></w:r>";
+    let see_begin =
+        "<w:r><w:t xml:space=\"preserve\">See </w:t><w:fldChar w:fldCharType=\"begin\"/></w:r>";
+    for (begin, end, kept) in [
+        (BEGIN, page_end, "w:type=\"page\""),
+        (see_begin, END, ">See </w:t>"),
+    ] {
+        let mut ed = toc_with(begin, end);
+        ed.set_caret(Caret::at(vec![3], 0));
+        ed.backspace();
+        assert!(!ed.has_selection(), "{kept}: Backspace does not select");
+
+        // A delete covering it deletes the result as on main: the shared
+        // run, and the markers with it, stay.
+        let mut ed = toc_with(begin, end);
+        select(&mut ed, Caret::at(vec![1], 0), Caret::at(vec![3], 0));
+        ed.backspace();
+        let xml = saved(&ed);
+        assert!(xml.contains(kept), "{kept} left: {xml}");
+        for kind in ["begin", "end"] {
+            let marker = format!("w:fldCharType=\"{kind}\"");
+            assert_eq!(xml.matches(&marker).count(), 1, "{kind} in {xml}");
+        }
+    }
+}

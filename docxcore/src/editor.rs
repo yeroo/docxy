@@ -1726,7 +1726,10 @@ impl Editor {
     ///
     /// Over a cell range it empties the selected cells, as Word's Delete does.
     ///
-    /// A picture or alignment tab the delete spans goes with it (#768).
+    /// A picture or alignment tab the delete spans goes with it (#768). A
+    /// loose field the selection cuts (one edge inside it) goes whole, and
+    /// the marker runs of a loose field it covers go with its result, so no
+    /// delete leaves a field shell or half a field (#1240).
     pub fn delete_selection(&mut self) -> bool {
         self.delete_selection_with(true)
     }
@@ -1736,7 +1739,8 @@ impl Editor {
     /// ends, which a cut's clip does not carry (they take no offset), so a
     /// paste could not bring them back. Paragraphs wholly inside the
     /// selection still go whole, their objects with them. A host that cuts
-    /// through its own copy (the wasm bridge's plain-text cut) calls this.
+    /// through its own plain-text copy calls [`Editor::cut_text`], which
+    /// copies what this then deletes.
     pub fn delete_selection_keeping_objects(&mut self) -> bool {
         self.delete_selection_with(false)
     }
@@ -1935,6 +1939,21 @@ impl Editor {
         let clip = self.copy()?;
         self.delete_selection_keeping_objects();
         Some(clip)
+    }
+
+    /// A host's plain-text cut (the wasm bridge's): the selection's text,
+    /// then the selection deleted as [`Editor::cut`] deletes it, keeping
+    /// the pictures its text cannot carry (#768). A loose field the
+    /// selection cuts is copied and deleted whole (#1240). `None`, and
+    /// nothing done, when the selection holds no text.
+    pub fn cut_text(&mut self) -> Option<String> {
+        self.widen_selection_over_loose_fields();
+        let text = self.selection_text();
+        if text.is_empty() {
+            return None;
+        }
+        self.delete_selection_keeping_objects();
+        Some(text)
     }
 
     /// Paste a [`Clip`] at the caret (replacing any selection). Pasting inside

@@ -17,7 +17,7 @@
 
 use super::*;
 use crate::field::{FieldEvent, field_events};
-use crate::load::is_field_code_raw;
+use crate::load::{is_clean_code_run, is_field_code_raw};
 use std::collections::BTreeSet;
 
 /// Where a field-code run is in a block container: its paragraph's index in
@@ -44,9 +44,11 @@ struct LooseField {
     begin: MarkerAt,
     end: MarkerAt,
     /// Its begin and end runs are paragraph children holding no other
-    /// field's marker, and every marker between them is a paragraph child or
-    /// in a link whose fields are its own: removing its marker runs removes
-    /// exactly this field (and the fields inside it).
+    /// field's marker, every marker between them is a paragraph child or in
+    /// a link whose fields are its own, and every one of those runs holds
+    /// field code only: removing its marker runs removes exactly this field
+    /// (and the fields inside it), never text, a break or a note reference
+    /// sharing a run with a marker.
     whole: bool,
 }
 
@@ -90,16 +92,19 @@ fn loose_fields(blocks: &[Block]) -> Vec<LooseField> {
             };
             match item {
                 Inline::Raw(raw) if is_field_code_raw(raw) => {
-                    pairing.step(field_events(raw), at, true);
+                    pairing.step(field_events(raw), at, true, is_clean_code_run(raw));
                 }
                 // A link's own fields (a TOC entry's PAGEREF) go with it;
                 // markers it shares with fields outside it pair as nested.
                 Inline::Hyperlink(h) if !link_is_balanced(h) => {
                     pairing.nested(&h.content, at);
                 }
+                // Its code runs go with a field around it: they must hold
+                // field code only.
+                Inline::Hyperlink(h) if !link_code_is_clean(h) => pairing.taint(),
                 Inline::Revision { content, .. } => pairing.nested(content, at),
                 Inline::UnsupportedRevision { raw, .. } => {
-                    pairing.step(field_events(raw), at, false);
+                    pairing.step(field_events(raw), at, false, false);
                 }
                 _ => {}
             }
@@ -123,20 +128,23 @@ impl Pairing {
         self.open.iter_mut().for_each(|(_, whole)| *whole = false);
     }
 
-    /// The events of one run at `at`; `top` when the run is a paragraph child.
-    fn step(&mut self, events: Vec<FieldEvent>, at: MarkerAt, top: bool) {
+    /// The events of one run at `at`; `top` when the run is a paragraph
+    /// child, `clean` when it holds field code only.
+    fn step(&mut self, events: Vec<FieldEvent>, at: MarkerAt, top: bool, clean: bool) {
         let marks = events
             .iter()
             .filter(|e| !matches!(e, FieldEvent::Instr(_)))
             .count();
-        if marks == 0 && top {
+        if marks == 0 && top && clean {
             return;
         }
-        if !top {
+        // Removing the run with a field around it would remove what else
+        // it holds (#1240 r2).
+        if !top || !clean {
             self.taint();
         }
         // Removing a run shared with another field's marker would cut it.
-        let alone = top && marks == 1;
+        let alone = top && clean && marks == 1;
         for event in events {
             match event {
                 FieldEvent::Begin => self.open.push((at, alone)),
@@ -159,12 +167,12 @@ impl Pairing {
         for item in content {
             match item {
                 Inline::Raw(raw) if is_field_code_raw(raw) => {
-                    self.step(field_events(raw), at, false);
+                    self.step(field_events(raw), at, false, false);
                 }
                 Inline::Hyperlink(h) => self.nested(&h.content, at),
                 Inline::Revision { content, .. } => self.nested(content, at),
                 Inline::UnsupportedRevision { raw, .. } => {
-                    self.step(field_events(raw), at, false);
+                    self.step(field_events(raw), at, false, false);
                 }
                 _ => {}
             }
@@ -200,6 +208,14 @@ fn link_is_balanced(h: &Hyperlink) -> bool {
         }
     }
     depth == 0
+}
+
+/// Whether every field-code run of a link holds field code only.
+fn link_code_is_clean(h: &Hyperlink) -> bool {
+    h.content.iter().all(|item| match item {
+        Inline::Raw(raw) if is_field_code_raw(raw) => is_clean_code_run(raw),
+        _ => true,
+    })
 }
 
 fn holds_field_code(content: &[Inline]) -> bool {
@@ -392,10 +408,9 @@ impl Editor {
 
     /// Widen the selection itself over every loose field it cuts, as a
     /// delete of it would ([`Editor::widen_over_loose_fields`]), keeping its
-    /// direction: a cut copies exactly what it then deletes. A host that cuts
-    /// through its own copy (the wasm bridge's plain-text cut) calls this
-    /// before copying.
-    pub fn widen_selection_over_loose_fields(&mut self) {
+    /// direction: a cut ([`Editor::cut`], [`Editor::cut_text`]) copies
+    /// exactly what it then deletes.
+    pub(super) fn widen_selection_over_loose_fields(&mut self) {
         if self.cell_range().is_some() {
             return;
         }
