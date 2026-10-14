@@ -6,9 +6,9 @@
 //! `_rels`, as Word does: discarded header text does not stay in the file.
 
 use super::doc_kind::resolve;
-use super::{Package, part_rels_name, remove_tags_matching, tag_attr};
+use super::{Package, decode_xml_part, part_rels_name, remove_tags_matching, tag_attr};
 use crate::load::start_tags;
-use crate::model::Block;
+use crate::serialize::document_to_xml;
 
 const HEADER_REL: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/header";
@@ -16,20 +16,22 @@ const FOOTER_REL: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer";
 
 impl Package {
-    /// Remove every header/footer part that `document.xml.rels` names but no
-    /// section of [`Package::document`] references, together with its
+    /// Remove every header/footer part that `document.xml.rels` names but the
+    /// document part a save writes never references, together with its
     /// relationship, its `[Content_Types].xml` override and its own `_rels`
     /// (and that one's override). The removed part names; when there are
     /// none the package is untouched.
     ///
-    /// A relationship counts as referenced when its id appears as an
-    /// attribute value in any section's `w:sectPr`, in any section's tracked
-    /// change, or anywhere in raw block XML the model keeps verbatim (a
-    /// paragraph inside an unmodelled block can end a section). Keeping a
-    /// part too many is harmless; dropping a referenced one makes Word
-    /// refuse the file. A part some other `.rels` still targets (the
+    /// `keeping_document` says which document part the save writes: the
+    /// stored one ([`super::save_package_keeping_document`]) or one
+    /// serialized from [`Package::document`] ([`super::save_package`]). A
+    /// relationship counts as referenced when its id appears as an attribute
+    /// value anywhere in that XML, so a section break at any depth (a table
+    /// cell, a text box, raw XML the model keeps verbatim) keeps its part.
+    /// Keeping a part too many is harmless; dropping a referenced one makes
+    /// Word refuse the file. A part some other `.rels` still targets (the
     /// glossary's) stays too, and media an orphan used stay.
-    pub fn drop_unreferenced_hf_parts(&mut self) -> Vec<String> {
+    pub fn drop_unreferenced_hf_parts(&mut self, keeping_document: bool) -> Vec<String> {
         let Some(doc_name) = self.parts.get(self.doc_index).map(|p| p.0.clone()) else {
             return Vec::new();
         };
@@ -39,15 +41,16 @@ impl Package {
         let Some(rels) = self.part_text(&rels_name) else {
             return Vec::new();
         };
-        let texts = self.section_reference_texts();
-        let referenced = |id: &str| {
-            let (dq, sq) = (format!("\"{id}\""), format!("'{id}'"));
-            texts.iter().any(|t| t.contains(&dq) || t.contains(&sq))
-        };
         let dir = doc_name.rsplit_once('/').map_or("", |(d, _)| d);
-        // (relationship id, part name) of each unreferenced header/footer.
+        // (relationship id, part name) of each header/footer relationship no
+        // section's sectPr names: an orphan unless the document names it
+        // elsewhere.
+        let sect_prs = self.section_sect_prs();
+        let named = |text: &str, id: &str| {
+            text.contains(&format!("\"{id}\"")) || text.contains(&format!("'{id}'"))
+        };
         let mut orphans: Vec<(String, String)> = Vec::new();
-        // Every part another document relationship still targets.
+        // Every part a relationship that stays targets.
         let mut kept: Vec<String> = Vec::new();
         for (_, tag) in start_tags(&rels, "Relationship") {
             if tag_attr(tag, "TargetMode").as_deref() == Some("External") {
@@ -63,12 +66,24 @@ impl Package {
             );
             // Only an empty `<Relationship/>` can go: removing a part whose
             // relationship stays would leave it dangling.
-            if hf && tag.ends_with("/>") && !referenced(&id) {
+            if hf && tag.ends_with("/>") && !sect_prs.iter().any(|s| named(s, &id)) {
                 orphans.push((id, part));
             } else {
                 kept.push(part);
             }
         }
+        if orphans.is_empty() {
+            return Vec::new();
+        }
+        // The whole document part, written only when a candidate is left.
+        let document = self.written_document_xml(keeping_document);
+        orphans.retain(|(id, part)| {
+            let used = named(&document, id);
+            if used {
+                kept.push(part.clone());
+            }
+            !used
+        });
         let own_rels: Vec<String> = orphans
             .iter()
             .filter_map(|(_, part)| part_rels_name(part))
@@ -126,43 +141,25 @@ impl Package {
         removed
     }
 
-    /// The XML a header/footer reference of the document can sit in: every
-    /// section's sectPr, the sections' tracked changes, and every raw block,
-    /// table cells included.
-    fn section_reference_texts(&self) -> Vec<String> {
-        fn walk(blocks: &[Block], out: &mut Vec<String>) {
-            for block in blocks {
-                match block {
-                    Block::Paragraph(p) => {
-                        if let Some(change) = &p.props.section_property_change {
-                            out.push(change.raw.clone());
-                        }
-                    }
-                    Block::Table(t) => {
-                        for row in &t.rows {
-                            out.extend(row.raw_props.iter().cloned());
-                            for cell in &row.cells {
-                                walk(&cell.blocks, out);
-                            }
-                        }
-                    }
-                    Block::SectionProperties(s) => {
-                        out.push(s.raw.clone());
-                        if let Some(change) = &s.property_change {
-                            out.push(change.raw.clone());
-                        }
-                    }
-                    Block::Raw(raw) => out.push(raw.clone()),
-                }
-            }
+    /// The main document part as a save writes it: the stored part when
+    /// `keeping_document`, else [`Package::document`] serialized, with the
+    /// captured trailing sectPr when the document has none (as
+    /// [`super::save_package`] adds it). Its root declarations and prolog
+    /// (`w:background`) hold no header reference and are left out.
+    fn written_document_xml(&self, keeping_document: bool) -> String {
+        if keeping_document {
+            return self.document_part().map_or_else(String::new, |bytes| {
+                decode_xml_part(bytes).map_or_else(
+                    || String::from_utf8_lossy(bytes).into_owned(),
+                    |xml| xml.into_owned(),
+                )
+            });
         }
-        let mut out: Vec<String> = self
-            .section_sect_prs()
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        walk(&self.document.body, &mut out);
-        out
+        let mut xml = document_to_xml(&self.document);
+        if self.document.trailing_section_properties().is_none() {
+            xml.push_str(&self.sect_pr);
+        }
+        xml
     }
 }
 
@@ -178,7 +175,7 @@ fn rels_source_dir(rels: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Document, Paragraph};
+    use crate::model::{Block, Document, Paragraph};
     use crate::package::{load_package, new_package, save_package, save_package_keeping_document};
 
     fn names(pkg: &Package) -> Vec<String> {
@@ -233,7 +230,7 @@ mod tests {
         let even_rid = rid_of(&pkg, &even);
         let own = part_rels_name(&even).unwrap();
 
-        assert_eq!(pkg.drop_unreferenced_hf_parts(), vec![even.clone()]);
+        assert_eq!(pkg.drop_unreferenced_hf_parts(false), vec![even.clone()]);
 
         let parts = names(&pkg);
         assert!(!parts.contains(&even), "{parts:?}");
@@ -265,7 +262,7 @@ mod tests {
         );
         pkg.set_part_text("word/_rels/document.xml.rels", &rels);
 
-        assert!(pkg.drop_unreferenced_hf_parts().is_empty());
+        assert!(pkg.drop_unreferenced_hf_parts(false).is_empty());
         assert!(names(&pkg).contains(&default));
         let rels = pkg.part_text("word/_rels/document.xml.rels").unwrap();
         assert!(rels.contains("rIdSpare"), "{rels}");
@@ -276,7 +273,7 @@ mod tests {
     fn drop_unreferenced_hf_parts_is_noop_without_orphans() {
         let (pkg, _, _) = two_header_pkg();
         let mut pruned = pkg.clone();
-        assert!(pruned.drop_unreferenced_hf_parts().is_empty());
+        assert!(pruned.drop_unreferenced_hf_parts(false).is_empty());
         assert_eq!(save_package(&pruned), save_package(&pkg));
         assert_eq!(
             save_package_keeping_document(&pruned),
@@ -296,8 +293,70 @@ mod tests {
                 "<w:customXml w:element=\"x\"><w:p><w:pPr><w:sectPr><w:headerReference w:type=\"even\" r:id=\"{rid}\"/></w:sectPr></w:pPr></w:p></w:customXml>"
             )),
         );
-        assert!(pkg.drop_unreferenced_hf_parts().is_empty());
+        assert!(pkg.drop_unreferenced_hf_parts(false).is_empty());
         assert!(names(&pkg).contains(&even));
+    }
+
+    /// The body parsed from `inner` (body XML), the even header's id
+    /// spliced in for `RID`.
+    fn body_naming(pkg: &Package, even: &str, inner: &str) -> Vec<Block> {
+        let rid = rid_of(pkg, even);
+        let xml = format!(
+            "<w:document xmlns:w=\"w\" xmlns:r=\"r\" xmlns:v=\"v\"><w:body>{}</w:body></w:document>",
+            inner.replace("RID", &rid)
+        );
+        crate::load::parse_document_xml(&xml, &pkg.document_rels()).body
+    }
+
+    /// A section break in a table cell's paragraph keeps its header (FIX r1).
+    #[test]
+    fn drop_unreferenced_hf_parts_keeps_part_referenced_from_table_cell() {
+        let (mut pkg, _, even) = two_header_pkg();
+        unlink_even(&mut pkg);
+        let mut body = body_naming(
+            &pkg,
+            &even,
+            "<w:tbl><w:tr><w:tc><w:p><w:pPr><w:sectPr><w:headerReference w:type=\"even\" r:id=\"RID\"/></w:sectPr></w:pPr></w:p></w:tc></w:tr></w:tbl>",
+        );
+        assert!(matches!(body[0], Block::Table(_)), "{body:?}");
+        body.extend(pkg.document.body.drain(..));
+        pkg.document.body = body;
+        assert!(pkg.drop_unreferenced_hf_parts(false).is_empty());
+        assert!(names(&pkg).contains(&even));
+    }
+
+    /// A section break in a text box's paragraph keeps its header (FIX r1).
+    #[test]
+    fn drop_unreferenced_hf_parts_keeps_part_referenced_from_text_box() {
+        let (mut pkg, _, even) = two_header_pkg();
+        unlink_even(&mut pkg);
+        let mut body = body_naming(
+            &pkg,
+            &even,
+            "<w:p><w:r><w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:pPr><w:sectPr><w:headerReference w:type=\"even\" r:id=\"RID\"/></w:sectPr></w:pPr></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>",
+        );
+        assert!(
+            matches!(&body[0], Block::Paragraph(p) if matches!(p.content[0], crate::model::Inline::TextBox { .. })),
+            "{body:?}"
+        );
+        body.extend(pkg.document.body.drain(..));
+        pkg.document.body = body;
+        assert!(pkg.drop_unreferenced_hf_parts(false).is_empty());
+        assert!(names(&pkg).contains(&even));
+    }
+
+    /// A save keeping the stored document part reads the references from
+    /// that part, not from the model.
+    #[test]
+    fn drop_unreferenced_hf_parts_reads_the_kept_document_part() {
+        let (pkg, _, even) = two_header_pkg();
+        let stored = save_package(&pkg);
+        let mut pkg = load_package(&stored).unwrap();
+        unlink_even(&mut pkg);
+        // The stored part still names the even header: kept.
+        assert!(pkg.clone().drop_unreferenced_hf_parts(true).is_empty());
+        // The document written from the model does not: dropped.
+        assert_eq!(pkg.drop_unreferenced_hf_parts(false), vec![even]);
     }
 
     /// A glossary's relationship (relative to its own folder) keeps the part.
@@ -313,7 +372,7 @@ mod tests {
             )
             .into_bytes(),
         ));
-        assert!(pkg.drop_unreferenced_hf_parts().is_empty());
+        assert!(pkg.drop_unreferenced_hf_parts(false).is_empty());
         assert!(names(&pkg).contains(&even));
     }
 
@@ -335,7 +394,7 @@ mod tests {
         let types = pkg.part_text("[Content_Types].xml").unwrap();
         assert!(types.contains(&format!("/{own_even}\"")), "{types}");
 
-        pkg.drop_unreferenced_hf_parts();
+        pkg.drop_unreferenced_hf_parts(false);
 
         let types = pkg.part_text("[Content_Types].xml").unwrap();
         assert!(!types.contains(&format!("/{own_even}\"")), "{types}");

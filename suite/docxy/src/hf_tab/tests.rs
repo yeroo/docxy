@@ -689,6 +689,38 @@ fn save_drops_cleared_even_header_but_undo_keeps_it() {
     assert_eq!(even_refs(&saved_sections(&pkg)), LOADED_EVEN);
 }
 
+/// #771 FIX r1: a converted tab rebases on the package it saved, but with
+/// the parts the file left out, so an undo after the save still resolves
+/// the even header it brings back.
+#[test]
+fn a_converted_tab_keeps_cleared_parts_for_undo_after_save() {
+    let mut t = odd_even("odd-even-converted");
+    t.access.converted = Some(crate::open_mode::Converted::Rtf);
+    let header = resolved_part(&t, 0, true, HeaderVariant::Even).unwrap();
+    edit_at(&mut t, 0, true);
+    hf_apply(&mut t, HfAct::DifferentOddEven).unwrap();
+    exit_hf_tab(&mut t);
+    let dir = tmp_dir("odd-even-converted-save");
+    let path = dir.join("saved.docx");
+    assert!(save_doc_tab(&mut t, Some(path.clone())), "{}", t.status);
+    assert!(t.access.converted.is_none());
+    let written = docxcore::package::load_package(&std::fs::read(&path).unwrap()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(written.part(&header).is_none(), "the file leaves it out");
+    assert!(
+        t.pkg.as_ref().unwrap().part(&header).is_some(),
+        "rebased with it"
+    );
+    body_history(&mut t, false);
+    assert_eq!(
+        resolved_part(&t, 0, true, HeaderVariant::Even).as_ref(),
+        Some(&header)
+    );
+    let pkg = saved(&mut t);
+    assert!(pkg.part(&header).is_some());
+    assert_eq!(even_refs(&saved_sections(&pkg)), LOADED_EVEN);
+}
+
 /// #770 criterion 2: turned on again, the even pages start with a new,
 /// empty header, not the one cleared.
 #[test]
