@@ -5037,7 +5037,7 @@ fn set_validations(xml: String, sheet: &Sheet) -> String {
     }
     // All the new rules in one pass over the part, not one per rule.
     let items: Vec<String> = new.iter().map(|dv| dv_element(dv)).collect();
-    match append_all_to_worksheet_child(&xml, "dataValidations", &items) {
+    match append_all_to_worksheet_child(&xml, "dataValidations", &items, None) {
         Some(out) => out,
         None if worksheet_takes(&xml, "dataValidations", true) => {
             let block = format!(
@@ -6123,18 +6123,30 @@ pub(crate) fn append_to_worksheet_child(
     insert_into_worksheet_child(out, tag, &item, 1)
 }
 
-/// [`append_to_worksheet_child`] for several items at once (none binding
-/// `r:`): one rewrite of the part, where an append each would rewrite it
-/// once per item (#707 r6).
+/// [`append_to_worksheet_child`] for several items at once: one rewrite of
+/// the part, where an append each would rewrite it once per item (#707 r6).
+/// With `rels`, the items' `r:id` is bound to that namespace: on the root
+/// once when it binds no `r`, else on each item ([`bind_r`]).
 pub(crate) fn append_all_to_worksheet_child(
     xml: &str,
     tag: &str,
     items: &[String],
+    rels: Option<&str>,
 ) -> Option<String> {
     worksheet_child_span(xml, tag)?;
-    let root = worksheet_root(xml)?;
-    let item: String = items.iter().map(|i| in_worksheet_ns(&root, i)).collect();
-    insert_into_worksheet_child(xml.to_string(), tag, &item, items.len() as u32)
+    let mut out = xml.to_string();
+    let mut root = worksheet_root(xml)?;
+    let mut item = String::new();
+    for i in items {
+        let mut i = in_worksheet_ns(&root, i);
+        if let Some(rels) = rels {
+            i = bind_r(&mut out, &root, i, rels);
+            // Bound on the root now if it bound nothing: once is enough.
+            root.r_ns.get_or_insert_with(|| rels.to_string());
+        }
+        item.push_str(&i);
+    }
+    insert_into_worksheet_child(out, tag, &item, items.len() as u32)
 }
 
 /// `item` (`added` elements) put at the end of the worksheet's `<tag>`
@@ -8344,13 +8356,16 @@ fn rels_takes(parts: &[(String, Vec<u8>)], rels_part: &str, must_exist: bool) ->
     }
 }
 
+/// A new, empty rels part.
+pub(crate) const EMPTY_RELS: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>";
+
 /// The next free `rIdN` in a rels part: one past the highest in use.
 pub(crate) fn next_rid(xml: &str) -> String {
     format!("rId{}", max_rid(xml) + 1)
 }
 
 /// The highest `N` of an `Id="rIdN"` in a rels part, 0 for none.
-pub(crate) fn max_rid(xml: &str) -> u32 {
+fn max_rid(xml: &str) -> u32 {
     let mut max = 0u32;
     let mut i = 0;
     while let Some(pos) = xml[i..].find("Id=\"rId") {
@@ -8376,8 +8391,7 @@ pub(crate) fn add_rel(
     target: &str,
 ) -> String {
     if !parts.iter().any(|(n, _)| n == rels_part) {
-        let empty = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>";
-        parts.push((rels_part.to_string(), empty.as_bytes().to_vec()));
+        parts.push((rels_part.to_string(), EMPTY_RELS.as_bytes().to_vec()));
     }
     if let Some(p) = parts.iter_mut().find(|(n, _)| n == rels_part) {
         let xml = String::from_utf8_lossy(&p.1).into_owned();
@@ -8679,7 +8693,7 @@ impl SheetPackage {
             let before = validation_spans(&xml).map_or(0, |(_, items)| items.len());
             // Into the existing block (in any prefix), bumping its count, or a
             // new block at its schema position.
-            let xml = append_all_to_worksheet_child(&xml, "dataValidations", &items)
+            let xml = append_all_to_worksheet_child(&xml, "dataValidations", &items, None)
                 .unwrap_or_else(|| {
                     let block = format!(
                         "<dataValidations count=\"{n}\">{}</dataValidations>",

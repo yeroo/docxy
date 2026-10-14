@@ -9,9 +9,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use opccore::xml::{Event, XmlParser};
 
 use super::{
-    OoxmlNs, append_all_to_worksheet_child, decode, element_children, esc_attr, parse_rels,
-    parse_rels_mode, put_worksheet_child, rels_part_name, rels_takes, remove_worksheet_child,
-    start_tag, with_decl, worksheet_child_span, worksheet_root, worksheet_takes,
+    EMPTY_RELS, OoxmlNs, append_all_to_worksheet_child, decode, element_children, esc_attr,
+    parse_rels, parse_rels_mode, put_worksheet_child, rels_part_name, rels_takes,
+    remove_worksheet_child, start_tag, worksheet_child_span, worksheet_takes,
 };
 use crate::sheet::{Sheet, cell_name, parse_cell_name, parse_range_name};
 
@@ -190,7 +190,7 @@ pub(super) fn write_hyperlinks(
     if span.is_none() && !worksheet_takes(&xml, "hyperlinks", false) {
         return xml;
     }
-    let mut rels = ExternalRels::new(parts, rels_part, ns.rel("hyperlink"));
+    let mut rels = ExternalRels::new(parts, rels_part, ns.rel("hyperlink"), &xml);
     let mut added = Vec::new();
     let mut uses_r = false;
     for (&(r, c), target) in &new {
@@ -233,30 +233,15 @@ pub(super) fn write_hyperlinks(
         }
         _ => None,
     };
-    let mut out = struck.unwrap_or(xml);
+    let out = struck.unwrap_or(xml);
     if added.is_empty() {
         return out;
     }
+    let rels = uses_r.then_some(ns.rels);
     if worksheet_child_span(&out, "hyperlinks").is_some() {
-        // Into the existing block: `r:` bound on the root when it binds
-        // nothing, else on each element that uses it.
-        if uses_r {
-            if let Some(root) = worksheet_root(&out) {
-                match root.r_ns.as_deref() {
-                    Some(r) if r == ns.rels => {}
-                    None => out.insert_str(root.tag_close, &format!(" xmlns:r=\"{}\"", ns.rels)),
-                    Some(_) => {
-                        for item in added.iter_mut().filter(|i| i.contains(" r:id=")) {
-                            *item = with_decl(item, &format!("xmlns:r=\"{}\"", ns.rels));
-                        }
-                    }
-                }
-            }
-        }
-        append_all_to_worksheet_child(&out, "hyperlinks", &added).unwrap_or(out)
+        append_all_to_worksheet_child(&out, "hyperlinks", &added, rels).unwrap_or(out)
     } else {
         let block = format!("<hyperlinks>{}</hyperlinks>", added.concat());
-        let rels = uses_r.then_some(ns.rels);
         put_worksheet_child(&out, "hyperlinks", &block, rels, false)
     }
 }
@@ -274,32 +259,48 @@ struct ExternalRels {
     exists: bool,
     /// The External relationships of `rel_type` there or added: target → id.
     have: HashMap<String, String>,
-    next: u32,
+    /// Every id the rels part has, and every `rIdN` the worksheet names (a
+    /// dangling `r:id` included), so a new one never takes either over.
+    taken: HashSet<String>,
+    next: u64,
     added: String,
 }
 
 impl ExternalRels {
-    fn new(parts: &[(String, Vec<u8>)], rels_part: String, rel_type: String) -> ExternalRels {
+    fn new(
+        parts: &[(String, Vec<u8>)],
+        rels_part: String,
+        rel_type: String,
+        worksheet: &str,
+    ) -> ExternalRels {
         let current = parts
             .iter()
             .find(|(n, _)| *n == rels_part)
             .map(|(_, b)| String::from_utf8_lossy(b).into_owned());
         let exists = current.is_some();
         let mut have = HashMap::new();
+        let mut taken = quoted_rids(worksheet);
         for (id, ty, target, mode) in current.as_deref().map(parse_rels_mode).unwrap_or_default() {
             if ty == rel_type && mode.as_deref() == Some("External") {
-                have.entry(target).or_insert(id);
+                have.entry(target).or_insert_with(|| id.clone());
             }
+            taken.insert(id);
         }
         let takes = rels_takes(parts, &rels_part, false) && (exists || rels_have_a_type(parts));
         let xml = takes.then(|| current.unwrap_or_else(|| EMPTY_RELS.to_string()));
-        let next = xml.as_deref().map_or(0, super::max_rid) + 1;
+        let next = taken
+            .iter()
+            .filter_map(|id| id.strip_prefix("rId")?.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         ExternalRels {
             rels_part,
             rel_type,
             xml,
             exists,
             have,
+            taken,
             next,
             added: String::new(),
         }
@@ -312,8 +313,13 @@ impl ExternalRels {
             return Some(id.clone());
         }
         self.xml.as_ref()?;
-        let rid = format!("rId{}", self.next);
-        self.next += 1;
+        let mut rid = format!("rId{}", self.next);
+        while self.taken.contains(&rid) {
+            self.next = self.next.checked_add(1)?;
+            rid = format!("rId{}", self.next);
+        }
+        self.next = self.next.saturating_add(1);
+        self.taken.insert(rid.clone());
         self.added.push_str(&format!(
             "<Relationship Id=\"{rid}\" Type=\"{}\" Target=\"{}\" TargetMode=\"External\"/>",
             self.rel_type,
@@ -343,9 +349,25 @@ impl ExternalRels {
     }
 }
 
-/// A new rels part, as [`super::add_rel`] creates one.
-const EMPTY_RELS: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
-<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>";
+/// The `rIdN` values in `xml`'s quoted attribute values (`"rId3"` or
+/// `'rId3'`), whatever attribute holds them.
+fn quoted_rids(xml: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut from = 0;
+    while let Some(at) = xml[from..].find("rId") {
+        let start = from + at;
+        from = start + 3;
+        let quote = match xml[..start].chars().next_back() {
+            Some(q @ ('"' | '\'')) => q,
+            _ => continue,
+        };
+        let digits = xml[from..].bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && xml[from + digits..].starts_with(quote) {
+            out.insert(xml[start..from + digits].to_string());
+        }
+    }
+    out
+}
 
 /// Whether `[Content_Types].xml` gives a `.rels` part a type: a `Default`
 /// for the `rels` extension (OPC compares extensions case-insensitively).

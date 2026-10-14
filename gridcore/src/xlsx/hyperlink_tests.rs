@@ -400,3 +400,54 @@ fn adding_many_links_saves_in_linear_time() {
     let re = load_xlsx(&bytes).unwrap();
     assert_links_kept(&pkg, &re);
 }
+
+/// FIX r1 m2: a worksheet `r:id` with no relationship behind it is never
+/// handed to a new link, or the dangling one would start opening its URL.
+#[test]
+fn a_dangling_worksheet_rid_is_not_taken_by_a_new_link() {
+    let ws = format!(
+        "<worksheet xmlns=\"{SML}\" xmlns:r=\"{RNS}\"><sheetData></sheetData><hyperlinks>\
+         <hyperlink ref=\"A1\" r:id=\"rId1\"/><hyperlink ref=\"A2\" r:id=\"rId2\"/></hyperlinks>\
+         <drawing r:id=\"rId3\"/></worksheet>"
+    );
+    let rels = rels_part(&format!(
+        "<Relationship Id=\"rId1\" Type=\"{RNS}/hyperlink\" Target=\"https://one.example\" TargetMode=\"External\"/>"
+    ));
+    let mut pkg = book(&ws, Some(&rels));
+    link(&mut pkg, "E7", "https://new.example");
+    let re = resaved(&pkg);
+    assert_links_kept(&pkg, &re);
+    assert!(
+        !re.workbook.sheets[0].hyperlinks.contains_key(&(1, 0)),
+        "A2 stays unlinked"
+    );
+    assert!(text(&re, SHEET).contains("<hyperlink ref=\"E7\" r:id=\"rId4\"/>"));
+}
+
+/// FIX r1 m1: ids are read from the parsed rels part, so a single-quoted
+/// one counts, and the highest possible `rIdN` doesn't overflow.
+#[test]
+fn new_rids_follow_the_parsed_relationships() {
+    let ws = format!(
+        "<worksheet xmlns=\"{SML}\" xmlns:r=\"{RNS}\"><sheetData></sheetData><hyperlinks>\
+         <hyperlink ref=\"A1\" r:id=\"rId1\"/></hyperlinks></worksheet>"
+    );
+    let rels = rels_part(&format!(
+        "<Relationship Id='rId1' Type='{RNS}/hyperlink' Target='https://one.example' TargetMode='External'/>"
+    ));
+    let mut pkg = book(&ws, Some(&rels));
+    link(&mut pkg, "E7", "https://new.example");
+    let re = resaved(&pkg);
+    assert_links_kept(&pkg, &re);
+    assert!(text(&re, SHEET).contains("<hyperlink ref=\"E7\" r:id=\"rId2\"/>"));
+
+    let rels = rels_part(&format!(
+        "<Relationship Id=\"rId4294967295\" Type=\"{RNS}/hyperlink\" Target=\"https://one.example\" TargetMode=\"External\"/>"
+    ));
+    let ws = ws.replace("\"rId1\"", "\"rId4294967295\"");
+    let mut pkg = book(&ws, Some(&rels));
+    link(&mut pkg, "E7", "https://new.example");
+    let re = resaved(&pkg);
+    assert_links_kept(&pkg, &re);
+    assert!(text(&re, SHEET).contains("r:id=\"rId4294967296\""));
+}
