@@ -849,3 +849,19 @@ fn every_control_verb_is_classified_for_protected_view() {
     assert_eq!(routed, listed);
     assert!(routed.len() > 60, "{routed:?}");
 }
+
+/// Enable Editing trusts the file as it was when it opened: one replaced
+/// while it was protected is not trusted with it, and reopens protected.
+#[test]
+fn enable_editing_trusts_the_file_as_opened_not_as_replaced() {
+    let (dir, book, mut app) = protected_app("stamp");
+    let bytes = std::fs::read(&book).unwrap();
+    std::fs::write(&book, [bytes.as_slice(), b"replaced"].concat()).unwrap();
+    app.enable_editing().unwrap();
+    app.open_workbook(book.to_str().unwrap());
+    assert!(
+        app.protected_view.is_some(),
+        "the replaced file was never the one enabled"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

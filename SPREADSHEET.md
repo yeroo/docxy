@@ -54,9 +54,9 @@ bold/italic/color); reproducing Excel's visual styling is a non-goal.
   says it was downloaded (ZoneId 3 or 4; `opccore::zone`, shared with the
   suite) opens in Protected View: a bar under the ribbon and
   `[Protected View]` in the title. Navigation, Find, Go To, copying and
-  printing work; every key, ribbon command, vim command, click and control
-  verb that would edit is refused, and nothing is written, Save As
-  included, until Enable Editing (the bar's button, File › Info, or
+  page counts (`print.pages`) work; every key, ribbon command, vim command,
+  click and control verb that would edit is refused, and nothing is
+  written, Save As and printing to PDF included, until Enable Editing (the bar's button, File › Info, or
   `wb.enable-editing`). Enable Editing trusts the unchanged file for the
   session. XLSTART is a trusted location, as in Excel.
 

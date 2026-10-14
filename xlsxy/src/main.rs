@@ -7161,9 +7161,10 @@ impl App {
     //
     // A workbook read from a file Windows marked as downloaded (zone 3 or 4)
     // opens in Protected View, as the suite's does (#610): it can be read,
-    // navigated, searched, copied from and printed, but no key, ribbon
-    // command, vim command, click or control verb edits it and nothing
-    // writes it, until Enable Editing. Each entry point asks an allow-list,
+    // navigated, searched and copied from, and its pages counted
+    // (`print.pages`), but no key, ribbon command, vim command, click or
+    // control verb edits it and nothing writes it (printing to PDF included),
+    // until Enable Editing. Each entry point asks an allow-list,
     // so a new command is refused until someone classifies it; every write
     // also stops at `guard_write`, and `protected_backstop` rolls back an
     // edit that slipped past anyway.
@@ -7232,8 +7233,9 @@ impl App {
     }
 
     /// Leave Protected View: the bar's button, File › Info's row, or
-    /// `wb.enable-editing`. The file, as it is now, is trusted for the rest
-    /// of the session, so reopening it unchanged opens it editable. A
+    /// `wb.enable-editing`. The file as it was when opened (its [`Stamp`])
+    /// is trusted for the rest of the session, so reopening it unchanged
+    /// opens it editable; a file replaced since it opened is not trusted. A
     /// workbook not in Protected View is the error.
     fn enable_editing(&mut self) -> Result<(), String> {
         let Some(pv) = self.protected_view.take() else {
@@ -7344,7 +7346,8 @@ impl App {
             _ => text.as_str(),
         };
         let pkg = text_to_pkg(body, &file_stem(&path), &parse, &self.text_open());
-        // The text file is the save target itself, not a source to guard.
+        // The text file is the save target itself, not an import source to
+        // guard; its zone still decides Protected View (#894).
         let source = PathBuf::from(&path);
         self.install_workbook(
             pkg,
@@ -7534,7 +7537,6 @@ impl App {
             Ok(pages) => format!("Exported {out} ({pages} page{})", plural(pages)),
             Err(msg) => msg,
         });
-        self.backstage = None;
     }
 
     /// Save As PDF (#761): the active sheet printed to `out`, as Excel
@@ -7583,7 +7585,6 @@ impl App {
             Ok(()) => self.status = Some(format!("Exported {out} ({} bytes)", csv.len())),
             Err(e) => self.status = Some(format!("Export failed: {e}")),
         }
-        self.backstage = None;
     }
 
     /// Act on a [`backstage::BackstageEvent`] returned by the backstage's own
@@ -10981,7 +10982,6 @@ fn row_line_count(
     lines.min(CAP)
 }
 
-/// The pivot field editor: four panes over a cleared overlay rect.
 /// The Protected View bar, `width` wide (#894): Excel's label and warning,
 /// cut to fit, then the Enable Editing button, always whole; and the column
 /// the button starts at.
@@ -11016,6 +11016,7 @@ fn protected_bar(width: u16) -> (RLine<'static>, u16) {
     (line, (room + 1).min(width) as u16)
 }
 
+/// The pivot field editor: four panes over a cleared overlay rect.
 fn draw_pivot_editor(app: &App, pe: &PivotEdit, f: &mut Frame, grid: Rect) {
     let piv = &app.pkg.workbook.pivots[pe.pivot];
     // Never exceed the grid area (tiny terminals must not underflow).
