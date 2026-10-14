@@ -4,7 +4,8 @@
 //! tests the button.
 
 use crate::{DocTab, Surface, live_comments};
-use docxcore::inspect::StoryCounts;
+use docxcore::inspect::{Stories, StoryCounts};
+use docxcore::model::Document;
 use docxcore::styles::StyleSheet;
 
 /// One of the inspector's categories, in the order the page lists them.
@@ -149,16 +150,16 @@ fn tab_styles(tab: &DocTab) -> Option<StyleSheet> {
     Some(docxcore::styles::parse_styles_xml(&xml))
 }
 
-/// What the tab's headers, footers and notes hold (#918). A header or footer
-/// open in its editor is counted from the editor, which may not have been
-/// written back to the package yet.
-fn story_counts(tab: &DocTab, styles: Option<&StyleSheet>) -> StoryCounts {
+/// What the headers, footers and notes of the tab, whose body is `doc`,
+/// hold (#918). A header or footer open in its editor is counted from the
+/// editor, which may not have been written back to the package yet.
+fn story_counts(tab: &DocTab, doc: &Document, styles: Option<&StyleSheet>) -> StoryCounts {
     let Some(pkg) = tab.pkg.as_ref() else {
         return StoryCounts::default();
     };
     let editing = tab.hf_edit.as_ref();
     let mut counts =
-        docxcore::inspect::count_in_stories(pkg, styles, editing.map(|h| h.part_name.as_str()));
+        Stories::new(pkg, doc).count(pkg, styles, editing.map(|h| h.part_name.as_str()));
     if let Some(hf) = editing {
         counts += docxcore::inspect::count_story_blocks(&hf.editor.doc.body, styles);
     }
@@ -172,7 +173,7 @@ pub(crate) fn inspect_doc_tab(tab: &DocTab) -> Option<Inspection> {
     };
     let doc = &editor.doc;
     let styles = tab_styles(tab);
-    let stories = story_counts(tab, styles.as_ref());
+    let stories = story_counts(tab, doc, styles.as_ref());
     Some(Inspection {
         // What the pane lists and a save writes: an undone new comment is
         // not there (#620).
@@ -210,14 +211,14 @@ pub(crate) fn inspect_remove(
         tab.status = status.clone().into();
         return Ok(status);
     }
-    let stories = matches!(
+    let in_stories = matches!(
         category,
         InspectCategory::Comments | InspectCategory::Hidden
     );
     let hf_open = tab
         .hf_edit
         .as_ref()
-        .filter(|_| stories)
+        .filter(|_| in_stories)
         .map(|h| (h.part_name.clone(), h.section, h.is_header, h.variant));
     if hf_open.is_some() {
         crate::flush_hf_tab(tab);
@@ -231,13 +232,19 @@ pub(crate) fn inspect_remove(
     let Surface::Doc(editor) = &mut tab.surface else {
         unreachable!("inspected above");
     };
+    let stories = tab
+        .pkg
+        .as_ref()
+        .filter(|_| in_stories)
+        .map(|pkg| Stories::new(pkg, &editor.doc));
     let (status, changed) = match category {
         InspectCategory::Comments => {
             let markers = editor.remove_all_comment_markers()
                 + tab
                     .pkg
                     .as_mut()
-                    .map_or(0, docxcore::inspect::remove_comment_markers_in_stories);
+                    .zip(stories.as_ref())
+                    .map_or(0, |(pkg, stories)| stories.remove_comment_markers(pkg));
             // Every comment keeps its record, tracked: unlisted and unsaved
             // now its markers are gone, so undoing this brings each back
             // whole with them, and the save removes the rest from the base
@@ -272,13 +279,19 @@ pub(crate) fn inspect_remove(
         InspectCategory::Hidden => {
             let styles = styles.as_ref();
             let removed = editor.remove_hidden_text(styles)
-                + tab.pkg.as_mut().map_or(0, |pkg| {
-                    docxcore::inspect::remove_hidden_text_in_stories(pkg, styles)
-                });
+                + tab
+                    .pkg
+                    .as_mut()
+                    .zip(stories.as_ref())
+                    .map_or(0, |(pkg, stories)| stories.remove_hidden_text(pkg, styles));
             let left = docxcore::inspect::count_unremovable_hidden_runs(&editor.doc)
-                + tab.pkg.as_ref().map_or(0, |pkg| {
-                    docxcore::inspect::count_in_stories(pkg, styles, None).hidden_unremovable
-                });
+                + tab
+                    .pkg
+                    .as_ref()
+                    .zip(stories.as_ref())
+                    .map_or(0, |(pkg, stories)| {
+                        stories.count(pkg, styles, None).hidden_unremovable
+                    });
             let status = if left == 0 {
                 format!("Removed all hidden text ({removed})")
             } else {
@@ -988,6 +1001,30 @@ mod tests {
             "{people}"
         );
         assert!(people.contains("w15:author=\"Rev\""), "{people}");
+    }
+
+    /// #918 FIX r1 m2: a comment added after Remove All keeps its author's
+    /// person, though the save writes it after the base dropped the others.
+    #[test]
+    fn a_comment_added_after_remove_all_keeps_its_person() {
+        let (path, mut tab) = open_parts("extras-readd", &extras_parts());
+        inspect_remove(&mut tab, InspectCategory::Comments).unwrap();
+        let Surface::Doc(ed) = &mut tab.surface else {
+            unreachable!()
+        };
+        ed.select_all();
+        let added = crate::add_doc_comment(
+            &mut tab,
+            "again".to_string(),
+            ("Bob".to_string(), "B".to_string()),
+        );
+        assert!(added.is_some());
+        assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+        let comments = part(&path, "word/comments.xml");
+        assert!(comments.contains("w:author=\"Bob\""), "{comments}");
+        let people = part(&path, "word/people.xml");
+        assert!(people.contains("w15:author=\"Bob\""), "{people}");
+        assert!(!people.contains("\"Ann\""), "{people}");
     }
 
     /// #918 p2: deleting one of two comments drops its entries, the

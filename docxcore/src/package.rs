@@ -2598,13 +2598,24 @@ impl Package {
             out.extend(entries(part, tag, attr, std::slice::from_ref(&para_id)));
         }
         // `commentsExtensible` is keyed by the durable id `commentsIds` gave it.
-        let durable: Vec<String> = out
-            .iter()
-            .filter_map(|e| crate::load::xml_attr_value(&e.element, "w16cid:durableId"))
-            .collect();
+        let durable = self.durable_ids(&para_id);
         let (part, tag, attr) = COMMENTS_EXTENSIBLE;
         out.extend(entries(part, tag, attr, &durable));
         out
+    }
+
+    /// The durable ids `commentsIds` gives the comment whose last paragraph
+    /// is `para_id`: what its `commentsExtensible` entry is keyed by.
+    fn durable_ids(&self, para_id: &str) -> Vec<String> {
+        let (part, tag, attr) = COMMENTS_IDS;
+        let Some(xml) = self.part_text(part) else {
+            return Vec::new();
+        };
+        crate::load::start_tags(&xml, tag)
+            .into_iter()
+            .filter(|(_, t)| crate::load::xml_attr_value(t, attr).as_deref() == Some(para_id))
+            .filter_map(|(_, t)| crate::load::xml_attr_value(t, "w16cid:durableId"))
+            .collect()
     }
 
     /// Put back entries [`Package::comment_extras`] returned, creating a part
@@ -2680,19 +2691,7 @@ impl Package {
     /// comment's `para_id`, and the `commentsExtensible` entry keyed by the
     /// durable id its `commentsIds` entry gave it (#918).
     fn remove_comment_extras(&mut self, para_id: &str) {
-        let (_, ids_tag, ids_attr) = COMMENT_EXTRAS[1];
-        let durable: Vec<String> = self
-            .part_text(COMMENT_EXTRAS[1].0)
-            .map(|xml| {
-                crate::load::start_tags(&xml, ids_tag)
-                    .into_iter()
-                    .filter(|(_, t)| {
-                        crate::load::xml_attr_value(t, ids_attr).as_deref() == Some(para_id)
-                    })
-                    .filter_map(|(_, t)| crate::load::xml_attr_value(t, "w16cid:durableId"))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let durable = self.durable_ids(para_id);
         let (part, tag, attr) = COMMENTS_EXTENSIBLE;
         if let Some(xml) = self.part_text(part).filter(|_| !durable.is_empty()) {
             let out = remove_elements_where(&xml, tag, |head| {
@@ -2882,18 +2881,25 @@ impl Package {
     /// author does not stay behind in the file (#918). A `people.xml` left
     /// with no person goes, with its override and relationship. Authors are
     /// compared with their XML entities decoded. `document` is the body as it
-    /// will be saved (the document part holds it as loaded). Whether it
-    /// changed anything.
-    pub fn prune_people(&mut self, document: &Document) -> bool {
+    /// will be saved, read in place of the main document part, which holds it
+    /// as loaded (a revision accepted since must not keep its author).
+    /// `authors` are kept too: those of comments the caller will still write
+    /// that the package does not hold yet. Whether it changed anything.
+    pub fn prune_people(&mut self, document: &Document, authors: &[&str]) -> bool {
         const PEOPLE: &str = "word/people.xml";
         let Some(xml) = self.part_text(PEOPLE) else {
             return false;
         };
-        let mut authors = std::collections::HashSet::new();
+        let mut named: std::collections::HashSet<String> =
+            authors.iter().map(|a| a.to_string()).collect();
+        let main = self
+            .parts
+            .get(self.doc_index)
+            .map(|(name, _)| name.as_str());
         let texts = std::iter::once(crate::serialize::document_to_xml(document)).chain(
             self.part_names()
                 .into_iter()
-                .filter(|name| *name != PEOPLE && name.ends_with(".xml"))
+                .filter(|name| *name != PEOPLE && Some(*name) != main && name.ends_with(".xml"))
                 .filter_map(|name| self.part_text(name)),
         );
         for text in texts {
@@ -2905,7 +2911,7 @@ impl Package {
                     }
                     let value = &text[at + key.len()..];
                     if let Some(end) = value.find(quote) {
-                        authors.insert(crate::field::xml_unescape(&value[..end]));
+                        named.insert(crate::field::xml_unescape(&value[..end]));
                     }
                 }
             }
@@ -2915,7 +2921,7 @@ impl Package {
             let author = crate::load::xml_attr_value(head, "w15:author")
                 .map(|a| crate::field::xml_unescape(&a))
                 .unwrap_or_default();
-            !authors.contains(&author)
+            !named.contains(&author)
         });
         if out == xml {
             return false;
@@ -4190,8 +4196,12 @@ fn extract_sectpr(xml: &str) -> String {
 /// element, its paraId attribute).
 const COMMENT_EXTRAS: [(&str, &str, &str); 2] = [
     ("word/commentsExtended.xml", "w15:commentEx", "w15:paraId"),
-    ("word/commentsIds.xml", "w16cid:commentId", "w16cid:paraId"),
+    COMMENTS_IDS,
 ];
+
+/// The part giving each comment its durable id, keyed by paragraph id.
+const COMMENTS_IDS: (&str, &str, &str) =
+    ("word/commentsIds.xml", "w16cid:commentId", "w16cid:paraId");
 
 /// The root start tag of one of the comment parts [`Package::comment_extras`]
 /// reads (`w15:commentsEx`, `w16cid:commentsIds`, `w16cex:commentsExtensible`).
@@ -7668,31 +7678,48 @@ mod tests {
     fn prune_people_keeps_revision_and_comment_authors_only() {
         let mut p = with_comment_extras();
         with_people(&mut p);
-        p.set_part_text(
-            "word/document.xml",
-            "<w:document xmlns:w=\"w\"><w:body><w:p><w:ins w:id=\"1\" w:author='Cy &amp; Co'>\
+        // The tracked change is in the live body, its author entity-escaped.
+        let live = crate::load::parse_document_xml(
+            "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>\
+             <w:p><w:ins w:id=\"1\" w:author=\"Cy &amp; Co\" w:date=\"2026-01-01T00:00:00Z\">\
              <w:r><w:t>x</w:t></w:r></w:ins></w:p></w:body></w:document>",
+            &crate::load::Relationships::default(),
         );
         p.set_part_text(
             "word/styles.xml",
-            "<w:styles xmlns:w=\"w\"><w:style w:styleId=\"S\"><w:rPr><w:rPrChange w:id=\"2\" w:author=\"Dee\"/></w:rPr></w:style></w:styles>",
+            "<w:styles xmlns:w=\"w\"><w:style w:styleId=\"S\"><w:rPr><w:rPrChange w:id=\"2\" w:author='Dee'/></w:rPr></w:style></w:styles>",
         );
-        // Nothing removed yet: everyone is someone's author but nobody's
-        // missing; Ann and Bob write comments.
-        assert!(!p.prune_people(&p.document.clone()));
+        // Nothing removed yet: everyone is someone's author; Ann and Bob
+        // write comments.
+        assert!(!p.prune_people(&live, &[]));
         assert_eq!(p.part_text("word/people.xml").unwrap(), PEOPLE);
 
         p.remove_comment_id("1");
-        assert!(p.prune_people(&p.document.clone()));
+        assert!(p.prune_people(&live, &[]));
         let people = p.part_text("word/people.xml").unwrap();
         assert!(!people.contains("Ann"), "{people}");
         for kept in ["w15:author=\"Bob\"", "Cy &amp; Co", "Dee"] {
             assert!(people.contains(kept), "{kept}: {people}");
         }
-        assert!(
-            !p.prune_people(&p.document.clone()),
-            "a second pass changes nothing"
+        assert!(!p.prune_people(&live, &[]), "a second pass changes nothing");
+    }
+
+    /// #918 FIX r1 M2: the main document part holds the body as loaded; its
+    /// revision's author goes once the live body (accepted since) no longer
+    /// names them.
+    #[test]
+    fn prune_people_ignores_the_loaded_document_part() {
+        let mut p = with_comment_extras();
+        with_people(&mut p);
+        p.set_part_text(
+            "word/document.xml",
+            "<w:document xmlns:w=\"w\"><w:body><w:p><w:ins w:id=\"1\" w:author=\"Dee\">\
+             <w:r><w:t>x</w:t></w:r></w:ins></w:p></w:body></w:document>",
         );
+        p.prune_people(&p.document.clone(), &[]);
+        let people = p.part_text("word/people.xml").unwrap();
+        assert!(!people.contains("Dee"), "{people}");
+        assert!(people.contains("\"Bob\""), "{people}");
     }
 
     /// #918: a `people.xml` left with nobody goes, with its content-type
@@ -7705,14 +7732,14 @@ mod tests {
             p.remove_comment_id(&id);
         }
         p.drop_empty_comment_parts();
-        assert!(p.prune_people(&p.document.clone()));
+        assert!(p.prune_people(&p.document.clone(), &[]));
         assert!(p.part("word/people.xml").is_none());
         let ct = p.part_text("[Content_Types].xml").unwrap();
         assert!(!ct.contains("people"), "{ct}");
         let rels = p.part_text("word/_rels/document.xml.rels").unwrap();
         assert!(!rels.contains("people"), "{rels}");
         assert!(p.part("word/document.xml").is_some());
-        assert!(!p.prune_people(&p.document.clone()));
+        assert!(!p.prune_people(&p.document.clone(), &[]));
     }
 
     /// #918: the document is read as it will be saved, not as its part was
@@ -7730,9 +7757,9 @@ mod tests {
             p.part_text("word/people.xml")
                 .is_some_and(|x| x.contains("w15:author=\"Ann\""))
         };
-        p.prune_people(&live);
+        p.prune_people(&live, &[]);
         assert!(ann(&p), "Ann authors a change in the live body");
-        p.prune_people(&p.document.clone());
+        p.prune_people(&p.document.clone(), &[]);
         assert!(!ann(&p), "not in the loaded one");
     }
 }

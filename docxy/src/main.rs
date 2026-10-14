@@ -3231,7 +3231,7 @@ impl App {
             // A deleted comment's author stays in people.xml only while
             // something else names them (#918).
             let body = self.hf_edit.as_ref().map_or(&self.editor, |hf| &hf.body);
-            self.pkg.prune_people(&body.doc);
+            self.pkg.prune_people(&body.doc, &[]);
         }
     }
 

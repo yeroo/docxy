@@ -352,17 +352,20 @@ fn root_of(xml: &str, is_header: bool) -> Option<(String, String)> {
 /// Replace an existing header/footer part's content with `inner` (block XML),
 /// keeping the part's own root start tag, so the namespaces its drawings,
 /// VML and markup-compatibility content use stay declared, plus any of
-/// `w`/`r`/`m` it lacks (the editor's content may use them). A part without
-/// a readable root gets a fresh one ([`part_xml`]).
+/// `w`/`r`/`m` it lacks (the editor's content may use them). The part is
+/// read and written in the encoding it has (UTF-16 stays UTF-16, a BOM
+/// stays). A part without a readable root gets a fresh one ([`part_xml`]),
+/// in UTF-8.
 pub fn rewrite_part(pkg: &mut crate::package::Package, part: &str, is_header: bool, inner: &str) {
-    let existing = pkg
-        .part(part)
-        .map(|b| String::from_utf8_lossy(b).into_owned());
-    let xml = match existing.as_deref().and_then(|x| root_of(x, is_header)) {
-        Some((head, tail)) => format!("{head}{inner}{tail}"),
-        None => part_xml(is_header, inner),
-    };
-    pkg.set_part(part, xml.into_bytes());
+    let existing = pkg.part_text(part);
+    match existing.as_deref().and_then(|x| root_of(x, is_header)) {
+        Some((head, tail)) => {
+            pkg.set_part_text(part, &format!("{head}{inner}{tail}"));
+        }
+        None => {
+            pkg.set_part(part, part_xml(is_header, inner).into_bytes());
+        }
+    }
 }
 
 /// The header/footer XML a new part holds, around its block content.

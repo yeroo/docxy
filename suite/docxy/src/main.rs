@@ -11449,9 +11449,12 @@ fn live_comments(tab: &DocTab, doc: &Document) -> Vec<Comment> {
 /// The base package a save of `tab` writes `doc` into ([`doc_to_docx`],
 /// with `live` its [`live_comments`]): its own, or after a Remove All of
 /// comments a copy without each `<w:comment>` neither in `live` nor marked
-/// in `doc`'s body. Remove All used to empty comments.xml; now that its
-/// undo can bring comments back, those the per-id save would miss (an id
-/// it reads as a different number, a part it can't parse) go here (#971).
+/// in `doc`'s body or in a header, footer or note it applies (#918).
+/// Remove All used to empty comments.xml; now that its undo can bring
+/// comments back, those the per-id save would miss (an id it reads as a
+/// different number, a part it can't parse) go here (#971). When it drops
+/// one, people.xml keeps only the people something still names, the
+/// authors of `live` included ([`Package::prune_people`]).
 fn save_base<'a>(
     tab: &'a DocTab,
     doc: &Document,
@@ -11476,7 +11479,7 @@ fn save_base<'a>(
     let mut keep = docxcore::inspect::comment_marker_ids(doc);
     keep.extend(live.iter().map(|c| c.id.clone()));
     // A comment anchored in a header, footer or note stays while it is (#918).
-    keep.extend(docxcore::inspect::story_comment_marker_ids(&base));
+    keep.extend(docxcore::inspect::Stories::new(&base, doc).comment_marker_ids(&base));
     let stale: Vec<String> = base
         .comment_ids()
         .into_iter()
@@ -11489,8 +11492,10 @@ fn save_base<'a>(
     for id in &stale {
         pruned.remove_comment_id(id);
     }
-    // And the people only those comments named (#918).
-    pruned.prune_people(doc);
+    // And the people only those comments named (#918): not the authors of
+    // the live comments the save adds after this (one added since, say).
+    let authors: Vec<&str> = live.iter().map(|c| c.author.as_str()).collect();
+    pruned.prune_people(doc, &authors);
     Some(base)
 }
 
@@ -11797,7 +11802,7 @@ fn doc_to_docx_pruning(
     // A removed comment's author stays in people.xml only while something
     // else names them (#918). Only then: an untouched file keeps its bytes.
     if removed {
-        pkg.prune_people(doc);
+        pkg.prune_people(doc, &[]);
     }
     // Only a type that disagrees is rewritten, so an unmodified save of a
     // file already of its type is still its own bytes.

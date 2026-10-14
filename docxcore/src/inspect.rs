@@ -727,11 +727,10 @@ pub fn remove_comment_markers(doc: &mut Document, id: &str) -> usize {
     remove_blocks(&mut doc.body, Target::CommentMarkers(Some(id)))
 }
 
-/// What the inspector finds in a document's other stories: its headers,
-/// footers, footnotes and endnotes ([`story_parts`]).
+/// What the inspector finds in a document's other stories ([`Stories`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StoryCounts {
-    /// Hidden runs, tabs and breaks [`remove_hidden_text_in_stories`] removes.
+    /// Hidden runs, tabs and breaks [`Stories::remove_hidden_text`] removes.
     pub hidden: usize,
     /// Hidden runs left in raw XML there ([`count_unremovable_hidden_runs`]).
     pub hidden_unremovable: usize,
@@ -753,50 +752,200 @@ const NOTE_PARTS: [(&str, &str); 2] = [
     ("word/endnotes.xml", "w:endnote"),
 ];
 
-/// The parts holding a document's other stories: every header and footer
-/// part, then `word/footnotes.xml` and `word/endnotes.xml` when present.
-pub fn story_parts(pkg: &Package) -> Vec<String> {
-    let mut parts: Vec<String> = pkg
-        .part_names()
-        .into_iter()
-        .filter(|n| hf_root(pkg, n).is_some())
-        .map(str::to_string)
-        .collect();
-    parts.extend(
-        NOTE_PARTS
-            .iter()
-            .filter(|(name, _)| pkg.part(name).is_some())
-            .map(|(name, _)| name.to_string()),
-    );
-    parts
+/// What a story part holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoryKind {
+    /// A header (`true`) or footer part.
+    HeaderFooter(bool),
+    /// A notes part, whose notes are this element.
+    Notes(&'static str),
 }
 
-/// Whether `part` is a header (`Some(true)`) or footer (`Some(false)`) part:
-/// a `word/header*.xml` or `word/footer*.xml` whose root is `w:hdr` or
-/// `w:ftr`.
-fn hf_root(pkg: &Package, part: &str) -> Option<bool> {
-    let name = part.strip_prefix("word/")?;
-    if name.contains('/')
-        || !name.ends_with(".xml")
-        || !(name.starts_with("header") || name.starts_with("footer"))
-    {
-        return None;
-    }
-    let xml = pkg.part_text(part)?;
-    let mut p = XmlParser::new(&xml);
-    loop {
-        match p.next() {
-            Event::Start => {
-                return match p.name() {
-                    "w:hdr" => Some(true),
-                    "w:ftr" => Some(false),
-                    _ => None,
-                };
+/// A document's other stories (#918): the header and footer parts some
+/// section of the body references, of any variant (shown or not: a save
+/// keeps them all), then `word/footnotes.xml` and `word/endnotes.xml` when
+/// present. A header or footer part no section references any more (kept in
+/// the package for undo, dropped by the save, #771) is not one of them.
+pub struct Stories {
+    parts: Vec<(String, StoryKind)>,
+}
+
+impl Stories {
+    /// The stories of `pkg` whose body is `doc` (the live one, whose section
+    /// breaks say which headers and footers apply).
+    pub fn new(pkg: &Package, doc: &Document) -> Stories {
+        let mut sect_prs: Vec<&str> = doc
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => p.props.section_break.as_deref(),
+                _ => None,
+            })
+            .collect();
+        sect_prs.push(
+            doc.trailing_section_properties()
+                .map_or("", |s| s.raw.as_str()),
+        );
+        let mut parts: Vec<(String, StoryKind)> = Vec::new();
+        for section in crate::package::section_header_parts(&sect_prs, &pkg.document_rels()) {
+            for (is_header, slots) in [(true, section.headers), (false, section.footers)] {
+                for part in slots.into_iter().flatten() {
+                    if pkg.part(&part.part_name).is_some()
+                        && !parts.iter().any(|(name, _)| *name == part.part_name)
+                    {
+                        parts.push((part.part_name, StoryKind::HeaderFooter(is_header)));
+                    }
+                }
             }
-            Event::Eof => return None,
-            _ => {}
         }
+        parts.extend(
+            NOTE_PARTS
+                .iter()
+                .filter(|(name, _)| pkg.part(name).is_some())
+                .map(|(name, element)| (name.to_string(), StoryKind::Notes(element))),
+        );
+        Stories { parts }
     }
+
+    /// The story part names, in order.
+    pub fn part_names(&self) -> Vec<&str> {
+        self.parts.iter().map(|(name, _)| name.as_str()).collect()
+    }
+
+    /// Every story's blocks, read from `pkg`, but `skip`'s (a header or footer
+    /// whose live content the caller holds, in an editor).
+    fn blocks(&self, pkg: &Package, skip: Option<&str>) -> Vec<Vec<Block>> {
+        let mut out = Vec::new();
+        for (part, kind) in &self.parts {
+            if Some(part.as_str()) == skip {
+                continue;
+            }
+            match *kind {
+                StoryKind::HeaderFooter(_) => out.extend(pkg.header_footer_blocks(part)),
+                StoryKind::Notes(element) => {
+                    let Some(xml) = pkg.part_text(part) else {
+                        continue;
+                    };
+                    let rels = pkg.part_rels(part);
+                    for range in note_ranges(&xml, element) {
+                        out.push(crate::load::parse_note_blocks(&xml[range], &rels));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// What the inspector finds in the stories, hidden text resolved through
+    /// `styles` when given. `skip` names a header or footer part to leave
+    /// out: one open in an editor, whose live blocks the caller counts with
+    /// [`count_story_blocks`].
+    pub fn count(
+        &self,
+        pkg: &Package,
+        styles: Option<&StyleSheet>,
+        skip: Option<&str>,
+    ) -> StoryCounts {
+        let mut counts = StoryCounts::default();
+        for blocks in self.blocks(pkg, skip) {
+            counts += count_story_blocks(&blocks, styles);
+        }
+        counts
+    }
+
+    /// Remove every hidden run, tab and break (see [`Stories::count`]) from
+    /// the stories. Only a header or footer part, or a note, that held one is
+    /// rewritten, from its modeled blocks: a header or footer keeps its root
+    /// start tag ([`crate::hf::rewrite_part`]), a note its own start and end
+    /// tags, and the other notes (the separators included) stay byte for
+    /// byte. A rewritten part keeps its encoding (UTF-16, a BOM). Hidden runs
+    /// in raw XML stay, as in the body. Returns how many were removed.
+    pub fn remove_hidden_text(&self, pkg: &mut Package, styles: Option<&StyleSheet>) -> usize {
+        let mut removed = 0;
+        for (part, kind) in &self.parts {
+            match *kind {
+                StoryKind::HeaderFooter(is_header) => {
+                    let Some(mut blocks) = pkg.header_footer_blocks(part) else {
+                        continue;
+                    };
+                    let n = remove_blocks(&mut blocks, hidden(styles));
+                    if n > 0 {
+                        let inner = crate::serialize::blocks_to_xml(&blocks);
+                        crate::hf::rewrite_part(pkg, part, is_header, &inner);
+                        removed += n;
+                    }
+                }
+                StoryKind::Notes(element) => {
+                    removed += remove_hidden_in_notes(pkg, part, element, styles);
+                }
+            }
+        }
+        removed
+    }
+
+    /// The `w:id` of every comment marker in the stories.
+    pub fn comment_marker_ids(&self, pkg: &Package) -> std::collections::BTreeSet<String> {
+        let mut ids = std::collections::BTreeSet::new();
+        for (part, _) in &self.parts {
+            if let Some(xml) = pkg.part_text(part) {
+                marker_ids_in_xml(&xml, &mut ids);
+            }
+        }
+        ids
+    }
+
+    /// Remove every comment marker from the stories, straight from each
+    /// part's XML, not through the model: nothing else in the part changes
+    /// but the run a `w:commentReference` leaves holding only its `w:rPr`,
+    /// which goes too. A part without a marker is not touched. Returns how
+    /// many markers were removed.
+    pub fn remove_comment_markers(&self, pkg: &mut Package) -> usize {
+        let mut removed = 0;
+        for (part, _) in &self.parts {
+            let Some(xml) = pkg.part_text(part) else {
+                continue;
+            };
+            let (out, n) = strip_markers_in_part(&xml);
+            if n > 0 {
+                pkg.set_part_text(part, &out);
+                removed += n;
+            }
+        }
+        removed
+    }
+}
+
+/// [`Stories::remove_hidden_text`] of notes part `part`, whose notes are
+/// `element`s: each note that held a hidden run is spliced back alone.
+fn remove_hidden_in_notes(
+    pkg: &mut Package,
+    part: &str,
+    element: &str,
+    styles: Option<&StyleSheet>,
+) -> usize {
+    let Some(xml) = pkg.part_text(part) else {
+        return 0;
+    };
+    let rels = pkg.part_rels(part);
+    let close = format!("</{element}>");
+    let mut out = xml.clone();
+    let mut removed = 0;
+    // Last first, so the earlier ranges stay valid.
+    for range in note_ranges(&xml, element).into_iter().rev() {
+        let note = &xml[range.clone()];
+        let mut blocks = crate::load::parse_note_blocks(note, &rels);
+        let n = remove_blocks(&mut blocks, hidden(styles));
+        let Some(head) = tag_end(note).filter(|_| n > 0) else {
+            continue;
+        };
+        let inner = range.start + head..range.end - close.len();
+        out.replace_range(inner, &crate::serialize::blocks_to_xml(&blocks));
+        removed += n;
+    }
+    if out != xml {
+        pkg.set_part_text(part, &out);
+    }
+    removed
 }
 
 /// The byte ranges of the notes a user wrote in a notes part, each a whole
@@ -823,138 +972,13 @@ fn note_ranges(xml: &str, element: &str) -> Vec<Range<usize>> {
     out
 }
 
-/// The element a notes part's notes are, `None` for any other part.
-fn note_element(part: &str) -> Option<&'static str> {
-    NOTE_PARTS
-        .iter()
-        .find(|(name, _)| *name == part)
-        .map(|(_, element)| *element)
-}
-
-/// Every story's blocks, read from `pkg`, but `skip`'s (a header or footer
-/// whose live content the caller holds, in an editor).
-fn story_blocks(pkg: &Package, skip: Option<&str>) -> Vec<Vec<Block>> {
-    let mut out = Vec::new();
-    for part in story_parts(pkg) {
-        if Some(part.as_str()) == skip {
-            continue;
-        }
-        if hf_root(pkg, &part).is_some() {
-            out.extend(pkg.header_footer_blocks(&part));
-            continue;
-        }
-        let (Some(xml), Some(element)) = (pkg.part_text(&part), note_element(&part)) else {
-            continue;
-        };
-        let rels = pkg.part_rels(&part);
-        for range in note_ranges(&xml, element) {
-            out.push(crate::load::parse_note_blocks(&xml[range], &rels));
-        }
-    }
-    out
-}
-
-/// What the inspector finds in `pkg`'s headers, footers and notes (#918),
-/// hidden text resolved through `styles` when given. `skip` names a header
-/// or footer part to leave out: one open in an editor, whose live blocks
-/// the caller counts with [`count_story_blocks`].
-pub fn count_in_stories(
-    pkg: &Package,
-    styles: Option<&StyleSheet>,
-    skip: Option<&str>,
-) -> StoryCounts {
-    let mut counts = StoryCounts::default();
-    for blocks in story_blocks(pkg, skip) {
-        counts += count_story_blocks(&blocks, styles);
-    }
-    counts
-}
-
-/// [`count_in_stories`] of one story's blocks.
+/// [`Stories::count`] of one story's blocks.
 pub fn count_story_blocks(blocks: &[Block], styles: Option<&StyleSheet>) -> StoryCounts {
     StoryCounts {
         hidden: count_blocks(blocks, hidden(styles)),
         hidden_unremovable: count_blocks(blocks, Target::RawHidden),
         comment_markers: count_blocks(blocks, Target::CommentMarkers(None)),
     }
-}
-
-/// Remove every hidden run, tab and break (see [`count_in_stories`]) from
-/// `pkg`'s headers, footers and notes. Only a header or footer part, or a
-/// note, that held one is rewritten, from its modeled blocks: a header or
-/// footer keeps its root start tag ([`crate::hf::rewrite_part`]), a note its
-/// own start and end tags, and the other notes (the separators included)
-/// stay byte for byte. Hidden runs in raw XML stay, as in the body. Returns
-/// how many were removed.
-pub fn remove_hidden_text_in_stories(pkg: &mut Package, styles: Option<&StyleSheet>) -> usize {
-    let mut removed = 0;
-    for part in story_parts(pkg) {
-        if let Some(is_header) = hf_root(pkg, &part) {
-            let Some(mut blocks) = pkg.header_footer_blocks(&part) else {
-                continue;
-            };
-            let n = remove_blocks(&mut blocks, hidden(styles));
-            if n > 0 {
-                let inner = crate::serialize::blocks_to_xml(&blocks);
-                crate::hf::rewrite_part(pkg, &part, is_header, &inner);
-                removed += n;
-            }
-            continue;
-        }
-        let (Some(xml), Some(element)) = (pkg.part_text(&part), note_element(&part)) else {
-            continue;
-        };
-        let rels = pkg.part_rels(&part);
-        let close = format!("</{element}>");
-        let mut out = xml.clone();
-        // Last first, so the earlier ranges stay valid.
-        for range in note_ranges(&xml, element).into_iter().rev() {
-            let note = &xml[range.clone()];
-            let mut blocks = crate::load::parse_note_blocks(note, &rels);
-            let n = remove_blocks(&mut blocks, hidden(styles));
-            let Some(head) = tag_end(note).filter(|_| n > 0) else {
-                continue;
-            };
-            let inner = range.start + head..range.end - close.len();
-            out.replace_range(inner, &crate::serialize::blocks_to_xml(&blocks));
-            removed += n;
-        }
-        if out != xml {
-            pkg.set_part_text(&part, &out);
-        }
-    }
-    removed
-}
-
-/// The `w:id` of every comment marker in `pkg`'s headers, footers and notes.
-pub fn story_comment_marker_ids(pkg: &Package) -> std::collections::BTreeSet<String> {
-    let mut ids = std::collections::BTreeSet::new();
-    for part in story_parts(pkg) {
-        if let Some(xml) = pkg.part_text(&part) {
-            marker_ids_in_xml(&xml, &mut ids);
-        }
-    }
-    ids
-}
-
-/// Remove every comment marker from `pkg`'s headers, footers and notes,
-/// straight from each part's XML, not through the model: nothing else in the
-/// part changes but the run a `w:commentReference` leaves holding only its
-/// `w:rPr`, which goes too. A part without a marker is not touched. Returns
-/// how many markers were removed.
-pub fn remove_comment_markers_in_stories(pkg: &mut Package) -> usize {
-    let mut removed = 0;
-    for part in story_parts(pkg) {
-        let Some(xml) = pkg.part_text(&part) else {
-            continue;
-        };
-        let (out, n) = strip_markers_in_part(&xml);
-        if n > 0 {
-            pkg.set_part_text(&part, &out);
-            removed += n;
-        }
-    }
-    removed
 }
 
 /// `xml` (a whole part) without its comment markers, and how many there
@@ -1130,6 +1154,10 @@ mod tests {
             (
                 "word/styles.xml".to_string(),
                 br#"<?xml version="1.0"?><w:styles/>"#.to_vec(),
+            ),
+            (
+                "word/_rels/document.xml.rels".to_string(),
+                HF_RELS.as_bytes().to_vec(),
             ),
         ];
         for (name, xml) in extra {
@@ -1941,11 +1969,23 @@ mod tests {
         )
     }
 
+    /// The relationships of the header and footer parts the tests use.
+    const HF_RELS: &str = "<?xml version=\"1.0\"?><Relationships>        <Relationship Id=\"rIdH\" Type=\"h\" Target=\"header1.xml\"/>        <Relationship Id=\"rIdH2\" Type=\"h\" Target=\"header2.xml\"/>        <Relationship Id=\"rIdF\" Type=\"f\" Target=\"footer1.xml\"/>        <Relationship Id=\"rIdH9\" Type=\"h\" Target=\"header9.xml\"/></Relationships>";
+
+    /// A trailing sectPr referencing header1 (default), header2 (first page,
+    /// not shown: no titlePg) and footer1. header9 is related, but no section
+    /// references it.
+    const SECT: &str = "<w:sectPr><w:headerReference w:type=\"default\" r:id=\"rIdH\"/>        <w:headerReference w:type=\"first\" r:id=\"rIdH2\"/>        <w:footerReference w:type=\"default\" r:id=\"rIdF\"/></w:sectPr>";
+
+    fn stories(pkg: &Package) -> Stories {
+        Stories::new(pkg, &pkg.document)
+    }
+
     fn storied_docx() -> Package {
         let document = format!(
             "<w:document {W}><w:body><w:p><w:r><w:t>Body</w:t></w:r>\
              <w:r><w:footnoteReference w:id=\"1\"/></w:r><w:r><w:endnoteReference w:id=\"1\"/></w:r></w:p>\
-             <w:sectPr><w:headerReference w:type=\"default\" r:id=\"rIdH\"/></w:sectPr></w:body></w:document>"
+             {SECT}</w:body></w:document>"
         );
         let footer = format!("<w:ftr {W}><w:p><w:r><w:t>Foot</w:t></w:r></w:p></w:ftr>");
         docx(
@@ -1971,7 +2011,7 @@ mod tests {
     fn header_hidden_run_and_comment_markers_are_counted_and_removed() {
         let mut pkg = storied_docx();
         assert_eq!(
-            story_parts(&pkg),
+            stories(&pkg).part_names(),
             [
                 "word/header1.xml",
                 "word/footer1.xml",
@@ -1979,7 +2019,7 @@ mod tests {
                 "word/endnotes.xml"
             ]
         );
-        let counts = count_in_stories(&pkg, None, None);
+        let counts = stories(&pkg).count(&pkg, None, None);
         assert_eq!(
             counts,
             StoryCounts {
@@ -1988,13 +2028,13 @@ mod tests {
                 comment_markers: 9,
             }
         );
-        let ids: Vec<String> = story_comment_marker_ids(&pkg).into_iter().collect();
+        let ids: Vec<String> = stories(&pkg).comment_marker_ids(&pkg).into_iter().collect();
         assert_eq!(ids, ["3", "4"]);
         // Leaving the header out (open in an editor) leaves its counts out.
-        let rest = count_in_stories(&pkg, None, Some("word/header1.xml"));
+        let rest = stories(&pkg).count(&pkg, None, Some("word/header1.xml"));
         assert_eq!((rest.hidden, rest.comment_markers), (2, 6));
 
-        assert_eq!(remove_comment_markers_in_stories(&mut pkg), 9);
+        assert_eq!(stories(&pkg).remove_comment_markers(&mut pkg), 9);
         let header = pkg.part_text("word/header1.xml").unwrap();
         assert_eq!(count_markers(&header, None), 0, "{header}");
         // The reference's run went with it; the rest is as it was.
@@ -2003,9 +2043,9 @@ mod tests {
             header.contains("<w:r><w:t>Head</w:t></w:r><w:r><w:rPr><w:vanish/>"),
             "{header}"
         );
-        assert!(story_comment_marker_ids(&pkg).is_empty());
+        assert!(stories(&pkg).comment_marker_ids(&pkg).is_empty());
 
-        assert_eq!(remove_hidden_text_in_stories(&mut pkg, None), 3);
+        assert_eq!(stories(&pkg).remove_hidden_text(&mut pkg, None), 3);
         let header = pkg.part_text("word/header1.xml").unwrap();
         assert!(!header.contains("w:vanish"), "{header}");
         assert!(header.contains("Head"), "{header}");
@@ -2013,7 +2053,10 @@ mod tests {
         let blocks = pkg.header_footer_blocks("word/header1.xml").unwrap();
         let text: String = blocks.iter().map(|b| b.plain_text()).collect();
         assert_eq!(text, "Head");
-        assert_eq!(count_in_stories(&pkg, None, None), StoryCounts::default());
+        assert_eq!(
+            stories(&pkg).count(&pkg, None, None),
+            StoryCounts::default()
+        );
     }
 
     /// #918: a footnote's and an endnote's hidden run and comment markers go;
@@ -2043,8 +2086,8 @@ mod tests {
             .iter()
             .map(|(part, element, _)| separators(&pkg, part, element))
             .collect();
-        assert_eq!(remove_hidden_text_in_stories(&mut pkg, None), 3);
-        assert_eq!(remove_comment_markers_in_stories(&mut pkg), 9);
+        assert_eq!(stories(&pkg).remove_hidden_text(&mut pkg, None), 3);
+        assert_eq!(stories(&pkg).remove_comment_markers(&mut pkg), 9);
         for ((part, element, mark), before) in notes.iter().zip(before) {
             let xml = pkg.part_text(part).unwrap();
             assert_eq!(before.len(), 2, "{xml}");
@@ -2073,7 +2116,7 @@ mod tests {
         );
         let mut pkg = docx(
             &format!(
-                "<w:document {W}><w:body><w:p><w:r><w:rPr><w:vanish/></w:rPr><w:t>x</w:t></w:r></w:p></w:body></w:document>"
+                "<w:document {W}><w:body><w:p><w:r><w:rPr><w:vanish/></w:rPr><w:t>x</w:t></w:r></w:p>{SECT}</w:body></w:document>"
             ),
             &[
                 ("word/header1.xml", &marked_header()),
@@ -2088,13 +2131,13 @@ mod tests {
                 .collect()
         };
         let before = bytes(&pkg);
-        assert_eq!(remove_hidden_text_in_stories(&mut pkg, None), 1);
-        assert_eq!(remove_comment_markers_in_stories(&mut pkg), 3);
+        assert_eq!(stories(&pkg).remove_hidden_text(&mut pkg, None), 1);
+        assert_eq!(stories(&pkg).remove_comment_markers(&mut pkg), 3);
         assert_eq!(bytes(&pkg), before);
         // And with nothing left anywhere, the header is not rewritten either.
         let header = pkg.part("word/header1.xml").unwrap().to_vec();
-        assert_eq!(remove_hidden_text_in_stories(&mut pkg, None), 0);
-        assert_eq!(remove_comment_markers_in_stories(&mut pkg), 0);
+        assert_eq!(stories(&pkg).remove_hidden_text(&mut pkg, None), 0);
+        assert_eq!(stories(&pkg).remove_comment_markers(&mut pkg), 0);
         assert_eq!(pkg.part("word/header1.xml").unwrap(), header);
     }
 
@@ -2151,11 +2194,11 @@ mod tests {
         assert_eq!(count_hidden_runs(&doc, Some(&styles)), 0);
         let header = format!("<w:hdr {W}><w:p>{run}</w:p></w:hdr>");
         let mut pkg = docx(
-            &format!("<w:document {W}><w:body/></w:document>"),
+            &format!("<w:document {W}><w:body>{SECT}</w:body></w:document>"),
             &[("word/header2.xml", &header)],
         );
-        assert_eq!(count_in_stories(&pkg, Some(&styles), None).hidden, 0);
-        assert_eq!(remove_hidden_text_in_stories(&mut pkg, Some(&styles)), 0);
+        assert_eq!(stories(&pkg).count(&pkg, Some(&styles), None).hidden, 0);
+        assert_eq!(stories(&pkg).remove_hidden_text(&mut pkg, Some(&styles)), 0);
         assert_eq!(pkg.part_text("word/header2.xml").unwrap(), header);
     }
 
@@ -2167,12 +2210,99 @@ mod tests {
             "<w:hdr {W}><w:p><w:fldSimple w:instr=\" PAGE \"><w:r><w:rPr><w:vanish/></w:rPr><w:t>1</w:t></w:r></w:fldSimple></w:p></w:hdr>"
         );
         let mut pkg = docx(
-            &format!("<w:document {W}><w:body/></w:document>"),
+            &format!("<w:document {W}><w:body>{SECT}</w:body></w:document>"),
             &[("word/header1.xml", &header)],
         );
-        let counts = count_in_stories(&pkg, None, None);
+        let counts = stories(&pkg).count(&pkg, None, None);
         assert_eq!((counts.hidden, counts.hidden_unremovable), (0, 1));
-        assert_eq!(remove_hidden_text_in_stories(&mut pkg, None), 0);
+        assert_eq!(stories(&pkg).remove_hidden_text(&mut pkg, None), 0);
         assert_eq!(pkg.part_text("word/header1.xml").unwrap(), header);
+    }
+
+    /// #918 FIX r1 M1: a UTF-16 header keeps its encoding, its BOM and its
+    /// root start tag (namespaces, `mc:Ignorable`) when its hidden run goes.
+    #[test]
+    fn utf16_header_keeps_encoding_and_root_when_hidden_text_goes() {
+        let root = format!(
+            "<w:hdr {W} xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" \
+             xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\" mc:Ignorable=\"w14\">"
+        );
+        let header = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-16\" standalone=\"yes\"?>\n{root}\
+             <w:p w14:paraId=\"1A2B3C4D\"><w:r><w:t>Head</w:t></w:r>\
+             <w:r><w:rPr><w:vanish/></w:rPr><w:t>Hush</w:t></w:r></w:p></w:hdr>"
+        );
+        let utf16: Vec<u8> = [0xff, 0xfe]
+            .into_iter()
+            .chain(header.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        let document = format!("<w:document {W}><w:body>{SECT}</w:body></w:document>");
+        let parts = vec![
+            (
+                "[Content_Types].xml".to_string(),
+                br#"<?xml version="1.0"?><Types/>"#.to_vec(),
+            ),
+            (
+                "_rels/.rels".to_string(),
+                br#"<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="word/document.xml"/></Relationships>"#.to_vec(),
+            ),
+            ("word/document.xml".to_string(), document.into_bytes()),
+            ("word/header1.xml".to_string(), utf16),
+            (
+                "word/_rels/document.xml.rels".to_string(),
+                HF_RELS.as_bytes().to_vec(),
+            ),
+        ];
+        let mut pkg = load_package(&write_zip(&parts)).unwrap();
+        assert_eq!(stories(&pkg).count(&pkg, None, None).hidden, 1);
+        assert_eq!(stories(&pkg).remove_hidden_text(&mut pkg, None), 1);
+        let bytes = pkg.part("word/header1.xml").unwrap();
+        assert!(
+            bytes.starts_with(&[0xff, 0xfe, b'<', 0]),
+            "still UTF-16 LE with its BOM"
+        );
+        let xml = pkg.part_text("word/header1.xml").unwrap();
+        assert!(
+            xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-16\""),
+            "{xml}"
+        );
+        // Kept, with only the namespaces the editor's content may use added.
+        let kept = root.trim_end_matches('>');
+        assert!(xml.contains(kept), "root start tag kept: {xml}");
+        assert!(!xml.contains("w:vanish") && !xml.contains("Hush"), "{xml}");
+        assert!(xml.contains("Head"), "{xml}");
+    }
+
+    /// #918 FIX r1 m1: a header part no section references (kept in the
+    /// package for undo, dropped by the save) is not inspected or edited.
+    #[test]
+    fn unreferenced_header_is_not_a_story() {
+        let hidden = format!(
+            "<w:hdr {W}><w:p><w:r><w:rPr><w:vanish/></w:rPr><w:t>Gone</w:t></w:r>\
+             <w:commentRangeStart w:id=\"7\"/></w:p></w:hdr>"
+        );
+        let mut pkg = docx(
+            &format!("<w:document {W}><w:body>{SECT}</w:body></w:document>"),
+            &[("word/header9.xml", &hidden)],
+        );
+        assert!(stories(&pkg).part_names().is_empty());
+        assert_eq!(
+            stories(&pkg).count(&pkg, None, None),
+            StoryCounts::default()
+        );
+        assert!(stories(&pkg).comment_marker_ids(&pkg).is_empty());
+        assert_eq!(stories(&pkg).remove_hidden_text(&mut pkg, None), 0);
+        assert_eq!(stories(&pkg).remove_comment_markers(&mut pkg), 0);
+        assert_eq!(pkg.part_text("word/header9.xml").unwrap(), hidden);
+        // Referenced from a section break, it is one.
+        let sect = SECT.replace("rIdH2", "rIdH9");
+        let pkg = docx(
+            &format!(
+                "<w:document {W}><w:body><w:p><w:pPr>{sect}</w:pPr></w:p>{SECT}</w:body></w:document>"
+            ),
+            &[("word/header9.xml", &hidden)],
+        );
+        assert_eq!(stories(&pkg).part_names(), ["word/header9.xml"]);
+        assert_eq!(stories(&pkg).count(&pkg, None, None).hidden, 1);
     }
 }
