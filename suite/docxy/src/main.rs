@@ -11475,6 +11475,8 @@ fn save_base<'a>(
     }
     let mut keep = docxcore::inspect::comment_marker_ids(doc);
     keep.extend(live.iter().map(|c| c.id.clone()));
+    // A comment anchored in a header, footer or note stays while it is (#918).
+    keep.extend(docxcore::inspect::story_comment_marker_ids(&base));
     let stale: Vec<String> = base
         .comment_ids()
         .into_iter()
@@ -11487,6 +11489,8 @@ fn save_base<'a>(
     for id in &stale {
         pruned.remove_comment_id(id);
     }
+    // And the people only those comments named (#918).
+    pruned.prune_people(doc);
     Some(base)
 }
 
@@ -11762,9 +11766,11 @@ fn doc_to_docx_pruning(
         })
         .unwrap_or_default();
     let current: HashSet<&str> = comments.iter().map(|c| c.id.as_str()).collect();
+    let mut removed = false;
     for id in &existing {
         if !current.contains(id.as_str()) {
             pkg.remove_comment_id(id);
+            removed = true;
         }
     }
     let existing_set: HashSet<&str> = existing.iter().map(String::as_str).collect();
@@ -11787,6 +11793,11 @@ fn doc_to_docx_pruning(
     }
     if comments.is_empty() {
         pkg.drop_empty_comment_parts();
+    }
+    // A removed comment's author stays in people.xml only while something
+    // else names them (#918). Only then: an untouched file keeps its bytes.
+    if removed {
+        pkg.prune_people(doc);
     }
     // Only a type that disagrees is rewritten, so an unmodified save of a
     // file already of its type is still its own bytes.

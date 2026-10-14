@@ -4,6 +4,8 @@
 //! tests the button.
 
 use crate::{DocTab, Surface, live_comments};
+use docxcore::inspect::StoryCounts;
+use docxcore::styles::StyleSheet;
 
 /// One of the inspector's categories, in the order the page lists them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,11 +67,13 @@ const UNREMOVABLE_HIDDEN: &str = "inside tracked moves, fields, shapes or other 
 pub(crate) struct Inspection {
     /// Comments in the tab's comment list.
     pub(crate) comments: usize,
-    /// Whether any comment marker is in the body (one can outlive its comment).
+    /// Whether any comment marker is in the body, a header, a footer or a
+    /// note (one can outlive its comment).
     pub(crate) comment_markers: bool,
     /// Tracked changes, property changes and unsupported records included.
     pub(crate) revisions: usize,
-    /// Hidden runs, tabs and breaks Remove All can remove.
+    /// Hidden runs, tabs and breaks Remove All can remove, in the body,
+    /// headers, footers and notes, hidden directly or through their styles.
     pub(crate) hidden: usize,
     /// Hidden runs left in raw XML (tracked moves, fields, a group shape's
     /// other text boxes, other preserved XML such as `w:customXml` or an
@@ -138,20 +142,46 @@ pub(crate) fn status_line(
     })
 }
 
+/// The tab's styles, which hidden text is resolved through; `None` for a
+/// document without a package (only direct `w:vanish` hides there).
+fn tab_styles(tab: &DocTab) -> Option<StyleSheet> {
+    let xml = tab.pkg.as_ref()?.part_text("word/styles.xml")?;
+    Some(docxcore::styles::parse_styles_xml(&xml))
+}
+
+/// What the tab's headers, footers and notes hold (#918). A header or footer
+/// open in its editor is counted from the editor, which may not have been
+/// written back to the package yet.
+fn story_counts(tab: &DocTab, styles: Option<&StyleSheet>) -> StoryCounts {
+    let Some(pkg) = tab.pkg.as_ref() else {
+        return StoryCounts::default();
+    };
+    let editing = tab.hf_edit.as_ref();
+    let mut counts =
+        docxcore::inspect::count_in_stories(pkg, styles, editing.map(|h| h.part_name.as_str()));
+    if let Some(hf) = editing {
+        counts += docxcore::inspect::count_story_blocks(&hf.editor.doc.body, styles);
+    }
+    counts
+}
+
 /// Inspect a document tab; `None` for any other kind of tab.
 pub(crate) fn inspect_doc_tab(tab: &DocTab) -> Option<Inspection> {
     let Surface::Doc(editor) = &tab.surface else {
         return None;
     };
     let doc = &editor.doc;
+    let styles = tab_styles(tab);
+    let stories = story_counts(tab, styles.as_ref());
     Some(Inspection {
         // What the pane lists and a save writes: an undone new comment is
         // not there (#620).
         comments: live_comments(tab, doc).len(),
-        comment_markers: docxcore::inspect::has_comment_markers(doc),
+        comment_markers: docxcore::inspect::has_comment_markers(doc) || stories.comment_markers > 0,
         revisions: doc.revisions().len(),
-        hidden: docxcore::inspect::count_hidden_runs(doc, None),
-        hidden_unremovable: docxcore::inspect::count_unremovable_hidden_runs(doc),
+        hidden: docxcore::inspect::count_hidden_runs(doc, styles.as_ref()) + stories.hidden,
+        hidden_unremovable: docxcore::inspect::count_unremovable_hidden_runs(doc)
+            + stories.hidden_unremovable,
         properties: tab
             .pkg
             .as_ref()
@@ -163,6 +193,12 @@ pub(crate) fn inspect_doc_tab(tab: &DocTab) -> Option<Inspection> {
 /// it can't run. Removing something marks the tab dirty; a category that
 /// was not found changes nothing but that status line ("… nothing to
 /// remove"). Revisions are accepted, never deleted with their text.
+///
+/// Comments and hidden text go from the headers, footers and notes too
+/// (#918). Those are package edits, not on the editor's undo stack (like
+/// Remove All properties): an undo brings back what the body lost only. An
+/// open header/footer editor is written back first, and reopened on its
+/// area when its part changed.
 pub(crate) fn inspect_remove(
     tab: &mut DocTab,
     category: InspectCategory,
@@ -174,12 +210,34 @@ pub(crate) fn inspect_remove(
         tab.status = status.clone().into();
         return Ok(status);
     }
+    let stories = matches!(
+        category,
+        InspectCategory::Comments | InspectCategory::Hidden
+    );
+    let hf_open = tab
+        .hf_edit
+        .as_ref()
+        .filter(|_| stories)
+        .map(|h| (h.part_name.clone(), h.section, h.is_header, h.variant));
+    if hf_open.is_some() {
+        crate::flush_hf_tab(tab);
+    }
+    let part_bytes = |tab: &DocTab| {
+        let (part, ..) = hf_open.as_ref()?;
+        tab.pkg.as_ref()?.part(part).map(<[u8]>::to_vec)
+    };
+    let edited_before = part_bytes(tab);
+    let styles = tab_styles(tab);
     let Surface::Doc(editor) = &mut tab.surface else {
         unreachable!("inspected above");
     };
     let (status, changed) = match category {
         InspectCategory::Comments => {
-            let markers = editor.remove_all_comment_markers();
+            let markers = editor.remove_all_comment_markers()
+                + tab
+                    .pkg
+                    .as_mut()
+                    .map_or(0, docxcore::inspect::remove_comment_markers_in_stories);
             // Every comment keeps its record, tracked: unlisted and unsaved
             // now its markers are gone, so undoing this brings each back
             // whole with them, and the save removes the rest from the base
@@ -212,8 +270,15 @@ pub(crate) fn inspect_remove(
             (status, accepted > 0)
         }
         InspectCategory::Hidden => {
-            let removed = editor.remove_hidden_text(None);
-            let left = docxcore::inspect::count_unremovable_hidden_runs(&editor.doc);
+            let styles = styles.as_ref();
+            let removed = editor.remove_hidden_text(styles)
+                + tab.pkg.as_mut().map_or(0, |pkg| {
+                    docxcore::inspect::remove_hidden_text_in_stories(pkg, styles)
+                });
+            let left = docxcore::inspect::count_unremovable_hidden_runs(&editor.doc)
+                + tab.pkg.as_ref().map_or(0, |pkg| {
+                    docxcore::inspect::count_in_stories(pkg, styles, None).hidden_unremovable
+                });
             let status = if left == 0 {
                 format!("Removed all hidden text ({removed})")
             } else {
@@ -237,6 +302,13 @@ pub(crate) fn inspect_remove(
     };
     if changed {
         tab.set_dirty();
+    }
+    // The open editor shows its part as it was: reopen it on the same area
+    // (its caret goes to the start).
+    if let Some((_, section, is_header, variant)) = hf_open
+        && part_bytes(tab) != edited_before
+    {
+        crate::hf_tab::reopen(tab, section, is_header, variant);
     }
     tab.status = status.clone().into();
     Ok(status)
@@ -570,5 +642,447 @@ mod tests {
             assert_eq!(InspectCategory::from_key(category.key()), Some(category));
         }
         assert_eq!(InspectCategory::from_key("macros"), None);
+    }
+
+    const W14: &str = "xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\"";
+    const R: &str =
+        "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"";
+
+    /// Write `parts` (with a package relationship to the document) as a .docx
+    /// under a fresh directory and open it.
+    fn open_parts(tag: &str, parts: &[(&str, String)]) -> (PathBuf, DocTab) {
+        let path = temp(tag).join(format!("{tag}.docx"));
+        let rels = "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+            <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/></Relationships>";
+        let mut zip = vec![("_rels/.rels".to_string(), rels.as_bytes().to_vec())];
+        zip.extend(
+            parts
+                .iter()
+                .map(|(n, x)| (n.to_string(), x.as_bytes().to_vec())),
+        );
+        std::fs::write(&path, docxcore::zipwrite::write_zip(&zip)).unwrap();
+        let tab = tab_from_path(&path);
+        assert!(!tab.load_failed, "{}", tab.status);
+        (path, tab)
+    }
+
+    /// `[Content_Types].xml` with an override per named part.
+    fn content_types(parts: &[&str]) -> String {
+        let overrides: String = parts
+            .iter()
+            .map(|p| format!("<Override PartName=\"/{p}\" ContentType=\"application/xml\"/>"))
+            .collect();
+        format!(
+            "<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+             <Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+             <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+             {overrides}</Types>"
+        )
+    }
+
+    /// `word/_rels/document.xml.rels` relating each `(id, type, target)`.
+    fn document_rels(rels: &[(&str, &str, &str)]) -> String {
+        let rels: String = rels
+            .iter()
+            .map(|(id, ty, target)| {
+                format!(
+                    "<Relationship Id=\"{id}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/{ty}\" Target=\"{target}\"/>"
+                )
+            })
+            .collect();
+        format!(
+            "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">{rels}</Relationships>"
+        )
+    }
+
+    /// A document with a comment and a style-hidden run in its body, a header
+    /// holding a hidden run and the only markers of comment 3, and a footnote
+    /// holding a hidden run and the only markers of comment 4.
+    fn storied_parts() -> Vec<(&'static str, String)> {
+        let document = format!(
+            "<w:document {W} {R}><w:body>\
+             <w:p><w:commentRangeStart w:id=\"0\"/><w:r><w:t>Visible</w:t></w:r><w:commentRangeEnd w:id=\"0\"/>\
+             <w:r><w:commentReference w:id=\"0\"/></w:r>\
+             <w:r><w:rPr><w:rStyle w:val=\"Secret\"/></w:rPr><w:t>Styled</w:t></w:r>\
+             <w:r><w:footnoteReference w:id=\"1\"/></w:r></w:p>\
+             <w:sectPr><w:headerReference w:type=\"default\" r:id=\"rIdH\"/></w:sectPr>\
+             </w:body></w:document>"
+        );
+        let header = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+             <w:hdr {W} {R}><w:p><w:commentRangeStart w:id=\"3\"/><w:r><w:t>Head</w:t></w:r>\
+             <w:commentRangeEnd w:id=\"3\"/><w:r><w:commentReference w:id=\"3\"/></w:r>\
+             <w:r><w:rPr><w:vanish/></w:rPr><w:t>Hush</w:t></w:r></w:p></w:hdr>"
+        );
+        let footnotes = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+             <w:footnotes {W}>\
+             <w:footnote w:type=\"separator\" w:id=\"-1\"><w:p><w:r><w:separator/></w:r></w:p></w:footnote>\
+             <w:footnote w:type=\"continuationSeparator\" w:id=\"0\"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote>\
+             <w:footnote w:id=\"1\"><w:p><w:r><w:footnoteRef/></w:r><w:r><w:t xml:space=\"preserve\"> Note</w:t></w:r>\
+             <w:r><w:rPr><w:vanish/></w:rPr><w:t>Quiet</w:t></w:r>\
+             <w:commentRangeStart w:id=\"4\"/><w:commentRangeEnd w:id=\"4\"/><w:r><w:commentReference w:id=\"4\"/></w:r></w:p></w:footnote>\
+             </w:footnotes>"
+        );
+        let comment = |id: &str, text: &str| {
+            format!(
+                "<w:comment w:id=\"{id}\" w:author=\"Ann\" w:initials=\"A\"><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:comment>"
+            )
+        };
+        let comments = format!(
+            "<?xml version=\"1.0\"?><w:comments {W}>{}{}{}</w:comments>",
+            comment("0", "body"),
+            comment("3", "head"),
+            comment("4", "note")
+        );
+        let styles = format!(
+            "<?xml version=\"1.0\"?><w:styles {W}>\
+             <w:style w:type=\"character\" w:styleId=\"Secret\"><w:rPr><w:vanish/></w:rPr></w:style></w:styles>"
+        );
+        vec![
+            (
+                "[Content_Types].xml",
+                content_types(&[
+                    "word/document.xml",
+                    "word/header1.xml",
+                    "word/footnotes.xml",
+                    "word/comments.xml",
+                    "word/styles.xml",
+                ]),
+            ),
+            (
+                "word/_rels/document.xml.rels",
+                document_rels(&[
+                    ("rIdH", "header", "header1.xml"),
+                    ("rIdF", "footnotes", "footnotes.xml"),
+                    ("rIdC", "comments", "comments.xml"),
+                    ("rIdS", "styles", "styles.xml"),
+                ]),
+            ),
+            ("word/document.xml", document),
+            ("word/header1.xml", header),
+            ("word/footnotes.xml", footnotes),
+            ("word/comments.xml", comments),
+            ("word/styles.xml", styles),
+        ]
+    }
+
+    /// #918 p1: Inspect Document finds hidden text and comment markers in the
+    /// header and the footnote, and hidden text through a character style;
+    /// Remove All takes them all, and the save keeps them gone: no comment
+    /// whose markers were only in the header or the note is left either.
+    #[test]
+    fn remove_all_in_headers_and_notes_survives_save() {
+        let (path, mut tab) = open_parts("stories", &storied_parts());
+        let found = inspect_doc_tab(&tab).unwrap();
+        assert_eq!(found.comments, 3);
+        assert!(found.comment_markers);
+        assert_eq!(
+            (found.hidden, found.hidden_unremovable),
+            (3, 0),
+            "{found:?}"
+        );
+        assert_eq!(found.line(InspectCategory::Hidden), "3 hidden runs found.");
+        let footnotes_before = part(&path, "word/footnotes.xml");
+
+        assert_eq!(
+            inspect_remove(&mut tab, InspectCategory::Hidden).unwrap(),
+            "Removed all hidden text (3)"
+        );
+        assert_eq!(
+            inspect_remove(&mut tab, InspectCategory::Comments).unwrap(),
+            "Removed all comments (3)"
+        );
+        let after = inspect_doc_tab(&tab).unwrap();
+        for category in [InspectCategory::Hidden, InspectCategory::Comments] {
+            assert!(!after.found(category), "{category:?}: {after:?}");
+        }
+        assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+
+        let header = part(&path, "word/header1.xml");
+        for gone in ["w:vanish", "Hush", "commentR"] {
+            assert!(!header.contains(gone), "{gone}: {header}");
+        }
+        assert!(header.contains("Head"), "{header}");
+        let footnotes = part(&path, "word/footnotes.xml");
+        for gone in ["w:vanish", "Quiet", "commentR"] {
+            assert!(!footnotes.contains(gone), "{gone}: {footnotes}");
+        }
+        for kept in ["<w:footnoteRef/>", " Note", "<w:footnote w:id=\"1\">"] {
+            assert!(footnotes.contains(kept), "{kept}: {footnotes}");
+        }
+        // The separators are as they were.
+        let separators = |xml: &str| xml[..xml.find("<w:footnote w:id=\"1\"").unwrap()].to_string();
+        assert_eq!(separators(&footnotes), separators(&footnotes_before));
+        let document = part(&path, "word/document.xml");
+        assert!(!document.contains("Styled"), "{document}");
+        assert!(
+            document.contains("<w:footnoteReference w:id=\"1\"/>"),
+            "{document}"
+        );
+        assert!(document.contains("Visible"), "{document}");
+        let comments = part(&path, "word/comments.xml");
+        assert!(!comments.contains("<w:comment "), "{comments}");
+
+        let reopened = tab_from_path(&path);
+        let found = inspect_doc_tab(&reopened).unwrap();
+        for category in [InspectCategory::Hidden, InspectCategory::Comments] {
+            assert!(!found.found(category), "{category:?}: {found:?}");
+        }
+    }
+
+    /// #918 p1: comment markers whose only place is a header are found, even
+    /// with no comment left to count.
+    #[test]
+    fn comment_markers_only_in_a_header_are_found() {
+        let mut parts = storied_parts();
+        parts.retain(|(name, _)| *name != "word/comments.xml");
+        for (name, xml) in parts.iter_mut() {
+            if *name == "word/document.xml" {
+                *xml = format!(
+                    "<w:document {W} {R}><w:body><w:p><w:r><w:t>Body</w:t></w:r></w:p>\
+                     <w:sectPr><w:headerReference w:type=\"default\" r:id=\"rIdH\"/></w:sectPr></w:body></w:document>"
+                );
+            }
+        }
+        parts.retain(|(name, _)| *name != "word/footnotes.xml");
+        let (path, mut tab) = open_parts("header-markers", &parts);
+        let found = inspect_doc_tab(&tab).unwrap();
+        assert_eq!(found.comments, 0);
+        assert!(found.comment_markers);
+        assert_eq!(
+            found.line(InspectCategory::Comments),
+            "Comment markers were found."
+        );
+        inspect_remove(&mut tab, InspectCategory::Comments).unwrap();
+        assert!(tab.dirty, "a package edit dirties the tab");
+        assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+        let header = part(&path, "word/header1.xml");
+        assert!(!header.contains("commentR"), "{header}");
+        assert!(header.contains("w:vanish"), "hidden text stays: {header}");
+    }
+
+    /// #918 p1: with the header open in its editor, Inspect counts what the
+    /// editor holds, and Remove All writes it back, removes from it and
+    /// reopens the editor on the result.
+    #[test]
+    fn remove_all_with_the_header_editor_open() {
+        let (path, mut tab) = open_parts("hf-open", &storied_parts());
+        assert!(crate::hf::open(
+            &mut tab,
+            0,
+            true,
+            docxcore::package::HeaderVariant::Default
+        ));
+        let part_name = tab.hf_edit.as_ref().unwrap().part_name.clone();
+        assert_eq!(part_name, "word/header1.xml");
+        // A hidden run typed in the header editor, not yet written back.
+        let hf = tab.hf_edit.as_mut().unwrap();
+        hf.editor.doc.body.push(docxcore::model::Block::Paragraph(
+            docxcore::model::Paragraph {
+                content: vec![docxcore::model::Inline::Run(docxcore::model::Run {
+                    text: "Typed".into(),
+                    props: docxcore::model::RunProps {
+                        vanish: true,
+                        ..Default::default()
+                    },
+                })],
+                ..Default::default()
+            },
+        ));
+        let found = inspect_doc_tab(&tab).unwrap();
+        assert_eq!(found.hidden, 4, "{found:?}");
+        inspect_remove(&mut tab, InspectCategory::Hidden).unwrap();
+        let hf = tab.hf_edit.as_ref().expect("the editor stays open");
+        let text: String = hf.editor.doc.body.iter().map(|b| b.plain_text()).collect();
+        assert_eq!(text, "Head");
+        assert_eq!(inspect_doc_tab(&tab).unwrap().hidden, 0);
+        assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+        let header = part(&path, "word/header1.xml");
+        assert!(
+            !header.contains("Typed") && !header.contains("Hush"),
+            "{header}"
+        );
+    }
+
+    /// Comments 1 (Ann) and 2 (Bob) with every part Word writes beside
+    /// comments.xml, and a tracked insertion by Rev.
+    fn extras_parts() -> Vec<(&'static str, String)> {
+        let document = format!(
+            "<w:document {W}><w:body>\
+             <w:p><w:commentRangeStart w:id=\"1\"/><w:r><w:t>One</w:t></w:r><w:commentRangeEnd w:id=\"1\"/>\
+             <w:r><w:commentReference w:id=\"1\"/></w:r></w:p>\
+             <w:p><w:commentRangeStart w:id=\"2\"/><w:r><w:t>Two</w:t></w:r><w:commentRangeEnd w:id=\"2\"/>\
+             <w:r><w:commentReference w:id=\"2\"/></w:r>\
+             <w:ins w:id=\"9\" w:author=\"Rev\" w:date=\"2026-01-01T00:00:00Z\"><w:r><w:t>New</w:t></w:r></w:ins></w:p>\
+             </w:body></w:document>"
+        );
+        let comments = format!(
+            "<?xml version=\"1.0\"?><w:comments {W} {W14}>\
+             <w:comment w:id=\"1\" w:author=\"Ann\" w:initials=\"A\"><w:p w14:paraId=\"0000AAAA\"><w:r><w:t>one</w:t></w:r></w:p></w:comment>\
+             <w:comment w:id=\"2\" w:author=\"Bob\" w:initials=\"B\"><w:p w14:paraId=\"0000BBBB\"><w:r><w:t>two</w:t></w:r></w:p></w:comment>\
+             </w:comments>"
+        );
+        let extended = "<?xml version=\"1.0\"?><w15:commentsEx xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\">\
+            <w15:commentEx w15:paraId=\"0000AAAA\" w15:done=\"0\"/><w15:commentEx w15:paraId=\"0000BBBB\" w15:done=\"0\"/></w15:commentsEx>";
+        let ids = "<?xml version=\"1.0\"?><w16cid:commentsIds xmlns:w16cid=\"http://schemas.microsoft.com/office/word/2016/wordml/cid\">\
+            <w16cid:commentId w16cid:paraId=\"0000AAAA\" w16cid:durableId=\"0A0A0A0A\"/>\
+            <w16cid:commentId w16cid:paraId=\"0000BBBB\" w16cid:durableId=\"0B0B0B0B\"/></w16cid:commentsIds>";
+        let extensible = "<?xml version=\"1.0\"?><w16cex:commentsExtensible xmlns:w16cex=\"http://schemas.microsoft.com/office/word/2018/wordml/cex\">\
+            <w16cex:commentExtensible w16cex:durableId=\"0A0A0A0A\" w16cex:dateUtc=\"2026-01-01T00:00:00Z\"/>\
+            <w16cex:commentExtensible w16cex:durableId=\"0B0B0B0B\" w16cex:dateUtc=\"2026-01-02T00:00:00Z\"/></w16cex:commentsExtensible>";
+        let people = "<?xml version=\"1.0\"?><w15:people xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\">\
+            <w15:person w15:author=\"Ann\"><w15:presenceInfo w15:providerId=\"None\" w15:userId=\"Ann\"/></w15:person>\
+            <w15:person w15:author=\"Bob\"><w15:presenceInfo w15:providerId=\"None\" w15:userId=\"Bob\"/></w15:person>\
+            <w15:person w15:author=\"Rev\"><w15:presenceInfo w15:providerId=\"None\" w15:userId=\"Rev\"/></w15:person>\
+            </w15:people>";
+        let names = [
+            "word/document.xml",
+            "word/comments.xml",
+            "word/commentsExtended.xml",
+            "word/commentsIds.xml",
+            "word/commentsExtensible.xml",
+            "word/people.xml",
+        ];
+        vec![
+            ("[Content_Types].xml", content_types(&names)),
+            (
+                "word/_rels/document.xml.rels",
+                document_rels(&[
+                    ("rId2", "comments", "comments.xml"),
+                    ("rId3", "commentsExtended", "commentsExtended.xml"),
+                    ("rId4", "commentsIds", "commentsIds.xml"),
+                    ("rId5", "commentsExtensible", "commentsExtensible.xml"),
+                    ("rId6", "people", "people.xml"),
+                ]),
+            ),
+            ("word/document.xml", document),
+            ("word/comments.xml", comments),
+            ("word/commentsExtended.xml", extended.to_string()),
+            ("word/commentsIds.xml", ids.to_string()),
+            ("word/commentsExtensible.xml", extensible.to_string()),
+            ("word/people.xml", people.to_string()),
+        ]
+    }
+
+    /// #918 p2: after Remove All comments and Save, no comment part is left
+    /// and people.xml names only someone something still names: the
+    /// revision's author.
+    #[test]
+    fn remove_all_comments_leaves_no_stale_extras_or_people_after_save() {
+        let (path, mut tab) = open_parts("extras", &extras_parts());
+        inspect_remove(&mut tab, InspectCategory::Comments).unwrap();
+        assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+        let pkg = docxcore::package::load_package(&std::fs::read(&path).unwrap()).unwrap();
+        for gone in [
+            "word/comments.xml",
+            "word/commentsExtended.xml",
+            "word/commentsIds.xml",
+            "word/commentsExtensible.xml",
+        ] {
+            assert!(pkg.part(gone).is_none(), "{gone}");
+        }
+        let people = pkg.part_text("word/people.xml").unwrap();
+        assert!(
+            !people.contains("\"Ann\"") && !people.contains("\"Bob\""),
+            "{people}"
+        );
+        assert!(people.contains("w15:author=\"Rev\""), "{people}");
+    }
+
+    /// #918 p2: deleting one of two comments drops its entries, the
+    /// commentsExtensible one included, and its author's person; the other
+    /// comment keeps everything.
+    #[test]
+    fn delete_comment_drops_its_extensible_entry_and_person() {
+        let (path, mut tab) = open_parts("extras-one", &extras_parts());
+        crate::delete_doc_comment(&mut tab, "1");
+        assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+        let extensible = part(&path, "word/commentsExtensible.xml");
+        assert!(!extensible.contains("0A0A0A0A"), "{extensible}");
+        assert!(extensible.contains("0B0B0B0B"), "{extensible}");
+        let ids = part(&path, "word/commentsIds.xml");
+        assert!(
+            !ids.contains("0A0A0A0A") && ids.contains("0B0B0B0B"),
+            "{ids}"
+        );
+        let people = part(&path, "word/people.xml");
+        assert!(!people.contains("\"Ann\""), "{people}");
+        assert!(
+            people.contains("\"Bob\"") && people.contains("\"Rev\""),
+            "{people}"
+        );
+    }
+
+    /// Every `w:commentReference` id in `document` has its comment in
+    /// `comments`, and these are the comment ids, in order.
+    fn assert_no_dangling(document: &str, comments: &str) -> Vec<String> {
+        let ids: Vec<String> = docxcore::comments::parse_comments_xml(comments)
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        for id in docxcore::inspect::comment_marker_ids_in_xml(document) {
+            assert!(ids.contains(&id), "{id} dangles: {comments}");
+        }
+        ids
+    }
+
+    fn undo(tab: &mut DocTab) {
+        let Surface::Doc(ed) = &mut tab.surface else {
+            unreachable!()
+        };
+        assert!(ed.undo());
+    }
+
+    /// #918 p5: undo of Remove All comments brings the comments back with
+    /// their markers, and the save writes every one.
+    #[test]
+    fn undo_remove_all_comments_saves_every_comment() {
+        let (path, mut tab) = open("undo-remove-all");
+        inspect_remove(&mut tab, InspectCategory::Comments).unwrap();
+        undo(&mut tab);
+        assert_eq!(inspect_doc_tab(&tab).unwrap().comments, 2);
+        assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+        let document = part(&path, "word/document.xml");
+        let comments = part(&path, "word/comments.xml");
+        assert_eq!(assert_no_dangling(&document, &comments), ["0", "1"]);
+        assert!(
+            comments.contains(">one<") && comments.contains(">two<"),
+            "{comments}"
+        );
+    }
+
+    /// #918 p5: Remove All, Save, Undo, Save: the first save left the
+    /// comments out of the file the tab now rests on, and the second writes
+    /// them back from their records, with no marker left dangling.
+    #[test]
+    fn remove_all_save_undo_save_restores_every_comment() {
+        let (path, mut tab) = open("remove-save-undo");
+        inspect_remove(&mut tab, InspectCategory::Comments).unwrap();
+        assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+        assert!(!part(&path, "word/comments.xml").contains("<w:comment "));
+        undo(&mut tab);
+        assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+        let document = part(&path, "word/document.xml");
+        let comments = part(&path, "word/comments.xml");
+        assert_eq!(assert_no_dangling(&document, &comments), ["0", "1"]);
+        assert!(
+            comments.contains(">one<") && comments.contains(">two<"),
+            "{comments}"
+        );
+    }
+
+    /// #918 p5: the same for a single Delete Comment and its undo.
+    #[test]
+    fn undo_delete_comment_saves_the_comment() {
+        let (path, mut tab) = open("undo-delete");
+        crate::delete_doc_comment(&mut tab, "1");
+        assert_eq!(inspect_doc_tab(&tab).unwrap().comments, 1);
+        undo(&mut tab);
+        assert_eq!(inspect_doc_tab(&tab).unwrap().comments, 2);
+        assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+        let document = part(&path, "word/document.xml");
+        let comments = part(&path, "word/comments.xml");
+        assert_eq!(assert_no_dangling(&document, &comments), ["0", "1"]);
     }
 }
