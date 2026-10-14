@@ -766,6 +766,7 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                         book.push_sheet(SheetIn {
                             name: attr("table:name"),
                             cells: BTreeMap::new(),
+                            ..SheetIn::default()
                         })?;
                         col_styles.clear();
                         next_col = 0;

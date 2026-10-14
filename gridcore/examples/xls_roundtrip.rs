@@ -17,14 +17,14 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    let (pkg, _) = match gridcore::legacy::open_workbook(&data) {
-        Ok(p) => p,
+    let opened = match gridcore::legacy::open_workbook_ex(&data) {
+        Ok(o) => o,
         Err(e) => {
             eprintln!("{input}: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
-    let out = gridcore::legacy::write_xls(&pkg);
+    let out = gridcore::legacy::write_xls(&opened.pkg);
     if let Err(e) = gridcore::legacy::check_xls(&out.bytes) {
         eprintln!("{input}: structure: {e}");
         return std::process::ExitCode::FAILURE;
@@ -32,6 +32,9 @@ fn main() -> std::process::ExitCode {
     if let Err(e) = std::fs::write(output, &out.bytes) {
         eprintln!("{output}: {e}");
         return std::process::ExitCode::FAILURE;
+    }
+    for d in &opened.dropped {
+        println!("dropped: {d}");
     }
     for l in &out.lost {
         println!("lost: {l}");

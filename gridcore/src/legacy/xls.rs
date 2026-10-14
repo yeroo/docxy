@@ -2,20 +2,25 @@
 //! `Workbook` stream ([MS-XLS]).
 //!
 //! The globals substream gives the sheets (BOUNDSHEET8), shared strings
-//! (SST), number formats (FORMAT, XF), the date system (DATEMODE), the
-//! reference tables (SUPBOOK, EXTERNSHEET, EXTERNNAME) and defined names
-//! (NAME). Each worksheet substream gives its cells. Records not listed here
-//! are skipped.
+//! (SST), cell formats (FONT, FORMAT, XF, PALETTE), the date system
+//! (DATEMODE), the reference tables (SUPBOOK, EXTERNSHEET, EXTERNNAME),
+//! defined names (NAME) and the active sheet (WINDOW1). Each worksheet
+//! substream gives its cells, merged cells (MERGECELLS), column widths
+//! (COLINFO), row heights (ROW) and frozen panes (WINDOW2, PANE). Records
+//! not listed here are skipped, and those whose content the import leaves
+//! out (charts, comments, conditional formatting, ...) are named in
+//! [`BookIn::dropped`], as are the formats a cell uses that the model can't
+//! hold (underline, borders other than a thin box, ...).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::ftab;
 use super::ptg::{self, Base, Biff, Names};
 use super::{
-    BookIn, ExternalLink, Le, Limits, OpenError, SheetIn, XfFormats, biff_error, on_grid, rk,
+    BookIn, ExternalLink, Le, Limits, OpenError, SheetIn, biff_error, builtin_format, on_grid, rk,
     set_array, sheet_prefix,
 };
-use crate::sheet::{Cell, CellValue, DefinedName};
+use crate::sheet::{Align, Cell, CellValue, DefinedName, Xf};
 
 /// One record, with any CONTINUE records that follow it appended to `data`.
 /// `breaks` holds the offsets in `data` where each CONTINUE began, which a
@@ -135,8 +140,9 @@ impl<'a> Cur<'a> {
     }
 
     /// `XLUnicodeRichExtendedString` (an SST entry): the text, with its
-    /// formatting runs and phonetic block skipped.
-    fn rich_string(&mut self) -> Option<String> {
+    /// formatting runs and phonetic block skipped; `rich` is set when it has
+    /// runs.
+    fn rich_string(&mut self, rich: &mut bool) -> Option<String> {
         let cch = self.u16()? as usize;
         let flags = self.u8()?;
         let runs = if flags & 0x08 != 0 {
@@ -144,6 +150,7 @@ impl<'a> Cur<'a> {
         } else {
             0
         };
+        *rich |= runs > 0;
         let ext = if flags & 0x04 != 0 {
             self.u32()? as usize
         } else {
@@ -286,6 +293,158 @@ fn builtin_name(code: u8) -> String {
 const BOF: u16 = 0x0809;
 const EOF: u16 = 0x000A;
 
+/// A FONT record's fields the import reads.
+struct FontIn {
+    /// Twips.
+    height: u16,
+    grbit: u16,
+    icv: u16,
+    bls: u16,
+    sss: u16,
+    uls: u8,
+    name: String,
+}
+
+/// The colours of indices 0-7, which no palette changes.
+const FIXED_COLORS: [(u8, u8, u8); 8] = [
+    (0, 0, 0),
+    (0xFF, 0xFF, 0xFF),
+    (0xFF, 0, 0),
+    (0, 0xFF, 0),
+    (0, 0, 0xFF),
+    (0xFF, 0xFF, 0),
+    (0xFF, 0, 0xFF),
+    (0, 0xFF, 0xFF),
+];
+
+/// The workbook's FONT, FORMAT, XF and PALETTE records, made into the
+/// model's cell formats as the cells use them.
+struct Styles {
+    fonts: Vec<FontIn>,
+    /// Each XF record's 20 bytes (a short one padded).
+    xfs: Vec<[u8; 20]>,
+    palette: [(u8, u8, u8); 56],
+    codes: HashMap<u16, String>,
+    /// XF index → `book.xfs` index, for the XFs made so far.
+    made: HashMap<u16, u32>,
+}
+
+impl Styles {
+    /// The colour of palette index `icv`; `None` for the automatic and
+    /// system colours.
+    fn rgb(&self, icv: u16) -> Option<(u8, u8, u8)> {
+        match icv {
+            0..=7 => Some(FIXED_COLORS[icv as usize]),
+            8..=63 => Some(self.palette[icv as usize - 8]),
+            _ => None,
+        }
+    }
+
+    /// The `book.xfs` index of XF `ixfe`, made the first time a cell uses
+    /// it. An XF the model can't hold all of is held as near as it can, and
+    /// what it lacks is named in `book.dropped`.
+    fn of(&mut self, ixfe: u16, book: &mut BookIn) -> u32 {
+        if let Some(&i) = self.made.get(&ixfe) {
+            return i;
+        }
+        let i = match self.xfs.get(ixfe as usize) {
+            Some(raw) => {
+                let xf = self.xf(raw, &mut book.dropped);
+                book.add_xf(xf)
+            }
+            None => 0,
+        };
+        self.made.insert(ixfe, i);
+        i
+    }
+
+    fn xf(&self, b: &[u8; 20], dropped: &mut std::collections::BTreeSet<&'static str>) -> Xf {
+        let u16_at = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
+        let u32_at = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        let mut xf = Xf::default();
+        let ifmt = u16_at(2);
+        let code = self
+            .codes
+            .get(&ifmt)
+            .cloned()
+            .or_else(|| builtin_format(ifmt as u32))
+            .filter(|c| !c.eq_ignore_ascii_case("General"));
+        if code.is_some() {
+            xf.set_code(code);
+        }
+        // Index 4 doesn't exist: the 5th FONT record is font 5.
+        let ifnt = u16_at(0) as usize;
+        let font = match ifnt {
+            4 => None,
+            i if i > 4 => self.fonts.get(i - 1),
+            i => self.fonts.get(i),
+        };
+        if let Some(f) = font {
+            xf.bold = f.bls >= 600;
+            xf.italic = f.grbit & 0x0002 != 0;
+            // Black is the automatic colour as the model sees it.
+            xf.color = self.rgb(f.icv).filter(|&c| c != (0, 0, 0));
+            let size = f.height as f64 / 20.0;
+            xf.font_size = (size != 11.0).then_some(size);
+            xf.font_name = (!f.name.eq_ignore_ascii_case("Calibri")).then(|| f.name.clone());
+            if f.uls != 0 {
+                dropped.insert("underlined text");
+            }
+            if f.grbit & 0x0008 != 0 {
+                dropped.insert("strikethrough");
+            }
+            if f.sss != 0 {
+                dropped.insert("superscript and subscript");
+            }
+        }
+        xf.quote_prefix = u16_at(4) & 0x0008 != 0;
+        xf.align = match b[6] & 0x07 {
+            0 => Align::General,
+            1 => Align::Left,
+            2 => Align::Center,
+            3 => Align::Right,
+            _ => {
+                dropped.insert("horizontal alignment other than left, center or right");
+                Align::General
+            }
+        };
+        xf.wrap = b[6] & 0x08 != 0;
+        if (b[6] >> 4) & 0x07 != 2 {
+            dropped.insert("vertical alignment");
+        }
+        if b[7] != 0 {
+            dropped.insert("rotated text");
+        }
+        if b[8] & 0x0F != 0 {
+            dropped.insert("indented text");
+        }
+        if b[8] & 0x10 != 0 {
+            dropped.insert("shrink to fit");
+        }
+        let dg = u32_at(10);
+        let sides = [dg & 0xF, (dg >> 4) & 0xF, (dg >> 8) & 0xF, (dg >> 12) & 0xF];
+        let more = u32_at(14);
+        let diagonal = dg >> 30 != 0 && (more >> 21) & 0xF != 0;
+        if sides == [1; 4] {
+            xf.border = true;
+        } else if sides != [0; 4] {
+            dropped.insert("borders other than a thin box");
+        }
+        if diagonal {
+            dropped.insert("borders other than a thin box");
+        }
+        let fls = (more >> 26) & 0x3F;
+        let fore = u16_at(18) & 0x7F;
+        if fls >= 1 {
+            xf.fill = self.rgb(fore);
+        }
+        if fls > 1 {
+            dropped.insert("patterned fills");
+        }
+        xf
+    }
+}
+
 /// Read a BIFF8 `Workbook` stream.
 pub(crate) fn read(stream: &[u8]) -> Result<BookIn, OpenError> {
     read_with(stream, Limits::default())
@@ -324,11 +483,18 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
         books: Vec::new(),
         names: Vec::new(),
     };
-    // (stream offset, dt) of each BOUNDSHEET8, in order.
-    let mut plies: Vec<(usize, u8)> = Vec::new();
+    // (stream offset, dt, hidden) of each BOUNDSHEET8, in order.
+    let mut plies: Vec<(usize, u8, bool)> = Vec::new();
     let mut sst: Vec<String> = Vec::new();
-    let mut fmt_codes: HashMap<u16, String> = HashMap::new();
-    let mut xf_fmt: Vec<u16> = Vec::new();
+    let mut rich = false;
+    let mut styles = Styles {
+        fonts: Vec::new(),
+        xfs: Vec::new(),
+        palette: super::xls_write::DEFAULT_PALETTE,
+        codes: HashMap::new(),
+        made: HashMap::new(),
+    };
+    let mut itab_cur = 0usize;
 
     for r in recs.iter().skip(1) {
         if r.ty == EOF {
@@ -342,25 +508,59 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
                 0x0022 => book.date1904 = c.u16()? == 1,
                 0x0085 => {
                     let pos = c.u32()? as usize;
-                    c.u8()?;
+                    let state = c.u8()?;
                     let dt = c.u8()?;
                     g.sheets.push(c.short_string()?);
-                    plies.push((pos, dt));
+                    plies.push((pos, dt, state & 0x03 != 0));
                 }
                 0x00FC => {
                     c.u32()?;
                     let unique = c.u32()? as usize;
                     for _ in 0..unique {
-                        sst.push(c.rich_string()?);
+                        sst.push(c.rich_string(&mut rich)?);
                     }
                 }
                 0x041E => {
                     let id = c.u16()?;
-                    fmt_codes.insert(id, c.xl_string()?);
+                    styles.codes.insert(id, c.xl_string()?);
                 }
                 0x00E0 => {
-                    c.u16()?;
-                    xf_fmt.push(c.u16()?);
+                    let mut raw = [0u8; 20];
+                    let n = r.data.len().min(20);
+                    raw[..n].copy_from_slice(&r.data[..n]);
+                    styles.xfs.push(raw);
+                }
+                0x0031 => {
+                    let height = c.u16()?;
+                    let grbit = c.u16()?;
+                    let icv = c.u16()?;
+                    let bls = c.u16()?;
+                    let sss = c.u16()?;
+                    let uls = c.u8()?;
+                    c.take(3)?;
+                    styles.fonts.push(FontIn {
+                        height,
+                        grbit,
+                        icv,
+                        bls,
+                        sss,
+                        uls,
+                        name: c.short_string()?,
+                    });
+                }
+                0x0092 => {
+                    let n = (c.u16()? as usize).min(56);
+                    for i in 0..n {
+                        let rgb = c.take(4)?;
+                        styles.palette[i] = (rgb[0], rgb[1], rgb[2]);
+                    }
+                }
+                0x003D => {
+                    c.take(10)?;
+                    itab_cur = c.u16()? as usize;
+                }
+                0x0012 if c.u16()? != 0 => {
+                    book.dropped.insert("workbook protection");
                 }
                 // SUPBOOK: the book takes its place before the rest is
                 // read, so a record cut short doesn't shift the books after
@@ -476,10 +676,9 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
         *k = Some(book.external_links.len() - 1);
     }
 
-    let formats = XfFormats {
-        xf_fmt,
-        codes: fmt_codes,
-    };
+    if rich {
+        book.dropped.insert("formatting within cell text");
+    }
 
     // Worksheets, in BOUNDSHEET8 order; `imported[i]` is the model index
     // of BOUNDSHEET8 `i`, for sheet-scoped names.
@@ -488,22 +687,30 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
     // A substream two BOUNDSHEET8s point at is read once (a crafted file
     // could otherwise multiply one sheet's cells by its sheet count).
     let mut seen: HashSet<usize> = HashSet::new();
-    for (i, &(pos, dt)) in plies.iter().enumerate() {
+    for (i, &(pos, dt, hidden)) in plies.iter().enumerate() {
         let start = index.get(&pos).copied().filter(|_| seen.insert(pos));
         let is_sheet = dt == 0
             && start
                 .and_then(|s| recs[s].data.get(2..4))
                 .is_some_and(|d| u16::from_le_bytes([d[0], d[1]]) == 0x0010);
         let (Some(start), true) = (start, is_sheet) else {
+            book.dropped.insert(match dt {
+                0x01 => "Excel 4.0 macro sheets",
+                0x02 => "chart sheets",
+                0x06 => "VB modules",
+                _ => "sheets that are not worksheets",
+            });
             imported.push(None);
             continue;
         };
-        let sheet = read_sheet(&recs[start + 1..], &g, &sst, &mut book, &formats)?;
+        let mut sheet = read_sheet(&recs[start + 1..], &g, &sst, &mut book, &mut styles)?;
+        if i == itab_cur {
+            book.active = book.sheets.len();
+        }
         imported.push(Some(book.sheets.len()));
-        book.push_sheet(SheetIn {
-            name: g.sheets[i].clone(),
-            cells: sheet,
-        })?;
+        sheet.name = g.sheets[i].clone();
+        sheet.hidden = hidden;
+        book.push_sheet(sheet)?;
     }
 
     for n in &g.names {
@@ -545,14 +752,17 @@ struct Pending {
 /// data.
 type Group = ((u32, u32, u32, u32), Vec<u8>, Vec<u8>);
 
-/// One worksheet substream (the records after its BOF) to cells.
+/// One worksheet substream (the records after its BOF) to a sheet: its
+/// cells and layout.
 fn read_sheet(
     recs: &[Rec],
     g: &Globals,
     sst: &[String],
     book: &mut BookIn,
-    formats: &XfFormats,
-) -> Result<BTreeMap<(u32, u32), Cell>, OpenError> {
+    styles: &mut Styles,
+) -> Result<SheetIn, OpenError> {
+    let mut sheet = SheetIn::default();
+    let mut frozen = false;
     let mut cells = BTreeMap::new();
     // Cells charged to the workbook's budget so far.
     let mut charged = 0usize;
@@ -568,12 +778,12 @@ fn read_sheet(
     // Array formulas: anchor → (range, rgce, extra).
     let mut arrays: HashMap<(u32, u32), Group> = HashMap::new();
 
-    let put = |cells: &mut BTreeMap<(u32, u32), Cell>,
-               r: u16,
-               c: u16,
-               ixfe: u16,
-               value: CellValue,
-               book: &mut BookIn| {
+    let mut put = |cells: &mut BTreeMap<(u32, u32), Cell>,
+                   r: u16,
+                   c: u16,
+                   ixfe: u16,
+                   value: CellValue,
+                   book: &mut BookIn| {
         if !on_grid(r as u32, c as u32) {
             return;
         }
@@ -581,7 +791,7 @@ fn read_sheet(
             (r as u32, c as u32),
             Cell {
                 value,
-                style: formats.format_of(ixfe.into(), book),
+                style: styles.of(ixfe, book),
                 ..Cell::default()
             },
         );
@@ -595,6 +805,7 @@ fn read_sheet(
         match r.ty {
             BOF => {
                 depth += 1;
+                book.dropped.insert("pictures, shapes and charts");
                 continue;
             }
             EOF if depth > 0 => {
@@ -736,6 +947,95 @@ fn read_sheet(
                     let rgce = c.take(cce)?.to_vec();
                     arrays.insert((range.0, range.2), (range, rgce, c.rest().to_vec()));
                 }
+                0x00E5 => {
+                    let n = c.u16()?;
+                    for _ in 0..n {
+                        let (r1, r2, c1, c2) = (c.u16()?, c.u16()?, c.u16()?, c.u16()?);
+                        let (r1, r2, c1, c2) = (r1 as u32, r2 as u32, c1 as u32, c2 as u32);
+                        if r2 >= r1 && c2 >= c1 && on_grid(r2, c2) {
+                            sheet.merges.push((r1, c1, r2, c2));
+                        }
+                    }
+                }
+                0x007D => {
+                    let (first, last, coldx) = (c.u16()?, c.u16()?, c.u16()?);
+                    c.u16()?;
+                    let grbit = c.u16()?;
+                    let hidden = grbit & 0x0001 != 0;
+                    let width = (grbit & 0x0002 != 0).then_some(coldx as f64 / 256.0);
+                    if grbit & 0x0700 != 0 {
+                        book.dropped.insert("outlines (grouped rows and columns)");
+                    }
+                    let last = (last as u32).min(crate::sheet::MAX_COLS - 1);
+                    if (width.is_some() || hidden) && first as u32 <= last {
+                        sheet.cols.push((first as u32, last, width, hidden));
+                    }
+                }
+                0x0208 => {
+                    let row = c.u16()?;
+                    c.take(4)?;
+                    let miy = c.u16()?;
+                    c.take(4)?;
+                    let grbit = c.u16()?;
+                    let hidden = grbit & 0x0020 != 0;
+                    let height = (grbit & 0x0040 != 0).then_some((miy & 0x7FFF) as f64 / 20.0);
+                    if grbit & 0x0007 != 0 {
+                        book.dropped.insert("outlines (grouped rows and columns)");
+                    }
+                    if height.is_some() || hidden {
+                        sheet.rows.push((row as u32, height, hidden));
+                    }
+                }
+                0x023E => frozen = c.u16()? & 0x0008 != 0,
+                0x0041 if frozen => {
+                    let (x, y) = (c.u16()?, c.u16()?);
+                    sheet.freeze = (y as u32, x as u32);
+                }
+                0x005D | 0x00EC => {
+                    book.dropped.insert("pictures, shapes and charts");
+                }
+                0x001C => {
+                    book.dropped.insert("comments");
+                }
+                0x01B0 | 0x01B1 | 0x0879 | 0x087A => {
+                    book.dropped.insert("conditional formatting");
+                }
+                0x01B2 | 0x01BE => {
+                    book.dropped.insert("data validation");
+                }
+                0x01B8 => {
+                    book.dropped.insert("hyperlinks");
+                }
+                0x009D => {
+                    book.dropped.insert("AutoFilter");
+                }
+                0x0236 => {
+                    book.dropped.insert("data tables");
+                }
+                0x0012 if c.u16()? != 0 => {
+                    book.dropped.insert("sheet protection");
+                }
+                0x001A | 0x001B if c.u16()? != 0 => {
+                    book.dropped.insert("page breaks");
+                }
+                0x0014 | 0x0015 if !r.data.is_empty() => {
+                    book.dropped.insert("page setup");
+                }
+                0x0081 if c.u16()? & 0x0100 != 0 => {
+                    book.dropped.insert("page setup");
+                }
+                0x00A1 => {
+                    c.u16()?;
+                    let scale = c.u16()?;
+                    c.take(6)?;
+                    let grbit = c.u16()?;
+                    // fPortrait off is landscape, unless fNoPls or
+                    // fNoOrient says there is no orientation.
+                    let landscape = grbit & 0x0046 == 0;
+                    if (scale != 100 && grbit & 0x0004 == 0) || landscape {
+                        book.dropped.insert("page setup");
+                    }
+                }
                 _ => {}
             }
             Some(())
@@ -773,7 +1073,8 @@ fn read_sheet(
             }
         }
     }
-    Ok(cells)
+    sheet.cells = cells;
+    Ok(sheet)
 }
 
 /// A `RefU`: rwFirst, rwLast (16-bit), colFirst, colLast (8-bit), as
@@ -1210,6 +1511,85 @@ pub(crate) mod tests {
         assert_eq!(c.len(), 2);
     }
 
+    /// An XF record: font, format, alignment byte, border word, fill.
+    fn xf_rec(ifnt: u16, align: u8, dg: u32, fill: u32) -> Vec<u8> {
+        let mut b = ifnt.to_le_bytes().to_vec();
+        b.extend([0, 0, 1, 0, align, 0, 0, 0xFC]);
+        b.extend(dg.to_le_bytes());
+        b.extend(fill.to_le_bytes());
+        b.extend([0x40, 0x20]);
+        rec(0x00E0, &b)
+    }
+
+    fn font_rec(bls: u16, uls: u8, grbit: u16) -> Vec<u8> {
+        let mut b = 220u16.to_le_bytes().to_vec();
+        b.extend(grbit.to_le_bytes());
+        b.extend(0x7FFFu16.to_le_bytes());
+        b.extend(bls.to_le_bytes());
+        b.extend([0, 0, uls, 0, 0, 0]);
+        b.extend(short("Calibri"));
+        rec(0x0031, &b)
+    }
+
+    /// What the model can't hold of a cell's format is named, only for the
+    /// formats cells use; what it can is read.
+    #[test]
+    fn formats_the_model_lacks_are_dropped_by_name() {
+        let fonts: Vec<Vec<u8>> = vec![
+            font_rec(400, 0, 0),
+            font_rec(400, 0, 0),
+            font_rec(400, 0, 0),
+            font_rec(400, 0, 0),
+            // Font 5: bold, underlined, struck through.
+            font_rec(700, 1, 0x0008),
+        ];
+        let mut globals = fonts;
+        // XF 0: plain. XF 1: font 5, centred, wrap, top-aligned, bottom
+        // border only, a gray-50% pattern. XF 2: an unused format with
+        // rotated text.
+        globals.push(xf_rec(0, 0x20, 0, 0));
+        globals.push(xf_rec(5, 0x02 | 0x08, 0x1000, 2 << 26));
+        let mut rot = xf_rec(0, 0x20, 0, 0);
+        rot[4 + 7] = 45;
+        globals.push(rot);
+        let mut d = cell(0, 0, 1);
+        d.extend(1.0f64.to_le_bytes());
+        let stream = workbook(&globals, &[rec(0x0203, &d), rec(0x001C, &[0; 12])]);
+        let book = read(&stream).unwrap();
+        let xf = &book.xfs[data(&book)[&(0, 0)].style as usize];
+        assert!(xf.bold && xf.wrap && !xf.border);
+        assert_eq!(xf.align, Align::Center);
+        assert_eq!(
+            book.dropped.iter().copied().collect::<Vec<_>>(),
+            [
+                "borders other than a thin box",
+                "comments",
+                "patterned fills",
+                "strikethrough",
+                "underlined text",
+                "vertical alignment"
+            ]
+        );
+    }
+
+    /// An embedded chart, and a VBA project's storage beside the stream.
+    #[test]
+    fn charts_and_vba_projects_are_dropped_by_name() {
+        let stream = workbook(&[], &[bof(0x0020), rec(EOF, &[])]);
+        let cfb = opccore::cfb::write_cfb_tree(&[
+            opccore::cfb::Node::Stream("Workbook", stream),
+            opccore::cfb::Node::Storage(
+                "_VBA_PROJECT_CUR",
+                vec![opccore::cfb::Node::Stream("PROJECT", vec![1, 2, 3])],
+            ),
+        ]);
+        let opened = crate::legacy::open_workbook_ex(&cfb).unwrap();
+        assert_eq!(
+            opened.dropped,
+            ["VB project", "pictures, shapes and charts"]
+        );
+    }
+
     #[test]
     fn formats_names_and_date_mode() {
         // DATEMODE 1904, a custom format 164 on XF 1, a global name and a
@@ -1248,7 +1628,7 @@ pub(crate) mod tests {
         let book = read(&stream).unwrap();
         assert!(book.date1904);
         let style = data(&book)[&(0, 0)].style;
-        assert_eq!(book.formats[style as usize], "yyyy-mm-dd");
+        assert_eq!(book.xfs[style as usize].code.as_deref(), Some("yyyy-mm-dd"));
         assert_eq!(book.names.len(), 1);
         assert_eq!(book.names[0].name, "TaxRate");
         assert_eq!(book.names[0].formula, "0.21");

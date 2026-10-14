@@ -1810,6 +1810,121 @@ mod tests {
         assert!(check_xls(&wrap(s)).unwrap_err().contains("4096"));
     }
 
+    /// A workbook with one number cell styled `xf`, written and read back:
+    /// the cell's format as read.
+    fn format_round_trip(xf: Xf) -> Xf {
+        let mut pkg = book(&[(0, 0, Cell::number(1.0))]);
+        let style = pkg.workbook.styles.intern(xf);
+        pkg.workbook.sheets[0].cells.get_mut(&(0, 0)).unwrap().style = style;
+        let (back, lost) = round(&pkg);
+        assert!(lost.is_empty(), "{lost:?}");
+        let wb = &back.workbook;
+        wb.styles.xf(wb.sheets[0].cells[&(0, 0)].style)
+    }
+
+    #[test]
+    fn fonts_round_trip() {
+        let mut xf = Xf::default();
+        xf.bold = true;
+        xf.italic = true;
+        xf.font_size = Some(14.0);
+        xf.font_name = Some("Arial".into());
+        xf.color = Some((0xFF, 0, 0));
+        let got = format_round_trip(xf.clone());
+        assert_eq!(
+            (
+                got.bold,
+                got.italic,
+                got.font_size,
+                got.font_name,
+                got.color
+            ),
+            (
+                true,
+                true,
+                Some(14.0),
+                Some("Arial".into()),
+                Some((0xFF, 0, 0))
+            )
+        );
+        // The default font reads back as the default.
+        assert_eq!(format_round_trip(Xf::default()), Xf::default());
+    }
+
+    #[test]
+    fn fills_and_a_custom_palette_round_trip() {
+        let mut xf = Xf::default();
+        xf.fill = Some((0xFF, 0xFF, 0x00));
+        assert_eq!(format_round_trip(xf.clone()).fill, Some((0xFF, 0xFF, 0x00)));
+        // A colour the default palette lacks takes a slot of a PALETTE.
+        xf.fill = Some((0x12, 0x34, 0x56));
+        xf.color = Some((0xAB, 0xCD, 0xEF));
+        let got = format_round_trip(xf);
+        assert_eq!(
+            (got.fill, got.color),
+            (Some((0x12, 0x34, 0x56)), Some((0xAB, 0xCD, 0xEF)))
+        );
+    }
+
+    #[test]
+    fn alignment_wrap_border_quote_prefix_and_number_format_round_trip() {
+        for align in [Align::Left, Align::Center, Align::Right, Align::General] {
+            let mut xf = Xf::default();
+            xf.align = align;
+            xf.wrap = true;
+            xf.border = true;
+            xf.quote_prefix = true;
+            xf.set_code(Some("0.000%".into()));
+            let got = format_round_trip(xf);
+            assert_eq!(
+                (
+                    got.align,
+                    got.wrap,
+                    got.border,
+                    got.quote_prefix,
+                    got.code.as_deref()
+                ),
+                (align, true, true, true, Some("0.000%"))
+            );
+        }
+        // A built-in format is written as its id.
+        let mut xf = Xf::default();
+        xf.set_code(Some("0.00%".into()));
+        assert_eq!(format_round_trip(xf).code.as_deref(), Some("0.00%"));
+    }
+
+    #[test]
+    fn merges_widths_heights_hidden_and_panes_round_trip() {
+        let mut pkg = book(&[(0, 0, Cell::text("a")), (5, 5, Cell::number(2.0))]);
+        {
+            let s = &mut pkg.workbook.sheets[0];
+            s.merges.push((0, 0, 1, 2));
+            s.set_col_width(3, 20.5);
+            s.set_col_hidden(4, true);
+            s.set_row_height(2, Some(30.0));
+            s.set_row_hidden(3, true);
+            s.freeze = (1, 2);
+        }
+        pkg.workbook.sheets[1].hidden = true;
+        pkg.workbook.active_tab = 0;
+        let (back, _) = round(&pkg);
+        let s = &back.workbook.sheets[0];
+        assert_eq!(s.merges, [(0, 0, 1, 2)]);
+        assert_eq!(s.col_width(3), 20.5);
+        assert!(s.col_hidden(4) && !s.col_hidden(3));
+        assert_eq!(s.row_height(2), Some(30.0));
+        assert!(s.row_hidden(3) && !s.row_hidden(2));
+        assert_eq!(s.freeze, (1, 2));
+        assert!(back.workbook.sheets[1].hidden);
+        // Only rows frozen, and the second sheet active.
+        pkg.workbook.sheets[0].freeze = (3, 0);
+        pkg.workbook.sheets[1].hidden = false;
+        pkg.workbook.active_tab = 1;
+        let (back, _) = round(&pkg);
+        assert_eq!(back.workbook.sheets[0].freeze, (3, 0));
+        assert_eq!(back.workbook.active_tab, 1);
+    }
+
     /// The offset of the first record of type `ty`.
     fn find(s: &[u8], ty: u16) -> usize {
         let mut at = 0;

@@ -7,8 +7,15 @@
 //! [`SheetPackage`] (as `new_xlsx` makes one) with the sheets, values, formulas,
 //! number formats, date system, defined names and the external links that
 //! calls to add-in functions need (`.xlsb`, `.xls`), so everything downstream
-//! (engine, editor, save) sees an ordinary workbook and saving writes
-//! `.xlsx`. Nothing the readers don't model survives the import.
+//! (engine, editor, save) sees an ordinary workbook. Nothing the readers don't
+//! model survives the import. The `.xls` reader also reads the formatting the
+//! model holds (fonts, fills, alignment, wrap, borders, merged cells, column
+//! widths, row heights, hidden rows, columns and sheets, frozen panes), and
+//! names what it skipped ([`Opened::dropped`]).
+//!
+//! An `.xls` can be written back too ([`write_xls`], #874): a host in
+//! Excel's Compatibility Mode saves the workbook as BIFF8 again, and names
+//! what the file can't hold ([`XlsOut::lost`]) before it does.
 //!
 //! The readers are lenient: a record or token they don't understand is
 //! skipped, and a formula they can't decompile keeps its cached value and
@@ -27,7 +34,7 @@ mod xls;
 mod xls_write;
 mod xlsb;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub use xls_write::{XlsOut, check_xls, write_xls};
 
@@ -114,6 +121,27 @@ const ODS_MIMETYPE: &str = "application/vnd.oasis.opendocument.spreadsheet";
 /// with `xl/workbook.bin` is `.xlsb`, a ZIP whose `mimetype` is ODF
 /// spreadsheet is `.ods`, and anything else goes to [`load_xlsx`] unchanged.
 pub fn open_workbook(data: &[u8]) -> Result<(SheetPackage, SourceFormat), OpenError> {
+    open_workbook_ex(data).map(|o| (o.pkg, o.format))
+}
+
+/// A workbook [`open_workbook_ex`] read.
+pub struct Opened {
+    pub pkg: SheetPackage,
+    pub format: SourceFormat,
+    /// What the file has that the import left out, one entry per kind, in
+    /// words for a "will be lost" list (`comments`, `underlined text`,
+    /// ...), sorted. Only the `.xls` reader names them; empty for the other
+    /// formats.
+    pub dropped: Vec<String>,
+}
+
+/// [`open_workbook`], with what the import left out.
+pub fn open_workbook_ex(data: &[u8]) -> Result<Opened, OpenError> {
+    let opened = |pkg, format| Opened {
+        pkg,
+        format,
+        dropped: Vec::new(),
+    };
     if data.len() >= 8 && data[..8] == OLE2 {
         let cfb = opccore::cfb::Cfb::open(data).map_err(OpenError::Corrupt)?;
         let names = cfb.stream_names();
@@ -125,20 +153,33 @@ pub fn open_workbook(data: &[u8]) -> Result<(SheetPackage, SourceFormat), OpenEr
             .iter()
             .find_map(|n| cfb.read_stream(n))
             .ok_or(OpenError::NotSpreadsheet)?;
-        return Ok((xls::read(&stream)?.build(), SourceFormat::Xls));
+        let mut book = xls::read(&stream)?;
+        if cfb
+            .paths()
+            .iter()
+            .any(|p| p.to_ascii_lowercase().starts_with("_vba_project_cur"))
+        {
+            book.dropped.insert("VB project");
+        }
+        let dropped = book.dropped.iter().map(|d| d.to_string()).collect();
+        return Ok(Opened {
+            pkg: book.build(),
+            format: SourceFormat::Xls,
+            dropped,
+        });
     }
     if let Some(zip) = opccore::zip::ZipArchive::open(data) {
         if zip.find("xl/workbook.bin").is_some() {
-            return Ok((xlsb::read(&zip)?.build(), SourceFormat::Xlsb));
+            return Ok(opened(xlsb::read(&zip)?.build(), SourceFormat::Xlsb));
         }
         if let Some(mime) = zip.read("mimetype") {
             if String::from_utf8_lossy(&mime).trim() == ODS_MIMETYPE {
-                return Ok((ods::read(&zip)?.build(), SourceFormat::Ods));
+                return Ok(opened(ods::read(&zip)?.build(), SourceFormat::Ods));
             }
         }
     }
     load_xlsx(data)
-        .map(|pkg| (pkg, SourceFormat::Xlsx))
+        .map(|pkg| opened(pkg, SourceFormat::Xlsx))
         .map_err(OpenError::Xlsx)
 }
 
@@ -179,8 +220,18 @@ impl Default for Limits {
 pub(crate) struct SheetIn {
     pub name: String,
     /// 0-based (row, col) → cell; `Cell::style` here is an index into
-    /// [`BookIn::formats`], not yet into the workbook's styles.
+    /// [`BookIn::xfs`], not yet into the workbook's styles.
     pub cells: BTreeMap<(u32, u32), Cell>,
+    /// Merged ranges (r1, c1, r2, c2).
+    pub merges: Vec<(u32, u32, u32, u32)>,
+    /// Column definitions: (first, last, width in characters when set,
+    /// hidden).
+    pub cols: Vec<(u32, u32, Option<f64>, bool)>,
+    /// Rows: (row, height in points when set, hidden).
+    pub rows: Vec<(u32, Option<f64>, bool)>,
+    /// Frozen rows and columns.
+    pub freeze: (u32, u32),
+    pub hidden: bool,
 }
 
 /// Another workbook or add-in whose names formulas call, as `[k]!NAME`
@@ -204,11 +255,15 @@ pub(crate) struct ExternalLink {
 #[derive(Debug, Default)]
 pub(crate) struct BookIn {
     pub sheets: Vec<SheetIn>,
-    /// Number-format codes the cells' `style` indices name; index 0 is
-    /// always General.
-    pub formats: Vec<String>,
-    /// `formats` by code.
+    /// The cell formats the cells' `style` indices name; index 0 is always
+    /// the default (General).
+    pub xfs: Vec<Xf>,
+    /// The `xfs` that are a number format alone, by code.
     format_ix: HashMap<String, u32>,
+    /// What the file has that the import leaves out ([`Opened::dropped`]).
+    pub dropped: BTreeSet<&'static str>,
+    /// The sheet the workbook opens on (an index into `sheets`).
+    pub active: usize,
     pub names: Vec<DefinedName>,
     /// The external books formulas name, `[1]` first.
     pub external_links: Vec<ExternalLink>,
@@ -228,13 +283,13 @@ impl BookIn {
 
     pub fn with_limits(limits: Limits) -> BookIn {
         BookIn {
-            formats: vec!["General".to_string()],
+            xfs: vec![Xf::default()],
             limits,
             ..BookIn::default()
         }
     }
 
-    /// The `formats` index of `code`, added when new.
+    /// The `xfs` index of number format `code` alone, added when new.
     pub fn format_index(&mut self, code: &str) -> u32 {
         if code.eq_ignore_ascii_case("General") || code.is_empty() {
             return 0;
@@ -242,10 +297,20 @@ impl BookIn {
         if let Some(&i) = self.format_ix.get(code) {
             return i;
         }
-        self.formats.push(code.to_string());
-        let i = (self.formats.len() - 1) as u32;
+        let mut xf = Xf::default();
+        xf.set_code(Some(code.to_string()));
+        let i = self.add_xf(xf);
         self.format_ix.insert(code.to_string(), i);
         i
+    }
+
+    /// The `xfs` index of a new cell format `xf` (0 for the default).
+    pub fn add_xf(&mut self, xf: Xf) -> u32 {
+        if xf == Xf::default() {
+            return 0;
+        }
+        self.xfs.push(xf);
+        (self.xfs.len() - 1) as u32
     }
 
     /// Start a new sheet, unless the workbook already has as many as
@@ -328,23 +393,46 @@ impl BookIn {
             Some(crate::formula::file_formula(&f).into_owned())
         };
         let mut pkg = crate::xlsx::new_xlsx_sheets(&names);
-        // Each format code becomes an xf (the codes are distinct, so none
-        // needs interning); General stays the default xf 0.
-        let mut xf_of = vec![0u32; self.formats.len()];
-        for (i, code) in self.formats.iter().enumerate().skip(1) {
-            let mut xf = Xf::default();
-            xf.set_code(Some(code.clone()));
+        // Each cell format becomes an xf (the readers made each one once);
+        // the default stays xf 0.
+        let mut xf_of = vec![0u32; self.xfs.len()];
+        for (i, xf) in self.xfs.into_iter().enumerate().skip(1) {
             pkg.workbook.styles.xfs.push(xf);
             xf_of[i] = (pkg.workbook.styles.xfs.len() - 1) as u32;
         }
         for (at, sheet) in self.sheets.into_iter().enumerate() {
-            let cells = &mut pkg.workbook.sheets[at].cells;
+            let s = &mut pkg.workbook.sheets[at];
             for (key, mut cell) in sheet.cells {
                 cell.style = xf_of.get(cell.style as usize).copied().unwrap_or(0);
                 cell.formula = cell.formula.take().and_then(|f| fix(f, false));
-                cells.insert(key, cell);
+                s.cells.insert(key, cell);
             }
+            s.merges = sheet.merges;
+            for (first, last, width, hidden) in sheet.cols {
+                s.col_defs.push(crate::sheet::ColDef {
+                    min: first,
+                    max: last,
+                    width,
+                    attrs: if hidden {
+                        crate::sheet::with_xml_attr("", "hidden", Some("1"))
+                    } else {
+                        String::new()
+                    },
+                    default_width: width.is_none(),
+                });
+            }
+            for (row, height, hidden) in sheet.rows {
+                if height.is_some() {
+                    s.set_row_height(row, height);
+                }
+                if hidden {
+                    s.set_row_hidden(row, true);
+                }
+            }
+            s.freeze = sheet.freeze;
+            s.hidden = sheet.hidden;
         }
+        pkg.workbook.active_tab = self.active.min(pkg.workbook.sheets.len() - 1);
         for mut name in self.names {
             let Some(formula) = fix(name.formula, true) else {
                 continue;
@@ -974,6 +1062,7 @@ mod tests {
         let sheet = |name: &str, cells: Vec<((u32, u32), Cell)>| SheetIn {
             name: name.to_string(),
             cells: cells.into_iter().collect(),
+            ..SheetIn::default()
         };
         let num = |v: f64| Cell {
             value: CellValue::Number(v),
@@ -1082,6 +1171,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            ..SheetIn::default()
         })
         .unwrap();
         for (name, formula) in [
@@ -1160,6 +1250,7 @@ mod tests {
             book.push_sheet(SheetIn {
                 name: name.to_string(),
                 cells: cells.into_iter().collect(),
+                ..SheetIn::default()
             })
             .unwrap();
         }
