@@ -28,8 +28,9 @@ pub struct XlsOut {
     /// The compound file.
     pub bytes: Vec<u8>,
     /// What the workbook has that the file lacks, one entry per kind, in
-    /// words for a "will be lost" list ("3 formulas that refer past row
-    /// 65,536 or column IV (saved as values)"). Empty when nothing is lost.
+    /// words for a "will be lost" list ("3 formulas with references past
+    /// row 65,536 or column IV (saved as values)"). Empty when nothing is
+    /// lost.
     pub lost: Vec<String>,
 }
 
@@ -108,6 +109,17 @@ pub(crate) const DEFAULT_PALETTE: [(u8, u8, u8); 56] = [
     (0x33, 0x33, 0x33),
 ];
 
+/// The built-in number formats an `.xls` names by id: the fixed ones (0-4,
+/// 9-22, 37-40, 45-49) and the currency and accounting ones Excel writes a
+/// FORMAT record for (5-8, 41-44). The others (23-36, 50-58) depend on the
+/// locale with no record, so a code that matches one is written as a
+/// custom format.
+const BUILTIN_FORMAT_IDS: [u16; 36] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 37, 38, 39,
+    40, 41, 42, 43, 44, 45, 46, 47, 48, 49,
+];
+const LOCALE_FORMAT_IDS: [u16; 8] = [5, 6, 7, 8, 41, 42, 43, 44];
+
 /// The automatic (window text) colour index.
 const ICV_AUTO: u16 = 0x7FFF;
 
@@ -178,7 +190,7 @@ impl Loss {
 pub fn write_xls(pkg: &SheetPackage) -> XlsOut {
     let wb = &pkg.workbook;
     let mut lost: BTreeMap<Loss, usize> = BTreeMap::new();
-    let styles = StyleTable::new(wb, &mut lost);
+    let styles = StyleTable::new(wb, &loaded_extras(pkg), &mut lost);
     let mut refs = Refs::new(pkg);
 
     // Defined names first: their NAME records come first, so the indices
@@ -271,7 +283,7 @@ fn unsupported_features(pkg: &SheetPackage) -> Vec<String> {
     if any(&|s| s.max_row_outline() > 0 || s.max_col_outline() > 0) {
         out.push("outlines (grouped rows and columns)");
     }
-    let used: std::collections::HashSet<u32> = wb
+    let used: std::collections::BTreeSet<u32> = wb
         .sheets
         .iter()
         .flat_map(|s| s.cells.values().map(|c| c.style))
@@ -281,6 +293,36 @@ fn unsupported_features(pkg: &SheetPackage) -> Vec<String> {
         x.fill_unresolved || x.color_unresolved
     }) {
         out.push("theme colors");
+    }
+    // What a loaded .xlsx format has beyond the model's xf (its border,
+    // underline, vertical alignment, ...), which the .xlsx writer keeps
+    // through `Xf::loaded_from` and this writer can't.
+    let extras = loaded_extras(pkg);
+    for &i in &used {
+        let Some(e) = wb
+            .styles
+            .xf(i)
+            .loaded_from
+            .and_then(|k| extras.get(k as usize))
+        else {
+            continue;
+        };
+        for &what in &e.lost {
+            if !out.contains(&what) {
+                out.push(what);
+            }
+        }
+    }
+    // A column's or row's own format (`<col style>`, `<row s>`).
+    if any(&|s| {
+        s.col_defs
+            .iter()
+            .any(|d| crate::sheet::xml_attr(&d.attrs, "style").is_some_and(|v| v != "0"))
+            || s.row_attrs
+                .values()
+                .any(|a| crate::sheet::xml_attr(a, "s").is_some_and(|v| v != "0"))
+    }) {
+        out.push("column and row formats");
     }
     // The .xls gets no property-set streams (#874 follow-up).
     let p = pkg.doc_properties();
@@ -342,6 +384,14 @@ fn custom_page_setup(p: &crate::print::setup::PageSetup) -> bool {
         || p.h_centered
         || p.v_centered
         || text
+}
+
+/// What each loaded `<cellXfs>` entry of the package's styles part has
+/// beyond the model's xf ([`crate::xlsx::loaded_xf_extras`]).
+fn loaded_extras(pkg: &SheetPackage) -> Vec<crate::xlsx::LoadedXfExtras> {
+    pkg.part("xl/styles.xml")
+        .map(|b| crate::xlsx::loaded_xf_extras(&String::from_utf8_lossy(b)))
+        .unwrap_or_default()
 }
 
 // ---- records ----------------------------------------------------------------
@@ -451,7 +501,11 @@ struct StyleTable {
 }
 
 impl StyleTable {
-    fn new(wb: &Workbook, lost: &mut BTreeMap<Loss, usize>) -> StyleTable {
+    fn new(
+        wb: &Workbook,
+        extras: &[crate::xlsx::LoadedXfExtras],
+        lost: &mut BTreeMap<Loss, usize>,
+    ) -> StyleTable {
         let model = &wb.styles.xfs;
         let default = Font::of(&Xf::default());
         // Fonts 0-3 are the default font, as Excel writes them; 4 is never
@@ -492,14 +546,24 @@ impl StyleTable {
             want(x.fill);
             let ifmt = match x.code.as_deref() {
                 None => 0,
-                Some(code) => match (0..164u16)
+                Some(code) => match BUILTIN_FORMAT_IDS
+                    .iter()
+                    .copied()
                     .find(|&id| crate::numfmt::builtin_code(id as u32).is_some_and(|b| b == code))
                 {
-                    Some(id) => id,
+                    // The currency and accounting formats depend on the
+                    // locale, so Excel writes a FORMAT record for them,
+                    // keeping the id; the rest are fixed.
+                    Some(id) => {
+                        if LOCALE_FORMAT_IDS.contains(&id) && !formats.iter().any(|f| f.0 == id) {
+                            formats.push((id, code.to_string()));
+                        }
+                        id
+                    }
                     None => match formats.iter().find(|(_, c)| c == code) {
                         Some((id, _)) => *id,
                         None => {
-                            let id = 164 + formats.len() as u16;
+                            let id = 164 + formats.iter().filter(|f| f.0 >= 164).count() as u16;
                             formats.push((id, code.to_string()));
                             id
                         }
@@ -507,7 +571,14 @@ impl StyleTable {
                 },
             };
             xf_of.push((STYLE_XFS + xfs.len()) as u16);
-            xfs.push((ifnt, ifmt, x.clone()));
+            // A loaded .xlsx format whose border is a thin box (which the
+            // .xlsx writer keeps through `loaded_from`) has the .xls one.
+            let mut x = x.clone();
+            x.border |= x
+                .loaded_from
+                .and_then(|k| extras.get(k as usize))
+                .is_some_and(|e| e.thin_box);
+            xfs.push((ifnt, ifmt, x));
         }
         if xfs.is_empty() {
             xfs.push((0, 0, Xf::default()));
@@ -2374,6 +2445,117 @@ mod tests {
             at += 4 + len;
         }
         assert_eq!(bordered, 1);
+    }
+
+    /// A loaded .xlsx format's border, underline and alignment, which the
+    /// model's xf doesn't hold: a thin box is written as the .xls border,
+    /// the rest is named (#874 r8).
+    #[test]
+    fn loaded_xlsx_formats_name_what_the_xls_loses() {
+        let styles = r#"<?xml version="1.0" encoding="UTF-8"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><u/><sz val="11"/><name val="Calibri"/></font></fonts>
+<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>
+<borders count="3"><border><left/><right/><top/><bottom/><diagonal/></border><border><left style="thin"><color indexed="64"/></left><right style="thin"><color indexed="64"/></right><top style="thin"><color indexed="64"/></top><bottom style="thin"><color indexed="64"/></bottom><diagonal/></border><border><left style="thick"/><right/><top/><bottom/><diagonal/></border></borders>
+<cellXfs count="4"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0"/><xf numFmtId="0" fontId="0" fillId="0" borderId="1"/><xf numFmtId="0" fontId="0" fillId="0" borderId="2"><alignment vertical="top"/></xf></cellXfs>
+</styleSheet>"#;
+        let with = |loaded: &[u32]| {
+            let mut pkg = book(&[]);
+            pkg.set_part("xl/styles.xml", styles.as_bytes().to_vec());
+            for (row, &k) in loaded.iter().enumerate() {
+                let style = pkg.workbook.styles.intern(Xf {
+                    loaded_from: Some(k),
+                    ..Xf::default()
+                });
+                pkg.workbook.sheets[0].set_cell(
+                    row as u32,
+                    0,
+                    Cell {
+                        style,
+                        ..Cell::number(1.0)
+                    },
+                );
+            }
+            pkg
+        };
+        assert!(write_xls(&with(&[0])).lost.is_empty());
+        assert_eq!(write_xls(&with(&[1])).lost, ["underlined text"]);
+        assert_eq!(
+            write_xls(&with(&[3])).lost,
+            ["borders other than a thin box", "vertical alignment"]
+        );
+        // The thin box is no loss: it comes back as the cell's border.
+        let pkg = with(&[2]);
+        let (back, lost) = round(&pkg);
+        assert!(lost.is_empty(), "{lost:?}");
+        let wb = &back.workbook;
+        assert!(wb.styles.xf(wb.sheets[0].cells[&(0, 0)].style).border);
+        // A column's or row's own format is named.
+        let mut pkg = book(&[(0, 0, Cell::number(1.0))]);
+        pkg.workbook.sheets[0].col_defs.push(crate::sheet::ColDef {
+            min: 1,
+            max: 1,
+            width: Some(12.0),
+            attrs: " style=\"1\"".into(),
+            default_width: false,
+        });
+        assert_eq!(write_xls(&pkg).lost, ["column and row formats"]);
+        let mut pkg = book(&[(0, 0, Cell::number(1.0))]);
+        pkg.workbook.sheets[0]
+            .row_attrs
+            .insert(0, " s=\"1\" customFormat=\"1\"".into());
+        assert_eq!(write_xls(&pkg).lost, ["column and row formats"]);
+    }
+
+    /// Excel's number formats by id: the fixed ones as the id alone, the
+    /// currency ones (5-8, 41-44) with a FORMAT record keeping the id, and
+    /// custom ones from 164 (#874 r8).
+    #[test]
+    fn number_formats_get_excels_ids_and_records() {
+        let codes = [
+            "0.00%",
+            "\"$\"#,##0_);\\(\"$\"#,##0\\)",
+            "0.0",
+            "_(\"$\"* #,##0_);_(\"$\"* \\(#,##0\\);_(\"$\"* \"-\"_);_(@_)",
+        ];
+        let mut pkg = book(&[]);
+        for (row, code) in codes.iter().enumerate() {
+            let mut xf = Xf::default();
+            xf.set_code(Some(code.to_string()));
+            let style = pkg.workbook.styles.intern(xf);
+            pkg.workbook.sheets[0].set_cell(
+                row as u32,
+                0,
+                Cell {
+                    style,
+                    ..Cell::number(1.0)
+                },
+            );
+        }
+        let out = write_xls(&pkg);
+        check_xls(&out.bytes).unwrap();
+        let cfb = opccore::cfb::Cfb::open(&out.bytes).unwrap();
+        let s = cfb.read_stream("Workbook").unwrap();
+        let mut ids = Vec::new();
+        let mut at = 0;
+        while at + 4 <= s.len() {
+            let ty = u16::from_le_bytes([s[at], s[at + 1]]);
+            let len = u16::from_le_bytes([s[at + 2], s[at + 3]]) as usize;
+            if ty == 0x041E {
+                ids.push(u16::from_le_bytes([s[at + 4], s[at + 5]]));
+            }
+            if ty == 0x000A {
+                break;
+            }
+            at += 4 + len;
+        }
+        assert_eq!(ids, [5, 164, 42]);
+        let (back, _) = round(&pkg);
+        let wb = &back.workbook;
+        for (row, code) in codes.iter().enumerate() {
+            let style = wb.sheets[0].cells[&(row as u32, 0)].style;
+            assert_eq!(wb.styles.xf(style).code.as_deref(), Some(*code));
+        }
     }
 
     /// The offset of the first record of type `ty`.

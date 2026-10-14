@@ -1451,6 +1451,133 @@ fn cell_xf_elements(xml: &str) -> Vec<&str> {
     out
 }
 
+/// What the model's [`Xf`] can't carry of one loaded `<cellXfs>` entry
+/// ([`Xf::loaded_from`]), which an `.xls` written from the package loses,
+/// in the words the `.xls` import names them in.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct LoadedXfExtras {
+    /// What it loses: "underlined text", "borders other than a thin box",
+    /// "vertical alignment", ...
+    pub lost: Vec<&'static str>,
+    /// Its border is a thin box (every side thin, in the automatic colour
+    /// or black), which an `.xls` holds as the model's `border`.
+    pub thin_box: bool,
+}
+
+/// [`LoadedXfExtras`] of each `<cellXfs>` entry of styles part `xml`, by
+/// index.
+pub(crate) fn loaded_xf_extras(xml: &str) -> Vec<LoadedXfExtras> {
+    let section = |name: &str, child: &str| -> Vec<&str> {
+        let Some(start) = xml
+            .find(&format!("<{name}"))
+            .filter(|&s| xml[s + name.len() + 1..].starts_with([' ', '>', '/', '\t', '\r', '\n']))
+        else {
+            return Vec::new();
+        };
+        let part = &xml[start..];
+        element_children(part)
+            .into_iter()
+            .filter(|(n, _, _)| n == child)
+            .map(|(_, s, e)| &part[s..e])
+            .collect()
+    };
+    let (fonts, fills, borders) = (
+        font_elements(xml),
+        section("fills", "fill"),
+        section("borders", "border"),
+    );
+    let open = |raw: &str| raw[..raw.find('>').map_or(raw.len(), |e| e + 1)].to_string();
+    let attr = |raw: &str, name: &str| tag_attr(&open(raw), name).map(str::to_string);
+    let on = |v: Option<String>| v.is_some_and(|v| v != "0" && v != "false");
+    cell_xf_elements(xml)
+        .into_iter()
+        .map(|xf| {
+            let mut lost: Vec<&'static str> = Vec::new();
+            let mut push = |what: &'static str| {
+                if !lost.contains(&what) {
+                    lost.push(what);
+                }
+            };
+            let id = |name: &str| attr(xf, name).and_then(|v| v.parse::<usize>().ok());
+            if let Some(font) = id("fontId").and_then(|i| fonts.get(i)) {
+                for (name, raw) in child_elements(font) {
+                    match name.as_str() {
+                        "u" if attr(&raw, "val").is_none_or(|v| v != "none") => {
+                            push("underlined text")
+                        }
+                        "strike" if attr(&raw, "val").is_none_or(|v| v != "0" && v != "false") => {
+                            push("strikethrough")
+                        }
+                        "vertAlign"
+                            if attr(&raw, "val")
+                                .is_some_and(|v| v == "superscript" || v == "subscript") =>
+                        {
+                            push("superscript and subscript")
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(fill) = id("fillId").and_then(|i| fills.get(i)) {
+                for (name, raw) in child_elements(fill) {
+                    let pattern = attr(&raw, "patternType").unwrap_or_default();
+                    if name == "gradientFill"
+                        || (name == "patternFill"
+                            && !matches!(pattern.as_str(), "" | "none" | "solid"))
+                    {
+                        push("patterned fills");
+                    }
+                }
+            }
+            let mut thin_box = false;
+            if let Some(border) = id("borderId").and_then(|i| borders.get(i)) {
+                let mut sides = std::collections::HashMap::new();
+                for (name, raw) in child_elements(border) {
+                    let style = attr(&raw, "style").unwrap_or_default();
+                    // A side's colour: automatic, black, or another.
+                    let plain = child_elements(&raw).iter().all(|(c, r)| {
+                        c != "color"
+                            || on(attr(r, "auto"))
+                            || attr(r, "rgb").is_some_and(|v| v.ends_with("000000"))
+                            || attr(r, "indexed").is_some_and(|v| v == "8" || v == "64")
+                    });
+                    sides.insert(name, (style, plain));
+                }
+                let side = |n: &str| sides.get(n).cloned().unwrap_or_default();
+                let box_sides = ["left", "right", "top", "bottom"].map(side);
+                let diagonal = !side("diagonal").0.is_empty();
+                if box_sides.iter().all(|(s, plain)| s == "thin" && *plain) && !diagonal {
+                    thin_box = true;
+                } else if box_sides.iter().any(|(s, _)| !s.is_empty()) || diagonal {
+                    push("borders other than a thin box");
+                }
+            }
+            for (name, raw) in child_elements(xf) {
+                if name != "alignment" {
+                    continue;
+                }
+                let h = attr(&raw, "horizontal").unwrap_or_default();
+                if !matches!(h.as_str(), "" | "general" | "left" | "center" | "right") {
+                    push("horizontal alignment other than left, center or right");
+                }
+                if attr(&raw, "vertical").is_some_and(|v| v != "bottom") {
+                    push("vertical alignment");
+                }
+                if attr(&raw, "indent").is_some_and(|v| v != "0") {
+                    push("indented text");
+                }
+                if attr(&raw, "textRotation").is_some_and(|v| v != "0") {
+                    push("rotated text");
+                }
+                if on(attr(&raw, "shrinkToFit")) {
+                    push("shrink to fit");
+                }
+            }
+            LoadedXfExtras { lost, thin_box }
+        })
+        .collect()
+}
+
 /// The raw `<font>` elements of `<fonts>`, in order (a `<dxf>`'s `<font>`
 /// lives outside `<fonts>` and is not one of them). Read with the loader's
 /// parser ([`element_children`]), so comments and prefixes are no trouble.
