@@ -526,9 +526,9 @@ impl Control {
         Json::obj(out)
     }
 
-    /// The control's input handler. `dialog-set` calls it, and so will a form's
-    /// editable widget once one is drawn (today's overlay draws controls
-    /// read-only). `args` is the verb's argument object: `value`,
+    /// The control's input handler. `dialog-set` calls it, and so do the
+    /// overlay's editable widgets, through [`Dialog::click_control`] and
+    /// typing. `args` is the verb's argument object: `value`,
     /// or for a grid `{row, column, value}`, `{insert_row}` or `{delete_row}`;
     /// a radio group, dropdown or list also takes `{index}`, which picks one
     /// of two items that read the same.

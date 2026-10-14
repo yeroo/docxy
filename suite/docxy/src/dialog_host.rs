@@ -6,6 +6,33 @@ use super::*;
 use crate::dialog::{self, ControlKind, Dialog, DialogOwner, DialogStack, NONE_OPEN};
 use unicode_segmentation::UnicodeSegmentation;
 
+/// Each list of the top dialog: its scroll, and the choice last scrolled to.
+pub(crate) type ListScrolls = std::collections::HashMap<
+    (&'static str, &'static str),
+    (UniformListScrollHandle, Option<usize>),
+>;
+
+/// The scroll for list `name` of dialog `id`, kept across frames. When the
+/// choice is not the one last seen it is scrolled into view (only if it is
+/// out of it), so a key that moves it past the shown rows brings it back,
+/// while a wheel scroll that leaves the choice alone is not undone.
+fn list_scroll(
+    lists: &mut ListScrolls,
+    key: (&'static str, &'static str),
+    chosen: Option<usize>,
+) -> UniformListScrollHandle {
+    let (handle, seen) = lists
+        .entry(key)
+        .or_insert_with(|| (UniformListScrollHandle::new(), None));
+    if chosen != *seen {
+        if let Some(k) = chosen {
+            handle.scroll_to_item(k, ScrollStrategy::Top);
+        }
+        *seen = chosen;
+    }
+    handle.clone()
+}
+
 /// Apply an accepted dialog to what it belongs to. An error refuses the
 /// press and leaves the dialog open. `Ok(true)` when it changed a document
 /// (a Project tracks its own changes); an untouched OK changes nothing.
@@ -834,6 +861,15 @@ impl Docxy {
                 // (#988). Virtualised like the check list: Go To's names can
                 // run long.
                 let n = c.items.len();
+                let chosen = match c.value {
+                    dialog::Value::Choice(k) => k,
+                    _ => None,
+                };
+                let scroll = list_scroll(
+                    &mut self.dialog_lists.borrow_mut(),
+                    (d.id.as_str(), c.name),
+                    chosen,
+                );
                 let list = uniform_list(
                     ("dialog-list", i),
                     n,
@@ -867,6 +903,7 @@ impl Docxy {
                             .collect()
                     }),
                 )
+                .track_scroll(&scroll)
                 .h(px(18. * n.clamp(3, 8) as f32))
                 .w_full();
                 v_flex()
@@ -897,6 +934,10 @@ impl Docxy {
     /// so the pointer cannot reach anything under it.
     pub(crate) fn dialog_overlay(&self, pal: Pal, cx: &mut Context<Self>) -> Option<AnyElement> {
         let d = self.active_dialogs()?.top()?;
+        // Another dialog's lists start again at the top when it next shows.
+        self.dialog_lists
+            .borrow_mut()
+            .retain(|(id, _), _| *id == d.id.as_str());
         let tabs = (!d.tabs.is_empty()).then(|| {
             h_flex()
                 .gap_3()
@@ -1038,6 +1079,32 @@ mod tests {
     use crate::dialog::{Button, ButtonRole, Control, Value};
     use crate::text_input::ImeState;
     use core::prelude::v1::test;
+
+    /// #988 r1: a list's choice that moves is scrolled into view once; a
+    /// frame with the same choice asks for no scroll (a wheel scroll stays),
+    /// and the handle is the same one frame to frame.
+    #[test]
+    fn a_list_scrolls_a_changed_choice_into_view_once() {
+        let mut lists = ListScrolls::default();
+        let key = ("consolidate", "refs");
+        let pending = |h: &UniformListScrollHandle| {
+            h.0.borrow_mut()
+                .deferred_scroll_to_item
+                .take()
+                .map(|d| d.item_index)
+        };
+        let h = list_scroll(&mut lists, key, None);
+        assert_eq!(pending(&h), None, "nothing chosen: no scroll");
+        let h = list_scroll(&mut lists, key, Some(40));
+        assert_eq!(pending(&h), Some(40));
+        let again = list_scroll(&mut lists, key, Some(40));
+        assert!(std::rc::Rc::ptr_eq(&h.0, &again.0));
+        assert_eq!(pending(&again), None, "the same choice: left alone");
+        let h = list_scroll(&mut lists, key, Some(0));
+        assert_eq!(pending(&h), Some(0));
+        let other = list_scroll(&mut lists, ("goto", "names"), Some(3));
+        assert!(!std::rc::Rc::ptr_eq(&h.0, &other.0));
+    }
 
     /// A document tab with a two-field form open: Top (a number) and Note.
     fn tab_with_form() -> DocTab {
