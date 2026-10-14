@@ -496,3 +496,26 @@ fn replacing_the_end_of_a_loose_result_stays_inside_it_1240() {
         .unwrap();
     assert_eq!(end, content.len() - 1, "X is in the result: {content:?}");
 }
+
+#[test]
+fn a_cut_across_one_edge_copies_the_whole_field_it_deletes_1240() {
+    // r1-M1: the cut copies what its delete takes, in either direction.
+    for forward in [true, false] {
+        let (mut ed, _) = toc("", true);
+        let (lo, hi) = (Caret::at(vec![0], 3), Caret::at(vec![1], 2));
+        if forward {
+            select(&mut ed, lo, hi);
+        } else {
+            select(&mut ed, hi, lo);
+        }
+        let clip = ed.cut().expect("a clip");
+        let copied: Vec<String> = clip.paras.iter().map(|p| editor_text(p)).collect();
+        assert_eq!(copied, ["ore", "Intro\t1", "Body\t2"], "forward {forward}");
+        assert_eq!(texts(&ed), ["Bef", "After"]);
+        assert_no_field(&ed);
+        // Pasting it back brings the text back (the field itself is not in
+        // a clip: zero-width markers never are).
+        ed.paste(&clip);
+        assert_eq!(texts(&ed), ["Before", "Intro\t1", "Body\t2", "After"]);
+    }
+}

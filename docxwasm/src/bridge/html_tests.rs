@@ -707,3 +707,26 @@ fn page_colour_survives_a_body_edit_in_doc_json() {
         .clone();
     assert_eq!(bg.get_str("color"), Some("FFF2CC"));
 }
+
+/// #1240 r1: a cut across one edge of a TOC spanning paragraphs copies the
+/// whole field, which its delete takes.
+#[test]
+fn a_cut_across_a_spanning_fields_edge_copies_all_it_deletes() {
+    let body = format!(
+        "{}<w:p><w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+         <w:r><w:instrText xml:space=\"preserve\"> TOC \\o \"1-3\"</w:instrText></w:r>\
+         <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+         <w:r><w:t>Intro</w:t></w:r></w:p>\
+         <w:p><w:r><w:t>Body</w:t></w:r></w:p>\
+         <w:p><w:r><w:fldChar w:fldCharType=\"end\"/></w:r></w:p>{}",
+        para("Before"),
+        para("After")
+    );
+    let mut s = open(&docx_from_body(&body));
+    s.exec_json("select\t0\t3\t1\t2");
+    let r = parse(&s.exec_json("cut"));
+    assert_eq!(r.get_str("copied"), Some("ore\nIntro\nBody"));
+    let texts: Vec<String> = all_paragraphs(&s).iter().map(para_text).collect();
+    assert_eq!(texts, ["Bef", "After"]);
+    assert!(!s.editor.doc.plain_text().contains("Intro"));
+}

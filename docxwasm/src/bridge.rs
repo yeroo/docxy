@@ -401,6 +401,9 @@ impl Session {
                 }
             }
             "cut" => {
+                // A loose field the selection cuts goes whole: copy all of
+                // what the delete takes (#1240).
+                self.editor.widen_selection_over_loose_fields();
                 let t = self.editor.selection_text();
                 if t.is_empty() {
                     mutated = false;

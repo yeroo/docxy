@@ -390,6 +390,25 @@ impl Editor {
             .collect()
     }
 
+    /// Widen the selection itself over every loose field it cuts, as a
+    /// delete of it would ([`Editor::widen_over_loose_fields`]), keeping its
+    /// direction: a cut copies exactly what it then deletes. A host that cuts
+    /// through its own copy (the wasm bridge's plain-text cut) calls this
+    /// before copying.
+    pub fn widen_selection_over_loose_fields(&mut self) {
+        if self.cell_range().is_some() {
+            return;
+        }
+        let Some((mut lo, mut hi)) = self.selection_range() else {
+            return;
+        };
+        let forward = self.anchor.as_ref() == Some(&lo);
+        self.widen_over_loose_fields(&mut lo, &mut hi);
+        let (anchor, caret) = if forward { (lo, hi) } else { (hi, lo) };
+        self.anchor = Some(anchor);
+        self.caret = caret;
+    }
+
     /// Remove the marker runs of the fields a delete covers (from
     /// [`Editor::widen_over_loose_fields`]) in the container of `path`. Not
     /// while tracking: a tracked delete records the result as deleted and
@@ -408,7 +427,11 @@ impl Editor {
 /// A loose field a selection delete covers.
 pub(super) struct LooseFieldCut(LooseField);
 
-/// Whether `content[k]` is a field-code run holding an end and no begin.
+/// What `content[k]` is to [`past_field_ends`]'s scan: `Some(true)` for a
+/// field-code run holding an end and no begin, which text typed there goes
+/// past; `None` for one holding a begin, where the scan stops (text lands
+/// before that field); `Some(false)` for anything else, which the scan goes
+/// over. `None` too when there is no `content[k]`.
 fn ends_a_field(content: &[Inline], k: usize) -> Option<bool> {
     match content.get(k)? {
         Inline::Raw(raw) if is_field_code_raw(raw) => {

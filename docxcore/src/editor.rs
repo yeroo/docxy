@@ -1928,8 +1928,10 @@ impl Editor {
         Some(Clip { paras })
     }
 
-    /// Cut: copy the selection, then delete it.
+    /// Cut: copy the selection, then delete it. A loose field the selection
+    /// cuts is cut whole, as the delete takes it (#1240).
     pub fn cut(&mut self) -> Option<Clip> {
+        self.widen_selection_over_loose_fields();
         let clip = self.copy()?;
         self.delete_selection_keeping_objects();
         Some(clip)
@@ -3668,7 +3670,9 @@ fn sdt_typing_props(content: &[Inline], at: usize) -> RunProps {
 }
 
 /// Type `ch` at caret offset `o`: into an empty content control there (see
-/// [`empty_sdt_at`]), else as [`content_insert_at`] places it.
+/// [`empty_sdt_at`]); after the end run of a loose field ending there (see
+/// `loose_fields::past_field_ends`, #1240), not into its result; else as
+/// [`content_insert_at`] places it.
 fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
     content_insert_with(content, o, ch, true);
 }
@@ -3680,8 +3684,9 @@ fn content_insert_at(content: &mut Vec<Inline>, o: usize, ch: char) {
     content_insert_with(content, o, ch, false);
 }
 
-fn content_insert_with(content: &mut Vec<Inline>, o: usize, ch: char, into_empty: bool) {
-    if let Some(at) = empty_sdt_at(content, o).filter(|_| into_empty) {
+/// [`content_insert`] when `typing`, else [`content_insert_at`].
+fn content_insert_with(content: &mut Vec<Inline>, o: usize, ch: char, typing: bool) {
+    if let Some(at) = empty_sdt_at(content, o).filter(|_| typing) {
         let props = sdt_typing_props(content, at);
         content.insert(
             at,
@@ -3710,7 +3715,7 @@ fn content_insert_with(content: &mut Vec<Inline>, o: usize, ch: char, into_empty
     // (#1240). Replace's edits stay in the inline holding them.
     let width = inline_len(&content[i]);
     let after = if width == 0 { i } else { i + 1 };
-    if into_empty && local == width {
+    if typing && local == width {
         if let Some(at) = loose_fields::past_field_ends(content, after) {
             let props = source_before(content, at)
                 .or_else(|| source_from(content, at))
@@ -3737,7 +3742,7 @@ fn content_insert_with(content: &mut Vec<Inline>, o: usize, ch: char, into_empty
         Inline::Hyperlink(h) => match link_part(h, local) {
             LinkPart::Runs(local) => runs_insert(&mut h.runs, local, ch),
             LinkPart::Content(local) => {
-                content_insert_with(&mut h.content, local, ch, into_empty);
+                content_insert_with(&mut h.content, local, ch, typing);
                 h.content_changed = true;
             }
         },
