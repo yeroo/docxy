@@ -87,6 +87,9 @@ pub struct Style {
     pub dim: bool,
     /// Selected text (drawn reversed by the TUI).
     pub highlight: bool,
+    /// A collapsed field's result (#1243): hosts draw it on a grey shade, as
+    /// Word does, so it reads apart from typed text. Display only.
+    pub field: bool,
     pub color: Option<Color>,
 }
 
@@ -1260,6 +1263,7 @@ fn style_from_run(p: &RunProps) -> Style {
         // The terminal has no per-run background, so a text highlight shows as
         // reversed video (same as a selection).
         highlight: p.highlight.is_some(),
+        field: false,
         color: p.color.as_deref().and_then(parse_hex).map(quantize),
     }
 }
@@ -1751,6 +1755,7 @@ fn flatten_para(
                     st.bold = true;
                 }
                 st.highlight |= sel_at(mc);
+                st.field = true;
                 for ch in text.chars() {
                     let (ch, disp) = if ch == ' ' {
                         ('\u{00a0}', Some(' '))
@@ -1787,6 +1792,7 @@ fn flatten_para(
                         if fi.link.is_some() {
                             st.color = Some(Color::Cyan);
                         }
+                        st.field = true;
                         for ch in text.chars() {
                             segs.last_mut().unwrap().glyphs.push(Glyph {
                                 ch,
@@ -4792,6 +4798,83 @@ mod tests {
                 .iter()
                 .any(|s| s.text == "9" && s.style.strike)
         );
+    }
+
+    // ---- #1243: a field's result is marked for the hosts' field shade ----
+
+    #[test]
+    fn field_result_glyphs_are_marked_as_a_field_1243() {
+        let bold = Inline::Field {
+            raw: "<w:fldSimple w:instr=\" PAGE \"><w:r><w:rPr><w:b/></w:rPr><w:t>7</w:t></w:r></w:fldSimple>"
+                .into(),
+            text: "7".into(),
+        };
+        let d = doc(vec![para(vec![
+            run("Page ", RunProps::default()),
+            field_642("Page 1"),
+            run(" of ", RunProps::default()),
+            bold,
+            Inline::Tab(Default::default()),
+            run("end", RunProps::default()),
+        ])]);
+        let lines = render(&d, &opts(60));
+        let field: Vec<&str> = lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.style.field)
+            .map(|s| s.text.as_str())
+            .collect();
+        // Field spaces display as spaces (they're non-breaking only in layout).
+        assert_eq!(field, vec!["Page 1", "7"], "only the fields are marked");
+        let seven = lines[0].spans.iter().find(|s| s.text == "7").unwrap();
+        assert!(seven.style.bold, "a field keeps its own run look");
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .filter(|s| !s.style.field)
+                .all(|s| !s.text.contains('7') && !s.text.contains("Page 1")),
+            "the field is its own span, not merged into its neighbours"
+        );
+    }
+
+    #[test]
+    fn field_in_a_tracked_change_is_marked_1243() {
+        let d = doc(vec![para(vec![
+            run("a", RunProps::default()),
+            Inline::Revision {
+                kind: RevisionKind::Insert,
+                metadata: RevisionMetadata::default(),
+                raw: "<w:ins/>".into(),
+                content: vec![run("b", RunProps::default()), field_642("9")],
+                content_changed: false,
+            },
+        ])]);
+        let lines = render(&d, &opts(40));
+        let nine = lines[0].spans.iter().find(|s| s.text == "9").unwrap();
+        assert!(nine.style.field && nine.style.underline);
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .filter(|s| s.text.contains('a') || s.text.contains('b'))
+                .all(|s| !s.style.field),
+            "the tracked run beside it is not a field"
+        );
+    }
+
+    #[test]
+    fn empty_result_field_marks_nothing_1243() {
+        let d = doc(vec![para(vec![
+            run("Index", RunProps::default()),
+            Inline::Field {
+                raw: "<w:fldSimple w:instr=\" XE &quot;x&quot; \"/>".into(),
+                text: String::new(),
+            },
+            equation_1242("x+1"),
+        ])]);
+        let lines = render(&d, &opts(40));
+        assert!(lines[0].spans.iter().all(|s| !s.style.field));
     }
 
     // ---- #1242: an equation or an inline picture is one editor offset ----
