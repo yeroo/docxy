@@ -484,6 +484,22 @@ fn legacy_inputs_recalc_to_xlsx_and_export_csv() {
     }
 }
 
+/// #874: an .xls opens in the editor in Compatibility Mode, bound to
+/// itself, but a headless run keeps it an import: neither `--recalc` nor
+/// `--csv` writes over it.
+#[test]
+fn headless_runs_never_write_the_xls_input() {
+    let dir = Dir::new("xls-guard");
+    let source = dir.0.join("book.xls");
+    std::fs::copy(corpus("legacy").join("calc-refs.xls"), &source).unwrap();
+    let original = std::fs::read(&source).unwrap();
+    for mode in ["--recalc", "--csv"] {
+        let result = run(&source, mode, &source);
+        assert!(!result.status.success(), "{mode}");
+        assert_eq!(std::fs::read(&source).unwrap(), original, "{mode}");
+    }
+}
+
 /// #603: `--recalc` to an .xls, .xlsb, .ods or .xml (types Save As refuses)
 /// exits 2 and writes nothing, rather than .xlsx bytes under that name.
 #[test]

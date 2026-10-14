@@ -3,8 +3,8 @@
 # legacy readers: the same workbooks as corpus/xlsx, written by Excel itself.
 #
 # Run from the repo root in Windows PowerShell:  powershell -File scripts/make-legacy-fixtures.ps1
-# (-Sections corpus,extra,addin,xll picks which parts below to rebuild; all by
-# default. xll builds a test XLL with cargo).
+# (-Sections corpus,extra,addin,xll,arrays picks which parts below to rebuild;
+# all by default. xll builds a test XLL with cargo).
 #
 # The ProgID Excel.Application may be registered to xlcomshim on a dev box, so
 # this starts EXCEL.EXE itself and binds to its running class object with
@@ -12,13 +12,13 @@
 # process stopped silently after a few files.
 param(
   [string]$Excel = "C:\Program Files\Microsoft Office\Root\Office16\EXCEL.EXE",
-  [string[]]$Sections = @('corpus', 'extra', 'addin', 'xll')
+  [string[]]$Sections = @('corpus', 'extra', 'addin', 'xll', 'arrays')
 )
 $ErrorActionPreference = 'Stop'
 # Under -File, `-Sections corpus,extra` arrives as one string 'corpus,extra'.
 $Sections = @($Sections -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-$unknown = @($Sections | Where-Object { $_ -notin @('corpus', 'extra', 'addin', 'xll') })
-if ($unknown.Count -gt 0) { throw "unknown section(s): $($unknown -join ', ') (expected corpus, extra, addin, xll)" }
+$unknown = @($Sections | Where-Object { $_ -notin @('corpus', 'extra', 'addin', 'xll', 'arrays') })
+if ($unknown.Count -gt 0) { throw "unknown section(s): $($unknown -join ', ') (expected corpus, extra, addin, xll, arrays)" }
 Add-Type -TypeDefinition @"
 using System; using System.Runtime.InteropServices;
 public static class RealCom {
@@ -206,6 +206,134 @@ try {
   $wb.SaveAs((Join-Path $addin "xll-udf.xlsx"), 51)
   $wb.SaveAs((Join-Path $addin "xll-udf.xlsb"), 50)
   Save-Xls $wb (Join-Path $addin "xll-udf.xls") $p.Id
+  $wb.Close($false)
+} finally {
+  $xl.Quit(); [Runtime.InteropServices.Marshal]::ReleaseComObject($xl) | Out-Null
+  Start-Sleep 2; if (!$p.HasExited) { $p.Kill() }
+}
+}
+
+# corpus/legacy/arrays: array formulas, built by Excel itself so
+# its .xls is the oracle for the operand classes the .xls writer (#874) gives
+# tokens in an array context. Legacy array formulas (FormulaArray), one over
+# several cells, one in a defined name used by one, and a dynamic array typed
+# as Excel 365 does (Formula2), which the .xls holds as a legacy array. Its
+# own folder, as it has no .xlsb or .ods for the three-format test.
+if ($Sections -contains 'arrays') {
+$arrays = Join-Path $PSScriptRoot "..\corpus\legacy\arrays"
+New-Item -ItemType Directory -Force $arrays | Out-Null
+$arrays = (Resolve-Path $arrays).Path
+Remove-Item (Join-Path $arrays "array-classes.*") -ErrorAction SilentlyContinue
+# array-classes-3 calls XLLTWICE, which the test XLL registers (built as in
+# the xll section above).
+$crate = Join-Path $PSScriptRoot "xll-fixture"
+cargo build --release --quiet --manifest-path (Join-Path $crate "Cargo.toml")
+if ($LASTEXITCODE -ne 0) { throw "building the XLL failed" }
+$xll = Join-Path $crate "target\release\XLLFIXT.XLL"
+Copy-Item (Join-Path $crate "target\release\xll_fixture.dll") $xll -Force
+$p = Start-Process $Excel -ArgumentList "/automation","-Embedding" -PassThru
+Start-Sleep -Seconds 8
+$xl = [RealCom]::Local("00024500-0000-0000-C000-000000000046")
+$xl.DisplayAlerts = $false
+try {
+  $wb = $xl.Workbooks.Add()
+  $ws = $wb.Worksheets.Item(1)
+  $ws.Name = "Data"
+  $ws.Range("A1").Value2 = 1; $ws.Range("A2").Value2 = 2; $ws.Range("A3").Value2 = 3
+  $ws.Range("B1").Value2 = 10; $ws.Range("B2").Value2 = 20; $ws.Range("B3").Value2 = 30
+  $ws.Range("C1").Value2 = "x"; $ws.Range("C2").Value2 = "y"; $ws.Range("C3").Value2 = "x"
+  $wb.Names.Add("Doubled", "=Data!`$A`$1:`$A`$3*2") | Out-Null
+  $ws.Range("E1").FormulaArray = '=SUM(A1:A3*B1:B3)'
+  $ws.Range("E2").FormulaArray = '=SUM(IF(A1:A3>1,A1:A3))'
+  $ws.Range("E3").FormulaArray = '=MAX(IF(C1:C3="x",B1:B3))'
+  $ws.Range("E4").FormulaArray = '=SUM((C1:C3="x")*B1:B3)'
+  $ws.Range("E5").FormulaArray = '=INDEX(A1:A3*2,2)'
+  $ws.Range("E6").FormulaArray = '=SUM(Doubled)'
+  $ws.Range("F1:F3").FormulaArray = '=A1:A3*2'
+  $ws.Range("G1").Formula2 = '=IF(A1:A3>1,A1:A3*2,0)'
+  $xl.Calculate()
+  $wb.CheckCompatibility = $false
+  $wb.SaveAs((Join-Path $arrays "array-classes.xlsx"), 51)
+  Save-Xls $wb (Join-Path $arrays "array-classes.xls") $p.Id
+  $wb.Close($false)
+
+  # array-classes-2 and -3: formula shapes written three ways, so every
+  # context's classes are pinned: a plain cell formula (sheet Cell, F1, F2,
+  # ...), a legacy array formula (sheet Arr, the same cells) and a dynamic
+  # array typed as Excel 365 does (sheet Dyn, one column each from F,
+  # spilling down). Each sheet has the data in A1:D3. -2 has BIFF8's own
+  # functions and defined names over array expressions; -3 the newer
+  # functions (written to an .xls as _xlfn. names), Analysis ToolPak ones
+  # (add-in names) and XLLTWICE, a function the test XLL registers.
+  function Write-Shapes($wb, $shapes) {
+    while ($wb.Worksheets.Count -lt 3) { $wb.Worksheets.Add([Type]::Missing, $wb.Worksheets.Item($wb.Worksheets.Count)) | Out-Null }
+    $sheetNames = @('Cell', 'Arr', 'Dyn')
+    for ($k = 0; $k -lt 3; $k++) {
+      $ws = $wb.Worksheets.Item($k + 1)
+      $ws.Name = $sheetNames[$k]
+      $ws.Range("A1").Value2 = 1; $ws.Range("A2").Value2 = 2; $ws.Range("A3").Value2 = 3
+      $ws.Range("B1").Value2 = 10; $ws.Range("B2").Value2 = 20; $ws.Range("B3").Value2 = 30
+      $ws.Range("C1").Value2 = "x"; $ws.Range("C2").Value2 = "y"; $ws.Range("C3").Value2 = "x"
+      $ws.Range("D1").Value2 = 1; $ws.Range("D2").Value2 = 2
+    }
+    for ($i = 0; $i -lt $shapes.Count; $i++) {
+      $f = '=' + $shapes[$i]
+      $wb.Worksheets.Item(1).Cells.Item($i + 1, 6).Formula = $f
+      $wb.Worksheets.Item(2).Cells.Item($i + 1, 6).FormulaArray = $f
+      $wb.Worksheets.Item(3).Cells.Item(1, $i + 6).Formula2 = $f
+    }
+  }
+  Remove-Item (Join-Path $arrays "array-classes-2.*") -ErrorAction SilentlyContinue
+  $wb = $xl.Workbooks.Add()
+  Write-Shapes $wb @(
+    'SUM(LEN(C1:C3))', 'MAX(ABS(A1:A3-2))', 'SUM(IFERROR(1/A1:A3,0))',
+    'SUM(IF(A1:A3>1,LEN(C1:C3)))', 'SUM(INDEX(A1:A3,{1;2}))', 'SUM(INDEX(A1:A3,D1:D2))',
+    'SUM(VLOOKUP(A1:A3,A1:B3,2,0))', 'SUM(HLOOKUP(A1,A1:B3,D1:D2,0))',
+    'SUM(MATCH(A1:A3,A1:A3,0))', 'SUM(INDEX(A1:A3,N(IF(1,D1:D2))))', 'SUM(-A1:A3)',
+    'SUM(ROUND(A1:A3*1.5,0))', 'SUMPRODUCT(--(C1:C3="x"),B1:B3)', 'SUM(CHOOSE(2,A1:A3,B1:B3))',
+    'SUM(OFFSET(A1,0,0,3,1)*2)', 'A1:A3%', 'A1:A3>1', 'SUM((A1:A3>1)*1)',
+    'AVERAGE(IF(C1:C3="x",B1:B3))', 'COUNTIF(A1:A3,">1")', 'SUMIF(C1:C3,"x",B1:B3)',
+    'TEXT(SUM(A1:A3),"0")', 'ROWS(A1:A3)*2', 'SUM(ROW(A1:A3))', 'LARGE(A1:A3*2,1)',
+    'SUM(N(A1:A3))', 'SUM(IF(A1>1,A1:A3,B1:B3))', 'SUM(ISNUMBER(A1:A3)*1)', 'ABS(A1:A3)',
+    'LEN(C1:C3)', 'A1:A3*B1:B3', 'INDEX(A1:A3,2)', 'MAX(A1:A3)+MIN(B1:B3)',
+    'IF(A1:A3>1,A1:A3,0)', 'CONCATENATE(C1:C3,"!")', 'SUM(A1:A3,B1)', 'VLOOKUP(2,A1:B3,2,0)',
+    'SUMPRODUCT(MAX((C1:C3="x")*B1:B3))', 'SUMPRODUCT(LARGE((A1:A3>1)*B1:B3,{1,2}))',
+    'SUMPRODUCT(MAX(LEN(C1:C3)))', 'LOOKUP(2,1/(A1:A3>1),B1:B3)',
+    'INDEX(B1:B3,MATCH(1,INDEX((A1:A3>1)*(C1:C3="x"),0),0))', 'IRR(A1:A3*1-2)',
+    'LOOKUP(2,A1:A3,B1:B3)', 'IRR(B1:B3)', 'SUM(TREND(B1:B3,A1:A3))',
+    'INDEX(LINEST(B1:B3,A1:A3),1)', 'SUM(FREQUENCY(A1:A3,D1:D2))', 'INDEX(A1:B3,2,2)'
+  )
+  $wb.Names.Add("AbsA", "=ABS(Cell!`$A`$1:`$A`$3)") | Out-Null
+  $wb.Names.Add("LenC", "=LEN(Cell!`$C`$1:`$C`$3)") | Out-Null
+  $wb.Names.Add("SumAB", "=SUM(Cell!`$A`$1:`$A`$3*Cell!`$B`$1:`$B`$3)") | Out-Null
+  $wb.Names.Add("PickB", "=INDEX(Cell!`$B`$1:`$B`$3,Cell!`$D`$1:`$D`$2)") | Out-Null
+  $wb.Names.Add("Neg", "=-Cell!`$A`$1:`$A`$3") | Out-Null
+  $wb.Names.Add("Big", "=IF(Cell!`$A`$1:`$A`$3>1,Cell!`$B`$1:`$B`$3)") | Out-Null
+  $xl.Calculate()
+  $wb.CheckCompatibility = $false
+  $wb.SaveAs((Join-Path $arrays "array-classes-2.xlsx"), 51)
+  Save-Xls $wb (Join-Path $arrays "array-classes-2.xls") $p.Id
+  $wb.Close($false)
+
+  Remove-Item (Join-Path $arrays "array-classes-3.*") -ErrorAction SilentlyContinue
+  $wb = $xl.Workbooks.Add()
+  if (-not $xl.RegisterXLL($xll)) { throw "Excel refused to load $xll" }
+  Write-Shapes $wb @(
+    'PERCENTILE.INC(A1:A3,0.5)', 'PERCENTILE.EXC(A1:A3,0.5)', 'QUARTILE.INC(A1:A3,1)',
+    'QUARTILE.EXC(A1:A3,1)', 'PERCENTRANK.INC(A1:A3,2)', 'PERCENTRANK.EXC(A1:A3,2)',
+    'RANK.EQ(2,A1:A3)', 'XLOOKUP(2,A1:A3,B1:B3)', 'XMATCH(2,A1:A3)',
+    'ROWS(FILTER(A1:A3,A1:A3>1))', 'SUM(UNIQUE(A1:A3))', 'SUM(SORT(A1:A3))',
+    'SUM(SORTBY(A1:A3,B1:B3))', 'TEXTJOIN(",",TRUE,C1:C3)', 'CONCAT(C1:C3)',
+    'SUM(IFS(A1:A3>1,B1:B3,TRUE,0))', 'SWITCH(A1,1,B1,2,B2)', 'STDEV.S(A1:A3)',
+    'NORM.DIST(A1,2,1,TRUE)', 'MAXIFS(B1:B3,A1:A3,">1")', 'FORECAST.LINEAR(4,B1:B3,A1:A3)',
+    'AGGREGATE(9,6,A1:A3)', 'SUM(PERCENTILE.INC(A1:A3*2,{0.5,1}))', 'SUM(XLOOKUP(A1:A3,A1:A3,B1:B3))',
+    'SUM(IFERROR(A1:A3/0,1))', 'SUM(EDATE(A1:A3,1))', 'SUMPRODUCT(WEEKNUM(A1:A3))', 'EDATE(A1,1)',
+    'XLLTWICE(A1)', 'SUMPRODUCT(XLLTWICE(A1:A3))', 'SUM(XLLTWICE(A1:A3*2))'
+  )
+  $xl.Calculate()
+  $wb.CheckCompatibility = $false
+  $wb.SaveAs((Join-Path $arrays "array-classes-3.xlsx"), 51)
+  Save-Xls $wb (Join-Path $arrays "array-classes-3.xls") $p.Id
   $wb.Close($false)
 } finally {
   $xl.Quit(); [Runtime.InteropServices.Marshal]::ReleaseComObject($xl) | Out-Null

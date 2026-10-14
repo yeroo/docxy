@@ -6,9 +6,19 @@ use crate::{Backstage, BackstageEvent, BackstageHost, Item, OptLine, OptValue, P
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Position;
 
-/// How many editable rows the host's Info page has.
+/// How many editable rows the host's Info page has: the Compatibility
+/// Mode section's `Convert` first, when it has one, then the properties.
 pub(crate) fn info_rows(host: &dyn BackstageHost) -> usize {
-    host.info_fields().len() + usize::from(host.info_custom_row())
+    usize::from(host.compat_mode()) + host.info_fields().len() + usize::from(host.info_custom_row())
+}
+
+/// The event for Info row `i`: `Convert`, or the property row it is.
+fn info_event(host: &dyn BackstageHost, i: usize) -> BackstageEvent {
+    match (host.compat_mode(), i) {
+        (true, 0) => BackstageEvent::Convert,
+        (true, i) => BackstageEvent::EditInfo(i - 1),
+        (false, i) => BackstageEvent::EditInfo(i),
+    }
 }
 
 impl Backstage {
@@ -153,7 +163,7 @@ impl Backstage {
                         self.info_sel = (self.info_sel + 1).min(rows.saturating_sub(1))
                     }
                     KeyCode::Enter if self.info_sel < rows => {
-                        return BackstageEvent::EditInfo(self.info_sel);
+                        return info_event(host, self.info_sel);
                     }
                     KeyCode::Left => self.pane = Pane::Menu,
                     _ => {}
@@ -444,7 +454,7 @@ impl Backstage {
                 .filter(|&i| i < rows);
             if let Some(i) = row {
                 if self.pane == Pane::Info && self.info_sel == i {
-                    return BackstageEvent::EditInfo(i);
+                    return info_event(host, i);
                 }
                 self.info_sel = i;
                 self.pane = Pane::Info;

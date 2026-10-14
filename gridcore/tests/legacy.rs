@@ -669,3 +669,472 @@ fn external_workbook_name_keeps_only_its_value(ext: &str) {
         back.part_names()
     );
 }
+
+// ---- the .xls writer (#874) ---------------------------------------------------
+
+/// Every `.xls` of the corpus (corpus/legacy, extra/, addin/, arrays/).
+fn xls_corpus() -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    for dir in [
+        corpus("legacy"),
+        corpus("legacy").join("extra"),
+        corpus("legacy").join("addin"),
+        corpus("legacy").join("arrays"),
+    ] {
+        for e in std::fs::read_dir(&dir).expect("corpus dir") {
+            let p = e.expect("dir entry").path();
+            if p.extension().is_some_and(|x| x == "xls") {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// What the import of each corpus `.xls` leaves out besides its document
+/// properties (every file Excel writes has them), by file; every other
+/// file has nothing else. The 17 workbooks of corpus/xlsx have margins
+/// other than Excel's Normal ones, which their `.xls` keep.
+const XLS_DROPPED: &[(&str, &[&str])] = &[
+    ("calc-3d.xls", &["page setup"]),
+    ("calc-arithmetic.xls", &["page setup"]),
+    ("calc-criteria.xls", &["page setup"]),
+    ("calc-dates.xls", &["page setup"]),
+    ("calc-financial.xls", &["page setup"]),
+    ("calc-logic.xls", &["page setup"]),
+    ("calc-lookup.xls", &["page setup"]),
+    ("calc-math.xls", &["page setup"]),
+    ("calc-refs.xls", &["page setup"]),
+    ("calc-stats.xls", &["page setup"]),
+    ("calc-text.xls", &["page setup"]),
+    ("calc-textfmt.xls", &["page setup"]),
+    // Two strings of the source are rich text.
+    (
+        "edge-cases.xls",
+        &["formatting within cell text", "page setup"],
+    ),
+    ("oracle-basic.xls", &["page setup"]),
+    ("shape-amortization.xls", &["page setup"]),
+    ("shape-gradebook.xls", &["page setup"]),
+    // Its table, which Excel wrote as a list (FEATURE11): the import keeps
+    // the cells, as Save As .xls from its .xlsx says.
+    (
+        "shape-salestable.xls",
+        &[
+            "page setup",
+            "tables (their cells are kept as plain ranges)",
+        ],
+    ),
+    ("chart-embedded.xls", &["pictures, shapes and charts"]),
+    // `SUM([1]!Prices)` and `[1]!Half*2`, names of another workbook.
+    (
+        "ext-name.xls",
+        &["2 formulas that refer to other workbooks or can't be read (kept as values)"],
+    ),
+];
+
+/// What writing each corpus `.xls`'s import back loses, by file; every
+/// other file loses nothing.
+const XLS_LOST: &[(&str, &[&str])] = &[];
+
+/// Import, write with `write_xls`, import again: the second import is the
+/// first. The sheets (names, order, hidden), values, formulas (as parsed;
+/// `[1]!` calls, which don't parse, as text), the whole cell format, names,
+/// date system, merges, columns, rows, panes and the active sheet. Each
+/// written file keeps the structural rules Excel holds it to.
+#[test]
+fn xls_corpus_round_trips_through_the_writer() {
+    let mut errs = Vec::new();
+    let files = xls_corpus();
+    for path in &files {
+        let file = path.file_name().unwrap().to_string_lossy().into_owned();
+        let first = gridcore::legacy::open_workbook_ex(&std::fs::read(path).unwrap())
+            .unwrap_or_else(|e| panic!("{file}: {e}"));
+        let mut want_dropped: Vec<&str> = XLS_DROPPED
+            .iter()
+            .find(|d| d.0 == file)
+            .map_or(&[][..], |d| d.1)
+            .to_vec();
+        want_dropped.push("document properties");
+        want_dropped.sort_unstable();
+        assert_eq!(first.dropped, want_dropped, "{file}: dropped");
+        let out = gridcore::legacy::write_xls(&first.pkg);
+        let want_lost = XLS_LOST
+            .iter()
+            .find(|d| d.0 == file)
+            .map_or(&[][..], |d| d.1);
+        assert_eq!(out.lost, want_lost, "{file}: lost");
+        if let Err(e) = gridcore::legacy::check_xls(&out.bytes) {
+            errs.push(format!("{file}: structure: {e}"));
+            continue;
+        }
+        let second = gridcore::legacy::open_workbook_ex(&out.bytes).unwrap();
+        assert_eq!(second.format, SourceFormat::Xls);
+        let (a, b) = (&first.pkg.workbook, &second.pkg.workbook);
+        compare_static(&file, a, b, &mut errs);
+        for (s, sheet) in a.sheets.iter().enumerate() {
+            let theirs = &b.sheets[s];
+            let at = |what: &str| format!("{file}: {}: {what}", sheet.name);
+            if sheet.hidden != theirs.hidden {
+                errs.push(at("hidden"));
+            }
+            if sheet.merges != theirs.merges {
+                errs.push(at(&format!(
+                    "merges {:?} != {:?}",
+                    theirs.merges, sheet.merges
+                )));
+            }
+            if sheet.col_defs != theirs.col_defs {
+                errs.push(at(&format!(
+                    "columns {:?} != {:?}",
+                    theirs.col_defs, sheet.col_defs
+                )));
+            }
+            if sheet.row_attrs != theirs.row_attrs {
+                errs.push(at(&format!(
+                    "rows {:?} != {:?}",
+                    theirs.row_attrs, sheet.row_attrs
+                )));
+            }
+            if sheet.freeze != theirs.freeze {
+                errs.push(at("frozen panes"));
+            }
+            for (&(r, c), cell) in &sheet.cells {
+                let Some(mine) = theirs.cell(r, c) else {
+                    continue; // (b) reported it
+                };
+                let name = cell_name(r, c);
+                if a.styles.xf(cell.style) != b.styles.xf(mine.style) {
+                    errs.push(at(&format!(
+                        "{name}: format {:?} != {:?}",
+                        b.styles.xf(mine.style),
+                        a.styles.xf(cell.style)
+                    )));
+                }
+                let (Some(want), Some(have)) = (&cell.formula, &mine.formula) else {
+                    continue;
+                };
+                let same = match (formula_ast(want), formula_ast(have)) {
+                    (Ok(x), Ok(y)) => x == y,
+                    _ => want == have,
+                };
+                if !same {
+                    errs.push(at(&format!("{name}: (e) ={have} != ={want}")));
+                }
+            }
+        }
+        if a.active_tab != b.active_tab {
+            errs.push(format!(
+                "{file}: active sheet {} != {}",
+                b.active_tab, a.active_tab
+            ));
+        }
+    }
+    assert_eq!(files.len(), 24, "17 + extra + addin + arrays .xls files");
+    assert!(
+        errs.is_empty(),
+        "{} problems:\n{}",
+        errs.len(),
+        errs.join("\n")
+    );
+}
+
+/// The `.xls` import reads the formatting the `.xlsx` original has: bold,
+/// italic, horizontal alignment and wrap of every cell, and the fill where
+/// the original gives it as an RGB colour (Excel's `.xlsx` gives most as a
+/// theme colour, which the model doesn't resolve).
+#[test]
+fn xls_formatting_matches_the_xlsx_originals() {
+    let mut errs = Vec::new();
+    let mut compared = 0;
+    for (src_dir, dir) in [
+        (corpus("xlsx"), corpus("legacy")),
+        (
+            corpus("legacy").join("extra"),
+            corpus("legacy").join("extra"),
+        ),
+    ] {
+        for e in std::fs::read_dir(&src_dir).expect("corpus dir") {
+            let src_path = e.expect("dir entry").path();
+            if src_path.extension().is_none_or(|x| x != "xlsx") {
+                continue;
+            }
+            let stem = src_path.file_stem().unwrap().to_string_lossy().into_owned();
+            let src = load_xlsx(&std::fs::read(&src_path).unwrap())
+                .unwrap()
+                .workbook;
+            let file = format!("{stem}.xls");
+            let (pkg, _) = open_workbook(&std::fs::read(dir.join(&file)).unwrap()).unwrap();
+            let got = &pkg.workbook;
+            for (s, sheet) in src.sheets.iter().enumerate() {
+                for (&(r, c), cell) in &sheet.cells {
+                    let Some(mine) = got.sheets[s].cell(r, c) else {
+                        continue;
+                    };
+                    let (x, y) = (src.styles.xf(cell.style), got.styles.xf(mine.style));
+                    compared += 1;
+                    let mut diff = Vec::new();
+                    if (x.bold, x.italic) != (y.bold, y.italic) {
+                        diff.push(format!("bold/italic {:?}", (y.bold, y.italic)));
+                    }
+                    if (x.align, x.wrap) != (y.align, y.wrap) {
+                        diff.push(format!("align/wrap {:?}", (y.align, y.wrap)));
+                    }
+                    if x.fill.is_some() && x.fill != y.fill {
+                        diff.push(format!("fill {:?}", y.fill));
+                    }
+                    if !diff.is_empty() {
+                        errs.push(format!(
+                            "{file}: {}!{}: {} (source {:?})",
+                            sheet.name,
+                            cell_name(r, c),
+                            diff.join(", "),
+                            (x.bold, x.italic, x.align, x.wrap, x.fill)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(compared > 600, "{compared} cells compared");
+    assert!(
+        errs.is_empty(),
+        "{} problems:\n{}",
+        errs.len(),
+        errs.join("\n")
+    );
+}
+
+/// One token as compared: its id (a shared formula's relative refs as
+/// plain ones), class, and a function's index and argument count.
+type Token = (u8, u8, u32);
+
+/// The tokens of `rgce` as compared: parentheses, the evaluation hints of
+/// ptgAttr (but tAttrSum and tAttrSemi) and the ptgMem wrappers are left
+/// out, as they don't change what Excel computes. `None` for a stream this
+/// doesn't walk.
+fn tokens(rgce: &[u8]) -> Option<Vec<Token>> {
+    let u16_at =
+        |i: usize| -> Option<u16> { Some(u16::from_le_bytes([*rgce.get(i)?, *rgce.get(i + 1)?])) };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < rgce.len() {
+        let p = rgce[i];
+        i += 1;
+        match p {
+            0x15 => {}
+            0x03..=0x16 => out.push((p, 0, 0)),
+            0x17 => {
+                let cch = *rgce.get(i)? as usize;
+                let wide = rgce.get(i + 1)? & 1 == 1;
+                i += 2 + cch * if wide { 2 } else { 1 };
+                out.push((p, 0, 0));
+            }
+            0x19 => {
+                let flags = *rgce.get(i)?;
+                let data = u16_at(i + 1)? as usize;
+                i += 3;
+                if flags & 0x04 != 0 {
+                    i += (data + 1) * 2;
+                }
+                if flags & 0x11 != 0 {
+                    out.push((p, flags & 0x11, 0));
+                }
+            }
+            0x1C | 0x1D => {
+                i += 1;
+                out.push((p, 0, 0));
+            }
+            0x1E => {
+                i += 2;
+                out.push((p, 0, 0));
+            }
+            0x1F => {
+                i += 8;
+                out.push((p, 0, 0));
+            }
+            0x20..=0x7F => {
+                let id = p & 0x1F | 0x20;
+                let class = p & 0x60;
+                let (size, aux) = match id {
+                    0x20 => (7, 0),
+                    0x21 => (2, u16_at(i)? as u32),
+                    0x22 => (3, ((u16_at(i + 1)? as u32) << 8) | *rgce.get(i)? as u32),
+                    0x23 | 0x24 | 0x2A | 0x2C => (4, 0),
+                    0x25 | 0x2B | 0x2D => (8, 0),
+                    0x26..=0x28 => (6, 0),
+                    0x29 => (2, 0),
+                    0x39 | 0x3A | 0x3C => (6, 0),
+                    0x3B | 0x3D => (10, 0),
+                    _ => return None,
+                };
+                i += size;
+                let id = match id {
+                    0x2C => 0x24,
+                    0x2D => 0x25,
+                    other => other,
+                };
+                if !(0x26..=0x29).contains(&id) {
+                    out.push((id, class, aux));
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// A formula cell: (sheet, row, col).
+type Cell3 = (usize, u16, u16);
+
+/// Tokens by (sheet, row, col).
+type FormulaTokens = std::collections::BTreeMap<Cell3, Option<Vec<Token>>>;
+
+/// Each worksheet formula's tokens in an `.xls`: a shared formula's from
+/// its SHRFMLA, an array formula's (on its anchor) from its ARRAY.
+fn xls_formula_tokens(file: &[u8]) -> FormulaTokens {
+    let cfb = opccore::cfb::Cfb::open(file).unwrap();
+    let s = cfb.read_stream("Workbook").unwrap();
+    let mut recs: Vec<(u16, Vec<u8>)> = Vec::new();
+    let mut at = 0;
+    while at + 4 <= s.len() {
+        let ty = u16::from_le_bytes([s[at], s[at + 1]]);
+        let len = u16::from_le_bytes([s[at + 2], s[at + 3]]) as usize;
+        let body = s[at + 4..at + 4 + len].to_vec();
+        match recs.last_mut() {
+            Some(prev) if ty == 0x003C => prev.1.extend(body),
+            _ => recs.push((ty, body)),
+        }
+        at += 4 + len;
+    }
+    let u16_of = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
+    let mut out = FormulaTokens::new();
+    let (mut sheet, mut depth) = (0usize, 0usize);
+    // (cell, the master its ptgExp names)
+    let mut pending: Vec<(Cell3, (u16, u16))> = Vec::new();
+    let mut groups: std::collections::HashMap<Cell3, Vec<u8>> = Default::default();
+    let mut last = (0u16, 0u16);
+    for (ty, b) in &recs {
+        match *ty {
+            0x0809 => {
+                depth += 1;
+                if depth == 1 && u16_of(b, 2) == 0x0010 {
+                    sheet += 1;
+                }
+            }
+            0x000A => depth = depth.saturating_sub(1),
+            _ if depth != 1 || sheet == 0 => {}
+            0x0006 => {
+                let (r, c) = (u16_of(b, 0), u16_of(b, 2));
+                last = (r, c);
+                let cce = u16_of(b, 20) as usize;
+                let rgce = &b[22..22 + cce];
+                if rgce.first() == Some(&0x01) {
+                    pending.push(((sheet - 1, r, c), (u16_of(rgce, 1), u16_of(rgce, 3))));
+                } else {
+                    out.insert((sheet - 1, r, c), tokens(rgce));
+                }
+            }
+            0x04BC => {
+                let cce = u16_of(b, 8) as usize;
+                groups.insert((sheet - 1, last.0, last.1), b[10..10 + cce].to_vec());
+            }
+            0x0221 => {
+                let cce = u16_of(b, 12) as usize;
+                groups.insert(
+                    (sheet - 1, u16_of(b, 0), b[4] as u16),
+                    b[14..14 + cce].to_vec(),
+                );
+            }
+            _ => {}
+        }
+    }
+    for (at, (mr, mc)) in pending {
+        if let Some(rgce) = groups.get(&(at.0, mr, mc)) {
+            out.insert(at, tokens(rgce));
+        }
+    }
+    out
+}
+
+/// Each defined name's tokens in an `.xls`, by name.
+fn xls_name_tokens(file: &[u8]) -> std::collections::BTreeMap<String, Option<Vec<Token>>> {
+    let cfb = opccore::cfb::Cfb::open(file).unwrap();
+    let s = cfb.read_stream("Workbook").unwrap();
+    let mut out = std::collections::BTreeMap::new();
+    let mut at = 0;
+    while at + 4 <= s.len() {
+        let ty = u16::from_le_bytes([s[at], s[at + 1]]);
+        let len = u16::from_le_bytes([s[at + 2], s[at + 3]]) as usize;
+        let b = &s[at + 4..at + 4 + len];
+        if ty == 0x000A {
+            break;
+        }
+        // A defined name (no fFunc/fOB/fProc), its name compressed.
+        if ty == 0x0018 && u16::from_le_bytes([b[0], b[1]]) & 0x0E == 0 && b[14] == 0 {
+            let (cch, cce) = (b[3] as usize, u16::from_le_bytes([b[4], b[5]]) as usize);
+            let name = String::from_utf8_lossy(&b[15..15 + cch]).into_owned();
+            out.insert(name, tokens(&b[15 + cch..15 + cch + cce]));
+        }
+        at += 4 + len;
+    }
+    out
+}
+
+/// The writer gives every corpus formula the tokens Excel gave it, operand
+/// classes included: Excel evaluates a reference token and a value token
+/// differently (scripts/check-xls-writer.ps1 checks the results in Excel
+/// itself). Parentheses and evaluation hints are not compared ([`tokens`]).
+/// So do defined names, and the array formulas of corpus/legacy/arrays,
+/// whose operands Excel evaluates as arrays.
+#[test]
+fn xls_writer_gives_formulas_excels_tokens() {
+    // calc-3d's Total sheet holds Excel's misreading of `Q1:Q3!` (the ALLOW
+    // above): its tokens take Q1 for a cell, the import reads the 3-D
+    // reference the source means, and the writer stores that.
+    let allow = |file: &str, sheet: usize| file == "calc-3d.xls" && sheet == 3;
+    let mut errs = Vec::new();
+    let mut compared = 0;
+    for path in xls_corpus() {
+        let file = path.file_name().unwrap().to_string_lossy().into_owned();
+        let data = std::fs::read(&path).unwrap();
+        let (pkg, _) = open_workbook(&data).unwrap();
+        let written = gridcore::legacy::write_xls(&pkg).bytes;
+        let excel = xls_formula_tokens(&data);
+        let ours = xls_formula_tokens(&written);
+        let (excel_names, our_names) = (xls_name_tokens(&data), xls_name_tokens(&written));
+        for (name, want) in &excel_names {
+            let Some(have) = our_names.get(name) else {
+                continue;
+            };
+            compared += 1;
+            if have != want {
+                errs.push(format!(
+                    "{file}: name {name}: {have:02x?} != Excel's {want:02x?}"
+                ));
+            }
+        }
+        for (&(s, r, c), want) in &excel {
+            // A formula the import couldn't read is written as a value.
+            let Some(have) = ours.get(&(s, r, c)) else {
+                continue;
+            };
+            compared += 1;
+            if have != want && !allow(&file, s) {
+                errs.push(format!(
+                    "{file}: sheet {s} {}: {have:02x?} != Excel's {want:02x?}",
+                    cell_name(r as u32, c as u32)
+                ));
+            }
+        }
+    }
+    println!("{compared} formulas and names compared with Excel's tokens");
+    assert!(compared > 600, "{compared} formulas compared");
+    assert!(
+        errs.is_empty(),
+        "{} problems:\n{}",
+        errs.len(),
+        errs.join("\n")
+    );
+}

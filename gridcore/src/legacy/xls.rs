@@ -2,20 +2,25 @@
 //! `Workbook` stream ([MS-XLS]).
 //!
 //! The globals substream gives the sheets (BOUNDSHEET8), shared strings
-//! (SST), number formats (FORMAT, XF), the date system (DATEMODE), the
-//! reference tables (SUPBOOK, EXTERNSHEET, EXTERNNAME) and defined names
-//! (NAME). Each worksheet substream gives its cells. Records not listed here
-//! are skipped.
+//! (SST), cell formats (FONT, FORMAT, XF, PALETTE), the date system
+//! (DATEMODE), the reference tables (SUPBOOK, EXTERNSHEET, EXTERNNAME),
+//! defined names (NAME) and the active sheet (WINDOW1). Each worksheet
+//! substream gives its cells, merged cells (MERGECELLS), column widths
+//! (COLINFO), row heights (ROW) and frozen panes (WINDOW2, PANE). Records
+//! not listed here are skipped, and those whose content the import leaves
+//! out (charts, comments, conditional formatting, ...) are named in
+//! [`BookIn::dropped`], as are the formats a cell uses that the model can't
+//! hold (underline, borders other than a thin box, ...).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::ftab;
 use super::ptg::{self, Base, Biff, Names};
 use super::{
-    BookIn, ExternalLink, Le, Limits, OpenError, SheetIn, XfFormats, biff_error, on_grid, rk,
-    set_array, sheet_prefix,
+    BookIn, ExternalLink, Le, Limits, OpenError, SheetIn, biff_error, on_grid, rk, set_array,
+    sheet_prefix,
 };
-use crate::sheet::{Cell, CellValue, DefinedName};
+use crate::sheet::{Align, Cell, CellValue, DefinedName, Xf};
 
 /// One record, with any CONTINUE records that follow it appended to `data`.
 /// `breaks` holds the offsets in `data` where each CONTINUE began, which a
@@ -135,8 +140,9 @@ impl<'a> Cur<'a> {
     }
 
     /// `XLUnicodeRichExtendedString` (an SST entry): the text, with its
-    /// formatting runs and phonetic block skipped.
-    fn rich_string(&mut self) -> Option<String> {
+    /// formatting runs and phonetic block skipped; `rich` is set when it has
+    /// runs.
+    fn rich_string(&mut self, rich: &mut bool) -> Option<String> {
         let cch = self.u16()? as usize;
         let flags = self.u8()?;
         let runs = if flags & 0x08 != 0 {
@@ -144,6 +150,7 @@ impl<'a> Cur<'a> {
         } else {
             0
         };
+        *rich |= runs > 0;
         let ext = if flags & 0x04 != 0 {
             self.u32()? as usize
         } else {
@@ -263,28 +270,291 @@ impl Names for Globals {
 
 /// The `_xlnm.` names of BIFF8's built-in name codes.
 fn builtin_name(code: u8) -> String {
-    let n = match code {
-        0x00 => "Consolidate_Area",
-        0x01 => "Auto_Open",
-        0x02 => "Auto_Close",
-        0x03 => "Extract",
-        0x04 => "Database",
-        0x05 => "Criteria",
-        0x06 => "Print_Area",
-        0x07 => "Print_Titles",
-        0x08 => "Recorder",
-        0x09 => "Data_Form",
-        0x0A => "Auto_Activate",
-        0x0B => "Auto_Deactivate",
-        0x0C => "Sheet_Title",
-        0x0D => "_FilterDatabase",
-        _ => return format!("_xlnm.Builtin_{code}"),
-    };
-    format!("_xlnm.{n}")
+    match super::BUILTIN_NAMES.get(code as usize) {
+        Some(n) => format!("_xlnm.{n}"),
+        None => format!("_xlnm.Builtin_{code}"),
+    }
 }
 
 const BOF: u16 = 0x0809;
 const EOF: u16 = 0x000A;
+
+/// A FONT record's fields the import reads.
+struct FontIn {
+    /// Twips.
+    height: u16,
+    grbit: u16,
+    icv: u16,
+    bls: u16,
+    sss: u16,
+    uls: u8,
+    name: String,
+}
+
+/// The colours of indices 0-7, which no palette changes.
+pub(super) const FIXED_COLORS: [(u8, u8, u8); 8] = [
+    (0, 0, 0),
+    (0xFF, 0xFF, 0xFF),
+    (0xFF, 0, 0),
+    (0, 0xFF, 0),
+    (0, 0, 0xFF),
+    (0xFF, 0xFF, 0),
+    (0xFF, 0, 0xFF),
+    (0, 0xFF, 0xFF),
+];
+
+/// The workbook's FONT, FORMAT, XF and PALETTE records, made into the
+/// model's cell formats as the cells use them.
+struct Styles {
+    fonts: Vec<FontIn>,
+    /// Each XF record's 20 bytes (a short one padded).
+    xfs: Vec<[u8; 20]>,
+    palette: [(u8, u8, u8); 56],
+    codes: HashMap<u16, String>,
+    /// XF index → `book.xfs` index, for the XFs made so far.
+    made: HashMap<u16, u32>,
+    /// XFEXT's colours by XF index.
+    ext: HashMap<u16, XfExt>,
+    /// XFCRC's count of XF records. XFEXT is used only when it matches the
+    /// XFs read: another writer that changed the XFs without rewriting
+    /// their XFEXTs (which Excel detects the same way) has stale ones.
+    xf_count: Option<u16>,
+}
+
+/// What an XFEXT says of an XF beyond its palette indices.
+#[derive(Default)]
+struct XfExt {
+    /// The fill's and the text's exact colours (xclrType 2), which replace
+    /// the palette's nearest.
+    fill: Option<(u8, u8, u8)>,
+    color: Option<(u8, u8, u8)>,
+    /// A theme colour other than the default text's (theme 1, no tint):
+    /// the palette's nearest is kept, the theme is lost.
+    theme: bool,
+    /// A gradient fill.
+    gradient: bool,
+}
+
+impl XfExt {
+    /// An XFEXT's ExtProp array (`cexts` of them); a malformed one ends
+    /// the read with what came before it.
+    fn read(c: &mut Cur, cexts: u16) -> XfExt {
+        let mut e = XfExt::default();
+        for _ in 0..cexts {
+            let (Some(ty), Some(cb)) = (c.u16(), c.u16()) else {
+                break;
+            };
+            let Some(body) = (cb as usize).checked_sub(4).and_then(|n| c.take(n)) else {
+                break;
+            };
+            // FullColorExt: xclrType, nTintShade, xclrValue.
+            let color = (body.len() >= 8).then(|| {
+                let kind = u16::from_le_bytes([body[0], body[1]]);
+                let tint = i16::from_le_bytes([body[2], body[3]]);
+                let value = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+                (kind, tint, value, (body[4], body[5], body[6]))
+            });
+            match (ty, color) {
+                // Cell (pattern foreground) and text colours.
+                (4 | 13, Some((kind, tint, value, rgb))) => match kind {
+                    2 if ty == 4 => e.fill = Some(rgb),
+                    2 => e.color = Some(rgb),
+                    3 if !(ty == 13 && value == 1 && tint == 0) => e.theme = true,
+                    _ => {}
+                },
+                (6, _) => e.gradient = true,
+                _ => {}
+            }
+        }
+        e
+    }
+}
+
+impl Styles {
+    /// The colour of palette index `icv`; `None` for the automatic and
+    /// system colours.
+    fn rgb(&self, icv: u16) -> Option<(u8, u8, u8)> {
+        super::icv_rgb(icv as u32, &self.palette)
+    }
+
+    /// The `book.xfs` index of XF `ixfe`, made the first time a cell uses
+    /// it. An XF the model can't hold all of is held as near as it can, and
+    /// what it lacks is named in `book.dropped`.
+    fn of(&mut self, ixfe: u16, book: &mut BookIn) -> u32 {
+        if let Some(&i) = self.made.get(&ixfe) {
+            return i;
+        }
+        let i = match self.xfs.get(ixfe as usize) {
+            Some(raw) => {
+                let mut xf = self.xf(raw, &mut book.dropped);
+                let current = self.xf_count == Some(self.xfs.len() as u16);
+                if let Some(e) = self.ext.get(&ixfe).filter(|_| current) {
+                    if xf.fill.is_some() {
+                        xf.fill = e.fill.or(xf.fill);
+                    }
+                    if let Some(c) = e.color {
+                        xf.color = (c != (0, 0, 0)).then_some(c);
+                    }
+                    if e.theme {
+                        book.dropped.insert("theme colors");
+                    }
+                    if e.gradient {
+                        book.dropped.insert("patterned fills");
+                    }
+                }
+                book.add_xf(xf)
+            }
+            None => 0,
+        };
+        self.made.insert(ixfe, i);
+        i
+    }
+
+    fn xf(&self, b: &[u8; 20], dropped: &mut std::collections::BTreeSet<&'static str>) -> Xf {
+        let u16_at = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
+        let u32_at = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        let mut xf = Xf::default();
+        let code = super::format_code(&self.codes, u16_at(2));
+        if code.is_some() {
+            xf.set_code(code);
+        }
+        // Index 4 doesn't exist: the 5th FONT record is font 5.
+        let ifnt = u16_at(0) as usize;
+        let font = match ifnt {
+            4 => None,
+            i if i > 4 => self.fonts.get(i - 1),
+            i => self.fonts.get(i),
+        };
+        if let Some(f) = font {
+            xf.bold = f.bls >= 600;
+            xf.italic = f.grbit & 0x0002 != 0;
+            // Black is the automatic colour as the model sees it.
+            xf.color = self.rgb(f.icv).filter(|&c| c != (0, 0, 0));
+            let size = f.height as f64 / 20.0;
+            xf.font_size = (size != 11.0).then_some(size);
+            xf.font_name = (!f.name.eq_ignore_ascii_case("Calibri")).then(|| f.name.clone());
+            if f.uls != 0 {
+                dropped.insert("underlined text");
+            }
+            if f.grbit & 0x0008 != 0 {
+                dropped.insert("strikethrough");
+            }
+            if f.sss != 0 {
+                dropped.insert("superscript and subscript");
+            }
+        }
+        xf.quote_prefix = u16_at(4) & 0x0008 != 0;
+        xf.align = match b[6] & 0x07 {
+            0 => Align::General,
+            1 => Align::Left,
+            2 => Align::Center,
+            3 => Align::Right,
+            _ => {
+                dropped.insert("horizontal alignment other than left, center or right");
+                Align::General
+            }
+        };
+        xf.wrap = b[6] & 0x08 != 0;
+        if (b[6] >> 4) & 0x07 != 2 {
+            dropped.insert("vertical alignment");
+        }
+        if b[7] != 0 {
+            dropped.insert("rotated text");
+        }
+        if b[8] & 0x0F != 0 {
+            dropped.insert("indented text");
+        }
+        if b[8] & 0x10 != 0 {
+            dropped.insert("shrink to fit");
+        }
+        let dg = u32_at(10);
+        let sides = [dg & 0xF, (dg >> 4) & 0xF, (dg >> 8) & 0xF, (dg >> 12) & 0xF];
+        let more = u32_at(14);
+        let diagonal = dg >> 30 != 0 && (more >> 21) & 0xF != 0;
+        if sides == [1; 4] {
+            xf.border = true;
+            // Its sides' colours: left, right, top, bottom.
+            let icvs = [
+                (dg >> 16) & 0x7F,
+                (dg >> 23) & 0x7F,
+                more & 0x7F,
+                (more >> 7) & 0x7F,
+            ];
+            if !icvs
+                .iter()
+                .all(|&icv| super::plain_border_color(self.rgb(icv as u16)))
+            {
+                dropped.insert("borders other than a thin box");
+            }
+        } else if sides != [0; 4] {
+            dropped.insert("borders other than a thin box");
+        }
+        if diagonal {
+            dropped.insert("borders other than a thin box");
+        }
+        let fls = (more >> 26) & 0x3F;
+        let fore = u16_at(18) & 0x7F;
+        if fls >= 1 {
+            xf.fill = self.rgb(fore);
+        }
+        if fls > 1 {
+            dropped.insert("patterned fills");
+        }
+        xf
+    }
+}
+
+/// The workbook globals' records the import reads (a guarded arm whose
+/// guard didn't hold is a default, so no loss), and those that hold nothing
+/// a person sees in the workbook. Any other record is named in
+/// `BookIn::unknown_records`, so a record nobody classified can't be lost
+/// without a word.
+#[rustfmt::skip]
+const GLOBALS_KNOWN: &[u16] = &[
+    // Read.
+    0x000E, 0x0012, 0x0017, 0x0018, 0x0019, 0x0022, 0x0023, 0x002F, 0x0031, 0x003D, 0x0040,
+    0x005B, 0x0085, 0x008D, 0x0092, 0x00DA, 0x00E0, 0x00FC, 0x01A9, 0x01AE, 0x01AF, 0x0293,
+    0x041E, 0x0863, 0x087C, 0x087D, 0x088C,
+    // CONTINUE (joined to its record), BOF.
+    0x003C, 0x0809,
+    // PASSWORD (PROTECT's hash; PROTECT is named), CODEPAGE, XCT and CRN
+    // (another workbook's cached cells: formulas into it are counted),
+    // WRITEACCESS, COUNTRY, FNGROUPCOUNT, MMS, INTERFACEHDR,
+    // INTERFACEEND.
+    0x0013, 0x0042, 0x0059, 0x005A, 0x005C, 0x008C, 0x009C, 0x00C1, 0x00E1, 0x00E2,
+    // MSODRAWINGGROUP, and HFPICTURE with the drawing group
+    // (fIsDrawingGroup), which Excel writes beside it: the drawings, and a
+    // sheet's own header and footer pictures (its HFPICTURE), are named
+    // where a sheet has them. EXTSST, TABID, USESELFS, DSF, REFRESHALL,
+    // PROT4REVPASS (PROT4REV's hash), EXCEL9FILE, RECALCID.
+    0x00EB, 0x0866, 0x00FF, 0x013D, 0x0160, 0x0161, 0x01B7, 0x01BC, 0x01C0, 0x01C1,
+    // TABLESTYLES, STYLEEXT, THEME (the theme XFEXT's theme colours
+    // resolve with; those are named), MTRSETTINGS, COMPRESSPICTURES,
+    // FORCEFULLCALCULATION.
+    0x088E, 0x0892, 0x0896, 0x089A, 0x089B, 0x08A3,
+];
+
+/// A worksheet's records, as [`GLOBALS_KNOWN`] is the globals'.
+#[rustfmt::skip]
+const SHEET_KNOWN: &[u16] = &[
+    // Read.
+    0x0006, 0x000C, 0x000D, 0x000F, 0x0010, 0x0011, 0x0012, 0x0014, 0x0015, 0x001A, 0x001B, 0x001C,
+    0x0026, 0x0027, 0x0028, 0x0029, 0x002A, 0x002B, 0x0041, 0x0055, 0x005D, 0x007D, 0x0081, 0x0083,
+    0x0084, 0x0099, 0x009D, 0x00A0, 0x00A1, 0x00AE, 0x00B0, 0x00BD, 0x00BE, 0x00E5, 0x00E9, 0x00EC,
+    0x00FD, 0x01AA, 0x01AD, 0x01B0, 0x01B1, 0x01B2, 0x01B8, 0x01BE, 0x0201, 0x0204, 0x0205, 0x0207,
+    0x0208, 0x0221, 0x0225, 0x0236, 0x023E, 0x027E, 0x04BC, 0x0862, 0x0868, 0x0872, 0x0879, 0x087A,
+    0x088B, 0x005F, 0x0866, 0x089C,
+    // CONTINUE, and USERSVIEWEND (its view's BEGIN is named).
+    0x003C, 0x01AB,
+    // PASSWORD (PROTECT's hash), SELECTION, GUTS (the outline gutters'
+    // size), GRIDSET, OBJPROTECT and SCENPROTECT (PROTECT's parts),
+    // DBCELL, DIMENSIONS, INDEX, TXO (a note's text: notes are named).
+    0x0013, 0x001D, 0x0080, 0x0082, 0x0063, 0x00DD, 0x00D7, 0x0200, 0x020B, 0x01B6,
+    // FEATHDR, FEATHDR11 and LIST12 (FEAT and FEATURE11 are named), and
+    // 0x01C2, which Excel writes beside spilled dynamic arrays (the arrays
+    // are read from their ARRAY records).
+    0x0867, 0x0871, 0x0877, 0x01C2,
+];
 
 /// Read a BIFF8 `Workbook` stream.
 pub(crate) fn read(stream: &[u8]) -> Result<BookIn, OpenError> {
@@ -324,13 +594,22 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
         books: Vec::new(),
         names: Vec::new(),
     };
-    // (stream offset, dt) of each BOUNDSHEET8, in order.
-    let mut plies: Vec<(usize, u8)> = Vec::new();
+    // (stream offset, dt, hidden) of each BOUNDSHEET8, in order.
+    let mut plies: Vec<(usize, u8, bool)> = Vec::new();
     let mut sst: Vec<String> = Vec::new();
-    let mut fmt_codes: HashMap<u16, String> = HashMap::new();
-    let mut xf_fmt: Vec<u16> = Vec::new();
+    let mut rich = false;
+    let mut styles = Styles {
+        fonts: Vec::new(),
+        xfs: Vec::new(),
+        palette: super::xls_write::DEFAULT_PALETTE,
+        codes: HashMap::new(),
+        made: HashMap::new(),
+        ext: HashMap::new(),
+        xf_count: None,
+    };
+    let mut itab_cur = 0usize;
 
-    for r in recs.iter().skip(1) {
+    for (k, r) in recs.iter().enumerate().skip(1) {
         if r.ty == EOF {
             break;
         }
@@ -342,25 +621,152 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
                 0x0022 => book.date1904 = c.u16()? == 1,
                 0x0085 => {
                     let pos = c.u32()? as usize;
-                    c.u8()?;
+                    let state = c.u8()?;
                     let dt = c.u8()?;
                     g.sheets.push(c.short_string()?);
-                    plies.push((pos, dt));
+                    if state & 0x03 == 2 {
+                        book.dropped.insert("very hidden sheets (saved as hidden)");
+                    }
+                    plies.push((pos, dt, state & 0x03 != 0));
                 }
                 0x00FC => {
                     c.u32()?;
                     let unique = c.u32()? as usize;
                     for _ in 0..unique {
-                        sst.push(c.rich_string()?);
+                        sst.push(c.rich_string(&mut rich)?);
                     }
                 }
                 0x041E => {
                     let id = c.u16()?;
-                    fmt_codes.insert(id, c.xl_string()?);
+                    styles.codes.insert(id, c.xl_string()?);
                 }
                 0x00E0 => {
+                    let mut raw = [0u8; 20];
+                    let n = r.data.len().min(20);
+                    raw[..n].copy_from_slice(&r.data[..n]);
+                    styles.xfs.push(raw);
+                }
+                0x0031 => {
+                    let height = c.u16()?;
+                    let grbit = c.u16()?;
+                    let icv = c.u16()?;
+                    let bls = c.u16()?;
+                    let sss = c.u16()?;
+                    let uls = c.u8()?;
+                    c.take(3)?;
+                    styles.fonts.push(FontIn {
+                        height,
+                        grbit,
+                        icv,
+                        bls,
+                        sss,
+                        uls,
+                        name: c.short_string()?,
+                    });
+                }
+                0x0092 => {
+                    let n = (c.u16()? as usize).min(56);
+                    for i in 0..n {
+                        let rgb = c.take(4)?;
+                        styles.palette[i] = (rgb[0], rgb[1], rgb[2]);
+                    }
+                }
+                0x003D => {
+                    c.take(8)?;
+                    let grbit = c.u16()?;
+                    itab_cur = c.u16()? as usize;
+                    let first = c.u16()?;
                     c.u16()?;
-                    xf_fmt.push(c.u16()?);
+                    let ratio = c.u16()?;
+                    // Hidden or minimized, scroll bars or sheet tabs
+                    // hidden, no AutoFilter date grouping, the first tab
+                    // shown, the tab bar's width: other than Excel's.
+                    if grbit & 0x007B != 0x0038 || first != 0 || ratio != 600 {
+                        book.dropped.insert("workbook window settings");
+                    }
+                }
+                // HIDEOBJ: objects shown as placeholders, or hidden.
+                0x008D if c.u16()? != 0 => {
+                    book.dropped.insert("workbook window settings");
+                }
+                // BACKUP: Always create backup.
+                0x0040 if c.u16()? != 0 => {
+                    book.dropped.insert("backup copy on save");
+                }
+                // PROT4REV: sharing with track changes protected.
+                0x01AF if c.u16()? != 0 => {
+                    book.dropped.insert("workbook protection");
+                }
+                // XFCRC: how many XFs the XFEXTs were written for.
+                0x087C => {
+                    c.take(14)?;
+                    styles.xf_count = Some(c.u16()?);
+                }
+                // XFEXT: an XF's exact and theme colours.
+                0x087D => {
+                    c.take(14)?;
+                    let ixfe = c.u16()?;
+                    c.u16()?;
+                    let cexts = c.u16()?;
+                    styles.ext.insert(ixfe, XfExt::read(&mut c, cexts));
+                }
+                // BOOKBOOL: external links' values not saved
+                // (fNoSaveSup), or their update not left to the prompt
+                // (grUpdateLinks).
+                0x00DA => {
+                    let f = c.u16()?;
+                    if f & 0x0001 != 0 || f & 0x0060 != 0 {
+                        book.dropped.insert("external link settings");
+                    }
+                }
+                // BOOKEXT: no AutoRecover (fDontAutoRecover), or personal
+                // information removed on save (fFilterPrivacy).
+                0x0863 => {
+                    c.take(16)?;
+                    if c.u32()? & 0x0005 != 0 {
+                        book.dropped.insert("workbook options");
+                    }
+                }
+                // COMPAT12: no Compatibility Checker on save.
+                0x088C => {
+                    c.take(12)?;
+                    if c.u32()? != 0 {
+                        book.dropped.insert("workbook options");
+                    }
+                }
+                // USERBVIEW: a custom view.
+                0x01A9 => {
+                    book.dropped.insert("custom views");
+                }
+                // STYLE: a cell style of the workbook's own; the import
+                // keeps the cells' formats alone. Excel 2007's built-in
+                // styles (Accent1, Good, ...) have fBuiltIn clear, and a
+                // STYLEEXT after them that says they're built in.
+                0x0293 if c.u16()? & 0x8000 == 0 => {
+                    let builtin = recs
+                        .get(k + 1)
+                        .filter(|n| n.ty == 0x0892)
+                        .and_then(|n| n.data.get(12))
+                        .is_some_and(|f| f & 0x01 != 0);
+                    if !builtin {
+                        book.dropped.insert("cell styles");
+                    }
+                }
+                0x0012 if c.u16()? != 0 => {
+                    book.dropped.insert("workbook protection");
+                }
+                // FILESHARING: read-only recommended, or a password to
+                // modify.
+                0x005B if c.u16()? != 0 || c.u16()? != 0 => {
+                    book.dropped
+                        .insert("password to modify and read-only recommendation");
+                }
+                0x0019 if c.u16()? != 0 => {
+                    book.dropped.insert("workbook protection");
+                }
+                // PRECISION 0: Set precision as displayed.
+                0x000E if c.u16()? == 0 => {
+                    book.dropped.insert("precision as displayed");
                 }
                 // SUPBOOK: the book takes its place before the rest is
                 // read, so a record cut short doesn't shift the books after
@@ -427,6 +833,12 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
                     if flags & 0x20 != 0 {
                         name = builtin_name(name.chars().next().map_or(0xFF, |ch| ch as u8));
                     }
+                    // A hidden defined name (not a function's, nor a
+                    // built-in one) comes back visible.
+                    if flags & 0x01 != 0 && flags & 0x2E == 0 {
+                        book.dropped
+                            .insert("hidden defined names (saved as visible)");
+                    }
                     let rgce = c.take(cce)?.to_vec();
                     let extra = c.rest().to_vec();
                     g.names.push(RawName {
@@ -438,7 +850,10 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
                         extra,
                     });
                 }
-                _ => {}
+                ty if GLOBALS_KNOWN.contains(&ty) => {}
+                ty => {
+                    book.unknown_records.insert(ty);
+                }
             }
             Some(())
         })();
@@ -476,10 +891,9 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
         *k = Some(book.external_links.len() - 1);
     }
 
-    let formats = XfFormats {
-        xf_fmt,
-        codes: fmt_codes,
-    };
+    if rich {
+        book.dropped.insert("formatting within cell text");
+    }
 
     // Worksheets, in BOUNDSHEET8 order; `imported[i]` is the model index
     // of BOUNDSHEET8 `i`, for sheet-scoped names.
@@ -488,22 +902,30 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
     // A substream two BOUNDSHEET8s point at is read once (a crafted file
     // could otherwise multiply one sheet's cells by its sheet count).
     let mut seen: HashSet<usize> = HashSet::new();
-    for (i, &(pos, dt)) in plies.iter().enumerate() {
+    for (i, &(pos, dt, hidden)) in plies.iter().enumerate() {
         let start = index.get(&pos).copied().filter(|_| seen.insert(pos));
         let is_sheet = dt == 0
             && start
                 .and_then(|s| recs[s].data.get(2..4))
                 .is_some_and(|d| u16::from_le_bytes([d[0], d[1]]) == 0x0010);
         let (Some(start), true) = (start, is_sheet) else {
+            book.dropped.insert(match dt {
+                0x01 => "Excel 4.0 macro sheets",
+                0x02 => "chart sheets",
+                0x06 => "VB modules",
+                _ => "sheets that are not worksheets",
+            });
             imported.push(None);
             continue;
         };
-        let sheet = read_sheet(&recs[start + 1..], &g, &sst, &mut book, &formats)?;
+        let mut sheet = read_sheet(&recs[start + 1..], &g, &sst, &mut book, &mut styles)?;
+        if i == itab_cur {
+            book.active = book.sheets.len();
+        }
         imported.push(Some(book.sheets.len()));
-        book.push_sheet(SheetIn {
-            name: g.sheets[i].clone(),
-            cells: sheet,
-        })?;
+        sheet.name = g.sheets[i].clone();
+        sheet.hidden = hidden;
+        book.push_sheet(sheet)?;
     }
 
     for n in &g.names {
@@ -515,11 +937,15 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
             t => match imported.get(t as usize - 1).copied().flatten() {
                 Some(s) => Some(s),
                 // Scoped to a chart or macro sheet that wasn't imported.
-                None => continue,
+                None => {
+                    book.unread_names += 1;
+                    continue;
+                }
             },
         };
         let Some(formula) = ptg::decompile(Biff::V8, &n.rgce, &n.extra, Base::Cell(None), &g)
         else {
+            book.unread_names += 1;
             continue;
         };
         book.names.push(DefinedName {
@@ -545,14 +971,18 @@ struct Pending {
 /// data.
 type Group = ((u32, u32, u32, u32), Vec<u8>, Vec<u8>);
 
-/// One worksheet substream (the records after its BOF) to cells.
+/// One worksheet substream (the records after its BOF) to a sheet: its
+/// cells and layout.
 fn read_sheet(
     recs: &[Rec],
     g: &Globals,
     sst: &[String],
     book: &mut BookIn,
-    formats: &XfFormats,
-) -> Result<BTreeMap<(u32, u32), Cell>, OpenError> {
+    styles: &mut Styles,
+) -> Result<SheetIn, OpenError> {
+    let mut sheet = SheetIn::default();
+    let mut frozen = false;
+    let (mut iteration, mut calc_count, mut delta) = (None, None, None);
     let mut cells = BTreeMap::new();
     // Cells charged to the workbook's budget so far.
     let mut charged = 0usize;
@@ -568,12 +998,12 @@ fn read_sheet(
     // Array formulas: anchor → (range, rgce, extra).
     let mut arrays: HashMap<(u32, u32), Group> = HashMap::new();
 
-    let put = |cells: &mut BTreeMap<(u32, u32), Cell>,
-               r: u16,
-               c: u16,
-               ixfe: u16,
-               value: CellValue,
-               book: &mut BookIn| {
+    let mut put = |cells: &mut BTreeMap<(u32, u32), Cell>,
+                   r: u16,
+                   c: u16,
+                   ixfe: u16,
+                   value: CellValue,
+                   book: &mut BookIn| {
         if !on_grid(r as u32, c as u32) {
             return;
         }
@@ -581,7 +1011,7 @@ fn read_sheet(
             (r as u32, c as u32),
             Cell {
                 value,
-                style: formats.format_of(ixfe.into(), book),
+                style: styles.of(ixfe, book),
                 ..Cell::default()
             },
         );
@@ -595,6 +1025,7 @@ fn read_sheet(
         match r.ty {
             BOF => {
                 depth += 1;
+                book.dropped.insert("pictures, shapes and charts");
                 continue;
             }
             EOF if depth > 0 => {
@@ -701,10 +1132,12 @@ fn read_sheet(
                             at,
                             master: (mr, mc),
                         });
-                    } else if let Some(f) =
-                        ptg::decompile(Biff::V8, rgce, extra, Base::Cell(Some(at)), g)
-                    {
-                        cells.get_mut(&at)?.formula = Some(f);
+                    } else {
+                        match ptg::decompile(Biff::V8, rgce, extra, Base::Cell(Some(at)), g) {
+                            Some(f) => cells.get_mut(&at)?.formula = Some(f),
+                            None if cells.contains_key(&at) => book.unread_formulas += 1,
+                            None => {}
+                        }
                     }
                 }
                 0x0207 => {
@@ -736,7 +1169,261 @@ fn read_sheet(
                     let rgce = c.take(cce)?.to_vec();
                     arrays.insert((range.0, range.2), (range, rgce, c.rest().to_vec()));
                 }
-                _ => {}
+                0x00E5 => {
+                    let n = c.u16()?;
+                    for _ in 0..n {
+                        let (r1, r2, c1, c2) = (c.u16()?, c.u16()?, c.u16()?, c.u16()?);
+                        let (r1, r2, c1, c2) = (r1 as u32, r2 as u32, c1 as u32, c2 as u32);
+                        if r2 >= r1 && c2 >= c1 && on_grid(r2, c2) {
+                            sheet.merges.push((r1, c1, r2, c2));
+                        }
+                    }
+                }
+                0x007D => {
+                    let (first, last, coldx) = (c.u16()?, c.u16()?, c.u16()?);
+                    let ixfe = c.u16()?;
+                    let grbit = c.u16()?;
+                    let hidden = grbit & 0x0001 != 0;
+                    // The width whether or not fUserSet says it was set (as
+                    // LibreOffice reads it: other writers leave the flag
+                    // clear), unless it is the sheet's default: its
+                    // STANDARDWIDTH, or else DEFCOLWIDTH's characters plus
+                    // the padding (Excel writes 8 characters as 2194).
+                    let base = sheet.base_col_width.unwrap_or(8).min(255) * 256;
+                    let default = match sheet.default_col_width {
+                        Some(w) => (coldx as f64 - w * 256.0).abs() < 1.0,
+                        None => (base..base + 256).contains(&(coldx as u32)),
+                    };
+                    let width = (grbit & 0x0002 != 0 || !default).then_some(coldx as f64 / 256.0);
+                    if ixfe != 15 {
+                        book.dropped.insert("column and row formats");
+                    }
+                    if grbit & 0x0700 != 0 {
+                        book.dropped.insert("outlines (grouped rows and columns)");
+                    }
+                    let last = (last as u32).min(crate::sheet::MAX_COLS - 1);
+                    if (width.is_some() || hidden) && first as u32 <= last {
+                        sheet.cols.push((first as u32, last, width, hidden));
+                    }
+                }
+                0x0208 => {
+                    let row = c.u16()?;
+                    c.take(4)?;
+                    let miy = c.u16()?;
+                    c.take(4)?;
+                    let grbit = c.u16()?;
+                    let ixfe = c.u16().unwrap_or(15) & 0x0FFF;
+                    let hidden = grbit & 0x0020 != 0;
+                    let height = (grbit & 0x0040 != 0).then_some((miy & 0x7FFF) as f64 / 20.0);
+                    // fGhostDirty: the row has a format of its own.
+                    if grbit & 0x0080 != 0 && ixfe != 15 {
+                        book.dropped.insert("column and row formats");
+                    }
+                    if grbit & 0x0007 != 0 {
+                        book.dropped.insert("outlines (grouped rows and columns)");
+                    }
+                    if height.is_some() || hidden {
+                        sheet.rows.push((row as u32, height, hidden));
+                    }
+                }
+                0x023E => {
+                    let grbit = c.u16()?;
+                    frozen = grbit & 0x0008 != 0;
+                    // View settings the model lacks: formulas shown,
+                    // gridlines, headings or zeros hidden, right to left.
+                    // Also a non-default header colour or outline symbols
+                    // hidden.
+                    if grbit & 0x0001 != 0
+                        || grbit & 0x0016 != 0x0016
+                        || grbit & 0x0040 != 0
+                        || grbit & 0x00A0 != 0x00A0
+                        || grbit & 0x0800 != 0
+                    {
+                        book.dropped.insert("sheet view settings");
+                    }
+                }
+                // CALCMODE: manual (0), or automatic except data tables (-1).
+                0x000D => match c.u16()? {
+                    0 => {
+                        book.dropped.insert("manual calculation");
+                    }
+                    0xFFFF => {
+                        book.dropped
+                            .insert("automatic calculation except data tables");
+                    }
+                    _ => {}
+                },
+                // DEFAULTROWHEIGHT, DEFCOLWIDTH, STANDARDWIDTH.
+                0x0225 => {
+                    // fDyZero: rows are hidden by default, and the height
+                    // is a hidden row's.
+                    if c.u16()? & 0x0002 != 0 {
+                        book.dropped.insert("rows hidden by default");
+                    } else {
+                        sheet.default_row_height = Some(c.u16()? as f64 / 20.0);
+                    }
+                }
+                // REFMODE 0: R1C1 references.
+                0x000F if c.u16()? == 0 => {
+                    book.dropped.insert("R1C1 reference style");
+                }
+                // HEADERFOOTER: different odd and even or first page
+                // headers, their text, or headers that don't scale with
+                // the document or align with its margins.
+                0x089C => {
+                    c.take(28)?;
+                    let flags = c.u16()?;
+                    let cch = [c.u16()?, c.u16()?, c.u16()?, c.u16()?];
+                    if flags & 0x0003 != 0
+                        || flags & 0x000C != 0x000C
+                        || cch.iter().any(|&n| n != 0)
+                    {
+                        book.dropped.insert("page setup");
+                    }
+                }
+                // SAVERECALC 0: no recalculation before saving.
+                0x005F if c.u16()? == 0 => {
+                    book.dropped.insert("workbook options");
+                }
+                // HFPICTURE: the sheet's header and footer pictures.
+                0x0866 => {
+                    book.dropped.insert("header and footer pictures");
+                }
+                // USERSVIEWBEGIN: a custom view's settings for the sheet.
+                0x01AA => {
+                    book.dropped.insert("custom views");
+                }
+                // FEAT: protected ranges (isf 2), ignored errors (3),
+                // smart tags (4).
+                0x0868 => {
+                    c.take(12)?;
+                    match c.u16()? {
+                        2 => book.dropped.insert("protected ranges"),
+                        3 => book.dropped.insert("ignored errors"),
+                        4 => book.dropped.insert("smart tags"),
+                        _ => false,
+                    };
+                }
+                // FEATURE11: a table (Excel 2003's list).
+                0x0872 => {
+                    book.dropped
+                        .insert("tables (their cells are kept as plain ranges)");
+                }
+                // PLV: Page Layout view.
+                0x088B => {
+                    c.take(14)?;
+                    if c.u16()? & 0x0001 != 0 {
+                        book.dropped.insert("sheet view settings");
+                    }
+                }
+                0x0055 => sheet.base_col_width = Some(c.u16()? as u32),
+                0x0099 => sheet.default_col_width = Some(c.u16()? as f64 / 256.0),
+                // SCL: a zoom other than 100%.
+                0x00A0 if c.u16()? != c.u16()? => {
+                    book.dropped.insert("sheet view settings");
+                }
+                0x00B0 => {
+                    book.dropped.insert("PivotTables");
+                }
+                0x00E9 => {
+                    book.dropped.insert("sheet backgrounds");
+                }
+                // SHEETEXT: a tab colour other than automatic (0x7F).
+                0x0862 => {
+                    c.take(12)?;
+                    if c.u32()? >= 20 && c.u32()? & 0x7F != 0x7F {
+                        book.dropped.insert("sheet tab colors");
+                    }
+                }
+                0x00AE => {
+                    book.dropped.insert("scenarios");
+                }
+                0x01AD => {
+                    book.dropped.insert("external data ranges");
+                }
+                // PRINTHEADERS, PRINTGRIDLINES, HCENTER, VCENTER.
+                0x002A | 0x002B | 0x0083 | 0x0084 if c.u16()? != 0 => {
+                    book.dropped.insert("page setup");
+                }
+                // Iterative calculation, the same in every sheet's block.
+                0x0011 => iteration = Some(c.u16()? != 0),
+                0x000C => calc_count = Some(c.u16()?),
+                0x0010 => delta = Some(c.f64()?),
+                0x0041 if frozen => {
+                    let (x, y) = (c.u16()?, c.u16()?);
+                    sheet.freeze = (y as u32, x as u32);
+                }
+                // A PANE under an unfrozen WINDOW2: a split window.
+                0x0041 => {
+                    book.dropped.insert("sheet view settings");
+                }
+                0x005D | 0x00EC => {
+                    book.dropped.insert("pictures, shapes and charts");
+                }
+                0x001C => {
+                    book.dropped.insert("comments");
+                }
+                0x01B0 | 0x01B1 | 0x0879 | 0x087A => {
+                    book.dropped.insert("conditional formatting");
+                }
+                0x01B2 | 0x01BE => {
+                    book.dropped.insert("data validation");
+                }
+                0x01B8 => {
+                    book.dropped.insert("hyperlinks");
+                }
+                0x009D => {
+                    book.dropped.insert("AutoFilter");
+                }
+                0x0236 => {
+                    book.dropped.insert("data tables");
+                }
+                0x0012 if c.u16()? != 0 => {
+                    book.dropped.insert("sheet protection");
+                }
+                0x001A | 0x001B if c.u16()? != 0 => {
+                    book.dropped.insert("page breaks");
+                }
+                0x0014 | 0x0015 if !r.data.is_empty() => {
+                    book.dropped.insert("page setup");
+                }
+                0x0081 if c.u16()? & 0x0100 != 0 => {
+                    book.dropped.insert("page setup");
+                }
+                0x00A1 => {
+                    c.u16()?;
+                    let scale = c.u16()?;
+                    c.take(6)?;
+                    let grbit = c.u16()?;
+                    c.take(4)?;
+                    let (header, footer) = (c.f64()?, c.f64()?);
+                    // fPortrait off is landscape, unless fNoPls or
+                    // fNoOrient says there is no orientation; the header and
+                    // footer margins count only with the printer settings.
+                    let landscape = grbit & 0x0046 == 0;
+                    let set = grbit & 0x0004 == 0;
+                    // Over then down, black and white, draft, comments,
+                    // a first page number.
+                    let options = grbit & 0x00B9 != 0;
+                    if (set
+                        && (scale != 100 || options || !near(header, 0.3) || !near(footer, 0.3)))
+                        || landscape
+                    {
+                        book.dropped.insert("page setup");
+                    }
+                }
+                // LEFTMARGIN, RIGHTMARGIN, TOPMARGIN, BOTTOMMARGIN: other
+                // than Excel's Normal margins.
+                0x0026..=0x0029 => {
+                    let normal = if r.ty <= 0x0027 { 0.7 } else { 0.75 };
+                    if !near(c.f64()?, normal) {
+                        book.dropped.insert("page setup");
+                    }
+                }
+                ty if SHEET_KNOWN.contains(&ty) => {}
+                ty => {
+                    book.unknown_records.insert(ty);
+                }
             }
             Some(())
         })();
@@ -751,29 +1438,39 @@ fn read_sheet(
             // An array formula lives on its anchor; the other cells of the
             // range hold plain values, as an .xlsx keeps them.
             if p.at == p.master {
-                let Some(f) = ptg::decompile(Biff::V8, rgce, extra, Base::Cell(Some(p.at)), g)
-                else {
+                let Some(cell) = cells.get_mut(&p.at) else {
                     continue;
                 };
-                if let Some(cell) = cells.get_mut(&p.at) {
-                    set_array(cell, *range, f);
-                }
+                let kept = ptg::decompile(Biff::V8, rgce, extra, Base::Cell(Some(p.at)), g)
+                    .is_some_and(|f| set_array(cell, *range, f));
+                book.unread_formulas += usize::from(!kept);
             }
+            continue;
+        }
+        if !cells.contains_key(&p.at) {
             continue;
         }
         // A cell outside the group's stated range still takes it: writers
         // get the range wrong, and the tokens are relative to the cell.
-        let Some((_, rgce, extra)) = shared.get(&p.master) else {
-            continue;
-        };
         let base = Base::Shared(p.at.0, p.at.1);
-        if let Some(f) = ptg::decompile(Biff::V8, rgce, extra, base, g) {
-            if let Some(cell) = cells.get_mut(&p.at) {
-                cell.formula = Some(f);
-            }
+        let f = shared
+            .get(&p.master)
+            .and_then(|(_, rgce, extra)| ptg::decompile(Biff::V8, rgce, extra, base, g));
+        match (f, cells.get_mut(&p.at)) {
+            (Some(f), Some(cell)) => cell.formula = Some(f),
+            _ => book.unread_formulas += 1,
         }
     }
-    Ok(cells)
+    sheet.cells = cells;
+    if book.sheets.is_empty() && iteration == Some(true) {
+        book.iterate = Some((calc_count.unwrap_or(100) as u32, delta.unwrap_or(0.001)));
+    }
+    Ok(sheet)
+}
+
+/// Whether two margins (inches) are the same, as Excel rounds them.
+fn near(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-6
 }
 
 /// A `RefU`: rwFirst, rwLast (16-bit), colFirst, colLast (8-bit), as
@@ -1210,6 +1907,669 @@ pub(crate) mod tests {
         assert_eq!(c.len(), 2);
     }
 
+    /// An XF record: font, format, alignment byte, border word, fill.
+    fn xf_rec(ifnt: u16, align: u8, dg: u32, fill: u32) -> Vec<u8> {
+        let mut b = ifnt.to_le_bytes().to_vec();
+        b.extend([0, 0, 1, 0, align, 0, 0, 0xFC]);
+        b.extend(dg.to_le_bytes());
+        b.extend(fill.to_le_bytes());
+        b.extend([0x40, 0x20]);
+        rec(0x00E0, &b)
+    }
+
+    fn font_rec(bls: u16, uls: u8, grbit: u16) -> Vec<u8> {
+        let mut b = 220u16.to_le_bytes().to_vec();
+        b.extend(grbit.to_le_bytes());
+        b.extend(0x7FFFu16.to_le_bytes());
+        b.extend(bls.to_le_bytes());
+        b.extend([0, 0, uls, 0, 0, 0]);
+        b.extend(short("Calibri"));
+        rec(0x0031, &b)
+    }
+
+    /// What the model can't hold of a cell's format is named, only for the
+    /// formats cells use; what it can is read.
+    #[test]
+    fn formats_the_model_lacks_are_dropped_by_name() {
+        let fonts: Vec<Vec<u8>> = vec![
+            font_rec(400, 0, 0),
+            font_rec(400, 0, 0),
+            font_rec(400, 0, 0),
+            font_rec(400, 0, 0),
+            // Font 5: bold, underlined, struck through.
+            font_rec(700, 1, 0x0008),
+        ];
+        let mut globals = fonts;
+        // XF 0: plain. XF 1: font 5, centred, wrap, top-aligned, bottom
+        // border only, a gray-50% pattern. XF 2: an unused format with
+        // rotated text.
+        globals.push(xf_rec(0, 0x20, 0, 0));
+        globals.push(xf_rec(5, 0x02 | 0x08, 0x1000, 2 << 26));
+        let mut rot = xf_rec(0, 0x20, 0, 0);
+        rot[4 + 7] = 45;
+        globals.push(rot);
+        let mut d = cell(0, 0, 1);
+        d.extend(1.0f64.to_le_bytes());
+        let stream = workbook(&globals, &[rec(0x0203, &d), rec(0x001C, &[0; 12])]);
+        let book = read(&stream).unwrap();
+        let xf = &book.xfs[data(&book)[&(0, 0)].style as usize];
+        assert!(xf.bold && xf.wrap && !xf.border);
+        assert_eq!(xf.align, Align::Center);
+        assert_eq!(
+            book.dropped.iter().copied().collect::<Vec<_>>(),
+            [
+                "borders other than a thin box",
+                "comments",
+                "patterned fills",
+                "strikethrough",
+                "underlined text",
+                "vertical alignment"
+            ]
+        );
+    }
+
+    /// A thin box is the model's border in any colour, but a colour other
+    /// than black or automatic is named lost (#874 r9).
+    #[test]
+    fn a_coloured_thin_box_keeps_the_border_and_names_its_colour() {
+        let boxed = |left: u32, right: u32, top: u32, bottom: u32| {
+            let globals = vec![
+                font_rec(400, 0, 0),
+                xf_rec(0, 0x20, 0, 0),
+                xf_rec(
+                    0,
+                    0x20,
+                    0x1111 | left << 16 | right << 23,
+                    top | bottom << 7,
+                ),
+            ];
+            let mut d = cell(0, 0, 1);
+            d.extend(1.0f64.to_le_bytes());
+            let book = read(&workbook(&globals, &[rec(0x0203, &d)])).unwrap();
+            let border = book.xfs[data(&book)[&(0, 0)].style as usize].border;
+            (border, book.dropped.iter().copied().collect::<Vec<_>>())
+        };
+        // Black (palette 8 and fixed 0) and automatic (0x40) sides.
+        assert_eq!(boxed(8, 0, 0x40, 0x7F), (true, vec![]));
+        // A red side (palette 10).
+        assert_eq!(
+            boxed(8, 8, 10, 8),
+            (true, vec!["borders other than a thin box"])
+        );
+    }
+
+    /// DEFCOLWIDTH 255 makes the default band end past u16 (#874 r9).
+    #[test]
+    fn the_widest_defcolwidth_reads() {
+        let mut b = Vec::new();
+        for v in [0u16, 0, 65300, 15, 0, 0] {
+            b.extend(v.to_le_bytes());
+        }
+        let book = read(&workbook(&[], &[rec(0x0055, &[255, 0]), rec(0x007D, &b)])).unwrap();
+        assert!(book.sheets[0].cols.is_empty());
+    }
+
+    /// Margins are page setup the import leaves out: Excel's Normal ones
+    /// are no loss, others are.
+    #[test]
+    fn custom_margins_are_dropped_page_setup() {
+        let margin = |ty: u16, v: f64| rec(ty, &v.to_le_bytes());
+        let normal = [
+            margin(0x0026, 0.7),
+            margin(0x0027, 0.7),
+            margin(0x0028, 0.75),
+            margin(0x0029, 0.75),
+        ];
+        let book = read(&workbook(&[], &normal)).unwrap();
+        assert!(book.dropped.is_empty());
+        let book = read(&workbook(&[], &[margin(0x0026, 1.0)])).unwrap();
+        assert_eq!(
+            book.dropped.iter().copied().collect::<Vec<_>>(),
+            ["page setup"]
+        );
+    }
+
+    /// A formula the reader can't read keeps its value and is counted: one
+    /// whose 3-D reference names another workbook's sheet, one with a
+    /// token it doesn't know; a defined name likewise.
+    #[test]
+    fn unread_formulas_and_names_are_counted() {
+        let other = supbook(b"other.xls", &["Data"]);
+        let xti = extern_sheet(&[(0, 0, 0)]);
+        // ptgRef3d into the external book, and ptgSxName (0x18 + 0x01), which
+        // isn't read.
+        let ext = [0x3A, 0, 0, 0, 0, 0, 0];
+        let unknown = [0x18, 0x01, 0, 0, 0, 0];
+        let mut name = 0u16.to_le_bytes().to_vec();
+        name.push(0);
+        name.push(4);
+        name.extend((ext.len() as u16).to_le_bytes());
+        name.extend([0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        name.extend(b"Ext1");
+        name.extend_from_slice(&ext);
+        let stream = workbook(
+            &[other, xti, rec(0x0018, &name)],
+            &[formula(0, 0, 5.0, &ext), formula(1, 0, 6.0, &unknown)],
+        );
+        let cfb = opccore::cfb::write_cfb(&[("Workbook", stream)]);
+        let o = crate::legacy::open_workbook_ex(&cfb).unwrap();
+        assert_eq!(
+            o.dropped,
+            [
+                "1 defined name that can't be read",
+                "2 formulas that refer to other workbooks or can't be read (kept as values)"
+            ]
+        );
+        let cells = &o.pkg.workbook.sheets[0].cells;
+        assert_eq!(cells[&(0, 0)].value, CellValue::Number(5.0));
+        assert_eq!(cells[&(0, 0)].formula, None);
+    }
+
+    /// What the model lacks of a sheet's views, PivotTables, scenarios,
+    /// external data, print options and very hidden state is named.
+    #[test]
+    fn unmodelled_sheet_records_are_dropped_by_name() {
+        let w2 = |grbit: u16| {
+            let mut b = grbit.to_le_bytes().to_vec();
+            b.extend([0; 16]);
+            rec(0x023E, &b)
+        };
+        let cases: Vec<(Vec<u8>, &str)> = vec![
+            (w2(0x06B4), "sheet view settings"),
+            (rec(0x00A0, &[3, 0, 4, 0]), "sheet view settings"),
+            (rec(0x00B0, &[0; 4]), "PivotTables"),
+            (rec(0x00AE, &[0; 4]), "scenarios"),
+            (rec(0x01AD, &[0; 4]), "external data ranges"),
+            (rec(0x002B, &[1, 0]), "page setup"),
+            (rec(0x0083, &[1, 0]), "page setup"),
+            (rec(0x000D, &[0, 0]), "manual calculation"),
+            (w2(0x06B7), "sheet view settings"),
+            (w2(0x06A6), "sheet view settings"),
+            (w2(0x06B2), "sheet view settings"),
+            (w2(0x06F6), "sheet view settings"),
+            (w2(0x0636), "sheet view settings"),
+            (w2(0x0696), "sheet view settings"),
+            (
+                rec(0x0041, &[0, 4, 0, 0, 0, 0, 0, 0, 3, 0]),
+                "sheet view settings",
+            ),
+        ];
+        for (r, want) in cases {
+            let book = read(&workbook(&[], &[r])).unwrap();
+            assert_eq!(book.dropped.iter().copied().collect::<Vec<_>>(), [want]);
+        }
+        // Excel's defaults are no loss.
+        let plain = [
+            w2(0x06B6),
+            rec(0x00A0, &[1, 0, 1, 0]),
+            rec(0x002B, &[0, 0]),
+            rec(0x000D, &[1, 0]),
+        ];
+        assert!(read(&workbook(&[], &plain)).unwrap().dropped.is_empty());
+        // SETUP's draft bit, with printer settings.
+        let mut setup = vec![0u8; 34];
+        setup[2] = 100;
+        setup[10] = 0x12;
+        setup[16..24].copy_from_slice(&0.3f64.to_le_bytes());
+        setup[24..32].copy_from_slice(&0.3f64.to_le_bytes());
+        let book = read(&workbook(&[], &[rec(0x00A1, &setup)])).unwrap();
+        assert_eq!(
+            book.dropped.iter().copied().collect::<Vec<_>>(),
+            ["page setup"]
+        );
+        setup[10] = 0x02;
+        assert!(
+            read(&workbook(&[], &[rec(0x00A1, &setup)]))
+                .unwrap()
+                .dropped
+                .is_empty()
+        );
+        // Precision as displayed (globals' PRECISION 0).
+        let book = read(&workbook(&[rec(0x000E, &[0, 0])], &[])).unwrap();
+        assert_eq!(
+            book.dropped.iter().copied().collect::<Vec<_>>(),
+            ["precision as displayed"]
+        );
+        assert!(
+            read(&workbook(&[rec(0x000E, &[1, 0])], &[]))
+                .unwrap()
+                .dropped
+                .is_empty()
+        );
+        // A very hidden sheet (BOUNDSHEET state 2).
+        let mut stream = workbook(&[], &[]);
+        let bs = stream.windows(2).position(|w| w == [0x85, 0x00]).unwrap();
+        stream[bs + 8] = 2;
+        let book = read(&stream).unwrap();
+        assert_eq!(
+            book.dropped.iter().copied().collect::<Vec<_>>(),
+            ["very hidden sheets (saved as hidden)"]
+        );
+        assert!(book.sheets[0].hidden);
+    }
+
+    /// An embedded chart, and a VBA project's storage beside the stream.
+    #[test]
+    fn charts_and_vba_projects_are_dropped_by_name() {
+        let stream = workbook(&[], &[bof(0x0020), rec(EOF, &[])]);
+        let cfb = opccore::cfb::write_cfb_tree(&[
+            opccore::cfb::Node::Stream("Workbook", stream),
+            opccore::cfb::Node::Storage(
+                "_VBA_PROJECT_CUR",
+                vec![opccore::cfb::Node::Stream("PROJECT", vec![1, 2, 3])],
+            ),
+        ]);
+        let opened = crate::legacy::open_workbook_ex(&cfb).unwrap();
+        assert_eq!(
+            opened.dropped,
+            ["VB project", "pictures, shapes and charts"]
+        );
+    }
+
+    /// Workbook and sheet settings the model has no place for (#874 r8).
+    #[test]
+    fn unmodelled_settings_are_dropped_by_name() {
+        let name = |flags: u16, text: &str| {
+            let mut n = flags.to_le_bytes().to_vec();
+            n.extend([0, text.len() as u8, 0, 0]);
+            n.extend([0; 9]);
+            n.extend(text.as_bytes());
+            rec(0x0018, &n)
+        };
+        let sheetext = |icv: u32| {
+            let mut b = vec![0u8; 12];
+            b.extend(20u32.to_le_bytes());
+            b.extend(icv.to_le_bytes());
+            rec(0x0862, &b)
+        };
+        let colinfo = |ixfe: u16| rec(0x007D, &[0, 0, 0, 0, 0x92, 0x08, ixfe as u8, 0, 0, 0, 0, 0]);
+        let row = |grbit: u16, ixfe: u16| {
+            let mut b = vec![0u8; 12];
+            b[6] = 0x2C;
+            b[7] = 0x01;
+            b.extend(grbit.to_le_bytes());
+            b.extend(ixfe.to_le_bytes());
+            rec(0x0208, &b)
+        };
+        let globals: Vec<(Vec<u8>, &str)> = vec![
+            (
+                rec(0x005B, &[1, 0, 0, 0, 0, 0]),
+                "password to modify and read-only recommendation",
+            ),
+            (
+                rec(0x005B, &[0, 0, 0x34, 0x12, 0, 0]),
+                "password to modify and read-only recommendation",
+            ),
+            (rec(0x0019, &[1, 0]), "workbook protection"),
+            (
+                name(0x01, "Secret"),
+                "hidden defined names (saved as visible)",
+            ),
+        ];
+        for (r, want) in globals {
+            let book = read(&workbook(&[r], &[])).unwrap();
+            assert_eq!(book.dropped.iter().copied().collect::<Vec<_>>(), [want]);
+        }
+        let sheet: Vec<(Vec<u8>, &str)> = vec![
+            (rec(0x00E9, &[9, 0, 1, 0]), "sheet backgrounds"),
+            (sheetext(10), "sheet tab colors"),
+            (colinfo(17), "column and row formats"),
+            (row(0x0180, 17), "column and row formats"),
+        ];
+        for (r, want) in sheet {
+            let book = read(&workbook(&[], &[r])).unwrap();
+            assert_eq!(book.dropped.iter().copied().collect::<Vec<_>>(), [want]);
+        }
+        // Their defaults are no loss: no share settings, no protection, a
+        // hidden function name, an automatic tab colour, the default xf.
+        let plain_globals = [
+            rec(0x005B, &[0; 6]),
+            rec(0x0019, &[0, 0]),
+            name(0x03, "_xlfn.MAXIFS"),
+        ];
+        let plain_sheet = [
+            sheetext(0x7F),
+            colinfo(15),
+            row(0x0100, 15),
+            row(0x0100, 17),
+        ];
+        assert!(
+            read(&workbook(&plain_globals, &plain_sheet))
+                .unwrap()
+                .dropped
+                .is_empty()
+        );
+    }
+
+    /// Every record is read, known to hold nothing a person sees, named, or
+    /// named by id as "other features" (#874 r11).
+    #[test]
+    fn every_record_is_read_known_or_named() {
+        let dropped = |globals: &[Vec<u8>], sheet: &[Vec<u8>]| {
+            let book = read(&workbook(globals, sheet)).unwrap();
+            let mut d: Vec<String> = book.dropped.iter().map(|s| s.to_string()).collect();
+            if !book.unknown_records.is_empty() {
+                d.push(format!("{:04X?}", book.unknown_records));
+            }
+            d
+        };
+        let window1 = |grbit: u16, first: u16, ratio: u16| {
+            let mut b = Vec::new();
+            for v in [0u16, 0, 0x3FCF, 0x2A4E, grbit, 0, first, 1, ratio] {
+                b.extend(v.to_le_bytes());
+            }
+            rec(0x003D, &b)
+        };
+        let style = |ixfe: u16| {
+            let mut b = ixfe.to_le_bytes().to_vec();
+            b.extend([3, 0, 0]);
+            b.extend(b"Own");
+            rec(0x0293, &b)
+        };
+        let style_ext = |builtin: bool| {
+            let mut b = vec![0u8; 12];
+            b.extend([u8::from(builtin), 0, 0, 0]);
+            rec(0x0892, &b)
+        };
+        let frt = |ty: u16, tail: &[u8]| {
+            let mut b = vec![0u8; 12];
+            b.extend_from_slice(tail);
+            rec(ty, &b)
+        };
+        let globals: Vec<(Vec<Vec<u8>>, &str)> = vec![
+            (vec![window1(0x0018, 0, 600)], "workbook window settings"),
+            (vec![window1(0x0038, 2, 600)], "workbook window settings"),
+            (vec![window1(0x0038, 0, 300)], "workbook window settings"),
+            (vec![rec(0x008D, &[2, 0])], "workbook window settings"),
+            (vec![rec(0x0040, &[1, 0])], "backup copy on save"),
+            (vec![rec(0x01AF, &[1, 0])], "workbook protection"),
+            (vec![rec(0x01A9, &[0; 8])], "custom views"),
+            (vec![style(0x0010)], "cell styles"),
+            (vec![style(0x0010), style_ext(false)], "cell styles"),
+        ];
+        for (g, want) in globals {
+            assert_eq!(dropped(&g, &[]), [want], "{want}");
+        }
+        let sheet: Vec<(Vec<u8>, &str)> = vec![
+            (rec(0x01AA, &[0; 8]), "custom views"),
+            (frt(0x0868, &[2, 0]), "protected ranges"),
+            (frt(0x0868, &[3, 0]), "ignored errors"),
+            (
+                frt(0x0872, &[0; 8]),
+                "tables (their cells are kept as plain ranges)",
+            ),
+            (frt(0x088B, &[100, 0, 1, 0]), "sheet view settings"),
+            (rec(0x000F, &[0, 0]), "R1C1 reference style"),
+            (rec(0x0225, &[2, 0, 0, 0]), "rows hidden by default"),
+        ];
+        for (r, want) in sheet {
+            assert_eq!(dropped(&[], &[r]), [want], "{want}");
+        }
+        // WINDOW2's page break preview.
+        let mut w2 = 0x08B6u16.to_le_bytes().to_vec();
+        w2.extend([0; 16]);
+        assert_eq!(dropped(&[], &[rec(0x023E, &w2)]), ["sheet view settings"]);
+        // fDyZero: the height is a hidden row's, not the default.
+        let book = read(&workbook(&[], &[rec(0x0225, &[2, 0, 0, 0])])).unwrap();
+        assert_eq!(book.sheets[0].default_row_height, None);
+        // Records nobody classified, in the globals and in a sheet.
+        assert_eq!(
+            dropped(&[rec(0x7777, &[1])], &[rec(0x7778, &[])]),
+            ["{7777, 7778}"]
+        );
+        // Excel's defaults and its bookkeeping name nothing.
+        let plain_globals = [
+            window1(0x0038, 0, 600),
+            rec(0x008D, &[0, 0]),
+            rec(0x0040, &[0, 0]),
+            rec(0x01AF, &[0, 0]),
+            rec(0x0042, &[0xB0, 0x04]),
+            style(0x8000),
+            style(0x0010),
+            style_ext(true),
+            frt(0x0896, &[0; 4]),
+        ];
+        let plain_sheet = [
+            rec(0x000F, &[1, 0]),
+            rec(0x0225, &[0, 0, 0x2C, 0x01]),
+            frt(0x088B, &[100, 0, 0, 0]),
+            frt(0x0867, &[0; 4]),
+            rec(0x0200, &[0; 14]),
+        ];
+        assert!(dropped(&plain_globals, &plain_sheet).is_empty());
+    }
+
+    /// XFEXT's exact colours replace the palette's nearest; a theme colour
+    /// (other than the default text's) and a gradient are named; a
+    /// malformed one is ignored (#874 r12).
+    #[test]
+    fn xfext_colours_are_carried_or_named() {
+        let color = |ty: u16, kind: u16, tint: i16, value: u32| {
+            let mut b = ty.to_le_bytes().to_vec();
+            b.extend(20u16.to_le_bytes());
+            b.extend(kind.to_le_bytes());
+            b.extend(tint.to_le_bytes());
+            b.extend(value.to_le_bytes());
+            b.extend([0; 8]);
+            b
+        };
+        let xfext = |props: &[Vec<u8>], cexts: u16| {
+            let mut b = vec![0u8; 12];
+            for v in [0u16, 1, 0, cexts] {
+                b.extend(v.to_le_bytes());
+            }
+            for p in props {
+                b.extend(p);
+            }
+            rec(0x087D, &b)
+        };
+        // XF 1: a solid fill in palette red (10), text in palette blue (12).
+        let mut xf1 = xf_rec(1, 0x20, 0, 1 << 26);
+        xf1[4 + 18] = 10;
+        xf1[4 + 19] = 0;
+        let fonts = vec![font_rec(400, 0, 0), {
+            let mut f = font_rec(400, 0, 0);
+            f[4 + 4] = 12;
+            f[4 + 5] = 0;
+            f
+        }];
+        let xfcrc = |cxfs: u16| {
+            let mut b = vec![0u8; 14];
+            b.extend(cxfs.to_le_bytes());
+            b.extend([0; 4]);
+            rec(0x087C, &b)
+        };
+        let read_crc = |crc: Option<Vec<u8>>, ext: Option<Vec<u8>>| {
+            let mut globals = fonts.clone();
+            globals.push(xf_rec(0, 0x20, 0, 0));
+            globals.push(xf1.clone());
+            globals.extend(crc);
+            globals.extend(ext);
+            let mut d = cell(0, 0, 1);
+            d.extend(1.0f64.to_le_bytes());
+            let book = read(&workbook(&globals, &[rec(0x0203, &d)])).unwrap();
+            let xf = book.xfs[data(&book)[&(0, 0)].style as usize].clone();
+            let dropped: Vec<&str> = book.dropped.iter().copied().collect();
+            (xf.fill, xf.color, dropped)
+        };
+        let read_with_ext = |ext: Option<Vec<u8>>| read_crc(Some(xfcrc(2)), ext);
+        let red = Some((0xFF, 0, 0));
+        let blue = Some((0, 0, 0xFF));
+        assert_eq!(read_with_ext(None), (red, blue, vec![]));
+        // Exact RGB colours (LongRGBA: r, g, b, a).
+        let ext = xfext(
+            &[color(4, 2, 0, 0x00_563412), color(13, 2, 0, 0x00_ABCDEF)],
+            2,
+        );
+        assert_eq!(
+            read_with_ext(Some(ext)),
+            (Some((0x12, 0x34, 0x56)), Some((0xEF, 0xCD, 0xAB)), vec![])
+        );
+        // The default text colour (theme 1, no tint) is no loss; another
+        // theme colour is, as is a tinted one, and a gradient.
+        assert_eq!(
+            read_with_ext(Some(xfext(&[color(13, 3, 0, 1)], 1))).2,
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            read_with_ext(Some(xfext(&[color(4, 3, 0, 4)], 1))).2,
+            ["theme colors"]
+        );
+        assert_eq!(
+            read_with_ext(Some(xfext(&[color(13, 3, 0x2000, 1)], 1))).2,
+            ["theme colors"]
+        );
+        let mut gradient = 6u16.to_le_bytes().to_vec();
+        gradient.extend(8u16.to_le_bytes());
+        gradient.extend([0; 4]);
+        assert_eq!(
+            read_with_ext(Some(xfext(&[gradient], 1))).2,
+            ["patterned fills"]
+        );
+        // Malformed: a cb past the record, or more exts than it holds.
+        let mut bad = color(4, 2, 0, 0x00_563412);
+        bad[2] = 200;
+        assert_eq!(read_with_ext(Some(xfext(&[bad], 1))), (red, blue, vec![]));
+        assert_eq!(
+            read_with_ext(Some(xfext(&[color(4, 2, 0, 0x00_563412)], 5))).0,
+            Some((0x12, 0x34, 0x56))
+        );
+        // Without an XFCRC, or with one counting other XFs, the XFEXTs are
+        // stale: the palette's colours stay and nothing is named.
+        for crc in [None, Some(xfcrc(3))] {
+            let ext = xfext(&[color(4, 2, 0, 0x00_563412), color(4, 3, 0, 4)], 2);
+            assert_eq!(read_crc(crc, Some(ext)), (red, blue, vec![]));
+        }
+    }
+
+    /// Header and footer, link and workbook options (#874 r12).
+    #[test]
+    fn header_footer_and_workbook_options_are_named() {
+        let frt = |ty: u16, tail: &[u8]| {
+            let mut b = vec![0u8; 12];
+            b.extend_from_slice(tail);
+            rec(ty, &b)
+        };
+        let hf = |flags: u16, cch: [u16; 4]| {
+            let mut b = vec![0u8; 16];
+            b.extend(flags.to_le_bytes());
+            for n in cch {
+                b.extend(n.to_le_bytes());
+            }
+            frt(0x089C, &b)
+        };
+        let names = |globals: &[Vec<u8>], sheet: &[Vec<u8>]| {
+            let book = read(&workbook(globals, sheet)).unwrap();
+            assert!(book.unknown_records.is_empty());
+            book.dropped.iter().copied().collect::<Vec<_>>()
+        };
+        for (r, want) in [
+            (hf(0x000D, [0; 4]), "page setup"),
+            (hf(0x000E, [0; 4]), "page setup"),
+            (hf(0x0008, [0; 4]), "page setup"),
+            (hf(0x000C, [0, 5, 0, 0]), "page setup"),
+            (rec(0x005F, &[0, 0]), "workbook options"),
+            (frt(0x0866, &[1, 0]), "header and footer pictures"),
+        ] {
+            assert_eq!(names(&[], &[r]), [want]);
+        }
+        for (r, want) in [
+            (rec(0x00DA, &[1, 0]), "external link settings"),
+            (rec(0x00DA, &[0x20, 0]), "external link settings"),
+            (frt(0x0863, &[22, 0, 0, 0, 1, 0, 0, 0]), "workbook options"),
+            (frt(0x0863, &[22, 0, 0, 0, 4, 0, 0, 0]), "workbook options"),
+            (frt(0x088C, &[1, 0, 0, 0]), "workbook options"),
+        ] {
+            assert_eq!(names(&[r], &[]), [want]);
+        }
+        // Excel's defaults, as the corpus has them (HEADERFOOTER's high
+        // bits are left over and ignored).
+        let globals = [
+            rec(0x00DA, &[0, 0]),
+            frt(0x0863, &[22, 0, 0, 0, 0, 0, 0, 0, 2, 0]),
+            frt(0x088C, &[0; 4]),
+            frt(0x0866, &[2, 0]),
+        ];
+        let sheet = [hf(0x60CC, [0; 4]), hf(0x333C, [0; 4]), rec(0x005F, &[1, 0])];
+        assert!(names(&globals, &sheet).is_empty());
+    }
+
+    /// Streams and storages beside the Workbook stream are named (#874 r11).
+    #[test]
+    fn other_streams_are_named() {
+        let stream = workbook(&[], &[]);
+        let open = |extra: Vec<opccore::cfb::Node>| {
+            let mut nodes = vec![opccore::cfb::Node::Stream("Workbook", stream.clone())];
+            nodes.extend(extra);
+            crate::legacy::open_workbook_ex(&opccore::cfb::write_cfb_tree(&nodes))
+                .unwrap()
+                .dropped
+        };
+        use opccore::cfb::Node::{Storage, Stream};
+        assert!(open(vec![Stream("\u{1}CompObj", vec![0; 8])]).is_empty());
+        assert_eq!(
+            open(vec![
+                Stream("Revision Log", vec![0; 8]),
+                Stream("User Names", vec![0; 8])
+            ]),
+            ["shared workbook revision history"]
+        );
+        assert_eq!(
+            open(vec![Storage("MsoDataStore", vec![Stream("Item", vec![1])])]),
+            ["custom XML data"]
+        );
+        assert_eq!(
+            open(vec![Storage("MBD0001", vec![Stream("CONTENTS", vec![1])])]),
+            ["embedded objects and controls"]
+        );
+        assert_eq!(
+            open(vec![Stream("Mystery", vec![1])]),
+            ["other workbook content (Mystery)"]
+        );
+        let book = read(&workbook(&[rec(0x7777, &[])], &[])).unwrap();
+        assert_eq!(book.unknown_records.len(), 1);
+        let cfb = opccore::cfb::write_cfb_tree(&[opccore::cfb::Node::Stream(
+            "Workbook",
+            workbook(&[rec(0x7777, &[])], &[rec(0x7778, &[])]),
+        )]);
+        assert_eq!(
+            crate::legacy::open_workbook_ex(&cfb).unwrap().dropped,
+            ["other features (records 0x7777, 0x7778)"]
+        );
+    }
+
+    /// A COLINFO's width counts without fUserSet (xlwt and other writers
+    /// leave it clear), except Excel's default width for the sheet.
+    #[test]
+    fn colinfo_widths_count_without_f_user_set() {
+        let colinfo = |first: u16, last: u16, coldx: u16, grbit: u16| {
+            let mut b = Vec::new();
+            for v in [first, last, coldx, 15, grbit, 0] {
+                b.extend(v.to_le_bytes());
+            }
+            rec(0x007D, &b)
+        };
+        let cols = |sheet: &[Vec<u8>]| read(&workbook(&[], sheet)).unwrap().sheets[0].cols.clone();
+        // xlwt's 0x0B6D (11.43 characters), flags clear.
+        assert_eq!(
+            cols(&[colinfo(1, 2, 0x0B6D, 0)]),
+            [(1, 2, Some(0x0B6D as f64 / 256.0), false)]
+        );
+        // Excel's default for DEFCOLWIDTH 8 (2194) is no width.
+        assert!(cols(&[rec(0x0055, &[8, 0]), colinfo(0, 255, 2194, 0)]).is_empty());
+        // Nor is STANDARDWIDTH's, when the sheet has one.
+        assert!(cols(&[rec(0x0099, &[0, 12]), colinfo(0, 255, 0x0C00, 0)]).is_empty());
+        assert_eq!(
+            cols(&[rec(0x0099, &[0, 12]), colinfo(0, 0, 2194, 0)]),
+            [(0, 0, Some(2194.0 / 256.0), false)]
+        );
+        // fUserSet keeps a width that equals the default.
+        assert_eq!(
+            cols(&[colinfo(3, 3, 2194, 2)]),
+            [(3, 3, Some(2194.0 / 256.0), false)]
+        );
+    }
+
     #[test]
     fn formats_names_and_date_mode() {
         // DATEMODE 1904, a custom format 164 on XF 1, a global name and a
@@ -1248,7 +2608,7 @@ pub(crate) mod tests {
         let book = read(&stream).unwrap();
         assert!(book.date1904);
         let style = data(&book)[&(0, 0)].style;
-        assert_eq!(book.formats[style as usize], "yyyy-mm-dd");
+        assert_eq!(book.xfs[style as usize].code.as_deref(), Some("yyyy-mm-dd"));
         assert_eq!(book.names.len(), 1);
         assert_eq!(book.names[0].name, "TaxRate");
         assert_eq!(book.names[0].formula, "0.21");

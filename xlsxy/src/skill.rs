@@ -54,7 +54,13 @@ where instance is `xlsxy-<AGWINTERM_SESSION_ID>` — the pane id shown by
 ```
 
 Verbs: `wb.path`, `sheet.list`, `sheet.read`, `cell.get`, `cell.set`,
-`range.clear`, `find`, `wb.recalc`, `wb.save`, `wb.reload`, `wb.open`.
+`range.clear`, `find`, `wb.recalc`, `wb.save`, `wb.reload`, `wb.open`,
+`wb.convert`.
+
+An Excel 97-2003 `.xls` opens in Compatibility Mode (`wb.path` says
+`"compat":true`): `wb.save` writes it back as `.xls` and lists in `lost` what
+that file can't hold; `wb.convert` replaces it with an `.xlsx` (an existing
+`.xlsx` only with `{"overwrite":true}`).
 
 ## Two panes in one agwinterm session
 `agwintermctl split on`, then launch `xlsxy <file>` in the new pane (or press

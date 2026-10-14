@@ -70,6 +70,36 @@ test prints. There are eight, for three causes:
 So seven entries come from what Excel wrote, and one (the `.xlsb`
 structured references) from the reader not importing tables.
 
+## The `.xls` writer (#874)
+
+The Excel-made `.xls` files are also the oracle for gridcore's BIFF8 writer
+(`gridcore::legacy::write_xls`). `gridcore/tests/legacy.rs` writes each
+import back and imports it again (the same workbook, formatting included),
+checks each file's structure (`check_xls`), and checks that every formula
+gets the tokens Excel gave it, operand classes included. Excel itself opens
+the rewritten files in `scripts/check-xls-writer.ps1`, which compares their
+recalculated values with the originals'; it needs Excel, so it runs before
+a merge rather than in CI.
+
+`arrays/` holds `array-classes`, which Excel built itself
+(`scripts/make-legacy-fixtures.ps1 -Sections arrays`), saved as `.xlsx` and
+`.xls` (no `.xlsb` or `.ods`, so it sits outside the three-format test):
+legacy array formulas (`{=SUM(A1:A3*B1:B3)}`, `{=SUM(IF(…))}`,
+`{=INDEX(A1:A3*2,2)}`, a multi-cell `{=A1:A3*2}`), a defined name
+`Doubled = Data!$A$1:$A$3*2` and a dynamic array typed as Excel 365 does,
+which its `.xls` holds as a legacy array over the spill.
+`array-classes-2` has 49 formula shapes three ways (a plain cell formula on
+sheet Cell, a legacy array on Arr, a dynamic array on Dyn) and six names
+over array expressions: values under reference parameters, forced-value
+parameters (INDEX's row, VLOOKUP's lookup value), unary minus, percent and
+comparisons inside calls, array arguments (LOOKUP, INDEX, IRR, TREND,
+LINEST, FREQUENCY). `array-classes-3` has the newer functions written the
+same three ways (PERCENTILE.INC and the other twins, XLOOKUP, XMATCH,
+FILTER, UNIQUE, SORT, SORTBY, IFS, SWITCH, TEXTJOIN, MAXIFS, ...), the
+Analysis ToolPak's EDATE and WEEKNUM, and XLLTWICE, which the test XLL
+registers (`scripts/xll-fixture`, built by the script). Their tokens are
+the oracle for the operand classes the writer gives in every context.
+
 ## Regenerating
 
 On Windows with Excel installed, from the repo root:
@@ -83,8 +113,9 @@ the three formats. Then it rebuilds `extra/`: Excel creates each of those
 workbooks from scratch and saves its `.xlsx` source as well as the three
 formats. Last it rebuilds `addin/`: `-Sections addin` the EUROTOOL.XLAM
 workbooks, `-Sections xll` `xll-udf` (this builds `scripts/xll-fixture` with
-cargo, and needs 64-bit Excel). `-Sections corpus,extra,addin,xll` picks
-which parts to rebuild. Excel's SaveAs `.xls` of a workbook with
+cargo, and needs 64-bit Excel), and `-Sections arrays` the `arrays/`
+workbooks. `-Sections corpus,extra,addin,xll,arrays` picks which parts to
+rebuild. Excel's SaveAs `.xls` of a workbook with
 an external link stops on the Compatibility Checker even under automation, so
 the script presses its Continue button through UI Automation from a
 background job. The output depends on the Excel build,

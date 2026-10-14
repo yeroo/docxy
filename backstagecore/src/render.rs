@@ -399,15 +399,37 @@ fn draw_info(f: &mut Frame, area: Rect, bs: &mut Backstage, host: &dyn Backstage
     let mut lines = host.info_lines();
     let fields = host.info_fields();
     let custom = host.info_custom_row();
+    let compat = host.compat_mode();
     let mut scroll = 0usize;
-    if !fields.is_empty() || custom {
+    if compat {
+        // Excel's Info page in Compatibility Mode, its Convert button the
+        // first of the rows below.
+        lines.push(RLine::raw(""));
+        lines.push(RLine::styled(
+            "  Compatibility Mode",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        for l in [
+            "  Some new features are disabled to prevent problems when",
+            "  working with previous versions of Office. Converting this",
+            "  file will enable these features.",
+        ] {
+            lines.push(RLine::raw(l));
+        }
+    }
+    if !fields.is_empty() || custom || compat {
         let focus = bs.pane == Pane::Info;
         let accent = Style::default().fg(Color::Black).bg(host.accent());
         lines.push(RLine::raw(""));
         let first_row = lines.len();
-        let rows = fields
-            .iter()
-            .map(|(label, value)| format!("  {label:<18}{value}"))
+        let rows = compat
+            .then(|| "  Convert…".to_string())
+            .into_iter()
+            .chain(
+                fields
+                    .iter()
+                    .map(|(label, value)| format!("  {label:<18}{value}")),
+            )
             .chain(custom.then(|| "  Custom property…".to_string()));
         for (i, text) in rows.enumerate() {
             let style = if focus && i == bs.info_sel {
@@ -701,6 +723,86 @@ mod tests {
         let buf = term.backend().buffer();
         assert_eq!(buf[(18, 6)].bg, Color::Green);
         assert_ne!(buf[(18, 5)].bg, Color::Green);
+    }
+
+    /// A host in Compatibility Mode: the Info page shows the section, and
+    /// its Convert row comes before the properties, which keep their
+    /// indices.
+    #[test]
+    fn the_info_page_offers_convert_in_compatibility_mode() {
+        struct Compat;
+        impl BackstageHost for Compat {
+            fn extensions(&self) -> &'static [&'static str] {
+                &["xls"]
+            }
+            fn default_save_name(&self) -> String {
+                "book.xls".into()
+            }
+            fn preview_lines(&self, _p: &Path, _w: usize) -> Vec<String> {
+                Vec::new()
+            }
+            fn info_lines(&self) -> Vec<Line<'static>> {
+                vec![Line::raw("  File  book.xls")]
+            }
+            fn accent(&self) -> Color {
+                Color::Green
+            }
+            fn info_fields(&self) -> Vec<(String, String)> {
+                vec![("Title".into(), "Budget".into())]
+            }
+            fn compat_mode(&self) -> bool {
+                true
+            }
+        }
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut bs = Backstage::open(std::env::temp_dir(), &["xls"]);
+        bs.focus_info(0);
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &Compat);
+        })
+        .unwrap();
+        let text = screen(&term);
+        assert!(text.contains("Compatibility Mode"), "{text}");
+        let top = bs.layout.info_top as usize;
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[top].contains("Convert…"), "{text}");
+        assert!(
+            lines[top + 1].contains("Title             Budget"),
+            "{text}"
+        );
+        let enter =
+            ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::Enter);
+        assert!(matches!(
+            bs.key(enter, &Compat),
+            crate::BackstageEvent::Convert
+        ));
+        bs.key(
+            ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::Down),
+            &Compat,
+        );
+        assert!(matches!(
+            bs.key(enter, &Compat),
+            crate::BackstageEvent::EditInfo(0)
+        ));
+        // A click on the Convert row selects it, a second converts.
+        let y = top as u16;
+        assert!(matches!(
+            bs.mouse(30, y, &Compat),
+            crate::BackstageEvent::None
+        ));
+        assert!(matches!(
+            bs.mouse(30, y, &Compat),
+            crate::BackstageEvent::Convert
+        ));
+        // Out of Compatibility Mode there is no section and no row.
+        bs.focus_info(0);
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &Editable);
+        })
+        .unwrap();
+        assert!(!screen(&term).contains("Compatibility Mode"));
     }
 
     /// More rows than the box holds: the page scrolls so the selected row

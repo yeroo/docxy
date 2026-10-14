@@ -820,7 +820,12 @@ function xlsxyToolDefs() {
       Object.fromEntries([target()]),
       [],
     ),
-    tool('xlsxy_save', 'Save the open workbook to its file.', Object.fromEntries([target()]), []),
+    tool(
+      'xlsxy_save',
+      'Save the open workbook to its file. In Compatibility Mode (an Excel 97-2003 .xls) it writes the .xls without asking: what that format can\'t hold is left out and listed in the reply\'s lost (xlsxy_convert replaces the .xls with an .xlsx).',
+      Object.fromEntries([target()]),
+      [],
+    ),
     tool(
       'xlsxy_comments',
       'List every cell comment (threads flattened in reply order): sheet, cell ref, author, text.',
@@ -1368,6 +1373,12 @@ function xlsxyToolDefs() {
       ]),
       [],
     ),
+    tool(
+      'xlsxy_convert',
+      'Convert a workbook in Compatibility Mode (an Excel 97-2003 .xls) to the current file format, as File > Info > Convert does but without its prompt: writes <name>.xlsx (refused when one exists, unless overwrite), deletes the .xls once that is written, and binds the workbook to the .xlsx. Returns path, compat, removed (whether the .xls was deleted), overwrote (whether an existing .xlsx was replaced) and lost (what the .xls had that the open left out).',
+      Object.fromEntries([['overwrite', prop('boolean', 'Replace an existing <name>.xlsx (default false: refused).')], target()]),
+      [],
+    ),
   ];
 }
 
@@ -1473,6 +1484,7 @@ const XLSXY_VERBS = {
   xlsxy_import_text: 'sheet.import-text',
   xlsxy_text_to_columns: 'range.text-to-columns',
   xlsxy_options: 'app.options',
+  xlsxy_convert: 'wb.convert',
 };
 
 /** Execute a tool by forwarding to the control surface. Returns the result

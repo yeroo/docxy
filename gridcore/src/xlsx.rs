@@ -1420,53 +1420,563 @@ fn bump_count(xml: &str, prefix: &str, delta: u32) -> String {
 
 /// The raw `<xf>` elements of `<cellXfs>`, in order.
 fn cell_xf_elements(xml: &str) -> Vec<&str> {
-    let Some(start) = xml.find("<cellXfs") else {
-        return Vec::new();
-    };
-    let end = xml[start..]
-        .find("</cellXfs>")
-        .map_or(xml.len(), |e| start + e);
-    let body = &xml[start..end];
-    let mut out = Vec::new();
-    let mut i = body.find('>').map_or(body.len(), |e| e + 1);
-    while let Some(p) = body[i..].find("<xf") {
-        let s = i + p;
-        if !body[s + 3..].starts_with([' ', '/', '>', '\t', '\r', '\n']) {
-            i = s + 3;
-            continue;
-        }
-        let Some(tag_end) = body[s..].find('>').map(|e| s + e + 1) else {
-            break;
-        };
-        let e = if body[..tag_end].ends_with("/>") {
-            tag_end
-        } else {
-            body[tag_end..]
-                .find("</xf>")
-                .map_or(body.len(), |x| tag_end + x + 5)
-        };
-        out.push(&body[s..e]);
-        i = e;
-    }
-    out
+    section_children(xml, "cellXfs", "xf")
+}
+
+/// What the model's [`Xf`] can't carry of one loaded `<cellXfs>` entry
+/// ([`Xf::loaded_from`]), which an `.xls` written from the package loses,
+/// in the words the `.xls` import names them in.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct LoadedXfExtras {
+    /// What it loses: "underlined text", "borders other than a thin box",
+    /// "vertical alignment", ...
+    pub lost: Vec<&'static str>,
+    /// Its border is a thin box (every side thin, in any colour), which an
+    /// `.xls` holds as the model's `border`, drawn in black: a colour other
+    /// than black or automatic is named in `lost`.
+    pub thin_box: bool,
+}
+
+/// [`LoadedXfExtras`] of each `<cellXfs>` entry of styles part `xml`, by
+/// index.
+pub(crate) fn loaded_xf_extras(xml: &str) -> Vec<LoadedXfExtras> {
+    let (fonts, fills, borders) = (
+        font_elements(xml),
+        section_children(xml, "fills", "fill"),
+        section_children(xml, "borders", "border"),
+    );
+    let open = |raw: &str| raw[..raw.find('>').map_or(raw.len(), |e| e + 1)].to_string();
+    let attr = |raw: &str, name: &str| tag_attr(&open(raw), name).map(str::to_string);
+    let on = |v: Option<String>| v.is_some_and(|v| v != "0" && v != "false");
+    cell_xf_elements(xml)
+        .into_iter()
+        .map(|xf| {
+            let mut lost: Vec<&'static str> = Vec::new();
+            let mut push = |what: &'static str| {
+                if !lost.contains(&what) {
+                    lost.push(what);
+                }
+            };
+            let id = |name: &str| attr(xf, name).and_then(|v| v.parse::<usize>().ok());
+            if let Some(font) = id("fontId").and_then(|i| fonts.get(i)) {
+                for (name, raw) in child_elements(font) {
+                    match name.as_str() {
+                        "u" if attr(&raw, "val").is_none_or(|v| v != "none") => {
+                            push("underlined text")
+                        }
+                        "strike" if attr(&raw, "val").is_none_or(|v| v != "0" && v != "false") => {
+                            push("strikethrough")
+                        }
+                        "vertAlign"
+                            if attr(&raw, "val")
+                                .is_some_and(|v| v == "superscript" || v == "subscript") =>
+                        {
+                            push("superscript and subscript")
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(fill) = id("fillId").and_then(|i| fills.get(i)) {
+                for (name, raw) in child_elements(fill) {
+                    let pattern = attr(&raw, "patternType").unwrap_or_default();
+                    if name == "gradientFill"
+                        || (name == "patternFill"
+                            && !matches!(pattern.as_str(), "" | "none" | "solid"))
+                    {
+                        push("patterned fills");
+                    }
+                }
+            }
+            let mut thin_box = false;
+            if let Some(border) = id("borderId").and_then(|i| borders.get(i)) {
+                let mut sides = std::collections::HashMap::new();
+                for (name, raw) in child_elements(border) {
+                    let style = attr(&raw, "style").unwrap_or_default();
+                    // A side's colour keeps in the .xls's black box, by the
+                    // .xls import's own rule; a theme colour doesn't.
+                    let plain = child_elements(&raw).iter().all(|(c, r)| {
+                        let rgb = || -> Option<Option<(u8, u8, u8)>> {
+                            if on(attr(r, "auto")) {
+                                return Some(None);
+                            }
+                            if let Some(v) = attr(r, "rgb") {
+                                return Some(Some(crate::format::hex_rgb(&v)?));
+                            }
+                            if let Some(v) = attr(r, "indexed") {
+                                return Some(crate::legacy::default_icv_rgb(v.parse().ok()?));
+                            }
+                            attr(r, "theme").is_none().then_some(None)
+                        };
+                        c != "color" || rgb().is_some_and(crate::legacy::plain_border_color)
+                    });
+                    sides.insert(name, (style, plain));
+                }
+                let side = |n: &str| sides.get(n).cloned().unwrap_or_default();
+                let box_sides = ["left", "right", "top", "bottom"].map(side);
+                let diagonal = !side("diagonal").0.is_empty();
+                if box_sides.iter().all(|(s, _)| s == "thin") && !diagonal {
+                    thin_box = true;
+                    if !box_sides.iter().all(|(_, plain)| *plain) {
+                        push("borders other than a thin box");
+                    }
+                } else if box_sides.iter().any(|(s, _)| !s.is_empty()) || diagonal {
+                    push("borders other than a thin box");
+                }
+            }
+            for (name, raw) in child_elements(xf) {
+                if name != "alignment" {
+                    continue;
+                }
+                let h = attr(&raw, "horizontal").unwrap_or_default();
+                if !matches!(h.as_str(), "" | "general" | "left" | "center" | "right") {
+                    push("horizontal alignment other than left, center or right");
+                }
+                if attr(&raw, "vertical").is_some_and(|v| v != "bottom") {
+                    push("vertical alignment");
+                }
+                if attr(&raw, "indent").is_some_and(|v| v != "0") {
+                    push("indented text");
+                }
+                if attr(&raw, "textRotation").is_some_and(|v| v != "0") {
+                    push("rotated text");
+                }
+                if on(attr(&raw, "shrinkToFit")) {
+                    push("shrink to fit");
+                }
+            }
+            LoadedXfExtras { lost, thin_box }
+        })
+        .collect()
 }
 
 /// The raw `<font>` elements of `<fonts>`, in order (a `<dxf>`'s `<font>`
 /// lives outside `<fonts>` and is not one of them). Read with the loader's
 /// parser ([`element_children`]), so comments and prefixes are no trouble.
 fn font_elements(xml: &str) -> Vec<&str> {
-    let Some(start) = xml
-        .find("<fonts")
-        .filter(|&s| xml[s + 6..].starts_with([' ', '>', '/', '\t', '\r', '\n']))
-    else {
-        return Vec::new();
+    section_children(xml, "fonts", "font")
+}
+
+/// The raw `<child>` elements of `<section>`, in order: the part's root
+/// when it is one (`<sst>`), else the root's first child of that name. By
+/// local name, so a prefixed part (`<x:sst>`, `<x:fills>`) reads the same.
+fn section_children<'a>(xml: &'a str, section: &str, child: &str) -> Vec<&'a str> {
+    let mut p = XmlParser::new(xml);
+    let root = loop {
+        match p.next() {
+            Event::Start => break (local(p.name()) == section).then(|| p.start_pos()),
+            Event::Eof => return Vec::new(),
+            _ => {}
+        }
     };
-    let fonts = &xml[start..];
-    element_children(fonts)
+    let part = match root {
+        Some(start) => &xml[start..],
+        None => match element_children(xml)
+            .into_iter()
+            .find(|(n, _, _)| n == section)
+        {
+            Some((_, s, e)) => &xml[s..e],
+            None => return Vec::new(),
+        },
+    };
+    element_children(part)
         .into_iter()
-        .filter(|(name, _, _)| name == "font")
-        .map(|(_, s, e)| &fonts[s..e])
+        .filter(|(name, _, _)| name == child)
+        .map(|(_, s, e)| &part[s..e])
         .collect()
+}
+
+/// What of `pkg`'s loaded parts an `.xls` written from it loses that the
+/// model doesn't hold (the `.xlsx` writer keeps it from the parts), in the
+/// words the `.xls` import names them in. Every top-level child of the
+/// workbook part and of each worksheet part is accounted for: one the
+/// `.xls` writer writes, or that the model holds and the writer names
+/// itself, passes; one with a name here is named; any other is named in an
+/// "other ... features (<elements>)" entry. Every package part likewise,
+/// by where it lives, and the shared strings' rich text runs.
+pub(crate) fn settings_xls_lacks(pkg: &SheetPackage) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |what: &str| {
+        if !out.iter().any(|o| o == what) {
+            out.push(what.to_string());
+        }
+    };
+    let on = |v: &str| !v.is_empty() && v != "0" && v != "false";
+    let off = |v: &str| v == "0" || v == "false";
+    let text = |name: &str| {
+        pkg.part(name)
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+    };
+    // Each start tag of `raw` (an element and what it holds), by local name.
+    let each_start = |raw: &str, f: &mut dyn FnMut(&str, &XmlParser)| {
+        let mut p = XmlParser::new(raw);
+        loop {
+            match p.next() {
+                Event::Start => f(local(p.name()), &p),
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+    };
+    // The first child of each `<ext>` of an `<extLst>`.
+    let ext_kinds = |raw: &str| -> Vec<String> {
+        element_children(raw)
+            .into_iter()
+            .filter(|(n, _, _)| n == "ext")
+            .map(|(_, s, e)| {
+                element_children(&raw[s..e])
+                    .into_iter()
+                    .next()
+                    .map_or_else(|| "ext".to_string(), |(n, _, _)| n)
+            })
+            .collect()
+    };
+    let mut other_book: Vec<String> = Vec::new();
+    let mut other_sheet: Vec<String> = Vec::new();
+    let mut other_part: Vec<String> = Vec::new();
+    let note = |list: &mut Vec<String>, name: &str| {
+        if !list.iter().any(|n| n == name) {
+            list.push(name.to_string());
+        }
+    };
+
+    if let Some(xml) = text(&workbook_part_name(&pkg.parts)) {
+        for child in worksheet_children(&xml).children {
+            let raw = &xml[child.start..child.end];
+            match child.rank_as {
+                // Nothing a person sees in the workbook: the version that
+                // saved it, function categories, the link list (formulas
+                // into another workbook are counted), the OLE size, web
+                // publishing and smart tag options, revision ids, the path
+                // it was saved at.
+                "fileVersion" | "functionGroups" | "externalReferences" | "oleSize"
+                | "webPublishing" | "smartTagPr" | "smartTagTypes" | "revisionPtr" | "absPath" => {}
+                "fileRecoveryPr" => each_start(raw, &mut |n, p| {
+                    if n == "fileRecoveryPr" && off(p.attr("autoRecover")) {
+                        push("workbook options");
+                    }
+                }),
+                // The date system is written; a backup copy, hidden
+                // objects, how external links update and save their
+                // values, and removing personal information on save
+                // aren't.
+                "workbookPr" => each_start(raw, &mut |n, p| {
+                    if n != "workbookPr" {
+                        return;
+                    }
+                    if on(p.attr("backupFile")) {
+                        push("backup copy on save");
+                    }
+                    if matches!(p.attr("showObjects"), "none" | "placeholders") {
+                        push("workbook window settings");
+                    }
+                    if matches!(p.attr("updateLinks"), "never" | "always")
+                        || off(p.attr("saveExternalLinkValues"))
+                    {
+                        push("external link settings");
+                    }
+                    if on(p.attr("filterPrivacy")) {
+                        push("workbook options");
+                    }
+                }),
+                // The active tab is written; the window's own settings
+                // (hidden, scroll bars or tabs hidden, the first tab shown,
+                // the tab bar's width) aren't.
+                "bookViews" => each_start(raw, &mut |n, p| {
+                    if n == "workbookView"
+                        && (matches!(p.attr("visibility"), "hidden" | "veryHidden")
+                            || on(p.attr("minimized"))
+                            || off(p.attr("showHorizontalScroll"))
+                            || off(p.attr("showVerticalScroll"))
+                            || off(p.attr("showSheetTabs"))
+                            || off(p.attr("autoFilterDateGrouping"))
+                            || !matches!(p.attr("firstSheet"), "" | "0")
+                            || !matches!(p.attr("tabRatio"), "" | "600"))
+                    {
+                        push("workbook window settings");
+                    }
+                }),
+                "workbookProtection" => each_start(raw, &mut |n, p| {
+                    if n == "workbookProtection"
+                        && ["lockStructure", "lockWindows", "lockRevision"]
+                            .iter()
+                            .any(|a| on(p.attr(a)))
+                    {
+                        push("workbook protection");
+                    }
+                }),
+                "fileSharing" => each_start(raw, &mut |n, p| {
+                    if n == "fileSharing"
+                        && (on(p.attr("readOnlyRecommended"))
+                            || !p.attr("reservationPassword").is_empty()
+                            || !p.attr("hashValue").is_empty())
+                    {
+                        push("password to modify and read-only recommendation");
+                    }
+                }),
+                "calcPr" => each_start(raw, &mut |n, p| {
+                    if n != "calcPr" {
+                        return;
+                    }
+                    match p.attr("calcMode") {
+                        "manual" => push("manual calculation"),
+                        "autoNoTable" => push("automatic calculation except data tables"),
+                        _ => {}
+                    }
+                    if off(p.attr("fullPrecision")) {
+                        push("precision as displayed");
+                    }
+                    if p.attr("refMode") == "R1C1" {
+                        push("R1C1 reference style");
+                    }
+                    if off(p.attr("calcOnSave")) {
+                        push("workbook options");
+                    }
+                }),
+                "sheets" => each_start(raw, &mut |n, p| {
+                    if n == "sheet" && p.attr("state") == "veryHidden" {
+                        push("very hidden sheets (saved as hidden)");
+                    }
+                }),
+                // A hidden name of its own, not a built-in one (print
+                // area, _FilterDatabase) nor a function's.
+                "definedNames" => each_start(raw, &mut |n, p| {
+                    if n == "definedName"
+                        && on(p.attr("hidden"))
+                        && !on(p.attr("function"))
+                        && !p.attr("name").starts_with("_xlnm.")
+                        && !p.attr("name").starts_with("_xlfn.")
+                    {
+                        push("hidden defined names (saved as visible)");
+                    }
+                }),
+                "customWorkbookViews" => push("custom views"),
+                "pivotCaches" => push("PivotTables"),
+                "extLst" => {
+                    for kind in ext_kinds(raw) {
+                        match kind.as_str() {
+                            // Excel's own bookkeeping: chart tracking, the
+                            // calculation features and compatibility version
+                            // it saved with.
+                            "workbookPr" | "calcFeatures" | "extCalcPr" | "version" => {}
+                            "slicerCaches" => push("slicers"),
+                            "timelineCachePivotCaches" | "timelineCacheRefs" => push("timelines"),
+                            "pivotCaches" => push("PivotTables"),
+                            "dataModel" => push("Data Model (relationships and measures)"),
+                            other => note(&mut other_book, other),
+                        }
+                    }
+                }
+                other => note(&mut other_book, other),
+            }
+        }
+    }
+
+    for part in &pkg.sheet_parts {
+        let Some(xml) = text(part) else {
+            continue;
+        };
+        for child in worksheet_children(&xml).children {
+            let raw = &xml[child.start..child.end];
+            match child.rank_as {
+                // Written, or held by the model, which names what the
+                // writer can't (sheet protection, conditional formatting,
+                // validations, hyperlinks, AutoFilter, page setup, page
+                // breaks, tables, column and row formats).
+                "dimension"
+                | "cols"
+                | "sheetData"
+                | "sheetCalcPr"
+                | "sheetProtection"
+                | "autoFilter"
+                | "mergeCells"
+                | "phoneticPr"
+                | "conditionalFormatting"
+                | "dataValidations"
+                | "hyperlinks"
+                | "printOptions"
+                | "pageMargins"
+                | "pageSetup"
+                | "headerFooter"
+                | "rowBreaks"
+                | "colBreaks"
+                | "tableParts" => {}
+                // The default sizes are written; rows hidden by default
+                // aren't.
+                "sheetFormatPr" => each_start(raw, &mut |n, p| {
+                    if n == "sheetFormatPr" && on(p.attr("zeroHeight")) {
+                        push("rows hidden by default");
+                    }
+                }),
+                "sheetPr" => each_start(raw, &mut |n, _| {
+                    if n == "tabColor" {
+                        push("sheet tab colors");
+                    }
+                }),
+                "sheetViews" => each_start(raw, &mut |n, p| {
+                    let view = match n {
+                        "sheetView" => {
+                            on(p.attr("rightToLeft"))
+                                || on(p.attr("showFormulas"))
+                                || off(p.attr("showGridLines"))
+                                || off(p.attr("showRowColHeaders"))
+                                || off(p.attr("showZeros"))
+                                || off(p.attr("showOutlineSymbols"))
+                                || off(p.attr("defaultGridColor"))
+                                || !matches!(p.attr("colorId"), "" | "64")
+                                || !matches!(p.attr("zoomScale"), "" | "100")
+                                || matches!(p.attr("view"), "pageBreakPreview" | "pageLayout")
+                        }
+                        // A split (not frozen) pane: its state defaults
+                        // to split.
+                        "pane" => {
+                            !matches!(p.attr("state"), "frozen" | "frozenSplit")
+                                && [p.attr("xSplit"), p.attr("ySplit")]
+                                    .iter()
+                                    .any(|v| v.parse::<f64>().is_ok_and(|v| v != 0.0))
+                        }
+                        _ => false,
+                    };
+                    if view {
+                        push("sheet view settings");
+                    }
+                }),
+                "drawing" => push("pictures, shapes and charts"),
+                // Comments' VML, unless the workbook has none: then form
+                // controls.
+                "legacyDrawing" => {
+                    if pkg.comments().is_empty() {
+                        push("embedded objects and controls");
+                    }
+                }
+                "legacyDrawingHF" | "drawingHF" => push("header and footer pictures"),
+                "picture" => push("sheet backgrounds"),
+                "oleObjects" | "controls" => push("embedded objects and controls"),
+                "scenarios" => push("scenarios"),
+                "customSheetViews" => push("custom views"),
+                "protectedRanges" => push("protected ranges"),
+                "extLst" => {
+                    for kind in ext_kinds(raw) {
+                        match kind.as_str() {
+                            "sparklineGroups" => push("sparklines"),
+                            "conditionalFormattings" => push("conditional formatting"),
+                            "dataValidations" => push("data validation"),
+                            "slicerList" => push("slicers"),
+                            "timelineRefs" => push("timelines"),
+                            "protectedRanges" => push("protected ranges"),
+                            other => note(&mut other_sheet, other),
+                        }
+                    }
+                }
+                other => note(&mut other_sheet, other),
+            }
+        }
+    }
+
+    // The parts, by where they live.
+    let sheet_parts: std::collections::HashSet<&str> =
+        pkg.sheet_parts.iter().map(String::as_str).collect();
+    for (name, _) in &pkg.parts {
+        let name = name.as_str();
+        let under = |dir: &str| name.starts_with(dir);
+        if sheet_parts.contains(name)
+            || name == "[Content_Types].xml"
+            || name.ends_with(".rels")
+            || under("docProps/")
+            || matches!(
+                name,
+                "xl/workbook.xml"
+                    | "xl/styles.xml"
+                    | "xl/calcChain.xml"
+                    | "xl/metadata.xml"
+                    | "xl/vbaProject.bin"
+                    | "xl/vbaProjectSignature.bin"
+                    | crate::model::MODEL_PART
+            )
+            || Some(name) == pkg.shared_part.as_deref()
+            || under("xl/sharedStrings")
+            || under("xl/theme/")
+            // Named through the model or the sheet's own elements.
+            || under("xl/tables/")
+            || under("xl/comments")
+            || under("xl/threadedComments/")
+            || under("xl/persons/")
+            || under("xl/drawings/")
+            || under("xl/charts/")
+            || under("xl/media/")
+            || under("xl/printerSettings/")
+            || under("xl/externalLinks/")
+            || under("xl/macrosheets/")
+            || under("xl/worksheets/")
+        {
+            continue;
+        }
+        if under("xl/pivotTables/") || under("xl/pivotCache/") {
+            push("PivotTables");
+        } else if under("xl/slicers/") || under("xl/slicerCaches/") {
+            push("slicers");
+        } else if under("xl/timelines/") || under("xl/timelineCaches/") {
+            push("timelines");
+        } else if under("xl/embeddings/") || under("xl/activeX/") || under("xl/ctrlProps/") {
+            push("embedded objects and controls");
+        } else if name == "xl/connections.xml" || under("xl/queryTables/") {
+            push("external data ranges");
+        } else if under("customXml/") {
+            push("custom XML data");
+        } else if under("xl/model/") {
+            push("Data Model (relationships and measures)");
+        } else if under("xl/chartsheets/") {
+            push("pictures, shapes and charts");
+        } else {
+            // Its folder (its own name, at the package's top).
+            let kind = name.rsplit_once('/').map_or(name, |(dir, _)| dir);
+            note(&mut other_part, kind);
+        }
+    }
+
+    // A cell style of the workbook's own (Excel's built-in ones carry a
+    // builtinId): the .xls gets the Normal style alone.
+    if let Some(xml) = text("xl/styles.xml") {
+        let own = section_children(&xml, "cellStyles", "cellStyle")
+            .into_iter()
+            .any(|raw| {
+                let open = &raw[..raw.find('>').map_or(raw.len(), |e| e + 1)];
+                tag_attr(open, "builtinId").is_none()
+            });
+        if own {
+            push("cell styles");
+        }
+    }
+
+    // A shared string with rich text runs that a cell shows.
+    if let Some(xml) = pkg.shared_part.as_deref().and_then(text) {
+        let rich: std::collections::HashSet<&str> = section_children(&xml, "sst", "si")
+            .into_iter()
+            .enumerate()
+            .filter(|(_, si)| child_elements(si).iter().any(|(n, _)| n == "r"))
+            .filter_map(|(i, _)| pkg.shared.get(i).map(String::as_str))
+            .collect();
+        if !rich.is_empty()
+            && pkg.workbook.sheets.iter().any(|s| {
+                s.cells.values().any(|c| {
+                    matches!(&c.value, crate::sheet::CellValue::Text(t) if rich.contains(t.as_str()))
+                })
+            })
+        {
+            push("formatting within cell text");
+        }
+    }
+
+    for (list, what) in [
+        (other_book, "other workbook features"),
+        (other_sheet, "other sheet features"),
+        (other_part, "other workbook content"),
+    ] {
+        if !list.is_empty() {
+            push(&format!("{what} ({})", list.join(", ")));
+        }
+    }
+    out
 }
 
 /// The child elements of one raw element, as (local name, raw element).
@@ -3613,7 +4123,7 @@ fn sheet_data_xml(
 /// edits to part of it, so this is a frozen block content was typed into
 /// (#837/#840), a block a formula in it blocks, or content loaded that way.
 /// A styled blank isn't content.
-fn block_taken(sheet: &Sheet, row: u32, col: u32, cell: &Cell) -> bool {
+pub(crate) fn block_taken(sheet: &Sheet, row: u32, col: u32, cell: &Cell) -> bool {
     if cell.spill.is_some() {
         return false;
     }

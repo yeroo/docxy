@@ -1357,7 +1357,7 @@ fn structured_to_string(
 // Serializer
 // ---------------------------------------------------------------------------
 
-fn prec(e: &Expr) -> u8 {
+pub(crate) fn prec(e: &Expr) -> u8 {
     match e {
         Expr::Bin(op, ..) => match op {
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => 1,
@@ -6277,7 +6277,7 @@ const FUTURE_FUNCTIONS: &[&str] = &[
 
 /// The prefix a file spells function `name` with: `_xlfn.` for a future
 /// function, `_xlfn._xlws.` for the two worksheet ones, `None` for the rest.
-fn future_prefix(name: &str) -> Option<&'static str> {
+pub(crate) fn future_prefix(name: &str) -> Option<&'static str> {
     if name.eq_ignore_ascii_case("SORT") || name.eq_ignore_ascii_case("FILTER") {
         Some("_xlfn._xlws.")
     } else if FUTURE_FUNCTIONS

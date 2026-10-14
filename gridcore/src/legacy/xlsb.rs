@@ -466,6 +466,7 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
         book.push_sheet(SheetIn {
             name: g.sheets[i].clone(),
             cells,
+            ..SheetIn::default()
         })?;
     }
 

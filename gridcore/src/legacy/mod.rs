@@ -7,8 +7,15 @@
 //! [`SheetPackage`] (as `new_xlsx` makes one) with the sheets, values, formulas,
 //! number formats, date system, defined names and the external links that
 //! calls to add-in functions need (`.xlsb`, `.xls`), so everything downstream
-//! (engine, editor, save) sees an ordinary workbook and saving writes
-//! `.xlsx`. Nothing the readers don't model survives the import.
+//! (engine, editor, save) sees an ordinary workbook. Nothing the readers don't
+//! model survives the import. The `.xls` reader also reads the formatting the
+//! model holds (fonts, fills, alignment, wrap, borders, merged cells, column
+//! widths, row heights, hidden rows, columns and sheets, frozen panes), and
+//! names what it skipped ([`Opened::dropped`]).
+//!
+//! An `.xls` can be written back too ([`write_xls`], #874): a host in
+//! Excel's Compatibility Mode saves the workbook as BIFF8 again, and names
+//! what the file can't hold ([`XlsOut::lost`]) before it does.
 //!
 //! The readers are lenient: a record or token they don't understand is
 //! skipped, and a formula they can't decompile keeps its cached value and
@@ -22,10 +29,38 @@
 mod ftab;
 mod ods;
 mod ptg;
+mod ptg_write;
 mod xls;
+mod xls_write;
 mod xlsb;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+pub use xls_write::{XlsOut, check_xls, write_xls};
+
+/// The colour of BIFF palette index `icv` under `palette` (the file's
+/// PALETTE, or the default one); `None` for the automatic and system
+/// colours.
+pub(crate) fn icv_rgb(icv: u32, palette: &[(u8, u8, u8); 56]) -> Option<(u8, u8, u8)> {
+    match icv {
+        0..=7 => Some(xls::FIXED_COLORS[icv as usize]),
+        8..=63 => Some(palette[icv as usize - 8]),
+        _ => None,
+    }
+}
+
+/// [`icv_rgb`] under the default palette (an `.xlsx`'s `indexed` colour).
+pub(crate) fn default_icv_rgb(icv: u32) -> Option<(u8, u8, u8)> {
+    icv_rgb(icv, &xls_write::DEFAULT_PALETTE)
+}
+
+/// Whether a thin-box side drawn in `rgb` (`None`: automatic) keeps its
+/// colour in the model's `border`, which an `.xls` writes in black: the
+/// one rule for the `.xls` import and for Save As `.xls` from an `.xlsx`.
+/// A box in another colour is still a box, but its colour is lost.
+pub(crate) fn plain_border_color(rgb: Option<(u8, u8, u8)>) -> bool {
+    rgb.is_none_or(|c| c == (0, 0, 0))
+}
 
 use crate::sheet::{Cell, DefinedName, Xf};
 use crate::xlsx::{SheetPackage, XlsxError, load_xlsx};
@@ -110,6 +145,27 @@ const ODS_MIMETYPE: &str = "application/vnd.oasis.opendocument.spreadsheet";
 /// with `xl/workbook.bin` is `.xlsb`, a ZIP whose `mimetype` is ODF
 /// spreadsheet is `.ods`, and anything else goes to [`load_xlsx`] unchanged.
 pub fn open_workbook(data: &[u8]) -> Result<(SheetPackage, SourceFormat), OpenError> {
+    open_workbook_ex(data).map(|o| (o.pkg, o.format))
+}
+
+/// A workbook [`open_workbook_ex`] read.
+pub struct Opened {
+    pub pkg: SheetPackage,
+    pub format: SourceFormat,
+    /// What the file has that the import left out, one entry per kind, in
+    /// words for a "will be lost" list (`comments`, `underlined text`,
+    /// ...), sorted. Only the `.xls` reader names them; empty for the other
+    /// formats.
+    pub dropped: Vec<String>,
+}
+
+/// [`open_workbook`], with what the import left out.
+pub fn open_workbook_ex(data: &[u8]) -> Result<Opened, OpenError> {
+    let opened = |pkg, format| Opened {
+        pkg,
+        format,
+        dropped: Vec::new(),
+    };
     if data.len() >= 8 && data[..8] == OLE2 {
         let cfb = opccore::cfb::Cfb::open(data).map_err(OpenError::Corrupt)?;
         let names = cfb.stream_names();
@@ -121,20 +177,93 @@ pub fn open_workbook(data: &[u8]) -> Result<(SheetPackage, SourceFormat), OpenEr
             .iter()
             .find_map(|n| cfb.read_stream(n))
             .ok_or(OpenError::NotSpreadsheet)?;
-        return Ok((xls::read(&stream)?.build(), SourceFormat::Xls));
+        let mut book = xls::read(&stream)?;
+        // Every stream and storage beside the Workbook stream, by its
+        // top-level name.
+        let mut other: BTreeSet<String> = BTreeSet::new();
+        for path in cfb.paths() {
+            let top = path.split(['/', '\\']).next().unwrap_or(&path);
+            let lower = top.to_ascii_lowercase();
+            match lower.as_str() {
+                "workbook" | "book" | "\u{1}compobj" | "\u{1}ole" => {}
+                // Title, author and the rest: property-set streams the
+                // import doesn't read.
+                "\u{5}summaryinformation" | "\u{5}documentsummaryinformation" => {
+                    book.dropped.insert("document properties");
+                }
+                "_vba_project_cur" => {
+                    book.dropped.insert("VB project");
+                }
+                // A PivotTable's cache.
+                "_sx_db_cur" => {
+                    book.dropped.insert("PivotTables");
+                }
+                "revision log" | "user names" => {
+                    book.dropped.insert("shared workbook revision history");
+                }
+                "msodatastore" => {
+                    book.dropped.insert("custom XML data");
+                }
+                "ctls" => {
+                    book.dropped.insert("embedded objects and controls");
+                }
+                _ if lower.starts_with("mbd") => {
+                    book.dropped.insert("embedded objects and controls");
+                }
+                _ => {
+                    other.insert(top.to_string());
+                }
+            }
+        }
+        let mut dropped: Vec<String> = book.dropped.iter().map(|d| d.to_string()).collect();
+        if !book.unknown_records.is_empty() {
+            let ids: Vec<String> = book
+                .unknown_records
+                .iter()
+                .map(|t| format!("0x{t:04X}"))
+                .collect();
+            dropped.push(format!("other features (records {})", ids.join(", ")));
+        }
+        if !other.is_empty() {
+            let names: Vec<String> = other.into_iter().collect();
+            dropped.push(format!("other workbook content ({})", names.join(", ")));
+        }
+        let (formulas, names) = (book.unread_formulas, book.unread_names);
+        let (pkg, more_formulas, more_names) = book.build_counted();
+        let plural = xls_write::plural;
+        if formulas + more_formulas > 0 {
+            dropped.push(plural(
+                formulas + more_formulas,
+                "formula that refers to another workbook or can't be read (kept as its value)",
+                "formulas that refer to other workbooks or can't be read (kept as values)",
+            ));
+        }
+        if names + more_names > 0 {
+            dropped.push(plural(
+                names + more_names,
+                "defined name that can't be read",
+                "defined names that can't be read",
+            ));
+        }
+        dropped.sort();
+        return Ok(Opened {
+            pkg,
+            format: SourceFormat::Xls,
+            dropped,
+        });
     }
     if let Some(zip) = opccore::zip::ZipArchive::open(data) {
         if zip.find("xl/workbook.bin").is_some() {
-            return Ok((xlsb::read(&zip)?.build(), SourceFormat::Xlsb));
+            return Ok(opened(xlsb::read(&zip)?.build(), SourceFormat::Xlsb));
         }
         if let Some(mime) = zip.read("mimetype") {
             if String::from_utf8_lossy(&mime).trim() == ODS_MIMETYPE {
-                return Ok((ods::read(&zip)?.build(), SourceFormat::Ods));
+                return Ok(opened(ods::read(&zip)?.build(), SourceFormat::Ods));
             }
         }
     }
     load_xlsx(data)
-        .map(|pkg| (pkg, SourceFormat::Xlsx))
+        .map(|pkg| opened(pkg, SourceFormat::Xlsx))
         .map_err(OpenError::Xlsx)
 }
 
@@ -175,8 +304,23 @@ impl Default for Limits {
 pub(crate) struct SheetIn {
     pub name: String,
     /// 0-based (row, col) → cell; `Cell::style` here is an index into
-    /// [`BookIn::formats`], not yet into the workbook's styles.
+    /// [`BookIn::xfs`], not yet into the workbook's styles.
     pub cells: BTreeMap<(u32, u32), Cell>,
+    /// Merged ranges (r1, c1, r2, c2).
+    pub merges: Vec<(u32, u32, u32, u32)>,
+    /// Column definitions: (first, last, width in characters when set,
+    /// hidden).
+    pub cols: Vec<(u32, u32, Option<f64>, bool)>,
+    /// Rows: (row, height in points when set, hidden).
+    pub rows: Vec<(u32, Option<f64>, bool)>,
+    /// Frozen rows and columns.
+    pub freeze: (u32, u32),
+    pub hidden: bool,
+    /// The sheet's default row height (points), base column width
+    /// (characters) and default column width, when the file gives them.
+    pub default_row_height: Option<f64>,
+    pub base_col_width: Option<u32>,
+    pub default_col_width: Option<f64>,
 }
 
 /// Another workbook or add-in whose names formulas call, as `[k]!NAME`
@@ -200,11 +344,25 @@ pub(crate) struct ExternalLink {
 #[derive(Debug, Default)]
 pub(crate) struct BookIn {
     pub sheets: Vec<SheetIn>,
-    /// Number-format codes the cells' `style` indices name; index 0 is
-    /// always General.
-    pub formats: Vec<String>,
-    /// `formats` by code.
+    /// The cell formats the cells' `style` indices name; index 0 is always
+    /// the default (General).
+    pub xfs: Vec<Xf>,
+    /// The `xfs` that are a number format alone, by code.
     format_ix: HashMap<String, u32>,
+    /// What the file has that the import leaves out ([`Opened::dropped`]).
+    pub dropped: BTreeSet<&'static str>,
+    /// The sheet the workbook opens on (an index into `sheets`).
+    pub active: usize,
+    /// Iterative calculation: (max iterations, max change), when on.
+    pub iterate: Option<(u32, f64)>,
+    /// Formulas the reader couldn't read, kept as their values (a reference
+    /// into another workbook, a token it doesn't know).
+    pub unread_formulas: usize,
+    /// Defined names the reader couldn't read, left out.
+    pub unread_names: usize,
+    /// The ids of records the `.xls` reader neither reads nor knows to hold
+    /// nothing a person sees: named as "other features".
+    pub unknown_records: BTreeSet<u16>,
     pub names: Vec<DefinedName>,
     /// The external books formulas name, `[1]` first.
     pub external_links: Vec<ExternalLink>,
@@ -224,13 +382,13 @@ impl BookIn {
 
     pub fn with_limits(limits: Limits) -> BookIn {
         BookIn {
-            formats: vec!["General".to_string()],
+            xfs: vec![Xf::default()],
             limits,
             ..BookIn::default()
         }
     }
 
-    /// The `formats` index of `code`, added when new.
+    /// The `xfs` index of number format `code` alone, added when new.
     pub fn format_index(&mut self, code: &str) -> u32 {
         if code.eq_ignore_ascii_case("General") || code.is_empty() {
             return 0;
@@ -238,10 +396,20 @@ impl BookIn {
         if let Some(&i) = self.format_ix.get(code) {
             return i;
         }
-        self.formats.push(code.to_string());
-        let i = (self.formats.len() - 1) as u32;
+        let mut xf = Xf::default();
+        xf.set_code(Some(code.to_string()));
+        let i = self.add_xf(xf);
         self.format_ix.insert(code.to_string(), i);
         i
+    }
+
+    /// The `xfs` index of a new cell format `xf` (0 for the default).
+    pub fn add_xf(&mut self, xf: Xf) -> u32 {
+        if xf == Xf::default() {
+            return 0;
+        }
+        self.xfs.push(xf);
+        (self.xfs.len() - 1) as u32
     }
 
     /// Start a new sheet, unless the workbook already has as many as
@@ -287,7 +455,16 @@ impl BookIn {
     /// Formula text goes through [`crate::formula::file_formula`], so it is
     /// stored as [`load_xlsx`] would store it. Sheet names are made valid
     /// for Excel ([`valid_sheet_names`]).
-    pub fn build(mut self) -> SheetPackage {
+    pub fn build(self) -> SheetPackage {
+        self.build_counted().0
+    }
+
+    /// [`BookIn::build`], with how many formulas and names the reader read
+    /// but the build couldn't keep (one naming another book's name on a
+    /// renamed sheet), on top of [`BookIn::unread_formulas`] and
+    /// [`BookIn::unread_names`].
+    pub fn build_counted(mut self) -> (SheetPackage, usize, usize) {
+        let (mut lost_formulas, mut lost_names) = (0, 0);
         if self.sheets.is_empty() {
             self.sheets.push(SheetIn {
                 name: "Sheet1".to_string(),
@@ -324,33 +501,66 @@ impl BookIn {
             Some(crate::formula::file_formula(&f).into_owned())
         };
         let mut pkg = crate::xlsx::new_xlsx_sheets(&names);
-        // Each format code becomes an xf (the codes are distinct, so none
-        // needs interning); General stays the default xf 0.
-        let mut xf_of = vec![0u32; self.formats.len()];
-        for (i, code) in self.formats.iter().enumerate().skip(1) {
-            let mut xf = Xf::default();
-            xf.set_code(Some(code.clone()));
+        // Each cell format becomes an xf (the readers made each one once);
+        // the default stays xf 0.
+        let mut xf_of = vec![0u32; self.xfs.len()];
+        for (i, xf) in self.xfs.into_iter().enumerate().skip(1) {
             pkg.workbook.styles.xfs.push(xf);
             xf_of[i] = (pkg.workbook.styles.xfs.len() - 1) as u32;
         }
         for (at, sheet) in self.sheets.into_iter().enumerate() {
-            let cells = &mut pkg.workbook.sheets[at].cells;
+            let s = &mut pkg.workbook.sheets[at];
             for (key, mut cell) in sheet.cells {
                 cell.style = xf_of.get(cell.style as usize).copied().unwrap_or(0);
-                cell.formula = cell.formula.take().and_then(|f| fix(f, false));
-                cells.insert(key, cell);
+                if let Some(f) = cell.formula.take() {
+                    cell.formula = fix(f, false);
+                    lost_formulas += usize::from(cell.formula.is_none());
+                }
+                s.cells.insert(key, cell);
             }
+            s.merges = sheet.merges;
+            for (first, last, width, hidden) in sheet.cols {
+                s.col_defs.push(crate::sheet::ColDef {
+                    min: first,
+                    max: last,
+                    width,
+                    attrs: if hidden {
+                        crate::sheet::with_xml_attr("", "hidden", Some("1"))
+                    } else {
+                        String::new()
+                    },
+                    default_width: width.is_none(),
+                });
+            }
+            for (row, height, hidden) in sheet.rows {
+                if height.is_some() {
+                    s.set_row_height(row, height);
+                }
+                if hidden {
+                    s.set_row_hidden(row, true);
+                }
+            }
+            s.freeze = sheet.freeze;
+            s.hidden = sheet.hidden;
+            s.format.default_row_height = sheet.default_row_height;
+            if let Some(b) = sheet.base_col_width {
+                s.format.base_col_width = b;
+            }
+            s.format.default_col_width = sheet.default_col_width;
         }
+        pkg.workbook.active_tab = self.active.min(pkg.workbook.sheets.len() - 1);
         for mut name in self.names {
             let Some(formula) = fix(name.formula, true) else {
+                lost_names += 1;
                 continue;
             };
             name.formula = formula;
             pkg.workbook.defined_names.push(name);
         }
         pkg.workbook.date1904 = self.date1904;
+        pkg.workbook.iterate = self.iterate;
         write_external_links(&mut pkg, &self.external_links);
-        pkg
+        (pkg, lost_formulas, lost_names)
     }
 }
 
@@ -759,8 +969,9 @@ impl<'a> Le<'a> {
     }
 }
 
-/// A file's number formats as its xfs use them (BIFF8 and BIFF12 alike):
-/// each xf's format id, and the file's own format codes by id.
+/// An `.xlsb`'s number formats as its xfs use them (the `.xls` reader
+/// reads whole XFs, see `xls::Styles`): each xf's format id, and the file's
+/// own format codes by id.
 #[derive(Default)]
 pub(crate) struct XfFormats {
     pub(crate) xf_fmt: Vec<u16>,
@@ -768,20 +979,25 @@ pub(crate) struct XfFormats {
 }
 
 impl XfFormats {
-    /// The `book.formats` index of xf `xf`'s number format: the file's own
-    /// code for its id, else the built-in one, else General.
+    /// The `book.xfs` index of xf `xf`'s number format alone
+    /// ([`format_code`]).
     pub(crate) fn format_of(&self, xf: u32, book: &mut BookIn) -> u32 {
         let ifmt = self.xf_fmt.get(xf as usize).copied().unwrap_or(0);
-        match self
-            .codes
-            .get(&ifmt)
-            .cloned()
-            .or_else(|| builtin_format(ifmt as u32))
-        {
+        match format_code(&self.codes, ifmt) {
             Some(code) => book.format_index(&code),
             None => 0,
         }
     }
+}
+
+/// The number format code of format id `ifmt` (BIFF8 and BIFF12 alike):
+/// the file's own code for it, else the built-in one; `None` for General.
+pub(crate) fn format_code(codes: &HashMap<u16, String>, ifmt: u16) -> Option<String> {
+    codes
+        .get(&ifmt)
+        .cloned()
+        .or_else(|| builtin_format(ifmt as u32))
+        .filter(|c| !c.eq_ignore_ascii_case("General"))
 }
 
 /// An RK number (BIFF8 and BIFF12): a 30-bit integer or the top of an
@@ -825,19 +1041,44 @@ pub(crate) fn set_array(
     true
 }
 
-/// The error text of a BIFF error code (shared by BIFF8 and BIFF12).
+/// BIFF8's built-in defined names (`_xlnm.` and these), by their code
+/// (shared by the `.xls` reader and writer).
+pub(crate) const BUILTIN_NAMES: [&str; 14] = [
+    "Consolidate_Area",
+    "Auto_Open",
+    "Auto_Close",
+    "Extract",
+    "Database",
+    "Criteria",
+    "Print_Area",
+    "Print_Titles",
+    "Recorder",
+    "Data_Form",
+    "Auto_Activate",
+    "Auto_Deactivate",
+    "Sheet_Title",
+    "_FilterDatabase",
+];
+
+/// BIFF's error codes and their text, both ways (the readers and the
+/// `.xls` writer).
+pub(crate) const BIFF_ERRORS: [(u8, &str); 8] = [
+    (0x00, "#NULL!"),
+    (0x07, "#DIV/0!"),
+    (0x0F, "#VALUE!"),
+    (0x17, "#REF!"),
+    (0x1D, "#NAME?"),
+    (0x24, "#NUM!"),
+    (0x2A, "#N/A"),
+    (0x2B, "#GETTING_DATA"),
+];
+
+/// The error text of a BIFF error code (`#N/A` for an unknown one).
 pub(crate) fn biff_error(code: u8) -> &'static str {
-    match code {
-        0x00 => "#NULL!",
-        0x07 => "#DIV/0!",
-        0x0F => "#VALUE!",
-        0x17 => "#REF!",
-        0x1D => "#NAME?",
-        0x24 => "#NUM!",
-        0x2A => "#N/A",
-        0x2B => "#GETTING_DATA",
-        _ => "#N/A",
-    }
+    BIFF_ERRORS
+        .iter()
+        .find(|e| e.0 == code)
+        .map_or("#N/A", |e| e.1)
 }
 
 /// The built-in number formats BIFF files leave implicit (no FORMAT record
@@ -970,6 +1211,7 @@ mod tests {
         let sheet = |name: &str, cells: Vec<((u32, u32), Cell)>| SheetIn {
             name: name.to_string(),
             cells: cells.into_iter().collect(),
+            ..SheetIn::default()
         };
         let num = |v: f64| Cell {
             value: CellValue::Number(v),
@@ -1078,6 +1320,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            ..SheetIn::default()
         })
         .unwrap();
         for (name, formula) in [
@@ -1156,6 +1399,7 @@ mod tests {
             book.push_sheet(SheetIn {
                 name: name.to_string(),
                 cells: cells.into_iter().collect(),
+                ..SheetIn::default()
             })
             .unwrap();
         }

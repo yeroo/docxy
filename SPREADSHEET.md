@@ -36,11 +36,20 @@ bold/italic/color); reproducing Excel's visual styling is a non-goal.
   areas, titles, breaks, fit-to, page order, hidden rows/sheets) and writes
   them as PDF; xlsxy edits page setup, print areas, titles and breaks through
   its control verbs and exports PDF from File › Export and `--pdf`.
-- Legacy formats (#603): `xlsxy book.xls` (also `.xlsb`, `.ods`) imports the
+- Legacy formats (#603): `xlsxy book.xlsb` (also `.ods`) imports the
   values, formulas, number formats, date system and defined names through
   `gridcore::legacy`; other formatting is not imported, and Ctrl+S writes
   `book.xlsx` beside the original (`book1.xlsx`, ... if that exists); the
   status line names the target.
+- Excel 97-2003 Compatibility Mode (#874): `xlsxy book.xls` opens the
+  workbook bound to itself, with a 65,536 x 256 grid and `[Compatibility
+  Mode]` in the title; the import also reads the cell formatting the model
+  holds. Ctrl+S writes it back as BIFF8 (`gridcore::legacy::write_xls`),
+  first asking about anything the file can't hold (charts the import
+  dropped, tables, conditional formatting, ...). Save As Excel 97-2003
+  Workbook enters the mode; File > Info > Convert (`wb.convert`) replaces
+  the `.xls` with an `.xlsx`. A BIFF8 file under another name (an `.xlt`)
+  is still an import.
 
 **Non-goals (at least initially)**
 - Full visual formatting *editing* (fonts, fills, borders); v1 renders what the
@@ -476,8 +485,9 @@ The strategic piece: **conformance is measured, not claimed.**
   per group with **filter context** propagated through the relationships.
   xlsxy opens `.csv` files directly (imported as a workbook and, as in
   Excel, saved back to the `.csv` as text; a `.tsv` is saved as `.xlsx`),
-  and `.xls`/`.xlsb`/`.ods` as imports saved as `.xlsx` (values, formulas,
-  number formats and names; not other formatting). The TUI surface shipped: `Ctrl-M` opens the model view (tables,
+  `.xlsb`/`.ods` as imports saved as `.xlsx` (values, formulas, number
+  formats and names; not other formatting), and `.xls` in Excel's
+  Compatibility Mode, saved back as `.xls`. The TUI surface shipped: `Ctrl-M` opens the model view (tables,
   relationships, measures) with prompt-driven editing — `r` relates
   `Sales[PID] = Products[ID]` (validated against the live tables), `m`
   defines `Total = SUM(Sales[Amount])`, `p` materializes a report
