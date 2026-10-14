@@ -2052,6 +2052,28 @@ fn doc_clip_ours(ours: &DocClip, now: &ClipRead, rich: bool) -> bool {
 /// is ours ([`doc_clip_ours`]), else the clipboard's RTF (another app's
 /// rich copy, or ours from another window), else its text. An RTF the
 /// importer cannot read pastes the text.
+/// The plain text a document copy of `clip` writes: its text, or, for a
+/// clip of pictures alone (no text, #1242), one U+FFFC per picture, so the
+/// write takes and the clip stays ours ([`clip_still_ours`]) until the
+/// clipboard changes, and another app's image copy is not taken for it.
+/// Another app's plain paste shows the stand-in; docxy's never types it.
+fn doc_copy_text(clip: &Clip) -> String {
+    let text = clip.to_text();
+    if !text.is_empty() {
+        return text;
+    }
+    clip.paras
+        .iter()
+        .map(|p| {
+            p.iter()
+                .filter(|i| docxcore::editor::is_object_unit(i))
+                .map(|_| docxcore::editor::FIELD_CHAR)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn doc_paste_clip(ours: Option<&DocClip>, now: &ClipRead, rtf: Option<&[u8]>) -> Option<Clip> {
     match ours {
         Some(ours) if doc_clip_ours(ours, now, rtf.is_some()) => Some(ours.clip.clone()),
@@ -21355,10 +21377,10 @@ impl Docxy {
         });
         if let Some(clip) = clip {
             let pkg = self.tabs.get(self.active).and_then(|t| t.pkg.as_ref());
-            let text = clip.to_text();
-            let rtf = (!text.is_empty())
+            let plain = clip.to_text();
+            let rtf = (!plain.is_empty())
                 .then(|| clip.to_rtf(&docxcore::export_context::ExportContext::for_package(pkg)));
-            let text = self.clipboard_write_rich(text, rtf, cx);
+            let text = self.clipboard_write_rich(doc_copy_text(&clip), rtf, cx);
             self.clip = Some(DocClip { clip, text });
             if cut {
                 if let Some(t) = self.tabs.get_mut(self.active) {
@@ -24099,8 +24121,8 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool
 #[cfg(test)]
 mod clipboard_tests {
     use super::{
-        ClipRead, ClipboardStore, DocClip, clip_still_ours, doc_paste_clip, recorded_after_write,
-        rtf_follows,
+        ClipRead, ClipboardStore, DocClip, clip_still_ours, doc_copy_text, doc_paste_clip,
+        recorded_after_write, rtf_follows,
     };
     use gridcore::engine::Engine;
     use gridcore::sheet::{Cell, CellValue, Sheet, Workbook};
@@ -24581,6 +24603,40 @@ mod clipboard_tests {
             Some("plain".into())
         );
         assert_eq!(doc_paste_clip(None, &ClipRead::Nothing, None), None);
+    }
+
+    /// #1242: a copy of a picture alone writes its stand-in, so the paste
+    /// takes the window's clip, the picture with it; another app's image
+    /// copy after it is not ours.
+    #[test]
+    fn a_copy_of_a_picture_alone_pastes_the_picture_1242() {
+        use docxcore::editor::Clip;
+        use docxcore::model::Inline;
+        let picture = Inline::Raw(
+            "<w:r><w:drawing><wp:inline><wp:extent cx=\"9525\" cy=\"9525\"/></wp:inline>\
+             </w:drawing></w:r>"
+                .into(),
+        );
+        let clip = Clip {
+            paras: vec![vec![picture.clone(), picture.clone()]],
+        };
+        assert_eq!(clip.to_text(), "");
+        let text = doc_copy_text(&clip);
+        assert_eq!(text, "\u{FFFC}\u{FFFC}");
+        let now = ClipRead::Text(text.clone());
+        let ours = DocClip {
+            text: recorded_after_write(text, &now),
+            clip: clip.clone(),
+        };
+        assert_eq!(doc_paste_clip(Some(&ours), &now, None), Some(clip.clone()));
+        assert_eq!(doc_paste_clip(Some(&ours), &ClipRead::NotText, None), None);
+        // A plain paste of the stand-in elsewhere in docxy types nothing.
+        assert_eq!(Clip::from_text("\u{FFFC}\u{FFFC}").to_text(), "");
+        // A clip with text writes its text.
+        let mixed = Clip {
+            paras: vec![vec![picture, Clip::from_text("ab").paras[0][0].clone()]],
+        };
+        assert_eq!(doc_copy_text(&mixed), "ab");
     }
 
     #[test]
@@ -28859,16 +28915,62 @@ fn emit_run(
 }
 
 /// How far one piece from `flat_inlines` advances `paragraph_el`'s caret offset
-/// (`idx`): a run's characters, one for a tab, a break or a field showing a
-/// result (#642), none for anything else (links are already opened up). This
-/// is the engine's `inline_len` for those pieces; `paragraph_el` asserts it.
+/// (`idx`): a run's characters, one for a tab, a break, a field showing a
+/// result (#642), an equation or an inline picture (#1242), none for anything
+/// else (links are already opened up). This is the engine's `inline_len` for
+/// those pieces; `paragraph_el` asserts it.
 fn caret_advance(inline: &Inline) -> usize {
     match inline {
         Inline::Run(_) | Inline::Tab(_) | Inline::Break(..) | Inline::Field { .. } => {
             docxcore::editor::inline_len(inline)
         }
+        Inline::Equation { .. } | Inline::Raw(_) => docxcore::editor::inline_len(inline),
         _ => 0,
     }
+}
+
+/// An equation or an inline picture, ONE char in the engine (#1242), edited
+/// as a unit: `el` drawn with the caret bar before it, the selection shade
+/// when its offset is selected, and a click on its left half putting the
+/// caret before it, on its right half after it.
+#[allow(clippy::too_many_arguments)]
+fn emit_object_unit(
+    out: &mut Vec<AnyElement>,
+    el: Div,
+    idx: &mut usize,
+    caret: &mut Option<usize>,
+    sel: Option<(usize, usize)>,
+    click: Option<Click>,
+    pal: Pal,
+    caret_h: f32,
+) {
+    let pos = *idx;
+    if *caret == Some(pos) {
+        out.push(caret_bar_h(caret_h));
+        *caret = None;
+    }
+    let selected = sel.is_some_and(|(s, e)| s < e && s <= pos && pos < e);
+    let half = |left: bool, c: &Click| {
+        let ent = c.ent.clone();
+        let path = c.path.to_vec();
+        let at = if left { pos } else { pos + 1 };
+        let d = div().absolute().top_0().h_full().w(relative(0.5));
+        let d = if left { d.left_0() } else { d.right_0() };
+        doc_text_cursor(d).on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+            cx.stop_propagation();
+            let extend = ev.modifiers.shift;
+            ent.update(cx, |this, cx| {
+                this.set_caret(path.clone(), at, extend, window, cx)
+            });
+        })
+    };
+    out.push(
+        el.relative()
+            .when(selected, |d| d.bg(pal.sel))
+            .when_some(click, |d, c| d.child(half(true, &c)).child(half(false, &c)))
+            .into_any_element(),
+    );
+    *idx += 1;
 }
 
 /// A tab is ONE char in the engine; render it as a fixed-width spacer that
@@ -29791,17 +29893,18 @@ fn paragraph_el(
                     }
                 }
                 // An inline picture (#768): a frame of its size, drawn in the
-                // line; the picture itself is not drawn here yet.
+                // line; the picture itself is not drawn here yet. It is one
+                // offset (#1242).
                 if let Some((cx_emu, cy_emu)) = docxcore::image::inline_extent(xml) {
                     let (w, h) = picture_frame_px(cx_emu, cy_emu, zoom);
-                    spans.push(
-                        div()
-                            .flex_none()
-                            .w(px(w))
-                            .h(px(h))
-                            .border_1()
-                            .border_color(pal.dim)
-                            .into_any_element(),
+                    let frame = div()
+                        .flex_none()
+                        .w(px(w))
+                        .h(px(h))
+                        .border_1()
+                        .border_color(pal.dim);
+                    emit_object_unit(
+                        &mut spans, frame, &mut idx, &mut caret, sel, click, pal, caret_h,
                     );
                     x += w;
                 }
@@ -29900,19 +30003,20 @@ fn paragraph_el(
                 } else {
                     latex.clone().unwrap_or_default()
                 };
-                spans.push(
-                    div()
-                        .px(px(3.))
-                        .rounded_sm()
-                        .bg(Hsla {
-                            a: 0.14,
-                            ..hsla_u(BRAND)
-                        })
-                        .text_size(px(base))
-                        .text_color(pal.fg)
-                        .italic()
-                        .child(SharedString::from(shown))
-                        .into_any_element(),
+                // One offset (#1242), edited as a unit.
+                let eq = div()
+                    .px(px(3.))
+                    .rounded_sm()
+                    .bg(Hsla {
+                        a: 0.14,
+                        ..hsla_u(BRAND)
+                    })
+                    .text_size(px(base))
+                    .text_color(pal.fg)
+                    .italic()
+                    .child(SharedString::from(shown));
+                emit_object_unit(
+                    &mut spans, eq, &mut idx, &mut caret, sel, click, pal, caret_h,
                 );
             }
             Inline::SmartArt { text, .. } => {
@@ -45990,6 +46094,41 @@ mod flat_inlines_tests {
         let before_cd = offsets(&items[..items.len() - 1]);
         // The field is one offset (#642).
         assert_eq!(before_cd, 12, "`cd` starts at the engine's offset 12");
+    }
+
+    /// #1242: an equation and an inline picture are one offset each, in a
+    /// link too; an anchored picture is none.
+    #[test]
+    fn an_equation_or_inline_picture_takes_one_offset_1242() {
+        let equation = Inline::Equation {
+            raw: "<m:oMath/>".into(),
+            text: "x".into(),
+            latex: None,
+        };
+        let picture = |wrap: &str| {
+            Inline::Raw(format!(
+                "<w:r><w:drawing><{wrap}><wp:extent cx=\"9525\" cy=\"9525\"/></{wrap}>\
+                 </w:drawing></w:r>"
+            ))
+        };
+        assert_eq!(caret_advance(&equation), 1);
+        assert_eq!(caret_advance(&picture("wp:inline")), 1);
+        assert_eq!(caret_advance(&picture("wp:anchor")), 0);
+        let link = Inline::Hyperlink(Hyperlink {
+            anchor: Some("top".into()),
+            content: vec![picture("wp:inline"), run("x")],
+            ..Hyperlink::default()
+        });
+        let content = vec![run("ab"), equation, link, picture("wp:anchor"), run("cd")];
+        let items = flat_inlines(&content);
+        assert_eq!(
+            offsets(&items),
+            content
+                .iter()
+                .map(docxcore::editor::inline_len)
+                .sum::<usize>()
+        );
+        assert_eq!(offsets(&items), 7);
     }
 }
 
