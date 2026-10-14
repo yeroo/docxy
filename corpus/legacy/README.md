@@ -87,9 +87,13 @@ a merge rather than in CI.
 legacy array formulas (`{=SUM(A1:A3*B1:B3)}`, `{=SUM(IF(…))}`,
 `{=INDEX(A1:A3*2,2)}`, a multi-cell `{=A1:A3*2}`), a defined name
 `Doubled = Data!$A$1:$A$3*2` and a dynamic array typed as Excel 365 does,
-which its `.xls` holds as a legacy array over the spill. Its tokens are the
-oracle for the operand classes the writer gives in an array context and in
-a name.
+which its `.xls` holds as a legacy array over the spill.
+`array-classes-2` has 37 formula shapes three ways (a plain cell formula on
+sheet Cell, a legacy array on Arr, a dynamic array on Dyn) and six names
+over array expressions: values under reference parameters, forced-value
+parameters (INDEX's row, VLOOKUP's lookup value), unary minus, percent and
+comparisons inside calls. Their tokens are the oracle for the operand
+classes the writer gives in every context.
 
 ## Regenerating
 
@@ -104,8 +108,9 @@ the three formats. Then it rebuilds `extra/`: Excel creates each of those
 workbooks from scratch and saves its `.xlsx` source as well as the three
 formats. Last it rebuilds `addin/`: `-Sections addin` the EUROTOOL.XLAM
 workbooks, `-Sections xll` `xll-udf` (this builds `scripts/xll-fixture` with
-cargo, and needs 64-bit Excel). `-Sections corpus,extra,addin,xll` picks
-which parts to rebuild. Excel's SaveAs `.xls` of a workbook with
+cargo, and needs 64-bit Excel), and `-Sections arrays` the `arrays/`
+workbooks. `-Sections corpus,extra,addin,xll,arrays` picks which parts to
+rebuild. Excel's SaveAs `.xls` of a workbook with
 an external link stops on the Compatibility Checker even under automation, so
 the script presses its Continue button through UI Automation from a
 background job. The output depends on the Excel build,

@@ -249,6 +249,55 @@ try {
   $wb.SaveAs((Join-Path $arrays "array-classes.xlsx"), 51)
   Save-Xls $wb (Join-Path $arrays "array-classes.xls") $p.Id
   $wb.Close($false)
+
+  # array-classes-2: the same formula shapes three ways, so every context's
+  # classes are pinned: a plain cell formula (sheet Cell, F1, F2, ...), a
+  # legacy array formula (sheet Arr, the same cells) and a dynamic array
+  # typed as Excel 365 does (sheet Dyn, one column each from F, spilling
+  # down); and defined names over array expressions. Each sheet has the
+  # data in A1:D3.
+  Remove-Item (Join-Path $arrays "array-classes-2.*") -ErrorAction SilentlyContinue
+  $shapes = @(
+    'SUM(LEN(C1:C3))', 'MAX(ABS(A1:A3-2))', 'SUM(IFERROR(1/A1:A3,0))',
+    'SUM(IF(A1:A3>1,LEN(C1:C3)))', 'SUM(INDEX(A1:A3,{1;2}))', 'SUM(INDEX(A1:A3,D1:D2))',
+    'SUM(VLOOKUP(A1:A3,A1:B3,2,0))', 'SUM(HLOOKUP(A1,A1:B3,D1:D2,0))',
+    'SUM(MATCH(A1:A3,A1:A3,0))', 'SUM(INDEX(A1:A3,N(IF(1,D1:D2))))', 'SUM(-A1:A3)',
+    'SUM(ROUND(A1:A3*1.5,0))', 'SUMPRODUCT(--(C1:C3="x"),B1:B3)', 'SUM(CHOOSE(2,A1:A3,B1:B3))',
+    'SUM(OFFSET(A1,0,0,3,1)*2)', 'A1:A3%', 'A1:A3>1', 'SUM((A1:A3>1)*1)',
+    'AVERAGE(IF(C1:C3="x",B1:B3))', 'COUNTIF(A1:A3,">1")', 'SUMIF(C1:C3,"x",B1:B3)',
+    'TEXT(SUM(A1:A3),"0")', 'ROWS(A1:A3)*2', 'SUM(ROW(A1:A3))', 'LARGE(A1:A3*2,1)',
+    'SUM(N(A1:A3))', 'SUM(IF(A1>1,A1:A3,B1:B3))', 'SUM(ISNUMBER(A1:A3)*1)', 'ABS(A1:A3)',
+    'LEN(C1:C3)', 'A1:A3*B1:B3', 'INDEX(A1:A3,2)', 'MAX(A1:A3)+MIN(B1:B3)',
+    'IF(A1:A3>1,A1:A3,0)', 'CONCATENATE(C1:C3,"!")', 'SUM(A1:A3,B1)', 'VLOOKUP(2,A1:B3,2,0)'
+  )
+  $wb = $xl.Workbooks.Add()
+  while ($wb.Worksheets.Count -lt 3) { $wb.Worksheets.Add([Type]::Missing, $wb.Worksheets.Item($wb.Worksheets.Count)) | Out-Null }
+  $names = @('Cell', 'Arr', 'Dyn')
+  for ($k = 0; $k -lt 3; $k++) {
+    $ws = $wb.Worksheets.Item($k + 1)
+    $ws.Name = $names[$k]
+    $ws.Range("A1").Value2 = 1; $ws.Range("A2").Value2 = 2; $ws.Range("A3").Value2 = 3
+    $ws.Range("B1").Value2 = 10; $ws.Range("B2").Value2 = 20; $ws.Range("B3").Value2 = 30
+    $ws.Range("C1").Value2 = "x"; $ws.Range("C2").Value2 = "y"; $ws.Range("C3").Value2 = "x"
+    $ws.Range("D1").Value2 = 1; $ws.Range("D2").Value2 = 2
+  }
+  for ($i = 0; $i -lt $shapes.Count; $i++) {
+    $f = '=' + $shapes[$i]
+    $wb.Worksheets.Item(1).Cells.Item($i + 1, 6).Formula = $f
+    $wb.Worksheets.Item(2).Cells.Item($i + 1, 6).FormulaArray = $f
+    $wb.Worksheets.Item(3).Cells.Item(1, $i + 6).Formula2 = $f
+  }
+  $wb.Names.Add("AbsA", "=ABS(Cell!`$A`$1:`$A`$3)") | Out-Null
+  $wb.Names.Add("LenC", "=LEN(Cell!`$C`$1:`$C`$3)") | Out-Null
+  $wb.Names.Add("SumAB", "=SUM(Cell!`$A`$1:`$A`$3*Cell!`$B`$1:`$B`$3)") | Out-Null
+  $wb.Names.Add("PickB", "=INDEX(Cell!`$B`$1:`$B`$3,Cell!`$D`$1:`$D`$2)") | Out-Null
+  $wb.Names.Add("Neg", "=-Cell!`$A`$1:`$A`$3") | Out-Null
+  $wb.Names.Add("Big", "=IF(Cell!`$A`$1:`$A`$3>1,Cell!`$B`$1:`$B`$3)") | Out-Null
+  $xl.Calculate()
+  $wb.CheckCompatibility = $false
+  $wb.SaveAs((Join-Path $arrays "array-classes-2.xlsx"), 51)
+  Save-Xls $wb (Join-Path $arrays "array-classes-2.xls") $p.Id
+  $wb.Close($false)
 } finally {
   $xl.Quit(); [Runtime.InteropServices.Marshal]::ReleaseComObject($xl) | Out-Null
   Start-Sleep 2; if (!$p.HasExited) { $p.Kill() }
