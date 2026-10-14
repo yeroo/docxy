@@ -319,7 +319,7 @@ mod tests {
             "<w:tbl><w:tr><w:tc><w:p><w:pPr><w:sectPr><w:headerReference w:type=\"even\" r:id=\"RID\"/></w:sectPr></w:pPr></w:p></w:tc></w:tr></w:tbl>",
         );
         assert!(matches!(body[0], Block::Table(_)), "{body:?}");
-        body.extend(pkg.document.body.drain(..));
+        body.append(&mut pkg.document.body);
         pkg.document.body = body;
         assert!(pkg.drop_unreferenced_hf_parts(false).is_empty());
         assert!(names(&pkg).contains(&even));
@@ -339,7 +339,7 @@ mod tests {
             matches!(&body[0], Block::Paragraph(p) if matches!(p.content[0], crate::model::Inline::TextBox { .. })),
             "{body:?}"
         );
-        body.extend(pkg.document.body.drain(..));
+        body.append(&mut pkg.document.body);
         pkg.document.body = body;
         assert!(pkg.drop_unreferenced_hf_parts(false).is_empty());
         assert!(names(&pkg).contains(&even));
