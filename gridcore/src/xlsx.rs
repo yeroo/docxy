@@ -1644,8 +1644,6 @@ pub(crate) fn settings_xls_lacks(pkg: &SheetPackage) -> Vec<String> {
         for child in worksheet_children(&xml).children {
             let raw = &xml[child.start..child.end];
             match child.rank_as {
-                // Written (the sheets, the active tab, the date system,
-                // the names, iteration), or nothing a workbook shows.
                 // Nothing a person sees in the workbook: the version that
                 // saved it, function categories, the link list (formulas
                 // into another workbook are counted), the OLE size, web
@@ -1658,8 +1656,10 @@ pub(crate) fn settings_xls_lacks(pkg: &SheetPackage) -> Vec<String> {
                         push("workbook options");
                     }
                 }),
-                // The date system is written; a backup copy and hidden
-                // objects aren't.
+                // The date system is written; a backup copy, hidden
+                // objects, how external links update and save their
+                // values, and removing personal information on save
+                // aren't.
                 "workbookPr" => each_start(raw, &mut |n, p| {
                     if n != "workbookPr" {
                         return;

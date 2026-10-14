@@ -315,6 +315,10 @@ struct Styles {
     made: HashMap<u16, u32>,
     /// XFEXT's colours by XF index.
     ext: HashMap<u16, XfExt>,
+    /// XFCRC's count of XF records. XFEXT is used only when it matches the
+    /// XFs read: another writer that changed the XFs without rewriting
+    /// their XFEXTs (which Excel detects the same way) has stale ones.
+    xf_count: Option<u16>,
 }
 
 /// What an XFEXT says of an XF beyond its palette indices.
@@ -383,7 +387,8 @@ impl Styles {
         let i = match self.xfs.get(ixfe as usize) {
             Some(raw) => {
                 let mut xf = self.xf(raw, &mut book.dropped);
-                if let Some(e) = self.ext.get(&ixfe) {
+                let current = self.xf_count == Some(self.xfs.len() as u16);
+                if let Some(e) = self.ext.get(&ixfe).filter(|_| current) {
                     if xf.fill.is_some() {
                         xf.fill = e.fill.or(xf.fill);
                     }
@@ -504,11 +509,13 @@ impl Styles {
 /// a person sees in the workbook. Any other record is named in
 /// `BookIn::unknown_records`, so a record nobody classified can't be lost
 /// without a word.
+#[rustfmt::skip]
 const GLOBALS_KNOWN: &[u16] = &[
     // Read.
-    0x000E, 0x0012, 0x0017, 0x0018, 0x0019, 0x0022, 0x0023, 0x002F, 0x0031, 0x003D, 0x0040, 0x005B,
-    0x0085, 0x008D, 0x0092, 0x00E0, 0x00FC, 0x01A9, 0x01AE, 0x01AF, 0x0293, 0x041E, 0x00DA, 0x0863,
-    0x087D, 0x088C, // CONTINUE (joined to its record), BOF.
+    0x000E, 0x0012, 0x0017, 0x0018, 0x0019, 0x0022, 0x0023, 0x002F, 0x0031, 0x003D, 0x0040,
+    0x005B, 0x0085, 0x008D, 0x0092, 0x00DA, 0x00E0, 0x00FC, 0x01A9, 0x01AE, 0x01AF, 0x0293,
+    0x041E, 0x0863, 0x087C, 0x087D, 0x088C,
+    // CONTINUE (joined to its record), BOF.
     0x003C, 0x0809,
     // PASSWORD (PROTECT's hash; PROTECT is named), CODEPAGE, XCT and CRN
     // (another workbook's cached cells: formulas into it are counted),
@@ -521,13 +528,14 @@ const GLOBALS_KNOWN: &[u16] = &[
     // where a sheet has them. EXTSST, TABID, USESELFS, DSF, REFRESHALL,
     // PROT4REVPASS (PROT4REV's hash), EXCEL9FILE, RECALCID.
     0x00EB, 0x0866, 0x00FF, 0x013D, 0x0160, 0x0161, 0x01B7, 0x01BC, 0x01C0, 0x01C1,
-    // XFCRC (XFEXT's checksum), TABLESTYLES, STYLEEXT, THEME (the theme
-    // XFEXT's theme colours resolve with; those are named), MTRSETTINGS,
-    // COMPRESSPICTURES, FORCEFULLCALCULATION.
-    0x087C, 0x088E, 0x0892, 0x0896, 0x089A, 0x089B, 0x08A3,
+    // TABLESTYLES, STYLEEXT, THEME (the theme XFEXT's theme colours
+    // resolve with; those are named), MTRSETTINGS, COMPRESSPICTURES,
+    // FORCEFULLCALCULATION.
+    0x088E, 0x0892, 0x0896, 0x089A, 0x089B, 0x08A3,
 ];
 
 /// A worksheet's records, as [`GLOBALS_KNOWN`] is the globals'.
+#[rustfmt::skip]
 const SHEET_KNOWN: &[u16] = &[
     // Read.
     0x0006, 0x000C, 0x000D, 0x000F, 0x0010, 0x0011, 0x0012, 0x0014, 0x0015, 0x001A, 0x001B, 0x001C,
@@ -597,6 +605,7 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
         codes: HashMap::new(),
         made: HashMap::new(),
         ext: HashMap::new(),
+        xf_count: None,
     };
     let mut itab_cur = 0usize;
 
@@ -687,6 +696,11 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
                 // PROT4REV: sharing with track changes protected.
                 0x01AF if c.u16()? != 0 => {
                     book.dropped.insert("workbook protection");
+                }
+                // XFCRC: how many XFs the XFEXTs were written for.
+                0x087C => {
+                    c.take(14)?;
+                    styles.xf_count = Some(c.u16()?);
                 }
                 // XFEXT: an XF's exact and theme colours.
                 0x087D => {
@@ -2359,10 +2373,17 @@ pub(crate) mod tests {
             f[4 + 5] = 0;
             f
         }];
-        let read_with_ext = |ext: Option<Vec<u8>>| {
+        let xfcrc = |cxfs: u16| {
+            let mut b = vec![0u8; 14];
+            b.extend(cxfs.to_le_bytes());
+            b.extend([0; 4]);
+            rec(0x087C, &b)
+        };
+        let read_crc = |crc: Option<Vec<u8>>, ext: Option<Vec<u8>>| {
             let mut globals = fonts.clone();
             globals.push(xf_rec(0, 0x20, 0, 0));
             globals.push(xf1.clone());
+            globals.extend(crc);
             globals.extend(ext);
             let mut d = cell(0, 0, 1);
             d.extend(1.0f64.to_le_bytes());
@@ -2371,6 +2392,7 @@ pub(crate) mod tests {
             let dropped: Vec<&str> = book.dropped.iter().copied().collect();
             (xf.fill, xf.color, dropped)
         };
+        let read_with_ext = |ext: Option<Vec<u8>>| read_crc(Some(xfcrc(2)), ext);
         let red = Some((0xFF, 0, 0));
         let blue = Some((0, 0, 0xFF));
         assert_eq!(read_with_ext(None), (red, blue, vec![]));
@@ -2412,6 +2434,12 @@ pub(crate) mod tests {
             read_with_ext(Some(xfext(&[color(4, 2, 0, 0x00_563412)], 5))).0,
             Some((0x12, 0x34, 0x56))
         );
+        // Without an XFCRC, or with one counting other XFs, the XFEXTs are
+        // stale: the palette's colours stay and nothing is named.
+        for crc in [None, Some(xfcrc(3))] {
+            let ext = xfext(&[color(4, 2, 0, 0x00_563412), color(4, 3, 0, 4)], 2);
+            assert_eq!(read_crc(crc, Some(ext)), (red, blue, vec![]));
+        }
     }
 
     /// Header and footer, link and workbook options (#874 r12).
