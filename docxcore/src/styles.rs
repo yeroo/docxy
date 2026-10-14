@@ -68,6 +68,9 @@ struct StyleDef {
     /// `w:pageBreakBefore` / `w:suppressLineNumbers` in the style's `w:pPr`.
     page_break_before: Option<bool>,
     suppress_line_numbers: Option<bool>,
+    /// `w:numPr` in the style's `w:pPr`: its `w:numId` (when given) and
+    /// `w:ilvl` (when given).
+    num_pr: Option<(Option<i32>, Option<i32>)>,
     /// Display name (`w:name`), e.g. "heading 1".
     name: Option<String>,
     /// Whether this is a paragraph style (`w:type="paragraph"`), so the
@@ -218,6 +221,34 @@ impl StyleSheet {
             .or(self.default_paragraph.as_deref())
             .and_then(|s| self.fold_ppr_flag(s, flag, &mut HashSet::new()))
             .unwrap_or(false)
+    }
+
+    /// The list numbering a paragraph style gives its paragraphs, through
+    /// its `w:basedOn` chain (the default paragraph style's when `para_style`
+    /// is `None`): `(numId, ilvl)`, the level `None` when no style in the
+    /// chain names one. A style's `w:numId` of 0 is no numbering. Heading
+    /// styles are numbered this way in Word's outline lists.
+    pub fn style_num_pr(&self, para_style: Option<&str>) -> Option<(i32, Option<i32>)> {
+        let mut id = para_style.or(self.default_paragraph.as_deref())?;
+        let mut seen = HashSet::new();
+        let (mut num_id, mut ilvl) = (None, None);
+        while seen.insert(id) {
+            let Some(def) = self.styles.get(id) else {
+                break;
+            };
+            if let Some((n, l)) = def.num_pr {
+                num_id = num_id.or(n);
+                ilvl = ilvl.or(l);
+            }
+            if num_id.is_some() {
+                break;
+            }
+            let Some(base) = def.based_on.as_deref() else {
+                break;
+            };
+            id = base;
+        }
+        num_id.filter(|&n| n > 0).map(|n| (n, ilvl))
     }
 
     fn fold_ppr_flag(&self, id: &str, flag: PprFlag, seen: &mut HashSet<String>) -> Option<bool> {
@@ -527,12 +558,34 @@ fn parse_style_ppr(p: &mut XmlParser, def: &mut StyleDef) {
                     def.suppress_line_numbers = Some(toggle(p.attr("w:val")));
                     p.skip_element();
                 }
+                "w:numPr" => def.num_pr = Some(parse_style_numpr(p)),
                 _ => p.skip_element(),
             },
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
     }
+}
+
+/// A style's `<w:numPr>`: `(numId, ilvl)`, each when present.
+fn parse_style_numpr(p: &mut XmlParser) -> (Option<i32>, Option<i32>) {
+    let mut out = (None, None);
+    loop {
+        match p.next() {
+            Event::Start => {
+                let val = p.attr("w:val").trim().parse::<i32>().ok();
+                match p.name() {
+                    "w:numId" => out.0 = val,
+                    "w:ilvl" => out.1 = val,
+                    _ => {}
+                }
+                p.skip_element();
+            }
+            Event::End | Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+    out
 }
 
 /// Parse a `<w:pBdr>` element's top/bottom sides into [`ParBorders`].
