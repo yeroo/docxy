@@ -140,6 +140,34 @@ fn ent_case_056_typed_urls_are_hyperlinks_in_one_undo_step() {
     assert_eq!(text(&v, 3, 0), "https://example.org");
 }
 
+/// #1025: the link a typed URL makes is in the saved file, and the
+/// reopened sheet has it.
+#[test]
+fn typed_url_hyperlink_survives_save_and_reopen() {
+    let mut v = view();
+    type_enter(&mut v, 2, 0, "https://example.com/a?b=1&c=2");
+    type_enter(&mut v, 3, 1, r"\\server\share");
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../target/autocorrect-tests")
+        .join(format!("{}-typed-url", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("links.xlsx");
+    let (bytes, _) = sheet_bytes(&v, Some(&path));
+    std::fs::write(&path, bytes).unwrap();
+    let (Surface::Sheet(again), _) = sheet_from_path(&path) else {
+        panic!("the saved file reopens as a sheet")
+    };
+    assert_eq!(again.sheet().hyperlinks, v.sheet().hyperlinks);
+    assert_eq!(
+        again.sheet().hyperlinks.get(&(2, 0)).map(String::as_str),
+        Some("https://example.com/a?b=1&c=2")
+    );
+    assert!(again.sheet().hyperlinks.contains_key(&(3, 1)));
+    assert_eq!(text(&again, 2, 0), "https://example.com/a?b=1&c=2");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// FIX r3 m5: Ctrl+Enter takes a proposal once, and links like Enter.
 #[test]
 fn ctrl_enter_links_only_what_was_typed() {

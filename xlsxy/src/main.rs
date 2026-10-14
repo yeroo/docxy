@@ -23919,6 +23919,36 @@ mod tests {
         assert_eq!(text_at(&app, 3, 0), "https://example.org");
     }
 
+    /// #1025: the link a typed URL makes is saved with the file.
+    #[test]
+    fn typed_url_hyperlink_survives_save_and_reopen() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-typed-url-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("links.xlsx");
+        let mut app = App::new(new_xlsx(), path.to_str().unwrap());
+        app.os_clip = None;
+        type_enter(&mut app, 2, 0, "www.example.com");
+        type_enter(&mut app, 3, 0, "a@b.example");
+        app.save();
+        let bytes = std::fs::read(&path).expect("saved");
+        let again = App::new(
+            gridcore::xlsx::load_xlsx(&bytes).unwrap(),
+            path.to_str().unwrap(),
+        );
+        assert_eq!(again.sheet().hyperlinks, app.sheet().hyperlinks);
+        assert_eq!(
+            again.sheet().hyperlinks.get(&(2, 0)).map(String::as_str),
+            Some("http://www.example.com")
+        );
+        assert_eq!(
+            again.sheet().hyperlinks.get(&(3, 0)).map(String::as_str),
+            Some("mailto:a@b.example")
+        );
+        assert_eq!(text_at(&again, 2, 0), "www.example.com");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn autocorrect_and_formula_autocomplete_persist_with_the_preferences() {
         let mut app = opts_app();

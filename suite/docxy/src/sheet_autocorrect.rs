@@ -8,9 +8,8 @@
 //! the app ([`Docxy::autocorrect_click`]), and Add, Delete and the
 //! exceptions' edits take effect at once, as Office's do; the check boxes
 //! apply with OK. Everything persists in `session.json` with the Sheet
-//! editing options. Hyperlinks a typed URL makes live in the workbook model
-//! but are not written to the file yet: the xlsx writer keeps the
-//! hyperlinks a file had (a follow-up).
+//! editing options. A hyperlink a typed URL makes is saved with the
+//! workbook: the xlsx writer adds the links the file doesn't have (#1025).
 
 use super::*;
 use crate::dialog::catalog;

@@ -27,6 +27,9 @@ mod consolidate;
 mod container_tests;
 #[cfg(test)]
 mod filter_tests;
+#[cfg(test)]
+mod hyperlink_tests;
+mod hyperlinks;
 mod page;
 mod repair;
 pub use repair::{Repairs, load_xlsx_repair};
@@ -452,11 +455,7 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
             .map(|xml| parse_rels(&xml))
             .unwrap_or_default();
         // External hyperlink URLs keyed by relationship id.
-        let hlink_targets: std::collections::HashMap<String, String> = ws_rels
-            .iter()
-            .filter(|(_, ty, _)| ty.ends_with("/hyperlink"))
-            .map(|(id, _, t)| (id.clone(), t.clone()))
-            .collect();
+        let hlink_targets = hyperlinks::hyperlink_targets(&ws_rels);
 
         let mut sheet = parse_worksheet(&xml, &shared, &hlink_targets);
         sheet.name = name;
@@ -2707,33 +2706,18 @@ fn parse_worksheet(
                 }
                 // A cell hyperlink: `ref` cell/range → external URL (via r:id) or
                 // an in-workbook `location`.
+                // The save reads the element the same way (#1025).
                 "hyperlink" => {
-                    let ref_attr = p.attr("ref").to_string();
-                    let rid = p.attr("r:id").to_string();
-                    let location = p.attr("location").to_string();
-                    if let Some((r1, c1, r2, c2)) = parse_range_name(&ref_attr)
-                        .or_else(|| parse_cell_name(&ref_attr).map(|(r, c)| (r, c, r, c)))
-                    {
-                        let target = if !rid.is_empty() {
-                            hlink_targets.get(&rid).cloned()
-                        } else if !location.is_empty() {
-                            Some(format!("#{location}"))
-                        } else {
-                            None
-                        };
-                        if let Some(t) = target {
-                            sheet.hyperlink_refs.insert((r1, c1), (r1, c1, r2, c2));
-                            // A whole-column hyperlink applies only to its anchor.
-                            let cells = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
-                            if cells > 4096 {
-                                sheet.hyperlinks.insert((r1, c1), t);
-                            } else {
-                                for r in r1..=r2 {
-                                    for c in c1..=c2 {
-                                        sheet.hyperlinks.insert((r, c), t.clone());
-                                    }
-                                }
-                            }
+                    if let Some((rect, t)) = hyperlinks::hyperlink_of(
+                        p.attr("ref"),
+                        p.attr("r:id"),
+                        p.attr("location"),
+                        hlink_targets,
+                    ) {
+                        sheet.hyperlink_refs.insert((rect.0, rect.1), rect);
+                        // A whole-column hyperlink applies only to its anchor.
+                        for cell in hyperlinks::link_cells(rect) {
+                            sheet.hyperlinks.insert(cell, t.clone());
                         }
                     }
                 }
@@ -3860,7 +3844,9 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
         } else {
             let sheet_data =
                 sheet_data_xml(sheet, &mut index_of, &mut any_formulas, new_cm.as_deref());
-            splice_worksheet(&source, sheet, &sheet_data, &wb.styles.dxfs, &mut dxf_for)
+            let out = splice_worksheet(&source, sheet, &sheet_data, &wb.styles.dxfs, &mut dxf_for);
+            // Links made in-session, and retyped ones, with their relationships.
+            hyperlinks::write_hyperlinks(out, sheet, &mut parts, part_name, pkg.ns())
         };
         let updated = if tabs_selected {
             set_tab_selected(&updated, idx == active_tab)
@@ -4684,7 +4670,9 @@ fn splice_worksheet(
 /// Strike the `<hyperlink>` elements whose links were removed
 /// ([`Sheet::hyperlinks_removed`]), and the `<hyperlinks>` block once it is
 /// empty. The external relationship a removed link used stays in the rels,
-/// unreferenced, which OPC allows. Every other element is left as it is.
+/// unreferenced, which OPC allows. Every other element is left as it is;
+/// links added or retyped are written by `saved_parts` afterwards
+/// ([`hyperlinks::write_hyperlinks`]), which has the rels parts.
 fn set_hyperlinks(xml: String, sheet: &Sheet) -> String {
     if sheet.hyperlinks_removed.is_empty() {
         return xml;
@@ -5049,7 +5037,7 @@ fn set_validations(xml: String, sheet: &Sheet) -> String {
     }
     // All the new rules in one pass over the part, not one per rule.
     let items: Vec<String> = new.iter().map(|dv| dv_element(dv)).collect();
-    match append_all_to_worksheet_child(&xml, "dataValidations", &items) {
+    match append_all_to_worksheet_child(&xml, "dataValidations", &items, None) {
         Some(out) => out,
         None if worksheet_takes(&xml, "dataValidations", true) => {
             let block = format!(
@@ -6135,18 +6123,30 @@ pub(crate) fn append_to_worksheet_child(
     insert_into_worksheet_child(out, tag, &item, 1)
 }
 
-/// [`append_to_worksheet_child`] for several items at once (none binding
-/// `r:`): one rewrite of the part, where an append each would rewrite it
-/// once per item (#707 r6).
+/// [`append_to_worksheet_child`] for several items at once: one rewrite of
+/// the part, where an append each would rewrite it once per item (#707 r6).
+/// With `rels`, the items' `r:id` is bound to that namespace: on the root
+/// once when it binds no `r`, else on each item ([`bind_r`]).
 pub(crate) fn append_all_to_worksheet_child(
     xml: &str,
     tag: &str,
     items: &[String],
+    rels: Option<&str>,
 ) -> Option<String> {
     worksheet_child_span(xml, tag)?;
-    let root = worksheet_root(xml)?;
-    let item: String = items.iter().map(|i| in_worksheet_ns(&root, i)).collect();
-    insert_into_worksheet_child(xml.to_string(), tag, &item, items.len() as u32)
+    let mut out = xml.to_string();
+    let mut root = worksheet_root(xml)?;
+    let mut item = String::new();
+    for i in items {
+        let mut i = in_worksheet_ns(&root, i);
+        if let Some(rels) = rels {
+            i = bind_r(&mut out, &root, i, rels);
+            // Bound on the root now if it bound nothing: once is enough.
+            root.r_ns.get_or_insert_with(|| rels.to_string());
+        }
+        item.push_str(&i);
+    }
+    insert_into_worksheet_child(out, tag, &item, items.len() as u32)
 }
 
 /// `item` (`added` elements) put at the end of the worksheet's `<tag>`
@@ -8356,6 +8356,32 @@ fn rels_takes(parts: &[(String, Vec<u8>)], rels_part: &str, must_exist: bool) ->
     }
 }
 
+/// A new, empty rels part.
+pub(crate) const EMPTY_RELS: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>";
+
+/// The next free `rIdN` in a rels part: one past the highest in use.
+pub(crate) fn next_rid(xml: &str) -> String {
+    format!("rId{}", max_rid(xml) + 1)
+}
+
+/// The highest `N` of an `Id="rIdN"` in a rels part, 0 for none.
+fn max_rid(xml: &str) -> u32 {
+    let mut max = 0u32;
+    let mut i = 0;
+    while let Some(pos) = xml[i..].find("Id=\"rId") {
+        let s = i + pos + "Id=\"rId".len();
+        let digits: String = xml[s..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(n) = digits.parse::<u32>() {
+            max = max.max(n);
+        }
+        i = s;
+    }
+    max
+}
+
 /// Add a relationship to any rels part (created when missing). Returns the
 /// assigned rId ("" when the target is already related).
 pub(crate) fn add_rel(
@@ -8365,29 +8391,14 @@ pub(crate) fn add_rel(
     target: &str,
 ) -> String {
     if !parts.iter().any(|(n, _)| n == rels_part) {
-        let empty = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>";
-        parts.push((rels_part.to_string(), empty.as_bytes().to_vec()));
+        parts.push((rels_part.to_string(), EMPTY_RELS.as_bytes().to_vec()));
     }
     if let Some(p) = parts.iter_mut().find(|(n, _)| n == rels_part) {
         let xml = String::from_utf8_lossy(&p.1).into_owned();
         if xml.contains(&format!("Target=\"{target}\"")) {
             return String::new();
         }
-        // Next free rIdN.
-        let mut max = 0u32;
-        let mut i = 0;
-        while let Some(pos) = xml[i..].find("Id=\"rId") {
-            let s = i + pos + "Id=\"rId".len();
-            let digits: String = xml[s..]
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
-            if let Ok(n) = digits.parse::<u32>() {
-                max = max.max(n);
-            }
-            i = s;
-        }
-        let rid = format!("rId{}", max + 1);
+        let rid = next_rid(&xml);
         let rel = format!("<Relationship Id=\"{rid}\" Type=\"{rel_type}\" Target=\"{target}\"/>");
         p.1 = xml
             .replacen("</Relationships>", &format!("{rel}</Relationships>"), 1)
@@ -8410,21 +8421,7 @@ pub(crate) fn add_workbook_rel(
         if xml.contains(&format!("Target=\"{target}\"")) {
             return String::new();
         }
-        // Next free rIdN.
-        let mut max = 0u32;
-        let mut i = 0;
-        while let Some(pos) = xml[i..].find("Id=\"rId") {
-            let s = i + pos + "Id=\"rId".len();
-            let digits: String = xml[s..]
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
-            if let Ok(n) = digits.parse::<u32>() {
-                max = max.max(n);
-            }
-            i = s;
-        }
-        let rid = format!("rId{}", max + 1);
+        let rid = next_rid(&xml);
         let rel = format!("<Relationship Id=\"{rid}\" Type=\"{rel_type}\" Target=\"{target}\"/>");
         p.1 = xml
             .replacen("</Relationships>", &format!("{rel}</Relationships>"), 1)
@@ -8696,7 +8693,7 @@ impl SheetPackage {
             let before = validation_spans(&xml).map_or(0, |(_, items)| items.len());
             // Into the existing block (in any prefix), bumping its count, or a
             // new block at its schema position.
-            let xml = append_all_to_worksheet_child(&xml, "dataValidations", &items)
+            let xml = append_all_to_worksheet_child(&xml, "dataValidations", &items, None)
                 .unwrap_or_else(|| {
                     let block = format!(
                         "<dataValidations count=\"{n}\">{}</dataValidations>",
@@ -20680,6 +20677,29 @@ mod strict_tests {
             let xml = String::from_utf8_lossy(bytes);
             assert!(!xml.contains("purl.oclc.org"), "{name}: {xml}");
         }
+    }
+
+    /// #1025: a link made in a Strict workbook gets the Strict hyperlink
+    /// relationship type and `r` namespace, and reloads.
+    #[test]
+    fn strict_file_hyperlink_uses_strict_rel_type() {
+        let mut pkg = load_xlsx(&strict_xlsx()).unwrap();
+        pkg.workbook.sheets[0]
+            .hyperlinks
+            .insert((0, 0), "https://example.com".into());
+        let out = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(
+            out.workbook.sheets[0].hyperlinks,
+            pkg.workbook.sheets[0].hyperlinks
+        );
+        let rels = text(&out, "xl/worksheets/_rels/sheet1.xml.rels");
+        assert!(
+            rels.contains(&format!("Type=\"{}/hyperlink\"", STRICT.rels)),
+            "{rels}"
+        );
+        let ws = text(&out, "xl/worksheets/sheet1.xml");
+        assert!(ws.contains(&format!("xmlns:r=\"{}\"", STRICT.rels)), "{ws}");
+        assert_strict_throughout(&out);
     }
 }
 
