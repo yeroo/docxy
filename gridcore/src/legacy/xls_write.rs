@@ -2681,6 +2681,11 @@ mod tests {
                 "sheet view settings",
             ),
             (r#"<webPublishItems count="1"/>"#.into(), "other sheet features (webPublishItems)"),
+            (
+                r#"<sheetViews><sheetView view="pageBreakPreview" workbookViewId="0"/></sheetViews>"#.into(),
+                "sheet view settings",
+            ),
+            (r#"<sheetFormatPr defaultRowHeight="15" zeroHeight="1"/>"#.into(), "rows hidden by default"),
             (ext(r#"<x99:future xmlns:x99="urn:x99"/>"#), "other sheet features (future)"),
         ];
         for (sheet, want) in &sheet_cases {
@@ -2701,6 +2706,23 @@ mod tests {
                 r#"<webPublishObjects count="1"/>"#.into(),
                 "other workbook features (webPublishObjects)",
             ),
+            (
+                r#"<workbookPr backupFile="1"/>"#.into(),
+                "backup copy on save",
+            ),
+            (
+                r#"<workbookPr showObjects="placeholders"/>"#.into(),
+                "workbook window settings",
+            ),
+            (
+                r#"<bookViews><workbookView showSheetTabs="0"/></bookViews>"#.into(),
+                "workbook window settings",
+            ),
+            (
+                r#"<bookViews><workbookView tabRatio="300"/></bookViews>"#.into(),
+                "workbook window settings",
+            ),
+            (r#"<calcPr refMode="R1C1"/>"#.into(), "R1C1 reference style"),
         ];
         for (workbook, want) in &book_cases {
             assert_eq!(with(workbook, "", None), [*want], "{workbook}");
@@ -2748,6 +2770,42 @@ mod tests {
         assert!(xml.contains("<r>"), "{xml}");
         rich.set_part(sst, xml.into_bytes());
         assert_eq!(write_xls(&rich).lost, ["formatting within cell text"]);
+        // A prefixed part reads the same (#874 r11).
+        let mut prefixed = pkg.clone();
+        prefixed.set_part(
+            sst,
+            br#"<x:sst xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1"><x:si><x:r><x:rPr><x:b/></x:rPr><x:t>hi</x:t></x:r></x:si></x:sst>"#.to_vec(),
+        );
+        assert_eq!(write_xls(&prefixed).lost, ["formatting within cell text"]);
+    }
+
+    /// A styles part under a prefix (`<x:styleSheet>`) is read by local
+    /// name, as an unprefixed one, and a cell style of the workbook's own
+    /// is named (#874 r11).
+    #[test]
+    fn prefixed_styles_and_own_cell_styles_are_read() {
+        let styles = r#"<x:styleSheet xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><x:fonts count="2"><x:font><x:sz val="11"/></x:font><x:font><x:u/><x:sz val="11"/></x:font></x:fonts><x:fills count="1"><x:fill><x:patternFill patternType="none"/></x:fill></x:fills><x:borders count="1"><x:border/></x:borders><x:cellXfs count="2"><x:xf fontId="0" fillId="0" borderId="0"/><x:xf fontId="1" fillId="0" borderId="0"/></x:cellXfs><x:cellStyles count="1"><x:cellStyle name="Normal" xfId="0" builtinId="0"/></x:cellStyles></x:styleSheet>"#;
+        let mut pkg = book(&[]);
+        pkg.set_part("xl/styles.xml", styles.as_bytes().to_vec());
+        let style = pkg.workbook.styles.intern(Xf {
+            loaded_from: Some(1),
+            ..Xf::default()
+        });
+        pkg.workbook.sheets[0].set_cell(
+            0,
+            0,
+            Cell {
+                style,
+                ..Cell::number(1.0)
+            },
+        );
+        assert_eq!(write_xls(&pkg).lost, ["underlined text"]);
+        let own = styles.replace(
+            "</x:cellStyles>",
+            r#"<x:cellStyle name="Mine" xfId="0"/></x:cellStyles>"#,
+        );
+        pkg.set_part("xl/styles.xml", own.into_bytes());
+        assert_eq!(write_xls(&pkg).lost, ["underlined text", "cell styles"]);
     }
 
     /// Excel's number formats by id: the fixed ones as the id alone, the

@@ -1420,35 +1420,7 @@ fn bump_count(xml: &str, prefix: &str, delta: u32) -> String {
 
 /// The raw `<xf>` elements of `<cellXfs>`, in order.
 fn cell_xf_elements(xml: &str) -> Vec<&str> {
-    let Some(start) = xml.find("<cellXfs") else {
-        return Vec::new();
-    };
-    let end = xml[start..]
-        .find("</cellXfs>")
-        .map_or(xml.len(), |e| start + e);
-    let body = &xml[start..end];
-    let mut out = Vec::new();
-    let mut i = body.find('>').map_or(body.len(), |e| e + 1);
-    while let Some(p) = body[i..].find("<xf") {
-        let s = i + p;
-        if !body[s + 3..].starts_with([' ', '/', '>', '\t', '\r', '\n']) {
-            i = s + 3;
-            continue;
-        }
-        let Some(tag_end) = body[s..].find('>').map(|e| s + e + 1) else {
-            break;
-        };
-        let e = if body[..tag_end].ends_with("/>") {
-            tag_end
-        } else {
-            body[tag_end..]
-                .find("</xf>")
-                .map_or(body.len(), |x| tag_end + x + 5)
-        };
-        out.push(&body[s..e]);
-        i = e;
-    }
-    out
+    section_children(xml, "cellXfs", "xf")
 }
 
 /// What the model's [`Xf`] can't carry of one loaded `<cellXfs>` entry
@@ -1585,15 +1557,28 @@ fn font_elements(xml: &str) -> Vec<&str> {
     section_children(xml, "fonts", "font")
 }
 
-/// The raw `<child>` elements of the first `<section>` of `xml`, in order.
+/// The raw `<child>` elements of `<section>`, in order: the part's root
+/// when it is one (`<sst>`), else the root's first child of that name. By
+/// local name, so a prefixed part (`<x:sst>`, `<x:fills>`) reads the same.
 fn section_children<'a>(xml: &'a str, section: &str, child: &str) -> Vec<&'a str> {
-    let Some(start) = xml
-        .find(&format!("<{section}"))
-        .filter(|&s| xml[s + section.len() + 1..].starts_with([' ', '>', '/', '\t', '\r', '\n']))
-    else {
-        return Vec::new();
+    let mut p = XmlParser::new(xml);
+    let root = loop {
+        match p.next() {
+            Event::Start => break (local(p.name()) == section).then(|| p.start_pos()),
+            Event::Eof => return Vec::new(),
+            _ => {}
+        }
     };
-    let part = &xml[start..];
+    let part = match root {
+        Some(start) => &xml[start..],
+        None => match element_children(xml)
+            .into_iter()
+            .find(|(n, _, _)| n == section)
+        {
+            Some((_, s, e)) => &xml[s..e],
+            None => return Vec::new(),
+        },
+    };
     element_children(part)
         .into_iter()
         .filter(|(name, _, _)| name == child)
@@ -1661,9 +1646,39 @@ pub(crate) fn settings_xls_lacks(pkg: &SheetPackage) -> Vec<String> {
             match child.rank_as {
                 // Written (the sheets, the active tab, the date system,
                 // the names, iteration), or nothing a workbook shows.
-                "fileVersion" | "workbookPr" | "bookViews" | "functionGroups"
-                | "externalReferences" | "oleSize" | "fileRecoveryPr" | "webPublishing"
-                | "smartTagPr" | "smartTagTypes" | "revisionPtr" | "absPath" => {}
+                "fileVersion" | "functionGroups" | "externalReferences" | "oleSize"
+                | "fileRecoveryPr" | "webPublishing" | "smartTagPr" | "smartTagTypes"
+                | "revisionPtr" | "absPath" => {}
+                // The date system is written; a backup copy and hidden
+                // objects aren't.
+                "workbookPr" => each_start(raw, &mut |n, p| {
+                    if n != "workbookPr" {
+                        return;
+                    }
+                    if on(p.attr("backupFile")) {
+                        push("backup copy on save");
+                    }
+                    if matches!(p.attr("showObjects"), "none" | "placeholders") {
+                        push("workbook window settings");
+                    }
+                }),
+                // The active tab is written; the window's own settings
+                // (hidden, scroll bars or tabs hidden, the first tab shown,
+                // the tab bar's width) aren't.
+                "bookViews" => each_start(raw, &mut |n, p| {
+                    if n == "workbookView"
+                        && (matches!(p.attr("visibility"), "hidden" | "veryHidden")
+                            || on(p.attr("minimized"))
+                            || off(p.attr("showHorizontalScroll"))
+                            || off(p.attr("showVerticalScroll"))
+                            || off(p.attr("showSheetTabs"))
+                            || off(p.attr("autoFilterDateGrouping"))
+                            || !matches!(p.attr("firstSheet"), "" | "0")
+                            || !matches!(p.attr("tabRatio"), "" | "600"))
+                    {
+                        push("workbook window settings");
+                    }
+                }),
                 "workbookProtection" => each_start(raw, &mut |n, p| {
                     if n == "workbookProtection"
                         && ["lockStructure", "lockWindows", "lockRevision"]
@@ -1693,6 +1708,9 @@ pub(crate) fn settings_xls_lacks(pkg: &SheetPackage) -> Vec<String> {
                     }
                     if off(p.attr("fullPrecision")) {
                         push("precision as displayed");
+                    }
+                    if p.attr("refMode") == "R1C1" {
+                        push("R1C1 reference style");
                     }
                 }),
                 "sheets" => each_start(raw, &mut |n, p| {
@@ -1746,7 +1764,6 @@ pub(crate) fn settings_xls_lacks(pkg: &SheetPackage) -> Vec<String> {
                 // validations, hyperlinks, AutoFilter, page setup, page
                 // breaks, tables, column and row formats).
                 "dimension"
-                | "sheetFormatPr"
                 | "cols"
                 | "sheetData"
                 | "sheetCalcPr"
@@ -1764,6 +1781,13 @@ pub(crate) fn settings_xls_lacks(pkg: &SheetPackage) -> Vec<String> {
                 | "rowBreaks"
                 | "colBreaks"
                 | "tableParts" => {}
+                // The default sizes are written; rows hidden by default
+                // aren't.
+                "sheetFormatPr" => each_start(raw, &mut |n, p| {
+                    if n == "sheetFormatPr" && on(p.attr("zeroHeight")) {
+                        push("rows hidden by default");
+                    }
+                }),
                 "sheetPr" => each_start(raw, &mut |n, _| {
                     if n == "tabColor" {
                         push("sheet tab colors");
@@ -1781,6 +1805,7 @@ pub(crate) fn settings_xls_lacks(pkg: &SheetPackage) -> Vec<String> {
                                 || off(p.attr("defaultGridColor"))
                                 || !matches!(p.attr("colorId"), "" | "64")
                                 || !matches!(p.attr("zoomScale"), "" | "100")
+                                || matches!(p.attr("view"), "pageBreakPreview" | "pageLayout")
                         }
                         // A split (not frozen) pane: its state defaults
                         // to split.
@@ -1883,9 +1908,23 @@ pub(crate) fn settings_xls_lacks(pkg: &SheetPackage) -> Vec<String> {
         } else if under("xl/chartsheets/") {
             push("pictures, shapes and charts");
         } else {
-            // Its folder, or its name without the number Excel gives it.
+            // Its folder (its own name, at the package's top).
             let kind = name.rsplit_once('/').map_or(name, |(dir, _)| dir);
             note(&mut other_part, kind);
+        }
+    }
+
+    // A cell style of the workbook's own (Excel's built-in ones carry a
+    // builtinId): the .xls gets the Normal style alone.
+    if let Some(xml) = text("xl/styles.xml") {
+        let own = section_children(&xml, "cellStyles", "cellStyle")
+            .into_iter()
+            .any(|raw| {
+                let open = &raw[..raw.find('>').map_or(raw.len(), |e| e + 1)];
+                tag_attr(open, "builtinId").is_none()
+            });
+        if own {
+            push("cell styles");
         }
     }
 
