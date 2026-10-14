@@ -52,9 +52,9 @@ pub use paste_special::{
 mod subtotal;
 pub(crate) use consolidate::split_ref_text;
 pub use consolidate::{
-    ConsolidateError, ConsolidateFunc, ConsolidateOptions, ConsolidateRef, ConsolidateSettings,
-    canonical_consolidate_ref, consolidate, consolidate_fn_name, consolidate_token,
-    format_consolidate_ref, parse_consolidate_func, parse_consolidate_ref,
+    CONSOLIDATE_AREA, ConsolidateError, ConsolidateFunc, ConsolidateOptions, ConsolidateRef,
+    ConsolidateSettings, canonical_consolidate_ref, consolidate, consolidate_fn_name,
+    consolidate_token, format_consolidate_ref, parse_consolidate_func, parse_consolidate_ref,
 };
 pub use sort::{
     BUILTIN_SORT_LISTS, SORT_MERGED, SORT_WARNING, SortError, SortLevel, SortOn, SortOptions,
@@ -1051,6 +1051,21 @@ pub fn text_to_columns(
     rows.len()
 }
 
+/// Each text that a structural edit rewrites like a defined name's
+/// definition: the defined names, and every sheet's kept Consolidate
+/// references (#988). A reference that is itself a defined name reads as a
+/// name and stays; a deleted area becomes `Sheet!#REF!`.
+fn for_each_name_text(wb: &mut Workbook, mut f: impl FnMut(&mut String)) {
+    for dn in &mut wb.defined_names {
+        f(&mut dn.formula);
+    }
+    for sheet in &mut wb.sheets {
+        if let Some(k) = &mut sheet.consolidate {
+            k.refs.iter_mut().for_each(&mut f);
+        }
+    }
+}
+
 /// Rename a sheet and rewrite every reference to it (formulas on all sheets
 /// plus defined-name definitions), as Excel does.
 pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
@@ -1066,15 +1081,15 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
             rename_sheet_in_cell(cell, &old, new_name);
         }
     }
-    for dn in &mut wb.defined_names {
+    for_each_name_text(wb, |text| {
         if let Some(updated) = crate::formula::rewrite_defined_name(
-            &dn.formula,
+            text,
             |e| crate::formula::rename_sheet_in_expr(e, &old, new_name),
             Some((&old, new_name)),
         ) {
-            dn.formula = updated;
+            *text = updated;
         }
-    }
+    });
     // A table's calculated-column formulas, which new rows take.
     for t in &mut wb.tables {
         for slot in t.calculated_formulas.iter_mut() {
@@ -1500,16 +1515,16 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
             }
         }
     }
-    for dn in &mut wb.defined_names {
+    for_each_name_text(wb, |text| {
         // Defined names have no home sheet; only sheet-qualified refs shift.
         if let Some(updated) = crate::formula::rewrite_defined_name(
-            &dn.formula,
+            text,
             |e| crate::formula::adjust_for_edit(e, false, &target_name, &shift),
             None,
         ) {
-            dn.formula = updated;
+            *text = updated;
         }
-    }
+    });
     // A table's calculated-column formulas move like its cells' formulas,
     // each read in the table's first data row (still where the tables were:
     // their ranges follow the grid below).
@@ -2244,13 +2259,13 @@ fn rewrite_workbook_formulas(
             }
         });
     }
-    for dn in &mut wb.defined_names {
+    for_each_name_text(wb, |text| {
         if let Some(updated) =
-            crate::formula::rewrite_defined_name(&dn.formula, |e| f(e, at(None, None)), None)
+            crate::formula::rewrite_defined_name(text, |e| f(e, at(None, None)), None)
         {
-            dn.formula = updated;
+            *text = updated;
         }
-    }
+    });
     // A table's calculated-column formulas sit in its first data row (one
     // below the header of a table that has no data row) and inside it.
     for t in &mut wb.tables {

@@ -528,6 +528,9 @@ fn apply_subtotal(
     }
     v.push_undo_snapshot(snap, SheetStep::Named("Subtotals"));
     v.engine = crate::sheet_engine(&v.pkg.workbook);
+    // The engine only indexes: the SUBTOTAL formulas just written (and any
+    // formula a removed row moved) need their values, which a save caches.
+    v.engine.recalc_all(&mut v.pkg.workbook);
     tab.set_dirty();
     tab.status = status.into();
     tab.dialogs.pop();
@@ -832,6 +835,14 @@ mod tests {
         assert_eq!(label(&mut t, 4), "A Total");
         assert_eq!(label(&mut t, 8), "Grand Total");
         assert_eq!(sheet(&mut t).row_outline(1), 2);
+        // The inserted SUBTOTALs hold their values, and a save caches them.
+        let amt = |t: &mut DocTab, r: u32| sheet(t).cell(r, 1).map(|c| c.value.clone());
+        assert_eq!(amt(&mut t, 4), Some(CellValue::Number(6.0)));
+        assert_eq!(amt(&mut t, 8), Some(CellValue::Number(15.0)));
+        let (bytes, _) = crate::sheet_bytes(view(&mut t), None);
+        let saved = gridcore::xlsx::load_xlsx(&bytes).unwrap();
+        let cached = saved.workbook.sheets[0].cell(4, 1).map(|c| c.value.clone());
+        assert_eq!(cached, Some(CellValue::Number(6.0)));
         // Remove All works on the region around the cursor, totals included.
         select(&mut t, 4, 0, 4, 0);
         let d = subtotal_dialog(&t).unwrap();

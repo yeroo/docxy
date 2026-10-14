@@ -20250,11 +20250,12 @@ mod ct_worksheet_order_tests {
         let s = &pkg.workbook.sheets[0];
         let want = crate::edit::ConsolidateSettings {
             func: crate::edit::SubtotalFunc::Average,
-            // Another workbook's reference (r:id) is left out.
+            // Another workbook's reference (r:id) is kept apart, as is.
             refs: vec!["'My sheet'!$A$1:$B$2".into(), "Totals".into()],
             top_row: true,
             left_col: true,
             links: false,
+            external: vec![r#"<dataRef ref="A1" sheet="X" r:id="rId9"/>"#.into()],
         };
         assert_eq!(s.consolidate.as_ref(), Some(&want));
         assert_eq!(s.consolidate_loaded, s.consolidate);
@@ -20280,6 +20281,7 @@ mod ct_worksheet_order_tests {
             top_row: false,
             left_col: true,
             links: true,
+            external: vec![],
         };
         pkg.workbook.sheets[0].consolidate = Some(changed.clone());
         let ws = saved_sheet(&pkg);
@@ -20295,6 +20297,74 @@ mod ct_worksheet_order_tests {
         pkg.workbook.sheets[0].consolidate = None;
         let ws = saved_sheet(&pkg);
         assert!(!ws.contains("dataConsolidate"), "{ws}");
+    }
+
+    /// #988: a re-run Consolidate keeps another workbook's `<dataRef r:id>`
+    /// (written after this workbook's references) and its relationship; a
+    /// deleted source area is written as `ref="#REF!"` and reads back so.
+    #[test]
+    fn an_external_data_ref_survives_a_settings_change() {
+        let mut pkg = new_xlsx();
+        pkg.set_part(
+            SHEET,
+            format!(
+                r#"<?xml version="1.0"?><worksheet xmlns="{NS}" xmlns:r="{R}">{ROWS}{CONSOLIDATED}{MARGINS}</worksheet>"#
+            )
+            .into_bytes(),
+        );
+        let rels = "xl/worksheets/_rels/sheet1.xml.rels";
+        let target = r#"Target="../externalLinks/externalLink1.xml""#;
+        pkg.set_part(
+            rels,
+            format!(
+                r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLinkPath" {target} TargetMode="External"/></Relationships>"#
+            )
+            .into_bytes(),
+        );
+        let mut pkg = load_xlsx(&write_zip(&pkg.parts)).expect("load");
+        let name = pkg.workbook.sheets[0].name.clone();
+        let o = crate::edit::ConsolidateOptions {
+            refs: vec![format!("{name}!A1:B2")],
+            ..Default::default()
+        };
+        crate::edit::consolidate(&mut pkg.workbook, 0, (4, 3, 4, 3), &o).unwrap();
+        let re = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+        let ws = String::from_utf8(re.part(SHEET).unwrap().to_vec()).unwrap();
+        assert!(
+            ws.contains(&format!(r#"<dataRefs count="2"><dataRef ref="A1:B2" sheet="{name}"/><dataRef ref="A1" sheet="X" r:id="rId9"/></dataRefs>"#)),
+            "{ws}"
+        );
+        let r = String::from_utf8(re.part(rels).unwrap().to_vec()).unwrap();
+        assert!(r.contains(r#"Id="rId9""#) && r.contains(target), "{r}");
+        // One written with an end tag is kept whole too.
+        let open_close = CONSOLIDATED.replace(
+            r#"<dataRef ref="A1" sheet="X" r:id="rId9"/>"#,
+            r#"<dataRef ref="A1" sheet="X" r:id="rId9"></dataRef>"#,
+        );
+        let k = loaded(&format!("{ROWS}{open_close}{MARGINS}"));
+        assert_eq!(
+            k.workbook.sheets[0].consolidate.as_ref().unwrap().external,
+            [r#"<dataRef ref="A1" sheet="X" r:id="rId9"></dataRef>"#]
+        );
+        assert_eq!(
+            re.workbook.sheets[0].consolidate.as_ref().unwrap().external,
+            [r#"<dataRef ref="A1" sheet="X" r:id="rId9"/>"#]
+        );
+
+        // A source area deleted since reads `Sheet!#REF!` and is saved as
+        // a `ref`, never as a name.
+        let mut pkg = re;
+        pkg.workbook.sheets[0].consolidate.as_mut().unwrap().refs = vec!["East!#REF!".into()];
+        let ws = saved_sheet(&pkg);
+        assert!(
+            ws.contains(r##"<dataRef ref="#REF!" sheet="East"/>"##),
+            "{ws}"
+        );
+        let back = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(
+            back.workbook.sheets[0].consolidate.as_ref().unwrap().refs,
+            ["East!#REF!"]
+        );
     }
 
     #[test]

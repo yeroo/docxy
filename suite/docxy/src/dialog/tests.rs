@@ -542,14 +542,15 @@ fn index(s: &DialogStack, name: &str) -> usize {
         .unwrap()
 }
 
-/// Tab and Shift+Tab walk the editable widgets on the current page, skipping
-/// labels, lists, grids, and disabled or hidden controls (#649).
+/// Tab and Shift+Tab walk the editable widgets on the current page, lists
+/// included (#988), skipping labels, grids, and disabled or hidden controls
+/// (#649).
 #[test]
 fn tab_steps_through_the_editable_widgets_and_wraps() {
     let mut s = stack();
     assert_eq!(focused_name(&s), None);
     let mut order = Vec::new();
-    for _ in 0..8 {
+    for _ in 0..9 {
         s.top_dialog_mut().unwrap().focus_step(false);
         order.push(focused_name(&s).unwrap());
     }
@@ -563,14 +564,75 @@ fn tab_steps_through_the_editable_widgets_and_wraps() {
             "milestone",
             "calendar",
             "kind",
+            "fields",
             "name"
         ]
     );
     s.top_dialog_mut().unwrap().focus_step(true);
-    assert_eq!(focused_name(&s), Some("kind"));
+    assert_eq!(focused_name(&s), Some("fields"));
     // Another tab has none of these: the focus goes with the page.
     s.select_tab("Predecessors").unwrap();
     assert_eq!(focused_name(&s), None);
+}
+
+/// A list is picked from (#988): a click chooses the item it lands on and
+/// takes the focus; Up/Down step from the chosen item, Home/End go to the
+/// first and last; each change goes through `set`. Home and End on a text
+/// field still move its caret.
+#[test]
+fn a_list_item_is_chosen_by_click_and_by_keys() {
+    let mut s = stack();
+    let fields = index(&s, "fields");
+    let choice = |s: &DialogStack| s.top().unwrap().controls[fields].value.clone();
+    let d = s.top_dialog_mut().unwrap();
+    d.controls[fields].items = vec!["Name".into(), "Start".into(), "Start".into()];
+    d.click_control(fields, None).unwrap();
+    assert_eq!(focused_name(&s), Some("fields"));
+    assert_eq!(
+        choice(&s),
+        Value::Choice(None),
+        "a click off the items picks none"
+    );
+    let d = s.top_dialog_mut().unwrap();
+    d.click_control(fields, Some(2)).unwrap();
+    assert_eq!(
+        choice(&s),
+        Value::Choice(Some(2)),
+        "the item clicked, though another reads the same"
+    );
+    let d = s.top_dialog_mut().unwrap();
+    d.step_focused(false).unwrap();
+    assert_eq!(choice(&s), Value::Choice(Some(1)));
+    let d = s.top_dialog_mut().unwrap();
+    assert!(d.list_edge(false).unwrap());
+    assert_eq!(choice(&s), Value::Choice(Some(0)));
+    let d = s.top_dialog_mut().unwrap();
+    d.step_focused(false).unwrap();
+    assert_eq!(choice(&s), Value::Choice(Some(0)), "Up stops at the top");
+    let d = s.top_dialog_mut().unwrap();
+    assert!(d.list_edge(true).unwrap());
+    d.step_focused(true).unwrap();
+    assert_eq!(
+        choice(&s),
+        Value::Choice(Some(2)),
+        "End, and Down stops there"
+    );
+    assert_eq!(
+        s.top_dialog_mut()
+            .unwrap()
+            .click_control(fields, Some(3))
+            .unwrap_err(),
+        "no such item"
+    );
+    // On a text field Home/End are the caret's.
+    let d = s.top_dialog_mut().unwrap();
+    d.focus = Some(0);
+    assert!(!d.list_edge(true).unwrap());
+    assert_eq!(choice(&s), Value::Choice(Some(2)));
+    // dialog-set takes an index too.
+    s.set("fields", &args(r#"{"index":1}"#)).unwrap();
+    assert_eq!(choice(&s), Value::Choice(Some(1)));
+    assert!(s.set("fields", &args(r#"{"index":7}"#)).is_err());
 }
 
 /// Typing edits the focused field through `Control::set`: a number field

@@ -285,6 +285,8 @@ fn entry_tests(e: &Entry) -> Vec<String> {
                         text_tests(e, f)
                     } else if f.kind == ControlKind::Dropdown {
                         dropdown_tests(e, f)
+                    } else if f.kind == ControlKind::List {
+                        list_tests(e, f)
                     } else {
                         Vec::new()
                     }
@@ -469,19 +471,35 @@ fn tab_start<'e>(e: &'e Entry, f: &Field) -> Option<&'e Field> {
 }
 
 fn dropdown_tests(e: &Entry, f: &Field) -> Vec<Test> {
-    let mut tests = Vec::new();
-
     let mut t = Test::new(e, f, "focus by click");
     t.open(e, f)
         .click(f)
         .read(f)
         .assert("reply.focused is true")
         .close();
-    tests.push(t);
+    vec![t, step_test(e, f)]
+}
 
-    // Down twice leaves the first item (from no choice, the first Down picks
-    // it); Up as often as it can have items gets back to it, so Up is proven
-    // too; Down then steps to the second.
+/// A list (#988): Tab focuses it (a click lands on an item, or on none in a
+/// short list), and Up and Down step its choice as a dropdown's. Its entry
+/// gives it two items or more, by `prep` when the dialog opens with fewer.
+fn list_tests(e: &Entry, f: &Field) -> Vec<Test> {
+    let mut t = Test::new(e, f, "focus by Tab");
+    t.open(e, f)
+        .call(
+            "real-key",
+            &format!("{{\"key\":\"tab\",\"to-field\":{}}}", js(f.name)),
+        )
+        .read(f)
+        .assert("reply.focused is true")
+        .close();
+    vec![t, step_test(e, f)]
+}
+
+/// Down twice leaves the first item (from no choice, the first Down picks
+/// it); Up as often as it can have items gets back to it, so Up is proven
+/// too; Down then steps to the second.
+fn step_test(e: &Entry, f: &Field) -> Test {
     let mut t = Test::new(e, f, "Up and Down step");
     t.open(e, f)
         .call(
@@ -502,8 +520,7 @@ fn dropdown_tests(e: &Entry, f: &Field) -> Vec<Test> {
         .read(f)
         .assert("reply.index is 1")
         .close();
-    tests.push(t);
-    tests
+    t
 }
 
 #[cfg(test)]
@@ -607,13 +624,16 @@ mod tests {
     }
 
     /// #1029: a field skipped says why and gets no test; a dropdown gets a
-    /// click and an Up/Down test; a checkbox none.
+    /// click and an Up/Down test, a list (#988) a Tab and an Up/Down test; a
+    /// checkbox none.
     #[test]
     fn skipped_fields_and_choices_get_only_their_own_tests() {
         static FIELDS: &[Field] = &[
             Field::text("gone").skip("hidden"),
             Field::other("pick", ControlKind::Dropdown),
             Field::other("tick", ControlKind::Checkbox),
+            Field::other("items", ControlKind::List),
+            Field::other("empty", ControlKind::List).skip("no items"),
         ];
         let e = entry(FIELDS);
         assert_eq!(
@@ -622,7 +642,18 @@ mod tests {
                 "doc user-name: matches the catalogue",
                 "doc user-name/pick: focus by click",
                 "doc user-name/pick: Up and Down step",
+                "doc user-name/items: focus by Tab",
+                "doc user-name/items: Up and Down step",
             ]
+        );
+        let tests = entry_tests(&e);
+        let tab = tests
+            .iter()
+            .find(|t| t.contains("items: focus by Tab"))
+            .unwrap();
+        assert!(
+            tab.contains(r#"call real-key {"key":"tab","to-field":"items"}"#),
+            "{tab}"
         );
     }
 }

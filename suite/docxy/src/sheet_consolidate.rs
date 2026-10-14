@@ -1,16 +1,19 @@
 //! Data › Data Tools › Consolidate (#694): Excel's dialog over
-//! [`gridcore::edit::consolidate`], writing at the cell it opened on.
+//! [`gridcore::edit::consolidate`], writing at the selection it opened on.
 //!
 //! The dialog sits on the tab's [`crate::dialog::DialogStack`] (id
 //! `consolidate`), so the harness's `dialog-set`/`dialog-click` drive it:
 //! Function, Reference, All references, Top row, Left column, Create links
 //! to source data, and the buttons Add, Delete, OK and Close. Add and
-//! Delete edit the list and keep the dialog open; OK consolidates as one
+//! Delete edit the list and keep the dialog open; choosing an entry of All
+//! references copies it into Reference (#988); OK consolidates as one
 //! undo step, and a refusal keeps the dialog open and says why. It opens on
 //! the settings the sheet kept from its last Consolidate.
 
 use crate::dialog::catalog;
-use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
+use crate::dialog::{
+    Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Reaction, Value,
+};
 use crate::sheet_step::SheetStep;
 use crate::{DocTab, Surface};
 use gridcore::edit::{
@@ -22,14 +25,14 @@ use gridcore::sheet::cell_name;
 const PROTECTED: &str =
     "The sheet is protected: unprotect it (Review › Protect Sheet) to consolidate into it.";
 
-/// The Consolidate dialog for the cursor's cell, starting from the
-/// settings the sheet kept.
+/// The Consolidate dialog for the selection, starting from the settings
+/// the sheet kept.
 pub(crate) fn consolidate_dialog(tab: &DocTab) -> Result<Dialog, String> {
     let Surface::Sheet(v) = &tab.surface else {
         return Err("Consolidate needs a spreadsheet".into());
     };
     let kept = v.sheet().consolidate.clone().unwrap_or_default();
-    let (row, col) = v.sel;
+    let area = crate::sel_range(v.sel, v.anchor);
     let mut d = Dialog::message(
         catalog::CONSOLIDATE,
         "Consolidate",
@@ -42,8 +45,7 @@ pub(crate) fn consolidate_dialog(tab: &DocTab) -> Result<Dialog, String> {
         ],
         DialogOwner::Consolidate {
             sheet: v.active,
-            row,
-            col,
+            area,
         },
     );
     d.text = None;
@@ -103,8 +105,29 @@ pub(crate) fn consolidate_dialog(tab: &DocTab) -> Result<Dialog, String> {
             Value::Bool(kept.links),
         ),
     ];
+    d.react = Some(Reaction(react));
     d.mark_opened();
     Ok(d)
+}
+
+/// Choosing an entry of All references copies it into Reference, as
+/// Excel's list does.
+fn react(d: &mut Dialog, i: usize, before: &Value) {
+    let Some(list) = d.controls.get(i).filter(|c| c.name == "refs") else {
+        return;
+    };
+    let Value::Choice(Some(k)) = list.value else {
+        return;
+    };
+    if list.value == *before {
+        return;
+    }
+    let Some(item) = list.items.get(k).cloned() else {
+        return;
+    };
+    if let Some(r) = control_mut(d, "reference") {
+        r.value = Value::Text(item);
+    }
 }
 
 fn control<'a>(d: &'a Dialog, name: &str) -> Option<&'a Control> {
@@ -200,7 +223,7 @@ fn presses(d: &Dialog, button: &str, label: &str) -> bool {
 /// `None` for any other press or dialog (Close closes through the stack).
 pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>> {
     let top = tab.dialogs.top()?;
-    let DialogOwner::Consolidate { sheet, row, col } = top.owner else {
+    let DialogOwner::Consolidate { sheet, area } = top.owner else {
         return None;
     };
     if presses(top, button, "Add") || presses(top, button, "Delete") {
@@ -233,16 +256,17 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
         return None;
     }
     let opts = consolidate_options(top);
-    Some(apply(tab, sheet, (row, col), opts))
+    Some(apply(tab, sheet, area, opts))
 }
 
-/// Consolidate into `sheet` at `at` as one undo step and close the dialog.
+/// Consolidate into `sheet` at `area` (its top-left; more than one cell
+/// limits the output) as one undo step and close the dialog.
 /// Linked detail rows carry the workbook's name, the tab's file stem. A
 /// refusal changes nothing and keeps the dialog open.
 fn apply(
     tab: &mut DocTab,
     sheet: usize,
-    at: (u32, u32),
+    area: (u32, u32, u32, u32),
     mut opts: ConsolidateOptions,
 ) -> Result<(), String> {
     opts.book_name = std::path::Path::new(&*tab.title)
@@ -262,7 +286,8 @@ fn apply(
     }
     let snap = v.snapshot();
     let before = v.pkg.workbook.sheets.clone();
-    let (r1, c1, r2, c2) = match consolidate(&mut v.pkg.workbook, sheet, at, &opts) {
+    let names = v.pkg.workbook.defined_names.clone();
+    let (r1, c1, r2, c2) = match consolidate(&mut v.pkg.workbook, sheet, area, &opts) {
         Ok(area) => area,
         Err(e) => {
             // gridcore refuses before it changes anything.
@@ -271,7 +296,9 @@ fn apply(
         }
     };
     tab.dialogs.pop();
-    if !sheets_differ(&before, &v.pkg.workbook.sheets) {
+    // Consolidate_Area is a defined name: a run that only sets it (the
+    // first run over a file that had none) is still a change.
+    if !sheets_differ(&before, &v.pkg.workbook.sheets) && names == v.pkg.workbook.defined_names {
         tab.status = "Consolidate changed nothing".into();
         return Ok(());
     }
@@ -445,6 +472,120 @@ mod tests {
         assert_eq!(view(&mut t).undo.len(), 0);
         press(&mut t, "Close").unwrap();
         assert!(t.dialogs.top().is_none());
+    }
+
+    fn key(t: &mut DocTab, k: &str) {
+        assert!(crate::dialog_host::dialog_key(
+            t,
+            k,
+            None,
+            gpui::Modifiers::default()
+        ));
+    }
+
+    /// #988: All references is picked from by pointer and keyboard; the
+    /// chosen entry is copied into Reference, and Delete takes it.
+    #[test]
+    fn choosing_an_entry_fills_reference_and_delete_takes_it() {
+        let mut t = book();
+        open(&mut t);
+        add(&mut t, "East!A1:B3");
+        add(&mut t, "West!A1:B3");
+        add(&mut t, "Summary!D1");
+        let refs = t
+            .dialogs
+            .top()
+            .unwrap()
+            .controls
+            .iter()
+            .position(|c| c.name == "refs")
+            .unwrap();
+        // A click on the second entry.
+        let d = t.dialogs.top_dialog_mut().unwrap();
+        d.click_control(refs, Some(1)).unwrap();
+        assert_eq!(typed(t.dialogs.top().unwrap()), "West!$A$1:$B$3");
+        // Up, End and Home move the choice, and Reference follows.
+        key(&mut t, "up");
+        assert_eq!(typed(t.dialogs.top().unwrap()), "East!$A$1:$B$3");
+        key(&mut t, "end");
+        assert_eq!(typed(t.dialogs.top().unwrap()), "Summary!$D$1");
+        // Typing somewhere else does not undo the choice: Delete takes the
+        // chosen entry, whatever Reference says.
+        set(&mut t, "reference", Json::Str("West!A1:B3".into()));
+        press(&mut t, "Delete").unwrap();
+        assert_eq!(
+            listed(t.dialogs.top().unwrap()),
+            ["East!$A$1:$B$3", "West!$A$1:$B$3"]
+        );
+        // Tab reaches the list from Reference.
+        let d = t.dialogs.top_dialog_mut().unwrap();
+        d.focus = Some(1);
+        key(&mut t, "tab");
+        key(&mut t, "home");
+        assert_eq!(typed(t.dialogs.top().unwrap()), "East!$A$1:$B$3");
+        assert_eq!(view(&mut t).undo.len(), 0);
+    }
+
+    /// #988: OK writes into the selection the dialog opened on, which limits
+    /// the output, and keeps Consolidate_Area; undo takes both back.
+    #[test]
+    fn ok_writes_into_the_selection_it_opened_on() {
+        let mut t = book();
+        // A1:B2: the label row and one category, the label column and Jan.
+        let v = view(&mut t);
+        v.anchor = (1, 1);
+        v.sel = (0, 0);
+        open(&mut t);
+        add(&mut t, "East!A1:B3");
+        add(&mut t, "West!A1:B3");
+        set(&mut t, "top", Json::Bool(true));
+        set(&mut t, "left", Json::Bool(true));
+        press(&mut t, "OK").unwrap();
+        assert_eq!(t.status.to_string(), "Consolidated into A1:B2");
+        assert_eq!(value(&mut t, 2, 1, 0), Some(CellValue::Text("A".into())));
+        assert_eq!(value(&mut t, 2, 1, 1), Some(CellValue::Number(1.0)));
+        assert_eq!(value(&mut t, 2, 2, 0), None, "B is past it");
+        let area = |t: &mut DocTab| {
+            view(t)
+                .pkg
+                .workbook
+                .defined_names
+                .iter()
+                .find(|d| d.name == gridcore::edit::CONSOLIDATE_AREA && d.scope == Some(2))
+                .map(|d| d.formula.clone())
+        };
+        assert_eq!(area(&mut t).as_deref(), Some("Summary!$A$1:$B$2"));
+        assert!(view(&mut t).undo_step());
+        assert_eq!(area(&mut t), None);
+        assert_eq!(value(&mut t, 2, 1, 0), None);
+    }
+
+    /// #988 r1: a run whose cells come out the same but which sets
+    /// Consolidate_Area (a file consolidated before it was kept) is one
+    /// undo step and makes the tab dirty; undo takes the name away.
+    #[test]
+    fn a_run_that_only_sets_consolidate_area_is_an_undo_step() {
+        let mut t = book();
+        open(&mut t);
+        add(&mut t, "East!A1:B3");
+        press(&mut t, "OK").unwrap();
+        // As a file from before #988 has it: the output, no name.
+        view(&mut t).pkg.workbook.defined_names.clear();
+        view(&mut t).undo.clear();
+        t.dirty = false;
+        open(&mut t);
+        press(&mut t, "OK").unwrap();
+        assert_eq!(view(&mut t).undo.len(), 1);
+        assert!(t.dirty);
+        assert_eq!(view(&mut t).pkg.workbook.defined_names.len(), 1);
+        assert!(view(&mut t).undo_step());
+        assert!(view(&mut t).pkg.workbook.defined_names.is_empty());
+        // Run again with nothing new: no step.
+        open(&mut t);
+        press(&mut t, "OK").unwrap();
+        open(&mut t);
+        press(&mut t, "OK").unwrap();
+        assert_eq!(t.status.to_string(), "Consolidate changed nothing");
     }
 
     #[test]

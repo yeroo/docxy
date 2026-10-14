@@ -81,6 +81,7 @@ pub(crate) fn verb_for(name: &str) -> Option<&'static str> {
         "xlsxy_text_to_columns" => "range.text-to-columns",
         "xlsxy_options" => "app.options",
         "xlsxy_convert" => "wb.convert",
+        "xlsxy_consolidate" => "wb.consolidate",
         _ => return None,
     })
 }
@@ -1131,6 +1132,56 @@ fn tool_defs() -> Json {
             ],
             &[],
         ),
+        tool(
+            "xlsxy_consolidate",
+            "Data > Consolidate, as the dialog's OK does it: combine the source ranges refs (Sheet!A1:C9, a bare range on the destination's sheet, or a defined name naming one area) into dest with fn, by position or by matching labels (top, left); links writes linked formulas in an outline (refused for a source on the destination sheet). The settings are kept on the destination sheet and its Consolidate_Area name set to the output. A refusal changes nothing. One undo step; returns sheet and range.",
+            vec![
+                (
+                    "refs",
+                    prop_array(
+                        item_ty("string"),
+                        "The source references, e.g. [\"East!A1:C4\", \"West!A1:C4\"] or a defined name.",
+                    ),
+                ),
+                (
+                    "dest",
+                    prop(
+                        "string",
+                        "The destination: a cell (Sheet!B2 or B2) or a range (Sheet!B2:D9), whose size more than one cell tall or wide limits the output that way (default: the cursor on the active sheet).",
+                    ),
+                ),
+                (
+                    "fn",
+                    prop(
+                        "string",
+                        "The function: a dialog name or file token, Sum (default), Count, Average, Max, Min, Product, Count Numbers (countNums), StdDev, StdDevp, Var, Varp.",
+                    ),
+                ),
+                (
+                    "top",
+                    prop(
+                        "boolean",
+                        "Use labels in the top row (match columns by label).",
+                    ),
+                ),
+                (
+                    "left",
+                    prop(
+                        "boolean",
+                        "Use labels in the left column (match rows by label).",
+                    ),
+                ),
+                (
+                    "links",
+                    prop(
+                        "boolean",
+                        "Create links to source data (formulas in a grouped outline).",
+                    ),
+                ),
+                target(),
+            ],
+            &["refs"],
+        ),
     ])
 }
 
@@ -1263,12 +1314,14 @@ mod tests {
             "xlsxy_options",
             // #874: Compatibility Mode's Convert.
             "xlsxy_convert",
+            // #988: Data > Consolidate.
+            "xlsxy_consolidate",
         ];
         let save_pos = names.iter().position(|n| *n == "xlsxy_save").unwrap();
         assert_eq!(
             &names[save_pos + 1..],
             &expected_tail,
-            "wave-1/wave-2/wave-3/#600/#612/#712/#761/#874 tools must be appended right after xlsxy_save, in this order"
+            "wave-1/wave-2/wave-3/#600/#612/#712/#761/#874/#988 tools must be appended right after xlsxy_save, in this order"
         );
         for t in tools {
             assert_eq!(
@@ -1297,6 +1350,7 @@ mod tests {
         assert_eq!(required_of("xlsxy_import_text"), "[]");
         assert_eq!(required_of("xlsxy_text_to_columns"), "[\"range\"]");
         assert_eq!(required_of("xlsxy_options"), "[]");
+        assert_eq!(required_of("xlsxy_consolidate"), "[\"refs\"]");
         assert_eq!(required_of("xlsxy_comment_add"), "[\"ref\",\"text\"]");
         assert_eq!(required_of("xlsxy_comment_remove"), "[\"ref\"]");
         assert_eq!(required_of("xlsxy_range_set"), "[\"start\",\"rows\"]");
@@ -1533,6 +1587,7 @@ mod tests {
         ("xlsxy_text_to_columns", "range.text-to-columns"),
         ("xlsxy_options", "app.options"),
         ("xlsxy_convert", "wb.convert"),
+        ("xlsxy_consolidate", "wb.consolidate"),
     ];
     /// Tools handled specially in `do_tool` (not simple verb forwards), so
     /// `verb_for` deliberately returns `None` for them.

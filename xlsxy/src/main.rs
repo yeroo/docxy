@@ -8309,7 +8309,11 @@ impl App {
             }
             Ok(msg) => {
                 self.status = Some(msg);
-                if !gridcore::edit::sheets_differ(&before.sheets, &self.pkg.workbook.sheets) {
+                // A defined name is a change too: Consolidate keeps its
+                // Consolidate_Area (#988), which may be all a run changed.
+                if !gridcore::edit::sheets_differ(&before.sheets, &self.pkg.workbook.sheets)
+                    && before.names == self.pkg.workbook.defined_names
+                {
                     return Ok(false);
                 }
                 self.rebuild_engine();
@@ -8497,7 +8501,7 @@ impl App {
         ));
     }
 
-    /// Consolidate…: the dialog writing at the cursor, starting from the
+    /// Consolidate…: the dialog writing at the selection, starting from the
     /// settings this sheet kept.
     fn open_consolidate(&mut self) {
         let kept = self.sheet().consolidate.as_ref();
@@ -8509,24 +8513,25 @@ impl App {
             .map(|s| s.name.clone())
             .collect();
         self.outline_dialog = Some(outlinedlg::Dialog::Consolidate(
-            outlinedlg::ConsolidateDialog::new(self.sheet, self.cur, kept, names),
+            outlinedlg::ConsolidateDialog::new(self.sheet, self.selection(), kept, names),
         ));
     }
 
-    /// Consolidate into `sheet` at `at` as one undo step. The detail rows of
+    /// Consolidate into `sheet` at `area` (its top-left; more than one cell
+    /// limits the output) as one undo step. The detail rows of
     /// a linked consolidation carry the workbook's name: the file's stem.
     /// A refusal changes nothing and says why.
     pub(crate) fn apply_consolidate(
         &mut self,
         sheet: usize,
-        at: (u32, u32),
+        area: gridcore::edit::Area,
         mut opts: gridcore::edit::ConsolidateOptions,
     ) -> Result<gridcore::edit::Area, String> {
         opts.book_name = file_stem(&self.path);
         let mut out = None;
         let done = self.try_outline_edit_on(sheet, |wb| {
             let area =
-                gridcore::edit::consolidate(wb, sheet, at, &opts).map_err(|e| e.to_string())?;
+                gridcore::edit::consolidate(wb, sheet, area, &opts).map_err(|e| e.to_string())?;
             out = Some(area);
             let (r1, c1, r2, c2) = area;
             Ok(format!(
@@ -8653,7 +8658,7 @@ impl App {
                     return;
                 };
                 // A refusal leaves the dialog open, with the reason showing.
-                if self.apply_consolidate(d.sheet, d.at, opts).is_ok() {
+                if self.apply_consolidate(d.sheet, d.area, opts).is_ok() {
                     self.outline_dialog = None;
                 }
             }

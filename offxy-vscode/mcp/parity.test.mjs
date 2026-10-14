@@ -52,9 +52,9 @@ function main() {
   assert.ok(Array.isArray(expected), `${SNAPSHOT_PATH} must be a JSON array`);
   assert.equal(
     expected.length,
-    92,
-    'the committed snapshot is expected to carry the 92-tool surface (66 + #612 page layout + #626 ' +
-      'compare + #955 page background + #712 Flash Fill and AutoCorrect + #621 comment resolve/delete-all + #625 display mode + #624 track changes + #761 text import, Text to Columns and options + #874 convert); if a tool ' +
+    93,
+    'the committed snapshot is expected to carry the 93-tool surface (66 + #612 page layout + #626 ' +
+      'compare + #955 page background + #712 Flash Fill and AutoCorrect + #621 comment resolve/delete-all + #625 display mode + #624 track changes + #761 text import, Text to Columns and options + #874 convert + #988 consolidate); if a tool ' +
       'was deliberately added/removed, regenerate the snapshot (see the header comment) ' +
       'rather than editing this number blindly',
   );

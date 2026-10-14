@@ -195,6 +195,51 @@ test sheet consolidate/reference: Escape cancels
   assert reply.value is not Esc9
   call real-key {"key":"escape"}
 
+test sheet consolidate/refs: focus by Tab
+  open ../fixtures/basic.xlsx
+  click E1
+  call ribbon-click {"tab":"Data","command":"Consolidate"}
+  assert dialog is consolidate
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"reference"}
+  call real-type {"text":"B2:B5"}
+  call pointer-click {"dialog-button":"Add"}
+  call pointer-click {"dialog-field":"reference"}
+  call real-type {"text":"C2:C5"}
+  call pointer-click {"dialog-button":"Add"}
+  call real-key {"key":"tab","to-field":"refs"}
+  call field-read {"dialog-field":"refs"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet consolidate/refs: Up and Down step
+  open ../fixtures/basic.xlsx
+  click E1
+  call ribbon-click {"tab":"Data","command":"Consolidate"}
+  assert dialog is consolidate
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"reference"}
+  call real-type {"text":"B2:B5"}
+  call pointer-click {"dialog-button":"Add"}
+  call pointer-click {"dialog-field":"reference"}
+  call real-type {"text":"C2:C5"}
+  call pointer-click {"dialog-button":"Add"}
+  call real-key {"key":"tab","to-field":"refs"}
+  call field-read {"dialog-field":"refs"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"refs"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"refs"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"refs"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
 test sheet drop-replace: matches the catalogue
   open ../fixtures/basic.xlsx
   call border-drag {"from":"B2","to":"A2"}
@@ -633,6 +678,43 @@ test sheet custom-lists: matches the catalogue
   call pointer-click {"at":"custom-lists-row"}
   assert dialog is custom-lists
   call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet custom-lists/lists: focus by Tab
+  open ../fixtures/basic.xlsx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"custom-lists-row"}
+  assert dialog is custom-lists
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"lists"}
+  call field-read {"dialog-field":"lists"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet custom-lists/lists: Up and Down step
+  open ../fixtures/basic.xlsx
+  call backstage {"action":"open"}
+  call pointer-wheel {"region":"backstage-content","dy":-6000}
+  shot window
+  call pointer-click {"at":"custom-lists-row"}
+  assert dialog is custom-lists
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"lists"}
+  call field-read {"dialog-field":"lists"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"lists"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"lists"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"lists"}
+  assert reply.index is 1
   call real-key {"key":"escape"}
 
 test sheet custom-lists/entries: focus by click

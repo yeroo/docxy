@@ -316,12 +316,13 @@ impl AxisDialog {
     }
 }
 
-/// The Consolidate dialog, writing at the cell it opened on.
+/// The Consolidate dialog, writing at the selection it opened on.
 #[derive(Clone, Debug)]
 pub struct ConsolidateDialog {
-    /// The destination: sheet, row and column.
+    /// The destination: the sheet, and the area selected when it opened
+    /// (more than one cell limits the output, DAT-161).
     pub sheet: usize,
-    pub at: (u32, u32),
+    pub area: gridcore::edit::Area,
     pub func: SubtotalFunc,
     /// The "Reference" box.
     pub reference: String,
@@ -359,14 +360,14 @@ impl ConsolidateDialog {
     /// kept (Excel's defaults, Sum and nothing checked, without).
     pub fn new(
         sheet: usize,
-        at: (u32, u32),
+        area: gridcore::edit::Area,
         kept: Option<&ConsolidateSettings>,
         sheet_names: Vec<String>,
     ) -> ConsolidateDialog {
         let s = kept.cloned().unwrap_or_default();
         ConsolidateDialog {
             sheet,
-            at,
+            area,
             func: s.func,
             reference: String::new(),
             refs: s.refs,
@@ -836,7 +837,7 @@ mod tests {
     #[test]
     fn consolidate_dialog_maps_its_fields_to_options() {
         let names = ["East", "West", "Summary"].map(String::from).to_vec();
-        let mut d = ConsolidateDialog::new(2, (0, 0), None, names);
+        let mut d = ConsolidateDialog::new(2, (0, 0, 0, 0), None, names);
         assert_eq!(d.options(), ConsolidateOptions::default());
         // Space on the Function row is not OK.
         assert_eq!(d.key(KeyCode::Char(' ')), Outcome::Pending);
@@ -903,8 +904,9 @@ mod tests {
             top_row: true,
             left_col: false,
             links: true,
+            external: vec![],
         };
-        let mut d = ConsolidateDialog::new(0, (3, 4), Some(&kept), Vec::new());
+        let mut d = ConsolidateDialog::new(0, (3, 4, 3, 4), Some(&kept), Vec::new());
         assert_eq!(
             (d.func, d.top_row, d.left_col, d.links),
             (SubtotalFunc::Max, true, false, true)
