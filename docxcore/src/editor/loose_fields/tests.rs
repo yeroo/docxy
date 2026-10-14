@@ -539,9 +539,15 @@ fn a_marker_run_sharing_text_or_a_break_stays_as_today_1240() {
     let page_end = "<w:r><w:br w:type=\"page\"/><w:fldChar w:fldCharType=\"end\"/></w:r>";
     let see_begin =
         "<w:r><w:t xml:space=\"preserve\">See </w:t><w:fldChar w:fldCharType=\"begin\"/></w:r>";
+    // r3-m1: anything but field code, not only what #642's collapse checks.
+    let hyphen_end = "<w:r><w:fldChar w:fldCharType=\"end\"/><w:noBreakHyphen/></w:r>";
+    let ptab_end = "<w:r><w:ptab w:relativeTo=\"margin\" w:alignment=\"right\" \
+        w:leader=\"none\"/><w:fldChar w:fldCharType=\"end\"/></w:r>";
     for (begin, end, kept) in [
         (BEGIN, page_end, "w:type=\"page\""),
         (see_begin, END, ">See </w:t>"),
+        (BEGIN, hyphen_end, "<w:noBreakHyphen/>"),
+        (BEGIN, ptab_end, "<w:ptab "),
     ] {
         let mut ed = toc_with(begin, end);
         ed.set_caret(Caret::at(vec![3], 0));
@@ -549,7 +555,12 @@ fn a_marker_run_sharing_text_or_a_break_stays_as_today_1240() {
         assert!(!ed.has_selection(), "{kept}: Backspace does not select");
 
         // A delete covering it deletes the result as on main: the shared
-        // run, and the markers with it, stay.
+        // run, and the markers with it, stay. (Not a positional tab's run:
+        // on main a delete spanning an alignment tab drops its run, #768,
+        // and this field's end with it.)
+        if kept == "<w:ptab " {
+            continue;
+        }
         let mut ed = toc_with(begin, end);
         select(&mut ed, Caret::at(vec![1], 0), Caret::at(vec![3], 0));
         ed.backspace();
@@ -560,4 +571,26 @@ fn a_marker_run_sharing_text_or_a_break_stays_as_today_1240() {
             assert_eq!(xml.matches(&marker).count(), 1, "{kind} in {xml}");
         }
     }
+}
+
+#[test]
+fn a_multi_paragraph_paste_at_a_loose_fields_begin_lands_before_it_1240() {
+    // r3-m2: every pasted piece lands outside the field, which opens right
+    // after the last one.
+    let (mut ed, _) = toc("", true);
+    ed.set_caret(b_of(""));
+    ed.paste(&Clip::from_text(
+        "Foo
+Bar",
+    ));
+    assert_eq!(kinds(&ed, &[1]), ["run Foo"]);
+    assert_eq!(
+        kinds(&ed, &[2])[..4],
+        ["run Bar", "begin", "instr", "separate"]
+    );
+    assert_eq!(
+        texts(&ed),
+        ["Before", "Foo", "BarIntro	1", "Body	2", "", "After"]
+    );
+    assert_markers(&ed, 1);
 }

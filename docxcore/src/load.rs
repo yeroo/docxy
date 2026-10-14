@@ -1137,7 +1137,7 @@ pub(crate) fn is_field_code_raw(run: &str) -> bool {
 /// Whether a field-code run holds only field code: nothing that shows (text, a
 /// tab, a break, a symbol) or anchors something (a comment or note reference),
 /// and no tracked formatting change, all of which a Field would hide.
-pub(crate) fn is_clean_code_run(run: &str) -> bool {
+fn is_clean_code_run(run: &str) -> bool {
     const OTHER: [&str; 10] = [
         "w:t",
         "w:delText",
@@ -1187,6 +1187,36 @@ pub(crate) fn is_empty_run(raw: &str) -> bool {
         match p.next() {
             Event::Start => match p.name() {
                 "w:rPr" | "w:lastRenderedPageBreak" => p.skip_element(),
+                _ => return false,
+            },
+            Event::Text => {
+                if !p.text().trim().is_empty() {
+                    return false;
+                }
+            }
+            Event::End | Event::Eof => return true,
+        }
+    }
+}
+
+/// Whether a field-code run holds field code and nothing else: its children
+/// are only run properties, `w:fldChar`, `w:instrText`, `w:delInstrText` and
+/// `w:lastRenderedPageBreak`. An allow-list, so a run removed with its loose
+/// field never takes anything else with it, such as text, a break, a
+/// hyphen, a positional tab or a note mark (#1240).
+pub(crate) fn holds_field_code_only(raw: &str) -> bool {
+    let mut p = XmlParser::new(raw);
+    if !matches!(p.next(), Event::Start) || p.name() != "w:r" {
+        return false;
+    }
+    loop {
+        match p.next() {
+            Event::Start => match p.name() {
+                "w:rPr"
+                | "w:fldChar"
+                | "w:instrText"
+                | "w:delInstrText"
+                | "w:lastRenderedPageBreak" => p.skip_element(),
                 _ => return false,
             },
             Event::Text => {

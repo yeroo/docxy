@@ -17,7 +17,7 @@
 
 use super::*;
 use crate::field::{FieldEvent, field_events};
-use crate::load::{is_clean_code_run, is_field_code_raw};
+use crate::load::{holds_field_code_only, is_field_code_raw};
 use std::collections::BTreeSet;
 
 /// Where a field-code run is in a block container: its paragraph's index in
@@ -92,7 +92,7 @@ fn loose_fields(blocks: &[Block]) -> Vec<LooseField> {
             };
             match item {
                 Inline::Raw(raw) if is_field_code_raw(raw) => {
-                    pairing.step(field_events(raw), at, true, is_clean_code_run(raw));
+                    pairing.step(field_events(raw), at, true, holds_field_code_only(raw));
                 }
                 // A link's own fields (a TOC entry's PAGEREF) go with it;
                 // markers it shares with fields outside it pair as nested.
@@ -123,7 +123,8 @@ struct Pairing {
 }
 
 impl Pairing {
-    /// The fields open now hold a marker that is not a paragraph child.
+    /// The open fields are no longer whole (see [`LooseField::whole`]): a
+    /// run between their edges cannot be removed with them.
     fn taint(&mut self) {
         self.open.iter_mut().for_each(|(_, whole)| *whole = false);
     }
@@ -213,7 +214,7 @@ fn link_is_balanced(h: &Hyperlink) -> bool {
 /// Whether every field-code run of a link holds field code only.
 fn link_code_is_clean(h: &Hyperlink) -> bool {
     h.content.iter().all(|item| match item {
-        Inline::Raw(raw) if is_field_code_raw(raw) => is_clean_code_run(raw),
+        Inline::Raw(raw) if is_field_code_raw(raw) => holds_field_code_only(raw),
         _ => true,
     })
 }
@@ -491,6 +492,34 @@ pub(super) fn first_trailing_begin(head: &[Inline]) -> Option<usize> {
         matches!(&head[i], Inline::Raw(raw) if is_field_code_raw(raw)
             && field_events(raw).iter().any(|e| matches!(e, FieldEvent::Begin)))
     })
+}
+
+/// Take out of `content` the zero-width inlines at editor offset `o` from
+/// the first field begin among them on: a paragraph split at `o` keeps
+/// zero-width inlines in its first half, so a multi-paragraph paste at a
+/// loose field's begin hands them to the last pasted piece's paragraph,
+/// and the field opens after the paste, not around its later pieces.
+pub(super) fn take_field_begins_at(content: &mut Vec<Inline>, o: usize) -> Vec<Inline> {
+    let mut offset = 0;
+    let mut first = None;
+    for (k, item) in content.iter().enumerate() {
+        let width = inline_len(item);
+        if offset == o && width == 0 {
+            if first.is_none() && first_trailing_begin(&content[k..=k]).is_some() {
+                first = Some(k);
+            }
+        } else if first.is_some() || offset + width > o {
+            let Some(j) = first else {
+                break;
+            };
+            return content.drain(j..k).collect();
+        }
+        offset += width;
+    }
+    match first {
+        Some(j) => content.drain(j..).collect(),
+        None => Vec::new(),
+    }
 }
 
 #[cfg(test)]

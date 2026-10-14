@@ -2020,7 +2020,11 @@ impl Editor {
             // closed after it and open again around the last piece.
             let first_len =
                 insert_inlines(&mut p.content, off, clip.paras[0].clone(), true, in_cover);
-            let (tail, inside) = split_paragraph_at(&mut p.content, off + first_len, in_cover);
+            // A loose field beginning at the split opens after the last
+            // piece, not around the pieces after the first (#1240).
+            let begins = loose_fields::take_field_begins_at(&mut p.content, off + first_len);
+            let (mut tail, inside) = split_paragraph_at(&mut p.content, off + first_len, in_cover);
+            tail.splice(inside..inside, begins);
 
             // A middle piece pasted inside content controls is inside them
             // too: a copy of each opens and closes around it.
