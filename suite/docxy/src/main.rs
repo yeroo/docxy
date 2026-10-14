@@ -40,6 +40,7 @@ mod doc_autocorrect;
 mod doc_export;
 #[cfg(test)]
 mod doc_export_tests;
+mod doc_fields;
 #[cfg(test)]
 mod doc_final_tests;
 mod doc_import;
@@ -4715,6 +4716,11 @@ struct DocTab {
     /// This document's mail merge (#628): its type, recipient list and
     /// preview state.
     mail: mailings_tab::MailState,
+    /// Field codes shown, Alt+F9 (#1241): every body field (table cells
+    /// too) draws as its code, `{ PAGE }`, instead of its result; header,
+    /// footer and frame fields keep their results. A view of this tab only:
+    /// never saved.
+    field_codes: bool,
     /// A converted tab's document as it was converted (#633): what
     /// Protected View's rollback restores, so it never converts again.
     converted_docx: Option<std::rc::Rc<Vec<u8>>>,
@@ -7123,6 +7129,8 @@ struct RenderCtx<'a> {
     cell_range: Option<&'a docxcore::editor::CellRange>,
     /// Mailings ▸ Highlight Merge Fields is on: merge fields draw shaded.
     merge_hl: bool,
+    /// Field codes are shown (Alt+F9, #1241): fields draw as `{ code }`.
+    field_codes: bool,
     /// In a table cell: its table style's run formatting, laid below each
     /// run's own (#765). A nested table sets its own.
     cell_run: Option<&'a docxcore::table_styles::RunLook>,
@@ -7346,6 +7354,7 @@ fn blank_docx_tab(title: &str) -> DocTab {
         converted_docx: None,
         pending_conversion: false,
         mail: Default::default(),
+        field_codes: false,
         import: Default::default(),
     }
 }
@@ -7409,6 +7418,7 @@ impl Loaded {
             comments_removed_all: false,
             used_comment_ids: Default::default(),
             mail: mailings_tab::MailState::from_pkg(self.pkg.as_ref()),
+            field_codes: false,
             pkg: self.pkg,
             notes: self.notes,
             markdown: self.markdown,
@@ -7883,6 +7893,7 @@ fn sheet_tab_from_path(path: &PathBuf, repair: bool) -> DocTab {
         converted_docx: None,
         pending_conversion: false,
         mail: Default::default(),
+        field_codes: false,
         import: Default::default(),
     }
 }
@@ -12011,6 +12022,7 @@ fn restore_tab_content(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 converted_docx: None,
                 pending_conversion: false,
                 mail: Default::default(),
+                field_codes: false,
                 import: Default::default(),
             }
         }
@@ -12045,6 +12057,7 @@ fn restore_tab_content(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 comments_removed_all: false,
                 used_comment_ids: Default::default(),
                 mail: mailings_tab::MailState::from_pkg(pkg.as_ref()),
+                field_codes: false,
                 import: Default::default(),
                 pkg,
                 notes,
@@ -13497,6 +13510,7 @@ impl Docxy {
             converted_docx: None,
             pending_conversion: false,
             mail: Default::default(),
+            field_codes: false,
             import: Default::default(),
         };
         self.tabs.push(match kind {
@@ -23514,6 +23528,16 @@ impl Docxy {
                 self.cancel_pointer_modes();
             }
         }
+        // Alt+F9 shows field codes (#1241): the Alt key-down raised the
+        // KeyTips, which would swallow the F9, so they go down unasked. A
+        // view only, so Protected View and final documents take it too.
+        if self.active_is_doc()
+            && doc_fields::doc_field_key(&key, ctrl, shift, m.alt)
+                == Some(doc_fields::FieldKey::ToggleCodes)
+        {
+            self.keytips = KeyTip::Off;
+            return self.doc_field_key_press(doc_fields::FieldKey::ToggleCodes, window, cx);
+        }
         // KeyTips (Alt / F10 access keys): toggle the overlay; while it's showing,
         // letters pick a tab / run a command instead of typing.
         if (key == "alt" || key == "f10") && !ctrl {
@@ -23584,6 +23608,10 @@ impl Docxy {
         // Ctrl+Alt+V: Paste Special… (#753), not the Ctrl+V below.
         if ctrl && m.alt && key == "v" {
             return self.dispatch(Act::PasteSpecial, window, cx);
+        }
+        // F9 updates fields, Shift+F9 edits one (#1241); Alt+F9 is above.
+        if let Some(fk) = doc_fields::doc_field_key(&key, ctrl, shift, m.alt) {
+            return self.doc_field_key_press(fk, window, cx);
         }
         if ctrl {
             match key.as_str() {
@@ -25067,6 +25095,7 @@ mod sheet_save_tests {
             converted_docx: None,
             pending_conversion: false,
             mail: Default::default(),
+            field_codes: false,
             import: Default::default(),
         }
     }
@@ -29046,6 +29075,44 @@ fn field_size(raw: &str, base: f32, zoom: f32) -> f32 {
         .map_or(base, |h| zoom * h as f32 / 2.0 * 1.333)
 }
 
+/// What a field draws (#1241): its result, `[field]` when it has none, or,
+/// with field codes shown (Alt+F9), its code in braces, `{ PAGE }`, falling
+/// back to the result when the code cannot be read alone (a field nested in
+/// it). Its width is measured from the same text, so lines wrap as drawn.
+fn field_shown<'a>(raw: &str, text: &'a str, codes: bool) -> std::borrow::Cow<'a, str> {
+    if codes {
+        if let Some(instr) = docxcore::field::instr_of(raw) {
+            return format!("{{ {} }}", instr.trim()).into();
+        }
+    }
+    if text.is_empty() {
+        "[field]".into()
+    } else {
+        text.into()
+    }
+}
+
+#[cfg(test)]
+mod field_shown_tests {
+    use super::field_shown;
+
+    const PAGE: &str =
+        r#"<w:fldSimple w:instr=" PAGE \* MERGEFORMAT "><w:r><w:t>3</w:t></w:r></w:fldSimple>"#;
+
+    #[test]
+    fn a_field_shows_its_result_or_with_codes_its_code_1241() {
+        assert_eq!(field_shown(PAGE, "3", false), "3");
+        assert_eq!(field_shown(PAGE, "3", true), r"{ PAGE \* MERGEFORMAT }");
+        // A field with no result: `[field]`, or its code (XE, TC).
+        let xe = "<w:fldSimple w:instr=\"XE &quot;a&quot;\"/>";
+        assert_eq!(field_shown(xe, "", false), "[field]");
+        assert_eq!(field_shown(xe, "", true), "{ XE \"a\" }");
+        // A code that holds a nested field cannot be read alone: its result.
+        let nested = "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>            <w:r><w:fldChar w:fldCharType=\"begin\"/></w:r><w:r><w:instrText>PAGE</w:instrText></w:r>            <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>            <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r><w:r><w:t>2</w:t></w:r>            <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
+        assert_eq!(field_shown(nested, "2", true), "2");
+    }
+}
+
 /// A frame group's content width in twips, measured as `hf_para_el` draws
 /// it at `zoom` (1 px = 15 / zoom twips), for a frame with no `w` (Word sizes
 /// it to its content): the widest paragraph, plus a space of slack.
@@ -29057,7 +29124,7 @@ fn frame_content_w(g: &docxcore::frame::FrameGroup, meas: &Measurer, zoom: f32) 
         let base = para_base(p, zoom);
         let items: f32 = flat_inlines(&p.content)
             .iter()
-            .map(|(i, _)| inline_width(i, base, zoom, meas, None))
+            .map(|(i, _)| inline_width(i, base, zoom, meas, None, false))
             .sum();
         items + meas.width(" ", base, false, false)
     };
@@ -29156,6 +29223,7 @@ fn inline_width(
     zoom: f32,
     m: &Measurer,
     cell_run: Option<&docxcore::table_styles::RunLook>,
+    field_codes: bool,
 ) -> f32 {
     match it {
         Inline::Run(r) => {
@@ -29166,11 +29234,10 @@ fn inline_width(
                 .unwrap_or(base);
             m.width(&r.text, sz, props.bold, props.italic)
         }
-        // Its shown text (`[field]` when it has none) and its 2 px padding
-        // each side.
+        // Its shown text ([`field_shown`]) and its 2 px padding each side.
         Inline::Field { raw, text } => {
             m.width(
-                if text.is_empty() { "[field]" } else { text },
+                &field_shown(raw, text, field_codes),
                 field_size(raw, base, zoom),
                 false,
                 false,
@@ -29197,6 +29264,7 @@ fn hf_para_el(p: &Paragraph, pal: Pal, meas: &Measurer, width: f32, zoom: f32) -
         pal,
         Some(meas),
         Some(width),
+        false,
         false,
         // Header/footer text is never line-numbered (#746).
         None,
@@ -29541,6 +29609,7 @@ fn paragraph_el(
     meas: Option<&Measurer>,
     hf_width: Option<f32>,
     merge_hl: bool,
+    field_codes: bool,
     lines: Option<LineSlot>,
     overlay: Option<AnyElement>,
     cell_run: Option<&docxcore::table_styles::RunLook>,
@@ -29612,8 +29681,11 @@ fn paragraph_el(
     // The rendered width of a single inline (for tracking x and looking ahead to
     // size centre/right tabs). An inline picture counts its frame's width;
     // other inlines with no measurable text contribute 0.
-    let inline_w =
-        |it: &Inline| -> f32 { m.map_or(0.0, |m| inline_width(it, base, zoom, m, cell_run)) };
+    let inline_w = |it: &Inline| -> f32 {
+        m.map_or(0.0, |m| {
+            inline_width(it, base, zoom, m, cell_run, field_codes)
+        })
+    };
     // Total width of content from index `from` up to the next tab, alignment
     // tab, break or end — the segment a centre/right tab must position.
     let seg_width = |from: usize| -> f32 {
@@ -29756,11 +29828,7 @@ fn paragraph_el(
                 // engine (#642), edited as a unit: it takes the caret before it, a
                 // click, and the selection highlight like a tab does. An empty one
                 // takes no offset.
-                let shown = if text.is_empty() {
-                    "[field]".to_string()
-                } else {
-                    text.clone()
-                };
+                let shown = field_shown(raw, text, field_codes).into_owned();
                 let width = caret_advance(inline);
                 let pos = idx;
                 if width == 1 && caret == Some(pos) {
@@ -30372,6 +30440,7 @@ fn block_el_numbered(
                 Some(ctx.meas),
                 ctx.hf_width,
                 ctx.merge_hl,
+                ctx.field_codes,
                 lines,
                 overlay,
                 ctx.cell_run,
@@ -35413,6 +35482,7 @@ impl Render for Docxy {
                         tbl: &tbl,
                         cell_range: body_range.as_ref(),
                         merge_hl: tab.mail.highlight,
+                        field_codes: tab.field_codes,
                         cell_run: None,
                     };
                     let body = &shown.body;
@@ -35655,6 +35725,10 @@ impl Render for Docxy {
                                     tbl: &tbl,
                                     cell_range: hf_range.as_ref(),
                                     merge_hl: tab.mail.highlight,
+                                    // Codes show in the body only: the bands
+                                    // `hf_para_el` draws on other pages keep
+                                    // their results, so the live one does too.
+                                    field_codes: false,
                                     cell_run: None,
                                 });
                                 // One region's margin content for this page: the live

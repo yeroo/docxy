@@ -398,6 +398,7 @@ mod tests {
             converted_docx: None,
             pending_conversion: false,
             mail: Default::default(),
+            field_codes: false,
             import: Default::default(),
         }
     }

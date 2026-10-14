@@ -1,0 +1,65 @@
+# #1241: Word's field keys in a document, pressed as real keys. Alt+F9
+# shows every field's code (the Alt key-down raises the KeyTips, which must
+# not swallow the F9), F9 updates the field at the caret, and Shift+F9
+# opens Edit Field on it. fields.docx: a PAGE field showing 1, then a
+# paragraph "Dated " and a DATE \@ "yyyy" field whose cache is 1999. The
+# state's `text` shows a field as U+FFFC, so a copy of its line reads its
+# result.
+
+test alt+f9 shows field codes and shows results again
+  open copy:../fixtures/fields.docx
+  assert view.field_codes is false
+  call real-key {"key":"alt+f9"}
+  assert view.field_codes is true
+  assert dialog is none
+  call real-key {"key":"alt+f9"}
+  assert view.field_codes is false
+
+# On macOS the ⌥ key-down reaches the window as a key of its own and raises
+# the KeyTips before the F9 comes; a real Alt press first plays that order.
+test alt+f9 shows field codes past the keytips the alt raised
+  open copy:../fixtures/fields.docx
+  call real-key {"key":"alt"}
+  assert keytips_up is true
+  call real-key {"key":"alt+f9"}
+  assert view.field_codes is true
+  assert keytips_up is false
+
+test f9 updates the field at the caret, and undo takes it back
+  open copy:../fixtures/fields.docx
+  key ctrl+end
+  assert dirty is false
+  call real-key {"key":"f9"}
+  assert dirty is true
+  call real-key {"key":"shift+home"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is not Dated 1999
+  call real-key {"key":"ctrl+end"}
+  call real-key {"key":"ctrl+z"}
+  call real-key {"key":"shift+home"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is Dated 1999
+
+test f9 leaves a field it cannot compute alone
+  open copy:../fixtures/fields.docx
+  key ctrl+home
+  call real-key {"key":"f9"}
+  assert dirty is false
+
+test shift+f9 edits the code and the result follows
+  open copy:../fixtures/fields.docx
+  key ctrl+home
+  call real-key {"key":"shift+f9"}
+  assert dialog is edit-field
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"= 6*7"}
+  call real-key {"key":"enter"}
+  assert dialog is none
+  assert dirty is true
+  call real-key {"key":"ctrl+home"}
+  call real-key {"key":"shift+end"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 42 is the page.

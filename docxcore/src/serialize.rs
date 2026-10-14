@@ -193,7 +193,7 @@ pub fn blocks_to_xml(blocks: &[Block]) -> String {
     without_duplicate_para_ids(s)
 }
 
-fn esc_text(s: &str, out: &mut String) {
+pub(crate) fn esc_text(s: &str, out: &mut String) {
     for ch in s.chars() {
         match ch {
             '&' => out.push_str("&amp;"),

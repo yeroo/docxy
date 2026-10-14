@@ -7,6 +7,11 @@
 //! See ECMA-376 Part 1 §17.16.5 (field-instruction grammar) and §17.16.6 (the
 //! field types and their switches).
 
+mod rewrite;
+
+pub(crate) use rewrite::stored_result;
+pub use rewrite::{with_instr, with_result};
+
 /// Compute a field's result from its (entity-decoded) instruction, or `None` when
 /// it isn't a field we evaluate (the caller keeps Word's cached result).
 pub fn eval_field(instr: &str) -> Option<String> {
@@ -954,7 +959,7 @@ pub(crate) fn field_events(raw: &str) -> Vec<FieldEvent> {
 /// end), the outermost field's `w:instrText` up to its `separate`. `None` when
 /// a field is nested in that instruction (`= { PAGE } + 1`): its value is part
 /// of the instruction, so the instruction text alone can't be evaluated.
-pub(crate) fn instr_of(raw: &str) -> Option<String> {
+pub fn instr_of(raw: &str) -> Option<String> {
     if raw.trim_start().starts_with("<w:fldSimple") {
         let k = "w:instr=\"";
         let s = raw.find(k)? + k.len();

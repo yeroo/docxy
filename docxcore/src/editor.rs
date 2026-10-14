@@ -18,6 +18,7 @@ mod autocorrect;
 #[cfg(test)]
 mod cell_sdt_tests;
 mod cover;
+mod fields;
 mod flat;
 mod loose_fields;
 mod placeholder;

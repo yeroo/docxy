@@ -1164,6 +1164,21 @@ dialogs! {
         accept_closes: true,
         unreachable: None,
     }
+    // Shift+F9 on a field (#1241): Word's Shift+F9 shows one field's code in
+    // place, but a field here is one unit, so its code is edited in a dialog.
+    EDIT_FIELD = "edit-field" {
+        surface: Surface::Doc,
+        file: "doc-home",
+        fixture: "copy:../fixtures/fields.docx",
+        // The document starts with a PAGE field, right of the caret.
+        open: &["key ctrl+home", "key shift+f9"],
+        // An instruction docxy cannot compute keeps the field's result; the
+        // code it was given is what Edit Field opens on again.
+        fields: &[Field::text("code").kept("Ab1")],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
     DATA_VALIDATION = "data-validation" {
         surface: Surface::Sheet,
         file: "sheet-data",

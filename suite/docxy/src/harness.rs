@@ -1609,6 +1609,8 @@ struct ViewFlags {
     display_mode: &'static str,
     /// The table pen on (#763): `pen` or `eraser`.
     draw: Option<&'static str>,
+    /// Field codes shown, Alt+F9 (#1241).
+    field_codes: bool,
 }
 
 impl ViewFlags {
@@ -1626,6 +1628,7 @@ impl ViewFlags {
             gridlines: app.view_gridlines,
             display_mode: app.markup.name(),
             draw: app.draw_tool().map(crate::table_draw::Tool::name),
+            field_codes: app.tabs.get(app.active).is_some_and(|t| t.field_codes),
         }
     }
 }
@@ -1738,6 +1741,7 @@ fn doc_state(editor: &Editor, flags: &ViewFlags) -> Json {
         ("gridlines", Json::Bool(flags.gridlines)),
         ("draw", str_or_null(flags.draw.map(str::to_string))),
         ("display_mode", Json::Str(flags.display_mode.into())),
+        ("field_codes", Json::Bool(flags.field_codes)),
     ]);
     Json::obj(vec![
         ("text", Json::Str(flat.main().text.clone())),
@@ -6598,6 +6602,7 @@ mod tests {
             converted_docx: None,
             pending_conversion: false,
             mail: Default::default(),
+            field_codes: false,
             import: Default::default(),
         };
         let mut word = doc(crate::Kind::Docx, "a.docx");
@@ -6787,6 +6792,7 @@ mod tests {
             gridlines: true,
             display_mode: "all",
             draw: None,
+            field_codes: false,
         };
         let state = doc_state(&editor(props, run), &flags);
         assert_eq!(state.get_str("text"), Some("abc\n"));
@@ -6866,6 +6872,7 @@ mod tests {
                 gridlines: true,
                 display_mode: "all",
                 draw: None,
+                field_codes: false,
             },
         );
         assert_ne!(state.get("para"), defaults.get("para"));
@@ -6965,6 +6972,7 @@ mod tests {
                 gridlines: true,
                 display_mode: "all",
                 draw: None,
+                field_codes: false,
             },
         );
         assert_eq!(state.get("cross_story"), Some(&Json::Bool(true)));
