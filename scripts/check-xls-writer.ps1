@@ -109,6 +109,8 @@ if ($LASTEXITCODE -ne 0) { throw "writing $synthetic failed" }
 $files = @(Get-ChildItem (Join-Path $root "corpus\legacy\*.xls")) +
   @(Get-ChildItem (Join-Path $root "corpus\legacy\extra\*.xls")) +
   @(Get-ChildItem (Join-Path $root "corpus\legacy\addin\*.xls")) +
+  @(Get-ChildItem (Join-Path $root "corpus\legacy\arrays\*.xls")) +
+  @(Get-ChildItem (Join-Path $root "corpus\legacy\arrays\*.xlsx")) +
   @(Get-ChildItem (Join-Path $root "corpus\xlsx\*.xlsx")) +
   @(Get-Item $synthetic)
 $failed = 0
