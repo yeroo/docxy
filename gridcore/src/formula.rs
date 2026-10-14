@@ -7176,6 +7176,18 @@ fn text_result(s: String) -> Value {
     }
 }
 
+/// UTF-16 units of `SUBSTITUTE(s, old, new)` replacing every non-overlapping
+/// `old` (as `str::replace` does), computed without building it. Saturates.
+fn substitute_units(s: &str, old: &str, new: &str) -> usize {
+    if old.is_empty() {
+        return s.encode_utf16().count();
+    }
+    let hits = s.matches(old).count();
+    let old_units = old.encode_utf16().count();
+    let new_units = new.encode_utf16().count();
+    (s.encode_utf16().count() - hits * old_units).saturating_add(hits.saturating_mul(new_units))
+}
+
 fn bin_op(op: BinOp, l: &Value, r: &Value) -> Value {
     use std::cmp::Ordering;
     match op {
@@ -8687,8 +8699,9 @@ impl<'a> Eval<'a> {
                 let to = from.saturating_add(count).min(chars.len());
                 Value::Str(chars[from..to].iter().collect())
             }
-            "LOWER" => self.one_text(args, |s| Value::Str(s.to_lowercase())),
-            "UPPER" => self.one_text(args, |s| Value::Str(s.to_uppercase())),
+            // Case mapping can lengthen text (ß → SS, İ → i̇), so these cap too.
+            "LOWER" => self.one_text(args, |s| text_result(s.to_lowercase())),
+            "UPPER" => self.one_text(args, |s| text_result(s.to_uppercase())),
             "PROPER" => self.one_text(args, |s| {
                 let mut out = String::with_capacity(s.len());
                 let mut boundary = true;
@@ -8705,7 +8718,7 @@ impl<'a> Eval<'a> {
                         boundary = true;
                     }
                 }
-                Value::Str(out)
+                text_result(out)
             }),
             "TRIM" => self.one_text(args, |s| {
                 // Excel semantics: strips and collapses *spaces* only (0x20);
@@ -8783,6 +8796,23 @@ impl<'a> Eval<'a> {
                 if skip_empty {
                     parts.retain(|p| !p.is_empty());
                 }
+                // The delimiter repeats once per gap, so sum the length before
+                // joining: a long delimiter over many parts would otherwise
+                // allocate far past the cap just to return #VALUE!.
+                let units = parts
+                    .iter()
+                    .fold(0usize, |acc, p| {
+                        acc.saturating_add(p.encode_utf16().count())
+                    })
+                    .saturating_add(
+                        delim
+                            .encode_utf16()
+                            .count()
+                            .saturating_mul(parts.len().saturating_sub(1)),
+                    );
+                if units > crate::entry::MAX_CELL_CHARS {
+                    return Value::Err(ExcelError::Value);
+                }
                 text_result(parts.join(&delim))
             }
             "REPT" => {
@@ -8818,7 +8848,7 @@ impl<'a> Eval<'a> {
                 let mut out: String = chars[..from].iter().collect();
                 out.push_str(&new);
                 out.extend(&chars[to..]);
-                Value::Str(out)
+                text_result(out)
             }
             "SUBSTITUTE" => {
                 if args.len() < 3 || args.len() > 4 {
@@ -8845,13 +8875,16 @@ impl<'a> Eval<'a> {
                             out.push_str(&rest[..i]);
                             out.push_str(&new);
                             out.push_str(&rest[i + old.len()..]);
-                            return Value::Str(out);
+                            return text_result(out);
                         }
                         out.push_str(&rest[..i + old.len()]);
                         rest = &rest[i + old.len()..];
                     }
                     out.push_str(rest);
                     Value::Str(out)
+                } else if substitute_units(&s, &old, &new) > crate::entry::MAX_CELL_CHARS {
+                    // Every match grows the text: refuse before building it.
+                    Value::Err(ExcelError::Value)
                 } else {
                     Value::Str(s.replace(&old, &new))
                 }
@@ -10698,12 +10731,17 @@ impl<'a> Eval<'a> {
                     self.unsupported = true;
                     return Value::Err(ExcelError::Value);
                 };
+                // Each `@` repeats the value, so text is sized before it is built.
+                let text = |s: &str| match fmt.format_text_capped(s, crate::entry::MAX_CELL_CHARS) {
+                    Some(t) => Value::Str(t),
+                    None => Value::Err(ExcelError::Value),
+                };
                 match &v {
-                    Value::Str(s) => Value::Str(fmt.format_text(s)),
-                    Value::Empty => Value::Str(fmt.format_text("")),
+                    Value::Str(s) => text(s),
+                    Value::Empty => text(""),
                     Value::Bool(b) => Value::Str(if *b { "TRUE" } else { "FALSE" }.to_string()),
                     Value::Num(n) => match fmt.format_number(*n, self.res.date1904()) {
-                        Some(s) => Value::Str(s),
+                        Some(s) => text_result(s),
                         None => {
                             self.unsupported = true;
                             Value::Err(ExcelError::Value)
@@ -10799,16 +10837,28 @@ impl<'a> Eval<'a> {
                     Some(e) => try_num!(self.eval(e)),
                 }
                 .trunc() as i64;
+                let no_commas = match args.get(2) {
+                    Some(e) if name == "FIXED" && !matches!(e, Expr::Missing) => {
+                        try_bool!(self.eval(e))
+                    }
+                    _ => false,
+                };
+                // Excel takes up to 127 decimals; more would format an
+                // unbounded string. Checked after every argument, so an
+                // argument's error wins.
+                if decimals > 127 {
+                    return Value::Err(ExcelError::Value);
+                }
                 if name == "FIXED" {
-                    let no_commas = match args.get(2) {
-                        None | Some(Expr::Missing) => false,
-                        Some(e) => try_bool!(self.eval(e)),
-                    };
                     let mag = grouped_magnitude(n, decimals, !no_commas);
-                    Value::Str(if n < 0.0 { format!("-{mag}") } else { mag })
+                    Value::Str(if n < 0.0 && !is_zero_magnitude(&mag) {
+                        format!("-{mag}")
+                    } else {
+                        mag
+                    })
                 } else {
                     let mag = grouped_magnitude(n, decimals, true);
-                    Value::Str(if n < 0.0 {
+                    Value::Str(if n < 0.0 && !is_zero_magnitude(&mag) {
                         format!("(${mag})")
                     } else {
                         format!("${mag}")
@@ -10924,12 +10974,14 @@ impl<'a> Eval<'a> {
                     None | Some(Expr::Missing) => Value::Str(core),
                     Some(e) => {
                         let sheet = try_text!(self.eval(e));
+                        // A sheet name of up to a cell's length (with each `'`
+                        // doubled) can push the address past the cap.
                         if sheet.is_empty() {
                             Value::Str(core)
                         } else if sheet.contains([' ', '\'']) {
-                            Value::Str(format!("'{}'!{core}", sheet.replace('\'', "''")))
+                            text_result(format!("'{}'!{core}", sheet.replace('\'', "''")))
                         } else {
-                            Value::Str(format!("{sheet}!{core}"))
+                            text_result(format!("{sheet}!{core}"))
                         }
                     }
                 }
@@ -12478,11 +12530,20 @@ fn group_thousands(digits: &str) -> String {
     out
 }
 
+/// A [`grouped_magnitude`] with no non-zero digit, which takes no sign.
+fn is_zero_magnitude(mag: &str) -> bool {
+    !mag.bytes().any(|b| matches!(b, b'1'..=b'9'))
+}
+
 /// Magnitude of `n` rounded to `decimals` places (may be negative), optionally
 /// with thousands separators. Sign and currency are added by the caller.
 fn grouped_magnitude(n: f64, decimals: i64, commas: bool) -> String {
     let x = n.abs();
-    let (rounded, frac_digits) = if decimals < 0 {
+    let (rounded, frac_digits) = if decimals < -308 {
+        // Every finite magnitude is under half of 10^309 and rounds to 0;
+        // this also keeps `-decimals` from overflowing at `i64::MIN`.
+        (0.0, 0usize)
+    } else if decimals < 0 {
         let f = 10f64.powi((-decimals) as i32);
         ((x / f).round() * f, 0usize)
     } else {
@@ -13280,6 +13341,190 @@ mod tests {
                 &g
             ),
             Value::Err(ExcelError::Div0)
+        );
+        assert_eq!(
+            eval_str("SUBSTITUTE(REPT(\"a\",32767),\"a\",\"xx\",1/0)", &g),
+            Value::Err(ExcelError::Div0)
+        );
+        assert_eq!(
+            eval_str("REPLACE(REPT(\"y\",32767),1,0,1/0)", &g),
+            Value::Err(ExcelError::Div0)
+        );
+        assert_eq!(
+            eval_str("FIXED(1,128,1/0)", &g),
+            Value::Err(ExcelError::Div0)
+        );
+    }
+
+    #[test]
+    fn substitute_over_cell_limit_is_value_error() {
+        let g = empty();
+        let over = Value::Err(ExcelError::Value);
+        assert_eq!(
+            text_len(eval_str(
+                "SUBSTITUTE(REPT(\"a\",16383)&\"b\",\"a\",\"xx\")",
+                &g
+            )),
+            32_767
+        );
+        assert_eq!(
+            eval_str("SUBSTITUTE(REPT(\"a\",16384),\"a\",\"xx\")", &g),
+            over
+        );
+        // The nth form replaces one match.
+        assert_eq!(
+            text_len(eval_str("SUBSTITUTE(REPT(\"a\",32766),\"a\",\"xx\",1)", &g)),
+            32_767
+        );
+        assert_eq!(
+            eval_str("SUBSTITUTE(REPT(\"a\",32767),\"a\",\"xx\",1)", &g),
+            over
+        );
+        // UTF-16 units: U+1F600 is 2 units in place of 1.
+        assert_eq!(
+            text_len(eval_str(
+                "SUBSTITUTE(REPT(\"a\",16383)&\"b\",\"a\",\"\u{1F600}\")",
+                &g
+            )),
+            32_767
+        );
+        assert_eq!(
+            eval_str("SUBSTITUTE(REPT(\"a\",16384),\"a\",\"\u{1F600}\")", &g),
+            over
+        );
+    }
+
+    #[test]
+    fn substitute_units_counts_utf16_and_saturates() {
+        assert_eq!(substitute_units("aXbXc", "X", "\u{1F600}"), 7);
+        // Non-overlapping matches, as `str::replace` takes them.
+        assert_eq!(substitute_units("aaa", "aa", "b"), 2);
+        assert_eq!(substitute_units("abc", "", "zzz"), 3);
+        assert_eq!(substitute_units("abc", "x", "zzz"), 3);
+        assert_eq!(substitute_units("xxxx", "xx", ""), 0);
+        let s = "a".repeat(32_767);
+        let new = "y".repeat(32_767);
+        assert_eq!(substitute_units(&s, "a", &new), 32_767 * 32_767);
+        assert_eq!(substitute_units("aa", "a", &"y".repeat(8)), 16);
+    }
+
+    #[test]
+    fn substitute_huge_result_is_refused_before_building() {
+        // 32,767 matches × a 32,767-unit replacement is ~1 G units:
+        // `substitute_units` refuses it before `replace` runs.
+        let g = empty();
+        assert_eq!(
+            eval_str("SUBSTITUTE(REPT(\"a\",32767),\"a\",REPT(\"y\",32767))", &g),
+            Value::Err(ExcelError::Value)
+        );
+    }
+
+    #[test]
+    fn replace_over_cell_limit_is_value_error() {
+        let g = empty();
+        let over = Value::Err(ExcelError::Value);
+        assert_eq!(eval_str("REPLACE(REPT(\"y\",32767),1,0,\"y\")", &g), over);
+        assert_eq!(eval_str("REPLACE(REPT(\"y\",32767),1,1,\"zz\")", &g), over);
+        assert_eq!(
+            text_len(eval_str("REPLACE(REPT(\"y\",32766),1,0,\"y\")", &g)),
+            32_767
+        );
+    }
+
+    #[test]
+    fn text_format_over_cell_limit_is_value_error() {
+        let g = empty();
+        let over = Value::Err(ExcelError::Value);
+        assert_eq!(eval_str("TEXT(REPT(\"y\",16384),\"@@\")", &g), over);
+        assert_eq!(
+            text_len(eval_str("TEXT(REPT(\"y\",16383),\"@\"\"-\"\"@\")", &g)),
+            32_767
+        );
+        // The literal counts.
+        assert_eq!(
+            eval_str("TEXT(REPT(\"y\",16383),\"@\"\"--\"\"@\")", &g),
+            over
+        );
+        // ~1 G units of `@` repetition, refused before it is built.
+        assert_eq!(
+            eval_str("TEXT(REPT(\"y\",32767),REPT(\"@\",32767))", &g),
+            over
+        );
+        // A number's format can repeat month names past the cap too.
+        assert_eq!(eval_str("TEXT(1,REPT(\"mmmm \",6553))", &g), over);
+        assert_eq!(
+            text_len(eval_str("TEXT(1,REPT(\"mmmm \",4095))", &g)),
+            8 * 4095
+        );
+    }
+
+    #[test]
+    fn case_mapping_over_cell_limit_is_value_error() {
+        let g = empty();
+        let over = Value::Err(ExcelError::Value);
+        // ß uppercases to SS: 1 unit becomes 2.
+        assert_eq!(eval_str("UPPER(REPT(\"\u{df}\",16384))", &g), over);
+        assert_eq!(
+            text_len(eval_str("UPPER(REPT(\"\u{df}\",16383))", &g)),
+            32_766
+        );
+        // İ (U+0130) lowercases to i + U+0307: 1 unit becomes 2.
+        assert_eq!(eval_str("LOWER(REPT(\"\u{130}\",16384))", &g), over);
+        // PROPER keeps the first letter upper, so lead with a plain one.
+        assert_eq!(eval_str("PROPER(\"a\"&REPT(\"\u{130}\",16384))", &g), over);
+        assert_eq!(
+            text_len(eval_str("PROPER(REPT(\"\u{130}\",16384))", &g)),
+            32_767
+        );
+    }
+
+    #[test]
+    fn fixed_dollar_decimals_out_of_range() {
+        let g = empty();
+        let over = Value::Err(ExcelError::Value);
+        assert_eq!(eval_str("FIXED(1,128)", &g), over);
+        assert_eq!(eval_str("DOLLAR(1,128)", &g), over);
+        assert_eq!(eval_str("FIXED(1,1E9)", &g), over);
+        assert_eq!(text_len(eval_str("FIXED(1,127)", &g)), 2 + 127);
+        // Huge negative decimals round everything to 0: no panic, no NaN.
+        assert_eq!(eval_str("FIXED(1,-1E300)", &g), Value::Str("0".into()));
+        assert_eq!(eval_str("FIXED(1,-400)", &g), Value::Str("0".into()));
+        assert_eq!(eval_str("DOLLAR(1,-400)", &g), Value::Str("$0".into()));
+        assert_eq!(eval_str("FIXED(-5,-400)", &g), Value::Str("0".into()));
+        assert_eq!(eval_str("FIXED(1E308,-400)", &g), Value::Str("0".into()));
+        assert_eq!(
+            eval_str("DOLLAR(-1.7E308,-400)", &g),
+            Value::Str("$0".into())
+        );
+        // A negative that rounds to zero takes no sign.
+        assert_eq!(eval_str("FIXED(-0.4,0)", &g), Value::Str("0".into()));
+        assert_eq!(eval_str("DOLLAR(-0.004)", &g), Value::Str("$0.00".into()));
+        assert_eq!(eval_str("FIXED(-1.5,0)", &g), Value::Str("-2".into()));
+        assert_eq!(eval_str("DOLLAR(-1)", &g), Value::Str("($1.00)".into()));
+    }
+
+    #[test]
+    fn address_over_cell_limit_is_value_error() {
+        let g = empty();
+        let over = Value::Err(ExcelError::Value);
+        // sheet + "!" + "$A$1"
+        assert_eq!(
+            text_len(eval_str("ADDRESS(1,1,1,TRUE,REPT(\"a\",32762))", &g)),
+            32_767
+        );
+        assert_eq!(eval_str("ADDRESS(1,1,1,TRUE,REPT(\"a\",32763))", &g), over);
+        // Quoting doubles every '.
+        assert_eq!(eval_str("ADDRESS(1,1,1,TRUE,REPT(\"'\",20000))", &g), over);
+    }
+
+    #[test]
+    fn textjoin_huge_delimiter_join_is_refused_before_building() {
+        // 2,000,000 parts × a 32,767-unit delimiter would be ~65 G units:
+        // the length is summed before the join, so this returns at once.
+        let g = empty();
+        assert_eq!(
+            eval_str("TEXTJOIN(REPT(\"y\",32767),FALSE,SEQUENCE(2000000))", &g),
+            Value::Err(ExcelError::Value)
         );
     }
 
