@@ -2321,5 +2321,48 @@
       },
       "required": []
     }
+  },
+  {
+    "name": "xlsxy_consolidate",
+    "description": "Data > Consolidate, as the dialog's OK does it: combine the source ranges refs (Sheet!A1:C9, a bare range on the destination's sheet, or a defined name naming one area) into dest with fn, by position or by matching labels (top, left); links writes linked formulas in an outline (refused for a source on the destination sheet). The settings are kept on the destination sheet and its Consolidate_Area name set to the output. A refusal changes nothing. One undo step; returns sheet and range.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The source references, e.g. [\"East!A1:C4\", \"West!A1:C4\"] or a defined name."
+        },
+        "dest": {
+          "type": "string",
+          "description": "The destination: a cell (Sheet!B2 or B2) or a range (Sheet!B2:D9), whose size more than one cell tall or wide limits the output that way (default: the cursor on the active sheet)."
+        },
+        "fn": {
+          "type": "string",
+          "description": "The function: a dialog name or file token, Sum (default), Count, Average, Max, Min, Product, Count Numbers (countNums), StdDev, StdDevp, Var, Varp."
+        },
+        "top": {
+          "type": "boolean",
+          "description": "Use labels in the top row (match columns by label)."
+        },
+        "left": {
+          "type": "boolean",
+          "description": "Use labels in the left column (match rows by label)."
+        },
+        "links": {
+          "type": "boolean",
+          "description": "Create links to source data (formulas in a grouped outline)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "refs"
+      ]
+    }
   }
 ]

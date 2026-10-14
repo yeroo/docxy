@@ -1379,6 +1379,20 @@ function xlsxyToolDefs() {
       Object.fromEntries([['overwrite', prop('boolean', 'Replace an existing <name>.xlsx (default false: refused).')], target()]),
       [],
     ),
+    tool(
+      'xlsxy_consolidate',
+      'Data > Consolidate, as the dialog\'s OK does it: combine the source ranges refs (Sheet!A1:C9, a bare range on the destination\'s sheet, or a defined name naming one area) into dest with fn, by position or by matching labels (top, left); links writes linked formulas in an outline (refused for a source on the destination sheet). The settings are kept on the destination sheet and its Consolidate_Area name set to the output. A refusal changes nothing. One undo step; returns sheet and range.',
+      Object.fromEntries([
+        ['refs', propArray(itemTy('string'), 'The source references, e.g. ["East!A1:C4", "West!A1:C4"] or a defined name.')],
+        ['dest', prop('string', 'The destination: a cell (Sheet!B2 or B2) or a range (Sheet!B2:D9), whose size more than one cell tall or wide limits the output that way (default: the cursor on the active sheet).')],
+        ['fn', prop('string', 'The function: a dialog name or file token, Sum (default), Count, Average, Max, Min, Product, Count Numbers (countNums), StdDev, StdDevp, Var, Varp.')],
+        ['top', prop('boolean', 'Use labels in the top row (match columns by label).')],
+        ['left', prop('boolean', 'Use labels in the left column (match rows by label).')],
+        ['links', prop('boolean', 'Create links to source data (formulas in a grouped outline).')],
+        target(),
+      ]),
+      ['refs'],
+    ),
   ];
 }
 
@@ -1485,6 +1499,7 @@ const XLSXY_VERBS = {
   xlsxy_text_to_columns: 'range.text-to-columns',
   xlsxy_options: 'app.options',
   xlsxy_convert: 'wb.convert',
+  xlsxy_consolidate: 'wb.consolidate',
 };
 
 /** Execute a tool by forwarding to the control surface. Returns the result

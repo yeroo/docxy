@@ -40,7 +40,7 @@
 //! | `range.text-to-columns` | `{range,options?,dest?,replace?,sheet?}` | `{rows}` — one column; refuses with "Do you want to replace the contents of the destination cells?" unless `replace:true`; one undo step |
 //! | `range.flash-fill` | `{ref,sheet?}` | `{changed:[ref], blank:[ref]}` — Data › Flash Fill (Ctrl+E) on the column of `ref`: the examples typed at the top of the data (or below a header row: the column's top cell empty, or the examples showing no pattern with it), the non-empty columns next to it as sources, down to their last row; cells holding values are kept; results are typed like entries: text when every example is text that would not stay text typed bare (`'007`), and never with an apostrophe in a Text-formatted cell; one undo step. No pattern errors with "Flash Fill didn't see a pattern…"; a protected sheet is refused |
 //! | `app.autocorrect` | `{options?:{ac_*:bool}, add?:{replace,with,overwrite?}, delete?, exception?:{kind:first_letter\|initial_caps, add?\|delete?}}` | `{options, entries:[{replace,with}], exceptions:{first_letter, initial_caps}}` — File › Options › Proofing › AutoCorrect: switches, the replace list (re-adding a word with another With needs `overwrite:true`, as the dialog asks) and the exceptions; everything given is checked before anything is set; saved with the app's preferences on exit |
-//! | `wb.consolidate` | `{refs,dest?,fn?,top?,left?,links?}` | `{sheet,range}` — Data › Consolidate: `refs` like `East!A1:C4` (a bare range is on the destination's sheet); `dest` a cell, `Sheet!B2` or `B2` (default: the cursor on the active sheet); `fn` a dialog name or file token (`Sum` default, `Count Numbers`/`countNums`, …); `top`/`left` match by labels; `links` writes linked formulas in an outline (refused for a source on the destination sheet). A refusal changes nothing. One undo step |
+//! | `wb.consolidate` | `{refs,dest?,fn?,top?,left?,links?}` | `{sheet,range}` — Data › Consolidate: `refs` like `East!A1:C4` (a bare range is on the destination's sheet); `dest` a cell or range, `Sheet!B2`, `B2` or `Sheet!B2:D9` (default: the cursor on the active sheet; a range more than one cell tall or wide keeps the categories that fit that way); a ref may also be a defined name; `fn` a dialog name or file token (`Sum` default, `Count Numbers`/`countNums`, …); `top`/`left` match by labels; `links` writes linked formulas in an outline (refused for a source on the destination sheet). A refusal changes nothing. One undo step |
 //! | `wb.replace-all` | `{query,text}` | `{replaced}` — every sheet, one undo group |
 //! | `sheet.add` | `{name?}` | `{sheet,name}` |
 //! | `sheet.remove` | `{sheet}` | `{removed:true}` (last-sheet error) |
@@ -1707,14 +1707,14 @@ fn wb_consolidate(app: &mut App, args: &Json) -> Result<Json, String> {
             .ok_or_else(|| format!("unknown function '{f}'"))?,
         None => Default::default(),
     };
-    let (sheet, at) = match args.get_str("dest") {
+    let (sheet, area) = match args.get_str("dest") {
         Some(d) => {
             let r = gridcore::edit::parse_consolidate_ref(&app.pkg.workbook, app.sheet, d)
                 .map_err(|_| format!("bad destination '{d}'"))?;
             let ix = app.pkg.workbook.sheet_index(&r.sheet).unwrap_or(app.sheet);
-            (ix, (r.area.0, r.area.1))
+            (ix, r.area)
         }
-        None => (app.sheet, app.cur),
+        None => (app.sheet, (app.cur.0, app.cur.1, app.cur.0, app.cur.1)),
     };
     let flag = |k: &str| args.get(k).and_then(Json::as_bool).unwrap_or(false);
     let opts = gridcore::edit::ConsolidateOptions {
@@ -1725,7 +1725,7 @@ fn wb_consolidate(app: &mut App, args: &Json) -> Result<Json, String> {
         links: flag("links"),
         book_name: String::new(),
     };
-    let (r1, c1, r2, c2) = app.apply_consolidate(sheet, at, opts)?;
+    let (r1, c1, r2, c2) = app.apply_consolidate(sheet, area, opts)?;
     Ok(Json::obj(vec![
         (
             "sheet",
@@ -7776,6 +7776,77 @@ mod consolidate_tests {
         )
         .unwrap();
         assert_eq!(value(&a, 2, 0, 0), Some(CellValue::Number(11.0)));
+    }
+
+    /// #988: a range destination limits the output (DAT-161), a defined
+    /// name is a source, and the run keeps Consolidate_Area, which undo
+    /// takes back with the cells.
+    #[test]
+    fn wb_consolidate_takes_a_range_dest_and_a_name() {
+        let mut a = app();
+        for s in [0, 1] {
+            let sh = &mut a.pkg.workbook.sheets[s];
+            sh.set_cell(1, 0, Cell::text("m"));
+            sh.set_cell(1, 1, Cell::number(5.0));
+        }
+        a.pkg
+            .workbook
+            .defined_names
+            .push(gridcore::sheet::DefinedName {
+                name: "WestData".into(),
+                scope: None,
+                formula: "West!$A$1:$B$2".into(),
+            });
+        let names = a.pkg.workbook.defined_names.clone();
+        let run = |a: &mut App, dest: &str| {
+            dispatch(
+                a,
+                "wb.consolidate",
+                &args(vec![
+                    ("refs", refs(&["East!A1:B2", "WestData"])),
+                    ("dest", Json::Str(dest.into())),
+                    ("left", Json::Bool(true)),
+                ]),
+            )
+            .unwrap()
+        };
+        // One row tall: only the columns are limited, so both rows land.
+        let r = run(&mut a, "Summary!B2:C2");
+        assert_eq!(r.get_str("range"), Some("B2:C3"));
+        assert_eq!(value(&a, 2, 1, 2), Some(CellValue::Number(11.0)));
+        assert_eq!(value(&a, 2, 2, 2), Some(CellValue::Number(10.0)));
+        assert_eq!(
+            a.pkg.workbook.sheets[2].consolidate.as_ref().unwrap().refs,
+            ["East!$A$1:$B$2", "WestData"]
+        );
+        // Two rows tall: two of East's three categories fit.
+        a.pkg.workbook.sheets[0].set_cell(2, 0, Cell::text("n"));
+        a.pkg.workbook.sheets[0].set_cell(2, 1, Cell::number(2.0));
+        let r = dispatch(
+            &mut a,
+            "wb.consolidate",
+            &args(vec![
+                ("refs", refs(&["East!A1:B3"])),
+                ("dest", Json::Str("Summary!E5:F6".into())),
+                ("left", Json::Bool(true)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(r.get_str("range"), Some("E5:F6"));
+        assert_eq!(value(&a, 2, 5, 4), Some(CellValue::Text("m".into())));
+        assert_eq!(value(&a, 2, 6, 4), None, "n is past it");
+        let area = a
+            .pkg
+            .workbook
+            .defined_names
+            .iter()
+            .find(|d| d.name == gridcore::edit::CONSOLIDATE_AREA && d.scope == Some(2))
+            .map(|d| d.formula.clone());
+        assert_eq!(area.as_deref(), Some("Summary!$E$5:$F$6"));
+        // Undo takes the name back with the cells.
+        a.undo();
+        a.undo();
+        assert_eq!(a.pkg.workbook.defined_names, names);
     }
 
     #[test]
