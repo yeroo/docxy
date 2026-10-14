@@ -7,6 +7,10 @@
 //! See ECMA-376 Part 1 §17.16.5 (field-instruction grammar) and §17.16.6 (the
 //! field types and their switches).
 
+mod rewrite;
+
+pub use rewrite::{with_instr, with_result};
+
 /// Compute a field's result from its (entity-decoded) instruction, or `None` when
 /// it isn't a field we evaluate (the caller keeps Word's cached result).
 pub fn eval_field(instr: &str) -> Option<String> {

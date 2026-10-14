@@ -19,8 +19,9 @@
 //!
 //! Not recorded (they change the document as without tracking): paragraph
 //! marks (Enter, and a Backspace or Delete that joins paragraphs), typing
-//! inside a hyperlink, fields and other one-unit inlines, formatting, and
-//! table structure. A selection across paragraphs records the deletion of its text
+//! inside a hyperlink, fields and other one-unit inlines (an Update Field or
+//! Edit Field rewrites a field's result and code outright, #1241),
+//! formatting, and table structure. A selection across paragraphs records the deletion of its text
 //! in each paragraph and keeps the paragraph marks. Inside a hyperlink, a
 //! Replace or AutoCorrect records the deletion of the old text but not the
 //! text put in, so Reject All keeps both until insertions inside links are
