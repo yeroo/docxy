@@ -287,13 +287,16 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
             }
             Ok(info)
         }
-        // File > Info > Convert without the prompt (#874).
+        // File > Info > Convert without the prompt (#874): an existing
+        // .xlsx is replaced only when the request says `overwrite`.
         "wb.convert" => {
-            let c = app.convert()?;
+            let overwrite = matches!(args.get("overwrite"), Some(Json::Bool(true)));
+            let c = app.convert(overwrite)?;
             Ok(Json::obj(vec![
                 ("path", Json::Str(app.path.clone())),
                 ("compat", Json::Bool(app.compat())),
                 ("removed", Json::Bool(c.removed)),
+                ("overwrote", Json::Bool(c.overwrote)),
                 (
                     "lost",
                     Json::Arr(c.lost.into_iter().map(Json::Str).collect()),
@@ -4123,7 +4126,7 @@ mod tests {
         assert!(a.confirm.is_none());
         assert_eq!(
             saved.get("lost").unwrap().to_string(),
-            "[\"pictures, shapes and charts\"]"
+            "[\"document properties\",\"pictures, shapes and charts\"]"
         );
         let data = std::fs::read(&xls).unwrap();
         assert_eq!(
@@ -4134,8 +4137,16 @@ mod tests {
         let again = dispatch(&mut a, "wb.save", &Json::Null).unwrap();
         assert_eq!(again.get("lost").unwrap().to_string(), "[]");
 
-        let c = dispatch(&mut a, "wb.convert", &Json::Null).unwrap();
+        // An existing .xlsx is kept unless the request says overwrite.
         let xlsx = dir.join("chart.xlsx");
+        std::fs::write(&xlsx, b"someone's").unwrap();
+        let err = dispatch(&mut a, "wb.convert", &Json::Null).unwrap_err();
+        assert!(err.contains("chart.xlsx already exists"), "{err}");
+        assert!(xls.exists() && a.compat());
+        assert_eq!(std::fs::read(&xlsx).unwrap(), b"someone's");
+        let yes = Json::obj(vec![("overwrite", Json::Bool(true))]);
+        let c = dispatch(&mut a, "wb.convert", &yes).unwrap();
+        assert_eq!(c.get("overwrote"), Some(&Json::Bool(true)));
         assert_eq!(c.get_str("path"), xlsx.to_str());
         assert_eq!(c.get("compat"), Some(&Json::Bool(false)));
         assert_eq!(c.get("removed"), Some(&Json::Bool(true)));

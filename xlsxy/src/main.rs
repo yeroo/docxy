@@ -463,10 +463,11 @@ fn type_for_path(path: &str) -> Option<usize> {
 }
 
 /// `path`'s save type when a workbook package can't be written under it:
-/// any type that is not a package, so an `.xls`, `.xlsb`, `.ods` (no
-/// writer), an `.xml` (needs XML maps), a text type's `.csv`/`.txt`/`.prn`,
-/// a Web Page's `.htm` or a `.pdf`. `None` for a package type, and for no or
-/// an unknown extension.
+/// any type that is not a package, so an `.xls` (written as BIFF8 only in
+/// Compatibility Mode, #874, never by a headless run), an `.xlsb` or `.ods`
+/// (no writer), an `.xml` (needs XML maps), a text type's
+/// `.csv`/`.txt`/`.prn`, a Web Page's `.htm` or a `.pdf`. `None` for a
+/// package type, and for no or an unknown extension.
 fn unwritable_type(path: &str) -> Option<&'static backstage::SaveType> {
     let t = &SAVE_TYPES[type_for_path(path)?];
     (save_kind(t) != SaveKind::Package).then_some(t)
@@ -1390,6 +1391,8 @@ fn remove_converted(path: &Path) -> io::Result<()> {
 struct Converted {
     /// Whether the `.xls` was deleted.
     removed: bool,
+    /// Whether an existing `.xlsx` was replaced.
+    overwrote: bool,
     /// What the open left out, which the `.xlsx` lacks too.
     lost: Vec<String>,
 }
@@ -2262,9 +2265,9 @@ struct App {
     /// out (charts, comments, ...; #874), until the workbook is first
     /// written: a save of it loses them, and says so first.
     dropped: Vec<String>,
-    /// The losses a person said Yes to saving without this session: the
-    /// same list doesn't ask again (#874).
-    compat_accepted: Option<Vec<String>>,
+    /// The losses a person said Yes to saving without this session: a save
+    /// that loses only these doesn't ask again (#874).
+    compat_accepted: Vec<String>,
     /// What the last save of the workbook as `.xls` lost (`wb.save`'s
     /// `lost`).
     last_lost: Vec<String>,
@@ -2455,7 +2458,7 @@ impl App {
             template: None,
             import_unsaved: false,
             dropped: Vec::new(),
-            compat_accepted: None,
+            compat_accepted: Vec::new(),
             last_lost: Vec::new(),
             sheet: pkg_active_tab,
             cur: (0, 0),
@@ -4708,7 +4711,7 @@ impl App {
         // already dropped.
         if self.compat() {
             let out = gridcore::legacy::write_xls(&self.pkg);
-            self.last_lost = merge_losses(&self.dropped, &out.lost);
+            self.last_lost = self.xls_losses(&out.lost);
             return out.bytes;
         }
         self.pkg.remove_part(MODEL_PART);
@@ -4773,7 +4776,18 @@ impl App {
     /// What saving the workbook as `.xls` loses: what the open left out,
     /// then what the writer can't hold.
     fn compat_losses(&self) -> Vec<String> {
-        merge_losses(&self.dropped, &gridcore::legacy::write_xls(&self.pkg).lost)
+        self.xls_losses(&gridcore::legacy::write_xls(&self.pkg).lost)
+    }
+
+    /// What the open left out, what the writer couldn't hold (`writer`),
+    /// and the Data Model, which xlsxy keeps beside the package and no
+    /// `.xls` holds.
+    fn xls_losses(&self, writer: &[String]) -> Vec<String> {
+        let mut lost = merge_losses(&self.dropped, writer);
+        if !self.model_rels.is_empty() || !self.model_measures.is_empty() {
+            lost.push("Data Model (relationships and measures)".to_string());
+        }
+        lost
     }
 
     /// The losses to ask about before the workbook is written to `target`:
@@ -4784,7 +4798,18 @@ impl App {
             return None;
         }
         let lost = self.compat_losses();
-        (!lost.is_empty() && self.compat_accepted.as_ref() != Some(&lost)).then_some(lost)
+        lost.iter()
+            .any(|l| !self.compat_accepted.contains(l))
+            .then_some(lost)
+    }
+
+    /// Yes to saving without `lost`: none of it asks again this session.
+    fn accept_losses(&mut self, lost: Vec<String>) {
+        for l in lost {
+            if !self.compat_accepted.contains(&l) {
+                self.compat_accepted.push(l);
+            }
+        }
     }
 
     /// Excel's compatibility check: the features an Excel 97-2003 file
@@ -5214,7 +5239,9 @@ impl App {
     /// of Compatibility Mode and clean. A file opened read-only can't be
     /// replaced, so it is refused; a failed write deletes nothing and stays
     /// in Compatibility Mode; a failed delete keeps the `.xlsx` and says so.
-    fn convert(&mut self) -> Result<Converted, String> {
+    /// An existing `<name>.xlsx` is replaced only with `overwrite` (the
+    /// prompt names it; `wb.convert` has to ask for it).
+    fn convert(&mut self, overwrite: bool) -> Result<Converted, String> {
         if !self.compat() {
             let msg = "the workbook is not in Compatibility Mode".to_string();
             self.status = Some(msg.clone());
@@ -5229,6 +5256,15 @@ impl App {
             self.status = Some(msg.clone());
             return Err(msg);
         }
+        let overwrote = Path::new(&target).exists();
+        if overwrote && !overwrite {
+            let msg = format!(
+                "{} already exists: nothing was converted (overwrite replaces it)",
+                file_name_of(&target)
+            );
+            self.status = Some(msg.clone());
+            return Err(msg);
+        }
         let lost = self.dropped.clone();
         self.path = target.clone();
         if let Err(e) = self.save_current() {
@@ -5238,7 +5274,7 @@ impl App {
         let removed = self
             .guard_write(Path::new(&source))
             .and_then(|()| remove_converted(Path::new(&source)));
-        self.compat_accepted = None;
+        self.compat_accepted.clear();
         self.status = Some(match &removed {
             Ok(()) => format!(
                 "Converted {} to {}",
@@ -5253,6 +5289,7 @@ impl App {
         });
         Ok(Converted {
             removed: removed.is_ok(),
+            overwrote,
             lost,
         })
     }
@@ -6894,7 +6931,7 @@ impl App {
         self.template = None;
         self.import_unsaved = false;
         self.dropped = Vec::new();
-        self.compat_accepted = None;
+        self.compat_accepted.clear();
         self.model_rels = rels;
         self.model_measures = meas;
         self.comments = comments;
@@ -7355,17 +7392,18 @@ impl App {
                         false
                     }
                     ConfirmAction::SaveCompat(lost) => {
-                        self.compat_accepted = Some(lost);
+                        self.accept_losses(lost);
                         let _ = self.save_current();
                         false
                     }
                     ConfirmAction::SaveAsCompat(path, lost) => {
-                        self.compat_accepted = Some(lost);
+                        self.accept_losses(lost);
                         self.save_as(path);
                         false
                     }
                     ConfirmAction::Convert => {
-                        let _ = self.convert();
+                        // The prompt named an .xlsx it replaces.
+                        let _ = self.convert(true);
                         false
                     }
                 }
@@ -14022,8 +14060,8 @@ mod tests {
         assert_eq!(
             app.status.as_deref(),
             Some(
-                "Opened chart.xls (Excel 97-2003 Workbook) in Compatibility Mode; pictures, \
-                 shapes and charts will be lost on save"
+                "Opened chart.xls (Excel 97-2003 Workbook) in Compatibility Mode; document \
+                 properties, pictures, shapes and charts will be lost on save"
             )
         );
         let original = std::fs::read(&path).unwrap();
@@ -14032,7 +14070,7 @@ mod tests {
         assert_eq!(
             prompt,
             "The following features are not supported by Excel 97-2003 and will be lost: \
-             pictures, shapes and charts. Save anyway?"
+             document properties; pictures, shapes and charts. Save anyway?"
         );
         assert!(!app.confirm.as_ref().unwrap().yes_selected());
         no(&mut app);
@@ -14072,6 +14110,28 @@ mod tests {
                 .unwrap()
                 .prompt()
                 .contains("hyperlinks; outlines")
+        );
+        yes(&mut app);
+        // Fewer losses than were accepted don't ask again.
+        app.pkg.workbook.sheets[app.sheet].set_row_outline(3, 0);
+        app.save();
+        assert!(app.confirm.is_none());
+        // Nor does the Data Model go without a word.
+        app.model_measures.push(gridcore::model::Measure {
+            name: "Total".into(),
+            formula: "SUM(Sales[Amount])".into(),
+        });
+        app.save();
+        assert!(
+            app.confirm
+                .as_ref()
+                .unwrap()
+                .prompt()
+                .contains("Data Model (relationships and measures)")
+        );
+        assert!(
+            app.compat_losses()
+                .contains(&"Data Model (relationships and measures)".to_string())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -14145,8 +14205,8 @@ mod tests {
             prompt,
             "This action converts the workbook to the current file format. The original Excel \
              97-2003 file chart.xls will be replaced by chart.xlsx. The existing chart.xlsx \
-             will be overwritten. These features of the original will be lost: pictures, \
-             shapes and charts. Continue?"
+             will be overwritten. These features of the original will be lost: document \
+             properties; pictures, shapes and charts. Continue?"
         );
         no(&mut app);
         assert!(path.exists() && app.compat());
@@ -14178,7 +14238,7 @@ mod tests {
         // The .xlsx can't be written: a folder holds its name.
         let (mut app, path) = open_xls(&dir, "oracle-basic.xls", "a.xls");
         std::fs::create_dir(dir.join("a.xlsx")).unwrap();
-        assert!(app.convert().is_err());
+        assert!(app.convert(true).is_err());
         assert!(path.exists() && app.compat());
         assert_eq!(Path::new(&app.path), path);
         assert!(app.status.as_deref().unwrap().starts_with("save failed"));
@@ -14186,7 +14246,7 @@ mod tests {
         // The .xls can't be deleted.
         let (mut app, path) = open_xls(&dir, "oracle-basic.xls", "b.xls");
         FAIL_REMOVE.with(|f| f.set(true));
-        let c = app.convert();
+        let c = app.convert(false);
         FAIL_REMOVE.with(|f| f.set(false));
         assert!(!c.unwrap().removed);
         assert!(path.exists() && dir.join("b.xlsx").exists());
@@ -14199,7 +14259,7 @@ mod tests {
         // Opened read-only.
         let (mut app, path) = open_xls(&dir, "oracle-basic.xls", "c.xls");
         app.set_read_only(path.to_str().unwrap());
-        assert!(app.convert().is_err());
+        assert!(app.convert(false).is_err());
         assert!(path.exists() && !dir.join("c.xlsx").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }

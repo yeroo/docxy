@@ -992,7 +992,7 @@
   },
   {
     "name": "xlsxy_save",
-    "description": "Save the open workbook to its file.",
+    "description": "Save the open workbook to its file. In Compatibility Mode (an Excel 97-2003 .xls) it writes the .xls without asking: what that format can't hold is left out and listed in the reply's lost (xlsxy_convert replaces the .xls with an .xlsx).",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2306,10 +2306,14 @@
   },
   {
     "name": "xlsxy_convert",
-    "description": "Convert a workbook in Compatibility Mode (an Excel 97-2003 .xls) to the current file format, as File > Info > Convert does but without its prompt: writes <name>.xlsx, deletes the .xls once that is written, and binds the workbook to the .xlsx. Returns path, compat, removed (whether the .xls was deleted) and lost (what the .xls had that the open left out).",
+    "description": "Convert a workbook in Compatibility Mode (an Excel 97-2003 .xls) to the current file format, as File > Info > Convert does but without its prompt: writes <name>.xlsx (refused when one exists, unless overwrite), deletes the .xls once that is written, and binds the workbook to the .xlsx. Returns path, compat, removed (whether the .xls was deleted), overwrote (whether an existing .xlsx was replaced) and lost (what the .xls had that the open left out).",
     "inputSchema": {
       "type": "object",
       "properties": {
+        "overwrite": {
+          "type": "boolean",
+          "description": "Replace an existing <name>.xlsx (default false: refused)."
+        },
         "target": {
           "type": "string",
           "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
