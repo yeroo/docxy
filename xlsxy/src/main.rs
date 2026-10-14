@@ -4932,6 +4932,8 @@ impl App {
             self.status = Some(msg.clone());
             return Err(msg);
         }
+        // Only an .xls save loses anything; wb.save reports this one's.
+        self.last_lost.clear();
         if let Some(t) = self.bound_text_type() {
             return self.save_text(t);
         }
@@ -4951,7 +4953,6 @@ impl App {
             }
             _ => None,
         };
-        self.last_lost.clear();
         let bytes = self.package_bytes();
         if self.pkg.always_create_backup() {
             if let Err(e) = self.write_backup(Path::new(&self.path)) {
@@ -6932,6 +6933,7 @@ impl App {
         self.import_unsaved = false;
         self.dropped = Vec::new();
         self.compat_accepted.clear();
+        self.last_lost.clear();
         self.model_rels = rels;
         self.model_measures = meas;
         self.comments = comments;

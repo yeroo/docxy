@@ -4156,6 +4156,24 @@ mod tests {
         assert_eq!(info.get_str("format"), Some("Excel Workbook"));
         // Out of Compatibility Mode there is nothing to convert.
         assert!(dispatch(&mut a, "wb.convert", &Json::Null).is_err());
+        // A text save right after a lossy .xls save loses nothing.
+        let xls2 = dir.join("again.xls");
+        std::fs::copy(corpus.join("chart-embedded.xls"), &xls2).unwrap();
+        let path = |p: &std::path::Path| {
+            Json::obj(vec![("path", Json::Str(p.to_string_lossy().into_owned()))])
+        };
+        dispatch(&mut a, "wb.open", &path(&xls2)).unwrap();
+        let saved = dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        assert_ne!(saved.get("lost").unwrap().to_string(), "[]");
+        let csv = dir.join("t.csv");
+        std::fs::write(
+            &csv, "a,1
+",
+        )
+        .unwrap();
+        dispatch(&mut a, "wb.open", &path(&csv)).unwrap();
+        let saved = dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        assert_eq!(saved.get("lost").unwrap().to_string(), "[]");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
