@@ -1411,6 +1411,33 @@ mod tests {
     }
 
     #[test]
+    fn a_cut_onto_a_sheet_that_cannot_hold_rules_leaves_them_and_says_so() {
+        let mut t = named_cut_book();
+        let v = view(&mut t);
+        // The second sheet's part (`add_sheet` names it sheet2.xml).
+        let part = "xl/worksheets/sheet2.xml";
+        v.pkg.set_part(
+            part,
+            br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/><autoFilter ref="A1:B2"><filterColumn colId="0"><pageMargins left="0.7"/></worksheet>"#.to_vec(),
+        );
+        assert!(!v.pkg.takes_validations(1));
+        v.anchor = at("B2");
+        v.sel = at("B3");
+        let clip = v.grid_clip(true).unwrap();
+        v.active = 1;
+        v.anchor = at("C2");
+        v.sel = at("C2");
+        match v.paste_grid_clip(&clip) {
+            Ok(crate::GridPasted::WithoutRules(why)) => {
+                assert!(why.contains("stays on the cut cells"), "{why}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(view(&mut t).pkg.workbook.sheets[1].validations.is_empty());
+        assert_eq!(seen(&mut t, 0, "B2").as_deref(), Some("Choices"));
+    }
+
+    #[test]
     fn rules_moved_by_a_cut_survive_a_save() {
         let mut t = named_cut_book();
         cut_range(&mut t, ("B2", "B3"), "C2", 1);
