@@ -1297,6 +1297,10 @@ struct Seg {
     /// multi-line equation, #1242), that offset: the caret stops after it on
     /// its last line when no text follows it.
     unit: Option<usize>,
+    /// The editor offset the seg starts at: a line showing no editable
+    /// character (an empty line after a break, a lone `¶`) puts its caret
+    /// stop there.
+    at: usize,
 }
 
 /// One piece of a paragraph as `flatten_para` lays it out. Hyperlinks are
@@ -1447,6 +1451,7 @@ fn flatten_para(
         sep: None,
         block: None,
         unit: None,
+        at: 0,
     }];
     let mut mc = 0usize;
 
@@ -1513,6 +1518,7 @@ fn flatten_para(
                 sep: None,
                 block: None,
                 unit: None,
+                at: mc,
             });
         }
         let item = match fi.item {
@@ -1627,6 +1633,7 @@ fn flatten_para(
                             sep: None,
                             block: None,
                             unit: None,
+                            at: mc + 1,
                         });
                     }
                     BreakKind::Page => segs.push(Seg {
@@ -1634,12 +1641,14 @@ fn flatten_para(
                         sep: Some(BreakKind::Page),
                         block: None,
                         unit: None,
+                        at: mc + 1,
                     }),
                     BreakKind::Column => segs.push(Seg {
                         glyphs: Vec::new(),
                         sep: Some(BreakKind::Column),
                         block: None,
                         unit: None,
+                        at: mc + 1,
                     }),
                 }
                 mc += 1;
@@ -1677,6 +1686,7 @@ fn flatten_para(
                         sep: None,
                         block: Some(idx),
                         unit: src,
+                        at: mc,
                     });
                 }
                 mc += crate::editor::inline_len(item);
@@ -1831,6 +1841,7 @@ fn flatten_para(
                         sep: None,
                         block: Some(idx),
                         unit,
+                        at: mc,
                     });
                 }
                 mc += crate::editor::inline_len(item);
@@ -1845,6 +1856,7 @@ fn flatten_para(
                 sep: None,
                 block: None,
                 unit: None,
+                at: mc,
             });
         }
         segs.last_mut().unwrap().glyphs.push(Glyph {
@@ -2328,9 +2340,13 @@ fn render_paragraph(
                 &mut out,
             );
             // A block that is one editor offset `k` (#1242): the text before
-            // it ends at `k` (an empty line at the paragraph's start). With no
-            // text after it, `k + 1` stops at the end of its last line.
-            let text_after = segs.get(si + 1).is_some_and(|s| s.block.is_none());
+            // it ends at `k` (an empty line at the paragraph's start, or
+            // after a break). Unless the text after it starts at `k + 1`
+            // (a `¶` alone starts there too), `k + 1` stops at the end of
+            // its last line: at the paragraph's end, or before a break.
+            let text_after = segs
+                .get(si + 1)
+                .is_some_and(|s| s.block.is_none() && Some(s.at) == seg.unit.map(|k| k + 1));
             if let (Some(k), false, true) = (seg.unit, text_after, out.len() > first_line) {
                 let end_col = images[first_image..]
                     .iter()
@@ -2420,15 +2436,22 @@ fn render_paragraph(
                     col: stop.col.saturating_sub(line_start_col),
                 })
                 .collect();
+            // A line with no editable character (empty after a break, or a
+            // lone `¶`) holds the offset its seg starts at.
+            let start = if visual.is_empty() {
+                seg.at
+            } else {
+                projected.start
+            };
             if visual.is_empty() {
                 visual.push(LineCaretStop {
-                    offset: projected.start,
+                    offset: start,
                     col: 0,
                 });
             }
             let lseg = LineSeg {
                 path: path.to_vec(),
-                start: projected.start,
+                start,
                 col0: prefix_cols,
                 cols,
                 visual,
@@ -4845,6 +4868,47 @@ mod tests {
             ]);
             assert_eq!(all_offsets_1242(&maps), vec![0, 1, 2]);
         }
+    }
+
+    /// FIX r1 M2: a block object keeps both stops beside a `¶`, a line
+    /// break before it or after it; an empty line after a break stops at
+    /// its own offset, not at 0.
+    #[test]
+    fn a_block_object_keeps_its_stops_beside_marks_and_breaks_1242() {
+        let br = || Inline::Break(BreakKind::Line, RunProps::default());
+        // Every (line, offset) stop, empty-looking lines included.
+        let stops = |content: Vec<Inline>, inv: bool| -> Vec<usize> {
+            let mut o = opts(40);
+            o.show_invisibles = inv;
+            let (_, maps) = render_mapped(&doc(vec![para(content)]), &o);
+            all_offsets_1242(&maps)
+        };
+        for object in [picture_1242(300, false), equation_1242("a b\nc d")] {
+            let ab = || run("ab", RunProps::default());
+            let cd = || run("cd", RunProps::default());
+            // At the end with Show ¶ on: 3 is after it (on the ¶ line).
+            assert_eq!(stops(vec![ab(), object.clone()], true), vec![0, 1, 2, 3]);
+            // Followed by a break, then text: 3 is before the break.
+            assert_eq!(
+                stops(vec![ab(), object.clone(), br(), cd()], false),
+                vec![0, 1, 2, 3, 4, 5, 6]
+            );
+            // After a break: 3 is on the empty line after it.
+            assert_eq!(
+                stops(vec![ab(), br(), object.clone(), cd()], false),
+                vec![0, 1, 2, 3, 4, 5, 6]
+            );
+            assert_eq!(
+                stops(vec![ab(), br(), object.clone(), cd()], true),
+                vec![0, 1, 2, 3, 4, 5, 6]
+            );
+        }
+        // Text then a trailing break: the empty line is offset 3.
+        let (_, maps) = render_mapped(
+            &doc(vec![para(vec![run("ab", RunProps::default()), br()])]),
+            &opts(40),
+        );
+        assert_eq!(all_offsets_1242(&maps), vec![0, 1, 2, 3]);
     }
 
     #[test]
