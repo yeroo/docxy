@@ -10837,16 +10837,19 @@ impl<'a> Eval<'a> {
                     Some(e) => try_num!(self.eval(e)),
                 }
                 .trunc() as i64;
+                let no_commas = match args.get(2) {
+                    Some(e) if name == "FIXED" && !matches!(e, Expr::Missing) => {
+                        try_bool!(self.eval(e))
+                    }
+                    _ => false,
+                };
                 // Excel takes up to 127 decimals; more would format an
-                // unbounded string.
+                // unbounded string. Checked after every argument, so an
+                // argument's error wins.
                 if decimals > 127 {
                     return Value::Err(ExcelError::Value);
                 }
                 if name == "FIXED" {
-                    let no_commas = match args.get(2) {
-                        None | Some(Expr::Missing) => false,
-                        Some(e) => try_bool!(self.eval(e)),
-                    };
                     let mag = grouped_magnitude(n, decimals, !no_commas);
                     Value::Str(if n < 0.0 && !is_zero_magnitude(&mag) {
                         format!("-{mag}")
@@ -12536,10 +12539,12 @@ fn is_zero_magnitude(mag: &str) -> bool {
 /// with thousands separators. Sign and currency are added by the caller.
 fn grouped_magnitude(n: f64, decimals: i64, commas: bool) -> String {
     let x = n.abs();
-    let (rounded, frac_digits) = if decimals < 0 {
-        // Past -308 every finite magnitude rounds to 0; clamping keeps the
-        // power finite and `-decimals` from overflowing at `i64::MIN`.
-        let f = 10f64.powi(decimals.max(-308).unsigned_abs() as i32);
+    let (rounded, frac_digits) = if decimals < -308 {
+        // Every finite magnitude is under half of 10^309 and rounds to 0;
+        // this also keeps `-decimals` from overflowing at `i64::MIN`.
+        (0.0, 0usize)
+    } else if decimals < 0 {
+        let f = 10f64.powi((-decimals) as i32);
         ((x / f).round() * f, 0usize)
     } else {
         (x, decimals as usize)
@@ -13345,6 +13350,10 @@ mod tests {
             eval_str("REPLACE(REPT(\"y\",32767),1,0,1/0)", &g),
             Value::Err(ExcelError::Div0)
         );
+        assert_eq!(
+            eval_str("FIXED(1,128,1/0)", &g),
+            Value::Err(ExcelError::Div0)
+        );
     }
 
     #[test]
@@ -13482,6 +13491,11 @@ mod tests {
         assert_eq!(eval_str("FIXED(1,-400)", &g), Value::Str("0".into()));
         assert_eq!(eval_str("DOLLAR(1,-400)", &g), Value::Str("$0".into()));
         assert_eq!(eval_str("FIXED(-5,-400)", &g), Value::Str("0".into()));
+        assert_eq!(eval_str("FIXED(1E308,-400)", &g), Value::Str("0".into()));
+        assert_eq!(
+            eval_str("DOLLAR(-1.7E308,-400)", &g),
+            Value::Str("$0".into())
+        );
         // A negative that rounds to zero takes no sign.
         assert_eq!(eval_str("FIXED(-0.4,0)", &g), Value::Str("0".into()));
         assert_eq!(eval_str("DOLLAR(-0.004)", &g), Value::Str("$0.00".into()));
