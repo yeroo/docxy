@@ -1293,6 +1293,10 @@ struct Seg {
     glyphs: Vec<Glyph>,
     sep: Option<BreakKind>,
     block: Option<usize>,
+    /// For a block that is one editor offset (a too-tall inline picture or a
+    /// multi-line equation, #1242), that offset: the caret stops after it on
+    /// its last line when no text follows it.
+    unit: Option<usize>,
 }
 
 /// One piece of a paragraph as `flatten_para` lays it out. Hyperlinks are
@@ -1442,6 +1446,7 @@ fn flatten_para(
         glyphs: Vec::new(),
         sep: None,
         block: None,
+        unit: None,
     }];
     let mut mc = 0usize;
 
@@ -1507,6 +1512,7 @@ fn flatten_para(
                 glyphs: Vec::new(),
                 sep: None,
                 block: None,
+                unit: None,
             });
         }
         let item = match fi.item {
@@ -1620,17 +1626,20 @@ fn flatten_para(
                             glyphs: Vec::new(),
                             sep: None,
                             block: None,
+                            unit: None,
                         });
                     }
                     BreakKind::Page => segs.push(Seg {
                         glyphs: Vec::new(),
                         sep: Some(BreakKind::Page),
                         block: None,
+                        unit: None,
                     }),
                     BreakKind::Column => segs.push(Seg {
                         glyphs: Vec::new(),
                         sep: Some(BreakKind::Column),
                         block: None,
+                        unit: None,
                     }),
                 }
                 mc += 1;
@@ -1639,17 +1648,24 @@ fn flatten_para(
             // its width with blank, non-breaking filler cells and tag the first so
             // the line emitter can place the overlay. Larger images and SmartArt are
             // drawn as blocks after the paragraph instead.
+            // An inline (not anchored) picture is one editor offset (#1242):
+            // every filler cell carries it, as a field's glyphs do. An
+            // anchored or VML picture draws the same but takes no offset.
             Inline::Raw(raw) => {
+                let unit = crate::editor::is_object_unit(item);
+                let src = unit.then_some(mc);
                 if let Some(img) = inline_image(raw) {
                     let rc = Rc::new(img);
                     let w = rc.cols;
+                    let mut st = Style::default();
+                    st.highlight |= unit && sel_at(mc);
                     for i in 0..w.max(1) {
                         segs.last_mut().unwrap().glyphs.push(Glyph {
                             ch: '\u{00a0}', // non-breaking: keep the image on one line
                             disp: Some(' '),
-                            style: Style::default(),
+                            style: st.clone(),
                             link: None,
-                            src: None,
+                            src,
                             dir: BidiRunDirection::Natural,
                             img: (i == 0).then(|| rc.clone()),
                         });
@@ -1660,24 +1676,35 @@ fn flatten_para(
                         glyphs: Vec::new(),
                         sep: None,
                         block: Some(idx),
+                        unit: src,
                     });
                 }
+                mc += crate::editor::inline_len(item);
             }
-            // A decoded equation flows as ordinary (non-editable) text at body
-            // size. A multi-line one (a matrix) is emitted as a block below.
+            // A decoded equation flows as text at body size, one editor
+            // offset (#1242) like a field's result: every glyph carries it and
+            // its spaces don't break. A multi-line one (a matrix) is emitted as
+            // a block below.
             Inline::Equation { text, .. } if !text.contains('\n') => {
-                let st = Style::default();
+                let mut st = Style::default();
+                st.highlight |= sel_at(mc);
                 for ch in text.chars() {
+                    let (ch, disp) = if ch == ' ' {
+                        ('\u{00a0}', Some(' '))
+                    } else {
+                        (ch, None)
+                    };
                     segs.last_mut().unwrap().glyphs.push(Glyph {
                         ch,
-                        disp: None,
+                        disp,
                         style: st.clone(),
-                        link: None,
-                        src: None,
+                        link: fi.link.clone(),
+                        src: Some(mc),
                         dir: BidiRunDirection::Natural,
                         img: None,
                     });
                 }
+                mc += 1;
             }
             // A field's cached result flows as body text, but it is one editor
             // offset (#642): every glyph carries it, so the caret stops only
@@ -1796,13 +1823,17 @@ fn flatten_para(
             | Inline::Chart { .. }
             | Inline::TextBox { .. }
             | Inline::Equation { .. } => {
+                // A multi-line equation is one editor offset (#1242).
+                let unit = crate::editor::is_object_unit(item).then_some(mc);
                 if !nested {
                     segs.push(Seg {
                         glyphs: Vec::new(),
                         sep: None,
                         block: Some(idx),
+                        unit,
                     });
                 }
+                mc += crate::editor::inline_len(item);
             }
             Inline::UnsupportedRevision { .. } => {}
         }
@@ -1813,6 +1844,7 @@ fn flatten_para(
                 glyphs: Vec::new(),
                 sep: None,
                 block: None,
+                unit: None,
             });
         }
         segs.last_mut().unwrap().glyphs.push(Glyph {
@@ -2281,8 +2313,10 @@ fn render_paragraph(
     }
     let mut line_idx = 0usize;
     let base_direction = paragraph_base_direction(para, opts);
-    for seg in &segs {
+    for (si, seg) in segs.iter().enumerate() {
         if let Some(bidx) = seg.block {
+            let first_line = out.len();
+            let first_image = images.len();
             emit_block_item(
                 &para.content[bidx],
                 bidx,
@@ -2293,6 +2327,28 @@ fn render_paragraph(
                 mermaid,
                 &mut out,
             );
+            // A block that is one editor offset `k` (#1242): the text before
+            // it ends at `k` (an empty line at the paragraph's start). With no
+            // text after it, `k + 1` stops at the end of its last line.
+            let text_after = segs.get(si + 1).is_some_and(|s| s.block.is_none());
+            if let (Some(k), false, true) = (seg.unit, text_after, out.len() > first_line) {
+                let end_col = images[first_image..]
+                    .iter()
+                    .map(|b| b.col + b.cols)
+                    .max()
+                    .unwrap_or(0);
+                let (line, map) = out.last_mut().unwrap();
+                map.segs.push(LineSeg {
+                    path: path.to_vec(),
+                    start: k + 1,
+                    col0: end_col.max(str_width(&line.plain())),
+                    cols: vec![0],
+                    visual: vec![LineCaretStop {
+                        offset: k + 1,
+                        col: 0,
+                    }],
+                });
+            }
             continue;
         }
         if let Some(kind) = seg.sep {
@@ -4653,6 +4709,142 @@ mod tests {
                 .iter()
                 .any(|s| s.text == "9" && s.style.strike)
         );
+    }
+
+    // ---- #1242: an equation or an inline picture is one editor offset ----
+
+    fn equation_1242(text: &str) -> Inline {
+        Inline::Equation {
+            raw: "<m:oMath/>".into(),
+            text: text.into(),
+            latex: None,
+        }
+    }
+
+    /// A run holding a picture of `px` × `px` pixels, inline or anchored.
+    fn picture_1242(px: u32, anchored: bool) -> Inline {
+        let emu = px * 9525;
+        let wrap = if anchored { "wp:anchor" } else { "wp:inline" };
+        Inline::Raw(format!(
+            "<w:r><w:drawing><{wrap}><wp:extent cx=\"{emu}\" cy=\"{emu}\"/>\
+             <a:blip r:embed=\"rId5\"/></{wrap}></w:drawing></w:r>"
+        ))
+    }
+
+    fn stops_1242(map: &LineMap) -> Vec<(usize, usize)> {
+        map.visual_positions()
+            .into_iter()
+            .map(|caret| (caret.offset, caret.col))
+            .collect()
+    }
+
+    /// Every caret offset any line offers, in line order.
+    fn all_offsets_1242(maps: &[LineMap]) -> Vec<usize> {
+        maps.iter()
+            .flat_map(|m| m.visual_positions().into_iter().map(|c| c.offset))
+            .collect()
+    }
+
+    #[test]
+    fn an_equation_or_inline_picture_has_stops_only_around_it_1242() {
+        let ab_cd = |object: Inline| {
+            doc(vec![para(vec![
+                run("ab", RunProps::default()),
+                object,
+                run("cd", RunProps::default()),
+            ])])
+        };
+        let (lines, maps) = render_mapped(&ab_cd(equation_1242("x + 1")), &opts(40));
+        assert_eq!(lines[0].plain(), "abx + 1cd");
+        assert_eq!(
+            stops_1242(&maps[0]),
+            vec![(0, 0), (1, 1), (2, 2), (3, 7), (4, 8), (5, 9)]
+        );
+        for col in 3..7 {
+            let off = maps[0].nearest_caret(col).unwrap().offset;
+            assert!(off == 2 || off == 3, "col {col} -> offset {off}");
+        }
+        // A 32-pixel picture flows as 4 filler cells.
+        let (_, maps) = render_mapped(&ab_cd(picture_1242(32, false)), &opts(40));
+        assert_eq!(
+            stops_1242(&maps[0]),
+            vec![(0, 0), (1, 1), (2, 2), (3, 6), (4, 7), (5, 8)]
+        );
+        // Selecting the offset highlights all of the equation.
+        let mut o = opts(40);
+        o.selection = vec![(vec![0], 2, 3)];
+        let highlighted: String = render(&ab_cd(equation_1242("x + 1")), &o)[0]
+            .spans
+            .iter()
+            .filter(|s| s.style.highlight)
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(highlighted, "x + 1");
+        // It never wraps mid-equation.
+        let d = doc(vec![para(vec![
+            run("Body ", RunProps::default()),
+            equation_1242("x + 1 = y"),
+        ])]);
+        let plain: Vec<String> = render(&d, &opts(10)).iter().map(|l| l.plain()).collect();
+        assert_eq!(plain, vec!["Body", "x + 1 = y"]);
+    }
+
+    /// An anchored or VML picture draws as it did and takes no offset.
+    #[test]
+    fn an_anchored_or_vml_picture_takes_no_offset_1242() {
+        let vml = Inline::Raw(
+            "<w:r><w:pict><v:shape style=\"width:24pt;height:24pt\">\
+             <v:imagedata r:id=\"rId1\"/></v:shape></w:pict></w:r>"
+                .into(),
+        );
+        for object in [picture_1242(32, true), vml] {
+            let d = doc(vec![para(vec![
+                run("ab", RunProps::default()),
+                object,
+                run("cd", RunProps::default()),
+            ])]);
+            let (_, maps) = render_mapped(&d, &opts(40));
+            // (The caret stands at 2 on both sides of it, as before.)
+            let mut offsets: Vec<usize> = stops_1242(&maps[0]).iter().map(|s| s.0).collect();
+            offsets.dedup();
+            assert_eq!(offsets, vec![0, 1, 2, 3, 4]);
+        }
+    }
+
+    /// A block object (a picture too tall to flow, a multi-line equation)
+    /// at offset `k`: the text before it ends at `k`, and `k + 1` has a stop
+    /// after it, at the start of the text after it or on its last line.
+    #[test]
+    fn a_block_object_has_a_stop_on_each_side_1242() {
+        for object in [picture_1242(300, false), equation_1242("a b\nc d")] {
+            let render_of =
+                |content: Vec<Inline>| render_mapped(&doc(vec![para(content)]), &opts(40));
+            // Mid-paragraph.
+            let (_, maps) = render_of(vec![
+                run("ab", RunProps::default()),
+                object.clone(),
+                run("cd", RunProps::default()),
+            ]);
+            assert_eq!(all_offsets_1242(&maps), vec![0, 1, 2, 3, 4, 5]);
+            // At the end: `k + 1` sits on the block's last line.
+            let (lines, maps) = render_of(vec![run("ab", RunProps::default()), object.clone()]);
+            assert_eq!(all_offsets_1242(&maps), vec![0, 1, 2, 3]);
+            let last = maps.iter().rposition(|m| !m.segs.is_empty()).unwrap();
+            assert!(last > 0 && lines.len() > 2, "{lines:?}");
+            assert_eq!(maps[last].visual_positions()[0].offset, 3);
+            // At the start: `0` on the line before it.
+            let (_, maps) = render_of(vec![object.clone(), run("cd", RunProps::default())]);
+            assert_eq!(all_offsets_1242(&maps), vec![0, 1, 2, 3]);
+            // Alone: both stops.
+            let (_, maps) = render_of(vec![object.clone()]);
+            assert_eq!(all_offsets_1242(&maps), vec![0, 1]);
+            // An anchored block picture adds no stop.
+            let (_, maps) = render_of(vec![
+                run("ab", RunProps::default()),
+                picture_1242(300, true),
+            ]);
+            assert_eq!(all_offsets_1242(&maps), vec![0, 1, 2]);
+        }
     }
 
     #[test]

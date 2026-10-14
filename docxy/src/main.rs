@@ -9355,6 +9355,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bidi_renderer_puts_caret_stops_only_around_an_equation_or_picture_1242() {
+        let equation = Inline::Equation {
+            raw: "<m:oMath/>".to_string(),
+            text: "x+1".to_string(),
+            latex: None,
+        };
+        let picture = Inline::Raw(
+            "<w:r><w:drawing><wp:inline><wp:extent cx=\"304800\" cy=\"304800\"/>\
+             <a:blip r:embed=\"rId5\"/></wp:inline></w:drawing></w:r>"
+                .to_string(),
+        );
+        for object in [equation, picture] {
+            let doc = bidi_doc(vec![
+                bidi_para_with(
+                    ParProps::default(),
+                    vec![bidi_run("ab"), object.clone(), bidi_run("cd")],
+                ),
+                bidi_para_with(
+                    ParProps::default(),
+                    vec![bidi_run("אבג "), object.clone(), bidi_run(" דה")],
+                ),
+            ]);
+            let (_, maps) = docxcore::render::render_mapped(&doc, &bidi_opts(30));
+            // A picture's rows below the text carry no stops.
+            let maps: Vec<_> = maps.into_iter().filter(|m| !m.segs.is_empty()).collect();
+            let offsets = |map: &docxcore::render::LineMap| -> Vec<usize> {
+                let mut o: Vec<usize> = map
+                    .visual_positions()
+                    .into_iter()
+                    .map(|caret| caret.offset)
+                    .collect();
+                o.sort_unstable();
+                o.dedup();
+                o
+            };
+            assert_eq!(offsets(&maps[0]), vec![0, 1, 2, 3, 4, 5]);
+            // Right to left too: one offset, two stops, none inside it.
+            assert_eq!(offsets(&maps[1]), (0..=8).collect::<Vec<_>>());
+            let cols = |off: usize| -> Vec<usize> {
+                maps[1]
+                    .visual_positions()
+                    .into_iter()
+                    .filter(|caret| caret.offset == off)
+                    .map(|caret| caret.col)
+                    .collect()
+            };
+            let edges: Vec<usize> = cols(4).into_iter().chain(cols(5)).collect();
+            let (lo, hi) = (*edges.iter().min().unwrap(), *edges.iter().max().unwrap());
+            assert!(hi - lo >= 3, "the object is drawn between {lo} and {hi}");
+            let inside: Vec<_> = maps[1]
+                .visual_positions()
+                .into_iter()
+                .filter(|caret| lo < caret.col && caret.col < hi)
+                .collect();
+            assert!(inside.is_empty(), "no stop inside it: {inside:?}");
+        }
+    }
+
     fn rendered_text(app: &mut App, width: u16) -> String {
         app.ensure_rendered(width);
         app.lines
