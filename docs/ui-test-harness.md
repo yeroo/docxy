@@ -396,7 +396,8 @@ each paragraph contributes a final `\n`, including a table cell paragraph.
 Tab is `\t`, and line/page/column breaks are `\u000B`/`\u000C`/`\u000E`.
 A field that shows a result contributes one U+FFFC (it is edited as one unit);
 its cached result text, like revision text, has no editor caret and
-contributes no offset.
+contributes no offset. An equation and an inline (not floating) picture
+each contribute one U+FFFC too (#1242); a floating picture contributes none.
 Text boxes appear in `textboxes` as separate stories.
 
 `table` is the caret's innermost table, or `null` outside one (#705):
