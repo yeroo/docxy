@@ -3228,6 +3228,10 @@ impl App {
         }
         if !self.tracked_comments.is_empty() {
             self.pkg.drop_empty_comment_parts();
+            // A deleted comment's author stays in people.xml only while
+            // something else names them (#918).
+            let body = self.hf_edit.as_ref().map_or(&self.editor, |hf| &hf.body);
+            self.pkg.prune_people(&body.doc, &[]);
         }
     }
 
@@ -13234,6 +13238,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         assert!(!doc.contains("w:id=\"1\""), "{doc}");
         assert_eq!(saved_comment_ids(&comments), ["2"], "{comments}");
+    }
+
+    /// #918: a deleted comment's author leaves `people.xml` with the save;
+    /// an author another comment still has stays.
+    #[test]
+    fn delete_comment_prunes_its_author_from_people() {
+        let app = app_with_rich_comments(2);
+        let mut parts: Vec<(String, Vec<u8>)> = app
+            .pkg
+            .part_names()
+            .into_iter()
+            .map(|n| (n.to_string(), app.pkg.part(n).unwrap().to_vec()))
+            .collect();
+        parts.push((
+            "word/people.xml".to_string(),
+            b"<w15:people xmlns:w15=\"p\"><w15:person w15:author=\"Ann\"/><w15:person w15:author=\"Bob\"/></w15:people>"
+                .to_vec(),
+        ));
+        let pkg = load_package(&docxcore::zipwrite::write_zip(&parts)).unwrap();
+        let mut app = App::new(pkg, "test.docx", false);
+        app.os_clip = None;
+        app.comment_sel = 0;
+        app.run_act(ribbon::Act::DeleteComment);
+        let path = save_to_temp(&mut app, "cmt-delete-people");
+        let people = saved_pkg(&path).part_text("word/people.xml").unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert!(!people.contains("\"Ann\""), "{people}");
+        assert!(people.contains("\"Bob\""), "{people}");
     }
 
     /// #971 FIX r1 m2: a comment added this session and saved, then

@@ -964,9 +964,9 @@ impl Editor {
     /// Document Inspector: remove every hidden run, tab and break
     /// ([`crate::inspect::remove_hidden_text`]) as one undo step, none when
     /// nothing was hidden. Returns how many were removed.
-    pub fn remove_hidden_text(&mut self) -> usize {
+    pub fn remove_hidden_text(&mut self, styles: Option<&crate::styles::StyleSheet>) -> usize {
         let before = self.transaction_start();
-        let removed = crate::inspect::remove_hidden_text(&mut self.doc);
+        let removed = crate::inspect::remove_hidden_text(&mut self.doc, styles);
         self.finish_review_transaction(before);
         removed
     }
@@ -5591,12 +5591,12 @@ mod tests {
             path: vec![1],
             offset: "seen unseen".len(),
         };
-        assert_eq!(ed.remove_hidden_text(), 1);
+        assert_eq!(ed.remove_hidden_text(None), 1);
         assert_eq!(top_text(&ed), ["first", "seen"]);
         assert_eq!(ed.caret.offset, "seen".len(), "caret clamped");
         // A no-op pushes no undo step: one undo restores the hidden run and
         // the caret, and there is nothing further to undo.
-        assert_eq!(ed.remove_hidden_text(), 0);
+        assert_eq!(ed.remove_hidden_text(None), 0);
         assert!(ed.undo());
         assert_eq!(top_text(&ed), ["first", "seen unseen"]);
         assert_eq!(ed.caret.offset, "seen unseen".len());
@@ -6747,7 +6747,7 @@ mod tests {
         let start = taken();
         ed.one_step("Clean", |ed| {
             ed.insert_char('x');
-            ed.remove_hidden_text();
+            ed.remove_hidden_text(None);
             ed.remove_all_comment_markers();
         });
         assert_eq!(taken() - start, 1);

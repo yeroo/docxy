@@ -18,14 +18,24 @@
 
 use crate::model::{Block, Document, Inline, Run, RunProps, Table, TableRowBoundaryKind};
 use crate::package::Package;
+use crate::styles::StyleSheet;
 use crate::xml::{Event, XmlParser};
 use std::ops::Range;
 
+/// The styles a [`Target::Hidden`] walk resolves `w:vanish` through, and the
+/// style of the paragraph it is in.
+#[derive(Clone, Copy)]
+struct Styled<'a> {
+    sheet: &'a StyleSheet,
+    para: Option<&'a str>,
+}
+
 /// What a body walk removes or counts.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum Target<'a> {
-    /// Runs, tabs and breaks formatted `w:vanish`.
-    Hidden,
+    /// Runs, tabs and breaks formatted `w:vanish`: directly, or through
+    /// their styles when the walk has them.
+    Hidden(Option<Styled<'a>>),
     /// `w:commentRangeStart`, `w:commentRangeEnd` and `w:commentReference`:
     /// every comment's, or only those whose `w:id` is the given one.
     CommentMarkers(Option<&'a str>),
@@ -33,27 +43,49 @@ enum Target<'a> {
     RawHidden,
 }
 
-impl Target<'_> {
+impl<'a> Target<'a> {
     /// Whether the walk drops this modeled inline whole. Comment markers
     /// live in raw XML and are stripped from it instead ([`strip_markers`]).
     fn matches(self, inline: &Inline) -> bool {
         match (self, inline) {
-            (Target::Hidden, Inline::Run(r)) => is_hidden(&r.props),
-            (Target::Hidden, Inline::Tab(p) | Inline::Break(_, p)) => is_hidden(p),
+            (Target::Hidden(styled), Inline::Run(r)) => is_hidden(&r.props, styled),
+            (Target::Hidden(styled), Inline::Tab(p) | Inline::Break(_, p)) => is_hidden(p, styled),
             _ => false,
         }
     }
 
     fn matches_run(self, run: &Run) -> bool {
-        self == Target::Hidden && is_hidden(&run.props)
+        matches!(self, Target::Hidden(styled) if is_hidden(&run.props, styled))
+    }
+
+    /// This target inside a paragraph of style `para`.
+    fn in_paragraph<'b>(self, para: Option<&'b str>) -> Target<'b>
+    where
+        'a: 'b,
+    {
+        match self {
+            Target::Hidden(Some(styled)) => Target::Hidden(Some(Styled {
+                sheet: styled.sheet,
+                para,
+            })),
+            other => other,
+        }
     }
 }
 
-/// Whether direct run formatting hides the text the way Word's inspector
-/// means it: `w:vanish`. `w:webHidden` (hidden only in Web layout; every TOC
-/// puts it on its page numbers) is not hidden text and is not `vanish`.
-fn is_hidden(props: &RunProps) -> bool {
-    props.vanish
+/// Whether run formatting hides the text the way Word's inspector means it:
+/// `w:vanish`, set directly or, with `styled`, through the run's character
+/// style, its paragraph's style or the document defaults
+/// ([`StyleSheet::effective_vanish`]). `w:webHidden` (hidden only in Web
+/// layout; every TOC puts it on its page numbers) is not hidden text and is
+/// not `vanish`.
+fn is_hidden(props: &RunProps, styled: Option<Styled>) -> bool {
+    match styled {
+        None => props.vanish,
+        Some(s) => s
+            .sheet
+            .effective_vanish(s.para, props.style_id.as_deref(), props),
+    }
 }
 
 const MARKER_TAGS: [&str; 3] = [
@@ -213,7 +245,7 @@ fn count_in_raw(xml: &str, target: Target) -> usize {
     match target {
         Target::CommentMarkers(id) => count_markers(xml, id),
         Target::RawHidden => count_hidden_in_xml(xml),
-        Target::Hidden => 0,
+        Target::Hidden(_) => 0,
     }
 }
 
@@ -221,7 +253,9 @@ fn count_blocks(blocks: &[Block], target: Target) -> usize {
     blocks
         .iter()
         .map(|b| match b {
-            Block::Paragraph(p) => count_inlines(&p.content, target),
+            Block::Paragraph(p) => {
+                count_inlines(&p.content, target.in_paragraph(p.props.style_id.as_deref()))
+            }
             Block::Table(t) => {
                 let cells: usize = t
                     .rows
@@ -313,7 +347,10 @@ fn remove_blocks(blocks: &mut [Block], target: Target) -> usize {
     let mut removed = 0;
     for b in blocks {
         match b {
-            Block::Paragraph(p) => removed += remove_inlines(&mut p.content, target),
+            Block::Paragraph(p) => {
+                let target = target.in_paragraph(p.props.style_id.as_deref());
+                removed += remove_inlines(&mut p.content, target);
+            }
             Block::Table(t) => {
                 for cell in t.rows.iter_mut().flat_map(|row| &mut row.cells) {
                     removed += remove_blocks(&mut cell.blocks, target);
@@ -575,9 +612,15 @@ fn sync_twin_copies(raw: &mut String, blocks: &[Block], twins: &[bool]) {
 }
 
 /// Hidden runs, tabs and breaks in the modeled body (see [`is_hidden`]):
-/// the ones [`remove_hidden_text`] removes.
-pub fn count_hidden_runs(doc: &Document) -> usize {
-    count_blocks(&doc.body, Target::Hidden)
+/// the ones [`remove_hidden_text`] removes. With `styles`, text hidden
+/// through its styles counts too; without, only direct `w:vanish`.
+pub fn count_hidden_runs(doc: &Document, styles: Option<&StyleSheet>) -> usize {
+    count_blocks(&doc.body, hidden(styles))
+}
+
+/// The [`Target::Hidden`] walk over `styles`, if any.
+fn hidden(styles: Option<&StyleSheet>) -> Target<'_> {
+    Target::Hidden(styles.map(|sheet| Styled { sheet, para: None }))
 }
 
 /// Hidden runs that stay raw XML (fields, tracked moves, unmodeled
@@ -589,8 +632,8 @@ pub fn count_unremovable_hidden_runs(doc: &Document) -> usize {
 
 /// Remove every hidden run, tab and break from the modeled body (see
 /// [`count_hidden_runs`]). Returns how many.
-pub fn remove_hidden_text(doc: &mut Document) -> usize {
-    remove_blocks(&mut doc.body, Target::Hidden)
+pub fn remove_hidden_text(doc: &mut Document, styles: Option<&StyleSheet>) -> usize {
+    remove_blocks(&mut doc.body, hidden(styles))
 }
 
 /// Whether any comment marker (range start/end or reference) is in the body.
@@ -682,6 +725,290 @@ pub fn remove_all_comment_markers(doc: &mut Document) -> usize {
 /// many.
 pub fn remove_comment_markers(doc: &mut Document, id: &str) -> usize {
     remove_blocks(&mut doc.body, Target::CommentMarkers(Some(id)))
+}
+
+/// What the inspector finds in a document's other stories ([`Stories`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoryCounts {
+    /// Hidden runs, tabs and breaks [`Stories::remove_hidden_text`] removes.
+    pub hidden: usize,
+    /// Hidden runs left in raw XML there ([`count_unremovable_hidden_runs`]).
+    pub hidden_unremovable: usize,
+    /// Comment markers (range start/end and references).
+    pub comment_markers: usize,
+}
+
+impl std::ops::AddAssign for StoryCounts {
+    fn add_assign(&mut self, o: StoryCounts) {
+        self.hidden += o.hidden;
+        self.hidden_unremovable += o.hidden_unremovable;
+        self.comment_markers += o.comment_markers;
+    }
+}
+
+/// The notes parts and the element each note is.
+const NOTE_PARTS: [(&str, &str); 2] = [
+    ("word/footnotes.xml", "w:footnote"),
+    ("word/endnotes.xml", "w:endnote"),
+];
+
+/// What a story part holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoryKind {
+    /// A header (`true`) or footer part.
+    HeaderFooter(bool),
+    /// A notes part, whose notes are this element.
+    Notes(&'static str),
+}
+
+/// A document's other stories (#918): the header and footer parts some
+/// section of the body references, of any variant (shown or not: a save
+/// keeps them all), then `word/footnotes.xml` and `word/endnotes.xml` when
+/// present. A header or footer part no section references any more (kept in
+/// the package for undo, dropped by the save, #771) is not one of them.
+pub struct Stories {
+    parts: Vec<(String, StoryKind)>,
+}
+
+impl Stories {
+    /// The stories of `pkg` whose body is `doc` (the live one, whose section
+    /// breaks say which headers and footers apply).
+    pub fn new(pkg: &Package, doc: &Document) -> Stories {
+        let mut sect_prs: Vec<&str> = doc
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => p.props.section_break.as_deref(),
+                _ => None,
+            })
+            .collect();
+        sect_prs.push(
+            doc.trailing_section_properties()
+                .map_or("", |s| s.raw.as_str()),
+        );
+        let mut parts: Vec<(String, StoryKind)> = Vec::new();
+        for section in crate::package::section_header_parts(&sect_prs, &pkg.document_rels()) {
+            for (is_header, slots) in [(true, section.headers), (false, section.footers)] {
+                for part in slots.into_iter().flatten() {
+                    if pkg.part(&part.part_name).is_some()
+                        && !parts.iter().any(|(name, _)| *name == part.part_name)
+                    {
+                        parts.push((part.part_name, StoryKind::HeaderFooter(is_header)));
+                    }
+                }
+            }
+        }
+        parts.extend(
+            NOTE_PARTS
+                .iter()
+                .filter(|(name, _)| pkg.part(name).is_some())
+                .map(|(name, element)| (name.to_string(), StoryKind::Notes(element))),
+        );
+        Stories { parts }
+    }
+
+    /// The story part names, in order.
+    pub fn part_names(&self) -> Vec<&str> {
+        self.parts.iter().map(|(name, _)| name.as_str()).collect()
+    }
+
+    /// Every story's blocks, read from `pkg`, but `skip`'s (a header or footer
+    /// whose live content the caller holds, in an editor).
+    fn blocks(&self, pkg: &Package, skip: Option<&str>) -> Vec<Vec<Block>> {
+        let mut out = Vec::new();
+        for (part, kind) in &self.parts {
+            if Some(part.as_str()) == skip {
+                continue;
+            }
+            match *kind {
+                StoryKind::HeaderFooter(_) => out.extend(pkg.header_footer_blocks(part)),
+                StoryKind::Notes(element) => {
+                    let Some(xml) = pkg.part_text(part) else {
+                        continue;
+                    };
+                    let rels = pkg.part_rels(part);
+                    for range in note_ranges(&xml, element) {
+                        out.push(crate::load::parse_note_blocks(&xml[range], &rels));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// What the inspector finds in the stories, hidden text resolved through
+    /// `styles` when given. `skip` names a header or footer part to leave
+    /// out: one open in an editor, whose live blocks the caller counts with
+    /// [`count_story_blocks`].
+    pub fn count(
+        &self,
+        pkg: &Package,
+        styles: Option<&StyleSheet>,
+        skip: Option<&str>,
+    ) -> StoryCounts {
+        let mut counts = StoryCounts::default();
+        for blocks in self.blocks(pkg, skip) {
+            counts += count_story_blocks(&blocks, styles);
+        }
+        counts
+    }
+
+    /// Remove every hidden run, tab and break (see [`Stories::count`]) from
+    /// the stories. Only a header or footer part, or a note, that held one is
+    /// rewritten, from its modeled blocks: a header or footer keeps its root
+    /// start tag ([`crate::hf::rewrite_part`]), a note its own start and end
+    /// tags, and the other notes (the separators included) stay byte for
+    /// byte. A rewritten part keeps its encoding (UTF-16, a BOM). Hidden runs
+    /// in raw XML stay, as in the body. Returns how many were removed.
+    pub fn remove_hidden_text(&self, pkg: &mut Package, styles: Option<&StyleSheet>) -> usize {
+        let mut removed = 0;
+        for (part, kind) in &self.parts {
+            match *kind {
+                StoryKind::HeaderFooter(is_header) => {
+                    let Some(mut blocks) = pkg.header_footer_blocks(part) else {
+                        continue;
+                    };
+                    let n = remove_blocks(&mut blocks, hidden(styles));
+                    if n > 0 {
+                        let inner = crate::serialize::blocks_to_xml(&blocks);
+                        crate::hf::rewrite_part(pkg, part, is_header, &inner);
+                        removed += n;
+                    }
+                }
+                StoryKind::Notes(element) => {
+                    removed += remove_hidden_in_notes(pkg, part, element, styles);
+                }
+            }
+        }
+        removed
+    }
+
+    /// The `w:id` of every comment marker in the stories.
+    pub fn comment_marker_ids(&self, pkg: &Package) -> std::collections::BTreeSet<String> {
+        let mut ids = std::collections::BTreeSet::new();
+        for (part, _) in &self.parts {
+            if let Some(xml) = pkg.part_text(part) {
+                marker_ids_in_xml(&xml, &mut ids);
+            }
+        }
+        ids
+    }
+
+    /// Remove every comment marker from the stories, straight from each
+    /// part's XML, not through the model: nothing else in the part changes
+    /// but the run a `w:commentReference` leaves holding only its `w:rPr`,
+    /// which goes too. A part without a marker is not touched. Returns how
+    /// many markers were removed.
+    pub fn remove_comment_markers(&self, pkg: &mut Package) -> usize {
+        let mut removed = 0;
+        for (part, _) in &self.parts {
+            let Some(xml) = pkg.part_text(part) else {
+                continue;
+            };
+            let (out, n) = strip_markers_in_part(&xml);
+            if n > 0 {
+                pkg.set_part_text(part, &out);
+                removed += n;
+            }
+        }
+        removed
+    }
+}
+
+/// [`Stories::remove_hidden_text`] of notes part `part`, whose notes are
+/// `element`s: each note that held a hidden run is spliced back alone.
+fn remove_hidden_in_notes(
+    pkg: &mut Package,
+    part: &str,
+    element: &str,
+    styles: Option<&StyleSheet>,
+) -> usize {
+    let Some(xml) = pkg.part_text(part) else {
+        return 0;
+    };
+    let rels = pkg.part_rels(part);
+    let close = format!("</{element}>");
+    let mut out = xml.clone();
+    let mut removed = 0;
+    // Last first, so the earlier ranges stay valid.
+    for range in note_ranges(&xml, element).into_iter().rev() {
+        let note = &xml[range.clone()];
+        let mut blocks = crate::load::parse_note_blocks(note, &rels);
+        let n = remove_blocks(&mut blocks, hidden(styles));
+        let Some(head) = tag_end(note).filter(|_| n > 0) else {
+            continue;
+        };
+        let inner = range.start + head..range.end - close.len();
+        out.replace_range(inner, &crate::serialize::blocks_to_xml(&blocks));
+        removed += n;
+    }
+    if out != xml {
+        pkg.set_part_text(part, &out);
+    }
+    removed
+}
+
+/// The byte ranges of the notes a user wrote in a notes part, each a whole
+/// `element` (`w:footnote` / `w:endnote`): not the separator, continuation
+/// separator or continuation notice Word keeps there, and not an empty one.
+fn note_ranges(xml: &str, element: &str) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some((start, end, filled)) = find_element_from(xml, element, from) {
+        from = end;
+        let Some(head) = tag_end(&xml[start..]) else {
+            break;
+        };
+        let mut p = XmlParser::new(&xml[start..start + head]);
+        let reserved = p.next() == Event::Start
+            && matches!(
+                p.attr("w:type"),
+                "separator" | "continuationSeparator" | "continuationNotice"
+            );
+        if filled && !reserved {
+            out.push(start..end);
+        }
+    }
+    out
+}
+
+/// [`Stories::count`] of one story's blocks.
+pub fn count_story_blocks(blocks: &[Block], styles: Option<&StyleSheet>) -> StoryCounts {
+    StoryCounts {
+        hidden: count_blocks(blocks, hidden(styles)),
+        hidden_unremovable: count_blocks(blocks, Target::RawHidden),
+        comment_markers: count_blocks(blocks, Target::CommentMarkers(None)),
+    }
+}
+
+/// `xml` (a whole part) without its comment markers, and how many there
+/// were. A run a marker leaves holding only its `w:rPr` goes too.
+fn strip_markers_in_part(xml: &str) -> (String, usize) {
+    const RUN_END: &str = "</w:r>";
+    let mut out = xml.to_string();
+    let mut removed = 0;
+    for name in MARKER_TAGS {
+        while let Some((start, end, _)) = find_element_from(&out, name, 0) {
+            out.replace_range(start..end, "");
+            removed += 1;
+            if !out[start..].starts_with(RUN_END) {
+                continue;
+            }
+            // The run around it: the last `<w:r>` / `<w:r …>` before it.
+            let run_start = out[..start]
+                .match_indices("<w:r")
+                .map(|(at, _)| at)
+                .filter(|&at| out[at + 4..].starts_with([' ', '>', '\t', '\r', '\n']))
+                .last();
+            if let Some(run_start) = run_start {
+                let run_end = start + RUN_END.len();
+                if is_leftover(&out[run_start..run_end]) {
+                    out.replace_range(run_start..run_end, "");
+                }
+            }
+        }
+    }
+    (out, removed)
 }
 
 /// The byte length of the tag starting at `s[0] == '<'`, through its `>`,
@@ -828,6 +1155,10 @@ mod tests {
                 "word/styles.xml".to_string(),
                 br#"<?xml version="1.0"?><w:styles/>"#.to_vec(),
             ),
+            (
+                "word/_rels/document.xml.rels".to_string(),
+                HF_RELS.as_bytes().to_vec(),
+            ),
         ];
         for (name, xml) in extra {
             parts.push((name.to_string(), xml.as_bytes().to_vec()));
@@ -898,9 +1229,9 @@ mod tests {
              <w:p><w:ins w:id=\"8\" w:author=\"A\">{VISIBLE}{HIDDEN}</w:ins></w:p>"
         );
         let mut doc = parse(&body);
-        assert_eq!(count_hidden_runs(&doc), 5);
-        assert_eq!(remove_hidden_text(&mut doc), 5);
-        assert_eq!(count_hidden_runs(&doc), 0);
+        assert_eq!(count_hidden_runs(&doc, None), 5);
+        assert_eq!(remove_hidden_text(&mut doc, None), 5);
+        assert_eq!(count_hidden_runs(&doc, None), 0);
         let texts: Vec<String> = doc.body.iter().map(|b| b.plain_text()).collect();
         assert!(texts.iter().all(|t| !t.contains("gone")), "{texts:?}");
         let xml = document_to_xml(&doc);
@@ -920,7 +1251,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(remove_hidden_text(&mut doc), 0);
+        assert_eq!(remove_hidden_text(&mut doc, None), 0);
     }
 
     #[test]
@@ -933,8 +1264,8 @@ mod tests {
             </w:hyperlink></w:p>";
         let mut doc = parse(body);
         let loaded = doc.clone();
-        assert_eq!(count_hidden_runs(&doc), 0);
-        assert_eq!(remove_hidden_text(&mut doc), 0);
+        assert_eq!(count_hidden_runs(&doc, None), 0);
+        assert_eq!(remove_hidden_text(&mut doc, None), 0);
         assert_eq!(doc, loaded);
     }
 
@@ -944,8 +1275,8 @@ mod tests {
         let body = "<w:p><w:r><w:t>keep</w:t></w:r>\
             <w:r><w:rPr><w:vanish/><w:webHidden/></w:rPr><w:t>gone</w:t></w:r></w:p>";
         let mut doc = parse(body);
-        assert_eq!(count_hidden_runs(&doc), 1);
-        assert_eq!(remove_hidden_text(&mut doc), 1);
+        assert_eq!(count_hidden_runs(&doc, None), 1);
+        assert_eq!(remove_hidden_text(&mut doc, None), 1);
         assert_eq!(doc.plain_text().trim(), "keep");
     }
 
@@ -1058,8 +1389,8 @@ mod tests {
     fn inspect_removal_reaches_a_text_box_fallback_copy() {
         let hidden = two_copy_text_box(&format!("<w:p>{VISIBLE}{HIDDEN}</w:p>"));
         let mut doc = parse(&hidden);
-        assert_eq!(count_hidden_runs(&doc), 1);
-        assert_eq!(remove_hidden_text(&mut doc), 1);
+        assert_eq!(count_hidden_runs(&doc, None), 1);
+        assert_eq!(remove_hidden_text(&mut doc, None), 1);
         let xml = document_to_xml(&doc);
         assert!(!xml.contains("gone"), "{xml}");
         assert_eq!(xml.matches("keep").count(), 2, "both copies keep: {xml}");
@@ -1099,8 +1430,8 @@ mod tests {
         let a = format!("<w:p>{VISIBLE}{HIDDEN}</w:p>");
         let b = "<w:p><w:r><w:t>Box B</w:t></w:r></w:p>";
         let mut doc = parse(&group_of_two_boxes(&a, b));
-        assert_eq!(count_hidden_runs(&doc), 1);
-        assert_eq!(remove_hidden_text(&mut doc), 1);
+        assert_eq!(count_hidden_runs(&doc, None), 1);
+        assert_eq!(remove_hidden_text(&mut doc, None), 1);
         let xml = document_to_xml(&doc);
         assert!(!xml.contains("gone"), "A and its twin lose it: {xml}");
         assert_eq!(xml.matches("keep").count(), 2, "{xml}");
@@ -1136,8 +1467,8 @@ mod tests {
         // Comments, then hidden text.
         let mut doc = parse(&rsid_box());
         assert_eq!(remove_all_comment_markers(&mut doc), 1 + 1);
-        assert_eq!(count_hidden_runs(&doc), 1);
-        assert_eq!(remove_hidden_text(&mut doc), 1);
+        assert_eq!(count_hidden_runs(&doc, None), 1);
+        assert_eq!(remove_hidden_text(&mut doc, None), 1);
         let xml = document_to_xml(&doc);
         assert!(!xml.contains("gone"), "{xml}");
         assert!(!xml.contains("comment"), "{xml}");
@@ -1145,7 +1476,7 @@ mod tests {
 
         // Hidden text, then comments: the second pass counts what it removes.
         let mut doc = parse(&rsid_box());
-        assert_eq!(remove_hidden_text(&mut doc), 1);
+        assert_eq!(remove_hidden_text(&mut doc, None), 1);
         let markers = count_blocks(&doc.body, Target::CommentMarkers(None));
         assert_eq!(markers, 2);
         assert_eq!(remove_all_comment_markers(&mut doc), markers);
@@ -1171,7 +1502,7 @@ mod tests {
         assert_eq!(xml.matches("w14:paraId=\"1A2B3C4D\"").count(), 2, "{xml}");
         let body = &xml[xml.find("<w:body>").unwrap() + 8..xml.find("</w:body>").unwrap()];
         let mut reopened = parse(body);
-        assert_eq!(remove_hidden_text(&mut reopened), 1);
+        assert_eq!(remove_hidden_text(&mut reopened, None), 1);
         let xml = document_to_xml(&reopened);
         assert!(!xml.contains("gone"), "{xml}");
         assert_eq!(xml.matches("keep").count(), 2, "{xml}");
@@ -1195,7 +1526,7 @@ mod tests {
         assert_eq!(xml.matches("w14:paraId=\"1A2B3C4D\"").count(), 3, "{xml}");
         let body = &xml[xml.find("<w:body>").unwrap() + 8..xml.find("</w:body>").unwrap()];
         let mut reopened = parse(body);
-        assert_eq!(remove_hidden_text(&mut reopened), 2);
+        assert_eq!(remove_hidden_text(&mut reopened, None), 2);
         let xml = document_to_xml(&reopened);
         assert!(!xml.contains("gone"), "{xml}");
         assert_eq!(xml.matches("keep").count(), 4, "{xml}");
@@ -1247,7 +1578,7 @@ mod tests {
         assert!(xml.contains("<w:lang xmlns:ux=\"urn:ux\""), "{xml}");
         let body = &xml[xml.find("<w:body>").unwrap() + 8..xml.find("</w:body>").unwrap()];
         let mut reopened = parse(body);
-        assert_eq!(remove_hidden_text(&mut reopened), 1);
+        assert_eq!(remove_hidden_text(&mut reopened, None), 1);
         let xml = document_to_xml(&reopened);
         assert!(!xml.contains("gone"), "{xml}");
         assert_eq!(xml.matches("keep").count(), 2, "{xml}");
@@ -1479,10 +1810,10 @@ mod tests {
             )
         );
         let mut doc = parse(&body);
-        assert_eq!(count_hidden_runs(&doc), 0, "none of it is modeled");
+        assert_eq!(count_hidden_runs(&doc, None), 0, "none of it is modeled");
         // One in the move, one in the field, B and its fallback twin B'.
         assert_eq!(count_unremovable_hidden_runs(&doc), 4);
-        assert_eq!(remove_hidden_text(&mut doc), 0);
+        assert_eq!(remove_hidden_text(&mut doc, None), 0);
         assert_eq!(count_unremovable_hidden_runs(&doc), 4, "left in place");
     }
 
@@ -1606,5 +1937,387 @@ mod tests {
         );
         assert!(!has_personal_properties(&pkg));
         assert!(!remove_personal_properties(&mut pkg));
+    }
+
+    /// A header holding a comment range and reference, a hidden run and
+    /// visible text.
+    fn marked_header() -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+             <w:hdr {W}><w:p><w:commentRangeStart w:id=\"3\"/><w:r><w:t>Head</w:t></w:r>\
+             <w:commentRangeEnd w:id=\"3\"/><w:r><w:rPr><w:rStyle w:val=\"CommentReference\"/></w:rPr>\
+             <w:commentReference w:id=\"3\"/></w:r>\
+             <w:r><w:rPr><w:vanish/></w:rPr><w:t>Hush</w:t></w:r></w:p></w:hdr>"
+        )
+    }
+
+    /// A notes part `root`/`element` with the two separators and one note
+    /// (id 1) holding its reference mark, visible text, a hidden run and a
+    /// comment reference.
+    fn notes_part(root: &str, element: &str, mark: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+             <w:{root} {W}>\
+             <w:{element} w:type=\"separator\" w:id=\"-1\"><w:p><w:r><w:separator/></w:r></w:p></w:{element}>\
+             <w:{element} w:type=\"continuationSeparator\" w:id=\"0\"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:{element}>\
+             <w:{element} w:id=\"1\"><w:p><w:r><w:rPr><w:rStyle w:val=\"Mark\"/></w:rPr><w:{mark}/></w:r>\
+             <w:r><w:t xml:space=\"preserve\"> Note</w:t></w:r>\
+             <w:r><w:rPr><w:vanish/></w:rPr><w:t>Quiet</w:t></w:r>\
+             <w:commentRangeStart w:id=\"4\"/><w:commentRangeEnd w:id=\"4\"/>\
+             <w:r><w:commentReference w:id=\"4\"/></w:r></w:p></w:{element}>\
+             </w:{root}>"
+        )
+    }
+
+    /// The relationships of the header and footer parts the tests use.
+    const HF_RELS: &str = "<?xml version=\"1.0\"?><Relationships>        <Relationship Id=\"rIdH\" Type=\"h\" Target=\"header1.xml\"/>        <Relationship Id=\"rIdH2\" Type=\"h\" Target=\"header2.xml\"/>        <Relationship Id=\"rIdF\" Type=\"f\" Target=\"footer1.xml\"/>        <Relationship Id=\"rIdH9\" Type=\"h\" Target=\"header9.xml\"/></Relationships>";
+
+    /// A trailing sectPr referencing header1 (default), header2 (first page,
+    /// not shown: no titlePg) and footer1. header9 is related, but no section
+    /// references it.
+    const SECT: &str = "<w:sectPr><w:headerReference w:type=\"default\" r:id=\"rIdH\"/>        <w:headerReference w:type=\"first\" r:id=\"rIdH2\"/>        <w:footerReference w:type=\"default\" r:id=\"rIdF\"/></w:sectPr>";
+
+    fn stories(pkg: &Package) -> Stories {
+        Stories::new(pkg, &pkg.document)
+    }
+
+    fn storied_docx() -> Package {
+        let document = format!(
+            "<w:document {W}><w:body><w:p><w:r><w:t>Body</w:t></w:r>\
+             <w:r><w:footnoteReference w:id=\"1\"/></w:r><w:r><w:endnoteReference w:id=\"1\"/></w:r></w:p>\
+             {SECT}</w:body></w:document>"
+        );
+        let footer = format!("<w:ftr {W}><w:p><w:r><w:t>Foot</w:t></w:r></w:p></w:ftr>");
+        docx(
+            &document,
+            &[
+                ("word/header1.xml", &marked_header()),
+                ("word/footer1.xml", &footer),
+                (
+                    "word/footnotes.xml",
+                    &notes_part("footnotes", "footnote", "footnoteRef"),
+                ),
+                (
+                    "word/endnotes.xml",
+                    &notes_part("endnotes", "endnote", "endnoteRef"),
+                ),
+            ],
+        )
+    }
+
+    /// #918: Inspect Document looks in headers, footers and notes too:
+    /// the header's hidden run and its comment's three markers are found.
+    #[test]
+    fn header_hidden_run_and_comment_markers_are_counted_and_removed() {
+        let mut pkg = storied_docx();
+        assert_eq!(
+            stories(&pkg).part_names(),
+            [
+                "word/header1.xml",
+                "word/footer1.xml",
+                "word/footnotes.xml",
+                "word/endnotes.xml"
+            ]
+        );
+        let counts = stories(&pkg).count(&pkg, None, None);
+        assert_eq!(
+            counts,
+            StoryCounts {
+                hidden: 3,
+                hidden_unremovable: 0,
+                comment_markers: 9,
+            }
+        );
+        let ids: Vec<String> = stories(&pkg).comment_marker_ids(&pkg).into_iter().collect();
+        assert_eq!(ids, ["3", "4"]);
+        // Leaving the header out (open in an editor) leaves its counts out.
+        let rest = stories(&pkg).count(&pkg, None, Some("word/header1.xml"));
+        assert_eq!((rest.hidden, rest.comment_markers), (2, 6));
+
+        assert_eq!(stories(&pkg).remove_comment_markers(&mut pkg), 9);
+        let header = pkg.part_text("word/header1.xml").unwrap();
+        assert_eq!(count_markers(&header, None), 0, "{header}");
+        // The reference's run went with it; the rest is as it was.
+        assert!(!header.contains("CommentReference"), "{header}");
+        assert!(
+            header.contains("<w:r><w:t>Head</w:t></w:r><w:r><w:rPr><w:vanish/>"),
+            "{header}"
+        );
+        assert!(stories(&pkg).comment_marker_ids(&pkg).is_empty());
+
+        assert_eq!(stories(&pkg).remove_hidden_text(&mut pkg, None), 3);
+        let header = pkg.part_text("word/header1.xml").unwrap();
+        assert!(!header.contains("w:vanish"), "{header}");
+        assert!(header.contains("Head"), "{header}");
+        assert!(header.starts_with("<?xml"), "{header}");
+        let blocks = pkg.header_footer_blocks("word/header1.xml").unwrap();
+        let text: String = blocks.iter().map(|b| b.plain_text()).collect();
+        assert_eq!(text, "Head");
+        assert_eq!(
+            stories(&pkg).count(&pkg, None, None),
+            StoryCounts::default()
+        );
+    }
+
+    /// #918: a footnote's and an endnote's hidden run and comment markers go;
+    /// the separators stay byte for byte, the note keeps its id and its
+    /// reference mark, and the body's references are untouched.
+    #[test]
+    fn footnote_and_endnote_hidden_runs_are_removed_separators_untouched() {
+        let mut pkg = storied_docx();
+        let body_before = pkg.part_text("word/document.xml").unwrap();
+        let separators = |pkg: &Package, part: &str, element: &str| -> Vec<String> {
+            let xml = pkg.part_text(part).unwrap();
+            let mut out = Vec::new();
+            let mut from = 0;
+            while let Some((a, b, _)) = find_element_from(&xml, element, from) {
+                if xml[a..b].contains("w:type=") {
+                    out.push(xml[a..b].to_string());
+                }
+                from = b;
+            }
+            out
+        };
+        let notes = [
+            ("word/footnotes.xml", "w:footnote", "w:footnoteRef"),
+            ("word/endnotes.xml", "w:endnote", "w:endnoteRef"),
+        ];
+        let before: Vec<Vec<String>> = notes
+            .iter()
+            .map(|(part, element, _)| separators(&pkg, part, element))
+            .collect();
+        assert_eq!(stories(&pkg).remove_hidden_text(&mut pkg, None), 3);
+        assert_eq!(stories(&pkg).remove_comment_markers(&mut pkg), 9);
+        for ((part, element, mark), before) in notes.iter().zip(before) {
+            let xml = pkg.part_text(part).unwrap();
+            assert_eq!(before.len(), 2, "{xml}");
+            assert_eq!(separators(&pkg, part, element), before, "{xml}");
+            assert!(!xml.contains("w:vanish"), "{xml}");
+            assert!(!xml.contains("Quiet"), "{xml}");
+            assert_eq!(count_markers(&xml, None), 0, "{xml}");
+            assert!(xml.contains(&format!("<{element} w:id=\"1\">")), "{xml}");
+            assert!(xml.contains(&format!("<{mark}/>")), "{xml}");
+            assert!(xml.contains(" Note"), "{xml}");
+        }
+        assert_eq!(pkg.part_text("word/document.xml").unwrap(), body_before);
+        let notes = crate::notes::parse_notes(&pkg);
+        assert_eq!(notes.len(), 2);
+        assert!(notes.iter().all(|n| n.id == 1 && n.text.contains("Note")));
+    }
+
+    /// #918: a Remove All that finds nothing in a story leaves its part's
+    /// bytes alone: no re-serialization of what did not change.
+    #[test]
+    fn unchanged_story_parts_are_not_rewritten() {
+        let footer = format!("<w:ftr {W}>\n  <w:p><w:r><w:t>Foot</w:t></w:r></w:p>\n</w:ftr>");
+        let footnotes = format!(
+            "<w:footnotes {W}><w:footnote w:type=\"separator\" w:id=\"-1\"><w:p><w:r><w:separator/></w:r></w:p></w:footnote>\
+             <w:footnote w:id=\"1\"><w:p><w:r><w:footnoteRef/></w:r><w:r><w:t>Plain</w:t></w:r></w:p></w:footnote></w:footnotes>"
+        );
+        let mut pkg = docx(
+            &format!(
+                "<w:document {W}><w:body><w:p><w:r><w:rPr><w:vanish/></w:rPr><w:t>x</w:t></w:r></w:p>{SECT}</w:body></w:document>"
+            ),
+            &[
+                ("word/header1.xml", &marked_header()),
+                ("word/footer1.xml", &footer),
+                ("word/footnotes.xml", &footnotes),
+            ],
+        );
+        let bytes = |pkg: &Package| -> Vec<Vec<u8>> {
+            ["word/footer1.xml", "word/footnotes.xml"]
+                .iter()
+                .map(|p| pkg.part(p).unwrap().to_vec())
+                .collect()
+        };
+        let before = bytes(&pkg);
+        assert_eq!(stories(&pkg).remove_hidden_text(&mut pkg, None), 1);
+        assert_eq!(stories(&pkg).remove_comment_markers(&mut pkg), 3);
+        assert_eq!(bytes(&pkg), before);
+        // And with nothing left anywhere, the header is not rewritten either.
+        let header = pkg.part("word/header1.xml").unwrap().to_vec();
+        assert_eq!(stories(&pkg).remove_hidden_text(&mut pkg, None), 0);
+        assert_eq!(stories(&pkg).remove_comment_markers(&mut pkg), 0);
+        assert_eq!(pkg.part("word/header1.xml").unwrap(), header);
+    }
+
+    /// #918: with the document's styles, a run hidden by its character
+    /// style, its paragraph style (through `basedOn`) or the default
+    /// paragraph style counts and goes; a direct `w:vanish w:val="0"` keeps
+    /// a run over a hidden style. Without styles only direct `w:vanish` does.
+    #[test]
+    fn style_inherited_hidden_run_is_counted_and_removed() {
+        let styles = crate::styles::parse_styles_xml(
+            r#"<w:styles>
+            <w:style w:type="character" w:styleId="Secret"><w:rPr><w:vanish/></w:rPr></w:style>
+            <w:style w:type="paragraph" w:styleId="Hush"><w:rPr><w:vanish/></w:rPr></w:style>
+            <w:style w:type="paragraph" w:styleId="HushChild"><w:basedOn w:val="Hush"/></w:style>
+            <w:style w:type="paragraph" w:default="1" w:styleId="Normal"/>
+        </w:styles>"#,
+        );
+        let body = "<w:p><w:r><w:t>keep</w:t></w:r>\
+            <w:r><w:rPr><w:rStyle w:val=\"Secret\"/></w:rPr><w:t>char</w:t></w:r>\
+            <w:hyperlink w:anchor=\"x\"><w:r><w:rPr><w:rStyle w:val=\"Secret\"/></w:rPr><w:t>link</w:t></w:r></w:hyperlink></w:p>\
+            <w:p><w:pPr><w:pStyle w:val=\"HushChild\"/></w:pPr><w:r><w:t>para</w:t></w:r>\
+            <w:r><w:rPr><w:vanish w:val=\"0\"/></w:rPr><w:t>shown</w:t></w:r></w:p>";
+        let doc = parse(body);
+        assert_eq!(count_hidden_runs(&doc, None), 0);
+        assert_eq!(count_hidden_runs(&doc, Some(&styles)), 3);
+        let mut doc = doc;
+        assert_eq!(remove_hidden_text(&mut doc, Some(&styles)), 3);
+        let text: String = doc.body.iter().map(|b| b.plain_text()).collect();
+        assert_eq!(text, "keepshown");
+        assert_eq!(count_hidden_runs(&doc, Some(&styles)), 0);
+
+        // The default paragraph style hides a paragraph that names none, and
+        // a text box's paragraph is judged by its own style.
+        let normal = crate::styles::parse_styles_xml(
+            r#"<w:styles><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:rPr><w:vanish/></w:rPr></w:style>
+            <w:style w:type="paragraph" w:styleId="Shown"/></w:styles>"#,
+        );
+        let doc = parse(
+            "<w:p><w:r><w:t>a</w:t></w:r></w:p>\
+             <w:p><w:pPr><w:pStyle w:val=\"Shown\"/></w:pPr><w:r><w:t>b</w:t></w:r></w:p>",
+        );
+        assert_eq!(count_hidden_runs(&doc, Some(&normal)), 1);
+
+        // A text box anchored in a paragraph of the hidden default style:
+        // its "Shown" paragraph is visible, its unstyled one hidden, and the
+        // removal reaches both copies of the box.
+        let boxed = two_copy_text_box(
+            "<w:p><w:pPr><w:pStyle w:val=\"Shown\"/></w:pPr><w:r><w:t>boxed</w:t></w:r></w:p>\
+             <w:p><w:r><w:t>hush</w:t></w:r></w:p>",
+        );
+        let mut doc = parse(&boxed);
+        assert_eq!(count_hidden_runs(&doc, Some(&normal)), 1);
+        assert_eq!(remove_hidden_text(&mut doc, Some(&normal)), 1);
+        let xml = document_to_xml(&doc);
+        assert_eq!(xml.matches("boxed").count(), 2, "{xml}");
+        assert!(!xml.contains("hush"), "{xml}");
+        assert_eq!(count_hidden_runs(&doc, Some(&normal)), 0);
+    }
+
+    /// #918: a direct `w:vanish w:val="0"` over a hidden character style is
+    /// not hidden text, in the body or a header.
+    #[test]
+    fn direct_vanish_off_over_hidden_style_is_not_hidden() {
+        let styles = crate::styles::parse_styles_xml(
+            r#"<w:styles><w:style w:type="character" w:styleId="Secret"><w:rPr><w:vanish/></w:rPr></w:style></w:styles>"#,
+        );
+        let run = "<w:r><w:rPr><w:rStyle w:val=\"Secret\"/><w:vanish w:val=\"0\"/></w:rPr><w:t>on</w:t></w:r>";
+        let doc = parse(&format!("<w:p>{run}</w:p>"));
+        assert_eq!(count_hidden_runs(&doc, Some(&styles)), 0);
+        let header = format!("<w:hdr {W}><w:p>{run}</w:p></w:hdr>");
+        let mut pkg = docx(
+            &format!("<w:document {W}><w:body>{SECT}</w:body></w:document>"),
+            &[("word/header2.xml", &header)],
+        );
+        assert_eq!(stories(&pkg).count(&pkg, Some(&styles), None).hidden, 0);
+        assert_eq!(stories(&pkg).remove_hidden_text(&mut pkg, Some(&styles)), 0);
+        assert_eq!(pkg.part_text("word/header2.xml").unwrap(), header);
+    }
+
+    /// A hidden run in a header's field stays raw: counted as unremovable,
+    /// as in the body.
+    #[test]
+    fn header_hidden_run_in_raw_xml_is_counted_unremovable() {
+        let header = format!(
+            "<w:hdr {W}><w:p><w:fldSimple w:instr=\" PAGE \"><w:r><w:rPr><w:vanish/></w:rPr><w:t>1</w:t></w:r></w:fldSimple></w:p></w:hdr>"
+        );
+        let mut pkg = docx(
+            &format!("<w:document {W}><w:body>{SECT}</w:body></w:document>"),
+            &[("word/header1.xml", &header)],
+        );
+        let counts = stories(&pkg).count(&pkg, None, None);
+        assert_eq!((counts.hidden, counts.hidden_unremovable), (0, 1));
+        assert_eq!(stories(&pkg).remove_hidden_text(&mut pkg, None), 0);
+        assert_eq!(pkg.part_text("word/header1.xml").unwrap(), header);
+    }
+
+    /// #918 FIX r1 M1: a UTF-16 header keeps its encoding, its BOM and its
+    /// root start tag (namespaces, `mc:Ignorable`) when its hidden run goes.
+    #[test]
+    fn utf16_header_keeps_encoding_and_root_when_hidden_text_goes() {
+        let root = format!(
+            "<w:hdr {W} xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" \
+             xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\" mc:Ignorable=\"w14\">"
+        );
+        let header = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-16\" standalone=\"yes\"?>\n{root}\
+             <w:p w14:paraId=\"1A2B3C4D\"><w:r><w:t>Head</w:t></w:r>\
+             <w:r><w:rPr><w:vanish/></w:rPr><w:t>Hush</w:t></w:r></w:p></w:hdr>"
+        );
+        let utf16: Vec<u8> = [0xff, 0xfe]
+            .into_iter()
+            .chain(header.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        let document = format!("<w:document {W}><w:body>{SECT}</w:body></w:document>");
+        let parts = vec![
+            (
+                "[Content_Types].xml".to_string(),
+                br#"<?xml version="1.0"?><Types/>"#.to_vec(),
+            ),
+            (
+                "_rels/.rels".to_string(),
+                br#"<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="word/document.xml"/></Relationships>"#.to_vec(),
+            ),
+            ("word/document.xml".to_string(), document.into_bytes()),
+            ("word/header1.xml".to_string(), utf16),
+            (
+                "word/_rels/document.xml.rels".to_string(),
+                HF_RELS.as_bytes().to_vec(),
+            ),
+        ];
+        let mut pkg = load_package(&write_zip(&parts)).unwrap();
+        assert_eq!(stories(&pkg).count(&pkg, None, None).hidden, 1);
+        assert_eq!(stories(&pkg).remove_hidden_text(&mut pkg, None), 1);
+        let bytes = pkg.part("word/header1.xml").unwrap();
+        assert!(
+            bytes.starts_with(&[0xff, 0xfe, b'<', 0]),
+            "still UTF-16 LE with its BOM"
+        );
+        let xml = pkg.part_text("word/header1.xml").unwrap();
+        assert!(
+            xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-16\""),
+            "{xml}"
+        );
+        // Kept, with only the namespaces the editor's content may use added.
+        let kept = root.trim_end_matches('>');
+        assert!(xml.contains(kept), "root start tag kept: {xml}");
+        assert!(!xml.contains("w:vanish") && !xml.contains("Hush"), "{xml}");
+        assert!(xml.contains("Head"), "{xml}");
+    }
+
+    /// #918 FIX r1 m1: a header part no section references (kept in the
+    /// package for undo, dropped by the save) is not inspected or edited.
+    #[test]
+    fn unreferenced_header_is_not_a_story() {
+        let hidden = format!(
+            "<w:hdr {W}><w:p><w:r><w:rPr><w:vanish/></w:rPr><w:t>Gone</w:t></w:r>\
+             <w:commentRangeStart w:id=\"7\"/></w:p></w:hdr>"
+        );
+        let mut pkg = docx(
+            &format!("<w:document {W}><w:body>{SECT}</w:body></w:document>"),
+            &[("word/header9.xml", &hidden)],
+        );
+        assert!(stories(&pkg).part_names().is_empty());
+        assert_eq!(
+            stories(&pkg).count(&pkg, None, None),
+            StoryCounts::default()
+        );
+        assert!(stories(&pkg).comment_marker_ids(&pkg).is_empty());
+        assert_eq!(stories(&pkg).remove_hidden_text(&mut pkg, None), 0);
+        assert_eq!(stories(&pkg).remove_comment_markers(&mut pkg), 0);
+        assert_eq!(pkg.part_text("word/header9.xml").unwrap(), hidden);
+        // Referenced from a section break, it is one.
+        let sect = SECT.replace("rIdH2", "rIdH9");
+        let pkg = docx(
+            &format!(
+                "<w:document {W}><w:body><w:p><w:pPr>{sect}</w:pPr></w:p>{SECT}</w:body></w:document>"
+            ),
+            &[("word/header9.xml", &hidden)],
+        );
+        assert_eq!(stories(&pkg).part_names(), ["word/header9.xml"]);
+        assert_eq!(stories(&pkg).count(&pkg, None, None).hidden, 1);
     }
 }

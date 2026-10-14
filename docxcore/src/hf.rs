@@ -8,7 +8,11 @@
 //! `load::parse_sdt_block`), so the same shape serves ours and Word's: Remove
 //! Page Numbers finds either, and never touches a `PAGE` field typed by hand.
 
+use crate::load::{M_NS, R_NS, W_NS};
 use crate::model::{Block, Paragraph};
+
+/// The namespaces header/footer content the editor writes uses.
+const HF_NAMESPACES: [(&str, &str); 3] = [("w", W_NS), ("r", R_NS), ("m", M_NS)];
 
 /// Where a page-number design sits on its line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,6 +315,66 @@ pub fn remove_page_numbers(blocks: &mut Vec<Block>) -> bool {
         blocks.push(Block::Paragraph(Paragraph::default()));
     }
     removed
+}
+
+/// The start of an existing header/footer part up to and including its root
+/// start tag (the XML declaration, `<w:hdr …>` with every namespace and
+/// `mc:Ignorable` it declares), and the end tag that closes it. `None` when
+/// the part holds no such root.
+fn root_of(xml: &str, is_header: bool) -> Option<(String, String)> {
+    let tag = if is_header { "w:hdr" } else { "w:ftr" };
+    let open = format!("<{tag}");
+    let mut from = 0;
+    let start = loop {
+        let at = from + xml[from..].find(&open)?;
+        let after = &xml[at + open.len()..];
+        if after.starts_with([' ', '>', '/', '\t', '\r', '\n']) {
+            break at;
+        }
+        from = at + open.len();
+    };
+    let gt = start + xml[start..].find('>')?;
+    let close = format!("</{tag}>");
+    // `<w:hdr …/>`, an empty part, opens up.
+    let end = if xml[..gt].ends_with('/') { gt - 1 } else { gt };
+    // Declare any namespace the editor's content uses that the root lacks.
+    let mut head = xml[..end].to_string();
+    let root = &xml[start..end];
+    for (prefix, ns) in HF_NAMESPACES {
+        if !root.contains(&format!("xmlns:{prefix}=")) {
+            head.push_str(&format!(" xmlns:{prefix}=\"{ns}\""));
+        }
+    }
+    head.push('>');
+    Some((head, close))
+}
+
+/// Replace an existing header/footer part's content with `inner` (block XML),
+/// keeping the part's own root start tag, so the namespaces its drawings,
+/// VML and markup-compatibility content use stay declared, plus any of
+/// `w`/`r`/`m` it lacks (the editor's content may use them). The part is
+/// read and written in the encoding it has (UTF-16 stays UTF-16, a BOM
+/// stays). A part without a readable root gets a fresh one ([`part_xml`]),
+/// in UTF-8.
+pub fn rewrite_part(pkg: &mut crate::package::Package, part: &str, is_header: bool, inner: &str) {
+    let existing = pkg.part_text(part);
+    match existing.as_deref().and_then(|x| root_of(x, is_header)) {
+        Some((head, tail)) => {
+            pkg.set_part_text(part, &format!("{head}{inner}{tail}"));
+        }
+        None => {
+            pkg.set_part(part, part_xml(is_header, inner).into_bytes());
+        }
+    }
+}
+
+/// The header/footer XML a new part holds, around its block content.
+pub fn part_xml(is_header: bool, inner: &str) -> String {
+    let tag = if is_header { "w:hdr" } else { "w:ftr" };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <{tag} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\" xmlns:m=\"{M_NS}\">{inner}</{tag}>"
+    )
 }
 
 #[cfg(test)]

@@ -12,9 +12,9 @@ use crate::model::*;
 use crate::xml::{Event, XmlParser};
 use crate::zip::ZipArchive;
 
-const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-const M_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/math";
+pub(crate) const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+pub(crate) const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+pub(crate) const M_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/math";
 const MC_NS: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
 const W15_NS: &str = "http://schemas.microsoft.com/office/word/2012/wordml";
 
@@ -728,6 +728,23 @@ pub fn parse_header_footer(xml: &str, rels: &Relationships) -> Vec<Block> {
     loop {
         match p.next() {
             Event::Start if p.name() == "w:hdr" || p.name() == "w:ftr" => {
+                return parse_blocks_until_end(&mut p, rels);
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Vec::new()
+}
+
+/// The block content of one `w:footnote` or `w:endnote` element (its own XML,
+/// from its start tag to its end tag), with `rels` its notes part's
+/// relationships. Empty when `xml` holds no such element.
+pub fn parse_note_blocks(xml: &str, rels: &Relationships) -> Vec<Block> {
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start if p.name() == "w:footnote" || p.name() == "w:endnote" => {
                 return parse_blocks_until_end(&mut p, rels);
             }
             Event::Eof => break,
