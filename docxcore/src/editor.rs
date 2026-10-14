@@ -4481,16 +4481,18 @@ fn range_all_have_at(
                     return false;
                 }
             }
-            // Not a formatted character: a field keeps its own result formatting.
-            Inline::Field { .. } => *pos += inline_len(inline),
+            // Not a formatted character: a field keeps its own result
+            // formatting; an equation or an inline picture is one offset of
+            // its own (#1242).
+            Inline::Field { .. } | Inline::Equation { .. } | Inline::Raw(_) => {
+                *pos += inline_len(inline)
+            }
             Inline::SmartArt { .. }
             | Inline::Chart { .. }
-            | Inline::Equation { .. }
             | Inline::TextBox { .. }
             | Inline::Revision { .. }
             | Inline::UnsupportedRevision { .. }
-            | Inline::FootnoteRef { .. }
-            | Inline::Raw(_) => {} // zero-length
+            | Inline::FootnoteRef { .. } => {} // zero-length
         }
     }
     true

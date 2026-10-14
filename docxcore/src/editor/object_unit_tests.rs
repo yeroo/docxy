@@ -425,3 +425,29 @@ fn a_plain_text_cut_keeps_the_objects_its_text_cannot_carry_1242() {
     assert_eq!(ed.cut_text(), None);
     assert_eq!(etext(&ed), "ab\u{FFFC}cd");
 }
+
+/// FIX r1 M1: the text after an equation or a picture sits one offset
+/// later in a formatting toggle's check too, so Ctrl+B over bold text there
+/// unbolds it.
+#[test]
+fn a_toggle_after_an_object_reads_the_right_characters_1242() {
+    for object in [EQ, PIC] {
+        let mut ed = Editor::new(doc(&[format!(
+            "{}{object}<w:r><w:rPr><w:b/></w:rPr><w:t>cd</w:t></w:r>{}",
+            t("ab"),
+            t("ef")
+        )]));
+        // "cd", all bold.
+        select(&mut ed, vec![0], 3, 5);
+        ed.toggle_bold();
+        let bold: String = para(&ed, 0)
+            .content
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Run(r) if r.props.bold => Some(r.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bold, "", "{object}");
+    }
+}

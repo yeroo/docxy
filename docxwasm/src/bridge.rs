@@ -671,9 +671,10 @@ impl Session {
             // text, which a client can feed straight back to replace-range.
             // `start`/`end` count only editor-editable text (runs, tabs and
             // breaks, including those inside hyperlinks, and one offset per
-            // field), while `text` is `plain_text()`, which holds a field's
-            // whole result and also the text of zero-width inlines (tracked
-            // changes, footnote refs, equations, SmartArt, chart titles, text
+            // field, equation or inline picture), while `text` is
+            // `plain_text()`, which holds a field's whole result, an
+            // equation's text and also the text of zero-width inlines
+            // (tracked changes, footnote refs, SmartArt, chart titles, text
             // boxes, and tracked changes inside a hyperlink): when the
             // paragraph has any, `text[start..end]` need not be the match.
             if m.path.len() == 1 {
