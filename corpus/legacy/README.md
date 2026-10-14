@@ -70,6 +70,17 @@ test prints. There are eight, for three causes:
 So seven entries come from what Excel wrote, and one (the `.xlsb`
 structured references) from the reader not importing tables.
 
+## The `.xls` writer (#874)
+
+The Excel-made `.xls` files are also the oracle for gridcore's BIFF8 writer
+(`gridcore::legacy::write_xls`). `gridcore/tests/legacy.rs` writes each
+import back and imports it again (the same workbook, formatting included),
+checks each file's structure (`check_xls`), and checks that every formula
+gets the tokens Excel gave it, operand classes included. Excel itself opens
+the rewritten files in `scripts/check-xls-writer.ps1`, which compares their
+recalculated values with the originals'; it needs Excel, so it runs before
+a merge rather than in CI.
+
 ## Regenerating
 
 On Windows with Excel installed, from the repo root:
