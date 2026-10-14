@@ -123,7 +123,7 @@ enum Loss {
     Fonts,
 }
 
-fn plural(n: usize, one: &str, many: &str) -> String {
+pub(crate) fn plural(n: usize, one: &str, many: &str) -> String {
     if n == 1 {
         format!("1 {one}")
     } else {
@@ -1139,9 +1139,18 @@ fn sheet_records(
         let Some(f) = cell.formula.as_deref() else {
             continue;
         };
-        let range = array_ref(cell).filter(|&(r1, c1, r2, c2)| {
-            (r1, c1) == (r, c) && r2 >= r1 && c2 >= c1 && on_grid(r2, c2)
-        });
+        // A spilling formula covers its spill as it is now (its stored ref
+        // may be stale), as the .xlsx writer writes it; else the legacy
+        // array's own ref.
+        let spill = cell
+            .spill
+            .filter(|&ext| ext != (1, 1) && ext.0 > 0 && ext.1 > 0)
+            .map(|(h, w)| (r, c, r + h - 1, c + w - 1));
+        let range = spill
+            .or_else(|| array_ref(cell))
+            .filter(|&(r1, c1, r2, c2)| {
+                (r1, c1) == (r, c) && r2 >= r1 && c2 >= c1 && on_grid(r2, c2)
+            });
         let site = Site::Cell {
             sheet: index,
             row: r,
@@ -1182,7 +1191,22 @@ fn sheet_records(
             keys.iter().map(|k| k.1).max().unwrap_or(0) + 1,
         )
     };
-    rec(&mut out, 0x0055, &8u16.to_le_bytes()); // DEFCOLWIDTH
+    // DEFAULTROWHEIGHT, DEFCOLWIDTH and STANDARDWIDTH, from the sheet's
+    // own defaults when it has them.
+    let default_miy = s
+        .format
+        .default_row_height
+        .map(|h| (h * 20.0).round().clamp(1.0, 8192.0) as u16);
+    if let Some(miy) = default_miy {
+        // fUnsynced: a height other than the default font's 15 points.
+        rec(&mut out, 0x0225, &u16s(&[u16::from(miy != 300), miy]));
+    }
+    let base = s.format.base_col_width.clamp(0, 255) as u16;
+    rec(&mut out, 0x0055, &base.to_le_bytes());
+    if let Some(w) = s.format.default_col_width {
+        let w = (w * 256.0).round().clamp(0.0, 65535.0) as u16;
+        rec(&mut out, 0x0099, &w.to_le_bytes());
+    }
     for d in &s.col_defs {
         if d.min as i64 > ptg_write::MAX_COL {
             continue;
@@ -1222,7 +1246,9 @@ fn sheet_records(
             let (lo, hi) = rows[&r];
             let lo = if lo == u16::MAX { 0 } else { lo };
             let height = s.row_height(r);
-            let miy = height.map_or(300, |h| (h * 20.0).round().clamp(0.0, 8192.0) as u16);
+            let miy = height.map_or(default_miy.unwrap_or(300), |h| {
+                (h * 20.0).round().clamp(0.0, 8192.0) as u16
+            });
             let mut flags: u16 = 0x0100;
             if s.row_hidden(r) {
                 flags |= 0x0020;
@@ -1246,8 +1272,9 @@ fn sheet_records(
                 let value = cell.map_or(&CellValue::Empty, |x| &x.value);
                 let mut rgce = vec![0x01];
                 rgce.extend_from_slice(&u16s(&[anchor.0 as u16, anchor.1 as u16]));
-                formula_rec(&mut out, &head, value, &rgce, &[], false);
-                if anchor == (r, c) {
+                // The anchor's ARRAY goes right after its FORMULA, before
+                // the STRING of a text result.
+                let array = (anchor == (r, c)).then(|| {
                     let (range, tokens) = &arrays[&anchor];
                     let mut b = u16s(&[range.0 as u16, range.2 as u16]);
                     b.push(range.1 as u8);
@@ -1257,8 +1284,9 @@ fn sheet_records(
                     b.extend_from_slice(&(tokens.rgce.len() as u16).to_le_bytes());
                     b.extend_from_slice(&tokens.rgce);
                     b.extend_from_slice(&tokens.extra);
-                    rec(&mut out, 0x0221, &b);
-                }
+                    b
+                });
+                formula_rec(&mut out, &head, value, &rgce, &[], false, array.as_deref());
                 continue;
             }
             let Some(cell) = cell else {
@@ -1273,6 +1301,7 @@ fn sheet_records(
                     &tokens.rgce,
                     &tokens.extra,
                     volatile,
+                    None,
                 );
                 continue;
             }
@@ -1368,6 +1397,7 @@ fn sheet_records(
 
 /// A FORMULA record (and a STRING after it for a text result): `head` is
 /// row, column and XF.
+#[allow(clippy::too_many_arguments)]
 fn formula_rec(
     out: &mut Vec<u8>,
     head: &[u8],
@@ -1375,6 +1405,7 @@ fn formula_rec(
     rgce: &[u8],
     extra: &[u8],
     always: bool,
+    array: Option<&[u8]>,
 ) {
     let mut b = head.to_vec();
     let mut text: Option<&str> = None;
@@ -1398,6 +1429,9 @@ fn formula_rec(
     b.extend_from_slice(rgce);
     b.extend_from_slice(extra);
     rec_split(out, 0x0006, &b);
+    if let Some(a) = array {
+        rec(out, 0x0221, a);
+    }
     if let Some(t) = text {
         let units: Vec<u16> = t.encode_utf16().take(MAX_TEXT).collect();
         let mut head = (units.len() as u16).to_le_bytes().to_vec();
@@ -1513,6 +1547,31 @@ pub fn check_xls(file: &[u8]) -> Result<(), String> {
     }
     if depth != 0 || subs.is_empty() {
         return Err("BOF/EOF unbalanced".into());
+    }
+    // A STRING (a formula's text result) follows its FORMULA, directly or
+    // after the FORMULA's ARRAY, SHRFMLA or TABLE (and CONTINUEs).
+    for (i, &(at, ty, _)) in recs.iter().enumerate() {
+        if ty != 0x0207 {
+            continue;
+        }
+        let before = recs[..i]
+            .iter()
+            .rev()
+            .map(|r| r.1)
+            .find(|&t| !matches!(t, CONTINUE | 0x0221 | 0x04BC | 0x0236));
+        if before != Some(0x0006) {
+            return Err(format!(
+                "{at}: STRING after {before:#06x?}, not its FORMULA"
+            ));
+        }
+    }
+    // An ARRAY directly follows its anchor's FORMULA.
+    for (i, &(at, ty, _)) in recs.iter().enumerate() {
+        if ty == 0x0221
+            && recs[..i].iter().rev().map(|r| r.1).find(|&t| t != CONTINUE) != Some(0x0006)
+        {
+            return Err(format!("{at}: ARRAY not after its FORMULA"));
+        }
     }
     // CONTINUE only after a record that may continue.
     for w in recs.windows(2) {
@@ -2016,6 +2075,117 @@ mod tests {
         let (back, lost) = round(&pkg);
         assert_eq!(lost, ["1 defined name Excel 97-2003 cannot hold"]);
         assert!(back.workbook.defined_names.is_empty());
+    }
+
+    /// A spilling formula is written over its spill as it is now, whatever
+    /// its stored `ref` says: larger or smaller, the range reads back as the
+    /// spill, and a cell past it keeps its own value.
+    #[test]
+    fn dynamic_arrays_are_written_over_their_spill() {
+        for stale in [None, Some("A1:A5"), Some("A1")] {
+            let mut anchor = formula("_xlfn.SEQUENCE(3)", CellValue::Number(1.0));
+            anchor.spill = Some((3, 1));
+            anchor.f_attrs = stale.map(|r| format!(" t=\"array\" ref=\"{r}\""));
+            let pkg = book(&[
+                (0, 0, anchor),
+                (1, 0, Cell::number(2.0)),
+                (2, 0, Cell::number(3.0)),
+                (4, 0, Cell::number(9.0)),
+            ]);
+            let (back, lost) = round(&pkg);
+            assert!(lost.is_empty(), "{lost:?}");
+            let cells = &back.workbook.sheets[0].cells;
+            assert_eq!(
+                cells[&(0, 0)].formula.as_deref(),
+                Some("_xlfn.SEQUENCE(3)"),
+                "{stale:?}"
+            );
+            assert_eq!(cells[&(0, 0)].spill, Some((3, 1)), "{stale:?}");
+            assert_eq!(cells[&(2, 0)].value, CellValue::Number(3.0));
+            assert_eq!(cells[&(4, 0)].value, CellValue::Number(9.0));
+            assert_eq!(cells[&(4, 0)].formula, None);
+        }
+    }
+
+    /// SORT and FILTER's hidden names are spelled `_xlfn._xlws.`, as Excel
+    /// stores them, and read back as SORT and FILTER.
+    #[test]
+    fn sort_and_filter_names_carry_xlws() {
+        let pkg = book(&[
+            (
+                0,
+                1,
+                formula("_xlfn._xlws.SORT(A1:A3)", CellValue::Number(1.0)),
+            ),
+            (
+                0,
+                2,
+                formula("_xlfn._xlws.FILTER(A1:A3,A1:A3>1)", CellValue::Number(2.0)),
+            ),
+        ]);
+        let out = write_xls(&pkg);
+        let cfb = opccore::cfb::Cfb::open(&out.bytes).unwrap();
+        let s = cfb.read_stream("Workbook").unwrap();
+        let text = String::from_utf8_lossy(&s);
+        assert!(text.contains("_xlfn._xlws.SORT") && text.contains("_xlfn._xlws.FILTER"));
+        let (back, _) = round(&pkg);
+        let cells = &back.workbook.sheets[0].cells;
+        assert_eq!(
+            cells[&(0, 1)].formula.as_deref(),
+            Some("_xlfn._xlws.SORT(A1:A3)")
+        );
+        assert_eq!(
+            cells[&(0, 2)].formula.as_deref(),
+            Some("_xlfn._xlws.FILTER(A1:A3,A1:A3>1)")
+        );
+    }
+
+    /// A text-valued legacy array: FORMULA, then ARRAY, then STRING, and
+    /// the check refuses another order.
+    #[test]
+    fn a_text_array_anchor_writes_array_before_string() {
+        let mut anchor = formula("A1:A2&\"!\"", CellValue::Text("a!".into()));
+        anchor.f_attrs = Some(" t=\"array\" ref=\"B1:B2\"".into());
+        let pkg = book(&[
+            (0, 0, Cell::text("a")),
+            (1, 0, Cell::text("b")),
+            (0, 1, anchor),
+            (1, 1, Cell::text("b!")),
+        ]);
+        let (back, _) = round(&pkg);
+        let cells = &back.workbook.sheets[0].cells;
+        assert_eq!(cells[&(0, 1)].value, CellValue::Text("a!".into()));
+        assert_eq!(cells[&(0, 1)].spill, Some((2, 1)));
+        // Swap the anchor's ARRAY and STRING: refused.
+        let out = write_xls(&pkg).bytes;
+        let cfb = opccore::cfb::Cfb::open(&out).unwrap();
+        let mut s = cfb.read_stream("Workbook").unwrap();
+        let a = find(&s, 0x0221);
+        let alen = 4 + u16::from_le_bytes([s[a + 2], s[a + 3]]) as usize;
+        let st = a + alen;
+        assert_eq!(u16::from_le_bytes([s[st], s[st + 1]]), 0x0207);
+        let slen = 4 + u16::from_le_bytes([s[st + 2], s[st + 3]]) as usize;
+        let array: Vec<u8> = s[a..st].to_vec();
+        let string: Vec<u8> = s[st..st + slen].to_vec();
+        s.splice(a..st + slen, string.into_iter().chain(array));
+        let bad = opccore::cfb::write_cfb(&[("Workbook", s)]);
+        assert!(check_xls(&bad).unwrap_err().contains("ARRAY"));
+    }
+
+    /// A sheet's default row height and column widths round-trip.
+    #[test]
+    fn default_row_height_and_column_widths_round_trip() {
+        let mut pkg = book(&[(0, 0, Cell::number(1.0))]);
+        let f = &mut pkg.workbook.sheets[0].format;
+        f.default_row_height = Some(18.0);
+        f.base_col_width = 10;
+        f.default_col_width = Some(12.5);
+        let (back, _) = round(&pkg);
+        let f = &back.workbook.sheets[0].format;
+        assert_eq!(
+            (f.default_row_height, f.base_col_width, f.default_col_width),
+            (Some(18.0), 10, Some(12.5))
+        );
     }
 
     /// Iterative calculation round-trips; off stays off.

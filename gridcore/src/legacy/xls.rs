@@ -551,6 +551,10 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
                 0x0012 if c.u16()? != 0 => {
                     book.dropped.insert("workbook protection");
                 }
+                // PRECISION 0: Set precision as displayed.
+                0x000E if c.u16()? == 0 => {
+                    book.dropped.insert("precision as displayed");
+                }
                 // SUPBOOK: the book takes its place before the rest is
                 // read, so a record cut short doesn't shift the books after
                 // it.
@@ -985,11 +989,30 @@ fn read_sheet(
                 0x023E => {
                     let grbit = c.u16()?;
                     frozen = grbit & 0x0008 != 0;
-                    // Gridlines hidden: a view setting the model lacks.
-                    if grbit & 0x0002 == 0 {
+                    // View settings the model lacks: formulas shown,
+                    // gridlines, headings or zeros hidden, right to left.
+                    if grbit & 0x0001 != 0 || grbit & 0x0016 != 0x0016 || grbit & 0x0040 != 0 {
                         book.dropped.insert("sheet view settings");
                     }
                 }
+                // CALCMODE: manual (0), or automatic except data tables (-1).
+                0x000D => match c.u16()? {
+                    0 => {
+                        book.dropped.insert("manual calculation");
+                    }
+                    0xFFFF => {
+                        book.dropped
+                            .insert("automatic calculation except data tables");
+                    }
+                    _ => {}
+                },
+                // DEFAULTROWHEIGHT, DEFCOLWIDTH, STANDARDWIDTH.
+                0x0225 => {
+                    c.u16()?;
+                    sheet.default_row_height = Some(c.u16()? as f64 / 20.0);
+                }
+                0x0055 => sheet.base_col_width = Some(c.u16()? as u32),
+                0x0099 => sheet.default_col_width = Some(c.u16()? as f64 / 256.0),
                 // SCL: a zoom other than 100%.
                 0x00A0 if c.u16()? != c.u16()? => {
                     book.dropped.insert("sheet view settings");
@@ -1696,13 +1719,23 @@ pub(crate) mod tests {
             (rec(0x01AD, &[0; 4]), "external data ranges"),
             (rec(0x002B, &[1, 0]), "page setup"),
             (rec(0x0083, &[1, 0]), "page setup"),
+            (rec(0x000D, &[0, 0]), "manual calculation"),
+            (w2(0x06B7), "sheet view settings"),
+            (w2(0x06A6), "sheet view settings"),
+            (w2(0x06B2), "sheet view settings"),
+            (w2(0x06F6), "sheet view settings"),
         ];
         for (r, want) in cases {
             let book = read(&workbook(&[], &[r])).unwrap();
             assert_eq!(book.dropped.iter().copied().collect::<Vec<_>>(), [want]);
         }
         // Excel's defaults are no loss.
-        let plain = [w2(0x06B6), rec(0x00A0, &[1, 0, 1, 0]), rec(0x002B, &[0, 0])];
+        let plain = [
+            w2(0x06B6),
+            rec(0x00A0, &[1, 0, 1, 0]),
+            rec(0x002B, &[0, 0]),
+            rec(0x000D, &[1, 0]),
+        ];
         assert!(read(&workbook(&[], &plain)).unwrap().dropped.is_empty());
         // SETUP's draft bit, with printer settings.
         let mut setup = vec![0u8; 34];
@@ -1718,6 +1751,18 @@ pub(crate) mod tests {
         setup[10] = 0x02;
         assert!(
             read(&workbook(&[], &[rec(0x00A1, &setup)]))
+                .unwrap()
+                .dropped
+                .is_empty()
+        );
+        // Precision as displayed (globals' PRECISION 0).
+        let book = read(&workbook(&[rec(0x000E, &[0, 0])], &[])).unwrap();
+        assert_eq!(
+            book.dropped.iter().copied().collect::<Vec<_>>(),
+            ["precision as displayed"]
+        );
+        assert!(
+            read(&workbook(&[rec(0x000E, &[1, 0])], &[]))
                 .unwrap()
                 .dropped
                 .is_empty()

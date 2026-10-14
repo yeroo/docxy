@@ -177,13 +177,7 @@ pub fn open_workbook_ex(data: &[u8]) -> Result<Opened, OpenError> {
         let mut dropped: Vec<String> = book.dropped.iter().map(|d| d.to_string()).collect();
         let (formulas, names) = (book.unread_formulas, book.unread_names);
         let (pkg, more_formulas, more_names) = book.build_counted();
-        let plural = |n: usize, one: &str, many: &str| {
-            if n == 1 {
-                format!("1 {one}")
-            } else {
-                format!("{n} {many}")
-            }
-        };
+        let plural = xls_write::plural;
         if formulas + more_formulas > 0 {
             dropped.push(plural(
                 formulas + more_formulas,
@@ -269,6 +263,11 @@ pub(crate) struct SheetIn {
     /// Frozen rows and columns.
     pub freeze: (u32, u32),
     pub hidden: bool,
+    /// The sheet's default row height (points), base column width
+    /// (characters) and default column width, when the file gives them.
+    pub default_row_height: Option<f64>,
+    pub base_col_width: Option<u32>,
+    pub default_col_width: Option<f64>,
 }
 
 /// Another workbook or add-in whose names formulas call, as `[k]!NAME`
@@ -487,6 +486,11 @@ impl BookIn {
             }
             s.freeze = sheet.freeze;
             s.hidden = sheet.hidden;
+            s.format.default_row_height = sheet.default_row_height;
+            if let Some(b) = sheet.base_col_width {
+                s.format.base_col_width = b;
+            }
+            s.format.default_col_width = sheet.default_col_width;
         }
         pkg.workbook.active_tab = self.active.min(pkg.workbook.sheets.len() - 1);
         for mut name in self.names {

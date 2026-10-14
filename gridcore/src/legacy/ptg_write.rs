@@ -729,6 +729,9 @@ impl Compiler<'_> {
         }
         // A named function: its name token first, then the arguments, then
         // ptgFuncVar 255 counting the name as one.
+        if args.len() + 1 > MAX_ARGS {
+            return Err(Why::TooLong);
+        }
         let atp = (384..=476u16).any(|i| ftab::lookup(i).is_some_and(|(n, _)| n == bare));
         let (book, ext) = if atp {
             (Some(Book::AddIn), bare.to_string())
@@ -755,8 +758,10 @@ impl Compiler<'_> {
                 self.args(args, "+R", cls)?;
             }
             None => {
+                // SORT and FILTER are `_xlfn._xlws.`, as a file spells them.
                 let stored = if is_new_function(bare) {
-                    format!("_xlfn.{bare}")
+                    let prefix = crate::formula::future_prefix(bare).unwrap_or("_xlfn.");
+                    format!("{prefix}{bare}")
                 } else {
                     bare.to_string()
                 };
@@ -1044,6 +1049,10 @@ pub(crate) mod tests {
         assert_eq!(round("_xll.FOO(A1)").unwrap(), "_xll.FOO(A1)");
         assert_eq!(round("_xlfn.LAMBDA(_xlpm.x,_xlpm.x)(1)"), Err(Why::Lambda));
         assert_eq!(round("_xlfn.LET(_xlpm.x,1,_xlpm.x)"), Err(Why::Lambda));
+        // A named function counts its name as an argument: 127 at most.
+        let args = |n: usize| vec!["1"; n].join(",");
+        assert!(round(&format!("MYUDF({})", args(126))).is_ok());
+        assert_eq!(round(&format!("MYUDF({})", args(127))), Err(Why::TooLong));
         // An array constant too big for one record.
         let row = vec!["\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""; 30].join(",");
         let big = format!("{{{}}}", vec![row; 10].join(";"));
