@@ -38,6 +38,30 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub use xls_write::{XlsOut, check_xls, write_xls};
 
+/// The colour of BIFF palette index `icv` under `palette` (the file's
+/// PALETTE, or the default one); `None` for the automatic and system
+/// colours.
+pub(crate) fn icv_rgb(icv: u32, palette: &[(u8, u8, u8); 56]) -> Option<(u8, u8, u8)> {
+    match icv {
+        0..=7 => Some(xls::FIXED_COLORS[icv as usize]),
+        8..=63 => Some(palette[icv as usize - 8]),
+        _ => None,
+    }
+}
+
+/// [`icv_rgb`] under the default palette (an `.xlsx`'s `indexed` colour).
+pub(crate) fn default_icv_rgb(icv: u32) -> Option<(u8, u8, u8)> {
+    icv_rgb(icv, &xls_write::DEFAULT_PALETTE)
+}
+
+/// Whether a thin-box side drawn in `rgb` (`None`: automatic) keeps its
+/// colour in the model's `border`, which an `.xls` writes in black: the
+/// one rule for the `.xls` import and for Save As `.xls` from an `.xlsx`.
+/// A box in another colour is still a box, but its colour is lost.
+pub(crate) fn plain_border_color(rgb: Option<(u8, u8, u8)>) -> bool {
+    rgb.is_none_or(|c| c == (0, 0, 0))
+}
+
 use crate::sheet::{Cell, DefinedName, Xf};
 use crate::xlsx::{SheetPackage, XlsxError, load_xlsx};
 

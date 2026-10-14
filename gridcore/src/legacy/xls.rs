@@ -292,7 +292,7 @@ struct FontIn {
 }
 
 /// The colours of indices 0-7, which no palette changes.
-const FIXED_COLORS: [(u8, u8, u8); 8] = [
+pub(super) const FIXED_COLORS: [(u8, u8, u8); 8] = [
     (0, 0, 0),
     (0xFF, 0xFF, 0xFF),
     (0xFF, 0, 0),
@@ -319,11 +319,7 @@ impl Styles {
     /// The colour of palette index `icv`; `None` for the automatic and
     /// system colours.
     fn rgb(&self, icv: u16) -> Option<(u8, u8, u8)> {
-        match icv {
-            0..=7 => Some(FIXED_COLORS[icv as usize]),
-            8..=63 => Some(self.palette[icv as usize - 8]),
-            _ => None,
-        }
+        super::icv_rgb(icv as u32, &self.palette)
     }
 
     /// The `book.xfs` index of XF `ixfe`, made the first time a cell uses
@@ -407,6 +403,19 @@ impl Styles {
         let diagonal = dg >> 30 != 0 && (more >> 21) & 0xF != 0;
         if sides == [1; 4] {
             xf.border = true;
+            // Its sides' colours: left, right, top, bottom.
+            let icvs = [
+                (dg >> 16) & 0x7F,
+                (dg >> 23) & 0x7F,
+                more & 0x7F,
+                (more >> 7) & 0x7F,
+            ];
+            if !icvs
+                .iter()
+                .all(|&icv| super::plain_border_color(self.rgb(icv as u16)))
+            {
+                dropped.insert("borders other than a thin box");
+            }
         } else if sides != [0; 4] {
             dropped.insert("borders other than a thin box");
         }
@@ -976,10 +985,10 @@ fn read_sheet(
                     // clear), unless it is the sheet's default: its
                     // STANDARDWIDTH, or else DEFCOLWIDTH's characters plus
                     // the padding (Excel writes 8 characters as 2194).
-                    let base = sheet.base_col_width.unwrap_or(8).min(255) as u16 * 256;
+                    let base = sheet.base_col_width.unwrap_or(8).min(255) * 256;
                     let default = match sheet.default_col_width {
                         Some(w) => (coldx as f64 - w * 256.0).abs() < 1.0,
-                        None => (base..base + 256).contains(&coldx),
+                        None => (base..base + 256).contains(&(coldx as u32)),
                     };
                     let width = (grbit & 0x0002 != 0 || !default).then_some(coldx as f64 / 256.0);
                     if ixfe != 15 {
@@ -1691,6 +1700,47 @@ pub(crate) mod tests {
                 "vertical alignment"
             ]
         );
+    }
+
+    /// A thin box is the model's border in any colour, but a colour other
+    /// than black or automatic is named lost (#874 r9).
+    #[test]
+    fn a_coloured_thin_box_keeps_the_border_and_names_its_colour() {
+        let boxed = |left: u32, right: u32, top: u32, bottom: u32| {
+            let globals = vec![
+                font_rec(400, 0, 0),
+                xf_rec(0, 0x20, 0, 0),
+                xf_rec(
+                    0,
+                    0x20,
+                    0x1111 | left << 16 | right << 23,
+                    top | bottom << 7,
+                ),
+            ];
+            let mut d = cell(0, 0, 1);
+            d.extend(1.0f64.to_le_bytes());
+            let book = read(&workbook(&globals, &[rec(0x0203, &d)])).unwrap();
+            let border = book.xfs[data(&book)[&(0, 0)].style as usize].border;
+            (border, book.dropped.iter().copied().collect::<Vec<_>>())
+        };
+        // Black (palette 8 and fixed 0) and automatic (0x40) sides.
+        assert_eq!(boxed(8, 0, 0x40, 0x7F), (true, vec![]));
+        // A red side (palette 10).
+        assert_eq!(
+            boxed(8, 8, 10, 8),
+            (true, vec!["borders other than a thin box"])
+        );
+    }
+
+    /// DEFCOLWIDTH 255 makes the default band end past u16 (#874 r9).
+    #[test]
+    fn the_widest_defcolwidth_reads() {
+        let mut b = Vec::new();
+        for v in [0u16, 0, 65300, 15, 0, 0] {
+            b.extend(v.to_le_bytes());
+        }
+        let book = read(&workbook(&[], &[rec(0x0055, &[255, 0]), rec(0x007D, &b)])).unwrap();
+        assert!(book.sheets[0].cols.is_empty());
     }
 
     /// Margins are page setup the import leaves out: Excel's Normal ones
