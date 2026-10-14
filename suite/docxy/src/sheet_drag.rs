@@ -104,6 +104,7 @@ impl SheetView {
                 let clip = self.grid_clip(true).map_err(str::to_string)?;
                 self.anchor = at;
                 self.sel = at;
+                // A drag stays on its sheet, which holds the rules it had.
                 self.paste_move(&clip, DRAG_AND_DROP).map_err(refused)?;
             }
             DropChoice::Copy => {

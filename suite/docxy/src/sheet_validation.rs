@@ -1281,8 +1281,29 @@ mod tests {
         assert!(v.circles.is_empty());
     }
 
+    // ---- #1050 ----
+
+    /// The formula the rule covering `cell` of `sheet` checks there.
+    fn seen(t: &mut DocTab, sheet: usize, cell: &str) -> Option<String> {
+        let (r, c) = at(cell);
+        let s = &view(t).pkg.workbook.sheets[sheet];
+        gridcore::validation::validation_at(s, r, c)
+            .map(|dv| gridcore::validation::as_seen_from(dv, r, c).formula1)
+    }
+
+    /// Every sheet's rules and removed elements: what undo must restore.
+    fn all_rules(t: &mut DocTab) -> Vec<(Vec<DataValidation>, Vec<usize>)> {
+        view(t)
+            .pkg
+            .workbook
+            .sheets
+            .iter()
+            .map(|s| (s.validations.clone(), s.dv_removed.clone()))
+            .collect()
+    }
+
     #[test]
-    fn a_cut_leaves_validation_where_it_is() {
+    fn a_cut_moves_the_rule_with_its_cells_and_undo_puts_it_back() {
         let mut t = cut_rule_book("B2>A2");
         // A rule of its own on the destination cells.
         view(&mut t).pkg.workbook.sheets[0]
@@ -1296,19 +1317,114 @@ mod tests {
                 show_error: true,
                 ..Default::default()
             });
-        let before = view(&mut t).sheet().validations.clone();
+        let before = all_rules(&mut t);
         cut_range(&mut t, ("A5", "B5"), "D5", 0);
-        assert_eq!(
-            view(&mut t).sheet().validations,
-            before,
-            "no rule moved, cleared or changed"
-        );
-        // A typed entry at the source is still checked by the rule that stayed.
-        assert!(refused(&mut t, 0, "B5", "-1"));
-        // The destination's own rule still applies there.
-        assert!(refused(&mut t, 0, "E5", "50"));
-        // One undo leaves them as they were.
+        let after = all_rules(&mut t);
+        assert_eq!(seen(&mut t, 0, "E5").as_deref(), Some("E5>D5"));
+        assert_eq!(seen(&mut t, 0, "B4").as_deref(), Some("B4>A4"));
+        assert_eq!(seen(&mut t, 0, "B6").as_deref(), Some("B6>A6"));
+        assert_eq!(seen(&mut t, 0, "B5"), None);
+        // D5 took A5's cell, which had no rule: the old one is gone.
+        assert_eq!(seen(&mut t, 0, "D5"), None);
+        // E5 is checked against the 3 that moved to D5.
+        assert!(refused(&mut t, 0, "E5", "1"));
+        assert!(!refused(&mut t, 0, "E5", "4"));
         assert!(view(&mut t).undo_step());
-        assert_eq!(view(&mut t).sheet().validations, before);
+        assert_eq!(all_rules(&mut t), before);
+        assert!(view(&mut t).redo_step());
+        assert_eq!(all_rules(&mut t), after);
+    }
+
+    #[test]
+    fn a_cut_of_the_anchor_cell_leaves_the_rest_checking_their_own_cells() {
+        let mut t = cut_rule_book("B2>0");
+        cut_range(&mut t, ("B2", "B2"), "D2", 0);
+        assert_eq!(seen(&mut t, 0, "D2").as_deref(), Some("D2>0"));
+        assert_eq!(seen(&mut t, 0, "B3").as_deref(), Some("B3>0"));
+        assert!(refused(&mut t, 0, "B3", "-1"));
+        assert!(!refused(&mut t, 0, "B3", "1"));
+    }
+
+    /// A list rule on Sheet1!B1:B5 reading `Choices` (scoped to Sheet1, on
+    /// Sheet1!A1:A3), Sheet2, and a Sheet3 rule reading Sheet1!B1:B5.
+    fn named_cut_book() -> DocTab {
+        let mut t = tab();
+        let v = view(&mut t);
+        v.pkg.add_sheet("Sheet2");
+        v.pkg.add_sheet("Sheet3");
+        let wb = &mut v.pkg.workbook;
+        for (r, item) in ["Red", "Green", "Blue"].iter().enumerate() {
+            wb.sheets[0].cells.insert((r as u32, 0), Cell::text(item));
+        }
+        wb.defined_names.push(gridcore::sheet::DefinedName {
+            name: "Choices".into(),
+            scope: Some(0),
+            formula: "Sheet1!$A$1:$A$3".into(),
+        });
+        wb.sheets[0].validations.push(DataValidation {
+            ranges: vec![(0, 1, 4, 1)], // B1:B5
+            kind: "list".into(),
+            formula1: "Choices".into(),
+            show_dropdown: true,
+            show_error: true,
+            ..Default::default()
+        });
+        let first = wb.sheets[0].name.clone();
+        wb.sheets[2].validations.push(DataValidation {
+            ranges: vec![(0, 0, 4, 0)], // A1:A5
+            kind: "custom".into(),
+            formula1: format!("{first}!B1<>\"\""),
+            show_error: true,
+            ..Default::default()
+        });
+        t
+    }
+
+    fn labels(t: &mut DocTab, sheet: usize, cell: &str) -> Vec<String> {
+        let (r, c) = at(cell);
+        gridcore::validation::list_choices(&view(t).pkg.workbook, sheet, r, c, None)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| c.label)
+            .collect()
+    }
+
+    #[test]
+    fn a_cut_to_another_sheet_keeps_a_named_list_and_a_third_sheets_rule_follows() {
+        let mut t = named_cut_book();
+        let before = all_rules(&mut t);
+        cut_range(&mut t, ("B2", "B3"), "C2", 1);
+        let after = all_rules(&mut t);
+        assert_eq!(labels(&mut t, 1, "C2"), ["Red", "Green", "Blue"]);
+        assert_eq!(labels(&mut t, 1, "C3"), ["Red", "Green", "Blue"]);
+        assert_eq!(seen(&mut t, 0, "B2"), None);
+        assert_eq!(seen(&mut t, 0, "B4").as_deref(), Some("Choices"));
+        let first = view(&mut t).pkg.workbook.sheets[0].name.clone();
+        assert_eq!(seen(&mut t, 2, "A1"), Some(format!("{first}!B1<>\"\"")));
+        assert_eq!(seen(&mut t, 2, "A2").as_deref(), Some("Sheet2!C2<>\"\""));
+        assert_eq!(seen(&mut t, 2, "A3").as_deref(), Some("Sheet2!C3<>\"\""));
+        assert_eq!(seen(&mut t, 2, "A4"), Some(format!("{first}!B4<>\"\"")));
+        assert!(view(&mut t).undo_step());
+        assert_eq!(all_rules(&mut t), before);
+        assert!(view(&mut t).redo_step());
+        assert_eq!(all_rules(&mut t), after);
+    }
+
+    #[test]
+    fn rules_moved_by_a_cut_survive_a_save() {
+        let mut t = named_cut_book();
+        cut_range(&mut t, ("B2", "B3"), "C2", 1);
+        let saved = gridcore::xlsx::save_xlsx(&view(&mut t).pkg);
+        let re = gridcore::xlsx::load_xlsx(&saved).unwrap();
+        let wb = &re.workbook;
+        let rule = |s: usize, cell: &str| {
+            let (r, c) = at(cell);
+            gridcore::validation::validation_at(&wb.sheets[s], r, c)
+                .map(|dv| gridcore::validation::as_seen_from(dv, r, c).formula1)
+        };
+        assert_eq!(rule(1, "C2").as_deref(), Some("Sheet1!$A$1:$A$3"));
+        assert_eq!(rule(0, "B2"), None);
+        assert_eq!(rule(0, "B5").as_deref(), Some("Choices"));
+        assert_eq!(rule(2, "A3").as_deref(), Some("Sheet2!C3<>\"\""));
     }
 }
