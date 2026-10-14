@@ -17,3 +17,162 @@ test doc doc-paste-special: matches the catalogue
   assert dialog is doc-paste-special
   call dialog-catalog-check {}
   call real-key {"key":"escape"}
+
+test doc edit-field: matches the catalogue
+  open copy:../fixtures/fields.docx
+  key ctrl+home
+  key shift+f9
+  assert dialog is edit-field
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc edit-field/code: focus by click
+  open copy:../fixtures/fields.docx
+  key ctrl+home
+  key shift+f9
+  assert dialog is edit-field
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"code"}
+  call field-read {"dialog-field":"code"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc edit-field/code: focus by Tab
+  open copy:../fixtures/fields.docx
+  key ctrl+home
+  key shift+f9
+  assert dialog is edit-field
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"code"}
+  call field-read {"dialog-field":"code"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc edit-field/code: types
+  open copy:../fixtures/fields.docx
+  key ctrl+home
+  key shift+f9
+  assert dialog is edit-field
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"code"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"dialog-field":"code"}
+  assert reply.value is "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test doc edit-field/code: edits
+  open copy:../fixtures/fields.docx
+  key ctrl+home
+  key shift+f9
+  assert dialog is edit-field
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"code"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"code"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"code"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"code"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"code"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"code"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc edit-field/code: select-all replaces
+  open copy:../fixtures/fields.docx
+  key ctrl+home
+  key shift+f9
+  assert dialog is edit-field
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"code"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"code"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"code"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc edit-field/code: pastes
+  open copy:../fixtures/fields.docx
+  key ctrl+home
+  key shift+f9
+  assert dialog is edit-field
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"code"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"code"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc edit-field/code: copies
+  open copy:../fixtures/fields.docx
+  key ctrl+home
+  key shift+f9
+  assert dialog is edit-field
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"code"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc edit-field/code: OK applies
+  open copy:../fixtures/fields.docx
+  key ctrl+home
+  key shift+f9
+  assert dialog is edit-field
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"code"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call real-key {"key":"enter"}
+  assert dialog is not edit-field
+  key ctrl+home
+  key shift+f9
+  assert dialog is edit-field
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"code"}
+  assert reply.value is Ab1
+  call real-key {"key":"escape"}
+
+test doc edit-field/code: Escape cancels
+  open copy:../fixtures/fields.docx
+  key ctrl+home
+  key shift+f9
+  assert dialog is edit-field
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"code"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not edit-field
+  key ctrl+home
+  key shift+f9
+  assert dialog is edit-field
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"code"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}

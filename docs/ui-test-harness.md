@@ -415,7 +415,8 @@ nested in another cell reports the nested table, with `range` `null` (the
 range belongs to the outer table, which the table commands act on). `view`
 carries `gridlines`, the Table Layout tab's View Gridlines, `display_mode`,
 Display for Review (`all`, `simple`, `none` or `original`), and `draw`, the
-table pen on in the tab (#763: `pen` for Draw Table, `eraser`, or `null`).
+table pen on in the tab (#763: `pen` for Draw Table, `eraser`, or `null`),
+and `field_codes`, whether Alt+F9 shows the tab's field codes (#1241).
 
 `mail` is the tab's mail merge (#628): `doc_type` (`Letters`, `E-mail
 Messages`, `Envelopes`, `Labels`, `Directory`, or `null` for a Normal Word

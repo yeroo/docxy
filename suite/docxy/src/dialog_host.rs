@@ -118,6 +118,8 @@ fn apply_dialog(
         DialogOwner::PasteSpecial { .. } => Err("Paste Special applies through Paste".into()),
         // Handled in `Docxy::doc_paste_dialog_click`, before this.
         DialogOwner::DocPasteSpecial => Err("Paste Special applies through Paste".into()),
+        // Handled in `doc_fields::click`, before this.
+        DialogOwner::EditField => Err("Edit Field applies through the field keys".into()),
         // Handled in `Docxy::drop_dialog_click`, before this.
         DialogOwner::DropReplace => Err("the drop applies through the grid".into()),
         // Handled in `Docxy::fill_dialog_click`, before this.
@@ -304,6 +306,9 @@ fn dialog_press(tab: &mut DocTab, button: &str) -> Result<(), String> {
         return done;
     }
     if let Some(done) = crate::mailings_dialogs::click(tab, button) {
+        return done;
+    }
+    if let Some(done) = crate::doc_fields::click(tab, button) {
         return done;
     }
     if let Some(done) = crate::design_dialogs::click(tab, button) {

@@ -958,7 +958,7 @@ pub(crate) fn field_events(raw: &str) -> Vec<FieldEvent> {
 /// end), the outermost field's `w:instrText` up to its `separate`. `None` when
 /// a field is nested in that instruction (`= { PAGE } + 1`): its value is part
 /// of the instruction, so the instruction text alone can't be evaluated.
-pub(crate) fn instr_of(raw: &str) -> Option<String> {
+pub fn instr_of(raw: &str) -> Option<String> {
     if raw.trim_start().starts_with("<w:fldSimple") {
         let k = "w:instr=\"";
         let s = raw.find(k)? + k.len();

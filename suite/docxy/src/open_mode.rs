@@ -432,6 +432,8 @@ pub(crate) fn protected_allows_doc_key(key: &str, ctrl: bool, alt: bool) -> bool
         }
         // KeyTips: the commands they reach are refused there.
         "f10" => !ctrl,
+        // Alt+F9 shows field codes, a view (#1241); F9 and Shift+F9 edit.
+        "f9" => alt && !ctrl,
         "c" | "a" | "f" | "=" | "+" | "-" | "0" | "f1" => ctrl && !alt,
         _ => false,
     }
@@ -486,6 +488,19 @@ mod tests {
                 "{key} ctrl={ctrl}"
             );
         }
+    }
+
+    /// Alt+F9 only shows field codes, so a locked document takes it; F9
+    /// (Shift+F9 too, which has no Alt) updates or edits a field (#1241).
+    #[test]
+    fn protected_documents_show_field_codes_but_never_update_them_1241() {
+        assert!(protected_allows_doc_key("f9", false, true), "alt+f9");
+        assert!(
+            !protected_allows_doc_key("f9", false, false),
+            "f9, shift+f9"
+        );
+        assert!(!protected_allows_doc_key("f9", true, true), "ctrl+alt+f9");
+        assert!(!protected_allows_doc_key("f9", true, false), "ctrl+f9");
     }
 
     #[test]

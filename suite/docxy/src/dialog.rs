@@ -218,6 +218,9 @@ pub(crate) enum DialogOwner {
     /// clipboard held when it opened. Applied by
     /// `Docxy::doc_paste_dialog_click`, which reads the clipboard again.
     DocPasteSpecial,
+    /// Edit Field (#1241), Shift+F9 on a field: its code. Applied by
+    /// `doc_fields::click`, which updates the field's result too.
+    EditField,
     /// "There's already data here. Do you want to replace it?" before a
     /// drop by the selection's border (#670), applied by
     /// `Docxy::drop_dialog_click`.
