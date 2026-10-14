@@ -1004,7 +1004,6 @@ pub(crate) const BUILTIN_NAMES: [&str; 14] = [
     "_FilterDatabase",
 ];
 
-/// The error text of a BIFF error code (shared by BIFF8 and BIFF12).
 /// BIFF's error codes and their text, both ways (the readers and the
 /// `.xls` writer).
 pub(crate) const BIFF_ERRORS: [(u8, &str); 8] = [

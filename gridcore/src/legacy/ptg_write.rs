@@ -142,13 +142,6 @@ impl Class {
             (_, p) => p,
         }
     }
-    /// The class an operator's operands get.
-    fn operand(self) -> Class {
-        match self {
-            Class::Arr => Class::Arr,
-            _ => Class::Val,
-        }
-    }
 }
 
 /// Compile the formula `src` (as a cell or name stores it, without `=`) at
@@ -166,9 +159,12 @@ pub(crate) fn compile(src: &str, site: Site, t: &mut dyn Tables) -> Result<Compi
         t,
         out: Compiled::default(),
         site,
+        forced: matches!(site, Site::Cell { array: true, .. } | Site::Name { .. }),
+        depth: 0,
     };
+    // A cell's formula is a value, an array formula's too (its function
+    // tokens are values: corpus/legacy/arrays); a name is a reference.
     let top = match site {
-        Site::Cell { array: true, .. } => Class::Arr,
         Site::Cell { .. } => Class::Val,
         Site::Name { .. } => Class::Ref,
     };
@@ -352,6 +348,11 @@ struct Compiler<'a> {
     t: &'a mut dyn Tables,
     out: Compiled,
     site: Site,
+    /// An array formula or a defined name: Excel evaluates it as arrays, so
+    /// its value operands are arrays ([`Compiler::operand_class`]).
+    forced: bool,
+    /// How many function calls deep the token being written is.
+    depth: usize,
 }
 
 impl Compiler<'_> {
@@ -504,7 +505,7 @@ impl Compiler<'_> {
                 self.number(-n);
             }
             Expr::Un(op, x) => {
-                self.operand(x, cls.operand(), prec(x) < prec(e))?;
+                self.operand(x, self.operand_class(cls), prec(x) < prec(e))?;
                 self.push(&[match op {
                     UnOp::Pos => 0x12,
                     UnOp::Neg => 0x13,
@@ -512,8 +513,9 @@ impl Compiler<'_> {
                 }]);
             }
             Expr::Bin(op, l, r) => {
-                self.operand(l, cls.operand(), prec(l) < prec(e))?;
-                self.operand(r, cls.operand(), prec(r) <= prec(e))?;
+                let oc = self.operand_class(cls);
+                self.operand(l, oc, prec(l) < prec(e))?;
+                self.operand(r, oc, prec(r) <= prec(e))?;
                 self.push(&[match op {
                     BinOp::Add => 0x03,
                     BinOp::Sub => 0x04,
@@ -702,7 +704,9 @@ impl Compiler<'_> {
             let p = params(bare);
             if bare == "SUM" && args.len() == 1 {
                 // Excel's one-argument SUM: tAttrSum.
+                self.depth += 1;
                 self.expr(&args[0], cls.of_param(Class::Ref))?;
+                self.depth -= 1;
                 self.push(&[0x19, 0x10, 0, 0]);
                 return Ok(());
             }
@@ -772,11 +776,35 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// The arguments of a call in context `cls`, by parameter types `p`.
+    /// In an array formula or a name a value parameter is an array one, as
+    /// Excel writes them (corpus/legacy/arrays).
     fn args(&mut self, args: &[Expr], p: &str, cls: Class) -> Result<(), Why> {
+        self.depth += 1;
         for (i, a) in args.iter().enumerate() {
-            self.expr(a, cls.of_param(param_class(p, i)))?;
+            let param = param_class(p, i);
+            let c = if self.forced && param == Class::Val {
+                Class::Arr
+            } else {
+                cls.of_param(param)
+            };
+            self.expr(a, c)?;
         }
+        self.depth -= 1;
         Ok(())
+    }
+
+    /// The class an operator's operands get in context `cls`. Excel's
+    /// array formula `{=SUM(A1:A3*B1:B3)}` makes them arrays inside a
+    /// function call, but a multi-cell `{=A1:A3*2}` keeps them values at its
+    /// top level (each cell takes its own element); a name's are arrays.
+    fn operand_class(&self, cls: Class) -> Class {
+        let named = matches!(self.site, Site::Name { .. });
+        if cls == Class::Arr || named || (self.forced && self.depth > 0) {
+            Class::Arr
+        } else {
+            Class::Val
+        }
     }
 }
 

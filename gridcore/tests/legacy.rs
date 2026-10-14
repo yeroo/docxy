@@ -672,13 +672,14 @@ fn external_workbook_name_keeps_only_its_value(ext: &str) {
 
 // ---- the .xls writer (#874) ---------------------------------------------------
 
-/// Every `.xls` of the corpus (corpus/legacy, extra/, addin/).
+/// Every `.xls` of the corpus (corpus/legacy, extra/, addin/, arrays/).
 fn xls_corpus() -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
     for dir in [
         corpus("legacy"),
         corpus("legacy").join("extra"),
         corpus("legacy").join("addin"),
+        corpus("legacy").join("arrays"),
     ] {
         for e in std::fs::read_dir(&dir).expect("corpus dir") {
             let p = e.expect("dir entry").path();
@@ -822,7 +823,7 @@ fn xls_corpus_round_trips_through_the_writer() {
             ));
         }
     }
-    assert_eq!(files.len(), 21, "17 + extra + addin .xls files");
+    assert_eq!(files.len(), 22, "17 + extra + addin + arrays .xls files");
     assert!(
         errs.is_empty(),
         "{} problems:\n{}",
@@ -1049,10 +1050,36 @@ fn xls_formula_tokens(file: &[u8]) -> FormulaTokens {
     out
 }
 
+/// Each defined name's tokens in an `.xls`, by name.
+fn xls_name_tokens(file: &[u8]) -> std::collections::BTreeMap<String, Option<Vec<Token>>> {
+    let cfb = opccore::cfb::Cfb::open(file).unwrap();
+    let s = cfb.read_stream("Workbook").unwrap();
+    let mut out = std::collections::BTreeMap::new();
+    let mut at = 0;
+    while at + 4 <= s.len() {
+        let ty = u16::from_le_bytes([s[at], s[at + 1]]);
+        let len = u16::from_le_bytes([s[at + 2], s[at + 3]]) as usize;
+        let b = &s[at + 4..at + 4 + len];
+        if ty == 0x000A {
+            break;
+        }
+        // A defined name (no fFunc/fOB/fProc), its name compressed.
+        if ty == 0x0018 && u16::from_le_bytes([b[0], b[1]]) & 0x0E == 0 && b[14] == 0 {
+            let (cch, cce) = (b[3] as usize, u16::from_le_bytes([b[4], b[5]]) as usize);
+            let name = String::from_utf8_lossy(&b[15..15 + cch]).into_owned();
+            out.insert(name, tokens(&b[15 + cch..15 + cch + cce]));
+        }
+        at += 4 + len;
+    }
+    out
+}
+
 /// The writer gives every corpus formula the tokens Excel gave it, operand
 /// classes included: Excel evaluates a reference token and a value token
 /// differently (scripts/check-xls-writer.ps1 checks the results in Excel
 /// itself). Parentheses and evaluation hints are not compared ([`tokens`]).
+/// So do defined names, and the array formulas of corpus/legacy/arrays,
+/// whose operands Excel evaluates as arrays.
 #[test]
 fn xls_writer_gives_formulas_excels_tokens() {
     // calc-3d's Total sheet holds Excel's misreading of `Q1:Q3!` (the ALLOW
@@ -1065,8 +1092,21 @@ fn xls_writer_gives_formulas_excels_tokens() {
         let file = path.file_name().unwrap().to_string_lossy().into_owned();
         let data = std::fs::read(&path).unwrap();
         let (pkg, _) = open_workbook(&data).unwrap();
+        let written = gridcore::legacy::write_xls(&pkg).bytes;
         let excel = xls_formula_tokens(&data);
-        let ours = xls_formula_tokens(&gridcore::legacy::write_xls(&pkg).bytes);
+        let ours = xls_formula_tokens(&written);
+        let (excel_names, our_names) = (xls_name_tokens(&data), xls_name_tokens(&written));
+        for (name, want) in &excel_names {
+            let Some(have) = our_names.get(name) else {
+                continue;
+            };
+            compared += 1;
+            if have != want {
+                errs.push(format!(
+                    "{file}: name {name}: {have:02x?} != Excel's {want:02x?}"
+                ));
+            }
+        }
         for (&(s, r, c), want) in &excel {
             // A formula the import couldn't read is written as a value.
             let Some(have) = ours.get(&(s, r, c)) else {

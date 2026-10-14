@@ -1082,19 +1082,6 @@ struct SheetOut {
     bytes: Vec<u8>,
 }
 
-/// The `ref` of a legacy array formula's anchor (`t="array" ref="A1:B2"`).
-fn array_ref(cell: &Cell) -> Option<(u32, u32, u32, u32)> {
-    let attrs = cell.f_attrs.as_deref()?;
-    if crate::sheet::xml_attr(attrs, "t")? != "array" {
-        return None;
-    }
-    let r = crate::sheet::xml_attr(attrs, "ref")?;
-    let (a, b) = r.split_once(':').unwrap_or((r, r));
-    let (r1, c1) = crate::sheet::parse_cell_name(a)?;
-    let (r2, c2) = crate::sheet::parse_cell_name(b)?;
-    Some((r1, c1, r2, c2))
-}
-
 fn on_grid(r: u32, c: u32) -> bool {
     r as i64 <= ptg_write::MAX_ROW && c as i64 <= ptg_write::MAX_COL
 }
@@ -1143,24 +1130,32 @@ fn sheet_records(
         // it: a spilling formula its spill as it is now (its stored ref may
         // be stale); a legacy CSE block its stored ref, unless other content
         // sits in it now; any other array formula (a dynamic one that
-        // doesn't spill, a taken block) its anchor alone. A block that would
-        // overlap one already written shrinks to its anchor, and an anchor
-        // inside another's block is a plain formula.
+        // doesn't spill, typed or with a stale ref, or a taken block) its
+        // anchor alone. A block never covers another cell's own formula,
+        // nor a block already written: it shrinks to its anchor. So no cell
+        // with its own formula is ever another block's member.
         let spill = cell
             .spill
             .filter(|&ext| ext != (1, 1) && ext.0 > 0 && ext.1 > 0)
             .map(|(h, w)| (r, c, r + h - 1, c + w - 1));
         let legacy = || {
             (!cell.is_dynamic() && !crate::xlsx::block_taken(s, r, c, cell))
-                .then(|| array_ref(cell))
+                .then(|| crate::sheet::array_block(cell))
                 .flatten()
         };
-        let alone = array_ref(cell).map(|_| (r, c, r, c));
+        let alone = (crate::sheet::array_block(cell).is_some() || cell.is_dynamic())
+            .then_some((r, c, r, c));
         let fits = |&(r1, c1, r2, c2): &Rect| {
             (r1, c1) == (r, c) && r2 >= r1 && c2 >= c1 && on_grid(r2, c2)
         };
         let free = |&(r1, c1, r2, c2): &Rect| {
-            (r1..=r2).all(|rr| (c1..=c2).all(|cc| !member.contains_key(&(rr, cc))))
+            (r1..=r2).all(|rr| {
+                (c1..=c2).all(|cc| {
+                    let own = (rr, cc) != (r, c)
+                        && cells.get(&(rr, cc)).is_some_and(|x| x.formula.is_some());
+                    !own && !member.contains_key(&(rr, cc))
+                })
+            })
         };
         let range = [spill, legacy(), alone]
             .into_iter()
@@ -2204,6 +2199,40 @@ mod tests {
         st[second + 9] = 1;
         let bad = opccore::cfb::write_cfb(&[("Workbook", st)]);
         assert!(check_xls(&bad).unwrap_err().contains("overlap"));
+    }
+
+    /// A typed dynamic array that doesn't spill (a 1×1 result) is an array
+    /// on its anchor alone, as the .xlsx writer writes it; two spills that
+    /// overlap (as an .xls with overlapping ARRAY records reads) keep each
+    /// cell's own formula and write no overlapping block.
+    #[test]
+    fn unspilled_dynamic_arrays_and_overlapping_spills() {
+        let mut one = formula("_xlfn.SEQUENCE(1)", CellValue::Number(1.0));
+        one.meta.get_or_insert_default().dynamic = true;
+        let (back, _) = round(&book(&[(0, 0, one)]));
+        assert_eq!(back.workbook.sheets[0].cells[&(0, 0)].spill, Some((1, 1)));
+
+        // B1 spills B1:B3 over B2, which has its own array B2:B3.
+        let arr = |f: &str, h: u32| {
+            let mut c = formula(f, CellValue::Number(1.0));
+            c.f_attrs = Some(format!(" t=\"array\" ref=\"B1:B{h}\""));
+            c.spill = Some((h, 1));
+            c
+        };
+        let mut b2 = arr("A1:A2*3", 2);
+        b2.f_attrs = Some(" t=\"array\" ref=\"B2:B3\"".into());
+        let pkg = book(&[
+            (0, 1, arr("A1:A3*2", 3)),
+            (1, 1, b2),
+            (2, 1, Cell::number(6.0)),
+        ]);
+        let out = write_xls(&pkg);
+        check_xls(&out.bytes).unwrap();
+        let (back, _) = round(&pkg);
+        let cells = &back.workbook.sheets[0].cells;
+        assert_eq!(cells[&(0, 1)].spill, Some((1, 1)));
+        assert_eq!(cells[&(1, 1)].formula.as_deref(), Some("A1:A2*3"));
+        assert_eq!(cells[&(1, 1)].spill, Some((2, 1)));
     }
 
     /// SORT and FILTER's hidden names are spelled `_xlfn._xlws.`, as Excel
