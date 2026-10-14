@@ -2253,6 +2253,9 @@ struct ClipData {
     rules: Vec<gridcore::sheet::DataValidation>,
     sheet: usize,
     from: (u32, u32),
+    /// The selection's rows and columns, before `cells` was cut to the used
+    /// range: a cut moves the rules of all of it (#1050).
+    span: (u32, u32),
     cut: bool,
 }
 
@@ -4391,11 +4394,13 @@ impl App {
             rows.push(row);
         }
         let rules = gridcore::validation::copy_rules(self.sheet(), (r1, c1, r2, c2));
+        let (sr1, sc1, sr2, sc2) = self.selection();
         self.clip = Some(ClipData {
             cells: rows,
             rules,
             sheet: self.sheet,
             from: (r1, c1),
+            span: (sr2 - sr1 + 1, sc2 - sc1 + 1),
             cut,
         });
         if let Some(cb) = &mut self.os_clip {
@@ -4556,10 +4561,18 @@ impl App {
                 // checking what it checked (#1050).
                 let rules_from = {
                     let (fr, fc) = clip.from;
+                    // A cut moves the rules of the whole selection, cells or
+                    // not; a copy's rules are those of its cells.
+                    let (h, w) = if cut {
+                        clip.span
+                    } else {
+                        (
+                            clip.cells.len().max(1) as u32,
+                            clip.cells.iter().map(Vec::len).max().unwrap_or(1).max(1) as u32,
+                        )
+                    };
                     // Only the part that fits the grid at the target is pasted.
-                    let h = (clip.cells.len().max(1) as u32).min(MAX_ROWS - r0);
-                    let w = (clip.cells.iter().map(Vec::len).max().unwrap_or(1).max(1) as u32)
-                        .min(MAX_COLS - c0);
+                    let (h, w) = (h.min(MAX_ROWS - r0), w.min(MAX_COLS - c0));
                     (fr, fc, fr + h - 1, fc + w - 1)
                 };
                 let rules = clip.rules.clone();
@@ -16269,6 +16282,7 @@ mod tests {
             rules: Vec::new(),
             sheet: 9,
             from: (0, 0),
+            span: (1, 1),
             cut: false,
         });
         app.paste_special(gridcore::edit::PasteSpec::default());
@@ -24285,6 +24299,37 @@ mod tests {
     }
 
     #[test]
+    fn a_cut_past_the_used_range_moves_the_rules_of_the_whole_selection() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        let data = (0..3).flat_map(|r| (0..2).map(move |c| (r, c, Cell::number(5.0))));
+        app.apply(data.collect()); // A1:B3
+        app.pkg.workbook.sheets[0]
+            .validations
+            .push(gridcore::sheet::DataValidation {
+                ranges: vec![(1, 1, 9, 1)], // B2:B10
+                kind: "custom".into(),
+                formula1: "B2>A2".into(),
+                show_error: true,
+                ..Default::default()
+            });
+        let before = every_rule(&app);
+        cut_to(&mut app, ((1, 1), (9, 1)), 0, (1, 3)); // B2:B10 to D2
+        let after = every_rule(&app);
+        let wb = &app.pkg.workbook;
+        for r in 1..=9u32 {
+            assert_eq!(rule_seen(wb, 0, (r, 1)), None, "B{}", r + 1);
+            let want = format!("D{0}>A{0}", r + 1);
+            assert_eq!(rule_seen(wb, 0, (r, 3)), Some(want), "D{}", r + 1);
+        }
+        assert_eq!(rule_seen(wb, 0, (10, 3)), None);
+        app.undo();
+        assert_eq!(every_rule(&app), before);
+        app.redo();
+        assert_eq!(every_rule(&app), after);
+    }
+
+    #[test]
     fn a_cut_of_the_anchor_cell_leaves_the_rest_checking_their_own_cells() {
         let mut app = cut_rule_app("B2>0");
         cut_to(&mut app, ((1, 1), (1, 1)), 0, (1, 3)); // B2 to D2
@@ -24305,9 +24350,6 @@ mod tests {
             (0, 0, Cell::text("Red")),
             (1, 0, Cell::text("Green")),
             (2, 0, Cell::text("Blue")),
-            // Picked, so the copy (cut to the used range) takes B2:B3.
-            (1, 1, Cell::text("Red")),
-            (2, 1, Cell::text("Blue")),
         ]);
         let wb = &mut app.pkg.workbook;
         let first = wb.sheets[0].name.clone();
