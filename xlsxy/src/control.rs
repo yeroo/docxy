@@ -7849,6 +7849,34 @@ mod consolidate_tests {
         assert_eq!(a.pkg.workbook.defined_names, names);
     }
 
+    /// #988 r1: a run whose cells come out the same but which sets
+    /// Consolidate_Area is one undo step; undo takes the name away.
+    #[test]
+    fn wb_consolidate_that_only_sets_the_area_name_is_an_undo_step() {
+        let mut a = app();
+        let run = |a: &mut App| {
+            dispatch(
+                a,
+                "wb.consolidate",
+                &args(vec![
+                    ("refs", refs(&["East!B1", "West!B1"])),
+                    ("dest", Json::Str("Summary!A1".into())),
+                ]),
+            )
+            .unwrap()
+        };
+        run(&mut a);
+        a.pkg.workbook.defined_names.clear();
+        a.modified = false;
+        let undo_len = a.undo.len();
+        run(&mut a);
+        assert_eq!(a.undo.len(), undo_len + 1);
+        assert!(a.modified);
+        assert_eq!(a.pkg.workbook.defined_names.len(), 1);
+        a.undo();
+        assert!(a.pkg.workbook.defined_names.is_empty());
+    }
+
     #[test]
     fn wb_consolidate_follows_the_destination_sheets_protection() {
         let mut a = app();

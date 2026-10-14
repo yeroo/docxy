@@ -286,6 +286,7 @@ fn apply(
     }
     let snap = v.snapshot();
     let before = v.pkg.workbook.sheets.clone();
+    let names = v.pkg.workbook.defined_names.clone();
     let (r1, c1, r2, c2) = match consolidate(&mut v.pkg.workbook, sheet, area, &opts) {
         Ok(area) => area,
         Err(e) => {
@@ -295,7 +296,9 @@ fn apply(
         }
     };
     tab.dialogs.pop();
-    if !sheets_differ(&before, &v.pkg.workbook.sheets) {
+    // Consolidate_Area is a defined name: a run that only sets it (the
+    // first run over a file that had none) is still a change.
+    if !sheets_differ(&before, &v.pkg.workbook.sheets) && names == v.pkg.workbook.defined_names {
         tab.status = "Consolidate changed nothing".into();
         return Ok(());
     }
@@ -555,6 +558,34 @@ mod tests {
         assert!(view(&mut t).undo_step());
         assert_eq!(area(&mut t), None);
         assert_eq!(value(&mut t, 2, 1, 0), None);
+    }
+
+    /// #988 r1: a run whose cells come out the same but which sets
+    /// Consolidate_Area (a file consolidated before it was kept) is one
+    /// undo step and makes the tab dirty; undo takes the name away.
+    #[test]
+    fn a_run_that_only_sets_consolidate_area_is_an_undo_step() {
+        let mut t = book();
+        open(&mut t);
+        add(&mut t, "East!A1:B3");
+        press(&mut t, "OK").unwrap();
+        // As a file from before #988 has it: the output, no name.
+        view(&mut t).pkg.workbook.defined_names.clear();
+        view(&mut t).undo.clear();
+        t.dirty = false;
+        open(&mut t);
+        press(&mut t, "OK").unwrap();
+        assert_eq!(view(&mut t).undo.len(), 1);
+        assert!(t.dirty);
+        assert_eq!(view(&mut t).pkg.workbook.defined_names.len(), 1);
+        assert!(view(&mut t).undo_step());
+        assert!(view(&mut t).pkg.workbook.defined_names.is_empty());
+        // Run again with nothing new: no step.
+        open(&mut t);
+        press(&mut t, "OK").unwrap();
+        open(&mut t);
+        press(&mut t, "OK").unwrap();
+        assert_eq!(t.status.to_string(), "Consolidate changed nothing");
     }
 
     #[test]

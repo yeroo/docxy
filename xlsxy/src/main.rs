@@ -8309,7 +8309,11 @@ impl App {
             }
             Ok(msg) => {
                 self.status = Some(msg);
-                if !gridcore::edit::sheets_differ(&before.sheets, &self.pkg.workbook.sheets) {
+                // A defined name is a change too: Consolidate keeps its
+                // Consolidate_Area (#988), which may be all a run changed.
+                if !gridcore::edit::sheets_differ(&before.sheets, &self.pkg.workbook.sheets)
+                    && before.names == self.pkg.workbook.defined_names
+                {
                     return Ok(false);
                 }
                 self.rebuild_engine();
