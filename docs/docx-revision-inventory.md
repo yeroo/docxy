@@ -88,7 +88,10 @@ stamped with the time of the edit (UTC), with a `w:id` above every revision and
 comment-marker id in the document.
 
 - **Typing, paste and Replace** record a tracked insertion: ordinary editable
-  text whose runs carry `RunProps::tracked_insert`. Consecutive typing extends
+  text whose runs carry `RunProps::tracked_insert`. Not inside a hyperlink:
+  typing there is not recorded, and a Replace or AutoCorrect there records the
+  deletion of the old text but not the text put in, so Reject All keeps both
+  until insertions inside links are recorded. Consecutive typing extends
   one insertion; a save writes it as one `<w:ins>`; it is listed as one
   revision and Accept / Reject act on all its runs. An insertion that is
   split (Enter, a table or a section break in the middle of it, a
