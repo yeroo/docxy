@@ -58,8 +58,10 @@ pub enum BackstageEvent {
     /// listed under the quick export, by index.
     ExportExtra(usize),
     Exit,
-    /// Enter (or a second click) on the Info pane's row `i`: one of
-    /// [`BackstageHost::info_fields`], or the custom-property row after them.
+    /// Enter (or a second click) on the Info pane's property row `i`: an
+    /// index into [`BackstageHost::info_fields`], or `info_fields().len()`
+    /// for the custom-property row after them. The Compatibility Mode
+    /// `Convert` row isn't counted ([`BackstageEvent::Convert`]).
     EditInfo(usize),
     /// Enter (or a second click) on the Info pane's `Convert` row, shown
     /// while [`BackstageHost::compat_mode`]: convert the document to the

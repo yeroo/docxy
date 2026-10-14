@@ -489,6 +489,13 @@ impl Backstage {
         self.info_sel = row;
     }
 
+    /// Show Info with property row `field` focused, as
+    /// [`crate::BackstageEvent::EditInfo`] numbers it: past the Convert row
+    /// when the host is in Compatibility Mode.
+    pub fn focus_info_field(&mut self, field: usize, host: &dyn crate::BackstageHost) {
+        self.focus_info(field + usize::from(host.compat_mode()));
+    }
+
     /// Save As's file-name field, for `field-read` (#1204): its text and
     /// caret while Save As is on screen, whether it has the keyboard, and
     /// where its text starts as last drawn (`name_x0`, inside the box's

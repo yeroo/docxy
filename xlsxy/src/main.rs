@@ -6658,11 +6658,10 @@ impl App {
     /// there (the status bar is hidden under the backstage).
     fn reopen_info(&mut self, row: usize, message: Option<String>) {
         self.open_backstage();
-        // In Compatibility Mode, Convert is the page's first row.
-        let row = row + usize::from(self.compat());
-        if let Some(b) = &mut self.backstage {
-            b.focus_info(row);
+        if let Some(mut b) = self.backstage.take() {
+            b.focus_info_field(row, self);
             b.info_message = message;
+            self.backstage = Some(b);
         }
     }
 
