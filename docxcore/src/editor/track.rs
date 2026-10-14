@@ -14,10 +14,13 @@
 //! * Deleting text inside the author's own insertion removes it outright, as
 //!   Word does.
 //!
+//! * Deleting text inside a hyperlink records the deletion inside the link,
+//!   as Word does: a wrapper never straddles the link's boundary (#1462).
+//!
 //! Not recorded (they change the document as without tracking): paragraph
-//! marks (Enter, and a Backspace or Delete that joins paragraphs), text inside
-//! a hyperlink, fields and other one-unit inlines, formatting, and table
-//! structure. A selection across paragraphs records the deletion of its text
+//! marks (Enter, and a Backspace or Delete that joins paragraphs), typing
+//! inside a hyperlink, fields and other one-unit inlines, formatting, and
+//! table structure. A selection across paragraphs records the deletion of its text
 //! in each paragraph and keeps the paragraph marks.
 
 use super::{
@@ -193,6 +196,11 @@ impl Editor {
             }
             return;
         };
+        // A deletion inside a link is recorded among the link's children, so a
+        // simple link's `runs` move into its `content` first.
+        if let Some(p) = para_mut(&mut self.doc.body, path) {
+            link_runs_into_content(&mut p.content, idx);
+        }
         let Some(para) = resolve_para(&self.doc.body, path) else {
             return;
         };
@@ -450,6 +458,11 @@ fn plan_delete(content: &[Inline], idx: usize, author: &str) -> Plan {
             let (props, last) = match inline {
                 Inline::Run(r) => (&r.props, idx - acc + 1 == len),
                 Inline::Tab(props) | Inline::Break(_, props) => (props, true),
+                // Planned among the link's own children; `runs` were moved
+                // into `content` by `link_runs_into_content`.
+                Inline::Hyperlink(h) if h.runs.is_empty() => {
+                    return plan_delete(&h.content, idx - acc, author);
+                }
                 _ => return Plan::Remove,
             };
             if props
@@ -471,6 +484,28 @@ fn plan_delete(content: &[Inline], idx: usize, author: &str) -> Plan {
         acc += len;
     }
     Plan::Remove
+}
+
+/// Move the `runs` of the link at offset `idx` of `content` (and of any link
+/// nested in it there) to the front of its `content`, where a tracked deletion
+/// can sit beside them. Offsets are unchanged: `runs` come first.
+fn link_runs_into_content(content: &mut [Inline], idx: usize) {
+    let mut acc = 0;
+    for inline in content.iter_mut() {
+        let len = inline_len(inline);
+        if idx < acc + len {
+            if let Inline::Hyperlink(h) = inline {
+                if !h.runs.is_empty() {
+                    let runs = std::mem::take(&mut h.runs).into_iter().map(Inline::Run);
+                    h.content.splice(0..0, runs);
+                    h.content_changed = true;
+                }
+                link_runs_into_content(&mut h.content, idx - acc);
+            }
+            return;
+        }
+        acc += len;
+    }
 }
 
 /// The deleted copy of a run-like inline, struck through. It keeps the
@@ -534,6 +569,13 @@ fn record_deletion(
     let Some((i, local)) = found else {
         return;
     };
+    if let Inline::Hyperlink(h) = &mut content[i] {
+        // Inside the link, so the wrapper never crosses its boundary; a save
+        // rebuilds it rather than writing its raw XML.
+        h.content_changed = true;
+        record_deletion(&mut h.content, local, author, meta);
+        return;
+    }
     let mut pieces: Vec<Inline> = Vec::new();
     let wrapper_at;
     let deleted = match &content[i] {

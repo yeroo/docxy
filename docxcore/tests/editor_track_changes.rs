@@ -864,3 +864,308 @@ fn paste_text_only_records_an_insertion_753() {
     assert_eq!(text(&ed), "One new two three.");
     assert!(xml(&ed).contains("<w:ins "));
 }
+
+/// The issue's TOC entry: an anchor link holding `Intro`, a tab and `1`
+/// (loaded as two links with the tab between them), then `After`.
+const TOC_ENTRY: &str = "<w:p><w:hyperlink w:anchor=\"_Toc1\"><w:r><w:t>Intro</w:t></w:r><w:r><w:tab/></w:r><w:r><w:t>1</w:t></w:r></w:hyperlink></w:p><w:p><w:r><w:t>After</w:t></w:r></w:p>";
+
+/// A paragraph with a simple link in the middle: `See here.`.
+const SEE_HERE: &str = "<w:p><w:r><w:t xml:space=\"preserve\">See </w:t></w:r><w:hyperlink w:anchor=\"x\"><w:r><w:t>here</w:t></w:r></w:hyperlink><w:r><w:t>.</w:t></w:r></w:p>";
+
+fn tracked(inner: &str) -> Editor {
+    let mut ed = Editor::new(parse(inner));
+    as_author(&mut ed, "Ada");
+    ed
+}
+
+/// The paragraph at `index` of `doc`'s body.
+fn para_at(doc: &Document, index: usize) -> &docxcore::model::Paragraph {
+    let Block::Paragraph(p) = &doc.body[index] else {
+        panic!("paragraph {index}")
+    };
+    p
+}
+
+/// Each top-level inline of `p`: a link as its anchor, live text and deleted
+/// text (`link _Toc1 "Intro" del ""`), `tab`, a run's text, or a deletion's
+/// text (`deleted "…"`).
+fn shape(p: &docxcore::model::Paragraph) -> Vec<String> {
+    fn live(content: &[Inline]) -> String {
+        content
+            .iter()
+            .map(|i| match i {
+                Inline::Run(r) => r.text.clone(),
+                Inline::Tab(_) => "\t".into(),
+                _ => String::new(),
+            })
+            .collect()
+    }
+    fn deleted(content: &[Inline]) -> String {
+        content
+            .iter()
+            .map(|i| match i {
+                Inline::Revision {
+                    kind: RevisionKind::Delete,
+                    content,
+                    ..
+                } => live(content),
+                _ => String::new(),
+            })
+            .collect()
+    }
+    p.content
+        .iter()
+        .map(|i| match i {
+            Inline::Hyperlink(h) => {
+                let runs: String = h.runs.iter().map(|r| r.text.as_str()).collect();
+                format!(
+                    "link {} {:?} del {:?}",
+                    h.anchor.as_deref().unwrap_or("-"),
+                    runs + &live(&h.content),
+                    deleted(&h.content)
+                )
+            }
+            Inline::Tab(_) => "tab".into(),
+            Inline::Run(r) => format!("{:?}", r.text),
+            Inline::Revision {
+                kind: RevisionKind::Delete,
+                content,
+                ..
+            } => format!("deleted {:?}", live(content)),
+            other => format!("{other:?}"),
+        })
+        .collect()
+}
+
+/// `xml` with every `w:id` value blanked, to match the rest literally.
+fn without_ids(xml: &str) -> String {
+    let mut out = String::new();
+    let mut rest = xml;
+    while let Some(at) = rest.find("w:id=\"") {
+        out.push_str(&rest[..at + 6]);
+        rest = &rest[at + 6..];
+        rest = &rest[rest.find('"').unwrap()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn reload(ed: &Editor) -> Document {
+    let saved = xml(ed);
+    let inner = saved
+        .split("<w:body>")
+        .nth(1)
+        .unwrap()
+        .replace("</w:body></w:document>", "");
+    parse(&inner)
+}
+
+/// Select from the start of the TOC entry to `Af|ter`.
+fn select_toc_into_after(ed: &mut Editor) {
+    ed.anchor = Some(Caret {
+        path: vec![0],
+        offset: 0,
+    });
+    ed.caret = Caret {
+        path: vec![1],
+        offset: 2,
+    };
+}
+
+/// The issue's repro: a tracked selection from a TOC entry's link into the
+/// next paragraph records the link's text inside the link, each `w:del` on
+/// its own side of a link boundary, and nothing is lost (#1462).
+#[test]
+fn a_tracked_selection_across_paragraphs_records_link_text_1462() {
+    let mut ed = tracked(TOC_ENTRY);
+    let before = ed.doc.clone();
+    select_toc_into_after(&mut ed);
+    ed.backspace();
+    assert_eq!(
+        shape(para_at(&ed.doc, 0)),
+        [
+            "link _Toc1 \"\" del \"Intro\"",
+            "deleted \"\\t\"",
+            "link _Toc1 \"\" del \"1\""
+        ],
+        "{}",
+        xml(&ed)
+    );
+    assert_eq!(kinds(&ed.doc), [RevisionKind::Delete; 4]);
+    let saved = without_ids(&xml(&ed));
+    let del = format!("<w:del w:id=\"\" w:author=\"Ada\" w:date=\"{NOW}\">");
+    let p0 = format!(
+        "<w:hyperlink w:anchor=\"_Toc1\">{del}<w:r><w:delText xml:space=\"preserve\">Intro</w:delText></w:r></w:del></w:hyperlink>\
+         {del}<w:r><w:tab/></w:r></w:del>\
+         <w:hyperlink w:anchor=\"_Toc1\">{del}<w:r><w:delText xml:space=\"preserve\">1</w:delText></w:r></w:del></w:hyperlink></w:p>"
+    );
+    assert!(saved.contains(&p0), "{saved}");
+    assert!(
+        saved.contains(&format!(
+            "{del}<w:r><w:delText xml:space=\"preserve\">Af</w:delText></w:r></w:del>"
+        )),
+        "paragraph 1 keeps its deletion: {saved}"
+    );
+
+    let mut rejected = ed.doc.clone();
+    assert!(
+        rejected
+            .reject_all_revisions()
+            .iter()
+            .all(|o| o.is_applied())
+    );
+    assert_eq!(
+        shape(para_at(&rejected, 0)),
+        [
+            "link _Toc1 \"Intro\" del \"\"",
+            "tab",
+            "link _Toc1 \"1\" del \"\""
+        ]
+    );
+    assert_eq!(para_at(&rejected, 1).plain_text(), "After");
+
+    let mut accepted = ed.doc.clone();
+    assert!(
+        accepted
+            .accept_all_revisions()
+            .iter()
+            .all(|o| o.is_applied())
+    );
+    assert_eq!(para_at(&accepted, 0).plain_text(), "");
+    assert_eq!(para_at(&accepted, 1).plain_text(), "ter");
+
+    // Undo is one step back to the exact prior document.
+    assert!(ed.undo());
+    assert_eq!(ed.doc, before);
+    assert!(!ed.undo());
+}
+
+/// The recorded link deletions survive a save and reload, Reject All there
+/// restores the links' text, and that survives another save (#1462).
+#[test]
+fn a_tracked_link_deletion_saves_and_reloads_1462() {
+    let mut ed = tracked(TOC_ENTRY);
+    select_toc_into_after(&mut ed);
+    ed.delete_selection();
+    let mut back = reload(&ed);
+    assert_eq!(kinds(&back), [RevisionKind::Delete; 4]);
+    assert_eq!(shape(para_at(&back, 0)), shape(para_at(&ed.doc, 0)));
+    assert!(back.reject_all_revisions().iter().all(|o| o.is_applied()));
+    let rejected = Editor::new(back);
+    let again = reload(&rejected);
+    assert!(again.revisions().is_empty(), "{}", xml(&rejected));
+    assert_eq!(
+        shape(para_at(&again, 0)),
+        [
+            "link _Toc1 \"Intro\" del \"\"",
+            "tab",
+            "link _Toc1 \"1\" del \"\""
+        ]
+    );
+    assert_eq!(para_at(&again, 1).plain_text(), "After");
+}
+
+/// Backspaces inside a simple link record each character inside it, joined
+/// into one deletion; once all of it is recorded the link stays, zero-width
+/// (#1462).
+#[test]
+fn backspace_in_a_simple_link_records_one_deletion_inside_it_1462() {
+    let mut ed = tracked(SEE_HERE);
+    at(&mut ed, 8); // after "here"
+    ed.backspace();
+    assert_eq!(text(&ed), "See her.");
+    assert_eq!(kinds(&ed.doc), [RevisionKind::Delete]);
+    for _ in 0..3 {
+        ed.backspace();
+    }
+    assert_eq!(text(&ed), "See .");
+    assert_eq!(kinds(&ed.doc), [RevisionKind::Delete], "{}", xml(&ed));
+    assert_eq!(
+        shape(para_at(&ed.doc, 0)),
+        ["\"See \"", "link x \"\" del \"here\"", "\".\""]
+    );
+    assert_eq!(ed.caret.offset, 4);
+    assert_eq!(docxcore::editor::para_text_len(para_at(&ed.doc, 0)), 5);
+    assert!(
+        xml(&ed).contains("<w:hyperlink w:anchor=\"x\"><w:del "),
+        "{}",
+        xml(&ed)
+    );
+    // Delete from there steps over the recorded link to the `.`, a deletion
+    // of its own outside the link.
+    ed.delete_forward();
+    assert_eq!(
+        shape(para_at(&ed.doc, 0)),
+        ["\"See \"", "link x \"\" del \"here\"", "deleted \".\""]
+    );
+}
+
+/// A selection over a link's edge records the text on each side, each in
+/// its own `w:del`: the one inside the link never joins the one outside
+/// (#1462).
+#[test]
+fn a_tracked_selection_over_a_link_edge_keeps_the_del_inside_the_link_1462() {
+    let mut ed = tracked(SEE_HERE);
+    select(&mut ed, 2, 6); // "e " outside the link, "he" inside
+    ed.delete_selection();
+    assert_eq!(text(&ed), "Sere.");
+    assert_eq!(
+        shape(para_at(&ed.doc, 0)),
+        [
+            "\"Se\"",
+            "deleted \"e \"",
+            "link x \"re\" del \"he\"",
+            "\".\""
+        ]
+    );
+    assert_eq!(kinds(&ed.doc), [RevisionKind::Delete; 2]);
+    let mut rejected = ed.doc.clone();
+    assert!(
+        rejected
+            .reject_all_revisions()
+            .iter()
+            .all(|o| o.is_applied())
+    );
+    assert_eq!(rejected.plain_text().trim_end(), "See here.");
+    let Some(Inline::Hyperlink(_)) = para_at(&rejected, 0)
+        .content
+        .iter()
+        .find(|i| matches!(i, Inline::Hyperlink(_)))
+    else {
+        panic!("the link stays")
+    };
+}
+
+/// A link that loads with its raw XML kept (an external link holding a tab)
+/// is rebuilt on save, so a deletion recorded inside it is written (#1462).
+#[test]
+fn a_tracked_delete_in_a_raw_kept_external_link_saves_inside_it_1462() {
+    let rels = docxcore::load::parse_rels_xml(
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId9\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"https://example.com/\" TargetMode=\"External\"/></Relationships>",
+    );
+    let doc = parse_document_xml(
+        &format!(
+            "<w:document {W} xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><w:body><w:p><w:hyperlink r:id=\"rId9\"><w:r><w:t>Go</w:t></w:r><w:r><w:tab/></w:r><w:r><w:t>here</w:t></w:r></w:hyperlink></w:p></w:body></w:document>"
+        ),
+        &rels,
+    );
+    let Inline::Hyperlink(h) = &para_at(&doc, 0).content[0] else {
+        panic!("link")
+    };
+    assert!(h.runs.is_empty() && h.raw.is_some() && !h.content_changed);
+    let mut ed = Editor::new(doc);
+    as_author(&mut ed, "Ada");
+    at(&mut ed, 0);
+    ed.delete_forward();
+    let saved = xml(&ed);
+    let link = &saved[saved.find("<w:hyperlink").unwrap()..saved.find("</w:hyperlink>").unwrap()];
+    assert!(link.contains("r:id=\"rId9\""), "{saved}");
+    assert!(
+        link.contains("<w:delText xml:space=\"preserve\">G</w:delText>"),
+        "{saved}"
+    );
+    assert!(
+        link.contains("<w:t xml:space=\"preserve\">o</w:t>"),
+        "{saved}"
+    );
+}
