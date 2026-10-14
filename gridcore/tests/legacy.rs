@@ -823,7 +823,7 @@ fn xls_corpus_round_trips_through_the_writer() {
             ));
         }
     }
-    assert_eq!(files.len(), 23, "17 + extra + addin + arrays .xls files");
+    assert_eq!(files.len(), 24, "17 + extra + addin + arrays .xls files");
     assert!(
         errs.is_empty(),
         "{} problems:\n{}",

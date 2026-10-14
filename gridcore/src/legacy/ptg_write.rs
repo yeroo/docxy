@@ -150,11 +150,12 @@ enum Conv {
     Org,
     /// A value: an array becomes a value.
     Val,
-    /// An array.
+    /// An array (a reference stays a reference).
     Arr,
     /// Repeat the enclosing conversion.
     Rpt,
-    /// Repeat it for a reference, else the token's own class.
+    /// Repeat it for a reference, or when it is an array conversion; else
+    /// the token's own class.
     Rpx,
     /// An operator's operand: its operator's conversion.
     Rpo,
@@ -299,10 +300,20 @@ fn mark_external_calls(src: &str) -> std::borrow::Cow<'_, str> {
 /// A function's parameter conversions, as a pattern: one letter per
 /// parameter, and after a `+` the group that repeats for the rest (`R+RV`
 /// is SUMIFS: a range, then range/criteria pairs). The letters are
-/// LibreOffice's parameter types: `R` RO (the token's own class), `V` VR
-/// (a value, the enclosing conversion repeated), `v` VV (a value, forced),
-/// `A` an array, `X` RX (a reference repeats the enclosing conversion), `O`
-/// VO (a value, its own class), `r` RR. Functions not listed take values.
+/// LibreOffice's parameter types (xlformula.cxx): `R` RO (the token's own
+/// class), `V` VR (a value, the enclosing conversion repeated), `v` VV (a
+/// value, forced), `A` VA (an array), `a` RA (an array, a reference left
+/// one), `X` RX (a reference repeats the enclosing conversion), `O` VO (a
+/// value, its own class), `r` RR.
+///
+/// The newer functions (`_xlfn.`) are pinned by Excel's own tokens
+/// (corpus/legacy/arrays/array-classes-3): one with a BIFF8 twin takes the
+/// twin's letters (PERCENTILE.INC, QUARTILE.EXC, RANK.EQ, STDEV.S,
+/// FORECAST.LINEAR, ...); XLOOKUP, XMATCH, FILTER, UNIQUE, SORT, SORTBY, IFS
+/// and SWITCH have their own. Any other function, newer or not, takes
+/// values ("+V"), which is what Excel writes for the scalar ones (NORM.DIST,
+/// the date and text functions); every newer function that takes ranges in
+/// the fixture is listed.
 fn params(name: &str) -> &'static str {
     match name {
         "SUM" | "AVERAGE" | "MIN" | "MAX" | "COUNT" | "COUNTA" | "PRODUCT" | "STDEV" | "STDEVP"
@@ -314,32 +325,43 @@ fn params(name: &str) -> &'static str {
         | "ANCHORARRAY" => "+R",
         "SUMPRODUCT" | "MODE" | "MODE.SNGL" | "MODE.MULT" | "MMULT" | "MDETERM" | "MINVERSE"
         | "TRANSPOSE" | "SUMX2MY2" | "SUMX2PY2" | "SUMXMY2" | "CORREL" | "PEARSON" | "RSQ"
-        | "SLOPE" | "INTERCEPT" | "STEYX" | "COVAR" | "FTEST" | "CHITEST" | "FREQUENCY" => "+A",
+        | "SLOPE" | "INTERCEPT" | "STEYX" | "COVAR" | "FTEST" | "CHITEST" => "+A",
+        "FREQUENCY" => "aa",
         "COUNTIF" => "RV",
         "SUMIF" | "AVERAGEIF" => "RVR",
         "COUNTIFS" => "+RV",
         "SUMIFS" | "AVERAGEIFS" | "MAXIFS" | "MINIFS" => "R+RV",
         "VLOOKUP" | "HLOOKUP" => "vRRv",
         "MATCH" => "VXr",
-        "LOOKUP" => "VXX",
-        "INDEX" => "Rvvv",
+        "XMATCH" => "VR",
+        "LOOKUP" => "Vaa",
+        "XLOOKUP" => "vRR",
+        "INDEX" => "avvv",
         "OFFSET" => "RVVVV",
         "CELL" => "vR",
         "RANK" | "RANK.EQ" | "RANK.AVG" => "VRV",
-        "LARGE" | "SMALL" | "PERCENTILE" | "QUARTILE" | "IRR" => "XV",
-        "PERCENTRANK" | "MIRR" => "XVV",
+        "LARGE" | "SMALL" | "PERCENTILE" | "QUARTILE" | "PERCENTILE.INC" | "PERCENTILE.EXC"
+        | "QUARTILE.INC" | "QUARTILE.EXC" => "XV",
+        "PERCENTRANK" | "PERCENTRANK.INC" | "PERCENTRANK.EXC" => "XVV",
+        "IRR" => "aV",
+        "MIRR" => "aVV",
         "NPV" => "V+X",
         "CHOOSE" => "O+R",
         "SUBTOTAL" => "V+R",
         "AGGREGATE" | "TEXTJOIN" => "VV+X",
         "IF" => "ORR",
         "IFERROR" | "IFNA" => "OR",
+        "IFS" => "+OR",
+        "SWITCH" => "O+VR",
+        "FILTER" => "RAV",
+        "UNIQUE" | "SORT" => "AVVV",
+        "SORTBY" => "A+AV",
         "DAVERAGE" | "DCOUNT" | "DCOUNTA" | "DGET" | "DMAX" | "DMIN" | "DPRODUCT" | "DSTDEV"
         | "DSTDEVP" | "DSUM" | "DVAR" | "DVARP" => "RrR",
-        "FORECAST" => "VAA",
+        "FORECAST" | "FORECAST.LINEAR" => "VAA",
         "TTEST" | "PROB" => "AAVV",
-        "TREND" | "GROWTH" => "AAAV",
-        "LINEST" | "LOGEST" => "AAVV",
+        "TREND" | "GROWTH" => "aaaV",
+        "LINEST" | "LOGEST" => "aaVV",
         _ => "+V",
     }
 }
@@ -358,6 +380,7 @@ fn param_conv(p: &str, i: usize) -> (Conv, bool) {
         b'R' => (Conv::Org, false),
         b'v' => (Conv::Val, true),
         b'A' => (Conv::Arr, true),
+        b'a' => (Conv::Arr, false),
         b'X' => (Conv::Rpx, false),
         b'O' => (Conv::Org, true),
         b'r' => (Conv::Rpt, false),
@@ -366,12 +389,15 @@ fn param_conv(p: &str, i: usize) -> (Conv, bool) {
 }
 
 /// A function token's own class: a reference for those that may return
-/// one, an array for those that return one, else a value.
+/// one, an array for those that return one, else a value. (A function
+/// Excel doesn't know, an XLL's or a UDF, is a reference: [`Compiler::call`].)
 fn return_class(name: &str) -> Class {
     match name {
-        "IF" | "CHOOSE" | "INDEX" | "OFFSET" | "INDIRECT" => Class::Ref,
+        "IF" | "CHOOSE" | "INDEX" | "OFFSET" | "INDIRECT" | "XLOOKUP" | "IFS" | "SWITCH" => {
+            Class::Ref
+        }
         "MMULT" | "MINVERSE" | "TRANSPOSE" | "FREQUENCY" | "LINEST" | "LOGEST" | "TREND"
-        | "GROWTH" => Class::Arr,
+        | "GROWTH" | "FILTER" | "UNIQUE" | "SORT" | "SORTBY" => Class::Arr,
         _ => Class::Val,
     }
 }
@@ -466,7 +492,9 @@ impl Compiler<'_> {
                 Conv::Rpx if !cx.parent_ref => ClassConv::Org,
                 _ => cx.prev_class,
             },
-            Conv::Rpx if cls == Some(Class::Ref) => cx.prev_class,
+            Conv::Rpx if cls == Some(Class::Ref) || cx.prev_class == ClassConv::Arr => {
+                cx.prev_class
+            }
             Conv::Rpx => ClassConv::Org,
         };
         let cls = cls.map(|c| match class_conv {
@@ -474,7 +502,9 @@ impl Compiler<'_> {
             ClassConv::Org => c,
             ClassConv::Val if c == Class::Arr => Class::Val,
             ClassConv::Val => c,
-            ClassConv::Arr => Class::Arr,
+            // A reference stays one: only a value becomes an array.
+            ClassConv::Arr if c == Class::Val => Class::Arr,
+            ClassConv::Arr => c,
         });
         (cls, conv, class_conv)
     }
@@ -807,13 +837,22 @@ impl Compiler<'_> {
             return Err(Why::Lambda);
         }
         let bare = name.strip_prefix("_XLFN.").unwrap_or(name);
-        let me = self.resolve(Some(return_class(bare)), cx);
+        // A function Excel doesn't know (an XLL's, a Library add-in's, a
+        // UDF) may return a reference, as Excel writes XLLTWICE's token.
+        let builtin = (0..=476u16).any(|i| ftab::lookup(i).is_some_and(|(n, _)| n == bare))
+            || is_new_function(bare);
+        let own = if builtin {
+            return_class(bare)
+        } else {
+            Class::Ref
+        };
+        let me = self.resolve(Some(own), cx);
         let token = me.0.unwrap_or(Class::Val);
-        let builtin = (0..=379u16).find_map(|i| {
+        let ftab_entry = (0..=379u16).find_map(|i| {
             let (n, argc) = ftab::lookup(i)?;
             n.eq_ignore_ascii_case(bare).then_some((i, argc))
         });
-        if let Some((i, argc)) = builtin {
+        if let Some((i, argc)) = ftab_entry {
             let p = params(bare);
             if bare == "SUM" && args.len() == 1 {
                 // Excel's one-argument SUM: tAttrSum.
@@ -862,8 +901,9 @@ impl Compiler<'_> {
                 self.push(&[0x19 | Class::Ref.bits()]);
                 self.push(&ixti.to_le_bytes());
                 self.push(&index.to_le_bytes());
-                // An add-in's parameters are references, as for any UDF.
-                self.args(args, "+X", me)?;
+                // An add-in's parameters are references (RO), as for any
+                // UDF, as Excel writes XLLTWICE's and EDATE's.
+                self.args(args, "+R", me)?;
             }
             None => {
                 // SORT and FILTER are `_xlfn._xlws.`, as a file spells them.
@@ -879,7 +919,7 @@ impl Compiler<'_> {
                 let p = if is_new_function(bare) {
                     params(bare)
                 } else {
-                    "+X"
+                    "+R"
                 };
                 self.args(args, p, me)?;
             }
