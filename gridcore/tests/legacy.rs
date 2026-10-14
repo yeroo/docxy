@@ -692,10 +692,30 @@ fn xls_corpus() -> Vec<std::path::PathBuf> {
 }
 
 /// What the import of each corpus `.xls` leaves out, by file; every other
-/// file has nothing.
+/// file has nothing. The 17 workbooks of corpus/xlsx have margins other
+/// than Excel's Normal ones, which their `.xls` keep.
 const XLS_DROPPED: &[(&str, &[&str])] = &[
+    ("calc-3d.xls", &["page setup"]),
+    ("calc-arithmetic.xls", &["page setup"]),
+    ("calc-criteria.xls", &["page setup"]),
+    ("calc-dates.xls", &["page setup"]),
+    ("calc-financial.xls", &["page setup"]),
+    ("calc-logic.xls", &["page setup"]),
+    ("calc-lookup.xls", &["page setup"]),
+    ("calc-math.xls", &["page setup"]),
+    ("calc-refs.xls", &["page setup"]),
+    ("calc-stats.xls", &["page setup"]),
+    ("calc-text.xls", &["page setup"]),
+    ("calc-textfmt.xls", &["page setup"]),
     // Two strings of the source are rich text.
-    ("edge-cases.xls", &["formatting within cell text"]),
+    (
+        "edge-cases.xls",
+        &["formatting within cell text", "page setup"],
+    ),
+    ("oracle-basic.xls", &["page setup"]),
+    ("shape-amortization.xls", &["page setup"]),
+    ("shape-gradebook.xls", &["page setup"]),
+    ("shape-salestable.xls", &["page setup"]),
     ("chart-embedded.xls", &["pictures, shapes and charts"]),
 ];
 

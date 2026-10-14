@@ -1029,10 +1029,24 @@ fn read_sheet(
                     let scale = c.u16()?;
                     c.take(6)?;
                     let grbit = c.u16()?;
+                    c.take(4)?;
+                    let (header, footer) = (c.f64()?, c.f64()?);
                     // fPortrait off is landscape, unless fNoPls or
-                    // fNoOrient says there is no orientation.
+                    // fNoOrient says there is no orientation; the header and
+                    // footer margins count only with the printer settings.
                     let landscape = grbit & 0x0046 == 0;
-                    if (scale != 100 && grbit & 0x0004 == 0) || landscape {
+                    let set = grbit & 0x0004 == 0;
+                    if (set && (scale != 100 || !near(header, 0.3) || !near(footer, 0.3)))
+                        || landscape
+                    {
+                        book.dropped.insert("page setup");
+                    }
+                }
+                // LEFTMARGIN, RIGHTMARGIN, TOPMARGIN, BOTTOMMARGIN: other
+                // than Excel's Normal margins.
+                0x0026..=0x0029 => {
+                    let normal = if r.ty <= 0x0027 { 0.7 } else { 0.75 };
+                    if !near(c.f64()?, normal) {
                         book.dropped.insert("page setup");
                     }
                 }
@@ -1075,6 +1089,11 @@ fn read_sheet(
     }
     sheet.cells = cells;
     Ok(sheet)
+}
+
+/// Whether two margins (inches) are the same, as Excel rounds them.
+fn near(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-6
 }
 
 /// A `RefU`: rwFirst, rwLast (16-bit), colFirst, colLast (8-bit), as
@@ -1569,6 +1588,26 @@ pub(crate) mod tests {
                 "underlined text",
                 "vertical alignment"
             ]
+        );
+    }
+
+    /// Margins are page setup the import leaves out: Excel's Normal ones
+    /// are no loss, others are.
+    #[test]
+    fn custom_margins_are_dropped_page_setup() {
+        let margin = |ty: u16, v: f64| rec(ty, &v.to_le_bytes());
+        let normal = [
+            margin(0x0026, 0.7),
+            margin(0x0027, 0.7),
+            margin(0x0028, 0.75),
+            margin(0x0029, 0.75),
+        ];
+        let book = read(&workbook(&[], &normal)).unwrap();
+        assert!(book.dropped.is_empty());
+        let book = read(&workbook(&[], &[margin(0x0026, 1.0)])).unwrap();
+        assert_eq!(
+            book.dropped.iter().copied().collect::<Vec<_>>(),
+            ["page setup"]
         );
     }
 

@@ -13885,6 +13885,20 @@ mod tests {
         (app, path)
     }
 
+    /// An `.xls` that loses nothing on save: corpus/legacy's oracle-basic
+    /// (whose margins aren't Excel's) as the writer writes it, opened.
+    fn open_clean_xls(dir: &Path, name: &str) -> (App, std::path::PathBuf) {
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/legacy");
+        let data = std::fs::read(corpus.join("oracle-basic.xls")).unwrap();
+        let (pkg, _) = gridcore::legacy::open_workbook(&data).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, gridcore::legacy::write_xls(&pkg).bytes).unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.os_clip = None;
+        app.open_workbook(path.to_str().unwrap());
+        (app, path)
+    }
+
     fn yes(app: &mut App) {
         let action = app.confirm.as_ref().expect("a prompt").action().clone();
         app.apply_confirm(backstage::ConfirmOutcome::Confirmed(action));
@@ -13900,7 +13914,7 @@ mod tests {
     #[test]
     fn an_xls_opens_in_compatibility_mode_bound_to_itself() {
         let dir = tmp("compat-open");
-        let (mut app, path) = open_xls(&dir, "oracle-basic.xls", "book.xls");
+        let (mut app, path) = open_clean_xls(&dir, "book.xls");
         assert_eq!(Path::new(&app.path), path);
         assert!(app.import_source.is_none() && !app.import_unsaved);
         assert!(app.compat());
@@ -13970,7 +13984,7 @@ mod tests {
     #[test]
     fn ctrl_s_writes_the_xls_back() {
         let dir = tmp("compat-save");
-        let (mut app, path) = open_xls(&dir, "oracle-basic.xls", "book.xls");
+        let (mut app, path) = open_clean_xls(&dir, "book.xls");
         app.apply(vec![(0, 0, gridcore::sheet::Cell::text("edited"))]);
         press_mod(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
         assert!(app.confirm.is_none(), "{:?}", app.status);

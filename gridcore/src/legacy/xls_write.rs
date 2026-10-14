@@ -227,7 +227,6 @@ pub fn write_xls(pkg: &SheetPackage) -> XlsOut {
 fn unsupported_features(pkg: &SheetPackage) -> Vec<String> {
     let wb = &pkg.workbook;
     let any = |f: &dyn Fn(&Sheet) -> bool| wb.sheets.iter().any(f);
-    let default_setup = crate::print::setup::PageSetup::default();
     let mut out: Vec<&str> = Vec::new();
     if !wb.tables.is_empty() {
         out.push("tables (their cells are kept as plain ranges)");
@@ -256,7 +255,7 @@ fn unsupported_features(pkg: &SheetPackage) -> Vec<String> {
     if any(&|s| s.protection.is_some()) {
         out.push("sheet protection");
     }
-    if any(&|s| s.page_setup != default_setup) {
+    if any(&|s| custom_page_setup(&s.page_setup)) {
         out.push("page setup");
     }
     if any(&|s| !s.row_breaks.is_empty() || !s.col_breaks.is_empty()) {
@@ -281,6 +280,40 @@ fn unsupported_features(pkg: &SheetPackage) -> Vec<String> {
         v.push(m.to_string());
     }
     v
+}
+
+/// Whether a sheet's page setup has something a person set, which the
+/// `.xls` would lose: Excel's defaults (portrait, 100%, Normal margins, no
+/// header or footer, ...) aren't worth a warning. Nor is the paper size,
+/// which is the printer's locale default as often as a choice.
+fn custom_page_setup(p: &crate::print::setup::PageSetup) -> bool {
+    let d = crate::print::setup::PageSetup::default();
+    let hf = &p.header_footer;
+    let text = [
+        &hf.odd_header,
+        &hf.odd_footer,
+        &hf.even_header,
+        &hf.even_footer,
+        &hf.first_header,
+        &hf.first_footer,
+    ]
+    .iter()
+    .any(|t| t.as_deref().is_some_and(|t| !t.is_empty()));
+    p.orientation.is_landscape()
+        || p.scale != d.scale
+        || p.fit_to_page
+        || p.margins != d.margins
+        || p.first_page_number.is_some()
+        || p.page_order != d.page_order
+        || p.black_and_white
+        || p.draft
+        || p.cell_comments != d.cell_comments
+        || p.errors != d.errors
+        || p.grid_lines
+        || p.headings
+        || p.h_centered
+        || p.v_centered
+        || text
 }
 
 // ---- records ----------------------------------------------------------------
@@ -1720,6 +1753,15 @@ mod tests {
             write_xls(&pkg).lost,
             ["hyperlinks", "outlines (grouped rows and columns)"]
         );
+        // Excel's own page setup isn't a loss (an .xlsx's says portrait and
+        // A4), a landscape one is.
+        let mut pkg = book(&[(0, 0, Cell::number(1.0))]);
+        let ps = &mut pkg.workbook.sheets[0].page_setup;
+        ps.orientation = crate::print::setup::Orientation::Portrait;
+        ps.paper_size = 9;
+        assert!(write_xls(&pkg).lost.is_empty());
+        pkg.workbook.sheets[0].page_setup.orientation = crate::print::setup::Orientation::Landscape;
+        assert_eq!(write_xls(&pkg).lost, ["page setup"]);
     }
 
     #[test]
