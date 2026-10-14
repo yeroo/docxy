@@ -545,6 +545,15 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
                 0x0012 if c.u16()? != 0 => {
                     book.dropped.insert("workbook protection");
                 }
+                // FILESHARING: read-only recommended, or a password to
+                // modify.
+                0x005B if c.u16()? != 0 || c.u16()? != 0 => {
+                    book.dropped
+                        .insert("password to modify and read-only recommendation");
+                }
+                0x0019 if c.u16()? != 0 => {
+                    book.dropped.insert("workbook protection");
+                }
                 // PRECISION 0: Set precision as displayed.
                 0x000E if c.u16()? == 0 => {
                     book.dropped.insert("precision as displayed");
@@ -613,6 +622,12 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
                     let mut name = c.chars(cch, high)?;
                     if flags & 0x20 != 0 {
                         name = builtin_name(name.chars().next().map_or(0xFF, |ch| ch as u8));
+                    }
+                    // A hidden defined name (not a function's, nor a
+                    // built-in one) comes back visible.
+                    if flags & 0x01 != 0 && flags & 0x2E == 0 {
+                        book.dropped
+                            .insert("hidden defined names (saved as visible)");
                     }
                     let rgce = c.take(cce)?.to_vec();
                     let extra = c.rest().to_vec();
@@ -953,10 +968,23 @@ fn read_sheet(
                 }
                 0x007D => {
                     let (first, last, coldx) = (c.u16()?, c.u16()?, c.u16()?);
-                    c.u16()?;
+                    let ixfe = c.u16()?;
                     let grbit = c.u16()?;
                     let hidden = grbit & 0x0001 != 0;
-                    let width = (grbit & 0x0002 != 0).then_some(coldx as f64 / 256.0);
+                    // The width whether or not fUserSet says it was set (as
+                    // LibreOffice reads it: other writers leave the flag
+                    // clear), unless it is the sheet's default: its
+                    // STANDARDWIDTH, or else DEFCOLWIDTH's characters plus
+                    // the padding (Excel writes 8 characters as 2194).
+                    let base = sheet.base_col_width.unwrap_or(8).min(255) as u16 * 256;
+                    let default = match sheet.default_col_width {
+                        Some(w) => (coldx as f64 - w * 256.0).abs() < 1.0,
+                        None => (base..base + 256).contains(&coldx),
+                    };
+                    let width = (grbit & 0x0002 != 0 || !default).then_some(coldx as f64 / 256.0);
+                    if ixfe != 15 {
+                        book.dropped.insert("column and row formats");
+                    }
                     if grbit & 0x0700 != 0 {
                         book.dropped.insert("outlines (grouped rows and columns)");
                     }
@@ -971,8 +999,13 @@ fn read_sheet(
                     let miy = c.u16()?;
                     c.take(4)?;
                     let grbit = c.u16()?;
+                    let ixfe = c.u16().unwrap_or(15) & 0x0FFF;
                     let hidden = grbit & 0x0020 != 0;
                     let height = (grbit & 0x0040 != 0).then_some((miy & 0x7FFF) as f64 / 20.0);
+                    // fGhostDirty: the row has a format of its own.
+                    if grbit & 0x0080 != 0 && ixfe != 15 {
+                        book.dropped.insert("column and row formats");
+                    }
                     if grbit & 0x0007 != 0 {
                         book.dropped.insert("outlines (grouped rows and columns)");
                     }
@@ -1019,6 +1052,16 @@ fn read_sheet(
                 }
                 0x00B0 => {
                     book.dropped.insert("PivotTables");
+                }
+                0x00E9 => {
+                    book.dropped.insert("sheet backgrounds");
+                }
+                // SHEETEXT: a tab colour other than automatic (0x7F).
+                0x0862 => {
+                    c.take(12)?;
+                    if c.u32()? >= 20 && c.u32()? & 0x7F != 0x7F {
+                        book.dropped.insert("sheet tab colors");
+                    }
                 }
                 0x00AE => {
                     book.dropped.insert("scenarios");
@@ -1804,6 +1847,113 @@ pub(crate) mod tests {
         assert_eq!(
             opened.dropped,
             ["VB project", "pictures, shapes and charts"]
+        );
+    }
+
+    /// Workbook and sheet settings the model has no place for (#874 r8).
+    #[test]
+    fn unmodelled_settings_are_dropped_by_name() {
+        let name = |flags: u16, text: &str| {
+            let mut n = flags.to_le_bytes().to_vec();
+            n.extend([0, text.len() as u8, 0, 0]);
+            n.extend([0; 9]);
+            n.extend(text.as_bytes());
+            rec(0x0018, &n)
+        };
+        let sheetext = |icv: u32| {
+            let mut b = vec![0u8; 12];
+            b.extend(20u32.to_le_bytes());
+            b.extend(icv.to_le_bytes());
+            rec(0x0862, &b)
+        };
+        let colinfo = |ixfe: u16| rec(0x007D, &[0, 0, 0, 0, 0x92, 0x08, ixfe as u8, 0, 0, 0, 0, 0]);
+        let row = |grbit: u16, ixfe: u16| {
+            let mut b = vec![0u8; 12];
+            b[6] = 0x2C;
+            b[7] = 0x01;
+            b.extend(grbit.to_le_bytes());
+            b.extend(ixfe.to_le_bytes());
+            rec(0x0208, &b)
+        };
+        let globals: Vec<(Vec<u8>, &str)> = vec![
+            (
+                rec(0x005B, &[1, 0, 0, 0, 0, 0]),
+                "password to modify and read-only recommendation",
+            ),
+            (
+                rec(0x005B, &[0, 0, 0x34, 0x12, 0, 0]),
+                "password to modify and read-only recommendation",
+            ),
+            (rec(0x0019, &[1, 0]), "workbook protection"),
+            (
+                name(0x01, "Secret"),
+                "hidden defined names (saved as visible)",
+            ),
+        ];
+        for (r, want) in globals {
+            let book = read(&workbook(&[r], &[])).unwrap();
+            assert_eq!(book.dropped.iter().copied().collect::<Vec<_>>(), [want]);
+        }
+        let sheet: Vec<(Vec<u8>, &str)> = vec![
+            (rec(0x00E9, &[9, 0, 1, 0]), "sheet backgrounds"),
+            (sheetext(10), "sheet tab colors"),
+            (colinfo(17), "column and row formats"),
+            (row(0x0180, 17), "column and row formats"),
+        ];
+        for (r, want) in sheet {
+            let book = read(&workbook(&[], &[r])).unwrap();
+            assert_eq!(book.dropped.iter().copied().collect::<Vec<_>>(), [want]);
+        }
+        // Their defaults are no loss: no share settings, no protection, a
+        // hidden function name, an automatic tab colour, the default xf.
+        let plain_globals = [
+            rec(0x005B, &[0; 6]),
+            rec(0x0019, &[0, 0]),
+            name(0x03, "_xlfn.MAXIFS"),
+        ];
+        let plain_sheet = [
+            sheetext(0x7F),
+            colinfo(15),
+            row(0x0100, 15),
+            row(0x0100, 17),
+        ];
+        assert!(
+            read(&workbook(&plain_globals, &plain_sheet))
+                .unwrap()
+                .dropped
+                .is_empty()
+        );
+    }
+
+    /// A COLINFO's width counts without fUserSet (xlwt and other writers
+    /// leave it clear), except Excel's default width for the sheet.
+    #[test]
+    fn colinfo_widths_count_without_f_user_set() {
+        let colinfo = |first: u16, last: u16, coldx: u16, grbit: u16| {
+            let mut b = Vec::new();
+            for v in [first, last, coldx, 15, grbit, 0] {
+                b.extend(v.to_le_bytes());
+            }
+            rec(0x007D, &b)
+        };
+        let cols = |sheet: &[Vec<u8>]| read(&workbook(&[], sheet)).unwrap().sheets[0].cols.clone();
+        // xlwt's 0x0B6D (11.43 characters), flags clear.
+        assert_eq!(
+            cols(&[colinfo(1, 2, 0x0B6D, 0)]),
+            [(1, 2, Some(0x0B6D as f64 / 256.0), false)]
+        );
+        // Excel's default for DEFCOLWIDTH 8 (2194) is no width.
+        assert!(cols(&[rec(0x0055, &[8, 0]), colinfo(0, 255, 2194, 0)]).is_empty());
+        // Nor is STANDARDWIDTH's, when the sheet has one.
+        assert!(cols(&[rec(0x0099, &[0, 12]), colinfo(0, 255, 0x0C00, 0)]).is_empty());
+        assert_eq!(
+            cols(&[rec(0x0099, &[0, 12]), colinfo(0, 0, 2194, 0)]),
+            [(0, 0, Some(2194.0 / 256.0), false)]
+        );
+        // fUserSet keeps a width that equals the default.
+        assert_eq!(
+            cols(&[colinfo(3, 3, 2194, 2)]),
+            [(3, 3, Some(2194.0 / 256.0), false)]
         );
     }
 
