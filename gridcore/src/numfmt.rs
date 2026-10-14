@@ -596,17 +596,7 @@ impl NumFormat {
 
     /// Render a text value (through the `@` section when present).
     pub fn format_text(&self, s: &str) -> String {
-        // The 4th section (or any section with @) formats text.
-        let sect = self
-            .sections
-            .iter()
-            .find(|x| x.is_text)
-            .or(if self.sections.len() == 4 {
-                self.sections.get(3)
-            } else {
-                None
-            });
-        match sect {
+        match self.text_section() {
             None => s.to_string(),
             Some(sect) => {
                 let mut out = String::new();
@@ -621,6 +611,34 @@ impl NumFormat {
                 out
             }
         }
+    }
+
+    /// [`Self::format_text`], or `None` when the result would be longer than
+    /// `max_units` UTF-16 units. The length is summed before anything is
+    /// built, so a value repeated by many `@` never allocates past the cap.
+    pub fn format_text_capped(&self, s: &str, max_units: usize) -> Option<String> {
+        let s_units = s.encode_utf16().count();
+        let units = match self.text_section() {
+            None => s_units,
+            Some(sect) => sect.toks.iter().fold(0usize, |acc, t| match t {
+                Tok::TextValue | Tok::General => acc.saturating_add(s_units),
+                Tok::Lit(l) => acc.saturating_add(l.encode_utf16().count()),
+                _ => acc,
+            }),
+        };
+        (units <= max_units).then(|| self.format_text(s))
+    }
+
+    /// The section that formats text: the one with `@`, else the 4th.
+    fn text_section(&self) -> Option<&Section> {
+        self.sections
+            .iter()
+            .find(|x| x.is_text)
+            .or(if self.sections.len() == 4 {
+                self.sections.get(3)
+            } else {
+                None
+            })
     }
 
     /// Is this format date-flavored (drives right-alignment etc.)?
@@ -1292,6 +1310,24 @@ mod tests {
         assert_eq!(f.format_text("pen"), "Item: pen");
         let f = parse_format("@").unwrap();
         assert_eq!(f.format_text("x"), "x");
+    }
+
+    #[test]
+    fn format_text_capped_counts_value_and_literals() {
+        let f = parse_format("@@").unwrap();
+        assert_eq!(f.format_text_capped("ab", 4).as_deref(), Some("abab"));
+        assert_eq!(f.format_text_capped("ab", 3), None);
+        // A literal counts, in UTF-16 units (U+1F600 is 2).
+        let f = parse_format("\"\u{1F600}: \"@").unwrap();
+        assert_eq!(
+            f.format_text_capped("x", 5).as_deref(),
+            Some("\u{1F600}: x")
+        );
+        assert_eq!(f.format_text_capped("x", 4), None);
+        // No text section: the value as is.
+        let f = parse_format("0.00").unwrap();
+        assert_eq!(f.format_text_capped("abc", 3).as_deref(), Some("abc"));
+        assert_eq!(f.format_text_capped("abc", 2), None);
     }
 
     #[test]
