@@ -717,7 +717,15 @@ const XLS_DROPPED: &[(&str, &[&str])] = &[
     ("oracle-basic.xls", &["page setup"]),
     ("shape-amortization.xls", &["page setup"]),
     ("shape-gradebook.xls", &["page setup"]),
-    ("shape-salestable.xls", &["page setup"]),
+    // Its table, which Excel wrote as a list (FEATURE11): the import keeps
+    // the cells, as Save As .xls from its .xlsx says.
+    (
+        "shape-salestable.xls",
+        &[
+            "page setup",
+            "tables (their cells are kept as plain ranges)",
+        ],
+    ),
     ("chart-embedded.xls", &["pictures, shapes and charts"]),
     // `SUM([1]!Prices)` and `[1]!Half*2`, names of another workbook.
     (

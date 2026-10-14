@@ -190,15 +190,53 @@ pub fn open_workbook_ex(data: &[u8]) -> Result<Opened, OpenError> {
         if has("\u{5}SummaryInformation") || has("\u{5}DocumentSummaryInformation") {
             book.dropped.insert("document properties");
         }
-        // A PivotTable's cache.
-        if cfb
-            .paths()
-            .iter()
-            .any(|p| p.to_ascii_lowercase().starts_with("_sx_db_cur"))
-        {
-            book.dropped.insert("PivotTables");
+        // Every other stream and storage, by its top-level name.
+        let mut other: BTreeSet<String> = BTreeSet::new();
+        for path in cfb.paths() {
+            let top = path.split(['/', '\\']).next().unwrap_or(&path);
+            let lower = top.to_ascii_lowercase();
+            match lower.as_str() {
+                "workbook"
+                | "book"
+                | "\u{5}summaryinformation"
+                | "\u{5}documentsummaryinformation"
+                | "\u{1}compobj"
+                | "\u{1}ole"
+                | "_vba_project_cur" => {}
+                // A PivotTable's cache.
+                "_sx_db_cur" => {
+                    book.dropped.insert("PivotTables");
+                }
+                "revision log" | "user names" => {
+                    book.dropped.insert("shared workbook revision history");
+                }
+                "msodatastore" => {
+                    book.dropped.insert("custom XML data");
+                }
+                "ctls" => {
+                    book.dropped.insert("embedded objects and controls");
+                }
+                _ if lower.starts_with("mbd") => {
+                    book.dropped.insert("embedded objects and controls");
+                }
+                _ => {
+                    other.insert(top.to_string());
+                }
+            }
         }
         let mut dropped: Vec<String> = book.dropped.iter().map(|d| d.to_string()).collect();
+        if !book.unknown_records.is_empty() {
+            let ids: Vec<String> = book
+                .unknown_records
+                .iter()
+                .map(|t| format!("0x{t:04X}"))
+                .collect();
+            dropped.push(format!("other features (records {})", ids.join(", ")));
+        }
+        if !other.is_empty() {
+            let names: Vec<String> = other.into_iter().collect();
+            dropped.push(format!("other workbook content ({})", names.join(", ")));
+        }
         let (formulas, names) = (book.unread_formulas, book.unread_names);
         let (pkg, more_formulas, more_names) = book.build_counted();
         let plural = xls_write::plural;
@@ -331,6 +369,9 @@ pub(crate) struct BookIn {
     pub unread_formulas: usize,
     /// Defined names the reader couldn't read, left out.
     pub unread_names: usize,
+    /// The ids of records the `.xls` reader neither reads nor knows to hold
+    /// nothing a person sees: named as "other features".
+    pub unknown_records: BTreeSet<u16>,
     pub names: Vec<DefinedName>,
     /// The external books formulas name, `[1]` first.
     pub external_links: Vec<ExternalLink>,
