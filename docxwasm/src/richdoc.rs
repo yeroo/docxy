@@ -382,6 +382,10 @@ impl SegWriter<'_, '_> {
             Inline::Raw(xml) => {
                 if let Some(extra) = image_extra(xml, self.ctx.rels) {
                     self.atom("img", width, "", &extra);
+                } else if width == 1 {
+                    // An inline picture whose media does not resolve is still
+                    // its one offset (#1242), drawn as an empty box.
+                    self.atom("box", width, "", "");
                 } else if let Some(id) = attr(xml, "w:commentReference", "w:id") {
                     let mut extra = String::from(",\"id\":");
                     json::push_str(&mut extra, &id);
