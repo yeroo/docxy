@@ -1357,7 +1357,7 @@ fn structured_to_string(
 // Serializer
 // ---------------------------------------------------------------------------
 
-fn prec(e: &Expr) -> u8 {
+pub(crate) fn prec(e: &Expr) -> u8 {
     match e {
         Expr::Bin(op, ..) => match op {
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => 1,

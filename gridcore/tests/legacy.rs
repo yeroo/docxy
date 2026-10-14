@@ -691,9 +691,10 @@ fn xls_corpus() -> Vec<std::path::PathBuf> {
     files
 }
 
-/// What the import of each corpus `.xls` leaves out, by file; every other
-/// file has nothing. The 17 workbooks of corpus/xlsx have margins other
-/// than Excel's Normal ones, which their `.xls` keep.
+/// What the import of each corpus `.xls` leaves out besides its document
+/// properties (every file Excel writes has them), by file; every other
+/// file has nothing else. The 17 workbooks of corpus/xlsx have margins
+/// other than Excel's Normal ones, which their `.xls` keep.
 const XLS_DROPPED: &[(&str, &[&str])] = &[
     ("calc-3d.xls", &["page setup"]),
     ("calc-arithmetic.xls", &["page setup"]),
@@ -736,10 +737,13 @@ fn xls_corpus_round_trips_through_the_writer() {
         let file = path.file_name().unwrap().to_string_lossy().into_owned();
         let first = gridcore::legacy::open_workbook_ex(&std::fs::read(path).unwrap())
             .unwrap_or_else(|e| panic!("{file}: {e}"));
-        let want_dropped = XLS_DROPPED
+        let mut want_dropped: Vec<&str> = XLS_DROPPED
             .iter()
             .find(|d| d.0 == file)
-            .map_or(&[][..], |d| d.1);
+            .map_or(&[][..], |d| d.1)
+            .to_vec();
+        want_dropped.push("document properties");
+        want_dropped.sort_unstable();
         assert_eq!(first.dropped, want_dropped, "{file}: dropped");
         let out = gridcore::legacy::write_xls(&first.pkg);
         let want_lost = XLS_LOST

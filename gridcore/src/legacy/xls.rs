@@ -270,24 +270,10 @@ impl Names for Globals {
 
 /// The `_xlnm.` names of BIFF8's built-in name codes.
 fn builtin_name(code: u8) -> String {
-    let n = match code {
-        0x00 => "Consolidate_Area",
-        0x01 => "Auto_Open",
-        0x02 => "Auto_Close",
-        0x03 => "Extract",
-        0x04 => "Database",
-        0x05 => "Criteria",
-        0x06 => "Print_Area",
-        0x07 => "Print_Titles",
-        0x08 => "Recorder",
-        0x09 => "Data_Form",
-        0x0A => "Auto_Activate",
-        0x0B => "Auto_Deactivate",
-        0x0C => "Sheet_Title",
-        0x0D => "_FilterDatabase",
-        _ => return format!("_xlnm.Builtin_{code}"),
-    };
-    format!("_xlnm.{n}")
+    match super::BUILTIN_NAMES.get(code as usize) {
+        Some(n) => format!("_xlnm.{n}"),
+        None => format!("_xlnm.Builtin_{code}"),
+    }
 }
 
 const BOF: u16 = 0x0809;

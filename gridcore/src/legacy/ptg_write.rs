@@ -28,7 +28,7 @@
 //! What BIFF8 can't hold makes the formula fail with a [`Why`], and the
 //! writer keeps the cell's value without it.
 
-use crate::formula::{BinOp, CellRef, ExcelError, Expr, UnOp, parse};
+use crate::formula::{BinOp, CellRef, ExcelError, Expr, UnOp, is_volatile, parse, prec};
 use crate::sheet::Workbook;
 
 use super::ftab;
@@ -110,6 +110,9 @@ pub(crate) const MAX_ROW: i64 = 0xFFFF;
 pub(crate) const MAX_COL: i64 = 0xFF;
 /// The longest `rgce` Excel writes (its formula limit, in bytes).
 const MAX_RGCE: usize = 1800;
+/// The most tokens and extra data a record holds: its body's limit, 8224
+/// bytes, less the fixed fields before them (a FORMULA's 22, the most).
+const MAX_TOKENS: usize = 8224 - 22 - 4;
 /// `ptgFuncVar` counts arguments in 7 bits.
 const MAX_ARGS: usize = 127;
 
@@ -169,12 +172,14 @@ pub(crate) fn compile(src: &str, site: Site, t: &mut dyn Tables) -> Result<Compi
         Site::Name { .. } => Class::Ref,
     };
     c.expr(&e, top)?;
-    if c.out.rgce.len() > MAX_RGCE {
+    // The tokens and their extra data go in one FORMULA, ARRAY or NAME
+    // record, after its fixed fields.
+    if c.out.rgce.len() > MAX_RGCE || c.out.rgce.len() + c.out.extra.len() > MAX_TOKENS {
         return Err(Why::TooLong);
     }
     // Excel marks a formula with a volatile function so it recalculates
     // on every calculation: tAttrSemi first.
-    if volatile(&e) {
+    if is_volatile(&e) {
         let mut rgce = vec![0x19, 0x01, 0, 0];
         rgce.extend_from_slice(&c.out.rgce);
         c.out.rgce = rgce;
@@ -245,39 +250,6 @@ fn mark_external_calls(src: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     out.into()
-}
-
-/// Whether `e` calls a function Excel recalculates every time.
-fn volatile(e: &Expr) -> bool {
-    match e {
-        Expr::Func(name, args) => {
-            matches!(
-                name.as_str(),
-                "NOW" | "TODAY" | "RAND" | "RANDBETWEEN" | "OFFSET" | "INDIRECT" | "INFO" | "CELL"
-            ) || args.iter().any(volatile)
-        }
-        Expr::Un(_, x) => volatile(x),
-        Expr::Bin(_, a, b) => volatile(a) || volatile(b),
-        Expr::Call(f, args) => volatile(f) || args.iter().any(volatile),
-        _ => false,
-    }
-}
-
-/// The printer's precedence ([`crate::formula::to_string`]'s), which
-/// decides where parentheses go.
-fn prec(e: &Expr) -> u8 {
-    match e {
-        Expr::Bin(op, ..) => match op {
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => 1,
-            BinOp::Concat => 2,
-            BinOp::Add | BinOp::Sub => 3,
-            BinOp::Mul | BinOp::Div => 4,
-            BinOp::Pow => 5,
-        },
-        Expr::Un(UnOp::Neg | UnOp::Pos | UnOp::Implicit, _) => 6,
-        Expr::Un(UnOp::Percent, _) => 7,
-        _ => 8,
-    }
 }
 
 /// A function's parameter classes, as a pattern: one letter per parameter
@@ -1058,6 +1030,10 @@ pub(crate) mod tests {
         assert_eq!(round("_xll.FOO(A1)").unwrap(), "_xll.FOO(A1)");
         assert_eq!(round("_xlfn.LAMBDA(_xlpm.x,_xlpm.x)(1)"), Err(Why::Lambda));
         assert_eq!(round("_xlfn.LET(_xlpm.x,1,_xlpm.x)"), Err(Why::Lambda));
+        // An array constant too big for one record.
+        let row = vec!["\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""; 30].join(",");
+        let big = format!("{{{}}}", vec![row; 10].join(";"));
+        assert_eq!(round(&big), Err(Why::TooLong));
         let long = format!("\"{}\"", "x".repeat(256));
         assert_eq!(round(&long), Err(Why::LongText));
         assert!(round(&format!("\"{}\"", "x".repeat(255))).is_ok());

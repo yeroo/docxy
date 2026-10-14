@@ -275,6 +275,27 @@ fn unsupported_features(pkg: &SheetPackage) -> Vec<String> {
     }) {
         out.push("theme colors");
     }
+    // The .xls gets no property-set streams (#874 follow-up).
+    let p = pkg.doc_properties();
+    let set = |v: &Option<String>| v.as_deref().is_some_and(|t| !t.is_empty());
+    if [
+        &p.title,
+        &p.subject,
+        &p.creator,
+        &p.keywords,
+        &p.description,
+        &p.last_modified_by,
+        &p.category,
+        &p.company,
+        &p.manager,
+        &p.hyperlink_base,
+    ]
+    .into_iter()
+    .any(set)
+        || !p.custom.is_empty()
+    {
+        out.push("document properties");
+    }
     let mut v: Vec<String> = out.into_iter().map(str::to_string).collect();
     for m in pkg.macro_features() {
         v.push(m.to_string());
@@ -487,7 +508,10 @@ impl StyleTable {
         // The palette: the default one, with each colour it lacks put in a
         // slot no needed colour uses; past 56 colours, the nearest.
         let mut palette = DEFAULT_PALETTE;
+        // Slot 0 (palette 8, black) stays black: a thin box border is
+        // written in it.
         let mut taken = [false; 56];
+        taken[0] = true;
         for c in &colors {
             if let Some(i) = palette.iter().position(|p| p == c) {
                 taken[i] = true;
@@ -908,23 +932,7 @@ fn external_links(pkg: &SheetPackage) -> Vec<Option<Link>> {
 /// table spells them.
 fn builtin_code(name: &str) -> Option<u8> {
     let n = name.strip_prefix("_xlnm.")?;
-    let codes = [
-        "Consolidate_Area",
-        "Auto_Open",
-        "Auto_Close",
-        "Extract",
-        "Database",
-        "Criteria",
-        "Print_Area",
-        "Print_Titles",
-        "Recorder",
-        "Data_Form",
-        "Auto_Activate",
-        "Auto_Deactivate",
-        "Sheet_Title",
-        "_FilterDatabase",
-    ];
-    codes
+    super::BUILTIN_NAMES
         .iter()
         .position(|c| c.eq_ignore_ascii_case(n))
         .map(|i| i as u8)
@@ -1762,6 +1770,12 @@ mod tests {
         assert!(write_xls(&pkg).lost.is_empty());
         pkg.workbook.sheets[0].page_setup.orientation = crate::print::setup::Orientation::Landscape;
         assert_eq!(write_xls(&pkg).lost, ["page setup"]);
+        // Document properties go in streams this doesn't write.
+        let mut pkg = book(&[(0, 0, Cell::number(1.0))]);
+        let mut p = pkg.doc_properties();
+        p.title = Some("Budget".into());
+        pkg.set_doc_properties(&p).unwrap();
+        assert_eq!(write_xls(&pkg).lost, ["document properties"]);
     }
 
     #[test]
@@ -1965,6 +1979,56 @@ mod tests {
         let (back, _) = round(&pkg);
         assert_eq!(back.workbook.sheets[0].freeze, (3, 0));
         assert_eq!(back.workbook.active_tab, 1);
+    }
+
+    /// More colours than the palette has free slots never take black's:
+    /// a bordered cell's border stays black (palette 8).
+    #[test]
+    fn custom_colours_leave_the_border_colour_black() {
+        let mut pkg = book(&[(0, 0, Cell::number(1.0))]);
+        for i in 0..70u32 {
+            let mut xf = Xf::default();
+            xf.fill = Some((1, (i * 3) as u8, 200));
+            xf.border = i == 69;
+            let style = pkg.workbook.styles.intern(xf);
+            pkg.workbook.sheets[0].set_cell(
+                i + 1,
+                0,
+                Cell {
+                    style,
+                    ..Cell::number(1.0)
+                },
+            );
+        }
+        let out = write_xls(&pkg);
+        check_xls(&out.bytes).unwrap();
+        let cfb = opccore::cfb::Cfb::open(&out.bytes).unwrap();
+        let s = cfb.read_stream("Workbook").unwrap();
+        let pal = find(&s, 0x0092);
+        assert_eq!(&s[pal + 6..pal + 9], &[0, 0, 0], "palette 8 is black");
+        // Every bordered XF draws its sides in palette 8.
+        let mut at = 0;
+        let mut bordered = 0;
+        while at + 4 <= s.len() {
+            let ty = u16::from_le_bytes([s[at], s[at + 1]]);
+            let len = u16::from_le_bytes([s[at + 2], s[at + 3]]) as usize;
+            if ty == 0x00E0 {
+                let b = &s[at + 4..at + 4 + len];
+                let dg = u32::from_le_bytes([b[10], b[11], b[12], b[13]]);
+                if dg & 0xFFFF == 0x1111 {
+                    bordered += 1;
+                    assert_eq!((dg >> 16) & 0x7F, 8);
+                    assert_eq!((dg >> 23) & 0x7F, 8);
+                    let more = u32::from_le_bytes([b[14], b[15], b[16], b[17]]);
+                    assert_eq!((more & 0x7F, (more >> 7) & 0x7F), (8, 8));
+                }
+            }
+            if ty == 0x000A && at > 0 {
+                break;
+            }
+            at += 4 + len;
+        }
+        assert_eq!(bordered, 1);
     }
 
     /// The offset of the first record of type `ty`.

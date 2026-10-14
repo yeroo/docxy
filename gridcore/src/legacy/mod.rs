@@ -161,6 +161,11 @@ pub fn open_workbook_ex(data: &[u8]) -> Result<Opened, OpenError> {
         {
             book.dropped.insert("VB project");
         }
+        // Title, author and the rest: property-set streams the import
+        // doesn't read.
+        if has("\u{5}SummaryInformation") || has("\u{5}DocumentSummaryInformation") {
+            book.dropped.insert("document properties");
+        }
         let dropped = book.dropped.iter().map(|d| d.to_string()).collect();
         return Ok(Opened {
             pkg: book.build(),
@@ -916,6 +921,25 @@ pub(crate) fn set_array(
     cell.spill = Some((r2 - r1 + 1, c2 - c1 + 1));
     true
 }
+
+/// BIFF8's built-in defined names (`_xlnm.` and these), by their code
+/// (shared by the `.xls` reader and writer).
+pub(crate) const BUILTIN_NAMES: [&str; 14] = [
+    "Consolidate_Area",
+    "Auto_Open",
+    "Auto_Close",
+    "Extract",
+    "Database",
+    "Criteria",
+    "Print_Area",
+    "Print_Titles",
+    "Recorder",
+    "Data_Form",
+    "Auto_Activate",
+    "Auto_Deactivate",
+    "Sheet_Title",
+    "_FilterDatabase",
+];
 
 /// The error text of a BIFF error code (shared by BIFF8 and BIFF12).
 pub(crate) fn biff_error(code: u8) -> &'static str {
