@@ -571,3 +571,194 @@ fn every_tabs_key_tips_are_prefix_free() {
     // The contextual tab's own KeyTip is the one its strip entry shows.
     assert_eq!(hf_tab().key_tip, "J");
 }
+
+/// #770: the three-section document with Different Odd & Even Pages on as
+/// its file says (`w:evenAndOddHeaders`), section 1's even header "Even A"
+/// and even footer "Even FA", section 3's even header "Even C".
+fn odd_even(name: &str) -> DocTab {
+    let mut t = three_sections(name, true);
+    let pkg = t.pkg.as_mut().unwrap();
+    let hp = |s: &str| format!("<w:p><w:r><w:t>{s}</w:t></w:r></w:p>");
+    let (a, _) = pkg.create_hf_part(true, &hp("Even A")).unwrap();
+    let (fa, _) = pkg.create_hf_part(false, &hp("Even FA")).unwrap();
+    let (c, _) = pkg.create_hf_part(true, &hp("Even C")).unwrap();
+    pkg.set_even_odd(true);
+    ed_mut(&mut t).edit_sections(&[0], |raw| {
+        let raw = set_hf_reference(raw, true, "even", Some(&a));
+        set_hf_reference(&raw, false, "even", Some(&fa))
+    });
+    ed_mut(&mut t).edit_sections(&[2], |raw| set_hf_reference(raw, true, "even", Some(&c)));
+    let dir = tmp_dir(name);
+    let path = dir.join("odd-even.docx");
+    std::fs::write(&path, doc_to_docx(&ed(&t).doc, &t.comments, t.pkg.as_ref())).unwrap();
+    let t = tab_from_path(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(hf_checked(&t, HfAct::DifferentOddEven));
+    assert!(ed(&t).undo_names().is_empty(), "loaded with no history");
+    t
+}
+
+/// Each section's (even header, even footer) references.
+fn even_refs(sections: &[String]) -> Vec<(bool, bool)> {
+    sections
+        .iter()
+        .map(|s| {
+            (
+                hf_reference(s, true, "even").is_some(),
+                hf_reference(s, false, "even").is_some(),
+            )
+        })
+        .collect()
+}
+
+/// Each section's (default header, default footer) references.
+fn default_refs(sections: &[String]) -> Vec<(bool, bool)> {
+    sections
+        .iter()
+        .map(|s| {
+            (
+                hf_reference(s, true, "default").is_some(),
+                hf_reference(s, false, "default").is_some(),
+            )
+        })
+        .collect()
+}
+
+const LOADED_EVEN: [(bool, bool); 3] = [(true, true), (false, false), (true, false)];
+const NO_EVEN: [(bool, bool); 3] = [(false, false); 3];
+
+/// The body editor's undo (`redo` false) or redo, as Ctrl+Z / Ctrl+Y end:
+/// the tab turns dirty, which brings the package's settings in step.
+fn body_history(t: &mut DocTab, redo: bool) {
+    let ed = ed_mut(t);
+    assert!(if redo { ed.redo() } else { ed.undo() });
+    t.set_dirty();
+}
+
+/// #770 criteria 1 and 5: clearing Different Odd & Even Pages drops every
+/// section's even header and footer and keeps the others, and Save writes
+/// neither the setting nor the even references.
+#[test]
+fn clearing_odd_even_drops_even_references_in_every_section() {
+    let mut t = odd_even("odd-even-clear");
+    let defaults = default_refs(&ed(&t).sections());
+    assert_eq!(even_refs(&ed(&t).sections()), LOADED_EVEN);
+    edit_at(&mut t, 0, true);
+    hf_apply(&mut t, HfAct::DifferentOddEven).unwrap();
+    assert!(!hf_checked(&t, HfAct::DifferentOddEven));
+    assert!(!t.pkg.as_ref().unwrap().has_even_odd());
+    assert_eq!(even_refs(&ed(&t).sections()), NO_EVEN);
+    assert_eq!(default_refs(&ed(&t).sections()), defaults);
+    assert_eq!(t.status.as_ref(), "Different Odd & Even Pages: off");
+    let pkg = saved(&mut t);
+    assert!(!pkg.has_even_odd());
+    assert_eq!(even_refs(&saved_sections(&pkg)), NO_EVEN);
+    assert_eq!(saved_hf(&pkg, 0, true), "Header A");
+    assert_eq!(saved_hf(&pkg, 2, true), "Header C");
+}
+
+/// #770 criterion 2: turned on again, the even pages start with a new,
+/// empty header, not the one cleared.
+#[test]
+fn odd_even_on_again_starts_with_empty_even_headers() {
+    let mut t = odd_even("odd-even-again");
+    let old = resolved_part(&t, 0, true, HeaderVariant::Even).unwrap();
+    edit_at(&mut t, 0, true);
+    hf_apply(&mut t, HfAct::DifferentOddEven).unwrap();
+    hf_apply(&mut t, HfAct::DifferentOddEven).unwrap();
+    assert!(hf_checked(&t, HfAct::DifferentOddEven));
+    assert_eq!(t.status.as_ref(), "Different Odd & Even Pages: on");
+    assert_eq!(even_refs(&ed(&t).sections()), NO_EVEN);
+    assert_eq!(resolved_part(&t, 0, true, HeaderVariant::Even), None);
+    assert!(crate::hf::open(&mut t, 0, true, HeaderVariant::Even));
+    let h = t.hf_edit.as_ref().unwrap();
+    assert_ne!(h.part_name, old);
+    assert_eq!(edited_text(&t), "");
+}
+
+/// #770 criteria 3 and 5: either way the toggle is one undo step, named,
+/// and an undo or redo brings the setting and the even references back
+/// together, into the package and what Save writes.
+#[test]
+fn odd_even_toggle_is_one_undo_step() {
+    let mut t = odd_even("odd-even-undo");
+    edit_at(&mut t, 0, true);
+    hf_apply(&mut t, HfAct::DifferentOddEven).unwrap();
+    exit_hf_tab(&mut t);
+    assert_eq!(
+        ed(&t).undo_names(),
+        vec!["Different Odd & Even Pages".to_string()]
+    );
+    body_history(&mut t, false);
+    assert!(hf_checked(&t, HfAct::DifferentOddEven));
+    assert_eq!(even_refs(&ed(&t).sections()), LOADED_EVEN);
+    let pkg = saved(&mut t);
+    assert!(pkg.has_even_odd());
+    assert_eq!(even_refs(&saved_sections(&pkg)), LOADED_EVEN);
+    body_history(&mut t, true);
+    assert!(!hf_checked(&t, HfAct::DifferentOddEven));
+    assert_eq!(even_refs(&ed(&t).sections()), NO_EVEN);
+    // Turning it on is one step too.
+    let mut t = three_sections("odd-even-on", true);
+    edit_at(&mut t, 0, true);
+    hf_apply(&mut t, HfAct::DifferentOddEven).unwrap();
+    assert!(hf_checked(&t, HfAct::DifferentOddEven));
+    exit_hf_tab(&mut t);
+    assert_eq!(
+        ed(&t).undo_names(),
+        vec!["Different Odd & Even Pages".to_string()]
+    );
+    body_history(&mut t, false);
+    assert!(!hf_checked(&t, HfAct::DifferentOddEven));
+    body_history(&mut t, true);
+    assert!(hf_checked(&t, HfAct::DifferentOddEven));
+}
+
+/// #770 criterion 4: the editor starts with the file's setting, so undoing
+/// an unrelated edit leaves it on.
+#[test]
+fn loaded_even_odd_flag_survives_an_unrelated_undo() {
+    let mut t = odd_even("odd-even-unrelated");
+    ed_mut(&mut t).insert_str("x");
+    t.set_dirty();
+    body_history(&mut t, false);
+    assert!(hf_checked(&t, HfAct::DifferentOddEven));
+    assert!(saved(&mut t).has_even_odd());
+}
+
+/// #770 criterion 6: clearing it while an even header is open goes to the
+/// odd one, and the even header's typing, kept in its part, comes back
+/// with the undo.
+#[test]
+fn clearing_odd_even_in_an_even_header_reopens_the_odd_one() {
+    let mut t = odd_even("odd-even-open");
+    assert!(crate::hf::open(&mut t, 0, true, HeaderVariant::Even));
+    assert_eq!(edited_text(&t), "Even A");
+    type_at_start(&mut t, "typed ");
+    hf_apply(&mut t, HfAct::DifferentOddEven).unwrap();
+    assert_eq!(slot(&t), (0, HeaderVariant::Default, true));
+    assert_eq!(edited_text(&t), "Header A");
+    exit_hf_tab(&mut t);
+    body_history(&mut t, false);
+    assert!(crate::hf::open(&mut t, 0, true, HeaderVariant::Even));
+    assert_eq!(edited_text(&t), "typed Even A");
+}
+
+/// #770 r1: a settings part the toggle cannot change (here undecodable, so
+/// the checkbox reads off) refuses the click with nothing changed: no undo
+/// step and the even references kept.
+#[test]
+fn odd_even_refuses_a_settings_part_it_cannot_change() {
+    let mut t = odd_even("odd-even-unreadable");
+    let pkg = t.pkg.as_mut().unwrap();
+    assert!(pkg.set_part(
+        "word/settings.xml",
+        b"<w:settings xmlns:w=\"w\"><w:evenAndOddHeaders/>\xff</w:settings>".to_vec(),
+    ));
+    assert!(!hf_checked(&t, HfAct::DifferentOddEven));
+    let err = hf_apply(&mut t, HfAct::DifferentOddEven).unwrap_err();
+    assert!(err.starts_with("Could not change"), "{err}");
+    assert!(!hf_checked(&t, HfAct::DifferentOddEven));
+    assert!(ed(&t).undo_names().is_empty());
+    assert_eq!(even_refs(&ed(&t).sections()), LOADED_EVEN);
+}

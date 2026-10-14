@@ -4738,9 +4738,19 @@ impl DocTab {
     /// A document tab's changes go through here; sheet commits and Project
     /// edits sync `dirty` themselves and call `bump_edit_generation`
     /// directly. Either way a Repeat record taken before goes stale (#618).
+    ///
+    /// The package's settings follow the body editor's here (#770): an edit,
+    /// undo or redo of a setting reaches the file, the render and the
+    /// header/footer commands through this one place.
     fn set_dirty(&mut self) {
         self.dirty = true;
         bump_edit_generation();
+        if let (Surface::Doc(ed), Some(pkg)) = (&self.surface, self.pkg.as_mut()) {
+            let on = ed.settings().even_and_odd_headers;
+            if pkg.has_even_odd() != on {
+                pkg.set_even_odd(on);
+            }
+        }
     }
 
     /// Every edit of a workbook ends here ([`Docxy::mark_sheet_dirty`]). In
@@ -7453,9 +7463,15 @@ fn reauthor_tracking(tabs: &mut [DocTab], user_name: &str, user_initials: &str) 
 /// A document editor over `doc`, recording tracked changes when the file's
 /// settings ask for it (`w:trackRevisions`, #624), as the configured reviewer
 /// ([`configured_identity`]). The Review tab's Track Changes turns it on or
-/// off after that.
+/// off after that. It starts with the file's document settings, which
+/// [`DocTab::set_dirty`] writes back after each edit (#770).
 fn new_doc_editor(doc: Document, pkg: Option<&Package>) -> Editor {
     let mut editor = Editor::new(doc);
+    if let Some(pkg) = pkg {
+        editor.seed_settings(docxcore::editor::DocSettings {
+            even_and_odd_headers: pkg.has_even_odd(),
+        });
+    }
     if pkg.is_some_and(Package::track_revisions) {
         editor.set_track_changes(Some(track_author(&configured_identity())));
     }

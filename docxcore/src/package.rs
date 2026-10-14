@@ -1934,7 +1934,12 @@ impl Package {
         };
         let name = name.as_str();
         if let Some(b) = self.part(name) {
-            let xml = String::from_utf8_lossy(b).into_owned();
+            // Read as `settings_flag` reads and written back in the part's
+            // own encoding: a lossy read of a UTF-16 part would write U+FFFD
+            // and NULs back (#770).
+            let Some(xml) = decode_xml_part(b).map(Cow::into_owned) else {
+                return; // undecodable: leave it alone
+            };
             let cur = settings_flag_of(&xml, elem);
             if cur == Some(on) {
                 return; // already in the wanted state
@@ -1949,7 +1954,7 @@ impl Package {
                 xml
             };
             if !on {
-                self.set_part(name, xml.into_bytes());
+                self.set_part_text(name, &xml);
                 return;
             }
             // `<w:settings … />` is a legal empty root; splicing after its `>`
@@ -1970,7 +1975,7 @@ impl Package {
             } else {
                 format!("{}<{elem}/>{}", &xml[..gt + 1], &xml[gt + 1..])
             };
-            self.set_part(name, new.into_bytes());
+            self.set_part_text(name, &new);
         }
     }
 
@@ -4344,6 +4349,41 @@ mod tests {
             r#"<w:settings xmlns:w="w"><w:evenAndOddHeaders/></w:settings>"#
         );
         assert!(p.has_even_odd());
+    }
+
+    /// #770: a UTF-16 settings part keeps its encoding when a flag is cleared
+    /// or set, and the flag reads as it was written.
+    #[test]
+    fn set_settings_flag_keeps_a_utf16_part_utf16() {
+        let mut p = load_package(&make_docx("<w:document/>")).unwrap();
+        let utf16 = |text: &str| {
+            let mut out = vec![0xff, 0xfe];
+            for u in text.encode_utf16() {
+                out.extend_from_slice(&u.to_le_bytes());
+            }
+            out
+        };
+        let decoded = |p: &Package| {
+            let b = p.part("word/settings.xml").unwrap();
+            assert!(b.starts_with(&[0xff, 0xfe]), "still UTF-16 LE");
+            decode_xml_part(b).unwrap().into_owned()
+        };
+        // Creates word/settings.xml and its relationship, then made UTF-16.
+        p.set_even_odd(true);
+        assert!(p.set_part(
+            "word/settings.xml",
+            utf16(r#"<?xml version="1.0" encoding="UTF-16"?><w:settings xmlns:w="w"><w:evenAndOddHeaders/></w:settings>"#),
+        ));
+        assert!(p.has_even_odd());
+        p.set_even_odd(false);
+        assert!(!p.has_even_odd());
+        assert_eq!(
+            decoded(&p),
+            r#"<?xml version="1.0" encoding="UTF-16"?><w:settings xmlns:w="w"></w:settings>"#
+        );
+        p.set_even_odd(true);
+        assert!(p.has_even_odd());
+        assert!(decoded(&p).contains("<w:evenAndOddHeaders/>"));
     }
 
     /// Build a tiny but valid .docx in memory.
