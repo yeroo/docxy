@@ -9297,7 +9297,17 @@ impl App {
             // (the workbook stays modified), keeps the editor open with the
             // reason on the status line.
             "wq" | "x" => {
-                if self.ask_where_to_save_template_workbook() || self.save_current().is_err() {
+                if self.ask_where_to_save_template_workbook() {
+                    return false;
+                }
+                // An .xls that would lose something asks first, as Ctrl+S
+                // does (#874), and doesn't quit: a Yes saves.
+                let path = self.path.clone();
+                if let Some(lost) = self.compat_losses_to_ask(&path) {
+                    self.ask_compat(lost.clone(), ConfirmAction::SaveCompat(lost));
+                    return false;
+                }
+                if self.save_current().is_err() {
                     return false;
                 }
                 if self.modified {
@@ -14063,6 +14073,22 @@ mod tests {
                 .prompt()
                 .contains("hyperlinks; outlines")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `:wq` on an `.xls` that would lose something asks as Ctrl+S does,
+    /// and stays open; one that loses nothing saves and quits.
+    #[test]
+    fn vim_wq_asks_before_a_lossy_xls_save() {
+        let dir = tmp("compat-wq");
+        let (mut app, path) = open_xls(&dir, "extra/chart-embedded.xls", "chart.xls");
+        let original = std::fs::read(&path).unwrap();
+        assert!(!app.vim_run_command("wq"));
+        assert!(app.confirm.is_some());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        yes(&mut app);
+        assert_ne!(std::fs::read(&path).unwrap(), original);
+        assert!(app.vim_run_command("wq"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
