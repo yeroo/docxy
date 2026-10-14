@@ -50,6 +50,15 @@ bold/italic/color); reproducing Excel's visual styling is a non-goal.
   Workbook enters the mode; File > Info > Convert (`wb.convert`) replaces
   the `.xls` with an `.xlsx`. A BIFF8 file under another name (an `.xlt`)
   is still an import.
+- Protected View (#894): on Windows, a workbook whose `Zone.Identifier`
+  says it was downloaded (ZoneId 3 or 4; `opccore::zone`, shared with the
+  suite) opens in Protected View: a bar under the ribbon and
+  `[Protected View]` in the title. Navigation, Find, Go To, copying and
+  page counts (`print.pages`) work; every key, ribbon command, vim command,
+  click and control verb that would edit is refused, and nothing is
+  written, Save As and printing to PDF included, until Enable Editing (the bar's button, File › Info, or
+  `wb.enable-editing`). Enable Editing trusts the unchanged file for the
+  session. XLSTART is a trusted location, as in Excel.
 
 **Non-goals (at least initially)**
 - Full visual formatting *editing* (fonts, fills, borders); v1 renders what the

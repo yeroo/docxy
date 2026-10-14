@@ -2503,7 +2503,9 @@ impl App {
                 self.quit_requested
             }
             // docxy lists no editable Info rows, so this never arrives.
-            BackstageEvent::EditInfo(_) | BackstageEvent::Convert => false,
+            BackstageEvent::EditInfo(_)
+            | BackstageEvent::Convert
+            | BackstageEvent::EnableEditing => false,
         }
     }
 

@@ -14,6 +14,7 @@
 //! - [`xml`] — minimal pull parser tuned for OOXML.
 //! - [`cfb`] — OLE2 Compound File Binary reader (and a small writer), the
 //!   container of legacy `.xls`, `.doc` and `.mpp` files.
+//! - [`zone`] — the `Zone.Identifier` mark a downloaded file carries.
 
 pub mod cfb;
 pub mod codepage;
@@ -22,3 +23,4 @@ pub mod inflate;
 pub mod xml;
 pub mod zip;
 pub mod zipwrite;
+pub mod zone;

@@ -31,6 +31,9 @@ mod skill;
 mod textdlg;
 mod validationdlg;
 
+#[cfg(test)]
+mod protected_view_tests;
+
 // Bring the trait's methods (`extensions`, `default_save_name`, …) into scope
 // for the `impl backstage::BackstageHost for App` call sites below.
 use backstage::BackstageHost as _;
@@ -827,6 +830,11 @@ fn main() -> ExitCode {
             vim: parsed.vim,
             read_only,
             dropped,
+            source: parsed
+                .inputs
+                .first()
+                .filter(|i| !is_text_import(i))
+                .cloned(),
         },
     ) {
         Ok(()) => ExitCode::SUCCESS,
@@ -1345,13 +1353,27 @@ fn preview_lines(path: &str, width: usize) -> Vec<String> {
 /// The terminal window title: `* AppName - filename` (the `* ` only when the
 /// file has unsaved changes), and Excel's ` [Read-Only]` while the file is
 /// one opened read-only (#882) and ` [Compatibility Mode]` while it is an
-/// Excel 97-2003 workbook (#874).
-fn window_title(app: &str, path: &str, modified: bool, read_only: bool, compat: bool) -> String {
+/// Excel 97-2003 workbook (#874). Protected View (#894) says
+/// ` [Protected View]` instead of ` [Read-Only]`: it says the most.
+fn window_title(
+    app: &str,
+    path: &str,
+    modified: bool,
+    read_only: bool,
+    compat: bool,
+    protected: bool,
+) -> String {
     let name = file_name_of(path);
     format!(
         "{}{app} - {name}{}{}",
         if modified { "* " } else { "" },
-        if read_only { " [Read-Only]" } else { "" },
+        if protected {
+            " [Protected View]"
+        } else if read_only {
+            " [Read-Only]"
+        } else {
+            ""
+        },
         if compat { " [Compatibility Mode]" } else { "" }
     )
 }
@@ -1420,6 +1442,108 @@ fn read_only_refusal(path: &str) -> String {
         "\"{}\" is read-only. Save a copy under a new name.",
         file_name_of(path)
     )
+}
+
+/// What a refused edit or save says in Protected View (#894), as the suite
+/// says it (#610).
+const PROTECTED_STATUS: &str = "Protected View — select Enable Editing to edit";
+/// The Protected View message bar: Excel's label and warning (the suite's),
+/// then the button that leaves it.
+const PROTECTED_LABEL: &str = "PROTECTED VIEW";
+const PROTECTED_TEXT: &str = "Be careful—files from the Internet can contain viruses. Unless you need to edit, it's safer to stay in Protected View.";
+const ENABLE_EDITING: &str = "[Enable Editing]";
+
+/// A file's length and modified time: what Enable Editing trusts for the
+/// rest of the session (#894), so a file replaced since is not trusted
+/// with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    len: u64,
+    modified: SystemTime,
+}
+
+impl Stamp {
+    /// `path`'s stamp now; `None` when it cannot be read, which trusts
+    /// nothing.
+    fn of(path: &Path) -> Option<Stamp> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Stamp {
+            len: meta.len(),
+            modified: meta.modified().ok()?,
+        })
+    }
+}
+
+/// Excel's Protected View (#894): the workbook came from a file Windows
+/// marked as downloaded (zone 3 or 4), so nothing edits or writes it until
+/// Enable Editing.
+struct ProtectedView {
+    /// The file opened (the `.csv` or `.xls` itself, not an import's
+    /// binding).
+    source: PathBuf,
+    /// The source as it was when opened: what Enable Editing trusts.
+    stamp: Option<Stamp>,
+    /// The workbook as it was installed: an edit that slips past the gates
+    /// is rolled back to it ([`App::protected_backstop`]).
+    snapshot: SheetPackage,
+}
+
+/// Whether a key may reach the grid's commands in Protected View (#894):
+/// moving and extending the selection, switching sheets, copying, finding,
+/// Go To, the sheet list, formula view, recalculating, File, New and Quit.
+/// Everything else would edit or write, and is refused.
+fn pv_allows_key(code: KeyCode, ctrl: bool, shift: bool, alt: bool) -> bool {
+    match code {
+        KeyCode::Char(c) if ctrl && !alt => {
+            matches!(
+                c.to_ascii_lowercase(),
+                'q' | 'n' | 'c' | 'o' | '`' | 'f' | 'g' | 'a'
+            )
+        }
+        KeyCode::Char(c) if alt && !ctrl => c.eq_ignore_ascii_case(&'f'),
+        // Shift+Space selects rows; any other character would type.
+        KeyCode::Char(' ') => shift && !ctrl && !alt,
+        KeyCode::Char(_) => false,
+        // Alt+Down opens a drop-down, Alt+Shift+arrows group.
+        KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Home
+        | KeyCode::End => !alt,
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc | KeyCode::Modifier(_) => true,
+        // Enter moves the selection.
+        KeyCode::Enter => !ctrl && !alt,
+        KeyCode::F(3) => true,
+        // Shift+F4 is the sheet list; F4 repeats.
+        KeyCode::F(4) => shift,
+        // Plain F9 engaged the ribbon before this; Shift/Ctrl+F9 recalculate
+        // without refreshing pivots while protected.
+        KeyCode::F(9) => true,
+        _ => false,
+    }
+}
+
+/// Whether a vim normal/visual-mode key may run in Protected View (#894):
+/// motions, visual mode, yank, the sheet list, sheet switching, Esc, Ctrl+Q
+/// and the `:` line (whose writes are refused there). `pending` is the
+/// prefix typed before it: after `g` and `y` every key only moves or copies.
+fn pv_allows_vim_key(code: KeyCode, ctrl: bool, pending: char) -> bool {
+    if matches!(pending, 'g' | 'y') {
+        return true;
+    }
+    match code {
+        KeyCode::Char('q') | KeyCode::PageUp | KeyCode::PageDown if ctrl => true,
+        KeyCode::Char(_) if ctrl => false,
+        KeyCode::Char(
+            ':' | 'h' | 'j' | 'k' | 'l' | '0' | '$' | 'G' | 'g' | 'w' | 'b' | 'v' | 'V' | 'y',
+        ) => true,
+        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => true,
+        KeyCode::F(4) | KeyCode::Esc | KeyCode::Modifier(_) => true,
+        _ => false,
+    }
 }
 
 /// `path`'s file name, or `path` itself when it has none.
@@ -2429,6 +2553,19 @@ struct App {
     /// finish keeps read-only, unlike an interactive import. Cleared when
     /// that wizard finishes or is cancelled.
     startup_import: bool,
+    /// Protected View (#894): the workbook came from a downloaded file and
+    /// nothing edits or writes it until Enable Editing. Every install
+    /// decides it again from the file it loaded.
+    protected_view: Option<ProtectedView>,
+    /// The files Enable Editing trusted this session, by canonical path and
+    /// [`Stamp`]: one reopened unchanged opens editable.
+    session_trusted: Vec<(PathBuf, Stamp)>,
+    /// How a file's security zone is read: [`opccore::zone::zone_id`].
+    /// Tests swap it, since only Windows marks files.
+    zone_of: fn(&Path) -> Option<u32>,
+    /// Where the last frame drew the Protected View bar's Enable Editing
+    /// button: its row and columns `x1..x2`.
+    pv_button: Option<(u16, u16, u16)>,
 }
 
 impl App {
@@ -2538,6 +2675,10 @@ impl App {
             alt_startup: None,
             startup_note: None,
             startup_import: false,
+            protected_view: None,
+            session_trusted: Vec::new(),
+            zone_of: opccore::zone::zone_id,
+            pv_button: None,
             sheet_picker: None,
             dv_picker: None,
             dv_alert: None,
@@ -2615,6 +2756,9 @@ impl App {
     }
 
     fn start_edit(&mut self, initial: Option<char>) {
+        if self.refuse_protected().is_err() {
+            return;
+        }
         if self.protected() {
             self.status =
                 Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
@@ -3998,8 +4142,14 @@ impl App {
     }
 
     /// F9 — full recalculation plus pivot refresh (like Excel's refresh-all).
+    /// In Protected View (#894) the pivots keep their cached values: a
+    /// refresh changes the workbook.
     fn recalc_and_refresh(&mut self) {
         self.engine.recalc_all(&mut self.pkg.workbook);
+        if self.protected_view.is_some() {
+            self.status = Some("Recalculated; pivots kept their cached values".to_string());
+            return;
+        }
         let outcome = gridcore::pivot::refresh_pivots(&mut self.pkg.workbook);
         if !outcome.changed.is_empty() {
             self.engine
@@ -4730,6 +4880,10 @@ impl App {
     /// Ctrl+S, `:w` and the backstage's Save. On a file opened read-only it
     /// opens Save As instead (#882), as Excel does.
     fn save(&mut self) {
+        // Protected View writes nothing, before any other question (#894).
+        if self.refuse_protected().is_err() {
+            return;
+        }
         if let Err(msg) = self.refuse_read_only(&self.path) {
             self.open_prompt(PromptKind::SaveAs);
             self.status = Some(msg);
@@ -4896,6 +5050,13 @@ impl App {
     // `--csv`) have no App and guard the input at startup.
 
     fn guard_write(&self, target: &Path) -> io::Result<()> {
+        // Protected View writes nothing, Save As included (#894).
+        if self.protected_view.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                PROTECTED_STATUS,
+            ));
+        }
         self.refuse_read_only(target)
             .map_err(|msg| io::Error::new(io::ErrorKind::PermissionDenied, msg))
     }
@@ -4932,6 +5093,7 @@ impl App {
         // Save As (which binds the path first), and the control surface's
         // `wb.save`. Other file writes go through write_export,
         // write_supporting and write_backup.
+        self.refuse_protected()?;
         if let Err(msg) = self.refuse_read_only(&self.path) {
             self.status = Some(msg.clone());
             return Err(msg);
@@ -5001,6 +5163,10 @@ impl App {
     }
 
     fn save_as(&mut self, path: String) -> bool {
+        // Refused before the binding moves (#894).
+        if self.refuse_protected().is_err() {
+            return false;
+        }
         let previous = std::mem::replace(&mut self.path, path);
         // A name chosen in Save As is written as chosen, even over a file.
         let template = self.template.take();
@@ -5118,6 +5284,9 @@ impl App {
     /// workbook package, the active sheet as text, or Excel's refusal for a
     /// type nothing here writes.
     fn save_as_type(&mut self, path: String, t: usize) {
+        if self.refuse_protected().is_err() {
+            return;
+        }
         let ty = SAVE_TYPES[t];
         match save_kind(&ty) {
             SaveKind::Package => self.request_save_as_package(path),
@@ -5151,6 +5320,9 @@ impl App {
     /// (`out.csv` is CSV UTF-8, never a workbook under a `.csv` name); an
     /// extension no type has keeps the workbook package.
     fn request_save_as(&mut self, path: String) {
+        if self.refuse_protected().is_err() {
+            return;
+        }
         // The type the workbook is bound to wins while the name keeps its
         // extension: Unicode Text or CSV (Comma delimited) saved again stays
         // that type, not the first type with the extension.
@@ -5209,7 +5381,7 @@ impl App {
     /// `.xlsx` that replaces the `.xls` (and one it overwrites), and what the
     /// open left out of the workbook, which the `.xlsx` lacks too.
     fn request_convert(&mut self) {
-        if !self.compat() {
+        if !self.compat() || self.refuse_protected().is_err() {
             return;
         }
         let target = convert_target(&self.path);
@@ -5256,6 +5428,7 @@ impl App {
     /// An existing `<name>.xlsx` is replaced only with `overwrite` (the
     /// prompt names it; `wb.convert` has to ask for it).
     fn convert(&mut self, overwrite: bool) -> Result<Converted, String> {
+        self.refuse_protected()?;
         if !self.compat() {
             let msg = "the workbook is not in Compatibility Mode".to_string();
             self.status = Some(msg.clone());
@@ -6477,6 +6650,10 @@ impl App {
 
     /// Dispatch a ribbon command to the matching editor operation.
     fn ribbon_act(&mut self, act: ribbon::Act) {
+        if self.protected_view.is_some() && !ribbon::allowed_in_protected_view(act) {
+            self.status = Some(PROTECTED_STATUS.to_string());
+            return;
+        }
         use ribbon::Act::*;
         match act {
             Cut => self.copy(true),
@@ -6869,7 +7046,13 @@ impl App {
                 // A person's Open that loads ends read-only (#882), the
                 // read-only file's own included.
                 self.read_only = None;
-                self.install_workbook(l.pkg, l.path, l.import_source, l.text);
+                self.install_workbook(
+                    l.pkg,
+                    l.path,
+                    l.import_source,
+                    l.text,
+                    Some(Path::new(path)),
+                );
                 self.dropped = l.dropped;
                 self.note_import(l.format);
                 self.note_template(path);
@@ -6919,14 +7102,43 @@ impl App {
     }
 
     /// Make `pkg` (loaded from, and to be saved to, `p`) the open workbook,
-    /// bound to `p` as text when `text` says how (#761).
+    /// bound to `p` as text when `text` says how (#761). `source` is the file
+    /// it was read from (`None` for a new workbook, or one started from a
+    /// template): Protected View is decided again from it (#894), so every
+    /// way a workbook arrives says where it came from.
     fn install_workbook(
         &mut self,
         pkg: SheetPackage,
         p: String,
         import_source: Option<String>,
         text: Option<TextBound>,
+        source: Option<&Path>,
     ) {
+        self.load_pkg(pkg);
+        self.path = p;
+        self.import_source = import_source;
+        self.bind_text(text);
+        self.template = None;
+        self.import_unsaved = false;
+        self.dropped = Vec::new();
+        self.compat_accepted.clear();
+        self.last_lost.clear();
+        self.backstage = None;
+        self.start_screen = false;
+        self.status = Some(if !self.circles_shown() {
+            format!("Opened {}", self.path)
+        } else {
+            format!("Opened {}. {CIRCULAR_WARNING}", self.path)
+        });
+        self.protected_view = None;
+        if let Some(source) = source {
+            self.decide_protected_view(source);
+        }
+    }
+
+    /// Put `pkg` in place of the workbook, keeping what it is bound to: a
+    /// fresh engine, its comments and data model, the view reset, clean.
+    fn load_pkg(&mut self, pkg: SheetPackage) {
         let (rels, meas) = pkg
             .part(MODEL_PART)
             .map(|b| parse_model_part(&String::from_utf8_lossy(b)))
@@ -6938,26 +7150,131 @@ impl App {
         self.engine = engine;
         self.pkg = pkg;
         self.forget_clip();
-        self.path = p;
-        self.import_source = import_source;
-        self.bind_text(text);
-        self.template = None;
-        self.import_unsaved = false;
-        self.dropped = Vec::new();
-        self.compat_accepted.clear();
-        self.last_lost.clear();
         self.model_rels = rels;
         self.model_measures = meas;
         self.comments = comments;
         self.reset_view();
         self.modified = false;
-        self.backstage = None;
-        self.start_screen = false;
-        self.status = Some(if !self.circles_shown() {
-            format!("Opened {}", self.path)
+    }
+
+    // ---- Protected View (#894) ---------------------------------------------
+    //
+    // A workbook read from a file Windows marked as downloaded (zone 3 or 4)
+    // opens in Protected View, as the suite's does (#610): it can be read,
+    // navigated, searched and copied from, and its pages counted
+    // (`print.pages`), but no key, ribbon command, vim command, click or
+    // control verb edits it and nothing writes it (printing to PDF included),
+    // until Enable Editing. Each entry point asks an allow-list,
+    // so a new command is refused until someone classifies it; every write
+    // also stops at `guard_write`, and `protected_backstop` rolls back an
+    // edit that slipped past anyway.
+
+    /// Enter Protected View when `source` is marked as downloaded, unless it
+    /// is in the XLSTART folder (a trusted location in Excel) or Enable
+    /// Editing trusted it, unchanged, earlier this session.
+    fn decide_protected_view(&mut self, source: &Path) {
+        if !opccore::zone::is_protected_zone((self.zone_of)(source)) || self.in_xlstart(source) {
+            return;
+        }
+        let stamp = Stamp::of(source);
+        if let (Some(stamp), Ok(canonical)) = (stamp, std::fs::canonicalize(source))
+            && self.session_trusted.contains(&(canonical, stamp))
+        {
+            return;
+        }
+        self.enter_protected_view(source, stamp);
+    }
+
+    /// Whether `source` is in the XLSTART folder.
+    fn in_xlstart(&self, source: &Path) -> bool {
+        let (Some(dir), Some(parent)) = (self.xlstart.as_deref(), source.parent()) else {
+            return false;
+        };
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
         } else {
-            format!("Opened {}. {CIRCULAR_WARNING}", self.path)
+            parent
+        };
+        match (std::fs::canonicalize(dir), std::fs::canonicalize(parent)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    /// Protected View for the workbook just installed from `source` (as
+    /// `stamp`). Whatever could edit it that is still open closes: a
+    /// dialog, prompt or editor a person had open when a control verb
+    /// opened the file. Find and Go To only read, and stay.
+    fn enter_protected_view(&mut self, source: &Path, stamp: Option<Stamp>) {
+        self.edit = None;
+        if !matches!(
+            self.prompt.as_ref().map(|p| &p.kind),
+            None | Some(PromptKind::Find | PromptKind::GoTo)
+        ) {
+            self.prompt = None;
+        }
+        self.confirm = None;
+        self.format_picker = None;
+        self.format_dialog = None;
+        self.text_dialog = None;
+        self.outline_dialog = None;
+        self.pivot_edit = None;
+        self.filter_picker = None;
+        self.model_view = None;
+        self.close_validation_ui();
+        if self.data_form.is_some() {
+            self.close_data_form();
+        }
+        self.protected_view = Some(ProtectedView {
+            source: source.to_path_buf(),
+            stamp,
+            snapshot: self.pkg.clone(),
         });
+    }
+
+    /// Leave Protected View: the bar's button, File › Info's row, or
+    /// `wb.enable-editing`. The file as it was when opened (its [`Stamp`])
+    /// is trusted for the rest of the session, so reopening it unchanged
+    /// opens it editable; a file replaced since it opened is not trusted. A
+    /// workbook not in Protected View is the error.
+    fn enable_editing(&mut self) -> Result<(), String> {
+        let Some(pv) = self.protected_view.take() else {
+            return Err("the workbook is not in Protected View".to_string());
+        };
+        if let (Some(stamp), Ok(canonical)) = (pv.stamp, std::fs::canonicalize(&pv.source)) {
+            let trusted = (canonical, stamp);
+            if !self.session_trusted.contains(&trusted) {
+                self.session_trusted.push(trusted);
+            }
+        }
+        self.status = Some("Editing enabled".to_string());
+        Ok(())
+    }
+
+    /// Refuse an edit or a write in Protected View: the status line says how
+    /// to edit, and the error carries the same words.
+    fn refuse_protected(&mut self) -> Result<(), String> {
+        if self.protected_view.is_none() {
+            return Ok(());
+        }
+        self.status = Some(PROTECTED_STATUS.to_string());
+        Err(PROTECTED_STATUS.to_string())
+    }
+
+    /// After every event and control request: a workbook in Protected View
+    /// that turned modified had an edit slip past the gates, so it goes
+    /// back to the workbook as it was installed and stays protected, as the
+    /// suite's `protected_rollback` does.
+    fn protected_backstop(&mut self) {
+        let Some(pv) = &self.protected_view else {
+            return;
+        };
+        if !self.modified {
+            return;
+        }
+        let pkg = pv.snapshot.clone();
+        self.load_pkg(pkg);
+        self.status = Some(format!("{PROTECTED_STATUS} (the change was undone)"));
     }
 
     /// Bind the workbook to its file as text (`None`: as a workbook).
@@ -6972,7 +7289,13 @@ impl App {
     /// A load that fails is the error (the verb reports it).
     fn open_without_wizard(&mut self, path: &str) -> Result<(), String> {
         let l = load_workbook(path, &self.text_open())?;
-        self.install_workbook(l.pkg, l.path, l.import_source, l.text);
+        self.install_workbook(
+            l.pkg,
+            l.path,
+            l.import_source,
+            l.text,
+            Some(Path::new(path)),
+        );
         self.dropped = l.dropped;
         self.note_import(l.format);
         self.note_template(path);
@@ -7023,7 +7346,9 @@ impl App {
             _ => text.as_str(),
         };
         let pkg = text_to_pkg(body, &file_stem(&path), &parse, &self.text_open());
-        // The text file is the save target itself, not a source to guard.
+        // The text file is the save target itself, not an import source to
+        // guard; its zone still decides Protected View (#894).
+        let source = PathBuf::from(&path);
         self.install_workbook(
             pkg,
             path,
@@ -7033,6 +7358,7 @@ impl App {
                 parse,
                 origin,
             }),
+            Some(&source),
         );
         Ok(())
     }
@@ -7066,7 +7392,7 @@ impl App {
                 .and_then(|data| open_any(&data).map_err(|e| e.to_string()))
             {
                 Ok(o) => {
-                    self.install_workbook(o.pkg, "untitled.xlsx".to_string(), None, None);
+                    self.install_workbook(o.pkg, "untitled.xlsx".to_string(), None, None, None);
                     self.read_only = None;
                     self.status = Some(format!("New workbook from {name}"));
                     return;
@@ -7083,6 +7409,7 @@ impl App {
         self.forget_clip();
         self.path = "untitled.xlsx".to_string();
         self.read_only = None;
+        self.protected_view = None;
         self.import_source = None;
         self.template = None;
         self.import_unsaved = false;
@@ -7198,6 +7525,10 @@ impl App {
     /// Print the current sheet to a `.pdf` next to the workbook. A sheet with
     /// nothing to print says so and writes nothing.
     fn export_pdf(&mut self) {
+        self.backstage = None;
+        if self.refuse_protected().is_err() {
+            return;
+        }
         let out = match self.path.rsplit_once('.') {
             Some((base, _)) => format!("{base}.pdf"),
             None => format!("{}.pdf", self.path),
@@ -7206,7 +7537,6 @@ impl App {
             Ok(pages) => format!("Exported {out} ({pages} page{})", plural(pages)),
             Err(msg) => msg,
         });
-        self.backstage = None;
     }
 
     /// Save As PDF (#761): the active sheet printed to `out`, as Excel
@@ -7214,6 +7544,9 @@ impl App {
     /// keeps its modified state; a sheet with nothing to print says so and
     /// writes nothing.
     fn save_pdf(&mut self, out: String) {
+        if self.refuse_protected().is_err() {
+            return;
+        }
         self.status = Some(match self.write_sheet_pdf(&out, "save failed") {
             Ok(pages) => format!("Saved {out} as PDF ({pages} page{})", plural(pages)),
             Err(msg) => msg,
@@ -7238,6 +7571,10 @@ impl App {
 
     /// Export the current sheet to a `.csv` (CSV UTF-8) next to the workbook.
     fn export_csv(&mut self) {
+        self.backstage = None;
+        if self.refuse_protected().is_err() {
+            return;
+        }
         let csv = csv_utf8_bytes(self.sheet(), &self.pkg.workbook);
         let out = match self.path.rsplit_once('.') {
             Some((base, _)) => format!("{base}.csv"),
@@ -7248,7 +7585,6 @@ impl App {
             Ok(()) => self.status = Some(format!("Exported {out} ({} bytes)", csv.len())),
             Err(e) => self.status = Some(format!("Export failed: {e}")),
         }
-        self.backstage = None;
     }
 
     /// Act on a [`backstage::BackstageEvent`] returned by the backstage's own
@@ -7294,6 +7630,12 @@ impl App {
             }
             // The minibuffer edits the property; the backstage comes back
             // on Info when it is done (see `reopen_info`).
+            BackstageEvent::EditInfo(_) if self.protected_view.is_some() => {
+                if let Some(b) = &mut self.backstage {
+                    b.info_message = Some(PROTECTED_STATUS.to_string());
+                }
+                false
+            }
             BackstageEvent::EditInfo(i) => {
                 self.backstage = None;
                 self.open_prompt(PromptKind::DocProperty(i as u8));
@@ -7302,6 +7644,11 @@ impl App {
             BackstageEvent::Convert => {
                 self.backstage = None;
                 self.request_convert();
+                false
+            }
+            BackstageEvent::EnableEditing => {
+                self.backstage = None;
+                let _ = self.enable_editing();
                 false
             }
         }
@@ -7485,6 +7832,11 @@ impl App {
     /// name carries no extension), then make it the current file and close the
     /// backstage.
     fn commit_save_as(&mut self, dir: std::path::PathBuf, name: String) {
+        if self.protected_view.is_some() {
+            self.backstage = None;
+            let _ = self.refuse_protected();
+            return;
+        }
         if name.is_empty() {
             self.status = Some("Save As — type a file name first.".to_string());
             return;
@@ -7814,10 +8166,18 @@ impl App {
                             parse: opts,
                             origin,
                         };
-                        self.install_workbook(pkg, path.clone(), None, Some(text));
+                        let source = PathBuf::from(path);
+                        self.install_workbook(pkg, path.clone(), None, Some(text), Some(&source));
                     }
                     None => {
-                        self.install_workbook(pkg, import_binding(path), Some(path.clone()), None);
+                        let source = PathBuf::from(path);
+                        self.install_workbook(
+                            pkg,
+                            import_binding(path),
+                            Some(path.clone()),
+                            None,
+                            Some(&source),
+                        );
                         self.import_unsaved = true;
                     }
                 }
@@ -7926,6 +8286,9 @@ impl App {
         sheet: usize,
         op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<String, String>,
     ) -> Result<bool, ()> {
+        if self.refuse_protected().is_err() {
+            return Err(());
+        }
         if self
             .pkg
             .workbook
@@ -9197,6 +9560,10 @@ impl App {
         if let Some(v) = &mut self.vim {
             v.pending = '\0';
         }
+        if self.protected_view.is_some() && !pv_allows_vim_key(code, ctrl, pending) {
+            self.status = Some(PROTECTED_STATUS.to_string());
+            return false;
+        }
         let visual = self.vim_mode() != VimMode::Normal;
 
         // Multi-key prefixes.
@@ -9343,6 +9710,10 @@ impl App {
     }
 
     fn vim_run_command(&mut self, cmd: &str) -> bool {
+        // Protected View writes nothing (#894): `:w`, `:wq` and `:x` stay.
+        if matches!(cmd.trim(), "w" | "wq" | "x") && self.refuse_protected().is_err() {
+            return false;
+        }
         match cmd.trim() {
             "w" => {
                 self.save();
@@ -9831,6 +10202,10 @@ impl backstage::BackstageHost for App {
         self.compat()
     }
 
+    fn protected_view(&self) -> bool {
+        self.protected_view.is_some()
+    }
+
     fn accent(&self) -> Color {
         Color::Green
     }
@@ -9923,6 +10298,16 @@ fn draw_screen(app: &mut App, f: &mut Frame) {
         f.render_widget(Paragraph::new(body), Rect::new(area.x, y, area.width, 6));
         y += 6;
     }
+    // --- Protected View message bar (#894) ------------------------------------
+    let pv_h = u16::from(app.protected_view.is_some());
+    app.pv_button = None;
+    if pv_h > 0 {
+        let (line, button_x) = protected_bar(area.width);
+        f.render_widget(Paragraph::new(line), Rect::new(area.x, y, area.width, 1));
+        let x1 = area.x + button_x;
+        app.pv_button = Some((y, x1, x1 + ENABLE_EDITING.chars().count() as u16));
+        y += 1;
+    }
 
     let fx_h = app.fx_bar_height();
     let formula_bar = Rect::new(area.x, y, area.width, fx_h);
@@ -9936,7 +10321,7 @@ fn draw_screen(app: &mut App, f: &mut Frame) {
     let col_hdr = Rect::new(area.x, y + fx_h + col_outline_h, area.width, 1);
     let grid_h = area
         .height
-        .saturating_sub(ribbon_h + 3 + fx_h + col_outline_h);
+        .saturating_sub(ribbon_h + pv_h + 3 + fx_h + col_outline_h);
     let mut grid = Rect::new(area.x, y + fx_h + 1 + col_outline_h, area.width, grid_h);
     app.col_outline_y = (col_outline_h > 0).then_some(col_outline.y);
     app.col_hdr_y = col_hdr.y;
@@ -10595,6 +10980,40 @@ fn row_line_count(
         }
     }
     lines.min(CAP)
+}
+
+/// The Protected View bar, `width` wide (#894): Excel's label and warning,
+/// cut to fit, then the Enable Editing button, always whole; and the column
+/// the button starts at.
+fn protected_bar(width: u16) -> (RLine<'static>, u16) {
+    let width = usize::from(width);
+    let button = ENABLE_EDITING.chars().count();
+    let room = width.saturating_sub(button + 1);
+    let label = format!(" {PROTECTED_LABEL} ");
+    let text: String = format!("{label} {PROTECTED_TEXT}")
+        .chars()
+        .take(room)
+        .collect();
+    let used = text.chars().count();
+    let pad = " ".repeat(room - used);
+    let bar = Style::default().fg(Color::Black).bg(Color::Yellow);
+    let label_len = label.chars().count().min(used);
+    let (head, tail): (String, String) = (
+        text.chars().take(label_len).collect(),
+        text.chars().skip(label_len).collect(),
+    );
+    let line = RLine::from(vec![
+        RSpan::styled(head, bar.add_modifier(Modifier::BOLD)),
+        RSpan::styled(format!("{tail}{pad} "), bar),
+        RSpan::styled(
+            ENABLE_EDITING.to_string(),
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    (line, (room + 1).min(width) as u16)
 }
 
 /// The pivot field editor: four panes over a cleared overlay rect.
@@ -11850,6 +12269,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return app.vim_key(key.code, ctrl, shift);
     }
 
+    // Protected View lets through only keys that move, read or copy (#894).
+    if app.protected_view.is_some() && !pv_allows_key(key.code, ctrl, shift, alt) {
+        app.status = Some(PROTECTED_STATUS.to_string());
+        return false;
+    }
+
     // --- navigation / commands --------------------------------------------------
     match key.code {
         KeyCode::Char('q') | KeyCode::Char('Q') if ctrl => {
@@ -12096,6 +12521,15 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
         }
         MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
             let drag = matches!(m.kind, MouseEventKind::Drag(_));
+            // The Protected View bar's Enable Editing button (#894).
+            if let Some((y, x1, x2)) = app.pv_button
+                && !drag
+                && m.row == y
+                && (x1..x2).contains(&m.column)
+            {
+                let _ = app.enable_editing();
+                return false;
+            }
             // The ribbon occupies the top rows.
             if !drag && m.row < app.ribbon_rows {
                 let expanded = app.ribbon_focus != ribbon::Focus::None;
@@ -12274,6 +12708,9 @@ struct TuiFlags {
     read_only: Option<String>,
     /// What opening an `.xls` in Compatibility Mode left out (#874).
     dropped: Vec<String>,
+    /// The file the workbook was read from, whose zone decides Protected
+    /// View (#894). A `.txt`/`.prn` decides at its wizard's finish instead.
+    source: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12302,6 +12739,9 @@ fn run_tui(
 
     let mut app = App::new(pkg, path);
     app.xlstart = xlstart_dir();
+    if let Some(source) = &flags.source {
+        app.decide_protected_view(Path::new(source));
+    }
     let format = import.as_ref().and_then(|(_, f)| *f);
     app.import_source = import.map(|(s, _)| s);
     app.bind_text(text);
@@ -12394,6 +12834,7 @@ fn run_tui(
             app.modified,
             app.bound_read_only(),
             app.compat(),
+            app.protected_view.is_some(),
         );
         if title != last_title {
             let _ = execute!(io::stdout(), SetTitle(&title));
@@ -12423,6 +12864,7 @@ fn run_tui(
                     Err(e) => req.reply_err(e),
                 },
             }
+            app.protected_backstop();
             if quit {
                 break;
             }
@@ -13994,7 +14436,7 @@ mod tests {
             Some("Opened book.xls (Excel 97-2003 Workbook) in Compatibility Mode")
         );
         assert_eq!(
-            window_title("xlsxy", &app.path, true, false, app.compat()),
+            window_title("xlsxy", &app.path, true, false, app.compat(), false),
             "* xlsxy - book.xls [Compatibility Mode]"
         );
         assert_eq!((app.max_rows(), app.max_cols()), (65_536, 256));
@@ -18955,19 +19397,19 @@ mod tests {
     #[test]
     fn window_title_format() {
         assert_eq!(
-            window_title("xlsxy", "/tmp/report.xlsx", false, false, false),
+            window_title("xlsxy", "/tmp/report.xlsx", false, false, false, false),
             "xlsxy - report.xlsx"
         );
         assert_eq!(
-            window_title("xlsxy", "/tmp/report.xlsx", true, false, false),
+            window_title("xlsxy", "/tmp/report.xlsx", true, false, false, false),
             "* xlsxy - report.xlsx"
         );
         assert_eq!(
-            window_title("xlsxy", "book.xlsx", true, false, false),
+            window_title("xlsxy", "book.xlsx", true, false, false, false),
             "* xlsxy - book.xlsx"
         );
         assert_eq!(
-            window_title("xlsxy", "book.xlsx", true, true, false),
+            window_title("xlsxy", "book.xlsx", true, true, false, false),
             "* xlsxy - book.xlsx [Read-Only]"
         );
     }
@@ -20643,7 +21085,14 @@ mod tests {
         app.set_read_only(a.to_str().unwrap());
         assert!(app.bound_read_only());
         assert_eq!(
-            window_title("xlsxy", &app.path, false, app.bound_read_only(), false),
+            window_title(
+                "xlsxy",
+                &app.path,
+                false,
+                app.bound_read_only(),
+                false,
+                false
+            ),
             "xlsxy - a.xlsx [Read-Only]"
         );
         type_into_a1(&mut app, 9.0);

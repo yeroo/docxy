@@ -6,15 +6,27 @@ use crate::{Backstage, BackstageEvent, BackstageHost, Item, OptLine, OptValue, P
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Position;
 
-/// How many editable rows the host's Info page has: the Compatibility
-/// Mode section's `Convert` first, when it has one, then the properties.
-pub(crate) fn info_rows(host: &dyn BackstageHost) -> usize {
-    usize::from(host.compat_mode()) + host.info_fields().len() + usize::from(host.info_custom_row())
+/// How many rows come before the host's property rows on its Info page:
+/// Protected View's `Enable Editing`, then Compatibility Mode's `Convert`,
+/// each when the host has it.
+pub(crate) fn info_lead_rows(host: &dyn BackstageHost) -> usize {
+    usize::from(host.protected_view()) + usize::from(host.compat_mode())
 }
 
-/// The event for Info row `i`: `Convert`, or the property row it is.
+/// How many editable rows the host's Info page has: the
+/// [`info_lead_rows`] first, then the properties.
+pub(crate) fn info_rows(host: &dyn BackstageHost) -> usize {
+    info_lead_rows(host) + host.info_fields().len() + usize::from(host.info_custom_row())
+}
+
+/// The event for Info row `i`: `EnableEditing`, `Convert`, or the property
+/// row it is.
 fn info_event(host: &dyn BackstageHost, i: usize) -> BackstageEvent {
-    match (host.compat_mode(), i) {
+    let protected = usize::from(host.protected_view());
+    if i < protected {
+        return BackstageEvent::EnableEditing;
+    }
+    match (host.compat_mode(), i - protected) {
         (true, 0) => BackstageEvent::Convert,
         (true, i) => BackstageEvent::EditInfo(i - 1),
         (false, i) => BackstageEvent::EditInfo(i),

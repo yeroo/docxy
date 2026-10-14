@@ -1140,7 +1140,9 @@ impl App {
             BackstageEvent::ExportExtra(_) => {}
             BackstageEvent::Exit => self.request_exit(),
             // yppxy lists no editable Info rows, so this never arrives.
-            BackstageEvent::EditInfo(_) | BackstageEvent::Convert => {}
+            BackstageEvent::EditInfo(_)
+            | BackstageEvent::Convert
+            | BackstageEvent::EnableEditing => {}
         }
     }
 
