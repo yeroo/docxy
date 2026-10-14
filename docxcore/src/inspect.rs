@@ -2180,6 +2180,21 @@ mod tests {
              <w:p><w:pPr><w:pStyle w:val=\"Shown\"/></w:pPr><w:r><w:t>b</w:t></w:r></w:p>",
         );
         assert_eq!(count_hidden_runs(&doc, Some(&normal)), 1);
+
+        // A text box anchored in a paragraph of the hidden default style:
+        // its "Shown" paragraph is visible, its unstyled one hidden, and the
+        // removal reaches both copies of the box.
+        let boxed = two_copy_text_box(
+            "<w:p><w:pPr><w:pStyle w:val=\"Shown\"/></w:pPr><w:r><w:t>boxed</w:t></w:r></w:p>\
+             <w:p><w:r><w:t>hush</w:t></w:r></w:p>",
+        );
+        let mut doc = parse(&boxed);
+        assert_eq!(count_hidden_runs(&doc, Some(&normal)), 1);
+        assert_eq!(remove_hidden_text(&mut doc, Some(&normal)), 1);
+        let xml = document_to_xml(&doc);
+        assert_eq!(xml.matches("boxed").count(), 2, "{xml}");
+        assert!(!xml.contains("hush"), "{xml}");
+        assert_eq!(count_hidden_runs(&doc, Some(&normal)), 0);
     }
 
     /// #918: a direct `w:vanish w:val="0"` over a hidden character style is

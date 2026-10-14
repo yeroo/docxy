@@ -2884,7 +2884,9 @@ impl Package {
     /// will be saved, read in place of the main document part, which holds it
     /// as loaded (a revision accepted since must not keep its author).
     /// `authors` are kept too: those of comments the caller will still write
-    /// that the package does not hold yet. Whether it changed anything.
+    /// that the package does not hold yet. A header or footer part no section
+    /// of `document` references ([`crate::inspect::Stories`]) is not read: the
+    /// save drops it (#771). Whether it changed anything.
     pub fn prune_people(&mut self, document: &Document, authors: &[&str]) -> bool {
         const PEOPLE: &str = "word/people.xml";
         let Some(xml) = self.part_text(PEOPLE) else {
@@ -2896,10 +2898,19 @@ impl Package {
             .parts
             .get(self.doc_index)
             .map(|(name, _)| name.as_str());
+        // Header and footer parts no section references: the save drops them.
+        let applied = crate::inspect::Stories::new(self, document);
+        let applied = applied.part_names();
+        let orphans: Vec<String> = self
+            .hf_relationship_parts()
+            .into_iter()
+            .filter(|p| !applied.iter().any(|a| a.eq_ignore_ascii_case(p)))
+            .collect();
         let texts = std::iter::once(crate::serialize::document_to_xml(document)).chain(
             self.part_names()
                 .into_iter()
                 .filter(|name| *name != PEOPLE && Some(*name) != main && name.ends_with(".xml"))
+                .filter(|name| !orphans.iter().any(|o| o.eq_ignore_ascii_case(name)))
                 .filter_map(|name| self.part_text(name)),
         );
         for text in texts {
@@ -7761,5 +7772,49 @@ mod tests {
         assert!(ann(&p), "Ann authors a change in the live body");
         p.prune_people(&p.document.clone(), &[]);
         assert!(!ann(&p), "not in the loaded one");
+    }
+
+    /// #918 FIX r2 m2: an author named only in a header part no section
+    /// references (dropped by the save, #771) is pruned; one named in a
+    /// referenced header stays.
+    #[test]
+    fn prune_people_ignores_unreferenced_headers() {
+        let mut p = with_comment_extras();
+        with_people(&mut p);
+        let rels = p
+            .part_text("word/_rels/document.xml.rels")
+            .unwrap()
+            .replace(
+                "</Relationships>",
+                "<Relationship Id=\"rIdH1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/header\" Target=\"header1.xml\"/>\
+                 <Relationship Id=\"rIdH2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/header\" Target=\"header2.xml\"/></Relationships>",
+            );
+        p.set_part_text("word/_rels/document.xml.rels", &rels);
+        for (name, author) in [
+            ("word/header1.xml", "Cy &amp; Co"),
+            ("word/header2.xml", "Dee"),
+        ] {
+            p.parts.push((
+                name.to_string(),
+                format!(
+                    "<w:hdr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:p>\
+                     <w:ins w:id=\"3\" w:author=\"{author}\"><w:r><w:t>x</w:t></w:r></w:ins></w:p></w:hdr>"
+                )
+                .into_bytes(),
+            ));
+        }
+        // The live body's one section references header1 only.
+        let live = crate::load::parse_document_xml(
+            "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
+             xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><w:body>\
+             <w:p/><w:sectPr><w:headerReference w:type=\"default\" r:id=\"rIdH1\"/></w:sectPr></w:body></w:document>",
+            &crate::load::Relationships::default(),
+        );
+        p.remove_comment_id("1");
+        assert!(p.prune_people(&live, &[]));
+        let people = p.part_text("word/people.xml").unwrap();
+        assert!(people.contains("Cy &amp; Co"), "{people}");
+        assert!(!people.contains("Dee"), "{people}");
+        assert!(people.contains("\"Bob\""), "{people}");
     }
 }

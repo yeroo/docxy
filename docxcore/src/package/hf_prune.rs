@@ -16,6 +16,29 @@ const FOOTER_REL: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer";
 
 impl Package {
+    /// Every part a header or footer relationship of the main document
+    /// targets, referenced by a section or not.
+    pub(super) fn hf_relationship_parts(&self) -> Vec<String> {
+        let Some(doc_name) = self.parts.get(self.doc_index).map(|p| p.0.clone()) else {
+            return Vec::new();
+        };
+        let Some(rels) = part_rels_name(&doc_name).and_then(|name| self.part_text(&name)) else {
+            return Vec::new();
+        };
+        let dir = doc_name.rsplit_once('/').map_or("", |(d, _)| d);
+        start_tags(&rels, "Relationship")
+            .into_iter()
+            .filter(|(_, tag)| {
+                tag_attr(tag, "TargetMode").as_deref() != Some("External")
+                    && matches!(
+                        tag_attr(tag, "Type").as_deref(),
+                        Some(HEADER_REL | FOOTER_REL)
+                    )
+            })
+            .filter_map(|(_, tag)| tag_attr(tag, "Target").map(|t| resolve(dir, &t)))
+            .collect()
+    }
+
     /// Remove every header/footer part that `document.xml.rels` names but the
     /// document part a save writes never references, together with its
     /// relationship, its `[Content_Types].xml` override and its own `_rels`
