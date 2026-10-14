@@ -70,12 +70,12 @@ fn kinds(ed: &Editor) -> Vec<String> {
             Inline::Run(r) => r.text.clone(),
             Inline::Equation { .. } => "[EQ]".into(),
             Inline::Raw(r) if is_object_unit(i) && r.contains("<w:drawing") => "[PIC]".into(),
-            Inline::Revision {
-                kind: RevisionKind::Delete,
-                content,
-                ..
-            } => format!(
-                "del({})",
+            Inline::Revision { kind, content, .. } => format!(
+                "{}({})",
+                match kind {
+                    RevisionKind::Delete => "del",
+                    RevisionKind::Insert => "ins",
+                },
                 content
                     .iter()
                     .map(|c| match c {
@@ -470,4 +470,81 @@ fn a_toggle_after_an_object_reads_the_right_characters_1242() {
             .collect();
         assert_eq!(bold, "", "{object}");
     }
+}
+
+/// FIX r1 M4: while tracking, a cut picture is a `w:del` where it was and
+/// its paste a `w:ins` where it goes, so Reject All leaves the one picture
+/// where it was and Accept All the one where it went.
+#[test]
+fn a_tracked_cut_and_paste_moves_a_picture_as_two_revisions_1242() {
+    let mut ed = ed_with(PIC);
+    track(&mut ed);
+    select(&mut ed, vec![0], 2, 3);
+    let clip = ed.cut().expect("a clip");
+    assert_eq!(kinds(&ed), ["ab", "del([PIC])", "cd"]);
+    ed.anchor = None;
+    ed.set_caret(Caret::at(vec![0], 4));
+    ed.paste(&clip);
+    assert_eq!(kinds(&ed), ["ab", "del([PIC])", "cd", "ins([PIC])"]);
+    assert_eq!(ed.caret.offset, 4, "a pending insertion takes no offset");
+    let xml = saved(&ed);
+    let ins = xml.find("<w:ins ").expect("a w:ins");
+    assert!(xml[ins..].contains("<w:drawing"), "{xml}");
+    assert_eq!(xml.matches(PIC).count(), 2, "{xml}");
+    let mut rejected = Editor::new(ed.doc.clone());
+    rejected.reject_all_revisions();
+    assert_eq!(etext(&rejected), "ab\u{FFFC}cd");
+    ed.accept_all_revisions();
+    assert_eq!(etext(&ed), "abcd\u{FFFC}");
+    assert_eq!(saved(&ed).matches(PIC).count(), 1);
+
+    // Text and a picture pasted together: each w:ins has an id of its own.
+    let mut ed = ed_with(PIC);
+    select(&mut ed, vec![0], 1, 4);
+    let clip = ed.copy().expect("a clip");
+    track(&mut ed);
+    ed.anchor = None;
+    ed.set_caret(Caret::at(vec![0], 5));
+    ed.paste(&clip);
+    let xml = saved(&ed);
+    let ids: Vec<&str> = xml
+        .match_indices("<w:ins ")
+        .map(|(at, _)| {
+            let id = &xml[at..][xml[at..].find("w:id=\"").unwrap() + 6..];
+            &id[..id.find('"').unwrap()]
+        })
+        .collect();
+    assert!(ids.len() >= 2, "{xml}");
+    let mut unique = ids.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), ids.len(), "{xml}");
+}
+
+/// FIX r1 M4: while tracking an equation stays where it was, so a cut
+/// leaves it out of its clip and a paste adds none: never two.
+#[test]
+fn a_tracked_cut_and_paste_never_doubles_an_equation_1242() {
+    let eqs = |ed: &Editor| saved(ed).matches("<m:oMath>").count();
+    let mut ed = ed_with(EQ);
+    track(&mut ed);
+    select(&mut ed, vec![0], 1, 4);
+    let clip = ed.cut().expect("a clip");
+    assert_eq!(kinds(&ed), ["a", "del(b)", "[EQ]", "del(c)", "d"]);
+    ed.anchor = None;
+    ed.set_caret(Caret::at(vec![0], 3));
+    ed.paste(&clip);
+    assert_eq!(eqs(&ed), 1, "{}", saved(&ed));
+    // A copy pasted while tracking leaves the equation out too.
+    let mut ed = ed_with(EQ);
+    select(&mut ed, vec![0], 2, 3);
+    let clip = ed.copy().expect("a clip");
+    track(&mut ed);
+    ed.anchor = None;
+    ed.set_caret(Caret::at(vec![0], 5));
+    ed.paste(&clip);
+    assert_eq!(eqs(&ed), 1);
+    // A new equation still goes in.
+    ed.insert_equation("y", false);
+    assert_eq!(eqs(&ed), 2);
 }

@@ -347,13 +347,21 @@ impl Editor {
 
     /// `clip` as it should go in: its text recorded as one tracked insertion
     /// when tracking, or with any insertion records taken off when not (a
-    /// pasted copy of recorded text is not itself recorded).
+    /// pasted copy of recorded text is not itself recorded). While tracking
+    /// an inline picture goes in a `w:ins` of its own, as Word records one
+    /// (#1242): zero-width until accepted.
     pub(super) fn clip_for_insertion(&self, clip: &super::Clip) -> super::Clip {
         let mut out = clip.clone();
         match self.fresh_revision_metadata() {
             Some(meta) => {
                 for inline in out.paras.iter_mut().flatten() {
                     with_props(inline, |props| record_insert(props, &meta));
+                }
+                // Each picture's `w:ins` has an id of its own, after the
+                // text's (which `unshare_insert_ids` then keeps clear of).
+                let mut next = meta.id.as_deref().and_then(|id| id.parse::<u64>().ok());
+                for para in out.paras.iter_mut() {
+                    record_inserted_pictures(para, &meta, &mut next);
                 }
             }
             None => {
@@ -559,8 +567,41 @@ fn deleted_props(props: &RunProps) -> RunProps {
     p
 }
 
+/// Wrap each inline picture in `content` (a hyperlink's too) in a tracked
+/// insertion with `meta`, each with the id after `last` (the last one used).
+fn record_inserted_pictures(
+    content: &mut [Inline],
+    meta: &RevisionMetadata,
+    last: &mut Option<u64>,
+) {
+    for inline in content.iter_mut() {
+        if let Inline::Hyperlink(h) = inline {
+            if h.content.iter().any(super::is_object_unit) {
+                h.content_changed = true;
+            }
+            record_inserted_pictures(&mut h.content, meta, last);
+        } else if matches!(inline, Inline::Raw(_)) && super::is_object_unit(inline) {
+            let picture = std::mem::replace(inline, Inline::Raw(String::new()));
+            let mut meta = meta.clone();
+            if let Some(id) = last.as_mut() {
+                *id += 1;
+                meta.id = Some(id.to_string());
+            }
+            *inline = revision_wrapper(RevisionKind::Insert, meta, picture);
+        }
+    }
+}
+
 fn deletion_wrapper(meta: RevisionMetadata, inner: Inline) -> Inline {
-    let mut raw = String::from("<w:del");
+    revision_wrapper(RevisionKind::Delete, meta, inner)
+}
+
+/// A tracked change of `kind` by `meta` around `inner`.
+fn revision_wrapper(kind: RevisionKind, meta: RevisionMetadata, inner: Inline) -> Inline {
+    let mut raw = String::from(match kind {
+        RevisionKind::Insert => "<w:ins",
+        RevisionKind::Delete => "<w:del",
+    });
     for (name, value) in [
         ("w:id", &meta.id),
         ("w:author", &meta.author),
@@ -576,7 +617,7 @@ fn deletion_wrapper(meta: RevisionMetadata, inner: Inline) -> Inline {
     }
     raw.push_str("/>");
     Inline::Revision {
-        kind: RevisionKind::Delete,
+        kind,
         metadata: meta,
         raw,
         content: vec![inner],

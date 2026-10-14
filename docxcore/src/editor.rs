@@ -1305,9 +1305,14 @@ impl Editor {
             text,
             latex: Some(latex.to_string()),
         };
-        self.paste(&Clip {
-            paras: vec![vec![inl]],
-        });
+        // A new equation goes in while tracking too, unrecorded (a `w:ins`
+        // cannot hold one whole), as it always has.
+        self.paste_clip(
+            &Clip {
+                paras: vec![vec![inl]],
+            },
+            false,
+        );
     }
 
     /// If the character at editor offset `idx` of the caret's paragraph is a
@@ -1959,7 +1964,12 @@ impl Editor {
     /// cuts is cut whole, as the delete takes it (#1240).
     pub fn cut(&mut self) -> Option<Clip> {
         self.widen_selection_over_loose_fields();
-        let clip = self.copy()?;
+        let mut clip = self.copy()?;
+        // A tracked delete keeps every equation, so the clip leaves them
+        // out: a paste must not add a second (#1242).
+        if self.track.is_some() {
+            clip = without_equations(&clip);
+        }
         self.delete_selection_keeping_objects();
         Some(clip)
     }
@@ -1986,10 +1996,27 @@ impl Editor {
     /// Paste a [`Clip`] at the caret (replacing any selection). Pasting inside
     /// a hyperlink splits it, so the pasted content lands between two links
     /// to the same target, not inside the link (see `split_content`).
+    ///
+    /// While tracking, a pasted inline picture is recorded as an insertion,
+    /// and an equation, which a `w:ins` cannot hold whole, is left out
+    /// (#1242): a tracked cut keeps its equations in place.
     pub fn paste(&mut self, clip: &Clip) {
+        self.paste_clip(clip, true);
+    }
+
+    /// [`Editor::paste`]; `drop_tracked_equations` false pastes equations
+    /// while tracking too (a new one from [`Editor::insert_equation`]).
+    fn paste_clip(&mut self, clip: &Clip, drop_tracked_equations: bool) {
         if clip.paras.is_empty() {
             return;
         }
+        let without;
+        let clip = if drop_tracked_equations && self.track.is_some() {
+            without = without_equations(clip);
+            &without
+        } else {
+            clip
+        };
         self.drop_collapsed_anchor();
         self.delete_selection_to_replace();
         self.checkpoint(EditKind::Structural);
@@ -4000,6 +4027,27 @@ fn drop_spanned_objects(
         let edge = whole && (p == 0 || p == len);
         !(is_spanned_object(raw) && (inside || edge))
     });
+}
+
+/// `clip` without its equations, a hyperlink's included.
+fn without_equations(clip: &Clip) -> Clip {
+    fn strip(content: &mut Vec<Inline>) {
+        content.retain(|i| !matches!(i, Inline::Equation { .. }));
+        for inline in content.iter_mut() {
+            if let Inline::Hyperlink(h) = inline {
+                if h.content
+                    .iter()
+                    .any(|i| matches!(i, Inline::Equation { .. }))
+                {
+                    h.content_changed = true;
+                }
+                strip(&mut h.content);
+            }
+        }
+    }
+    let mut out = clip.clone();
+    out.paras.iter_mut().for_each(strip);
+    out
 }
 
 /// Delete editor offsets `from..to` of `content`, keeping the equations and
