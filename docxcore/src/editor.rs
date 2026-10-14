@@ -21,6 +21,8 @@ mod cover;
 mod fields;
 mod flat;
 mod loose_fields;
+#[cfg(test)]
+mod object_unit_tests;
 mod placeholder;
 mod sections;
 mod table_design;
@@ -1309,14 +1311,14 @@ impl Editor {
     }
 
     /// If the character at editor offset `idx` of the caret's paragraph is a
-    /// field ([`is_field_unit`]), select it and return true: the first
-    /// Backspace or Delete next to a field selects the whole field, as in Word,
-    /// and the next press deletes it. Selecting is not an edit, so it pushes no
-    /// undo step. The caret keeps its side of the field.
+    /// field ([`is_field_unit`]) or an equation, select it and return true:
+    /// the first Backspace or Delete next to one selects all of it, as in
+    /// Word, and the next press deletes it. Selecting is not an edit, so it
+    /// pushes no undo step. The caret keeps its side of the unit.
     fn select_field_unit(&mut self, idx: usize) -> bool {
         let is_field = resolve_para(&self.doc.body, &self.caret.path)
             .and_then(|p| inline_covering(&p.content, idx))
-            .is_some_and(is_field_unit);
+            .is_some_and(|i| is_field_unit(i) || matches!(i, Inline::Equation { .. }));
         if is_field {
             let other = if self.caret.offset == idx {
                 idx + 1
@@ -1332,8 +1334,26 @@ impl Editor {
         is_field
     }
 
+    /// Whether the selection is one equation while tracking: a `w:del`
+    /// cannot record it, so Backspace and Delete leave it selected (#1242).
+    fn selects_kept_equation(&self) -> bool {
+        let Some((lo, hi)) = self.selection_range() else {
+            return false;
+        };
+        self.track.is_some()
+            && lo.path == hi.path
+            && hi.offset == lo.offset + 1
+            && resolve_para(&self.doc.body, &lo.path)
+                .and_then(|p| inline_covering(&p.content, lo.offset))
+                .is_some_and(|i| matches!(i, Inline::Equation { .. }))
+    }
+
     pub fn backspace(&mut self) {
         self.drop_collapsed_anchor();
+        if self.selects_kept_equation() {
+            self.last = EditKind::None;
+            return;
+        }
         if self.has_selection() {
             self.delete_selection();
             return;
@@ -1397,6 +1417,10 @@ impl Editor {
 
     pub fn delete_forward(&mut self) {
         self.drop_collapsed_anchor();
+        if self.selects_kept_equation() {
+            self.last = EditKind::None;
+            return;
+        }
         if self.has_selection() {
             self.delete_selection();
             return;
@@ -1771,9 +1795,7 @@ impl Editor {
                     drop_spanned_objects(&mut p.content, lo.offset, hi.offset, false, false);
                 }
             }
-            for _ in lo.offset..hi.offset {
-                self.delete_char_at(&lo.path, lo.offset);
-            }
+            self.delete_chars(&lo.path, lo.offset, hi.offset);
             self.caret = lo;
             return true;
         }
@@ -3229,15 +3251,30 @@ pub fn inline_len(i: &Inline) -> usize {
         Inline::Hyperlink(h) => link_runs_len(h) + h.content.iter().map(inline_len).sum::<usize>(),
         Inline::Tab(_) | Inline::Break(..) => 1,
         Inline::Field { text, .. } => usize::from(!text.is_empty()),
+        // An equation or an inline picture is one unit (#1242).
+        Inline::Equation { .. } => 1,
+        Inline::Raw(_) => usize::from(is_object_unit(i)),
         // Zero-length, invisible in the editor (preserved for save only).
         Inline::SmartArt { .. }
         | Inline::Chart { .. }
-        | Inline::Equation { .. }
         | Inline::TextBox { .. }
         | Inline::Revision { .. }
         | Inline::UnsupportedRevision { .. }
-        | Inline::FootnoteRef { .. }
-        | Inline::Raw(_) => 0,
+        | Inline::FootnoteRef { .. } => 0,
+    }
+}
+
+/// Whether an inline is an object the editor counts as one offset and edits
+/// as one unit, [`FIELD_CHAR`] in editor text (#1242): an equation (inline or
+/// display OMML, or a legacy Equation Editor object), or a run holding an
+/// inline (not anchored) DrawingML picture with an extent. Anchored drawings,
+/// VML pictures, positional tabs, charts, SmartArt, text boxes and anything
+/// inside a tracked change stay zero-width.
+pub fn is_object_unit(inline: &Inline) -> bool {
+    match inline {
+        Inline::Equation { .. } => true,
+        Inline::Raw(raw) => crate::image::inline_extent(raw).is_some(),
+        _ => false,
     }
 }
 
@@ -3268,6 +3305,9 @@ fn push_editor_text(content: &[Inline], out: &mut String) {
                     out.push(FIELD_CHAR);
                 }
             }
+            Inline::Equation { .. } | Inline::Raw(_) if is_object_unit(inline) => {
+                out.push(FIELD_CHAR);
+            }
             Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::Equation { .. }
@@ -3280,8 +3320,9 @@ fn push_editor_text(content: &[Inline], out: &mut String) {
     }
 }
 
-/// The character a field stands for in editor text ([`editor_text`], and the
-/// automation text built from it): U+FFFC OBJECT REPLACEMENT CHARACTER. It is
+/// The character a field, an equation or an inline picture stands for in
+/// editor text ([`editor_text`], and the automation text built from it):
+/// U+FFFC OBJECT REPLACEMENT CHARACTER (see [`is_object_unit`]). It is
 /// never inserted as text: typing, pasting, replacing or splicing Markdown
 /// (`agent::parse_markdown_blocks`) with it adds nothing.
 pub const FIELD_CHAR: char = '\u{FFFC}';
@@ -3357,12 +3398,14 @@ fn push_display_text(
                 *pos = a + runs.chars().count();
                 push_display_text(&h.content, start, end, pos, out);
             }
-            Inline::Field { text, .. } if len == 1 => {
+            Inline::Field { text, .. } | Inline::Equation { text, .. } if len == 1 => {
                 if start <= a && a < end {
                     out.push_str(text);
                 }
                 *pos += 1;
             }
+            // A picture shows no text (#1242).
+            Inline::Raw(_) if len == 1 => *pos += 1,
             _ => {
                 let t = editor_text(std::slice::from_ref(inline));
                 let (s, e) = (start.clamp(a, a + len), end.clamp(a, a + len));
@@ -3849,6 +3892,8 @@ fn source_from(content: &[Inline], i: usize) -> Option<&RunProps> {
 /// the paragraph start, of the character after it):
 /// - at the paragraph start (`local == 0`): the nearest source at or after `i`;
 /// - after a tab or a break: its own formatting (#279);
+/// - after an equation or a picture: the nearest source before it, then
+///   after it (#1242);
 /// - after a zero-width inline: the run or tab right after it; failing that,
 ///   the nearest source before, then after, it.
 fn typing_props(content: &[Inline], i: usize, local: usize) -> RunProps {
@@ -3859,6 +3904,14 @@ fn typing_props(content: &[Inline], i: usize, local: usize) -> RunProps {
     }
     if let Inline::Tab(props) | Inline::Break(_, props) = &content[i] {
         return props.continued();
+    }
+    // After an equation or a picture (#1242): the text before it, as after
+    // any character, never the object's own run properties.
+    if is_object_unit(&content[i]) {
+        return source_before(content, i)
+            .or_else(|| source_from(content, i + 1))
+            .map(RunProps::continued)
+            .unwrap_or_default();
     }
     content
         .get(i + 1)
@@ -3878,12 +3931,15 @@ fn end_props(content: &[Inline]) -> RunProps {
 }
 
 /// Whether `raw` is a run holding a drawing or a positional tab (#768):
-/// zero-width in the editor, yet something a person put there, which a
+/// zero-width in the editor (an inline picture, one offset since #1242, is
+/// deleted through its offset instead), yet something a person put there, which a
 /// delete over it removes, as Word deletes the character it is. Other
 /// zero-width XML (bookmarks, content-control boundaries, comment ranges)
 /// stays.
 fn is_spanned_object(raw: &str) -> bool {
-    raw.starts_with("<w:r") && (raw.contains("<w:drawing") || raw.contains("<w:ptab"))
+    raw.starts_with("<w:r")
+        && (raw.contains("<w:drawing") || raw.contains("<w:ptab"))
+        && crate::image::inline_extent(raw).is_none()
 }
 
 /// Remove the drawing and positional-tab runs a delete spans in one
@@ -3947,9 +4003,10 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
                     }
                     // A link with no editable text left goes, as in Word. Its
                     // bookmarks and proofing marks stay where it was; anything
-                    // still showing inside it (a tracked change, a picture, an
-                    // empty field) keeps the link, zero-width. A field with a
-                    // result is editable, one offset, so its link is not empty.
+                    // still showing inside it (a tracked change, an anchored
+                    // drawing, an empty field) keeps the link, zero-width. A
+                    // field with a result, an equation or an inline picture is
+                    // one offset, so its link is not empty (#1242).
                     if h.runs.is_empty() && h.content.iter().all(is_marker) {
                         let kept = std::mem::take(&mut h.content);
                         content.splice(i..=i, kept);
@@ -5127,7 +5184,11 @@ mod tests {
 
     const PTAB: &str =
         "<w:r><w:ptab w:relativeTo=\"margin\" w:alignment=\"right\" w:leader=\"none\"/></w:r>";
-    const PICTURE: &str = "<w:r><w:drawing><wp:inline/></w:drawing></w:r>";
+    /// A floating (anchored) picture: zero-width, so #768's rule is what
+    /// deletes it. An inline one is one offset since #1242 (see
+    /// `object_unit_tests`).
+    const PICTURE: &str = "<w:r><w:drawing><wp:anchor><wp:extent cx=\"952500\" cy=\"952500\"/>\
+        </wp:anchor></w:drawing></w:r>";
     const BOOKMARK: &str = "<w:bookmarkStart w:id=\"0\" w:name=\"b\"/>";
 
     fn raws(ed: &Editor, para: usize) -> Vec<String> {

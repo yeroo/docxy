@@ -197,13 +197,16 @@ impl Walk {
                     let mark = crate::render::superscript(*id);
                     self.read_only(&mark, self.offset, self.offset, None);
                 }
+                // An equation is one editor unit (#1242), as a field is.
                 Inline::Equation { text, .. } if !text.contains('\n') => {
-                    self.read_only(text, self.offset, self.offset, None);
+                    self.read_only(text, self.offset, self.offset + 1, None);
+                    self.offset += 1;
                 }
                 Inline::Equation { text, .. } => {
                     if !nested {
                         self.block(text.split('\n'));
                     }
+                    self.offset += 1;
                 }
                 // The node text, not the box's "SmartArt" caption.
                 Inline::SmartArt { text, .. } => {
@@ -220,6 +223,8 @@ impl Walk {
                     if !nested && crate::render::is_block_image(raw) {
                         self.block([]);
                     }
+                    // An inline picture is one editor unit (#1242).
+                    self.offset += super::inline_len(inline);
                 }
                 Inline::UnsupportedRevision { .. } => {}
             }

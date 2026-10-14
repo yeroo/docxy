@@ -191,14 +191,16 @@ impl Editor {
 
     /// Delete the character at editor offset `idx` of the paragraph at `path`:
     /// recorded as a tracked deletion when tracking, else removed outright.
-    pub(super) fn delete_char_at(&mut self, path: &[usize], idx: usize) {
+    /// False when it stays: an equation is not deleted while tracking
+    /// (#1242), so a loop deleting a range steps past it.
+    pub(super) fn delete_char_at(&mut self, path: &[usize], idx: usize) -> bool {
         self.clear_placeholders_around(path);
         self.clear_inline_placeholders(path, idx, idx + 1);
         let Some(author) = self.track.as_ref().map(|t| t.author.clone()) else {
             if let Some(p) = para_mut(&mut self.doc.body, path) {
                 content_delete(&mut p.content, idx);
             }
-            return;
+            return true;
         };
         // A deletion inside a link is recorded among the link's children, so a
         // simple link's `runs` move into its `content` first.
@@ -206,10 +208,11 @@ impl Editor {
             link_runs_into_content(&mut p.content, idx);
         }
         let Some(para) = resolve_para(&self.doc.body, path) else {
-            return;
+            return true;
         };
         let plan = plan_delete(&para.content, idx, &author);
         match plan {
+            Plan::Keep => return false,
             Plan::Remove => {
                 if let Some(p) = para_mut(&mut self.doc.body, path) {
                     content_delete(&mut p.content, idx);
@@ -229,6 +232,19 @@ impl Editor {
                     // insertion stays in it; see `unshare_insert_ids`).
                     self.settle_revisions();
                 }
+            }
+        }
+        true
+    }
+
+    /// Delete editor offsets `from..to` of the paragraph at `path` with
+    /// [`Editor::delete_char_at`], stepping past what stays (an equation
+    /// while tracking), so nothing after `to` is touched.
+    pub(super) fn delete_chars(&mut self, path: &[usize], from: usize, to: usize) {
+        let mut at = from;
+        for _ in from..to {
+            if !self.delete_char_at(path, at) {
+                at += 1;
             }
         }
     }
@@ -280,9 +296,7 @@ impl Editor {
                 (false, true) => (0, hi.offset.min(len)),
                 (false, false) => (0, len),
             };
-            for _ in from..to {
-                self.delete_char_at(path, from);
-            }
+            self.delete_chars(path, from, to);
         }
         true
     }
@@ -306,9 +320,7 @@ impl Editor {
             return;
         }
         let with = super::without_field_chars(with);
-        for _ in start..end {
-            self.delete_char_at(path, start);
-        }
+        self.delete_chars(path, start, end);
         let mut n = 0;
         if let Some(p) = para_mut(&mut self.doc.body, path) {
             for (k, ch) in with.chars().enumerate() {
@@ -409,6 +421,8 @@ enum Plan {
     /// Delete for real: not a plain run character, or the author's own
     /// insertion.
     Remove,
+    /// Leave it: an equation while tracking (#1242).
+    Keep,
     /// Record a deletion; `merges` when an adjacent deletion by the author
     /// takes it (no new revision, so no new id).
     Record { merges: bool },
@@ -467,6 +481,11 @@ fn plan_delete(content: &[Inline], idx: usize, author: &str) -> Plan {
                 Inline::Hyperlink(h) if h.runs.is_empty() => {
                     return plan_delete(&h.content, idx - acc, author);
                 }
+                // A picture is recorded as deleted, in a revision of its own
+                // (#1242); an equation, which a `w:del` cannot hold whole,
+                // stays.
+                Inline::Raw(_) => return Plan::Record { merges: false },
+                Inline::Equation { .. } => return Plan::Keep,
                 _ => return Plan::Remove,
             };
             if props
@@ -618,12 +637,24 @@ fn record_deletion(
             pieces.push(deleted.clone());
             deleted
         }
+        // A picture (#1242): its run goes in the `w:del` as it is.
+        Inline::Raw(raw) if super::is_object_unit(&content[i]) => {
+            wrapper_at = 0;
+            let deleted = Inline::Raw(raw.clone());
+            pieces.push(deleted.clone());
+            deleted
+        }
         _ => return,
     };
     let insert = insert_id_of(&deleted).flatten();
+    let picture = matches!(deleted, Inline::Raw(_));
     pieces[wrapper_at] = deletion_wrapper(meta.unwrap_or_default(), deleted);
     content.splice(i..=i, pieces);
     let mut at = i + wrapper_at;
+    // A picture's deletion stays a revision of its own: no run joins it.
+    if picture {
+        return;
+    }
 
     // Join the author's deletion just before, and just after, into one: the
     // older wrapper stays (its id, date and place), the new text goes into it.
