@@ -10,7 +10,9 @@
 //! as Word keeps it when it cannot resolve.
 
 use super::{EditKind, Editor, inline_len, is_field_unit, link_runs_len, para_mut, resolve_para};
-use crate::field::{FieldContext, eval_field_ctx, instr_of, with_instr, with_result};
+use crate::field::{
+    FieldContext, eval_field_ctx, instr_of, stored_result, with_instr, with_result,
+};
 use crate::model::Inline;
 
 /// The editor offsets of the field units in `content` within `[start, end)`,
@@ -62,11 +64,16 @@ fn inline_covering_mut(content: &mut [Inline], idx: usize) -> Option<&mut Inline
 
 /// A field's raw XML and text after an update against `ctx`, or `None` when
 /// it cannot be computed, would be empty, cannot be written into its XML, or
-/// is the same as now.
+/// is the same value as now: shown, and stored in its XML. The XML's bytes
+/// are not compared (a rewrite drops run attributes and `xml:space`), but
+/// its stored text is, since the loader shows a formula field's value
+/// computed afresh over a stale cache.
 fn updated(raw: &str, text: &str, ctx: &FieldContext) -> Option<(String, String)> {
     let value = eval_field_ctx(&instr_of(raw)?, ctx).filter(|v| !v.is_empty())?;
-    let new_raw = with_result(raw, &value)?;
-    (new_raw != raw || value != text).then_some((new_raw, value))
+    if value == text && stored_result(raw).as_deref() == Some(value.as_str()) {
+        return None;
+    }
+    Some((with_result(raw, &value)?, value))
 }
 
 impl Editor {
@@ -230,6 +237,10 @@ mod tests {
         format!("<w:r><w:t xml:space=\"preserve\">{t}</w:t></w:r>")
     }
 
+    fn first_para(ed: &Editor) -> &crate::model::Paragraph {
+        resolve_para(&ed.doc.body, &[0]).unwrap()
+    }
+
     /// The field texts of the first paragraph, in order.
     fn field_texts(ed: &Editor) -> Vec<String> {
         let mut out = Vec::new();
@@ -308,6 +319,27 @@ mod tests {
         let steps = ed.undo_names().len();
         assert_eq!(ed.update_fields(&ctx()), 0, "already current");
         assert_eq!(ed.undo_names().len(), steps, "no empty step");
+    }
+
+    #[test]
+    fn f9_on_a_current_value_takes_no_step_whatever_its_xml_looks_like_1241() {
+        // Insert Field's own form: `<w:t xml:space="preserve">`.
+        let inserted = crate::field::fld_simple("= 2+2", "4", &Default::default());
+        let Inline::Field { raw, .. } = &inserted else {
+            unreachable!()
+        };
+        let word = "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>             <w:r><w:instrText xml:space=\"preserve\"> = 2+2 </w:instrText></w:r>             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>             <w:r w:rsidR=\"00A1B2C3\"><w:t>4</w:t></w:r>             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
+        for raw in [raw.as_str(), word] {
+            let mut ed = Editor::new(doc(&format!("<w:p>{raw}</w:p>")));
+            assert_eq!(field_texts(&ed), ["4"]);
+            at(&mut ed, &[0], 0);
+            assert_eq!(ed.update_fields(&ctx()), 0, "{raw}");
+            assert!(ed.undo_names().is_empty());
+            let Inline::Field { raw: kept, .. } = &first_para(&ed).content[0] else {
+                panic!("a field");
+            };
+            assert_eq!(kept, raw, "its XML is untouched");
+        }
     }
 
     #[test]

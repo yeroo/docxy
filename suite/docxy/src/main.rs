@@ -4716,8 +4716,10 @@ struct DocTab {
     /// This document's mail merge (#628): its type, recipient list and
     /// preview state.
     mail: mailings_tab::MailState,
-    /// Field codes shown, Alt+F9 (#1241): every field draws as its code,
-    /// `{ PAGE }`, instead of its result. A view of this tab only: never saved.
+    /// Field codes shown, Alt+F9 (#1241): every body field (table cells
+    /// too) draws as its code, `{ PAGE }`, instead of its result; header,
+    /// footer and frame fields keep their results. A view of this tab only:
+    /// never saved.
     field_codes: bool,
     /// A converted tab's document as it was converted (#633): what
     /// Protected View's rollback restores, so it never converts again.
@@ -35723,6 +35725,9 @@ impl Render for Docxy {
                                     tbl: &tbl,
                                     cell_range: hf_range.as_ref(),
                                     merge_hl: tab.mail.highlight,
+                                    // Codes show in the body only: the bands
+                                    // `hf_para_el` draws on other pages keep
+                                    // their results, so the live one does too.
                                     field_codes: false,
                                     cell_run: None,
                                 });

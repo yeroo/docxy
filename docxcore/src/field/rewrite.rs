@@ -191,6 +191,14 @@ fn complex_marks(raw: &str, els: &[El<'_>]) -> Option<(usize, Option<usize>, usi
 /// bookmark, a tracked change, a comment range, a tab, a picture, a nested
 /// field.
 pub fn with_result(raw: &str, text: &str) -> Option<String> {
+    let (head, region, tail) = result_region(raw)?;
+    let runs = new_result(raw, &region, text)?;
+    Some(format!("{}{runs}{}", &raw[..head], &raw[tail..]))
+}
+
+/// The result [`with_result`] would replace: the end of what comes before
+/// it, its elements, and the start of what comes after it.
+fn result_region(raw: &str) -> Option<(usize, Vec<El<'_>>, usize)> {
     if is_simple(raw) {
         let els = siblings(raw)?;
         let [el] = els.as_slice() else {
@@ -210,8 +218,7 @@ pub fn with_result(raw: &str, text: &str) -> Option<String> {
             })
             .collect();
         let close = kids.last().map_or(open_end, |k| k.end);
-        let runs = new_result(raw, &kids, text)?;
-        return Some(format!("{}{runs}{}", &raw[..open_end], &raw[close..]));
+        return Some((open_end, kids, close));
     }
     if !raw.contains("<w:fldChar") {
         return None; // a `w:sym` run
@@ -219,13 +226,41 @@ pub fn with_result(raw: &str, text: &str) -> Option<String> {
     let els = siblings(raw)?;
     let (_, separate, end) = complex_marks(raw, &els)?;
     let separate = separate?;
-    let region = &els[separate + 1..end];
-    let runs = new_result(raw, region, text)?;
-    Some(format!(
-        "{}{runs}{}",
-        &raw[..els[separate].end],
-        &raw[els[end].start..]
-    ))
+    let (head, tail) = (els[separate].end, els[end].start);
+    let region = els
+        .into_iter()
+        .skip(separate + 1)
+        .take(end - separate - 1)
+        .collect();
+    Some((head, region, tail))
+}
+
+/// The text of the result stored in `raw` (its runs' `w:t`, decoded), which
+/// may differ from what the editor shows: the loader computes a formula
+/// field's value afresh. `None` where [`with_result`] would refuse.
+pub(crate) fn stored_result(raw: &str) -> Option<String> {
+    let (_, region, _) = result_region(raw)?;
+    let mut out = String::new();
+    for el in &region {
+        match el.name {
+            "w:proofErr" => {}
+            "w:r" if plain_result_run(&raw[el.start..el.end]) => {
+                let mut p = XmlParser::new(&raw[el.start..el.end]);
+                let mut in_t = false;
+                loop {
+                    match p.next() {
+                        Event::Start => in_t = p.name() == "w:t",
+                        Event::End => in_t = false,
+                        Event::Text if in_t => XmlParser::append_decoded(p.text(), &mut out),
+                        Event::Text => {}
+                        Event::Eof => break,
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 /// `raw` with its instruction replaced by `instr`: a `w:fldSimple`'s
@@ -386,6 +421,17 @@ mod tests {
         assert_eq!(with_result(nested_simple, "x"), None);
         let marked_simple = "<w:fldSimple w:instr=\"A\"><w:bookmarkStart w:id=\"1\" w:name=\"b\"/><w:r><w:t>1</w:t></w:r></w:fldSimple>";
         assert_eq!(with_result(marked_simple, "x"), None);
+    }
+
+    #[test]
+    fn the_stored_result_is_the_text_of_its_runs_1241() {
+        let raw = complex(
+            "<w:r w:rsidR=\"00A1\"><w:t xml:space=\"preserve\">a &amp; </w:t></w:r><w:proofErr w:type=\"gramStart\"/><w:r><w:t>b</w:t></w:r>",
+        );
+        assert_eq!(stored_result(&raw).as_deref(), Some("a & b"));
+        let simple = "<w:fldSimple w:instr=\"PAGE\"><w:r><w:t>4</w:t></w:r></w:fldSimple>";
+        assert_eq!(stored_result(simple).as_deref(), Some("4"));
+        assert_eq!(stored_result(&complex("<w:r><w:tab/></w:r>")), None);
     }
 
     #[test]
