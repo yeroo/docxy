@@ -147,7 +147,9 @@ fn typed_url_hyperlink_survives_save_and_reopen() {
     let mut v = view();
     type_enter(&mut v, 2, 0, "https://example.com/a?b=1&c=2");
     type_enter(&mut v, 3, 1, r"\\server\share");
-    let dir = std::env::temp_dir().join(format!("docxy-typed-url-{}", std::process::id()));
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../target/autocorrect-tests")
+        .join(format!("{}-typed-url", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("links.xlsx");

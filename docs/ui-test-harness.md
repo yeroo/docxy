@@ -756,9 +756,8 @@ correction an undo step of its own (`AutoCorrect`, or `AutoFormat` for smart
 quotes, em dashes and automatic lists); the cases are in
 `uiharness/cases/word-autocorrect.uit`. A typed URL, `www.` address, e-mail address
 or UNC path becomes a hyperlink while `ac_hyperlinks` is on; such a
-hyperlink lives in the workbook model (clickable, undoable) but is not yet
-written to the file, since the xlsx writer keeps only the hyperlinks a file
-already had (a follow-up).
+hyperlink lives in the workbook model (clickable, undoable) and is saved with
+the workbook: the xlsx writer adds the links the file doesn't have (#1025).
 
 `project-tabs.uit` drives several plans at once: a blank one from `proj.new`
 that takes tasks without a fixture, two opened plans switched between by title
