@@ -56,3 +56,25 @@ test a drag from past the first wrapped row resolves to that row's end
   assert sel.start is 0
   assert sel.end is not 0
   assert sel.end is not 185
+
+test a line ending in a tab takes a press and a drag past it after the tab
+  open copy:../fixtures/basic.docx
+  type ab
+  key tab
+  call pointer-click {"region":"doc-line-end:0"}
+  assert sel.start is 3
+  assert sel.end is 3
+  call pointer-drag {"from":"doc-line-start:0","to":"doc-line-end:0","offset":[200,0]}
+  assert sel.start is 0
+  assert sel.end is 3
+
+test a line ending in a field takes a press and a drag past it after the field
+  open copy:../fixtures/fields.docx
+  call pointer-click {"region":"doc-line-end:1"}
+  assert sel.start is 22
+  assert sel.end is 22
+  call pointer-drag {"from":"doc-line-start:1","to":"doc-line-end:1","offset":[200,0]}
+  assert sel.end is 22
+  call pointer-drag {"from":"doc-line-end:1","to":"doc-line-start:1","offset":[30,0]}
+  assert sel.end is 22
+  assert sel.start is not 22
