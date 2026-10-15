@@ -1801,7 +1801,11 @@ impl Printer {
                     }
                     ls = format!("({ls})");
                 }
-                // `A1 [Qty]` reads as the table reference `A1[Qty]`.
+                // `A1 (B1:C3 C2:D4)` reads as the call `A1(…)`, `A1 [Qty]` as
+                // the table reference `A1[Qty]`.
+                if *op == BinOp::Isect && !lp && rs.starts_with('(') && ends_in_cell(l) {
+                    ls = format!("({ls})");
+                }
                 if *op == BinOp::Isect && !lp && rs.starts_with('[') && ends_in_cell(l) {
                     ls = format!("({ls})");
                 }
@@ -4146,12 +4150,6 @@ pub fn is_volatile(e: &Expr) -> bool {
         Expr::ArrayLit(rows) => rows.iter().flatten().any(is_volatile),
         Expr::Call(callee, args) => is_volatile(callee) || args.iter().any(is_volatile),
         Expr::Un(_, x) => is_volatile(x),
-        // A span whose ends are not literal references has no box to depend
-        // on until it is evaluated.
-        Expr::Bin(BinOp::Range, ..) => {
-            let ends = span_leaves(e);
-            !ends.iter().all(|x| is_literal_ref(x)) || ends.into_iter().any(is_volatile)
-        }
         Expr::Bin(_, l, r) => is_volatile(l) || is_volatile(r),
         _ => false,
     }
@@ -6337,6 +6335,14 @@ impl<'a> Eval<'a> {
                 (BinOp::Isect, ends)
             }
         };
+        // The ends of a span are the cells the dependency graph boxes, so
+        // only forms it can read from the text qualify. A name or call end
+        // (`Sales[Qty]:Rate`, `:INDEX(…)`) parses but is not evaluated: the
+        // cell keeps the file's cached value.
+        if op == BinOp::Range && !ends.iter().all(|x| is_literal_ref(x)) {
+            self.unsupported = true;
+            return Arg::Scalar(Value::Err(ExcelError::Value));
+        }
         let mut acc: Option<(usize, u32, u32, u32, u32)> = None;
         for end in ends {
             let b = match self.ref_rect(end, true) {
@@ -16131,7 +16137,34 @@ mod tests {
             col1: Some(col.into()),
             col2: None,
         };
+        // A cell before `(` would read as a call (`A1(…)`).
+        let paren = isect(
+            Expr::Range(cell(None, 0, 1), cell(None, 2, 2)),
+            Expr::Range(cell(None, 1, 2), cell(None, 3, 3)),
+        );
+        let ref_a1 = Expr::Ref(cell(None, 0, 0));
+        let convert = isect(
+            bare("Qty"),
+            isect(
+                sales(TableItem::Data, "Qty"),
+                sales(TableItem::Data, "Price"),
+            ),
+        );
         for ast in [
+            isect(ref_a1.clone(), paren.clone()),
+            isect(
+                isect(
+                    Expr::Range(cell(None, 0, 1), cell(None, 4, 1)),
+                    ref_a1.clone(),
+                ),
+                paren.clone(),
+            ),
+            isect(convert.clone(), paren.clone()),
+            isect(sales(TableItem::Data, "Qty"), paren.clone()),
+            isect(
+                bare("Qty"),
+                isect(sales(TableItem::Data, "Qty"), bare("Price")),
+            ),
             isect(Expr::Ref(cell(None, 0, 0)), bare("Qty")),
             isect(Expr::Name("Rate".into()), bare("Qty")),
             isect(
@@ -16228,7 +16261,6 @@ mod tests {
         let g = issue_680_grid().with_name("Rate", "Sheet1!$B$3");
         // A one-cell defined name is a reference.
         for (src, want) in [
-            ("SUM(Sales[Qty]:Rate)", 37.0),
             ("SUM(Sales[Qty] Rate)", 10.0),
             ("SUM(Rate Sales[Qty])", 10.0),
             ("ROWS(OFFSET(Rate,0,0,2,1))", 2.0),
@@ -16239,10 +16271,18 @@ mod tests {
         }
         // References the evaluator holds only as values are flagged, so the
         // file's cached answer stands instead of a wrong #VALUE!.
+        // A span with a name or call end parses but is not evaluated: its
+        // ends are what the dependency graph boxes, and it can read only
+        // forms in the text.
         for src in [
             "SUM(Sales[Qty] LET(c,B3,c))",
             "LET(c,B3,SUM(Sales[Qty] c))",
             "SUM(Sales[Qty]:INDEX(Sales[Price],2))",
+            "SUM(Sales[Qty]:Rate)",
+            "ROWS(Sales[Qty]:Sales)",
+            "LET(c,B3,SUM(Sales[Qty]:c))",
+            "ISREF(Sales[Qty]:Rate)",
+            "ROWS(Sales[Qty]:OFFSET(Sales[Price],1,0))",
         ] {
             let (_, unsupported) = eval_outside(src, &g);
             assert!(unsupported, "{src}");

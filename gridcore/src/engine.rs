@@ -2577,13 +2577,11 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
     formula::collect_range_ops(ast, &mut spans);
     for leaves in spans {
         let mut ends = Vec::new();
-        // Only ends that name cells: a literal reference, or a defined name
-        // that is one. A call end (`INDEX(…)`) has no cells of its own to
-        // box, and its arguments are not the span (they would box the
-        // formula's own cell into a false circle); such a span is volatile,
-        // but that only marks it dirty, so the order of calculation comes
-        // from the ends it does box.
-        for leaf in leaves.into_iter().filter(|l| names_cells(wb, sheet, l, 0)) {
+        // Only literal ends: a span with a name or call end is not
+        // evaluated (it keeps its cached value), and the arguments of a call
+        // end are not the span (they would box the formula's own cell into a
+        // false circle).
+        for leaf in leaves.into_iter().filter(|l| formula::is_literal_ref(l)) {
             collect_deps(wb, key, leaf, &mut ends, depth + 1);
         }
         let Some(&(s, ..)) = ends.first() else {
@@ -2651,21 +2649,6 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
                 collect_deps(wb, key, &def_ast, out, depth + 1);
             }
         }
-    }
-}
-
-/// Whether a span end names cells by its text or through a defined name whose
-/// definition does (depth-capped as [`collect_deps`] expands names).
-fn names_cells(wb: &Workbook, sheet: usize, e: &Expr, depth: u32) -> bool {
-    match e {
-        Expr::Name(n) => {
-            depth < 8
-                && wb
-                    .defined_name(n, sheet)
-                    .and_then(|d| formula::parse(d).ok())
-                    .is_some_and(|d| names_cells(wb, sheet, &d, depth + 1))
-        }
-        e => formula::is_literal_ref(e),
     }
 }
 
@@ -5797,7 +5780,6 @@ mod tests {
             ("A2", Cell::number(5.0)),
             ("F1", Cell::formula("SUM(Sales[Qty]:Sales[Price])")),
             ("F2", Cell::formula("SUM(Sales[Qty]:A1)")),
-            ("F3", Cell::formula("SUM(Sales[Qty]:Rate)")),
         ]);
         wb.tables.push(crate::sheet::Table {
             name: "Sales".to_string(),
@@ -5819,7 +5801,6 @@ mod tests {
         eng.recalc_all(&mut wb);
         assert_eq!(value_at(&wb, "F1"), CellValue::Number(111.0));
         assert_eq!(value_at(&wb, "F2"), CellValue::Number(1006.0));
-        assert_eq!(value_at(&wb, "F3"), CellValue::Number(111.0));
         set(&mut eng, &mut wb, "C3", Cell::number(20.0));
         assert_eq!(value_at(&wb, "F1"), CellValue::Number(121.0));
         assert_eq!(value_at(&wb, "F2"), CellValue::Number(1006.0));
@@ -5907,51 +5888,43 @@ mod tests {
     }
 
     #[test]
-    fn a_span_to_a_defined_name_depends_on_the_cells_between_its_ends() {
-        // #680 FIX r5: `Sales[Qty]:Rate` (Rate = $D$3) boxes B2:D3, so C3
-        // inside it is calculated first, and a span inside its own box is a
-        // circle.
-        let make = |span_at: &str| {
-            let mut wb = wb_one_sheet(&[
-                ("B1", Cell::text("Qty")),
-                ("B2", Cell::number(1.0)),
-                ("B3", Cell::number(2.0)),
-                ("D3", Cell::number(4.0)),
-                ("A9", Cell::number(10.0)),
-                ("C3", Cell::formula("A9*2")),
-                (span_at, Cell::formula("SUM(Sales[Qty]:Rate)")),
-            ]);
-            wb.tables.push(crate::sheet::Table {
-                name: "Sales".to_string(),
-                sheet: 0,
-                range: (0, 1, 2, 1),
-                header_rows: 1,
-                totals_rows: 0,
-                columns: vec!["Qty".into()],
-                part: String::new(),
-                column_ids: Vec::new(),
-                calculated_formulas: Vec::new(),
-            });
-            wb.defined_names.push(crate::sheet::DefinedName {
-                name: "Rate".into(),
-                scope: None,
-                formula: "Sheet1!$D$3".into(),
-            });
-            wb
-        };
-        // G1 sorts before C3 yet reads it: B2:D3 = 1+2+(C3=20)+4 (+ gaps).
-        let mut wb = make("G1");
+    fn a_span_to_a_name_or_call_end_keeps_its_cached_value() {
+        // #680 FIX r6: the ends of a span are what the graph boxes, so a
+        // name (defined, LET-bound, a bare table) or call end is not
+        // evaluated: the cell stays on its cached value, boxes nothing, and
+        // is no circle even where its text spans its own cell.
+        let mut wb = wb_one_sheet(&[
+            ("B1", Cell::text("Qty")),
+            ("B2", Cell::number(1.0)),
+            ("B3", Cell::number(2.0)),
+            ("D3", Cell::number(4.0)),
+            ("G1", Cell::formula("SUM(Sales[Qty]:Rate)")),
+            ("C2", Cell::formula("SUM(Sales[Qty]:Rate)")),
+            ("G2", Cell::formula("LET(c,D3,SUM(Sales[Qty]:c))")),
+            ("G3", Cell::formula("SUM(Sales[Qty]:Sales)")),
+        ]);
+        wb.tables.push(crate::sheet::Table {
+            name: "Sales".to_string(),
+            sheet: 0,
+            range: (0, 1, 2, 1),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["Qty".into()],
+            part: String::new(),
+            column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
+        });
+        wb.defined_names.push(crate::sheet::DefinedName {
+            name: "Rate".into(),
+            scope: None,
+            formula: "Sheet1!$D$3".into(),
+        });
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
-        assert_eq!(value_at(&wb, "G1"), CellValue::Number(27.0));
-        set(&mut eng, &mut wb, "A9", Cell::number(100.0));
-        assert_eq!(value_at(&wb, "G1"), CellValue::Number(207.0));
-        // A span cell inside its own box.
-        let mut wb = make("C2");
-        let eng = Engine::new(&wb);
-        let mut eng = eng;
-        eng.recalc_all(&mut wb);
-        assert!(eng.circular_refs().contains(&(0, 1, 2)));
+        for key in [(0, 0, 6), (0, 1, 2), (0, 1, 6), (0, 2, 6)] {
+            assert!(eng.is_unsupported(key), "{key:?}");
+        }
+        assert_eq!(eng.circular_refs(), Vec::<Key>::new());
     }
 
     #[test]
