@@ -657,6 +657,9 @@ impl Compiler<'_> {
                     _ => 0x14,
                 }]);
             }
+            // The reference operators have their own tokens (ptgRange,
+            // ptgIsect); the writer does not emit them.
+            Expr::Bin(BinOp::Range | BinOp::Isect, ..) => return Err(Why::Unsupported),
             Expr::Bin(op, l, r) => {
                 let oc = Self::child(self.resolve(None, cx), Conv::Rpo, true);
                 self.operand(l, oc, prec(l) < prec(e))?;
@@ -674,6 +677,7 @@ impl Compiler<'_> {
                     BinOp::Ge => 0x0C,
                     BinOp::Gt => 0x0D,
                     BinOp::Ne => 0x0E,
+                    BinOp::Range | BinOp::Isect => unreachable!("refused above"),
                 }]);
             }
         }

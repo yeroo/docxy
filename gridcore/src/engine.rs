@@ -2571,6 +2571,31 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
             }
         }
     }
+    // `a:b` reads the box spanning both ends, not just the ends: a span from
+    // `Sales[Item]` to `Sales[Price]` reads the columns between them.
+    let mut spans = Vec::new();
+    formula::collect_range_ops(ast, &mut spans);
+    for leaves in spans {
+        let mut ends = Vec::new();
+        // Only literal ends: a span with a name or call end is not
+        // evaluated (it keeps its cached value), and the arguments of a call
+        // end are not the span (they would box the formula's own cell into a
+        // false circle).
+        for leaf in leaves.into_iter().filter(|l| formula::is_literal_ref(l)) {
+            collect_deps(wb, key, leaf, &mut ends, depth + 1);
+        }
+        let Some(&(s, ..)) = ends.first() else {
+            continue;
+        };
+        if let Some(bx) = ends
+            .iter()
+            .filter(|e| e.0 == s)
+            .copied()
+            .reduce(|a, b| (s, a.1.min(b.1), a.2.min(b.2), a.3.max(b.3), a.4.max(b.4)))
+        {
+            out.push(bx);
+        }
+    }
     // Tables iterated by SUMX-family calls: the whole data region is read.
     let mut iterated = Vec::new();
     formula::collect_iterated_tables(ast, &mut iterated);
@@ -2663,6 +2688,9 @@ fn without_position_refs(wb: &Workbook, sheet: usize, ast: &Expr) -> Option<Expr
             | Expr::ColRange { .. }
             | Expr::RowRange { .. }
             | Expr::Structured { .. } => true,
+            Expr::Bin(formula::BinOp::Range | formula::BinOp::Isect, l, r) => {
+                position_only(wb, sheet, l, depth) && position_only(wb, sheet, r, depth)
+            }
             Expr::Name(n) => match wb.defined_name(n, sheet) {
                 Some(def) => {
                     depth < 8
@@ -5694,6 +5722,212 @@ mod tests {
     }
 
     #[test]
+    fn reference_operators_track_their_operands_dependencies() {
+        // #680: `Sales[Qty]:Sales[Price]` and the space operator read the
+        // table's cells, so editing one recalculates them.
+        let mut wb = wb_one_sheet(&[
+            ("B2", Cell::text("Qty")),
+            ("C2", Cell::text("Price")),
+            ("B3", Cell::number(2.0)),
+            ("C3", Cell::number(10.0)),
+            ("B4", Cell::number(3.0)),
+            ("C4", Cell::number(5.0)),
+            ("E1", Cell::formula("SUM(Sales[Qty]:Sales[Price])")),
+            ("E2", Cell::formula("SUM(Sales[Qty] Sales[[#All],[Qty]])")),
+            ("E3", Cell::formula("SUM(INDIRECT(\"Sales[Qty]\"))")),
+            ("E4", Cell::formula("ISREF(Sales[Qty]:Sales[Price])")),
+            ("E5", Cell::formula("Sales[[#This Row],[Qty]]")),
+        ]);
+        wb.tables.push(crate::sheet::Table {
+            name: "Sales".to_string(),
+            sheet: 0,
+            range: (1, 1, 3, 2),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["Qty".into(), "Price".into()],
+            part: String::new(),
+            column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
+        });
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(20.0));
+        assert_eq!(value_at(&wb, "E2"), CellValue::Number(5.0));
+        assert_eq!(value_at(&wb, "E3"), CellValue::Number(5.0));
+        assert_eq!(value_at(&wb, "E4"), CellValue::Bool(true));
+        // E5 is on row 5, below the table (rows 2-4): #VALUE!.
+        assert_eq!(value_at(&wb, "E5"), CellValue::Error("#VALUE!".to_string()));
+        set(&mut eng, &mut wb, "B3", Cell::number(100.0));
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(118.0));
+        assert_eq!(value_at(&wb, "E2"), CellValue::Number(103.0));
+        assert_eq!(value_at(&wb, "E3"), CellValue::Number(103.0));
+        set(&mut eng, &mut wb, "C4", Cell::number(50.0));
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(163.0));
+    }
+
+    #[test]
+    fn a_span_depends_on_the_cells_between_its_ends() {
+        // #680 FIX r1: `Sales[Qty]:Sales[Price]` reads the middle column and
+        // `Sales[Qty]:A1` reads the gap between them, though neither is named.
+        let mut wb = wb_one_sheet(&[
+            ("B2", Cell::text("Qty")),
+            ("C2", Cell::text("Mid")),
+            ("D2", Cell::text("Price")),
+            ("B3", Cell::number(1.0)),
+            ("C3", Cell::number(10.0)),
+            ("D3", Cell::number(100.0)),
+            ("A3", Cell::number(1000.0)),
+            ("A2", Cell::number(5.0)),
+            ("F1", Cell::formula("SUM(Sales[Qty]:Sales[Price])")),
+            ("F2", Cell::formula("SUM(Sales[Qty]:A1)")),
+        ]);
+        wb.tables.push(crate::sheet::Table {
+            name: "Sales".to_string(),
+            sheet: 0,
+            range: (1, 1, 2, 3),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["Qty".into(), "Mid".into(), "Price".into()],
+            part: String::new(),
+            column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
+        });
+        wb.defined_names.push(crate::sheet::DefinedName {
+            name: "Rate".into(),
+            scope: None,
+            formula: "Sheet1!$D$3".into(),
+        });
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "F1"), CellValue::Number(111.0));
+        assert_eq!(value_at(&wb, "F2"), CellValue::Number(1006.0));
+        set(&mut eng, &mut wb, "C3", Cell::number(20.0));
+        assert_eq!(value_at(&wb, "F1"), CellValue::Number(121.0));
+        assert_eq!(value_at(&wb, "F2"), CellValue::Number(1006.0));
+        // A2 is in the box but named by neither end.
+        set(&mut eng, &mut wb, "A2", Cell::number(50.0));
+        assert_eq!(value_at(&wb, "F2"), CellValue::Number(1051.0));
+    }
+
+    #[test]
+    fn a_long_span_chain_builds_its_dependencies_at_once() {
+        // #680 FIX r2: `A1:A2:…:A60` is one box, not 2^60 walks.
+        let chain = (1..=60)
+            .map(|i| format!("A{i}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("A30", Cell::number(2.0)),
+            ("A60", Cell::number(3.0)),
+            ("C1", Cell::formula(&format!("SUM({chain})"))),
+            ("C2", Cell::formula(&format!("SUM(({chain}) A30)"))),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(6.0));
+        assert_eq!(value_at(&wb, "C2"), CellValue::Number(2.0));
+        set(&mut eng, &mut wb, "A45", Cell::number(10.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(16.0));
+    }
+
+    #[test]
+    fn a_span_chain_of_thousands_of_ends_is_one_box() {
+        // #680 FIX r3: a chain is flattened, not walked once per level.
+        let chain = (1..=1500)
+            .map(|i| format!("A{i}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("A1500", Cell::number(3.0)),
+            ("C1", Cell::formula(&format!("SUM({chain})"))),
+            ("C2", Cell::formula(&format!("ROWS({chain})"))),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(4.0));
+        assert_eq!(value_at(&wb, "C2"), CellValue::Number(1500.0));
+        set(&mut eng, &mut wb, "A777", Cell::number(10.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(14.0));
+    }
+
+    #[test]
+    fn a_span_to_a_computed_end_is_no_false_circle() {
+        // #680 FIX r4/r5: the arguments of `INDEX(Sales[Qty],$F$1)` are not a
+        // span end, so they do not box the formula cells in column D with
+        // `$F$1` (the old box B1:F3 held D2 and D3).
+        let mut wb = wb_one_sheet(&[
+            ("B1", Cell::text("Qty")),
+            ("B2", Cell::number(1.0)),
+            ("B3", Cell::number(2.0)),
+            ("F1", Cell::number(1.0)),
+            (
+                "D2",
+                Cell::formula("SUM(Sales[Qty]:INDEX(Sales[Qty],$F$1))"),
+            ),
+            (
+                "D3",
+                Cell::formula("SUM(Sales[Qty]:INDEX(Sales[Qty],$F$1))"),
+            ),
+        ]);
+        wb.tables.push(crate::sheet::Table {
+            name: "Sales".to_string(),
+            sheet: 0,
+            range: (0, 1, 2, 1),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["Qty".into()],
+            part: String::new(),
+            column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
+        });
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(eng.circular_refs(), Vec::<Key>::new());
+    }
+
+    #[test]
+    fn a_span_to_a_name_or_call_end_keeps_its_cached_value() {
+        // #680 FIX r6: the ends of a span are what the graph boxes, so a
+        // name (defined, LET-bound, a bare table) or call end is not
+        // evaluated: the cell stays on its cached value, boxes nothing, and
+        // is no circle even where its text spans its own cell.
+        let mut wb = wb_one_sheet(&[
+            ("B1", Cell::text("Qty")),
+            ("B2", Cell::number(1.0)),
+            ("B3", Cell::number(2.0)),
+            ("D3", Cell::number(4.0)),
+            ("G1", Cell::formula("SUM(Sales[Qty]:Rate)")),
+            ("C2", Cell::formula("SUM(Sales[Qty]:Rate)")),
+            ("G2", Cell::formula("LET(c,D3,SUM(Sales[Qty]:c))")),
+            ("G3", Cell::formula("SUM(Sales[Qty]:Sales)")),
+        ]);
+        wb.tables.push(crate::sheet::Table {
+            name: "Sales".to_string(),
+            sheet: 0,
+            range: (0, 1, 2, 1),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["Qty".into()],
+            part: String::new(),
+            column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
+        });
+        wb.defined_names.push(crate::sheet::DefinedName {
+            name: "Rate".into(),
+            scope: None,
+            formula: "Sheet1!$D$3".into(),
+        });
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        for key in [(0, 0, 6), (0, 1, 2), (0, 1, 6), (0, 2, 6)] {
+            assert!(eng.is_unsupported(key), "{key:?}");
+        }
+        assert_eq!(eng.circular_refs(), Vec::<Key>::new());
+    }
+
+    #[test]
     fn position_functions_do_not_read_their_reference_arguments() {
         // #679 FIX r1 M2: ROW/COLUMN/ROWS/COLUMNS read where a reference is,
         // not its values, so a calculated column measuring its own table is
@@ -5704,6 +5938,8 @@ mod tests {
             ("ROW()-ROW(Sales)+1", 1.0, 2.0),
             ("COLUMN(Sales[Calc])", 4.0, 4.0),
             ("ROWS(Sales[#All])", 3.0, 3.0),
+            ("ROWS(Sales[Qty]:Sales[Price])", 2.0, 2.0),
+            ("ROWS(Sales[Qty] Sales[[#All],[Qty]])", 2.0, 2.0),
             ("ROWS(A1:D3)+COLUMN(D2)", 7.0, 7.0),
         ] {
             let mut wb = calc_column_wb("Sales", calc);
