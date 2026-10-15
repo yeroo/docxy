@@ -36,9 +36,9 @@ pub use repair::{Repairs, load_xlsx_repair};
 
 use crate::formula::{file_formula, translate_formula};
 use crate::sheet::{
-    Cell, CellMeta, CellValue, ColDef, DefinedName, NumFmt, Sheet, Styles, Table, Workbook, Xf,
-    cell_name, classify_builtin, classify_format_code, is_array_f, parse_cell_name,
-    parse_range_name, ref_starts_at, with_ref,
+    CalcMode, CalcSettings, Cell, CellMeta, CellValue, ColDef, DefinedName, NumFmt, Sheet, Styles,
+    Table, Workbook, Xf, cell_name, classify_builtin, classify_format_code, is_array_f,
+    parse_cell_name, parse_range_name, ref_starts_at, with_ref,
 };
 
 const OLE2: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
@@ -402,7 +402,7 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
     let resolve = |target: &str| -> String { resolve_relative(wb_dir, target) };
 
     // Workbook: sheet list + date system + defined names.
-    let (sheet_meta, date1904, iterate, raw_names) = parse_workbook_xml(&wb_xml);
+    let (sheet_meta, date1904, iterate, mut calc, raw_names) = parse_workbook_xml(&wb_xml);
     let active_tab = parse_active_tab(&wb_xml).min(sheet_meta.len().saturating_sub(1));
 
     // Shared strings + styles (relative to the workbook dir). Keep the resolved
@@ -461,6 +461,7 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
         sheet.name = name;
         sheet.hidden = hidden;
         sheet.filter_mode = Some(read_filter_mode(&xml));
+        calc.transition_eval |= read_transition_evaluation(&xml);
         sheet.auto_filter = sheet_auto_filter_span(&xml)
             .and_then(|(s, e)| auto_filter_position(&xml[s..e], &styles.dxfs));
         let sheet_idx = sheets.len();
@@ -615,6 +616,7 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
             pivots,
             date1904,
             iterate,
+            calc,
             active_tab,
         },
     })
@@ -1006,9 +1008,11 @@ fn parse_workbook_xml(
     Vec<(String, String, bool)>,
     bool,
     Option<(u32, f64)>,
+    CalcSettings,
     Vec<(String, Option<usize>, String)>,
 ) {
     let mut sheets = Vec::new();
+    let mut calc = CalcSettings::default();
     let mut date1904 = false;
     let mut seen_workbook_pr = false;
     let mut iterate = None;
@@ -1044,11 +1048,15 @@ fn parse_workbook_xml(
                 }
                 "calcPr" => {
                     let it = p.attr("iterate");
+                    calc.iterate_count = p.attr("iterateCount").parse().unwrap_or(100);
+                    calc.iterate_delta = p.attr("iterateDelta").parse().unwrap_or(0.001);
                     if it == "1" || it == "true" {
-                        let count = p.attr("iterateCount").parse().unwrap_or(100);
-                        let delta = p.attr("iterateDelta").parse().unwrap_or(0.001);
-                        iterate = Some((count, delta));
+                        iterate = Some((calc.iterate_count, calc.iterate_delta));
                     }
+                    calc.mode = CalcMode::from_attr(p.attr("calcMode"));
+                    calc.precision_file_off = matches!(p.attr("fullPrecision"), "0" | "false");
+                    calc.num_threads = p.attr("numThreads").parse().ok();
+                    calc.concurrent_calc = !matches!(p.attr("concurrentCalc"), "0" | "false");
                 }
                 "definedName" => {
                     let scope = p.attr("localSheetId").parse::<usize>().ok();
@@ -1077,7 +1085,7 @@ fn parse_workbook_xml(
             Event::Eof => break,
         }
     }
-    (sheets, date1904, iterate, names)
+    (sheets, date1904, iterate, calc, names)
 }
 
 /// `<workbookView activeTab>` of the first workbook view; 0 when absent.
@@ -3848,6 +3856,11 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
             // Links made in-session, and retyped ones, with their relationships.
             hyperlinks::write_hyperlinks(out, sheet, &mut parts, part_name, pkg.ns())
         };
+        let updated = if wb.calc.transition_eval_changed && !cellless {
+            set_transition_evaluation(updated, wb.calc.transition_eval)
+        } else {
+            updated
+        };
         let updated = if tabs_selected {
             set_tab_selected(&updated, idx == active_tab)
         } else {
@@ -4029,6 +4042,15 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
         // The date system too: an imported 1904 workbook (#603) starts from
         // new_xlsx's 1900 part, and its dates would shift by 1462 days.
         p.1 = set_date1904(&xml, wb.date1904).into_bytes();
+    }
+
+    // --- calcPr: the calculation settings the user can change ------------------
+    if let Some(p) = parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
+        let xml = String::from_utf8_lossy(&p.1).into_owned();
+        let out = sync_calc_pr(&xml, wb);
+        if out != xml {
+            p.1 = out.into_bytes();
+        }
     }
 
     // --- calc chain: drop it, ask Excel to recalculate ---------------------
@@ -5463,6 +5485,20 @@ fn read_filter_mode(xml: &str) -> bool {
     }
     worksheet_child_span(xml, "sheetPr")
         .is_some_and(|(start, _)| matches!(attr_at(xml, start, "filterMode"), Some("1" | "true")))
+}
+
+/// `<sheetPr transitionEvaluation>`: whether the sheet says Transition formula
+/// evaluation is on.
+fn read_transition_evaluation(xml: &str) -> bool {
+    if !xml.contains("transitionEvaluation") {
+        return false;
+    }
+    worksheet_child_span(xml, "sheetPr").is_some_and(|(start, _)| {
+        matches!(
+            attr_at(xml, start, "transitionEvaluation"),
+            Some("1" | "true")
+        )
+    })
 }
 
 /// Sync `<sheetPr filterMode>` (some rows of the sheet are filtered) with
@@ -8083,6 +8119,124 @@ fn set_date1904(xml: &str, on: bool) -> String {
     }
 }
 
+/// Write the calculation settings into `<calcPr>`: each attribute only when
+/// the model says something other than the part already does, so a workbook
+/// whose settings were not touched keeps its `calcPr` byte for byte, and
+/// attributes this model does not know survive. A workbook that needs none
+/// of them gets no `calcPr` from this.
+fn sync_calc_pr(xml: &str, wb: &Workbook) -> String {
+    let c = &wb.calc;
+    let off = |v: &str| matches!(v, "0" | "false");
+    let on = |v: &str| matches!(v, "1" | "true");
+    let precision_off = c.precision_as_displayed || c.precision_file_off;
+    // (attribute, the value to write — None removes it, whether the part's
+    // current value already means that).
+    type Want<'a> = (&'static str, Option<String>, Box<dyn Fn(&str) -> bool + 'a>);
+    let mut wants: Vec<Want> = vec![
+        (
+            "calcMode",
+            c.mode.attr().map(str::to_string),
+            Box::new(|v| CalcMode::from_attr(v) == c.mode),
+        ),
+        (
+            "fullPrecision",
+            precision_off.then(|| "0".to_string()),
+            Box::new(move |v| off(v) == precision_off),
+        ),
+        (
+            "iterate",
+            wb.iterate.map(|_| "1".to_string()),
+            Box::new(move |v| on(v) == wb.iterate.is_some()),
+        ),
+        (
+            "concurrentCalc",
+            (!c.concurrent_calc).then(|| "0".to_string()),
+            Box::new(move |v| off(v) != c.concurrent_calc),
+        ),
+    ];
+    if let Some((count, delta)) = wb.iterate {
+        wants.push((
+            "iterateCount",
+            Some(count.to_string()),
+            // Absent means Excel's default of 100.
+            Box::new(move |v| v.parse::<f64>().unwrap_or(100.0) == f64::from(count)),
+        ));
+        wants.push((
+            "iterateDelta",
+            Some(delta.to_string()),
+            // Absent means Excel's default of 0.001.
+            Box::new(move |v| v.parse::<f64>().unwrap_or(0.001) == delta),
+        ));
+    }
+    if let Some(n) = c.num_threads {
+        wants.push((
+            "numThreads",
+            Some(n.to_string()),
+            Box::new(move |v| v.parse::<u32>().is_ok_and(|x| x == n)),
+        ));
+    }
+    let Some(start) = workbook_child(xml, "calcPr").map(|c| c.start) else {
+        let attrs: String = wants
+            .iter()
+            .filter_map(|(name, v, _)| v.as_ref().map(|v| format!(" {name}=\"{v}\"")))
+            .collect();
+        if attrs.is_empty() {
+            return xml.to_string();
+        }
+        return match workbook_slot(xml, "calcPr") {
+            WorkbookSlot::At(at, px) => {
+                let mut out = xml.to_string();
+                out.insert_str(at, &format!("<{px}calcPr calcId=\"0\"{attrs}/>"));
+                out
+            }
+            _ => xml.to_string(),
+        };
+    };
+    let mut out = xml.to_string();
+    for (name, value, same) in &wants {
+        let end = tag_end(&out, start);
+        // A start tag the part cuts off: nothing to patch.
+        if !out[start..end].ends_with('>') {
+            break;
+        }
+        if !same(attr_at(&out, start, name).unwrap_or("")) {
+            out = set_tag_attr(&out, start, name, value.as_deref());
+        }
+    }
+    out
+}
+
+/// Sync `<sheetPr transitionEvaluation>` (Transition formula evaluation) with
+/// the workbook-wide setting; called only after the user changed it.
+fn set_transition_evaluation(xml: String, now: bool) -> String {
+    let Some((start, _)) = worksheet_child_span(&xml, "sheetPr") else {
+        if !now {
+            return xml;
+        }
+        return put_worksheet_child(
+            &xml,
+            "sheetPr",
+            "<sheetPr transitionEvaluation=\"1\"/>",
+            None,
+            false,
+        );
+    };
+    let was = matches!(
+        attr_at(&xml, start, "transitionEvaluation"),
+        Some("1" | "true")
+    );
+    if was == now {
+        return xml;
+    }
+    let out = set_tag_attr(&xml, start, "transitionEvaluation", now.then_some("1"));
+    match worksheet_child_span(&out, "sheetPr") {
+        Some((s, e)) if !now && page::is_bare(&out[s..e]) => {
+            remove_worksheet_child(&out, "sheetPr")
+        }
+        _ => out,
+    }
+}
+
 /// Guarantee `<calcPr … fullCalcOnLoad="1"/>` in workbook.xml, in any prefix:
 /// an existing calcPr gets the attribute (or has a `0`/`false` one turned on,
 /// since save has just dropped the calc chain), and a workbook without one
@@ -9868,6 +10022,7 @@ pub(crate) fn new_xlsx_sheets(names: &[String]) -> SheetPackage {
             pivots: Vec::new(),
             date1904: false,
             iterate: None,
+            calc: CalcSettings::default(),
             active_tab: 0,
         },
     }
@@ -22901,5 +23056,154 @@ mod table_command_tests {
             t.calculated_formulas,
             vec![None, Some("#REF!*$E$11".to_string())]
         );
+    }
+}
+
+#[cfg(test)]
+mod calc_settings_tests {
+    use super::*;
+
+    fn part_text(pkg: &SheetPackage, name: &str) -> String {
+        String::from_utf8_lossy(pkg.part(name).unwrap()).into_owned()
+    }
+
+    fn with_workbook_xml(pkg: &mut SheetPackage, f: impl Fn(&str) -> String) {
+        let xml = part_text(pkg, "xl/workbook.xml");
+        pkg.set_part("xl/workbook.xml", f(&xml).into_bytes());
+    }
+
+    /// A one-sheet package whose workbook.xml carries `calc_pr`.
+    fn with_calc_pr(calc_pr: &str) -> SheetPackage {
+        let mut pkg = new_xlsx();
+        with_workbook_xml(&mut pkg, |xml| {
+            let xml = match xml.find("<calcPr") {
+                Some(i) => {
+                    let end = xml[i..].find("/>").unwrap() + i + 2;
+                    format!("{}{}", &xml[..i], &xml[end..])
+                }
+                None => xml.to_string(),
+            };
+            xml.replacen("</workbook>", &format!("{calc_pr}</workbook>"), 1)
+        });
+        // The parts as they stand, not through a save (which would write the
+        // model's default settings over the part just built).
+        load_xlsx(&write_zip(&pkg.parts)).unwrap()
+    }
+
+    #[test]
+    fn calc_settings_round_trip_xlsx() {
+        let mut pkg = with_calc_pr(
+            r#"<calcPr calcId="191029" futureAttr="keep" calcMode="manual" iterate="1" iterateCount="50" iterateDelta="0.01" numThreads="4" concurrentCalc="0"/>"#,
+        );
+        let c = &pkg.workbook.calc;
+        assert_eq!(c.mode, CalcMode::Manual);
+        assert_eq!((c.num_threads, c.concurrent_calc), (Some(4), false));
+        assert_eq!(pkg.workbook.iterate, Some((50, 0.01)));
+        // Untouched: the attributes, known and unknown, come back as they were.
+        let again = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let wb = part_text(&again, "xl/workbook.xml");
+        assert!(wb.contains(r#"futureAttr="keep""#), "{wb}");
+        assert!(wb.contains(r#"calcMode="manual""#), "{wb}");
+        assert!(wb.contains(r#"numThreads="4""#), "{wb}");
+        assert!(wb.contains(r#"concurrentCalc="0""#), "{wb}");
+        assert_eq!(again.workbook.calc.mode, CalcMode::Manual);
+
+        // Changed: only what the user set is rewritten.
+        pkg.workbook.calc.mode = CalcMode::AutoNoTable;
+        pkg.workbook.set_iteration(false, 50, 0.01);
+        pkg.workbook.calc.num_threads = Some(2);
+        pkg.workbook.calc.concurrent_calc = true;
+        pkg.workbook.calc.set_precision_as_displayed(true);
+        let again = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let wb = part_text(&again, "xl/workbook.xml");
+        assert!(wb.contains(r#"futureAttr="keep""#), "{wb}");
+        assert!(wb.contains(r#"calcMode="autoNoTable""#), "{wb}");
+        assert!(wb.contains(r#"numThreads="2""#), "{wb}");
+        assert!(!wb.contains("concurrentCalc"), "{wb}");
+        assert!(!wb.contains(r#"iterate="1""#), "{wb}");
+        assert!(wb.contains(r#"fullPrecision="0""#), "{wb}");
+        assert_eq!(again.workbook.iterate, None);
+        assert_eq!(again.workbook.calc.mode, CalcMode::AutoNoTable);
+        assert!(again.workbook.calc.precision_file_off);
+        assert!(
+            !again.workbook.calc.precision_as_displayed,
+            "load applies nothing"
+        );
+    }
+
+    #[test]
+    fn full_precision_off_in_file_is_kept_not_applied() {
+        let pkg = with_calc_pr(r#"<calcPr calcId="1" fullPrecision="0"/>"#);
+        assert!(pkg.workbook.calc.precision_file_off);
+        assert!(!pkg.workbook.calc.precision_as_displayed);
+        let wb = part_text(&load_xlsx(&save_xlsx(&pkg)).unwrap(), "xl/workbook.xml");
+        assert!(wb.contains(r#"fullPrecision="0""#), "{wb}");
+        // Turned on and back off by the user: the attribute goes.
+        let mut pkg = pkg;
+        pkg.workbook.calc.set_precision_as_displayed(false);
+        let wb = part_text(&load_xlsx(&save_xlsx(&pkg)).unwrap(), "xl/workbook.xml");
+        assert!(!wb.contains("fullPrecision"), "{wb}");
+    }
+
+    #[test]
+    fn manual_file_loads_fresh_and_saves_full_calc_on_load() {
+        let mut pkg = with_calc_pr(r#"<calcPr calcId="1" calcMode="manual"/>"#);
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell::number(5.0));
+        pkg.workbook.sheets[0].set_cell(1, 0, Cell::formula("A1*2"));
+        let mut again = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let wb = part_text(&again, "xl/workbook.xml");
+        assert!(wb.contains(r#"fullCalcOnLoad="1""#), "{wb}");
+        assert!(wb.contains(r#"calcMode="manual""#), "{wb}");
+        // Load itself does the full calculation: values fresh, nothing stale.
+        let mut eng = crate::engine::Engine::new(&again.workbook);
+        eng.recalc_all(&mut again.workbook);
+        assert_eq!(
+            again.workbook.sheets[0].cell(1, 0).unwrap().value,
+            CellValue::Number(10.0)
+        );
+        assert!(!eng.is_stale());
+        assert_eq!(again.workbook.calc.mode, CalcMode::Manual);
+    }
+
+    #[test]
+    fn untouched_calc_settings_keep_workbook_xml_bytes() {
+        let pkg = with_calc_pr(r#"<calcPr  calcId="1" iterate="true" iterateCount="100.0" />"#);
+        let before = part_text(&pkg, "xl/workbook.xml");
+        let out = sync_calc_pr(&before, &pkg.workbook);
+        assert_eq!(out, before);
+    }
+
+    #[test]
+    fn prefixed_calc_pr_is_patched_in_place() {
+        let xml = r#"<x:workbook xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><x:sheets/><x:calcPr calcId="1" keep="1"/></x:workbook>"#;
+        let mut wb = Workbook::default();
+        wb.calc.mode = CalcMode::Manual;
+        let out = sync_calc_pr(xml, &wb);
+        assert!(out.contains(r#"keep="1""#), "{out}");
+        assert!(out.contains(r#"calcMode="manual""#), "{out}");
+        assert_eq!(out.matches("calcPr").count(), 1, "one element: {out}");
+    }
+
+    #[test]
+    fn transition_evaluation_reads_and_writes_the_sheet_pr_attribute() {
+        let mut pkg = new_xlsx();
+        assert!(!pkg.workbook.calc.transition_eval);
+        // Untouched: no sheet gets the attribute on save.
+        let saved = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert!(!part_text(&saved, "xl/worksheets/sheet1.xml").contains("transitionEvaluation"));
+
+        pkg.workbook.calc.set_transition_eval(true);
+        let saved = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let ws = part_text(&saved, "xl/worksheets/sheet1.xml");
+        assert!(ws.contains(r#"<sheetPr transitionEvaluation="1""#), "{ws}");
+        assert!(saved.workbook.calc.transition_eval);
+
+        // Turned off again: the attribute (and a sheetPr left bare) goes.
+        let mut pkg = saved;
+        pkg.workbook.calc.set_transition_eval(false);
+        let saved = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let ws = part_text(&saved, "xl/worksheets/sheet1.xml");
+        assert!(!ws.contains("transitionEvaluation"), "{ws}");
+        assert!(!saved.workbook.calc.transition_eval);
     }
 }

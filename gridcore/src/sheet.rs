@@ -1931,6 +1931,100 @@ pub struct DefinedName {
     pub formula: String,
 }
 
+/// When the engine recalculates (`<calcPr calcMode>`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CalcMode {
+    /// Every edit recalculates its dependents (`auto`).
+    #[default]
+    Auto,
+    /// As [`CalcMode::Auto`] but for data tables (`autoNoTable`); this engine
+    /// has no data tables, so the two behave alike.
+    AutoNoTable,
+    /// Edits leave dependents stale until Calculate Now / Calculate Sheet.
+    Manual,
+}
+
+impl CalcMode {
+    /// The `calcMode` attribute value; `None` for the default (`auto`).
+    pub fn attr(self) -> Option<&'static str> {
+        match self {
+            CalcMode::Auto => None,
+            CalcMode::AutoNoTable => Some("autoNoTable"),
+            CalcMode::Manual => Some("manual"),
+        }
+    }
+
+    /// The mode a `calcMode` attribute names (anything unknown is `auto`).
+    pub fn from_attr(v: &str) -> CalcMode {
+        match v {
+            "manual" => CalcMode::Manual,
+            "autoNoTable" => CalcMode::AutoNoTable,
+            _ => CalcMode::Auto,
+        }
+    }
+}
+
+/// The calculation settings a workbook carries besides
+/// [`Workbook::iterate`] (which stays the engine-facing iteration switch).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CalcSettings {
+    pub mode: CalcMode,
+    /// Set precision as displayed is on: constants and formula results are
+    /// stored rounded to their number format.
+    pub precision_as_displayed: bool,
+    /// The file said `fullPrecision="0"` and the user has not changed the
+    /// setting since: kept on save, never applied.
+    pub precision_file_off: bool,
+    /// Maximum Iterations / Maximum Change, remembered while iteration is off
+    /// so the options dialog and the file keep them.
+    pub iterate_count: u32,
+    pub iterate_delta: f64,
+    /// `numThreads`: `None` = the file did not say (all processors).
+    pub num_threads: Option<u32>,
+    /// `concurrentCalc` (multi-threaded calculation); on unless the file says
+    /// otherwise.
+    pub concurrent_calc: bool,
+    /// Transition formula evaluation (`<sheetPr transitionEvaluation>`),
+    /// workbook-wide: on when any sheet says so.
+    pub transition_eval: bool,
+    /// The user changed [`Self::transition_eval`]: a save writes it to every
+    /// sheet. Untouched, the sheets are written as they were read.
+    pub transition_eval_changed: bool,
+}
+
+impl Default for CalcSettings {
+    fn default() -> Self {
+        CalcSettings {
+            mode: CalcMode::Auto,
+            precision_as_displayed: false,
+            precision_file_off: false,
+            iterate_count: 100,
+            iterate_delta: 0.001,
+            num_threads: None,
+            concurrent_calc: true,
+            transition_eval: false,
+            transition_eval_changed: false,
+        }
+    }
+}
+
+impl CalcSettings {
+    /// Turn Transition formula evaluation on or off, noting a change for save.
+    pub fn set_transition_eval(&mut self, on: bool) {
+        if self.transition_eval != on {
+            self.transition_eval = on;
+            self.transition_eval_changed = true;
+        }
+    }
+
+    /// Turn Set precision as displayed on or off. Either way the file's own
+    /// `fullPrecision="0"` is superseded by what the user chose.
+    pub fn set_precision_as_displayed(&mut self, on: bool) {
+        self.precision_as_displayed = on;
+        self.precision_file_off = false;
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Workbook {
     pub sheets: Vec<Sheet>,
@@ -1953,6 +2047,10 @@ pub struct Workbook {
     /// Iterative calculation opt-in from `<calcPr iterate="1">`:
     /// (max iterations, convergence delta). None = cycles are errors.
     pub iterate: Option<(u32, f64)>,
+    /// The calculation settings beyond [`Self::iterate`]: mode, precision as
+    /// displayed, the remembered iteration limits, threads, transition
+    /// formula evaluation (File > Options > Formulas).
+    pub calc: CalcSettings,
     /// The active sheet (`<workbookView activeTab>`): the sheet the workbook
     /// opens on and the one a CSV export writes. Saved back to `activeTab`;
     /// when the file marks a selected tab (`tabSelected`, as Excel's files
@@ -1962,6 +2060,14 @@ pub struct Workbook {
 }
 
 impl Workbook {
+    /// Enable or disable iterative calculation with its limits (File >
+    /// Options > Formulas). The limits are remembered while it is off.
+    pub fn set_iteration(&mut self, enabled: bool, max_iterations: u32, max_change: f64) {
+        self.calc.iterate_count = max_iterations.max(1);
+        self.calc.iterate_delta = max_change;
+        self.iterate = enabled.then_some((self.calc.iterate_count, max_change));
+    }
+
     /// Sheet index by name, case-insensitive (as Excel resolves references).
     pub fn sheet_index(&self, name: &str) -> Option<usize> {
         self.sheets
