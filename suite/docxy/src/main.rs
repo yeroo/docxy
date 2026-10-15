@@ -7173,6 +7173,166 @@ const FIELDS: &[(&str, &str, &str)] = &[
 struct Click<'a> {
     ent: &'a Entity<Docxy>,
     path: &'a [usize],
+    /// The paragraph's painted words, for a press or drag in the blank area
+    /// beside its lines (#1472).
+    words: &'a WordSpans,
+}
+
+/// One painted word of a paragraph: its layout (the bounds are known after
+/// paint), its char offset in the paragraph, its length, and whether it ends
+/// in the space that separates it from the next word (#1472).
+#[derive(Clone)]
+struct WordSpan {
+    layout: TextLayout,
+    off: usize,
+    len: usize,
+    trailing_space: bool,
+}
+
+type WordSpans = std::rc::Rc<std::cell::RefCell<Vec<WordSpan>>>;
+
+thread_local! {
+    /// The words of each top-level body paragraph as last rendered, by block
+    /// index, for the harness's `doc-line-start` / `doc-line-end` regions.
+    static DOC_WORDS: std::cell::RefCell<Vec<(usize, WordSpans)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A word's bounds with its first and one-past-last paragraph offsets.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WordBox {
+    bounds: Bounds<Pixels>,
+    start: usize,
+    end: usize,
+}
+
+/// The visual row of `boxes` nearest to height `y`: the boxes that share the
+/// vertical middle of the closest one.
+fn row_of(boxes: &[WordBox], y: Pixels) -> Vec<WordBox> {
+    let dist = |b: &WordBox| {
+        if y < b.bounds.top() {
+            b.bounds.top() - y
+        } else if y > b.bounds.bottom() {
+            y - b.bounds.bottom()
+        } else {
+            px(0.)
+        }
+    };
+    let Some(near) = boxes.iter().min_by(|a, b| {
+        dist(a)
+            .partial_cmp(&dist(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }) else {
+        return Vec::new();
+    };
+    let mid = near.bounds.center().y;
+    boxes
+        .iter()
+        .filter(|b| b.bounds.top() <= mid && mid <= b.bounds.bottom())
+        .copied()
+        .collect()
+}
+
+/// Where a press or drag at `pos` lands when it is beside the words of the row
+/// it is on: right of the row is the row's last caret stop, left of it the
+/// first. `None` inside the row, or with no words (#1472).
+fn line_end_hit(boxes: &[WordBox], pos: Point<Pixels>) -> Option<usize> {
+    let row = row_of(boxes, pos.y);
+    let last = row.iter().max_by(|a, b| {
+        a.bounds
+            .right()
+            .partial_cmp(&b.bounds.right())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })?;
+    let first = row.iter().min_by(|a, b| {
+        a.bounds
+            .left()
+            .partial_cmp(&b.bounds.left())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })?;
+    if pos.x >= last.bounds.right() {
+        Some(last.end)
+    } else if pos.x <= first.bounds.left() {
+        Some(first.start)
+    } else {
+        None
+    }
+}
+
+/// The harness point of visual row `row` of top-level paragraph `block`: the
+/// left edge of its first word or the right edge of its last, as a zero-size
+/// box at the row's vertical middle (#1472).
+fn doc_line_point(block: usize, row: usize, end: bool) -> Option<Bounds<Pixels>> {
+    let words = DOC_WORDS.with(|d| {
+        d.borrow()
+            .iter()
+            .find(|(b, _)| *b == block)
+            .map(|(_, w)| w.clone())
+    })?;
+    let mut boxes: Vec<Bounds<Pixels>> = words
+        .borrow()
+        .iter()
+        .map(|w| w.layout.bounds())
+        .filter(|b| b.size.width > px(0.) && b.size.height > px(0.))
+        .collect();
+    boxes.sort_by(|a, b| {
+        a.center()
+            .y
+            .partial_cmp(&b.center().y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    // Rows, top to bottom: a box joins the row whose first box it shares a
+    // vertical middle with.
+    let mut rows: Vec<Vec<Bounds<Pixels>>> = Vec::new();
+    for b in boxes {
+        let mid = b.center().y;
+        match rows.iter_mut().find(|r| {
+            let f = r[0];
+            f.top() <= mid && mid <= f.bottom()
+        }) {
+            Some(r) => r.push(b),
+            None => rows.push(vec![b]),
+        }
+    }
+    let r = rows.get(row)?;
+    let y = r[0].center().y;
+    let x = if end {
+        r.iter().map(|b| b.right()).fold(px(f32::MIN), Pixels::max)
+    } else {
+        r.iter().map(|b| b.left()).fold(px(f32::MAX), Pixels::min)
+    };
+    Some(Bounds {
+        origin: point(x, y),
+        size: size(px(0.), px(0.)),
+    })
+}
+
+/// [`line_end_hit`] over a paragraph's painted words. A word that ends in a
+/// space and is followed by more text puts the caret before the space, where
+/// the line breaks (#1472).
+fn words_line_end_hit(words: &WordSpans, pos: Point<Pixels>) -> Option<usize> {
+    let words = words.borrow();
+    let para_end = words.iter().map(|w| w.off + w.len).max().unwrap_or(0);
+    let boxes: Vec<WordBox> = words
+        .iter()
+        .filter(|w| {
+            let b = w.layout.bounds();
+            b.size.width > px(0.) && b.size.height > px(0.)
+        })
+        .map(|w| {
+            let end = w.off + w.len;
+            WordBox {
+                bounds: w.layout.bounds(),
+                start: w.off,
+                end: if w.trailing_space && end < para_end {
+                    end - 1
+                } else {
+                    end
+                },
+            }
+        })
+        .collect();
+    line_end_hit(&boxes, pos)
 }
 
 /// Where a numbered paragraph's margin numbers go: which probe entry the
@@ -7321,6 +7481,65 @@ fn place_click_caret(ed: &mut Editor, caret: Caret, extend: bool, plant: bool) {
 fn click_selects_placeholder(ed: &mut Editor) -> bool {
     let collapsed = ed.anchor.as_ref().is_none_or(|a| *a == ed.caret);
     collapsed && ed.select_placeholder_at_caret()
+}
+
+#[cfg(test)]
+mod line_end_hit_tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    fn word(x: f32, y: f32, w: f32, start: usize, end: usize) -> WordBox {
+        WordBox {
+            bounds: Bounds {
+                origin: point(px(x), px(y)),
+                size: size(px(w), px(20.)),
+            },
+            start,
+            end,
+        }
+    }
+
+    /// `A bulleted list:` on one row, then a second row `and more` below.
+    fn rows() -> Vec<WordBox> {
+        vec![
+            word(10., 0., 20., 0, 2),
+            word(30., 0., 60., 2, 11),
+            word(90., 0., 40., 11, 16),
+            word(10., 20., 30., 17, 21),
+            word(40., 20., 40., 21, 25),
+        ]
+    }
+
+    #[test]
+    fn right_of_a_row_is_that_rows_last_stop() {
+        assert_eq!(line_end_hit(&rows(), point(px(400.), px(10.))), Some(16));
+        assert_eq!(line_end_hit(&rows(), point(px(131.), px(10.))), Some(16));
+    }
+
+    #[test]
+    fn right_of_a_wrapped_row_is_its_own_end_not_the_paragraphs() {
+        assert_eq!(line_end_hit(&rows(), point(px(400.), px(30.))), Some(25));
+        assert_eq!(line_end_hit(&rows(), point(px(400.), px(5.))), Some(16));
+    }
+
+    #[test]
+    fn left_of_a_row_is_its_first_stop() {
+        assert_eq!(line_end_hit(&rows(), point(px(2.), px(10.))), Some(0));
+        assert_eq!(line_end_hit(&rows(), point(px(2.), px(30.))), Some(17));
+    }
+
+    #[test]
+    fn between_rows_and_below_take_the_nearest_row() {
+        // The padding under the last row, and above the first.
+        assert_eq!(line_end_hit(&rows(), point(px(400.), px(48.))), Some(25));
+        assert_eq!(line_end_hit(&rows(), point(px(400.), px(-6.))), Some(16));
+    }
+
+    #[test]
+    fn inside_a_row_and_with_no_words_is_nothing() {
+        assert_eq!(line_end_hit(&rows(), point(px(60.), px(10.))), None);
+        assert_eq!(line_end_hit(&[], point(px(60.), px(10.))), None);
+    }
 }
 
 #[cfg(test)]
@@ -15283,6 +15502,8 @@ impl Docxy {
                 &harness::region_name(region),
             )
             .ok_or_else(|| "the File screen is not open".to_string()),
+            Region::DocLine { block, row, end } => doc_line_point(block, row, end)
+                .ok_or_else(|| format!("body paragraph {block} row {row} is not on screen")),
             Region::Qat(name) => lookup(&self.probes.borrow(), name).ok_or_else(|| {
                 if name == "qat-redo-arrow" {
                     format!("{name} is not drawn: only a sheet tab draws it")
@@ -28886,6 +29107,14 @@ fn emit_words(
         let word_str = word.to_string();
         let styled = StyledText::new(word_str.clone());
         let layout = styled.layout().clone();
+        if let Some(c) = click {
+            c.words.borrow_mut().push(WordSpan {
+                layout: layout.clone(),
+                off: word_off,
+                len: word_str.chars().count(),
+                trailing_space: word_str.ends_with(' '),
+            });
+        }
         out.push(
             div()
                 .child(styled)
@@ -28941,11 +29170,17 @@ fn emit_words(
                         .on_mouse_move(move |ev, _window, cx| {
                             let off = off_at(ev.position);
                             let path = path.clone();
-                            ent.update(cx, move |this, cx| {
+                            let selecting = ent.update(cx, move |this, cx| {
                                 if this.selecting {
                                     this.extend_select(path, off, cx);
                                 }
+                                this.selecting
                             });
+                            // The word owns the drag: the paragraph's own move
+                            // handler, for the blank area, stays out (#1472).
+                            if selecting {
+                                cx.stop_propagation();
+                            }
                         })
                 })
                 .into_any_element(),
@@ -30233,12 +30468,30 @@ fn paragraph_el(
         .when_some(click, |d, c| {
             let ent = c.ent.clone();
             let path = c.path.to_vec();
+            let words = c.words.clone();
+            // Beside a line (right of its text, or its indent gutter) a press
+            // lands at that line's end or start and starts a drag, as a press
+            // on a word does; with no painted words it is the paragraph end.
             d.cursor_text()
-                .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
-                    let extend = ev.modifiers.shift;
-                    ent.update(cx, |this, cx| {
-                        this.set_caret(path.clone(), para_end, extend, window, cx)
-                    });
+                .on_mouse_down(MouseButton::Left, {
+                    let (ent, path, words) = (ent.clone(), path.clone(), words.clone());
+                    move |ev, window, cx| {
+                        let extend = ev.modifiers.shift;
+                        let off = words_line_end_hit(&words, ev.position).unwrap_or(para_end);
+                        ent.update(cx, |this, cx| {
+                            this.begin_select(path.clone(), off, extend, window, cx)
+                        });
+                    }
+                })
+                .on_mouse_move(move |ev, _window, cx| {
+                    if let Some(off) = words_line_end_hit(&words, ev.position) {
+                        let path = path.clone();
+                        ent.update(cx, move |this, cx| {
+                            if this.selecting {
+                                this.extend_select(path, off, cx);
+                            }
+                        });
+                    }
                 })
         })
         .child(match lines {
@@ -30604,9 +30857,20 @@ fn block_el_numbered(
                         .map(|(_, s, e)| (*s, *e))
                 })
                 .flatten();
+            let words = WordSpans::default();
+            if ctx.active && ctx.hf_width.is_none() {
+                if let &[block] = path.as_slice() {
+                    DOC_WORDS.with(|d| {
+                        let mut d = d.borrow_mut();
+                        d.retain(|(b, _)| *b != block);
+                        d.push((block, words.clone()));
+                    });
+                }
+            }
             let click = ctx.active.then_some(Click {
                 ent: ctx.ent,
                 path: &path,
+                words: &words,
             });
             // A table pen is on (#763): record where a top-level paragraph
             // lies, so a table drawn from it goes after it.

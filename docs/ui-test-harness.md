@@ -1539,7 +1539,7 @@ not drawn in place (collapsed into a flyout, or on another tab).
 scrolled out of view; `shot` it before a `pointer-click` so the click lands
 on the frame that drew it. `backstage-content` and `backstage-rail` are the File
 screen's scrolling content pane and its left rail (#1028), an error ("the File
-screen is not open") while File is closed. `qat-undo` and `qat-redo` are the
+screen is not open") while File is closed. `doc-line-start:K` and `doc-line-end:K` (or `:K:R` for visual row R, counting from 0) are a point on top-level body paragraph K's row: the left edge of its first word or the right edge of its last, at the row's vertical middle, so `pointer-drag` with an `offset` can start or end in the blank area beside a line (#1472). `qat-undo` and `qat-redo` are the
 Quick Access Toolbar's Undo and Redo buttons, `qat-undo-arrow` and
 `qat-redo-arrow` their split arrows (#1149); a sheet tab draws both arrows, a
 document tab the Undo one. `shot` before a `pointer-click` there too. Inside a
