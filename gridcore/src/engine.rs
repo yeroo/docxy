@@ -1684,6 +1684,21 @@ impl Engine {
         out
     }
 
+    /// The formulas that read the cell directly: those whose dependency
+    /// ranges cover it (Trace Dependents' first level, #675), sorted. The
+    /// cell itself need not be a formula, and a formula that names itself
+    /// is listed.
+    pub fn direct_dependents(&mut self, sheet: usize, row: u32, col: u32) -> Vec<Key> {
+        self.ensure_covers();
+        let mut out = Vec::new();
+        if let Some(idx) = self.covers.as_ref().and_then(|m| m.get(&sheet)) {
+            idx.for_each_covering(row, col, |fk| out.push(fk));
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Iterative calculation of one circle (Excel's File > Options >
     /// Formulas > Enable iterative calculation): sweep its cells up to
     /// `count` times. A sweep whose largest change is under `delta` means the
@@ -3034,6 +3049,27 @@ fn components_in_order(nodes: &[Key], edges: &HashMap<Key, Vec<Key>>) -> Vec<Vec
 /// `#NAME?` if the formula doesn't parse.
 pub fn eval_formula_at(wb: &Workbook, sheet: usize, row: u32, col: u32, src: &str) -> Value {
     eval_formula_at_clock(wb, sheet, row, col, src, None)
+}
+
+/// An expression evaluated in the context of cell (sheet, row, col), whole:
+/// a range or an array stays an array. Evaluate Formula's step (#675); the
+/// expression may hold references, which read the workbook as it stands.
+pub fn eval_expr_at(
+    wb: &Workbook,
+    sheet: usize,
+    row: u32,
+    col: u32,
+    e: &formula::Expr,
+    clock: Option<f64>,
+) -> formula::DynResult {
+    let resolver = WbResolver {
+        wb,
+        clock,
+        rand_state: StdCell::new(0),
+        has_rand: false,
+    };
+    let mut ev = Eval::new(&resolver, sheet, (row, col));
+    ev.eval_dynamic(e)
 }
 
 /// [`eval_formula_at`] under the host's clock, so `TODAY()` and `NOW()` read
@@ -4563,6 +4599,40 @@ mod tests {
         assert_eq!(value_at(&wb, "C1"), CellValue::Number(21.0));
         set(&mut eng, &mut wb, "A1", Cell::formula("SEQUENCE(3,1,5,5)"));
         assert_eq!(value_at(&wb, "C1"), CellValue::Number(11.0));
+    }
+
+    fn key(a1: &str) -> Key {
+        let (r, c) = crate::sheet::parse_cell_name(a1).unwrap();
+        (0, r, c)
+    }
+
+    #[test]
+    fn direct_dependents_are_the_formulas_that_read_the_cell() {
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("B1", Cell::formula("A1+1")),
+            ("C1", Cell::formula("SUM(A1:A3)")),
+            ("D1", Cell::formula("B1*2")),
+            ("E1", Cell::formula("5")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        // A constant has dependents too; a range reads each cell in it.
+        assert_eq!(eng.direct_dependents(0, 0, 0), vec![key("B1"), key("C1")]);
+        assert_eq!(
+            eng.direct_dependents(0, 1, 0),
+            vec![key("C1")],
+            "A2 is in A1:A3"
+        );
+        assert_eq!(eng.direct_dependents(0, 0, 1), vec![key("D1")], "one level");
+        assert!(eng.direct_dependents(0, 0, 3).is_empty());
+        assert!(eng.direct_dependents(0, 9, 9).is_empty());
+        // A formula edit is seen at once: the cache is not stale.
+        set(&mut eng, &mut wb, "E1", Cell::formula("A1*3"));
+        assert_eq!(
+            eng.direct_dependents(0, 0, 0),
+            vec![key("B1"), key("C1"), key("E1")]
+        );
     }
 
     #[test]

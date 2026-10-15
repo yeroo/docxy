@@ -1929,6 +1929,23 @@ fn shift_rule_formula(
 /// loses every range goes (its element named in `cf_removed` / `dv_removed`
 /// for the save); on any sheet their formulas' refs move.
 fn shift_rules(sheet: &mut Sheet, home_is_target: bool, target: &str, shift: &EditShift) {
+    if home_is_target {
+        // Ignore Error moves with its cells; what it covered no more is gone.
+        sheet.ignored_errors.retain_mut(|e| {
+            e.sqref = e
+                .sqref
+                .iter()
+                .filter_map(|&(r1, c1, r2, c2)| {
+                    if shift.rows {
+                        span(r1, r2, shift).map(|(lo, hi)| (lo, c1, hi, c2))
+                    } else {
+                        span(c1, c2, shift).map(|(lo, hi)| (r1, lo, r2, hi))
+                    }
+                })
+                .collect();
+            !(e.sqref.is_empty() && e.unparsed.is_empty())
+        });
+    }
     let removed = &mut sheet.cf_removed;
     sheet.cond_formats.retain_mut(|cf| {
         let by = if home_is_target {

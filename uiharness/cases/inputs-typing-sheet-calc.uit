@@ -491,3 +491,35 @@ test sheet precision-warning: matches the catalogue
   assert dialog is precision-warning
   call dialog-catalog-check {}
   call real-key {"key":"escape"}
+
+test sheet error-checking: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click J1
+  type =1/0
+  key enter
+  call ribbon-click {"tab":"Formulas","command":"Error Checking"}
+  assert dialog is error-checking
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet error-check-done: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click J1
+  type =1/0
+  key enter
+  call ribbon-click {"tab":"Formulas","command":"Error Checking"}
+  call dialog-click {"button":"Ignore Error"}
+  assert dialog is error-check-done
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet evaluate-formula: matches the catalogue
+  open ../fixtures/basic.xlsx
+  click J1
+  type =1+2*3
+  key enter
+  click J1
+  call ribbon-click {"tab":"Formulas","command":"Evaluate Formula"}
+  assert dialog is evaluate-formula
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}

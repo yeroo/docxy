@@ -709,6 +709,15 @@ impl NumShape {
     }
 }
 
+/// The number a text reads as when typed into a General cell, with the
+/// number format that entry would bring (`Some("0%")` for `12%`), or `None`
+/// for text that is not a plain number (a date, a fraction and a formula stay
+/// out). What Error Checking's Convert to Number writes.
+pub fn text_as_number(text: &str) -> Option<(f64, Option<&'static str>)> {
+    let (n, shape) = parse_number(text.trim())?;
+    Some((n, shape.format()))
+}
+
 /// Excel's number grammar: `(…)` or a sign for negatives, `$`, thousands
 /// separators in groups of three, `%` before or after, and an exponent.
 fn parse_number(t: &str) -> Option<(f64, NumShape)> {

@@ -556,6 +556,12 @@ pub struct Sheet {
     /// The `ref`s of loaded `<hyperlink>` elements whose link was removed: the
     /// worksheet part still holds them, so a save strikes them.
     pub hyperlinks_removed: Vec<(u32, u32, u32, u32)>,
+    /// Error Checking's Ignore Error: the rules hidden over ranges of this
+    /// sheet (`<ignoredErrors>`).
+    pub ignored_errors: Vec<crate::audit::IgnoredError>,
+    /// What the loaded `<ignoredErrors>` parsed to. A save leaves the
+    /// element's bytes alone while [`Sheet::ignored_errors`] still equals it.
+    pub ignored_errors_loaded: Vec<crate::audit::IgnoredError>,
     /// Data-validation rules (`<dataValidation>`): the constraint on a cell's
     /// value (a dropdown list, a number range, …). Typed entries are checked
     /// against them ([`crate::validation::check_entry`]); a save writes edits
@@ -2057,6 +2063,9 @@ pub struct Workbook {
     /// do), the mark moves to this sheet alone. A file that marks none is
     /// left unmarked.
     pub active_tab: usize,
+    /// Which background error-checking rules are on (Excel's Error Checking
+    /// options): the indicator and Formulas > Error Checking read it.
+    pub audit_rules: crate::audit::Rules,
 }
 
 impl Workbook {
@@ -2205,6 +2214,10 @@ pub struct Xf {
     /// the value is text even where it reads as a number, and the editor shows
     /// the apostrophe again.
     pub quote_prefix: bool,
+    /// The xf's `<protection locked="0"/>`: the cell is unlocked. Read from
+    /// the file and kept by every xf an edit derives from it; save reuses the
+    /// source `<xf>`'s protection element, so this is never written fresh.
+    pub unlocked: bool,
     /// The `<cellXfs>` index this xf was loaded from, kept by every copy an
     /// edit derives from it. Save writes a derived xf by reusing that source
     /// element's font, fill, border, number format, alignment and protection

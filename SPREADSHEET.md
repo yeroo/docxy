@@ -381,6 +381,24 @@ placeholder would be painful to retrofit):
   surface is `wb.calc`, `wb.calc.set` and `wb.recalc {sheet}`
   (docs/agent-control.md); the desktop suite has Formulas › Calculation
   and F9 / Shift+F9, xlsxy Ctrl+F9 / Shift+F9.
+- **Formula auditing** (#675): `gridcore::audit` holds Error Checking's
+  rules (`Rule`: error value, number stored as text, inconsistent formula,
+  formula omitting adjacent cells, formula referring to empty cells, unlocked
+  formula cell), which of them are on (`Workbook::audit_rules`, empty-cell
+  references off by default), and `check_cell` / `flags`. Ignore Error is
+  `Sheet::ignored_errors` (`<ignoredErrors>`): an untouched element is saved
+  byte for byte, an edited one regenerated with the attributes the model does
+  not carry kept, and insert and delete of rows and columns move or drop its
+  ranges. `Xf::unlocked` reads `<protection locked="0"/>`. The trace arrows
+  are data (`precedent_arrows`, `dependent_arrows`, `error_arrows`, over
+  `Engine::direct_dependents`), and `gridcore::evalsteps` takes a formula apart
+  in calculation order for Evaluate Formula (the part to calculate next is
+  marked by `formula::to_string_marked`; `IF`, `IFS`, `IFERROR`, `IFNA` and
+  `CHOOSE` calculate only what they pick). The desktop suite draws the green
+  corner indicator and smart tag, runs Formulas › Error Checking, the traces,
+  Remove Arrows, Evaluate Formula and Ctrl+[ / Ctrl+] (all levels with Shift);
+  arrows are view state, never saved, and an edit removes them. xlsxy and the
+  wasm bridge have none of it yet.
 - **Graceful degradation, never corruption:** a formula the engine can't parse
   or evaluate (unknown function, unsupported construct) keeps Excel's cached
   value, is never re-evaluated, and is saved byte-faithful. With

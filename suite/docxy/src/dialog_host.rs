@@ -114,6 +114,10 @@ fn apply_dialog(
         DialogOwner::GoTo | DialogOwner::GoToSpecial => {
             Err("Go To applies through Find & Select".into())
         }
+        // Handled in `sheet_audit::click`, before this.
+        DialogOwner::ErrorChecking { .. }
+        | DialogOwner::ErrorCheckDone
+        | DialogOwner::EvaluateFormula => Err("Error Checking applies through Formulas".into()),
         // Handled in `Docxy::paste_dialog_click`, before this.
         DialogOwner::PasteSpecial { .. } => Err("Paste Special applies through Paste".into()),
         // Handled in `Docxy::doc_paste_dialog_click`, before this.
@@ -244,6 +248,9 @@ pub(crate) fn presses_through_app(owner: &DialogOwner) -> bool {
                 | DialogOwner::DropReplace
                 | DialogOwner::GoTo
                 | DialogOwner::GoToSpecial
+                | DialogOwner::ErrorChecking { .. }
+                | DialogOwner::ErrorCheckDone
+                | DialogOwner::EvaluateFormula
                 | DialogOwner::HfOnlinePictures
         )
 }
@@ -286,6 +293,11 @@ fn dialog_press(tab: &mut DocTab, button: &str) -> Result<(), String> {
     }
     // Go To's OK selects; its Special… opens Go To Special (#671).
     if let Some(done) = crate::sheet_goto::click(tab, button) {
+        return done;
+    }
+    // Error Checking's presses (Next, Previous, Ignore Error, ...) and Evaluate
+    // Formula's (Evaluate, Step In, ...) (#675).
+    if let Some(done) = crate::sheet_audit::click(tab, button) {
         return done;
     }
     // Consolidate's Add and Delete edit its list; OK consolidates (#694).

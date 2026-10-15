@@ -874,10 +874,17 @@ extends a Project range from the cursor instead of replacing it (#560). The
 Project `cell` reply adds the task's `id` and `uid`, and `entry: true` on the
 entry row, which reads empty.
 On a sheet, `call cell {"cell":"B2"}` replies `{cell, row, col, text, value,
-empty, hyperlink}`: `text` is what the cell shows, `value` its input text (a
-formula with its `=`, a text a typed entry would read otherwise with its `'`,
-so a Flash Filled `'042` reads as text), and `hyperlink` its link target or
-null (#667).
+empty, hyperlink, flags, flagged}`: `text` is what the cell shows, `value` its
+input text (a formula with its `=`, a text a typed entry would read otherwise
+with its `'`, so a Flash Filled `'042` reads as text), `hyperlink` its link
+target or null (#667), and `flags` the Error Checking rules that flag it as
+`<ignoredError>` names them (`evalError`, `numberStoredAsText`, `formula`,
+`formulaRange`, `emptyCellReference`, `unlockedFormula`; an ignored one is
+out), which is what the green corner indicator draws for; `flagged` says
+whether there are any (#675). `call trace-read {}` replies `{count, arrows:[{from,
+to, kind, off_sheet}]}`: the trace arrows drawn on the active sheet, `from` a
+cell or a range (with its sheet's name when that is another sheet), `to` the
+cell it points at, `kind` `trace` (blue) or `error` (red).
 
 `call rows {}` lists the rows the entry table draws, top to bottom, without the
 entry row; an optional `tab` picks a Project tab as the control verbs do, without
@@ -1370,7 +1377,7 @@ Menus open today:
 
 | Verb | Args | Reply |
 |---|---|---|
-| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, Paste Special…, the Filter and Sort submenus, New Comment, Pick From Drop-down List...; #690, #691, #665), `"flash-fill"` (the Flash Fill Options button's menu: Undo Flash Fill, Accept suggestions, Select all N blank cells, Select all N changed cells; an error when no fill stands, #666), `"pick-list"` (Pick From Drop-down List over the selected cell, as Alt+Down opens it: the column block's distinct text entries, sorted; an empty list is an error naming why, #665), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task; a press inside the selected range keeps the range and the cursor, and the menu is still the clicked row's: its task items select that row before they run, its range items act on the range; #1213), `{"bar": <task uid>}` (a right-click on that task's Gantt bar, pressed where the bar is drawn now; #1207), `{"column": "<heading>"}` (a right-click on that entry-table heading, any case, pressed where it is drawn now; #1208), `{"ribbon": [tab, group, command]}` (on a sheet: Paste's gallery, Fill, Clear, Find & Select, Sort & Filter; on a document: Paste's menu, #753), `{"grid": "fill-options" \| "paste-options"}` (the button a fill or a paste left, #707) or `{"qat": "qat-undo"}` (the Quick Access Toolbar Undo arrow on a document or sheet tab; #619, #1149), `{"qat": "qat-redo"}` (a sheet tab's Redo arrow; #1149), `"ribbon-bar"` (the ribbon's right-click menu: Collapse the Ribbon, ticked while collapsed; #590) | the menu, as `menu-read` |
+| `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, Paste Special…, the Filter and Sort submenus, New Comment, Pick From Drop-down List...; #690, #691, #665), `"flash-fill"` (the Flash Fill Options button's menu: Undo Flash Fill, Accept suggestions, Select all N blank cells, Select all N changed cells; an error when no fill stands, #666), `"pick-list"` (Pick From Drop-down List over the selected cell, as Alt+Down opens it: the column block's distinct text entries, sorted; an empty list is an error naming why, #665), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task; a press inside the selected range keeps the range and the cursor, and the menu is still the clicked row's: its task items select that row before they run, its range items act on the range; #1213), `{"bar": <task uid>}` (a right-click on that task's Gantt bar, pressed where the bar is drawn now; #1207), `{"column": "<heading>"}` (a right-click on that entry-table heading, any case, pressed where it is drawn now; #1208), `{"ribbon": [tab, group, command]}` (on a sheet: Paste's gallery, Fill, Clear, Find & Select, Sort & Filter; on a document: Paste's menu, #753), `{"grid": "fill-options" \| "paste-options"}` (the button a fill or a paste left, #707) or `{"grid": "error-check"}` (the error smart tag beside a flagged active cell: its heading, then what the rule offers, Ignore Error and Edit in Formula Bar; an error when the selected cell is not flagged, #675) or `{"qat": "qat-undo"}` (the Quick Access Toolbar Undo arrow on a document or sheet tab; #619, #1149), `{"qat": "qat-redo"}` (a sheet tab's Redo arrow; #1149), `"ribbon-bar"` (the ribbon's right-click menu: Collapse the Ribbon, ticked while collapsed; #590) | the menu, as `menu-read` |
 | `menu-read` | `{}` | `{open: true, target, items, highlight, depth}`, or `{open: false}`; `highlight` is the index of the item Up/Down have highlighted, or null; `depth` is the submenu level the menu sits at (0 where it opened, +1 per submenu entered in its place; #591) |
 | `menu-click` | `{label}` among the top-level items, `{path: [labels]}` through submenus, or `{index}`: the top-level item at that 0-based index, separators and headings not counted, for labels that repeat | `state` after the item's handler; the menu closes first |
 | `menu-close` | `{}` | `state`, as Esc leaves it |

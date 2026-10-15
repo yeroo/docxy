@@ -38,8 +38,13 @@
 //! - [`flashfill`] — Flash Fill: a column's pattern from typed examples.
 //! - [`fcomplete`] — Formula AutoComplete: the names offered while a
 //!   formula is typed.
+//! - [`audit`] — background error checking (the green indicator's rules,
+//!   Ignore Error) and the formula-auditing sets behind the trace arrows.
+//! - [`evalsteps`] — Evaluate Formula: a formula calculated one step at a
+//!   time, in Excel's order.
 //! - [`print`] — page setup, print areas and breaks, pagination, sheet PDF.
 
+pub mod audit;
 pub mod autocorrect;
 pub mod calc;
 pub mod cf;
@@ -52,6 +57,7 @@ pub mod drawing;
 pub mod edit;
 pub mod engine;
 pub mod entry;
+pub mod evalsteps;
 pub mod fcomplete;
 pub mod filter;
 pub mod flashfill;

@@ -55,6 +55,8 @@ pub(crate) enum GridMenu {
     PasteOptions,
     FillDrop,
     BorderDrop,
+    /// The error smart tag beside a flagged cell (#675).
+    ErrorCheck,
 }
 
 impl GridMenu {
@@ -65,6 +67,7 @@ impl GridMenu {
             GridMenu::PasteOptions => "paste-options",
             GridMenu::FillDrop => "fill-drop",
             GridMenu::BorderDrop => "border-drop",
+            GridMenu::ErrorCheck => "error-check",
         }
     }
 
@@ -74,6 +77,7 @@ impl GridMenu {
             GridMenu::PasteOptions,
             GridMenu::FillDrop,
             GridMenu::BorderDrop,
+            GridMenu::ErrorCheck,
         ]
         .into_iter()
         .find(|g| g.name() == s)

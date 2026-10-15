@@ -1448,6 +1448,29 @@ pub fn to_string(e: &Expr) -> String {
     Printer::default().print(e)
 }
 
+/// [`to_string`] of `e`, and where in that text `target` (a node inside `e`,
+/// found by address) is printed: the byte range of its own text, without any
+/// parentheses its parent put round it. Evaluate Formula underlines it.
+/// `None` when `target` is not a node of `e`.
+pub fn to_string_marked(e: &Expr, target: &Expr) -> (String, Option<std::ops::Range<usize>>) {
+    let plain = Printer::default().print(e);
+    // Two private-use characters the text does not hold, to bracket the node:
+    // formula text and cell text may hold any of them.
+    let mut free = ('\u{E000}'..='\u{F8FF}').filter(|c| !plain.contains(*c));
+    let (Some(open), Some(close)) = (free.next(), free.next()) else {
+        return (plain, None);
+    };
+    let mut printer = Printer {
+        mark: Some((target as *const Expr, open, close)),
+        ..Printer::default()
+    };
+    let marked = printer.print(e);
+    let (Some(a), Some(b)) = (marked.find(open), marked.find(close)) else {
+        return (plain, None);
+    };
+    (plain, Some(a..b - open.len_utf8()))
+}
+
 /// The AST printer behind [`to_string`] (the spelling held in memory and shown
 /// to the user) and [`file_formula`] (the spelling Excel stores in a file).
 #[derive(Default)]
@@ -1460,10 +1483,22 @@ struct Printer {
     /// (file spelling only), without their `_xlpm.` prefix, and whether each
     /// may hold a lambda (see [`Printer::func`]).
     scope: Vec<(String, bool)>,
+    /// A node whose text [`to_string_marked`] brackets.
+    mark: Option<(*const Expr, char, char)>,
 }
 
 impl Printer {
     fn print(&mut self, e: &Expr) -> String {
+        let text = self.print_node(e);
+        if let Some((m, open, close)) = self.mark {
+            if std::ptr::eq(m, e) {
+                return format!("{open}{text}{close}");
+            }
+        }
+        text
+    }
+
+    fn print_node(&mut self, e: &Expr) -> String {
         match e {
             Expr::Num(n) => self.num(*n),
             Expr::Str(s) => format!("\"{}\"", s.replace('"', "\"\"")),
@@ -6348,7 +6383,7 @@ pub fn file_formula(src: &str) -> Cow<'_, str> {
         if let Ok(e) = parse(src) {
             let mut p = Printer {
                 file: true,
-                scope: Vec::new(),
+                ..Printer::default()
             };
             return Cow::Owned(p.print(&e));
         }
@@ -6374,7 +6409,7 @@ pub fn file_formula(src: &str) -> Cow<'_, str> {
 pub fn to_file_string(e: &Expr) -> String {
     let mut p = Printer {
         file: true,
-        scope: Vec::new(),
+        ..Printer::default()
     };
     p.print(e)
 }

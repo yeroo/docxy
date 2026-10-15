@@ -6212,6 +6212,65 @@ fn dispatch_verb(
                     "hyperlink",
                     str_or_null(v.sheet().hyperlinks.get(&(r, c)).cloned()),
                 ),
+                // The rules that flag it, as `<ignoredError>` names them: what
+                // the green indicator draws for (#675). Ignored ones are out.
+                (
+                    "flags",
+                    Json::Arr(
+                        v.cell_flags(r, c)
+                            .iter()
+                            .map(|rule| Json::Str(rule.attr().into()))
+                            .collect(),
+                    ),
+                ),
+                ("flagged", Json::Bool(!v.cell_flags(r, c).is_empty())),
+            ]))
+        }
+
+        // The trace arrows on the active sheet (#675), in the order they were
+        // drawn: `{count, arrows:[{from, to, kind, off_sheet}]}`, `from` a cell or a
+        // range (named with its sheet when that is not the active one), `to`
+        // the cell it points at, `kind` `trace` (blue) or `error` (red).
+        "trace-read" => {
+            let v = sheet(app)?;
+            let wb = &v.pkg.workbook;
+            let name = |si: usize, rect: (u32, u32, u32, u32)| {
+                let at = gridcore::print::area::rect_name(rect);
+                match wb.sheets.get(si) {
+                    Some(s) if si != v.active => format!("{}!{at}", s.name),
+                    _ => at,
+                }
+            };
+            let arrows: Vec<Json> = v
+                .trace_arrows()
+                .iter()
+                .map(|a| {
+                    Json::obj(vec![
+                        ("from", Json::Str(name(a.from.0, a.from.1))),
+                        (
+                            "to",
+                            Json::Str(name(a.to.0, (a.to.1, a.to.2, a.to.1, a.to.2))),
+                        ),
+                        (
+                            "kind",
+                            Json::Str(
+                                match a.kind {
+                                    gridcore::audit::ArrowKind::Trace => "trace",
+                                    gridcore::audit::ArrowKind::Error => "error",
+                                }
+                                .into(),
+                            ),
+                        ),
+                        (
+                            "off_sheet",
+                            Json::Bool(a.from.0 != v.active || a.to.0 != v.active),
+                        ),
+                    ])
+                })
+                .collect();
+            Done::ok(Json::obj(vec![
+                ("count", Json::Num(arrows.len() as f64)),
+                ("arrows", Json::Arr(arrows)),
             ]))
         }
 
@@ -7570,6 +7629,7 @@ mod tests {
             "doc",
             "rows",
             "cell",
+            "trace-read",
             "selection",
             "capture",
             "rect",
