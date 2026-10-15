@@ -22,7 +22,8 @@ the File screen.
    opens a file picker, not a page.)
 5. Make the window as short as it goes (it stops at 420 px): the rail's
    last item, Close, is still visible, or the rail scrolls to it.
-6. Switch the theme with the title bar's button and repeat step 2. No
+6. Switch the theme (View > Theme, or the Theme row under Settings on the
+   File screen's Open page) and repeat step 2. No
    horizontal scrollbar appears at normal widths.
 
 **Fails when:** content below the fold is unreachable, a page opens already

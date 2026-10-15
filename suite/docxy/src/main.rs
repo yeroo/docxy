@@ -28281,6 +28281,30 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
     ])
 }
 
+#[cfg(test)]
+mod theme_button_tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    /// The document's View tab keeps the Theme button (#1473), now the only
+    /// theme control a document has on screen besides Backstage's.
+    #[test]
+    fn the_document_view_tab_has_the_theme_button() {
+        let ribbon = docxy_ribbon();
+        let view = ribbon.tabs.iter().find(|t| t.name == "View").unwrap();
+        let has = view
+            .groups
+            .iter()
+            .flat_map(|g| g.items.iter())
+            .any(|c| match c {
+                Control::Large(c) | Control::Toggle(c) => c.act == Act::DarkMode,
+                Control::Column(c) => c.iter().any(|c| c.act == Act::DarkMode),
+                _ => false,
+            });
+        assert!(has, "the document's View tab has no Theme button");
+    }
+}
+
 fn ribbon_for(kind: Kind) -> rs::Ribbon<Act> {
     match kind {
         Kind::Project => project_ribbon(),

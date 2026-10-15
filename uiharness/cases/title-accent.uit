@@ -51,11 +51,18 @@ test issue 1473 each tab type shows its label and accent, per theme
   call tab-list {}
   assert reply.drawn_accent is "#2aa79b"
   call theme-set {"theme":"auto"}
-  # The accent follows the preference at once, with no frame in between.
+  # The accent follows the preference after theme-set, which clears the
+  # applied theme until a render. (Run against an accent taken from `applied`,
+  # this still passes: a frame lands between verbs and the capture draws
+  # twice, so the harness cannot see the first-frame order.)
   call tab-select {"tab":1}
-  call appearance-set {"appearance":"dark"}
+  call theme-set {"theme":"dark"}
   call tab-list {}
   assert reply.accent is "#23843f"
-  call appearance-set {"appearance":"light"}
+  shot window
+  call tab-list {}
+  assert reply.drawn_accent is "#23843f"
+  call theme-set {"theme":"light"}
   call tab-list {}
   assert reply.accent is "#1e7b3a"
+  call theme-set {"theme":"auto"}

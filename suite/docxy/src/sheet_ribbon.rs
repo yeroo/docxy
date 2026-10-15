@@ -1647,6 +1647,20 @@ pub(crate) fn resolve_on(
 
 #[cfg(test)]
 mod tests {
+    /// The sheet's View tab has the Theme button (#1473), calling
+    /// `SheetAct::Theme`.
+    #[test]
+    fn the_sheet_view_tab_has_the_theme_button() {
+        let view = tab_def(RibbonTab::View);
+        let theme = view
+            .groups
+            .iter()
+            .flat_map(|g| g.commands())
+            .find(|c| c.label == "Theme")
+            .expect("the sheet's View tab has a Theme button");
+        assert_eq!(theme.act, SheetAct::Theme);
+    }
+
     use super::*;
     use crate::{Kind, ribbon_tab_set};
     use std::collections::HashSet;

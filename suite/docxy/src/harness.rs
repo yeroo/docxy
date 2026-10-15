@@ -3871,7 +3871,7 @@ fn state_for_reply(app: &crate::Docxy, window: &Window, cx: &mut App) -> Json {
 }
 
 /// The kind a tab is, as `tab-list` names it: the Backstage › New cards'.
-pub(crate) fn kind_name(kind: crate::Kind) -> &'static str {
+fn kind_name(kind: crate::Kind) -> &'static str {
     match kind {
         crate::Kind::Docx => "docx",
         crate::Kind::Xlsx => "xlsx",

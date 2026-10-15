@@ -4812,38 +4812,25 @@ fn row_menu_press_with_open_cell_commits() {
     assert_eq!(sel_of(&t), None);
 }
 
-/// The theme button moved from the title bar to the View tab (#1473): the
-/// tabs that draw a ribbon body (document, workbook, Project) have it. Mail,
-/// a failed load, no tab, Protected View and a minimised ribbon draw none
-/// (`ribbon_body_hidden`), so Backstage's Settings has a Theme row too.
+/// The theme button moved from the title bar to the View tab (#1473); this is
+/// Project's. The document's is checked beside `docxy_ribbon`, the sheet's in
+/// `sheet_ribbon`; Mail, a failed load, no tab, Protected View and a
+/// minimised ribbon draw none (`ribbon_body_hidden`), so Backstage's Settings
+/// has a Theme row too.
 #[test]
-fn every_view_tab_has_the_theme_button() {
-    for kind in [Kind::Project, Kind::Docx] {
-        let ribbon = ribbon_for(kind);
-        let view = ribbon.tabs.iter().find(|t| t.name == "View").unwrap();
-        let labels: Vec<&str> = view
-            .groups
-            .iter()
-            .flat_map(|g| g.items.iter())
-            .flat_map(|c| match c {
-                Control::Large(c) | Control::Toggle(c) => vec![c.label],
-                Control::Column(c) => c.iter().map(|c| c.label).collect(),
-                _ => vec![],
-            })
-            .collect();
-        assert!(
-            labels.contains(&"Theme"),
-            "{}: {labels:?}",
-            crate::harness::kind_name(kind)
-        );
-    }
-    let sheet = crate::sheet_ribbon::tab_def(crate::RibbonTab::View);
-    assert!(
-        sheet
-            .groups
-            .iter()
-            .flat_map(|g| g.commands())
-            .any(|c| c.label == "Theme"),
-        "the sheet's View tab"
-    );
+fn the_project_view_tab_has_the_theme_button() {
+    let ribbon = ribbon_for(Kind::Project);
+    let view = ribbon.tabs.iter().find(|t| t.name == "View").unwrap();
+    let theme = view
+        .groups
+        .iter()
+        .flat_map(|g| g.items.iter())
+        .flat_map(|c| match c {
+            Control::Large(c) | Control::Toggle(c) => vec![c],
+            Control::Column(c) => c.iter().collect(),
+            _ => vec![],
+        })
+        .find(|c| c.label == "Theme")
+        .expect("Project's View tab has a Theme button");
+    assert_eq!(theme.act, Act::Project(ProjectAct::Theme));
 }
