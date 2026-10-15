@@ -6212,6 +6212,18 @@ fn dispatch_verb(
                     "hyperlink",
                     str_or_null(v.sheet().hyperlinks.get(&(r, c)).cloned()),
                 ),
+                // The rules that flag it, as `<ignoredError>` names them: what
+                // the green indicator draws for (#675). Ignored ones are out.
+                (
+                    "flags",
+                    Json::Arr(
+                        v.cell_flags(r, c)
+                            .iter()
+                            .map(|rule| Json::Str(rule.attr().into()))
+                            .collect(),
+                    ),
+                ),
+                ("flagged", Json::Bool(!v.cell_flags(r, c).is_empty())),
             ]))
         }
 

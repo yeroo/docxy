@@ -1096,6 +1096,37 @@ dialogs! {
         accept_closes: true,
         unreachable: None,
     }
+    ERROR_CHECKING = "error-checking" {
+        surface: Surface::Sheet,
+        file: "sheet-calc",
+        fixture: XLSX,
+        open: &[
+            "click J1",
+            "type =1/0",
+            "key enter",
+            r#"call ribbon-click {"tab":"Formulas","command":"Error Checking"}"#,
+        ],
+        fields: &[],
+        reopen: &[],
+        accept_closes: false,
+        unreachable: None,
+    }
+    ERROR_CHECK_DONE = "error-check-done" {
+        surface: Surface::Sheet,
+        file: "sheet-calc",
+        fixture: XLSX,
+        open: &[
+            "click J1",
+            "type =1/0",
+            "key enter",
+            r#"call ribbon-click {"tab":"Formulas","command":"Error Checking"}"#,
+            r#"call dialog-click {"button":"Ignore Error"}"#,
+        ],
+        fields: &[],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
     GOTO_SPECIAL = "goto-special" {
         surface: Surface::Sheet,
         file: "sheet-data",

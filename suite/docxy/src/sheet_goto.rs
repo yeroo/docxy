@@ -246,7 +246,7 @@ fn presses(d: &Dialog, button: &str, label: &str) -> bool {
 }
 
 /// Select `rect` on `sheet` as Go To does: the active cell at its top-left.
-fn go_to(v: &mut SheetView, sheet: usize, (r0, c0, r1, c1): (u32, u32, u32, u32)) {
+pub(crate) fn go_to(v: &mut SheetView, sheet: usize, (r0, c0, r1, c1): (u32, u32, u32, u32)) {
     v.active = sheet;
     v.sel = (r0, c0);
     v.anchor = (r1, c1);

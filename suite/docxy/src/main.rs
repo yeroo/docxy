@@ -91,6 +91,8 @@ mod save_preserve_tests;
 #[cfg(test)]
 mod sect_pr_tests;
 mod sheet_audit;
+#[cfg(test)]
+mod sheet_audit_tests;
 mod sheet_autocorrect;
 #[cfg(test)]
 mod sheet_circular_tests;

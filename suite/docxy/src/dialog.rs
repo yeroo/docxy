@@ -205,6 +205,14 @@ pub(crate) enum DialogOwner {
     /// `sheet_goto::click`.
     GoTo,
     GoToSpecial,
+    /// Formulas › Error Checking (#675), applied in `sheet_audit::click`: the
+    /// walk began at `start` and shows the flagged cell `cur`.
+    ErrorChecking {
+        start: (u32, u32),
+        cur: (u32, u32),
+    },
+    /// Error Checking's "The error check is complete" box.
+    ErrorCheckDone,
     /// Home › Fill › Series… (#668); its OK needs the app's custom lists,
     /// so `Docxy::fill_dialog_click` applies it.
     Series,

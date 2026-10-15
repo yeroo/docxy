@@ -9,12 +9,16 @@
 //! every restore does), and are found a cell at a time, only for the cells
 //! drawn.
 
-use crate::SheetView;
+use crate::dialog::catalog;
+use crate::dialog::{ButtonRole, Dialog, DialogOwner};
 use crate::sheet_goto::SHEET_PROTECTED;
 use crate::sheet_step::SheetStep;
+use crate::{DocTab, SheetView, Surface};
 use gridcore::audit::{self, Along, Rule};
+use gridcore::sheet::cell_name;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ops::Bound;
 
 /// A command of the smart tag's menu, on the active cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +33,8 @@ pub(crate) enum AuditAct {
     EditInFormulaBar,
     /// Help on this error.
     Help,
+    /// Formulas > Error Checking: walks the flagged cells.
+    ErrorChecking,
 }
 
 /// What the view remembers between paints.
@@ -70,7 +76,11 @@ impl SheetView {
     /// The smart tag's heading for the active cell: its error's name, else
     /// the rule's.
     pub(crate) fn smart_tag_title(&self, rule: Rule) -> String {
-        let (r, c) = self.sel;
+        self.smart_tag_title_at(rule, self.sel)
+    }
+
+    /// [`Self::smart_tag_title`] for the cell at `(r, c)`.
+    pub(crate) fn smart_tag_title_at(&self, rule: Rule, (r, c): (u32, u32)) -> String {
         match (rule, self.sheet().cell(r, c).map(|x| &x.value)) {
             (Rule::ErrorValue, Some(gridcore::sheet::CellValue::Error(code))) => {
                 audit::error_title(code).to_string()
@@ -145,6 +155,15 @@ impl crate::Docxy {
             self.sheet_begin_edit(None, cx);
             return;
         }
+        if act == AuditAct::ErrorChecking {
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                if let Err(e) = open_error_checking(tab) {
+                    tab.status = e.into();
+                }
+            }
+            cx.notify();
+            return;
+        }
         let Some(v) = self.active_sheet_mut() else {
             return;
         };
@@ -154,7 +173,7 @@ impl crate::Docxy {
             AuditAct::CopyFormula => v.audit_copy_formula().map(|d| (d, "Formula copied")),
             AuditAct::IgnoreError => v.audit_ignore().map(|d| (d, "Error ignored")),
             AuditAct::Help => Ok((false, "")),
-            AuditAct::EditInFormulaBar => unreachable!("handled above"),
+            AuditAct::EditInFormulaBar | AuditAct::ErrorChecking => unreachable!("handled above"),
         };
         match (act, done) {
             (_, Err(e)) => self.set_status(e),
@@ -169,6 +188,218 @@ impl crate::Docxy {
             (_, Ok((false, _))) => self.set_status("Nothing to fix here"),
         }
         cx.notify();
+    }
+}
+
+/// Error Checking's last word, when the walk has nothing more to show.
+pub(crate) const COMPLETE: &str = "The error check is complete for the entire sheet.";
+
+const HELP: &str = "Help on this error";
+const IGNORE: &str = "Ignore Error";
+const EDIT: &str = "Edit in Formula Bar";
+const PREVIOUS: &str = "Previous";
+const NEXT: &str = "Next";
+
+/// A range of cells in row-major order, as the sheet's cell map takes one.
+type CellRange = (Bound<(u32, u32)>, Bound<(u32, u32)>);
+
+/// The nearest flagged cell in `range` of the sheet's cells (row by row),
+/// from the near end, or the far end when `last`.
+fn scan(v: &SheetView, range: CellRange, last: bool) -> Option<(u32, u32)> {
+    let flagged = |&&(r, c): &&(u32, u32)| !v.cell_flags(r, c).is_empty();
+    let mut keys = v.sheet().cells.range(range).map(|(k, _)| k);
+    if last {
+        keys.rev().find(flagged).copied()
+    } else {
+        keys.find(flagged).copied()
+    }
+}
+
+/// The flagged cell the walk from `start` shows after `cur` (the first when
+/// `cur` is `None`): no cell of the sheet is looked at but the ones that
+/// exist, in order, until one is flagged.
+fn walk_next(v: &SheetView, start: (u32, u32), cur: Option<(u32, u32)>) -> Option<(u32, u32)> {
+    use Bound::{Excluded, Included, Unbounded};
+    match cur {
+        Some(cur) if cur <= start => scan(v, (Excluded(cur), Included(start)), false),
+        Some(cur) => scan(v, (Excluded(cur), Unbounded), false)
+            .or_else(|| scan(v, (Unbounded, Included(start)), false)),
+        None => scan(v, (Excluded(start), Unbounded), false)
+            .or_else(|| scan(v, (Unbounded, Included(start)), false)),
+    }
+}
+
+/// The flagged cell before `cur` in the walk from `start`, `None` at its first.
+fn walk_previous(v: &SheetView, start: (u32, u32), cur: (u32, u32)) -> Option<(u32, u32)> {
+    use Bound::{Excluded, Unbounded};
+    if cur <= start {
+        scan(v, (Unbounded, Excluded(cur)), true)
+            .or_else(|| scan(v, (Excluded(start), Unbounded), true))
+    } else {
+        scan(v, (Excluded(start), Excluded(cur)), true)
+    }
+}
+
+fn sheet_view_of(tab: &mut DocTab) -> Result<&mut SheetView, String> {
+    match &mut tab.surface {
+        Surface::Sheet(v) => Ok(v),
+        _ => Err("Error Checking needs a spreadsheet".into()),
+    }
+}
+
+/// The Error Checking dialog on the flagged cell `cur` of a walk from `start`.
+fn error_dialog(v: &SheetView, start: (u32, u32), cur: (u32, u32)) -> Dialog {
+    let rule = v.cell_flags(cur.0, cur.1).first().copied();
+    let formula = v
+        .sheet()
+        .cell(cur.0, cur.1)
+        .and_then(|c| c.formula.as_deref())
+        .map(|f| format!("={f}"));
+    let mut lines = vec![format!("Error in cell {}", cell_name(cur.0, cur.1))];
+    lines.extend(formula);
+    if let Some(rule) = rule {
+        lines.push(v.smart_tag_title_at(rule, cur));
+        lines.push(rule.explanation().to_string());
+    }
+    let mut d = Dialog::message(
+        catalog::ERROR_CHECKING,
+        "Error Checking",
+        lines.join("\n"),
+        &[
+            (HELP, ButtonRole::Accept),
+            (IGNORE, ButtonRole::Accept),
+            (EDIT, ButtonRole::Accept),
+            (PREVIOUS, ButtonRole::Accept),
+            (NEXT, ButtonRole::Accept),
+            ("Close", ButtonRole::Cancel),
+        ],
+        DialogOwner::ErrorChecking { start, cur },
+    );
+    for b in &mut d.buttons {
+        b.default = b.label == NEXT;
+        if b.label == PREVIOUS {
+            b.enabled = walk_previous(v, start, cur).is_some();
+        }
+    }
+    d
+}
+
+fn done_dialog() -> Dialog {
+    Dialog::message(
+        catalog::ERROR_CHECK_DONE,
+        "Error Checking",
+        COMPLETE.to_string(),
+        &[("OK", ButtonRole::Cancel)],
+        DialogOwner::ErrorCheckDone,
+    )
+}
+
+/// Formulas > Error Checking: select the first flagged cell after the active
+/// one and show it, or say the check is complete when none is.
+pub(crate) fn open_error_checking(tab: &mut DocTab) -> Result<(), String> {
+    let v = sheet_view_of(tab)?;
+    let start = v.sel;
+    match walk_next(v, start, None) {
+        Some(cur) => {
+            crate::sheet_goto::go_to(v, v.active, (cur.0, cur.1, cur.0, cur.1));
+            let d = error_dialog(v, start, cur);
+            tab.dialogs.push(d);
+        }
+        None => tab.dialogs.push(done_dialog()),
+    }
+    Ok(())
+}
+
+/// Show `cur` (or the end of the walk) in place of the open dialog.
+fn show(tab: &mut DocTab, start: (u32, u32), cur: Option<(u32, u32)>) -> Result<(), String> {
+    let v = sheet_view_of(tab)?;
+    let d = match cur {
+        Some(cur) => {
+            crate::sheet_goto::go_to(v, v.active, (cur.0, cur.1, cur.0, cur.1));
+            error_dialog(v, start, cur)
+        }
+        None => done_dialog(),
+    };
+    tab.dialogs.pop();
+    tab.dialogs.push(d);
+    Ok(())
+}
+
+/// A press Error Checking handles: Help, Ignore Error, Edit in Formula Bar,
+/// Previous and Next. `None` for any other (Close closes through the stack).
+pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>> {
+    let top = tab.dialogs.top()?;
+    let DialogOwner::ErrorChecking { start, cur } = top.owner else {
+        return None;
+    };
+    let pressed = |label: &str| {
+        top.buttons
+            .iter()
+            .any(|b| b.label == label && b.enabled && b.label.eq_ignore_ascii_case(button.trim()))
+    };
+    let (help, ignore, edit, previous, next) = (
+        pressed(HELP),
+        pressed(IGNORE),
+        pressed(EDIT),
+        pressed(PREVIOUS),
+        pressed(NEXT),
+    );
+    Some(if help {
+        let v = match sheet_view_of(tab) {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        };
+        let what = v
+            .cell_flags(cur.0, cur.1)
+            .first()
+            .map_or("There is no error here", |r| r.explanation());
+        tab.status = what.into();
+        Ok(())
+    } else if ignore {
+        ignore_here(tab, start, cur)
+    } else if edit {
+        let v = match sheet_view_of(tab) {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        };
+        if v.sheet().is_protected() {
+            return Some(Err(SHEET_PROTECTED.into()));
+        }
+        v.begin_cell_edit(None);
+        tab.dialogs.pop();
+        Ok(())
+    } else if previous {
+        match sheet_view_of(tab).map(|v| walk_previous(v, start, cur)) {
+            Ok(Some(p)) => show(tab, start, Some(p)),
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
+        }
+    } else if next {
+        match sheet_view_of(tab).map(|v| walk_next(v, start, Some(cur))) {
+            Ok(n) => show(tab, start, n),
+            Err(e) => Err(e),
+        }
+    } else {
+        return None;
+    })
+}
+
+/// Ignore Error on the cell the dialog shows: it stays while another rule
+/// still flags the cell, else the walk goes on.
+fn ignore_here(tab: &mut DocTab, start: (u32, u32), cur: (u32, u32)) -> Result<(), String> {
+    let v = sheet_view_of(tab)?;
+    v.sel = cur;
+    v.anchor = cur;
+    if !v.audit_ignore()? {
+        return Ok(());
+    }
+    tab.sheet_edited();
+    let v = sheet_view_of(tab)?;
+    if v.cell_flags(cur.0, cur.1).is_empty() {
+        let n = walk_next(v, start, Some(cur));
+        show(tab, start, n)
+    } else {
+        show(tab, start, Some(cur))
     }
 }
 

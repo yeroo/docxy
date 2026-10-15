@@ -18,6 +18,7 @@
 //! with a fourth row does not compile (#1018).
 
 use crate::help_tab::HelpAct;
+use crate::sheet_audit::AuditAct;
 use crate::sheet_calc::CalcAct;
 use crate::sheet_menus::SheetMenu;
 use crate::sheet_page_setup::{AreaOp, BreakOp, MarginPreset, PageAct, SetupTab};
@@ -1095,7 +1096,12 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                             COL,
                             &[
                                 row("show-formulas", "Show Formulas", None, SheetAct::Todo),
-                                row("error-checking", "Error Checking", None, SheetAct::Todo),
+                                row(
+                                    "error-checking",
+                                    "Error Checking",
+                                    None,
+                                    SheetAct::Audit(AuditAct::ErrorChecking),
+                                ),
                                 row("evaluate-formula", "Evaluate Formula", None, SheetAct::Todo),
                             ],
                         ),
@@ -1784,7 +1790,6 @@ mod tests {
                 "trace-dependents",
                 "remove-arrows",
                 "show-formulas",
-                "error-checking",
                 "evaluate-formula",
                 "watch-window",
                 "spelling",

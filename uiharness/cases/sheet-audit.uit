@@ -1,0 +1,142 @@
+# Formula auditing (#675): the green indicator and smart tag on a flagged
+# cell, Convert to Number and Ignore Error (one undo step each), and
+# Formulas > Error Checking walking the flagged cells. Run with:
+#
+#   cargo run -p uiharness -- run uiharness/cases/sheet-audit.uit
+#
+# The fixture's data is A1:C5; columns J and K are clear. `cell` reports the
+# rules that flag a cell (`flags`, named as `<ignoredError>` names them): the
+# cells the grid draws the green corner on.
+
+test an error and a number stored as text are flagged
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type =1/0
+  key enter
+  click K1
+  type '123
+  key enter
+  call cell {"cell":"J1"}
+  assert reply.flagged is true
+  assert reply.flags.0 is evalError
+  call cell {"cell":"K1"}
+  assert reply.flagged is true
+  assert reply.flags.0 is numberStoredAsText
+  call cell {"cell":"A1"}
+  assert reply.flagged is false
+
+test the smart tag on an error names it and offers its commands
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type =1/0
+  key enter
+  click J1
+  call menu-open {"target":{"grid":"error-check"}}
+  call menu-read {}
+  assert reply.target.grid is error-check
+  assert reply.items.0.heading is Divide by Zero Error
+  assert reply.items.1.id is error-help
+  assert reply.items.3.id is ignore-error
+  assert reply.items.4.id is edit-in-formula-bar
+  call menu-close {}
+
+test the smart tag on a number stored as text converts it, and undo brings the text back
+  open copy:../fixtures/basic.xlsx
+  click K1
+  type '123
+  key enter
+  click K1
+  call menu-open {"target":{"grid":"error-check"}}
+  call menu-read {}
+  assert reply.items.0.heading is Number Stored as Text
+  assert reply.items.1.id is convert-to-number
+  call menu-click {"label":"Convert to Number"}
+  assert cell K1 is 123
+  call cell {"cell":"K1"}
+  assert reply.flagged is false
+  key ctrl+z
+  call cell {"cell":"K1"}
+  assert reply.flagged is true
+  assert reply.flags.0 is numberStoredAsText
+
+test Ignore Error stops the flag on that cell only, and undo restores it
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type =1/0
+  key enter
+  click J2
+  type =1/0
+  key enter
+  click J1
+  call menu-open {"target":{"grid":"error-check"}}
+  call menu-click {"label":"Ignore Error"}
+  call cell {"cell":"J1"}
+  assert reply.flagged is false
+  call cell {"cell":"J2"}
+  assert reply.flagged is true
+  call-error menu-open {"target":{"grid":"error-check"}} => no error indicator is showing on the selected cell
+  key ctrl+z
+  call cell {"cell":"J1"}
+  assert reply.flagged is true
+
+test the smart tag opens only on a flagged cell
+  open copy:../fixtures/basic.xlsx
+  click A1
+  call-error menu-open {"target":{"grid":"error-check"}} => no error indicator is showing on the selected cell
+
+test Error Checking shows each flagged cell after the active one, row by row
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type =1/0
+  key enter
+  click K1
+  type '123
+  key enter
+  click L2
+  type =NA()
+  key enter
+  click A1
+  call ribbon-click {"tab":"Formulas","command":"Error Checking"}
+  assert dialog is error-checking
+  assert sel is J1
+  call dialog-read {}
+  assert reply.title is Error Checking
+  assert reply.buttons.3.label is Previous
+  assert reply.buttons.3.enabled is false
+  call dialog-click {"button":"Next"}
+  assert sel is K1
+  call dialog-click {"button":"Next"}
+  assert sel is L2
+  call dialog-click {"button":"Previous"}
+  assert sel is K1
+  call dialog-click {"button":"Close"}
+  assert dialog is none
+
+test Error Checking skips an ignored error and ends with its message
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type =1/0
+  key enter
+  click K1
+  type '123
+  key enter
+  click J1
+  call menu-open {"target":{"grid":"error-check"}}
+  call menu-click {"label":"Ignore Error"}
+  click A1
+  call ribbon-click {"tab":"Formulas","command":"Error Checking"}
+  assert dialog is error-checking
+  assert sel is K1
+  call dialog-click {"button":"Ignore Error"}
+  assert dialog is error-check-done
+  call dialog-read {}
+  assert reply.text is The error check is complete for the entire sheet.
+  call dialog-click {"button":"OK"}
+  assert dialog is none
+
+test Error Checking on a clean sheet says the check is complete
+  open copy:../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"Error Checking"}
+  assert dialog is error-check-done
+  call dialog-click {"button":"OK"}
+  assert dialog is none
