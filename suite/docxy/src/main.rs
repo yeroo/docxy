@@ -35119,6 +35119,26 @@ impl Docxy {
                         .mt_4()
                         .child("Settings"),
                 )
+                // The Light/Dark/Auto cycle: the View ribbon's Theme button
+                // is not drawn on a Mail or failed-load tab, with no tab, in
+                // Protected View or with the ribbon minimised (#1473), and
+                // File always is.
+                .child(
+                    div()
+                        .id("bs-theme")
+                        .relative()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .py_1()
+                        .cursor_pointer()
+                        .rounded_sm()
+                        .hover(|d| d.bg(sidebar))
+                        .child(probe(&self.probes, "bs-theme"))
+                        .child(div().text_color(fg).child("Theme"))
+                        .child(div().text_color(dim).child(self.theme_pref.label()))
+                        .on_click(cx.listener(|this, _, window, cx| this.cycle_theme(window, cx))),
+                )
                 .child(
                     div()
                         .id("bs-ask-toggle")
@@ -35823,10 +35843,10 @@ impl Render for Docxy {
             self.tab_more_open = false;
         }
 
-        // NOTE: the brand label and the flex_1 spacer are plain,
+        // NOTE: the type label and the flex_1 spacer are plain,
         // non-interactive divs, so TitleBar's own drag region shows through them
         // — that idle space is natively draggable and double-click maximizes.
-        // Only the *interactive* clusters (chips, theme button) swallow the
+        // Only the *interactive* clusters (the QAT and the tab strip) swallow the
         // mouse-down so a drag on them doesn't start a window move.
         // The OS window title is the active tab's Project-style
         // `<stem>  -  docxy` (#588); no tab gets the bare brand. It is set

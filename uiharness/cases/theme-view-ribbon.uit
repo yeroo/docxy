@@ -1,7 +1,9 @@
 # #1473: the theme button moved from the title bar to the View ribbon. Each
 # tab type's View > Theme cycles Auto, Light, Dark (the title bar's old cycle),
-# and the title bar no longer has a theme button. Mail has no harness-opened
-# tab; its View tab is the document one, covered by a unit test.
+# and the title bar no longer has a theme button. Where no View tab is drawn
+# (Mail, a failed load, no tab, Protected View, a minimised ribbon) Backstage's
+# Settings Theme row is the control; the harness opens no Mail tab, so the
+# minimised ribbon stands for them (all one `ribbon_body_hidden`).
 test issue 1473 View Theme cycles the theme on a document tab
   call theme-set {"theme":"auto"}
   call tab-list {}
@@ -46,7 +48,29 @@ test issue 1473 View Theme cycles the theme on a project tab
   call appearance-set {"appearance":"light"}
   assert reply.theme is auto
 
+test issue 1473 Backstage Settings changes the theme where no View tab is drawn
+  call tab-select {"tab":0}
+  call theme-set {"theme":"auto"}
+  key ctrl+f1
+  call-error ribbon-read {} => the ribbon is collapsed
+  call backstage {"action":"open"}
+  shot window
+  call pointer-click {"at":"theme-row"}
+  call appearance-set {"appearance":"light"}
+  assert reply.theme is light
+  call pointer-click {"at":"theme-row"}
+  call appearance-set {"appearance":"light"}
+  assert reply.theme is dark
+  call pointer-click {"at":"theme-row"}
+  call appearance-set {"appearance":"light"}
+  assert reply.theme is auto
+  call backstage {"action":"close"}
+  key ctrl+f1
+  call ribbon-read {}
+
 test issue 1473 the title bar has no theme button
   call title-bar {}
   assert reply.drag_ok is true
   assert reply.controls_clear is true
+  # The drag space runs to the content's end; a button at the right would end it early.
+  assert reply.drag_reaches_end is true

@@ -4812,11 +4812,13 @@ fn row_menu_press_with_open_cell_commits() {
     assert_eq!(sel_of(&t), None);
 }
 
-/// The theme button moved from the title bar to the View tab (#1473): every
-/// kind's View tab has it, Mail's (the document's) included.
+/// The theme button moved from the title bar to the View tab (#1473): the
+/// tabs that draw a ribbon body (document, workbook, Project) have it. Mail,
+/// a failed load, no tab, Protected View and a minimised ribbon draw none
+/// (`ribbon_body_hidden`), so Backstage's Settings has a Theme row too.
 #[test]
 fn every_view_tab_has_the_theme_button() {
-    for kind in [Kind::Project, Kind::Docx, Kind::Xlsx, Kind::Look] {
+    for kind in [Kind::Project, Kind::Docx] {
         let ribbon = ribbon_for(kind);
         let view = ribbon.tabs.iter().find(|t| t.name == "View").unwrap();
         let labels: Vec<&str> = view

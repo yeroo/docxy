@@ -4110,6 +4110,12 @@ fn dispatch_verb(
                     Json::Bool(content_right <= caption_left + 0.5),
                 ),
                 ("drag_w", Json::Num(drag_w as f64)),
+                // The drag space runs to the content's end: nothing sits
+                // right of it, as the theme button once did (#1473).
+                (
+                    "drag_reaches_end",
+                    Json::Bool((drag_right - content_right).abs() <= 0.5),
+                ),
                 (
                     "drag_ok",
                     Json::Bool(drag_w + 0.5 >= crate::tabstrip::DRAG_MIN_W),
@@ -5218,6 +5224,13 @@ fn dispatch_verb(
                         .on_screen("bs-user-name")
                         .ok_or("the User name row is not drawn: open File (backstage) first")?
                         .center(),
+                    // Its Theme row (#1473).
+                    Some("theme-row") => app
+                        .probes
+                        .borrow()
+                        .on_screen("bs-theme")
+                        .ok_or("the Theme row is not drawn: open File (backstage) first")?
+                        .center(),
                     // Its Edit Custom Lists… row (#1029).
                     Some("custom-lists-row") => app
                         .probes
@@ -5258,7 +5271,7 @@ fn dispatch_verb(
                     }
                     Some(other) => {
                         return Err(format!(
-                            "unknown pointer target '{other}' (fill-handle, user-name-row, custom-lists-row, sheet-replace-button, sheet-replace-all-button, doc-replace-button, doc-replace-all-button)"
+                            "unknown pointer target '{other}' (fill-handle, user-name-row, theme-row, custom-lists-row, sheet-replace-button, sheet-replace-all-button, doc-replace-button, doc-replace-all-button)"
                         ));
                     }
                     None => return Err("'at' must be a string".into()),

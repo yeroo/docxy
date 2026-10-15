@@ -1425,7 +1425,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             // the label stays "Theme" as in the document ribbon.
             Group {
                 title: "Appearance",
-                priority: 80,
+                priority: 90,
                 launcher: false,
                 launch: None,
                 body: Body::Strip {
@@ -1440,7 +1440,7 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
             },
             Group {
                 title: "Window",
-                priority: 90,
+                priority: 80,
                 launcher: false,
                 launch: None,
                 body: Body::Strip {
