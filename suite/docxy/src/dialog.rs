@@ -213,6 +213,9 @@ pub(crate) enum DialogOwner {
     },
     /// Error Checking's "The error check is complete" box.
     ErrorCheckDone,
+    /// Formulas › Evaluate Formula (#675), applied in `sheet_audit::click`:
+    /// the evaluation is the sheet view's.
+    EvaluateFormula,
     /// Home › Fill › Series… (#668); its OK needs the app's custom lists,
     /// so `Docxy::fill_dialog_click` applies it.
     Series,

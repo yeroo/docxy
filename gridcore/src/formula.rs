@@ -1448,6 +1448,26 @@ pub fn to_string(e: &Expr) -> String {
     Printer::default().print(e)
 }
 
+/// [`to_string`] of `e`, and where in that text `target` (a node inside `e`,
+/// found by address) is printed: the byte range of its own text, without any
+/// parentheses its parent put round it. Evaluate Formula underlines it.
+/// `None` when `target` is not a node of `e`.
+pub fn to_string_marked(e: &Expr, target: &Expr) -> (String, Option<std::ops::Range<usize>>) {
+    // Private-use characters no formula text holds, taken out again below.
+    const OPEN: char = '\u{E000}';
+    const CLOSE: char = '\u{E001}';
+    let mut printer = Printer {
+        mark: Some(target as *const Expr),
+        ..Printer::default()
+    };
+    let marked = printer.print(e);
+    let (Some(a), Some(b)) = (marked.find(OPEN), marked.find(CLOSE)) else {
+        return (marked.replace([OPEN, CLOSE], ""), None);
+    };
+    let text = marked.replace([OPEN, CLOSE], "");
+    (text, Some(a..b - OPEN.len_utf8()))
+}
+
 /// The AST printer behind [`to_string`] (the spelling held in memory and shown
 /// to the user) and [`file_formula`] (the spelling Excel stores in a file).
 #[derive(Default)]
@@ -1460,10 +1480,20 @@ struct Printer {
     /// (file spelling only), without their `_xlpm.` prefix, and whether each
     /// may hold a lambda (see [`Printer::func`]).
     scope: Vec<(String, bool)>,
+    /// A node whose text [`to_string_marked`] brackets.
+    mark: Option<*const Expr>,
 }
 
 impl Printer {
     fn print(&mut self, e: &Expr) -> String {
+        let text = self.print_node(e);
+        if self.mark.is_some_and(|m| std::ptr::eq(m, e)) {
+            return format!("\u{E000}{text}\u{E001}");
+        }
+        text
+    }
+
+    fn print_node(&mut self, e: &Expr) -> String {
         match e {
             Expr::Num(n) => self.num(*n),
             Expr::Str(s) => format!("\"{}\"", s.replace('"', "\"\"")),
@@ -6348,7 +6378,7 @@ pub fn file_formula(src: &str) -> Cow<'_, str> {
         if let Ok(e) = parse(src) {
             let mut p = Printer {
                 file: true,
-                scope: Vec::new(),
+                ..Printer::default()
             };
             return Cow::Owned(p.print(&e));
         }
@@ -6374,7 +6404,7 @@ pub fn file_formula(src: &str) -> Cow<'_, str> {
 pub fn to_file_string(e: &Expr) -> String {
     let mut p = Printer {
         file: true,
-        scope: Vec::new(),
+        ..Printer::default()
     };
     p.print(e)
 }

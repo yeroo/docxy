@@ -224,6 +224,14 @@ pub(crate) fn smart_tag_menu(v: &crate::SheetView) -> Option<Vec<MenuItem>> {
         act(AuditAct::Help),
         true,
     ));
+    if rule == Rule::ErrorValue {
+        items.push(item(
+            "show-steps",
+            "Show Calculation Steps\u{2026}",
+            act(AuditAct::EvaluateFormula),
+            true,
+        ));
+    }
     items.push(sep());
     items.push(item(
         "ignore-error",

@@ -115,9 +115,9 @@ fn apply_dialog(
             Err("Go To applies through Find & Select".into())
         }
         // Handled in `sheet_audit::click`, before this.
-        DialogOwner::ErrorChecking { .. } | DialogOwner::ErrorCheckDone => {
-            Err("Error Checking applies through Formulas".into())
-        }
+        DialogOwner::ErrorChecking { .. }
+        | DialogOwner::ErrorCheckDone
+        | DialogOwner::EvaluateFormula => Err("Error Checking applies through Formulas".into()),
         // Handled in `Docxy::paste_dialog_click`, before this.
         DialogOwner::PasteSpecial { .. } => Err("Paste Special applies through Paste".into()),
         // Handled in `Docxy::doc_paste_dialog_click`, before this.
@@ -250,6 +250,7 @@ pub(crate) fn presses_through_app(owner: &DialogOwner) -> bool {
                 | DialogOwner::GoToSpecial
                 | DialogOwner::ErrorChecking { .. }
                 | DialogOwner::ErrorCheckDone
+                | DialogOwner::EvaluateFormula
                 | DialogOwner::HfOnlinePictures
         )
 }

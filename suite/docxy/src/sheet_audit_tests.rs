@@ -244,3 +244,149 @@ fn the_smart_tag_commands_follow_the_sheet_command_rules() {
         AuditAct::ErrorChecking
     )));
 }
+
+/// The labels of the open Evaluate Formula dialog, by name.
+fn label(t: &DocTab, name: &str) -> String {
+    t.dialogs
+        .top()
+        .unwrap()
+        .controls
+        .iter()
+        .find(|c| c.name == name)
+        .map(|c| c.text())
+        .unwrap_or_default()
+}
+
+fn enabled(t: &DocTab, button: &str) -> bool {
+    t.dialogs
+        .top()
+        .unwrap()
+        .buttons
+        .iter()
+        .find(|b| b.label == button)
+        .unwrap_or_else(|| panic!("a {button} button"))
+        .enabled
+}
+
+fn evaluate_tab() -> DocTab {
+    let mut t = tab();
+    put(&mut t, "A1", Cell::number(1.0));
+    put(&mut t, "A2", Cell::number(2.0));
+    put(&mut t, "B1", Cell::formula("SUM(A1:A2)*2"));
+    t
+}
+
+/// What the dialog shows is the underline in `[ ]`.
+fn evaluation(t: &DocTab) -> String {
+    label(t, "evaluation").replace('\u{332}', "")
+}
+
+#[test]
+fn evaluate_formula_underlines_the_next_part_and_steps_to_the_value() {
+    let mut t = evaluate_tab();
+    select(&mut t, "B1");
+    crate::sheet_audit::open_evaluate(&mut t).unwrap();
+    let d = t.dialogs.top().unwrap();
+    assert_eq!(d.owner, DialogOwner::EvaluateFormula);
+    assert_eq!(label(&t, "reference"), "Sheet1!$B$1");
+    assert_eq!(evaluation(&t), "=SUM(A1:A2)*2");
+    assert_eq!(label(&t, "next"), "A1:A2", "the part underlined");
+    // The underline itself: a combining low line after each of its characters.
+    assert_eq!(
+        label(&t, "evaluation"),
+        "=SUM(A\u{332}1\u{332}:\u{332}A\u{332}2\u{332})*2"
+    );
+    for (next, shown) in [("SUM({1;2})", "=SUM({1;2})*2"), ("3*2", "=3*2")] {
+        assert_eq!(click(&mut t, "Evaluate"), Some(Ok(())));
+        assert_eq!(evaluation(&t), shown);
+        assert_eq!(label(&t, "next"), next);
+    }
+    assert_eq!(click(&mut t, "Evaluate"), Some(Ok(())));
+    assert_eq!(evaluation(&t), "6", "the value, with nothing underlined");
+    assert_eq!(label(&t, "next"), "");
+    assert!(!enabled(&t, "Evaluate"), "nothing left to calculate");
+    assert_eq!(t.dialogs.depth(), 1, "one dialog throughout");
+}
+
+#[test]
+fn restart_goes_back_to_the_formula() {
+    let mut t = evaluate_tab();
+    select(&mut t, "B1");
+    crate::sheet_audit::open_evaluate(&mut t).unwrap();
+    click(&mut t, "Evaluate");
+    click(&mut t, "Evaluate");
+    assert_ne!(evaluation(&t), "=SUM(A1:A2)*2");
+    assert_eq!(click(&mut t, "Restart"), Some(Ok(())));
+    assert_eq!(evaluation(&t), "=SUM(A1:A2)*2");
+    assert_eq!(label(&t, "next"), "A1:A2");
+}
+
+#[test]
+fn step_in_and_step_out_follow_a_reference_to_a_formula() {
+    let mut t = tab();
+    put(&mut t, "A1", Cell::number(2.0));
+    put(&mut t, "A2", Cell::formula("A1*10"));
+    put(&mut t, "B1", Cell::formula("A2+1"));
+    select(&mut t, "B1");
+    crate::sheet_audit::open_evaluate(&mut t).unwrap();
+    assert!(enabled(&t, "Step In"), "A2 holds a formula");
+    assert!(!enabled(&t, "Step Out"));
+    assert_eq!(click(&mut t, "Step In"), Some(Ok(())));
+    assert_eq!(label(&t, "reference"), "Sheet1!$A$2");
+    assert_eq!(evaluation(&t), "=A1*10");
+    assert!(enabled(&t, "Step Out") && !enabled(&t, "Step In"));
+    assert_eq!(click(&mut t, "Step Out"), Some(Ok(())));
+    assert_eq!(label(&t, "reference"), "Sheet1!$B$1");
+    assert_eq!(evaluation(&t), "=20+1");
+}
+
+#[test]
+fn a_volatile_function_and_a_constant_each_get_their_note() {
+    let mut t = tab();
+    put(&mut t, "A1", Cell::formula("RAND()+1"));
+    put(&mut t, "A2", Cell::number(5.0));
+    select(&mut t, "A1");
+    crate::sheet_audit::open_evaluate(&mut t).unwrap();
+    assert!(label(&t, "note").contains("volatile"));
+    t.dialogs.pop();
+    select(&mut t, "A2");
+    crate::sheet_audit::open_evaluate(&mut t).unwrap();
+    assert_eq!(
+        label(&t, "note"),
+        "The cell currently being evaluated contains a constant."
+    );
+    assert_eq!(evaluation(&t), "5");
+    assert!(!enabled(&t, "Evaluate"));
+}
+
+#[test]
+fn close_is_not_evaluates_and_an_off_button_presses_nothing() {
+    let mut t = evaluate_tab();
+    select(&mut t, "B1");
+    crate::sheet_audit::open_evaluate(&mut t).unwrap();
+    assert_eq!(click(&mut t, "Close"), None);
+    assert_eq!(click(&mut t, "Step Out"), None, "nothing was stepped into");
+}
+
+#[test]
+fn show_calculation_steps_opens_evaluate_on_top_of_error_checking() {
+    let mut t = flagged_sheet();
+    select(&mut t, "A1");
+    open_error_checking(&mut t).unwrap();
+    // The walk shows D1 first, a number stored as text: no steps for it.
+    assert!(!enabled(&t, "Show Calculation Steps\u{2026}"));
+    click(&mut t, "Next");
+    assert_eq!(shown(&t), Some(at("B2")));
+    assert!(enabled(&t, "Show Calculation Steps\u{2026}"));
+    assert_eq!(
+        click(&mut t, "Show Calculation Steps\u{2026}"),
+        Some(Ok(()))
+    );
+    assert_eq!(t.dialogs.depth(), 2, "on top of Error Checking");
+    assert_eq!(label(&t, "reference"), "Sheet1!$B$2");
+    assert_eq!(evaluation(&t), "=1/0");
+    click(&mut t, "Evaluate");
+    assert_eq!(evaluation(&t), "#DIV/0!");
+    t.dialogs.pop();
+    assert_eq!(shown(&t), Some(at("B2")), "back in Error Checking");
+}

@@ -36,8 +36,9 @@ test the smart tag on an error names it and offers its commands
   assert reply.target.grid is error-check
   assert reply.items.0.heading is Divide by Zero Error
   assert reply.items.1.id is error-help
-  assert reply.items.3.id is ignore-error
-  assert reply.items.4.id is edit-in-formula-bar
+  assert reply.items.2.id is show-steps
+  assert reply.items.4.id is ignore-error
+  assert reply.items.5.id is edit-in-formula-bar
   call menu-close {}
 
 test the smart tag on a number stored as text converts it, and undo brings the text back
@@ -101,8 +102,8 @@ test Error Checking shows each flagged cell after the active one, row by row
   assert sel is J1
   call dialog-read {}
   assert reply.title is Error Checking
-  assert reply.buttons.3.label is Previous
-  assert reply.buttons.3.enabled is false
+  assert reply.buttons.4.label is Previous
+  assert reply.buttons.4.enabled is false
   call dialog-click {"button":"Next"}
   assert sel is K1
   call dialog-click {"button":"Next"}
@@ -252,3 +253,72 @@ test Ctrl+[ selects the direct precedents, Ctrl+Shift+{ every level, Ctrl+] the 
   key ctrl+]
   call status-read {}
   assert reply.items.1.text is No cells were found.
+
+
+# Evaluate Formula takes a formula apart in Excel's order. The dialog's
+# `evaluation` label holds the formula with a combining low line after each
+# character of the part to calculate next; `next` holds that part alone.
+
+test Evaluate Formula underlines the next part and steps to the value
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type 3
+  key enter
+  type 4
+  key enter
+  type =SUM(J1:J2)*2
+  key enter
+  click J3
+  call ribbon-click {"tab":"Formulas","command":"Evaluate Formula"}
+  assert dialog is evaluate-formula
+  call dialog-read {}
+  assert reply.controls.0.text is Sheet1!$J$3
+  assert reply.controls.2.text is J1:J2
+  call dialog-click {"button":"Evaluate"}
+  call dialog-read {}
+  assert reply.controls.2.text is SUM({3;4})
+  call dialog-click {"button":"Evaluate"}
+  call dialog-read {}
+  assert reply.controls.2.text is 7*2
+  call dialog-click {"button":"Evaluate"}
+  call dialog-read {}
+  assert reply.controls.1.text is 14
+  call dialog-click {"button":"Restart"}
+  call dialog-read {}
+  assert reply.controls.2.text is J1:J2
+  call dialog-click {"button":"Close"}
+  assert dialog is none
+
+test Step In shows the referenced formula and Step Out puts its value back
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type 2
+  key enter
+  type =J1*10
+  key enter
+  type =J2+1
+  key enter
+  click J3
+  call ribbon-click {"tab":"Formulas","command":"Evaluate Formula"}
+  call dialog-click {"button":"Step In"}
+  call dialog-read {}
+  assert reply.controls.0.text is Sheet1!$J$2
+  call dialog-click {"button":"Step Out"}
+  call dialog-read {}
+  assert reply.controls.0.text is Sheet1!$J$3
+  call dialog-click {"button":"Close"}
+
+test Show Calculation Steps on an error opens Evaluate Formula over Error Checking
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type =1/0
+  key enter
+  click J1
+  call menu-open {"target":{"grid":"error-check"}}
+  call menu-click {"label":"Show Calculation Steps…"}
+  assert dialog is evaluate-formula
+  call dialog-click {"button":"Evaluate"}
+  call dialog-read {}
+  assert reply.controls.1.text is "#DIV/0!"
+  call dialog-click {"button":"Close"}
+  assert dialog is none

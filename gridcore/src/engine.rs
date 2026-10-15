@@ -3068,6 +3068,27 @@ pub fn eval_formula_at(wb: &Workbook, sheet: usize, row: u32, col: u32, src: &st
     eval_formula_at_clock(wb, sheet, row, col, src, None)
 }
 
+/// An expression evaluated in the context of cell (sheet, row, col), whole:
+/// a range or an array stays an array. Evaluate Formula's step (#675); the
+/// expression may hold references, which read the workbook as it stands.
+pub fn eval_expr_at(
+    wb: &Workbook,
+    sheet: usize,
+    row: u32,
+    col: u32,
+    e: &formula::Expr,
+    clock: Option<f64>,
+) -> formula::DynResult {
+    let resolver = WbResolver {
+        wb,
+        clock,
+        rand_state: StdCell::new(0),
+        has_rand: false,
+    };
+    let mut ev = Eval::new(&resolver, sheet, (row, col));
+    ev.eval_dynamic(e)
+}
+
 /// [`eval_formula_at`] under the host's clock, so `TODAY()` and `NOW()` read
 /// it (data validation's rules and typed formulas; a rule that compares with
 /// today means today).

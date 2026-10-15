@@ -1127,6 +1127,22 @@ dialogs! {
         accept_closes: true,
         unreachable: None,
     }
+    EVALUATE_FORMULA = "evaluate-formula" {
+        surface: Surface::Sheet,
+        file: "sheet-calc",
+        fixture: XLSX,
+        open: &[
+            "click J1",
+            "type =1+2*3",
+            "key enter",
+            "click J1",
+            r#"call ribbon-click {"tab":"Formulas","command":"Evaluate Formula"}"#,
+        ],
+        fields: &[],
+        reopen: &[],
+        accept_closes: false,
+        unreachable: None,
+    }
     GOTO_SPECIAL = "goto-special" {
         surface: Surface::Sheet,
         file: "sheet-data",

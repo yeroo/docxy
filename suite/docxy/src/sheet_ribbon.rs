@@ -1117,7 +1117,12 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                                     None,
                                     SheetAct::Audit(AuditAct::ErrorChecking),
                                 ),
-                                row("evaluate-formula", "Evaluate Formula", None, SheetAct::Todo),
+                                row(
+                                    "evaluate-formula",
+                                    "Evaluate Formula",
+                                    None,
+                                    SheetAct::Audit(AuditAct::EvaluateFormula),
+                                ),
                             ],
                         ),
                         // Excel has Trace Error in Error Checking's drop-down; a
@@ -1813,7 +1818,6 @@ mod tests {
                 "use-in-formula",
                 "create-from-selection",
                 "show-formulas",
-                "evaluate-formula",
                 "watch-window",
                 "spelling",
                 "protect-workbook",

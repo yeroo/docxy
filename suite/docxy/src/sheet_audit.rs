@@ -47,6 +47,9 @@ pub(crate) enum AuditAct {
     Trace(TraceKind),
     /// Formulas > Remove Arrows.
     RemoveArrows,
+    /// Formulas > Evaluate Formula, and the smart tag's and Error Checking's
+    /// Show Calculation Steps: the formula of the active cell, step by step.
+    EvaluateFormula,
     /// Ctrl+[ and Ctrl+Shift+{ (`all`: every level): select what the cells
     /// read; Ctrl+] and Ctrl+Shift+}: the formulas that read them.
     Select { kind: Reach, all: bool },
@@ -98,6 +101,8 @@ pub(crate) struct AuditState {
     /// never saved, and an edit takes them away.
     traces: Vec<TraceSet>,
     traces_gen: u64,
+    /// The formula Evaluate Formula is taking apart.
+    eval: Option<gridcore::evalsteps::Evaluation>,
 }
 
 /// The flags found so far, valid for one (`edit_gen`, sheet).
@@ -347,6 +352,15 @@ impl crate::Docxy {
                 cx.notify();
                 return;
             }
+            AuditAct::EvaluateFormula => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    if let Err(e) = open_evaluate(tab) {
+                        tab.status = e.into();
+                    }
+                }
+                cx.notify();
+                return;
+            }
             AuditAct::Select { kind, all } => {
                 if let Some(Err(e)) = self.active_sheet_mut().map(|v| v.select_reach(kind, all)) {
                     self.set_status(e);
@@ -378,6 +392,7 @@ impl crate::Docxy {
             | AuditAct::ErrorChecking
             | AuditAct::Trace(_)
             | AuditAct::RemoveArrows
+            | AuditAct::EvaluateFormula
             | AuditAct::Select { .. } => unreachable!("handled above"),
         };
         match (act, done) {
@@ -400,6 +415,7 @@ impl crate::Docxy {
 pub(crate) const COMPLETE: &str = "The error check is complete for the entire sheet.";
 
 const HELP: &str = "Help on this error";
+const STEPS: &str = "Show Calculation Steps\u{2026}";
 const IGNORE: &str = "Ignore Error";
 const EDIT: &str = "Edit in Formula Bar";
 const PREVIOUS: &str = "Previous";
@@ -472,6 +488,7 @@ fn error_dialog(v: &SheetView, start: (u32, u32), cur: (u32, u32)) -> Dialog {
         lines.join("\n"),
         &[
             (HELP, ButtonRole::Accept),
+            (STEPS, ButtonRole::Accept),
             (IGNORE, ButtonRole::Accept),
             (EDIT, ButtonRole::Accept),
             (PREVIOUS, ButtonRole::Accept),
@@ -484,6 +501,13 @@ fn error_dialog(v: &SheetView, start: (u32, u32), cur: (u32, u32)) -> Dialog {
         b.default = b.label == NEXT;
         if b.label == PREVIOUS {
             b.enabled = walk_previous(v, start, cur).is_some();
+        }
+        // The steps are for a formula: a number stored as text has none.
+        if b.label == STEPS {
+            b.enabled = v
+                .sheet()
+                .cell(cur.0, cur.1)
+                .is_some_and(|c| c.formula.is_some());
         }
     }
     d
@@ -534,6 +558,9 @@ fn show(tab: &mut DocTab, start: (u32, u32), cur: Option<(u32, u32)>) -> Result<
 /// Previous and Next. `None` for any other (Close closes through the stack).
 pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>> {
     let top = tab.dialogs.top()?;
+    if top.owner == DialogOwner::EvaluateFormula {
+        return evaluate_click(tab, button);
+    }
     let DialogOwner::ErrorChecking { start, cur } = top.owner else {
         return None;
     };
@@ -542,14 +569,17 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
             .iter()
             .any(|b| b.label == label && b.enabled && b.label.eq_ignore_ascii_case(button.trim()))
     };
-    let (help, ignore, edit, previous, next) = (
+    let (help, steps, ignore, edit, previous, next) = (
         pressed(HELP),
+        pressed(STEPS),
         pressed(IGNORE),
         pressed(EDIT),
         pressed(PREVIOUS),
         pressed(NEXT),
     );
-    Some(if help {
+    Some(if steps {
+        open_evaluate(tab)
+    } else if help {
         let v = match sheet_view_of(tab) {
             Ok(v) => v,
             Err(e) => return Some(Err(e)),
@@ -587,6 +617,151 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
     } else {
         return None;
     })
+}
+
+const EVALUATE: &str = "Evaluate";
+const STEP_IN: &str = "Step In";
+const STEP_OUT: &str = "Step Out";
+const RESTART: &str = "Restart";
+
+/// `text` with the bytes `span` underlined: each character of it followed by
+/// a combining low line.
+fn underlined(text: &str, span: &std::ops::Range<usize>) -> String {
+    let mut out = String::new();
+    for (i, ch) in text.char_indices() {
+        out.push(ch);
+        if span.contains(&i) {
+            out.push('\u{332}');
+        }
+    }
+    out
+}
+
+/// The Evaluate Formula dialog for the evaluation the view holds.
+fn evaluate_dialog(v: &SheetView) -> Option<Dialog> {
+    use crate::dialog::{Control, ControlKind, Value};
+    let ev = v.audit.eval.as_ref()?;
+    let view = ev.view(&v.pkg.workbook);
+    let label = |name: &'static str, caption: &str, text: String| {
+        Control::new(name, caption, ControlKind::Label, Value::Text(text))
+    };
+    let shown = match &view.underline {
+        Some(span) => underlined(&view.text, span),
+        None => view.text.clone(),
+    };
+    let mut controls = vec![
+        label("reference", "Reference:", view.reference.clone()),
+        label("evaluation", "Evaluation:", shown),
+    ];
+    if let Some(span) = &view.underline {
+        controls.push(label(
+            "next",
+            "Next to evaluate:",
+            view.text[span.clone()].to_string(),
+        ));
+    }
+    if view.constant {
+        controls.push(label(
+            "note",
+            "",
+            "The cell currently being evaluated contains a constant.".into(),
+        ));
+    } else if view.volatile {
+        controls.push(label(
+            "note",
+            "",
+            "A volatile function may give a different result each time the formula is evaluated."
+                .into(),
+        ));
+    }
+    let mut d = Dialog::message(
+        catalog::EVALUATE_FORMULA,
+        "Evaluate Formula",
+        String::new(),
+        &[
+            (EVALUATE, ButtonRole::Accept),
+            (STEP_IN, ButtonRole::Accept),
+            (STEP_OUT, ButtonRole::Accept),
+            (RESTART, ButtonRole::Accept),
+            ("Close", ButtonRole::Cancel),
+        ],
+        DialogOwner::EvaluateFormula,
+    );
+    d.text = None;
+    d.controls = controls;
+    for b in &mut d.buttons {
+        b.enabled = match b.label.as_str() {
+            EVALUATE => view.underline.is_some(),
+            STEP_IN => view.step_in,
+            STEP_OUT => view.step_out,
+            _ => true,
+        };
+        b.default = b.label
+            == if view.underline.is_some() {
+                EVALUATE
+            } else {
+                RESTART
+            };
+    }
+    Some(d)
+}
+
+/// Formulas > Evaluate Formula on the active cell: its formula as it stands,
+/// with the part to calculate first underlined.
+pub(crate) fn open_evaluate(tab: &mut DocTab) -> Result<(), String> {
+    let v = sheet_view_of(tab)?;
+    let (s, (r, c)) = (v.active, v.sel);
+    v.audit.eval = Some(gridcore::evalsteps::Evaluation::new(
+        &v.pkg.workbook,
+        s,
+        r,
+        c,
+        v.engine.clock,
+    )?);
+    let d = evaluate_dialog(v).ok_or("nothing to evaluate")?;
+    tab.dialogs.push(d);
+    Ok(())
+}
+
+/// A press the Evaluate Formula dialog handles; `None` for Close.
+fn evaluate_click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>> {
+    let top = tab.dialogs.top()?;
+    let pressed = |label: &str| {
+        top.buttons
+            .iter()
+            .any(|b| b.label == label && b.enabled && b.label.eq_ignore_ascii_case(button.trim()))
+    };
+    let (evaluate, step_in, step_out, restart) = (
+        pressed(EVALUATE),
+        pressed(STEP_IN),
+        pressed(STEP_OUT),
+        pressed(RESTART),
+    );
+    if !(evaluate || step_in || step_out || restart) {
+        return None;
+    }
+    let v = match sheet_view_of(tab) {
+        Ok(v) => v,
+        Err(e) => return Some(Err(e)),
+    };
+    let Some(mut ev) = v.audit.eval.take() else {
+        return Some(Err("no evaluation is open".into()));
+    };
+    let wb = &v.pkg.workbook;
+    if evaluate {
+        ev.evaluate(wb);
+    } else if step_in {
+        ev.step_in(wb);
+    } else if step_out {
+        ev.step_out(wb);
+    } else {
+        ev.restart();
+    }
+    v.audit.eval = Some(ev);
+    let d = evaluate_dialog(v);
+    tab.dialogs.pop();
+    tab.dialogs.push(d?);
+    Some(Ok(()))
 }
 
 /// Ignore Error on the cell the dialog shows: it stays while another rule
@@ -985,6 +1160,7 @@ mod tests {
             [
                 "# Divide by Zero Error",
                 "error-help",
+                "show-steps",
                 "-",
                 "ignore-error",
                 "edit-in-formula-bar"
