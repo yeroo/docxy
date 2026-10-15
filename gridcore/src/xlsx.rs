@@ -2740,9 +2740,7 @@ fn parse_worksheet(
                 "conditionalFormatting" => {
                     let mut ranges = Vec::new();
                     for tok in p.attr("sqref").split_whitespace() {
-                        if let Some(r) = parse_range_name(tok)
-                            .or_else(|| parse_cell_name(tok).map(|(r, c)| (r, c, r, c)))
-                        {
+                        if let Some(r) = parse_sqref_token(tok) {
                             ranges.push(r);
                         }
                     }
@@ -2791,9 +2789,7 @@ fn parse_worksheet(
                 "dataValidation" => {
                     let mut ranges = Vec::new();
                     for tok in p.attr("sqref").split_whitespace() {
-                        if let Some(r) = parse_range_name(tok)
-                            .or_else(|| parse_cell_name(tok).map(|(r, c)| (r, c, r, c)))
-                        {
+                        if let Some(r) = parse_sqref_token(tok) {
                             ranges.push(r);
                         }
                     }
@@ -4875,14 +4871,15 @@ fn validation_spans(xml: &str) -> Option<(Span, Vec<Span>)> {
 }
 
 /// The ranges of an element's `sqref`, read as the loader reads them; `None`
-/// when a token doesn't read as a cell or range (a whole column, say), since
-/// writing the model's ranges back would lose it.
+/// when a token doesn't read as a cell, a range, whole columns or whole rows
+/// (a sheet-qualified one, say), since writing the model's ranges back would
+/// lose it.
 fn held_sqref(element: &str) -> Option<Vec<(u32, u32, u32, u32)>> {
     let tag = start_tag(element)?;
     let &(_, vs, ve) = tag.attrs.iter().find(|(name, _, _)| *name == "sqref")?;
     element[vs..ve]
         .split_whitespace()
-        .map(crate::sheet::parse_range_name)
+        .map(parse_sqref_token)
         .collect()
 }
 
@@ -22346,7 +22343,7 @@ mod rule_shift_tests {
 
     #[test]
     fn unparseable_sqref_token_element_left_alone() {
-        let cf = r#"<conditionalFormatting sqref="A:A B1:B2"><cfRule type="expression" priority="1"><formula>TRUE</formula></cfRule></conditionalFormatting>"#;
+        let cf = r#"<conditionalFormatting sqref="Other!A1 B1:B2"><cfRule type="expression" priority="1"><formula>TRUE</formula></cfRule></conditionalFormatting>"#;
         let mut pkg = one("S", cf);
         assert_eq!(
             pkg.workbook.sheets[0].cond_formats[0].ranges,
@@ -22361,6 +22358,82 @@ mod rule_shift_tests {
         assert_eq!(pkg.workbook.sheets[0].cf_removed, vec![0]);
         let (_, ws) = saved(&pkg, SHEET1);
         assert!(ws.contains(cf), "{ws}");
+    }
+
+    const COL_B: (u32, u32, u32, u32) = (0, 1, crate::sheet::MAX_ROWS - 1, 1);
+    const ROW_3: (u32, u32, u32, u32) = (2, 0, 2, crate::sheet::MAX_COLS - 1);
+    const SHEET_ALL: (u32, u32, u32, u32) =
+        (0, 0, crate::sheet::MAX_ROWS - 1, crate::sheet::MAX_COLS - 1);
+
+    #[test]
+    fn whole_column_row_and_sheet_conditional_formats_round_trip() {
+        let cf = |sqref: &str| {
+            format!(
+                r#"<conditionalFormatting sqref="{sqref}"><cfRule type="expression" priority="1"><formula>TRUE</formula></cfRule></conditionalFormatting>"#
+            )
+        };
+        for (sqref, rect) in [("B:B", COL_B), ("3:3", ROW_3), ("A:XFD", SHEET_ALL)] {
+            let pkg = one("S", &cf(sqref));
+            assert_eq!(
+                pkg.workbook.sheets[0].cond_formats[0].ranges,
+                vec![rect],
+                "{sqref}"
+            );
+            let (re, ws) = saved(&pkg, SHEET1);
+            assert_eq!(
+                re.workbook.sheets[0].cond_formats[0].ranges,
+                vec![rect],
+                "{sqref}"
+            );
+            assert!(ws.contains(&cf(sqref)), "{sqref} kept as it was: {ws}");
+        }
+        // A column inserted before it moves a whole-column rule and the new
+        // spelling reads back.
+        let mut pkg = one("S", &cf("B:B"));
+        insert_cols(&mut pkg.workbook, 0, 0, 1);
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(r#"sqref="C:C""#), "{ws}");
+        assert_eq!(
+            re.workbook.sheets[0].cond_formats[0].ranges,
+            vec![(0, 2, crate::sheet::MAX_ROWS - 1, 2)]
+        );
+    }
+
+    #[test]
+    fn whole_column_row_and_sheet_validations_round_trip() {
+        let dv = |sqref: &str| {
+            format!(
+                r#"<dataValidations count="1"><dataValidation type="list" sqref="{sqref}"><formula1>"a,b"</formula1></dataValidation></dataValidations>"#
+            )
+        };
+        for (sqref, rect) in [("B:B", COL_B), ("3:3", ROW_3), ("A:XFD", SHEET_ALL)] {
+            let pkg = one("S", &dv(sqref));
+            assert_eq!(
+                pkg.workbook.sheets[0].validations[0].ranges,
+                vec![rect],
+                "{sqref}"
+            );
+            let (re, _) = saved(&pkg, SHEET1);
+            assert_eq!(
+                re.workbook.sheets[0].validations[0].ranges,
+                vec![rect],
+                "{sqref}"
+            );
+        }
+        // A rule made in the app over a clicked column header is written
+        // and read back as the column.
+        let mut pkg = one("S", "");
+        pkg.workbook.sheets[0]
+            .validations
+            .push(crate::sheet::DataValidation {
+                ranges: vec![COL_B],
+                kind: "list".into(),
+                formula1: "\"a,b\"".into(),
+                ..Default::default()
+            });
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(r#"sqref="B:B""#), "{ws}");
+        assert_eq!(re.workbook.sheets[0].validations[0].ranges, vec![COL_B]);
     }
 
     #[test]

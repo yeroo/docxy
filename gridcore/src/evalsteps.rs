@@ -395,14 +395,27 @@ fn is_reference(e: &Expr) -> bool {
     )
 }
 
+/// Calls whose result is a reference, which the call round them may read.
+const RETURNING_REFERENCE: [&str; 3] = ["OFFSET", "INDIRECT", "INDEX"];
+
+fn returns_reference(e: &Expr) -> bool {
+    matches!(e, Expr::Func(name, _)
+        if RETURNING_REFERENCE.iter().any(|r| r.eq_ignore_ascii_case(name)))
+}
+
 /// Whether the call `e` leaves its child `i`, which is `c`, as a reference
 /// for it to read: see [`REFERENCING`] and [`REFERENCING_FIRST`]; the
 /// implicit-intersection `@` is one too.
 fn keeps_reference(e: &Expr, i: usize, c: &Expr) -> bool {
-    if !is_reference(c) {
+    // A call that returns a reference (OFFSET, INDIRECT, INDEX) is read as
+    // one, so the call round it is calculated whole.
+    if !(is_reference(c) || returns_reference(c)) {
         return false;
     }
-    let several = !matches!(c, Expr::Ref(_) | Expr::Name(_) | Expr::SpillRef(_));
+    let several = !matches!(
+        c,
+        Expr::Ref(_) | Expr::Name(_) | Expr::SpillRef(_) | Expr::Func(..)
+    );
     match e {
         Expr::Func(name, _) => {
             REFERENCING.iter().any(|r| r.eq_ignore_ascii_case(name))
@@ -510,6 +523,11 @@ fn next_in(e: &Expr, root: bool) -> Option<Vec<usize>> {
         // Its first argument first; when that is a value the call itself is
         // the step, which picks what to calculate.
         let first = child(e, 0)?;
+        // A bare 3D reference is no value: it is calculated (to #VALUE!, as
+        // in the cell) before the call chooses.
+        if matches!(first, Expr::Ref3D { .. }) {
+            return Some(vec![0]);
+        }
         return match next_in(first, false) {
             Some(mut p) => {
                 p.insert(0, 0);
@@ -1016,5 +1034,49 @@ mod tests {
         let (text, span) = formula::to_string_marked(&e, r);
         assert_eq!(text, "\"\u{E000}\"&A1");
         assert_eq!(&text[span.unwrap()], "A1");
+    }
+
+    #[test]
+    fn a_call_that_returns_a_reference_is_read_as_one_by_the_call_round_it() {
+        let mut cells: Vec<(String, Cell)> =
+            (1..=10).map(|r| (format!("A{r}"), num(r as f64))).collect();
+        cells.extend([
+            ("B1".into(), Cell::text("A1:A10")),
+            ("C1".into(), f("COUNTIF(OFFSET(A1,0,0,10,1),\">5\")")),
+            ("C2".into(), f("SUMIF(INDIRECT(\"A1:A10\"),\">5\")")),
+            ("C3".into(), f("ROW(INDIRECT(\"A5\"))")),
+            ("C4".into(), f("OFFSET(OFFSET(A1,1,0),1,0)")),
+            ("C7".into(), f("COUNTIF(INDIRECT(B1),\">5\")")),
+        ]);
+        let refs: Vec<(&str, Cell)> = cells.iter().map(|(n, c)| (n.as_str(), c.clone())).collect();
+        let w = wb(&refs);
+        for at in ["C1", "C2", "C3", "C4", "C7"] {
+            let held = held(&w, at);
+            assert!(
+                !matches!(held, Value::Err(_) | Value::Empty),
+                "{at}: {held:?}"
+            );
+            assert_eq!(ends_on(&w, at), held, "{at}");
+        }
+    }
+
+    #[test]
+    fn a_bare_3d_reference_in_a_lazy_call_is_calculated_before_it_chooses() {
+        let mut w = wb(&[
+            ("A1", num(1.0)),
+            ("B1", f("IF(Sheet1:Sheet2!A1,\"y\",\"n\")")),
+            ("B2", f("IFERROR(Sheet1:Sheet2!A1,0)")),
+        ]);
+        let mut two = Sheet {
+            name: "Sheet2".into(),
+            ..Sheet::default()
+        };
+        two.set_cell(0, 0, num(10.0));
+        w.sheets.push(two);
+        let mut eng = crate::engine::Engine::new(&w);
+        eng.recalc_all(&mut w);
+        for at in ["B1", "B2"] {
+            assert_eq!(ends_on(&w, at), held(&w, at), "{at}");
+        }
     }
 }
