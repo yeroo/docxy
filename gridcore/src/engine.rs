@@ -2577,7 +2577,11 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
     formula::collect_range_ops(ast, &mut spans);
     for leaves in spans {
         let mut ends = Vec::new();
-        for leaf in leaves {
+        // Only literal ends: a computed end (`INDEX(…)`, a name) has no
+        // cells of its own to box, and its arguments are not the span (they
+        // would box the formula's own cell into a false circle). Such a span
+        // is volatile, so it is recalculated whatever it names.
+        for leaf in leaves.into_iter().filter(|l| formula::is_literal_ref(l)) {
             collect_deps(wb, key, leaf, &mut ends, depth + 1);
         }
         let Some(&(s, ..)) = ends.first() else {
@@ -5848,6 +5852,37 @@ mod tests {
         assert_eq!(value_at(&wb, "C2"), CellValue::Number(1500.0));
         set(&mut eng, &mut wb, "A777", Cell::number(10.0));
         assert_eq!(value_at(&wb, "C1"), CellValue::Number(14.0));
+    }
+
+    #[test]
+    fn a_span_to_a_computed_end_is_no_false_circle() {
+        // #680 FIX r4: the arguments of `INDEX(Sales[Price],2)` are not a span
+        // end, so they do not box the Calc column between Qty and Price.
+        let mut wb = wb_one_sheet(&[
+            ("B1", Cell::text("Qty")),
+            ("C1", Cell::text("Calc")),
+            ("D1", Cell::text("Price")),
+            ("B2", Cell::number(1.0)),
+            ("D2", Cell::number(10.0)),
+            ("B3", Cell::number(2.0)),
+            ("D3", Cell::number(20.0)),
+            ("C2", Cell::formula("SUM(Sales[Qty]:INDEX(Sales[Price],2))")),
+            ("C3", Cell::formula("SUM(Sales[Qty]:INDEX(Sales[Price],2))")),
+        ]);
+        wb.tables.push(crate::sheet::Table {
+            name: "Sales".to_string(),
+            sheet: 0,
+            range: (0, 1, 2, 3),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["Qty".into(), "Calc".into(), "Price".into()],
+            part: String::new(),
+            column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
+        });
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(eng.circular_refs(), Vec::<Key>::new());
     }
 
     #[test]
