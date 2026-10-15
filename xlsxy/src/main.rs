@@ -6091,7 +6091,11 @@ impl App {
             return;
         }
         let (s, now) = (self.sheet, !self.formula_view());
-        self.structural(|wb| wb.sheets[s].show_formulas = now);
+        // A view edit: nothing is recalculated, no circles or cut dropped.
+        let _ = self.layout_edit(|wb| {
+            wb.sheets[s].show_formulas = now;
+            Ok(true)
+        });
         self.status = Some(
             if now {
                 "Showing formulas"
@@ -19562,6 +19566,37 @@ mod tests {
         assert!(!app.formula_view());
         app.undo();
         assert!(app.formula_view(), "undo restores the flag");
+        app.redo();
+        assert!(!app.formula_view(), "redo takes it off again");
+        app.undo();
+        assert!(app.formula_view());
+    }
+
+    /// #676: Show Formulas is a view edit: a manual workbook stays stale, a
+    /// pending cut stays a cut.
+    #[test]
+    fn show_formulas_recalculates_nothing_and_keeps_a_pending_cut() {
+        let mut pkg = new_xlsx();
+        pkg.workbook.calc.mode = gridcore::sheet::CalcMode::Manual;
+        let sh = &mut pkg.workbook.sheets[0];
+        sh.set_cell(0, 0, Cell::number(5.0));
+        let mut f = Cell::formula("A1*2");
+        f.value = CellValue::Number(1.0);
+        sh.set_cell(1, 0, f);
+        let pkg = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&pkg)).unwrap();
+        let mut app = App::new(pkg, "t.xlsx");
+        // The file opens fresh (#674): make B1 stale again.
+        let mut stale = Cell::formula("A1*2");
+        stale.value = CellValue::Number(1.0);
+        app.pkg.workbook.sheets[0].set_cell(1, 0, stale);
+        app.cur = (0, 0);
+        app.copy(true);
+        assert!(app.clip.as_ref().is_some_and(|c| c.cut));
+        app.toggle_formula_view();
+        assert!(app.formula_view());
+        assert!(app.clip.as_ref().is_some_and(|c| c.cut), "the cut survives");
+        let b1 = || app.sheet().cell(1, 0).map(|c| c.value.clone());
+        assert_eq!(b1(), Some(CellValue::Number(1.0)), "no recalculation");
     }
 
     /// #676: the old view-wide preference is neither written nor acted on.

@@ -1722,6 +1722,13 @@ fn fx_toggle_key(ctrl: bool, shift: bool, key: &str) -> bool {
     ctrl && shift && key.eq_ignore_ascii_case("u")
 }
 
+/// Is this Ctrl+` (#676), Show Formulas? On a Mac only Control: ⌘` is the
+/// system's Cycle Through Windows and must not edit the workbook. `control`
+/// is the Control key alone, `ctrl` Control or ⌘.
+fn show_formulas_key(control: bool, ctrl: bool, shift: bool, alt: bool, macos: bool) -> bool {
+    !shift && !alt && if macos { control } else { ctrl }
+}
+
 /// Is this Ctrl+1 (⌘1 on a Mac), which opens Format Cells (#1164)? Not with
 /// Shift, Excel's number-format row, nor with Alt: AltGr is Ctrl+Alt on
 /// Windows, and its `1` is a character.
@@ -18538,8 +18545,7 @@ impl Docxy {
     fn sheet_toggle_border(&mut self, cx: &mut Context<Self>) {
         self.sheet_toggle("Borders", |x| x.border, |x, on| x.border = on, cx);
     }
-    /// Freeze panes at the selected cell (toggles off if already frozen). Rows
-    /// above and columns left of the selection stay pinned while scrolling.
+
     /// Whether the active sheet shows its formulas (#676).
     fn sheet_shows_formulas(&self) -> bool {
         self.active_sheet().is_some_and(|v| v.sheet().show_formulas)
@@ -18567,6 +18573,8 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Freeze panes at the selected cell (toggles off if already frozen). Rows
+    /// above and columns left of the selection stay pinned while scrolling.
     fn sheet_freeze(&mut self, cx: &mut Context<Self>) {
         if let Some(v) = self.active_sheet_mut() {
             let (r, c) = v.sel;
@@ -20464,7 +20472,14 @@ impl Docxy {
                 "b" => return self.run_sheet_act(SheetAct::Bold, window, cx),
                 "i" => return self.run_sheet_act(SheetAct::Italic, window, cx),
                 // Show Formulas (#676), Formulas › Formula Auditing's own act.
-                "`" if !shift && !alt => {
+                "`" if show_formulas_key(
+                    ev.keystroke.modifiers.control,
+                    ctrl,
+                    shift,
+                    alt,
+                    text_input::MACOS,
+                ) =>
+                {
                     return self.run_sheet_act(SheetAct::ShowFormulas, window, cx);
                 }
                 // Format Cells (#1164), Home › Cells › Format's own act.
@@ -26442,6 +26457,32 @@ mod sheet_save_tests {
         );
         assert_eq!(super::shown_cell_text(false, &f, &xf, false, 200.0), "3");
         assert_eq!(super::shown_cell_text(true, &n, &xf, false, 200.0), "3");
+    }
+
+    #[test]
+    fn only_a_real_control_toggles_show_formulas_on_a_mac() {
+        // (control, ctrl = control or ⌘, shift, alt, macos)
+        assert!(
+            super::show_formulas_key(true, true, false, false, true),
+            "Ctrl+`"
+        );
+        assert!(
+            !super::show_formulas_key(false, true, false, false, true),
+            "⌘` on a Mac"
+        );
+        assert!(
+            super::show_formulas_key(false, true, false, false, false),
+            "Win key chord elsewhere"
+        );
+        assert!(super::show_formulas_key(true, true, false, false, false));
+        assert!(
+            !super::show_formulas_key(true, true, true, false, true),
+            "Ctrl+Shift+`"
+        );
+        assert!(
+            !super::show_formulas_key(true, true, false, true, true),
+            "Ctrl+Alt+`"
+        );
     }
 
     #[test]
@@ -32982,7 +33023,7 @@ impl Docxy {
         let enabled = !matches!(act, SheetAct::Help(a) if !help_tab::help_enabled(a));
         let ink = if enabled { pal.fg } else { pal.dim };
         // Show Formulas draws pressed while the sheet shows its formulas.
-        let pressed = matches!(act, SheetAct::ShowFormulas) && self.sheet_shows_formulas();
+        let pressed = matches!(act, SheetAct::ShowFormulas) && self.sheet_act_checked(act);
         div()
             .id(ElementId::Name(format!("srb-{label}").into()))
             .when(pressed, |d| {
@@ -33788,6 +33829,7 @@ impl Docxy {
             SheetAct::Filter => v.sheet().auto_filter.is_some(),
             SheetAct::Page(p) => sheet_page_setup::is_on(p, &v.pkg.workbook, v.active),
             SheetAct::Calc(c) => sheet_calc::is_on(c, &v.pkg.workbook),
+            SheetAct::ShowFormulas => v.sheet().show_formulas,
             _ => false,
         }
     }
