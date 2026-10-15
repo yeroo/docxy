@@ -3400,7 +3400,7 @@ pub fn table_refs_to_cells_in_expr(e: &Expr, t: &TableToRange, host: FormulaHost
             )
         }
     };
-    map_expr(e, &|x| match x {
+    let rewritten = map_expr(e, &|x| match x {
         Expr::Structured {
             table,
             item,
@@ -3429,6 +3429,27 @@ pub fn table_refs_to_cells_in_expr(e: &Expr, t: &TableToRange, host: FormulaHost
                 Some(r) => rect(r, true),
                 None => Expr::Err(ExcelError::Ref),
             })
+        }
+        _ => None,
+    });
+    span_ends_reparse(&rewritten)
+}
+
+/// `e` with a one-cell reference that starts a span written as the 1x1 range
+/// (`$B2:$B2:C5`): the printed text of `$B2:C5` over a cell and a name, call
+/// or other-sheet cell does not read back as the span it was.
+fn span_ends_reparse(e: &Expr) -> Expr {
+    map_expr(e, &|x| match x {
+        Expr::Bin(BinOp::Range, l, r) => {
+            let l = match span_ends_reparse(l) {
+                Expr::Ref(c) => Expr::Range(c.clone(), CellRef { sheet: None, ..c }),
+                other => other,
+            };
+            Some(Expr::Bin(
+                BinOp::Range,
+                Box::new(l),
+                Box::new(span_ends_reparse(r)),
+            ))
         }
         _ => None,
     })
@@ -4111,14 +4132,14 @@ pub fn is_literal_ref(e: &Expr) -> bool {
     }
 }
 
-/// The operands of every `a:b` between references in a formula, outermost
-/// first (the operands of a nested span included).
+/// The operands of every outermost `a:b` between references in a formula (not
+/// the spans nested in their operands).
 pub fn collect_range_ops<'a>(e: &'a Expr, out: &mut Vec<(&'a Expr, &'a Expr)>) {
     match e {
-        Expr::Bin(op, l, r) => {
-            if *op == BinOp::Range {
-                out.push((l, r));
-            }
+        // A chain `a:b:c` is one box: the caller walks the operands of each
+        // span it gets, so the spans inside them are found there.
+        Expr::Bin(BinOp::Range, l, r) => out.push((l, r)),
+        Expr::Bin(_, l, r) => {
             collect_range_ops(l, out);
             collect_range_ops(r, out);
         }
@@ -6292,9 +6313,13 @@ impl<'a> Eval<'a> {
             | Expr::SpillRef(_)
             | Expr::Structured { .. }
             | Expr::Bin(BinOp::Range | BinOp::Isect, ..) => {
-                matches!(self.eval_arg(e), Arg::Range(..))
+                self.sheets_known(e) && matches!(self.eval_arg(e), Arg::Range(..))
             }
-            Expr::Ref3D { .. } => self.resolve_3d(e).is_ok(),
+            Expr::Ref3D { .. } => {
+                let known = self.resolve_3d(e).is_ok();
+                self.unsupported |= !known;
+                known
+            }
             Expr::Name(n) => {
                 let bound = self
                     .lets
@@ -6348,6 +6373,29 @@ impl<'a> Eval<'a> {
                 false
             }
             _ => false,
+        }
+    }
+
+    /// Whether every sheet a reference form names is in the workbook. One
+    /// that is not (a missing sheet, an external book) is not decided here:
+    /// it marks the formula unsupported.
+    fn sheets_known(&mut self, e: &Expr) -> bool {
+        let sheet = match e {
+            Expr::Ref(r) | Expr::SpillRef(r) => &r.sheet,
+            Expr::Range(a, _) => &a.sheet,
+            Expr::ColRange { sheet, .. } | Expr::RowRange { sheet, .. } => sheet,
+            Expr::Bin(BinOp::Range | BinOp::Isect, l, r) => {
+                let (l, r) = (self.sheets_known(l), self.sheets_known(r));
+                return l && r;
+            }
+            _ => return true,
+        };
+        match self.resolve_sheet(sheet) {
+            Ok(_) => true,
+            Err(_) => {
+                self.unsupported = true;
+                false
+            }
         }
     }
 
@@ -15727,6 +15775,11 @@ mod tests {
             "ISREF(LET(c,B3,c))",
             "ISREF(Union)",
             "ISREF(Missing!A1)",
+            "ISREF(Missing!A1:B2)",
+            "ISREF(Missing!A:A)",
+            "ISREF(Sales[Qty]:Missing!A1)",
+            "AREAS(Missing!A:A)",
+            "ISREF(Missing:Other!A1)",
             "ISREF(INDIRECT(\"A1\",FALSE))",
         ] {
             assert!(eval_outside(src, &g).1, "{src} should be unsupported");
@@ -15773,6 +15826,37 @@ mod tests {
                 (Value::Num(a), Value::Num(b)) => assert!((a - b).abs() < 1e-9, "{text}: {a}"),
                 (a, b) => assert_eq!(a, b, "{text}"),
             }
+        }
+        // A one-cell end of a span stays a span after the rewrite.
+        let g2 = issue_680_grid().with_name("Rate", "Sheet1!$B$3");
+        for (src, same_sheet) in [
+            ("SUM(Sales[[#This Row],[Qty]]:Rate)", true),
+            ("SUM(Sales[[#This Row],[Qty]]:#REF!)", true),
+            ("SUM(Sales[[#This Row],[Qty]]:Other[Price])", true),
+            ("SUM(Sales[[#This Row],[Qty]]:INDEX(Sales[Price],2))", true),
+            (
+                "SUM(Sales[[#This Row],[Qty]]:Sales[[#This Row],[Price]])",
+                false,
+            ),
+            (
+                "SUM(Sales[[#This Row],[Qty]]:Sales[[#This Row],[Qty]])",
+                true,
+            ),
+        ] {
+            let host = FormulaHost {
+                same_sheet,
+                row: Some(1),
+                inside: false,
+            };
+            let ast = parse(src).unwrap();
+            let out = table_refs_to_cells_in_expr(&ast, &t, host);
+            let text = to_string(&out);
+            let back = parse(&text).unwrap_or_else(|e| panic!("{src} -> {text}: {e}"));
+            assert_eq!(to_string(&back), text, "{src}");
+            // Same cell, same answer (the other-sheet text names Sheet1).
+            let before = eval_680(src, &g2, (1, 5)).0;
+            let after = eval_680(&text.replace("Sheet1!", ""), &g2, (1, 5)).0;
+            assert_eq!(before, after, "{src} -> {text}");
         }
         // Deleting the table or a column leaves #REF! operands.
         let ast = parse("SUM(Sales[Qty]:Sales[Price] Sales[[#All],[Qty]])").unwrap();

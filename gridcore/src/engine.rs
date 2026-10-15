@@ -5807,6 +5807,28 @@ mod tests {
     }
 
     #[test]
+    fn a_long_span_chain_builds_its_dependencies_at_once() {
+        // #680 FIX r2: `A1:A2:…:A60` is one box, not 2^60 walks.
+        let chain = (1..=60)
+            .map(|i| format!("A{i}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("A30", Cell::number(2.0)),
+            ("A60", Cell::number(3.0)),
+            ("C1", Cell::formula(&format!("SUM({chain})"))),
+            ("C2", Cell::formula(&format!("SUM(({chain}) A30)"))),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(6.0));
+        assert_eq!(value_at(&wb, "C2"), CellValue::Number(2.0));
+        set(&mut eng, &mut wb, "A45", Cell::number(10.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(16.0));
+    }
+
+    #[test]
     fn position_functions_do_not_read_their_reference_arguments() {
         // #679 FIX r1 M2: ROW/COLUMN/ROWS/COLUMNS read where a reference is,
         // not its values, so a calculated column measuring its own table is
