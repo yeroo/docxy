@@ -290,9 +290,12 @@ fn protected_view_keeps_navigation_find_and_copy() {
     handle_key(&mut app, key(KeyCode::F(4), shift));
     assert!(app.sheet_picker.is_some(), "Shift+F4 lists the sheets");
     handle_key(&mut app, key(KeyCode::Esc, none));
-    let view = app.formula_view;
+    // Show Formulas is saved with the sheet (#676), so it is refused.
+    app.status = None;
     handle_key(&mut app, key(KeyCode::Char('`'), ctrl));
-    assert_ne!(app.formula_view, view, "Ctrl+` shows formulas");
+    assert!(!app.formula_view(), "Ctrl+` changes nothing");
+    assert!(!app.modified);
+    assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
     handle_key(&mut app, key(KeyCode::Char('u'), ctrl | shift));
     assert!(app.fx_expanded, "Ctrl+Shift+U expands the formula bar");
     // Ctrl+F9 is Calculate Now; Shift+F9 (#674) Calculate Sheet.

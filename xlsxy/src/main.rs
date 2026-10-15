@@ -2486,7 +2486,6 @@ struct App {
     /// read it with, until a save writes it as `text_type` (#761).
     text_read: Option<(TextParse, Origin)>,
     // View preferences (persisted to a config file).
-    formula_view: bool,
     light_theme: bool,
     auto_hide_ribbon: bool,
     /// Reveal rows/columns hidden by a filter or manual hide (off = Excel view).
@@ -2673,7 +2672,6 @@ impl App {
             data_form: None,
             text_type: None,
             text_read: None,
-            formula_view: false,
             light_theme: false,
             auto_hide_ribbon: false,
             show_hidden: false,
@@ -5723,7 +5721,7 @@ impl App {
         if self.show_comments {
             v.push(ribbon::Act::ToggleComments);
         }
-        if self.formula_view {
+        if self.formula_view() {
             v.push(ribbon::Act::FormulaView);
         }
         if self.freeze() != (0, 0) {
@@ -6081,10 +6079,21 @@ impl App {
         }
     }
 
+    /// Show Formulas for the current sheet (`<sheetView showFormulas>`).
+    fn formula_view(&self) -> bool {
+        self.sheet().show_formulas
+    }
+
+    /// Ctrl+`: flip Show Formulas on the current sheet only. It is saved with
+    /// the file, so it is an undoable edit and Protected View refuses it.
     fn toggle_formula_view(&mut self) {
-        self.formula_view = !self.formula_view;
+        if self.refuse_protected().is_err() {
+            return;
+        }
+        let (s, now) = (self.sheet, !self.formula_view());
+        self.structural(|wb| wb.sheets[s].show_formulas = now);
         self.status = Some(
-            if self.formula_view {
+            if now {
                 "Showing formulas"
             } else {
                 "Showing values"
@@ -6682,7 +6691,6 @@ impl App {
             if let Some((k, v)) = line.split_once('=') {
                 let on = v.trim() == "1";
                 match k.trim() {
-                    "formula_view" => self.formula_view = on,
                     "light_theme" => self.light_theme = on,
                     "auto_hide_ribbon" => self.auto_hide_ribbon = on,
                     "show_comments" => self.show_comments = on,
@@ -6708,11 +6716,8 @@ impl App {
     fn view_prefs_text(&self) -> String {
         let auto = self.auto_convert;
         let mut text = format!(
-            "formula_view={}\nlight_theme={}\nauto_hide_ribbon={}\nshow_comments={}\n",
-            self.formula_view as u8,
-            self.light_theme as u8,
-            self.auto_hide_ribbon as u8,
-            self.show_comments as u8,
+            "light_theme={}\nauto_hide_ribbon={}\nshow_comments={}\n",
+            self.light_theme as u8, self.auto_hide_ribbon as u8, self.show_comments as u8,
         );
         let switches = [
             auto.remove_leading_zeros,
@@ -10622,7 +10627,7 @@ fn draw_screen(app: &mut App, f: &mut Frame) {
         .map(|c| (c.row, c.col))
         .collect();
     let base = app.base_style();
-    let formula_view = app.formula_view;
+    let formula_view = app.formula_view();
     let vis_rows = app.vis_rows.clone();
     let vis_subline = app.vis_subline.clone();
     let sheet = app.sheet();
@@ -19525,12 +19530,56 @@ mod tests {
         assert_eq!(app.cur, (0, 0)); // viewport reset
     }
 
+    /// #676: Show Formulas belongs to the sheet: Ctrl+` flips the current
+    /// one only, switching sheets keeps each one's setting, the toggle is an
+    /// undoable edit, and it survives a save.
+    #[test]
+    fn show_formulas_is_per_sheet_and_saved() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.add_sheet("Two");
+        app.goto_sheet(1);
+        app.modified = false;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('`'), KeyModifiers::CONTROL),
+        );
+        assert!(app.formula_view() && app.modified);
+        assert_eq!(app.status.as_deref(), Some("Showing formulas"));
+        assert!(app.ribbon_toggles().contains(&ribbon::Act::FormulaView));
+        app.goto_sheet(0);
+        assert!(!app.formula_view(), "the first sheet shows values");
+        assert!(!app.ribbon_toggles().contains(&ribbon::Act::FormulaView));
+        app.goto_sheet(1);
+        let re = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&app.pkg)).unwrap();
+        assert!(!re.workbook.sheets[0].show_formulas);
+        assert!(re.workbook.sheets[1].show_formulas);
+        // A file that says showFormulas opens showing them.
+        let mut again = App::new(re, "t.xlsx");
+        again.goto_sheet(1);
+        assert!(again.formula_view());
+        // Off again, then undo and redo bring it back.
+        app.toggle_formula_view();
+        assert!(!app.formula_view());
+        app.undo();
+        assert!(app.formula_view(), "undo restores the flag");
+    }
+
+    /// #676: the old view-wide preference is neither written nor acted on.
+    #[test]
+    fn old_formula_view_pref_is_ignored() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.apply_view_prefs("formula_view=1\nlight_theme=1\n");
+        assert!(!app.formula_view(), "no sheet shows formulas");
+        assert!(app.light_theme, "other prefs still apply");
+        assert!(!app.view_prefs_text().contains("formula_view"));
+    }
+
     #[test]
     fn view_toggles_and_ribbon_state() {
         let mut app = App::new(new_xlsx(), "t.xlsx");
-        assert!(!app.formula_view);
+        assert!(!app.formula_view());
         app.toggle_formula_view();
-        assert!(app.formula_view);
+        assert!(app.formula_view());
         app.cur = (3, 2);
         app.toggle_freeze();
         assert_eq!(app.freeze(), (3, 2));
