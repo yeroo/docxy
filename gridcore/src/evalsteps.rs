@@ -407,14 +407,15 @@ fn returns_reference(e: &Expr) -> bool {
 /// for it to read: see [`REFERENCING`] and [`REFERENCING_FIRST`]; the
 /// implicit-intersection `@` is one too.
 fn keeps_reference(e: &Expr, i: usize, c: &Expr) -> bool {
-    // A call that returns a reference (OFFSET, INDIRECT, INDEX) is read as
-    // one, so the call round it is calculated whole.
-    if !(is_reference(c) || returns_reference(c)) {
+    // A call that returns a reference (OFFSET, INDIRECT, INDEX, or a LET or
+    // lambda call that may) is read as one, so the call round it is
+    // calculated whole.
+    if !(is_reference(c) || returns_reference(c) || atomic(c)) {
         return false;
     }
     let several = !matches!(
         c,
-        Expr::Ref(_) | Expr::Name(_) | Expr::SpillRef(_) | Expr::Func(..)
+        Expr::Ref(_) | Expr::Name(_) | Expr::SpillRef(_) | Expr::Func(..) | Expr::Call(..)
     );
     match e {
         Expr::Func(name, _) => {
@@ -1077,6 +1078,26 @@ mod tests {
         eng.recalc_all(&mut w);
         for at in ["B1", "B2"] {
             assert_eq!(ends_on(&w, at), held(&w, at), "{at}");
+        }
+    }
+
+    #[test]
+    fn a_let_in_a_reference_position_is_read_as_one_by_the_call_round_it() {
+        let mut cells: Vec<(String, Cell)> =
+            (1..=10).map(|r| (format!("A{r}"), num(r as f64))).collect();
+        cells.extend([
+            ("C1".into(), f("COUNTIF(LET(r,A1:A10,r),\">5\")")),
+            ("C2".into(), f("SUMIF(LET(r,A1:A10,r),\">5\")")),
+        ]);
+        let refs: Vec<(&str, Cell)> = cells.iter().map(|(n, c)| (n.as_str(), c.clone())).collect();
+        let w = wb(&refs);
+        for at in ["C1", "C2"] {
+            let held = held(&w, at);
+            assert!(
+                !matches!(held, Value::Err(_) | Value::Empty),
+                "{at}: {held:?}"
+            );
+            assert_eq!(ends_on(&w, at), held, "{at}");
         }
     }
 }
