@@ -2385,7 +2385,7 @@
   },
   {
     "name": "xlsxy_calc_set",
-    "description": "Change calculation settings (Formulas > Calculation Options, File > Options > Formulas); every key is optional and everything given is checked before any is set. In manual mode an edit evaluates only the formulas typed; dependents and volatiles stay stale until xlsxy_recalc. precisionAsDisplayed:true rounds every constant to its displayed number format (General, dates and text untouched; one undo step) and is refused without acceptLoss:true (\"Data will permanently lose accuracy.\"). Returns the new settings.",
+    "description": "Change calculation settings (Formulas > Calculation Options, File > Options > Formulas); every key is optional and everything given is checked before any is set. In manual mode an edit evaluates only the formulas typed; dependents and volatiles stay stale until xlsxy_recalc. precisionAsDisplayed:true rounds every constant to its displayed number format (General, dates and text untouched; one undo step) and is its own undo step, so send it with only acceptLoss (it is refused with any other key), and is refused without acceptLoss:true (\"Data will permanently lose accuracy.\"). Returns the new settings.",
     "inputSchema": {
       "type": "object",
       "properties": {

@@ -142,6 +142,10 @@ pub struct CalcPatch {
     pub threads: Option<Option<u32>>,
     pub concurrent: Option<bool>,
     pub transition_eval: Option<bool>,
+    /// Put Set precision as displayed back on without converting anything: the
+    /// undo of switching it off, the data being rounded already. Internal to
+    /// the hosts' undo; the flag goes on, the results are calculated again.
+    pub restore_precision: bool,
 }
 
 impl CalcPatch {
@@ -209,30 +213,16 @@ pub fn recalc_or_mark_stale(wb: &mut Workbook, eng: &mut Engine) {
 /// limits or turning precision off are not undo steps, as in Excel.
 pub fn apply_settings(wb: &mut Workbook, eng: &mut Engine, p: &CalcPatch) {
     let now = info(wb, eng);
+    let mut iteration_changed = false;
     if p.iterate.is_some() || p.max_iterations.is_some() || p.max_change.is_some() {
         wb.set_iteration(
             p.iterate.unwrap_or(now.iterate),
             p.max_iterations.unwrap_or(now.max_iterations),
             p.max_change.unwrap_or(now.max_change),
         );
-        // Circles are iterated, or errors, from the next calculation on; in
-        // manual mode, from the next Calculate, which the circle's members
-        // wait for as stale formulas. (The mode changes last, so a
-        // Manual -> Automatic call in the same patch calculates them.)
-        let now_iter = info(wb, eng);
-        if (
-            now_iter.iterate,
-            now_iter.max_iterations,
-            now_iter.max_change,
-        ) != (now.iterate, now.max_iterations, now.max_change)
-        {
-            if wb.calc.mode == CalcMode::Manual {
-                let members: Vec<_> = eng.circular_keys().collect();
-                eng.mark_stale(members);
-            } else {
-                eng.recalc_all(wb);
-            }
-        }
+        let then = info(wb, eng);
+        iteration_changed = (then.iterate, then.max_iterations, then.max_change)
+            != (now.iterate, now.max_iterations, now.max_change);
     }
     if let Some(t) = p.threads {
         wb.calc.num_threads = t;
@@ -243,13 +233,29 @@ pub fn apply_settings(wb: &mut Workbook, eng: &mut Engine, p: &CalcPatch) {
     if let Some(t) = p.transition_eval {
         wb.calc.set_transition_eval(t);
     }
-    if p.precision_as_displayed == Some(false) && wb.calc.precision_as_displayed {
+    let precision_off = p.precision_as_displayed == Some(false);
+    let mut rounded_results = precision_off && wb.calc.precision_as_displayed;
+    if precision_off {
         wb.calc.set_precision_as_displayed(false);
-        // Results stored rounded are recalculated at full precision; in
-        // manual mode they wait for the next Calculate.
-        recalc_or_mark_stale(wb, eng);
-    } else if p.precision_as_displayed == Some(false) {
-        wb.calc.set_precision_as_displayed(false);
+    }
+    if p.restore_precision && !wb.calc.precision_as_displayed {
+        wb.calc.set_precision_as_displayed(true);
+        rounded_results = true;
+    }
+    // What was calculated under other settings is calculated again, once:
+    // the results stored rounded at full precision, the circles under the new
+    // limits. In manual mode they wait for the next Calculate as stale
+    // formulas. (The mode changes last, so a Manual -> Automatic call in the
+    // same patch calculates them.)
+    if wb.calc.mode == CalcMode::Manual {
+        if rounded_results {
+            eng.mark_all_stale();
+        } else if iteration_changed {
+            let members: Vec<_> = eng.circular_keys().collect();
+            eng.mark_stale(members);
+        }
+    } else if rounded_results || iteration_changed {
+        eng.recalc_all(wb);
     }
     if let Some(m) = p.mode {
         set_mode(wb, eng, m);

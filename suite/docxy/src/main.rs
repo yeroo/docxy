@@ -4208,11 +4208,7 @@ impl SheetView {
         let was_stale = snap.stale || self.engine.is_stale() || settings_differ;
         self.rebuild_engine();
         if was_stale {
-            if self.pkg.workbook.calc.mode == gridcore::sheet::CalcMode::Manual {
-                self.engine.mark_all_stale();
-            } else {
-                self.engine.recalc_all(&mut self.pkg.workbook);
-            }
+            gridcore::calc::recalc_or_mark_stale(&mut self.pkg.workbook, &mut self.engine);
         }
         self.active = snap
             .active

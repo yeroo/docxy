@@ -262,7 +262,7 @@ const EDITORS: EditorSpec[] = [
         // any other key, so the step is the whole call). Any other change is
         // not on the wasm undo stack (undoSteps:0) but carries an `inverse`
         // (the same verb restoring the previous values; turning precision off
-        // is undone by the internal `restorePrecision`), so it dirties the
+        // is undone by the internal `wb.calc.restore-precision`, kept out of wasmVerbs), so it dirties the
         // document and undoes like bucket B; a call that changes nothing
         // carries none.
         'wb.calc.set',

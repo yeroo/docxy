@@ -1241,6 +1241,11 @@ impl Session {
             }
             "wb.calc" => Ok(self.ctl_calc_info(None)),
             "wb.calc.set" => self.ctl_calc_set(args),
+            // INTERNAL-ONLY: the inverse of a wb.calc.set that switched Set
+            // precision as displayed off, driven by the host like
+            // `sheet.restore-removed` and left out of `wasmVerbs`, so an
+            // external agent gets "unknown verb 'wb.calc.restore-precision'".
+            "wb.calc.restore-precision" => self.ctl_calc_set_with(args, true),
             "wb.recalc" => {
                 // Mirrors xlsxy's `App::recalc_and_refresh`: Calculate Now,
                 // then each supported pivot is recomputed from its (possibly
@@ -1553,6 +1558,14 @@ impl Session {
     /// undoable change (`undoSteps:1`, a snapshot step that also puts the
     /// switch back).
     fn ctl_calc_set(&mut self, args: &json::Json) -> Result<String, String> {
+        self.ctl_calc_set_with(args, false)
+    }
+
+    /// [`Self::ctl_calc_set`]; with `restore` (the internal
+    /// `wb.calc.restore-precision`, the inverse of a call that switched
+    /// precision off) it also puts Set precision as displayed back on without
+    /// converting, and only when it is off.
+    fn ctl_calc_set_with(&mut self, args: &json::Json, restore: bool) -> Result<String, String> {
         let json::Json::Obj(fields) = args else {
             return Err("wb.calc.set takes an object".into());
         };
@@ -1565,7 +1578,6 @@ impl Session {
             _ => Err(format!("'{k}' is a whole number")),
         };
         let mut p = gridcore::calc::CalcPatch::default();
-        let mut restore_precision = false;
         for (k, v) in fields {
             match k.as_str() {
                 "mode" => {
@@ -1603,22 +1615,20 @@ impl Session {
                 }
                 "concurrent" => p.concurrent = Some(flag(k, v)?),
                 "transitionEvaluation" => p.transition_eval = Some(flag(k, v)?),
-                // INTERNAL (the inverse of turning precision off): puts the
-                // flag back without converting; the data it rounded is
-                // already rounded. Not in the MCP schema.
-                "restorePrecision" => restore_precision = flag(k, v)?,
                 "target" => {}
                 other => return Err(format!("unknown wb.calc.set key '{other}'")),
             }
+        }
+        if restore {
+            if self.pkg.workbook.calc.precision_as_displayed {
+                return Err("Set precision as displayed is already on".into());
+            }
+            p.restore_precision = true;
         }
         gridcore::calc::check_patch(&self.pkg.workbook, &p)?;
         let converts = p.converts(&self.pkg.workbook);
         let before = gridcore::calc::info(&self.pkg.workbook, &self.engine);
         gridcore::calc::apply_settings(&mut self.pkg.workbook, &mut self.engine, &p);
-        if restore_precision && !self.pkg.workbook.calc.precision_as_displayed {
-            self.pkg.workbook.calc.set_precision_as_displayed(true);
-            gridcore::calc::recalc_or_mark_stale(&mut self.pkg.workbook, &mut self.engine);
-        }
         let mut steps = 0;
         if converts {
             let was = {
@@ -1669,9 +1679,8 @@ impl Session {
             }
             args.push_str(&format!("\"{k}\":{v}"));
         };
-        if before.precision_as_displayed && !after.precision_as_displayed {
-            put(&mut args, "restorePrecision", "true".into());
-        } else if !before.precision_as_displayed && after.precision_as_displayed {
+        let restore = before.precision_as_displayed && !after.precision_as_displayed;
+        if !before.precision_as_displayed && after.precision_as_displayed {
             put(&mut args, "precisionAsDisplayed", "false".into());
         }
         if before.mode != after.mode {
@@ -1710,7 +1719,12 @@ impl Session {
                 before.transition_eval.to_string(),
             );
         }
-        format!("{{\"verb\":\"wb.calc.set\",\"args\":{{{args}}}}}")
+        let verb = if restore {
+            "wb.calc.restore-precision"
+        } else {
+            "wb.calc.set"
+        };
+        format!("{{\"verb\":\"{verb}\",\"args\":{{{args}}}}}")
     }
 
     /// `{}` -> `{sheets, active, modified}` (the host composes this with its
@@ -6759,7 +6773,9 @@ mod tests {
         assert!(!s.pkg.workbook.calc.precision_as_displayed);
         assert!(off.contains("\"undoSteps\":0"), "{off}");
         // Undo: the flag is back, and the data was already rounded.
-        let back = s.ctl(&calc_inverse_request(&off));
+        let request = calc_inverse_request(&off);
+        assert!(request.contains("wb.calc.restore-precision"), "{request}");
+        let back = s.ctl(&request);
         assert!(s.pkg.workbook.calc.precision_as_displayed, "{back}");
         assert_eq!(
             s.pkg.workbook.sheets[0].cell(0, 2).unwrap().value,
@@ -6779,5 +6795,20 @@ mod tests {
         assert!(out.contains("send it alone"), "{out}");
         assert!(!s.pkg.workbook.calc.precision_as_displayed);
         assert_eq!(s.pkg.workbook.calc.mode, gridcore::sheet::CalcMode::Auto);
+    }
+
+    #[test]
+    fn restoring_precision_is_internal_and_only_when_it_is_off() {
+        let mut s = calc_book();
+        let out = s.ctl(r#"{"verb":"wb.calc.set","args":{"restorePrecision":true}}"#);
+        assert!(out.contains("unknown wb.calc.set key"), "{out}");
+        // Precision is on: the internal verb refuses.
+        s.ctl(r#"{"verb":"wb.calc.set","args":{"precisionAsDisplayed":true,"acceptLoss":true}}"#);
+        let out = s.ctl(r#"{"verb":"wb.calc.restore-precision","args":{}}"#);
+        assert!(out.contains("already on"), "{out}");
+        // Off: it works.
+        s.ctl(r#"{"verb":"wb.calc.set","args":{"precisionAsDisplayed":false}}"#);
+        s.ctl(r#"{"verb":"wb.calc.restore-precision","args":{}}"#);
+        assert!(s.pkg.workbook.calc.precision_as_displayed);
     }
 }

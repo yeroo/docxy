@@ -290,3 +290,22 @@ fn going_automatic_in_the_same_call_calculates_the_circle() {
         "iterated to its fixed point"
     );
 }
+
+#[test]
+fn one_patch_calculates_once() {
+    // Precision off and a new iteration limit in one patch: one recalculation
+    // (50 passes of A1 = A1+1), not one for each.
+    let mut wb = book(&["Sheet1"]);
+    wb.set_iteration(true, 100, 1e-9);
+    wb.calc.set_precision_as_displayed(true);
+    let mut eng = Engine::new(&wb);
+    put(&mut eng, &mut wb, 0, "A1", Cell::formula("A1+1"));
+    let before = num(&wb, 0, "A1");
+    let p = gridcore::calc::CalcPatch {
+        precision_as_displayed: Some(false),
+        max_iterations: Some(50),
+        ..Default::default()
+    };
+    gridcore::calc::apply_settings(&mut wb, &mut eng, &p);
+    assert_eq!(num(&wb, 0, "A1") - before, 50.0);
+}

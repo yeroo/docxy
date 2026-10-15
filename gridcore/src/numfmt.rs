@@ -628,6 +628,12 @@ impl NumFormat {
             back /= 100.0;
         }
         let back = to_sig15(back);
+        // Scaling a huge value up (1E300 to ten decimals) overflows, as does
+        // a format with more decimals than a float has range for: there is
+        // nothing to store, and the cell keeps its value.
+        if !shown.is_finite() || !back.is_finite() {
+            return None;
+        }
         Some(if v < 0.0 { -back } else { back })
     }
 
@@ -1277,11 +1283,23 @@ mod tests {
     fn round_to_display_stores_what_the_format_shows() {
         for code in ["0.00,", "0.0,,", "0.00%,", "0.00%", "#,##0.0"] {
             let f = parse_format(code).unwrap();
-            for v in [285.0, 565.0, 575.0, 1005.0, 1015.0, 2.85, 0.285, 12345.675] {
+            for v in [
+                285.0,
+                565.0,
+                575.0,
+                1005.0,
+                1015.0,
+                2.85,
+                0.285,
+                12345.675,
+                285_000.0,
+                565_000.0,
+                1_005_000.0,
+            ] {
                 for v in [v, -v] {
                     let stored = f.round_to_display(v).expect(code);
                     // A negative that shows as -0.00 stores 0, which has no sign.
-                    if stored == 0.0 {
+                    if v < 0.0 && stored == 0.0 {
                         continue;
                     }
                     assert_eq!(
@@ -1291,6 +1309,20 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn round_to_display_has_nothing_to_store_when_scaling_overflows() {
+        let f = parse_format("0.0000000000").unwrap();
+        assert_eq!(f.round_to_display(1e300), None);
+        let f = parse_format("0.00%").unwrap();
+        assert_eq!(f.round_to_display(1e306), None);
+        assert_eq!(f.round_to_display(0.5), Some(0.5));
+        // More decimals than a float has range for.
+        let many = format!("0.{}", "0".repeat(400));
+        if let Some(f) = parse_format(&many) {
+            assert_eq!(f.round_to_display(1.5), None);
         }
     }
 
