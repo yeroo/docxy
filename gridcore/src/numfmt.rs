@@ -612,20 +612,22 @@ impl NumFormat {
         {
             return None;
         }
-        // The same scaling and rounding `render_number` applies.
-        let mut scale = 1.0;
-        if sect.has_percent {
-            scale *= 100.0;
-        }
+        // What `render_number` prints: scaled, rounded to the decimals, then
+        // to 15 significant digits.
+        let shown = to_sig15(round_decimals(
+            scale_for_display(sect, v.abs()),
+            sect.dec_digits,
+        ));
+        // Taking the scale back out must not manufacture noise the display
+        // would not show (0.07 / 100 * 100 and the like).
+        let mut back = shown;
         for _ in 0..sect.scale_commas {
-            scale /= 1000.0;
+            back *= 1000.0;
         }
-        // What `render_number` prints: rounded to the decimals, then to 15
-        // significant digits.
-        let shown = to_sig15(round_decimals(v.abs() * scale, sect.dec_digits));
-        // Dividing the scale back out must not manufacture noise the
-        // display would not show (0.07 / 100 * 100 and the like).
-        let back = to_sig15(shown / scale);
+        if sect.has_percent {
+            back /= 100.0;
+        }
+        let back = to_sig15(back);
         Some(if v < 0.0 { -back } else { back })
     }
 
@@ -886,7 +888,9 @@ fn to_sig15(x: f64) -> f64 {
     format!("{x:.14e}").parse().unwrap_or(x)
 }
 
-fn render_number(sect: &Section, x: f64, explicit_sign: bool) -> String {
+/// `x` scaled as the section displays it: a percent sign multiplies by 100,
+/// then each trailing comma divides by 1000.
+fn scale_for_display(sect: &Section, x: f64) -> f64 {
     let mut v = x;
     if sect.has_percent {
         v *= 100.0;
@@ -894,6 +898,11 @@ fn render_number(sect: &Section, x: f64, explicit_sign: bool) -> String {
     for _ in 0..sect.scale_commas {
         v /= 1000.0;
     }
+    v
+}
+
+fn render_number(sect: &Section, x: f64, explicit_sign: bool) -> String {
+    let mut v = scale_for_display(sect, x);
 
     // Scientific: v = mantissa * 10^exp with int_digits mantissa digits.
     let mut exp_val: i32 = 0;
@@ -1262,6 +1271,27 @@ mod tests {
             .unwrap_or_else(|| panic!("parse {code}"))
             .format_number(v, false)
             .unwrap_or_else(|| panic!("render {code}"))
+    }
+
+    #[test]
+    fn round_to_display_stores_what_the_format_shows() {
+        for code in ["0.00,", "0.0,,", "0.00%,", "0.00%", "#,##0.0"] {
+            let f = parse_format(code).unwrap();
+            for v in [285.0, 565.0, 575.0, 1005.0, 1015.0, 2.85, 0.285, 12345.675] {
+                for v in [v, -v] {
+                    let stored = f.round_to_display(v).expect(code);
+                    // A negative that shows as -0.00 stores 0, which has no sign.
+                    if stored == 0.0 {
+                        continue;
+                    }
+                    assert_eq!(
+                        fmt(code, stored),
+                        fmt(code, v),
+                        "{code} on {v} stored {stored}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

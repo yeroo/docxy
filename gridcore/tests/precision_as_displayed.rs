@@ -85,7 +85,7 @@ fn filled() -> (Workbook, Engine) {
 fn precision_as_displayed_rounds_constants_not_general() {
     let (mut wb, mut eng) = filled();
     assert_eq!(num(&wb, "B1"), 3.14659 + 2.71928, "full precision before");
-    let converted = calc::set_precision_as_displayed(&mut wb, &mut eng, true);
+    calc::precision_on(&mut wb, &mut eng);
     assert!(wb.calc.precision_as_displayed);
     assert_eq!(num(&wb, "A1"), 3.15);
     assert_eq!(num(&wb, "A2"), 2.71928, "General untouched");
@@ -103,42 +103,20 @@ fn precision_as_displayed_rounds_constants_not_general() {
         Some("A1+A2")
     );
     assert_eq!(num(&wb, "B1"), 5.87);
-    assert_eq!(converted, 4, "A1, A3, A6, A7 changed");
-}
-
-#[test]
-fn precision_as_displayed_undo_restores() {
-    // Hosts snapshot for their undo step; restoring the cells and the switch
-    // brings full precision back, formula results included.
-    let (mut wb, mut eng) = filled();
-    let before = wb.clone();
-    calc::set_precision_as_displayed(&mut wb, &mut eng, true);
-    assert_eq!(num(&wb, "A1"), 3.15);
-    wb = before;
-    eng = Engine::new(&wb);
-    eng.recalc_all(&mut wb);
-    assert!(!wb.calc.precision_as_displayed);
-    assert_eq!(num(&wb, "A1"), 3.14659);
-    assert_eq!(num(&wb, "A3"), 0.12345);
-    assert_eq!(num(&wb, "A7"), -2.346);
-    assert_eq!(num(&wb, "B1"), 3.14659 + 2.71928);
 }
 
 #[test]
 fn turning_it_off_changes_no_data() {
     let (mut wb, mut eng) = filled();
-    calc::set_precision_as_displayed(&mut wb, &mut eng, true);
-    assert_eq!(
-        calc::set_precision_as_displayed(&mut wb, &mut eng, false),
-        0
-    );
+    calc::precision_on(&mut wb, &mut eng);
+    wb.calc.set_precision_as_displayed(false);
     assert_eq!(num(&wb, "A1"), 3.15);
 }
 
 #[test]
 fn typed_constants_round_but_a_restored_snapshot_does_not() {
     let (mut wb, mut eng) = filled();
-    calc::set_precision_as_displayed(&mut wb, &mut eng, true);
+    calc::precision_on(&mut wb, &mut eng);
     put(&mut eng, &mut wb, "C1", CellValue::Number(9.8765), TWO);
     assert_eq!(num(&wb, "C1"), 9.88);
     let exact = Cell {

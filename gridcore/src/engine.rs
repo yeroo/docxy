@@ -1124,6 +1124,16 @@ impl Engine {
         }
     }
 
+    /// These formulas are out of date (manual mode); cells that are not
+    /// supported formulas are ignored.
+    pub fn mark_stale(&mut self, keys: impl IntoIterator<Item = Key>) {
+        for k in keys {
+            if self.formulas.contains_key(&k) && !self.unsupported.contains(&k) {
+                self.stale.insert(k);
+            }
+        }
+    }
+
     /// Every formula is out of date: the cells came from a state whose
     /// values were not calculated (an undo to a manual-mode snapshot).
     pub fn mark_all_stale(&mut self) {

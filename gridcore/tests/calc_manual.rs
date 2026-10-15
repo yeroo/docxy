@@ -241,3 +241,52 @@ fn iterate_one_pass_per_calculate_in_manual() {
     );
     assert_eq!(eng.circular_refs(), vec![key(0, "D1")], "still circular");
 }
+
+/// D1 = D1/2+5 with iteration off: a circle, in manual mode.
+fn manual_circle() -> (Workbook, Engine) {
+    let mut wb = book(&["Sheet1"]);
+    let mut eng = Engine::new(&wb);
+    put(&mut eng, &mut wb, 0, "D1", Cell::formula("D1/2+5"));
+    assert_eq!(eng.circular_refs(), vec![key(0, "D1")]);
+    wb.calc.mode = CalcMode::Manual;
+    (wb, eng)
+}
+
+#[test]
+fn an_iteration_change_in_manual_mode_waits_for_calculate() {
+    let (mut wb, mut eng) = manual_circle();
+    let on = gridcore::calc::CalcPatch {
+        iterate: Some(true),
+        max_iterations: Some(100),
+        max_change: Some(1e-9),
+        ..Default::default()
+    };
+    gridcore::calc::apply_settings(&mut wb, &mut eng, &on);
+    assert!(eng.is_stale(), "the circle's member waits for a Calculate");
+    assert_eq!(wb.iterate.map(|i| i.0), Some(100));
+    eng.recalc_sheet(&mut wb, 0);
+    assert!(!eng.is_stale());
+    assert_eq!(num(&wb, 0, "D1"), 5.0, "one pass");
+
+    // The same settings again change nothing and leave nothing stale.
+    gridcore::calc::apply_settings(&mut wb, &mut eng, &on);
+    assert!(!eng.is_stale());
+}
+
+#[test]
+fn going_automatic_in_the_same_call_calculates_the_circle() {
+    let (mut wb, mut eng) = manual_circle();
+    let p = gridcore::calc::CalcPatch {
+        mode: Some(CalcMode::Auto),
+        iterate: Some(true),
+        max_iterations: Some(100),
+        max_change: Some(1e-9),
+        ..Default::default()
+    };
+    gridcore::calc::apply_settings(&mut wb, &mut eng, &p);
+    assert!(!eng.is_stale());
+    assert!(
+        (num(&wb, 0, "D1") - 10.0).abs() < 1e-6,
+        "iterated to its fixed point"
+    );
+}

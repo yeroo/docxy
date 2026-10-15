@@ -56,35 +56,27 @@ pub fn set_mode(wb: &mut Workbook, eng: &mut Engine, mode: CalcMode) {
 /// Replace every number constant whose cell format shows a fixed number of
 /// decimals by the value shown (the data half of switching Set precision as
 /// displayed on, for hosts that snapshot the workbook for their undo step).
-/// Formulas, dates, text and General cells stay. Returns how many changed.
-pub fn convert_constants(wb: &mut Workbook) -> usize {
+/// Formulas, dates, text and General cells stay.
+pub fn convert_constants(wb: &mut Workbook) {
     let xfs = wb.styles.xfs.clone();
-    let mut n = 0;
     for sheet in &mut wb.sheets {
         for cell in sheet.cells.values_mut() {
-            if cell.formula.is_none() && cell.f_attrs.is_none() && round_cell_to_display(&xfs, cell)
-            {
-                n += 1;
+            if cell.formula.is_none() && cell.f_attrs.is_none() {
+                round_cell_to_display(&xfs, cell);
             }
         }
     }
-    n
 }
 
-/// Turn Set precision as displayed on or off. On (the caller has shown
-/// [`PRECISION_WARNING`] and been told OK) replaces the constants
-/// ([`convert_constants`]), then recalculates so formula results round too;
-/// the host holds the cells as they were for its undo step. Off changes no
-/// data. Returns how many constants were replaced.
-pub fn set_precision_as_displayed(wb: &mut Workbook, eng: &mut Engine, on: bool) -> usize {
-    if !on {
-        wb.calc.set_precision_as_displayed(false);
-        return 0;
-    }
-    let n = convert_constants(wb);
+/// Switch Set precision as displayed on (the caller has shown
+/// [`PRECISION_WARNING`] and been told OK): [`convert_constants`], the flag,
+/// then a recalculation so formula results round too. The host holds the
+/// cells as they were for its undo step. Switching it off changes no data
+/// ([`apply_settings`]).
+pub fn precision_on(wb: &mut Workbook, eng: &mut Engine) {
+    convert_constants(wb);
     wb.calc.set_precision_as_displayed(true);
     eng.recalc_all(wb);
-    n
 }
 
 /// The `calcMode` names the control surface uses.
@@ -200,9 +192,22 @@ pub fn apply_settings(wb: &mut Workbook, eng: &mut Engine, p: &CalcPatch) {
             p.max_change.unwrap_or(now.max_change),
         );
         // Circles are iterated, or errors, from the next calculation on; in
-        // manual mode, from the next Calculate.
-        if wb.calc.mode != CalcMode::Manual {
-            eng.recalc_all(wb);
+        // manual mode, from the next Calculate, which the circle's members
+        // wait for as stale formulas. (The mode changes last, so a
+        // Manual -> Automatic call in the same patch calculates them.)
+        let now_iter = info(wb, eng);
+        if (
+            now_iter.iterate,
+            now_iter.max_iterations,
+            now_iter.max_change,
+        ) != (now.iterate, now.max_iterations, now.max_change)
+        {
+            if wb.calc.mode == CalcMode::Manual {
+                let members: Vec<_> = eng.circular_keys().collect();
+                eng.mark_stale(members);
+            } else {
+                eng.recalc_all(wb);
+            }
         }
     }
     if let Some(t) = p.threads {

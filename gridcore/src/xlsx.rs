@@ -8156,7 +8156,9 @@ fn sync_calc_pr(xml: &str, wb: &Workbook) -> String {
     ];
     // The counts are written whether or not iteration is on: Excel keeps
     // them in the dialog either way.
-    let (count, delta) = (c.iterate_count, c.iterate_delta);
+    // The limits iteration runs with (`wb.iterate`, which a legacy `.xls`
+    // load sets without `calc`), else the remembered ones.
+    let (count, delta) = wb.iterate.unwrap_or((c.iterate_count, c.iterate_delta));
     wants.push((
         "iterateCount",
         Some(count.to_string()),
@@ -23205,6 +23207,20 @@ mod calc_settings_tests {
             auto.workbook.sheets[0].cell(1, 0).unwrap().value,
             CellValue::Number(1.0)
         );
+    }
+
+    #[test]
+    fn iteration_limits_set_on_the_engine_side_alone_are_saved() {
+        // A loader that sets `wb.iterate` (a legacy .xls) leaves `calc` at
+        // its defaults; the save still writes the limits iteration runs with.
+        let mut pkg = with_calc_pr(r#"<calcPr calcId="1"/>"#);
+        pkg.workbook.iterate = Some((250, 0.0005));
+        assert_eq!(pkg.workbook.calc.iterate_count, 100);
+        let again = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let wb = part_text(&again, "xl/workbook.xml");
+        assert!(wb.contains(r#"iterateCount="250""#), "{wb}");
+        assert!(wb.contains(r#"iterateDelta="0.0005""#), "{wb}");
+        assert_eq!(again.workbook.iterate, Some((250, 0.0005)));
     }
 
     #[test]

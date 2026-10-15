@@ -354,7 +354,7 @@ placeholder would be painful to retrofit):
 - **Calculation options** (#674): `Workbook::calc` (`CalcSettings`) holds the
   mode (`calcMode`: Automatic, Automatic except data tables — the same here,
   there are no data tables — and Manual), Set precision as displayed
-  (`fullPrecision`), the remembered iteration limits, `numThreads`,
+  (`fullPrecision`), the remembered iteration limits, `concurrentManualCount`,
   `concurrentCalc` and Transition formula evaluation (`sheetPr
   transitionEvaluation`, mirrored on every sheet once the user changes it).
   Save patches only the `calcPr` attributes the model says differently from
@@ -366,14 +366,18 @@ placeholder would be painful to retrofit):
   (Calculate Now, F9, every sheet) or `recalc_sheet` (Calculate Sheet,
   Shift+F9; other sheets' dependents stay stale). With iteration on, each
   manual Calculate runs one pass per circle. A file opens with a full
-  calculation whatever its mode (nothing stale), and a save keeps
+  calculation whatever its mode (nothing stale; the hosts' open step, 
+  `calc::load_fresh`), and a save keeps
   `fullCalcOnLoad="1"`. Set precision as displayed (`gridcore::calc`) rounds
   every constant whose format shows fixed decimals (not General, dates, text,
   fractions or scientific) after "Data will permanently lose accuracy.", then
   rounds typed constants and formula results as they are written; switching it
   on is the one undo step, the mode and other settings are not history.
-  Internal full recalculations a host runs for its own reasons (sort, fill,
-  structural edits) still evaluate everything in manual mode. The control
+  The hosts differ on what they rebuild: xlsxy and the wasm bridge
+  recalculate everything after a structural edit, as do sort, fill and
+  filter in the desktop suite, while the suite's structural edits and its
+  undo and redo keep the formulas stale in manual mode (`Engine::inherit_stale`,
+  and a flag on each undo snapshot). The control
   surface is `wb.calc`, `wb.calc.set` and `wb.recalc {sheet}`
   (docs/agent-control.md); the desktop suite has Formulas › Calculation
   and F9 / Shift+F9, xlsxy Ctrl+F9 / Shift+F9.

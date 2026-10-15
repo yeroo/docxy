@@ -1979,7 +1979,7 @@ pub struct CalcSettings {
     /// so the options dialog and the file keep them.
     pub iterate_count: u32,
     pub iterate_delta: f64,
-    /// `numThreads`: `None` = the file did not say (all processors).
+    /// `concurrentManualCount`: `None` = the file did not say (all processors).
     pub num_threads: Option<u32>,
     /// `concurrentCalc` (multi-threaded calculation); on unless the file says
     /// otherwise.

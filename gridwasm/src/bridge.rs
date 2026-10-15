@@ -1653,7 +1653,7 @@ impl Session {
     /// The `wb.calc.set` call that puts `before` back over `after`.
     fn calc_inverse(before: &gridcore::calc::CalcInfo, after: &gridcore::calc::CalcInfo) -> String {
         let mut args = String::new();
-        let mut put = |args: &mut String, k: &str, v: String| {
+        let put = |args: &mut String, k: &str, v: String| {
             if !args.is_empty() {
                 args.push(',');
             }

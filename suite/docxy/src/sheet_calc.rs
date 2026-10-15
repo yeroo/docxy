@@ -264,7 +264,7 @@ fn precision_on(tab: &mut DocTab) -> Result<(), String> {
     let was = (c.precision_as_displayed, c.precision_file_off);
     let mut snap = v.snapshot();
     snap.precision = Some(was);
-    calc::set_precision_as_displayed(&mut v.pkg.workbook, &mut v.engine, true);
+    calc::precision_on(&mut v.pkg.workbook, &mut v.engine);
     v.push_undo_snapshot(snap, SheetStep::Named("Set Precision as Displayed"));
     tab.set_dirty();
     tab.status = "Set precision as displayed is on".into();
