@@ -467,6 +467,15 @@ fn type_for_path(path: &str) -> Option<usize> {
     SAVE_TYPES.iter().position(|t| t.ext == ext)
 }
 
+/// The headless `--recalc`: Calculate Now on a freshly loaded workbook, so a
+/// manual workbook and what reads its pivot output are up to date in the file.
+fn recalc_package(pkg: &mut SheetPackage) -> gridcore::pivot::RefreshOutcome {
+    let mut engine = Engine::new(&pkg.workbook);
+    engine.clock = now_serial();
+    engine.seed = entropy_seed();
+    gridcore::calc::calculate_now(&mut pkg.workbook, &mut engine, true)
+}
+
 /// `path`'s save type when a workbook package can't be written under it:
 /// any type that is not a package, so an `.xls` (written as BIFF8 only in
 /// Compatibility Mode, #874, never by a headless run), an `.xlsb` or `.ods`
@@ -744,16 +753,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         let mut pkg = pkg;
-        let mut engine = Engine::new(&pkg.workbook);
-        engine.clock = now_serial();
-        engine.seed = entropy_seed();
-        engine.recalc_all(&mut pkg.workbook);
-        // Refresh pivots from the recalculated data, then recalculate
-        // anything that reads pivot output cells.
-        let pivots = gridcore::pivot::refresh_pivots(&mut pkg.workbook);
-        if !pivots.changed.is_empty() {
-            engine.recalc_from(&mut pkg.workbook, &pivots.changed);
-        }
+        let pivots = recalc_package(&mut pkg);
         if pivots.refreshed + pivots.skipped > 0 {
             println!(
                 "pivots: {} refreshed, {} kept on cached values",
@@ -2579,9 +2579,12 @@ struct App {
 
 impl App {
     fn new(pkg: SheetPackage, path: &str) -> App {
+        let mut pkg = pkg;
         let mut engine = Engine::new(&pkg.workbook);
         engine.clock = now_serial();
         engine.seed = entropy_seed();
+        // A manual-mode file opens fresh (#674).
+        gridcore::calc::load_fresh(&mut pkg.workbook, &mut engine);
         let (model_rels, model_measures) = pkg
             .part(MODEL_PART)
             .map(|b| parse_model_part(&String::from_utf8_lossy(b)))
@@ -7218,7 +7221,7 @@ impl App {
 
     /// Put `pkg` in place of the workbook, keeping what it is bound to: a
     /// fresh engine, its comments and data model, the view reset, clean.
-    fn load_pkg(&mut self, pkg: SheetPackage) {
+    fn load_pkg(&mut self, mut pkg: SheetPackage) {
         let (rels, meas) = pkg
             .part(MODEL_PART)
             .map(|b| parse_model_part(&String::from_utf8_lossy(b)))
@@ -7227,6 +7230,8 @@ impl App {
         let mut engine = Engine::new(&pkg.workbook);
         engine.clock = now_serial();
         engine.seed = entropy_seed();
+        // A manual-mode file opens fresh (#674).
+        gridcore::calc::load_fresh(&mut pkg.workbook, &mut engine);
         self.engine = engine;
         self.pkg = pkg;
         self.forget_clip();

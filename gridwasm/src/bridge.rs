@@ -1608,6 +1608,7 @@ impl Session {
         }
         gridcore::calc::check_patch(&self.pkg.workbook, &p)?;
         let converts = p.converts(&self.pkg.workbook);
+        let before = gridcore::calc::info(&self.pkg.workbook, &self.engine);
         gridcore::calc::apply_settings(&mut self.pkg.workbook, &mut self.engine, &p);
         let mut steps = 0;
         if converts {
@@ -1625,8 +1626,76 @@ impl Session {
             }
             steps = 1;
         }
-        self.dirty = true;
-        Ok(self.ctl_calc_info(Some(steps)))
+        let after = gridcore::calc::info(&self.pkg.workbook, &self.engine);
+        // Only a change dirties the document (`stale` follows from the
+        // settings and is not one itself).
+        let changed = steps > 0
+            || gridcore::calc::CalcInfo {
+                stale: before.stale,
+                ..after.clone()
+            } != before;
+        if changed {
+            self.dirty = true;
+        }
+        let mut out = self.ctl_calc_info(Some(steps));
+        // A settings-only change is not on the wasm undo stack (undoSteps:0),
+        // so the host undoes it through an `inverse`: this verb restoring the
+        // previous values. Set precision as displayed is left out — turning
+        // it on is its own undo step, and turning it off changes no data.
+        if changed && steps == 0 {
+            let inverse = Self::calc_inverse(&before, &after);
+            out.pop();
+            out.push_str(&format!(",\"inverse\":{inverse}}}"));
+        }
+        Ok(out)
+    }
+
+    /// The `wb.calc.set` call that puts `before` back over `after`.
+    fn calc_inverse(before: &gridcore::calc::CalcInfo, after: &gridcore::calc::CalcInfo) -> String {
+        let mut args = String::new();
+        let mut put = |args: &mut String, k: &str, v: String| {
+            if !args.is_empty() {
+                args.push(',');
+            }
+            args.push_str(&format!("\"{k}\":{v}"));
+        };
+        if before.mode != after.mode {
+            let mut m = String::new();
+            json::push_str(&mut m, gridcore::calc::mode_name(before.mode));
+            put(&mut args, "mode", m);
+        }
+        if (before.iterate, before.max_iterations, before.max_change)
+            != (after.iterate, after.max_iterations, after.max_change)
+        {
+            let mut chg = String::new();
+            json::push_num(&mut chg, before.max_change);
+            put(
+                &mut args,
+                "iterate",
+                format!(
+                    "{{\"enabled\":{},\"maxIterations\":{},\"maxChange\":{chg}}}",
+                    before.iterate, before.max_iterations
+                ),
+            );
+        }
+        if before.threads != after.threads {
+            put(
+                &mut args,
+                "threads",
+                before.threads.map_or("null".into(), |n| n.to_string()),
+            );
+        }
+        if before.concurrent != after.concurrent {
+            put(&mut args, "concurrent", before.concurrent.to_string());
+        }
+        if before.transition_eval != after.transition_eval {
+            put(
+                &mut args,
+                "transitionEvaluation",
+                before.transition_eval.to_string(),
+            );
+        }
+        format!("{{\"verb\":\"wb.calc.set\",\"args\":{{{args}}}}}")
     }
 
     /// `{}` -> `{sheets, active, modified}` (the host composes this with its
@@ -6535,6 +6604,14 @@ mod tests {
         v.get_str("text").unwrap_or_default().to_string()
     }
 
+    fn calc_cell_text_on(s: &mut Session, at: &str, sheet: &str) -> String {
+        let out = s.ctl(&format!(
+            r#"{{"verb":"cell.get","args":{{"ref":"{at}","sheet":"{sheet}"}}}}"#
+        ));
+        let v = json::Json::parse(&out).unwrap();
+        v.get_str("text").unwrap_or_default().to_string()
+    }
+
     fn calc_book() -> Session {
         let mut s = Session::open(&new_workbook()).expect("open");
         s.ctl(r#"{"verb":"cell.set","args":{"ref":"A1","text":"5"}}"#);
@@ -6561,11 +6638,17 @@ mod tests {
     fn ctl_wb_recalc_sheet_scope() {
         let mut s = calc_book();
         s.ctl(r#"{"verb":"sheet.add","args":{"name":"Two"}}"#);
-        s.ctl(r#"{"verb":"cell.set","args":{"ref":"B1","text":"=Sheet1!A1+1","sheet":"Two"}}"#);
+        s.ctl(r#"{"verb":"cell.set","args":{"ref":"B1","text":"=Sheet1!A2+1","sheet":"Two"}}"#);
+        assert_eq!(calc_cell_text_on(&mut s, "B1", "Two"), "11");
         s.ctl(r#"{"verb":"wb.calc.set","args":{"mode":"manual"}}"#);
         s.ctl(r#"{"verb":"cell.set","args":{"ref":"A1","text":"7"}}"#);
         let out = s.ctl(r#"{"verb":"wb.recalc","args":{"sheet":"Sheet1"}}"#);
         assert!(out.contains("\"stale\":1"), "Two's cell stays stale: {out}");
+        assert_eq!(
+            calc_cell_text_on(&mut s, "B1", "Two"),
+            "11",
+            "B1 reads A2 and is not calculated"
+        );
         assert_eq!(calc_cell_text(&mut s, "A2"), "14");
         let out = s.ctl(r#"{"verb":"wb.recalc","args":{"sheet":"Nope"}}"#);
         assert!(out.contains("no sheet named"), "{out}");
@@ -6608,5 +6691,39 @@ mod tests {
             CellValue::Number(3.14659)
         );
         assert!(!s.pkg.workbook.calc.precision_as_displayed);
+    }
+
+    #[test]
+    fn calc_settings_changes_dirty_the_document_and_carry_an_inverse() {
+        let mut s = Session::open(&new_workbook()).expect("open");
+        assert!(!s.dirty);
+        // Nothing changes: clean, and no inverse.
+        for args in [r#"{}"#, r#"{"mode":"auto"}"#] {
+            let out = s.ctl(&format!(r#"{{"verb":"wb.calc.set","args":{args}}}"#));
+            assert!(!out.contains("inverse"), "{out}");
+            assert!(!s.dirty, "{args} changes nothing");
+        }
+        // A setting changes: dirty, undoSteps 0, and the inverse restores it.
+        let out = s.ctl(
+            r#"{"verb":"wb.calc.set","args":{"mode":"manual","iterate":{"enabled":true,"maxIterations":50},"threads":4}}"#,
+        );
+        assert!(s.dirty);
+        assert!(out.contains("\"undoSteps\":0"), "{out}");
+        let v = json::Json::parse(&out).unwrap();
+        let inv = v.get("inverse").expect("an inverse");
+        assert_eq!(inv.get_str("verb"), Some("wb.calc.set"));
+        assert_eq!(s.pkg.workbook.calc.mode, gridcore::sheet::CalcMode::Manual);
+        assert_eq!(s.pkg.workbook.calc.num_threads, Some(4));
+        // The inverse is the request itself: the text after `"inverse":`
+        // up to the inverse's own closing brace.
+        let at = out.find("\"inverse\":").unwrap() + "\"inverse\":".len();
+        let request = out[at..out.rfind(",\"ok\"").unwrap()].to_string();
+        let out = s.ctl(&request);
+        let c = &s.pkg.workbook.calc;
+        assert_eq!(c.mode, gridcore::sheet::CalcMode::Auto);
+        assert_eq!((c.num_threads, s.pkg.workbook.iterate), (None, None));
+        assert_eq!(c.iterate_count, 100);
+        // ...and that call's own inverse puts the change back (the flip-flop).
+        assert!(out.contains("\"inverse\""), "{out}");
     }
 }

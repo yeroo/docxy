@@ -23171,20 +23171,40 @@ mod calc_settings_tests {
     fn manual_file_loads_fresh_and_saves_full_calc_on_load() {
         let mut pkg = with_calc_pr(r#"<calcPr calcId="1" calcMode="manual"/>"#);
         pkg.workbook.sheets[0].set_cell(0, 0, Cell::number(5.0));
-        pkg.workbook.sheets[0].set_cell(1, 0, Cell::formula("A1*2"));
+        let mut stale = Cell::formula("A1*2");
+        stale.value = CellValue::Number(1.0);
+        pkg.workbook.sheets[0].set_cell(1, 0, stale);
         let mut again = load_xlsx(&save_xlsx(&pkg)).unwrap();
         let wb = part_text(&again, "xl/workbook.xml");
         assert!(wb.contains(r#"fullCalcOnLoad="1""#), "{wb}");
         assert!(wb.contains(r#"calcMode="manual""#), "{wb}");
-        // Load itself does the full calculation: values fresh, nothing stale.
+        assert_eq!(again.workbook.calc.mode, CalcMode::Manual);
+        // The file holds the value it was saved with; the hosts' open step
+        // calculates a manual file in full.
         let mut eng = crate::engine::Engine::new(&again.workbook);
-        eng.recalc_all(&mut again.workbook);
+        assert_eq!(
+            again.workbook.sheets[0].cell(1, 0).unwrap().value,
+            CellValue::Number(1.0)
+        );
+        crate::calc::load_fresh(&mut again.workbook, &mut eng);
         assert_eq!(
             again.workbook.sheets[0].cell(1, 0).unwrap().value,
             CellValue::Number(10.0)
         );
         assert!(!eng.is_stale());
-        assert_eq!(again.workbook.calc.mode, CalcMode::Manual);
+
+        // An automatic file keeps its cached values on open.
+        let mut auto = load_xlsx(&save_xlsx(&with_calc_pr(r#"<calcPr calcId="1"/>"#))).unwrap();
+        auto.workbook.sheets[0].set_cell(0, 0, Cell::number(5.0));
+        let mut cached = Cell::formula("A1*2");
+        cached.value = CellValue::Number(1.0);
+        auto.workbook.sheets[0].set_cell(1, 0, cached);
+        let mut eng = crate::engine::Engine::new(&auto.workbook);
+        crate::calc::load_fresh(&mut auto.workbook, &mut eng);
+        assert_eq!(
+            auto.workbook.sheets[0].cell(1, 0).unwrap().value,
+            CellValue::Number(1.0)
+        );
     }
 
     #[test]

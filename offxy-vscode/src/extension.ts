@@ -257,9 +257,11 @@ const EDITORS: EditorSpec[] = [
         'col.delete',
         'wb.replace-all',
         'sheet.add',
-        // #674: wb.calc.set is bucket A only when it switches Set precision as
-        // displayed on (a snapshot step, undoSteps:1); every other setting is
-        // not undoable, as in Excel (undoSteps:0, nothing to flip-flop).
+        // #674: wb.calc.set is bucket A when it switches Set precision as
+        // displayed on (a snapshot step, undoSteps:1). Any other change is not
+        // on the wasm undo stack (undoSteps:0) but carries an `inverse` (the
+        // same verb restoring the previous values), so it dirties the document
+        // and undoes like bucket B; a call that changes nothing carries none.
         'wb.calc.set',
         // Wave-2: cell.format lands on the SAME true wasm-undo-stack group
         // range.set uses (Session::apply captures the style-only before/after

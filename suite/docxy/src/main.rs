@@ -1045,6 +1045,9 @@ struct SheetSnapshot {
     /// A restore leaves the workbook's calculation settings as they are now,
     /// as an edit's undo does in Excel, except this one.
     precision: Option<(bool, bool)>,
+    /// Whether formulas were out of date (manual mode) when it was taken
+    /// (#674): its values may be, and restoring it must say so.
+    stale: bool,
 }
 
 /// What an undo step's Undo and Redo select (#1148), as Excel's do: what
@@ -2425,10 +2428,11 @@ enum StructOp {
 
 impl SheetView {
     /// A fresh engine over the workbook as it stands, after an edit that
-    /// rebuilds it (sheets added or removed, rows moved, an undo). What was
-    /// stale stays so (#674): the new engine cannot tell which formulas were
-    /// calculated, so in manual mode every formula is marked, and the next
-    /// Calculate puts them right.
+    /// rebuilds it (sheets added or removed, rows moved). If the outgoing
+    /// engine had stale formulas they stay so (#674): the new engine cannot
+    /// tell which were calculated, so every formula is marked, and the next
+    /// Calculate puts them right. An undo or redo ([`Self::restore`]) also
+    /// asks the restored snapshot.
     fn rebuild_engine(&mut self) {
         let mut engine = sheet_engine(&self.pkg.workbook);
         engine.inherit_stale(&self.engine);
@@ -4166,6 +4170,7 @@ impl SheetView {
             areas: self.extra_areas(),
             target: None,
             precision: None,
+            stale: self.engine.is_stale(),
         }
     }
 
@@ -4189,7 +4194,18 @@ impl SheetView {
         }
         self.charts = snap.charts;
         self.pivot_views = snap.pivots;
+        // Whether the values in hand are out of date comes from the snapshot
+        // as well as the engine being replaced (#674). Manual mode marks every
+        // formula; otherwise (the mode changed since) they are calculated now.
+        let was_stale = snap.stale || self.engine.is_stale();
         self.rebuild_engine();
+        if was_stale {
+            if self.pkg.workbook.calc.mode == gridcore::sheet::CalcMode::Manual {
+                self.engine.mark_all_stale();
+            } else {
+                self.engine.recalc_all(&mut self.pkg.workbook);
+            }
+        }
         self.active = snap
             .active
             .min(self.pkg.workbook.sheets.len().saturating_sub(1));
@@ -10778,6 +10794,8 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                 if has_uncached_formula(&pkg.workbook) {
                     engine.recalc_all(&mut pkg.workbook);
                 }
+                // A manual-mode file opens fresh (#674).
+                gridcore::calc::load_fresh(&mut pkg.workbook, &mut engine);
                 let view = SheetView {
                     pkg,
                     active: 0,

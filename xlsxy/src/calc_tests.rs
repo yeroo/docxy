@@ -277,3 +277,94 @@ fn another_structural_undo_leaves_precision_alone() {
         "an older step's undo does not turn it back on"
     );
 }
+
+/// A manual-mode workbook as a file holds it: A2 = A1*2 cached as 1 (stale).
+fn stale_manual_pkg() -> SheetPackage {
+    let mut pkg = new_xlsx();
+    pkg.workbook.calc.mode = gridcore::sheet::CalcMode::Manual;
+    let sh = &mut pkg.workbook.sheets[0];
+    sh.set_cell(0, 0, Cell::number(5.0));
+    let mut f = Cell::formula("A1*2");
+    f.value = CellValue::Number(1.0);
+    sh.set_cell(1, 0, f);
+    gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&pkg)).unwrap()
+}
+
+#[test]
+fn a_manual_file_opens_fresh() {
+    let pkg = stale_manual_pkg();
+    assert_eq!(
+        pkg.workbook.sheets[0].cell(1, 0).unwrap().value,
+        CellValue::Number(1.0),
+        "the file holds the stale value"
+    );
+    let mut a = App::new(pkg.clone(), "manual.xlsx");
+    assert_eq!(a.sheet().cell(1, 0).unwrap().value, CellValue::Number(10.0));
+    assert!(!a.engine.is_stale());
+    a.load_pkg(pkg);
+    assert_eq!(a.sheet().cell(1, 0).unwrap().value, CellValue::Number(10.0));
+}
+
+#[test]
+fn headless_recalc_updates_what_reads_a_refreshed_pivot_in_manual_mode() {
+    use gridcore::pivot::{DataField, Pivot, PivotSource};
+    let mut pkg = new_xlsx();
+    pkg.workbook.calc.mode = gridcore::sheet::CalcMode::Manual;
+    let sh = &mut pkg.workbook.sheets[0];
+    sh.set_cell(0, 0, Cell::text("Region"));
+    sh.set_cell(0, 1, Cell::text("Sales"));
+    for (i, (r, v)) in [("East", 10.0), ("West", 20.0), ("East", 30.0)]
+        .iter()
+        .enumerate()
+    {
+        sh.set_cell(i as u32 + 1, 0, Cell::text(r));
+        sh.set_cell(i as u32 + 1, 1, Cell::number(*v));
+    }
+    sh.set_cell(0, 6, Cell::formula("E2*2"));
+    pkg.workbook.pivots.push(Pivot {
+        name: "P".into(),
+        sheet: 0,
+        location: (0, 3, 0, 3),
+        source: PivotSource::Range {
+            sheet: "Sheet1".into(),
+            rect: (0, 0, 3, 1),
+        },
+        fields: vec!["Region".into(), "Sales".into()],
+        row_fields: vec![0],
+        col_fields: vec![],
+        data_fields: vec![DataField {
+            name: "Sum of Sales".into(),
+            field: 1,
+            agg: gridcore::frame::Agg::Sum,
+        }],
+        field_items: Vec::new(),
+        hidden: Vec::new(),
+        page: Vec::new(),
+        items_order: Vec::new(),
+        calc_formulas: Vec::new(),
+        grand_rows: true,
+        grand_cols: true,
+        subtotals: false,
+        data_on_rows: false,
+        unsupported: false,
+        edited: false,
+        refreshed: false,
+        part: String::new(),
+        cache_part: String::new(),
+    });
+    let out = recalc_package(&mut pkg);
+    assert_eq!(out.refreshed, 1);
+    let g1 = pkg.workbook.sheets[0].cell(0, 6).unwrap().value.clone();
+    assert_eq!(g1, CellValue::Number(80.0), "G1 reads the refreshed E2");
+}
+
+#[test]
+fn wb_calc_set_that_changes_nothing_leaves_the_workbook_clean() {
+    let mut a = app();
+    assert!(!a.modified);
+    calc_set(&mut a, vec![]).unwrap();
+    calc_set(&mut a, vec![("mode", Json::Str("auto".into()))]).unwrap();
+    assert!(!a.modified, "no setting changed");
+    calc_set(&mut a, vec![("mode", manual())]).unwrap();
+    assert!(a.modified);
+}

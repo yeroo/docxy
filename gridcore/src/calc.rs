@@ -34,6 +34,15 @@ pub fn calculate_now(wb: &mut Workbook, eng: &mut Engine, pivots: bool) -> Refre
     outcome
 }
 
+/// A workbook just opened: a manual-mode file keeps the values it was saved
+/// with, which may be stale, so they are calculated in full, as Excel does on
+/// open (`fullCalcOnLoad`). An automatic file keeps its cached values.
+pub fn load_fresh(wb: &mut Workbook, eng: &mut Engine) {
+    if wb.calc.mode == CalcMode::Manual {
+        eng.recalc_all(wb);
+    }
+}
+
 /// Calculation Options > Automatic / Automatic Except Data Tables / Manual.
 /// Going back to automatic brings everything up to date at once, as Excel does.
 pub fn set_mode(wb: &mut Workbook, eng: &mut Engine, mode: CalcMode) {

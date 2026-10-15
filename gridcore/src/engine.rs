@@ -1120,13 +1120,19 @@ impl Engine {
     /// the cells may have moved and the rebuild cannot tell which were fresh.
     pub fn inherit_stale(&mut self, old: &Engine) {
         if old.is_stale() {
-            self.stale = self
-                .formulas
-                .keys()
-                .copied()
-                .filter(|k| !self.unsupported.contains(k))
-                .collect();
+            self.mark_all_stale();
         }
+    }
+
+    /// Every formula is out of date: the cells came from a state whose
+    /// values were not calculated (an undo to a manual-mode snapshot).
+    pub fn mark_all_stale(&mut self) {
+        self.stale = self
+            .formulas
+            .keys()
+            .copied()
+            .filter(|k| !self.unsupported.contains(k))
+            .collect();
     }
 
     /// How many formulas are stale.

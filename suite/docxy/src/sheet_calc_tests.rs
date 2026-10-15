@@ -339,6 +339,69 @@ fn an_unrelated_edit_and_undo_keep_the_stale_formulas_stale() {
 }
 
 #[test]
+fn undo_after_calculate_restores_the_stale_values_and_says_so() {
+    let mut t = manual_book();
+    type_into(&mut t, "A1", "7");
+    type_into(&mut t, "B1", "1");
+    run(&mut t, CalcAct::Now);
+    assert_eq!(value(&mut t, "A2"), CellValue::Number(14.0));
+    assert_eq!(word(&mut t), None);
+    assert!(view(&mut t).undo_step()); // B1, taken while A2 was stale
+    assert_eq!(value(&mut t, "A2"), CellValue::Number(10.0));
+    assert_eq!(word(&mut t), Some("Calculate"));
+    run(&mut t, CalcAct::Sheet);
+    assert_eq!(value(&mut t, "A2"), CellValue::Number(14.0));
+    assert_eq!(word(&mut t), None);
+}
+
+#[test]
+fn undo_after_going_automatic_calculates_what_it_restores() {
+    let mut t = manual_book();
+    type_into(&mut t, "A1", "7");
+    type_into(&mut t, "B1", "1");
+    run(&mut t, CalcAct::Mode(CalcMode::Auto));
+    assert_eq!(value(&mut t, "A2"), CellValue::Number(14.0));
+    assert!(view(&mut t).undo_step());
+    assert_eq!(mode(&mut t), CalcMode::Auto);
+    assert_eq!(value(&mut t, "A2"), CellValue::Number(14.0));
+    assert_eq!(word(&mut t), None);
+}
+
+#[test]
+fn redo_of_a_calculated_state_is_not_stale() {
+    let mut t = manual_book();
+    type_into(&mut t, "A1", "7");
+    type_into(&mut t, "B1", "1");
+    run(&mut t, CalcAct::Now);
+    assert!(view(&mut t).undo_step());
+    assert_eq!(word(&mut t), Some("Calculate"));
+    run(&mut t, CalcAct::Now);
+    assert!(view(&mut t).redo_step()); // B1 = 1 with A2 = 14, as it was taken
+    assert_eq!(value(&mut t, "A2"), CellValue::Number(14.0));
+    assert_eq!(word(&mut t), None);
+}
+
+#[test]
+fn a_manual_file_opens_fresh_without_the_calculate_word() {
+    let mut pkg = gridcore::xlsx::new_xlsx();
+    pkg.workbook.calc.mode = CalcMode::Manual;
+    let sh = &mut pkg.workbook.sheets[0];
+    sh.set_cell(0, 0, gridcore::sheet::Cell::number(5.0));
+    let mut stale = gridcore::sheet::Cell::formula("A1*2");
+    stale.value = CellValue::Number(1.0);
+    sh.set_cell(1, 0, stale);
+    let path = std::env::temp_dir().join(format!("docxy-674-manual-{}.xlsx", std::process::id()));
+    std::fs::write(&path, gridcore::xlsx::save_xlsx(&pkg)).unwrap();
+    let (surface, _) = crate::sheet_from_path_mode(&path, false);
+    let _ = std::fs::remove_file(&path);
+    let mut t = tab();
+    t.surface = surface;
+    assert_eq!(mode(&mut t), CalcMode::Manual);
+    assert_eq!(value(&mut t, "A2"), CellValue::Number(10.0));
+    assert_eq!(word(&mut t), None);
+}
+
+#[test]
 fn calculate_now_in_protected_view_keeps_pivots_and_the_tab_clean() {
     use gridcore::pivot::{DataField, Pivot, PivotSource};
     let mut t = tab();

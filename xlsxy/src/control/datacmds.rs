@@ -679,10 +679,20 @@ pub(super) fn wb_calc_set(app: &mut App, args: &Json) -> Result<Json, String> {
     let patch = calc_patch(args)?;
     gridcore::calc::check_patch(&app.pkg.workbook, &patch)?;
     let converts = patch.converts(&app.pkg.workbook);
+    let before = gridcore::calc::info(&app.pkg.workbook, &app.engine);
     gridcore::calc::apply_settings(&mut app.pkg.workbook, &mut app.engine, &patch);
     if converts {
         app.precision_on();
     }
-    app.modified = true;
+    let after = gridcore::calc::info(&app.pkg.workbook, &app.engine);
+    // Only a change modifies the workbook (`stale` follows from the settings).
+    if converts
+        || (gridcore::calc::CalcInfo {
+            stale: before.stale,
+            ..after
+        }) != before
+    {
+        app.modified = true;
+    }
     Ok(calc_info_json(app))
 }
