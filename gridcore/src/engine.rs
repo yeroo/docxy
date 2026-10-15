@@ -2575,10 +2575,11 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
     // `Sales[Item]` to `Sales[Price]` reads the columns between them.
     let mut spans = Vec::new();
     formula::collect_range_ops(ast, &mut spans);
-    for (l, r) in spans {
+    for leaves in spans {
         let mut ends = Vec::new();
-        collect_deps(wb, key, l, &mut ends, depth + 1);
-        collect_deps(wb, key, r, &mut ends, depth + 1);
+        for leaf in leaves {
+            collect_deps(wb, key, leaf, &mut ends, depth + 1);
+        }
         let Some(&(s, ..)) = ends.first() else {
             continue;
         };
@@ -5826,6 +5827,27 @@ mod tests {
         assert_eq!(value_at(&wb, "C2"), CellValue::Number(2.0));
         set(&mut eng, &mut wb, "A45", Cell::number(10.0));
         assert_eq!(value_at(&wb, "C1"), CellValue::Number(16.0));
+    }
+
+    #[test]
+    fn a_span_chain_of_thousands_of_ends_is_one_box() {
+        // #680 FIX r3: a chain is flattened, not walked once per level.
+        let chain = (1..=1500)
+            .map(|i| format!("A{i}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("A1500", Cell::number(3.0)),
+            ("C1", Cell::formula(&format!("SUM({chain})"))),
+            ("C2", Cell::formula(&format!("ROWS({chain})"))),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(4.0));
+        assert_eq!(value_at(&wb, "C2"), CellValue::Number(1500.0));
+        set(&mut eng, &mut wb, "A777", Cell::number(10.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(14.0));
     }
 
     #[test]

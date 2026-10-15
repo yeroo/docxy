@@ -537,6 +537,17 @@ struct Parser<'a> {
 /// engine keeps the cached value) instead of overflowing the native stack.
 const MAX_PARSE_DEPTH: u32 = 128;
 
+/// Whether the last operand of `e`, through spans and intersections, is a
+/// cell reference or a name: the readers of those take a following `:`
+/// themselves.
+fn ends_in_cell(e: &Expr) -> bool {
+    match e {
+        Expr::Ref(_) | Expr::Name(_) => true,
+        Expr::Bin(BinOp::Range | BinOp::Isect, _, r) => ends_in_cell(r),
+        _ => false,
+    }
+}
+
 /// Whether `e` is built from literal reference forms and the reference
 /// operators only.
 fn indirect_literal_refs(e: &Expr) -> bool {
@@ -559,7 +570,12 @@ fn indirect_literal_refs(e: &Expr) -> bool {
 fn can_span_from(e: &Expr) -> bool {
     matches!(
         e,
-        Expr::Structured { .. }
+        // A cell or name is only here when parenthesised: unparenthesised,
+        // its reader takes the `:` itself.
+        Expr::Ref(_)
+            | Expr::Name(_)
+            | Expr::Func(..)
+            | Expr::Structured { .. }
             | Expr::Range(..)
             | Expr::ColRange { .. }
             | Expr::RowRange { .. }
@@ -935,48 +951,55 @@ impl<'a> Parser<'a> {
             }
             Tok::Ident(id) => {
                 self.bump()?;
-                match self.tok {
-                    Tok::Bang => {
-                        self.bump()?;
-                        self.sheet_ref(Some(id))
-                    }
-                    Tok::Bracket(_) => {
-                        let Tok::Bracket(spec) = std::mem::replace(&mut self.tok, Tok::Eof) else {
-                            unreachable!()
-                        };
-                        self.bump()?;
-                        parse_spec(Some(id), &spec)
-                    }
-                    Tok::LParen => {
-                        self.bump()?;
-                        let args = self.call_args()?;
-                        // Excel writes post-2007 functions as _xlfn.NAME, and
-                        // spells the dynamic-array operators as functions in
-                        // stored formulas: `A1#` is `_xlfn.ANCHORARRAY(A1)`,
-                        // `@x` is `_xlfn.SINGLE(x)`.
-                        let name = id
-                            .strip_prefix("_xlfn.")
-                            .unwrap_or(&id)
-                            .to_ascii_uppercase();
-                        let name = name.strip_prefix("_XLWS.").unwrap_or(&name).to_string();
-                        match (name.as_str(), args.len()) {
-                            ("ANCHORARRAY", 1) => {
-                                if let Expr::Ref(r) = &args[0] {
-                                    return Ok(Expr::SpillRef(r.clone()));
-                                }
-                                Err("ANCHORARRAY needs a cell reference".into())
-                            }
-                            ("SINGLE", 1) => Ok(Expr::Un(
-                                UnOp::Implicit,
-                                Box::new(args.into_iter().next().unwrap()),
-                            )),
-                            _ => Ok(Expr::Func(name, args)),
-                        }
-                    }
-                    _ => self.ident_expr(id, None),
-                }
+                self.ident_tail(id)
             }
             t => Err(format!("unexpected token {t:?}")),
+        }
+    }
+
+    /// What follows an identifier outside a range start: a sheet qualifier,
+    /// a table reference, a call, or a cell / name (the identifier is read,
+    /// the token after it current).
+    fn ident_tail(&mut self, id: String) -> Result<Expr, String> {
+        match self.tok {
+            Tok::Bang => {
+                self.bump()?;
+                self.sheet_ref(Some(id))
+            }
+            Tok::Bracket(_) => {
+                let Tok::Bracket(spec) = std::mem::replace(&mut self.tok, Tok::Eof) else {
+                    unreachable!()
+                };
+                self.bump()?;
+                parse_spec(Some(id), &spec)
+            }
+            Tok::LParen => {
+                self.bump()?;
+                let args = self.call_args()?;
+                // Excel writes post-2007 functions as _xlfn.NAME, and
+                // spells the dynamic-array operators as functions in
+                // stored formulas: `A1#` is `_xlfn.ANCHORARRAY(A1)`,
+                // `@x` is `_xlfn.SINGLE(x)`.
+                let name = id
+                    .strip_prefix("_xlfn.")
+                    .unwrap_or(&id)
+                    .to_ascii_uppercase();
+                let name = name.strip_prefix("_XLWS.").unwrap_or(&name).to_string();
+                match (name.as_str(), args.len()) {
+                    ("ANCHORARRAY", 1) => {
+                        if let Expr::Ref(r) = &args[0] {
+                            return Ok(Expr::SpillRef(r.clone()));
+                        }
+                        Err("ANCHORARRAY needs a cell reference".into())
+                    }
+                    ("SINGLE", 1) => Ok(Expr::Un(
+                        UnOp::Implicit,
+                        Box::new(args.into_iter().next().unwrap()),
+                    )),
+                    _ => Ok(Expr::Func(name, args)),
+                }
+            }
+            _ => self.ident_expr(id, None),
         }
     }
 
@@ -1053,7 +1076,20 @@ impl<'a> Parser<'a> {
                         self.bump()?;
                         return self.three_d(id, l);
                     }
-                    t => return Err(format!("expected range end, got {t:?}")),
+                    // `A1:Sales[Qty]`, `A1:#REF!`, `A1:(…)`: a span from a cell
+                    // to something other than a cell.
+                    t => {
+                        self.tok = t;
+                        let end = self.primary()?;
+                        if !is_ref_expr(&end) {
+                            return Err("range operator needs references".into());
+                        }
+                        return Ok(Expr::Bin(
+                            BinOp::Range,
+                            Box::new(Expr::Ref(r)),
+                            Box::new(end),
+                        ));
+                    }
                 };
                 // `Q1:Q3!A1` — both endpoints looked like cell refs, but the
                 // trailing ! reveals a 3D sheet span (sheets named Q1..Q3).
@@ -1064,7 +1100,18 @@ impl<'a> Parser<'a> {
                     self.bump()?;
                     return self.three_d(id, id2);
                 }
-                let second = second.ok_or("bad range end")?;
+                // `A1:Rate`, `A1:INDEX(…)`: a span from a cell to a name or call.
+                let Some(second) = second else {
+                    let end = self.ident_tail(id2)?;
+                    if !is_ref_expr(&end) {
+                        return Err("bad range end".into());
+                    }
+                    return Ok(Expr::Bin(
+                        BinOp::Range,
+                        Box::new(Expr::Ref(r)),
+                        Box::new(end),
+                    ));
+                };
                 return Ok(Expr::Range(r, second));
             }
             return Ok(Expr::Ref(r));
@@ -1744,11 +1791,15 @@ impl Printer {
                 // `:` binds tighter than the space, so a space inside a span
                 // needs parens; atoms are the same precedence as the
                 // reference operators and never do.
+                // A cell before a `:` would be read with the next end as a
+                // plain range, so a span that ends in one is parenthesised.
                 let lp = prec(l) < prec(e)
-                    || (*op == BinOp::Range && matches!(**l, Expr::Bin(BinOp::Isect, ..)));
+                    || (*op == BinOp::Range
+                        && (matches!(**l, Expr::Bin(BinOp::Isect, ..)) || ends_in_cell(l)));
                 // Same-precedence right operands need parens for - / ^ etc.
                 let rp = if refop {
                     prec(r) < prec(e)
+                        || (*op == BinOp::Range && matches!(**r, Expr::Bin(BinOp::Range, ..)))
                         || (*op == BinOp::Range && matches!(**r, Expr::Bin(BinOp::Isect, ..)))
                         || (*op == BinOp::Isect && matches!(**r, Expr::Bin(BinOp::Isect, ..)))
                 } else {
@@ -3435,21 +3486,19 @@ pub fn table_refs_to_cells_in_expr(e: &Expr, t: &TableToRange, host: FormulaHost
     span_ends_reparse(&rewritten)
 }
 
-/// `e` with a one-cell reference that starts a span written as the 1x1 range
-/// (`$B2:$B2:C5`): the printed text of `$B2:C5` over a cell and a name, call
-/// or other-sheet cell does not read back as the span it was.
+/// `e` with every cell that is an end of a span written as the 1x1 range
+/// (`$B2:$B2:$C2:Rate`): a cell before a `:` in printed text reads as the
+/// start of a plain range (or, after another sheet's cell, a 3D span), so the
+/// text would not read back as the span it was. A 1x1 range reads the same
+/// cell.
 fn span_ends_reparse(e: &Expr) -> Expr {
     map_expr(e, &|x| match x {
         Expr::Bin(BinOp::Range, l, r) => {
-            let l = match span_ends_reparse(l) {
+            let end = |x: &Expr| match span_ends_reparse(x) {
                 Expr::Ref(c) => Expr::Range(c.clone(), CellRef { sheet: None, ..c }),
                 other => other,
             };
-            Some(Expr::Bin(
-                BinOp::Range,
-                Box::new(l),
-                Box::new(span_ends_reparse(r)),
-            ))
+            Some(Expr::Bin(BinOp::Range, Box::new(end(l)), Box::new(end(r))))
         }
         _ => None,
     })
@@ -4109,8 +4158,9 @@ pub fn is_volatile(e: &Expr) -> bool {
         Expr::Un(_, x) => is_volatile(x),
         // A span whose ends are not literal references has no box to depend
         // on until it is evaluated.
-        Expr::Bin(BinOp::Range, l, r) => {
-            !(is_literal_ref(l) && is_literal_ref(r)) || is_volatile(l) || is_volatile(r)
+        Expr::Bin(BinOp::Range, ..) => {
+            let ends = span_leaves(e);
+            !ends.iter().all(|x| is_literal_ref(x)) || ends.into_iter().any(is_volatile)
         }
         Expr::Bin(_, l, r) => is_volatile(l) || is_volatile(r),
         _ => false,
@@ -4127,18 +4177,35 @@ pub fn is_literal_ref(e: &Expr) -> bool {
         | Expr::RowRange { .. }
         | Expr::Structured { .. }
         | Expr::Err(_) => true,
-        Expr::Bin(BinOp::Range | BinOp::Isect, l, r) => is_literal_ref(l) && is_literal_ref(r),
+        Expr::Bin(BinOp::Range, ..) => span_leaves(e).into_iter().all(is_literal_ref),
+        Expr::Bin(BinOp::Isect, l, r) => is_literal_ref(l) && is_literal_ref(r),
         _ => false,
     }
 }
 
-/// The operands of every outermost `a:b` between references in a formula (not
-/// the spans nested in their operands).
-pub fn collect_range_ops<'a>(e: &'a Expr, out: &mut Vec<(&'a Expr, &'a Expr)>) {
+/// The ends of a chain `a:b:c:…`: its operands that are not themselves spans,
+/// found without recursing down the chain (a formula can chain thousands).
+pub fn span_leaves(e: &Expr) -> Vec<&Expr> {
+    let mut leaves = Vec::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        match x {
+            Expr::Bin(BinOp::Range, l, r) => {
+                stack.push(r);
+                stack.push(l);
+            }
+            other => leaves.push(other),
+        }
+    }
+    leaves
+}
+
+/// The ends of every outermost chain of `a:b` between references in a formula
+/// (see [`span_leaves`]); spans inside an end are the caller's to find when it
+/// walks that end.
+pub fn collect_range_ops<'a>(e: &'a Expr, out: &mut Vec<Vec<&'a Expr>>) {
     match e {
-        // A chain `a:b:c` is one box: the caller walks the operands of each
-        // span it gets, so the spans inside them are found there.
-        Expr::Bin(BinOp::Range, l, r) => out.push((l, r)),
+        Expr::Bin(BinOp::Range, ..) => out.push(span_leaves(e)),
         Expr::Bin(_, l, r) => {
             collect_range_ops(l, out);
             collect_range_ops(r, out);
@@ -4930,7 +4997,7 @@ impl<'a> Eval<'a> {
                 let v = self.eval_arg(x);
                 self.broadcast_un(*op, v)
             }
-            Expr::Bin(op @ (BinOp::Range | BinOp::Isect), l, r) => self.ref_op(*op, l, r),
+            Expr::Bin(BinOp::Range | BinOp::Isect, ..) => self.ref_op(e),
             Expr::Bin(op, l, r) => {
                 let lv = self.eval_arg(l);
                 let rv = self.eval_arg(r);
@@ -6257,35 +6324,60 @@ impl<'a> Eval<'a> {
         }
     }
 
-    /// `a:b` and `a b` over references: the box spanning both, and their
-    /// overlap (`#NULL!` when there is none). Both must be on one sheet.
-    fn ref_op(&mut self, op: BinOp, l: &Expr, r: &Expr) -> Arg {
-        let (a, b) = match (self.ref_rect(l, true), self.ref_rect(r, true)) {
-            (Ok(a), Ok(b)) => (a, b),
-            (Err(v), _) | (_, Err(v)) => return Arg::Scalar(v),
+    /// `a:b` and `a b` over references: the box spanning them, and their
+    /// overlap (`#NULL!` when there is none). All must be on one sheet. A
+    /// chain (`a:b:c:…`, `a b c …`) is read in one pass, not one call per link.
+    fn ref_op(&mut self, e: &Expr) -> Arg {
+        let (op, ends) = match e {
+            Expr::Bin(BinOp::Range, ..) => (BinOp::Range, span_leaves(e)),
+            _ => {
+                let mut ends = Vec::new();
+                let mut x = e;
+                while let Expr::Bin(BinOp::Isect, l, r) = x {
+                    ends.push(&**r);
+                    x = l;
+                }
+                ends.push(x);
+                ends.reverse();
+                (BinOp::Isect, ends)
+            }
         };
-        if a.0 != b.0 {
-            return Arg::Scalar(Value::Err(ExcelError::Value));
+        let mut acc: Option<(usize, u32, u32, u32, u32)> = None;
+        for end in ends {
+            let b = match self.ref_rect(end, true) {
+                Ok(b) => b,
+                Err(v) => return Arg::Scalar(v),
+            };
+            let (lo_r2, hi_r2) = (b.1.min(b.3), b.1.max(b.3));
+            let (lo_c2, hi_c2) = (b.2.min(b.4), b.2.max(b.4));
+            let Some(a) = acc else {
+                acc = Some((b.0, lo_r2, lo_c2, hi_r2, hi_c2));
+                continue;
+            };
+            if a.0 != b.0 {
+                return Arg::Scalar(Value::Err(ExcelError::Value));
+            }
+            acc = Some(if op == BinOp::Range {
+                (
+                    a.0,
+                    a.1.min(lo_r2),
+                    a.2.min(lo_c2),
+                    a.3.max(hi_r2),
+                    a.4.max(hi_c2),
+                )
+            } else {
+                let (r1, c1) = (a.1.max(lo_r2), a.2.max(lo_c2));
+                let (r2, c2) = (a.3.min(hi_r2), a.4.min(hi_c2));
+                if r1 > r2 || c1 > c2 {
+                    return Arg::Scalar(Value::Err(ExcelError::Null));
+                }
+                (a.0, r1, c1, r2, c2)
+            });
         }
-        let (lo_r, hi_r) = (a.1.min(a.3), a.1.max(a.3));
-        let (lo_c, hi_c) = (a.2.min(a.4), a.2.max(a.4));
-        let (lo_r2, hi_r2) = (b.1.min(b.3), b.1.max(b.3));
-        let (lo_c2, hi_c2) = (b.2.min(b.4), b.2.max(b.4));
-        if op == BinOp::Range {
-            return Arg::Range(
-                a.0,
-                lo_r.min(lo_r2),
-                lo_c.min(lo_c2),
-                hi_r.max(hi_r2),
-                hi_c.max(hi_c2),
-            );
+        match acc {
+            Some((s, r1, c1, r2, c2)) => Arg::Range(s, r1, c1, r2, c2),
+            None => Arg::Scalar(Value::Err(ExcelError::Value)),
         }
-        let (r1, c1) = (lo_r.max(lo_r2), lo_c.max(lo_c2));
-        let (r2, c2) = (hi_r.min(hi_r2), hi_c.min(hi_c2));
-        if r1 > r2 || c1 > c2 {
-            return Arg::Scalar(Value::Err(ExcelError::Null));
-        }
-        Arg::Range(a.0, r1, c1, r2, c2)
     }
 
     /// Whether `e` is a reference (cells, not their values): a reference
@@ -6296,17 +6388,7 @@ impl<'a> Eval<'a> {
     fn yields_ref(&mut self, e: &Expr) -> bool {
         match e {
             // A literal cell reference is one unless it is a lost `#REF!`.
-            Expr::Ref(r) => {
-                r.row >= 0
-                    && r.col >= 0
-                    && match self.resolve_sheet(&r.sheet) {
-                        Ok(_) => true,
-                        Err(_) => {
-                            self.unsupported = true;
-                            false
-                        }
-                    }
-            }
+            Expr::Ref(r) => r.row >= 0 && r.col >= 0 && self.sheets_known(e),
             Expr::Range(..)
             | Expr::ColRange { .. }
             | Expr::RowRange { .. }
@@ -6315,11 +6397,7 @@ impl<'a> Eval<'a> {
             | Expr::Bin(BinOp::Range | BinOp::Isect, ..) => {
                 self.sheets_known(e) && matches!(self.eval_arg(e), Arg::Range(..))
             }
-            Expr::Ref3D { .. } => {
-                let known = self.resolve_3d(e).is_ok();
-                self.unsupported |= !known;
-                known
-            }
+            Expr::Ref3D { .. } => self.sheets_known(e),
             Expr::Name(n) => {
                 let bound = self
                     .lets
@@ -6387,6 +6465,11 @@ impl<'a> Eval<'a> {
             Expr::Bin(BinOp::Range | BinOp::Isect, l, r) => {
                 let (l, r) = (self.sheets_known(l), self.sheets_known(r));
                 return l && r;
+            }
+            Expr::Ref3D { .. } => {
+                let known = self.resolve_3d(e).is_ok();
+                self.unsupported |= !known;
+                return known;
             }
             _ => return true,
         };
@@ -15842,6 +15925,25 @@ mod tests {
                 "SUM(Sales[[#This Row],[Qty]]:Sales[[#This Row],[Qty]])",
                 true,
             ),
+            ("SUM(Sales[Qty]:Sales[[#This Row],[Price]]:Rate)", true),
+            ("SUM(Sales[Qty]:Sales[[#This Row],[Price]]:#REF!)", true),
+            (
+                "SUM(Sales[Qty]:Sales[[#This Row],[Price]]:INDEX(Sales[Price],2))",
+                true,
+            ),
+            (
+                "SUM(Sales[Qty]:Sales[[#This Row],[Price]]:Other[Price])",
+                true,
+            ),
+            ("SUM(Sales[Qty]:Sales[[#This Row],[Price]]:Other!A1)", true),
+            (
+                "SUM(Sales[[#This Row],[Qty]]:Sales[[#This Row],[Price]]:Rate)",
+                false,
+            ),
+            (
+                "SUM(Sales[[#This Row],[Qty]]:Sales[[#This Row],[Price]]:Other!A1)",
+                false,
+            ),
         ] {
             let host = FormulaHost {
                 same_sheet,
@@ -15915,6 +16017,88 @@ mod tests {
             let text = adjust_formula_for_edit(src, true, "Sheet1", &shift).unwrap();
             assert_eq!(text, want, "{src}");
             assert!(parse(&text).is_ok(), "{text} should reparse");
+        }
+    }
+
+    #[test]
+    fn every_span_chain_reads_back_as_printed() {
+        // #680 FIX r3: print -> parse -> print is stable, and the answer the
+        // same, for every chain the parser or a rewrite can build.
+        let cell = |sheet: Option<&str>, row: i64, col: i64| CellRef {
+            sheet: sheet.map(String::from),
+            row,
+            col,
+            abs_row: false,
+            abs_col: false,
+        };
+        let sales = |item, col: &str| Expr::Structured {
+            table: Some("Sales".into()),
+            item,
+            col1: Some(col.into()),
+            col2: None,
+        };
+        // (operand, whether a span can start with it)
+        let pool: Vec<(Expr, bool)> = vec![
+            (Expr::Ref(cell(None, 0, 0)), true),
+            (Expr::Range(cell(None, 1, 1), cell(None, 1, 1)), true),
+            (Expr::Range(cell(None, 1, 0), cell(None, 2, 2)), true),
+            (sales(TableItem::Data, "Qty"), true),
+            (sales(TableItem::Headers, "Qty"), true),
+            (Expr::Err(ExcelError::Ref), true),
+            (Expr::Name("Rate".into()), false),
+            (
+                Expr::Func(
+                    "INDEX".into(),
+                    vec![sales(TableItem::Data, "Price"), Expr::Num(2.0)],
+                ),
+                false,
+            ),
+            (Expr::Ref(cell(Some("Other"), 0, 0)), false),
+        ];
+        let g = issue_680_grid().with_name("Rate", "Sheet1!$B$3");
+        let run = |ast: &Expr| {
+            let text = to_string(ast);
+            let back = parse(&text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(to_string(&back), text, "{text}");
+            let value = |e: &Expr| Eval::new(&g, 0, (99, 25)).eval(e);
+            assert_eq!(value(ast), value(&back), "{text}");
+        };
+        let span = |l: Expr, r: Expr| Expr::Bin(BinOp::Range, Box::new(l), Box::new(r));
+        let mut chains = 0;
+        for len in 2..=4usize {
+            let total = pool.len().pow(len as u32);
+            for n in 0..total {
+                // Operand `k` of chain number `n`, most significant first.
+                let pick =
+                    |k: usize| &pool[(n / pool.len().pow((len - 1 - k) as u32)) % pool.len()];
+                if !pick(0).1 {
+                    continue;
+                }
+                let ends: Vec<Expr> = (0..len).map(|k| pick(k).0.clone()).collect();
+                // Left-nested, as the parser builds it…
+                run(&ends[1..].iter().cloned().fold(ends[0].clone(), span));
+                // …and right-nested, as a rewrite can leave it.
+                if len == 3 {
+                    run(&span(
+                        ends[0].clone(),
+                        span(ends[1].clone(), ends[2].clone()),
+                    ));
+                }
+                chains += 1;
+            }
+        }
+        assert!(chains > 2000, "{chains}");
+        // Typed forms the report named.
+        for src in [
+            "(Sales[Qty]:A1):Rate",
+            "(Sales[Qty]:A1):#REF!",
+            "(Sales[Qty]:A1):Other!A1",
+            "(A1):B2",
+            "(A1):Rate",
+            "SUM(Sales[Qty]:B2:Rate)",
+        ] {
+            let ast = parse(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+            run(&ast);
         }
     }
 
