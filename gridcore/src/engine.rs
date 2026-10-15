@@ -2577,11 +2577,13 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
     formula::collect_range_ops(ast, &mut spans);
     for leaves in spans {
         let mut ends = Vec::new();
-        // Only literal ends: a computed end (`INDEX(…)`, a name) has no
-        // cells of its own to box, and its arguments are not the span (they
-        // would box the formula's own cell into a false circle). Such a span
-        // is volatile, so it is recalculated whatever it names.
-        for leaf in leaves.into_iter().filter(|l| formula::is_literal_ref(l)) {
+        // Only ends that name cells: a literal reference, or a defined name
+        // that is one. A call end (`INDEX(…)`) has no cells of its own to
+        // box, and its arguments are not the span (they would box the
+        // formula's own cell into a false circle); such a span is volatile,
+        // but that only marks it dirty, so the order of calculation comes
+        // from the ends it does box.
+        for leaf in leaves.into_iter().filter(|l| names_cells(wb, sheet, l, 0)) {
             collect_deps(wb, key, leaf, &mut ends, depth + 1);
         }
         let Some(&(s, ..)) = ends.first() else {
@@ -2649,6 +2651,21 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
                 collect_deps(wb, key, &def_ast, out, depth + 1);
             }
         }
+    }
+}
+
+/// Whether a span end names cells by its text or through a defined name whose
+/// definition does (depth-capped as [`collect_deps`] expands names).
+fn names_cells(wb: &Workbook, sheet: usize, e: &Expr, depth: u32) -> bool {
+    match e {
+        Expr::Name(n) => {
+            depth < 8
+                && wb
+                    .defined_name(n, sheet)
+                    .and_then(|d| formula::parse(d).ok())
+                    .is_some_and(|d| names_cells(wb, sheet, &d, depth + 1))
+        }
+        e => formula::is_literal_ref(e),
     }
 }
 
@@ -5856,26 +5873,30 @@ mod tests {
 
     #[test]
     fn a_span_to_a_computed_end_is_no_false_circle() {
-        // #680 FIX r4: the arguments of `INDEX(Sales[Price],2)` are not a span
-        // end, so they do not box the Calc column between Qty and Price.
+        // #680 FIX r4/r5: the arguments of `INDEX(Sales[Qty],$F$1)` are not a
+        // span end, so they do not box the formula cells in column D with
+        // `$F$1` (the old box B1:F3 held D2 and D3).
         let mut wb = wb_one_sheet(&[
             ("B1", Cell::text("Qty")),
-            ("C1", Cell::text("Calc")),
-            ("D1", Cell::text("Price")),
             ("B2", Cell::number(1.0)),
-            ("D2", Cell::number(10.0)),
             ("B3", Cell::number(2.0)),
-            ("D3", Cell::number(20.0)),
-            ("C2", Cell::formula("SUM(Sales[Qty]:INDEX(Sales[Price],2))")),
-            ("C3", Cell::formula("SUM(Sales[Qty]:INDEX(Sales[Price],2))")),
+            ("F1", Cell::number(1.0)),
+            (
+                "D2",
+                Cell::formula("SUM(Sales[Qty]:INDEX(Sales[Qty],$F$1))"),
+            ),
+            (
+                "D3",
+                Cell::formula("SUM(Sales[Qty]:INDEX(Sales[Qty],$F$1))"),
+            ),
         ]);
         wb.tables.push(crate::sheet::Table {
             name: "Sales".to_string(),
             sheet: 0,
-            range: (0, 1, 2, 3),
+            range: (0, 1, 2, 1),
             header_rows: 1,
             totals_rows: 0,
-            columns: vec!["Qty".into(), "Calc".into(), "Price".into()],
+            columns: vec!["Qty".into()],
             part: String::new(),
             column_ids: Vec::new(),
             calculated_formulas: Vec::new(),
@@ -5883,6 +5904,54 @@ mod tests {
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
         assert_eq!(eng.circular_refs(), Vec::<Key>::new());
+    }
+
+    #[test]
+    fn a_span_to_a_defined_name_depends_on_the_cells_between_its_ends() {
+        // #680 FIX r5: `Sales[Qty]:Rate` (Rate = $D$3) boxes B2:D3, so C3
+        // inside it is calculated first, and a span inside its own box is a
+        // circle.
+        let make = |span_at: &str| {
+            let mut wb = wb_one_sheet(&[
+                ("B1", Cell::text("Qty")),
+                ("B2", Cell::number(1.0)),
+                ("B3", Cell::number(2.0)),
+                ("D3", Cell::number(4.0)),
+                ("A9", Cell::number(10.0)),
+                ("C3", Cell::formula("A9*2")),
+                (span_at, Cell::formula("SUM(Sales[Qty]:Rate)")),
+            ]);
+            wb.tables.push(crate::sheet::Table {
+                name: "Sales".to_string(),
+                sheet: 0,
+                range: (0, 1, 2, 1),
+                header_rows: 1,
+                totals_rows: 0,
+                columns: vec!["Qty".into()],
+                part: String::new(),
+                column_ids: Vec::new(),
+                calculated_formulas: Vec::new(),
+            });
+            wb.defined_names.push(crate::sheet::DefinedName {
+                name: "Rate".into(),
+                scope: None,
+                formula: "Sheet1!$D$3".into(),
+            });
+            wb
+        };
+        // G1 sorts before C3 yet reads it: B2:D3 = 1+2+(C3=20)+4 (+ gaps).
+        let mut wb = make("G1");
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "G1"), CellValue::Number(27.0));
+        set(&mut eng, &mut wb, "A9", Cell::number(100.0));
+        assert_eq!(value_at(&wb, "G1"), CellValue::Number(207.0));
+        // A span cell inside its own box.
+        let mut wb = make("C2");
+        let eng = Engine::new(&wb);
+        let mut eng = eng;
+        eng.recalc_all(&mut wb);
+        assert!(eng.circular_refs().contains(&(0, 1, 2)));
     }
 
     #[test]

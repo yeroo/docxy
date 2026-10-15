@@ -537,10 +537,6 @@ struct Parser<'a> {
 /// engine keeps the cached value) instead of overflowing the native stack.
 const MAX_PARSE_DEPTH: u32 = 128;
 
-/// Whether the last operand of `e`, through spans and intersections, is a
-/// cell reference or a name: the readers of those take a following `:` (and
-/// its end) themselves, so a span that ends in one is parenthesised before a
-/// further `:`.
 /// Whether the last operand of `e`, through spans and intersections, is a name
 /// or a call, which a `(` after it (even after a space) turns into a call.
 fn ends_callable(e: &Expr) -> bool {
@@ -551,6 +547,10 @@ fn ends_callable(e: &Expr) -> bool {
     }
 }
 
+/// Whether the last operand of `e`, through spans and intersections, is a
+/// cell reference or a name: the readers of those take a following `:` (and
+/// its end) or `[` themselves, so a span that ends in one is parenthesised
+/// before a further `:`, and an intersection's left end before a `[`.
 fn ends_in_cell(e: &Expr) -> bool {
     match e {
         Expr::Ref(_) | Expr::Name(_) => true,
@@ -1799,6 +1799,10 @@ impl Printer {
                     if matches!(**l, Expr::Name(_) | Expr::Func(..) | Expr::Call(..)) {
                         return format!("{rs} {ls}");
                     }
+                    ls = format!("({ls})");
+                }
+                // `A1 [Qty]` reads as the table reference `A1[Qty]`.
+                if *op == BinOp::Isect && !lp && rs.starts_with('[') && ends_in_cell(l) {
                     ls = format!("({ls})");
                 }
                 format!("{ls}{}{rs}", bin_symbol(*op))
@@ -16119,6 +16123,30 @@ mod tests {
             Expr::Name("Total".into()),
         );
         let isect = |l: Expr, r: Expr| Expr::Bin(BinOp::Isect, Box::new(l), Box::new(r));
+        // …and a left end that is a cell or name before a `[` would read as
+        // a table reference.
+        let bare = |col: &str| Expr::Structured {
+            table: None,
+            item: TableItem::Data,
+            col1: Some(col.into()),
+            col2: None,
+        };
+        for ast in [
+            isect(Expr::Ref(cell(None, 0, 0)), bare("Qty")),
+            isect(Expr::Name("Rate".into()), bare("Qty")),
+            isect(
+                span(sales(TableItem::Data, "Qty"), Expr::Name("Rate".into())),
+                bare("Price"),
+            ),
+        ] {
+            let text = to_string(&ast);
+            let back = parse(&text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert!(
+                matches!(back, Expr::Bin(BinOp::Isect, ..)),
+                "{text} read back as {back:?}"
+            );
+            assert_eq!(to_string(&back), text);
+        }
         let index = Expr::Func(
             "INDEX".into(),
             vec![sales(TableItem::Data, "Price"), Expr::Num(2.0)],
