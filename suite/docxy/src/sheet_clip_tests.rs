@@ -116,7 +116,7 @@ fn a_tiled_paste_over_part_of_an_array_is_refused_whole() {
     d1.f_attrs = Some(" t=\"array\" ref=\"D1:D3\"".into());
     v.pkg.workbook.sheets[s].set_cell(0, 3, d1);
     put(&mut v, "F1", Cell::number(7.0));
-    v.engine = sheet_engine(&v.pkg.workbook);
+    v.rebuild_engine();
     v.engine.recalc_all(&mut v.pkg.workbook);
     let clip = copy(&mut v, "F1", "F1");
     let before = v.sheet().cells.clone();

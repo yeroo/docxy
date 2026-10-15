@@ -26,7 +26,8 @@ use crate::formula::{
     contains_db_fn,
 };
 use crate::sheet::{
-    Cell, CellMeta, CellValue, Sheet, Workbook, array_block, f_ref, is_array_f, own_array_ref,
+    CalcMode, Cell, CellMeta, CellValue, Sheet, Workbook, array_block, f_ref, is_array_f,
+    own_array_ref,
 };
 
 /// (sheet index, row, col) — the engine's cell address.
@@ -101,6 +102,16 @@ pub struct Engine {
     /// a pure function of `formulas`. Built on first use, dropped together
     /// with `rev` by [`Engine::invalidate_rev`].
     flagged: Option<FlaggedKeys>,
+    /// Manual mode ([`CalcMode::Manual`]): formulas whose values are out of
+    /// date because something they read changed, or because they are volatile,
+    /// and which Calculate Now / Calculate Sheet will bring up to date.
+    stale: HashSet<Key>,
+    /// A Calculate Now / Calculate Sheet is running: manual mode is lifted so
+    /// its nested spill passes evaluate too.
+    forcing: bool,
+    /// The running Calculate is a manual one with iterative calculation on:
+    /// each circle gets one pass, not a run to convergence.
+    one_pass: bool,
 }
 
 /// The keys of the volatile formulas and of those with a spill reference
@@ -406,7 +417,7 @@ impl Engine {
             }
             None => {}
         }
-        self.put_cell(wb, key, cell, refuse)
+        self.put_cell(wb, key, cell, refuse, true)
     }
 
     /// Apply a group of edits to sheet `s` (a paste, a fill, a replace-all)
@@ -647,7 +658,7 @@ impl Engine {
     /// ([`Engine::set_cell`]): it puts back a state the sheet was in. A plain
     /// value restored into an evaluated block that stays is refilled by it.
     pub fn restore_cell(&mut self, wb: &mut Workbook, key: Key, cell: Cell) {
-        self.put_cell(wb, key, cell, false);
+        self.put_cell(wb, key, cell, false, false);
     }
 
     /// Put a group of cells on sheet `s` back exactly as they were (an undo or
@@ -864,8 +875,21 @@ impl Engine {
     /// ([`Engine::set_cell`]) refuses; a group checked whole
     /// ([`Engine::set_cells_prechecked`], [`Engine::paste_block_prechecked`])
     /// does not, nor does a restored snapshot.
-    fn put_cell(&mut self, wb: &mut Workbook, key: Key, mut cell: Cell, refuse: bool) -> bool {
+    ///
+    /// `typed` is a user's entry (not a restored snapshot): with Set precision
+    /// as displayed on, a constant number is stored as its format shows it.
+    fn put_cell(
+        &mut self,
+        wb: &mut Workbook,
+        key: Key,
+        mut cell: Cell,
+        refuse: bool,
+        typed: bool,
+    ) -> bool {
         cell.spill = None;
+        if typed && wb.calc.precision_as_displayed && cell.formula.is_none() {
+            crate::sheet::round_cell_to_display(&wb.styles.xfs, &mut cell);
+        }
         let (s, r, c) = key;
         let SpillOwner {
             mut owner,
@@ -924,6 +948,7 @@ impl Engine {
         self.unsupported.remove(&key);
         self.supported.remove(&key);
         self.spill_blocked.remove(&key);
+        self.stale.remove(&key);
         let mut changed = vec![key];
         if let Some(sheet) = wb.sheets.get_mut(s) {
             // Replacing a spill anchor orphans its spilled cells: clear them.
@@ -1053,13 +1078,115 @@ impl Engine {
     /// after load when a full refresh is wanted).
     pub fn recalc_all(&mut self, wb: &mut Workbook) {
         let all: HashSet<Key> = self.formulas.keys().copied().collect();
-        self.evaluate(wb, all, 0);
+        self.forced(wb, all);
+        self.stale.clear();
+    }
+
+    /// Calculate Sheet (Shift+F9): bring the formulas of sheet `s` that are
+    /// stale or volatile up to date, with their dependents on that sheet. In
+    /// manual mode the dependents on other sheets go stale; otherwise they
+    /// are evaluated too, as every edit does.
+    pub fn recalc_sheet(&mut self, wb: &mut Workbook, s: usize) {
+        self.ensure_flagged();
+        let mut seeds: HashSet<Key> = self.stale.iter().copied().filter(|k| k.0 == s).collect();
+        if let Some(f) = &self.flagged {
+            seeds.extend(f.volatile.iter().copied().filter(|k| k.0 == s));
+        }
+        seeds.extend(self.spill_blocked.iter().copied().filter(|k| k.0 == s));
+        seeds.retain(|k| self.formulas.contains_key(k));
+        let mut dirty = self.dependents_of(&seeds.iter().copied().collect::<Vec<_>>());
+        dirty.extend(seeds);
+        if wb.calc.mode == CalcMode::Manual {
+            let (here, elsewhere): (HashSet<Key>, HashSet<Key>) =
+                dirty.into_iter().partition(|k| k.0 == s);
+            for k in elsewhere {
+                if !self.unsupported.contains(&k) {
+                    self.stale.insert(k);
+                }
+            }
+            dirty = here;
+        }
+        self.forced(wb, dirty);
+    }
+
+    /// Whether any formula is stale (manual mode): the status bar's
+    /// `Calculate`.
+    pub fn is_stale(&self) -> bool {
+        self.stale_count() > 0
+    }
+
+    /// For an engine rebuilt over the same workbook (a structural edit, an
+    /// undo): when `old` had stale formulas, every formula here is stale, since
+    /// the cells may have moved and the rebuild cannot tell which were fresh.
+    pub fn inherit_stale(&mut self, old: &Engine) {
+        if old.is_stale() {
+            self.mark_all_stale();
+        }
+    }
+
+    /// These formulas are out of date (manual mode); cells that are not
+    /// supported formulas are ignored.
+    pub fn mark_stale(&mut self, keys: impl IntoIterator<Item = Key>) {
+        for k in keys {
+            if self.formulas.contains_key(&k) && !self.unsupported.contains(&k) {
+                self.stale.insert(k);
+            }
+        }
+    }
+
+    /// Every formula is out of date: the cells came from a state whose
+    /// values were not calculated (an undo to a manual-mode snapshot).
+    pub fn mark_all_stale(&mut self) {
+        self.stale = self
+            .formulas
+            .keys()
+            .copied()
+            .filter(|k| !self.unsupported.contains(k))
+            .collect();
+    }
+
+    /// How many formulas are stale.
+    pub fn stale_count(&self) -> usize {
+        self.stale
+            .iter()
+            .filter(|k| self.formulas.contains_key(k) && !self.unsupported.contains(k))
+            .count()
+    }
+
+    /// How many formulas of sheet `s` are stale.
+    pub fn stale_on_sheet(&self, s: usize) -> usize {
+        self.stale
+            .iter()
+            .filter(|k| k.0 == s && self.formulas.contains_key(k) && !self.unsupported.contains(k))
+            .count()
+    }
+
+    /// Evaluate `dirty` as a Calculate: manual mode lifted, and in manual
+    /// mode with iteration on, one pass per circle.
+    fn forced(&mut self, wb: &mut Workbook, dirty: HashSet<Key>) {
+        self.forcing = true;
+        self.one_pass = wb.calc.mode == CalcMode::Manual;
+        self.evaluate(wb, dirty, 0);
+        self.forcing = false;
+        self.one_pass = false;
     }
 
     /// Dirty the transitive dependents of `changed` (plus volatiles) and
-    /// re-evaluate them.
+    /// re-evaluate them. In manual mode only the changed formulas themselves
+    /// evaluate and every dependent goes stale (see [`Engine::is_stale`]);
+    /// [`Engine::recalc_from_forced`] is the Calculate form.
     pub fn recalc_from(&mut self, wb: &mut Workbook, changed: &[Key]) {
         self.recalc_from_depth(wb, changed, 0);
+    }
+
+    /// [`Engine::recalc_from`] as part of a Calculate: manual mode lifted, so
+    /// the dependents evaluate (and leave the stale set) instead of going stale.
+    pub fn recalc_from_forced(&mut self, wb: &mut Workbook, changed: &[Key]) {
+        self.forcing = true;
+        self.one_pass = wb.calc.mode == CalcMode::Manual;
+        self.recalc_from_depth(wb, changed, 0);
+        self.forcing = false;
+        self.one_pass = false;
     }
 
     fn recalc_from_depth(&mut self, wb: &mut Workbook, changed: &[Key], depth: u32) {
@@ -1143,6 +1270,28 @@ impl Engine {
             }
         }
         self.rev = Some(rev);
+        // Manual mode: an edit evaluates the formulas it typed and leaves
+        // everything else — dependents, volatiles, blocked anchors, and the
+        // dependents of any spill write — stale for the next Calculate.
+        let dirty = if wb.calc.mode == CalcMode::Manual && !self.forcing {
+            let now: HashSet<Key> = if depth == 0 {
+                changed
+                    .iter()
+                    .copied()
+                    .filter(|k| self.formulas.contains_key(k))
+                    .collect()
+            } else {
+                HashSet::new()
+            };
+            for &k in dirty.difference(&now) {
+                if self.formulas.contains_key(&k) && !self.unsupported.contains(&k) {
+                    self.stale.insert(k);
+                }
+            }
+            now
+        } else {
+            dirty
+        };
         self.evaluate(wb, dirty, depth);
     }
 
@@ -1354,6 +1503,9 @@ impl Engine {
             // their spills never outlives one top-level pass.
             self.pass_anchors.clear();
         }
+        for k in &dirty {
+            self.stale.remove(k);
+        }
         // Only supported formulas actually evaluate; unsupported ones keep
         // their cached values but still satisfy dependents.
         let dirty: Vec<Key> = dirty
@@ -1451,6 +1603,7 @@ impl Engine {
             found.extend(comp.iter().copied());
             match wb.iterate {
                 Some((count, delta)) => {
+                    let count = if self.one_pass { 1 } else { count };
                     spilled.extend(self.iterate_circle(wb, &comp, count, delta));
                 }
                 None => {
@@ -1578,7 +1731,31 @@ impl Engine {
 
     /// Evaluate one formula and store its result. Returns the keys of cells
     /// beyond the anchor whose stored values changed (spill writes/clears).
+    /// With Set precision as displayed on, the numbers it stored (the anchor's
+    /// and any spill's) are rounded to their cells' formats.
     fn eval_one(&mut self, wb: &mut Workbook, key: Key) -> Vec<Key> {
+        let changed = self.eval_one_raw(wb, key);
+        if wb.calc.precision_as_displayed && !self.unsupported.contains(&key) {
+            let (s, r, c) = key;
+            let (h, w) = (wb.sheets.get(s))
+                .and_then(|sh| sh.cell(r, c))
+                .and_then(|cl| cl.spill)
+                .unwrap_or((1, 1));
+            let xfs = &wb.styles.xfs;
+            if let Some(sheet) = wb.sheets.get_mut(s) {
+                for rr in r..r + h {
+                    for cc in c..c + w {
+                        if let Some(cell) = sheet.cells.get_mut(&(rr, cc)) {
+                            crate::sheet::round_cell_to_display(xfs, cell);
+                        }
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    fn eval_one_raw(&mut self, wb: &mut Workbook, key: Key) -> Vec<Key> {
         let info = match self.formulas.get(&key) {
             Some(i) => i,
             None => return Vec::new(),

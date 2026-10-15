@@ -82,6 +82,8 @@ pub(crate) fn verb_for(name: &str) -> Option<&'static str> {
         "xlsxy_options" => "app.options",
         "xlsxy_convert" => "wb.convert",
         "xlsxy_consolidate" => "wb.consolidate",
+        "xlsxy_calc" => "wb.calc",
+        "xlsxy_calc_set" => "wb.calc.set",
         _ => return None,
     })
 }
@@ -211,8 +213,17 @@ fn tool_defs() -> Json {
         ),
         tool(
             "xlsxy_recalc",
-            "Recalculate the whole workbook (and refresh pivots).",
-            vec![target()],
+            "Calculate Now: recalculate the whole workbook (and refresh pivots), bringing everything stale up to date. With a sheet (index or name), Calculate Sheet instead: only that sheet's stale and volatile formulas and their dependents there; other sheets' stale cells stay stale (the reply's stale counts them).",
+            vec![
+                (
+                    "sheet",
+                    prop(
+                        "string",
+                        "Calculate Sheet on this sheet (index or name); omit for Calculate Now on every sheet.",
+                    ),
+                ),
+                target(),
+            ],
             &[],
         ),
         tool(
@@ -1182,6 +1193,76 @@ fn tool_defs() -> Json {
             ],
             &["refs"],
         ),
+        tool(
+            "xlsxy_calc",
+            "Read the calculation settings: mode (auto, autoNoTable, manual), precisionAsDisplayed, iterate {enabled, maxIterations, maxChange}, threads (null = all), concurrent, transitionEvaluation, and stale (formulas out of date in manual mode).",
+            vec![target()],
+            &[],
+        ),
+        tool(
+            "xlsxy_calc_set",
+            "Change calculation settings (Formulas > Calculation Options, File > Options > Formulas); every key is optional and everything given is checked before any is set. In manual mode an edit evaluates only the formulas typed; dependents and volatiles stay stale until xlsxy_recalc. precisionAsDisplayed:true rounds every constant to its displayed number format (General, dates and text untouched; one undo step) and is its own undo step, so send it with only acceptLoss (it is refused with any other key), and is refused without acceptLoss:true (\"Data will permanently lose accuracy.\"). Returns the new settings.",
+            vec![
+                (
+                    "mode",
+                    prop(
+                        "string",
+                        "auto, autoNoTable (as auto here: no data tables) or manual.",
+                    ),
+                ),
+                (
+                    "precisionAsDisplayed",
+                    prop("boolean", "Set precision as displayed."),
+                ),
+                (
+                    "acceptLoss",
+                    prop(
+                        "boolean",
+                        "Accept the warning when switching precisionAsDisplayed on.",
+                    ),
+                ),
+                (
+                    "iterate",
+                    prop_obj(
+                        vec![
+                            ("enabled", prop("boolean", "Enable iterative calculation.")),
+                            (
+                                "maxIterations",
+                                prop("integer", "Maximum Iterations, 1 to 32767."),
+                            ),
+                            ("maxChange", prop("number", "Maximum Change, 0 or more.")),
+                        ],
+                        &[],
+                        "Iterative calculation; in manual mode each Calculate runs one pass.",
+                    ),
+                ),
+                (
+                    "threads",
+                    Json::obj(vec![
+                        (
+                            "type",
+                            Json::Arr(vec![Json::Str("integer".into()), Json::Str("null".into())]),
+                        ),
+                        (
+                            "description",
+                            Json::Str(
+                                "Calculation threads, 1 to 1024; null for all processors.".into(),
+                            ),
+                        ),
+                    ]),
+                ),
+                (
+                    "concurrent",
+                    prop("boolean", "Enable multi-threaded calculation."),
+                ),
+                (
+                    "transitionEvaluation",
+                    prop("boolean", "Transition formula evaluation."),
+                ),
+                target(),
+            ],
+            &[],
+        ),
     ])
 }
 
@@ -1316,12 +1397,15 @@ mod tests {
             "xlsxy_convert",
             // #988: Data > Consolidate.
             "xlsxy_consolidate",
+            // #674: calculation options.
+            "xlsxy_calc",
+            "xlsxy_calc_set",
         ];
         let save_pos = names.iter().position(|n| *n == "xlsxy_save").unwrap();
         assert_eq!(
             &names[save_pos + 1..],
             &expected_tail,
-            "wave-1/wave-2/wave-3/#600/#612/#712/#761/#874/#988 tools must be appended right after xlsxy_save, in this order"
+            "wave-1/wave-2/wave-3/#600/#612/#712/#761/#874/#988/#674 tools must be appended right after xlsxy_save, in this order"
         );
         for t in tools {
             assert_eq!(
@@ -1588,6 +1672,8 @@ mod tests {
         ("xlsxy_options", "app.options"),
         ("xlsxy_convert", "wb.convert"),
         ("xlsxy_consolidate", "wb.consolidate"),
+        ("xlsxy_calc", "wb.calc"),
+        ("xlsxy_calc_set", "wb.calc.set"),
     ];
     /// Tools handled specially in `do_tool` (not simple verb forwards), so
     /// `verb_for` deliberately returns `None` for them.

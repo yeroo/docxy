@@ -106,7 +106,7 @@ impl SheetView {
         self.sel = (r1, c1);
         self.clear_areas();
         // Filled formulas were re-based, so their copied results are stale.
-        self.engine = crate::sheet_engine(&self.pkg.workbook);
+        self.rebuild_engine();
         self.engine.recalc_all(&mut self.pkg.workbook);
         Ok(filled)
     }

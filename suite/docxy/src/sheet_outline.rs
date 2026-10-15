@@ -102,7 +102,7 @@ fn edit_sheet(
     }
     v.push_undo_snapshot(snap, SheetStep::Named(step));
     // Hidden rows change what SUBTOTAL(101..111) and AGGREGATE return.
-    v.engine = crate::sheet_engine(&v.pkg.workbook);
+    v.rebuild_engine();
     tab.set_dirty();
     Ok(true)
 }
@@ -527,7 +527,7 @@ fn apply_subtotal(
         return Ok(());
     }
     v.push_undo_snapshot(snap, SheetStep::Named("Subtotals"));
-    v.engine = crate::sheet_engine(&v.pkg.workbook);
+    v.rebuild_engine();
     // The engine only indexes: the SUBTOTAL formulas just written (and any
     // formula a removed row moved) need their values, which a save caches.
     v.engine.recalc_all(&mut v.pkg.workbook);
@@ -611,7 +611,7 @@ mod tests {
             s.set_cell(r, 0, Cell::text(g));
             s.set_cell(r, 1, Cell::number(n));
         }
-        v.engine = crate::sheet_engine(&v.pkg.workbook);
+        v.rebuild_engine();
         select(&mut t, 2, 0, 2, 0);
         t
     }

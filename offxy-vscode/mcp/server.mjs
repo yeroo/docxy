@@ -816,8 +816,17 @@ function xlsxyToolDefs() {
     ),
     tool(
       'xlsxy_recalc',
-      'Recalculate the whole workbook (and refresh pivots).',
-      Object.fromEntries([target()]),
+      'Calculate Now: recalculate the whole workbook (and refresh pivots), bringing everything stale up to date. With a sheet (index or name), Calculate Sheet instead: only that sheet\'s stale and volatile formulas and their dependents there; other sheets\' stale cells stay stale (the reply\'s stale counts them).',
+      Object.fromEntries([
+        [
+          'sheet',
+          prop(
+            'string',
+            'Calculate Sheet on this sheet (index or name); omit for Calculate Now on every sheet.',
+          ),
+        ],
+        target(),
+      ]),
       [],
     ),
     tool(
@@ -1393,6 +1402,44 @@ function xlsxyToolDefs() {
       ]),
       ['refs'],
     ),
+    tool(
+      'xlsxy_calc',
+      'Read the calculation settings: mode (auto, autoNoTable, manual), precisionAsDisplayed, iterate {enabled, maxIterations, maxChange}, threads (null = all), concurrent, transitionEvaluation, and stale (formulas out of date in manual mode).',
+      Object.fromEntries([target()]),
+      [],
+    ),
+    tool(
+      'xlsxy_calc_set',
+      'Change calculation settings (Formulas > Calculation Options, File > Options > Formulas); every key is optional and everything given is checked before any is set. In manual mode an edit evaluates only the formulas typed; dependents and volatiles stay stale until xlsxy_recalc. precisionAsDisplayed:true rounds every constant to its displayed number format (General, dates and text untouched; one undo step) and is its own undo step, so send it with only acceptLoss (it is refused with any other key), and is refused without acceptLoss:true ("Data will permanently lose accuracy."). Returns the new settings.',
+      Object.fromEntries([
+        ['mode', prop('string', 'auto, autoNoTable (as auto here: no data tables) or manual.')],
+        ['precisionAsDisplayed', prop('boolean', 'Set precision as displayed.')],
+        ['acceptLoss', prop('boolean', 'Accept the warning when switching precisionAsDisplayed on.')],
+        [
+          'iterate',
+          propObj(
+            Object.fromEntries([
+              ['enabled', prop('boolean', 'Enable iterative calculation.')],
+              ['maxIterations', prop('integer', 'Maximum Iterations, 1 to 32767.')],
+              ['maxChange', prop('number', 'Maximum Change, 0 or more.')],
+            ]),
+            [],
+            'Iterative calculation; in manual mode each Calculate runs one pass.',
+          ),
+        ],
+        [
+          'threads',
+          {
+            type: ['integer', 'null'],
+            description: 'Calculation threads, 1 to 1024; null for all processors.',
+          },
+        ],
+        ['concurrent', prop('boolean', 'Enable multi-threaded calculation.')],
+        ['transitionEvaluation', prop('boolean', 'Transition formula evaluation.')],
+        target(),
+      ]),
+      [],
+    ),
   ];
 }
 
@@ -1500,6 +1547,8 @@ const XLSXY_VERBS = {
   xlsxy_options: 'app.options',
   xlsxy_convert: 'wb.convert',
   xlsxy_consolidate: 'wb.consolidate',
+  xlsxy_calc: 'wb.calc',
+  xlsxy_calc_set: 'wb.calc.set',
 };
 
 /** Execute a tool by forwarding to the control surface. Returns the result

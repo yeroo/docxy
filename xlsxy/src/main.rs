@@ -32,6 +32,8 @@ mod textdlg;
 mod validationdlg;
 
 #[cfg(test)]
+mod calc_tests;
+#[cfg(test)]
 mod protected_view_tests;
 
 // Bring the trait's methods (`extensions`, `default_save_name`, …) into scope
@@ -465,6 +467,15 @@ fn type_for_path(path: &str) -> Option<usize> {
     SAVE_TYPES.iter().position(|t| t.ext == ext)
 }
 
+/// The headless `--recalc`: Calculate Now on a freshly loaded workbook, so a
+/// manual workbook and what reads its pivot output are up to date in the file.
+fn recalc_package(pkg: &mut SheetPackage) -> gridcore::pivot::RefreshOutcome {
+    let mut engine = Engine::new(&pkg.workbook);
+    engine.clock = now_serial();
+    engine.seed = entropy_seed();
+    gridcore::calc::calculate_now(&mut pkg.workbook, &mut engine, true)
+}
+
 /// `path`'s save type when a workbook package can't be written under it:
 /// any type that is not a package, so an `.xls` (written as BIFF8 only in
 /// Compatibility Mode, #874, never by a headless run), an `.xlsb` or `.ods`
@@ -742,16 +753,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         let mut pkg = pkg;
-        let mut engine = Engine::new(&pkg.workbook);
-        engine.clock = now_serial();
-        engine.seed = entropy_seed();
-        engine.recalc_all(&mut pkg.workbook);
-        // Refresh pivots from the recalculated data, then recalculate
-        // anything that reads pivot output cells.
-        let pivots = gridcore::pivot::refresh_pivots(&mut pkg.workbook);
-        if !pivots.changed.is_empty() {
-            engine.recalc_from(&mut pkg.workbook, &pivots.changed);
-        }
+        let pivots = recalc_package(&mut pkg);
         if pivots.refreshed + pivots.skipped > 0 {
             println!(
                 "pivots: {} refreshed, {} kept on cached values",
@@ -1519,8 +1521,8 @@ fn pv_allows_key(code: KeyCode, ctrl: bool, shift: bool, alt: bool) -> bool {
         KeyCode::F(3) => true,
         // Shift+F4 is the sheet list; F4 repeats.
         KeyCode::F(4) => shift,
-        // Plain F9 engaged the ribbon before this; Shift/Ctrl+F9 recalculate
-        // without refreshing pivots while protected.
+        // Plain F9 engaged the ribbon before this; Ctrl+F9 is Calculate Now
+        // (pivots kept cached while protected), Shift+F9 Calculate Sheet.
         KeyCode::F(9) => true,
         _ => false,
     }
@@ -1948,6 +1950,10 @@ struct WbSnapshot {
     /// converted ones keep their parts until a save.
     tables: Vec<gridcore::sheet::Table>,
     removed_tables: Vec<gridcore::sheet::RemovedTable>,
+    /// Set precision as displayed (on, and the file's own `fullPrecision="0"`
+    /// kept), only in the snapshots of the step that switches it on
+    /// ([`App::precision_on`]); every other step leaves the setting alone.
+    precision: Option<(bool, bool)>,
     /// Each PivotTable's source: a table rename moves it.
     pivot_sources: Vec<gridcore::pivot::PivotSource>,
     /// A table rename (from, to) to replay on the data model when this
@@ -2573,9 +2579,12 @@ struct App {
 
 impl App {
     fn new(pkg: SheetPackage, path: &str) -> App {
+        let mut pkg = pkg;
         let mut engine = Engine::new(&pkg.workbook);
         engine.clock = now_serial();
         engine.seed = entropy_seed();
+        // A manual-mode file opens fresh (#674).
+        gridcore::calc::load_fresh(&mut pkg.workbook, &mut engine);
         let (model_rels, model_measures) = pkg
             .part(MODEL_PART)
             .map(|b| parse_model_part(&String::from_utf8_lossy(b)))
@@ -2907,6 +2916,8 @@ impl App {
     /// The words Excel's status bar shows for the options in force.
     fn status_words(&self) -> Vec<&'static str> {
         let mut words = Vec::new();
+        // Manual calculation with values out of date (Excel's `Calculate`).
+        words.extend(gridcore::calc::status_word(&self.engine));
         if self.edit_opts.fixed_decimal {
             words.push("Fixed Decimal");
         }
@@ -3699,6 +3710,7 @@ impl App {
             names: wb.defined_names.clone(),
             tables: wb.tables.clone(),
             removed_tables: wb.removed_tables.clone(),
+            precision: None,
             pivot_sources: wb.pivots.iter().map(|p| p.source.clone()).collect(),
             model_rename: None,
         }
@@ -3717,6 +3729,9 @@ impl App {
         wb.defined_names = snap.names.clone();
         wb.tables = snap.tables.clone();
         wb.removed_tables = snap.removed_tables.clone();
+        if let Some((on, file_off)) = snap.precision {
+            (wb.calc.precision_as_displayed, wb.calc.precision_file_off) = (on, file_off);
+        }
         // Pivots aren't added or removed by a structural edit; if their count
         // changed since, the sources no longer line up and stay as they are.
         if wb.pivots.len() == snap.pivot_sources.len() {
@@ -4148,15 +4163,13 @@ impl App {
     /// In Protected View (#894) the pivots keep their cached values: a
     /// refresh changes the workbook.
     fn recalc_and_refresh(&mut self) {
-        self.engine.recalc_all(&mut self.pkg.workbook);
-        if self.protected_view.is_some() {
+        let pv = self.protected_view.is_some();
+        let outcome = gridcore::calc::calculate_now(&mut self.pkg.workbook, &mut self.engine, !pv);
+        if pv {
             self.status = Some("Recalculated; pivots kept their cached values".to_string());
             return;
         }
-        let outcome = gridcore::pivot::refresh_pivots(&mut self.pkg.workbook);
         if !outcome.changed.is_empty() {
-            self.engine
-                .recalc_from(&mut self.pkg.workbook, &outcome.changed);
             self.modified = true;
         }
         self.status = Some(match (outcome.refreshed, outcome.skipped) {
@@ -4164,6 +4177,41 @@ impl App {
             (r, 0) => format!("Recalculated; {r} pivot(s) refreshed"),
             (r, s) => format!("Recalculated; {r} pivot(s) refreshed, {s} kept cached values"),
         });
+    }
+
+    /// Switch Set precision as displayed on (the warning is the caller's):
+    /// the constants take their displayed values, formula results round, and
+    /// one undo step puts the constants and the switch back.
+    fn precision_on(&mut self) {
+        let was = {
+            let c = &self.pkg.workbook.calc;
+            (c.precision_as_displayed, c.precision_file_off)
+        };
+        self.structural(|wb| {
+            gridcore::calc::convert_constants(wb);
+            wb.calc.set_precision_as_displayed(true);
+        });
+        if let Some(UndoAction::Structural { before, after, .. }) = self.undo.last_mut() {
+            before.precision = Some(was);
+            after.precision = Some((true, false));
+        }
+    }
+
+    /// Shift+F9 — Calculate Sheet: the stale and volatile formulas of the
+    /// active sheet, with their dependents there. Pivots are not refreshed
+    /// (that is Calculate Now's, like Excel's refresh-all).
+    fn calculate_sheet(&mut self) {
+        let s = self.sheet;
+        self.calculate_sheet_at(s);
+    }
+
+    /// [`Self::calculate_sheet`] for sheet `s`.
+    fn calculate_sheet_at(&mut self, s: usize) {
+        self.engine.recalc_sheet(&mut self.pkg.workbook, s);
+        self.status = Some(format!(
+            "Calculated {}",
+            self.pkg.workbook.sheets.get(s).map_or("", |sh| &sh.name)
+        ));
     }
 
     fn clamp_cursor(&mut self) {
@@ -7173,7 +7221,7 @@ impl App {
 
     /// Put `pkg` in place of the workbook, keeping what it is bound to: a
     /// fresh engine, its comments and data model, the view reset, clean.
-    fn load_pkg(&mut self, pkg: SheetPackage) {
+    fn load_pkg(&mut self, mut pkg: SheetPackage) {
         let (rels, meas) = pkg
             .part(MODEL_PART)
             .map(|b| parse_model_part(&String::from_utf8_lossy(b)))
@@ -7182,6 +7230,8 @@ impl App {
         let mut engine = Engine::new(&pkg.workbook);
         engine.clock = now_serial();
         engine.seed = entropy_seed();
+        // A manual-mode file opens fresh (#674).
+        gridcore::calc::load_fresh(&mut pkg.workbook, &mut engine);
         self.engine = engine;
         self.pkg = pkg;
         self.forget_clip();
@@ -12015,7 +12065,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
 
     // --- ribbon ---------------------------------------------------------------
     let overlay_open = app.overlay_open();
-    // Plain F9 engages the ribbon (docxy parity); Shift/Ctrl+F9 stays recalc.
+    // Plain F9 engages the ribbon (docxy parity); Ctrl+F9 is Calculate Now,
+    // Shift+F9 Calculate Sheet.
     if key.code == KeyCode::F(9) && !overlay_open && !shift && !ctrl {
         app.ribbon_focus = if app.ribbon_focus == ribbon::Focus::None {
             ribbon::Focus::Tab(app.ribbon.active_tab())
@@ -12357,7 +12408,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         // F4 is Excel's Redo/Repeat (#1169); the sheet list moved to Shift+F4.
         KeyCode::F(4) if shift => app.open_sheet_picker(),
         KeyCode::F(4) => app.redo_or_repeat(),
-        // Plain F9 opens the ribbon (handled earlier); Shift+F9 forces recalc.
+        // Plain F9 opens the ribbon (handled earlier); Ctrl+F9 is Calculate
+        // Now (every sheet), Shift+F9 Calculate Sheet (the active one).
+        KeyCode::F(9) if shift && !ctrl => app.calculate_sheet(),
         KeyCode::F(9) => app.recalc_and_refresh(),
         KeyCode::Char('p') | KeyCode::Char('P') if ctrl => app.open_pivot_editor(),
         KeyCode::Char('m') | KeyCode::Char('M') if ctrl => app.open_model_view(),

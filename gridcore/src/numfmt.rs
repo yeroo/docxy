@@ -594,6 +594,49 @@ impl NumFormat {
         Some(render_section(section, x, v, explicit, date1904))
     }
 
+    /// The value as this format displays it: `v` rounded the way
+    /// [`NumFormat::format_number`] rounds it before printing (Set precision as
+    /// displayed). `None` when the format shows no fixed number of decimals of
+    /// a plain number: General, dates and times, text, fractions, scientific.
+    pub fn round_to_display(&self, v: f64) -> Option<f64> {
+        if !v.is_finite() {
+            return None;
+        }
+        let sect = self.pick_section(v)?;
+        if sect.is_date
+            || sect.is_text
+            || sect.fraction.is_some()
+            || sect.exp.is_some()
+            || sect.toks.iter().any(|t| matches!(t, Tok::General))
+            || !sect.toks.iter().any(|t| matches!(t, Tok::Digit(_)))
+        {
+            return None;
+        }
+        // What `render_number` prints: scaled, rounded to the decimals, then
+        // to 15 significant digits.
+        let shown = to_sig15(round_decimals(
+            scale_for_display(sect, v.abs()),
+            sect.dec_digits,
+        ));
+        // Taking the scale back out must not manufacture noise the display
+        // would not show (0.07 / 100 * 100 and the like).
+        let mut back = shown;
+        for _ in 0..sect.scale_commas {
+            back *= 1000.0;
+        }
+        if sect.has_percent {
+            back /= 100.0;
+        }
+        let back = to_sig15(back);
+        // Scaling a huge value up (1E300 to ten decimals) overflows, as does
+        // a format with more decimals than a float has range for: there is
+        // nothing to store, and the cell keeps its value.
+        if !shown.is_finite() || !back.is_finite() {
+            return None;
+        }
+        Some(if v < 0.0 { -back } else { back })
+    }
+
     /// Render a text value (through the `@` section when present).
     pub fn format_text(&self, s: &str) -> String {
         match self.text_section() {
@@ -840,7 +883,20 @@ fn sig15_digits(x: f64) -> (String, String) {
     }
 }
 
-fn render_number(sect: &Section, x: f64, explicit_sign: bool) -> String {
+/// `x` rounded to `dec` decimals, half away from zero.
+fn round_decimals(x: f64, dec: usize) -> f64 {
+    let f = 10f64.powi(dec as i32);
+    (x * f).round() / f
+}
+
+/// `x` at the 15 significant digits a cell shows (see [`sig15_digits`]).
+fn to_sig15(x: f64) -> f64 {
+    format!("{x:.14e}").parse().unwrap_or(x)
+}
+
+/// `x` scaled as the section displays it: a percent sign multiplies by 100,
+/// then each trailing comma divides by 1000.
+fn scale_for_display(sect: &Section, x: f64) -> f64 {
     let mut v = x;
     if sect.has_percent {
         v *= 100.0;
@@ -848,6 +904,11 @@ fn render_number(sect: &Section, x: f64, explicit_sign: bool) -> String {
     for _ in 0..sect.scale_commas {
         v /= 1000.0;
     }
+    v
+}
+
+fn render_number(sect: &Section, x: f64, explicit_sign: bool) -> String {
+    let mut v = scale_for_display(sect, x);
 
     // Scientific: v = mantissa * 10^exp with int_digits mantissa digits.
     let mut exp_val: i32 = 0;
@@ -861,10 +922,7 @@ fn render_number(sect: &Section, x: f64, explicit_sign: bool) -> String {
     }
 
     let negative = v < 0.0 || (explicit_sign && x < 0.0);
-    let rounded = {
-        let f = 10f64.powi(sect.dec_digits as i32);
-        (v.abs() * f).round() / f
-    };
+    let rounded = { round_decimals(v.abs(), sect.dec_digits) };
     // Excel shows at most 15 significant digits; the rest print as zeros.
     let (int_digits, frac_all) = sig15_digits(rounded);
 
@@ -1219,6 +1277,53 @@ mod tests {
             .unwrap_or_else(|| panic!("parse {code}"))
             .format_number(v, false)
             .unwrap_or_else(|| panic!("render {code}"))
+    }
+
+    #[test]
+    fn round_to_display_stores_what_the_format_shows() {
+        for code in ["0.00,", "0.0,,", "0.00%,", "0.00%", "#,##0.0"] {
+            let f = parse_format(code).unwrap();
+            for v in [
+                285.0,
+                565.0,
+                575.0,
+                1005.0,
+                1015.0,
+                2.85,
+                0.285,
+                12345.675,
+                285_000.0,
+                565_000.0,
+                1_005_000.0,
+            ] {
+                for v in [v, -v] {
+                    let stored = f.round_to_display(v).expect(code);
+                    // A negative that shows as -0.00 stores 0, which has no sign.
+                    if v < 0.0 && stored == 0.0 {
+                        continue;
+                    }
+                    assert_eq!(
+                        fmt(code, stored),
+                        fmt(code, v),
+                        "{code} on {v} stored {stored}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round_to_display_has_nothing_to_store_when_scaling_overflows() {
+        let f = parse_format("0.0000000000").unwrap();
+        assert_eq!(f.round_to_display(1e300), None);
+        let f = parse_format("0.00%").unwrap();
+        assert_eq!(f.round_to_display(1e306), None);
+        assert_eq!(f.round_to_display(0.5), Some(0.5));
+        // More decimals than a float has range for.
+        let many = format!("0.{}", "0".repeat(400));
+        if let Some(f) = parse_format(&many) {
+            assert_eq!(f.round_to_display(1.5), None);
+        }
     }
 
     #[test]

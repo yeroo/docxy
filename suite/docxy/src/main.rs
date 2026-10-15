@@ -102,6 +102,7 @@ mod sheet_drag;
 /// and still far below what the quadratic version they guard took (minutes).
 #[cfg(test)]
 pub(crate) const PERF_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
+mod sheet_calc;
 #[cfg(test)]
 mod sheet_entry_tests;
 mod sheet_fill;
@@ -1039,6 +1040,14 @@ struct SheetSnapshot {
     /// one, the selection taken with the step. Carried to the other stack,
     /// so Redo selects what Undo did.
     target: Option<UndoTarget>,
+    /// Set precision as displayed (on, and the file's own `fullPrecision="0"`
+    /// kept), only in the snapshots of the step that switches it on (#674).
+    /// A restore leaves the workbook's calculation settings as they are now,
+    /// as an edit's undo does in Excel, except this one.
+    precision: Option<(bool, bool)>,
+    /// Whether formulas were out of date (manual mode) when it was taken
+    /// (#674): its values may be, and restoring it must say so.
+    stale: bool,
 }
 
 /// What an undo step's Undo and Redo select (#1148), as Excel's do: what
@@ -1200,6 +1209,9 @@ fn protected_view_allows_act(act: SheetAct) -> bool {
             | SheetAct::Help(_)
             | SheetAct::NewWindow
             | SheetAct::ArrangeAll
+            // Calculating changes no file; the mode and options do.
+            | SheetAct::Calc(sheet_calc::CalcAct::Now)
+            | SheetAct::Calc(sheet_calc::CalcAct::Sheet)
     )
 }
 
@@ -1294,7 +1306,9 @@ fn multi_area_ok(act: SheetAct) -> bool {
         // Page Layout (#1019): Set and Add to Print Area take every area,
         // as Excel's do; Breaks act at the active cell, and the rest are
         // the sheet's.
-        | SheetAct::Page(_) => true,
+        | SheetAct::Page(_)
+        // Calculation is the workbook's, never the selection's (#674).
+        | SheetAct::Calc(_) => true,
         // One rectangle only.
         SheetAct::Cut
         | SheetAct::Paste
@@ -1386,6 +1400,7 @@ fn act_targets_cells(act: SheetAct) -> bool {
             | SheetAct::CustomLists
             | SheetAct::NewWindow
             | SheetAct::ArrangeAll
+            | SheetAct::Calc(_)
             | SheetAct::Todo
     )
 }
@@ -2214,6 +2229,9 @@ enum SheetAct {
     /// A Page Layout tab command (#1019): page setup, print area, breaks,
     /// scale to fit and the print options.
     Page(sheet_page_setup::PageAct),
+    /// A Formulas › Calculation command (#674): the mode, Calculate Now and
+    /// Sheet, More Calculation Options....
+    Calc(sheet_calc::CalcAct),
     FormatCells,
     Merge,
     CondFormat,
@@ -2409,6 +2427,18 @@ enum StructOp {
 }
 
 impl SheetView {
+    /// A fresh engine over the workbook as it stands, after an edit that
+    /// rebuilds it (sheets added or removed, rows moved). If the outgoing
+    /// engine had stale formulas they stay so (#674): the new engine cannot
+    /// tell which were calculated, so every formula is marked, and the next
+    /// Calculate puts them right. An undo or redo ([`Self::restore`]) also
+    /// asks the restored snapshot.
+    fn rebuild_engine(&mut self) {
+        let mut engine = sheet_engine(&self.pkg.workbook);
+        engine.inherit_stale(&self.engine);
+        self.engine = engine;
+    }
+
     fn end_cell_edit(&mut self) {
         // An entry waiting on a data-validation alert goes with its editor.
         self.dv_pending = None;
@@ -2694,6 +2724,12 @@ impl SheetView {
         });
         let mut now = self.snapshot_like(&snap);
         now.target = Some(target.clone());
+        // The step that switched Set precision as displayed on carries the
+        // switch both ways, so Redo puts it back as Undo took it off.
+        now.precision = snap.precision.map(|_| {
+            let c = &self.pkg.workbook.calc;
+            (c.precision_as_displayed, c.precision_file_off)
+        });
         let sheets = self.pkg.workbook.sheets.len();
         self.restore(snap);
         if self.pkg.workbook.sheets.len() == sheets {
@@ -2782,7 +2818,7 @@ impl SheetView {
         self.clear_areas();
         self.anchor = (0, 0);
         self.end_cell_edit();
-        self.engine = sheet_engine(&self.pkg.workbook);
+        self.rebuild_engine();
         idx
     }
 
@@ -2853,7 +2889,7 @@ impl SheetView {
         self.clear_areas();
         self.anchor = (0, 0);
         self.end_cell_edit();
-        self.engine = sheet_engine(&self.pkg.workbook);
+        self.rebuild_engine();
         true
     }
 
@@ -3059,7 +3095,7 @@ impl SheetView {
         });
         self.push_undo_snapshot(snap, step);
         // Structured references now cover a grown table: recalculate.
-        self.engine = sheet_engine(&self.pkg.workbook);
+        self.rebuild_engine();
         self.engine.recalc_all(&mut self.pkg.workbook);
     }
 
@@ -4015,7 +4051,7 @@ impl SheetView {
         for ch in self.charts.iter_mut() {
             edit::shift_chart_refs(&mut ch.data, &name, ch.sheet == s, &shift);
         }
-        self.engine = sheet_engine(&self.pkg.workbook);
+        self.rebuild_engine();
         true
     }
 
@@ -4133,6 +4169,8 @@ impl SheetView {
             anchor: self.anchor,
             areas: self.extra_areas(),
             target: None,
+            precision: None,
+            stale: self.engine.is_stale(),
         }
     }
 
@@ -4140,13 +4178,38 @@ impl SheetView {
     fn restore(&mut self, snap: SheetSnapshot) {
         self.edit_gen += 1;
         let sheets = self.pkg.workbook.sheets.len();
+        // The calculation settings are not history's (#674): an undo keeps
+        // the mode and the iteration limits it finds, and takes Set precision
+        // as displayed back only with the step that switched it.
+        let (calc, iterate) = (self.pkg.workbook.calc.clone(), self.pkg.workbook.iterate);
         match snap.body {
             SnapshotBody::Workbook(wb) => self.pkg.workbook = wb,
             SnapshotBody::Package(pkg) => self.pkg = *pkg,
         }
+        // The snapshot's values were calculated under its own iteration and
+        // precision settings; if the ones kept differ, they need calculating.
+        let (snap_iterate, snap_precision) = (
+            self.pkg.workbook.iterate,
+            self.pkg.workbook.calc.precision_as_displayed,
+        );
+        self.pkg.workbook.calc = calc;
+        self.pkg.workbook.iterate = iterate;
+        if let Some((on, file_off)) = snap.precision {
+            let c = &mut self.pkg.workbook.calc;
+            (c.precision_as_displayed, c.precision_file_off) = (on, file_off);
+        }
+        let settings_differ = snap_iterate != iterate
+            || snap_precision != self.pkg.workbook.calc.precision_as_displayed;
         self.charts = snap.charts;
         self.pivot_views = snap.pivots;
-        self.engine = sheet_engine(&self.pkg.workbook);
+        // Whether the values in hand are out of date comes from the snapshot
+        // as well as the engine being replaced (#674). Manual mode marks every
+        // formula; otherwise (the mode changed since) they are calculated now.
+        let was_stale = snap.stale || self.engine.is_stale() || settings_differ;
+        self.rebuild_engine();
+        if was_stale {
+            gridcore::calc::recalc_or_mark_stale(&mut self.pkg.workbook, &mut self.engine);
+        }
         self.active = snap
             .active
             .min(self.pkg.workbook.sheets.len().saturating_sub(1));
@@ -4612,7 +4675,7 @@ impl SheetView {
         // References follow next, and the engine is rebuilt on them, so the
         // writes below recalculate what reads the moved cells where they land.
         gridcore::edit::move_refs(&mut self.pkg.workbook, src, &mv);
-        self.engine = sheet_engine(&self.pkg.workbook);
+        self.rebuild_engine();
         // A clear landing in a frozen array block goes last
         // (`Engine::split_frozen_blanks`): a no-op while the block is whole,
         // it clears its cell once the paste has put content into the block.
@@ -10732,8 +10795,12 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                 // A formula saved without its cached `<v>` (openpyxl writes
                 // none) would show blank until something recalculated it;
                 // Excel computes such cells on open (#673).
+                // A manual-mode file opens fresh too (#674), by the same one
+                // calculation (a second would advance an iterating circle).
                 if has_uncached_formula(&pkg.workbook) {
                     engine.recalc_all(&mut pkg.workbook);
+                } else {
+                    gridcore::calc::load_fresh(&mut pkg.workbook, &mut engine);
                 }
                 let view = SheetView {
                     pkg,
@@ -17487,7 +17554,7 @@ impl Docxy {
                     self.sheet_try_edit(SheetStep::Named(CF_STEP), |v| {
                         let s = v.active;
                         let done = v.pkg.clear_conditional_formats(s);
-                        v.engine = sheet_engine(&v.pkg.workbook);
+                        v.rebuild_engine();
                         done
                     });
                 } else if let Some(((op, val, val2), cells)) = parse_cf_input(&buf).zip(cells) {
@@ -17501,7 +17568,7 @@ impl Docxy {
                             val2.as_deref(),
                             cf_preset_dxf(),
                         );
-                        v.engine = sheet_engine(&v.pkg.workbook);
+                        v.rebuild_engine();
                         done
                     });
                 }
@@ -17692,7 +17759,7 @@ impl Docxy {
                 let idx = wb.styles.intern(xf);
                 wb.sheets[s].cells.entry((r0, c0)).or_default().style = idx;
             }
-            v.engine = sheet_engine(&v.pkg.workbook);
+            v.rebuild_engine();
         }
         self.mark_sheet_dirty();
         cx.notify();
@@ -17733,7 +17800,7 @@ impl Docxy {
             }
             let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
             gridcore::edit::dedupe_rows(&mut v.pkg.workbook, s, top, bottom, header);
-            v.engine = sheet_engine(&v.pkg.workbook);
+            v.rebuild_engine();
         }
         self.mark_sheet_dirty();
         cx.notify();
@@ -18330,7 +18397,7 @@ impl Docxy {
                         }
                     }
                 }
-                v.engine = sheet_engine(&v.pkg.workbook);
+                v.rebuild_engine();
             }
         }
     }
@@ -19554,6 +19621,12 @@ impl Docxy {
                 }
                 cx.notify();
             }
+            SheetAct::Calc(c) => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    sheet_calc::run(tab, c);
+                }
+                cx.notify();
+            }
             SheetAct::FormatCells => self.sheet_format_cells(cx),
             SheetAct::Merge => self.sheet_merge_toggle(cx),
             SheetAct::WrapText => self.sheet_toggle_wrap(cx),
@@ -20098,6 +20171,13 @@ impl Docxy {
                     v.edit_eval_formula();
                 }
                 cx.notify();
+            }
+            // Calculate Sheet and Calculate Now (#674).
+            "f9" if shift && !ctrl && !alt => {
+                self.run_sheet_act(SheetAct::Calc(sheet_calc::CalcAct::Sheet), window, cx)
+            }
+            "f9" if !alt => {
+                self.run_sheet_act(SheetAct::Calc(sheet_calc::CalcAct::Now), window, cx)
             }
             // F4 while editing a formula cycles the anchoring of the reference
             // at the caret (A1, $A$1, A$1, $A1); anywhere else in the editor it
@@ -32844,7 +32924,7 @@ impl Docxy {
             self.sheet_try_edit(SheetStep::Named(CF_STEP), |v| {
                 let s = v.active;
                 let done = v.pkg.clear_conditional_formats(s);
-                v.engine = sheet_engine(&v.pkg.workbook);
+                v.rebuild_engine();
                 done
             });
         } else if let Some(((op, val, val2), cells)) = parse_cf_input(&buf).zip(cells) {
@@ -32858,7 +32938,7 @@ impl Docxy {
                     val2.as_deref(),
                     cf_preset_dxf(),
                 );
-                v.engine = sheet_engine(&v.pkg.workbook);
+                v.rebuild_engine();
                 done
             });
         }
@@ -33105,6 +33185,7 @@ impl Docxy {
         match act {
             SheetAct::Filter => v.sheet().auto_filter.is_some(),
             SheetAct::Page(p) => sheet_page_setup::is_on(p, &v.pkg.workbook, v.active),
+            SheetAct::Calc(c) => sheet_calc::is_on(c, &v.pkg.workbook),
             _ => false,
         }
     }
@@ -36439,6 +36520,10 @@ impl Render for Docxy {
             })
             .when_some(self.active_sheet().and_then(sheet_circular_word), |d, w| {
                 d.child(div().id("status-circular").text_color(fg).child(w))
+            })
+            // Manual calculation with values out of date (#674).
+            .when_some(self.active_sheet().and_then(sheet_calc::status_word), |d, w| {
+                d.child(div().id("status-calculate").text_color(fg).child(w))
             })
             .child(div().flex_1())
             .child(if self.active_is_sheet() {

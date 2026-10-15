@@ -127,7 +127,7 @@ fn a_tables_autocorrect_step_is_named_for_what_it_did_1149() {
     v.pkg
         .add_table(0, (0, 0, 1, 1), true, "TableStyleMedium2")
         .unwrap();
-    v.engine = sheet_engine(&v.pkg.workbook);
+    v.rebuild_engine();
     // Typed under the table: it grows to take the row.
     type_at(&mut v, (2, 0), "5");
     assert_eq!(v.undo_names(), ["Table AutoExpansion", "Typing '5' in A3"]);

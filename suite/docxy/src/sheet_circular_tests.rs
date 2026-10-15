@@ -146,12 +146,10 @@ fn inserting_a_row_above_a_circle_does_not_warn() {
 fn iterative_book_shows_no_circle() {
     let mut pkg = blank();
     pkg.workbook.sheets[0].set_cell(0, 3, Cell::formula("D1/2+5"));
-    // Iteration is a `<calcPr>` setting of the file.
+    // Iteration is a `<calcPr>` setting of the file, written from the model
+    // (#674): turn it on there and the save puts it in the part.
     let mut saved = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&pkg)).unwrap();
-    let wb_xml = String::from_utf8(saved.part("xl/workbook.xml").unwrap().to_vec()).unwrap();
-    assert!(wb_xml.contains("<calcPr "), "{wb_xml}");
-    let wb_xml = wb_xml.replacen("<calcPr ", "<calcPr iterate=\"1\" iterateCount=\"100\" ", 1);
-    saved.set_part("xl/workbook.xml", wb_xml.into_bytes());
+    saved.workbook.set_iteration(true, 100, 0.001);
     let book = Book::from_bytes(&gridcore::xlsx::save_xlsx(&saved));
     let mut t = book.open();
     assert!(view(&mut t).pkg.workbook.iterate.is_some());

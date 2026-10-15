@@ -952,6 +952,38 @@ dialogs! {
         accept_closes: true,
         unreachable: None,
     }
+    CALC_OPTIONS = "calc-options" {
+        surface: Surface::Sheet,
+        file: "sheet-calc",
+        fixture: XLSX,
+        open: &[r#"call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}"#],
+        fields: &[
+            checkbox("precision"),
+            checkbox("iterate"),
+            Field::number("max-iterations", "50").kept("50"),
+            Field::number("max-change", "0.5").kept("0.5"),
+            Field::number("threads", "2").kept("2"),
+            checkbox("concurrent"),
+            checkbox("transition"),
+        ],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
+    PRECISION_WARNING = "precision-warning" {
+        surface: Surface::Sheet,
+        file: "sheet-calc",
+        fixture: XLSX,
+        open: &[
+            r#"call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}"#,
+            r#"call pointer-click {"dialog-control":"precision"}"#,
+            r#"call dialog-click {"button":"OK"}"#,
+        ],
+        fields: &[],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
     CONSOLIDATE = "consolidate" {
         surface: Surface::Sheet,
         file: "sheet-data",

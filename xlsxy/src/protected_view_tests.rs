@@ -295,11 +295,14 @@ fn protected_view_keeps_navigation_find_and_copy() {
     assert_ne!(app.formula_view, view, "Ctrl+` shows formulas");
     handle_key(&mut app, key(KeyCode::Char('u'), ctrl | shift));
     assert!(app.fx_expanded, "Ctrl+Shift+U expands the formula bar");
-    handle_key(&mut app, key(KeyCode::F(9), shift));
+    // Ctrl+F9 is Calculate Now; Shift+F9 (#674) Calculate Sheet.
+    handle_key(&mut app, key(KeyCode::F(9), ctrl));
     assert_eq!(
         app.status.as_deref(),
         Some("Recalculated; pivots kept their cached values")
     );
+    handle_key(&mut app, key(KeyCode::F(9), shift));
+    assert_eq!(app.status.as_deref(), Some("Calculated Sheet1"));
     handle_key(&mut app, key(KeyCode::F(9), none));
     assert_ne!(
         app.ribbon_focus,

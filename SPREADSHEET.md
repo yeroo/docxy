@@ -351,6 +351,36 @@ placeholder would be painful to retrofit):
   `Circular References: <ref>` footer segment, and `wb.path.circular`. When
   the workbook enables iterative calculation (`calcPr iterate`), a circle
   iterates up to its count, and a converged circle stays put on recalc.
+- **Calculation options** (#674): `Workbook::calc` (`CalcSettings`) holds the
+  mode (`calcMode`: Automatic, Automatic except data tables — the same here,
+  there are no data tables — and Manual), Set precision as displayed
+  (`fullPrecision`), the remembered iteration limits, `concurrentManualCount`,
+  `concurrentCalc` and Transition formula evaluation (`sheetPr
+  transitionEvaluation`, mirrored on every sheet once the user changes it).
+  Save patches only the `calcPr` attributes the model says differently from
+  the part, so unknown ones survive; a file's `fullPrecision="0"` is kept but
+  never applied until the user turns the setting on. In **manual** mode an
+  edit evaluates only the formulas typed; their dependents, the volatile
+  formulas, blocked spill anchors and the readers of any spill write are
+  *stale* (`Engine::is_stale`, shown as `Calculate`) until `recalc_all`
+  (Calculate Now, F9, every sheet) or `recalc_sheet` (Calculate Sheet,
+  Shift+F9; other sheets' dependents stay stale). With iteration on, each
+  manual Calculate runs one pass per circle. A manual-mode file opens
+  with a full calculation (nothing stale; the hosts' open step,
+  `calc::load_fresh`); an automatic file keeps its cached values (the wasm
+  bridge calculates every file on open). A save keeps `fullCalcOnLoad="1"`. Set precision as displayed (`gridcore::calc`) rounds
+  every constant whose format shows fixed decimals (not General, dates, text,
+  fractions or scientific) after "Data will permanently lose accuracy.", then
+  rounds typed constants and formula results as they are written; switching it
+  on is the one undo step, the mode and other settings are not history.
+  The hosts differ on what they rebuild: xlsxy and the wasm bridge
+  recalculate everything after a structural edit, as do sort, fill and
+  filter in the desktop suite, while the suite's structural edits and its
+  undo and redo keep the formulas stale in manual mode (`Engine::inherit_stale`,
+  and a flag on each undo snapshot). The control
+  surface is `wb.calc`, `wb.calc.set` and `wb.recalc {sheet}`
+  (docs/agent-control.md); the desktop suite has Formulas › Calculation
+  and F9 / Shift+F9, xlsxy Ctrl+F9 / Shift+F9.
 - **Graceful degradation, never corruption:** a formula the engine can't parse
   or evaluate (unknown function, unsupported construct) keeps Excel's cached
   value, is never re-evaluated, and is saved byte-faithful. With

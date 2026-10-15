@@ -978,10 +978,14 @@
   },
   {
     "name": "xlsxy_recalc",
-    "description": "Recalculate the whole workbook (and refresh pivots).",
+    "description": "Calculate Now: recalculate the whole workbook (and refresh pivots), bringing everything stale up to date. With a sheet (index or name), Calculate Sheet instead: only that sheet's stale and volatile formulas and their dependents there; other sheets' stale cells stay stale (the reply's stale counts them).",
     "inputSchema": {
       "type": "object",
       "properties": {
+        "sheet": {
+          "type": "string",
+          "description": "Calculate Sheet on this sheet (index or name); omit for Calculate Now on every sheet."
+        },
         "target": {
           "type": "string",
           "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
@@ -2363,6 +2367,80 @@
       "required": [
         "refs"
       ]
+    }
+  },
+  {
+    "name": "xlsxy_calc",
+    "description": "Read the calculation settings: mode (auto, autoNoTable, manual), precisionAsDisplayed, iterate {enabled, maxIterations, maxChange}, threads (null = all), concurrent, transitionEvaluation, and stale (formulas out of date in manual mode).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "xlsxy_calc_set",
+    "description": "Change calculation settings (Formulas > Calculation Options, File > Options > Formulas); every key is optional and everything given is checked before any is set. In manual mode an edit evaluates only the formulas typed; dependents and volatiles stay stale until xlsxy_recalc. precisionAsDisplayed:true rounds every constant to its displayed number format (General, dates and text untouched; one undo step) and is its own undo step, so send it with only acceptLoss (it is refused with any other key), and is refused without acceptLoss:true (\"Data will permanently lose accuracy.\"). Returns the new settings.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "description": "auto, autoNoTable (as auto here: no data tables) or manual."
+        },
+        "precisionAsDisplayed": {
+          "type": "boolean",
+          "description": "Set precision as displayed."
+        },
+        "acceptLoss": {
+          "type": "boolean",
+          "description": "Accept the warning when switching precisionAsDisplayed on."
+        },
+        "iterate": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable iterative calculation."
+            },
+            "maxIterations": {
+              "type": "integer",
+              "description": "Maximum Iterations, 1 to 32767."
+            },
+            "maxChange": {
+              "type": "number",
+              "description": "Maximum Change, 0 or more."
+            }
+          },
+          "required": [],
+          "description": "Iterative calculation; in manual mode each Calculate runs one pass."
+        },
+        "threads": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Calculation threads, 1 to 1024; null for all processors."
+        },
+        "concurrent": {
+          "type": "boolean",
+          "description": "Enable multi-threaded calculation."
+        },
+        "transitionEvaluation": {
+          "type": "boolean",
+          "description": "Transition formula evaluation."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
     }
   }
 ]
