@@ -1492,14 +1492,14 @@ struct ProtectedView {
 
 /// Whether a key may reach the grid's commands in Protected View (#894):
 /// moving and extending the selection, switching sheets, copying, finding,
-/// Go To, the sheet list, formula view, recalculating, File, New and Quit.
+/// Go To, the sheet list, recalculating, File, New and Quit.
 /// Everything else would edit or write, and is refused.
 fn pv_allows_key(code: KeyCode, ctrl: bool, shift: bool, alt: bool) -> bool {
     match code {
         KeyCode::Char(c) if ctrl && !alt => {
             matches!(
                 c.to_ascii_lowercase(),
-                'q' | 'n' | 'c' | 'o' | '`' | 'f' | 'g' | 'a'
+                'q' | 'n' | 'c' | 'o' | 'f' | 'g' | 'a'
             )
         }
         KeyCode::Char(c) if alt && !ctrl => c.eq_ignore_ascii_case(&'f'),

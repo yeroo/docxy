@@ -2688,6 +2688,20 @@ impl SheetView {
             .is_some_and(|(buf, seed)| buf == seed)
     }
 
+    /// Flip the active sheet's Show Formulas flag as an undo step (#676);
+    /// the flag now.
+    fn toggle_show_formulas(&mut self) -> bool {
+        let now = !self.sheet().show_formulas;
+        self.push_undo(SheetStep::Named(if now {
+            "Show Formulas"
+        } else {
+            "Hide Formulas"
+        }));
+        let s = self.active;
+        self.pkg.workbook.sheets[s].show_formulas = now;
+        now
+    }
+
     /// Snapshot before a mutation, named `step`; share the history limit
     /// across all edits.
     fn push_undo(&mut self, step: SheetStep) {
@@ -18546,23 +18560,18 @@ impl Docxy {
         self.sheet_toggle("Borders", |x| x.border, |x, on| x.border = on, cx);
     }
 
-    /// Whether the active sheet shows its formulas (#676).
-    fn sheet_shows_formulas(&self) -> bool {
-        self.active_sheet().is_some_and(|v| v.sheet().show_formulas)
-    }
-
     /// Formulas › Show Formulas / Ctrl+`: flip the active sheet's own flag
     /// (undoable; saved with the file as `showFormulas`).
     fn sheet_show_formulas(&mut self, cx: &mut Context<Self>) {
-        let now = !self.sheet_shows_formulas();
-        self.sheet_snapshot(SheetStep::Named(if now {
-            "Show Formulas"
-        } else {
-            "Hide Formulas"
-        }));
-        if let Some(v) = self.active_sheet_mut() {
-            let s = v.active;
-            v.pkg.workbook.sheets[s].show_formulas = now;
+        // The undo step bumps the edit generation, which would end copy
+        // mode; a view flag edits no cell, so a live copy or cut stays (as a
+        // paste keeps its own).
+        let keep = self.grid_clip_current().is_some();
+        let now = self
+            .active_sheet_mut()
+            .is_some_and(SheetView::toggle_show_formulas);
+        if keep {
+            self.grid_clip_restamp();
         }
         self.set_status(if now {
             "Showing formulas"
@@ -26420,15 +26429,15 @@ mod sheet_save_tests {
         assert_eq!(saved_sheets(v), with);
     }
 
-    /// #676: Show Formulas is one sheet's flag, an undo step, and saved.
+    /// #676: Show Formulas is the active sheet's own flag, an undo step, and
+    /// saved; a pending cut survives it (as the action restamps the clip).
     #[test]
     fn show_formulas_is_per_sheet_undoable_and_saved() {
         let mut tab = three_sheet_tab();
         let Surface::Sheet(v) = &mut tab.surface else {
             unreachable!()
         };
-        v.push_undo(super::SheetStep::Named("Show Formulas"));
-        v.pkg.workbook.sheets[1].show_formulas = true;
+        v.active = 1;
         let shows = |v: &SheetView| -> Vec<bool> {
             let saved = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&v.pkg)).unwrap();
             saved
@@ -26438,11 +26447,35 @@ mod sheet_save_tests {
                 .map(|s| s.show_formulas)
                 .collect()
         };
-        assert_eq!(shows(v), [false, true, false]);
+        assert!(v.toggle_show_formulas());
+        assert_eq!(shows(v), [false, true, false], "the active sheet only");
+        assert_eq!(v.undo.len(), 1);
         assert!(v.undo_step());
         assert_eq!(shows(v), [false, false, false], "undo restores the flag");
         assert!(v.redo_step());
         assert_eq!(shows(v), [false, true, false]);
+        assert!(!v.toggle_show_formulas(), "and off again");
+        assert_eq!(shows(v), [false, false, false]);
+    }
+
+    #[test]
+    fn a_pending_cut_survives_show_formulas_once_restamped() {
+        let mut tab = three_sheet_tab();
+        let Surface::Sheet(v) = &mut tab.surface else {
+            unreachable!()
+        };
+        v.sel = (0, 0);
+        v.anchor = (0, 0);
+        let mut clip = v.grid_clip(true).expect("something to cut");
+        assert!(!clip.stale_in(v));
+        v.toggle_show_formulas();
+        assert!(clip.stale_in(v), "the undo step ends copy mode by itself");
+        clip.restamp(v);
+        assert!(!clip.stale_in(v), "the action restamps a live clip");
+        v.sel = (5, 0);
+        v.anchor = (5, 0);
+        assert_eq!(v.paste_grid_clip(&clip), Ok(super::GridPasted::Done));
+        assert_eq!(v.sheet().cell(0, 0), None, "the cut moved the cell");
     }
 
     #[test]
@@ -38206,6 +38239,7 @@ fn sheet_row(
         let edit_draw = cell_edit_draw(selected, editing.is_some(), ov.edit_in_cell);
         let cell_editing = edit_draw == CellEditDraw::Editor;
         let on_freeze = fc > 0 && c + 1 == fc;
+        let shows_formula = show_formulas && sh.cell(r, c).is_some_and(|cl| cl.formula.is_some());
         let (text, xf, is_num) = match sh.cell(r, c) {
             // Editing directly in cells off: the cell shows the entry as
             // plain text while the caret is in the formula bar (#672).
@@ -38223,13 +38257,11 @@ fn sheet_row(
                 (
                     shown_cell_text(show_formulas, cl, &xf, d1904, cell_w),
                     Some(xf),
-                    matches!(cl.value, CellValue::Number(_))
-                        && !(show_formulas && cl.formula.is_some()),
+                    matches!(cl.value, CellValue::Number(_)) && !shows_formula,
                 )
             }
             _ => (String::new(), None, false),
         };
-        let shows_formula = show_formulas && sh.cell(r, c).is_some_and(|cl| cl.formula.is_some());
         let halign = match xf.as_ref().map(|x| x.align).unwrap_or(Align::General) {
             // A formula shown is raw text, always left (#676).
             _ if shows_formula => 0,
