@@ -559,6 +559,9 @@ pub struct Sheet {
     /// Error Checking's Ignore Error: the rules hidden over ranges of this
     /// sheet (`<ignoredErrors>`).
     pub ignored_errors: Vec<crate::audit::IgnoredError>,
+    /// What the loaded `<ignoredErrors>` parsed to. A save leaves the
+    /// element's bytes alone while [`Sheet::ignored_errors`] still equals it.
+    pub ignored_errors_loaded: Vec<crate::audit::IgnoredError>,
     /// Data-validation rules (`<dataValidation>`): the constraint on a cell's
     /// value (a dropdown list, a number range, …). Typed entries are checked
     /// against them ([`crate::validation::check_entry`]); a save writes edits

@@ -566,6 +566,61 @@ mod tests {
         );
     }
 
+    fn with_ignored(sqref: Vec<(u32, u32, u32, u32)>) -> Workbook {
+        let mut w = wb(&[("A1", Cell::number(1.0))]);
+        let mut other = Sheet {
+            name: "T".into(),
+            ..Sheet::default()
+        };
+        other.ignored_errors.push(IgnoredError {
+            sqref: vec![(5, 0, 5, 0)],
+            rules: vec![Rule::ErrorValue],
+            extra: String::new(),
+        });
+        w.sheets.push(other);
+        w.sheets[0].ignored_errors.push(IgnoredError {
+            sqref,
+            rules: vec![Rule::ErrorValue],
+            extra: String::new(),
+        });
+        w
+    }
+
+    #[test]
+    fn inserting_rows_above_moves_ignore_error_with_its_cells() {
+        let mut w = with_ignored(vec![(4, 1, 6, 1)]); // B5:B7
+        crate::edit::insert_rows(&mut w, 0, 0, 2);
+        assert_eq!(w.sheets[0].ignored_errors[0].sqref, vec![(6, 1, 8, 1)]);
+        assert_eq!(
+            w.sheets[1].ignored_errors[0].sqref,
+            vec![(5, 0, 5, 0)],
+            "another sheet is not moved"
+        );
+    }
+
+    #[test]
+    fn inserting_columns_moves_ignore_error_sideways() {
+        let mut w = with_ignored(vec![(4, 1, 6, 1)]);
+        crate::edit::insert_cols(&mut w, 0, 0, 1);
+        assert_eq!(w.sheets[0].ignored_errors[0].sqref, vec![(4, 2, 6, 2)]);
+    }
+
+    #[test]
+    fn deleting_rows_shrinks_or_drops_ignore_error() {
+        // Rows 5-6 (0-based 4-5) deleted from B5:B7: one row left, moved up.
+        let mut w = with_ignored(vec![(4, 1, 6, 1)]);
+        crate::edit::delete_rows(&mut w, 0, 4, 2);
+        assert_eq!(w.sheets[0].ignored_errors[0].sqref, vec![(4, 1, 4, 1)]);
+        // Everything it covered deleted: the entry goes.
+        let mut w = with_ignored(vec![(4, 1, 5, 1)]);
+        crate::edit::delete_rows(&mut w, 0, 3, 4);
+        assert!(w.sheets[0].ignored_errors.is_empty());
+        // A delete below leaves it as it is.
+        let mut w = with_ignored(vec![(4, 1, 6, 1)]);
+        crate::edit::delete_rows(&mut w, 0, 10, 3);
+        assert_eq!(w.sheets[0].ignored_errors[0].sqref, vec![(4, 1, 6, 1)]);
+    }
+
     #[test]
     fn rule_names_round_trip_through_their_attribute() {
         for r in Rule::ALL {

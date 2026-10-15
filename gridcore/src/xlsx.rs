@@ -2956,7 +2956,90 @@ fn parse_worksheet(
     sheet.outline_loaded = sheet.outline;
     sheet.consolidate = consolidate::read(xml);
     sheet.consolidate_loaded = sheet.consolidate.clone();
+    sheet.ignored_errors = read_ignored_errors(xml);
+    sheet.ignored_errors_loaded = sheet.ignored_errors.clone();
     sheet
+}
+
+/// The worksheet's `<ignoredErrors>`: Error Checking's Ignore Error. An
+/// attribute naming a rule the model carries (set to true) is a rule; every
+/// other attribute is kept raw in [`IgnoredError::extra`] so a save writes it
+/// back. An entry with no `sqref` is dropped, as Excel does.
+fn read_ignored_errors(xml: &str) -> Vec<crate::audit::IgnoredError> {
+    use crate::audit::{IgnoredError, Rule};
+    let Some((s, e)) = worksheet_child_span(xml, "ignoredErrors") else {
+        return Vec::new();
+    };
+    let block = &xml[s..e];
+    let mut out = Vec::new();
+    for (name, a, b) in element_children(block) {
+        if name != "ignoredError" {
+            continue;
+        }
+        let item = &block[a..b];
+        let open = &item[..item.find('>').map_or(item.len(), |i| i + 1)];
+        let mut entry = IgnoredError::default();
+        let mut extra = Vec::new();
+        for (attr, value) in tag_attrs(open) {
+            if attr == "sqref" {
+                entry.sqref = value
+                    .split_whitespace()
+                    .filter_map(crate::sheet::parse_range_name)
+                    .collect();
+            } else if let Some(rule) =
+                Rule::from_attr(&attr).filter(|_| matches!(value.as_str(), "1" | "true"))
+            {
+                entry.rules.push(rule);
+            } else {
+                extra.push(format!("{attr}=\"{value}\""));
+            }
+        }
+        entry.rules.sort();
+        entry.extra = extra.join(" ");
+        if !entry.sqref.is_empty() {
+            out.push(entry);
+        }
+    }
+    out
+}
+
+/// Write the sheet's `<ignoredErrors>` from the model: left exactly as the
+/// part has it while the model still equals what the load read, otherwise
+/// regenerated at its schema position (and dropped when none is left).
+fn set_ignored_errors(xml: String, sheet: &Sheet) -> String {
+    if sheet.ignored_errors == sheet.ignored_errors_loaded {
+        return xml;
+    }
+    if sheet.ignored_errors.is_empty() {
+        return sync_worksheet_child(&xml, "ignoredErrors", None);
+    }
+    let mut block = String::from("<ignoredErrors>");
+    for e in &sheet.ignored_errors {
+        let sqref: Vec<String> = e
+            .sqref
+            .iter()
+            .map(|&(r1, c1, r2, c2)| {
+                if (r1, c1) == (r2, c2) {
+                    cell_name(r1, c1)
+                } else {
+                    format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
+                }
+            })
+            .collect();
+        block.push_str(&format!("<ignoredError sqref=\"{}\"", sqref.join(" ")));
+        for rule in crate::audit::Rule::ALL {
+            if e.rules.contains(&rule) {
+                block.push_str(&format!(" {}=\"1\"", rule.attr()));
+            }
+        }
+        if !e.extra.is_empty() {
+            block.push(' ');
+            block.push_str(&e.extra);
+        }
+        block.push_str("/>");
+    }
+    block.push_str("</ignoredErrors>");
+    sync_worksheet_child(&xml, "ignoredErrors", Some(&block))
 }
 
 /// Block cells a sheet may name through array `ref`s beyond twice its own
@@ -4692,6 +4775,8 @@ fn splice_worksheet(
     // Conditional formatting and data validation: likewise.
     let out = set_cond_formats(out, sheet);
     let out = set_validations(out, sheet);
+    // Ignore Error: kept while it matches the load, else regenerated.
+    let out = set_ignored_errors(out, sheet);
     // Hyperlinks: a removed link's element goes.
     set_hyperlinks(out, sheet)
 }
@@ -10507,6 +10592,109 @@ mod tests {
         assert!(re.workbook.sheets[0].row_hidden(0));
         let ws = String::from_utf8(re.part(&re.sheet_parts[0].clone()).unwrap().to_vec()).unwrap();
         assert!(ws.contains("outlineLevel=\"2\""), "{ws}");
+    }
+
+    /// A new workbook whose first worksheet part has `ignored` (an
+    /// `<ignoredErrors>` element) after its `<sheetData>`, saved and reloaded.
+    fn pkg_with_ignored_errors(ignored: &str) -> SheetPackage {
+        let pkg = new_xlsx();
+        let part = pkg.sheet_parts[0].clone();
+        let ws = String::from_utf8(pkg.part(&part).unwrap().to_vec()).unwrap();
+        let at = ws.find("<sheetData/>").unwrap() + "<sheetData/>".len();
+        let mut pkg = pkg;
+        pkg.set_part(
+            &part,
+            format!("{}{ignored}{}", &ws[..at], &ws[at..]).into_bytes(),
+        );
+        load_xlsx(&save_xlsx(&pkg)).unwrap()
+    }
+
+    fn sheet1_xml(pkg: &SheetPackage) -> String {
+        String::from_utf8(pkg.part(&pkg.sheet_parts[0]).unwrap().to_vec()).unwrap()
+    }
+
+    fn ignored_block(xml: &str) -> &str {
+        let s = xml.find("<ignoredErrors").unwrap();
+        &xml[s..xml.find("</ignoredErrors>").unwrap() + "</ignoredErrors>".len()]
+    }
+
+    #[test]
+    fn ignored_errors_load_with_their_rules_and_unmodelled_attributes() {
+        use crate::audit::Rule;
+        let pkg = pkg_with_ignored_errors(
+            "<ignoredErrors><ignoredError sqref=\"A1 C2:D3\" evalError=\"1\" \
+             numberStoredAsText=\"1\" twoDigitTextYear=\"1\"/>\
+             <ignoredError sqref=\"B5\" formula=\"true\" formulaRange=\"0\"/></ignoredErrors>",
+        );
+        let ig = &pkg.workbook.sheets[0].ignored_errors;
+        assert_eq!(ig.len(), 2);
+        assert_eq!(ig[0].sqref, vec![(0, 0, 0, 0), (1, 2, 2, 3)]);
+        assert_eq!(ig[0].rules, vec![Rule::ErrorValue, Rule::NumberAsText]);
+        assert_eq!(ig[0].extra, "twoDigitTextYear=\"1\"");
+        assert_eq!(ig[1].rules, vec![Rule::Inconsistent]);
+        assert_eq!(ig[1].extra, "formulaRange=\"0\"");
+        assert_eq!(pkg.workbook.sheets[0].ignored_errors_loaded, *ig);
+    }
+
+    #[test]
+    fn an_untouched_ignored_errors_element_is_saved_byte_for_byte() {
+        // Odd spelling on purpose: attribute order, a space, an attribute we
+        // do not model. A regenerated element could not match it.
+        let element = "<ignoredErrors><ignoredError  twoDigitTextYear=\"1\"  sqref=\"A1\" evalError=\"1\"/></ignoredErrors>";
+        let pkg = pkg_with_ignored_errors(element);
+        let again = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(ignored_block(&sheet1_xml(&again)), element);
+    }
+
+    #[test]
+    fn an_edited_ignored_errors_element_is_regenerated_and_keeps_unmodelled_attributes() {
+        use crate::audit::{IgnoredError, Rule};
+        let mut pkg = pkg_with_ignored_errors(
+            "<ignoredErrors><ignoredError sqref=\"A1\" evalError=\"1\" twoDigitTextYear=\"1\"/></ignoredErrors>",
+        );
+        pkg.workbook.sheets[0].ignored_errors.push(IgnoredError {
+            sqref: vec![(2, 1, 4, 1)],
+            rules: vec![Rule::NumberAsText, Rule::UnlockedFormula],
+            extra: String::new(),
+        });
+        let again = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(
+            ignored_block(&sheet1_xml(&again)),
+            "<ignoredErrors>\
+             <ignoredError sqref=\"A1\" evalError=\"1\" twoDigitTextYear=\"1\"/>\
+             <ignoredError sqref=\"B3:B5\" numberStoredAsText=\"1\" unlockedFormula=\"1\"/>\
+             </ignoredErrors>"
+        );
+        assert_eq!(
+            again.workbook.sheets[0].ignored_errors,
+            pkg.workbook.sheets[0].ignored_errors
+        );
+    }
+
+    #[test]
+    fn ignored_errors_land_between_cell_watches_and_the_drawing_and_go_when_emptied() {
+        use crate::audit::{IgnoredError, Rule};
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].merges.push((0, 0, 0, 2));
+        pkg.workbook.sheets[0].ignored_errors.push(IgnoredError {
+            sqref: vec![(0, 0, 0, 0)],
+            rules: vec![Rule::ErrorValue],
+            extra: String::new(),
+        });
+        let mut re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let ws = sheet1_xml(&re);
+        let (m, i) = (
+            ws.find("<mergeCells").unwrap(),
+            ws.find("<ignoredErrors").unwrap(),
+        );
+        assert!(m < i, "mergeCells precede ignoredErrors: {ws}");
+        if let Some(d) = ws.find("<drawing") {
+            assert!(i < d, "{ws}");
+        }
+        re.workbook.sheets[0].ignored_errors.clear();
+        let gone = load_xlsx(&save_xlsx(&re)).unwrap();
+        assert!(!sheet1_xml(&gone).contains("<ignoredErrors"));
+        assert!(gone.workbook.sheets[0].ignored_errors.is_empty());
     }
 
     #[test]
