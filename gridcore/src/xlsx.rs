@@ -618,6 +618,7 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
             iterate,
             calc,
             active_tab,
+            audit_rules: Default::default(),
         },
     })
 }
@@ -1347,8 +1348,14 @@ fn parse_styles(xml: &str) -> Styles {
                         border: false,
                         wrap: false,
                         quote_prefix: matches!(p.attr("quotePrefix"), "1" | "true"),
+                        unlocked: false,
                         loaded_from,
                     });
+                }
+                "protection" if in_cellxfs => {
+                    if let Some(x) = xfs.last_mut() {
+                        x.unlocked = matches!(p.attr("locked"), "0" | "false");
+                    }
                 }
                 "alignment" if in_cellxfs => {
                     if let Some(x) = xfs.last_mut() {
@@ -10030,6 +10037,7 @@ pub(crate) fn new_xlsx_sheets(names: &[String]) -> SheetPackage {
             iterate: None,
             calc: CalcSettings::default(),
             active_tab: 0,
+            audit_rules: Default::default(),
         },
     }
 }
@@ -12782,6 +12790,18 @@ b",
             "{x}"
         );
         assert!(x.contains("wrapText=\"1\""), "{x}");
+    }
+
+    #[test]
+    fn an_xf_protection_element_reads_as_unlocked() {
+        let xml = "<styleSheet><cellXfs count=\"3\">\
+            <xf numFmtId=\"0\"/>\
+            <xf numFmtId=\"0\"><protection locked=\"0\"/></xf>\
+            <xf numFmtId=\"0\"><alignment horizontal=\"left\"/><protection hidden=\"1\"/></xf>\
+            </cellXfs></styleSheet>";
+        let xfs = parse_styles(xml).xfs;
+        let unlocked: Vec<bool> = xfs.iter().map(|x| x.unlocked).collect();
+        assert_eq!(unlocked, vec![false, true, false]);
     }
 
     #[test]

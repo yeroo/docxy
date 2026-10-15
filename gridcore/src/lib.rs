@@ -38,8 +38,11 @@
 //! - [`flashfill`] — Flash Fill: a column's pattern from typed examples.
 //! - [`fcomplete`] — Formula AutoComplete: the names offered while a
 //!   formula is typed.
+//! - [`audit`] — background error checking (the green indicator's rules,
+//!   Ignore Error) and the formula-auditing sets behind the trace arrows.
 //! - [`print`] — page setup, print areas and breaks, pagination, sheet PDF.
 
+pub mod audit;
 pub mod autocorrect;
 pub mod calc;
 pub mod cf;
