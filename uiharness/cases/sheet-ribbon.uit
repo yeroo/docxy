@@ -39,10 +39,10 @@ test sheet ribbon click selects the tab and reads a toggle's current label
   call ribbon-click {"tab":"View","command":"Freeze Panes"}
   assert ribbon_tab is View
   call ribbon-read {}
-  assert reply.tabs.7.groups.0.commands.0.label is Unfreeze Panes
+  assert reply.tabs.7.groups.1.commands.0.label is Unfreeze Panes
   call ribbon-click {"tab":"View","command":"Unfreeze Panes"}
   call ribbon-read {}
-  assert reply.tabs.7.groups.0.commands.0.label is Freeze Panes
+  assert reply.tabs.7.groups.1.commands.0.label is Freeze Panes
 
 test sheet ribbon refuses a placeholder, a missing command and a command with no menu
   open ../fixtures/basic.xlsx
