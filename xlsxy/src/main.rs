@@ -32,6 +32,8 @@ mod textdlg;
 mod validationdlg;
 
 #[cfg(test)]
+mod calc_tests;
+#[cfg(test)]
 mod protected_view_tests;
 
 // Bring the trait's methods (`extensions`, `default_save_name`, …) into scope
@@ -1948,6 +1950,10 @@ struct WbSnapshot {
     /// converted ones keep their parts until a save.
     tables: Vec<gridcore::sheet::Table>,
     removed_tables: Vec<gridcore::sheet::RemovedTable>,
+    /// Set precision as displayed (on, and the file's own `fullPrecision="0"`
+    /// kept), only in the snapshots of the step that switches it on
+    /// ([`App::precision_on`]); every other step leaves the setting alone.
+    precision: Option<(bool, bool)>,
     /// Each PivotTable's source: a table rename moves it.
     pivot_sources: Vec<gridcore::pivot::PivotSource>,
     /// A table rename (from, to) to replay on the data model when this
@@ -2907,6 +2913,8 @@ impl App {
     /// The words Excel's status bar shows for the options in force.
     fn status_words(&self) -> Vec<&'static str> {
         let mut words = Vec::new();
+        // Manual calculation with values out of date (Excel's `Calculate`).
+        words.extend(gridcore::calc::status_word(&self.engine));
         if self.edit_opts.fixed_decimal {
             words.push("Fixed Decimal");
         }
@@ -3699,6 +3707,7 @@ impl App {
             names: wb.defined_names.clone(),
             tables: wb.tables.clone(),
             removed_tables: wb.removed_tables.clone(),
+            precision: None,
             pivot_sources: wb.pivots.iter().map(|p| p.source.clone()).collect(),
             model_rename: None,
         }
@@ -3717,6 +3726,9 @@ impl App {
         wb.defined_names = snap.names.clone();
         wb.tables = snap.tables.clone();
         wb.removed_tables = snap.removed_tables.clone();
+        if let Some((on, file_off)) = snap.precision {
+            (wb.calc.precision_as_displayed, wb.calc.precision_file_off) = (on, file_off);
+        }
         // Pivots aren't added or removed by a structural edit; if their count
         // changed since, the sources no longer line up and stay as they are.
         if wb.pivots.len() == snap.pivot_sources.len() {
@@ -4164,6 +4176,43 @@ impl App {
             (r, 0) => format!("Recalculated; {r} pivot(s) refreshed"),
             (r, s) => format!("Recalculated; {r} pivot(s) refreshed, {s} kept cached values"),
         });
+    }
+
+    /// Switch Set precision as displayed on (the warning is the caller's):
+    /// the constants take their displayed values, formula results round, and
+    /// one undo step puts the constants and the switch back.
+    fn precision_on(&mut self) -> Result<(), String> {
+        let was = {
+            let c = &self.pkg.workbook.calc;
+            (c.precision_as_displayed, c.precision_file_off)
+        };
+        self.try_structural(None, |wb| {
+            gridcore::calc::convert_constants(wb);
+            wb.calc.set_precision_as_displayed(true);
+            Ok(())
+        })?;
+        if let Some(UndoAction::Structural { before, after, .. }) = self.undo.last_mut() {
+            before.precision = Some(was);
+            after.precision = Some((true, false));
+        }
+        Ok(())
+    }
+
+    /// Shift+F9 — Calculate Sheet: the stale and volatile formulas of the
+    /// active sheet, with their dependents there. Pivots are not refreshed
+    /// (that is Calculate Now's, like Excel's refresh-all).
+    fn calculate_sheet(&mut self) {
+        let s = self.sheet;
+        self.calculate_sheet_at(s);
+    }
+
+    /// [`Self::calculate_sheet`] for sheet `s`.
+    fn calculate_sheet_at(&mut self, s: usize) {
+        self.engine.recalc_sheet(&mut self.pkg.workbook, s);
+        self.status = Some(format!(
+            "Calculated {}",
+            self.pkg.workbook.sheets.get(s).map_or("", |sh| &sh.name)
+        ));
     }
 
     fn clamp_cursor(&mut self) {
@@ -12357,7 +12406,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         // F4 is Excel's Redo/Repeat (#1169); the sheet list moved to Shift+F4.
         KeyCode::F(4) if shift => app.open_sheet_picker(),
         KeyCode::F(4) => app.redo_or_repeat(),
-        // Plain F9 opens the ribbon (handled earlier); Shift+F9 forces recalc.
+        // Plain F9 opens the ribbon (handled earlier); Ctrl+F9 is Calculate
+        // Now (every sheet), Shift+F9 Calculate Sheet (the active one).
+        KeyCode::F(9) if shift && !ctrl => app.calculate_sheet(),
         KeyCode::F(9) => app.recalc_and_refresh(),
         KeyCode::Char('p') | KeyCode::Char('P') if ctrl => app.open_pivot_editor(),
         KeyCode::Char('m') | KeyCode::Char('M') if ctrl => app.open_model_view(),

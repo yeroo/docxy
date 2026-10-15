@@ -34,7 +34,9 @@ use its tools:
   (validated, recalculated), otherwise number/bool/text is inferred like typing
 - `xlsxy_clear` `{range, sheet?}` — blank a range (styles kept)
 - `xlsxy_find` `{query, sheet?}` — search values and formula text
-- `xlsxy_recalc`, `xlsxy_save`
+- `xlsxy_recalc` `{sheet?}` — Calculate Now, or Calculate Sheet with a `sheet`
+- `xlsxy_calc`, `xlsxy_calc_set` — calculation mode (`auto`, `autoNoTable`, `manual`), precision as displayed, iteration, threads
+- `xlsxy_save`
 
 `sheet` is an index or a name and defaults to the active sheet. When several
 xlsxy editors are open, pass `target` (a substring of the pane id; `xlsxy_list`

@@ -70,7 +70,9 @@
 //! | `sheet.rows` | `{range, sheet?}` | `{rows:[{row, hidden, hiddenBy}]}` |
 //! | `range.sort` | `{range, keys, header?, caseSensitive?, orientation?, expand?, sheet?}` | `{sorted, range, count, changed}`, or `{sorted:false, warning, expanded}` for a selection inside a wider list |
 //! | `wb.clock` | `{date}` | `{date}` — fixes today (`null`: the local clock) |
-//! | `wb.recalc` | — | `{recalculated:true}` |
+//! | `wb.recalc` | `{sheet?}` | `{recalculated:true}` — Calculate Now (every sheet, pivots refreshed); with a `sheet` (index or name) Calculate Sheet: that sheet's stale and volatile formulas with their dependents there, other sheets' stay stale — `{recalculated, sheet, stale}` |
+//! | `wb.calc` | — | `{mode:"auto"\|"autoNoTable"\|"manual", precisionAsDisplayed, iterate:{enabled,maxIterations,maxChange}, threads (null = all), concurrent, transitionEvaluation, stale}` — Formulas › Calculation Options and File › Options › Formulas; `stale` counts formulas out of date in manual mode |
+//! | `wb.calc.set` | `{mode?, precisionAsDisplayed?, acceptLoss?, iterate?:{enabled?,maxIterations?,maxChange?}, threads?, concurrent?, transitionEvaluation?}` | the new `wb.calc` — everything given is checked before any is set (unknown keys, iterations 1–32767, change ≥ 0, threads 1–1024 or null). In `manual` an edit evaluates only the formulas typed; dependents and volatiles stay stale until `wb.recalc`. `precisionAsDisplayed:true` rounds every constant to its displayed format (General, dates and text untouched; one undo step) and is refused without `acceptLoss:true` ("Data will permanently lose accuracy."); the other settings are not undoable |
 //! | `wb.properties` | — | `{title, tags, categories, subject, comments, company, manager, hyperlinkBase, author, lastModifiedBy, created, modified, custom:[{name,type,value}]}` — File › Info; an absent property is `null`; `type` is `text`/`number`/`bool`/`date`/`other` |
 //! | `wb.set-properties` | `{title?, tags?, categories?, subject?, comments?, company?, manager?, hyperlinkBase?, custom?:{name: value\|null}}` | `wb.properties` + `{changed}` — `null`/`""` removes; a custom value is a string (text), number, bool or `{"date":"YYYY-MM-DD[THH:MM:SSZ]"}`; marks the workbook modified when something changed; NOT on the undo stack (Excel's Info edits aren't either) |
 //! | `wb.save` | — | `{path, …}`; a failed write errors with `save failed: …` (the status-bar text) and the workbook stays modified |
@@ -283,6 +285,8 @@ pub(crate) const VERBS: &[(&str, bool)] = &[
     ("wb.properties", true),
     ("wb.set-properties", false),
     ("wb.recalc", true),
+    ("wb.calc", true),
+    ("wb.calc.set", false),
     ("wb.save", false),
     ("wb.convert", false),
     ("wb.reload", true),
@@ -293,7 +297,7 @@ pub(crate) const VERBS: &[(&str, bool)] = &[
 
 /// Whether `verb` may run in Protected View ([`VERBS`]); an unknown verb
 /// may not.
-fn allowed_in_protected_view(verb: &str) -> bool {
+pub(crate) fn allowed_in_protected_view(verb: &str) -> bool {
     VERBS.iter().any(|&(v, ok)| v == verb && ok)
 }
 
@@ -370,10 +374,24 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "wb.clock" => datacmds::wb_clock(app, args),
         "wb.properties" => Ok(properties_json(app)),
         "wb.set-properties" => set_properties(app, args),
-        "wb.recalc" => {
-            app.recalc_and_refresh();
-            Ok(Json::obj(vec![("recalculated", Json::Bool(true))]))
-        }
+        // Calculate Now, or with a `sheet` Calculate Sheet (Shift+F9).
+        "wb.recalc" => match args.get("sheet") {
+            None | Some(Json::Null) => {
+                app.recalc_and_refresh();
+                Ok(Json::obj(vec![("recalculated", Json::Bool(true))]))
+            }
+            Some(_) => {
+                let s = sheet_arg(app, args)?;
+                app.calculate_sheet_at(s);
+                Ok(Json::obj(vec![
+                    ("recalculated", Json::Bool(true)),
+                    ("sheet", Json::Str(app.pkg.workbook.sheets[s].name.clone())),
+                    ("stale", Json::Num(app.engine.stale_count() as f64)),
+                ]))
+            }
+        },
+        "wb.calc" => Ok(datacmds::calc_info_json(app)),
+        "wb.calc.set" => datacmds::wb_calc_set(app, args),
         // In Compatibility Mode the save doesn't ask (#874): the reply's
         // `lost` names what the .xls couldn't hold.
         "wb.save" => {

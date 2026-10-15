@@ -215,6 +215,9 @@ const EDITORS: EditorSpec[] = [
         'range.clear',
         'find',
         'wb.recalc',
+        // #674: calculation options (read; set).
+        'wb.calc',
+        'wb.calc.set',
         // Wave-1 read verbs (no repaint, no edit event).
         'comment.list',
         'wb.export-csv',
@@ -254,6 +257,10 @@ const EDITORS: EditorSpec[] = [
         'col.delete',
         'wb.replace-all',
         'sheet.add',
+        // #674: wb.calc.set is bucket A only when it switches Set precision as
+        // displayed on (a snapshot step, undoSteps:1); every other setting is
+        // not undoable, as in Excel (undoSteps:0, nothing to flip-flop).
+        'wb.calc.set',
         // Wave-2: cell.format lands on the SAME true wasm-undo-stack group
         // range.set uses (Session::apply captures the style-only before/after
         // Cell diff) — bucket A, undoSteps:1 (see gridwasm's ctl_cell_format).

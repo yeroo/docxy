@@ -582,3 +582,107 @@ fn parse_date(s: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests;
+
+/// `wb.calc`'s reply: File > Options > Formulas as it stands, plus how many
+/// formulas are stale (manual mode).
+pub(super) fn calc_info_json(app: &App) -> Json {
+    let i = gridcore::calc::info(&app.pkg.workbook, &app.engine);
+    Json::obj(vec![
+        (
+            "mode",
+            Json::Str(gridcore::calc::mode_name(i.mode).to_string()),
+        ),
+        ("precisionAsDisplayed", Json::Bool(i.precision_as_displayed)),
+        (
+            "iterate",
+            Json::obj(vec![
+                ("enabled", Json::Bool(i.iterate)),
+                ("maxIterations", Json::Num(f64::from(i.max_iterations))),
+                ("maxChange", Json::Num(i.max_change)),
+            ]),
+        ),
+        (
+            "threads",
+            i.threads.map_or(Json::Null, |n| Json::Num(f64::from(n))),
+        ),
+        ("concurrent", Json::Bool(i.concurrent)),
+        ("transitionEvaluation", Json::Bool(i.transition_eval)),
+        ("stale", Json::Num(i.stale as f64)),
+    ])
+}
+
+/// The settings a `wb.calc.set` request asks for. A key it does not know is
+/// an error, so a misspelt one does not silently do nothing.
+fn calc_patch(args: &Json) -> Result<gridcore::calc::CalcPatch, String> {
+    let Json::Obj(fields) = args else {
+        return Err("wb.calc.set takes an object".into());
+    };
+    let flag = |k: &str, v: &Json| match v {
+        Json::Bool(b) => Ok(*b),
+        _ => Err(format!("'{k}' is true or false")),
+    };
+    let whole = |k: &str, v: &Json| match v.as_f64() {
+        Some(n) if n.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(&n) => Ok(n as u32),
+        _ => Err(format!("'{k}' is a whole number")),
+    };
+    let mut p = gridcore::calc::CalcPatch::default();
+    for (k, v) in fields {
+        match k.as_str() {
+            "mode" => {
+                let name = v.as_str().unwrap_or("");
+                p.mode = Some(gridcore::calc::parse_mode(name).ok_or_else(|| {
+                    "'mode' is \"auto\", \"autoNoTable\" or \"manual\"".to_string()
+                })?);
+            }
+            "precisionAsDisplayed" => p.precision_as_displayed = Some(flag(k, v)?),
+            "acceptLoss" => p.accept_loss = flag(k, v)?,
+            "iterate" => {
+                let Json::Obj(o) = v else {
+                    return Err("'iterate' is {enabled?, maxIterations?, maxChange?}".into());
+                };
+                for (ik, iv) in o {
+                    match ik.as_str() {
+                        "enabled" => p.iterate = Some(flag("iterate.enabled", iv)?),
+                        "maxIterations" => {
+                            p.max_iterations = Some(whole("iterate.maxIterations", iv)?);
+                        }
+                        "maxChange" => {
+                            p.max_change =
+                                Some(iv.as_f64().ok_or("'iterate.maxChange' is a number")?);
+                        }
+                        other => return Err(format!("unknown iterate key '{other}'")),
+                    }
+                }
+            }
+            "threads" => {
+                p.threads = Some(match v {
+                    Json::Null => None,
+                    v => Some(whole(k, v)?),
+                });
+            }
+            "concurrent" => p.concurrent = Some(flag(k, v)?),
+            "transitionEvaluation" => p.transition_eval = Some(flag(k, v)?),
+            // The MCP server's routing key, not a setting.
+            "target" => {}
+            other => return Err(format!("unknown wb.calc.set key '{other}'")),
+        }
+    }
+    Ok(p)
+}
+
+/// `wb.calc.set`: change calculation settings; everything given is checked
+/// before any is set. Switching Set precision as displayed on rewrites the
+/// constants (one undo step) and is refused without `acceptLoss:true`
+/// ("Data will permanently lose accuracy."); the other settings are not
+/// undoable, as in Excel. The reply is `wb.calc`'s.
+pub(super) fn wb_calc_set(app: &mut App, args: &Json) -> Result<Json, String> {
+    let patch = calc_patch(args)?;
+    gridcore::calc::check_patch(&app.pkg.workbook, &patch)?;
+    let converts = patch.converts(&app.pkg.workbook);
+    gridcore::calc::apply_settings(&mut app.pkg.workbook, &mut app.engine, &patch);
+    if converts {
+        app.precision_on()?;
+    }
+    app.modified = true;
+    Ok(calc_info_json(app))
+}

@@ -63,6 +63,10 @@ struct WbSnapshot {
     names: Vec<DefinedName>,
     tables: Vec<gridcore::sheet::Table>,
     removed_tables: Vec<gridcore::sheet::RemovedTable>,
+    /// Set precision as displayed (on, and the file's own `fullPrecision="0"`
+    /// kept), only in the snapshots of the step that switches it on
+    /// ([`Session::ctl_calc_set`]); every other step leaves the setting alone.
+    precision: Option<(bool, bool)>,
 }
 
 impl WbSnapshot {
@@ -72,6 +76,7 @@ impl WbSnapshot {
             names: wb.defined_names.clone(),
             tables: wb.tables.clone(),
             removed_tables: wb.removed_tables.clone(),
+            precision: None,
         }
     }
 }
@@ -718,6 +723,9 @@ impl Session {
         wb.defined_names = snap.names.clone();
         wb.tables = snap.tables.clone();
         wb.removed_tables = snap.removed_tables.clone();
+        if let Some((on, file_off)) = snap.precision {
+            (wb.calc.precision_as_displayed, wb.calc.precision_file_off) = (on, file_off);
+        }
         self.rebuild_engine();
         self.dirty = true;
     }
@@ -1226,6 +1234,13 @@ impl Session {
             "cell.set" => self.ctl_cell_set(args),
             "range.clear" => self.ctl_range_clear(args),
             "find" => self.ctl_find(args),
+            // Calculate Sheet: only the named sheet's stale and volatile
+            // formulas (and their dependents there); no pivot refresh.
+            "wb.recalc" if args.get("sheet").is_some_and(|v| *v != json::Json::Null) => {
+                self.ctl_calc_sheet(args)
+            }
+            "wb.calc" => Ok(self.ctl_calc_info(None)),
+            "wb.calc.set" => self.ctl_calc_set(args),
             "wb.recalc" => {
                 self.engine.recalc_all(&mut self.pkg.workbook);
                 // Mirrors xlsxy control.rs's `wb.recalc` -> `App::recalc_and_refresh`:
@@ -1496,6 +1511,127 @@ impl Session {
         out.push_str(&matches);
         out.push_str("]}");
         Ok(out)
+    }
+
+    /// `{sheet}` -> `{recalculated, sheet, stale}`: Calculate Sheet.
+    fn ctl_calc_sheet(&mut self, args: &json::Json) -> Result<String, String> {
+        let s = self.ctl_sheet_arg(args)?;
+        self.engine.recalc_sheet(&mut self.pkg.workbook, s);
+        let mut out = String::from("{\"recalculated\":true,\"sheet\":");
+        json::push_str(&mut out, &self.pkg.workbook.sheets[s].name);
+        out.push_str(&format!(",\"stale\":{}}}", self.engine.stale_count()));
+        Ok(out)
+    }
+
+    /// `wb.calc`'s reply (plus `undoSteps` for a `wb.calc.set`, always
+    /// present there as the host's edit event needs it): the
+    /// calculation settings and how many formulas are stale.
+    fn ctl_calc_info(&self, undo_steps: Option<usize>) -> String {
+        let i = gridcore::calc::info(&self.pkg.workbook, &self.engine);
+        let mut out = String::from("{\"mode\":");
+        json::push_str(&mut out, gridcore::calc::mode_name(i.mode));
+        out.push_str(&format!(
+            ",\"precisionAsDisplayed\":{},\"iterate\":{{\"enabled\":{},\"maxIterations\":{},\"maxChange\":",
+            i.precision_as_displayed, i.iterate, i.max_iterations
+        ));
+        json::push_num(&mut out, i.max_change);
+        out.push_str("},\"threads\":");
+        match i.threads {
+            Some(n) => out.push_str(&n.to_string()),
+            None => out.push_str("null"),
+        }
+        out.push_str(&format!(
+            ",\"concurrent\":{},\"transitionEvaluation\":{},\"stale\":{}",
+            i.concurrent, i.transition_eval, i.stale
+        ));
+        if let Some(n) = undo_steps {
+            out.push_str(&format!(",\"undoSteps\":{n}"));
+        }
+        out.push('}');
+        out
+    }
+
+    /// `{mode?, precisionAsDisplayed?, acceptLoss?, iterate?, threads?,
+    /// concurrent?, transitionEvaluation?}` -> the new `wb.calc`. As xlsxy's
+    /// `wb.calc.set`: everything given is checked first; switching Set
+    /// precision as displayed on needs `acceptLoss:true` and is the one
+    /// undoable change (`undoSteps:1`, a snapshot step that also puts the
+    /// switch back).
+    fn ctl_calc_set(&mut self, args: &json::Json) -> Result<String, String> {
+        let json::Json::Obj(fields) = args else {
+            return Err("wb.calc.set takes an object".into());
+        };
+        let flag = |k: &str, v: &json::Json| match v {
+            json::Json::Bool(b) => Ok(*b),
+            _ => Err(format!("'{k}' is true or false")),
+        };
+        let whole = |k: &str, v: &json::Json| match v.as_f64() {
+            Some(n) if n.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(&n) => Ok(n as u32),
+            _ => Err(format!("'{k}' is a whole number")),
+        };
+        let mut p = gridcore::calc::CalcPatch::default();
+        for (k, v) in fields {
+            match k.as_str() {
+                "mode" => {
+                    p.mode = Some(
+                        gridcore::calc::parse_mode(v.as_str().unwrap_or("")).ok_or_else(|| {
+                            "'mode' is \"auto\", \"autoNoTable\" or \"manual\"".to_string()
+                        })?,
+                    );
+                }
+                "precisionAsDisplayed" => p.precision_as_displayed = Some(flag(k, v)?),
+                "acceptLoss" => p.accept_loss = flag(k, v)?,
+                "iterate" => {
+                    let json::Json::Obj(o) = v else {
+                        return Err("'iterate' is {enabled?, maxIterations?, maxChange?}".into());
+                    };
+                    for (ik, iv) in o {
+                        match ik.as_str() {
+                            "enabled" => p.iterate = Some(flag("iterate.enabled", iv)?),
+                            "maxIterations" => {
+                                p.max_iterations = Some(whole("iterate.maxIterations", iv)?);
+                            }
+                            "maxChange" => {
+                                p.max_change =
+                                    Some(iv.as_f64().ok_or("'iterate.maxChange' is a number")?);
+                            }
+                            other => return Err(format!("unknown iterate key '{other}'")),
+                        }
+                    }
+                }
+                "threads" => {
+                    p.threads = Some(match v {
+                        json::Json::Null => None,
+                        v => Some(whole(k, v)?),
+                    });
+                }
+                "concurrent" => p.concurrent = Some(flag(k, v)?),
+                "transitionEvaluation" => p.transition_eval = Some(flag(k, v)?),
+                "target" => {}
+                other => return Err(format!("unknown wb.calc.set key '{other}'")),
+            }
+        }
+        gridcore::calc::check_patch(&self.pkg.workbook, &p)?;
+        let converts = p.converts(&self.pkg.workbook);
+        gridcore::calc::apply_settings(&mut self.pkg.workbook, &mut self.engine, &p);
+        let mut steps = 0;
+        if converts {
+            let was = {
+                let c = &self.pkg.workbook.calc;
+                (c.precision_as_displayed, c.precision_file_off)
+            };
+            self.structural(|wb| {
+                gridcore::calc::convert_constants(wb);
+                wb.calc.set_precision_as_displayed(true);
+            });
+            if let Some(UndoAction::Structural { before, after }) = self.undo.last_mut() {
+                before.precision = Some(was);
+                after.precision = Some((true, false));
+            }
+            steps = 1;
+        }
+        self.dirty = true;
+        Ok(self.ctl_calc_info(Some(steps)))
     }
 
     /// `{}` -> `{sheets, active, modified}` (the host composes this with its
@@ -6394,5 +6530,82 @@ mod tests {
         assert!(inv.contains("\"removed\":true"), "{inv}");
         let v = s.view_json(None);
         assert!(v.contains("\"sheets\":[\"Sheet1\"]"), "{v}");
+    }
+
+    // -- #674: calculation options ------------------------------------------
+
+    fn calc_cell_text(s: &mut Session, at: &str) -> String {
+        let out = s.ctl(&format!(r#"{{"verb":"cell.get","args":{{"ref":"{at}"}}}}"#));
+        let v = json::Json::parse(&out).unwrap();
+        v.get_str("text").unwrap_or_default().to_string()
+    }
+
+    fn calc_book() -> Session {
+        let mut s = Session::open(&new_workbook()).expect("open");
+        s.ctl(r#"{"verb":"cell.set","args":{"ref":"A1","text":"5"}}"#);
+        s.ctl(r#"{"verb":"cell.set","args":{"ref":"A2","text":"=A1*2"}}"#);
+        s
+    }
+
+    #[test]
+    fn ctl_manual_mode_repro_from_issue() {
+        let mut s = calc_book();
+        let out = s.ctl(r#"{"verb":"wb.calc.set","args":{"mode":"manual"}}"#);
+        assert!(out.contains("\"mode\":\"manual\""), "{out}");
+        s.ctl(r#"{"verb":"cell.set","args":{"ref":"A1","text":"7"}}"#);
+        assert_eq!(calc_cell_text(&mut s, "A2"), "10", "A2 is left stale");
+        let out = s.ctl(r#"{"verb":"wb.calc","args":{}}"#);
+        assert!(out.contains("\"stale\":1"), "{out}");
+        s.ctl(r#"{"verb":"wb.recalc","args":{}}"#);
+        assert_eq!(calc_cell_text(&mut s, "A2"), "14");
+        let out = s.ctl(r#"{"verb":"wb.calc","args":{}}"#);
+        assert!(out.contains("\"stale\":0"), "{out}");
+    }
+
+    #[test]
+    fn ctl_wb_recalc_sheet_scope() {
+        let mut s = calc_book();
+        s.ctl(r#"{"verb":"sheet.add","args":{"name":"Two"}}"#);
+        s.ctl(r#"{"verb":"cell.set","args":{"ref":"B1","text":"=Sheet1!A1+1","sheet":"Two"}}"#);
+        s.ctl(r#"{"verb":"wb.calc.set","args":{"mode":"manual"}}"#);
+        s.ctl(r#"{"verb":"cell.set","args":{"ref":"A1","text":"7"}}"#);
+        let out = s.ctl(r#"{"verb":"wb.recalc","args":{"sheet":"Sheet1"}}"#);
+        assert!(out.contains("\"stale\":1"), "Two's cell stays stale: {out}");
+        assert_eq!(calc_cell_text(&mut s, "A2"), "14");
+        let out = s.ctl(r#"{"verb":"wb.recalc","args":{"sheet":"Nope"}}"#);
+        assert!(out.contains("no sheet named"), "{out}");
+    }
+
+    #[test]
+    fn ctl_calc_set_checks_then_precision_needs_the_warning_and_undoes() {
+        let mut s = calc_book();
+        let out = s.ctl(r#"{"verb":"wb.calc.set","args":{"mode":"nope"}}"#);
+        assert!(out.contains("'mode' is"), "{out}");
+        s.ctl(r#"{"verb":"cell.set","args":{"ref":"C1","text":"3.14659"}}"#);
+        s.ctl(r#"{"verb":"cell.format","args":{"range":"C1","patch":{"numFmt":"0.00"}}}"#);
+        let out = s.ctl(r#"{"verb":"wb.calc.set","args":{"precisionAsDisplayed":true}}"#);
+        assert!(
+            out.contains("Data will permanently lose accuracy."),
+            "{out}"
+        );
+        assert_eq!(calc_cell_text(&mut s, "C1"), "3.15");
+        let out = s.ctl(
+            r#"{"verb":"wb.calc.set","args":{"precisionAsDisplayed":true,"acceptLoss":true}}"#,
+        );
+        assert!(
+            out.contains("\"precisionAsDisplayed\":true") && out.contains("\"undoSteps\":1"),
+            "{out}"
+        );
+        let (r, c) = (0, 2);
+        assert_eq!(
+            s.pkg.workbook.sheets[0].cell(r, c).unwrap().value,
+            CellValue::Number(3.15)
+        );
+        s.dispatch("undo");
+        assert_eq!(
+            s.pkg.workbook.sheets[0].cell(r, c).unwrap().value,
+            CellValue::Number(3.14659)
+        );
+        assert!(!s.pkg.workbook.calc.precision_as_displayed);
     }
 }
