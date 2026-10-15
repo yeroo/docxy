@@ -41,6 +41,7 @@
 //! - [`print`] — page setup, print areas and breaks, pagination, sheet PDF.
 
 pub mod autocorrect;
+pub mod calc;
 pub mod cf;
 pub mod circular;
 pub mod clock;

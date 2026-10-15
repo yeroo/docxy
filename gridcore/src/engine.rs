@@ -417,7 +417,7 @@ impl Engine {
             }
             None => {}
         }
-        self.put_cell(wb, key, cell, refuse)
+        self.put_cell(wb, key, cell, refuse, true)
     }
 
     /// Apply a group of edits to sheet `s` (a paste, a fill, a replace-all)
@@ -658,7 +658,7 @@ impl Engine {
     /// ([`Engine::set_cell`]): it puts back a state the sheet was in. A plain
     /// value restored into an evaluated block that stays is refilled by it.
     pub fn restore_cell(&mut self, wb: &mut Workbook, key: Key, cell: Cell) {
-        self.put_cell(wb, key, cell, false);
+        self.put_cell(wb, key, cell, false, false);
     }
 
     /// Put a group of cells on sheet `s` back exactly as they were (an undo or
@@ -875,8 +875,28 @@ impl Engine {
     /// ([`Engine::set_cell`]) refuses; a group checked whole
     /// ([`Engine::set_cells_prechecked`], [`Engine::paste_block_prechecked`])
     /// does not, nor does a restored snapshot.
-    fn put_cell(&mut self, wb: &mut Workbook, key: Key, mut cell: Cell, refuse: bool) -> bool {
+    ///
+    /// `typed` is a user's entry (not a restored snapshot): with Set precision
+    /// as displayed on, a constant number is stored as its format shows it.
+    fn put_cell(
+        &mut self,
+        wb: &mut Workbook,
+        key: Key,
+        mut cell: Cell,
+        refuse: bool,
+        typed: bool,
+    ) -> bool {
         cell.spill = None;
+        if typed && wb.calc.precision_as_displayed && cell.formula.is_none() {
+            let shown = wb
+                .styles
+                .xfs
+                .get(cell.style as usize)
+                .and_then(|xf| crate::sheet::round_to_display(xf, &cell.value));
+            if let Some(n) = shown {
+                cell.value = CellValue::Number(n);
+            }
+        }
         let (s, r, c) = key;
         let SpillOwner {
             mut owner,
@@ -1676,7 +1696,36 @@ impl Engine {
 
     /// Evaluate one formula and store its result. Returns the keys of cells
     /// beyond the anchor whose stored values changed (spill writes/clears).
+    /// With Set precision as displayed on, the numbers it stored (the anchor's
+    /// and any spill's) are rounded to their cells' formats.
     fn eval_one(&mut self, wb: &mut Workbook, key: Key) -> Vec<Key> {
+        let changed = self.eval_one_raw(wb, key);
+        if wb.calc.precision_as_displayed && !self.unsupported.contains(&key) {
+            let (s, r, c) = key;
+            let (h, w) = (wb.sheets.get(s))
+                .and_then(|sh| sh.cell(r, c))
+                .and_then(|cl| cl.spill)
+                .unwrap_or((1, 1));
+            let xfs = &wb.styles.xfs;
+            if let Some(sheet) = wb.sheets.get_mut(s) {
+                for rr in r..r + h {
+                    for cc in c..c + w {
+                        if let Some(cell) = sheet.cells.get_mut(&(rr, cc)) {
+                            let shown = xfs
+                                .get(cell.style as usize)
+                                .and_then(|xf| crate::sheet::round_to_display(xf, &cell.value));
+                            if let Some(n) = shown {
+                                cell.value = CellValue::Number(n);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    fn eval_one_raw(&mut self, wb: &mut Workbook, key: Key) -> Vec<Key> {
         let info = match self.formulas.get(&key) {
             Some(i) => i,
             None => return Vec::new(),

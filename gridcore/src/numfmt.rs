@@ -594,6 +594,41 @@ impl NumFormat {
         Some(render_section(section, x, v, explicit, date1904))
     }
 
+    /// The value as this format displays it: `v` rounded the way
+    /// [`NumFormat::format_number`] rounds it before printing (Set precision as
+    /// displayed). `None` when the format shows no fixed number of decimals of
+    /// a plain number: General, dates and times, text, fractions, scientific.
+    pub fn round_to_display(&self, v: f64) -> Option<f64> {
+        if !v.is_finite() {
+            return None;
+        }
+        let sect = self.pick_section(v)?;
+        if sect.is_date
+            || sect.is_text
+            || sect.fraction.is_some()
+            || sect.exp.is_some()
+            || sect.toks.iter().any(|t| matches!(t, Tok::General))
+            || !sect.toks.iter().any(|t| matches!(t, Tok::Digit(_)))
+        {
+            return None;
+        }
+        // The same scaling and rounding `render_number` applies.
+        let mut scale = 1.0;
+        if sect.has_percent {
+            scale *= 100.0;
+        }
+        for _ in 0..sect.scale_commas {
+            scale /= 1000.0;
+        }
+        let f = 10f64.powi(sect.dec_digits as i32);
+        let shown = ((v.abs() * scale) * f).round() / f;
+        let back = shown / scale;
+        // Rounding to the shown digits must not manufacture noise the
+        // display would not show (0.07 / 100 * 100 and the like).
+        let back = format!("{back:.15e}").parse::<f64>().unwrap_or(back);
+        Some(if v < 0.0 { -back } else { back })
+    }
+
     /// Render a text value (through the `@` section when present).
     pub fn format_text(&self, s: &str) -> String {
         match self.text_section() {

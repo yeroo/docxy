@@ -2785,6 +2785,17 @@ pub fn format_with(xf: &Xf, value: &CellValue, date1904: bool) -> String {
     format_value(value, xf.numfmt, date1904)
 }
 
+/// `value` as the cell's number format displays it (Set precision as
+/// displayed): `None` when the format shows no fixed decimals of a plain
+/// number (General, dates, text) or the cell is not a number.
+pub fn round_to_display(xf: &Xf, value: &CellValue) -> Option<f64> {
+    let CellValue::Number(n) = value else {
+        return None;
+    };
+    let fmt = crate::numfmt::parse_format(xf.code.as_deref()?)?;
+    fmt.round_to_display(*n)
+}
+
 /// Export one sheet as CSV text the way Excel writes it (display values,
 /// formulas as their cached results, CR LF after each record, LF inside a
 /// quoted field). The file's encoding (Excel's UTF-8 BOM) is the writer's:
