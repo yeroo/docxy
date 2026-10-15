@@ -392,6 +392,7 @@ fn is_reference(e: &Expr) -> bool {
             | Expr::Name(_)
             | Expr::Structured { .. }
             | Expr::SpillRef(_)
+            | Expr::Bin(formula::BinOp::Range | formula::BinOp::Isect, ..)
     )
 }
 
@@ -440,6 +441,8 @@ fn child_count(e: &Expr) -> usize {
         Expr::Func(_, args) => args.len(),
         Expr::Call(_, args) => args.len() + 1,
         Expr::Un(_, _) => 1,
+        // `a:b` and `a b` are one reference, read whole like `A1:B2`.
+        Expr::Bin(formula::BinOp::Range | formula::BinOp::Isect, ..) => 0,
         Expr::Bin(..) => 2,
         Expr::ArrayLit(rows) => rows.iter().map(Vec::len).sum(),
         _ => 0,
@@ -1059,6 +1062,30 @@ mod tests {
             );
             assert_eq!(ends_on(&w, at), held, "{at}");
         }
+    }
+
+    #[test]
+    fn a_reference_operator_is_one_reference_to_the_steps() {
+        // #680: `a:b` and `a b` read whole, like `A1:B2`, so the call round
+        // them still ends on the cell's own result.
+        let w = wb(&[
+            ("A1", num(1.0)),
+            ("A2", num(2.0)),
+            ("B1", num(4.0)),
+            ("B2", num(8.0)),
+            ("C1", f("SUM(A1:B1 B1:B2)")),
+            ("C2", f("ISREF(A1:B1 B1:B2)")),
+            ("C3", f("ROWS(A1:A2 A1:B1)")),
+        ]);
+        for at in ["C1", "C2", "C3"] {
+            let held = held(&w, at);
+            assert!(
+                !matches!(held, Value::Err(_) | Value::Empty),
+                "{at}: {held:?}"
+            );
+            assert_eq!(ends_on(&w, at), held, "{at}");
+        }
+        assert_eq!(held(&w, "C1"), Value::Num(4.0));
     }
 
     #[test]

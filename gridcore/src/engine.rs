@@ -2663,6 +2663,9 @@ fn without_position_refs(wb: &Workbook, sheet: usize, ast: &Expr) -> Option<Expr
             | Expr::ColRange { .. }
             | Expr::RowRange { .. }
             | Expr::Structured { .. } => true,
+            Expr::Bin(formula::BinOp::Range | formula::BinOp::Isect, l, r) => {
+                position_only(wb, sheet, l, depth) && position_only(wb, sheet, r, depth)
+            }
             Expr::Name(n) => match wb.defined_name(n, sheet) {
                 Some(def) => {
                     depth < 8
@@ -5694,6 +5697,50 @@ mod tests {
     }
 
     #[test]
+    fn reference_operators_track_their_operands_dependencies() {
+        // #680: `Sales[Qty]:Sales[Price]` and the space operator read the
+        // table's cells, so editing one recalculates them.
+        let mut wb = wb_one_sheet(&[
+            ("B2", Cell::text("Qty")),
+            ("C2", Cell::text("Price")),
+            ("B3", Cell::number(2.0)),
+            ("C3", Cell::number(10.0)),
+            ("B4", Cell::number(3.0)),
+            ("C4", Cell::number(5.0)),
+            ("E1", Cell::formula("SUM(Sales[Qty]:Sales[Price])")),
+            ("E2", Cell::formula("SUM(Sales[Qty] Sales[[#All],[Qty]])")),
+            ("E3", Cell::formula("SUM(INDIRECT(\"Sales[Qty]\"))")),
+            ("E4", Cell::formula("ISREF(Sales[Qty]:Sales[Price])")),
+            ("E5", Cell::formula("Sales[[#This Row],[Qty]]")),
+        ]);
+        wb.tables.push(crate::sheet::Table {
+            name: "Sales".to_string(),
+            sheet: 0,
+            range: (1, 1, 3, 2),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["Qty".into(), "Price".into()],
+            part: String::new(),
+            column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
+        });
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(20.0));
+        assert_eq!(value_at(&wb, "E2"), CellValue::Number(5.0));
+        assert_eq!(value_at(&wb, "E3"), CellValue::Number(5.0));
+        assert_eq!(value_at(&wb, "E4"), CellValue::Bool(true));
+        // E5 is on row 5, below the table (rows 2-4): #VALUE!.
+        assert_eq!(value_at(&wb, "E5"), CellValue::Error("#VALUE!".to_string()));
+        set(&mut eng, &mut wb, "B3", Cell::number(100.0));
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(118.0));
+        assert_eq!(value_at(&wb, "E2"), CellValue::Number(103.0));
+        assert_eq!(value_at(&wb, "E3"), CellValue::Number(103.0));
+        set(&mut eng, &mut wb, "C4", Cell::number(50.0));
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(163.0));
+    }
+
+    #[test]
     fn position_functions_do_not_read_their_reference_arguments() {
         // #679 FIX r1 M2: ROW/COLUMN/ROWS/COLUMNS read where a reference is,
         // not its values, so a calculated column measuring its own table is
@@ -5704,6 +5751,8 @@ mod tests {
             ("ROW()-ROW(Sales)+1", 1.0, 2.0),
             ("COLUMN(Sales[Calc])", 4.0, 4.0),
             ("ROWS(Sales[#All])", 3.0, 3.0),
+            ("ROWS(Sales[Qty]:Sales[Price])", 2.0, 2.0),
+            ("ROWS(Sales[Qty] Sales[[#All],[Qty]])", 2.0, 2.0),
             ("ROWS(A1:D3)+COLUMN(D2)", 7.0, 7.0),
         ] {
             let mut wb = calc_column_wb("Sales", calc);
