@@ -258,10 +258,13 @@ const EDITORS: EditorSpec[] = [
         'wb.replace-all',
         'sheet.add',
         // #674: wb.calc.set is bucket A when it switches Set precision as
-        // displayed on (a snapshot step, undoSteps:1). Any other change is not
-        // on the wasm undo stack (undoSteps:0) but carries an `inverse` (the
-        // same verb restoring the previous values), so it dirties the document
-        // and undoes like bucket B; a call that changes nothing carries none.
+        // displayed on (a snapshot step, undoSteps:1; refused together with
+        // any other key, so the step is the whole call). Any other change is
+        // not on the wasm undo stack (undoSteps:0) but carries an `inverse`
+        // (the same verb restoring the previous values; turning precision off
+        // is undone by the internal `restorePrecision`), so it dirties the
+        // document and undoes like bucket B; a call that changes nothing
+        // carries none.
         'wb.calc.set',
         // Wave-2: cell.format lands on the SAME true wasm-undo-stack group
         // range.set uses (Session::apply captures the style-only before/after

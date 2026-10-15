@@ -381,6 +381,85 @@ fn redo_of_a_calculated_state_is_not_stale() {
     assert_eq!(word(&mut t), None);
 }
 
+/// D1 = D1+1: a circle, with iteration off an error until it is enabled.
+fn circle_book() -> DocTab {
+    let mut t = tab();
+    type_into(&mut t, "D1", "=D1+1");
+    t
+}
+
+fn set_iteration(t: &mut DocTab, on: bool, max: &str) {
+    open(t);
+    set(t, "iterate", Json::Bool(on));
+    set(t, "max-iterations", Json::Str(max.into()));
+    press(t, "OK");
+}
+
+#[test]
+fn undo_recalculates_values_made_under_other_iteration_settings() {
+    // Iteration off: the circle is an error. C1 is an unrelated edit.
+    let mut t = circle_book();
+    let off = value(&mut t, "D1");
+    type_into(&mut t, "C1", "1");
+    set_iteration(&mut t, true, "10");
+    run(&mut t, CalcAct::Now);
+    let on = value(&mut t, "D1");
+    assert_ne!(on, off, "iterating changes the circle's value");
+    // C1's snapshot holds the circle as it was with iteration off; the
+    // iteration setting is not history's, so the circle is calculated again.
+    assert!(view(&mut t).undo_step());
+    assert!(view(&mut t).pkg.workbook.iterate.is_some());
+    assert!(
+        matches!(value(&mut t, "D1"), CellValue::Number(_)),
+        "calculated under iteration, not the error the snapshot holds: {off:?}"
+    );
+}
+
+#[test]
+fn undo_after_iteration_is_turned_off_calculates_without_it() {
+    let mut t = circle_book();
+    set_iteration(&mut t, true, "10");
+    run(&mut t, CalcAct::Now);
+    type_into(&mut t, "C1", "1");
+    let iterated = value(&mut t, "D1");
+    set_iteration(&mut t, false, "10");
+    let plain = value(&mut t, "D1");
+    assert!(view(&mut t).undo_step()); // C1, taken while iterating
+    assert_eq!(value(&mut t, "D1"), plain, "not the iterated {iterated:?}");
+}
+
+#[test]
+fn undo_after_a_max_iterations_change_calculates_with_the_new_limit() {
+    let mut t = circle_book();
+    set_iteration(&mut t, true, "3");
+    run(&mut t, CalcAct::Now);
+    type_into(&mut t, "C1", "1");
+    let three = value(&mut t, "D1");
+    set_iteration(&mut t, true, "9");
+    run(&mut t, CalcAct::Now);
+    let nine = value(&mut t, "D1");
+    assert_ne!(three, nine);
+    assert!(view(&mut t).undo_step());
+    // The circle was recalculated under the kept limit (9), not restored at 3.
+    assert_ne!(value(&mut t, "D1"), three);
+}
+
+#[test]
+fn a_manual_file_with_an_uncached_circle_opens_after_one_pass() {
+    let mut pkg = gridcore::xlsx::new_xlsx();
+    pkg.workbook.calc.mode = CalcMode::Manual;
+    pkg.workbook.set_iteration(true, 100, 0.001);
+    // No cached value, and every pass adds 1.
+    pkg.workbook.sheets[0].set_cell(0, 3, gridcore::sheet::Cell::formula("D1+1"));
+    let path = std::env::temp_dir().join(format!("docxy-674-circle-{}.xlsx", std::process::id()));
+    std::fs::write(&path, gridcore::xlsx::save_xlsx(&pkg)).unwrap();
+    let (surface, _) = crate::sheet_from_path_mode(&path, false);
+    let _ = std::fs::remove_file(&path);
+    let mut t = tab();
+    t.surface = surface;
+    assert_eq!(value(&mut t, "D1"), CellValue::Number(1.0), "one pass");
+}
+
 #[test]
 fn a_manual_file_opens_fresh_without_the_calculate_word() {
     let mut pkg = gridcore::xlsx::new_xlsx();

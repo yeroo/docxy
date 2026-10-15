@@ -190,3 +190,61 @@ fn rounding_matches_the_15_digit_display() {
         "storing the displayed value changes nothing the cell shows"
     );
 }
+
+/// A1 = 1, B1 = A1/3 shown as 0.00, C1 = B1*3.
+fn thirds() -> (Workbook, Engine) {
+    let mut wb = book();
+    let mut eng = Engine::new(&wb);
+    put(&mut eng, &mut wb, "A1", CellValue::Number(1.0), GENERAL);
+    put_formula(&mut eng, &mut wb, "B1", "A1/3", TWO);
+    put_formula(&mut eng, &mut wb, "C1", "B1*3", GENERAL);
+    (wb, eng)
+}
+
+#[test]
+fn turning_it_off_brings_formula_results_back_to_full_precision() {
+    let (mut wb, mut eng) = thirds();
+    calc::precision_on(&mut wb, &mut eng);
+    assert_eq!(num(&wb, "B1"), 0.33);
+    assert_eq!(num(&wb, "C1"), 0.99);
+    let off = calc::CalcPatch {
+        precision_as_displayed: Some(false),
+        ..Default::default()
+    };
+    calc::apply_settings(&mut wb, &mut eng, &off);
+    assert!(!wb.calc.precision_as_displayed);
+    assert_eq!(num(&wb, "B1"), 1.0 / 3.0);
+    assert_eq!(num(&wb, "C1"), 1.0);
+}
+
+#[test]
+fn turning_it_off_in_manual_mode_leaves_results_for_the_next_calculate() {
+    let (mut wb, mut eng) = thirds();
+    calc::precision_on(&mut wb, &mut eng);
+    wb.calc.mode = CalcMode::Manual;
+    let off = calc::CalcPatch {
+        precision_as_displayed: Some(false),
+        ..Default::default()
+    };
+    calc::apply_settings(&mut wb, &mut eng, &off);
+    assert!(eng.is_stale());
+    assert_eq!(num(&wb, "C1"), 0.99);
+    eng.recalc_all(&mut wb);
+    assert_eq!(num(&wb, "C1"), 1.0);
+    assert!(!eng.is_stale());
+}
+
+#[test]
+fn switching_on_is_refused_with_other_settings() {
+    let wb = book();
+    let p = calc::CalcPatch {
+        precision_as_displayed: Some(true),
+        accept_loss: true,
+        mode: Some(CalcMode::Manual),
+        ..Default::default()
+    };
+    let e = calc::check_patch(&wb, &p).unwrap_err();
+    assert!(e.contains("send it alone"), "{e}");
+    let alone = calc::CalcPatch { mode: None, ..p };
+    assert!(calc::check_patch(&wb, &alone).is_ok());
+}

@@ -4186,18 +4186,26 @@ impl SheetView {
             SnapshotBody::Workbook(wb) => self.pkg.workbook = wb,
             SnapshotBody::Package(pkg) => self.pkg = *pkg,
         }
+        // The snapshot's values were calculated under its own iteration and
+        // precision settings; if the ones kept differ, they need calculating.
+        let (snap_iterate, snap_precision) = (
+            self.pkg.workbook.iterate,
+            self.pkg.workbook.calc.precision_as_displayed,
+        );
         self.pkg.workbook.calc = calc;
         self.pkg.workbook.iterate = iterate;
         if let Some((on, file_off)) = snap.precision {
             let c = &mut self.pkg.workbook.calc;
             (c.precision_as_displayed, c.precision_file_off) = (on, file_off);
         }
+        let settings_differ = snap_iterate != iterate
+            || snap_precision != self.pkg.workbook.calc.precision_as_displayed;
         self.charts = snap.charts;
         self.pivot_views = snap.pivots;
         // Whether the values in hand are out of date comes from the snapshot
         // as well as the engine being replaced (#674). Manual mode marks every
         // formula; otherwise (the mode changed since) they are calculated now.
-        let was_stale = snap.stale || self.engine.is_stale();
+        let was_stale = snap.stale || self.engine.is_stale() || settings_differ;
         self.rebuild_engine();
         if was_stale {
             if self.pkg.workbook.calc.mode == gridcore::sheet::CalcMode::Manual {
@@ -10791,11 +10799,13 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                 // A formula saved without its cached `<v>` (openpyxl writes
                 // none) would show blank until something recalculated it;
                 // Excel computes such cells on open (#673).
+                // A manual-mode file opens fresh too (#674), by the same one
+                // calculation (a second would advance an iterating circle).
                 if has_uncached_formula(&pkg.workbook) {
                     engine.recalc_all(&mut pkg.workbook);
+                } else {
+                    gridcore::calc::load_fresh(&mut pkg.workbook, &mut engine);
                 }
-                // A manual-mode file opens fresh (#674).
-                gridcore::calc::load_fresh(&mut pkg.workbook, &mut engine);
                 let view = SheetView {
                     pkg,
                     active: 0,

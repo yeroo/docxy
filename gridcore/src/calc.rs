@@ -171,12 +171,36 @@ pub fn check_patch(wb: &Workbook, p: &CalcPatch) -> Result<(), String> {
             return Err("Number of calculation threads is from 1 to 1024".to_string());
         }
     }
+    if p.converts(wb)
+        && (p.mode.is_some()
+            || p.iterate.is_some()
+            || p.max_iterations.is_some()
+            || p.max_change.is_some()
+            || p.threads.is_some()
+            || p.concurrent.is_some()
+            || p.transition_eval.is_some())
+    {
+        return Err(
+            "Set precision as displayed rewrites data and is its own undo step: send it alone"
+                .to_string(),
+        );
+    }
     if p.converts(wb) && !p.accept_loss {
         return Err(format!(
             "{PRECISION_WARNING} Send acceptLoss:true to turn Set precision as displayed on."
         ));
     }
     Ok(())
+}
+
+/// Everything may have been calculated under other settings: calculate it now
+/// (automatic) or leave it stale for the next Calculate (manual).
+pub fn recalc_or_mark_stale(wb: &mut Workbook, eng: &mut Engine) {
+    if wb.calc.mode == CalcMode::Manual {
+        eng.mark_all_stale();
+    } else {
+        eng.recalc_all(wb);
+    }
 }
 
 /// Apply every setting of `p` that is not the precision switch-on (which
@@ -219,7 +243,12 @@ pub fn apply_settings(wb: &mut Workbook, eng: &mut Engine, p: &CalcPatch) {
     if let Some(t) = p.transition_eval {
         wb.calc.set_transition_eval(t);
     }
-    if p.precision_as_displayed == Some(false) {
+    if p.precision_as_displayed == Some(false) && wb.calc.precision_as_displayed {
+        wb.calc.set_precision_as_displayed(false);
+        // Results stored rounded are recalculated at full precision; in
+        // manual mode they wait for the next Calculate.
+        recalc_or_mark_stale(wb, eng);
+    } else if p.precision_as_displayed == Some(false) {
         wb.calc.set_precision_as_displayed(false);
     }
     if let Some(m) = p.mode {

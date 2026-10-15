@@ -365,10 +365,10 @@ placeholder would be painful to retrofit):
   *stale* (`Engine::is_stale`, shown as `Calculate`) until `recalc_all`
   (Calculate Now, F9, every sheet) or `recalc_sheet` (Calculate Sheet,
   Shift+F9; other sheets' dependents stay stale). With iteration on, each
-  manual Calculate runs one pass per circle. A file opens with a full
-  calculation whatever its mode (nothing stale; the hosts' open step, 
-  `calc::load_fresh`), and a save keeps
-  `fullCalcOnLoad="1"`. Set precision as displayed (`gridcore::calc`) rounds
+  manual Calculate runs one pass per circle. A manual-mode file opens
+  with a full calculation (nothing stale; the hosts' open step,
+  `calc::load_fresh`); an automatic file keeps its cached values (the wasm
+  bridge calculates every file on open). A save keeps `fullCalcOnLoad="1"`. Set precision as displayed (`gridcore::calc`) rounds
   every constant whose format shows fixed decimals (not General, dates, text,
   fractions or scientific) after "Data will permanently lose accuracy.", then
   rounds typed constants and formula results as they are written; switching it

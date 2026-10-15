@@ -1565,6 +1565,7 @@ impl Session {
             _ => Err(format!("'{k}' is a whole number")),
         };
         let mut p = gridcore::calc::CalcPatch::default();
+        let mut restore_precision = false;
         for (k, v) in fields {
             match k.as_str() {
                 "mode" => {
@@ -1602,6 +1603,10 @@ impl Session {
                 }
                 "concurrent" => p.concurrent = Some(flag(k, v)?),
                 "transitionEvaluation" => p.transition_eval = Some(flag(k, v)?),
+                // INTERNAL (the inverse of turning precision off): puts the
+                // flag back without converting; the data it rounded is
+                // already rounded. Not in the MCP schema.
+                "restorePrecision" => restore_precision = flag(k, v)?,
                 "target" => {}
                 other => return Err(format!("unknown wb.calc.set key '{other}'")),
             }
@@ -1610,6 +1615,10 @@ impl Session {
         let converts = p.converts(&self.pkg.workbook);
         let before = gridcore::calc::info(&self.pkg.workbook, &self.engine);
         gridcore::calc::apply_settings(&mut self.pkg.workbook, &mut self.engine, &p);
+        if restore_precision && !self.pkg.workbook.calc.precision_as_displayed {
+            self.pkg.workbook.calc.set_precision_as_displayed(true);
+            gridcore::calc::recalc_or_mark_stale(&mut self.pkg.workbook, &mut self.engine);
+        }
         let mut steps = 0;
         if converts {
             let was = {
@@ -1640,8 +1649,9 @@ impl Session {
         let mut out = self.ctl_calc_info(Some(steps));
         // A settings-only change is not on the wasm undo stack (undoSteps:0),
         // so the host undoes it through an `inverse`: this verb restoring the
-        // previous values. Set precision as displayed is left out — turning
-        // it on is its own undo step, and turning it off changes no data.
+        // previous values. Switching precision on is its own undo step (and
+        // is refused with other keys); switching it off changes no data, and
+        // its inverse puts the flag back without converting.
         if changed && steps == 0 {
             let inverse = Self::calc_inverse(&before, &after);
             out.pop();
@@ -1659,6 +1669,11 @@ impl Session {
             }
             args.push_str(&format!("\"{k}\":{v}"));
         };
+        if before.precision_as_displayed && !after.precision_as_displayed {
+            put(&mut args, "restorePrecision", "true".into());
+        } else if !before.precision_as_displayed && after.precision_as_displayed {
+            put(&mut args, "precisionAsDisplayed", "false".into());
+        }
         if before.mode != after.mode {
             let mut m = String::new();
             json::push_str(&mut m, gridcore::calc::mode_name(before.mode));
@@ -6725,5 +6740,44 @@ mod tests {
         assert_eq!(c.iterate_count, 100);
         // ...and that call's own inverse puts the change back (the flip-flop).
         assert!(out.contains("\"inverse\""), "{out}");
+    }
+
+    /// The request inside a reply's `"inverse":`.
+    fn calc_inverse_request(out: &str) -> String {
+        let at = out.find("\"inverse\":").expect("an inverse") + "\"inverse\":".len();
+        out[at..out.rfind(",\"ok\"").unwrap()].to_string()
+    }
+
+    #[test]
+    fn precision_off_has_an_inverse_that_puts_the_flag_back() {
+        let mut s = calc_book();
+        s.ctl(r#"{"verb":"cell.set","args":{"ref":"C1","text":"3.14659"}}"#);
+        s.ctl(r#"{"verb":"cell.format","args":{"range":"C1","patch":{"numFmt":"0.00"}}}"#);
+        s.ctl(r#"{"verb":"wb.calc.set","args":{"precisionAsDisplayed":true,"acceptLoss":true}}"#);
+        assert!(s.pkg.workbook.calc.precision_as_displayed);
+        let off = s.ctl(r#"{"verb":"wb.calc.set","args":{"precisionAsDisplayed":false}}"#);
+        assert!(!s.pkg.workbook.calc.precision_as_displayed);
+        assert!(off.contains("\"undoSteps\":0"), "{off}");
+        // Undo: the flag is back, and the data was already rounded.
+        let back = s.ctl(&calc_inverse_request(&off));
+        assert!(s.pkg.workbook.calc.precision_as_displayed, "{back}");
+        assert_eq!(
+            s.pkg.workbook.sheets[0].cell(0, 2).unwrap().value,
+            CellValue::Number(3.15)
+        );
+        // Redo: the inverse's own inverse switches it off again.
+        s.ctl(&calc_inverse_request(&back));
+        assert!(!s.pkg.workbook.calc.precision_as_displayed);
+    }
+
+    #[test]
+    fn switching_precision_on_is_refused_with_other_keys() {
+        let mut s = calc_book();
+        let out = s.ctl(
+            r#"{"verb":"wb.calc.set","args":{"precisionAsDisplayed":true,"acceptLoss":true,"mode":"manual"}}"#,
+        );
+        assert!(out.contains("send it alone"), "{out}");
+        assert!(!s.pkg.workbook.calc.precision_as_displayed);
+        assert_eq!(s.pkg.workbook.calc.mode, gridcore::sheet::CalcMode::Auto);
     }
 }

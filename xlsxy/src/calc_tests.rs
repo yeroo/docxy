@@ -368,3 +368,20 @@ fn wb_calc_set_that_changes_nothing_leaves_the_workbook_clean() {
     calc_set(&mut a, vec![("mode", manual())]).unwrap();
     assert!(a.modified);
 }
+
+#[test]
+fn switching_precision_on_is_refused_with_other_keys() {
+    let mut a = app();
+    let e = calc_set(
+        &mut a,
+        vec![
+            ("precisionAsDisplayed", Json::Bool(true)),
+            ("acceptLoss", Json::Bool(true)),
+            ("mode", manual()),
+        ],
+    )
+    .unwrap_err();
+    assert!(e.contains("send it alone"), "{e}");
+    assert!(!a.pkg.workbook.calc.precision_as_displayed);
+    assert_eq!(a.pkg.workbook.calc.mode, gridcore::sheet::CalcMode::Auto);
+}
