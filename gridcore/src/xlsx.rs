@@ -1055,7 +1055,7 @@ fn parse_workbook_xml(
                     }
                     calc.mode = CalcMode::from_attr(p.attr("calcMode"));
                     calc.precision_file_off = matches!(p.attr("fullPrecision"), "0" | "false");
-                    calc.num_threads = p.attr("numThreads").parse().ok();
+                    calc.num_threads = p.attr("concurrentManualCount").parse().ok();
                     calc.concurrent_calc = !matches!(p.attr("concurrentCalc"), "0" | "false");
                 }
                 "definedName" => {
@@ -8154,27 +8154,28 @@ fn sync_calc_pr(xml: &str, wb: &Workbook) -> String {
             Box::new(move |v| off(v) != c.concurrent_calc),
         ),
     ];
-    if let Some((count, delta)) = wb.iterate {
-        wants.push((
-            "iterateCount",
-            Some(count.to_string()),
-            // Absent means Excel's default of 100.
-            Box::new(move |v| v.parse::<f64>().unwrap_or(100.0) == f64::from(count)),
-        ));
-        wants.push((
-            "iterateDelta",
-            Some(delta.to_string()),
-            // Absent means Excel's default of 0.001.
-            Box::new(move |v| v.parse::<f64>().unwrap_or(0.001) == delta),
-        ));
-    }
-    if let Some(n) = c.num_threads {
-        wants.push((
-            "numThreads",
-            Some(n.to_string()),
-            Box::new(move |v| v.parse::<u32>().is_ok_and(|x| x == n)),
-        ));
-    }
+    // The counts are written whether or not iteration is on: Excel keeps
+    // them in the dialog either way.
+    let (count, delta) = (c.iterate_count, c.iterate_delta);
+    wants.push((
+        "iterateCount",
+        Some(count.to_string()),
+        // Absent means Excel's default of 100.
+        Box::new(move |v| v.parse::<f64>().unwrap_or(100.0) == f64::from(count)),
+    ));
+    wants.push((
+        "iterateDelta",
+        Some(delta.to_string()),
+        // Absent means Excel's default of 0.001.
+        Box::new(move |v| v.parse::<f64>().unwrap_or(0.001) == delta),
+    ));
+    // CT_CalcPr's thread count: absent means all processors.
+    let threads = c.num_threads;
+    wants.push((
+        "concurrentManualCount",
+        threads.map(|n| n.to_string()),
+        Box::new(move |v| v.parse::<u32>().ok() == threads),
+    ));
     let Some(start) = workbook_child(xml, "calcPr").map(|c| c.start) else {
         let attrs: String = wants
             .iter()
@@ -23093,7 +23094,7 @@ mod calc_settings_tests {
     #[test]
     fn calc_settings_round_trip_xlsx() {
         let mut pkg = with_calc_pr(
-            r#"<calcPr calcId="191029" futureAttr="keep" calcMode="manual" iterate="1" iterateCount="50" iterateDelta="0.01" numThreads="4" concurrentCalc="0"/>"#,
+            r#"<calcPr calcId="191029" futureAttr="keep" calcMode="manual" iterate="1" iterateCount="50" iterateDelta="0.01" concurrentManualCount="4" concurrentCalc="0"/>"#,
         );
         let c = &pkg.workbook.calc;
         assert_eq!(c.mode, CalcMode::Manual);
@@ -23104,7 +23105,7 @@ mod calc_settings_tests {
         let wb = part_text(&again, "xl/workbook.xml");
         assert!(wb.contains(r#"futureAttr="keep""#), "{wb}");
         assert!(wb.contains(r#"calcMode="manual""#), "{wb}");
-        assert!(wb.contains(r#"numThreads="4""#), "{wb}");
+        assert!(wb.contains(r#"concurrentManualCount="4""#), "{wb}");
         assert!(wb.contains(r#"concurrentCalc="0""#), "{wb}");
         assert_eq!(again.workbook.calc.mode, CalcMode::Manual);
 
@@ -23118,7 +23119,8 @@ mod calc_settings_tests {
         let wb = part_text(&again, "xl/workbook.xml");
         assert!(wb.contains(r#"futureAttr="keep""#), "{wb}");
         assert!(wb.contains(r#"calcMode="autoNoTable""#), "{wb}");
-        assert!(wb.contains(r#"numThreads="2""#), "{wb}");
+        assert!(wb.contains(r#"concurrentManualCount="2""#), "{wb}");
+        assert!(wb.contains(r#"iterateCount="50""#), "iteration off keeps its counts: {wb}");
         assert!(!wb.contains("concurrentCalc"), "{wb}");
         assert!(!wb.contains(r#"iterate="1""#), "{wb}");
         assert!(wb.contains(r#"fullPrecision="0""#), "{wb}");
@@ -23129,6 +23131,20 @@ mod calc_settings_tests {
             !again.workbook.calc.precision_as_displayed,
             "load applies nothing"
         );
+    }
+
+    #[test]
+    fn threads_none_removes_the_attribute_and_counts_survive_without_iteration() {
+        let mut pkg = with_calc_pr(r#"<calcPr calcId="1" concurrentManualCount="4"/>"#);
+        pkg.workbook.calc.num_threads = None;
+        pkg.workbook.set_iteration(false, 50, 0.01);
+        let again = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let wb = part_text(&again, "xl/workbook.xml");
+        assert!(!wb.contains("concurrentManualCount"), "{wb}");
+        assert_eq!(again.workbook.calc.num_threads, None);
+        assert_eq!(again.workbook.calc.iterate_count, 50);
+        assert_eq!(again.workbook.calc.iterate_delta, 0.01);
+        assert_eq!(again.workbook.iterate, None);
     }
 
     #[test]
