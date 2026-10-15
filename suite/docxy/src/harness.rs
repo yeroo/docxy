@@ -3903,8 +3903,20 @@ fn recent_files_json(files: &[std::path::PathBuf], message: Option<&str>) -> Jso
     ])
 }
 
+/// An accent as `#rrggbb`.
+fn hex(c: u32) -> String {
+    format!("#{c:06x}")
+}
+
 /// `tab-list`: every open tab, in strip order, and which one is active.
-fn tab_list(tabs: &[crate::DocTab], active: usize, os_title: Option<&str>) -> Json {
+fn tab_list(
+    tabs: &[crate::DocTab],
+    active: usize,
+    os_title: Option<&str>,
+    dark: bool,
+    drawn_accent: u32,
+) -> Json {
+    let kind = tabs.get(active).map(|t| t.kind);
     let window_title = crate::doc_name::window_title(tabs.get(active).map(|t| t.title.as_ref()));
     let tabs = tabs
         .iter()
@@ -3931,6 +3943,15 @@ fn tab_list(tabs: &[crate::DocTab], active: usize, os_title: Option<&str>) -> Js
     Json::obj(vec![
         ("active", Json::Num(active as f64)),
         ("window_title", Json::Str(window_title)),
+        // The title bar's one-word type label and the selected tab's accent
+        // (#1473). `accent` is computed from the tab; `drawn_accent` is what
+        // the last render set, so a render that stops following the tab shows.
+        ("title_label", Json::Str(crate::accent::label(kind).into())),
+        (
+            "accent",
+            Json::Str(hex(crate::accent::for_kind(kind, dark))),
+        ),
+        ("drawn_accent", Json::Str(hex(drawn_accent))),
         // `last_window_title`, the cache render updates beside its
         // `set_window_title` call: not recomputed from the tabs, so it catches
         // a render that stops updating the title (#1143), though not a dropped
@@ -4128,6 +4149,8 @@ fn dispatch_verb(
             &app.tabs,
             app.active,
             app.last_window_title.as_deref(),
+            app.applied == Some(gpui_component::ThemeMode::Dark),
+            crate::accent::brand(),
         )),
         // The run's windows (#587). These go through the same handlers as
         // View › Window: `window-new` is the New Window command (it moves
@@ -6648,6 +6671,8 @@ mod tests {
             &[word, book, blank, mpp, inbox],
             2,
             Some("Project1  -  docxy"),
+            false,
+            crate::BRAND,
         );
         assert_eq!(list.get_str("os_title"), Some("Project1  -  docxy"));
         assert_eq!(list.get("active"), Some(&Json::Num(2.)));

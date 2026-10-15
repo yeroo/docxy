@@ -23,6 +23,7 @@ compile_error!(
 );
 
 mod about;
+mod accent;
 mod close;
 #[cfg(test)]
 mod comment_tests;
@@ -16903,6 +16904,14 @@ impl Docxy {
         )
     }
 
+    /// The accent of the selected tab's type on the drawn theme (#1473).
+    pub(crate) fn accent_now(&self) -> u32 {
+        accent::for_kind(
+            self.tabs.get(self.active).map(|t| t.kind),
+            self.applied == Some(ThemeMode::Dark),
+        )
+    }
+
     fn active_is_sheet(&self) -> bool {
         matches!(
             self.tabs.get(self.active).map(|t| &t.surface),
@@ -31129,15 +31138,15 @@ impl Docxy {
                     .text_size(px(12.))
                     .when(!is_file, |d| d.hover(|d| d.bg(Hsla { a: 0.10, ..fg })))
                     .when(is_file, |d| {
-                        d.bg(rgb(BRAND))
+                        d.bg(rgb(accent::brand()))
                             .text_color(rgb(FILE_FG))
                             .font_weight(FontWeight::BOLD)
                             .rounded_t_sm()
                     })
                     .when(active, |d| {
-                        d.text_color(rgb(BRAND))
+                        d.text_color(rgb(accent::brand()))
                             .border_b_2()
-                            .border_color(rgb(BRAND))
+                            .border_color(rgb(accent::brand()))
                     })
                     .when(!active && !is_file, |d| d.text_color(fg))
                     .child(name)
@@ -32002,7 +32011,7 @@ impl Docxy {
                 .when(self.act_active(act), |d| {
                     d.bg(Hsla {
                         a: 0.20,
-                        ..hsla_u(BRAND)
+                        ..hsla_u(accent::brand())
                     })
                 })
                 .hover(|d| d.bg(pal.hover))
@@ -32757,7 +32766,7 @@ impl Docxy {
             .when(on, |d| {
                 d.bg(Hsla {
                     a: 0.20,
-                    ..hsla_u(BRAND)
+                    ..hsla_u(accent::brand())
                 })
             })
             .hover(|d| d.bg(pal.hover))
@@ -32929,7 +32938,7 @@ impl Docxy {
             .border_color(pal.border)
             .bg(pal.panel)
             .cursor_pointer()
-            .hover(|d| d.border_color(hsla_u(BRAND)))
+            .hover(|d| d.border_color(hsla_u(accent::brand())))
             .child(
                 div()
                     .text_size(px(11.))
@@ -32965,7 +32974,7 @@ impl Docxy {
             .border_color(pal.border)
             .bg(pal.panel)
             .cursor_pointer()
-            .hover(|d| d.border_color(hsla_u(BRAND)))
+            .hover(|d| d.border_color(hsla_u(accent::brand())))
             .child(
                 div()
                     .text_size(px(11.))
@@ -33125,7 +33134,7 @@ impl Docxy {
                     .border_color(if c == 0xFFFFFF { pal.fg } else { pal.border })
                     .bg(hsla_u(c))
                     .cursor_pointer()
-                    .hover(|d| d.border_color(hsla_u(BRAND)))
+                    .hover(|d| d.border_color(hsla_u(accent::brand())))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.sheet_apply_color(pick, Some(rgb), cx)
                     })),
@@ -34047,7 +34056,7 @@ impl Docxy {
         let dark = self.applied == Some(ThemeMode::Dark);
         let t = cx.theme();
         let fg = t.foreground.to_rgb();
-        let colors = sg::tile_colors(t.background.to_rgb(), fg, rgb(BRAND), dark);
+        let colors = sg::tile_colors(t.background.to_rgb(), fg, rgb(accent::brand()), dark);
         let tiles: Vec<AnyElement> = gal
             .items
             .iter()
@@ -34068,7 +34077,7 @@ impl Docxy {
                     .border(px(g.border))
                     .overflow_hidden()
                     .border_color(if selected {
-                        hsla_u(BRAND)
+                        hsla_u(accent::brand())
                     } else {
                         gpui::transparent_black()
                     })
@@ -34191,7 +34200,7 @@ impl Docxy {
             .border_color(pal.border)
             .bg(pal.panel)
             .cursor_pointer()
-            .hover(|d| d.border_color(hsla_u(BRAND)))
+            .hover(|d| d.border_color(hsla_u(accent::brand())))
             .child(
                 div()
                     .text_size(px(11.))
@@ -34246,7 +34255,7 @@ impl Docxy {
             .when(on, |d| {
                 d.bg(Hsla {
                     a: 0.20,
-                    ..hsla_u(BRAND)
+                    ..hsla_u(accent::brand())
                 })
             })
             .hover(|d| d.bg(pal.hover))
@@ -34465,10 +34474,10 @@ impl Docxy {
             .when(on, |d| {
                 d.bg(Hsla {
                     a: 0.20,
-                    ..hsla_u(BRAND)
+                    ..hsla_u(accent::brand())
                 })
                 .border_1()
-                .border_color(hsla_u(BRAND))
+                .border_color(hsla_u(accent::brand()))
             })
             .when(!on, |d| {
                 d.border_1().border_color(gpui::transparent_black())
@@ -34557,7 +34566,7 @@ impl Docxy {
                             .border_color(dim)
                             .text_color(fg)
                             .cursor_pointer()
-                            .hover(|d| d.border_color(rgb(BRAND)))
+                            .hover(|d| d.border_color(rgb(accent::brand())))
                             .child("About docxy suite")
                             .on_click(cx.listener(|this, _, _, cx| this.open_about_clicked(cx))),
                     ),
@@ -34620,7 +34629,7 @@ impl Docxy {
                                 .border_color(dim)
                                 .text_color(fg)
                                 .cursor_pointer()
-                                .hover(|d| d.border_color(rgb(BRAND)))
+                                .hover(|d| d.border_color(rgb(accent::brand())))
                                 .child("Remove All")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     let _ = this.inspect_remove_active(category);
@@ -34711,7 +34720,7 @@ impl Docxy {
                             .border_color(dim)
                             .text_color(fg)
                             .cursor_pointer()
-                            .hover(|d| d.border_color(rgb(BRAND)))
+                            .hover(|d| d.border_color(rgb(accent::brand())))
                             .child("Convert")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let _ = this.convert_active();
@@ -34774,12 +34783,12 @@ impl Docxy {
                     .cursor_pointer()
                     .rounded_sm()
                     .text_color(if matches!(action, BackstageRailAction::Back) {
-                        hsla_u(BRAND)
+                        hsla_u(accent::brand())
                     } else {
                         fg
                     })
                     .when(!matches!(action, BackstageRailAction::Back), |d| {
-                        d.hover(|d| d.bg(rgb(BRAND)).text_color(rgb(FILE_FG)))
+                        d.hover(|d| d.bg(rgb(accent::brand())).text_color(rgb(FILE_FG)))
                     })
                     .child(item.display)
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -34805,7 +34814,7 @@ impl Docxy {
                     .border_1()
                     .border_color(dim)
                     .cursor_pointer()
-                    .hover(|d| d.border_color(rgb(BRAND)))
+                    .hover(|d| d.border_color(rgb(accent::brand())))
                     .child(div().text_size(px(40.)).child(glyph))
                     .child(
                         div()
@@ -34968,9 +34977,9 @@ impl Docxy {
                     .size(px(16.))
                     .rounded(px(3.))
                     .border_1()
-                    .border_color(if on { hsla_u(BRAND) } else { dim })
+                    .border_color(if on { hsla_u(accent::brand()) } else { dim })
                     .bg(if on {
-                        hsla_u(BRAND)
+                        hsla_u(accent::brand())
                     } else {
                         Hsla { a: 0., ..fg }
                     })
@@ -35017,7 +35026,7 @@ impl Docxy {
                 .child(
                     div()
                         .text_size(px(13.))
-                        .text_color(rgb(BRAND))
+                        .text_color(rgb(accent::brand()))
                         .mt_4()
                         .child("Open"),
                 )
@@ -35055,7 +35064,7 @@ impl Docxy {
                 .child(
                     div()
                         .text_size(px(13.))
-                        .text_color(rgb(BRAND))
+                        .text_color(rgb(accent::brand()))
                         .mt_4()
                         .child("Recent"),
                 )
@@ -35078,7 +35087,7 @@ impl Docxy {
                     d.child(
                         div()
                             .text_size(px(13.))
-                            .text_color(rgb(BRAND))
+                            .text_color(rgb(accent::brand()))
                             .mt_4()
                             .child("Recover Unsaved Workbooks"),
                     )
@@ -35098,7 +35107,7 @@ impl Docxy {
                 .child(
                     div()
                         .text_size(px(13.))
-                        .text_color(rgb(BRAND))
+                        .text_color(rgb(accent::brand()))
                         .mt_4()
                         .child("Settings"),
                 )
@@ -35148,7 +35157,7 @@ impl Docxy {
                                 .px_2()
                                 .rounded(px(3.))
                                 .border_1()
-                                .border_color(hsla_u(BRAND))
+                                .border_color(hsla_u(accent::brand()))
                                 .text_color(fg)
                                 .child(recover::choice_label(self.autorecover_minutes)),
                         )
@@ -35251,7 +35260,7 @@ impl Docxy {
                                 .px_2()
                                 .rounded(px(3.))
                                 .border_1()
-                                .border_color(hsla_u(BRAND))
+                                .border_color(hsla_u(accent::brand()))
                                 .text_color(fg)
                                 .child("Clear"),
                         )
@@ -35522,6 +35531,9 @@ impl Docxy {
 
 impl Render for Docxy {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The ribbon, backstage and title bar draw the selected tab's accent
+        // (#1473); set it before any of them is built.
+        accent::set(self.accent_now());
         HL_CURSOR.store(
             self.hl_mode.as_ref().is_some_and(|m| m.tab == self.active),
             std::sync::atomic::Ordering::Relaxed,
@@ -35813,10 +35825,12 @@ impl Render for Docxy {
         // — that idle space is natively draggable and double-click maximizes.
         // Only the *interactive* clusters (chips, theme button) swallow the
         // mouse-down so a drag on them doesn't start a window move.
-        // The brand label draws the active tab's window title, Project's
-        // `<stem>  -  docxy` (#588); no tab draws the bare brand. The OS
-        // window title gets the same string — but only when it changed, as
-        // the platform writes it on every call.
+        // The OS window title is the active tab's Project-style
+        // `<stem>  -  docxy` (#588); no tab gets the bare brand. It is set
+        // only when it changed, as the platform writes it on every call. The
+        // title bar's own label names the tab's type instead (#1473), so the
+        // document's name stays on its tab.
+        let title_label = accent::label(self.tabs.get(self.active).map(|t| t.kind));
         let window_title =
             doc_name::window_title(self.tabs.get(self.active).map(|t| t.title.as_ref()));
         if self.last_window_title.as_deref() != Some(window_title.as_str()) {
@@ -35848,12 +35862,12 @@ impl Render for Docxy {
                         .child(
                             div()
                                 .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(BRAND))
+                                .text_color(rgb(accent::brand()))
                                 .flex_none()
                                 .max_w(px(label_cap))
                                 .overflow_hidden()
                                 .whitespace_nowrap()
-                                .child(window_title),
+                                .child(title_label),
                         )
                         .child(
                             h_flex()

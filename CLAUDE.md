@@ -121,3 +121,17 @@
 - The generated cases type with `real-key`/`real-type` and focus by real click
   or Tab only. An input outside dialogs goes in `suite/docxy/src/inputs.rs` with
   the issue that covers it. See `qa/inputs-typing.md`.
+
+## Title label and accent per tab type (#1473)
+
+- The suite's title bar names the selected tab's type in one word (`doc`,
+  `sheet`, `project`; Mail `mail`, no tab `doc`), not the document, whose name
+  stays on its tab. The OS window title is unchanged (`doc_name::window_title`).
+- `suite/docxy/src/accent.rs` holds the accent per type and theme (doc keeps
+  `BRAND`, sheet green, project yellow; the sheet and project shades hold white
+  File text at 4.5:1). `Docxy::render` calls `accent::set` before building any
+  chrome and the ribbon, backstage and title bar read `accent::brand()`; every
+  other `BRAND` use (dialogs, comment and find bars, carets, Gantt) is not
+  accent. A hover closure reads it at paint, still inside that window's draw.
+  `tab-list` reports `title_label`, `accent` (from the tab) and `drawn_accent`
+  (what the last render set); `uiharness/cases/title-accent.uit` asserts them.
