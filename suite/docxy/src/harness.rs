@@ -862,6 +862,17 @@ pub enum Region {
     /// split arrow (`qat-undo-arrow`, `qat-redo-arrow`), by its probe
     /// (#1149).
     Qat(&'static str),
+    /// A point on a top-level body paragraph's visual row, at the row's
+    /// vertical middle: the left edge of its first painted piece (a word, tab,
+    /// field, picture or equation; `end` false) or the right edge of its last
+    /// (`end` true) plus 4px, so it is in the blank area past the row. Addressed by block index and row (`doc-line-start:3`,
+    /// `doc-line-end:3:1`); a row with no painted piece is not counted
+    /// (#1472).
+    DocLine {
+        block: usize,
+        row: usize,
+        end: bool,
+    },
 }
 
 /// The Quick Access Toolbar's probed parts [`Region::Qat`] names.
@@ -949,6 +960,22 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
         }
         "backstage-content" if arg.is_none() => Ok(Region::BackstageContent),
         "backstage-rail" if arg.is_none() => Ok(Region::BackstageRail),
+        "doc-line-start" | "doc-line-end" => {
+            let a = arg.filter(|a| !a.is_empty()).ok_or_else(|| {
+                format!("'{head}' needs a block index, e.g. {head}:3 or {head}:3:1 for row 1")
+            })?;
+            let (b, r) = a.split_once(':').unwrap_or((a, "0"));
+            let num = |n: &str| {
+                n.trim()
+                    .parse::<usize>()
+                    .map_err(|_| format!("'{n}' is not an index (they count from 0)"))
+            };
+            Ok(Region::DocLine {
+                block: num(b)?,
+                row: num(r)?,
+                end: head.eq_ignore_ascii_case("doc-line-end"),
+            })
+        }
         "window" | "grid" | "chart-panel" | "title-tabs" | "tab-prev" | "tab-next" | "tab-more"
         | "gantt" | "project-hbar-table" | "project-hbar-chart" | "project-vbar"
         | "project-timeline" | "project-split" | "gallery" | "ribbon" | "ribbon-flyout"
@@ -1047,6 +1074,10 @@ pub fn region_name(region: Region) -> String {
         Region::BackstageContent => "backstage-content".into(),
         Region::BackstageRail => "backstage-rail".into(),
         Region::Qat(name) => name.into(),
+        Region::DocLine { block, row, end } => format!(
+            "doc-line-{}:{block}:{row}",
+            if end { "end" } else { "start" }
+        ),
         Region::FilterButton(c) => format!("filter-button:{}", gridcore::sheet::col_name(c)),
     }
 }
@@ -9023,6 +9054,16 @@ mod tests {
             Region::Qat("qat-redo"),
             Region::Qat("qat-undo-arrow"),
             Region::Qat("qat-redo-arrow"),
+            Region::DocLine {
+                block: 3,
+                row: 1,
+                end: true,
+            },
+            Region::DocLine {
+                block: 0,
+                row: 0,
+                end: false,
+            },
         ] {
             assert_eq!(parse_region(&region_name(r)), Ok(r));
         }

@@ -1,0 +1,105 @@
+# A mouse drag in the document treats the blank area beside a line as that
+# line's end (or start): a drag that ends past the last character includes it,
+# and a drag that starts there anchors a selection (#1472). Real pointer
+# events, so the paragraph's own press and move handlers run.
+
+test a drag ending past the line end includes the last character
+  open copy:../fixtures/basic.docx
+  type A bulleted list:
+  call pointer-drag {"from":"doc-line-start:0","to":"doc-line-end:0","offset":[200,0]}
+  assert sel.start is 0
+  assert sel.end is 16
+  call pointer-drag {"from":"doc-line-start:0","to":"doc-line-end:0","offset":[3,0]}
+  assert sel.start is 0
+  assert sel.end is 16
+
+test a drag starting past the line end, right to left, selects
+  open copy:../fixtures/basic.docx
+  type A bulleted list:
+  call pointer-drag {"from":"doc-line-end:0","to":"doc-line-start:0","offset":[-2,0]}
+  assert sel.start is 0
+  assert sel.end is 16
+
+test a drag starting just past the last character, to the line start, selects
+  open copy:../fixtures/basic.docx
+  type A bulleted list:
+  call pointer-drag {"from":"doc-line-end:0","to":"doc-line-start:0"}
+  assert sel.start is 0
+  assert sel.end is 16
+
+test a drag from past the line end to the middle selects to the line end
+  open copy:../fixtures/basic.docx
+  type A bulleted list:
+  call pointer-drag {"from":"doc-line-end:0","to":"doc-line-start:0","offset":[90,0]}
+  assert sel.end is 16
+  assert sel.start is not 16
+  assert sel.start is not 0
+
+test a drag between characters is unchanged
+  open copy:../fixtures/basic.docx
+  type A bulleted list:
+  call pointer-drag {"from":"doc-line-start:0","to":"doc-line-end:0","offset":[-60,0]}
+  assert sel.start is 0
+  assert sel.end is not 16
+  assert sel.end is not 0
+
+test a right-to-left drag from past the line ends the selection at the line end
+  open copy:../fixtures/basic.docx
+  type A bulleted list:
+  call pointer-drag {"from":"doc-line-end:0","to":"doc-line-start:0","offset":[60,0]}
+  assert sel.end is 16
+  assert sel.start is not 0
+
+test a click right of the line puts the caret at the line end
+  open copy:../fixtures/basic.docx
+  type A bulleted list:
+  call pointer-click {"region":"doc-line-end:0"}
+  assert sel.start is 16
+  assert sel.end is 16
+
+test a drag from past the first wrapped row resolves to that row's end
+  open copy:../fixtures/basic.docx
+  type one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty twentyone twentytwo twentythree twentyfour twentyfive
+  call pointer-drag {"from":"doc-line-end:0:0","to":"doc-line-start:0:0"}
+  assert sel.start is 0
+  assert sel.end is not 0
+  assert sel.end is not 185
+
+test a line ending in a tab takes a press and a drag past it after the tab
+  open copy:../fixtures/basic.docx
+  type ab
+  key tab
+  call pointer-click {"region":"doc-line-end:0"}
+  assert sel.start is 3
+  assert sel.end is 3
+  call pointer-drag {"from":"doc-line-start:0","to":"doc-line-end:0","offset":[200,0]}
+  assert sel.start is 0
+  assert sel.end is 3
+
+test a line ending in a field takes a press and a drag past it after the field
+  open copy:../fixtures/fields.docx
+  call pointer-click {"region":"doc-line-end:1"}
+  assert sel.start is 22
+  assert sel.end is 22
+  call pointer-drag {"from":"doc-line-start:1","to":"doc-line-end:1","offset":[200,0]}
+  assert sel.end is 22
+
+test a right-to-left drag from past a line ending in a field starts after the field
+  open copy:../fixtures/fields.docx
+  call pointer-drag {"from":"doc-line-end:1","to":"doc-line-start:1","offset":[30,0]}
+  assert sel.end is 22
+  assert sel.start is not 22
+
+test a drag ending in the margin left of the line selects to the line start
+  open copy:../fixtures/basic.docx
+  type A bulleted list:
+  call pointer-drag {"from":"doc-line-end:0","to":"doc-line-start:0","offset":[-30,0]}
+  assert sel.start is 0
+  assert sel.end is 16
+
+test a drag ending in the margin right of the line selects to the line end
+  open copy:../fixtures/basic.docx
+  type A bulleted list:
+  call pointer-drag {"from":"doc-line-start:0","to":"doc-line-end:0","offset":[400,0]}
+  assert sel.start is 0
+  assert sel.end is 16
