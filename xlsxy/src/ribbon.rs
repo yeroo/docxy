@@ -670,9 +670,10 @@ fn view_groups() -> Vec<Group> {
 pub fn allowed_in_protected_view(act: Act) -> bool {
     use Act::*;
     match act {
-        Copy | Find | GoTo | PrevComment | NextComment | ToggleComments | FormulaView
-        | ShowHidden | ShowObjects | ThemeToggle | AutoHideRibbon | Help | ContactSupport
-        | Feedback | About => true,
+        Copy | Find | GoTo | PrevComment | NextComment | ToggleComments | ShowHidden
+        | ShowObjects | ThemeToggle | AutoHideRibbon | Help | ContactSupport | Feedback | About => {
+            true
+        }
         Cut | Paste | PasteSpecial | Undo | Redo | Replace | ClearContents | FillDown
         | FillRight | FillUp | FillLeft | InsertRow | InsertCol | DeleteRow | DeleteCol
         | SortAsc | SortDesc | CustomSort | AutoSum | InsertChart(_) | AddSheet | RenameSheet
@@ -683,7 +684,7 @@ pub fn allowed_in_protected_view(act: Act) -> bool {
         | TableName | ResizeTable | ConvertToRange | Consolidate | Subtotal | DataForm
         | GroupOutline | UngroupOutline | ShowDetail | HideDetail | AutoOutline | ClearOutline
         | OutlineSettings | NewComment | NewNote | DeleteComment | ProtectSheet | FreezePanes
-        | Todo(_) => false,
+        | FormulaView | Todo(_) => false,
     }
 }
 

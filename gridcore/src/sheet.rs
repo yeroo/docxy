@@ -634,6 +634,13 @@ pub struct Sheet {
     pub outline: OutlineSettings,
     /// The outline settings the worksheet part held at load.
     pub outline_loaded: OutlineSettings,
+    /// Formulas ▸ Show Formulas for this sheet (`<sheetView showFormulas>`):
+    /// formula cells show their formula text, not their value. Edit this; a
+    /// save writes it only when it differs from
+    /// [`Sheet::show_formulas_loaded`].
+    pub show_formulas: bool,
+    /// What the first `<sheetView>` said at load.
+    pub show_formulas_loaded: bool,
     /// Data ▸ Consolidate's settings for this sheet as destination
     /// (`<dataConsolidate>`): the dialog starts from them. A save writes the
     /// element only when they differ from [`Sheet::consolidate_loaded`].

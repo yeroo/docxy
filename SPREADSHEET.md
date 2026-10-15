@@ -612,8 +612,9 @@ The strategic piece: **conformance is measured, not claimed.**
   backed by a new gridcore `styles.xml` *append-writer* (`Styles::intern`
   + `splice_styles`) that adds fonts/fills/numFmts/xfs without disturbing
   a single existing style byte, so it round-trips. **View toggles**:
-  formula view (Ctrl+`), freeze panes, light/dark theme, ribbon
-  auto-hide, all persisted to `~/.config/xlsxy/view.conf`. **Templates
+  Show Formulas (Ctrl+`) and freeze panes, saved per sheet in the
+  workbook (`showFormulas`, `<pane>`), and light/dark theme and ribbon
+  auto-hide, persisted to `~/.config/xlsxy/view.conf`. **Templates
   and XLSTART** (#614): a workbook started from a template (`.xltx`/`.xltm`)
   asks Save As on its first save; `book.xltx` in `~/.config/xlsxy/XLSTART`
   is the template File › New and Ctrl+N start from; launched with no file,
