@@ -503,6 +503,7 @@ fn project_instruction_paths_exist() {
             HideSubtasks,
         ),
         ("View", "Split View", "Timeline", "Timeline View", Timeline),
+        ("View", "Appearance", "Theme", "Theme", Theme),
         ("View", "Window", "New Window", "New Window", NewWindow),
         ("View", "Window", "Arrange All", "Arrange All", ArrangeAll),
         (
@@ -4809,4 +4810,38 @@ fn row_menu_press_with_open_cell_commits() {
     assert!(v(&t).cell.is_none(), "the edit committed: {}", t.status);
     assert_eq!(names(&t)[1], "Renamed");
     assert_eq!(sel_of(&t), None);
+}
+
+/// The theme button moved from the title bar to the View tab (#1473): every
+/// kind's View tab has it, Mail's (the document's) included.
+#[test]
+fn every_view_tab_has_the_theme_button() {
+    for kind in [Kind::Project, Kind::Docx, Kind::Xlsx, Kind::Look] {
+        let ribbon = ribbon_for(kind);
+        let view = ribbon.tabs.iter().find(|t| t.name == "View").unwrap();
+        let labels: Vec<&str> = view
+            .groups
+            .iter()
+            .flat_map(|g| g.items.iter())
+            .flat_map(|c| match c {
+                Control::Large(c) | Control::Toggle(c) => vec![c.label],
+                Control::Column(c) => c.iter().map(|c| c.label).collect(),
+                _ => vec![],
+            })
+            .collect();
+        assert!(
+            labels.contains(&"Theme"),
+            "{}: {labels:?}",
+            crate::harness::kind_name(kind)
+        );
+    }
+    let sheet = crate::sheet_ribbon::tab_def(crate::RibbonTab::View);
+    assert!(
+        sheet
+            .groups
+            .iter()
+            .flat_map(|g| g.commands())
+            .any(|c| c.label == "Theme"),
+        "the sheet's View tab"
+    );
 }

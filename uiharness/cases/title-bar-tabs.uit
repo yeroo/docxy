@@ -30,7 +30,6 @@ test title bar keeps caption controls visible with twenty tabs
   assert reply.active_visible is true
   assert reply.controls_clear is true
   assert reply.drag_ok is true
-  assert reply.theme_visible is true
   call window-size {"w":600,"h":700}
   shot title-tabs
   shot window
@@ -38,13 +37,11 @@ test title bar keeps caption controls visible with twenty tabs
   assert reply.controls_clear is true
   assert reply.active_visible is true
   assert reply.drag_ok is true
-  assert reply.theme_visible is true
   call window-size {"w":1000,"h":700}
   shot title-tabs
   call title-bar {}
   assert reply.controls_clear is true
   assert reply.active_visible is true
-  assert reply.theme_visible is true
   call window-zoom {}
   shot title-tabs
   call title-bar {}
@@ -95,17 +92,14 @@ test title bar keeps caption controls visible with twenty tabs
   shot title-tabs
   call title-bar {}
   assert reply.controls_clear is true
-  assert reply.theme_visible is true
   call theme-set {"theme":"light"}
   shot title-tabs
   call title-bar {}
   assert reply.controls_clear is true
-  assert reply.theme_visible is true
   call theme-set {"theme":"auto"}
   shot title-tabs
   call title-bar {}
   assert reply.controls_clear is true
-  assert reply.theme_visible is true
   call close-tab {"index":19}
   call close-tab {"index":18}
   call close-tab {"index":17}

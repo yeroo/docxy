@@ -22,10 +22,10 @@ lines name the regression each one is meant to catch.
 **Steps:**
 1. Open `sample.docx` in the desktop suite (`suite.exe`). Open
    `sample.docx.html` in Chromium, side by side, both at 100%.
-2. Compare: title bar (wordmark, Undo/Redo, document chip, theme button),
+2. Compare: title bar (wordmark, Undo/Redo, document chip, no theme button),
    ribbon tabs (File in the accent colour), every Home group and its buttons,
    the Styles gallery, the grey canvas with the white page, and the status bar.
-3. Switch both to Dark with the theme button, then compare again.
+3. Switch both to Dark with View > Theme (the web page keeps its own control), then compare again.
 4. In each app, put the caret in the table. Check that the Table tab appears.
 
 **Expect:** the same tabs, groups, buttons, icons and order. The same Auto → Light → Dark

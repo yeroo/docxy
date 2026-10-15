@@ -3871,7 +3871,7 @@ fn state_for_reply(app: &crate::Docxy, window: &Window, cx: &mut App) -> Json {
 }
 
 /// The kind a tab is, as `tab-list` names it: the Backstage › New cards'.
-fn kind_name(kind: crate::Kind) -> &'static str {
+pub(crate) fn kind_name(kind: crate::Kind) -> &'static str {
     match kind {
         crate::Kind::Docx => "docx",
         crate::Kind::Xlsx => "xlsx",
@@ -4058,7 +4058,6 @@ fn dispatch_verb(
             let content = read("title-content")?;
             let strip = read("title-tabs")?;
             let drag = read("title-drag")?;
-            let theme = read("title-theme")?;
             // The root probe measures the actual inner box after Root's CSD
             // shadow and border. This oracle is independent of the renderer's
             // title-width arithmetic.
@@ -4075,10 +4074,6 @@ fn dispatch_verb(
             let drag_left = f32::from(drag.origin.x);
             let drag_right = f32::from(drag.origin.x + drag.size.width);
             let drag_w = (drag_right.min(content_right) - drag_left.max(content_left)).max(0.0);
-            let theme_left = f32::from(theme.origin.x);
-            let theme_right = f32::from(theme.origin.x + theme.size.width);
-            let theme_visible =
-                theme_left >= content_left - 0.5 && theme_right <= content_right + 0.5;
             let layout = app.tab_layout;
             let active_visible = layout.active_visible(app.active)
                 && probes.get("title-active-chip").is_some_and(|chip| {
@@ -4107,7 +4102,6 @@ fn dispatch_verb(
                 ("overflow", Json::Bool(layout.more)),
                 ("active_visible", Json::Bool(active_visible)),
                 ("active_dirty_visible", Json::Bool(active_dirty_visible)),
-                ("theme_visible", Json::Bool(theme_visible)),
                 ("strip_right", Json::Num(strip_right as f64)),
                 ("content_right", Json::Num(content_right as f64)),
                 ("caption_left", Json::Num(caption_left as f64)),

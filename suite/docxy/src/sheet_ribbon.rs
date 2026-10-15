@@ -1420,36 +1420,55 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
     Tab {
         tab: RibbonTab::View,
         titles: Titles::Plain,
-        groups: &[Group {
-            title: "Window",
-            priority: 90,
-            launcher: false,
-            launch: None,
-            body: Body::Strip {
-                gap: GAP_1,
-                items: &[
-                    Item::One(toggle(
-                        "freeze-panes",
-                        "Freeze Panes",
-                        "Unfreeze Panes",
-                        None,
-                        SheetAct::FreezePanes,
-                    )),
-                    Item::One(large(
-                        "newwindow",
-                        "New Window",
-                        Some("new"),
-                        SheetAct::NewWindow,
-                    )),
-                    Item::One(large(
-                        "arrangeall",
-                        "Arrange All",
-                        Some("columns"),
-                        SheetAct::ArrangeAll,
-                    )),
-                ],
+        groups: &[
+            // The Light/Dark/Auto cycle moved here from the title bar (#1473);
+            // the label stays "Theme" as in the document ribbon.
+            Group {
+                title: "Appearance",
+                priority: 80,
+                launcher: false,
+                launch: None,
+                body: Body::Strip {
+                    gap: GAP_1,
+                    items: &[Item::One(large(
+                        "theme",
+                        "Theme",
+                        Some("case"),
+                        SheetAct::Theme,
+                    ))],
+                },
             },
-        }],
+            Group {
+                title: "Window",
+                priority: 90,
+                launcher: false,
+                launch: None,
+                body: Body::Strip {
+                    gap: GAP_1,
+                    items: &[
+                        Item::One(toggle(
+                            "freeze-panes",
+                            "Freeze Panes",
+                            "Unfreeze Panes",
+                            None,
+                            SheetAct::FreezePanes,
+                        )),
+                        Item::One(large(
+                            "newwindow",
+                            "New Window",
+                            Some("new"),
+                            SheetAct::NewWindow,
+                        )),
+                        Item::One(large(
+                            "arrangeall",
+                            "Arrange All",
+                            Some("columns"),
+                            SheetAct::ArrangeAll,
+                        )),
+                    ],
+                },
+            },
+        ],
     },
     // Help ends the row, as in Excel (#1021): the document ribbon's Help tab.
     Tab {

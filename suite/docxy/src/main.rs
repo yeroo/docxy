@@ -161,11 +161,7 @@ use docxcore::package::{HeaderVariant, Package};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    ActiveTheme, Root, Sizable, Theme, ThemeMode, TitleBar,
-    button::{Button, ButtonVariants},
-    h_flex,
-    tooltip::Tooltip,
-    v_flex,
+    ActiveTheme, Root, Theme, ThemeMode, TitleBar, h_flex, tooltip::Tooltip, v_flex,
 };
 use gridcore::circular::CIRCULAR_WARNING;
 use gridcore::options::{EditOptions, EnterMove};
@@ -1210,6 +1206,7 @@ fn protected_view_allows_act(act: SheetAct) -> bool {
             | SheetAct::Help(_)
             | SheetAct::NewWindow
             | SheetAct::ArrangeAll
+            | SheetAct::Theme
             // Calculating changes no file; the mode and options do.
             | SheetAct::Calc(sheet_calc::CalcAct::Now)
             | SheetAct::Calc(sheet_calc::CalcAct::Sheet)
@@ -1280,6 +1277,7 @@ fn multi_area_ok(act: SheetAct) -> bool {
         | SheetAct::FreezePanes
         | SheetAct::NewWindow
         | SheetAct::ArrangeAll
+        | SheetAct::Theme
         | SheetAct::PrevComment
         | SheetAct::NextComment
         | SheetAct::ProtectSheet
@@ -1401,6 +1399,7 @@ fn act_targets_cells(act: SheetAct) -> bool {
             | SheetAct::CustomLists
             | SheetAct::NewWindow
             | SheetAct::ArrangeAll
+            | SheetAct::Theme
             | SheetAct::Calc(_)
             | SheetAct::Todo
     )
@@ -2212,6 +2211,9 @@ enum SheetAct {
     /// View › Window › Arrange All (#587): resize every window to an equal
     /// strip of this window's display.
     ArrangeAll,
+    /// View › Appearance › Theme (#1473): cycle Light, Dark and Auto, as the
+    /// title bar's theme button did.
+    Theme,
     NewComment,
     DeleteComment,
     PrevComment,
@@ -12807,26 +12809,24 @@ const TITLE_LABEL_MAX_W: f32 = 260.0;
 const TITLE_QAT_MAX_W: f32 = 20.0 + 2.0 + 20.0 + 10.0 + 8.0;
 
 /// The left chrome's width cap and the title label's cap inside it. The cap
-/// reserves the theme button, the drag region's minimum and the strip's More
-/// button plus a floor-width chip before the label, so the label starves
-/// before the strip does (#588 r1 m6). `theme_w` is the theme
-/// button's width from the last frame, exactly as the `avail` below consumes
-/// it.
+/// reserves the drag region's minimum and the strip's More button plus a
+/// floor-width chip before the label, so the label starves before the strip
+/// does (#588 r1 m6).
 ///
 /// The reservation keeps 1px of slack so fractional f32 widths (device
 /// scales of 125/150/175%) cannot land the render's `avail` just under the
 /// strip floor, whose comparison in `tabstrip::layout` is strict. Below the
 /// width where the QAT and the floor chip both fit, the QAT stays whole and
 /// the strip degrades to MoreOnly, as it did before the label cap existed.
-fn title_left_caps(title_w: f32, theme_w: f32) -> (f32, f32) {
-    // 8 is the pl_2 padding and 24 the three 8px gaps between the four
+fn title_left_caps(title_w: f32) -> (f32, f32) {
+    // 8 is the pl_2 padding and 16 the two 8px gaps between the three
     // in-flow children — the render's own arithmetic, shared here so the
     // test measures the same chain.
-    let pad_gaps = 8.0 + 24.0;
+    let pad_gaps = 8.0 + 16.0;
     // The strip's minimum (More + a floor chip + gap) plus the slack.
     let strip_floor = tabstrip::MORE_W + tabstrip::TAB_FLOOR_W + tabstrip::TAB_GAP + 1.0;
     // The widest cap that still leaves the strip its floor.
-    let strip_cap = title_w - pad_gaps - theme_w - tabstrip::DRAG_MIN_W - strip_floor;
+    let strip_cap = title_w - pad_gaps - tabstrip::DRAG_MIN_W - strip_floor;
     // The widest cap that keeps the QAT whole (label at zero), never eating
     // into the drag region's minimum.
     let qat_cap = TITLE_QAT_MAX_W.min((title_w - pad_gaps - tabstrip::DRAG_MIN_W).max(0.0));
@@ -12844,29 +12844,29 @@ mod title_caps_tests {
 
     /// The render's avail formula, copied deliberately: the test asserts on
     /// the same f32 chain the layout consumes.
-    fn avail(title_w: f32, left_cap: f32, theme_w: f32) -> f32 {
-        title_w - 8.0 - 24.0 - left_cap - theme_w - tabstrip::DRAG_MIN_W
+    fn avail(title_w: f32, left_cap: f32) -> f32 {
+        title_w - 8.0 - 16.0 - left_cap - tabstrip::DRAG_MIN_W
     }
 
     #[test]
     fn the_label_yields_first_and_the_strip_keeps_its_minimum() {
         // Wide title content: the label keeps its full cap.
-        let (left, label) = title_left_caps(1280.0, 80.0);
+        let (left, label) = title_left_caps(1280.0);
         assert_eq!(label, TITLE_LABEL_MAX_W);
         assert!(left > label + TITLE_QAT_MAX_W);
         // Narrow title-content widths (what `title_w` names here — window
         // width minus caption controls, left pad and insets): the cap binds,
         // the label shrinks below its cap, and what it yields keeps the
-        // strip's More button, a floor-width chip and the theme button
-        // alive, with the QAT whole.
-        for w in [300.0, 460.0, 500.0] {
-            let (left, label) = title_left_caps(w, 80.0);
+        // strip's More button and a floor-width chip alive, with the QAT
+        // whole.
+        for w in [300.0, 380.0, 460.0] {
+            let (left, label) = title_left_caps(w);
             assert!(label < TITLE_LABEL_MAX_W, "w={w}");
             assert!(label >= 0.0, "w={w}");
             // The label plus the QAT's widest form never exceeds the cap, so
             // the QAT is never what the strip takes from.
             assert!(label + TITLE_QAT_MAX_W <= left + f32::EPSILON, "w={w}");
-            let a = avail(w, left, 80.0);
+            let a = avail(w, left);
             assert!(
                 a >= tabstrip::MORE_W + tabstrip::TAB_FLOOR_W + tabstrip::TAB_GAP,
                 "w={w}: avail={a}"
@@ -12875,35 +12875,33 @@ mod title_caps_tests {
         // Fractional widths at device scales like 150%: the two f32 chains
         // drift by ulps, and the 1px slack keeps the render's avail at or
         // over the floor wherever the floor and the QAT both fit.
-        let (left, label) = title_left_caps(300.4, 34.4);
+        let (left, label) = title_left_caps(300.4);
         assert!(label > 0.0);
-        let a = avail(300.4, left, 34.4);
+        let a = avail(300.4, left);
         assert!(
             a >= tabstrip::MORE_W + tabstrip::TAB_FLOOR_W + tabstrip::TAB_GAP,
             "avail={a}"
         );
-        // The (232, 292) band at a typical theme width: the QAT and the
-        // floor chip cannot both fit, so the floor keeps the QAT whole and
-        // the strip falls back to MoreOnly, as before the label cap.
-        for w in [240.0, 260.0, 280.0] {
-            let (left, label) = title_left_caps(w, 80.0);
+        // The (124, 205) band: the QAT and the floor chip cannot both fit, so
+        // the floor keeps the QAT whole and the strip falls back to MoreOnly,
+        // as before the label cap.
+        for w in [140.0, 160.0, 180.0, 200.0] {
+            let (left, label) = title_left_caps(w);
             assert_eq!(left, TITLE_QAT_MAX_W, "w={w}");
             assert_eq!(label, 0.0, "w={w}");
             assert!(
-                avail(w, left, 80.0) < tabstrip::MORE_W + tabstrip::TAB_FLOOR_W + tabstrip::TAB_GAP,
+                avail(w, left) < tabstrip::MORE_W + tabstrip::TAB_FLOOR_W + tabstrip::TAB_GAP,
                 "w={w}"
             );
         }
         // The reviewer's fractional point sits in that band: the QAT is
         // whole, the strip is in the MoreOnly exception.
-        let (left, label) = title_left_caps(240.0, 34.4);
+        let (left, label) = title_left_caps(160.0);
         assert_eq!(left, TITLE_QAT_MAX_W);
         assert_eq!(label, 0.0);
-        assert!(
-            avail(240.0, left, 34.4) < tabstrip::MORE_W + tabstrip::TAB_FLOOR_W + tabstrip::TAB_GAP
-        );
+        assert!(avail(160.0, left) < tabstrip::MORE_W + tabstrip::TAB_FLOOR_W + tabstrip::TAB_GAP);
         // Absurdly narrow: the caps bottom out at zero rather than going negative.
-        let (left, label) = title_left_caps(60.0, 80.0);
+        let (left, label) = title_left_caps(60.0);
         assert_eq!((left, label), (0.0, 0.0));
     }
 }
@@ -13527,7 +13525,10 @@ impl Docxy {
     }
 
     fn cycle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_theme_pref(self.theme_pref.next(), window, cx);
+        let next = self.theme_pref.next();
+        self.set_theme_pref(next, window, cx);
+        // The View ribbon's Theme button shows no state, so say it (#1473).
+        self.set_status(format!("Theme: {}", next.label()));
     }
 
     fn set_theme_pref(&mut self, pref: ThemePref, window: &mut Window, cx: &mut Context<Self>) {
@@ -19967,6 +19968,7 @@ impl Docxy {
                 let n = self.arrange_all(window, cx);
                 self.set_status(format!("Arranged {n} windows"));
             }
+            SheetAct::Theme => self.cycle_theme(window, cx),
             SheetAct::NewComment => self.sheet_new_comment(cx),
             SheetAct::DeleteComment => self.sheet_delete_comment(cx),
             SheetAct::PrevComment => self.sheet_comment_nav(false, cx),
@@ -35645,8 +35647,7 @@ impl Render for Docxy {
         let tab_active = t.tab_active;
         let pal = Pal::of(cx);
 
-        // --- title bar: wordmark + document tab chips + theme toggle ---
-        let theme_pref = self.theme_pref;
+        // --- title bar: type label + document tab chips ---
         let qat_state = self.qat_state();
         // The pinned TitleBar gives #bar flex-shrink:0. A definite width,
         // accounting for Root's client decoration insets, keeps the caption
@@ -35657,19 +35658,14 @@ impl Render for Docxy {
             .get("title-left")
             .map(|b| f32::from(b.size.width))
             .unwrap_or(170.0);
-        let theme_w = chrome
-            .get("title-theme")
-            .map(|b| f32::from(b.size.width))
-            .unwrap_or(80.0);
         drop(chrome);
         // The left chrome yields before the tab strip does: the cap reserves
-        // the theme button, the drag region's minimum and the strip's More
-        // button plus a floor-width chip, so the label starves before the
-        // strip does (#588 r1 m6).
-        let (left_cap, label_cap) = title_left_caps(title_w, theme_w);
-        // Four children, three 8px gaps, plus our 8px left padding.
-        let avail =
-            (title_w - 8.0 - 24.0 - left_w.min(left_cap) - theme_w - tabstrip::DRAG_MIN_W).max(0.0);
+        // the drag region's minimum and the strip's More button plus a
+        // floor-width chip, so the label starves before the strip does
+        // (#588 r1 m6).
+        let (left_cap, label_cap) = title_left_caps(title_w);
+        // Three children, two 8px gaps, plus our 8px left padding.
+        let avail = (title_w - 8.0 - 16.0 - left_w.min(left_cap) - tabstrip::DRAG_MIN_W).max(0.0);
         let strip = tabstrip::layout(avail, self.tabs.len(), self.active, self.tab_first);
         self.tab_first = strip.first;
         self.tab_layout = strip;
@@ -35950,24 +35946,6 @@ impl Render for Docxy {
                         .h_full()
                         .min_w(px(tabstrip::DRAG_MIN_W))
                         .child(probe(&self.probes, "title-drag")),
-                )
-                .child(
-                    div()
-                        .relative()
-                        .flex_none()
-                        .child(probe_with_reflow(&self.probes, "title-theme", move |b| {
-                            (f32::from(b.size.width) - theme_w).abs() > 0.5
-                        }))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(
-                            Button::new("theme")
-                                .ghost()
-                                .xsmall()
-                                .label(theme_pref.label())
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.cycle_theme(window, cx)),
-                                ),
-                        ),
                 ),
         );
         let tab_popup = self

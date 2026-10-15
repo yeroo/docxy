@@ -136,3 +136,7 @@
   render too. `accent_now` takes the theme from the preference, as render sets
   the accent before `apply_theme`. `tab-list` reports `title_label`, `accent`
   (from the tab) and `drawn_accent` (what this window's last render set); `uiharness/cases/title-accent.uit` asserts them.
+- The Light/Dark/Auto theme button is not in the title bar: View > Theme
+  (doc `Act::DarkMode`, `SheetAct::Theme`, `ProjectAct::Theme`; Mail uses the
+  document's View tab) calls `cycle_theme`, which says the new setting on the
+  status line. `title_left_caps` no longer reserves a theme width.
