@@ -2672,6 +2672,10 @@ fn parse_worksheet(
                 // A frozen pane: the leading `ySplit` rows / `xSplit` cols stay put.
                 "sheetView" if !in_custom_views => {
                     in_first_view = sheet_views_seen == 0;
+                    if in_first_view {
+                        sheet.show_formulas = matches!(p.attr("showFormulas"), "1" | "true");
+                        sheet.show_formulas_loaded = sheet.show_formulas;
+                    }
                     sheet_views_seen += 1;
                 }
                 "pane" if in_first_view && !in_custom_views => {
@@ -4736,6 +4740,8 @@ fn splice_worksheet(
 
     // Frozen panes: sync the first sheetView's <pane> from the model.
     let out = set_freeze_pane(&out, sheet.freeze);
+    // Show Formulas: the first sheetView's attribute, only when it changed.
+    let out = set_show_formulas(&out, sheet.show_formulas, sheet.show_formulas_loaded);
     // Merged regions: regenerate <mergeCells> from the model.
     let out = set_merge_cells(&out, &sheet.merges);
     // Sheet protection: <sheetProtection> regenerated at its CT_Worksheet
@@ -6494,9 +6500,32 @@ fn set_freeze_pane(xml: &str, freeze: (u32, u32)) -> String {
     out
 }
 
+/// Sync the first `<sheetView showFormulas>` with the model, only when the
+/// flag differs from what the part said at load, so an untouched sheet stays
+/// byte-identical. Off removes the attribute (its default). A sheet with no
+/// `<sheetView>` gets a block when the flag is on.
+fn set_show_formulas(xml: &str, now: bool, loaded: bool) -> String {
+    if now == loaded {
+        return xml.to_string();
+    }
+    match first_sheet_view(xml) {
+        Some(view) => set_tag_attr(xml, view.start, "showFormulas", now.then_some("1")),
+        None if now => put_worksheet_child(
+            xml,
+            "sheetViews",
+            "<sheetViews><sheetView showFormulas=\"1\" workbookViewId=\"0\"/></sheetViews>",
+            None,
+            true,
+        ),
+        None => xml.to_string(),
+    }
+}
+
 /// The worksheet's first `<sheetView>` (in any prefix, inside the top-level
 /// `<sheetViews>`, never one in `<customSheetViews>`) and its `<pane>`.
 struct SheetViewAt {
+    /// Where its start tag begins.
+    start: usize,
     /// Just past its start tag.
     tag_end: usize,
     qname: String,
@@ -6520,6 +6549,7 @@ fn first_sheet_view(xml: &str) -> Option<SheetViewAt> {
         }
     }
     let qname = p.name().to_string();
+    let start = vs + p.start_pos();
     let tag_end = vs + p.pos();
     let self_closing = xml[..tag_end].ends_with("/>");
     let mut pane = None;
@@ -6543,6 +6573,7 @@ fn first_sheet_view(xml: &str) -> Option<SheetViewAt> {
         }
     }
     Some(SheetViewAt {
+        start,
         tag_end,
         qname,
         self_closing,
@@ -19413,6 +19444,111 @@ mod ct_worksheet_order_tests {
     }
 
     const PREFIXED: &str = r#"<x:dimension ref="A1:B2"/><x:sheetViews><x:sheetView workbookViewId="0"><x:pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></x:sheetView></x:sheetViews><x:cols><x:col min="1" max="1" width="20" customWidth="1"/></x:cols><x:sheetData><x:row r="1"><x:c r="A1"><x:v>1</x:v></x:c><x:c r="B1"><x:v>2</x:v></x:c></x:row></x:sheetData><x:mergeCells count="1"><x:mergeCell ref="D1:E1"/></x:mergeCells><x:dataValidations count="1"><x:dataValidation type="whole" sqref="A1"><x:formula1>1</x:formula1></x:dataValidation></x:dataValidations><x:pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>"#;
+
+    fn sheet_with_views(views: &str) -> SheetPackage {
+        let mut pkg = new_xlsx();
+        pkg.set_part(
+            SHEET,
+            format!(
+                r#"<?xml version="1.0"?><worksheet xmlns="{NS}">{views}<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#
+            )
+            .into_bytes(),
+        );
+        load_xlsx(&write_zip(&pkg.parts)).expect("load")
+    }
+
+    #[test]
+    fn show_formulas_loads_from_the_first_sheet_view_only() {
+        let on = sheet_with_views(
+            r#"<sheetViews><sheetView showFormulas="1" workbookViewId="0"/></sheetViews>"#,
+        );
+        assert!(on.workbook.sheets[0].show_formulas);
+        assert!(on.workbook.sheets[0].show_formulas_loaded);
+        let word = sheet_with_views(
+            r#"<sheetViews><sheetView showFormulas="true" workbookViewId="0"/></sheetViews>"#,
+        );
+        assert!(word.workbook.sheets[0].show_formulas);
+        let off = sheet_with_views(
+            r#"<sheetViews><sheetView workbookViewId="0"/><sheetView showFormulas="1" workbookViewId="1"/></sheetViews>"#,
+        );
+        assert!(!off.workbook.sheets[0].show_formulas, "a second view");
+        let custom = sheet_with_views(
+            r#"<sheetViews><sheetView workbookViewId="0"/></sheetViews><customSheetViews><customSheetView guid="{A}"><sheetView showFormulas="1"/></customSheetView></customSheetViews>"#,
+        );
+        assert!(!custom.workbook.sheets[0].show_formulas, "a custom view");
+    }
+
+    #[test]
+    fn show_formulas_saves_per_sheet_and_leaves_untouched_sheets_alone() {
+        let mut pkg = new_xlsx();
+        let two = pkg.add_sheet("Two");
+        pkg.workbook.sheets[two].show_formulas = true;
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert!(!re.workbook.sheets[0].show_formulas);
+        assert!(re.workbook.sheets[two].show_formulas);
+        assert!(re.workbook.sheets[two].show_formulas_loaded);
+        let ws2 =
+            String::from_utf8_lossy(re.part(&re.sheet_parts[two].clone()).unwrap()).into_owned();
+        assert!(ws2.contains(r#"showFormulas="1""#), "{ws2}");
+        assert_eq!(count_local(&ws2, "sheetView"), 1, "{ws2}");
+        let ws1 = String::from_utf8_lossy(re.part(SHEET).unwrap()).into_owned();
+        assert!(!ws1.contains("showFormulas"), "{ws1}");
+        // Off again: the attribute goes.
+        let mut re = re;
+        re.workbook.sheets[two].show_formulas = false;
+        let re2 = load_xlsx(&save_xlsx(&re)).unwrap();
+        assert!(!re2.workbook.sheets[two].show_formulas);
+        let ws2 =
+            String::from_utf8_lossy(re2.part(&re2.sheet_parts[two].clone()).unwrap()).into_owned();
+        assert!(!ws2.contains("showFormulas"), "{ws2}");
+    }
+
+    #[test]
+    fn an_unchanged_show_formulas_is_not_touched() {
+        let views = r#"<sheetViews><sheetView showFormulas="1" tabSelected="1" workbookViewId="0"/></sheetViews>"#;
+        let pkg = sheet_with_views(views);
+        assert!(saved_sheet(&pkg).contains(views), "kept as written");
+    }
+
+    #[test]
+    fn show_formulas_edits_only_the_first_view_and_makes_a_missing_block() {
+        let two = r#"<sheetViews><sheetView workbookViewId="0"/><sheetView workbookViewId="1"/></sheetViews>"#;
+        let mut pkg = sheet_with_views(two);
+        pkg.workbook.sheets[0].show_formulas = true;
+        let ws = saved_sheet(&pkg);
+        assert!(
+            ws.contains(
+                r#"<sheetView showFormulas="1" workbookViewId="0"/><sheetView workbookViewId="1"/>"#
+            ),
+            "{ws}"
+        );
+        let mut none = sheet_with_views("");
+        none.workbook.sheets[0].show_formulas = true;
+        let ws = saved_sheet(&none);
+        assert!(
+            ws.contains(r#"<sheetView showFormulas="1" workbookViewId="0"/>"#),
+            "{ws}"
+        );
+        assert_ct_worksheet_order(&ws);
+        assert!(load_xlsx(&save_xlsx(&none)).unwrap().workbook.sheets[0].show_formulas);
+        // With a freeze too: one view carries both.
+        none.workbook.sheets[0].freeze = (1, 0);
+        let ws = saved_sheet(&none);
+        assert_eq!(count_local(&ws, "sheetView"), 1, "{ws}");
+        assert!(ws.contains("showFormulas") && ws.contains("<pane"), "{ws}");
+    }
+
+    #[test]
+    fn show_formulas_patches_a_prefixed_view() {
+        let mut pkg = loaded_prefixed(PREFIXED);
+        pkg.workbook.sheets[0].show_formulas = true;
+        let ws = saved_sheet(&pkg);
+        assert!(
+            ws.contains(r#"<x:sheetView showFormulas="1" workbookViewId="0">"#),
+            "{ws}"
+        );
+        assert_names_bound(&ws);
+    }
 
     #[test]
     fn a_prefixed_worksheet_saves_without_duplicating_any_child() {
