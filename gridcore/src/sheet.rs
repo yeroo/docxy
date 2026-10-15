@@ -2796,6 +2796,21 @@ pub fn round_to_display(xf: &Xf, value: &CellValue) -> Option<f64> {
     fmt.round_to_display(*n)
 }
 
+/// Round a number constant or result to what its cell's format shows (Set
+/// precision as displayed). `true` when the value changed.
+pub fn round_cell_to_display(xfs: &[Xf], cell: &mut Cell) -> bool {
+    let shown = xfs
+        .get(cell.style as usize)
+        .and_then(|xf| round_to_display(xf, &cell.value));
+    match shown {
+        Some(n) if CellValue::Number(n) != cell.value => {
+            cell.value = CellValue::Number(n);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Export one sheet as CSV text the way Excel writes it (display values,
 /// formulas as their cached results, CR LF after each record, LF inside a
 /// quoted field). The file's encoding (Excel's UTF-8 BOM) is the writer's:

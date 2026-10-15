@@ -85,7 +85,7 @@ fn filled() -> (Workbook, Engine) {
 fn precision_as_displayed_rounds_constants_not_general() {
     let (mut wb, mut eng) = filled();
     assert_eq!(num(&wb, "B1"), 3.14659 + 2.71928, "full precision before");
-    let conv = calc::set_precision_as_displayed(&mut wb, &mut eng, true).expect("converted");
+    let converted = calc::set_precision_as_displayed(&mut wb, &mut eng, true);
     assert!(wb.calc.precision_as_displayed);
     assert_eq!(num(&wb, "A1"), 3.15);
     assert_eq!(num(&wb, "A2"), 2.71928, "General untouched");
@@ -103,14 +103,20 @@ fn precision_as_displayed_rounds_constants_not_general() {
         Some("A1+A2")
     );
     assert_eq!(num(&wb, "B1"), 5.87);
-    assert_eq!(conv.cells.len(), 4, "A1, A3, A6, A7 changed");
+    assert_eq!(converted, 4, "A1, A3, A6, A7 changed");
 }
 
 #[test]
 fn precision_as_displayed_undo_restores() {
+    // Hosts snapshot for their undo step; restoring the cells and the switch
+    // brings full precision back, formula results included.
     let (mut wb, mut eng) = filled();
-    let conv = calc::set_precision_as_displayed(&mut wb, &mut eng, true).unwrap();
-    calc::undo_precision_conversion(&mut wb, &mut eng, &conv);
+    let before = wb.clone();
+    calc::set_precision_as_displayed(&mut wb, &mut eng, true);
+    assert_eq!(num(&wb, "A1"), 3.15);
+    wb = before;
+    eng = Engine::new(&wb);
+    eng.recalc_all(&mut wb);
     assert!(!wb.calc.precision_as_displayed);
     assert_eq!(num(&wb, "A1"), 3.14659);
     assert_eq!(num(&wb, "A3"), 0.12345);
@@ -121,15 +127,18 @@ fn precision_as_displayed_undo_restores() {
 #[test]
 fn turning_it_off_changes_no_data() {
     let (mut wb, mut eng) = filled();
-    calc::set_precision_as_displayed(&mut wb, &mut eng, true).unwrap();
-    assert!(calc::set_precision_as_displayed(&mut wb, &mut eng, false).is_none());
+    calc::set_precision_as_displayed(&mut wb, &mut eng, true);
+    assert_eq!(
+        calc::set_precision_as_displayed(&mut wb, &mut eng, false),
+        0
+    );
     assert_eq!(num(&wb, "A1"), 3.15);
 }
 
 #[test]
 fn typed_constants_round_but_a_restored_snapshot_does_not() {
     let (mut wb, mut eng) = filled();
-    calc::set_precision_as_displayed(&mut wb, &mut eng, true).unwrap();
+    calc::set_precision_as_displayed(&mut wb, &mut eng, true);
     put(&mut eng, &mut wb, "C1", CellValue::Number(9.8765), TWO);
     assert_eq!(num(&wb, "C1"), 9.88);
     let exact = Cell {
@@ -173,8 +182,33 @@ fn iteration_passes_round_each_pass() {
     wb.sheets[0].cells.get_mut(&(0, 3)).unwrap().value = CellValue::Number(0.0);
     let mut seen = Vec::new();
     for _ in 0..3 {
-        calc::calculate_now(&mut wb, &mut eng);
+        calc::calculate_now(&mut wb, &mut eng, false);
         seen.push(num(&wb, "D1"));
     }
     assert_eq!(seen, [5.0, 7.5, 8.8]);
+}
+
+#[test]
+fn rounding_matches_the_15_digit_display() {
+    // 12345678901234.567 shows as ...34.60 (15 significant digits), so that
+    // is what is stored.
+    let mut wb = book();
+    let mut eng = Engine::new(&wb);
+    wb.calc.set_precision_as_displayed(true);
+    put(
+        &mut eng,
+        &mut wb,
+        "A1",
+        CellValue::Number(12345678901234.567),
+        TWO,
+    );
+    assert_eq!(num(&wb, "A1"), 12345678901234.6);
+    let xf = &wb.styles.xfs[TWO as usize];
+    let typed = CellValue::Number(12345678901234.567);
+    let stored = wb.sheets[0].cell(0, 0).unwrap().value.clone();
+    assert_eq!(
+        gridcore::sheet::format_with(xf, &stored, false),
+        gridcore::sheet::format_with(xf, &typed, false),
+        "storing the displayed value changes nothing the cell shows"
+    );
 }

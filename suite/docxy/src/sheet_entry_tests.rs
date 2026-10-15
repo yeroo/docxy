@@ -1402,7 +1402,7 @@ fn a_fill_mixing_a_blank_into_a_frozen_block_clears_it() {
     sheet.set_cell(1, 4, Cell::number(8.0));
     sheet.set_cell(2, 4, Cell::number(9.0));
     sheet.set_cell(2, 3, Cell::number(5.0));
-    v.engine = sheet_engine(&v.pkg.workbook);
+    v.rebuild_engine();
     v.sel = (1, 3);
     v.anchor = (2, 4);
     assert!(v.fill_selection(gridcore::edit::FillDir::Right));
@@ -1458,7 +1458,7 @@ fn a_replace_all_mixing_a_blank_into_a_frozen_block_clears_it() {
     );
     sheet.set_cell(1, 4, Cell::text("x"));
     sheet.set_cell(2, 4, Cell::text("xy"));
-    v.engine = sheet_engine(&v.pkg.workbook);
+    v.rebuild_engine();
     assert_eq!(v.replace_all_cells("x", ""), 2);
     assert_eq!(value(&v, 0, 4), CellValue::Number(7.0));
     assert_eq!(value(&v, 1, 4), CellValue::Empty);
@@ -1478,7 +1478,7 @@ fn view_with_cse_block() -> SheetView {
     let mut d1 = Cell::formula("A1:A3*2");
     d1.f_attrs = Some(" t=\"array\" ref=\"D1:D3\"".into());
     sheet.set_cell(0, 3, d1);
-    v.engine = sheet_engine(&v.pkg.workbook);
+    v.rebuild_engine();
     v.engine.recalc_all(&mut v.pkg.workbook);
     assert_eq!(value(&v, 2, 3), CellValue::Number(6.0));
     v
@@ -1557,7 +1557,7 @@ fn a_drag_fill_from_a_source_holding_the_anchor_is_refused() {
     let mut d2 = Cell::formula("A1*2");
     d2.f_attrs = Some(" t=\"array\" ref=\"D2:D4\"".into());
     sheet.set_cell(1, 3, d2);
-    v.engine = sheet_engine(&v.pkg.workbook);
+    v.rebuild_engine();
     v.engine.recalc_all(&mut v.pkg.workbook);
     let src = (0, 3, 1, 3);
     let bx = fill_box(src, (5, 3));
@@ -1959,7 +1959,7 @@ fn calc_view() -> SheetView {
         .add_table(0, (0, 0, 3, 2), true, "TableStyleMedium2")
         .unwrap();
     gridcore::edit::rename_table(&mut v.pkg.workbook, "Table1", "Calc").unwrap();
-    v.engine = sheet_engine(&v.pkg.workbook);
+    v.rebuild_engine();
     put(&mut v, 0, 4, Cell::formula("SUM(Calc[Qty])"));
     v
 }

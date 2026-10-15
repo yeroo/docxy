@@ -87,7 +87,7 @@ fn wb_recalc_sheet_scope() {
             ("sheet", Json::Str("Two".into())),
         ])
     };
-    call(&mut a, "cell.set", two("B1", "=Sheet1!A1+1")).unwrap();
+    call(&mut a, "cell.set", two("B1", "=Sheet1!A2+1")).unwrap();
     calc_set(&mut a, vec![("mode", manual())]).unwrap();
     set(&mut a, "A1", "7");
     let r = call(
@@ -107,7 +107,7 @@ fn wb_recalc_sheet_scope() {
         ]),
     )
     .unwrap();
-    assert_eq!(b1.get_str("text"), Some("6"));
+    assert_eq!(b1.get_str("text"), Some("11"), "not calculated: {b1}");
     let err = call(
         &mut a,
         "wb.recalc",
@@ -255,12 +255,6 @@ fn precision_as_displayed_needs_the_warning_accepted_and_undoes_in_one_step() {
 fn another_structural_undo_leaves_precision_alone() {
     let mut a = app();
     set(&mut a, "A1", "1");
-    call(
-        &mut a,
-        "row.insert",
-        Json::obj(vec![("at", Json::Num(0.0))]),
-    )
-    .unwrap();
     calc_set(
         &mut a,
         vec![
@@ -269,10 +263,17 @@ fn another_structural_undo_leaves_precision_alone() {
         ],
     )
     .unwrap();
-    a.undo(); // the precision step
-    a.undo(); // the row insert
-    assert!(!a.pkg.workbook.calc.precision_as_displayed);
-    a.redo();
-    a.redo();
-    assert!(a.pkg.workbook.calc.precision_as_displayed);
+    call(
+        &mut a,
+        "row.insert",
+        Json::obj(vec![("at", Json::Num(0.0))]),
+    )
+    .unwrap();
+    // Switched off outside history, between the row insert and its undo.
+    calc_set(&mut a, vec![("precisionAsDisplayed", Json::Bool(false))]).unwrap();
+    a.undo(); // the row insert, whose snapshot was taken with it on
+    assert!(
+        !a.pkg.workbook.calc.precision_as_displayed,
+        "an older step's undo does not turn it back on"
+    );
 }

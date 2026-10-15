@@ -681,7 +681,7 @@ pub(super) fn wb_calc_set(app: &mut App, args: &Json) -> Result<Json, String> {
     let converts = patch.converts(&app.pkg.workbook);
     gridcore::calc::apply_settings(&mut app.pkg.workbook, &mut app.engine, &patch);
     if converts {
-        app.precision_on()?;
+        app.precision_on();
     }
     app.modified = true;
     Ok(calc_info_json(app))

@@ -97,7 +97,9 @@ fn calculate_sheet_only_touches_that_sheet() {
     let mut eng = Engine::new(&wb);
     put(&mut eng, &mut wb, 0, "A1", Cell::number(5.0));
     put(&mut eng, &mut wb, 0, "A2", Cell::formula("A1*2"));
-    put(&mut eng, &mut wb, 1, "B1", Cell::formula("Sheet1!A1+1"));
+    // Reads a formula of the calculated sheet, so it depends on what changes.
+    put(&mut eng, &mut wb, 1, "B1", Cell::formula("Sheet1!A2+1"));
+    assert_eq!(num(&wb, 1, "B1"), 11.0);
     wb.calc.mode = CalcMode::Manual;
     put(&mut eng, &mut wb, 0, "A1", Cell::number(7.0));
     assert_eq!(eng.stale_on_sheet(0), 1);
@@ -105,13 +107,73 @@ fn calculate_sheet_only_touches_that_sheet() {
 
     eng.recalc_sheet(&mut wb, 0);
     assert_eq!(num(&wb, 0, "A2"), 14.0);
-    assert_eq!(num(&wb, 1, "B1"), 6.0, "the other sheet is not calculated");
+    assert_eq!(num(&wb, 1, "B1"), 11.0, "the other sheet is not calculated");
     assert_eq!(eng.stale_on_sheet(0), 0);
     assert_eq!(eng.stale_on_sheet(1), 1, "and stays reported");
 
     eng.recalc_sheet(&mut wb, 1);
-    assert_eq!(num(&wb, 1, "B1"), 8.0);
+    assert_eq!(num(&wb, 1, "B1"), 15.0);
     assert!(!eng.is_stale());
+}
+
+#[test]
+fn calculate_now_in_manual_mode_updates_what_reads_a_refreshed_pivot() {
+    use gridcore::pivot::{DataField, Pivot, PivotSource};
+    let mut wb = book(&["Sheet1"]);
+    let sh = &mut wb.sheets[0];
+    sh.set_cell(0, 0, Cell::text("Region"));
+    sh.set_cell(0, 1, Cell::text("Sales"));
+    for (i, (r, v)) in [("East", 10.0), ("West", 20.0), ("East", 30.0)]
+        .iter()
+        .enumerate()
+    {
+        sh.set_cell(i as u32 + 1, 0, Cell::text(r));
+        sh.set_cell(i as u32 + 1, 1, Cell::number(*v));
+    }
+    wb.pivots.push(Pivot {
+        name: "P".into(),
+        sheet: 0,
+        location: (0, 3, 0, 3),
+        source: PivotSource::Range {
+            sheet: "Sheet1".into(),
+            rect: (0, 0, 3, 1),
+        },
+        fields: vec!["Region".into(), "Sales".into()],
+        row_fields: vec![0],
+        col_fields: vec![],
+        data_fields: vec![DataField {
+            name: "Sum of Sales".into(),
+            field: 1,
+            agg: gridcore::frame::Agg::Sum,
+        }],
+        field_items: Vec::new(),
+        hidden: Vec::new(),
+        page: Vec::new(),
+        items_order: Vec::new(),
+        calc_formulas: Vec::new(),
+        grand_rows: true,
+        grand_cols: true,
+        subtotals: false,
+        data_on_rows: false,
+        unsupported: false,
+        edited: false,
+        refreshed: false,
+        part: String::new(),
+        cache_part: String::new(),
+    });
+    let mut eng = Engine::new(&wb);
+    // G1 reads the pivot's East total (E2).
+    put(&mut eng, &mut wb, 0, "G1", Cell::formula("E2*2"));
+    gridcore::calc::calculate_now(&mut wb, &mut eng, true);
+    assert_eq!(num(&wb, 0, "E2"), 40.0);
+    assert_eq!(num(&wb, 0, "G1"), 80.0);
+
+    wb.calc.mode = CalcMode::Manual;
+    put(&mut eng, &mut wb, 0, "B2", Cell::number(100.0));
+    gridcore::calc::calculate_now(&mut wb, &mut eng, true);
+    assert_eq!(num(&wb, 0, "E2"), 130.0, "the pivot refreshed");
+    assert_eq!(num(&wb, 0, "G1"), 260.0, "and its reader follows");
+    assert!(!eng.is_stale(), "nothing is left to calculate");
 }
 
 #[test]

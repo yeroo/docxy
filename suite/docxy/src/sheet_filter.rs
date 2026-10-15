@@ -75,7 +75,7 @@ pub(crate) fn run(
         v.push_undo_snapshot(snap, SheetStep::Named(step));
         // The rebuilt engine keeps the clock the old one had.
         let clock = v.engine.clock;
-        v.engine = crate::sheet_engine(&v.pkg.workbook);
+        v.rebuild_engine();
         v.engine.clock = clock;
         v.engine.recalc_all(&mut v.pkg.workbook);
     }

@@ -817,7 +817,16 @@ function xlsxyToolDefs() {
     tool(
       'xlsxy_recalc',
       'Calculate Now: recalculate the whole workbook (and refresh pivots), bringing everything stale up to date. With a sheet (index or name), Calculate Sheet instead: only that sheet\'s stale and volatile formulas and their dependents there; other sheets\' stale cells stay stale (the reply\'s stale counts them).',
-      Object.fromEntries([sheet(), target()]),
+      Object.fromEntries([
+        [
+          'sheet',
+          prop(
+            'string',
+            'Calculate Sheet on this sheet (index or name); omit for Calculate Now on every sheet.',
+          ),
+        ],
+        target(),
+      ]),
       [],
     ),
     tool(
@@ -1418,7 +1427,13 @@ function xlsxyToolDefs() {
             'Iterative calculation; in manual mode each Calculate runs one pass.',
           ),
         ],
-        ['threads', prop('integer', 'Calculation threads, 1 to 1024; null for all processors.')],
+        [
+          'threads',
+          {
+            type: ['integer', 'null'],
+            description: 'Calculation threads, 1 to 1024; null for all processors.',
+          },
+        ],
         ['concurrent', prop('boolean', 'Enable multi-threaded calculation.')],
         ['transitionEvaluation', prop('boolean', 'Transition formula evaluation.')],
         target(),

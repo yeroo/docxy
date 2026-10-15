@@ -78,7 +78,7 @@ pub(crate) fn sort_view(
                 v.circles.clear();
                 // The rebuilt engine keeps the clock the old one had.
                 let clock = v.engine.clock;
-                v.engine = crate::sheet_engine(&v.pkg.workbook);
+                v.rebuild_engine();
                 v.engine.clock = clock;
                 v.engine.recalc_all(&mut v.pkg.workbook);
             }

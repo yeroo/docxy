@@ -8179,6 +8179,9 @@ fn sync_calc_pr(xml: &str, wb: &Workbook) -> String {
     let Some(start) = workbook_child(xml, "calcPr").map(|c| c.start) else {
         let attrs: String = wants
             .iter()
+            // An absent attribute already means the default, so only what
+            // differs from that is written.
+            .filter(|(_, _, same)| !same(""))
             .filter_map(|(name, v, _)| v.as_ref().map(|v| format!(" {name}=\"{v}\"")))
             .collect();
         if attrs.is_empty() {
@@ -23120,7 +23123,10 @@ mod calc_settings_tests {
         assert!(wb.contains(r#"futureAttr="keep""#), "{wb}");
         assert!(wb.contains(r#"calcMode="autoNoTable""#), "{wb}");
         assert!(wb.contains(r#"concurrentManualCount="2""#), "{wb}");
-        assert!(wb.contains(r#"iterateCount="50""#), "iteration off keeps its counts: {wb}");
+        assert!(
+            wb.contains(r#"iterateCount="50""#),
+            "iteration off keeps its counts: {wb}"
+        );
         assert!(!wb.contains("concurrentCalc"), "{wb}");
         assert!(!wb.contains(r#"iterate="1""#), "{wb}");
         assert!(wb.contains(r#"fullPrecision="0""#), "{wb}");

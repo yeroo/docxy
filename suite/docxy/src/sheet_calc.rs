@@ -81,14 +81,13 @@ fn set_mode(tab: &mut DocTab, m: CalcMode) -> Result<(), String> {
 /// Calculate Now: every formula of every sheet, pivots refreshed from their
 /// sources, as xlsxy's F9 does.
 fn calculate_now(tab: &mut DocTab) -> Result<(), String> {
+    // Protected View keeps pivots at their cached values and the tab clean
+    // (the sheet_edited gate), as xlsxy's F9 does (#894).
+    let protected = tab.access.protected;
     let v = sheet_view(tab)?;
     let was_stale = v.engine.is_stale();
-    calc::calculate_now(&mut v.pkg.workbook, &mut v.engine);
-    let outcome = gridcore::pivot::refresh_pivots(&mut v.pkg.workbook);
-    if !outcome.changed.is_empty() {
-        v.engine.recalc_from(&mut v.pkg.workbook, &outcome.changed);
-    }
-    if was_stale || !outcome.changed.is_empty() {
+    let outcome = calc::calculate_now(&mut v.pkg.workbook, &mut v.engine, !protected);
+    if !protected && (was_stale || !outcome.changed.is_empty()) {
         tab.set_dirty();
     }
     tab.status = "Calculated".into();

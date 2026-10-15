@@ -1,11 +1,12 @@
 //! Calculation options as hosts surface them (Formulas > Calculation): the
 //! `Calculate` status word, Calculate Now / Sheet, the mode, and Set precision
-//! as displayed with its warning and its one undo step. Every host (the
+//! as displayed with its warning. Every host (the
 //! desktop suite, `xlsxy`, the wasm bridge) calls these, so each shows and
 //! changes the settings the same way.
 
 use crate::engine::Engine;
-use crate::sheet::{CalcMode, Cell, CellValue, Workbook, round_to_display};
+use crate::pivot::RefreshOutcome;
+use crate::sheet::{CalcMode, Workbook, round_cell_to_display};
 
 /// The status-bar word while values are out of date (manual mode, after an
 /// edit), like Excel's `Calculate`.
@@ -17,16 +18,20 @@ pub fn status_word(eng: &Engine) -> Option<&'static str> {
 /// OK goes ahead, Cancel changes nothing.
 pub const PRECISION_WARNING: &str = "Data will permanently lose accuracy.";
 
-/// Calculate Now (F9): every formula of every sheet.
-pub fn calculate_now(wb: &mut Workbook, eng: &mut Engine) {
+/// Calculate Now (F9): every formula of every sheet. With `pivots`, pivot
+/// tables are refreshed from their sources first and what reads their output
+/// is calculated too (in manual mode as well); without, the outcome is empty
+/// (Protected View keeps the cached pivot values).
+pub fn calculate_now(wb: &mut Workbook, eng: &mut Engine, pivots: bool) -> RefreshOutcome {
     eng.recalc_all(wb);
-}
-
-/// Calculate Sheet (Shift+F9). The sheet is named; `None` = unknown name.
-pub fn calculate_sheet(wb: &mut Workbook, eng: &mut Engine, sheet: &str) -> Option<()> {
-    let s = wb.sheet_index(sheet)?;
-    eng.recalc_sheet(wb, s);
-    Some(())
+    if !pivots {
+        return RefreshOutcome::default();
+    }
+    let outcome = crate::pivot::refresh_pivots(wb);
+    if !outcome.changed.is_empty() {
+        eng.recalc_from_forced(wb, &outcome.changed);
+    }
+    outcome
 }
 
 /// Calculation Options > Automatic / Automatic Except Data Tables / Manual.
@@ -39,77 +44,38 @@ pub fn set_mode(wb: &mut Workbook, eng: &mut Engine, mode: CalcMode) {
     }
 }
 
-/// The constants Set precision as displayed replaced, as they were: the
-/// one undo step of switching it on.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct PrecisionConversion {
-    pub cells: Vec<(usize, u32, u32, Cell)>,
-}
-
 /// Replace every number constant whose cell format shows a fixed number of
 /// decimals by the value shown (the data half of switching Set precision as
 /// displayed on, for hosts that snapshot the workbook for their undo step).
-/// The cells as they were; formulas, dates, text and General cells stay.
-pub fn convert_constants(wb: &mut Workbook) -> PrecisionConversion {
-    let mut conv = PrecisionConversion::default();
+/// Formulas, dates, text and General cells stay. Returns how many changed.
+pub fn convert_constants(wb: &mut Workbook) -> usize {
     let xfs = wb.styles.xfs.clone();
-    for (s, sheet) in wb.sheets.iter_mut().enumerate() {
-        let mut keys: Vec<(u32, u32)> = sheet.cells.keys().copied().collect();
-        keys.sort_unstable();
-        for (r, c) in keys {
-            let cell = sheet.cells.get_mut(&(r, c)).expect("listed");
-            if cell.formula.is_some() || cell.f_attrs.is_some() {
-                continue;
-            }
-            let Some(xf) = xfs.get(cell.style as usize) else {
-                continue;
-            };
-            let Some(shown) = round_to_display(xf, &cell.value) else {
-                continue;
-            };
-            if CellValue::Number(shown) != cell.value {
-                conv.cells.push((s, r, c, cell.clone()));
-                cell.value = CellValue::Number(shown);
+    let mut n = 0;
+    for sheet in &mut wb.sheets {
+        for cell in sheet.cells.values_mut() {
+            if cell.formula.is_none() && cell.f_attrs.is_none() && round_cell_to_display(&xfs, cell)
+            {
+                n += 1;
             }
         }
     }
-    conv
+    n
 }
 
 /// Turn Set precision as displayed on or off. On (the caller has shown
 /// [`PRECISION_WARNING`] and been told OK) replaces the constants
 /// ([`convert_constants`]), then recalculates so formula results round too;
-/// the result holds the cells as they were for the undo. Off changes no data
-/// and returns nothing.
-pub fn set_precision_as_displayed(
-    wb: &mut Workbook,
-    eng: &mut Engine,
-    on: bool,
-) -> Option<PrecisionConversion> {
+/// the host holds the cells as they were for its undo step. Off changes no
+/// data. Returns how many constants were replaced.
+pub fn set_precision_as_displayed(wb: &mut Workbook, eng: &mut Engine, on: bool) -> usize {
     if !on {
         wb.calc.set_precision_as_displayed(false);
-        return None;
+        return 0;
     }
-    let conv = convert_constants(wb);
+    let n = convert_constants(wb);
     wb.calc.set_precision_as_displayed(true);
     eng.recalc_all(wb);
-    Some(conv)
-}
-
-/// Undo the switch-on: precision as displayed off, the constants back.
-pub fn undo_precision_conversion(wb: &mut Workbook, eng: &mut Engine, conv: &PrecisionConversion) {
-    wb.calc.set_precision_as_displayed(false);
-    let sheets: std::collections::BTreeSet<usize> = conv.cells.iter().map(|c| c.0).collect();
-    for s in sheets {
-        let cells: Vec<(u32, u32, Cell)> = conv
-            .cells
-            .iter()
-            .filter(|c| c.0 == s)
-            .map(|(_, r, c, cell)| (*r, *c, cell.clone()))
-            .collect();
-        eng.restore_cells(wb, s, &cells);
-    }
-    eng.recalc_all(wb);
+    n
 }
 
 /// The `calcMode` names the control surface uses.

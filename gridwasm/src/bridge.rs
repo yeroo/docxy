@@ -1242,21 +1242,16 @@ impl Session {
             "wb.calc" => Ok(self.ctl_calc_info(None)),
             "wb.calc.set" => self.ctl_calc_set(args),
             "wb.recalc" => {
-                self.engine.recalc_all(&mut self.pkg.workbook);
-                // Mirrors xlsxy control.rs's `wb.recalc` -> `App::recalc_and_refresh`:
-                // a plain engine recalc alone never touches pivot output —
-                // `refresh_pivots` recomputes each supported pivot from its
-                // (possibly just-edited) source range, then a follow-up
-                // targeted recalc propagates any resulting cell changes to
-                // formulas that read the pivot's output region. Skips
-                // gracefully (no crash, `out.skipped` counts it) when a
-                // pivot's source sheet has itself been removed — see
-                // gridcore's `refreshing_a_pivots_output_after_its_source_
-                // sheet_is_removed_skips_gracefully`.
-                let outcome = gridcore::pivot::refresh_pivots(&mut self.pkg.workbook);
+                // Mirrors xlsxy's `App::recalc_and_refresh`: Calculate Now,
+                // then each supported pivot is recomputed from its (possibly
+                // just-edited) source and what reads its output follows.
+                // Skips gracefully (`skipped`) when a pivot's source sheet
+                // has itself been removed — see gridcore's `refreshing_a_
+                // pivots_output_after_its_source_sheet_is_removed_skips_
+                // gracefully`.
+                let outcome =
+                    gridcore::calc::calculate_now(&mut self.pkg.workbook, &mut self.engine, true);
                 if !outcome.changed.is_empty() {
-                    self.engine
-                        .recalc_from(&mut self.pkg.workbook, &outcome.changed);
                     self.dirty = true;
                 }
                 Ok("{\"recalculated\":true}".to_string())
@@ -6589,6 +6584,12 @@ mod tests {
             "{out}"
         );
         assert_eq!(calc_cell_text(&mut s, "C1"), "3.15");
+        assert_eq!(
+            s.pkg.workbook.sheets[0].cell(0, 2).unwrap().value,
+            CellValue::Number(3.14659),
+            "the refusal converted nothing"
+        );
+        assert!(!s.pkg.workbook.calc.precision_as_displayed);
         let out = s.ctl(
             r#"{"verb":"wb.calc.set","args":{"precisionAsDisplayed":true,"acceptLoss":true}}"#,
         );

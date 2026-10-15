@@ -250,7 +250,7 @@ fn a_refused_repaste_keeps_the_first_paste_and_its_step() {
     a3.f_attrs = Some(" t=\"array\" ref=\"A3:B3\"".into());
     v.pkg.workbook.sheets[s].set_cell(2, 0, a3);
     v.pkg.workbook.sheets[s].set_cell(2, 1, Cell::number(2.0));
-    v.engine = crate::sheet_engine(&v.pkg.workbook);
+    v.rebuild_engine();
     v.engine.recalc_all(&mut v.pkg.workbook);
     let mut clip = copy(&mut v, "X1", "Z1");
     select(&mut v, "B2");

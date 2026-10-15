@@ -888,14 +888,7 @@ impl Engine {
     ) -> bool {
         cell.spill = None;
         if typed && wb.calc.precision_as_displayed && cell.formula.is_none() {
-            let shown = wb
-                .styles
-                .xfs
-                .get(cell.style as usize)
-                .and_then(|xf| crate::sheet::round_to_display(xf, &cell.value));
-            if let Some(n) = shown {
-                cell.value = CellValue::Number(n);
-            }
+            crate::sheet::round_cell_to_display(&wb.styles.xfs, &mut cell);
         }
         let (s, r, c) = key;
         let SpillOwner {
@@ -1122,6 +1115,20 @@ impl Engine {
         self.stale_count() > 0
     }
 
+    /// For an engine rebuilt over the same workbook (a structural edit, an
+    /// undo): when `old` had stale formulas, every formula here is stale, since
+    /// the cells may have moved and the rebuild cannot tell which were fresh.
+    pub fn inherit_stale(&mut self, old: &Engine) {
+        if old.is_stale() {
+            self.stale = self
+                .formulas
+                .keys()
+                .copied()
+                .filter(|k| !self.unsupported.contains(k))
+                .collect();
+        }
+    }
+
     /// How many formulas are stale.
     pub fn stale_count(&self) -> usize {
         self.stale
@@ -1149,9 +1156,21 @@ impl Engine {
     }
 
     /// Dirty the transitive dependents of `changed` (plus volatiles) and
-    /// re-evaluate them.
+    /// re-evaluate them. In manual mode only the changed formulas themselves
+    /// evaluate and every dependent goes stale (see [`Engine::is_stale`]);
+    /// [`Engine::recalc_from_forced`] is the Calculate form.
     pub fn recalc_from(&mut self, wb: &mut Workbook, changed: &[Key]) {
         self.recalc_from_depth(wb, changed, 0);
+    }
+
+    /// [`Engine::recalc_from`] as part of a Calculate: manual mode lifted, so
+    /// the dependents evaluate (and leave the stale set) instead of going stale.
+    pub fn recalc_from_forced(&mut self, wb: &mut Workbook, changed: &[Key]) {
+        self.forcing = true;
+        self.one_pass = wb.calc.mode == CalcMode::Manual;
+        self.recalc_from_depth(wb, changed, 0);
+        self.forcing = false;
+        self.one_pass = false;
     }
 
     fn recalc_from_depth(&mut self, wb: &mut Workbook, changed: &[Key], depth: u32) {
@@ -1711,12 +1730,7 @@ impl Engine {
                 for rr in r..r + h {
                     for cc in c..c + w {
                         if let Some(cell) = sheet.cells.get_mut(&(rr, cc)) {
-                            let shown = xfs
-                                .get(cell.style as usize)
-                                .and_then(|xf| crate::sheet::round_to_display(xf, &cell.value));
-                            if let Some(n) = shown {
-                                cell.value = CellValue::Number(n);
-                            }
+                            crate::sheet::round_cell_to_display(xfs, cell);
                         }
                     }
                 }

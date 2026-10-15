@@ -214,7 +214,16 @@ fn tool_defs() -> Json {
         tool(
             "xlsxy_recalc",
             "Calculate Now: recalculate the whole workbook (and refresh pivots), bringing everything stale up to date. With a sheet (index or name), Calculate Sheet instead: only that sheet's stale and volatile formulas and their dependents there; other sheets' stale cells stay stale (the reply's stale counts them).",
-            vec![sheet(), target()],
+            vec![
+                (
+                    "sheet",
+                    prop(
+                        "string",
+                        "Calculate Sheet on this sheet (index or name); omit for Calculate Now on every sheet.",
+                    ),
+                ),
+                target(),
+            ],
             &[],
         ),
         tool(
@@ -1229,10 +1238,18 @@ fn tool_defs() -> Json {
                 ),
                 (
                     "threads",
-                    prop(
-                        "integer",
-                        "Calculation threads, 1 to 1024; null for all processors.",
-                    ),
+                    Json::obj(vec![
+                        (
+                            "type",
+                            Json::Arr(vec![Json::Str("integer".into()), Json::Str("null".into())]),
+                        ),
+                        (
+                            "description",
+                            Json::Str(
+                                "Calculation threads, 1 to 1024; null for all processors.".into(),
+                            ),
+                        ),
+                    ]),
                 ),
                 (
                     "concurrent",

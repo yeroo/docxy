@@ -1521,8 +1521,8 @@ fn pv_allows_key(code: KeyCode, ctrl: bool, shift: bool, alt: bool) -> bool {
         KeyCode::F(3) => true,
         // Shift+F4 is the sheet list; F4 repeats.
         KeyCode::F(4) => shift,
-        // Plain F9 engaged the ribbon before this; Shift/Ctrl+F9 recalculate
-        // without refreshing pivots while protected.
+        // Plain F9 engaged the ribbon before this; Ctrl+F9 is Calculate Now
+        // (pivots kept cached while protected), Shift+F9 Calculate Sheet.
         KeyCode::F(9) => true,
         _ => false,
     }
@@ -4160,15 +4160,13 @@ impl App {
     /// In Protected View (#894) the pivots keep their cached values: a
     /// refresh changes the workbook.
     fn recalc_and_refresh(&mut self) {
-        self.engine.recalc_all(&mut self.pkg.workbook);
-        if self.protected_view.is_some() {
+        let pv = self.protected_view.is_some();
+        let outcome = gridcore::calc::calculate_now(&mut self.pkg.workbook, &mut self.engine, !pv);
+        if pv {
             self.status = Some("Recalculated; pivots kept their cached values".to_string());
             return;
         }
-        let outcome = gridcore::pivot::refresh_pivots(&mut self.pkg.workbook);
         if !outcome.changed.is_empty() {
-            self.engine
-                .recalc_from(&mut self.pkg.workbook, &outcome.changed);
             self.modified = true;
         }
         self.status = Some(match (outcome.refreshed, outcome.skipped) {
@@ -4181,21 +4179,19 @@ impl App {
     /// Switch Set precision as displayed on (the warning is the caller's):
     /// the constants take their displayed values, formula results round, and
     /// one undo step puts the constants and the switch back.
-    fn precision_on(&mut self) -> Result<(), String> {
+    fn precision_on(&mut self) {
         let was = {
             let c = &self.pkg.workbook.calc;
             (c.precision_as_displayed, c.precision_file_off)
         };
-        self.try_structural(None, |wb| {
+        self.structural(|wb| {
             gridcore::calc::convert_constants(wb);
             wb.calc.set_precision_as_displayed(true);
-            Ok(())
-        })?;
+        });
         if let Some(UndoAction::Structural { before, after, .. }) = self.undo.last_mut() {
             before.precision = Some(was);
             after.precision = Some((true, false));
         }
-        Ok(())
     }
 
     /// Shift+F9 — Calculate Sheet: the stale and volatile formulas of the
@@ -12064,7 +12060,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
 
     // --- ribbon ---------------------------------------------------------------
     let overlay_open = app.overlay_open();
-    // Plain F9 engages the ribbon (docxy parity); Shift/Ctrl+F9 stays recalc.
+    // Plain F9 engages the ribbon (docxy parity); Ctrl+F9 is Calculate Now,
+    // Shift+F9 Calculate Sheet.
     if key.code == KeyCode::F(9) && !overlay_open && !shift && !ctrl {
         app.ribbon_focus = if app.ribbon_focus == ribbon::Focus::None {
             ribbon::Focus::Tab(app.ribbon.active_tab())

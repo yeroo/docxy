@@ -108,7 +108,7 @@ fn calculate_sheet_calculates_the_active_sheet_only() {
     type_into(&mut t, "A1", "5");
     type_into(&mut t, "A2", "=A1*2");
     view(&mut t).active = 1;
-    type_into(&mut t, "B1", "=Sheet1!A1+1");
+    type_into(&mut t, "B1", "=Sheet1!A2+1");
     view(&mut t).active = 0;
     run(&mut t, CalcAct::Mode(CalcMode::Manual));
     type_into(&mut t, "A1", "7");
@@ -116,10 +116,13 @@ fn calculate_sheet_calculates_the_active_sheet_only() {
     run(&mut t, CalcAct::Sheet);
     assert_eq!(value(&mut t, "A2"), CellValue::Number(14.0));
     assert_eq!(t.status.as_ref(), "Calculated Sheet1");
-    // The other sheet's formula is still stale, and still reported.
+    // The other sheet's formula, which reads A2, keeps its old value and is
+    // still reported.
     assert_eq!(word(&mut t), Some("Calculate"));
     view(&mut t).active = 1;
+    assert_eq!(value(&mut t, "B1"), CellValue::Number(11.0));
     run(&mut t, CalcAct::Sheet);
+    assert_eq!(value(&mut t, "B1"), CellValue::Number(15.0));
     assert_eq!(word(&mut t), None);
 }
 
@@ -299,17 +302,98 @@ fn precision_as_displayed_warns_then_rounds_in_one_undo_step() {
 }
 
 #[test]
-fn undoing_an_older_step_does_not_turn_precision_off() {
+fn undoing_an_older_step_does_not_change_precision() {
     let mut t = precision_book();
     open(&mut t);
     set(&mut t, "precision", Json::Bool(true));
     press(&mut t, "OK");
     press(&mut t, "OK");
     type_into(&mut t, "C1", "1");
-    assert!(view(&mut t).undo_step()); // the entry in C1
-    assert!(view(&mut t).pkg.workbook.calc.precision_as_displayed);
+    // Switched off outside history, after the entry in C1.
+    open(&mut t);
+    set(&mut t, "precision", Json::Bool(false));
+    press(&mut t, "OK");
+    assert!(!view(&mut t).pkg.workbook.calc.precision_as_displayed);
+    assert!(view(&mut t).undo_step()); // the entry in C1, taken with it on
+    assert!(
+        !view(&mut t).pkg.workbook.calc.precision_as_displayed,
+        "an older step's undo does not turn it back on"
+    );
     assert!(view(&mut t).undo_step()); // the switch
     assert!(!view(&mut t).pkg.workbook.calc.precision_as_displayed);
-    assert!(view(&mut t).undo_step()); // an older entry
-    assert!(!view(&mut t).pkg.workbook.calc.precision_as_displayed);
+    assert_eq!(value(&mut t, "A1"), CellValue::Number(3.14659));
+}
+
+#[test]
+fn an_unrelated_edit_and_undo_keep_the_stale_formulas_stale() {
+    let mut t = manual_book();
+    type_into(&mut t, "A1", "7");
+    assert_eq!(word(&mut t), Some("Calculate"));
+    type_into(&mut t, "B1", "1");
+    assert!(view(&mut t).undo_step()); // B1; the engine is rebuilt
+    assert_eq!(value(&mut t, "A2"), CellValue::Number(10.0));
+    assert_eq!(word(&mut t), Some("Calculate"), "A2 is still out of date");
+    run(&mut t, CalcAct::Sheet);
+    assert_eq!(value(&mut t, "A2"), CellValue::Number(14.0));
+    assert_eq!(word(&mut t), None);
+}
+
+#[test]
+fn calculate_now_in_protected_view_keeps_pivots_and_the_tab_clean() {
+    use gridcore::pivot::{DataField, Pivot, PivotSource};
+    let mut t = tab();
+    {
+        let wb = &mut view(&mut t).pkg.workbook;
+        let sh = &mut wb.sheets[0];
+        sh.set_cell(0, 0, gridcore::sheet::Cell::text("Region"));
+        sh.set_cell(0, 1, gridcore::sheet::Cell::text("Sales"));
+        for (i, (r, v)) in [("East", 10.0), ("West", 20.0)].iter().enumerate() {
+            sh.set_cell(i as u32 + 1, 0, gridcore::sheet::Cell::text(r));
+            sh.set_cell(i as u32 + 1, 1, gridcore::sheet::Cell::number(*v));
+        }
+        wb.pivots.push(Pivot {
+            name: "P".into(),
+            sheet: 0,
+            location: (0, 3, 0, 3),
+            source: PivotSource::Range {
+                sheet: "Sheet1".into(),
+                rect: (0, 0, 2, 1),
+            },
+            fields: vec!["Region".into(), "Sales".into()],
+            row_fields: vec![0],
+            col_fields: vec![],
+            data_fields: vec![DataField {
+                name: "Sum of Sales".into(),
+                field: 1,
+                agg: gridcore::frame::Agg::Sum,
+            }],
+            field_items: Vec::new(),
+            hidden: Vec::new(),
+            page: Vec::new(),
+            items_order: Vec::new(),
+            calc_formulas: Vec::new(),
+            grand_rows: true,
+            grand_cols: true,
+            subtotals: false,
+            data_on_rows: false,
+            unsupported: false,
+            edited: false,
+            refreshed: false,
+            part: String::new(),
+            cache_part: String::new(),
+        });
+    }
+    t.dirty = false;
+    t.access.protected = true;
+    run(&mut t, CalcAct::Now);
+    assert_eq!(
+        value(&mut t, "E2"),
+        CellValue::Empty,
+        "the pivot is not refreshed"
+    );
+    assert!(!t.dirty, "and the tab is not dirty");
+    t.access.protected = false;
+    run(&mut t, CalcAct::Now);
+    assert_eq!(value(&mut t, "E2"), CellValue::Number(10.0));
+    assert!(t.dirty);
 }

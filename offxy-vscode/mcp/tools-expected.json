@@ -984,7 +984,7 @@
       "properties": {
         "sheet": {
           "type": "string",
-          "description": "Optional sheet index or name (default: the active sheet)."
+          "description": "Calculate Sheet on this sheet (index or name); omit for Calculate Now on every sheet."
         },
         "target": {
           "type": "string",
@@ -2421,7 +2421,10 @@
           "description": "Iterative calculation; in manual mode each Calculate runs one pass."
         },
         "threads": {
-          "type": "integer",
+          "type": [
+            "integer",
+            "null"
+          ],
           "description": "Calculation threads, 1 to 1024; null for all processors."
         },
         "concurrent": {

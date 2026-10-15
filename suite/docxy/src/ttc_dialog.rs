@@ -469,7 +469,7 @@ fn convert(tab: &mut DocTab, src: &TtcSource, opts: &TextParse) {
     v.push_undo(SheetStep::Named("Text to Columns"));
     let today = v.engine.clock;
     let n = text_to_columns(&mut v.pkg.workbook, src, opts, today);
-    v.engine = crate::sheet_engine(&v.pkg.workbook);
+    v.rebuild_engine();
     tab.set_dirty();
     tab.status = format!(
         "Text to Columns: converted {n} row{}",
@@ -491,7 +491,7 @@ mod tests {
             for (r, c, t) in cells {
                 v.pkg.workbook.sheets[0].set_cell(*r, *c, Cell::text(t));
             }
-            v.engine = crate::sheet_engine(&v.pkg.workbook);
+            v.rebuild_engine();
         }
         DocTab {
             kind: Kind::Xlsx,

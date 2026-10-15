@@ -305,7 +305,7 @@ fn apply(
     v.push_undo_snapshot(snap, SheetStep::Named("Consolidate"));
     // Linked output is formulas: evaluate them now, or they show (and
     // save) blank.
-    v.engine = crate::sheet_engine(&v.pkg.workbook);
+    v.rebuild_engine();
     v.engine.recalc_all(&mut v.pkg.workbook);
     tab.set_dirty();
     tab.status = format!(
@@ -387,7 +387,7 @@ mod tests {
         v.active = 2;
         v.anchor = (0, 0);
         v.sel = (0, 0);
-        v.engine = crate::sheet_engine(&v.pkg.workbook);
+        v.rebuild_engine();
         t
     }
 
@@ -596,7 +596,7 @@ mod tests {
         let mut t = book();
         view(&mut t).pkg.workbook.sheets[0].set_cell(1, 1, Cell::formula("Summary!C2"));
         let v = view(&mut t);
-        v.engine = crate::sheet_engine(&v.pkg.workbook);
+        v.rebuild_engine();
         v.engine.recalc_all(&mut v.pkg.workbook);
         t.status = "before".into();
         open(&mut t);

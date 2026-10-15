@@ -2424,6 +2424,17 @@ enum StructOp {
 }
 
 impl SheetView {
+    /// A fresh engine over the workbook as it stands, after an edit that
+    /// rebuilds it (sheets added or removed, rows moved, an undo). What was
+    /// stale stays so (#674): the new engine cannot tell which formulas were
+    /// calculated, so in manual mode every formula is marked, and the next
+    /// Calculate puts them right.
+    fn rebuild_engine(&mut self) {
+        let mut engine = sheet_engine(&self.pkg.workbook);
+        engine.inherit_stale(&self.engine);
+        self.engine = engine;
+    }
+
     fn end_cell_edit(&mut self) {
         // An entry waiting on a data-validation alert goes with its editor.
         self.dv_pending = None;
@@ -2803,7 +2814,7 @@ impl SheetView {
         self.clear_areas();
         self.anchor = (0, 0);
         self.end_cell_edit();
-        self.engine = sheet_engine(&self.pkg.workbook);
+        self.rebuild_engine();
         idx
     }
 
@@ -2874,7 +2885,7 @@ impl SheetView {
         self.clear_areas();
         self.anchor = (0, 0);
         self.end_cell_edit();
-        self.engine = sheet_engine(&self.pkg.workbook);
+        self.rebuild_engine();
         true
     }
 
@@ -3080,7 +3091,7 @@ impl SheetView {
         });
         self.push_undo_snapshot(snap, step);
         // Structured references now cover a grown table: recalculate.
-        self.engine = sheet_engine(&self.pkg.workbook);
+        self.rebuild_engine();
         self.engine.recalc_all(&mut self.pkg.workbook);
     }
 
@@ -4036,7 +4047,7 @@ impl SheetView {
         for ch in self.charts.iter_mut() {
             edit::shift_chart_refs(&mut ch.data, &name, ch.sheet == s, &shift);
         }
-        self.engine = sheet_engine(&self.pkg.workbook);
+        self.rebuild_engine();
         true
     }
 
@@ -4178,7 +4189,7 @@ impl SheetView {
         }
         self.charts = snap.charts;
         self.pivot_views = snap.pivots;
-        self.engine = sheet_engine(&self.pkg.workbook);
+        self.rebuild_engine();
         self.active = snap
             .active
             .min(self.pkg.workbook.sheets.len().saturating_sub(1));
@@ -4644,7 +4655,7 @@ impl SheetView {
         // References follow next, and the engine is rebuilt on them, so the
         // writes below recalculate what reads the moved cells where they land.
         gridcore::edit::move_refs(&mut self.pkg.workbook, src, &mv);
-        self.engine = sheet_engine(&self.pkg.workbook);
+        self.rebuild_engine();
         // A clear landing in a frozen array block goes last
         // (`Engine::split_frozen_blanks`): a no-op while the block is whole,
         // it clears its cell once the paste has put content into the block.
@@ -17519,7 +17530,7 @@ impl Docxy {
                     self.sheet_try_edit(SheetStep::Named(CF_STEP), |v| {
                         let s = v.active;
                         let done = v.pkg.clear_conditional_formats(s);
-                        v.engine = sheet_engine(&v.pkg.workbook);
+                        v.rebuild_engine();
                         done
                     });
                 } else if let Some(((op, val, val2), cells)) = parse_cf_input(&buf).zip(cells) {
@@ -17533,7 +17544,7 @@ impl Docxy {
                             val2.as_deref(),
                             cf_preset_dxf(),
                         );
-                        v.engine = sheet_engine(&v.pkg.workbook);
+                        v.rebuild_engine();
                         done
                     });
                 }
@@ -17724,7 +17735,7 @@ impl Docxy {
                 let idx = wb.styles.intern(xf);
                 wb.sheets[s].cells.entry((r0, c0)).or_default().style = idx;
             }
-            v.engine = sheet_engine(&v.pkg.workbook);
+            v.rebuild_engine();
         }
         self.mark_sheet_dirty();
         cx.notify();
@@ -17765,7 +17776,7 @@ impl Docxy {
             }
             let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
             gridcore::edit::dedupe_rows(&mut v.pkg.workbook, s, top, bottom, header);
-            v.engine = sheet_engine(&v.pkg.workbook);
+            v.rebuild_engine();
         }
         self.mark_sheet_dirty();
         cx.notify();
@@ -18362,7 +18373,7 @@ impl Docxy {
                         }
                     }
                 }
-                v.engine = sheet_engine(&v.pkg.workbook);
+                v.rebuild_engine();
             }
         }
     }
@@ -32889,7 +32900,7 @@ impl Docxy {
             self.sheet_try_edit(SheetStep::Named(CF_STEP), |v| {
                 let s = v.active;
                 let done = v.pkg.clear_conditional_formats(s);
-                v.engine = sheet_engine(&v.pkg.workbook);
+                v.rebuild_engine();
                 done
             });
         } else if let Some(((op, val, val2), cells)) = parse_cf_input(&buf).zip(cells) {
@@ -32903,7 +32914,7 @@ impl Docxy {
                     val2.as_deref(),
                     cf_preset_dxf(),
                 );
-                v.engine = sheet_engine(&v.pkg.workbook);
+                v.rebuild_engine();
                 done
             });
         }

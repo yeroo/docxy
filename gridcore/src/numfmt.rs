@@ -620,12 +620,12 @@ impl NumFormat {
         for _ in 0..sect.scale_commas {
             scale /= 1000.0;
         }
-        let f = 10f64.powi(sect.dec_digits as i32);
-        let shown = ((v.abs() * scale) * f).round() / f;
-        let back = shown / scale;
-        // Rounding to the shown digits must not manufacture noise the
+        // What `render_number` prints: rounded to the decimals, then to 15
+        // significant digits.
+        let shown = to_sig15(round_decimals(v.abs() * scale, sect.dec_digits));
+        // Dividing the scale back out must not manufacture noise the
         // display would not show (0.07 / 100 * 100 and the like).
-        let back = format!("{back:.15e}").parse::<f64>().unwrap_or(back);
+        let back = to_sig15(shown / scale);
         Some(if v < 0.0 { -back } else { back })
     }
 
@@ -875,6 +875,17 @@ fn sig15_digits(x: f64) -> (String, String) {
     }
 }
 
+/// `x` rounded to `dec` decimals, half away from zero.
+fn round_decimals(x: f64, dec: usize) -> f64 {
+    let f = 10f64.powi(dec as i32);
+    (x * f).round() / f
+}
+
+/// `x` at the 15 significant digits a cell shows (see [`sig15_digits`]).
+fn to_sig15(x: f64) -> f64 {
+    format!("{x:.14e}").parse().unwrap_or(x)
+}
+
 fn render_number(sect: &Section, x: f64, explicit_sign: bool) -> String {
     let mut v = x;
     if sect.has_percent {
@@ -896,10 +907,7 @@ fn render_number(sect: &Section, x: f64, explicit_sign: bool) -> String {
     }
 
     let negative = v < 0.0 || (explicit_sign && x < 0.0);
-    let rounded = {
-        let f = 10f64.powi(sect.dec_digits as i32);
-        (v.abs() * f).round() / f
-    };
+    let rounded = { round_decimals(v.abs(), sect.dec_digits) };
     // Excel shows at most 15 significant digits; the rest print as zeros.
     let (int_digits, frac_all) = sig15_digits(rounded);
 
