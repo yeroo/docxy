@@ -6981,7 +6981,8 @@ impl App {
         }
         self.doc_hscroll = self.comments_hscroll as u16;
 
-        let shade_light = self.light_page || self.page_view && self.pkg.page_background().is_some();
+        let page_bg = self.page_view.then(|| self.pkg.page_background()).flatten();
+        let shade_light = field_shade_is_light(self.light_page, page_bg.as_ref().map(|b| b.color));
         let rlines: Vec<_> = visible
             .iter()
             .map(|l| doc_line_to_ratatui(l, shade_light))
@@ -6994,7 +6995,6 @@ impl App {
         // and the centering margins / inter-page gaps stay black. In
         // continuous view there is no page frame, so the whole content area
         // is white.
-        let page_bg = self.page_view.then(|| self.pkg.page_background()).flatten();
         let mut para = if let Some(bg) = page_bg {
             let sheet = rgb_color(bg.color);
             let ink = rgb_color(page_ink(bg.color).0);
@@ -8344,6 +8344,13 @@ fn paint_page_on_black(line: RLine<'static>) -> RLine<'static> {
     paint_page(line, Color::White, Color::Black)
 }
 
+/// Whether a field's shade is the light one (#1243): on a page colour, by the
+/// sheet's own brightness (the ink `page_ink` picks is dark on a light sheet);
+/// otherwise by the terminal's light page.
+fn field_shade_is_light(light_page: bool, page_color: Option<u32>) -> bool {
+    page_color.map_or(light_page, |c| page_ink(c).0 == 0x202020)
+}
+
 /// Style one rendered line. A field's result is shaded grey (#1243): 238 under
 /// the terminal's own foreground, or on a light sheet (`light`, which includes
 /// a page colour) 253 with the text forced black unless the run has its own
@@ -8984,6 +8991,32 @@ mod tests {
         // The gap between pages (all whitespace) is fully black.
         let out = paint_page_on_black(RLine::from(vec![RSpan::raw("        ")]));
         assert!(out.spans.iter().all(|s| s.style.bg == Some(Color::Black)));
+    }
+
+    #[test]
+    fn a_field_shade_follows_the_sheet_brightness_1243() {
+        use docxcore::render::{Line as DL, Span as DS, Style as DST};
+        assert!(!field_shade_is_light(false, None));
+        assert!(field_shade_is_light(true, None));
+        // A page colour decides by its own brightness, not by light_page.
+        assert!(field_shade_is_light(false, Some(0xFFFF99)));
+        assert!(!field_shade_is_light(true, Some(0x000080)));
+        // A bright field on a navy page keeps its colour on the dark shade.
+        let line = DL {
+            spans: vec![DS {
+                text: "7".into(),
+                style: DST {
+                    field: true,
+                    color: Some(DocColor::BrightWhite),
+                    ..Default::default()
+                },
+                link: None,
+            }],
+        };
+        let rl = doc_line_to_ratatui(&line, field_shade_is_light(false, Some(0x000080)));
+        let painted = paint_page(rl, Color::Rgb(0, 0, 128), Color::White);
+        assert_eq!(painted.spans[0].style.bg, Some(Color::Indexed(238)));
+        assert_eq!(painted.spans[0].style.fg, Some(Color::White));
     }
 
     #[test]

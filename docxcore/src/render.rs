@@ -4763,6 +4763,23 @@ mod tests {
     }
 
     #[test]
+    fn a_field_inside_a_hyperlink_is_flagged_field_1243() {
+        let h = Inline::Hyperlink(Hyperlink {
+            target: Some("https://x.test/".to_string()),
+            content: vec![field_642("5")],
+            ..Hyperlink::default()
+        });
+        let lines = render(
+            &doc(vec![para(vec![run("a", RunProps::default()), h])]),
+            &opts(40),
+        );
+        let f = lines[0].spans.iter().find(|s| s.text == "5").unwrap();
+        assert!(f.style.field);
+        assert_eq!(f.link.as_deref(), Some("https://x.test/"));
+        assert!(!lines[0].spans[0].style.field);
+    }
+
+    #[test]
     fn a_selected_field_is_both_highlighted_and_flagged_1243() {
         let d = doc(vec![para(vec![
             run("Body", RunProps::default()),
