@@ -1,0 +1,94 @@
+# Formulas > Calculation (#674): Calculation Options (Automatic, Automatic
+# Except for Data Tables, Manual), Calculate Now (F9), Calculate Sheet
+# (Shift+F9), the `Calculate` status word while values are stale, and More
+# Calculation Options... with Set precision as displayed and its warning.
+# Run with:
+#
+#   cargo run -p uiharness -- run uiharness/cases/sheet-calc.uit
+#
+# The fixture's data is A1:C5; column J is clear.
+
+test manual mode leaves a dependent stale until F9
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type 5
+  key enter
+  click J2
+  type =J1*2
+  key enter
+  assert cell J2 is 10
+  call ribbon-click {"tab":"Formulas","command":"Manual"}
+  click J1
+  type 7
+  key enter
+  assert cell J2 is 10
+  call status-read {}
+  assert reply.items.2.id is calculate
+  assert reply.items.2.text is Calculate
+  key f9
+  assert cell J2 is 14
+  call status-read {}
+  assert reply.items.1.id is message
+
+test Calculate Now and Calculate Sheet are ribbon commands too
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type 5
+  key enter
+  click J2
+  type =J1*2
+  key enter
+  call ribbon-click {"tab":"Formulas","command":"Manual"}
+  click J1
+  type 7
+  key enter
+  assert cell J2 is 10
+  call ribbon-click {"tab":"Formulas","command":"Calculate Sheet"}
+  assert cell J2 is 14
+  click J1
+  type 8
+  key enter
+  assert cell J2 is 14
+  call ribbon-click {"tab":"Formulas","command":"Calculate Now"}
+  assert cell J2 is 16
+  click J1
+  type 9
+  key enter
+  key shift+f9
+  assert cell J2 is 18
+
+test Automatic recalculates on every edit again
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type 5
+  key enter
+  click J2
+  type =J1*2
+  key enter
+  call ribbon-click {"tab":"Formulas","command":"Manual"}
+  click J1
+  type 7
+  key enter
+  assert cell J2 is 10
+  call ribbon-click {"tab":"Formulas","command":"Automatic"}
+  assert cell J2 is 14
+  click J1
+  type 8
+  key enter
+  assert cell J2 is 16
+
+test Set precision as displayed asks first and Cancel changes nothing
+  open copy:../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call pointer-click {"dialog-control":"precision"}
+  call dialog-click {"button":"OK"}
+  assert dialog is precision-warning
+  call dialog-read {}
+  assert reply.text is Data will permanently lose accuracy.
+  call dialog-click {"button":"Cancel"}
+  assert dialog is none
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  call dialog-read {}
+  assert reply.controls.0.text is unchecked
+  key escape

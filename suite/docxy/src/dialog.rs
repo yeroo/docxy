@@ -197,6 +197,10 @@ pub(crate) enum DialogOwner {
     /// Page Layout's Page Setup dialog for the active sheet (#1019), applied
     /// in `sheet_page_setup::click`.
     SheetPageSetup,
+    /// Formulas › Calculation › More Calculation Options... (#674) and Set
+    /// precision as displayed's warning, applied in `sheet_calc::click`.
+    SheetCalcOptions,
+    SheetPrecisionWarning,
     /// Home › Find & Select › Go To… and Go To Special… (#671), applied in
     /// `sheet_goto::click`.
     GoTo,

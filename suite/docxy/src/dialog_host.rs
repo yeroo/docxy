@@ -150,6 +150,10 @@ fn apply_dialog(
         }
         // Handled in `sheet_page_setup::click`, before this.
         DialogOwner::SheetPageSetup => Err("page setup applies through the Page Layout tab".into()),
+        // Handled in `sheet_calc::click`, before this.
+        DialogOwner::SheetCalcOptions | DialogOwner::SheetPrecisionWarning => {
+            Err("calculation options apply through the Formulas tab".into())
+        }
         // Handled in `reopen_click`, before this: Yes replaces the whole tab.
         DialogOwner::Reopen { .. } => Err("reopening replaces the tab".into()),
         // Handled in `mailings_dialogs::click`, before this: they act on the
@@ -274,6 +278,10 @@ fn dialog_press(tab: &mut DocTab, button: &str) -> Result<(), String> {
     }
     // Page Layout's Page Setup (#1019).
     if let Some(done) = crate::sheet_page_setup::click(tab, button) {
+        return done;
+    }
+    // Formulas' More Calculation Options and its precision warning (#674).
+    if let Some(done) = crate::sheet_calc::click(tab, button) {
         return done;
     }
     // Go To's OK selects; its Special… opens Go To Special (#671).

@@ -978,6 +978,12 @@ pub(crate) fn status_items(tab: &DocTab, app_dialog: bool) -> Vec<(&'static str,
         ));
     }
     items.push(("message", tab.status.to_string()));
+    // Manual calculation with values out of date (#674).
+    if let Surface::Sheet(v) = &tab.surface {
+        if let Some(word) = crate::sheet_calc::status_word(v) {
+            items.push(("calculate", word.to_string()));
+        }
+    }
     if let Some(stats) = crate::doc_stats_text(tab) {
         items.push(("stats", stats));
     }

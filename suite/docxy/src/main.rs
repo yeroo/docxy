@@ -102,6 +102,7 @@ mod sheet_drag;
 /// and still far below what the quadratic version they guard took (minutes).
 #[cfg(test)]
 pub(crate) const PERF_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
+mod sheet_calc;
 #[cfg(test)]
 mod sheet_entry_tests;
 mod sheet_fill;
@@ -1039,6 +1040,11 @@ struct SheetSnapshot {
     /// one, the selection taken with the step. Carried to the other stack,
     /// so Redo selects what Undo did.
     target: Option<UndoTarget>,
+    /// Set precision as displayed (on, and the file's own `fullPrecision="0"`
+    /// kept), only in the snapshots of the step that switches it on (#674).
+    /// A restore leaves the workbook's calculation settings as they are now,
+    /// as an edit's undo does in Excel, except this one.
+    precision: Option<(bool, bool)>,
 }
 
 /// What an undo step's Undo and Redo select (#1148), as Excel's do: what
@@ -1200,6 +1206,9 @@ fn protected_view_allows_act(act: SheetAct) -> bool {
             | SheetAct::Help(_)
             | SheetAct::NewWindow
             | SheetAct::ArrangeAll
+            // Calculating changes no file; the mode and options do.
+            | SheetAct::Calc(sheet_calc::CalcAct::Now)
+            | SheetAct::Calc(sheet_calc::CalcAct::Sheet)
     )
 }
 
@@ -1294,7 +1303,9 @@ fn multi_area_ok(act: SheetAct) -> bool {
         // Page Layout (#1019): Set and Add to Print Area take every area,
         // as Excel's do; Breaks act at the active cell, and the rest are
         // the sheet's.
-        | SheetAct::Page(_) => true,
+        | SheetAct::Page(_)
+        // Calculation is the workbook's, never the selection's (#674).
+        | SheetAct::Calc(_) => true,
         // One rectangle only.
         SheetAct::Cut
         | SheetAct::Paste
@@ -1386,6 +1397,7 @@ fn act_targets_cells(act: SheetAct) -> bool {
             | SheetAct::CustomLists
             | SheetAct::NewWindow
             | SheetAct::ArrangeAll
+            | SheetAct::Calc(_)
             | SheetAct::Todo
     )
 }
@@ -2214,6 +2226,9 @@ enum SheetAct {
     /// A Page Layout tab command (#1019): page setup, print area, breaks,
     /// scale to fit and the print options.
     Page(sheet_page_setup::PageAct),
+    /// A Formulas › Calculation command (#674): the mode, Calculate Now and
+    /// Sheet, More Calculation Options....
+    Calc(sheet_calc::CalcAct),
     FormatCells,
     Merge,
     CondFormat,
@@ -2694,6 +2709,12 @@ impl SheetView {
         });
         let mut now = self.snapshot_like(&snap);
         now.target = Some(target.clone());
+        // The step that switched Set precision as displayed on carries the
+        // switch both ways, so Redo puts it back as Undo took it off.
+        now.precision = snap.precision.map(|_| {
+            let c = &self.pkg.workbook.calc;
+            (c.precision_as_displayed, c.precision_file_off)
+        });
         let sheets = self.pkg.workbook.sheets.len();
         self.restore(snap);
         if self.pkg.workbook.sheets.len() == sheets {
@@ -4133,6 +4154,7 @@ impl SheetView {
             anchor: self.anchor,
             areas: self.extra_areas(),
             target: None,
+            precision: None,
         }
     }
 
@@ -4140,9 +4162,19 @@ impl SheetView {
     fn restore(&mut self, snap: SheetSnapshot) {
         self.edit_gen += 1;
         let sheets = self.pkg.workbook.sheets.len();
+        // The calculation settings are not history's (#674): an undo keeps
+        // the mode and the iteration limits it finds, and takes Set precision
+        // as displayed back only with the step that switched it.
+        let (calc, iterate) = (self.pkg.workbook.calc.clone(), self.pkg.workbook.iterate);
         match snap.body {
             SnapshotBody::Workbook(wb) => self.pkg.workbook = wb,
             SnapshotBody::Package(pkg) => self.pkg = *pkg,
+        }
+        self.pkg.workbook.calc = calc;
+        self.pkg.workbook.iterate = iterate;
+        if let Some((on, file_off)) = snap.precision {
+            let c = &mut self.pkg.workbook.calc;
+            (c.precision_as_displayed, c.precision_file_off) = (on, file_off);
         }
         self.charts = snap.charts;
         self.pivot_views = snap.pivots;
@@ -19554,6 +19586,12 @@ impl Docxy {
                 }
                 cx.notify();
             }
+            SheetAct::Calc(c) => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    sheet_calc::run(tab, c);
+                }
+                cx.notify();
+            }
             SheetAct::FormatCells => self.sheet_format_cells(cx),
             SheetAct::Merge => self.sheet_merge_toggle(cx),
             SheetAct::WrapText => self.sheet_toggle_wrap(cx),
@@ -20098,6 +20136,13 @@ impl Docxy {
                     v.edit_eval_formula();
                 }
                 cx.notify();
+            }
+            // Calculate Sheet and Calculate Now (#674).
+            "f9" if shift && !ctrl && !alt => {
+                self.run_sheet_act(SheetAct::Calc(sheet_calc::CalcAct::Sheet), window, cx)
+            }
+            "f9" if !alt => {
+                self.run_sheet_act(SheetAct::Calc(sheet_calc::CalcAct::Now), window, cx)
             }
             // F4 while editing a formula cycles the anchoring of the reference
             // at the caret (A1, $A$1, A$1, $A1); anywhere else in the editor it
@@ -33105,6 +33150,7 @@ impl Docxy {
         match act {
             SheetAct::Filter => v.sheet().auto_filter.is_some(),
             SheetAct::Page(p) => sheet_page_setup::is_on(p, &v.pkg.workbook, v.active),
+            SheetAct::Calc(c) => sheet_calc::is_on(c, &v.pkg.workbook),
             _ => false,
         }
     }
@@ -36439,6 +36485,10 @@ impl Render for Docxy {
             })
             .when_some(self.active_sheet().and_then(sheet_circular_word), |d, w| {
                 d.child(div().id("status-circular").text_color(fg).child(w))
+            })
+            // Manual calculation with values out of date (#674).
+            .when_some(self.active_sheet().and_then(sheet_calc::status_word), |d, w| {
+                d.child(div().id("status-calculate").text_color(fg).child(w))
             })
             .child(div().flex_1())
             .child(if self.active_is_sheet() {

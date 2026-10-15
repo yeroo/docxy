@@ -1,0 +1,493 @@
+# GENERATED from suite/docxy/src/dialog/catalog/entries.rs by
+# `UPDATE_INPUTS_TYPING=1 cargo test --manifest-path suite/Cargo.toml
+# inputs_typing_case_is_current`; do not edit by hand (#1029).
+#
+# Every editable field of every sheet dialog, typed into with real keys
+# only: `real-key` and `real-type` go through the window's own input
+# path, and the field is focused by a real click or by Tab. A test is
+# one field and one step, named `<surface> <dialog>/<field>: <step>`.
+# See qa/inputs-typing.md.
+
+test sheet calc-options: matches the catalogue
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test sheet calc-options/max-iterations: focus by click
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"max-iterations"}
+  call field-read {"dialog-field":"max-iterations"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet calc-options/max-iterations: focus by Tab
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"max-change"}
+  call field-read {"dialog-field":"max-iterations"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"max-iterations"}
+  call field-read {"dialog-field":"max-iterations"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet calc-options/max-iterations: types
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"max-iterations"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"50"}
+  call field-read {"dialog-field":"max-iterations"}
+  assert reply.value is 50
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet calc-options/max-iterations: edits
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"max-iterations"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"max-iterations"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"max-iterations"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"max-iterations"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"max-iterations"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"max-iterations"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet calc-options/max-iterations: select-all replaces
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"max-iterations"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"max-iterations"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"max-iterations"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test sheet calc-options/max-iterations: pastes
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"max-iterations"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"max-iterations"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test sheet calc-options/max-iterations: copies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"max-iterations"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test sheet calc-options/max-iterations: OK applies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"max-iterations"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"50"}
+  call real-key {"key":"enter"}
+  assert dialog is not calc-options
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"max-iterations"}
+  assert reply.value is 50
+  call real-key {"key":"escape"}
+
+test sheet calc-options/max-iterations: Escape cancels
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"max-iterations"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not calc-options
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"max-iterations"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test sheet calc-options/max-iterations: refuses invalid
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"max-iterations"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"50"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"max-iterations"}
+  assert reply.value is 50
+  call real-key {"key":"escape"}
+
+test sheet calc-options/max-change: focus by click
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"max-change"}
+  call field-read {"dialog-field":"max-change"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet calc-options/max-change: focus by Tab
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"max-iterations"}
+  call field-read {"dialog-field":"max-change"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"max-change"}
+  call field-read {"dialog-field":"max-change"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet calc-options/max-change: types
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"max-change"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"0.5"}
+  call field-read {"dialog-field":"max-change"}
+  assert reply.value is 0.5
+  assert reply.caret is 3
+  call real-key {"key":"escape"}
+
+test sheet calc-options/max-change: edits
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"max-change"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"max-change"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"max-change"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"max-change"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"max-change"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"max-change"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet calc-options/max-change: select-all replaces
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"max-change"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"max-change"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"max-change"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test sheet calc-options/max-change: pastes
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"max-change"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"max-change"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test sheet calc-options/max-change: copies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"max-change"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test sheet calc-options/max-change: OK applies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"max-change"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"0.5"}
+  call real-key {"key":"enter"}
+  assert dialog is not calc-options
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"max-change"}
+  assert reply.value is 0.5
+  call real-key {"key":"escape"}
+
+test sheet calc-options/max-change: Escape cancels
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"max-change"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not calc-options
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"max-change"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test sheet calc-options/max-change: refuses invalid
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"max-change"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"0.5"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"max-change"}
+  assert reply.value is 0.5
+  call real-key {"key":"escape"}
+
+test sheet calc-options/threads: focus by click
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"threads"}
+  call field-read {"dialog-field":"threads"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet calc-options/threads: focus by Tab
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"max-iterations"}
+  call field-read {"dialog-field":"threads"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"threads"}
+  call field-read {"dialog-field":"threads"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet calc-options/threads: types
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"threads"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call field-read {"dialog-field":"threads"}
+  assert reply.value is 2
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test sheet calc-options/threads: edits
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"threads"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"threads"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"threads"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"threads"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"threads"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"threads"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test sheet calc-options/threads: select-all replaces
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"threads"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"threads"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"threads"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test sheet calc-options/threads: pastes
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"threads"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"threads"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test sheet calc-options/threads: copies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"threads"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test sheet calc-options/threads: OK applies
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"threads"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-key {"key":"enter"}
+  assert dialog is not calc-options
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"threads"}
+  assert reply.value is 2
+  call real-key {"key":"escape"}
+
+test sheet calc-options/threads: Escape cancels
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"threads"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not calc-options
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"threads"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test sheet calc-options/threads: refuses invalid
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  assert dialog is calc-options
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"threads"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"threads"}
+  assert reply.value is 2
+  call real-key {"key":"escape"}
+
+test sheet precision-warning: matches the catalogue
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
+  call pointer-click {"dialog-control":"precision"}
+  call dialog-click {"button":"OK"}
+  assert dialog is precision-warning
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}

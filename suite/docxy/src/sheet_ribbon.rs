@@ -18,9 +18,11 @@
 //! with a fourth row does not compile (#1018).
 
 use crate::help_tab::HelpAct;
+use crate::sheet_calc::CalcAct;
 use crate::sheet_menus::SheetMenu;
 use crate::sheet_page_setup::{AreaOp, BreakOp, MarginPreset, PageAct, SetupTab};
 use crate::{RibbonTab, SheetAct, SumFn};
+use gridcore::sheet::CalcMode;
 
 /// A flex gap, in the unit the hand-drawn ribbon used for it (`gap_1` is a
 /// rem quarter, `gap(px(1.))` is a pixel), so the table draws the same pixels.
@@ -1109,17 +1111,48 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                 body: Body::Strip {
                     gap: GAP_1,
                     items: &[
-                        Item::One(large(
+                        menu(
                             "calculation-options",
                             "Calculation Options",
                             None,
-                            SheetAct::Todo,
-                        )),
+                            &[
+                                menu_item(
+                                    "calc-automatic",
+                                    "Automatic",
+                                    SheetAct::Calc(CalcAct::Mode(CalcMode::Auto)),
+                                ),
+                                menu_item(
+                                    "calc-automatic-except-tables",
+                                    "Automatic Except for Data Tables",
+                                    SheetAct::Calc(CalcAct::Mode(CalcMode::AutoNoTable)),
+                                ),
+                                menu_item(
+                                    "calc-manual",
+                                    "Manual",
+                                    SheetAct::Calc(CalcAct::Mode(CalcMode::Manual)),
+                                ),
+                                menu_item(
+                                    "more-calculation-options",
+                                    "More Calculation Options...",
+                                    SheetAct::Calc(CalcAct::Dialog),
+                                ),
+                            ],
+                        ),
                         col(
                             COL,
                             &[
-                                row("calculate-now", "Calculate Now", None, SheetAct::Todo),
-                                row("calculate-sheet", "Calculate Sheet", None, SheetAct::Todo),
+                                row(
+                                    "calculate-now",
+                                    "Calculate Now",
+                                    None,
+                                    SheetAct::Calc(CalcAct::Now),
+                                ),
+                                row(
+                                    "calculate-sheet",
+                                    "Calculate Sheet",
+                                    None,
+                                    SheetAct::Calc(CalcAct::Sheet),
+                                ),
                             ],
                         ),
                     ],
@@ -1721,9 +1754,6 @@ mod tests {
                 "error-checking",
                 "evaluate-formula",
                 "watch-window",
-                "calculation-options",
-                "calculate-now",
-                "calculate-sheet",
                 "spelling",
                 "protect-workbook",
                 // Help (#1021): nothing to show yet.
@@ -1971,7 +2001,15 @@ mod tests {
                 ),
                 (
                     "Calculation",
-                    vec!["Calculation Options", "Calculate Now", "Calculate Sheet"]
+                    vec![
+                        "Calculation Options",
+                        "Automatic",
+                        "Automatic Except for Data Tables",
+                        "Manual",
+                        "More Calculation Options...",
+                        "Calculate Now",
+                        "Calculate Sheet",
+                    ]
                 ),
             ]
         );
@@ -2044,7 +2082,7 @@ mod tests {
             "Trace Precedents",
             "Name Manager",
             "Show Formulas",
-            "Calculate Now",
+            "Watch Window",
         ] {
             assert_eq!(
                 resolve_on(f, "Formulas", q, off).unwrap_err(),
