@@ -6981,7 +6981,11 @@ impl App {
         }
         self.doc_hscroll = self.comments_hscroll as u16;
 
-        let rlines: Vec<_> = visible.iter().map(doc_line_to_ratatui).collect();
+        let shade_light = self.light_page || self.page_view && self.pkg.page_background().is_some();
+        let rlines: Vec<_> = visible
+            .iter()
+            .map(|l| doc_line_to_ratatui(l, shade_light))
+            .collect();
         // A set page colour tints the page sheet in Print Layout (in both
         // terminal themes), with the ink picked by the sheet's luminance; the
         // centering margins and inter-page gaps stay black. Otherwise: light
@@ -8299,7 +8303,11 @@ fn rgb_color(rgb: u32) -> Color {
 /// its colour). Fully-blank lines (the gaps between pages) become all black.
 fn paint_page(line: RLine<'static>, sheet: Color, ink: Color) -> RLine<'static> {
     let paint = |sp: RSpan<'static>| -> RSpan<'static> {
-        let mut st = sp.style.bg(sheet);
+        // A field's shade (#1243) is already a background: keep it.
+        let mut st = sp.style;
+        if st.bg.is_none() {
+            st = st.bg(sheet);
+        }
         if st.fg.is_none() {
             st = st.fg(ink);
         }
@@ -8336,7 +8344,11 @@ fn paint_page_on_black(line: RLine<'static>) -> RLine<'static> {
     paint_page(line, Color::White, Color::Black)
 }
 
-fn doc_line_to_ratatui(line: &DocLine) -> RLine<'static> {
+/// Style one rendered line. A field's result is shaded grey (#1243): 238 under
+/// the terminal's own foreground, or on a light sheet (`light`, which includes
+/// a page colour) 253 with the text forced black unless the run has its own
+/// colour, since a page colour may have picked white ink. Selection wins.
+fn doc_line_to_ratatui(line: &DocLine, light: bool) -> RLine<'static> {
     let spans: Vec<RSpan<'static>> = line
         .spans
         .iter()
@@ -8366,6 +8378,12 @@ fn doc_line_to_ratatui(line: &DocLine) -> RLine<'static> {
             if let Some(c) = st.color {
                 if c != DocColor::Black {
                     style = style.fg(map_color(c));
+                }
+            }
+            if st.field && !st.highlight {
+                style = style.bg(Color::Indexed(if light { 253 } else { 238 }));
+                if light && style.fg.is_none() {
+                    style = style.fg(Color::Black);
                 }
             }
             RSpan::styled(s.text.clone(), style)
@@ -12319,11 +12337,68 @@ mod tests {
                 },
             ],
         };
-        let rl = doc_line_to_ratatui(&line);
+        let rl = doc_line_to_ratatui(&line, false);
         // black → no fg (terminal default, so it's visible on a dark background)
         assert_eq!(rl.spans[0].style.fg, None);
         // other colors still map
         assert_eq!(rl.spans[1].style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn a_field_span_is_shaded_unless_selected_1243() {
+        use docxcore::render::{Line as DL, Span as DS, Style as DST};
+        let line = DL {
+            spans: vec![
+                DS {
+                    text: "a".into(),
+                    style: DST::default(),
+                    link: None,
+                },
+                DS {
+                    text: "7".into(),
+                    style: DST {
+                        field: true,
+                        ..Default::default()
+                    },
+                    link: None,
+                },
+                DS {
+                    text: "r".into(),
+                    style: DST {
+                        field: true,
+                        color: Some(DocColor::Red),
+                        ..Default::default()
+                    },
+                    link: None,
+                },
+                DS {
+                    text: "s".into(),
+                    style: DST {
+                        field: true,
+                        highlight: true,
+                        ..Default::default()
+                    },
+                    link: None,
+                },
+            ],
+        };
+        let dark = doc_line_to_ratatui(&line, false);
+        assert_eq!(dark.spans[0].style.bg, None);
+        assert_eq!(dark.spans[1].style.bg, Some(Color::Indexed(238)));
+        assert_eq!(dark.spans[1].style.fg, None);
+        let light = doc_line_to_ratatui(&line, true);
+        assert_eq!(light.spans[1].style.bg, Some(Color::Indexed(253)));
+        assert_eq!(light.spans[1].style.fg, Some(Color::Black));
+        assert_eq!(light.spans[2].style.fg, Some(Color::Red));
+        for l in [&dark, &light] {
+            assert_eq!(l.spans[3].style.bg, None);
+            assert!(l.spans[3].style.add_modifier.contains(Modifier::REVERSED));
+        }
+        // paint_page keeps the field's own shade and ink on a dark page colour.
+        let painted = paint_page(light, Color::Rgb(0, 0, 80), Color::White);
+        assert_eq!(painted.spans[1].style.bg, Some(Color::Indexed(253)));
+        assert_eq!(painted.spans[1].style.fg, Some(Color::Black));
+        assert_eq!(painted.spans[0].style.bg, Some(Color::Rgb(0, 0, 80)));
     }
 
     #[test]

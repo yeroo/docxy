@@ -88,6 +88,9 @@ pub struct Style {
     /// Selected text (drawn reversed by the TUI).
     pub highlight: bool,
     pub color: Option<Color>,
+    /// A field's result (#1243): hosts shade it so it reads as a field before
+    /// it is selected. A flag, not a colour; text, tabs and runs never set it.
+    pub field: bool,
 }
 
 fn dim_style() -> Style {
@@ -1261,6 +1264,7 @@ fn style_from_run(p: &RunProps) -> Style {
         // reversed video (same as a selection).
         highlight: p.highlight.is_some(),
         color: p.color.as_deref().and_then(parse_hex).map(quantize),
+        field: false,
     }
 }
 
@@ -1750,6 +1754,7 @@ fn flatten_para(
                 if heading {
                     st.bold = true;
                 }
+                st.field = true;
                 st.highlight |= sel_at(mc);
                 for ch in text.chars() {
                     let (ch, disp) = if ch == ' ' {
@@ -1787,6 +1792,7 @@ fn flatten_para(
                         if fi.link.is_some() {
                             st.color = Some(Color::Cyan);
                         }
+                        st.field = true;
                         for ch in text.chars() {
                             segs.last_mut().unwrap().glyphs.push(Glyph {
                                 ch,
@@ -4720,6 +4726,54 @@ mod tests {
             .map(|s| s.text.as_str())
             .collect();
         assert_eq!(highlighted, "Page 1");
+    }
+
+    #[test]
+    fn only_a_fields_result_glyphs_are_flagged_field_1243() {
+        let d = doc(vec![para(vec![
+            run("a", RunProps::default()),
+            Inline::Tab(RunProps::default()),
+            field_642("Page 1"),
+            run("b", RunProps::default()),
+            Inline::Revision {
+                kind: RevisionKind::Insert,
+                metadata: RevisionMetadata::default(),
+                raw: "<w:ins/>".into(),
+                content: vec![field_642("9")],
+                content_changed: false,
+            },
+        ])]);
+        let lines = render(&d, &opts(40));
+        let shaded: String = lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.style.field)
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(shaded.replace('\u{00a0}', " "), "Page 19");
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .filter(|s| !s.style.field)
+                .all(|s| s.text.trim() == "a" || s.text.trim().is_empty() || s.text == "b")
+        );
+        // Shading changes nothing the text, offsets or widths see.
+        assert_eq!(lines[0].plain(), "a       Page 1b9");
+    }
+
+    #[test]
+    fn a_selected_field_is_both_highlighted_and_flagged_1243() {
+        let d = doc(vec![para(vec![
+            run("Body", RunProps::default()),
+            field_642("Page 1"),
+        ])]);
+        let mut o = opts(40);
+        o.selection = vec![(vec![0], 4, 5)];
+        let lines = render(&d, &o);
+        let f = lines[0].spans.iter().find(|s| s.style.field).unwrap();
+        assert!(f.style.highlight);
+        assert!(!lines[0].spans[0].style.field);
     }
 
     #[test]
