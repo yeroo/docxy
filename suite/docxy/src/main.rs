@@ -5323,6 +5323,8 @@ struct Docxy {
     // time), so the render below only calls set_window_title when the
     // computed title changed.
     last_window_title: Option<String>,
+    /// The accent this window's last render set (#1473), for the harness.
+    drawn_accent: u32,
 }
 
 /// Where the regions a harness test can name actually landed, as gpui measured
@@ -12796,18 +12798,18 @@ fn title_bar_geometry(window: &Window) -> f32 {
     )
 }
 
-/// The brand label's absolute cap: a window title is information, not
-/// chrome, so it never gets more than this before it starts clipping.
+/// The title label's absolute cap: the one-word type label (#1473) never
+/// gets more than this before it starts clipping.
 const TITLE_LABEL_MAX_W: f32 = 260.0;
 
 /// The QAT's widest form, for the label cap below: two 20px buttons with a
 /// 2px gap, the 10px Undo split arrow, and the cluster's 8px gap before it.
 const TITLE_QAT_MAX_W: f32 = 20.0 + 2.0 + 20.0 + 10.0 + 8.0;
 
-/// The left chrome's width cap and the brand label's cap inside it. The cap
+/// The left chrome's width cap and the title label's cap inside it. The cap
 /// reserves the theme button, the drag region's minimum and the strip's More
-/// button plus a floor-width chip before the label, so a long window title
-/// starves the label, never the strip (#588 r1 m6). `theme_w` is the theme
+/// button plus a floor-width chip before the label, so the label starves
+/// before the strip does (#588 r1 m6). `theme_w` is the theme
 /// button's width from the last frame, exactly as the `avail` below consumes
 /// it.
 ///
@@ -13138,6 +13140,7 @@ impl Docxy {
             probes: Default::default(),
             frame: 0,
             last_window_title: None,
+            drawn_accent: BRAND,
         }
     }
 
@@ -13620,7 +13623,7 @@ impl Docxy {
                 .px_2()
                 .rounded(px(3.))
                 .border_1()
-                .border_color(hsla_u(BRAND))
+                .border_color(hsla_u(accent::brand()))
                 .text_color(fg)
                 .child(text)
         };
@@ -13646,7 +13649,7 @@ impl Docxy {
             .child(
                 div()
                     .text_size(px(13.))
-                    .text_color(rgb(BRAND))
+                    .text_color(rgb(accent::brand()))
                     .mt_4()
                     .child("Sheet editing"),
             )
@@ -16905,10 +16908,13 @@ impl Docxy {
     }
 
     /// The accent of the selected tab's type on the drawn theme (#1473).
+    /// The dark flag comes from the preference, not `applied`: render sets
+    /// the accent before `apply_theme` runs, and `applied` is still `None` on
+    /// the first frame and stale after a theme switch.
     pub(crate) fn accent_now(&self) -> u32 {
         accent::for_kind(
             self.tabs.get(self.active).map(|t| t.kind),
-            self.applied == Some(ThemeMode::Dark),
+            self.theme_pref.resolve(self.os_appearance) == ThemeMode::Dark,
         )
     }
 
@@ -33053,7 +33059,7 @@ impl Docxy {
                     .border_1()
                     .border_color(pal.border)
                     .bg(hsla_u(0xffffff))
-                    .hover(|d| d.border_color(hsla_u(BRAND)))
+                    .hover(|d| d.border_color(hsla_u(accent::brand())))
                     .child(
                         div()
                             .text_size(px(11.))
@@ -35533,7 +35539,8 @@ impl Render for Docxy {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The ribbon, backstage and title bar draw the selected tab's accent
         // (#1473); set it before any of them is built.
-        accent::set(self.accent_now());
+        self.drawn_accent = self.accent_now();
+        accent::set(self.drawn_accent);
         HL_CURSOR.store(
             self.hl_mode.as_ref().is_some_and(|m| m.tab == self.active),
             std::sync::atomic::Ordering::Relaxed,
@@ -35657,8 +35664,8 @@ impl Render for Docxy {
         drop(chrome);
         // The left chrome yields before the tab strip does: the cap reserves
         // the theme button, the drag region's minimum and the strip's More
-        // button plus a floor-width chip, so a long window title starves the
-        // label, never the strip (#588 r1 m6).
+        // button plus a floor-width chip, so the label starves before the
+        // strip does (#588 r1 m6).
         let (left_cap, label_cap) = title_left_caps(title_w, theme_w);
         // Four children, three 8px gaps, plus our 8px left padding.
         let avail =

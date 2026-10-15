@@ -3913,7 +3913,7 @@ fn tab_list(
     tabs: &[crate::DocTab],
     active: usize,
     os_title: Option<&str>,
-    dark: bool,
+    accent: u32,
     drawn_accent: u32,
 ) -> Json {
     let kind = tabs.get(active).map(|t| t.kind);
@@ -3947,10 +3947,7 @@ fn tab_list(
         // (#1473). `accent` is computed from the tab; `drawn_accent` is what
         // the last render set, so a render that stops following the tab shows.
         ("title_label", Json::Str(crate::accent::label(kind).into())),
-        (
-            "accent",
-            Json::Str(hex(crate::accent::for_kind(kind, dark))),
-        ),
+        ("accent", Json::Str(hex(accent))),
         ("drawn_accent", Json::Str(hex(drawn_accent))),
         // `last_window_title`, the cache render updates beside its
         // `set_window_title` call: not recomputed from the tabs, so it catches
@@ -4149,8 +4146,8 @@ fn dispatch_verb(
             &app.tabs,
             app.active,
             app.last_window_title.as_deref(),
-            app.applied == Some(gpui_component::ThemeMode::Dark),
-            crate::accent::brand(),
+            app.accent_now(),
+            app.drawn_accent,
         )),
         // The run's windows (#587). These go through the same handlers as
         // View › Window: `window-new` is the New Window command (it moves
@@ -6671,7 +6668,7 @@ mod tests {
             &[word, book, blank, mpp, inbox],
             2,
             Some("Project1  -  docxy"),
-            false,
+            crate::BRAND,
             crate::BRAND,
         );
         assert_eq!(list.get_str("os_title"), Some("Project1  -  docxy"));

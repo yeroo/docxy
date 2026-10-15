@@ -132,6 +132,7 @@
   File text at 4.5:1). `Docxy::render` calls `accent::set` before building any
   chrome and the ribbon, backstage and title bar read `accent::brand()`; every
   other `BRAND` use (dialogs, comment and find bars, carets, Gantt) is not
-  accent. A hover closure reads it at paint, still inside that window's draw.
-  `tab-list` reports `title_label`, `accent` (from the tab) and `drawn_accent`
-  (what the last render set); `uiharness/cases/title-accent.uit` asserts them.
+  accent. A `.hover` style is built at once, so it reads the accent during
+  render too. `accent_now` takes the theme from the preference, as render sets
+  the accent before `apply_theme`. `tab-list` reports `title_label`, `accent`
+  (from the tab) and `drawn_accent` (what this window's last render set); `uiharness/cases/title-accent.uit` asserts them.

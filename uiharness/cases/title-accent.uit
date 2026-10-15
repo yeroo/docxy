@@ -51,3 +51,11 @@ test issue 1473 each tab type shows its label and accent, per theme
   call tab-list {}
   assert reply.drawn_accent is "#2aa79b"
   call theme-set {"theme":"auto"}
+  # The accent follows the preference at once, with no frame in between.
+  call tab-select {"tab":1}
+  call appearance-set {"appearance":"dark"}
+  call tab-list {}
+  assert reply.accent is "#23843f"
+  call appearance-set {"appearance":"light"}
+  call tab-list {}
+  assert reply.accent is "#1e7b3a"

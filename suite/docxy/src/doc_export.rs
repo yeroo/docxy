@@ -272,7 +272,7 @@ impl Docxy {
                     .border_1()
                     .border_color(dim)
                     .cursor_pointer()
-                    .hover(|d| d.border_color(rgb(BRAND)))
+                    .hover(|d| d.border_color(rgb(crate::accent::brand())))
                     .child(
                         div()
                             .text_color(fg)
@@ -301,7 +301,7 @@ impl Docxy {
                 .child(
                     div()
                         .text_size(px(13.))
-                        .text_color(rgb(BRAND))
+                        .text_color(rgb(crate::accent::brand()))
                         .child("Change File Type"),
                 )
                 .child(rows)
@@ -333,7 +333,7 @@ impl Docxy {
                     .cursor_pointer()
                     .rounded_sm()
                     .text_color(fg)
-                    .hover(|d| d.text_color(rgb(BRAND)))
+                    .hover(|d| d.text_color(rgb(crate::accent::brand())))
                     .child(format!(
                         "{} {}",
                         Kind::Docx.glyph(),
@@ -349,7 +349,7 @@ impl Docxy {
             .child(
                 div()
                     .text_size(px(13.))
-                    .text_color(rgb(BRAND))
+                    .text_color(rgb(crate::accent::brand()))
                     .mt_4()
                     .child("Personal templates"),
             )
