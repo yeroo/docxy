@@ -862,10 +862,12 @@ pub enum Region {
     /// split arrow (`qat-undo-arrow`, `qat-redo-arrow`), by its probe
     /// (#1149).
     Qat(&'static str),
-    /// A point on a top-level body paragraph's visual row: its first
-    /// character's left edge (`end` false) or its last character's right edge
-    /// (`end` true), at the row's vertical middle. Addressed by block index
-    /// and row (`doc-line-start:3`, `doc-line-end:3:1`; #1472).
+    /// A point on a top-level body paragraph's visual row, at the row's
+    /// vertical middle: the left edge of its first painted piece (a word, tab,
+    /// field, picture or equation; `end` false) or the right edge of its last
+    /// (`end` true). Addressed by block index and row (`doc-line-start:3`,
+    /// `doc-line-end:3:1`); a row with no painted piece is not counted
+    /// (#1472).
     DocLine {
         block: usize,
         row: usize,

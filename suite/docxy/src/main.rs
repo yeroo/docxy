@@ -30589,7 +30589,10 @@ fn paragraph_el(
     // The whole paragraph area is a press fallback (empty space past the text, the
     // indent gutter): it lands at the end or start of the line it is beside, else
     // at the paragraph end. Word, tab, field and picture presses fire first and
-    // stop propagation, so this only runs on a press beside the text.
+    // stop propagation, so this only runs on a press beside the text, or on a
+    // piece that takes no offset or press of its own (tracked-change text, a
+    // footnote number, a comment badge, an empty field), which stays a plain
+    // caret at the paragraph end.
     let para_end = idx;
     // Space before / after the paragraph (`w:spacing` before/after, twips → px).
     let sp_before = zoom * (p.props.spacing.before.unwrap_or(0).max(0) as f32) / 15.0;
@@ -30609,16 +30612,17 @@ fn paragraph_el(
             let words = c.words.clone();
             // Beside a line (right of its text, or its indent gutter) a press
             // lands at that line's end or start and starts a drag, as a press
-            // on a word does; with no painted words it is the paragraph end.
+            // on a word does. Anywhere else (no line beside the point) it is a
+            // caret at the paragraph end, as before, with no drag.
             d.cursor_text()
                 .on_mouse_down(MouseButton::Left, {
                     let (ent, path, words) = (ent.clone(), path.clone(), words.clone());
                     move |ev, window, cx| {
                         let extend = ev.modifiers.shift;
-                        let off =
-                            words_line_end_hit(&words, ev.position, para_end).unwrap_or(para_end);
-                        ent.update(cx, |this, cx| {
-                            this.begin_select(path.clone(), off, extend, window, cx)
+                        let hit = words_line_end_hit(&words, ev.position, para_end);
+                        ent.update(cx, |this, cx| match hit {
+                            Some(off) => this.begin_select(path.clone(), off, extend, window, cx),
+                            None => this.set_caret(path.clone(), para_end, extend, window, cx),
                         });
                     }
                 })
