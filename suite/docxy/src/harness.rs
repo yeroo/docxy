@@ -865,7 +865,7 @@ pub enum Region {
     /// A point on a top-level body paragraph's visual row, at the row's
     /// vertical middle: the left edge of its first painted piece (a word, tab,
     /// field, picture or equation; `end` false) or the right edge of its last
-    /// (`end` true). Addressed by block index and row (`doc-line-start:3`,
+    /// (`end` true) plus 4px, so it is in the blank area past the row. Addressed by block index and row (`doc-line-start:3`,
     /// `doc-line-end:3:1`); a row with no painted piece is not counted
     /// (#1472).
     DocLine {

@@ -7328,8 +7328,10 @@ fn doc_line_point(block: usize, row: usize, end: bool) -> Option<Bounds<Pixels>>
     }
     let r = rows.get(row)?;
     let y = r[0].center().y;
+    // The end is a few px past the last piece, so a press there is in the
+    // blank area whatever the font's rounding at the piece's edge.
     let x = if end {
-        r.iter().map(|b| b.right()).fold(px(f32::MIN), Pixels::max)
+        r.iter().map(|b| b.right()).fold(px(f32::MIN), Pixels::max) + px(4.)
     } else {
         r.iter().map(|b| b.left()).fold(px(f32::MAX), Pixels::min)
     };

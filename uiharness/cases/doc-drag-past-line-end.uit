@@ -19,6 +19,10 @@ test a drag starting past the line end, right to left, selects
   call pointer-drag {"from":"doc-line-end:0","to":"doc-line-start:0","offset":[-2,0]}
   assert sel.start is 0
   assert sel.end is 16
+
+test a drag starting just past the last character, to the line start, selects
+  open copy:../fixtures/basic.docx
+  type A bulleted list:
   call pointer-drag {"from":"doc-line-end:0","to":"doc-line-start:0"}
   assert sel.start is 0
   assert sel.end is 16
@@ -38,6 +42,10 @@ test a drag between characters is unchanged
   assert sel.start is 0
   assert sel.end is not 16
   assert sel.end is not 0
+
+test a right-to-left drag from past the line ends the selection at the line end
+  open copy:../fixtures/basic.docx
+  type A bulleted list:
   call pointer-drag {"from":"doc-line-end:0","to":"doc-line-start:0","offset":[60,0]}
   assert sel.end is 16
   assert sel.start is not 0
@@ -75,6 +83,9 @@ test a line ending in a field takes a press and a drag past it after the field
   assert sel.end is 22
   call pointer-drag {"from":"doc-line-start:1","to":"doc-line-end:1","offset":[200,0]}
   assert sel.end is 22
+
+test a right-to-left drag from past a line ending in a field starts after the field
+  open copy:../fixtures/fields.docx
   call pointer-drag {"from":"doc-line-end:1","to":"doc-line-start:1","offset":[30,0]}
   assert sel.end is 22
   assert sel.start is not 22
