@@ -89,3 +89,17 @@ test a right-to-left drag from past a line ending in a field starts after the fi
   call pointer-drag {"from":"doc-line-end:1","to":"doc-line-start:1","offset":[30,0]}
   assert sel.end is 22
   assert sel.start is not 22
+
+test a drag ending in the margin left of the line selects to the line start
+  open copy:../fixtures/basic.docx
+  type A bulleted list:
+  call pointer-drag {"from":"doc-line-end:0","to":"doc-line-start:0","offset":[-30,0]}
+  assert sel.start is 0
+  assert sel.end is 16
+
+test a drag ending in the margin right of the line selects to the line end
+  open copy:../fixtures/basic.docx
+  type A bulleted list:
+  call pointer-drag {"from":"doc-line-start:0","to":"doc-line-end:0","offset":[400,0]}
+  assert sel.start is 0
+  assert sel.end is 16

@@ -7362,6 +7362,18 @@ fn words_line_end_hit(words: &WordSpans, pos: Point<Pixels>, para_end: usize) ->
     line_end_hit(&boxes, pos, tail_end, para_end)
 }
 
+/// Where a text drag lands when its pointer is on no paragraph: level with a
+/// top-level body paragraph's row but outside the paragraph (the page margin),
+/// the block and the row's first or last caret stop (#1472).
+fn margin_drag_hit(pos: Point<Pixels>) -> Option<(usize, usize)> {
+    DOC_WORDS.with(|d| {
+        d.borrow().iter().find_map(|(block, words)| {
+            let tail = words.borrow().iter().map(|w| w.off + w.len).max()?;
+            words_line_end_hit(words, pos, tail).map(|off| (*block, off))
+        })
+    })
+}
+
 /// Record a unit (a tab, field, picture or equation) at `off` as one caret
 /// stop of the paragraph, and give back the probe to put inside it (its parent
 /// must be `relative`); `None` where nothing is clickable (#1472).
@@ -30629,13 +30641,18 @@ fn paragraph_el(
                     }
                 })
                 .on_mouse_move(move |ev, _window, cx| {
-                    if let Some(off) = words_line_end_hit(&words, ev.position, para_end) {
-                        let path = path.clone();
-                        ent.update(cx, move |this, cx| {
-                            if this.selecting {
-                                this.extend_select(path, off, cx);
-                            }
-                        });
+                    let hit = words_line_end_hit(&words, ev.position, para_end);
+                    let path = path.clone();
+                    let selecting = ent.update(cx, move |this, cx| {
+                        if let (true, Some(off)) = (this.selecting, hit) {
+                            this.extend_select(path, off, cx);
+                        }
+                        this.selecting
+                    });
+                    // A paragraph under the pointer owns the drag; the window's
+                    // handler for a pointer on no paragraph stays out.
+                    if selecting {
+                        cx.stop_propagation();
                     }
                 })
         })
@@ -37104,6 +37121,14 @@ impl Render for Docxy {
             // hitbox-scoped, so a ruler-only handler would stop the moment the
             // cursor moved off it).
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
+                // A text drag whose pointer is on no paragraph (the page
+                // margin, between paragraphs): no word or paragraph handler
+                // ran, so it lands on the row it is level with (#1472).
+                if this.selecting && this.hl_mode.is_none() {
+                    if let Some((block, off)) = margin_drag_hit(ev.position) {
+                        this.extend_select(vec![block], off, cx);
+                    }
+                }
                 if this.ruler_drag.is_some() {
                     this.ruler_drag_move(f32::from(ev.position.x), window, cx);
                 }
