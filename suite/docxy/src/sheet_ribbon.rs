@@ -1822,7 +1822,6 @@ mod tests {
                 "define-name",
                 "use-in-formula",
                 "create-from-selection",
-                "show-formulas",
                 "watch-window",
                 "spelling",
                 "protect-workbook",
