@@ -2330,7 +2330,8 @@ enum SheetAct {
     FlashSelectChanged,
     /// A Help tab command (#1021): the document ribbon's, run the same way.
     Help(help_tab::HelpAct),
-    /// A command of the error smart tag's menu (#675).
+    /// A formula-auditing command (#675): the error smart tag's menu, the
+    /// Formulas › Formula Auditing group and Ctrl+[ / Ctrl+].
     Audit(sheet_audit::AuditAct),
     Todo,
 }

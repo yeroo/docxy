@@ -73,6 +73,7 @@ fn set_mode(tab: &mut DocTab, m: CalcMode) -> Result<(), String> {
         return Ok(());
     }
     calc::set_mode(&mut v.pkg.workbook, &mut v.engine, m);
+    v.recalculated();
     tab.set_dirty();
     tab.status = format!("Calculation: {}", mode_name(m)).into();
     Ok(())
@@ -88,7 +89,7 @@ fn calculate_now(tab: &mut DocTab) -> Result<(), String> {
     let was_stale = v.engine.is_stale();
     let outcome = calc::calculate_now(&mut v.pkg.workbook, &mut v.engine, !protected);
     // The values moved: what Error Checking found is out of date (#675).
-    v.edit_gen += 1;
+    v.recalculated();
     if !protected && (was_stale || !outcome.changed.is_empty()) {
         tab.set_dirty();
     }
@@ -102,7 +103,7 @@ fn calculate_sheet(tab: &mut DocTab) -> Result<(), String> {
     let s = v.active;
     let was_stale = v.engine.stale_on_sheet(s) > 0;
     v.engine.recalc_sheet(&mut v.pkg.workbook, s);
-    v.edit_gen += 1;
+    v.recalculated();
     let name = v.pkg.workbook.sheets[s].name.clone();
     if was_stale {
         tab.set_dirty();
@@ -302,6 +303,7 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
             }
             let before = calc::info(&v.pkg.workbook, &v.engine);
             calc::apply_settings(&mut v.pkg.workbook, &mut v.engine, &now);
+            v.recalculated();
             let changed = calc::info(&v.pkg.workbook, &v.engine) != before;
             tab.dialogs.pop();
             if converts {

@@ -1943,7 +1943,7 @@ fn shift_rules(sheet: &mut Sheet, home_is_target: bool, target: &str, shift: &Ed
                     }
                 })
                 .collect();
-            !e.sqref.is_empty()
+            !(e.sqref.is_empty() && e.unparsed.is_empty())
         });
     }
     let removed = &mut sheet.cf_removed;

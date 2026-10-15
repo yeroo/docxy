@@ -539,3 +539,52 @@ fn calculate_now_in_protected_view_keeps_pivots_and_the_tab_clean() {
     assert_eq!(value(&mut t, "E2"), CellValue::Number(10.0));
     assert!(t.dirty);
 }
+
+// ---- #675: what Error Checking found, and what a recalculation keeps -------
+
+#[test]
+fn the_error_flags_refresh_when_manual_mode_goes_back_to_automatic() {
+    let mut t = tab();
+    type_into(&mut t, "B1", "1");
+    type_into(&mut t, "A1", "=1/B1");
+    run(&mut t, CalcAct::Mode(CalcMode::Manual));
+    type_into(&mut t, "B1", "0");
+    // The stale 1 is still what A1 shows, and the flags are read from it.
+    assert!(view(&mut t).cell_flags(0, 0).is_empty());
+    run(&mut t, CalcAct::Mode(CalcMode::Auto));
+    assert_eq!(
+        view(&mut t).cell_flags(0, 0),
+        vec![gridcore::audit::Rule::ErrorValue],
+        "#DIV/0! now"
+    );
+    // Calculate Now refreshes them too, in both directions.
+    run(&mut t, CalcAct::Mode(CalcMode::Manual));
+    type_into(&mut t, "B1", "2");
+    assert!(
+        !view(&mut t).cell_flags(0, 0).is_empty(),
+        "stale: still an error"
+    );
+    run(&mut t, CalcAct::Now);
+    assert!(view(&mut t).cell_flags(0, 0).is_empty());
+    type_into(&mut t, "B1", "0");
+    run(&mut t, CalcAct::Sheet);
+    assert!(!view(&mut t).cell_flags(0, 0).is_empty());
+}
+
+#[test]
+fn calculate_now_and_sheet_leave_a_pending_cut_and_the_fill_buttons_alone() {
+    let mut t = manual_book();
+    let v = view(&mut t);
+    v.anchor = (0, 0);
+    v.sel = (1, 0);
+    let clip = v.grid_clip(true).expect("something to cut");
+    assert!(!clip.stale_in(v));
+    let before = v.edit_gen;
+    run(&mut t, CalcAct::Now);
+    run(&mut t, CalcAct::Sheet);
+    run(&mut t, CalcAct::Mode(CalcMode::Auto));
+    let v = view(&mut t);
+    assert_eq!(v.edit_gen, before, "no undo step, no edit");
+    assert!(!clip.stale_in(v), "the cut is still pending");
+    assert!(v.cut_still_live(&clip));
+}

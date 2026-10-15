@@ -1,13 +1,14 @@
 //! Formula auditing (#675): the green indicator on a flagged cell, its smart
 //! tag menu (Convert to Number, Copy Formula from Above, Ignore Error, Edit in
-//! Formula Bar), and what they do to the sheet. The rules are
-//! `gridcore::audit`'s; this holds the view's side: which cells are flagged
-//! now, and the edits.
+//! Formula Bar), Formulas > Error Checking, the trace arrows, Evaluate Formula
+//! and Ctrl+[ / Ctrl+]. The rules are `gridcore::audit`'s; this holds the
+//! view's side: which cells are flagged now, the dialogs and the edits.
 //!
 //! A flagged cell is looked up on every paint, so the flags a view has found
 //! are kept until an edit moves [`SheetView::edit_gen`] (every undo step and
-//! every restore does), and are found a cell at a time, only for the cells
-//! drawn.
+//! every restore does) or a recalculation moves the values
+//! ([`SheetView::recalculated`]), and are found a cell at a time, only for
+//! the cells drawn.
 
 use crate::dialog::catalog;
 use crate::dialog::{ButtonRole, Dialog, DialogOwner};
@@ -27,7 +28,8 @@ const NO_ERROR: &str =
     "The Trace Error command requires that the active cell contain an error value.";
 const NOTHING_MORE: &str = "There is nothing more to trace.";
 
-/// A command of the smart tag's menu, on the active cell.
+/// A formula-auditing command (#675): the smart tag's menu, the Formulas >
+/// Formula Auditing group and Ctrl+[ / Ctrl+].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AuditAct {
     /// Convert to Number: the text of a number stored as text becomes the number.
@@ -72,8 +74,9 @@ pub(crate) enum TraceKind {
 
 impl AuditAct {
     /// Whether the command changes the sheet, as against reading it or only
-    /// drawing over it: refused in Protected View and on a multi-area
-    /// selection, which the smart tag does not act on.
+    /// drawing over it: refused on a multi-area selection, which the smart
+    /// tag's edits do not act on. (Protected View refuses every audit command
+    /// through `protected_view_allows_act`, which has no arm for them.)
     pub(crate) fn edits(self) -> bool {
         matches!(
             self,
@@ -96,19 +99,23 @@ pub(crate) struct TraceSet {
 #[derive(Default)]
 pub(crate) struct AuditState {
     cache: RefCell<FlagCache>,
+    /// Advanced by every recalculation that is no undo step (a mode change,
+    /// Calculate Now and Sheet, the options): the values the flags and the
+    /// trace of errors read moved with no edit.
+    calc_gen: u64,
     /// The traces drawn, valid while the sheet stands as it was when they
-    /// were made (`traces_gen` is its `edit_gen`): arrows are view state,
-    /// never saved, and an edit takes them away.
+    /// were made (`traces_gen` is its `edit_gen` and `calc_gen`): arrows are
+    /// view state, never saved, and an edit or a recalculation takes them away.
     traces: Vec<TraceSet>,
-    traces_gen: u64,
+    traces_gen: (u64, u64),
     /// The formula Evaluate Formula is taking apart.
     eval: Option<gridcore::evalsteps::Evaluation>,
 }
 
-/// The flags found so far, valid for one (`edit_gen`, sheet).
+/// The flags found so far, valid for one (`edit_gen`, `calc_gen`, sheet).
 #[derive(Default)]
 struct FlagCache {
-    key: Option<(u64, usize)>,
+    key: Option<(u64, u64, usize)>,
     flags: HashMap<(u32, u32), Vec<Rule>>,
 }
 
@@ -116,7 +123,7 @@ impl SheetView {
     /// The rules that flag the cell on the active sheet and that Ignore Error
     /// has not hidden, first the one the smart tag names.
     pub(crate) fn cell_flags(&self, row: u32, col: u32) -> Vec<Rule> {
-        let key = (self.edit_gen, self.active);
+        let key = (self.edit_gen, self.audit.calc_gen, self.active);
         let mut cache = self.audit.cache.borrow_mut();
         if cache.key != Some(key) {
             cache.key = Some(key);
@@ -161,7 +168,7 @@ impl SheetView {
     /// The traces still drawn: none once an edit has moved the sheet on, and
     /// only the active sheet's.
     pub(crate) fn live_traces(&self) -> impl Iterator<Item = &TraceSet> {
-        let live = self.audit.traces_gen == self.edit_gen;
+        let live = self.audit.traces_gen == (self.edit_gen, self.audit.calc_gen);
         self.audit
             .traces
             .iter()
@@ -173,6 +180,12 @@ impl SheetView {
         self.live_traces()
             .flat_map(|t| t.arrows.iter().copied())
             .collect()
+    }
+
+    /// The values moved without an edit (a recalculation that is no undo
+    /// step): what the flags and the arrows found is out of date.
+    pub(crate) fn recalculated(&mut self) {
+        self.audit.calc_gen += 1;
     }
 
     /// Remove Arrows.
@@ -187,9 +200,10 @@ impl SheetView {
     pub(crate) fn trace(&mut self, kind: TraceKind) -> Result<usize, String> {
         let (s, (r, c)) = (self.active, self.sel);
         // Arrows of an older state of the sheet, or of another sheet, go.
-        if self.audit.traces_gen != self.edit_gen {
+        let now = (self.edit_gen, self.audit.calc_gen);
+        if self.audit.traces_gen != now {
             self.audit.traces.clear();
-            self.audit.traces_gen = self.edit_gen;
+            self.audit.traces_gen = now;
         }
         self.audit.traces.retain(|t| t.sheet == s);
         let found = self
@@ -325,89 +339,68 @@ impl SheetView {
 }
 
 impl crate::Docxy {
-    /// Run a smart tag command on the active sheet's active cell; a refusal
-    /// or a word about the result goes to the status line.
+    /// Run a formula-auditing command on the active sheet; a refusal or a
+    /// word about the result goes to the status line.
     pub(crate) fn sheet_audit_act(&mut self, act: AuditAct, cx: &mut gpui::Context<Self>) {
-        if act == AuditAct::EditInFormulaBar {
-            self.sheet_begin_edit(None, cx);
-            return;
-        }
         match act {
-            AuditAct::Trace(kind) => {
-                let done = self.active_sheet_mut().map(|v| v.trace(kind));
-                match done {
-                    Some(Ok(n)) => {
-                        self.set_status(format!("{n} arrow{} drawn", if n == 1 { "" } else { "s" }))
-                    }
-                    Some(Err(e)) => self.set_status(e),
-                    None => {}
+            AuditAct::EditInFormulaBar => self.sheet_begin_edit(None, cx),
+            AuditAct::Trace(kind) => match self.active_sheet_mut().map(|v| v.trace(kind)) {
+                Some(Ok(n)) => {
+                    self.set_status(format!("{n} arrow{} drawn", if n == 1 { "" } else { "s" }));
                 }
-                cx.notify();
-                return;
-            }
+                Some(Err(e)) => self.set_status(e),
+                None => {}
+            },
             AuditAct::RemoveArrows => {
                 if let Some(v) = self.active_sheet_mut() {
                     v.remove_arrows();
                 }
-                cx.notify();
-                return;
             }
-            AuditAct::EvaluateFormula => {
-                if let Some(tab) = self.tabs.get_mut(self.active) {
-                    if let Err(e) = open_evaluate(tab) {
-                        tab.status = e.into();
-                    }
-                }
-                cx.notify();
-                return;
-            }
+            AuditAct::EvaluateFormula => self.audit_tab_dialog(open_evaluate),
+            AuditAct::ErrorChecking => self.audit_tab_dialog(open_error_checking),
             AuditAct::Select { kind, all } => {
                 if let Some(Err(e)) = self.active_sheet_mut().map(|v| v.select_reach(kind, all)) {
                     self.set_status(e);
                 }
-                cx.notify();
-                return;
             }
-            _ => {}
-        }
-        if act == AuditAct::ErrorChecking {
-            if let Some(tab) = self.tabs.get_mut(self.active) {
-                if let Err(e) = open_error_checking(tab) {
-                    tab.status = e.into();
-                }
+            AuditAct::Help => {
+                let rule = self.active_sheet().and_then(SheetView::flagged_rule);
+                self.set_status(rule.map_or("There is no error here", |r| r.explanation()));
             }
-            cx.notify();
-            return;
+            AuditAct::ConvertToNumber => {
+                self.audit_edit(SheetView::audit_convert, "Converted to a number");
+            }
+            AuditAct::CopyFormula => {
+                self.audit_edit(SheetView::audit_copy_formula, "Formula copied")
+            }
+            AuditAct::IgnoreError => self.audit_edit(SheetView::audit_ignore, "Error ignored"),
         }
+        cx.notify();
+    }
+
+    /// Open a dialog on the active tab; why not goes to its status.
+    fn audit_tab_dialog(&mut self, open: fn(&mut DocTab) -> Result<(), String>) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            if let Err(e) = open(tab) {
+                tab.status = e.into();
+            }
+        }
+    }
+
+    /// One of the smart tag's edits: the sheet is marked changed and `said`
+    /// shown when it did something.
+    fn audit_edit(&mut self, run: fn(&mut SheetView) -> Result<bool, String>, said: &str) {
         let Some(v) = self.active_sheet_mut() else {
             return;
         };
-        let rule = v.flagged_rule();
-        let done = match act {
-            AuditAct::ConvertToNumber => v.audit_convert().map(|d| (d, "Converted to a number")),
-            AuditAct::CopyFormula => v.audit_copy_formula().map(|d| (d, "Formula copied")),
-            AuditAct::IgnoreError => v.audit_ignore().map(|d| (d, "Error ignored")),
-            AuditAct::Help => Ok((false, "")),
-            AuditAct::EditInFormulaBar
-            | AuditAct::ErrorChecking
-            | AuditAct::Trace(_)
-            | AuditAct::RemoveArrows
-            | AuditAct::EvaluateFormula
-            | AuditAct::Select { .. } => unreachable!("handled above"),
-        };
-        match (act, done) {
-            (_, Err(e)) => self.set_status(e),
-            (AuditAct::Help, _) => {
-                let what = rule.map_or("There is no error here", |r| r.explanation());
-                self.set_status(what);
-            }
-            (_, Ok((true, said))) => {
+        match run(v) {
+            Err(e) => self.set_status(e),
+            Ok(true) => {
                 self.mark_sheet_dirty();
-                self.set_status(said);
+                self.set_status(said.to_string());
             }
-            (_, Ok((false, _))) => self.set_status("Nothing to fix here"),
+            Ok(false) => self.set_status("Nothing to fix here"),
         }
-        cx.notify();
     }
 }
 
@@ -554,8 +547,10 @@ fn show(tab: &mut DocTab, start: (u32, u32), cur: Option<(u32, u32)>) -> Result<
     Ok(())
 }
 
-/// A press Error Checking handles: Help, Ignore Error, Edit in Formula Bar,
-/// Previous and Next. `None` for any other (Close closes through the stack).
+/// A press Error Checking or Evaluate Formula handles: Error Checking's Help,
+/// Show Calculation Steps, Ignore Error, Edit in Formula Bar, Previous and
+/// Next, and Evaluate Formula's Evaluate, Step In, Step Out and Restart.
+/// `None` for any other (Close closes through the stack).
 pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>> {
     let top = tab.dialogs.top()?;
     if top.owner == DialogOwner::EvaluateFormula {
@@ -1104,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn the_flags_follow_an_edit_and_the_active_sheet() {
+    fn the_flags_follow_an_edit() {
         let mut v = view(&[("B1", Cell::text("5"))]);
         assert_eq!(v.cell_flags(0, 1), vec![Rule::NumberAsText]);
         // An edit that goes through an undo step drops what was remembered.
@@ -1112,6 +1107,36 @@ mod tests {
         v.push_undo(SheetStep::Named("Test"));
         v.pkg.workbook.sheets[0].set_cell(0, 1, Cell::text("x"));
         assert!(v.cell_flags(0, 1).is_empty());
+    }
+
+    #[test]
+    fn the_flags_follow_the_active_sheet() {
+        let mut v = view(&[("B1", Cell::text("5"))]);
+        let mut other = gridcore::sheet::Sheet {
+            name: "Sheet2".into(),
+            ..Default::default()
+        };
+        other.set_cell(0, 1, Cell::text("x"));
+        v.pkg.workbook.sheets.push(other);
+        // The cache is full for sheet one; sheet two's same cell is no flag.
+        assert_eq!(v.cell_flags(0, 1), vec![Rule::NumberAsText]);
+        v.active = 1;
+        assert!(v.cell_flags(0, 1).is_empty());
+        v.active = 0;
+        assert_eq!(v.cell_flags(0, 1), vec![Rule::NumberAsText]);
+    }
+
+    #[test]
+    fn a_recalculation_that_is_no_edit_drops_the_flags_and_the_arrows() {
+        let mut v = chain();
+        at(&mut v, "D1");
+        v.trace(TraceKind::Precedents).unwrap();
+        assert_eq!(v.cell_flags(5, 0), Vec::new(), "E1 is fine");
+        v.pkg.workbook.sheets[0].set_cell(5, 0, Cell::text("5"));
+        assert!(v.cell_flags(5, 0).is_empty(), "remembered");
+        v.recalculated();
+        assert_eq!(v.cell_flags(5, 0), vec![Rule::NumberAsText]);
+        assert!(v.trace_arrows().is_empty());
     }
 
     #[test]

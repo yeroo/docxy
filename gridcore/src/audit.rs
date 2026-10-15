@@ -23,7 +23,7 @@ pub enum Rule {
     Inconsistent,
     /// A formula whose range leaves out a number next to it.
     OmitsAdjacent,
-    /// A formula that refers to nothing but empty cells.
+    /// A formula that refers to an empty cell or range.
     RefsEmpty,
     /// A formula in an unlocked cell.
     UnlockedFormula,
@@ -150,8 +150,12 @@ impl Rules {
 /// One `<ignoredError>`: the rules Ignore Error turned off over some ranges.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct IgnoredError {
-    /// The `sqref` ranges, as (r1, c1, r2, c2), 0-based inclusive.
+    /// The `sqref` ranges, as (r1, c1, r2, c2), 0-based inclusive; a whole
+    /// column or row (`B:B`, `3:3`) is the rectangle down or across the grid.
     pub sqref: Vec<(u32, u32, u32, u32)>,
+    /// The `sqref` tokens this model cannot read, as they stand in the file,
+    /// so a save writes them back.
+    pub unparsed: Vec<String>,
     /// The rules hidden over them.
     pub rules: Vec<Rule>,
     /// The attributes this model does not carry (`twoDigitTextYear="1"`), as
@@ -170,8 +174,8 @@ impl IgnoredError {
     }
 }
 
-/// The rules that flag the cell, whether or not they are on or ignored.
-/// Empty for a cell the sheet does not have.
+/// The rules that are on and flag the cell, whether or not Ignore Error
+/// hides them. Empty for a cell the sheet does not have.
 pub fn check_cell(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Vec<Rule> {
     let rules = wb.audit_rules;
     let Some(s) = wb.sheets.get(sheet) else {
@@ -237,7 +241,7 @@ pub fn ignore(sheet: &mut crate::sheet::Sheet, rule: Rule, row: u32, col: u32) {
         None => sheet.ignored_errors.push(IgnoredError {
             sqref: vec![rect],
             rules: vec![rule],
-            extra: String::new(),
+            ..IgnoredError::default()
         }),
     }
 }
@@ -824,6 +828,7 @@ mod tests {
             sqref: vec![(0, 0, 0, 1)], // A1:B1
             rules: vec![Rule::ErrorValue],
             extra: String::new(),
+            unparsed: Vec::new(),
         });
         assert!(flags(&w, 0, 0, 0).is_empty(), "A1 ignored");
         assert_eq!(flags(&w, 0, 1, 0), vec![Rule::ErrorValue], "A2 outside");
@@ -849,12 +854,14 @@ mod tests {
             sqref: vec![(5, 0, 5, 0)],
             rules: vec![Rule::ErrorValue],
             extra: String::new(),
+            unparsed: Vec::new(),
         });
         w.sheets.push(other);
         w.sheets[0].ignored_errors.push(IgnoredError {
             sqref,
             rules: vec![Rule::ErrorValue],
             extra: String::new(),
+            unparsed: Vec::new(),
         });
         w
     }
@@ -952,6 +959,7 @@ mod tests {
             sqref: vec![(9, 9, 9, 9)],
             rules: vec![Rule::ErrorValue],
             extra: "twoDigitTextYear=\"1\"".into(),
+            unparsed: Vec::new(),
         });
         ignore(s, Rule::ErrorValue, 0, 0);
         assert_eq!(s.ignored_errors.len(), 2);

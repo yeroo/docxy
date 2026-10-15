@@ -295,7 +295,8 @@ fn dialog_press(tab: &mut DocTab, button: &str) -> Result<(), String> {
     if let Some(done) = crate::sheet_goto::click(tab, button) {
         return done;
     }
-    // Error Checking's Next, Previous, Ignore Error and Edit in Formula Bar (#675).
+    // Error Checking's presses (Next, Previous, Ignore Error, ...) and Evaluate
+    // Formula's (Evaluate, Step In, ...) (#675).
     if let Some(done) = crate::sheet_audit::click(tab, button) {
         return done;
     }

@@ -1453,19 +1453,22 @@ pub fn to_string(e: &Expr) -> String {
 /// parentheses its parent put round it. Evaluate Formula underlines it.
 /// `None` when `target` is not a node of `e`.
 pub fn to_string_marked(e: &Expr, target: &Expr) -> (String, Option<std::ops::Range<usize>>) {
-    // Private-use characters no formula text holds, taken out again below.
-    const OPEN: char = '\u{E000}';
-    const CLOSE: char = '\u{E001}';
+    let plain = Printer::default().print(e);
+    // Two private-use characters the text does not hold, to bracket the node:
+    // formula text and cell text may hold any of them.
+    let mut free = ('\u{E000}'..='\u{F8FF}').filter(|c| !plain.contains(*c));
+    let (Some(open), Some(close)) = (free.next(), free.next()) else {
+        return (plain, None);
+    };
     let mut printer = Printer {
-        mark: Some(target as *const Expr),
+        mark: Some((target as *const Expr, open, close)),
         ..Printer::default()
     };
     let marked = printer.print(e);
-    let (Some(a), Some(b)) = (marked.find(OPEN), marked.find(CLOSE)) else {
-        return (marked.replace([OPEN, CLOSE], ""), None);
+    let (Some(a), Some(b)) = (marked.find(open), marked.find(close)) else {
+        return (plain, None);
     };
-    let text = marked.replace([OPEN, CLOSE], "");
-    (text, Some(a..b - OPEN.len_utf8()))
+    (plain, Some(a..b - open.len_utf8()))
 }
 
 /// The AST printer behind [`to_string`] (the spelling held in memory and shown
@@ -1481,14 +1484,16 @@ struct Printer {
     /// may hold a lambda (see [`Printer::func`]).
     scope: Vec<(String, bool)>,
     /// A node whose text [`to_string_marked`] brackets.
-    mark: Option<*const Expr>,
+    mark: Option<(*const Expr, char, char)>,
 }
 
 impl Printer {
     fn print(&mut self, e: &Expr) -> String {
         let text = self.print_node(e);
-        if self.mark.is_some_and(|m| std::ptr::eq(m, e)) {
-            return format!("\u{E000}{text}\u{E001}");
+        if let Some((m, open, close)) = self.mark {
+            if std::ptr::eq(m, e) {
+                return format!("{open}{text}{close}");
+            }
         }
         text
     }

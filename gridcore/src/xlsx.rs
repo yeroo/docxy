@@ -2982,10 +2982,12 @@ fn read_ignored_errors(xml: &str) -> Vec<crate::audit::IgnoredError> {
         let mut extra = Vec::new();
         for (attr, value) in tag_attrs(open) {
             if attr == "sqref" {
-                entry.sqref = value
-                    .split_whitespace()
-                    .filter_map(crate::sheet::parse_range_name)
-                    .collect();
+                for tok in value.split_whitespace() {
+                    match parse_sqref_token(tok) {
+                        Some(rect) => entry.sqref.push(rect),
+                        None => entry.unparsed.push(tok.to_string()),
+                    }
+                }
             } else if let Some(rule) =
                 Rule::from_attr(&attr).filter(|_| matches!(value.as_str(), "1" | "true"))
             {
@@ -2996,7 +2998,7 @@ fn read_ignored_errors(xml: &str) -> Vec<crate::audit::IgnoredError> {
         }
         entry.rules.sort();
         entry.extra = extra.join(" ");
-        if !entry.sqref.is_empty() {
+        if !(entry.sqref.is_empty() && entry.unparsed.is_empty()) {
             out.push(entry);
         }
     }
@@ -3015,18 +3017,14 @@ fn set_ignored_errors(xml: String, sheet: &Sheet) -> String {
     }
     let mut block = String::from("<ignoredErrors>");
     for e in &sheet.ignored_errors {
-        let sqref: Vec<String> = e
-            .sqref
-            .iter()
-            .map(|&(r1, c1, r2, c2)| {
-                if (r1, c1) == (r2, c2) {
-                    cell_name(r1, c1)
-                } else {
-                    format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
-                }
-            })
-            .collect();
-        block.push_str(&format!("<ignoredError sqref=\"{}\"", sqref.join(" ")));
+        let mut sqref = sqref_of(&e.sqref);
+        for tok in &e.unparsed {
+            if !sqref.is_empty() {
+                sqref.push(' ');
+            }
+            sqref.push_str(tok);
+        }
+        block.push_str(&format!("<ignoredError sqref=\"{sqref}\""));
         for rule in crate::audit::Rule::ALL {
             if e.rules.contains(&rule) {
                 block.push_str(&format!(" {}=\"1\"", rule.attr()));
@@ -4959,12 +4957,47 @@ fn start_tag_end(element: &str) -> Option<usize> {
     element[from..].find('>').map(|i| from + i + 1)
 }
 
-/// `ranges` as an `sqref` value.
+/// One `sqref` token as a rectangle: a cell, a range, whole columns (`B:C`)
+/// or whole rows (`3:5`). `None` for anything else.
+fn parse_sqref_token(tok: &str) -> Option<(u32, u32, u32, u32)> {
+    if let Some(rect) = parse_range_name(tok) {
+        return Some(rect);
+    }
+    let (a, b) = tok.split_once(':')?;
+    let (a, b) = (a.trim_start_matches('$'), b.trim_start_matches('$'));
+    if let (Some((c1, n1)), Some((c2, n2))) =
+        (crate::sheet::parse_col(a), crate::sheet::parse_col(b))
+    {
+        if n1 == a.len() && n2 == b.len() {
+            return Some((0, c1.min(c2), crate::sheet::MAX_ROWS - 1, c1.max(c2)));
+        }
+    }
+    let (r1, r2) = (a.parse::<u32>().ok()?, b.parse::<u32>().ok()?);
+    let ok = |r: u32| (1..=crate::sheet::MAX_ROWS).contains(&r);
+    (ok(r1) && ok(r2)).then(|| {
+        (
+            r1.min(r2) - 1,
+            0,
+            r1.max(r2) - 1,
+            crate::sheet::MAX_COLS - 1,
+        )
+    })
+}
+
+/// `ranges` as an `sqref` value: whole columns and rows as `B:C` and `3:5`.
 fn sqref_of(ranges: &[(u32, u32, u32, u32)]) -> String {
     ranges
         .iter()
         .map(|&(r1, c1, r2, c2)| {
-            if (r1, c1) == (r2, c2) {
+            if r1 == 0 && r2 == crate::sheet::MAX_ROWS - 1 {
+                format!(
+                    "{}:{}",
+                    crate::sheet::col_name(c1),
+                    crate::sheet::col_name(c2)
+                )
+            } else if c1 == 0 && c2 == crate::sheet::MAX_COLS - 1 {
+                format!("{}:{}", r1 + 1, r2 + 1)
+            } else if (r1, c1) == (r2, c2) {
                 cell_name(r1, c1)
             } else {
                 format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
@@ -10656,6 +10689,7 @@ mod tests {
             sqref: vec![(2, 1, 4, 1)],
             rules: vec![Rule::NumberAsText, Rule::UnlockedFormula],
             extra: String::new(),
+            unparsed: Vec::new(),
         });
         let again = load_xlsx(&save_xlsx(&pkg)).unwrap();
         assert_eq!(
@@ -10672,29 +10706,76 @@ mod tests {
     }
 
     #[test]
-    fn ignored_errors_land_between_cell_watches_and_the_drawing_and_go_when_emptied() {
+    fn ignored_errors_land_after_page_setup_and_before_the_drawing_parts() {
         use crate::audit::{IgnoredError, Rule};
-        let mut pkg = new_xlsx();
+        // The elements that must come before it and after it are in the part.
+        let mut pkg = pkg_with_ignored_errors(
+            "<pageMargins left=\"1\" right=\"1\" top=\"1\" bottom=\"1\" header=\"0.5\" footer=\"0.5\"/><tableParts count=\"0\"/>",
+        );
         pkg.workbook.sheets[0].merges.push((0, 0, 0, 2));
         pkg.workbook.sheets[0].ignored_errors.push(IgnoredError {
             sqref: vec![(0, 0, 0, 0)],
             rules: vec![Rule::ErrorValue],
-            extra: String::new(),
+            ..IgnoredError::default()
         });
         let mut re = load_xlsx(&save_xlsx(&pkg)).unwrap();
         let ws = sheet1_xml(&re);
-        let (m, i) = (
-            ws.find("<mergeCells").unwrap(),
-            ws.find("<ignoredErrors").unwrap(),
-        );
-        assert!(m < i, "mergeCells precede ignoredErrors: {ws}");
-        if let Some(d) = ws.find("<drawing") {
-            assert!(i < d, "{ws}");
-        }
+        let at = |tag: &str| ws.find(tag).unwrap_or_else(|| panic!("{tag} in {ws}"));
+        assert!(at("<mergeCells") < at("<pageMargins"), "{ws}");
+        assert!(at("<pageMargins") < at("<ignoredErrors"), "{ws}");
+        assert!(at("<ignoredErrors") < at("<tableParts"), "{ws}");
         re.workbook.sheets[0].ignored_errors.clear();
         let gone = load_xlsx(&save_xlsx(&re)).unwrap();
         assert!(!sheet1_xml(&gone).contains("<ignoredErrors"));
         assert!(gone.workbook.sheets[0].ignored_errors.is_empty());
+    }
+
+    #[test]
+    fn whole_column_and_row_ignored_errors_are_read_and_survive_an_edit() {
+        use crate::audit::{Rule, flags, ignore};
+        let mut pkg = pkg_with_ignored_errors(
+            "<ignoredErrors><ignoredError sqref=\"B:B 3:4 D1 Nonsense!Z\" numberStoredAsText=\"1\"/></ignoredErrors>",
+        );
+        let ig = &pkg.workbook.sheets[0].ignored_errors;
+        assert_eq!(ig.len(), 1);
+        assert_eq!(
+            ig[0].sqref,
+            vec![(0, 1, 1_048_575, 1), (2, 0, 3, 16_383), (0, 3, 0, 3)]
+        );
+        assert_eq!(ig[0].unparsed, vec!["Nonsense!Z".to_string()]);
+        // The column and the rows ignore the rule; another column does not.
+        for (r, c, hidden) in [
+            (1, 1, true),
+            (50, 1, true),
+            (2, 7, true),
+            (3, 0, true),
+            (1, 2, false),
+        ] {
+            pkg.workbook.sheets[0].set_cell(r, c, crate::sheet::Cell::text("123"));
+            let got = flags(&pkg.workbook, 0, r, c);
+            assert_eq!(got.is_empty(), hidden, "({r},{c}) {got:?}");
+            assert!(hidden || got == vec![Rule::NumberAsText]);
+        }
+        // An unrelated Ignore Error regenerates the element, and nothing is lost.
+        ignore(&mut pkg.workbook.sheets[0], Rule::ErrorValue, 9, 9);
+        let again = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let block = ignored_block(&sheet1_xml(&again)).to_string();
+        assert!(block.contains("sqref=\"B:B 3:4 D1 Nonsense!Z\""), "{block}");
+        assert!(block.contains("sqref=\"J10\" evalError=\"1\""), "{block}");
+        assert_eq!(
+            again.workbook.sheets[0].ignored_errors,
+            pkg.workbook.sheets[0].ignored_errors
+        );
+    }
+
+    #[test]
+    fn an_ignored_error_with_only_tokens_it_cannot_read_is_kept() {
+        let pkg = pkg_with_ignored_errors(
+            "<ignoredErrors><ignoredError sqref=\"Nonsense!Z\" evalError=\"1\"/></ignoredErrors>",
+        );
+        let ig = &pkg.workbook.sheets[0].ignored_errors;
+        assert_eq!(ig.len(), 1);
+        assert!(ig[0].sqref.is_empty() && ig[0].unparsed == ["Nonsense!Z"]);
     }
 
     #[test]

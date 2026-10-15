@@ -37,6 +37,38 @@ const ATOMIC: [&str; 8] = [
     "MAKEARRAY",
 ];
 
+/// Calls that read the references among their arguments, not the values in
+/// them: those arguments are left as they are, or the call would read a
+/// literal and end on another result than the cell.
+const REFERENCING: [&str; 22] = [
+    "SUMIF",
+    "SUMIFS",
+    "COUNTIF",
+    "COUNTIFS",
+    "AVERAGEIF",
+    "AVERAGEIFS",
+    "MAXIFS",
+    "MINIFS",
+    "CELL",
+    "SUBTOTAL",
+    "AGGREGATE",
+    "COUNTBLANK",
+    "AREAS",
+    "ISREF",
+    "ROW",
+    "ROWS",
+    "COLUMN",
+    "COLUMNS",
+    "FORMULATEXT",
+    "ISFORMULA",
+    "SHEET",
+    "SHEETS",
+];
+
+/// Calls that read a reference as their first argument, and any range after
+/// it; a single cell later on is a value to calculate as usual.
+const REFERENCING_FIRST: [&str; 2] = ["OFFSET", "INDEX"];
+
 /// Calls that calculate their first argument and then pick what else to.
 const LAZY: [&str; 5] = ["IF", "IFS", "IFERROR", "IFNA", "CHOOSE"];
 
@@ -260,12 +292,33 @@ fn reference_of(wb: &Workbook, f: &Frame) -> String {
     format!("{name}!${}${}", col_name(f.col), f.row + 1)
 }
 
-/// The expression with a calculated blank shown as `(blank)`, not as nothing.
+/// The most values of an array the dialog prints; the rest is `...`.
+const SHOWN_CELLS: usize = 64;
+
+/// The expression as the dialog prints it: a calculated blank as `(blank)`,
+/// not as nothing, and a long array cut short.
 fn blank_shown(e: &Expr) -> Expr {
     let mut out = e.clone();
     walk_mut(&mut out, &mut |x| {
         if matches!(x, Expr::Lit(Value::Empty)) {
             *x = Expr::Name("(blank)".into());
+        }
+        if let Expr::ArrayLit(rows) = x {
+            let mut left = SHOWN_CELLS;
+            let total: usize = rows.iter().map(Vec::len).sum();
+            if total > SHOWN_CELLS {
+                rows.retain_mut(|row| {
+                    if left == 0 {
+                        return false;
+                    }
+                    row.truncate(left);
+                    left -= row.len();
+                    true
+                });
+                if let Some(last) = rows.last_mut() {
+                    last.push(Expr::Name("...".into()));
+                }
+            }
         }
     });
     out
@@ -293,6 +346,7 @@ fn value_of(e: &Expr) -> Value {
             Value::Num(n) => Value::Num(-n),
             other => other,
         },
+        Expr::Un(UnOp::Pos, x) => value_of(x),
         Expr::ArrayLit(rows) => rows
             .first()
             .and_then(|r| r.first())
@@ -310,7 +364,9 @@ fn is_value(e: &Expr) -> bool {
         | Expr::Err(_)
         | Expr::Missing
         | Expr::Lit(_) => true,
-        Expr::Un(UnOp::Neg | UnOp::Pos, x) => matches!(**x, Expr::Num(_) | Expr::Lit(_)),
+        // The parser's own negative or signed number; a sign over anything
+        // else is a step.
+        Expr::Un(UnOp::Neg | UnOp::Pos, x) => matches!(**x, Expr::Num(_)),
         Expr::ArrayLit(rows) => rows.iter().flatten().all(is_value),
         _ => false,
     }
@@ -320,6 +376,42 @@ fn atomic(e: &Expr) -> bool {
     match e {
         Expr::Func(name, _) => ATOMIC.iter().any(|a| a.eq_ignore_ascii_case(name)),
         Expr::Call(..) => true,
+        _ => false,
+    }
+}
+
+/// Whether `e` names cells, which a call that reads a reference takes as it is.
+fn is_reference(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Ref(_)
+            | Expr::Range(..)
+            | Expr::ColRange { .. }
+            | Expr::RowRange { .. }
+            | Expr::Ref3D { .. }
+            | Expr::Name(_)
+            | Expr::Structured { .. }
+            | Expr::SpillRef(_)
+    )
+}
+
+/// Whether the call `e` leaves its child `i`, which is `c`, as a reference
+/// for it to read: see [`REFERENCING`] and [`REFERENCING_FIRST`]; the
+/// implicit-intersection `@` is one too.
+fn keeps_reference(e: &Expr, i: usize, c: &Expr) -> bool {
+    if !is_reference(c) {
+        return false;
+    }
+    let several = !matches!(c, Expr::Ref(_) | Expr::Name(_) | Expr::SpillRef(_));
+    match e {
+        Expr::Func(name, _) => {
+            REFERENCING.iter().any(|r| r.eq_ignore_ascii_case(name))
+                || (REFERENCING_FIRST
+                    .iter()
+                    .any(|r| r.eq_ignore_ascii_case(name))
+                    && (i == 0 || several))
+        }
+        Expr::Un(UnOp::Implicit, _) => true,
         _ => false,
     }
 }
@@ -399,8 +491,17 @@ fn put(e: &mut Expr, path: &[usize], with: Expr) {
 
 /// The path to the part to calculate next, `None` when `e` is a value.
 fn next(e: &Expr) -> Option<Vec<usize>> {
+    next_in(e, true)
+}
+
+/// [`next`]; `root` is whether `e` is the whole formula, where a 3D
+/// reference has no call to read it and is calculated itself.
+fn next_in(e: &Expr, root: bool) -> Option<Vec<usize>> {
     if is_value(e) {
         return None;
+    }
+    if matches!(e, Expr::Ref3D { .. }) {
+        return root.then(Vec::new);
     }
     if atomic(e) {
         return Some(Vec::new());
@@ -409,7 +510,7 @@ fn next(e: &Expr) -> Option<Vec<usize>> {
         // Its first argument first; when that is a value the call itself is
         // the step, which picks what to calculate.
         let first = child(e, 0)?;
-        return match next(first) {
+        return match next_in(first, false) {
             Some(mut p) => {
                 p.insert(0, 0);
                 Some(p)
@@ -418,7 +519,13 @@ fn next(e: &Expr) -> Option<Vec<usize>> {
         };
     }
     for i in 0..child_count(e) {
-        if let Some(mut p) = child(e, i).and_then(next) {
+        let Some(c) = child(e, i) else { continue };
+        // A call that reads a reference keeps its references, and any 3D
+        // reference is read by the call round it.
+        if keeps_reference(e, i, c) || matches!(c, Expr::Ref3D { .. }) {
+            continue;
+        }
+        if let Some(mut p) = next_in(c, false) {
             p.insert(0, i);
             return Some(p);
         }
@@ -452,6 +559,10 @@ fn choose(e: &Expr) -> Option<Expr> {
         return None;
     }
     let first = &args[0];
+    // An array of several values is lifted by the call itself: whole.
+    if matches!(first, Expr::ArrayLit(_)) && !is_scalar_array(first) {
+        return None;
+    }
     let missing = |x: Option<&Expr>, empty: Value| match x {
         None | Some(Expr::Missing) => Expr::Lit(empty),
         Some(x) => x.clone(),
@@ -459,7 +570,11 @@ fn choose(e: &Expr) -> Option<Expr> {
     match name.to_ascii_uppercase().as_str() {
         "IF" => match truth(first)? {
             Ok(true) => Some(missing(args.get(1), Value::Num(0.0))),
-            Ok(false) => Some(missing(args.get(2), Value::Bool(false))),
+            // No third argument is FALSE, an empty one 0.
+            Ok(false) => Some(match args.get(2) {
+                None => Expr::Lit(Value::Bool(false)),
+                Some(x) => missing(Some(x), Value::Num(0.0)),
+            }),
             Err(x) => Some(Expr::Lit(Value::Err(x))),
         },
         "IFS" => match truth(first)? {
@@ -731,5 +846,175 @@ mod tests {
             None,
             "not a node of it"
         );
+    }
+
+    /// The value a formula ends on when stepped to the end.
+    fn ends_on(w: &Workbook, at: &str) -> Value {
+        let mut ev = start(w, at);
+        while ev.evaluate(w) {}
+        ev.view(w).result.expect("finished")
+    }
+
+    /// What the cell itself holds after the recalculation.
+    fn held(w: &Workbook, at: &str) -> Value {
+        let (r, c) = crate::sheet::parse_cell_name(at).unwrap();
+        crate::engine::cell_to_value(&w.sheets[0].cell(r, c).unwrap().value)
+    }
+
+    #[test]
+    fn calls_that_read_a_reference_end_on_the_cells_value() {
+        let mut cells: Vec<(String, Cell)> =
+            (1..=10).map(|r| (format!("A{r}"), num(r as f64))).collect();
+        cells.extend([
+            ("C1".into(), f("COUNTIF(A1:A10,\">5\")")),
+            ("C2".into(), f("SUMIF(A1:A10,\">5\",A1:A10)")),
+            ("C3".into(), f("ROW(A5)")),
+            ("C5".into(), f("INDEX(A1:A10,3)+0")),
+            ("C6".into(), f("COUNTBLANK(B:B)")),
+            ("C7".into(), f("OFFSET(A1,2,0)")),
+            ("C8".into(), f("COLUMNS(A1:C3)")),
+            ("C9".into(), f("SUBTOTAL(9,A1:A10)")),
+        ]);
+        let refs: Vec<(&str, Cell)> = cells.iter().map(|(n, c)| (n.as_str(), c.clone())).collect();
+        let w = wb(&refs);
+        for at in ["C1", "C2", "C3", "C5", "C6", "C7", "C8", "C9"] {
+            assert_eq!(ends_on(&w, at), held(&w, at), "{at}");
+        }
+        // The reference stays where the call reads it.
+        let s = steps(&w, "C1");
+        assert_eq!(s[0], "=[COUNTIF(A1:A10,\">5\")]");
+        assert_eq!(s.len(), 2, "one step: {s:?}");
+    }
+
+    #[test]
+    fn a_reference_that_is_computed_still_steps_inside_a_referencing_call() {
+        let w = wb(&[
+            ("A1", num(1.0)),
+            ("A2", num(2.0)),
+            ("B1", num(2.0)),
+            ("C1", f("INDEX(A1:A2,B1)+0")),
+        ]);
+        let s = steps(&w, "C1");
+        assert_eq!(s[0], "=INDEX(A1:A2,[B1])+0", "{s:?}");
+        assert_eq!(ends_on(&w, "C1"), held(&w, "C1"));
+    }
+
+    #[test]
+    fn a_3d_reference_is_read_by_its_call() {
+        let mut w = wb(&[("A1", num(1.0)), ("B1", f("SUM(Sheet1:Sheet2!A1)"))]);
+        let mut two = Sheet {
+            name: "Sheet2".into(),
+            ..Sheet::default()
+        };
+        two.set_cell(0, 0, num(10.0));
+        w.sheets.push(two);
+        let mut eng = crate::engine::Engine::new(&w);
+        eng.recalc_all(&mut w);
+        assert_eq!(held(&w, "B1"), Value::Num(11.0));
+        assert_eq!(ends_on(&w, "B1"), Value::Num(11.0));
+    }
+
+    #[test]
+    fn iferror_lifts_over_an_array_as_the_cell_does() {
+        let na = Cell {
+            value: crate::sheet::CellValue::Error("#N/A".into()),
+            ..Cell::default()
+        };
+        let w = wb(&[
+            ("A1", na),
+            ("A2", num(5.0)),
+            ("A3", num(7.0)),
+            ("B1", f("SUM(IFERROR(A1:A3,0))")),
+            ("B2", f("SUM(IFERROR(A2:A3,0))")),
+        ]);
+        for at in ["B1", "B2"] {
+            assert_eq!(held(&w, at), Value::Num(12.0), "{at}");
+            assert_eq!(ends_on(&w, at), Value::Num(12.0), "{at}");
+        }
+    }
+
+    #[test]
+    fn a_sign_over_a_calculated_value_is_a_step() {
+        let w = wb(&[
+            ("A1", num(5.0)),
+            ("A2", Cell::text("abc")),
+            (
+                "A3",
+                Cell {
+                    value: crate::sheet::CellValue::Bool(true),
+                    ..Cell::default()
+                },
+            ),
+            ("B1", f("+A1")),
+            ("B2", f("-A2")),
+            ("B3", f("-A3")),
+            ("B4", f("-A9")),
+        ]);
+        for at in ["B1", "B2", "B3", "B4"] {
+            assert_eq!(ends_on(&w, at), held(&w, at), "{at}");
+        }
+        assert_eq!(steps(&w, "B1"), ["=+[A1]", "=[+5]", "5"]);
+        assert_eq!(steps(&w, "B3").pop().unwrap(), "-1");
+    }
+
+    #[test]
+    fn if_with_an_empty_third_argument_is_zero() {
+        let w = wb(&[
+            ("A1", num(1.0)),
+            ("B1", f("IF(A1>3,1,)")),
+            ("B2", f("IF(A1>3,1)")),
+        ]);
+        assert_eq!(held(&w, "B1"), Value::Num(0.0));
+        assert_eq!(ends_on(&w, "B1"), Value::Num(0.0));
+        assert_eq!(ends_on(&w, "B2"), Value::Bool(false));
+    }
+
+    #[test]
+    fn a_long_array_is_cut_short_in_the_dialog_but_calculated_whole() {
+        let cells: Vec<(String, Cell)> = (1..=200).map(|r| (format!("A{r}"), num(1.0))).collect();
+        let mut refs: Vec<(&str, Cell)> =
+            cells.iter().map(|(n, c)| (n.as_str(), c.clone())).collect();
+        refs.push(("B1", f("SUM(A1:A200)")));
+        let w = wb(&refs);
+        let mut ev = start(&w, "B1");
+        ev.evaluate(&w);
+        let text = ev.view(&w).text;
+        assert!(text.len() < 400, "{} bytes", text.len());
+        assert!(text.contains("..."), "{text}");
+        assert!(ev.evaluate(&w));
+        assert_eq!(ends_on(&w, "B1"), Value::Num(200.0));
+    }
+
+    #[test]
+    fn text_with_private_use_characters_does_not_confuse_the_underline() {
+        let w = wb(&[
+            ("A1", Cell::text("\u{E001}")),
+            ("B1", f("\"\u{E000}\"&A1")),
+            ("C1", f("A1&D1")),
+        ]);
+        for at in ["B1", "C1"] {
+            let mut ev = start(&w, at);
+            loop {
+                let v = ev.view(&w);
+                if let Some(r) = &v.underline {
+                    assert!(
+                        v.text.get(r.clone()).is_some(),
+                        "{at}: {r:?} in {:?}",
+                        v.text
+                    );
+                }
+                if !ev.evaluate(&w) {
+                    break;
+                }
+            }
+        }
+        // And the text keeps the user's own characters.
+        let e = formula::parse("\"\u{E000}\"&A1").unwrap();
+        let formula::Expr::Bin(_, _, r) = &e else {
+            panic!("a concatenation")
+        };
+        let (text, span) = formula::to_string_marked(&e, r);
+        assert_eq!(text, "\"\u{E000}\"&A1");
+        assert_eq!(&text[span.unwrap()], "A1");
     }
 }

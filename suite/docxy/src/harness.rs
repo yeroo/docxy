@@ -6235,12 +6235,7 @@ fn dispatch_verb(
             let v = sheet(app)?;
             let wb = &v.pkg.workbook;
             let name = |si: usize, rect: (u32, u32, u32, u32)| {
-                let (r1, c1, r2, c2) = rect;
-                let at = if (r1, c1) == (r2, c2) {
-                    cell_name(r1, c1)
-                } else {
-                    format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
-                };
+                let at = gridcore::print::area::rect_name(rect);
                 match wb.sheets.get(si) {
                     Some(s) if si != v.active => format!("{}!{at}", s.name),
                     _ => at,
