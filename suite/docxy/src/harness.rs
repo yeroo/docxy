@@ -6227,6 +6227,58 @@ fn dispatch_verb(
             ]))
         }
 
+        // The trace arrows on the active sheet (#675), in the order they were
+        // drawn: `{count, arrows:[{from, to, kind, off_sheet}]}`, `from` a cell or a
+        // range (named with its sheet when that is not the active one), `to`
+        // the cell it points at, `kind` `trace` (blue) or `error` (red).
+        "trace-read" => {
+            let v = sheet(app)?;
+            let wb = &v.pkg.workbook;
+            let name = |si: usize, rect: (u32, u32, u32, u32)| {
+                let (r1, c1, r2, c2) = rect;
+                let at = if (r1, c1) == (r2, c2) {
+                    cell_name(r1, c1)
+                } else {
+                    format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
+                };
+                match wb.sheets.get(si) {
+                    Some(s) if si != v.active => format!("{}!{at}", s.name),
+                    _ => at,
+                }
+            };
+            let arrows: Vec<Json> = v
+                .trace_arrows()
+                .iter()
+                .map(|a| {
+                    Json::obj(vec![
+                        ("from", Json::Str(name(a.from.0, a.from.1))),
+                        (
+                            "to",
+                            Json::Str(name(a.to.0, (a.to.1, a.to.2, a.to.1, a.to.2))),
+                        ),
+                        (
+                            "kind",
+                            Json::Str(
+                                match a.kind {
+                                    gridcore::audit::ArrowKind::Trace => "trace",
+                                    gridcore::audit::ArrowKind::Error => "error",
+                                }
+                                .into(),
+                            ),
+                        ),
+                        (
+                            "off_sheet",
+                            Json::Bool(a.from.0 != v.active || a.to.0 != v.active),
+                        ),
+                    ])
+                })
+                .collect();
+            Done::ok(Json::obj(vec![
+                ("count", Json::Num(arrows.len() as f64)),
+                ("arrows", Json::Arr(arrows)),
+            ]))
+        }
+
         // How many frames the app has drawn, and a request for one more.
         //
         // The primitive a driver waits on before it measures or photographs
@@ -7582,6 +7634,7 @@ mod tests {
             "doc",
             "rows",
             "cell",
+            "trace-read",
             "selection",
             "capture",
             "rect",

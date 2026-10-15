@@ -140,3 +140,115 @@ test Error Checking on a clean sheet says the check is complete
   assert dialog is error-check-done
   call dialog-click {"button":"OK"}
   assert dialog is none
+
+# The columns hold J1 = 3, J2 = J1*2, J3 = SUM(J1:J2)+1, so J3 reads the range
+# J1:J2 (and through J2, J1), and J1 is read by J2 and J3.
+
+test Trace Precedents draws one level per press, a range as a box, and Remove Arrows clears them
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type 3
+  key enter
+  type =J1*2
+  key enter
+  type =SUM(J1:J2)+1
+  key enter
+  click J3
+  call ribbon-click {"tab":"Formulas","command":"Trace Precedents"}
+  call trace-read {}
+  assert reply.count is 1
+  assert reply.arrows.0.from is J1:J2
+  assert reply.arrows.0.to is J3
+  assert reply.arrows.0.kind is trace
+  assert reply.arrows.0.off_sheet is false
+  call ribbon-click {"tab":"Formulas","command":"Trace Precedents"}
+  call trace-read {}
+  assert reply.count is 2
+  assert reply.arrows.1.from is J1
+  assert reply.arrows.1.to is J2
+  call ribbon-click {"tab":"Formulas","command":"Remove Arrows"}
+  call trace-read {}
+  assert reply.count is 0
+
+test Trace Dependents draws from the cell to the formulas that read it, one level per press
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type 3
+  key enter
+  type =J1*2
+  key enter
+  type =J2+1
+  key enter
+  click J1
+  call ribbon-click {"tab":"Formulas","command":"Trace Dependents"}
+  call trace-read {}
+  assert reply.count is 1
+  assert reply.arrows.0.from is J1
+  assert reply.arrows.0.to is J2
+  call ribbon-click {"tab":"Formulas","command":"Trace Dependents"}
+  call trace-read {}
+  assert reply.count is 2
+  assert reply.arrows.1.from is J2
+  assert reply.arrows.1.to is J3
+
+test Trace Error draws red from the cell the error starts in
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type =1/0
+  key enter
+  type =J1+1
+  key enter
+  click J2
+  call ribbon-click {"tab":"Formulas","command":"Trace Error"}
+  call trace-read {}
+  assert reply.count is 1
+  assert reply.arrows.0.from is J1
+  assert reply.arrows.0.to is J2
+  assert reply.arrows.0.kind is error
+
+test a trace with nothing to draw says why, and an edit takes the arrows away
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type 3
+  key enter
+  type =J1*2
+  key enter
+  click J1
+  call ribbon-click {"tab":"Formulas","command":"Trace Precedents"}
+  call status-read {}
+  assert reply.items.1.text is The Trace Precedents command requires that the active cell contain a formula which refers to other cells.
+  click J2
+  call ribbon-click {"tab":"Formulas","command":"Trace Precedents"}
+  call trace-read {}
+  assert reply.count is 1
+  click K1
+  type 9
+  key enter
+  call trace-read {}
+  assert reply.count is 0
+
+test Ctrl+[ selects the direct precedents, Ctrl+Shift+{ every level, Ctrl+] the direct dependents
+  open copy:../fixtures/basic.xlsx
+  click J1
+  type 3
+  key enter
+  type =J1*2
+  key enter
+  type =SUM(J1:J2)+1
+  key enter
+  click J3
+  key ctrl+[
+  assert range is J1:J2
+  click J3
+  key ctrl+shift+[
+  assert range is J1:J2
+  click J1
+  key ctrl+]
+  assert range is J2:J3
+  click J1
+  key ctrl+shift+]
+  assert range is J2:J3
+  click J3
+  key ctrl+]
+  call status-read {}
+  assert reply.items.1.text is No cells were found.

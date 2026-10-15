@@ -20,6 +20,13 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Bound;
 
+/// Excel's words when a trace has nothing to draw.
+const NO_PRECEDENTS: &str = "The Trace Precedents command requires that the active cell contain a formula which refers to other cells.";
+const NO_DEPENDENTS: &str = "The Trace Dependents command requires that the active cell be referred to by a formula in the workbook.";
+const NO_ERROR: &str =
+    "The Trace Error command requires that the active cell contain an error value.";
+const NOTHING_MORE: &str = "There is nothing more to trace.";
+
 /// A command of the smart tag's menu, on the active cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AuditAct {
@@ -35,12 +42,62 @@ pub(crate) enum AuditAct {
     Help,
     /// Formulas > Error Checking: walks the flagged cells.
     ErrorChecking,
+    /// Formulas > Trace Precedents, Trace Dependents, Trace Error: one more
+    /// level of arrows for the active cell.
+    Trace(TraceKind),
+    /// Formulas > Remove Arrows.
+    RemoveArrows,
+    /// Ctrl+[ and Ctrl+Shift+{ (`all`: every level): select what the cells
+    /// read; Ctrl+] and Ctrl+Shift+}: the formulas that read them.
+    Select { kind: Reach, all: bool },
+}
+
+/// Which way a selection or trace goes from the active cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reach {
+    Precedents,
+    Dependents,
+}
+
+/// What a trace draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TraceKind {
+    Precedents,
+    Dependents,
+    Error,
+}
+
+impl AuditAct {
+    /// Whether the command changes the sheet, as against reading it or only
+    /// drawing over it: refused in Protected View and on a multi-area
+    /// selection, which the smart tag does not act on.
+    pub(crate) fn edits(self) -> bool {
+        matches!(
+            self,
+            AuditAct::ConvertToNumber | AuditAct::CopyFormula | AuditAct::IgnoreError
+        )
+    }
+}
+
+/// One press of a trace command: the arrows it left for a cell, `level`
+/// deep, as they were when it ran.
+pub(crate) struct TraceSet {
+    pub sheet: usize,
+    pub cell: (u32, u32),
+    pub kind: TraceKind,
+    pub level: u32,
+    pub arrows: Vec<audit::Arrow>,
 }
 
 /// What the view remembers between paints.
 #[derive(Default)]
 pub(crate) struct AuditState {
     cache: RefCell<FlagCache>,
+    /// The traces drawn, valid while the sheet stands as it was when they
+    /// were made (`traces_gen` is its `edit_gen`): arrows are view state,
+    /// never saved, and an edit takes them away.
+    traces: Vec<TraceSet>,
+    traces_gen: u64,
 }
 
 /// The flags found so far, valid for one (`edit_gen`, sheet).
@@ -94,6 +151,121 @@ impl SheetView {
     pub(crate) fn copy_formula_source(&self) -> Option<(Along, String)> {
         let (r, c) = self.sel;
         audit::consistent_formula(&self.pkg.workbook, self.active, r, c)
+    }
+
+    /// The traces still drawn: none once an edit has moved the sheet on, and
+    /// only the active sheet's.
+    pub(crate) fn live_traces(&self) -> impl Iterator<Item = &TraceSet> {
+        let live = self.audit.traces_gen == self.edit_gen;
+        self.audit
+            .traces
+            .iter()
+            .filter(move |t| live && t.sheet == self.active)
+    }
+
+    /// Every arrow of the live traces.
+    pub(crate) fn trace_arrows(&self) -> Vec<audit::Arrow> {
+        self.live_traces()
+            .flat_map(|t| t.arrows.iter().copied())
+            .collect()
+    }
+
+    /// Remove Arrows.
+    pub(crate) fn remove_arrows(&mut self) {
+        self.audit.traces.clear();
+    }
+
+    /// One press of a trace command on the active cell: a new trace at level
+    /// one, or the next level of the one already drawn for the cell. Excel's
+    /// refusal, as the status line shows it, when there is nothing to trace
+    /// or nothing more of it; the arrows count when it drew.
+    pub(crate) fn trace(&mut self, kind: TraceKind) -> Result<usize, String> {
+        let (s, (r, c)) = (self.active, self.sel);
+        // Arrows of an older state of the sheet, or of another sheet, go.
+        if self.audit.traces_gen != self.edit_gen {
+            self.audit.traces.clear();
+            self.audit.traces_gen = self.edit_gen;
+        }
+        self.audit.traces.retain(|t| t.sheet == s);
+        let found = self
+            .audit
+            .traces
+            .iter()
+            .position(|t| t.cell == (r, c) && t.kind == kind);
+        let level = found.map_or(1, |i| self.audit.traces[i].level + 1);
+        let arrows = match kind {
+            TraceKind::Precedents => audit::precedent_arrows(&self.pkg.workbook, s, r, c, level),
+            TraceKind::Dependents => audit::dependent_arrows(&mut self.engine, s, r, c, level),
+            TraceKind::Error => audit::error_arrows(&self.pkg.workbook, s, r, c),
+        };
+        let before = found.map_or(0, |i| self.audit.traces[i].arrows.len());
+        if arrows.is_empty() && found.is_none() {
+            return Err(match kind {
+                TraceKind::Precedents => NO_PRECEDENTS,
+                TraceKind::Dependents => NO_DEPENDENTS,
+                TraceKind::Error => NO_ERROR,
+            }
+            .into());
+        }
+        if arrows.len() == before {
+            return Err(NOTHING_MORE.into());
+        }
+        let n = arrows.len();
+        let set = TraceSet {
+            sheet: s,
+            cell: (r, c),
+            kind,
+            level,
+            arrows,
+        };
+        match found {
+            Some(i) => self.audit.traces[i] = set,
+            None => self.audit.traces.push(set),
+        }
+        Ok(n)
+    }
+
+    /// Ctrl+[ and its kin: select the precedents or dependents of the
+    /// selection, the active cell going to the first found. A precedent on
+    /// another sheet is jumped to when the sheet has none of its own.
+    pub(crate) fn select_reach(&mut self, kind: Reach, all: bool) -> Result<(), String> {
+        use gridcore::edit::{GoSpecial, go_to_special};
+        let s = self.active;
+        let special = match kind {
+            Reach::Precedents => GoSpecial::Precedents { all },
+            Reach::Dependents => GoSpecial::Dependents { all },
+        };
+        let found = go_to_special(
+            &self.pkg.workbook,
+            s,
+            &self.areas_all(),
+            self.sel,
+            special,
+            &[],
+        );
+        match found {
+            Ok(rects) => {
+                self.set_areas(&rects);
+                Ok(())
+            }
+            Err(why) => {
+                let (r, c) = self.sel;
+                let away = (kind == Reach::Precedents)
+                    .then(|| {
+                        gridcore::formula::direct_precedents(&self.pkg.workbook, s, r, c)
+                            .into_iter()
+                            .find(|&(si, _)| si != s)
+                    })
+                    .flatten();
+                match away {
+                    Some((si, rect)) => {
+                        crate::sheet_goto::go_to(self, si, rect);
+                        Ok(())
+                    }
+                    None => Err(why.into()),
+                }
+            }
+        }
     }
 
     /// Convert to Number on the active cell: one undo step. `Ok(false)` when
@@ -155,6 +327,35 @@ impl crate::Docxy {
             self.sheet_begin_edit(None, cx);
             return;
         }
+        match act {
+            AuditAct::Trace(kind) => {
+                let done = self.active_sheet_mut().map(|v| v.trace(kind));
+                match done {
+                    Some(Ok(n)) => {
+                        self.set_status(format!("{n} arrow{} drawn", if n == 1 { "" } else { "s" }))
+                    }
+                    Some(Err(e)) => self.set_status(e),
+                    None => {}
+                }
+                cx.notify();
+                return;
+            }
+            AuditAct::RemoveArrows => {
+                if let Some(v) = self.active_sheet_mut() {
+                    v.remove_arrows();
+                }
+                cx.notify();
+                return;
+            }
+            AuditAct::Select { kind, all } => {
+                if let Some(Err(e)) = self.active_sheet_mut().map(|v| v.select_reach(kind, all)) {
+                    self.set_status(e);
+                }
+                cx.notify();
+                return;
+            }
+            _ => {}
+        }
         if act == AuditAct::ErrorChecking {
             if let Some(tab) = self.tabs.get_mut(self.active) {
                 if let Err(e) = open_error_checking(tab) {
@@ -173,7 +374,11 @@ impl crate::Docxy {
             AuditAct::CopyFormula => v.audit_copy_formula().map(|d| (d, "Formula copied")),
             AuditAct::IgnoreError => v.audit_ignore().map(|d| (d, "Error ignored")),
             AuditAct::Help => Ok((false, "")),
-            AuditAct::EditInFormulaBar | AuditAct::ErrorChecking => unreachable!("handled above"),
+            AuditAct::EditInFormulaBar
+            | AuditAct::ErrorChecking
+            | AuditAct::Trace(_)
+            | AuditAct::RemoveArrows
+            | AuditAct::Select { .. } => unreachable!("handled above"),
         };
         match (act, done) {
             (_, Err(e)) => self.set_status(e),
@@ -401,6 +606,188 @@ fn ignore_here(tab: &mut DocTab, start: (u32, u32), cur: (u32, u32)) -> Result<(
     } else {
         show(tab, start, Some(cur))
     }
+}
+
+/// A trace arrow laid out in pixels, relative to the grid layer the cells
+/// are drawn under.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Line {
+    pub from: (f32, f32),
+    pub to: (f32, f32),
+    /// Red, along an error (Trace Error); else blue.
+    pub red: bool,
+    /// Dashed and black from a worksheet icon: the other end is on another sheet.
+    pub off_sheet: bool,
+    /// The box round a range the arrow starts from: (x0, y0, x1, y1).
+    pub boxed: Option<(f32, f32, f32, f32)>,
+    /// Where the worksheet icon sits (its top-left), when an end is off the sheet.
+    pub icon: Option<(f32, f32)>,
+}
+
+/// The worksheet icon's side.
+pub(crate) const ICON: f32 = 16.0;
+
+/// Lay the arrows out for the sheet `active`: `col_x` is a column's left edge
+/// (`None` when it is scrolled out of the layer), `row_y` a row's top,
+/// `col_w` a column's width and `row_h` a cell's height. An arrow with an end
+/// that is not drawn is left out; one with an end on another sheet runs to
+/// the worksheet icon beside its cell.
+pub(crate) fn layout(
+    arrows: &[audit::Arrow],
+    active: usize,
+    col_x: impl Fn(u32) -> Option<f32>,
+    row_y: impl Fn(u32) -> f32,
+    col_w: impl Fn(u32) -> f32,
+    row_h: f32,
+) -> Vec<Line> {
+    let mid_left = |r: u32, c: u32| col_x(c).map(|x| (x + 6.0, row_y(r) + row_h / 2.0));
+    let mut out = Vec::new();
+    for a in arrows {
+        let red = a.kind == audit::ArrowKind::Error;
+        let (fs, (r1, c1, r2, c2)) = a.from;
+        let (ts, tr, tc) = a.to;
+        if (fs, r1, c1) == (ts, tr, tc) && (r1, c1) == (r2, c2) {
+            continue;
+        }
+        let line = match (fs == active, ts == active) {
+            (true, true) => {
+                let (Some(from), Some(to)) = (mid_left(r1, c1), mid_left(tr, tc)) else {
+                    continue;
+                };
+                let boxed = ((r1, c1) != (r2, c2))
+                    .then(|| {
+                        let (x0, y0) = (col_x(c1)?, row_y(r1));
+                        Some((x0, y0, col_x(c2)? + col_w(c2), row_y(r2) + row_h))
+                    })
+                    .flatten();
+                Line {
+                    from,
+                    to,
+                    red,
+                    off_sheet: false,
+                    boxed,
+                    icon: None,
+                }
+            }
+            (false, true) => {
+                let Some(to) = mid_left(tr, tc) else { continue };
+                let icon = ((to.0 - 6.0 - 30.0).max(0.0), to.1 - ICON / 2.0);
+                Line {
+                    from: (icon.0 + ICON, icon.1 + ICON / 2.0),
+                    to,
+                    red,
+                    off_sheet: true,
+                    boxed: None,
+                    icon: Some(icon),
+                }
+            }
+            (true, false) => {
+                let (Some(from), Some(x)) = (mid_left(r1, c1), col_x(c1)) else {
+                    continue;
+                };
+                let icon = (x + col_w(c1) + 14.0, from.1 - ICON / 2.0);
+                Line {
+                    from,
+                    to: (icon.0, icon.1 + ICON / 2.0),
+                    red,
+                    off_sheet: true,
+                    boxed: None,
+                    icon: Some(icon),
+                }
+            }
+            (false, false) => continue,
+        };
+        out.push(line);
+    }
+    out
+}
+
+/// The elements that draw the lines over the grid: one canvas for every
+/// stroke, and a worksheet icon where an arrow comes from or goes to another
+/// sheet. Not interactive.
+pub(crate) fn overlay(lines: Vec<Line>) -> Vec<gpui::AnyElement> {
+    use gpui::prelude::*;
+    use gpui::{PathBuilder, Pixels, Point, canvas, div, point, px};
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let icons: Vec<(f32, f32)> = lines.iter().filter_map(|l| l.icon).collect();
+    let strokes = canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _cx| {
+            let at = |x: f32, y: f32| -> Point<Pixels> {
+                point(bounds.origin.x + px(x), bounds.origin.y + px(y))
+            };
+            for l in &lines {
+                let color = crate::hsla_u(match (l.off_sheet, l.red) {
+                    (true, _) => 0x303030,
+                    (false, true) => 0xd00000,
+                    (false, false) => 0x1f5fbf,
+                });
+                let mut stroke = |width: f32, dashed: bool, pts: &[(f32, f32)]| {
+                    let mut b = PathBuilder::stroke(px(width));
+                    if dashed {
+                        b = b.dash_array(&[px(4.0), px(3.0)]);
+                    }
+                    for (i, &(x, y)) in pts.iter().enumerate() {
+                        if i == 0 {
+                            b.move_to(at(x, y));
+                        } else {
+                            b.line_to(at(x, y));
+                        }
+                    }
+                    if let Ok(path) = b.build() {
+                        window.paint_path(path, color);
+                    }
+                };
+                stroke(1.5, l.off_sheet, &[l.from, l.to]);
+                // The arrowhead, two strokes back from the point.
+                let (dx, dy) = (l.to.0 - l.from.0, l.to.1 - l.from.1);
+                let len = (dx * dx + dy * dy).sqrt().max(1.0);
+                let (ux, uy) = (dx / len, dy / len);
+                let back = (l.to.0 - ux * 8.0, l.to.1 - uy * 8.0);
+                for side in [-1.0, 1.0] {
+                    let wing = (back.0 - uy * 4.0 * side, back.1 + ux * 4.0 * side);
+                    stroke(1.5, false, &[l.to, wing]);
+                }
+                // The dot the arrow starts from.
+                stroke(5.0, false, &[l.from, (l.from.0 + 0.1, l.from.1)]);
+                if let Some((x0, y0, x1, y1)) = l.boxed {
+                    stroke(
+                        1.0,
+                        false,
+                        &[(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)],
+                    );
+                }
+            }
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full();
+    let mut out = vec![strokes.into_any_element()];
+    for (x, y) in icons {
+        out.push(
+            div()
+                .absolute()
+                .left(px(x))
+                .top(px(y))
+                .w(px(ICON))
+                .h(px(ICON))
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(crate::hsla_u(0xffffff))
+                .border_1()
+                .border_color(crate::hsla_u(0x303030))
+                .text_size(px(10.))
+                .text_color(crate::hsla_u(0x303030))
+                .child("\u{25A6}")
+                .into_any_element(),
+        );
+    }
+    out
 }
 
 #[cfg(test)]
@@ -639,5 +1026,303 @@ mod tests {
         ]);
         at(&mut v, "B2");
         assert!(ids(&v).contains(&"copy-formula".to_string()));
+    }
+
+    fn chain() -> SheetView {
+        // D1 = SUM(B1:B2) + C1; B1 = A1 * 2; E1 = D1 + 1.
+        view(&[
+            ("A1", Cell::number(3.0)),
+            ("B1", Cell::formula("A1*2")),
+            ("B2", Cell::number(5.0)),
+            ("C1", Cell::number(1.0)),
+            ("D1", Cell::formula("SUM(B1:B2)+C1")),
+            ("E1", Cell::formula("D1+1")),
+        ])
+    }
+
+    fn pairs(v: &SheetView) -> Vec<(String, String)> {
+        v.trace_arrows()
+            .iter()
+            .map(|a| {
+                let (r1, c1, r2, c2) = a.from.1;
+                let from = if (r1, c1) == (r2, c2) {
+                    gridcore::sheet::cell_name(r1, c1)
+                } else {
+                    format!(
+                        "{}:{}",
+                        gridcore::sheet::cell_name(r1, c1),
+                        gridcore::sheet::cell_name(r2, c2)
+                    )
+                };
+                (from, gridcore::sheet::cell_name(a.to.1, a.to.2))
+            })
+            .collect()
+    }
+
+    fn p(a: &str, b: &str) -> (String, String) {
+        (a.to_string(), b.to_string())
+    }
+
+    #[test]
+    fn trace_precedents_draws_one_more_level_each_press() {
+        let mut v = chain();
+        at(&mut v, "D1");
+        assert_eq!(v.trace(TraceKind::Precedents), Ok(2));
+        assert_eq!(pairs(&v), vec![p("B1:B2", "D1"), p("C1", "D1")]);
+        assert_eq!(v.trace(TraceKind::Precedents), Ok(3));
+        assert_eq!(
+            pairs(&v),
+            vec![p("B1:B2", "D1"), p("C1", "D1"), p("A1", "B1")]
+        );
+        assert_eq!(
+            v.trace(TraceKind::Precedents),
+            Err(NOTHING_MORE.to_string()),
+            "nothing past A1"
+        );
+        assert_eq!(v.trace_arrows().len(), 3, "the drawing stands");
+    }
+
+    #[test]
+    fn trace_dependents_draws_from_the_cell_one_level_each_press() {
+        let mut v = chain();
+        at(&mut v, "B1");
+        assert_eq!(v.trace(TraceKind::Dependents), Ok(1));
+        assert_eq!(pairs(&v), vec![p("B1", "D1")]);
+        assert_eq!(v.trace(TraceKind::Dependents), Ok(2));
+        assert_eq!(pairs(&v), vec![p("B1", "D1"), p("D1", "E1")]);
+    }
+
+    #[test]
+    fn traces_of_different_cells_and_kinds_stay_together_until_removed() {
+        let mut v = chain();
+        at(&mut v, "E1");
+        v.trace(TraceKind::Precedents).unwrap();
+        at(&mut v, "B1");
+        v.trace(TraceKind::Dependents).unwrap();
+        assert_eq!(pairs(&v), vec![p("D1", "E1"), p("B1", "D1")]);
+        v.remove_arrows();
+        assert!(v.trace_arrows().is_empty());
+    }
+
+    #[test]
+    fn a_trace_with_nothing_to_draw_says_why() {
+        let mut v = chain();
+        at(&mut v, "A1");
+        assert_eq!(v.trace(TraceKind::Precedents), Err(NO_PRECEDENTS.into()));
+        at(&mut v, "E1");
+        assert_eq!(v.trace(TraceKind::Dependents), Err(NO_DEPENDENTS.into()));
+        assert_eq!(v.trace(TraceKind::Error), Err(NO_ERROR.into()));
+        assert!(v.trace_arrows().is_empty());
+    }
+
+    #[test]
+    fn trace_error_draws_red_from_where_the_error_starts() {
+        let mut v = view(&[
+            ("A1", Cell::number(5.0)),
+            ("B1", Cell::formula("A1/0")),
+            ("C1", Cell::formula("B1+1")),
+        ]);
+        at(&mut v, "C1");
+        assert_eq!(v.trace(TraceKind::Error), Ok(2));
+        let kinds: Vec<_> = v.trace_arrows().iter().map(|a| a.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![audit::ArrowKind::Error, audit::ArrowKind::Trace]
+        );
+    }
+
+    #[test]
+    fn an_edit_takes_the_arrows_away() {
+        let mut v = chain();
+        at(&mut v, "D1");
+        v.trace(TraceKind::Precedents).unwrap();
+        assert!(!v.trace_arrows().is_empty());
+        v.push_undo(SheetStep::Named("Test"));
+        v.pkg.workbook.sheets[0].set_cell(0, 2, Cell::number(2.0));
+        assert!(v.trace_arrows().is_empty(), "the sheet moved on");
+        // A new trace starts from level one again.
+        assert_eq!(v.trace(TraceKind::Precedents), Ok(2));
+    }
+
+    #[test]
+    fn arrows_belong_to_their_sheet() {
+        let mut v = chain();
+        at(&mut v, "D1");
+        v.trace(TraceKind::Precedents).unwrap();
+        v.active = 1;
+        assert!(v.trace_arrows().is_empty());
+        v.active = 0;
+        assert_eq!(v.trace_arrows().len(), 2);
+    }
+
+    /// The cells the selection covers, whichever way the areas are cut.
+    fn selected(v: &SheetView) -> Vec<(u32, u32)> {
+        let mut cells: Vec<(u32, u32)> = v
+            .areas_all()
+            .into_iter()
+            .flat_map(|(r1, c1, r2, c2)| {
+                (r1..=r2).flat_map(move |r| (c1..=c2).map(move |c| (r, c)))
+            })
+            .collect();
+        cells.sort_unstable();
+        cells.dedup();
+        cells
+    }
+
+    fn cells(names: &[&str]) -> Vec<(u32, u32)> {
+        let mut out: Vec<_> = names
+            .iter()
+            .map(|n| gridcore::sheet::parse_cell_name(n).unwrap())
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn ctrl_bracket_selects_the_direct_precedents_and_shift_all_of_them() {
+        let mut v = chain();
+        at(&mut v, "D1");
+        assert_eq!(v.select_reach(Reach::Precedents, false), Ok(()));
+        assert_eq!(selected(&v), cells(&["B1", "B2", "C1"]));
+        at(&mut v, "D1");
+        v.clear_areas();
+        assert_eq!(v.select_reach(Reach::Precedents, true), Ok(()));
+        assert_eq!(selected(&v), cells(&["A1", "B1", "B2", "C1"]), "A1 too");
+    }
+
+    #[test]
+    fn ctrl_bracket_selects_the_direct_dependents_and_shift_all_of_them() {
+        let mut v = chain();
+        at(&mut v, "B1");
+        assert_eq!(v.select_reach(Reach::Dependents, false), Ok(()));
+        assert_eq!(selected(&v), cells(&["D1"]));
+        at(&mut v, "B1");
+        v.clear_areas();
+        assert_eq!(v.select_reach(Reach::Dependents, true), Ok(()));
+        assert_eq!(selected(&v), cells(&["D1", "E1"]));
+    }
+
+    #[test]
+    fn selecting_with_nothing_to_select_says_so_and_leaves_the_selection() {
+        let mut v = chain();
+        at(&mut v, "A1");
+        assert!(v.select_reach(Reach::Precedents, false).is_err());
+        assert_eq!(v.sel, gridcore::sheet::parse_cell_name("A1").unwrap());
+        at(&mut v, "E1");
+        assert!(v.select_reach(Reach::Dependents, false).is_err());
+    }
+
+    #[test]
+    fn ctrl_bracket_goes_to_a_precedent_on_another_sheet() {
+        let mut v = view(&[("A1", Cell::formula("Sheet2!B3+1"))]);
+        let mut other = gridcore::sheet::Sheet {
+            name: "Sheet2".into(),
+            ..Default::default()
+        };
+        other.set_cell(2, 1, Cell::number(7.0));
+        v.pkg.workbook.sheets.push(other);
+        at(&mut v, "A1");
+        assert_eq!(v.select_reach(Reach::Precedents, false), Ok(()));
+        assert_eq!(v.active, 1);
+        assert_eq!(v.sel, gridcore::sheet::parse_cell_name("B3").unwrap());
+    }
+
+    fn lay(arrows: &[audit::Arrow], active: usize) -> Vec<Line> {
+        layout(
+            arrows,
+            active,
+            |c| (c < 20).then_some(30.0 + c as f32 * 64.0),
+            |r| r as f32 * 21.0,
+            |_| 64.0,
+            20.0,
+        )
+    }
+
+    #[test]
+    fn a_range_arrow_is_a_box_and_one_line_into_the_cell() {
+        let mut v = chain();
+        at(&mut v, "D1");
+        v.trace(TraceKind::Precedents).unwrap();
+        let lines = lay(&v.trace_arrows(), 0);
+        assert_eq!(lines.len(), 2);
+        // B1:B2 -> D1: the box is the two cells, the line goes to D1's left edge.
+        let boxed = lines[0].boxed.unwrap();
+        assert_eq!(boxed, (94.0, 0.0, 158.0, 41.0));
+        assert_eq!(lines[0].from, (100.0, 10.0));
+        assert_eq!(lines[0].to, (30.0 + 3.0 * 64.0 + 6.0, 10.0));
+        assert!(lines[1].boxed.is_none(), "C1 is one cell");
+        assert!(
+            lines
+                .iter()
+                .all(|l| !l.off_sheet && l.icon.is_none() && !l.red)
+        );
+    }
+
+    #[test]
+    fn an_arrow_from_another_sheet_runs_from_the_worksheet_icon() {
+        let a = audit::Arrow {
+            from: (1, (4, 2, 4, 2)),
+            to: (0, 0, 3),
+            kind: audit::ArrowKind::Trace,
+        };
+        let lines = lay(&[a], 0);
+        let l = &lines[0];
+        assert!(l.off_sheet);
+        let icon = l.icon.unwrap();
+        assert_eq!(
+            l.from,
+            (icon.0 + ICON, icon.1 + ICON / 2.0),
+            "from the icon"
+        );
+        assert_eq!(l.to, (30.0 + 3.0 * 64.0 + 6.0, 10.0));
+        // And one to a dependent on another sheet ends at its icon.
+        let b = audit::Arrow {
+            from: (0, (0, 1, 0, 1)),
+            to: (1, 7, 7),
+            kind: audit::ArrowKind::Trace,
+        };
+        let lines = lay(&[b], 0);
+        assert!(lines[0].off_sheet && lines[0].icon.is_some());
+        assert_eq!(lines[0].from, (30.0 + 64.0 + 6.0, 10.0));
+        // An arrow between two other sheets is not drawn here.
+        let c = audit::Arrow {
+            from: (1, (0, 0, 0, 0)),
+            to: (2, 1, 1),
+            kind: audit::ArrowKind::Trace,
+        };
+        assert!(lay(&[c], 0).is_empty());
+    }
+
+    #[test]
+    fn an_arrow_to_a_scrolled_off_column_is_left_out_and_red_is_kept() {
+        let a = audit::Arrow {
+            from: (0, (0, 0, 0, 0)),
+            to: (0, 2, 25),
+            kind: audit::ArrowKind::Error,
+        };
+        assert!(lay(&[a], 0).is_empty(), "column 25 is not drawn");
+        let b = audit::Arrow {
+            from: (0, (0, 0, 0, 0)),
+            to: (0, 2, 2),
+            kind: audit::ArrowKind::Error,
+        };
+        assert!(lay(&[b], 0)[0].red);
+    }
+
+    #[test]
+    fn the_trace_commands_are_not_todo_and_run_through_the_ribbon_table() {
+        use crate::sheet_ribbon::{resolve_on, tab_def};
+        let formulas = tab_def(crate::RibbonTab::Formulas);
+        for (label, kind) in [
+            ("Trace Precedents", Some(TraceKind::Precedents)),
+            ("Trace Dependents", Some(TraceKind::Dependents)),
+            ("Trace Error", Some(TraceKind::Error)),
+            ("Remove Arrows", None),
+        ] {
+            let c = resolve_on(formulas, "Formulas", label, |_| false)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+            let want = kind.map_or(AuditAct::RemoveArrows, AuditAct::Trace);
+            assert_eq!(c.act, crate::SheetAct::Audit(want), "{label}");
+        }
     }
 }

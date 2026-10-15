@@ -874,10 +874,17 @@ extends a Project range from the cursor instead of replacing it (#560). The
 Project `cell` reply adds the task's `id` and `uid`, and `entry: true` on the
 entry row, which reads empty.
 On a sheet, `call cell {"cell":"B2"}` replies `{cell, row, col, text, value,
-empty, hyperlink}`: `text` is what the cell shows, `value` its input text (a
-formula with its `=`, a text a typed entry would read otherwise with its `'`,
-so a Flash Filled `'042` reads as text), and `hyperlink` its link target or
-null (#667).
+empty, hyperlink, flags, flagged}`: `text` is what the cell shows, `value` its
+input text (a formula with its `=`, a text a typed entry would read otherwise
+with its `'`, so a Flash Filled `'042` reads as text), `hyperlink` its link
+target or null (#667), and `flags` the Error Checking rules that flag it as
+`<ignoredError>` names them (`evalError`, `numberStoredAsText`, `formula`,
+`formulaRange`, `emptyCellReference`, `unlockedFormula`; an ignored one is
+out), which is what the green corner indicator draws for; `flagged` says
+whether there are any (#675). `call trace-read {}` replies `{count, arrows:[{from,
+to, kind, off_sheet}]}`: the trace arrows drawn on the active sheet, `from` a
+cell or a range (with its sheet's name when that is another sheet), `to` the
+cell it points at, `kind` `trace` (blue) or `error` (red).
 
 `call rows {}` lists the rows the entry table draws, top to bottom, without the
 entry row; an optional `tab` picks a Project tab as the control verbs do, without

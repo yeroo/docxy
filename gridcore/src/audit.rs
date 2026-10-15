@@ -384,6 +384,166 @@ fn refs_empty(wb: &Workbook, sheet: usize, row: u32, col: u32) -> bool {
         })
 }
 
+/// What colour a trace arrow is drawn in: blue for Trace Precedents and
+/// Dependents, red along the cells that carry an error (Trace Error).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArrowKind {
+    Trace,
+    Error,
+}
+
+/// One trace arrow, from a cell or range (`from`) to the cell it points at.
+/// Either end may be on another sheet than the one traced: the host draws
+/// the worksheet icon there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Arrow {
+    /// The sheet and the (r1, c1, r2, c2) it starts from.
+    pub from: (usize, (u32, u32, u32, u32)),
+    /// The sheet, row and column it points at.
+    pub to: (usize, u32, u32),
+    pub kind: ArrowKind,
+}
+
+/// No trace draws more arrows than this: a column of a million formulas is
+/// not a picture.
+pub const MAX_ARROWS: usize = 2000;
+
+/// The formula cells of `area`, in sheet order, as (sheet, row, col).
+fn formula_cells(wb: &Workbook, (si, (r1, c1, r2, c2)): crate::formula::Area) -> Vec<Key> {
+    let Some(s) = wb.sheets.get(si) else {
+        return Vec::new();
+    };
+    s.cells
+        .range((r1, 0)..=(r2, u32::MAX))
+        .filter(|((_, c), cell)| (c1..=c2).contains(c) && cell.formula.is_some())
+        .map(|(&(r, c), _)| (si, r, c))
+        .collect()
+}
+
+use crate::engine::{Engine, Key};
+
+/// Trace Precedents from the formula at (`sheet`, `row`, `col`), `level`
+/// presses deep: the first draws an arrow into the cell from each range its
+/// formula reads, each further one the arrows into the formula cells of
+/// those ranges, and so on. A cell is followed once.
+pub fn precedent_arrows(wb: &Workbook, sheet: usize, row: u32, col: u32, level: u32) -> Vec<Arrow> {
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<Key> = [(sheet, row, col)].into();
+    let mut frontier = vec![(sheet, row, col)];
+    for _ in 0..level {
+        let mut next = Vec::new();
+        for (s, r, c) in frontier {
+            for area in direct_precedents(wb, s, r, c) {
+                if out.len() >= MAX_ARROWS {
+                    return out;
+                }
+                out.push(Arrow {
+                    from: area,
+                    to: (s, r, c),
+                    kind: ArrowKind::Trace,
+                });
+                next.extend(
+                    formula_cells(wb, area)
+                        .into_iter()
+                        .filter(|k| seen.insert(*k)),
+                );
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    out
+}
+
+/// Trace Dependents from the cell at (`sheet`, `row`, `col`), `level` presses
+/// deep: an arrow from the cell to each formula that reads it, then from
+/// each of those to the formulas that read them. A cell is followed once.
+pub fn dependent_arrows(
+    eng: &mut Engine,
+    sheet: usize,
+    row: u32,
+    col: u32,
+    level: u32,
+) -> Vec<Arrow> {
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<Key> = [(sheet, row, col)].into();
+    let mut frontier = vec![(sheet, row, col)];
+    for _ in 0..level {
+        let mut next = Vec::new();
+        for (s, r, c) in frontier {
+            for k in eng.direct_dependents(s, r, c) {
+                if k == (s, r, c) {
+                    continue;
+                }
+                if out.len() >= MAX_ARROWS {
+                    return out;
+                }
+                out.push(Arrow {
+                    from: (s, (r, c, r, c)),
+                    to: k,
+                    kind: ArrowKind::Trace,
+                });
+                if seen.insert(k) {
+                    next.push(k);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    out
+}
+
+/// Trace Error from the cell holding an error value: red arrows along the
+/// ranges that hold errors, followed back to where the error starts, and
+/// blue ones from the ranges that hold none. Empty when the cell holds no
+/// error.
+pub fn error_arrows(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Vec<Arrow> {
+    let is_error = |s: usize, r: u32, c: u32| {
+        wb.sheets
+            .get(s)
+            .and_then(|sh| sh.cell(r, c))
+            .is_some_and(|x| matches!(x.value, CellValue::Error(_)))
+    };
+    let mut out = Vec::new();
+    if !is_error(sheet, row, col) {
+        return out;
+    }
+    let mut seen: std::collections::HashSet<Key> = [(sheet, row, col)].into();
+    let mut frontier = vec![(sheet, row, col)];
+    while let Some((s, r, c)) = frontier.pop() {
+        for area in direct_precedents(wb, s, r, c) {
+            if out.len() >= MAX_ARROWS {
+                return out;
+            }
+            let (si, (r1, c1, r2, c2)) = area;
+            let errors: Vec<Key> = wb.sheets.get(si).map_or_else(Vec::new, |sh| {
+                sh.cells
+                    .range((r1, 0)..=(r2, u32::MAX))
+                    .filter(|((_, cc), _)| (c1..=c2).contains(cc))
+                    .filter(|(_, x)| matches!(x.value, CellValue::Error(_)))
+                    .map(|(&(rr, cc), _)| (si, rr, cc))
+                    .collect()
+            });
+            out.push(Arrow {
+                from: area,
+                to: (s, r, c),
+                kind: if errors.is_empty() {
+                    ArrowKind::Trace
+                } else {
+                    ArrowKind::Error
+                },
+            });
+            frontier.extend(errors.into_iter().filter(|k| seen.insert(*k)));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,6 +964,131 @@ mod tests {
         assert_eq!(error_title("#REF!"), "Invalid Cell Reference Error");
         assert_eq!(error_title("#VALUE!"), "Error in Value");
         assert_eq!(error_title("#WHATEVER"), "Error in Value");
+    }
+
+    fn area(a1: &str) -> (usize, (u32, u32, u32, u32)) {
+        (0, crate::sheet::parse_range_name(a1).unwrap())
+    }
+
+    fn arrow(from: &str, to: &str, kind: ArrowKind) -> Arrow {
+        let (r, c) = crate::sheet::parse_cell_name(to).unwrap();
+        Arrow {
+            from: area(from),
+            to: (0, r, c),
+            kind,
+        }
+    }
+
+    fn chain() -> Workbook {
+        // D1 = SUM(B1:B2) + C1; B1 = A1 * 2; B2 = 5; C1 = 1.
+        wb(&[
+            ("A1", Cell::number(3.0)),
+            ("B1", f("A1*2")),
+            ("B2", Cell::number(5.0)),
+            ("C1", Cell::number(1.0)),
+            ("D1", f("SUM(B1:B2)+C1")),
+        ])
+    }
+
+    #[test]
+    fn trace_precedents_goes_one_level_per_press() {
+        let w = chain();
+        let (r, c) = crate::sheet::parse_cell_name("D1").unwrap();
+        assert_eq!(
+            precedent_arrows(&w, 0, r, c, 1),
+            vec![
+                arrow("B1:B2", "D1", ArrowKind::Trace),
+                arrow("C1", "D1", ArrowKind::Trace)
+            ],
+            "a range is one arrow from its box"
+        );
+        assert_eq!(
+            precedent_arrows(&w, 0, r, c, 2),
+            vec![
+                arrow("B1:B2", "D1", ArrowKind::Trace),
+                arrow("C1", "D1", ArrowKind::Trace),
+                arrow("A1", "B1", ArrowKind::Trace),
+            ],
+            "the second press goes on from the formulas inside B1:B2"
+        );
+        assert_eq!(precedent_arrows(&w, 0, r, c, 9).len(), 3, "nothing past A1");
+        assert!(
+            precedent_arrows(&w, 0, 0, 0, 3).is_empty(),
+            "a constant has none"
+        );
+    }
+
+    #[test]
+    fn trace_precedents_names_a_precedent_on_another_sheet() {
+        let mut w = chain();
+        let mut other = Sheet {
+            name: "Other".into(),
+            ..Sheet::default()
+        };
+        other.set_cell(0, 0, Cell::number(1.0));
+        w.sheets.push(other);
+        w.sheets[0].set_cell(5, 0, f("Other!A1+1"));
+        assert_eq!(
+            precedent_arrows(&w, 0, 5, 0, 1),
+            vec![Arrow {
+                from: (1, (0, 0, 0, 0)),
+                to: (0, 5, 0),
+                kind: ArrowKind::Trace
+            }]
+        );
+    }
+
+    #[test]
+    fn trace_precedents_follows_a_cell_once_round_a_circle() {
+        let w = wb(&[("A1", f("B1")), ("B1", f("A1"))]);
+        assert_eq!(precedent_arrows(&w, 0, 0, 0, 9).len(), 2);
+    }
+
+    #[test]
+    fn trace_dependents_goes_one_level_per_press() {
+        let mut w = chain();
+        let mut eng = Engine::new(&w);
+        eng.recalc_all(&mut w);
+        let mut d = |level| dependent_arrows(&mut eng, 0, 0, 0, level);
+        assert_eq!(d(1), vec![arrow("A1", "B1", ArrowKind::Trace)]);
+        assert_eq!(
+            d(2),
+            vec![
+                arrow("A1", "B1", ArrowKind::Trace),
+                arrow("B1", "D1", ArrowKind::Trace)
+            ]
+        );
+        assert_eq!(d(9).len(), 2, "D1 feeds nothing");
+        assert!(
+            dependent_arrows(&mut eng, 0, 5, 5, 3).is_empty(),
+            "a cell nothing reads"
+        );
+    }
+
+    #[test]
+    fn trace_error_is_red_along_the_errors_and_blue_from_the_cells_without() {
+        // C1 = B1 + 1; B1 = A1 / 0 (the error starts here); A1 = 5.
+        let mut w = wb(&[
+            ("A1", Cell::number(5.0)),
+            ("B1", f("A1/0")),
+            ("C1", f("B1+1")),
+            ("D1", f("C1*2")),
+        ]);
+        let mut eng = Engine::new(&w);
+        eng.recalc_all(&mut w);
+        let (r, c) = crate::sheet::parse_cell_name("D1").unwrap();
+        let mut got = error_arrows(&w, 0, r, c);
+        got.sort_by_key(|a| a.to);
+        assert_eq!(
+            got,
+            vec![
+                arrow("A1", "B1", ArrowKind::Trace),
+                arrow("B1", "C1", ArrowKind::Error),
+                arrow("C1", "D1", ArrowKind::Error),
+            ]
+        );
+        let (r, c) = crate::sheet::parse_cell_name("A1").unwrap();
+        assert!(error_arrows(&w, 0, r, c).is_empty(), "not an error");
     }
 
     #[test]

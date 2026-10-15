@@ -1684,6 +1684,38 @@ impl Engine {
         out
     }
 
+    /// The formulas that read the cell directly: those whose dependency
+    /// ranges cover it (Trace Dependents' first level, #675), sorted. The
+    /// cell itself need not be a formula, and a formula that names itself
+    /// is listed.
+    pub fn direct_dependents(&mut self, sheet: usize, row: u32, col: u32) -> Vec<Key> {
+        self.ensure_covers();
+        let mut out = Vec::new();
+        if let Some(idx) = self.covers.as_ref().and_then(|m| m.get(&sheet)) {
+            idx.for_each_covering(row, col, |fk| out.push(fk));
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// The formulas that read the cell directly or through other formulas
+    /// (Ctrl+Shift+}), sorted; the cell itself only when it is on a circle.
+    pub fn all_dependents(&mut self, sheet: usize, row: u32, col: u32) -> Vec<Key> {
+        let mut seen: HashSet<Key> = HashSet::new();
+        let mut frontier: VecDeque<Key> = VecDeque::from([(sheet, row, col)]);
+        while let Some((s, r, c)) = frontier.pop_front() {
+            for k in self.direct_dependents(s, r, c) {
+                if seen.insert(k) {
+                    frontier.push_back(k);
+                }
+            }
+        }
+        let mut out: Vec<Key> = seen.into_iter().collect();
+        out.sort_unstable();
+        out
+    }
+
     /// Iterative calculation of one circle (Excel's File > Options >
     /// Formulas > Enable iterative calculation): sweep its cells up to
     /// `count` times. A sweep whose largest change is under `delta` means the
@@ -4563,6 +4595,64 @@ mod tests {
         assert_eq!(value_at(&wb, "C1"), CellValue::Number(21.0));
         set(&mut eng, &mut wb, "A1", Cell::formula("SEQUENCE(3,1,5,5)"));
         assert_eq!(value_at(&wb, "C1"), CellValue::Number(11.0));
+    }
+
+    fn key(a1: &str) -> Key {
+        let (r, c) = crate::sheet::parse_cell_name(a1).unwrap();
+        (0, r, c)
+    }
+
+    #[test]
+    fn direct_dependents_are_the_formulas_that_read_the_cell() {
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("B1", Cell::formula("A1+1")),
+            ("C1", Cell::formula("SUM(A1:A3)")),
+            ("D1", Cell::formula("B1*2")),
+            ("E1", Cell::formula("5")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        // A constant has dependents too; a range reads each cell in it.
+        assert_eq!(eng.direct_dependents(0, 0, 0), vec![key("B1"), key("C1")]);
+        assert_eq!(
+            eng.direct_dependents(0, 1, 0),
+            vec![key("C1")],
+            "A2 is in A1:A3"
+        );
+        assert_eq!(eng.direct_dependents(0, 0, 1), vec![key("D1")], "one level");
+        assert!(eng.direct_dependents(0, 0, 3).is_empty());
+        assert!(eng.direct_dependents(0, 9, 9).is_empty());
+        // A formula edit is seen at once: the cache is not stale.
+        set(&mut eng, &mut wb, "E1", Cell::formula("A1*3"));
+        assert_eq!(
+            eng.direct_dependents(0, 0, 0),
+            vec![key("B1"), key("C1"), key("E1")]
+        );
+    }
+
+    #[test]
+    fn all_dependents_follow_the_chain_and_stop_on_a_circle() {
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("B1", Cell::formula("A1+1")),
+            ("C1", Cell::formula("B1+1")),
+            ("D1", Cell::formula("C1+1")),
+            ("F1", Cell::formula("G1")),
+            ("G1", Cell::formula("F1")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(
+            eng.all_dependents(0, 0, 0),
+            vec![key("B1"), key("C1"), key("D1")]
+        );
+        assert!(eng.all_dependents(0, 0, 3).is_empty(), "D1 feeds nothing");
+        assert_eq!(
+            eng.all_dependents(0, 0, 5),
+            vec![key("F1"), key("G1")],
+            "a circle ends"
+        );
     }
 
     #[test]

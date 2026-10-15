@@ -69,7 +69,7 @@ Landscape and Narrow, Print Gridlines shows a ticked box, and Width: ticks
 Automatic. 5% is refused with "scale 5 is outside 10–400" and the dialog stays;
 80% applies. After the reopen the dialog shows Landscape, the narrow margins, 80%,
 gridlines and A1:C5. AutoSum writes `=AVERAGE(...)` over the run above. The
-placeholders (Themes, Arrange, Name Manager, Trace Precedents, ...) do nothing.
+placeholders (Themes, Arrange, Name Manager, Watch Window, ...) do nothing.
 
 **Fails when:** a new tab is missing or out of order, a wired command does
 nothing or is not saved, or a placeholder looks like it ran.

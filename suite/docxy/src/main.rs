@@ -1313,6 +1313,10 @@ fn multi_area_ok(act: SheetAct) -> bool {
         | SheetAct::Page(_)
         // Calculation is the workbook's, never the selection's (#674).
         | SheetAct::Calc(_) => true,
+        // The smart tag's edits act on the active cell (#675); the rest of
+        // its commands, the traces, the selections of precedents and
+        // dependents and Error Checking read the active cell or the sheet.
+        SheetAct::Audit(a) => !a.edits(),
         // One rectangle only.
         SheetAct::Cut
         | SheetAct::Paste
@@ -1360,9 +1364,7 @@ fn multi_area_ok(act: SheetAct) -> bool {
         | SheetAct::FillSeries
         | SheetAct::FillJustify
         | SheetAct::FillAs(_)
-        | SheetAct::FillDrop(_)
-        // The smart tag acts on the active cell (#675).
-        | SheetAct::Audit(_) => false,
+        | SheetAct::FillDrop(_) => false,
     }
 }
 
@@ -20392,6 +20394,18 @@ impl Docxy {
                 // #670).
                 "c" => return self.run_sheet_act(SheetAct::Copy, window, cx),
                 "g" => return self.run_sheet_act(SheetAct::GoTo, window, cx),
+                // Select the precedents (Ctrl+[) or the dependents (Ctrl+])
+                // of the selection; with Shift every level (#675).
+                "[" | "{" | "]" | "}" => {
+                    let kind = if matches!(key, "[" | "{") {
+                        sheet_audit::Reach::Precedents
+                    } else {
+                        sheet_audit::Reach::Dependents
+                    };
+                    let all = shift || matches!(key, "{" | "}");
+                    let act = SheetAct::Audit(sheet_audit::AuditAct::Select { kind, all });
+                    return self.run_sheet_act(act, window, cx);
+                }
                 "x" => return self.run_sheet_act(SheetAct::Cut, window, cx),
                 "v" => return self.run_sheet_act(SheetAct::Paste, window, cx),
                 "z" => self.sheet_undo(cx),
@@ -40572,6 +40586,15 @@ fn sheet_el(
                 .into_any_element(),
         );
     }
+    // Trace arrows (#675), over the cells they join.
+    dv_overlay.extend(sheet_audit::overlay(sheet_audit::layout(
+        &view.trace_arrows(),
+        view.active,
+        col_x,
+        row_y,
+        |c| col_px(sh.col_width(c)),
+        SHEET_ROW_H,
+    )));
     // The input message of the selected cell's rule (#689), under the cell.
     if !sel_hidden && view.editing.is_none() {
         let (tr, tc) = view.sel;

@@ -18,7 +18,7 @@
 //! with a fourth row does not compile (#1018).
 
 use crate::help_tab::HelpAct;
-use crate::sheet_audit::AuditAct;
+use crate::sheet_audit::{AuditAct, TraceKind};
 use crate::sheet_calc::CalcAct;
 use crate::sheet_menus::SheetMenu;
 use crate::sheet_page_setup::{AreaOp, BreakOp, MarginPreset, PageAct, SetupTab};
@@ -1087,9 +1087,24 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                         col(
                             COL,
                             &[
-                                row("trace-precedents", "Trace Precedents", None, SheetAct::Todo),
-                                row("trace-dependents", "Trace Dependents", None, SheetAct::Todo),
-                                row("remove-arrows", "Remove Arrows", None, SheetAct::Todo),
+                                row(
+                                    "trace-precedents",
+                                    "Trace Precedents",
+                                    None,
+                                    SheetAct::Audit(AuditAct::Trace(TraceKind::Precedents)),
+                                ),
+                                row(
+                                    "trace-dependents",
+                                    "Trace Dependents",
+                                    None,
+                                    SheetAct::Audit(AuditAct::Trace(TraceKind::Dependents)),
+                                ),
+                                row(
+                                    "remove-arrows",
+                                    "Remove Arrows",
+                                    None,
+                                    SheetAct::Audit(AuditAct::RemoveArrows),
+                                ),
                             ],
                         ),
                         col(
@@ -1104,6 +1119,17 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                                 ),
                                 row("evaluate-formula", "Evaluate Formula", None, SheetAct::Todo),
                             ],
+                        ),
+                        // Excel has Trace Error in Error Checking's drop-down; a
+                        // small row has no drop-down here, so it is a button.
+                        col(
+                            COL,
+                            &[row(
+                                "trace-error",
+                                "Trace Error",
+                                None,
+                                SheetAct::Audit(AuditAct::Trace(TraceKind::Error)),
+                            )],
                         ),
                         Item::One(large("watch-window", "Watch Window", None, SheetAct::Todo)),
                     ],
@@ -1786,9 +1812,6 @@ mod tests {
                 "define-name",
                 "use-in-formula",
                 "create-from-selection",
-                "trace-precedents",
-                "trace-dependents",
-                "remove-arrows",
                 "show-formulas",
                 "evaluate-formula",
                 "watch-window",
@@ -2034,6 +2057,7 @@ mod tests {
                         "Show Formulas",
                         "Error Checking",
                         "Evaluate Formula",
+                        "Trace Error",
                         "Watch Window",
                     ]
                 ),
@@ -2116,12 +2140,7 @@ mod tests {
                 ..
             }
         ));
-        for q in [
-            "Trace Precedents",
-            "Name Manager",
-            "Show Formulas",
-            "Watch Window",
-        ] {
+        for q in ["Name Manager", "Show Formulas", "Watch Window"] {
             assert_eq!(
                 resolve_on(f, "Formulas", q, off).unwrap_err(),
                 format!("'{q}' is not implemented")
