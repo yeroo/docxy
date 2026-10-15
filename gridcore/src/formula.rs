@@ -1791,23 +1791,22 @@ impl Printer {
                 } else {
                     self.print(r)
                 };
-                // `Rate (A1:B2):C3` reads as the call `Rate(A1:B2)`: when the
-                // right operand opens with `(` after a name or call, a bare
-                // name or call goes second (an intersection is symmetric)
-                // and a span ending in one is wrapped.
-                if *op == BinOp::Isect && !lp && rs.starts_with('(') && ends_callable(l) {
-                    if matches!(**l, Expr::Name(_) | Expr::Func(..) | Expr::Call(..)) {
-                        return format!("{rs} {ls}");
+                // `Rate (A1:B2):C3` reads as the call `Rate(A1:B2)` and
+                // `A1 (B1:C3 C2:D4)` as `A1(…)`: when the right operand opens
+                // with `(` after a cell, name or call, a bare name or call
+                // goes second (an intersection is symmetric) and anything
+                // else ending in one is wrapped. `A1 [Qty]` reads as the
+                // table reference `A1[Qty]`, so a cell or name is wrapped
+                // before a `[`.
+                if *op == BinOp::Isect && !lp {
+                    if rs.starts_with('(') && (ends_callable(l) || ends_in_cell(l)) {
+                        if matches!(**l, Expr::Name(_) | Expr::Func(..) | Expr::Call(..)) {
+                            return format!("{rs} {ls}");
+                        }
+                        ls = format!("({ls})");
+                    } else if rs.starts_with('[') && ends_in_cell(l) {
+                        ls = format!("({ls})");
                     }
-                    ls = format!("({ls})");
-                }
-                // `A1 (B1:C3 C2:D4)` reads as the call `A1(…)`, `A1 [Qty]` as
-                // the table reference `A1[Qty]`.
-                if *op == BinOp::Isect && !lp && rs.starts_with('(') && ends_in_cell(l) {
-                    ls = format!("({ls})");
-                }
-                if *op == BinOp::Isect && !lp && rs.starts_with('[') && ends_in_cell(l) {
-                    ls = format!("({ls})");
                 }
                 format!("{ls}{}{rs}", bin_symbol(*op))
             }
@@ -16150,6 +16149,22 @@ mod tests {
                 sales(TableItem::Data, "Price"),
             ),
         );
+        // A span ending in a name before `(` is wrapped once, not twice.
+        let rate_span = span(sales(TableItem::Data, "Qty"), Expr::Name("Rate".into()));
+        for ast in [
+            isect(rate_span.clone(), paren.clone()),
+            isect(
+                isect(sales(TableItem::Data, "Qty"), Expr::Name("Rate".into())),
+                paren.clone(),
+            ),
+        ] {
+            let text = to_string(&ast);
+            assert!(!text.contains("(("), "{text}");
+            assert_eq!(text.matches(')').count(), 2, "{text}");
+            let back = parse(&text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert!(matches!(back, Expr::Bin(BinOp::Isect, ..)), "{text}");
+            assert_eq!(to_string(&back), text);
+        }
         for ast in [
             isect(ref_a1.clone(), paren.clone()),
             isect(
