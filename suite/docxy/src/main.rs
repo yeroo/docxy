@@ -1280,6 +1280,7 @@ fn multi_area_ok(act: SheetAct) -> bool {
         // that pick a new selection.
         | SheetAct::Menu(_)
         | SheetAct::FreezePanes
+        | SheetAct::ShowFormulas
         | SheetAct::NewWindow
         | SheetAct::ArrangeAll
         | SheetAct::Theme
@@ -1397,6 +1398,7 @@ fn act_targets_cells(act: SheetAct) -> bool {
     !matches!(
         act,
         SheetAct::ProtectSheet
+            | SheetAct::ShowFormulas
             | SheetAct::ShowLevel(_)
             | SheetAct::ClearOutline
             | SheetAct::OutlineSettings
@@ -2214,6 +2216,9 @@ enum SheetAct {
     FontColor,
     ToggleBorder,
     FreezePanes,
+    /// Formulas › Show Formulas / Ctrl+` (#676): the active sheet's formula
+    /// cells show their formula text; saved as `<sheetView showFormulas>`.
+    ShowFormulas,
     /// View › Window › New Window (#587): move the active tab into a new
     /// window; a one-tab window opens the new window on a blank document.
     NewWindow,
@@ -8539,6 +8544,21 @@ fn grid_cell_text(
             gridcore::sheet::fmt_general_cell(*n, chars)
         }
         _ => gridcore::sheet::format_with(xf, value, d1904),
+    }
+}
+
+/// What a grid cell shows (#676): its formula as typed, `=…`, when the sheet
+/// shows formulas and the cell has one, else [`grid_cell_text`].
+fn shown_cell_text(
+    show_formulas: bool,
+    cell: &gridcore::sheet::Cell,
+    xf: &gridcore::sheet::Xf,
+    d1904: bool,
+    cell_w: f32,
+) -> String {
+    match &cell.formula {
+        Some(f) if show_formulas => format!("={f}"),
+        _ => grid_cell_text(xf, &cell.value, d1904, cell_w),
     }
 }
 
@@ -18520,6 +18540,33 @@ impl Docxy {
     }
     /// Freeze panes at the selected cell (toggles off if already frozen). Rows
     /// above and columns left of the selection stay pinned while scrolling.
+    /// Whether the active sheet shows its formulas (#676).
+    fn sheet_shows_formulas(&self) -> bool {
+        self.active_sheet().is_some_and(|v| v.sheet().show_formulas)
+    }
+
+    /// Formulas › Show Formulas / Ctrl+`: flip the active sheet's own flag
+    /// (undoable; saved with the file as `showFormulas`).
+    fn sheet_show_formulas(&mut self, cx: &mut Context<Self>) {
+        let now = !self.sheet_shows_formulas();
+        self.sheet_snapshot(SheetStep::Named(if now {
+            "Show Formulas"
+        } else {
+            "Hide Formulas"
+        }));
+        if let Some(v) = self.active_sheet_mut() {
+            let s = v.active;
+            v.pkg.workbook.sheets[s].show_formulas = now;
+        }
+        self.set_status(if now {
+            "Showing formulas"
+        } else {
+            "Showing values"
+        });
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
     fn sheet_freeze(&mut self, cx: &mut Context<Self>) {
         if let Some(v) = self.active_sheet_mut() {
             let (r, c) = v.sel;
@@ -19977,6 +20024,7 @@ impl Docxy {
             }
             SheetAct::ToggleBorder => self.sheet_toggle_border(cx),
             SheetAct::FreezePanes => self.sheet_freeze(cx),
+            SheetAct::ShowFormulas => self.sheet_show_formulas(cx),
             // View › Window (#587): app-level commands, handled on the app.
             SheetAct::NewWindow => match self.new_window(None, window, cx) {
                 Ok(_) => self.set_status("Opened a new window"),
@@ -20415,6 +20463,10 @@ impl Docxy {
                 "y" => self.sheet_redo_or_repeat(cx),
                 "b" => return self.run_sheet_act(SheetAct::Bold, window, cx),
                 "i" => return self.run_sheet_act(SheetAct::Italic, window, cx),
+                // Show Formulas (#676), Formulas › Formula Auditing's own act.
+                "`" if !shift && !alt => {
+                    return self.run_sheet_act(SheetAct::ShowFormulas, window, cx);
+                }
                 // Format Cells (#1164), Home › Cells › Format's own act.
                 "1" if format_cells_key(key, ctrl, shift, alt) => {
                     return self.run_sheet_act(SheetAct::FormatCells, window, cx);
@@ -26351,6 +26403,54 @@ mod sheet_save_tests {
         assert!(v.redo_step());
         assert_eq!(v.pivot_views.len(), 1);
         assert_eq!(saved_sheets(v), with);
+    }
+
+    /// #676: Show Formulas is one sheet's flag, an undo step, and saved.
+    #[test]
+    fn show_formulas_is_per_sheet_undoable_and_saved() {
+        let mut tab = three_sheet_tab();
+        let Surface::Sheet(v) = &mut tab.surface else {
+            unreachable!()
+        };
+        v.push_undo(super::SheetStep::Named("Show Formulas"));
+        v.pkg.workbook.sheets[1].show_formulas = true;
+        let shows = |v: &SheetView| -> Vec<bool> {
+            let saved = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&v.pkg)).unwrap();
+            saved
+                .workbook
+                .sheets
+                .iter()
+                .map(|s| s.show_formulas)
+                .collect()
+        };
+        assert_eq!(shows(v), [false, true, false]);
+        assert!(v.undo_step());
+        assert_eq!(shows(v), [false, false, false], "undo restores the flag");
+        assert!(v.redo_step());
+        assert_eq!(shows(v), [false, true, false]);
+    }
+
+    #[test]
+    fn a_shown_formula_is_its_text_and_other_cells_keep_their_value() {
+        let xf = gridcore::sheet::Xf::default();
+        let mut f = gridcore::sheet::Cell::formula("SUM(A1:A2)");
+        f.value = gridcore::sheet::CellValue::Number(3.0);
+        let n = gridcore::sheet::Cell::number(3.0);
+        assert_eq!(
+            super::shown_cell_text(true, &f, &xf, false, 200.0),
+            "=SUM(A1:A2)"
+        );
+        assert_eq!(super::shown_cell_text(false, &f, &xf, false, 200.0), "3");
+        assert_eq!(super::shown_cell_text(true, &n, &xf, false, 200.0), "3");
+    }
+
+    #[test]
+    fn show_formulas_is_a_view_act_that_does_not_target_cells() {
+        assert!(!super::act_targets_cells(super::SheetAct::ShowFormulas));
+        // It changes what the file saves, so Protected View refuses it.
+        assert!(!super::protected_view_allows_act(
+            super::SheetAct::ShowFormulas
+        ));
     }
 
     /// #789 r1: a pivot's output sheet takes the first free "Pivot", "Pivot2",
@@ -32881,8 +32981,16 @@ impl Docxy {
         // document ribbon draws a disabled command.
         let enabled = !matches!(act, SheetAct::Help(a) if !help_tab::help_enabled(a));
         let ink = if enabled { pal.fg } else { pal.dim };
+        // Show Formulas draws pressed while the sheet shows its formulas.
+        let pressed = matches!(act, SheetAct::ShowFormulas) && self.sheet_shows_formulas();
         div()
             .id(ElementId::Name(format!("srb-{label}").into()))
+            .when(pressed, |d| {
+                d.bg(Hsla {
+                    a: 0.20,
+                    ..hsla_u(accent::brand())
+                })
+            })
             .flex()
             .items_center()
             .gap_1p5()
@@ -37946,6 +38054,7 @@ fn sheet_row(
     let sh = view.sheet();
     let styles = &view.pkg.workbook.styles;
     let d1904 = view.pkg.workbook.date1904;
+    let show_formulas = sh.show_formulas;
     // The active sheet index for conditional-formatting lookups.
     let sidx = view
         .active
@@ -38070,14 +38179,18 @@ fn sheet_row(
             Some(cl) if !cl.is_blank() => {
                 let xf = styles.xf(cl.style);
                 (
-                    grid_cell_text(&xf, &cl.value, d1904, cell_w),
+                    shown_cell_text(show_formulas, cl, &xf, d1904, cell_w),
                     Some(xf),
-                    matches!(cl.value, CellValue::Number(_)),
+                    matches!(cl.value, CellValue::Number(_))
+                        && !(show_formulas && cl.formula.is_some()),
                 )
             }
             _ => (String::new(), None, false),
         };
+        let shows_formula = show_formulas && sh.cell(r, c).is_some_and(|cl| cl.formula.is_some());
         let halign = match xf.as_ref().map(|x| x.align).unwrap_or(Align::General) {
+            // A formula shown is raw text, always left (#676).
+            _ if shows_formula => 0,
             Align::Left => 0,
             Align::Center => 1,
             Align::Right => 2,

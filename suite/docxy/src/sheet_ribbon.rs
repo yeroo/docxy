@@ -1110,7 +1110,12 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                         col(
                             COL,
                             &[
-                                row("show-formulas", "Show Formulas", None, SheetAct::Todo),
+                                row(
+                                    "show-formulas",
+                                    "Show Formulas",
+                                    None,
+                                    SheetAct::ShowFormulas,
+                                ),
                                 row(
                                     "error-checking",
                                     "Error Checking",
@@ -2144,12 +2149,16 @@ mod tests {
                 ..
             }
         ));
-        for q in ["Name Manager", "Show Formulas", "Watch Window"] {
+        for q in ["Name Manager", "Watch Window"] {
             assert_eq!(
                 resolve_on(f, "Formulas", q, off).unwrap_err(),
                 format!("'{q}' is not implemented")
             );
         }
+        assert_eq!(
+            resolve_on(f, "Formulas", "Show Formulas", off).unwrap().act,
+            SheetAct::ShowFormulas
+        );
         for q in ["Themes", "View Gridlines", "Background...", "Bring Forward"] {
             assert!(resolve_on(pl, "Page Layout", q, off).is_err(), "{q}");
         }
