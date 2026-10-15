@@ -90,6 +90,7 @@ mod rich_clip;
 mod save_preserve_tests;
 #[cfg(test)]
 mod sect_pr_tests;
+mod sheet_audit;
 mod sheet_autocorrect;
 #[cfg(test)]
 mod sheet_circular_tests;
@@ -797,6 +798,8 @@ struct SheetView {
     /// How many commands are running on the view
     /// ([`DocTab::circle_cmd_begin`]): the warning waits for the outermost.
     circ_cmd: u8,
+    /// Formula auditing (#675): the error flags found for the cells drawn.
+    audit: sheet_audit::AuditState,
     /// Leftmost visible column (horizontal scroll offset). Columns virtualize by
     /// offset — rendered `col0..=cend` — so columns past the viewport are
     /// reachable (raw gpui can't wrap the virtualized row list in an h-scroller).
@@ -1355,7 +1358,9 @@ fn multi_area_ok(act: SheetAct) -> bool {
         | SheetAct::FillSeries
         | SheetAct::FillJustify
         | SheetAct::FillAs(_)
-        | SheetAct::FillDrop(_) => false,
+        | SheetAct::FillDrop(_)
+        // The smart tag acts on the active cell (#675).
+        | SheetAct::Audit(_) => false,
     }
 }
 
@@ -2321,6 +2326,8 @@ enum SheetAct {
     FlashSelectChanged,
     /// A Help tab command (#1021): the document ribbon's, run the same way.
     Help(help_tab::HelpAct),
+    /// A command of the error smart tag's menu (#675).
+    Audit(sheet_audit::AuditAct),
     Todo,
 }
 
@@ -11088,6 +11095,7 @@ fn new_sheet_surface() -> Surface {
         circ_seen: engine.circular_keys().count(),
         circ_warn: false,
         circ_cmd: 0,
+        audit: Default::default(),
         engine,
         undo: vec![],
         redo: vec![],
@@ -11180,6 +11188,7 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                     circ_seen: engine.circular_keys().count(),
                     circ_warn: false,
                     circ_cmd: 0,
+                    audit: Default::default(),
                     engine,
                     undo: vec![],
                     redo: vec![],
@@ -19812,6 +19821,10 @@ impl Docxy {
             menu::GridMenu::FillDrop | menu::GridMenu::BorderDrop => {
                 return Err("a drop menu opens only when a right-drag ends".into());
             }
+            menu::GridMenu::ErrorCheck => self
+                .active_sheet()
+                .and_then(sheet_menus::smart_tag_menu)
+                .ok_or("no error indicator is showing on the selected cell")?,
         };
         self.open_menu(menu::MenuTarget::Grid(kind), at, items, cx);
         Ok(())
@@ -20131,6 +20144,7 @@ impl Docxy {
                 cx.notify();
             }
             SheetAct::Drop(choice) => self.border_drop_choice(choice, cx),
+            SheetAct::Audit(a) => self.sheet_audit_act(a, cx),
             // Help ran at the top of `run_sheet_act`; Todo does nothing.
             SheetAct::Help(_) | SheetAct::Todo => {}
         }
@@ -38461,6 +38475,55 @@ fn sheet_row(
                         let at = ev.position;
                         ent_opts.update(cx2, |this, cx2| {
                             if let Err(e) = this.open_grid_menu(kind, at, cx2) {
+                                this.set_status(e);
+                            }
+                        });
+                    }),
+            ));
+        }
+        // Green corner indicator for a cell Error Checking flags (#675), and,
+        // on the active one, the smart tag that opens its menu.
+        let flagged = !view.cell_flags(r, c).is_empty();
+        if flagged {
+            cell = cell.relative().child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(px(0.))
+                    .h(px(0.))
+                    .border_t(px(5.))
+                    .border_l(px(5.))
+                    .border_color(hsla_u(0x1e9e4f)),
+            );
+        }
+        if flagged && (r, c) == (sr, sc) && editing.is_none() && !ov.sel_hidden {
+            let ent_tag = ent.clone();
+            cell = cell.relative().child(deferred(
+                div()
+                    .id("error-smart-tag")
+                    .absolute()
+                    .left(px(-20.))
+                    .top(px(1.))
+                    .w(px(18.))
+                    .h(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(2.))
+                    .border_1()
+                    .border_color(hsla_u(0x8a6d00))
+                    .bg(hsla_u(0xffd84d))
+                    .text_size(px(11.))
+                    .text_color(hsla_u(0x1a1a1a))
+                    .cursor_pointer()
+                    .child("!")
+                    .on_mouse_down(MouseButton::Left, move |ev, _w, cx2| {
+                        cx2.stop_propagation();
+                        let at = ev.position;
+                        ent_tag.update(cx2, |this, cx2| {
+                            if let Err(e) = this.open_grid_menu(menu::GridMenu::ErrorCheck, at, cx2)
+                            {
                                 this.set_status(e);
                             }
                         });

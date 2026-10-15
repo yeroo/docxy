@@ -186,6 +186,60 @@ pub(crate) fn paste_again_menu(current: PasteItem) -> Vec<MenuItem> {
     items
 }
 
+/// The error smart tag's menu on the active cell (#675), `None` when nothing
+/// flags it: the heading (the error's name, or the rule's), then what the
+/// rule offers, then Ignore Error and Edit in Formula Bar.
+pub(crate) fn smart_tag_menu(v: &crate::SheetView) -> Option<Vec<MenuItem>> {
+    use crate::sheet_audit::AuditAct;
+    use gridcore::audit::{Along, Rule};
+    let rule = v.flagged_rule()?;
+    let act = |a: AuditAct| SheetAct::Audit(a);
+    let mut items = vec![MenuItem::Heading(v.smart_tag_title(rule))];
+    match rule {
+        Rule::NumberAsText => items.push(item(
+            "convert-to-number",
+            "Convert to Number",
+            act(AuditAct::ConvertToNumber),
+            true,
+        )),
+        Rule::Inconsistent => {
+            if let Some((along, _)) = v.copy_formula_source() {
+                let label = match along {
+                    Along::Column => "Copy Formula from Above",
+                    Along::Row => "Copy Formula from Left",
+                };
+                items.push(item(
+                    "copy-formula",
+                    label,
+                    act(AuditAct::CopyFormula),
+                    true,
+                ));
+            }
+        }
+        _ => {}
+    }
+    items.push(item(
+        "error-help",
+        "Help on this error",
+        act(AuditAct::Help),
+        true,
+    ));
+    items.push(sep());
+    items.push(item(
+        "ignore-error",
+        "Ignore Error",
+        act(AuditAct::IgnoreError),
+        true,
+    ));
+    items.push(item(
+        "edit-in-formula-bar",
+        "Edit in Formula Bar",
+        act(AuditAct::EditInFormulaBar),
+        true,
+    ));
+    Some(items)
+}
+
 /// Home › Fill.
 pub(crate) fn fill_menu() -> Vec<MenuItem> {
     vec![

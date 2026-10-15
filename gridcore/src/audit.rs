@@ -92,6 +92,22 @@ impl Rule {
     }
 }
 
+/// What the smart tag and the Error Checking dialog call an error value, as
+/// Excel does (`Divide by Zero Error` for `#DIV/0!`).
+pub fn error_title(code: &str) -> &'static str {
+    match code {
+        "#DIV/0!" => "Divide by Zero Error",
+        "#N/A" => "Value Not Available Error",
+        "#NAME?" => "Invalid Name Error",
+        "#NULL!" => "Null Error",
+        "#NUM!" => "Number Error",
+        "#REF!" => "Invalid Cell Reference Error",
+        "#SPILL!" => "Spill Error",
+        "#CALC!" => "Calculation Error",
+        _ => "Error in Value",
+    }
+}
+
 /// Which rules are on: Excel's File > Options > Formulas > Error checking
 /// rules. All but [`Rule::RefsEmpty`] by default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -204,6 +220,61 @@ pub fn flags(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Vec<Rule> {
     out
 }
 
+/// Ignore Error: hide `rule` on one cell. The rule joins an entry that hides
+/// the same rule alone and carries nothing unmodelled, else gets an entry of
+/// its own, so what a loaded file says stays as it is.
+pub fn ignore(sheet: &mut crate::sheet::Sheet, rule: Rule, row: u32, col: u32) {
+    if sheet.ignored_errors.iter().any(|e| e.hides(rule, row, col)) {
+        return;
+    }
+    let rect = (row, col, row, col);
+    match sheet
+        .ignored_errors
+        .iter_mut()
+        .find(|e| e.extra.is_empty() && e.rules == [rule])
+    {
+        Some(e) => e.sqref.push(rect),
+        None => sheet.ignored_errors.push(IgnoredError {
+            sqref: vec![rect],
+            rules: vec![rule],
+            extra: String::new(),
+        }),
+    }
+}
+
+/// Convert to Number: the cell a number stored as text becomes: its value as
+/// a number in a General cell (the Text format and the apostrophe go), and a
+/// `12%` or `1,234` its format as typing it would give. `None` when the cell
+/// is not a number stored as text. The style is resolved into `wb`.
+pub fn convert_to_number(
+    wb: &mut Workbook,
+    sheet: usize,
+    row: u32,
+    col: u32,
+) -> Option<crate::sheet::Cell> {
+    let cell = wb.sheets.get(sheet)?.cell(row, col)?;
+    let CellValue::Text(text) = &cell.value else {
+        return None;
+    };
+    if cell.formula.is_some() {
+        return None;
+    }
+    let (n, format) = text_as_number(text)?;
+    let mut xf = wb.styles.xf(cell.style);
+    if crate::entry::is_text(&xf) {
+        xf.numfmt = crate::sheet::NumFmt::General;
+        xf.set_code(None);
+    }
+    xf.quote_prefix = false;
+    if let Some(code) = format.filter(|_| crate::entry::is_general(&xf)) {
+        xf.set_code(Some(code.to_string()));
+    }
+    let style = wb.styles.intern(xf);
+    let mut out = crate::sheet::Cell::number(n);
+    out.style = style;
+    Some(out)
+}
+
 fn number_as_text(cell: &crate::sheet::Cell) -> bool {
     cell.formula.is_none()
         && matches!(&cell.value, CellValue::Text(t) if text_as_number(t).is_some())
@@ -217,31 +288,57 @@ fn shifted(wb: &Workbook, sheet: usize, row: u32, col: u32, dr: i64, dc: i64) ->
     translate_formula(src, dr, dc)
 }
 
+/// Where an inconsistent formula's neighbours that agree with each other
+/// sit: above and below it, or to its left and right.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Along {
+    Column,
+    Row,
+}
+
 /// Inconsistent: the neighbours on both sides, in a row or in a column, are
 /// formulas that read the same relative to their own cell, and this one
-/// does not.
-fn inconsistent(wb: &Workbook, sheet: usize, row: u32, col: u32) -> bool {
+/// does not. The direction they sit in and the formula they agree on, as it
+/// reads in this cell.
+fn inconsistent_with(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Option<(Along, String)> {
     let (r, c) = (i64::from(row), i64::from(col));
-    let Some(mine) = shifted(wb, sheet, row, col, 0, 0) else {
-        return false;
-    };
+    let mine = shifted(wb, sheet, row, col, 0, 0)?;
     // (before, after) neighbours as (dr, dc) steps.
-    [((0, -1), (0, 1)), ((-1, 0), (1, 0))]
-        .into_iter()
-        .any(|((br, bc), (ar, ac))| {
-            let at = |dr: i64, dc: i64| -> Option<String> {
-                let (nr, nc) = (r + dr, c + dc);
-                if nr < 0 || nc < 0 {
-                    return None;
-                }
-                // The neighbour's formula as it would read in this cell.
-                shifted(wb, sheet, nr as u32, nc as u32, -dr, -dc)
-            };
-            match (at(br, bc), at(ar, ac)) {
-                (Some(a), Some(b)) => a == b && a != mine,
-                _ => false,
+    [
+        (Along::Row, (0, -1), (0, 1)),
+        (Along::Column, (-1, 0), (1, 0)),
+    ]
+    .into_iter()
+    .find_map(|(along, (br, bc), (ar, ac))| {
+        let at = |dr: i64, dc: i64| -> Option<String> {
+            let (nr, nc) = (r + dr, c + dc);
+            if nr < 0 || nc < 0 {
+                return None;
             }
-        })
+            // The neighbour's formula as it would read in this cell.
+            shifted(wb, sheet, nr as u32, nc as u32, -dr, -dc)
+        };
+        match (at(br, bc), at(ar, ac)) {
+            (Some(a), Some(b)) if a == b && a != mine => Some((along, a)),
+            _ => None,
+        }
+    })
+}
+
+fn inconsistent(wb: &Workbook, sheet: usize, row: u32, col: u32) -> bool {
+    inconsistent_with(wb, sheet, row, col).is_some()
+}
+
+/// Copy Formula from Above / from Left: the formula the cell's neighbours
+/// agree on, as it reads here, and which side to name (`Column`: above).
+/// `None` when the cell is not an inconsistent formula.
+pub fn consistent_formula(
+    wb: &Workbook,
+    sheet: usize,
+    row: u32,
+    col: u32,
+) -> Option<(Along, String)> {
+    inconsistent_with(wb, sheet, row, col)
 }
 
 /// Omits adjacent cells: a single-column (or single-row) range of the
@@ -410,6 +507,22 @@ mod tests {
             ("B3", f("A3+1")),
         ]);
         assert!(rules(&w, "B2").is_empty());
+    }
+
+    #[test]
+    fn the_formula_the_neighbours_agree_on_reads_as_it_would_in_the_cell() {
+        let w = wb(&[
+            ("B1", f("A1+1")),
+            ("B2", f("A2*2")),
+            ("B3", f("A3+1")),
+            ("C1", f("A1+1")),
+        ]);
+        assert_eq!(
+            consistent_formula(&w, 0, 1, 1),
+            Some((Along::Column, "A2+1".to_string()))
+        );
+        assert_eq!(consistent_formula(&w, 0, 0, 1), None, "B1 is consistent");
+        assert_eq!(consistent_formula(&w, 0, 0, 2), None, "no neighbours agree");
     }
 
     #[test]
@@ -619,6 +732,78 @@ mod tests {
         let mut w = with_ignored(vec![(4, 1, 6, 1)]);
         crate::edit::delete_rows(&mut w, 0, 10, 3);
         assert_eq!(w.sheets[0].ignored_errors[0].sqref, vec![(4, 1, 6, 1)]);
+    }
+
+    #[test]
+    fn convert_to_number_makes_a_general_number_of_the_text() {
+        let mut w = wb(&[
+            ("A1", Cell::text("123")),
+            ("A2", Cell::text("abc")),
+            ("A3", f("1")),
+        ]);
+        w.styles.xfs = vec![Xf::default()];
+        let cell = convert_to_number(&mut w, 0, 0, 0).unwrap();
+        assert_eq!(cell.value, CellValue::Number(123.0));
+        assert_eq!(cell.style, 0, "a General cell keeps its style");
+        assert!(convert_to_number(&mut w, 0, 1, 0).is_none(), "not a number");
+        assert!(convert_to_number(&mut w, 0, 2, 0).is_none(), "a formula");
+        assert!(convert_to_number(&mut w, 0, 9, 9).is_none(), "no cell");
+    }
+
+    #[test]
+    fn convert_to_number_drops_the_text_format_and_the_apostrophe_and_keeps_a_percent() {
+        let mut w = wb(&[("A1", Cell::text("007")), ("A2", Cell::text("12%"))]);
+        let mut text_xf = Xf {
+            quote_prefix: true,
+            bold: true,
+            ..Xf::default()
+        };
+        text_xf.set_code(Some("@".into()));
+        w.styles.xfs = vec![Xf::default(), text_xf];
+        w.sheets[0].cells.get_mut(&(0, 0)).unwrap().style = 1;
+        let a1 = convert_to_number(&mut w, 0, 0, 0).unwrap();
+        let xf = w.styles.xf(a1.style);
+        assert_eq!(a1.value, CellValue::Number(7.0));
+        assert!(!crate::entry::is_text(&xf) && !xf.quote_prefix);
+        assert!(xf.bold, "the rest of the format stays");
+        let a2 = convert_to_number(&mut w, 0, 1, 0).unwrap();
+        assert_eq!(
+            a2.value,
+            CellValue::Number(0.12),
+            "a percent is its fraction, as typed"
+        );
+        assert_eq!(w.styles.xf(a2.style).code.as_deref(), Some("0%"));
+    }
+
+    #[test]
+    fn ignore_adds_one_cell_and_merges_with_its_own_kind() {
+        let mut w = wb(&[("A1", err("#N/A"))]);
+        let s = &mut w.sheets[0];
+        ignore(s, Rule::ErrorValue, 0, 0);
+        ignore(s, Rule::ErrorValue, 0, 0); // twice: still one
+        ignore(s, Rule::ErrorValue, 4, 1);
+        ignore(s, Rule::NumberAsText, 4, 1);
+        assert_eq!(s.ignored_errors.len(), 2);
+        assert_eq!(s.ignored_errors[0].sqref, vec![(0, 0, 0, 0), (4, 1, 4, 1)]);
+        assert_eq!(s.ignored_errors[1].rules, vec![Rule::NumberAsText]);
+        // A loaded entry with an unmodelled attribute is left as it was.
+        s.ignored_errors.clear();
+        s.ignored_errors.push(IgnoredError {
+            sqref: vec![(9, 9, 9, 9)],
+            rules: vec![Rule::ErrorValue],
+            extra: "twoDigitTextYear=\"1\"".into(),
+        });
+        ignore(s, Rule::ErrorValue, 0, 0);
+        assert_eq!(s.ignored_errors.len(), 2);
+        assert_eq!(s.ignored_errors[0].sqref, vec![(9, 9, 9, 9)]);
+    }
+
+    #[test]
+    fn error_values_are_named_as_excel_names_them() {
+        assert_eq!(error_title("#DIV/0!"), "Divide by Zero Error");
+        assert_eq!(error_title("#REF!"), "Invalid Cell Reference Error");
+        assert_eq!(error_title("#VALUE!"), "Error in Value");
+        assert_eq!(error_title("#WHATEVER"), "Error in Value");
     }
 
     #[test]

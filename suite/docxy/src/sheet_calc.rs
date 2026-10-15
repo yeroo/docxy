@@ -87,6 +87,8 @@ fn calculate_now(tab: &mut DocTab) -> Result<(), String> {
     let v = sheet_view(tab)?;
     let was_stale = v.engine.is_stale();
     let outcome = calc::calculate_now(&mut v.pkg.workbook, &mut v.engine, !protected);
+    // The values moved: what Error Checking found is out of date (#675).
+    v.edit_gen += 1;
     if !protected && (was_stale || !outcome.changed.is_empty()) {
         tab.set_dirty();
     }
@@ -100,6 +102,7 @@ fn calculate_sheet(tab: &mut DocTab) -> Result<(), String> {
     let s = v.active;
     let was_stale = v.engine.stale_on_sheet(s) > 0;
     v.engine.recalc_sheet(&mut v.pkg.workbook, s);
+    v.edit_gen += 1;
     let name = v.pkg.workbook.sheets[s].name.clone();
     if was_stale {
         tab.set_dirty();
