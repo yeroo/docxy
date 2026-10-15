@@ -99,6 +99,9 @@ pub(crate) enum ProjectAct {
     /// display (gpui cannot move windows at the pinned rev, so positions
     /// stay).
     ArrangeAll,
+    /// View › Appearance › Theme (#1473): cycle Light, Dark and Auto, as the
+    /// title bar's theme button did.
+    Theme,
 }
 
 impl ProjectAct {
@@ -135,6 +138,7 @@ impl ProjectAct {
         Self::Copy,
         Self::NewWindow,
         Self::ArrangeAll,
+        Self::Theme,
         Self::OpenReportMenu(ReportMenu::Dashboards),
         Self::OpenReportMenu(ReportMenu::Resources),
         Self::OpenReportMenu(ReportMenu::Costs),
@@ -608,6 +612,18 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                         Timeline,
                         "Alt, W, T",
                         "T",
+                    )])],
+                ),
+                rs::group(
+                    "Appearance",
+                    65,
+                    vec![rs::column(vec![cmd(
+                        "pr-theme",
+                        "case",
+                        "Theme",
+                        Theme,
+                        "Alt, W, E",
+                        "E",
                     )])],
                 ),
                 rs::group(
@@ -1865,7 +1881,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             | NewProject => {}
             // App-level View › Window commands (#587): the host dispatches
             // them on the app before a tab ever sees them.
-            NewWindow | ArrangeAll => {}
+            NewWindow | ArrangeAll | Theme => {}
         }
         Ok(())
     })();
@@ -2160,6 +2176,7 @@ impl Docxy {
                 let n = self.arrange_all(window, cx);
                 self.set_status(format!("Arranged {n} windows"));
             }
+            ProjectAct::Theme => self.cycle_theme(window, cx),
             // Deferred so the status bar can say Busy: render schedules it.
             ProjectAct::Level | ProjectAct::LevelAll | ProjectAct::ClearLeveling => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {

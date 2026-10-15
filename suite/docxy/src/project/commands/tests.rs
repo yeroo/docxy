@@ -503,6 +503,7 @@ fn project_instruction_paths_exist() {
             HideSubtasks,
         ),
         ("View", "Split View", "Timeline", "Timeline View", Timeline),
+        ("View", "Appearance", "Theme", "Theme", Theme),
         ("View", "Window", "New Window", "New Window", NewWindow),
         ("View", "Window", "Arrange All", "Arrange All", ArrangeAll),
         (
@@ -4809,4 +4810,27 @@ fn row_menu_press_with_open_cell_commits() {
     assert!(v(&t).cell.is_none(), "the edit committed: {}", t.status);
     assert_eq!(names(&t)[1], "Renamed");
     assert_eq!(sel_of(&t), None);
+}
+
+/// The theme button moved from the title bar to the View tab (#1473); this is
+/// Project's. The document's is checked beside `docxy_ribbon`, the sheet's in
+/// `sheet_ribbon`; Mail, a failed load, no tab, Protected View and a
+/// minimised ribbon draw none (`ribbon_body_hidden`), so Backstage's Settings
+/// has a Theme row too.
+#[test]
+fn the_project_view_tab_has_the_theme_button() {
+    let ribbon = ribbon_for(Kind::Project);
+    let view = ribbon.tabs.iter().find(|t| t.name == "View").unwrap();
+    let theme = view
+        .groups
+        .iter()
+        .flat_map(|g| g.items.iter())
+        .flat_map(|c| match c {
+            Control::Large(c) | Control::Toggle(c) => vec![c],
+            Control::Column(c) => c.iter().collect(),
+            _ => vec![],
+        })
+        .find(|c| c.label == "Theme")
+        .expect("Project's View tab has a Theme button");
+    assert_eq!(theme.act, Act::Project(ProjectAct::Theme));
 }

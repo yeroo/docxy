@@ -23,6 +23,7 @@ compile_error!(
 );
 
 mod about;
+mod accent;
 mod close;
 #[cfg(test)]
 mod comment_tests;
@@ -160,11 +161,7 @@ use docxcore::package::{HeaderVariant, Package};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    ActiveTheme, Root, Sizable, Theme, ThemeMode, TitleBar,
-    button::{Button, ButtonVariants},
-    h_flex,
-    tooltip::Tooltip,
-    v_flex,
+    ActiveTheme, Root, Theme, ThemeMode, TitleBar, h_flex, tooltip::Tooltip, v_flex,
 };
 use gridcore::circular::CIRCULAR_WARNING;
 use gridcore::options::{EditOptions, EnterMove};
@@ -1209,6 +1206,7 @@ fn protected_view_allows_act(act: SheetAct) -> bool {
             | SheetAct::Help(_)
             | SheetAct::NewWindow
             | SheetAct::ArrangeAll
+            | SheetAct::Theme
             // Calculating changes no file; the mode and options do.
             | SheetAct::Calc(sheet_calc::CalcAct::Now)
             | SheetAct::Calc(sheet_calc::CalcAct::Sheet)
@@ -1279,6 +1277,7 @@ fn multi_area_ok(act: SheetAct) -> bool {
         | SheetAct::FreezePanes
         | SheetAct::NewWindow
         | SheetAct::ArrangeAll
+        | SheetAct::Theme
         | SheetAct::PrevComment
         | SheetAct::NextComment
         | SheetAct::ProtectSheet
@@ -1400,6 +1399,7 @@ fn act_targets_cells(act: SheetAct) -> bool {
             | SheetAct::CustomLists
             | SheetAct::NewWindow
             | SheetAct::ArrangeAll
+            | SheetAct::Theme
             | SheetAct::Calc(_)
             | SheetAct::Todo
     )
@@ -2211,6 +2211,9 @@ enum SheetAct {
     /// View › Window › Arrange All (#587): resize every window to an equal
     /// strip of this window's display.
     ArrangeAll,
+    /// View › Appearance › Theme (#1473): cycle Light, Dark and Auto, as the
+    /// title bar's theme button did.
+    Theme,
     NewComment,
     DeleteComment,
     PrevComment,
@@ -5322,6 +5325,8 @@ struct Docxy {
     // time), so the render below only calls set_window_title when the
     // computed title changed.
     last_window_title: Option<String>,
+    /// The accent this window's last render set (#1473), for the harness.
+    drawn_accent: u32,
 }
 
 /// Where the regions a harness test can name actually landed, as gpui measured
@@ -12795,35 +12800,33 @@ fn title_bar_geometry(window: &Window) -> f32 {
     )
 }
 
-/// The brand label's absolute cap: a window title is information, not
-/// chrome, so it never gets more than this before it starts clipping.
+/// The title label's absolute cap: the one-word type label (#1473) never
+/// gets more than this before it starts clipping.
 const TITLE_LABEL_MAX_W: f32 = 260.0;
 
 /// The QAT's widest form, for the label cap below: two 20px buttons with a
 /// 2px gap, the 10px Undo split arrow, and the cluster's 8px gap before it.
 const TITLE_QAT_MAX_W: f32 = 20.0 + 2.0 + 20.0 + 10.0 + 8.0;
 
-/// The left chrome's width cap and the brand label's cap inside it. The cap
-/// reserves the theme button, the drag region's minimum and the strip's More
-/// button plus a floor-width chip before the label, so a long window title
-/// starves the label, never the strip (#588 r1 m6). `theme_w` is the theme
-/// button's width from the last frame, exactly as the `avail` below consumes
-/// it.
+/// The left chrome's width cap and the title label's cap inside it. The cap
+/// reserves the drag region's minimum and the strip's More button plus a
+/// floor-width chip before the label, so the label starves before the strip
+/// does (#588 r1 m6).
 ///
 /// The reservation keeps 1px of slack so fractional f32 widths (device
 /// scales of 125/150/175%) cannot land the render's `avail` just under the
 /// strip floor, whose comparison in `tabstrip::layout` is strict. Below the
 /// width where the QAT and the floor chip both fit, the QAT stays whole and
 /// the strip degrades to MoreOnly, as it did before the label cap existed.
-fn title_left_caps(title_w: f32, theme_w: f32) -> (f32, f32) {
-    // 8 is the pl_2 padding and 24 the three 8px gaps between the four
+fn title_left_caps(title_w: f32) -> (f32, f32) {
+    // 8 is the pl_2 padding and 16 the two 8px gaps between the three
     // in-flow children — the render's own arithmetic, shared here so the
     // test measures the same chain.
-    let pad_gaps = 8.0 + 24.0;
+    let pad_gaps = 8.0 + 16.0;
     // The strip's minimum (More + a floor chip + gap) plus the slack.
     let strip_floor = tabstrip::MORE_W + tabstrip::TAB_FLOOR_W + tabstrip::TAB_GAP + 1.0;
     // The widest cap that still leaves the strip its floor.
-    let strip_cap = title_w - pad_gaps - theme_w - tabstrip::DRAG_MIN_W - strip_floor;
+    let strip_cap = title_w - pad_gaps - tabstrip::DRAG_MIN_W - strip_floor;
     // The widest cap that keeps the QAT whole (label at zero), never eating
     // into the drag region's minimum.
     let qat_cap = TITLE_QAT_MAX_W.min((title_w - pad_gaps - tabstrip::DRAG_MIN_W).max(0.0));
@@ -12841,29 +12844,29 @@ mod title_caps_tests {
 
     /// The render's avail formula, copied deliberately: the test asserts on
     /// the same f32 chain the layout consumes.
-    fn avail(title_w: f32, left_cap: f32, theme_w: f32) -> f32 {
-        title_w - 8.0 - 24.0 - left_cap - theme_w - tabstrip::DRAG_MIN_W
+    fn avail(title_w: f32, left_cap: f32) -> f32 {
+        title_w - 8.0 - 16.0 - left_cap - tabstrip::DRAG_MIN_W
     }
 
     #[test]
     fn the_label_yields_first_and_the_strip_keeps_its_minimum() {
         // Wide title content: the label keeps its full cap.
-        let (left, label) = title_left_caps(1280.0, 80.0);
+        let (left, label) = title_left_caps(1280.0);
         assert_eq!(label, TITLE_LABEL_MAX_W);
         assert!(left > label + TITLE_QAT_MAX_W);
         // Narrow title-content widths (what `title_w` names here — window
         // width minus caption controls, left pad and insets): the cap binds,
         // the label shrinks below its cap, and what it yields keeps the
-        // strip's More button, a floor-width chip and the theme button
-        // alive, with the QAT whole.
-        for w in [300.0, 460.0, 500.0] {
-            let (left, label) = title_left_caps(w, 80.0);
+        // strip's More button and a floor-width chip alive, with the QAT
+        // whole.
+        for w in [300.0, 380.0, 460.0] {
+            let (left, label) = title_left_caps(w);
             assert!(label < TITLE_LABEL_MAX_W, "w={w}");
             assert!(label >= 0.0, "w={w}");
             // The label plus the QAT's widest form never exceeds the cap, so
             // the QAT is never what the strip takes from.
             assert!(label + TITLE_QAT_MAX_W <= left + f32::EPSILON, "w={w}");
-            let a = avail(w, left, 80.0);
+            let a = avail(w, left);
             assert!(
                 a >= tabstrip::MORE_W + tabstrip::TAB_FLOOR_W + tabstrip::TAB_GAP,
                 "w={w}: avail={a}"
@@ -12872,35 +12875,33 @@ mod title_caps_tests {
         // Fractional widths at device scales like 150%: the two f32 chains
         // drift by ulps, and the 1px slack keeps the render's avail at or
         // over the floor wherever the floor and the QAT both fit.
-        let (left, label) = title_left_caps(300.4, 34.4);
+        let (left, label) = title_left_caps(300.4);
         assert!(label > 0.0);
-        let a = avail(300.4, left, 34.4);
+        let a = avail(300.4, left);
         assert!(
             a >= tabstrip::MORE_W + tabstrip::TAB_FLOOR_W + tabstrip::TAB_GAP,
             "avail={a}"
         );
-        // The (232, 292) band at a typical theme width: the QAT and the
-        // floor chip cannot both fit, so the floor keeps the QAT whole and
-        // the strip falls back to MoreOnly, as before the label cap.
-        for w in [240.0, 260.0, 280.0] {
-            let (left, label) = title_left_caps(w, 80.0);
+        // The (124, 205) band: the QAT and the floor chip cannot both fit, so
+        // the floor keeps the QAT whole and the strip falls back to MoreOnly,
+        // as before the label cap.
+        for w in [140.0, 160.0, 180.0, 200.0] {
+            let (left, label) = title_left_caps(w);
             assert_eq!(left, TITLE_QAT_MAX_W, "w={w}");
             assert_eq!(label, 0.0, "w={w}");
             assert!(
-                avail(w, left, 80.0) < tabstrip::MORE_W + tabstrip::TAB_FLOOR_W + tabstrip::TAB_GAP,
+                avail(w, left) < tabstrip::MORE_W + tabstrip::TAB_FLOOR_W + tabstrip::TAB_GAP,
                 "w={w}"
             );
         }
         // The reviewer's fractional point sits in that band: the QAT is
         // whole, the strip is in the MoreOnly exception.
-        let (left, label) = title_left_caps(240.0, 34.4);
+        let (left, label) = title_left_caps(160.0);
         assert_eq!(left, TITLE_QAT_MAX_W);
         assert_eq!(label, 0.0);
-        assert!(
-            avail(240.0, left, 34.4) < tabstrip::MORE_W + tabstrip::TAB_FLOOR_W + tabstrip::TAB_GAP
-        );
+        assert!(avail(160.0, left) < tabstrip::MORE_W + tabstrip::TAB_FLOOR_W + tabstrip::TAB_GAP);
         // Absurdly narrow: the caps bottom out at zero rather than going negative.
-        let (left, label) = title_left_caps(60.0, 80.0);
+        let (left, label) = title_left_caps(60.0);
         assert_eq!((left, label), (0.0, 0.0));
     }
 }
@@ -13137,6 +13138,7 @@ impl Docxy {
             probes: Default::default(),
             frame: 0,
             last_window_title: None,
+            drawn_accent: BRAND,
         }
     }
 
@@ -13523,7 +13525,10 @@ impl Docxy {
     }
 
     fn cycle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_theme_pref(self.theme_pref.next(), window, cx);
+        let next = self.theme_pref.next();
+        self.set_theme_pref(next, window, cx);
+        // The View ribbon's Theme button shows no state, so say it (#1473).
+        self.set_status(format!("Theme: {}", next.label()));
     }
 
     fn set_theme_pref(&mut self, pref: ThemePref, window: &mut Window, cx: &mut Context<Self>) {
@@ -13619,7 +13624,7 @@ impl Docxy {
                 .px_2()
                 .rounded(px(3.))
                 .border_1()
-                .border_color(hsla_u(BRAND))
+                .border_color(hsla_u(accent::brand()))
                 .text_color(fg)
                 .child(text)
         };
@@ -13645,7 +13650,7 @@ impl Docxy {
             .child(
                 div()
                     .text_size(px(13.))
-                    .text_color(rgb(BRAND))
+                    .text_color(rgb(accent::brand()))
                     .mt_4()
                     .child("Sheet editing"),
             )
@@ -16903,6 +16908,17 @@ impl Docxy {
         )
     }
 
+    /// The accent of the selected tab's type on the drawn theme (#1473).
+    /// The dark flag comes from the preference, not `applied`: render sets
+    /// the accent before `apply_theme` runs, and `applied` is still `None` on
+    /// the first frame and stale after a theme switch.
+    pub(crate) fn accent_now(&self) -> u32 {
+        accent::for_kind(
+            self.tabs.get(self.active).map(|t| t.kind),
+            self.theme_pref.resolve(self.os_appearance) == ThemeMode::Dark,
+        )
+    }
+
     fn active_is_sheet(&self) -> bool {
         matches!(
             self.tabs.get(self.active).map(|t| &t.surface),
@@ -19952,6 +19968,7 @@ impl Docxy {
                 let n = self.arrange_all(window, cx);
                 self.set_status(format!("Arranged {n} windows"));
             }
+            SheetAct::Theme => self.cycle_theme(window, cx),
             SheetAct::NewComment => self.sheet_new_comment(cx),
             SheetAct::DeleteComment => self.sheet_delete_comment(cx),
             SheetAct::PrevComment => self.sheet_comment_nav(false, cx),
@@ -28264,6 +28281,30 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
     ])
 }
 
+#[cfg(test)]
+mod theme_button_tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    /// The document's View tab keeps the Theme button (#1473), now the only
+    /// theme control a document has on screen besides Backstage's.
+    #[test]
+    fn the_document_view_tab_has_the_theme_button() {
+        let ribbon = docxy_ribbon();
+        let view = ribbon.tabs.iter().find(|t| t.name == "View").unwrap();
+        let has = view
+            .groups
+            .iter()
+            .flat_map(|g| g.items.iter())
+            .any(|c| match c {
+                Control::Large(c) | Control::Toggle(c) => c.act == Act::DarkMode,
+                Control::Column(c) => c.iter().any(|c| c.act == Act::DarkMode),
+                _ => false,
+            });
+        assert!(has, "the document's View tab has no Theme button");
+    }
+}
+
 fn ribbon_for(kind: Kind) -> rs::Ribbon<Act> {
     match kind {
         Kind::Project => project_ribbon(),
@@ -31129,15 +31170,15 @@ impl Docxy {
                     .text_size(px(12.))
                     .when(!is_file, |d| d.hover(|d| d.bg(Hsla { a: 0.10, ..fg })))
                     .when(is_file, |d| {
-                        d.bg(rgb(BRAND))
+                        d.bg(rgb(accent::brand()))
                             .text_color(rgb(FILE_FG))
                             .font_weight(FontWeight::BOLD)
                             .rounded_t_sm()
                     })
                     .when(active, |d| {
-                        d.text_color(rgb(BRAND))
+                        d.text_color(rgb(accent::brand()))
                             .border_b_2()
-                            .border_color(rgb(BRAND))
+                            .border_color(rgb(accent::brand()))
                     })
                     .when(!active && !is_file, |d| d.text_color(fg))
                     .child(name)
@@ -32002,7 +32043,7 @@ impl Docxy {
                 .when(self.act_active(act), |d| {
                     d.bg(Hsla {
                         a: 0.20,
-                        ..hsla_u(BRAND)
+                        ..hsla_u(accent::brand())
                     })
                 })
                 .hover(|d| d.bg(pal.hover))
@@ -32757,7 +32798,7 @@ impl Docxy {
             .when(on, |d| {
                 d.bg(Hsla {
                     a: 0.20,
-                    ..hsla_u(BRAND)
+                    ..hsla_u(accent::brand())
                 })
             })
             .hover(|d| d.bg(pal.hover))
@@ -32929,7 +32970,7 @@ impl Docxy {
             .border_color(pal.border)
             .bg(pal.panel)
             .cursor_pointer()
-            .hover(|d| d.border_color(hsla_u(BRAND)))
+            .hover(|d| d.border_color(hsla_u(accent::brand())))
             .child(
                 div()
                     .text_size(px(11.))
@@ -32965,7 +33006,7 @@ impl Docxy {
             .border_color(pal.border)
             .bg(pal.panel)
             .cursor_pointer()
-            .hover(|d| d.border_color(hsla_u(BRAND)))
+            .hover(|d| d.border_color(hsla_u(accent::brand())))
             .child(
                 div()
                     .text_size(px(11.))
@@ -33044,7 +33085,7 @@ impl Docxy {
                     .border_1()
                     .border_color(pal.border)
                     .bg(hsla_u(0xffffff))
-                    .hover(|d| d.border_color(hsla_u(BRAND)))
+                    .hover(|d| d.border_color(hsla_u(accent::brand())))
                     .child(
                         div()
                             .text_size(px(11.))
@@ -33125,7 +33166,7 @@ impl Docxy {
                     .border_color(if c == 0xFFFFFF { pal.fg } else { pal.border })
                     .bg(hsla_u(c))
                     .cursor_pointer()
-                    .hover(|d| d.border_color(hsla_u(BRAND)))
+                    .hover(|d| d.border_color(hsla_u(accent::brand())))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.sheet_apply_color(pick, Some(rgb), cx)
                     })),
@@ -34047,7 +34088,7 @@ impl Docxy {
         let dark = self.applied == Some(ThemeMode::Dark);
         let t = cx.theme();
         let fg = t.foreground.to_rgb();
-        let colors = sg::tile_colors(t.background.to_rgb(), fg, rgb(BRAND), dark);
+        let colors = sg::tile_colors(t.background.to_rgb(), fg, rgb(accent::brand()), dark);
         let tiles: Vec<AnyElement> = gal
             .items
             .iter()
@@ -34068,7 +34109,7 @@ impl Docxy {
                     .border(px(g.border))
                     .overflow_hidden()
                     .border_color(if selected {
-                        hsla_u(BRAND)
+                        hsla_u(accent::brand())
                     } else {
                         gpui::transparent_black()
                     })
@@ -34191,7 +34232,7 @@ impl Docxy {
             .border_color(pal.border)
             .bg(pal.panel)
             .cursor_pointer()
-            .hover(|d| d.border_color(hsla_u(BRAND)))
+            .hover(|d| d.border_color(hsla_u(accent::brand())))
             .child(
                 div()
                     .text_size(px(11.))
@@ -34246,7 +34287,7 @@ impl Docxy {
             .when(on, |d| {
                 d.bg(Hsla {
                     a: 0.20,
-                    ..hsla_u(BRAND)
+                    ..hsla_u(accent::brand())
                 })
             })
             .hover(|d| d.bg(pal.hover))
@@ -34465,10 +34506,10 @@ impl Docxy {
             .when(on, |d| {
                 d.bg(Hsla {
                     a: 0.20,
-                    ..hsla_u(BRAND)
+                    ..hsla_u(accent::brand())
                 })
                 .border_1()
-                .border_color(hsla_u(BRAND))
+                .border_color(hsla_u(accent::brand()))
             })
             .when(!on, |d| {
                 d.border_1().border_color(gpui::transparent_black())
@@ -34557,7 +34598,7 @@ impl Docxy {
                             .border_color(dim)
                             .text_color(fg)
                             .cursor_pointer()
-                            .hover(|d| d.border_color(rgb(BRAND)))
+                            .hover(|d| d.border_color(rgb(accent::brand())))
                             .child("About docxy suite")
                             .on_click(cx.listener(|this, _, _, cx| this.open_about_clicked(cx))),
                     ),
@@ -34620,7 +34661,7 @@ impl Docxy {
                                 .border_color(dim)
                                 .text_color(fg)
                                 .cursor_pointer()
-                                .hover(|d| d.border_color(rgb(BRAND)))
+                                .hover(|d| d.border_color(rgb(accent::brand())))
                                 .child("Remove All")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     let _ = this.inspect_remove_active(category);
@@ -34711,7 +34752,7 @@ impl Docxy {
                             .border_color(dim)
                             .text_color(fg)
                             .cursor_pointer()
-                            .hover(|d| d.border_color(rgb(BRAND)))
+                            .hover(|d| d.border_color(rgb(accent::brand())))
                             .child("Convert")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let _ = this.convert_active();
@@ -34774,12 +34815,12 @@ impl Docxy {
                     .cursor_pointer()
                     .rounded_sm()
                     .text_color(if matches!(action, BackstageRailAction::Back) {
-                        hsla_u(BRAND)
+                        hsla_u(accent::brand())
                     } else {
                         fg
                     })
                     .when(!matches!(action, BackstageRailAction::Back), |d| {
-                        d.hover(|d| d.bg(rgb(BRAND)).text_color(rgb(FILE_FG)))
+                        d.hover(|d| d.bg(rgb(accent::brand())).text_color(rgb(FILE_FG)))
                     })
                     .child(item.display)
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -34805,7 +34846,7 @@ impl Docxy {
                     .border_1()
                     .border_color(dim)
                     .cursor_pointer()
-                    .hover(|d| d.border_color(rgb(BRAND)))
+                    .hover(|d| d.border_color(rgb(accent::brand())))
                     .child(div().text_size(px(40.)).child(glyph))
                     .child(
                         div()
@@ -34968,9 +35009,9 @@ impl Docxy {
                     .size(px(16.))
                     .rounded(px(3.))
                     .border_1()
-                    .border_color(if on { hsla_u(BRAND) } else { dim })
+                    .border_color(if on { hsla_u(accent::brand()) } else { dim })
                     .bg(if on {
-                        hsla_u(BRAND)
+                        hsla_u(accent::brand())
                     } else {
                         Hsla { a: 0., ..fg }
                     })
@@ -35017,7 +35058,7 @@ impl Docxy {
                 .child(
                     div()
                         .text_size(px(13.))
-                        .text_color(rgb(BRAND))
+                        .text_color(rgb(accent::brand()))
                         .mt_4()
                         .child("Open"),
                 )
@@ -35055,7 +35096,7 @@ impl Docxy {
                 .child(
                     div()
                         .text_size(px(13.))
-                        .text_color(rgb(BRAND))
+                        .text_color(rgb(accent::brand()))
                         .mt_4()
                         .child("Recent"),
                 )
@@ -35078,7 +35119,7 @@ impl Docxy {
                     d.child(
                         div()
                             .text_size(px(13.))
-                            .text_color(rgb(BRAND))
+                            .text_color(rgb(accent::brand()))
                             .mt_4()
                             .child("Recover Unsaved Workbooks"),
                     )
@@ -35098,9 +35139,29 @@ impl Docxy {
                 .child(
                     div()
                         .text_size(px(13.))
-                        .text_color(rgb(BRAND))
+                        .text_color(rgb(accent::brand()))
                         .mt_4()
                         .child("Settings"),
+                )
+                // The Light/Dark/Auto cycle: the View ribbon's Theme button
+                // is not drawn on a Mail or failed-load tab, with no tab, in
+                // Protected View or with the ribbon minimised (#1473), and
+                // File always is.
+                .child(
+                    div()
+                        .id("bs-theme")
+                        .relative()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .py_1()
+                        .cursor_pointer()
+                        .rounded_sm()
+                        .hover(|d| d.bg(sidebar))
+                        .child(probe(&self.probes, "bs-theme"))
+                        .child(div().text_color(fg).child("Theme"))
+                        .child(div().text_color(dim).child(self.theme_pref.label()))
+                        .on_click(cx.listener(|this, _, window, cx| this.cycle_theme(window, cx))),
                 )
                 .child(
                     div()
@@ -35148,7 +35209,7 @@ impl Docxy {
                                 .px_2()
                                 .rounded(px(3.))
                                 .border_1()
-                                .border_color(hsla_u(BRAND))
+                                .border_color(hsla_u(accent::brand()))
                                 .text_color(fg)
                                 .child(recover::choice_label(self.autorecover_minutes)),
                         )
@@ -35251,7 +35312,7 @@ impl Docxy {
                                 .px_2()
                                 .rounded(px(3.))
                                 .border_1()
-                                .border_color(hsla_u(BRAND))
+                                .border_color(hsla_u(accent::brand()))
                                 .text_color(fg)
                                 .child("Clear"),
                         )
@@ -35522,6 +35583,10 @@ impl Docxy {
 
 impl Render for Docxy {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The ribbon, backstage and title bar draw the selected tab's accent
+        // (#1473); set it before any of them is built.
+        self.drawn_accent = self.accent_now();
+        accent::set(self.drawn_accent);
         HL_CURSOR.store(
             self.hl_mode.as_ref().is_some_and(|m| m.tab == self.active),
             std::sync::atomic::Ordering::Relaxed,
@@ -35626,8 +35691,7 @@ impl Render for Docxy {
         let tab_active = t.tab_active;
         let pal = Pal::of(cx);
 
-        // --- title bar: wordmark + document tab chips + theme toggle ---
-        let theme_pref = self.theme_pref;
+        // --- title bar: type label + document tab chips ---
         let qat_state = self.qat_state();
         // The pinned TitleBar gives #bar flex-shrink:0. A definite width,
         // accounting for Root's client decoration insets, keeps the caption
@@ -35638,19 +35702,14 @@ impl Render for Docxy {
             .get("title-left")
             .map(|b| f32::from(b.size.width))
             .unwrap_or(170.0);
-        let theme_w = chrome
-            .get("title-theme")
-            .map(|b| f32::from(b.size.width))
-            .unwrap_or(80.0);
         drop(chrome);
         // The left chrome yields before the tab strip does: the cap reserves
-        // the theme button, the drag region's minimum and the strip's More
-        // button plus a floor-width chip, so a long window title starves the
-        // label, never the strip (#588 r1 m6).
-        let (left_cap, label_cap) = title_left_caps(title_w, theme_w);
-        // Four children, three 8px gaps, plus our 8px left padding.
-        let avail =
-            (title_w - 8.0 - 24.0 - left_w.min(left_cap) - theme_w - tabstrip::DRAG_MIN_W).max(0.0);
+        // the drag region's minimum and the strip's More button plus a
+        // floor-width chip, so the label starves before the strip does
+        // (#588 r1 m6).
+        let (left_cap, label_cap) = title_left_caps(title_w);
+        // Three children, two 8px gaps, plus our 8px left padding.
+        let avail = (title_w - 8.0 - 16.0 - left_w.min(left_cap) - tabstrip::DRAG_MIN_W).max(0.0);
         let strip = tabstrip::layout(avail, self.tabs.len(), self.active, self.tab_first);
         self.tab_first = strip.first;
         self.tab_layout = strip;
@@ -35808,15 +35867,17 @@ impl Render for Docxy {
             self.tab_more_open = false;
         }
 
-        // NOTE: the brand label and the flex_1 spacer are plain,
+        // NOTE: the type label and the flex_1 spacer are plain,
         // non-interactive divs, so TitleBar's own drag region shows through them
         // — that idle space is natively draggable and double-click maximizes.
-        // Only the *interactive* clusters (chips, theme button) swallow the
+        // Only the *interactive* clusters (the QAT and the tab strip) swallow the
         // mouse-down so a drag on them doesn't start a window move.
-        // The brand label draws the active tab's window title, Project's
-        // `<stem>  -  docxy` (#588); no tab draws the bare brand. The OS
-        // window title gets the same string — but only when it changed, as
-        // the platform writes it on every call.
+        // The OS window title is the active tab's Project-style
+        // `<stem>  -  docxy` (#588); no tab gets the bare brand. It is set
+        // only when it changed, as the platform writes it on every call. The
+        // title bar's own label names the tab's type instead (#1473), so the
+        // document's name stays on its tab.
+        let title_label = accent::label(self.tabs.get(self.active).map(|t| t.kind));
         let window_title =
             doc_name::window_title(self.tabs.get(self.active).map(|t| t.title.as_ref()));
         if self.last_window_title.as_deref() != Some(window_title.as_str()) {
@@ -35848,12 +35909,12 @@ impl Render for Docxy {
                         .child(
                             div()
                                 .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(BRAND))
+                                .text_color(rgb(accent::brand()))
                                 .flex_none()
                                 .max_w(px(label_cap))
                                 .overflow_hidden()
                                 .whitespace_nowrap()
-                                .child(window_title),
+                                .child(title_label),
                         )
                         .child(
                             h_flex()
@@ -35929,24 +35990,6 @@ impl Render for Docxy {
                         .h_full()
                         .min_w(px(tabstrip::DRAG_MIN_W))
                         .child(probe(&self.probes, "title-drag")),
-                )
-                .child(
-                    div()
-                        .relative()
-                        .flex_none()
-                        .child(probe_with_reflow(&self.probes, "title-theme", move |b| {
-                            (f32::from(b.size.width) - theme_w).abs() > 0.5
-                        }))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(
-                            Button::new("theme")
-                                .ghost()
-                                .xsmall()
-                                .label(theme_pref.label())
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.cycle_theme(window, cx)),
-                                ),
-                        ),
                 ),
         );
         let tab_popup = self

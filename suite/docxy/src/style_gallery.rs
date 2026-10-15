@@ -235,8 +235,11 @@ mod tests {
     /// 3:1 like the rest of that chrome.
     #[test]
     fn samples_and_names_have_enough_contrast_on_every_tile_state() {
-        let brand = gpui::rgb(crate::BRAND);
-        for dark in [false, true] {
+        for (dark, kind) in [false, true].into_iter().flat_map(|d| {
+            [None, Some(crate::Kind::Xlsx), Some(crate::Kind::Project)].map(|k| (d, k))
+        }) {
+            // The checked tile mixes in the selected tab's accent (#1473).
+            let brand = gpui::rgb(crate::accent::for_kind(kind, dark));
             let t = theme(dark);
             let (fg, muted) = (t.foreground.to_rgb(), t.muted_foreground.to_rgb());
             let c = tile_colors(t.background.to_rgb(), fg, brand, dark);

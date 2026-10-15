@@ -1,0 +1,68 @@
+# #1473: the title bar names the selected tab's type (doc / sheet / project)
+# and the chrome draws that type's accent. `accent` is computed from the tab
+# and theme; `drawn_accent` is what the last render set, so a render that
+# stops following the tab fails here. The OS window title is unchanged (see
+# window-title.uit). The shots are for eyeballing the File button and tabs.
+# One case: tabs 0/1/2 are the sample docx, a workbook and a project.
+test issue 1473 each tab type shows its label and accent, per theme
+  call theme-set {"theme":"light"}
+  call tab-list {}
+  assert reply.tabs.0.kind is docx
+  assert reply.title_label is doc
+  assert reply.accent is "#2aa79b"
+  assert reply.drawn_accent is "#2aa79b"
+  open copy:../fixtures/basic.xlsx
+  shot window
+  call tab-list {}
+  assert reply.title_label is sheet
+  assert reply.accent is "#1e7b3a"
+  assert reply.drawn_accent is "#1e7b3a"
+  call proj.new {}
+  shot window
+  call tab-list {}
+  assert reply.title_label is project
+  assert reply.accent is "#8f6b00"
+  assert reply.drawn_accent is "#8f6b00"
+  # Switching tabs switches both at once.
+  call tab-select {"tab":0}
+  shot window
+  call tab-list {}
+  assert reply.title_label is doc
+  assert reply.drawn_accent is "#2aa79b"
+  call tab-select {"tab":1}
+  shot window
+  call tab-list {}
+  assert reply.title_label is sheet
+  assert reply.drawn_accent is "#1e7b3a"
+  # The dark theme has its own shades.
+  call theme-set {"theme":"dark"}
+  shot window
+  call tab-list {}
+  assert reply.accent is "#23843f"
+  assert reply.drawn_accent is "#23843f"
+  call tab-select {"tab":2}
+  shot window
+  call tab-list {}
+  assert reply.title_label is project
+  assert reply.accent is "#946f00"
+  assert reply.drawn_accent is "#946f00"
+  call tab-select {"tab":0}
+  shot window
+  call tab-list {}
+  assert reply.drawn_accent is "#2aa79b"
+  call theme-set {"theme":"auto"}
+  # The accent follows the preference after theme-set, which clears the
+  # applied theme until a render. (Run against an accent taken from `applied`,
+  # this still passes: a frame lands between verbs and the capture draws
+  # twice, so the harness cannot see the first-frame order.)
+  call tab-select {"tab":1}
+  call theme-set {"theme":"dark"}
+  call tab-list {}
+  assert reply.accent is "#23843f"
+  shot window
+  call tab-list {}
+  assert reply.drawn_accent is "#23843f"
+  call theme-set {"theme":"light"}
+  call tab-list {}
+  assert reply.accent is "#1e7b3a"
+  call theme-set {"theme":"auto"}

@@ -40,7 +40,6 @@ test issue 588 r1 a long window title yields to the tab strip on a narrow window
   shot window
   call title-bar {}
   assert reply.overflow is true
-  assert reply.theme_visible is true
   assert reply.controls_clear is true
   assert reply.active_visible is true
   call tab-list {}
