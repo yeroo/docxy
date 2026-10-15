@@ -2571,6 +2571,26 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
             }
         }
     }
+    // `a:b` reads the box spanning both ends, not just the ends: a span from
+    // `Sales[Item]` to `Sales[Price]` reads the columns between them.
+    let mut spans = Vec::new();
+    formula::collect_range_ops(ast, &mut spans);
+    for (l, r) in spans {
+        let mut ends = Vec::new();
+        collect_deps(wb, key, l, &mut ends, depth + 1);
+        collect_deps(wb, key, r, &mut ends, depth + 1);
+        let Some(&(s, ..)) = ends.first() else {
+            continue;
+        };
+        if let Some(bx) = ends
+            .iter()
+            .filter(|e| e.0 == s)
+            .copied()
+            .reduce(|a, b| (s, a.1.min(b.1), a.2.min(b.2), a.3.max(b.3), a.4.max(b.4)))
+        {
+            out.push(bx);
+        }
+    }
     // Tables iterated by SUMX-family calls: the whole data region is read.
     let mut iterated = Vec::new();
     formula::collect_iterated_tables(ast, &mut iterated);
@@ -5738,6 +5758,52 @@ mod tests {
         assert_eq!(value_at(&wb, "E3"), CellValue::Number(103.0));
         set(&mut eng, &mut wb, "C4", Cell::number(50.0));
         assert_eq!(value_at(&wb, "E1"), CellValue::Number(163.0));
+    }
+
+    #[test]
+    fn a_span_depends_on_the_cells_between_its_ends() {
+        // #680 FIX r1: `Sales[Qty]:Sales[Price]` reads the middle column and
+        // `Sales[Qty]:A1` reads the gap between them, though neither is named.
+        let mut wb = wb_one_sheet(&[
+            ("B2", Cell::text("Qty")),
+            ("C2", Cell::text("Mid")),
+            ("D2", Cell::text("Price")),
+            ("B3", Cell::number(1.0)),
+            ("C3", Cell::number(10.0)),
+            ("D3", Cell::number(100.0)),
+            ("A3", Cell::number(1000.0)),
+            ("A2", Cell::number(5.0)),
+            ("F1", Cell::formula("SUM(Sales[Qty]:Sales[Price])")),
+            ("F2", Cell::formula("SUM(Sales[Qty]:A1)")),
+            ("F3", Cell::formula("SUM(Sales[Qty]:Rate)")),
+        ]);
+        wb.tables.push(crate::sheet::Table {
+            name: "Sales".to_string(),
+            sheet: 0,
+            range: (1, 1, 2, 3),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["Qty".into(), "Mid".into(), "Price".into()],
+            part: String::new(),
+            column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
+        });
+        wb.defined_names.push(crate::sheet::DefinedName {
+            name: "Rate".into(),
+            scope: None,
+            formula: "Sheet1!$D$3".into(),
+        });
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "F1"), CellValue::Number(111.0));
+        assert_eq!(value_at(&wb, "F2"), CellValue::Number(1006.0));
+        assert_eq!(value_at(&wb, "F3"), CellValue::Number(111.0));
+        set(&mut eng, &mut wb, "C3", Cell::number(20.0));
+        assert_eq!(value_at(&wb, "F1"), CellValue::Number(121.0));
+        assert_eq!(value_at(&wb, "F2"), CellValue::Number(1006.0));
+        // A2 is in the box but named by neither end.
+        set(&mut eng, &mut wb, "A2", Cell::number(50.0));
+        assert_eq!(value_at(&wb, "F2"), CellValue::Number(1051.0));
     }
 
     #[test]

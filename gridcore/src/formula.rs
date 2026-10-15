@@ -127,8 +127,9 @@ pub enum BinOp {
     Le,
     Gt,
     Ge,
-    /// `a:b` between two references — the box spanning both. Only the parser
-    /// makes it (after a structured reference); it evaluates as references.
+    /// `a:b` between two references where one is not a plain cell reference
+    /// (`Sales[Qty]:Sales[Price]`, `A1:B2:C3`, a lost `#REF!`): the box
+    /// spanning both. It evaluates as references.
     Range,
     /// `a b` (a space) between two references — their overlap.
     Isect,
@@ -552,9 +553,19 @@ fn indirect_literal_refs(e: &Expr) -> bool {
     }
 }
 
-/// Whether `e` is `a:b` built by the range operator.
-fn is_range_op(e: &Expr) -> bool {
-    matches!(e, Expr::Bin(BinOp::Range, ..))
+/// Whether a `:` after `e` extends it to a span: the reference forms the
+/// printer can write in front of one (a table reference, a range, a lost
+/// `#REF!`, an earlier span or intersection).
+fn can_span_from(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Structured { .. }
+            | Expr::Range(..)
+            | Expr::ColRange { .. }
+            | Expr::RowRange { .. }
+            | Expr::Err(ExcelError::Ref)
+            | Expr::Bin(BinOp::Range | BinOp::Isect, ..)
+    )
 }
 
 /// Whether `e` reads as a reference, so `:` and the space operator may join
@@ -569,6 +580,7 @@ fn is_ref_expr(e: &Expr) -> bool {
             | Expr::Structured { .. }
             | Expr::Name(_)
             | Expr::Func(..)
+            | Expr::Err(ExcelError::Ref)
             | Expr::Bin(BinOp::Range | BinOp::Isect, ..)
     )
 }
@@ -708,19 +720,26 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 Ok(Expr::Un(UnOp::Implicit, Box::new(self.unary()?)))
             }
-            _ => self.isect(),
+            _ => self.postfix(),
         }
     }
 
-    /// `a b` — the intersection of two references, tighter than negation and
-    /// looser than `:`.
+    /// `a b` — the intersection of two references, tighter than `%` and
+    /// negation and looser than `:`.
     fn isect(&mut self) -> Result<Expr, String> {
-        let mut e = self.postfix()?;
-        while self.space_before
-            && is_ref_expr(&e)
-            && matches!(self.tok, Tok::Ident(_) | Tok::Bracket(_) | Tok::Quoted(_))
-        {
-            let r = self.postfix()?;
+        let mut e = self.ref_chain()?;
+        while self.space_before && is_ref_expr(&e) {
+            // `(` opens a parenthesised operand, but not after a name or
+            // call, where `f (x)` is a call.
+            let starts_ref = match self.tok {
+                Tok::Ident(_) | Tok::Bracket(_) | Tok::Quoted(_) | Tok::Err(_) => true,
+                Tok::LParen => !matches!(e, Expr::Func(..) | Expr::Name(_) | Expr::Call(..)),
+                _ => false,
+            };
+            if !starts_ref {
+                break;
+            }
+            let r = self.ref_chain()?;
             if !is_ref_expr(&r) {
                 return Err("intersection needs references".into());
             }
@@ -729,14 +748,13 @@ impl<'a> Parser<'a> {
         Ok(e)
     }
 
-    fn postfix(&mut self) -> Result<Expr, String> {
+    /// A primary with the reference suffixes that bind tighter than the space
+    /// operator: `A1#` and `a:b` between references (`Sales[Qty]:Sales[Price]`,
+    /// `A1:B2:C3`).
+    fn ref_chain(&mut self) -> Result<Expr, String> {
         let mut e = self.primary()?;
         loop {
             match self.tok {
-                Tok::Percent => {
-                    self.bump()?;
-                    e = Expr::Un(UnOp::Percent, Box::new(e));
-                }
                 Tok::Hash => {
                     self.bump()?;
                     let Expr::Ref(r) = e else {
@@ -744,14 +762,27 @@ impl<'a> Parser<'a> {
                     };
                     e = Expr::SpillRef(r);
                 }
-                // `Sales[Qty]:Sales[Price]` — a span between references.
-                Tok::Colon if matches!(e, Expr::Structured { .. }) || is_range_op(&e) => {
+                Tok::Colon if can_span_from(&e) => {
                     self.bump()?;
                     let r = self.primary()?;
                     if !is_ref_expr(&r) {
                         return Err("range operator needs references".into());
                     }
                     e = Expr::Bin(BinOp::Range, Box::new(e), Box::new(r));
+                }
+                _ => break,
+            }
+        }
+        Ok(e)
+    }
+
+    fn postfix(&mut self) -> Result<Expr, String> {
+        let mut e = self.isect()?;
+        loop {
+            match self.tok {
+                Tok::Percent => {
+                    self.bump()?;
+                    e = Expr::Un(UnOp::Percent, Box::new(e));
                 }
                 // Immediate invocation: LAMBDA(x,x*2)(5).
                 Tok::LParen => {
@@ -4055,8 +4086,53 @@ pub fn is_volatile(e: &Expr) -> bool {
         Expr::ArrayLit(rows) => rows.iter().flatten().any(is_volatile),
         Expr::Call(callee, args) => is_volatile(callee) || args.iter().any(is_volatile),
         Expr::Un(_, x) => is_volatile(x),
+        // A span whose ends are not literal references has no box to depend
+        // on until it is evaluated.
+        Expr::Bin(BinOp::Range, l, r) => {
+            !(is_literal_ref(l) && is_literal_ref(r)) || is_volatile(l) || is_volatile(r)
+        }
         Expr::Bin(_, l, r) => is_volatile(l) || is_volatile(r),
         _ => false,
+    }
+}
+
+/// Whether `e` names cells by the formula's text alone: a reference form, a
+/// table reference, a lost `#REF!`, or reference operators over those.
+pub fn is_literal_ref(e: &Expr) -> bool {
+    match e {
+        Expr::Ref(_)
+        | Expr::Range(..)
+        | Expr::ColRange { .. }
+        | Expr::RowRange { .. }
+        | Expr::Structured { .. }
+        | Expr::Err(_) => true,
+        Expr::Bin(BinOp::Range | BinOp::Isect, l, r) => is_literal_ref(l) && is_literal_ref(r),
+        _ => false,
+    }
+}
+
+/// The operands of every `a:b` between references in a formula, outermost
+/// first (the operands of a nested span included).
+pub fn collect_range_ops<'a>(e: &'a Expr, out: &mut Vec<(&'a Expr, &'a Expr)>) {
+    match e {
+        Expr::Bin(op, l, r) => {
+            if *op == BinOp::Range {
+                out.push((l, r));
+            }
+            collect_range_ops(l, out);
+            collect_range_ops(r, out);
+        }
+        Expr::Func(_, args) => args.iter().for_each(|a| collect_range_ops(a, out)),
+        Expr::Call(callee, args) => {
+            collect_range_ops(callee, out);
+            args.iter().for_each(|a| collect_range_ops(a, out));
+        }
+        Expr::Un(_, x) => collect_range_ops(x, out),
+        Expr::ArrayLit(rows) => rows
+            .iter()
+            .flatten()
+            .for_each(|x| collect_range_ops(x, out)),
+        _ => {}
     }
 }
 
@@ -4198,7 +4274,8 @@ pub struct TableInfo {
 
 impl TableInfo {
     /// Resolve one structured reference against this table. `cur_row` is the
-    /// formula's own row (for `@`). Returns the rect, or None → `#REF!`.
+    /// formula's own row (for `@`). Returns the rect, or None when it names
+    /// nothing (see [`Self::resolve_err`] for the error Excel gives).
     pub fn resolve(
         &self,
         item: TableItem,
@@ -6114,26 +6191,55 @@ impl<'a> Eval<'a> {
         }
     }
 
-    /// A reference operand as `(sheet, r1, c1, r2, c2)`; a value that is not a
-    /// reference is `#VALUE!` (an error value stands as it is).
-    fn ref_rect(&mut self, e: &Expr) -> Result<(usize, u32, u32, u32, u32), Value> {
+    /// A reference as `(sheet, r1, c1, r2, c2)`; a value that is not one is
+    /// `#VALUE!` (an error value stands as it is). A defined name is read
+    /// through its definition. `operand` is a reference operator's operand:
+    /// a reference the evaluator can only hold as a value (a single-cell
+    /// `INDEX`, a `LET` variable) marks the formula unsupported rather than
+    /// answering `#VALUE!` where Excel would not.
+    fn ref_rect(&mut self, e: &Expr, operand: bool) -> Result<(usize, u32, u32, u32, u32), Value> {
         match e {
+            // A bare cell ref means the *position*, not the value.
             Expr::Ref(r) if r.row >= 0 && r.col >= 0 => {
                 let s = self.resolve_sheet(&r.sheet)?;
-                Ok((s, r.row as u32, r.col as u32, r.row as u32, r.col as u32))
+                return Ok((s, r.row as u32, r.col as u32, r.row as u32, r.col as u32));
             }
-            e => match self.eval_arg(e) {
-                Arg::Range(s, a, b, c, d) => Ok((s, a, b, c, d)),
-                Arg::Scalar(v @ Value::Err(_)) => Err(v),
-                _ => Err(Value::Err(ExcelError::Value)),
-            },
+            Expr::Name(n)
+                if self.depth < 32
+                    && !self
+                        .lets
+                        .iter()
+                        .any(|(l, _)| l.eq_ignore_ascii_case(bare_param(n))) =>
+            {
+                if let Some(def) = self.res.defined_name(n, self.sheet) {
+                    let Ok(ast) = parse(&def) else {
+                        self.unsupported = true;
+                        return Err(Value::Err(ExcelError::Name));
+                    };
+                    self.depth += 1;
+                    let r = self.ref_rect(&ast, operand);
+                    self.depth -= 1;
+                    return r;
+                }
+            }
+            _ => {}
+        }
+        match self.eval_arg(e) {
+            Arg::Range(s, a, b, c, d) => Ok((s, a, b, c, d)),
+            Arg::Scalar(v @ Value::Err(_)) => Err(v),
+            // Computed arrays and scalars don't qualify.
+            Arg::Scalar(_) | Arg::Matrix(_) => {
+                self.unsupported |= operand;
+                Err(Value::Err(ExcelError::Value))
+            }
+            Arg::Lambda(_) => Err(Value::Err(ExcelError::Calc)),
         }
     }
 
     /// `a:b` and `a b` over references: the box spanning both, and their
     /// overlap (`#NULL!` when there is none). Both must be on one sheet.
     fn ref_op(&mut self, op: BinOp, l: &Expr, r: &Expr) -> Arg {
-        let (a, b) = match (self.ref_rect(l), self.ref_rect(r)) {
+        let (a, b) = match (self.ref_rect(l, true), self.ref_rect(r, true)) {
             (Ok(a), Ok(b)) => (a, b),
             (Err(v), _) | (_, Err(v)) => return Arg::Scalar(v),
         };
@@ -6163,30 +6269,51 @@ impl<'a> Eval<'a> {
 
     /// Whether `e` is a reference (cells, not their values): a reference
     /// form, a name or table that is one, or a function that returns one.
+    /// What the evaluator cannot tell (a reference it can only hold as a
+    /// value, a definition it cannot read) marks the formula unsupported, so
+    /// the file's cached answer stands.
     fn yields_ref(&mut self, e: &Expr) -> bool {
         match e {
             // A literal cell reference is one unless it is a lost `#REF!`.
-            Expr::Ref(r) => r.row >= 0 && r.col >= 0 && self.resolve_sheet(&r.sheet).is_ok(),
+            Expr::Ref(r) => {
+                r.row >= 0
+                    && r.col >= 0
+                    && match self.resolve_sheet(&r.sheet) {
+                        Ok(_) => true,
+                        Err(_) => {
+                            self.unsupported = true;
+                            false
+                        }
+                    }
+            }
             Expr::Range(..)
             | Expr::ColRange { .. }
             | Expr::RowRange { .. }
-            | Expr::Ref3D { .. }
             | Expr::SpillRef(_)
             | Expr::Structured { .. }
             | Expr::Bin(BinOp::Range | BinOp::Isect, ..) => {
                 matches!(self.eval_arg(e), Arg::Range(..))
             }
-            // A defined name is one when its definition is.
-            Expr::Name(n) if self.depth < 32 => {
-                match self.res.defined_name(n, self.sheet).map(|d| parse(&d)) {
-                    Some(Ok(def)) => {
-                        self.depth += 1;
-                        let r = self.yields_ref(&def);
-                        self.depth -= 1;
-                        r
-                    }
-                    Some(Err(_)) => false,
-                    None => matches!(self.eval_arg(e), Arg::Range(..)),
+            Expr::Ref3D { .. } => self.resolve_3d(e).is_ok(),
+            Expr::Name(n) => {
+                let bound = self
+                    .lets
+                    .iter()
+                    .any(|(l, _)| l.eq_ignore_ascii_case(bare_param(n)));
+                match self.res.defined_name(n, self.sheet) {
+                    Some(def) if !bound && self.depth < 32 => match parse(&def) {
+                        Ok(ast) => {
+                            self.depth += 1;
+                            let r = self.yields_ref(&ast);
+                            self.depth -= 1;
+                            r
+                        }
+                        Err(_) => {
+                            self.unsupported = true;
+                            false
+                        }
+                    },
+                    _ => self.held_ref(e),
                 }
             }
             Expr::Func(name, args) if name == "INDIRECT" && self.depth < 32 => {
@@ -6205,8 +6332,36 @@ impl<'a> Eval<'a> {
                 args.first().is_some_and(|a| self.yields_ref(a))
                     && !matches!(self.eval_arg(e), Arg::Scalar(Value::Err(_)))
             }
+            // These can pass a reference through; the evaluator holds the
+            // result as a value unless it is a range.
+            Expr::Func(name, _)
+                if matches!(
+                    name.as_str(),
+                    "IF" | "IFS" | "IFERROR" | "IFNA" | "CHOOSE" | "SWITCH" | "LET" | "XLOOKUP"
+                ) =>
+            {
+                self.held_ref(e)
+            }
             Expr::Func(..) => matches!(self.eval_arg(e), Arg::Range(..)),
+            Expr::Call(..) => {
+                self.unsupported = true;
+                false
+            }
             _ => false,
+        }
+    }
+
+    /// [`Self::yields_ref`] for an expression that may pass a reference
+    /// through but is evaluated to a value: a range is a reference, an error
+    /// is not, and any other value is undecided.
+    fn held_ref(&mut self, e: &Expr) -> bool {
+        match self.eval_arg(e) {
+            Arg::Range(..) => true,
+            Arg::Scalar(Value::Err(_)) => false,
+            _ => {
+                self.unsupported = true;
+                false
+            }
         }
     }
 
@@ -6216,11 +6371,7 @@ impl<'a> Eval<'a> {
         if args.len() != 1 {
             return Arg::Scalar(Value::Err(ExcelError::Value));
         }
-        let unsupported = self.unsupported;
         let is_ref = self.yields_ref(&args[0]);
-        // Asking whether something is a reference is not itself a use of
-        // anything unsupported.
-        self.unsupported = unsupported;
         Arg::Scalar(if areas {
             if is_ref {
                 Value::Num(1.0)
@@ -6237,26 +6388,9 @@ impl<'a> Eval<'a> {
         if args.len() < 3 || args.len() > 5 {
             return Arg::Scalar(Value::Err(ExcelError::Value));
         }
-        let (s, r1, c1, r2, c2) = match &args[0] {
-            // A bare cell ref means the *position*, not the value.
-            Expr::Ref(r) if r.row >= 0 && r.col >= 0 => match self.resolve_sheet(&r.sheet) {
-                Ok(s) => (s, r.row as u32, r.col as u32, r.row as u32, r.col as u32),
-                Err(v) => return Arg::Scalar(v),
-            },
-            e => match self.eval_arg(e) {
-                Arg::Range(s, a, b, c, d) => (s, a, b, c, d),
-                // OFFSET needs an actual reference; computed arrays and
-                // scalars don't qualify.
-                Arg::Scalar(v) => {
-                    return Arg::Scalar(if v.is_err() {
-                        v
-                    } else {
-                        Value::Err(ExcelError::Value)
-                    });
-                }
-                Arg::Matrix(_) => return Arg::Scalar(Value::Err(ExcelError::Value)),
-                Arg::Lambda(_) => return Arg::Scalar(Value::Err(ExcelError::Calc)),
-            },
+        let (s, r1, c1, r2, c2) = match self.ref_rect(&args[0], false) {
+            Ok(r) => r,
+            Err(v) => return Arg::Scalar(v),
         };
         let dr = match to_num(&self.eval(&args[1])) {
             Ok(n) => n.trunc() as i64,
@@ -13432,7 +13566,11 @@ mod tests {
             self.cells.get(&(row, col)).cloned().unwrap_or(Value::Empty)
         }
         fn sheet_index(&self, name: &str) -> Option<usize> {
-            (name == "Sheet1").then_some(0)
+            match name {
+                "Sheet1" => Some(0),
+                "Other" => Some(1),
+                _ => None,
+            }
         }
         fn cells_in(
             &self,
@@ -15418,9 +15556,18 @@ mod tests {
             eval_outside("SUM(Sales[Qty]:Sales[Nope])", &g).0,
             Value::Err(ExcelError::Ref)
         );
-        // Another sheet's cells can't join the table's rect.
+        // Another sheet's cells can't join the table's rect…
         assert_eq!(
             eval_outside("SUM(Sales[Qty]:Other!A1)", &g).0,
+            Value::Err(ExcelError::Value)
+        );
+        assert_eq!(
+            eval_outside("SUM(Sales[Qty] Other!A1:B2)", &g).0,
+            Value::Err(ExcelError::Value)
+        );
+        // …and a sheet the workbook lacks is #REF!.
+        assert_eq!(
+            eval_outside("SUM(Sales[Qty]:Missing!A1)", &g).0,
             Value::Err(ExcelError::Ref)
         );
     }
@@ -15569,9 +15716,186 @@ mod tests {
         ] {
             assert_eq!(eval_outside(src, &g).0, want, "{src}");
         }
-        // A reference test never marks the formula unsupported.
-        let (_, unsupported) = eval_outside("ISREF(Unseen[Qty])", &Grid::new(&[]));
+        // What the evaluator cannot decide keeps the file's cached answer.
+        let g = issue_680_grid()
+            .with_name("Rate", "Sheet1!$B$3")
+            .with_name("Union", "(A1,B2)");
+        for src in [
+            "ISREF(Unseen[Qty])",
+            "ISREF(IF(TRUE,A1))",
+            "ISREF(CHOOSE(1,A1,B1))",
+            "ISREF(LET(c,B3,c))",
+            "ISREF(Union)",
+            "ISREF(Missing!A1)",
+            "ISREF(INDIRECT(\"A1\",FALSE))",
+        ] {
+            assert!(eval_outside(src, &g).1, "{src} should be unsupported");
+        }
+        // A name that is one cell is a reference.
+        let (v, unsupported) = eval_outside("ISREF(Rate)", &g);
+        assert_eq!(v, Value::Bool(true));
         assert!(!unsupported);
+    }
+
+    #[test]
+    fn rewritten_reference_operators_reparse_and_evaluate() {
+        let g = issue_680_grid();
+        let info = g.table.clone().unwrap();
+        let t = TableToRange {
+            name: "Sales",
+            sheet_name: "Sheet1",
+            info: &info,
+        };
+        let host = FormulaHost {
+            same_sheet: true,
+            row: Some(1),
+            inside: false,
+        };
+        // Convert to Range turns the table references into cells.
+        for (src, want) in [
+            ("SUM(Sales[Qty]:Sales[Price])", Value::Num(44.85)),
+            ("SUM(Sales[Qty] Sales[[#All],[Qty]])", Value::Num(37.0)),
+            (
+                "SUM(Sales[[#This Row],[Qty]]:Sales[Price])",
+                Value::Num(44.85),
+            ),
+            (
+                "SUM(Sales[Item]:Sales[Qty]:Sales[Price])",
+                Value::Num(44.85),
+            ),
+        ] {
+            let out = table_refs_to_cells_in_expr(&parse(src).unwrap(), &t, host);
+            let text = to_string(&out);
+            let back = parse(&text).unwrap_or_else(|e| panic!("{src} -> {text}: {e}"));
+            assert_eq!(to_string(&back), text);
+            let (v, _) = eval_680(&text, &g, (1, 5));
+            match (v, want) {
+                (Value::Num(a), Value::Num(b)) => assert!((a - b).abs() < 1e-9, "{text}: {a}"),
+                (a, b) => assert_eq!(a, b, "{text}"),
+            }
+        }
+        // Deleting the table or a column leaves #REF! operands.
+        let ast = parse("SUM(Sales[Qty]:Sales[Price] Sales[[#All],[Qty]])").unwrap();
+        let gone = delete_table_in_expr(&ast, "Sales", false);
+        let cols = ["Item", "Qty", "Price", "Region"].map(String::from);
+        let cut =
+            delete_table_columns_in_expr(&ast, "Sales", false, &cols, &[false, true, false, false]);
+        for edited in [gone, cut] {
+            let text = to_string(&edited);
+            assert_eq!(parse(&text).unwrap(), edited, "{text}");
+            assert_eq!(
+                eval_outside(&text, &g).0,
+                Value::Err(ExcelError::Ref),
+                "{text}"
+            );
+        }
+        // A row or column delete under `:` and the space operator.
+        for (src, shift, want) in [
+            (
+                "SUM(A1:C3 B2)",
+                EditShift {
+                    rows: false,
+                    at: 1,
+                    delta: -1,
+                },
+                "SUM(A1:B3 #REF!)",
+            ),
+            (
+                "SUM(A1:C3 B2)",
+                EditShift {
+                    rows: true,
+                    at: 1,
+                    delta: -1,
+                },
+                "SUM(A1:C2 #REF!)",
+            ),
+            (
+                "SUM(Sales[Qty]:B2)",
+                EditShift {
+                    rows: false,
+                    at: 1,
+                    delta: -1,
+                },
+                "SUM(Sales[Qty]:#REF!)",
+            ),
+            (
+                "SUM(A1:B2:D4)",
+                EditShift {
+                    rows: false,
+                    at: 1,
+                    delta: 1,
+                },
+                "SUM(A1:C2:E4)",
+            ),
+        ] {
+            let text = adjust_formula_for_edit(src, true, "Sheet1", &shift).unwrap();
+            assert_eq!(text, want, "{src}");
+            assert!(parse(&text).is_ok(), "{text} should reparse");
+        }
+    }
+
+    #[test]
+    fn chained_spans_and_parenthesised_operands() {
+        let g = Grid::new(&[
+            ("A1", Value::Num(1.0)),
+            ("B2", Value::Num(2.0)),
+            ("C3", Value::Num(4.0)),
+            ("D4", Value::Num(8.0)),
+        ]);
+        for (src, want) in [
+            ("SUM(A1:B2:C3)", 7.0),
+            ("SUM(A1:B2:D4)", 15.0),
+            ("SUM(A1:B2 (B2:C3 B1:D2))", 2.0),
+            ("SUM((A1:C3 B2:D4)%)", 0.06),
+        ] {
+            match eval_outside(src, &g).0 {
+                Value::Num(n) => assert!((n - want).abs() < 1e-9, "{src}: {n}"),
+                other => panic!("{src}: {other:?}"),
+            }
+        }
+        // `%` ranks below the reference operators, so it round-trips.
+        for src in [
+            "(A1:B3 B2:C4)%",
+            "(Sales[Qty] Sales[[#All],[Qty]])%",
+            "A1:B2 (B1:C3 C2:D4)",
+            "SUM(A1:B2:C3)",
+        ] {
+            let ast = parse(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+            let text = to_string(&ast);
+            assert_eq!(parse(&text).unwrap(), ast, "{src} -> {text}");
+        }
+        assert!(matches!(
+            parse("(A1:B3 B2:C4)%").unwrap(),
+            Expr::Un(UnOp::Percent, _)
+        ));
+        // A call keeps its space before the argument list.
+        assert!(parse("SUM (A1:B2)").is_ok());
+    }
+
+    #[test]
+    fn reference_operands_read_names_and_never_answer_value_unflagged() {
+        let g = issue_680_grid().with_name("Rate", "Sheet1!$B$3");
+        // A one-cell defined name is a reference.
+        for (src, want) in [
+            ("SUM(Sales[Qty]:Rate)", 37.0),
+            ("SUM(Sales[Qty] Rate)", 10.0),
+            ("SUM(Rate Sales[Qty])", 10.0),
+            ("ROWS(OFFSET(Rate,0,0,2,1))", 2.0),
+        ] {
+            let (v, unsupported) = eval_outside(src, &g);
+            assert_eq!(v, Value::Num(want), "{src}");
+            assert!(!unsupported, "{src}");
+        }
+        // References the evaluator holds only as values are flagged, so the
+        // file's cached answer stands instead of a wrong #VALUE!.
+        for src in [
+            "SUM(Sales[Qty] LET(c,B3,c))",
+            "LET(c,B3,SUM(Sales[Qty] c))",
+            "SUM(Sales[Qty]:INDEX(Sales[Price],2))",
+        ] {
+            let (_, unsupported) = eval_outside(src, &g);
+            assert!(unsupported, "{src}");
+        }
     }
 
     #[test]
