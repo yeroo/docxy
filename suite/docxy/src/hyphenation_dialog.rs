@@ -106,9 +106,9 @@ pub(crate) fn apply_hyphenation(pkg: &mut Package, d: &Dialog) -> Result<bool, S
         if text.is_empty() {
             Some(None)
         } else {
-            let n: i64 = text.parse().map_err(|_| {
-                "Limit consecutive hyphens to takes a whole number, or blank for no limit"
-            })?;
+            let n: i64 = text.parse().map_err(
+                |_| "Limit consecutive hyphens to takes a whole number, or blank for no limit",
+            )?;
             if n < 0 {
                 return Err("Limit consecutive hyphens to cannot be negative".into());
             }

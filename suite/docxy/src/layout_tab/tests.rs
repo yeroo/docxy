@@ -473,7 +473,11 @@ fn hyphenation_options_is_enabled() {
     let act = menu_rows(LayoutMenu::Hyphenation)
         .into_iter()
         .find_map(|r| match r {
-            Row::Item { id: "hyphen-options", act, .. } => Some(act),
+            Row::Item {
+                id: "hyphen-options",
+                act,
+                ..
+            } => Some(act),
             _ => None,
         })
         .expect("the row");
