@@ -19,17 +19,19 @@ pub(crate) enum Op<'a> {
 /// Whether a key-down is Excel's Alt+R / Alt+A in the Find bar: `Some(true)`
 /// for Replace All (`a`), `Some(false)` for Replace (`r`). Not Ctrl+Alt (AltGr
 /// types text), and not when ⌥ made another character (macOS ⌥R is "®", ⌥A
-/// "å"): that is typing, not a chord (#1162).
+/// "å"): that is typing, not a chord (#1162). Off macOS (`mac` false) Alt is
+/// never text, so the layout's character (Russian Alt+R is "к") is ignored.
 pub(crate) fn alt_replace(
     key: &str,
     key_char: Option<&str>,
     ctrl: bool,
     alt: bool,
+    mac: bool,
 ) -> Option<bool> {
     if !alt || ctrl || !matches!(key, "r" | "a") {
         return None;
     }
-    if key_char.is_some_and(|c| !c.eq_ignore_ascii_case(key)) {
+    if mac && key_char.is_some_and(|c| !c.eq_ignore_ascii_case(key)) {
         return None;
     }
     Some(key == "a")
@@ -174,17 +176,28 @@ mod tests {
     }
 
     #[test]
-    fn alt_replace_takes_the_plain_letter_only() {
-        assert_eq!(alt_replace("r", Some("r"), false, true), Some(false));
-        assert_eq!(alt_replace("a", Some("a"), false, true), Some(true));
-        assert_eq!(alt_replace("a", None, false, true), Some(true));
-        for c in ["®", "å", "ą"] {
-            assert_eq!(alt_replace("r", Some(c), false, true), None);
-            assert_eq!(alt_replace("a", Some(c), false, true), None);
+    fn alt_replace_takes_the_plain_letter_only_on_macos() {
+        assert_eq!(alt_replace("r", Some("r"), false, true, true), Some(false));
+        assert_eq!(alt_replace("a", Some("a"), false, true, true), Some(true));
+        assert_eq!(alt_replace("a", None, false, true, true), Some(true));
+        for c in ["®", "å", "ą", "к"] {
+            assert_eq!(alt_replace("r", Some(c), false, true, true), None);
+            assert_eq!(alt_replace("a", Some(c), false, true, true), None);
         }
-        assert_eq!(alt_replace("r", Some("r"), true, true), None, "AltGr");
-        assert_eq!(alt_replace("r", Some("r"), false, false), None);
-        assert_eq!(alt_replace("x", Some("x"), false, true), None);
+        assert_eq!(alt_replace("r", Some("r"), true, true, true), None, "AltGr");
+        assert_eq!(alt_replace("r", Some("r"), false, false, true), None);
+        assert_eq!(alt_replace("x", Some("x"), false, true, true), None);
+    }
+
+    #[test]
+    fn alt_replace_ignores_the_layouts_character_off_macos() {
+        assert_eq!(alt_replace("r", Some("к"), false, true, false), Some(false));
+        assert_eq!(alt_replace("a", Some("ф"), false, true, false), Some(true));
+        assert_eq!(
+            alt_replace("r", Some("r"), true, true, false),
+            None,
+            "AltGr"
+        );
     }
 
     #[test]

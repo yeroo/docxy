@@ -18830,9 +18830,9 @@ impl Docxy {
         }
     }
 
-    /// The sheet Find bar's caret for `f`: kept while its text is as the bar
-    /// left it, else at the end.
-    fn sf_caret_of(&self, f: FindField) -> usize {
+    /// The sheet Find bar's caret and whole-field selection for `f`: kept
+    /// while its text is as the bar left it, else the end and none.
+    fn sf_state(&self, f: FindField) -> (usize, bool) {
         let i = f.idx();
         field_edit::current(
             self.sf_text(f),
@@ -18840,19 +18840,6 @@ impl Docxy {
             self.sf_sel[i],
             self.sf_len[i],
         )
-        .0
-    }
-
-    /// Whether `f`'s whole text is selected.
-    fn sf_sel_of(&self, f: FindField) -> bool {
-        let i = f.idx();
-        field_edit::current(
-            self.sf_text(f),
-            self.sf_caret[i],
-            self.sf_sel[i],
-            self.sf_len[i],
-        )
-        .1
     }
 
     /// Open the sheet Find bar's fields with the caret at each text's end.
@@ -18875,8 +18862,7 @@ impl Docxy {
     fn sf_edit(&mut self, op: field_edit::Op) {
         let f = self.find_field;
         let i = f.idx();
-        let mut caret = self.sf_caret_of(f);
-        let mut sel = self.sf_sel_of(f);
+        let (mut caret, mut sel) = self.sf_state(f);
         let text = match f {
             FindField::Query => &mut self.find_query,
             FindField::Replace => &mut self.replace_text,
@@ -18900,8 +18886,13 @@ impl Docxy {
         use field_edit::Op;
         let f = self.find_field;
         // Replace and Replace All have keys, as Excel's Alt+R / Alt+A (#1342).
-        if let Some(all) = field_edit::alt_replace(key, ev.keystroke.key_char.as_deref(), ctrl, alt)
-        {
+        if let Some(all) = field_edit::alt_replace(
+            key,
+            ev.keystroke.key_char.as_deref(),
+            ctrl,
+            alt,
+            text_input::MACOS,
+        ) {
             if all {
                 self.sheet_replace_all(cx);
             } else {
@@ -18915,7 +18906,7 @@ impl Docxy {
                 "a" => self.sf_edit(Op::SelectAll),
                 "c" | "x" => {
                     let text = self.sf_text(f).clone();
-                    if self.sf_sel_of(f) && !text.is_empty() {
+                    if self.sf_state(f).1 && !text.is_empty() {
                         self.clipboard_write(text.clone(), cx);
                         self.office_clip.push(&text);
                         if key == "x" {
@@ -24448,8 +24439,14 @@ impl Docxy {
         // past the KeyTips the bare Alt raised (they would pick a tab).
         if self.active_is_sheet()
             && self.find_open
-            && field_edit::alt_replace(&key, ev.keystroke.key_char.as_deref(), ctrl, m.alt)
-                .is_some()
+            && field_edit::alt_replace(
+                &key,
+                ev.keystroke.key_char.as_deref(),
+                ctrl,
+                m.alt,
+                text_input::MACOS,
+            )
+            .is_some()
         {
             self.keytips = KeyTip::Off;
             return self.sheet_key(ev, ctrl, shift, m.alt, key.as_str(), window, cx);
@@ -34246,8 +34243,8 @@ impl Docxy {
                 field(
                     "sf-q",
                     &self.find_query,
-                    self.sf_caret_of(FindField::Query),
-                    qf && self.sf_sel_of(FindField::Query),
+                    self.sf_state(FindField::Query).0,
+                    qf && self.sf_state(FindField::Query).1,
                     qf,
                     "Find in sheet",
                 )
@@ -34274,8 +34271,8 @@ impl Docxy {
                 field(
                     "sf-r",
                     &self.replace_text,
-                    self.sf_caret_of(FindField::Replace),
-                    rf && self.sf_sel_of(FindField::Replace),
+                    self.sf_state(FindField::Replace).0,
+                    rf && self.sf_state(FindField::Replace).1,
                     rf,
                     "Replace with",
                 )
