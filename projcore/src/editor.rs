@@ -44,7 +44,9 @@ use cells::parse_predecessors;
 use cells::{bracket_units, day_start, parse_resource_token, same_shown_units};
 mod moving;
 mod outline;
+mod props;
 use outline::subtree_end;
+pub use props::{PRIORITY_DEFAULT, PRIORITY_MAX};
 #[cfg(test)]
 mod refresh_tests;
 
