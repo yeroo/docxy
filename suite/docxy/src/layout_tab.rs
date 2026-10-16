@@ -347,12 +347,12 @@ pub(crate) fn menu_items(menu: LayoutMenu, checked: impl Fn(Act) -> bool) -> Vec
         .collect()
 }
 
-/// The body editor and package of a .docx tab, or why a Layout command has
-/// nothing to act on.
 /// Why a settings.xml flag could not be changed (#1273).
 pub(crate) const SETTINGS_UNREADABLE: &str =
     "Could not change the setting: the document's settings part is unreadable";
 
+/// The body editor and package of a .docx tab, or why a Layout command has
+/// nothing to act on.
 fn body(tab: &mut DocTab) -> Result<(&mut Editor, &mut Package), String> {
     match (&mut tab.surface, tab.pkg.as_mut()) {
         (Surface::Doc(ed), Some(pkg)) => Ok((ed, pkg)),

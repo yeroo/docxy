@@ -1363,3 +1363,36 @@ fn gutter_multiple_pages_and_margins_are_one_undo_step_1273() {
     assert!(p.has_gutter_at_top() && p.has_mirror_margins());
     assert_eq!(ed(&t).doc, after);
 }
+
+/// #1273: a settings part where only turning a flag off can work (no
+/// `w:settings` root to add one to) refuses a dialog that turns one off and
+/// the other on, with the package still agreeing with the editor.
+#[test]
+fn a_refused_second_flag_leaves_the_first_alone_1273() {
+    let mut t = three_sections();
+    {
+        let pkg = t.pkg.as_mut().unwrap();
+        pkg.set_gutter_at_top(true); // creates the part
+        pkg.set_gutter_at_top(false);
+        assert!(pkg.set_part(
+            "word/settings.xml",
+            b"<other><w:gutterAtTop/></other>".to_vec()
+        ));
+        assert!(pkg.has_gutter_at_top());
+    }
+    let Surface::Doc(e) = &mut t.surface else {
+        panic!()
+    };
+    e.seed_settings(docxcore::editor::DocSettings {
+        gutter_at_top: true,
+        ..Default::default()
+    });
+    t.dirty = false;
+    open(&mut t, PageSetupTab::Margins);
+    set(&mut t, "Gutter position", s("Left"));
+    set(&mut t, "Multiple pages", s("Mirror margins"));
+    assert!(ok(&mut t).is_err());
+    assert!(t.pkg.as_ref().unwrap().has_gutter_at_top());
+    assert!(ed(&t).settings().gutter_at_top);
+    assert!(!t.dirty && ed(&t).undo_names().is_empty());
+}
