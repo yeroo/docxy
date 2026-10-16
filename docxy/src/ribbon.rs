@@ -123,9 +123,20 @@ pub enum Act {
     InsertTable,
     /// Insert a page break at the caret.
     PageBreak,
-    /// Cycle newspaper columns (1 → 2 → 3) for the section.
+    // Layout tab (#1274): pickers acting on the section(s) at the caret.
+    /// Open the Margins picker (Normal, Narrow, …, Mirrored).
+    Margins,
+    /// Open the Orientation picker (Portrait / Landscape).
+    Orientation,
+    /// Open the paper-size picker.
+    PaperSize,
+    /// Open the Columns picker (One, Two, Three, Left, Right).
     Columns,
-    /// Toggle automatic hyphenation for the document.
+    /// Open the Breaks picker (page, column, wrapping and section breaks).
+    Breaks,
+    /// Open the Line Numbers picker.
+    LineNumbers,
+    /// Open the Hyphenation picker (None / Automatic).
     Hyphenation,
     /// Open the equation-template picker and insert the chosen formula.
     InsertEquation,
@@ -165,7 +176,7 @@ type Group = ribboncore::Group<Act>;
 /// xlsxy green, yppxy yellow).
 const ACCENT: Color = Color::LightBlue;
 const HOME_TAB: usize = 1;
-const VIEW_TAB: usize = 6;
+const VIEW_TAB: usize = 7;
 
 /// A focusable button (docxy hand-counts widths — some glyphs render one column
 /// where unicode-width reports two).
@@ -183,7 +194,7 @@ pub struct Ribbon {
 impl Ribbon {
     pub fn home() -> Ribbon {
         let tabs = vec![
-            "File", "Home", "Styles", "Insert", "Design", "Review", "View", "Help",
+            "File", "Home", "Styles", "Insert", "Design", "Layout", "Review", "View", "Help",
         ];
         let tab_groups = vec![
             Vec::new(), // File → backstage
@@ -191,6 +202,7 @@ impl Ribbon {
             styles_groups(),
             insert_groups(),
             design_groups(),
+            layout_groups(),
             review_groups(),
             view_groups(false),
             help_groups(),
@@ -472,19 +484,6 @@ fn insert_groups() -> Vec<Group> {
             ],
         },
         Group {
-            title: "Layout",
-            width: 12,
-            rows: [
-                vec![btn("▐▐ Columns", 10, Columns, "Newspaper columns (1/2/3)")],
-                vec![btn(
-                    "‑ Hyphenate",
-                    11,
-                    Hyphenation,
-                    "Toggle automatic hyphenation",
-                )],
-            ],
-        },
-        Group {
             title: "Text",
             width: 13,
             rows: [
@@ -547,6 +546,55 @@ fn design_groups() -> Vec<Group> {
             )],
         ],
     }]
+}
+
+/// The Layout tab's groups (#1274): Page Setup and Text Flow. Every button
+/// opens a picker acting on the section(s) at the caret.
+fn layout_groups() -> Vec<Group> {
+    use Act::*;
+    vec![
+        Group {
+            title: "Page Setup",
+            width: 33,
+            rows: [
+                vec![
+                    btn("Margins ▾", 9, Margins, "Margins — page margins"),
+                    Seg::Gap(" "),
+                    btn(
+                        "Orientation ▾",
+                        13,
+                        Orientation,
+                        "Orientation — portrait or landscape",
+                    ),
+                    Seg::Gap(" "),
+                    btn("Size ▾", 6, PaperSize, "Size — paper size"),
+                ],
+                vec![
+                    btn("Columns ▾", 9, Columns, "Columns — newspaper columns"),
+                    Seg::Gap(" "),
+                    btn("Breaks ▾", 8, Breaks, "Breaks — page, column and section"),
+                ],
+            ],
+        },
+        Group {
+            title: "Text Flow",
+            width: 14,
+            rows: [
+                vec![btn(
+                    "Line Nos ▾",
+                    10,
+                    LineNumbers,
+                    "Line Numbers — number the lines of the section",
+                )],
+                vec![btn(
+                    "Hyphen ▾",
+                    8,
+                    Hyphenation,
+                    "Hyphenation — automatic hyphenation",
+                )],
+            ],
+        },
+    ]
 }
 
 fn review_groups() -> Vec<Group> {
@@ -889,6 +937,7 @@ mod tests {
                 styles_groups(),
                 insert_groups(),
                 design_groups(),
+                layout_groups(),
                 review_groups(),
                 view_groups(md),
                 help_groups(),
@@ -941,8 +990,8 @@ mod tests {
     #[test]
     fn review_tab_offers_compare() {
         let mut r = Ribbon::home();
-        r.set_active(5);
-        assert_eq!(r.tab_label(5), Some("Review"));
+        r.set_active(6);
+        assert_eq!(r.tab_label(6), Some("Review"));
         assert!(r.has_act(Act::Compare));
     }
 
@@ -950,15 +999,42 @@ mod tests {
     fn design_tab_offers_page_background() {
         let mut r = Ribbon::home();
         assert_eq!(r.tab_label(4), Some("Design"));
-        assert_eq!(r.tab_label(5), Some("Review"));
-        assert_eq!(r.tab_label(6), Some("View"));
+        assert_eq!(r.tab_label(5), Some("Layout"));
+        assert_eq!(r.tab_label(6), Some("Review"));
+        assert_eq!(r.tab_label(7), Some("View"));
         r.set_active(4);
         assert!(r.has_act(Act::PageColor));
         assert!(r.has_act(Act::Watermark));
         assert!(r.has_act(Act::PageBorders));
     }
 
-    const HELP_TAB: usize = 7;
+    const HELP_TAB: usize = 8;
+
+    #[test]
+    fn layout_tab_follows_design_and_owns_columns_and_hyphenation() {
+        let mut r = Ribbon::home();
+        assert_eq!(r.tab_label(4), Some("Design"));
+        assert_eq!(r.tab_label(5), Some("Layout"));
+        r.set_active(5);
+        for act in [
+            Act::Margins,
+            Act::Orientation,
+            Act::PaperSize,
+            Act::Columns,
+            Act::Breaks,
+            Act::LineNumbers,
+            Act::Hyphenation,
+        ] {
+            assert!(r.has_act(act), "{act:?}");
+        }
+        r.set_active(3); // Insert
+        assert!(!r.has_act(Act::Columns));
+        assert!(!r.has_act(Act::Hyphenation));
+        assert!(
+            insert_groups().iter().all(|g| g.title != "Layout"),
+            "Insert has no Layout group"
+        );
+    }
 
     #[test]
     fn help_is_the_last_tab() {

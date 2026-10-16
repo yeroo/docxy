@@ -17,6 +17,7 @@ mod backstage;
 mod bidi;
 mod control;
 mod html;
+mod layout_tab;
 mod mcp;
 mod metafile;
 mod protection;
@@ -1133,6 +1134,14 @@ enum PickerKind {
     PageColor,
     Watermark,
     PageBorders,
+    // Layout tab (#1274)
+    Margins,
+    Orientation,
+    PaperSize,
+    Columns,
+    Breaks,
+    LineNumbers,
+    Hyphenation,
 }
 
 /// Common equation templates for Insert ▸ Equation: (label, LaTeX). The engine
@@ -1261,6 +1270,13 @@ impl PickerKind {
             PickerKind::PageColor => " Page Color ",
             PickerKind::Watermark => " Watermark ",
             PickerKind::PageBorders => " Page Borders ",
+            PickerKind::Margins => " Margins ",
+            PickerKind::Orientation => " Orientation ",
+            PickerKind::PaperSize => " Size ",
+            PickerKind::Columns => " Columns ",
+            PickerKind::Breaks => " Breaks ",
+            PickerKind::LineNumbers => " Line Numbers ",
+            PickerKind::Hyphenation => " Hyphenation ",
         }
     }
     fn items(self) -> &'static [&'static str] {
@@ -1328,6 +1344,13 @@ impl PickerKind {
             PickerKind::PageColor => PAGE_COLOR_ITEMS,
             PickerKind::Watermark => WATERMARK_ITEMS,
             PickerKind::PageBorders => PAGE_BORDER_ITEMS,
+            PickerKind::Margins => layout_tab::MARGIN_ITEMS,
+            PickerKind::Orientation => layout_tab::ORIENTATION_ITEMS,
+            PickerKind::PaperSize => layout_tab::PAPER_ITEMS,
+            PickerKind::Columns => layout_tab::COLUMN_ITEMS,
+            PickerKind::Breaks => layout_tab::BREAK_ITEMS,
+            PickerKind::LineNumbers => layout_tab::LINE_NUMBER_ITEMS,
+            PickerKind::Hyphenation => layout_tab::HYPHEN_ITEMS,
         }
     }
 }
@@ -2162,6 +2185,13 @@ impl App {
             PageColor => self.open_design_picker(PickerKind::PageColor),
             Watermark => self.open_design_picker(PickerKind::Watermark),
             PageBorders => self.open_design_picker(PickerKind::PageBorders),
+            Margins => self.open_layout_picker(PickerKind::Margins),
+            Orientation => self.open_layout_picker(PickerKind::Orientation),
+            PaperSize => self.open_layout_picker(PickerKind::PaperSize),
+            Columns => self.open_layout_picker(PickerKind::Columns),
+            Breaks => self.open_layout_picker(PickerKind::Breaks),
+            LineNumbers => self.open_layout_picker(PickerKind::LineNumbers),
+            Hyphenation => self.open_layout_picker(PickerKind::Hyphenation),
             PageNumber => {
                 let inl = self.build_field(FieldKind::Page);
                 self.editor.paste(&Clip {
@@ -2188,30 +2218,6 @@ impl App {
                     }
                     Err(e) => self.status = Some(e),
                 }
-            }
-            Columns => {
-                let next = self.edit_final_sect_pr(true, |pkg| {
-                    let next = match pkg.columns() {
-                        1 => 2,
-                        2 => 3,
-                        _ => 1,
-                    };
-                    pkg.set_columns(next);
-                    next
-                });
-                self.modified = true;
-                self.dirty = true;
-                self.status = Some(format!("Columns: {next}"));
-            }
-            Hyphenation => {
-                let on = !self.pkg.has_auto_hyphenation();
-                self.pkg.set_auto_hyphenation(on);
-                self.modified = true;
-                self.dirty = true;
-                self.status = Some(format!(
-                    "Automatic hyphenation: {}",
-                    if on { "on" } else { "off" }
-                ));
             }
             Paste => self.do_paste(),
             Bold => {
@@ -3025,10 +3031,10 @@ impl App {
             PageBreak | InsertTable => Some(MutationKind::Structure),
             PageNumber | ChangeCase => Some(MutationKind::Content),
             Sort => Some(MutationKind::Structure),
-            HorizontalLine | Columns | Hyphenation | Bold | Italic | Underline | Strike
-            | Subscript | Superscript | GrowFont | ShrinkFont | ClearFormatting
-            | IncreaseIndent | DecreaseIndent | FirstLineIndent | HangingIndent | AlignLeft
-            | AlignCenter | AlignRight | Justify | ApplyStyle(_) => Some(MutationKind::Formatting),
+            HorizontalLine | Bold | Italic | Underline | Strike | Subscript | Superscript
+            | GrowFont | ShrinkFont | ClearFormatting | IncreaseIndent | DecreaseIndent
+            | FirstLineIndent | HangingIndent | AlignLeft | AlignCenter | AlignRight | Justify
+            | ApplyStyle(_) => Some(MutationKind::Formatting),
             _ => None,
         }
     }
@@ -5143,6 +5149,8 @@ impl App {
         };
         let mutation = if matches!(kind, PickerKind::Symbol | PickerKind::Equation) {
             protection::MutationKind::Content
+        } else if kind == PickerKind::Breaks {
+            protection::MutationKind::Structure
         } else {
             protection::MutationKind::Formatting
         };
@@ -5176,6 +5184,16 @@ impl App {
                 if let Some(&(_, latex)) = EQUATIONS.iter().find(|(l, _)| *l == item) {
                     self.editor.insert_equation(latex, false);
                 }
+            }
+            PickerKind::Margins
+            | PickerKind::Orientation
+            | PickerKind::PaperSize
+            | PickerKind::Columns
+            | PickerKind::Breaks
+            | PickerKind::LineNumbers
+            | PickerKind::Hyphenation => {
+                // The Layout picks set their own status and bookkeeping.
+                return self.apply_layout_pick(p.kind, item);
             }
             PickerKind::PageColor | PickerKind::Watermark | PickerKind::PageBorders => {
                 // The design picks set their own status; the generic one below
@@ -10179,7 +10197,7 @@ mod tests {
     #[test]
     fn view_tab_shows_markdown_group_only_for_md() {
         let mut r = ribbon::Ribbon::home();
-        r.set_active(6); // View
+        r.set_active(7); // View
         // For .docx: Read/Print Layout present, no Markdown switch.
         assert!(r.has_act(ribbon::Act::PrintLayout));
         assert!(!r.has_act(ribbon::Act::MdRendered));
@@ -11706,7 +11724,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         app.path = dir.join("t.docx").to_string_lossy().into_owned();
-        app.run_act(ribbon::Act::Columns);
+        pick_layout(&mut app, ribbon::Act::Columns, PickerKind::Columns, "Two");
         app.save();
         let bytes = std::fs::read(dir.join("t.docx")).expect("saved");
         let reloaded = docxcore::package::load_package(&bytes).unwrap();
@@ -11732,6 +11750,12 @@ mod tests {
             .unwrap_or_else(|| panic!("{label} not in the {kind:?} items"));
         app.font_picker.as_mut().unwrap().sel = idx;
         app.apply_picker();
+    }
+
+    /// Open a Layout picker from its ribbon button and apply `label`.
+    fn pick_layout(app: &mut App, act: ribbon::Act, kind: PickerKind, label: &str) {
+        app.run_act(act);
+        pick(app, kind, label);
     }
 
     #[test]
@@ -11955,7 +11979,7 @@ mod tests {
     fn toggling_columns_mirrors_into_the_editor_as_an_undo_step() {
         let mut app = app_with_trailing_sect_pr();
         let before = app.editor.doc.trailing_section_properties().cloned();
-        app.run_act(ribbon::Act::Columns);
+        pick_layout(&mut app, ribbon::Act::Columns, PickerKind::Columns, "Two");
         let raw = &app.editor.doc.trailing_section_properties().unwrap().raw;
         assert!(raw.contains(r#"w:num="2""#), "{raw}");
         assert!(app.editor.undo());
@@ -12044,7 +12068,7 @@ mod tests {
         let mut app = app_with(&refs);
         let count = |pdf: &str| pdf.matches("/Type /Page /Parent").count();
         assert_eq!(count(&app_pdf(&app)), 2, "one column needs two pages");
-        app.run_act(ribbon::Act::Columns);
+        pick_layout(&mut app, ribbon::Act::Columns, PickerKind::Columns, "Two");
         assert_eq!(count(&app_pdf(&app)), 1, "two columns fit one page");
         app.on_key(ctrl(KeyCode::Char('z')));
         assert!(!final_sect(&app).contains(r#"w:num="2""#));
@@ -12055,7 +12079,7 @@ mod tests {
             "{}",
             saved.sect_pr()
         );
-        app.run_act(ribbon::Act::Columns);
+        pick_layout(&mut app, ribbon::Act::Columns, PickerKind::Columns, "Two");
         assert!(
             final_sect(&app).contains(r#"w:num="2""#),
             "{}",
@@ -12334,11 +12358,12 @@ mod tests {
     #[test]
     fn review_tab_present_and_toggle_flips_the_panel() {
         let mut app = app_with(&["body text"]);
-        // The ribbon has a Review tab after File, Home, Styles, Insert and Design.
-        assert_eq!(app.ribbon.tab_label(5), Some("Review"));
+        // The ribbon has a Review tab after File, Home, Styles, Insert, Design
+        // and Layout.
+        assert_eq!(app.ribbon.tab_label(6), Some("Review"));
         // Switching to it activates the Review ribbon.
-        app.ribbon.set_active(5);
-        assert_eq!(app.ribbon.active_tab(), 5);
+        app.ribbon.set_active(6);
+        assert_eq!(app.ribbon.active_tab(), 6);
         // The Comments toggle flips the side-panel flag.
         assert!(!app.show_comments);
         app.run_act(ribbon::Act::ToggleComments);
@@ -12437,7 +12462,7 @@ mod tests {
     #[test]
     fn view_ribbon_actions_toggle_their_state() {
         let mut app = app_with(&["heading"]);
-        assert_eq!(app.ribbon.tab_label(6), Some("View"));
+        assert_eq!(app.ribbon.tab_label(7), Some("View"));
         app.run_act(ribbon::Act::PrintLayout);
         assert!(app.page_view);
         app.run_act(ribbon::Act::ReadMode);
@@ -12494,7 +12519,7 @@ mod tests {
         let mut app = app_with(&["x"]);
         app.open_backstage();
         // Wide enough that the trailing hint isn't clipped by the frame edge.
-        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(110, 24)).unwrap();
         term.draw(|f| app.draw(f)).unwrap();
         let text = format!("{:?}", term.backend().buffer());
         assert!(
@@ -15948,16 +15973,24 @@ mod tests {
     #[test]
     fn lesson_22_columns() {
         let mut app = app_with(&["text"]);
-        assert_eq!(app.pkg.columns(), 1);
-        app.run_act(ribbon::Act::Columns);
-        assert_eq!(app.pkg.columns(), 2, "columns not set to 2");
+        assert!(!final_sect(&app).contains(r#"w:num="2""#));
+        pick_layout(&mut app, ribbon::Act::Columns, PickerKind::Columns, "Two");
+        assert!(
+            final_sect(&app).contains(r#"w:num="2""#),
+            "columns not set to 2"
+        );
     }
 
     #[test]
     fn lesson_23_hyphenation() {
         let mut app = app_with(&["text"]);
         assert!(!app.pkg.has_auto_hyphenation());
-        app.run_act(ribbon::Act::Hyphenation);
+        pick_layout(
+            &mut app,
+            ribbon::Act::Hyphenation,
+            PickerKind::Hyphenation,
+            "Automatic",
+        );
         assert!(app.pkg.has_auto_hyphenation(), "hyphenation not turned on");
     }
 
@@ -16175,6 +16208,345 @@ mod tests {
         assert!(app.compare_dialog.is_none());
         assert_eq!(app.path, original);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Layout tab (#1274) ----
+
+    /// "s1", a section break, then "s2" and the document's own final sectPr.
+    fn two_section_app() -> App {
+        let para = |t: &str, brk: Option<&str>| {
+            Block::Paragraph(MPara {
+                props: ParProps {
+                    section_break: brk.map(str::to_string),
+                    ..ParProps::default()
+                },
+                content: vec![Inline::Run(Run {
+                    text: t.to_string(),
+                    props: RunProps::default(),
+                })],
+            })
+        };
+        let sect = r#"<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/></w:sectPr>"#;
+        app_with_blocks(vec![
+            para("s1", Some(sect)),
+            para("s2", None),
+            Block::SectionProperties(docxcore::model::SectionProperties {
+                raw: sect.to_string(),
+                property_change: None,
+            }),
+        ])
+    }
+
+    fn sect_setup(app: &App, k: usize) -> docxcore::sect::SectionSetup {
+        docxcore::sect::SectionSetup::parse(&app.body_editor().sections()[k])
+    }
+
+    fn caret_in_section(app: &mut App, k: usize) {
+        if k > 0 {
+            app.editor.move_doc_end();
+        } else {
+            app.editor.move_doc_start();
+        }
+        assert_eq!(app.editor.caret_section(), k);
+    }
+
+    #[test]
+    fn layout_pickers_items_match_the_suite_menus() {
+        let labels: Vec<&str> = docxcore::sect::Paper::ALL
+            .iter()
+            .map(|p| p.label())
+            .collect();
+        assert_eq!(layout_tab::PAPER_ITEMS, labels.as_slice());
+        assert_eq!(
+            layout_tab::MARGIN_ITEMS,
+            &["Normal", "Narrow", "Moderate", "Wide", "Mirrored"]
+        );
+        assert_eq!(
+            layout_tab::COLUMN_ITEMS,
+            &["One", "Two", "Three", "Left", "Right"]
+        );
+        assert_eq!(layout_tab::LINE_NUMBER_ITEMS.len(), 5);
+    }
+
+    #[test]
+    fn columns_pick_edits_only_the_caret_section_as_one_undo_step() {
+        for k in [0, 1] {
+            let mut app = two_section_app();
+            caret_in_section(&mut app, k);
+            app.modified = false;
+            pick_layout(&mut app, ribbon::Act::Columns, PickerKind::Columns, "Two");
+            assert_eq!(sect_setup(&app, k).columns.count(), 2);
+            assert_eq!(sect_setup(&app, 1 - k).columns.count(), 1);
+            assert_eq!(app.status.as_deref(), Some("Columns: Two"));
+            assert!(app.modified);
+            assert!(app.editor.undo());
+            assert_eq!(sect_setup(&app, k).columns.count(), 1, "one undo step");
+        }
+    }
+
+    #[test]
+    fn columns_presets_set_their_values() {
+        for (label, count, left_narrow) in [
+            ("One", 1, None),
+            ("Two", 2, None),
+            ("Three", 3, None),
+            ("Left", 2, Some(true)),
+            ("Right", 2, Some(false)),
+        ] {
+            let mut app = two_section_app();
+            pick_layout(&mut app, ribbon::Act::Columns, PickerKind::Columns, "Three");
+            pick_layout(&mut app, ribbon::Act::Columns, PickerKind::Columns, label);
+            let c = sect_setup(&app, 0).columns;
+            assert_eq!(c.count(), count, "{label}");
+            if let Some(narrow) = left_narrow {
+                assert_eq!(c.cols[0].w < c.cols[1].w, narrow, "{label}");
+            } else {
+                assert!(c.equal_width(), "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn margins_orientation_and_size_picks_edit_the_caret_section() {
+        let mut app = two_section_app();
+        caret_in_section(&mut app, 1);
+        for (label, vals) in [
+            ("Narrow", (720, 720, 720, 720)),
+            ("Moderate", (1440, 1440, 1080, 1080)),
+            ("Wide", (1440, 1440, 2880, 2880)),
+            ("Normal", (1440, 1440, 1440, 1440)),
+        ] {
+            pick_layout(&mut app, ribbon::Act::Margins, PickerKind::Margins, label);
+            let m = sect_setup(&app, 1).margins;
+            assert_eq!((m.top, m.bottom, m.left, m.right), vals, "{label}");
+        }
+        pick_layout(
+            &mut app,
+            ribbon::Act::Margins,
+            PickerKind::Margins,
+            "Narrow",
+        );
+        assert_eq!(
+            sect_setup(&app, 0).margins.left,
+            1440,
+            "section 1 untouched"
+        );
+        let undo_to_normal = app.editor.undo();
+        assert!(undo_to_normal);
+        assert_eq!(sect_setup(&app, 1).margins.left, 1440, "margins undo whole");
+
+        pick_layout(
+            &mut app,
+            ribbon::Act::Orientation,
+            PickerKind::Orientation,
+            "Landscape",
+        );
+        assert!(sect_setup(&app, 1).page.landscape);
+        assert!(!sect_setup(&app, 0).page.landscape);
+        pick_layout(
+            &mut app,
+            ribbon::Act::PaperSize,
+            PickerKind::PaperSize,
+            "A4",
+        );
+        let page = sect_setup(&app, 1).page;
+        assert_eq!((page.w, page.h), (16838, 11906), "A4 landscape");
+        assert_eq!(sect_setup(&app, 0).page.w, 12240);
+    }
+
+    #[test]
+    fn a_no_op_pick_leaves_the_document_unmodified() {
+        let mut app = two_section_app();
+        app.modified = false;
+        pick_layout(
+            &mut app,
+            ribbon::Act::Orientation,
+            PickerKind::Orientation,
+            "Portrait",
+        );
+        assert!(!app.modified);
+        assert_eq!(app.status.as_deref(), Some("Orientation: Portrait"));
+    }
+
+    #[test]
+    fn mirrored_margins_and_hyphenation_write_the_package_only() {
+        let mut app = two_section_app();
+        pick_layout(
+            &mut app,
+            ribbon::Act::Margins,
+            PickerKind::Margins,
+            "Mirrored",
+        );
+        assert!(app.pkg.has_mirror_margins());
+        let m = sect_setup(&app, 0).margins;
+        assert_eq!((m.left, m.right), (1800, 1440));
+        pick_layout(
+            &mut app,
+            ribbon::Act::Margins,
+            PickerKind::Margins,
+            "Normal",
+        );
+        assert!(!app.pkg.has_mirror_margins());
+        pick_layout(
+            &mut app,
+            ribbon::Act::Hyphenation,
+            PickerKind::Hyphenation,
+            "Automatic",
+        );
+        assert!(app.pkg.has_auto_hyphenation());
+        assert_eq!(app.status.as_deref(), Some("Automatic hyphenation: on"));
+        pick_layout(
+            &mut app,
+            ribbon::Act::Hyphenation,
+            PickerKind::Hyphenation,
+            "None",
+        );
+        assert!(!app.pkg.has_auto_hyphenation());
+        let saved = save_and_reload(&mut app, "layout-flags");
+        assert!(!saved.has_auto_hyphenation() && !saved.has_mirror_margins());
+    }
+
+    #[test]
+    fn line_number_picks_set_and_clear_the_section() {
+        use docxcore::sect::LnRestart;
+        let mut app = two_section_app();
+        for (label, restart) in [
+            ("Continuous", LnRestart::Continuous),
+            ("Restart Each Page", LnRestart::NewPage),
+            ("Restart Each Section", LnRestart::NewSection),
+        ] {
+            pick_layout(
+                &mut app,
+                ribbon::Act::LineNumbers,
+                PickerKind::LineNumbers,
+                label,
+            );
+            assert_eq!(sect_setup(&app, 0).line_numbers.unwrap().restart, restart);
+            assert!(sect_setup(&app, 1).line_numbers.is_none());
+        }
+        pick_layout(
+            &mut app,
+            ribbon::Act::LineNumbers,
+            PickerKind::LineNumbers,
+            "None",
+        );
+        assert!(sect_setup(&app, 0).line_numbers.is_none());
+        pick_layout(
+            &mut app,
+            ribbon::Act::LineNumbers,
+            PickerKind::LineNumbers,
+            "Suppress for Current Paragraph",
+        );
+        assert!(app.editor.caret_suppresses_line_numbers());
+    }
+
+    #[test]
+    fn break_picks_insert_page_column_and_section_breaks() {
+        let mut app = two_section_app();
+        caret_in_section(&mut app, 1);
+        app.editor.move_end();
+        pick_layout(&mut app, ribbon::Act::Breaks, PickerKind::Breaks, "Page");
+        assert_eq!(app.status.as_deref(), Some("Page break"));
+        pick_layout(&mut app, ribbon::Act::Breaks, PickerKind::Breaks, "Column");
+        pick_layout(
+            &mut app,
+            ribbon::Act::Breaks,
+            PickerKind::Breaks,
+            "Text Wrapping",
+        );
+        let sections = app.editor.sections().len();
+        pick_layout(
+            &mut app,
+            ribbon::Act::Breaks,
+            PickerKind::Breaks,
+            "Continuous",
+        );
+        assert_eq!(app.editor.sections().len(), sections + 1);
+        assert!(app.editor.undo());
+        assert_eq!(app.editor.sections().len(), sections);
+    }
+
+    #[test]
+    fn breaks_in_a_header_go_to_the_header_but_section_breaks_are_refused() {
+        let mut app = two_section_app();
+        app.run_act(ribbon::Act::EditHeader);
+        assert!(app.hf_edit.is_some());
+        let sections = app.body_editor().sections().len();
+        pick_layout(
+            &mut app,
+            ribbon::Act::Breaks,
+            PickerKind::Breaks,
+            "Next Page",
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("A section break cannot go in a header or footer")
+        );
+        assert_eq!(app.body_editor().sections().len(), sections);
+        pick_layout(&mut app, ribbon::Act::Breaks, PickerKind::Breaks, "Page");
+        assert_eq!(app.status.as_deref(), Some("Page break"));
+        // A section pick while the header is open still edits the body.
+        pick_layout(&mut app, ribbon::Act::Columns, PickerKind::Columns, "Two");
+        assert_eq!(sect_setup(&app, 0).columns.count(), 2);
+    }
+
+    #[test]
+    fn layout_pickers_start_on_the_current_choice() {
+        let mut app = two_section_app();
+        pick_layout(&mut app, ribbon::Act::Columns, PickerKind::Columns, "Right");
+        pick_layout(
+            &mut app,
+            ribbon::Act::Orientation,
+            PickerKind::Orientation,
+            "Landscape",
+        );
+        pick_layout(
+            &mut app,
+            ribbon::Act::PaperSize,
+            PickerKind::PaperSize,
+            "A5",
+        );
+        pick_layout(&mut app, ribbon::Act::Margins, PickerKind::Margins, "Wide");
+        for (act, kind, want) in [
+            (ribbon::Act::Columns, PickerKind::Columns, 4),
+            (ribbon::Act::Orientation, PickerKind::Orientation, 1),
+            (ribbon::Act::PaperSize, PickerKind::PaperSize, 4),
+            (ribbon::Act::Margins, PickerKind::Margins, 3),
+            (ribbon::Act::LineNumbers, PickerKind::LineNumbers, 0),
+            (ribbon::Act::Hyphenation, PickerKind::Hyphenation, 0),
+        ] {
+            app.run_act(act);
+            let p = app.font_picker.take().unwrap();
+            assert_eq!((p.kind, p.sel), (kind, want), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn layout_pickers_refuse_markdown_and_protected_documents() {
+        let mut app = two_section_app();
+        app.format = DocFormat::Markdown;
+        app.run_act(ribbon::Act::Columns);
+        assert!(app.font_picker.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Columns needs a .docx (not Markdown)")
+        );
+
+        let mut app = two_section_app();
+        protect(&mut app, ProtectionEditMode::ReadOnly, false);
+        app.run_act(ribbon::Act::Columns);
+        pick(&mut app, PickerKind::Columns, "Two");
+        assert_eq!(sect_setup(&app, 0).columns.count(), 1, "read-only refuses");
+    }
+
+    #[test]
+    fn a_columns_pick_in_section_one_survives_save_and_reload() {
+        let mut app = two_section_app();
+        pick_layout(&mut app, ribbon::Act::Columns, PickerKind::Columns, "Two");
+        let saved = save_and_reload(&mut app, "layout-cols");
+        let sections = App::new(saved, "t.docx", false).editor.sections();
+        assert!(sections[0].contains(r#"w:num="2""#), "{}", sections[0]);
+        assert!(!sections[1].contains(r#"w:num="2""#), "{}", sections[1]);
     }
 }
 

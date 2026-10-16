@@ -197,3 +197,17 @@
   refuses with nothing changed), then set the editor inside one `one_step`. The
   Hyphenation dialog's caps, zone and limit still write the package without
   undo; terminal `docxy` has no settings sync.
+
+## Terminal docxy Layout tab (#1274)
+
+- `docxy/src/layout_tab.rs` is terminal `docxy`'s Layout ribbon tab (after
+  Design): Margins, Orientation, Size, Columns, Breaks, Line Numbers and
+  Hyphenation are `PickerKind` list pickers (dialog-only rows of the suite's
+  menus are absent). Insert has no Layout group. The presets duplicate
+  `suite/docxy/src/layout_tab.rs`; keep their values the same.
+- Section picks edit `body_editor_mut().target_sections()` through
+  `edit_section_setups` (the section(s) at the caret or selection, even with
+  a header open), then `sync_page_parts` and `after_edit`. A picker starts on
+  the caret section's current choice. Mirrored margins and Hyphenation write
+  the package only (a settings part docxy cannot edit refuses) and have no
+  undo in the terminal.
