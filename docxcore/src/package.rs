@@ -1821,6 +1821,128 @@ impl Package {
         self.set_settings_flag("w:autoHyphenation", on);
     }
 
+    /// The hyphenation zone in twips (`<w:hyphenationZone w:val="N"/>`), or
+    /// `None` when the settings carry none (Word then uses 360, a quarter inch).
+    pub fn hyphenation_zone(&self) -> Option<i32> {
+        self.settings_value("w:hyphenationZone")
+    }
+
+    /// Set the hyphenation zone in twips, or remove it with `None`. Whether
+    /// the settings changed. Not honoured by docxy's own layout: it only keeps
+    /// the value for Word.
+    pub fn set_hyphenation_zone(&mut self, twips: Option<i32>) -> bool {
+        self.set_settings_value("w:hyphenationZone", twips)
+    }
+
+    /// The most consecutive lines that may end in a hyphen
+    /// (`w:consecutiveHyphenLimit`), or `None` for no limit (absent). Word
+    /// reads 0 as no limit too.
+    pub fn consecutive_hyphen_limit(&self) -> Option<i32> {
+        self.settings_value("w:consecutiveHyphenLimit")
+    }
+
+    /// Set the consecutive hyphen limit, or remove it with `None`. Whether
+    /// the settings changed.
+    pub fn set_consecutive_hyphen_limit(&mut self, limit: Option<i32>) -> bool {
+        self.set_settings_value("w:consecutiveHyphenLimit", limit)
+    }
+
+    /// Whether words in capitals may be hyphenated: on unless
+    /// `w:doNotHyphenateCaps` is.
+    pub fn hyphenate_caps(&self) -> bool {
+        !self.settings_flag("w:doNotHyphenateCaps").unwrap_or(false)
+    }
+
+    /// Allow or forbid hyphenating words in capitals (`w:doNotHyphenateCaps`,
+    /// present only to forbid). Whether the settings changed.
+    pub fn set_hyphenate_caps(&mut self, on: bool) -> bool {
+        const ELEM: &str = "w:doNotHyphenateCaps";
+        let present = self.settings_has(ELEM);
+        if present == !on && (!present || self.settings_flag(ELEM) == Some(true)) {
+            return false;
+        }
+        self.set_settings_element(ELEM, (!on).then(|| format!("<{ELEM}/>")))
+    }
+
+    /// The `w:val` of the first `elem` in the settings, as a whole number.
+    fn settings_value(&self, elem: &str) -> Option<i32> {
+        let name = self.settings_part_name().ok()??;
+        let xml = decode_xml_part(self.part(&name)?)?;
+        let (a, b) = crate::sect::find_element(&xml, elem)?;
+        let end = xml[a..b].find('>').map_or(b, |g| a + g);
+        tag_attr(&xml[a..end], "w:val")?.trim().parse().ok()
+    }
+
+    fn set_settings_value(&mut self, elem: &str, value: Option<i32>) -> bool {
+        if self.settings_value(elem) == value && value.is_none() != self.settings_has(elem) {
+            return false;
+        }
+        self.set_settings_element(elem, value.map(|v| format!("<{elem} w:val=\"{v}\"/>")))
+    }
+
+    fn settings_has(&self, elem: &str) -> bool {
+        let Ok(Some(name)) = self.settings_part_name() else {
+            return false;
+        };
+        self.part(&name)
+            .and_then(decode_xml_part)
+            .is_some_and(|xml| crate::sect::find_element(&xml, elem).is_some())
+    }
+
+    /// Replace every `elem` in the settings with `child` at its `CT_Settings`
+    /// position (after the last predecessor present), or remove them with
+    /// `None`. Creates the part only when there is a child to write; an
+    /// undecodable or unrecognised part is left alone. Whether it changed.
+    fn set_settings_element(&mut self, elem: &str, child: Option<String>) -> bool {
+        // CT_Settings children between `w:documentType` and the hyphenation
+        // elements, in schema order.
+        const AFTER_DOCUMENT_TYPE: [&str; 13] = [
+            "w:mailMerge",
+            "w:revisionView",
+            "w:trackRevisions",
+            "w:doNotTrackMoves",
+            "w:doNotTrackFormatting",
+            "w:documentProtection",
+            "w:autoFormatOverride",
+            "w:styleLockTheme",
+            "w:styleLockQFSet",
+            "w:defaultTabStop",
+            "w:autoHyphenation",
+            "w:consecutiveHyphenLimit",
+            "w:hyphenationZone",
+        ];
+        let name = if child.is_some() {
+            self.ensure_settings_part()
+        } else {
+            self.settings_part_name().ok().flatten()
+        };
+        let Some(name) = name else {
+            return false;
+        };
+        let Some(mut xml) = self
+            .part(&name)
+            .and_then(decode_xml_part)
+            .map(Cow::into_owned)
+        else {
+            return false;
+        };
+        if child.is_some() && !xml.contains("<w:settings") {
+            return false;
+        }
+        while crate::sect::find_element(&xml, elem).is_some() {
+            xml = crate::sect::remove_element(&xml, elem);
+        }
+        if let Some(child) = child {
+            let mut before = SETTINGS_BEFORE_MAIL_MERGE.to_vec();
+            before.extend(AFTER_DOCUMENT_TYPE.iter().take_while(|n| **n != elem));
+            if elem == "w:doNotHyphenateCaps" {
+                before.extend(AFTER_DOCUMENT_TYPE);
+            }
+            xml = insert_settings_child(&xml, &child, &before);
+        }
+        self.set_part_text(&name, &xml)
+    }
+
     /// The page colour (Design > Page Color, #651): the document part's
     /// `w:background`. Cheap enough to call every frame: the part is borrowed (a UTF-8 part
     /// is not copied) and only the prolog before `<w:body` is read.
@@ -4513,6 +4635,118 @@ mod tests {
         p.set_even_odd(true);
         assert!(p.has_even_odd());
         assert!(decoded(&p).contains("<w:evenAndOddHeaders/>"));
+    }
+
+    fn settings_text(p: &Package) -> String {
+        String::from_utf8(p.part("word/settings.xml").unwrap().to_vec()).unwrap()
+    }
+
+    /// Put `bytes` in the settings part, related to the document as Word does.
+    fn set_settings(p: &mut Package, _name: &str, bytes: Vec<u8>) {
+        p.ensure_settings_part();
+        assert!(p.set_part("word/settings.xml", bytes));
+    }
+
+    #[test]
+    fn hyphenation_values_read_defaults_and_explicit_values() {
+        let mut p = load_package(&make_docx("<w:document/>")).unwrap();
+        assert_eq!(p.hyphenation_zone(), None);
+        assert_eq!(p.consecutive_hyphen_limit(), None);
+        assert!(p.hyphenate_caps());
+        set_settings(&mut p,
+            "word/settings.xml",
+            br#"<w:settings xmlns:w="w"><w:autoHyphenation w:val="false"/><w:consecutiveHyphenLimit w:val="2"/><w:hyphenationZone w:val="425"/><w:doNotHyphenateCaps/></w:settings>"#.to_vec(),
+        );
+        assert_eq!(p.hyphenation_zone(), Some(425));
+        assert_eq!(p.consecutive_hyphen_limit(), Some(2));
+        assert!(!p.hyphenate_caps());
+        set_settings(
+            &mut p,
+            "word/settings.xml",
+            br#"<w:settings xmlns:w="w"><w:doNotHyphenateCaps w:val="false"/></w:settings>"#
+                .to_vec(),
+        );
+        assert!(p.hyphenate_caps());
+    }
+
+    #[test]
+    fn hyphenation_value_setters_land_in_schema_order_and_replace() {
+        let mut p = load_package(&make_docx("<w:document/>")).unwrap();
+        set_settings(&mut p,
+            "word/settings.xml",
+            br#"<w:settings xmlns:w="w"><w:zoom w:percent="100"/><w:defaultTabStop w:val="720"/><w:characterSpacingControl w:val="x"/></w:settings>"#.to_vec(),
+        );
+        // Written out of order, and each lands where the schema puts it.
+        assert!(p.set_hyphenate_caps(false));
+        assert!(p.set_hyphenation_zone(Some(360)));
+        assert!(p.set_consecutive_hyphen_limit(Some(3)));
+        assert_eq!(
+            settings_text(&p),
+            r#"<w:settings xmlns:w="w"><w:zoom w:percent="100"/><w:defaultTabStop w:val="720"/><w:consecutiveHyphenLimit w:val="3"/><w:hyphenationZone w:val="360"/><w:doNotHyphenateCaps/><w:characterSpacingControl w:val="x"/></w:settings>"#
+        );
+        // Same value: no change; new value: replaced, not duplicated.
+        assert!(!p.set_hyphenation_zone(Some(360)));
+        assert!(p.set_hyphenation_zone(Some(500)));
+        assert_eq!(settings_text(&p).matches("hyphenationZone").count(), 1);
+        assert_eq!(p.hyphenation_zone(), Some(500));
+        // None removes, every duplicate included; a second removal is a no-op.
+        set_settings(&mut p,
+            "word/settings.xml",
+            br#"<w:settings xmlns:w="w"><w:consecutiveHyphenLimit w:val="1"/><w:consecutiveHyphenLimit w:val="2"/><w:doNotHyphenateCaps w:val="false"/></w:settings>"#.to_vec(),
+        );
+        assert!(p.set_consecutive_hyphen_limit(None));
+        assert!(!p.set_consecutive_hyphen_limit(None));
+        assert_eq!(p.consecutive_hyphen_limit(), None);
+        // Allowing capitals drops a stale explicit off, too.
+        assert!(p.set_hyphenate_caps(true));
+        assert_eq!(
+            settings_text(&p),
+            r#"<w:settings xmlns:w="w"></w:settings>"#
+        );
+        assert!(!p.set_hyphenate_caps(true));
+    }
+
+    #[test]
+    fn hyphenation_value_setters_leave_the_auto_flag_and_open_an_empty_root() {
+        let mut p = load_package(&make_docx("<w:document/>")).unwrap();
+        // No settings part: removing creates nothing.
+        assert!(!p.set_hyphenation_zone(None));
+        assert!(!p.set_hyphenate_caps(true));
+        assert!(p.part("word/settings.xml").is_none());
+        // Writing a value creates the part.
+        assert!(p.set_hyphenation_zone(Some(720)));
+        assert_eq!(p.hyphenation_zone(), Some(720));
+        p.set_auto_hyphenation(true);
+        set_settings(
+            &mut p,
+            "word/settings.xml",
+            br#"<w:settings xmlns:w="w"/>"#.to_vec(),
+        );
+        assert!(p.set_consecutive_hyphen_limit(Some(2)));
+        assert_eq!(
+            settings_text(&p),
+            r#"<w:settings xmlns:w="w"><w:consecutiveHyphenLimit w:val="2"/></w:settings>"#
+        );
+        assert!(!p.has_auto_hyphenation());
+        p.set_auto_hyphenation(true);
+        assert!(p.set_hyphenation_zone(Some(10)));
+        assert!(p.has_auto_hyphenation());
+        assert_eq!(p.consecutive_hyphen_limit(), Some(2));
+    }
+
+    #[test]
+    fn hyphenation_value_setters_keep_a_utf16_part_utf16() {
+        let mut p = load_package(&make_docx("<w:document/>")).unwrap();
+        let mut bytes = vec![0xff, 0xfe];
+        for u in r#"<?xml version="1.0" encoding="UTF-16"?><w:settings xmlns:w="w"><w:defaultTabStop w:val="720"/></w:settings>"#.encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        p.ensure_settings_part();
+        p.set_part("word/settings.xml", bytes);
+        assert!(p.set_hyphenation_zone(Some(300)));
+        let b = p.part("word/settings.xml").unwrap();
+        assert!(b.starts_with(&[0xff, 0xfe]), "still UTF-16 LE");
+        assert_eq!(p.hyphenation_zone(), Some(300));
     }
 
     /// Build a tiny but valid .docx in memory.
