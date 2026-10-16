@@ -1,45 +1,92 @@
 //! Counted FixedMeta index for task records.
+//!
+//! `TBkndTask/FixedMeta` is a 16-byte header (magic `ba ad df fa`, the entry
+//! count at +8) followed by one 47-byte entry per FixedData record: the entry
+//! kind `u16` at +0 and the record's FixedData offset `u32` at +4. A record
+//! runs to the next entry's offset (the last one to the end of FixedData).
+//! The first three entries are schema stubs, 8 bytes each in MPP9 and 16 in
+//! MPP12 and current Project.
 use std::collections::HashSet;
 
+/// Length of a task FixedMeta entry, in every generation [`index`] reads.
+pub const TASK_META_STRIDE: usize = 47;
+/// Length of a current Project task FixedData record.
+pub const TASK_RECORD_LEN: usize = 202;
+/// Length of a Project 2007 (MPP12) task FixedData record.
+pub const MPP12_TASK_RECORD_LEN: usize = 264;
+
+/// A task row of the current (202-byte) or MPP12 (264-byte) layout. Current
+/// records hold the row ID at +0 and the UID at +4; MPP12 records hold the
+/// UID at +0 and the ID at +4. A blank grid row (current layout only) is a
+/// 16-byte record of FixedMeta kind 4 holding its UID at +0 and ID at +4.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct CurrentRecord {
+pub struct CurrentRecord {
     /// Position of this record's FixedMeta entry, which also indexes Fixed2Meta.
     pub entry: usize,
+    /// The visible row ID; IDs run contiguously from 0 (the project summary).
     pub id: u32,
+    /// The stable unique ID that links, assignments and VarMeta refer to.
     pub uid: u32,
+    /// Byte offset of the record in FixedData.
     pub offset: usize,
+    /// Byte length of the record in FixedData.
     pub len: usize,
+    /// A blank grid row: FixedMeta kind 4 with a 16-byte record.
     pub is_null: bool,
 }
 
+/// A task row of the MPP9 (Project 2000-2003) layout: UID at +0, ID at +4,
+/// every record the same length of at least 176 bytes.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct LegacyRecord {
+pub struct LegacyRecord {
+    /// The visible row ID; IDs run contiguously from 0 (the project summary).
     pub id: u32,
+    /// The stable unique ID that links and VarMeta refer to.
     pub uid: u32,
+    /// Byte offset of the record in FixedData.
     pub offset: usize,
+    /// Byte length of the record in FixedData.
     pub len: usize,
 }
 
-pub(crate) enum TaskIndex {
+/// The live task rows of a validated FixedMeta index, sorted by row ID. The
+/// variant names the generation the index was recognised as: the schema stub
+/// size (16 or 8 bytes) and the first record's length tell them apart.
+#[derive(Clone, Debug)]
+pub enum TaskIndex {
+    /// Current Project: 16-byte stubs and 202-byte records. FixedMeta kind 0
+    /// is a live row, kind 2 a superseded one (skipped) and kind 4 with a
+    /// 16-byte record a blank row (kept, [`CurrentRecord::is_null`]).
     Current(Vec<CurrentRecord>),
+    /// Project 2007: 16-byte stubs and 264-byte records, kinds 0 and 2 only.
     Mpp12(Vec<CurrentRecord>),
+    /// MPP9: 8-byte stubs and fixed-length records of at least 176 bytes.
     Legacy(Vec<LegacyRecord>),
 }
 
-pub(crate) fn index(meta: &[u8], data: &[u8]) -> Result<TaskIndex, String> {
+/// Index the task FixedData records through their FixedMeta entries. The
+/// header count must match the stream length, offsets must strictly
+/// increase within FixedData, kinds and lengths must be a recognised
+/// combination, and IDs and UIDs must be unique, at most `i32::MAX`, with
+/// IDs contiguous from 0. Anything else is an error, not a guess.
+pub fn index(meta: &[u8], data: &[u8]) -> Result<TaskIndex, String> {
     if meta.len() < 16 || meta[..4] != [0xba, 0xad, 0xdf, 0xfa] {
         return Err("invalid FixedMeta header".into());
     }
     let count = u32::from_le_bytes(meta[8..12].try_into().unwrap()) as usize;
     if count < 3
-        || 16usize.checked_add(count.checked_mul(47).ok_or("FixedMeta count overflow")?)
-            != Some(meta.len())
+        || 16usize.checked_add(
+            count
+                .checked_mul(TASK_META_STRIDE)
+                .ok_or("FixedMeta count overflow")?,
+        ) != Some(meta.len())
     {
         return Err("FixedMeta count or length mismatch".into());
     }
     let offsets: Vec<_> = (0..count)
         .map(|i| {
-            u32::from_le_bytes(meta[16 + i * 47 + 4..16 + i * 47 + 8].try_into().unwrap()) as usize
+            let at = 16 + i * TASK_META_STRIDE + 4;
+            u32::from_le_bytes(meta[at..at + 4].try_into().unwrap()) as usize
         })
         .collect();
     let stub = offsets[1];
@@ -66,10 +113,10 @@ pub(crate) fn index(meta: &[u8], data: &[u8]) -> Result<TaskIndex, String> {
                 .unwrap_or(data.len())
                 .checked_sub(*start)
         });
-        if first_len == Some(264) {
-            current_index(meta, data, &offsets, 264, false).map(TaskIndex::Mpp12)
+        if first_len == Some(MPP12_TASK_RECORD_LEN) {
+            current_index(meta, data, &offsets, MPP12_TASK_RECORD_LEN, false).map(TaskIndex::Mpp12)
         } else {
-            current_index(meta, data, &offsets, 202, true).map(TaskIndex::Current)
+            current_index(meta, data, &offsets, TASK_RECORD_LEN, true).map(TaskIndex::Current)
         }
     } else {
         legacy_index(data, &offsets).map(TaskIndex::Legacy)
@@ -89,7 +136,7 @@ fn current_index(
     let mut ids = HashSet::new();
     let mut uids = HashSet::new();
     for i in 3..offsets.len() {
-        let entry = &meta[16 + i * 47..16 + (i + 1) * 47];
+        let entry = &meta[16 + i * TASK_META_STRIDE..16 + (i + 1) * TASK_META_STRIDE];
         let kind = u16::from_le_bytes(entry[..2].try_into().unwrap());
         let begin = offsets[i];
         let end = offsets.get(i + 1).copied().unwrap_or(data.len());
@@ -138,13 +185,21 @@ fn current_index(
 }
 
 /// Length of a current Project `Fixed2Data` task record.
-pub(crate) const FIXED2_LEN: usize = 64;
-const FIXED2_META_LEN: usize = 96;
+pub const FIXED2_LEN: usize = 64;
+/// Length of a current Project task `Fixed2Meta` entry.
+pub const FIXED2_META_LEN: usize = 96;
 
 /// A task's current Project `Fixed2Meta` entry and `Fixed2Data` record.
+/// The task reader takes from Fixed2Meta +8 bit `0x80` (manual) and bit
+/// `0x40` (active), +9 bit `0x10` (DisplayAsSummary), +76 and +77 flags; and
+/// from Fixed2Data +0 the task GUID, +16 the f64 row sort key, +50/+54 the
+/// manual start and finish timestamps, +58 the manual duration (`i32` tenths
+/// of a minute) and +62 its DurationFormat.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Fixed2<'a> {
+pub struct Fixed2<'a> {
+    /// The 96-byte Fixed2Meta entry.
     pub meta: &'a [u8],
+    /// The 64-byte Fixed2Data record.
     pub data: &'a [u8],
 }
 
@@ -155,7 +210,9 @@ pub(crate) struct Fixed2<'a> {
 /// inserted rows) at +16, and a blank row holds neither. Sorted by task ID,
 /// the tasks' sort keys must strictly increase. Project rewrites the keys when
 /// it renumbers rows in place (corpus case `order/o5-sorted-renumbered`).
-pub(crate) fn current_fixed2<'a>(
+/// `fixed_count` is the FixedMeta entry count (its `u32` at +8) and `rows`
+/// the [`TaskIndex::Current`] rows; MPP12 and MPP9 have no such pairing.
+pub fn current_fixed2<'a>(
     meta: &'a [u8],
     data: &'a [u8],
     fixed_count: usize,

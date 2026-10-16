@@ -566,7 +566,7 @@ pub fn read_mpp(bytes: &[u8]) -> Result<MppInfo, String> {
 /// Project corpus stores day 0x3a86 for 2025-01-06 in its XML export; using
 /// 1984-01-01 here would produce 2025-01-07. Legacy samples likewise shift
 /// from Tuesday starts to Monday starts with this epoch.
-pub(crate) const MPP_EPOCH_DAYS: i64 = 5112;
+pub const MPP_EPOCH_DAYS: i64 = 5112;
 
 fn u16le(b: &[u8], o: usize) -> u16 {
     if o + 2 <= b.len() {
@@ -597,7 +597,9 @@ pub fn decode_timestamp(data: &[u8], off: usize) -> Option<String> {
 
 /// A task/property timestamp with NA allowed but an out-of-day time refused.
 /// Callers validate that four bytes are available and add field-specific errors.
-pub(crate) fn decode_checked_timestamp(data: &[u8], off: usize) -> Result<Option<String>, ()> {
+// The unit error lets each caller name the field it was reading.
+#[allow(clippy::result_unit_err)]
+pub fn decode_checked_timestamp(data: &[u8], off: usize) -> Result<Option<String>, ()> {
     let days = u16le(data, off + 2);
     if days == 0xffff {
         return Ok(None);

@@ -1,18 +1,31 @@
 //! Strict readers for the current Project resource and assignment tables.
+//!
+//! A table is the four streams `FixedMeta`, `FixedData`, `VarMeta` and
+//! `Var2Data` of one `TBknd*` storage. FixedMeta is a 16-byte header (magic
+//! `ba ad df fa`, entry count at +8) and fixed-stride entries holding the
+//! kind `u16` at +0 and the FixedData offset `u32` at +4; each record runs to
+//! the next entry's offset. VarMeta is a 24-byte header (magic, entry count
+//! at +8, Var2Data length at +20) and 12-byte entries: UID `u32` at +0,
+//! Var2Data offset `u32` at +4, field key `u16` at +8 and the table's tag
+//! `u16` at +10. Each Var2Data value is a `u32` length and that many bytes.
 use crate::cfb::Cfb;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-pub(crate) fn u16_at(b: &[u8], at: usize) -> u16 {
+/// The little-endian `u16` at `at`. Panics past the end of `b`.
+pub fn u16_at(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes(b[at..at + 2].try_into().unwrap())
 }
-pub(crate) fn u32_at(b: &[u8], at: usize) -> u32 {
+/// The little-endian `u32` at `at`. Panics past the end of `b`.
+pub fn u32_at(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
 }
-pub(crate) fn i32_at(b: &[u8], at: usize) -> i32 {
+/// The little-endian `i32` at `at`. Panics past the end of `b`.
+pub fn i32_at(b: &[u8], at: usize) -> i32 {
     i32::from_le_bytes(b[at..at + 4].try_into().unwrap())
 }
-pub(crate) fn f64_at(b: &[u8], at: usize) -> f64 {
+/// The little-endian `f64` at `at`. Panics past the end of `b`.
+pub fn f64_at(b: &[u8], at: usize) -> f64 {
     f64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
@@ -24,27 +37,105 @@ fn record_ok(i: usize, kind: u16, len: usize, stubs: usize, row_len: usize) -> b
     }
 }
 
+/// The shape [`read`] validates a table against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableLayout {
+    /// The storage name, such as `TBkndRsc`.
+    pub name: &'static str,
+    /// Length of one FixedMeta entry.
+    pub meta_stride: usize,
+    /// Length of one live FixedData row.
+    pub row_len: usize,
+    /// The VarMeta tag `u16` at +10 of every entry.
+    pub marker: u16,
+}
+
+impl TableLayout {
+    /// [`read`] this table from a `.mpp` file's bytes.
+    pub fn read(&self, bytes: &[u8]) -> Result<Option<Table>, String> {
+        read(
+            bytes,
+            self.name,
+            self.meta_stride,
+            self.row_len,
+            self.marker,
+        )
+    }
+}
+
+/// Current Project resources: 37-byte FixedMeta entries, three 16-byte
+/// schema stubs, 172-byte rows (ID at +0, UID at +4, max units × 10000 as an
+/// f64 at +8, standard rate format at +166, work/other flag at +170) and
+/// VarMeta tag `0x0c40` (name under key 1, material label under key 299).
+/// Validated against newest-generation Project files only.
+pub const RESOURCE_TABLE: TableLayout = TableLayout {
+    name: "TBkndRsc",
+    meta_stride: 37,
+    row_len: 172,
+    marker: 0x0c40,
+};
+
+/// Current Project assignments: 34-byte FixedMeta entries, no schema stubs,
+/// 110-byte rows (UID at +0, task UID at +4, resource UID at +8, units ×
+/// 10000 as an f64 at +12, work in thousandths of a minute as an f64 at +20,
+/// start and finish timestamps at +52 and +56) and VarMeta tag `0x0f40`
+/// (Baseline work, cost, start and finish under keys `0x10`, `0x20`, `0x92`
+/// and `0x93`; Baseline*n* under `0x121`, `0x122`, `0x127` and `0x128` plus
+/// `9 × (n - 1)`). Validated against newest-generation Project files only.
+pub const ASSIGNMENT_TABLE: TableLayout = TableLayout {
+    name: "TBkndAssn",
+    meta_stride: 34,
+    row_len: 110,
+    marker: 0x0f40,
+};
+
+/// A validated table: its live rows and the Var2Data values VarMeta keys.
 #[derive(Debug)]
-pub(crate) struct Table {
+pub struct Table {
+    /// The FixedData bytes of each live (kind 0) row, in FixedMeta order.
+    /// Schema stubs, kind-4 16-byte rows and superseded (kind 2) rows are
+    /// left out.
     pub rows: Vec<Vec<u8>>,
     fields: HashMap<(u32, u16), Range<usize>>,
     v2: Vec<u8>,
 }
 
 impl Table {
-    pub(crate) fn field(&self, uid: u32, key: u16) -> Option<&[u8]> {
+    /// The Var2Data value VarMeta keys under `(uid, key)`, without its
+    /// length prefix.
+    pub fn field(&self, uid: u32, key: u16) -> Option<&[u8]> {
         self.fields
             .get(&(uid, key))
             .map(|range| &self.v2[range.clone()])
     }
+
+    /// Every keyed value as `(uid, key, value)`, sorted by UID and key.
+    pub fn fields(&self) -> Vec<(u32, u16, &[u8])> {
+        let mut out: Vec<_> = self
+            .fields
+            .iter()
+            .map(|(&(uid, key), range)| (uid, key, &self.v2[range.clone()]))
+            .collect();
+        out.sort_by_key(|&(uid, key, _)| (uid, key));
+        out
+    }
 }
 
-pub(crate) fn present(bytes: &[u8], name: &str) -> Result<bool, String> {
+/// Whether the file has any stream under a `name/` storage.
+pub fn present(bytes: &[u8], name: &str) -> Result<bool, String> {
     let cfb = Cfb::open(bytes)?;
     Ok(cfb.paths().iter().any(|p| p.contains(&format!("{name}/"))))
 }
 
-pub(crate) fn read(
+/// Read and validate the `name` table (see [`RESOURCE_TABLE`] and
+/// [`ASSIGNMENT_TABLE`] for the validated layouts). `Ok(None)` means the
+/// file has no such table, or has one in another entry stride or row layout,
+/// which an older or unvalidated generation writes. A torn index, offsets out
+/// of order, a partial stream set, duplicate live UIDs, or a VarMeta entry
+/// with another tag, an unindexed UID or a block outside Var2Data is an error.
+/// `TBkndRsc` is read with three schema stubs and its UID at row +4; any
+/// other name with no stubs and its UID at row +0.
+pub fn read(
     bytes: &[u8],
     name: &str,
     meta_stride: usize,

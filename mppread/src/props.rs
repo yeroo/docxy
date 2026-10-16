@@ -10,8 +10,11 @@ fn u32_at(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
 }
 
-/// Keyed values of a validated Props stream.
-pub(crate) fn entries(b: &[u8]) -> Result<HashMap<u32, &[u8]>, String> {
+/// Keyed values of a validated Props stream, each without its size, key and
+/// attribute words or its padding. A bad header, an entry past the end, a
+/// duplicate key or bytes after the last entry is an error. Validated on
+/// current Project's `   114/Props` only.
+pub fn entries(b: &[u8]) -> Result<HashMap<u32, &[u8]>, String> {
     let header_len = (b.len() as u64).checked_sub(4);
     if b.len() < 16
         || Some(u32_at(b, 0) as u64) != header_len
@@ -44,8 +47,10 @@ pub(crate) fn entries(b: &[u8]) -> Result<HashMap<u32, &[u8]>, String> {
 }
 
 /// `NewTasksAreManual`: a 2-byte value, `0`, `1`, or `0x00ff`.
-pub(crate) const NEW_TASKS_ARE_MANUAL: u32 = 0x0240_13c8;
-const PROJECT_START: u32 = 0x0240_0002;
+pub const NEW_TASKS_ARE_MANUAL: u32 = 0x0240_13c8;
+/// Project StartDate: a four-byte timestamp (see
+/// [`crate::mpp::decode_timestamp`]).
+pub const PROJECT_START: u32 = 0x0240_0002;
 
 /// Project StartDate in the same four-byte format as task timestamps.
 pub(crate) fn project_start(b: &[u8]) -> Result<Option<String>, String> {
@@ -61,7 +66,7 @@ pub(crate) fn project_start(b: &[u8]) -> Result<Option<String>, String> {
 }
 /// WBS code mask. Project writes four zero bytes for its ordinary numeric
 /// outline mask in the paired corpus; absent also means no custom mask.
-const WBS_CODE_MASK: u32 = 0x0240_138b;
+pub const WBS_CODE_MASK: u32 = 0x0240_138b;
 
 pub(crate) fn has_default_wbs_mask(b: &[u8]) -> Result<bool, String> {
     Ok(matches!(
@@ -71,8 +76,8 @@ pub(crate) fn has_default_wbs_mask(b: &[u8]) -> Result<bool, String> {
 }
 
 /// Project's default base calendar name, observed changing from Standard to
-/// Night in the paired c1 calendar probe.
-const DEFAULT_CALENDAR_NAME: u32 = 0x0240_000e;
+/// Night in the paired c1 calendar probe: NUL-terminated UTF-16, zero-padded.
+pub const DEFAULT_CALENDAR_NAME: u32 = 0x0240_000e;
 
 pub(crate) fn default_calendar_name(b: &[u8]) -> Result<Option<String>, String> {
     let entries = entries(b)?;
@@ -109,7 +114,7 @@ pub(crate) fn default_calendar_name(b: &[u8]) -> Result<Option<String>, String> 
 /// moniker has none, its ASCII ANSI path; a non-ASCII ANSI path without an
 /// extension leaves that item unnamed. Other item types have no oracle and
 /// make the table unknown.
-const SUBPROJECTS: u32 = 0x0240_00a2;
+pub const SUBPROJECTS: u32 = 0x0240_00a2;
 const FILE_MONIKER: [u8; 16] = [3, 3, 0, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46];
 
 fn file_moniker_path(b: &[u8], at: usize) -> Result<String, String> {

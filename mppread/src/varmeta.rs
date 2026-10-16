@@ -114,6 +114,75 @@ pub fn names(varmeta: &[u8], var2data: &[u8]) -> Vec<String> {
     best
 }
 
+/// One 12-byte keyed VarMeta entry, as MPP12 and current Project write
+/// them: the item's UID `u32` at +0, the Var2Data offset `u32` of its value
+/// at +4, the field key `u16` at +8 and the table's tag `u16` at +10
+/// (`0x0b40` tasks, `0x0c40` resources, `0x0d40` calendars, `0x0f40`
+/// assignments).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VarEntry<'a> {
+    /// The UID of the row the value belongs to.
+    pub uid: u32,
+    /// Offset of the value's `u32` length prefix in Var2Data.
+    pub offset: usize,
+    /// The field key, such as `0x000e` for a task name.
+    pub key: u16,
+    /// The table's tag, the same on every entry of one table.
+    pub tag: u16,
+    /// The value: the Var2Data bytes after the length prefix.
+    pub value: &'a [u8],
+}
+
+/// Read the counted 12-byte entries of a VarMeta stream against its
+/// Var2Data, in stream order. The 24-byte header must start with the magic
+/// and give the entry count at +8 and the Var2Data length at +20; every
+/// value must lie inside Var2Data, and a `(uid, key)` pair may appear only
+/// once. Bytes after the counted entries are ignored, as the task reader
+/// ignores them (the resource, assignment and calendar readers refuse
+/// them). UIDs are not checked against a FixedMeta index and tags are
+/// returned as found. MPP9's 8-byte entries are not read.
+pub fn var_entries<'a>(varmeta: &[u8], var2data: &'a [u8]) -> Result<Vec<VarEntry<'a>>, String> {
+    if varmeta.len() < 24 || u32le(varmeta, 0) != MAGIC {
+        return Err("invalid VarMeta header".into());
+    }
+    let count = u32le(varmeta, 8) as usize;
+    if count
+        .checked_mul(12)
+        .and_then(|n| n.checked_add(24))
+        .is_none_or(|n| n > varmeta.len())
+        || u32le(varmeta, 20) as usize != var2data.len()
+    {
+        return Err("VarMeta count or Var2Data length mismatch".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let e = &varmeta[24 + i * 12..36 + i * 12];
+        let (uid, offset, key, tag) =
+            (u32le(e, 0), u32le(e, 4) as usize, u16le(e, 8), u16le(e, 10));
+        let Some(start) = offset.checked_add(4).filter(|&n| n <= var2data.len()) else {
+            return Err(format!("Var2Data offset out of range at entry {i}"));
+        };
+        let Some(end) = start
+            .checked_add(u32le(var2data, offset) as usize)
+            .filter(|&n| n <= var2data.len())
+        else {
+            return Err(format!("Var2Data block out of range at entry {i}"));
+        };
+        if !seen.insert((uid, key)) {
+            return Err(format!("duplicate VarMeta key ({uid},{key})"));
+        }
+        out.push(VarEntry {
+            uid,
+            offset,
+            key,
+            tag,
+            value: &var2data[start..end],
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +276,54 @@ mod tests {
     #[test]
     fn rejects_non_varmeta() {
         assert!(names(b"not varmeta at all", &[]).is_empty());
+    }
+
+    fn keyed(entries: &[(u32, u32, u16)], v2_len: usize) -> Vec<u8> {
+        let mut vm = MAGIC.to_le_bytes().to_vec();
+        vm.resize(24, 0);
+        vm[8..12].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        vm[20..24].copy_from_slice(&(v2_len as u32).to_le_bytes());
+        for &(uid, off, key) in entries {
+            vm.extend_from_slice(&uid.to_le_bytes());
+            vm.extend_from_slice(&off.to_le_bytes());
+            vm.extend_from_slice(&key.to_le_bytes());
+            vm.extend_from_slice(&0x0b40u16.to_le_bytes());
+        }
+        vm
+    }
+
+    #[test]
+    fn var_entries_read_counted_keyed_values() {
+        let (v2, offs) = build_var2(&["One", "Two"]);
+        let mut vm = keyed(
+            &[(7, offs[0] as u32, 0x0e), (8, offs[1] as u32, 0x0e)],
+            v2.len(),
+        );
+        let got = var_entries(&vm, &v2).unwrap();
+        assert_eq!(
+            got.iter()
+                .map(|e| (e.uid, e.key, e.tag, e.offset))
+                .collect::<Vec<_>>(),
+            [(7, 0x0e, 0x0b40, offs[0]), (8, 0x0e, 0x0b40, offs[1])]
+        );
+        assert_eq!(
+            vardata::utf16le_string(got[1].value).as_deref(),
+            Some("Two")
+        );
+        // Bytes past the counted entries have no standing.
+        vm.extend_from_slice(&[0xff; 12]);
+        assert_eq!(var_entries(&vm, &v2).unwrap().len(), 2);
+        let err = |vm: &[u8], v2: &[u8]| var_entries(vm, v2).unwrap_err();
+        assert!(err(&vm[..20], &v2).contains("header"));
+        assert!(err(&vm, &v2[1..]).contains("length mismatch"));
+        let past = keyed(&[(7, v2.len() as u32, 0x0e)], v2.len());
+        assert!(err(&past, &v2).contains("offset out of range"));
+        let torn = keyed(&[(7, offs[1] as u32 + 1, 0x0e)], v2.len());
+        assert!(err(&torn, &v2).contains("block out of range"));
+        let twice = keyed(&[(7, 0, 0x0e), (7, offs[1] as u32, 0x0e)], v2.len());
+        assert!(err(&twice, &v2).contains("duplicate"));
+        let mut short = keyed(&[(7, 0, 0x0e)], v2.len());
+        short[8..12].copy_from_slice(&2u32.to_le_bytes());
+        assert!(err(&short, &v2).contains("count"));
     }
 }
