@@ -281,3 +281,11 @@
   direct formatting; typing the value shown is an edit and applies. The old chip strips (`PickKind::FontName`
   / `FontSize`) are gone. `uiharness/cases/doc-font-box.uit` covers what
   `doc-inputs-typing.uit` does not.
+
+## Document comment editor (#1362)
+
+- The comment bar (`comment_key` / `comment_bar`) edits at a caret through
+  `field_edit` like the Find bar: `comment_caret/sel/len` with `comment_state`
+  and `comment_edit`, Ctrl+A/C/X/V in `comment_chord` (paste is one line),
+  and `field-read comment-editor` reports the caret and the `[0,len]`
+  selection. Click-to-place and Shift+arrows are not there.

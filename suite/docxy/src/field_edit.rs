@@ -45,6 +45,11 @@ pub(crate) fn is_save_chord(ctrl: bool, alt: bool, key: &str) -> bool {
     ctrl && !alt && key == "s"
 }
 
+/// `text` as one line: line breaks drop out (a paste into a one-line field).
+pub(crate) fn one_line(text: &str) -> String {
+    text.chars().filter(|c| !matches!(c, '\r' | '\n')).collect()
+}
+
 /// The caret and selection to use for `text`: those kept, unless the text's
 /// length is no longer the one they were kept for (another path edited the
 /// text), when the caret is at the end and nothing is selected.
@@ -86,6 +91,12 @@ pub(crate) fn apply(text: &mut String, caret: &mut usize, sel: &mut bool, op: Op
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn one_line_drops_line_breaks() {
+        assert_eq!(super::one_line("a\r\nb\nc"), "abc");
+        assert_eq!(super::one_line("\r\n"), "");
+    }
+
     #[test]
     fn only_a_plain_ctrl_s_is_the_save_chord() {
         assert!(is_save_chord(true, false, "s"));

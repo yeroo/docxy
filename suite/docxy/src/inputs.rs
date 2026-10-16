@@ -564,14 +564,7 @@ pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
 /// selection (#1361) and read the caret run's font and size while unfocused.
 fn read_doc(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
     crate::harness::active_doc(app)?;
-    let end_if = |text: &str, focused: bool| {
-        if focused {
-            Json::Num(text.chars().count() as f64)
-        } else {
-            Json::Null
-        }
-    };
-    let (value, focused, caret) = match i.id {
+    let (value, focused, caret, selection) = match i.id {
         "doc-find" | "doc-replace" => {
             let (text, field) = if i.id == "doc-find" {
                 (&app.find_query, crate::FindField::Query)
@@ -638,15 +631,28 @@ fn read_doc(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
         }
         "comment-editor" => {
             let focused = app.comment_open;
+            let (caret, sel) = app.comment_state();
+            let len = app.comment_text.chars().count();
+            let selection = if focused && sel && len > 0 {
+                Json::Arr(vec![Json::Num(0.0), Json::Num(len as f64)])
+            } else {
+                Json::Null
+            };
+            let caret = if focused {
+                Json::Num(caret as f64)
+            } else {
+                Json::Null
+            };
             (
                 Json::Str(app.comment_text.clone()),
                 focused,
-                end_if(&app.comment_text, focused),
+                caret,
+                selection,
             )
         }
         _ => return Err(not_covered(i)),
     };
-    Ok(field_json(i.id, value, focused, caret, Json::Null))
+    Ok(field_json(i.id, value, focused, caret, selection))
 }
 
 /// A Project input, pressed where it is drawn. The cell editor is a
