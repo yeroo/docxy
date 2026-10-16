@@ -503,13 +503,32 @@ pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
             ),
         },
         "sheet-font" | "sheet-font-size" => {
-            let cmd = if id == "sheet-font" {
-                "font-name"
+            let which = if id == "sheet-font" {
+                crate::FontBox::Name
             } else {
-                "font-size"
+                crate::FontBox::Size
             };
-            let value = combo_value(cmd).ok_or_else(|| format!("no combo '{cmd}'"))?;
-            (Json::Str(value.into()), false, Json::Null, Json::Null)
+            match app
+                .font_box
+                .as_ref()
+                .filter(|f| f.which == which && app.font_box_live())
+            {
+                Some(fb) => {
+                    let len = fb.text.chars().count();
+                    let selection = if fb.sel && len > 0 {
+                        Json::Arr(vec![num(0), num(len)])
+                    } else {
+                        Json::Null
+                    };
+                    (Json::Str(fb.text.clone()), true, num(fb.caret), selection)
+                }
+                None => (
+                    Json::Str(app.font_box_value(which)),
+                    false,
+                    Json::Null,
+                    Json::Null,
+                ),
+            }
         }
         "sheet-tab-rename" => match &app.sheet_rename {
             Some((_, buf)) => (
@@ -701,18 +720,6 @@ fn field_json(id: &str, value: Json, focused: bool, caret: Json, selection: Json
     ])
 }
 
-/// The value a sheet ribbon combo draws.
-fn combo_value(id: &str) -> Option<&'static str> {
-    crate::sheet_ribbon::SHEET_RIBBON
-        .iter()
-        .flat_map(crate::sheet_ribbon::Tab::commands)
-        .find(|c| c.id == id)
-        .and_then(|c| match c.shape {
-            crate::sheet_ribbon::Shape::Combo { value, .. } => Some(value),
-            _ => None,
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -876,14 +883,6 @@ mod tests {
             ..RunProps::default()
         };
         assert_eq!(crate::doc_combo_value("fontsize", Some(whole)), "12");
-    }
-
-    /// The Font combos read the value the ribbon table draws.
-    #[test]
-    fn the_font_combos_read_their_drawn_values() {
-        assert_eq!(combo_value("font-name"), Some("Calibri"));
-        assert_eq!(combo_value("font-size"), Some("11"));
-        assert_eq!(combo_value("bold"), None);
     }
 
     /// #1204: every terminal editor's input is typed into by its case, and

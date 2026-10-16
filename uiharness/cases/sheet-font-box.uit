@@ -1,0 +1,72 @@
+# The Home ribbon's Font and Font Size boxes on a sheet (#1344), beyond the
+# per-input cases of sheet-inputs-typing.uit. Run with:
+#
+#   cargo run -p uiharness -- run uiharness/cases/sheet-font-box.uit
+
+test a size that is not a number keeps the box open and formats nothing
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-font-size"}
+  call real-type {"text":"abc"}
+  call real-key {"key":"enter"}
+  call field-read {"input":"sheet-font-size"}
+  assert reply.focused is true
+  assert reply.value is abc
+  assert dirty is false
+  call real-key {"key":"escape"}
+  call field-read {"input":"sheet-font-size"}
+  assert reply.value is 11
+
+test a size out of range is refused and a decimal size applies
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-font-size"}
+  call real-type {"text":"410"}
+  call real-key {"key":"enter"}
+  call field-read {"input":"sheet-font-size"}
+  assert reply.focused is true
+  assert dirty is false
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"10.5"}
+  call real-key {"key":"enter"}
+  assert dirty is true
+  call field-read {"input":"sheet-font-size"}
+  assert reply.focused is false
+  assert reply.value is 10.5
+
+test Enter on the Font box is one undo step named Font
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-font"}
+  call real-type {"text":"Arial"}
+  call real-key {"key":"enter"}
+  call ribbon-read {}
+  assert reply.qat.0.tip.title is Undo Font (Ctrl+Z)
+  key ctrl+z
+  call field-read {"input":"sheet-font"}
+  assert reply.value is Calibri
+
+test the font boxes and the Name Box give each other the keyboard
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-font"}
+  call real-type {"text":"Ar"}
+  call pointer-click {"input":"name-box"}
+  call field-read {"input":"name-box"}
+  assert reply.focused is true
+  call field-read {"input":"sheet-font"}
+  assert reply.focused is false
+  assert reply.value is Calibri
+  call pointer-click {"input":"sheet-font-size"}
+  call field-read {"input":"name-box"}
+  assert reply.focused is false
+  call field-read {"input":"sheet-font-size"}
+  assert reply.focused is true
+  call pointer-click {"input":"sheet-font"}
+  call field-read {"input":"sheet-font-size"}
+  assert reply.focused is false
+  call real-key {"key":"escape"}

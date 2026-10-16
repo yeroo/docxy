@@ -22,22 +22,6 @@ inputs-typing-sheet-data.uit | sheet text-to-columns/destination: OK applies | #
 
 # Home's Font and Font Size boxes are inert (SheetAct::Todo, a fixed
 # value): a click takes no focus, and what is typed goes into the cell (#1200).
-sheet-inputs-typing.uit | sheet sheet-font: focus by click | #1344
-sheet-inputs-typing.uit | sheet sheet-font: types | #1344
-sheet-inputs-typing.uit | sheet sheet-font: edits | #1344
-sheet-inputs-typing.uit | sheet sheet-font: select-all replaces | #1344
-sheet-inputs-typing.uit | sheet sheet-font: copies | #1344
-sheet-inputs-typing.uit | sheet sheet-font: pastes | #1344
-sheet-inputs-typing.uit | sheet sheet-font: Enter formats the selection | #1344
-sheet-inputs-typing.uit | sheet sheet-font: Escape cancels | #1344
-sheet-inputs-typing.uit | sheet sheet-font-size: focus by click | #1344
-sheet-inputs-typing.uit | sheet sheet-font-size: types | #1344
-sheet-inputs-typing.uit | sheet sheet-font-size: edits | #1344
-sheet-inputs-typing.uit | sheet sheet-font-size: select-all replaces | #1344
-sheet-inputs-typing.uit | sheet sheet-font-size: copies | #1344
-sheet-inputs-typing.uit | sheet sheet-font-size: pastes | #1344
-sheet-inputs-typing.uit | sheet sheet-font-size: Enter formats the selection | #1344
-sheet-inputs-typing.uit | sheet sheet-font-size: Escape cancels | #1344
 
 # The document Find bar's fields are append-only (find_key): no caret, so
 # Home, End, Left, Right and Delete do nothing, and Ctrl+A/C/V are ignored

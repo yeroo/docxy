@@ -44,8 +44,8 @@ pub(crate) enum Shape {
     Icon(&'static str),
     /// A text glyph only.
     Glyph(&'static str),
-    /// An inert combo box showing a fixed value.
-    Combo { value: &'static str, wide: bool },
+    /// The Font / Font Size text box, drawn by `Docxy::sheet_combo` (#1344).
+    Combo { wide: bool },
     /// The Number group's format combo, showing the selection's format.
     NumFmt,
     /// A Large button that opens a drop-down (Sort & Filter); its items are
@@ -355,8 +355,8 @@ const fn glyph(
     cmd(id, label, Shape::Glyph(glyph), act)
 }
 
-const fn combo(id: &'static str, label: &'static str, value: &'static str, wide: bool) -> SheetCmd {
-    cmd(id, label, Shape::Combo { value, wide }, SheetAct::Todo)
+const fn combo(id: &'static str, label: &'static str, wide: bool) -> SheetCmd {
+    cmd(id, label, Shape::Combo { wide }, SheetAct::Todo)
 }
 
 /// A check box beside its name.
@@ -427,8 +427,8 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                 launch: Some(SheetAct::FormatCells),
                 body: rows(&[
                     &[
-                        combo("font-name", "Font", "Calibri", true),
-                        combo("font-size", "Font Size", "11", false),
+                        combo("font-name", "Font", true),
+                        combo("font-size", "Font Size", false),
                         icon(
                             "grow-font",
                             "Increase Font Size",

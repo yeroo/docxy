@@ -246,3 +246,14 @@
   sandbox's `docxy/plugins` before launch (build with `cargo build --release
   -p uiharness -p plugin_fixture`; `ui-sweep-linux` does). Harness instances
   never inherit `$YPPX_PLUGIN_DIR`.
+
+## Sheet Home ribbon Font / Font Size boxes (#1344)
+
+- The two boxes are text fields: `Docxy::font_box` (`FontBoxEdit`, tied to the
+  tab and sheet like the Name Box) opened by a click on `sheet_combo`, keyed by
+  `font_box_key`; Enter applies the name (`Font` undo step) or a size of 1 to
+  409 (`Font Size`; a bad one keeps the box and says so), Escape or a press
+  elsewhere restores, and a locked sheet refuses Enter. `sheet_field_live`
+  (Name Box or font box) is what the key gates ask. Unfocused they show the
+  active cell's font and size (`font_box.rs`). `uiharness/cases/sheet-font-box.uit`
+  covers what `sheet-inputs-typing.uit` does not.
