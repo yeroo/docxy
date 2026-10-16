@@ -324,9 +324,9 @@ test an untouched editor a cell act closes stays clean
   call clipboard {"action":"read"}
   assert reply.app.kind is grid
 
-# #510 r1: Ctrl+V with an open editor commits the entry first, and the paste
-# still lands — the commit's own undo step must not end copy mode (#664).
-test paste with an open editor commits first and still pastes
+# #1341: Ctrl+V with an open editor inserts the clipboard text at the caret and
+# keeps the entry open; the cells are not pasted into.
+test paste with an open editor inserts at the caret
   open copy:../fixtures/basic.xlsx
   click A2
   click B2 shift
@@ -334,9 +334,31 @@ test paste with an open editor commits first and still pastes
   click D2
   type x
   key ctrl+v
-  assert cell D2 is North
-  assert cell E2 is 10
+  assert editing is true
+  assert dirty is false
+  # `x` + "North<tab>10": the copied row's trailing line break is not taken.
+  call field-read {"input":"cell-editor"}
+  assert reply.caret is 9
+  key escape
+
+# #510 r1: a paste-family act that still commits (Paste Link) commits the entry
+# first, and the paste still lands — the commit's own undo step must not end
+# copy mode (#664).
+test paste link with an open editor commits first
+  open copy:../fixtures/basic.xlsx
+  click A2
+  click B2 shift
+  key ctrl+c
+  click D2
+  type x
+  call menu-open {"target":{"ribbon":["Home","Clipboard","Paste"]}}
+  call menu-click {"label":"Paste Link"}
+  assert editing is false
   assert dirty is true
+  call cell {"cell":"D2"}
+  assert reply.value is =A2
+  call cell {"cell":"E2"}
+  assert reply.value is =B2
 
 # #510 r1: a refused entry (a formula that does not parse) stops the act:
 # the editor stays open and the command does not run. Fails if the early

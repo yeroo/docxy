@@ -2014,10 +2014,11 @@ fn the_autocorrect_switches_turn_the_table_rules_off() {
 /// read nor rewrite cell values, and the pick list, leave it open. Copy and
 /// Cut commit it too, except while its text is selected (#1340, see
 /// `copy_and_cut_leave_the_entry_open_only_while_its_text_is_selected_1340`).
+/// Paste is in the set but never reaches the commit while an entry is open:
+/// it inserts the clipboard text at the caret instead (#1341).
 #[test]
 fn acts_that_rewrite_cells_close_the_editor() {
     for act in [
-        SheetAct::Paste,
         SheetAct::Cut,
         SheetAct::Copy,
         SheetAct::RemoveDuplicates,
@@ -2333,10 +2334,10 @@ fn other_keys_and_touches_end_the_entry_selection_1340() {
     v.edit_select_entry();
     v.edit_touched();
     assert!(v.edit_selected_text().is_none());
-    // Ctrl+V is not a key that keeps it.
+    // Ctrl+V keeps it for the paste to replace (#1341).
     v.edit_select_entry();
     v.end_revert_for_key("v", true, false, false);
-    assert!(v.edit_selected_text().is_none());
+    assert!(v.edit_selected_text().is_some());
 }
 
 #[test]
@@ -2375,4 +2376,49 @@ fn copy_and_cut_leave_the_entry_open_only_while_its_text_is_selected_1340() {
     // Cut takes the text out of the entry.
     v.edit_clear_selected();
     assert_eq!(v.editing.as_deref(), Some(""));
+}
+
+// ---- #1341: Ctrl+V in an open entry inserts the clipboard text at the caret ----
+
+#[test]
+fn paste_text_goes_in_at_the_caret_and_the_entry_stays_open_1341() {
+    let mut v = old_book();
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_type("abcd");
+    v.edit_caret = 2;
+    v.edit_paste_text("XY");
+    assert_eq!(v.editing.as_deref(), Some("abXYcd"));
+    assert_eq!(v.edit_caret, 4);
+}
+
+#[test]
+fn paste_text_replaces_a_selected_entry_and_keeps_line_breaks_1341() {
+    let mut v = old_book();
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_type("abcd");
+    v.edit_select_entry();
+    v.edit_paste_text("a\r\nb\rc");
+    assert_eq!(v.editing.as_deref(), Some("a\nb\nc"));
+    assert!(v.edit_selected_text().is_none());
+}
+
+#[test]
+fn pasting_empty_text_keeps_a_selected_entry_1341() {
+    let mut v = old_book();
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_type("abcd");
+    v.edit_select_entry();
+    v.edit_paste_text("");
+    assert_eq!(v.editing.as_deref(), Some("abcd"));
+}
+
+#[test]
+fn ctrl_v_after_ctrl_a_replaces_the_entry_and_a_copied_cells_line_break_is_dropped_1341() {
+    let mut v = old_book();
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_type("abcd");
+    v.edit_select_entry();
+    v.end_revert_for_key("v", true, false, false);
+    v.edit_paste_text("XY\r\n");
+    assert_eq!(v.editing.as_deref(), Some("XY"));
 }

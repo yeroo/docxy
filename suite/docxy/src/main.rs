@@ -1468,12 +1468,10 @@ fn act_commits_editor(act: SheetAct) -> bool {
 /// of the clip does not touch, and its own re-paste re-stamps the clip when
 /// it lands. Its copy mode ending on the commit's edit is right, as for any
 /// other act: a Cut makes a new clip, and a Sort and its like end copy mode
-/// as they should.
+/// as they should. Plain Paste is not in the set: in an open entry it inserts
+/// text instead of committing (#1341).
 fn act_restamps_clip(act: SheetAct) -> bool {
-    matches!(
-        act,
-        SheetAct::Paste | SheetAct::PasteAs(_) | SheetAct::PasteSpecial
-    )
+    matches!(act, SheetAct::PasteAs(_) | SheetAct::PasteSpecial)
 }
 
 /// A run of Tab / Shift+Tab entries: the column it began in, and the cell the
@@ -3538,7 +3536,8 @@ impl SheetView {
     /// What `key` does to a revert's toggle and selection (#1147): the revert
     /// itself (Ctrl+Z, Alt+Backspace) keeps them, a typed character, Backspace
     /// or Delete uses the selection up itself, Ctrl+A / Ctrl+C / Ctrl+X keep
-    /// the selection but drop the toggle (#1340), any other key (a lone
+    /// the selection but drop the toggle (#1340), Ctrl+V keeps it for the paste
+    /// to replace (#1341), any other key (a lone
     /// modifier aside) drops both.
     fn end_revert_for_key(&mut self, key: &str, ctrl: bool, alt: bool, typed: bool) {
         let modifier = matches!(key, "shift" | "control" | "alt" | "platform" | "function");
@@ -3548,8 +3547,9 @@ impl SheetView {
         }
         self.edit_redo = None;
         let uses_it = !ctrl && !alt && (typed || key == "backspace" || key == "delete");
-        // Ctrl+A selects the entry's text and Ctrl+C / Ctrl+X read it (#1340).
-        let keeps_it = ctrl && !alt && matches!(key, "a" | "c" | "x");
+        // Ctrl+A selects the entry's text, Ctrl+C / Ctrl+X read it (#1340) and
+        // Ctrl+V replaces it (#1341).
+        let keeps_it = ctrl && !alt && matches!(key, "a" | "c" | "x" | "v");
         if !uses_it && !keeps_it {
             self.edit_select_all = false;
         }
@@ -4216,6 +4216,20 @@ impl SheetView {
     /// Put the caret at the end of the current buffer (called when editing starts).
     fn edit_caret_to_end(&mut self) {
         self.edit_caret = self.edit_len();
+    }
+    /// Ctrl+V in the entry (#1341): the clipboard text goes in at the caret
+    /// as typed text would (it replaces a selection, overtypes in overtype
+    /// mode), line breaks as `\n`; a proposed completion is dropped first.
+    fn edit_paste_text(&mut self, text: &str) {
+        self.drop_proposal();
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        // A copied cell's text ends its row with a line break; Excel's entry
+        // does not take it.
+        let text = text.strip_suffix('\n').unwrap_or(&text);
+        if text.is_empty() {
+            return;
+        }
+        self.edit_type(text);
     }
     /// Insert text at the caret, advancing it.
     fn edit_insert(&mut self, s: &str) {
@@ -20155,6 +20169,18 @@ impl Docxy {
             .is_some_and(|v| act_takes_entry_text(act, v))
         {
             return self.sheet_entry_copy(act == SheetAct::Cut, cx);
+        }
+        // Paste in an open entry inserts the clipboard text at the caret and
+        // keeps the entry open, as Excel's does (#1341); the cells are never
+        // pasted into. A clipboard with no text pastes nothing.
+        if act == SheetAct::Paste && self.active_sheet().is_some_and(|v| v.editing.is_some()) {
+            if let ClipRead::Text(text) = self.clipboard_read(cx) {
+                if let Some(v) = self.active_sheet_mut() {
+                    v.edit_paste_text(&text);
+                }
+                cx.notify();
+            }
+            return;
         }
         // Protected View (#610): the ribbon is hidden, but shortcuts, KeyTips
         // and the harness's `ribbon-click` still come here.

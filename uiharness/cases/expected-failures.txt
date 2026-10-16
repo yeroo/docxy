@@ -20,11 +20,6 @@ inputs-typing-sheet-data.uit | sheet text-to-columns/breaks: OK applies | #1205
 inputs-typing-sheet-data.uit | sheet text-to-columns/formats: OK applies | #1205
 inputs-typing-sheet-data.uit | sheet text-to-columns/destination: OK applies | #1205
 
-# Ctrl+V while editing a cell runs the sheet's Paste, which ends the entry
-# and pastes into the cells, instead of inserting at the caret (#1200).
-sheet-inputs-typing.uit | sheet formula-bar: pastes | #1341
-sheet-inputs-typing.uit | sheet cell-editor: pastes | #1341
-
 # The sheet Find bar's fields are append-only: no caret, so Home, End,
 # Left, Right and Delete do nothing, and Ctrl+A/C/V are ignored (#1200).
 sheet-inputs-typing.uit | sheet sheet-find: edits | #1342
