@@ -441,10 +441,13 @@ pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
         "formula-bar" | "cell-editor" => match &v.editing {
             Some(buf) => {
                 let len = buf.chars().count();
-                let sel = v
-                    .edit_proposal
-                    .as_ref()
-                    .map(|p| Json::Arr(vec![num(p.0), num(len)]));
+                let sel = if v.edit_select_all {
+                    Some(Json::Arr(vec![num(0), num(len)]))
+                } else {
+                    v.edit_proposal
+                        .as_ref()
+                        .map(|p| Json::Arr(vec![num(p.0), num(len)]))
+                };
                 (
                     Json::Str(buf.clone()),
                     true,
