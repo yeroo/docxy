@@ -747,8 +747,9 @@ struct SheetView {
     /// seed): an immediate second Ctrl+Z puts it back, any other key drops
     /// it (#1147).
     edit_redo: Option<EditRedo>,
-    /// After a revert in Enter mode the restored text is selected: the next
-    /// typed character replaces it, Backspace or Delete empties it.
+    /// The entry's whole-text selection, set by a revert in Enter mode or by
+    /// Ctrl+A (#1340): the next typed character replaces it, Backspace or
+    /// Delete empties it, Ctrl+C / Ctrl+X take it.
     edit_select_all: bool,
     /// The last formatting change, for F4 (repeat), and its step's name. A
     /// resolved setter (bold ON), so repeating applies it rather than
@@ -1416,6 +1417,13 @@ fn act_targets_cells(act: SheetAct) -> bool {
             | SheetAct::Calc(_)
             | SheetAct::Todo
     )
+}
+
+/// Copy and Cut act on an open entry's selected text rather than the cells
+/// (#1340): only while some of it is selected, else they commit the entry
+/// ([`act_commits_editor`]) and copy the cells as before.
+fn act_takes_entry_text(act: SheetAct, v: &SheetView) -> bool {
+    matches!(act, SheetAct::Copy | SheetAct::Cut) && v.edit_selected_text().is_some()
 }
 
 /// Does `act` need a closed cell editor? (#510) Everything that reads or
@@ -3529,8 +3537,9 @@ impl SheetView {
 
     /// What `key` does to a revert's toggle and selection (#1147): the revert
     /// itself (Ctrl+Z, Alt+Backspace) keeps them, a typed character, Backspace
-    /// or Delete uses the selection up itself, any other key (a lone modifier
-    /// aside) drops both.
+    /// or Delete uses the selection up itself, Ctrl+A / Ctrl+C / Ctrl+X keep
+    /// the selection but drop the toggle (#1340), any other key (a lone
+    /// modifier aside) drops both.
     fn end_revert_for_key(&mut self, key: &str, ctrl: bool, alt: bool, typed: bool) {
         let modifier = matches!(key, "shift" | "control" | "alt" | "platform" | "function");
         if self.editing.is_none() || modifier || (ctrl && key == "z") || (alt && key == "backspace")
@@ -3556,9 +3565,12 @@ impl SheetView {
         self.edit_redo = None;
     }
 
-    /// The entry's selected text, if Ctrl+A (or a revert) selected it.
+    /// The entry's selected text, if Ctrl+A (or a revert) selected some.
     fn edit_selected_text(&self) -> Option<String> {
-        self.edit_select_all.then(|| self.editing.clone()).flatten()
+        self.edit_select_all
+            .then(|| self.editing.clone())
+            .flatten()
+            .filter(|t| !t.is_empty())
     }
 
     /// The caret or buffer changed by something other than typing (a click, a
@@ -4212,7 +4224,8 @@ impl SheetView {
             buf_insert(buf, &mut self.edit_caret, s);
         }
     }
-    /// A revert's selected text goes when anything is typed or deleted.
+    /// The entry's selected text (a revert's, or Ctrl+A's) goes when anything
+    /// is typed or deleted.
     fn edit_clear_selected(&mut self) -> bool {
         self.edit_redo = None;
         if !std::mem::take(&mut self.edit_select_all) {
@@ -17695,13 +17708,10 @@ impl Docxy {
         })
     }
 
-    /// Copy (or cut) the selected range into the grid clipboard and, as TSV, the
-    /// system clipboard. A cut only marks its range, as Excel's does: the
-    /// paste moves the cells ([`SheetView::paste_grid_clip`], #664).
     /// Ctrl+C / Ctrl+X in an open cell entry (#1340): the selected text goes
     /// to the clipboard (and the Office Clipboard), a cut also empties the
-    /// entry. With nothing selected nothing happens, as in any text field;
-    /// the copied cells (`grid_clip`) are left as they were.
+    /// entry. Run only with text selected (else the cells' copy runs); the
+    /// copied cells (`grid_clip`) are left as they were.
     fn sheet_entry_copy(&mut self, cut: bool, cx: &mut Context<Self>) {
         let Some(v) = self.active_sheet_mut() else {
             return;
@@ -17717,6 +17727,9 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Copy (or cut) the selected range into the grid clipboard and, as TSV, the
+    /// system clipboard. A cut only marks its range, as Excel's does: the
+    /// paste moves the cells ([`SheetView::paste_grid_clip`], #664).
     fn sheet_copy(&mut self, cut: bool, cx: &mut Context<Self>) {
         // A cut of part of an array is refused before anything is copied; a
         // cut in Protected View too, since its paste would clear the source.
@@ -20134,10 +20147,12 @@ impl Docxy {
         if let SheetAct::Help(a) = act {
             return self.help_act(a, window, cx);
         }
-        // Copy and Cut in an open entry act on its selected text, never on
-        // the cells, and never end the entry (#1340).
-        if matches!(act, SheetAct::Copy | SheetAct::Cut)
-            && self.active_sheet().is_some_and(|v| v.editing.is_some())
+        // Copy and Cut with text selected in an open entry act on that text,
+        // never on the cells, and leave the entry open; with none selected
+        // they commit the entry and copy the cells as before (#1340).
+        if self
+            .active_sheet()
+            .is_some_and(|v| act_takes_entry_text(act, v))
         {
             return self.sheet_entry_copy(act == SheetAct::Cut, cx);
         }

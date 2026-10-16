@@ -2011,7 +2011,9 @@ fn the_autocorrect_switches_turn_the_table_rules_off() {
 
 /// #510: everything that reads or rewrites cell content or moves cells
 /// closes the editor first; formatting and dialog/bar openers that neither
-/// read nor rewrite cell values, and the pick list, leave it open.
+/// read nor rewrite cell values, and the pick list, leave it open. Copy and
+/// Cut commit it too, except while its text is selected (#1340, see
+/// `copy_and_cut_leave_the_entry_open_only_while_its_text_is_selected_1340`).
 #[test]
 fn acts_that_rewrite_cells_close_the_editor() {
     for act in [
@@ -2346,4 +2348,31 @@ fn select_all_drops_a_proposal_and_leaves_the_text_1340() {
     v.edit_select_entry();
     assert_eq!(v.edit_selected_text().as_deref(), Some("ol"));
     assert!(v.edit_proposal.is_none());
+}
+
+#[test]
+fn copy_and_cut_leave_the_entry_open_only_while_its_text_is_selected_1340() {
+    let mut v = old_book();
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_type("abcd");
+    // Nothing selected: the old path, which commits the entry and copies cells.
+    for act in [SheetAct::Copy, SheetAct::Cut] {
+        assert!(!act_takes_entry_text(act, &v), "{act:?}");
+        assert!(act_commits_editor(act), "{act:?}");
+    }
+    v.edit_select_entry();
+    for act in [SheetAct::Copy, SheetAct::Cut] {
+        assert!(act_takes_entry_text(act, &v), "{act:?}");
+    }
+    assert!(!act_takes_entry_text(SheetAct::Paste, &v));
+    assert!(!act_takes_entry_text(SheetAct::Bold, &v));
+    // An empty entry has no text to take, even when "selected".
+    let mut e = old_book();
+    e.begin_cell_edit(Some(String::new()));
+    e.edit_select_entry();
+    assert!(e.edit_selected_text().is_none());
+    assert!(!act_takes_entry_text(SheetAct::Copy, &e));
+    // Cut takes the text out of the entry.
+    v.edit_clear_selected();
+    assert_eq!(v.editing.as_deref(), Some(""));
 }

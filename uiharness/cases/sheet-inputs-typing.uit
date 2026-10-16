@@ -342,6 +342,8 @@ test sheet name-box: copies
   call real-key {"key":"escape"}
   call clipboard {"action":"write","text":"before"}
   call pointer-click {"input":"name-box"}
+  call field-read {"input":"name-box"}
+  assert reply.focused is true
   call real-type {"text":"abcd"}
   call real-key {"key":"ctrl+a"}
   call real-key {"key":"ctrl+c"}
@@ -877,6 +879,8 @@ test sheet sheet-font: copies
   call real-key {"key":"escape"}
   call clipboard {"action":"write","text":"before"}
   call pointer-click {"input":"sheet-font"}
+  call field-read {"input":"sheet-font"}
+  assert reply.focused is true
   call real-type {"text":"abcd"}
   call real-key {"key":"ctrl+a"}
   call real-key {"key":"ctrl+c"}
@@ -997,6 +1001,8 @@ test sheet sheet-font-size: copies
   call real-key {"key":"escape"}
   call clipboard {"action":"write","text":"before"}
   call pointer-click {"input":"sheet-font-size"}
+  call field-read {"input":"sheet-font-size"}
+  assert reply.focused is true
   call real-type {"text":"abcd"}
   call real-key {"key":"ctrl+a"}
   call real-key {"key":"ctrl+c"}
