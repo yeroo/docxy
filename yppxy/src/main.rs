@@ -17,6 +17,10 @@
 //!                                      (`project-overview`, `late-tasks`, …)
 //!   yppxy <in> --save <out.(yppx|xml)> headless: convert/save and exit
 //!   yppxy --version (-V)               print the build (commit, last merged PR, kind)
+//!
+//! Format plugins (`yppx_*` shared libraries in `<config>/yppxy/plugins` or
+//! `$YPPX_PLUGIN_DIR`, see [`formats`]) add the types they read to Open and
+//! the types they write to Save As and `--save`.
 
 use opccore::fsio::{export_atomic, write_atomic};
 use std::path::Path;
@@ -26,6 +30,7 @@ use std::process::ExitCode;
 
 mod backstage;
 mod control;
+mod formats;
 mod mcp;
 mod ribbon;
 mod skill;
@@ -36,18 +41,20 @@ use backstage::Backstage;
 use backstage::BackstageHost as _;
 use ribbon::{Act, Ribbon};
 
-use mppread::project::project_from_mpp;
 use projcore::datetime::DateTime;
 use projcore::editor::{
     AssignOutcome, DURATION_HINT, Editor, FindOutcome, NEW_PROJECT_NAME, constraint_hint,
     duration_suffix, format_resource_names, parse_task_duration,
 };
+use projcore::formats::Registry;
 #[cfg(test)]
 use projcore::model::Predecessor;
 use projcore::model::{LinkType, Project, Task};
+#[cfg(test)]
+use projcore::mspdi;
 use projcore::report::ReportKind;
 use projcore::schedule::{Schedule, schedule};
-use projcore::{gantt, mspdi, report, yppx};
+use projcore::{gantt, report};
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
@@ -132,16 +139,26 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Load the project (or start a fresh one).
-    let proj = match &parsed.input {
-        Some(path) => match load(path) {
-            Ok(p) => p,
+    // The formats, with any plugins: a headless run says which did not load
+    // (the editor puts the first on its status line).
+    let formats = formats::global();
+    if parsed.save.is_some() || parsed.gantt_md.is_some() || parsed.report_md.is_some() {
+        for error in &formats.errors {
+            eprintln!("yppxy: plugin not loaded: {error}");
+        }
+    }
+
+    // Load the project (or start a fresh one), keeping the file for a format
+    // plugin's saves.
+    let (proj, source) = match &parsed.input {
+        Some(path) => match read_file(formats.registry, path) {
+            Ok((p, bytes)) => (p, formats.source(path, bytes)),
             Err(e) => {
                 eprintln!("{path}: {e}");
                 return ExitCode::FAILURE;
             }
         },
-        None => new_project(),
+        None => (new_project(), None),
     };
 
     // Headless modes: do the job and exit, no TUI.
@@ -162,14 +179,14 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if let Some(out) = &parsed.save {
-        if let Err(e) = save_to(&proj, out) {
+        if let Err(e) = save_with(formats.registry, &proj, out, source.as_ref()) {
             eprintln!("{out}: {e}");
             return ExitCode::FAILURE;
         }
         return ExitCode::SUCCESS;
     }
 
-    match run_tui(proj, parsed.input, parsed.vim) {
+    match run_tui(proj, parsed.input, parsed.vim, source) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("yppxy: {e}");
@@ -241,23 +258,23 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     Ok(out)
 }
 
+/// Read the project at `path` with the process's formats.
+#[cfg(test)]
 fn load(path: &str) -> Result<Project, String> {
+    read_file(formats::global().registry, path).map(|(project, _)| project)
+}
+
+/// Read the project at `path` by its extension's reader (`.yppx`, `.mpp`, a
+/// plugin's type; anything else is MSPDI), with the file's bytes.
+fn read_file(registry: &Registry, path: &str) -> Result<(Project, Vec<u8>), String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    let lower = path.to_ascii_lowercase();
-    let mut project = if lower.ends_with(".yppx") {
-        yppx::read_yppx(&bytes)
-    } else if lower.ends_with(".mpp") {
-        project_from_mpp(&bytes)
-    } else {
-        let xml = String::from_utf8(bytes).map_err(|_| "not UTF-8".to_string())?;
-        mspdi::read_mspdi(&xml)
-    }?;
+    let mut project = registry.read(Path::new(path), &bytes)?;
     let stem = Path::new(path)
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("");
     project.fill_unnamed_summary(stem);
-    Ok(project)
+    Ok((project, bytes))
 }
 
 fn write_gantt_md(
@@ -301,17 +318,22 @@ fn export_base(path: Option<&str>) -> String {
     )
 }
 
+#[cfg(test)]
 fn save_to(proj: &Project, path: &str) -> Result<std::path::PathBuf, String> {
-    let path = yppx::save_target(Path::new(path))?;
-    let bytes = if path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("yppx"))
-    {
-        yppx::write_yppx(proj)?
-    } else {
-        mspdi::write_mspdi(proj).into_bytes()
-    };
+    save_with(formats::global().registry, proj, path, None)
+}
+
+/// Save `proj` to `path` (extensionless names become `.yppx`) by its
+/// extension's writer, refusing a type nothing writes. `source`, the file the
+/// plan was opened from, goes to a save of the same type.
+fn save_with(
+    registry: &Registry,
+    proj: &Project,
+    path: &str,
+    source: Option<&formats::Source>,
+) -> Result<std::path::PathBuf, String> {
+    let path = registry.save_target(Path::new(path))?;
+    let bytes = registry.write(proj, &path, source.and_then(|s| s.for_target(&path)))?;
     write_atomic(&path, &bytes).map_err(|e| e.to_string())?;
     Ok(path)
 }
@@ -413,6 +435,11 @@ struct Prompt {
 struct App {
     ed: Editor,
     path: Option<String>,
+    /// The formats Open lists and Save writes (`formats::global`).
+    formats: &'static formats::Formats,
+    /// The file the plan was opened from, while a format plugin writes its
+    /// type (see [`formats::Source`]).
+    source: Option<formats::Source>,
     top: usize,   // first shown row, in visible-row space (collapsed subtasks skipped)
     hscroll: i64, // gantt horizontal scroll in days from the earliest displayed start
     prompt: Option<Prompt>,
@@ -472,6 +499,8 @@ impl App {
         App {
             ed: Editor::new(proj),
             path,
+            formats: formats::global(),
+            source: None,
             top: 0,
             hscroll: 0,
             prompt: None,
@@ -540,7 +569,16 @@ impl App {
             .filter(|d| !d.as_os_str().is_empty())
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        self.backstage = Some(Backstage::open(dir, self.extensions()));
+        let mut backstage = Backstage::open(dir, self.extensions());
+        // A plugin that writes adds a Save as type list (and Export's Change
+        // File Type); without one the backstage is as it always was.
+        if !self.formats.save_types.is_empty() {
+            backstage = backstage.with_save_types(
+                self.formats.save_types,
+                "Export the Gantt chart as Markdown next to the plan",
+            );
+        }
+        self.backstage = Some(backstage);
         self.rfocus = ribbon::Focus::None;
     }
 
@@ -1024,9 +1062,14 @@ impl App {
 
     /// Publish the resolved binding and clean state only after a successful save.
     fn save_to_path(&mut self, path: &str) -> Result<(), String> {
-        let path = save_to(self.ed.project(), path)?
-            .to_string_lossy()
-            .into_owned();
+        let path = save_with(
+            self.formats.registry,
+            self.ed.project(),
+            path,
+            self.source.as_ref(),
+        )?
+        .to_string_lossy()
+        .into_owned();
         self.ed.commit_save();
         self.status = format!("Saved {path}");
         self.path = Some(path);
@@ -1077,26 +1120,19 @@ impl App {
     /// open text prompt is closed — it belonged to the replaced project
     /// (#1049).
     fn open_file(&mut self, path: &str) {
-        match load(path) {
-            Ok(p) => {
+        match read_file(self.formats.registry, path) {
+            Ok((p, bytes)) => {
                 self.ed.replace_project(p);
                 self.path = Some(path.to_string());
+                self.source = self.formats.source(path, bytes);
                 self.top = 0;
                 self.hscroll = 0;
                 self.prompt = None;
                 self.backstage = None;
                 self.start_screen = false;
-                let is_mpp = path.to_ascii_lowercase().ends_with(".mpp");
-                self.status = if is_mpp && !self.ed.project().tasks.is_empty() {
-                    format!(
-                        "Opened {path} — {} .mpp tasks imported",
-                        self.ed.project().tasks.len()
-                    )
-                } else if is_mpp {
-                    format!("Opened {path} — .mpp metadata only (no task table found)")
-                } else {
-                    format!("Opened {path}")
-                };
+                self.status = self
+                    .formats
+                    .opened_status(path, self.ed.project().tasks.len());
             }
             Err(e) => self.status = format!("Open failed: {e}"),
         }
@@ -1109,6 +1145,7 @@ impl App {
     fn new_schedule(&mut self) {
         self.ed.replace_project(new_project());
         self.path = None;
+        self.source = None;
         self.top = 0;
         self.hscroll = 0;
         self.prompt = None;
@@ -1182,14 +1219,28 @@ impl App {
     }
 
     /// Write the project to `dir/name` (defaulting to `.yppx` when the typed
-    /// name carries no extension), then make it the current
-    /// file and close the backstage.
+    /// name carries no extension, or to the type picked in the Save as type
+    /// list a plugin adds), then make it the current file and close the
+    /// backstage.
     fn commit_save_as(&mut self, dir: std::path::PathBuf, name: String) {
         let name = name.trim();
         if name.is_empty() {
             self.status = "Save As — type a file name first.".to_string();
             return;
         }
+        let picked = self
+            .backstage
+            .as_ref()
+            .and_then(|b| b.chosen_type())
+            .and_then(|t| self.formats.save_types.get(t));
+        let name = match picked {
+            Some(t)
+                if !projcore::formats::extension(Path::new(name)).eq_ignore_ascii_case(t.ext) =>
+            {
+                format!("{name}.{}", t.ext)
+            }
+            _ => name.to_string(),
+        };
         let path = dir.join(name).to_string_lossy().into_owned();
         self.backstage = None;
         if let Err(e) = self.save_to_path(&path) {
@@ -1263,7 +1314,11 @@ fn project_preview(proj: &Project, sched: &Schedule, path: Option<&Path>) -> Vec
 /// accent matches yppxy's ribbon (yellow).
 impl backstage::BackstageHost for App {
     fn extensions(&self) -> &'static [&'static str] {
-        &["xml", "yppx", "mpp"]
+        self.formats.open_exts
+    }
+
+    fn default_save_type(&self) -> Option<usize> {
+        self.formats.save_type_of(self.path.as_deref()?)
     }
 
     fn default_save_name(&self) -> String {
@@ -1276,8 +1331,8 @@ impl backstage::BackstageHost for App {
 
     /// Render a quick summary of the highlighted project.
     fn preview_lines(&self, path: &std::path::Path, _width: usize) -> Vec<String> {
-        match load(&path.to_string_lossy()) {
-            Ok(p) => {
+        match read_file(self.formats.registry, &path.to_string_lossy()) {
+            Ok((p, _)) => {
                 let s = schedule(&p);
                 project_preview(&p, &s, Some(path))
             }
@@ -1318,7 +1373,12 @@ impl backstage::BackstageHost for App {
 
 // ---- TUI loop ---------------------------------------------------------------
 
-fn run_tui(proj: Project, path: Option<String>, vim: bool) -> io::Result<()> {
+fn run_tui(
+    proj: Project,
+    path: Option<String>,
+    vim: bool,
+    source: Option<formats::Source>,
+) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -1326,6 +1386,10 @@ fn run_tui(proj: Project, path: Option<String>, vim: bool) -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(proj, path, vim);
+    app.source = source;
+    if let Some(error) = app.formats.errors.first() {
+        app.status = format!("Plugin not loaded: {error}");
+    }
     let mut title = String::new();
 
     // Bring up the agent control surface. Best-effort: if the config directory or
@@ -2706,6 +2770,66 @@ mod tests {
         save_to(&project, xml.to_str().unwrap()).unwrap();
         assert!(xml.exists());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// With a format plugin that writes `.mpp` (an in-process stand-in), an
+    /// opened `.mpp` is no import: Save writes it in place, passing the
+    /// opened file back as its source, and Save As lists the plugin's type.
+    #[test]
+    fn a_plugin_writer_saves_mpp_in_place_with_its_source() {
+        let dir = std::env::temp_dir().join(format!(
+            "yppxy-plugin-mpp-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plan = dir.join("plan.mpp");
+        let plan_path = plan.to_str().unwrap();
+        let original = mspdi::write_mspdi(&new_project()).into_bytes();
+        std::fs::write(&plan, &original).unwrap();
+        let note = format!("<!-- source {} bytes -->", original.len());
+
+        let mut app = App::new(new_project(), None, false);
+        app.formats = formats::tests::with_mpp_writer();
+        app.open_file(plan_path);
+        assert_eq!(app.status, format!("Opened {plan_path} — 1 tasks"));
+        app.ed.rename(1, "Edited").unwrap();
+        app.save();
+        assert_eq!(app.status, format!("Saved {plan_path}"));
+        assert!(!app.ed.dirty());
+        let saved = std::fs::read_to_string(&plan).unwrap();
+        assert!(
+            saved.contains("<Name>Edited</Name>") && saved.ends_with(&note),
+            "{saved}"
+        );
+
+        // MSPDI is a built-in: no source goes to it.
+        app.commit_save_as(dir.clone(), "copy.xml".into());
+        assert!(
+            !std::fs::read_to_string(dir.join("copy.xml"))
+                .unwrap()
+                .contains("<!--")
+        );
+
+        // Save As lists the plugin's type; picking it names the file.
+        app.path = Some(plan_path.into());
+        assert_eq!(app.default_save_type(), Some(2));
+        app.open_backstage();
+        let backstage = app.backstage.as_mut().unwrap();
+        assert_eq!(backstage.save_types.len(), 3);
+        assert_eq!(backstage.save_types[2].label, "Project");
+        backstage.begin_save_as("picked".into(), Some(2));
+        app.commit_save_as(dir.clone(), "picked".into());
+        let picked = dir.join("picked.mpp");
+        assert_eq!(app.path.as_deref(), picked.to_str());
+        // The source is still the file the plan was opened from.
+        assert!(std::fs::read_to_string(&picked).unwrap().ends_with(&note));
+
+        // New drops the source.
+        app.new_schedule();
+        assert!(app.source.is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

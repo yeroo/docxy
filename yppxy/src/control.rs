@@ -31,7 +31,7 @@
 //! | `assign.add` | `{task, resource, units?, work?, fields?}` | the new assignment |
 //! | `assign.set` | `{uid, units?, work?, overtime_work?, contour?, rate_table?, delay?, actual_work? \| percent_work_complete?, fields?}` | the updated assignment |
 //! | `assign.del` | `{uid}` | `{deleted, task}` |
-//! | `proj.save` | `{path?}` (.yppx/.xml only; extensionless adds .yppx) | `{path, …}` with the actual saved path |
+//! | `proj.save` | `{path?}` (.yppx/.xml, or a type a format plugin writes; extensionless adds .yppx) | `{path, …}` with the actual saved path |
 //! | `proj.reload` | — | `{path, …}` |
 //! | `proj.open` | `{path}` | `{path, …}` |
 //! | `field-read` | `{input?}` | a text prompt (`yppxy-prompt`, `yppxy-save-as`): `{input, value, focused, caret, selection, at, kind, keys, clicks, frames, dirty}`; with no `input`, the counters and the ids (`ctlcore::field`, #1204) |

@@ -44,6 +44,8 @@ Built bottom-up, each a pure module:
 | `gantt` | export a scheduled project as a Markdown/Mermaid Gantt chart, with a task table (dates, Deadline with a missed-deadline `⚠`, duration, slack) |
 | `report` | Project's Report › View Reports as Markdown, from the plan's stored values |
 | `yppx` | the native `.yppx` OPC package (ZIP + `[Content_Types].xml` + `project.xml`) |
+| `formats` | the `ProjectFormat` trait and the `Registry` of formats hosts open and save (built-in `.yppx` and `.xml`), and, behind the `plugins` feature, the format plugin loader |
+| `plugin_abi` | the C ABI a format plugin implements (see [Format plugins](#format-plugins)) |
 
 The model is **pure input** — the scheduler never mutates it; it returns a
 separate `Schedule`. MSPDI's own computed `Start`/`Finish` are captured as
@@ -316,6 +318,62 @@ and text decoders. Each item's docs give the record sizes and offsets it
 assumes and the Project generation it is validated for.
 `mppread/tests/raw_api.rs` walks the corpus snapshots through it and checks
 the counts against `project_from_mpp`.
+
+## Format plugins
+
+A host can open and save more file types through **format plugins**: shared
+libraries named `yppx_*` with the platform's library extension (`.dll`,
+`.so`, `.dylib`). `yppxy` loads, once at start, each one in
+`<config>/yppxy/plugins` (`%APPDATA%\yppxy\plugins` on Windows, else
+`$XDG_CONFIG_HOME/yppxy/plugins` or `~/.config/yppxy/plugins`, beside its
+control discovery files), then each in `$YPPX_PLUGIN_DIR` when set. **No
+plugin ships** with the workspace; without one, every list, status line and
+save refusal is what it was before plugins existed. The desktop suite does
+not load them yet.
+
+- **`projcore::formats`** holds the `ProjectFormat` trait (extensions, label,
+  reads/writes, `read(bytes)`, `write(project, source)`) and the `Registry`
+  hosts consult for Open's file list, Save As's types, reads and writes, and
+  the save-path check. The built-in `.yppx` and `.xml` (MSPDI) come first,
+  then what the host registers: `mppread::project::MppImport`, the read-only
+  `.mpp` import, then the plugins. A later registration for an extension
+  replaces, in place, its reader (when it reads) and its writer (when it
+  writes), so a plugin that reads `.mpp` takes over from the import and one
+  that only writes it keeps the import as the reader. `yppx::save_target` is
+  the built-in registry's, so its refusal ("Project schedules can only be
+  saved as .yppx or .xml (MSPDI)") is unchanged; a registry with a plugin
+  writer lists that type too.
+- **`projcore::plugin_abi`** is the C ABI, version 1: six `extern "C"`
+  functions (`yppx_plugin_abi`, `yppx_plugin_formats`, `yppx_plugin_read`,
+  `yppx_plugin_write`, `yppx_plugin_free`, `yppx_plugin_last_error`), a
+  `YppxBuf { ptr, len }` the plugin owns and frees, return codes (0 ok, 1
+  unsupported extension, 2 malformed input, 3 unsupported content, 4 internal
+  error) and the formats JSON
+  (`[{"ext":"mpp","label":"Project","read":true,"write":true}]`). MSPDI XML
+  text crosses the boundary, never model structs. A save to the type the
+  plan was opened from passes the plugin that file's bytes, so it can carry
+  over what the model does not hold.
+- **`projcore::formats::plugin`**, behind the cargo feature `plugins` (it
+  adds `libloading`; hosts enable it, so the default build and the wasm
+  builds stay dependency-free), loads the libraries, checks the ABI version
+  and the six symbols, and wraps each declared type as a `ProjectFormat`
+  whose `read` is `yppx_plugin_read` then `read_mspdi`, and whose `write` is
+  `write_mspdi` then `yppx_plugin_write`. A library stays loaded for the
+  process and calls into it are serialised. One that fails to load is
+  skipped with a message: headless `yppxy` prints it on stderr, the editor
+  shows the first on its status line.
+- In **`yppxy`** the registry drives the Open browser's list, every read,
+  `--save` and Save / Save As, so `yppxy plan.xml --save out.<ext>` works for
+  any registered writer. A plugin writer adds a *Save as type* list to Save
+  As. A file of a type a plugin also writes is not an import: opening one
+  says "Opened x.mpp — N tasks" rather than "… .mpp tasks imported", and
+  Save writes it back in place.
+- **The fixture**: `projcore/tests/plugin_fixture` is a dependency-free cdylib
+  (`publish = false`) that implements the ABI by hand for a fake `.fakeproj`
+  type, passing MSPDI through. `projcore/tests/plugins.rs` (run with
+  `--features plugins`) and `yppxy/tests/plugins.rs` build it with cargo, copy
+  it into a plugin directory as `yppx_fixture.<dll|so|dylib>`, and round-trip
+  a plan through it, `yppxy plan.xml --save out.fakeproj` included.
 
 ## Desktop suite entry table
 

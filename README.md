@@ -280,6 +280,10 @@ yppxy plan.xml  --report-md late-tasks out.md  # headless: a View Report
 yppxy plan.xml  --save out.yppx   # headless: convert to the native package
 ```
 
+**Format plugins** (`yppx_*` shared libraries in `<config>/yppxy/plugins` or
+`$YPPX_PLUGIN_DIR`) can add file types to Open, Save As and `--save`; none
+ships, see [PROJECT.md](PROJECT.md#format-plugins).
+
 Like docxy and xlsxy, yppxy has the same **ribbon** — with Microsoft Project's
 tabs, groups and command names (File · Task · Resource · Report · Project ·
 View · Help, e.g. Project › Schedule › Set Baseline; `F9` to engage) — the same **File
