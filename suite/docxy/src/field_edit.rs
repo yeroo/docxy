@@ -38,6 +38,13 @@ pub(crate) fn alt_replace(
     Some(key == "a")
 }
 
+/// Whether a key-down is Ctrl+S, which a focused one-line field lets through to
+/// the sheet's save. Not Ctrl+Alt: that is AltGr on Windows, where S is text
+/// (Polish "ś").
+pub(crate) fn is_save_chord(ctrl: bool, alt: bool, key: &str) -> bool {
+    ctrl && !alt && key == "s"
+}
+
 /// The caret and selection to use for `text`: those kept, unless the text's
 /// length is no longer the one they were kept for (another path edited the
 /// text), when the caret is at the end and nothing is selected.
@@ -79,6 +86,14 @@ pub(crate) fn apply(text: &mut String, caret: &mut usize, sel: &mut bool, op: Op
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_plain_ctrl_s_is_the_save_chord() {
+        assert!(is_save_chord(true, false, "s"));
+        assert!(!is_save_chord(true, true, "s"), "AltGr+S is text");
+        assert!(!is_save_chord(false, false, "s"));
+        assert!(!is_save_chord(true, false, "a"));
+    }
+
     use super::*;
 
     fn run(text: &str, caret: usize, sel: bool, ops: Vec<Op>) -> (String, usize, bool) {
