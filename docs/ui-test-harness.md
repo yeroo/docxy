@@ -967,7 +967,9 @@ active tab's paste would take besides it: `{kind: "doc", text}` (a document's
 copied runs, formatting intact) or `{kind: "grid", text, rows, cols}` (the
 sheet's copied cells), each kept while the clipboard still holds the text that
 copy wrote, or holds no item at all; or `{kind: "none"}`, when a document,
-sheet or Project paste takes `text` (#755). A copy with no text in it (an
+sheet or Project paste takes `text` (#755). In a sheet, `none` also means a
+paste takes another app's HTML table (`html`), else its RTF table, else
+`text`, an HTML-only copy (no `text`) included (#1248). A copy with no text in it (an
 image, an empty copy) is newer than either clip too: `text` is `null`, `app`
 is `none`, and a paste does nothing. The exception is a document copy of only
 an image, whose own text is empty: its clip stays ours.

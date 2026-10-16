@@ -380,12 +380,29 @@ mod tests {
             html_fragment(page.as_bytes()).as_deref(),
             Some(page.as_str())
         );
-        // Offsets past the payload, or inside a character.
+        // Offsets past the payload.
         let bad = "Version:0.9\r\nStartFragment:0000000010\r\nEndFragment:0000009999\r\n<table>";
         assert_eq!(html_fragment(bad.as_bytes()).as_deref(), Some("<table>"));
         let split = "StartFragment:0000000051\r\nEndFragment:0000000052\r\n<p>\u{e9}";
-        // Not a CF_HTML payload: text before the first tag stays.
+        // Not a CF_HTML payload (no `Version:`): it stays whole.
         assert_eq!(html_fragment(split.as_bytes()).as_deref(), Some(split));
+        // Offsets between the two bytes of an `\u{e9}`: no panic, and the
+        // page from its first tag on (the header is cut).
+        let table = "<table><tr><td>\u{e9}</td></tr></table>";
+        let head = "Version:0.9\r\nStartFragment:0000000000\r\nEndFragment:0000000000\r\n";
+        let e = head.len() + table.find('\u{e9}').unwrap();
+        let payload = format!(
+            "Version:0.9\r\nStartFragment:{:010}\r\nEndFragment:{:010}\r\n{table}",
+            e + 1,
+            e + 2
+        );
+        assert_eq!(html_fragment(payload.as_bytes()).as_deref(), Some(table));
+        let payload = format!(
+            "Version:0.9\r\nStartFragment:{:010}\r\nEndFragment:{:010}\r\n{table}",
+            head.len(),
+            e + 1
+        );
+        assert_eq!(html_fragment(payload.as_bytes()).as_deref(), Some(table));
         let intro = "Intro<table><tr><td>1</td></tr></table>";
         assert_eq!(html_fragment(intro.as_bytes()).as_deref(), Some(intro));
         // A header and its table still read, and parse as a table.

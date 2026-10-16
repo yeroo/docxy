@@ -2221,10 +2221,13 @@ impl ClipboardStore {
         }
     }
 
-    /// The clipboard's HTML table, if it has one. `os` reads the OS one's.
+    /// The clipboard's HTML table, if it has one. `os` reads the OS one's
+    /// (already cut out of its CF_HTML payload); a private `html` is read as
+    /// that one is, so a CF_HTML string given to `clipboard write` reads alike.
     fn read_html(&self, harness: bool, os: impl FnOnce() -> Option<String>) -> Option<String> {
         if harness {
-            self.private.borrow().as_ref()?.html.clone()
+            let html = self.private.borrow().as_ref()?.html.clone()?;
+            rich_clip::html_fragment(html.as_bytes())
         } else {
             os()
         }
@@ -17639,10 +17642,7 @@ impl Docxy {
     /// The clipboard's HTML table fragment (#1248): the OS one's, or the
     /// private one's.
     fn clipboard_read_html(&self) -> Option<String> {
-        // A harness `html` is read as the OS one is: a CF_HTML header cut.
-        self.clipboard
-            .read_html(self.harness, rich_clip::read_html)
-            .and_then(|html| rich_clip::html_fragment(html.as_bytes()))
+        self.clipboard.read_html(self.harness, rich_clip::read_html)
     }
 
     /// Add `html` to the copy of `text` on the clipboard (#1248).

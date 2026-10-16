@@ -3417,6 +3417,9 @@ fn resolve_commands(
 /// holds its text (`clip_still_ours`) and copy mode is on
 /// (`GridClip::live`); otherwise `none`, and a paste takes the RTF (a
 /// document's) or `text` (or, over a spent grid clip's own text, nothing).
+/// In a sheet, `none` also covers another app's HTML table, else its RTF
+/// table, which a paste takes before `text` (#1248), an HTML-only copy
+/// included.
 /// `rich` is whether the clipboard holds an RTF.
 fn clipboard_app_json(
     surface: Option<&crate::Surface>,
