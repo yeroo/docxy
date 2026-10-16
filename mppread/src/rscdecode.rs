@@ -4,11 +4,17 @@ use projcore::Resource;
 use projcore::model::ResourceType;
 use std::collections::HashSet;
 
-pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<Vec<Resource>>, String> {
+/// Decode the current Project resource table
+/// ([`crate::raw::RESOURCE_TABLE`]): UID, ID, name, type and max
+/// units of each live row. The implicit UID 0 "unassigned" row is left out,
+/// as Project's XML resource sheet leaves it out. `Ok(None)` when `legacy`
+/// (MPP9 and MPP12, whose resource layouts are not validated), when the file
+/// has no resource table, or when the table has an unvalidated layout.
+pub fn decode(bytes: &[u8], legacy: bool) -> Result<Option<Vec<Resource>>, String> {
     if legacy {
         return Ok(None);
     }
-    let Some(table) = crate::tabledecode::read(bytes, "TBkndRsc", 37, 172, 0x0c40)? else {
+    let Some(table) = crate::tabledecode::RESOURCE_TABLE.read(bytes)? else {
         return Ok(None);
     };
     let mut result = Vec::new();

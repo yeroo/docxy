@@ -292,6 +292,14 @@ a leaf, as it does a childless inserted subproject.
    Add a version-specific layout only when the task index, names, dates, levels,
    and links can be validated; otherwise leave that layout refused.
 
+To read a table's records rather than its hex, use `mppread::raw`, the
+inspection API: the FixedMeta index, VarMeta/Var2Data, `Props` and per-table
+readers the importer itself runs, with the record sizes and offsets each
+assumes in its docs (`cargo doc -p mppread --open`). `mppread/tests/raw_api.rs`
+walks `TBkndTask`, `TBkndCons`, `TBkndRsc`, `TBkndAssn` and `TBkndCal` of
+every snapshot through it and checks the counts against `project_from_mpp`;
+like the oracle test, it skips when `snapshots/` is absent.
+
 ## Where to get sample files
 
 Both `git clone` and `raw.githubusercontent.com` downloads work here (only the

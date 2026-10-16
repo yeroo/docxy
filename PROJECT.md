@@ -306,6 +306,17 @@ task: its bookings are placed first, and auto tasks level around them.
   leaves retain decoded durations, and outline summaries roll up from their
   children. Nonzero link lag still lacks a real-file oracle.
 
+`mppread::raw` is the inspection API for tools and tests that look at a
+`.mpp`'s `TBknd*` tables directly. It re-exports the validated readers the
+importer runs, without a second, looser decoder: the task FixedMeta index and
+its Fixed2 pairing, the resource and assignment table reader with its layouts,
+VarMeta entries and Var2Data blocks, the `Props` entries and keys, the decoded
+task, calendar, resource and assignment tables, and the timestamp, duration
+and text decoders. Each item's docs give the record sizes and offsets it
+assumes and the Project generation it is validated for.
+`mppread/tests/raw_api.rs` walks the corpus snapshots through it and checks
+the counts against `project_from_mpp`.
+
 ## Desktop suite entry table
 
 The suite's Project tab edits Task Mode, Name, Duration, Start, Finish,

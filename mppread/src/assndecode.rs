@@ -29,7 +29,16 @@ fn work(v: f64, uid: u32, what: &str) -> Result<i64, String> {
         .ok_or_else(|| format!("invalid {what} for assignment UID {uid}"))
 }
 
-pub(crate) fn decode(
+/// Decode the current Project assignment table
+/// ([`crate::raw::ASSIGNMENT_TABLE`]): UID, task and resource UIDs,
+/// units, work, start, finish and the saved Baseline and Baseline1..10
+/// start, finish, work and cost. The internal task-0/resource-0 placeholder
+/// row is left out. Every other row must name a UID in `task_uids` (the
+/// importer passes the non-blank task UIDs and 0, the project summary) and
+/// a resource in `resources`, or the unassigned resource UID -65535.
+/// `Ok(None)` when `legacy` (MPP9 and MPP12), when the file has no
+/// assignment table, or when the table has an unvalidated layout.
+pub fn decode(
     bytes: &[u8],
     legacy: bool,
     task_uids: &HashSet<i32>,
@@ -38,7 +47,7 @@ pub(crate) fn decode(
     if legacy {
         return Ok(None);
     }
-    let Some(table) = crate::tabledecode::read(bytes, "TBkndAssn", 34, 110, 0x0f40)? else {
+    let Some(table) = crate::tabledecode::ASSIGNMENT_TABLE.read(bytes)? else {
         return Ok(None);
     };
     let resource_uids: HashSet<_> = resources.iter().map(|r| r.uid).collect();

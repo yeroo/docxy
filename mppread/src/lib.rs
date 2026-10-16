@@ -15,6 +15,9 @@
 //!   predecessor links, task modes, calendars, resources, assignments and saved
 //!   assignment baselines into a `projcore` project for the
 //!   terminal and suite hosts.
+//! - [`raw`] — the inspection API: the same validated table readers, their
+//!   record layouts and decoded intermediate tables, for tools and tests
+//!   that look at the `TBknd*` tables directly.
 
 mod assndecode;
 mod caldecode;
@@ -26,6 +29,7 @@ mod overalloc;
 pub mod project;
 mod props;
 mod publish;
+pub mod raw;
 mod rscdecode;
 mod rtf;
 mod tabledecode;

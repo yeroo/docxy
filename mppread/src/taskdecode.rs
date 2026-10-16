@@ -134,16 +134,24 @@ const LEGACY_LINK: LinkLayout = LinkLayout {
     format_of: |code| (code == 7).then_some(LagFormat::DAYS),
 };
 
+/// Length of a `TBkndCons/FixedData` link record in every generation the
+/// task reader validates: predecessor UID `u32` at +4, successor UID `u32`
+/// at +8 and link type `u16` at +12 (MSPDI codes 0..=3), then the lag `i32`
+/// and LagFormat `u16` at +14/+18 in current Project and +16/+14 in MPP12
+/// and MPP9. The links decode into each successor's
+/// [`MppTask::predecessors`].
+pub const LINK_RECORD_LEN: usize = 20;
+
 fn links(cfb: &Cfb, prefix: &str, out: &mut [MppTask], layout: LinkLayout) -> Result<(), String> {
     let cons_path = prefix.replace("TBkndTask/", "TBkndCons/FixedData");
     let Some(cons) = cfb.read_path(&cons_path) else {
         return Ok(());
     };
-    if !cons.len().is_multiple_of(20) {
+    if !cons.len().is_multiple_of(LINK_RECORD_LEN) {
         return Err("link record length mismatch".into());
     }
     let positions: HashMap<_, _> = out.iter().enumerate().map(|(i, t)| (t.uid, i)).collect();
-    for rec in cons.as_chunks::<20>().0 {
+    for rec in cons.as_chunks::<LINK_RECORD_LEN>().0 {
         let pred_uid = u32_at(rec, 4);
         let succ_uid = u32_at(rec, 8);
         if pred_uid == 0 || succ_uid == 0 {
@@ -173,7 +181,12 @@ fn links(cfb: &Cfb, prefix: &str, out: &mut [MppTask], layout: LinkLayout) -> Re
     Ok(())
 }
 
-fn decode_text(
+/// Strictly decode the Var2Data block at `off` as text: a `u32` byte length,
+/// then UTF-16LE code units ending in one NUL, with no control characters
+/// and, unless `allow_empty`, at least one character. `uid` and `what` name
+/// the value in the error. Task names (VarMeta key `0x000e`), explicit WBS
+/// codes (`0x0010`) and the keyed text fields are read with it.
+pub fn decode_text(
     v2: &[u8],
     off: usize,
     uid: u32,
@@ -531,7 +544,8 @@ fn manual_fields(rec: &[u8], uid: u32) -> Result<ManualFields, String> {
     Ok((start, finish, duration))
 }
 
-fn tenths_to_minutes(tenths: i32) -> i64 {
+/// A stored duration in tenths of a minute, as whole minutes.
+pub fn tenths_to_minutes(tenths: i32) -> i64 {
     // Round half away from zero, as MSPDI import rounds a duration's seconds.
     (f64::from(tenths) / 10.0).round() as i64
 }
@@ -589,14 +603,15 @@ fn progress_fields(rec: &[u8], physical_percent: u8, uid: u32) -> Result<MppProg
 }
 
 /// Work as Project stores it: thousandths of a minute, rounded for MSPDI.
-pub(crate) fn work_minutes(value: f64) -> Option<i64> {
+/// `None` for a negative, infinite or NaN value.
+pub fn work_minutes(value: f64) -> Option<i64> {
     (value.is_finite() && value >= 0.0 && value / 1000.0 <= i64::MAX as f64)
         .then(|| (value / 1000.0).round() as i64)
 }
 
 /// A stored cost as Project's MSPDI export writes it: rounded to two
 /// decimals, without trailing zeros (`9319.5`, `3406`).
-pub(crate) fn cost_rate(value: f64) -> Option<Rate> {
+pub fn cost_rate(value: f64) -> Option<Rate> {
     if !value.is_finite() {
         return None;
     }
@@ -607,10 +622,17 @@ pub(crate) fn cost_rate(value: f64) -> Option<Rate> {
 
 /// A validated task table and the project's new-task mode. The mode is kept
 /// as its own result so a bad project option refuses an import but not
-/// [`decode`].
-pub(crate) struct Table {
+/// [`crate::mpp::decode_tasks`].
+#[derive(Debug)]
+pub struct Table {
+    /// Every row in ID order: ID 0 (the project summary) first, blank rows
+    /// included, links decoded from `TBkndCons` onto their successors.
     pub tasks: Vec<MppTask>,
+    /// The project Props `NewTasksAreManual`; `false` for MPP9, MPP12 and a
+    /// file with no task table.
     pub new_tasks_are_manual: Result<bool, String>,
+    /// The project Props StartDate (`YYYY-MM-DD HH:MM`); UID 0's start for
+    /// MPP12, absent for MPP9.
     pub project_start: Result<Option<String>, String>,
     /// Use task-only import and legacy scheduling rules (MPP9/MPP12).
     pub legacy: bool,
@@ -628,7 +650,20 @@ pub(crate) fn new_tasks_are_manual(bytes: &[u8]) -> Result<bool, String> {
 /// Decode the task table. MPP9 predates manual tasks and a file without a
 /// task table has nothing to default, so both have an auto default; the
 /// newest layout reads it from the project Props beside the table.
-pub(crate) fn decode_table(bytes: &[u8]) -> Result<Table, String> {
+///
+/// The rows come from [`crate::raw::task_index`]. A current Project record
+/// is 202 bytes: Start and Finish timestamps at +0x68/+0x6c, outline level
+/// byte at +172, constraint type `u16` +64 and date +66, priority `u16` +78,
+/// task type `u16` +140, LevelingDelayFormat `u16` +162, DurationFormat
+/// `u16` +164, CalendarUID `i32` +178, deadline +182, creation date +128,
+/// and the progress fields tabled in `corpus/mpp/README.md` (work, cost and
+/// duration from +8 to +94, actual dates and resume/stop from +120 to +136).
+/// An MPP12 (264-byte) record holds its outline level `u32` at +40 and
+/// Start/Finish at +88/+92; an MPP9 record (264 bytes in the validated
+/// files) its level byte at +40 and Start/Finish at +88/+92. Names are
+/// VarMeta key `0x000e` (tag `0x0b40`) in current Project and MPP12, and
+/// key `0x0b00` in MPP9's 8-byte VarMeta entries.
+pub fn decode_table(bytes: &[u8]) -> Result<Table, String> {
     let cfb = Cfb::open(bytes)?;
     let paths = cfb.paths();
     let task_paths: Vec<_> = paths.iter().filter(|p| p.contains("TBkndTask/")).collect();

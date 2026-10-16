@@ -410,16 +410,32 @@ fn resource_names(cfb: &Cfb, prefix: &str) -> Result<HashMap<i32, String>, Strin
     Ok(names)
 }
 
+/// The calendars of a current Project `TBkndCal` table.
 #[derive(Debug, PartialEq)]
-pub(crate) struct DecodedCalendars {
+pub struct DecodedCalendars {
+    /// Named base and derived calendars, in UID order, as Project's MSPDI
+    /// export lists them. Unnamed internal rows are left out.
     pub calendars: Vec<Calendar>,
+    /// The project's default base calendar, named by the project Props.
     pub default_calendar_uid: i32,
     /// `(resource UID, calendar UID)` for each resource's own calendar, as
     /// the calendar row names its resource.
     pub resource_calendars: Vec<(i32, i32)>,
 }
 
-pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<DecodedCalendars>, String> {
+/// Decode the current Project calendar table. FixedMeta has 10-byte entries
+/// (kind `u16` at +0, offset `u32` at +4), its header count at +8 and
+/// FixedData length at +12; the first four records are 16-byte kind-4
+/// schema stubs. Each calendar row is 12 bytes: base calendar UID `i32` at
+/// +0 (-1, 0 or the row's own UID for a base calendar), resource UID `i32` at +4
+/// and UID `i32` at +8; a 14-byte terminal row may end the table. VarMeta
+/// entries carry tag `0x0d40`: key 1 is the UTF-16 name and key 8 the
+/// weekday, exception and work-week block described in `corpus/mpp/README.md`.
+/// A resource calendar without a name takes its resource's name. The default
+/// calendar is named by the `Props` key 0x0240000e beside the table.
+/// `Ok(None)` when `legacy` (MPP9 and MPP12) or the file has no calendar
+/// table; an unrecognised record or block is an error.
+pub fn decode(bytes: &[u8], legacy: bool) -> Result<Option<DecodedCalendars>, String> {
     if legacy {
         return Ok(None);
     }
