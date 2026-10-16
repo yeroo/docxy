@@ -326,8 +326,11 @@ impl Editor {
             _ => None,
         };
         let is_para = |b: usize| matches!(self.doc.body.get(b), Some(Block::Paragraph(_)));
-        // Edges of an empty paragraph stay: its one offset is both its start
-        // and its end, and the paragraph is selected text.
+        // An empty paragraph's one offset is both its start and its end, so
+        // at the start edge it stays in the selection. At the end edge it
+        // does too when it is the last of its section (Select All over a
+        // blank last paragraph); elsewhere the selection stops before its
+        // mark like any paragraph start.
         let mut lo_gap = None;
         let mut hi_moved = false;
         if len(lb)? > 0 && len(lb)? == lo.offset && lb < hb {
@@ -342,7 +345,11 @@ impl Editor {
                 lo_gap = Some(lb);
             }
         }
-        if hi.offset == 0 && len(hb)? > 0 && hb > lb && is_para(hb - 1) {
+        let ends_section = matches!(
+            self.doc.body.get(hb),
+            Some(Block::Paragraph(p)) if p.props.section_break.is_some()
+        ) || hb + 1 >= self.doc.content_block_count();
+        if hi.offset == 0 && (len(hb)? > 0 || !ends_section) && hb > lb && is_para(hb - 1) {
             // To a paragraph's start: the text ends with the previous mark.
             hb -= 1;
             hi_moved = true;
@@ -407,9 +414,9 @@ impl Editor {
     /// selection starts at its section's start, where the existing break
     /// stays), and so does the section after it. No empty paragraph is made
     /// where a selection edge is at a paragraph edge: the neighbouring
-    /// paragraph's mark carries the break, except where a table is the
-    /// neighbour before the text: a table cannot carry a sectPr, so an empty
-    /// paragraph after it does. The selection stays on the same text.
+    /// paragraph's mark carries the break, except beside a table (before the
+    /// text or ending it): a table cannot carry a sectPr, so a split leaves an
+    /// empty paragraph next to it. The selection stays on the same text.
     pub fn wrap_selection_in_section(
         &mut self,
         start: SectionStart,
@@ -975,6 +982,38 @@ mod tests {
         let mut e = blanks(&["alpha", "", "gamma"]);
         select(&mut e, (1, 0), (2, 0));
         assert!(e.selection_section_wrappable());
+    }
+
+    #[test]
+    fn a_selection_ending_before_a_blank_paragraph_in_the_middle_leaves_it_out_1272() {
+        let mut e = blanks(&["alpha", "", "gamma"]);
+        select(&mut e, (0, 0), (1, 0));
+        // Edge start, so only the end cuts: "alpha" ends the first section.
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(margin(&e, 0), 720);
+        assert!(matches!(&e.doc.body[0], Block::Paragraph(p) if p.props.section_break.is_some()));
+        assert!(matches!(&e.doc.body[1], Block::Paragraph(p) if p.props.section_break.is_none()));
+        let mut e = blanks(&["alpha", "beta", "", "delta"]);
+        select(&mut e, (1, 0), (2, 0));
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(margin(&e, 1), 720);
+        assert!(matches!(&e.doc.body[0], Block::Paragraph(p) if p.props.section_break.is_some()));
+        assert!(matches!(&e.doc.body[1], Block::Paragraph(p) if p.props.section_break.is_some()));
+        assert!(matches!(&e.doc.body[2], Block::Paragraph(p) if p.props.section_break.is_none()));
+    }
+
+    #[test]
+    fn a_selection_ending_right_after_a_table_splits_there_1272() {
+        let mut e = wrap_doc();
+        e.doc.body.insert(1, Block::Table(Table::default()));
+        select(&mut e, (0, 2), (2, 0)); // to the start of "gamma", after the table
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(e.sections().len(), 4);
+        assert_eq!(margin(&e, 1), 720);
+        assert_eq!(texts(&e)[0], "al");
     }
 
     #[test]

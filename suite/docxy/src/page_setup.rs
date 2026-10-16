@@ -1,6 +1,7 @@
 //! Word's Page Setup and Columns dialogs (#649), opened from the Layout tab.
 //!
-//! Each dialog opens on the caret section's values. OK applies to the sections
+//! Each dialog opens on the values of the section it opened on (the one Selected
+//! text edits when offered, else the caret's). OK applies to the sections
 //! "Apply to" names, as one undo step on the body editor:
 //! - This section (Selected sections when the selection spans several), the
 //!   caret's sections;
@@ -91,7 +92,7 @@ fn body_of(tab: &DocTab) -> Result<(&Editor, &Package), String> {
     }
 }
 
-/// The caret section's setup.
+/// The caret section's setup (Line Numbers).
 fn caret_setup(ed: &Editor) -> SectionSetup {
     SectionSetup::parse(&caret_raw(ed))
 }
@@ -125,7 +126,7 @@ fn apply_to(ed: &Editor, selected_text: bool) -> Control {
     )
 }
 
-/// The Page Setup dialog on the caret section's values, open on `page`.
+/// The Page Setup dialog on the opened-on section's values, open on `page`.
 pub(crate) fn page_setup_dialog(tab: &DocTab, page: PageSetupTab) -> Result<Dialog, String> {
     let (ed, pkg) = body_of(tab)?;
     let s = SectionSetup::parse(&dialog_raw(ed));
@@ -272,11 +273,11 @@ pub(crate) fn twips_of(text: &str) -> Option<i32> {
 //    when their shape disagrees); then, when the person picked a named paper,
 //    `set_paper` (kept in the orientation);
 // 2. the person's part: each field (a margin, a distance, Width, Height) whose
-//    shown value differs from what step 1 gives the caret section is written
+//    shown value differs from what step 1 gives the opened-on section is written
 //    as shown, and the paper code follows the resulting sides.
 // The dialog reacts by the same rule: after an orientation change or a paper
 // pick it shows step 1's result in every field the person has not changed, so
-// for the caret section OK writes exactly what the dialog shows, and to any
+// for the opened-on section OK writes exactly what the dialog shows, and to any
 // other section it adds only what the person changed.
 
 /// Writes one page field into a section.
@@ -312,7 +313,7 @@ fn picked(d: &Dialog) -> Option<Paper> {
     Paper::ALL.into_iter().find(|p| p.label() == pick)
 }
 
-/// Step 1 for the caret section, for an orientation and a pick.
+/// Step 1 for the opened-on section, for an orientation and a pick.
 fn automatic(d: &Dialog, landscape: bool, pick: Option<Paper>) -> SectionSetup {
     let mut s = SectionSetup::parse(&text_of(d, "caret_sect"));
     apply_automatic(&mut s, landscape != opened_landscape(d), landscape, pick);
@@ -330,7 +331,7 @@ fn apply_automatic(s: &mut SectionSetup, turn: bool, landscape: bool, pick: Opti
 }
 
 /// Whether the person changed a field: what the dialog shows is not what
-/// step 1 gives the caret section.
+/// step 1 gives the opened-on section.
 fn person_changed(d: &Dialog, auto: &SectionSetup, name: &str) -> bool {
     text_of(d, name).trim() != inches((field_of(name).1)(auto))
 }
@@ -748,7 +749,7 @@ pub(crate) fn after_columns_set(d: &mut Dialog, i: usize, _before: &Value) {
     }
 }
 
-/// The Columns dialog on the caret section's columns.
+/// The Columns dialog on the opened-on section's columns.
 pub(crate) fn columns_dialog(tab: &DocTab) -> Result<Dialog, String> {
     let (ed, pkg) = body_of(tab)?;
     let s = SectionSetup::parse(&dialog_raw(ed));

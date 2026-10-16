@@ -181,8 +181,8 @@
   the dialog says (Continuous for Columns, NextPage for Page Setup, whose
   Section start overrides the middle only when the person changed it). A
   selection edge at a paragraph edge cuts by the neighbouring paragraph's mark,
-  never an empty paragraph (except after a table before the text, which
-  cannot carry a sectPr); an edge already at the section's edge adds no
+  never an empty paragraph (except beside a table, before the text or
+  ending it, which cannot carry a sectPr); an edge already at the section's edge adds no
   break (and keeps the section's existing start type).
 - "Selected text" is offered, and the default, only when
   `selection_section_wrappable` (not a whole section, not across sections or in
