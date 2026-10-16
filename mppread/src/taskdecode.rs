@@ -135,28 +135,95 @@ const LEGACY_LINK: LinkLayout = LinkLayout {
 };
 
 /// Length of a `TBkndCons/FixedData` link record in every generation the
-/// task reader validates: predecessor UID `u32` at +4, successor UID `u32`
-/// at +8 and link type `u16` at +12 (MSPDI codes 0..=3), then the lag `i32`
-/// and LagFormat `u16` at +14/+18 in current Project and +16/+14 in MPP12
-/// and MPP9. The links decode into each successor's
+/// task reader validates: the link's own UID `u32` at +0, predecessor UID
+/// `u32` at +4, successor UID `u32` at +8 and link type `u16` at +12 (MSPDI
+/// codes 0..=3), then the lag `i32` and LagFormat `u16` at +14/+18 in
+/// current Project and +16/+14 in MPP12 and MPP9. The records
+/// [`link_records`] selects decode into each successor's
 /// [`MppTask::predecessors`].
 pub const LINK_RECORD_LEN: usize = 20;
+/// Length of a `TBkndCons/FixedMeta` entry in the same generations: the
+/// entry kind `u16` at +0 and the record's FixedData offset `u32` at +4.
+pub const LINK_META_STRIDE: usize = 10;
 
-fn links(cfb: &Cfb, prefix: &str, out: &mut [MppTask], layout: LinkLayout) -> Result<(), String> {
-    let cons_path = prefix.replace("TBkndTask/", "TBkndCons/FixedData");
-    let Some(cons) = cfb.read_path(&cons_path) else {
-        return Ok(());
-    };
-    if !cons.len().is_multiple_of(LINK_RECORD_LEN) {
+/// The link records of a `TBkndCons` table that are links, in index order.
+///
+/// `meta` is `TBkndCons/FixedMeta`: a 16-byte header (magic `ba ad df fa`,
+/// the entry count `u32` at +8), then [`LINK_META_STRIDE`]-byte entries of
+/// which only the first `count` index the table. Kind 0 is a live link and
+/// kind 2 a deleted one, skipped as in the task index; another kind, an
+/// offset that is not a whole [`LINK_RECORD_LEN`]-byte record inside `data`
+/// or a record indexed twice is refused. A FixedData record no counted entry
+/// names is not read: when a link is deleted Project can leave its record
+/// behind, blanked to its own link UID at +0 or still holding the old
+/// endpoints, and keep stale entries past the count. Without a FixedMeta (a
+/// table built by hand) every record is read.
+///
+/// Either way a blank record, both endpoint UIDs 0, is a deleted link and is
+/// skipped. A record with exactly one endpoint UID 0 is refused: UID 0 is the
+/// project summary, which no link can reach.
+pub fn link_records<'a>(
+    meta: Option<&[u8]>,
+    data: &'a [u8],
+) -> Result<Vec<&'a [u8; LINK_RECORD_LEN]>, String> {
+    if !data.len().is_multiple_of(LINK_RECORD_LEN) {
         return Err("link record length mismatch".into());
     }
+    let records: Vec<&[u8; LINK_RECORD_LEN]> = match meta {
+        None => data.as_chunks::<LINK_RECORD_LEN>().0.iter().collect(),
+        Some(meta) => {
+            if meta.len() < 16 || meta[..4] != [0xba, 0xad, 0xdf, 0xfa] {
+                return Err("invalid link FixedMeta header".into());
+            }
+            let count = u32_at(meta, 8) as usize;
+            let slots = (meta.len() - 16) / LINK_META_STRIDE;
+            if !(meta.len() - 16).is_multiple_of(LINK_META_STRIDE) || count > slots {
+                return Err("link FixedMeta count or length mismatch".into());
+            }
+            let mut indexed = HashSet::new();
+            let mut records = Vec::new();
+            for i in 0..count {
+                let entry = &meta[16 + i * LINK_META_STRIDE..16 + (i + 1) * LINK_META_STRIDE];
+                match u16_at(entry, 0) {
+                    0 => {}
+                    2 => continue,
+                    kind => return Err(format!("unrecognized link FixedMeta kind {kind}")),
+                }
+                let offset = u32_at(entry, 4) as usize;
+                if !offset.is_multiple_of(LINK_RECORD_LEN)
+                    || offset >= data.len()
+                    || !indexed.insert(offset)
+                {
+                    return Err(format!(
+                        "link FixedMeta entry {i} does not index a record of its own"
+                    ));
+                }
+                records.push(data[offset..offset + LINK_RECORD_LEN].try_into().unwrap());
+            }
+            records
+        }
+    };
+    let mut links = Vec::with_capacity(records.len());
+    for rec in records {
+        match (u32_at(rec, 4), u32_at(rec, 8)) {
+            (0, 0) => {}
+            (0, _) | (_, 0) => return Err("link endpoint UID 0 is the project summary".into()),
+            _ => links.push(rec),
+        }
+    }
+    Ok(links)
+}
+
+fn links(cfb: &Cfb, prefix: &str, out: &mut [MppTask], layout: LinkLayout) -> Result<(), String> {
+    let cons = prefix.replace("TBkndTask/", "TBkndCons/");
+    let Some(data) = cfb.read_path(&format!("{cons}FixedData")) else {
+        return Ok(());
+    };
+    let meta = cfb.read_path(&format!("{cons}FixedMeta"));
     let positions: HashMap<_, _> = out.iter().enumerate().map(|(i, t)| (t.uid, i)).collect();
-    for rec in cons.as_chunks::<LINK_RECORD_LEN>().0 {
+    for rec in link_records(meta.as_deref(), &data)? {
         let pred_uid = u32_at(rec, 4);
         let succ_uid = u32_at(rec, 8);
-        if pred_uid == 0 || succ_uid == 0 {
-            return Err("link endpoint UID 0 is the project summary".into());
-        }
         let kind = u16_at(rec, 12);
         let lag = i32::from_le_bytes(rec[layout.lag..layout.lag + 4].try_into().unwrap());
         let format = u16_at(rec, layout.format);
@@ -1034,6 +1101,8 @@ mod tests {
         vm: Vec<u8>,
         v2: Vec<u8>,
         cons: Vec<u8>,
+        /// `TBkndCons/FixedMeta`, absent when `None`.
+        cons_meta: Option<Vec<u8>>,
         f2m: Vec<u8>,
         f2d: Vec<u8>,
         props: Vec<u8>,
@@ -1085,6 +1154,7 @@ mod tests {
             vm,
             v2,
             cons: Vec::new(),
+            cons_meta: None,
             f2m,
             f2d,
             props: props(&[0, 0]),
@@ -1123,7 +1193,7 @@ mod tests {
                             Node::Stream("Var2Data", s.v2.clone()),
                         ],
                     ),
-                    Node::Storage("TBkndCons", vec![Node::Stream("FixedData", s.cons.clone())]),
+                    cons_storage(s),
                 ],
             ),
         ])
@@ -1304,7 +1374,7 @@ mod tests {
             vec![
                 Node::Stream("Props", s.props.clone()),
                 Node::Storage("TBkndTask", task),
-                Node::Storage("TBkndCons", vec![Node::Stream("FixedData", s.cons.clone())]),
+                cons_storage(s),
             ],
         )])
     }
@@ -1362,7 +1432,7 @@ mod tests {
                         Node::Stream("Fixed2Data", s.f2d.clone()),
                     ],
                 ),
-                Node::Storage("TBkndCons", vec![Node::Stream("FixedData", s.cons.clone())]),
+                cons_storage(s),
                 Node::Storage(
                     "TBkndCal",
                     vec![
@@ -2541,5 +2611,119 @@ mod tests {
         r[12..14].copy_from_slice(&1u16.to_le_bytes());
         r[18..20].copy_from_slice(&format.to_le_bytes());
         r
+    }
+    /// A deleted link's record as Project 2024 leaves it: the link's own UID
+    /// at +0, then zeros (no endpoints, type, lag or format).
+    fn blank_link(link_uid: u32) -> Vec<u8> {
+        let mut r = vec![0u8; 20];
+        r[..4].copy_from_slice(&link_uid.to_le_bytes());
+        r
+    }
+    /// A `TBkndCons/FixedMeta`: `count` in the header, then one entry per
+    /// `(kind, offset)`, those past the count included.
+    fn link_meta(count: u32, entries: &[(u16, u32)]) -> Vec<u8> {
+        let mut meta = vec![0xba, 0xad, 0xdf, 0xfa, 4, 0, 0, 0];
+        meta.extend_from_slice(&count.to_le_bytes());
+        meta.extend_from_slice(&[0; 4]);
+        for &(kind, offset) in entries {
+            meta.extend_from_slice(&kind.to_le_bytes());
+            meta.extend_from_slice(&[0; 2]);
+            meta.extend_from_slice(&offset.to_le_bytes());
+            meta.extend_from_slice(&[0xdd, 0]);
+        }
+        meta
+    }
+    fn cons_storage(s: &Streams) -> Node<'static> {
+        let mut streams = vec![Node::Stream("FixedData", s.cons.clone())];
+        if let Some(meta) = &s.cons_meta {
+            streams.push(Node::Stream("FixedMeta", meta.clone()));
+        }
+        Node::Storage("TBkndCons", streams)
+    }
+    const FS_DAYS: MppPred = MppPred {
+        pred_uid: 1,
+        kind: 1,
+        lag: 0,
+        lag_format: 7,
+    };
+
+    #[test]
+    fn blank_link_records_are_skipped_but_one_zero_endpoint_is_refused() {
+        // Without a FixedMeta every record is read; a blank one (both
+        // endpoints 0, here with and without its link UID) is a deleted link.
+        let mut s = fixture();
+        s.cons = [blank_link(3), link(1, 1, 7), vec![0; 20]].concat();
+        let tasks = decode(&file(&s, true)).unwrap();
+        assert_eq!(tasks[1].predecessors, [FS_DAYS]);
+        for (pred, succ) in [(0, 1), (1, 0)] {
+            let mut s = fixture();
+            s.cons = [blank_link(3), link(pred, succ, 7)].concat();
+            let error = decode(&file(&s, true)).unwrap_err();
+            assert!(error.contains("UID 0 is the project summary"), "{error}");
+        }
+    }
+
+    #[test]
+    fn link_fixedmeta_counted_entries_index_the_live_links() {
+        // As Project 2024 leaves a plan whose links were deleted: a blanked
+        // record (0) and a stale one still naming old endpoints (20, an
+        // unknown UID 9 here) that no entry indexes, a deleted (kind 2)
+        // entry (80), and stale entries past the count.
+        let mut s = fixture();
+        s.cons = [
+            blank_link(3),
+            link(9, 1, 7),
+            link(1, 1, 7),
+            blank_link(4),
+            link(9, 1, 7),
+        ]
+        .concat();
+        s.cons_meta = Some(link_meta(2, &[(0, 40), (2, 80), (0, 40), (2, 60)]));
+        assert_eq!(decode(&file(&s, true)).unwrap()[1].predecessors, [FS_DAYS]);
+        // A counted entry indexing a blank record reads it as deleted too.
+        s.cons_meta = Some(link_meta(2, &[(0, 0), (0, 40)]));
+        assert_eq!(decode(&file(&s, true)).unwrap()[1].predecessors, [FS_DAYS]);
+        s.cons_meta = Some(link_meta(0, &[(0, 40)]));
+        assert!(decode(&file(&s, true)).unwrap()[1].predecessors.is_empty());
+        let mut torn = link_meta(1, &[(0, 40)]);
+        torn.push(0);
+        let mut magic = link_meta(1, &[(0, 40)]);
+        magic[0] = 0;
+        for (meta, why) in [
+            (link_meta(2, &[(0, 40)]), "count past the entries"),
+            (torn, "a partial entry"),
+            (magic, "bad magic"),
+            (link_meta(1, &[(4, 40)]), "unrecognized kind"),
+            (link_meta(1, &[(0, 50)]), "offset inside a record"),
+            (link_meta(1, &[(0, 100)]), "offset past FixedData"),
+            (link_meta(2, &[(0, 40), (0, 40)]), "a record indexed twice"),
+            (link_meta(1, &[(0, 20)]), "a live link to an unknown UID"),
+        ] {
+            s.cons_meta = Some(meta);
+            assert!(decode(&file(&s, true)).is_err(), "{why}");
+        }
+        s.cons = [blank_link(3), link(0, 1, 7)].concat();
+        s.cons_meta = Some(link_meta(1, &[(0, 20)]));
+        reject(&s); // an indexed link with one endpoint UID 0
+    }
+
+    #[test]
+    fn mpp12_links_skip_blank_and_unindexed_records_too() {
+        // MPP12 and MPP9 read TBkndCons through the same `link_records`.
+        let mut s = mpp12_fixture();
+        let mut live = vec![0u8; 20];
+        live[4..8].copy_from_slice(&42u32.to_le_bytes());
+        live[8..12].copy_from_slice(&42u32.to_le_bytes());
+        live[12..14].copy_from_slice(&1u16.to_le_bytes());
+        live[14..16].copy_from_slice(&7u16.to_le_bytes());
+        let mut stale = live.clone();
+        stale[4..8].copy_from_slice(&9u32.to_le_bytes());
+        s.cons = [blank_link(1), live, stale].concat();
+        let error = decode(&mpp12_file(&s)).unwrap_err();
+        assert!(error.contains("unknown UID 9"), "{error}"); // no FixedMeta
+        s.cons_meta = Some(link_meta(1, &[(0, 20), (0, 40)]));
+        let tasks = decode(&mpp12_file(&s)).unwrap();
+        assert_eq!(tasks[1].predecessors.len(), 1);
+        assert_eq!(tasks[1].predecessors[0].pred_uid, 42);
     }
 }

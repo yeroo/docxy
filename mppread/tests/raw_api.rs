@@ -142,12 +142,14 @@ fn walk(path: &Path, seen: &mut Seen) {
         assert_eq!(names[&task.uid], task.name, "{at}: UID {}", task.uid);
     }
 
-    // TBkndCons: one 20-byte record per predecessor link, on its successor.
+    // TBkndCons: one 20-byte record per predecessor link FixedMeta indexes,
+    // on its successor.
     let cons = stream(&cfb, "TBkndCons", "FixedData").unwrap_or_default();
-    assert_eq!(cons.len() % raw::LINK_RECORD_LEN, 0, "{at}");
+    let cons_meta = stream(&cfb, "TBkndCons", "FixedMeta");
+    let records = raw::link_records(cons_meta.as_deref(), &cons).unwrap();
     let by_uid: HashMap<u32, &mppread::mpp::MppTask> =
         table.tasks.iter().map(|t| (t.uid, t)).collect();
-    for rec in cons.chunks(raw::LINK_RECORD_LEN) {
+    for &rec in &records {
         let (pred, succ) = (raw::u32_at(rec, 4), raw::u32_at(rec, 8));
         assert!(
             by_uid[&succ]
@@ -157,7 +159,7 @@ fn walk(path: &Path, seen: &mut Seen) {
             "{at}: link {pred} -> {succ}"
         );
     }
-    let links = cons.len() / raw::LINK_RECORD_LEN;
+    let links = records.len();
     let decoded: usize = table.tasks.iter().map(|t| t.predecessors.len()).sum();
     let kept: usize = project.tasks.iter().map(|t| t.predecessors.len()).sum();
     assert_eq!((decoded, kept), (links, links), "{at}: links");
