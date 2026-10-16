@@ -92,9 +92,14 @@ fn walk_barred(items: &[Inline], out: &mut Vec<bool>, depth: &mut i32, in_link: 
                 out.resize(out.len() + inline_len(item), *depth > 0 || in_link);
             }
             Inline::Hyperlink(h) if !h.content.is_empty() => {
+                out.resize(out.len() + link_runs_len(h), true);
                 walk_barred(&h.content, out, depth, true)
             }
-            Inline::Revision { content, .. } => walk_barred(content, out, depth, in_link),
+            // Zero-width in the editor ([`inline_len`]): its fields still
+            // open and close, but it adds no chars to flag.
+            Inline::Revision { content, .. } => {
+                walk_barred(content, &mut Vec::new(), depth, in_link)
+            }
             _ => {
                 let barred = *depth > 0 || in_link || matches!(item, Inline::Hyperlink(_));
                 out.resize(out.len() + inline_len(item), barred);
@@ -2894,6 +2899,9 @@ impl Editor {
                 continue;
             }
             let text: Vec<char> = editor_text(&p.content).chars().collect();
+            // One flag per editor char; a mismatch is a bug, and the
+            // paragraph is then left alone rather than guessed at.
+            debug_assert_eq!(barred.len(), text.len(), "walk_barred out of step");
             if barred.len() != text.len() {
                 continue;
             }

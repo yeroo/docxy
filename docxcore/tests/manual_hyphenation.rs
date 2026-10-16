@@ -181,3 +181,29 @@ fn a_word_in_a_hyperlink_is_not_found_and_the_link_is_untouched() {
     let xml = document_to_xml(&ed.doc);
     assert_eq!(xml.matches("<w:hyperlink").count(), 1, "{xml}");
 }
+
+#[test]
+fn a_tracked_change_does_not_hide_the_words_around_it() {
+    let ed = editor(
+        "<w:p><w:r><w:t xml:space=\"preserve\">computer </w:t></w:r>\
+         <w:ins w:id=\"1\" w:author=\"a\"><w:r><w:t>inserted</w:t></w:r></w:ins>\
+         <w:del w:id=\"2\" w:author=\"a\"><w:r><w:delText>deleted</w:delText></w:r></w:del>\
+         <w:r><w:t xml:space=\"preserve\"> wanted</w:t></w:r></w:p>",
+    );
+    assert_eq!(words(&ed, true), ["computer", "wanted"]);
+}
+
+#[test]
+fn a_field_opened_inside_a_tracked_change_still_bars_what_follows() {
+    // The begin sits in an insertion, the end after the next word: the word
+    // between is a field result.
+    let ed = editor(
+        "<w:p><w:ins w:id=\"1\" w:author=\"a\"><w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+         <w:r><w:instrText xml:space=\"preserve\"> TOC </w:instrText></w:r>\
+         <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r></w:ins>\
+         <w:r><w:t xml:space=\"preserve\">hyphenation </w:t></w:r>\
+         <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>\
+         <w:r><w:t xml:space=\"preserve\"> computer</w:t></w:r></w:p>",
+    );
+    assert_eq!(words(&ed, true), ["computer"]);
+}
