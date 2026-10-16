@@ -148,12 +148,100 @@ test a document cut with nothing selected leaves the document clean
   key ctrl+x
   assert dirty is false
 
+# #1248: a sheet copy carries an HTML table beside its text, and a paste reads
+# another app's HTML table.
+test a sheet copy puts an HTML table with its formatting beside the text
+  open ../fixtures/basic.xlsx
+  click A1
+  key ctrl+b
+  click B2 shift
+  key ctrl+c
+  call clipboard {"action":"read"}
+  assert reply.html_bold is Region
+  assert reply.app.kind is grid
+  click D8
+  key ctrl+v
+  assert cell D8 is Region
+
+test another app's HTML table pastes its cells
+  open ../fixtures/basic.xlsx
+  call clipboard {"action":"write","text":"x\ty\n","html":"<table><tr><td>7</td><td colspan=2>a &amp; b</td><td>z</td></tr><tr><td>9</td></tr></table>"}
+  assert reply.app.kind is none
+  click D8
+  key ctrl+v
+  assert cell D8 is 7
+  assert cell E8 is a & b
+  assert cell F8 is nothing
+  assert cell G8 is z
+  assert cell D9 is 9
+
+test an HTML table with no text beside it pastes
+  open ../fixtures/basic.xlsx
+  call clipboard {"action":"write","text":"","html":"<table><tr><td>5</td><td>6</td></tr></table>"}
+  click D8
+  key ctrl+v
+  assert cell D8 is 5
+  assert cell E8 is 6
+
+test another app's RTF table pastes its cells
+  open ../fixtures/basic.xlsx
+  call clipboard {"action":"write","text":"x","rtf":"{\\rtf1\\trowd\\cellx1000\\cellx2000 1\\cell 2\\cell \\row}"}
+  click D8
+  key ctrl+v
+  assert cell D8 is 1
+  assert cell E8 is 2
+
+test text another window copied as docxy pastes as its exact text, not its table
+  # The HTML says 007; the TSV beside it says '007, which keeps it text.
+  open ../fixtures/basic.xlsx
+  click M50
+  type '007
+  key enter
+  click M50
+  key ctrl+c
+  call window-new {}
+  open ../fixtures/basic.xlsx
+  click D8
+  key ctrl+v
+  assert cell D8 is 007
+
+test a copy that is a table and a paragraph pastes as text
+  open ../fixtures/basic.xlsx
+  call clipboard {"action":"write","text":"Title\n1\t2\nafter\n","html":"<h1>Title</h1><table><tr><td>1</td><td>2</td></tr></table><p>after</p>"}
+  click D8
+  key ctrl+v
+  assert cell D8 is Title
+  assert cell D9 is 1
+  assert cell E9 is 2
+  assert cell D10 is after
+
+test text before a table pastes as text
+  open ../fixtures/basic.xlsx
+  call clipboard {"action":"write","text":"Intro\n1\t2\n","html":"Intro<table><tr><td>1</td><td>2</td></tr></table>"}
+  click D8
+  key ctrl+v
+  assert cell D8 is Intro
+  assert cell D9 is 1
+  assert cell E9 is 2
+
+test text copied after a sheet copy leaves no HTML behind
+  open ../fixtures/basic.xlsx
+  click A1
+  key ctrl+c
+  call clipboard {"action":"write","text":"7","html":"<table><tr><td>1</td></tr></table>"}
+  call clipboard {"action":"write","text":"8"}
+  assert reply.html is nothing
+  click D8
+  key ctrl+v
+  assert cell D8 is 8
+
 test the clipboard verb refuses what it does not do
   open ../fixtures/basic.xlsx
   call-error clipboard {"action":"paste-special"} => press the app's own key (key ctrl+alt+v)
   call-error clipboard {"action":"copy"} => press the app's own key
   call-error clipboard {"action":"write"} => text
   call-error clipboard {"action":"write","text":"x","rtf":1} => 'rtf' must be a string
+  call-error clipboard {"action":"write","text":"x","html":1} => 'html' must be a string
   call-error clipboard {"action":"shuffle"} => unknown clipboard action
 
 # #664: Excel's sheet clipboard. Each case builds the issue's book in an

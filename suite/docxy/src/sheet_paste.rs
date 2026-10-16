@@ -108,18 +108,25 @@ impl SheetView {
     /// lands in at `at` ([`gridcore::entry::paste_cell`]), as a text paste
     /// reads it.
     pub(crate) fn text_block(&mut self, text: &str, at: (u32, u32)) -> Vec<Vec<Cell>> {
+        let rows: Vec<Vec<String>> = text
+            .replace("\r\n", "\n")
+            .trim_end_matches('\n')
+            .split('\n')
+            .map(|line| line.split('\t').map(str::to_string).collect())
+            .collect();
+        self.fields_block(&rows, at)
+    }
+
+    /// Rows of fields (a TSV's, or an HTML or RTF table's cell texts, #1248)
+    /// as a copy: each read as typed into the cell it lands in at `at`.
+    pub(crate) fn fields_block(&mut self, rows: &[Vec<String>], at: (u32, u32)) -> Vec<Vec<Cell>> {
         let s = self.active;
         let ctx = gridcore::entry::entry_ctx(&self.pkg.workbook, self.engine.clock);
         let wb = &mut self.pkg.workbook;
         let mut block = Vec::new();
-        for (dr, line) in text
-            .replace("\r\n", "\n")
-            .trim_end_matches('\n')
-            .split('\n')
-            .enumerate()
-        {
+        for (dr, line) in rows.iter().enumerate() {
             let mut row = Vec::new();
-            for (dc, f) in line.split('\t').enumerate() {
+            for (dc, f) in line.iter().enumerate() {
                 let style = wb.sheets[s]
                     .cell(at.0 + dr as u32, at.1 + dc as u32)
                     .map_or(0, |cl| cl.style);

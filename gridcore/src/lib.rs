@@ -49,6 +49,7 @@ pub mod autocorrect;
 pub mod calc;
 pub mod cf;
 pub mod circular;
+pub mod clip_html;
 pub mod clock;
 pub mod codepage;
 pub mod comments;

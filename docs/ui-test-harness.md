@@ -917,8 +917,8 @@ pointer on a few pixels, each driven through the app's own handlers (#699).
 | `hf-insert-picture {"path":"logo.png"}` | Header & Footer › Pictures… without the native dialog (#768): the picture at `path` goes to the same insert the dialog's answer feeds, at the caret of the open header or footer, related from that part's own rels. A relative path resolves against the tab's folder. The reply is `{status}`; with no header or footer open, in Protected View, or for a file that is not a PNG, JPEG, GIF or BMP, nothing is inserted and the verb is refused |
 | `save-as {"path":"out.md"}` | Save As the active tab to `path` without the native dialog: the path goes to the same save function the dialog's answer feeds (`save_doc_to`, `save_sheet_as`, `save_project_to`), and the tab is rebound (title, path, clean, a document's Markdown flag) exactly as after a dialog Save As. Optional `format` and `overwrite` |
 | `new-from-template {"path":"Letter.dotx"}` | File › New › Personal templates without the click (#636): a new, untitled document from the `.dotx`/`.dotm` at `path` (a relative one resolves against the active tab's folder and is refused when that tab was never saved), the way opening a template makes one. Replies `{path: null, title, dirty, status}`; a file that is not a Word template, or one that will not load, opens nothing and is refused |
-| `clipboard {"action":"read"}` | the clipboard's text, its RTF (`rtf`, null without one) and the text of that RTF's bold runs (`rtf_bold`, #1074), and what the active tab's paste would use |
-| `clipboard {"action":"write","text":"a\tb\n"}` | put text on the clipboard, as another app's copy would; an optional `rtf` goes beside it, as a rich copy's does (#1074). A write without `rtf` leaves none |
+| `clipboard {"action":"read"}` | the clipboard's text, its RTF (`rtf`, null without one) and the text of that RTF's bold runs (`rtf_bold`, #1074), its HTML table (`html`, null without one) and the texts of that table's bold cells (`html_bold`, #1248), and what the active tab's paste would use |
+| `clipboard {"action":"write","text":"a\tb\n"}` | put text on the clipboard, as another app's copy would; an optional `rtf` goes beside it, as a rich copy's does (#1074). An optional `html` (a table fragment) goes beside it too, as a sheet copy's does (#1248). A write without `rtf` or `html` leaves none |
 | `fill-drag {"from":"B4:B5","to":"B8"}` | press the fill handle, cross each cell to `to`, release. Optional `from`, `option`, `ctrl`, `right`, `double` (#668) |
 | `border-drag {"from":"B2:B3","to":"J2"}` | press the selection's edge, drop the block with its top-left on `to` (#670). Optional `from`, `ctrl`, `right`, `choice`, `replace` |
 | `office-clipboard {"action":"open"}` | the Office Clipboard pane's own handlers (#669): `read` (the default), `open`, `close`, `paste` item `index`, `paste-all`, `clear-all`, `delete` item `index`. Replies `{open, items, state}`. It collects sheet copies and cuts only, not a document's |
@@ -967,7 +967,9 @@ active tab's paste would take besides it: `{kind: "doc", text}` (a document's
 copied runs, formatting intact) or `{kind: "grid", text, rows, cols}` (the
 sheet's copied cells), each kept while the clipboard still holds the text that
 copy wrote, or holds no item at all; or `{kind: "none"}`, when a document,
-sheet or Project paste takes `text` (#755). A copy with no text in it (an
+sheet or Project paste takes `text` (#755). In a sheet, `none` also means a
+paste takes another app's HTML table (`html`), else its RTF table, else
+`text`, an HTML-only copy (no `text`) included (#1248). A copy with no text in it (an
 image, an empty copy) is newer than either clip too: `text` is `null`, `app`
 is `none`, and a paste does nothing. The exception is a document copy of only
 an image, whose own text is empty: its clip stays ours.

@@ -3417,6 +3417,9 @@ fn resolve_commands(
 /// holds its text (`clip_still_ours`) and copy mode is on
 /// (`GridClip::live`); otherwise `none`, and a paste takes the RTF (a
 /// document's) or `text` (or, over a spent grid clip's own text, nothing).
+/// In a sheet, `none` also covers another app's HTML table, else its RTF
+/// table, which a paste takes before `text` (#1248), an HTML-only copy
+/// included.
 /// `rich` is whether the clipboard holds an RTF.
 fn clipboard_app_json(
     surface: Option<&crate::Surface>,
@@ -3453,11 +3456,13 @@ fn clipboard_app_json(
 }
 
 /// The `clipboard` reply: the clipboard's text (the harness's private one),
-/// its RTF and the text of the RTF's bold runs (#1074), and what the active
-/// tab's paste would use.
+/// its RTF and the text of the RTF's bold runs (#1074), its HTML table and
+/// the texts of that table's bold cells (#1248), and what the active tab's
+/// paste would use.
 fn clipboard_json(app: &crate::Docxy, cx: &App) -> Json {
     let now = app.clipboard_read(cx);
     let rtf = app.clipboard_read_rtf();
+    let html = app.clipboard_read_html();
     let surface = app.tabs.get(app.active).map(|t| &t.surface);
     // A grid clip whose workbook was edited since is over (#664).
     let used = clipboard_app_json(
@@ -3478,8 +3483,35 @@ fn clipboard_json(app: &crate::Docxy, cx: &App) -> Json {
             str_or_null(rtf.map(|r| String::from_utf8_lossy(&r).into_owned())),
         ),
         ("rtf_bold", str_or_null(bold)),
+        ("html", str_or_null(html.clone())),
+        ("html_bold", str_or_null(html.map(|h| html_bold_text(&h)))),
         ("app", used),
     ])
+}
+
+/// The texts of an HTML table's bold cells (a `<td>` or `<th>` whose style
+/// says `font-weight` 700 or bold), in order, one per line: what the table
+/// pastes as bold (#1248).
+fn html_bold_text(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(i) = lower[at..].find("<t").map(|n| at + n) {
+        let Some(open_end) = lower[i..].find('>').map(|n| i + n) else {
+            break;
+        };
+        at = open_end + 1;
+        let tag = lower[i..open_end].replace(' ', "");
+        let cell = tag.starts_with("<td") || tag.starts_with("<th");
+        if cell && (tag.contains("font-weight:700") || tag.contains("font-weight:bold")) {
+            let close = lower[at..].find("</t").map_or(lower.len(), |n| at + n);
+            let table = format!("<table><tr><td>{}</td></tr></table>", &html[at..close]);
+            if let Some(rows) = gridcore::clip_html::parse_html_table(&table) {
+                out.push(rows[0][0].clone());
+            }
+        }
+    }
+    out.join("\n")
 }
 
 /// The text of `clip`'s bold runs, in order, each paragraph's on a line of
@@ -5925,8 +5957,8 @@ fn dispatch_verb(
         }
         // The clipboard (#699). A harness instance has a private one (it starts
         // empty and never touches the OS clipboard); `write` puts text on it
-        // as another app's copy would, with an optional `rtf` beside it as a
-        // rich copy has (#1074). Copy, cut and paste are the app's own keys
+        // as another app's copy would, with an optional `rtf` (#1074) and
+        // `html` table (#1248) beside it as a rich copy has. Copy, cut and paste are the app's own keys
         // and buttons (`key ctrl+c`, `ribbon-click`), not a second route.
         "clipboard" => {
             match arg_str(args, "action")? {
@@ -5938,9 +5970,17 @@ fn dispatch_verb(
                         Some(Json::Str(rtf)) => Some(rtf.clone()),
                         Some(_) => return Err("'rtf' must be a string".into()),
                     };
+                    let html = match args.get("html") {
+                        None | Some(Json::Null) => None,
+                        Some(Json::Str(html)) => Some(html.clone()),
+                        Some(_) => return Err("'html' must be a string".into()),
+                    };
                     app.clipboard_write(text.clone(), cx);
                     if let Some(rtf) = rtf {
                         app.clipboard_write_rtf(rtf, &text);
+                    }
+                    if let Some(html) = html {
+                        app.clipboard_write_html(html, &text);
                     }
                 }
                 "paste-special" => {
@@ -6535,6 +6575,18 @@ fn capture(_app: &crate::Docxy, _window: &mut Window) -> Result<Done, String> {
 
 #[cfg(test)]
 mod tests {
+    /// #1248: a bold cell with non-ASCII text reads back (and does not panic).
+    #[test]
+    fn the_bold_cells_of_a_table_are_read_with_non_ascii_text() {
+        let html = "<table><tr><td style='font-weight:700'>M\u{fc}ller \u{20ac}</td>\
+            <td>\u{e9}</td><th style=\"font-weight: bold\">\u{4e2d}</th></tr></table>";
+        assert_eq!(
+            super::html_bold_text(html),
+            "M\u{fc}ller \u{20ac}\n\u{4e2d}"
+        );
+        assert_eq!(super::html_bold_text("<p>\u{e9}</p>"), "");
+    }
+
     use super::*;
 
     use docxcore::model::{Block, Document, ParProps, Paragraph, Run, RunProps, Spacing};
