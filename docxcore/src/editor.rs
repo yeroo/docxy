@@ -70,6 +70,39 @@ pub struct HyphenCandidate {
     pub point: usize,
 }
 
+/// For each editor char of `items`, whether Manual hyphenation must leave it
+/// alone (#1266): it is in a hyperlink, or between a complex field's begin
+/// and end (`depth` open fields on entry, updated). Appends one flag per char.
+fn walk_barred(items: &[Inline], out: &mut Vec<bool>, depth: &mut i32, in_link: bool) {
+    use crate::field::{FieldEvent, field_events};
+    let mut step = |raw: &str, depth: &mut i32| {
+        for e in field_events(raw) {
+            match e {
+                FieldEvent::Begin => *depth += 1,
+                FieldEvent::End => *depth = (*depth - 1).max(0),
+                _ => {}
+            }
+        }
+    };
+    for item in items {
+        match item {
+            Inline::Raw(raw) if crate::load::is_field_code_raw(raw) => step(raw, depth),
+            Inline::UnsupportedRevision { raw, .. } => {
+                step(raw, depth);
+                out.resize(out.len() + inline_len(item), *depth > 0 || in_link);
+            }
+            Inline::Hyperlink(h) if !h.content.is_empty() => {
+                walk_barred(&h.content, out, depth, true)
+            }
+            Inline::Revision { content, .. } => walk_barred(content, out, depth, in_link),
+            _ => {
+                let barred = *depth > 0 || in_link || matches!(item, Inline::Hyperlink(_));
+                out.resize(out.len() + inline_len(item), barred);
+            }
+        }
+    }
+}
+
 fn para_text_len_at(body: &[Block], path: &[usize]) -> usize {
     resolve_para(body, path).map_or(0, para_text_len)
 }
@@ -2823,8 +2856,12 @@ impl Editor {
     /// with no hyphen, digit or apostrophe around it, no field or object
     /// stuck to it and, unless `caps`, not in capitals; and with a point
     /// ([`crate::hyphenate::proposed_point`]). A word already holding an
-    /// optional hyphen is one token with it, so it never qualifies. Field
-    /// results are not editor text, so a word inside one is never found.
+    /// optional hyphen is one token with it, so it never qualifies. A word
+    /// touching a field (a collapsed field is not editor text, but a loose
+    /// one, a TOC's, keeps its result as editable text between zero-width
+    /// markers, possibly across paragraphs) or a hyperlink is never found: a
+    /// hyphen in a result is lost when the field updates, and inserting one
+    /// in a link would split it.
     pub fn next_hyphen_candidate(
         &self,
         from: (&[usize], usize),
@@ -2844,11 +2881,22 @@ impl Editor {
                     '-' | '\u{2011}' | '\u{ad}' | '\'' | '\u{2019}' | '_' | FIELD_CHAR
                 )
         };
-        for (k, path) in paths.iter().enumerate().take(last + 1).skip(first) {
+        // Field nesting is carried from paragraph to paragraph of a container.
+        let mut depths: std::collections::HashMap<&[usize], i32> = Default::default();
+        for (k, path) in paths.iter().enumerate().take(last + 1) {
             let Some(p) = resolve_para(&self.doc.body, path) else {
                 continue;
             };
+            let depth = depths.entry(&path[..path.len() - 1]).or_insert(0);
+            let mut barred = Vec::new();
+            walk_barred(&p.content, &mut barred, depth, false);
+            if k < first {
+                continue;
+            }
             let text: Vec<char> = editor_text(&p.content).chars().collect();
+            if barred.len() != text.len() {
+                continue;
+            }
             let floor = if k == first { from.1 } else { 0 };
             let ceil = match to {
                 Some((_, off)) if k == last => off,
@@ -2864,7 +2912,7 @@ impl Editor {
                 while i < text.len() && joins(text[i]) {
                     i += 1;
                 }
-                if start < floor || i > ceil {
+                if start < floor || i > ceil || barred[start..i].iter().any(|&b| b) {
                     continue;
                 }
                 let word: String = text[start..i].iter().collect();

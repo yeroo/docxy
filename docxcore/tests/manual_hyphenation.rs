@@ -145,3 +145,39 @@ fn an_offset_past_the_paragraph_inserts_nothing() {
     assert!(!ed.insert_soft_hyphen(&[7], 0));
     assert_eq!(text(&ed, 0), "computer");
 }
+
+#[test]
+fn a_loose_field_result_across_paragraphs_is_not_found() {
+    // A TOC-shaped field: begin in one paragraph, end in another, its result
+    // (editable text) between them.
+    let ed = editor(
+        "<w:p><w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+         <w:r><w:instrText xml:space=\"preserve\"> TOC \\o </w:instrText></w:r>\
+         <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+         <w:r><w:t>hyphenation</w:t></w:r></w:p>\
+         <w:p><w:r><w:t>computer</w:t></w:r></w:p>\
+         <w:p><w:r><w:fldChar w:fldCharType=\"end\"/></w:r>\
+         <w:r><w:t xml:space=\"preserve\"> wanted</w:t></w:r></w:p>\
+         <w:p><w:r><w:t>beautiful</w:t></w:r></w:p>",
+    );
+    let mut at = (vec![0], 0);
+    let mut found = Vec::new();
+    while let Some(c) = ed.next_hyphen_candidate((&at.0, at.1), None, true) {
+        found.push(c.word.clone());
+        at = (c.path, c.end);
+    }
+    assert_eq!(found, ["wanted", "beautiful"]);
+}
+
+#[test]
+fn a_word_in_a_hyperlink_is_not_found_and_the_link_is_untouched() {
+    let mut ed = editor(
+        "<w:p><w:hyperlink w:anchor=\"x\"><w:r><w:t>hyphenation</w:t></w:r></w:hyperlink>\
+         <w:r><w:t xml:space=\"preserve\"> computer</w:t></w:r></w:p>",
+    );
+    assert_eq!(words(&ed, true), ["computer"]);
+    let c = ed.next_hyphen_candidate((P0, 0), None, true).unwrap();
+    assert!(ed.insert_soft_hyphen(&c.path, c.start + c.point));
+    let xml = document_to_xml(&ed.doc);
+    assert_eq!(xml.matches("<w:hyperlink").count(), 1, "{xml}");
+}

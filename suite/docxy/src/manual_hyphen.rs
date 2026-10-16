@@ -140,6 +140,11 @@ pub(crate) fn start(tab: &mut DocTab) -> Result<(), String> {
     if tab.access.locked() {
         return Err(tab.access.locked_status().into());
     }
+    // The header or footer being edited has its own editor; the walk reads
+    // the body.
+    if tab.hf_edit.is_some() {
+        return Err("Close the header or footer first".into());
+    }
     let (ed, _) = editor(tab)?;
     let (from, to) = match ed.selection_range() {
         Some((lo, hi)) => ((lo.path, lo.offset), Some((hi.path, hi.offset))),
@@ -157,15 +162,37 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
         return None;
     }
     let want = button.replace('&', "");
+    let Some(b) = top
+        .buttons
+        .iter()
+        .find(|b| b.label.replace('&', "").eq_ignore_ascii_case(want.trim()))
+    else {
+        let labels: Vec<&str> = top.buttons.iter().map(|b| b.label.as_str()).collect();
+        return Some(Err(format!(
+            "no button '{button}'; buttons: {}",
+            labels.join(", ")
+        )));
+    };
+    if !b.enabled {
+        return None;
+    }
+    // Yes accepts, No is the Apply button, and only the Cancel one stops.
+    let role = b.role;
     let to = decode(&text_of(top, "to"));
     let added: usize = text_of(top, "added").parse().unwrap_or(0);
     let at = text_of(top, "at");
-    Some(answer(tab, want.trim(), &at, to, added))
+    Some(answer(tab, role, &at, to, added))
 }
 
-fn answer(tab: &mut DocTab, button: &str, at: &str, to: End, added: usize) -> Result<(), String> {
-    let yes = button.eq_ignore_ascii_case("Yes");
-    let no = button.eq_ignore_ascii_case("No");
+fn answer(
+    tab: &mut DocTab,
+    role: ButtonRole,
+    at: &str,
+    to: End,
+    added: usize,
+) -> Result<(), String> {
+    let yes = role == ButtonRole::Accept;
+    let no = role == ButtonRole::Apply;
     let (ed, _) = editor(tab)?;
     // The candidate is the selection; the caret ends it.
     let (path, start, end) = match ed.selection_range() {
@@ -422,6 +449,42 @@ mod tests {
         press(&mut t, "Cancel").unwrap();
         t.pkg.as_mut().unwrap().set_hyphenate_caps(false);
         start(&mut t).unwrap();
+        assert!(!t.dialogs.is_open());
+    }
+
+    /// An unknown label is an error that leaves the dialog and the text alone,
+    /// not a Cancel.
+    #[test]
+    fn an_unknown_button_is_an_error_not_a_cancel() {
+        let mut t = tab(&["computer"]);
+        start(&mut t).unwrap();
+        for label in ["OK", "Yess", ""] {
+            let e = press(&mut t, label).unwrap_err();
+            assert!(e.contains("no button"), "{label}: {e}");
+            assert_eq!(t.dialogs.depth(), 1, "{label}");
+            assert_eq!(ed(&t).selection_text(), "computer", "{label}");
+        }
+        assert_eq!(text(&t, 0), "computer");
+        // The accelerator spelling of a real one still works.
+        press(&mut t, "&No").unwrap();
+        assert!(!t.dialogs.is_open());
+    }
+
+    /// While a header or footer is being edited the walk would edit the
+    /// hidden body: refused.
+    #[test]
+    fn it_refuses_while_a_header_or_footer_is_edited() {
+        let mut t = tab(&["computer"]);
+        t.hf_edit = Some(crate::HfEdit {
+            editor: Editor::new(ed(&t).doc.clone()),
+            part_name: "word/header1.xml".into(),
+            is_header: true,
+            section: 0,
+            variant: docxcore::package::HeaderVariant::Default,
+            show_text: true,
+        });
+        let e = start(&mut t).unwrap_err();
+        assert_eq!(e, "Close the header or footer first");
         assert!(!t.dialogs.is_open());
     }
 
