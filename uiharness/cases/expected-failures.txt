@@ -20,26 +20,6 @@ inputs-typing-sheet-data.uit | sheet text-to-columns/breaks: OK applies | #1205
 inputs-typing-sheet-data.uit | sheet text-to-columns/formats: OK applies | #1205
 inputs-typing-sheet-data.uit | sheet text-to-columns/destination: OK applies | #1205
 
-# Home's Font and Font Size boxes (document) are not text boxes: a click opens
-# the font or size chip picker, nothing takes the focus, and what is typed
-# edits the document; Enter applies nothing (#1201 found it).
-doc-inputs-typing.uit | document doc-font: focus by click | #1361
-doc-inputs-typing.uit | document doc-font: types | #1361
-doc-inputs-typing.uit | document doc-font: edits | #1361
-doc-inputs-typing.uit | document doc-font: select-all replaces | #1361
-doc-inputs-typing.uit | document doc-font: copies | #1361
-doc-inputs-typing.uit | document doc-font: pastes | #1361
-doc-inputs-typing.uit | document doc-font: Enter formats the selection | #1361
-doc-inputs-typing.uit | document doc-font: Escape cancels | #1361
-doc-inputs-typing.uit | document doc-font-size: focus by click | #1361
-doc-inputs-typing.uit | document doc-font-size: types | #1361
-doc-inputs-typing.uit | document doc-font-size: edits | #1361
-doc-inputs-typing.uit | document doc-font-size: select-all replaces | #1361
-doc-inputs-typing.uit | document doc-font-size: copies | #1361
-doc-inputs-typing.uit | document doc-font-size: pastes | #1361
-doc-inputs-typing.uit | document doc-font-size: Enter formats the selection | #1361
-doc-inputs-typing.uit | document doc-font-size: Escape cancels | #1361
-
 # The comment editor is append-only (comment_key): no caret, so Home, End,
 # Left, Right and Delete do nothing, and Ctrl+A/C/V are ignored (#1201 found
 # it).

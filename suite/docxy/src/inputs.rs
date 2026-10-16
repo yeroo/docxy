@@ -560,8 +560,8 @@ pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
 /// with the sheet's, so it reads only while a document is active. Ctrl+F
 /// opens the Find bar under an open comment bar, but `on_key` gives the
 /// comment bar the keys first, so a Find field is focused only while no
-/// comment is being typed. The Font boxes never take the focus today: they
-/// read what they draw.
+/// comment is being typed. The Font boxes keep a caret and a whole-field
+/// selection (#1361) and read the caret run's font and size while unfocused.
 fn read_doc(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
     crate::harness::active_doc(app)?;
     let end_if = |text: &str, focused: bool| {
@@ -600,13 +600,41 @@ fn read_doc(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
             ));
         }
         "doc-font" | "doc-font-size" => {
-            let cmd = if i.id == "doc-font" {
-                "fontname"
+            let which = if i.id == "doc-font" {
+                crate::FontBox::Name
             } else {
-                "fontsize"
+                crate::FontBox::Size
             };
-            let value = crate::doc_combo_value(cmd, app.caret_run_props());
-            (Json::Str(value), false, Json::Null)
+            return Ok(
+                match app
+                    .font_box
+                    .as_ref()
+                    .filter(|f| f.which == which && app.font_box_live())
+                {
+                    Some(fb) => {
+                        let len = fb.text.chars().count();
+                        let selection = if fb.sel && len > 0 {
+                            Json::Arr(vec![Json::Num(0.0), Json::Num(len as f64)])
+                        } else {
+                            Json::Null
+                        };
+                        field_json(
+                            i.id,
+                            Json::Str(fb.text.clone()),
+                            true,
+                            Json::Num(fb.caret as f64),
+                            selection,
+                        )
+                    }
+                    None => field_json(
+                        i.id,
+                        Json::Str(app.font_box_value(which)),
+                        false,
+                        Json::Null,
+                        Json::Null,
+                    ),
+                },
+            );
         }
         "comment-editor" => {
             let focused = app.comment_open;

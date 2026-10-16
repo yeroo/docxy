@@ -259,3 +259,20 @@
   the Home tab's body is drawn (a tab switch or Esc on its flyout closes it). Unfocused they show the
   active cell's font and size (`font_box.rs`). `uiharness/cases/sheet-font-box.uit`
   covers what `sheet-inputs-typing.uit` does not.
+
+## Document Home ribbon Font / Font Size boxes (#1361)
+
+- The document's boxes are the same `Docxy::font_box` (`FontBoxEdit` with
+  `sheet: None`, tied to the tab only), opened by a click on `combo_box` or by
+  `Act::FontName` / `FontSize` (their KeyTips) through `font_box_open_doc`,
+  which closes the Find and comment bars. `font_box_live` is surface-aware, so
+  `sheet_field_live` and `entry_owns_keys` cover it. `on_key` hands it every
+  key after the KeyTips and `document_key` (Ctrl+W, Ctrl+Tab, F12 still act),
+  Ctrl+S saving and closing it. `dispatch_act` closes it for any other command;
+  Find and a new comment close it too.
+- Enter sets `set_font` (name cut to 31 characters) or `set_font_size`
+  (`font_box::parse_doc_size`: 1 to 1638 pt, rounded to a half point; a bad one
+  keeps the box and says so), as one undo step, and the document gets the
+  keyboard back, as it does on Escape. The old chip strips (`PickKind::FontName`
+  / `FontSize`) are gone. `uiharness/cases/doc-font-box.uit` covers what
+  `doc-inputs-typing.uit` does not.
