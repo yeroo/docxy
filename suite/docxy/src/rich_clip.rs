@@ -97,11 +97,11 @@ fn html_page(fragment: &str) -> String {
 
 /// The HTML an `HTML Format` / `public.html` payload carries: the fragment
 /// its CF_HTML header names (when the offsets fit the payload, cut it on
-/// character boundaries and it holds the `<table`), else the whole page, from
-/// its first tag on (Excel's fragment starts inside the table, after its
+/// character boundaries and it holds the `<table`), else the whole page, less
+/// a CF_HTML header (Excel's fragment starts inside the table, after its
 /// `<table>` tag, so the page is the one that has it). `None` for an empty
 /// payload.
-fn html_fragment(bytes: &[u8]) -> Option<String> {
+pub(crate) fn html_fragment(bytes: &[u8]) -> Option<String> {
     if bytes.is_empty() {
         return None;
     }
@@ -121,7 +121,17 @@ fn html_fragment(bytes: &[u8]) -> Option<String> {
         }
     }
     let page = String::from_utf8_lossy(bytes);
-    Some(page[page.find('<').unwrap_or(0)..].to_string())
+    // Only a real CF_HTML header is cut off (at the page's own offset, else
+    // at its first tag); text before the first tag of anything else is text.
+    if page.starts_with("Version:")
+        && (page.contains("StartHTML:") || page.contains("StartFragment:"))
+    {
+        let at = offset("StartHTML:")
+            .filter(|&at| at <= bytes.len() && std::str::from_utf8(&bytes[at..]).is_ok())
+            .unwrap_or_else(|| page.find('<').unwrap_or(page.len()));
+        return Some(String::from_utf8_lossy(&bytes[at.min(bytes.len())..]).into_owned());
+    }
+    Some(page.into_owned())
 }
 
 #[cfg(target_os = "macos")]
@@ -374,10 +384,14 @@ mod tests {
         let bad = "Version:0.9\r\nStartFragment:0000000010\r\nEndFragment:0000009999\r\n<table>";
         assert_eq!(html_fragment(bad.as_bytes()).as_deref(), Some("<table>"));
         let split = "StartFragment:0000000051\r\nEndFragment:0000000052\r\n<p>\u{e9}";
-        assert_eq!(
-            html_fragment(split.as_bytes()).as_deref(),
-            Some("<p>\u{e9}")
-        );
+        // Not a CF_HTML payload: text before the first tag stays.
+        assert_eq!(html_fragment(split.as_bytes()).as_deref(), Some(split));
+        let intro = "Intro<table><tr><td>1</td></tr></table>";
+        assert_eq!(html_fragment(intro.as_bytes()).as_deref(), Some(intro));
+        // A header and its table still read, and parse as a table.
+        let payload = cf_html("<table><tr><td>1</td></tr></table>");
+        let got = html_fragment(payload.as_bytes()).unwrap();
+        assert!(gridcore::clip_html::parse_html_table(&got).is_some());
         assert_eq!(html_fragment(b""), None);
     }
 

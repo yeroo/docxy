@@ -215,6 +215,15 @@ test a copy that is a table and a paragraph pastes as text
   assert cell E9 is 2
   assert cell D10 is after
 
+test text before a table pastes as text
+  open ../fixtures/basic.xlsx
+  call clipboard {"action":"write","text":"Intro\n1\t2\n","html":"Intro<table><tr><td>1</td><td>2</td></tr></table>"}
+  click D8
+  key ctrl+v
+  assert cell D8 is Intro
+  assert cell D9 is 1
+  assert cell E9 is 2
+
 test text copied after a sheet copy leaves no HTML behind
   open ../fixtures/basic.xlsx
   click A1

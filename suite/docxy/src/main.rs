@@ -17639,7 +17639,10 @@ impl Docxy {
     /// The clipboard's HTML table fragment (#1248): the OS one's, or the
     /// private one's.
     fn clipboard_read_html(&self) -> Option<String> {
-        self.clipboard.read_html(self.harness, rich_clip::read_html)
+        // A harness `html` is read as the OS one is: a CF_HTML header cut.
+        self.clipboard
+            .read_html(self.harness, rich_clip::read_html)
+            .and_then(|html| rich_clip::html_fragment(html.as_bytes()))
     }
 
     /// Add `html` to the copy of `text` on the clipboard (#1248).
@@ -25220,6 +25223,14 @@ mod clipboard_tests {
         );
         assert!(gridcore::clip_html::is_own_table(&own));
         assert_eq!(foreign_table(Some(&own), None), None);
+    }
+
+    /// #1248: leading text before the table is text, however the HTML got here.
+    #[test]
+    fn text_before_the_table_pastes_as_text() {
+        let html = "Intro<table><tr><td>1</td><td>2</td></tr></table>";
+        let read = crate::rich_clip::html_fragment(html.as_bytes()).unwrap();
+        assert_eq!(foreign_table(Some(&read), None), None);
     }
 
     /// #1248: a copy that is more than a table pastes as its text.

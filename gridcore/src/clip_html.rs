@@ -7,9 +7,9 @@
 //! fill, alignment). [`parse_html_table`] and [`parse_rtf_table`] go the other
 //! way for a paste: the cell texts of the table that is the whole copy
 //! (`None` when there is other text or a second table), by position, with no
-//! styles. Both parsers are small tolerant scanners (unclosed tags, text
-//! before the first tag such as a CF_HTML header, Excel's `class=xl65`
-//! attributes), not full HTML or RTF readers.
+//! styles. Both parsers are small tolerant scanners (unclosed tags, Excel's
+//! `class=xl65` attributes), not full HTML or RTF readers; the caller strips a
+//! CF_HTML header first (`rich_clip::html_fragment`).
 
 use crate::sheet::{Align, Cell, CellValue, Sheet, Styles, format_with};
 
@@ -353,7 +353,7 @@ fn collapse(raw: &str) -> String {
 /// outside the table (a heading or a paragraph beside it: the copy is more
 /// than a table, so its text is pasted instead). Entities are decoded, source
 /// line breaks are blanks and a `<br>` is a line feed; a table inside a cell
-/// is part of that cell's text. Text before the first tag (a CF_HTML header), `<html>`, `<title>` and
+/// is part of that cell's text. `<html>`, `<title>` and
 /// `<style>` are not text, and an unclosed `<td>`, `<tr>` or `<table>` ends
 /// at the next one.
 #[allow(unused_assignments)]
@@ -366,8 +366,7 @@ pub fn parse_html_table(html: &str) -> Option<Vec<Vec<String>>> {
     let mut cell: Option<(String, usize, usize)> = None;
     let mut next_row = 0usize;
     let (mut depth, mut tables, mut outside) = (0usize, 0usize, false);
-    // Text before the first tag (a CF_HTML header) is not the copy's.
-    let mut i = html.find('<').unwrap_or(html.len());
+    let mut i = 0;
     macro_rules! close_cell {
         () => {
             if let Some((text, cs, rs)) = cell.take() {
@@ -822,13 +821,14 @@ mod tests {
         assert_eq!(parse_html_table(&format!("{t}{t}")), None);
         assert!(parse_html_table(&format!("<p> &nbsp;</p>{t}\n")).is_some());
         assert!(parse_html_table(&format!("<p>a &lt; b</p>{t}")).is_none());
-        // Text before the first tag is a CF_HTML header, not the copy's.
-        assert!(parse_html_table(&format!("Version:0.9\r\nStartHTML:1\r\n{t}")).is_some());
+        // Text before the first tag is text, and a header is the caller's.
+        assert_eq!(parse_html_table(&format!("a &lt; b {t}")), None);
+        assert_eq!(parse_html_table(&format!("Intro{t}")), None);
     }
 
     #[test]
     fn non_ascii_text_parses_at_every_cut() {
-        let html = "Version:0.9\r\n<html><head><title>t\u{e9}</title></head><body><table>\
+        let html = "<html><head><title>t\u{e9}</title></head><body><table>\
             <tr><td>\u{e9}</td><td>\u{20ac}</td><td>M\u{fc}ller</td><td>\u{41f}\u{440}</td>\
             <td>\u{4e2d}\u{6587}</td><td>a\u{a0}b</td></tr></table></body></html>";
         assert_eq!(
