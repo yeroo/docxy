@@ -87,10 +87,8 @@ fn walk_barred(items: &[Inline], out: &mut Vec<bool>, depth: &mut i32, in_link: 
     for item in items {
         match item {
             Inline::Raw(raw) if crate::load::is_field_code_raw(raw) => step(raw, depth),
-            Inline::UnsupportedRevision { raw, .. } => {
-                step(raw, depth);
-                out.resize(out.len() + inline_len(item), *depth > 0 || in_link);
-            }
+            // Zero-width ([`inline_len`]): only its fields count.
+            Inline::UnsupportedRevision { raw, .. } => step(raw, depth),
             Inline::Hyperlink(h) if !h.content.is_empty() => {
                 out.resize(out.len() + link_runs_len(h), true);
                 walk_barred(&h.content, out, depth, true)
@@ -2928,6 +2926,18 @@ impl Editor {
                     && word.chars().all(|c| !c.is_lowercase())
                     && word.chars().any(|c| c.is_uppercase());
                 if capital && !caps {
+                    continue;
+                }
+                // Typing into a content control still showing its
+                // placeholder would clear that, so its text is left alone.
+                let in_placeholder = |at: usize| {
+                    self.placeholder_range_at(&Caret {
+                        path: path.clone(),
+                        offset: at,
+                    })
+                    .is_some()
+                };
+                if in_placeholder(start + 1) || in_placeholder(i - 1) {
                     continue;
                 }
                 if let Some(point) = crate::hyphenate::proposed_point(&word) {

@@ -207,3 +207,18 @@ fn a_field_opened_inside_a_tracked_change_still_bars_what_follows() {
     );
     assert_eq!(words(&ed, true), ["computer"]);
 }
+
+#[test]
+fn a_word_in_a_content_control_showing_its_placeholder_is_left_alone() {
+    let ed = editor(
+        "<w:p><w:sdt><w:sdtPr><w:id w:val=\"7\"/><w:showingPlcHdr/></w:sdtPr><w:sdtContent>\
+         <w:r><w:t>placeholder</w:t></w:r></w:sdtContent></w:sdt>\
+         <w:r><w:t xml:space=\"preserve\"> computer</w:t></w:r></w:p>\
+         <w:p><w:sdt><w:sdtPr><w:id w:val=\"8\"/></w:sdtPr><w:sdtContent>\
+         <w:r><w:t>hyphenation</w:t></w:r></w:sdtContent></w:sdt></w:p>",
+    );
+    // The placeholder's text stays; a filled control's text is ordinary.
+    assert_eq!(words(&ed, true), ["computer", "hyphenation"]);
+    let xml = document_to_xml(&ed.doc);
+    assert_eq!(xml.matches("<w:showingPlcHdr").count(), 1, "{xml}");
+}

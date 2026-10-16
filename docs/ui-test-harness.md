@@ -1360,8 +1360,9 @@ Menus open today:
   opens one. The items follow Word, with its separators and the Breaks menu's
   `Page Breaks` / `Section Breaks` headings; the current choice is `checked`
   (the caret section's margins, orientation, size, columns and line numbers,
-  and the document's hyphenation). Manual reads
-  `enabled: false`. Custom Margins... and More Paper Sizes... open the
+  and the document's hyphenation). Manual starts the
+  Manual Hyphenation walk (the `manual-hyphenation` dialog: Yes, No, Cancel).
+  Custom Margins... and More Paper Sizes... open the
   `page-setup` dialog, More Columns... the `columns` one, and Line Numbering
   Options... the `line-numbers` one, Hyphenation Options... the `hyphenation`
   one;
