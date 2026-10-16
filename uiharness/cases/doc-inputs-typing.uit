@@ -823,6 +823,18 @@ test document comment-editor: pastes
   assert reply.caret is 6
   call real-key {"key":"escape"}
 
+test document comment-editor: a paste drops control characters
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  call clipboard {"action":"write","text":"a\u000bb\u001bc"}
+  call pointer-click {"input":"comment-editor"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"comment-editor"}
+  assert reply.value is exactly abc
+  call real-key {"key":"escape"}
+
 test document comment-editor: Enter adds the comment
   open copy:../fixtures/doc-table.docx
   call real-key {"key":"escape"}
