@@ -1,5 +1,5 @@
-//! The sheet Home ribbon's Font and Font Size boxes (#1344): what they show
-//! and what Enter makes of the typed text.
+//! The Home ribbon's Font and Font Size boxes, the sheet's (#1344) and the
+//! document's (#1361): what they show and what Enter makes of the typed text.
 
 /// The font a cell without one of its own has, and its size.
 pub(crate) const DEFAULT_FONT: &str = "Calibri";
@@ -33,6 +33,20 @@ pub(crate) fn parse_size(text: &str) -> Option<f64> {
     (n.is_finite() && (MIN_SIZE..=MAX_SIZE).contains(&n)).then_some(n)
 }
 
+/// Word's bounds for a document font size, in points.
+pub(crate) const MAX_DOC_SIZE: f64 = 1638.0;
+
+/// The size typed in a document's box, in half points (what the editor
+/// stores): a number from 1 to 1638 points, rounded to the nearest half
+/// point; a comma is a decimal mark too.
+pub(crate) fn parse_doc_size(text: &str) -> Option<u32> {
+    let n: f64 = text.trim().replace(',', ".").parse().ok()?;
+    if !n.is_finite() || !(MIN_SIZE..=MAX_DOC_SIZE).contains(&n) {
+        return None;
+    }
+    Some((n * 2.0).round() as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,6 +75,21 @@ mod tests {
         assert_eq!(parse_size("409"), Some(409.0));
         for bad in ["0", "0.5", "410", "-3", "abc", "NaN", "inf", "", " "] {
             assert_eq!(parse_size(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_typed_document_size_is_half_points_in_words_range() {
+        assert_eq!(parse_doc_size("11"), Some(22));
+        assert_eq!(parse_doc_size(" 10.5 "), Some(21));
+        assert_eq!(parse_doc_size("10,5"), Some(21));
+        assert_eq!(parse_doc_size("1"), Some(2));
+        assert_eq!(parse_doc_size("1638"), Some(3276));
+        // Rounded to the nearest half point.
+        assert_eq!(parse_doc_size("10.25"), Some(21));
+        assert_eq!(parse_doc_size("10.24"), Some(20));
+        for bad in ["0", "0.9", "1639", "-3", "abc", "NaN", "inf", "", " "] {
+            assert_eq!(parse_doc_size(bad), None, "{bad:?}");
         }
     }
 }

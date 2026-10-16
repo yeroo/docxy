@@ -7317,23 +7317,36 @@ enum FontBox {
 
 impl FontBox {
     /// The probe the box is drawn under: present only while it is on screen.
-    fn probe(self) -> &'static str {
-        match self {
-            FontBox::Name => "sheet-combo:font-name",
-            FontBox::Size => "sheet-combo:font-size",
+    fn probe(self, doc: bool) -> &'static str {
+        match (self, doc) {
+            (FontBox::Name, false) => "sheet-combo:font-name",
+            (FontBox::Size, false) => "sheet-combo:font-size",
+            (FontBox::Name, true) => "doc-combo:fontname",
+            (FontBox::Size, true) => "doc-combo:fontsize",
         }
     }
 }
 
-/// The Font or Font Size box while focused (#1344): a one-line field like the
-/// Name Box, tied to the tab and sheet it was opened on.
+/// The Font or Font Size box while focused (#1344, #1361): a one-line field
+/// like the Name Box, tied to the tab (and, on a sheet, the sheet) it was
+/// opened on. `sheet` is `None` for a document's box.
 struct FontBoxEdit {
     which: FontBox,
     text: String,
     caret: usize,
     sel: bool,
+    /// Whether the person has changed the text (typed, deleted, cut or
+    /// pasted): a document's box Enter finds unedited is Escape.
+    edited: bool,
     tab: close::TabId,
-    sheet: usize,
+    sheet: Option<usize>,
+}
+
+impl FontBoxEdit {
+    /// The probe the box is drawn under.
+    fn probe(&self) -> &'static str {
+        self.which.probe(self.sheet.is_none())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -7355,8 +7368,6 @@ impl FindField {
 enum PickKind {
     Color,
     Highlight,
-    FontName,
-    FontSize,
     Field,
     Symbol,
     LineSpacing,
@@ -17184,14 +17195,15 @@ impl Docxy {
     }
 
     /// Whether a text entry the active surface draws takes the keyboard: the
-    /// find or comment bar where it is shown, a Project entry, or a sheet's
-    /// cell, Name Box, font box, rename, comment, range, rule or row-height entry. F1 leaves these
-    /// alone (#1021).
+    /// find or comment bar or a document's font box where shown, a Project
+    /// entry, or a sheet's cell, Name Box, font box, rename, comment, range,
+    /// rule or row-height entry. F1 leaves these alone (#1021).
     fn entry_owns_keys(&self) -> bool {
         let doc = self.active_is_doc();
         let sheet = self.active_is_sheet();
         (self.find_open && (doc || sheet))
             || (self.comment_open && doc)
+            || (doc && self.font_box_live())
             || self.project_edit_open()
             || (sheet
                 && (self.sheet_rename.is_some()
@@ -19113,13 +19125,14 @@ impl Docxy {
         cx.notify();
     }
 
-    /// Whether a one-line ribbon or bar field of the sheet has the keyboard:
-    /// the Name Box or a font box.
+    /// Whether a one-line ribbon or bar field has the keyboard: the sheet's
+    /// Name Box, or a font box on either surface.
     fn sheet_field_live(&self) -> bool {
         self.name_box_live() || self.font_box_live()
     }
 
-    /// Whether a font box has the keyboard: opened on the sheet now shown,
+    /// Whether a font box has the keyboard: opened on the tab now shown (and,
+    /// on a sheet, the sheet now shown),
     /// with the Home ribbon body that draws it still up and the box itself
     /// on screen (a narrow window can fold its group away: that frame refuses
     /// the very next key, and the next render closes the box).
@@ -19129,13 +19142,24 @@ impl Docxy {
         };
         self.ribbon_tab == RibbonTab::Home
             && !self.ribbon_body_hidden()
-            && self.probes.borrow().on_screen(fb.which.probe()).is_some()
+            && self.probes.borrow().on_screen(fb.probe()).is_some()
             && self.active_tab_id().as_ref() == Some(&fb.tab)
-            && self.active_sheet().is_some_and(|v| v.active == fb.sheet)
+            && match fb.sheet {
+                Some(sheet) => self.active_sheet().is_some_and(|v| v.active == sheet),
+                None => self.active_is_doc(),
+            }
     }
 
-    /// What font box `which` shows unfocused: the active cell's font or size.
+    /// What font box `which` shows unfocused: the active cell's font or size,
+    /// or the caret run's in a document.
     fn font_box_value(&self, which: FontBox) -> String {
+        if self.active_is_doc() {
+            let cmd = match which {
+                FontBox::Name => "fontname",
+                FontBox::Size => "fontsize",
+            };
+            return doc_combo_value(cmd, self.caret_run_props());
+        }
         let xf = self.active_xf();
         match which {
             FontBox::Name => xf
@@ -19151,13 +19175,19 @@ impl Docxy {
         if self.font_box_live() && self.font_box.as_ref().is_some_and(|f| f.which == which) {
             return;
         }
-        let (Some(tab), Some(v)) = (self.active_tab_id(), self.active_sheet()) else {
+        let Some(tab) = self.active_tab_id() else {
+            return;
+        };
+        if self.active_is_doc() {
+            return self.font_box_open_doc(which, tab, cx);
+        }
+        let Some(v) = self.active_sheet() else {
             return;
         };
         if v.editing.is_some() {
             return;
         }
-        let sheet = v.active;
+        let sheet = Some(v.active);
         let text = self.font_box_value(which);
         let caret = text.chars().count();
         self.sheet_comment_bar_leave();
@@ -19168,6 +19198,7 @@ impl Docxy {
         self.name_box = None;
         self.font_box = Some(FontBoxEdit {
             which,
+            edited: false,
             text,
             caret,
             sel: true,
@@ -19177,21 +19208,55 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Focus a document's font box `which` with its text selected (#1361): the
+    /// Find and comment bars give way, and the document's selection stays.
+    fn font_box_open_doc(&mut self, which: FontBox, tab: close::TabId, cx: &mut Context<Self>) {
+        let text = self.font_box_value(which);
+        let caret = text.chars().count();
+        self.find_open = false;
+        self.comment_open = false;
+        self.picker = None;
+        self.font_box = Some(FontBoxEdit {
+            which,
+            edited: false,
+            text,
+            caret,
+            sel: true,
+            tab,
+            sheet: None,
+        });
+        cx.notify();
+    }
+
     /// Apply what the box holds to the selection (Enter): a bad size keeps
     /// the box, a blank box is Escape, a protected sheet refuses. (Protected
     /// View and a final document hide the ribbon body, so the box cannot be
     /// open there; the `active_locked` check is a backstop.)
-    fn font_box_enter(&mut self, cx: &mut Context<Self>) {
-        let Some((which, text)) = self
-            .font_box
-            .as_ref()
-            .map(|f| (f.which, f.text.trim().to_string()))
-        else {
+    fn font_box_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((which, text, doc, untouched)) = self.font_box.as_ref().map(|f| {
+            (
+                f.which,
+                f.text.trim().to_string(),
+                f.sheet.is_none(),
+                f.sheet.is_none() && !f.edited,
+            )
+        }) else {
             return;
         };
-        if text.is_empty() {
+        // A blank box is Escape; so is a document's box nothing was typed in.
+        // Its fill is the caret run's direct font or size (Calibri / 11 when
+        // it has none), and writing that back would turn a style's size or a
+        // theme font into direct formatting. Typing the very value shown is
+        // an edit and applies.
+        if text.is_empty() || untouched {
             self.font_box = None;
+            if doc {
+                self.refocus(window, cx);
+            }
             return;
+        }
+        if doc {
+            return self.font_box_enter_doc(which, &text, window, cx);
         }
         if self.sheet_protected() {
             self.set_status(sheet_goto::SHEET_PROTECTED);
@@ -19219,6 +19284,50 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Enter in a document's font box (#1361): the typed font or size goes to
+    /// the selection as one undo step, and the document has the keyboard
+    /// back. A bad size keeps the box open. A caret alone has no run to
+    /// format (the editor keeps no pending font or size), so it changes
+    /// nothing and says so.
+    fn font_box_enter_doc(
+        &mut self,
+        which: FontBox,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Protected View hides the ribbon body, so the box cannot be open
+        // there; `with_editor` refuses it all the same.
+        let half_pts = match which {
+            FontBox::Name => None,
+            FontBox::Size => {
+                let Some(half_pts) = font_box::parse_doc_size(text) else {
+                    self.set_status("Font size: type a number from 1 to 1638");
+                    cx.notify();
+                    return;
+                };
+                Some(half_pts)
+            }
+        };
+        self.font_box = None;
+        if !self.edit_target().is_some_and(|e| e.has_selection()) {
+            self.set_status("Select text first, then set its font or size");
+            self.refocus(window, cx);
+            return cx.notify();
+        }
+        match half_pts {
+            None => {
+                let name = font_box::clamp_name(text);
+                self.with_editor(window, cx, |e| e.one_step("Font", |e| e.set_font(&name)));
+            }
+            Some(half_pts) => self.with_editor(window, cx, |e| {
+                e.one_step("Font Size", |e| e.set_font_size(half_pts))
+            }),
+        }
+        self.refocus(window, cx);
+        cx.notify();
+    }
+
     /// Route a keystroke to the focused font box (#1344), as the Name Box's.
     fn font_box_key(
         &mut self,
@@ -19226,6 +19335,7 @@ impl Docxy {
         ctrl: bool,
         alt: bool,
         key: &str,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         use field_edit::Op;
@@ -19233,7 +19343,9 @@ impl Docxy {
             return;
         };
         let edit = |fb: &mut FontBoxEdit, op: Op| {
-            field_edit::apply(&mut fb.text, &mut fb.caret, &mut fb.sel, op)
+            let before = fb.text.clone();
+            field_edit::apply(&mut fb.text, &mut fb.caret, &mut fb.sel, op);
+            fb.edited |= fb.text != before;
         };
         // Ctrl+Alt is AltGr on Windows: its keys are text, not chords.
         if ctrl && !alt {
@@ -19261,7 +19373,7 @@ impl Docxy {
                         }
                     }
                 }
-                "enter" => self.font_box_enter(cx),
+                "enter" => self.font_box_enter(window, cx),
                 // Any other chord is not text.
                 _ => {}
             }
@@ -19269,8 +19381,14 @@ impl Docxy {
             return;
         }
         match key {
-            "escape" => self.font_box = None,
-            "enter" => self.font_box_enter(cx),
+            "escape" => {
+                let doc = self.font_box.as_ref().is_some_and(|f| f.sheet.is_none());
+                self.font_box = None;
+                if doc {
+                    self.refocus(window, cx);
+                }
+            }
+            "enter" => self.font_box_enter(window, cx),
             "backspace" => edit(fb, Op::Backspace),
             "delete" => edit(fb, Op::Delete),
             "left" => edit(fb, Op::Left),
@@ -21036,7 +21154,7 @@ impl Docxy {
         // And the Home ribbon's font boxes (#1344), with the same Ctrl+S rule.
         if self.font_box_live() {
             if !field_edit::is_save_chord(ctrl, alt, key) {
-                return self.font_box_key(ev, ctrl, alt, key, cx);
+                return self.font_box_key(ev, ctrl, alt, key, window, cx);
             }
             self.font_box = None;
         }
@@ -22758,6 +22876,7 @@ impl Docxy {
 
     /// Open the find bar (focused on the query field) or close it.
     fn toggle_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.font_box = None;
         self.find_open = !self.find_open;
         // A new Find starts from the caret, not from a match left by the last.
         self.find_cur = None;
@@ -22968,16 +23087,6 @@ impl Docxy {
         }
     }
 
-    fn apply_font(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.picker = None;
-        self.with_editor(window, cx, |e| e.set_font(&name));
-    }
-
-    fn apply_size(&mut self, pts: u32, window: &mut Window, cx: &mut Context<Self>) {
-        self.picker = None;
-        self.with_editor(window, cx, |e| e.set_font_size(pts * 2));
-    }
-
     /// Field evaluation context: the current clock, author and file name.
     fn field_context(&self) -> docxcore::field::FieldContext {
         tab_field_context(self.tabs.get(self.active))
@@ -23141,8 +23250,6 @@ impl Docxy {
                 .child(match kind {
                     PickKind::Color => "Font colour",
                     PickKind::Highlight => "Highlight",
-                    PickKind::FontName => "Font",
-                    PickKind::FontSize => "Size",
                     PickKind::Field => "Field",
                     PickKind::Symbol => "Symbol",
                     PickKind::LineSpacing => "Line spacing",
@@ -23221,23 +23328,6 @@ impl Docxy {
                             this.apply_highlight(Some(name.to_string()), window, cx)
                         },
                     )));
-                }
-            }
-            PickKind::FontName => {
-                for (i, &name) in FONT_NAMES.iter().enumerate() {
-                    // Preview each name in its own font family.
-                    row = row.child(chip(i, name.into(), "fn").font_family(name).on_click(
-                        cx.listener(move |this, _, window, cx| {
-                            this.apply_font(name.to_string(), window, cx)
-                        }),
-                    ));
-                }
-            }
-            PickKind::FontSize => {
-                for (i, &pts) in FONT_SIZES.iter().enumerate() {
-                    row = row.child(chip(i, pts.to_string().into(), "fs").on_click(
-                        cx.listener(move |this, _, window, cx| this.apply_size(pts, window, cx)),
-                    ));
                 }
             }
             PickKind::Field => {
@@ -23351,6 +23441,7 @@ impl Docxy {
             return self.refocus(window, cx);
         }
         self.comment_open = true;
+        self.font_box = None;
         self.doc_entry_tab = self.active_tab_id();
         self.comment_text.clear();
         self.picker = None;
@@ -24993,6 +25084,15 @@ impl Docxy {
         }
         if self.active_is_project() {
             return self.project_key(ev, window, cx);
+        }
+        // The Home ribbon's Font and Font Size boxes of a document (#1361)
+        // take every key, Ctrl+S excepted: it saves and closes the box, as
+        // the sheet's does.
+        if self.font_box_live() {
+            if !field_edit::is_save_chord(ctrl, m.alt, &key) {
+                return self.font_box_key(ev, ctrl, m.alt, &key, window, cx);
+            }
+            self.font_box = None;
         }
         // In header/footer edit mode, Esc returns to the document body.
         if key == "escape" && self.hf_active() {
@@ -30269,22 +30369,6 @@ const HIGHLIGHT_SWATCHES: &[&str] = &[
     "darkBlue",
     "lightGray",
 ];
-/// Font families offered in the Font-name picker.
-const FONT_NAMES: &[&str] = &[
-    "Calibri",
-    "Cambria",
-    "Arial",
-    "Times New Roman",
-    "Georgia",
-    "Verdana",
-    "Tahoma",
-    "Segoe UI",
-    "Courier New",
-    "Consolas",
-    "Comic Sans MS",
-];
-/// Point sizes offered in the Font-size picker.
-const FONT_SIZES: &[u32] = &[8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48, 72];
 
 /// Snap a twips measurement to the nearest 1/8" ruler gridline (180 twips), so
 /// dragging a ruler marker sticks to the visible ticks like Word's ruler.
@@ -33305,6 +33389,11 @@ impl Docxy {
     }
 
     fn dispatch_act(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
+        // A command takes the keyboard from a Font box (#1361); the boxes' own
+        // commands (a click, the harness's `ribbon-click`) focus one below.
+        if !matches!(act, Act::FontName | Act::FontSize) {
+            self.font_box = None;
+        }
         // A command run from anywhere ends an open menu's moment (#397), and
         // a live preview (#764): a tile's click applies what it previewed.
         self.close_menu();
@@ -33386,8 +33475,16 @@ impl Docxy {
             Find => self.toggle_find(window, cx),
             FontColor => self.toggle_picker(PickKind::Color, window, cx),
             Highlight => self.highlight_click(window, cx),
-            FontName => self.toggle_picker(PickKind::FontName, window, cx),
-            FontSize => self.toggle_picker(PickKind::FontSize, window, cx),
+            FontName | FontSize => {
+                let which = if matches!(act, FontName) {
+                    FontBox::Name
+                } else {
+                    FontBox::Size
+                };
+                self.picker = None;
+                self.font_box_open(which, cx);
+                self.focus.focus(window, cx);
+            }
             NewComment => self.start_comment(window, cx),
             ResolveComment => self.resolve_selected_comment(window, cx),
             ToggleTrack => self.toggle_track(window, cx),
@@ -35426,6 +35523,17 @@ impl Docxy {
         // The Font and Font Size boxes are probed where the harness's
         // `pointer-click {"input":id}` finds them (#1201).
         let probed = matches!(cmd.id, "fontname" | "fontsize");
+        let which = match cmd.id {
+            "fontname" => Some(FontBox::Name),
+            "fontsize" => Some(FontBox::Size),
+            _ => None,
+        };
+        // The Font and Font Size boxes are text fields (#1361).
+        let edit = which.and_then(|w| {
+            self.font_box
+                .as_ref()
+                .filter(|f| f.which == w && self.font_box_live())
+        });
         div()
             .id(cmd.id)
             .relative()
@@ -35441,24 +35549,49 @@ impl Docxy {
             .px_1p5()
             .rounded(px(3.))
             .border_1()
-            .border_color(pal.border)
+            .border_color(if edit.is_some() {
+                hsla_u(BRAND)
+            } else {
+                pal.border
+            })
             .bg(pal.panel)
-            .cursor_pointer()
+            .when(which.is_some(), |d| d.cursor_text())
+            .when(which.is_none(), |d| d.cursor_pointer())
             .hover(|d| d.border_color(hsla_u(accent::brand())))
-            .child(
-                div()
+            .child(match edit {
+                // Focused: the text split at the caret, a whole-field
+                // selection tinted, as the sheet's box draws.
+                Some(f) => {
+                    let at = char_to_byte(&f.text, f.caret);
+                    div()
+                        .flex()
+                        .items_center()
+                        .overflow_hidden()
+                        .text_size(px(11.))
+                        .text_color(pal.fg)
+                        .when(f.sel, |d| d.bg(hsla_u(BRAND).opacity(0.25)))
+                        .child(SharedString::from(f.text[..at].to_string()))
+                        .child(div().w(px(1.)).h(px(13.)).bg(hsla_u(BRAND)))
+                        .child(SharedString::from(f.text[at..].to_string()))
+                }
+                None => div()
                     .text_size(px(11.))
                     .text_color(pal.fg)
                     .overflow_hidden()
                     .child(value),
-            )
+            })
             .child(
                 div()
                     .text_size(px(8.))
                     .text_color(pal.dim)
                     .child("\u{25BE}"),
             )
-            .on_click(cx.listener(move |this, _, window, cx| this.dispatch(act, window, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| match which {
+                // A click focuses the field where it stands: `dispatch` would
+                // close the ribbon flyout the box is drawn in (#1361).
+                Some(_) => this.dispatch_act(act, window, cx),
+                None => this.dispatch(act, window, cx),
+            }))
             .into_any_element()
     }
 
@@ -36856,7 +36989,7 @@ impl Render for Docxy {
         // folded away in a narrower window) is closed, not suspended: a wider
         // window must not revive it with stale text (#1344).
         if let Some(fb) = &self.font_box {
-            if self.probes.borrow().get(fb.which.probe()).is_none() {
+            if self.probes.borrow().get(fb.probe()).is_none() {
                 self.font_box = None;
             }
         }
@@ -38395,7 +38528,7 @@ impl Render for Docxy {
                 }
                 // The same for a font box, whose probe is its own (#1344).
                 if let Some(fb) = &this.font_box {
-                    let probe = fb.which.probe();
+                    let probe = fb.probe();
                     let inside = this
                         .probes
                         .borrow()

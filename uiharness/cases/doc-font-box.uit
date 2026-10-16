@@ -1,0 +1,185 @@
+# The Home ribbon's Font and Font Size boxes in a document (#1361), beyond the
+# per-input cases of doc-inputs-typing.uit. Run with:
+#
+#   cargo run -p uiharness -- run uiharness/cases/doc-font-box.uit
+
+test document font box: a size that is not a number keeps the box open and formats nothing
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font-size"}
+  call real-type {"text":"abc"}
+  call real-key {"key":"enter"}
+  call field-read {"input":"doc-font-size"}
+  assert reply.focused is true
+  assert reply.value is abc
+  assert status is Font size: type a number from 1 to 1638
+  assert dirty is false
+  call real-key {"key":"escape"}
+  call field-read {"input":"doc-font-size"}
+  assert reply.focused is false
+  assert reply.value is 11
+
+test document font box: a size out of range is refused and a decimal size applies
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font-size"}
+  call real-type {"text":"1639"}
+  call real-key {"key":"enter"}
+  call field-read {"input":"doc-font-size"}
+  assert reply.focused is true
+  assert dirty is false
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"10.5"}
+  call real-key {"key":"enter"}
+  assert dirty is true
+  assert run.size_half_pts is 21
+  call field-read {"input":"doc-font-size"}
+  assert reply.focused is false
+  assert reply.value is 10.5
+
+test document font box: Enter on the Font box is one undo step
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font"}
+  call real-type {"text":"Arial"}
+  call real-key {"key":"enter"}
+  assert run.font is Arial
+  call menu-open {"target":{"qat":"qat-undo"}}
+  call menu-read {}
+  assert reply.items.0.label is Font
+  key escape
+  key ctrl+z
+  call field-read {"input":"doc-font"}
+  assert reply.value is Calibri
+
+test document font box: a blank box is Escape
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"enter"}
+  assert dirty is false
+  call field-read {"input":"doc-font"}
+  assert reply.focused is false
+  assert reply.value is Calibri
+
+test document font box: no key reaches the document while a box has the focus
+  open copy:../fixtures/basic.docx
+  type hello
+  call pointer-click {"input":"doc-font"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+z"}
+  call real-type {"text":"Q"}
+  call real-key {"key":"escape"}
+  assert text is hello
+
+test document font box: the Font and Font Size boxes give each other the keyboard
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font"}
+  call real-type {"text":"Ar"}
+  call pointer-click {"input":"doc-font-size"}
+  call field-read {"input":"doc-font-size"}
+  assert reply.focused is true
+  call field-read {"input":"doc-font"}
+  assert reply.focused is false
+  assert reply.value is Calibri
+  call real-key {"key":"escape"}
+
+test document font box: a font box does not outlive the Home tab that draws it
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font"}
+  call real-type {"text":"Zz"}
+  key alt n
+  key escape
+  key escape
+  call-error pointer-click {"input":"doc-font"} => the ribbon's Font combo (document) is not drawn: show the Home ribbon tab first
+  key alt h
+  key escape
+  call field-read {"input":"doc-font"}
+  assert reply.focused is false
+  assert reply.value is Calibri
+
+test document font box: Enter on an untouched box formats nothing
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font"}
+  call real-key {"key":"enter"}
+  assert dirty is false
+  call field-read {"input":"doc-font"}
+  assert reply.focused is false
+  call pointer-click {"input":"doc-font-size"}
+  call real-key {"key":"enter"}
+  assert dirty is false
+  call field-read {"input":"doc-font-size"}
+  assert reply.focused is false
+
+test document font box: typing the value shown is an edit and applies
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font-size"}
+  call real-type {"text":"11"}
+  call real-key {"key":"enter"}
+  assert dirty is true
+  assert run.size_half_pts is 22
+
+test document font box: a box in a collapsed group's flyout takes the keys
+  open copy:../fixtures/doc-table.docx
+  call window-size {"w":520,"h":800}
+  # Settle the resized window's frame (an X server applies a resize later
+  # than a Mac): the Font group has folded away.
+  call ribbon-layout {"tab":"Home"}
+  shot window
+  call ribbon-layout {"tab":"Home"}
+  assert reply.settled is true
+  assert reply.groups.1.title is Font
+  assert reply.groups.1.state is collapsed
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call ribbon-flyout {"action":"open","group":"Font"}
+  assert reply.open is true
+  call pointer-click {"input":"doc-font"}
+  call field-read {"input":"doc-font"}
+  assert reply.focused is true
+  call real-type {"text":"Arial"}
+  call field-read {"input":"doc-font"}
+  assert reply.value is Arial
+  call real-key {"key":"enter"}
+  assert run.font is Arial
+  call window-size {"w":1400,"h":800}
+
+test document font box: Enter with only a caret changes nothing and says so
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":3,"end":3}
+  call pointer-click {"input":"doc-font-size"}
+  call real-type {"text":"14"}
+  call real-key {"key":"enter"}
+  assert dirty is false
+  assert status is Select text first, then set its font or size
+  call field-read {"input":"doc-font-size"}
+  assert reply.focused is false
+
+test document font box: a key that changes nothing is not an edit
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font-size"}
+  call real-key {"key":"end"}
+  call real-key {"key":"delete"}
+  call real-key {"key":"enter"}
+  assert dirty is false
+  call pointer-click {"input":"doc-font"}
+  call real-key {"key":"home"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"enter"}
+  assert dirty is false
