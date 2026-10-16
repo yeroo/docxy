@@ -91,6 +91,15 @@ test save-as writes a Project as yppx or MSPDI xml
   assert reply.format is xml
   call-error save-as {"path":"plan.mpp"} => can only be saved as .yppx or .xml
 
+test without a format plugin a Project's Save As lists the two built-in types
+  open copy:../fixtures/schedule.xml
+  call save-types {}
+  assert reply.count is 2
+  assert reply.types.0.label is Project schedule
+  assert reply.types.0.extensions.0 is yppx
+  assert reply.types.1.label is MSPDI
+  assert reply.types.1.extensions.0 is xml
+
 test save-as needs an absolute path for a never-saved tab
   call proj.new {}
   call-error save-as {"path":"plan.yppx"} => never been saved

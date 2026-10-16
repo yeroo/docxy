@@ -73,7 +73,10 @@ options for run:
 A script whose first line is `terminal <docxy|xlsxy|yppxy> [args...]` drives
 that terminal editor in a pseudo-terminal instead of the suite: each `open`
 starts it on the file, and real-key, real-type and pointer-click write real
-key and mouse bytes into its terminal (#1204).
+key and mouse bytes into its terminal (#1204). A suite script may start with
+`plugin <name>` lines: each format plugin named (yppx_fixture, the test
+fixture) is copied from beside uiharness into the sandbox's docxy/plugins
+before the suite starts.
 
 regions:
   window  title-tabs  tab-prev  tab-next  tab-more  tab-more-item:0
@@ -378,6 +381,17 @@ fn run_scripts(a: &Args) -> Result<String, String> {
             uiharness::term::find_editor(&t.app, a.term_bin.as_deref())?;
         }
     }
+    // The format plugins a script's `plugin` lines name are built beside
+    // this harness, like the terminal editors.
+    let plugin_bin = if scripts.iter().any(|(_, _, s)| !s.plugins.is_empty()) {
+        let dir = uiharness::launch::harness_dir()?;
+        for name in scripts.iter().flat_map(|(_, _, s)| &s.plugins) {
+            uiharness::launch::find_plugin(name, &dir)?;
+        }
+        Some(dir)
+    } else {
+        None
+    };
     let run = Run::create(&a.run_dir).map_err(|e| format!("{}: {e}", a.run_dir.display()))?;
     // ⚠️ The default sandbox must be one no other run can name, because the app
     // persists into it: `quit` writes `session.json` plus a hot sidecar holding
@@ -453,6 +467,15 @@ fn run_scripts(a: &Args) -> Result<String, String> {
         let Some(exe) = &exe else {
             unreachable!("the suite was found above for every suite script");
         };
+        // The suite loads its format plugins once, at start, from the
+        // sandbox: they go there before the launch.
+        if let Some(dir) = &plugin_bin
+            && let Err(e) = uiharness::launch::install_plugins(&sandbox, &script.plugins, dir)
+        {
+            all_passed = false;
+            out.push_str(&format!("  ERROR {e}\n"));
+            break;
+        }
         // A launch or connect failure stops the run rather than skipping to
         // the next file: the harness or the app is broken, not a case, and
         // the remaining files would hit the same wall. The error lands under

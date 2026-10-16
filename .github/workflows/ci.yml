@@ -219,9 +219,11 @@ jobs:
       - name: Build release suite
         run: cargo build --release --locked --manifest-path suite/Cargo.toml
       # The terminal editors beside it: the terminal-*.uit scripts run them in a
-      # pseudo-terminal, found next to uiharness (#1204).
-      - name: Build release uiharness and the terminal editors
-        run: cargo build --release --locked -p uiharness -p docxy -p xlsxy -p yppxy
+      # pseudo-terminal, found next to uiharness (#1204). The fixture format
+      # plugin too: project-plugin.uit's `plugin yppx_fixture` copies it from
+      # there into the suite's sandbox.
+      - name: Build release uiharness, the terminal editors and the fixture plugin
+        run: cargo build --release --locked -p uiharness -p docxy -p xlsxy -p yppxy -p plugin_fixture
       - name: Sweep runner unit tests
         run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
       # The slowest script took 13 s locally: a per-script --timeout turns a hang

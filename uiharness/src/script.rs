@@ -61,6 +61,14 @@
 //! `call`, `call-error` and `assert reply.<path>`; anything that reads the
 //! suite's window or state is refused here.
 //!
+//! ## Format plugins
+//!
+//! A suite script may start with `plugin <name>` lines (before its first
+//! case): the runner copies each named library (`yppx_fixture`, the test
+//! fixture `projcore/tests/plugin_fixture` builds) from beside the harness
+//! into the sandbox's `docxy/plugins/` before it launches the suite, which
+//! loads the format plugins there at start ([`crate::launch::install_plugins`]).
+//!
 //! ## Assertions
 //!
 //! | Assertion | Reads |
@@ -90,6 +98,9 @@ pub struct Script {
     /// `terminal <app> [args…]`: the script drives that terminal editor in a
     /// pseudo-terminal ([`crate::term`]) rather than the suite (#1204).
     pub terminal: Option<TerminalSpec>,
+    /// `plugin <name>` lines: the format plugins the suite starts with
+    /// ([`crate::launch::install_plugins`]).
+    pub plugins: Vec<String>,
     pub cases: Vec<Case>,
 }
 
@@ -267,6 +278,7 @@ pub fn duplicate_case(scripts: &[(String, &Script)]) -> Option<String> {
 pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
     let mut cases: Vec<Case> = Vec::new();
     let mut terminal: Option<TerminalSpec> = None;
+    let mut plugins: Vec<String> = Vec::new();
     for (i, raw) in text.lines().enumerate() {
         let line = i + 1;
         let (head, rest) = split_word(raw.trim());
@@ -302,6 +314,18 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
                 ));
             }
             terminal = Some(parse_terminal(&rest, line)?);
+            continue;
+        }
+
+        if head.eq_ignore_ascii_case("plugin") {
+            if !cases.is_empty() {
+                return Err(err(line, "'plugin' lines come before the first case"));
+            }
+            let name = parse_plugin(&rest, line)?;
+            if plugins.contains(&name) {
+                return Err(err(line, format!("the plugin '{name}' is named twice")));
+            }
+            plugins.push(name);
             continue;
         }
 
@@ -351,6 +375,12 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
     if let Some(c) = cases.iter().find(|c| c.steps.is_empty()) {
         return Err(err(c.line, format!("the case '{}' has no steps", c.name)));
     }
+    if terminal.is_some() && !plugins.is_empty() {
+        return Err(err(
+            0,
+            "'plugin' installs a format plugin for the suite; a terminal script has none",
+        ));
+    }
     if terminal.is_some() {
         for step in cases.iter().flat_map(|c| &c.steps) {
             if !terminal_step(&step.action) {
@@ -364,7 +394,39 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
             }
         }
     }
-    Ok(Script { terminal, cases })
+    Ok(Script {
+        terminal,
+        plugins,
+        cases,
+    })
+}
+
+/// `plugin <name>`: one library stem, `yppx_` then letters, digits, `_` or
+/// `-`, as the suite loads only `yppx_*` libraries.
+fn parse_plugin(rest: &str, line: usize) -> Result<String, ScriptError> {
+    let mut words = rest.split_whitespace();
+    let name = words.next().ok_or_else(|| {
+        err(
+            line,
+            "'plugin' needs a library name, e.g. 'plugin yppx_fixture'",
+        )
+    })?;
+    if words.next().is_some() {
+        return Err(err(line, "'plugin' takes one library name"));
+    }
+    let plain = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !plain || !name.starts_with("yppx_") || name.len() == "yppx_".len() {
+        return Err(err(
+            line,
+            format!(
+                "'{name}' is not a format plugin's name: the suite loads `yppx_*` libraries, \
+                 named here without the platform's prefix or extension (e.g. yppx_fixture)"
+            ),
+        ));
+    }
+    Ok(name.to_string())
 }
 
 /// What a terminal script may do: open a file (which starts the editor on
@@ -1660,6 +1722,7 @@ test t
         );
         assert_eq!(s.cases[0].steps.len(), 3);
         assert_eq!(parse_script(VALID).unwrap().terminal, None);
+        assert!(s.plugins.is_empty());
 
         let refused = |text: &str| parse_script(text).unwrap_err().to_string();
         assert!(
@@ -1706,5 +1769,41 @@ test t
             ));
             assert!(e.contains("needs the suite"), "{step}: {e}");
         }
+    }
+
+    #[test]
+    fn plugin_lines_name_the_format_plugins_a_suite_script_starts_with() {
+        let s = parse_script(
+            "# plugins first
+plugin yppx_fixture
+plugin yppx_other-2  # a comment
+test t
+  open a.xml
+",
+        )
+        .unwrap();
+        assert_eq!(s.plugins, ["yppx_fixture", "yppx_other-2"]);
+        assert!(parse_script(VALID).unwrap().plugins.is_empty());
+
+        let refused = |text: &str| parse_script(text).unwrap_err().to_string();
+        for (line, why) in [
+            ("plugin", "needs a library name"),
+            ("plugin yppx_a yppx_b", "one library name"),
+            ("plugin fixture", "not a format plugin's name"),
+            ("plugin yppx_", "not a format plugin's name"),
+            ("plugin libyppx_fixture.so", "not a format plugin's name"),
+            ("plugin ../yppx_fixture", "not a format plugin's name"),
+        ] {
+            let e = refused(&format!("{line}\ntest t\n  open a\n"));
+            assert!(e.contains(why), "{line}: {e}");
+        }
+        assert!(
+            refused("plugin yppx_a\nplugin yppx_a\ntest t\n  open a\n").contains("named twice")
+        );
+        assert!(refused("test t\n  open a\nplugin yppx_a\n").contains("before the first case"));
+        assert!(
+            refused("terminal yppxy\nplugin yppx_a\ntest t\n  open a\n")
+                .contains("a terminal script has none")
+        );
     }
 }
