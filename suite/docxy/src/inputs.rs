@@ -421,8 +421,9 @@ fn press_doc(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
 /// nothing records which one the edit began in. The sheet Find bar's fields
 /// keep a caret and a whole-field selection (#1342); the sheet tab's rename
 /// appends and pops only, so its caret is its end, and it reads the active sheet's name while it is closed. The
-/// Name Box keeps a caret and a whole-field selection like them (#1343); the
-/// Font combos never take the focus today: they read what they draw.
+/// Name Box keeps a caret and a whole-field selection like them (#1343), and
+/// so do the Font and Font Size boxes (#1344), which read the active cell's
+/// font and size while unfocused.
 pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
     let i = find(id)?;
     if let Some(why) = unreachable(i) {

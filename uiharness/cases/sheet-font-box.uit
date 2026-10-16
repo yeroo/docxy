@@ -70,3 +70,36 @@ test the font boxes and the Name Box give each other the keyboard
   call field-read {"input":"sheet-font-size"}
   assert reply.focused is false
   call real-key {"key":"escape"}
+
+test a font box does not outlive the Home tab that draws it
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-font"}
+  call real-type {"text":"Zz"}
+  key alt n
+  key escape
+  key alt h
+  key escape
+  call field-read {"input":"sheet-font"}
+  assert reply.focused is false
+  assert reply.value is Calibri
+  call real-type {"text":"Q"}
+  call real-key {"key":"enter"}
+  assert cell E1 is Q
+
+test a protected sheet refuses Enter in a font box and keeps it open
+  open copy:"../fixtures/basic.xlsx" as locked.xlsx
+  click B6
+  call ribbon-click {"tab":"Review","command":"Protect Sheet"}
+  call ribbon-click {"tab":"Home","command":"AutoSum"}
+  call pointer-click {"input":"sheet-font"}
+  call real-type {"text":"Arial"}
+  call real-key {"key":"enter"}
+  assert status is The cell or chart you're trying to change is on a protected sheet.
+  call field-read {"input":"sheet-font"}
+  assert reply.focused is true
+  assert reply.value is Arial
+  call real-key {"key":"escape"}
+  call field-read {"input":"sheet-font"}
+  assert reply.value is Calibri

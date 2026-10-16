@@ -13637,6 +13637,8 @@ impl Docxy {
     fn select_ribbon_tab(&mut self, tab: RibbonTab, window: &mut Window, cx: &mut Context<Self>) {
         if tab != self.ribbon_tab {
             self.ribbon_flyout = None;
+            // The font boxes are drawn on Home only (#1344).
+            self.font_box = None;
         }
         self.ribbon_tab = tab;
         self.refocus(window, cx);
@@ -17173,7 +17175,7 @@ impl Docxy {
 
     /// Whether a text entry the active surface draws takes the keyboard: the
     /// find or comment bar where it is shown, a Project entry, or a sheet's
-    /// cell, Name Box, rename, comment, range, rule or row-height entry. F1 leaves these
+    /// cell, Name Box, font box, rename, comment, range, rule or row-height entry. F1 leaves these
     /// alone (#1021).
     fn entry_owns_keys(&self) -> bool {
         let doc = self.active_is_doc();
@@ -17464,7 +17466,7 @@ impl Docxy {
     }
 
     /// Whether a sheet bar takes the keys, Ctrl+Z and Ctrl+Y among them, so
-    /// they never reach the history: the sheet-tab rename, the Name Box, the comment,
+    /// they never reach the history: the sheet-tab rename, the Name Box, the font boxes, the comment,
     /// conditional-format (unless its range field has the focus) and
     /// row-height bars, and Find (see `sheet_key`). They hold sheet indices
     /// and cells an undo would move under them, so the QAT buttons and the
@@ -18819,8 +18821,8 @@ impl Docxy {
         self.sheet_format(
             "Font",
             move |xf| {
-                let cur = xf.font_size.unwrap_or(11.0);
-                xf.font_size = Some((cur + delta).clamp(1.0, 409.0));
+                let cur = xf.font_size.unwrap_or(font_box::DEFAULT_SIZE);
+                xf.font_size = Some((cur + delta).clamp(font_box::MIN_SIZE, font_box::MAX_SIZE));
             },
             cx,
         );
@@ -19107,12 +19109,15 @@ impl Docxy {
         self.name_box_live() || self.font_box_live()
     }
 
-    /// Whether a font box has the keyboard: opened on the sheet now shown.
+    /// Whether a font box has the keyboard: opened on the sheet now shown,
+    /// with the Home ribbon body that draws it still up.
     fn font_box_live(&self) -> bool {
         let Some(fb) = &self.font_box else {
             return false;
         };
-        self.active_tab_id().as_ref() == Some(&fb.tab)
+        self.ribbon_tab == RibbonTab::Home
+            && !self.ribbon_body_hidden()
+            && self.active_tab_id().as_ref() == Some(&fb.tab)
             && self.active_sheet().is_some_and(|v| v.active == fb.sheet)
     }
 
@@ -19160,7 +19165,8 @@ impl Docxy {
     }
 
     /// Apply what the box holds to the selection (Enter): a bad size keeps
-    /// the box, a blank box is Escape, a locked sheet refuses.
+    /// the box, a blank box is Escape, a protected sheet or a tab that takes
+    /// no edits (Protected View, Mark as Final) refuses.
     fn font_box_enter(&mut self, cx: &mut Context<Self>) {
         let Some((which, text)) = self
             .font_box
@@ -19171,6 +19177,11 @@ impl Docxy {
         };
         if text.is_empty() {
             self.font_box = None;
+            return;
+        }
+        if self.sheet_protected() {
+            self.set_status(sheet_goto::SHEET_PROTECTED);
+            cx.notify();
             return;
         }
         if self.active_locked() {
@@ -20658,7 +20669,8 @@ impl Docxy {
     fn run_sheet_act_now(&mut self, act: SheetAct, window: &mut Window, cx: &mut Context<Self>) {
         use gridcore::sheet::Align;
         // A command (a ribbon press that reaches no capture handler: KeyTips,
-        // the harness's `ribbon-click`) takes the keyboard from the Name Box.
+        // the harness's `ribbon-click`) takes the keyboard from the Name Box
+        // and the font boxes.
         self.name_box = None;
         self.font_box = None;
         // A command ends an open ribbon flyout's moment, except a toggle in
@@ -20975,7 +20987,8 @@ impl Docxy {
             return;
         }
         // Protected View (#610): only keys that look, move or copy reach the
-        // workbook. The find bar and the Name Box (a goto writes nothing) still
+        // workbook. The find bar, the Name Box (a goto writes nothing) and the font
+        // boxes (typing and copying write nothing; Enter is refused) still
         // take typing; the bar's Replace is refused where it would write.
         if self.active_locked()
             && !self.find_open
@@ -24789,6 +24802,8 @@ impl Docxy {
         }
         // Esc closes an open ribbon flyout (#1020), and only that.
         if ev.keystroke.key == "escape" && self.ribbon_flyout.take().is_some() {
+            // The box may have sat in that flyout, which is gone now (#1344).
+            self.font_box = None;
             cx.notify();
             return;
         }
@@ -34028,7 +34043,8 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// A combo-box display (font name/size) — inert for now.
+    /// The Home Font and Font Size boxes: a text field drawn from `font_box`
+    /// (#1344).
     fn sheet_combo(
         &self,
         id: &'static str,

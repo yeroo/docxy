@@ -20,9 +20,6 @@ inputs-typing-sheet-data.uit | sheet text-to-columns/breaks: OK applies | #1205
 inputs-typing-sheet-data.uit | sheet text-to-columns/formats: OK applies | #1205
 inputs-typing-sheet-data.uit | sheet text-to-columns/destination: OK applies | #1205
 
-# Home's Font and Font Size boxes are inert (SheetAct::Todo, a fixed
-# value): a click takes no focus, and what is typed goes into the cell (#1200).
-
 # The document Find bar's fields are append-only (find_key): no caret, so
 # Home, End, Left, Right and Delete do nothing, and Ctrl+A/C/V are ignored
 # (#1201 found it).
