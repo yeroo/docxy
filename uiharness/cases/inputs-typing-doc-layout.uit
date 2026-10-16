@@ -7224,6 +7224,166 @@ test doc hyphenation/limit: refuses invalid
   assert reply.value is 3
   call real-key {"key":"escape"}
 
+test doc manual-hyphenation: matches the catalogue
+  open ../fixtures/basic.docx
+  type computer
+  key home
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Hyphenation"]}}
+  call menu-click {"label":"Manual"}
+  assert dialog is manual-hyphenation
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc manual-hyphenation/at: focus by click
+  open ../fixtures/basic.docx
+  type computer
+  key home
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Hyphenation"]}}
+  call menu-click {"label":"Manual"}
+  assert dialog is manual-hyphenation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"at"}
+  call field-read {"dialog-field":"at"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc manual-hyphenation/at: focus by Tab
+  open ../fixtures/basic.docx
+  type computer
+  key home
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Hyphenation"]}}
+  call menu-click {"label":"Manual"}
+  assert dialog is manual-hyphenation
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"at"}
+  call field-read {"dialog-field":"at"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc manual-hyphenation/at: types
+  open ../fixtures/basic.docx
+  type computer
+  key home
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Hyphenation"]}}
+  call menu-click {"label":"Manual"}
+  assert dialog is manual-hyphenation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"at"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"dialog-field":"at"}
+  assert reply.value is "Ab1 "
+  assert reply.caret is 4
+  call real-key {"key":"escape"}
+
+test doc manual-hyphenation/at: edits
+  open ../fixtures/basic.docx
+  type computer
+  key home
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Hyphenation"]}}
+  call menu-click {"label":"Manual"}
+  assert dialog is manual-hyphenation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"at"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"at"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"at"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"at"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"at"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"at"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc manual-hyphenation/at: select-all replaces
+  open ../fixtures/basic.docx
+  type computer
+  key home
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Hyphenation"]}}
+  call menu-click {"label":"Manual"}
+  assert dialog is manual-hyphenation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"at"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"at"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"at"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc manual-hyphenation/at: pastes
+  open ../fixtures/basic.docx
+  type computer
+  key home
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Hyphenation"]}}
+  call menu-click {"label":"Manual"}
+  assert dialog is manual-hyphenation
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"at"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"at"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc manual-hyphenation/at: copies
+  open ../fixtures/basic.docx
+  type computer
+  key home
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Hyphenation"]}}
+  call menu-click {"label":"Manual"}
+  assert dialog is manual-hyphenation
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"at"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc manual-hyphenation/at: Escape cancels
+  open ../fixtures/basic.docx
+  type computer
+  key home
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Hyphenation"]}}
+  call menu-click {"label":"Manual"}
+  assert dialog is manual-hyphenation
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"at"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not manual-hyphenation
+  type computer
+  key home
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Hyphenation"]}}
+  call menu-click {"label":"Manual"}
+  assert dialog is manual-hyphenation
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"at"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
 test doc hf-distance: matches the catalogue
   open ../fixtures/basic.docx
   call ribbon-click {"tab":"Insert","command":"Edit Header"}

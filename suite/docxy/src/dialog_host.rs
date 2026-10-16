@@ -86,6 +86,9 @@ fn apply_dialog(
             };
             crate::hyphenation_dialog::apply_hyphenation(pkg, dialog)
         }
+        // Handled in `manual_hyphen::click`, before this: Yes and No act and
+        // ask about the next word.
+        DialogOwner::ManualHyphen => Err("Manual hyphenation answers through its buttons".into()),
         DialogOwner::HfDistance { is_header, section } => {
             let Surface::Doc(ed) = surface else {
                 return Err("this dialog belongs to a document".into());
@@ -332,6 +335,9 @@ fn dialog_press(tab: &mut DocTab, button: &str) -> Result<(), String> {
         return done;
     }
     if let Some(done) = crate::mailings_dialogs::click(tab, button) {
+        return done;
+    }
+    if let Some(done) = crate::manual_hyphen::click(tab, button) {
         return done;
     }
     if let Some(done) = crate::doc_fields::click(tab, button) {

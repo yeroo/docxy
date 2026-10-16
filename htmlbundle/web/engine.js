@@ -664,6 +664,7 @@
     'Layout(LineNumbers(RestartEachPage))': NOT_YET,
     'Layout(LineNumbers(RestartEachSection))': NOT_YET,
     'Layout(LineNumbersOptions)': NOT_YET,
+    'Layout(ManualHyphenation)': NOT_YET,
     'Layout(Margins(Mirrored))': NOT_YET,
     'Layout(Margins(Moderate))': NOT_YET,
     'Layout(Margins(Narrow))': NOT_YET,
@@ -689,7 +690,6 @@
     'Layout(Paper(Letter))': NOT_YET,
     'Layout(Paper(Tabloid))': NOT_YET,
     'Layout(SuppressLineNumbers)': NOT_YET,
-    'Layout(Unavailable)': NOT_YET,
     // The Mailings tab (#628): mail merge needs a recipient file and new
     // documents, which the page has no model for.
     'Mail(AddressBlock)': NOT_YET,

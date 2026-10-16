@@ -38,8 +38,8 @@ pub(crate) enum LayoutAct {
     /// Open the Line Numbers dialog (#747).
     LineNumbersOptions,
     HyphenationOptions,
-    /// An item Word has that has nothing behind it yet: drawn disabled.
-    Unavailable,
+    /// Word's Manual hyphenation walk (#1266).
+    ManualHyphenation,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -236,7 +236,7 @@ fn menu_rows(menu: LayoutMenu) -> Vec<Row> {
         LayoutMenu::Hyphenation => vec![
             item("hyphen-none", "None", L::Hyphen(false)),
             item("hyphen-auto", "Automatic", L::Hyphen(true)),
-            item("hyphen-manual", "Manual", L::Unavailable),
+            item("hyphen-manual", "Manual", L::ManualHyphenation),
             Row::Separator,
             item(
                 "hyphen-options",
@@ -336,23 +336,14 @@ pub(crate) fn menu_items(menu: LayoutMenu, checked: impl Fn(Act) -> bool) -> Vec
         .into_iter()
         .map(|row| match row {
             Row::Item { id, label, act } => {
-                let entry = if act == LayoutAct::Unavailable {
-                    menu::Entry::unavailable(id, label)
-                } else {
-                    menu::Entry::new(id, label, "", Act::Layout(act), true)
-                        .checked(checked(Act::Layout(act)))
-                };
+                let entry = menu::Entry::new(id, label, "", Act::Layout(act), true)
+                    .checked(checked(Act::Layout(act)));
                 menu::MenuItem::Item(entry)
             }
             Row::Heading(h) => menu::MenuItem::Heading(h.into()),
             Row::Separator => menu::MenuItem::Separator,
         })
         .collect()
-}
-
-/// Whether a Layout command can run: the placeholders cannot.
-pub(crate) fn layout_enabled(act: LayoutAct) -> bool {
-    act != LayoutAct::Unavailable
 }
 
 /// The body editor and package of a .docx tab, or why a Layout command has
@@ -526,7 +517,7 @@ pub(crate) fn layout_apply(tab: &mut DocTab, act: LayoutAct) -> Result<(), Strin
         | LayoutAct::MoreColumns
         | LayoutAct::LineNumbersOptions
         | LayoutAct::HyphenationOptions
-        | LayoutAct::Unavailable => return Ok(()),
+        | LayoutAct::ManualHyphenation => return Ok(()),
     };
     if changed {
         tab.set_dirty();
@@ -568,7 +559,13 @@ impl Docxy {
             LayoutAct::HyphenationOptions => {
                 self.open_layout_dialog(crate::hyphenation_dialog::hyphenation_dialog)
             }
-            LayoutAct::Unavailable => {}
+            LayoutAct::ManualHyphenation => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    if let Err(e) = crate::manual_hyphen::start(tab) {
+                        tab.status = e.into();
+                    }
+                }
+            }
             _ => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     if let Err(e) = layout_apply(tab, act) {

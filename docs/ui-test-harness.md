@@ -552,8 +552,7 @@ footer editor; `selection-set` refuses while it is open.
 
 `ribbon-read` and `ribbon-click` work on document, Project and sheet tabs. Each
 command's `enabled` is the predicate its button draws with (every document and
-Project ribbon command is enabled today except the document Layout tab's
-placeholders, `LayoutAct::Unavailable`: Manual, and
+Project ribbon command is enabled today except
 the Design tab's Page Borders on a Markdown tab,
 which keeps no section properties; sheet placeholders, drawn but doing nothing
 yet, report `enabled: false`, see below), and a command inside a split button's or a

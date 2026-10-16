@@ -250,6 +250,23 @@ dialogs! {
         accept_closes: true,
         unreachable: None,
     }
+    MANUAL_HYPHENATION = "manual-hyphenation" {
+        surface: Surface::Doc,
+        file: "doc-layout",
+        fixture: DOCX,
+        open: &[
+            "type computer",
+            "key home",
+            r#"call menu-open {"target":{"ribbon":["Layout","Page Setup","Hyphenation"]}}"#,
+            r#"call menu-click {"label":"Manual"}"#,
+        ],
+        fields: &[Field::text("at").no_ok(
+            "Yes refuses text that is not the word with one hyphen inside it, which the sample is not",
+        )],
+        reopen: &[],
+        accept_closes: false,
+        unreachable: None,
+    }
     HF_DISTANCE = "hf-distance" {
         surface: Surface::Doc,
         file: "doc-layout",

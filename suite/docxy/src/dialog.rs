@@ -41,6 +41,8 @@ pub(crate) enum DialogOwner {
     LineNumbers,
     /// Word's Hyphenation, on the document's settings (#1265).
     Hyphenation,
+    /// Word's Manual Hyphenation, on the walk's current word (#1266).
+    ManualHyphen,
     /// The Header & Footer tab's Header from Top (`is_header`) or Footer from
     /// Bottom Custom... box, for one section (#641).
     HfDistance {

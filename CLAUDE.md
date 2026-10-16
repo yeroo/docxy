@@ -158,3 +158,17 @@
   minimised ribbon, where `ribbon_body_hidden` draws no View tab) call
   `cycle_theme`, which says the new setting on the status line.
   `title_left_caps` no longer reserves a theme width.
+
+## Manual hyphenation (#1266)
+
+- Layout > Hyphenation > Manual (`suite/docxy/src/manual_hyphen.rs`) walks the
+  words that may take an optional hyphen, from the caret or over the selection,
+  one "Manual Hyphenation" dialog each (Yes inserts, No skips, Cancel stops; the
+  `-` in the "Hyphenate at:" box can be moved). It proposes every eligible word,
+  not only those at a line end as Word does: docxy's layout never hyphenates
+  and wrapping differs per host. The candidate is the editor's selection; the
+  dialog keeps the walk's end and the count in hidden labels.
+- `docxcore::hyphenate` is a dependency-free English-oriented syllable
+  heuristic, not a dictionary. `Editor::insert_soft_hyphen` puts U+00AD in a run
+  of its own with `hyphen_elements`, so it saves as `w:softHyphen` (a plain run's
+  U+00AD would stay literal text), as one undo step.

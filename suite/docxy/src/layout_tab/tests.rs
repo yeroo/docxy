@@ -376,13 +376,7 @@ fn menus_follow_word_with_headings_separators_and_placeholders() {
     );
     assert_eq!(
         labels(LayoutMenu::Hyphenation),
-        [
-            "None",
-            "Automatic",
-            "(Manual)",
-            "-",
-            "Hyphenation Options..."
-        ]
+        ["None", "Automatic", "Manual", "-", "Hyphenation Options..."]
     );
     assert_eq!(
         labels(LayoutMenu::Size).last().unwrap(),
@@ -482,4 +476,28 @@ fn hyphenation_options_is_enabled() {
         })
         .expect("the row");
     assert_eq!(act, LayoutAct::HyphenationOptions);
+}
+
+/// #1266: Manual is a live command, drawn enabled, that starts the walk.
+#[test]
+fn manual_hyphenation_is_enabled() {
+    let rows = menu_rows(LayoutMenu::Hyphenation);
+    let act = rows
+        .into_iter()
+        .find_map(|r| match r {
+            Row::Item {
+                id: "hyphen-manual",
+                act,
+                ..
+            } => Some(act),
+            _ => None,
+        })
+        .expect("the row");
+    assert_eq!(act, LayoutAct::ManualHyphenation);
+    let items = menu_items(LayoutMenu::Hyphenation, |_| false);
+    let manual = items.iter().find_map(|i| match i {
+        menu::MenuItem::Item(e) if e.id == "hyphen-manual" => Some(e),
+        _ => None,
+    });
+    assert!(manual.expect("the item").enabled);
 }

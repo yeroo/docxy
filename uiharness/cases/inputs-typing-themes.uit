@@ -1,19 +1,21 @@
 # GENERATED with the inputs-typing-*.uit cases (see there); do not edit
 # by hand (#1029). A text, a number and a dropdown field under each theme.
 
-test dark theme doc insert-table/width: types
+test dark theme doc manual-hyphenation/at: types
   open ../fixtures/basic.docx
   call theme-set {"theme":"dark"}
-  call ribbon-click {"tab":"Insert","command":"table"}
-  call menu-click {"label":"Insert Table..."}
-  assert dialog is insert-table
+  type computer
+  key home
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Hyphenation"]}}
+  call menu-click {"label":"Manual"}
+  assert dialog is manual-hyphenation
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"width"}
+  call pointer-click {"dialog-field":"at"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"1.5"}
-  call field-read {"dialog-field":"width"}
-  assert reply.value is 1.5
-  assert reply.caret is 3
+  call real-type {"text":"Ab1 "}
+  call field-read {"dialog-field":"at"}
+  assert reply.value is "Ab1 "
+  assert reply.caret is 4
   shot window
   call real-key {"key":"escape"}
   call theme-set {"theme":"auto"}
@@ -62,19 +64,21 @@ test dark theme doc page-setup/multiple: Up and Down step
   call real-key {"key":"escape"}
   call theme-set {"theme":"auto"}
 
-test light theme doc insert-table/width: types
+test light theme doc manual-hyphenation/at: types
   open ../fixtures/basic.docx
   call theme-set {"theme":"light"}
-  call ribbon-click {"tab":"Insert","command":"table"}
-  call menu-click {"label":"Insert Table..."}
-  assert dialog is insert-table
+  type computer
+  key home
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Hyphenation"]}}
+  call menu-click {"label":"Manual"}
+  assert dialog is manual-hyphenation
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"width"}
+  call pointer-click {"dialog-field":"at"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"1.5"}
-  call field-read {"dialog-field":"width"}
-  assert reply.value is 1.5
-  assert reply.caret is 3
+  call real-type {"text":"Ab1 "}
+  call field-read {"dialog-field":"at"}
+  assert reply.value is "Ab1 "
+  assert reply.caret is 4
   shot window
   call real-key {"key":"escape"}
   call theme-set {"theme":"auto"}

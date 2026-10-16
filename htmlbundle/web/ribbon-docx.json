@@ -2368,7 +2368,7 @@
                   "id": "hyphen-manual",
                   "label": "Manual",
                   "icon": "hyphenation",
-                  "act": "Layout(Unavailable)",
+                  "act": "Layout(ManualHyphenation)",
                   "keyTip": "",
                   "tip": {
                     "title": "",
