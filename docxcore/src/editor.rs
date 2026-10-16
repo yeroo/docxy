@@ -75,7 +75,7 @@ pub struct HyphenCandidate {
 /// and end (`depth` open fields on entry, updated). Appends one flag per char.
 fn walk_barred(items: &[Inline], out: &mut Vec<bool>, depth: &mut i32, in_link: bool) {
     use crate::field::{FieldEvent, field_events};
-    let mut step = |raw: &str, depth: &mut i32| {
+    let step = |raw: &str, depth: &mut i32| {
         for e in field_events(raw) {
             match e {
                 FieldEvent::Begin => *depth += 1,
