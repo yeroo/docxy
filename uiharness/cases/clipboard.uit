@@ -165,13 +165,14 @@ test a sheet copy puts an HTML table with its formatting beside the text
 
 test another app's HTML table pastes its cells
   open ../fixtures/basic.xlsx
-  call clipboard {"action":"write","text":"x\ty\n","html":"<table><tr><td>7</td><td colspan=2>a &amp; b</td></tr><tr><td>9</td></tr></table>"}
+  call clipboard {"action":"write","text":"x\ty\n","html":"<table><tr><td>7</td><td colspan=2>a &amp; b</td><td>z</td></tr><tr><td>9</td></tr></table>"}
   assert reply.app.kind is none
   click D8
   key ctrl+v
   assert cell D8 is 7
   assert cell E8 is a & b
-  assert cell G8 is nothing
+  assert cell F8 is nothing
+  assert cell G8 is z
   assert cell D9 is 9
 
 test an HTML table with no text beside it pastes
@@ -189,6 +190,30 @@ test another app's RTF table pastes its cells
   key ctrl+v
   assert cell D8 is 1
   assert cell E8 is 2
+
+test text another window copied as docxy pastes as its exact text, not its table
+  # The HTML says 007; the TSV beside it says '007, which keeps it text.
+  open ../fixtures/basic.xlsx
+  click M50
+  type '007
+  key enter
+  click M50
+  key ctrl+c
+  call window-new {}
+  open ../fixtures/basic.xlsx
+  click D8
+  key ctrl+v
+  assert cell D8 is 007
+
+test a copy that is a table and a paragraph pastes as text
+  open ../fixtures/basic.xlsx
+  call clipboard {"action":"write","text":"Title\n1\t2\nafter\n","html":"<h1>Title</h1><table><tr><td>1</td><td>2</td></tr></table><p>after</p>"}
+  click D8
+  key ctrl+v
+  assert cell D8 is Title
+  assert cell D9 is 1
+  assert cell E9 is 2
+  assert cell D10 is after
 
 test text copied after a sheet copy leaves no HTML behind
   open ../fixtures/basic.xlsx

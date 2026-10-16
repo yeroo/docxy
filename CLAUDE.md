@@ -110,9 +110,10 @@
   recorded text and the harness's private clipboard stay LF.
 - A sheet paste takes the live grid clip, else another app's HTML table, else
   its RTF table (`foreign_table`: cell texts only, each read as typed through
-  `fields_block`), else the text as TSV. The HTML wins over the text beside
-  it, so a text cell like `007` copied from docxy pastes back through its table
-  without the `'` the TSV carries. Paste Special still reads the text.
+  `fields_block`), else the text as TSV. A table counts only when it is the
+  whole copy (no other text, one table), and docxy's own table (marked
+  `data-source=docxy`) never does: its exact TSV, with the `'` a text cell like
+  `007` needs, is what pastes. Paste Special still reads the text.
 
 ## Build info
 

@@ -91,9 +91,11 @@ fn html_page(fragment: &str) -> String {
 }
 
 /// The HTML an `HTML Format` / `public.html` payload carries: the fragment
-/// its CF_HTML header names (when the offsets fit the payload and cut it on
-/// character boundaries), else the whole payload read as UTF-8. `None` for
-/// an empty payload.
+/// its CF_HTML header names (when the offsets fit the payload, cut it on
+/// character boundaries and it holds the `<table`), else the whole page, from
+/// its first tag on (Excel's fragment starts inside the table, after its
+/// `<table>` tag, so the page is the one that has it). `None` for an empty
+/// payload.
 fn html_fragment(bytes: &[u8]) -> Option<String> {
     if bytes.is_empty() {
         return None;
@@ -107,11 +109,14 @@ fn html_fragment(bytes: &[u8]) -> Option<String> {
     if let (Some(start), Some(end)) = (offset("StartFragment:"), offset("EndFragment:")) {
         if start <= end && end <= bytes.len() {
             if let Ok(fragment) = std::str::from_utf8(&bytes[start..end]) {
-                return Some(fragment.to_string());
+                if fragment.to_ascii_lowercase().contains("<table") {
+                    return Some(fragment.to_string());
+                }
             }
         }
     }
-    Some(String::from_utf8_lossy(bytes).into_owned())
+    let page = String::from_utf8_lossy(bytes);
+    Some(page[page.find('<').unwrap_or(0)..].to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -362,10 +367,33 @@ mod tests {
         );
         // Offsets past the payload, or inside a character.
         let bad = "Version:0.9\r\nStartFragment:0000000010\r\nEndFragment:0000009999\r\n<table>";
-        assert_eq!(html_fragment(bad.as_bytes()).as_deref(), Some(bad));
-        let split = "StartFragment:0000000051\r\nEndFragment:0000000052\r\n\u{e9}";
-        assert_eq!(html_fragment(split.as_bytes()).as_deref(), Some(split));
+        assert_eq!(html_fragment(bad.as_bytes()).as_deref(), Some("<table>"));
+        let split = "StartFragment:0000000051\r\nEndFragment:0000000052\r\n<p>\u{e9}";
+        assert_eq!(
+            html_fragment(split.as_bytes()).as_deref(),
+            Some("<p>\u{e9}")
+        );
         assert_eq!(html_fragment(b""), None);
+    }
+
+    /// Excel's CF_HTML fragment starts after the opening `<table>` tag, so the
+    /// table's attributes and the page around it are what the paste needs.
+    #[test]
+    fn a_fragment_inside_the_table_reads_the_whole_page() {
+        let page = "<html><body><table x=1>\r\n<!--StartFragment--><tr><td>a</td></tr><!--EndFragment--></table></body></html>";
+        let start = page.find("<tr>").unwrap();
+        let end = page.find("<!--EndFragment").unwrap();
+        let payload = format!(
+            "Version:0.9\r\nStartHTML:0000000105\r\nEndHTML:{:010}\r\nStartFragment:{:010}\r\nEndFragment:{:010}\r\n{page}",
+            105 + page.len(),
+            105 + start,
+            105 + end
+        );
+        let got = html_fragment(payload.as_bytes()).unwrap();
+        assert!(
+            got.starts_with("<html>") && got.contains("<table x=1>"),
+            "{got}"
+        );
     }
 
     #[test]

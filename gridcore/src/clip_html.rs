@@ -15,6 +15,15 @@ use crate::sheet::{Align, Cell, CellValue, Sheet, Styles, format_with};
 /// a hostile `rowspan` cannot ask for more memory than this.
 const MAX_CELLS: usize = 4_000_000;
 
+/// The attribute [`html_table`] puts on its table: docxy's own copy, whose
+/// exact TSV beside it (with the `'` a text cell needs) a paste prefers.
+const OWN_MARK: &str = "data-source=docxy";
+
+/// Whether `html` holds a table [`html_table`] wrote.
+pub fn is_own_table(html: &str) -> bool {
+    html.contains(OWN_MARK)
+}
+
 /// `s` for an HTML text node or attribute: `&`, `<`, `>`, `"` escaped, a
 /// line feed as `<br>`.
 fn escape(s: &str) -> String {
@@ -75,6 +84,10 @@ fn cell_style(xf: &crate::sheet::Xf, value: &CellValue) -> String {
         }
         Align::General => {}
     }
+    // Text stays text where another app would read it as a number or a date.
+    if matches!(value, CellValue::Text(_)) {
+        css.push_str("mso-number-format:\"\\@\";");
+    }
     css
 }
 
@@ -88,7 +101,7 @@ pub fn html_table(
     rows: &[u32],
     cols: &[u32],
 ) -> String {
-    let mut out = String::from("<table border=0 cellpadding=0 cellspacing=0>");
+    let mut out = format!("<table {OWN_MARK} border=0 cellpadding=0 cellspacing=0>");
     for &r in rows {
         out.push_str("<tr>");
         for &c in cols {
@@ -99,7 +112,7 @@ pub fn html_table(
                     let attr = if css.is_empty() {
                         String::new()
                     } else {
-                        format!(" style=\"{css}\"")
+                        format!(" style='{css}'")
                     };
                     out.push_str(&format!(
                         "<td{attr}>{}</td>",
@@ -112,7 +125,7 @@ pub fn html_table(
                     if css.is_empty() {
                         out.push_str("<td></td>");
                     } else {
-                        out.push_str(&format!("<td style=\"{css}\"></td>"));
+                        out.push_str(&format!("<td style='{css}'></td>"));
                     }
                 }
                 None => out.push_str("<td></td>"),
@@ -129,19 +142,20 @@ pub fn html_table(
 #[derive(Default)]
 struct Grid {
     rows: Vec<Vec<Option<String>>>,
+    /// Cells allocated so far, and cells visited filling spans: both are
+    /// bounded by [`MAX_CELLS`], so a hostile table costs neither memory nor
+    /// time without limit.
     cells: usize,
+    work: usize,
 }
 
 impl Grid {
     fn ensure(&mut self, r: usize, c: usize) -> bool {
-        if r >= self.rows.len() || c >= self.rows[r].len() {
-            let grow = (r + 1).saturating_sub(self.rows.len())
-                + c.saturating_sub(self.rows.get(r).map_or(0, Vec::len))
-                + 1;
-            self.cells += grow;
-            if self.cells > MAX_CELLS {
-                return false;
-            }
+        let have = self.rows.get(r).map_or(0, Vec::len);
+        let grow = (r + 1).saturating_sub(self.rows.len()) + (c + 1).saturating_sub(have);
+        self.cells += grow;
+        if self.cells > MAX_CELLS {
+            return false;
         }
         while self.rows.len() <= r {
             self.rows.push(Vec::new());
@@ -169,6 +183,10 @@ impl Grid {
         cs: usize,
         rs: usize,
     ) -> Option<usize> {
+        self.work += cs * rs;
+        if self.work > MAX_CELLS {
+            return None;
+        }
         while self.taken(r, c) {
             c += 1;
         }
@@ -187,9 +205,12 @@ impl Grid {
         Some(c + cs)
     }
 
+    /// The rows padded to the widest, or `None` for no cell or for more
+    /// cells than [`MAX_CELLS`] once padded (a thousand rows of one cell and
+    /// one of a thousand would otherwise make a million).
     fn finish(self) -> Option<Vec<Vec<String>>> {
         let width = self.rows.iter().map(Vec::len).max().unwrap_or(0);
-        if width == 0 {
+        if width == 0 || self.rows.len().saturating_mul(width) > MAX_CELLS {
             return None;
         }
         Some(
@@ -221,21 +242,23 @@ fn entity(body: &str) -> Option<char> {
         "gt" => '>',
         "quot" => '"',
         "apos" => '\'',
-        "nbsp" => ' ',
+        "nbsp" => '\u{a0}',
         _ => return None,
     })
 }
 
-/// `text` with entities decoded.
+/// `text` with entities decoded. An `&` looks only a few bytes ahead for its
+/// `;`, so a run of bare `&`s costs no more than its length.
 fn decode(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(i) = rest.find('&') {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
-        let decoded = rest[1..]
-            .find(';')
-            .filter(|&n| n <= 10)
+        let decoded = rest.as_bytes()[1..]
+            .iter()
+            .take(11)
+            .position(|&b| b == b';')
             .and_then(|n| entity(&rest[1..1 + n]).map(|c| (c, n + 2)));
         match decoded {
             Some((c, used)) => {
@@ -287,19 +310,25 @@ fn span(tag: &str, name: &str) -> usize {
     1
 }
 
+/// A `<br>` or block end inside a cell's text, until [`collapse`] makes it a
+/// line feed.
+const BREAK: char = '\u{1}';
+
 /// A cell's text with HTML whitespace collapsed: a run of blanks is one
-/// space, the cell's ends are trimmed; line breaks were already LF.
+/// space, the cell's ends are trimmed, a [`BREAK`] is a line feed, and a
+/// no-break space (`&nbsp;`) is a space that survives all of that. A cell of
+/// nothing else (Excel writes `&nbsp;` for an empty one) is empty.
 fn collapse(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
-    let mut blank = false;
+    let mut blank = true;
     for c in raw.chars() {
-        if c == '\n' {
+        if c == BREAK {
             while out.ends_with(' ') {
                 out.pop();
             }
-            out.push('\n');
+            out.push(BREAK);
             blank = true;
-        } else if c.is_whitespace() {
+        } else if c.is_whitespace() && c != '\u{a0}' {
             if !blank {
                 out.push(' ');
                 blank = true;
@@ -309,28 +338,33 @@ fn collapse(raw: &str) -> String {
             blank = false;
         }
     }
-    out.trim_matches([' ', '\n']).to_string()
+    let text = out.trim_matches([' ', BREAK]).replace(BREAK, "\n");
+    if text.chars().all(char::is_whitespace) {
+        return String::new();
+    }
+    text.replace('\u{a0}', " ")
 }
 
-/// The cell texts of the first `<table>` in `html`, rows by columns (short
+/// The cell texts of the table that is all of `html`, rows by columns (short
 /// rows padded; a `colspan`/`rowspan` fills the cells it covers with empty
-/// text), or `None` for no table or no cell. Entities are decoded and a
-/// `<br>` is a line feed. Text before the table (a CF_HTML header, `<html>`
-/// and `<style>`) is skipped, and unclosed `<td>`, `<tr>` and `<table>` end
+/// text), or `None` for no table, no cell, more than one table, or any text
+/// outside the table (a heading or a paragraph beside it: the copy is more
+/// than a table, so its text is pasted instead). Entities are decoded, source
+/// line breaks are blanks and a `<br>` is a line feed; a table inside a cell
+/// is part of that cell's text. A CF_HTML header, `<html>`, `<title>` and
+/// `<style>` are not text, and an unclosed `<td>`, `<tr>` or `<table>` ends
 /// at the next one.
 #[allow(unused_assignments)]
 pub fn parse_html_table(html: &str) -> Option<Vec<Vec<String>>> {
     let lower = html.to_ascii_lowercase();
-    let start = lower.find("<table")?;
+    let bytes = html.as_bytes();
     let mut grid = Grid::default();
     let mut row: Option<usize> = None;
     let mut col = 0usize;
     let mut cell: Option<(String, usize, usize)> = None;
     let mut next_row = 0usize;
-    let mut i = start;
-    let mut depth = 0usize;
-    let bytes = html.as_bytes();
-    // Text up to the next tag, tag by tag.
+    let (mut depth, mut tables, mut outside) = (0usize, 0usize, false);
+    let mut i = 0;
     macro_rules! close_cell {
         () => {
             if let Some((text, cs, rs)) = cell.take() {
@@ -339,12 +373,30 @@ pub fn parse_html_table(html: &str) -> Option<Vec<Vec<String>>> {
             }
         };
     }
-    while i < bytes.len() {
-        if bytes[i] != b'<' {
-            let end = html[i..].find('<').map_or(html.len(), |n| i + n);
-            if let Some((text, ..)) = cell.as_mut() {
-                text.push_str(&html[i..end]);
+    macro_rules! text {
+        ($t:expr) => {
+            let t: &str = $t;
+            if let Some((cell, ..)) = cell.as_mut() {
+                cell.extend(t.chars().map(|c| {
+                    if matches!(c, '\r' | '\n' | '\t') {
+                        ' '
+                    } else {
+                        c
+                    }
+                }));
+            } else if depth == 0 && !decode(t).chars().all(char::is_whitespace) {
+                outside = true;
             }
+        };
+    }
+    while i < bytes.len() {
+        let is_tag = bytes[i] == b'<'
+            && bytes
+                .get(i + 1)
+                .is_some_and(|&n| n.is_ascii_alphabetic() || matches!(n, b'/' | b'!' | b'?'));
+        if !is_tag {
+            let end = html[i + 1..].find('<').map_or(html.len(), |n| i + 1 + n);
+            text!(&html[i..end]);
             i = end;
             continue;
         }
@@ -359,21 +411,28 @@ pub fn parse_html_table(html: &str) -> Option<Vec<Vec<String>>> {
         let (name, closing) = tag_name(tag);
         i += n + 1;
         match (name.as_str(), closing) {
-            ("table", false) => depth += 1,
+            ("table", false) => {
+                if depth == 0 {
+                    tables += 1;
+                    if tables > 1 {
+                        return None;
+                    }
+                }
+                depth += 1;
+            }
             ("table", true) => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
                     close_cell!();
-                    break;
                 }
             }
-            ("style" | "script", false) => {
+            ("style" | "script" | "title", false) => {
                 let close = format!("</{name}");
                 i = lower[i..].find(&close).map_or(html.len(), |n| i + n);
             }
             // A nested table's cells belong to the outer cell's text: only
             // the outermost table's own rows and cells make the grid.
-            _ if depth > 1 => {}
+            _ if depth != 1 => {}
             ("tr", false) => {
                 close_cell!();
                 row = Some(next_row);
@@ -391,15 +450,10 @@ pub fn parse_html_table(html: &str) -> Option<Vec<Vec<String>>> {
                 cell = Some((String::new(), span(tag, "colspan"), span(tag, "rowspan")));
             }
             ("td" | "th", true) => close_cell!(),
-            ("br", _) => {
+            ("br", _) | ("p" | "div", true) => {
                 if let Some((text, ..)) = cell.as_mut() {
-                    text.push('\n');
-                }
-            }
-            ("p" | "div", true) => {
-                if let Some((text, ..)) = cell.as_mut() {
-                    if !text.is_empty() && !text.ends_with('\n') {
-                        text.push('\n');
+                    if !text.ends_with(BREAK) {
+                        text.push(BREAK);
                     }
                 }
             }
@@ -407,52 +461,14 @@ pub fn parse_html_table(html: &str) -> Option<Vec<Vec<String>>> {
         }
     }
     close_cell!();
+    if outside {
+        return None;
+    }
     grid.finish()
 }
 
-/// The texts of the bold cells (`font-weight` 700 or bold on a `<td>` or
-/// `<th>`) of the first table in `html`, in order: what a pasted table would
-/// show in bold. For tests of what a copy puts on the clipboard.
-pub fn html_bold_cells(html: &str) -> Vec<String> {
-    let lower = html.to_ascii_lowercase();
-    let mut out = Vec::new();
-    let mut at = lower.find("<table").unwrap_or(lower.len());
-    while let Some(i) = lower[at..].find("<td").map(|n| at + n) {
-        let Some(open_end) = lower[i..].find('>').map(|n| i + n) else {
-            break;
-        };
-        let close = lower[open_end..]
-            .find("</td")
-            .map_or(lower.len(), |n| open_end + n);
-        let tag = &lower[i..open_end];
-        if tag.contains("font-weight:700") || tag.contains("font-weight:bold") {
-            let cell = format!(
-                "<table><tr><td>{}</td></tr></table>",
-                &html[open_end + 1..close]
-            );
-            if let Some(rows) = parse_html_table(&cell) {
-                out.push(rows[0][0].clone());
-            }
-        }
-        at = close;
-    }
-    out
-}
-
-/// The character of byte `b` in Windows-1252.
-fn windows_1252(b: u8) -> char {
-    const HIGH: [char; 32] = [
-        '\u{20ac}', '\u{81}', '\u{201a}', '\u{192}', '\u{201e}', '\u{2026}', '\u{2020}',
-        '\u{2021}', '\u{2c6}', '\u{2030}', '\u{160}', '\u{2039}', '\u{152}', '\u{8d}', '\u{17d}',
-        '\u{8f}', '\u{90}', '\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}', '\u{2022}', '\u{2013}',
-        '\u{2014}', '\u{2dc}', '\u{2122}', '\u{161}', '\u{203a}', '\u{153}', '\u{9d}', '\u{17e}',
-        '\u{178}',
-    ];
-    match b {
-        0x80..=0x9f => HIGH[(b - 0x80) as usize],
-        _ => b as char,
-    }
-}
+/// What a `\'hh` byte reads as when its code page is not known.
+const REPLACEMENT: char = '\u{fffd}';
 
 /// The RTF groups whose text is not the document's.
 fn skipped_destination(word: &str) -> bool {
@@ -479,23 +495,28 @@ fn skipped_destination(word: &str) -> bool {
     )
 }
 
-/// The cell texts of the first table in `rtf` (a `\trowd` row with its
-/// `\cell`s and `\row`), or `None` when the RTF holds no table. Control words
-/// and groups are dropped, `\'hh` is read as Windows-1252, `\uN` as UTF-16 (the
-/// fallback character after it skipped), `\par` and `\line` as a line feed
-/// inside the cell. Rows are padded to the widest.
+/// The cell texts of the table that is all of `rtf` (rows of `\trowd`,
+/// `\cell`s and `\row`), or `None` when the RTF holds no table or any text
+/// outside it (a paragraph before or after: the copy is more than a table,
+/// so its text is pasted instead). Control words and groups are dropped,
+/// `\'hh` is read in the `\ansicpgN` code page (1252 without one), `\uN` as
+/// UTF-16 (the fallback character after it skipped), `\par` and `\line` as a
+/// line feed inside the cell. A `\trowd` repeated before `\row`, as Word
+/// writes it, keeps the row's cells. A table inside a cell is part of that
+/// cell's text. Rows are padded to the widest.
 pub fn parse_rtf_table(rtf: &str) -> Option<Vec<Vec<String>>> {
     let b = rtf.as_bytes();
     let mut i = 0;
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut row: Vec<String> = Vec::new();
     let mut cur = String::new();
-    let mut in_table = false;
+    let (mut seen_table, mut outside) = (false, false);
     let mut cells = 0usize;
     let mut skip_depth: Option<usize> = None;
     let mut depth = 0usize;
     let mut uc = 1usize;
     let mut uc_skip = 0usize;
+    let mut page = 1252i32;
     // Pending high surrogate of a `\uN` pair.
     let mut high: Option<u16> = None;
     while i < b.len() {
@@ -526,33 +547,38 @@ pub fn parse_rtf_table(rtf: &str) -> Option<Vec<Vec<String>>> {
             }
             b'\\' => {
                 i += 1;
-                let Some(&next) = b.get(i) else {
+                let Some(ch) = rtf[i..].chars().next() else {
                     break;
                 };
-                if !next.is_ascii_alphabetic() {
-                    i += 1;
+                if !ch.is_ascii_alphabetic() {
+                    i += ch.len_utf8();
                     let skipping = skip_depth.is_some();
-                    match next {
-                        b'\'' => {
-                            let hex = rtf
-                                .get(i..i + 2)
-                                .and_then(|h| u8::from_str_radix(h, 16).ok());
-                            i += 2.min(b.len() - i);
+                    match ch {
+                        '\'' => {
+                            let hex: String = rtf[i..]
+                                .chars()
+                                .take(2)
+                                .take_while(char::is_ascii_hexdigit)
+                                .collect();
+                            i += hex.len();
                             if uc_skip > 0 {
                                 uc_skip -= 1;
-                            } else if let (Some(byte), false) = (hex, skipping) {
-                                cur.push(windows_1252(byte));
+                            } else if hex.len() == 2 && !skipping {
+                                let byte = u8::from_str_radix(&hex, 16).unwrap_or(b'?');
+                                cur.push(
+                                    opccore::codepage::decode(page, byte).unwrap_or(REPLACEMENT),
+                                );
                             }
                         }
-                        b'\\' | b'{' | b'}' if !skipping => {
+                        '\\' | '{' | '}' if !skipping => {
                             if uc_skip > 0 {
                                 uc_skip -= 1;
                             } else {
-                                cur.push(next as char);
+                                cur.push(ch);
                             }
                         }
-                        b'\n' | b'\r' if !skipping => cur.push('\n'),
-                        b'~' if !skipping => cur.push(' '),
+                        '\n' | '\r' if !skipping => cur.push('\n'),
+                        '~' if !skipping => cur.push(' '),
                         _ => {}
                     }
                     continue;
@@ -577,28 +603,33 @@ pub fn parse_rtf_table(rtf: &str) -> Option<Vec<Vec<String>>> {
                     continue;
                 }
                 match word {
+                    "ansicpg" => page = param.unwrap_or(1252),
                     "trowd" => {
-                        in_table = true;
-                        cur.clear();
-                        row.clear();
+                        // Word repeats the row's definition before `\row`:
+                        // only a row's first one ends the text before it.
+                        if row.is_empty() {
+                            if !cur.trim().is_empty() {
+                                outside = true;
+                            }
+                            cur.clear();
+                        }
+                        seen_table = true;
                     }
-                    "cell" | "nestcell" if in_table => {
+                    "cell" if seen_table => {
                         row.push(cur.trim_matches(['\n', ' ']).to_string());
                         cur.clear();
                         cells += 1;
-                        if cells > MAX_CELLS {
-                            return None;
-                        }
                     }
-                    "row" | "nestrow" if in_table => {
+                    "row" if seen_table => {
                         if !cur.trim().is_empty() {
                             row.push(cur.trim_matches(['\n', ' ']).to_string());
                         }
                         cur.clear();
                         rows.push(std::mem::take(&mut row));
+                        cells += 1;
                     }
+                    "nestcell" | "nestrow" | "tab" => cur.push(' '),
                     "par" | "line" => cur.push('\n'),
-                    "tab" => cur.push(' '),
                     "uc" => uc = param.unwrap_or(1).max(0) as usize,
                     "u" => {
                         if let Some(n) = param {
@@ -621,6 +652,9 @@ pub fn parse_rtf_table(rtf: &str) -> Option<Vec<Vec<String>>> {
                     }
                     _ => {}
                 }
+                if cells > MAX_CELLS {
+                    return None;
+                }
             }
             b'\r' | b'\n' => i += 1,
             _ => {
@@ -637,8 +671,11 @@ pub fn parse_rtf_table(rtf: &str) -> Option<Vec<Vec<String>>> {
             }
         }
     }
+    if !cur.trim().is_empty() {
+        outside = true;
+    }
     let width = rows.iter().map(Vec::len).max().unwrap_or(0);
-    if !in_table || rows.is_empty() || width == 0 {
+    if !seen_table || outside || width == 0 || rows.len().saturating_mul(width) > MAX_CELLS {
         return None;
     }
     for r in &mut rows {
@@ -652,8 +689,7 @@ mod tests {
     use super::*;
     use crate::sheet::{Cell, Xf};
 
-    fn sheet_with(cells: &[(u32, u32, Cell)], styles: &mut Styles) -> Sheet {
-        let _ = styles;
+    fn sheet_with(cells: &[(u32, u32, Cell)]) -> Sheet {
         let mut sh = Sheet {
             name: "S".into(),
             ..Default::default()
@@ -662,6 +698,12 @@ mod tests {
             sh.set_cell(*r, *c, cell.clone());
         }
         sh
+    }
+
+    fn rows(r: &[&[&str]]) -> Vec<Vec<String>> {
+        r.iter()
+            .map(|row| row.iter().map(|c| c.to_string()).collect())
+            .collect()
     }
 
     #[test]
@@ -677,17 +719,20 @@ mod tests {
         });
         let mut b = Cell::text("a<b> & \"c\"\nd");
         b.style = bold;
-        let sh = sheet_with(&[(0, 0, b), (0, 1, Cell::number(1.5))], &mut styles);
+        let sh = sheet_with(&[(0, 0, b), (0, 1, Cell::number(1.5))]);
         let html = html_table(&sh, &styles, false, &[0, 1], &[0, 1]);
         assert!(html.starts_with("<table"));
+        assert!(is_own_table(&html));
         assert!(
             html.contains("font-weight:700;color:#ff0000;background:#00ff00;text-align:center;")
         );
         assert!(html.contains("a&lt;b&gt; &amp; &quot;c&quot;<br>d"));
         assert!(
-            html.contains("<td style=\"text-align:right;\">1.5</td>"),
+            html.contains("<td style='text-align:right;'>1.5</td>"),
             "{html}"
         );
+        // Text stays text in another app.
+        assert!(html.contains("mso-number-format:\"\\@\";"));
         // Two rows, two cells each, the empty ones present.
         assert_eq!(html.matches("<tr>").count(), 2);
         assert_eq!(html.matches("<td").count(), 4);
@@ -695,32 +740,28 @@ mod tests {
     }
 
     #[test]
-    fn the_bold_cells_are_listed() {
-        let html = "<table><tr><td style=\"font-weight:700;\">a&amp;b</td><td>c</td>\
-            <td style='font-weight:bold'>d</td></tr></table>";
-        assert_eq!(html_bold_cells(html), vec!["a&b", "d"]);
-        assert!(html_bold_cells("<p>x</p>").is_empty());
+    fn only_our_own_table_is_marked() {
+        assert!(!is_own_table("<table><tr><td>x</td></tr></table>"));
     }
 
-    /// The TSV beside the table carries a `'` for text that reads as a number
-    /// (`entry::copy_field`); the table does not, since another app would show
-    /// it. A docxy paste takes the table over the text, so "007" copied as
-    /// text pastes back as the number 7: the cost of HTML winning (#1248).
+    /// The TSV beside docxy's table carries a `'` for text that reads as a
+    /// number (`entry::copy_field`); the table does not, since another app
+    /// would show it. So a paste prefers the TSV to the table it marked.
     #[test]
     fn a_numeric_looking_text_has_no_apostrophe_in_the_table() {
-        let mut styles = Styles::default();
-        let sh = sheet_with(&[(0, 0, Cell::text("007"))], &mut styles);
+        let styles = Styles::default();
+        let sh = sheet_with(&[(0, 0, Cell::text("007"))]);
         let html = html_table(&sh, &styles, false, &[0], &[0]);
         assert!(html.contains(">007<") && !html.contains("'007"));
-        assert_eq!(parse_html_table(&html).unwrap(), vec![vec!["007"]]);
+        assert!(is_own_table(&html));
     }
 
     #[test]
     fn a_formula_shows_only_its_result() {
-        let mut styles = Styles::default();
+        let styles = Styles::default();
         let mut cell = Cell::number(3.0);
         cell.formula = Some("1+2".into());
-        let sh = sheet_with(&[(0, 0, cell)], &mut styles);
+        let sh = sheet_with(&[(0, 0, cell)]);
         let html = html_table(&sh, &styles, false, &[0], &[0]);
         assert!(html.contains(">3<"));
         assert!(!html.contains("1+2"));
@@ -728,12 +769,22 @@ mod tests {
 
     #[test]
     fn a_parsed_table_has_its_cells_by_position() {
-        let html = "Version:0.9\r\nStartHTML:0000\r\n<html><head><style>td{x:y}</style></head><body>\
+        let html = "<html><head><title>t</title><style>td{x:y}</style></head><body>\
             <!--StartFragment--><table><tr><td class=xl65 style='x:y'>a &amp; b</td><td>1&nbsp;2</td></tr>\
             <tr><td colspan=2>wide<br>text</td></tr></table><!--EndFragment--></body></html>";
         assert_eq!(
             parse_html_table(html).unwrap(),
-            vec![vec!["a & b", "1 2"], vec!["wide\ntext", ""]]
+            rows(&[&["a & b", "1 2"], &["wide\ntext", ""]])
+        );
+    }
+
+    #[test]
+    fn source_line_breaks_are_blanks_and_nbsp_survives() {
+        let html = "<table><tr><td>long\r\n  text\tmore</td><td>&nbsp;&nbsp;ID</td><td>&nbsp;</td>\
+            <td><p>one</p><p>two</p></td></tr></table>";
+        assert_eq!(
+            parse_html_table(html).unwrap(),
+            rows(&[&["long text more", "  ID", "", "one\ntwo"]])
         );
     }
 
@@ -742,7 +793,7 @@ mod tests {
         let html = "<TABLE><TR><TD rowspan=2>a<TD>b<TR><TD>c<TR><TH>d<TH>e&#33;&#x21;</TABLE>";
         assert_eq!(
             parse_html_table(html).unwrap(),
-            vec![vec!["a", "b"], vec!["", "c"], vec!["d", "e!!"]]
+            rows(&[&["a", "b"], &["", "c"], &["d", "e!!"]])
         );
     }
 
@@ -754,30 +805,124 @@ mod tests {
     }
 
     #[test]
-    fn a_nested_table_belongs_to_its_cell_and_a_huge_span_is_bounded() {
+    fn a_table_with_other_content_or_a_second_table_is_not_a_table_copy() {
+        let t = "<table><tr><td>x</td></tr></table>";
+        assert_eq!(
+            parse_html_table(&format!("<h1>Title</h1>{t}<p>after</p>")),
+            None
+        );
+        assert_eq!(parse_html_table(&format!("{t}<p>after</p>")), None);
+        assert_eq!(parse_html_table(&format!("{t}{t}")), None);
+        assert!(parse_html_table(&format!("<p> &nbsp;</p>{t}\n")).is_some());
+        assert!(parse_html_table(&format!("a &lt; b {t}")).is_none());
+    }
+
+    #[test]
+    fn a_nested_table_belongs_to_its_cell() {
         let html =
             "<table><tr><td>x<table><tr><td>inner</td></tr></table>y</td><td>z</td></tr></table>";
-        assert_eq!(parse_html_table(html).unwrap(), vec![vec!["xinnery", "z"]]);
+        assert_eq!(parse_html_table(html).unwrap(), rows(&[&["xinnery", "z"]]));
+    }
+
+    #[test]
+    fn a_hostile_table_is_bounded() {
         let big = "<table><tr><td rowspan=1000 colspan=1000>a</td></tr></table>";
         assert_eq!(parse_html_table(big).unwrap().len(), 1000);
+        // A thousand one-cell rows and one a thousand wide: a million cells
+        // once padded, and several thousand of them past the cap.
+        let mut wide = String::from("<table>");
+        for _ in 0..5000 {
+            wide.push_str("<tr><td>x</td></tr>");
+        }
+        wide.push_str("<tr><td colspan=1000>y</td></tr></table>");
+        assert_eq!(parse_html_table(&wide), None);
+        // The same span over and over costs time, not memory.
+        let mut spans = String::from("<table><tr>");
+        for _ in 0..5000 {
+            spans.push_str("<td rowspan=1000 colspan=1000>z</td>");
+        }
+        spans.push_str("</tr></table>");
+        assert_eq!(parse_html_table(&spans), None);
+        // Bare ampersands are linear.
+        let amps = format!("<table><tr><td>{}</td></tr></table>", "&".repeat(200_000));
+        assert_eq!(parse_html_table(&amps).unwrap()[0][0].len(), 200_000);
     }
 
     #[test]
     fn an_rtf_table_reads_its_cells() {
-        let rtf = "{\\rtf1\\ansi{\\fonttbl{\\f0 Arial;}}{\\colortbl;\\red0\\green0\\blue0;}\
-            before\\par\
+        let rtf = "{\\rtf1\\ansi\\ansicpg1252{\\fonttbl{\\f0 Arial;}}{\\colortbl;\\red0\\green0\\blue0;}\
             \\trowd\\cellx1000\\cellx2000\\pard\\intbl a\\'e9\\cell \\pard\\intbl {\\b b}\\u8364?\\cell \\row\
             \\trowd\\cellx1000\\pard\\intbl c\\line d\\par\\cell \\row\
-            \\pard after\\par}";
+            \\pard\\par}";
         assert_eq!(
             parse_rtf_table(rtf).unwrap(),
-            vec![vec!["a\u{e9}", "b\u{20ac}"], vec!["c\nd", ""]]
+            rows(&[&["a\u{e9}", "b\u{20ac}"], &["c\nd", ""]])
         );
     }
 
     #[test]
-    fn an_rtf_without_a_table_is_none() {
+    fn an_rtf_table_with_other_text_or_none_is_not_a_table_copy() {
+        let t = "\\trowd\\cellx1000\\pard\\intbl a\\cell \\row";
+        assert!(parse_rtf_table(&format!("{{\\rtf1 {t}\\pard\\par}}")).is_some());
+        assert_eq!(
+            parse_rtf_table(&format!("{{\\rtf1 before\\par {t}}}")),
+            None
+        );
+        assert_eq!(
+            parse_rtf_table(&format!("{{\\rtf1 {t}\\pard after\\par}}")),
+            None
+        );
         assert_eq!(parse_rtf_table("{\\rtf1 plain\\par}"), None);
         assert_eq!(parse_rtf_table(""), None);
+    }
+
+    /// Word, and docxy's own export, repeat the row definition before `\row`.
+    #[test]
+    fn a_row_definition_repeated_before_row_keeps_the_cells() {
+        let rtf = "{\\rtf1\\ansi\\trowd\\cellx1000\\cellx2000\\pard\\intbl a\\cell\\pard\\intbl b\\cell\
+            \\pard\\intbl\\trowd\\cellx1000\\cellx2000\\row\
+            \\trowd\\cellx1000\\cellx2000\\pard\\intbl c\\cell\\pard\\intbl d\\cell\
+            \\pard\\intbl\\trowd\\cellx1000\\cellx2000\\row\\pard\\plain\n}";
+        assert_eq!(
+            parse_rtf_table(rtf).unwrap(),
+            rows(&[&["a", "b"], &["c", "d"]])
+        );
+    }
+
+    #[test]
+    fn an_rtf_with_a_wide_character_after_a_backslash_does_not_panic() {
+        assert_eq!(parse_rtf_table("{\\rtf1 \\\u{e9}}"), None);
+        let rtf = "{\\rtf1\\trowd\\cellx1000 \\'9\u{e9}x\\cell \\'\u{e9}\\cell \\row}";
+        let cells = parse_rtf_table(rtf).unwrap();
+        assert_eq!(cells.len(), 1);
+        assert!(cells[0][0].ends_with("\u{e9}x") || cells[0][0].contains('x'));
+        assert_eq!(parse_rtf_table("{\\rtf1 \\"), None);
+        assert_eq!(parse_rtf_table("{\\rtf1 \\'4"), None);
+    }
+
+    #[test]
+    fn the_rtf_code_page_reads_high_bytes() {
+        let rtf = "{\\rtf1\\ansicpg1251\\trowd\\cellx1000\\pard\\intbl \\'cf\\'f0\\cell \\row}";
+        assert_eq!(parse_rtf_table(rtf).unwrap(), rows(&[&["\u{41f}\u{440}"]]));
+    }
+
+    #[test]
+    fn a_hostile_rtf_is_bounded() {
+        let mut rtf = String::from("{\\rtf1\\trowd\\cellx1000 ");
+        for _ in 0..5000 {
+            rtf.push_str("x\\cell \\row ");
+        }
+        rtf.push_str("y\\cell ");
+        for _ in 0..1000 {
+            rtf.push_str("z\\cell ");
+        }
+        rtf.push_str("\\row}");
+        assert_eq!(parse_rtf_table(&rtf), None);
+        let mut empties = String::from("{\\rtf1\\trowd ");
+        for _ in 0..4_100_000 {
+            empties.push_str("\\row");
+        }
+        empties.push('}');
+        assert_eq!(parse_rtf_table(&empties), None);
     }
 }

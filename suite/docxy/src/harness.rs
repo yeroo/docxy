@@ -3481,12 +3481,34 @@ fn clipboard_json(app: &crate::Docxy, cx: &App) -> Json {
         ),
         ("rtf_bold", str_or_null(bold)),
         ("html", str_or_null(html.clone())),
-        (
-            "html_bold",
-            str_or_null(html.map(|h| gridcore::clip_html::html_bold_cells(&h).join("\n"))),
-        ),
+        ("html_bold", str_or_null(html.map(|h| html_bold_text(&h)))),
         ("app", used),
     ])
+}
+
+/// The texts of an HTML table's bold cells (a `<td>` or `<th>` whose style
+/// says `font-weight` 700 or bold), in order, one per line: what the table
+/// pastes as bold (#1248).
+fn html_bold_text(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(i) = lower[at..].find("<t").map(|n| at + n) {
+        let Some(open_end) = lower[i..].find('>').map(|n| i + n) else {
+            break;
+        };
+        at = open_end + 1;
+        let tag = lower[i..open_end].replace(' ', "");
+        let cell = tag.starts_with("<td") || tag.starts_with("<th");
+        if cell && (tag.contains("font-weight:700") || tag.contains("font-weight:bold")) {
+            let close = lower[at..].find("</t").map_or(lower.len(), |n| at + n);
+            let table = format!("<table><tr><td>{}</td></tr></table>", &html[at..close]);
+            if let Some(rows) = gridcore::clip_html::parse_html_table(&table) {
+                out.push(rows[0][0].clone());
+            }
+        }
+    }
+    out.join("\n")
 }
 
 /// The text of `clip`'s bold runs, in order, each paragraph's on a line of

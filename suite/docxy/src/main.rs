@@ -2085,8 +2085,15 @@ fn os_text(text: &str, crlf: bool) -> String {
 /// The cell texts a sheet paste takes from another app's rich copy (#1248):
 /// the HTML table when it parses to a cell, else the RTF table, else `None`
 /// (the text is pasted as TSV). The HTML wins over the text beside it, as
-/// Excel's own paste prefers its richer formats.
+/// Excel's own paste prefers its richer formats, but only when the copy is
+/// that table and nothing else (a heading or paragraph beside it pastes as
+/// text), and never docxy's own table, whose exact TSV is beside it.
 fn foreign_table(html: Option<&str>, rtf: Option<&[u8]>) -> Option<Vec<Vec<String>>> {
+    // Our own table's exact TSV (with the `'` a text cell needs) is the text
+    // beside it, so that is what pastes.
+    if html.is_some_and(gridcore::clip_html::is_own_table) {
+        return None;
+    }
     html.and_then(gridcore::clip_html::parse_html_table)
         .or_else(|| {
             rtf.and_then(|rtf| gridcore::clip_html::parse_rtf_table(&String::from_utf8_lossy(rtf)))
@@ -17733,9 +17740,9 @@ impl Docxy {
 
     /// Paste at the selection: the grid clipboard while it is still what the
     /// clipboard holds (full-fidelity cells, tiled and translated, or a cut
-    /// moved), else the clipboard text parsed as TSV. Nothing while the
-    /// clipboard still holds a clip whose copy mode is over. Whether it
-    /// pasted.
+    /// moved), else another app's HTML or RTF table ([`foreign_table`]), else
+    /// the clipboard text parsed as TSV. Nothing while the clipboard still
+    /// holds a clip whose copy mode is over. Whether it pasted.
     fn sheet_paste(&mut self, cx: &mut Context<Self>) -> bool {
         // A paste's note ("pasted as a copy") stays, the warning of a circle
         // it made after it.
@@ -25201,6 +25208,43 @@ mod clipboard_tests {
         assert_eq!(
             store.read_rtf(false, || Some(b"os".to_vec())).as_deref(),
             Some(&b"os"[..])
+        );
+    }
+
+    /// #1248: docxy's own table is never read back; its TSV beside it is.
+    #[test]
+    fn our_own_html_table_is_left_to_its_text() {
+        let own = format!(
+            "<table {} border=0><tr><td>007</td></tr></table>",
+            "data-source=docxy"
+        );
+        assert!(gridcore::clip_html::is_own_table(&own));
+        assert_eq!(foreign_table(Some(&own), None), None);
+    }
+
+    /// #1248: a copy that is more than a table pastes as its text.
+    #[test]
+    fn a_table_with_a_heading_or_paragraph_pastes_as_text() {
+        let html = "<h1>Title</h1><table><tr><td>a</td></tr></table><p>after</p>";
+        assert_eq!(foreign_table(Some(html), None), None);
+        let doc =
+            docxcore::markdown::from_markdown("# H\n\n| a | b |\n|---|---|\n| c | d |\n\nafter\n");
+        let rtf =
+            docxcore::export_rtf::to_rtf(&doc, &docxcore::export_context::ExportContext::default());
+        assert_eq!(foreign_table(None, Some(rtf.as_bytes())), None);
+    }
+
+    /// #1248: our own RTF export of a table (Word's pattern: the row
+    /// definition repeated before `\row`) reads back its cells.
+    #[test]
+    fn an_exported_rtf_table_pastes_its_cells() {
+        let doc = docxcore::markdown::from_markdown("| a | b |\n|---|---|\n| c | d |\n");
+        let rtf =
+            docxcore::export_rtf::to_rtf(&doc, &docxcore::export_context::ExportContext::default());
+        let cell = |s: &str| s.to_string();
+        assert_eq!(
+            foreign_table(None, Some(rtf.as_bytes())),
+            Some(vec![vec![cell("a"), cell("b")], vec![cell("c"), cell("d")]])
         );
     }
 
