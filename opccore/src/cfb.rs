@@ -12,10 +12,11 @@
 //! the DIFAT/FAT/mini-FAT chains and the directory red-black tree. Streams are
 //! exposed by leaf name ([`Cfb::read_stream`]) and by full path through the
 //! storage hierarchy ([`Cfb::paths`] / [`Cfb::read_path`], e.g.
-//! `"TBkndTask/FixedData"` — how `.mpp` nests its task/resource blocks). A small
-//! v3 writer ([`write_cfb`] / [`write_cfb_tree`]) round-trip tests the reader,
-//! nesting included, without shipping a binary fixture, and wraps the `.xls`
-//! writer's `Workbook` stream.
+//! `"TBkndTask/FixedData"` — how `.mpp` nests its task/resource blocks). A v3
+//! writer ([`write_cfb`] / [`write_cfb_tree`] / [`write_cfb_tree_with`])
+//! round-trip tests the reader, nesting included, without shipping a binary
+//! fixture, wraps the `.xls` writer's `Workbook` stream, and lays out its
+//! directory as strict readers require (see [`write_cfb_tree_with`]).
 //!
 //! [MS-CFB]: https://learn.microsoft.com/openspecs/windows_protocols/ms-cfb/
 
@@ -55,6 +56,8 @@ pub struct Entry {
     left: u32,
     right: u32,
     child: u32,
+    /// The class id stored with a storage (all zeroes for none).
+    clsid: [u8; 16],
 }
 
 impl Entry {
@@ -174,6 +177,8 @@ impl Cfb {
                 utf16_name(&chunk[0..64], name_len)
             };
             let start = u32le(chunk, 116);
+            let mut clsid = [0u8; 16];
+            clsid.copy_from_slice(&chunk[80..96]);
             let mut size = u64le(chunk, 120);
             if sector_size == 512 {
                 size &= 0xFFFF_FFFF; // v3: high 32 bits are reserved
@@ -186,6 +191,7 @@ impl Cfb {
                 left: u32le(chunk, 68),
                 right: u32le(chunk, 72),
                 child: u32le(chunk, 76),
+                clsid,
             });
         }
 
@@ -310,6 +316,14 @@ impl Cfb {
         self.entries.iter().position(|e| e.kind == 5)
     }
 
+    /// The root storage's CLSID as its 16 bytes sit in the file (see
+    /// [`clsid`]); all zeroes when the file sets none. A rewrite passes it
+    /// back as [`CfbWriteOptions::root_clsid`].
+    pub fn root_clsid(&self) -> [u8; 16] {
+        self.root_index()
+            .map_or([0; 16], |root| self.entries[root].clsid)
+    }
+
     /// The direct children of a storage, in the directory's in-order sequence.
     /// (The CFB directory is a red-black tree; an in-order walk of a storage's
     /// child subtree yields its entries.)
@@ -347,6 +361,27 @@ impl Cfb {
     /// and the walk keeps its own stack, so deep nesting can't overflow
     /// the thread's.
     pub fn paths(&self) -> Vec<String> {
+        self.walk()
+            .into_iter()
+            .filter(|&(_, e)| self.entries[e].is_stream())
+            .map(|(path, _)| path)
+            .collect()
+    }
+
+    /// Full paths (`storage/sub`) of every storage below the root, empty
+    /// ones included (which [`paths`](Cfb::paths) cannot show), each after
+    /// the storage that holds it. Walked as [`paths`](Cfb::paths) is.
+    pub fn storage_paths(&self) -> Vec<String> {
+        self.walk()
+            .into_iter()
+            .filter(|&(_, e)| self.entries[e].is_storage())
+            .map(|(path, _)| path)
+            .collect()
+    }
+
+    /// Every entry below the root with its full path: a storage's children
+    /// in directory order, then each child storage's own, depth first.
+    fn walk(&self) -> Vec<(String, usize)> {
         let mut out = Vec::new();
         let Some(root) = self.root_index() else {
             return out;
@@ -367,11 +402,10 @@ impl Cfb {
                 } else {
                     format!("{prefix}/{}", e.name)
                 };
-                if e.is_stream() {
-                    out.push(path);
-                } else if e.is_storage() {
-                    sub.push((c, path));
+                if e.is_storage() {
+                    sub.push((c, path.clone()));
                 }
+                out.push((path, c));
             }
             todo.extend(sub.into_iter().rev());
         }
@@ -413,7 +447,7 @@ fn utf16_name(raw: &[u8], name_len: usize) -> String {
     String::from_utf16_lossy(&units)
 }
 
-// ---- minimal v3 writer ------------------------------------------------------
+// ---- v3 writer --------------------------------------------------------------
 
 /// A node in a compound file's directory tree, for the writer.
 pub enum Node<'a> {
@@ -421,63 +455,146 @@ pub enum Node<'a> {
     Storage(&'a str, Vec<Node<'a>>),
 }
 
-/// One directory entry under construction.
-struct DirEnt {
-    name: String,
-    kind: u8,
-    data: Option<Vec<u8>>, // stream payload
-    child: u32,
-    right: u32,
+impl<'a> Node<'a> {
+    fn name(&self) -> &'a str {
+        match self {
+            Node::Stream(name, _) | Node::Storage(name, _) => name,
+        }
+    }
 }
 
-/// Assign directory indices to a sibling group, chaining them via right-siblings
-/// (a valid, if unbalanced, red-black tree). Returns the first child's index.
-fn assign_dir(nodes: &[Node], dir: &mut Vec<DirEnt>) -> u32 {
+/// What [`write_cfb_tree_with`] puts in the directory fields no stream data
+/// fills. The default (a zero CLSID, no times) is what [`write_cfb_tree`]
+/// writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CfbWriteOptions {
+    /// The root storage's CLSID: the 16 bytes at offset 80 of the root
+    /// directory entry, in file order (build them with [`clsid`], or take
+    /// an opened file's from [`Cfb::root_clsid`]).
+    pub root_clsid: [u8; 16],
+    /// A FILETIME (100 ns ticks since 1601-01-01 UTC) written as every
+    /// storage's creation and modification time and as the root's
+    /// modification time; a stream's times and the root's creation time
+    /// stay zero, as [MS-CFB] requires. `None` leaves every time zero.
+    pub timestamps: Option<u64>,
+}
+
+/// The 16 bytes CLSID `{data1-data2-data3-data4}` takes in a compound file:
+/// the first three fields little-endian, `data4` as written. `.mpp` files'
+/// `74B78F3A-C8C8-11D1-BE11-00C04FB6FAF1` is
+/// `clsid(0x74B7_8F3A, 0xC8C8, 0x11D1, [0xBE, 0x11, 0x00, 0xC0, 0x4F, 0xB6, 0xFA, 0xF1])`.
+pub const fn clsid(data1: u32, data2: u16, data3: u16, data4: [u8; 8]) -> [u8; 16] {
+    let a = data1.to_le_bytes();
+    let b = data2.to_le_bytes();
+    let c = data3.to_le_bytes();
+    let d = data4;
+    [
+        a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1], d[0], d[1], d[2], d[3], d[4], d[5], d[6],
+        d[7],
+    ]
+}
+
+/// One directory entry under construction.
+struct DirEnt<'n> {
+    /// The name as written: at most 31 UTF-16 code units.
+    name: Vec<u16>,
+    kind: u8,
+    data: Option<&'n [u8]>, // stream payload
+    left: u32,
+    right: u32,
+    child: u32,
+    red: bool,
+}
+
+/// The key [MS-CFB] orders a storage's children by: shorter names first,
+/// then names of one length by their code units, each upper-cased.
+fn name_key(units: &[u16]) -> (usize, Vec<u16>) {
+    (units.len(), units.iter().map(|&u| upper_unit(u)).collect())
+}
+
+/// A UTF-16 code unit's simple Unicode upper case; a unit whose upper case
+/// is not one BMP character (`ß`, half of a surrogate pair) stays as it is.
+fn upper_unit(u: u16) -> u16 {
+    let Some(c) = char::from_u32(u32::from(u)) else {
+        return u;
+    };
+    let mut up = c.to_uppercase();
+    match (up.next(), up.next()) {
+        (Some(one), None) => u16::try_from(u32::from(one)).unwrap_or(u),
+        _ => u,
+    }
+}
+
+/// Give a sibling group directory indices in name order and link it into a
+/// balanced red-black tree, then do the same below each of its storages
+/// (an empty storage gets no child). Returns the index of the tree's root,
+/// `NOSTREAM` for no siblings.
+fn assign_dir<'n>(nodes: &'n [Node<'_>], dir: &mut Vec<DirEnt<'n>>) -> u32 {
     if nodes.is_empty() {
         return NOSTREAM;
     }
-    let base = dir.len() as u32;
-    for _ in nodes {
-        dir.push(DirEnt {
-            name: String::new(),
-            kind: 0,
-            data: None,
-            child: NOSTREAM,
-            right: NOSTREAM,
-        });
-    }
-    for (i, node) in nodes.iter().enumerate() {
-        let idx = base as usize + i;
-        let right = if i + 1 < nodes.len() {
-            base + i as u32 + 1
-        } else {
-            NOSTREAM
-        };
-        dir[idx] = match node {
-            Node::Stream(name, data) => DirEnt {
-                name: (*name).to_string(),
-                kind: 2,
-                data: Some(data.clone()),
-                child: NOSTREAM,
-                right,
-            },
-            Node::Storage(name, kids) => {
-                let child = assign_dir(kids, dir);
-                DirEnt {
-                    name: (*name).to_string(),
-                    kind: 1,
-                    data: None,
-                    child,
-                    right,
-                }
+    let mut sorted: Vec<(Vec<u16>, &'n Node<'_>)> = nodes
+        .iter()
+        .map(|node| (node.name().encode_utf16().take(31).collect(), node))
+        .collect();
+    sorted.sort_by_cached_key(|(name, _)| name_key(name));
+    let base = dir.len();
+    let n = sorted.len();
+    let mut storages = Vec::new();
+    for (i, (name, node)) in sorted.into_iter().enumerate() {
+        let (kind, data) = match node {
+            Node::Stream(_, data) => (2, Some(data.as_slice())),
+            Node::Storage(_, kids) => {
+                storages.push((base + i, kids));
+                (1, None)
             }
         };
+        dir.push(DirEnt {
+            name,
+            kind,
+            data,
+            left: NOSTREAM,
+            right: NOSTREAM,
+            child: NOSTREAM,
+            red: false,
+        });
     }
-    base
+    // Split at midpoints, the tree fills all its levels but the last: `full`.
+    let full = (n + 1).ilog2();
+    let root = link(dir, base, 0..n, 0, full);
+    for (at, kids) in storages {
+        dir[at].child = assign_dir(kids, dir);
+    }
+    root
 }
 
-/// Assemble a minimal v3 compound file with `streams` (name, bytes) directly
-/// under the root storage. See [`write_cfb_tree`] for nested storages.
+/// Link the siblings at `dir[base + range]`, in name order, into a binary
+/// search tree split at the range's midpoint, and return its root's index.
+/// A node `full` levels down (on the last, partial level, so a leaf) is
+/// red and every other black: each path from the root then passes the
+/// same number of black nodes, and no red node has a red child.
+fn link(
+    dir: &mut [DirEnt],
+    base: usize,
+    range: std::ops::Range<usize>,
+    depth: u32,
+    full: u32,
+) -> u32 {
+    if range.is_empty() {
+        return NOSTREAM;
+    }
+    let mid = range.start + range.len() / 2;
+    let left = link(dir, base, range.start..mid, depth + 1, full);
+    let right = link(dir, base, mid + 1..range.end, depth + 1, full);
+    let ent = &mut dir[base + mid];
+    ent.left = left;
+    ent.right = right;
+    ent.red = depth >= full;
+    (base + mid) as u32
+}
+
+/// Assemble a v3 compound file with `streams` (name, bytes) directly under
+/// the root storage: [`write_cfb_tree`] over streams alone.
 pub fn write_cfb(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
     let nodes: Vec<Node> = streams
         .iter()
@@ -486,23 +603,50 @@ pub fn write_cfb(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
     write_cfb_tree(&nodes)
 }
 
-/// Assemble a minimal v3 compound file from a directory tree (streams and
-/// nested storages). Small streams go in the mini stream, large ones in the FAT.
-/// Minimal: an unbalanced (right-leaning) directory tree, enough to exercise
-/// the reader's navigation in tests and to hold the `.xls` writer's one
-/// `Workbook` stream, not a general CFB authoring tool. Files of any size get
-/// DIFAT sectors past the header's 109 FAT-sector pointers (~7 MB).
+/// [`write_cfb_tree_with`] with a zero root CLSID and no times, as the
+/// `.xls` writer and the tests here write.
 pub fn write_cfb_tree(root_children: &[Node]) -> Vec<u8> {
+    write_cfb_tree_with(root_children, &CfbWriteOptions::default())
+}
+
+/// Assemble a v3 compound file from a directory tree (streams and nested
+/// storages, in any order), with the root CLSID and storage times
+/// `options` gives. Small streams go in the mini stream, large ones in the
+/// FAT; files of any size get DIFAT sectors past the header's 109
+/// FAT-sector pointers (~7 MB).
+///
+/// The directory keeps three rules that a lenient reader (this module's
+/// [`Cfb`] among them) lets pass but strict ones hold a file to: Microsoft
+/// Project 2024 silently refuses a file that breaks any of them.
+///
+/// 1. Each storage's children form a red-black tree in [MS-CFB] name order:
+///    shorter names first, then names of one length compared code unit by
+///    code unit after upper-casing. The tree is balanced, every level black
+///    but a last partial one, which is red.
+/// 2. The root entry carries the CLSID of the application that owns the
+///    file ([`CfbWriteOptions::root_clsid`]); a rewrite keeps the
+///    original's ([`Cfb::root_clsid`]).
+/// 3. A storage with no children is still written as a directory entry, so
+///    a rewrite that keeps the original's empty storages
+///    ([`Cfb::storage_paths`]) keeps those the application looks for.
+///
+/// Names are cut to 31 UTF-16 code units. Siblings whose names differ only
+/// in case, which [MS-CFB] forbids, are the caller's to avoid.
+///
+/// [MS-CFB]: https://learn.microsoft.com/openspecs/windows_protocols/ms-cfb/
+pub fn write_cfb_tree_with(root_children: &[Node], options: &CfbWriteOptions) -> Vec<u8> {
     const SS: usize = 512;
     const CUTOFF: usize = 4096;
 
     // 1) Build the directory tree (index 0 = root storage).
     let mut dir: Vec<DirEnt> = vec![DirEnt {
-        name: "Root Entry".into(),
+        name: "Root Entry".encode_utf16().collect(),
         kind: 5,
         data: None,
-        child: NOSTREAM,
+        left: NOSTREAM,
         right: NOSTREAM,
+        child: NOSTREAM,
+        red: false,
     }];
     let rc = assign_dir(root_children, &mut dir);
     dir[0].child = rc;
@@ -538,10 +682,9 @@ pub fn write_cfb_tree(root_children: &[Node]) -> Vec<u8> {
     let mut minifat: Vec<u32> = Vec::new();
     let mut place: Vec<(u32, u64, bool)> = vec![(ENDOFCHAIN, 0, false); dir.len()];
     for (idx, ent) in dir.iter().enumerate() {
-        if ent.kind != 2 {
+        let Some(data) = ent.data else {
             continue;
-        }
-        let data = ent.data.as_ref().unwrap();
+        };
         if data.is_empty() {
             continue;
         } else if data.len() < CUTOFF {
@@ -566,10 +709,12 @@ pub fn write_cfb_tree(root_children: &[Node]) -> Vec<u8> {
     }
 
     // Allocate big streams in the FAT.
-    for idx in 0..dir.len() {
-        if dir[idx].kind == 2 && !place[idx].2 && place[idx].1 as usize >= CUTOFF {
-            let data = dir[idx].data.clone().unwrap();
-            place[idx].0 = alloc(&data, &mut sectors, &mut fat);
+    for (idx, ent) in dir.iter().enumerate() {
+        match ent.data {
+            Some(data) if data.len() >= CUTOFF => {
+                place[idx].0 = alloc(data, &mut sectors, &mut fat);
+            }
+            _ => {}
         }
     }
 
@@ -584,6 +729,7 @@ pub fn write_cfb_tree(root_children: &[Node]) -> Vec<u8> {
     };
 
     // 4) Serialize the directory entries with their tree pointers.
+    let time = options.timestamps.unwrap_or(0).to_le_bytes();
     let mut dbytes: Vec<u8> = Vec::new();
     for (idx, ent) in dir.iter().enumerate() {
         let (start, size) = match ent.kind {
@@ -592,30 +738,39 @@ pub fn write_cfb_tree(root_children: &[Node]) -> Vec<u8> {
                 let (s, sz, _) = place[idx];
                 (if sz == 0 { ENDOFCHAIN } else { s }, sz)
             }
-            _ => (ENDOFCHAIN, 0), // storage
+            _ => (0, 0), // a storage: [MS-CFB] wants both zero
         };
         let mut e = [0u8; DIR_ENTRY_SIZE];
-        let utf16: Vec<u16> = ent.name.encode_utf16().collect();
-        for (i, u) in utf16.iter().enumerate().take(31) {
+        for (i, u) in ent.name.iter().enumerate() {
             e[i * 2..i * 2 + 2].copy_from_slice(&u.to_le_bytes());
         }
-        let name_len = if ent.kind == 0 {
-            0
-        } else {
-            ((utf16.len().min(31) + 1) * 2) as u16
-        };
+        let name_len = ((ent.name.len() + 1) * 2) as u16; // with the NUL
         e[64..66].copy_from_slice(&name_len.to_le_bytes());
         e[66] = ent.kind;
-        e[67] = 1; // color: black
-        e[68..72].copy_from_slice(&NOSTREAM.to_le_bytes()); // left
+        e[67] = if ent.red { 0 } else { 1 };
+        e[68..72].copy_from_slice(&ent.left.to_le_bytes());
         e[72..76].copy_from_slice(&ent.right.to_le_bytes());
         e[76..80].copy_from_slice(&ent.child.to_le_bytes());
+        match ent.kind {
+            5 => {
+                e[80..96].copy_from_slice(&options.root_clsid);
+                e[108..116].copy_from_slice(&time); // modified; created stays zero
+            }
+            1 => {
+                e[100..108].copy_from_slice(&time);
+                e[108..116].copy_from_slice(&time);
+            }
+            _ => {}
+        }
         e[116..120].copy_from_slice(&start.to_le_bytes());
         e[120..128].copy_from_slice(&size.to_le_bytes());
         dbytes.extend_from_slice(&e);
     }
+    // Unused slots: kind 0, all zero but their links, which are NOSTREAM.
+    let mut free = [0u8; DIR_ENTRY_SIZE];
+    free[68..80].fill(0xFF);
     while !dbytes.len().is_multiple_of(SS) {
-        dbytes.extend_from_slice(&[0u8; DIR_ENTRY_SIZE]); // unused slots (kind 0)
+        dbytes.extend_from_slice(&free);
     }
     let dir_start = alloc(&dbytes, &mut sectors, &mut fat);
 
@@ -986,5 +1141,254 @@ mod tests {
         assert_eq!(fat_of(first_difat), DIFSECT);
         let cfb = Cfb::open(&bytes).unwrap();
         assert_eq!(cfb.read_stream("Workbook").unwrap(), big);
+    }
+
+    /// Offset of directory entry `i` (the writer lays the directory out
+    /// in consecutive sectors).
+    fn entry_at(f: &[u8], i: u32) -> usize {
+        (u32le(f, 48) as usize + 1) * 512 + i as usize * DIR_ENTRY_SIZE
+    }
+
+    #[test]
+    fn siblings_sort_in_name_order() {
+        // Shorter names first; one length by upper-cased code units, so
+        // `a` < `B` and `x_` ("X_") < `_x` ("_X"), which a raw compare
+        // orders the other way; `é` upper-cases to U+00C9, before `Ê`.
+        let names = [
+            "x_",
+            "Props14",
+            "_x",
+            "Zeta",
+            "Ê",
+            "alpha",
+            "B",
+            "\u{5}SummaryInformation",
+            "a",
+            "AC",
+            "é",
+            "ab",
+            "Props",
+            "CVba",
+            "CV_iew",
+        ];
+        let tree: Vec<Node> = names.iter().map(|n| Node::Stream(n, vec![1])).collect();
+        let f = write_cfb_tree(&tree);
+        let want = [
+            "a",
+            "B",
+            "é",
+            "Ê",
+            "ab",
+            "AC",
+            "x_",
+            "_x",
+            "CVba",
+            "Zeta",
+            "alpha",
+            "Props",
+            "CV_iew",
+            "Props14",
+            "\u{5}SummaryInformation",
+        ];
+        assert_eq!(Cfb::open(&f).unwrap().paths(), want);
+        // The file holds them in that order too, whatever order they came in.
+        let mut reversed: Vec<Node> = names.iter().map(|n| Node::Stream(n, vec![1])).collect();
+        reversed.reverse();
+        assert_eq!(write_cfb_tree(&reversed), f);
+        // In a storage as at the root.
+        let nested = write_cfb_tree(&[Node::Storage("S", tree)]);
+        let paths = Cfb::open(&nested).unwrap().paths();
+        assert_eq!(paths, want.map(|n| format!("S/{n}")));
+    }
+
+    /// The black height of the sibling tree at `node`, checking it is a
+    /// binary search tree in name order (by `cfb`'s entries) whose every
+    /// path has that many black nodes and no red node a red child.
+    fn red_black(f: &[u8], cfb: &Cfb, node: u32, parent_red: bool) -> usize {
+        if node == NOSTREAM {
+            return 1;
+        }
+        let red = f[entry_at(f, node) + 67] == 0;
+        assert!(!(red && parent_red), "red {node} under a red parent");
+        let e = &cfb.entries[node as usize];
+        let key = |i: u32| {
+            name_key(
+                &cfb.entries[i as usize]
+                    .name
+                    .encode_utf16()
+                    .collect::<Vec<_>>(),
+            )
+        };
+        if e.left != NOSTREAM {
+            assert!(key(e.left) < key(node));
+        }
+        if e.right != NOSTREAM {
+            assert!(key(node) < key(e.right));
+        }
+        let left = red_black(f, cfb, e.left, red);
+        assert_eq!(left, red_black(f, cfb, e.right, red), "under {node}");
+        left + usize::from(!red)
+    }
+
+    #[test]
+    fn sibling_trees_are_balanced_red_black() {
+        for n in 0..=70usize {
+            let names: Vec<String> = (0..n).map(|i| format!("s{}", i * 37 % 71)).collect();
+            let tree: Vec<Node> = names.iter().map(|s| Node::Stream(s, vec![1])).collect();
+            let f = write_cfb_tree(&tree);
+            let cfb = Cfb::open(&f).unwrap();
+            let root = cfb.entries[0].child;
+            assert_eq!(cfb.paths().len(), n);
+            if root == NOSTREAM {
+                assert_eq!(n, 0);
+                continue;
+            }
+            assert_eq!(
+                f[entry_at(&f, root) + 67],
+                1,
+                "{n}: the tree's root is black"
+            );
+            let black = red_black(&f, &cfb, root, false);
+            // Balanced: as many black levels as a full tree of `n` has.
+            assert_eq!(black - 1, (n + 1).ilog2() as usize, "{n}");
+        }
+    }
+
+    #[test]
+    fn empty_storages_are_written() {
+        let tree = vec![
+            Node::Storage(
+                "   214",
+                vec![
+                    Node::Storage("CVba", Vec::new()),
+                    Node::Stream("x", vec![1, 2]),
+                ],
+            ),
+            Node::Storage("Empty", Vec::new()),
+        ];
+        let cfb = Cfb::open(&write_cfb_tree(&tree)).unwrap();
+        assert_eq!(cfb.storage_paths(), ["Empty", "   214", "   214/CVba"]);
+        assert_eq!(cfb.paths(), ["   214/x"]);
+        let cvba = cfb
+            .entries()
+            .into_iter()
+            .find(|e| e.name == "CVba")
+            .unwrap();
+        assert!(cvba.is_storage() && cvba.size() == 0);
+        assert_eq!(cfb.read_path("   214/x"), Some(vec![1, 2]));
+        assert_eq!(cfb.read_path("   214/CVba"), None); // a storage
+    }
+
+    #[test]
+    fn root_clsid_and_times() {
+        let project = clsid(
+            0x74B7_8F3A,
+            0xC8C8,
+            0x11D1,
+            [0xBE, 0x11, 0x00, 0xC0, 0x4F, 0xB6, 0xFA, 0xF1],
+        );
+        // As a `.mpp` file holds it.
+        assert_eq!(
+            project,
+            [
+                0x3A, 0x8F, 0xB7, 0x74, 0xC8, 0xC8, 0xD1, 0x11, 0xBE, 0x11, 0x00, 0xC0, 0x4F, 0xB6,
+                0xFA, 0xF1
+            ]
+        );
+        let at = 0x01DD_12FB_D29C_41D0u64;
+        let tree = [Node::Storage("S", Vec::new()), Node::Stream("x", vec![1])];
+        let options = CfbWriteOptions {
+            root_clsid: project,
+            timestamps: Some(at),
+        };
+        let f = write_cfb_tree_with(&tree, &options);
+        let (dir, by_name) = directory(&f);
+        assert_eq!(f[dir + 66], 5);
+        assert_eq!(f[dir + 80..dir + 96], project);
+        assert_eq!(&f[8..24], &[0; 16]); // the header's CLSID stays zero
+        let time = |e: usize, field: usize| u64le(&f, e + field);
+        assert_eq!((time(dir, 100), time(dir, 108)), (0, at)); // root: modified only
+        let s = by_name["S"];
+        assert_eq!((time(s, 100), time(s, 108)), (at, at));
+        assert_eq!((u32le(&f, s + 116), u64le(&f, s + 120)), (0, 0));
+        let x = by_name["x"];
+        assert_eq!((time(x, 100), time(x, 108)), (0, 0)); // a stream has none
+        assert_eq!(Cfb::open(&f).unwrap().root_clsid(), project);
+
+        // The plain writer: no CLSID, no times.
+        let plain = write_cfb_tree(&tree);
+        let (dir, by_name) = directory(&plain);
+        assert_eq!(plain[dir + 80..dir + 96], [0; 16]);
+        assert_eq!(u64le(&plain, by_name["S"] + 108), 0);
+        assert_eq!(Cfb::open(&plain).unwrap().root_clsid(), [0; 16]);
+        // Unused directory slots link nowhere.
+        let free = entry_at(&plain, 3);
+        assert_eq!(plain[free + 66], 0);
+        assert_eq!(&plain[free + 68..free + 80], &[0xFF; 12]);
+    }
+
+    #[test]
+    fn nested_tree_round_trips() {
+        let tree = vec![
+            Node::Storage(
+                "TBkndTask",
+                vec![
+                    Node::Stream("Var2Data", vec![3u8; 5000]), // big → FAT
+                    Node::Stream("FixedData", (0..300u16).map(|i| i as u8).collect()),
+                    Node::Stream("FixedMeta", Vec::new()),
+                    Node::Storage(
+                        "Deeper",
+                        vec![
+                            Node::Storage("Deepest", vec![Node::Stream("leaf", b"leaf".to_vec())]),
+                            Node::Storage("Hollow", Vec::new()),
+                        ],
+                    ),
+                ],
+            ),
+            Node::Stream("Props", vec![9u8; 100]),
+            Node::Stream("\u{1}CompObj", vec![1u8; 115]),
+        ];
+        let options = CfbWriteOptions {
+            root_clsid: [7; 16],
+            timestamps: Some(1),
+        };
+        let cfb = Cfb::open(&write_cfb_tree_with(&tree, &options)).unwrap();
+        assert_eq!(
+            cfb.paths(),
+            [
+                "Props",
+                "\u{1}CompObj",
+                "TBkndTask/Var2Data",
+                "TBkndTask/FixedData",
+                "TBkndTask/FixedMeta",
+                "TBkndTask/Deeper/Deepest/leaf",
+            ]
+        );
+        assert_eq!(
+            cfb.storage_paths(),
+            [
+                "TBkndTask",
+                "TBkndTask/Deeper",
+                "TBkndTask/Deeper/Hollow",
+                "TBkndTask/Deeper/Deepest",
+            ]
+        );
+        // Every stream reads back as written.
+        fn streams<'t>(prefix: &str, nodes: &'t [Node], out: &mut Vec<(String, &'t [u8])>) {
+            for node in nodes {
+                let path = format!("{prefix}{}", node.name());
+                match node {
+                    Node::Stream(_, data) => out.push((path, data.as_slice())),
+                    Node::Storage(_, kids) => streams(&format!("{path}/"), kids, out),
+                }
+            }
+        }
+        let mut want = Vec::new();
+        streams("", &tree, &mut want);
+        assert_eq!(want.len(), 6);
+        for (path, data) in want {
+            assert_eq!(cfb.read_path(&path).as_deref(), Some(data), "{path}");
+        }
+        assert_eq!(cfb.root_clsid(), [7; 16]);
     }
 }
