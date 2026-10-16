@@ -2,7 +2,7 @@
 use super::*;
 use crate::dialog::catalog;
 use crate::dialog::{ButtonRole, Dialog, DialogOwner};
-use projcore::editor::{AssignOutcome, FindOutcome, constraint_hint};
+use projcore::editor::{AssignOutcome, FindOutcome};
 use projcore::report::ReportKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,10 +19,11 @@ pub(crate) enum ProjectAct {
     ManuallySchedule,
     AutoSchedule,
     MoveTask,
+    /// Task › Properties › Information... and a bar or row menu's: the Task
+    /// Information dialog on its General page (#1368).
     Constraint,
     /// Task › Properties › Notes... and a task row's context menu › Notes...:
-    /// the selected task's notes in one prompt (`\n` types a newline; empty
-    /// removes), like Project's Notes command.
+    /// the same dialog on its Notes page.
     Notes,
     Baseline,
     ClearBaseline,
@@ -929,34 +930,28 @@ fn task_inactive(v: &ProjectView, uid: Option<i32>) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptKind {
     Predecessor,
-    Constraint,
     Move,
     Assign,
     Find,
     Hyperlink,
-    Notes,
 }
 impl PromptKind {
     pub fn name(self) -> &'static str {
         match self {
             Self::Predecessor => "predecessor",
-            Self::Constraint => "constraint",
             Self::Move => "move",
             Self::Assign => "assign",
             Self::Find => "find",
             Self::Hyperlink => "hyperlink",
-            Self::Notes => "notes",
         }
     }
     fn label(self) -> &'static str {
         match self {
             Self::Predecessor => "Predecessor ID",
-            Self::Constraint => "Constraint (TYPE [date])",
             Self::Move => "Move task by (1d / 1w / 4w; -1d back)",
             Self::Assign => "Assign resource (empty to clear)",
             Self::Find => "Find",
             Self::Hyperlink => "Hyperlink (ADDRESS[#LOCATION] [| TEXT]; empty to remove)",
-            Self::Notes => "Notes (\\n = new line; empty to remove)",
         }
     }
 }
@@ -981,11 +976,7 @@ impl ProjectView {
         }
         let task = self.ed.project().tasks.get(self.ed.sel());
         let buf = match kind {
-            PromptKind::Constraint => task.map(constraint_hint).unwrap_or_default(),
             PromptKind::Hyperlink => task.map(hyperlink_hint).unwrap_or_default(),
-            PromptKind::Notes => task
-                .map(|t| projcore::text::notes_to_line(t.notes.as_deref().unwrap_or("")))
-                .unwrap_or_default(),
             _ => String::new(),
         };
         self.prompt = Some(ProjectPrompt {
@@ -1308,17 +1299,6 @@ fn commit_edit(v: &mut ProjectView, p: ProjectPrompt) -> Result<Option<String>, 
             }
             v.ed.add_predecessor(uid, pred, LinkType::FinishStart, 0)?;
         }
-        PromptKind::Constraint => {
-            v.ed.set_constraint(uid, &p.buf)?;
-            return Ok(Some(format!(
-                "Constraint set: {}",
-                p.buf
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .to_ascii_uppercase()
-            )));
-        }
         PromptKind::Move => {
             let start = v.ed.move_task(uid, &p.buf)?;
             return Ok(Some(format!("Moved to {}", date(Some(start)))));
@@ -1353,26 +1333,6 @@ fn commit_edit(v: &mut ProjectView, p: ProjectPrompt) -> Result<Option<String>, 
                 Some(text) => Some(format!("Hyperlink set: {text}")),
                 None => had_link.then(|| "Hyperlink removed".into()),
             });
-        }
-        PromptKind::Notes => {
-            let notes = projcore::text::notes_from_line(&p.buf);
-            // Decoding the prefill gives back the stored notes exactly
-            // (notes_from_line ∘ notes_to_line is the identity), so the
-            // changed flag the editor reports on the normalised comparison
-            // is exact. An empty buffer still removes a note that exists,
-            // and stored empty notes count as none, so "empty to remove" is
-            // not swallowed.
-            if !v.ed.set_notes(uid, &notes)? {
-                return Ok(None);
-            }
-            return Ok(Some(
-                if notes.is_empty() {
-                    "Notes removed"
-                } else {
-                    "Notes set"
-                }
-                .into(),
-            ));
         }
         PromptKind::Find => unreachable!(),
     }
@@ -1421,6 +1381,19 @@ fn delete_selected_task(v: &mut ProjectView) -> Result<Option<Dialog>, String> {
     }
     v.ed.delete_task(uid)?;
     Ok(None)
+}
+
+/// Task > Properties > Information... and Notes...: the Task Information
+/// dialog for the selected task, for the caller to open on the tab. The entry
+/// row and a blank row have no task, so nothing opens.
+pub(super) fn open_task_info(v: &ProjectView, page: InfoPage) -> Result<Option<Dialog>, String> {
+    let Some(uid) = v.selected_uid() else {
+        return Ok(None);
+    };
+    if v.ed.project().task(uid).is_none_or(|t| t.is_null) {
+        return Ok(None);
+    }
+    task_info_dialog(&v.ed, uid, page).map(Some)
 }
 
 /// The yes/no message box a summary's delete asks: Yes deletes the summary
@@ -1800,8 +1773,8 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                 }
             }
             MoveTask => v.open_prompt(PromptKind::Move),
-            Constraint => v.open_prompt(PromptKind::Constraint),
-            Notes => v.open_prompt(PromptKind::Notes),
+            Constraint => dialog = open_task_info(v, InfoPage::General)?,
+            Notes => dialog = open_task_info(v, InfoPage::Notes)?,
             Assign => v.open_prompt(PromptKind::Assign),
             Hyperlink => v.open_prompt(PromptKind::Hyperlink),
             Find => v.open_prompt(PromptKind::Find),

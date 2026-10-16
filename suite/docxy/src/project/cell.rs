@@ -342,7 +342,7 @@ pub(crate) fn cell_edit_text(ed: &ProjectEditor, task: &Task, col: usize) -> Str
 /// summary's are its own, typed like a manual task's.
 const SUMMARY_READ_ONLY: std::ops::RangeInclusive<usize> = COL_DURATION..=COL_FINISH;
 
-fn summary_read_only(task: &Task, col: usize) -> bool {
+pub(crate) fn summary_read_only(task: &Task, col: usize) -> bool {
     task.summary && !task.manual && SUMMARY_READ_ONLY.contains(&col)
 }
 
@@ -770,7 +770,7 @@ fn cell_click(tab: &mut DocTab, target: ClickTarget, col: Option<usize>, double:
     // followed by the click gpui dispatches for that same release: that click
     // must not undo the gesture, so it is swallowed. The flag is taken, so a
     // later click is never swallowed; a double-click still runs (an ID
-    // cell's "ID is read-only", for one).
+    // cell's Task Information, for one).
     let swallowed = {
         let Surface::Project(v) = &mut tab.surface else {
             return;
@@ -812,7 +812,14 @@ fn cell_click(tab: &mut DocTab, target: ClickTarget, col: Option<usize>, double:
         v.col = col.min(COLUMN_COUNT - 1);
         v.reveal_col();
     }
-    if double && col.is_some() {
+    if double && col == Some(COL_ID) && matches!(target, ClickTarget::Task(_)) {
+        // A double-click on a task's ID opens its Task Information (#1368).
+        match open_task_info(v, InfoPage::General) {
+            Ok(Some(dialog)) => tab.dialogs.push(dialog),
+            Ok(None) => {}
+            Err(e) => tab.status = e.into(),
+        }
+    } else if double && col.is_some() {
         if let Err(e) = v.open_cell(None) {
             tab.status = e.into();
         }

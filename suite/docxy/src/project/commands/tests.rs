@@ -996,7 +996,7 @@ fn keys_and_whole_route_enforce_modifiers() {
         assert_eq!(v(&t).ed.project(), &before);
         assert_eq!(v(&t).ed.sel(), sel);
     }
-    apply_project_act(&mut t, Constraint);
+    apply_project_act(&mut t, MoveTask);
     let buf = v(&t).prompt.as_ref().unwrap().buf.clone();
     for key in ["enter", "escape", "backspace", "n"] {
         for m in [
@@ -1051,16 +1051,16 @@ fn prompts_bind_uid_cancel_and_edit_unicode_without_dispatching_commands() {
     project_input(&mut t, "escape", None, Modifiers::default());
     assert!(v(&t).prompt.is_none());
     assert_eq!(t.status, status);
-    apply_project_act(&mut t, ProjectAct::Constraint);
+    apply_project_act(&mut t, ProjectAct::MoveTask);
     vm(&mut t).select_row(1);
     assert!(v(&t).prompt.is_none());
-    apply_project_act(&mut t, ProjectAct::Constraint);
+    apply_project_act(&mut t, ProjectAct::MoveTask);
     apply_project_act(&mut t, ProjectAct::Undo);
     assert!(v(&t).prompt.is_none());
     // An empty plan has only the entry row, where task prompts do not open.
     let mut empty = new_project_tab("Project1");
     let status = empty.status.clone();
-    apply_project_act(&mut empty, ProjectAct::Constraint);
+    apply_project_act(&mut empty, ProjectAct::MoveTask);
     assert!(v(&empty).prompt.is_none());
     assert_eq!(empty.status, status);
     assert!(!empty.dirty);
@@ -1073,7 +1073,6 @@ fn rejection_preserves_model_geometry_and_both_history_stacks() {
         (AddLink, "abc", "Predecessor must be a task ID (number)"),
         (AddLink, "999", "No other task with ID 999"),
         (AddLink, "2", "No other task with ID 2"),
-        (Constraint, "mso", "MSO needs a date, e.g. mso 2026-03-05"),
     ] {
         let mut t = tab();
         vm(&mut t).ed.rename(1, "Temporary").unwrap();
@@ -1120,7 +1119,6 @@ fn every_edit_undoes_and_redoes_model_and_geometry_through_command_paths() {
         (Indent, None, true),
         (Outdent, None, true),
         (AddLink, Some("1"), true),
-        (Constraint, Some("SNET 2026-01-08"), true),
         (Assign, Some("Alice"), false),
         (Baseline, None, false),
         (ClearBaseline, None, false),
@@ -1160,10 +1158,6 @@ fn every_edit_undoes_and_redoes_model_and_geometry_through_command_paths() {
             Indent => assert_eq!(after.task(2).unwrap().outline_level, 2),
             Outdent => assert_eq!(after.task(2).unwrap().outline_level, 1),
             AddLink => assert_eq!(after.task(2).unwrap().predecessors[0].uid, 1),
-            Constraint => assert_ne!(
-                before.task(2).unwrap().constraint,
-                after.task(2).unwrap().constraint
-            ),
             Assign => {
                 assert_eq!(after.resources.len(), 1);
                 assert_eq!(after.assignments.len(), 1);
@@ -1695,6 +1689,7 @@ fn task_commands_do_nothing_on_the_entry_row() {
         Outdent,
         AddLink,
         Constraint,
+        Notes,
         Assign,
         Hyperlink,
         UnlinkTasks,
@@ -1707,6 +1702,7 @@ fn task_commands_do_nothing_on_the_entry_row() {
         apply_project_act(&mut t, act);
         assert_eq!(v(&t).gantt_x.get(), 44., "{act:?}");
         assert!(v(&t).prompt.is_none(), "{act:?} opened a prompt");
+        assert!(!t.dialogs.is_open(), "{act:?} opened a dialog");
         assert_eq!(v(&t).ed.project(), &before, "{act:?}");
         assert_eq!(v(&t).ed.undo_depth(), 0, "{act:?}");
         assert_eq!(t.status, status, "{act:?}");
@@ -3190,95 +3186,7 @@ fn hyperlink_prompt_empty_buffer_removes_empty_stored_parts() {
     assert_eq!(hyperlink_parts(&t), (None, Some(String::new()), None));
 }
 
-/// #454: Task › Properties › Notes... opens the prompt prefilled with the
-/// one-line form of the stored notes; Enter commits as one undo step.
-#[test]
-fn notes_prompt_prefills_and_commit_sets_notes_and_undo_restores() {
-    let mut t = tab();
-    // No notes yet: the prompt opens with an empty buffer.
-    apply_project_act(&mut t, ProjectAct::Notes);
-    let p = v(&t).prompt.as_ref().unwrap();
-    assert_eq!(p.kind, PromptKind::Notes);
-    assert_eq!(p.uid, Some(2));
-    assert_eq!(p.buf, "");
-    vm(&mut t).cancel_prompt();
-    // Multi-line notes prefill escaped, newlines intact.
-    vm(&mut t).ed.set_notes(2, "Line 1\nLine 2").unwrap();
-    apply_project_act(&mut t, ProjectAct::Notes);
-    assert_eq!(v(&t).prompt.as_ref().unwrap().buf, "Line 1\\nLine 2");
-    vm(&mut t).cancel_prompt();
-    // Enter on a new buffer commits, as ONE undo step on top of the edit
-    // above.
-    let depth = v(&t).ed.undo_depth();
-    commit(&mut t, ProjectAct::Notes, "run the checks");
-    assert_eq!(
-        v(&t).ed.project().task(2).unwrap().notes.as_deref(),
-        Some("run the checks")
-    );
-    assert_eq!(t.status.as_ref(), "Notes set");
-    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
-    apply_project_act(&mut t, ProjectAct::Undo);
-    assert_eq!(
-        v(&t).ed.project().task(2).unwrap().notes.as_deref(),
-        Some("Line 1\nLine 2")
-    );
-}
-
-/// #454: the prefill escapes newlines, so Enter on it unchanged keeps a
-/// multi-line note intact, pushing no undo step and reporting nothing.
-#[test]
-fn notes_prompt_multiline_notes_survive_enter_on_prefill() {
-    let mut t = tab();
-    vm(&mut t).ed.set_notes(2, "a\nb").unwrap();
-    vm(&mut t).ed.mark_saved();
-    let depth = v(&t).ed.undo_depth();
-    let status = t.status.clone();
-    apply_project_act(&mut t, ProjectAct::Notes);
-    assert_eq!(v(&t).prompt.as_ref().unwrap().buf, "a\\nb");
-    press(&mut t, "enter");
-    assert_eq!(
-        v(&t).ed.project().task(2).unwrap().notes.as_deref(),
-        Some("a\nb")
-    );
-    assert_eq!(v(&t).ed.undo_depth(), depth);
-    assert_eq!(t.status, status);
-    assert!(!t.dirty);
-}
-
-#[test]
-fn notes_prompt_empty_removes_and_reports() {
-    let mut t = tab();
-    // Nothing to remove: no status, no history.
-    let status = t.status.clone();
-    commit(&mut t, ProjectAct::Notes, "");
-    assert_eq!(v(&t).ed.project().task(2).unwrap().notes, None);
-    assert_eq!(t.status, status);
-    assert_eq!(v(&t).ed.undo_depth(), 0);
-    // A removed note says so, as one undo step holding the previous note.
-    vm(&mut t).ed.set_notes(2, "docs").unwrap();
-    commit(&mut t, ProjectAct::Notes, "");
-    assert_eq!(v(&t).ed.project().task(2).unwrap().notes, None);
-    assert_eq!(t.status.as_ref(), "Notes removed");
-    apply_project_act(&mut t, ProjectAct::Undo);
-    assert_eq!(
-        v(&t).ed.project().task(2).unwrap().notes.as_deref(),
-        Some("docs")
-    );
-}
-
-#[test]
-fn notes_prompt_does_not_open_on_the_entry_row() {
-    let mut t = tab();
-    vm(&mut t).enter_entry_row();
-    let status = t.status.clone();
-    apply_project_act(&mut t, ProjectAct::Notes);
-    assert!(v(&t).prompt.is_none());
-    assert_eq!(v(&t).ed.undo_depth(), 0);
-    assert_eq!(t.status, status);
-    assert!(!t.dirty);
-}
-
-/// #454: the row menu's Notes... opens the prompt on a task row only, like
+/// #454: the row menu's Notes... opens on a task row only, like
 /// Information....
 #[test]
 fn row_menu_notes_is_enabled_on_a_task_row() {
