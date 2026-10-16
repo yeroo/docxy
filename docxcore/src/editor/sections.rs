@@ -744,7 +744,10 @@ mod tests {
         assert_eq!(selected_text(&e), "pha b");
         assert!(e.undo());
         assert_eq!(e.doc, before);
-        assert_eq!(e.selection_range(), Some((Caret::top(0, 2), Caret::top(0, 7))));
+        assert_eq!(
+            e.selection_range(),
+            Some((Caret::top(0, 2), Caret::top(0, 7)))
+        );
     }
 
     #[test]

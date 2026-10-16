@@ -26,6 +26,7 @@ pub(crate) use line_numbers::{apply_line_numbers, line_numbers_dialog};
 const CUSTOM: &str = "Custom";
 const THIS_SECTION: &str = "This section";
 const SELECTED_SECTIONS: &str = "Selected sections";
+const SELECTED_TEXT: &str = "Selected text";
 const FORWARD: &str = "This point forward";
 const WHOLE: &str = "Whole document";
 const STARTS: [(SectionStart, &str); 4] = [
@@ -93,21 +94,29 @@ fn caret_setup(ed: &Editor) -> SectionSetup {
 
 /// "Apply to"'s choices: Word's, with Selected sections in place of This
 /// section when the selection spans several, and only Whole document and
-/// This point forward in a one-section document.
-fn apply_to(ed: &Editor) -> Control {
-    let items: Vec<&str> = if ed.sections().len() == 1 {
+/// This point forward in a one-section document. Selected text (#1272) is
+/// offered, and the default, for a text selection inside one section that
+/// does not cover all of it: after This section, else first. Line Numbers
+/// keeps its own Apply to without it.
+fn apply_to(ed: &Editor, selected_text: bool) -> Control {
+    let mut items: Vec<&str> = if ed.sections().len() == 1 {
         vec![WHOLE, FORWARD]
     } else if ed.target_sections().len() > 1 {
         vec![SELECTED_SECTIONS, FORWARD, WHOLE]
     } else {
         vec![THIS_SECTION, FORWARD, WHOLE]
     };
+    let mut default = 0;
+    if selected_text && ed.selection_section_wrappable() {
+        default = usize::from(items[0] == THIS_SECTION);
+        items.insert(default, SELECTED_TEXT);
+    }
     choice(
         "apply",
         "Apply to:",
         ControlKind::Dropdown,
         &items,
-        Some(0),
+        Some(default),
         None,
     )
 }
@@ -187,7 +196,7 @@ pub(crate) fn page_setup_dialog(tab: &DocTab, page: PageSetupTab) -> Result<Dial
         ),
         number("header", "Header from edge:", m.header, Some(2)),
         number("footer", "Footer from edge:", m.footer, Some(2)),
-        apply_to(ed),
+        apply_to(ed, true),
         hidden("caret_sect", caret_raw(ed)),
         hidden("paper_pick", String::new()),
     ];
@@ -449,12 +458,46 @@ fn field(d: &Dialog, name: &str) -> Result<i32, String> {
     twips_of(&c.text()).ok_or_else(|| format!("{} takes a number", c.label.replace('&', "")))
 }
 
-/// Which sections "Apply to" names; `None` for This point forward.
-fn targets(ed: &Editor, d: &Dialog) -> Option<Vec<usize>> {
+/// What "Apply to" names.
+enum Target {
+    Sections(Vec<usize>),
+    /// This point forward: a new section from the caret.
+    Forward,
+    /// Selected text: new sections around the selection, the middle edited.
+    Selected,
+}
+
+impl Target {
+    /// The sections to check before anything is written: each target, else
+    /// the one both new breaks land in.
+    fn checked(&self, ed: &Editor) -> Result<Vec<usize>, String> {
+        match self {
+            Target::Sections(k) => Ok(k.clone()),
+            Target::Forward | Target::Selected => Ok(vec![ed.break_section()?]),
+        }
+    }
+
+    /// Write `edit` to the target as one undo step. Whether anything changed.
+    fn write(
+        self,
+        ed: &mut Editor,
+        start: SectionStart,
+        edit: impl Fn(&mut SectionSetup),
+    ) -> Result<bool, String> {
+        match self {
+            Target::Sections(k) => Ok(ed.edit_section_setups(&k, edit)),
+            Target::Forward => ed.insert_section_break_with(start, edit).map(|_| true),
+            Target::Selected => ed.wrap_selection_in_section(start, edit).map(|_| true),
+        }
+    }
+}
+
+fn targets(ed: &Editor, d: &Dialog) -> Target {
     match text_of(d, "apply").as_str() {
-        FORWARD => None,
-        WHOLE => Some((0..ed.sections().len()).collect()),
-        _ => Some(ed.target_sections()),
+        FORWARD => Target::Forward,
+        SELECTED_TEXT => Target::Selected,
+        WHOLE => Target::Sections((0..ed.sections().len()).collect()),
+        _ => Target::Sections(ed.target_sections()),
     }
 }
 
@@ -508,22 +551,13 @@ pub(crate) fn apply_page_setup(
     // Check every section it would write before writing any.
     let sections = ed.sections();
     let targets = targets(ed, d);
-    let check: Vec<usize> = match &targets {
-        Some(k) => k.clone(),
-        None => vec![ed.break_section()?],
-    };
+    let check = targets.checked(ed)?;
     for k in check {
         let mut s = SectionSetup::parse(&sections[k.min(sections.len() - 1)]);
         edit(&mut s);
         check_setup(&s, gutter_at_top)?;
     }
-    let mut any = match targets {
-        Some(k) => ed.edit_section_setups(&k, edit),
-        None => {
-            ed.insert_section_break_with(SectionStart::NextPage, edit)?;
-            true
-        }
-    };
+    let mut any = targets.write(ed, SectionStart::NextPage, edit)?;
     if changed("gutter_pos") {
         pkg.set_gutter_at_top(gutter_at_top);
         any = true;
@@ -750,7 +784,7 @@ pub(crate) fn columns_dialog(tab: &DocTab) -> Result<Dialog, String> {
             ControlKind::Checkbox,
             Value::Bool(c.sep),
         ),
-        apply_to(ed),
+        apply_to(ed, true),
         hidden("text_width", tw.to_string()),
     ]);
     show_rows(&mut d);
@@ -763,7 +797,8 @@ pub(crate) fn columns_dialog(tab: &DocTab) -> Result<Dialog, String> {
 }
 
 /// Apply an accepted Columns dialog: one undo step on the body editor. This
-/// point forward starts the new section with a Continuous break. Whether
+/// point forward and Selected text start the new section with a Continuous
+/// break. Whether
 /// anything changed.
 pub(crate) fn apply_columns(
     ed: &mut Editor,
@@ -798,10 +833,7 @@ pub(crate) fn apply_columns(
     // each section, so they only need room for the spacing; unequal ones
     // must add up to the section's text width.
     let targets_now = targets(ed, d);
-    let check: Vec<usize> = match &targets_now {
-        Some(k) => k.clone(),
-        None => vec![ed.break_section()?],
-    };
+    let check = targets_now.checked(ed)?;
     let sections = ed.sections();
     let total: i32 = widths.iter().sum::<i32>() + spaces.iter().sum::<i32>();
     // Each value is shown to 0.01", so it may be up to half of that off the
@@ -865,13 +897,7 @@ pub(crate) fn apply_columns(
             s.columns.sep = sep;
         }
     };
-    Ok(match targets_now {
-        Some(k) => ed.edit_section_setups(&k, edit),
-        None => {
-            ed.insert_section_break_with(SectionStart::Continuous, edit)?;
-            true
-        }
-    })
+    targets_now.write(ed, SectionStart::Continuous, edit)
 }
 
 #[cfg(test)]

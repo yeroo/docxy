@@ -172,3 +172,17 @@
   heuristic, not a dictionary. `Editor::insert_soft_hyphen` puts U+00AD in a run
   of its own with `hyphen_elements`, so it saves as `w:softHyphen` (a plain run's
   U+00AD would stay literal text), as one undo step.
+
+## Page Setup / Columns: Apply to Selected text (#1272)
+
+- `Editor::wrap_selection_in_section` wraps a text selection inside one section
+  in section breaks and edits only the middle section, as one undo step with
+  the selection kept on its text. The middle and the section after start as
+  the dialog says (Continuous for Columns, NextPage for Page Setup, whose
+  Section start overrides the middle only when the person changed it). A
+  selection edge at a paragraph edge cuts by the neighbouring paragraph's mark,
+  never an empty paragraph; an edge already at the section's edge adds no
+  break (and keeps the section's existing start type).
+- "Selected text" is offered, and the default, only when
+  `selection_section_wrappable` (not a whole section, not across sections or in
+  a table cell). Line Numbers keeps its own Apply to without it.

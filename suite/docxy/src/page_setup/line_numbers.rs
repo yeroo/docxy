@@ -98,7 +98,7 @@ pub(crate) fn line_numbers_dialog(tab: &DocTab) -> Result<Dialog, String> {
             ),
             None,
         ),
-        apply_to(ed),
+        apply_to(ed, false),
     ];
     d.buttons = ok_cancel();
     d.react = Some(Reaction(after_line_numbers_set));
@@ -250,13 +250,7 @@ pub(crate) fn apply_line_numbers(ed: &mut Editor, d: &Dialog) -> Result<bool, St
             },
         };
     };
-    Ok(match targets(ed, d) {
-        Some(k) => ed.edit_section_setups(&k, edit),
-        None => {
-            ed.insert_section_break_with(SectionStart::Continuous, edit)?;
-            true
-        }
-    })
+    targets(ed, d).write(ed, SectionStart::Continuous, edit)
 }
 
 #[cfg(test)]

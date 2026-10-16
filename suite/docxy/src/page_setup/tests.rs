@@ -1145,3 +1145,133 @@ fn turning_and_picking_alone_are_the_automatic_part() {
         (20160, 12240, true, Some(5))
     );
 }
+
+/// "two" in section 1, from after "t" to its end: wraps a piece of one section.
+fn select_in_section_one(t: &mut DocTab) {
+    let ed = ed_mut(t);
+    ed.anchor = Some(Caret::top(1, 1));
+    ed.caret = Caret::top(1, 3);
+}
+
+#[test]
+fn selected_text_is_offered_and_default_for_a_selection_inside_one_section_1272() {
+    let mut t = three_sections();
+    open(&mut t, PageSetupTab::Margins);
+    assert_eq!(
+        items(&t, "apply"),
+        ["This section", "This point forward", "Whole document"],
+        "a caret only"
+    );
+    let mut t = three_sections();
+    select_in_section_one(&mut t);
+    open(&mut t, PageSetupTab::Margins);
+    assert_eq!(
+        items(&t, "apply"),
+        [
+            "This section",
+            "Selected text",
+            "This point forward",
+            "Whole document"
+        ]
+    );
+    assert_eq!(shown(&t, "apply"), "Selected text");
+    // Columns offers it too.
+    let mut t = three_sections();
+    select_in_section_one(&mut t);
+    open_columns(&mut t);
+    assert_eq!(shown(&t, "apply"), "Selected text");
+    // A selection across sections keeps Selected sections.
+    let mut t = three_sections();
+    ed_mut(&mut t).anchor = Some(Caret::top(0, 1));
+    open(&mut t, PageSetupTab::Margins);
+    assert_eq!(
+        items(&t, "apply"),
+        ["Selected sections", "This point forward", "Whole document"]
+    );
+    // A selection of a whole section has nothing to wrap.
+    let mut t = three_sections();
+    let ed = ed_mut(&mut t);
+    ed.anchor = Some(Caret::top(0, 0));
+    ed.caret = Caret::top(0, 3);
+    open(&mut t, PageSetupTab::Margins);
+    assert_eq!(shown(&t, "apply"), "This section");
+    // In a one-section document Select All keeps Whole document.
+    let mut t = three_sections();
+    let ed = ed_mut(&mut t);
+    ed.doc.body.truncate(2);
+    if let Block::Paragraph(p) = &mut ed.doc.body[0] {
+        p.props.section_break = None;
+    }
+    ed.anchor = Some(Caret::top(0, 0));
+    ed.caret = Caret::top(1, 0);
+    ed.caret = Caret::top(1, ed.doc.body[1].plain_text().chars().count());
+    open(&mut t, PageSetupTab::Margins);
+    assert_eq!(shown(&t, "apply"), "Whole document");
+    // Line Numbers keeps its own Apply to.
+    let mut t = three_sections();
+    select_in_section_one(&mut t);
+    let d = line_numbers_dialog(&t).unwrap();
+    t.dialogs.push(d);
+    assert!(!items(&t, "apply").contains(&"Selected text".to_string()));
+}
+
+#[test]
+fn page_setup_on_selected_text_changes_only_the_middle_in_one_undo_step_1272() {
+    let mut t = three_sections();
+    select_in_section_one(&mut t);
+    let before = ed(&t).doc.clone();
+    open(&mut t, PageSetupTab::Margins);
+    set(&mut t, "orientation", s("Landscape"));
+    ok(&mut t).unwrap();
+    let s = setups(&t);
+    assert_eq!(s.len(), 5);
+    let landscape: Vec<bool> = s.iter().map(|x| x.page.landscape).collect();
+    assert_eq!(landscape, [false, false, true, false, false]);
+    assert_eq!(s[2].start, SectionStart::NextPage);
+    assert_eq!(s[3].start, SectionStart::NextPage);
+    let text: Vec<String> = ed(&t).doc.body.iter().map(|b| b.plain_text()).collect();
+    assert_eq!(text[..5], ["one", "t", "wo", "two b", "three"]);
+    assert_eq!(ed(&t).selection_text(), "wo", "the selection stays");
+    assert!(ed_mut(&mut t).undo());
+    assert_eq!(ed(&t).doc, before);
+    assert_eq!(
+        ed(&t).selection_range(),
+        Some((Caret::top(1, 1), Caret::top(1, 3)))
+    );
+}
+
+#[test]
+fn columns_on_selected_text_makes_continuous_sections_1272() {
+    let mut t = three_sections();
+    select_in_section_one(&mut t);
+    let before = ed(&t).doc.clone();
+    open_columns(&mut t);
+    set(&mut t, "Presets", s("Two"));
+    ok(&mut t).unwrap();
+    let s = setups(&t);
+    assert_eq!(s.len(), 5);
+    let counts: Vec<i32> = s.iter().map(|x| x.columns.count()).collect();
+    assert_eq!(counts, [1, 1, 2, 1, 1]);
+    assert_eq!(s[2].start, SectionStart::Continuous);
+    assert_eq!(s[3].start, SectionStart::Continuous);
+    assert!(ed_mut(&mut t).undo());
+    assert_eq!(ed(&t).doc, before);
+}
+
+#[test]
+fn selected_text_checks_the_section_before_writing_1272() {
+    let mut t = three_sections();
+    ed_mut(&mut t).edit_section_setups(&[1], |s| s.page.set_custom(5760, 15840));
+    select_in_section_one(&mut t);
+    let before = ed(&t).doc.clone();
+    open(&mut t, PageSetupTab::Margins);
+    set(&mut t, "left", s("3"));
+    set(&mut t, "right", s("2"));
+    assert_eq!(shown(&t, "apply"), "Selected text");
+    assert_eq!(
+        ok(&mut t).unwrap_err(),
+        "The margins leave no room for text on the page"
+    );
+    assert!(t.dialogs.is_open());
+    assert_eq!(ed(&t).doc, before, "nothing changed");
+}
