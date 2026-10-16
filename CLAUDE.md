@@ -289,3 +289,27 @@
   and `comment_edit`, Ctrl+A/C/X/V in `comment_chord` (paste is one line),
   and `field-read comment-editor` reports the caret and the `[0,len]`
   selection. Click-to-place and Shift+arrows are not there.
+
+## Project Task Information dialog (#1368)
+
+- Task > Properties > Information..., Notes... (same dialog, on its Notes
+  page), the bar and row menus' items, and a double-click on a task's ID cell
+  open `suite/docxy/src/project/task_info.rs`: the catalogued `task-information`
+  dialog (General, Predecessors, Resources, Advanced, Notes). The entry row and
+  a blank row open nothing. `PromptKind::Constraint` and `Notes` are gone; the
+  prompt bar keeps Predecessor, Move, Assign, Hyperlink and Find. A double-click
+  on a Gantt bar does not open it (the bar has only a right-press handler).
+- Each field is the grid cell's own text (`cell_edit_text` to prefill,
+  `apply_cell` to write), so Predecessors and Resources are one text field each
+  in the column's grammar, not tables. Notes is one line, `\n` = new line (no
+  multiline control). Constraint type + date go through `Editor::set_constraint`
+  (a date without a time is the day's first working time for SNET/FNET); the
+  date follows the type (ASAP and ALAP disable it).
+- OK writes only the fields that changed (`Dialog::changed`), inside
+  `Editor::batch`: one undo step, an unchanged OK leaves the plan clean, and a
+  refused field applies nothing and keeps the dialog open with the message in
+  the status line. Duration, Start, Finish and % Complete of an auto summary
+  are disabled. The new projcore setters (`set_percent_complete`,
+  `set_priority`, `set_deadline`, `set_task_type`, `set_effort_driven`) are in
+  `projcore/src/editor/props.rs`. The old `task-info` input of `inputs.rs` is
+  gone; `uiharness/cases/project-task-info.uit` drives the dialog by hand.

@@ -18,20 +18,25 @@ test project invalid prompts preserve the schedule
   assert dirty is false
   assert bar_2 is on-track 0-0
   key alt t c
-  key backspace backspace backspace backspace
-  type mso
-  key enter
-  assert status is MSO needs a date, e.g. mso 2026-03-05
+  assert dialog is task-information
+  call dialog-tab {"tab":"Advanced"}
+  call dialog-set {"control":"ctype","value":"Must Start On"}
+  call-error dialog-click {"button":"OK"} => MSO needs a constraint date
+  assert dialog is task-information
   assert dirty is false
   assert bar_2 is on-track 0-0
+  key escape
+  assert dialog is none
   key ctrl+alt+z alt+down ctrl+n
   assert selected_task is 1
   assert tasks is 3
   key alt t c
-  type mso
-  key ctrl+enter alt+escape ctrl+backspace tab shift+tab f10
-  assert prompt is constraint:mso
+  call dialog-tab {"tab":"Advanced"}
+  call dialog-set {"control":"ctype","value":"Must Start On"}
+  key ctrl+alt+z alt+down ctrl+n f10
+  assert dialog is task-information
+  assert tasks is 3
   assert dirty is false
   shot window
   key escape
-  assert prompt is none
+  assert dialog is none

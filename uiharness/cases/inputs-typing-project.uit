@@ -1444,6 +1444,7 @@ test project task-information/cdate: focus by click
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Advanced"}
   call real-key {"key":"tab","to-field":"ctype"}
   call real-key {"key":"down","times":4}
   call pointer-click {"dialog-tab":"Advanced"}
@@ -1458,6 +1459,7 @@ test project task-information/cdate: focus by Tab
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Advanced"}
   call real-key {"key":"tab","to-field":"ctype"}
   call real-key {"key":"down","times":4}
   call pointer-click {"dialog-tab":"Advanced"}
@@ -1472,6 +1474,7 @@ test project task-information/cdate: types
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Advanced"}
   call real-key {"key":"tab","to-field":"ctype"}
   call real-key {"key":"down","times":4}
   call pointer-click {"dialog-tab":"Advanced"}
@@ -1489,6 +1492,7 @@ test project task-information/cdate: edits
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Advanced"}
   call real-key {"key":"tab","to-field":"ctype"}
   call real-key {"key":"down","times":4}
   call pointer-click {"dialog-tab":"Advanced"}
@@ -1521,6 +1525,7 @@ test project task-information/cdate: select-all replaces
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Advanced"}
   call real-key {"key":"tab","to-field":"ctype"}
   call real-key {"key":"down","times":4}
   call pointer-click {"dialog-tab":"Advanced"}
@@ -1542,6 +1547,7 @@ test project task-information/cdate: pastes
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Advanced"}
   call real-key {"key":"tab","to-field":"ctype"}
   call real-key {"key":"down","times":4}
   call pointer-click {"dialog-tab":"Advanced"}
@@ -1559,6 +1565,7 @@ test project task-information/cdate: copies
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Advanced"}
   call real-key {"key":"tab","to-field":"ctype"}
   call real-key {"key":"down","times":4}
   call pointer-click {"dialog-tab":"Advanced"}
@@ -1578,6 +1585,7 @@ test project task-information/cdate: OK applies
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Advanced"}
   call real-key {"key":"tab","to-field":"ctype"}
   call real-key {"key":"down","times":4}
   call pointer-click {"dialog-tab":"Advanced"}
@@ -1590,6 +1598,7 @@ test project task-information/cdate: OK applies
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Advanced"}
   call real-key {"key":"tab","to-field":"ctype"}
   call real-key {"key":"down","times":4}
   call pointer-click {"dialog-tab":"Advanced"}
@@ -1603,6 +1612,7 @@ test project task-information/cdate: Escape cancels
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Advanced"}
   call real-key {"key":"tab","to-field":"ctype"}
   call real-key {"key":"down","times":4}
   call pointer-click {"dialog-tab":"Advanced"}
@@ -1615,6 +1625,7 @@ test project task-information/cdate: Escape cancels
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Advanced"}
   call real-key {"key":"tab","to-field":"ctype"}
   call real-key {"key":"down","times":4}
   call pointer-click {"dialog-tab":"Advanced"}
@@ -1628,6 +1639,7 @@ test project task-information/cdate: refuses invalid
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"Advanced"}
   call real-key {"key":"tab","to-field":"ctype"}
   call real-key {"key":"down","times":4}
   call pointer-click {"dialog-tab":"Advanced"}

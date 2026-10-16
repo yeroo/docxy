@@ -1,23 +1,19 @@
-# The Project inputs outside the dialogs, typed into with real keys only
-# (#1203, the Project slice of #1029): the grid's inline cell editor and
-# Task > Information...'s prompt. Written by hand, not generated: the dialog
-# catalogue's `inputs-typing-*.uit` own that prefix.
+# The Project input outside the dialogs, typed into with real keys only
+# (#1203, the Project slice of #1029): the grid's inline cell editor. Written
+# by hand, not generated: the dialog catalogue's `inputs-typing-*.uit` own
+# that prefix.
 #
-# An input is focused by `pointer-click {"input":id}`: a double-click on the
-# cursor's cell for the cell editor, a click on the prompt bar's field for
-# task-info. Keys go by `real-key` and `real-type` only, and the prompt is
-# opened by its KeyTips, Alt, T, C; `open` and `click <cell>` are setup. A
-# test is one input and one step, named `project <input>: <step>`; each
-# opens its own copy of project-clipboard.xml (tasks A and B, both As Soon
-# As Possible). Expected values follow Project. The steps that fail today
-# are in expected-failures.txt. See qa/inputs-typing.md.
+# The input is focused by `pointer-click {"input":"project-cell"}`: a
+# double-click on the cursor's cell. Keys go by `real-key` and `real-type`
+# only; `open` and `click <cell>` are setup. A test is one input and one
+# step, named `project <input>: <step>`; each opens its own copy of
+# project-clipboard.xml (tasks A and B, both As Soon As Possible). Expected
+# values follow Project. The steps that fail today are in
+# expected-failures.txt. See qa/inputs-typing.md.
 #
-# The suite has no Task Information dialog (#1368): Information... opens
-# the prompt bar's Constraint prompt, prefilled with the task's constraint
-# (empty for As Soon As Possible). The bar's other prompts (Notes,
-# Hyperlink, Assign, Move, Predecessor, Find) are the same field on the same
-# key path, so they are not typed into again. When #1368 adds the dialog,
-# the catalogue lists it and `inputs-typing-project.uit` types into it.
+# Task > Information... was once a second input here, the prompt bar's
+# Constraint prompt. It is the catalogued Task Information dialog now
+# (#1368), which `inputs-typing-project.uit` types into.
 
 # ---- The cell editor: a double-click on the cursor's cell opens it, with
 # the cell's text and the caret at its end. The typing steps use the entry
@@ -188,181 +184,4 @@ test project project-cell: a click is refused while a cell is open
   call pointer-click {"input":"project-cell"}
   call-error pointer-click {"input":"project-cell"} => a Project cell edit is already open; a click on a cell commits it
   assert cell_edit is A
-  call real-key {"key":"escape"}
-
-# ---- Task > Information... (Alt, T, C): the prompt bar's Constraint
-# prompt. It has the keys from the moment it opens; a click on its field
-# must leave it open with them. Enter sets the constraint, which the prompt
-# shows again the next time it opens.
-
-test project task-info: is refused while no prompt is open
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  call-error pointer-click {"input":"task-info"} => Task > Information...'s constraint prompt is not drawn: Task > Information... first
-  call field-read {"input":"task-info"}
-  assert reply.focused is false
-  assert reply.value is null
-
-test project task-info: focus by click
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  call real-key {"key":"alt"}
-  call real-key {"key":"t"}
-  call real-key {"key":"c"}
-  assert prompt is constraint:
-  call pointer-click {"input":"task-info"}
-  assert reply.clicks is 1
-  assert prompt is constraint:
-  call field-read {"input":"task-info"}
-  assert reply.focused is true
-  assert reply.value is exactly ""
-  assert reply.caret is 0
-  assert reply.selection is null
-  call real-type {"text":"x"}
-  call field-read {"input":"task-info"}
-  assert reply.value is x
-  call real-key {"key":"escape"}
-
-test project task-info: types
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  call real-key {"key":"alt"}
-  call real-key {"key":"t"}
-  call real-key {"key":"c"}
-  call pointer-click {"input":"task-info"}
-  call real-type {"text":"Ab1 "}
-  call field-read {"input":"task-info"}
-  assert reply.focused is true
-  assert reply.value is exactly "Ab1 "
-  assert reply.caret is 4
-  call real-key {"key":"escape"}
-
-test project task-info: edits
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  call real-key {"key":"alt"}
-  call real-key {"key":"t"}
-  call real-key {"key":"c"}
-  call pointer-click {"input":"task-info"}
-  call real-type {"text":"abcd"}
-  call real-key {"key":"backspace"}
-  call field-read {"input":"task-info"}
-  assert reply.value is abc
-  call real-key {"key":"home"}
-  call field-read {"input":"task-info"}
-  assert reply.caret is 0
-  call real-key {"key":"right"}
-  call real-key {"key":"delete"}
-  call field-read {"input":"task-info"}
-  assert reply.value is ac
-  call real-key {"key":"end"}
-  call real-key {"key":"left"}
-  call field-read {"input":"task-info"}
-  assert reply.caret is 1
-  call real-type {"text":"X"}
-  call field-read {"input":"task-info"}
-  assert reply.value is aXc
-  assert reply.caret is 2
-  call real-key {"key":"escape"}
-
-test project task-info: select-all replaces
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  call real-key {"key":"alt"}
-  call real-key {"key":"t"}
-  call real-key {"key":"c"}
-  call pointer-click {"input":"task-info"}
-  call real-type {"text":"abcd"}
-  call real-key {"key":"ctrl+a"}
-  call field-read {"input":"task-info"}
-  assert reply.focused is true
-  assert reply.selection is [0,4]
-  call real-type {"text":"X"}
-  call field-read {"input":"task-info"}
-  assert reply.value is X
-  call real-key {"key":"escape"}
-
-test project task-info: copies
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  call clipboard {"action":"write","text":"before"}
-  call real-key {"key":"alt"}
-  call real-key {"key":"t"}
-  call real-key {"key":"c"}
-  call pointer-click {"input":"task-info"}
-  call real-type {"text":"abcd"}
-  call real-key {"key":"ctrl+a"}
-  call real-key {"key":"ctrl+c"}
-  call clipboard {"action":"read"}
-  assert reply.text is abcd
-  call real-key {"key":"escape"}
-
-test project task-info: pastes
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  call clipboard {"action":"write","text":"Pasted"}
-  call real-key {"key":"alt"}
-  call real-key {"key":"t"}
-  call real-key {"key":"c"}
-  call pointer-click {"input":"task-info"}
-  call real-key {"key":"ctrl+v"}
-  call field-read {"input":"task-info"}
-  assert reply.focused is true
-  assert reply.value is Pasted
-  assert reply.caret is 6
-  call real-key {"key":"escape"}
-
-test project task-info: Enter commits
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  assert dirty is false
-  call real-key {"key":"alt"}
-  call real-key {"key":"t"}
-  call real-key {"key":"c"}
-  call pointer-click {"input":"task-info"}
-  call real-type {"text":"SNET 2026-01-19"}
-  call real-key {"key":"enter"}
-  assert prompt is none
-  assert status is Constraint set: SNET
-  assert dirty is true
-  call field-read {"input":"task-info"}
-  assert reply.focused is false
-  call real-key {"key":"alt"}
-  call real-key {"key":"t"}
-  call real-key {"key":"c"}
-  call field-read {"input":"task-info"}
-  assert reply.value is SNET 2026-01-19
-  call real-key {"key":"escape"}
-
-test project task-info: Escape cancels
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  call real-key {"key":"alt"}
-  call real-key {"key":"t"}
-  call real-key {"key":"c"}
-  call pointer-click {"input":"task-info"}
-  call real-type {"text":"SNET 2026-01-19"}
-  call real-key {"key":"escape"}
-  assert prompt is none
-  assert dirty is false
-  call real-key {"key":"alt"}
-  call real-key {"key":"t"}
-  call real-key {"key":"c"}
-  call field-read {"input":"task-info"}
-  assert reply.value is exactly ""
-  call real-key {"key":"escape"}
-
-# Another prompt kind is the same field, but not this input: field-read
-# does not report its buffer as Information...'s, and a click is refused.
-test project task-info: another prompt is not it
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  call real-key {"key":"alt"}
-  call real-key {"key":"t"}
-  call real-key {"key":"p"}
-  assert prompt is predecessor:
-  call-error pointer-click {"input":"task-info"} => the open prompt is predecessor, not Task > Information...'s constraint
-  call field-read {"input":"task-info"}
-  assert reply.focused is false
-  assert reply.value is null
   call real-key {"key":"escape"}

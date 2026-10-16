@@ -57,14 +57,13 @@ Every editable input in the suite is typed into with real keys by a case:
   covers from Backstage (the #1027 path).
 - **Project's inputs** (#1203) are in the hand-written
   `uiharness/cases/project-inputs-typing.uit`: the grid's inline cell editor
-  (`project-cell`), which a double-click on the cursor's cell opens, and
-  Task > Information... (`task-info`), which opens the prompt bar's
-  Constraint prompt by its KeyTips, Alt, T, C. Each test opens its own copy
-  of `project-clipboard.xml` and checks one step against what Project does;
-  Enter sets the task's name or constraint. The suite has no Task Information
-  dialog yet (#1368); when it lands, the catalogue lists it. The bar's other
-  prompts (Notes, Hyperlink, Assign, Move, Predecessor, Find) are the same
-  field, so they are not typed into again.
+  (`project-cell`), which a double-click on the cursor's cell opens. Each
+  test opens its own copy of `project-clipboard.xml` and checks one step
+  against what Project does. Task > Information... is the catalogued Task
+  Information dialog (#1368, `task-information`), typed into by the
+  generated `inputs-typing-project.uit`. The prompt bar's remaining prompts
+  (Hyperlink, Assign, Move, Predecessor, Find) are the same field, so they
+  are not typed into again.
 - **The terminal editors' prompts** (#1204) are typed into by the
   hand-written `uiharness/cases/terminal-docxy-inputs-typing.uit`,
   `terminal-xlsxy-inputs-typing.uit` and `terminal-yppxy-inputs-typing.uit`

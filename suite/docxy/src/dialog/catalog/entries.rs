@@ -46,7 +46,11 @@ macro_rules! pick {
 
 // Prep: the choices that show or enable a field.
 // Task Information: a constraint type with a date (Start No Earlier Than).
-const PICK_SNET: &[&str] = pick!("ctype", 4);
+const PICK_SNET: &[&str] = &[
+    r#"call pointer-click {"dialog-tab":"Advanced"}"#,
+    r#"call real-key {"key":"tab","to-field":"ctype"}"#,
+    r#"call real-key {"key":"down","times":4}"#,
+];
 const TWELVE_COLUMNS: &[&str] = &[
     r#"call pointer-click {"dialog-field":"num"}"#,
     r#"call real-key {"key":"ctrl+a"}"#,
