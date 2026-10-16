@@ -3538,7 +3538,8 @@ impl SheetView {
     /// What `key` does to a revert's toggle and selection (#1147): the revert
     /// itself (Ctrl+Z, Alt+Backspace) keeps them, a typed character, Backspace
     /// or Delete uses the selection up itself, Ctrl+A / Ctrl+C / Ctrl+X keep
-    /// the selection but drop the toggle (#1340), any other key (a lone
+    /// the selection but drop the toggle (#1340), Ctrl+V keeps it for the paste
+    /// to replace (#1341), any other key (a lone
     /// modifier aside) drops both.
     fn end_revert_for_key(&mut self, key: &str, ctrl: bool, alt: bool, typed: bool) {
         let modifier = matches!(key, "shift" | "control" | "alt" | "platform" | "function");
@@ -3548,8 +3549,9 @@ impl SheetView {
         }
         self.edit_redo = None;
         let uses_it = !ctrl && !alt && (typed || key == "backspace" || key == "delete");
-        // Ctrl+A selects the entry's text and Ctrl+C / Ctrl+X read it (#1340).
-        let keeps_it = ctrl && !alt && matches!(key, "a" | "c" | "x");
+        // Ctrl+A selects the entry's text, Ctrl+C / Ctrl+X read it (#1340) and
+        // Ctrl+V replaces it (#1341).
+        let keeps_it = ctrl && !alt && matches!(key, "a" | "c" | "x" | "v");
         if !uses_it && !keeps_it {
             self.edit_select_all = false;
         }
@@ -4221,12 +4223,15 @@ impl SheetView {
     /// as typed text would (it replaces a selection, overtypes in overtype
     /// mode), line breaks as `\n`; a proposed completion is dropped first.
     fn edit_paste_text(&mut self, text: &str) {
+        self.drop_proposal();
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        // A copied cell's text ends its row with a line break; Excel's entry
+        // does not take it.
+        let text = text.strip_suffix('\n').unwrap_or(&text);
         if text.is_empty() {
             return;
         }
-        self.drop_proposal();
-        let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        self.edit_type(&text);
+        self.edit_type(text);
     }
     /// Insert text at the caret, advancing it.
     fn edit_insert(&mut self, s: &str) {
