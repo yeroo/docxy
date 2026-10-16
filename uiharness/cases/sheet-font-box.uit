@@ -121,8 +121,14 @@ test a font box whose group folds away in a narrower window is not kept
   call pointer-click {"input":"sheet-font"}
   call real-type {"text":"Zz"}
   call window-size {"w":640,"h":800}
-  # The resize is drawn before this click looks for the box (an X server
-  # applies it later than a Mac does), and the Font group has folded away.
+  # Settle the resized window's frame the way ribbon-fit.uit does (an X
+  # server applies a resize later than a Mac): the Font group has folded away.
+  call ribbon-layout {"tab":"Home"}
+  shot window
+  call ribbon-layout {"tab":"Home"}
+  assert reply.settled is true
+  assert reply.groups.1.title is Font
+  assert reply.groups.1.state is collapsed
   call-error pointer-click {"input":"sheet-font"} => the ribbon's Font combo (sheet) is not drawn: show the Home ribbon tab first
   call real-type {"text":"Q"}
   call real-key {"key":"enter"}
@@ -132,7 +138,11 @@ test a font box whose group folds away in a narrower window is not kept
   assert reply.value is Calibri
   # Wider again: the box is not revived with its stale text.
   call window-size {"w":1400,"h":800}
-  call pointer-move {"to":"cell:C2"}
+  call ribbon-layout {"tab":"Home"}
+  shot window
+  call ribbon-layout {"tab":"Home"}
+  assert reply.settled is true
+  assert reply.groups.1.state is full
   call field-read {"input":"sheet-font"}
   assert reply.focused is false
   call real-type {"text":"R"}
