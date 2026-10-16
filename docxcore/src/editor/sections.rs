@@ -9,7 +9,8 @@
 //! what the page view and Save read.
 
 use super::{
-    Caret, EditKind, Editor, resolve_para, spans_containers, split_paragraph_content, tab_props_at,
+    Caret, EditKind, Editor, para_text_len, resolve_para, spans_containers,
+    split_paragraph_content, tab_props_at,
 };
 use crate::model::{Block, BreakKind, Inline, Paragraph, SectionProperties};
 use crate::sect::{SectionSetup, SectionStart};
@@ -23,6 +24,17 @@ pub(super) enum SectAt {
     Para(usize),
     /// The body-level trailing section properties.
     Trailing,
+}
+
+/// How one end of a selection cuts its section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Cut {
+    /// Already at the section's edge: nothing to cut.
+    Edge,
+    /// Between paragraphs: the mark of this body paragraph ends the section.
+    Gap(usize),
+    /// Inside a paragraph (or beside a table): split it.
+    Mid,
 }
 
 /// A raw sectPr for a section that has none of its own yet.
@@ -217,7 +229,29 @@ impl Editor {
         start: SectionStart,
         edit: impl FnOnce(&mut SectionSetup),
     ) -> Result<(), String> {
-        let (at, block, k) = self.break_point()?;
+        let (at, _, _) = self.break_point()?;
+        self.anchor = None;
+        self.caret = at.clone();
+        self.checkpoint(EditKind::Structural);
+        self.split_section_at(&at, start, edit)?;
+        self.settle_revisions();
+        Ok(())
+    }
+
+    /// Split the body paragraph at `at` and give the section after the split
+    /// `start` and `edit`, with no undo step taken and the selection left to
+    /// the caller (the caret ends at the second half's start). The first
+    /// half closes a copy of the section's sectPr with its original `w:type`.
+    fn split_section_at(
+        &mut self,
+        at: &Caret,
+        start: SectionStart,
+        edit: impl FnOnce(&mut SectionSetup),
+    ) -> Result<(), String> {
+        let &[block] = at.path.as_slice() else {
+            return Err("A section break can only go in the body text, not here".into());
+        };
+        let k = self.section_of_block(block);
         let slot = self.section_slots()[k];
         let old = self.sect_raw(slot).to_string();
         let mut setup = SectionSetup::parse(&old);
@@ -225,13 +259,10 @@ impl Editor {
         edit(&mut setup);
         let closing = setup.apply(&old);
 
-        self.anchor = None;
-        self.caret = at;
-        self.checkpoint(EditKind::Structural);
         let Some(Block::Paragraph(p)) = self.doc.body.get_mut(block) else {
             return Err("A section break needs the caret in a paragraph".into());
         };
-        let right = split_paragraph_content(&mut p.content, self.caret.offset);
+        let right = split_paragraph_content(&mut p.content, at.offset);
         let second = Paragraph {
             props: p.props.clone(),
             content: right,
@@ -251,6 +282,196 @@ impl Editor {
         };
         self.set_sect_raw(moved, closing);
         self.caret = Caret::at(vec![block + 1], 0);
+        Ok(())
+    }
+
+    /// End the section after body paragraph `after` without splitting it: its
+    /// mark takes a copy of the section's sectPr (original `w:type`), and the
+    /// sectPr behind it takes `start` and `edit`.
+    fn cut_section_after(
+        &mut self,
+        after: usize,
+        start: SectionStart,
+        edit: impl FnOnce(&mut SectionSetup),
+    ) {
+        let k = self.section_of_block(after);
+        let slot = self.section_slots()[k];
+        let old = self.sect_raw(slot).to_string();
+        let mut setup = SectionSetup::parse(&old);
+        setup.start = start;
+        edit(&mut setup);
+        let closing = setup.apply(&old);
+        if let Some(Block::Paragraph(p)) = self.doc.body.get_mut(after) {
+            p.props.section_break = Some(old);
+            p.props.section_property_change = None;
+        }
+        self.set_sect_raw(slot, closing);
+    }
+
+    /// How the selection's two ends cut their section for
+    /// [`Editor::wrap_selection_in_section`], or `None` when it cannot be
+    /// wrapped: no selection, a table-cell range, an end outside a top-level
+    /// body paragraph, ends in different sections, or both ends already at
+    /// the section's edges (nothing would be cut).
+    fn selection_cuts(&self) -> Option<(Caret, Caret, Cut, Cut)> {
+        if self.cell_range().is_some() {
+            return None;
+        }
+        let (mut lo, mut hi) = self.selection_range()?;
+        let (&[mut lb], &[mut hb]) = (lo.path.as_slice(), hi.path.as_slice()) else {
+            return None;
+        };
+        let len = |b: usize| match self.doc.body.get(b) {
+            Some(Block::Paragraph(p)) => Some(para_text_len(p)),
+            _ => None,
+        };
+        let is_para = |b: usize| matches!(self.doc.body.get(b), Some(Block::Paragraph(_)));
+        // An empty paragraph's one offset is both its start and its end, so
+        // at the start edge it stays in the selection. At the end edge it
+        // does too when it is the last of its section (Select All over a
+        // blank last paragraph); elsewhere the selection stops before its
+        // mark like any paragraph start.
+        let mut lo_gap = None;
+        let mut hi_moved = false;
+        let lb_len = len(lb)?;
+        if lb_len > 0 && lb_len == lo.offset && lb < hb {
+            // From a paragraph's end: the selection starts with its mark, so
+            // the text starts at the next block. A table there cannot start
+            // the section by a split without a blank paragraph before it, so
+            // the mark ends the section instead.
+            if is_para(lb + 1) {
+                lb += 1;
+                lo = Caret::at(vec![lb], 0);
+            } else {
+                lo_gap = Some(lb);
+            }
+        }
+        let ends_section = |b: usize| {
+            matches!(
+                self.doc.body.get(b),
+                Some(Block::Paragraph(p)) if p.props.section_break.is_some()
+            ) || b + 1 >= self.doc.content_block_count()
+        };
+        // A blank first paragraph of the next section is not this section's.
+        let blank_end = len(hb)? == 0
+            && ends_section(hb)
+            && self.section_of_block(hb) == self.section_of_block(lb);
+        if hi.offset == 0 && !blank_end && hb > lb && is_para(hb - 1) {
+            // To a paragraph's start: the text ends with the previous mark.
+            hb -= 1;
+            hi_moved = true;
+            hi = Caret::at(vec![hb], len(hb)?);
+        }
+        let hlen = len(hb)?;
+        // An empty paragraph's own mark is a selection (moved onto by the end
+        // rule); a bare paragraph mark before it is not.
+        if (hb, hi.offset) < (lb, lo.offset) || ((hb, hi.offset) == (lb, lo.offset) && !hi_moved) {
+            return None;
+        }
+        let k = self.section_of_block(lb);
+        if self.section_of_block(hb) != k {
+            return None;
+        }
+        let lo_cut = if let Some(p) = lo_gap {
+            Cut::Gap(p)
+        } else if lo.offset > 0 {
+            Cut::Mid
+        } else if lb == 0 || self.section_of_block(lb - 1) != k {
+            Cut::Edge
+        } else if is_para(lb - 1) {
+            Cut::Gap(lb - 1)
+        } else {
+            Cut::Mid
+        };
+        let hi_cut = if hi.offset == hlen {
+            if ends_section(hb) {
+                Cut::Edge
+            } else {
+                Cut::Gap(hb)
+            }
+        } else {
+            Cut::Mid
+        };
+        if lo_cut == Cut::Edge && hi_cut == Cut::Edge {
+            return None;
+        }
+        // A tracked paragraph mark would take the break with it on Accept or
+        // Reject: Selected text is not offered there.
+        let tracked = |c: &Cut| match c {
+            Cut::Gap(p) => matches!(
+                self.doc.body.get(*p),
+                Some(Block::Paragraph(q)) if !q.props.mark_revisions.is_empty()
+            ),
+            _ => false,
+        };
+        if tracked(&lo_cut) || tracked(&hi_cut) {
+            return None;
+        }
+        Some((lo, hi, lo_cut, hi_cut))
+    }
+
+    /// The section [`Editor::wrap_selection_in_section`] edits: the one the
+    /// selected text lies in.
+    pub fn selection_wrap_section(&self) -> Option<usize> {
+        let (lo, ..) = self.selection_cuts()?;
+        lo.path.first().map(|&b| self.section_of_block(b))
+    }
+
+    /// Whether [`Editor::wrap_selection_in_section`] applies: a text
+    /// selection inside one section that does not cover all of it.
+    pub fn selection_section_wrappable(&self) -> bool {
+        self.selection_cuts().is_some()
+    }
+
+    /// Wrap the selection in section breaks and `edit` the section made of
+    /// just the selected text (Word's "Apply to: Selected text"), as one
+    /// undo step. The middle section starts as `start` says (unless the
+    /// selection starts at its section's start, where the existing break
+    /// stays), and so does the section after it. No empty paragraph is made
+    /// where a selection edge is at a paragraph edge: the neighbouring
+    /// paragraph's mark carries the break, except beside a table (before the
+    /// text or ending it): a table cannot carry a sectPr, so a split leaves an
+    /// empty paragraph next to it. The selection stays on the same text.
+    pub fn wrap_selection_in_section(
+        &mut self,
+        start: SectionStart,
+        edit: impl FnOnce(&mut SectionSetup),
+    ) -> Result<(), String> {
+        let Some((lo, hi, lo_cut, hi_cut)) = self.selection_cuts() else {
+            return Err("Selected text needs a text selection inside one section".into());
+        };
+        let anchor = self.anchor.clone();
+        let caret = self.caret.clone();
+        self.checkpoint(EditKind::Structural);
+        // The end first, so the start's position stays valid.
+        match &hi_cut {
+            Cut::Edge => {}
+            Cut::Gap(p) => self.cut_section_after(*p, start, |_| {}),
+            Cut::Mid => self.split_section_at(&hi, start, |_| {})?,
+        }
+        match &lo_cut {
+            Cut::Edge => {
+                let slot = self.section_slots()[self.section_of_block(lo.path[0])];
+                let old = self.sect_raw(slot).to_string();
+                let mut setup = SectionSetup::parse(&old);
+                edit(&mut setup);
+                let new = setup.apply(&old);
+                self.set_sect_raw(slot, new);
+            }
+            Cut::Gap(p) => self.cut_section_after(*p, start, edit),
+            Cut::Mid => self.split_section_at(&lo, start, edit)?,
+        }
+        // Keep the selection on its text: a split at the start moved
+        // everything from it on into the next paragraph.
+        let shift = |c: &Caret| match (&lo_cut, c.path.as_slice()) {
+            (Cut::Mid, &[b]) if b > lo.path[0] => Caret::at(vec![b + 1], c.offset),
+            (Cut::Mid, &[b]) if b == lo.path[0] && c.offset >= lo.offset => {
+                Caret::at(vec![b + 1], c.offset - lo.offset)
+            }
+            _ => c.clone(),
+        };
+        self.anchor = anchor.as_ref().map(shift);
+        self.caret = shift(&caret);
         self.settle_revisions();
         Ok(())
     }
@@ -510,6 +731,360 @@ mod tests {
         assert_eq!(e.caret, Caret::top(2, 0));
         assert!(e.undo());
         assert_eq!(e.doc, before);
+    }
+
+    /// One section "alpha beta", "gamma", "delta" (three paragraphs), a
+    /// continuous break after the first section of a longer document in
+    /// `wrap_doc`.
+    fn wrap_doc() -> Editor {
+        let mut doc = Document {
+            body: vec![
+                para("alpha beta", None),
+                para("gamma", None),
+                para("delta", None),
+                para("tail", Some(&sect("<w:type w:val=\"oddPage\"/>"))),
+                para("next", None),
+            ],
+        };
+        doc.set_trailing_section_properties(SectionProperties {
+            raw: sect(""),
+            property_change: None,
+        });
+        Editor::new(doc)
+    }
+
+    fn texts(e: &Editor) -> Vec<String> {
+        e.doc.body.iter().map(|b| b.plain_text()).collect()
+    }
+
+    fn select(e: &mut Editor, a: (usize, usize), c: (usize, usize)) {
+        e.anchor = Some(Caret::top(a.0, a.1));
+        e.caret = Caret::top(c.0, c.1);
+    }
+
+    fn selected_text(e: &Editor) -> String {
+        assert!(e.has_selection());
+        let mut out = Vec::new();
+        for (path, a, b) in e.selection_spans() {
+            let t = e.doc.body[path[0]].plain_text();
+            out.push(t.chars().skip(a).take(b - a).collect::<String>());
+        }
+        out.join("|")
+    }
+
+    fn margin(e: &Editor, k: usize) -> i32 {
+        SectionSetup::parse(&e.sections()[k]).margins.left
+    }
+
+    #[test]
+    fn wrapping_mid_paragraph_text_makes_three_sections_with_the_edit_on_the_middle() {
+        let mut e = wrap_doc();
+        select(&mut e, (0, 2), (0, 7)); // "pha b"
+        let before = e.doc.clone();
+        assert!(e.selection_section_wrappable());
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(texts(&e)[..4], ["al", "pha b", "eta", "gamma"]);
+        let s = e.sections();
+        assert_eq!(s.len(), 4);
+        // Before keeps the original, the middle is edited and Continuous,
+        // the one after is the original body, Continuous.
+        assert_eq!(start_of(&s[0]), SectionStart::OddPage);
+        assert_ne!(margin(&e, 0), 720);
+        assert_eq!(start_of(&s[1]), SectionStart::Continuous);
+        assert_eq!(margin(&e, 1), 720);
+        assert_eq!(start_of(&s[2]), SectionStart::Continuous);
+        assert_ne!(margin(&e, 2), 720);
+        // The selection stays on the same text.
+        assert_eq!(selected_text(&e), "pha b");
+        assert!(e.undo());
+        assert_eq!(e.doc, before);
+        assert_eq!(
+            e.selection_range(),
+            Some((Caret::top(0, 2), Caret::top(0, 7)))
+        );
+    }
+
+    #[test]
+    fn wrapping_inside_one_paragraph_keeps_the_text_and_one_undo_step() {
+        let mut e = wrap_doc();
+        select(&mut e, (1, 1), (1, 3)); // "am"
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(texts(&e)[1..4], ["g", "am", "ma"]);
+        assert_eq!(selected_text(&e), "am");
+        assert!(e.undo());
+        assert_eq!(texts(&e)[1], "gamma");
+        assert_eq!(e.sections().len(), 2);
+    }
+
+    #[test]
+    fn wrapping_whole_paragraphs_makes_no_empty_paragraph() {
+        let mut e = wrap_doc();
+        select(&mut e, (1, 0), (1, 5)); // all of "gamma"
+        let n = e.doc.body.len();
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(e.doc.body.len(), n, "marks carry the breaks");
+        assert_eq!(texts(&e)[..3], ["alpha beta", "gamma", "delta"]);
+        let s = e.sections();
+        assert_eq!(s.len(), 4);
+        assert_eq!(margin(&e, 0), SectionSetup::parse(&sect("")).margins.left);
+        assert_eq!(margin(&e, 1), 720);
+        assert_eq!(start_of(&s[1]), SectionStart::Continuous);
+        assert_eq!(start_of(&s[2]), SectionStart::Continuous);
+        assert_eq!(selected_text(&e), "gamma");
+        // Selected back to front gives the same result.
+        let mut r = wrap_doc();
+        select(&mut r, (1, 5), (1, 0));
+        r.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(r.doc.body, e.doc.body);
+        assert_eq!(r.caret, Caret::top(1, 0));
+        assert!(e.undo());
+        assert_eq!(e.sections().len(), 2);
+    }
+
+    #[test]
+    fn a_selection_ending_at_the_next_paragraph_start_cuts_the_same_gap() {
+        let mut e = wrap_doc();
+        select(&mut e, (1, 0), (2, 0));
+        let n = e.doc.body.len();
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(e.doc.body.len(), n);
+        assert_eq!(e.sections().len(), 4);
+        assert_eq!(margin(&e, 1), 720);
+    }
+
+    #[test]
+    fn wrapping_from_the_section_start_or_to_its_end_adds_one_break() {
+        // Starts at the document start: only the end cuts.
+        let mut e = wrap_doc();
+        select(&mut e, (0, 0), (0, 5)); // "alpha"
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(texts(&e)[..2], ["alpha", " beta"]);
+        let s = e.sections();
+        assert_eq!(s.len(), 3);
+        assert_eq!(margin(&e, 0), 720);
+        assert_eq!(margin(&e, 1), SectionSetup::parse(&sect("")).margins.left);
+        assert_eq!(start_of(&s[1]), SectionStart::Continuous);
+        assert_eq!(selected_text(&e), "alpha");
+
+        // Reaches the end of its section ("tail" carries the break): only
+        // the start cuts, the closing break stays the section's own.
+        let mut e = wrap_doc();
+        select(&mut e, (3, 2), (3, 4)); // "il"
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(texts(&e)[3..5], ["ta", "il"]);
+        let s = e.sections();
+        assert_eq!(s.len(), 3);
+        assert_eq!(start_of(&s[0]), SectionStart::OddPage, "the part before");
+        assert_eq!(margin(&e, 1), 720);
+        assert_eq!(start_of(&s[1]), SectionStart::Continuous);
+        assert_eq!(selected_text(&e), "il");
+    }
+
+    #[test]
+    fn wrapping_after_a_table_splits_at_the_paragraph_start() {
+        let mut e = wrap_doc();
+        e.doc.body.insert(1, Block::Table(Table::default()));
+        select(&mut e, (2, 0), (2, 5)); // all of "gamma", a table before it
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(selected_text(&e), "gamma");
+        assert_eq!(e.sections().len(), 4);
+        assert_eq!(margin(&e, 1), 720);
+    }
+
+    #[test]
+    fn a_selection_from_a_paragraph_end_makes_no_empty_paragraph_1272() {
+        let mut e = wrap_doc();
+        select(&mut e, (0, 10), (1, 5)); // "alpha beta" mark, all of "gamma"
+        let n = e.doc.body.len();
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(e.doc.body.len(), n, "no blank half");
+        assert_eq!(texts(&e)[..3], ["alpha beta", "gamma", "delta"]);
+        assert_eq!(margin(&e, 0), SectionSetup::parse(&sect("")).margins.left);
+        assert_eq!(margin(&e, 1), 720);
+        assert_eq!(e.sections().len(), 4);
+        assert_eq!(
+            e.selection_range(),
+            Some((Caret::top(0, 10), Caret::top(1, 5)))
+        );
+        // Only a paragraph mark selected: nothing to wrap.
+        let mut e = wrap_doc();
+        select(&mut e, (0, 10), (1, 0));
+        assert!(!e.selection_section_wrappable());
+    }
+
+    #[test]
+    fn edges_in_the_neighbouring_section_are_taken_into_the_selections_own_1272() {
+        // To the start of the next section's first paragraph ("next").
+        let mut e = wrap_doc();
+        select(&mut e, (3, 2), (4, 0));
+        assert!(e.selection_section_wrappable());
+        assert_eq!(e.selection_wrap_section(), Some(0));
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(texts(&e)[3..6], ["ta", "il", "next"]);
+        assert_eq!(margin(&e, 1), 720);
+        // From the end of the last paragraph of the previous section.
+        let mut e = wrap_doc();
+        select(&mut e, (3, 4), (4, 2)); // "tail" mark, "ne"
+        assert!(e.selection_section_wrappable());
+        assert_eq!(e.selection_wrap_section(), Some(1));
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(texts(&e)[4..6], ["ne", "xt"]);
+        assert_eq!(margin(&e, 1), 720);
+        assert_eq!(e.sections().len(), 3);
+    }
+
+    #[test]
+    fn a_selection_from_a_paragraph_end_before_a_table_ends_the_section_at_its_mark_1272() {
+        let mut e = wrap_doc();
+        e.doc.body.insert(1, Block::Table(Table::default()));
+        select(&mut e, (0, 10), (2, 3)); // mark, table, "gam"
+        let n = e.doc.body.len();
+        let before = e.doc.clone();
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(e.doc.body.len(), n + 1, "only the end splits");
+        assert_eq!(texts(&e)[0], "alpha beta");
+        assert_eq!(margin(&e, 1), 720);
+        assert_eq!(e.sections().len(), 4);
+        assert!(e.undo());
+        assert_eq!(e.doc, before);
+    }
+
+    fn blanks(texts: &[&str]) -> Editor {
+        let mut doc = Document {
+            body: texts.iter().map(|t| para(t, None)).collect(),
+        };
+        doc.set_trailing_section_properties(SectionProperties {
+            raw: sect(""),
+            property_change: None,
+        });
+        Editor::new(doc)
+    }
+
+    #[test]
+    fn an_empty_paragraph_at_an_edge_stays_in_the_selection_1272() {
+        // Select All with a blank first or last paragraph is the whole section.
+        let mut e = blanks(&["", "a", "b"]);
+        select(&mut e, (0, 0), (2, 1));
+        assert!(!e.selection_section_wrappable());
+        let mut e = blanks(&["a", "b", ""]);
+        select(&mut e, (0, 0), (2, 0));
+        assert!(!e.selection_section_wrappable());
+        // The blank paragraph is inside the middle section.
+        let mut e = blanks(&["alpha", "", "gamma", "delta"]);
+        select(&mut e, (1, 0), (2, 5));
+        let n = e.doc.body.len();
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(e.doc.body.len(), n);
+        assert_eq!(texts(&e)[..3], ["alpha", "", "gamma"]);
+        // alpha | "" gamma | delta: the break marks are on "alpha" and "gamma".
+        assert!(matches!(&e.doc.body[0], Block::Paragraph(p) if p.props.section_break.is_some()));
+        assert!(matches!(&e.doc.body[2], Block::Paragraph(p) if p.props.section_break.is_some()));
+        assert_eq!(margin(&e, 1), 720);
+        // From an empty paragraph to the next one's start.
+        let mut e = blanks(&["alpha", "", "gamma"]);
+        select(&mut e, (1, 0), (2, 0));
+        assert!(e.selection_section_wrappable());
+    }
+
+    #[test]
+    fn a_selection_ending_before_a_blank_paragraph_in_the_middle_leaves_it_out_1272() {
+        let mut e = blanks(&["alpha", "", "gamma"]);
+        select(&mut e, (0, 0), (1, 0));
+        // Edge start, so only the end cuts: "alpha" ends the first section.
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(margin(&e, 0), 720);
+        assert!(matches!(&e.doc.body[0], Block::Paragraph(p) if p.props.section_break.is_some()));
+        assert!(matches!(&e.doc.body[1], Block::Paragraph(p) if p.props.section_break.is_none()));
+        let mut e = blanks(&["alpha", "beta", "", "delta"]);
+        select(&mut e, (1, 0), (2, 0));
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(margin(&e, 1), 720);
+        assert!(matches!(&e.doc.body[0], Block::Paragraph(p) if p.props.section_break.is_some()));
+        assert!(matches!(&e.doc.body[1], Block::Paragraph(p) if p.props.section_break.is_some()));
+        assert!(matches!(&e.doc.body[2], Block::Paragraph(p) if p.props.section_break.is_none()));
+    }
+
+    #[test]
+    fn a_selection_ending_right_after_a_table_splits_there_1272() {
+        let mut e = wrap_doc();
+        e.doc.body.insert(1, Block::Table(Table::default()));
+        select(&mut e, (0, 2), (2, 0)); // to the start of "gamma", after the table
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(e.sections().len(), 4);
+        assert_eq!(margin(&e, 1), 720);
+        assert_eq!(texts(&e)[0], "al");
+    }
+
+    #[test]
+    fn a_blank_first_paragraph_of_the_next_section_does_not_refuse_the_selection_1272() {
+        let mut doc = Document {
+            body: vec![para("alpha beta", Some(&sect(""))), para("", None)],
+        };
+        doc.set_trailing_section_properties(SectionProperties {
+            raw: sect(""),
+            property_change: None,
+        });
+        let mut e = Editor::new(doc);
+        select(&mut e, (0, 2), (1, 0));
+        assert!(e.selection_section_wrappable());
+        assert_eq!(e.selection_wrap_section(), Some(0));
+    }
+
+    #[test]
+    fn a_tracked_paragraph_mark_at_a_gap_is_not_offered_1272() {
+        let mut e = wrap_doc();
+        select(&mut e, (1, 0), (1, 5)); // gaps after "alpha beta" and "gamma"
+        assert!(e.selection_section_wrappable());
+        if let Block::Paragraph(p) = &mut e.doc.body[1] {
+            p.props
+                .mark_revisions
+                .push(crate::model::ParagraphMarkRevision {
+                    kind: crate::model::RevisionKind::Insert,
+                    metadata: Default::default(),
+                });
+        }
+        assert!(!e.selection_section_wrappable());
+    }
+
+    #[test]
+    fn a_selection_that_cannot_be_wrapped_is_refused() {
+        let mut e = wrap_doc();
+        // A caret only.
+        assert!(!e.selection_section_wrappable());
+        // The whole section.
+        select(&mut e, (0, 0), (3, 4));
+        assert!(!e.selection_section_wrappable());
+        // Across a section break.
+        select(&mut e, (1, 1), (4, 2));
+        assert!(!e.selection_section_wrappable());
+        let before = e.doc.clone();
+        assert!(
+            e.wrap_selection_in_section(SectionStart::Continuous, |_| {})
+                .is_err()
+        );
+        assert_eq!(e.doc, before);
+        // Inside a table cell.
+        let mut e = wrap_doc();
+        e.doc.body.insert(0, Block::Table(Table::default()));
+        e.anchor = Some(Caret::at(vec![0, 0, 0, 0], 0));
+        e.caret = Caret::at(vec![0, 0, 0, 0], 1);
+        assert!(!e.selection_section_wrappable());
     }
 
     #[test]

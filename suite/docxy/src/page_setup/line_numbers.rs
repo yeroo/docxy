@@ -250,13 +250,7 @@ pub(crate) fn apply_line_numbers(ed: &mut Editor, d: &Dialog) -> Result<bool, St
             },
         };
     };
-    Ok(match targets(ed, d) {
-        Some(k) => ed.edit_section_setups(&k, edit),
-        None => {
-            ed.insert_section_break_with(SectionStart::Continuous, edit)?;
-            true
-        }
-    })
+    targets(ed, d).write(ed, SectionStart::Continuous, edit)
 }
 
 #[cfg(test)]

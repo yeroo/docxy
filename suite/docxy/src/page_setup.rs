@@ -1,11 +1,16 @@
 //! Word's Page Setup and Columns dialogs (#649), opened from the Layout tab.
 //!
-//! Each dialog opens on the caret section's values. OK applies to the sections
+//! Each dialog opens on the values of the section it opened on (the one Selected
+//! text edits when offered, else the caret's). OK applies to the sections
 //! "Apply to" names, as one undo step on the body editor:
 //! - This section (Selected sections when the selection spans several), the
 //!   caret's sections;
 //! - This point forward, a new section from the caret, started by a section
 //!   break (Next Page for Page Setup, Continuous for Columns);
+//! - Selected text, a text selection inside one section (not all of it),
+//!   wrapped in section breaks with only the middle section changed (the same
+//!   start as This point forward); nothing is wrapped when OK changes no
+//!   section setting;
 //! - Whole document, every section.
 //!
 //! OK writes only the fields the person changed since the dialog opened, so
@@ -26,6 +31,7 @@ pub(crate) use line_numbers::{apply_line_numbers, line_numbers_dialog};
 const CUSTOM: &str = "Custom";
 const THIS_SECTION: &str = "This section";
 const SELECTED_SECTIONS: &str = "Selected sections";
+const SELECTED_TEXT: &str = "Selected text";
 const FORWARD: &str = "This point forward";
 const WHOLE: &str = "Whole document";
 const STARTS: [(SectionStart, &str); 4] = [
@@ -86,36 +92,56 @@ fn body_of(tab: &DocTab) -> Result<(&Editor, &Package), String> {
     }
 }
 
-/// The caret section's setup.
+/// The caret section's setup (Line Numbers).
 fn caret_setup(ed: &Editor) -> SectionSetup {
     SectionSetup::parse(&caret_raw(ed))
 }
 
 /// "Apply to"'s choices: Word's, with Selected sections in place of This
 /// section when the selection spans several, and only Whole document and
-/// This point forward in a one-section document.
+/// This point forward in a one-section document. Line Numbers uses these.
 fn apply_to(ed: &Editor) -> Control {
-    let items: Vec<&str> = if ed.sections().len() == 1 {
+    apply_control(&apply_choices(ed), 0)
+}
+
+/// [`apply_to`] plus Selected text (#1272), offered, and the default, for a
+/// text selection inside one section that does not cover all of it: after
+/// This section, else first.
+fn apply_to_with_selected_text(ed: &Editor) -> Control {
+    let mut items = apply_choices(ed);
+    let mut default = 0;
+    if ed.selection_section_wrappable() {
+        default = usize::from(items[0] == THIS_SECTION);
+        items.insert(default, SELECTED_TEXT);
+    }
+    apply_control(&items, default)
+}
+
+fn apply_choices(ed: &Editor) -> Vec<&'static str> {
+    if ed.sections().len() == 1 {
         vec![WHOLE, FORWARD]
     } else if ed.target_sections().len() > 1 {
         vec![SELECTED_SECTIONS, FORWARD, WHOLE]
     } else {
         vec![THIS_SECTION, FORWARD, WHOLE]
-    };
+    }
+}
+
+fn apply_control(items: &[&str], default: usize) -> Control {
     choice(
         "apply",
         "Apply to:",
         ControlKind::Dropdown,
-        &items,
-        Some(0),
+        items,
+        Some(default),
         None,
     )
 }
 
-/// The Page Setup dialog on the caret section's values, open on `page`.
+/// The Page Setup dialog on the opened-on section's values, open on `page`.
 pub(crate) fn page_setup_dialog(tab: &DocTab, page: PageSetupTab) -> Result<Dialog, String> {
     let (ed, pkg) = body_of(tab)?;
-    let s = caret_setup(ed);
+    let s = SectionSetup::parse(&dialog_raw(ed));
     let m = s.margins;
     let paper = Paper::matching(s.page.w, s.page.h);
     let mut papers: Vec<&str> = Paper::ALL.iter().map(|p| p.label()).collect();
@@ -187,8 +213,8 @@ pub(crate) fn page_setup_dialog(tab: &DocTab, page: PageSetupTab) -> Result<Dial
         ),
         number("header", "Header from edge:", m.header, Some(2)),
         number("footer", "Footer from edge:", m.footer, Some(2)),
-        apply_to(ed),
-        hidden("caret_sect", caret_raw(ed)),
+        apply_to_with_selected_text(ed),
+        hidden("caret_sect", dialog_raw(ed)),
         hidden("paper_pick", String::new()),
     ];
     d.buttons = ok_cancel();
@@ -207,6 +233,15 @@ fn hidden(name: &'static str, value: String) -> Control {
     c.visible = false;
     c.page = Some(HIDDEN_PAGE);
     c
+}
+
+/// The sectPr a Page Setup or Columns dialog opens on: the section Selected
+/// text edits when that is offered, else the caret's.
+fn dialog_raw(ed: &Editor) -> String {
+    match ed.selection_wrap_section() {
+        Some(k) => ed.sections()[k].clone(),
+        None => caret_raw(ed),
+    }
 }
 
 /// The caret section's sectPr.
@@ -250,11 +285,11 @@ pub(crate) fn twips_of(text: &str) -> Option<i32> {
 //    when their shape disagrees); then, when the person picked a named paper,
 //    `set_paper` (kept in the orientation);
 // 2. the person's part: each field (a margin, a distance, Width, Height) whose
-//    shown value differs from what step 1 gives the caret section is written
+//    shown value differs from what step 1 gives the opened-on section is written
 //    as shown, and the paper code follows the resulting sides.
 // The dialog reacts by the same rule: after an orientation change or a paper
 // pick it shows step 1's result in every field the person has not changed, so
-// for the caret section OK writes exactly what the dialog shows, and to any
+// for the opened-on section OK writes exactly what the dialog shows, and to any
 // other section it adds only what the person changed.
 
 /// Writes one page field into a section.
@@ -290,7 +325,7 @@ fn picked(d: &Dialog) -> Option<Paper> {
     Paper::ALL.into_iter().find(|p| p.label() == pick)
 }
 
-/// Step 1 for the caret section, for an orientation and a pick.
+/// Step 1 for the opened-on section, for an orientation and a pick.
 fn automatic(d: &Dialog, landscape: bool, pick: Option<Paper>) -> SectionSetup {
     let mut s = SectionSetup::parse(&text_of(d, "caret_sect"));
     apply_automatic(&mut s, landscape != opened_landscape(d), landscape, pick);
@@ -308,7 +343,7 @@ fn apply_automatic(s: &mut SectionSetup, turn: bool, landscape: bool, pick: Opti
 }
 
 /// Whether the person changed a field: what the dialog shows is not what
-/// step 1 gives the caret section.
+/// step 1 gives the opened-on section.
 fn person_changed(d: &Dialog, auto: &SectionSetup, name: &str) -> bool {
     text_of(d, name).trim() != inches((field_of(name).1)(auto))
 }
@@ -449,12 +484,60 @@ fn field(d: &Dialog, name: &str) -> Result<i32, String> {
     twips_of(&c.text()).ok_or_else(|| format!("{} takes a number", c.label.replace('&', "")))
 }
 
-/// Which sections "Apply to" names; `None` for This point forward.
-fn targets(ed: &Editor, d: &Dialog) -> Option<Vec<usize>> {
+/// What "Apply to" names.
+enum Target {
+    Sections(Vec<usize>),
+    /// This point forward: a new section from the caret.
+    Forward,
+    /// Selected text: new sections around the selection, the middle edited.
+    Selected,
+}
+
+impl Target {
+    /// The sections to check before anything is written: each target, else
+    /// the one both new breaks land in.
+    fn checked(&self, ed: &Editor) -> Result<Vec<usize>, String> {
+        match self {
+            Target::Sections(k) => Ok(k.clone()),
+            Target::Forward => Ok(vec![ed.break_section()?]),
+            Target::Selected => ed
+                .selection_wrap_section()
+                .map(|k| vec![k])
+                .ok_or_else(|| "Selected text needs a text selection inside one section".into()),
+        }
+    }
+
+    /// Write `edit` to the target as one undo step. Whether anything changed.
+    fn write(
+        self,
+        ed: &mut Editor,
+        start: SectionStart,
+        edit: impl Fn(&mut SectionSetup),
+    ) -> Result<bool, String> {
+        match self {
+            Target::Sections(k) => Ok(ed.edit_section_setups(&k, edit)),
+            Target::Forward => ed.insert_section_break_with(start, edit).map(|_| true),
+            Target::Selected => {
+                // Nothing the person changed reaches the sectPr: no breaks.
+                let k = ed.selection_wrap_section().ok_or("No selected text")?;
+                let old = ed.sections()[k].clone();
+                let mut setup = SectionSetup::parse(&old);
+                edit(&mut setup);
+                if setup.apply(&old) == old {
+                    return Ok(false);
+                }
+                ed.wrap_selection_in_section(start, edit).map(|_| true)
+            }
+        }
+    }
+}
+
+fn targets(ed: &Editor, d: &Dialog) -> Target {
     match text_of(d, "apply").as_str() {
-        FORWARD => None,
-        WHOLE => Some((0..ed.sections().len()).collect()),
-        _ => Some(ed.target_sections()),
+        FORWARD => Target::Forward,
+        SELECTED_TEXT => Target::Selected,
+        WHOLE => Target::Sections((0..ed.sections().len()).collect()),
+        _ => Target::Sections(ed.target_sections()),
     }
 }
 
@@ -508,22 +591,13 @@ pub(crate) fn apply_page_setup(
     // Check every section it would write before writing any.
     let sections = ed.sections();
     let targets = targets(ed, d);
-    let check: Vec<usize> = match &targets {
-        Some(k) => k.clone(),
-        None => vec![ed.break_section()?],
-    };
+    let check = targets.checked(ed)?;
     for k in check {
         let mut s = SectionSetup::parse(&sections[k.min(sections.len() - 1)]);
         edit(&mut s);
         check_setup(&s, gutter_at_top)?;
     }
-    let mut any = match targets {
-        Some(k) => ed.edit_section_setups(&k, edit),
-        None => {
-            ed.insert_section_break_with(SectionStart::NextPage, edit)?;
-            true
-        }
-    };
+    let mut any = targets.write(ed, SectionStart::NextPage, edit)?;
     if changed("gutter_pos") {
         pkg.set_gutter_at_top(gutter_at_top);
         any = true;
@@ -687,10 +761,10 @@ pub(crate) fn after_columns_set(d: &mut Dialog, i: usize, _before: &Value) {
     }
 }
 
-/// The Columns dialog on the caret section's columns.
+/// The Columns dialog on the opened-on section's columns.
 pub(crate) fn columns_dialog(tab: &DocTab) -> Result<Dialog, String> {
     let (ed, pkg) = body_of(tab)?;
-    let s = caret_setup(ed);
+    let s = SectionSetup::parse(&dialog_raw(ed));
     let tw = s.text_width(pkg.has_gutter_at_top());
     let c = &s.columns;
     let n = c.count() as usize;
@@ -750,7 +824,7 @@ pub(crate) fn columns_dialog(tab: &DocTab) -> Result<Dialog, String> {
             ControlKind::Checkbox,
             Value::Bool(c.sep),
         ),
-        apply_to(ed),
+        apply_to_with_selected_text(ed),
         hidden("text_width", tw.to_string()),
     ]);
     show_rows(&mut d);
@@ -763,8 +837,8 @@ pub(crate) fn columns_dialog(tab: &DocTab) -> Result<Dialog, String> {
 }
 
 /// Apply an accepted Columns dialog: one undo step on the body editor. This
-/// point forward starts the new section with a Continuous break. Whether
-/// anything changed.
+/// point forward and Selected text start the new section with a Continuous
+/// break. Whether anything changed.
 pub(crate) fn apply_columns(
     ed: &mut Editor,
     pkg: &mut Package,
@@ -798,10 +872,7 @@ pub(crate) fn apply_columns(
     // each section, so they only need room for the spacing; unequal ones
     // must add up to the section's text width.
     let targets_now = targets(ed, d);
-    let check: Vec<usize> = match &targets_now {
-        Some(k) => k.clone(),
-        None => vec![ed.break_section()?],
-    };
+    let check = targets_now.checked(ed)?;
     let sections = ed.sections();
     let total: i32 = widths.iter().sum::<i32>() + spaces.iter().sum::<i32>();
     // Each value is shown to 0.01", so it may be up to half of that off the
@@ -865,13 +936,7 @@ pub(crate) fn apply_columns(
             s.columns.sep = sep;
         }
     };
-    Ok(match targets_now {
-        Some(k) => ed.edit_section_setups(&k, edit),
-        None => {
-            ed.insert_section_break_with(SectionStart::Continuous, edit)?;
-            true
-        }
-    })
+    targets_now.write(ed, SectionStart::Continuous, edit)
 }
 
 #[cfg(test)]
