@@ -68,15 +68,14 @@ test document font box: a blank box is Escape
   assert reply.value is Calibri
 
 test document font box: no key reaches the document while a box has the focus
-  open copy:../fixtures/doc-table.docx
-  call real-key {"key":"escape"}
-  call selection-set {"start":0,"end":6}
+  open copy:../fixtures/basic.docx
+  type hello
   call pointer-click {"input":"doc-font"}
   call real-key {"key":"ctrl+a"}
   call real-key {"key":"ctrl+z"}
   call real-type {"text":"Q"}
   call real-key {"key":"escape"}
-  assert dirty is false
+  assert text is hello
 
 test document font box: the Font and Font Size boxes give each other the keyboard
   open copy:../fixtures/doc-table.docx
@@ -122,3 +121,38 @@ test document font box: Enter on an untouched box formats nothing
   assert dirty is false
   call field-read {"input":"doc-font-size"}
   assert reply.focused is false
+
+test document font box: typing the value shown is an edit and applies
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font-size"}
+  call real-type {"text":"11"}
+  call real-key {"key":"enter"}
+  assert dirty is true
+  assert run.size_half_pts is 22
+
+test document font box: a box in a collapsed group's flyout takes the keys
+  open copy:../fixtures/doc-table.docx
+  call window-size {"w":520,"h":800}
+  # Settle the resized window's frame (an X server applies a resize later
+  # than a Mac): the Font group has folded away.
+  call ribbon-layout {"tab":"Home"}
+  shot window
+  call ribbon-layout {"tab":"Home"}
+  assert reply.settled is true
+  assert reply.groups.1.title is Font
+  assert reply.groups.1.state is collapsed
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call ribbon-flyout {"action":"open","group":"Font"}
+  assert reply.open is true
+  call pointer-click {"input":"doc-font"}
+  call field-read {"input":"doc-font"}
+  assert reply.focused is true
+  call real-type {"text":"Arial"}
+  call field-read {"input":"doc-font"}
+  assert reply.value is Arial
+  call real-key {"key":"enter"}
+  assert run.font is Arial
+  call window-size {"w":1400,"h":800}

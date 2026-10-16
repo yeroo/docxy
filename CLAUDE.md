@@ -273,8 +273,9 @@
 - Enter sets `set_font` (name cut to 31 characters) or `set_font_size`
   (`font_box::parse_doc_size`: 1 to 1638 pt, rounded to a half point; a bad one
   keeps the box and says so), as one undo step, and the document gets the
-  keyboard back, as it does on Escape. Enter on a box left as filled (the caret
-  run's direct format) is Escape too, so it never writes a style's size or a
-  theme font as direct formatting. The old chip strips (`PickKind::FontName`
+  keyboard back, as it does on Escape. Enter on a box nothing was typed in (`edited`
+  false: the fill is the caret run's direct font or size, Calibri / 11 when it has
+  none) is Escape too, so it never writes a style's size or a theme font as
+  direct formatting; typing the value shown is an edit and applies. The old chip strips (`PickKind::FontName`
   / `FontSize`) are gone. `uiharness/cases/doc-font-box.uit` covers what
   `doc-inputs-typing.uit` does not.

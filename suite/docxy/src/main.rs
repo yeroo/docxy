@@ -7335,8 +7335,9 @@ struct FontBoxEdit {
     text: String,
     caret: usize,
     sel: bool,
-    /// The text the box was filled with: Enter on it unchanged is Escape.
-    orig: String,
+    /// Whether the person has changed the text (typed, deleted, cut or
+    /// pasted): a document's box Enter finds unedited is Escape.
+    edited: bool,
     tab: close::TabId,
     sheet: Option<usize>,
 }
@@ -17194,9 +17195,9 @@ impl Docxy {
     }
 
     /// Whether a text entry the active surface draws takes the keyboard: the
-    /// find or comment bar where it is shown, a Project entry, or a sheet's
-    /// cell, Name Box, font box, rename, comment, range, rule or row-height entry. F1 leaves these
-    /// alone (#1021).
+    /// find or comment bar or a document's font box where shown, a Project
+    /// entry, or a sheet's cell, Name Box, font box, rename, comment, range,
+    /// rule or row-height entry. F1 leaves these alone (#1021).
     fn entry_owns_keys(&self) -> bool {
         let doc = self.active_is_doc();
         let sheet = self.active_is_sheet();
@@ -19197,7 +19198,7 @@ impl Docxy {
         self.name_box = None;
         self.font_box = Some(FontBoxEdit {
             which,
-            orig: text.clone(),
+            edited: false,
             text,
             caret,
             sel: true,
@@ -19217,7 +19218,7 @@ impl Docxy {
         self.picker = None;
         self.font_box = Some(FontBoxEdit {
             which,
-            orig: text.clone(),
+            edited: false,
             text,
             caret,
             sel: true,
@@ -19237,15 +19238,16 @@ impl Docxy {
                 f.which,
                 f.text.trim().to_string(),
                 f.sheet.is_none(),
-                f.sheet.is_none() && f.text.trim() == f.orig.trim(),
+                f.sheet.is_none() && !f.edited,
             )
         }) else {
             return;
         };
-        // A blank box is Escape; so is a document's box Enter leaves as it
-        // was filled (that fill is the caret run's direct format, and writing
-        // it back would turn a style's size or a theme font into direct
-        // formatting).
+        // A blank box is Escape; so is a document's box nothing was typed in.
+        // Its fill is the caret run's direct font or size (Calibri / 11 when
+        // it has none), and writing that back would turn a style's size or a
+        // theme font into direct formatting. Typing the very value shown is
+        // an edit and applies.
         if text.is_empty() || untouched {
             self.font_box = None;
             if doc {
@@ -19294,13 +19296,11 @@ impl Docxy {
     ) {
         // Protected View hides the ribbon body, so the box cannot be open
         // there; `with_editor` refuses it all the same.
-        let since = docxcore::editor::undo_serial_counter();
-        let name = match which {
+        match which {
             FontBox::Name => {
                 let name = font_box::clamp_name(text);
                 self.font_box = None;
-                self.with_editor(window, cx, |e| e.set_font(&name));
-                "Font"
+                self.with_editor(window, cx, |e| e.one_step("Font", |e| e.set_font(&name)));
             }
             FontBox::Size => {
                 let Some(half_pts) = font_box::parse_doc_size(text) else {
@@ -19309,13 +19309,9 @@ impl Docxy {
                     return;
                 };
                 self.font_box = None;
-                self.with_editor(window, cx, |e| e.set_font_size(half_pts));
-                "Font Size"
-            }
-        };
-        if let (Some(ed), _) = self.edit_target_and_repeat() {
-            if ed.undo_serial().is_some_and(|s| s > since) {
-                ed.name_command(since, name);
+                self.with_editor(window, cx, |e| {
+                    e.one_step("Font Size", |e| e.set_font_size(half_pts))
+                });
             }
         }
         self.refocus(window, cx);
@@ -19337,6 +19333,7 @@ impl Docxy {
             return;
         };
         let edit = |fb: &mut FontBoxEdit, op: Op| {
+            fb.edited |= matches!(op, Op::Insert(_) | Op::Backspace | Op::Delete);
             field_edit::apply(&mut fb.text, &mut fb.caret, &mut fb.sel, op)
         };
         // Ctrl+Alt is AltGr on Windows: its keys are text, not chords.
@@ -35578,7 +35575,19 @@ impl Docxy {
                     .text_color(pal.dim)
                     .child("\u{25BE}"),
             )
-            .on_click(cx.listener(move |this, _, window, cx| this.dispatch(act, window, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| match which {
+                // A click focuses the field where it stands: `dispatch` would
+                // close the ribbon flyout the box is drawn in (#1361).
+                Some(w) => {
+                    this.close_menu();
+                    this.doc_preview = None;
+                    this.cancel_pointer_modes();
+                    this.picker = None;
+                    this.font_box_open(w, cx);
+                    this.focus.focus(window, cx);
+                }
+                None => this.dispatch(act, window, cx),
+            }))
             .into_any_element()
     }
 
