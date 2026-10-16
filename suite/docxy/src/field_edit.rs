@@ -45,6 +45,12 @@ pub(crate) fn is_save_chord(ctrl: bool, alt: bool, key: &str) -> bool {
     ctrl && !alt && key == "s"
 }
 
+/// `text` as one line of typed text: line breaks and every other control
+/// character drop out (a paste into the comment bar, whose text reaches XML).
+pub(crate) fn one_line(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
 /// The caret and selection to use for `text`: those kept, unless the text's
 /// length is no longer the one they were kept for (another path edited the
 /// text), when the caret is at the end and nothing is selected.
@@ -86,6 +92,14 @@ pub(crate) fn apply(text: &mut String, caret: &mut usize, sel: &mut bool, op: Op
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn one_line_drops_line_breaks_and_control_characters() {
+        assert_eq!(super::one_line("a\r\nb\nc"), "abc");
+        assert_eq!(super::one_line("\r\n"), "");
+        assert_eq!(super::one_line("a\x0bb\x0cc\x1bd\0e\tf"), "abcdef");
+        assert_eq!(super::one_line("é日 \u{1F600}"), "é日 \u{1F600}");
+    }
+
     #[test]
     fn only_a_plain_ctrl_s_is_the_save_chord() {
         assert!(is_save_chord(true, false, "s"));

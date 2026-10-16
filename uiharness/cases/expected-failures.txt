@@ -20,14 +20,6 @@ inputs-typing-sheet-data.uit | sheet text-to-columns/breaks: OK applies | #1205
 inputs-typing-sheet-data.uit | sheet text-to-columns/formats: OK applies | #1205
 inputs-typing-sheet-data.uit | sheet text-to-columns/destination: OK applies | #1205
 
-# The comment editor is append-only (comment_key): no caret, so Home, End,
-# Left, Right and Delete do nothing, and Ctrl+A/C/V are ignored (#1201 found
-# it).
-doc-inputs-typing.uit | document comment-editor: edits | #1362
-doc-inputs-typing.uit | document comment-editor: select-all replaces | #1362
-doc-inputs-typing.uit | document comment-editor: copies | #1362
-doc-inputs-typing.uit | document comment-editor: pastes | #1362
-
 # The sheet tab's rename is append-only: the name is not selected on open,
 # no caret, so Home, End, Left, Right and Delete do nothing, and Ctrl+A/C/V
 # do nothing (#1202 found it).

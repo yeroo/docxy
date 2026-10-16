@@ -5303,6 +5303,11 @@ struct Docxy {
     /// not saved; No Markup and Original refuse edits.
     markup: docxcore::markup::MarkupView,
     comment_text: String,
+    /// The comment bar's caret, whole-field selection and the text length they
+    /// were kept for (see [`field_edit::current`]).
+    comment_caret: usize,
+    comment_sel: bool,
+    comment_len: usize,
     /// The document the comment entry bar or a ruler drag was started on
     /// (#1286), named as `selected_comment` names it: a change of active
     /// tab to any other document cancels both (`drop_grid_state`).
@@ -13345,6 +13350,9 @@ impl Docxy {
             selected_comment: None,
             markup: Default::default(),
             comment_text: String::new(),
+            comment_caret: 0,
+            comment_sel: false,
+            comment_len: 0,
             doc_entry_tab: None,
             show_marks: false,
             show_comments: false,
@@ -14870,6 +14878,7 @@ impl Docxy {
         if self.doc_entry_tab.is_some() && self.doc_entry_tab != self.active_tab_id() {
             self.comment_open = false;
             self.comment_text.clear();
+            self.comment_reset();
             self.ruler_drag = None;
             self.ruler_guide = None;
             self.doc_entry_tab = None;
@@ -23444,6 +23453,7 @@ impl Docxy {
         self.font_box = None;
         self.doc_entry_tab = self.active_tab_id();
         self.comment_text.clear();
+        self.comment_reset();
         self.picker = None;
         self.find_open = false;
         self.refocus(window, cx);
@@ -23469,33 +23479,103 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    /// The comment bar's caret and whole-field selection: kept while its text
+    /// is as the bar left it, else the end and none.
+    fn comment_state(&self) -> (usize, bool) {
+        field_edit::current(
+            &self.comment_text,
+            self.comment_caret,
+            self.comment_sel,
+            self.comment_len,
+        )
+    }
+
+    /// Empty the comment bar's caret state (the text was just cleared).
+    fn comment_reset(&mut self) {
+        self.comment_caret = 0;
+        self.comment_sel = false;
+        self.comment_len = 0;
+    }
+
+    /// One caret edit of the comment bar's text.
+    fn comment_edit(&mut self, op: field_edit::Op) {
+        let (mut caret, mut sel) = self.comment_state();
+        field_edit::apply(&mut self.comment_text, &mut caret, &mut sel, op);
+        self.comment_caret = caret;
+        self.comment_sel = sel;
+        self.comment_len = self.comment_text.chars().count();
+    }
+
+    /// A Ctrl chord in the comment bar: A selects the field, C and X copy it,
+    /// V pastes one line. Any other chord is not text and does nothing.
+    fn comment_chord(&mut self, key: &str, cx: &mut Context<Self>) {
+        use field_edit::Op;
+        match key {
+            "a" => self.comment_edit(Op::SelectAll),
+            "c" | "x" => {
+                let text = self.comment_text.clone();
+                if self.comment_state().1 && !text.is_empty() {
+                    self.clipboard_write(text.clone(), cx);
+                    self.office_clip.push(&text);
+                    if key == "x" {
+                        self.comment_edit(Op::Delete);
+                    }
+                }
+            }
+            "v" => {
+                if let ClipRead::Text(text) = self.clipboard_read(cx) {
+                    let line = field_edit::one_line(&text);
+                    if !line.is_empty() {
+                        self.comment_edit(Op::Insert(&line));
+                    }
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
     /// Route a keystroke to the comment entry bar while it is open.
     fn comment_key(
         &mut self,
         ev: &KeyDownEvent,
+        ctrl: bool,
+        alt: bool,
         key: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match key {
+        use field_edit::Op;
+        // Ctrl+Alt is AltGr on Windows: its keys are text, not chords.
+        if ctrl && !alt && !matches!(key, "escape" | "enter" | "backspace" | "delete") {
+            return self.comment_chord(key, cx);
+        }
+        let op = match key {
             "escape" => {
                 self.comment_open = false;
                 self.comment_text.clear();
+                self.comment_reset();
                 return self.refocus(window, cx);
             }
             "enter" => return self.commit_comment(window, cx),
-            "backspace" => {
-                self.comment_text.pop();
-                return cx.notify();
+            "backspace" => Op::Backspace,
+            "delete" => Op::Delete,
+            "left" => Op::Left,
+            "right" => Op::Right,
+            "home" => Op::Home,
+            "end" => Op::End,
+            _ => {
+                if let Some(c) = ev.keystroke.key_char.as_deref() {
+                    if !c.is_empty() && !c.chars().next().unwrap().is_control() {
+                        self.comment_edit(Op::Insert(c));
+                        cx.notify();
+                    }
+                }
+                return;
             }
-            _ => {}
-        }
-        if let Some(c) = ev.keystroke.key_char.as_deref() {
-            if !c.is_empty() && !c.chars().next().unwrap().is_control() {
-                self.comment_text.push_str(c);
-                cx.notify();
-            }
-        }
+        };
+        self.comment_edit(op);
+        cx.notify();
     }
 
     /// Begin dragging a ruler marker.
@@ -23936,13 +24016,18 @@ impl Docxy {
                     .border_1()
                     .border_color(hsla_u(BRAND))
                     .bg(pal.panel)
-                    .child(
-                        div()
+                    .child({
+                        let (caret, sel) = self.comment_state();
+                        let at = char_to_byte(&self.comment_text, caret);
+                        let (head, tail) = self.comment_text.split_at(at);
+                        h_flex()
                             .text_size(px(13.))
                             .text_color(pal.fg)
-                            .child(SharedString::from(self.comment_text.clone())),
-                    )
-                    .child(caret_bar()),
+                            .when(sel, |d| d.bg(hsla_u(BRAND).opacity(0.25)))
+                            .child(SharedString::from(head.to_string()))
+                            .child(caret_bar())
+                            .child(SharedString::from(tail.to_string()))
+                    }),
             )
             .child(
                 div()
@@ -25114,7 +25199,7 @@ impl Docxy {
             return self.toggle_find(window, cx);
         }
         if self.comment_open {
-            return self.comment_key(ev, key.as_str(), window, cx);
+            return self.comment_key(ev, ctrl, m.alt, key.as_str(), window, cx);
         }
         if self.find_open {
             return self.find_key(ev, shift, ctrl, m.alt, key.as_str(), window, cx);
