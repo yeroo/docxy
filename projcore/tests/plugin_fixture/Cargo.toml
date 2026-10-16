@@ -1,0 +1,24 @@
+[package]
+name = "plugin_fixture"
+description = "Test fixture: a format plugin for a fake `.fakeproj` type, loaded by projcore's and yppxy's plugin tests."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+# The loader takes `yppx_*` libraries; the tests copy the built file into a
+# plugin directory under that name (cargo adds `lib` on Unix).
+[lib]
+name = "yppx_fixture"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+# Dependency-free on purpose: it implements the C ABI by hand, as a plugin in
+# any language would, rather than through projcore's Rust types.
+[dependencies]

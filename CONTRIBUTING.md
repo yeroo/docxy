@@ -93,7 +93,9 @@ Win32 window capture). The desktop GPUI suite lives in its own workspace under
 
 The three `*core` crates above must stay **dependency-free** (`std` only), as
 must `projcore` and `editcore`; `mailcore` is the exception, since IMAP and a
-local mail store need HTTP/TLS and SQLite. Most logic
+local mail store need HTTP/TLS and SQLite. (`projcore`'s optional `plugins`
+feature, which only the native hosts enable, adds `libloading` to load format
+plugins; its default build stays `std`-only.) Most logic
 lives there and is covered by fast, pure unit tests — please add tests there for
 behavior changes.
 

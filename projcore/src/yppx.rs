@@ -11,6 +11,7 @@
 //! carries everything the model holds and stays interoperable: unzip a `.yppx`,
 //! rename `project.xml`, and MS Project can open it.
 
+use crate::formats::Registry;
 use crate::model::{PackageParts, Project};
 use crate::mspdi::{read_mspdi, write_mspdi};
 use opccore::xml::{Event, XmlParser};
@@ -32,20 +33,13 @@ const CONTENT_TYPES_END: &str = "</Types>\n";
 /// Name of the main document part inside the package.
 pub const MAIN_PART: &str = "project.xml";
 
-/// Resolve a project save destination for both the terminal editor and suite.
-/// Extensionless names become `.yppx`; only `.yppx` and `.xml` are writable.
+/// Resolve a project save destination for both the terminal editor and suite,
+/// against the built-in formats alone ([`Registry::new`]): extensionless names
+/// become `.yppx`; only `.yppx` and `.xml` are writable. A host that registers
+/// more writers (format plugins) calls [`Registry::save_target`] on its own
+/// registry instead.
 pub fn save_target(path: &Path) -> Result<PathBuf, String> {
-    if path.extension().is_none() {
-        Ok(path.with_extension("yppx"))
-    } else if path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("yppx") || ext.eq_ignore_ascii_case("xml"))
-    {
-        Ok(path.to_path_buf())
-    } else {
-        Err("Project schedules can only be saved as .yppx or .xml (MSPDI)".into())
-    }
+    Registry::new().save_target(path)
 }
 
 /// Serialize a [`Project`] into a `.yppx` package (bytes of a ZIP container).
