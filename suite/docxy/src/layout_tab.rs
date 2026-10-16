@@ -37,6 +37,7 @@ pub(crate) enum LayoutAct {
     MoreColumns,
     /// Open the Line Numbers dialog (#747).
     LineNumbersOptions,
+    HyphenationOptions,
     /// An item Word has that has nothing behind it yet: drawn disabled.
     Unavailable,
 }
@@ -237,7 +238,11 @@ fn menu_rows(menu: LayoutMenu) -> Vec<Row> {
             item("hyphen-auto", "Automatic", L::Hyphen(true)),
             item("hyphen-manual", "Manual", L::Unavailable),
             Row::Separator,
-            item("hyphen-options", "Hyphenation Options...", L::Unavailable),
+            item(
+                "hyphen-options",
+                "Hyphenation Options...",
+                L::HyphenationOptions,
+            ),
         ],
     }
 }
@@ -520,6 +525,7 @@ pub(crate) fn layout_apply(tab: &mut DocTab, act: LayoutAct) -> Result<(), Strin
         | LayoutAct::PageSetup(_)
         | LayoutAct::MoreColumns
         | LayoutAct::LineNumbersOptions
+        | LayoutAct::HyphenationOptions
         | LayoutAct::Unavailable => return Ok(()),
     };
     if changed {
@@ -558,6 +564,9 @@ impl Docxy {
             LayoutAct::MoreColumns => self.open_layout_dialog(crate::page_setup::columns_dialog),
             LayoutAct::LineNumbersOptions => {
                 self.open_layout_dialog(crate::page_setup::line_numbers_dialog)
+            }
+            LayoutAct::HyphenationOptions => {
+                self.open_layout_dialog(crate::hyphenation_dialog::hyphenation_dialog)
             }
             LayoutAct::Unavailable => {}
             _ => {

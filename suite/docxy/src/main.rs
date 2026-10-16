@@ -61,6 +61,7 @@ mod help_tab;
 mod hf;
 mod hf_insert;
 mod hf_tab;
+mod hyphenation_dialog;
 mod hl_mode;
 mod html_bundle;
 mod inputs;

@@ -80,6 +80,12 @@ fn apply_dialog(
             };
             crate::page_setup::apply_line_numbers(ed, dialog)
         }
+        DialogOwner::Hyphenation => {
+            let Some(pkg) = pkg else {
+                return Err("this dialog belongs to a .docx document".into());
+            };
+            crate::hyphenation_dialog::apply_hyphenation(pkg, dialog)
+        }
         DialogOwner::HfDistance { is_header, section } => {
             let Surface::Doc(ed) = surface else {
                 return Err("this dialog belongs to a document".into());

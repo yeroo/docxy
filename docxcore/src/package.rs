@@ -1858,7 +1858,7 @@ impl Package {
     pub fn set_hyphenate_caps(&mut self, on: bool) -> bool {
         const ELEM: &str = "w:doNotHyphenateCaps";
         let present = self.settings_has(ELEM);
-        if present == !on && (!present || self.settings_flag(ELEM) == Some(true)) {
+        if present != on && (!present || self.settings_flag(ELEM) == Some(true)) {
             return false;
         }
         self.set_settings_element(ELEM, (!on).then(|| format!("<{ELEM}/>")))

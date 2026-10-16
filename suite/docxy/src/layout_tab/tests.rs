@@ -381,7 +381,7 @@ fn menus_follow_word_with_headings_separators_and_placeholders() {
             "Automatic",
             "(Manual)",
             "-",
-            "(Hyphenation Options...)"
+            "Hyphenation Options..."
         ]
     );
     assert_eq!(
@@ -465,4 +465,17 @@ fn a_markdown_tab_refuses_section_commands() {
     t.pkg = None;
     let err = layout_apply(&mut t, LayoutAct::Orient(true)).unwrap_err();
     assert!(err.contains(".docx"), "{err}");
+}
+
+/// #1265: Hyphenation Options... is a live command, not an unavailable row.
+#[test]
+fn hyphenation_options_is_enabled() {
+    let act = menu_rows(LayoutMenu::Hyphenation)
+        .into_iter()
+        .find_map(|r| match r {
+            Row::Item { id: "hyphen-options", act, .. } => Some(act),
+            _ => None,
+        })
+        .expect("the row");
+    assert_eq!(act, LayoutAct::HyphenationOptions);
 }

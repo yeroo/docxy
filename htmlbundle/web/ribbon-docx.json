@@ -2380,7 +2380,7 @@
                   "id": "hyphen-options",
                   "label": "Hyphenation Options...",
                   "icon": "hyphenation",
-                  "act": "Layout(Unavailable)",
+                  "act": "Layout(HyphenationOptions)",
                   "keyTip": "",
                   "tip": {
                     "title": "",

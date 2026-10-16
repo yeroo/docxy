@@ -39,6 +39,8 @@ pub(crate) enum DialogOwner {
     Columns,
     /// Word's Line Numbers, for the caret's sections (#747).
     LineNumbers,
+    /// Word's Hyphenation, on the document's settings (#1265).
+    Hyphenation,
     /// The Header & Footer tab's Header from Top (`is_header`) or Footer from
     /// Bottom Custom... box, for one section (#641).
     HfDistance {
