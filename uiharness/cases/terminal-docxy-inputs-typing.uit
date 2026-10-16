@@ -278,13 +278,13 @@ test docxy docxy-replace: Tab
 
 
 # ---- A new comment's text: select "One" (Shift+Right three times), then
-# Review > New by its keys (F9, Right x4, Down, Enter). It is typed on the
+# Review > New by its keys (F9, Right x5, Down, Enter). It is typed on the
 # status line.
 test docxy docxy-comment: focus
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"shift+right","times":3}
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"enter"}
   call field-read {"input":"docxy-comment"}
@@ -297,7 +297,7 @@ test docxy docxy-comment: focus by click
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"shift+right","times":3}
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"enter"}
   call pointer-click {"input":"docxy-comment"}
@@ -308,7 +308,7 @@ test docxy docxy-comment: types
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"shift+right","times":3}
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"enter"}
   call real-type {"text":"Ab1 "}
@@ -321,7 +321,7 @@ test docxy docxy-comment: edits
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"shift+right","times":3}
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"enter"}
   call real-type {"text":"abcd"}
@@ -348,7 +348,7 @@ test docxy docxy-comment: select-all replaces
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"shift+right","times":3}
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"enter"}
   call real-type {"text":"abcd"}
@@ -364,7 +364,7 @@ test docxy docxy-comment: copies
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"shift+right","times":3}
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"enter"}
   call real-type {"text":"abcd"}
@@ -385,7 +385,7 @@ test docxy docxy-comment: pastes
   call real-key {"key":"home"}
   call real-key {"key":"shift+right","times":3}
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"enter"}
   call real-key {"key":"ctrl+v"}
@@ -398,7 +398,7 @@ test docxy docxy-comment: Enter commits
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"shift+right","times":3}
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"enter"}
   call real-type {"text":"Ab1"}
@@ -413,7 +413,7 @@ test docxy docxy-comment: Escape cancels
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"shift+right","times":3}
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"enter"}
   call real-type {"text":"Ab1"}
@@ -426,7 +426,7 @@ test docxy docxy-comment: Escape cancels
   assert reply.modified is false
 
 
-# ---- Review > Compare's two paths (F9, Right x4, Down, Right x9, Enter).
+# ---- Review > Compare's two paths (F9, Right x5, Down, Right x9, Enter).
 # The open document is a saved .docx, so Original opens on its path and
 # Revised, empty, has the keyboard; Shift+Tab moves to Original. The
 # typing steps first empty Original with Backspace (260 presses, a
@@ -436,7 +436,7 @@ test docxy docxy-comment: Escape cancels
 test docxy docxy-compare-original: focus
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"right","times":9}
   call real-key {"key":"enter"}
@@ -450,7 +450,7 @@ test docxy docxy-compare-original: focus
 test docxy docxy-compare-original: focus by click
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"right","times":9}
   call real-key {"key":"enter"}
@@ -463,7 +463,7 @@ test docxy docxy-compare-original: focus by click
 test docxy docxy-compare-original: types
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"right","times":9}
   call real-key {"key":"enter"}
@@ -478,7 +478,7 @@ test docxy docxy-compare-original: types
 test docxy docxy-compare-original: edits
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"right","times":9}
   call real-key {"key":"enter"}
@@ -507,7 +507,7 @@ test docxy docxy-compare-original: edits
 test docxy docxy-compare-original: select-all replaces
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"right","times":9}
   call real-key {"key":"enter"}
@@ -525,7 +525,7 @@ test docxy docxy-compare-original: select-all replaces
 test docxy docxy-compare-original: copies
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"right","times":9}
   call real-key {"key":"enter"}
@@ -547,7 +547,7 @@ test docxy docxy-compare-original: pastes
   call real-key {"key":"shift+end"}
   call real-key {"key":"ctrl+c"}
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"right","times":9}
   call real-key {"key":"enter"}
@@ -562,7 +562,7 @@ test docxy docxy-compare-original: pastes
 test docxy docxy-compare-original: Enter commits
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"right","times":9}
   call real-key {"key":"enter"}
@@ -577,7 +577,7 @@ test docxy docxy-compare-original: Enter commits
 test docxy docxy-compare-original: Escape cancels
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"right","times":9}
   call real-key {"key":"enter"}
@@ -593,7 +593,7 @@ test docxy docxy-compare-original: Escape cancels
 test docxy docxy-compare-original: Tab
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"right","times":9}
   call real-key {"key":"enter"}
@@ -612,7 +612,7 @@ test docxy docxy-compare-original: Tab
 test docxy docxy-compare-revised: focus
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"right","times":9}
   call real-key {"key":"enter"}
@@ -625,7 +625,7 @@ test docxy docxy-compare-revised: focus
 test docxy docxy-compare-revised: focus by click
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"right","times":9}
   call real-key {"key":"enter"}
@@ -637,7 +637,7 @@ test docxy docxy-compare-revised: focus by click
 test docxy docxy-compare-revised: types
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"right","times":9}
   call real-key {"key":"enter"}
@@ -650,7 +650,7 @@ test docxy docxy-compare-revised: types
 test docxy docxy-compare-revised: edits
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"right","times":9}
   call real-key {"key":"enter"}
@@ -677,7 +677,7 @@ test docxy docxy-compare-revised: edits
 test docxy docxy-compare-revised: select-all replaces
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"right","times":9}
   call real-key {"key":"enter"}
@@ -693,7 +693,7 @@ test docxy docxy-compare-revised: select-all replaces
 test docxy docxy-compare-revised: copies
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"right","times":9}
   call real-key {"key":"enter"}
@@ -713,7 +713,7 @@ test docxy docxy-compare-revised: pastes
   call real-key {"key":"shift+end"}
   call real-key {"key":"ctrl+c"}
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"right","times":9}
   call real-key {"key":"enter"}
@@ -726,7 +726,7 @@ test docxy docxy-compare-revised: pastes
 test docxy docxy-compare-revised: Enter commits
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"right","times":9}
   call real-key {"key":"enter"}
@@ -738,7 +738,7 @@ test docxy docxy-compare-revised: Enter commits
 test docxy docxy-compare-revised: Escape cancels
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"f9"}
-  call real-key {"key":"right","times":4}
+  call real-key {"key":"right","times":5}
   call real-key {"key":"down"}
   call real-key {"key":"right","times":9}
   call real-key {"key":"enter"}
