@@ -1,7 +1,8 @@
 //! Caret edits for a one-line text field kept as a plain `String` (the sheet
-//! Find bar's Find and Replace fields, #1342). Char-indexed, no gpui, so the
-//! edits are unit-testable. `sel` is a whole-field selection: only Ctrl+A makes
-//! one, as in the cell entry (#1340).
+//! Find bar's Find and Replace fields, #1342, and the Name Box, #1343).
+//! Char-indexed, no gpui, so the edits are unit-testable. `sel` is a
+//! whole-field selection: Ctrl+A makes one, as in the cell entry (#1340), and a
+//! click on the Name Box does too.
 
 use crate::{buf_backspace, buf_delete, buf_insert};
 
@@ -35,6 +36,13 @@ pub(crate) fn alt_replace(
         return None;
     }
     Some(key == "a")
+}
+
+/// Whether a key-down is Ctrl+S, which a focused one-line field lets through to
+/// the sheet's save. Not Ctrl+Alt: that is AltGr on Windows, where S is text
+/// (Polish "ś").
+pub(crate) fn is_save_chord(ctrl: bool, alt: bool, key: &str) -> bool {
+    ctrl && !alt && key == "s"
 }
 
 /// The caret and selection to use for `text`: those kept, unless the text's
@@ -78,6 +86,14 @@ pub(crate) fn apply(text: &mut String, caret: &mut usize, sel: &mut bool, op: Op
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_plain_ctrl_s_is_the_save_chord() {
+        assert!(is_save_chord(true, false, "s"));
+        assert!(!is_save_chord(true, true, "s"), "AltGr+S is text");
+        assert!(!is_save_chord(false, false, "s"));
+        assert!(!is_save_chord(true, false, "a"));
+    }
+
     use super::*;
 
     fn run(text: &str, caret: usize, sel: bool, ops: Vec<Op>) -> (String, usize, bool) {

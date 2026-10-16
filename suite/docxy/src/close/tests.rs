@@ -3094,6 +3094,34 @@ fn exit_commits_typed_sheet_rename_and_follows_chart_refs() {
     assert_eq!(v.pkg.workbook.sheets[0].name, new);
 }
 
+/// #1343: the commit an implicit leave of the rename bar (the Name Box taking
+/// the keyboard) uses: a changed name commits, an untouched or merely
+/// whitespace-different one is left alone, so the tab stays clean. This pins
+/// `commit_rename_buffer_for_exit`; the `.uit` cases cover the Docxy wiring.
+#[test]
+fn leaving_an_untouched_rename_changes_and_dirties_nothing() {
+    let mut tabs = [tab(Kind::Xlsx)];
+    let name = {
+        let Surface::Sheet(v) = &tabs[0].surface else {
+            panic!()
+        };
+        v.pkg.workbook.sheets[0].name.clone()
+    };
+    assert!(!commit_rename_buffer_for_exit(&mut tabs[0], 0, &name));
+    assert!(!commit_rename_buffer_for_exit(
+        &mut tabs[0],
+        0,
+        &format!("{name} ")
+    ));
+    assert!(!tabs[0].dirty);
+    assert!(commit_rename_buffer_for_exit(
+        &mut tabs[0],
+        0,
+        &format!("{name}Y")
+    ));
+    assert!(tabs[0].dirty);
+}
+
 #[test]
 fn tab_level_exit_commits_leave_cf_dv_and_rowh_alone() {
     // What this pins: the tab-level exit commits (`commit_comment_buffer_for_exit`,

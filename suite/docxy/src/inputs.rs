@@ -421,8 +421,8 @@ fn press_doc(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
 /// nothing records which one the edit began in. The sheet Find bar's fields
 /// keep a caret and a whole-field selection (#1342); the sheet tab's rename
 /// appends and pops only, so its caret is its end, and it reads the active sheet's name while it is closed. The
-/// Name Box and the Font combos never take the focus today: they read what
-/// they draw.
+/// Name Box keeps a caret and a whole-field selection like them (#1343); the
+/// Font combos never take the focus today: they read what they draw.
 pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
     let i = find(id)?;
     if let Some(why) = unreachable(i) {
@@ -485,12 +485,23 @@ pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
             };
             (Json::Str(text.clone()), focused, caret, selection)
         }
-        "name-box" => (
-            Json::Str(crate::name_box_text(v)),
-            false,
-            Json::Null,
-            Json::Null,
-        ),
+        "name-box" => match app.name_box.as_ref().filter(|_| app.name_box_live()) {
+            Some(nb) => {
+                let len = nb.text.chars().count();
+                let selection = if nb.sel && len > 0 {
+                    Json::Arr(vec![num(0), num(len)])
+                } else {
+                    Json::Null
+                };
+                (Json::Str(nb.text.clone()), true, num(nb.caret), selection)
+            }
+            None => (
+                Json::Str(crate::name_box_text(v)),
+                false,
+                Json::Null,
+                Json::Null,
+            ),
+        },
         "sheet-font" | "sheet-font-size" => {
             let cmd = if id == "sheet-font" {
                 "font-name"
