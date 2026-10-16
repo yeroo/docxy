@@ -59,6 +59,21 @@ impl Caret {
     }
 }
 
+/// A word Manual hyphenation proposes (#1266): its paragraph, editor offsets
+/// `start..end`, text, and the char index in it where the hyphen is proposed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HyphenCandidate {
+    pub path: Vec<usize>,
+    pub start: usize,
+    pub end: usize,
+    pub word: String,
+    pub point: usize,
+}
+
+fn para_text_len_at(body: &[Block], path: &[usize]) -> usize {
+    resolve_para(body, path).map_or(0, para_text_len)
+}
+
 /// A search match: a character range within a paragraph.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Match {
@@ -2800,6 +2815,106 @@ impl Editor {
             offset: m.start,
         });
         self.last = EditKind::None;
+    }
+
+    /// The next word Manual hyphenation (#1266) may hyphenate, at or after
+    /// `from` (a paragraph path and editor offset) and ending by `to` when
+    /// given: a word of letters only, [`crate::hyphenate::MIN_WORD`] or more,
+    /// with no hyphen, digit or apostrophe around it, no field or object
+    /// stuck to it and, unless `caps`, not in capitals; and with a point
+    /// ([`crate::hyphenate::proposed_point`]). A word already holding an
+    /// optional hyphen is one token with it, so it never qualifies. Field
+    /// results are not editor text, so a word inside one is never found.
+    pub fn next_hyphen_candidate(
+        &self,
+        from: (&[usize], usize),
+        to: Option<(&[usize], usize)>,
+        caps: bool,
+    ) -> Option<HyphenCandidate> {
+        let paths = all_paragraph_paths(&self.doc.body);
+        let first = paths.iter().position(|p| p.as_slice() == from.0)?;
+        let last = match to {
+            Some((path, _)) => paths.iter().position(|p| p.as_slice() == path)?,
+            None => paths.len() - 1,
+        };
+        let joins = |c: char| {
+            c.is_alphanumeric()
+                || matches!(
+                    c,
+                    '-' | '\u{2011}' | '\u{ad}' | '\'' | '\u{2019}' | '_' | FIELD_CHAR
+                )
+        };
+        for (k, path) in paths.iter().enumerate().take(last + 1).skip(first) {
+            let Some(p) = resolve_para(&self.doc.body, path) else {
+                continue;
+            };
+            let text: Vec<char> = editor_text(&p.content).chars().collect();
+            let floor = if k == first { from.1 } else { 0 };
+            let ceil = match to {
+                Some((_, off)) if k == last => off,
+                _ => usize::MAX,
+            };
+            let mut i = 0;
+            while i < text.len() {
+                if !joins(text[i]) {
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                while i < text.len() && joins(text[i]) {
+                    i += 1;
+                }
+                if start < floor || i > ceil {
+                    continue;
+                }
+                let word: String = text[start..i].iter().collect();
+                let capital = word.chars().count() > 1
+                    && word.chars().all(|c| !c.is_lowercase())
+                    && word.chars().any(|c| c.is_uppercase());
+                if capital && !caps {
+                    continue;
+                }
+                if let Some(point) = crate::hyphenate::proposed_point(&word) {
+                    return Some(HyphenCandidate {
+                        path: path.clone(),
+                        start,
+                        end: i,
+                        word,
+                        point,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// Put an optional hyphen (U+00AD, written as `w:softHyphen`) at editor
+    /// offset `offset` of the paragraph at `path`, as one undo step "Optional
+    /// hyphen" that leaves the caret just after it. The hyphen takes the
+    /// formatting typing there would, in a run of its own that writes it as
+    /// the element. Whether anything was inserted.
+    pub fn insert_soft_hyphen(&mut self, path: &[usize], offset: usize) -> bool {
+        let fits = resolve_para(&self.doc.body, path).is_some_and(|p| offset <= para_text_len(p));
+        if !fits {
+            return false;
+        }
+        self.anchor = None;
+        self.caret = Caret {
+            path: path.to_vec(),
+            offset,
+        };
+        let before = para_text_len_at(&self.doc.body, path);
+        self.one_step("Optional hyphen", |ed| {
+            let mut props = ed.typing_props_here(None);
+            props.hyphen_elements = true;
+            ed.paste(&Clip {
+                paras: vec![vec![Inline::Run(Run {
+                    text: "\u{ad}".into(),
+                    props,
+                })]],
+            });
+        });
+        para_text_len_at(&self.doc.body, path) > before
     }
 
     /// Replace the current selection with plain text (used by replace-current).
