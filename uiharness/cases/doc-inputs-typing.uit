@@ -763,6 +763,22 @@ test document comment-editor: edits
   assert reply.caret is 2
   call real-key {"key":"escape"}
 
+test document comment-editor: Ctrl+Backspace still deletes a character
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  call pointer-click {"input":"comment-editor"}
+  call real-type {"text":"abc"}
+  call real-key {"key":"ctrl+backspace"}
+  call field-read {"input":"comment-editor"}
+  assert reply.value is ab
+  call real-key {"key":"home"}
+  call real-key {"key":"ctrl+delete"}
+  call field-read {"input":"comment-editor"}
+  assert reply.value is b
+  call real-key {"key":"escape"}
+
 test document comment-editor: select-all replaces
   open copy:../fixtures/doc-table.docx
   call real-key {"key":"escape"}

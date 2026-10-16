@@ -23547,7 +23547,7 @@ impl Docxy {
     ) {
         use field_edit::Op;
         // Ctrl+Alt is AltGr on Windows: its keys are text, not chords.
-        if ctrl && !alt && !matches!(key, "escape" | "enter") {
+        if ctrl && !alt && !matches!(key, "escape" | "enter" | "backspace" | "delete") {
             return self.comment_chord(key, cx);
         }
         let op = match key {
@@ -24018,11 +24018,7 @@ impl Docxy {
                     .bg(pal.panel)
                     .child({
                         let (caret, sel) = self.comment_state();
-                        let at = self
-                            .comment_text
-                            .char_indices()
-                            .nth(caret)
-                            .map_or(self.comment_text.len(), |(i, _)| i);
+                        let at = char_to_byte(&self.comment_text, caret);
                         let (head, tail) = self.comment_text.split_at(at);
                         h_flex()
                             .text_size(px(13.))

@@ -555,8 +555,8 @@ pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
 
 /// `field-read {"input":id}` for a document input, in the sheet inputs'
 /// shape. The Find bar's fields keep a caret and whole-field selection
-/// (`sf_state`, as the sheet bar's, #1360); the comment editor appends and
-/// pops only, so its focused caret is its end; the Find bar is the window's, shared
+/// (`sf_state`, as the sheet bar's, #1360), and so does the comment editor
+/// (`comment_state`, #1362); the Find bar is the window's, shared
 /// with the sheet's, so it reads only while a document is active. Ctrl+F
 /// opens the Find bar under an open comment bar, but `on_key` gives the
 /// comment bar the keys first, so a Find field is focused only while no
