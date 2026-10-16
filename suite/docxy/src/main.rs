@@ -18900,12 +18900,12 @@ impl Docxy {
         use field_edit::Op;
         let f = self.find_field;
         // Replace and Replace All have keys, as Excel's Alt+R / Alt+A (#1342).
-        // Alt without Ctrl: AltGr is Ctrl+Alt on Windows and types text.
-        if alt && !ctrl && matches!(key, "r" | "a") {
-            if key == "r" {
-                self.sheet_replace(cx);
-            } else {
+        if let Some(all) = field_edit::alt_replace(key, ev.keystroke.key_char.as_deref(), ctrl, alt)
+        {
+            if all {
                 self.sheet_replace_all(cx);
+            } else {
+                self.sheet_replace(cx);
             }
             return;
         }
@@ -24448,9 +24448,8 @@ impl Docxy {
         // past the KeyTips the bare Alt raised (they would pick a tab).
         if self.active_is_sheet()
             && self.find_open
-            && m.alt
-            && !ctrl
-            && matches!(key.as_str(), "r" | "a")
+            && field_edit::alt_replace(&key, ev.keystroke.key_char.as_deref(), ctrl, m.alt)
+                .is_some()
         {
             self.keytips = KeyTip::Off;
             return self.sheet_key(ev, ctrl, shift, m.alt, key.as_str(), window, cx);

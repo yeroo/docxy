@@ -34,7 +34,7 @@ Every editable input in the suite is typed into with real keys by a case:
   focused by `pointer-click {"input":id}` (the in-cell editor by a double-click
   on the cell) and read by `field-read {"input":id}`; each test opens its own
   copy and checks one step against what Excel does. The Find bar's Replace and
-  All buttons have no key, so those steps click them for real.
+  All buttons are clicked for real, and Alt+R and Alt+A press them too (#1342).
 - **The document's inputs** (#1201) are typed into by the hand-written
   `uiharness/cases/doc-inputs-typing.uit` the same way: the Find bar's Find
   and Replace fields, Home's Font and Font Size boxes, and the comment editor,

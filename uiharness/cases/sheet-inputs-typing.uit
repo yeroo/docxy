@@ -397,7 +397,7 @@ test sheet name-box: Escape cancels
 
 # ---- The Find bar (Ctrl+F): Find what and Replace with. Tab moves between
 # them; Enter finds the next match from either, Escape closes the bar;
-# its Replace and All buttons have no key, so a real click presses them.
+# its Replace and All buttons also have Alt+R and Alt+A (#1342).
 
 test sheet sheet-find: focus by click
   open copy:../fixtures/basic.xlsx
@@ -572,15 +572,17 @@ test sheet sheet-find: Alt+R replaces the match
   call real-key {"key":"backspace","times":60}
   call real-type {"text":"X"}
   call pointer-click {"input":"sheet-find"}
-  call real-type {"text":"West"}
+  call real-type {"text":"st"}
   call real-key {"key":"enter"}
-  assert sel is A5
+  assert sel is A4
   call real-key {"key":"alt"}
   assert keytips_up is true
   call real-key {"key":"alt+r"}
   assert keytips_up is false
+  call cell {"cell":"A4"}
+  assert reply.text is EaX
   call cell {"cell":"A5"}
-  assert reply.text is X
+  assert reply.text is West
   call real-key {"key":"escape"}
 
 test sheet sheet-find: Alt+A replaces all
@@ -595,13 +597,15 @@ test sheet sheet-find: Alt+A replaces all
   call real-key {"key":"backspace","times":60}
   call real-type {"text":"X"}
   call pointer-click {"input":"sheet-find"}
-  call real-type {"text":"West"}
+  call real-type {"text":"st"}
   call real-key {"key":"alt"}
   assert keytips_up is true
   call real-key {"key":"alt+a"}
   assert keytips_up is false
+  call cell {"cell":"A4"}
+  assert reply.text is EaX
   call cell {"cell":"A5"}
-  assert reply.text is X
+  assert reply.text is WeX
   call real-key {"key":"escape"}
 
 test sheet sheet-find: Escape closes the bar
