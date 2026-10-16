@@ -2072,6 +2072,27 @@ fn rtf_follows(wrote: &str, now: &ClipRead) -> bool {
         && matches!(now, ClipRead::Text(held) if held.replace("\r\n", "\n") == wrote.replace("\r\n", "\n"))
 }
 
+/// A sheet copy's `text` as the OS clipboard gets it: with CRLF record ends
+/// when `crlf` (Windows, where Excel writes them, #1248), else as it is.
+fn os_text(text: &str, crlf: bool) -> String {
+    if crlf {
+        text.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else {
+        text.to_string()
+    }
+}
+
+/// The cell texts a sheet paste takes from another app's rich copy (#1248):
+/// the HTML table when it parses to a cell, else the RTF table, else `None`
+/// (the text is pasted as TSV). The HTML wins over the text beside it, as
+/// Excel's own paste prefers its richer formats.
+fn foreign_table(html: Option<&str>, rtf: Option<&[u8]>) -> Option<Vec<Vec<String>>> {
+    html.and_then(gridcore::clip_html::parse_html_table)
+        .or_else(|| {
+            rtf.and_then(|rtf| gridcore::clip_html::parse_rtf_table(&String::from_utf8_lossy(rtf)))
+        })
+}
+
 /// Whether a document paste takes the window's own clip `ours` (#755,
 /// #1074): while the clipboard still holds its text ([`clip_still_ours`]),
 /// unless the clipboard holds an RTF (`rich`) with no text beside it. That
@@ -2116,11 +2137,13 @@ fn doc_paste_clip(ours: Option<&DocClip>, now: &ClipRead, rtf: Option<&[u8]>) ->
 }
 
 /// What the harness's private clipboard holds: a copy's text and, from a
-/// document copy or another app's rich copy, its RTF (#1074).
+/// document copy or another app's rich copy, its RTF (#1074), and, from a
+/// sheet copy or another app's table, its HTML table (#1248).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PrivateClip {
     text: String,
     rtf: Option<String>,
+    html: Option<String>,
 }
 
 /// The harness's run-wide private clipboard (see [`ClipboardStore`]).
@@ -2141,9 +2164,9 @@ pub(crate) type SharedClip = std::rc::Rc<std::cell::RefCell<Option<PrivateClip>>
 /// document paste to its RTF, else its text), exactly like a paste from
 /// another application.
 ///
-/// A copy's RTF (#1074) sits beside its text, in the private store as on
-/// the OS clipboard: a write of text alone drops the RTF, so an RTF never
-/// outlives the text it came with.
+/// A copy's RTF (#1074) and HTML table (#1248) sit beside its text, in the
+/// private store as on the OS clipboard: a write of text alone drops them,
+/// so neither outlives the text it came with.
 #[derive(Clone, Default)]
 struct ClipboardStore {
     private: SharedClip,
@@ -2157,7 +2180,11 @@ impl ClipboardStore {
 
     fn write(&mut self, harness: bool, text: String, os: impl FnOnce(String)) {
         if harness {
-            *self.private.borrow_mut() = Some(PrivateClip { text, rtf: None });
+            *self.private.borrow_mut() = Some(PrivateClip {
+                text,
+                rtf: None,
+                html: None,
+            });
         } else {
             os(text);
         }
@@ -2172,6 +2199,27 @@ impl ClipboardStore {
             }
         } else {
             os(rtf);
+        }
+    }
+
+    /// Add `html` (the table fragment) to the copy [`Self::write`] just made:
+    /// never on its own. `os` adds it to the OS clipboard's item.
+    fn write_html(&mut self, harness: bool, html: String, os: impl FnOnce(String)) {
+        if harness {
+            if let Some(clip) = self.private.borrow_mut().as_mut() {
+                clip.html = Some(html);
+            }
+        } else {
+            os(html);
+        }
+    }
+
+    /// The clipboard's HTML table, if it has one. `os` reads the OS one's.
+    fn read_html(&self, harness: bool, os: impl FnOnce() -> Option<String>) -> Option<String> {
+        if harness {
+            self.private.borrow().as_ref()?.html.clone()
+        } else {
+            os()
         }
     }
 
@@ -4452,6 +4500,20 @@ impl SheetView {
             view_gen: self.edit_gen,
             spent: false,
         })
+    }
+
+    /// [`Self::grid_clip`] and the HTML table of the same rows and columns
+    /// (#1248): display text and cell formatting, never formulas.
+    fn grid_clip_html(&self, cut: bool) -> Result<(GridClip, String), &'static str> {
+        let clip = self.grid_clip(cut)?;
+        let html = gridcore::clip_html::html_table(
+            self.sheet(),
+            &self.pkg.workbook.styles,
+            self.pkg.workbook.date1904,
+            &clip.block.rows,
+            &clip.block.cols,
+        );
+        Ok((clip, html))
     }
 
     /// Select the block just written at `at`: the active cell at its
@@ -17532,17 +17594,10 @@ impl Docxy {
         });
     }
 
-    /// Write `text` to the clipboard and return the text a copy should record
-    /// for it: `text`, unless the write did not take ([`recorded_after_write`]).
-    fn clipboard_write_recorded(&mut self, text: String, cx: &mut App) -> String {
-        self.clipboard_write(text.clone(), cx);
-        recorded_after_write(text, &self.clipboard_read(cx))
-    }
-
     /// Write `text` and, when the read-back shows that write took
     /// ([`rtf_follows`]), `rtf` beside it (#1074). The RTF is made before
     /// the text is written, so as little as possible runs between the two
-    /// writes. The text to record, as [`Self::clipboard_write_recorded`].
+    /// writes. The text to record: [`recorded_after_write`].
     fn clipboard_write_rich(&mut self, text: String, rtf: Option<String>, cx: &mut App) -> String {
         self.clipboard_write(text.clone(), cx);
         let now = self.clipboard_read(cx);
@@ -17558,6 +17613,33 @@ impl Docxy {
         let harness = self.harness;
         self.clipboard
             .write_rtf(harness, rtf, |rtf| rich_clip::write_rtf(rtf, text));
+    }
+
+    /// Write a sheet copy's `text` (CRLF-ended on a Windows OS clipboard,
+    /// [`os_text`]) and, when the read-back shows that write took
+    /// ([`rtf_follows`]), its `html` table beside it (#1248). The text to
+    /// record is always the LF `text` ([`recorded_after_write`]).
+    fn clipboard_write_sheet(&mut self, text: String, html: String, cx: &mut App) -> String {
+        let os = os_text(&text, cfg!(windows) && !self.harness);
+        self.clipboard_write(os, cx);
+        let now = self.clipboard_read(cx);
+        if rtf_follows(&text, &now) {
+            self.clipboard_write_html(html, &text);
+        }
+        recorded_after_write(text, &now)
+    }
+
+    /// The clipboard's HTML table fragment (#1248): the OS one's, or the
+    /// private one's.
+    fn clipboard_read_html(&self) -> Option<String> {
+        self.clipboard.read_html(self.harness, rich_clip::read_html)
+    }
+
+    /// Add `html` to the copy of `text` on the clipboard (#1248).
+    fn clipboard_write_html(&mut self, html: String, text: &str) {
+        let harness = self.harness;
+        self.clipboard
+            .write_html(harness, html, |html| rich_clip::write_html(html, text));
     }
 
     /// The clipboard's RTF (#1074): the OS one's, or the private one's.
@@ -17586,15 +17668,15 @@ impl Docxy {
         };
         // A filter hiding every selected row leaves nothing to copy; the
         // clipboard and copy mode stay as they were.
-        let mut clip = match v.grid_clip(cut) {
-            Ok(clip) => clip,
+        let (mut clip, html) = match v.grid_clip_html(cut) {
+            Ok(both) => both,
             Err(why) => {
                 self.set_status(why);
                 cx.notify();
                 return;
             }
         };
-        clip.text = self.clipboard_write_recorded(std::mem::take(&mut clip.text), cx);
+        clip.text = self.clipboard_write_sheet(std::mem::take(&mut clip.text), html, cx);
         // Every copy and cut goes on the Office Clipboard too (#669).
         self.office_clip.push(&clip.text);
         self.grid_clip = Some(clip);
@@ -17731,6 +17813,14 @@ impl Docxy {
             }
             return false;
         }
+        // Another app's table (#1248): its HTML, else its RTF, keeps its
+        // cells; with neither, the text is read as TSV. An HTML-only copy has
+        // no text at all.
+        let html = self.clipboard_read_html();
+        let rtf = self.clipboard_read_rtf();
+        if let Some(rows) = foreign_table(html.as_deref(), rtf.as_deref()) {
+            return self.paste_rows(&rows, cx);
+        }
         let ClipRead::Text(text) = now else {
             return false;
         };
@@ -17747,6 +17837,31 @@ impl Docxy {
         };
         let (br, bc, _, _) = v.range();
         let block = v.text_block(text, (br, bc));
+        self.paste_cells(block, cx)
+    }
+
+    /// [`Self::paste_text`] for the cell texts of another app's HTML or RTF
+    /// table (#1248): each read as typed into its target cell.
+    fn paste_rows(&mut self, rows: &[Vec<String>], cx: &mut Context<Self>) -> bool {
+        let Some(v) = self.active_sheet_mut() else {
+            return false;
+        };
+        let (br, bc, _, _) = v.range();
+        let block = v.fields_block(rows, (br, bc));
+        self.paste_cells(block, cx)
+    }
+
+    /// Write `block` at the selection's top-left as one Paste step. Whether
+    /// it landed.
+    fn paste_cells(
+        &mut self,
+        block: Vec<Vec<gridcore::sheet::Cell>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(v) = self.active_sheet_mut() else {
+            return false;
+        };
+        let (br, bc, _, _) = v.range();
         if block.is_empty() {
             return false;
         }
@@ -24676,7 +24791,7 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool
 mod clipboard_tests {
     use super::{
         ClipRead, ClipboardStore, DocClip, clip_still_ours, doc_copy_text, doc_paste_clip,
-        recorded_after_write, rtf_follows,
+        foreign_table, os_text, recorded_after_write, rtf_follows,
     };
     use gridcore::engine::Engine;
     use gridcore::sheet::{Cell, CellValue, Sheet, Workbook};
@@ -25087,6 +25202,54 @@ mod clipboard_tests {
             store.read_rtf(false, || Some(b"os".to_vec())).as_deref(),
             Some(&b"os"[..])
         );
+    }
+
+    /// #1248: a Windows write ends records with CRLF, once, and the other
+    /// platforms keep the text as it is.
+    #[test]
+    fn a_sheet_copys_text_gets_crlf_only_where_asked() {
+        assert_eq!(os_text("a\tb\n1\t2\n", true), "a\tb\r\n1\t2\r\n");
+        assert_eq!(os_text("a\r\nb\n", true), "a\r\nb\r\n");
+        assert_eq!(os_text("a\tb\n", false), "a\tb\n");
+    }
+
+    /// #1248: another app's table is read from its HTML, else its RTF, else
+    /// not at all (the text is pasted as TSV); an HTML with no table falls
+    /// through, and so does an RTF with none.
+    #[test]
+    fn a_foreign_table_is_html_then_rtf_then_none() {
+        let html = "<table><tr><td>h1</td><td>h2</td></tr></table>";
+        let rtf: &[u8] = b"{\\rtf1\\trowd\\cellx9 r1\\cell \\row}";
+        let h = vec![vec!["h1".to_string(), "h2".to_string()]];
+        assert_eq!(foreign_table(Some(html), Some(rtf)), Some(h));
+        assert_eq!(
+            foreign_table(Some("<p>no table</p>"), Some(rtf)),
+            Some(vec![vec!["r1".to_string()]])
+        );
+        assert_eq!(
+            foreign_table(None, Some(rtf)),
+            foreign_table(Some(""), Some(rtf))
+        );
+        assert_eq!(foreign_table(Some("<p>x</p>"), Some(b"{\\rtf1 x}")), None);
+        assert_eq!(foreign_table(None, None), None);
+    }
+
+    /// #1248: the HTML sits beside its text, and a plain write drops it.
+    #[test]
+    fn a_plain_write_drops_the_html_beside_the_text() {
+        let mut store = ClipboardStore::default();
+        store.write(true, "a".into(), |_| {});
+        store.write_html(true, "<table></table>".into(), |_| {});
+        assert_eq!(
+            store.read_html(true, || None).as_deref(),
+            Some("<table></table>")
+        );
+        store.write(true, "b".into(), |_| {});
+        assert_eq!(store.read_html(true, || None), None);
+        // An HTML with no text before it is never stored on its own.
+        let mut empty = ClipboardStore::default();
+        empty.write_html(true, "<table></table>".into(), |_| {});
+        assert_eq!(empty.read_html(true, || None), None);
     }
 
     /// #1074: the RTF follows only a text write the read-back shows took,

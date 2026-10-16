@@ -1,4 +1,4 @@
-//! The RTF beside a copy's text on the OS clipboard (#1074).
+//! The RTF (and HTML) beside a copy's text on the OS clipboard (#1074, #1248).
 //!
 //! gpui's clipboard carries text (and images) only, so a document copy adds
 //! its RTF here, right after gpui wrote the text: macOS as `public.rtf` on
@@ -11,6 +11,11 @@
 //! text, checked again just before the write: another app may have copied
 //! since gpui wrote it, and our RTF beside their text would paste our
 //! formatting over their words.
+//!
+//! A sheet copy adds an HTML table the same way (#1248): macOS `public.html`,
+//! Windows the registered "HTML Format" (CF_HTML: a `Version:0.9` header of
+//! byte offsets, then the page around the table), checked and bounded like
+//! the RTF.
 //!
 //! A failed write leaves the copy as plain text; a failed read pastes the
 //! plain text, and so does an RTF past [`MAX_RTF`], read no further.
@@ -50,6 +55,65 @@ pub(crate) fn read_rtf() -> Option<Vec<u8>> {
     imp::read_rtf()
 }
 
+/// Add `html` (a fragment: the table) to the copy on the clipboard, if it
+/// still holds `text` (#1248).
+pub(crate) fn write_html(html: String, text: &str) {
+    imp::write_html(&html, text);
+}
+
+/// The HTML table fragment on the clipboard, if any.
+pub(crate) fn read_html() -> Option<String> {
+    let bytes = imp::read_html()?;
+    html_fragment(&bytes)
+}
+
+/// `fragment` as a CF_HTML clipboard payload (Windows' "HTML Format"): the
+/// `Version:0.9` header with the byte offsets (UTF-8, ten digits, so the
+/// header's length does not depend on them) of the page, and of the fragment
+/// between its `<!--StartFragment-->` markers.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn cf_html(fragment: &str) -> String {
+    const HEADER: usize = "Version:0.9\r\nStartHTML:0000000000\r\nEndHTML:0000000000\r\nStartFragment:0000000000\r\nEndFragment:0000000000\r\n".len();
+    let before = "<html><body>\r\n<!--StartFragment-->";
+    let after = "<!--EndFragment-->\r\n</body>\r\n</html>";
+    let start_fragment = HEADER + before.len();
+    let end_fragment = start_fragment + fragment.len();
+    let end = end_fragment + after.len();
+    format!(
+        "Version:0.9\r\nStartHTML:{HEADER:010}\r\nEndHTML:{end:010}\r\nStartFragment:{start_fragment:010}\r\nEndFragment:{end_fragment:010}\r\n{before}{fragment}{after}"
+    )
+}
+
+/// `fragment` as the macOS `public.html` page.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn html_page(fragment: &str) -> String {
+    format!("<html><body>{fragment}</body></html>")
+}
+
+/// The HTML an `HTML Format` / `public.html` payload carries: the fragment
+/// its CF_HTML header names (when the offsets fit the payload and cut it on
+/// character boundaries), else the whole payload read as UTF-8. `None` for
+/// an empty payload.
+fn html_fragment(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]);
+    let offset = |key: &str| -> Option<usize> {
+        let rest = &head[head.find(key)? + key.len()..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    };
+    if let (Some(start), Some(end)) = (offset("StartFragment:"), offset("EndFragment:")) {
+        if start <= end && end <= bytes.len() {
+            if let Ok(fragment) = std::str::from_utf8(&bytes[start..end]) {
+                return Some(fragment.to_string());
+            }
+        }
+    }
+    Some(String::from_utf8_lossy(bytes).into_owned())
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use objc2_app_kit::NSPasteboard;
@@ -58,24 +122,43 @@ mod imp {
     /// `NSPasteboardTypeRTF`.
     const RTF: &str = "public.rtf";
 
-    pub(super) fn write_rtf(rtf: &str, text: &str) {
+    /// `NSPasteboardTypeHTML`.
+    const HTML: &str = "public.html";
+
+    fn write(kind: &str, bytes: &[u8], text: &str) {
         let board = NSPasteboard::generalPasteboard();
         let held = board.stringForType(&NSString::from_str("public.utf8-plain-text"));
         if !held.is_some_and(|held| super::same_text(&held.to_string(), text)) {
             return;
         }
-        let kind = NSString::from_str(RTF);
+        let kind = NSString::from_str(kind);
         // SAFETY: no owner object; the type is a plain NSString.
         unsafe { board.addTypes_owner(&NSArray::from_slice(&[&*kind]), None) };
-        board.setData_forType(Some(&NSData::with_bytes(rtf.as_bytes())), &kind);
+        board.setData_forType(Some(&NSData::with_bytes(bytes)), &kind);
     }
 
-    pub(super) fn read_rtf() -> Option<Vec<u8>> {
+    fn read(kind: &str) -> Option<Vec<u8>> {
         let board = NSPasteboard::generalPasteboard();
-        let data = board.dataForType(&NSString::from_str(RTF))?;
+        let data = board.dataForType(&NSString::from_str(kind))?;
         // Measured before it is copied.
         let len = data.len();
         (len > 0 && len <= super::MAX_RTF).then(|| data.to_vec())
+    }
+
+    pub(super) fn write_rtf(rtf: &str, text: &str) {
+        write(RTF, rtf.as_bytes(), text);
+    }
+
+    pub(super) fn read_rtf() -> Option<Vec<u8>> {
+        read(RTF)
+    }
+
+    pub(super) fn write_html(html: &str, text: &str) {
+        write(HTML, super::html_page(html).as_bytes(), text);
+    }
+
+    pub(super) fn read_html() -> Option<Vec<u8>> {
+        read(HTML)
     }
 }
 
@@ -104,10 +187,9 @@ mod imp {
     const GMEM_MOVEABLE: u32 = 0x0002;
     const CF_UNICODETEXT: u32 = 13;
 
-    /// The registered "Rich Text Format" clipboard format, `None` if
-    /// registering failed.
-    fn format() -> Option<u32> {
-        let name: Vec<u16> = "Rich Text Format".encode_utf16().chain([0]).collect();
+    /// The registered clipboard format `name`, `None` if registering failed.
+    fn format(name: &str) -> Option<u32> {
+        let name: Vec<u16> = name.encode_utf16().chain([0]).collect();
         // SAFETY: `name` is a NUL-terminated UTF-16 string that outlives the call.
         let id = unsafe { RegisterClipboardFormatW(name.as_ptr()) };
         (id != 0).then_some(id)
@@ -161,7 +243,23 @@ mod imp {
     }
 
     pub(super) fn write_rtf(rtf: &str, text: &str) {
-        let Some(format) = format() else {
+        write("Rich Text Format", rtf.as_bytes(), text);
+    }
+
+    pub(super) fn read_rtf() -> Option<Vec<u8>> {
+        read("Rich Text Format")
+    }
+
+    pub(super) fn write_html(html: &str, text: &str) {
+        write("HTML Format", super::cf_html(html).as_bytes(), text);
+    }
+
+    pub(super) fn read_html() -> Option<Vec<u8>> {
+        read("HTML Format")
+    }
+
+    fn write(name: &str, bytes: &[u8], text: &str) {
+        let Some(format) = format(name) else {
             return;
         };
         let Some(_open) = Open::new() else {
@@ -170,8 +268,7 @@ mod imp {
         if !held_text().is_some_and(|held| super::same_text(&held, text)) {
             return;
         }
-        let bytes = rtf.as_bytes();
-        // SAFETY: a moveable block one byte longer than the RTF, filled and
+        // SAFETY: a moveable block one byte longer than the payload, filled and
         // NUL-terminated while locked; the clipboard owns it once
         // SetClipboardData takes it, else it is freed here.
         unsafe {
@@ -193,8 +290,8 @@ mod imp {
         }
     }
 
-    pub(super) fn read_rtf() -> Option<Vec<u8>> {
-        let format = format()?;
+    fn read(name: &str) -> Option<Vec<u8>> {
+        let format = format(name)?;
         let _open = Open::new()?;
         // SAFETY: the handle belongs to the open clipboard; it is read only
         // while locked, within the size the allocation reports.
@@ -208,7 +305,7 @@ mod imp {
                 return None;
             }
             let block = std::slice::from_raw_parts(ptr, GlobalSize(mem));
-            // NUL-terminated, and may be padded past it; the RTF ends at the
+            // NUL-terminated, and may be padded past it; the payload ends at the
             // NUL (or, without one, where MAX_RTF stops the copy).
             let end = block
                 .iter()
@@ -224,13 +321,51 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_RTF, bounded_copy, same_text};
+    use super::{MAX_RTF, bounded_copy, cf_html, html_fragment, html_page, same_text};
 
     #[test]
     fn the_rtf_goes_only_beside_its_own_text() {
         assert!(same_text("a\r\nb", "a\nb"));
         assert!(same_text("bold", "bold"));
         assert!(!same_text("theirs", "bold"));
+    }
+
+    #[test]
+    fn cf_html_offsets_cut_the_fragment_out() {
+        let fragment = "<table><tr><td>caf\u{e9} \u{20ac}</td></tr></table>";
+        let payload = cf_html(fragment);
+        let bytes = payload.as_bytes();
+        let field = |key: &str| -> usize {
+            let at = payload.find(key).unwrap() + key.len();
+            payload[at..at + 10].parse().unwrap()
+        };
+        assert!(payload.starts_with("Version:0.9\r\nStartHTML:"));
+        assert_eq!(field("EndHTML:"), bytes.len());
+        assert_eq!(
+            &payload[field("StartHTML:")..field("StartHTML:") + 6],
+            "<html>"
+        );
+        assert_eq!(
+            &bytes[field("StartFragment:")..field("EndFragment:")],
+            fragment.as_bytes()
+        );
+        assert_eq!(html_fragment(bytes).as_deref(), Some(fragment));
+    }
+
+    #[test]
+    fn a_foreign_payload_is_read_whole_and_a_bad_header_falls_back() {
+        // No header (macOS `public.html`, a browser's page).
+        let page = html_page("<table><tr><td>x</td></tr></table>");
+        assert_eq!(
+            html_fragment(page.as_bytes()).as_deref(),
+            Some(page.as_str())
+        );
+        // Offsets past the payload, or inside a character.
+        let bad = "Version:0.9\r\nStartFragment:0000000010\r\nEndFragment:0000009999\r\n<table>";
+        assert_eq!(html_fragment(bad.as_bytes()).as_deref(), Some(bad));
+        let split = "StartFragment:0000000051\r\nEndFragment:0000000052\r\n\u{e9}";
+        assert_eq!(html_fragment(split.as_bytes()).as_deref(), Some(split));
+        assert_eq!(html_fragment(b""), None);
     }
 
     #[test]
@@ -249,6 +384,12 @@ mod imp {
     pub(super) fn write_rtf(_rtf: &str, _text: &str) {}
 
     pub(super) fn read_rtf() -> Option<Vec<u8>> {
+        None
+    }
+
+    pub(super) fn write_html(_html: &str, _text: &str) {}
+
+    pub(super) fn read_html() -> Option<Vec<u8>> {
         None
     }
 }

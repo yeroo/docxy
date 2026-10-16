@@ -148,12 +148,66 @@ test a document cut with nothing selected leaves the document clean
   key ctrl+x
   assert dirty is false
 
+# #1248: a sheet copy carries an HTML table beside its text, and a paste reads
+# another app's HTML table.
+test a sheet copy puts an HTML table with its formatting beside the text
+  open ../fixtures/basic.xlsx
+  click A1
+  key ctrl+b
+  click B2 shift
+  key ctrl+c
+  call clipboard {"action":"read"}
+  assert reply.html_bold is Region
+  assert reply.app.kind is grid
+  click D8
+  key ctrl+v
+  assert cell D8 is Region
+
+test another app's HTML table pastes its cells
+  open ../fixtures/basic.xlsx
+  call clipboard {"action":"write","text":"x\ty\n","html":"<table><tr><td>7</td><td colspan=2>a &amp; b</td></tr><tr><td>9</td></tr></table>"}
+  assert reply.app.kind is none
+  click D8
+  key ctrl+v
+  assert cell D8 is 7
+  assert cell E8 is a & b
+  assert cell G8 is nothing
+  assert cell D9 is 9
+
+test an HTML table with no text beside it pastes
+  open ../fixtures/basic.xlsx
+  call clipboard {"action":"write","text":"","html":"<table><tr><td>5</td><td>6</td></tr></table>"}
+  click D8
+  key ctrl+v
+  assert cell D8 is 5
+  assert cell E8 is 6
+
+test another app's RTF table pastes its cells
+  open ../fixtures/basic.xlsx
+  call clipboard {"action":"write","text":"x","rtf":"{\\rtf1\\trowd\\cellx1000\\cellx2000 1\\cell 2\\cell \\row}"}
+  click D8
+  key ctrl+v
+  assert cell D8 is 1
+  assert cell E8 is 2
+
+test text copied after a sheet copy leaves no HTML behind
+  open ../fixtures/basic.xlsx
+  click A1
+  key ctrl+c
+  call clipboard {"action":"write","text":"7","html":"<table><tr><td>1</td></tr></table>"}
+  call clipboard {"action":"write","text":"8"}
+  assert reply.html is nothing
+  click D8
+  key ctrl+v
+  assert cell D8 is 8
+
 test the clipboard verb refuses what it does not do
   open ../fixtures/basic.xlsx
   call-error clipboard {"action":"paste-special"} => press the app's own key (key ctrl+alt+v)
   call-error clipboard {"action":"copy"} => press the app's own key
   call-error clipboard {"action":"write"} => text
   call-error clipboard {"action":"write","text":"x","rtf":1} => 'rtf' must be a string
+  call-error clipboard {"action":"write","text":"x","html":1} => 'html' must be a string
   call-error clipboard {"action":"shuffle"} => unknown clipboard action
 
 # #664: Excel's sheet clipboard. Each case builds the issue's book in an

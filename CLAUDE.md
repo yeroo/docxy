@@ -100,6 +100,20 @@
   plain write drops it. `clipboard {"action":"write","rtf":…}` plays another
   app's rich copy; `read` reports `rtf` and `rtf_bold`.
 
+## Sheet copy and paste with other apps (#1248)
+
+- A sheet copy or cut puts an HTML table (`gridcore::clip_html::html_table`:
+  display text and inline cell styles, never formulas) beside its TSV, through
+  `rich_clip::write_html` (macOS `public.html`, Windows "HTML Format" as CF_HTML,
+  nothing on Linux), under the same `rtf_follows` read-back gate as the RTF. On
+  a Windows OS clipboard the text ends records with CRLF (`os_text`); the
+  recorded text and the harness's private clipboard stay LF.
+- A sheet paste takes the live grid clip, else another app's HTML table, else
+  its RTF table (`foreign_table`: cell texts only, each read as typed through
+  `fields_block`), else the text as TSV. The HTML wins over the text beside
+  it, so a text cell like `007` copied from docxy pastes back through its table
+  without the `'` the TSV carries. Paste Special still reads the text.
+
 ## Build info
 
 - `buildinfo` is the one place that stamps binaries (commit, last merged PR, kind,

@@ -3453,11 +3453,13 @@ fn clipboard_app_json(
 }
 
 /// The `clipboard` reply: the clipboard's text (the harness's private one),
-/// its RTF and the text of the RTF's bold runs (#1074), and what the active
-/// tab's paste would use.
+/// its RTF and the text of the RTF's bold runs (#1074), its HTML table and
+/// the texts of that table's bold cells (#1248), and what the active tab's
+/// paste would use.
 fn clipboard_json(app: &crate::Docxy, cx: &App) -> Json {
     let now = app.clipboard_read(cx);
     let rtf = app.clipboard_read_rtf();
+    let html = app.clipboard_read_html();
     let surface = app.tabs.get(app.active).map(|t| &t.surface);
     // A grid clip whose workbook was edited since is over (#664).
     let used = clipboard_app_json(
@@ -3478,6 +3480,11 @@ fn clipboard_json(app: &crate::Docxy, cx: &App) -> Json {
             str_or_null(rtf.map(|r| String::from_utf8_lossy(&r).into_owned())),
         ),
         ("rtf_bold", str_or_null(bold)),
+        ("html", str_or_null(html.clone())),
+        (
+            "html_bold",
+            str_or_null(html.map(|h| gridcore::clip_html::html_bold_cells(&h).join("\n"))),
+        ),
         ("app", used),
     ])
 }
@@ -5925,8 +5932,8 @@ fn dispatch_verb(
         }
         // The clipboard (#699). A harness instance has a private one (it starts
         // empty and never touches the OS clipboard); `write` puts text on it
-        // as another app's copy would, with an optional `rtf` beside it as a
-        // rich copy has (#1074). Copy, cut and paste are the app's own keys
+        // as another app's copy would, with an optional `rtf` (#1074) and
+        // `html` table (#1248) beside it as a rich copy has. Copy, cut and paste are the app's own keys
         // and buttons (`key ctrl+c`, `ribbon-click`), not a second route.
         "clipboard" => {
             match arg_str(args, "action")? {
@@ -5938,9 +5945,17 @@ fn dispatch_verb(
                         Some(Json::Str(rtf)) => Some(rtf.clone()),
                         Some(_) => return Err("'rtf' must be a string".into()),
                     };
+                    let html = match args.get("html") {
+                        None | Some(Json::Null) => None,
+                        Some(Json::Str(html)) => Some(html.clone()),
+                        Some(_) => return Err("'html' must be a string".into()),
+                    };
                     app.clipboard_write(text.clone(), cx);
                     if let Some(rtf) = rtf {
                         app.clipboard_write_rtf(rtf, &text);
+                    }
+                    if let Some(html) = html {
+                        app.clipboard_write_html(html, &text);
                     }
                 }
                 "paste-special" => {
