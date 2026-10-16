@@ -1327,3 +1327,72 @@ fn the_dialog_opens_on_the_section_selected_text_edits_1272() {
     let counts: Vec<i32> = setups(&t).iter().map(|x| x.columns.count()).collect();
     assert_eq!(counts, [1, 2, 1, 1]);
 }
+
+/// #1273: gutter position, Multiple pages and a margin change are one undo
+/// step that takes the sections and both flags back, and redo reapplies.
+#[test]
+fn gutter_multiple_pages_and_margins_are_one_undo_step_1273() {
+    let mut t = three_sections();
+    let before = ed(&t).doc.clone();
+    open(&mut t, PageSetupTab::Margins);
+    set(&mut t, "top", s("0.5"));
+    set(&mut t, "Gutter position", s("Top"));
+    set(&mut t, "Multiple pages", s("Mirror margins"));
+    ok(&mut t).unwrap();
+    assert_eq!(ed(&t).undo_names(), vec!["Page Setup"]);
+    let after = ed(&t).doc.clone();
+    {
+        let p = t.pkg.as_ref().unwrap();
+        assert!(p.has_gutter_at_top() && p.has_mirror_margins());
+    }
+    let Surface::Doc(e) = &mut t.surface else {
+        panic!()
+    };
+    assert!(e.undo());
+    t.set_dirty();
+    let p = t.pkg.as_ref().unwrap();
+    assert!(!p.has_gutter_at_top() && !p.has_mirror_margins());
+    assert_eq!(ed(&t).doc, before);
+    let Surface::Doc(e) = &mut t.surface else {
+        panic!()
+    };
+    assert!(!e.undo(), "one step");
+    assert!(e.redo());
+    t.set_dirty();
+    let p = t.pkg.as_ref().unwrap();
+    assert!(p.has_gutter_at_top() && p.has_mirror_margins());
+    assert_eq!(ed(&t).doc, after);
+}
+
+/// #1273: a settings part where only turning a flag off can work (no
+/// `w:settings` root to add one to) refuses a dialog that turns one off and
+/// the other on, with the package still agreeing with the editor.
+#[test]
+fn a_refused_second_flag_leaves_the_first_alone_1273() {
+    let mut t = three_sections();
+    {
+        let pkg = t.pkg.as_mut().unwrap();
+        pkg.set_gutter_at_top(true); // creates the part
+        pkg.set_gutter_at_top(false);
+        assert!(pkg.set_part(
+            "word/settings.xml",
+            b"<other><w:gutterAtTop/></other>".to_vec()
+        ));
+        assert!(pkg.has_gutter_at_top());
+    }
+    let Surface::Doc(e) = &mut t.surface else {
+        panic!()
+    };
+    e.seed_settings(docxcore::editor::DocSettings {
+        gutter_at_top: true,
+        ..Default::default()
+    });
+    t.dirty = false;
+    open(&mut t, PageSetupTab::Margins);
+    set(&mut t, "Gutter position", s("Left"));
+    set(&mut t, "Multiple pages", s("Mirror margins"));
+    assert!(ok(&mut t).is_err());
+    assert!(t.pkg.as_ref().unwrap().has_gutter_at_top());
+    assert!(ed(&t).settings().gutter_at_top);
+    assert!(!t.dirty && ed(&t).undo_names().is_empty());
+}

@@ -4968,9 +4968,18 @@ impl DocTab {
         self.dirty = true;
         bump_edit_generation();
         if let (Surface::Doc(ed), Some(pkg)) = (&self.surface, self.pkg.as_mut()) {
-            let on = ed.settings().even_and_odd_headers;
-            if pkg.has_even_odd() != on {
-                pkg.set_even_odd(on);
+            let s = ed.settings();
+            if pkg.has_even_odd() != s.even_and_odd_headers {
+                pkg.set_even_odd(s.even_and_odd_headers);
+            }
+            if pkg.has_auto_hyphenation() != s.auto_hyphenation {
+                pkg.set_auto_hyphenation(s.auto_hyphenation);
+            }
+            if pkg.has_mirror_margins() != s.mirror_margins {
+                pkg.set_mirror_margins(s.mirror_margins);
+            }
+            if pkg.has_gutter_at_top() != s.gutter_at_top {
+                pkg.set_gutter_at_top(s.gutter_at_top);
             }
         }
     }
@@ -8050,6 +8059,9 @@ fn new_doc_editor(doc: Document, pkg: Option<&Package>) -> Editor {
     if let Some(pkg) = pkg {
         editor.seed_settings(docxcore::editor::DocSettings {
             even_and_odd_headers: pkg.has_even_odd(),
+            auto_hyphenation: pkg.has_auto_hyphenation(),
+            mirror_margins: pkg.has_mirror_margins(),
+            gutter_at_top: pkg.has_gutter_at_top(),
         });
     }
     if pkg.is_some_and(Package::track_revisions) {

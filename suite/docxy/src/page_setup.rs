@@ -597,16 +597,43 @@ pub(crate) fn apply_page_setup(
         edit(&mut s);
         check_setup(&s, gutter_at_top)?;
     }
-    let mut any = targets.write(ed, SectionStart::NextPage, edit)?;
-    if changed("gutter_pos") {
-        pkg.set_gutter_at_top(gutter_at_top);
-        any = true;
+    let gutter = changed("gutter_pos").then_some(gutter_at_top);
+    let mirror = changed("multiple").then(|| chosen(d, "multiple") == Some(1));
+    // The file first: a settings part docxy cannot edit refuses the dialog
+    // with nothing changed (#1273). Both flags are tried on a copy, as one
+    // can take and the other be refused.
+    let gutter_moves = gutter.is_some_and(|on| pkg.has_gutter_at_top() != on);
+    let mirror_moves = mirror.is_some_and(|on| pkg.has_mirror_margins() != on);
+    if gutter_moves || mirror_moves {
+        let mut probe = pkg.clone();
+        if let (true, Some(on)) = (gutter_moves, gutter) {
+            probe.set_gutter_at_top(on);
+        }
+        if let (true, Some(on)) = (mirror_moves, mirror) {
+            probe.set_mirror_margins(on);
+        }
+        if gutter.is_some_and(|on| probe.has_gutter_at_top() != on)
+            || mirror.is_some_and(|on| probe.has_mirror_margins() != on)
+        {
+            return Err(crate::layout_tab::SETTINGS_UNREADABLE.into());
+        }
+        *pkg = probe;
     }
-    if changed("multiple") {
-        pkg.set_mirror_margins(chosen(d, "multiple") == Some(1));
-        any = true;
+    let mut any = Ok(false);
+    ed.one_step("Page Setup", |ed| {
+        any = targets.write(ed, SectionStart::NextPage, edit).map(|a| {
+            let g = gutter.is_some_and(|on| ed.set_gutter_at_top(on));
+            let m = mirror.is_some_and(|on| ed.set_mirror_margins(on));
+            a || g || m
+        });
+    });
+    if any.is_err() {
+        // Nothing was written: the file follows the editor again.
+        let kept = ed.settings();
+        pkg.set_gutter_at_top(kept.gutter_at_top);
+        pkg.set_mirror_margins(kept.mirror_margins);
     }
-    Ok(any)
+    any
 }
 
 /// Refuse a page Word would not lay out.

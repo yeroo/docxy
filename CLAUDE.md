@@ -187,3 +187,13 @@
 - "Selected text" is offered, and the default, only when
   `selection_section_wrappable` (not a whole section, not across sections or in
   a table cell). Line Numbers keeps its own Apply to without it.
+
+## Layout settings.xml edits are undo steps (#1273)
+
+- `DocSettings` (docxcore) holds `w:evenAndOddHeaders`, `w:autoHyphenation`,
+  `w:mirrorMargins` and `w:gutterAtTop`; snapshots carry them and
+  `DocTab::set_dirty` writes them to the package. Layout > Margins, Hyphenation
+  and Page Setup's OK write the package first (a settings part docxy cannot edit
+  refuses with nothing changed), then set the editor inside one `one_step`. The
+  Hyphenation dialog's caps, zone and limit still write the package without
+  undo; terminal `docxy` has no settings sync.

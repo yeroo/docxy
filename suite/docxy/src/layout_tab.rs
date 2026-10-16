@@ -9,8 +9,9 @@
 //! Section edits go through the body editor's [`Editor::edit_section_setups`]
 //! as one undo step, even while a header or footer is open: the body caret
 //! picks the section. They are untracked, as the Insert tab's old Columns
-//! toggle was. Settings edits (hyphenation, mirrored margins) write the
-//! package and have no undo, as before.
+//! toggle was. Settings edits (hyphenation, mirrored margins) are undo steps
+//! of the body editor's `DocSettings` too (#1273); [`DocTab::set_dirty`]
+//! writes them to the package.
 use super::*;
 use crate::dialog::Dialog;
 use docxcore::model::BreakKind;
@@ -346,6 +347,10 @@ pub(crate) fn menu_items(menu: LayoutMenu, checked: impl Fn(Act) -> bool) -> Vec
         .collect()
 }
 
+/// Why a settings.xml flag could not be changed (#1273).
+pub(crate) const SETTINGS_UNREADABLE: &str =
+    "Could not change the setting: the document's settings part is unreadable";
+
 /// The body editor and package of a .docx tab, or why a Layout command has
 /// nothing to act on.
 fn body(tab: &mut DocTab) -> Result<(&mut Editor, &mut Package), String> {
@@ -403,18 +408,29 @@ pub(crate) fn layout_apply(tab: &mut DocTab, act: LayoutAct) -> Result<(), Strin
         LayoutAct::Margins(p) => {
             let (ed, pkg) = body(tab)?;
             let (top, bottom, left, right) = p.values();
-            let k = ed.target_sections();
-            let sections = ed.edit_section_setups(&k, |s| {
-                (
-                    s.margins.top,
-                    s.margins.bottom,
-                    s.margins.left,
-                    s.margins.right,
-                ) = (top, bottom, left, right);
-            });
             let mirror = p == MarginPreset::Mirrored;
-            let settings = pkg.has_mirror_margins() != mirror;
-            pkg.set_mirror_margins(mirror);
+            if pkg.has_mirror_margins() != mirror {
+                // The file first: a settings part docxy cannot edit refuses
+                // the command with nothing changed (#1273).
+                pkg.set_mirror_margins(mirror);
+                if pkg.has_mirror_margins() != mirror {
+                    return Err(SETTINGS_UNREADABLE.into());
+                }
+            }
+            let k = ed.target_sections();
+            let mut sections = false;
+            let mut settings = false;
+            ed.one_step("Margins", |ed| {
+                sections = ed.edit_section_setups(&k, |s| {
+                    (
+                        s.margins.top,
+                        s.margins.bottom,
+                        s.margins.left,
+                        s.margins.right,
+                    ) = (top, bottom, left, right);
+                });
+                settings = ed.set_mirror_margins(mirror);
+            });
             (sections || settings, format!("Margins: {p:?}"))
         }
         LayoutAct::Orient(landscape) => {
@@ -480,9 +496,14 @@ pub(crate) fn layout_apply(tab: &mut DocTab, act: LayoutAct) -> Result<(), Strin
             (true, "Suppress line numbers toggled".into())
         }
         LayoutAct::Hyphen(on) => {
-            let (_, pkg) = body(tab)?;
-            let changed = pkg.has_auto_hyphenation() != on;
-            pkg.set_auto_hyphenation(on);
+            let (ed, pkg) = body(tab)?;
+            if pkg.has_auto_hyphenation() != on {
+                pkg.set_auto_hyphenation(on);
+                if pkg.has_auto_hyphenation() != on {
+                    return Err(SETTINGS_UNREADABLE.into());
+                }
+            }
+            let changed = ed.set_auto_hyphenation(on);
             let status = if on {
                 "Automatic hyphenation: on"
             } else {

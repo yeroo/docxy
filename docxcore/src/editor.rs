@@ -458,6 +458,12 @@ fn unshare_body(body: Vec<Arc<Block>>) -> Document {
 pub struct DocSettings {
     /// Different Odd & Even Pages (`w:evenAndOddHeaders`).
     pub even_and_odd_headers: bool,
+    /// Automatic hyphenation (`w:autoHyphenation`, #1273).
+    pub auto_hyphenation: bool,
+    /// Mirrored margins / Multiple pages (`w:mirrorMargins`, #1273).
+    pub mirror_margins: bool,
+    /// The gutter at the top of the page (`w:gutterAtTop`, #1273).
+    pub gutter_at_top: bool,
 }
 
 /// An editing session over a [`Document`].
@@ -606,6 +612,39 @@ impl Editor {
         }
         self.checkpoint(EditKind::Structural);
         self.settings.even_and_odd_headers = on;
+        true
+    }
+
+    /// Automatic hyphenation on or off as an undo step (none when it already
+    /// is). Whether it changed (#1273).
+    pub fn set_auto_hyphenation(&mut self, on: bool) -> bool {
+        if self.settings.auto_hyphenation == on {
+            return false;
+        }
+        self.checkpoint(EditKind::Structural);
+        self.settings.auto_hyphenation = on;
+        true
+    }
+
+    /// Mirrored margins on or off as an undo step (none when it already is).
+    /// Whether it changed (#1273).
+    pub fn set_mirror_margins(&mut self, on: bool) -> bool {
+        if self.settings.mirror_margins == on {
+            return false;
+        }
+        self.checkpoint(EditKind::Structural);
+        self.settings.mirror_margins = on;
+        true
+    }
+
+    /// The gutter at the top or the left as an undo step (none when it
+    /// already is there). Whether it changed (#1273).
+    pub fn set_gutter_at_top(&mut self, on: bool) -> bool {
+        if self.settings.gutter_at_top == on {
+            return false;
+        }
+        self.checkpoint(EditKind::Structural);
+        self.settings.gutter_at_top = on;
         true
     }
 
@@ -9639,6 +9678,7 @@ mod tests {
         let mut ed = Editor::new(doc(&["a"]));
         ed.seed_settings(DocSettings {
             even_and_odd_headers: true,
+            ..DocSettings::default()
         });
         assert!(ed.undo_names().is_empty(), "a seed takes no step");
         assert!(!ed.set_even_and_odd_headers(true), "unchanged: no step");
@@ -9657,6 +9697,7 @@ mod tests {
         let mut ed = Editor::new(doc(&["a"]));
         ed.seed_settings(DocSettings {
             even_and_odd_headers: true,
+            ..DocSettings::default()
         });
         ed.insert_str("x");
         assert!(ed.undo());
@@ -9680,5 +9721,44 @@ mod tests {
         assert!(ed.redo());
         assert!(ed.settings().even_and_odd_headers);
         assert_eq!(top_text(&ed), vec!["xa"]);
+    }
+
+    /// #1273: hyphenation, mirrored margins and the gutter position are undo
+    /// steps like Different Odd & Even Pages, and group with a body edit.
+    #[test]
+    fn mirror_margins_gutter_hyphenation_are_undo_steps_1273() {
+        let mut ed = Editor::new(doc(&["a"]));
+        ed.seed_settings(DocSettings {
+            mirror_margins: true,
+            ..DocSettings::default()
+        });
+        assert!(ed.undo_names().is_empty(), "a seed takes no step");
+        assert!(!ed.set_mirror_margins(true));
+        assert!(!ed.set_gutter_at_top(false));
+        assert!(!ed.set_auto_hyphenation(false));
+        assert!(ed.undo_names().is_empty(), "unchanged: no step");
+        assert!(ed.set_mirror_margins(false));
+        assert!(ed.set_gutter_at_top(true));
+        assert!(ed.set_auto_hyphenation(true));
+        assert!(ed.undo());
+        assert!(!ed.settings().auto_hyphenation);
+        assert!(ed.undo());
+        assert!(!ed.settings().gutter_at_top);
+        assert!(ed.undo());
+        assert!(ed.settings().mirror_margins);
+        assert!(ed.redo());
+        assert!(!ed.settings().mirror_margins);
+
+        let mut ed = Editor::new(doc(&["a"]));
+        ed.one_step("Page Setup", |ed| {
+            ed.set_gutter_at_top(true);
+            ed.set_mirror_margins(true);
+            ed.insert_str("x");
+        });
+        assert_eq!(ed.undo_names(), vec!["Page Setup"]);
+        assert!(ed.undo());
+        assert_eq!(ed.settings(), DocSettings::default());
+        assert!(ed.redo());
+        assert!(ed.settings().gutter_at_top && ed.settings().mirror_margins);
     }
 }
