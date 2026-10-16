@@ -16925,31 +16925,37 @@ impl Docxy {
         }
     }
 
-    /// Route a keystroke into the active inline rename (char/backspace/enter/esc).
-    /// Commit the open sheet-tab rename (Enter, or another entry taking the
-    /// keyboard from it).
-    fn sheet_rename_commit(&mut self, cx: &mut Context<Self>) {
+    /// Commit the open sheet-tab rename. Enter (`enter`) marks the tab dirty even
+    /// when the name was declined or unchanged, a quirk that predates the
+    /// extraction and stays. Another entry taking the keyboard from the rename
+    /// (`!enter`) leaves as the exit path does: an untouched buffer changes
+    /// nothing and dirties nothing.
+    fn sheet_rename_commit(&mut self, enter: bool, cx: &mut Context<Self>) {
         let Some((idx, buf)) = self.sheet_rename.take() else {
             return;
         };
         if self.protected_refused(cx) {
             return;
         }
-        if let Some(t) = self.tabs.get_mut(self.active) {
+        let Some(t) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if enter {
             crate::close::commit_rename_buffer(t, idx, &buf);
+            self.mark_sheet_dirty();
+        } else if crate::close::commit_rename_buffer_for_exit(t, idx, &buf) {
+            self.mark_sheet_dirty();
         }
-        // Enter marks the tab dirty even when the name was declined;
-        // that quirk predates the extraction and stays.
-        self.mark_sheet_dirty();
     }
 
+    /// Route a keystroke into the active inline rename (char/backspace/enter/esc).
     fn sheet_rename_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
         let Some((idx, mut buf)) = self.sheet_rename.clone() else {
             return;
         };
         match key {
             "escape" => self.sheet_rename = None,
-            "enter" => self.sheet_rename_commit(cx),
+            "enter" => self.sheet_rename_commit(true, cx),
             "backspace" => {
                 buf.pop();
                 self.sheet_rename = Some((idx, buf));
@@ -18934,7 +18940,7 @@ impl Docxy {
         // the bars give it up, as they do for a cell entry; a comment or a
         // rename being typed is committed, not dropped.
         self.sheet_comment_bar_leave();
-        self.sheet_rename_commit(cx);
+        self.sheet_rename_commit(false, cx);
         self.typing_bars_close();
         self.range_edit = None;
         self.chart_hand_back(cx);

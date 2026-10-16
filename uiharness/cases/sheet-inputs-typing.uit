@@ -450,7 +450,7 @@ test sheet name-box: Enter on a bad reference keeps it
   assert sel is E1
   call real-key {"key":"escape"}
 
-test sheet name-box: a pointer press elsewhere leaves it
+test sheet name-box: a press on the formula bar leaves it
   open copy:../fixtures/basic.xlsx
   click E1
   call real-key {"key":"escape"}
