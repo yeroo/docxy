@@ -559,6 +559,45 @@ test sheet sheet-find: Enter finds the next match
   assert find_open is true
   call real-key {"key":"escape"}
 
+# Excel's Alt+R and Alt+A reach the buttons' code (#1342).
+test sheet sheet-find: Alt+R replaces the match
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  call real-type {"text":"X"}
+  call pointer-click {"input":"sheet-find"}
+  call real-type {"text":"West"}
+  call real-key {"key":"enter"}
+  assert sel is A5
+  call real-key {"key":"alt+r"}
+  call cell {"cell":"A5"}
+  assert reply.text is X
+  call real-key {"key":"escape"}
+
+test sheet sheet-find: Alt+A replaces all
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"backspace","times":60}
+  call real-type {"text":"X"}
+  call pointer-click {"input":"sheet-find"}
+  call real-type {"text":"West"}
+  call real-key {"key":"alt+a"}
+  call cell {"cell":"A5"}
+  assert reply.text is X
+  call real-key {"key":"escape"}
+
 test sheet sheet-find: Escape closes the bar
   open copy:../fixtures/basic.xlsx
   click E1

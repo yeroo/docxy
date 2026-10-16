@@ -20,17 +20,6 @@ inputs-typing-sheet-data.uit | sheet text-to-columns/breaks: OK applies | #1205
 inputs-typing-sheet-data.uit | sheet text-to-columns/formats: OK applies | #1205
 inputs-typing-sheet-data.uit | sheet text-to-columns/destination: OK applies | #1205
 
-# The sheet Find bar's fields are append-only: no caret, so Home, End,
-# Left, Right and Delete do nothing, and Ctrl+A/C/V are ignored (#1200).
-sheet-inputs-typing.uit | sheet sheet-find: edits | #1342
-sheet-inputs-typing.uit | sheet sheet-replace: edits | #1342
-sheet-inputs-typing.uit | sheet sheet-find: select-all replaces | #1342
-sheet-inputs-typing.uit | sheet sheet-replace: select-all replaces | #1342
-sheet-inputs-typing.uit | sheet sheet-find: copies | #1342
-sheet-inputs-typing.uit | sheet sheet-replace: copies | #1342
-sheet-inputs-typing.uit | sheet sheet-find: pastes | #1342
-sheet-inputs-typing.uit | sheet sheet-replace: pastes | #1342
-
 # The Name Box is display-only: a click takes no focus, and what is typed
 # goes into the active cell (#1200).
 sheet-inputs-typing.uit | sheet name-box: focus by click | #1343

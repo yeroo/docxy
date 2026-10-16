@@ -55,6 +55,7 @@ mod doc_recovery;
 mod doc_templates;
 #[cfg(test)]
 mod doc_templates_tests;
+mod field_edit;
 mod file_keys;
 mod harness;
 mod help_tab;
@@ -5268,6 +5269,10 @@ struct Docxy {
     find_query: String,
     replace_text: String,
     find_field: FindField,
+    /// The sheet Find bar's caret and whole-field selection per field
+    /// ([`FindField::idx`]); the doc bar keeps appending (#1342).
+    sf_caret: [usize; 2],
+    sf_sel: [bool; 2],
     find_case: bool,
     /// The find bar's current match and its index in the search it came from
     /// (see `find_step_in`).
@@ -7286,6 +7291,15 @@ fn ruler_drag_result(d: RulerDrag, x: f32) -> RulerDragResult {
 enum FindField {
     Query,
     Replace,
+}
+
+impl FindField {
+    fn idx(self) -> usize {
+        match self {
+            FindField::Query => 0,
+            FindField::Replace => 1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -13241,6 +13255,8 @@ impl Docxy {
             find_query: String::new(),
             replace_text: String::new(),
             find_field: FindField::Query,
+            sf_caret: [0; 2],
+            sf_sel: [false; 2],
             find_case: false,
             find_cur: None,
             picker: None,
@@ -18802,32 +18818,115 @@ impl Docxy {
 
     // ---- find & replace (sheet) -------------------------------------------
 
+    /// The sheet Find bar's text for `f`.
+    fn sf_text(&self, f: FindField) -> &String {
+        match f {
+            FindField::Query => &self.find_query,
+            FindField::Replace => &self.replace_text,
+        }
+    }
+
+    /// The sheet Find bar's caret for `f`, clamped to its text.
+    fn sf_caret_of(&self, f: FindField) -> usize {
+        self.sf_caret[f.idx()].min(self.sf_text(f).chars().count())
+    }
+
+    /// Open the sheet Find bar's fields with the caret at each text's end.
+    fn sf_reset(&mut self) {
+        self.sf_sel = [false; 2];
+        for f in [FindField::Query, FindField::Replace] {
+            self.sf_caret[f.idx()] = self.sf_text(f).chars().count();
+        }
+    }
+
+    /// Focus field `f` (a click or Tab): caret at its end, nothing selected.
+    fn sf_focus(&mut self, f: FindField) {
+        self.find_field = f;
+        self.sf_sel = [false; 2];
+        self.sf_caret[f.idx()] = self.sf_text(f).chars().count();
+    }
+
+    /// One caret edit of the focused sheet Find bar field.
+    fn sf_edit(&mut self, op: field_edit::Op) {
+        let f = self.find_field;
+        let i = f.idx();
+        let mut caret = self.sf_caret_of(f);
+        let mut sel = self.sf_sel[i];
+        let text = match f {
+            FindField::Query => &mut self.find_query,
+            FindField::Replace => &mut self.replace_text,
+        };
+        field_edit::apply(text, &mut caret, &mut sel, op);
+        self.sf_caret[i] = caret;
+        self.sf_sel[i] = sel;
+    }
+
     /// Route a keystroke to the open find bar (query / replace fields).
     fn sheet_find_key(
         &mut self,
         ev: &KeyDownEvent,
         shift: bool,
+        ctrl: bool,
+        alt: bool,
         key: &str,
         cx: &mut Context<Self>,
     ) {
+        use field_edit::Op;
+        let f = self.find_field;
+        // Replace and Replace All have keys, as Excel's Alt+R / Alt+A (#1342).
+        // Alt without Ctrl: AltGr is Ctrl+Alt on Windows and types text.
+        if alt && !ctrl && matches!(key, "r" | "a") {
+            if key == "r" {
+                self.sheet_replace(cx);
+            } else {
+                self.sheet_replace_all(cx);
+            }
+            return;
+        }
+        if ctrl {
+            match key {
+                "a" => self.sf_edit(Op::SelectAll),
+                "c" | "x" => {
+                    let i = f.idx();
+                    let text = self.sf_text(f).clone();
+                    if self.sf_sel[i] && !text.is_empty() {
+                        self.clipboard_write(text.clone(), cx);
+                        self.office_clip.push(&text);
+                        if key == "x" {
+                            self.sf_edit(Op::Delete);
+                        }
+                    }
+                }
+                "v" => {
+                    // A one-line field: line breaks drop out; no text pastes nothing.
+                    if let ClipRead::Text(text) = self.clipboard_read(cx) {
+                        let line: String =
+                            text.chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
+                        if !line.is_empty() {
+                            self.sf_edit(Op::Insert(&line));
+                        }
+                    }
+                }
+                "enter" => return self.sheet_find_next(shift, cx),
+                // Any other chord is not text.
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
         match key {
             "escape" => self.find_open = false,
             "enter" => return self.sheet_find_next(shift, cx),
-            "backspace" => match self.find_field {
-                FindField::Query => {
-                    self.find_query.pop();
-                }
-                FindField::Replace => {
-                    self.replace_text.pop();
-                }
-            },
+            "backspace" => self.sf_edit(Op::Backspace),
+            "delete" => self.sf_edit(Op::Delete),
+            "left" => self.sf_edit(Op::Left),
+            "right" => self.sf_edit(Op::Right),
+            "home" => self.sf_edit(Op::Home),
+            "end" => self.sf_edit(Op::End),
             _ => {
                 if let Some(c) = ev.keystroke.key_char.as_deref() {
                     if !c.is_empty() && !c.chars().next().unwrap().is_control() {
-                        match self.find_field {
-                            FindField::Query => self.find_query.push_str(c),
-                            FindField::Replace => self.replace_text.push_str(c),
-                        }
+                        self.sf_edit(Op::Insert(c));
                     }
                 }
             }
@@ -20511,7 +20610,7 @@ impl Docxy {
                 cx.notify();
                 return;
             }
-            return self.sheet_find_key(ev, shift, key, cx);
+            return self.sheet_find_key(ev, shift, ctrl, alt, key, cx);
         }
         let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
         // Flash Fill's preview stands for one key: Enter takes it, any
@@ -20676,6 +20775,7 @@ impl Docxy {
                 "f" => {
                     self.find_open = true;
                     self.find_field = FindField::Query;
+                    self.sf_reset();
                     cx.notify();
                 }
                 // The shortcuts of ribbon commands run the commands' own
@@ -22198,6 +22298,7 @@ impl Docxy {
         self.find_cur = None;
         if self.find_open {
             self.find_field = FindField::Query;
+            self.sf_reset();
             // Seed from the current selection, if any, for a quick "find selected".
             if let Some(ed) = self.active_editor() {
                 let sel = ed.selection_text();
@@ -24083,10 +24184,11 @@ impl Docxy {
         // While the find bar is open, Tab switches between the query and replace
         // fields.
         if self.find_open {
-            self.find_field = match self.find_field {
+            let next = match self.find_field {
                 FindField::Query => FindField::Replace,
                 FindField::Replace => FindField::Query,
             };
+            self.sf_focus(next);
             cx.notify();
             return;
         }
@@ -34020,8 +34122,14 @@ impl Docxy {
         let rf = self.find_field == FindField::Replace;
         // Each field and button is probed under its own id, where the
         // harness's `pointer-click` finds it (#1200).
-        let field = |id: &'static str, val: &str, focused: bool, ph: &'static str| {
+        let field = |id: &'static str,
+                     val: &str,
+                     caret: usize,
+                     sel: bool,
+                     focused: bool,
+                     ph: &'static str| {
             let empty = val.is_empty();
+            let at = char_to_byte(val, caret);
             div()
                 .id(id)
                 .relative()
@@ -34042,12 +34150,23 @@ impl Docxy {
                 } else {
                     hsla_u(0x1a1a1a)
                 })
-                .child(SharedString::from(if empty {
-                    ph.to_string()
-                } else {
-                    val.to_string()
-                }))
-                .when(focused, |d| {
+                .when(empty, |d| d.child(SharedString::from(ph.to_string())))
+                .when(!empty, |d| {
+                    // The text split at the caret; a whole-field selection
+                    // (Ctrl+A) tints it.
+                    d.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .when(sel, |d| d.bg(hsla_u(BRAND).opacity(0.25)))
+                            .child(SharedString::from(val[..at].to_string()))
+                            .when(focused, |d| {
+                                d.child(div().w(px(1.)).h(px(13.)).bg(hsla_u(BRAND)))
+                            })
+                            .child(SharedString::from(val[at..].to_string())),
+                    )
+                })
+                .when(focused && empty, |d| {
                     d.child(div().w(px(1.)).h(px(13.)).ml(px(1.)).bg(hsla_u(BRAND)))
                 })
         };
@@ -34088,12 +34207,18 @@ impl Docxy {
                     .child("Find"),
             )
             .child(
-                field("sf-q", &self.find_query, qf, "Find in sheet").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.find_field = FindField::Query;
-                        cx.notify();
-                    },
-                )),
+                field(
+                    "sf-q",
+                    &self.find_query,
+                    self.sf_caret_of(FindField::Query),
+                    qf && self.sf_sel[0],
+                    qf,
+                    "Find in sheet",
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.sf_focus(FindField::Query);
+                    cx.notify();
+                })),
             )
             .child(
                 btn("sf-prev", "\u{25C0}".into())
@@ -34110,12 +34235,18 @@ impl Docxy {
                     .child("Replace"),
             )
             .child(
-                field("sf-r", &self.replace_text, rf, "Replace with").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.find_field = FindField::Replace;
-                        cx.notify();
-                    },
-                )),
+                field(
+                    "sf-r",
+                    &self.replace_text,
+                    self.sf_caret_of(FindField::Replace),
+                    rf && self.sf_sel[1],
+                    rf,
+                    "Replace with",
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.sf_focus(FindField::Replace);
+                    cx.notify();
+                })),
             )
             .child(
                 btn("sf-rep", "Replace".into())
