@@ -9,6 +9,14 @@ pub(crate) const DEFAULT_SIZE: f64 = 11.0;
 pub(crate) const MIN_SIZE: f64 = 1.0;
 pub(crate) const MAX_SIZE: f64 = 409.0;
 
+/// Excel's longest font name, in characters.
+pub(crate) const MAX_NAME: usize = 31;
+
+/// The font name typed in the box, trimmed and cut to Excel's limit.
+pub(crate) fn clamp_name(text: &str) -> String {
+    text.trim().chars().take(MAX_NAME).collect()
+}
+
 /// A size as the box shows it: `11`, `10.5`.
 pub(crate) fn size_text(size: f64) -> String {
     if size.fract() == 0.0 {
@@ -28,6 +36,14 @@ pub(crate) fn parse_size(text: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_font_name_is_cut_to_excels_limit() {
+        assert_eq!(clamp_name("  Arial "), "Arial");
+        let long = "x".repeat(40);
+        assert_eq!(clamp_name(&long).chars().count(), 31);
+        assert_eq!(clamp_name(&"é".repeat(40)).chars().count(), 31);
+    }
 
     #[test]
     fn a_size_shows_without_a_trailing_zero() {

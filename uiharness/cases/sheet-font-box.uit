@@ -129,10 +129,11 @@ test a font box whose group folds away in a narrower window is not kept
   assert reply.value is Calibri
   # Wider again: the box is not revived with its stale text.
   call window-size {"w":1400,"h":800}
-  click F1
+  call field-read {"input":"sheet-font"}
+  assert reply.focused is false
   call real-type {"text":"R"}
   call real-key {"key":"enter"}
-  assert cell F1 is R
+  assert cell E2 is R
   call field-read {"input":"sheet-font"}
   assert reply.focused is false
   assert reply.value is Calibri

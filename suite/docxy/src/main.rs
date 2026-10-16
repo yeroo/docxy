@@ -19204,7 +19204,8 @@ impl Docxy {
         }
         match which {
             FontBox::Name => {
-                self.sheet_format("Font", move |xf| xf.font_name = Some(text.clone()), cx);
+                let name = font_box::clamp_name(&text);
+                self.sheet_format("Font", move |xf| xf.font_name = Some(name.clone()), cx);
             }
             FontBox::Size => {
                 let Some(size) = font_box::parse_size(&text) else {
