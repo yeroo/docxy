@@ -20778,10 +20778,14 @@ impl Docxy {
             return self.sheet_rename_key(ev, key, cx);
         }
         // So does the focused Name Box (#1343).
-        // Ctrl+S saves, as it does from the Find bar; the box stays. Ctrl+Alt
-        // is AltGr on Windows: its S is text.
-        if self.name_box_live() && !field_edit::is_save_chord(ctrl, alt, key) {
-            return self.name_box_key(ev, ctrl, alt, key, cx);
+        // Ctrl+S saves, as it does from the Find bar, and the box closes: a
+        // first save renames the tab, which the box is tied to, so it could
+        // not stay live. Ctrl+Alt is AltGr on Windows: its S is text.
+        if self.name_box_live() {
+            if !field_edit::is_save_chord(ctrl, alt, key) {
+                return self.name_box_key(ev, ctrl, alt, key, cx);
+            }
+            self.name_box = None;
         }
         // A bar's range field is asked before the bar it sits in, or the bar's
         // own buffer would eat what is typed into the field. Ctrl chords stay

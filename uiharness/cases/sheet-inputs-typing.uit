@@ -505,6 +505,19 @@ test sheet name-box: Ctrl+S saves from it
   call real-key {"key":"ctrl+s"}
   assert dirty is false
   call field-read {"input":"name-box"}
+  assert reply.focused is false
+
+test sheet name-box: Ctrl+Alt+S does not save
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  type 5
+  key enter
+  assert dirty is true
+  call pointer-click {"input":"name-box"}
+  call real-key {"key":"ctrl+alt+s"}
+  assert dirty is true
+  call field-read {"input":"name-box"}
   assert reply.focused is true
   call real-key {"key":"escape"}
 
