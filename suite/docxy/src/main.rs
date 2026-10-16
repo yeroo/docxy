@@ -5440,6 +5440,8 @@ struct Docxy {
     sheet_pick: Option<SheetPick>,
     // Inline sheet-tab rename in progress: (tab index, edit buffer). None = idle.
     sheet_rename: Option<(usize, String)>,
+    /// The sheet's Name Box while it has the keyboard (#1343).
+    name_box: Option<NameBoxEdit>,
     // Grid width (px) captured each render, so the horizontal scroll track can map
     // a click x back to a column fraction.
     sheet_grid_w: f32,
@@ -7288,6 +7290,17 @@ fn ruler_drag_result(d: RulerDrag, x: f32) -> RulerDragResult {
         }
     };
     RulerDragResult { change, guide }
+}
+
+/// The Name Box while focused (#1343): a one-line field over a `String`, kept
+/// for the tab and sheet it was opened on (it is closed when either changes).
+struct NameBoxEdit {
+    text: String,
+    caret: usize,
+    /// The whole text is selected (a click, Ctrl+A).
+    sel: bool,
+    tab: close::TabId,
+    sheet: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -13328,6 +13341,7 @@ impl Docxy {
             clipboard: ClipboardStore::shared(windows::shared_clipboard_text(cx)),
             sheet_pick: None,
             sheet_rename: None,
+            name_box: None,
             sheet_grid_w: 1000.0,
             sheet_comment_edit: None,
             sheet_comment_seed: None,
@@ -14775,6 +14789,7 @@ impl Docxy {
         // tab, Enter would apply them there, a Protected View tab included
         // (#610).
         self.sheet_rename = None;
+        self.name_box = None;
         self.sheet_rowh_edit = None;
         self.sheet_comment_bar_close();
         self.sheet_fill = None;
@@ -15385,6 +15400,7 @@ impl Docxy {
         self.bar_close();
         self.sheet_comment_bar_close();
         self.sheet_rowh_edit = None;
+        self.name_box = None;
         self.find_open = false;
     }
 
@@ -16485,6 +16501,11 @@ impl Docxy {
                 || self.active_sheet().is_some_and(SheetView::multi_area),
             edit_in_cell: self.edit_opts.edit_in_cell,
             fx_expanded: self.fx_expanded,
+            name_box: self
+                .name_box
+                .as_ref()
+                .filter(|_| self.name_box_live())
+                .map(|n| (n.text.clone(), n.caret, n.sel)),
             extra_areas: std::rc::Rc::new(
                 self.active_sheet()
                     .map(SheetView::extra_areas)
@@ -17099,6 +17120,7 @@ impl Docxy {
             || self.project_edit_open()
             || (sheet
                 && (self.sheet_rename.is_some()
+                    || self.name_box_live()
                     || self.sheet_comment_edit.is_some()
                     || self.range_edit.is_some()
                     || self.sheet_cf_edit.is_some()
@@ -17387,6 +17409,7 @@ impl Docxy {
     fn sheet_bar_holds_keys(&self) -> bool {
         let bar_field = matches!(&self.range_edit, Some(f) if f.target.is_bar());
         self.sheet_rename.is_some()
+            || self.name_box_live()
             || self.sheet_comment_edit.is_some()
             || (self.sheet_cf_edit.is_some() && !bar_field)
             || self.sheet_rowh_edit.is_some()
@@ -18854,6 +18877,7 @@ impl Docxy {
 
     /// Focus field `f` (a click or Tab): caret at its end, nothing selected.
     fn sf_focus(&mut self, f: FindField) {
+        self.name_box = None;
         self.find_field = f;
         self.sf_reset();
     }
@@ -18871,6 +18895,128 @@ impl Docxy {
         self.sf_caret[i] = caret;
         self.sf_sel[i] = sel;
         self.sf_len[i] = self.sf_text(f).chars().count();
+    }
+
+    /// Whether the Name Box has the keyboard: opened on the sheet now shown.
+    fn name_box_live(&self) -> bool {
+        let Some(nb) = &self.name_box else {
+            return false;
+        };
+        self.active_tab_id().as_ref() == Some(&nb.tab)
+            && self.active_sheet().is_some_and(|v| v.active == nb.sheet)
+    }
+
+    /// Focus the Name Box with its reference selected (a click). Ignored while
+    /// a cell entry is open, where a click is not a goto.
+    fn name_box_open(&mut self, cx: &mut Context<Self>) {
+        let (Some(tab), Some(v)) = (self.active_tab_id(), self.active_sheet()) else {
+            return;
+        };
+        if v.editing.is_some() {
+            return;
+        }
+        let text = name_box_text(v);
+        let (caret, sheet) = (text.chars().count(), v.active);
+        self.range_edit = None;
+        self.chart_hand_back(cx);
+        self.name_box = Some(NameBoxEdit {
+            text,
+            caret,
+            sel: true,
+            tab,
+            sheet,
+        });
+        cx.notify();
+    }
+
+    /// Go to what the Name Box holds (Enter): a bad reference keeps the box.
+    fn name_box_enter(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = self.name_box.as_ref().map(|n| n.text.clone()) else {
+            return;
+        };
+        if text.trim().is_empty() {
+            self.name_box = None;
+            return;
+        }
+        // A goto moves the selection: a press on the cells like any arrow key.
+        self.chart_hand_back(cx);
+        let went = match self.active_sheet_mut() {
+            Some(v) => sheet_goto::go_to_reference(v, &text),
+            None => Err(sheet_goto::BAD_REFERENCE),
+        };
+        match went {
+            Ok(()) => self.name_box = None,
+            Err(why) => self.set_status(why),
+        }
+    }
+
+    /// Route a keystroke to the focused Name Box (#1343).
+    fn name_box_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        ctrl: bool,
+        alt: bool,
+        key: &str,
+        cx: &mut Context<Self>,
+    ) {
+        use field_edit::Op;
+        let Some(nb) = self.name_box.as_mut() else {
+            return;
+        };
+        let edit = |nb: &mut NameBoxEdit, op: Op| {
+            field_edit::apply(&mut nb.text, &mut nb.caret, &mut nb.sel, op)
+        };
+        // Ctrl+Alt is AltGr on Windows: its keys are text, not chords.
+        if ctrl && !alt {
+            match key {
+                "a" => edit(nb, Op::SelectAll),
+                "c" | "x" => {
+                    let text = nb.text.clone();
+                    if nb.sel && !text.is_empty() {
+                        if key == "x" {
+                            edit(nb, Op::Delete);
+                        }
+                        self.clipboard_write(text.clone(), cx);
+                        self.office_clip.push(&text);
+                    }
+                }
+                "v" => {
+                    // A one-line field: line breaks drop out.
+                    if let ClipRead::Text(text) = self.clipboard_read(cx) {
+                        let line: String =
+                            text.chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
+                        if !line.is_empty() {
+                            if let Some(nb) = self.name_box.as_mut() {
+                                edit(nb, Op::Insert(&line));
+                            }
+                        }
+                    }
+                }
+                "enter" => self.name_box_enter(cx),
+                // Any other chord is not text.
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
+        match key {
+            "escape" => self.name_box = None,
+            "enter" => self.name_box_enter(cx),
+            "backspace" => edit(nb, Op::Backspace),
+            "delete" => edit(nb, Op::Delete),
+            "left" => edit(nb, Op::Left),
+            "right" => edit(nb, Op::Right),
+            "home" => edit(nb, Op::Home),
+            "end" => edit(nb, Op::End),
+            _ => {
+                if let Some(c) = ev.keystroke.key_char.as_deref() {
+                    if !c.is_empty() && !c.chars().next().unwrap().is_control() {
+                        edit(nb, Op::Insert(c));
+                    }
+                }
+            }
+        }
+        cx.notify();
     }
 
     /// Route a keystroke to the open find bar (query / replace fields).
@@ -20586,6 +20732,7 @@ impl Docxy {
         // where it would write.
         if self.active_locked()
             && !self.find_open
+            && !self.name_box_live()
             && !open_mode::protected_allows_key(key, ctrl, shift, alt)
         {
             self.protected_refused(cx);
@@ -20594,6 +20741,10 @@ impl Docxy {
         // An inline sheet-tab rename swallows all typing until Enter/Esc.
         if self.sheet_rename.is_some() {
             return self.sheet_rename_key(ev, key, cx);
+        }
+        // So does the focused Name Box (#1343).
+        if self.name_box_live() {
+            return self.name_box_key(ev, ctrl, alt, key, cx);
         }
         // A bar's range field is asked before the bar it sits in, or the bar's
         // own buffer would eat what is typed into the field. Ctrl chords stay
@@ -24321,7 +24472,11 @@ impl Docxy {
             }
             return;
         }
-        if self.keytips != KeyTip::Off || self.find_open || self.comment_open {
+        if self.keytips != KeyTip::Off
+            || self.find_open
+            || self.comment_open
+            || self.name_box_live()
+        {
             return;
         }
         self.mini_bar = None;
@@ -24382,6 +24537,7 @@ impl Docxy {
         if (self.hl_mode.is_some() || self.table_draw.is_some())
             && self.keytips == KeyTip::Off
             && !self.find_open
+            && !self.name_box_live()
             && !self.comment_open
             && !matches!(
                 hl_key,
@@ -38555,6 +38711,8 @@ struct GridOverlay {
     edit_in_cell: bool,
     /// Ctrl+Shift+U: the formula bar is about four lines tall (#672).
     fx_expanded: bool,
+    /// The focused Name Box's text, caret and whole-field selection (#1343).
+    name_box: Option<(String, usize, bool)>,
     /// The selection's areas other than the active one (#670), shaded like
     /// it. An INPUT to `area_ix`, which `sheet_el` builds; the row renderer
     /// reads that.
@@ -40553,6 +40711,8 @@ fn sheet_el(
     let editing = view.editing.clone();
     // ---- formula / reference bar ----
     let sel_ref = name_box_text(view);
+    let name_edit = ov.name_box.clone();
+    let ent_nb = ent.clone();
     let sel_full = match &editing {
         Some(buf) => buf.clone(),
         None => fx_bar_text(view),
@@ -40572,18 +40732,46 @@ fn sheet_el(
         .border_color(gridline)
         .child(
             div()
+                .id("name-box")
                 .min_w(px(64.))
                 .px_2()
                 .py(px(2.))
                 .rounded_sm()
                 .bg(hsla_u(0xffffff))
                 .border_1()
-                .border_color(gridline)
+                .border_color(if name_edit.is_some() {
+                    hsla_u(BRAND)
+                } else {
+                    gridline
+                })
+                .cursor_text()
                 .text_size(px(12.))
                 .text_color(hsla_u(0x333333))
                 .relative()
-                .child(SharedString::from(sel_ref))
-                .child(probe(probes, "name-box")),
+                .map(|d| match &name_edit {
+                    // Focused: the text split at the caret, a whole-field
+                    // selection tinted, as the Find bar's fields draw.
+                    Some((text, caret, sel)) => {
+                        let at = char_to_byte(text, *caret);
+                        d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .when(*sel, |d| d.bg(hsla_u(BRAND).opacity(0.25)))
+                                .child(SharedString::from(text[..at].to_string()))
+                                .child(div().w(px(1.)).h(px(13.)).bg(hsla_u(BRAND)))
+                                .child(SharedString::from(text[at..].to_string())),
+                        )
+                    }
+                    None => d.child(SharedString::from(sel_ref)),
+                })
+                .child(probe(probes, "name-box"))
+                .on_click(move |_ev, window, cx| {
+                    ent_nb.update(cx, |this, cx| {
+                        this.name_box_open(cx);
+                        this.focus.focus(window, cx);
+                    });
+                }),
         )
         .child(
             div()

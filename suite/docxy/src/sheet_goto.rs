@@ -256,6 +256,18 @@ pub(crate) fn go_to(v: &mut SheetView, sheet: usize, (r0, c0, r1, c1): (u32, u32
     v.reveal((r0, c0, r1, c1));
 }
 
+/// Select what `text` names (a reference, a range, `Sheet2!A1` or a defined
+/// name), as the Name Box's Enter does; a reference that is not one changes
+/// nothing.
+pub(crate) fn go_to_reference(v: &mut SheetView, text: &str) -> Result<(), &'static str> {
+    let Some((sheet, rect)) = gridcore::edit::resolve_reference(&v.pkg.workbook, v.active, text)
+    else {
+        return Err(BAD_REFERENCE);
+    };
+    go_to(v, sheet, rect);
+    Ok(())
+}
+
 /// A press the Go To dialogs handle: Go To's OK and Special…, Go To
 /// Special's OK. `None` for any other press (Cancel closes through the
 /// stack).
@@ -396,6 +408,25 @@ mod tests {
         set(&mut t, "reference", Value::Text("banana".into()));
         assert_eq!(click(&mut t, "OK"), Some(Err(BAD_REFERENCE.into())));
         assert!(t.dialogs.top().is_some(), "stays open");
+    }
+
+    /// #1343: the Name Box's Enter selects a cell, a range, another sheet's
+    /// cell; a bad reference changes nothing.
+    #[test]
+    fn name_box_goes_to_a_reference_and_refuses_a_bad_one() {
+        let mut t = tab();
+        let v = view(&mut t);
+        v.pkg.add_sheet("Far");
+        assert_eq!(go_to_reference(v, "C3"), Ok(()));
+        assert_eq!((v.sel, v.anchor), (at("C3"), at("C3")));
+        assert_eq!(go_to_reference(v, "B2:C4"), Ok(()));
+        assert_eq!((v.sel, v.anchor), (at("B2"), at("C4")));
+        assert_eq!(go_to_reference(v, "Far!D5"), Ok(()));
+        assert_eq!((v.active, v.sel), (1, at("D5")));
+        v.active = 0;
+        v.sel = at("B2");
+        assert_eq!(go_to_reference(v, "banana"), Err(BAD_REFERENCE));
+        assert_eq!((v.active, v.sel), (0, at("B2")), "nothing moved");
     }
 
     /// #707 r5 M3: Go To scrolls the target into view, on its own sheet.

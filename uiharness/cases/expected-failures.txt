@@ -20,17 +20,6 @@ inputs-typing-sheet-data.uit | sheet text-to-columns/breaks: OK applies | #1205
 inputs-typing-sheet-data.uit | sheet text-to-columns/formats: OK applies | #1205
 inputs-typing-sheet-data.uit | sheet text-to-columns/destination: OK applies | #1205
 
-# The Name Box is display-only: a click takes no focus, and what is typed
-# goes into the active cell (#1200).
-sheet-inputs-typing.uit | sheet name-box: focus by click | #1343
-sheet-inputs-typing.uit | sheet name-box: types | #1343
-sheet-inputs-typing.uit | sheet name-box: edits | #1343
-sheet-inputs-typing.uit | sheet name-box: select-all replaces | #1343
-sheet-inputs-typing.uit | sheet name-box: copies | #1343
-sheet-inputs-typing.uit | sheet name-box: pastes | #1343
-sheet-inputs-typing.uit | sheet name-box: Enter goes to the reference | #1343
-sheet-inputs-typing.uit | sheet name-box: Escape cancels | #1343
-
 # Home's Font and Font Size boxes are inert (SheetAct::Todo, a fixed
 # value): a click takes no focus, and what is typed goes into the cell (#1200).
 sheet-inputs-typing.uit | sheet sheet-font: focus by click | #1344
