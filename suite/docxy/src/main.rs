@@ -5454,8 +5454,8 @@ struct Docxy {
     // buffer opens, cleared with it.
     sheet_comment_seed: Option<String>,
     // The cell (sheet index, row, col) the bar opened on: the label, Enter,
-    // Save and the exit commit all target it. A cell click, right-click,
-    // Previous/Next Comment or a row/column insert/delete commits a changed
+    // Save and the exit commit all target it. A cell click, right-click, a
+    // Name Box click, Previous/Next Comment or a row/column insert/delete commits a changed
     // buffer to it and closes the bar first; the anchor still matters for
     // moves that leave the bar open (header clicks, Go To) and
     // for the exit commit. Set with the seed, cleared with it.
@@ -18165,8 +18165,8 @@ impl Docxy {
     /// existing comment text (so New Comment doubles as Edit). The bar
     /// remembers the cell it opened on — the anchor — alongside the seed:
     /// the label, Enter and an exit commit all target the anchor, not the
-    /// live selection, and a cell click, right-click, Previous/Next Comment
-    /// or a row/column insert/delete commits a changed buffer to the anchor
+    /// live selection, and a cell click, right-click, Name Box click,
+    /// Previous/Next Comment or a row/column insert/delete commits a changed buffer to the anchor
     /// and closes the bar first. Selection moves that leave the bar open
     /// (header clicks, Go To) still never move the note.
     fn sheet_new_comment(&mut self, cx: &mut Context<Self>) {
@@ -18192,8 +18192,8 @@ impl Docxy {
     /// selection moves or rows/columns shift: a changed buffer commits to the
     /// anchor cell (the exit commit's rules — an untouched bar, or one whose
     /// text the anchor's note already holds, writes nothing), then the bar
-    /// closes. No-op when the bar is closed. A cell click, right-click,
-    /// Previous/Next Comment and a row/column insert/delete all leave it;
+    /// closes. No-op when the bar is closed. A cell click, right-click, a
+    /// Name Box click, Previous/Next Comment and a row/column insert/delete all leave it;
     /// the window-close exit commit (`commit_dialog_buffers_for_exit`) is
     /// this same leave.
     pub(crate) fn sheet_comment_bar_leave(&mut self) {
@@ -20778,7 +20778,8 @@ impl Docxy {
             return self.sheet_rename_key(ev, key, cx);
         }
         // So does the focused Name Box (#1343).
-        if self.name_box_live() {
+        // Ctrl+S saves, as it does from the Find bar; the box stays.
+        if self.name_box_live() && !(ctrl && key == "s") {
             return self.name_box_key(ev, ctrl, alt, key, cx);
         }
         // A bar's range field is asked before the bar it sits in, or the bar's

@@ -3094,9 +3094,10 @@ fn exit_commits_typed_sheet_rename_and_follows_chart_refs() {
     assert_eq!(v.pkg.workbook.sheets[0].name, new);
 }
 
-/// #1343: an implicit leave of the rename bar (another entry taking the
-/// keyboard) commits a changed name and leaves an untouched or merely
-/// whitespace-different one alone, so the tab stays clean.
+/// #1343: the commit an implicit leave of the rename bar (the Name Box taking
+/// the keyboard) uses: a changed name commits, an untouched or merely
+/// whitespace-different one is left alone, so the tab stays clean. This pins
+/// `commit_rename_buffer_for_exit`; the `.uit` cases cover the Docxy wiring.
 #[test]
 fn leaving_an_untouched_rename_changes_and_dirties_nothing() {
     let mut tabs = [tab(Kind::Xlsx)];

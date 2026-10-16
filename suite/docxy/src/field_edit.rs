@@ -1,7 +1,8 @@
 //! Caret edits for a one-line text field kept as a plain `String` (the sheet
-//! Find bar's Find and Replace fields, #1342). Char-indexed, no gpui, so the
-//! edits are unit-testable. `sel` is a whole-field selection: only Ctrl+A makes
-//! one, as in the cell entry (#1340).
+//! Find bar's Find and Replace fields, #1342, and the Name Box, #1343).
+//! Char-indexed, no gpui, so the edits are unit-testable. `sel` is a
+//! whole-field selection: Ctrl+A makes one, as in the cell entry (#1340), and a
+//! click on the Name Box does too.
 
 use crate::{buf_backspace, buf_delete, buf_insert};
 

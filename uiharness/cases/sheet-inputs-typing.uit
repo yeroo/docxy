@@ -488,6 +488,44 @@ test sheet name-box: a comment being typed is kept
   assert reply.focused is true
   call real-key {"key":"escape"}
 
+test sheet name-box: Ctrl+S saves from it
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  type 5
+  key enter
+  assert dirty is true
+  call pointer-click {"input":"name-box"}
+  call real-key {"key":"ctrl+s"}
+  assert dirty is false
+  call field-read {"input":"name-box"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet name-box: a click commits a sheet rename being typed
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-tab-rename"}
+  call real-key {"key":"backspace","times":6}
+  call real-type {"text":"Zed"}
+  call pointer-click {"input":"name-box"}
+  assert sheet is Zed
+  call field-read {"input":"sheet-tab-rename"}
+  assert reply.focused is false
+  call real-key {"key":"escape"}
+
+test sheet name-box: a click leaves an untouched sheet rename clean
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  assert dirty is false
+  call pointer-click {"input":"sheet-tab-rename"}
+  call pointer-click {"input":"name-box"}
+  assert sheet is Sheet1
+  assert dirty is false
+  call real-key {"key":"escape"}
+
 # ---- The Find bar (Ctrl+F): Find what and Replace with. Tab moves between
 # them; Enter finds the next match from either, Escape closes the bar;
 # its Replace and All buttons also have Alt+R and Alt+A (#1342).
