@@ -122,8 +122,10 @@ pub(crate) fn apply_hyphenation(pkg: &mut Package, d: &Dialog) -> Result<bool, S
     };
     let mut changed = false;
     if d.changed("auto") {
+        let before = pkg.has_auto_hyphenation();
         pkg.set_auto_hyphenation(is_on(d, "auto"));
-        changed = true;
+        // A settings part docxy cannot edit takes nothing: no false dirty.
+        changed |= pkg.has_auto_hyphenation() != before;
     }
     if d.changed("caps") {
         changed |= pkg.set_hyphenate_caps(is_on(d, "caps"));
@@ -265,6 +267,23 @@ mod tests {
         set(&mut t, "limit", s("0"));
         ok(&mut t).unwrap();
         assert_eq!(pkg(&mut t).consecutive_hyphen_limit(), None);
+    }
+
+    /// A settings part without a `w:settings` root takes no edit: nothing is
+    /// written and the tab stays clean.
+    #[test]
+    fn an_unrecognised_settings_part_leaves_the_tab_clean() {
+        let mut t = three_sections();
+        pkg(&mut t).set_hyphenation_zone(Some(300));
+        assert!(pkg(&mut t).set_part("word/settings.xml", b"<other/>".to_vec()));
+        t.dirty = false;
+        open(&mut t);
+        set(&mut t, "auto", Json::Bool(true));
+        set(&mut t, "caps", Json::Bool(false));
+        set(&mut t, "zone", s("0.5"));
+        ok(&mut t).unwrap();
+        assert!(!t.dirty);
+        assert_eq!(pkg(&mut t).part("word/settings.xml").unwrap(), b"<other/>");
     }
 
     /// Criterion 5: an invalid zone or limit refuses OK, leaves the dialog

@@ -1896,7 +1896,7 @@ impl Package {
     fn set_settings_element(&mut self, elem: &str, child: Option<String>) -> bool {
         // CT_Settings children between `w:documentType` and the hyphenation
         // elements, in schema order.
-        const AFTER_DOCUMENT_TYPE: [&str; 13] = [
+        const AFTER_DOCUMENT_TYPE: [&str; 14] = [
             "w:mailMerge",
             "w:revisionView",
             "w:trackRevisions",
@@ -1910,6 +1910,7 @@ impl Package {
             "w:autoHyphenation",
             "w:consecutiveHyphenLimit",
             "w:hyphenationZone",
+            "w:doNotHyphenateCaps",
         ];
         let name = if child.is_some() {
             self.ensure_settings_part()
@@ -1919,11 +1920,7 @@ impl Package {
         let Some(name) = name else {
             return false;
         };
-        let Some(mut xml) = self
-            .part(&name)
-            .and_then(decode_xml_part)
-            .map(Cow::into_owned)
-        else {
+        let Some(mut xml) = self.part_text(&name) else {
             return false;
         };
         if child.is_some() && !xml.contains("<w:settings") {
@@ -1935,9 +1932,6 @@ impl Package {
         if let Some(child) = child {
             let mut before = SETTINGS_BEFORE_MAIL_MERGE.to_vec();
             before.extend(AFTER_DOCUMENT_TYPE.iter().take_while(|n| **n != elem));
-            if elem == "w:doNotHyphenateCaps" {
-                before.extend(AFTER_DOCUMENT_TYPE);
-            }
             xml = insert_settings_child(&xml, &child, &before);
         }
         self.set_part_text(&name, &xml)
@@ -4642,7 +4636,7 @@ mod tests {
     }
 
     /// Put `bytes` in the settings part, related to the document as Word does.
-    fn set_settings(p: &mut Package, _name: &str, bytes: Vec<u8>) {
+    fn set_settings(p: &mut Package, bytes: Vec<u8>) {
         p.ensure_settings_part();
         assert!(p.set_part("word/settings.xml", bytes));
     }
@@ -4653,16 +4647,13 @@ mod tests {
         assert_eq!(p.hyphenation_zone(), None);
         assert_eq!(p.consecutive_hyphen_limit(), None);
         assert!(p.hyphenate_caps());
-        set_settings(&mut p,
-            "word/settings.xml",
-            br#"<w:settings xmlns:w="w"><w:autoHyphenation w:val="false"/><w:consecutiveHyphenLimit w:val="2"/><w:hyphenationZone w:val="425"/><w:doNotHyphenateCaps/></w:settings>"#.to_vec(),
+        set_settings(&mut p, br#"<w:settings xmlns:w="w"><w:autoHyphenation w:val="false"/><w:consecutiveHyphenLimit w:val="2"/><w:hyphenationZone w:val="425"/><w:doNotHyphenateCaps/></w:settings>"#.to_vec(),
         );
         assert_eq!(p.hyphenation_zone(), Some(425));
         assert_eq!(p.consecutive_hyphen_limit(), Some(2));
         assert!(!p.hyphenate_caps());
         set_settings(
             &mut p,
-            "word/settings.xml",
             br#"<w:settings xmlns:w="w"><w:doNotHyphenateCaps w:val="false"/></w:settings>"#
                 .to_vec(),
         );
@@ -4672,9 +4663,7 @@ mod tests {
     #[test]
     fn hyphenation_value_setters_land_in_schema_order_and_replace() {
         let mut p = load_package(&make_docx("<w:document/>")).unwrap();
-        set_settings(&mut p,
-            "word/settings.xml",
-            br#"<w:settings xmlns:w="w"><w:zoom w:percent="100"/><w:defaultTabStop w:val="720"/><w:characterSpacingControl w:val="x"/></w:settings>"#.to_vec(),
+        set_settings(&mut p, br#"<w:settings xmlns:w="w"><w:zoom w:percent="100"/><w:defaultTabStop w:val="720"/><w:characterSpacingControl w:val="x"/></w:settings>"#.to_vec(),
         );
         // Written out of order, and each lands where the schema puts it.
         assert!(p.set_hyphenate_caps(false));
@@ -4690,9 +4679,7 @@ mod tests {
         assert_eq!(settings_text(&p).matches("hyphenationZone").count(), 1);
         assert_eq!(p.hyphenation_zone(), Some(500));
         // None removes, every duplicate included; a second removal is a no-op.
-        set_settings(&mut p,
-            "word/settings.xml",
-            br#"<w:settings xmlns:w="w"><w:consecutiveHyphenLimit w:val="1"/><w:consecutiveHyphenLimit w:val="2"/><w:doNotHyphenateCaps w:val="false"/></w:settings>"#.to_vec(),
+        set_settings(&mut p, br#"<w:settings xmlns:w="w"><w:consecutiveHyphenLimit w:val="1"/><w:consecutiveHyphenLimit w:val="2"/><w:doNotHyphenateCaps w:val="false"/></w:settings>"#.to_vec(),
         );
         assert!(p.set_consecutive_hyphen_limit(None));
         assert!(!p.set_consecutive_hyphen_limit(None));
@@ -4717,11 +4704,7 @@ mod tests {
         assert!(p.set_hyphenation_zone(Some(720)));
         assert_eq!(p.hyphenation_zone(), Some(720));
         p.set_auto_hyphenation(true);
-        set_settings(
-            &mut p,
-            "word/settings.xml",
-            br#"<w:settings xmlns:w="w"/>"#.to_vec(),
-        );
+        set_settings(&mut p, br#"<w:settings xmlns:w="w"/>"#.to_vec());
         assert!(p.set_consecutive_hyphen_limit(Some(2)));
         assert_eq!(
             settings_text(&p),
