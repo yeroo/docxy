@@ -19121,14 +19121,15 @@ impl Docxy {
 
     /// Whether a font box has the keyboard: opened on the sheet now shown,
     /// with the Home ribbon body that draws it still up and the box itself
-    /// drawn in the last frame (a narrow window can fold its group away).
+    /// on screen (a narrow window can fold its group away: that frame refuses
+    /// the very next key, and the next render closes the box).
     fn font_box_live(&self) -> bool {
         let Some(fb) = &self.font_box else {
             return false;
         };
         self.ribbon_tab == RibbonTab::Home
             && !self.ribbon_body_hidden()
-            && self.probes.borrow().current(fb.which.probe()).is_some()
+            && self.probes.borrow().on_screen(fb.which.probe()).is_some()
             && self.active_tab_id().as_ref() == Some(&fb.tab)
             && self.active_sheet().is_some_and(|v| v.active == fb.sheet)
     }
@@ -36819,6 +36820,14 @@ impl Render for Docxy {
                         eprintln!("docxy: ribbon group {title:?} content is taller than its body");
                     }
                 }
+            }
+        }
+        // A font box whose combo the finished frame did not draw (its group
+        // folded away in a narrower window) is closed, not suspended: a wider
+        // window must not revive it with stale text (#1344).
+        if let Some(fb) = &self.font_box {
+            if self.probes.borrow().get(fb.which.probe()).is_none() {
+                self.font_box = None;
             }
         }
         // Apply the theme choice (Auto follows the OS appearance).
