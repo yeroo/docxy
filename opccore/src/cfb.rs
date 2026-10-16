@@ -1191,7 +1191,7 @@ mod tests {
             "\u{5}SummaryInformation",
         ];
         assert_eq!(Cfb::open(&f).unwrap().paths(), want);
-        // The file holds them in that order too, whatever order they came in.
+        // Whatever order they come in, the file is the same.
         let mut reversed: Vec<Node> = names.iter().map(|n| Node::Stream(n, vec![1])).collect();
         reversed.reverse();
         assert_eq!(write_cfb_tree(&reversed), f);
@@ -1201,9 +1201,9 @@ mod tests {
         assert_eq!(paths, want.map(|n| format!("S/{n}")));
     }
 
-    /// The black height of the sibling tree at `node`, checking it is a
-    /// binary search tree in name order (by `cfb`'s entries) whose every
-    /// path has that many black nodes and no red node a red child.
+    /// The black height of the sibling tree at `node`, checking that every
+    /// path down it passes that many black nodes and no red node has a red
+    /// child.
     fn red_black(f: &[u8], cfb: &Cfb, node: u32, parent_red: bool) -> usize {
         if node == NOSTREAM {
             return 1;
@@ -1211,20 +1211,6 @@ mod tests {
         let red = f[entry_at(f, node) + 67] == 0;
         assert!(!(red && parent_red), "red {node} under a red parent");
         let e = &cfb.entries[node as usize];
-        let key = |i: u32| {
-            name_key(
-                &cfb.entries[i as usize]
-                    .name
-                    .encode_utf16()
-                    .collect::<Vec<_>>(),
-            )
-        };
-        if e.left != NOSTREAM {
-            assert!(key(e.left) < key(node));
-        }
-        if e.right != NOSTREAM {
-            assert!(key(node) < key(e.right));
-        }
         let left = red_black(f, cfb, e.left, red);
         assert_eq!(left, red_black(f, cfb, e.right, red), "under {node}");
         left + usize::from(!red)
@@ -1238,7 +1224,14 @@ mod tests {
             let f = write_cfb_tree(&tree);
             let cfb = Cfb::open(&f).unwrap();
             let root = cfb.entries[0].child;
-            assert_eq!(cfb.paths().len(), n);
+            // A search tree: its in-order walk is in name order.
+            let order = cfb.paths();
+            assert_eq!(order.len(), n);
+            let keys: Vec<_> = order
+                .iter()
+                .map(|p| name_key(&p.encode_utf16().collect::<Vec<_>>()))
+                .collect();
+            assert!(keys.is_sorted_by(|a, b| a < b), "{n}: {order:?}");
             if root == NOSTREAM {
                 assert_eq!(n, 0);
                 continue;
