@@ -7315,6 +7315,16 @@ enum FontBox {
     Size,
 }
 
+impl FontBox {
+    /// The probe the box is drawn under: present only while it is on screen.
+    fn probe(self) -> &'static str {
+        match self {
+            FontBox::Name => "sheet-combo:font-name",
+            FontBox::Size => "sheet-combo:font-size",
+        }
+    }
+}
+
 /// The Font or Font Size box while focused (#1344): a one-line field like the
 /// Name Box, tied to the tab and sheet it was opened on.
 struct FontBoxEdit {
@@ -19110,13 +19120,15 @@ impl Docxy {
     }
 
     /// Whether a font box has the keyboard: opened on the sheet now shown,
-    /// with the Home ribbon body that draws it still up.
+    /// with the Home ribbon body that draws it still up and the box itself
+    /// drawn in the last frame (a narrow window can fold its group away).
     fn font_box_live(&self) -> bool {
         let Some(fb) = &self.font_box else {
             return false;
         };
         self.ribbon_tab == RibbonTab::Home
             && !self.ribbon_body_hidden()
+            && self.probes.borrow().current(fb.which.probe()).is_some()
             && self.active_tab_id().as_ref() == Some(&fb.tab)
             && self.active_sheet().is_some_and(|v| v.active == fb.sheet)
     }
@@ -19165,8 +19177,9 @@ impl Docxy {
     }
 
     /// Apply what the box holds to the selection (Enter): a bad size keeps
-    /// the box, a blank box is Escape, a protected sheet or a tab that takes
-    /// no edits (Protected View, Mark as Final) refuses.
+    /// the box, a blank box is Escape, a protected sheet refuses. (Protected
+    /// View and a final document hide the ribbon body, so the box cannot be
+    /// open there; the `active_locked` check is a backstop.)
     fn font_box_enter(&mut self, cx: &mut Context<Self>) {
         let Some((which, text)) = self
             .font_box
@@ -20987,9 +21000,8 @@ impl Docxy {
             return;
         }
         // Protected View (#610): only keys that look, move or copy reach the
-        // workbook. The find bar, the Name Box (a goto writes nothing) and the font
-        // boxes (typing and copying write nothing; Enter is refused) still
-        // take typing; the bar's Replace is refused where it would write.
+        // workbook. The find bar and the Name Box (a goto writes nothing) still
+        // take typing (the font boxes cannot be up: the ribbon body is hidden); the bar's Replace is refused where it would write.
         if self.active_locked()
             && !self.find_open
             && !self.sheet_field_live()
@@ -24809,7 +24821,7 @@ impl Docxy {
         }
         // The highlighting mode (#623) and the table pens (#763) end on Esc,
         // which they consume, and on any other key but a bare modifier.
-        // KeyTips, the find bar, the Name Box and the comment bar take their keys (Esc
+        // KeyTips, the find bar, the Name Box, the font boxes and the comment bar take their keys (Esc
         // included) first; the KeyTips' Alt leaves the modes be.
         let hl_key = ev.keystroke.key.as_str();
         if (self.hl_mode.is_some() || self.table_draw.is_some())
@@ -33225,6 +33237,7 @@ impl Docxy {
                     // when it is drawn, else under the ribbon (a KeyTip that
                     // just switched tabs).
                     self.ribbon_flyout = None;
+                    self.font_box = None;
                     let at = split_menu_anchor(&self.probes.borrow(), id)
                         .unwrap_or_else(|| point(px(12.), px(140.)));
                     if let Err(e) = self.open_split_menu(id, at, cx) {
@@ -37203,6 +37216,8 @@ impl Render for Docxy {
         if let Some(f) = self.ribbon_flyout {
             if !self.flyout_still_fits(f, window) {
                 self.ribbon_flyout = None;
+                // The box may have sat in that flyout (#1344).
+                self.font_box = None;
             }
         }
         let ribbon_tabs = self.ribbon_tabs(fg, dim, panel, cx);
@@ -38341,10 +38356,7 @@ impl Render for Docxy {
                 }
                 // The same for a font box, whose probe is its own (#1344).
                 if let Some(fb) = &this.font_box {
-                    let probe = match fb.which {
-                        FontBox::Name => "sheet-combo:font-name",
-                        FontBox::Size => "sheet-combo:font-size",
-                    };
+                    let probe = fb.which.probe();
                     let inside = this
                         .probes
                         .borrow()
