@@ -301,6 +301,28 @@
         "link-fs"
       ],
       "desc": "Project 2024 (#779): SNET/FNET milestones hold their constraint instant, at a period end and inside a non-working gap."
+    },
+    {
+      "file": "30-mfo-honor-constraints-on.xml",
+      "category": "constraint",
+      "tags": [
+        "constraint",
+        "constraint-mfo",
+        "honor-constraints",
+        "negative-slack"
+      ],
+      "desc": "Project 2024 (#1504): HonorConstraints 0 is on; MFO beats the FS link, -2d total slack."
+    },
+    {
+      "file": "31-mfo-honor-constraints-off.xml",
+      "category": "constraint",
+      "tags": [
+        "constraint",
+        "constraint-mfo",
+        "honor-constraints",
+        "negative-slack"
+      ],
+      "desc": "Project 2024 (#1504): HonorConstraints 1 is off; the FS link moves the MFO task after its predecessor, -2d total slack."
     }
   ]
 }

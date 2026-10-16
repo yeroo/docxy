@@ -25,6 +25,9 @@
 //! summaries, issue #124), and file 28 (alternate work weeks, issue #218).
 //! File 29 (SNET/FNET milestone instants, issue #779) was likewise checked
 //! against Project 2024 by `verify_mspdi_project.py`, with 0 mismatches.
+//! Files 30 and 31 (an MFO behind an FS link with `HonorConstraints` 0 and
+//! 1, issue #1504) were too, as generated and as `write_mspdi` writes them
+//! back, including that Project reads `0` as its option on.
 //! Slack invariants below also check
 //! properties that do not depend on the embedded expectations.
 
@@ -73,6 +76,64 @@ fn fnlt_conflict_matches_project_2024_negative_slack() {
         let r = sched.get(uid).unwrap();
         assert_eq!(r.total_slack_min, -2400);
         assert!(r.critical);
+    }
+}
+
+/// The text of a document's `<HonorConstraints>` elements.
+fn honor_constraints_texts(xml: &str) -> Vec<String> {
+    header_leaves(xml)
+        .into_iter()
+        .filter(|(n, _)| n == "HonorConstraints")
+        .map(|(_, t)| t)
+        .collect()
+}
+
+#[test]
+fn honor_constraints_reads_and_saves_inverted_as_project_2024_does() {
+    // #1504: Project writes "Tasks will always honor their constraint dates"
+    // inverted, `0` on and `1` off. On, B's Must Finish On at A's finish beats
+    // its FS link; off, the link moves B after A. Both show -2d total slack.
+    let at = |day, hour| projcore::DateTime::from_ymd_hm(2026, 3, day, hour, 0);
+    for (file, text, honor, b_dates) in [
+        (
+            "30-mfo-honor-constraints-on.xml",
+            "0",
+            true,
+            (at(5, 8), at(6, 17)),
+        ),
+        (
+            "31-mfo-honor-constraints-off.xml",
+            "1",
+            false,
+            (at(9, 8), at(10, 17)),
+        ),
+    ] {
+        let xml = std::fs::read_to_string(corpus_dir().join(file)).unwrap();
+        assert_eq!(honor_constraints_texts(&xml), [text], "{file}");
+        let proj = read_mspdi(&xml).unwrap();
+        assert_eq!(proj.honor_constraints, honor, "{file}");
+        let saved = write_mspdi(&proj);
+        let packaged = write_mspdi(&read_yppx(&write_yppx(&proj).unwrap()).unwrap());
+        for (label, saved) in [("mspdi", &saved), ("yppx", &packaged)] {
+            assert_eq!(honor_constraints_texts(saved), [text], "{file} {label}");
+            let back = read_mspdi(saved).unwrap();
+            assert_eq!(back.honor_constraints, honor, "{file} {label}");
+            for proj in [&proj, &back] {
+                let sched = schedule(proj);
+                let b = sched.get(2).unwrap();
+                assert_eq!((b.early_start, b.early_finish), b_dates, "{file} {label}");
+                assert_eq!(
+                    sched.get(1).unwrap().early_finish,
+                    at(6, 17),
+                    "{file} {label}"
+                );
+                for uid in [1, 2] {
+                    let r = sched.get(uid).unwrap();
+                    assert_eq!(r.total_slack_min, -960, "{file} {label} task {uid}");
+                    assert!(r.critical, "{file} {label} task {uid}");
+                }
+            }
+        }
     }
 }
 

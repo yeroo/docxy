@@ -1583,7 +1583,10 @@ pub struct Project {
     pub name: String,
     pub title: String,
     pub start_date: Option<DateTime>,
-    /// Let date constraints override conflicting links (MSPDI HonorConstraints).
+    /// Let date constraints override conflicting links: Project's "Tasks will
+    /// always honor their constraint dates", on by default. MSPDI's
+    /// `HonorConstraints` element encodes it inverted, as Project writes and
+    /// reads it: `0` means on (this field `true`), `1` off (#1504).
     pub honor_constraints: bool,
     /// Whether tasks added to this plan start out manually scheduled (MSPDI
     /// `NewTasksAreManual`).
