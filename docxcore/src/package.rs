@@ -2353,8 +2353,9 @@ impl Package {
     }
 
     /// Set the number of newspaper columns (`w:cols w:num`) in the body section,
-    /// with an equal gap. docxy still renders a single column on screen, but the
-    /// column layout round-trips and Word lays it out in columns.
+    /// with an equal gap. Test-only: the apps edit sections through
+    /// `Editor::edit_section_setups`.
+    #[cfg(test)]
     pub fn set_columns(&mut self, num: i32) {
         let sect = self.sect_pr().to_string();
         let mut setup = crate::sect::SectionSetup::parse(&sect);

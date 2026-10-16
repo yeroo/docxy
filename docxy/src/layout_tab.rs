@@ -37,7 +37,7 @@ pub(crate) const LINE_NUMBER_ITEMS: &[&str] = &[
     "Continuous",
     "Restart Each Page",
     "Restart Each Section",
-    "Suppress for Current Paragraph",
+    "Suppress for Paragraph",
 ];
 pub(crate) const HYPHEN_ITEMS: &[&str] = &["None", "Automatic"];
 
@@ -117,19 +117,10 @@ impl App {
     }
 
     /// Open a Layout picker. Like the Design pickers it needs no selection and
-    /// refuses a Markdown document.
+    /// refuses a Markdown document; it starts on the current choice.
     pub(crate) fn open_layout_picker(&mut self, kind: PickerKind) {
-        if self.format == DocFormat::Markdown {
-            self.status = Some(format!(
-                "{} needs a .docx (not Markdown)",
-                kind.title().trim()
-            ));
-            self.dirty = true;
-            return;
-        }
         let sel = self.layout_current(kind);
-        self.font_picker = Some(FontPicker { kind, sel });
-        self.dirty = true;
+        self.open_page_picker(kind, sel);
     }
 
     /// Apply a Layout pick. The status says what happened; an error says why

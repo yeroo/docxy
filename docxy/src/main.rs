@@ -1565,6 +1565,8 @@ struct App {
     /// The modal font/size/colour/highlight picker, plus its row/button rects.
     font_picker: Option<FontPicker>,
     fp_rows: Vec<Rect>,
+    /// The list index drawn on the picker's first row (it scrolls).
+    fp_top: usize,
     fp_btns: [Rect; 2],
     /// Field-evaluation context (clock + document properties + filename), kept so
     /// newly inserted fields can be computed.
@@ -1765,6 +1767,7 @@ impl App {
             sd_btns: [Rect::default(); 2],
             font_picker: None,
             fp_rows: Vec::new(),
+            fp_top: 0,
             fp_btns: [Rect::default(); 2],
             field_ctx,
             find: None,
@@ -5131,6 +5134,12 @@ impl App {
     /// Open a Design ▸ Page Background picker. Unlike the font pickers these
     /// act on the whole document, not the selection, and they need a .docx.
     fn open_design_picker(&mut self, kind: PickerKind) {
+        self.open_page_picker(kind, 0);
+    }
+
+    /// Open a whole-document picker on row `sel`; a Markdown document has
+    /// no page to set.
+    fn open_page_picker(&mut self, kind: PickerKind, sel: usize) {
         if self.format == DocFormat::Markdown {
             self.status = Some(format!(
                 "{} needs a .docx (not Markdown)",
@@ -5139,7 +5148,7 @@ impl App {
             self.dirty = true;
             return;
         }
-        self.font_picker = Some(FontPicker { kind, sel: 0 });
+        self.font_picker = Some(FontPicker { kind, sel });
         self.dirty = true;
     }
 
@@ -5357,7 +5366,7 @@ impl App {
         let pos = Position { x, y };
         if let Some(i) = self.fp_rows.iter().position(|r| r.contains(pos)) {
             if let Some(p) = self.font_picker.as_mut() {
-                p.sel = i;
+                p.sel = self.fp_top + i;
             }
             self.dirty = true;
             return;
@@ -7325,6 +7334,7 @@ impl App {
 
         let on_style = Style::default().fg(Color::Black).bg(Color::Cyan);
         self.fp_rows.clear();
+        self.fp_top = top as usize;
         for row in 0..view {
             let i = (top + row) as usize;
             let r = Rect {
@@ -11750,6 +11760,11 @@ mod tests {
             .unwrap_or_else(|| panic!("{label} not in the {kind:?} items"));
         app.font_picker.as_mut().unwrap().sel = idx;
         app.apply_picker();
+    }
+
+    fn pick_layout_open(app: &mut App, act: ribbon::Act) {
+        app.run_act(act);
+        assert!(app.font_picker.is_some());
     }
 
     /// Open a Layout picker from its ribbon button and apply `label`.
@@ -16435,9 +16450,25 @@ mod tests {
             &mut app,
             ribbon::Act::LineNumbers,
             PickerKind::LineNumbers,
-            "Suppress for Current Paragraph",
+            "Suppress for Paragraph",
         );
         assert!(app.editor.caret_suppresses_line_numbers());
+    }
+
+    /// Every inline break in the top-level paragraphs of `doc`.
+    fn breaks_in(doc: &Document) -> Vec<BreakKind> {
+        doc.body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .flat_map(|p| p.content.iter())
+            .filter_map(|i| match i {
+                Inline::Break(kind, _) => Some(*kind),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -16447,12 +16478,21 @@ mod tests {
         app.editor.move_end();
         pick_layout(&mut app, ribbon::Act::Breaks, PickerKind::Breaks, "Page");
         assert_eq!(app.status.as_deref(), Some("Page break"));
+        assert_eq!(breaks_in(&app.editor.doc), [BreakKind::Page]);
         pick_layout(&mut app, ribbon::Act::Breaks, PickerKind::Breaks, "Column");
         pick_layout(
             &mut app,
             ribbon::Act::Breaks,
             PickerKind::Breaks,
             "Text Wrapping",
+        );
+        assert_eq!(
+            breaks_in(&app.editor.doc),
+            [
+                BreakKind::Page,
+                BreakKind::Column,
+                BreakKind::Clear(docxcore::model::ClearKind::All)
+            ]
         );
         let sections = app.editor.sections().len();
         pick_layout(
@@ -16483,8 +16523,11 @@ mod tests {
             Some("A section break cannot go in a header or footer")
         );
         assert_eq!(app.body_editor().sections().len(), sections);
+        let body_before = app.body_editor().doc.clone();
         pick_layout(&mut app, ribbon::Act::Breaks, PickerKind::Breaks, "Page");
         assert_eq!(app.status.as_deref(), Some("Page break"));
+        assert_eq!(breaks_in(&app.editor.doc), [BreakKind::Page], "header");
+        assert_eq!(app.body_editor().doc, body_before, "body untouched");
         // A section pick while the header is open still edits the body.
         pick_layout(&mut app, ribbon::Act::Columns, PickerKind::Columns, "Two");
         assert_eq!(sect_setup(&app, 0).columns.count(), 2);
@@ -16519,6 +16562,21 @@ mod tests {
             let p = app.font_picker.take().unwrap();
             assert_eq!((p.kind, p.sel), (kind, want), "{kind:?}");
         }
+    }
+
+    #[test]
+    fn a_click_on_a_scrolled_picker_selects_the_clicked_item() {
+        // A short terminal shows 3 of the 7 sizes; Tabloid (last) starts the
+        // list scrolled, so the first drawn row is item 4, not item 0.
+        let mut app = two_section_app();
+        pick_layout_open(&mut app, ribbon::Act::PaperSize);
+        app.font_picker.as_mut().unwrap().sel = 6;
+        let mut term = Terminal::new(TestBackend::new(60, 9)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        assert_eq!(app.fp_top, 4);
+        let first = app.fp_rows[0];
+        app.picker_mouse(first.x + 1, first.y);
+        assert_eq!(app.font_picker.as_ref().unwrap().sel, 4, "A5, not Letter");
     }
 
     #[test]
