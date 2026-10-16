@@ -7,7 +7,8 @@ Total Slack and Critical with the oracle embedded in the fixture.
 
 The copy has every task's <Start>, <Finish>, <TotalSlack> and <Critical>
 removed, so Project must schedule from the inputs (durations, links, lags,
-constraints, calendars and their exceptions) and cannot read the oracle back.
+constraints, calendars and their exceptions, and the HonorConstraints option
+when stated) and cannot read the oracle back.
 Before comparing dates, it checks that Project imported those inputs as the
 file states them (input fidelity), so an import problem is not mistaken for a
 scheduling fact.
@@ -98,6 +99,14 @@ def read_fixture(path):
             "critical": text(t, "Critical") == "1",
         })
     return tasks
+
+
+def read_honor_constraints(path):
+    """Project's "Tasks will always honor their constraint dates" as the file
+    states it, or None when it does not. MSPDI writes it inverted (#1504):
+    `0` means on, `1` off."""
+    value = text(ET.parse(path).getroot(), "HonorConstraints")
+    return None if value is None else value.strip() not in ("1", "true", "True")
 
 
 def read_exceptions(path):
@@ -261,6 +270,11 @@ def check(app, path, tmpdir):
 
         fidelity, mismatches = [], []
         print(name)
+        # The constraint precedence option (#1504), when the file states it.
+        want_honor = read_honor_constraints(path)
+        if want_honor is not None and bool(project.HonorConstraints) != want_honor:
+            fidelity.append(f"  FIDELITY HonorConstraints: file means {want_honor}"
+                            f" project={bool(project.HonorConstraints)}")
         # Calendar exceptions (#126): count, name, type, dates and whether the
         # day works.
         want_exceptions = read_exceptions(path)

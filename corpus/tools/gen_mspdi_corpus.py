@@ -19,7 +19,8 @@ exceptions, #126) were verified against Project Professional 2024 (build
 16.0.17932.21000), as generated and as projcore's write_mspdi writes them, as
 was file 26 (percentage and elapsed lags, #104), whose plan and values come
 from Project itself (gen_mpp_lag_cases.py), file 27 (manual summaries, #124),
-and file 28 (alternate work weeks, #218).
+file 28 (alternate work weeks, #218), and files 30 and 31 (HonorConstraints 0
+and 1, which Project reads inverted, #1504).
 
 Every file isolates exactly ONE feature (one link type, one constraint, one
 rollup rule) so a failing assertion points at a single code path, mirroring
@@ -222,7 +223,10 @@ def standard_calendar(uid=1, name="Standard", saturday=False, exs=()):
 
 def project(name, tasks_xml, *, resources_xml="", assignments_xml="",
             calendars=None, new_tasks_are_manual=None, extended_attributes="",
-            outline_codes="", wbs_masks=""):
+            outline_codes="", wbs_masks="", honor_constraints=None):
+    """`honor_constraints` is the <HonorConstraints> text, written only when
+    given. Project writes it inverted (#1504): `0` when "Tasks will always
+    honor their constraint dates" is on, its default, and `1` when off."""
     calendars = calendars or [standard_calendar()]
     parts = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -232,6 +236,10 @@ def project(name, tasks_xml, *, resources_xml="", assignments_xml="",
         "  <MinutesPerWeek>2400</MinutesPerWeek>",
         "  <CalendarUID>1</CalendarUID>",
         f"  <StartDate>2026-03-02T08:00:00</StartDate>",
+    ]
+    if honor_constraints is not None:
+        parts.append(f"  <HonorConstraints>{honor_constraints}</HonorConstraints>")
+    parts += [
         # Without this, Project treats the file as externally edited, ignores
         # <Duration> and rederives it from Start/Finish, which zeroes tasks that
         # start at the project start (#74).
@@ -1128,6 +1136,26 @@ def build():
                  slack=1200, critical=False, milestone=True,
                  ctype=FNET, cdate=dt(4, "12:30:00")),
         ])))
+
+    # 30/31 — Project 2024 (#1504) writes and reads <HonorConstraints>
+    # inverted: `0` is its default "honor constraint dates", under which B's
+    # Must Finish On at A's finish beats the FS link; `1` turns it off, and
+    # the link moves B after A. Both report the conflict as -2d total slack.
+    for fname, honor, b_start, b_finish, desc in [
+        ("30-mfo-honor-constraints-on.xml", 0, dt(5), dt(6, "17:00:00"),
+         "Project 2024 (#1504): HonorConstraints 0 is on; MFO beats the FS link, "
+         "-2d total slack."),
+        ("31-mfo-honor-constraints-off.xml", 1, dt(9), dt(10, "17:00:00"),
+         "Project 2024 (#1504): HonorConstraints 1 is off; the FS link moves the "
+         "MFO task after its predecessor, -2d total slack."),
+    ]:
+        add(fname, ["constraint", "constraint-mfo", "honor-constraints", "negative-slack"],
+            desc,
+            project(os.path.splitext(fname)[0][3:], "\n".join([
+                task(1, "A", 5 * D, dt(2), dt(6, "17:00:00"), slack=-2 * D, critical=True),
+                task(2, "B", 2 * D, b_start, b_finish, slack=-2 * D, critical=True,
+                     preds=[(1, FS, 0)], ctype=MFO, cdate=dt(6, "17:00:00")),
+            ]), honor_constraints=honor))
 
     manifest = {
         "anchor": "2026-03-02T08:00:00",

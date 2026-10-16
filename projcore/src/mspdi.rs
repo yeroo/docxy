@@ -55,7 +55,11 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
                     "Name" => proj.name = text_of(&mut p),
                     "Title" => proj.title = text_of(&mut p),
                     "StartDate" => proj.start_date = DateTime::parse_mspdi(&text_of(&mut p)),
-                    "HonorConstraints" => proj.honor_constraints = bool_of(&mut p),
+                    // Project writes this element inverted: `0` when its
+                    // "Tasks will always honor their constraint dates" option
+                    // is on, `1` when it is off, and reads it the same way
+                    // (measured on Project 2024, #1504).
+                    "HonorConstraints" => proj.honor_constraints = !bool_of(&mut p),
                     "NewTasksAreManual" => proj.new_tasks_are_manual = bool_of(&mut p),
                     // Modeled options: a value that parses fills the field; one
                     // that does not is kept verbatim. Of repeated leaves, the
@@ -1712,7 +1716,8 @@ fn header_text(proj: &Project, name: &str) -> Option<String> {
         "CalendarUID" => Some(proj.default_calendar_uid.to_string()),
         "MinutesPerDay" => Some(((proj.hours_per_day * 60.0).round() as i64).to_string()),
         "MinutesPerWeek" => Some(((proj.hours_per_week * 60.0).round() as i64).to_string()),
-        "HonorConstraints" => flag(proj.honor_constraints),
+        // Inverted, as Project writes it (see `read_mspdi`, #1504).
+        "HonorConstraints" => flag(!proj.honor_constraints),
         "NewTasksAreManual" => flag(proj.new_tasks_are_manual),
         // The options below are written only when the file stated them (or
         // an edit set them); unparseable text falls back to the stored option.
@@ -2912,9 +2917,11 @@ mod tests {
         );
     }
 
+    /// #1504: Project exports its "honor constraint dates" option, on by
+    /// default, as `0` and off as `1`, and imports the element the same way.
     #[test]
-    fn honor_constraints_reads_boolean_forms_and_defaults_to_true() {
-        for (value, expected) in [("0", false), ("1", true), ("false", false), ("true", true)] {
+    fn honor_constraints_reads_inverted_boolean_forms_and_defaults_to_true() {
+        for (value, expected) in [("0", true), ("1", false), ("false", true), ("true", false)] {
             let xml = format!("<Project><HonorConstraints>{value}</HonorConstraints></Project>");
             assert_eq!(read_mspdi(&xml).unwrap().honor_constraints, expected);
         }
@@ -2930,9 +2937,9 @@ mod tests {
             };
             let xml = write_mspdi(&proj);
             assert!(xml.contains(if honor_constraints {
-                "<HonorConstraints>1</HonorConstraints>"
-            } else {
                 "<HonorConstraints>0</HonorConstraints>"
+            } else {
+                "<HonorConstraints>1</HonorConstraints>"
             }));
             assert_eq!(
                 read_mspdi(&xml).unwrap().honor_constraints,
@@ -5883,7 +5890,8 @@ mod tests {
                     "CalendarUID" => "1".to_string(),
                     "MinutesPerDay" => "420".to_string(),
                     "MinutesPerWeek" => "2100".to_string(),
-                    "HonorConstraints" => "0".to_string(),
+                    // Off: Project writes the option inverted (#1504).
+                    "HonorConstraints" => "1".to_string(),
                     "NewTasksAreManual" => "1".to_string(),
                     "ScheduleFromStart" => "0".to_string(),
                     "ProjectExternallyEdited" => "0".to_string(),
@@ -6009,7 +6017,7 @@ mod tests {
         // After StatusDate/CurrentDate's slot, before NewTasksAreManual.
         let at = |entry: &str| names.iter().position(|n| n == entry).unwrap();
         assert!(at("Autolink=1") < at("NewTasksAreManual=0"), "{names:?}");
-        assert!(at("HonorConstraints=1") < at("Autolink=1"), "{names:?}");
+        assert!(at("HonorConstraints=0") < at("Autolink=1"), "{names:?}");
     }
 
     #[test]
@@ -6535,7 +6543,8 @@ mod tests {
                 ("CalendarUID", "1"),
                 ("MinutesPerDay", "420"),
                 ("MinutesPerWeek", "2100"),
-                ("HonorConstraints", "1"),
+                // The default, on, which Project writes as `0` (#1504).
+                ("HonorConstraints", "0"),
                 ("NewTasksAreManual", "0"),
                 ("ProjectExternallyEdited", "0"),
             ]

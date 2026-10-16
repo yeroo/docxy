@@ -158,8 +158,10 @@ Wednesday 08:00" both come out right.
 
 - **Forward pass** → early start/finish, honoring links + lag, ASAP by default,
   plus SNET/FNET date bounds. With `HonorConstraints` enabled (the default,
-  persisted as MSPDI `HonorConstraints`), MSO/MFO/FNLT/SNLT override conflicting
+  persisted as MSPDI `HonorConstraints`, which Project writes and reads
+  inverted: `0` on, `1` off, #1504), MSO/MFO/FNLT/SNLT override conflicting
   links; with it off, links can delay tasks past those constraint dates.
+  Corpus files 30 and 31 pin both modes against Project 2024.
   An SNET or FNET milestone holds its constraint instant itself, even at the
   end of a working period or inside a non-working gap (Fri 17:00, Wed 19:00),
   as Project 2024 does (#118, #133, #779, corpus file 29); a date before the
@@ -229,7 +231,7 @@ cycles fall back to input order.
 ### Verification
 
 There's no free high-fidelity oracle for scheduling (Project isn't scriptable in
-CI), so the corpus is **self-oracling**: `corpus/mspdi/` holds twenty-seven tiny
+CI), so the corpus is **self-oracling**: `corpus/mspdi/` holds thirty-one tiny
 one-feature MSPDI files, each embedding every task's `Start`/`Finish`,
 `TotalSlack` and `Critical`. In files 01–18 these are the values Microsoft
 Project 2024 computes: `corpus/tools/verify_mspdi_project.py` checked every
