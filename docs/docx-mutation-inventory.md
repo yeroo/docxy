@@ -60,15 +60,16 @@ the time they were made; it is not a new document edit.
 ## Ribbon and dialog mapping
 
 Every implemented mutating `ribbon::Act` is covered above: Cut, Paste,
-PasteSpecial, HorizontalLine, PageNumber, PageBreak, InsertTable, Columns,
-Hyphenation, Bold, Italic, Underline, Strike, Subscript, Superscript, GrowFont,
+PasteSpecial, HorizontalLine, PageNumber, PageBreak, InsertTable, Bold, Italic, Underline, Strike, Subscript, Superscript, GrowFont,
 ShrinkFont, ChangeCase, ClearFormatting, Bullets, Numbering, IncreaseIndent,
 DecreaseIndent, FirstLineIndent, HangingIndent, Sort, ParaBorders, AlignLeft,
 AlignCenter, AlignRight, Justify, ApplyStyle, NewComment, DeleteComment, ResolveComment,
 DeleteAllComments, ToggleTrack (Package metadata), and the
 commits made by InsertField, InsertSymbol, InsertEquation, LineSpacing,
 ParagraphDialog, StylesDialog, font/size/color/highlight pickers, and the
-PageColor, Watermark, and PageBorders pickers. Dialog
+PageColor, Watermark, and PageBorders pickers, and the Layout tab's Margins,
+Orientation, Size, Columns, Breaks, Line Numbers, and Hyphenation pickers
+(Formatting; Breaks is Structure). Dialog
 open, navigation, and cancel paths are non-mutating.
 
 ## Control and MCP routes
