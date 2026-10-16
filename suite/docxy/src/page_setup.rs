@@ -128,7 +128,7 @@ fn apply_to(ed: &Editor, selected_text: bool) -> Control {
 /// The Page Setup dialog on the caret section's values, open on `page`.
 pub(crate) fn page_setup_dialog(tab: &DocTab, page: PageSetupTab) -> Result<Dialog, String> {
     let (ed, pkg) = body_of(tab)?;
-    let s = caret_setup(ed);
+    let s = SectionSetup::parse(&dialog_raw(ed));
     let m = s.margins;
     let paper = Paper::matching(s.page.w, s.page.h);
     let mut papers: Vec<&str> = Paper::ALL.iter().map(|p| p.label()).collect();
@@ -201,7 +201,7 @@ pub(crate) fn page_setup_dialog(tab: &DocTab, page: PageSetupTab) -> Result<Dial
         number("header", "Header from edge:", m.header, Some(2)),
         number("footer", "Footer from edge:", m.footer, Some(2)),
         apply_to(ed, true),
-        hidden("caret_sect", caret_raw(ed)),
+        hidden("caret_sect", dialog_raw(ed)),
         hidden("paper_pick", String::new()),
     ];
     d.buttons = ok_cancel();
@@ -220,6 +220,15 @@ fn hidden(name: &'static str, value: String) -> Control {
     c.visible = false;
     c.page = Some(HIDDEN_PAGE);
     c
+}
+
+/// The sectPr a Page Setup or Columns dialog opens on: the section Selected
+/// text edits when that is offered, else the caret's.
+fn dialog_raw(ed: &Editor) -> String {
+    match ed.selection_wrap_section() {
+        Some(k) => ed.sections()[k].clone(),
+        None => caret_raw(ed),
+    }
 }
 
 /// The caret section's sectPr.
@@ -742,7 +751,7 @@ pub(crate) fn after_columns_set(d: &mut Dialog, i: usize, _before: &Value) {
 /// The Columns dialog on the caret section's columns.
 pub(crate) fn columns_dialog(tab: &DocTab) -> Result<Dialog, String> {
     let (ed, pkg) = body_of(tab)?;
-    let s = caret_setup(ed);
+    let s = SectionSetup::parse(&dialog_raw(ed));
     let tw = s.text_width(pkg.has_gutter_at_top());
     let c = &s.columns;
     let n = c.count() as usize;

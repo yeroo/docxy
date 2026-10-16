@@ -1299,3 +1299,31 @@ fn selected_text_without_a_change_wraps_nothing_1272() {
     assert_eq!(ed(&t).doc, before, "no breaks");
     assert!(t.dirty);
 }
+
+#[test]
+fn the_dialog_opens_on_the_section_selected_text_edits_1272() {
+    // A selection from the end of "one" (section 0) into "two" (section 1)
+    // is wrapped in section 1, though the caret is in section 0.
+    let mut t = three_sections();
+    distinct_margins(&mut t);
+    let ed = ed_mut(&mut t);
+    ed.anchor = Some(Caret::top(1, 2));
+    ed.caret = Caret::top(0, 3);
+    assert_eq!(ed.caret_section(), 0);
+    assert_eq!(ed.selection_wrap_section(), Some(1));
+    open(&mut t, PageSetupTab::Margins);
+    assert_eq!(shown(&t, "apply"), "Selected text");
+    assert_eq!(shown(&t, "left"), "1.5");
+    // Columns lays its presets out on that section's width (2" here), not on
+    // the caret section's 6.5".
+    let mut t = three_sections();
+    ed_mut(&mut t).edit_section_setups(&[1], |s| s.page.set_custom(5760, 15840));
+    let ed = ed_mut(&mut t);
+    ed.anchor = Some(Caret::top(1, 2));
+    ed.caret = Caret::top(0, 3);
+    open_columns(&mut t);
+    set(&mut t, "Presets", s("Left"));
+    ok(&mut t).unwrap();
+    let counts: Vec<i32> = setups(&t).iter().map(|x| x.columns.count()).collect();
+    assert_eq!(counts, [1, 2, 1, 1]);
+}

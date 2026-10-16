@@ -326,27 +326,41 @@ impl Editor {
             _ => None,
         };
         let is_para = |b: usize| matches!(self.doc.body.get(b), Some(Block::Paragraph(_)));
-        if len(lb)? == lo.offset && lb < hb && is_para(lb + 1) {
+        // Edges of an empty paragraph stay: its one offset is both its start
+        // and its end, and the paragraph is selected text.
+        let mut lo_gap = None;
+        let mut hi_moved = false;
+        if len(lb)? > 0 && len(lb)? == lo.offset && lb < hb {
             // From a paragraph's end: the selection starts with its mark, so
-            // the text starts at the next paragraph.
-            lb += 1;
-            lo = Caret::at(vec![lb], 0);
+            // the text starts at the next block. A table there cannot start
+            // the section by a split without a blank paragraph before it, so
+            // the mark ends the section instead.
+            if is_para(lb + 1) {
+                lb += 1;
+                lo = Caret::at(vec![lb], 0);
+            } else {
+                lo_gap = Some(lb);
+            }
         }
-        if hi.offset == 0 && hb > lb && is_para(hb - 1) {
+        if hi.offset == 0 && len(hb)? > 0 && hb > lb && is_para(hb - 1) {
             // To a paragraph's start: the text ends with the previous mark.
             hb -= 1;
+            hi_moved = true;
             hi = Caret::at(vec![hb], len(hb)?);
         }
-        len(lb)?;
         let hlen = len(hb)?;
-        if (hb, hi.offset) <= (lb, lo.offset) {
+        // An empty paragraph's own mark is a selection (moved onto by the end
+        // rule); a bare paragraph mark before it is not.
+        if (hb, hi.offset) < (lb, lo.offset) || ((hb, hi.offset) == (lb, lo.offset) && !hi_moved) {
             return None;
         }
         let k = self.section_of_block(lb);
         if self.section_of_block(hb) != k {
             return None;
         }
-        let lo_cut = if lo.offset > 0 {
+        let lo_cut = if let Some(p) = lo_gap {
+            Cut::Gap(p)
+        } else if lo.offset > 0 {
             Cut::Mid
         } else if lb == 0 || self.section_of_block(lb - 1) != k {
             Cut::Edge
@@ -393,8 +407,9 @@ impl Editor {
     /// selection starts at its section's start, where the existing break
     /// stays), and so does the section after it. No empty paragraph is made
     /// where a selection edge is at a paragraph edge: the neighbouring
-    /// paragraph's mark carries the break. The selection stays on the same
-    /// text.
+    /// paragraph's mark carries the break, except where a table is the
+    /// neighbour before the text: a table cannot carry a sectPr, so an empty
+    /// paragraph after it does. The selection stays on the same text.
     pub fn wrap_selection_in_section(
         &mut self,
         start: SectionStart,
@@ -905,6 +920,61 @@ mod tests {
         assert_eq!(texts(&e)[4..6], ["ne", "xt"]);
         assert_eq!(margin(&e, 1), 720);
         assert_eq!(e.sections().len(), 3);
+    }
+
+    #[test]
+    fn a_selection_from_a_paragraph_end_before_a_table_ends_the_section_at_its_mark_1272() {
+        let mut e = wrap_doc();
+        e.doc.body.insert(1, Block::Table(Table::default()));
+        select(&mut e, (0, 10), (2, 3)); // mark, table, "gam"
+        let n = e.doc.body.len();
+        let before = e.doc.clone();
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(e.doc.body.len(), n + 1, "only the end splits");
+        assert_eq!(texts(&e)[0], "alpha beta");
+        assert_eq!(margin(&e, 1), 720);
+        assert_eq!(e.sections().len(), 4);
+        assert!(e.undo());
+        assert_eq!(e.doc, before);
+    }
+
+    fn blanks(texts: &[&str]) -> Editor {
+        let mut doc = Document {
+            body: texts.iter().map(|t| para(t, None)).collect(),
+        };
+        doc.set_trailing_section_properties(SectionProperties {
+            raw: sect(""),
+            property_change: None,
+        });
+        Editor::new(doc)
+    }
+
+    #[test]
+    fn an_empty_paragraph_at_an_edge_stays_in_the_selection_1272() {
+        // Select All with a blank first or last paragraph is the whole section.
+        let mut e = blanks(&["", "a", "b"]);
+        select(&mut e, (0, 0), (2, 1));
+        assert!(!e.selection_section_wrappable());
+        let mut e = blanks(&["a", "b", ""]);
+        select(&mut e, (0, 0), (2, 0));
+        assert!(!e.selection_section_wrappable());
+        // The blank paragraph is inside the middle section.
+        let mut e = blanks(&["alpha", "", "gamma", "delta"]);
+        select(&mut e, (1, 0), (2, 5));
+        let n = e.doc.body.len();
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(e.doc.body.len(), n);
+        assert_eq!(texts(&e)[..3], ["alpha", "", "gamma"]);
+        // alpha | "" gamma | delta: the break marks are on "alpha" and "gamma".
+        assert!(matches!(&e.doc.body[0], Block::Paragraph(p) if p.props.section_break.is_some()));
+        assert!(matches!(&e.doc.body[2], Block::Paragraph(p) if p.props.section_break.is_some()));
+        assert_eq!(margin(&e, 1), 720);
+        // From an empty paragraph to the next one's start.
+        let mut e = blanks(&["alpha", "", "gamma"]);
+        select(&mut e, (1, 0), (2, 0));
+        assert!(e.selection_section_wrappable());
     }
 
     #[test]
