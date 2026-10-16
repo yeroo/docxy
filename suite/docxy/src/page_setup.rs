@@ -597,16 +597,37 @@ pub(crate) fn apply_page_setup(
         edit(&mut s);
         check_setup(&s, gutter_at_top)?;
     }
-    let mut any = targets.write(ed, SectionStart::NextPage, edit)?;
-    if changed("gutter_pos") {
-        pkg.set_gutter_at_top(gutter_at_top);
-        any = true;
+    let gutter = changed("gutter_pos").then_some(gutter_at_top);
+    let mirror = changed("multiple").then(|| chosen(d, "multiple") == Some(1));
+    // The file first: a settings part docxy cannot edit refuses the dialog
+    // with nothing changed (#1273).
+    if gutter.is_some_and(|on| pkg.has_gutter_at_top() != on) {
+        pkg.set_gutter_at_top(gutter.unwrap_or_default());
+        if Some(pkg.has_gutter_at_top()) != gutter {
+            return Err(crate::layout_tab::SETTINGS_UNREADABLE.into());
+        }
     }
-    if changed("multiple") {
-        pkg.set_mirror_margins(chosen(d, "multiple") == Some(1));
-        any = true;
+    if mirror.is_some_and(|on| pkg.has_mirror_margins() != on) {
+        pkg.set_mirror_margins(mirror.unwrap_or_default());
+        if Some(pkg.has_mirror_margins()) != mirror {
+            return Err(crate::layout_tab::SETTINGS_UNREADABLE.into());
+        }
     }
-    Ok(any)
+    let mut any = Ok(false);
+    ed.one_step("Page Setup", |ed| {
+        any = targets.write(ed, SectionStart::NextPage, edit).map(|a| {
+            let g = gutter.is_some_and(|on| ed.set_gutter_at_top(on));
+            let m = mirror.is_some_and(|on| ed.set_mirror_margins(on));
+            a || g || m
+        });
+    });
+    if any.is_err() {
+        // Nothing was written: the file follows the editor again.
+        let kept = ed.settings();
+        pkg.set_gutter_at_top(kept.gutter_at_top);
+        pkg.set_mirror_margins(kept.mirror_margins);
+    }
+    any
 }
 
 /// Refuse a page Word would not lay out.

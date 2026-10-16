@@ -81,10 +81,10 @@ fn apply_dialog(
             crate::page_setup::apply_line_numbers(ed, dialog)
         }
         DialogOwner::Hyphenation => {
-            let Some(pkg) = pkg else {
+            let (Surface::Doc(ed), Some(pkg)) = (surface, pkg) else {
                 return Err("this dialog belongs to a .docx document".into());
             };
-            crate::hyphenation_dialog::apply_hyphenation(pkg, dialog)
+            crate::hyphenation_dialog::apply_hyphenation(ed, pkg, dialog)
         }
         // Handled in `manual_hyphen::click`, before this: Yes and No act and
         // ask about the next word.

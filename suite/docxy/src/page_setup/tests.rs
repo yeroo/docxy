@@ -1327,3 +1327,39 @@ fn the_dialog_opens_on_the_section_selected_text_edits_1272() {
     let counts: Vec<i32> = setups(&t).iter().map(|x| x.columns.count()).collect();
     assert_eq!(counts, [1, 2, 1, 1]);
 }
+
+/// #1273: gutter position, Multiple pages and a margin change are one undo
+/// step that takes the sections and both flags back, and redo reapplies.
+#[test]
+fn gutter_multiple_pages_and_margins_are_one_undo_step_1273() {
+    let mut t = three_sections();
+    let before = ed(&t).doc.clone();
+    open(&mut t, PageSetupTab::Margins);
+    set(&mut t, "top", s("0.5"));
+    set(&mut t, "Gutter position", s("Top"));
+    set(&mut t, "Multiple pages", s("Mirror margins"));
+    ok(&mut t).unwrap();
+    assert_eq!(ed(&t).undo_names(), vec!["Page Setup"]);
+    let after = ed(&t).doc.clone();
+    {
+        let p = t.pkg.as_ref().unwrap();
+        assert!(p.has_gutter_at_top() && p.has_mirror_margins());
+    }
+    let Surface::Doc(e) = &mut t.surface else {
+        panic!()
+    };
+    assert!(e.undo());
+    t.set_dirty();
+    let p = t.pkg.as_ref().unwrap();
+    assert!(!p.has_gutter_at_top() && !p.has_mirror_margins());
+    assert_eq!(ed(&t).doc, before);
+    let Surface::Doc(e) = &mut t.surface else {
+        panic!()
+    };
+    assert!(!e.undo(), "one step");
+    assert!(e.redo());
+    t.set_dirty();
+    let p = t.pkg.as_ref().unwrap();
+    assert!(p.has_gutter_at_top() && p.has_mirror_margins());
+    assert_eq!(ed(&t).doc, after);
+}

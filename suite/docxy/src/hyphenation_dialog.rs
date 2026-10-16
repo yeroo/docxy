@@ -83,7 +83,11 @@ fn is_on(d: &Dialog, name: &str) -> bool {
 /// Apply an accepted Hyphenation dialog: whether any setting changed. The
 /// changed zone and limit are validated before anything is written, so a
 /// refused OK leaves the package untouched.
-pub(crate) fn apply_hyphenation(pkg: &mut Package, d: &Dialog) -> Result<bool, String> {
+pub(crate) fn apply_hyphenation(
+    ed: &mut docxcore::editor::Editor,
+    pkg: &mut Package,
+    d: &Dialog,
+) -> Result<bool, String> {
     let zone = if d.changed("zone") {
         let inches: f64 = text_of(d, "zone")
             .parse()
@@ -122,10 +126,14 @@ pub(crate) fn apply_hyphenation(pkg: &mut Package, d: &Dialog) -> Result<bool, S
     };
     let mut changed = false;
     if d.changed("auto") {
-        let before = pkg.has_auto_hyphenation();
-        pkg.set_auto_hyphenation(is_on(d, "auto"));
-        // A settings part docxy cannot edit takes nothing: no false dirty.
-        changed |= pkg.has_auto_hyphenation() != before;
+        let on = is_on(d, "auto");
+        pkg.set_auto_hyphenation(on);
+        // A settings part docxy cannot edit takes nothing: no false dirty,
+        // and the editor's setting stays with the file's. Automatic is an
+        // undo step of the body editor (#1273); the other fields are not.
+        if pkg.has_auto_hyphenation() == on {
+            changed |= ed.set_auto_hyphenation(on);
+        }
     }
     if d.changed("caps") {
         changed |= pkg.set_hyphenate_caps(is_on(d, "caps"));
@@ -267,6 +275,29 @@ mod tests {
         set(&mut t, "limit", s("0"));
         ok(&mut t).unwrap();
         assert_eq!(pkg(&mut t).consecutive_hyphen_limit(), None);
+    }
+
+    /// #1273: Automatic through the dialog is an undo step; the other fields
+    /// are not.
+    #[test]
+    fn automatic_through_the_dialog_is_undoable_1273() {
+        let mut t = three_sections();
+        open(&mut t);
+        set(&mut t, "auto", Json::Bool(true));
+        ok(&mut t).unwrap();
+        assert!(pkg(&mut t).has_auto_hyphenation());
+        let crate::Surface::Doc(ed) = &mut t.surface else {
+            panic!()
+        };
+        assert!(ed.undo());
+        t.set_dirty();
+        assert!(!pkg(&mut t).has_auto_hyphenation());
+        let crate::Surface::Doc(ed) = &mut t.surface else {
+            panic!()
+        };
+        assert!(ed.redo());
+        t.set_dirty();
+        assert!(pkg(&mut t).has_auto_hyphenation());
     }
 
     /// A settings part without a `w:settings` root takes no edit: nothing is

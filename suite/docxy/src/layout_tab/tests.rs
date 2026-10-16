@@ -501,3 +501,87 @@ fn manual_hyphenation_is_enabled() {
     });
     assert!(manual.expect("the item").enabled);
 }
+
+/// The body editor's undo or redo as Ctrl+Z / Ctrl+Y end: the tab turns
+/// dirty, which brings the package's settings in step (#1273).
+fn history(t: &mut DocTab, redo: bool) {
+    let ed = ed_mut(t);
+    assert!(if redo { ed.redo() } else { ed.undo() });
+    t.set_dirty();
+}
+
+fn saved_xml(t: &DocTab) -> String {
+    let bytes = doc_to_docx(&ed(t).doc, &t.comments, t.pkg.as_ref());
+    let pkg = docxcore::package::load_package(&bytes).unwrap();
+    format!(
+        "{}|{}|{}",
+        pkg.has_mirror_margins(),
+        pkg.has_auto_hyphenation(),
+        pkg.has_gutter_at_top()
+    )
+}
+
+/// #1273: Margins > Mirrored is one undo step that takes the margins and
+/// `w:mirrorMargins` back together, and redo brings both back.
+#[test]
+fn mirrored_margins_undo_restores_the_setting_with_the_margins_1273() {
+    let mut t = three_sections();
+    let before = setups(&t);
+    apply(&mut t, LayoutAct::Margins(MarginPreset::Mirrored));
+    assert!(t.pkg.as_ref().unwrap().has_mirror_margins());
+    let mirrored = setups(&t);
+    assert_ne!(mirrored, before);
+    assert_eq!(ed(&t).undo_names(), vec!["Margins"]);
+    history(&mut t, false);
+    assert!(!t.pkg.as_ref().unwrap().has_mirror_margins());
+    assert_eq!(setups(&t), before);
+    assert_eq!(saved_xml(&t), "false|false|false");
+    assert!(!ed_mut(&mut t).undo(), "one step");
+    history(&mut t, true);
+    assert!(t.pkg.as_ref().unwrap().has_mirror_margins());
+    assert_eq!(setups(&t), mirrored);
+    // Normal turns it off again, and undo turns it back on.
+    apply(&mut t, LayoutAct::Margins(MarginPreset::Normal));
+    assert!(!t.pkg.as_ref().unwrap().has_mirror_margins());
+    history(&mut t, false);
+    assert!(t.pkg.as_ref().unwrap().has_mirror_margins());
+    assert_eq!(saved_xml(&t), "true|false|false");
+}
+
+/// #1273: Hyphenation None / Automatic is an undo step; the current choice
+/// adds none and leaves a clean tab clean.
+#[test]
+fn hyphenation_choice_is_an_undo_step_1273() {
+    let mut t = three_sections();
+    t.dirty = false;
+    apply(&mut t, LayoutAct::Hyphen(false));
+    assert!(!t.dirty && ed(&t).undo_names().is_empty());
+    apply(&mut t, LayoutAct::Hyphen(true));
+    assert!(t.pkg.as_ref().unwrap().has_auto_hyphenation());
+    assert_eq!(saved_xml(&t), "false|true|false");
+    history(&mut t, false);
+    assert!(!t.pkg.as_ref().unwrap().has_auto_hyphenation());
+    assert_eq!(saved_xml(&t), "false|false|false");
+    history(&mut t, true);
+    assert!(t.pkg.as_ref().unwrap().has_auto_hyphenation());
+}
+
+/// #1273: a settings part docxy cannot edit takes nothing: Mirrored is
+/// refused before the margins change, and Hyphenation leaves the tab clean.
+#[test]
+fn an_unreadable_settings_part_refuses_the_setting_1273() {
+    let mut t = three_sections();
+    let pkg = t.pkg.as_mut().unwrap();
+    pkg.set_even_odd(true); // creates the part
+    assert!(pkg.set_part(
+        "word/settings.xml",
+        b"<w:settings xmlns:w=\"w\">\xff</w:settings>".to_vec()
+    ));
+    t.dirty = false;
+    let before = setups(&t);
+    assert!(layout_apply(&mut t, LayoutAct::Margins(MarginPreset::Mirrored)).is_err());
+    assert_eq!(setups(&t), before);
+    assert!(layout_apply(&mut t, LayoutAct::Hyphen(true)).is_err());
+    assert!(!t.dirty && ed(&t).undo_names().is_empty());
+    assert!(!ed(&t).settings().mirror_margins && !ed(&t).settings().auto_hyphenation);
+}
