@@ -475,6 +475,10 @@ test sheet name-box: a command gives it the keyboard up
   assert reply.focused is false
   type Hi
   assert comment_edit is Hi
+  call real-key {"key":"escape"}
+  # New Comment left the ribbon on Review; the cases after this one (the Font
+  # boxes) need Home.
+  call ribbon-click {"tab":"Home","command":"Copy"}
 
 test sheet name-box: a comment being typed is kept
   open copy:../fixtures/basic.xlsx
@@ -487,6 +491,8 @@ test sheet name-box: a comment being typed is kept
   call field-read {"input":"name-box"}
   assert reply.focused is true
   call real-key {"key":"escape"}
+  # Back to the Home tab, which the Font cases that follow need.
+  call ribbon-click {"tab":"Home","command":"Copy"}
 
 test sheet name-box: Ctrl+S saves from it
   open copy:../fixtures/basic.xlsx
