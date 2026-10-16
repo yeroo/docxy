@@ -6,6 +6,10 @@
 //!   caret's sections;
 //! - This point forward, a new section from the caret, started by a section
 //!   break (Next Page for Page Setup, Continuous for Columns);
+//! - Selected text, a text selection inside one section (not all of it),
+//!   wrapped in section breaks with only the middle section changed (the same
+//!   start as This point forward); nothing is wrapped when OK changes no
+//!   section setting;
 //! - Whole document, every section.
 //!
 //! OK writes only the fields the person changed since the dialog opened, so
@@ -473,7 +477,11 @@ impl Target {
     fn checked(&self, ed: &Editor) -> Result<Vec<usize>, String> {
         match self {
             Target::Sections(k) => Ok(k.clone()),
-            Target::Forward | Target::Selected => Ok(vec![ed.break_section()?]),
+            Target::Forward => Ok(vec![ed.break_section()?]),
+            Target::Selected => ed
+                .selection_wrap_section()
+                .map(|k| vec![k])
+                .ok_or_else(|| "Selected text needs a text selection inside one section".into()),
         }
     }
 
@@ -487,7 +495,17 @@ impl Target {
         match self {
             Target::Sections(k) => Ok(ed.edit_section_setups(&k, edit)),
             Target::Forward => ed.insert_section_break_with(start, edit).map(|_| true),
-            Target::Selected => ed.wrap_selection_in_section(start, edit).map(|_| true),
+            Target::Selected => {
+                // Nothing the person changed reaches the sectPr: no breaks.
+                let k = ed.selection_wrap_section().ok_or("No selected text")?;
+                let old = ed.sections()[k].clone();
+                let mut setup = SectionSetup::parse(&old);
+                edit(&mut setup);
+                if setup.apply(&old) == old {
+                    return Ok(false);
+                }
+                ed.wrap_selection_in_section(start, edit).map(|_| true)
+            }
         }
     }
 }
@@ -798,8 +816,7 @@ pub(crate) fn columns_dialog(tab: &DocTab) -> Result<Dialog, String> {
 
 /// Apply an accepted Columns dialog: one undo step on the body editor. This
 /// point forward and Selected text start the new section with a Continuous
-/// break. Whether
-/// anything changed.
+/// break. Whether anything changed.
 pub(crate) fn apply_columns(
     ed: &mut Editor,
     pkg: &mut Package,

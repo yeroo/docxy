@@ -1203,7 +1203,6 @@ fn selected_text_is_offered_and_default_for_a_selection_inside_one_section_1272(
         p.props.section_break = None;
     }
     ed.anchor = Some(Caret::top(0, 0));
-    ed.caret = Caret::top(1, 0);
     ed.caret = Caret::top(1, ed.doc.body[1].plain_text().chars().count());
     open(&mut t, PageSetupTab::Margins);
     assert_eq!(shown(&t, "apply"), "Whole document");
@@ -1274,4 +1273,29 @@ fn selected_text_checks_the_section_before_writing_1272() {
     );
     assert!(t.dialogs.is_open());
     assert_eq!(ed(&t).doc, before, "nothing changed");
+}
+
+#[test]
+fn selected_text_without_a_change_wraps_nothing_1272() {
+    let mut t = three_sections();
+    select_in_section_one(&mut t);
+    let before = ed(&t).doc.clone();
+    open(&mut t, PageSetupTab::Margins);
+    ok(&mut t).unwrap();
+    assert!(!t.dialogs.is_open());
+    assert_eq!(ed(&t).doc, before, "no breaks");
+    assert!(!t.dirty);
+    let mut t = three_sections();
+    select_in_section_one(&mut t);
+    open_columns(&mut t);
+    ok(&mut t).unwrap();
+    assert_eq!(ed(&t).doc, before);
+    // A package-only change applies without breaks.
+    let mut t = three_sections();
+    select_in_section_one(&mut t);
+    open(&mut t, PageSetupTab::Margins);
+    set(&mut t, "multiple", s("Mirror margins"));
+    ok(&mut t).unwrap();
+    assert_eq!(ed(&t).doc, before, "no breaks");
+    assert!(t.dirty);
 }

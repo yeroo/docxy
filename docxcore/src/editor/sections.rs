@@ -317,21 +317,35 @@ impl Editor {
         if self.cell_range().is_some() {
             return None;
         }
-        let (lo, hi) = self.selection_range()?;
-        let (&[lb], &[hb]) = (lo.path.as_slice(), hi.path.as_slice()) else {
+        let (mut lo, mut hi) = self.selection_range()?;
+        let (&[mut lb], &[mut hb]) = (lo.path.as_slice(), hi.path.as_slice()) else {
             return None;
         };
         let len = |b: usize| match self.doc.body.get(b) {
             Some(Block::Paragraph(p)) => Some(p.content.iter().map(inline_len).sum::<usize>()),
             _ => None,
         };
+        let is_para = |b: usize| matches!(self.doc.body.get(b), Some(Block::Paragraph(_)));
+        if len(lb)? == lo.offset && lb < hb && is_para(lb + 1) {
+            // From a paragraph's end: the selection starts with its mark, so
+            // the text starts at the next paragraph.
+            lb += 1;
+            lo = Caret::at(vec![lb], 0);
+        }
+        if hi.offset == 0 && hb > lb && is_para(hb - 1) {
+            // To a paragraph's start: the text ends with the previous mark.
+            hb -= 1;
+            hi = Caret::at(vec![hb], len(hb)?);
+        }
         len(lb)?;
         let hlen = len(hb)?;
+        if (hb, hi.offset) <= (lb, lo.offset) {
+            return None;
+        }
         let k = self.section_of_block(lb);
         if self.section_of_block(hb) != k {
             return None;
         }
-        let is_para = |b: usize| matches!(self.doc.body.get(b), Some(Block::Paragraph(_)));
         let lo_cut = if lo.offset > 0 {
             Cut::Mid
         } else if lb == 0 || self.section_of_block(lb - 1) != k {
@@ -351,8 +365,6 @@ impl Editor {
             } else {
                 Cut::Gap(hb)
             }
-        } else if hi.offset == 0 && hb > lb && is_para(hb - 1) {
-            Cut::Gap(hb - 1)
         } else {
             Cut::Mid
         };
@@ -360,6 +372,13 @@ impl Editor {
             return None;
         }
         Some((lo, hi, lo_cut, hi_cut))
+    }
+
+    /// The section [`Editor::wrap_selection_in_section`] edits: the one the
+    /// selected text lies in.
+    pub fn selection_wrap_section(&self) -> Option<usize> {
+        let (lo, ..) = self.selection_cuts()?;
+        lo.path.first().map(|&b| self.section_of_block(b))
     }
 
     /// Whether [`Editor::wrap_selection_in_section`] applies: a text
@@ -707,13 +726,12 @@ mod tests {
     }
 
     fn selected_text(e: &Editor) -> String {
-        let (lo, hi) = e.selection_range().unwrap();
+        assert!(e.has_selection());
         let mut out = Vec::new();
         for (path, a, b) in e.selection_spans() {
             let t = e.doc.body[path[0]].plain_text();
             out.push(t.chars().skip(a).take(b - a).collect::<String>());
         }
-        let _ = (lo, hi);
         out.join("|")
     }
 
@@ -842,6 +860,51 @@ mod tests {
         assert_eq!(selected_text(&e), "gamma");
         assert_eq!(e.sections().len(), 4);
         assert_eq!(margin(&e, 1), 720);
+    }
+
+    #[test]
+    fn a_selection_from_a_paragraph_end_makes_no_empty_paragraph_1272() {
+        let mut e = wrap_doc();
+        select(&mut e, (0, 10), (1, 5)); // "alpha beta" mark, all of "gamma"
+        let n = e.doc.body.len();
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(e.doc.body.len(), n, "no blank half");
+        assert_eq!(texts(&e)[..3], ["alpha beta", "gamma", "delta"]);
+        assert_eq!(margin(&e, 0), SectionSetup::parse(&sect("")).margins.left);
+        assert_eq!(margin(&e, 1), 720);
+        assert_eq!(e.sections().len(), 4);
+        assert_eq!(
+            e.selection_range(),
+            Some((Caret::top(0, 10), Caret::top(1, 5)))
+        );
+        // Only a paragraph mark selected: nothing to wrap.
+        let mut e = wrap_doc();
+        select(&mut e, (0, 10), (1, 0));
+        assert!(!e.selection_section_wrappable());
+    }
+
+    #[test]
+    fn edges_in_the_neighbouring_section_are_taken_into_the_selections_own_1272() {
+        // To the start of the next section's first paragraph ("next").
+        let mut e = wrap_doc();
+        select(&mut e, (3, 2), (4, 0));
+        assert!(e.selection_section_wrappable());
+        assert_eq!(e.selection_wrap_section(), Some(0));
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(texts(&e)[3..6], ["ta", "il", "next"]);
+        assert_eq!(margin(&e, 1), 720);
+        // From the end of the last paragraph of the previous section.
+        let mut e = wrap_doc();
+        select(&mut e, (3, 4), (4, 2)); // "tail" mark, "ne"
+        assert!(e.selection_section_wrappable());
+        assert_eq!(e.selection_wrap_section(), Some(1));
+        e.wrap_selection_in_section(SectionStart::Continuous, |s| s.margins.left = 720)
+            .unwrap();
+        assert_eq!(texts(&e)[4..6], ["ne", "xt"]);
+        assert_eq!(margin(&e, 1), 720);
+        assert_eq!(e.sections().len(), 3);
     }
 
     #[test]
