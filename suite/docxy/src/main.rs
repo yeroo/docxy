@@ -7293,7 +7293,8 @@ fn ruler_drag_result(d: RulerDrag, x: f32) -> RulerDragResult {
 }
 
 /// The Name Box while focused (#1343): a one-line field over a `String`, kept
-/// for the tab and sheet it was opened on (it is closed when either changes).
+/// for the tab and sheet it was opened on (`Docxy::name_box_live` treats it as
+/// closed once either changes).
 struct NameBoxEdit {
     text: String,
     caret: usize,
@@ -15647,6 +15648,7 @@ impl Docxy {
     /// one changed.
     fn grid_press_cell(&mut self, cell: (u32, u32), ctrl: bool, _cx: &mut Context<Self>) {
         self.sheet_comment_bar_leave();
+        self.name_box = None;
         self.drag_ctrl = ctrl;
         if self.formula_pick_active() {
             // Anchor the reference on the pressed cell, with the buffer as it
@@ -15685,6 +15687,7 @@ impl Docxy {
         // too (a no-op when the press already closed it). A drag fires no
         // click: there the press's leave is the only one.
         self.sheet_comment_bar_leave();
+        self.name_box = None;
         if shift {
             self.extend_to(r, c, cx)
         } else if ctrl && !self.formula_pick_active() && !self.range_field_active() {
@@ -15736,6 +15739,7 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) {
         self.sheet_comment_bar_leave();
+        self.name_box = None;
         let inside = self.active_sheet().is_some_and(|v| {
             let (r1, c1, r2, c2) = sel_range(v.sel, v.anchor);
             (r1..=r2).contains(&r) && (c1..=c2).contains(&c)
@@ -17110,7 +17114,7 @@ impl Docxy {
 
     /// Whether a text entry the active surface draws takes the keyboard: the
     /// find or comment bar where it is shown, a Project entry, or a sheet's
-    /// cell, rename, comment, range, rule or row-height entry. F1 leaves these
+    /// cell, Name Box, rename, comment, range, rule or row-height entry. F1 leaves these
     /// alone (#1021).
     fn entry_owns_keys(&self) -> bool {
         let doc = self.active_is_doc();
@@ -17401,7 +17405,7 @@ impl Docxy {
     }
 
     /// Whether a sheet bar takes the keys, Ctrl+Z and Ctrl+Y among them, so
-    /// they never reach the history: the sheet-tab rename, the comment,
+    /// they never reach the history: the sheet-tab rename, the Name Box, the comment,
     /// conditional-format (unless its range field has the focus) and
     /// row-height bars, and Find (see `sheet_key`). They hold sheet indices
     /// and cells an undo would move under them, so the QAT buttons and the
@@ -18909,6 +18913,10 @@ impl Docxy {
     /// Focus the Name Box with its reference selected (a click). Ignored while
     /// a cell entry is open, where a click is not a goto.
     fn name_box_open(&mut self, cx: &mut Context<Self>) {
+        // A click in the box it already has places nothing new: keep the edit.
+        if self.name_box_live() {
+            return;
+        }
         let (Some(tab), Some(v)) = (self.active_tab_id(), self.active_sheet()) else {
             return;
         };
@@ -18917,6 +18925,10 @@ impl Docxy {
         }
         let text = name_box_text(v);
         let (caret, sheet) = (text.chars().count(), v.active);
+        // One entry holds the keyboard: the Find bar, a sheet-tab rename and
+        // the other bars give it up, as they do for a cell entry.
+        self.typing_bars_close();
+        self.sheet_rename = None;
         self.range_edit = None;
         self.chart_hand_back(cx);
         self.name_box = Some(NameBoxEdit {
@@ -18940,12 +18952,19 @@ impl Docxy {
         }
         // A goto moves the selection: a press on the cells like any arrow key.
         self.chart_hand_back(cx);
+        let before = self.active_sheet().map(|v| v.active);
         let went = match self.active_sheet_mut() {
             Some(v) => sheet_goto::go_to_reference(v, &text),
             None => Err(sheet_goto::BAD_REFERENCE),
         };
         match went {
-            Ok(()) => self.name_box = None,
+            Ok(()) => {
+                self.name_box = None;
+                // Another sheet: everything that points into the old grid goes.
+                if self.active_sheet().map(|v| v.active) != before {
+                    self.drop_grid_state();
+                }
+            }
             Err(why) => self.set_status(why),
         }
     }
@@ -20728,8 +20747,8 @@ impl Docxy {
             return;
         }
         // Protected View (#610): only keys that look, move or copy reach the
-        // workbook. The find bar still takes typing; its Replace is refused
-        // where it would write.
+        // workbook. The find bar and the Name Box (a goto writes nothing) still
+        // take typing; the bar's Replace is refused where it would write.
         if self.active_locked()
             && !self.find_open
             && !self.name_box_live()
@@ -24360,7 +24379,7 @@ impl Docxy {
             cx.notify();
             return;
         }
-        if self.keytips != KeyTip::Off || self.comment_open {
+        if self.keytips != KeyTip::Off || self.comment_open || self.name_box_live() {
             return;
         }
         self.mini_bar = None;
@@ -24531,7 +24550,7 @@ impl Docxy {
         }
         // The highlighting mode (#623) and the table pens (#763) end on Esc,
         // which they consume, and on any other key but a bare modifier.
-        // KeyTips, the find bar and the comment bar take their keys (Esc
+        // KeyTips, the find bar, the Name Box and the comment bar take their keys (Esc
         // included) first; the KeyTips' Alt leaves the modes be.
         let hl_key = ev.keystroke.key.as_str();
         if (self.hl_mode.is_some() || self.table_draw.is_some())
@@ -38010,6 +38029,20 @@ impl Render for Docxy {
             .relative()
             .track_focus(&self.focus)
             .key_routing(&self.focus, cx)
+            // A press anywhere but in the Name Box takes the keyboard from it
+            // (#1343): the ribbon, the headers, the sheet tabs and the rest stop
+            // their events below, so it is asked while the press is captured.
+            .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                let inside = this
+                    .probes
+                    .borrow()
+                    .current("name-box")
+                    .is_some_and(|b| b.contains(&ev.position));
+                if this.name_box.is_some() && !inside {
+                    this.name_box = None;
+                    cx.notify();
+                }
+            }))
             .child(gesture_listeners)
             // Ruler drags are tracked at the window level so they keep working when
             // the pointer leaves the thin ruler strip (gpui move events are

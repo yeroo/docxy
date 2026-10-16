@@ -294,12 +294,9 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
             let Surface::Sheet(v) = &mut tab.surface else {
                 return Some(Err("Go To needs a spreadsheet".into()));
             };
-            let Some((sheet, rect)) =
-                gridcore::edit::resolve_reference(&v.pkg.workbook, v.active, &target)
-            else {
-                return Some(Err(BAD_REFERENCE.into()));
-            };
-            go_to(v, sheet, rect);
+            if let Err(why) = go_to_reference(v, &target) {
+                return Some(Err(why.into()));
+            }
             tab.dialogs.pop();
             Some(Ok(()))
         }

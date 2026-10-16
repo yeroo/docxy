@@ -395,6 +395,61 @@ test sheet name-box: Escape cancels
   assert reply.focused is false
   assert reply.value is E1
 
+test sheet name-box: a click on a cell leaves it
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"name-box"}
+  call field-read {"input":"name-box"}
+  assert reply.focused is true
+  click C3
+  call field-read {"input":"name-box"}
+  assert reply.focused is false
+  assert reply.value is C3
+  call real-type {"text":"Q"}
+  assert editing is true
+  call real-key {"key":"escape"}
+  assert cell E1 is empty
+
+test sheet name-box: Tab stays in it
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"name-box"}
+  call real-key {"key":"tab"}
+  assert sel is E1
+  call field-read {"input":"name-box"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet name-box: takes the focus from the Find bar
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  call pointer-click {"input":"sheet-find"}
+  call field-read {"input":"sheet-find"}
+  assert reply.focused is true
+  call pointer-click {"input":"name-box"}
+  call field-read {"input":"sheet-find"}
+  assert reply.focused is false
+  call field-read {"input":"name-box"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test sheet name-box: Enter on a bad reference keeps it
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"name-box"}
+  call real-type {"text":"Nowhere!A1"}
+  call real-key {"key":"enter"}
+  call field-read {"input":"name-box"}
+  assert reply.focused is true
+  assert reply.value is exactly "Nowhere!A1"
+  assert sel is E1
+  call real-key {"key":"escape"}
+
 # ---- The Find bar (Ctrl+F): Find what and Replace with. Tab moves between
 # them; Enter finds the next match from either, Escape closes the bar;
 # its Replace and All buttons also have Alt+R and Alt+A (#1342).
