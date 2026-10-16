@@ -18,6 +18,13 @@ workspace = true
 [dependencies]
 # Intentionally std-only — the one dependency is our own shared OPC/XML layer.
 opccore = { version = "0.1.0", path = "../opccore" }
+# Only for the `plugins` feature, which the native hosts enable; the default
+# build (and every wasm build) stays dependency-free.
+libloading = { version = "0.8", optional = true }
+
+[features]
+# `formats::plugin`: load `yppx_*` format plugins (shared libraries) at runtime.
+plugins = ["dep:libloading"]
 
 [[example]]
 name = "convert"

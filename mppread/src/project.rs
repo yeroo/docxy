@@ -497,11 +497,55 @@ fn link_resource_calendars(resources: &mut [projcore::Resource], links: &[(i32, 
     }
 }
 
+/// The `.mpp` import as a [`projcore::formats::ProjectFormat`]: it reads
+/// with [`project_from_mpp`] and does not write. Hosts register it after the
+/// built-ins, so a format plugin that reads `.mpp`, registered later,
+/// replaces it, and one that only writes `.mpp` leaves it the reader.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MppImport;
+
+impl projcore::formats::ProjectFormat for MppImport {
+    fn extensions(&self) -> &[&str] {
+        &["mpp"]
+    }
+    fn label(&self) -> &str {
+        "Microsoft Project"
+    }
+    fn reads(&self) -> bool {
+        true
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    fn read(&self, bytes: &[u8]) -> Result<Project, String> {
+        project_from_mpp(bytes)
+    }
+    fn write(&self, _project: &Project, _source: Option<&[u8]>) -> Result<Vec<u8>, String> {
+        Err("a .mpp file can be imported, not written".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use crate::cfb::{Node, write_cfb_tree};
+
+    #[test]
+    fn the_import_registers_as_a_read_only_format() {
+        use projcore::formats::{ProjectFormat, Registry};
+        let mut registry = Registry::new();
+        registry.register(Box::new(MppImport));
+        assert_eq!(registry.open_extensions(), ["yppx", "xml", "mpp"]);
+        assert_eq!(registry.save_extensions(), ["yppx", "xml"]);
+        assert!(registry.writer("mpp").is_none());
+        let path = std::path::Path::new("plan.MPP");
+        assert_eq!(
+            registry.read(path, b"not a compound file").unwrap_err(),
+            project_from_mpp(b"not a compound file").unwrap_err()
+        );
+        assert!(MppImport.write(&Project::default(), None).is_err());
+    }
 
     #[test]
     fn unsupported_resource_layout_keeps_task_only_import() {

@@ -8,12 +8,17 @@
 //! - [`assign`] — assignment dates and costs, refreshed after an edit.
 //! - [`editor`] — shared editing, selection, undo/redo and live scheduling.
 //! - [`datetime`] — a `std`-only civil wall-clock instant.
+//! - [`formats`] — the file formats a host opens and saves (`.yppx`, `.xml`,
+//!   and what it registers), and, behind the `plugins` feature, the loader of
+//!   format plugins.
 //! - [`model`] — the pure domain model (tasks, links, resources, calendars).
 //! - [`mspdi`] — reader for MS Project's documented open XML interchange
 //!   format, the interop bridge that avoids the undocumented binary `.mpp`.
 //! - [`schedule`] — the Critical Path Method engine (forward/backward passes
 //!   over working-time calendars).
 //! - [`gantt`] — export a scheduled project as a Markdown/Mermaid Gantt chart.
+//! - [`plugin_abi`] — the C ABI a format plugin implements (MSPDI XML text
+//!   across the boundary).
 //! - [`report`] — Project's View Reports (Project Overview, Late Tasks, …) as
 //!   Markdown.
 //! - [`text`] — text conventions shared by the readers (newlines in notes).
@@ -23,9 +28,11 @@
 pub mod assign;
 pub mod datetime;
 pub mod editor;
+pub mod formats;
 pub mod gantt;
 pub mod model;
 pub mod mspdi;
+pub mod plugin_abi;
 pub mod report;
 pub mod schedule;
 pub mod text;

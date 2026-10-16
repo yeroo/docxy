@@ -400,11 +400,10 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 // Shared host helpers (used by every editor that grows a control surface)
 // ---------------------------------------------------------------------------
 
-/// The directory where `app` publishes its control discovery files, alongside
-/// its other config: `<config>/<app>/ctl` (`%APPDATA%` on Windows, else
-/// `$XDG_CONFIG_HOME` / `~/.config`). An agent reads `<dir>/<instance>.json` to
-/// find the port + token.
-pub fn config_ctl_dir(app: &str) -> Option<PathBuf> {
+/// `app`'s config directory: `<config>/<app>` (`%APPDATA%` on Windows, else
+/// `$XDG_CONFIG_HOME` / `~/.config`). Its control discovery files
+/// ([`config_ctl_dir`]) and, for yppxy, its format plugins live under it.
+pub fn config_app_dir(app: &str) -> Option<PathBuf> {
     let base = if cfg!(windows) {
         std::env::var_os("APPDATA").map(PathBuf::from)
     } else {
@@ -412,7 +411,14 @@ pub fn config_ctl_dir(app: &str) -> Option<PathBuf> {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
     }?;
-    Some(base.join(app).join("ctl"))
+    Some(base.join(app))
+}
+
+/// The directory where `app` publishes its control discovery files, alongside
+/// its other config: `<config>/<app>/ctl` (see [`config_app_dir`]). An agent
+/// reads `<dir>/<instance>.json` to find the port + token.
+pub fn config_ctl_dir(app: &str) -> Option<PathBuf> {
+    Some(config_app_dir(app)?.join("ctl"))
 }
 
 /// This editor's control instance name. Inside an agwinterm pane it is

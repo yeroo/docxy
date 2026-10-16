@@ -1099,3 +1099,31 @@ reschedule the plan (CPM) live. MCP: `claude mcp add yppxy -- yppxy --mcp` →
 Everything else — discovery, the wire protocol, tokens, `target`
 disambiguation, the status-dot flash on agent edits — works identically across
 the three.
+
+## Format plugins (yppxy)
+
+`yppxy` can open and save more project file types through **format plugins**:
+shared libraries named `yppx_*.dll` / `yppx_*.so` / `yppx_*.dylib`, loaded once
+at start from `<config>/yppxy/plugins` (`%APPDATA%\yppxy\plugins` on Windows,
+else `$XDG_CONFIG_HOME/yppxy/plugins` or `~/.config/yppxy/plugins`: the
+directory beside `ctl/`) and then from `$YPPX_PLUGIN_DIR` when set. No plugin
+ships with docxy, and with none every verb behaves as described above. The desktop
+suite does not load them yet.
+
+- `proj.save {"path"}` (and `yppxy_save`) accepts any extension a loaded
+  plugin writes, besides `.yppx`/`.xml`; an unwritable extension is refused
+  with a message that lists the writable ones. Headless,
+  `yppxy plan.xml --save out.<ext>` does the same.
+- `proj.open` / `proj.reload` read a plugin's types through the plugin. A file
+  of a type a plugin also writes is not an import: its status line is
+  `Opened <path> — N tasks` (no "imported"), and `proj.save` without a path
+  writes it back in place, handing the plugin the bytes of the file the plan
+  was opened from so it can keep what yppxy does not model.
+- A plugin that does not load is skipped: headless runs print
+  `yppxy: plugin not loaded: <file>: <why>` on stderr, the editor shows the
+  first such message on its status line.
+
+The ABI (C, MSPDI XML text across the boundary) is `projcore::plugin_abi`;
+the loader is `projcore::formats::plugin` (cargo feature `plugins`). See
+[PROJECT.md](../PROJECT.md#format-plugins) for the registry and the test
+fixture plugin.

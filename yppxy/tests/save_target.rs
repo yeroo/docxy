@@ -1,16 +1,23 @@
 use std::path::Path;
 use std::process::Command;
 
+/// yppxy with no format plugins, whatever is installed: the refusals these
+/// tests pin are the built-in ones.
+fn yppxy() -> Command {
+    let no_config = std::env::temp_dir().join("yppxy-tests-no-config");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_yppxy"));
+    cmd.env("APPDATA", &no_config)
+        .env("XDG_CONFIG_HOME", &no_config)
+        .env_remove("YPPX_PLUGIN_DIR");
+    cmd
+}
+
 #[test]
 fn headless_save_adds_native_extension_and_refuses_mpp() {
     let dir = std::env::temp_dir().join(format!("yppxy-cli-save-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let target = dir.join("plan");
-    let result = Command::new(env!("CARGO_BIN_EXE_yppxy"))
-        .arg("--save")
-        .arg(&target)
-        .output()
-        .unwrap();
+    let result = yppxy().arg("--save").arg(&target).output().unwrap();
     assert!(
         result.status.success(),
         "{}",
@@ -21,11 +28,7 @@ fn headless_save_adds_native_extension_and_refuses_mpp() {
     assert!(!target.exists());
     let binary = dir.join("plan.mpp");
     std::fs::write(&binary, b"original binary schedule").unwrap();
-    let result = Command::new(env!("CARGO_BIN_EXE_yppxy"))
-        .arg("--save")
-        .arg(&binary)
-        .output()
-        .unwrap();
+    let result = yppxy().arg("--save").arg(&binary).output().unwrap();
     assert!(!result.status.success());
     assert!(
         String::from_utf8_lossy(&result.stderr).contains("Project schedules can only be saved")
@@ -39,7 +42,7 @@ fn headless_save_adds_native_extension_and_refuses_mpp() {
 const SAVE_FORMAT_ERROR: &str = "Project schedules can only be saved as .yppx or .xml (MSPDI)";
 
 fn yppxy_save(input: Option<&Path>, target: &Path) -> std::process::Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_yppxy"));
+    let mut cmd = yppxy();
     if let Some(input) = input {
         cmd.arg(input);
     }
@@ -159,7 +162,7 @@ fn headless_gantt_md_and_save_together_are_refused() {
     std::fs::create_dir_all(&dir).unwrap();
     let gantt = dir.join("g.md");
     let target = dir.join("out.yppx");
-    let result = Command::new(env!("CARGO_BIN_EXE_yppxy"))
+    let result = yppxy()
         .arg("--gantt-md")
         .arg(&gantt)
         .arg("--save")
@@ -408,10 +411,7 @@ fn a_new_plan_is_named_project1() {
     let dir = std::env::temp_dir().join(format!("yppxy-cli-new-name-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let run = |args: &[&Path]| {
-        let result = Command::new(env!("CARGO_BIN_EXE_yppxy"))
-            .args(args)
-            .output()
-            .unwrap();
+        let result = yppxy().args(args).output().unwrap();
         assert!(
             result.status.success(),
             "{}",

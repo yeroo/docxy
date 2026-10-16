@@ -29,7 +29,7 @@ projctl = { version = "0.1.0", path = "../projctl" }
 # live schedule from a sibling agwinterm pane.
 ctlcore = { version = "0.5.0", path = "../ctlcore" }
 # Path + version so `yppxy` can be published once `projcore` is on crates.io.
-projcore = { version = "0.1.0", path = "../projcore" }
+projcore = { version = "0.1.0", path = "../projcore", features = ["plugins"] }
 # Reads the OLE2 container of legacy binary .mpp files (metadata for now).
 mppread = { version = "0.1.0", path = "../mppread" }
 # ratatui re-exports crossterm, so we don't depend on crossterm separately.
