@@ -578,7 +578,25 @@ fn read_doc(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
                 (&app.replace_text, crate::FindField::Replace)
             };
             let focused = app.find_open && !app.comment_open && app.find_field == field;
-            (Json::Str(text.clone()), focused, end_if(text, focused))
+            let (caret, sel) = app.sf_state(field);
+            let len = text.chars().count();
+            let selection = if focused && sel && len > 0 {
+                Json::Arr(vec![Json::Num(0.0), Json::Num(len as f64)])
+            } else {
+                Json::Null
+            };
+            let caret = if focused {
+                Json::Num(caret as f64)
+            } else {
+                Json::Null
+            };
+            return Ok(field_json(
+                i.id,
+                Json::Str(text.clone()),
+                focused,
+                caret,
+                selection,
+            ));
         }
         "doc-font" | "doc-font-size" => {
             let cmd = if i.id == "doc-font" {

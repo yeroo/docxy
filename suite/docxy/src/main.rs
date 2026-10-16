@@ -5271,8 +5271,8 @@ struct Docxy {
     find_query: String,
     replace_text: String,
     find_field: FindField,
-    /// The sheet Find bar's caret and whole-field selection per field
-    /// ([`FindField::idx`]); the doc bar keeps appending (#1342).
+    /// The Find bar's caret and whole-field selection per field
+    /// ([`FindField::idx`]), for the sheet bar (#1342) and the document bar (#1360).
     sf_caret: [usize; 2],
     sf_sel: [bool; 2],
     /// The text length each caret was kept for: another path (the doc bar,
@@ -19289,6 +19289,36 @@ impl Docxy {
     }
 
     /// Route a keystroke to the open find bar (query / replace fields).
+    /// A Ctrl chord in a Find bar field: A selects the field, C and X copy it,
+    /// V pastes one line. Any other chord is not text and does nothing.
+    fn sf_chord(&mut self, key: &str, cx: &mut Context<Self>) {
+        use field_edit::Op;
+        let f = self.find_field;
+        match key {
+            "a" => self.sf_edit(Op::SelectAll),
+            "c" | "x" => {
+                let text = self.sf_text(f).clone();
+                if self.sf_state(f).1 && !text.is_empty() {
+                    self.clipboard_write(text.clone(), cx);
+                    self.office_clip.push(&text);
+                    if key == "x" {
+                        self.sf_edit(Op::Delete);
+                    }
+                }
+            }
+            "v" => {
+                // A one-line field: line breaks drop out; no text pastes nothing.
+                if let ClipRead::Text(text) = self.clipboard_read(cx) {
+                    let line: String = text.chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
+                    if !line.is_empty() {
+                        self.sf_edit(Op::Insert(&line));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn sheet_find_key(
         &mut self,
         ev: &KeyDownEvent,
@@ -19299,7 +19329,6 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) {
         use field_edit::Op;
-        let f = self.find_field;
         // Replace and Replace All have keys, as Excel's Alt+R / Alt+A (#1342).
         if let Some(all) = field_edit::alt_replace(
             key,
@@ -19317,32 +19346,10 @@ impl Docxy {
         }
         // Ctrl+Alt is AltGr on Windows: its keys are text, not chords.
         if ctrl && !alt {
-            match key {
-                "a" => self.sf_edit(Op::SelectAll),
-                "c" | "x" => {
-                    let text = self.sf_text(f).clone();
-                    if self.sf_state(f).1 && !text.is_empty() {
-                        self.clipboard_write(text.clone(), cx);
-                        self.office_clip.push(&text);
-                        if key == "x" {
-                            self.sf_edit(Op::Delete);
-                        }
-                    }
-                }
-                "v" => {
-                    // A one-line field: line breaks drop out; no text pastes nothing.
-                    if let ClipRead::Text(text) = self.clipboard_read(cx) {
-                        let line: String =
-                            text.chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
-                        if !line.is_empty() {
-                            self.sf_edit(Op::Insert(&line));
-                        }
-                    }
-                }
-                "enter" => return self.sheet_find_next(shift, cx),
-                // Any other chord is not text.
-                _ => {}
+            if key == "enter" {
+                return self.sheet_find_next(shift, cx);
             }
+            self.sf_chord(key, cx);
             cx.notify();
             return;
         }
@@ -24405,10 +24412,13 @@ impl Docxy {
         &mut self,
         ev: &KeyDownEvent,
         shift: bool,
+        ctrl: bool,
+        alt: bool,
         key: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        use field_edit::Op;
         match key {
             "escape" => return self.toggle_find(window, cx),
             "enter" => {
@@ -24422,43 +24432,45 @@ impl Docxy {
             // Tab is swallowed by gpui's focus traversal, so also accept Up/Down to
             // move between the Find and Replace fields (Tab still works if delivered).
             "tab" | "down" | "up" => {
-                self.find_field = match (self.find_field, key) {
+                let to = match (self.find_field, key) {
                     (FindField::Query, "up") => FindField::Query,
                     (FindField::Replace, "down") => FindField::Replace,
                     (FindField::Query, _) => FindField::Replace,
                     (FindField::Replace, _) => FindField::Query,
                 };
+                self.sf_focus(to);
                 cx.notify();
-                return;
-            }
-            "backspace" => {
-                let f = self.find_field;
-                let field = if f == FindField::Query {
-                    &mut self.find_query
-                } else {
-                    &mut self.replace_text
-                };
-                field.pop();
-                if f == FindField::Query {
-                    self.find_step(false, true, cx);
-                } else {
-                    cx.notify();
-                }
                 return;
             }
             _ => {}
         }
-        if let Some(c) = ev.keystroke.key_char.as_deref() {
-            if !c.is_empty() && !c.chars().next().unwrap().is_control() {
-                let f = self.find_field;
-                if f == FindField::Query {
-                    self.find_query.push_str(c);
-                    self.find_step(false, true, cx);
-                } else {
-                    self.replace_text.push_str(c);
-                    cx.notify();
+        let f = self.find_field;
+        let before = self.sf_text(f).clone();
+        // Ctrl+Alt is AltGr on Windows: its keys are text, not chords.
+        if ctrl && !alt {
+            self.sf_chord(key, cx);
+        } else {
+            match key {
+                "backspace" => self.sf_edit(Op::Backspace),
+                "delete" => self.sf_edit(Op::Delete),
+                "left" => self.sf_edit(Op::Left),
+                "right" => self.sf_edit(Op::Right),
+                "home" => self.sf_edit(Op::Home),
+                "end" => self.sf_edit(Op::End),
+                _ => {
+                    if let Some(c) = ev.keystroke.key_char.as_deref() {
+                        if !c.is_empty() && !c.chars().next().unwrap().is_control() {
+                            self.sf_edit(Op::Insert(c));
+                        }
+                    }
                 }
             }
+        }
+        // Typing finds as it goes: only an edit that changed the query re-searches.
+        if f == FindField::Query && *self.sf_text(f) != before {
+            self.find_step(false, true, cx);
+        } else {
+            cx.notify();
         }
     }
 
@@ -24475,7 +24487,13 @@ impl Docxy {
 
         // Each field and the Replace and All buttons are probed under their
         // own ids, where the harness's `pointer-click` finds them (#1201).
-        let field = |id: &'static str, label: &'static str, text: &str, active: bool| {
+        let field = |id: &'static str,
+                     label: &'static str,
+                     text: &str,
+                     caret: usize,
+                     sel: bool,
+                     active: bool| {
+            let at = char_to_byte(text, caret);
             h_flex()
                 .id(id)
                 .relative()
@@ -24492,11 +24510,15 @@ impl Docxy {
                 .child(div().text_size(px(10.)).text_color(pal.dim).child(label))
                 .child(
                     div()
+                        .flex()
+                        .items_center()
                         .text_size(px(13.))
                         .text_color(pal.fg)
-                        .child(SharedString::from(text.to_string())),
+                        .when(sel, |d| d.bg(hsla_u(BRAND).opacity(0.25)))
+                        .child(SharedString::from(text[..at].to_string()))
+                        .when(active, |d| d.child(caret_bar()))
+                        .child(SharedString::from(text[at..].to_string())),
                 )
-                .when(active, |d| d.child(caret_bar()))
         };
 
         let icon_btn = |id: &'static str, glyph: &'static str, on: bool| {
@@ -24548,12 +24570,14 @@ impl Docxy {
                     "df-q",
                     "Find",
                     &self.find_query,
+                    self.sf_state(FindField::Query).0,
+                    self.sf_state(FindField::Query).1,
                     self.find_field == FindField::Query,
                 )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
-                        this.find_field = FindField::Query;
+                        this.sf_focus(FindField::Query);
                         cx.notify();
                     }),
                 ),
@@ -24579,12 +24603,14 @@ impl Docxy {
                     "df-r",
                     "Replace",
                     &self.replace_text,
+                    self.sf_state(FindField::Replace).0,
+                    self.sf_state(FindField::Replace).1,
                     self.find_field == FindField::Replace,
                 )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
-                        this.find_field = FindField::Replace;
+                        this.sf_focus(FindField::Replace);
                         cx.notify();
                     }),
                 ),
@@ -24988,7 +25014,7 @@ impl Docxy {
             return self.comment_key(ev, key.as_str(), window, cx);
         }
         if self.find_open {
-            return self.find_key(ev, shift, key.as_str(), window, cx);
+            return self.find_key(ev, shift, ctrl, m.alt, key.as_str(), window, cx);
         }
         // Ctrl+Alt+V: Paste Special… (#753), not the Ctrl+V below.
         if ctrl && m.alt && key == "v" {
