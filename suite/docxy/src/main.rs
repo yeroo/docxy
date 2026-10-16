@@ -19285,8 +19285,10 @@ impl Docxy {
     }
 
     /// Enter in a document's font box (#1361): the typed font or size goes to
-    /// the selection (or the caret's format) as one undo step, and the
-    /// document has the keyboard back. A bad size keeps the box open.
+    /// the selection as one undo step, and the document has the keyboard
+    /// back. A bad size keeps the box open. A caret alone has no run to
+    /// format (the editor keeps no pending font or size), so it changes
+    /// nothing and says so.
     fn font_box_enter_doc(
         &mut self,
         which: FontBox,
@@ -19296,23 +19298,31 @@ impl Docxy {
     ) {
         // Protected View hides the ribbon body, so the box cannot be open
         // there; `with_editor` refuses it all the same.
-        match which {
-            FontBox::Name => {
-                let name = font_box::clamp_name(text);
-                self.font_box = None;
-                self.with_editor(window, cx, |e| e.one_step("Font", |e| e.set_font(&name)));
-            }
+        let half_pts = match which {
+            FontBox::Name => None,
             FontBox::Size => {
                 let Some(half_pts) = font_box::parse_doc_size(text) else {
                     self.set_status("Font size: type a number from 1 to 1638");
                     cx.notify();
                     return;
                 };
-                self.font_box = None;
-                self.with_editor(window, cx, |e| {
-                    e.one_step("Font Size", |e| e.set_font_size(half_pts))
-                });
+                Some(half_pts)
             }
+        };
+        self.font_box = None;
+        if !self.edit_target().is_some_and(|e| e.has_selection()) {
+            self.set_status("Select text first, then set its font or size");
+            self.refocus(window, cx);
+            return cx.notify();
+        }
+        match half_pts {
+            None => {
+                let name = font_box::clamp_name(text);
+                self.with_editor(window, cx, |e| e.one_step("Font", |e| e.set_font(&name)));
+            }
+            Some(half_pts) => self.with_editor(window, cx, |e| {
+                e.one_step("Font Size", |e| e.set_font_size(half_pts))
+            }),
         }
         self.refocus(window, cx);
         cx.notify();
@@ -19333,8 +19343,9 @@ impl Docxy {
             return;
         };
         let edit = |fb: &mut FontBoxEdit, op: Op| {
-            fb.edited |= matches!(op, Op::Insert(_) | Op::Backspace | Op::Delete);
-            field_edit::apply(&mut fb.text, &mut fb.caret, &mut fb.sel, op)
+            let before = fb.text.clone();
+            field_edit::apply(&mut fb.text, &mut fb.caret, &mut fb.sel, op);
+            fb.edited |= fb.text != before;
         };
         // Ctrl+Alt is AltGr on Windows: its keys are text, not chords.
         if ctrl && !alt {
@@ -35578,14 +35589,7 @@ impl Docxy {
             .on_click(cx.listener(move |this, _, window, cx| match which {
                 // A click focuses the field where it stands: `dispatch` would
                 // close the ribbon flyout the box is drawn in (#1361).
-                Some(w) => {
-                    this.close_menu();
-                    this.doc_preview = None;
-                    this.cancel_pointer_modes();
-                    this.picker = None;
-                    this.font_box_open(w, cx);
-                    this.focus.focus(window, cx);
-                }
+                Some(_) => this.dispatch_act(act, window, cx),
                 None => this.dispatch(act, window, cx),
             }))
             .into_any_element()

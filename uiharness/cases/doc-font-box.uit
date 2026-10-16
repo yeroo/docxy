@@ -156,3 +156,30 @@ test document font box: a box in a collapsed group's flyout takes the keys
   call real-key {"key":"enter"}
   assert run.font is Arial
   call window-size {"w":1400,"h":800}
+
+test document font box: Enter with only a caret changes nothing and says so
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":3,"end":3}
+  call pointer-click {"input":"doc-font-size"}
+  call real-type {"text":"14"}
+  call real-key {"key":"enter"}
+  assert dirty is false
+  assert status is Select text first, then set its font or size
+  call field-read {"input":"doc-font-size"}
+  assert reply.focused is false
+
+test document font box: a key that changes nothing is not an edit
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font-size"}
+  call real-key {"key":"end"}
+  call real-key {"key":"delete"}
+  call real-key {"key":"enter"}
+  assert dirty is false
+  call pointer-click {"input":"doc-font"}
+  call real-key {"key":"home"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"enter"}
+  assert dirty is false

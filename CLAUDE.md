@@ -272,8 +272,10 @@
   Find and a new comment close it too.
 - Enter sets `set_font` (name cut to 31 characters) or `set_font_size`
   (`font_box::parse_doc_size`: 1 to 1638 pt, rounded to a half point; a bad one
-  keeps the box and says so), as one undo step, and the document gets the
-  keyboard back, as it does on Escape. Enter on a box nothing was typed in (`edited`
+  keeps the box and says so), on the selection as one undo step (a bare caret has no run to format and
+  the editor keeps no pending font or size: the box closes and the status says
+  to select text), and the document gets the keyboard back, as it does on
+  Escape. Enter on a box nothing was typed in (`edited`
   false: the fill is the caret run's direct font or size, Calibri / 11 when it has
   none) is Escape too, so it never writes a style's size or a theme font as
   direct formatting; typing the value shown is an edit and applies. The old chip strips (`PickKind::FontName`
