@@ -391,10 +391,24 @@ task GUIDs (in Fixed2Data) no longer matched its endpoints. The MPP9
 a duplicate predecessor before. The reader takes kind 0, skips kind 2 and
 refuses other kinds; skips a blank record (both endpoint UIDs 0) wherever it
 is; and refuses a record with exactly one endpoint UID 0, the project summary.
-A hand-built table with no FixedMeta has every record read. The same plan's
-`TBkndAssn` shows the deleted-row pattern too (a count of 37 under 39 entries,
-two unindexed 110-byte records between live ones), which the assignment reader
-still refuses as a FixedMeta count mismatch.
+A hand-built table with no FixedMeta has every record read.
+
+Deleted resource, assignment and calendar rows follow the same pattern. The
+same plan's `TBkndAssn` has a count of 37 under 39 entries (the two past the
+count repeat the last two live offsets) and two 110-byte records no counted
+entry names between live ones, and its 53-byte `Fixed2Meta` entries carry the
+same stale tail. The table readers (`TBkndRsc`, `TBkndAssn`, `TBkndCal` and
+the over-allocation and IsPublished readers beside them) read only the first
+`count` entries: kind 0 a row, kind 2 a superseded row, kind 4 a 16-byte stub
+or blank row. Between a record and the next counted offset (or the end of
+FixedData) only whole rows of the table's length may lie (110 bytes for
+assignments, 172 for resources, 12 for calendars), and they are skipped.
+Other spacing, offsets out of order or past FixedData, and a count above the
+entries are refused as before; for `TBkndRsc` and `TBkndAssn` a spacing or
+kind this layout does not explain is still read as an unvalidated layout.
+With them the plan imports 31 tasks, 21 links, 8 resources and 37
+assignments, the same as the other save field for field apart from GUIDs;
+the 136 other local files import exactly as before.
 
 Task mode is decoded for the newest layout. The manual flag is bit `0x80` of
 byte 8 of the task's `Fixed2Meta` entry, and a manual task's start, finish and

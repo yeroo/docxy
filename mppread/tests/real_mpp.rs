@@ -402,12 +402,11 @@ fn resource_calendars_survive_mpp_saves_when_present() {
 }
 
 /// A plan of your own that stays outside the repo: `MPPREAD_LOCAL_FILE`
-/// names one or more `.mpp` files, joined like `PATH`. Each task table must
-/// decode, its links included, and the counts are reported. The full import
-/// is reported, not asserted: a table outside the task reader can still
-/// refuse a plan. Skips when the variable is unset or a file is absent.
+/// names one or more `.mpp` files, joined like `PATH`. Each must import, and
+/// its counts are reported. Skips when the variable is unset or a file is
+/// absent.
 #[test]
-fn local_file_task_table_decodes_when_given() {
+fn local_file_imports_when_given() {
     let Some(files) = std::env::var_os("MPPREAD_LOCAL_FILE") else {
         return;
     };
@@ -417,22 +416,14 @@ fn local_file_task_table_decodes_when_given() {
             eprintln!("{at}: absent, skipped");
             continue;
         };
-        let rows = mppread::mpp::decode_tasks(&bytes).unwrap_or_else(|e| panic!("{at}: {e}"));
-        let tasks = rows.iter().filter(|t| t.uid != 0 && !t.is_null).count();
-        let links: usize = rows.iter().map(|t| t.predecessors.len()).sum();
-        eprintln!("{at}: task table {tasks} tasks, {links} links");
-        match mppread::project::project_from_mpp(&bytes) {
-            Ok(project) => eprintln!(
-                "{at}: imports {} tasks, {} links, {} assignments",
-                project.tasks.len(),
-                project
-                    .tasks
-                    .iter()
-                    .map(|t| t.predecessors.len())
-                    .sum::<usize>(),
-                project.assignments.len()
-            ),
-            Err(error) => eprintln!("{at}: import refused: {error}"),
-        }
+        let project =
+            mppread::project::project_from_mpp(&bytes).unwrap_or_else(|e| panic!("{at}: {e}"));
+        let links: usize = project.tasks.iter().map(|t| t.predecessors.len()).sum();
+        eprintln!(
+            "{at}: {} tasks, {links} links, {} resources, {} assignments",
+            project.tasks.len(),
+            project.resources.len(),
+            project.assignments.len()
+        );
     }
 }

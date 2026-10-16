@@ -30,6 +30,9 @@ pub(crate) fn stream(cfb: &Cfb, table: &str, name: &str) -> Result<Vec<u8>, Stri
     cfb.read_path(&path)
         .ok_or_else(|| format!("missing {suffix}"))
 }
+/// The header count of a fixed table's meta stream: whole `stride`-byte
+/// entries, of which the ones past the count are stale (Project keeps them
+/// after deleting rows) and not read.
 pub(crate) fn count(
     meta: &[u8],
     stride: usize,
@@ -40,13 +43,22 @@ pub(crate) fn count(
         return Err("invalid fixed table header".into());
     }
     let n = u32_at(meta, 8) as usize;
+    let payload = meta.len() - 16;
     if n < minimum
-        || 16usize.checked_add(n.checked_mul(stride).ok_or("table too large")?) != Some(meta.len())
+        || !payload.is_multiple_of(stride)
+        || n > payload / stride
         || u32_at(meta, 12) as usize != data_len
     {
         return Err("fixed table count mismatch".into());
     }
     Ok(n)
+}
+
+/// Whether `space`, from a record's offset to the next counted one (or the
+/// end of FixedData), holds the record's `len` bytes and then only whole
+/// `row`-byte records no entry names: rows Project deleted.
+fn spaced(space: usize, len: usize, row: usize) -> bool {
+    space >= len && (space - len).is_multiple_of(row)
 }
 fn row_time(b: &[u8], at: usize) -> Option<u32> {
     let time = u16_at(b, at);
@@ -123,7 +135,8 @@ pub(crate) fn resources(cfb: &Cfb) -> Result<HashMap<u32, Resource>, String> {
     let vm = stream(cfb, "TBkndRsc", "VarMeta")?;
     let v2 = stream(cfb, "TBkndRsc", "Var2Data")?;
     let n = count(&fm, 37, fd.len(), 3)?;
-    if f2m.len() != 16 + n * 51
+    if f2m.len() < 16 + n * 51
+        || !(f2m.len() - 16).is_multiple_of(51)
         || f2m[..4] != [0xba, 0xad, 0xdf, 0xfa]
         || u32_at(&f2m, 8) as usize != n
     {
@@ -150,7 +163,7 @@ pub(crate) fn resources(cfb: &Cfb) -> Result<HashMap<u32, Resource>, String> {
     } else {
         fd.len()
     };
-    if schema_end != 48 {
+    if !spaced(schema_end, 48, 172) {
         return Err("resource schema length mismatch".into());
     }
     let mut out = HashMap::new();
@@ -165,16 +178,16 @@ pub(crate) fn resources(cfb: &Cfb) -> Result<HashMap<u32, Resource>, String> {
         if end < at || end > fd.len() {
             return Err("resource offset out of range".into());
         }
-        if meta_kind == 4 && end - at == 16 {
+        if meta_kind == 4 && spaced(end - at, 16, 172) {
             continue; // Blank resource row.
         }
-        if !matches!(meta_kind, 0 | 2) || end - at != 172 {
+        if !matches!(meta_kind, 0 | 2) || !spaced(end - at, 172, 172) {
             return Err("unrecognized resource record length".into());
         }
         if meta_kind == 2 {
             continue; // Deleted row may reuse a live UID or ID.
         }
-        let row = &fd[at..end];
+        let row = &fd[at..at + 172];
         let uid = u32_at(row, 4);
         if uid == 0 {
             continue; // Implicit unassigned resource.
@@ -236,14 +249,15 @@ pub(crate) fn resources(cfb: &Cfb) -> Result<HashMap<u32, Resource>, String> {
 
 /// Live 110-byte assignment records with their FixedMeta entry index, which
 /// also indexes the assignment Fixed2Meta. Blank (kind 4, 16 bytes) and
-/// deleted (kind 2) rows are skipped; any other kind or length is an error.
+/// deleted (kind 2) rows are skipped, and so are whole 110-byte records no
+/// counted entry names (rows Project deleted); any other kind or length is
+/// an error.
 pub(crate) fn live_assignment_rows<'a>(
     fm: &[u8],
     fd: &'a [u8],
 ) -> Result<Vec<(usize, &'a [u8])>, String> {
     let n = count(fm, 34, fd.len(), 0)?;
     let mut out = Vec::new();
-    let mut previous_end = 0;
     for i in 0..n {
         let meta = &fm[16 + i * 34..16 + (i + 1) * 34];
         let at = u32_at(meta, 4) as usize;
@@ -252,21 +266,21 @@ pub(crate) fn live_assignment_rows<'a>(
         } else {
             fd.len()
         };
-        if at != previous_end || end < at || end > fd.len() {
+        // Deleted rows can also lie before the first record.
+        if (i == 0 && !at.is_multiple_of(110)) || end < at || end > fd.len() {
             return Err("assignment offset mismatch".into());
         }
-        previous_end = end;
         let kind = u16_at(meta, 0);
-        if kind == 4 && end - at == 16 {
+        if kind == 4 && spaced(end - at, 16, 110) {
             continue; // Blank assignment row.
         }
-        if !matches!(kind, 0 | 2) || end - at != 110 {
+        if !matches!(kind, 0 | 2) || !spaced(end - at, 110, 110) {
             return Err("assignment record length mismatch".into());
         }
         if kind == 2 {
             continue; // Deleted assignment row.
         }
-        out.push((i, &fd[at..end]));
+        out.push((i, &fd[at..at + 110]));
     }
     Ok(out)
 }
@@ -676,6 +690,34 @@ mod tests {
         }
         Cfb::open(&write_cfb_tree(&nodes)).unwrap()
     }
+    #[test]
+    fn assignment_rows_skip_stale_entries_and_deleted_rows() {
+        // Records with UIDs 7, 8 and 9; the two counted entries skip 8, and a
+        // stale third entry past the count repeats the second's offset.
+        let mut meta = fixed_header(3, 330, 34);
+        meta[8..12].copy_from_slice(&2u32.to_le_bytes());
+        for (i, off) in [0u32, 220, 220].into_iter().enumerate() {
+            meta[16 + i * 34 + 4..16 + i * 34 + 8].copy_from_slice(&off.to_le_bytes());
+        }
+        let mut data = vec![0u8; 330];
+        for i in 0..3 {
+            data[i * 110..i * 110 + 4].copy_from_slice(&(7 + i as u32).to_le_bytes());
+        }
+        let uids = |meta: &[u8]| {
+            live_assignment_rows(meta, &data)
+                .map(|rows| rows.iter().map(|&(i, row)| (i, u32_at(row, 0))).collect())
+        };
+        assert_eq!(uids(&meta), Ok(vec![(0, 7), (1, 9)]));
+        for (offset, why) in [(150u32, "space not whole rows"), (440, "past FixedData")] {
+            let mut bad = meta.clone();
+            bad[16 + 34 + 4..16 + 34 + 8].copy_from_slice(&offset.to_le_bytes());
+            assert!(uids(&bad).is_err(), "{why}");
+        }
+        let mut over = meta;
+        over[8..12].copy_from_slice(&4u32.to_le_bytes());
+        assert!(uids(&over).is_err(), "count past the entries");
+    }
+
     #[test]
     fn assignment_units_capacity_and_optional_table() {
         let tasks = [MppTask {

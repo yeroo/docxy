@@ -428,7 +428,10 @@ pub struct DecodedCalendars {
 /// FixedData length at +12; the first four records are 16-byte kind-4
 /// schema stubs. Each calendar row is 12 bytes: base calendar UID `i32` at
 /// +0 (-1, 0 or the row's own UID for a base calendar), resource UID `i32` at +4
-/// and UID `i32` at +8; a 14-byte terminal row may end the table. VarMeta
+/// and UID `i32` at +8; a 14-byte terminal row may end the table. Only the
+/// first `count` entries are read: entries past the count are stale, and
+/// whole 12-byte rows no counted entry names, between or after the indexed
+/// records, are deleted ones and skipped. VarMeta
 /// entries carry tag `0x0d40`: key 1 is the UTF-16 name and key 8 the
 /// weekday, exception and work-week block described in `corpus/mpp/README.md`.
 /// A resource calendar without a name takes its resource's name. The default
@@ -462,13 +465,17 @@ pub fn decode(bytes: &[u8], legacy: bool) -> Result<Option<DecodedCalendars>, St
         return Err("invalid calendar FixedMeta header".into());
     }
     let count = u32_at(&fm, 8) as usize;
+    // Entries past the count are stale ones Project keeps after deletions.
     if count < 5
-        || 16usize.checked_add(count.checked_mul(10).ok_or("calendar count overflow")?)
-            != Some(fm.len())
+        || !(fm.len() - 16).is_multiple_of(10)
+        || count > (fm.len() - 16) / 10
         || u32_at(&fm, 12) as usize != fd.len()
     {
         return Err("calendar FixedMeta count or FixedData length mismatch".into());
     }
+    // A record runs `len` bytes; up to the next counted offset only whole
+    // 12-byte calendar rows no entry names (deleted ones) may follow it.
+    let spaced = |space: usize, len: usize| space >= len && (space - len).is_multiple_of(12);
     let mut rows = Vec::new();
     let mut indexed_uids = HashSet::new();
     for i in 0..count {
@@ -482,20 +489,20 @@ pub fn decode(bytes: &[u8], legacy: bool) -> Result<Option<DecodedCalendars>, St
         if off >= end || end > fd.len() {
             return Err(format!("calendar FixedMeta offset {i} out of range"));
         }
-        let len = end - off;
+        let space = end - off;
         if i < 4 {
-            if len != 16 || u16_at(e, 0) != 4 {
+            if !spaced(space, 16) || u16_at(e, 0) != 4 {
                 return Err("unrecognized calendar schema stubs".into());
             }
-        } else if i + 1 == count && len == 14 {
+        } else if i + 1 == count && space == 14 {
             // Some files append a 14-byte terminal row. Others end with an
             // ordinary 12-byte calendar row.
         } else {
             let kind = u16_at(e, 0);
-            if len != 12 || !matches!(kind, 0 | 2) {
+            if !spaced(space, 12) || !matches!(kind, 0 | 2) {
                 return Err(format!("unrecognized calendar record {i}"));
             }
-            let rec = &fd[off..end];
+            let rec = &fd[off..off + 12];
             let uid = i32_at(rec, 8);
             let base = i32_at(rec, 0);
             if uid <= 0 || base < -1 {
@@ -1250,6 +1257,43 @@ pub(crate) mod tests {
         let mut bad = fd.clone();
         bad[76..80].copy_from_slice(&99i32.to_le_bytes());
         assert!(decode(&file(fm, bad, vm, v2), false).is_err());
+    }
+
+    #[test]
+    fn skips_stale_entries_and_unindexed_deleted_rows() {
+        let (fm, fd, vm, v2) = fixture();
+        let plain = decode(&file(fm.clone(), fd.clone(), vm.clone(), v2.clone()), false).unwrap();
+        // A deleted calendar row (UID 9) between the two live ones, which no
+        // counted entry names, and a stale entry past the count naming it.
+        let mut gap_fd = fd[..76].to_vec();
+        for value in [-1i32, -1, 9] {
+            gap_fd.extend_from_slice(&value.to_le_bytes());
+        }
+        gap_fd.extend_from_slice(&fd[76..]);
+        let mut gap_fm = fm.clone();
+        gap_fm[12..16].copy_from_slice(&(gap_fd.len() as u32).to_le_bytes());
+        gap_fm[16 + 5 * 10 + 4..16 + 5 * 10 + 8].copy_from_slice(&88u32.to_le_bytes());
+        let mut stale = [0u8; 10];
+        stale[4..8].copy_from_slice(&76u32.to_le_bytes());
+        gap_fm.extend_from_slice(&stale);
+        let gap = |fm: &[u8], fd: &[u8]| {
+            decode(
+                &file(fm.to_vec(), fd.to_vec(), vm.clone(), v2.clone()),
+                false,
+            )
+        };
+        assert_eq!(gap(&gap_fm, &gap_fd).unwrap(), plain);
+        // Space that is not whole calendar rows is still refused.
+        let mut torn = gap_fd.clone();
+        torn.insert(76, 0);
+        let mut torn_fm = gap_fm.clone();
+        torn_fm[12..16].copy_from_slice(&(torn.len() as u32).to_le_bytes());
+        torn_fm[16 + 5 * 10 + 4..16 + 5 * 10 + 8].copy_from_slice(&89u32.to_le_bytes());
+        assert!(gap(&torn_fm, &torn).is_err());
+        // So is a counted entry past FixedData.
+        let mut out = gap_fm;
+        out[16 + 5 * 10 + 4..16 + 5 * 10 + 8].copy_from_slice(&200u32.to_le_bytes());
+        assert!(gap(&out, &gap_fd).unwrap_err().contains("out of range"));
     }
 
     #[test]
