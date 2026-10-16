@@ -4217,6 +4217,14 @@ impl SheetView {
     fn edit_caret_to_end(&mut self) {
         self.edit_caret = self.edit_len();
     }
+    /// Ctrl+V in the entry (#1341): the clipboard text goes in at the caret
+    /// as typed text would (it replaces a selection, overtypes in overtype
+    /// mode), line breaks as `\n`; a proposed completion is dropped first.
+    fn edit_paste_text(&mut self, text: &str) {
+        self.drop_proposal();
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        self.edit_type(&text);
+    }
     /// Insert text at the caret, advancing it.
     fn edit_insert(&mut self, s: &str) {
         self.edit_redo = None;
@@ -20155,6 +20163,18 @@ impl Docxy {
             .is_some_and(|v| act_takes_entry_text(act, v))
         {
             return self.sheet_entry_copy(act == SheetAct::Cut, cx);
+        }
+        // Paste in an open entry inserts the clipboard text at the caret and
+        // keeps the entry open, as Excel's does (#1341); the cells are never
+        // pasted into. A clipboard with no text pastes nothing.
+        if act == SheetAct::Paste && self.active_sheet().is_some_and(|v| v.editing.is_some()) {
+            if let ClipRead::Text(text) = self.clipboard_read(cx) {
+                if let Some(v) = self.active_sheet_mut() {
+                    v.edit_paste_text(&text);
+                }
+                cx.notify();
+            }
+            return;
         }
         // Protected View (#610): the ribbon is hidden, but shortcuts, KeyTips
         // and the harness's `ribbon-click` still come here.

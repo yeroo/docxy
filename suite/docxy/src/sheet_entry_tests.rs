@@ -2376,3 +2376,27 @@ fn copy_and_cut_leave_the_entry_open_only_while_its_text_is_selected_1340() {
     v.edit_clear_selected();
     assert_eq!(v.editing.as_deref(), Some(""));
 }
+
+// ---- #1341: Ctrl+V in an open entry inserts the clipboard text at the caret ----
+
+#[test]
+fn paste_text_goes_in_at_the_caret_and_the_entry_stays_open_1341() {
+    let mut v = old_book();
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_type("abcd");
+    v.edit_caret = 2;
+    v.edit_paste_text("XY");
+    assert_eq!(v.editing.as_deref(), Some("abXYcd"));
+    assert_eq!(v.edit_caret, 4);
+}
+
+#[test]
+fn paste_text_replaces_a_selected_entry_and_keeps_line_breaks_1341() {
+    let mut v = old_book();
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_type("abcd");
+    v.edit_select_entry();
+    v.edit_paste_text("a\r\nb\rc");
+    assert_eq!(v.editing.as_deref(), Some("a\nb\nc"));
+    assert!(v.edit_selected_text().is_none());
+}
