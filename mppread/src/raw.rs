@@ -18,7 +18,7 @@
 //! | Storage | Reader | Generations validated |
 //! |---|---|---|
 //! | `TBkndTask` | [`task_index`], [`task_fixed2`], [`decode_task_table`] | current Project, MPP12, MPP9 |
-//! | `TBkndCons` | [`decode_task_table`] ([`LINK_RECORD_LEN`]-byte records) | current Project, MPP12, MPP9 |
+//! | `TBkndCons` | [`link_records`], [`decode_task_table`] ([`LINK_RECORD_LEN`]-byte records) | current Project, MPP12, MPP9 |
 //! | `TBkndRsc` | [`RESOURCE_TABLE`], [`decode_resources`] | current Project |
 //! | `TBkndAssn` | [`ASSIGNMENT_TABLE`], [`decode_assignments`] | current Project |
 //! | `TBkndCal` | [`decode_calendars`] | current Project |
@@ -29,8 +29,8 @@
 //! `u16` at +0 and the record's FixedData offset `u32` at +4. Kind 0 is a
 //! live row, kind 2 a superseded one and kind 4 a schema stub or blank row.
 //! The entry stride is per table: 47 bytes for tasks ([`TASK_META_STRIDE`]),
-//! 37 for resources, 34 for assignments and 10 for calendars (the link
-//! reader takes `TBkndCons/FixedData` alone). VarMeta entries are read by
+//! 37 for resources, 34 for assignments and 10 for calendars and links
+//! ([`LINK_META_STRIDE`]). VarMeta entries are read by
 //! [`var_entries`]; Var2Data blocks by the [`crate::vardata`] helpers
 //! re-exported here.
 //!
@@ -60,8 +60,8 @@ pub use crate::tabledecode::{
     read as read_table, u16_at, u32_at,
 };
 pub use crate::taskdecode::{
-    LINK_RECORD_LEN, Table as TaskTable, cost_rate, decode_table as decode_task_table, decode_text,
-    tenths_to_minutes, work_minutes,
+    LINK_META_STRIDE, LINK_RECORD_LEN, Table as TaskTable, cost_rate,
+    decode_table as decode_task_table, decode_text, link_records, tenths_to_minutes, work_minutes,
 };
 pub use crate::vardata::{block_offsets, blocks, string_at, strings, utf16le_string};
 pub use crate::varmeta::{VarEntry, var_entries};

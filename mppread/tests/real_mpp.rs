@@ -162,6 +162,18 @@ fn indexed_legacy_imports_when_present() {
             Some(date),
             "{path}"
         );
+        // new-product.mpp keeps a stale copy of one link in a record its
+        // TBkndCons FixedMeta does not index; it is not read twice.
+        for task in &rows {
+            let mut links = std::collections::HashSet::new();
+            assert!(
+                task.predecessors
+                    .iter()
+                    .all(|p| links.insert((p.pred_uid, p.kind))),
+                "{path}: UID {} repeats a link",
+                task.uid
+            );
+        }
         let imported =
             mppread::project::project_from_mpp(&bytes).unwrap_or_else(|e| panic!("{path}: {e}"));
         assert_eq!(imported.tasks.len(), rows.len() - 1, "{path}");
@@ -386,5 +398,41 @@ fn resource_calendars_survive_mpp_saves_when_present() {
             saved.calendars.iter().map(fields).collect::<Vec<_>>()
         );
         assert_eq!(imported.default_calendar_uid, saved.default_calendar_uid);
+    }
+}
+
+/// A plan of your own that stays outside the repo: `MPPREAD_LOCAL_FILE`
+/// names one or more `.mpp` files, joined like `PATH`. Each task table must
+/// decode, its links included, and the counts are reported. The full import
+/// is reported, not asserted: a table outside the task reader can still
+/// refuse a plan. Skips when the variable is unset or a file is absent.
+#[test]
+fn local_file_task_table_decodes_when_given() {
+    let Some(files) = std::env::var_os("MPPREAD_LOCAL_FILE") else {
+        return;
+    };
+    for path in std::env::split_paths(&files) {
+        let at = path.display();
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("{at}: absent, skipped");
+            continue;
+        };
+        let rows = mppread::mpp::decode_tasks(&bytes).unwrap_or_else(|e| panic!("{at}: {e}"));
+        let tasks = rows.iter().filter(|t| t.uid != 0 && !t.is_null).count();
+        let links: usize = rows.iter().map(|t| t.predecessors.len()).sum();
+        eprintln!("{at}: task table {tasks} tasks, {links} links");
+        match mppread::project::project_from_mpp(&bytes) {
+            Ok(project) => eprintln!(
+                "{at}: imports {} tasks, {} links, {} assignments",
+                project.tasks.len(),
+                project
+                    .tasks
+                    .iter()
+                    .map(|t| t.predecessors.len())
+                    .sum::<usize>(),
+                project.assignments.len()
+            ),
+            Err(error) => eprintln!("{at}: import refused: {error}"),
+        }
     }
 }

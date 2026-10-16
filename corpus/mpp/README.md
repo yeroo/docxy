@@ -376,6 +376,26 @@ import. Files without
 `TBkndCal`, and MPP9 files, keep a synthesized Standard. Task progress is
 imported (see below); assignment progress is not yet decoded.
 
+Blank (deleted) link rows. `TBkndCons/FixedMeta` indexes the 20-byte link
+records with 10-byte entries (kind `u16` at +0, FixedData offset `u32` at +4)
+in every generation read, and only its first `count` entries (the `u32` at +8)
+are links. When a link is deleted Project can leave its FixedData record
+behind, blanked to the link's own UID at +0 with the endpoints, type, lag and
+format all 0, or still holding the old link, and keep stale entries past the
+count that repeat a live offset or name a blank record with kind 2. A Project
+2024 plan with deleted links held 25 records, 24 entries and a count of 21;
+another save of the same plan held exactly the 21 counted links. Of the four
+records no counted entry names, three were blank and one a stale link whose
+task GUIDs (in Fixed2Data) no longer matched its endpoints. The MPP9
+`new-product.mpp` keeps an unindexed stale copy of one link, which was read as
+a duplicate predecessor before. The reader takes kind 0, skips kind 2 and
+refuses other kinds; skips a blank record (both endpoint UIDs 0) wherever it
+is; and refuses a record with exactly one endpoint UID 0, the project summary.
+A hand-built table with no FixedMeta has every record read. The same plan's
+`TBkndAssn` shows the deleted-row pattern too (a count of 37 under 39 entries,
+two unindexed 110-byte records between live ones), which the assignment reader
+still refuses as a FixedMeta count mismatch.
+
 Task mode is decoded for the newest layout. The manual flag is bit `0x80` of
 byte 8 of the task's `Fixed2Meta` entry, and a manual task's start, finish and
 duration are at +50, +54 and +58 of its 64-byte `Fixed2Data` record. The
