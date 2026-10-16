@@ -5,9 +5,11 @@
 //! system clipboard: display values only, never formulas, each cell with the
 //! inline style Excel, Numbers and Pages read (bold, italic, font, colour,
 //! fill, alignment). [`parse_html_table`] and [`parse_rtf_table`] go the other
-//! way for a paste: the first table's cell texts, by position, with no
-//! styles. Both parsers are small tolerant scanners (unclosed tags, CF_HTML
-//! headers, Excel's `class=xl65` attributes), not full HTML or RTF readers.
+//! way for a paste: the cell texts of the table that is the whole copy
+//! (`None` when there is other text or a second table), by position, with no
+//! styles. Both parsers are small tolerant scanners (unclosed tags, text
+//! before the first tag such as a CF_HTML header, Excel's `class=xl65`
+//! attributes), not full HTML or RTF readers.
 
 use crate::sheet::{Align, Cell, CellValue, Sheet, Styles, format_with};
 
@@ -351,7 +353,7 @@ fn collapse(raw: &str) -> String {
 /// outside the table (a heading or a paragraph beside it: the copy is more
 /// than a table, so its text is pasted instead). Entities are decoded, source
 /// line breaks are blanks and a `<br>` is a line feed; a table inside a cell
-/// is part of that cell's text. A CF_HTML header, `<html>`, `<title>` and
+/// is part of that cell's text. Text before the first tag (a CF_HTML header), `<html>`, `<title>` and
 /// `<style>` are not text, and an unclosed `<td>`, `<tr>` or `<table>` ends
 /// at the next one.
 #[allow(unused_assignments)]
@@ -364,7 +366,8 @@ pub fn parse_html_table(html: &str) -> Option<Vec<Vec<String>>> {
     let mut cell: Option<(String, usize, usize)> = None;
     let mut next_row = 0usize;
     let (mut depth, mut tables, mut outside) = (0usize, 0usize, false);
-    let mut i = 0;
+    // Text before the first tag (a CF_HTML header) is not the copy's.
+    let mut i = html.find('<').unwrap_or(html.len());
     macro_rules! close_cell {
         () => {
             if let Some((text, cs, rs)) = cell.take() {
@@ -395,7 +398,9 @@ pub fn parse_html_table(html: &str) -> Option<Vec<Vec<String>>> {
                 .get(i + 1)
                 .is_some_and(|&n| n.is_ascii_alphabetic() || matches!(n, b'/' | b'!' | b'?'));
         if !is_tag {
-            let end = html[i + 1..].find('<').map_or(html.len(), |n| i + 1 + n);
+            // Past the whole character, so `end` is on a boundary.
+            let next = i + html[i..].chars().next().map_or(1, char::len_utf8);
+            let end = html[next..].find('<').map_or(html.len(), |n| next + n);
             text!(&html[i..end]);
             i = end;
             continue;
@@ -608,7 +613,9 @@ pub fn parse_rtf_table(rtf: &str) -> Option<Vec<Vec<String>>> {
                         // Word repeats the row's definition before `\row`:
                         // only a row's first one ends the text before it.
                         if row.is_empty() {
-                            if !cur.trim().is_empty() {
+                            // Text before the table, or a paragraph mark
+                            // between two tables: more than one table.
+                            if !cur.trim().is_empty() || (!rows.is_empty() && !cur.is_empty()) {
                                 outside = true;
                             }
                             cur.clear();
@@ -814,7 +821,46 @@ mod tests {
         assert_eq!(parse_html_table(&format!("{t}<p>after</p>")), None);
         assert_eq!(parse_html_table(&format!("{t}{t}")), None);
         assert!(parse_html_table(&format!("<p> &nbsp;</p>{t}\n")).is_some());
-        assert!(parse_html_table(&format!("a &lt; b {t}")).is_none());
+        assert!(parse_html_table(&format!("<p>a &lt; b</p>{t}")).is_none());
+        // Text before the first tag is a CF_HTML header, not the copy's.
+        assert!(parse_html_table(&format!("Version:0.9\r\nStartHTML:1\r\n{t}")).is_some());
+    }
+
+    #[test]
+    fn non_ascii_text_parses_at_every_cut() {
+        let html = "Version:0.9\r\n<html><head><title>t\u{e9}</title></head><body><table>\
+            <tr><td>\u{e9}</td><td>\u{20ac}</td><td>M\u{fc}ller</td><td>\u{41f}\u{440}</td>\
+            <td>\u{4e2d}\u{6587}</td><td>a\u{a0}b</td></tr></table></body></html>";
+        assert_eq!(
+            parse_html_table(html).unwrap(),
+            rows(&[&[
+                "\u{e9}",
+                "\u{20ac}",
+                "M\u{fc}ller",
+                "\u{41f}\u{440}",
+                "\u{4e2d}\u{6587}",
+                "a b"
+            ]])
+        );
+        for cut in (0..=html.len()).filter(|&n| html.is_char_boundary(n)) {
+            let _ = parse_html_table(&html[..cut]);
+            let _ = parse_html_table(&html[cut..]);
+        }
+        let rtf = "{\\rtf1\\ansicpg1252\\trowd\\cellx1000 \\'e9\\u8364? \u{e9}\u{4e2d} \\\u{e9}x\\cell \\row}";
+        for cut in (0..=rtf.len()).filter(|&n| rtf.is_char_boundary(n)) {
+            let _ = parse_rtf_table(&rtf[..cut]);
+            let _ = parse_rtf_table(&rtf[cut..]);
+        }
+    }
+
+    #[test]
+    fn two_rtf_tables_apart_by_a_paragraph_mark_are_not_one_table() {
+        let t = "\\trowd\\cellx1000\\pard\\intbl a\\cell \\row";
+        assert_eq!(
+            parse_rtf_table(&format!("{{\\rtf1 {t}\\pard\\par {t}}}")),
+            None
+        );
+        assert!(parse_rtf_table(&format!("{{\\rtf1 {t}{t}}}")).is_some());
     }
 
     #[test]

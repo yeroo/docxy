@@ -6572,6 +6572,18 @@ fn capture(_app: &crate::Docxy, _window: &mut Window) -> Result<Done, String> {
 
 #[cfg(test)]
 mod tests {
+    /// #1248: a bold cell with non-ASCII text reads back (and does not panic).
+    #[test]
+    fn the_bold_cells_of_a_table_are_read_with_non_ascii_text() {
+        let html = "<table><tr><td style='font-weight:700'>M\u{fc}ller \u{20ac}</td>\
+            <td>\u{e9}</td><th style=\"font-weight: bold\">\u{4e2d}</th></tr></table>";
+        assert_eq!(
+            super::html_bold_text(html),
+            "M\u{fc}ller \u{20ac}\n\u{4e2d}"
+        );
+        assert_eq!(super::html_bold_text("<p>\u{e9}</p>"), "");
+    }
+
     use super::*;
 
     use docxcore::model::{Block, Document, ParProps, Paragraph, Run, RunProps, Spacing};

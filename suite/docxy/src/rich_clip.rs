@@ -67,6 +67,11 @@ pub(crate) fn read_html() -> Option<String> {
     html_fragment(&bytes)
 }
 
+/// The meta that tells a reader the page is UTF-8: a clipboard HTML has no
+/// other way to say so, and readers assume a Windows code page without it.
+#[cfg_attr(not(any(target_os = "macos", windows, test)), allow(dead_code))]
+const CHARSET: &str = "<meta charset=\"utf-8\">";
+
 /// `fragment` as a CF_HTML clipboard payload (Windows' "HTML Format"): the
 /// `Version:0.9` header with the byte offsets (UTF-8, ten digits, so the
 /// header's length does not depend on them) of the page, and of the fragment
@@ -74,7 +79,7 @@ pub(crate) fn read_html() -> Option<String> {
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn cf_html(fragment: &str) -> String {
     const HEADER: usize = "Version:0.9\r\nStartHTML:0000000000\r\nEndHTML:0000000000\r\nStartFragment:0000000000\r\nEndFragment:0000000000\r\n".len();
-    let before = "<html><body>\r\n<!--StartFragment-->";
+    let before = format!("<html><head>{CHARSET}</head><body>\r\n<!--StartFragment-->");
     let after = "<!--EndFragment-->\r\n</body>\r\n</html>";
     let start_fragment = HEADER + before.len();
     let end_fragment = start_fragment + fragment.len();
@@ -87,7 +92,7 @@ fn cf_html(fragment: &str) -> String {
 /// `fragment` as the macOS `public.html` page.
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 fn html_page(fragment: &str) -> String {
-    format!("<html><body>{fragment}</body></html>")
+    format!("<html><head>{CHARSET}</head><body>{fragment}</body></html>")
 }
 
 /// The HTML an `HTML Format` / `public.html` payload carries: the fragment
@@ -394,6 +399,22 @@ mod tests {
             got.starts_with("<html>") && got.contains("<table x=1>"),
             "{got}"
         );
+    }
+
+    /// The pages say they are UTF-8, so a non-ASCII cell reads right in an
+    /// app that would otherwise assume a code page, and the table inside
+    /// survives both wrappers.
+    #[test]
+    fn the_pages_say_they_are_utf8_around_a_marked_table() {
+        let fragment = "<table data-source=docxy><tr><td>M\u{fc}ller \u{4e2d}</td></tr></table>";
+        let page = html_page(fragment);
+        assert!(page.contains("<meta charset=\"utf-8\">") && page.contains(fragment));
+        let payload = cf_html(fragment);
+        assert!(payload.contains("<meta charset=\"utf-8\">"));
+        assert_eq!(html_fragment(payload.as_bytes()).as_deref(), Some(fragment));
+        assert!(gridcore::clip_html::is_own_table(
+            &html_fragment(page.as_bytes()).unwrap()
+        ));
     }
 
     #[test]
