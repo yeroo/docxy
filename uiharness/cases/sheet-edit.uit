@@ -356,9 +356,9 @@ test paste link with an open editor commits first
   assert editing is false
   assert dirty is true
   call cell {"cell":"D2"}
-  assert reply.value is =$A$2
+  assert reply.value is =A2
   call cell {"cell":"E2"}
-  assert reply.value is =$B$2
+  assert reply.value is =B2
 
 # #510 r1: a refused entry (a formula that does not parse) stops the act:
 # the editor stays open and the command does not run. Fails if the early
