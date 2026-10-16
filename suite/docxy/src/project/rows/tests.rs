@@ -1,5 +1,6 @@
 use super::*;
 use core::prelude::v1::test;
+use projcore::mspdi;
 
 /// The harness case's fixture: 1 Outer (L1) / 2 Inner (L2) / 3 Deep (L3) /
 /// 4 Sibling (L2) / 5 blank / 6 After (L1).

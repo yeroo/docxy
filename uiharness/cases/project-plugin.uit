@@ -1,0 +1,42 @@
+# Format plugins in the desktop suite. The `plugin` line copies the test
+# fixture plugin (projcore/tests/plugin_fixture, built beside uiharness by
+# `cargo build --release -p uiharness -p plugin_fixture`) into the sandbox's
+# docxy/plugins before the suite starts. It declares one fake type,
+# `.fakeproj`, whose files are MSPDI passed through. save-as.uit checks the
+# same lists without it.
+plugin yppx_fixture
+
+test a format plugin adds its type to the Save As list after the built-ins
+  open copy:../fixtures/schedule.xml
+  call save-types {}
+  assert reply.count is 3
+  assert reply.types.0.label is Project schedule
+  assert reply.types.0.extensions.0 is yppx
+  assert reply.types.1.label is MSPDI
+  assert reply.types.2.label is Fake Project
+  assert reply.types.2.extensions.0 is fakeproj
+
+test save-as writes the plugin's type and the plan saves back to it in place
+  open copy:../fixtures/schedule.xml
+  call save-as {"path":"plan","format":"fakeproj"}
+  assert reply.format is fakeproj
+  assert reply.title is plan.fakeproj
+  assert reply.dirty is false
+  # The file is there: a second save-as onto it asks first.
+  call-error save-as {"path":"plan.fakeproj"} => already exists
+  # It reads back through the plugin, as a plan of its own, not an import.
+  call proj.reload {}
+  assert reply.imported is false
+  assert status is loaded — 3 tasks
+  call task.set {"uid":2,"name":"Through the plugin"}
+  assert dirty is true
+  key ctrl+s
+  assert dirty is false
+  assert title is plan.fakeproj
+  call proj.save {}
+  assert reply.imported is false
+
+test the save refusal names the plugin's type
+  open copy:../fixtures/schedule.xml
+  call-error save-as {"path":"plan.mpp"} => can only be saved as .yppx, .xml (MSPDI) or .fakeproj
+  call-error save-as {"path":"plan","format":"docx"} => can only be saved as .yppx, .xml (MSPDI) or .fakeproj

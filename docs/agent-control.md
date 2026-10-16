@@ -1100,15 +1100,17 @@ Everything else — discovery, the wire protocol, tokens, `target`
 disambiguation, the status-dot flash on agent edits — works identically across
 the three.
 
-## Format plugins (yppxy)
+## Format plugins (yppxy and the desktop suite)
 
 `yppxy` can open and save more project file types through **format plugins**:
 shared libraries named `yppx_*.dll` / `yppx_*.so` / `yppx_*.dylib`, loaded once
 at start from `<config>/yppxy/plugins` (`%APPDATA%\yppxy\plugins` on Windows,
 else `$XDG_CONFIG_HOME/yppxy/plugins` or `~/.config/yppxy/plugins`: the
-directory beside `ctl/`) and then from `$YPPX_PLUGIN_DIR` when set. No plugin
-ships with docxy, and with none every verb behaves as described above. The desktop
-suite does not load them yet.
+directory beside `ctl/`) and then from `$YPPX_PLUGIN_DIR` when set. The
+desktop suite loads them for its Project tabs from `<config>/docxy/plugins`
+(beside its `session.json`, under `DOCXY_CONFIG_DIR` when that is set) and
+then `$YPPX_PLUGIN_DIR`. No plugin ships with docxy, and with none every verb
+behaves as described above.
 
 - `proj.save {"path"}` (and `yppxy_save`) accepts any extension a loaded
   plugin writes, besides `.yppx`/`.xml`; an unwritable extension is refused
@@ -1122,6 +1124,15 @@ suite does not load them yet.
 - A plugin that does not load is skipped: headless runs print
   `yppxy: plugin not loaded: <file>: <why>` on stderr, the editor shows the
   first such message on its status line.
+- In the suite, `proj.save {"path"}` likewise takes any extension a plugin
+  writes, and `proj.save` without a path on a plan that needs Save As says
+  which it takes (`pass "path" to save this project (.yppx or .xml)` with
+  none). `proj.path` reports `imported: true` only for a type nothing
+  writes, so a `.mpp` is an import unless a plugin writes `.mpp`; then
+  `proj.save` writes it in place with the opened file as the plugin's source.
+  `proj.open` and `proj.reload` read a plugin's types through it. A plugin
+  that does not load is reported on stderr, in `<config>/docxy/crash.log`
+  and on the first window's status line.
 
 The ABI (C, MSPDI XML text across the boundary) is `projcore::plugin_abi`;
 the loader is `projcore::formats::plugin` (cargo feature `plugins`). See

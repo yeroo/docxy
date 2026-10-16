@@ -555,6 +555,36 @@ fn save_policy_preserves_binding_history_and_source_on_refusal() {
     }
 }
 
+/// With a format plugin that writes `.mpp` (an in-process stand-in), a
+/// plan opened from one is no import: `proj.path` says so, `proj.save`
+/// writes it in place and takes the type as a path, and the refusal to save
+/// a plan with no file names the type too.
+#[test]
+fn proj_save_takes_a_format_plugins_type() {
+    let _plugins = crate::project_formats::tests::Override::new(vec![
+        crate::project_formats::tests::mpp_writer(),
+    ]);
+    let dir = scratch();
+    let source = dir.join("plan.mpp");
+    std::fs::copy(fixture(), &source).unwrap();
+    let mut tabs = vec![project_tab_from_path(&source)];
+    let (info, _) = call(&mut tabs, 0, "proj.path", Json::Null).unwrap();
+    assert_eq!(info.get("imported").and_then(Json::as_bool), Some(false));
+    vm(&mut tabs[0]).ed.rename(1, "In place").unwrap();
+    call(&mut tabs, 0, "proj.save", Json::Null).unwrap();
+    assert_eq!(tabs[0].path.as_ref(), Some(&source));
+    let saved = std::fs::read_to_string(&source).unwrap();
+    assert!(saved.contains("<Name>In place</Name>") && saved.contains("<!-- source "));
+    let target = dir.join("copy.MPP");
+    call(&mut tabs, 0, "proj.save", path_args(&target)).unwrap();
+    assert_eq!(tabs[0].path.as_ref(), Some(&target));
+    tabs[0].path = None;
+    assert_eq!(
+        call(&mut tabs, 0, "proj.save", Json::Null).unwrap_err(),
+        "pass \"path\" to save this project (.yppx, .xml or .mpp)"
+    );
+}
+
 #[test]
 fn reload_commits_only_a_successful_load() {
     let dir = scratch();

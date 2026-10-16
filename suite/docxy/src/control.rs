@@ -195,9 +195,10 @@ pub(crate) fn project_verb(
                         None => match save_decision(tab, true, false) {
                             SaveDecision::InPlace(path) => path,
                             _ => {
-                                return Err(
-                                    "pass \"path\" to save this project (.yppx or .xml)".into()
-                                );
+                                return Err(format!(
+                                    "pass \"path\" to save this project ({})",
+                                    crate::project_formats::global().save_list()
+                                ));
                             }
                         },
                     };
@@ -235,6 +236,8 @@ pub(crate) fn project_verb(
                 // from the task count, so it stays valid over any reload,
                 // and a reload to an empty plan latches it.
                 v.ed.replace_project(fresh.ed.project().clone());
+                // A plugin's saves get the file as it is now.
+                v.source = fresh.source;
                 v.latch_entry_row();
                 v.cancel_prompt();
                 v.cell = None;

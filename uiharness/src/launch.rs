@@ -23,6 +23,12 @@ pub const CONFIG_DIR_ENV: &str = "DOCXY_CONFIG_DIR";
 /// The flag that turns the control server on.
 pub const HARNESS_FLAG: &str = "--harness";
 
+/// The variable naming one more format plugin directory, which the suite
+/// reads besides `<config root>/docxy/plugins`. A harness instance never
+/// inherits it: the only plugins it loads are the sandbox's own, which a
+/// script's `plugin` lines put there ([`install_plugins`]).
+pub const PLUGIN_DIR_ENV: &str = "YPPX_PLUGIN_DIR";
+
 /// The binary's name on this platform.
 pub fn exe_name() -> &'static str {
     if cfg!(windows) { "suite.exe" } else { "suite" }
@@ -599,6 +605,13 @@ pub fn launch_on_desktop_with_env(
     Err("--desktop: a separate desktop is Windows-only".to_string())
 }
 
+/// Whether the child keeps the parent's variable `name`: everything but the
+/// agwinterm variables ([`is_terminal_integration_var`]) and
+/// [`PLUGIN_DIR_ENV`], in any case.
+fn kept_from_parent(name: &std::ffi::OsStr) -> bool {
+    !is_terminal_integration_var(name) && !name.eq_ignore_ascii_case(PLUGIN_DIR_ENV)
+}
+
 /// Whether `name` is one of the variables agwinterm sets in its panes
 /// (`AGWINTERM_SESSION_ID`, `AGWINTERM_PIPE`, …, and bare `AGWINTERM`). A
 /// prefix rather than a list: agwinterm keeps adding them. ASCII
@@ -611,7 +624,8 @@ pub fn is_terminal_integration_var(name: &std::ffi::OsStr) -> bool {
 
 /// The environment the desktop launch hands the child, as a list
 /// [`environment_block`] can serialize: `parent` without the agwinterm
-/// variables ([`is_terminal_integration_var`]) and without any existing
+/// variables ([`is_terminal_integration_var`]), without [`PLUGIN_DIR_ENV`]
+/// and without any existing
 /// `DOCXY_CONFIG_DIR` — Windows names are case-insensitive, so the override
 /// must replace whatever case the parent used, never add a second entry —
 /// plus one [`CONFIG_DIR_ENV`] pointing at `sandbox`. Hidden `=C:`-style
@@ -623,7 +637,7 @@ pub fn child_env(
 ) -> Vec<(OsString, OsString)> {
     let mut env: Vec<(OsString, OsString)> = parent
         .into_iter()
-        .filter(|(name, _)| !is_terminal_integration_var(name))
+        .filter(|(name, _)| kept_from_parent(name))
         .filter(|(name, _)| !name.eq_ignore_ascii_case(CONFIG_DIR_ENV))
         .collect();
     env.push((
@@ -644,6 +658,64 @@ fn upper(unit: &u16) -> u16 {
         0x61..=0x7a => unit - 0x20, // 'a'..='z'
         _ => *unit,
     }
+}
+
+/// The file a format plugin named `name` (`yppx_fixture`) is built as: the
+/// platform's library prefix and extension around it (`yppx_fixture.dll`,
+/// `libyppx_fixture.so`, `libyppx_fixture.dylib`).
+pub fn built_plugin_name(name: &str) -> String {
+    use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
+    format!("{DLL_PREFIX}{name}{DLL_SUFFIX}")
+}
+
+/// Where the suite started in `sandbox` loads format plugins from: its
+/// config root's `docxy/plugins`.
+pub fn plugins_dir(sandbox: &Path) -> PathBuf {
+    sandbox.join("docxy").join("plugins")
+}
+
+/// The built format plugin `name` in `dir` (the directory the harness runs
+/// from, where `cargo build -p plugin_fixture` puts the fixture beside it).
+pub fn find_plugin(name: &str, dir: &Path) -> Result<PathBuf, String> {
+    let built = dir.join(built_plugin_name(name));
+    if built.is_file() {
+        Ok(built)
+    } else {
+        Err(format!(
+            "no {name} format plugin at {} — build it next to uiharness \
+             (`cargo build --release -p uiharness -p plugin_fixture` for the test fixture)",
+            built.display()
+        ))
+    }
+}
+
+/// Copy each format plugin in `names` from `dir` into the sandbox's plugin
+/// directory ([`plugins_dir`]) as `<name>.<dll|so|dylib>`, the name the
+/// suite's loader takes (it wants `yppx_*`, with no `lib` prefix). Done
+/// before the launch: the suite loads its plugins once, at start.
+pub fn install_plugins(sandbox: &Path, names: &[String], dir: &Path) -> Result<(), String> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let into = plugins_dir(sandbox);
+    std::fs::create_dir_all(&into).map_err(|e| format!("{}: {e}", into.display()))?;
+    for name in names {
+        let built = find_plugin(name, dir)?;
+        let to = into.join(format!("{name}{}", std::env::consts::DLL_SUFFIX));
+        std::fs::copy(&built, &to)
+            .map_err(|e| format!("{} -> {}: {e}", built.display(), to.display()))?;
+    }
+    Ok(())
+}
+
+/// The directory this harness runs from: the workspace's `target/<profile>/`,
+/// where the terminal editors and the fixture plugin are built beside it.
+pub fn harness_dir() -> Result<PathBuf, String> {
+    std::env::current_exe()
+        .map_err(|e| format!("where this harness runs from: {e}"))?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "this harness runs from no directory".to_string())
 }
 
 /// `env` as a `CreateProcessW` environment block: entries `name=value\0`,
@@ -713,7 +785,7 @@ pub fn command(
     cmd.env_clear().envs(
         parent
             .into_iter()
-            .filter(|(name, _)| !is_terminal_integration_var(name)),
+            .filter(|(name, _)| kept_from_parent(name)),
     );
     cmd.arg(HARNESS_FLAG)
         .env(CONFIG_DIR_ENV, sandbox)
@@ -773,7 +845,8 @@ mod tests {
     }
 
     /// #697: the child gets `parent` without its agwinterm variables, in any
-    /// case, and without dropping anything else.
+    /// case, and without dropping anything else but the plugin directory
+    /// variable (its plugins are the sandbox's).
     #[test]
     fn the_agwinterm_variables_are_removed_from_the_child_and_nothing_else() {
         let parent = [
@@ -784,6 +857,7 @@ mod tests {
             "PATH",
             "XAGWINTERM_Y",
             "AGWINTER",
+            "yppx_plugin_dir",
         ]
         .map(|k| (OsString::from(k), OsString::from("v")));
         let cmd = command(Path::new("suite.exe"), Path::new("sandbox"), parent);
@@ -825,6 +899,7 @@ mod tests {
         let parent = [
             ("AGWINTERM_PIPE", "x"),
             ("docxy_config_dir", "stale"),
+            ("YPPX_PLUGIN_DIR", "elsewhere"),
             ("=C:", r"C:\w"),
             ("PATH", "p"),
         ]
@@ -864,6 +939,34 @@ mod tests {
             .collect();
         assert_eq!(block, want);
         assert_eq!(environment_block(&[]), [0, 0]);
+    }
+
+    /// A script's `plugin` lines copy the built libraries into the sandbox's
+    /// `docxy/plugins` under the name the suite loads; a missing one says
+    /// how to build it.
+    #[test]
+    fn plugins_are_copied_into_the_sandbox_under_the_loaders_name() {
+        let base = std::env::temp_dir().join(format!(
+            "uiharness-plugins-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let (bin, sandbox) = (base.join("bin"), base.join("sandbox"));
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join(built_plugin_name("yppx_a")), b"lib").unwrap();
+        install_plugins(&sandbox, &[], &bin).unwrap();
+        assert!(!plugins_dir(&sandbox).exists());
+        install_plugins(&sandbox, &["yppx_a".into()], &bin).unwrap();
+        let copied = plugins_dir(&sandbox).join(format!("yppx_a{}", std::env::consts::DLL_SUFFIX));
+        assert_eq!(std::fs::read(&copied).unwrap(), b"lib");
+        assert_eq!(plugins_dir(&sandbox), sandbox.join("docxy").join("plugins"));
+        let e = install_plugins(&sandbox, &["yppx_missing".into()], &bin).unwrap_err();
+        assert!(
+            e.contains("no yppx_missing format plugin") && e.contains("plugin_fixture"),
+            "{e}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// `CreateProcessW` takes the command line as one writable string, the

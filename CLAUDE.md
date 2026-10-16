@@ -211,3 +211,38 @@
   the caret section's current choice. Mirrored margins and Hyphenation write
   the package only (a settings part docxy cannot edit refuses) and have no
   undo in the terminal.
+
+## Format plugins
+
+- A format plugin is a `yppx_*` shared library (`.dll`/`.so`/`.dylib`)
+  implementing `projcore::plugin_abi` (C ABI, MSPDI XML text across it) that
+  adds project file types. `projcore::formats::Registry` holds the built-in
+  `.yppx` and `.xml`, then the host's `mppread::project::MppImport` (read-only
+  `.mpp`), then the plugins; a later registration replaces an extension's
+  reader and/or writer in place. The loader is `projcore::formats::plugin`,
+  behind the `plugins` feature (it adds `libloading`), which only native hosts
+  enable; projcore's default and wasm builds stay dependency-free.
+- `yppxy` loads them once at start from `<config>/yppxy/plugins`, then
+  `$YPPX_PLUGIN_DIR` (`yppxy/src/formats.rs`). The suite loads them into one
+  process-wide registry (`suite/docxy/src/project_formats.rs`, `global()`,
+  first asked in `main`) from `<config root>/docxy/plugins` (`DOCXY_CONFIG_DIR`
+  when set), then `$YPPX_PLUGIN_DIR`. That registry decides `is_project_path`,
+  the Open dialog's lists (`open_extensions()`), every read and write, the
+  Save As dialog's types (`save_types()`, registry order), the harness's
+  `save-as` and `save-types`, and control `proj.save`. Unit tests load none;
+  `project_formats::tests::Override` swaps in a stand-in per thread.
+- Imported-status rule: a Project type nothing writes is an import (status
+  "…, imported from .<ext>; Save As .yppx or MSPDI to keep edits", Save goes
+  to Save As, `proj.path`/`tab-list` `imported: true`). With a plugin that
+  writes `.mpp`, an `.mpp` tab saves in place. The opened file (re-read for a
+  sidecar restore, refreshed by `proj.reload`) is `ProjectView::source`, passed
+  to a plugin's save of the same extension only.
+- A plugin that fails to load is skipped: stderr and the crash log at start,
+  the first window's status line, never a dialog. The public build ships no
+  plugin; without one every list, status and refusal is the built-ins'.
+- The fixture is `projcore/tests/plugin_fixture` (lib `yppx_fixture`, a fake
+  `.fakeproj` type). `uiharness/cases/project-plugin.uit` starts with
+  `plugin yppx_fixture`: the runner copies it from beside uiharness into the
+  sandbox's `docxy/plugins` before launch (build with `cargo build --release
+  -p uiharness -p plugin_fixture`; `ui-sweep-linux` does). Harness instances
+  never inherit `$YPPX_PLUGIN_DIR`.

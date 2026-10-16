@@ -79,6 +79,33 @@ def script_editor(text):
     return None
 
 
+def script_plugins(text):
+    """The format plugins a suite script starts with (`plugin <name>` lines).
+
+    uiharness copies each, built beside it, into the suite's sandbox before
+    the launch; the parser takes them only before the first case.
+    """
+    names = []
+    for raw in text.splitlines():
+        words = strip_comment(raw).split()
+        if not words:
+            continue
+        if words[0].lower() == 'test':
+            break
+        if words[0].lower() == 'plugin' and len(words) == 2:
+            names.append(words[1])
+    return names
+
+
+def built_plugin(directory, name):
+    """Where `cargo build -p <fixture>` puts the plugin library `name`."""
+    if sys.platform == 'win32':
+        return directory / f'{name}.dll'
+    if sys.platform == 'darwin':
+        return directory / f'lib{name}.dylib'
+    return directory / f'lib{name}.so'
+
+
 @dataclass(frozen=True)
 class Entry:
     script: str
@@ -385,6 +412,11 @@ def main(argv=None):
     for app in sorted(e for e in editors if e):
         needed.append((term_bin / f'{app}{exe_suffix}',
                        'cargo build --release -p docxy -p xlsxy -p yppxy'))
+    # A suite script's format plugins are built beside uiharness.
+    plugins = {n for p in scripts for n in script_plugins(p.read_text(encoding='utf-8'))}
+    for name in sorted(plugins):
+        needed.append((built_plugin(uiharness.parent, name),
+                       'cargo build --release -p uiharness -p plugin_fixture'))
     for exe, build in needed:
         if not exe.is_file():
             parser.error(f'{exe} is missing; build it with: {build}')

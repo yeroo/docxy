@@ -5033,6 +5033,7 @@ dependencies = [
 name = "projcore"
 version = "0.1.0"
 dependencies = [
+ "libloading",
  "opccore",
 ]
 

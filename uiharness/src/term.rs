@@ -99,7 +99,7 @@ pub fn find_editor(app: &str, dir: Option<&Path>) -> Result<PathBuf, String> {
 }
 
 /// The environment an editor starts with: this process's, without the
-/// agwinterm variables (#697) and with every config root it reads pointed
+/// agwinterm variables (#697) or `YPPX_PLUGIN_DIR`, and with every config root it reads pointed
 /// into `home`, so its preferences, recent files and control discovery file
 /// are the case's own.
 pub fn editor_env(
@@ -120,6 +120,9 @@ pub fn editor_env(
         "TMUX",
         "TERM_PROGRAM",
         "DOCXY_CONFIG_DIR",
+        // yppxy's extra format plugin directory: a case's editor loads none
+        // but what its home holds.
+        crate::launch::PLUGIN_DIR_ENV,
     ];
     let mut env: Vec<(OsString, OsString)> = parent
         .into_iter()
@@ -565,6 +568,7 @@ mod tests {
                 ("appdata".into(), "C:/real".into()),
                 ("PATH".into(), "/bin".into()),
                 ("TERM".into(), "screen".into()),
+                ("YPPX_PLUGIN_DIR".into(), "/plugins".into()),
             ],
         );
         let get = |k: &str| {
@@ -574,6 +578,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert!(get("AGWINTERM_SESSION_ID").is_empty());
+        assert!(get("YPPX_PLUGIN_DIR").is_empty());
         assert_eq!(get("APPDATA"), [home.join("appdata").to_string_lossy()]);
         assert_eq!(
             get("XDG_CONFIG_HOME"),

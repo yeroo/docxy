@@ -83,6 +83,16 @@ class ScriptCases(unittest.TestCase):
                      for p in sweep.CASES.glob('terminal-*.uit')}
         self.assertEqual(sorted(set(committed.values())), ['docxy', 'xlsxy', 'yppxy'])
 
+    def test_reads_the_format_plugins_a_script_starts_with(self):
+        self.assertEqual(sweep.script_plugins('# p\nplugin yppx_a  # x\nplugin yppx_b\ntest t\n'),
+                         ['yppx_a', 'yppx_b'])
+        self.assertEqual(sweep.script_plugins('test t\nplugin yppx_a\n'), [],
+                         'only lines before the first case name plugins')
+        self.assertEqual(sweep.script_plugins('test t\n  open x.xlsx\n'), [])
+        self.assertEqual(
+            sweep.script_plugins((sweep.CASES / 'project-plugin.uit').read_text(encoding='utf-8')),
+            ['yppx_fixture'])
+
     def test_every_committed_script_declares_cases(self):
         for path in sorted(sweep.CASES.glob('*.uit')):
             self.assertTrue(sweep.script_cases(path.read_text(encoding='utf-8')), path.name)

@@ -1,6 +1,7 @@
 use super::*;
 use crate::dialog_host::{dialog_click, dialog_key};
 use core::prelude::v1::test;
+use projcore::mspdi;
 
 fn v(t: &DocTab) -> &ProjectView {
     let Surface::Project(v) = &t.surface else {
