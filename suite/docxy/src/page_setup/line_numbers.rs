@@ -98,7 +98,7 @@ pub(crate) fn line_numbers_dialog(tab: &DocTab) -> Result<Dialog, String> {
             ),
             None,
         ),
-        apply_to(ed, false),
+        apply_to(ed),
     ];
     d.buttons = ok_cancel();
     d.react = Some(Reaction(after_line_numbers_set));

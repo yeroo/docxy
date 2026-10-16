@@ -9,8 +9,8 @@
 //! what the page view and Save read.
 
 use super::{
-    Caret, EditKind, Editor, inline_len, resolve_para, spans_containers, split_paragraph_content,
-    tab_props_at,
+    Caret, EditKind, Editor, para_text_len, resolve_para, spans_containers,
+    split_paragraph_content, tab_props_at,
 };
 use crate::model::{Block, BreakKind, Inline, Paragraph, SectionProperties};
 use crate::sect::{SectionSetup, SectionStart};
@@ -322,7 +322,7 @@ impl Editor {
             return None;
         };
         let len = |b: usize| match self.doc.body.get(b) {
-            Some(Block::Paragraph(p)) => Some(p.content.iter().map(inline_len).sum::<usize>()),
+            Some(Block::Paragraph(p)) => Some(para_text_len(p)),
             _ => None,
         };
         let is_para = |b: usize| matches!(self.doc.body.get(b), Some(Block::Paragraph(_)));
@@ -333,7 +333,8 @@ impl Editor {
         // mark like any paragraph start.
         let mut lo_gap = None;
         let mut hi_moved = false;
-        if len(lb)? > 0 && len(lb)? == lo.offset && lb < hb {
+        let lb_len = len(lb)?;
+        if lb_len > 0 && lb_len == lo.offset && lb < hb {
             // From a paragraph's end: the selection starts with its mark, so
             // the text starts at the next block. A table there cannot start
             // the section by a split without a blank paragraph before it, so
@@ -345,11 +346,17 @@ impl Editor {
                 lo_gap = Some(lb);
             }
         }
-        let ends_section = matches!(
-            self.doc.body.get(hb),
-            Some(Block::Paragraph(p)) if p.props.section_break.is_some()
-        ) || hb + 1 >= self.doc.content_block_count();
-        if hi.offset == 0 && (len(hb)? > 0 || !ends_section) && hb > lb && is_para(hb - 1) {
+        let ends_section = |b: usize| {
+            matches!(
+                self.doc.body.get(b),
+                Some(Block::Paragraph(p)) if p.props.section_break.is_some()
+            ) || b + 1 >= self.doc.content_block_count()
+        };
+        // A blank first paragraph of the next section is not this section's.
+        let blank_end = len(hb)? == 0
+            && ends_section(hb)
+            && self.section_of_block(hb) == self.section_of_block(lb);
+        if hi.offset == 0 && !blank_end && hb > lb && is_para(hb - 1) {
             // To a paragraph's start: the text ends with the previous mark.
             hb -= 1;
             hi_moved = true;
@@ -377,11 +384,7 @@ impl Editor {
             Cut::Mid
         };
         let hi_cut = if hi.offset == hlen {
-            let carries = matches!(
-                &self.doc.body[hb],
-                Block::Paragraph(p) if p.props.section_break.is_some()
-            );
-            if carries || hb + 1 >= self.doc.content_block_count() {
+            if ends_section(hb) {
                 Cut::Edge
             } else {
                 Cut::Gap(hb)
@@ -390,6 +393,18 @@ impl Editor {
             Cut::Mid
         };
         if lo_cut == Cut::Edge && hi_cut == Cut::Edge {
+            return None;
+        }
+        // A tracked paragraph mark would take the break with it on Accept or
+        // Reject: Selected text is not offered there.
+        let tracked = |c: &Cut| match c {
+            Cut::Gap(p) => matches!(
+                self.doc.body.get(*p),
+                Some(Block::Paragraph(q)) if !q.props.mark_revisions.is_empty()
+            ),
+            _ => false,
+        };
+        if tracked(&lo_cut) || tracked(&hi_cut) {
             return None;
         }
         Some((lo, hi, lo_cut, hi_cut))
@@ -1014,6 +1029,37 @@ mod tests {
         assert_eq!(e.sections().len(), 4);
         assert_eq!(margin(&e, 1), 720);
         assert_eq!(texts(&e)[0], "al");
+    }
+
+    #[test]
+    fn a_blank_first_paragraph_of_the_next_section_does_not_refuse_the_selection_1272() {
+        let mut doc = Document {
+            body: vec![para("alpha beta", Some(&sect(""))), para("", None)],
+        };
+        doc.set_trailing_section_properties(SectionProperties {
+            raw: sect(""),
+            property_change: None,
+        });
+        let mut e = Editor::new(doc);
+        select(&mut e, (0, 2), (1, 0));
+        assert!(e.selection_section_wrappable());
+        assert_eq!(e.selection_wrap_section(), Some(0));
+    }
+
+    #[test]
+    fn a_tracked_paragraph_mark_at_a_gap_is_not_offered_1272() {
+        let mut e = wrap_doc();
+        select(&mut e, (1, 0), (1, 5)); // gaps after "alpha beta" and "gamma"
+        assert!(e.selection_section_wrappable());
+        if let Block::Paragraph(p) = &mut e.doc.body[1] {
+            p.props
+                .mark_revisions
+                .push(crate::model::ParagraphMarkRevision {
+                    kind: crate::model::RevisionKind::Insert,
+                    metadata: Default::default(),
+                });
+        }
+        assert!(!e.selection_section_wrappable());
     }
 
     #[test]

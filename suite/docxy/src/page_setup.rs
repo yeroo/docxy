@@ -99,28 +99,40 @@ fn caret_setup(ed: &Editor) -> SectionSetup {
 
 /// "Apply to"'s choices: Word's, with Selected sections in place of This
 /// section when the selection spans several, and only Whole document and
-/// This point forward in a one-section document. Selected text (#1272) is
-/// offered, and the default, for a text selection inside one section that
-/// does not cover all of it: after This section, else first. Line Numbers
-/// keeps its own Apply to without it.
-fn apply_to(ed: &Editor, selected_text: bool) -> Control {
-    let mut items: Vec<&str> = if ed.sections().len() == 1 {
+/// This point forward in a one-section document. Line Numbers uses these.
+fn apply_to(ed: &Editor) -> Control {
+    apply_control(&apply_choices(ed), 0)
+}
+
+/// [`apply_to`] plus Selected text (#1272), offered, and the default, for a
+/// text selection inside one section that does not cover all of it: after
+/// This section, else first.
+fn apply_to_with_selected_text(ed: &Editor) -> Control {
+    let mut items = apply_choices(ed);
+    let mut default = 0;
+    if ed.selection_section_wrappable() {
+        default = usize::from(items[0] == THIS_SECTION);
+        items.insert(default, SELECTED_TEXT);
+    }
+    apply_control(&items, default)
+}
+
+fn apply_choices(ed: &Editor) -> Vec<&'static str> {
+    if ed.sections().len() == 1 {
         vec![WHOLE, FORWARD]
     } else if ed.target_sections().len() > 1 {
         vec![SELECTED_SECTIONS, FORWARD, WHOLE]
     } else {
         vec![THIS_SECTION, FORWARD, WHOLE]
-    };
-    let mut default = 0;
-    if selected_text && ed.selection_section_wrappable() {
-        default = usize::from(items[0] == THIS_SECTION);
-        items.insert(default, SELECTED_TEXT);
     }
+}
+
+fn apply_control(items: &[&str], default: usize) -> Control {
     choice(
         "apply",
         "Apply to:",
         ControlKind::Dropdown,
-        &items,
+        items,
         Some(default),
         None,
     )
@@ -201,7 +213,7 @@ pub(crate) fn page_setup_dialog(tab: &DocTab, page: PageSetupTab) -> Result<Dial
         ),
         number("header", "Header from edge:", m.header, Some(2)),
         number("footer", "Footer from edge:", m.footer, Some(2)),
-        apply_to(ed, true),
+        apply_to_with_selected_text(ed),
         hidden("caret_sect", dialog_raw(ed)),
         hidden("paper_pick", String::new()),
     ];
@@ -812,7 +824,7 @@ pub(crate) fn columns_dialog(tab: &DocTab) -> Result<Dialog, String> {
             ControlKind::Checkbox,
             Value::Bool(c.sep),
         ),
-        apply_to(ed, true),
+        apply_to_with_selected_text(ed),
         hidden("text_width", tw.to_string()),
     ]);
     show_rows(&mut d);
