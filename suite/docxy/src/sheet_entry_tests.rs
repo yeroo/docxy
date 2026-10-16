@@ -2011,7 +2011,9 @@ fn the_autocorrect_switches_turn_the_table_rules_off() {
 
 /// #510: everything that reads or rewrites cell content or moves cells
 /// closes the editor first; formatting and dialog/bar openers that neither
-/// read nor rewrite cell values, and the pick list, leave it open.
+/// read nor rewrite cell values, and the pick list, leave it open. Copy and
+/// Cut commit it too, except while its text is selected (#1340, see
+/// `copy_and_cut_leave_the_entry_open_only_while_its_text_is_selected_1340`).
 #[test]
 fn acts_that_rewrite_cells_close_the_editor() {
     for act in [
@@ -2278,4 +2280,99 @@ fn tab_run_does_not_cross_sheets() {
     v.tab_run.as_mut().unwrap().sheet = v.active + 1;
     enter_text(&mut v, "2");
     assert_eq!(v.sel, (1, 1));
+}
+
+// ---- #1340: Ctrl+A in an open entry selects its text ---------------------------
+
+#[test]
+fn select_all_in_the_entry_selects_its_text_and_typing_replaces_it_1340() {
+    for mode in [EditMode::Enter, EditMode::Edit] {
+        let mut v = old_book();
+        v.begin_cell_edit(Some(String::new()));
+        v.edit_mode = mode;
+        v.edit_type("abcd");
+        v.edit_caret = 1;
+        v.end_revert_for_key("a", true, false, false);
+        v.edit_select_entry();
+        assert_eq!(v.editing.as_deref(), Some("abcd"), "{mode:?}");
+        assert_eq!(v.edit_selected_text().as_deref(), Some("abcd"), "{mode:?}");
+        assert_eq!(v.edit_caret, 4);
+        // Ctrl+C / Ctrl+X read the selection, so it survives their key.
+        v.end_revert_for_key("c", true, false, false);
+        assert!(v.edit_selected_text().is_some(), "{mode:?}");
+        v.edit_type("X");
+        assert_eq!(v.editing.as_deref(), Some("X"), "{mode:?}");
+        assert!(v.edit_selected_text().is_none());
+    }
+}
+
+#[test]
+fn backspace_and_delete_empty_a_selected_entry_1340() {
+    for delete in [false, true] {
+        let mut v = old_book();
+        v.begin_cell_edit(Some(String::new()));
+        v.edit_type("abcd");
+        v.edit_select_entry();
+        if delete {
+            v.edit_delete();
+        } else {
+            v.edit_backspace();
+        }
+        assert_eq!(v.editing.as_deref(), Some(""));
+    }
+}
+
+#[test]
+fn other_keys_and_touches_end_the_entry_selection_1340() {
+    let mut v = old_book();
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_type("abcd");
+    v.edit_select_entry();
+    v.end_revert_for_key("left", false, false, false);
+    assert!(v.edit_selected_text().is_none());
+    v.edit_select_entry();
+    v.edit_touched();
+    assert!(v.edit_selected_text().is_none());
+    // Ctrl+V is not a key that keeps it.
+    v.edit_select_entry();
+    v.end_revert_for_key("v", true, false, false);
+    assert!(v.edit_selected_text().is_none());
+}
+
+#[test]
+fn select_all_drops_a_proposal_and_leaves_the_text_1340() {
+    let mut v = old_book();
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_type("old");
+    v.edit_proposal = Some((2, "d".to_string()));
+    v.edit_select_entry();
+    assert_eq!(v.edit_selected_text().as_deref(), Some("ol"));
+    assert!(v.edit_proposal.is_none());
+}
+
+#[test]
+fn copy_and_cut_leave_the_entry_open_only_while_its_text_is_selected_1340() {
+    let mut v = old_book();
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_type("abcd");
+    // Nothing selected: the old path, which commits the entry and copies cells.
+    for act in [SheetAct::Copy, SheetAct::Cut] {
+        assert!(!act_takes_entry_text(act, &v), "{act:?}");
+        assert!(act_commits_editor(act), "{act:?}");
+    }
+    v.edit_select_entry();
+    for act in [SheetAct::Copy, SheetAct::Cut] {
+        assert!(act_takes_entry_text(act, &v), "{act:?}");
+    }
+    assert!(!act_takes_entry_text(SheetAct::Paste, &v));
+    assert!(!act_takes_entry_text(SheetAct::Bold, &v));
+    // An empty entry has no text to take, even when "selected".
+    let mut e = old_book();
+    e.begin_cell_edit(Some(String::new()));
+    e.edit_select_entry();
+    assert!(e.edit_selected_text().is_none());
+    assert!(!act_takes_entry_text(SheetAct::Copy, &e));
+    // Cut takes the text out of the entry.
+    v.edit_clear_selected();
+    assert_eq!(v.editing.as_deref(), Some(""));
 }

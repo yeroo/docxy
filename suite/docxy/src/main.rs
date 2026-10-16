@@ -747,8 +747,9 @@ struct SheetView {
     /// seed): an immediate second Ctrl+Z puts it back, any other key drops
     /// it (#1147).
     edit_redo: Option<EditRedo>,
-    /// After a revert in Enter mode the restored text is selected: the next
-    /// typed character replaces it, Backspace or Delete empties it.
+    /// The entry's whole-text selection, set by a revert in Enter mode or by
+    /// Ctrl+A (#1340): the next typed character replaces it, Backspace or
+    /// Delete empties it, Ctrl+C / Ctrl+X take it.
     edit_select_all: bool,
     /// The last formatting change, for F4 (repeat), and its step's name. A
     /// resolved setter (bold ON), so repeating applies it rather than
@@ -1416,6 +1417,13 @@ fn act_targets_cells(act: SheetAct) -> bool {
             | SheetAct::Calc(_)
             | SheetAct::Todo
     )
+}
+
+/// Copy and Cut act on an open entry's selected text rather than the cells
+/// (#1340): only while some of it is selected, else they commit the entry
+/// ([`act_commits_editor`]) and copy the cells as before.
+fn act_takes_entry_text(act: SheetAct, v: &SheetView) -> bool {
+    matches!(act, SheetAct::Copy | SheetAct::Cut) && v.edit_selected_text().is_some()
 }
 
 /// Does `act` need a closed cell editor? (#510) Everything that reads or
@@ -3529,8 +3537,9 @@ impl SheetView {
 
     /// What `key` does to a revert's toggle and selection (#1147): the revert
     /// itself (Ctrl+Z, Alt+Backspace) keeps them, a typed character, Backspace
-    /// or Delete uses the selection up itself, any other key (a lone modifier
-    /// aside) drops both.
+    /// or Delete uses the selection up itself, Ctrl+A / Ctrl+C / Ctrl+X keep
+    /// the selection but drop the toggle (#1340), any other key (a lone
+    /// modifier aside) drops both.
     fn end_revert_for_key(&mut self, key: &str, ctrl: bool, alt: bool, typed: bool) {
         let modifier = matches!(key, "shift" | "control" | "alt" | "platform" | "function");
         if self.editing.is_none() || modifier || (ctrl && key == "z") || (alt && key == "backspace")
@@ -3539,9 +3548,29 @@ impl SheetView {
         }
         self.edit_redo = None;
         let uses_it = !ctrl && !alt && (typed || key == "backspace" || key == "delete");
-        if !uses_it {
+        // Ctrl+A selects the entry's text and Ctrl+C / Ctrl+X read it (#1340).
+        let keeps_it = ctrl && !alt && matches!(key, "a" | "c" | "x");
+        if !uses_it && !keeps_it {
             self.edit_select_all = false;
         }
+    }
+
+    /// Ctrl+A in the entry: the whole text is selected, so the next typed
+    /// character replaces it, Backspace or Delete empties it, and Ctrl+C
+    /// copies it (#1340). A proposed completion is dropped first.
+    fn edit_select_entry(&mut self) {
+        self.drop_proposal();
+        self.edit_caret_to_end();
+        self.edit_select_all = true;
+        self.edit_redo = None;
+    }
+
+    /// The entry's selected text, if Ctrl+A (or a revert) selected some.
+    fn edit_selected_text(&self) -> Option<String> {
+        self.edit_select_all
+            .then(|| self.editing.clone())
+            .flatten()
+            .filter(|t| !t.is_empty())
     }
 
     /// The caret or buffer changed by something other than typing (a click, a
@@ -4195,7 +4224,8 @@ impl SheetView {
             buf_insert(buf, &mut self.edit_caret, s);
         }
     }
-    /// A revert's selected text goes when anything is typed or deleted.
+    /// The entry's selected text (a revert's, or Ctrl+A's) goes when anything
+    /// is typed or deleted.
     fn edit_clear_selected(&mut self) -> bool {
         self.edit_redo = None;
         if !std::mem::take(&mut self.edit_select_all) {
@@ -17678,6 +17708,25 @@ impl Docxy {
         })
     }
 
+    /// Ctrl+C / Ctrl+X in an open cell entry (#1340): the selected text goes
+    /// to the clipboard (and the Office Clipboard), a cut also empties the
+    /// entry. Run only with text selected (else the cells' copy runs); the
+    /// copied cells (`grid_clip`) are left as they were.
+    fn sheet_entry_copy(&mut self, cut: bool, cx: &mut Context<Self>) {
+        let Some(v) = self.active_sheet_mut() else {
+            return;
+        };
+        let Some(text) = v.edit_selected_text() else {
+            return;
+        };
+        if cut {
+            v.edit_clear_selected();
+        }
+        self.clipboard_write(text.clone(), cx);
+        self.office_clip.push(&text);
+        cx.notify();
+    }
+
     /// Copy (or cut) the selected range into the grid clipboard and, as TSV, the
     /// system clipboard. A cut only marks its range, as Excel's does: the
     /// paste moves the cells ([`SheetView::paste_grid_clip`], #664).
@@ -20098,6 +20147,15 @@ impl Docxy {
         if let SheetAct::Help(a) = act {
             return self.help_act(a, window, cx);
         }
+        // Copy and Cut with text selected in an open entry act on that text,
+        // never on the cells, and leave the entry open; with none selected
+        // they commit the entry and copy the cells as before (#1340).
+        if self
+            .active_sheet()
+            .is_some_and(|v| act_takes_entry_text(act, v))
+        {
+            return self.sheet_entry_copy(act == SheetAct::Cut, cx);
+        }
         // Protected View (#610): the ribbon is hidden, but shortcuts, KeyTips
         // and the harness's `ribbon-click` still come here.
         if !protected_view_allows_act(act) && self.protected_refused(cx) {
@@ -20649,8 +20707,11 @@ impl Docxy {
                 "+" => return self.sheet_struct_chord(true, editing, window, cx),
                 "-" if !shift => return self.sheet_struct_chord(false, editing, window, cx),
                 "a" => {
-                    // Select the whole used range.
-                    if let Some(v) = self.active_sheet_mut() {
+                    // In an open entry, select its text (#1340); otherwise
+                    // the whole used range.
+                    if let Some(v) = self.active_sheet_mut().filter(|v| v.editing.is_some()) {
+                        v.edit_select_entry();
+                    } else if let Some(v) = self.active_sheet_mut() {
                         let (mr, mc) = v.extent();
                         v.sel = (0, 0);
                         v.clear_areas();
