@@ -616,8 +616,9 @@ pub fn write_cfb_tree(root_children: &[Node]) -> Vec<u8> {
 /// FAT-sector pointers (~7 MB).
 ///
 /// The directory keeps three rules that a lenient reader (this module's
-/// [`Cfb`] among them) lets pass but strict ones hold a file to: Microsoft
-/// Project 2024 silently refuses a file that breaks any of them.
+/// [`Cfb`] among them) lets pass but strict ones hold a file to. Microsoft
+/// Project 2024 refuses a file that breaks the first or the third, the
+/// third without saying so; the second is what its own files do.
 ///
 /// 1. Each storage's children form a red-black tree in [MS-CFB] name order:
 ///    shorter names first, then names of one length compared code unit by
@@ -628,7 +629,8 @@ pub fn write_cfb_tree(root_children: &[Node]) -> Vec<u8> {
 ///    original's ([`Cfb::root_clsid`]).
 /// 3. A storage with no children is still written as a directory entry, so
 ///    a rewrite that keeps the original's empty storages
-///    ([`Cfb::storage_paths`]) keeps those the application looks for.
+///    ([`Cfb::storage_paths`]) keeps those the application looks for (an
+///    `.mpp` file's empty `CVba`, say).
 ///
 /// Names are cut to 31 UTF-16 code units. Siblings whose names differ only
 /// in case, which [MS-CFB] forbids, are the caller's to avoid.
