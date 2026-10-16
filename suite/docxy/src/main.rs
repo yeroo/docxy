@@ -5273,6 +5273,9 @@ struct Docxy {
     /// ([`FindField::idx`]); the doc bar keeps appending (#1342).
     sf_caret: [usize; 2],
     sf_sel: [bool; 2],
+    /// The text length each caret was kept for: another path (the doc bar,
+    /// the selection seed) that edits the text leaves it behind.
+    sf_len: [usize; 2],
     find_case: bool,
     /// The find bar's current match and its index in the search it came from
     /// (see `find_step_in`).
@@ -13257,6 +13260,7 @@ impl Docxy {
             find_field: FindField::Query,
             sf_caret: [0; 2],
             sf_sel: [false; 2],
+            sf_len: [0; 2],
             find_case: false,
             find_cur: None,
             picker: None,
@@ -18826,24 +18830,45 @@ impl Docxy {
         }
     }
 
-    /// The sheet Find bar's caret for `f`, clamped to its text.
+    /// The sheet Find bar's caret for `f`: kept while its text is as the bar
+    /// left it, else at the end.
     fn sf_caret_of(&self, f: FindField) -> usize {
-        self.sf_caret[f.idx()].min(self.sf_text(f).chars().count())
+        let i = f.idx();
+        field_edit::current(
+            self.sf_text(f),
+            self.sf_caret[i],
+            self.sf_sel[i],
+            self.sf_len[i],
+        )
+        .0
+    }
+
+    /// Whether `f`'s whole text is selected.
+    fn sf_sel_of(&self, f: FindField) -> bool {
+        let i = f.idx();
+        field_edit::current(
+            self.sf_text(f),
+            self.sf_caret[i],
+            self.sf_sel[i],
+            self.sf_len[i],
+        )
+        .1
     }
 
     /// Open the sheet Find bar's fields with the caret at each text's end.
     fn sf_reset(&mut self) {
         self.sf_sel = [false; 2];
         for f in [FindField::Query, FindField::Replace] {
-            self.sf_caret[f.idx()] = self.sf_text(f).chars().count();
+            let n = self.sf_text(f).chars().count();
+            self.sf_caret[f.idx()] = n;
+            self.sf_len[f.idx()] = n;
         }
     }
 
     /// Focus field `f` (a click or Tab): caret at its end, nothing selected.
     fn sf_focus(&mut self, f: FindField) {
         self.find_field = f;
-        self.sf_sel = [false; 2];
-        self.sf_caret[f.idx()] = self.sf_text(f).chars().count();
+        self.sf_reset();
     }
 
     /// One caret edit of the focused sheet Find bar field.
@@ -18851,7 +18876,7 @@ impl Docxy {
         let f = self.find_field;
         let i = f.idx();
         let mut caret = self.sf_caret_of(f);
-        let mut sel = self.sf_sel[i];
+        let mut sel = self.sf_sel_of(f);
         let text = match f {
             FindField::Query => &mut self.find_query,
             FindField::Replace => &mut self.replace_text,
@@ -18859,6 +18884,7 @@ impl Docxy {
         field_edit::apply(text, &mut caret, &mut sel, op);
         self.sf_caret[i] = caret;
         self.sf_sel[i] = sel;
+        self.sf_len[i] = self.sf_text(f).chars().count();
     }
 
     /// Route a keystroke to the open find bar (query / replace fields).
@@ -18883,13 +18909,13 @@ impl Docxy {
             }
             return;
         }
-        if ctrl {
+        // Ctrl+Alt is AltGr on Windows: its keys are text, not chords.
+        if ctrl && !alt {
             match key {
                 "a" => self.sf_edit(Op::SelectAll),
                 "c" | "x" => {
-                    let i = f.idx();
                     let text = self.sf_text(f).clone();
-                    if self.sf_sel[i] && !text.is_empty() {
+                    if self.sf_sel_of(f) && !text.is_empty() {
                         self.clipboard_write(text.clone(), cx);
                         self.office_clip.push(&text);
                         if key == "x" {
@@ -22298,7 +22324,6 @@ impl Docxy {
         self.find_cur = None;
         if self.find_open {
             self.find_field = FindField::Query;
-            self.sf_reset();
             // Seed from the current selection, if any, for a quick "find selected".
             if let Some(ed) = self.active_editor() {
                 let sel = ed.selection_text();
@@ -22306,6 +22331,7 @@ impl Docxy {
                     self.find_query = sel;
                 }
             }
+            self.sf_reset();
             self.find_step(false, false, cx); // highlight the first match
             self.refocus(window, cx);
         } else {
@@ -24414,6 +24440,17 @@ impl Docxy {
         if self.active_is_sheet()
             && sheet_complete::alt_backspace_key(&key, *m)
             && self.active_sheet().is_some_and(|v| v.editing.is_some())
+        {
+            self.keytips = KeyTip::Off;
+            return self.sheet_key(ev, ctrl, shift, m.alt, key.as_str(), window, cx);
+        }
+        // Alt+R / Alt+A in the sheet Find bar: Replace / Replace All (#1342),
+        // past the KeyTips the bare Alt raised (they would pick a tab).
+        if self.active_is_sheet()
+            && self.find_open
+            && m.alt
+            && !ctrl
+            && matches!(key.as_str(), "r" | "a")
         {
             self.keytips = KeyTip::Off;
             return self.sheet_key(ev, ctrl, shift, m.alt, key.as_str(), window, cx);
@@ -34211,7 +34248,7 @@ impl Docxy {
                     "sf-q",
                     &self.find_query,
                     self.sf_caret_of(FindField::Query),
-                    qf && self.sf_sel[0],
+                    qf && self.sf_sel_of(FindField::Query),
                     qf,
                     "Find in sheet",
                 )
@@ -34239,7 +34276,7 @@ impl Docxy {
                     "sf-r",
                     &self.replace_text,
                     self.sf_caret_of(FindField::Replace),
-                    rf && self.sf_sel[1],
+                    rf && self.sf_sel_of(FindField::Replace),
                     rf,
                     "Replace with",
                 )

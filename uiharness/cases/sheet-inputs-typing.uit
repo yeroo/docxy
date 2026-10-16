@@ -575,7 +575,10 @@ test sheet sheet-find: Alt+R replaces the match
   call real-type {"text":"West"}
   call real-key {"key":"enter"}
   assert sel is A5
+  call real-key {"key":"alt"}
+  assert keytips_up is true
   call real-key {"key":"alt+r"}
+  assert keytips_up is false
   call cell {"cell":"A5"}
   assert reply.text is X
   call real-key {"key":"escape"}
@@ -593,7 +596,10 @@ test sheet sheet-find: Alt+A replaces all
   call real-type {"text":"X"}
   call pointer-click {"input":"sheet-find"}
   call real-type {"text":"West"}
+  call real-key {"key":"alt"}
+  assert keytips_up is true
   call real-key {"key":"alt+a"}
+  assert keytips_up is false
   call cell {"cell":"A5"}
   assert reply.text is X
   call real-key {"key":"escape"}

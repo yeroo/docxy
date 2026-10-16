@@ -478,7 +478,7 @@ pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
                 Json::Null
             };
             let len = text.chars().count();
-            let selection = if focused && app.sf_sel[field.idx()] && len > 0 {
+            let selection = if focused && app.sf_sel_of(field) && len > 0 {
                 Json::Arr(vec![num(0), num(len)])
             } else {
                 Json::Null

@@ -16,9 +16,20 @@ pub(crate) enum Op<'a> {
     SelectAll,
 }
 
-/// Apply `op`; `caret` is clamped to the text first. Returns whether the text
-/// changed.
-pub(crate) fn apply(text: &mut String, caret: &mut usize, sel: &mut bool, op: Op) -> bool {
+/// The caret and selection to use for `text`: those kept, unless the text's
+/// length is no longer the one they were kept for (another path edited the
+/// text), when the caret is at the end and nothing is selected.
+pub(crate) fn current(text: &str, caret: usize, sel: bool, seen_len: usize) -> (usize, bool) {
+    let len = text.chars().count();
+    if len != seen_len {
+        (len, false)
+    } else {
+        (caret.min(len), sel && len > 0)
+    }
+}
+
+/// Apply `op`; `caret` is clamped to the text first.
+pub(crate) fn apply(text: &mut String, caret: &mut usize, sel: &mut bool, op: Op) {
     let len = text.chars().count();
     *caret = (*caret).min(len);
     let had_sel = std::mem::take(sel) && len > 0;
@@ -29,20 +40,9 @@ pub(crate) fn apply(text: &mut String, caret: &mut usize, sel: &mut bool, op: Op
         cleared = true;
     }
     match op {
-        Op::Insert(s) => {
-            buf_insert(text, caret, s);
-            return cleared || !s.is_empty();
-        }
-        Op::Backspace if !cleared => {
-            let before = text.len();
-            buf_backspace(text, caret);
-            return text.len() != before;
-        }
-        Op::Delete if !cleared => {
-            let before = text.len();
-            buf_delete(text, *caret);
-            return text.len() != before;
-        }
+        Op::Insert(s) => buf_insert(text, caret, s),
+        Op::Backspace if !cleared => buf_backspace(text, caret),
+        Op::Delete if !cleared => buf_delete(text, *caret),
         Op::Backspace | Op::Delete => {}
         Op::Left => *caret = if had_sel { 0 } else { caret.saturating_sub(1) },
         Op::Right => *caret = if had_sel { len } else { (*caret + 1).min(len) },
@@ -53,7 +53,6 @@ pub(crate) fn apply(text: &mut String, caret: &mut usize, sel: &mut bool, op: Op
             *sel = len > 0;
         }
     }
-    cleared
 }
 
 #[cfg(test)]
@@ -153,6 +152,14 @@ mod tests {
             run("", 0, false, vec![Op::SelectAll]),
             (String::new(), 0, false)
         );
+    }
+
+    #[test]
+    fn a_text_edited_elsewhere_resets_caret_and_selection() {
+        assert_eq!(current("abcdef", 1, true, 3), (6, false));
+        assert_eq!(current("abc", 1, true, 3), (1, true));
+        assert_eq!(current("abc", 9, false, 3), (3, false));
+        assert_eq!(current("", 0, true, 0), (0, false));
     }
 
     #[test]
