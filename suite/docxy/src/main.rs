@@ -63,6 +63,7 @@ mod hf_insert;
 mod hf_tab;
 mod hl_mode;
 mod html_bundle;
+mod hyphenation_dialog;
 mod inputs;
 mod inspector;
 mod layout_tab;
@@ -28855,8 +28856,7 @@ fn ribbon_tab_name(tab: RibbonTab) -> &'static str {
 /// Whether a ribbon command can run now: its button draws greyed and takes
 /// no click when it cannot, a split button's menu greys the item, and
 /// `ribbon-read` reports the same. Every ribbon command can run except the
-/// Layout tab's placeholders (`LayoutAct::Unavailable`: Manual and
-/// Hyphenation Options...); a row menu's items have
+/// Layout tab's placeholders (`LayoutAct::Unavailable`: Manual); a row menu's items have
 /// their own rules (`project_row_menu`).
 fn act_enabled(act: Act) -> bool {
     match act {

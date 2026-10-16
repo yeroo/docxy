@@ -232,6 +232,24 @@ dialogs! {
         accept_closes: true,
         unreachable: None,
     }
+    HYPHENATION = "hyphenation" {
+        surface: Surface::Doc,
+        file: "doc-layout",
+        fixture: DOCX,
+        open: &[
+            r#"call menu-open {"target":{"ribbon":["Layout","Page Setup","Hyphenation"]}}"#,
+            r#"call menu-click {"label":"Hyphenation Options..."}"#,
+        ],
+        fields: &[
+            checkbox("auto"),
+            checkbox("caps"),
+            Field::number("zone", "0.5").kept("0.5"),
+            Field::number("limit", "3").kept("3"),
+        ],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
     HF_DISTANCE = "hf-distance" {
         surface: Surface::Doc,
         file: "doc-layout",

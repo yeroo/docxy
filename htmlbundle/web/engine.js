@@ -658,6 +658,7 @@
     'Layout(Columns(Two))': NOT_YET,
     'Layout(Hyphen(false))': NOT_YET,
     'Layout(Hyphen(true))': NOT_YET,
+    'Layout(HyphenationOptions)': NOT_YET,
     'Layout(LineNumbers(Continuous))': NOT_YET,
     'Layout(LineNumbers(None))': NOT_YET,
     'Layout(LineNumbers(RestartEachPage))': NOT_YET,
