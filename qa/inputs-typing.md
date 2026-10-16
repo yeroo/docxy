@@ -37,7 +37,7 @@ Every editable input in the suite is typed into with real keys by a case:
   All buttons are clicked for real, and Alt+R and Alt+A press them too (#1342).
 - **The document's inputs** (#1201) are typed into by the hand-written
   `uiharness/cases/doc-inputs-typing.uit` the same way: the Find bar's Find
-  and Replace fields, Home's Font and Font Size boxes, and the comment editor,
+  and Replace fields (a caret, like the sheet's, #1360), Home's Font and Font Size boxes, and the comment editor,
   which Review > New Comment on a selection opens focused (a click on it does
   nothing more). Each test opens its own copy of `doc-table.docx` and checks
   one step against what Word does, except that Enter in the Replace field

@@ -554,8 +554,9 @@ pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
 }
 
 /// `field-read {"input":id}` for a document input, in the sheet inputs'
-/// shape. The Find bar's fields and the comment editor append and pop only,
-/// so a focused one's caret is its end; the Find bar is the window's, shared
+/// shape. The Find bar's fields keep a caret and whole-field selection
+/// (`sf_state`, as the sheet bar's, #1360); the comment editor appends and
+/// pops only, so its focused caret is its end; the Find bar is the window's, shared
 /// with the sheet's, so it reads only while a document is active. Ctrl+F
 /// opens the Find bar under an open comment bar, but `on_key` gives the
 /// comment bar the keys first, so a Find field is focused only while no
@@ -578,7 +579,25 @@ fn read_doc(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
                 (&app.replace_text, crate::FindField::Replace)
             };
             let focused = app.find_open && !app.comment_open && app.find_field == field;
-            (Json::Str(text.clone()), focused, end_if(text, focused))
+            let (caret, sel) = app.sf_state(field);
+            let len = text.chars().count();
+            let selection = if focused && sel && len > 0 {
+                Json::Arr(vec![Json::Num(0.0), Json::Num(len as f64)])
+            } else {
+                Json::Null
+            };
+            let caret = if focused {
+                Json::Num(caret as f64)
+            } else {
+                Json::Null
+            };
+            return Ok(field_json(
+                i.id,
+                Json::Str(text.clone()),
+                focused,
+                caret,
+                selection,
+            ));
         }
         "doc-font" | "doc-font-size" => {
             let cmd = if i.id == "doc-font" {
