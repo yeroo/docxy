@@ -552,8 +552,7 @@ footer editor; `selection-set` refuses while it is open.
 
 `ribbon-read` and `ribbon-click` work on document, Project and sheet tabs. Each
 command's `enabled` is the predicate its button draws with (every document and
-Project ribbon command is enabled today except the document Layout tab's
-placeholders, `LayoutAct::Unavailable`: Manual, and
+Project ribbon command is enabled today except
 the Design tab's Page Borders on a Markdown tab,
 which keeps no section properties; sheet placeholders, drawn but doing nothing
 yet, report `enabled: false`, see below), and a command inside a split button's or a
@@ -1361,8 +1360,9 @@ Menus open today:
   opens one. The items follow Word, with its separators and the Breaks menu's
   `Page Breaks` / `Section Breaks` headings; the current choice is `checked`
   (the caret section's margins, orientation, size, columns and line numbers,
-  and the document's hyphenation). Manual reads
-  `enabled: false`. Custom Margins... and More Paper Sizes... open the
+  and the document's hyphenation). Manual starts the
+  Manual Hyphenation walk (the `manual-hyphenation` dialog: Yes, No, Cancel).
+  Custom Margins... and More Paper Sizes... open the
   `page-setup` dialog, More Columns... the `columns` one, and Line Numbering
   Options... the `line-numbers` one, Hyphenation Options... the `hyphenation`
   one;

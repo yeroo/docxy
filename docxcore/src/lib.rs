@@ -40,6 +40,7 @@ pub mod final_mark;
 pub mod frame;
 pub mod hf;
 pub mod highlight;
+pub mod hyphenate;
 pub mod image;
 pub mod import;
 pub mod inspect;

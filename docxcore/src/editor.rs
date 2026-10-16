@@ -59,6 +59,57 @@ impl Caret {
     }
 }
 
+/// A word Manual hyphenation proposes (#1266): its paragraph, editor offsets
+/// `start..end`, text, and the char index in it where the hyphen is proposed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HyphenCandidate {
+    pub path: Vec<usize>,
+    pub start: usize,
+    pub end: usize,
+    pub word: String,
+    pub point: usize,
+}
+
+/// For each editor char of `items`, whether Manual hyphenation must leave it
+/// alone (#1266): it is in a hyperlink, or between a complex field's begin
+/// and end (`depth` open fields on entry, updated). Appends one flag per char.
+fn walk_barred(items: &[Inline], out: &mut Vec<bool>, depth: &mut i32, in_link: bool) {
+    use crate::field::{FieldEvent, field_events};
+    let step = |raw: &str, depth: &mut i32| {
+        for e in field_events(raw) {
+            match e {
+                FieldEvent::Begin => *depth += 1,
+                FieldEvent::End => *depth = (*depth - 1).max(0),
+                _ => {}
+            }
+        }
+    };
+    for item in items {
+        match item {
+            Inline::Raw(raw) if crate::load::is_field_code_raw(raw) => step(raw, depth),
+            // Zero-width ([`inline_len`]): only its fields count.
+            Inline::UnsupportedRevision { raw, .. } => step(raw, depth),
+            Inline::Hyperlink(h) if !h.content.is_empty() => {
+                out.resize(out.len() + link_runs_len(h), true);
+                walk_barred(&h.content, out, depth, true)
+            }
+            // Zero-width in the editor ([`inline_len`]): its fields still
+            // open and close, but it adds no chars to flag.
+            Inline::Revision { content, .. } => {
+                walk_barred(content, &mut Vec::new(), depth, in_link)
+            }
+            _ => {
+                let barred = *depth > 0 || in_link || matches!(item, Inline::Hyperlink(_));
+                out.resize(out.len() + inline_len(item), barred);
+            }
+        }
+    }
+}
+
+fn para_text_len_at(body: &[Block], path: &[usize]) -> usize {
+    resolve_para(body, path).map_or(0, para_text_len)
+}
+
 /// A search match: a character range within a paragraph.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Match {
@@ -2800,6 +2851,136 @@ impl Editor {
             offset: m.start,
         });
         self.last = EditKind::None;
+    }
+
+    /// The next word Manual hyphenation (#1266) may hyphenate, at or after
+    /// `from` (a paragraph path and editor offset) and ending by `to` when
+    /// given: a word of letters only, [`crate::hyphenate::MIN_WORD`] or more,
+    /// with no hyphen, digit or apostrophe around it, no field or object
+    /// stuck to it and, unless `caps`, not in capitals; and with a point
+    /// ([`crate::hyphenate::proposed_point`]). A word already holding an
+    /// optional hyphen is one token with it, so it never qualifies. A word
+    /// touching a field (a collapsed field is not editor text, but a loose
+    /// one, a TOC's, keeps its result as editable text between zero-width
+    /// markers, possibly across paragraphs) or a hyperlink is never found: a
+    /// hyphen in a result is lost when the field updates, and inserting one
+    /// in a link would split it.
+    pub fn next_hyphen_candidate(
+        &self,
+        from: (&[usize], usize),
+        to: Option<(&[usize], usize)>,
+        caps: bool,
+    ) -> Option<HyphenCandidate> {
+        let paths = all_paragraph_paths(&self.doc.body);
+        let first = paths.iter().position(|p| p.as_slice() == from.0)?;
+        let last = match to {
+            Some((path, _)) => paths.iter().position(|p| p.as_slice() == path)?,
+            None => paths.len() - 1,
+        };
+        let joins = |c: char| {
+            c.is_alphanumeric()
+                || matches!(
+                    c,
+                    '-' | '\u{2011}' | '\u{ad}' | '\'' | '\u{2019}' | '_' | FIELD_CHAR
+                )
+        };
+        // Field nesting is carried from paragraph to paragraph of a container.
+        let mut depths: std::collections::HashMap<&[usize], i32> = Default::default();
+        for (k, path) in paths.iter().enumerate().take(last + 1) {
+            let Some(p) = resolve_para(&self.doc.body, path) else {
+                continue;
+            };
+            let depth = depths.entry(&path[..path.len() - 1]).or_insert(0);
+            let mut barred = Vec::new();
+            walk_barred(&p.content, &mut barred, depth, false);
+            if k < first {
+                continue;
+            }
+            let text: Vec<char> = editor_text(&p.content).chars().collect();
+            // One flag per editor char; a mismatch is a bug, and the
+            // paragraph is then left alone rather than guessed at.
+            debug_assert_eq!(barred.len(), text.len(), "walk_barred out of step");
+            if barred.len() != text.len() {
+                continue;
+            }
+            let floor = if k == first { from.1 } else { 0 };
+            let ceil = match to {
+                Some((_, off)) if k == last => off,
+                _ => usize::MAX,
+            };
+            let mut i = 0;
+            while i < text.len() {
+                if !joins(text[i]) {
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                while i < text.len() && joins(text[i]) {
+                    i += 1;
+                }
+                if start < floor || i > ceil || barred[start..i].iter().any(|&b| b) {
+                    continue;
+                }
+                let word: String = text[start..i].iter().collect();
+                let capital = word.chars().count() > 1
+                    && word.chars().all(|c| !c.is_lowercase())
+                    && word.chars().any(|c| c.is_uppercase());
+                if capital && !caps {
+                    continue;
+                }
+                // Typing into a content control still showing its
+                // placeholder would clear that, so its text is left alone.
+                let in_placeholder = |at: usize| {
+                    self.placeholder_range_at(&Caret {
+                        path: path.clone(),
+                        offset: at,
+                    })
+                    .is_some()
+                };
+                if in_placeholder(start + 1) || in_placeholder(i - 1) {
+                    continue;
+                }
+                if let Some(point) = crate::hyphenate::proposed_point(&word) {
+                    return Some(HyphenCandidate {
+                        path: path.clone(),
+                        start,
+                        end: i,
+                        word,
+                        point,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// Put an optional hyphen (U+00AD, written as `w:softHyphen`) at editor
+    /// offset `offset` of the paragraph at `path`, as one undo step "Optional
+    /// hyphen" that leaves the caret just after it. The hyphen takes the
+    /// formatting typing there would, in a run of its own that writes it as
+    /// the element. Whether anything was inserted.
+    pub fn insert_soft_hyphen(&mut self, path: &[usize], offset: usize) -> bool {
+        let fits = resolve_para(&self.doc.body, path).is_some_and(|p| offset <= para_text_len(p));
+        if !fits {
+            return false;
+        }
+        self.anchor = None;
+        self.caret = Caret {
+            path: path.to_vec(),
+            offset,
+        };
+        let before = para_text_len_at(&self.doc.body, path);
+        self.one_step("Optional hyphen", |ed| {
+            let mut props = ed.typing_props_here(None);
+            props.hyphen_elements = true;
+            ed.paste(&Clip {
+                paras: vec![vec![Inline::Run(Run {
+                    text: "\u{ad}".into(),
+                    props,
+                })]],
+            });
+        });
+        para_text_len_at(&self.doc.body, path) > before
     }
 
     /// Replace the current selection with plain text (used by replace-current).

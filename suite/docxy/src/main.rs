@@ -72,6 +72,7 @@ mod mac_nav;
 mod macos_menu;
 mod mailings_dialogs;
 mod mailings_tab;
+mod manual_hyphen;
 mod menu;
 mod open_mode;
 #[cfg(test)]
@@ -28856,11 +28857,11 @@ fn ribbon_tab_name(tab: RibbonTab) -> &'static str {
 /// Whether a ribbon command can run now: its button draws greyed and takes
 /// no click when it cannot, a split button's menu greys the item, and
 /// `ribbon-read` reports the same. Every ribbon command can run except the
-/// Layout tab's placeholders (`LayoutAct::Unavailable`: Manual); a row menu's items have
+/// placeholders of the other tabs (`Unavailable`); a row menu's items have
 /// their own rules (`project_row_menu`).
 fn act_enabled(act: Act) -> bool {
     match act {
-        Act::Layout(act) => layout_tab::layout_enabled(act),
+        Act::Layout(_) => true,
         // As a document with no recipient list has them.
         Act::Mail(act) => mailings_tab::mail_enabled(&mailings_tab::MailState::default(), act),
         Act::Table(act) => act != table_tab::TableAct::Unavailable,
