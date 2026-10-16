@@ -450,6 +450,44 @@ test sheet name-box: Enter on a bad reference keeps it
   assert sel is E1
   call real-key {"key":"escape"}
 
+test sheet name-box: a pointer press elsewhere leaves it
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"name-box"}
+  call pointer-click {"input":"formula-bar"}
+  call field-read {"input":"name-box"}
+  assert reply.focused is false
+  call real-type {"text":"Zed"}
+  assert editing is true
+  call field-read {"input":"formula-bar"}
+  assert reply.value is Zed
+  call real-key {"key":"escape"}
+  assert cell E1 is empty
+
+test sheet name-box: a command gives it the keyboard up
+  open copy:../fixtures/basic.xlsx
+  click A1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"name-box"}
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  call field-read {"input":"name-box"}
+  assert reply.focused is false
+  type Hi
+  assert comment_edit is Hi
+
+test sheet name-box: a comment being typed is kept
+  open copy:../fixtures/basic.xlsx
+  click A1
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  type Keep
+  call pointer-click {"input":"name-box"}
+  assert comment_edit is null
+  assert comment is Keep
+  call field-read {"input":"name-box"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
 # ---- The Find bar (Ctrl+F): Find what and Replace with. Tab moves between
 # them; Enter finds the next match from either, Escape closes the bar;
 # its Replace and All buttons also have Alt+R and Alt+A (#1342).

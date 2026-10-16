@@ -5457,7 +5457,7 @@ struct Docxy {
     // Save and the exit commit all target it. A cell click, right-click,
     // Previous/Next Comment or a row/column insert/delete commits a changed
     // buffer to it and closes the bar first; the anchor still matters for
-    // moves that leave the bar open (header clicks, the Name Box, Go To) and
+    // moves that leave the bar open (header clicks, Go To) and
     // for the exit commit. Set with the seed, cleared with it.
     sheet_comment_cell: Option<(usize, u32, u32)>,
     // Whether the data-validation list dropdown is open on the selected cell.
@@ -16926,25 +16926,30 @@ impl Docxy {
     }
 
     /// Route a keystroke into the active inline rename (char/backspace/enter/esc).
+    /// Commit the open sheet-tab rename (Enter, or another entry taking the
+    /// keyboard from it).
+    fn sheet_rename_commit(&mut self, cx: &mut Context<Self>) {
+        let Some((idx, buf)) = self.sheet_rename.take() else {
+            return;
+        };
+        if self.protected_refused(cx) {
+            return;
+        }
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            crate::close::commit_rename_buffer(t, idx, &buf);
+        }
+        // Enter marks the tab dirty even when the name was declined;
+        // that quirk predates the extraction and stays.
+        self.mark_sheet_dirty();
+    }
+
     fn sheet_rename_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
         let Some((idx, mut buf)) = self.sheet_rename.clone() else {
             return;
         };
         match key {
             "escape" => self.sheet_rename = None,
-            "enter" => {
-                if self.protected_refused(cx) {
-                    self.sheet_rename = None;
-                    return;
-                }
-                if let Some(t) = self.tabs.get_mut(self.active) {
-                    crate::close::commit_rename_buffer(t, idx, &buf);
-                }
-                self.sheet_rename = None;
-                // Enter marks the tab dirty even when the name was declined;
-                // that quirk predates the extraction and stays.
-                self.mark_sheet_dirty();
-            }
+            "enter" => self.sheet_rename_commit(cx),
             "backspace" => {
                 buf.pop();
                 self.sheet_rename = Some((idx, buf));
@@ -18157,7 +18162,7 @@ impl Docxy {
     /// live selection, and a cell click, right-click, Previous/Next Comment
     /// or a row/column insert/delete commits a changed buffer to the anchor
     /// and closes the bar first. Selection moves that leave the bar open
-    /// (header clicks, the Name Box, Go To) still never move the note.
+    /// (header clicks, Go To) still never move the note.
     fn sheet_new_comment(&mut self, cx: &mut Context<Self>) {
         if let Some(v) = self.active_sheet() {
             let cell = (v.active, v.sel.0, v.sel.1);
@@ -18926,9 +18931,11 @@ impl Docxy {
         let text = name_box_text(v);
         let (caret, sheet) = (text.chars().count(), v.active);
         // One entry holds the keyboard: the Find bar, a sheet-tab rename and
-        // the other bars give it up, as they do for a cell entry.
+        // the bars give it up, as they do for a cell entry; a comment or a
+        // rename being typed is committed, not dropped.
+        self.sheet_comment_bar_leave();
+        self.sheet_rename_commit(cx);
         self.typing_bars_close();
-        self.sheet_rename = None;
         self.range_edit = None;
         self.chart_hand_back(cx);
         self.name_box = Some(NameBoxEdit {
@@ -20433,6 +20440,9 @@ impl Docxy {
 
     fn run_sheet_act_now(&mut self, act: SheetAct, window: &mut Window, cx: &mut Context<Self>) {
         use gridcore::sheet::Align;
+        // A command (a ribbon press that reaches no capture handler: KeyTips,
+        // the harness's `ribbon-click`) takes the keyboard from the Name Box.
+        self.name_box = None;
         // A command ends an open ribbon flyout's moment, except a toggle in
         // it and a split button's arrow, whose menu opens over it (#1020).
         if !matches!(act, SheetAct::Menu(_)) && !self.flyout_keeps_open_for_sheet_act(act) {
