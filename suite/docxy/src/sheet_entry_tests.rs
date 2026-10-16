@@ -2400,3 +2400,13 @@ fn paste_text_replaces_a_selected_entry_and_keeps_line_breaks_1341() {
     assert_eq!(v.editing.as_deref(), Some("a\nb\nc"));
     assert!(v.edit_selected_text().is_none());
 }
+
+#[test]
+fn pasting_empty_text_keeps_a_selected_entry_1341() {
+    let mut v = old_book();
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_type("abcd");
+    v.edit_select_entry();
+    v.edit_paste_text("");
+    assert_eq!(v.editing.as_deref(), Some("abcd"));
+}

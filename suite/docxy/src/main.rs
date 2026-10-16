@@ -4221,6 +4221,9 @@ impl SheetView {
     /// as typed text would (it replaces a selection, overtypes in overtype
     /// mode), line breaks as `\n`; a proposed completion is dropped first.
     fn edit_paste_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
         self.drop_proposal();
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         self.edit_type(&text);
