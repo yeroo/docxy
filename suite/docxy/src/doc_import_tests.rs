@@ -9,7 +9,7 @@ use crate::doc_import::{
 };
 use crate::open_mode_tests::Scratch;
 use crate::{
-    DocSaveTarget, DocTab, Kind, OPEN_EXTENSIONS, Session, Surface, doc_save_target, is_imported,
+    DocSaveTarget, DocTab, Kind, Session, Surface, doc_save_target, is_imported, open_extensions,
     persist_tab, restore_tab, save_doc_tab, tab_from_path,
 };
 use std::path::{Path, PathBuf};
@@ -405,8 +405,8 @@ fn binary_paths_and_the_open_filter() {
     for p in ["a.docx", "a.docm", "doc", "a.doc.html", "a.md"] {
         assert!(!is_binary_doc_path(Path::new(p)), "{p}");
     }
-    assert!(OPEN_EXTENSIONS.contains(&"doc"));
-    assert!(OPEN_EXTENSIONS.contains(&"docx"));
+    assert!(open_extensions().contains(&"doc"));
+    assert!(open_extensions().contains(&"docx"));
 }
 
 /// A document Word itself saved as Word 97-2003 opens the same way, with

@@ -487,7 +487,8 @@ fn doc_save_format(path: &Path, html_ok: bool) -> Result<&'static str, String> {
 /// relative one resolves against `base`, the active file's directory, where
 /// the dialog opens; a path with no extension takes `format`'s, or the tab
 /// kind's default (the Save As dialog's first filter). The extension rules
-/// are the app's own: `sheet_save_target`, `yppx::save_target`, and
+/// are the app's own: `sheet_save_target`, the project formats registry's
+/// `save_target` (the built-ins and any type a format plugin writes), and
 /// [`doc_save_format`]. `format`, when given, must be one the tab kind saves
 /// and must agree with an explicit extension.
 fn save_as_target(
@@ -517,10 +518,11 @@ fn save_as_target(
         )?
         .join(given)
     };
-    let kind_formats: &[&str] = match kind {
-        Kind::Docx => &["docx", "docm", "dotx", "dotm", "rtf", "txt", "md", "html"],
-        Kind::Xlsx => &crate::SHEET_EXTENSIONS,
-        Kind::Project => &["yppx", "xml"],
+    let projects = crate::project_formats::global();
+    let kind_formats: Vec<&'static str> = match kind {
+        Kind::Docx => vec!["docx", "docm", "dotx", "dotm", "rtf", "txt", "md", "html"],
+        Kind::Xlsx => crate::SHEET_EXTENSIONS.to_vec(),
+        Kind::Project => projects.registry.save_extensions(),
         Kind::Look => return Err("this tab cannot be saved as a file".into()),
     };
     if let Some(f) = format {
@@ -530,14 +532,16 @@ fn save_as_target(
             let foreign = Path::new("x.not-a-format");
             return Err(match kind {
                 Kind::Xlsx => crate::sheet_save_target(foreign).err(),
-                Kind::Project => projcore::yppx::save_target(foreign).err(),
+                Kind::Project => projects.registry.save_target(foreign).err(),
                 _ => None,
             }
             .unwrap_or_else(|| DOC_SAVE_FORMATS.into()));
         }
     }
     if path.extension().is_none() {
-        let ext = format_extension(format.unwrap_or(kind_formats[0])).unwrap_or_default();
+        // A format plugin's type is named by its extension.
+        let format = format.unwrap_or(kind_formats[0]);
+        let ext = format_extension(format).map_or_else(|| format!(".{format}"), String::from);
         let mut name = path.file_name().unwrap_or_default().to_os_string();
         name.push(ext);
         path.set_file_name(name);
@@ -551,11 +555,15 @@ fn save_as_target(
             (path, written)
         }
         Kind::Project => {
-            let path = projcore::yppx::save_target(&path)?;
-            let yppx = path
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("yppx"));
-            (path, if yppx { "yppx" } else { "xml" })
+            let path = projects.registry.save_target(&path)?;
+            // The target keeps a writable extension: its type is the format.
+            let ext = projcore::formats::extension(&path);
+            let written = kind_formats
+                .iter()
+                .copied()
+                .find(|f| f.eq_ignore_ascii_case(ext))
+                .unwrap_or(projcore::formats::DEFAULT_SAVE_EXTENSION);
+            (path, written)
         }
         _ => {
             let written = doc_save_format(&path, html_ok)?;
@@ -569,6 +577,31 @@ fn save_as_target(
         ));
     }
     Ok((path, written))
+}
+
+/// The types the Save As dialog lists for a tab of `kind`, in its order:
+/// each filter's name and extensions. The same lists the dialogs are built
+/// from: a document's `save_filters` (`html` when the tab can be saved as
+/// editable HTML), the workbook types, and the project formats registry's
+/// writable types (the built-ins, then any a format plugin writes).
+fn save_types(
+    kind: crate::Kind,
+    html: bool,
+) -> Result<Vec<(&'static str, Vec<&'static str>)>, String> {
+    use crate::Kind;
+    Ok(match kind {
+        Kind::Docx => crate::doc_export::save_filters(html, None)
+            .into_iter()
+            .map(|f| (f.filter_name(), f.extensions().to_vec()))
+            .collect(),
+        Kind::Xlsx => vec![(crate::SHEET_SAVE_FILTER, crate::SHEET_EXTENSIONS.to_vec())],
+        Kind::Project => crate::project_formats::global()
+            .save_types()
+            .into_iter()
+            .map(|(label, ext)| (label, vec![ext]))
+            .collect(),
+        Kind::Look => return Err("this tab cannot be saved as a file".into()),
+    })
 }
 
 /// A cell or range argument (`"A1"` or `"A1:C5"`), as its two corners.
@@ -5735,6 +5768,36 @@ fn dispatch_verb(
             ]))
         }
 
+        // What the Save As dialog would list for the active tab, which a
+        // harness instance never opens: `count`, and each type's `label`
+        // and `extensions` in the dialog's order. A read.
+        "save-types" => {
+            let tab = app.tabs.get(app.active).ok_or("no tab is open")?;
+            let types = save_types(tab.kind, crate::doc_html_save_allowed(tab))?;
+            Done::ok(Json::obj(vec![
+                ("count", Json::Num(types.len() as f64)),
+                (
+                    "types",
+                    Json::Arr(
+                        types
+                            .into_iter()
+                            .map(|(label, exts)| {
+                                Json::obj(vec![
+                                    ("label", Json::Str(label.into())),
+                                    (
+                                        "extensions",
+                                        Json::Arr(
+                                            exts.into_iter().map(|e| Json::Str(e.into())).collect(),
+                                        ),
+                                    ),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+            ]))
+        }
+
         // The fill handle (#699): the handle's own press, one move per cell
         // crossed, the release — what a pointer dragging the handle does. The
         // `drag` verb presses the grid instead, so it sweeps a selection.
@@ -8402,6 +8465,59 @@ mod tests {
         );
         // A one-cell range is a drag that goes nowhere, not an error.
         assert_eq!(drag_args(&obj(&[("range", s("B2"))])), Ok(((1, 1), (1, 1))));
+    }
+
+    /// A Project's `save-as` takes the types a format plugin writes (an
+    /// in-process stand-in for `.mpp` here), by extension or by format, and
+    /// its refusal names them; `save-types` lists them after the built-ins.
+    #[test]
+    fn save_as_and_save_types_take_a_format_plugins_type() {
+        use crate::Kind;
+        let _plugins = crate::project_formats::tests::Override::new(vec![
+            crate::project_formats::tests::mpp_writer(),
+        ]);
+        let base = Path::new("/sandbox/case");
+        let ok = |raw: &str, format: Option<&str>| {
+            save_as_target(Kind::Project, Some(base), raw, format, true)
+        };
+        assert_eq!(ok("plan.MPP", None), Ok((base.join("plan.MPP"), "mpp")));
+        assert_eq!(ok("plan", Some("mpp")), Ok((base.join("plan.mpp"), "mpp")));
+        assert_eq!(ok("plan", None), Ok((base.join("plan.yppx"), "yppx")));
+        let refusal = "Project schedules can only be saved as .yppx, .xml (MSPDI) or .mpp";
+        assert_eq!(ok("plan.txt", None).unwrap_err(), refusal);
+        assert_eq!(ok("plan", Some("docx")).unwrap_err(), refusal);
+        assert_eq!(
+            ok("plan.xml", Some("mpp")).unwrap_err(),
+            "'format' mpp does not match plan.xml, which saves as xml"
+        );
+        assert_eq!(
+            save_types(Kind::Project, false).unwrap(),
+            [
+                ("Project schedule", vec!["yppx"]),
+                ("MSPDI", vec!["xml"]),
+                ("Project", vec!["mpp"])
+            ]
+        );
+    }
+
+    /// `save-types` reads the lists the Save As dialogs are built from.
+    #[test]
+    fn save_types_are_the_save_as_dialogs_lists() {
+        use crate::Kind;
+        assert_eq!(
+            save_types(Kind::Project, true).unwrap(),
+            [("Project schedule", vec!["yppx"]), ("MSPDI", vec!["xml"])]
+        );
+        assert_eq!(
+            save_types(Kind::Xlsx, true).unwrap(),
+            [("Excel workbook", vec!["xlsx", "xlsm", "xltx", "xltm"])]
+        );
+        let docs = save_types(Kind::Docx, false).unwrap();
+        assert_eq!(docs[0], ("Word document", vec!["docx"]));
+        assert_eq!(docs[1], ("Markdown", vec!["md", "markdown"]));
+        assert!(!docs.iter().any(|(_, exts)| exts.contains(&"html")));
+        assert_eq!(save_types(Kind::Docx, true).unwrap().len(), docs.len() + 1);
+        assert!(save_types(Kind::Look, true).is_err());
     }
 
     /// #699: `save-as` resolves the path the dialog would have answered with,

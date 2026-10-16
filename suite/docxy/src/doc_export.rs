@@ -59,7 +59,7 @@ impl SaveFormat {
     }
 
     /// The Save As dialog filter's name.
-    fn filter_name(self) -> &'static str {
+    pub(crate) fn filter_name(self) -> &'static str {
         match self {
             SaveFormat::Docx => "Word document",
             SaveFormat::Markdown => "Markdown",
@@ -71,7 +71,7 @@ impl SaveFormat {
         }
     }
 
-    fn extensions(self) -> &'static [&'static str] {
+    pub(crate) fn extensions(self) -> &'static [&'static str] {
         match self {
             SaveFormat::Docx => &["docx"],
             SaveFormat::Markdown => &["md", "markdown"],

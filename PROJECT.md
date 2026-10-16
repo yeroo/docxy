@@ -326,10 +326,14 @@ libraries named `yppx_*` with the platform's library extension (`.dll`,
 `.so`, `.dylib`). `yppxy` loads, once at start, each one in
 `<config>/yppxy/plugins` (`%APPDATA%\yppxy\plugins` on Windows, else
 `$XDG_CONFIG_HOME/yppxy/plugins` or `~/.config/yppxy/plugins`, beside its
-control discovery files), then each in `$YPPX_PLUGIN_DIR` when set. **No
-plugin ships** with the workspace; without one, every list, status line and
-save refusal is what it was before plugins existed. The desktop suite does
-not load them yet.
+control discovery files), then each in `$YPPX_PLUGIN_DIR` when set. The
+desktop suite loads them the same way for its Project tabs, from
+`<config>/docxy/plugins` (beside its `session.json`: under
+`DOCXY_CONFIG_DIR` when that is set, else `%APPDATA%\docxy\plugins` on
+Windows, `~/Library/Application Support/docxy/plugins` on macOS and
+`~/.config/docxy/plugins` elsewhere), then `$YPPX_PLUGIN_DIR`. **No plugin
+ships** with the workspace; without one, every list, status line and save
+refusal is what it was before plugins existed.
 
 - **`projcore::formats`** holds the `ProjectFormat` trait (extensions, label,
   reads/writes, `read(bytes)`, `write(project, source)`) and the `Registry`
@@ -368,12 +372,29 @@ not load them yet.
   As. A file of a type a plugin also writes is not an import: opening one
   says "Opened x.mpp — N tasks" rather than "… .mpp tasks imported", and
   Save writes it back in place.
+- In the **desktop suite** (`suite/docxy/src/project_formats.rs`) one
+  registry, built at start before any tab loads, drives what opens as a
+  Project tab (the Open dialog's lists, the command line, Recent), every
+  read, Save and Save As (the native dialog's types are the registry's
+  writable ones, in its order), the harness's `save-as` and the control
+  `proj.save`. A type nothing writes is an import: its status says
+  "imported from .<ext>; Save As .yppx or MSPDI to keep edits", Save goes to
+  Save As and `proj.path` reports `imported: true`; with a plugin that
+  writes `.mpp`, an opened `.mpp` is a plan like any other and Save writes it
+  in place. The file a plan was opened from (re-read for one restored from
+  its sidecar) goes to a plugin's save of its type as the source. A plugin
+  that does not load is reported on stderr, in the crash log and on the
+  first window's status line, never in a dialog.
 - **The fixture**: `projcore/tests/plugin_fixture` is a dependency-free cdylib
   (`publish = false`) that implements the ABI by hand for a fake `.fakeproj`
   type, passing MSPDI through. `projcore/tests/plugins.rs` (run with
   `--features plugins`) and `yppxy/tests/plugins.rs` build it with cargo, copy
   it into a plugin directory as `yppx_fixture.<dll|so|dylib>`, and round-trip
-  a plan through it, `yppxy plan.xml --save out.fakeproj` included.
+  a plan through it, `yppxy plan.xml --save out.fakeproj` included. The
+  suite's `uiharness/cases/project-plugin.uit` starts with `plugin
+  yppx_fixture`, which copies the fixture (built beside uiharness by
+  `cargo build --release -p uiharness -p plugin_fixture`) into the sandbox's
+  `docxy/plugins` before the suite starts.
 
 ## Desktop suite entry table
 

@@ -32,7 +32,8 @@ docxcore = { path = "../../docxcore" }
 # with the `html-export` feature (embeds the docxwasm engine, see build.rs).
 htmlbundle = { path = "../../htmlbundle" }
 gridcore = { path = "../../gridcore" }
-projcore = { path = "../../projcore" }
+# `plugins`: Project tabs open and save the types format plugins add.
+projcore = { path = "../../projcore", features = ["plugins"] }
 mppread = { path = "../../mppread" }
 # Loopback-JSON control for normal Project tabs and the opt-in UI test harness.
 ctlcore = { path = "../../ctlcore" }

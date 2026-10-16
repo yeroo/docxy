@@ -281,8 +281,9 @@ yppxy plan.xml  --save out.yppx   # headless: convert to the native package
 ```
 
 **Format plugins** (`yppx_*` shared libraries in `<config>/yppxy/plugins` or
-`$YPPX_PLUGIN_DIR`) can add file types to Open, Save As and `--save`; none
-ships, see [PROJECT.md](PROJECT.md#format-plugins).
+`$YPPX_PLUGIN_DIR`) can add file types to Open, Save As and `--save`; the
+desktop suite's Project tabs load them too, from `<config>/docxy/plugins`.
+None ships, see [PROJECT.md](PROJECT.md#format-plugins).
 
 Like docxy and xlsxy, yppxy has the same **ribbon** — with Microsoft Project's
 tabs, groups and command names (File · Task · Resource · Report · Project ·

@@ -82,6 +82,7 @@ mod page_flow;
 mod page_number;
 mod page_setup;
 mod project;
+mod project_formats;
 mod recent_files;
 mod recover;
 #[cfg(test)]
@@ -8425,17 +8426,29 @@ fn sheet_bytes(v: &SheetView, target: Option<&std::path::Path>) -> (Vec<u8>, usi
     }
 }
 
-/// What the Open dialog's "All supported" filter lists: documents
-/// (Word 97-2003 `.doc` imports, #634; RTF, web pages and PDFs opened
-/// converted, #633; Word templates, opened as new documents, #636),
-/// workbooks and project schedules.
-const OPEN_EXTENSIONS: [&str; 18] = [
-    "docx", "docm", "dotx", "dotm", "doc", "md", "markdown", "html", "htm", "rtf", "pdf", "xlsx",
-    "xlsm", "xltx", "xltm", "yppx", "xml", "mpp",
+/// The documents the Open dialog takes: Word 97-2003 `.doc` imports (#634);
+/// RTF, web pages and PDFs opened converted (#633); Word templates, opened
+/// as new documents (#636).
+const DOC_OPEN_EXTENSIONS: [&str; 11] = [
+    "docx", "docm", "dotx", "dotm", "doc", "md", "markdown", "html", "htm", "rtf", "pdf",
 ];
+
+/// What the Open dialog's "All supported" filter lists: documents,
+/// workbooks and the project schedules some format reads (`.yppx`, `.xml`,
+/// `.mpp`, then a format plugin's types).
+fn open_extensions() -> Vec<&'static str> {
+    DOC_OPEN_EXTENSIONS
+        .into_iter()
+        .chain(SHEET_EXTENSIONS)
+        .chain(project_formats::global().registry.open_extensions())
+        .collect()
+}
 
 /// The extensions a workbook opens from and saves to.
 const SHEET_EXTENSIONS: [&str; 4] = ["xlsx", "xlsm", "xltx", "xltm"];
+
+/// The workbook Save As dialog's one type, over [`SHEET_EXTENSIONS`].
+const SHEET_SAVE_FILTER: &str = "Excel workbook";
 
 /// Whether `path` is a workbook or template (`.xlsx`, `.xlsm`, `.xltx`,
 /// `.xltm`).
@@ -13188,6 +13201,11 @@ impl Docxy {
         // After a crash, each recovered document's original is offered once
         // the startup files are open (#1225).
         this.recovery_pending = recovered;
+        // A format plugin that did not load (`main` logged each one): the
+        // first says so on the status line.
+        if let Some(error) = project_formats::global().errors.first() {
+            this.set_status(format!("Plugin not loaded: {error}"));
+        }
         // win_id is 0 until the window registers: the write below behaves
         // exactly like the single-window write this was (no union, base 0).
         this.persist_to(&root, SessionWrite::All, cx);
@@ -17060,10 +17078,13 @@ impl Docxy {
             SaveDecision::Dialog { suggested } => {
                 let start = doc_import::save_start_dir_of(tab);
                 let target = macos_menu::native_modal(|| {
-                    let mut dialog = rfd::FileDialog::new()
-                        .add_filter("Project schedule", &["yppx"])
-                        .add_filter("MSPDI", &["xml"])
-                        .set_file_name(suggested);
+                    // The registry's writable types, in its order: the
+                    // built-ins, then any a format plugin writes.
+                    let mut dialog = rfd::FileDialog::new();
+                    for (label, ext) in project_formats::global().save_types() {
+                        dialog = dialog.add_filter(label, &[ext]);
+                    }
+                    let mut dialog = dialog.set_file_name(suggested);
                     if let Some(dir) = start {
                         dialog = dialog.set_directory(dir);
                     }
@@ -21721,7 +21742,7 @@ impl Docxy {
         let pick = |suggested| {
             macos_menu::native_modal(|| {
                 let mut dialog = rfd::FileDialog::new()
-                    .add_filter("Excel workbook", &SHEET_EXTENSIONS)
+                    .add_filter(SHEET_SAVE_FILTER, &SHEET_EXTENSIONS)
                     .set_file_name(suggested);
                 if let Some(dir) = &start {
                     dialog = dialog.set_directory(dir);
@@ -21829,8 +21850,11 @@ impl Docxy {
 
     fn open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let dialog = rfd::FileDialog::new()
-            .add_filter("All supported", &OPEN_EXTENSIONS)
-            .add_filter("Project schedule", &["yppx", "xml", "mpp"])
+            .add_filter("All supported", &open_extensions())
+            .add_filter(
+                "Project schedule",
+                &project_formats::global().registry.open_extensions(),
+            )
             .add_filter("Word or Markdown", &["docx", "docm", "md", "markdown"])
             // Opened as a new document from the template (#636).
             .add_filter("Word Template", &["dotx", "dotm"])
@@ -42016,6 +42040,16 @@ fn main() {
             }
         }
     };
+    // The project formats, format plugins included, before any tab loads and
+    // after the harness gate, so a refused instance loads none. A plugin that
+    // does not load is skipped: said here and in the crash log (the release
+    // build has no console), and on the first window's status line, never in
+    // a dialog.
+    for error in &project_formats::global().errors {
+        let msg = format!("docxy: plugin not loaded: {error}");
+        eprintln!("{msg}");
+        crashlog::startup(&config_root(), &msg);
+    }
     let app = gpui_platform::application()
         .with_assets(DocxyAssets)
         .with_quit_mode(quit_mode());

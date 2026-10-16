@@ -1,5 +1,7 @@
 use super::*;
+use crate::project_formats::tests::{Override, mpp_writer};
 use core::prelude::v1::test;
+use projcore::{mspdi, yppx};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
@@ -172,7 +174,7 @@ fn extensions_route_to_project_and_mpp_is_imported() {
     let ed = ProjectEditor::new(untitled_project());
     for name in ["x.YPPX", "x.XML"] {
         let path = dir.path(name);
-        write_project(&ed, &path).unwrap();
+        write_project(&ed, &path, None).unwrap();
         let tab = tab_from_path(&path);
         assert!(tab.kind == Kind::Project);
         assert!(tab.status.starts_with("loaded"));
@@ -206,7 +208,7 @@ fn every_mspdi_fixture_opens_and_matches_its_date_oracle() {
     let mut paths: Vec<_> = std::fs::read_dir(corpus(""))
         .unwrap()
         .map(|e| e.unwrap().path())
-        .filter(|p| ext_is(p, "xml"))
+        .filter(|p| projcore::formats::extension(p).eq_ignore_ascii_case("xml"))
         .collect();
     paths.sort();
     let on_disk: Vec<String> = paths.iter().map(|p| file_name(p)).collect();
@@ -280,7 +282,7 @@ fn save_target_validates_extension_before_writing() {
     let dir = Scratch::new();
     let source = mpp_stub(&dir);
     let before = std::fs::read(&source).unwrap();
-    assert!(write_project(&view(&new_project_tab("Project1")).ed, &source).is_err());
+    assert!(write_project(&view(&new_project_tab("Project1")).ed, &source, None).is_err());
     assert_eq!(std::fs::read(source).unwrap(), before);
 }
 
@@ -289,7 +291,7 @@ fn saved_formats_round_trip_the_complete_project() {
     let dir = Scratch::new();
     let tab = project_tab_from_path(&corpus("11-resource-assignment.xml"));
     for name in ["saved.yppx", "saved.XML", "extensionless"] {
-        let (path, n) = write_project(&view(&tab).ed, &dir.path(name)).unwrap();
+        let (path, n) = write_project(&view(&tab).ed, &dir.path(name), None).unwrap();
         assert!(n > 0);
         assert_eq!(&project_from_path(&path).unwrap(), view(&tab).ed.project());
     }
@@ -434,11 +436,11 @@ fn unreadable_parts_refuse_yppx_but_allow_xml() {
     project.package.unreadable = vec!["media/mystery.bin".into()];
     let ed = ProjectEditor::new(project);
     let native = dir.path("blocked.yppx");
-    let error = write_project(&ed, &native).unwrap_err();
+    let error = write_project(&ed, &native, None).unwrap_err();
     assert!(error.contains("media/mystery.bin") && error.contains("save as .xml"));
     assert!(!native.exists());
     let xml = dir.path("safe.xml");
-    write_project(&ed, &xml).unwrap();
+    write_project(&ed, &xml, None).unwrap();
     assert!(xml.exists());
 }
 
@@ -472,7 +474,7 @@ fn hot_exit_preserves_unreadable_guard_without_original() {
         ["media/mystery.bin"]
     );
     let target = dir.path("blocked.yppx");
-    let error = write_project(&view(&restored).ed, &target).unwrap_err();
+    let error = write_project(&view(&restored).ed, &target, None).unwrap_err();
     assert!(error.contains("media/mystery.bin"));
     assert!(!target.exists());
 }
@@ -1023,4 +1025,97 @@ fn save_clears_undo_and_redo_only_on_success() {
     assert!(!view_mut(&mut tab).ed.undo());
     assert!(!view_mut(&mut tab).ed.redo());
     assert_eq!(view(&tab).ed.project().tasks[0].name, "Unsaved rename");
+}
+
+/// With a format plugin that writes `.mpp` (an in-process stand-in), an
+/// opened `.mpp` is no import: it saves in place, the opened file going back
+/// to the plugin as its source, and only a save of that type gets it.
+#[test]
+fn a_plugin_writer_saves_mpp_in_place_with_its_source() {
+    let _plugins = Override::new(vec![mpp_writer()]);
+    let dir = Scratch::new();
+    let path = dir.path("plan.MPP");
+    let original = std::fs::read(corpus("11-resource-assignment.xml")).unwrap();
+    std::fs::write(&path, &original).unwrap();
+    let note = format!("<!-- source {} bytes -->", original.len());
+
+    let mut tab = tab_from_path(&path);
+    assert!(tab.kind == Kind::Project);
+    let tasks = view(&tab).ed.project().tasks.len();
+    assert_eq!(tab.status.as_ref(), format!("loaded — {tasks} tasks"));
+    assert!(!is_imported(&tab));
+    assert_eq!(
+        save_decision(&tab, true, false),
+        SaveDecision::InPlace(path.clone())
+    );
+    view_mut(&mut tab).ed.rename(1, "Edited").unwrap();
+    tab.dirty = true;
+    apply_save(&mut tab, &path).unwrap();
+    assert!(!tab.dirty);
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        saved.contains("<Name>Edited</Name>") && saved.ends_with(&note),
+        "{saved}"
+    );
+
+    // MSPDI is a built-in: no source goes to it, and the tab moves there.
+    apply_save(&mut tab, &dir.path("copy.xml")).unwrap();
+    assert!(
+        !std::fs::read_to_string(dir.path("copy.xml"))
+            .unwrap()
+            .contains("<!--")
+    );
+    // The source stays the file the plan was opened from.
+    apply_save(&mut tab, &dir.path("again.mpp")).unwrap();
+    assert!(
+        std::fs::read_to_string(dir.path("again.mpp"))
+            .unwrap()
+            .ends_with(&note)
+    );
+
+    // A plan restored from its sidecar keeps the file as its source too.
+    let mut reopened = tab_from_path(&path);
+    view_mut(&mut reopened).ed.rename(1, "Restored").unwrap();
+    reopened.dirty = true;
+    let persisted = persist_tab(&dir.0, 0, 0, &reopened);
+    let restored = restore_project_tab(&persisted);
+    assert!(restored.dirty && !is_imported(&restored));
+    let saved = std::fs::read(&path).unwrap();
+    assert_eq!(
+        view(&restored).source.as_ref().unwrap().for_target(&path),
+        Some(saved.as_slice())
+    );
+}
+
+/// A plugin's type opens as a plan, and saves back in place, only while the
+/// plugin is loaded: without it the file is no project, and a tab still
+/// bound to one (restored from its sidecar, say) saves through Save As.
+#[test]
+fn a_plugin_type_is_a_project_only_while_its_plugin_is_loaded() {
+    let plugins = Override::new(vec![Box::new(crate::project_formats::tests::Passthrough {
+        ext: &["fakeproj"],
+        label: "Fake Project",
+        reads: true,
+    })]);
+    let dir = Scratch::new();
+    let path = dir.path("plan.fakeproj");
+    std::fs::copy(corpus("11-resource-assignment.xml"), &path).unwrap();
+    let tab = tab_from_path(&path);
+    assert!(tab.kind == Kind::Project && !is_imported(&tab));
+    assert_eq!(save_target(&path).unwrap(), path);
+    drop(plugins);
+
+    assert!(!is_project_path(&path));
+    assert_eq!(
+        project_from_path(&path).unwrap_err(),
+        "expected .yppx, .xml or .mpp"
+    );
+    let mut bound = new_project_tab("Project1");
+    bound.path = Some(path.clone());
+    assert!(is_imported(&bound));
+    assert!(matches!(
+        save_decision(&bound, false, false),
+        SaveDecision::Dialog { .. }
+    ));
+    assert!(save_target(&path).is_err());
 }

@@ -1,11 +1,12 @@
 //! Project tab: file/session policy and the Gantt view over the shared editor.
 use super::*;
+use crate::project_formats::{self, Source};
 use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarShow};
 use projcore::editor::{
     ENTRY_FIELDS, Editor as ProjectEditor, FieldReader, format_date_field as date, task_mode_name,
     untitled_project,
 };
-use projcore::{LinkType, Project, Task, mspdi, yppx};
+use projcore::{LinkType, Project, Task};
 use std::cell::Cell;
 use std::path::Path;
 use std::rc::Rc;
@@ -97,6 +98,9 @@ pub(super) struct ProjectView {
     /// the cell/row/body `on_click` that gpui delivers on release must not
     /// clear what the gesture selected, so `cell_click` swallows that click.
     pub drag_made_range: bool,
+    /// The file the plan was opened from, while a format plugin writes its
+    /// type: each save of that type passes it back ([`Source`]).
+    pub source: Option<Source>,
 }
 
 impl ProjectView {
@@ -132,6 +136,7 @@ impl ProjectView {
             row_header: false,
             dragging: false,
             drag_made_range: false,
+            source: None,
         }
     }
 
@@ -656,38 +661,31 @@ pub(super) fn project_state(
     entries
 }
 
-fn ext_is(path: &Path, extension: &str) -> bool {
-    path.extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case(extension))
-}
-
+/// Whether `path` opens as a Project tab: a type some project format reads
+/// (`.yppx`, `.xml`, `.mpp`, a format plugin's).
 pub(super) fn is_project_path(path: &Path) -> bool {
-    ["yppx", "xml", "mpp"].iter().any(|e| ext_is(path, e))
+    project_formats::global().is_project_path(path)
 }
 
-/// Whether the tab's file is one its Save never writes: a project imported
-/// from `.mpp`, or a document imported from a Word 97-2003 file (#634).
+/// Whether the tab's file is one its Save never writes: a project of a type
+/// nothing writes (`.mpp` unless a format plugin writes it), or a document
+/// imported from a Word 97-2003 file (#634).
 pub(super) fn is_imported(tab: &DocTab) -> bool {
     match tab.kind {
-        Kind::Project => tab.path.as_deref().is_some_and(|p| ext_is(p, "mpp")),
+        Kind::Project => tab
+            .path
+            .as_deref()
+            .is_some_and(|p| project_formats::global().is_import(p)),
         Kind::Docx => tab.import.binary_source,
         _ => false,
     }
 }
 
+/// `status`, with the import note when `path` is of a type nothing writes.
 fn imported_status(status: String, path: Option<&Path>) -> SharedString {
-    if path.is_some_and(|p| ext_is(p, "mpp")) {
-        let task_only = path
-            .and_then(|p| std::fs::read(p).ok())
-            .is_some_and(|bytes| mppread::mpp::is_mpp12(&bytes));
-        let source = if task_only {
-            "MPP12 task-only import"
-        } else {
-            "imported from .mpp"
-        };
-        format!("{status}, {source}; Save As .yppx or MSPDI to keep edits").into()
-    } else {
-        status.into()
+    match path.and_then(|p| project_formats::global().import_note(p)) {
+        Some(note) => format!("{status}, {note}; Save As .yppx or MSPDI to keep edits").into(),
+        None => status.into(),
     }
 }
 
@@ -726,24 +724,29 @@ fn project_tab(
     }
 }
 
+/// The plan in the file at `path`, by its type's reader.
 pub(super) fn project_from_path(path: &Path) -> Result<Project, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("read error: {e}"))?;
-    if ext_is(path, "yppx") {
-        yppx::read_yppx(&bytes)
-    } else if ext_is(path, "mpp") {
-        mppread::project::project_from_mpp(&bytes)
-    } else if ext_is(path, "xml") {
-        mspdi::read_mspdi(std::str::from_utf8(&bytes).map_err(|_| "not UTF-8")?)
-    } else {
-        Err("expected .yppx, .xml or .mpp".into())
-    }
+    project_formats::global()
+        .read(path)
+        .map(|(project, _)| project)
+}
+
+/// A view of the plan in the file at `path`, keeping the file as the
+/// [`Source`] of its saves when a format plugin writes its type.
+fn view_from_path(path: &Path) -> Result<ProjectView, String> {
+    let formats = project_formats::global();
+    let (project, bytes) = formats.read(path)?;
+    let mut view = ProjectView::new(project, false);
+    view.source = formats.source(path, bytes);
+    Ok(view)
 }
 
 pub(super) fn project_tab_from_path(path: &Path) -> DocTab {
-    let (surface, status) = match project_from_path(path) {
-        Ok(p) => {
-            let status = imported_status(format!("loaded — {} tasks", p.tasks.len()), Some(path));
-            (Surface::Project(ProjectView::new(p, false)), status)
+    let (surface, status) = match view_from_path(path) {
+        Ok(v) => {
+            let tasks = v.ed.project().tasks.len();
+            let status = imported_status(format!("loaded — {tasks} tasks"), Some(path));
+            (Surface::Project(v), status)
         }
         Err(e) => (
             Surface::Placeholder,
@@ -778,17 +781,24 @@ pub(super) fn new_project_tab(title: &str) -> DocTab {
     )
 }
 
+/// Where a save to `path` goes: an extensionless name becomes `.yppx`, a
+/// type no format writes is refused.
 fn save_target(path: &Path) -> Result<PathBuf, String> {
-    yppx::save_target(path)
+    project_formats::global().registry.save_target(path)
 }
 
-fn write_project(ed: &ProjectEditor, path: &Path) -> Result<(PathBuf, usize), String> {
+/// Write the plan to `path` by its type's writer, handing `source` (the
+/// file it was opened from) to a save of that file's type.
+fn write_project(
+    ed: &ProjectEditor,
+    path: &Path,
+    source: Option<&Source>,
+) -> Result<(PathBuf, usize), String> {
     let path = save_target(path)?;
-    let bytes = if ext_is(&path, "yppx") {
-        yppx::write_yppx(ed.project())?
-    } else {
-        mspdi::write_mspdi(ed.project()).into_bytes()
-    };
+    let source = source.and_then(|s| s.for_target(&path));
+    let bytes = project_formats::global()
+        .registry
+        .write(ed.project(), &path, source)?;
     opccore::fsio::write_atomic(&path, &bytes).map_err(|e| format!("save failed: {e}"))?;
     Ok((path, bytes.len()))
 }
@@ -835,7 +845,7 @@ pub(super) fn apply_save(tab: &mut DocTab, target: &Path) -> Result<usize, Strin
         return Err(tab.status.to_string());
     }
     let result = match &tab.surface {
-        Surface::Project(v) => write_project(&v.ed, target),
+        Surface::Project(v) => write_project(&v.ed, target, v.source.as_ref()),
         _ => Err("This project could not be loaded and cannot be saved".into()),
     };
     match result {
@@ -891,10 +901,16 @@ pub(super) fn restore_project_tab(t: &PersistTab) -> DocTab {
                     .into(),
                     path.as_deref(),
                 );
+                let mut view = ProjectView::new(p, t.dirty);
+                // The sidecar holds the plan; a plugin's save still gets the
+                // file it was opened from as its source.
+                view.source = path
+                    .as_deref()
+                    .and_then(|p| project_formats::global().source_at(p));
                 return project_tab(
                     t.title.clone().into(),
                     path,
-                    Surface::Project(ProjectView::new(p, t.dirty)),
+                    Surface::Project(view),
                     t.dirty,
                     status,
                 );
@@ -918,9 +934,9 @@ pub(super) fn restore_project_tab(t: &PersistTab) -> DocTab {
         };
     }
     let (surface, status) = match path.as_deref() {
-        Some(orig) => match project_from_path(orig) {
-            Ok(p) => (
-                Surface::Project(ProjectView::new(p, false)),
+        Some(orig) => match view_from_path(orig) {
+            Ok(v) => (
+                Surface::Project(v),
                 imported_status(
                     format!(
                         "{recovery} — reloaded {}; unsaved edits lost",
