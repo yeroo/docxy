@@ -264,7 +264,7 @@
 
 - The document's boxes are the same `Docxy::font_box` (`FontBoxEdit` with
   `sheet: None`, tied to the tab only), opened by a click on `combo_box` or by
-  `Act::FontName` / `FontSize` (their KeyTips) through `font_box_open_doc`,
+  `Act::FontName` / `FontSize` (the harness's `ribbon-click`; the combos have no KeyTips) through `font_box_open_doc`,
   which closes the Find and comment bars. `font_box_live` is surface-aware, so
   `sheet_field_live` and `entry_owns_keys` cover it. `on_key` hands it every
   key after the KeyTips and `document_key` (Ctrl+W, Ctrl+Tab, F12 still act),
@@ -273,6 +273,8 @@
 - Enter sets `set_font` (name cut to 31 characters) or `set_font_size`
   (`font_box::parse_doc_size`: 1 to 1638 pt, rounded to a half point; a bad one
   keeps the box and says so), as one undo step, and the document gets the
-  keyboard back, as it does on Escape. The old chip strips (`PickKind::FontName`
+  keyboard back, as it does on Escape. Enter on a box left as filled (the caret
+  run's direct format) is Escape too, so it never writes a style's size or a
+  theme font as direct formatting. The old chip strips (`PickKind::FontName`
   / `FontSize`) are gone. `uiharness/cases/doc-font-box.uit` covers what
   `doc-inputs-typing.uit` does not.

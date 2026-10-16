@@ -7335,6 +7335,8 @@ struct FontBoxEdit {
     text: String,
     caret: usize,
     sel: bool,
+    /// The text the box was filled with: Enter on it unchanged is Escape.
+    orig: String,
     tab: close::TabId,
     sheet: Option<usize>,
 }
@@ -19122,13 +19124,14 @@ impl Docxy {
         cx.notify();
     }
 
-    /// Whether a one-line ribbon or bar field of the sheet has the keyboard:
-    /// the Name Box or a font box.
+    /// Whether a one-line ribbon or bar field has the keyboard: the sheet's
+    /// Name Box, or a font box on either surface.
     fn sheet_field_live(&self) -> bool {
         self.name_box_live() || self.font_box_live()
     }
 
-    /// Whether a font box has the keyboard: opened on the sheet now shown,
+    /// Whether a font box has the keyboard: opened on the tab now shown (and,
+    /// on a sheet, the sheet now shown),
     /// with the Home ribbon body that draws it still up and the box itself
     /// on screen (a narrow window can fold its group away: that frame refuses
     /// the very next key, and the next render closes the box).
@@ -19194,6 +19197,7 @@ impl Docxy {
         self.name_box = None;
         self.font_box = Some(FontBoxEdit {
             which,
+            orig: text.clone(),
             text,
             caret,
             sel: true,
@@ -19213,6 +19217,7 @@ impl Docxy {
         self.picker = None;
         self.font_box = Some(FontBoxEdit {
             which,
+            orig: text.clone(),
             text,
             caret,
             sel: true,
@@ -19227,14 +19232,21 @@ impl Docxy {
     /// View and a final document hide the ribbon body, so the box cannot be
     /// open there; the `active_locked` check is a backstop.)
     fn font_box_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((which, text, doc)) = self
-            .font_box
-            .as_ref()
-            .map(|f| (f.which, f.text.trim().to_string(), f.sheet.is_none()))
-        else {
+        let Some((which, text, doc, untouched)) = self.font_box.as_ref().map(|f| {
+            (
+                f.which,
+                f.text.trim().to_string(),
+                f.sheet.is_none(),
+                f.sheet.is_none() && f.text.trim() == f.orig.trim(),
+            )
+        }) else {
             return;
         };
-        if text.is_empty() {
+        // A blank box is Escape; so is a document's box Enter leaves as it
+        // was filled (that fill is the caret run's direct format, and writing
+        // it back would turn a style's size or a theme font into direct
+        // formatting).
+        if text.is_empty() || untouched {
             self.font_box = None;
             if doc {
                 self.refocus(window, cx);
@@ -19280,18 +19292,15 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Protected View and a final document hide the ribbon body, so the box
-        // cannot be open there; this is a backstop.
-        if self.active_locked() || self.view_only_active() {
-            self.font_box = None;
-            self.protected_refused(cx);
-            return self.refocus(window, cx);
-        }
-        match which {
+        // Protected View hides the ribbon body, so the box cannot be open
+        // there; `with_editor` refuses it all the same.
+        let since = docxcore::editor::undo_serial_counter();
+        let name = match which {
             FontBox::Name => {
                 let name = font_box::clamp_name(text);
                 self.font_box = None;
                 self.with_editor(window, cx, |e| e.set_font(&name));
+                "Font"
             }
             FontBox::Size => {
                 let Some(half_pts) = font_box::parse_doc_size(text) else {
@@ -19301,6 +19310,12 @@ impl Docxy {
                 };
                 self.font_box = None;
                 self.with_editor(window, cx, |e| e.set_font_size(half_pts));
+                "Font Size"
+            }
+        };
+        if let (Some(ed), _) = self.edit_target_and_repeat() {
+            if ed.undo_serial().is_some_and(|s| s > since) {
+                ed.name_command(since, name);
             }
         }
         self.refocus(window, cx);
@@ -33367,7 +33382,7 @@ impl Docxy {
 
     fn dispatch_act(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
         // A command takes the keyboard from a Font box (#1361); the boxes' own
-        // commands (a click, their KeyTips) focus one below.
+        // commands (a click, the harness's `ribbon-click`) focus one below.
         if !matches!(act, Act::FontName | Act::FontSize) {
             self.font_box = None;
         }

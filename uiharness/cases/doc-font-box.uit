@@ -47,6 +47,10 @@ test document font box: Enter on the Font box is one undo step
   call real-type {"text":"Arial"}
   call real-key {"key":"enter"}
   assert run.font is Arial
+  call menu-open {"target":{"qat":"qat-undo"}}
+  call menu-read {}
+  assert reply.items.0.label is Font
+  key escape
   key ctrl+z
   call field-read {"input":"doc-font"}
   assert reply.value is Calibri
@@ -103,3 +107,18 @@ test document font box: a font box does not outlive the Home tab that draws it
   call field-read {"input":"doc-font"}
   assert reply.focused is false
   assert reply.value is Calibri
+
+test document font box: Enter on an untouched box formats nothing
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":6}
+  call pointer-click {"input":"doc-font"}
+  call real-key {"key":"enter"}
+  assert dirty is false
+  call field-read {"input":"doc-font"}
+  assert reply.focused is false
+  call pointer-click {"input":"doc-font-size"}
+  call real-key {"key":"enter"}
+  assert dirty is false
+  call field-read {"input":"doc-font-size"}
+  assert reply.focused is false

@@ -2341,7 +2341,7 @@ impl Editor {
     pub fn resize_font(&mut self, delta: i32) {
         self.map_props(|p| {
             let cur = p.size_half_pts.unwrap_or(22) as i32;
-            p.size_half_pts = Some((cur + delta).clamp(2, 264) as u32);
+            p.size_half_pts = Some((cur + delta).clamp(2, 3276) as u32);
         });
     }
     pub fn set_font_size(&mut self, half_pts: u32) {
@@ -6207,6 +6207,18 @@ mod tests {
         assert!(ed.all_in_list(42));
         ed.set_list(None);
         assert!(!ed.all_in_list(42));
+    }
+
+    #[test]
+    fn grow_and_shrink_keep_sizes_above_132pt() {
+        let mut ed = Editor::new(doc(&["hello"]));
+        ed.select_all();
+        ed.set_font_size(400); // 200pt
+        ed.resize_font(2);
+        assert_eq!(ed.caret_props().size_half_pts, Some(402));
+        ed.set_font_size(3276);
+        ed.resize_font(2);
+        assert_eq!(ed.caret_props().size_half_pts, Some(3276));
     }
 
     #[test]
