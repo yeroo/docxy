@@ -418,9 +418,9 @@ fn press_doc(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
 /// field's (`value`, `focused`, `caret` and `selection` in chars, `null`
 /// while it has no focus). The formula bar and the in-cell
 /// editor are one buffer, so both are focused while a cell is being edited:
-/// nothing records which one the edit began in. The Find bar's fields and
-/// the sheet tab's rename append and pop only, so a focused one's caret is
-/// its end; the rename reads the active sheet's name while it is closed. The
+/// nothing records which one the edit began in. The sheet Find bar's fields
+/// keep a caret and a whole-field selection (#1342); the sheet tab's rename
+/// appends and pops only, so its caret is its end, and it reads the active sheet's name while it is closed. The
 /// Name Box and the Font combos never take the focus today: they read what
 /// they draw.
 pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
@@ -473,11 +473,17 @@ pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
             };
             let focused = app.find_open && app.find_field == field;
             let caret = if focused {
-                num(text.chars().count())
+                num(app.sf_state(field).0)
             } else {
                 Json::Null
             };
-            (Json::Str(text.clone()), focused, caret, Json::Null)
+            let len = text.chars().count();
+            let selection = if focused && app.sf_state(field).1 && len > 0 {
+                Json::Arr(vec![num(0), num(len)])
+            } else {
+                Json::Null
+            };
+            (Json::Str(text.clone()), focused, caret, selection)
         }
         "name-box" => (
             Json::Str(crate::name_box_text(v)),

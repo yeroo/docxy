@@ -5273,7 +5273,7 @@ fn dispatch_verb(
                         )?
                         .center(),
                     // The sheet Find bar's Replace and All buttons (#1200),
-                    // which no key presses.
+                    // which Alt+R and Alt+A also press (#1342).
                     Some(at @ ("sheet-replace-button" | "sheet-replace-all-button")) => {
                         let probe = if at == "sheet-replace-button" {
                             "sf-rep"
