@@ -5275,8 +5275,8 @@ struct Docxy {
     /// ([`FindField::idx`]), for the sheet bar (#1342) and the document bar (#1360).
     sf_caret: [usize; 2],
     sf_sel: [bool; 2],
-    /// The text length each caret was kept for: another path (the doc bar,
-    /// the selection seed) that edits the text leaves it behind.
+    /// The text length each caret was kept for: another path (the
+    /// selection seed) that edits the text leaves it behind.
     sf_len: [usize; 2],
     find_case: bool,
     /// The find bar's current match and its index in the search it came from
@@ -18918,9 +18918,9 @@ impl Docxy {
         cx.notify();
     }
 
-    // ---- find & replace (sheet) -------------------------------------------
+    // ---- find & replace -------------------------------------------
 
-    /// The sheet Find bar's text for `f`.
+    /// The Find bar's text for `f`.
     fn sf_text(&self, f: FindField) -> &String {
         match f {
             FindField::Query => &self.find_query,
@@ -18928,7 +18928,7 @@ impl Docxy {
         }
     }
 
-    /// The sheet Find bar's caret and whole-field selection for `f`: kept
+    /// The Find bar's caret and whole-field selection for `f`: kept
     /// while its text is as the bar left it, else the end and none.
     fn sf_state(&self, f: FindField) -> (usize, bool) {
         let i = f.idx();
@@ -18940,7 +18940,7 @@ impl Docxy {
         )
     }
 
-    /// Open the sheet Find bar's fields with the caret at each text's end.
+    /// Open the Find bar's fields with the caret at each text's end.
     fn sf_reset(&mut self) {
         self.sf_sel = [false; 2];
         for f in [FindField::Query, FindField::Replace] {
@@ -18958,7 +18958,7 @@ impl Docxy {
         self.sf_reset();
     }
 
-    /// One caret edit of the focused sheet Find bar field.
+    /// One caret edit of the focused Find bar field.
     fn sf_edit(&mut self, op: field_edit::Op) {
         let f = self.find_field;
         let i = f.idx();
@@ -24438,7 +24438,9 @@ impl Docxy {
                     (FindField::Query, _) => FindField::Replace,
                     (FindField::Replace, _) => FindField::Query,
                 };
-                self.sf_focus(to);
+                if to != self.find_field {
+                    self.sf_focus(to);
+                }
                 cx.notify();
                 return;
             }
@@ -24447,7 +24449,8 @@ impl Docxy {
         let f = self.find_field;
         let before = self.sf_text(f).clone();
         // Ctrl+Alt is AltGr on Windows: its keys are text, not chords.
-        if ctrl && !alt {
+        // Ctrl/Cmd+Backspace and Delete still delete a character.
+        if ctrl && !alt && !matches!(key, "backspace" | "delete") {
             self.sf_chord(key, cx);
         } else {
             match key {
