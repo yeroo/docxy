@@ -1468,12 +1468,10 @@ fn act_commits_editor(act: SheetAct) -> bool {
 /// of the clip does not touch, and its own re-paste re-stamps the clip when
 /// it lands. Its copy mode ending on the commit's edit is right, as for any
 /// other act: a Cut makes a new clip, and a Sort and its like end copy mode
-/// as they should.
+/// as they should. Plain Paste is not in the set: in an open entry it inserts
+/// text instead of committing (#1341).
 fn act_restamps_clip(act: SheetAct) -> bool {
-    matches!(
-        act,
-        SheetAct::Paste | SheetAct::PasteAs(_) | SheetAct::PasteSpecial
-    )
+    matches!(act, SheetAct::PasteAs(_) | SheetAct::PasteSpecial)
 }
 
 /// A run of Tab / Shift+Tab entries: the column it began in, and the cell the
