@@ -19288,7 +19288,6 @@ impl Docxy {
         cx.notify();
     }
 
-    /// Route a keystroke to the open find bar (query / replace fields).
     /// A Ctrl chord in a Find bar field: A selects the field, C and X copy it,
     /// V pastes one line. Any other chord is not text and does nothing.
     fn sf_chord(&mut self, key: &str, cx: &mut Context<Self>) {
@@ -19319,6 +19318,7 @@ impl Docxy {
         }
     }
 
+    /// Route a keystroke to the open find bar (query / replace fields).
     fn sheet_find_key(
         &mut self,
         ev: &KeyDownEvent,

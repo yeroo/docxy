@@ -20,10 +20,6 @@ inputs-typing-sheet-data.uit | sheet text-to-columns/breaks: OK applies | #1205
 inputs-typing-sheet-data.uit | sheet text-to-columns/formats: OK applies | #1205
 inputs-typing-sheet-data.uit | sheet text-to-columns/destination: OK applies | #1205
 
-# The document Find bar's fields are append-only (find_key): no caret, so
-# Home, End, Left, Right and Delete do nothing, and Ctrl+A/C/V are ignored
-# (#1201 found it).
-
 # Home's Font and Font Size boxes (document) are not text boxes: a click opens
 # the font or size chip picker, nothing takes the focus, and what is typed
 # edits the document; Enter applies nothing (#1201 found it).
