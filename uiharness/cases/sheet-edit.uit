@@ -336,6 +336,9 @@ test paste with an open editor inserts at the caret
   key ctrl+v
   assert editing is true
   assert dirty is false
+  # `x` + "North<tab>10": the copied row's trailing line break is not taken.
+  call field-read {"input":"cell-editor"}
+  assert reply.caret is 9
   key escape
 
 # #510 r1: a paste-family act that still commits (Paste Link) commits the entry
@@ -352,6 +355,10 @@ test paste link with an open editor commits first
   call menu-click {"label":"Paste Link"}
   assert editing is false
   assert dirty is true
+  call cell {"cell":"D2"}
+  assert reply.value is =$A$2
+  call cell {"cell":"E2"}
+  assert reply.value is =$B$2
 
 # #510 r1: a refused entry (a formula that does not parse) stops the act:
 # the editor stays open and the command does not run. Fails if the early
