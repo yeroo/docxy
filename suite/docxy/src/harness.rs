@@ -2602,6 +2602,8 @@ struct RibbonCommand {
     gallery: bool,
     /// The id of the split button or drop-down whose menu holds it.
     menu: Option<String>,
+    /// Contributed by a UI plugin (#1532): `ribbon-read` says `"plugin": true`.
+    plugin: bool,
 }
 
 impl RibbonCommand {
@@ -2615,6 +2617,7 @@ impl RibbonCommand {
             act: cmd.act,
             gallery: false,
             menu: None,
+            plugin: crate::plugin_ui::is_plugin(cmd.act),
         }
     }
     fn in_menu(cmd: &crate::rs::Cmd<crate::Act>, owner: &crate::rs::Cmd<crate::Act>) -> Self {
@@ -2646,6 +2649,9 @@ impl RibbonCommand {
         if let Some(menu) = &self.menu {
             fields.push(("menu", Json::Str(menu.clone())));
         }
+        if self.plugin {
+            fields.push(("plugin", Json::Bool(true)));
+        }
         Json::obj(fields)
     }
 }
@@ -2673,6 +2679,7 @@ fn control_commands(control: &crate::Control<crate::Act>, out: &mut Vec<RibbonCo
             act: item.act,
             gallery: true,
             menu: None,
+            plugin: crate::plugin_ui::is_plugin(item.act),
         })),
         Control::Rows(rows) => {
             for cell in rows.iter().flatten() {
@@ -3087,6 +3094,15 @@ fn menu_open(
         Json::Str(name) if name == "flash-fill" => app.open_flash_menu(cx),
         // The ribbon's own right-click menu (#590): the tab strip or the
         // body, through the same opener the pointer press calls.
+        // The Gantt chart's own menu (#1532): a right-press beside the bars.
+        Json::Str(name) if name == "chart" => {
+            if !app.active_is_project() {
+                return Err("the chart menu opens on a Project tab".into());
+            }
+            let at = menu_point(app, window, Some("project-body"), |b| b.center());
+            app.open_chart_menu(at, cx);
+            Ok(())
+        }
         Json::Str(name) if name == "ribbon-bar" => {
             let at = menu_point(app, window, Some("ribbon-body"), |b| b.center());
             app.open_ribbon_bar_menu(at, cx);
@@ -4838,6 +4854,15 @@ fn dispatch_verb(
             Done::ok(crate::menu::read_json(app.menu.as_ref()))
         }
         "menu-read" => Done::ok(crate::menu::read_json(app.menu.as_ref())),
+        // The UI plugins' overlay shapes for the active Project's chart
+        // (#1532), as the chart paints them: `{count, shapes}`.
+        "project-overlay" => {
+            let Some(crate::Surface::Project(v)) = app.tabs.get(app.active).map(|t| &t.surface)
+            else {
+                return Err("project-overlay needs a Project tab".into());
+            };
+            Done::ok(crate::plugin_ui::overlay_json(v))
+        }
         // Insert > Table's hover grid (#646): `{cols, rows}` moves the pointer
         // over that cell (`{}` off the grid), `click: true` clicks it. The
         // same handlers the drawn cells call; the reply carries the header.
@@ -7544,6 +7569,7 @@ mod tests {
             act,
             gallery: false,
             menu: None,
+            plugin: false,
         };
         let commands = vec![
             cmd("one", "Move", "Move Task", Act::Bold),
@@ -7743,6 +7769,7 @@ mod tests {
             "menu-read",
             "menu-click",
             "menu-close",
+            "project-overlay",
             "key",
             "type",
             "ime-mark",
@@ -7933,6 +7960,7 @@ mod tests {
                 act: crate::Act::Bold,
                 gallery: false,
                 menu: None,
+                plugin: false,
             },
             RibbonCommand {
                 id: "two".into(),
@@ -7943,6 +7971,7 @@ mod tests {
                 act: crate::Act::Italic,
                 gallery: false,
                 menu: None,
+                plugin: false,
             },
         ];
         let err = resolve_commands(&commands, "Home", "Same").err().unwrap();

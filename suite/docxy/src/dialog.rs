@@ -37,6 +37,11 @@ pub(crate) enum DialogOwner {
     TaskInfo {
         uid: i32,
     },
+    /// A dialog a UI plugin's command asked for (#1532): OK sends `command`
+    /// again with the values (`plugin_ui::dialog_click`).
+    Plugin {
+        command: &'static str,
+    },
     /// Word's Page Setup, for the caret's sections (#649).
     PageSetup,
     /// Word's Columns, for the caret's sections (#649).
@@ -374,8 +379,13 @@ pub(crate) enum ControlKind {
     Radio,
     Dropdown,
     List,
+    /// Rows of cells, one column kind each (`Control::column_kinds`, text
+    /// when unset); `dialog-set` addresses a cell as `name[row].column`
+    /// (#1532). Drawn as a table, edited by `dialog-set` only.
     Grid,
     Label,
+    /// A text field of several lines: Enter is a new line, not OK (#1532).
+    Multiline,
     /// Items each checked or not, a tree by `Control::depths`: checking an
     /// item checks the items under it, and an item with items under it is
     /// checked when they all are (the AutoFilter value list, #690).
@@ -395,6 +405,7 @@ impl ControlKind {
             Self::List => "list",
             Self::Grid => "grid",
             Self::Label => "label",
+            Self::Multiline => "multiline",
             Self::CheckList => "checklist",
         }
     }
@@ -405,7 +416,7 @@ impl ControlKind {
     pub fn is_text(self) -> bool {
         matches!(
             self,
-            Self::Text | Self::Number | Self::Date | Self::Duration
+            Self::Text | Self::Number | Self::Date | Self::Duration | Self::Multiline
         )
     }
     /// A control the keyboard and pointer can edit: a grid is still a
@@ -459,8 +470,14 @@ pub(crate) struct Control {
     pub items: Vec<String>,
     /// A grid's column headings.
     pub columns: Vec<String>,
+    /// A grid's column kinds, one per column (text when shorter), checked
+    /// when a cell is set (#1532).
+    pub column_kinds: Vec<ControlKind>,
     /// A check list's items' depths in its tree (0 at the top).
     pub depths: Vec<u8>,
+    /// Contributed by a UI plugin (#1532): `dialog-read` says `"plugin":
+    /// true`, and the catalogue check leaves it out.
+    pub plugin: bool,
 }
 
 impl Control {
@@ -475,8 +492,18 @@ impl Control {
             page: None,
             items: Vec::new(),
             columns: Vec::new(),
+            column_kinds: Vec::new(),
             depths: Vec::new(),
+            plugin: false,
         }
+    }
+
+    /// The kind of a grid's column `col` (text when none is set).
+    pub fn column_kind(&self, col: usize) -> ControlKind {
+        self.column_kinds
+            .get(col)
+            .copied()
+            .unwrap_or(ControlKind::Text)
     }
 
     /// What the control shows.
@@ -535,7 +562,18 @@ impl Control {
         }
         if let Value::Rows(rows) = &self.value {
             out.push(("columns", strs(&self.columns)));
+            out.push((
+                "column_kinds",
+                Json::Arr(
+                    (0..self.columns.len())
+                        .map(|c| Json::Str(self.column_kind(c).name().into()))
+                        .collect(),
+                ),
+            ));
             out.push(("rows", rows_json(rows)));
+        }
+        if self.plugin {
+            out.push(("plugin", Json::Bool(true)));
         }
         if self.kind == ControlKind::CheckList {
             out.push(("items", strs(&self.items)));
@@ -573,7 +611,10 @@ impl Control {
         };
         self.value = match self.kind {
             ControlKind::Label => return Err(format!("'{label}' is a label; it cannot be set")),
-            ControlKind::Text | ControlKind::Date | ControlKind::Duration => Value::Text(text()?),
+            ControlKind::Text
+            | ControlKind::Date
+            | ControlKind::Duration
+            | ControlKind::Multiline => Value::Text(text()?),
             ControlKind::Number => match value()? {
                 Json::Num(n) if n.is_finite() => Value::Text(n.to_string()),
                 // Rust parses "NaN", "inf" and "1e999"; a field takes none of them.
@@ -736,12 +777,51 @@ impl Control {
                 })?,
             None => return Err("missing argument 'column'".into()),
         };
-        let Some(Json::Str(value)) = args.get("value") else {
-            return Err(format!("'{label}' cells take text"));
+        // A cell takes what its column's kind takes (#1532): a number
+        // column a finite number (as text or a number), a checkbox column
+        // true or false, the rest text.
+        let kind = self.column_kind(column);
+        let heading = self.columns.get(column).map_or("", String::as_str);
+        let value = match (kind, args.get("value")) {
+            (ControlKind::Checkbox, Some(Json::Bool(b))) => b.to_string(),
+            (ControlKind::Checkbox, Some(Json::Str(s)))
+                if s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("false") =>
+            {
+                s.to_ascii_lowercase()
+            }
+            (ControlKind::Checkbox, _) => {
+                return Err(format!("'{label}' column '{heading}' takes true or false"));
+            }
+            (ControlKind::Number, Some(Json::Num(n))) if n.is_finite() => n.to_string(),
+            (ControlKind::Number, Some(Json::Str(s)))
+                if s.trim().parse::<f64>().is_ok_and(f64::is_finite) || partial_number(s) =>
+            {
+                s.clone()
+            }
+            (ControlKind::Number, _) => {
+                return Err(format!("'{label}' column '{heading}' takes a number"));
+            }
+            (_, Some(Json::Str(s))) => s.clone(),
+            (_, Some(Json::Num(n))) => n.to_string(),
+            _ => return Err(format!("'{label}' cells take text")),
         };
-        rows[row][column] = value.clone();
+        if rows[row].len() < self.columns.len() {
+            rows[row].resize(self.columns.len(), String::new());
+        }
+        rows[row][column] = value;
         Ok(())
     }
+}
+
+/// `name[row].column` (#1532): a grid cell's address, as `dialog-set` takes
+/// it; `column` is a heading or an index. `None` for a plain control name.
+pub(crate) fn grid_address(control: &str) -> Option<(&str, usize, &str)> {
+    let open = control.find('[')?;
+    let close = control[open..].find(']')? + open;
+    let name = &control[..open];
+    let row = control[open + 1..close].trim().parse::<usize>().ok()?;
+    let column = control[close + 1..].strip_prefix('.')?.trim();
+    (!name.is_empty() && !column.is_empty()).then_some((name, row, column))
 }
 
 fn no_row(label: &str, row: usize, len: usize) -> String {
@@ -773,6 +853,11 @@ fn fold(label: &str) -> String {
         .trim_end_matches(':')
         .trim()
         .to_lowercase()
+}
+
+/// [`fold`], for the dialogs' owners outside this module.
+pub(crate) fn fold_label(label: &str) -> String {
+    fold(label)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1025,10 +1110,11 @@ impl Dialog {
             .id
             .entry()
             .ok_or_else(|| format!("'{}' is a test-only dialog", self.id.as_str()))?;
+        // A UI plugin's controls (#1532) are not the catalogue's to list.
         let have: Vec<(&str, ControlKind, Option<&str>)> = self
             .controls
             .iter()
-            .filter(|c| c.kind.is_editable())
+            .filter(|c| c.kind.is_editable() && !c.plugin)
             .map(|c| (c.name, c.kind, self.page_label(c)))
             .collect();
         let want: Vec<(&str, ControlKind, Option<&str>)> = entry
@@ -1059,8 +1145,31 @@ impl Dialog {
         ))
     }
 
-    /// Set one control through its input handler.
+    /// Set one control through its input handler. A grid cell may be named
+    /// `name[row].column` (#1532), the same as `{control: name, row, column}`.
     pub fn set(&mut self, control: &str, args: &Json) -> Result<(), String> {
+        if let Some((name, row, column)) = grid_address(control) {
+            let i = self.control_index(name)?;
+            if self.controls[i].kind != ControlKind::Grid {
+                return Err(format!(
+                    "'{}' is not a grid; only a grid cell is named name[row].column",
+                    shown(&self.controls[i].label)
+                ));
+            }
+            let mut fields = vec![
+                ("row".to_string(), Json::Num(row as f64)),
+                (
+                    "column".to_string(),
+                    column
+                        .parse::<f64>()
+                        .map_or_else(|_| Json::Str(column.to_string()), Json::Num),
+                ),
+            ];
+            if let Json::Obj(given) = args {
+                fields.extend(given.iter().filter(|(k, _)| k == "value").cloned());
+            }
+            return self.set_at(i, &Json::Obj(fields));
+        }
         let i = self.control_index(control)?;
         self.set_at(i, args)
     }
@@ -1580,6 +1689,14 @@ impl DialogStack {
     pub fn key_button(&self, key: &str, plain: bool) -> Option<String> {
         let top = self.top()?;
         if !plain {
+            return None;
+        }
+        // Enter in a multiline field is a new line (#1532), not OK.
+        if key == "enter"
+            && top
+                .focused()
+                .is_some_and(|c| c.kind == ControlKind::Multiline)
+        {
             return None;
         }
         let b = match key {

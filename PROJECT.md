@@ -486,6 +486,21 @@ without one nothing changes.
 - **yppxy** ignores the UI contributions except commands: `yppxy plan.xml
   --command <id> [--save out]` runs one headless with the first task selected
   and prints the status, which is how QA drives a plugin's commands.
+- **The desktop suite** (`suite/docxy/src/plugin_ui.rs`) draws the
+  contributions: ribbon groups and controls after each project tab's own
+  (a control with a built-in command's id replaces it in place; a gallery's
+  swatches as colour tiles; KeyTips as declared), items in the row, bar,
+  column and chart menus (after the `after` label, else at the end), the
+  `task-information` spec's pages in the Task Information dialog, a
+  command's dialog with `multiline` and `grid` controls, the overlay's
+  shapes over the chart after the bars, the palette the plan's formatting
+  names on the bars, and the formatting's text styles on the table. State
+  (enabled, checked, the checked swatch, dialog prefills) is asked when the
+  plan's revision, the selection or the view changes, never per frame; a
+  command's ops and `view` are one undo step. The harness marks what came
+  from a plugin with `"plugin": true` (`ribbon-read`, `menu-read`,
+  `dialog-read`), reads the overlay with `project-overlay`, and
+  `uiharness/cases/project-plugin-ui.uit` covers the fixture's.
 - **The fixture** exports the target (`0.1.*` for both hosts) and the UI
   symbols with one of everything (see `projcore/tests/plugin_fixture/src/ui.rs`);
   `projcore/tests/plugins.rs` round-trips them through `libloading`, and

@@ -1,0 +1,170 @@
+# UI plugins in the desktop suite (#1532). The `plugin` line copies the test
+# fixture (projcore/tests/plugin_fixture, built beside uiharness by
+# `cargo build --release -p uiharness -p plugin_fixture`) into the sandbox's
+# docxy/plugins before the suite starts. Besides its `.fakeproj` format the
+# fixture carries a version target (0.1.*, this host) and the UI symbols
+# with one of everything: on the Task tab a group "Fixture" with a large
+# button, a toggle and a two-swatch gallery; a row-menu item after Notes...;
+# a Task Information page with a multiline and a grid; a dialog the button
+# opens; an overlay line between the first two bars; and `fixture.rename`,
+# one `task.set` op. Each case opens its own copy of project-clipboard.xml
+# (tasks A and B).
+
+plugin yppx_fixture
+
+test app-info lists the fixture as a loaded UI plugin with its commands
+  open copy:../fixtures/project-clipboard.xml
+  call app-info {}
+  assert reply.plugins.loaded.0.formats.0 is fakeproj
+  assert reply.plugins.loaded.0.ui is true
+  assert reply.plugins.loaded.0.built_against is fixture
+  assert reply.plugins.ui.0.commands.0 is fixture.hello
+  assert reply.plugins.skipped is []
+
+test the manifest's group is drawn after the Task tab's own, its controls marked plugin
+  open copy:../fixtures/project-clipboard.xml
+  call ribbon-read {}
+  # File, then Task: its last group is the fixture's.
+  assert reply.tabs.1.name is Task
+  assert reply.tabs.1.groups.-1.title is Fixture
+  assert reply.tabs.1.groups.-1.commands.0.id is fixture.hello
+  assert reply.tabs.1.groups.-1.commands.0.label is Hello
+  assert reply.tabs.1.groups.-1.commands.0.tip.title is Say hello from the fixture
+  assert reply.tabs.1.groups.-1.commands.0.key_tip is XH
+  assert reply.tabs.1.groups.-1.commands.0.plugin is true
+  assert reply.tabs.1.groups.-1.commands.1.id is fixture.flag
+  assert reply.tabs.1.groups.-1.commands.1.checked is false
+  assert reply.tabs.1.groups.-1.galleries.0.id is fixture.palette
+  assert reply.tabs.1.groups.-1.galleries.0.items.0 is Blue
+  assert reply.tabs.1.groups.-1.galleries.0.items.1 is Red
+
+test a toggle runs its command and reads back checked as the plugin says
+  open copy:../fixtures/project-clipboard.xml
+  call ribbon-click {"tab":"Task","command":"fixture.flag"}
+  assert status is Fixture: flag on
+  call ribbon-read {}
+  assert reply.tabs.1.groups.-1.commands.1.checked is true
+  call ribbon-click {"tab":"Task","command":"fixture.flag"}
+  assert status is Fixture: flag off
+  call ribbon-read {}
+  assert reply.tabs.1.groups.-1.commands.1.checked is false
+
+test a swatch sets the plan's palette (an edit) and the gallery follows
+  open copy:../fixtures/project-clipboard.xml
+  assert dirty is false
+  call ribbon-read {}
+  assert reply.tabs.1.groups.-1.commands.2.id is fixture.palette:Blue
+  assert reply.tabs.1.groups.-1.commands.2.checked is true
+  call ribbon-click {"tab":"Task","command":"fixture.palette:Red"}
+  assert status is Fixture: palette fixture.red
+  assert dirty is true
+  call ribbon-read {}
+  assert reply.tabs.1.groups.-1.commands.3.id is fixture.palette:Red
+  assert reply.tabs.1.groups.-1.commands.3.checked is true
+  assert reply.tabs.1.groups.-1.commands.2.checked is false
+
+test the button's command opens the plugin's dialog, whose OK sends the values back
+  open copy:../fixtures/project-clipboard.xml
+  call ribbon-click {"tab":"Task","command":"Hello"}
+  assert dialog is plugin
+  call dialog-read {}
+  assert reply.title is Fixture Options
+  assert reply.controls.0.name is n
+  assert reply.controls.0.kind is number
+  assert reply.controls.0.value is 1
+  assert reply.controls.0.plugin is true
+  assert reply.buttons.0.label is OK
+  assert reply.buttons.1.label is Cancel
+  call dialog-set {"control":"n","value":7}
+  call dialog-click {"button":"OK"}
+  assert dialog is none
+  assert status is Fixture: hello 7
+  # Cancel sends nothing.
+  call ribbon-click {"tab":"Task","command":"Hello"}
+  assert dialog is plugin
+  call dialog-click {"button":"Cancel"}
+  assert dialog is none
+  assert status is Fixture: asking
+
+test the row menu's item comes after Notes..., needs a task and renames it as one undo step
+  open copy:../fixtures/project-clipboard.xml
+  click C2
+  assert selected_name is B
+  call menu-open {"target":{"row":2}}
+  call menu-read {}
+  # After Notes..., before Add to Timeline, as the manifest's `after` says.
+  assert reply.items.23.label is Notes...
+  assert reply.items.24.label is Rename (fixture)
+  assert reply.items.24.plugin is true
+  assert reply.items.24.enabled is true
+  assert reply.items.25.label is Add to Timeline
+  call menu-click {"label":"Rename (fixture)"}
+  assert selected_name is Renamed by fixture
+  assert status is Fixture: renamed task 2
+  assert dirty is true
+  key ctrl+z
+  assert selected_name is B
+  # On the entry row there is no task: the item is disabled.
+  click C3
+  call menu-open {"target":{"row":null}}
+  call menu-read {}
+  assert reply.items.24.label is Rename (fixture)
+  assert reply.items.24.enabled is false
+  key escape
+
+test the chart menu opens beside the bars with Project's items greyed
+  open copy:../fixtures/project-clipboard.xml
+  call menu-open {"target":"chart"}
+  call menu-read {}
+  assert reply.target is chart
+  assert reply.items.0.label is Gridlines...
+  assert reply.items.0.enabled is false
+  key escape
+
+test Task Information gains the plugin's page, prefilled, with a multiline and a grid
+  open copy:../fixtures/project-clipboard.xml
+  click C2
+  key alt t c
+  assert dialog is task-information
+  call dialog-read {}
+  assert reply.tabs.5 is Fixture
+  call dialog-tab {"tab":"Fixture"}
+  call dialog-read {}
+  assert reply.controls.0.name is fixture.note
+  assert reply.controls.0.kind is multiline
+  assert reply.controls.0.value is note for task 2
+  assert reply.controls.0.plugin is true
+  assert reply.controls.1.name is fixture.grid
+  assert reply.controls.1.kind is grid
+  assert reply.controls.1.columns.1 is Done
+  assert reply.controls.1.column_kinds.1 is checkbox
+  assert reply.controls.1.rows.1.0 is 2
+  assert reply.controls.1.rows.1.1 is true
+  # A grid cell by its address, checked against the column's kind.
+  call dialog-set {"control":"fixture.grid[1].Done","value":false}
+  call dialog-read {}
+  assert reply.controls.1.rows.1.1 is false
+  call-error dialog-set {"control":"fixture.grid[1].Done","value":"maybe"} => takes true or false
+  # Enter in the multiline is a new line, not OK.
+  call pointer-click {"dialog-field":"fixture.note"}
+  call real-key {"key":"end"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"more"}
+  assert dialog is task-information
+  call field-read {"dialog-field":"fixture.note"}
+  assert reply.caret is 20
+  # The catalogue check leaves the plugin's controls out.
+  call dialog-catalog-check {}
+  assert reply.id is task-information
+  call dialog-click {"button":"OK"}
+  assert dialog is none
+  assert status is Fixture: note saved (20 chars)
+
+test the overlay returns the fixture's shapes for the chart
+  open copy:../fixtures/project-clipboard.xml
+  call project-overlay {}
+  assert reply.count is 3
+  assert reply.shapes.0.kind is text
+  assert reply.shapes.0.text is fixture
+  assert reply.shapes.1.kind is polyline
+  assert reply.shapes.2.kind is arrow

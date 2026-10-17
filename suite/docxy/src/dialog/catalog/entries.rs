@@ -1671,4 +1671,18 @@ dialogs! {
         accept_closes: true,
         unreachable: None,
     }
+    // A dialog a UI plugin's manifest declares (#1532): its controls are the
+    // plugin's (`"plugin": true`), so the catalogue lists none and the
+    // typing cases do not open it; `project-plugin-ui.uit` drives the
+    // fixture's.
+    PLUGIN = "plugin" {
+        surface: Surface::Project,
+        file: "project",
+        fixture: PROJECT_DOC,
+        open: &[],
+        fields: &[],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: Some("opened by a UI plugin's command; the public build loads none"),
+    }
 }

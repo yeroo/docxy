@@ -12,7 +12,8 @@
 //! - Commands: `fixture.hello` (the dialog, then a status with its number),
 //!   `fixture.flag` (flips the toggle), the swatches (set the palette,
 //!   returned as `view.palette`), `fixture.rename` (one `task.set` op
-//!   renaming the first selected task to "Renamed by fixture").
+//!   renaming the first selected task to "Renamed by fixture"), and
+//!   `task-information` (the page's OK: a status with the note's length).
 //! - Overlay: a polyline with an arrowhead from the first bar's end to the
 //!   second bar's start, and a text label at the first bar.
 
@@ -176,6 +177,22 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
                 r#"{{"ops":[],"status":{},"view":{{"palette":{}}}}}"#,
                 quote(&format!("Fixture: palette {id}")),
                 quote(id)
+            )
+        }
+        // Task Information's OK with the fixture page's values: the note's
+        // length, so a test can see the values arrive.
+        "task-information" => {
+            let note = req
+                .get("values")
+                .and_then(|v| v.get("fixture.note"))
+                .and_then(Json::str)
+                .unwrap_or_default();
+            format!(
+                r#"{{"ops":[],"status":{}}}"#,
+                quote(&format!(
+                    "Fixture: note saved ({} chars)",
+                    note.chars().count()
+                ))
             )
         }
         "fixture.rename" => match first_uid(&req) {

@@ -103,6 +103,9 @@ pub(crate) enum ProjectAct {
     /// View › Appearance › Theme (#1473): cycle Light, Dark and Auto, as the
     /// title bar's theme button did.
     Theme,
+    /// A UI plugin's command (#1532), by the id its manifest gave the
+    /// control, menu item or swatch; run through `plugin_ui::run_command`.
+    Plugin(&'static str),
 }
 
 impl ProjectAct {
@@ -289,7 +292,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
             .tip(tip, "", shortcut)
             .key(key)
     };
-    rs::Ribbon::new(vec![
+    let mut ribbon = rs::Ribbon::new(vec![
         rs::tab(
             "Task",
             "T",
@@ -653,7 +656,12 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
         ),
         // Help ends the row, as in Project (#1021).
         crate::help_tab::help_tab(),
-    ])
+    ]);
+    // What the UI plugins contribute (#1532), after each tab's own groups.
+    for tab in &mut ribbon.tabs {
+        crate::plugin_ui::extend_tab(tab);
+    }
+    ribbon
 }
 
 /// Project's contextual Gantt Chart Format tab, shown after Help while a
@@ -663,7 +671,7 @@ pub(crate) fn gantt_format_tab() -> rs::Tab<Act> {
     let cmd = |id, icon, label, act, shortcut, key| {
         cmdt(id, icon, label, Act::Project(act), shortcut).key(key)
     };
-    rs::tab(
+    let mut tab = rs::tab(
         "Gantt Chart Format",
         "O",
         vec![rs::group(
@@ -688,7 +696,9 @@ pub(crate) fn gantt_format_tab() -> rs::Tab<Act> {
                 ),
             ])],
         )],
-    )
+    );
+    crate::plugin_ui::extend_tab(&mut tab);
+    tab
 }
 
 /// Whether a command act drops the entry-table range selection: every act
@@ -734,6 +744,8 @@ fn task_act_active(v: &ProjectView, act: ProjectAct, uid: Option<i32>) -> bool {
         ProjectAct::CriticalTasks => v.show_critical,
         ProjectAct::BaselineBars => v.show_baseline,
         ProjectAct::Inactivate => task_inactive(v, uid),
+        // A plugin toggle is checked as its `yppx_ui_state` says (#1532).
+        ProjectAct::Plugin(id) => crate::plugin_ui::checked(v, id),
         // The selected task's mode, as Project highlights it; none on the
         // entry row or a blank row.
         ProjectAct::ManuallySchedule | ProjectAct::AutoSchedule => uid
@@ -777,7 +789,7 @@ pub(crate) fn project_row_menu(
         )
     };
     let none = |id, label| Item(Entry::unavailable(id, label));
-    vec![
+    let mut items = vec![
         item("rm-cut", "Cut", "cut", Cut, true),
         item("rm-copy", "Copy", "copy", Copy, true),
         item("rm-paste", "Paste", "paste", Paste, true),
@@ -849,7 +861,9 @@ pub(crate) fn project_row_menu(
         // No link icon in the set yet; Project's chain is drawn by the
         // column-chooser follow-up. The item still runs its command.
         item("rm-hyperlink", "Hyperlink...", "", Hyperlink, task),
-    ]
+    ];
+    crate::plugin_ui::extend_menu(v, "row", &mut items);
+    items
 }
 
 /// A Gantt bar's context menu (#1207), in Project's order: its bar
@@ -872,7 +886,7 @@ pub(crate) fn project_bar_menu(v: &ProjectView) -> Vec<crate::menu::MenuItem> {
         Item(Entry::new(id, label, icon, Act::Project(act), task))
     };
     let none = |id, label| Item(Entry::unavailable(id, label));
-    vec![
+    let mut items = vec![
         none("bm-bar-styles", "Format Bar Styles..."),
         none("bm-format-bar", "Format Bar..."),
         Separator,
@@ -881,7 +895,33 @@ pub(crate) fn project_bar_menu(v: &ProjectView) -> Vec<crate::menu::MenuItem> {
         none("bm-timeline", "Add to Timeline"),
         Separator,
         item("bm-hyperlink", "Hyperlink...", "", Hyperlink),
-    ]
+    ];
+    crate::plugin_ui::extend_menu(v, "bar", &mut items);
+    items
+}
+
+/// The Gantt chart's own context menu (#1532), opened by a right-press on
+/// the chart beside the bars, in Project's order (its chart formatting
+/// dialogs are not built, so the items are drawn disabled), then what a UI
+/// plugin adds to the `chart` menu.
+pub(crate) fn project_chart_menu(v: &ProjectView) -> Vec<crate::menu::MenuItem> {
+    use crate::menu::{
+        Entry,
+        MenuItem::{Item, Separator},
+    };
+    let none = |id, label| Item(Entry::unavailable(id, label));
+    let mut items = vec![
+        none("ch-gridlines", "Gridlines..."),
+        none("ch-bar-styles", "Bar Styles..."),
+        none("ch-layout", "Layout..."),
+        none("ch-nonworking", "Nonworking Time..."),
+        none("ch-progress-lines", "Progress Lines..."),
+        Separator,
+        none("ch-show-timeline", "Show Timeline"),
+        none("ch-show-split", "Show Split"),
+    ];
+    crate::plugin_ui::extend_menu(v, "chart", &mut items);
+    items
 }
 
 /// A column heading's context menu (#1208), in Project's order (CUS-035).
@@ -1422,7 +1462,7 @@ pub(super) fn open_task_info(v: &ProjectView, page: InfoPage) -> Result<Option<D
     if v.ed.project().task(uid).is_none_or(|t| t.is_null) {
         return Ok(None);
     }
-    task_info_dialog(&v.ed, uid, page).map(Some)
+    task_info_dialog_for(v, uid, page).map(Some)
 }
 
 /// The yes/no message box a summary's delete asks: Yes deletes the summary
@@ -1877,6 +1917,13 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             Timeline => v.timeline = !v.timeline,
             CriticalTasks => v.show_critical = !v.show_critical,
             BaselineBars => v.show_baseline = !v.show_baseline,
+            // A UI plugin's command (#1532): its ops as one undo step, its
+            // status, and the dialog it asks for.
+            Plugin(id) => {
+                let outcome = crate::plugin_ui::run_command(v, id, None)?;
+                status = outcome.status;
+                dialog = outcome.dialog;
+            }
             // Window-dependent host actions: the file dialog, the clipboard,
             // a new tab.
             Save | ExportGantt | Report(_) | OpenReportMenu(_) | Copy | Cut | Paste
