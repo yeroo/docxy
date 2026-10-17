@@ -82,6 +82,16 @@ test docxy docxy-find: select-all replaces
   call field-read {"input":"docxy-find"}
   assert reply.value is exactly X
 
+test docxy docxy-find: select-all then Left goes to the start
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"ctrl+f"}
+  call real-type {"text":"abc"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"left"}
+  call real-type {"text":"X"}
+  call field-read {"input":"docxy-find"}
+  assert reply.value is exactly Xabc
+
 test docxy docxy-find: copies
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"ctrl+f"}

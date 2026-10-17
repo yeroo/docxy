@@ -140,12 +140,24 @@ impl LineEdit {
         true
     }
 
+    /// With a selection, Left collapses to its start instead of stepping.
     pub fn left(&mut self) {
+        if let Some((from, _)) = self.selection() {
+            self.anchor = None;
+            self.caret = from;
+            return;
+        }
         self.anchor = None;
         self.caret = self.caret.saturating_sub(1);
     }
 
+    /// With a selection, Right collapses to its end instead of stepping.
     pub fn right(&mut self) {
+        if let Some((_, to)) = self.selection() {
+            self.anchor = None;
+            self.caret = to;
+            return;
+        }
         self.anchor = None;
         self.caret = (self.caret + 1).min(self.len());
     }
@@ -300,10 +312,32 @@ mod tests {
             assert_eq!(l.handle(code), Edit::Moved);
             assert_eq!((l.as_str(), l.selection()), ("abc", None));
         }
+    }
+
+    #[test]
+    fn left_and_right_collapse_to_the_selection_edges() {
         let mut l = typed("abc");
         l.select_all();
         l.left();
-        assert_eq!(l.caret(), 2);
+        assert_eq!((l.caret(), l.selection()), (0, None));
+        l.select_all();
+        l.right();
+        assert_eq!((l.caret(), l.selection()), (3, None));
+        // A selection with the caret at its start, inside the text.
+        for (anchor, caret, left, right) in [(3, 1, 1, 3), (1, 3, 1, 3), (1, 2, 1, 2)] {
+            for go_left in [true, false] {
+                let mut l = typed("abcd");
+                l.anchor = Some(anchor);
+                l.caret = caret;
+                if go_left {
+                    l.left();
+                } else {
+                    l.right();
+                }
+                assert_eq!(l.caret(), if go_left { left } else { right });
+                assert_eq!(l.selection(), None);
+            }
+        }
     }
 
     #[test]
