@@ -302,8 +302,8 @@
 - Each field is the grid cell's own text (`cell_edit_text` to prefill,
   `apply_cell` to write), so Predecessors and Resources are one text field each
   in the column's grammar, not tables. Notes is one line, `\n` = new line (no
-  multiline control). Constraint type + date go through `Editor::set_constraint`
-  (a date without a time is the day's first working time for SNET/FNET); the
+  multiline control). Constraint type + date go through `Editor::set_constraint_typed`
+  (the date resolved by `parse_stamp`); the
   date follows the type (ASAP and ALAP disable it).
 - OK writes only the fields that changed (`Dialog::changed`), inside
   `Editor::batch`: one undo step, an unchanged OK leaves the plan clean, and a
@@ -312,8 +312,9 @@
   % Complete of any summary, are disabled. A bare Deadline or constraint date
   is the day's last working time (FNLT, MFO, Deadline) or first (the other
   types), `YYYY-MM-DDThh:mm` takes a time, and the field shows a stored
-  instant bare only when it is that boundary. A change of constraint type
-  alone keeps the stored instant. Start and Finish together on an auto task
+  instant bare only when it is that boundary. What the field shows is what
+  applies, also when only the type changed (`parse_stamp`): a bare date takes
+  the new type's boundary, a time keeps its instant. Start and Finish together on an auto task
   are refused (each would replace the other's constraint). Task type and
   Effort driven apply before the rest, since a resource added in the same OK
   rescales by them. The new projcore setters (`set_percent_complete`,

@@ -684,7 +684,7 @@ fn press_project(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
 }
 
 /// Whether `pointer-click` double-clicks a Project input: the cell editor
-/// opens on a double-click, the prompt's field takes one click.
+/// opens on a double-click.
 fn project_double(id: &str) -> Option<bool> {
     match id {
         "project-cell" => Some(true),

@@ -298,13 +298,12 @@ fn whole(d: &Dialog, name: &str, what: &str, lo: i32, hi: i32) -> Result<i32, St
 }
 
 /// Write what the person changed in `d` to task `uid`, as one undo step.
-/// `Ok(true)` when the plan changed. A refused field changes nothing.
+/// A refused field changes nothing.
 pub(crate) fn apply_task_info(
     ed: &mut ProjectEditor,
     uid: i32,
     d: &Dialog,
-) -> Result<bool, String> {
-    let stored = ed.project().task(uid).and_then(|t| t.constraint_date);
+) -> Result<(), String> {
     let changed = |name: &str| d.changed(name);
     ed.batch(|ed| {
         // Task type and Effort driven first: a resource added below rescales
@@ -348,8 +347,7 @@ pub(crate) fn apply_task_info(
             ed.set_priority(uid, whole(d, "priority", "Priority", 0, PRIORITY_MAX)?)?;
         }
         // After Start and Finish, which add their own constraint to an auto
-        // task: the person's explicit choice here wins. A change of type
-        // alone keeps the stored instant.
+        // task: the person's explicit choice here wins.
         if changed("ctype") || changed("cdate") {
             let kind = chosen(d, "ctype")
                 .and_then(|k| CONSTRAINTS.get(k))
@@ -357,14 +355,14 @@ pub(crate) fn apply_task_info(
                 .ok_or("Pick a constraint type")?;
             let date = if !needs_date(kind) {
                 None
-            } else if changed("cdate") {
+            } else {
+                // What the field shows is what applies: a bare date takes the
+                // new type's boundary, a time keeps its instant.
                 let typed = text_of(d, "cdate");
                 if typed.trim().is_empty() {
                     return Err(format!("{} needs a constraint date", kind.abbrev()));
                 }
                 Some(parse_stamp(ed, uid, &typed, constraint_ends_day(kind))?)
-            } else {
-                Some(stored.ok_or_else(|| format!("{} needs a constraint date", kind.abbrev()))?)
             };
             ed.set_constraint_typed(uid, kind, date)?;
         }
@@ -381,10 +379,7 @@ pub(crate) fn apply_task_info(
             ed.set_notes(uid, &projcore::text::notes_from_line(&text_of(d, "notes")))?;
         }
         Ok(())
-    })?;
-    // The tab's dirty flag and edit generation follow the editor
-    // (`complete_project`), as for a summary delete.
-    Ok(false)
+    })
 }
 
 #[cfg(test)]

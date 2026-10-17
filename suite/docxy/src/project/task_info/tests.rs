@@ -422,20 +422,37 @@ fn start_and_finish_together_are_refused_on_an_auto_task_and_taken_on_a_manual_o
 }
 
 #[test]
-fn a_type_only_change_keeps_the_stored_constraint_instant() {
+fn a_type_only_change_applies_what_the_field_shows() {
+    use projcore::ConstraintType::*;
+    // SNET at 08:00 shows the bare date: Must Finish On means that day's end.
+    let mut t = tab();
+    let start = DateTime::from_ymd_hm(2026, 3, 5, 8, 0);
+    vm(&mut t)
+        .ed
+        .set_constraint_typed(2, StartNoEarlierThan, Some(start))
+        .unwrap();
+    open(&mut t, ProjectAct::Constraint);
+    assert_eq!(read(&t, "cdate"), "2026-03-05");
+    put(&mut t, "ctype", "Must Finish On");
+    dialog_click(&mut t, "OK").unwrap();
+    let task = plain_task(&t);
+    assert_eq!(task.constraint, MustFinishOn);
+    assert_eq!(
+        task.constraint_date,
+        Some(DateTime::from_ymd_hm(2026, 3, 5, 17, 0))
+    );
+    // A time shown keeps its instant: FNET 17:00 -> MFO.
     let mut t = tab();
     let at = DateTime::from_ymd_hm(2026, 3, 5, 17, 0);
     vm(&mut t)
         .ed
-        .set_constraint_typed(2, projcore::ConstraintType::FinishNoEarlierThan, Some(at))
+        .set_constraint_typed(2, FinishNoEarlierThan, Some(at))
         .unwrap();
     open(&mut t, ProjectAct::Constraint);
-    assert_eq!(read(&t, "cdate"), "2026-03-05T17:00", "FNET is not a day-end type");
+    assert_eq!(read(&t, "cdate"), "2026-03-05T17:00");
     put(&mut t, "ctype", "Must Finish On");
     dialog_click(&mut t, "OK").unwrap();
-    let task = plain_task(&t);
-    assert_eq!(task.constraint, projcore::ConstraintType::MustFinishOn);
-    assert_eq!(task.constraint_date, Some(at));
+    assert_eq!(plain_task(&t).constraint_date, Some(at));
 }
 
 #[test]
