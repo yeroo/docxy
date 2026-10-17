@@ -139,6 +139,10 @@ pub struct Editor {
     pending: Option<Schedule>,
     /// Inside [`Self::batch`]; batches do not nest.
     batching: bool,
+    /// Moves on every change of the plan the editor makes or restores (an
+    /// edit, undo, redo, a replaced project), so a host can cache what it
+    /// derives from the plan by it ([`Self::revision`]).
+    revision: u64,
 }
 
 impl Editor {
@@ -166,12 +170,34 @@ impl Editor {
             pushes: 0,
             pending: None,
             batching: false,
+            revision: 0,
         }
+    }
+
+    /// A number that moves on every change of the plan (an edit, undo, redo,
+    /// a replaced project): two equal revisions of one editor hold the same
+    /// plan.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Edit the plan's formatting ([`crate::formatting::Formatting`]) as one
+    /// undo step; an edit that changes nothing records nothing.
+    pub fn edit_formatting(&mut self, edit: impl FnOnce(&mut crate::formatting::Formatting)) {
+        let mut next = self.proj.formatting.clone();
+        edit(&mut next);
+        if next == self.proj.formatting {
+            return;
+        }
+        self.snapshot();
+        self.proj.formatting = next;
+        self.changed();
     }
 
     /// Begin a new document session, retaining find and leveling preferences.
     pub fn replace_project(&mut self, proj: Project) {
         self.proj = proj;
+        self.revision += 1;
         self.sel = 0;
         self.sel_uid = self.selected_uid();
         self.collapsed.clear();
@@ -383,6 +409,7 @@ impl Editor {
 
     fn changed(&mut self) {
         self.dirty = true;
+        self.revision += 1;
         self.prune_collapsed();
         self.sel = self.sel.min(self.proj.tasks.len().saturating_sub(1));
         if self.selected_uid() == self.sel_uid {

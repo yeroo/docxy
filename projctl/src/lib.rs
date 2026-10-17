@@ -116,6 +116,28 @@ pub fn is_editor_verb(verb: &str) -> bool {
         )
 }
 
+/// Apply a UI plugin command's ops (`projcore::uiplugin::Op`: an editor
+/// verb and its args) as one `Editor::batch`: one undo step, and a refused
+/// op (or one that is not an editor verb) rolls every op back and is the
+/// error. The hosts call it for `yppx_ui_command`'s reply.
+pub fn apply_ops(ed: &mut Editor, ops: &[projcore::uiplugin::Op]) -> Result<(), String> {
+    if ops.is_empty() {
+        return Ok(());
+    }
+    ed.batch(|ed| {
+        for (n, op) in ops.iter().enumerate() {
+            let args = Json::parse(&op.args.to_string())
+                .map_err(|e| format!("op {} ({}): bad args: {e}", n + 1, op.verb))?;
+            match dispatch_editor(ed, &op.verb, &args) {
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(format!("{}: {e}", op.verb)),
+                None => return Err(format!("op {}: '{}' is not an editor verb", n + 1, op.verb)),
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Project verbs independent of the host's file handling. `None` means the
 /// verb belongs to the host (or is unknown).
 pub fn dispatch_editor(ed: &mut Editor, verb: &str, args: &Json) -> Option<Result<Json, String>> {

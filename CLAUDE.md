@@ -257,6 +257,38 @@
   -p uiharness -p plugin_fixture`; `ui-sweep-linux` does). Harness instances
   never inherit `$YPPX_PLUGIN_DIR`.
 
+## UI plugins (#1532)
+
+- A `yppx_*` library may carry, beside the six format symbols, a version
+  target and five UI symbols (`projcore::plugin_abi`: `yppx_plugin_target`,
+  `yppx_ui_abi`, `yppx_ui_manifest`, `yppx_ui_state`, `yppx_ui_command`,
+  `yppx_ui_overlay`; JSON over `YppxBuf`). The hosts own the extension points
+  and call whatever library is present; nothing here names a plugin but the
+  fixture, and "Pro" or a private repository is never mentioned.
+- `load_plugins_for(dirs, Some(Host {name, version}))` checks the target for
+  the host's name (`suite`, `yppxy`) against `CARGO_PKG_VERSION` before any
+  other symbol: a mismatch skips the library with its reason among `errors`
+  (stderr, crash log, first window's status line) and in `skipped`; a library
+  without the target symbol is formats-only and its UI symbols are not looked
+  up. `projcore::uiplugin` holds the typed JSON (`Target`,
+  `version_satisfies`, `Manifest`, `StateCtx`/`State`, `Command`/
+  `CommandResult`, `OverlayCtx`/`Shape`); `projcore::json` is the value type
+  (strict parser, compact writer; the formats declaration uses it too).
+- Command ops are `projctl` editor verbs applied by `projctl::apply_ops` in
+  one `Editor::batch`. yppxy's `--command <id>` runs one headless (first
+  task selected) and prints the status. Both hosts' `app-info` reports
+  `plugins: {loaded, ui, skipped}`. The fixture
+  (`projcore/tests/plugin_fixture/src/ui.rs`) exports one of everything;
+  `projcore/tests/plugins.rs` and `yppxy/tests/plugins.rs` cover it.
+- The plan's formatting (`projcore::formatting::Formatting`: palette id,
+  text styles per category and per cell, gridlines, link style) is
+  `Project::formatting`, edited as one undo step by `Editor::edit_formatting`
+  (a command's `view` reply goes through `Formatting::apply_view`), saved in
+  the `.yppx` part `formatting.xml` (own content-type override, never kept as
+  an extra part, absent when empty) and never in MSPDI. `Editor::revision()`
+  moves on every change of the plan, for hosts caching what they derive from
+  it (plugin state, the overlay).
+
 ## Sheet Home ribbon Font / Font Size boxes (#1344)
 
 - The two boxes are text fields: `Docxy::font_box` (`FontBoxEdit`, tied to the

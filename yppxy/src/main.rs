@@ -17,6 +17,7 @@
 //!                                      (`project-overview`, `late-tasks`, …)
 //!   yppxy <in> --save <out.(yppx|xml)> headless: convert/save and exit
 //!   yppxy --version (-V)               print the build (commit, last merged PR, kind)
+//!   yppxy plan.xml --command <id> [--save out]  run a UI plugin's command headless
 //!
 //! Format plugins (`yppx_*` shared libraries in `<config>/yppxy/plugins` or
 //! `$YPPX_PLUGIN_DIR`, see [`formats`]) add the types they read to Open and
@@ -127,14 +128,14 @@ fn main() -> ExitCode {
         Err(m) => {
             eprintln!("{m}");
             eprintln!(
-                "usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--report-md <report> <out>] [--save <out.(yppx|xml)>] | --version (-V)"
+                "usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--report-md <report> <out>] [--command <id>] [--save <out.(yppx|xml)>] | --version (-V)"
             );
             return ExitCode::from(2);
         }
     };
     if parsed.help {
         println!(
-            "usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--report-md <report> <out>] [--save <out.(yppx|xml)>] | --version (-V)"
+            "usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--report-md <report> <out>] [--command <id>] [--save <out.(yppx|xml)>] | --version (-V)"
         );
         return ExitCode::SUCCESS;
     }
@@ -142,7 +143,11 @@ fn main() -> ExitCode {
     // The formats, with any plugins: a headless run says which did not load
     // (the editor puts the first on its status line).
     let formats = formats::global();
-    if parsed.save.is_some() || parsed.gantt_md.is_some() || parsed.report_md.is_some() {
+    if parsed.save.is_some()
+        || parsed.gantt_md.is_some()
+        || parsed.report_md.is_some()
+        || parsed.command.is_some()
+    {
         for error in &formats.errors {
             eprintln!("yppxy: plugin not loaded: {error}");
         }
@@ -162,6 +167,27 @@ fn main() -> ExitCode {
     };
 
     // Headless modes: do the job and exit, no TUI.
+    // `--command <id>`: a UI plugin's command on the plan (its first task
+    // selected, as a fresh editor's is), the status on stdout, the plan
+    // saved when `--save` says where (#1532). This is how QA drives a
+    // plugin's commands without a window.
+    if let Some(id) = &parsed.command {
+        let mut ed = Editor::new(proj);
+        match formats.run_command(&mut ed, id, None) {
+            Ok(status) => println!("{status}"),
+            Err(e) => {
+                eprintln!("yppxy: --command {id}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        if let Some(out) = &parsed.save
+            && let Err(e) = save_with(formats.registry, ed.project(), out, source.as_ref())
+        {
+            eprintln!("{out}: {e}");
+            return ExitCode::FAILURE;
+        }
+        return ExitCode::SUCCESS;
+    }
     if let Some((kind, out)) = &parsed.report_md {
         let ed = Editor::new(proj);
         if let Err(e) = write_report_md(&ed, *kind, parsed.input.as_deref(), out) {
@@ -200,6 +226,8 @@ struct Args {
     gantt_md: Option<String>,
     report_md: Option<(ReportKind, String)>,
     save: Option<String>,
+    /// `--command <id>`: a UI plugin's command, run headless.
+    command: Option<String>,
     help: bool,
     vim: bool,
 }
@@ -210,6 +238,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         gantt_md: None,
         report_md: None,
         save: None,
+        command: None,
         help: false,
         vim: false,
     };
@@ -237,6 +266,14 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                 i += 1;
                 out.save = Some(args.get(i).ok_or("--save needs a path")?.clone());
             }
+            "--command" => {
+                i += 1;
+                let id = args.get(i).ok_or("--command needs a command id")?;
+                if id.is_empty() || id.starts_with('-') {
+                    return Err("--command needs a command id".into());
+                }
+                out.command = Some(id.clone());
+            }
             s if s.starts_with('-') => return Err(format!("unknown flag: {s}")),
             s => {
                 if out.input.is_some() {
@@ -254,6 +291,10 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     }
     if out.report_md.is_some() && (out.gantt_md.is_some() || out.save.is_some()) {
         return Err("--report-md cannot be combined with --gantt-md or --save".into());
+    }
+    // `--command` may save its result; the exports show the plan as read.
+    if out.command.is_some() && (out.gantt_md.is_some() || out.report_md.is_some()) {
+        return Err("--command cannot be combined with --gantt-md or --report-md".into());
     }
     Ok(out)
 }

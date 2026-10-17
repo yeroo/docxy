@@ -109,3 +109,76 @@ fn a_plugin_that_does_not_load_is_reported_and_skipped() {
     assert!(projcore::mspdi::read_mspdi(&std::fs::read_to_string(&out).unwrap()).is_ok());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// `--command <id>` runs a UI plugin's command headless (#1532): the
+/// fixture's `fixture.rename` renames the first task through a `task.set`
+/// op, `--save` writes the result, and the status is printed. A command no
+/// plugin owns, or a plugin built for another host version, fails.
+#[test]
+fn a_ui_plugin_command_runs_headless() {
+    let plugins = fixture_plugin::plugin_dir("yppxy-plugin-ui");
+    let dir = work_dir("yppxy-plugin-command");
+    let input = dir.join("plan.xml");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mspdi/10-summary.xml"),
+        &input,
+    )
+    .unwrap();
+    let out = dir.join("renamed.xml");
+    let output = yppxy(
+        Some(&plugins),
+        &[
+            &input,
+            Path::new("--command"),
+            Path::new("fixture.rename"),
+            Path::new("--save"),
+            &out,
+        ],
+    );
+    ok(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("Fixture: renamed task "), "{stdout}");
+    let plan = projcore::mspdi::read_mspdi(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    assert_eq!(plan.tasks[0].name, "Renamed by fixture");
+    assert!(
+        plan.tasks[1..]
+            .iter()
+            .all(|t| t.name != "Renamed by fixture")
+    );
+
+    // A status-only command saves nothing and says what the plugin said.
+    let output = yppxy(
+        Some(&plugins),
+        &[&input, Path::new("--command"), Path::new("fixture.flag")],
+    );
+    ok(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "Fixture: flag on"
+    );
+
+    // No plugin owns the id.
+    let output = yppxy(
+        Some(&plugins),
+        &[&input, Path::new("--command"), Path::new("nobody.home")],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no plugin runs the command 'nobody.home'"),
+        "{stderr}"
+    );
+
+    // Without the plugin directory there is no UI plugin at all.
+    let output = yppxy(
+        None,
+        &[&input, Path::new("--command"), Path::new("fixture.rename")],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("(0 UI plugins loaded)"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
