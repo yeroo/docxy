@@ -377,7 +377,10 @@ fn each_agent_edit_is_undoable_and_changes_only_its_inactive_target() {
         ("assign.add", r#"{"tab":1,"task":1,"resource":"Agent"}"#),
         ("assign.set", r#"{"tab":1,"uid":1,"units":0.5}"#),
         ("assign.del", r#"{"tab":1,"uid":1}"#),
-        ("resource.add", r#"{"tab":1,"name":"Agent","max_units":"50%"}"#),
+        (
+            "resource.add",
+            r#"{"tab":1,"name":"Agent","max_units":"50%"}"#,
+        ),
         ("resource.set", r#"{"tab":1,"uid":1,"group":"Crew"}"#),
         ("resource.del", r#"{"tab":1,"uid":1}"#),
     ] {
