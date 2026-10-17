@@ -31205,6 +31205,13 @@ fn ptab_leader_count(gap: f32, one: f32) -> usize {
     }
 }
 
+/// The width an alignment tab measures against: the column or cell it lies in
+/// when that is known (a header or footer table cell has both), else the
+/// header or footer's text width (#1433).
+fn ptab_line_width(hf_width: Option<f32>, line_width: Option<f32>) -> Option<f32> {
+    line_width.or(hf_width)
+}
+
 /// The gap an alignment tab leaves, `gap` px wide: blank, or filled with its
 /// leader's glyph repeated to fit (#1433).
 fn ptab_gap_el(
@@ -31808,7 +31815,7 @@ fn paragraph_el(
                 // line's margin or indent, where the line's width is known (a
                 // header or footer, or a body column or cell, #1433); it takes
                 // no caret offset.
-                if let (Some(ptab), Some(w)) = (ptab_of(inline), hf_width.or(line_width)) {
+                if let (Some(ptab), Some(w)) = (ptab_of(inline), ptab_line_width(hf_width, line_width)) {
                     let stop =
                         ptab_stop(ptab, w, tw_px(indent.left, zoom), tw_px(indent.right, zoom));
                     let gap = ptab_gap(ptab.align, stop, pad_l + x, seg_width(i + 1));

@@ -221,7 +221,7 @@
   right inset). The terminal fills the gap with the leader glyph (cells carry
   no editor offset). The suite lays a ptab out wherever the line width is
   known: `RenderCtx::hf_width` (header/footer) or `line_width` (a Print
-  Layout column or a table cell); the flow view has none, so a body ptab
+  Layout column or a table cell, which wins in a header table cell); the flow view has none, so a body ptab
   there stays a zero-width object. `ptab_gap_el` draws the leader.
 - A delete over a floating drawing or `w:ptab` (zero-width: no offset reaches
   it) records each as its own `w:del` while tracking
@@ -240,9 +240,9 @@
   its other controls with `Editor::set_bound_property` as part of the edit's
   own undo step; the other editor takes it as an undo step of its own (so
   its Ctrl+Z, like the source's, undoes the property everywhere through the
-  next sync). That step is one per step of the source editor (`PropSource`:
-  reused in place while it is the newest, no redo waits and the source's
-  newest step is the one it answered; undo and redo forget it), and it
+  next sync). That step is one per step of the source editor, whatever properties it
+  changed (`PropSource`: reused in place while it is the newest, no redo
+  waits and the source's newest step is the one it answered; undo and redo forget it), and it
   advances the serial counter like any step, so the host refreshes the source's
   Repeat record after the sync (`keep_current`). Controls
   in a header or footer that is not open, and a package without the part,

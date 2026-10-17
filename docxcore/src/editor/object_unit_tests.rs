@@ -1029,7 +1029,49 @@ fn a_property_from_the_other_editor_is_one_step_per_source_step_1433() {
     assert!(ed.set_bound_property(BoundProp::Title, "Z", from(11)));
     assert!(!ed.can_redo());
     assert_eq!(ed.undo_names().len(), n0 + 2);
+    // The sync step is the newest with a redo waiting (an unrelated edit
+    // undone): a sync from the same source step is a fresh step, and the
+    // redo is gone.
+    let mut ed2 = Editor::new(ed.doc.clone());
+    assert!(ed2.set_bound_property(BoundProp::Title, "Q", from(20)));
+    let steps = ed2.undo_names().len();
+    ed2.set_caret(Caret::at(vec![1], 0));
+    ed2.insert_char('x');
+    assert!(ed2.undo());
+    assert!(ed2.can_redo());
+    assert!(ed2.set_bound_property(BoundProp::Title, "QR", from(20)));
+    assert!(!ed2.can_redo());
+    assert_eq!(ed2.undo_names().len(), steps + 1);
     // A sync that changes nothing pushes nothing.
     assert!(!ed.set_bound_property(BoundProp::Title, "Z", from(12)));
     assert_eq!(ed.undo_names().len(), n0 + 2);
+}
+
+/// #1433: all the properties one step of the other editor changes are one
+/// step here, and a later keystroke of that step merges into it.
+#[test]
+fn two_properties_from_one_source_step_are_one_step_1433() {
+    use crate::sdt::{BoundProp, core_property_control};
+    let mut content = core_property_control(BoundProp::Title, "T", 1, &RunProps::default());
+    content.extend(core_property_control(
+        BoundProp::Company,
+        "C",
+        2,
+        &RunProps::default(),
+    ));
+    let mut ed = Editor::new(Document {
+        body: vec![Block::Paragraph(Paragraph {
+            props: ParProps::default(),
+            content,
+        })],
+    });
+    let from = PropSource::Other {
+        newest_step: Some(7),
+    };
+    let n0 = ed.undo_names().len();
+    assert!(ed.set_bound_property(BoundProp::Title, "T2", from));
+    assert!(ed.set_bound_property(BoundProp::Company, "C2", from));
+    assert!(ed.set_bound_property(BoundProp::Title, "T23", from));
+    assert_eq!(ed.undo_names().len(), n0 + 1);
+    assert_eq!(ed.undo_names()[0], "Title");
 }

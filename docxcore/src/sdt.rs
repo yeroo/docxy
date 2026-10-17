@@ -1,13 +1,14 @@
 //! Document property content controls (#768): Insert › Quick Parts ›
 //! Document Property, and the Header & Footer tab's Document Info, put an
-//! inline `w:sdt` bound to a core property in `docProps/core.xml`, as Word
-//! does. The control loads as two `Inline::Raw` boundaries around its runs
+//! inline `w:sdt` bound to a core property in `docProps/core.xml` or, since
+//! #1433, to Company or Manager in `docProps/app.xml`, as Word does. The control loads as two `Inline::Raw` boundaries around its runs
 //! (see `load::parse_inline_sdt`); this builds the same shape.
 
 use crate::field::DocProps;
 use crate::model::{Inline, Run, RunProps};
 
-/// The core-properties part every document property control is bound to.
+/// The core-properties part (`docProps/core.xml`) the core property controls
+/// are bound to.
 pub const CORE_STORE_ID: &str = "{6C3C8BC8-F283-45AE-878A-BAB7291924A1}";
 
 /// The extended-properties part (`docProps/app.xml`): Company, Manager.

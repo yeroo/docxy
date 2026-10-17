@@ -522,12 +522,12 @@ pub enum PropSource {
     Other { newest_step: Option<u64> },
 }
 
-/// The undo step a property sync pushed, with the property and the other
-/// editor's step it answers.
+/// The undo step a property sync pushed and the other editor's step it
+/// answers: every property that step changed merges into it, named for the
+/// first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SyncStep {
     serial: u64,
-    prop: crate::sdt::BoundProp,
     source: Option<u64>,
 }
 
@@ -1930,9 +1930,9 @@ impl Editor {
     /// set the property in this editor: no undo step of its own, so undoing
     /// that edit puts all of them back. From [`PropSource::Other`] (a header
     /// or footer, the body) it is an undo step here, named for the property.
-    /// The run of them one typing run of the other editor makes is one step:
-    /// while the newest step here is the one pushed for the same property and
-    /// the other editor's newest step is the one it was pushed for, a further
+    /// All the properties one step of the other editor changes, and the run of
+    /// them one typing run makes, are one step: while the newest step here is
+    /// the one pushed for that step of the other editor, a further
     /// sync changes it in place, unless a redo is waiting (the step would no
     /// longer be the end of the history). The caret and anchor follow the
     /// text they stood after. True when a control changed.
@@ -1950,7 +1950,6 @@ impl Editor {
                     && self.sync_step
                         == mine.map(|serial| SyncStep {
                             serial,
-                            prop,
                             source: newest_step,
                         });
                 if !coalesce {
@@ -1959,7 +1958,6 @@ impl Editor {
                         step.name = StepName::Named(prop.label().to_string());
                         self.sync_step = Some(SyncStep {
                             serial: step.serial,
-                            prop,
                             source: newest_step,
                         });
                     }
