@@ -45,6 +45,7 @@ Supported verbs are `proj.path`, `proj.get`, `proj.set`, `task.list`, `task.get`
 `task.add`, `task.del`, `link.add`, `link.del`, `find`, `assign.list`,
 `assign.get`, `assign.fields`, `assign.add`, `assign.set`, `assign.del`,
 `resource.list`, `resource.get`, `resource.add`, `resource.set`, `resource.del`,
+`level.all`, `level.clear`, `level.overallocations`,
 `proj.save`, `proj.reload`, `proj.open` and `proj.new`, with the yppxy
 argument/result shapes, plus `app-info` (the build: version, commit, last merged PR, kind, `manual`; #1023). `proj.path` additionally
 reports `tab`, `imported`, `default_save_ext` (the type Save As proposes, see
@@ -281,6 +282,18 @@ derived calendar when nothing else uses it; the resources after it move up one
 ID. The reply is `{deleted, assignments: [uid…]}`. Each verb is one undo step,
 a value the resource already has records none, and every argument is checked
 first, so a rejected call leaves the plan untouched.
+
+Leveling is a display overlay (#1589): `level.all {}` shows the plan leveled,
+as Resource > Level > Level All does (tasks delayed so no work resource is
+booked past its capacity; see the leveler's rules in PROJECT.md), and
+`level.clear {}` shows it as scheduled again. Neither is an undo step, neither
+dirties the plan, and both reply `{leveled, overallocated}`, the count of work
+resources still booked past their capacity as shown; `proj.path` reports
+`leveled`. `level.overallocations {}` lists those resources, earliest first,
+each with `uid, name, max_units, peak_units` (1.0 = 100%) and `first`, the
+first overallocated instant, where Project's Next Overallocation goes.
+`level.selection`, `level.resource` and `level.options` are refused by name:
+the model levels the whole plan (#1594 is the leveler work).
 
 File handling differs from the TUI:
 

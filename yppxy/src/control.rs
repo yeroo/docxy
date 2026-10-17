@@ -31,6 +31,8 @@
 //! | `assign.add` | `{task, resource, units?, work?, fields?}` | the new assignment |
 //! | `assign.set` | `{uid, units?, work?, overtime_work?, contour?, rate_table?, delay?, actual_work? \| percent_work_complete?, fields?}` | the updated assignment |
 //! | `assign.del` | `{uid}` | `{deleted, task}` |
+//! | `level.all` / `level.clear` | `{}` | `{leveled, overallocated}`: show the plan leveled or as scheduled (the display overlay, not an undo step, #1589); see `projctl` |
+//! | `level.overallocations` | `{}` | `{count, resources:[{uid, name, max_units, peak_units, first}]}`: the work resources booked past their capacity as shown (#1589) |
 //! | `resource.list` | `{}` | `{count, resources:[{uid, id, name, type, initials, group, code, email, material_label, max_units, standard_rate, overtime_rate, cost_per_use, accrue_at, base_calendar, notes, assignments}]}` (#1588); see `projctl` |
 //! | `resource.get` | `{uid}` | one resource |
 //! | `resource.add` | `{name, type?, …the resource fields}` | the new resource, one undo step (#1588) |

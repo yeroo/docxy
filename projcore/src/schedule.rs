@@ -3319,10 +3319,30 @@ pub fn overbooked(
     proj: &Project,
     shown: impl Fn(i32) -> Option<(DateTime, DateTime)>,
 ) -> HashMap<i32, f64> {
+    overbookings(proj, shown)
+        .into_iter()
+        .map(|(uid, o)| (uid, o.peak))
+        .collect()
+}
+
+/// One work resource's overallocation on the plan as shown: its peak booking
+/// (1.0 = 100%) and the first instant it is booked past its capacity, where
+/// Project's Next Overallocation goes (#1589).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Overbooking {
+    pub peak: f64,
+    pub first: DateTime,
+}
+
+/// [`overbooked`] with each resource's first overallocated instant.
+pub fn overbookings(
+    proj: &Project,
+    shown: impl Fn(i32) -> Option<(DateTime, DateTime)>,
+) -> HashMap<i32, Overbooking> {
     let clean = without_unscheduled_rows(proj);
     let dormant = dormant_uids(&clean);
     let active = without_tasks(&clean, &dormant);
-    Scheduler::new(&active).overbooked(shown)
+    Scheduler::new(&active).overbookings(shown)
 }
 
 fn level_local(proj: &Project) -> Leveled {
@@ -3654,8 +3674,11 @@ impl Scheduler<'_> {
         assign
     }
 
-    /// See [`overbooked`].
-    fn overbooked(&self, shown: impl Fn(i32) -> Option<(DateTime, DateTime)>) -> HashMap<i32, f64> {
+    /// See [`overbookings`].
+    fn overbookings(
+        &self,
+        shown: impl Fn(i32) -> Option<(DateTime, DateTime)>,
+    ) -> HashMap<i32, Overbooking> {
         let mut tl = self
             .timelines
             .get(&self.default_cal)
@@ -3710,7 +3733,7 @@ impl Scheduler<'_> {
                 .collect();
             points.sort_unstable();
             points.dedup();
-            let (mut peak, mut past) = (0.0f64, false);
+            let (mut peak, mut first) = (0.0f64, None);
             for p in points {
                 let load: f64 = bk
                     .iter()
@@ -3718,12 +3741,20 @@ impl Scheduler<'_> {
                     .map(|&(_, _, u)| u)
                     .sum();
                 if load > 0.0 {
-                    past |= load > capacity_at(cap, p) + 1e-9;
+                    if load > capacity_at(cap, p) + 1e-9 && first.is_none() {
+                        first = Some(p);
+                    }
                     peak = peak.max(load);
                 }
             }
-            if past {
-                over.insert(*rid, peak);
+            if let Some(p) = first {
+                over.insert(
+                    *rid,
+                    Overbooking {
+                        peak,
+                        first: DateTime::from_minutes(tl.abs_start(p)),
+                    },
+                );
             }
         }
         over
@@ -9640,6 +9671,14 @@ mod tests {
         let s = schedule(&proj);
         let shown = |uid| s.get(uid).map(|r| (r.early_start, r.early_finish));
         assert_eq!(overbooked(&proj, shown), HashMap::from([(1, 2.0)]));
+        // The first overallocated instant is where both start (#1589).
+        assert_eq!(
+            overbookings(&proj, shown)[&1],
+            Overbooking {
+                peak: 2.0,
+                first: s.get(2).unwrap().early_start
+            }
+        );
         proj.tasks[2].predecessors.push(fs(2));
         let s = schedule(&proj);
         let shown = |uid| s.get(uid).map(|r| (r.early_start, r.early_finish));

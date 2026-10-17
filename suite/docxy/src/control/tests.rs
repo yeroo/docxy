@@ -318,6 +318,7 @@ fn reads_and_rejected_edits_preserve_prompt_selection_history_and_scroll() {
         ("assign.fields", Json::Null),
         ("resource.list", Json::Null),
         ("resource.get", args(r#"{"uid":1}"#)),
+        ("level.overallocations", Json::Null),
     ] {
         let (_, effect) = call(&mut tabs, 0, verb, a).unwrap();
         assert_eq!(effect, Effect::default());
@@ -352,6 +353,7 @@ fn reads_and_rejected_edits_preserve_prompt_selection_history_and_scroll() {
             "start",
             "finish",
             "new_tasks",
+            "leveled",
             "tab",
             "imported",
             "default_save_ext",
@@ -362,6 +364,31 @@ fn reads_and_rejected_edits_preserve_prompt_selection_history_and_scroll() {
             "cell_drag"
         ]
     );
+}
+
+/// Level All and Clear Leveling switch the target tab's overlay (#1589): a
+/// repaint and agent activity, no undo step, the plan clean, the other tab
+/// untouched; the rest of Project's Level group is refused by name.
+#[test]
+fn level_verbs_switch_the_overlay_of_their_target_tab_only() {
+    let mut tabs = vec![tab(), tab()];
+    let untouched = snapshot(&tabs[0]);
+    let depth = view(&tabs[1]).ed.undo_depth();
+    let (reply, effect) = call(&mut tabs, 0, "level.all", args(r#"{"tab":1}"#)).unwrap();
+    assert_eq!(reply.get("leveled"), Some(&Json::Bool(true)));
+    assert!(effect.repaint && effect.activity);
+    assert!(view(&tabs[1]).ed.leveled());
+    assert!(!view(&tabs[0]).ed.leveled());
+    assert_eq!(view(&tabs[1]).ed.undo_depth(), depth);
+    assert!(!tabs[1].dirty);
+    assert_eq!(snapshot(&tabs[0]), untouched);
+    let (reply, _) = call(&mut tabs, 0, "level.clear", args(r#"{"tab":1}"#)).unwrap();
+    assert_eq!(reply.get("leveled"), Some(&Json::Bool(false)));
+    assert!(!view(&tabs[1]).ed.leveled());
+    let (info, _) = call(&mut tabs, 0, "proj.path", args(r#"{"tab":1}"#)).unwrap();
+    assert_eq!(info.get("leveled"), Some(&Json::Bool(false)));
+    let err = call(&mut tabs, 0, "level.options", args(r#"{"tab":1}"#)).unwrap_err();
+    assert!(err.contains("whole plan"), "{err}");
 }
 
 #[test]
