@@ -45,6 +45,7 @@ use cells::parse_predecessors;
 use cells::{bracket_units, parse_resource_token, same_shown_units};
 mod moving;
 mod outline;
+mod plan;
 mod props;
 use outline::subtree_end;
 pub use props::{
