@@ -321,6 +321,26 @@ wired wrongly* rather than *a handler behaving wrongly*, a case cannot be the
 whole guard — put the invariant where the state changes, test it there, and let
 the case cover the behaviour around it.
 
+### UI plugins (#1532)
+
+A `yppx_*` library may also contribute user interface (PROJECT.md, "UI
+plugins"): the same `plugin <name>` line installs it, and the suite loads
+its UI when its version target names this host's version. What it adds is
+reported like the built-ins, marked `"plugin": true`: `ribbon-read`'s
+commands and gallery tiles (a contributed control with a built-in's id
+replaces it in place, so the built-in's slot then reads `plugin: true`),
+`menu-read`'s items (the row, bar, column and chart menus; `menu-open
+{"target":"chart"}` opens the chart's own menu beside the bars, whose
+Project items are drawn greyed), and `dialog-read`'s controls (a dialog a
+plugin command opened is `plugin`; Task Information gains the plugin's
+pages). A contributed command runs through `ribbon-click` and `menu-click`
+like a built-in, as one undo step with its status on the status line.
+`project-overlay {}` reads the shapes the plugins' overlay returned for the
+active Project's chart (`{count, shapes:[{kind, ...}]}`, in chart pixels),
+the ones the chart paints after its bars. `app-info`'s `plugins` lists the
+libraries loaded (`ui: true` for one with user interface, its command ids
+under `ui`) and skipped. `project-plugin-ui.uit` drives the fixture's.
+
 ### Format plugins
 
 The suite loads its format plugins (`yppx_*` shared libraries that add
@@ -1246,7 +1266,7 @@ point. Four verbs read and drive it:
 | Verb | Args | Reply |
 |---|---|---|
 | `dialog-read` | `{}` | the top dialog, or `{open: false}` |
-| `dialog-set` | `{control, value}`; a grid takes `{control, row, column, value}`, `{control, insert_row: n}` or `{control, delete_row: n}`; a check list `{control, value: true\|false\|[labels]}`, `{control, item, checked}` or `{control, index, checked}` | the dialog after the edit |
+| `dialog-set` | `{control, value}`; a grid takes `{control, row, column, value}`, `{control, insert_row: n}` or `{control, delete_row: n}`, or names the cell as `{"control": "name[row].column", value}` (#1532; `column` a heading or an index, the value checked against the column's kind: a checkbox column true or false, a number column a number); a check list `{control, value: true\|false\|[labels]}`, `{control, item, checked}` or `{control, index, checked}` | the dialog after the edit |
 | `dialog-tab` | `{tab}` | the dialog on that tab |
 | `dialog-click` | `{button}` | `state` after the button's handler, with `dialog` set to the dialog now on top (the child it opened, the parent, or `{open: false}`) |
 
@@ -1256,13 +1276,21 @@ a message box's message (null otherwise), and `tab` is the current tab's label
 (null for a dialog without tabs). Each button is `{label, enabled, default}`.
 Each control is `{name, label, kind, value, text, enabled, visible}`:
 
-- `kind` is one of `text`, `number`, `date`, `duration`, `checkbox`, `radio`,
-  `dropdown`, `list`, `grid`, `checklist` and `label`.
+- `kind` is one of `text`, `number`, `date`, `duration`, `multiline`,
+  `checkbox`, `radio`, `dropdown`, `list`, `grid`, `checklist` and `label`.
+  A `multiline` field (#1532) is typed into like a text field, and Enter in
+  it is a new line rather than OK; Ctrl+V keeps a pasted text's line breaks.
 - `value` is typed: a checkbox's is a bool, a number's a number, an item
   control's the selected item's label (or null), and a grid's its rows.
   `text` is what the control shows.
 - `radio`, `dropdown` and `list` add `items` (in order) and `selected` (an
-  index, or null). A `grid` adds `columns` and `rows`.
+  index, or null). A `grid` adds `columns`, `column_kinds` (one of the kinds
+  above per column, `text` when the dialog set none, #1532) and `rows`; it
+  is drawn as a table (a checkbox column's cells as ☐/☑) and edited by
+  `dialog-set` only.
+- A control a UI plugin contributed (#1532) carries `plugin: true`; the
+  catalogue check (`dialog-catalog-check`) leaves those out, since the
+  catalogue lists the built-in fields only.
 - A `checklist` (the AutoFilter drop-down's values, #690) has a bool per item
   as its `value`, and adds `items` and `depths`: the items form a tree by
   depth (`(Select All)` at 0 over the values; a year › month › day date
@@ -1416,6 +1444,7 @@ Menus open today:
 | Verb | Args | Reply |
 |---|---|---|
 | `menu-open` | `{target}`: `"document"`, `"cell"` (a sheet's cell menu over the selection: Cut, Copy, Paste, Paste Special…, the Filter and Sort submenus, New Comment, Pick From Drop-down List...; #690, #691, #665), `"flash-fill"` (the Flash Fill Options button's menu: Undo Flash Fill, Accept suggestions, Select all N blank cells, Select all N changed cells; an error when no fill stands, #666), `"pick-list"` (Pick From Drop-down List over the selected cell, as Alt+Down opens it: the column block's distinct text entries, sorted; an empty list is an error naming why, #665), `{"cell": "D7"}` (a right-click on that cell: outside the selection it selects it first, then the cell menu), `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task; a press inside the selected range keeps the range and the cursor, and the menu is still the clicked row's: its task items select that row before they run, its range items act on the range; #1213), `{"bar": <task uid>}` (a right-click on that task's Gantt bar, pressed where the bar is drawn now; #1207), `{"column": "<heading>"}` (a right-click on that entry-table heading, any case, pressed where it is drawn now; #1208), `{"ribbon": [tab, group, command]}` (on a sheet: Paste's gallery, Fill, Clear, Find & Select, Sort & Filter; on a document: Paste's menu, #753), `{"grid": "fill-options" \| "paste-options"}` (the button a fill or a paste left, #707) or `{"grid": "error-check"}` (the error smart tag beside a flagged active cell: its heading, then what the rule offers, Ignore Error and Edit in Formula Bar; an error when the selected cell is not flagged, #675) or `{"qat": "qat-undo"}` (the Quick Access Toolbar Undo arrow on a document or sheet tab; #619, #1149), `{"qat": "qat-redo"}` (a sheet tab's Redo arrow; #1149), `"ribbon-bar"` (the ribbon's right-click menu: Collapse the Ribbon, ticked while collapsed; #590) | the menu, as `menu-read` |
+| `project-overlay {}` | the UI plugins' overlay shapes for the active Project's chart (#1532): `{count, shapes}`, each shape `{kind, ...}` (`polyline`/`dashed` with `points`, `arrow` with `from`/`to`, `bracket`, `rect`, `text`), colours as `#RRGGBB`, coordinates in chart pixels (x from the scale's origin, y from the top of the first row). Empty without a UI plugin |
 | `menu-read` | `{}` | `{open: true, target, items, highlight, depth}`, or `{open: false}`; `highlight` is the index of the item Up/Down have highlighted, or null; `depth` is the submenu level the menu sits at (0 where it opened, +1 per submenu entered in its place; #591) |
 | `menu-click` | `{label}` among the top-level items, `{path: [labels]}` through submenus, or `{index}`: the top-level item at that 0-based index, separators and headings not counted, for labels that repeat | `state` after the item's handler; the menu closes first |
 | `menu-close` | `{}` | `state`, as Esc leaves it |

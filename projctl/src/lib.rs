@@ -124,18 +124,22 @@ pub fn apply_ops(ed: &mut Editor, ops: &[projcore::uiplugin::Op]) -> Result<(), 
     if ops.is_empty() {
         return Ok(());
     }
-    ed.batch(|ed| {
-        for (n, op) in ops.iter().enumerate() {
-            let args = Json::parse(&op.args.to_string())
-                .map_err(|e| format!("op {} ({}): bad args: {e}", n + 1, op.verb))?;
-            match dispatch_editor(ed, &op.verb, &args) {
-                Some(Ok(_)) => {}
-                Some(Err(e)) => return Err(format!("{}: {e}", op.verb)),
-                None => return Err(format!("op {}: '{}' is not an editor verb", n + 1, op.verb)),
-            }
+    ed.batch(|ed| apply_ops_in(ed, ops))
+}
+
+/// [`apply_ops`] inside a batch the caller already holds (a dialog's OK
+/// that applies its own fields in the same undo step).
+pub fn apply_ops_in(ed: &mut Editor, ops: &[projcore::uiplugin::Op]) -> Result<(), String> {
+    for (n, op) in ops.iter().enumerate() {
+        let args = Json::parse(&op.args.to_string())
+            .map_err(|e| format!("op {} ({}): bad args: {e}", n + 1, op.verb))?;
+        match dispatch_editor(ed, &op.verb, &args) {
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return Err(format!("{}: {e}", op.verb)),
+            None => return Err(format!("op {}: '{}' is not an editor verb", n + 1, op.verb)),
         }
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
 /// Project verbs independent of the host's file handling. `None` means the

@@ -214,6 +214,21 @@ pub(crate) fn task_info_dialog(
     Ok(d)
 }
 
+/// [`task_info_dialog`] with the UI plugins' pages for the view's plan
+/// (#1532): a page named like a built-in one replaces it, the rest follow.
+pub(crate) fn task_info_dialog_for(
+    v: &ProjectView,
+    uid: i32,
+    page: InfoPage,
+) -> Result<Dialog, String> {
+    let mut d = task_info_dialog(&v.ed, uid, page)?;
+    if crate::plugin_ui::any() {
+        crate::plugin_ui::extend_task_info(&mut d, v, uid);
+        d.mark_opened();
+    }
+    Ok(d)
+}
+
 /// ASAP and ALAP take no date: the constraint date field follows the type.
 fn react(d: &mut Dialog, i: usize, _before: &Value) {
     if d.controls[i].name != "ctype" {
@@ -300,8 +315,18 @@ fn whole(d: &Dialog, name: &str, what: &str, lo: i32, hi: i32) -> Result<i32, St
 /// Write what the person changed in `d` to task `uid`, as one undo step.
 /// A refused field changes nothing.
 pub(crate) fn apply_task_info(ed: &mut ProjectEditor, uid: i32, d: &Dialog) -> Result<(), String> {
+    ed.batch(|ed| apply_task_info_in(ed, uid, d))
+}
+
+/// [`apply_task_info`] inside a batch the caller holds (Task Information
+/// with a UI plugin's pages applies both in one step, #1532).
+pub(crate) fn apply_task_info_in(
+    ed: &mut ProjectEditor,
+    uid: i32,
+    d: &Dialog,
+) -> Result<(), String> {
     let changed = |name: &str| d.changed(name);
-    ed.batch(|ed| {
+    (|| {
         // Task type and Effort driven first: a resource added below rescales
         // work or duration by them.
         if changed("ttype") {
@@ -375,7 +400,7 @@ pub(crate) fn apply_task_info(ed: &mut ProjectEditor, uid: i32, d: &Dialog) -> R
             ed.set_notes(uid, &projcore::text::notes_from_line(&text_of(d, "notes")))?;
         }
         Ok(())
-    })
+    })()
 }
 
 #[cfg(test)]

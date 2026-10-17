@@ -103,6 +103,10 @@ pub(super) struct ProjectView {
     /// The file the plan was opened from, while a format plugin writes its
     /// type: each save of that type passes it back ([`Source`]).
     pub source: Option<Source>,
+    /// What the UI plugins last answered for this view (#1532): control
+    /// state by plan revision and selection, overlay shapes by revision and
+    /// scale (`plugin_ui`).
+    pub plugin_cache: std::cell::RefCell<crate::plugin_ui::PluginCache>,
 }
 
 impl ProjectView {
@@ -138,6 +142,7 @@ impl ProjectView {
             row_header: false,
             dragging: false,
             drag_made_range: false,
+            plugin_cache: crate::plugin_ui::new_cache(),
             source: None,
         }
     }
@@ -1013,7 +1018,7 @@ pub(crate) fn project_row(ed: &ProjectEditor, task: &Task) -> [String; COLUMN_CO
     ENTRY_FIELDS.map(|field| reader.read(task, field).text)
 }
 
-const ROW_H: f32 = 28.;
+pub(crate) const ROW_H: f32 = 28.;
 const WIDTHS: [f32; COLUMN_COUNT] = [48., 130., 240., 80., 100., 100., 150., 190.];
 const TABLE_W: f32 = sum_widths();
 /// Includes the divider, leaving space between clipped table text and the chart.
@@ -1036,38 +1041,43 @@ const fn sum_widths() -> f32 {
 /// right press on one selects its column and opens the column's menu
 /// (#1208).
 fn heading_cells(
+    v: &ProjectView,
     index: usize,
     probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
     cx: &mut Context<Docxy>,
 ) -> impl IntoElement {
-    h_flex()
-        .h(px(ROW_H))
-        .items_center()
-        .children(COLUMNS.iter().enumerate().map(|(col, name)| {
-            div()
-                .id(("project-heading", col))
-                .relative()
-                .h_full()
-                .flex()
-                .items_center()
-                .w(px(WIDTHS[col]))
-                .flex_none()
-                .px_2()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .when(col == COL_NAME, |d| d.pl(px(8.)))
-                .child(probe(probes, format!("project-heading:{col}")))
-                .child(*name)
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                        cx.stop_propagation();
-                        if this.active == index {
-                            let _ = this.open_column_menu(col, ev.position, window, cx);
-                        }
-                    }),
-                )
-        }))
+    // The plan's Column Titles text style (#1532), when it sets one.
+    let style = crate::plugin_ui::category_style(v, "Column Titles");
+    let row = h_flex().h(px(ROW_H)).items_center();
+    let row = match &style {
+        Some(style) => crate::plugin_ui::styled(row, style),
+        None => row,
+    };
+    row.children(COLUMNS.iter().enumerate().map(|(col, name)| {
+        div()
+            .id(("project-heading", col))
+            .relative()
+            .h_full()
+            .flex()
+            .items_center()
+            .w(px(WIDTHS[col]))
+            .flex_none()
+            .px_2()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .when(col == COL_NAME, |d| d.pl(px(8.)))
+            .child(probe(probes, format!("project-heading:{col}")))
+            .child(*name)
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    if this.active == index {
+                        let _ = this.open_column_menu(col, ev.position, window, cx);
+                    }
+                }),
+            )
+    }))
 }
 
 /// A row's cells: a task's, or the empty entry row's when `task` is `None`.
@@ -1085,6 +1095,12 @@ fn editable_row_cells(
     let inactive = inactive_row(v.ed.project(), row);
     let values = task.map(|t| project_row(&v.ed, t)).unwrap_or_default();
     let (uid, summary) = (task.map(|t| t.uid), task.is_some_and(|t| t.summary));
+    // The plan's text styles (#1532): the row's categories, then each
+    // cell's own, when the formatting sets any.
+    let critical = task
+        .and_then(|t| v.ed.schedule().get(t.uid))
+        .is_some_and(|r| r.critical);
+    let row_style = task.and_then(|t| crate::plugin_ui::row_style(v, t, critical, inactive));
     let probe_row = task.map_or_else(|| "entry".to_string(), |t| t.id.to_string());
     let cursor_row = v.cursor_row();
     // Once per row: which cells, if any, the range selection covers.
@@ -1097,114 +1113,123 @@ fn editable_row_cells(
             hsla(0., 0., 0., 0.)
         }
     };
-    h_flex()
+    let cells = h_flex()
         .h(px(ROW_H))
         .items_center()
-        .when(inactive, |d| d.text_color(pal.dim).line_through())
-        .children(values.into_iter().enumerate().map(|(col, value)| {
-            let edit = v.cell.as_ref().filter(|c| c.uid == uid && c.col == col);
-            let content = if let Some(edit) = edit {
-                let measure = Measurer::new(window);
-                let offset =
-                    edit.scroll_x(WIDTHS[col] - 24., |s| measure.width(s, 12., summary, false));
-                line_edit_view(edit, offset, 16.).into_any_element()
-            } else if let Some(uid) = uid.filter(|_| summary && col == COL_NAME) {
-                // A summary's outline glyph: a click shows or hides its
-                // subtasks without editing the cell or moving the cursor.
-                // The press is swallowed too, so the cell's own press
-                // listener cannot move the cursor before the click toggles.
-                let glyph = if v.ed.is_collapsed(uid) { "▸" } else { "▾" };
-                h_flex()
-                    .child(
-                        div()
-                            .id(("project-toggle", row))
-                            .relative()
-                            .flex_none()
-                            .w(px(12.))
-                            .cursor_pointer()
-                            .child(probe(probes, format!("project-toggle:{probe_row}")))
-                            .child(glyph)
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                cx.stop_propagation();
-                            })
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                if let Some(tab) = this.tabs.get_mut(index) {
-                                    toggle_project_collapse(tab, uid);
-                                }
-                                this.refocus(window, cx);
-                            })),
-                    )
-                    .child(value)
-                    .into_any_element()
-            } else {
-                div().child(value).into_any_element()
-            };
-            div()
-                .id(("project-cell", row * COLUMN_COUNT + col))
-                .relative()
-                .flex()
-                .items_center()
-                .w(px(WIDTHS[col]))
-                .h(px(ROW_H))
-                .flex_none()
-                .px_2()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .bg(selected_bg(uid, col))
-                .border_1()
-                .border_color(if row == cursor_row && col == v.col {
-                    hsla_u(BRAND)
-                } else {
-                    hsla(0., 0., 0., 0.)
-                })
-                .when(col == COL_NAME && edit.is_none(), |d| d.pl(px(8. + indent)))
-                .child(probe(probes, format!("project-cell:{probe_row}:{col}")))
-                .child(content)
-                // The press starts (and the move extends) a drag selection;
-                // the release is the window-level mouse-up, like the sheet.
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                        if this.active == index
-                            && let Some(tab) = this.tabs.get_mut(index)
-                        {
-                            project_cell_press(tab, row, col, ev.modifiers.shift);
-                        }
-                        this.refocus(window, cx);
-                    }),
+        .when(inactive, |d| d.text_color(pal.dim).line_through());
+    let cells = match &row_style {
+        Some(style) => crate::plugin_ui::styled(cells, style),
+        None => cells,
+    };
+    cells.children(values.into_iter().enumerate().map(|(col, value)| {
+        let cell_style = crate::plugin_ui::cell_style(v, row_style.as_ref(), uid, COLUMNS[col]);
+        let edit = v.cell.as_ref().filter(|c| c.uid == uid && c.col == col);
+        let content = if let Some(edit) = edit {
+            let measure = Measurer::new(window);
+            let offset =
+                edit.scroll_x(WIDTHS[col] - 24., |s| measure.width(s, 12., summary, false));
+            line_edit_view(edit, offset, 16.).into_any_element()
+        } else if let Some(uid) = uid.filter(|_| summary && col == COL_NAME) {
+            // A summary's outline glyph: a click shows or hides its
+            // subtasks without editing the cell or moving the cursor.
+            // The press is swallowed too, so the cell's own press
+            // listener cannot move the cursor before the click toggles.
+            let glyph = if v.ed.is_collapsed(uid) { "▸" } else { "▾" };
+            h_flex()
+                .child(
+                    div()
+                        .id(("project-toggle", row))
+                        .relative()
+                        .flex_none()
+                        .w(px(12.))
+                        .cursor_pointer()
+                        .child(probe(probes, format!("project-toggle:{probe_row}")))
+                        .child(glyph)
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            if let Some(tab) = this.tabs.get_mut(index) {
+                                toggle_project_collapse(tab, uid);
+                            }
+                            this.refocus(window, cx);
+                        })),
                 )
-                .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _window, cx| {
-                    // A held left button is a drag's move; plain hover never
-                    // extends a range, however the press state stands.
-                    if ev.pressed_button != Some(MouseButton::Left) {
-                        return;
-                    }
+                .child(value)
+                .into_any_element()
+        } else {
+            div().child(value).into_any_element()
+        };
+        let cell = div()
+            .id(("project-cell", row * COLUMN_COUNT + col))
+            .relative()
+            .flex()
+            .items_center()
+            .w(px(WIDTHS[col]))
+            .h(px(ROW_H))
+            .flex_none()
+            .px_2()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .bg(selected_bg(uid, col));
+        let cell = match &cell_style {
+            Some(style) => crate::plugin_ui::styled(cell, style),
+            None => cell,
+        };
+        cell.border_1()
+            .border_color(if row == cursor_row && col == v.col {
+                hsla_u(BRAND)
+            } else {
+                hsla(0., 0., 0., 0.)
+            })
+            .when(col == COL_NAME && edit.is_none(), |d| d.pl(px(8. + indent)))
+            .child(probe(probes, format!("project-cell:{probe_row}:{col}")))
+            .child(content)
+            // The press starts (and the move extends) a drag selection;
+            // the release is the window-level mouse-up, like the sheet.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
                     if this.active == index
                         && let Some(tab) = this.tabs.get_mut(index)
-                        && project_cell_drag_over(tab, row, col)
                     {
-                        cx.notify();
-                    }
-                }))
-                // Right-click selects the cell, then opens the row's menu.
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                        cx.stop_propagation();
-                        if this.active == index {
-                            let _ = this.open_row_menu(row, Some(col), ev.position, window, cx);
-                        }
-                    }),
-                )
-                .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
-                    cx.stop_propagation();
-                    if let Some(tab) = this.tabs.get_mut(index) {
-                        project_row_click(tab, row, Some(col), ev.click_count() >= 2);
+                        project_cell_press(tab, row, col, ev.modifiers.shift);
                     }
                     this.refocus(window, cx);
-                }))
-        }))
+                }),
+            )
+            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _window, cx| {
+                // A held left button is a drag's move; plain hover never
+                // extends a range, however the press state stands.
+                if ev.pressed_button != Some(MouseButton::Left) {
+                    return;
+                }
+                if this.active == index
+                    && let Some(tab) = this.tabs.get_mut(index)
+                    && project_cell_drag_over(tab, row, col)
+                {
+                    cx.notify();
+                }
+            }))
+            // Right-click selects the cell, then opens the row's menu.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    if this.active == index {
+                        let _ = this.open_row_menu(row, Some(col), ev.position, window, cx);
+                    }
+                }),
+            )
+            .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                if let Some(tab) = this.tabs.get_mut(index) {
+                    project_row_click(tab, row, Some(col), ev.click_count() >= 2);
+                }
+                this.refocus(window, cx);
+            }))
+    }))
 }
 
 /// Whether a click on the Project body, pressed at `down_y` and released at
@@ -1277,6 +1302,8 @@ pub(super) fn project_el(
     let (table_bar, chart_bar) = view.pane_scrolls();
     let vbar = harness::region_name(harness::Region::ProjectVbar);
     let row_probes = probes.clone();
+    // The bar palette the plan's formatting names (#1532), once per render.
+    let palette = std::rc::Rc::new(crate::plugin_ui::palette(view));
     v_flex()
         .flex_1()
         .h_full()
@@ -1334,7 +1361,7 @@ pub(super) fn project_el(
                         .flex_none()
                         .bg(pal.panel)
                         .font_weight(FontWeight::BOLD)
-                        .child(pane(table_w, table_x, heading_cells(index, probes, cx)))
+                        .child(pane(table_w, table_x, heading_cells(view, index, probes, cx)))
                         .child(chart_pane(
                             gantt_w,
                             gantt_x,
@@ -1477,6 +1504,7 @@ pub(super) fn project_el(
                                                             task.map_or(0, |t| t.id),
                                                             scale,
                                                             pal,
+                                                            palette.as_ref().as_ref(),
                                                             &row_probes,
                                                             // A right-press on the bar
                                                             // selects its row and opens
@@ -1492,6 +1520,22 @@ pub(super) fn project_el(
                                                                             i,
                                                                             ev.position,
                                                                             window,
+                                                                            cx,
+                                                                        );
+                                                                    }
+                                                                },
+                                                            ),
+                                                            // A right-press beside the bar:
+                                                            // the chart's menu (#1532).
+                                                            cx.listener(
+                                                                move |this,
+                                                                      ev: &MouseDownEvent,
+                                                                      _window,
+                                                                      cx| {
+                                                                    cx.stop_propagation();
+                                                                    if this.active == index {
+                                                                        this.open_chart_menu(
+                                                                            ev.position,
                                                                             cx,
                                                                         );
                                                                     }
@@ -1528,6 +1572,8 @@ pub(super) fn project_el(
                                 list
                             }),
                         )
+                        // The UI plugins' overlay, after the rows (#1532).
+                        .children(gantt_overlay(view, pal))
                         // Project's one vertical bar, shared by table and chart, over the
                         // SCROLLBAR_W that `layout` keeps out of the chart.
                         .child(

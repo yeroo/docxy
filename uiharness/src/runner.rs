@@ -610,11 +610,20 @@ impl<'a> Runner<'a> {
 }
 
 /// Dotted keys let a script assert nested document state without comparing
-/// whole JSON objects. Numeric components index arrays (`tabs.0.name`).
+/// whole JSON objects. Numeric components index arrays (`tabs.0.name`); a
+/// negative one counts from the end (`groups.-1.title`, the last group).
 fn json_path<'a>(value: &'a Json, path: &str) -> Option<&'a Json> {
     path.split('.')
         .try_fold(value, |current, part| match current {
-            Json::Arr(items) => items.get(part.parse::<usize>().ok()?),
+            Json::Arr(items) => {
+                let i = part.parse::<i64>().ok()?;
+                let i = if i < 0 {
+                    usize::try_from(i64::try_from(items.len()).ok()? + i).ok()?
+                } else {
+                    usize::try_from(i).ok()?
+                };
+                items.get(i)
+            }
             _ => current.get(part),
         })
 }

@@ -73,6 +73,9 @@ fn apply_dialog(
             crate::project::apply_task_info(&mut v.ed, uid, dialog)?;
             Ok(false)
         }
+        // Handled in `plugin_ui::dialog_click`, before this: OK sends the
+        // plugin its command again with the values.
+        DialogOwner::Plugin { .. } => Err("a plugin's dialog applies through its OK".into()),
         DialogOwner::PageSetup | DialogOwner::Columns => {
             let (Surface::Doc(ed), Some(pkg)) = (surface, pkg) else {
                 return Err("this dialog belongs to a .docx document".into());
@@ -354,6 +357,10 @@ fn dialog_press(tab: &mut DocTab, button: &str) -> Result<(), String> {
     if let Some(done) = crate::design_dialogs::click(tab, button) {
         return done;
     }
+    // A UI plugin's dialog, or Task Information with plugin pages (#1532).
+    if let Some(done) = crate::plugin_ui::dialog_click(tab, button) {
+        return done;
+    }
     let DocTab {
         dialogs,
         surface,
@@ -439,7 +446,15 @@ pub(crate) fn edit_key(
                 Ok(())
             }
             ("v", Some(text)) => {
-                let line: String = text.chars().filter(|c| !c.is_control()).collect();
+                // A multiline field keeps the pasted text's line breaks.
+                let multiline = d
+                    .focused()
+                    .is_some_and(|c| c.kind == dialog::ControlKind::Multiline);
+                let line: String = text
+                    .replace("\r\n", "\n")
+                    .chars()
+                    .filter(|c| !c.is_control() || (multiline && *c == '\n'))
+                    .collect();
                 d.insert_text(&line)
             }
             _ => Ok(()),
@@ -472,6 +487,9 @@ pub(crate) fn edit_key(
             Ok(())
         }
         "space" => d.space(),
+        // Enter reaches here only with a multiline field focused
+        // (`DialogStack::key_button`): a new line (#1532).
+        "enter" => d.insert_text("\n"),
         "up" => d.step_focused(false),
         "down" => d.step_focused(true),
         _ => match typed
@@ -766,6 +784,147 @@ impl Docxy {
         };
         let boxed = |text: String| boxed_with(SharedString::from(text).into_any_element());
         match c.kind {
+            // A multiline field (#1532): the lines one under another, the
+            // caret's line drawn with its caret and selection like a field's.
+            ControlKind::Multiline => {
+                let name = c.name;
+                let text = c.text();
+                let chars: Vec<char> = text.chars().collect();
+                let caret = d.caret_at().min(chars.len());
+                let (from, to) = d.selection().unwrap_or((caret, caret));
+                let mut lines: Vec<AnyElement> = Vec::new();
+                let mut start = 0;
+                let line_count = text.split('\n').count();
+                for (n, line) in text.split('\n').enumerate() {
+                    let len = line.chars().count();
+                    let end = start + len;
+                    let shown: AnyElement = if focused
+                        && caret >= start
+                        && caret <= end
+                        && (n + 1 == line_count || caret < end + 1)
+                    {
+                        let part = |a: usize, b: usize| {
+                            SharedString::from(
+                                chars[a.min(end)..b.min(end)].iter().collect::<String>(),
+                            )
+                        };
+                        let (f, t) = (from.clamp(start, end), to.clamp(start, end));
+                        h_flex()
+                            .h(px(16.))
+                            .child(part(start, f))
+                            .when(caret == f, |r| r.child(caret_bar(pal.fg)))
+                            .when(f != t, |r| {
+                                r.child(div().bg(hsla_u(BRAND).opacity(0.35)).child(part(f, t)))
+                            })
+                            .when(caret == t && f != t, |r| r.child(caret_bar(pal.fg)))
+                            .child(part(t, end))
+                            .into_any_element()
+                    } else {
+                        div()
+                            .h(px(16.))
+                            .child(SharedString::from(line.to_string()))
+                            .into_any_element()
+                    };
+                    lines.push(shown);
+                    start = end + 1;
+                }
+                v_flex()
+                    .id(("dialog-control", i))
+                    .gap_1()
+                    .text_size(px(12.))
+                    .text_color(fg)
+                    .child(probe(&self.probes, format!("dialog-control:{}", c.name)))
+                    .child(label)
+                    .child(
+                        v_flex()
+                            .id(("dialog-multiline", i))
+                            .relative()
+                            .min_w(px(240.))
+                            .min_h(px(16. * 3. + 4.))
+                            .px_1()
+                            .border_1()
+                            .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
+                            .bg(pal.panel)
+                            .child(probe(&self.probes, format!("dialog-field:{name}")))
+                            .children(lines)
+                            .when(editable, |r| {
+                                r.cursor_text().on_click(cx.listener(
+                                    move |this, ev: &ClickEvent, window, cx| {
+                                        this.dialog_field_click(i, ev.position(), window, cx)
+                                    },
+                                ))
+                            }),
+                    )
+                    .into_any_element()
+            }
+            // A grid (#1532): its headings and rows as a table, edited by
+            // `dialog-set` (a cell is `name[row].column`).
+            ControlKind::Grid => {
+                let rows = match &c.value {
+                    dialog::Value::Rows(rows) => rows.clone(),
+                    _ => Vec::new(),
+                };
+                let widths: Vec<f32> = (0..c.columns.len())
+                    .map(|col| {
+                        let longest = std::iter::once(c.columns[col].chars().count())
+                            .chain(
+                                rows.iter()
+                                    .map(|r| r.get(col).map_or(0, |s| s.chars().count())),
+                            )
+                            .max()
+                            .unwrap_or(1);
+                        (longest as f32 * 7. + 12.).clamp(40., 200.)
+                    })
+                    .collect();
+                let cell = |text: String, w: f32, head: bool| {
+                    div()
+                        .w(px(w))
+                        .h(px(18.))
+                        .px_1()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .border_r_1()
+                        .border_b_1()
+                        .border_color(pal.border)
+                        .when(head, |d| d.font_weight(FontWeight::BOLD).bg(pal.hover))
+                        .child(SharedString::from(text))
+                };
+                let header = h_flex().children(
+                    c.columns
+                        .iter()
+                        .enumerate()
+                        .map(|(col, name)| cell(name.clone(), widths[col], true)),
+                );
+                let body = rows.iter().enumerate().map(|(r, row)| {
+                    h_flex().id(("dialog-grid-row", i * 1024 + r)).children(
+                        (0..c.columns.len()).map(|col| {
+                            let text = row.get(col).cloned().unwrap_or_default();
+                            let text = match (c.column_kind(col), text.as_str()) {
+                                (ControlKind::Checkbox, "true") => "\u{2611}".to_string(),
+                                (ControlKind::Checkbox, _) => "\u{2610}".to_string(),
+                                _ => text,
+                            };
+                            cell(text, widths[col], false)
+                        }),
+                    )
+                });
+                v_flex()
+                    .id(("dialog-control", i))
+                    .gap_1()
+                    .text_size(px(12.))
+                    .text_color(fg)
+                    .child(probe(&self.probes, format!("dialog-control:{}", c.name)))
+                    .when(!label.is_empty(), |v| v.child(label))
+                    .child(
+                        v_flex()
+                            .border_1()
+                            .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
+                            .bg(pal.panel)
+                            .child(header)
+                            .children(body),
+                    )
+                    .into_any_element()
+            }
             k if k.is_text() => {
                 let name = c.name;
                 // The text, with the caret in it and the selection shaded.
