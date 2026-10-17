@@ -1850,7 +1850,8 @@ struct EditState {
     /// The whole text is selected (Ctrl+A, or the text Ctrl+Z restored when
     /// typing over a cell): the next typed character replaces it, Backspace
     /// or Delete empties it, Left collapses it to the start and any other
-    /// key drops it.
+    /// key drops it, but Ctrl+C keeps it, Ctrl+X cuts it and Ctrl+V replaces
+    /// it (#1377).
     select_all: bool,
     /// AutoComplete's proposal (#672): the char index its selected suffix
     /// starts at (the caret stays there) and the value it completes to. Any
@@ -4578,6 +4579,14 @@ impl App {
 
     fn paste(&mut self) {
         let os_text = self.os_clip.as_mut().and_then(|cb| cb.get_text().ok());
+        // Without an OS clipboard a field's copy (which drops the grid clip)
+        // is still the last text copied (#1377).
+        let os_text = os_text.or_else(|| {
+            self.clip
+                .is_none()
+                .then(|| self.clip_text.clone())
+                .flatten()
+        });
         self.paste_from(os_text);
     }
 
@@ -12515,7 +12524,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 }
             }
             KeyCode::Char('v') if ctrl => {
-                if let Some(line) = app.field_paste_line() {
+                // A paste is not typing: no AutoCorrect at the commit
+                // (`typed_tail` false) and no proposal; an empty one does
+                // nothing, a selection included.
+                if let Some(line) = app.field_paste_line().filter(|l| !l.is_empty()) {
                     app.drop_proposal();
                     if let Some(e) = &mut app.edit {
                         if std::mem::take(&mut e.select_all) {
@@ -12524,7 +12536,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                             e.seed = None;
                         }
                         let idx = char_index(&e.text, e.cursor);
-                        e.typed_tail = e.cursor == e.text.chars().count();
+                        e.typed_tail = false;
                         e.text.insert_str(idx, &line);
                         e.cursor += line.chars().count();
                         e.correction = None;
@@ -12592,7 +12604,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         // Ctrl+A makes one.
         let selects = key.code == KeyCode::Char('a') && ctrl;
         // Ctrl+C keeps the selection it copied (#1377).
-        let keeps = selects || key.code == KeyCode::Char('c') && ctrl;
+        // An empty Ctrl+V changed nothing, so it keeps it too.
+        let keeps = selects
+            || ctrl && key.code == KeyCode::Char('c')
+            || ctrl && key.code == KeyCode::Char('v') && now == was;
         if let Some(e) = &mut app.edit {
             e.redo_text = None;
             e.select_all &= keeps;
@@ -25622,9 +25637,28 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(app.clip.is_none());
         app.cur = (2, 0);
-        app.paste_from(Some("Q".into()));
+        // No OS clipboard: the real `None` path.
+        ctrl_key(&mut app, 'v');
         assert_eq!(
             app.sheet().cell(2, 0).map(|c| c.value.clone()),
+            Some(CellValue::Text("Q".into()))
+        );
+        // A grid copy with no OS clipboard still pastes its own cells.
+        app.cur = (0, 0);
+        app.copy(false);
+        app.cur = (4, 0);
+        ctrl_key(&mut app, 'v');
+        assert_eq!(
+            app.sheet().cell(4, 0).map(|c| c.value.clone()),
+            Some(CellValue::Text("cell".into()))
+        );
+        // And with an OS text equal to the field copy.
+        app.clip = None;
+        app.clip_text = Some("Q".into());
+        app.cur = (6, 0);
+        app.paste_from(Some("Q".into()));
+        assert_eq!(
+            app.sheet().cell(6, 0).map(|c| c.value.clone()),
             Some(CellValue::Text("Q".into()))
         );
     }
@@ -25657,6 +25691,36 @@ mod tests {
         ctrl_key(&mut app, 'x');
         assert_eq!(cell_state(&app), ("".into(), None));
         assert_eq!(app.clip_text.as_deref(), Some("xyxyzz"));
+    }
+
+    #[test]
+    fn a_pasted_word_is_not_autocorrected_and_an_empty_paste_does_nothing() {
+        let mut app = opts_app();
+        app.os_clip = None;
+        app.cur = (0, 0);
+        press(&mut app, KeyCode::F(2));
+        app.clip_text = Some("teh".into());
+        ctrl_key(&mut app, 'v');
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(text_at(&app, 0, 0), "teh");
+
+        // An empty paste changes nothing, over a selection too.
+        app.cur = (2, 0);
+        press(&mut app, KeyCode::F(2));
+        type_text(&mut app, "abc");
+        ctrl_a(&mut app);
+        app.clip_text = Some("\nx".into());
+        ctrl_key(&mut app, 'v');
+        assert_eq!(cell_state(&app), ("abc".into(), Some((0, 3))));
+        press(&mut app, KeyCode::Esc);
+
+        // A word nobody typed is not corrected by an empty paste.
+        put(&mut app, 3, 0, "teh");
+        app.cur = (3, 0);
+        press(&mut app, KeyCode::F(2));
+        ctrl_key(&mut app, 'v');
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(text_at(&app, 3, 0), "teh");
     }
 
     #[test]

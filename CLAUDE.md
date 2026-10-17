@@ -364,9 +364,10 @@
   letter. The text comes from the OS clipboard, else from `clip_text` (the last
   text the editor put there: a headless Linux has no `os_clip`, which is the
   harness's path). docxy's `LineEdit` has `selected_text`, `cut`, `paste`;
-  `Docxy` `field_copy`/`field_paste_text` serve Find (a paste or cut in the
+  terminal docxy's `App::field_copy`/`field_paste_text` serve Find (a paste or cut in the
   query re-runs the match), Replace and Compare. xlsxy's `Prompt` has
-  `selected_text`/`paste`, `App::field_copy`/`field_paste_line`.
+  `selected_text`/`paste`, `App::field_copy`/`field_paste_line`; without an OS
+  clipboard a grid paste after a field copy falls back to `clip_text`.
 - A field copy replaces the other clip with the field's plain text: docxy sets
   `clipboard` to `Clip::from_text`; xlsxy clears `clip`, so a grid paste of that
   text is external TSV and not the old cells (`paste_from` treats an OS text
