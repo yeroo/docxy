@@ -101,8 +101,10 @@ pub(crate) fn global() -> &'static Formats {
 /// (`file`, `reason`).
 pub(crate) fn plugins_json(formats: &Formats) -> Json {
     let file = |p: &Path| {
-        p.file_name()
-            .map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())
+        p.file_name().map_or_else(
+            || p.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        )
     };
     Json::obj(vec![
         (
