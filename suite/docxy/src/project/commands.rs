@@ -86,7 +86,7 @@ pub(crate) enum ProjectAct {
     /// prompt. Keyboard and row-menu only; no ribbon command.
     Hyperlink,
     /// Ctrl+C / Ctrl+X / Ctrl+V: the cursor cell (or range) on the table, the
-    /// whole buffer in an open cell edit (#561); also the Task tab's
+    /// selection (else the whole buffer) in an open cell edit (#561); also the Task tab's
     /// Clipboard group. See `clip.rs`.
     Copy,
     Cut,
@@ -707,10 +707,10 @@ pub(crate) fn project_act_clears_range(act: ProjectAct) -> bool {
 }
 
 /// Whether an in-cell cut may empty the buffer: the read-back clipboard
-/// `now` holds the buffer's text `wrote`, compared CRLF-insensitively. A
+/// `now` holds the cut text `wrote`, compared CRLF-insensitively. A
 /// write can fail without a word — another process holds the OS clipboard —
 /// and it then reads as `Nothing` or someone else's item, never as our text;
-/// the buffer must not be lost to a copy that never landed (#561 r1/r2).
+/// the text must not be lost to a copy that never landed (#561 r1/r2).
 /// Cutting an empty buffer is harmless and the host skips the check.
 pub(crate) fn cell_cut_write_took(now: &ClipRead, wrote: &str) -> bool {
     match now {

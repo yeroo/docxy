@@ -150,7 +150,8 @@ impl CellEdit {
     }
 
     /// Cut: the selection leaves with the caller, else the whole buffer; the
-    /// edit continues without it, the caret where it was.
+    /// edit continues without it, the caret at the selection's start (0 when the
+    /// whole buffer went).
     pub fn cut(&mut self) -> String {
         let text = self.copy_text();
         if !self.delete_selection() {
