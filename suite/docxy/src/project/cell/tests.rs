@@ -1755,11 +1755,12 @@ fn clicking_the_id_cell_selects_the_whole_row_and_keeps_the_cursor_on_id() {
     assert_eq!(s.count(), 3 * COLUMN_COUNT);
     assert_eq!(s.uids, [10, 20, 30]);
     assert_eq!(v(&t).col, COL_ID, "the cursor column stays on ID");
-    // A double-click on ID is not swallowed: the read-only status still shows.
+    // A double-click on ID is not swallowed: it opens Task Information.
     project_cell_press(&mut t, 0, COL_ID, false);
     project_cell_release(&mut t);
     project_cell_click(&mut t, 0, Some(COL_ID), true);
-    assert_eq!(t.status.as_ref(), "ID is read-only");
+    assert_eq!(t.dialogs.top_id(), "task-information");
+    assert!(v(&t).cell.is_none());
 }
 
 #[test]

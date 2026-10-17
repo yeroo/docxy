@@ -13,10 +13,9 @@
 //! rename (#1202), for `uiharness/cases/backstage-inputs-typing.uit`, which
 //! also pins why Backstage's are not typed into: Save As's file name is the
 //! OS's file dialog, and File > Info has no properties yet (#1364). So are
-//! Project's (#1203): the grid's inline cell editor and Task >
-//! Information...'s constraint prompt, for
-//! `uiharness/cases/project-inputs-typing.uit`; the suite has no Task
-//! Information dialog yet (#1368). The terminal editors' prompts (#1204)
+//! Project's (#1203): the grid's inline cell editor, for
+//! `uiharness/cases/project-inputs-typing.uit`; Task > Information... is the
+//! catalogued Task Information dialog (#1368). The terminal editors' prompts (#1204)
 //! are listed too, one id per field: docxy, xlsxy and yppxy are other
 //! programs, so the suite's verbs only name the case that types into each,
 //! `uiharness/cases/terminal-<app>-inputs-typing.uit`, which runs the editor
@@ -227,16 +226,10 @@ static REGISTRY: &[Input] = &[
         Surface::Project,
         PROJECT,
     ),
-    // Task > Information... opens the prompt bar's Constraint prompt: the
-    // suite has no Task Information dialog yet (#1368). The bar's other
-    // prompts (Notes, Hyperlink, Assign, Move, Predecessor, Find) are the
-    // same field on the same key path, so they are not inputs of their own.
-    input(
-        "task-info",
-        "Task > Information...'s constraint prompt",
-        Surface::Project,
-        PROJECT,
-    ),
+    // Task > Information... is the catalogued Task Information dialog
+    // (#1368); the prompt bar's other prompts (Hyperlink, Assign, Move,
+    // Predecessor, Find) are the same field on the same key path, so they are
+    // not inputs of their own.
     // The terminal editors' prompts (#1204): typed into through a
     // pseudo-terminal by uiharness/cases/terminal-<app>-inputs-typing.uit,
     // read by each editor's own `field-read`. A prompt several commands
@@ -659,9 +652,7 @@ fn read_doc(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
 /// double-click on the cursor's cell, which opens it as it does for a
 /// person, resolved as `click C<n>` resolves it (clipped to the table's
 /// viewport); it is refused while a cell edit is open, where a click commits
-/// it, and while a prompt is open, where `open_cell` opens nothing. The
-/// constraint prompt is a click on its field, refused while it is closed
-/// and while another prompt holds the bar.
+/// it, and while a prompt is open, where `open_cell` opens nothing.
 fn press_project(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
     let v = crate::harness::project(app)?;
     let double = project_double(i.id).ok_or_else(|| not_covered(i))?;
@@ -684,25 +675,6 @@ fn press_project(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
                 crate::Probes::on_screen,
             )?
         }
-        "task-info" => {
-            match &v.prompt {
-                Some(p) if p.kind == crate::PromptKind::Constraint => {}
-                Some(p) => {
-                    return Err(format!(
-                        "the open prompt is {}, not Task > Information...'s constraint",
-                        p.kind.name()
-                    ));
-                }
-                None => {
-                    return Err(format!(
-                        "{} is not drawn: Task > Information... first",
-                        i.name
-                    ));
-                }
-            }
-            let bounds = app.probes.borrow().on_screen("project-prompt-field");
-            bounds.ok_or_else(|| format!("{} is not drawn", i.name))?
-        }
         _ => return Err(not_covered(i)),
     };
     Ok(Press {
@@ -712,11 +684,10 @@ fn press_project(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
 }
 
 /// Whether `pointer-click` double-clicks a Project input: the cell editor
-/// opens on a double-click, the prompt's field takes one click.
+/// opens on a double-click.
 fn project_double(id: &str) -> Option<bool> {
     match id {
         "project-cell" => Some(true),
-        "task-info" => Some(false),
         _ => None,
     }
 }
@@ -724,8 +695,7 @@ fn project_double(id: &str) -> Option<bool> {
 /// `field-read {"input":id}` for a Project input, in the sheet inputs'
 /// shape. The cell editor's caret is a byte offset, read in chars; it has
 /// no selection. Idle, it reads the text the cursor's cell would open with
-/// (none on the entry row). The constraint prompt appends and pops only, so
-/// a focused one's caret is its end; another prompt kind is not it.
+/// (none on the entry row).
 fn read_project(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
     let v = crate::harness::project(app)?;
     let (value, focused, caret) = match i.id {
@@ -743,14 +713,6 @@ fn read_project(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
                         .map(|t| crate::cell_edit_text(&v.ed, t, v.col));
                 (text.map_or(Json::Null, Json::Str), false, Json::Null)
             }
-        },
-        "task-info" => match &v.prompt {
-            Some(p) if p.kind == crate::PromptKind::Constraint => (
-                Json::Str(p.buf.clone()),
-                true,
-                Json::Num(p.buf.chars().count() as f64),
-            ),
-            _ => (Json::Null, false, Json::Null),
         },
         _ => return Err(not_covered(i)),
     };
@@ -889,8 +851,8 @@ mod tests {
         }
     }
 
-    /// #1203: both Project inputs are pressed where they are drawn: the
-    /// cursor's cell and the prompt bar's field.
+    /// #1203: the Project input is pressed where it is drawn: the cursor's
+    /// cell.
     #[test]
     fn every_project_input_has_a_target() {
         let project: Vec<&str> = registry()
@@ -898,9 +860,9 @@ mod tests {
             .filter(|i| i.surface == Surface::Project)
             .map(|i| i.id)
             .collect();
-        assert_eq!(project, ["project-cell", "task-info"]);
+        assert_eq!(project, ["project-cell"]);
         for id in project {
-            assert_eq!(project_double(id), Some(id == "project-cell"), "{id}");
+            assert_eq!(project_double(id), Some(true), "{id}");
         }
     }
 

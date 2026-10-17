@@ -297,5 +297,9 @@ test a row menu over a kept range is the clicked row's: its task items act on th
   call menu-open {"target":{"row":2}}
   call menu-click {"label":"Notes..."}
   assert selected_name is Task 2
-  assert prompt is notes:
+  assert dialog is task-information
+  call dialog-read {}
+  assert reply.tab is Notes
   assert selection is none
+  key escape
+  assert dialog is none

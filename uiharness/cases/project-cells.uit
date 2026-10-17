@@ -57,7 +57,8 @@ test project cell invalid edits retain focus and read-only cells stay closed
   open ../fixtures/gantt-summary.xml
   click A2 double
   assert cell_edit is none
-  assert status is ID is read-only
+  assert dialog is task-information
+  key escape
   click D1 double
   assert cell_edit is none
   assert status is Duration is read-only for summary tasks

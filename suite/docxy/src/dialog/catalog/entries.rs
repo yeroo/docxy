@@ -11,6 +11,7 @@ use super::*;
 const DOCX: &str = "../fixtures/basic.docx";
 const XLSX: &str = "../fixtures/basic.xlsx";
 const TABLE_DOCX: &str = "../fixtures/doc-table.docx";
+const PROJECT_DOC: &str = "copy:../fixtures/project-clipboard.xml";
 
 const fn dropdown(name: &'static str) -> Field {
     Field::other(name, ControlKind::Dropdown)
@@ -44,6 +45,12 @@ macro_rules! pick {
 }
 
 // Prep: the choices that show or enable a field.
+// Task Information: a constraint type with a date (Start No Earlier Than).
+const PICK_SNET: &[&str] = &[
+    r#"call pointer-click {"dialog-tab":"Advanced"}"#,
+    r#"call real-key {"key":"tab","to-field":"ctype"}"#,
+    r#"call real-key {"key":"down","times":4}"#,
+];
 const TWELVE_COLUMNS: &[&str] = &[
     r#"call pointer-click {"dialog-field":"num"}"#,
     r#"call real-key {"key":"ctrl+a"}"#,
@@ -1619,6 +1626,31 @@ dialogs! {
         unreachable: None,
     }
     // ---- Project -----------------------------------------------------------
+    TASK_INFORMATION = "task-information" {
+        surface: Surface::Project,
+        file: "project",
+        fixture: PROJECT_DOC,
+        open: &["click C1", "key alt t c"],
+        fields: &[
+            Field::text("name").on("General").applied(&["assert selected_name is Ab1"]).kept("Ab1"),
+            Field::duration("duration", "3d", "x").on("General").kept("3d"),
+            Field::number("percent", "40").on("General").kept("40"),
+            Field::number("priority", "700").on("General").kept("700"),
+            Field::date("start", "2026-01-12", "x").on("General").kept("2026-01-12"),
+            Field::date("finish", "2026-01-30", "x").on("General").kept("2026-01-30"),
+            Field::text("predecessors").sample("2").on("Predecessors").kept("2"),
+            Field::text("resources").on("Resources").kept("Ab1"),
+            dropdown("ctype").on("Advanced"),
+            Field::date("cdate", "2026-02-02", "x").on("Advanced").prep(PICK_SNET).kept("2026-02-02"),
+            Field::date("deadline", "2026-03-02", "x").on("Advanced").kept("2026-03-02"),
+            dropdown("ttype").on("Advanced"),
+            checkbox("effort").on("Advanced"),
+            Field::text("notes").on("Notes").kept("Ab1"),
+        ],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
     DELETE_SUMMARY = "delete-summary" {
         surface: Surface::Project,
         file: "project",

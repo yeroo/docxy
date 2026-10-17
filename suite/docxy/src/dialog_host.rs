@@ -65,6 +65,14 @@ fn apply_dialog(
             v.ed.delete_task(uid)?;
             Ok(false)
         }
+        DialogOwner::TaskInfo { uid } => {
+            let Surface::Project(v) = surface else {
+                return Err("this dialog belongs to a Project".into());
+            };
+            // The tab's dirty flag follows the editor (`complete_project`).
+            crate::project::apply_task_info(&mut v.ed, uid, dialog)?;
+            Ok(false)
+        }
         DialogOwner::PageSetup | DialogOwner::Columns => {
             let (Surface::Doc(ed), Some(pkg)) = (surface, pkg) else {
                 return Err("this dialog belongs to a .docx document".into());

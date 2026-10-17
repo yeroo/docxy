@@ -33,6 +33,10 @@ pub(crate) enum DialogOwner {
     DeleteSummary {
         uid: i32,
     },
+    /// Project's Task Information, for one task (#1368).
+    TaskInfo {
+        uid: i32,
+    },
     /// Word's Page Setup, for the caret's sections (#649).
     PageSetup,
     /// Word's Columns, for the caret's sections (#649).

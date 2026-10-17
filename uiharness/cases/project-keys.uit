@@ -39,10 +39,12 @@ test project editing keys and prompts
   key enter
   assert bar_2 is critical 4-8
   key alt t c
-  key backspace backspace backspace backspace
-  type SNET 2026-01-19
-  key enter
-  assert status is Constraint set: SNET
+  call dialog-tab {"tab":"Advanced"}
+  call dialog-set {"control":"ctype","value":"Start No Earlier Than"}
+  call dialog-set {"control":"cdate","value":"2026-01-19"}
+  call dialog-click {"button":"OK"}
+  assert dialog is none
+  assert dirty is true
   assert bar_2 is critical 14-16
   key alt u a
   type Alice

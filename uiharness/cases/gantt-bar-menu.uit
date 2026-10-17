@@ -35,16 +35,21 @@ test a bar's menu is Project's and opens for that task by uid
   call-error menu-click {"label":"Delete Task"} => no menu item 'Delete Task'
   call menu-click {"label":"Notes..."}
   assert menu is nothing
-  assert prompt is notes:
+  assert dialog is task-information
+  call dialog-read {}
+  assert reply.tab is Notes
   assert selected_name is Gamma
   key escape
-  assert prompt is none
+  assert dialog is none
   call menu-open {"target":{"bar":1}}
   assert selected_name is Beta
   call menu-click {"label":"Information..."}
-  assert prompt is constraint:
+  assert dialog is task-information
+  call dialog-read {}
+  assert reply.tab is General
   assert selected_name is Beta
   key escape
+  assert dialog is none
   call menu-open {"target":{"bar":3}}
   assert selected_name is Alpha
   key escape
