@@ -116,7 +116,7 @@ fn the_insert_group_and_position_group_follow_word() {
             item("File Name", true, 0),
             item("File Path", true, 0),
             item("Document Title", true, 0),
-            item("Document Property", true, 7),
+            item("Document Property", true, 9),
             item("Field...", true, 0),
         ]
     );
@@ -127,7 +127,7 @@ fn the_insert_group_and_position_group_follow_word() {
         labels(&quick),
         [
             item("AutoText", false, 0),
-            item("Document Property", true, 7),
+            item("Document Property", true, 9),
             item("Field...", true, 0),
             item("Building Blocks Organizer...", false, 0),
             item("Save Selection to Quick Part Gallery...", false, 0),
@@ -147,7 +147,8 @@ fn the_insert_group_and_position_group_follow_word() {
     assert_eq!(
         names,
         [
-            "Author", "Category", "Comments", "Keywords", "Status", "Subject", "Title"
+            "Author", "Category", "Comments", "Company", "Keywords", "Manager", "Status",
+            "Subject", "Title"
         ]
     );
 }
@@ -268,6 +269,10 @@ fn with_core(name: &str, author: &str, title: &str) -> DocTab {
          <dc:creator>{author}</dc:creator><cp:category>Memo</cp:category></cp:coreProperties>"
     );
     parts.push(("docProps/core.xml".into(), core.into_bytes()));
+    let app = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+        <Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\">\
+        <Application>docxy</Application><Company>Acme</Company></Properties>";
+    parts.push(("docProps/app.xml".into(), app.as_bytes().to_vec()));
     let dir = tmp_dir(name);
     let path = dir.join("in.docx");
     std::fs::write(&path, docxcore::zipwrite::write_zip(&parts)).unwrap();
@@ -330,6 +335,92 @@ fn a_property_controls_id_is_unique_in_the_document() {
         panic!()
     };
     assert!(open.contains("<w:id w:val=\"42\"/>"), "{open}");
+}
+
+/// #1433: typing in a document property control writes the property back to
+/// its part, the other controls bound to it follow, an undo writes the old
+/// value back, and a Company control is bound to `docProps/app.xml`.
+#[test]
+fn typing_in_a_property_control_writes_the_property_back_1433() {
+    let mut t = with_core("write-back", "Ann", "Quarterly Report");
+    // Title at the start, Company at the end of the first paragraph.
+    for (prop, offset) in [(BoundProp::Title, 0), (BoundProp::Company, usize::MAX)] {
+        let control = property_control(&t, prop);
+        let Surface::Doc(ed) = &mut t.surface else {
+            panic!()
+        };
+        ed.set_caret(docxcore::editor::Caret::at(vec![0], offset));
+        ed.anchor = None;
+        ed.paste(&Clip {
+            paras: vec![control],
+        });
+    }
+    // The body's Title control; a second one in the header.
+    open_header(&mut t);
+    let control = property_control(&t, BoundProp::Title);
+    hf_ed(&mut t).paste(&Clip {
+        paras: vec![control],
+    });
+    let part = |t: &DocTab, name: &str| t.pkg.as_ref().unwrap().part_text(name).unwrap();
+    let body_text = |t: &DocTab| match &t.surface {
+        Surface::Doc(ed) => ed.doc.body[0].plain_text(),
+        _ => panic!(),
+    };
+    assert!(
+        body_text(&t).contains("Quarterly Report"),
+        "{}",
+        body_text(&t)
+    );
+    // Type in the header's control (the caret is at its end).
+    hf_ed(&mut t).insert_char('!');
+    t.set_dirty();
+    assert!(part(&t, "docProps/core.xml").contains("<dc:title>Quarterly Report!</dc:title>"));
+    assert!(
+        body_text(&t).contains("Quarterly Report!"),
+        "{}",
+        body_text(&t)
+    );
+    // The package reloads with the typed value.
+    let again = load_package(&docxcore::package::save_package(t.pkg.as_ref().unwrap())).unwrap();
+    assert!(
+        again
+            .part_text("docProps/core.xml")
+            .unwrap()
+            .contains("Quarterly Report!")
+    );
+    // Undo puts the old text back, and the property with it.
+    assert!(hf_ed(&mut t).undo());
+    t.set_dirty();
+    assert!(part(&t, "docProps/core.xml").contains("<dc:title>Quarterly Report</dc:title>"));
+    assert!(!body_text(&t).contains('!'), "{}", body_text(&t));
+    // Nothing else of the core part moved.
+    assert!(part(&t, "docProps/core.xml").contains("<dc:creator>Ann</dc:creator>"));
+    // The Company control reads app.xml and writes it back.
+    assert!(body_text(&t).contains("Acme"), "{}", body_text(&t));
+    t.hf_edit = None;
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!()
+    };
+    let paths = (0..ed.doc.body.len()).map(|i| vec![i]);
+    let found = paths
+        .filter_map(|p| {
+            let Block::Paragraph(para) = &ed.doc.body[p[0]] else {
+                return None;
+            };
+            docxcore::sdt::scan_paragraph(&para.content)
+                .into_iter()
+                .find(|c| c.prop == BoundProp::Company)
+                .map(|c| (p, c))
+        })
+        .next()
+        .expect("a Company control");
+    ed.caret = docxcore::editor::Caret::at(found.0, found.1.end);
+    ed.insert_char('X');
+    t.set_dirty();
+    let app = part(&t, "docProps/app.xml");
+    assert!(app.contains("<Company>AcmeX</Company>"), "{app}");
+    assert!(app.contains("<Application>docxy</Application>"), "{app}");
+    assert!(!part(&t, "docProps/core.xml").contains("Company"));
 }
 
 /// A small PNG file in `dir`, `w` x `h` px.

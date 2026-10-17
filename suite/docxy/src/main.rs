@@ -5029,6 +5029,47 @@ impl DocTab {
                 pkg.set_gutter_at_top(s.gutter_at_top);
             }
         }
+        self.sync_bound_property();
+    }
+
+    /// Typing in a document property control writes the property back to
+    /// `docProps/core.xml` or `app.xml` and shows it in the other controls
+    /// bound to it (#1433). The control at the caret, in the open header or
+    /// footer else the body, is the one typed in; the property is what the
+    /// package holds, so an undo or redo that puts the old text back writes
+    /// the old value, and the other controls follow with no step of their
+    /// own (`Editor::set_bound_property`). A package without the part keeps
+    /// the text in its controls only, and controls in a header or footer
+    /// that is not open are not reached.
+    fn sync_bound_property(&mut self) {
+        let (Surface::Doc(body), Some(pkg)) = (&mut self.surface, self.pkg.as_mut()) else {
+            return;
+        };
+        let typed = match &self.hf_edit {
+            Some(h) => h.editor.bound_property_at_caret(),
+            None => None,
+        }
+        .or_else(|| body.bound_property_at_caret());
+        let Some((prop, text)) = typed else {
+            return;
+        };
+        let part = |name: &str| pkg.part_text(name).unwrap_or_default();
+        let props =
+            docxcore::field::parse_app_props(&part("docProps/core.xml"), &part("docProps/app.xml"));
+        if prop.value(&props) == text {
+            return;
+        }
+        let Some(xml) = pkg.part_text(prop.part_name()) else {
+            return;
+        };
+        let Some(new) = prop.write(&xml, &text) else {
+            return;
+        };
+        pkg.set_part_text(prop.part_name(), &new);
+        body.set_bound_property(prop, &text);
+        if let Some(h) = &mut self.hf_edit {
+            h.editor.set_bound_property(prop, &text);
+        }
     }
 
     /// Every edit of a workbook ends here ([`Docxy::mark_sheet_dirty`]). In

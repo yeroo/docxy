@@ -126,29 +126,35 @@ const MENU_IDS: [(HfMenu, &str); 7] = [
 
 /// Document Property ›'s items' ids in each menu, in [`BoundProp::ALL`]'s
 /// order, and the labels the ribbon's flat item list gives them.
-const INFO_PROP_IDS: [&str; 7] = [
+const INFO_PROP_IDS: [&str; 9] = [
     "hf-info-prop-author",
     "hf-info-prop-category",
     "hf-info-prop-comments",
+    "hf-info-prop-company",
     "hf-info-prop-keywords",
+    "hf-info-prop-manager",
     "hf-info-prop-status",
     "hf-info-prop-subject",
     "hf-info-prop-title",
 ];
-const QP_PROP_IDS: [&str; 7] = [
+const QP_PROP_IDS: [&str; 9] = [
     "hf-qp-prop-author",
     "hf-qp-prop-category",
     "hf-qp-prop-comments",
+    "hf-qp-prop-company",
     "hf-qp-prop-keywords",
+    "hf-qp-prop-manager",
     "hf-qp-prop-status",
     "hf-qp-prop-subject",
     "hf-qp-prop-title",
 ];
-const PROP_ITEM_LABELS: [&str; 7] = [
+const PROP_ITEM_LABELS: [&str; 9] = [
     "Document Property: Author",
     "Document Property: Category",
     "Document Property: Comments",
+    "Document Property: Company",
     "Document Property: Keywords",
+    "Document Property: Manager",
     "Document Property: Status",
     "Document Property: Subject",
     "Document Property: Title",
@@ -302,7 +308,7 @@ fn doc_info_head() -> [rs::Cmd<Act>; 4] {
 }
 
 /// Document Property ›'s commands with `ids`, under `labels`.
-fn property_cmds(ids: &[&'static str; 7], labels: &[&'static str; 7]) -> Vec<rs::Cmd<Act>> {
+fn property_cmds(ids: &[&'static str; 9], labels: &[&'static str; 9]) -> Vec<rs::Cmd<Act>> {
     BoundProp::ALL
         .iter()
         .zip(ids.iter().zip(labels))
@@ -615,8 +621,8 @@ pub(crate) fn menu_items(tab: Option<&DocTab>, menu: HfMenu) -> Vec<menu::MenuIt
     }
 }
 
-/// Document Property ›: the core properties, by `ids`.
-fn property_menu(id: &str, ids: &[&str; 7]) -> menu::MenuItem {
+/// Document Property ›: the core and extended properties, by `ids`.
+fn property_menu(id: &str, ids: &[&str; 9]) -> menu::MenuItem {
     let mut e = menu::Entry::unavailable(id, "Document Property");
     e.enabled = true;
     e.submenu = BoundProp::ALL
