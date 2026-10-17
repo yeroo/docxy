@@ -25,7 +25,7 @@ mod fields;
 mod links;
 pub use assignments::{AssignmentPatch, ResourceRef};
 pub use cells::{
-    day_end, day_finish, day_start, format_duration_exact, format_predecessors,
+    day_end, day_finish, day_start, format_duration_exact, format_lag, format_predecessors,
     format_resource_names, parse_cell_date, parse_lag, parse_task_predecessors,
     split_resource_names,
 };

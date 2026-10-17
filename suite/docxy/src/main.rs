@@ -82,6 +82,7 @@ mod open_mode_tests;
 mod page_flow;
 mod page_number;
 mod page_setup;
+mod plugin_ui;
 mod project;
 mod project_formats;
 mod recent_files;
@@ -32837,11 +32838,24 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        let col = self
-            .press_project(window, cx, |tab| crate::project_column_select(tab, col))?
-            .col;
-        self.open_menu(menu::MenuTarget::Column(col), at, project_column_menu(), cx);
+        let v = self.press_project(window, cx, |tab| crate::project_column_select(tab, col))?;
+        let col = v.col;
+        let mut items = project_column_menu();
+        // What a UI plugin adds to the column menu (#1532).
+        plugin_ui::extend_menu(v, "column", &mut items);
+        self.open_menu(menu::MenuTarget::Column(col), at, items, cx);
         Ok(())
+    }
+
+    /// A right-press on the Gantt chart beside the bars, and `menu-open
+    /// "chart"` (#1532): the chart's own menu, with what a UI plugin adds.
+    /// Nothing is selected first; the menu is the view's, not a task's.
+    pub(crate) fn open_chart_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(Surface::Project(v)) = self.tabs.get(self.active).map(|t| &t.surface) else {
+            return;
+        };
+        let items = project_chart_menu(v);
+        self.open_menu(menu::MenuTarget::Chart, at, items, cx);
     }
 
     /// The press a bar menu opens with, and the one a row menu's task item
@@ -35445,6 +35459,14 @@ impl Docxy {
             Control::Gallery(gal) if gal.id == "tablestyles" => {
                 self.table_style_gallery(gal, max_w, pal, cx)
             }
+            Control::Gallery(gal)
+                if gal
+                    .items
+                    .first()
+                    .is_some_and(|it| plugin_ui::is_plugin(it.act)) =>
+            {
+                self.swatch_gallery(gal, max_w, pal, cx)
+            }
             Control::Gallery(gal) => self.style_gallery(gal, max_w, pal, cx),
             Control::Separator => div()
                 .w(px(1.))
@@ -35458,10 +35480,88 @@ impl Docxy {
     /// Whether the Styles gallery shows `act`'s item as selected for the caret's
     /// paragraph; the renderer and the UI harness both read it.
     fn gallery_item_selected(&self, act: Act) -> bool {
+        // A plugin gallery's checked swatch is its `yppx_ui_state`'s (#1532).
+        if let Act::Project(ProjectAct::Plugin(id)) = act {
+            return self.tabs.get(self.active).is_some_and(
+                |t| matches!(&t.surface, Surface::Project(v) if plugin_ui::swatch_checked(v, id)),
+            );
+        }
         let Some(Surface::Doc(editor)) = self.tabs.get(self.active).map(|tab| &tab.surface) else {
             return false;
         };
         gallery_style_selected(&editor.caret_para_props(), act)
+    }
+
+    /// A UI plugin's gallery (#1532): a tile per swatch, filled with the
+    /// swatch's colour (its preview, `#RRGGBB`) over its label, the checked
+    /// one framed in the accent.
+    fn swatch_gallery(
+        &self,
+        gal: &rs::Gallery<Act>,
+        max_w: Option<f32>,
+        pal: Pal,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let g = style_gallery::TILE;
+        let geom = ribbon_fit::gallery_geom(gal);
+        let (per_row, _) = ribbon_fit::gallery_row(geom, gal.items.len(), max_w);
+        let rows = gal.items.len().div_ceil(per_row).max(1) as f32;
+        let tiles: Vec<AnyElement> = gal
+            .items
+            .iter()
+            .map(|it| {
+                let act = it.act;
+                let selected = self.gallery_item_selected(act);
+                let color = plugin_ui::swatch_color(it.preview).map(hsla_u);
+                v_flex()
+                    .id(it.label)
+                    .flex_none()
+                    .justify_between()
+                    .items_start()
+                    .w(px(g.w))
+                    .h(px(g.h))
+                    .p(px(g.pad))
+                    .rounded(px(g.radius))
+                    .border(px(g.border))
+                    .overflow_hidden()
+                    .border_color(if selected {
+                        hsla_u(accent::brand())
+                    } else {
+                        pal.border
+                    })
+                    .bg(if selected { pal.sel } else { pal.panel })
+                    .cursor_pointer()
+                    .when(!selected, |d| d.hover(move |d| d.bg(pal.hover)))
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(g.h - g.name_size - 3. * g.pad))
+                            .rounded(px(2.))
+                            .when_some(color, |d, c| d.bg(c))
+                            .when(color.is_none(), |d| d.border_1().border_color(pal.dim)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(g.name_size))
+                            .text_color(pal.fg)
+                            .whitespace_nowrap()
+                            .child(it.label),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.dispatch(act, window, cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+        div()
+            .id(gal.id)
+            .flex()
+            .flex_wrap()
+            .gap(px(g.gap))
+            .w(px(per_row as f32 * g.w + (per_row as f32 - 1.) * g.gap))
+            .h(px(rows * g.h + (rows - 1.) * g.gap))
+            .children(tiles)
+            .into_any_element()
     }
 
     /// The Styles gallery: a well of fixed-size tiles, each a live "AaBbCc" in
@@ -35839,6 +35939,10 @@ impl Docxy {
         act_enabled(act)
             && match act {
                 Act::Table(a) => table_tab::table_enabled(self.edit_target_ref(), a),
+                // A plugin control is enabled as its `yppx_ui_state` says (#1532).
+                Act::Project(ProjectAct::Plugin(id)) => self.tabs.get(self.active).is_some_and(
+                    |t| matches!(&t.surface, Surface::Project(v) if plugin_ui::enabled(v, id)),
+                ),
                 _ => true,
             }
     }

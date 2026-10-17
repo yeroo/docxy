@@ -26,6 +26,68 @@ pub(crate) struct GanttBar {
     pub warning: bool,
 }
 
+/// A bar kind's name as the UI plugins know it (#1532).
+pub(crate) fn bar_kind_name(kind: BarKind) -> &'static str {
+    match kind {
+        BarKind::Critical => "critical",
+        BarKind::OnTrack => "on-track",
+        BarKind::Summary => "summary",
+        BarKind::Milestone => "milestone",
+    }
+}
+
+/// The rectangle `gantt_strip` draws `bar` in, `(x, y, w, h)` within its
+/// row: a leaf bar, a summary's thinner bar, or a milestone's diamond box.
+pub(crate) fn bar_rect(bar: &GanttBar) -> (f32, f32, f32, f32) {
+    let w = (bar.end - bar.start + 1).max(1) as f32 * DAY_W;
+    match bar.kind {
+        BarKind::Summary => (bar.start as f32 * DAY_W, 9., w, 10.),
+        BarKind::Milestone => (bar.start as f32 * DAY_W + 4., 5., 14., 14.),
+        BarKind::Critical | BarKind::OnTrack => (bar.start as f32 * DAY_W, 5., w, 14.),
+    }
+}
+
+/// How a bar is drawn: its colour and shape, from the plan's palette (a UI
+/// plugin's, #1532) when it names the kind, else the built-in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BarShape {
+    /// A filled bar.
+    Bar,
+    /// An outlined bar.
+    Hollow,
+    /// A thin bar in the middle of the row.
+    Thin,
+    /// A summary's bar with its end posts.
+    Summary,
+    /// A milestone diamond.
+    Diamond,
+}
+
+/// `kind`'s colour and shape under `palette` (`None` is the built-in look).
+pub(crate) fn bar_look(
+    kind: BarKind,
+    palette: Option<&projcore::uiplugin::Palette>,
+) -> (u32, BarShape) {
+    let builtin_shape = match kind {
+        BarKind::Summary => BarShape::Summary,
+        BarKind::Milestone => BarShape::Diamond,
+        BarKind::Critical | BarKind::OnTrack => BarShape::Bar,
+    };
+    let Some(style) = palette.and_then(|p| p.bars.iter().find(|b| b.kind == bar_kind_name(kind)))
+    else {
+        return (bar_kind_color(kind), builtin_shape);
+    };
+    let shape = match style.shape.as_str() {
+        "hollow" => BarShape::Hollow,
+        "thin" => BarShape::Thin,
+        "summary" => BarShape::Summary,
+        "diamond" => BarShape::Diamond,
+        "bar" => BarShape::Bar,
+        _ => builtin_shape,
+    };
+    (style.color, shape)
+}
+
 impl GanttBar {
     pub fn state(self) -> String {
         let kind = match self.kind {
@@ -414,13 +476,22 @@ pub(crate) fn gantt_strip(
     id: i32,
     scale: GanttScale,
     pal: Pal,
+    palette: Option<&projcore::uiplugin::Palette>,
     probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
     on_right: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    on_chart_right: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let strip = div().relative().w(px(scale.width())).h(px(ROW_H));
+    // The strip itself takes a right-press beside the bar: the chart's own
+    // menu (#1532). The bar's press stops before it.
+    let strip = div()
+        .relative()
+        .w(px(scale.width()))
+        .h(px(ROW_H))
+        .on_mouse_down(MouseButton::Right, on_chart_right);
     let Some(bar) = bar else {
         return strip;
     };
+    let (color, shape) = bar_look(bar.kind, palette);
     let span = |s: i64, e: i64, y: f32, h: f32, color: Hsla, hollow: bool| {
         div()
             .absolute()
@@ -447,7 +518,6 @@ pub(crate) fn gantt_strip(
         strip = strip.child(span(s, e, 22., 4., pal.dim, false));
     }
     if bar.inactive {
-        let color = bar_kind_color(bar.kind);
         if let Some((s, e)) = bar.rollup {
             strip = strip.child(span(s, e, 3., 4., hsla_u(color), true));
         }
@@ -455,7 +525,7 @@ pub(crate) fn gantt_strip(
             strip = strip.child(span(s, e, 3., 4., hsla_u(GANTT_WARNING), true));
         }
         let marker = probe(probes, format!("bar:{id}"));
-        let outline = if bar.kind == BarKind::Milestone {
+        let outline = if shape == BarShape::Diamond {
             div()
                 .absolute()
                 .left(px(bar.start as f32 * DAY_W + 4.))
@@ -467,12 +537,8 @@ pub(crate) fn gantt_strip(
             span(
                 bar.start,
                 bar.end,
-                if bar.kind == BarKind::Summary { 9. } else { 5. },
-                if bar.kind == BarKind::Summary {
-                    10.
-                } else {
-                    14.
-                },
+                if shape == BarShape::Summary { 9. } else { 5. },
+                if shape == BarShape::Summary { 10. } else { 14. },
                 hsla_u(color),
                 true,
             )
@@ -500,17 +566,11 @@ pub(crate) fn gantt_strip(
         strip = strip.child(span(s, e, 3., 3., hsla_u(GANTT_WARNING), false));
     }
     let marker = probe(probes, format!("bar:{id}"));
-    let element = match bar.kind {
-        BarKind::Critical | BarKind::OnTrack => span(
-            bar.start,
-            bar.end,
-            5.,
-            14.,
-            hsla_u(bar_kind_color(bar.kind)),
-            false,
-        )
-        .child(marker),
-        BarKind::Summary => div()
+    let element = match shape {
+        BarShape::Bar => span(bar.start, bar.end, 5., 14., hsla_u(color), false).child(marker),
+        BarShape::Hollow => span(bar.start, bar.end, 5., 14., hsla_u(color), true).child(marker),
+        BarShape::Thin => span(bar.start, bar.end, 11., 6., hsla_u(color), false).child(marker),
+        BarShape::Summary => div()
             .absolute()
             .left(px(bar.start as f32 * DAY_W))
             .top(px(9.))
@@ -522,7 +582,7 @@ pub(crate) fn gantt_strip(
                     .top_0()
                     .w_full()
                     .h(px(6.))
-                    .bg(hsla_u(bar_kind_color(bar.kind))),
+                    .bg(hsla_u(color)),
             )
             .child(
                 div()
@@ -530,7 +590,7 @@ pub(crate) fn gantt_strip(
                     .left_0()
                     .w(px(3.))
                     .h_full()
-                    .bg(hsla_u(bar_kind_color(bar.kind))),
+                    .bg(hsla_u(color)),
             )
             .child(
                 div()
@@ -538,18 +598,206 @@ pub(crate) fn gantt_strip(
                     .right_0()
                     .w(px(3.))
                     .h_full()
-                    .bg(hsla_u(bar_kind_color(bar.kind))),
+                    .bg(hsla_u(color)),
             )
             .child(marker),
-        BarKind::Milestone => div()
+        BarShape::Diamond => div()
             .absolute()
             .left(px(bar.start as f32 * DAY_W + 4.))
             .top(px(5.))
             .size(px(14.))
-            .child(milestone_diamond(bar_kind_color(bar.kind), false))
+            .child(milestone_diamond(color, false))
             .child(marker),
     };
     strip.child(element.on_mouse_down(MouseButton::Right, on_right))
+}
+
+/// The UI plugins' overlay (#1532): their shapes, in chart pixels (x from
+/// the scale's origin, y from the top of the first row), painted over the
+/// rows after the bars, scrolled with them and clipped to the chart. The
+/// shapes are asked for once per plan revision, scale and view switches
+/// (`plugin_ui::overlay_shapes`); nothing is drawn without a UI plugin.
+pub(crate) fn gantt_overlay(view: &ProjectView, pal: Pal) -> Option<impl IntoElement> {
+    let shapes = crate::plugin_ui::overlay_shapes(view);
+    if shapes.is_empty() {
+        return None;
+    }
+    let scroll = view.scroll.clone();
+    let (table_w, gantt_w, gantt_x) = (view.table_w, view.gantt_w, view.gantt_x.get());
+    let font = Font {
+        family: "Segoe UI".into(),
+        ..Default::default()
+    };
+    let _ = pal;
+    Some(
+        canvas(
+            |_, _, _| (),
+            move |bounds, _, window, cx| {
+                let scroll_y = -f32::from(scroll.0.borrow().base_handle.offset().y);
+                let Some(chart) = gantt_viewport(bounds, table_w, gantt_w) else {
+                    return;
+                };
+                // Chart pixels to window pixels.
+                let ox = f32::from(chart.origin.x) - gantt_x;
+                let oy = f32::from(bounds.origin.y) - scroll_y;
+                let at = |(x, y): (f32, f32)| point(px(ox + x), px(oy + y));
+                window.with_content_mask(Some(ContentMask { bounds: chart }), |window| {
+                    for shape in shapes.iter() {
+                        paint_shape(window, cx, shape, &at, &font);
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_full(),
+    )
+}
+
+/// Paint one overlay shape, `at` mapping chart pixels to window pixels.
+fn paint_shape(
+    window: &mut Window,
+    cx: &mut App,
+    shape: &projcore::uiplugin::Shape,
+    at: &dyn Fn((f32, f32)) -> Point<Pixels>,
+    font: &Font,
+) {
+    use projcore::uiplugin::Shape;
+    let stroke = |window: &mut Window, points: &[(f32, f32)], color: u32, width: f32| {
+        if points.len() < 2 {
+            return;
+        }
+        let mut path = PathBuilder::stroke(px(width.max(0.5)));
+        path.move_to(at(points[0]));
+        for p in &points[1..] {
+            path.line_to(at(*p));
+        }
+        if let Ok(path) = path.build() {
+            window.paint_path(path, rgb(color));
+        }
+    };
+    match shape {
+        Shape::Polyline {
+            points,
+            color,
+            width,
+        } => stroke(window, points, *color, *width),
+        Shape::Dashed {
+            points,
+            color,
+            width,
+        } => {
+            // Dashes of 4 px with 3 px gaps along each segment.
+            for pair in points.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+                let len = (dx * dx + dy * dy).sqrt();
+                if len <= 0. {
+                    continue;
+                }
+                let (ux, uy) = (dx / len, dy / len);
+                let mut t = 0.;
+                while t < len {
+                    let end = (t + 4.).min(len);
+                    stroke(
+                        window,
+                        &[
+                            (a.0 + ux * t, a.1 + uy * t),
+                            (a.0 + ux * end, a.1 + uy * end),
+                        ],
+                        *color,
+                        *width,
+                    );
+                    t += 7.;
+                }
+            }
+        }
+        Shape::Arrow {
+            from,
+            to,
+            color,
+            width,
+        } => {
+            stroke(window, &[*from, *to], *color, *width);
+            let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+            let len = (dx * dx + dy * dy).sqrt().max(0.001);
+            let (ux, uy) = (dx / len, dy / len);
+            let size = 6.;
+            let base = (to.0 - ux * size, to.1 - uy * size);
+            let (nx, ny) = (-uy * size / 2., ux * size / 2.);
+            let mut path = PathBuilder::fill();
+            path.move_to(at(*to));
+            path.line_to(at((base.0 + nx, base.1 + ny)));
+            path.line_to(at((base.0 - nx, base.1 - ny)));
+            path.close();
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgb(*color));
+            }
+        }
+        Shape::Bracket {
+            x0,
+            x1,
+            y,
+            tick,
+            color,
+            width,
+        } => stroke(
+            window,
+            &[(*x0, y + tick), (*x0, *y), (*x1, *y), (*x1, y + tick)],
+            *color,
+            *width,
+        ),
+        Shape::Rect {
+            x,
+            y,
+            w,
+            h,
+            color,
+            filled,
+        } => {
+            let bounds = Bounds {
+                origin: at((*x, *y)),
+                size: size(px(*w), px(*h)),
+            };
+            if *filled {
+                window.paint_quad(fill(bounds, rgb(*color)));
+            } else {
+                stroke(
+                    window,
+                    &[(*x, *y), (x + w, *y), (x + w, y + h), (*x, y + h), (*x, *y)],
+                    *color,
+                    1.,
+                );
+            }
+        }
+        Shape::Text {
+            x,
+            y,
+            text,
+            color,
+            size: text_size,
+        } => {
+            let run = TextRun {
+                len: text.len(),
+                font: font.clone(),
+                color: rgb(*color).into(),
+                ..Default::default()
+            };
+            let line = window.text_system().shape_line(
+                SharedString::from(text.clone()),
+                px(*text_size),
+                &[run],
+                None,
+            );
+            let _ = line.paint(
+                at((*x, *y)),
+                px(text_size * 1.3),
+                TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
+        }
+    }
 }
 
 fn milestone_diamond(color: u32, hollow: bool) -> impl IntoElement {

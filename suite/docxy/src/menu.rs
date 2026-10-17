@@ -26,6 +26,9 @@ pub(crate) enum MenuTarget {
     /// A Project entry-table column heading's context menu (#1208), by
     /// column index (see `COLUMNS`).
     Column(usize),
+    /// The Gantt chart's own menu (#1532), opened beside the bars: Project's
+    /// chart formatting items, and what a UI plugin adds.
+    Chart,
     /// A ribbon split button's drop-down: tab, group and the primary's label
     /// (and its id, which the drawn arrow knows it by; not reported).
     Ribbon {
@@ -112,6 +115,7 @@ impl MenuTarget {
                 "column",
                 Json::Str(crate::COLUMNS.get(*c).copied().unwrap_or_default().into()),
             )]),
+            Self::Chart => Json::Str("chart".into()),
             Self::Ribbon {
                 tab, group, label, ..
             } => Json::obj(vec![(
@@ -144,6 +148,8 @@ pub(crate) struct Entry {
     pub act: Option<Act>,
     /// A submenu the item opens instead of running a command.
     pub submenu: Vec<MenuItem>,
+    /// Contributed by a UI plugin (#1532): `menu-read` says `"plugin": true`.
+    pub plugin: bool,
 }
 
 impl Entry {
@@ -158,6 +164,7 @@ impl Entry {
             checked: false,
             act: Some(act),
             submenu: Vec::new(),
+            plugin: false,
         }
     }
     /// An item drawn for order parity with no command behind it: disabled.
@@ -171,10 +178,16 @@ impl Entry {
             checked: false,
             act: None,
             submenu: Vec::new(),
+            plugin: false,
         }
     }
     pub fn checked(mut self, checked: bool) -> Self {
         self.checked = checked;
+        self
+    }
+    /// An item a UI plugin contributed.
+    pub fn plugin(mut self) -> Self {
+        self.plugin = true;
         self
     }
     pub fn key(mut self, key_tip: &str) -> Self {
@@ -342,21 +355,27 @@ fn items_json(items: &[MenuItem]) -> Json {
                         ("rows", Json::Num(*rows as f64)),
                     ]),
                 )]),
-                MenuItem::Item(e) => Json::obj(vec![
-                    ("id", Json::Str(e.id.clone())),
-                    ("label", Json::Str(e.label.clone())),
-                    ("enabled", Json::Bool(e.enabled)),
-                    ("checked", Json::Bool(e.checked)),
-                    ("key_tip", Json::Str(e.key_tip.clone())),
-                    (
-                        "submenu",
-                        if e.submenu.is_empty() {
-                            Json::Null
-                        } else {
-                            items_json(&e.submenu)
-                        },
-                    ),
-                ]),
+                MenuItem::Item(e) => {
+                    let mut fields = vec![
+                        ("id", Json::Str(e.id.clone())),
+                        ("label", Json::Str(e.label.clone())),
+                        ("enabled", Json::Bool(e.enabled)),
+                        ("checked", Json::Bool(e.checked)),
+                        ("key_tip", Json::Str(e.key_tip.clone())),
+                        (
+                            "submenu",
+                            if e.submenu.is_empty() {
+                                Json::Null
+                            } else {
+                                items_json(&e.submenu)
+                            },
+                        ),
+                    ];
+                    if e.plugin {
+                        fields.push(("plugin", Json::Bool(true)));
+                    }
+                    Json::obj(fields)
+                }
             })
             .collect(),
     )
@@ -391,6 +410,8 @@ pub(crate) fn target_stands(
             Some(_) => Err("the column menu's column is no longer the selected one".into()),
             None => Err("the column menu runs on a Project tab".into()),
         },
+        (MenuTarget::Chart, Some(_)) => Ok(()),
+        (MenuTarget::Chart, None) => Err("the chart menu runs on a Project tab".into()),
         (MenuTarget::Document, Some(_)) => {
             Err("the document menu does not run on a Project tab".into())
         }
