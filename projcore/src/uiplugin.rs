@@ -1138,7 +1138,7 @@ impl CommandResult {
 // ---- the overlay -------------------------------------------------------------
 
 /// What the host sends `yppx_ui_overlay`: the chart as drawn.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct OverlayCtx {
     /// The rows in view, top to bottom.
     pub rows: Vec<OverlayRow>,
@@ -1149,12 +1149,17 @@ pub struct OverlayCtx {
     pub links: Vec<OverlayLink>,
     /// The plan's status date, `YYYY-MM-DDTHH:MM`, when set.
     pub status_date: Option<String>,
-    /// The view's switches (`critical`, `baseline`, ...), by key.
+    /// The plan's current date (Project's `CurrentDate`), when set (#1548).
+    pub current_date: Option<String>,
+    /// The view's switches (`critical`, `baseline`, `timeline`), the
+    /// plan's `palette`, and its formatting's `link_style` and `gridlines`
+    /// (#1548), by key.
     pub flags: Json,
 }
 
-/// One row of the chart: its task and its bar's rectangle in chart pixels.
-#[derive(Debug, Clone, PartialEq)]
+/// One row of the chart: its task and its bar's rectangle in chart pixels,
+/// with what a chart draws over the bar (#1548).
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct OverlayRow {
     pub uid: i32,
     pub row_y: f32,
@@ -1166,6 +1171,17 @@ pub struct OverlayRow {
     pub milestone: bool,
     pub critical: bool,
     pub inactive: bool,
+    /// The task's name.
+    pub name: String,
+    /// `% Complete`, 0 to 100.
+    pub percent_complete: u8,
+    /// The deadline's x in chart pixels, when the task has one.
+    pub deadline_x: Option<f32>,
+    /// The constraint's MSPDI abbreviation (`SNET`, `MFO`, ...) and its
+    /// date's x, for the types that have a date.
+    pub constraint: Option<(String, f32)>,
+    /// The Resource Names cell's text.
+    pub resource_names: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1206,6 +1222,18 @@ impl OverlayCtx {
                     milestone: r.flag("milestone"),
                     critical: r.flag("critical"),
                     inactive: r.flag("inactive"),
+                    name: r.text("name"),
+                    percent_complete: r
+                        .int("percent_complete")
+                        .and_then(|n| u8::try_from(n).ok())
+                        .unwrap_or(0)
+                        .min(100),
+                    deadline_x: f(r, "deadline_x"),
+                    constraint: r
+                        .get("constraint")
+                        .filter(|c| !c.is_null())
+                        .and_then(|c| Some((c.text("type"), f(c, "x")?))),
+                    resource_names: r.text("resource_names"),
                 }
             })
             .collect();
@@ -1233,6 +1261,7 @@ impl OverlayCtx {
             row_h: f(&scale, "row_h").unwrap_or(28.0),
             links,
             status_date: v.get_str("status_date").map(str::to_string),
+            current_date: v.get_str("current_date").map(str::to_string),
             flags: v.get("flags").cloned().unwrap_or(Json::Obj(Vec::new())),
         })
     }
@@ -1262,6 +1291,16 @@ impl OverlayCtx {
                     ("milestone", Json::Bool(r.milestone)),
                     ("critical", Json::Bool(r.critical)),
                     ("inactive", Json::Bool(r.inactive)),
+                    ("name", Json::str(r.name.clone())),
+                    ("percent_complete", Json::Num(f64::from(r.percent_complete))),
+                    ("deadline_x", r.deadline_x.map_or(Json::Null, num)),
+                    (
+                        "constraint",
+                        r.constraint.as_ref().map_or(Json::Null, |(kind, x)| {
+                            Json::obj(vec![("type", Json::str(kind.clone())), ("x", num(*x))])
+                        }),
+                    ),
+                    ("resource_names", Json::str(r.resource_names.clone())),
                 ])
             })
             .collect();
@@ -1291,6 +1330,10 @@ impl OverlayCtx {
             (
                 "status_date",
                 self.status_date.clone().map_or(Json::Null, Json::Str),
+            ),
+            (
+                "current_date",
+                self.current_date.clone().map_or(Json::Null, Json::Str),
             ),
             ("flags", self.flags.clone()),
         ])
@@ -1676,10 +1719,13 @@ mod tests {
                 row_y: 0.0,
                 bar: Some((22.0, 5.0, 66.0, 14.0)),
                 kind: "critical".into(),
-                summary: false,
-                milestone: false,
                 critical: true,
-                inactive: false,
+                name: "A".into(),
+                percent_complete: 25,
+                deadline_x: Some(110.0),
+                constraint: Some(("FNLT".into(), 88.0)),
+                resource_names: "Alice".into(),
+                ..OverlayRow::default()
             }],
             origin_day: 20000,
             day_w: 22.0,
@@ -1691,6 +1737,7 @@ mod tests {
                 lag: "2d".into(),
             }],
             status_date: Some("2026-01-05T08:00".into()),
+            current_date: None,
             flags: Json::obj(vec![("critical", Json::Bool(true))]),
         };
         assert_eq!(OverlayCtx::parse(&ctx.json()).unwrap(), ctx);
@@ -1881,20 +1928,20 @@ mod tests {
                     row_y: 0.0,
                     bar: Some((22.0, 5.0, 66.0, 14.0)),
                     kind: "critical".into(),
-                    summary: false,
-                    milestone: false,
                     critical: true,
-                    inactive: false,
+                    name: "Design".into(),
+                    percent_complete: 40,
+                    deadline_x: Some(132.0),
+                    constraint: Some(("SNET".into(), 22.0)),
+                    resource_names: "Alice, Bob[50%]".into(),
+                    ..OverlayRow::default()
                 },
                 OverlayRow {
                     uid: 2,
                     row_y: 28.0,
-                    bar: None,
                     kind: "summary".into(),
                     summary: true,
-                    milestone: false,
-                    critical: false,
-                    inactive: false,
+                    ..OverlayRow::default()
                 },
             ],
             origin_day: 20000,
@@ -1907,14 +1954,37 @@ mod tests {
                 lag: "2d".into(),
             }],
             status_date: Some("2026-01-05T08:00".into()),
-            flags: Json::obj(vec![("critical", Json::Bool(true))]),
+            current_date: Some("2026-01-06T08:00".into()),
+            flags: Json::obj(vec![
+                ("critical", Json::Bool(true)),
+                ("link_style", Json::str("straight")),
+            ]),
         };
         let j = Json::parse(&ctx.json()).unwrap();
         assert_eq!(j.list("rows")[0].get("bar").unwrap().num("w"), Some(66.0));
         assert!(j.list("rows")[1].get("bar").unwrap().is_null());
+        assert_eq!(j.list("rows")[0].int("percent_complete"), Some(40));
+        assert_eq!(j.list("rows")[0].num("deadline_x"), Some(132.0));
+        assert_eq!(
+            j.list("rows")[0].get("constraint").unwrap().text("type"),
+            "SNET"
+        );
+        assert!(j.list("rows")[1].get("deadline_x").unwrap().is_null());
+        assert!(j.list("rows")[1].get("constraint").unwrap().is_null());
         assert_eq!(j.get("scale").unwrap().int("origin_day"), Some(20000));
         assert_eq!(j.list("links")[0].text("type"), "FS");
         assert_eq!(j.text("status_date"), "2026-01-05T08:00");
+        assert_eq!(j.text("current_date"), "2026-01-06T08:00");
+        // An older request without the new fields reads as their defaults.
+        let old = OverlayCtx::parse(
+            r#"{"rows":[{"uid":3,"row_y":0,"bar":null,"kind":"on-track"}],"scale":{"origin_day":1,"day_w":22,"row_h":28},"links":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(old.rows[0].percent_complete, 0);
+        assert_eq!(old.rows[0].deadline_x, None);
+        assert_eq!(old.rows[0].constraint, None);
+        assert_eq!(old.rows[0].resource_names, "");
+        assert_eq!(old.current_date, None);
         let shapes = parse_shapes(
             r##"{"shapes":[
               {"kind":"polyline","points":[[10,5],[10,30]],"color":"#000000","width":2},

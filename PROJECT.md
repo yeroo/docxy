@@ -471,10 +471,13 @@ without one nothing changes.
   `values`; `view` sets host view settings (the palette, flags). Code 1
   (unsupported) means "not my command", so several plugins can coexist.
 - **Overlay** (`yppx_ui_overlay`): the rows in view (`uid`, `row_y`, the bar
-  rectangle, kind flags), the scale (`origin_day`, `day_w`, `row_h`), the
-  links, the status date and the view flags in; shapes in chart pixels out
-  (`polyline`, `dashed`, `arrow`, `bracket`, `rect`, `text`, each with a
-  colour and width), drawn over the bars.
+  rectangle, kind flags, and since #1548 `name`, `percent_complete`,
+  `deadline_x`, `constraint {type, x}` and `resource_names`), the scale
+  (`origin_day`, `day_w`, `row_h`), the links, the status and current dates
+  and the view flags (the switches, the plan's `palette`, `link_style` and
+  `gridlines`) in; shapes in chart pixels out (`polyline`, `dashed`,
+  `arrow`, `bracket`, `rect`, `text`, each with a colour and width), drawn
+  over the bars.
 - **Loader.** `projcore::formats::plugin::load_plugins_for(dirs, Some(Host
   {name, version}))` returns `Loaded {formats, ui: Vec<Arc<UiPlugin>>,
   plugins: Vec<PluginInfo>, errors, skipped}`; `UiPlugin` has `manifest()`,

@@ -288,10 +288,7 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         row_y: y,
         bar,
         kind: "on-track".into(),
-        summary: false,
-        milestone: false,
-        critical: false,
-        inactive: false,
+        ..OverlayRow::default()
     };
     let overlay = OverlayCtx {
         rows: vec![
@@ -304,6 +301,7 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         row_h: 28.0,
         links: Vec::new(),
         status_date: None,
+        current_date: None,
         flags: Json::Obj(Vec::new()),
     };
     let shapes = ui.overlay(&overlay).unwrap();

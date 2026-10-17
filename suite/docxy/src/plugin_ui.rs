@@ -258,20 +258,18 @@ pub(crate) struct PluginCache {
     shapes: Rc<Vec<Shape>>,
 }
 
-/// The view's switches as the plugins see them (`view` in every request).
+/// The view's switches as the plugins see them (`view` in every request),
+/// with the plan's formatting choices an overlay follows (#1548).
 fn view_json(v: &ProjectView) -> Json {
+    let formatting = &v.ed.project().formatting;
+    let text = |s: &Option<String>| s.clone().map_or(Json::Null, Json::Str);
     Json::obj(vec![
         ("critical", Json::Bool(v.show_critical)),
         ("baseline", Json::Bool(v.show_baseline)),
         ("timeline", Json::Bool(v.timeline)),
-        (
-            "palette",
-            v.ed.project()
-                .formatting
-                .palette
-                .clone()
-                .map_or(Json::Null, Json::Str),
-        ),
+        ("palette", text(&formatting.palette)),
+        ("link_style", text(&formatting.link_style)),
+        ("gridlines", text(&formatting.gridlines)),
     ])
 }
 
@@ -886,6 +884,17 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
     let ed = &v.ed;
     let tasks = &ed.project().tasks;
     let shown = ed.visible_rows();
+    // An instant's x in chart pixels, within its day.
+    let x_at = |d: projcore::DateTime| {
+        (d.minutes() - scale.origin_day * 1440) as f32 / 1440.0 * crate::DAY_W
+    };
+    let stamp = |d: projcore::DateTime| {
+        let p = d.parts();
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}",
+            p.year, p.month, p.day, p.hour, p.minute
+        )
+    };
     let rows: Vec<OverlayRow> = shown
         .iter()
         .enumerate()
@@ -893,6 +902,11 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
             let task = tasks.get(i)?;
             let bar = crate::gantt_bar(ed, task, scale).map(|b| v.styled_bar(b));
             let row_y = row as f32 * crate::ROW_H;
+            let dated = !matches!(
+                task.constraint,
+                projcore::ConstraintType::AsSoonAsPossible
+                    | projcore::ConstraintType::AsLateAsPossible
+            );
             Some(OverlayRow {
                 uid: task.uid,
                 row_y,
@@ -905,6 +919,14 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
                 milestone: task.is_milestone(),
                 critical: bar.is_some_and(|b| b.kind == crate::BarKind::Critical),
                 inactive: bar.is_some_and(|b| b.inactive),
+                name: task.name.clone(),
+                percent_complete: task.percent_complete.unwrap_or(0).min(100),
+                deadline_x: task.deadline.map(x_at),
+                constraint: task
+                    .constraint_date
+                    .filter(|_| dated)
+                    .map(|d| (task.constraint.abbrev().to_string(), x_at(d))),
+                resource_names: projcore::editor::format_resource_names(ed.project(), task.uid),
             })
         })
         .collect();
@@ -930,13 +952,12 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
                 })
         })
         .collect();
-    let status_date = ed.project().status_date().map(|d| {
-        let p = d.parts();
-        format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}",
-            p.year, p.month, p.day, p.hour, p.minute
-        )
-    });
+    let status_date = ed.project().status_date().map(stamp);
+    let current_date = ed
+        .project()
+        .option("CurrentDate")
+        .and_then(projcore::DateTime::parse_mspdi)
+        .map(stamp);
     OverlayCtx {
         rows,
         origin_day: scale.origin_day,
@@ -944,6 +965,7 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
         row_h: crate::ROW_H,
         links,
         status_date,
+        current_date,
         flags: view_json(v),
     }
 }
