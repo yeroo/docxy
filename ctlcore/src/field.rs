@@ -65,6 +65,17 @@ impl Field {
         }
     }
 
+    /// An open field that edits at a caret (`caret` chars in); nothing can be
+    /// selected.
+    pub fn with_caret(value: &str, focused: bool, caret: usize) -> Field {
+        Field {
+            value: Some(value.to_string()),
+            focused,
+            caret: Some(caret),
+            ..Field::default()
+        }
+    }
+
     /// Drawn with its first character at `at`.
     pub fn at(mut self, at: Option<(u16, u16)>) -> Field {
         self.at = at;

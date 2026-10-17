@@ -18,6 +18,7 @@ mod bidi;
 mod control;
 mod html;
 mod layout_tab;
+mod line_edit;
 mod mcp;
 mod metafile;
 mod protection;
@@ -65,6 +66,7 @@ use docxcore::sect::{BorderSide, PageBorders, PgBorderDisplay, PgBorderOffset};
 use docxcore::serialize::blocks_to_xml;
 use docxcore::styles::{StyleSheet, parse_styles_xml};
 use docxcore::watermark::TextWatermarkSpec;
+use line_edit::{Edit, LineEdit};
 use std::rc::Rc;
 
 use ratatui::backend::CrosstermBackend;
@@ -104,6 +106,39 @@ impl DocFormat {
     fn is_docx(self) -> bool {
         matches!(self, DocFormat::Docx | DocFormat::Html)
     }
+}
+
+/// The Replace bar's two fields as drawn: the focused one carries the caret
+/// mark at its caret. The status text and `field-read`'s `at` both read this.
+fn replace_drawn(f: &FindState) -> (String, String) {
+    let repl = f.replacement.as_ref().cloned().unwrap_or_default();
+    if f.editing_replacement {
+        (f.query.as_str().to_string(), repl.with_mark("▏"))
+    } else {
+        (f.query.with_mark("▏"), repl.as_str().to_string())
+    }
+}
+
+/// A Compare path field as drawn in `room` cells (plus one for the caret mark
+/// when `focused`): the tail of a long path, or from the caret when it is left
+/// of that tail. The second value is how many cells the caret mark pushes the
+/// first shown char right (`field-read`'s `at`).
+fn compare_window(value: &LineEdit, room: usize, focused: bool) -> (String, u16) {
+    let n = value.len();
+    let caret = value.caret();
+    let start = if focused {
+        n.saturating_sub(room).min(caret)
+    } else {
+        n.saturating_sub(room)
+    };
+    let shown: String = value.as_str().chars().skip(start).take(room).collect();
+    if !focused {
+        return (shown, 0);
+    }
+    let before: String = shown.chars().take(caret - start).collect();
+    let after: String = shown.chars().skip(caret - start).collect();
+    let lead = u16::from(caret == start && !shown.is_empty());
+    (format!("{before}▏{after}"), lead)
 }
 
 /// Pick a format from a path's extension: any `.html`/`.htm` is an editable-HTML
@@ -749,9 +784,9 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
 
 /// State for the find / replace bar.
 struct FindState {
-    query: String,
+    query: LineEdit,
     /// `None` = find-only; `Some` = replace mode (the replacement text).
-    replacement: Option<String>,
+    replacement: Option<LineEdit>,
     editing_replacement: bool,
     matches: Vec<FoundMatch>,
     idx: usize,
@@ -771,7 +806,7 @@ struct VimState {
     count: String,
     pending_op: Option<char>, // 'd' | 'c' | 'y'
     pending_g: bool,
-    cmdline: Option<String>, // Some while typing a `:` command
+    cmdline: Option<LineEdit>, // Some while typing a `:` command
     last_search: String,
     linewise_clip: bool,
 }
@@ -1082,14 +1117,14 @@ impl ParagraphDialog {
 
 /// The Review ▸ Compare dialog: the original and revised `.docx` paths.
 struct CompareDialog {
-    original: String,
-    revised: String,
+    original: LineEdit,
+    revised: LineEdit,
     /// Focused field: 0 = original, 1 = revised.
     field: usize,
 }
 
 impl CompareDialog {
-    fn focused(&mut self) -> &mut String {
+    fn focused(&mut self) -> &mut LineEdit {
         if self.field == 0 {
             &mut self.original
         } else {
@@ -1513,7 +1548,7 @@ struct App {
     comment_sel: usize,
     comment_active: bool,
     /// While entering a new comment's text (the draft body).
-    comment_input: Option<String>,
+    comment_input: Option<LineEdit>,
     /// Key presses, clicks and frames handled so far, for `field-read`
     /// (#1204).
     counts: ctlcore::field::InputCounts,
@@ -3095,7 +3130,7 @@ impl App {
             self.dirty = true;
             return;
         }
-        self.comment_input = Some(String::new());
+        self.comment_input = Some(LineEdit::default());
         self.dirty = true;
     }
 
@@ -3106,8 +3141,8 @@ impl App {
     fn commit_comment(&mut self) {
         if self
             .comment_input
-            .as_deref()
-            .unwrap_or_default()
+            .as_ref()
+            .map_or("", LineEdit::as_str)
             .trim()
             .is_empty()
         {
@@ -3119,7 +3154,12 @@ impl App {
         if !self.mutation_allowed(protection::MutationKind::Comment) {
             return;
         }
-        let text = self.comment_input.take().unwrap_or_default();
+        let text = self
+            .comment_input
+            .take()
+            .unwrap_or_default()
+            .as_str()
+            .to_string();
         let quoted = self.editor.selection_text();
         let id = self.next_comment_id();
         if !self.editor.add_comment(&id.to_string()) {
@@ -3425,15 +3465,15 @@ impl App {
                 self.dirty = true;
             }
             KeyCode::Enter => self.commit_comment(),
-            KeyCode::Backspace => {
+            KeyCode::Char(c) => {
                 if let Some(s) = self.comment_input.as_mut() {
-                    s.pop();
+                    s.insert(c);
                 }
                 self.dirty = true;
             }
-            KeyCode::Char(c) => {
+            code if LineEdit::is_edit_key(&key) => {
                 if let Some(s) = self.comment_input.as_mut() {
-                    s.push(c);
+                    s.handle(code);
                 }
                 self.dirty = true;
             }
@@ -4051,7 +4091,7 @@ impl App {
         // text under its matches: rebuild them so Replace never acts on a
         // stale range. The caret and selection stay where the edit left them.
         if let Some(f) = self.find.as_mut() {
-            f.matches = self.editor.find_visible(&f.query, false);
+            f.matches = self.editor.find_visible(f.query.as_str(), false);
             if f.idx >= f.matches.len() {
                 f.idx = 0;
             }
@@ -4813,8 +4853,8 @@ impl App {
         };
         let field = usize::from(!original.is_empty());
         self.compare_dialog = Some(CompareDialog {
-            original,
-            revised: String::new(),
+            original: original.into(),
+            revised: LineEdit::default(),
             field,
         });
         self.dirty = true;
@@ -4826,7 +4866,7 @@ impl App {
         };
         // Paths pasted or dropped from a file manager often arrive quoted.
         let clean = |s: &str| s.trim().trim_matches('"').to_string();
-        let (original, revised) = (clean(&d.original), clean(&d.revised));
+        let (original, revised) = (clean(d.original.as_str()), clean(d.revised.as_str()));
         self.dirty = true;
         if original.is_empty() || revised.is_empty() {
             self.status = Some("Compare needs an original and a revised .docx".to_string());
@@ -4858,15 +4898,15 @@ impl App {
         match key.code {
             KeyCode::Up | KeyCode::BackTab => d.field = 0,
             KeyCode::Down | KeyCode::Tab => d.field = 1,
-            KeyCode::Backspace => {
-                d.focused().pop();
+            code if LineEdit::is_edit_key(&key) => {
+                d.focused().handle(code);
             }
             KeyCode::Char(c)
                 if !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                d.focused().push(c);
+                d.focused().insert(c);
             }
             KeyCode::Enter => self.submit_compare_dialog(),
             KeyCode::Esc => self.compare_dialog = None,
@@ -5732,7 +5772,7 @@ impl App {
 
     fn enter_find(&mut self) {
         self.find = Some(FindState {
-            query: String::new(),
+            query: LineEdit::default(),
             replacement: None,
             editing_replacement: false,
             matches: Vec::new(),
@@ -5746,7 +5786,11 @@ impl App {
     /// so a match can be read-only (in a tracked change, a field's result, …):
     /// see [`docxcore::editor::FoundMatch`].
     fn find_recompute(&mut self) {
-        let Some((query, idx0)) = self.find.as_ref().map(|f| (f.query.clone(), f.idx)) else {
+        let Some((query, idx0)) = self
+            .find
+            .as_ref()
+            .map(|f| (f.query.as_str().to_string(), f.idx))
+        else {
             return;
         };
         let matches = self.editor.find_visible(&query, false);
@@ -5784,7 +5828,7 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => {
-                if let Some(q) = self.find.as_ref().map(|f| f.query.clone()) {
+                if let Some(q) = self.find.as_ref().map(|f| f.query.as_str().to_string()) {
                     if let Some(v) = &mut self.vim {
                         v.last_search = q;
                     }
@@ -5797,7 +5841,7 @@ impl App {
                 if let Some(f) = &mut self.find {
                     match f.replacement {
                         None => {
-                            f.replacement = Some(String::new());
+                            f.replacement = Some(LineEdit::default());
                             f.editing_replacement = true;
                         }
                         Some(_) => f.editing_replacement = !f.editing_replacement,
@@ -5807,11 +5851,12 @@ impl App {
             }
             KeyCode::Char('f') if ctrl => self.find_step(1),
             KeyCode::Char('a') if ctrl => {
-                if let Some((q, Some(repl))) = self
-                    .find
-                    .as_ref()
-                    .map(|f| (f.query.clone(), f.replacement.clone()))
-                {
+                if let Some((q, Some(repl))) = self.find.as_ref().map(|f| {
+                    (
+                        f.query.as_str().to_string(),
+                        f.replacement.as_ref().map(|r| r.as_str().to_string()),
+                    )
+                }) {
                     if !self.mutation_allowed(protection::MutationKind::Content) {
                         return false;
                     }
@@ -5837,7 +5882,9 @@ impl App {
                     }
                     let (repl, current) = match &self.find {
                         Some(f) => (
-                            f.replacement.clone().unwrap_or_default(),
+                            f.replacement
+                                .as_ref()
+                                .map_or_else(String::new, |r| r.as_str().to_string()),
                             f.matches.get(f.idx).cloned(),
                         ),
                         None => (String::new(), None),
@@ -5868,16 +5915,15 @@ impl App {
             }
             KeyCode::Down => self.find_step(1),
             KeyCode::Up => self.find_step(-1),
-            KeyCode::Backspace => {
+            code if LineEdit::is_edit_key(&key) => {
                 let mut query_changed = false;
                 if let Some(f) = &mut self.find {
                     match &mut f.replacement {
                         Some(repl) if f.editing_replacement => {
-                            repl.pop();
+                            repl.handle(code);
                         }
                         _ => {
-                            f.query.pop();
-                            query_changed = true;
+                            query_changed = f.query.handle(code) == Edit::Changed;
                         }
                     }
                 }
@@ -5891,9 +5937,9 @@ impl App {
                 let mut query_changed = false;
                 if let Some(f) = &mut self.find {
                     match &mut f.replacement {
-                        Some(repl) if f.editing_replacement => repl.push(c),
+                        Some(repl) if f.editing_replacement => repl.insert(c),
                         _ => {
-                            f.query.push(c);
+                            f.query.insert(c);
                             query_changed = true;
                         }
                     }
@@ -6287,7 +6333,7 @@ impl App {
             'N' => self.vim_search_next(true),
             ':' => {
                 if let Some(v) = &mut self.vim {
-                    v.cmdline = Some(String::new());
+                    v.cmdline = Some(LineEdit::default());
                 }
                 self.dirty = true;
             }
@@ -6330,17 +6376,17 @@ impl App {
                     .and_then(|v| v.cmdline.take())
                     .unwrap_or_default();
                 self.dirty = true;
-                return self.vim_run_command(&cmd);
-            }
-            KeyCode::Backspace => {
-                if let Some(s) = self.vim.as_mut().and_then(|v| v.cmdline.as_mut()) {
-                    s.pop();
-                }
-                self.dirty = true;
+                return self.vim_run_command(cmd.as_str());
             }
             KeyCode::Char(c) => {
                 if let Some(s) = self.vim.as_mut().and_then(|v| v.cmdline.as_mut()) {
-                    s.push(c);
+                    s.insert(c);
+                }
+                self.dirty = true;
+            }
+            code if LineEdit::is_edit_key(&key) => {
+                if let Some(s) = self.vim.as_mut().and_then(|v| v.cmdline.as_mut()) {
+                    s.handle(code);
                 }
                 self.dirty = true;
             }
@@ -6735,38 +6781,39 @@ impl App {
     }
 
     /// A prompt field, as `field-read {"input":id}` reports it (#1204).
-    /// docxy's prompts only append and pop, so the caret is their end; the
-    /// Backstage Save As name is backstagecore's, with a real caret.
+    /// Every prompt edits at a caret (#1372); the Backstage Save As name is
+    /// backstagecore's.
     fn input_field(&self, id: &str) -> ctlcore::field::Field {
         use ctlcore::field::Field;
         let field = match id {
             "docxy-find" => self.find.as_ref().map(|f| {
-                Field::append_only(
-                    &f.query,
+                Field::with_caret(
+                    f.query.as_str(),
                     !(f.replacement.is_some() && f.editing_replacement),
+                    f.query.caret(),
                 )
             }),
             "docxy-replace" => self.find.as_ref().and_then(|f| {
                 f.replacement
                     .as_ref()
-                    .map(|r| Field::append_only(r, f.editing_replacement))
+                    .map(|r| Field::with_caret(r.as_str(), f.editing_replacement, r.caret()))
             }),
             "docxy-comment" => self
                 .comment_input
                 .as_ref()
-                .map(|c| Field::append_only(c, true)),
+                .map(|c| Field::with_caret(c.as_str(), true, c.caret())),
             "docxy-compare-original" | "docxy-compare-revised" => {
                 self.compare_dialog.as_ref().map(|d| {
                     let i = usize::from(id == "docxy-compare-revised");
                     let value = if i == 0 { &d.original } else { &d.revised };
-                    Field::append_only(value, d.field == i)
+                    Field::with_caret(value.as_str(), d.field == i, value.caret())
                 })
             }
             "docxy-vim-command" => self
                 .vim
                 .as_ref()
                 .and_then(|v| v.cmdline.as_ref())
-                .map(|c| Field::append_only(c, true)),
+                .map(|c| Field::with_caret(c.as_str(), true, c.caret())),
             "docxy-save-as" => {
                 return self
                     .backstage
@@ -7146,7 +7193,10 @@ impl App {
             on_off(!self.borderless),
         );
         let status_text = if let Some(draft) = &self.comment_input {
-            format!(" New comment: {draft}▏   ( Enter = add · Esc = cancel )")
+            format!(
+                " New comment: {}   ( Enter = add · Esc = cancel )",
+                draft.with_mark("▏")
+            )
         } else if let Some(url) = &self.pending_link {
             format!(" Open this link?  {url}   ( y = open in browser · any other key = cancel )")
         } else if let Some(f) = &self.find {
@@ -7160,24 +7210,19 @@ impl App {
             };
             match &f.replacement {
                 None => format!(
-                    " Find: {}▏  ({cur})  ·  ↵/↓ next · ↑ prev · Tab→replace · Esc done",
-                    f.query
+                    " Find: {}  ({cur})  ·  ↵/↓ next · ↑ prev · Tab→replace · Esc done",
+                    f.query.with_mark("▏")
                 ),
-                Some(repl) => {
-                    let (qc, rc) = if f.editing_replacement {
-                        ("", "▏")
-                    } else {
-                        ("▏", "")
-                    };
+                Some(_) => {
+                    let (q, repl) = replace_drawn(f);
                     format!(
-                        " Replace: {}{qc} → {}{rc}  ({cur})  ·  ↵ replace · Ctrl-A all · Tab field · Esc done",
-                        f.query, repl
+                        " Replace: {q} → {repl}  ({cur})  ·  ↵ replace · Ctrl-A all · Tab field · Esc done",
                     )
                 }
             }
         } else if let Some(v) = &self.vim {
             if let Some(cmd) = &v.cmdline {
-                format!(":{cmd}▏")
+                format!(":{}", cmd.with_mark("▏"))
             } else {
                 let m = match v.mode {
                     VimMode::Normal => "-- NORMAL --",
@@ -7219,23 +7264,30 @@ impl App {
         // Where each prompt's text starts on the status line, for a click on
         // it (`field-read`'s `at`).
         let col = |prefix: &str| status.x + RLine::from(prefix).width() as u16;
-        let mut at = |id: &'static str, prefix: &str| {
-            self.drawn_fields.push((id, (col(prefix), status.y)));
+        // `lead` is 1 when the caret mark sits before a non-empty field's
+        // first char, so `at` names that char, not the mark.
+        let mut at = |id: &'static str, prefix: &str, lead: u16| {
+            self.drawn_fields.push((id, (col(prefix) + lead, status.y)));
         };
-        if self.comment_input.is_some() {
-            at("docxy-comment", " New comment: ");
+        if let Some(c) = &self.comment_input {
+            at("docxy-comment", " New comment: ", c.mark_lead());
         } else if self.pending_link.is_some() {
         } else if let Some(f) = &self.find {
             match &f.replacement {
-                None => at("docxy-find", " Find: "),
-                Some(_) => {
-                    at("docxy-find", " Replace: ");
-                    let qc = if f.editing_replacement { "" } else { "▏" };
-                    at("docxy-replace", &format!(" Replace: {}{qc} → ", f.query));
+                None => at("docxy-find", " Find: ", f.query.mark_lead()),
+                Some(repl) => {
+                    let (q_lead, r_lead) = if f.editing_replacement {
+                        (0, repl.mark_lead())
+                    } else {
+                        (f.query.mark_lead(), 0)
+                    };
+                    at("docxy-find", " Replace: ", q_lead);
+                    let (q, _) = replace_drawn(f);
+                    at("docxy-replace", &format!(" Replace: {q} → "), r_lead);
                 }
             }
-        } else if self.vim.as_ref().is_some_and(|v| v.cmdline.is_some()) {
-            at("docxy-vim-command", ":");
+        } else if let Some(c) = self.vim.as_ref().and_then(|v| v.cmdline.as_ref()) {
+            at("docxy-vim-command", ":", c.mark_lead());
         }
         let status_widget =
             Paragraph::new(status_text).style(Style::default().add_modifier(Modifier::REVERSED));
@@ -7587,18 +7639,18 @@ impl App {
         {
             let r = line(i as u16);
             let on = i == d.field;
-            // Show the end of a long path (the file name), plus a caret.
+            // Show the end of a long path (the file name), or the stretch
+            // the caret is in, plus the caret.
             let room = (r.width as usize).saturating_sub(12);
-            let chars: Vec<char> = value.chars().collect();
-            let shown: String = chars[chars.len().saturating_sub(room)..].iter().collect();
-            let caret = if on { "▏" } else { "" };
-            let text = format!(" {:<10}{shown}{caret}", format!("{label}:"));
+            let (shown, lead) = compare_window(value, room, on);
+            let text = format!(" {:<10}{shown}", format!("{label}:"));
             let style = if on { on_style } else { Style::default() };
             f.render_widget(Paragraph::new(text).style(style), r);
             self.cd_rows.push(r);
-            // The path starts past the leading space and the 10-wide label.
+            // The path starts past the leading space and the 10-wide label
+            // (and the caret mark, when it sits before the first shown char).
             let id = ["docxy-compare-original", "docxy-compare-revised"][i];
-            self.drawn_fields.push((id, (r.x + 11, r.y)));
+            self.drawn_fields.push((id, (r.x + 11 + lead, r.y)));
         }
         f.render_widget(
             Paragraph::new("Tab field · type a .docx path · Enter compare")
@@ -10163,12 +10215,15 @@ mod tests {
         assert!(!app.dirty);
         assert!(app.insert_field.is_some());
 
-        app.comment_input = Some("note".to_string());
+        app.comment_input = Some("note".into());
         app.dirty = false;
         app.status = None;
         app.comment_input_key(key(KeyCode::Enter));
         assert!(!app.dirty);
-        assert_eq!(app.comment_input.as_deref(), Some("note"));
+        assert_eq!(
+            app.comment_input.as_ref().map(LineEdit::as_str),
+            Some("note")
+        );
     }
 
     #[test]
@@ -11400,8 +11455,8 @@ mod tests {
         let (dir, original, revised) = compare_fixture("hf-fail-dialog");
         let mut app = app_in_failing_header_edit();
         app.compare_dialog = Some(CompareDialog {
-            original,
-            revised,
+            original: original.into(),
+            revised: revised.into(),
             field: 1,
         });
         app.submit_compare_dialog();
