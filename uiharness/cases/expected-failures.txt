@@ -29,9 +29,6 @@ backstage-inputs-typing.uit | rename sheet-tab-rename: select-all replaces | #13
 backstage-inputs-typing.uit | rename sheet-tab-rename: copies | #1365
 backstage-inputs-typing.uit | rename sheet-tab-rename: pastes | #1365
 
-# xlsxy's vim `:` command line is append-only: no caret (#1204).
-terminal-xlsxy-vim-inputs-typing.uit | xlsxy xlsxy-vim-command: edits | #1373
-
 # yppxy's prompt (every kind) is append-only: no caret (#1204).
 terminal-yppxy-inputs-typing.uit | yppxy yppxy-prompt: edits | #1374
 
