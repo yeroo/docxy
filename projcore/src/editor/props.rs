@@ -1,8 +1,14 @@
 //! Single-field task properties the Task Information dialog sets (#1368):
-//! % Complete, Priority, Deadline, Task type and Effort driven. Each is one
+//! % Complete, Priority, Deadline, Task type and Effort driven, and the
+//! Advanced page's Calendar, Scheduling ignores resource calendars, WBS
+//! code, Earned value method and Mark task as milestone (#1550). Each is one
 //! undo step, validates before it snapshots, and changes nothing (`Ok(false)`)
 //! when the value is already the task's.
 use super::*;
+
+/// Project's earned value methods (MSPDI `EarnedValueMethod`).
+pub const EV_PERCENT_COMPLETE: i32 = 0;
+pub const EV_PHYSICAL_PERCENT_COMPLETE: i32 = 1;
 
 /// Levelling priority bounds, as Project's Priority field.
 pub const PRIORITY_MAX: i32 = 1000;
@@ -102,6 +108,94 @@ impl Editor {
         }
         self.snapshot();
         self.proj.tasks[i].effort_driven = Some(on);
+        self.changed();
+        Ok(true)
+    }
+
+    /// Mark the task a milestone (a zero duration) or not (a day, as
+    /// Project's Mark task as milestone unticked restores a duration).
+    pub fn set_milestone(&mut self, uid: i32, on: bool) -> Result<bool, String> {
+        let i = self.property_row(uid)?;
+        let task = &self.proj.tasks[i];
+        if task.summary {
+            return Err("A summary task cannot be a milestone".into());
+        }
+        if task.is_milestone() == on {
+            return Ok(false);
+        }
+        self.toggle_milestone(uid)?;
+        Ok(true)
+    }
+
+    /// Set the task's calendar: a base calendar's uid, or `None` for the
+    /// project's. A derived or unknown calendar is refused.
+    pub fn set_task_calendar(&mut self, uid: i32, calendar: Option<i32>) -> Result<bool, String> {
+        let i = self.property_row(uid)?;
+        if let Some(cal) = calendar {
+            match self.proj.calendar(cal) {
+                None => return Err(format!("no calendar with uid {cal}")),
+                Some(c) if c.base_calendar_uid.is_some() => {
+                    return Err(format!("'{}' is not a base calendar", c.name));
+                }
+                Some(_) => {}
+            }
+        }
+        if self.proj.tasks[i].calendar_uid == calendar {
+            return Ok(false);
+        }
+        self.snapshot();
+        self.proj.tasks[i].calendar_uid = calendar;
+        self.changed();
+        Ok(true)
+    }
+
+    /// Set whether the task's own calendar overrides its resources'
+    /// calendars (Scheduling ignores resource calendars); it needs a task
+    /// calendar.
+    pub fn set_ignore_resource_calendar(&mut self, uid: i32, on: bool) -> Result<bool, String> {
+        let i = self.property_row(uid)?;
+        if on && self.proj.tasks[i].calendar_uid.is_none() {
+            return Err("Scheduling ignores resource calendars needs a task calendar".into());
+        }
+        if self.proj.tasks[i].ignore_resource_calendar.unwrap_or(false) == on {
+            return Ok(false);
+        }
+        self.snapshot();
+        self.proj.tasks[i].ignore_resource_calendar = Some(on);
+        self.changed();
+        Ok(true)
+    }
+
+    /// Set the task's WBS code (its text; an empty code clears it).
+    pub fn set_wbs(&mut self, uid: i32, wbs: &str) -> Result<bool, String> {
+        let i = self.property_row(uid)?;
+        let wbs = wbs.trim();
+        let next = (!wbs.is_empty()).then(|| wbs.to_string());
+        if self.proj.tasks[i].wbs == next {
+            return Ok(false);
+        }
+        self.snapshot();
+        self.proj.tasks[i].wbs = next;
+        self.changed();
+        Ok(true)
+    }
+
+    /// Set the task's earned value method ([`EV_PERCENT_COMPLETE`] or
+    /// [`EV_PHYSICAL_PERCENT_COMPLETE`]).
+    pub fn set_earned_value_method(&mut self, uid: i32, method: i32) -> Result<bool, String> {
+        let i = self.property_row(uid)?;
+        if !matches!(method, EV_PERCENT_COMPLETE | EV_PHYSICAL_PERCENT_COMPLETE) {
+            return Err("Earned value method is % Complete (0) or Physical % Complete (1)".into());
+        }
+        if self.proj.tasks[i]
+            .earned_value_method
+            .unwrap_or(EV_PERCENT_COMPLETE)
+            == method
+        {
+            return Ok(false);
+        }
+        self.snapshot();
+        self.proj.tasks[i].earned_value_method = Some(method);
         self.changed();
         Ok(true)
     }

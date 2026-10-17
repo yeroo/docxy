@@ -163,3 +163,58 @@ fn a_blank_row_takes_no_properties() {
     })
     .unwrap();
 }
+
+/// The Advanced page's other fields (#1550): milestone, calendar, ignore
+/// resource calendar, WBS and earned value method, each one undo step,
+/// each a no-op on its own value, each refusing what Project refuses.
+#[test]
+fn advanced_fields_set_once_and_refuse_bad_values() {
+    // A new plan: it has the Standard calendar the task calendar can name.
+    let fresh = || {
+        let mut ed = Editor::new(crate::editor::untitled_project());
+        ed.add_task(None, "A", 480, false).unwrap();
+        ed
+    };
+    let mut ed = fresh();
+    let uid = ed.project().tasks[0].uid;
+    let depth0 = ed.undo_depth();
+    assert!(ed.set_milestone(uid, true).unwrap());
+    assert!(ed.project().task(uid).unwrap().is_milestone());
+    assert!(!ed.set_milestone(uid, true).unwrap());
+    assert!(ed.set_milestone(uid, false).unwrap());
+    assert!(!ed.project().task(uid).unwrap().is_milestone());
+
+    let base = ed.project().calendars.first().map(|c| c.uid).unwrap();
+    assert!(ed.set_task_calendar(uid, Some(base)).unwrap());
+    assert_eq!(ed.project().task(uid).unwrap().calendar_uid, Some(base));
+    assert!(!ed.set_task_calendar(uid, Some(base)).unwrap());
+    assert!(ed.set_task_calendar(uid, Some(999)).is_err());
+    assert!(ed.set_ignore_resource_calendar(uid, true).unwrap());
+    assert_eq!(
+        ed.project().task(uid).unwrap().ignore_resource_calendar,
+        Some(true)
+    );
+    assert!(ed.set_task_calendar(uid, None).unwrap());
+    // Without a task calendar the flag cannot be turned on.
+    ed.set_ignore_resource_calendar(uid, false).unwrap();
+    assert!(ed.set_ignore_resource_calendar(uid, true).is_err());
+
+    assert!(ed.set_wbs(uid, " 1.2 ").unwrap());
+    assert_eq!(ed.project().task(uid).unwrap().wbs.as_deref(), Some("1.2"));
+    assert!(!ed.set_wbs(uid, "1.2").unwrap());
+    assert!(ed.set_wbs(uid, "").unwrap());
+    assert_eq!(ed.project().task(uid).unwrap().wbs, None);
+
+    assert!(
+        ed.set_earned_value_method(uid, EV_PHYSICAL_PERCENT_COMPLETE)
+            .unwrap()
+    );
+    assert!(!ed.set_earned_value_method(uid, 1).unwrap());
+    assert!(ed.set_earned_value_method(uid, 2).is_err());
+    // Every change above was one step; undoing them all restores the plan.
+    let steps = ed.undo_depth() - depth0;
+    for _ in 0..steps {
+        assert!(ed.undo());
+    }
+    assert_eq!(ed.project().task(uid), fresh().project().task(uid));
+}

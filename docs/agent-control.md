@@ -61,6 +61,18 @@ to switch a task between Manually and Auto Scheduled: a task that becomes manual
 is pinned at its shown start and finish, one that becomes auto is placed by its
 links and constraints again. It may be combined with `name`, `duration` and
 `level` in one undo step; every task in `task.list`/`task.get` reports `manual`.
+`task.set` also takes the Task Information dialog's fields (#1550):
+`percent_complete` (0 to 100), `priority` (0 to 1000), `deadline` (a date or
+`null`), `constraint` (`{"type": "FNLT", "date": "2026-03-04"}`, the type by its
+abbreviation, the date `null` for ASAP and ALAP), `task_type`
+(`fixed-units|fixed-duration|fixed-work`), `effort_driven`, `notes` (`
+` is a
+new line), `milestone`, `calendar` (a base calendar's name or UID, `null` or
+`"none"` to clear), `ignore_resource_calendar`, `wbs` and `earned_value_method`
+(`percent-complete|physical-percent-complete`). A date is `YYYY-MM-DD` (a
+deadline, FNLT or MFO date ends the working day, the other types start it) or
+`YYYY-MM-DDTHH:MM`. Every field given applies with the patch as one undo step,
+and a refused field applies nothing.
 
 Every task in `task.list`, `task.get` and `find` also reports its row `id` and
 its `outline_number` (`1.2`; `0` for the project summary row, `null` for a

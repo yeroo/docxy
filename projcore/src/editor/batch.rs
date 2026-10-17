@@ -22,12 +22,17 @@ impl Editor {
     /// records nothing and keeps redo. On `Err` every piece of editor state
     /// (the plan, history, redo, dirty flag, selection, collapsed summaries
     /// and the derived schedule) is restored exactly, whatever `edit` had
-    /// already applied.
+    /// already applied. A batch opened inside another (a control verb that
+    /// batches its own setters, run as one of a plugin command's ops) is
+    /// part of the outer step: it runs `edit` and leaves the rollback to
+    /// the batch that holds it.
     pub fn batch<T>(
         &mut self,
         edit: impl FnOnce(&mut Editor) -> Result<T, String>,
     ) -> Result<T, String> {
-        debug_assert!(!self.batching, "batches do not nest");
+        if self.batching {
+            return edit(self);
+        }
         let saved = Saved {
             proj: self.proj.clone(),
             sel: self.sel,

@@ -18,7 +18,7 @@
 //! | `task.list` | `{fields?}` | `{count, tasks:[{uid, id, outline_number, name, level, manual, duration, start, finish, critical, …}]}` |
 //! | `task.get` | `{uid, fields?}` | one task |
 //! | `task.fields` | — | `{count, fields:[name…]}`: the field names `fields` can read |
-//! | `task.set` | `{uid, name?, duration?, level?, manual?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled) |
+//! | `task.set` | `{uid, name?, duration?, level?, manual?, percent_complete?, priority?, deadline?, constraint?, task_type?, effort_driven?, notes?, milestone?, calendar?, ignore_resource_calendar?, wbs?, earned_value_method?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled). The Task Information fields (#1550): `percent_complete` 0–100, `priority` 0–1000, `deadline` a date (`YYYY-MM-DD`, the day's last working time, or `YYYY-MM-DDTHH:MM`) or `null`, `constraint` `{type, date?}` with the type `ASAP`/`ALAP`/`MSO`/`MFO`/`SNET`/`SNLT`/`FNET`/`FNLT`, `task_type` `fixed-units`/`fixed-duration`/`fixed-work`, `effort_driven` and `milestone` booleans, `notes` text (`\n` line breaks), `calendar` a base calendar's name or uid or `null`, `ignore_resource_calendar` a boolean, `wbs` text, `earned_value_method` `percent-complete`/`physical-percent-complete`. Every argument is checked and all apply in one undo step, or none does |
 //! | `task.add` | `{after?, name?, duration?}` | the new task (without `duration`, 1 day, estimated when the plan's `NewTasksEstimated` is; inserted `after` a task that a finish-to-start link joins to the next, it is linked into that chain when the plan's `Autolink` is on, as it is by default) |
 //! | `task.del` | `{uid}` | `{deleted, removed:[uid…]}` (a summary takes its subtree) |
 //! | `link.add` | `{uid, pred, type?, lag?}` | the updated task (`lag` uses Predecessors cell spellings such as `4h`, `2ed`, `50%`; other duration spellings such as `1 month` are read as working-days lags) |
@@ -82,12 +82,15 @@
 use ctlcore::json::Json;
 use projcore::datetime::DateTime;
 use projcore::editor::{
-    AssignmentField, AssignmentPatch, DURATION_HINT, Editor, Field, FieldReader, FieldValue,
-    ResourceRef, TaskPatch, assignment_dates, assignment_field_names, duration_format_code,
-    field_names, parse_duration, parse_lag, parse_task_duration_unit, rate_table_letter,
-    read_assignment_field, work_contour_name,
+    AssignmentField, AssignmentPatch, DURATION_HINT, EV_PERCENT_COMPLETE,
+    EV_PHYSICAL_PERCENT_COMPLETE, Editor, Field, FieldReader, FieldValue, ResourceRef, TaskPatch,
+    assignment_dates, assignment_field_names, day_end, day_start, duration_format_code,
+    field_names, parse_cell_date, parse_duration, parse_lag, parse_task_duration_unit,
+    rate_table_letter, read_assignment_field, work_contour_name,
 };
-use projcore::model::{Assignment, LagFormat, LagUnit, LinkType, Predecessor, Rate, Task};
+use projcore::model::{
+    Assignment, ConstraintType, LagFormat, LagUnit, LinkType, Predecessor, Rate, Task, TaskType,
+};
 
 /// Successful calls to these verbs signal agent editing activity.
 pub const MUTATING: &[&str] = &[
@@ -434,9 +437,241 @@ fn task_reply(ed: &Editor, uid: i32, asked: Option<&[(String, Field)]>) -> Resul
     ))
 }
 
+/// The Task Information fields `task.set` takes beside the patch (#1550),
+/// parsed before anything is applied.
+#[derive(Default)]
+struct TaskInfoArgs {
+    percent_complete: Option<i32>,
+    priority: Option<i32>,
+    /// `Some(None)` clears the deadline.
+    deadline: Option<Option<DateTime>>,
+    constraint: Option<(ConstraintType, Option<DateTime>)>,
+    task_type: Option<TaskType>,
+    effort_driven: Option<bool>,
+    notes: Option<String>,
+    milestone: Option<bool>,
+    /// `Some(None)` is the project's calendar.
+    calendar: Option<Option<i32>>,
+    ignore_resource_calendar: Option<bool>,
+    wbs: Option<String>,
+    earned_value_method: Option<i32>,
+}
+
+impl TaskInfoArgs {
+    fn any(&self) -> bool {
+        self.percent_complete.is_some()
+            || self.priority.is_some()
+            || self.deadline.is_some()
+            || self.constraint.is_some()
+            || self.task_type.is_some()
+            || self.effort_driven.is_some()
+            || self.notes.is_some()
+            || self.milestone.is_some()
+            || self.calendar.is_some()
+            || self.ignore_resource_calendar.is_some()
+            || self.wbs.is_some()
+            || self.earned_value_method.is_some()
+    }
+
+    /// Read the fields from `args`, for task `uid` of `ed`'s plan (dates
+    /// are resolved in the task's calendar).
+    fn parse(ed: &Editor, uid: i32, args: &Json) -> Result<TaskInfoArgs, String> {
+        let task = ed
+            .project()
+            .task(uid)
+            .ok_or_else(|| format!("no task with uid {uid}"))?;
+        let proj = ed.project();
+        let whole = |key: &str| -> Result<Option<i32>, String> {
+            args.get(key)
+                .map(|v| {
+                    v.as_i64()
+                        .and_then(|n| i32::try_from(n).ok())
+                        .ok_or_else(|| format!("'{key}' must be a whole number"))
+                })
+                .transpose()
+        };
+        let flag = |key: &str| -> Result<Option<bool>, String> {
+            args.get(key)
+                .map(|v| {
+                    v.as_bool()
+                        .ok_or_else(|| format!("'{key}' must be true or false"))
+                })
+                .transpose()
+        };
+        let text = |key: &str| -> Result<Option<String>, String> {
+            args.get(key)
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| format!("'{key}' must be text"))
+                })
+                .transpose()
+        };
+        // A date: `YYYY-MM-DD` is the day's first working time, or its last
+        // when `ends_day`; `YYYY-MM-DDTHH:MM` is taken as typed.
+        let stamp = |key: &str, s: &str, ends_day: bool| -> Result<DateTime, String> {
+            let bad = || format!("'{key}' must be a date, YYYY-MM-DD or YYYY-MM-DDTHH:MM");
+            if s.contains('T') {
+                return DateTime::parse_mspdi(s).ok_or_else(bad);
+            }
+            let day = parse_cell_date(s).map_err(|_| bad())?;
+            Ok(if ends_day {
+                day_end(proj, task, day)
+            } else {
+                day_start(proj, task, day)
+            })
+        };
+        let deadline = match args.get("deadline") {
+            None => None,
+            Some(Json::Null) => Some(None),
+            Some(Json::Str(s)) if s.trim().is_empty() => Some(None),
+            Some(Json::Str(s)) => Some(Some(stamp("deadline", s.trim(), true)?)),
+            Some(_) => return Err("'deadline' must be a date or null".into()),
+        };
+        let constraint = match args.get("constraint") {
+            None => None,
+            Some(c) => {
+                let kind = c.get_str("type").ok_or("'constraint' needs a 'type'")?;
+                let kind = [
+                    ConstraintType::AsSoonAsPossible,
+                    ConstraintType::AsLateAsPossible,
+                    ConstraintType::MustStartOn,
+                    ConstraintType::MustFinishOn,
+                    ConstraintType::StartNoEarlierThan,
+                    ConstraintType::StartNoLaterThan,
+                    ConstraintType::FinishNoEarlierThan,
+                    ConstraintType::FinishNoLaterThan,
+                ]
+                .into_iter()
+                .find(|k| k.abbrev().eq_ignore_ascii_case(kind.trim()))
+                .ok_or_else(|| {
+                    format!(
+                        "'constraint.type' is one of ASAP, ALAP, MSO, MFO, SNET, SNLT, FNET, FNLT, not '{kind}'"
+                    )
+                })?;
+                let ends_day = matches!(
+                    kind,
+                    ConstraintType::FinishNoLaterThan | ConstraintType::MustFinishOn
+                );
+                let date = match c.get("date") {
+                    None | Some(Json::Null) => None,
+                    Some(Json::Str(s)) if s.trim().is_empty() => None,
+                    Some(Json::Str(s)) => Some(stamp("constraint.date", s.trim(), ends_day)?),
+                    Some(_) => return Err("'constraint.date' must be a date or null".into()),
+                };
+                Some((kind, date))
+            }
+        };
+        let task_type = match args.get_str("task_type") {
+            None => None,
+            Some(t) => Some(match t.trim().to_ascii_lowercase().as_str() {
+                "fixed-units" | "fixed units" => TaskType::FixedUnits,
+                "fixed-duration" | "fixed duration" => TaskType::FixedDuration,
+                "fixed-work" | "fixed work" => TaskType::FixedWork,
+                other => {
+                    return Err(format!(
+                        "'task_type' is fixed-units, fixed-duration or fixed-work, not '{other}'"
+                    ));
+                }
+            }),
+        };
+        let calendar = match args.get("calendar") {
+            None => None,
+            Some(Json::Null) => Some(None),
+            Some(Json::Str(s)) if s.trim().is_empty() || s.trim().eq_ignore_ascii_case("none") => {
+                Some(None)
+            }
+            Some(Json::Str(name)) => {
+                let cal = proj
+                    .calendars
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(name.trim()))
+                    .ok_or_else(|| format!("no calendar named '{name}'"))?;
+                Some(Some(cal.uid))
+            }
+            Some(Json::Num(n)) => Some(Some(
+                i32::try_from(*n as i64).map_err(|_| "'calendar' must be a calendar uid")?,
+            )),
+            Some(_) => return Err("'calendar' must be a calendar name, uid or null".into()),
+        };
+        let earned_value_method = match args.get_str("earned_value_method") {
+            None => None,
+            Some(m) => Some(match m.trim().to_ascii_lowercase().as_str() {
+                "percent-complete" | "% complete" | "0" => EV_PERCENT_COMPLETE,
+                "physical-percent-complete" | "physical % complete" | "1" => {
+                    EV_PHYSICAL_PERCENT_COMPLETE
+                }
+                other => {
+                    return Err(format!(
+                        "'earned_value_method' is percent-complete or physical-percent-complete, not '{other}'"
+                    ));
+                }
+            }),
+        };
+        Ok(TaskInfoArgs {
+            percent_complete: whole("percent_complete")?,
+            priority: whole("priority")?,
+            deadline,
+            constraint,
+            task_type,
+            effort_driven: flag("effort_driven")?,
+            notes: text("notes")?,
+            milestone: flag("milestone")?,
+            calendar,
+            ignore_resource_calendar: flag("ignore_resource_calendar")?,
+            wbs: text("wbs")?,
+            earned_value_method,
+        })
+    }
+
+    /// Apply the fields, in the dialog's order: type and effort driven
+    /// first (a resource added later rescales by them), the constraint after
+    /// the dates.
+    fn apply(&self, ed: &mut Editor, uid: i32) -> Result<(), String> {
+        if let Some(kind) = self.task_type {
+            ed.set_task_type(uid, kind)?;
+        }
+        if let Some(on) = self.effort_driven {
+            ed.set_effort_driven(uid, on)?;
+        }
+        if let Some(on) = self.milestone {
+            ed.set_milestone(uid, on)?;
+        }
+        if let Some(p) = self.percent_complete {
+            ed.set_percent_complete(uid, p)?;
+        }
+        if let Some(p) = self.priority {
+            ed.set_priority(uid, p)?;
+        }
+        if let Some((kind, date)) = self.constraint {
+            ed.set_constraint_typed(uid, kind, date)?;
+        }
+        if let Some(d) = self.deadline {
+            ed.set_deadline(uid, d)?;
+        }
+        if let Some(cal) = self.calendar {
+            ed.set_task_calendar(uid, cal)?;
+        }
+        if let Some(on) = self.ignore_resource_calendar {
+            ed.set_ignore_resource_calendar(uid, on)?;
+        }
+        if let Some(wbs) = &self.wbs {
+            ed.set_wbs(uid, wbs)?;
+        }
+        if let Some(m) = self.earned_value_method {
+            ed.set_earned_value_method(uid, m)?;
+        }
+        if let Some(notes) = &self.notes {
+            ed.set_notes(uid, &projcore::text::notes_from_line(notes))?;
+        }
+        Ok(())
+    }
+}
+
 fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
     let uid = uid_arg(args, "uid")?;
     let asked = fields_arg(args)?;
+    let info = TaskInfoArgs::parse(ed, uid, args)?;
     let duration = args
         .get_str("duration")
         .map(|d| {
@@ -456,17 +691,31 @@ fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         .get("manual")
         .map(|m| m.as_bool().ok_or("'manual' must be true or false"))
         .transpose()?;
-    ed.update_task(
-        uid,
-        TaskPatch {
-            name: args.get_str("name").map(str::to_string),
-            duration_min: duration.map(|d| d.0),
-            level,
-            manual,
-            estimated: duration.map(|d| d.1),
-            duration_format: duration.and_then(|d| duration_format_code(d.2)),
-        },
-    )?;
+    let patch = TaskPatch {
+        name: args.get_str("name").map(str::to_string),
+        duration_min: duration.map(|d| d.0),
+        level,
+        manual,
+        estimated: duration.map(|d| d.1),
+        duration_format: duration.and_then(|d| duration_format_code(d.2)),
+    };
+    let has_patch = patch.name.is_some()
+        || patch.duration_min.is_some()
+        || patch.level.is_some()
+        || patch.manual.is_some();
+    if !has_patch && !info.any() {
+        return Err(
+            "task.set needs at least one of 'name', 'duration', 'level', 'manual' or a Task Information field"
+                .into(),
+        );
+    }
+    // One undo step for the patch and every field; a refusal undoes all.
+    ed.batch(|ed| {
+        if has_patch {
+            ed.update_task(uid, patch)?;
+        }
+        info.apply(ed, uid)
+    })?;
     task_reply(ed, uid, asked.as_deref())
 }
 
@@ -1806,6 +2055,152 @@ mod tests {
             assert!(!ed.dirty());
         }
     }
+    /// The Task Information fields (#1550): every argument applies in the
+    /// one undo step, and a refused one undoes them all.
+    #[test]
+    fn task_set_takes_the_task_information_fields_as_one_step() {
+        let mut a = app();
+        let uid = add(&mut a, "Design", "3d");
+        let get =
+            |a: &Editor| task_get(a, &Json::obj(vec![("uid", Json::Num(uid as f64))])).unwrap();
+        let depth = a.undo_depth();
+        let calendar = a.project().calendars[0].name.clone();
+        let r = dispatch_editor(
+            &mut a,
+            "task.set",
+            &Json::obj(vec![
+                ("uid", Json::Num(uid as f64)),
+                ("percent_complete", Json::Num(40.0)),
+                ("priority", Json::Num(800.0)),
+                ("deadline", Json::Str("2026-03-27".into())),
+                (
+                    "constraint",
+                    Json::obj(vec![
+                        ("type", Json::Str("snet".into())),
+                        ("date", Json::Str("2026-03-10".into())),
+                    ]),
+                ),
+                ("task_type", Json::Str("fixed-work".into())),
+                ("effort_driven", Json::Bool(true)),
+                ("notes", Json::Str("check\nit".into())),
+                ("calendar", Json::Str(calendar.clone())),
+                ("ignore_resource_calendar", Json::Bool(true)),
+                ("wbs", Json::Str("1.2".into())),
+                (
+                    "earned_value_method",
+                    Json::Str("physical-percent-complete".into()),
+                ),
+            ]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(r.get_str("name"), Some("Design"));
+        assert_eq!(a.undo_depth(), depth + 1, "every field is one step");
+        let t = a.project().task(uid as i32).unwrap().clone();
+        assert_eq!(t.percent_complete, Some(40));
+        assert_eq!(t.priority, Some(800));
+        assert_eq!(
+            t.deadline.map(|d| d.parts().day),
+            Some(27),
+            "the deadline is the day's last working time"
+        );
+        assert_eq!(t.deadline.map(|d| d.parts().hour), Some(17));
+        assert_eq!(t.constraint, ConstraintType::StartNoEarlierThan);
+        assert_eq!(
+            t.constraint_date.map(|d| (d.parts().day, d.parts().hour)),
+            Some((10, 8))
+        );
+        assert_eq!(t.task_type, Some(TaskType::FixedWork));
+        assert_eq!(t.effort_driven, Some(true));
+        assert_eq!(
+            t.notes.as_deref(),
+            Some(
+                "check
+it"
+            )
+        );
+        assert_eq!(t.calendar_uid, Some(a.project().calendars[0].uid));
+        assert_eq!(t.ignore_resource_calendar, Some(true));
+        assert_eq!(t.wbs.as_deref(), Some("1.2"));
+        assert_eq!(t.earned_value_method, Some(EV_PHYSICAL_PERCENT_COMPLETE));
+        assert_eq!(get(&a).get_str("name"), Some("Design"));
+
+        // A milestone, a cleared deadline and calendar, a dateless constraint.
+        dispatch_editor(
+            &mut a,
+            "task.set",
+            &Json::obj(vec![
+                ("uid", Json::Num(uid as f64)),
+                ("milestone", Json::Bool(true)),
+                ("deadline", Json::Null),
+                ("ignore_resource_calendar", Json::Bool(false)),
+                ("calendar", Json::Null),
+                (
+                    "constraint",
+                    Json::obj(vec![("type", Json::Str("ASAP".into()))]),
+                ),
+            ]),
+        )
+        .unwrap()
+        .unwrap();
+        let t = a.project().task(uid as i32).unwrap().clone();
+        assert!(t.is_milestone() && t.deadline.is_none() && t.calendar_uid.is_none());
+        assert_eq!(t.constraint, ConstraintType::AsSoonAsPossible);
+
+        // A refused field undoes the whole call.
+        let before = a.project().clone();
+        let depth = a.undo_depth();
+        let err = dispatch_editor(
+            &mut a,
+            "task.set",
+            &Json::obj(vec![
+                ("uid", Json::Num(uid as f64)),
+                ("priority", Json::Num(5.0)),
+                ("percent_complete", Json::Num(500.0)),
+            ]),
+        )
+        .unwrap()
+        .unwrap_err();
+        assert!(err.contains("0 to 100"), "{err}");
+        assert_eq!(*a.project(), before);
+        assert_eq!(a.undo_depth(), depth);
+        // Bad spellings are refused before anything applies.
+        for (key, value) in [
+            ("task_type", Json::Str("fixed-cost".into())),
+            ("earned_value_method", Json::Str("guess".into())),
+            ("deadline", Json::Str("soon".into())),
+            ("calendar", Json::Str("Night".into())),
+            (
+                "constraint",
+                Json::obj(vec![("type", Json::Str("WHEN".into()))]),
+            ),
+            (
+                "constraint",
+                Json::obj(vec![("type", Json::Str("MSO".into()))]),
+            ),
+            ("priority", Json::Str("high".into())),
+        ] {
+            let err = dispatch_editor(
+                &mut a,
+                "task.set",
+                &Json::obj(vec![("uid", Json::Num(uid as f64)), (key, value)]),
+            )
+            .unwrap()
+            .unwrap_err();
+            assert!(!err.is_empty(), "{key}");
+            assert_eq!(*a.project(), before, "{key}");
+        }
+        // No argument at all is refused by name.
+        let err = dispatch_editor(
+            &mut a,
+            "task.set",
+            &Json::obj(vec![("uid", Json::Num(uid as f64))]),
+        )
+        .unwrap()
+        .unwrap_err();
+        assert!(err.contains("Task Information field"), "{err}");
+    }
+
     #[test]
     fn task_set_switches_the_mode_in_one_undo_step() {
         let mut a = app();

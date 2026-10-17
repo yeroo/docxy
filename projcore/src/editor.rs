@@ -47,7 +47,9 @@ mod moving;
 mod outline;
 mod props;
 use outline::subtree_end;
-pub use props::{PRIORITY_DEFAULT, PRIORITY_MAX};
+pub use props::{
+    EV_PERCENT_COMPLETE, EV_PHYSICAL_PERCENT_COMPLETE, PRIORITY_DEFAULT, PRIORITY_MAX,
+};
 #[cfg(test)]
 mod refresh_tests;
 
