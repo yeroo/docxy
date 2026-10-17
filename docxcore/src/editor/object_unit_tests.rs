@@ -836,3 +836,74 @@ fn a_cut_keeps_the_objects_of_a_removed_middle_paragraph_1433() {
         "{xml}"
     );
 }
+
+/// #1433: typing inside a document property control is seen at the caret,
+/// and `set_bound_property` shows the new text in every control bound to the
+/// property without an undo step of its own.
+#[test]
+fn typing_in_a_property_control_updates_the_others_1433() {
+    use crate::sdt::{BoundProp, core_property_control};
+    let control =
+        |value: &str, id| core_property_control(BoundProp::Title, value, id, &RunProps::default());
+    let body = vec![
+        Block::Paragraph(Paragraph {
+            props: ParProps::default(),
+            content: [
+                vec![Inline::Run(Run {
+                    text: "T: ".into(),
+                    props: RunProps::default(),
+                })],
+                control("Old", 1),
+            ]
+            .concat(),
+        }),
+        Block::Paragraph(Paragraph {
+            props: ParProps::default(),
+            content: [
+                control("Old", 2),
+                vec![Inline::Run(Run {
+                    text: " end".into(),
+                    props: RunProps::default(),
+                })],
+            ]
+            .concat(),
+        }),
+    ];
+    let mut ed = Editor::new(Document { body });
+    // The caret at the end of "Old" in the first control: seen, unchanged.
+    ed.set_caret(Caret::at(vec![0], 6));
+    assert_eq!(
+        ed.bound_property_at_caret(),
+        Some((BoundProp::Title, "Old".into()))
+    );
+    ed.insert_char('!');
+    assert_eq!(
+        ed.bound_property_at_caret(),
+        Some((BoundProp::Title, "Old!".into()))
+    );
+    // The other control, in another paragraph, takes the text.
+    assert!(ed.set_bound_property(BoundProp::Title, "Old!"));
+    let text = |ed: &Editor, i: usize| para(ed, i).plain_text();
+    assert_eq!(text(&ed, 1), "Old! end");
+    assert!(!ed.set_bound_property(BoundProp::Title, "Old!"));
+    // Undoing the typing puts both back: the other control's change had no
+    // step of its own. The caret's control then reads as the old value, which
+    // is what the host writes back to the property.
+    assert!(ed.undo());
+    assert_eq!(text(&ed, 0), "T: Old");
+    assert_eq!(text(&ed, 1), "Old end");
+    assert_eq!(
+        ed.bound_property_at_caret().map(|(_, t)| t),
+        Some("Old".into())
+    );
+    // An emptied property shows the placeholder, flagged, and a value
+    // clears the flag again.
+    ed.set_bound_property(BoundProp::Title, "");
+    assert_eq!(text(&ed, 1), "[Title] end");
+    assert!(saved(&ed).matches("<w:showingPlcHdr/>").count() >= 1);
+    ed.set_bound_property(BoundProp::Title, "Back");
+    assert_eq!(text(&ed, 1), "Back end");
+    assert!(!saved(&ed).contains("<w:showingPlcHdr/>"));
+    // A control of another property is left alone.
+    assert!(!ed.set_bound_property(BoundProp::Author, "Ann"));
+}

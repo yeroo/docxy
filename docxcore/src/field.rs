@@ -618,6 +618,9 @@ pub struct DocProps {
     /// controls show (#768).
     pub category: String,
     pub content_status: String,
+    /// `Company` and `Manager` of `docProps/app.xml` ([`parse_app_props`]).
+    pub company: String,
+    pub manager: String,
     pub created: Option<DateTime>,
     pub modified: Option<DateTime>,
 }
@@ -851,8 +854,20 @@ pub fn parse_core_props(xml: &str) -> DocProps {
         revision: core_element(xml, "cp:revision"),
         category: core_element(xml, "cp:category"),
         content_status: core_element(xml, "cp:contentStatus"),
+        company: String::new(),
+        manager: String::new(),
         created: parse_iso(&core_element(xml, "dcterms:created")),
         modified: parse_iso(&core_element(xml, "dcterms:modified")),
+    }
+}
+
+/// `core` (`docProps/core.xml`) read with `docProps/app.xml`'s Company and
+/// Manager (#1433).
+pub fn parse_app_props(core: &str, app: &str) -> DocProps {
+    DocProps {
+        company: core_element(app, "Company"),
+        manager: core_element(app, "Manager"),
+        ..parse_core_props(core)
     }
 }
 

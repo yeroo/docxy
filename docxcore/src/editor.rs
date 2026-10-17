@@ -1840,6 +1840,48 @@ impl Editor {
         out
     }
 
+    /// The document property control the caret is in (or at the end of) and
+    /// the text it holds (#1433): what a host compares with the property to
+    /// see that typing changed it.
+    pub fn bound_property_at_caret(&self) -> Option<(crate::sdt::BoundProp, String)> {
+        let para = resolve_para(&self.doc.body, &self.caret.path)?;
+        crate::sdt::scan_paragraph(&para.content)
+            .into_iter()
+            .find(|c| c.start <= self.caret.offset && self.caret.offset <= c.end)
+            .map(|c| (c.prop, c.text))
+    }
+
+    /// Show `text` in every document property control bound to `prop`
+    /// (#1433), as one change with whatever edit set it: no undo step of its
+    /// own, so undoing that edit puts all of them back. The caret and anchor
+    /// follow the text they stood after. True when a control changed.
+    pub fn set_bound_property(&mut self, prop: crate::sdt::BoundProp, text: &str) -> bool {
+        let mut changed = false;
+        for path in all_paragraph_paths(&self.doc.body) {
+            let Some(p) = para_mut(&mut self.doc.body, &path) else {
+                continue;
+            };
+            let controls = crate::sdt::scan_paragraph(&p.content);
+            for c in controls.iter().rev().filter(|c| c.prop == prop) {
+                let before: usize = p.content.iter().map(inline_len).sum();
+                if !crate::sdt::set_control_text(&mut p.content, c, text) {
+                    continue;
+                }
+                changed = true;
+                let after: usize = p.content.iter().map(inline_len).sum();
+                for caret in std::iter::once(&mut self.caret).chain(self.anchor.as_mut()) {
+                    if caret.path == path && caret.offset >= c.end {
+                        caret.offset = (caret.offset + after).saturating_sub(before);
+                    }
+                }
+            }
+        }
+        if changed {
+            self.clamp();
+        }
+        changed
+    }
+
     /// Delete the current selection. Handles a single paragraph and a range of
     /// sibling paragraphs (merging the ends). A selection spanning different
     /// containers (e.g. body into a table cell) just collapses to the start.
@@ -5709,7 +5751,7 @@ mod tests {
         let mut ed = selected(vec![run("T: ", RunProps::default())], 3, 3);
         ed.anchor = None;
         let control = crate::sdt::core_property_control(
-            crate::sdt::CoreProp::Title,
+            crate::sdt::BoundProp::Title,
             "Report",
             1,
             &RunProps::default(),
@@ -5743,7 +5785,7 @@ mod tests {
         // each redo brings back its own state's place.
         let control = || {
             crate::sdt::core_property_control(
-                crate::sdt::CoreProp::Title,
+                crate::sdt::BoundProp::Title,
                 "R",
                 1,
                 &RunProps::default(),

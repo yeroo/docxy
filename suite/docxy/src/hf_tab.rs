@@ -27,7 +27,7 @@ use crate::hf::PageSlot;
 use crate::page_flow;
 use crate::page_setup::{ok_cancel, text_of, twips_of};
 use ctlcore::json::Json;
-use docxcore::sdt::CoreProp;
+use docxcore::sdt::BoundProp;
 use docxcore::sect::{TWIPS_PER_INCH, hf_reference, set_hf_reference};
 
 pub(crate) use docxcore::hf::rewrite_part;
@@ -71,7 +71,7 @@ pub(crate) enum HfAct {
     FileName(bool),
     /// A document property control: Document Info › Author and Document
     /// Title, and Document Property › in both menus.
-    Property(CoreProp),
+    Property(BoundProp),
     /// Pictures...: a picture from a file.
     Pictures,
     /// Online Pictures...: its dialog, which offers a file instead.
@@ -124,7 +124,7 @@ const MENU_IDS: [(HfMenu, &str); 7] = [
     (HfMenu::QuickParts, "hf-quickparts"),
 ];
 
-/// Document Property ›'s items' ids in each menu, in [`CoreProp::ALL`]'s
+/// Document Property ›'s items' ids in each menu, in [`BoundProp::ALL`]'s
 /// order, and the labels the ribbon's flat item list gives them.
 const INFO_PROP_IDS: [&str; 7] = [
     "hf-info-prop-author",
@@ -278,7 +278,7 @@ fn doc_info_head() -> [rs::Cmd<Act>; 4] {
             "hf-info-author",
             "",
             "Author",
-            hf(HfAct::Property(CoreProp::Author)),
+            hf(HfAct::Property(BoundProp::Author)),
         ),
         rs::cmd(
             "hf-info-filename",
@@ -296,14 +296,14 @@ fn doc_info_head() -> [rs::Cmd<Act>; 4] {
             "hf-info-title",
             "",
             "Document Title",
-            hf(HfAct::Property(CoreProp::Title)),
+            hf(HfAct::Property(BoundProp::Title)),
         ),
     ]
 }
 
 /// Document Property ›'s commands with `ids`, under `labels`.
 fn property_cmds(ids: &[&'static str; 7], labels: &[&'static str; 7]) -> Vec<rs::Cmd<Act>> {
-    CoreProp::ALL
+    BoundProp::ALL
         .iter()
         .zip(ids.iter().zip(labels))
         .map(|(p, (id, label))| rs::cmd(id, "", label, hf(HfAct::Property(*p))))
@@ -619,7 +619,7 @@ pub(crate) fn menu_items(tab: Option<&DocTab>, menu: HfMenu) -> Vec<menu::MenuIt
 fn property_menu(id: &str, ids: &[&str; 7]) -> menu::MenuItem {
     let mut e = menu::Entry::unavailable(id, "Document Property");
     e.enabled = true;
-    e.submenu = CoreProp::ALL
+    e.submenu = BoundProp::ALL
         .iter()
         .zip(ids)
         .map(|(p, id)| {

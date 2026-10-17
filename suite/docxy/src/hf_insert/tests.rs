@@ -283,11 +283,11 @@ fn with_core(name: &str, author: &str, title: &str) -> DocTab {
 fn a_document_property_control_goes_into_the_header_bound() {
     let mut t = with_core("property", "Ann", "Quarterly Report");
     open_header(&mut t);
-    let control = property_control(&t, CoreProp::Title);
+    let control = property_control(&t, BoundProp::Title);
     hf_ed(&mut t).paste(&Clip {
         paras: vec![control],
     });
-    let control = property_control(&t, CoreProp::Status);
+    let control = property_control(&t, BoundProp::Status);
     hf_ed(&mut t).paste(&Clip {
         paras: vec![control],
     });
@@ -319,13 +319,13 @@ fn a_property_controls_id_is_unique_in_the_document() {
     let mut t = header_tab("property-id");
     if let Surface::Doc(ed) = &mut t.surface {
         let body_control =
-            docxcore::sdt::core_property_control(CoreProp::Author, "", 41, &Default::default());
+            docxcore::sdt::core_property_control(BoundProp::Author, "", 41, &Default::default());
         ed.caret = docxcore::editor::Caret::at(vec![0], 0);
         ed.paste(&Clip {
             paras: vec![body_control],
         });
     }
-    let control = property_control(&t, CoreProp::Author);
+    let control = property_control(&t, BoundProp::Author);
     let Inline::Raw(open) = &control[0] else {
         panic!()
     };
@@ -554,7 +554,7 @@ fn typing_after_an_inserted_object_goes_after_it_in_the_header() {
     let mut t = with_core("type-after-control", "Ann", "Quarterly Report");
     open_header(&mut t);
     hf_ed(&mut t).caret.offset = 8;
-    let control = property_control(&t, CoreProp::Title);
+    let control = property_control(&t, BoundProp::Title);
     hf_ed(&mut t).insert_object(control);
     hf_ed(&mut t).insert_str(" - draft");
     let (_, xml) = saved_header(&mut t);

@@ -16,7 +16,7 @@ use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
 use crate::page_setup::{choice, chosen, ok_cancel, text_of};
 use docxcore::field::{DateTime, FieldContext};
-use docxcore::sdt::CoreProp;
+use docxcore::sdt::BoundProp;
 use hf_tab::HfAct;
 use std::path::Path;
 
@@ -249,7 +249,7 @@ fn story_xmls(tab: &DocTab) -> Vec<String> {
 /// story: bound to the property, showing its value from
 /// `docProps/core.xml` (or the placeholder), with an id no other control
 /// in the document has.
-pub(crate) fn property_control(tab: &DocTab, prop: CoreProp) -> Vec<Inline> {
+pub(crate) fn property_control(tab: &DocTab, prop: BoundProp) -> Vec<Inline> {
     let core = tab
         .pkg
         .as_ref()

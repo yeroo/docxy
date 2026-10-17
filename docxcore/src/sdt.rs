@@ -10,29 +10,42 @@ use crate::model::{Inline, Run, RunProps};
 /// The core-properties part every document property control is bound to.
 pub const CORE_STORE_ID: &str = "{6C3C8BC8-F283-45AE-878A-BAB7291924A1}";
 
+/// The extended-properties part (`docProps/app.xml`): Company, Manager.
+pub const EXTENDED_STORE_ID: &str = "{55AF091B-3C7A-41E3-B477-F2FDAA23CFDA}";
+
 /// The namespace prefixes Word's controls declare: `ns0` Dublin Core, `ns1`
 /// the core-properties namespace.
 const PREFIX_MAPPINGS: &str = "xmlns:ns0='http://purl.org/dc/elements/1.1/' \
      xmlns:ns1='http://schemas.openxmlformats.org/package/2006/metadata/core-properties'";
 
-/// A core property Word's Document Property menu lists, in its order.
+/// The extended-properties controls declare `ns0` as that part's namespace.
+const EXTENDED_PREFIX_MAPPINGS: &str =
+    "xmlns:ns0='http://schemas.openxmlformats.org/officeDocument/2006/extended-properties'";
+
+/// A document property Word's Document Property menu lists, in its order:
+/// the core properties (`docProps/core.xml`) and, since #1433, Company and
+/// Manager of the extended ones (`docProps/app.xml`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CoreProp {
+pub enum BoundProp {
     Author,
     Category,
     Comments,
+    Company,
     Keywords,
+    Manager,
     Status,
     Subject,
     Title,
 }
 
-impl CoreProp {
-    pub const ALL: [CoreProp; 7] = [
+impl BoundProp {
+    pub const ALL: [BoundProp; 9] = [
         Self::Author,
         Self::Category,
         Self::Comments,
+        Self::Company,
         Self::Keywords,
+        Self::Manager,
         Self::Status,
         Self::Subject,
         Self::Title,
@@ -44,40 +57,223 @@ impl CoreProp {
             Self::Author => "Author",
             Self::Category => "Category",
             Self::Comments => "Comments",
+            Self::Company => "Company",
             Self::Keywords => "Keywords",
+            Self::Manager => "Manager",
             Self::Status => "Status",
             Self::Subject => "Subject",
             Self::Title => "Title",
         }
     }
 
-    /// The bound element of `cp:coreProperties`, as the control's XPath
-    /// names it.
-    fn xpath_element(self) -> &'static str {
-        match self {
-            Self::Author => "ns0:creator",
-            Self::Category => "ns1:category",
-            Self::Comments => "ns0:description",
-            Self::Keywords => "ns1:keywords",
-            Self::Status => "ns1:contentStatus",
-            Self::Subject => "ns0:subject",
-            Self::Title => "ns0:title",
+    /// Whether the property lives in `docProps/app.xml`.
+    pub fn is_extended(self) -> bool {
+        matches!(self, Self::Company | Self::Manager)
+    }
+
+    /// The package part that holds the property.
+    pub fn part_name(self) -> &'static str {
+        if self.is_extended() {
+            "docProps/app.xml"
+        } else {
+            "docProps/core.xml"
         }
     }
 
-    /// The property's value in `props` (read from `docProps/core.xml`).
+    /// The `w:storeItemID` of the property's data store.
+    pub fn store_id(self) -> &'static str {
+        if self.is_extended() {
+            EXTENDED_STORE_ID
+        } else {
+            CORE_STORE_ID
+        }
+    }
+
+    /// The bound element, as the control's XPath names it.
+    fn xpath(self) -> String {
+        let (root, el) = match self {
+            Self::Author => ("ns1:coreProperties", "ns0:creator"),
+            Self::Category => ("ns1:coreProperties", "ns1:category"),
+            Self::Comments => ("ns1:coreProperties", "ns0:description"),
+            Self::Keywords => ("ns1:coreProperties", "ns1:keywords"),
+            Self::Status => ("ns1:coreProperties", "ns1:contentStatus"),
+            Self::Subject => ("ns1:coreProperties", "ns0:subject"),
+            Self::Title => ("ns1:coreProperties", "ns0:title"),
+            Self::Company => ("ns0:Properties", "ns0:Company"),
+            Self::Manager => ("ns0:Properties", "ns0:Manager"),
+        };
+        format!("/{root}[1]/{el}[1]")
+    }
+
+    /// The element's name in its part.
+    fn part_element(self) -> &'static str {
+        match self {
+            Self::Author => "dc:creator",
+            Self::Category => "cp:category",
+            Self::Comments => "dc:description",
+            Self::Company => "Company",
+            Self::Keywords => "cp:keywords",
+            Self::Manager => "Manager",
+            Self::Status => "cp:contentStatus",
+            Self::Subject => "dc:subject",
+            Self::Title => "dc:title",
+        }
+    }
+
+    /// The property a control's `w:dataBinding` names, if it is one of ours.
+    pub fn from_binding(store_id: &str, xpath: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|p| p.store_id().eq_ignore_ascii_case(store_id) && p.xpath() == xpath)
+    }
+
+    /// The property's value in `props` (read from `docProps/core.xml` and
+    /// `docProps/app.xml`, [`crate::field::parse_app_props`]).
     pub fn value(self, props: &DocProps) -> String {
         match self {
             Self::Author => &props.author,
             Self::Category => &props.category,
             Self::Comments => &props.comments,
+            Self::Company => &props.company,
             Self::Keywords => &props.keywords,
+            Self::Manager => &props.manager,
             Self::Status => &props.content_status,
             Self::Subject => &props.subject,
             Self::Title => &props.title,
         }
         .clone()
     }
+
+    /// `xml` (the property's part) with the property set to `text`: its
+    /// element's content replaced, or the element added before the root's
+    /// close. `None` when `xml` has no root to add it to.
+    pub fn write(self, xml: &str, text: &str) -> Option<String> {
+        let name = self.part_element();
+        let mut escaped = String::new();
+        crate::serialize::esc_text(text, &mut escaped);
+        let open = format!("<{name}");
+        let mut from = 0;
+        while let Some(at) = xml[from..].find(&open).map(|i| from + i) {
+            from = at + open.len();
+            if !xml[from..].starts_with(['>', '/', ' ', '\t', '\r', '\n']) {
+                continue;
+            }
+            let gt = xml[from..].find('>').map(|e| from + e + 1)?;
+            let close = format!("</{name}>");
+            if xml[..gt].ends_with("/>") {
+                return Some(format!(
+                    "{}<{name}>{escaped}</{name}>{}",
+                    &xml[..at],
+                    &xml[gt..]
+                ));
+            }
+            let end = xml[gt..].find(&close).map(|e| gt + e)?;
+            return Some(format!("{}{escaped}{}", &xml[..gt], &xml[end..]));
+        }
+        let root_close = xml.rfind("</")?;
+        Some(format!(
+            "{}<{name}>{escaped}</{name}>{}",
+            &xml[..root_close],
+            &xml[root_close..]
+        ))
+    }
+}
+
+/// A document property control in a paragraph's content (#1433): the `open`
+/// and `close` boundaries' indices, the editor offsets `start..end` its text
+/// spans, the property it is bound to and the text it holds (empty while it
+/// shows its placeholder).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParaControl {
+    pub open: usize,
+    pub close: usize,
+    pub start: usize,
+    pub end: usize,
+    pub prop: BoundProp,
+    pub text: String,
+    pub placeholder: bool,
+}
+
+/// The document property controls among `content`, in order.
+pub fn scan_paragraph(content: &[Inline]) -> Vec<ParaControl> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    let mut open: Option<(usize, usize, BoundProp, bool)> = None;
+    let mut text = String::new();
+    for (k, inline) in content.iter().enumerate() {
+        match inline {
+            Inline::Raw(raw) if open.is_none() && raw.ends_with("<w:sdtContent>") => {
+                if let Some(prop) = binding_of(raw) {
+                    open = Some((k, at, prop, raw.contains("<w:showingPlcHdr")));
+                    text.clear();
+                }
+            }
+            Inline::Raw(raw) if open.is_some() && raw == crate::load::SDT_BLOCK_CLOSE => {
+                let (o, start, prop, placeholder) = open.take().expect("checked");
+                out.push(ParaControl {
+                    open: o,
+                    close: k,
+                    start,
+                    end: at,
+                    prop,
+                    text: if placeholder {
+                        String::new()
+                    } else {
+                        std::mem::take(&mut text)
+                    },
+                    placeholder,
+                });
+            }
+            Inline::Run(r) if open.is_some() => text.push_str(&r.text),
+            _ => {}
+        }
+        at += crate::editor::inline_len(inline);
+    }
+    out
+}
+
+/// The property a control's opening boundary is bound to.
+fn binding_of(open: &str) -> Option<BoundProp> {
+    let at = open.find("<w:dataBinding")?;
+    let el = &open[at..at + open[at..].find('>')?];
+    BoundProp::from_binding(
+        &crate::load::xml_attr_value(el, "w:storeItemID")?,
+        &crate::load::xml_attr_value(el, "w:xpath")?,
+    )
+}
+
+/// `content` with the control `c` showing `text` instead (its placeholder
+/// when empty); true when anything changed. The text takes the properties of
+/// the control's first run.
+pub fn set_control_text(content: &mut Vec<Inline>, c: &ParaControl, text: &str) -> bool {
+    if c.text == text {
+        return false;
+    }
+    let props = content[c.open + 1..c.close]
+        .iter()
+        .find_map(|i| match i {
+            Inline::Run(r) => Some(r.props.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let shown = if text.is_empty() {
+        format!("[{}]", c.prop.label())
+    } else {
+        text.to_string()
+    };
+    if let Inline::Raw(open) = &mut content[c.open] {
+        let flag = "<w:showingPlcHdr/>";
+        if text.is_empty() && !open.contains(flag) {
+            *open = open.replacen("<w:dataBinding", &format!("{flag}<w:dataBinding"), 1);
+        } else if !text.is_empty() {
+            *open = open.replace(flag, "");
+        }
+    }
+    content.splice(
+        c.open + 1..c.close,
+        [Inline::Run(Run { text: shown, props })],
+    );
+    true
 }
 
 /// Every content control `w:id` in `xml` (a part, or serialized blocks).
@@ -128,29 +324,35 @@ pub fn next_control_id<'a>(xmls: impl IntoIterator<Item = &'a str>) -> i64 {
 /// `w:placeholder` names a glossary entry this package does not have, so
 /// it is left out.
 pub fn core_property_control(
-    prop: CoreProp,
+    prop: BoundProp,
     value: &str,
     id: i64,
     props: &RunProps,
 ) -> Vec<Inline> {
     let alias = prop.label();
     let placeholder = value.is_empty();
-    let text_el = if prop == CoreProp::Comments {
+    let text_el = if prop == BoundProp::Comments {
         "<w:text w:multiLine=\"1\"/>"
     } else {
         "<w:text/>"
     };
     let open = format!(
         "<w:sdt><w:sdtPr><w:alias w:val=\"{alias}\"/><w:id w:val=\"{id}\"/>{}\
-         <w:dataBinding w:prefixMappings=\"{PREFIX_MAPPINGS}\" \
-         w:xpath=\"/ns1:coreProperties[1]/{}[1]\" w:storeItemID=\"{CORE_STORE_ID}\"/>\
+         <w:dataBinding w:prefixMappings=\"{}\" \
+         w:xpath=\"{}\" w:storeItemID=\"{}\"/>\
          {text_el}</w:sdtPr><w:sdtContent>",
         if placeholder {
             "<w:showingPlcHdr/>"
         } else {
             ""
         },
-        prop.xpath_element(),
+        if prop.is_extended() {
+            EXTENDED_PREFIX_MAPPINGS
+        } else {
+            PREFIX_MAPPINGS
+        },
+        prop.xpath(),
+        prop.store_id(),
     );
     let shown = if placeholder {
         format!("[{alias}]")
@@ -185,7 +387,12 @@ mod tests {
 
     #[test]
     fn a_title_control_matches_words() {
-        let c = core_property_control(CoreProp::Title, "Quarterly Report", 5, &RunProps::default());
+        let c = core_property_control(
+            BoundProp::Title,
+            "Quarterly Report",
+            5,
+            &RunProps::default(),
+        );
         // The serializer writes every `w:t` with `xml:space`; Word left it off.
         let xml = para_xml(c).replace(" xml:space=\"preserve\"", "");
         assert!(xml.contains(WORD_TITLE), "{xml}");
@@ -193,12 +400,12 @@ mod tests {
 
     #[test]
     fn an_empty_property_shows_the_placeholder_and_each_binds_its_element() {
-        let c = core_property_control(CoreProp::Status, "", 9, &RunProps::default());
+        let c = core_property_control(BoundProp::Status, "", 9, &RunProps::default());
         let xml = para_xml(c);
         assert!(xml.contains("<w:showingPlcHdr/>"), "{xml}");
         assert!(xml.contains(">[Status]<"), "{xml}");
         assert!(xml.contains("w:xpath=\"/ns1:coreProperties[1]/ns1:contentStatus[1]\""));
-        let xpaths: Vec<String> = CoreProp::ALL
+        let xpaths: Vec<String> = BoundProp::ALL
             .iter()
             .map(|p| {
                 let c = core_property_control(*p, "v", 1, &RunProps::default());
@@ -212,7 +419,9 @@ mod tests {
                 "/ns1:coreProperties[1]/ns0:creator[1]",
                 "/ns1:coreProperties[1]/ns1:category[1]",
                 "/ns1:coreProperties[1]/ns0:description[1]",
+                "/ns0:Properties[1]/ns0:Company[1]",
                 "/ns1:coreProperties[1]/ns1:keywords[1]",
+                "/ns0:Properties[1]/ns0:Manager[1]",
                 "/ns1:coreProperties[1]/ns1:contentStatus[1]",
                 "/ns1:coreProperties[1]/ns0:subject[1]",
                 "/ns1:coreProperties[1]/ns0:title[1]",
@@ -228,16 +437,16 @@ mod tests {
             <dc:title>Q &amp; A</dc:title><cp:categoryX>No</cp:categoryX><cp:category>Memo</cp:category>\
             <cp:contentStatus/><dc:creator>Ann</dc:creator></cp:coreProperties>";
         let props = crate::field::parse_core_props(core);
-        assert_eq!(CoreProp::Title.value(&props), "Q & A");
-        assert_eq!(CoreProp::Author.value(&props), "Ann");
-        assert_eq!(CoreProp::Category.value(&props), "Memo");
-        assert_eq!(CoreProp::Status.value(&props), "");
-        assert_eq!(CoreProp::Subject.value(&props), "");
+        assert_eq!(BoundProp::Title.value(&props), "Q & A");
+        assert_eq!(BoundProp::Author.value(&props), "Ann");
+        assert_eq!(BoundProp::Category.value(&props), "Memo");
+        assert_eq!(BoundProp::Status.value(&props), "");
+        assert_eq!(BoundProp::Subject.value(&props), "");
         let props = crate::field::parse_core_props(
             "<x><cp:contentStatus>Final</cp:contentStatus><dc:subject/></x>",
         );
-        assert_eq!(CoreProp::Status.value(&props), "Final");
-        assert_eq!(CoreProp::Subject.value(&props), "");
+        assert_eq!(BoundProp::Status.value(&props), "Final");
+        assert_eq!(BoundProp::Subject.value(&props), "");
     }
 
     #[test]
@@ -252,5 +461,65 @@ mod tests {
         let extremes = "<w:id w:val=\"9223372036854775807\"/><w:id w:val=\"-9223372036854775808\"/>\
                         <w:id w:val=\"1\"/><w:id w:val=\"2\"/>";
         assert_eq!(next_control_id([extremes]), 3);
+    }
+
+    fn para(content: Vec<Inline>) -> Vec<Inline> {
+        content
+    }
+
+    #[test]
+    fn company_and_manager_bind_to_the_extended_store_1433() {
+        let c = core_property_control(BoundProp::Company, "Acme & Co", 3, &RunProps::default());
+        let xml = para_xml(c);
+        assert!(
+            xml.contains("w:xpath=\"/ns0:Properties[1]/ns0:Company[1]\""),
+            "{xml}"
+        );
+        assert!(xml.contains("w:storeItemID=\"{55AF091B-3C7A-41E3-B477-F2FDAA23CFDA}\""));
+        assert!(xml.contains("extended-properties"), "{xml}");
+        assert!(!xml.contains("core-properties"), "{xml}");
+        assert_eq!(BoundProp::Company.part_name(), "docProps/app.xml");
+        assert_eq!(BoundProp::Title.part_name(), "docProps/core.xml");
+        let app = "<Properties xmlns=\"x\"><Application>docxy</Application>\
+            <Company>Acme &amp; Co</Company><Manager/></Properties>";
+        let props = crate::field::parse_app_props("<x/>", app);
+        assert_eq!(BoundProp::Company.value(&props), "Acme & Co");
+        assert_eq!(BoundProp::Manager.value(&props), "");
+        // Every property is found again from its own binding.
+        for p in BoundProp::ALL {
+            let c = core_property_control(p, "v", 1, &RunProps::default());
+            let found = scan_paragraph(&para(c));
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].prop, p);
+            assert_eq!(found[0].text, "v");
+        }
+    }
+
+    #[test]
+    fn writing_a_property_replaces_or_adds_its_element_1433() {
+        let core = "<cp:coreProperties><dc:title>Old</dc:title><dc:creator/></cp:coreProperties>";
+        let out = BoundProp::Title.write(core, "A & B <x>").unwrap();
+        assert_eq!(
+            out,
+            "<cp:coreProperties><dc:title>A &amp; B &lt;x&gt;</dc:title><dc:creator/></cp:coreProperties>"
+        );
+        let props = crate::field::parse_core_props(&out);
+        assert_eq!(BoundProp::Title.value(&props), "A & B <x>");
+        let out = BoundProp::Author.write(core, "Ann").unwrap();
+        assert!(out.contains("<dc:creator>Ann</dc:creator>"), "{out}");
+        // Absent: added before the root's close.
+        let out = BoundProp::Subject.write(core, "S").unwrap();
+        assert!(
+            out.ends_with("<dc:subject>S</dc:subject></cp:coreProperties>"),
+            "{out}"
+        );
+        // A longer name the property's begins is not it.
+        let app = "<Properties><CompanyX>no</CompanyX></Properties>";
+        let out = BoundProp::Company.write(app, "Acme").unwrap();
+        assert_eq!(
+            out,
+            "<Properties><CompanyX>no</CompanyX><Company>Acme</Company></Properties>"
+        );
+        assert_eq!(BoundProp::Company.write("", "x"), None);
     }
 }
