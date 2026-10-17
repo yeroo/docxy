@@ -1151,6 +1151,11 @@ pub struct OverlayCtx {
     pub status_date: Option<String>,
     /// The plan's current date (Project's `CurrentDate`), when set (#1548).
     pub current_date: Option<String>,
+    /// The selected tasks' UIDs, the cursor's first (#1552).
+    pub selected: Vec<i32>,
+    /// The schedule's project start and finish in chart pixels (#1552).
+    pub project_start_x: Option<f32>,
+    pub project_finish_x: Option<f32>,
     /// The view's switches (`critical`, `baseline`, `timeline`), the
     /// plan's `palette`, and its formatting's `link_style` and `gridlines`
     /// (#1548), by key.
@@ -1182,9 +1187,24 @@ pub struct OverlayRow {
     pub constraint: Option<(String, f32)>,
     /// The Resource Names cell's text.
     pub resource_names: String,
+    /// Project's Status field text (`Complete`, `On Schedule`, `Late`,
+    /// `Future Task`; empty without a status date) (#1552).
+    pub status: String,
+    /// The schedule's late start and late finish in chart pixels (#1552).
+    pub late_start_x: Option<f32>,
+    pub late_finish_x: Option<f32>,
+    /// Where the free slack ends: the finish moved by the free slack's
+    /// working minutes (#1552).
+    pub slack_x: Option<f32>,
+    /// The schedule's slacks in working minutes (#1552).
+    pub total_slack_min: i64,
+    pub free_slack_min: i64,
+    /// Every baseline slot with both dates: `(slot, x, w)`, slot 0 first
+    /// (#1552).
+    pub baselines: Vec<(u8, f32, f32)>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct OverlayLink {
     pub pred: i32,
     pub succ: i32,
@@ -1192,6 +1212,9 @@ pub struct OverlayLink {
     pub kind: String,
     /// The lag as the predecessor cell shows it (`2d`, `-1h`, `50%`).
     pub lag: String,
+    /// Whether this predecessor sets the successor's start (FS, SS) or
+    /// finish (FF, SF): `Editor::driving_predecessors` (#1552).
+    pub driving: bool,
 }
 
 impl OverlayCtx {
@@ -1234,6 +1257,20 @@ impl OverlayCtx {
                         .filter(|c| !c.is_null())
                         .and_then(|c| Some((c.text("type"), f(c, "x")?))),
                     resource_names: r.text("resource_names"),
+                    status: r.text("status"),
+                    late_start_x: f(r, "late_start_x"),
+                    late_finish_x: f(r, "late_finish_x"),
+                    slack_x: f(r, "slack_x"),
+                    total_slack_min: r.int("total_slack_min").unwrap_or(0),
+                    free_slack_min: r.int("free_slack_min").unwrap_or(0),
+                    baselines: r
+                        .list("baselines")
+                        .iter()
+                        .filter_map(|b| {
+                            let slot = b.int("slot").and_then(|n| u8::try_from(n).ok())?;
+                            Some((slot, f(b, "x")?, f(b, "w")?))
+                        })
+                        .collect(),
                 }
             })
             .collect();
@@ -1251,6 +1288,7 @@ impl OverlayCtx {
                     .unwrap_or(0),
                 kind: l.text("type"),
                 lag: l.text("lag"),
+                driving: l.flag("driving"),
             })
             .collect();
         let scale = v.get("scale").cloned().unwrap_or(Json::Obj(Vec::new()));
@@ -1262,6 +1300,13 @@ impl OverlayCtx {
             links,
             status_date: v.get_str("status_date").map(str::to_string),
             current_date: v.get_str("current_date").map(str::to_string),
+            selected: v
+                .list("selected")
+                .iter()
+                .filter_map(|u| i32::try_from(u.as_i64()?).ok())
+                .collect(),
+            project_start_x: f(&v, "project_start_x"),
+            project_finish_x: f(&v, "project_finish_x"),
             flags: v.get("flags").cloned().unwrap_or(Json::Obj(Vec::new())),
         })
     }
@@ -1301,6 +1346,27 @@ impl OverlayCtx {
                         }),
                     ),
                     ("resource_names", Json::str(r.resource_names.clone())),
+                    ("status", Json::str(r.status.clone())),
+                    ("late_start_x", r.late_start_x.map_or(Json::Null, num)),
+                    ("late_finish_x", r.late_finish_x.map_or(Json::Null, num)),
+                    ("slack_x", r.slack_x.map_or(Json::Null, num)),
+                    ("total_slack_min", Json::Num(r.total_slack_min as f64)),
+                    ("free_slack_min", Json::Num(r.free_slack_min as f64)),
+                    (
+                        "baselines",
+                        Json::Arr(
+                            r.baselines
+                                .iter()
+                                .map(|&(slot, x, w)| {
+                                    Json::obj(vec![
+                                        ("slot", Json::Num(f64::from(slot))),
+                                        ("x", num(x)),
+                                        ("w", num(w)),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
                 ])
             })
             .collect();
@@ -1313,6 +1379,7 @@ impl OverlayCtx {
                     ("succ", Json::Num(f64::from(l.succ))),
                     ("type", Json::str(l.kind.clone())),
                     ("lag", Json::str(l.lag.clone())),
+                    ("driving", Json::Bool(l.driving)),
                 ])
             })
             .collect();
@@ -1334,6 +1401,23 @@ impl OverlayCtx {
             (
                 "current_date",
                 self.current_date.clone().map_or(Json::Null, Json::Str),
+            ),
+            (
+                "selected",
+                Json::Arr(
+                    self.selected
+                        .iter()
+                        .map(|&u| Json::Num(f64::from(u)))
+                        .collect(),
+                ),
+            ),
+            (
+                "project_start_x",
+                self.project_start_x.map_or(Json::Null, num),
+            ),
+            (
+                "project_finish_x",
+                self.project_finish_x.map_or(Json::Null, num),
             ),
             ("flags", self.flags.clone()),
         ])
@@ -1725,6 +1809,13 @@ mod tests {
                 deadline_x: Some(110.0),
                 constraint: Some(("FNLT".into(), 88.0)),
                 resource_names: "Alice".into(),
+                status: "Late".into(),
+                late_start_x: Some(44.0),
+                late_finish_x: Some(110.0),
+                slack_x: Some(110.0),
+                total_slack_min: 960,
+                free_slack_min: 480,
+                baselines: vec![(0, 22.0, 44.0), (1, 0.0, 66.0)],
                 ..OverlayRow::default()
             }],
             origin_day: 20000,
@@ -1735,9 +1826,13 @@ mod tests {
                 succ: 2,
                 kind: "FS".into(),
                 lag: "2d".into(),
+                driving: true,
             }],
             status_date: Some("2026-01-05T08:00".into()),
             current_date: None,
+            selected: vec![2, 1],
+            project_start_x: Some(0.0),
+            project_finish_x: Some(154.0),
             flags: Json::obj(vec![("critical", Json::Bool(true))]),
         };
         assert_eq!(OverlayCtx::parse(&ctx.json()).unwrap(), ctx);
@@ -1952,15 +2047,25 @@ mod tests {
                 succ: 2,
                 kind: "FS".into(),
                 lag: "2d".into(),
+                driving: true,
             }],
             status_date: Some("2026-01-05T08:00".into()),
             current_date: Some("2026-01-06T08:00".into()),
+            selected: vec![1],
+            project_start_x: Some(0.0),
+            project_finish_x: Some(220.0),
             flags: Json::obj(vec![
                 ("critical", Json::Bool(true)),
                 ("link_style", Json::str("straight")),
             ]),
         };
         let j = Json::parse(&ctx.json()).unwrap();
+        assert_eq!(j.list("rows")[0].text("status"), "");
+        assert!(j.list("rows")[0].get("slack_x").unwrap().is_null());
+        assert_eq!(j.list("rows")[0].list("baselines").len(), 0);
+        assert!(j.list("links")[0].flag("driving"));
+        assert_eq!(j.list("selected")[0].as_i64(), Some(1));
+        assert_eq!(j.num("project_finish_x"), Some(220.0));
         assert_eq!(j.list("rows")[0].get("bar").unwrap().num("w"), Some(66.0));
         assert!(j.list("rows")[1].get("bar").unwrap().is_null());
         assert_eq!(j.list("rows")[0].int("percent_complete"), Some(40));
@@ -1985,6 +2090,13 @@ mod tests {
         assert_eq!(old.rows[0].constraint, None);
         assert_eq!(old.rows[0].resource_names, "");
         assert_eq!(old.current_date, None);
+        assert_eq!(old.rows[0].status, "");
+        assert_eq!(old.rows[0].late_finish_x, None);
+        assert_eq!(old.rows[0].slack_x, None);
+        assert_eq!(old.rows[0].free_slack_min, 0);
+        assert!(old.rows[0].baselines.is_empty());
+        assert!(old.selected.is_empty());
+        assert_eq!(old.project_start_x, None);
         let shapes = parse_shapes(
             r##"{"shapes":[
               {"kind":"polyline","points":[[10,5],[10,30]],"color":"#000000","width":2},
