@@ -1639,12 +1639,16 @@ pub struct Project {
     pub resources: Vec<Resource>,
     pub assignments: Vec<Assignment>,
     pub calendars: Vec<Calendar>,
+    /// The plan's formatting (#1532): the `.yppx` `formatting.xml` part;
+    /// MSPDI carries none.
+    pub formatting: crate::formatting::Formatting,
 }
 
 impl Default for Project {
     fn default() -> Project {
         Project {
             package: PackageParts::default(),
+            formatting: crate::formatting::Formatting::default(),
             name: String::new(),
             title: String::new(),
             start_date: None,

@@ -14,21 +14,31 @@
 //! the plan was opened from when something writes it, else the type a plugin
 //! declared the default, else `.yppx` ([`Formats::default_save_extension`]).
 
+use ctlcore::json::Json;
 use projcore::Project;
-use projcore::formats::plugin::load_plugins_with_errors;
+use projcore::formats::plugin::{Host, Loaded, PluginInfo, UiPlugin, load_plugins_for};
 use projcore::formats::{NATIVE_EXTENSIONS, ProjectFormat, Registry, extension};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// The environment variable naming one more plugin directory (yppxy's too).
 pub(crate) const PLUGIN_DIR_ENV: &str = "YPPX_PLUGIN_DIR";
+
+/// How a plugin's version target names this host (#1532).
+pub(crate) const HOST_NAME: &str = "suite";
 
 /// The process's project formats, built once.
 pub(crate) struct Formats {
     pub registry: Registry,
     /// Why each plugin that did not load was skipped (`<file>: <why>`).
     pub errors: Vec<String>,
+    /// The libraries loaded, for `app-info`.
+    pub plugins: Vec<PluginInfo>,
+    /// The skipped libraries, as path and reason.
+    pub skipped: Vec<(PathBuf, String)>,
+    /// The UI plugins (#1532), in load order.
+    pub ui: Vec<Arc<UiPlugin>>,
     /// Whether mppread's import still reads `.mpp` (no plugin took it), so
     /// an MPP12 file's status can say what that import keeps.
     builtin_mpp: bool,
@@ -74,9 +84,94 @@ pub(crate) fn global() -> &'static Formats {
         } else {
             plugin_dirs(&crate::config_root(), std::env::var_os(PLUGIN_DIR_ENV))
         };
-        let (plugins, errors) = load_plugins_with_errors(&dirs);
-        Formats::new(plugins, errors)
+        let loaded = load_plugins_for(
+            &dirs,
+            Some(Host {
+                name: HOST_NAME,
+                version: env!("CARGO_PKG_VERSION"),
+            }),
+        );
+        Formats::from_loaded(loaded)
     })
+}
+
+/// `app-info`'s `plugins` (#1532): the libraries loaded (`file`, `formats`,
+/// `ui`, `built_against`), the UI plugins among them with the command ids
+/// their manifests name (`ui: [{file, commands}]`), and the ones skipped
+/// (`file`, `reason`).
+pub(crate) fn plugins_json(formats: &Formats) -> Json {
+    let file = |p: &Path| {
+        p.file_name().map_or_else(
+            || p.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        )
+    };
+    Json::obj(vec![
+        (
+            "loaded",
+            Json::Arr(
+                formats
+                    .plugins
+                    .iter()
+                    .map(|p| {
+                        Json::obj(vec![
+                            ("file", Json::Str(p.file.clone())),
+                            (
+                                "formats",
+                                Json::Arr(p.formats.iter().cloned().map(Json::Str).collect()),
+                            ),
+                            ("ui", Json::Bool(p.ui)),
+                            (
+                                "built_against",
+                                p.target
+                                    .as_ref()
+                                    .map_or(Json::Null, |t| Json::Str(t.built_against.clone())),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "ui",
+            Json::Arr(
+                formats
+                    .ui
+                    .iter()
+                    .map(|p| {
+                        Json::obj(vec![
+                            ("file", Json::Str(p.name().to_string())),
+                            (
+                                "commands",
+                                Json::Arr(
+                                    p.manifest()
+                                        .command_ids()
+                                        .into_iter()
+                                        .map(|id| Json::Str(id.to_string()))
+                                        .collect(),
+                                ),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "skipped",
+            Json::Arr(
+                formats
+                    .skipped
+                    .iter()
+                    .map(|(path, reason)| {
+                        Json::obj(vec![
+                            ("file", Json::Str(file(path))),
+                            ("reason", Json::Str(reason.clone())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
 }
 
 /// Where plugins load from: `<root>/docxy/plugins`, beside the session and
@@ -106,6 +201,16 @@ pub(crate) fn ext_list(exts: &[&str]) -> String {
 }
 
 impl Formats {
+    /// The host's formats, then what the loader found.
+    pub fn from_loaded(loaded: Loaded) -> Formats {
+        Formats {
+            plugins: loaded.plugins,
+            skipped: loaded.skipped,
+            ui: loaded.ui,
+            ..Formats::new(loaded.formats, loaded.errors)
+        }
+    }
+
     /// The host's formats, then `plugins` in load order.
     pub fn new(plugins: Vec<Box<dyn ProjectFormat>>, errors: Vec<String>) -> Formats {
         let mut registry = host_registry();
@@ -124,6 +229,9 @@ impl Formats {
         Formats {
             registry,
             errors,
+            plugins: Vec::new(),
+            skipped: Vec::new(),
+            ui: Vec::new(),
             builtin_mpp,
         }
     }

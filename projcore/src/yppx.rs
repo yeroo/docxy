@@ -12,6 +12,7 @@
 //! rename `project.xml`, and MS Project can open it.
 
 use crate::formats::Registry;
+use crate::formatting::{self, Formatting};
 use crate::model::{PackageParts, Project};
 use crate::mspdi::{read_mspdi, write_mspdi};
 use opccore::xml::{Event, XmlParser};
@@ -53,14 +54,22 @@ pub fn write_yppx(proj: &Project) -> Result<Vec<u8>, String> {
     let mut entries = vec![
         (
             CONTENT_TYPES_PART.to_string(),
-            build_content_types(&proj.package).into_bytes(),
+            build_content_types(&proj.package, !proj.formatting.is_empty()).into_bytes(),
         ),
         (MAIN_PART.to_string(), write_mspdi(proj).into_bytes()),
     ];
     let mut seen = HashSet::from([
         CONTENT_TYPES_PART.to_ascii_lowercase(),
         MAIN_PART.to_ascii_lowercase(),
+        formatting::PART.to_ascii_lowercase(),
     ]);
+    // The formatting part (#1532), only when there is formatting to keep.
+    if !proj.formatting.is_empty() {
+        entries.push((
+            formatting::PART.to_string(),
+            proj.formatting.to_xml().into_bytes(),
+        ));
+    }
     for (name, bytes) in &proj.package.parts {
         if !name.ends_with('/') && seen.insert(name.to_ascii_lowercase()) {
             entries.push((name.clone(), bytes.to_vec()));
@@ -70,9 +79,17 @@ pub fn write_yppx(proj: &Project) -> Result<Vec<u8>, String> {
 }
 
 /// XML parts default to the project type, and the main part is `/project.xml`.
-/// Insert retained declarations before closing the map.
-fn build_content_types(package: &PackageParts) -> String {
+/// Insert retained declarations before closing the map, and the formatting
+/// part's own type when that part is written.
+fn build_content_types(package: &PackageParts, with_formatting: bool) -> String {
     let mut content_types = format!("{CONTENT_TYPES_START}{PROJECT_CONTENT_TYPE}\"/>");
+    if with_formatting {
+        content_types.push_str(&format!(
+            "<Override PartName=\"/{}\" ContentType=\"{}\"/>",
+            formatting::PART,
+            formatting::CONTENT_TYPE
+        ));
+    }
     for (extension, content_type) in &package.defaults {
         if extension.eq_ignore_ascii_case("xml") {
             continue;
@@ -274,6 +291,10 @@ fn read_yppx_within(bytes: &[u8], budget: u64) -> Result<Project, String> {
         .find(|entry| entry.name.eq_ignore_ascii_case(MAIN_PART))
         .ok_or_else(missing)?;
     let mut seen = HashSet::new();
+    let formatting_part = zip
+        .entries()
+        .iter()
+        .find(|entry| entry.name.eq_ignore_ascii_case(formatting::PART));
     let extras: Vec<_> = zip
         .entries()
         .iter()
@@ -282,6 +303,7 @@ fn read_yppx_within(bytes: &[u8], budget: u64) -> Result<Project, String> {
             !(name.ends_with('/')
                 || name.eq_ignore_ascii_case(CONTENT_TYPES_PART)
                 || name.eq_ignore_ascii_case(MAIN_PART)
+                || name.eq_ignore_ascii_case(formatting::PART)
                 || !seen.insert(name.to_ascii_lowercase()))
         })
         .collect();
@@ -292,7 +314,8 @@ fn read_yppx_within(bytes: &[u8], budget: u64) -> Result<Project, String> {
     let total = declared_bytes(
         std::iter::once(main)
             .chain(extras.iter().copied())
-            .chain(content_types),
+            .chain(content_types)
+            .chain(formatting_part),
     );
     if total > budget {
         return Err(format!(
@@ -302,6 +325,15 @@ fn read_yppx_within(bytes: &[u8], budget: u64) -> Result<Project, String> {
     let part = zip.extract(main).ok_or_else(missing)?;
     let xml = String::from_utf8(part).map_err(|_| format!("{MAIN_PART} is not valid UTF-8"))?;
     let mut project = read_mspdi(&xml)?;
+    // The formatting part (#1532) is the model's, not a retained extra.
+    if let Some(entry) = formatting_part {
+        let bytes = zip
+            .extract(entry)
+            .ok_or_else(|| format!("{} could not be read", formatting::PART))?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| format!("{} is not valid UTF-8", formatting::PART))?;
+        project.formatting = Formatting::from_xml(&text)?;
+    }
     for entry in extras {
         if let Some(bytes) = zip.extract(entry) {
             project
@@ -328,6 +360,62 @@ mod tests {
     use crate::model::*;
 
     const ORIGINAL_CONTENT_TYPES: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"xml\" ContentType=\"application/vnd.yppx.project+xml\"/></Types>\n";
+
+    /// The formatting part (#1532): written only when there is formatting,
+    /// declared in the content types, read back into the model (not kept as
+    /// an extra part), and a plan without any writes no part.
+    #[test]
+    fn formatting_round_trips_through_its_own_part() {
+        let mut proj = Project::default();
+        let bytes = write_yppx(&proj).unwrap();
+        let zip = ZipArchive::open(&bytes).unwrap();
+        assert!(zip.read(crate::formatting::PART).is_none());
+        assert!(
+            !String::from_utf8(zip.read(CONTENT_TYPES_PART).unwrap())
+                .unwrap()
+                .contains("formatting")
+        );
+        proj.formatting.palette = Some("fx.blue".into());
+        proj.formatting.set_category(
+            "Summary Tasks",
+            crate::formatting::TextStyle {
+                bold: Some(true),
+                ..Default::default()
+            },
+        );
+        let bytes = write_yppx(&proj).unwrap();
+        let zip = ZipArchive::open(&bytes).unwrap();
+        let part = String::from_utf8(zip.read(crate::formatting::PART).unwrap()).unwrap();
+        assert!(part.contains("palette=\"fx.blue\""), "{part}");
+        let map = String::from_utf8(zip.read(CONTENT_TYPES_PART).unwrap()).unwrap();
+        assert!(
+            map.contains(
+                "<Override PartName=\"/formatting.xml\" ContentType=\"application/vnd.yppx.formatting+xml\"/>"
+            ),
+            "{map}"
+        );
+        let back = read_yppx(&bytes).unwrap();
+        assert_eq!(back.formatting, proj.formatting);
+        assert!(back.package.parts.is_empty());
+        assert!(back.package.overrides.is_empty());
+        // Saved again, the part is rewritten once (not duplicated).
+        let again = write_yppx(&back).unwrap();
+        let names: Vec<_> = ZipArchive::open(&again)
+            .unwrap()
+            .entries()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| *n == crate::formatting::PART)
+                .count(),
+            1,
+            "{names:?}"
+        );
+        assert_eq!(read_yppx(&again).unwrap().formatting, proj.formatting);
+    }
 
     #[test]
     fn save_targets_add_native_extension_and_reject_lossy_formats() {

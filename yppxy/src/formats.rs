@@ -9,11 +9,15 @@
 //! default, else `.yppx` (`Registry::default_save_extension`).
 
 use crate::backstage::SaveType;
-use projcore::formats::plugin::load_plugins_with_errors;
+use ctlcore::json::Json;
+use projcore::formats::plugin::{Host, Loaded, PluginInfo, UiPlugin, load_plugins_for};
 use projcore::formats::{NATIVE_EXTENSIONS, Registry, extension};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+
+/// How a plugin's version target names this host.
+pub(crate) const HOST_NAME: &str = "yppxy";
 
 /// The environment variable naming one more plugin directory.
 pub(crate) const PLUGIN_DIR_ENV: &str = "YPPX_PLUGIN_DIR";
@@ -32,6 +36,12 @@ pub(crate) struct Formats {
     by_default: &'static [&'static [SaveType]],
     /// Why each plugin that did not load was skipped.
     pub errors: Vec<String>,
+    /// The libraries loaded, for `app-info`.
+    pub plugins: Vec<PluginInfo>,
+    /// The skipped libraries, as path and reason.
+    pub skipped: Vec<(PathBuf, String)>,
+    /// The UI plugins, in load order: `--command` runs their commands.
+    pub ui: Vec<Arc<UiPlugin>>,
 }
 
 /// The file a plan was opened from, kept while a format plugin writes its
@@ -64,7 +74,7 @@ pub(crate) fn host_registry() -> Registry {
 pub(crate) fn global() -> &'static Formats {
     static GLOBAL: OnceLock<&'static Formats> = OnceLock::new();
     GLOBAL.get_or_init(|| {
-        let mut registry = host_registry();
+        let registry = host_registry();
         let dirs = if cfg!(test) {
             Vec::new()
         } else {
@@ -73,12 +83,93 @@ pub(crate) fn global() -> &'static Formats {
                 std::env::var_os(PLUGIN_DIR_ENV),
             )
         };
-        let (plugins, errors) = load_plugins_with_errors(&dirs);
-        for plugin in plugins {
-            registry.register(plugin);
-        }
-        Formats::new(registry, errors)
+        let loaded = load_plugins_for(
+            &dirs,
+            Some(Host {
+                name: HOST_NAME,
+                version: env!("CARGO_PKG_VERSION"),
+            }),
+        );
+        Formats::from_loaded(registry, loaded)
     })
+}
+
+/// `app-info`'s `plugins`: the libraries loaded (`file`, `formats`, `ui`,
+/// `built_against`), the UI plugins among them with their command ids
+/// (`ui: [{file, commands}]`), and the ones skipped (`file`, `reason`).
+pub(crate) fn plugins_json(
+    plugins: &[PluginInfo],
+    ui: &[Arc<UiPlugin>],
+    skipped: &[(PathBuf, String)],
+) -> Json {
+    let file = |p: &Path| {
+        p.file_name().map_or_else(
+            || p.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        )
+    };
+    Json::obj(vec![
+        (
+            "loaded",
+            Json::Arr(
+                plugins
+                    .iter()
+                    .map(|p| {
+                        Json::obj(vec![
+                            ("file", Json::Str(p.file.clone())),
+                            (
+                                "formats",
+                                Json::Arr(p.formats.iter().cloned().map(Json::Str).collect()),
+                            ),
+                            ("ui", Json::Bool(p.ui)),
+                            (
+                                "built_against",
+                                p.target
+                                    .as_ref()
+                                    .map_or(Json::Null, |t| Json::Str(t.built_against.clone())),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "ui",
+            Json::Arr(
+                ui.iter()
+                    .map(|p| {
+                        Json::obj(vec![
+                            ("file", Json::Str(p.name().to_string())),
+                            (
+                                "commands",
+                                Json::Arr(
+                                    p.manifest()
+                                        .command_ids()
+                                        .into_iter()
+                                        .map(|id| Json::Str(id.to_string()))
+                                        .collect(),
+                                ),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "skipped",
+            Json::Arr(
+                skipped
+                    .iter()
+                    .map(|(path, reason)| {
+                        Json::obj(vec![
+                            ("file", Json::Str(file(path))),
+                            ("reason", Json::Str(reason.clone())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
 }
 
 /// Where plugins load from: `<config>/plugins`, then `$YPPX_PLUGIN_DIR` when
@@ -92,8 +183,34 @@ pub(crate) fn plugin_dirs(config: Option<PathBuf>, env: Option<OsString>) -> Vec
 }
 
 impl Formats {
-    /// Freeze `registry` for the process (it and its lists live as long).
+    /// Freeze `registry` for the process (it and its lists live as long),
+    /// with no plugin library behind it (the tests' stand-ins).
+    #[cfg(test)]
     pub fn new(registry: Registry, errors: Vec<String>) -> &'static Formats {
+        Self::build(registry, errors, Vec::new(), Vec::new(), Vec::new())
+    }
+
+    /// The host's `registry` with what the loader found registered.
+    pub fn from_loaded(mut registry: Registry, loaded: Loaded) -> &'static Formats {
+        for plugin in loaded.formats {
+            registry.register(plugin);
+        }
+        Self::build(
+            registry,
+            loaded.errors,
+            loaded.plugins,
+            loaded.skipped,
+            loaded.ui,
+        )
+    }
+
+    fn build(
+        registry: Registry,
+        errors: Vec<String>,
+        plugins: Vec<PluginInfo>,
+        skipped: Vec<(PathBuf, String)>,
+        ui: Vec<Arc<UiPlugin>>,
+    ) -> &'static Formats {
         let registry: &'static Registry = Box::leak(Box::new(registry));
         let open_exts = Box::leak(registry.open_extensions().into_boxed_slice());
         let list = |types: Vec<(&'static str, &'static str)>| -> &'static [SaveType] {
@@ -119,7 +236,53 @@ impl Formats {
             save_types,
             by_default: Box::leak(by_default.into_boxed_slice()),
             errors,
+            plugins,
+            skipped,
+            ui,
         }))
+    }
+
+    /// Run the plugin command `id` on `ed`'s plan with the editor's
+    /// selection, as a UI plugin would from the ribbon: the first UI plugin
+    /// that owns the id applies its ops as one undo step and the status is
+    /// returned (a dialog the command asks for is not opened here; the plan
+    /// is unchanged then, and the status says so). `Err` when no plugin owns
+    /// the id or an op was refused.
+    pub fn run_command(
+        &self,
+        ed: &mut projcore::editor::Editor,
+        id: &str,
+        values: Option<projcore::json::Json>,
+    ) -> Result<String, String> {
+        let command = projcore::uiplugin::Command {
+            id: id.to_string(),
+            plan: projcore::mspdi::write_mspdi(ed.project()),
+            selection: projcore::uiplugin::Selection {
+                uids: ed.selected_uid().into_iter().collect(),
+                cols: vec!["Name".to_string()],
+            },
+            view: projcore::json::Json::Obj(Vec::new()),
+            values,
+        };
+        for plugin in &self.ui {
+            let Some(result) = plugin.command(&command)? else {
+                continue;
+            };
+            projctl::apply_ops(ed, &result.ops)?;
+            let mut status = result.status.unwrap_or_default();
+            if let Some(dialog) = result.dialog {
+                if !status.is_empty() {
+                    status.push_str("; ");
+                }
+                status.push_str(&format!("opens the dialog '{dialog}' (not here)"));
+            }
+            return Ok(status);
+        }
+        Err(format!(
+            "no plugin runs the command '{id}' ({} UI plugin{} loaded)",
+            self.ui.len(),
+            if self.ui.len() == 1 { "" } else { "s" }
+        ))
     }
 
     /// The type Save As proposes for the plan bound to `path` (`None` for a

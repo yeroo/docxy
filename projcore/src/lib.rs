@@ -17,8 +17,14 @@
 //! - [`schedule`] — the Critical Path Method engine (forward/backward passes
 //!   over working-time calendars).
 //! - [`gantt`] — export a scheduled project as a Markdown/Mermaid Gantt chart.
+//! - [`formatting`] — the plan's formatting (bar palette, text styles per
+//!   category and cell, gridlines, link style), saved in the `.yppx`
+//!   `formatting.xml` part.
+//! - [`json`] — the small JSON value the plugin ABI's payloads use.
 //! - [`plugin_abi`] — the C ABI a format plugin implements (MSPDI XML text
-//!   across the boundary).
+//!   across the boundary), with the optional version-target and UI symbols.
+//! - [`uiplugin`] — the JSON shapes of a UI plugin's manifest, state,
+//!   commands and overlay, and the host version requirement it targets.
 //! - [`report`] — Project's View Reports (Project Overview, Late Tasks, …) as
 //!   Markdown.
 //! - [`text`] — text conventions shared by the readers (newlines in notes).
@@ -29,13 +35,16 @@ pub mod assign;
 pub mod datetime;
 pub mod editor;
 pub mod formats;
+pub mod formatting;
 pub mod gantt;
+pub mod json;
 pub mod model;
 pub mod mspdi;
 pub mod plugin_abi;
 pub mod report;
 pub mod schedule;
 pub mod text;
+pub mod uiplugin;
 pub mod yppx;
 
 pub use datetime::DateTime;

@@ -43,9 +43,12 @@ Built bottom-up, each a pure module:
 | `editor` | shared editing, selection, dirty tracking, undo/redo, and live scheduling |
 | `gantt` | export a scheduled project as a Markdown/Mermaid Gantt chart, with a task table (dates, Deadline with a missed-deadline `⚠`, duration, slack) |
 | `report` | Project's Report › View Reports as Markdown, from the plan's stored values |
-| `yppx` | the native `.yppx` OPC package (ZIP + `[Content_Types].xml` + `project.xml`) |
-| `formats` | the `ProjectFormat` trait and the `Registry` of formats hosts open and save (built-in `.yppx` and `.xml`), and, behind the `plugins` feature, the format plugin loader |
-| `plugin_abi` | the C ABI a format plugin implements (see [Format plugins](#format-plugins)) |
+| `yppx` | the native `.yppx` OPC package (ZIP + `[Content_Types].xml` + `project.xml`, plus `formatting.xml` when the plan has formatting) |
+| `formatting` | the plan's formatting (#1532, #1390): bar palette id, text styles per category and per cell, gridline and link-line styles; `Project::formatting`, edited as one undo step by `Editor::edit_formatting`, saved in `formatting.xml`, never in MSPDI |
+| `formats` | the `ProjectFormat` trait and the `Registry` of formats hosts open and save (built-in `.yppx` and `.xml`), and, behind the `plugins` feature, the format and UI plugin loader |
+| `plugin_abi` | the C ABI a format plugin implements, with the optional version-target and UI symbols (see [Format plugins](#format-plugins) and [UI plugins](#ui-plugins-1532)) |
+| `json` | the hand-written JSON value the plugin ABI's payloads use |
+| `uiplugin` | the typed JSON of a UI plugin: `Target`, `Manifest`, `StateCtx`/`State`, `Command`/`CommandResult`, `OverlayCtx`/`Shape` |
 
 The model is **pure input** — the scheduler never mutates it; it returns a
 separate `Schedule`. MSPDI's own computed `Start`/`Finish` are captured as
@@ -279,7 +282,12 @@ task: its bookings are placed first, and auto tasks level around them.
 - **`.yppx`** — the native package: an OPC ZIP (`[Content_Types].xml` +
   `project.xml`) built on `opccore`, the project analog of `.docx`/`.xlsx`. The
   `project.xml` part is MSPDI-compatible, so `.yppx` stays interoperable — unzip,
-  rename, and Project opens it — while giving us a container to grow.
+  rename, and Project opens it — while giving us a container to grow. The first
+  growth is `formatting.xml` (`projcore::formatting`, #1532): the plan's bar
+  palette, text styles per category and per cell, gridlines and link style,
+  written only when the plan has any, declared in the content types with its
+  own override, and read back into `Project::formatting`; MSPDI carries none
+  of it, as in Project.
 - **`.mpp`** — the legacy binary. It's an OLE2 **Compound File** (MS-CFB), which
   `mppread` reads exactly — including the **storage tree**, so nested blocks are
   addressable by path (`read_path("TBkndTask/FixedData")`). Its metadata streams
@@ -409,6 +417,79 @@ refusal is what it was before plugins existed.
   yppx_fixture`, which copies the fixture (built beside uiharness by
   `cargo build --release -p uiharness -p plugin_fixture`) into the sandbox's
   `docxy/plugins` before the suite starts.
+
+### UI plugins (#1532)
+
+The same `yppx_*` library may also contribute **user interface as data**:
+ribbon groups and controls, context-menu items, Task Information pages,
+dialogs, Gantt overlay shapes, bar palettes, text style categories, and
+commands that edit the plan. The hosts define the extension points and call
+into whatever library is present; they know no plugin's features or names
+(nothing in this repository refers to any plugin but the test fixture), and
+without one nothing changes.
+
+- **Version target.** `yppx_plugin_target(YppxBuf*)` (an optional symbol)
+  returns `{"suite": "<req>", "yppxy": "<req>", "built_against": "<commit>"}`:
+  a semver-style requirement per host name (`0.1.*`, `^0.1.2`, `~0.1`,
+  `>=0.1, <0.3`, `=0.1.0`; `projcore::uiplugin::version_satisfies`). Each
+  host checks the requirement for its own name (`suite`, `yppxy`) against its
+  `CARGO_PKG_VERSION` **before any other symbol** and skips a library that
+  does not match ("`<file>` targets suite 0.1.*, this is 0.2.0": stderr, the
+  crash log, the first window's status line, never a dialog). A library
+  without the symbol is a format plugin only: its formats load and the UI
+  symbols are not looked up.
+- **The UI symbols**, all five or none, looked up only behind a matching
+  target: `uint32_t yppx_ui_abi(void)` (1), `int32_t yppx_ui_manifest(YppxBuf*)`,
+  and `int32_t yppx_ui_state / yppx_ui_command / yppx_ui_overlay(const
+  uint8_t* json, size_t len, YppxBuf* out)`. Payloads are UTF-8 JSON in
+  `YppxBuf`, freed with `yppx_plugin_free`; return codes and
+  `yppx_plugin_last_error` as for the format calls; one call at a time.
+  `projcore::uiplugin` holds the typed shapes and `projcore::json` the JSON
+  value (hand-written, like the formats declaration).
+- **Manifest** (`yppx_ui_manifest`, static): `ribbon` (per project tab:
+  groups to append, or controls for an existing group by title; a control is
+  `{id, kind: button|toggle|split|dropdown|gallery|combo, label, tip, keytip,
+  icon, large, items, swatches}`), `menus` (items per `row`, `bar`, `column`,
+  `chart`, `heading-filter` menu with an `after` label hint), `dialogs`
+  (specs by id: pages of controls with kinds `text`, `number`, `date`,
+  `duration`, `checkbox`, `radio`, `dropdown`, `list`, `grid` with per-column
+  kinds, `multiline`, `label`, `color`, `font`; the `task-information` spec's
+  pages add to the host's Task Information dialog, one named like a built-in
+  page replacing it), `palettes` (bar colours and shapes per kind) and
+  `text_style_categories`. A contributed control, menu item or page whose id
+  (or page name) is a built-in's replaces it in place.
+- **State** (`yppx_ui_state`): the host sends `{plan: <MSPDI>, selection:
+  {uids, cols}, view, dialog?: {id, uid}}` when the plan, the selection or
+  the view changes (never per frame) and gets `{controls: {id: {enabled,
+  checked}}, gallery: {id: swatch}, values: {name: value}}` back.
+- **Commands** (`yppx_ui_command`): `{id, plan, selection, view, values?}` in,
+  `{ops, status, dialog?, view?}` out. `ops` are `projctl`'s editor verbs
+  (`task.set`, `task.add`, `task.del`, `link.add`, `link.del`, `assign.*`,
+  ...) as `{verb, args}`, applied by `projctl::apply_ops` in one
+  `Editor::batch`: one undo step, all or nothing, the refusal on the status
+  line. `dialog` names a spec to open, whose OK sends the same id again with
+  `values`; `view` sets host view settings (the palette, flags). Code 1
+  (unsupported) means "not my command", so several plugins can coexist.
+- **Overlay** (`yppx_ui_overlay`): the rows in view (`uid`, `row_y`, the bar
+  rectangle, kind flags), the scale (`origin_day`, `day_w`, `row_h`), the
+  links, the status date and the view flags in; shapes in chart pixels out
+  (`polyline`, `dashed`, `arrow`, `bracket`, `rect`, `text`, each with a
+  colour and width), drawn over the bars.
+- **Loader.** `projcore::formats::plugin::load_plugins_for(dirs, Some(Host
+  {name, version}))` returns `Loaded {formats, ui: Vec<Arc<UiPlugin>>,
+  plugins: Vec<PluginInfo>, errors, skipped}`; `UiPlugin` has `manifest()`,
+  `state(&StateCtx)`, `command(&Command)` (`None` when not its id) and
+  `overlay(&OverlayCtx)`. The old `load_plugins_with_errors` is the nameless
+  form: no target check, no UI. Both hosts' `app-info` reports `plugins:
+  {loaded: [{file, formats, ui, built_against}], ui: [{file, commands}],
+  skipped: [{file, reason}]}`.
+- **yppxy** ignores the UI contributions except commands: `yppxy plan.xml
+  --command <id> [--save out]` runs one headless with the first task selected
+  and prints the status, which is how QA drives a plugin's commands.
+- **The fixture** exports the target (`0.1.*` for both hosts) and the UI
+  symbols with one of everything (see `projcore/tests/plugin_fixture/src/ui.rs`);
+  `projcore/tests/plugins.rs` round-trips them through `libloading`, and
+  `yppxy/tests/plugins.rs` runs `--command fixture.rename`.
 
 ## Desktop suite entry table
 

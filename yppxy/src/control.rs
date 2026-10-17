@@ -43,9 +43,18 @@
 use crate::App;
 use ctlcore::json::Json;
 
-/// `app-info`: the build this binary is (see the `buildinfo` crate), as JSON.
+/// `app-info`: the build this binary is (see the `buildinfo` crate), as
+/// JSON, with `plugins` (the libraries loaded and skipped, #1532).
 fn app_info() -> Result<Json, String> {
-    Json::parse(&buildinfo::get(env!("CARGO_PKG_VERSION")).json())
+    let mut info = Json::parse(&buildinfo::get(env!("CARGO_PKG_VERSION")).json())?;
+    let formats = crate::formats::global();
+    if let Json::Obj(fields) = &mut info {
+        fields.push((
+            "plugins".into(),
+            crate::formats::plugins_json(&formats.plugins, &formats.ui, &formats.skipped),
+        ));
+    }
+    Ok(info)
 }
 
 /// yppxy's text prompts, as `field-read {"input":id}` names them (#1204):
@@ -138,9 +147,26 @@ mod tests {
             "kind",
             "manual",
             "summary",
+            "plugins",
         ] {
             assert!(info.get(k).is_some(), "app-info lacks {k}: {info:?}");
         }
+        // No plugin loads in a unit test: both lists are empty.
+        let plugins = info.get("plugins").unwrap();
+        assert_eq!(
+            plugins
+                .get("loaded")
+                .and_then(Json::as_array)
+                .map(<[Json]>::len),
+            Some(0)
+        );
+        assert_eq!(
+            plugins
+                .get("skipped")
+                .and_then(Json::as_array)
+                .map(<[Json]>::len),
+            Some(0)
+        );
         assert_eq!(info.get_str("version"), Some(env!("CARGO_PKG_VERSION")));
         let kind = info.get_str("kind").unwrap();
         assert!(["release", "ci", "local"].contains(&kind), "{kind}");

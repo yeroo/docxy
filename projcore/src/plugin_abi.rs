@@ -49,7 +49,35 @@
 //! A host refuses a library whose `yppx_plugin_abi` is not [`ABI_VERSION`],
 //! or that lacks any of the six symbols, and keeps every library it loaded
 //! for the life of the process.
+//!
+//! ## Version target and user interface (optional symbols)
+//!
+//! The same library may carry more symbols, looked up by name, so a library
+//! with the six above alone still loads as a format plugin:
+//!
+//! ```c
+//! int32_t  yppx_plugin_target(YppxBuf* out);   // {"suite":"0.1.*","yppxy":"0.1.*","built_against":"<commit>"}
+//! uint32_t yppx_ui_abi(void);                  // returns 1
+//! int32_t  yppx_ui_manifest(YppxBuf* out);     // the UI manifest JSON
+//! int32_t  yppx_ui_state   (const uint8_t* ctx, size_t len, YppxBuf* out);
+//! int32_t  yppx_ui_command (const uint8_t* cmd, size_t len, YppxBuf* out);
+//! int32_t  yppx_ui_overlay (const uint8_t* ctx, size_t len, YppxBuf* out);
+//! ```
+//!
+//! `yppx_plugin_target` names the host versions the library was built for
+//! ([`crate::uiplugin::Target`]): a host checks the requirement for its own
+//! name against its version *before* any other symbol, and skips a library
+//! that does not match, saying why. A library without the symbol is a
+//! format plugin only: its formats load and the `yppx_ui_*` symbols are not
+//! looked up. With a matching target, the host looks the UI symbols up: all
+//! five present (and `yppx_ui_abi` returning [`UI_ABI_VERSION`]) makes the
+//! library a UI plugin ([`crate::uiplugin`] holds the JSON shapes); none
+//! present makes it a format plugin; some present is a refusal. Buffers,
+//! return codes, the one-thread rule and `yppx_plugin_last_error` are as for
+//! the format calls; [`UNSUPPORTED_EXTENSION`] from `yppx_ui_command` means
+//! the command is not this plugin's.
 
+use crate::json::{Json, quote};
 use std::os::raw::c_char;
 
 /// The ABI version this host speaks: `yppx_plugin_abi` must return it.
@@ -80,6 +108,31 @@ pub const SYMBOLS: [&str; 6] = [
     SYMBOL_WRITE,
     SYMBOL_FREE,
     SYMBOL_LAST_ERROR,
+];
+
+/// The UI ABI version this host speaks: `yppx_ui_abi` must return it.
+pub const UI_ABI_VERSION: u32 = 1;
+
+/// `int32_t yppx_plugin_target(YppxBuf* out)`: see [`TargetFn`].
+pub const SYMBOL_TARGET: &str = "yppx_plugin_target";
+/// `uint32_t yppx_ui_abi(void)`: see [`AbiFn`].
+pub const SYMBOL_UI_ABI: &str = "yppx_ui_abi";
+/// `int32_t yppx_ui_manifest(YppxBuf* out)`: see [`FormatsFn`] (same shape).
+pub const SYMBOL_UI_MANIFEST: &str = "yppx_ui_manifest";
+/// `int32_t yppx_ui_state(const uint8_t*, size_t, YppxBuf*)`: see [`UiCallFn`].
+pub const SYMBOL_UI_STATE: &str = "yppx_ui_state";
+/// `int32_t yppx_ui_command(const uint8_t*, size_t, YppxBuf*)`: see [`UiCallFn`].
+pub const SYMBOL_UI_COMMAND: &str = "yppx_ui_command";
+/// `int32_t yppx_ui_overlay(const uint8_t*, size_t, YppxBuf*)`: see [`UiCallFn`].
+pub const SYMBOL_UI_OVERLAY: &str = "yppx_ui_overlay";
+
+/// The five UI symbols, all present or all absent.
+pub const UI_SYMBOLS: [&str; 5] = [
+    SYMBOL_UI_ABI,
+    SYMBOL_UI_MANIFEST,
+    SYMBOL_UI_STATE,
+    SYMBOL_UI_COMMAND,
+    SYMBOL_UI_OVERLAY,
 ];
 
 /// The call succeeded.
@@ -166,6 +219,14 @@ pub type FreeFn = unsafe extern "C" fn(buf: *mut YppxBuf);
 /// last non-zero return.
 pub type LastErrorFn = unsafe extern "C" fn(utf8_out: *mut YppxBuf) -> i32;
 
+/// `int32_t yppx_plugin_target(YppxBuf* out)`: the target JSON, UTF-8
+/// ([`crate::uiplugin::Target`]).
+pub type TargetFn = unsafe extern "C" fn(out: *mut YppxBuf) -> i32;
+
+/// `int32_t yppx_ui_state/command/overlay(const uint8_t* input, size_t len,
+/// YppxBuf* out)`: a JSON request in, a JSON reply out.
+pub type UiCallFn = unsafe extern "C" fn(input: *const u8, len: usize, out: *mut YppxBuf) -> i32;
+
 /// One entry of the formats JSON: a file type the plugin reads and/or writes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FormatDecl {
@@ -198,15 +259,8 @@ pub struct FormatDecl {
 /// ([`crate::formats::Registry::default_save_extension`]). Other keys are
 /// ignored, so a later ABI can add some.
 pub fn parse_formats(json: &str) -> Result<Vec<FormatDecl>, String> {
-    let mut parser = Parser {
-        s: json.as_bytes(),
-        i: 0,
-    };
-    let value = parser.value(0)?;
-    parser.ws();
-    if parser.i != parser.s.len() {
-        return Err(parser.error("text after the formats array"));
-    }
+    let value = Json::parse(json)
+        .map_err(|e| e.replacen("the JSON is malformed", "the formats JSON is malformed", 1))?;
     let Json::Arr(items) = value else {
         return Err("the formats JSON is not an array".into());
     };
@@ -238,28 +292,13 @@ pub fn formats_json(decls: &[FormatDecl]) -> String {
     out
 }
 
-fn quote(out: &mut String, s: &str) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-}
-
 /// Entry `n` (1-based) of the formats array.
 fn decl(n: usize, item: Json) -> Result<FormatDecl, String> {
     let Json::Obj(fields) = item else {
         return Err(format!("format {n} is not an object"));
     };
     let get = |key: &str| fields.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v);
+    // `Json::get` reads the last value too; the closure keeps the borrow local.
     let text = |key: &str| match get(key) {
         Some(Json::Str(s)) => Ok(s.trim().to_string()),
         Some(_) => Err(format!("format {n}: \"{key}\" is not a string")),
@@ -290,203 +329,6 @@ fn decl(n: usize, item: Json) -> Result<FormatDecl, String> {
         write: flag("write")?,
         default: flag("default")?,
     })
-}
-
-/// A parsed JSON value; numbers are checked, not kept.
-enum Json {
-    Null,
-    Bool(bool),
-    Num,
-    Str(String),
-    Arr(Vec<Json>),
-    Obj(Vec<(String, Json)>),
-}
-
-/// Nesting deeper than this is refused rather than recursed into.
-const MAX_DEPTH: usize = 32;
-
-struct Parser<'a> {
-    s: &'a [u8],
-    i: usize,
-}
-
-impl Parser<'_> {
-    fn error(&self, what: &str) -> String {
-        format!("the formats JSON is malformed at byte {}: {what}", self.i)
-    }
-
-    fn ws(&mut self) {
-        while self
-            .s
-            .get(self.i)
-            .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
-        {
-            self.i += 1;
-        }
-    }
-
-    fn eat(&mut self, word: &str) -> bool {
-        let found = self.s[self.i..].starts_with(word.as_bytes());
-        if found {
-            self.i += word.len();
-        }
-        found
-    }
-
-    fn value(&mut self, depth: usize) -> Result<Json, String> {
-        if depth > MAX_DEPTH {
-            return Err(self.error("nested too deeply"));
-        }
-        self.ws();
-        match self.s.get(self.i) {
-            Some(b'[') => {
-                self.i += 1;
-                let mut items = Vec::new();
-                self.ws();
-                if self.eat("]") {
-                    return Ok(Json::Arr(items));
-                }
-                loop {
-                    items.push(self.value(depth + 1)?);
-                    self.ws();
-                    if self.eat("]") {
-                        return Ok(Json::Arr(items));
-                    }
-                    if !self.eat(",") {
-                        return Err(self.error("expected , or ]"));
-                    }
-                }
-            }
-            Some(b'{') => {
-                self.i += 1;
-                let mut fields = Vec::new();
-                self.ws();
-                if self.eat("}") {
-                    return Ok(Json::Obj(fields));
-                }
-                loop {
-                    self.ws();
-                    if self.s.get(self.i) != Some(&b'"') {
-                        return Err(self.error("expected a key"));
-                    }
-                    let key = self.string()?;
-                    self.ws();
-                    if !self.eat(":") {
-                        return Err(self.error("expected :"));
-                    }
-                    fields.push((key, self.value(depth + 1)?));
-                    self.ws();
-                    if self.eat("}") {
-                        return Ok(Json::Obj(fields));
-                    }
-                    if !self.eat(",") {
-                        return Err(self.error("expected , or }"));
-                    }
-                }
-            }
-            Some(b'"') => self.string().map(Json::Str),
-            Some(b't') if self.eat("true") => Ok(Json::Bool(true)),
-            Some(b'f') if self.eat("false") => Ok(Json::Bool(false)),
-            Some(b'n') if self.eat("null") => Ok(Json::Null),
-            Some(b'-' | b'0'..=b'9') => self.number(),
-            Some(_) => Err(self.error("unexpected character")),
-            None => Err(self.error("unexpected end")),
-        }
-    }
-
-    fn digits(&mut self) -> usize {
-        let start = self.i;
-        while self.s.get(self.i).is_some_and(u8::is_ascii_digit) {
-            self.i += 1;
-        }
-        self.i - start
-    }
-
-    fn number(&mut self) -> Result<Json, String> {
-        self.eat("-");
-        if self.digits() == 0 {
-            return Err(self.error("expected a digit"));
-        }
-        if self.eat(".") && self.digits() == 0 {
-            return Err(self.error("expected a digit"));
-        }
-        if matches!(self.s.get(self.i), Some(b'e' | b'E')) {
-            self.i += 1;
-            if !self.eat("+") {
-                self.eat("-");
-            }
-            if self.digits() == 0 {
-                return Err(self.error("expected a digit"));
-            }
-        }
-        Ok(Json::Num)
-    }
-
-    fn hex4(&mut self) -> Result<u32, String> {
-        let hex = self
-            .s
-            .get(self.i..self.i + 4)
-            .and_then(|h| std::str::from_utf8(h).ok())
-            .and_then(|h| u32::from_str_radix(h, 16).ok())
-            .ok_or_else(|| self.error("bad \\u escape"))?;
-        self.i += 4;
-        Ok(hex)
-    }
-
-    /// A string starting at its opening quote.
-    fn string(&mut self) -> Result<String, String> {
-        self.i += 1;
-        let mut out = Vec::new();
-        loop {
-            let Some(&b) = self.s.get(self.i) else {
-                return Err(self.error("unterminated string"));
-            };
-            self.i += 1;
-            match b {
-                b'"' => break,
-                b'\\' => {
-                    let Some(&e) = self.s.get(self.i) else {
-                        return Err(self.error("unterminated string"));
-                    };
-                    self.i += 1;
-                    let c = match e {
-                        b'"' => '"',
-                        b'\\' => '\\',
-                        b'/' => '/',
-                        b'b' => '\u{8}',
-                        b'f' => '\u{c}',
-                        b'n' => '\n',
-                        b'r' => '\r',
-                        b't' => '\t',
-                        b'u' => {
-                            let hi = self.hex4()?;
-                            let code = if (0xD800..0xDC00).contains(&hi) {
-                                if !self.eat("\\u") {
-                                    return Err(self.error("unpaired surrogate"));
-                                }
-                                let lo = self.hex4()?;
-                                if !(0xDC00..0xE000).contains(&lo) {
-                                    return Err(self.error("unpaired surrogate"));
-                                }
-                                0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
-                            } else {
-                                hi
-                            };
-                            char::from_u32(code).ok_or_else(|| self.error("unpaired surrogate"))?
-                        }
-                        _ => return Err(self.error("bad escape")),
-                    };
-                    let mut utf8 = [0; 4];
-                    out.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
-                }
-                b if b < 0x20 => return Err(self.error("control character in a string")),
-                b => out.push(b),
-            }
-        }
-        // The input is a `str` and a string ends only at an ASCII quote, so
-        // the bytes copied through stay whole UTF-8 sequences.
-        String::from_utf8(out).map_err(|_| self.error("invalid UTF-8"))
-    }
 }
 
 #[cfg(test)]
@@ -568,7 +410,7 @@ mod tests {
 
     #[test]
     fn refuses_malformed_json() {
-        let deep = format!("{}{}", "[".repeat(40), "]".repeat(40));
+        let deep = format!("{}{}", "[".repeat(80), "]".repeat(80));
         for json in [
             "",
             "[",

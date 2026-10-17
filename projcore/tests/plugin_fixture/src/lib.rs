@@ -9,6 +9,12 @@
 //!   .fakeproj file", which the host reads through `yppx_plugin_last_error`;
 //! - writing with source bytes appends `<!-- fixture: source N bytes -->`
 //!   after the MSPDI, so a test can see the source arrive.
+//!
+//! It also carries the optional version target and user-interface symbols
+//! (`ui`), so the hosts' UI plumbing is covered without any real plugin.
+
+mod json;
+mod ui;
 
 use std::ffi::CStr;
 use std::os::raw::c_char;
@@ -21,16 +27,16 @@ pub struct YppxBuf {
     len: usize,
 }
 
-const OK: i32 = 0;
-const UNSUPPORTED_EXTENSION: i32 = 1;
-const MALFORMED_INPUT: i32 = 2;
+pub(crate) const OK: i32 = 0;
+pub(crate) const UNSUPPORTED_EXTENSION: i32 = 1;
+pub(crate) const MALFORMED_INPUT: i32 = 2;
 
 const FORMATS: &str =
     r#"[{"ext":"fakeproj","label":"Fake Project","read":true,"write":true,"default":true}]"#;
 
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
 
-fn fail(code: i32, message: &str) -> i32 {
+pub(crate) fn fail(code: i32, message: &str) -> i32 {
     *LAST_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = message.to_string();
     code
 }
@@ -39,7 +45,7 @@ fn fail(code: i32, message: &str) -> i32 {
 ///
 /// # Safety
 /// `out` is a valid buffer pointer.
-unsafe fn give(out: *mut YppxBuf, bytes: Vec<u8>) {
+pub(crate) unsafe fn give(out: *mut YppxBuf, bytes: Vec<u8>) {
     let boxed = bytes.into_boxed_slice();
     let len = boxed.len();
     let ptr = Box::into_raw(boxed) as *mut u8;
@@ -49,7 +55,7 @@ unsafe fn give(out: *mut YppxBuf, bytes: Vec<u8>) {
 
 /// # Safety
 /// `ptr` points at `len` readable bytes, or `len` is 0.
-unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
+pub(crate) unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
     if ptr.is_null() || len == 0 {
         &[]
     } else {
