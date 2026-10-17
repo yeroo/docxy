@@ -481,7 +481,8 @@ without one nothing changes.
   the successor's dates, `Editor::driving_predecessors`), the status and
   current dates, the `selected` UIDs (the cursor's first), the project
   start and finish x and the view flags (the switches, the plan's
-  `palette`, `link_style` and `gridlines`) in; shapes in chart pixels out (`polyline`, `dashed`,
+  `palette`, `link_style` and `gridlines`, the plugins' `switches`, the
+  formatting's `text_styles` and the selected cells' `cells`, #1572) in; shapes in chart pixels out (`polyline`, `dashed`,
   `arrow`, `bracket`, `rect`, `text`, each with a colour and width), drawn
   over the bars.
 - **Loader.** `projcore::formats::plugin::load_plugins_for(dirs, Some(Host

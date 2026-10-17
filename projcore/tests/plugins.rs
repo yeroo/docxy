@@ -157,6 +157,7 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
             ("fixture.hello", ControlKind::Button),
             ("fixture.flag", ControlKind::Toggle),
             ("fixture.palette", ControlKind::Gallery),
+            ("fixture.bold", ControlKind::Toggle),
         ]
     );
     assert!(group.controls[0].large && group.controls[0].keytip == "XH");
@@ -190,6 +191,7 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
     let state = ui.state(&ctx(Vec::new(), None)).unwrap();
     assert_eq!(state.control("fixture.flag").checked, Some(false));
     assert_eq!(state.control("fixture.rename").enabled, Some(false));
+    assert_eq!(state.control("fixture.bold").enabled, Some(false));
     assert_eq!(
         state.checked_swatch("fixture.palette"),
         Some("fixture.blue")
@@ -269,6 +271,51 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         .unwrap()
         .unwrap();
     assert_eq!(off.status.as_deref(), Some("Fixture: flag off"));
+    // The Bold toggle reads the cursor cell's style from the view's cells
+    // (#1572), and its command writes them for the selection.
+    let bold_view = Json::parse(
+        r#"{"cells":[{"uid":3,"column":"Name","bold":true},{"uid":4,"column":"Name","italic":true}]}"#,
+    )
+    .unwrap();
+    let on = StateCtx {
+        view: bold_view.clone(),
+        ..ctx(vec![3], None)
+    };
+    assert_eq!(
+        ui.state(&on).unwrap().control("fixture.bold").checked,
+        Some(true)
+    );
+    let off = StateCtx {
+        view: bold_view.clone(),
+        ..ctx(vec![4], None)
+    };
+    assert_eq!(
+        ui.state(&off).unwrap().control("fixture.bold").checked,
+        Some(false)
+    );
+    let unbold = ui
+        .command(&Command {
+            view: bold_view,
+            selection: Selection {
+                uids: vec![3, 4],
+                cols: vec!["Name".into()],
+            },
+            ..cmd("fixture.bold", vec![3, 4], None)
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        unbold.status.as_deref(),
+        Some("Fixture: bold off"),
+        "{:?}",
+        unbold.view
+    );
+    let view = unbold.view.clone().unwrap();
+    let cells = view.list("cells");
+    assert_eq!(cells.len(), 2, "{view:?}");
+    assert_eq!(cells[0].int("uid"), Some(3));
+    assert_eq!(cells[0].get_str("column"), Some("Name"));
+    assert_eq!(cells[0].get("bold"), Some(&Json::Bool(false)));
     let renamed = ui
         .command(&cmd("fixture.rename", vec![3, 4], None))
         .unwrap()

@@ -32,7 +32,8 @@ const MANIFEST: &str = r##"{
     {"id":"fixture.flag","kind":"toggle","label":"Flag","tip":"A toggle the fixture keeps","keytip":"XF","icon":"lock"},
     {"id":"fixture.palette","kind":"gallery","label":"Palette","tip":"Bar palettes","swatches":[
       {"id":"fixture.blue","label":"Blue","color":"#3366CC","preview":"fixture.blue"},
-      {"id":"fixture.red","label":"Red","color":"#CC3333","preview":"fixture.red"}]}]}]}],
+      {"id":"fixture.red","label":"Red","color":"#CC3333","preview":"fixture.red"}]},
+    {"id":"fixture.bold","kind":"toggle","label":"Bold","tip":"Bold on the selected cells (the view's cells)","keytip":"XB","icon":"bold"}]}]}],
   "menus":[{"menu":"row","items":[{"id":"fixture.rename","label":"Rename (fixture)","icon":"comment","after":"Notes..."}]}],
   "dialogs":[
     {"id":"task-information","pages":[{"name":"Fixture","controls":[
@@ -50,6 +51,33 @@ const MANIFEST: &str = r##"{
 
 /// The chosen palette, kept across calls.
 static PALETTE: Mutex<String> = Mutex::new(String::new());
+
+/// The selection's first task and column, when the request has them.
+fn cursor_cell(req: &Json) -> Option<(i64, String)> {
+    let sel = req.get("selection")?;
+    let uid = sel.get("uids")?.list().first()?.num()? as i64;
+    let col = sel.get("cols")?.list().first()?.str()?.to_string();
+    Some((uid, col))
+}
+
+/// Whether the cursor cell is bold in the view's `cells` (#1572).
+fn bold(req: &Json) -> bool {
+    let Some((uid, col)) = cursor_cell(req) else {
+        return false;
+    };
+    req.get("view")
+        .and_then(|v| v.get("cells"))
+        .map(Json::list)
+        .unwrap_or(&[])
+        .iter()
+        .find(|c| {
+            c.get("uid").and_then(Json::num).map(|n| n as i64) == Some(uid)
+                && c.get("column").and_then(Json::str) == Some(col.as_str())
+        })
+        .and_then(|c| c.get("bold"))
+        .and_then(Json::bool)
+        .unwrap_or(false)
+}
 
 /// The toggle's state: the `fixture.flag` switch of the request's view.
 fn flag(req: &Json) -> bool {
@@ -124,8 +152,9 @@ pub unsafe extern "C" fn yppx_ui_state(input: *const u8, len: usize, out: *mut Y
     };
     let selected = first_uid(&req).is_some();
     let mut reply = format!(
-        r#"{{"controls":{{"fixture.flag":{{"enabled":true,"checked":{}}},"fixture.rename":{{"enabled":{selected}}}}},"gallery":{{"fixture.palette":{}}}"#,
+        r#"{{"controls":{{"fixture.flag":{{"enabled":true,"checked":{}}},"fixture.bold":{{"enabled":{selected},"checked":{}}},"fixture.rename":{{"enabled":{selected}}}}},"gallery":{{"fixture.palette":{}}}"#,
         flag(&req),
+        bold(&req),
         quote(&palette())
     );
     // A Task Information dialog about to open: the page's values.
@@ -173,6 +202,45 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
                 )
             }
         },
+        "fixture.bold" => {
+            // Bold on every selected cell, off when the cursor cell is bold.
+            let on = !bold(&req);
+            let uids: Vec<i64> = req
+                .get("selection")
+                .and_then(|s| s.get("uids"))
+                .map(Json::list)
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(Json::num)
+                .map(|n| n as i64)
+                .collect();
+            let cols: Vec<String> = req
+                .get("selection")
+                .and_then(|s| s.get("cols"))
+                .map(Json::list)
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(Json::str)
+                .map(str::to_string)
+                .collect();
+            if uids.is_empty() || cols.is_empty() {
+                r#"{"ops":[],"status":"Fixture: select a cell first"}"#.to_string()
+            } else {
+                let cells: Vec<String> = uids
+                    .iter()
+                    .flat_map(|uid| {
+                        cols.iter().map(move |col| {
+                            format!(r#"{{"uid":{uid},"column":{},"bold":{on}}}"#, quote(col))
+                        })
+                    })
+                    .collect();
+                format!(
+                    r#"{{"ops":[],"status":"Fixture: bold {}","view":{{"cells":[{}]}}}}"#,
+                    if on { "on" } else { "off" },
+                    cells.join(",")
+                )
+            }
+        }
         "fixture.flag" => {
             let on = !flag(&req);
             format!(

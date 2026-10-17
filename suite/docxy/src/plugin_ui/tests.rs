@@ -45,6 +45,62 @@ fn tab() -> DocTab {
     t
 }
 
+#[test]
+fn the_view_json_carries_the_text_styles_and_the_selected_cells_styles() {
+    let mut tab = tab();
+    let Surface::Project(v) = &mut tab.surface else {
+        unreachable!()
+    };
+    let uid = v.ed.project().tasks[0].uid;
+    let other = v.ed.project().tasks[1].uid;
+    v.ed.edit_formatting(|f| {
+        f.set_category(
+            "Critical Tasks",
+            projcore::formatting::TextStyle {
+                bold: Some(true),
+                color: Some(0xCC0000),
+                ..Default::default()
+            },
+        );
+        for u in [uid, other] {
+            f.set_cell(
+                u,
+                "Name",
+                projcore::formatting::TextStyle {
+                    italic: Some(true),
+                    ..Default::default()
+                },
+            );
+        }
+    });
+    // The cursor is on the first task's Name cell: its style is sent, the
+    // other task's is not; every category is.
+    v.entry = false;
+    v.ed.select(0);
+    v.col = crate::COLUMNS.iter().position(|c| *c == "Name").unwrap();
+    let view = view_json(v);
+    let styles = view.get("text_styles").unwrap();
+    assert_eq!(
+        styles.get("Critical Tasks").unwrap().get("bold"),
+        Some(&Json::Bool(true))
+    );
+    assert_eq!(
+        styles.get("Critical Tasks").unwrap().get_str("color"),
+        Some("#CC0000")
+    );
+    let cells = view.list("cells");
+    assert_eq!(cells.len(), 1);
+    assert_eq!(cells[0].int("uid"), Some(i64::from(uid)));
+    assert_eq!(cells[0].get_str("column"), Some("Name"));
+    assert_eq!(cells[0].get("italic"), Some(&Json::Bool(true)));
+    // Another column: no cell style there.
+    v.col = crate::COLUMNS
+        .iter()
+        .position(|c| *c == "Duration")
+        .unwrap();
+    assert!(view_json(v).list("cells").is_empty());
+}
+
 fn ids(tab: &rs::Tab<Act>) -> Vec<(String, Vec<String>)> {
     tab.groups
         .iter()
