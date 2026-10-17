@@ -3465,6 +3465,13 @@ impl App {
                 self.dirty = true;
             }
             KeyCode::Enter => self.commit_comment(),
+            // Word's select-all in the field; it never types an `a` (#1376).
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(s) = self.comment_input.as_mut() {
+                    s.select_all();
+                }
+                self.dirty = true;
+            }
             KeyCode::Char(c) => {
                 if let Some(s) = self.comment_input.as_mut() {
                     s.insert(c);
@@ -4898,6 +4905,9 @@ impl App {
         match key.code {
             KeyCode::Up | KeyCode::BackTab => d.field = 0,
             KeyCode::Down | KeyCode::Tab => d.field = 1,
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                d.focused().select_all();
+            }
             code if LineEdit::is_edit_key(&key) => {
                 d.focused().handle(code);
             }
@@ -6811,15 +6821,18 @@ impl App {
                     ..Field::with_caret(r.as_str(), f.editing_replacement, r.caret())
                 })
             }),
-            "docxy-comment" => self
-                .comment_input
-                .as_ref()
-                .map(|c| Field::with_caret(c.as_str(), true, c.caret())),
+            "docxy-comment" => self.comment_input.as_ref().map(|c| Field {
+                selection: c.selection(),
+                ..Field::with_caret(c.as_str(), true, c.caret())
+            }),
             "docxy-compare-original" | "docxy-compare-revised" => {
                 self.compare_dialog.as_ref().map(|d| {
                     let i = usize::from(id == "docxy-compare-revised");
                     let value = if i == 0 { &d.original } else { &d.revised };
-                    Field::with_caret(value.as_str(), d.field == i, value.caret())
+                    Field {
+                        selection: value.selection().filter(|_| d.field == i),
+                        ..Field::with_caret(value.as_str(), d.field == i, value.caret())
+                    }
                 })
             }
             "docxy-vim-command" => self
@@ -10239,6 +10252,59 @@ mod tests {
         assert_eq!(
             app.comment_input.as_ref().map(LineEdit::as_str),
             Some("note")
+        );
+    }
+
+    #[test]
+    fn ctrl_a_selects_the_comment_and_compare_fields_and_typing_replaces_it() {
+        let body = vec![Block::Paragraph(docxcore::model::Paragraph::default())];
+        let mut app = App::new(new_package(Document { body }), "a.docx", false);
+        app.comment_input = Some("abcd".into());
+        app.comment_input_key(ctrl(KeyCode::Char('a')));
+        assert_eq!(
+            app.comment_input.as_ref().map(LineEdit::as_str),
+            Some("abcd"),
+            "Ctrl+A types no `a`"
+        );
+        let r = app.input_field("docxy-comment");
+        assert_eq!((r.caret, r.selection), (Some(4), Some((0, 4))));
+        app.comment_input_key(ctrl(KeyCode::Char('a')));
+        app.comment_input_key(key(KeyCode::Left));
+        let r = app.input_field("docxy-comment");
+        assert_eq!((r.caret, r.selection), (Some(0), None));
+        app.comment_input_key(ctrl(KeyCode::Char('a')));
+        app.comment_input_key(key(KeyCode::Char('X')));
+        assert_eq!(app.input_field("docxy-comment").value.as_deref(), Some("X"));
+        app.comment_input_key(ctrl(KeyCode::Char('a')));
+        app.comment_input_key(key(KeyCode::Backspace));
+        assert_eq!(app.input_field("docxy-comment").value.as_deref(), Some(""));
+        app.comment_input_key(ctrl(KeyCode::Char('a')));
+        assert_eq!(app.input_field("docxy-comment").selection, None, "empty");
+
+        app.compare_dialog = Some(CompareDialog {
+            original: "abc".into(),
+            revised: "xyz".into(),
+            field: 1,
+        });
+        app.compare_dialog_key(ctrl(KeyCode::Char('a')));
+        let r = app.input_field("docxy-compare-revised");
+        assert_eq!((r.caret, r.selection), (Some(3), Some((0, 3))));
+        assert_eq!(app.input_field("docxy-compare-original").selection, None);
+        app.compare_dialog_key(key(KeyCode::Char('Q')));
+        assert_eq!(
+            app.input_field("docxy-compare-revised").value.as_deref(),
+            Some("Q")
+        );
+        assert_eq!(
+            app.input_field("docxy-compare-original").value.as_deref(),
+            Some("abc")
+        );
+        app.compare_dialog_key(key(KeyCode::Up));
+        app.compare_dialog_key(ctrl(KeyCode::Char('a')));
+        app.compare_dialog_key(key(KeyCode::Delete));
+        assert_eq!(
+            app.input_field("docxy-compare-original").value.as_deref(),
+            Some("")
         );
     }
 

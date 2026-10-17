@@ -5,7 +5,7 @@ use crate::{Backstage, BackstageHost, Item, OptLine, OptValue, Pane};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line as RLine;
+use ratatui::text::{Line as RLine, Span};
 use ratatui::widgets::{
     Block as RBlock, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
@@ -276,7 +276,7 @@ fn draw_save_as(f: &mut Frame, area: Rect, bs: &Backstage, host: &dyn BackstageH
     // cursor (same as the main editor), placed via set_cursor_position only
     // while the field is focused.
     f.render_widget(
-        Paragraph::new(RLine::raw(format!(" {}", bs.name_input))).block(
+        Paragraph::new(name_line(bs)).block(
             RBlock::default()
                 .borders(Borders::ALL)
                 .border_style(name_border)
@@ -507,6 +507,23 @@ fn fit_width(s: &str, w: usize) -> String {
     let mut out: String = s.chars().take(w - 1).collect();
     out.push('…');
     out
+}
+
+/// The file-name text after its leading space, the selected part reversed.
+fn name_line(bs: &Backstage) -> RLine<'static> {
+    let chars: Vec<char> = bs.name_input.chars().collect();
+    let Some((from, to)) = bs.name_selection() else {
+        return RLine::raw(format!(" {}", bs.name_input));
+    };
+    let (from, to) = (from.min(chars.len()), to.min(chars.len()));
+    RLine::from(vec![
+        Span::raw(format!(" {}", chars[..from].iter().collect::<String>())),
+        Span::styled(
+            chars[from..to].iter().collect::<String>(),
+            Style::default().add_modifier(Modifier::REVERSED),
+        ),
+        Span::raw(chars[to..].iter().collect::<String>()),
+    ])
 }
 
 #[cfg(test)]

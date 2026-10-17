@@ -3,7 +3,7 @@
 //! `save_as_key`/`save_as_name_key`/`save_as_browser_key`/`bs_scroll_preview`.
 
 use crate::{Backstage, BackstageEvent, BackstageHost, Item, OptLine, OptValue, Pane};
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Position;
 
 /// How many rows come before the host's property rows on its Info page:
@@ -303,13 +303,19 @@ impl Backstage {
     fn save_as_name_key(&mut self, key: KeyEvent) {
         let len = self.name_input.chars().count();
         match key.code {
+            // Word's select-all in the field; it never types an `a` (#1376).
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.name_cursor = len;
+                self.name_anchor = Some(0);
+            }
             KeyCode::Char(c) => {
+                self.delete_name_selection();
                 let at = byte_index(&self.name_input, self.name_cursor);
                 self.name_input.insert(at, c);
                 self.name_cursor += 1;
             }
             KeyCode::Backspace => {
-                if self.name_cursor > 0 {
+                if !self.delete_name_selection() && self.name_cursor > 0 {
                     let start = byte_index(&self.name_input, self.name_cursor - 1);
                     let end = byte_index(&self.name_input, self.name_cursor);
                     self.name_input.replace_range(start..end, "");
@@ -317,18 +323,61 @@ impl Backstage {
                 }
             }
             KeyCode::Delete => {
-                if self.name_cursor < len {
+                if !self.delete_name_selection() && self.name_cursor < len {
                     let start = byte_index(&self.name_input, self.name_cursor);
                     let end = byte_index(&self.name_input, self.name_cursor + 1);
                     self.name_input.replace_range(start..end, "");
                 }
             }
-            KeyCode::Left => self.name_cursor = self.name_cursor.saturating_sub(1),
-            KeyCode::Right => self.name_cursor = (self.name_cursor + 1).min(len),
-            KeyCode::Home => self.name_cursor = 0,
-            KeyCode::End => self.name_cursor = len,
+            // With a selection, Left and Right collapse to its edges.
+            KeyCode::Left => {
+                self.name_cursor = match self.name_selection() {
+                    Some((from, _)) => from,
+                    None => self.name_cursor.saturating_sub(1),
+                };
+                self.name_anchor = None;
+            }
+            KeyCode::Right => {
+                self.name_cursor = match self.name_selection() {
+                    Some((_, to)) => to,
+                    None => (self.name_cursor + 1).min(len),
+                };
+                self.name_anchor = None;
+            }
+            KeyCode::Home => {
+                self.name_anchor = None;
+                self.name_cursor = 0;
+            }
+            KeyCode::End => {
+                self.name_anchor = None;
+                self.name_cursor = len;
+            }
             _ => {}
         }
+    }
+
+    /// The selected span of the file name `(from, to)` in chars, `from < to`.
+    pub fn name_selection(&self) -> Option<(usize, usize)> {
+        let a = self.name_anchor?.min(self.name_input.chars().count());
+        let c = self.name_cursor;
+        (a != c).then(|| (a.min(c), a.max(c)))
+    }
+
+    /// Removes the selected part of the file name, leaving the caret where it
+    /// began; whether there was one.
+    fn delete_name_selection(&mut self) -> bool {
+        let sel = self.name_selection();
+        self.name_anchor = None;
+        let Some((from, to)) = sel else {
+            return false;
+        };
+        let (a, b) = (
+            byte_index(&self.name_input, from),
+            byte_index(&self.name_input, to),
+        );
+        self.name_input.replace_range(a..b, "");
+        self.name_cursor = from;
+        true
     }
 
     /// Navigation keys while the folder browser is focused (Save As dialog).
@@ -344,6 +393,7 @@ impl Backstage {
                 } else if let Some(e) = self.selected() {
                     let name = e.name.clone();
                     self.name_cursor = name.chars().count();
+                    self.name_anchor = None;
                     self.name_input = name;
                     self.name_focus = true;
                 }
@@ -405,6 +455,7 @@ impl Backstage {
                 self.type_focus = false;
                 let off = x.saturating_sub(self.layout.name_x0) as usize;
                 self.name_cursor = off.min(self.name_input.chars().count());
+                self.name_anchor = None;
                 return BackstageEvent::None;
             }
             // Click in the folder list: focus the browser (hiding the name
@@ -425,6 +476,7 @@ impl Backstage {
                 } else if !is_dir {
                     self.name_input = self.entries[idx].name.clone();
                     self.name_cursor = self.name_input.chars().count();
+                    self.name_anchor = None;
                 }
             }
             return BackstageEvent::None;
@@ -824,6 +876,94 @@ mod tests {
             BackstageEvent::SaveAs { name, .. } => assert_eq!(name, "a"),
             _ => panic!("{e:?}"),
         }
+    }
+
+    fn ctrl_a() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)
+    }
+
+    /// Save As open on `name`, its caret at the end.
+    fn name_field(name: &str) -> Backstage {
+        let mut bs = Backstage::open(std::env::temp_dir(), &["docx"]);
+        bs.pane = Pane::SaveAs;
+        bs.begin_save_as(name.to_string(), None);
+        bs
+    }
+
+    #[test]
+    fn ctrl_a_selects_the_file_name_and_typing_replaces_it() {
+        let mut bs = name_field("abcd");
+        bs.key(ctrl_a(), &TestHost);
+        assert_eq!(bs.name_input, "abcd", "Ctrl+A types no `a`");
+        assert_eq!(bs.save_as_name_field().selection, Some((0, 4)));
+        bs.key(key(KeyCode::Char('X')), &TestHost);
+        assert_eq!(bs.name_input, "X");
+        assert_eq!(bs.save_as_name_field().selection, None);
+        assert_eq!(bs.name_cursor, 1);
+    }
+
+    #[test]
+    fn backspace_and_delete_remove_the_file_name_selection() {
+        for code in [KeyCode::Backspace, KeyCode::Delete] {
+            let mut bs = name_field("abcd");
+            bs.key(ctrl_a(), &TestHost);
+            bs.key(key(code), &TestHost);
+            assert_eq!((bs.name_input.as_str(), bs.name_cursor), ("", 0));
+            assert_eq!(bs.name_anchor, None);
+        }
+    }
+
+    #[test]
+    fn arrows_collapse_the_file_name_selection_and_home_end_drop_it() {
+        let mut bs = name_field("abcd");
+        bs.key(ctrl_a(), &TestHost);
+        bs.key(key(KeyCode::Left), &TestHost);
+        assert_eq!(
+            (bs.name_cursor, bs.save_as_name_field().selection),
+            (0, None)
+        );
+        bs.key(ctrl_a(), &TestHost);
+        bs.key(key(KeyCode::Right), &TestHost);
+        assert_eq!(
+            (bs.name_cursor, bs.save_as_name_field().selection),
+            (4, None)
+        );
+        for (code, at) in [(KeyCode::Home, 0), (KeyCode::End, 4)] {
+            bs.key(ctrl_a(), &TestHost);
+            bs.key(key(code), &TestHost);
+            assert_eq!(
+                (bs.name_cursor, bs.save_as_name_field().selection),
+                (at, None)
+            );
+            bs.key(key(KeyCode::Char('z')), &TestHost);
+            assert_eq!(
+                bs.name_input.chars().count(),
+                5,
+                "typing inserts, not replaces"
+            );
+            bs.key(key(KeyCode::Backspace), &TestHost);
+        }
+    }
+
+    #[test]
+    fn ctrl_a_on_an_empty_file_name_selects_nothing() {
+        let mut bs = name_field("");
+        bs.key(ctrl_a(), &TestHost);
+        assert_eq!(bs.save_as_name_field().selection, None);
+        assert_eq!(bs.name_input, "");
+    }
+
+    #[test]
+    fn a_click_in_the_file_name_drops_its_selection() {
+        let mut bs = name_field("abcd");
+        bs.layout.name_x0 = 20;
+        bs.layout.name_top = 5;
+        bs.key(ctrl_a(), &TestHost);
+        bs.mouse(22, 6, &TestHost);
+        assert_eq!(bs.name_cursor, 2);
+        assert_eq!(bs.save_as_name_field().selection, None);
+        bs.key(key(KeyCode::Char('X')), &TestHost);
+        assert_eq!(bs.name_input, "abXcd");
     }
 
     #[test]
