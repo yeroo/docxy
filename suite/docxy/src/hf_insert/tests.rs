@@ -9,6 +9,7 @@ use crate::hf_tab::{HfMenu, hf_apply, hf_tab, menu_items};
 use core::prelude::v1::test;
 use docxcore::model::TabAlign;
 use docxcore::package::load_package;
+use docxcore::ptab::PtabLeader;
 
 /// Section 1's header open, the caret at its start.
 fn open_header(t: &mut DocTab) {
@@ -639,6 +640,7 @@ fn an_alignment_tab_places_the_text_after_it() {
     let right = crate::Ptab {
         align: TabAlign::Right,
         indent: false,
+        leader: PtabLeader::None,
     };
     let stop = crate::ptab_stop(right, 600.0, 30.0, 20.0);
     let gap = crate::ptab_gap(TabAlign::Right, stop, 100.0, 50.0);
@@ -646,6 +648,7 @@ fn an_alignment_tab_places_the_text_after_it() {
     let center = crate::Ptab {
         align: TabAlign::Center,
         indent: true,
+        leader: PtabLeader::None,
     };
     let stop = crate::ptab_stop(center, 600.0, 40.0, 60.0);
     assert_eq!(stop, 290.0);
@@ -657,13 +660,27 @@ fn an_alignment_tab_places_the_text_after_it() {
         crate::ptab_of(&run),
         Some(crate::Ptab {
             align: TabAlign::Left,
-            indent: false
+            indent: false,
+            leader: PtabLeader::None,
         })
     );
     assert_eq!(
         crate::ptab_of(&Inline::Raw("<w:bookmarkStart/>".into())),
         None
     );
+    // The leader is read too, and fills the gap by the glyph's width (#1433).
+    for (name, leader) in [
+        ("dot", PtabLeader::Dot),
+        ("hyphen", PtabLeader::Hyphen),
+        ("underscore", PtabLeader::Underscore),
+        ("middleDot", PtabLeader::MiddleDot),
+    ] {
+        let raw = format!("<w:r><w:ptab w:alignment=\"right\" w:leader=\"{name}\"/></w:r>");
+        assert_eq!(crate::ptab_of(&Inline::Raw(raw)).unwrap().leader, leader);
+    }
+    assert_eq!(crate::ptab_leader_count(100.0, 4.0), 25);
+    assert_eq!(crate::ptab_leader_count(3.0, 4.0), 0);
+    assert_eq!(crate::ptab_leader_count(100.0, 0.0), 0);
     // A picture's frame is its extent at the zoom.
     assert_eq!(
         crate::picture_frame_px(914_400, 457_200, 1.5),
