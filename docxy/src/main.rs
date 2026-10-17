@@ -4520,6 +4520,20 @@ impl App {
         self.os_clip.as_mut().and_then(|cb| cb.get_text().ok())
     }
 
+    /// A prompt field's copy or cut: its text is the clipboard's, for the
+    /// document too, so a later document paste is plain text (#1377).
+    fn field_copy(&mut self, text: &str, cut: bool) {
+        self.clipboard = Some(Clip::from_text(text));
+        self.os_set(text);
+        self.status = Some(if cut { "Cut" } else { "Copied" }.to_string());
+    }
+
+    /// The text a prompt field pastes: the OS clipboard's, else the last one
+    /// docxy put there.
+    fn field_paste_text(&mut self) -> Option<String> {
+        self.os_get().or_else(|| self.clip_text.clone())
+    }
+
     fn do_copy(&mut self) {
         if let Some(c) = self.editor.copy() {
             let text = c.to_text();
@@ -4908,6 +4922,11 @@ impl App {
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 d.focused().select_all();
             }
+            KeyCode::Char(k @ ('c' | 'x' | 'v'))
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.compare_field_clip(k);
+            }
             code if LineEdit::is_edit_key(&key) => {
                 d.focused().handle(code);
             }
@@ -4923,6 +4942,29 @@ impl App {
             _ => {}
         }
         false
+    }
+
+    /// Ctrl+C, X or V in the focused Compare path (#1377).
+    fn compare_field_clip(&mut self, k: char) {
+        if k == 'v' {
+            if let Some(text) = self.field_paste_text() {
+                if let Some(d) = self.compare_dialog.as_mut() {
+                    d.focused().paste(&text);
+                }
+            }
+            return;
+        }
+        let Some(d) = self.compare_dialog.as_mut() else {
+            return;
+        };
+        let text = if k == 'x' {
+            d.focused().cut()
+        } else {
+            d.focused().selected_text()
+        };
+        if let Some(text) = text {
+            self.field_copy(&text, k == 'x');
+        }
     }
 
     fn compare_dialog_mouse(&mut self, x: u16, y: u16) {
@@ -5870,6 +5912,10 @@ impl App {
                 }
                 self.dirty = true;
             }
+            // Copy, cut and paste in the focused field (#1377).
+            KeyCode::Char(k @ ('c' | 'x' | 'v')) if ctrl && !alt => {
+                self.find_field_clip(k);
+            }
             // Replace All is Word's Alt+A button accelerator (#1375); with no
             // Replace field it does nothing, and it never types an `a`.
             KeyCode::Char('a' | 'A') if alt && !ctrl => {
@@ -5975,6 +6021,41 @@ impl App {
             _ => {}
         }
         false
+    }
+
+    /// Ctrl+C, X or V in the focused Find or Replace field (#1377).
+    fn find_field_clip(&mut self, k: char) {
+        let pasted = if k == 'v' {
+            self.field_paste_text()
+        } else {
+            None
+        };
+        let Some(f) = &mut self.find else {
+            return;
+        };
+        let in_query = !(f.editing_replacement && f.replacement.is_some());
+        let replacing = f.editing_replacement;
+        let field = match &mut f.replacement {
+            Some(repl) if replacing => repl,
+            _ => &mut f.query,
+        };
+        let (text, changed) = match k {
+            'v' => (None, pasted.is_some_and(|t| field.paste(&t))),
+            'x' => {
+                let t = field.cut();
+                let c = t.is_some();
+                (t, c)
+            }
+            _ => (field.selected_text(), false),
+        };
+        if let Some(t) = text {
+            self.field_copy(&t, k == 'x');
+        }
+        if changed && in_query {
+            self.find_recompute();
+        } else {
+            self.dirty = true;
+        }
     }
 
     // ---- vim mode ----
@@ -10306,6 +10387,87 @@ mod tests {
             app.input_field("docxy-compare-original").value.as_deref(),
             Some("")
         );
+    }
+
+    #[test]
+    fn find_and_replace_fields_copy_cut_and_paste_text() {
+        let mut app = app_with(&["alpha beta"]);
+        app.os_clip = None;
+        app.on_key(ctrl(KeyCode::Char('f')));
+        app.on_key(key(KeyCode::Char('b')));
+        app.on_key(key(KeyCode::Char('e')));
+        // No selection: copies nothing and types no `c`.
+        app.on_key(ctrl(KeyCode::Char('c')));
+        assert_eq!(app.clip_text, None);
+        assert_eq!(app.find.as_ref().unwrap().query.as_str(), "be");
+        app.on_key(ctrl(KeyCode::Char('a')));
+        app.on_key(ctrl(KeyCode::Char('x')));
+        assert_eq!(app.clip_text.as_deref(), Some("be"));
+        assert_eq!(app.find.as_ref().unwrap().query.as_str(), "");
+        assert!(app.find.as_ref().unwrap().matches.is_empty());
+        // Paste re-runs the match.
+        app.on_key(ctrl(KeyCode::Char('v')));
+        let f = app.find.as_ref().unwrap();
+        assert_eq!((f.query.as_str(), f.query.caret()), ("be", 2));
+        assert!(!f.matches.is_empty());
+        // The Replace field is the focused one after Tab.
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(ctrl(KeyCode::Char('v')));
+        let f = app.find.as_ref().unwrap();
+        assert_eq!(f.replacement.as_ref().unwrap().as_str(), "be");
+        assert_eq!(f.query.as_str(), "be");
+        app.on_key(ctrl(KeyCode::Char('a')));
+        app.on_key(ctrl(KeyCode::Char('c')));
+        assert_eq!(app.status.as_deref(), Some("Copied"));
+    }
+
+    #[test]
+    fn a_field_copy_replaces_the_document_clip_with_plain_text() {
+        let mut app = app_with(&["alpha beta"]);
+        app.os_clip = None;
+        app.editor.select_all();
+        app.on_key(ctrl(KeyCode::Char('c')));
+        app.on_key(ctrl(KeyCode::Char('f')));
+        app.on_key(key(KeyCode::Char('Q')));
+        app.on_key(ctrl(KeyCode::Char('a')));
+        app.on_key(ctrl(KeyCode::Char('c')));
+        assert_eq!(app.clip_text.as_deref(), Some("Q"));
+        assert_eq!(
+            app.clipboard.as_ref().map(Clip::to_text).as_deref(),
+            Some("Q")
+        );
+    }
+
+    #[test]
+    fn compare_fields_copy_cut_and_paste_text() {
+        let body = vec![Block::Paragraph(docxcore::model::Paragraph::default())];
+        let mut app = App::new(new_package(Document { body }), "a.docx", false);
+        app.os_clip = None;
+        app.compare_dialog = Some(CompareDialog {
+            original: "abc".into(),
+            revised: "x\ty".into(),
+            field: 0,
+        });
+        app.compare_dialog_key(ctrl(KeyCode::Char('c')));
+        assert_eq!(app.clip_text, None);
+        app.compare_dialog_key(ctrl(KeyCode::Char('a')));
+        app.compare_dialog_key(ctrl(KeyCode::Char('c')));
+        assert_eq!(app.clip_text.as_deref(), Some("abc"));
+        app.compare_dialog_key(key(KeyCode::Down));
+        app.compare_dialog_key(ctrl(KeyCode::Char('a')));
+        app.compare_dialog_key(ctrl(KeyCode::Char('v')));
+        let r = app.input_field("docxy-compare-revised");
+        assert_eq!((r.value.as_deref(), r.caret), (Some("abc"), Some(3)));
+        app.compare_dialog_key(ctrl(KeyCode::Char('a')));
+        app.clip_text = Some("old".into());
+        app.status = None;
+        app.compare_dialog_key(ctrl(KeyCode::Char('x')));
+        assert_eq!(
+            app.input_field("docxy-compare-revised").value.as_deref(),
+            Some("")
+        );
+        assert_eq!(app.clip_text.as_deref(), Some("abc"));
+        assert_eq!(app.status.as_deref(), Some("Cut"));
     }
 
     #[test]

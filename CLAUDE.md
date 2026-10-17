@@ -362,8 +362,32 @@
   `field-read` reports it. In Find and Replace (#1375) Ctrl+A selects the
   focused field and Replace All is Alt+A (nothing in find-only mode). The
   comment bar and Compare's two paths take Ctrl+A too (#1376); the vim `:`
-  line does not. Copy/paste (#1377) and click-to-place (#1379)
+  line does not. Find, Replace and Compare copy and paste (#1377, below);
+  the comment bar, the vim `:` line (#1378) and click-to-place (#1379)
   are still not there.
+
+## Terminal editors: Ctrl+C/X/V in Find, Replace, Compare, the minibuffer and the cell editor (#1377)
+
+- Ctrl+C copies the field's selection, Ctrl+X cuts it, Ctrl+V pastes the first
+  line of the clipboard (control characters dropped) at the caret, over a
+  selection. With no selection Ctrl+C and Ctrl+X do nothing, and none types a
+  letter. An empty paste (the clipboard starts with a line break or holds only
+  control characters) changes nothing in every editor, a selection included. The text comes from the OS clipboard, else from `clip_text` (the last
+  text the editor put there: a headless Linux has no `os_clip`, which is the
+  harness's path). docxy's `LineEdit` has `selected_text`, `cut`, `paste`;
+  terminal docxy's `App::field_copy`/`field_paste_text` serve Find (a paste or cut in the
+  query re-runs the match), Replace and Compare. xlsxy's `Prompt` has
+  `selected_text`/`paste`, `App::field_copy`/`field_paste_line`; without an OS
+  clipboard a grid paste after a field copy falls back to `clip_text`.
+- A field copy replaces the other clip with the field's plain text: docxy sets
+  `clipboard` to `Clip::from_text`; xlsxy clears `clip`, so a grid paste of that
+  text is external TSV and not the old cells (`paste_from` treats an OS text
+  equal to `clip_text` as its own clip).
+- The xlsxy cell editor has only a select-all selection, so Ctrl+C/X take the
+  text only while it is all selected (Ctrl+C keeps the selection); Ctrl+V
+  inserts at the caret, replacing the text under select-all; a paste is not
+  typing (`typed_tail` false, so no AutoCorrect at commit, and no AutoComplete
+  proposal), and an empty paste changes nothing.
 
 ## Terminal editors: Ctrl+A in the other prompts (#1376)
 
