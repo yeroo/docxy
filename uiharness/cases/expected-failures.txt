@@ -29,20 +29,6 @@ backstage-inputs-typing.uit | rename sheet-tab-rename: select-all replaces | #13
 backstage-inputs-typing.uit | rename sheet-tab-rename: copies | #1365
 backstage-inputs-typing.uit | rename sheet-tab-rename: pastes | #1365
 
-# A Ctrl chord types its bare letter (Ctrl+C types c, Ctrl+V types v) in
-# docxy's new comment, yppxy's prompt and Backstage Save As's file name in
-# all three editors (#1204).
-terminal-docxy-inputs-typing.uit | docxy docxy-comment: copies | #1378
-terminal-docxy-inputs-typing.uit | docxy docxy-comment: pastes | #1378
-terminal-docxy-inputs-typing.uit | docxy docxy-save-as: copies | #1378
-terminal-docxy-inputs-typing.uit | docxy docxy-save-as: pastes | #1378
-terminal-xlsxy-inputs-typing.uit | xlsxy xlsxy-save-as: copies | #1378
-terminal-xlsxy-inputs-typing.uit | xlsxy xlsxy-save-as: pastes | #1378
-terminal-yppxy-inputs-typing.uit | yppxy yppxy-prompt: copies | #1378
-terminal-yppxy-inputs-typing.uit | yppxy yppxy-prompt: pastes | #1378
-terminal-yppxy-inputs-typing.uit | yppxy yppxy-save-as: copies | #1378
-terminal-yppxy-inputs-typing.uit | yppxy yppxy-save-as: pastes | #1378
-
 # A click on a docxy Find bar field does not move the focus to it (#1204).
 terminal-docxy-inputs-typing.uit | docxy docxy-find: focus by click | #1379
 terminal-docxy-inputs-typing.uit | docxy docxy-replace: focus by click | #1379
