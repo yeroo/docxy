@@ -321,6 +321,23 @@ def table(results):
     return '\n'.join(lines) + '\n'
 
 
+def script_command(platform, script, uiharness, suite, term_bin, out):
+    """The command that runs one script, its files under `out`.
+
+    Linux wraps it in a private Xvfb display (ui-linux.py). Windows has no
+    such wrapper: the harness starts the suite on a Win32 desktop of its own,
+    named for the script, which is never shown (#1405).
+    """
+    run = [str(uiharness)]
+    if platform == 'win32':
+        run += ['--desktop', f'sweep-{script.stem}']
+    run += ['run', str(script), '--suite', str(suite),
+            '--term-bin', str(term_bin), '--run', str(out / 'harness')]
+    if platform == 'win32':
+        return run
+    return [sys.executable, str(UI_LINUX), '--logs', str(out / 'x11'), '--'] + run
+
+
 def run_one(cmd, transcript_path, timeout):
     """Run cmd with its output in transcript_path; return (exit code, timed out).
 
@@ -434,9 +451,7 @@ def main(argv=None):
         out = run / path.stem
         out.mkdir()
         print(f'[{i}/{len(scripts)}] {path.stem} ... ', end='', flush=True)
-        cmd = [sys.executable, str(UI_LINUX), '--logs', str(out / 'x11'), '--',
-               str(uiharness), 'run', str(path), '--suite', str(suite),
-               '--term-bin', str(term_bin), '--run', str(out / 'harness')]
+        cmd = script_command(sys.platform, path, uiharness, suite, term_bin, out)
         began = time.monotonic()
         try:
             code, timed_out = run_one(cmd, out / 'transcript.txt', args.timeout)

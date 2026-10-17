@@ -241,6 +241,43 @@ jobs:
           path: uiharness-runs/sweep
           if-no-files-found: ignore
 
+  ui-sweep-windows:
+    name: ui sweep (windows)
+    # The Linux sweep's counterpart: every uiharness/cases/*.uit, each in a fresh
+    # release suite on a Win32 desktop of its own (`uiharness --desktop`), checked
+    # against uiharness/cases/expected-failures.txt. #1234 was a Windows-only
+    # transport defect that only a manual daily sweep found (#1405).
+    runs-on: windows-latest
+    # Nobody has seen this job's Windows baseline: expected-failures.txt lists the
+    # Linux one. Remove this once the first run is green, or once that list is
+    # split per platform.
+    continue-on-error: true
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            suite -> target
+            . -> target
+      - name: Build release suite
+        run: cargo build --release --locked --manifest-path suite/Cargo.toml
+      - name: Build release uiharness, the terminal editors and the fixture plugin
+        run: cargo build --release --locked -p uiharness -p docxy -p xlsxy -p yppxy -p plugin_fixture
+      - name: Sweep runner unit tests
+        run: python -m unittest discover -s scripts -p "test_*.py" -v
+      - name: Sweep
+        timeout-minutes: 60
+        run: python scripts/ui-linux-sweep.py --timeout 120 --suite suite/target/release/suite.exe --uiharness target/release/uiharness.exe --run "${{ github.workspace }}/uiharness-runs/sweep"
+      - name: Upload the sweep's transcripts and evidence
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ui-sweep-windows
+          path: uiharness-runs/sweep
+          if-no-files-found: ignore
+
   suite-macos:
     name: desktop suite (macos)
     # Releases already build the suite on macOS; this catches a macOS break in the PR
