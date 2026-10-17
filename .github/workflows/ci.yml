@@ -248,6 +248,8 @@ jobs:
     # against uiharness/cases/expected-failures.txt. #1234 was a Windows-only
     # transport defect that only a manual daily sweep found (#1405).
     runs-on: windows-latest
+    # No DOCXY_BUILD_KIND here on purpose: build-info.uit asserts this sweep's suite
+    # reports kind `local`, as on ui-sweep-linux (#1023).
     # Nobody has seen this job's Windows baseline: expected-failures.txt lists the
     # Linux one. Remove this once the first run is green, or once that list is
     # split per platform.

@@ -120,13 +120,14 @@ pub fn discover_live(dir: &Path) -> Vec<Instance> {
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A request/response client. Its [`call`](Client::call)s share one
-/// connection, opened on the first call and kept for as long as the `Client`
-/// lives: one connection per call left a client port in TIME_WAIT per verb,
+/// connection, opened on the first call (unless the client was primed with the
+/// connection of the liveness probe that found it) and kept for as long as the
+/// `Client` lives: one connection per call left a client port in TIME_WAIT per verb,
 /// and a UI harness sweep ran Windows' ephemeral ports out (#1234).
 pub struct Client {
     instance: Instance,
-    /// The cached connection; `None` before the first call and after a
-    /// transport failure. The lock also keeps one request in flight at a time.
+    /// The cached connection; `None` for an unprimed client before its first
+    /// call, and after a transport failure. The lock also keeps one request in flight at a time.
     conn: Mutex<Option<Conn>>,
 }
 

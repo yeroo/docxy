@@ -121,7 +121,8 @@
   manual build). Keep it dependency-free; hosts parse its `json()` text into their own
   JSON type and pass their own `CARGO_PKG_VERSION` (the suite, xlsxy, yppxy and lookxy are 0.1.0, docxy 0.5.0).
 - `ci.yml` sets `DOCXY_BUILD_KIND: ci` per job and `release.yml` sets `release`, but
-  never on `ui-sweep-linux`: `uiharness/cases/build-info.uit` asserts `local`.
+  never on `ui-sweep-linux` or `ui-sweep-windows`: `uiharness/cases/build-info.uit`
+  asserts `local`.
 
 ## Dialogs and typed input (#1029)
 

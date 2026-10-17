@@ -254,5 +254,20 @@ class ScriptCommandTests(unittest.TestCase):
         self.assertEqual(cmd[-2:], ['--run', str(Path('/r/doc-state/harness'))])
 
 
+class KillTreeTests(unittest.TestCase):
+    class Proc:
+        pid = 4242
+
+    def test_windows_kills_the_process_tree(self):
+        calls = []
+        sweep.kill_tree(self.Proc(), 'win32', lambda cmd, **kw: calls.append(cmd))
+        self.assertEqual(calls, [['taskkill', '/T', '/F', '/PID', '4242']])
+
+    def test_linux_runs_nothing(self):
+        calls = []
+        sweep.kill_tree(self.Proc(), 'linux', lambda cmd, **kw: calls.append(cmd))
+        self.assertEqual(calls, [])
+
+
 if __name__ == '__main__':
     unittest.main()

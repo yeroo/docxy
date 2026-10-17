@@ -84,7 +84,7 @@ depth 1, so it says `kind: ci`, no badge when clean, `last PR: none` and no comm
 `app-info` agree.
 
 **Fails when:** `release.yml` stops setting `DOCXY_BUILD_KIND=release`, or `ci.yml`
-sets a kind on the `ui-sweep-linux` job (its `.uit` asserts `local`).
+sets a kind on the `ui-sweep-linux` or `ui-sweep-windows` job (the `.uit` asserts `local`).
 
 ## Windows: `--version` reaches a redirect, a pipe and the console
 
