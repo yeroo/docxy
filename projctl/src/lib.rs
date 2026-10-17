@@ -31,6 +31,11 @@
 //! | `assign.set` | `{uid, units?, work?, overtime_work?, contour?, rate_table?, delay?, actual_work? \| percent_work_complete?, fields?}` | the updated assignment, after its task is rescheduled |
 //! | `assign.del` | `{uid}` | `{deleted, task}` |
 //! | `proj.get` | `{}` | the plan's settings (#1587): `{title, start, finish, status_date, current_date, calendar: {uid, name}, calendars: [{uid, name}]}` (dates `YYYY-MM-DD HH:MM`, the status and current dates `null` when unset, `calendars` the base calendars) |
+//! | `resource.list` | `{}` | `{count, resources: [{uid, id, name, type, initials, group, code, email, material_label, max_units, standard_rate, overtime_rate, cost_per_use, accrue_at, base_calendar: {uid, name}, notes, assignments}]}` (#1588): `type` `work`/`material`/`cost`, `max_units` a fraction, the rates currency per hour (per unit for a material) and the cost per use in currency units, `accrue_at` `Start`/`End`/`Prorated`, `assignments` how many the resource has |
+//! | `resource.get` | `{uid}` | one resource |
+//! | `resource.add` | `{name, type?, initials?, group?, code?, email?, material_label?, max_units?, standard_rate?, overtime_rate?, cost_per_use?, accrue_at?, base_calendar?, notes?}` | the new resource (#1588): a work resource at 100%, costs prorated, unless given otherwise; the name is unique ignoring ASCII case, not a number, without a comma |
+//! | `resource.set` | `{uid, name?, type?, …the same fields}` | the updated resource (#1588): `null` or `""` clears an optional text or rate; `type` changes only while the resource has no assignments; a rate edit keeps cost rate table A's current row, and a `max_units` edit the availability period in effect, in step |
+//! | `resource.del` | `{uid}` | `{deleted, assignments: [uid…]}` (#1588): its assignments go with it, each as the Resource Names cell removes a name, and its own derived calendar when nothing else uses it; later resources move up one ID |
 //! | `proj.set` | `{title?, start?, status_date?, current_date?, calendar?}` | the same reply after the change (#1587): dates `YYYY-MM-DD` (the project calendar's day start; a bare status date is the day's end, as Project sets it) or `YYYY-MM-DDTHH:MM`, `null` clearing a status or current date, `calendar` a base calendar's name or uid. All apply in one undo step, or none does |
 //!
 //! `fields` is a list of Project field names (`["% Complete", "Baseline1
@@ -85,13 +90,15 @@ use ctlcore::json::Json;
 use projcore::datetime::DateTime;
 use projcore::editor::{
     AssignmentField, AssignmentPatch, DURATION_HINT, EV_PERCENT_COMPLETE,
-    EV_PHYSICAL_PERCENT_COMPLETE, Editor, Field, FieldReader, FieldValue, ResourceRef, TaskPatch,
-    assignment_dates, assignment_field_names, day_end, day_start, duration_format_code,
-    field_names, parse_cell_date, parse_duration, parse_lag, parse_task_duration_unit,
-    rate_table_letter, read_assignment_field, work_contour_name,
+    EV_PHYSICAL_PERCENT_COMPLETE, Editor, Field, FieldReader, FieldValue, ResourcePatch,
+    ResourceRef, TaskPatch, assignment_dates, assignment_field_names, day_end, day_start,
+    duration_format_code, field_names, kind_name, parse_cell_date, parse_duration, parse_lag,
+    parse_task_duration_unit, rate_table_letter, read_assignment_field, resource_base_calendar,
+    work_contour_name,
 };
 use projcore::model::{
-    Assignment, ConstraintType, LagFormat, LagUnit, LinkType, Predecessor, Rate, Task, TaskType,
+    AccrueAt, Assignment, ConstraintType, LagFormat, LagUnit, LinkType, Predecessor, Rate,
+    Resource, ResourceType, Task, TaskType,
 };
 
 /// Successful calls to these verbs signal agent editing activity.
@@ -105,6 +112,9 @@ pub const MUTATING: &[&str] = &[
     "assign.add",
     "assign.set",
     "assign.del",
+    "resource.add",
+    "resource.set",
+    "resource.del",
 ];
 
 /// Recognize editor verbs before a host resolves its target document.
@@ -120,6 +130,8 @@ pub fn is_editor_verb(verb: &str) -> bool {
                 | "assign.list"
                 | "assign.get"
                 | "assign.fields"
+                | "resource.list"
+                | "resource.get"
         )
 }
 
@@ -170,6 +182,11 @@ pub fn dispatch_editor(ed: &mut Editor, verb: &str, args: &Json) -> Option<Resul
         "assign.add" => assign_add(ed, args),
         "assign.set" => assign_set(ed, args),
         "assign.del" => assign_del(ed, args),
+        "resource.list" => Ok(resource_list(ed)),
+        "resource.get" => resource_get(ed, args),
+        "resource.add" => resource_add(ed, args),
+        "resource.set" => resource_set(ed, args),
+        "resource.del" => resource_del(ed, args),
         _ => return None,
     })
 }
@@ -1082,7 +1099,12 @@ fn resource_arg(args: &Json) -> Result<Option<ResourceRef<'_>>, String> {
 
 /// `units` as a fraction: a number, or a percent string (`"50%"`).
 fn units_arg(args: &Json) -> Result<Option<f64>, String> {
-    let Some(u) = args.get("units") else {
+    fraction_arg(args, "units")
+}
+
+/// `key` as a fraction: a number, or a percent string (`"50%"`).
+fn fraction_arg(args: &Json, key: &str) -> Result<Option<f64>, String> {
+    let Some(u) = args.get(key) else {
         return Ok(None);
     };
     let units = match u.as_str() {
@@ -1098,7 +1120,7 @@ fn units_arg(args: &Json) -> Result<Option<f64>, String> {
     units
         .filter(|u| u.is_finite())
         .map(Some)
-        .ok_or_else(|| "couldn't read 'units' (try 0.5 or \"50%\")".to_string())
+        .ok_or_else(|| format!("couldn't read '{key}' (try 0.5 or \"50%\")"))
 }
 
 /// `key` in minutes: a number of hours, or a duration (`"40h"`, `"5d"`).
@@ -1253,6 +1275,248 @@ fn assign_del(ed: &mut Editor, args: &Json) -> Result<Json, String> {
     Ok(Json::obj(vec![
         ("deleted", Json::Num(uid as f64)),
         ("task", Json::Num(task as f64)),
+    ]))
+}
+
+// ---------------------------------------------------------------------------
+// Resources (#1588)
+// ---------------------------------------------------------------------------
+
+/// One resource as JSON.
+fn resource_json(ed: &Editor, r: &Resource) -> Json {
+    let proj = ed.project();
+    let text = |v: &Option<String>| v.clone().map_or(Json::Null, Json::Str);
+    let rate = |v: &Option<Rate>| {
+        v.as_ref()
+            .and_then(Rate::to_f64)
+            .map_or(Json::Null, Json::Num)
+    };
+    let base = resource_base_calendar(proj, r).and_then(|uid| proj.calendar(uid));
+    Json::obj(vec![
+        ("uid", Json::Num(f64::from(r.uid))),
+        ("id", Json::Num(f64::from(r.id))),
+        ("name", Json::Str(r.name.clone())),
+        ("type", Json::Str(kind_name(r.kind).into())),
+        ("initials", text(&r.initials)),
+        ("group", text(&r.group)),
+        ("code", text(&r.code)),
+        ("email", text(&r.email_address)),
+        ("material_label", text(&r.material_label)),
+        (
+            "max_units",
+            if r.kind == ResourceType::Work {
+                Json::Num(r.max_units)
+            } else {
+                Json::Null
+            },
+        ),
+        ("standard_rate", rate(&r.standard_rate)),
+        ("overtime_rate", rate(&r.overtime_rate)),
+        ("cost_per_use", money(r.cost_per_use.as_ref())),
+        (
+            "accrue_at",
+            Json::Str(accrue_name(r.accrue_at.unwrap_or(AccrueAt::Prorated)).into()),
+        ),
+        (
+            "base_calendar",
+            base.map_or(Json::Null, |c| {
+                Json::obj(vec![
+                    ("uid", Json::Num(f64::from(c.uid))),
+                    ("name", Json::Str(c.name.clone())),
+                ])
+            }),
+        ),
+        ("notes", text(&r.notes)),
+        (
+            "assignments",
+            Json::Num(
+                proj.assignments
+                    .iter()
+                    .filter(|a| a.resource_uid == r.uid)
+                    .count() as f64,
+            ),
+        ),
+    ])
+}
+
+fn accrue_name(accrue: AccrueAt) -> &'static str {
+    match accrue {
+        AccrueAt::Start => "Start",
+        AccrueAt::End => "End",
+        AccrueAt::Prorated | AccrueAt::Invalid => "Prorated",
+    }
+}
+
+fn resource_uid(args: &Json) -> Result<i32, String> {
+    args.get("uid")
+        .and_then(Json::as_i64)
+        .and_then(|n| i32::try_from(n).ok())
+        .ok_or_else(|| "needs a numeric 'uid' (a resource UID)".to_string())
+}
+
+fn resource_reply(ed: &Editor, uid: i32) -> Result<Json, String> {
+    let r = ed
+        .project()
+        .resources
+        .iter()
+        .find(|r| r.uid == uid)
+        .ok_or_else(|| format!("no resource with uid {uid}"))?;
+    Ok(resource_json(ed, r))
+}
+
+fn resource_list(ed: &Editor) -> Json {
+    let resources: Vec<Json> = ed
+        .project()
+        .resources
+        .iter()
+        .map(|r| resource_json(ed, r))
+        .collect();
+    Json::obj(vec![
+        ("count", Json::Num(resources.len() as f64)),
+        ("resources", Json::Arr(resources)),
+    ])
+}
+
+fn resource_get(ed: &Editor, args: &Json) -> Result<Json, String> {
+    resource_reply(ed, resource_uid(args)?)
+}
+
+/// `type` as a resource type: `work`, `material` or `cost`, ASCII case
+/// ignored.
+fn resource_type_arg(args: &Json) -> Result<Option<ResourceType>, String> {
+    let Some(t) = args.get("type") else {
+        return Ok(None);
+    };
+    match t.as_str().map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("work") => Ok(Some(ResourceType::Work)),
+        Some("material") => Ok(Some(ResourceType::Material)),
+        Some("cost") => Ok(Some(ResourceType::Cost)),
+        _ => Err("'type' is \"work\", \"material\" or \"cost\"".into()),
+    }
+}
+
+/// An optional text: a string, or `null` to clear it.
+fn text_arg(args: &Json, key: &str) -> Result<Option<Option<String>>, String> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(Json::Null) => Ok(Some(None)),
+        Some(Json::Str(s)) => Ok(Some(Some(s.clone()))),
+        Some(_) => Err(format!("'{key}' must be text or null")),
+    }
+}
+
+/// A rate in currency units: a number or a numeric string, or `null` to
+/// clear it; stored `scale` times larger (100 for a cost kept in hundredths).
+fn rate_arg(args: &Json, key: &str, scale: f64) -> Result<Option<Option<Rate>>, String> {
+    let Some(v) = args.get(key) else {
+        return Ok(None);
+    };
+    if matches!(v, Json::Null) {
+        return Ok(Some(None));
+    }
+    let n = match v.as_str() {
+        Some(text) => text.trim().trim_start_matches('$').parse::<f64>().ok(),
+        None => v.as_f64(),
+    };
+    let n = n
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .ok_or_else(|| format!("couldn't read '{key}' (a number of currency units, at least 0)"))?;
+    let rate = if scale == 1.0 {
+        Rate::from_f64(n)
+    } else {
+        Rate::from_f64((n * scale).round() + 0.0)
+    };
+    Ok(Some(rate))
+}
+
+/// `accrue_at` as an accrual: `Start`, `End` or `Prorated`, ASCII case
+/// ignored.
+fn accrue_arg(args: &Json) -> Result<Option<AccrueAt>, String> {
+    let Some(a) = args.get("accrue_at") else {
+        return Ok(None);
+    };
+    match a.as_str().map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("start") => Ok(Some(AccrueAt::Start)),
+        Some("end") => Ok(Some(AccrueAt::End)),
+        Some("prorated") => Ok(Some(AccrueAt::Prorated)),
+        _ => Err("'accrue_at' is \"Start\", \"End\" or \"Prorated\"".into()),
+    }
+}
+
+/// `base_calendar` as a base calendar's uid, from its name or uid.
+fn base_calendar_arg(ed: &Editor, args: &Json) -> Result<Option<i32>, String> {
+    match args.get("base_calendar") {
+        None => Ok(None),
+        Some(Json::Str(name)) => {
+            let name = name.trim();
+            ed.project()
+                .calendars
+                .iter()
+                .find(|c| c.base_calendar_uid.is_none() && c.name.eq_ignore_ascii_case(name))
+                .map(|c| Some(c.uid))
+                .or_else(|| name.parse::<i32>().ok().map(Some))
+                .ok_or_else(|| format!("no base calendar named '{name}'"))
+        }
+        Some(Json::Num(n)) => Ok(Some(*n as i32)),
+        Some(_) => Err("'base_calendar' must be a base calendar's name or uid".into()),
+    }
+}
+
+/// The resource fields `resource.add` and `resource.set` share.
+fn resource_patch(ed: &Editor, args: &Json) -> Result<ResourcePatch, String> {
+    Ok(ResourcePatch {
+        name: args.get_str("name").map(str::to_string),
+        kind: resource_type_arg(args)?,
+        initials: text_arg(args, "initials")?,
+        group: text_arg(args, "group")?,
+        code: text_arg(args, "code")?,
+        email: text_arg(args, "email")?,
+        material_label: text_arg(args, "material_label")?,
+        max_units: fraction_arg(args, "max_units")?,
+        standard_rate: rate_arg(args, "standard_rate", 1.0)?,
+        overtime_rate: rate_arg(args, "overtime_rate", 1.0)?,
+        cost_per_use: rate_arg(args, "cost_per_use", 100.0)?,
+        accrue_at: accrue_arg(args)?,
+        base_calendar: base_calendar_arg(ed, args)?,
+        notes: text_arg(args, "notes")?,
+    })
+}
+
+fn resource_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
+    let name = args
+        .get_str("name")
+        .ok_or("resource.add needs a 'name'")?
+        .to_string();
+    let patch = resource_patch(ed, args)?;
+    let kind = patch.kind.unwrap_or(ResourceType::Work);
+    let uid = ed.add_resource(&name, kind, &patch)?;
+    resource_reply(ed, uid)
+}
+
+fn resource_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
+    let uid = resource_uid(args)?;
+    let patch = resource_patch(ed, args)?;
+    if patch.is_empty() {
+        return Err("resource.set needs at least one field to change".into());
+    }
+    ed.set_resource(uid, &patch)?;
+    resource_reply(ed, uid)
+}
+
+fn resource_del(ed: &mut Editor, args: &Json) -> Result<Json, String> {
+    let uid = resource_uid(args)?;
+    let assignments = ed.delete_resource(uid)?;
+    Ok(Json::obj(vec![
+        ("deleted", Json::Num(f64::from(uid))),
+        (
+            "assignments",
+            Json::Arr(
+                assignments
+                    .into_iter()
+                    .map(|a| Json::Num(f64::from(a)))
+                    .collect(),
+            ),
+        ),
     ]))
 }
 
@@ -2472,6 +2736,104 @@ it"
         });
         p.resources = vec![ann, resource(2, "Bob", "30")];
         Editor::new(p)
+    }
+
+    #[test]
+    fn resource_verbs_read_add_edit_and_delete_resources() {
+        for verb in ["resource.list", "resource.get"] {
+            assert!(is_editor_verb(verb), "{verb}");
+            assert!(!MUTATING.contains(&verb), "{verb}");
+        }
+        for verb in ["resource.add", "resource.set", "resource.del"] {
+            assert!(is_editor_verb(verb), "{verb}");
+            assert!(MUTATING.contains(&verb), "{verb}");
+        }
+        let mut ed = staffed(projcore::model::TaskType::FixedUnits, false);
+        let list = run(&mut ed, "resource.list", "{}").unwrap();
+        assert_eq!(num(&list, "count"), 2.0);
+        let ann = &list.get("resources").unwrap().as_array().unwrap()[0];
+        assert_eq!(ann.get_str("name"), Some("Ann"));
+        assert_eq!(ann.get_str("type"), Some("work"));
+        assert_eq!(num(ann, "max_units"), 1.0);
+        assert_eq!(num(ann, "standard_rate"), 50.0);
+        assert_eq!(ann.get("cost_per_use"), Some(&Json::Null));
+        assert_eq!(ann.get_str("accrue_at"), Some("Prorated"));
+        assert_eq!(
+            ann.get("base_calendar").unwrap().get_str("name"),
+            Some("Standard")
+        );
+        assert_eq!(num(ann, "assignments"), 0.0);
+        // Added with its fields, in currency units.
+        let added = run(
+            &mut ed,
+            "resource.add",
+            r#"{"name":"Steel","type":"Material","material_label":"t","standard_rate":"120","cost_per_use":25.5,"accrue_at":"end","notes":"Grade S355"}"#,
+        )
+        .unwrap();
+        assert_eq!(num(&added, "uid"), 3.0);
+        assert_eq!(added.get_str("type"), Some("material"));
+        assert_eq!(added.get("max_units"), Some(&Json::Null));
+        assert_eq!(num(&added, "standard_rate"), 120.0);
+        assert_eq!(num(&added, "cost_per_use"), 25.5);
+        assert_eq!(added.get_str("accrue_at"), Some("End"));
+        assert_eq!(added.get_str("material_label"), Some("t"));
+        assert_eq!(ed.undo_depth(), 1);
+        // Edited: rate and units, a cleared note; the reply is the resource.
+        let set = run(
+            &mut ed,
+            "resource.set",
+            r#"{"uid":1,"standard_rate":60,"max_units":"50%","group":"Crew","initials":"A","email":"ann@example.com"}"#,
+        )
+        .unwrap();
+        assert_eq!(num(&set, "standard_rate"), 60.0);
+        assert_eq!(num(&set, "max_units"), 0.5);
+        assert_eq!(set.get_str("group"), Some("Crew"));
+        assert_eq!(set.get_str("email"), Some("ann@example.com"));
+        let cleared = run(&mut ed, "resource.set", r#"{"uid":1,"group":null}"#).unwrap();
+        assert_eq!(cleared.get("group"), Some(&Json::Null));
+        assert_eq!(ed.undo_depth(), 3);
+        let got = run(&mut ed, "resource.get", r#"{"uid":1}"#).unwrap();
+        assert_eq!(got, cleared);
+        // Refusals change nothing.
+        let before = ed.project().clone();
+        for args in [
+            r#"{"uid":1}"#,
+            r#"{"uid":99,"name":"X"}"#,
+            r#"{"uid":1,"name":"Steel"}"#,
+            r#"{"uid":1,"type":"robot"}"#,
+            r#"{"uid":1,"standard_rate":"lots"}"#,
+            r#"{"uid":1,"standard_rate":-5}"#,
+            r#"{"uid":1,"accrue_at":"sometimes"}"#,
+            r#"{"uid":1,"base_calendar":"Moon"}"#,
+            r#"{"uid":3,"max_units":1}"#,
+        ] {
+            assert!(run(&mut ed, "resource.set", args).is_err(), "{args}");
+        }
+        assert!(run(&mut ed, "resource.add", r#"{"type":"work"}"#).is_err());
+        assert!(run(&mut ed, "resource.add", r#"{"name":"ann"}"#).is_err());
+        assert_eq!(*ed.project(), before);
+        assert_eq!(ed.undo_depth(), 3);
+        // Deleting takes the assignments along, as one step.
+        let a = run(&mut ed, "assign.add", r#"{"task":1,"resource":1}"#).unwrap();
+        let a_uid = num(&a, "uid") as i32;
+        assert!(run(&mut ed, "resource.set", r#"{"uid":1,"type":"cost"}"#).is_err());
+        let del = run(&mut ed, "resource.del", r#"{"uid":1}"#).unwrap();
+        assert_eq!(num(&del, "deleted"), 1.0);
+        assert_eq!(
+            del.get("assignments").unwrap().as_array().unwrap(),
+            [Json::Num(f64::from(a_uid))]
+        );
+        assert_eq!(ed.undo_depth(), 5);
+        let list = run(&mut ed, "resource.list", "{}").unwrap();
+        assert_eq!(num(&list, "count"), 2.0);
+        assert_eq!(
+            num(&list.get("resources").unwrap().as_array().unwrap()[0], "id"),
+            1.0
+        );
+        assert!(ed.project().assignments.is_empty());
+        assert!(run(&mut ed, "resource.get", r#"{"uid":1}"#).is_err());
+        assert!(ed.undo());
+        assert_eq!(ed.project().assignments.len(), 1);
     }
 
     #[test]
