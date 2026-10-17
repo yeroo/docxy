@@ -103,7 +103,8 @@ Verbs: `proj.path`, `task.list`, `task.get`, `task.fields`, `task.set`, `task.ad
 `assign.fields`, `assign.add`, `assign.set`, `assign.del`, `proj.save`,
 `proj.reload`, `proj.open`, and the grid's view: `proj.view`,
 `proj.sort {column?, descending?}`, `proj.filter {column, values? | clear}` (`values` are
-cell texts or, on a date column, `YYYY`, `YYYY-MM`, `YYYY-MM-DD`).
+cell texts, `(Blanks)` for an empty cell, or on a date column `YYYY`, `YYYY-MM`,
+`YYYY-MM-DD`).
 
 Assignments are addressed by their own UID, as `assign.list {uid?, resource?}`
 reports it. `assign.add {task, resource, units?, work?}` takes a resource uid or

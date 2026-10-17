@@ -474,6 +474,12 @@ impl Editor {
         }
         self.sel_uid = self.selected_uid();
         self.reschedule();
+        // The edit may have made the selected task fail a filter (its Finish
+        // moved, its name changed): the displayed rows depend on the new
+        // schedule, so this comes after it.
+        if !self.sel_pinned && !self.filters.is_empty() {
+            self.sel_into_display();
+        }
     }
 
     /// Validate newly created/exposed leaves before touching history or UI state.

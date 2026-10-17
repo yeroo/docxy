@@ -35,7 +35,7 @@
 //! | `proj.set` | `{title?, start?, status_date?, current_date?, calendar?}` | the same after the change, one undo step (#1587); see `projctl` |
 //! | `proj.view` | — | the grid's order (#1533): `{sort, sort_descending, filter, filters:[{column, values}], count, rows:[uid…]}`, the rows in the order the table draws them |
 //! | `proj.sort` | `{column?, descending?}` (no `column` clears) | the same as `proj.view`; view state, not an edit |
-//! | `proj.filter` | `{column, values?}` or `{clear:true}` | the same as `proj.view`; `values` are the cell texts, `(Blanks)`, or on a date column `YYYY`, `YYYY-MM`, `YYYY-MM-DD`; no `values` clears that column |
+//! | `proj.filter` | `{column, values?}` or `{clear:true}` | the same as `proj.view`; `values` are the cell texts (one may contain `|`), `(Blanks)`, or on a date column `YYYY`, `YYYY-MM`, `YYYY-MM-DD`; no `values` clears that column |
 //! | `proj.save` | `{path?}` (.yppx/.xml, or a type a format plugin writes; extensionless adds .yppx) | `{path, …}` with the actual saved path |
 //! | `proj.reload` | — | `{path, …}` |
 //! | `proj.open` | `{path}` | `{path, …}` |
@@ -112,31 +112,28 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
             Ok(view_json(app))
         }
         "proj.filter" => {
-            let text = if args.get("clear").and_then(Json::as_bool) == Some(true) {
-                String::new()
+            if args.get("clear").and_then(Json::as_bool) == Some(true) {
+                app.apply_filter("")?;
             } else {
-                let column = args
-                    .get_str("column")
-                    .ok_or("proj.filter needs a 'column' (or {\"clear\": true})")?;
-                let values: Vec<&str> = match args.get("values") {
+                let field = crate::entry_field(
+                    args.get_str("column")
+                        .ok_or("proj.filter needs a 'column' (or {\"clear\": true})")?,
+                )?;
+                let values: Vec<String> = match args.get("values") {
                     None => Vec::new(),
                     Some(v) => v
                         .as_array()
                         .ok_or("'values' must be an array of texts")?
                         .iter()
-                        .map(|v| v.as_str().ok_or("'values' must be an array of texts"))
+                        .map(|v| {
+                            v.as_str()
+                                .map(str::to_string)
+                                .ok_or("'values' must be an array of texts")
+                        })
                         .collect::<Result<_, _>>()?,
                 };
-                if values.iter().any(|v| v.contains('|')) {
-                    return Err("a value cannot contain '|'".into());
-                }
-                if values.is_empty() {
-                    column.to_string()
-                } else {
-                    format!("{column}: {}", values.join(" | "))
-                }
-            };
-            app.apply_filter(&text)?;
+                app.filter_values(field, &values)?;
+            }
             Ok(view_json(app))
         }
         "field-read" => ctlcore::field::reply(args, INPUTS, app.counts, app.ed.dirty(), |id| {
@@ -693,5 +690,42 @@ mod tests {
             a.ed.sort().map(|s| (s.field.name(), s.descending)),
             Some(("Name".into(), true))
         );
+    }
+
+    #[test]
+    fn filter_values_may_hold_a_bar_and_an_empty_text_is_a_blank_cell() {
+        let mut a = dated();
+        a.ed.rename(2, "Build | Test").unwrap();
+        let filter = |a: &mut App, column: &str, values: &[&str]| {
+            dispatch(
+                a,
+                "proj.filter",
+                &obj(vec![
+                    ("column", Json::Str(column.into())),
+                    (
+                        "values",
+                        Json::Arr(values.iter().map(|v| Json::Str((*v).into())).collect()),
+                    ),
+                ]),
+            )
+        };
+        let v = filter(&mut a, "Name", &["Build | Test"]).unwrap();
+        assert_eq!(uids(&v), [2]);
+        // No task has an empty Name: asking for it is refused, not a clear.
+        let err = filter(&mut a, "Name", &[""]).unwrap_err();
+        assert_eq!(err, "No value '' in Name");
+        assert_eq!(
+            uids(&dispatch(&mut a, "proj.view", &Json::Null).unwrap()),
+            [2]
+        );
+        // Every task has no resource: (Blanks) is every value, so no filter.
+        dispatch(
+            &mut a,
+            "proj.filter",
+            &obj(vec![("clear", Json::Bool(true))]),
+        )
+        .unwrap();
+        let v = filter(&mut a, "Resource Names", &["(Blanks)"]).unwrap();
+        assert_eq!(v.get_str("filter"), Some("All Tasks"));
     }
 }

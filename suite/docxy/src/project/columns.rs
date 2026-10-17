@@ -37,18 +37,24 @@ pub(crate) struct WidthDrag {
     pub width: f32,
 }
 
+/// The columns' committed widths: the plan's own over the defaults.
+pub(crate) fn committed_widths(ed: &ProjectEditor) -> [f32; COLUMN_COUNT] {
+    std::array::from_fn(|col| {
+        ed.project()
+            .table_view
+            .width(COLUMNS[col])
+            .unwrap_or(DEFAULT_WIDTHS[col])
+    })
+}
+
 impl ProjectView {
     /// The columns' widths: the live drag's, the plan's own, else the default.
     pub fn widths(&self) -> [f32; COLUMN_COUNT] {
-        std::array::from_fn(|col| match self.width_drag {
-            Some(d) if d.col == col => d.width,
-            _ => self
-                .ed
-                .project()
-                .table_view
-                .width(COLUMNS[col])
-                .unwrap_or(DEFAULT_WIDTHS[col]),
-        })
+        let mut widths = committed_widths(&self.ed);
+        if let Some(d) = self.width_drag {
+            widths[d.col] = d.width;
+        }
+        widths
     }
 
     /// The columns' widths in all: the entry table's content width.
@@ -102,7 +108,6 @@ impl ProjectView {
         self.ed
             .edit_table_view(|v| v.set_width(COLUMNS[col], width));
         self.apply_widths();
-        self.reveal_col();
         self.ed.revision() != before
     }
 }

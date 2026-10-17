@@ -249,18 +249,18 @@ pub(crate) fn control<'a>(d: &'a Dialog, name: &str) -> Option<&'a Control> {
     d.controls.iter().find(|c| c.name == name)
 }
 
-pub(crate) fn control_mut<'a>(d: &'a mut Dialog, name: &str) -> Option<&'a mut Control> {
+fn control_mut<'a>(d: &'a mut Dialog, name: &str) -> Option<&'a mut Control> {
     d.controls.iter_mut().find(|c| c.name == name)
 }
 
-pub(crate) fn text_of(d: &Dialog, name: &str) -> String {
+fn text_of(d: &Dialog, name: &str) -> String {
     match control(d, name).map(|c| &c.value) {
         Some(Value::Text(t)) => t.trim().to_string(),
         _ => String::new(),
     }
 }
 
-pub(crate) fn choice_of(d: &Dialog, name: &str) -> Option<String> {
+fn choice_of(d: &Dialog, name: &str) -> Option<String> {
     let c = control(d, name)?;
     match c.value {
         Value::Choice(Some(i)) => c.items.get(i).cloned(),
@@ -268,7 +268,7 @@ pub(crate) fn choice_of(d: &Dialog, name: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn checked(d: &Dialog, name: &str) -> bool {
+fn checked(d: &Dialog, name: &str) -> bool {
     control(d, name).is_some_and(|c| c.value == Value::Bool(true))
 }
 

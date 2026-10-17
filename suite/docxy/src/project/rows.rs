@@ -26,7 +26,7 @@ pub(crate) fn shown_task(ed: &ProjectEditor, row: usize) -> Option<ShownRow> {
 }
 
 /// The zero-based drawn row of task `index`; `None` while a collapsed summary
-/// hides it.
+/// or the AutoFilter hides it.
 pub(crate) fn shown_row_of(ed: &ProjectEditor, index: usize) -> Option<usize> {
     ed.display_rows().iter().position(|&i| i == index)
 }
@@ -34,7 +34,7 @@ pub(crate) fn shown_row_of(ed: &ProjectEditor, index: usize) -> Option<usize> {
 /// A Project cell a harness verb addresses, by A1 drawn row or by `{uid, column}`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CellTarget {
-    /// The zero-based drawn row; `None` for a task a collapsed summary hides.
+    /// The zero-based drawn row; `None` for a task a collapsed summary or the AutoFilter hides.
     pub row: Option<usize>,
     /// What that row holds; `None` past the entry row.
     pub at: Option<ShownRow>,
@@ -139,16 +139,6 @@ pub(crate) fn rows_json(ed: &ProjectEditor) -> Json {
         ("total", Json::Num(tasks.len() as f64)),
         ("rows", Json::Arr(rows)),
     ])
-}
-
-/// The columns' committed widths: the plan's own over the defaults.
-fn committed_widths(ed: &ProjectEditor) -> [f32; COLUMN_COUNT] {
-    std::array::from_fn(|col| {
-        ed.project()
-            .table_view
-            .width(COLUMNS[col])
-            .unwrap_or(DEFAULT_WIDTHS[col])
-    })
 }
 
 /// `{column: px}` for every entry column.

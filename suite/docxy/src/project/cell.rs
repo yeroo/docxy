@@ -377,6 +377,10 @@ impl ProjectView {
             };
             self.entry = false;
             self.ed.select(row);
+            // A task the filter hides has no row to put the cursor on.
+            if !self.ed.display_rows().contains(&row) {
+                self.enter_entry_row();
+            }
             return Ok(status);
         };
         apply_cell(&mut self.ed, uid, col, &buf)
@@ -923,18 +927,29 @@ pub(crate) fn project_cell_input(tab: &mut DocTab, key: &str, text: Option<&str>
     }
     // Up, Down, and Shift+Enter commit and move a row, as Enter does, in Project.
     if matches!(key, "enter" | "tab" | "up" | "down") {
+        // The cell edited is the entry row's: its commit appends a task that
+        // a sort or filter may put or hide anywhere, so Enter and Down go
+        // back to the entry row, not to the row after it in display order.
+        let was_entry = matches!(
+            &tab.surface,
+            Surface::Project(v) if v.cell.as_ref().is_some_and(|c| c.uid.is_none())
+        );
         if commit_project_cell(tab) {
             if let Surface::Project(v) = &mut tab.surface {
-                v.key(
-                    match key {
-                        "enter" if m.shift => "up",
-                        "enter" => "down",
-                        "up" | "down" => key,
-                        _ if m.shift => "left",
-                        _ => "right",
-                    },
-                    false,
-                );
+                if was_entry && (key == "down" || (key == "enter" && !m.shift)) {
+                    v.enter_entry_row();
+                } else {
+                    v.key(
+                        match key {
+                            "enter" if m.shift => "up",
+                            "enter" => "down",
+                            "up" | "down" => key,
+                            _ if m.shift => "left",
+                            _ => "right",
+                        },
+                        false,
+                    );
+                }
             }
             complete_project(tab, key != "tab");
         }

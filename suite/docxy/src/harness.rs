@@ -3196,7 +3196,7 @@ fn menu_open(
                     .ok_or_else(|| format!("no task with uid {uid}"))?;
                 if !v.ed.display_rows().contains(&row) {
                     return Err(format!(
-                        "task {uid} is hidden under a collapsed summary; there is no row to right-click"
+                        "task {uid} is hidden (under a collapsed summary or by the AutoFilter); there is no row to right-click"
                     ));
                 }
                 let probe = format!("project-cell:{}:{}", tasks[row].id, v.col);
@@ -3219,7 +3219,7 @@ fn menu_open(
                     .ok_or_else(|| format!("no task with uid {uid}"))?;
                 if !v.ed.display_rows().contains(&row) {
                     return Err(format!(
-                        "task {uid} is hidden under a collapsed summary; there is no bar to right-click"
+                        "task {uid} is hidden (under a collapsed summary or by the AutoFilter); there is no bar to right-click"
                     ));
                 }
                 let task = &tasks[row];
@@ -5261,7 +5261,7 @@ fn dispatch_verb(
                 }
                 if target.row.is_none() {
                     return Err(
-                        "that task is hidden under a collapsed summary; expand it to click it"
+                        "that task is hidden (under a collapsed summary or by the AutoFilter); expand or clear the filter to click it"
                             .into(),
                     );
                 }
@@ -6376,7 +6376,7 @@ fn dispatch_verb(
                 let text = task
                     .map(|t| crate::project_row(&v.ed, t)[c].clone())
                     .unwrap_or_default();
-                // A task a collapsed summary hides has no drawn row to name.
+                // A task a collapsed summary or the AutoFilter hides has no drawn row to name.
                 let row = target.row;
                 let mut out = vec![
                     (

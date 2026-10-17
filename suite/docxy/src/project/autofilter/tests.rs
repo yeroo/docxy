@@ -359,3 +359,100 @@ fn the_cases_fixture_finishes_in_three_months() {
         ["Mon 1/12/26", "Mon 3/2/26", "Tue 3/17/26", "Mon 4/6/26"]
     );
 }
+
+fn vm(t: &mut DocTab) -> &mut ProjectView {
+    let Surface::Project(v) = &mut t.surface else {
+        panic!("project")
+    };
+    v
+}
+
+/// Type `name` into the entry row's Name cell and press `key`.
+fn type_entry(t: &mut DocTab, name: &str, key: &str) {
+    vm(t).enter_entry_row();
+    vm(t).col = COL_NAME;
+    vm(t).open_cell(Some(name)).unwrap();
+    project_cell_input(t, key, None, Modifiers::default());
+}
+
+#[test]
+fn enter_after_an_entry_row_commit_returns_to_the_entry_row_under_a_sort() {
+    let mut t = tab();
+    open(&mut t, COL_NAME);
+    dialog_click(&mut t, "Sort A to Z").unwrap();
+    // "Amy" ranks between A and B, so it is not the last displayed row.
+    type_entry(&mut t, "Amy", "enter");
+    assert!(v(&t).on_entry_row(), "the cursor is on the entry row");
+    assert_eq!(names(&t), ["S", "A", "Amy", "B", "C"]);
+    assert!(v(&t).cell.is_none());
+    // The next name is a new task, not a rewrite of Amy.
+    type_entry(&mut t, "Bob", "enter");
+    assert_eq!(names(&t), ["S", "A", "Amy", "B", "Bob", "C"]);
+    assert!(v(&t).on_entry_row());
+}
+
+#[test]
+fn a_new_entry_task_a_filter_hides_leaves_the_cursor_on_the_entry_row() {
+    let mut t = tab();
+    open(&mut t, COL_NAME);
+    set_checks(&mut t, |checks, depths| {
+        gridcore::filter::check_tree(checks, depths, 0, false);
+        gridcore::filter::check_tree(checks, depths, 2, true);
+    });
+    dialog_click(&mut t, "OK").unwrap();
+    assert_eq!(names(&t), ["S", "B"]);
+    type_entry(&mut t, "Zed", "enter");
+    assert_eq!(v(&t).ed.project().tasks.len(), 5);
+    assert!(v(&t).on_entry_row());
+    assert_eq!(names(&t), ["S", "B"], "Zed fails the Name filter");
+    assert!(v(&t).ed.display_rows().contains(&v(&t).ed.sel()));
+}
+
+#[test]
+fn an_edit_that_hides_the_cursor_row_moves_it_to_a_shown_row() {
+    let mut t = tab();
+    open(&mut t, COL_NAME);
+    set_checks(&mut t, |checks, depths| {
+        gridcore::filter::check_tree(checks, depths, 0, false);
+        gridcore::filter::check_tree(checks, depths, 1, true);
+        gridcore::filter::check_tree(checks, depths, 2, true);
+    });
+    dialog_click(&mut t, "OK").unwrap();
+    assert_eq!(names(&t), ["S", "B", "A"]);
+    vm(&mut t).ed.select(2);
+    vm(&mut t).ed.rename(3, "Zed").unwrap();
+    let ed = &v(&t).ed;
+    assert!(
+        ed.display_rows().contains(&ed.sel()),
+        "the cursor row is shown"
+    );
+    assert_eq!(
+        v(&t).display_row(),
+        v(&t)
+            .ed
+            .display_rows()
+            .iter()
+            .position(|&i| i == v(&t).ed.sel())
+            .unwrap()
+    );
+}
+
+#[test]
+fn select_all_on_a_filtered_column_clears_the_filter() {
+    let mut t = tab();
+    open(&mut t, COL_NAME);
+    set_checks(&mut t, |checks, depths| {
+        gridcore::filter::check_tree(checks, depths, 0, false);
+        gridcore::filter::check_tree(checks, depths, 2, true);
+    });
+    dialog_click(&mut t, "OK").unwrap();
+    assert!(v(&t).ed.is_filtered());
+    open(&mut t, COL_NAME);
+    set_checks(&mut t, |checks, depths| {
+        gridcore::filter::check_tree(checks, depths, 0, true);
+    });
+    dialog_click(&mut t, "OK").unwrap();
+    assert!(!v(&t).ed.is_filtered());
+    assert_eq!(t.status.as_ref(), "Filter cleared from Name");
+    assert_eq!(names(&t), ["S", "B", "A", "C"]);
+}

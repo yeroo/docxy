@@ -1115,8 +1115,8 @@ Skill: `xlsxy install skill`.
 resource assignments, by assignment UID), `proj.save {path?}`, `proj.reload`,
 `proj.open {path}`, `proj.view` / `proj.sort {column?, descending?}` /
 `proj.filter {column, values? | clear}` (the grid's sort and AutoFilter, view
-state: `values` are cell texts, or on a date column `YYYY`, `YYYY-MM`,
-`YYYY-MM-DD`; #1533), `app-info` (the build; #1023). Edits
+state: `values` are cell texts, `(Blanks)` for an empty cell, or on a date
+column `YYYY`, `YYYY-MM`, `YYYY-MM-DD`; #1533), `app-info` (the build; #1023). Edits
 reschedule the plan (CPM) live. MCP: `claude mcp add yppxy -- yppxy --mcp` →
 `yppxy_list`, `yppxy_status`, `yppxy_tasks`, `yppxy_get`, `yppxy_set`,
 `yppxy_fields`, `yppxy_add`, `yppxy_del`, `yppxy_link`, `yppxy_unlink`,

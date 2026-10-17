@@ -25,7 +25,7 @@ pub(super) use timeline::*;
 mod rows;
 pub(super) use rows::*;
 mod columns;
-pub(super) use columns::{ARROW_W, EDGE_W, WidthDrag, project_width_release_all};
+pub(super) use columns::{ARROW_W, EDGE_W, WidthDrag, committed_widths, project_width_release_all};
 mod autofilter;
 pub(super) use autofilter::{AUTO_FILTER_STATUS, autofilter_click};
 
@@ -173,7 +173,8 @@ impl ProjectView {
     }
 
     fn apply_widths(&mut self) {
-        self.table_w = split_table_width_for(self.width, self.split, self.table_total());
+        self.table_w =
+            split_table_width_for(self.width, self.split, self.table_total(), self.widths()[0]);
         self.gantt_w = (self.width - self.table_w - GANTT_INSET - SCROLLBAR_W).max(0.);
         self.refresh_schedule_layout();
     }
@@ -185,6 +186,7 @@ impl ProjectView {
             self.width,
             Some(table_w),
             self.table_total(),
+            self.widths()[0],
         ));
         self.apply_widths();
     }
@@ -239,8 +241,10 @@ impl ProjectView {
         }
     }
 
-    /// The cursor's row as shown, where collapsed summaries hide rows: its
-    /// position among the visible rows, or their count on the entry row.
+    /// The cursor's row as shown, where collapsed summaries and the AutoFilter
+    /// hide rows: its position among the displayed rows (0 for a selection
+    /// none shows, which an edit's `sel_into_display` prevents), or their
+    /// count on the entry row.
     pub fn display_row(&self) -> usize {
         let rows = self.ed.display_rows();
         if self.on_entry_row() {
@@ -315,7 +319,11 @@ impl ProjectView {
             "up" if self.on_entry_row() => last.unwrap_or(0),
             "up" => self.ed.visible_step(self.ed.sel(), -1),
             // Down from the last task goes to the entry row, as in Project.
-            "down" if self.on_entry_row() || last.is_none_or(|last| self.ed.sel() == last) => {
+            "down"
+                if self.on_entry_row()
+                    || last.is_none_or(|last| self.ed.sel() == last)
+                    || !self.ed.display_rows().contains(&self.ed.sel()) =>
+            {
                 self.enter_entry_row();
                 return true;
             }

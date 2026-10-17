@@ -322,3 +322,30 @@ fn filter_texts_resolve_values_blanks_and_date_nodes() {
     // A text value that looks like a number is still a value first.
     assert!(ed.filter_texts(Field::Name, &specs(&["(Blanks)"])).is_err());
 }
+
+#[test]
+fn an_edit_that_hides_the_selected_task_moves_the_selection_to_a_displayed_row() {
+    let mut ed = sample();
+    // Name filter: A and B stay. Rename A to something else: it fails.
+    ed.set_filter(Field::Name, only(&["A", "B"]));
+    ed.select(0);
+    ed.rename(1, "Zed").unwrap();
+    let shown = ed.display_rows();
+    assert!(
+        shown.contains(&ed.sel()),
+        "sel {} not in {shown:?}",
+        ed.sel()
+    );
+    assert_eq!(ed.project().tasks[ed.sel()].name, "B");
+    // Undo brings A back, and the selection stays on a displayed row.
+    assert!(ed.undo());
+    assert!(ed.display_rows().contains(&ed.sel()));
+
+    // A Duration filter: lengthening the selected task leaves the list.
+    let mut ed = sample();
+    ed.set_filter(Field::Duration, only(&["3 days"]));
+    ed.select(0);
+    ed.set_duration(1, "9d").unwrap();
+    assert!(ed.display_rows().contains(&ed.sel()));
+    assert_ne!(ed.selected_uid(), Some(1));
+}

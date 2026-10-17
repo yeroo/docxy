@@ -248,7 +248,10 @@ pub(crate) fn table_pane_width_for(width: f32, total: f32) -> f32 {
     (width * 0.5).max(320.).min(total).min(width.max(0.))
 }
 
-/// The split bar never hides the ID column, and leaves the chart some days.
+/// The split bar never narrows the table below the ID column's default width
+/// (the live width, `ProjectView::widths()[0]`, in production), and leaves the
+/// chart some days.
+#[cfg(test)]
 pub(crate) const MIN_TABLE_W: f32 = DEFAULT_WIDTHS[0];
 pub(crate) const MIN_CHART_W: f32 = 48.;
 
@@ -256,17 +259,23 @@ pub(crate) const MIN_CHART_W: f32 = 48.;
 /// window is too narrow for both minimums the chart's yields first.
 #[cfg(test)]
 pub(crate) fn split_table_width(width: f32, split: Option<f32>) -> f32 {
-    split_table_width_for(width, split, TABLE_W)
+    split_table_width_for(width, split, TABLE_W, MIN_TABLE_W)
 }
 
-/// [`split_table_width`] for columns `total` px wide in all.
-pub(crate) fn split_table_width_for(width: f32, split: Option<f32>, total: f32) -> f32 {
+/// [`split_table_width`] for columns `total` px wide in all, whose ID column
+/// is `min_table` wide: the split bar never hides it.
+pub(crate) fn split_table_width_for(
+    width: f32,
+    split: Option<f32>,
+    total: f32,
+    min_table: f32,
+) -> f32 {
     let Some(w) = split else {
         return table_pane_width_for(width, total);
     };
     w.min(total)
         .min(width - GANTT_INSET - SCROLLBAR_W - MIN_CHART_W)
-        .max(MIN_TABLE_W)
+        .max(min_table)
         .min(width.max(0.))
 }
 

@@ -106,7 +106,7 @@ impl Editor {
     }
 
     /// Move a selection the filter hides to the first displayed row.
-    fn sel_into_display(&mut self) {
+    pub(super) fn sel_into_display(&mut self) {
         let rows = self.display_rows();
         if rows.contains(&self.sel) || self.sel_pinned {
             return;

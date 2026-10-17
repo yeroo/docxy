@@ -111,3 +111,25 @@ fn widths_survive_a_yppx_round_trip_and_an_mspdi_save_has_none() {
     let again = ProjectView::new(projcore::mspdi::read_mspdi(&xml).unwrap(), false);
     assert_eq!(again.widths(), DEFAULT_WIDTHS);
 }
+
+#[test]
+fn resizing_a_column_does_not_scroll_the_table_back_to_the_cursor_column() {
+    let mut v = view();
+    v.layout(900.);
+    v.col = COL_ID;
+    v.table_x.set(200.);
+    assert!(v.set_column_width(COL_RESOURCES, 150.));
+    assert_eq!(v.table_x.get(), 200., "the offset stays (only re-clamped)");
+}
+
+#[test]
+fn the_split_bar_keeps_the_live_id_width() {
+    let mut v = view();
+    v.set_column_width(COL_ID, 120.);
+    v.layout(1400.);
+    v.set_split(-500.);
+    assert_eq!(v.table_w, 120.);
+    v.set_column_width(COL_ID, 30.);
+    v.set_split(-500.);
+    assert_eq!(v.table_w, 30.);
+}

@@ -1150,11 +1150,17 @@ impl App {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .collect();
+        self.filter_values(field, &specs)
+    }
+
+    /// Filter `field` to `specs` (see `Editor::filter_texts`); none clears
+    /// the column's filter, and every value is no filter at all.
+    fn filter_values(&mut self, field: Field, specs: &[String]) -> Result<String, String> {
         if specs.is_empty() {
             self.ed.set_filter(field, None);
             return Ok(format!("Filter cleared from {}", field.name()));
         }
-        let allowed = self.ed.filter_texts(field, &specs)?;
+        let allowed = self.ed.filter_texts(field, specs)?;
         // Every value allowed is no filter at all.
         if allowed.len() == self.ed.column_values(field).len() {
             self.ed.set_filter(field, None);
