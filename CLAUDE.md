@@ -213,6 +213,36 @@
   the package only (a settings part docxy cannot edit refuses) and have no
   undo in the terminal.
 
+## Header & Footer leftovers (#1433)
+
+- `docxcore::ptab` reads a `w:ptab` (alignment, relativeTo, leader) and holds
+  the stop and gap maths both hosts share, in the unit each counts: cells in
+  `render.rs`, px in the suite (`ptab_stop`/`ptab_gap` wrap it with the 4 px
+  right inset). The terminal fills the gap with the leader glyph (cells carry
+  no editor offset). The suite lays a ptab out wherever the line width is
+  known: `RenderCtx::hf_width` (header/footer) or `line_width` (a Print
+  Layout column or a table cell); the flow view has none, so a body ptab
+  there stays a zero-width object. `ptab_gap_el` draws the leader.
+- A delete over a floating drawing or `w:ptab` (zero-width: no offset reaches
+  it) records each as its own `w:del` while tracking
+  (`Editor::drop_or_record_objects`, from `spanned_object_indices`). A cut
+  over 3+ paragraphs keeps the zero-width objects of the paragraphs it
+  removes whole, re-inserted at the seam: the clip cannot carry them.
+- `sdt::BoundProp` (was `CoreProp`) adds Company and Manager, bound to
+  `docProps/app.xml` under the extended-properties store item
+  (`{55AF091B-…}`; unmeasured against Word). `DocTab::sync_bound_property`
+  (in `set_dirty`) takes the control at the caret, in the open header/footer
+  else the body, and when its text is not the property writes the part
+  (`BoundProp::write`) and shows it in the other controls with
+  `Editor::set_bound_property`: no undo step of its own, so an undo puts
+  every control back and the next sync writes the old value back. Controls
+  in a header or footer that is not open, and a package without the part,
+  are not reached; terminal `docxy` has no package sync.
+- Insert > Text has Date & Time... and Quick Parts (the H&F tab's commands,
+  acting on the body when no header or footer is open; KeyTips D and K, as Q
+  is Field's). Alt+Shift+D / T insert a DATE / TIME field
+  (`doc_fields::doc_insert_key`).
+
 ## Format plugins
 
 - A format plugin is a `yppx_*` shared library (`.dll`/`.so`/`.dylib`)
