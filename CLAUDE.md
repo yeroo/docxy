@@ -502,14 +502,15 @@
   Year > Month > Day tree on dates, two-state boxes), OK applies (all checked
   is no filter; none is refused), Cancel discards. `menu-open {"target":
   {"filter":"Finish"}}` opens it; `rows` reports `filter`, `filters`, `sort`,
-  `sort_descending` and `widths`, `tab-list`-style state reports `widths`; the
-  status bar adds `AutoFilter Applied` while filtered.
+  `sort_descending` and `widths`, the Project state reports `widths` and
+  `filtered`; the status bar adds `AutoFilter Applied` while filtered.
 - yppxy (terminal) has View > Data > Sort... / Filter... prompts, `:sort` and
   `:filter`, and the control verbs `proj.view`, `proj.sort`, `proj.filter`
   (`Editor::filter_texts` resolves a value, `(Blanks)` or `YYYY[-MM[-DD]]`);
   no mouse resize.
 - `uiharness/cases/project-columns.uit` and `project-autofilter.uit` drive it;
-  they cannot run on macOS (the window belongs to another process there).
+  the sweeps run them (macOS cannot drive the window, so they were not run
+  there).
 
 ## Project summary row (UID 0) is not a grid row (#1511)
 
