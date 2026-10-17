@@ -201,9 +201,11 @@ pub fn dispatch_editor(ed: &mut Editor, verb: &str, args: &Json) -> Option<Resul
         "level.all" => Ok(level_set(ed, true)),
         "level.clear" => Ok(level_set(ed, false)),
         "level.overallocations" => Ok(level_overallocations(ed)),
-        "level.selection" | "level.resource" | "level.options" => Err(format!(
-            "{verb}: the model levels the whole plan (yeroo/docxy #1594); level.all and level.clear switch it"
-        )),
+        // (`apply_ops` prefixes the verb itself.)
+        "level.selection" | "level.resource" | "level.options" => Err(
+            "the model levels the whole plan (yeroo/docxy #1594); level.all and level.clear switch it"
+                .into(),
+        ),
         _ => return None,
     })
 }
