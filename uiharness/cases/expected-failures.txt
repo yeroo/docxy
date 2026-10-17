@@ -29,21 +29,6 @@ backstage-inputs-typing.uit | rename sheet-tab-rename: select-all replaces | #13
 backstage-inputs-typing.uit | rename sheet-tab-rename: copies | #1365
 backstage-inputs-typing.uit | rename sheet-tab-rename: pastes | #1365
 
-# Ctrl+C and Ctrl+V do nothing in these terminal prompts: no copy or paste
-# (#1204).
-terminal-docxy-inputs-typing.uit | docxy docxy-find: copies | #1377
-terminal-docxy-inputs-typing.uit | docxy docxy-find: pastes | #1377
-terminal-docxy-inputs-typing.uit | docxy docxy-replace: copies | #1377
-terminal-docxy-inputs-typing.uit | docxy docxy-replace: pastes | #1377
-terminal-docxy-inputs-typing.uit | docxy docxy-compare-original: copies | #1377
-terminal-docxy-inputs-typing.uit | docxy docxy-compare-original: pastes | #1377
-terminal-docxy-inputs-typing.uit | docxy docxy-compare-revised: copies | #1377
-terminal-docxy-inputs-typing.uit | docxy docxy-compare-revised: pastes | #1377
-terminal-xlsxy-inputs-typing.uit | xlsxy xlsxy-prompt: copies | #1377
-terminal-xlsxy-inputs-typing.uit | xlsxy xlsxy-prompt: pastes | #1377
-terminal-xlsxy-inputs-typing.uit | xlsxy xlsxy-cell: copies | #1377
-terminal-xlsxy-inputs-typing.uit | xlsxy xlsxy-cell: pastes | #1377
-
 # A Ctrl chord types its bare letter (Ctrl+C types c, Ctrl+V types v) in
 # docxy's new comment, yppxy's prompt and Backstage Save As's file name in
 # all three editors (#1204).
