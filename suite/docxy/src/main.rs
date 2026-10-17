@@ -161,7 +161,7 @@ use project::*;
 use std::path::PathBuf;
 
 use docxcore::comments::Comment;
-use docxcore::editor::{Caret, Clip, Editor, FoundMatch, step_found};
+use docxcore::editor::{Caret, Clip, Editor, FoundMatch, PropSource, step_found};
 use docxcore::markup::MarkupView;
 use docxcore::model::{
     Align, Block, BorderKind, Document, Inline, ParBorders, Paragraph, RunProps, Table, VertAlign,
@@ -5030,6 +5030,71 @@ impl DocTab {
                 pkg.set_gutter_at_top(s.gutter_at_top);
             }
         }
+        self.sync_bound_property();
+    }
+
+    /// Typing in a document property control writes the property back to
+    /// `docProps/core.xml` or `app.xml` and shows it in the other controls
+    /// bound to it (#1433). Only an edit of a control's text counts
+    /// (`Editor::take_bound_edits`, in the open header or footer and in the
+    /// body): a package-only change (Inspect Document's Remove All), a
+    /// formatting change or a property another tool changed writes nothing.
+    /// An undo or redo that puts the old text back writes the old value, and
+    /// the other controls follow with no step of their own
+    /// (`Editor::set_bound_property`); the other editor takes it as an undo
+    /// step of its own. A package without the part keeps the
+    /// text in its controls only, and controls in a header or footer that is
+    /// not open are not reached.
+    fn sync_bound_property(&mut self) {
+        let (Surface::Doc(body), Some(pkg)) = (&mut self.surface, self.pkg.as_mut()) else {
+            return;
+        };
+        // Every edited property, the header or footer's first: where it was
+        // typed is its source, which takes the change with the edit's own
+        // undo step, and the other editor gets a step of its own.
+        let mut edits: Vec<(docxcore::sdt::BoundProp, String, bool)> = self
+            .hf_edit
+            .as_mut()
+            .map(|h| h.editor.take_bound_edits())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(p, t)| (p, t, true))
+            .collect();
+        for (p, t) in body.take_bound_edits() {
+            if !edits.iter().any(|(q, _, _)| *q == p) {
+                edits.push((p, t, false));
+            }
+        }
+        // The newest step of the editor each edit came from, after the edit.
+        let body_step = body.undo_serial();
+        let hf_step = self.hf_edit.as_ref().and_then(|h| h.editor.undo_serial());
+        for (prop, text, from_hf) in edits {
+            let Some(xml) = pkg.part_text(prop.part_name()) else {
+                continue;
+            };
+            let Some(new) = prop.write(&xml, &text) else {
+                continue;
+            };
+            pkg.set_part_text(prop.part_name(), &new);
+            let other = |newest_step| PropSource::Other { newest_step };
+            body.set_bound_property(
+                prop,
+                &text,
+                if from_hf {
+                    other(hf_step)
+                } else {
+                    PropSource::Here
+                },
+            );
+            if let Some(h) = &mut self.hf_edit {
+                let from = if from_hf {
+                    PropSource::Here
+                } else {
+                    other(body_step)
+                };
+                h.editor.set_bound_property(prop, &text, from);
+            }
+        }
     }
 
     /// Every edit of a workbook ends here ([`Docxy::mark_sheet_dirty`]). In
@@ -7682,6 +7747,9 @@ struct RenderCtx<'a> {
     /// Content width (px) when rendering header/footer paragraphs, enabling the
     /// implicit centre/right tab stops. `None` for body paragraphs.
     hf_width: Option<f32>,
+    /// The text width (px) of the column or cell a body paragraph lies in, for
+    /// its alignment tabs (#1433); `None` where it is not known (the flow view).
+    line_width: Option<f32>,
     /// Table styles and view settings for drawing tables.
     tbl: &'a TableCtx<'a>,
     /// The story's cell-range selection, highlighted cell by cell.
@@ -25131,6 +25199,19 @@ impl Docxy {
             self.keytips = KeyTip::Off;
             return self.doc_field_key_press(doc_fields::FieldKey::ToggleCodes, window, cx);
         }
+        // Alt+Shift+D / Alt+Shift+T insert the date / time field (#1433): the
+        // Alt key-down raised the KeyTips, which would take the letter, so
+        // they go down unasked. On macOS ⌥⇧D is text AppKit commits, which
+        // `ImeState::commit` replays as this key.
+        if self.active_is_doc() && !self.entry_owns_keys() {
+            if let Some(insert) = doc_fields::doc_insert_key(&key, ctrl, shift, m.alt) {
+                self.keytips = KeyTip::Off;
+                if self.protected_refused(cx) {
+                    return self.refocus(window, cx);
+                }
+                return self.insert_field(insert.instr(), "", window, cx);
+            }
+        }
         // KeyTips (Alt / F10 access keys): toggle the overlay; while it's showing,
         // letters pick a tab / run a command instead of typing.
         if (key == "alt" || key == "f10") && !ctrl {
@@ -27992,6 +28073,9 @@ fn repeat_untouched(rec: &Option<RepeatRecord>) -> bool {
 fn keep_current(rec: &mut Option<RepeatRecord>, keep: bool) {
     if let (true, Some(r)) = (keep, rec.as_mut()) {
         r.generation = edit_generation();
+        // The only step pushed after the record was taken is the property
+        // sync's, in the other editor (#1433): none the record's editor made.
+        r.counter = docxcore::editor::undo_serial_counter();
     }
 }
 
@@ -29415,9 +29499,11 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                 rs::group(
                     "Text",
                     30,
-                    vec![Control::Large(
-                        cmdt("field", "case", "Field", InsertField, "").key("Q"),
-                    )],
+                    vec![
+                        Control::Large(cmdt("field", "case", "Field", InsertField, "").key("Q")),
+                        hf_tab::date_time_control("D"),
+                        hf_tab::quick_parts_control("K"),
+                    ],
                 ),
                 rs::group(
                     "Symbols",
@@ -31083,34 +31169,16 @@ fn para_base(p: &Paragraph, zoom: f32) -> f32 {
     }
 }
 
-/// An alignment tab (`w:ptab`, #768): where it aligns the text after it,
-/// and whether it measures from the paragraph's indents rather than the
-/// margins.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Ptab {
-    align: docxcore::model::TabAlign,
-    indent: bool,
-}
+/// An alignment tab (`w:ptab`, #768); docxcore reads and measures it for both
+/// hosts (#1433).
+type Ptab = docxcore::ptab::Ptab;
 
 /// The alignment tab a raw run holds, if it holds one.
 fn ptab_of(it: &Inline) -> Option<Ptab> {
-    use docxcore::model::TabAlign;
-    let Inline::Raw(raw) = it else {
-        return None;
-    };
-    if !raw.starts_with("<w:r") {
-        return None;
+    match it {
+        Inline::Raw(raw) => docxcore::ptab::parse(raw),
+        _ => None,
     }
-    let at = raw.find("<w:ptab")?;
-    let end = at + raw[at..].find('>')?;
-    let el = &raw[at..end];
-    let align = match docxcore::load::xml_attr_value(el, "w:alignment").as_deref() {
-        Some("center") => TabAlign::Center,
-        Some("right") => TabAlign::Right,
-        _ => TabAlign::Left,
-    };
-    let indent = docxcore::load::xml_attr_value(el, "w:relativeTo").as_deref() == Some("indent");
-    Some(Ptab { align, indent })
 }
 
 /// Where an alignment tab's stop is, in px from the left margin, on a line
@@ -31118,30 +31186,56 @@ fn ptab_of(it: &Inline) -> Option<Ptab> {
 /// right stop sits a few px inside the edge, as the implicit header stops
 /// do, so the segment ending there does not wrap the row.
 fn ptab_stop(p: Ptab, width: f32, left: f32, right: f32) -> f32 {
-    use docxcore::model::TabAlign;
-    let (lo, hi) = if p.indent {
-        (left, (width - right).max(left))
-    } else {
-        (0.0, width)
-    };
-    match p.align {
-        TabAlign::Left => lo,
-        TabAlign::Center => (lo + hi) / 2.0,
-        _ => (hi - 4.0).max(lo),
-    }
+    docxcore::ptab::stop(p, width, left, right, 4.0)
 }
 
 /// The space an alignment tab at `xm` (px from the margin) leaves so the
 /// segment after it, `seg` px wide, starts at, centres on or ends at
 /// `stop`; none when the text has already passed it (it does not wrap).
 fn ptab_gap(align: docxcore::model::TabAlign, stop: f32, xm: f32, seg: f32) -> f32 {
-    use docxcore::model::TabAlign;
-    match align {
-        TabAlign::Center => stop - seg / 2.0 - xm,
-        TabAlign::Right => stop - seg - xm,
-        _ => stop - xm,
+    docxcore::ptab::gap(align, stop, xm, seg)
+}
+
+/// How many leader glyphs of `one` px fit in a `gap` px wide alignment tab,
+/// at most 1000.
+fn ptab_leader_count(gap: f32, one: f32) -> usize {
+    if one > 0.0 {
+        ((gap / one) as usize).min(1000)
+    } else {
+        0
     }
-    .max(0.0)
+}
+
+/// The width an alignment tab measures against: the column or cell it lies in
+/// when that is known (a header or footer table cell has both), else the
+/// header or footer's text width (#1433).
+fn ptab_line_width(hf_width: Option<f32>, line_width: Option<f32>) -> Option<f32> {
+    line_width.or(hf_width)
+}
+
+/// The gap an alignment tab leaves, `gap` px wide: blank, or filled with its
+/// leader's glyph repeated to fit (#1433).
+fn ptab_gap_el(
+    gap: f32,
+    leader: docxcore::ptab::PtabLeader,
+    base: f32,
+    pal: Pal,
+    meas: Option<&Measurer>,
+) -> AnyElement {
+    let mut d = div().flex_none().w(px(gap)).h(px(1.));
+    if let (Some(glyph), Some(m)) = (leader.glyph(), meas) {
+        let n = ptab_leader_count(gap, m.width(&glyph.to_string(), base, false, false));
+        if n > 0 {
+            d = d
+                .h(px(base * 1.35))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_size(px(base))
+                .text_color(pal.dim)
+                .child(glyph.to_string().repeat(n));
+        }
+    }
+    d.into_any_element()
 }
 
 /// An inline picture's frame in px at `zoom`, from its extent in EMUs
@@ -31202,6 +31296,7 @@ fn hf_para_el(p: &Paragraph, pal: Pal, meas: &Measurer, width: f32, zoom: f32) -
         pal,
         Some(meas),
         Some(width),
+        None,
         false,
         false,
         // Header/footer text is never line-numbered (#746).
@@ -31546,6 +31641,7 @@ fn paragraph_el(
     pal: Pal,
     meas: Option<&Measurer>,
     hf_width: Option<f32>,
+    line_width: Option<f32>,
     merge_hl: bool,
     field_codes: bool,
     lines: Option<LineSlot>,
@@ -31718,13 +31814,16 @@ fn paragraph_el(
             Inline::Raw(xml) => {
                 // An alignment tab (#768) places the text after it against the
                 // line's margin or indent, where the line's width is known (a
-                // header or footer); it takes no caret offset.
-                if let (Some(ptab), Some(w)) = (ptab_of(inline), hf_width) {
+                // header or footer, or a body column or cell, #1433); it takes
+                // no caret offset.
+                if let (Some(ptab), Some(w)) =
+                    (ptab_of(inline), ptab_line_width(hf_width, line_width))
+                {
                     let stop =
                         ptab_stop(ptab, w, tw_px(indent.left, zoom), tw_px(indent.right, zoom));
                     let gap = ptab_gap(ptab.align, stop, pad_l + x, seg_width(i + 1));
                     if gap > 0.0 {
-                        spans.push(div().flex_none().w(px(gap)).h(px(1.)).into_any_element());
+                        spans.push(ptab_gap_el(gap, ptab.leader, base, pal, meas));
                         x += gap;
                     }
                 }
@@ -32121,6 +32220,7 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
             // The cell's text: over its style's run formatting, and in ink
             // that reads on its fill (#765).
             let cell_ctx = RenderCtx {
+                line_width: Some(tw_px(cb.width as i32 - 216, zoom).max(0.0)),
                 pal: cell_pal(ctx.pal, cb.fill),
                 cell_run: Some(&cb.run),
                 ..ctx
@@ -32418,6 +32518,7 @@ fn block_el_numbered(
                 ctx.pal,
                 Some(ctx.meas),
                 ctx.hf_width,
+                ctx.line_width,
                 ctx.merge_hl,
                 ctx.field_codes,
                 lines,
@@ -37701,6 +37802,7 @@ impl Render for Docxy {
                         active: hf.is_none() && self.markup.is_editable() && !previewing,
                         meas: &measurer,
                         hf_width: None,
+                        line_width: None,
                         tbl: &tbl,
                         cell_range: body_range.as_ref(),
                         merge_hl: tab.mail.highlight,
@@ -37856,13 +37958,19 @@ impl Render for Docxy {
                             };
                             if sect.col_w.len() <= 1 {
                                 let (s, e) = band.cols.first().copied().unwrap_or((0, 0));
+                                let col_ctx = RenderCtx {
+                                    line_width: Some(
+                                        zoom * sect.single_col_w().max(0) as f32 / 15.0,
+                                    ),
+                                    ..ctx
+                                };
                                 let blocks: Vec<AnyElement> = (s..e)
                                     .map(|i| {
                                         block_el_numbered(
                                             &body[i],
                                             vec![i],
                                             markers[i].as_deref(),
-                                            ctx,
+                                            col_ctx,
                                             slot_for(&body[i]),
                                         )
                                     })
@@ -37894,13 +38002,17 @@ impl Render for Docxy {
                                     els.push(g.into_any_element());
                                 }
                                 let (s, e) = band.cols.get(ci).copied().unwrap_or((0, 0));
+                                let col_ctx = RenderCtx {
+                                    line_width: Some(zoom * sect.col_w[ci].max(0) as f32 / 15.0),
+                                    ..ctx
+                                };
                                 let blocks: Vec<AnyElement> = (s..e)
                                     .map(|i| {
                                         block_el_numbered(
                                             &body[i],
                                             vec![i],
                                             markers[i].as_deref(),
-                                            ctx,
+                                            col_ctx,
                                             slot_for(&body[i]),
                                         )
                                     })
@@ -37944,6 +38056,7 @@ impl Render for Docxy {
                                     active: true,
                                     meas: &measurer,
                                     hf_width: Some(hf_w),
+                                    line_width: None,
                                     tbl: &tbl,
                                     cell_range: hf_range.as_ref(),
                                     merge_hl: tab.mail.highlight,

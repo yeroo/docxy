@@ -16,7 +16,7 @@ use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
 use crate::page_setup::{choice, chosen, ok_cancel, text_of};
 use docxcore::field::{DateTime, FieldContext};
-use docxcore::sdt::CoreProp;
+use docxcore::sdt::BoundProp;
 use hf_tab::HfAct;
 use std::path::Path;
 
@@ -247,15 +247,19 @@ fn story_xmls(tab: &DocTab) -> Vec<String> {
 
 /// The document property control for `prop` at the caret of `tab`'s edited
 /// story: bound to the property, showing its value from
-/// `docProps/core.xml` (or the placeholder), with an id no other control
+/// `docProps/core.xml` or `app.xml` (or the placeholder), with an id no other control
 /// in the document has.
-pub(crate) fn property_control(tab: &DocTab, prop: CoreProp) -> Vec<Inline> {
-    let core = tab
-        .pkg
-        .as_ref()
-        .and_then(|p| p.part_text("docProps/core.xml"))
-        .unwrap_or_default();
-    let value = prop.value(&docxcore::field::parse_core_props(&core));
+pub(crate) fn property_control(tab: &DocTab, prop: BoundProp) -> Vec<Inline> {
+    let part = |name| {
+        tab.pkg
+            .as_ref()
+            .and_then(|p| p.part_text(name))
+            .unwrap_or_default()
+    };
+    let value = prop.value(&docxcore::field::parse_app_props(
+        &part("docProps/core.xml"),
+        &part("docProps/app.xml"),
+    ));
     let xmls = story_xmls(tab);
     let id = docxcore::sdt::next_control_id(xmls.iter().map(String::as_str));
     let run_props = tab_edit_target_ref(tab)

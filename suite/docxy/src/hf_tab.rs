@@ -27,7 +27,7 @@ use crate::hf::PageSlot;
 use crate::page_flow;
 use crate::page_setup::{ok_cancel, text_of, twips_of};
 use ctlcore::json::Json;
-use docxcore::sdt::CoreProp;
+use docxcore::sdt::BoundProp;
 use docxcore::sect::{TWIPS_PER_INCH, hf_reference, set_hf_reference};
 
 pub(crate) use docxcore::hf::rewrite_part;
@@ -71,7 +71,7 @@ pub(crate) enum HfAct {
     FileName(bool),
     /// A document property control: Document Info › Author and Document
     /// Title, and Document Property › in both menus.
-    Property(CoreProp),
+    Property(BoundProp),
     /// Pictures...: a picture from a file.
     Pictures,
     /// Online Pictures...: its dialog, which offers a file instead.
@@ -124,31 +124,37 @@ const MENU_IDS: [(HfMenu, &str); 7] = [
     (HfMenu::QuickParts, "hf-quickparts"),
 ];
 
-/// Document Property ›'s items' ids in each menu, in [`CoreProp::ALL`]'s
+/// Document Property ›'s items' ids in each menu, in [`BoundProp::ALL`]'s
 /// order, and the labels the ribbon's flat item list gives them.
-const INFO_PROP_IDS: [&str; 7] = [
+const INFO_PROP_IDS: [&str; 9] = [
     "hf-info-prop-author",
     "hf-info-prop-category",
     "hf-info-prop-comments",
+    "hf-info-prop-company",
     "hf-info-prop-keywords",
+    "hf-info-prop-manager",
     "hf-info-prop-status",
     "hf-info-prop-subject",
     "hf-info-prop-title",
 ];
-const QP_PROP_IDS: [&str; 7] = [
+const QP_PROP_IDS: [&str; 9] = [
     "hf-qp-prop-author",
     "hf-qp-prop-category",
     "hf-qp-prop-comments",
+    "hf-qp-prop-company",
     "hf-qp-prop-keywords",
+    "hf-qp-prop-manager",
     "hf-qp-prop-status",
     "hf-qp-prop-subject",
     "hf-qp-prop-title",
 ];
-const PROP_ITEM_LABELS: [&str; 7] = [
+const PROP_ITEM_LABELS: [&str; 9] = [
     "Document Property: Author",
     "Document Property: Category",
     "Document Property: Comments",
+    "Document Property: Company",
     "Document Property: Keywords",
+    "Document Property: Manager",
     "Document Property: Status",
     "Document Property: Subject",
     "Document Property: Title",
@@ -278,7 +284,7 @@ fn doc_info_head() -> [rs::Cmd<Act>; 4] {
             "hf-info-author",
             "",
             "Author",
-            hf(HfAct::Property(CoreProp::Author)),
+            hf(HfAct::Property(BoundProp::Author)),
         ),
         rs::cmd(
             "hf-info-filename",
@@ -296,17 +302,17 @@ fn doc_info_head() -> [rs::Cmd<Act>; 4] {
             "hf-info-title",
             "",
             "Document Title",
-            hf(HfAct::Property(CoreProp::Title)),
+            hf(HfAct::Property(BoundProp::Title)),
         ),
     ]
 }
 
 /// Document Property ›'s commands with `ids`, under `labels`.
-fn property_cmds(ids: &[&'static str; 7], labels: &[&'static str; 7]) -> Vec<rs::Cmd<Act>> {
-    CoreProp::ALL
+fn property_cmds(ids: &[&'static str; 9], labels: &[&'static str; 9]) -> Vec<rs::Cmd<Act>> {
+    BoundProp::ALL
         .iter()
         .zip(ids.iter().zip(labels))
-        .map(|(p, (id, label))| rs::cmd(id, "", label, hf(HfAct::Property(*p))))
+        .map(|(p, (id, label))| rs::cmd(id, "info", label, hf(HfAct::Property(*p))))
         .collect()
 }
 
@@ -332,6 +338,46 @@ fn quick_parts_cmds() -> Vec<rs::Cmd<Act>> {
     out
 }
 
+/// Date & Time...: on the Header & Footer tab and, since #1433, Insert ›
+/// Text, where it inserts into the body when no header or footer is open.
+pub(crate) fn date_time_control(key: &'static str) -> Control<Act> {
+    Control::Large(
+        cmdt(
+            "hf-datetime",
+            "mail-update",
+            "Date & Time...",
+            hf(HfAct::DateTime),
+            "",
+        )
+        .tip(
+            "Insert Date and Time",
+            "Add the current date or time to the document, header or footer.",
+            "",
+        )
+        .key(key),
+    )
+}
+
+/// Quick Parts: the same two places as [`date_time_control`].
+pub(crate) fn quick_parts_control(key: &'static str) -> Control<Act> {
+    Control::Dropdown {
+        cmd: cmdt(
+            "hf-quickparts",
+            "case",
+            "Quick Parts",
+            hf(HfAct::Menu(HfMenu::QuickParts)),
+            "",
+        )
+        .tip(
+            "Explore Quick Parts",
+            "Insert a document property or a field.",
+            "",
+        )
+        .key(key),
+        items: quick_parts_cmds(),
+    }
+}
+
 /// The contextual Header & Footer tab.
 pub(crate) fn hf_tab() -> rs::Tab<Act> {
     rs::tab(
@@ -343,21 +389,7 @@ pub(crate) fn hf_tab() -> rs::Tab<Act> {
                 "Insert",
                 20,
                 vec![
-                    Control::Large(
-                        cmdt(
-                            "hf-datetime",
-                            "mail-update",
-                            "Date & Time...",
-                            hf(HfAct::DateTime),
-                            "",
-                        )
-                        .tip(
-                            "Insert Date and Time",
-                            "Add the current date or time to the header or footer.",
-                            "",
-                        )
-                        .key("D"),
-                    ),
+                    date_time_control("D"),
                     Control::Dropdown {
                         cmd: cmdt(
                             "hf-docinfo",
@@ -374,22 +406,7 @@ pub(crate) fn hf_tab() -> rs::Tab<Act> {
                         .key("I"),
                         items: doc_info_cmds(),
                     },
-                    Control::Dropdown {
-                        cmd: cmdt(
-                            "hf-quickparts",
-                            "case",
-                            "Quick Parts",
-                            hf(HfAct::Menu(HfMenu::QuickParts)),
-                            "",
-                        )
-                        .tip(
-                            "Explore Quick Parts",
-                            "Insert a document property or a field.",
-                            "",
-                        )
-                        .key("Q"),
-                        items: quick_parts_cmds(),
-                    },
+                    quick_parts_control("Q"),
                     Control::Large(
                         cmdt(
                             "hf-pictures",
@@ -615,11 +632,11 @@ pub(crate) fn menu_items(tab: Option<&DocTab>, menu: HfMenu) -> Vec<menu::MenuIt
     }
 }
 
-/// Document Property ›: the core properties, by `ids`.
-fn property_menu(id: &str, ids: &[&str; 7]) -> menu::MenuItem {
+/// Document Property ›: the core and extended properties, by `ids`.
+fn property_menu(id: &str, ids: &[&str; 9]) -> menu::MenuItem {
     let mut e = menu::Entry::unavailable(id, "Document Property");
     e.enabled = true;
-    e.submenu = CoreProp::ALL
+    e.submenu = BoundProp::ALL
         .iter()
         .zip(ids)
         .map(|(p, id)| {

@@ -1387,6 +1387,7 @@ fn following_inline_width(items: &[FlatInline<'_>], from: usize) -> usize {
             // Both are laid out as `FlatItem::Run`s by `flat_inlines`.
             Inline::Run(_) | Inline::Hyperlink(_) => {}
             Inline::Tab(_) | Inline::Break(..) => break,
+            Inline::Raw(raw) if crate::ptab::parse(raw).is_some() => break,
             Inline::Equation { text, .. } if !text.contains('\n') => w += str_width(text),
             Inline::Field { text, .. } => w += str_width(text),
             Inline::Revision { content, .. } => {
@@ -1699,6 +1700,39 @@ fn flatten_para(
                     // in the line, so its one offset shows (#1242).
                     let label = format!("[image {pw}×{ph}]");
                     push_unit_label(&mut segs, &label, mc, sel_at(mc), fi.link.clone());
+                }
+                // An alignment tab (#1433) fills a gap so the text after it
+                // starts at, centres on or ends at its stop on the line; it
+                // takes no editor offset, so its cells carry none.
+                if let Some(pt) = crate::ptab::parse(raw) {
+                    let cur: usize = segs.last().unwrap().glyphs.iter().map(glyph_w).sum();
+                    // Columns the paragraph's indent takes, for a margin stop.
+                    let ind = (para.props.indent.max(0) / 120) as usize;
+                    let right = (para.props.indent_right.max(0) / 120) as f32;
+                    let inset = usize::from(inv) as f32;
+                    let stop =
+                        crate::ptab::stop(pt, (avail + ind) as f32, ind as f32, right, inset);
+                    let fw = following_inline_width(&items, k) as f32;
+                    let n =
+                        crate::ptab::gap(pt.align, stop, (cur + ind) as f32, fw).round() as usize;
+                    let n = n.min(avail.saturating_sub(cur));
+                    let fill = pt.leader.glyph();
+                    let seg = &mut segs.last_mut().unwrap().glyphs;
+                    for _ in 0..n {
+                        let (ch, style) = match fill {
+                            Some(c) => (c, dim_style()),
+                            None => (' ', Style::default()),
+                        };
+                        seg.push(Glyph {
+                            ch,
+                            disp: None,
+                            style,
+                            link: None,
+                            src: None,
+                            dir: BidiRunDirection::Natural,
+                            img: None,
+                        });
+                    }
                 }
                 mc += crate::editor::inline_len(item);
             }
@@ -5135,6 +5169,75 @@ mod tests {
         let lines = render(&doc(vec![p]), &opts(40));
         assert_eq!(lead(&lines[0].plain()), 0, "hanging first line");
         assert_eq!(lead(&lines[1].plain()), 6, "hanging continuation");
+    }
+
+    /// #1433: an alignment tab lays out a gap so the text after it starts at,
+    /// centres on or ends at its stop, and its leader fills the gap.
+    #[test]
+    fn a_ptab_lays_out_a_gap_with_its_leader_1433() {
+        let ptab = |align: &str, rel: &str, leader: &str| {
+            Inline::Raw(format!(
+                "<w:r><w:ptab w:relativeTo=\"{rel}\" w:alignment=\"{align}\" w:leader=\"{leader}\"/></w:r>"
+            ))
+        };
+        let line = |inl: Vec<Inline>| -> String {
+            let p = Block::Paragraph(Paragraph {
+                props: ParProps::default(),
+                content: inl,
+            });
+            render(&doc(vec![p]), &opts(40))[0].plain()
+        };
+        let plain = |t: &str| run(t, RunProps::default());
+        // Right: the text after it ends at the right edge.
+        let l = line(vec![
+            plain("Left"),
+            ptab("right", "margin", "none"),
+            plain("Page 1"),
+        ]);
+        assert!(
+            l.starts_with("Left") && l.trim_end().ends_with("Page 1"),
+            "{l:?}"
+        );
+        assert!(l.trim_end().chars().count() >= 38, "{l:?}");
+        // Centre: the middle of the text is near the middle of the line.
+        let l = line(vec![
+            plain("L"),
+            ptab("center", "margin", "none"),
+            plain("Mid"),
+        ]);
+        let at = l.find("Mid").unwrap();
+        assert!((18..=20).contains(&at), "{l:?}");
+        // A leader fills the gap with its glyph (a middle dot, dots, dashes).
+        for (name, glyph) in [
+            ("dot", '.'),
+            ("hyphen", '-'),
+            ("underscore", '_'),
+            ("middleDot", '\u{b7}'),
+        ] {
+            let l = line(vec![plain("A"), ptab("right", "margin", name), plain("Z")]);
+            assert!(l.contains(&glyph.to_string().repeat(10)), "{name}: {l:?}");
+        }
+        let l = line(vec![
+            plain("A"),
+            ptab("right", "margin", "none"),
+            plain("Z"),
+        ]);
+        assert!(!l.contains('.') && !l.contains('-'), "{l:?}");
+        // Text already past the stop: no gap and no wrap.
+        let long = "x".repeat(39);
+        let l = line(vec![
+            plain(&long),
+            ptab("right", "margin", "dot"),
+            plain("Z"),
+        ]);
+        assert!(!l.contains('.'), "{l:?}");
+        // A ptab takes no editor offset: the caret offsets are the text's.
+        let p = Block::Paragraph(Paragraph {
+            props: ParProps::default(),
+            content: vec![plain("A"), ptab("right", "margin", "dot"), plain("Z")],
+        });
+        let (_, maps) = render_mapped(&doc(vec![p]), &opts(40));
+        assert_eq!(maps[0].segs[0].cols, [0, 1, 40]);
     }
 
     #[test]

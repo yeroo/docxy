@@ -9,6 +9,7 @@ use crate::hf_tab::{HfMenu, hf_apply, hf_tab, menu_items};
 use core::prelude::v1::test;
 use docxcore::model::TabAlign;
 use docxcore::package::load_package;
+use docxcore::ptab::PtabLeader;
 
 /// Section 1's header open, the caret at its start.
 fn open_header(t: &mut DocTab) {
@@ -115,7 +116,7 @@ fn the_insert_group_and_position_group_follow_word() {
             item("File Name", true, 0),
             item("File Path", true, 0),
             item("Document Title", true, 0),
-            item("Document Property", true, 7),
+            item("Document Property", true, 9),
             item("Field...", true, 0),
         ]
     );
@@ -126,7 +127,7 @@ fn the_insert_group_and_position_group_follow_word() {
         labels(&quick),
         [
             item("AutoText", false, 0),
-            item("Document Property", true, 7),
+            item("Document Property", true, 9),
             item("Field...", true, 0),
             item("Building Blocks Organizer...", false, 0),
             item("Save Selection to Quick Part Gallery...", false, 0),
@@ -146,7 +147,8 @@ fn the_insert_group_and_position_group_follow_word() {
     assert_eq!(
         names,
         [
-            "Author", "Category", "Comments", "Keywords", "Status", "Subject", "Title"
+            "Author", "Category", "Comments", "Company", "Keywords", "Manager", "Status",
+            "Subject", "Title"
         ]
     );
 }
@@ -267,6 +269,10 @@ fn with_core(name: &str, author: &str, title: &str) -> DocTab {
          <dc:creator>{author}</dc:creator><cp:category>Memo</cp:category></cp:coreProperties>"
     );
     parts.push(("docProps/core.xml".into(), core.into_bytes()));
+    let app = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+        <Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\">\
+        <Application>docxy</Application><Company>Acme</Company></Properties>";
+    parts.push(("docProps/app.xml".into(), app.as_bytes().to_vec()));
     let dir = tmp_dir(name);
     let path = dir.join("in.docx");
     std::fs::write(&path, docxcore::zipwrite::write_zip(&parts)).unwrap();
@@ -282,11 +288,11 @@ fn with_core(name: &str, author: &str, title: &str) -> DocTab {
 fn a_document_property_control_goes_into_the_header_bound() {
     let mut t = with_core("property", "Ann", "Quarterly Report");
     open_header(&mut t);
-    let control = property_control(&t, CoreProp::Title);
+    let control = property_control(&t, BoundProp::Title);
     hf_ed(&mut t).paste(&Clip {
         paras: vec![control],
     });
-    let control = property_control(&t, CoreProp::Status);
+    let control = property_control(&t, BoundProp::Status);
     hf_ed(&mut t).paste(&Clip {
         paras: vec![control],
     });
@@ -318,17 +324,344 @@ fn a_property_controls_id_is_unique_in_the_document() {
     let mut t = header_tab("property-id");
     if let Surface::Doc(ed) = &mut t.surface {
         let body_control =
-            docxcore::sdt::core_property_control(CoreProp::Author, "", 41, &Default::default());
+            docxcore::sdt::core_property_control(BoundProp::Author, "", 41, &Default::default());
         ed.caret = docxcore::editor::Caret::at(vec![0], 0);
         ed.paste(&Clip {
             paras: vec![body_control],
         });
     }
-    let control = property_control(&t, CoreProp::Author);
+    let control = property_control(&t, BoundProp::Author);
     let Inline::Raw(open) = &control[0] else {
         panic!()
     };
     assert!(open.contains("<w:id w:val=\"42\"/>"), "{open}");
+}
+
+/// #1433: typing in a document property control writes the property back to
+/// its part, the other controls bound to it follow, an undo writes the old
+/// value back, and a Company control is bound to `docProps/app.xml`.
+#[test]
+fn typing_in_a_property_control_writes_the_property_back_1433() {
+    let mut t = with_core("write-back", "Ann", "Quarterly Report");
+    // Title at the start, Company at the end of the first paragraph.
+    for (prop, offset) in [(BoundProp::Title, 0), (BoundProp::Company, usize::MAX)] {
+        let control = property_control(&t, prop);
+        let Surface::Doc(ed) = &mut t.surface else {
+            panic!()
+        };
+        ed.set_caret(docxcore::editor::Caret::at(vec![0], offset));
+        ed.anchor = None;
+        ed.paste(&Clip {
+            paras: vec![control],
+        });
+    }
+    // The body's Title control; a second one in the header.
+    open_header(&mut t);
+    let control = property_control(&t, BoundProp::Title);
+    hf_ed(&mut t).paste(&Clip {
+        paras: vec![control],
+    });
+    let part = |t: &DocTab, name: &str| t.pkg.as_ref().unwrap().part_text(name).unwrap();
+    let body_text = |t: &DocTab| match &t.surface {
+        Surface::Doc(ed) => ed.doc.body[0].plain_text(),
+        _ => panic!(),
+    };
+    assert!(
+        body_text(&t).contains("Quarterly Report"),
+        "{}",
+        body_text(&t)
+    );
+    // Inserting controls is no edit of a property.
+    t.set_dirty();
+    assert!(part(&t, "docProps/core.xml").contains("<dc:title>Quarterly Report</dc:title>"));
+    // Type in the header's control (the caret is at its end).
+    hf_ed(&mut t).insert_char('!');
+    t.set_dirty();
+    assert!(part(&t, "docProps/core.xml").contains("<dc:title>Quarterly Report!</dc:title>"));
+    assert!(
+        body_text(&t).contains("Quarterly Report!"),
+        "{}",
+        body_text(&t)
+    );
+    // The package reloads with the typed value.
+    let again = load_package(&docxcore::package::save_package(t.pkg.as_ref().unwrap())).unwrap();
+    assert!(
+        again
+            .part_text("docProps/core.xml")
+            .unwrap()
+            .contains("Quarterly Report!")
+    );
+    // Undo puts the old text back, and the property with it.
+    assert!(hf_ed(&mut t).undo());
+    t.set_dirty();
+    assert!(part(&t, "docProps/core.xml").contains("<dc:title>Quarterly Report</dc:title>"));
+    assert!(!body_text(&t).contains('!'), "{}", body_text(&t));
+    // Nothing else of the core part moved.
+    assert!(part(&t, "docProps/core.xml").contains("<dc:creator>Ann</dc:creator>"));
+    // The Company control reads app.xml and writes it back.
+    assert!(body_text(&t).contains("Acme"), "{}", body_text(&t));
+    t.hf_edit = None;
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!()
+    };
+    // The Company control is last in the paragraph: its end is the end.
+    ed.set_caret(docxcore::editor::Caret::at(vec![0], usize::MAX));
+    ed.insert_char('X');
+    t.set_dirty();
+    let app = part(&t, "docProps/app.xml");
+    assert!(app.contains("<Company>AcmeX</Company>"), "{app}");
+    assert!(app.contains("<Application>docxy</Application>"), "{app}");
+    assert!(!part(&t, "docProps/core.xml").contains("Company"));
+}
+
+/// #1433: only an edit of a control's text writes the property. A
+/// package-only change with the caret in a Title control (Inspect
+/// Document's Remove All), a stale control beside a newer core.xml, and a
+/// formatting change leave the property alone.
+#[test]
+fn only_typing_in_a_control_writes_the_property_1433() {
+    let mut t = with_core("write-back-only", "Ann", "Quarterly Report");
+    let control = property_control(&t, BoundProp::Title);
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!()
+    };
+    ed.set_caret(docxcore::editor::Caret::at(vec![0], 0));
+    ed.anchor = None;
+    ed.paste(&Clip {
+        paras: vec![control],
+    });
+    // The caret stands in the control's text.
+    ed.set_caret(docxcore::editor::Caret::at(vec![0], 4));
+    t.set_dirty();
+    let core = |t: &DocTab| {
+        t.pkg
+            .as_ref()
+            .unwrap()
+            .part_text("docProps/core.xml")
+            .unwrap()
+    };
+    // Another tool (or Remove All) changed the property under the control.
+    let stripped = core(&t).replace("Quarterly Report", "");
+    t.pkg
+        .as_mut()
+        .unwrap()
+        .set_part_text("docProps/core.xml", &stripped);
+    t.set_dirty();
+    assert!(!core(&t).contains("Quarterly Report"), "{}", core(&t));
+    // Bold over the control's text writes nothing either.
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!()
+    };
+    ed.anchor = Some(docxcore::editor::Caret::at(vec![0], 0));
+    ed.caret = docxcore::editor::Caret::at(vec![0], 8);
+    ed.toggle_bold();
+    t.set_dirty();
+    assert!(!core(&t).contains("Quarterly Report"), "{}", core(&t));
+    // Typing does.
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!()
+    };
+    ed.anchor = None;
+    ed.set_caret(docxcore::editor::Caret::at(vec![0], 8));
+    ed.insert_char('!');
+    t.set_dirty();
+    assert!(
+        core(&t).contains("<dc:title>Quarterl!y Report</dc:title>"),
+        "{}",
+        core(&t)
+    );
+    // With a header open and its caret outside a control, a body control
+    // is not typed in.
+    let mut t = with_core("write-back-hf", "Ann", "Quarterly Report");
+    let control = property_control(&t, BoundProp::Title);
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!()
+    };
+    ed.paste(&Clip {
+        paras: vec![control],
+    });
+    t.set_dirty();
+    open_header(&mut t);
+    let newer = core(&t).replace("Quarterly Report", "New");
+    t.pkg
+        .as_mut()
+        .unwrap()
+        .set_part_text("docProps/core.xml", &newer);
+    hf_ed(&mut t).insert_str("x");
+    t.set_dirty();
+    assert!(
+        core(&t).contains("<dc:title>New</dc:title>"),
+        "{}",
+        core(&t)
+    );
+}
+
+/// #1433: a property typed in the header is an undo step in the body too,
+/// so the body's Ctrl+Z undoes the property everywhere and the header takes
+/// it as a step of its own (and the other way round).
+#[test]
+fn a_property_copied_to_the_other_editor_is_an_undo_step_there_1433() {
+    let mut t = with_core("write-back-undo", "Ann", "Quarterly Report");
+    let control = property_control(&t, BoundProp::Title);
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!()
+    };
+    ed.paste(&Clip {
+        paras: vec![control],
+    });
+    t.set_dirty();
+    open_header(&mut t);
+    let control = property_control(&t, BoundProp::Title);
+    hf_ed(&mut t).paste(&Clip {
+        paras: vec![control],
+    });
+    t.set_dirty();
+    let core = |t: &DocTab| {
+        t.pkg
+            .as_ref()
+            .unwrap()
+            .part_text("docProps/core.xml")
+            .unwrap()
+    };
+    let body_text = |t: &DocTab| match &t.surface {
+        Surface::Doc(ed) => ed.doc.body[0].plain_text(),
+        _ => panic!(),
+    };
+    let hf_text = |t: &DocTab| t.hf_edit.as_ref().unwrap().editor.doc.body[0].plain_text();
+    hf_ed(&mut t).insert_char('!');
+    t.set_dirty();
+    assert!(core(&t).contains("Quarterly Report!"), "{}", core(&t));
+    assert!(
+        body_text(&t).contains("Quarterly Report!"),
+        "{}",
+        body_text(&t)
+    );
+    // The body's Ctrl+Z undoes the copy: the property is the old one
+    // everywhere, the header taking it as its own step.
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!()
+    };
+    assert!(ed.undo());
+    t.set_dirty();
+    assert!(
+        core(&t).contains("<dc:title>Quarterly Report</dc:title>"),
+        "{}",
+        core(&t)
+    );
+    assert!(!body_text(&t).contains('!'), "{}", body_text(&t));
+    assert!(!hf_text(&t).contains('!'), "{}", hf_text(&t));
+    // The header's Ctrl+Z undoes that step: the property is back, and the
+    // body takes it as a step of its own.
+    assert!(hf_ed(&mut t).undo());
+    t.set_dirty();
+    assert!(core(&t).contains("Quarterly Report!"), "{}", core(&t));
+    assert!(
+        body_text(&t).contains("Quarterly Report!"),
+        "{}",
+        body_text(&t)
+    );
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!()
+    };
+    assert!(ed.undo());
+    t.set_dirty();
+    assert!(!core(&t).contains('!'), "{}", core(&t));
+}
+
+/// #1433: typing several characters in a header's property control, through
+/// the key handler's calls, is one header typing step and one body step, the
+/// header's Repeat record stays ready, and a command run in the body after
+/// the header closes is a step of its own beside the property's.
+#[test]
+fn typing_in_a_header_control_is_one_step_in_each_editor_1433() {
+    let mut t = with_core("write-back-steps", "Ann", "Quarterly Report");
+    let control = property_control(&t, BoundProp::Title);
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!()
+    };
+    ed.paste(&Clip {
+        paras: vec![control],
+    });
+    t.set_dirty();
+    open_header(&mut t);
+    let control = property_control(&t, BoundProp::Title);
+    hf_ed(&mut t).paste(&Clip {
+        paras: vec![control],
+    });
+    t.set_dirty();
+    let body_names = |t: &DocTab| match &t.surface {
+        Surface::Doc(ed) => ed.undo_names(),
+        _ => panic!(),
+    };
+    let hf_steps = |t: &DocTab| t.hf_edit.as_ref().unwrap().editor.undo_names().len();
+    let (b0, h0) = (body_names(&t).len(), hf_steps(&t));
+    let mut repeat = None;
+    for c in "2025".chars() {
+        let since = docxcore::editor::undo_serial_counter();
+        let ed = hf_ed(&mut t);
+        let noted = crate::type_key_text(ed, &repeat, &c.to_string(), &Default::default());
+        let recorded = crate::note_edit(ed, &mut repeat, since, noted);
+        t.set_dirty();
+        crate::keep_current(&mut repeat, recorded);
+        let ed = &t.hf_edit.as_ref().unwrap().editor;
+        assert!(recorded && crate::repeat_ready(ed, &repeat), "{c}");
+    }
+    assert_eq!(hf_steps(&t) - h0, 1);
+    assert_eq!(body_names(&t).len() - b0, 1);
+    assert_eq!(body_names(&t)[0], "Title");
+    let core = |t: &DocTab| {
+        t.pkg
+            .as_ref()
+            .unwrap()
+            .part_text("docProps/core.xml")
+            .unwrap()
+    };
+    assert!(core(&t).contains("Quarterly Report2025"), "{}", core(&t));
+    // The header closes; a named command in the body is its own step and
+    // its Ctrl+Z leaves the Title controls alone.
+    t.hf_edit = None;
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!()
+    };
+    let since = docxcore::editor::undo_serial_counter();
+    ed.select_all();
+    ed.toggle_bold();
+    ed.name_command(since, "Bold");
+    assert_eq!(&ed.undo_names()[..2], ["Bold", "Title"]);
+    assert!(ed.undo());
+    t.set_dirty();
+    assert!(core(&t).contains("Quarterly Report2025"), "{}", core(&t));
+    assert_eq!(body_names(&t)[0], "Title");
+}
+
+/// #1433: two properties changed by one step both reach their parts.
+#[test]
+fn two_properties_changed_in_one_step_are_both_written_1433() {
+    let mut t = with_core("write-back-two", "Ann", "Quarterly Report");
+    for (prop, offset) in [(BoundProp::Title, 0), (BoundProp::Company, usize::MAX)] {
+        let control = property_control(&t, prop);
+        let Surface::Doc(ed) = &mut t.surface else {
+            panic!()
+        };
+        ed.set_caret(docxcore::editor::Caret::at(vec![0], offset));
+        ed.anchor = None;
+        ed.paste(&Clip {
+            paras: vec![control],
+        });
+    }
+    t.set_dirty();
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!()
+    };
+    // Both controls' text replaced in one step, as a Replace All does.
+    ed.one_step("Replace All", |e| {
+        e.replace_all("Quarterly Report", "Annual Report", true);
+        e.replace_all("Acme", "Globex", true);
+    });
+    t.set_dirty();
+    let part = |t: &DocTab, n: &str| t.pkg.as_ref().unwrap().part_text(n).unwrap();
+    assert!(part(&t, "docProps/core.xml").contains("<dc:title>Annual Report</dc:title>"));
+    assert!(part(&t, "docProps/app.xml").contains("<Company>Globex</Company>"));
 }
 
 /// A small PNG file in `dir`, `w` x `h` px.
@@ -553,7 +886,7 @@ fn typing_after_an_inserted_object_goes_after_it_in_the_header() {
     let mut t = with_core("type-after-control", "Ann", "Quarterly Report");
     open_header(&mut t);
     hf_ed(&mut t).caret.offset = 8;
-    let control = property_control(&t, CoreProp::Title);
+    let control = property_control(&t, BoundProp::Title);
     hf_ed(&mut t).insert_object(control);
     hf_ed(&mut t).insert_str(" - draft");
     let (_, xml) = saved_header(&mut t);
@@ -639,6 +972,7 @@ fn an_alignment_tab_places_the_text_after_it() {
     let right = crate::Ptab {
         align: TabAlign::Right,
         indent: false,
+        leader: PtabLeader::None,
     };
     let stop = crate::ptab_stop(right, 600.0, 30.0, 20.0);
     let gap = crate::ptab_gap(TabAlign::Right, stop, 100.0, 50.0);
@@ -646,6 +980,7 @@ fn an_alignment_tab_places_the_text_after_it() {
     let center = crate::Ptab {
         align: TabAlign::Center,
         indent: true,
+        leader: PtabLeader::None,
     };
     let stop = crate::ptab_stop(center, 600.0, 40.0, 60.0);
     assert_eq!(stop, 290.0);
@@ -657,13 +992,35 @@ fn an_alignment_tab_places_the_text_after_it() {
         crate::ptab_of(&run),
         Some(crate::Ptab {
             align: TabAlign::Left,
-            indent: false
+            indent: false,
+            leader: PtabLeader::None,
         })
     );
     assert_eq!(
         crate::ptab_of(&Inline::Raw("<w:bookmarkStart/>".into())),
         None
     );
+    // The leader is read too, and fills the gap by the glyph's width (#1433).
+    for (name, leader) in [
+        ("dot", PtabLeader::Dot),
+        ("hyphen", PtabLeader::Hyphen),
+        ("underscore", PtabLeader::Underscore),
+        ("middleDot", PtabLeader::MiddleDot),
+    ] {
+        let raw = format!("<w:r><w:ptab w:alignment=\"right\" w:leader=\"{name}\"/></w:r>");
+        assert_eq!(crate::ptab_of(&Inline::Raw(raw)).unwrap().leader, leader);
+    }
+    // In a header table cell the cell's width wins over the header's.
+    assert_eq!(
+        crate::ptab_line_width(Some(600.0), Some(200.0)),
+        Some(200.0)
+    );
+    assert_eq!(crate::ptab_line_width(Some(600.0), None), Some(600.0));
+    assert_eq!(crate::ptab_line_width(None, Some(200.0)), Some(200.0));
+    assert_eq!(crate::ptab_line_width(None, None), None);
+    assert_eq!(crate::ptab_leader_count(100.0, 4.0), 25);
+    assert_eq!(crate::ptab_leader_count(3.0, 4.0), 0);
+    assert_eq!(crate::ptab_leader_count(100.0, 0.0), 0);
     // A picture's frame is its extent at the zoom.
     assert_eq!(
         crate::picture_frame_px(914_400, 457_200, 1.5),

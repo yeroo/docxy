@@ -694,3 +694,384 @@ fn a_tracked_cut_of_cells_carries_their_equations_1242() {
             .any(|i| matches!(i, Inline::Equation { .. }))
     );
 }
+
+/// The `w:del` wrappers in the saved XML, each with its id.
+fn deleted_objects(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(at) = rest.find("<w:del ") {
+        let end = rest[at..].find("</w:del>").map_or(rest.len(), |e| at + e);
+        out.push(rest[at..end].to_string());
+        rest = &rest[end..];
+    }
+    out
+}
+
+/// #1433: a tracked delete over a floating picture or an alignment tab
+/// records each as a `w:del` with an id of its own (it kept them silently
+/// before); reject keeps them, accept removes them, and a save and reload
+/// keeps the records.
+#[test]
+fn a_tracked_delete_records_a_floating_picture_and_a_ptab_1433() {
+    let mut ed = Editor::new(doc(&[format!(
+        "{}{ANCHORED}{}{PTAB}{}",
+        t("ab"),
+        t("cd"),
+        t("ef")
+    )]));
+    track(&mut ed);
+    select(&mut ed, vec![0], 1, 5);
+    assert!(ed.delete_selection());
+    let xml = saved(&ed);
+    let dels = deleted_objects(&xml);
+    let with = |needle: &str| dels.iter().filter(|d| d.contains(needle)).count();
+    assert_eq!(with("<w:drawing"), 1, "{xml}");
+    assert_eq!(with("<w:ptab"), 1, "{xml}");
+    assert!(dels.iter().all(|d| d.contains("w:author=\"Ann\"")), "{xml}");
+    let ids: Vec<&str> = dels
+        .iter()
+        .filter(|d| d.contains("<w:drawing") || d.contains("<w:ptab"))
+        .map(|d| {
+            d.split("w:id=\"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1], "{xml}");
+
+    // A save and reload keeps the records.
+    let reloaded = parse_document_xml(&xml, &Relationships::default());
+    assert_eq!(
+        deleted_objects(&document_to_xml(&reloaded))
+            .iter()
+            .filter(|d| d.contains("<w:drawing") || d.contains("<w:ptab"))
+            .count(),
+        2
+    );
+
+    // Reject keeps both objects; accept removes them.
+    let mut rejected = Editor::new(ed.doc.clone());
+    rejected.reject_all_revisions();
+    let after = saved(&rejected);
+    assert!(
+        after.contains("<w:drawing") && after.contains("<w:ptab"),
+        "{after}"
+    );
+    assert!(!after.contains("<w:del "), "{after}");
+    ed.accept_all_revisions();
+    let after = saved(&ed);
+    assert!(
+        !after.contains("<w:drawing") && !after.contains("<w:ptab"),
+        "{after}"
+    );
+}
+
+/// #1433: tracked, across paragraphs, the middle paragraph's objects are
+/// recorded too; edge objects are kept as untracked.
+#[test]
+fn a_tracked_delete_across_paragraphs_records_middle_objects_1433() {
+    let mut ed = Editor::new(doc(&[
+        format!("{}{PTAB}", t("ab")),
+        format!("{ANCHORED}{}", t("cd")),
+        t("ef"),
+    ]));
+    track(&mut ed);
+    ed.anchor = Some(Caret::at(vec![0], 1));
+    ed.caret = Caret::at(vec![2], 1);
+    assert!(ed.delete_selection());
+    let xml = saved(&ed);
+    // The ptab is after "b" in the first paragraph: inside the range's
+    // end of that paragraph, so it is recorded; so is the picture.
+    assert_eq!(
+        deleted_objects(&xml)
+            .iter()
+            .filter(|d| d.contains("<w:drawing") || d.contains("<w:ptab"))
+            .count(),
+        2,
+        "{xml}"
+    );
+    ed.accept_all_revisions();
+    let after = saved(&ed);
+    assert!(
+        !after.contains("<w:drawing") && !after.contains("<w:ptab"),
+        "{after}"
+    );
+}
+
+/// #1433 (r2-m4): a cut over three paragraphs keeps the zero-width objects
+/// of the middle one, the clip not carrying them; a delete takes them.
+#[test]
+fn a_cut_keeps_the_objects_of_a_removed_middle_paragraph_1433() {
+    let content = || vec![t("ab"), format!("{ANCHORED}{PTAB}{}", t("mid")), t("cd")];
+    let at_end = |ed: &mut Editor| {
+        ed.anchor = Some(Caret::at(vec![0], 1));
+        ed.caret = Caret::at(vec![2], 1);
+    };
+    let mut ed = Editor::new(doc(&content()));
+    at_end(&mut ed);
+    let clip = ed.cut().expect("a clip");
+    assert_eq!(ed.doc.body.len(), 1);
+    assert_eq!(etext(&ed), "ad");
+    let xml = saved(&ed);
+    assert!(
+        xml.contains("<w:drawing") && xml.contains("<w:ptab"),
+        "{xml}"
+    );
+    assert_eq!(clip.paras.len(), 3);
+    // Undo restores all of it.
+    assert!(ed.undo());
+    assert_eq!(ed.doc.body.len(), 3);
+    assert_eq!(etext(&ed), "ab");
+    // A plain delete takes the objects with the paragraph.
+    let mut ed = Editor::new(doc(&content()));
+    at_end(&mut ed);
+    assert!(ed.delete_selection());
+    let xml = saved(&ed);
+    assert!(
+        !xml.contains("<w:drawing") && !xml.contains("<w:ptab"),
+        "{xml}"
+    );
+}
+
+/// #1433: typing inside a document property control is seen at the caret,
+/// and `set_bound_property` shows the new text in every control bound to the
+/// property without an undo step of its own.
+#[test]
+fn typing_in_a_property_control_updates_the_others_1433() {
+    use crate::sdt::{BoundProp, core_property_control};
+    let control =
+        |value: &str, id| core_property_control(BoundProp::Title, value, id, &RunProps::default());
+    let body = vec![
+        Block::Paragraph(Paragraph {
+            props: ParProps::default(),
+            content: [
+                vec![Inline::Run(Run {
+                    text: "T: ".into(),
+                    props: RunProps::default(),
+                })],
+                control("Old", 1),
+            ]
+            .concat(),
+        }),
+        Block::Paragraph(Paragraph {
+            props: ParProps::default(),
+            content: [
+                control("Old", 2),
+                vec![Inline::Run(Run {
+                    text: " end".into(),
+                    props: RunProps::default(),
+                })],
+            ]
+            .concat(),
+        }),
+    ];
+    let mut ed = Editor::new(Document { body });
+    // Nothing was edited yet; a caret move or a formatting change is no edit.
+    ed.set_caret(Caret::at(vec![0], 6));
+    assert_eq!(ed.take_bound_edits(), []);
+    // Typing at the end of the control's text extends it.
+    ed.insert_char('!');
+    assert_eq!(ed.take_bound_edits(), [(BoundProp::Title, "Old!".into())]);
+    assert_eq!(ed.take_bound_edits(), []);
+    // The other control, in another paragraph, takes the text.
+    assert!(ed.set_bound_property(BoundProp::Title, "Old!", PropSource::Here));
+    let text = |ed: &Editor, i: usize| para(ed, i).plain_text();
+    assert_eq!(text(&ed, 1), "Old! end");
+    assert!(!ed.set_bound_property(BoundProp::Title, "Old!", PropSource::Here));
+    assert_eq!(ed.take_bound_edits(), [], "the sync is not an edit");
+    // Undoing the typing puts both back: the other control's change had no
+    // step of its own. The host sees the old text as the edit.
+    assert!(ed.undo());
+    assert_eq!(text(&ed, 0), "T: Old");
+    assert_eq!(text(&ed, 1), "Old end");
+    assert_eq!(ed.take_bound_edits(), [(BoundProp::Title, "Old".into())]);
+    // An emptied property shows the placeholder, flagged, and a value
+    // clears the flag again.
+    ed.set_bound_property(BoundProp::Title, "", PropSource::Here);
+    assert_eq!(text(&ed, 1), "[Title] end");
+    assert!(saved(&ed).matches("<w:showingPlcHdr/>").count() >= 1);
+    ed.set_bound_property(BoundProp::Title, "Back", PropSource::Here);
+    assert_eq!(text(&ed, 1), "Back end");
+    assert!(!saved(&ed).contains("<w:showingPlcHdr/>"));
+    // A control of another property is left alone.
+    assert!(!ed.set_bound_property(BoundProp::Author, "Ann", PropSource::Here));
+}
+
+/// #1433: a control inserted, or a change that leaves every control's text
+/// alone, is not an edit of a property.
+#[test]
+fn only_a_changed_control_text_is_a_bound_edit_1433() {
+    use crate::sdt::{BoundProp, core_property_control};
+    let control = core_property_control(BoundProp::Title, "Old", 1, &RunProps::default());
+    let mut ed = Editor::new(Document {
+        body: vec![Block::Paragraph(Paragraph {
+            props: ParProps::default(),
+            content: control,
+        })],
+    });
+    // Bold over the control's text: no edit.
+    ed.anchor = Some(Caret::at(vec![0], 0));
+    ed.caret = Caret::at(vec![0], 3);
+    ed.toggle_bold();
+    assert_eq!(ed.take_bound_edits(), []);
+    // A second control pasted in: the count changed, not an edit.
+    ed.set_caret(Caret::at(vec![0], 3));
+    let other = core_property_control(BoundProp::Title, "Old", 2, &RunProps::default());
+    ed.insert_object(other);
+    assert_eq!(ed.take_bound_edits(), []);
+}
+
+fn first_content(ed: &mut Editor) -> &mut Vec<Inline> {
+    match &mut ed.doc.body[0] {
+        Block::Paragraph(p) => &mut p.content,
+        _ => panic!(),
+    }
+}
+
+/// #1433: controls are paired by their content-control id. Two properties
+/// changed in one step both report; a swap, or a control replaced by another,
+/// reports nothing; a count change still reports a surviving control's text.
+#[test]
+fn bound_edits_pair_controls_by_id_1433() {
+    use crate::sdt::{BoundProp, core_property_control, scan_paragraph, set_control_text};
+    let two = || {
+        let mut content = core_property_control(BoundProp::Title, "T", 1, &RunProps::default());
+        content.extend(core_property_control(
+            BoundProp::Author,
+            "A",
+            2,
+            &RunProps::default(),
+        ));
+        Editor::new(Document {
+            body: vec![Block::Paragraph(Paragraph {
+                props: ParProps::default(),
+                content,
+            })],
+        })
+    };
+    // Both texts change in one step: one edit per property.
+    let mut ed = two();
+    let c = first_content(&mut ed);
+    for k in (0..2).rev() {
+        let found = scan_paragraph(c);
+        set_control_text(c, &found[k], if k == 0 { "T2" } else { "A2" });
+    }
+    assert_eq!(
+        ed.take_bound_edits(),
+        [
+            (BoundProp::Title, "T2".into()),
+            (BoundProp::Author, "A2".into())
+        ]
+    );
+    // The two swapped: no edit.
+    let mut ed = two();
+    let c = first_content(&mut ed);
+    let (title, author) = c.split_at(3);
+    *c = [author, title].concat();
+    assert_eq!(ed.take_bound_edits(), []);
+    // One replaced by another control of the same count and another id.
+    let mut ed = two();
+    let c = first_content(&mut ed);
+    c.splice(
+        0..3,
+        core_property_control(BoundProp::Title, "Other", 9, &RunProps::default()),
+    );
+    assert_eq!(ed.take_bound_edits(), []);
+    // One removed while the other's text changed: the survivor reports.
+    let mut ed = two();
+    let c = first_content(&mut ed);
+    let found = scan_paragraph(c);
+    set_control_text(c, &found[1], "A3");
+    c.drain(0..3);
+    assert_eq!(ed.take_bound_edits(), [(BoundProp::Author, "A3".into())]);
+}
+
+/// #1433: a property set from the other editor is an undo step here, named
+/// for it; one run of the other editor's typing is one step, a new step of
+/// the other editor is a new one, and after an undo a sync pushes a fresh
+/// step, clearing the redo it would otherwise leave behind.
+#[test]
+fn a_property_from_the_other_editor_is_one_step_per_source_step_1433() {
+    use crate::sdt::{BoundProp, core_property_control};
+    let control = |id| core_property_control(BoundProp::Title, "Old", id, &RunProps::default());
+    let mut ed = Editor::new(Document {
+        body: vec![
+            Block::Paragraph(Paragraph {
+                props: ParProps::default(),
+                content: control(1),
+            }),
+            Block::Paragraph(Paragraph {
+                props: ParProps::default(),
+                content: control(2),
+            }),
+        ],
+    });
+    let from = |step| PropSource::Other {
+        newest_step: Some(step),
+    };
+    let n0 = ed.undo_names().len();
+    assert!(ed.set_bound_property(BoundProp::Title, "A", from(10)));
+    assert!(ed.set_bound_property(BoundProp::Title, "AB", from(10)));
+    assert_eq!(ed.undo_names().len(), n0 + 1);
+    assert_eq!(ed.undo_names()[0], "Title");
+    // The other editor's next step is a step of ours.
+    assert!(ed.set_bound_property(BoundProp::Title, "ABC", from(11)));
+    assert_eq!(ed.undo_names().len(), n0 + 2);
+    // An undo brings the earlier text back; a sync then is a fresh step and
+    // leaves nothing to redo.
+    assert!(ed.undo());
+    assert_eq!(para(&ed, 0).plain_text(), "AB");
+    assert!(ed.can_redo());
+    assert!(ed.set_bound_property(BoundProp::Title, "Z", from(11)));
+    assert!(!ed.can_redo());
+    assert_eq!(ed.undo_names().len(), n0 + 2);
+    // The sync step is the newest with a redo waiting (an unrelated edit
+    // undone): a sync from the same source step is a fresh step, and the
+    // redo is gone.
+    let mut ed2 = Editor::new(ed.doc.clone());
+    assert!(ed2.set_bound_property(BoundProp::Title, "Q", from(20)));
+    let steps = ed2.undo_names().len();
+    ed2.set_caret(Caret::at(vec![1], 0));
+    ed2.insert_char('x');
+    assert!(ed2.undo());
+    assert!(ed2.can_redo());
+    assert!(ed2.set_bound_property(BoundProp::Title, "QR", from(20)));
+    assert!(!ed2.can_redo());
+    assert_eq!(ed2.undo_names().len(), steps + 1);
+    // A sync that changes nothing pushes nothing.
+    assert!(!ed.set_bound_property(BoundProp::Title, "Z", from(12)));
+    assert_eq!(ed.undo_names().len(), n0 + 2);
+}
+
+/// #1433: all the properties one step of the other editor changes are one
+/// step here, and a later keystroke of that step merges into it.
+#[test]
+fn two_properties_from_one_source_step_are_one_step_1433() {
+    use crate::sdt::{BoundProp, core_property_control};
+    let mut content = core_property_control(BoundProp::Title, "T", 1, &RunProps::default());
+    content.extend(core_property_control(
+        BoundProp::Company,
+        "C",
+        2,
+        &RunProps::default(),
+    ));
+    let mut ed = Editor::new(Document {
+        body: vec![Block::Paragraph(Paragraph {
+            props: ParProps::default(),
+            content,
+        })],
+    });
+    let from = PropSource::Other {
+        newest_step: Some(7),
+    };
+    let n0 = ed.undo_names().len();
+    assert!(ed.set_bound_property(BoundProp::Title, "T2", from));
+    assert!(ed.set_bound_property(BoundProp::Company, "C2", from));
+    assert!(ed.set_bound_property(BoundProp::Title, "T23", from));
+    assert_eq!(ed.undo_names().len(), n0 + 1);
+    assert_eq!(ed.undo_names()[0], "Title");
+}

@@ -503,6 +503,59 @@ pub struct Editor {
     /// A [`Editor::preview_copy`]: its edits keep no history and issue no
     /// undo serial, which hosts read as "an edit happened" (#764).
     display_only: bool,
+    /// The document property controls' texts as the host last saw them
+    /// ([`Editor::take_bound_edits`]), keyed by the control's `w:id`;
+    /// controls without one are not tracked.
+    bound_seen: Vec<(i64, crate::sdt::BoundProp, String)>,
+    /// The step [`Editor::set_bound_property`] last pushed: the one a further
+    /// sync reuses while it is the newest. Undo and redo forget it.
+    sync_step: Option<SyncStep>,
+}
+
+/// Where a document property came from, for [`Editor::set_bound_property`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PropSource {
+    /// This editor: its own edit set it.
+    Here,
+    /// Another editor, whose newest undo step (its serial, if it has one) is
+    /// the edit that set it.
+    Other { newest_step: Option<u64> },
+}
+
+/// The undo step a property sync pushed and the other editor's step it
+/// answers: every property that step changed merges into it, named for the
+/// first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SyncStep {
+    serial: u64,
+    source: Option<u64>,
+}
+
+/// Whether a control bound to `prop` in `body` shows other than `text`.
+fn bound_controls_differ(body: &[Block], prop: crate::sdt::BoundProp, text: &str) -> bool {
+    all_paragraph_paths(body).iter().any(|path| {
+        resolve_para(body, path).is_some_and(|p| {
+            crate::sdt::scan_paragraph(&p.content)
+                .iter()
+                .any(|c| c.prop == prop && c.text != text)
+        })
+    })
+}
+
+/// Every document property control with a content-control id in `body` in
+/// document order, with the text it holds.
+fn bound_controls(body: &[Block]) -> Vec<(i64, crate::sdt::BoundProp, String)> {
+    let mut out = Vec::new();
+    for path in all_paragraph_paths(body) {
+        if let Some(p) = resolve_para(body, &path) {
+            out.extend(
+                crate::sdt::scan_paragraph(&p.content)
+                    .into_iter()
+                    .filter_map(|c| Some((c.id?, c.prop, c.text))),
+            );
+        }
+    }
+    out
 }
 
 /// Whether `lo` and `hi` sit in different containers (a body paragraph and
@@ -517,7 +570,10 @@ impl Editor {
     pub fn new(mut doc: Document) -> Self {
         doc.initialize_revision_targets();
         let path = first_paragraph_path(&doc.body).unwrap_or_else(|| vec![0]);
+        let bound_seen = bound_controls(&doc.body);
         Editor {
+            bound_seen,
+            sync_step: None,
             doc,
             caret: Caret { path, offset: 0 },
             anchor: None,
@@ -561,6 +617,8 @@ impl Editor {
             after_object: self.after_object.clone(),
             settings: self.settings,
             display_only: true,
+            bound_seen: self.bound_seen.clone(),
+            sync_step: None,
         }
     }
 
@@ -869,6 +927,7 @@ impl Editor {
             self.pending = prev.pending;
             self.after_object = prev.after_object;
             self.settings = prev.settings;
+            self.sync_step = None;
             self.last = EditKind::None;
             self.refresh_merge_preview();
             true
@@ -887,6 +946,7 @@ impl Editor {
             self.pending = next.pending;
             self.after_object = next.after_object;
             self.settings = next.settings;
+            self.sync_step = None;
             self.last = EditKind::None;
             self.refresh_merge_preview();
             true
@@ -1840,6 +1900,97 @@ impl Editor {
         out
     }
 
+    /// The document properties whose controls' text was edited since the host
+    /// last asked (#1433): each with the new text, one per property, the
+    /// first changed control in document order giving it. A control is the
+    /// same one when its content-control id is, so a control inserted or
+    /// removed, or controls reordered, report nothing for themselves while
+    /// the ones present both times still report a change of text. An edit, an
+    /// undo or a redo of typing in a control is that; a formatting change or
+    /// a package-only change is not. The host writes each property and calls
+    /// [`Editor::set_bound_property`].
+    pub fn take_bound_edits(&mut self) -> Vec<(crate::sdt::BoundProp, String)> {
+        let now = bound_controls(&self.doc.body);
+        let was = std::mem::replace(&mut self.bound_seen, now);
+        let mut out: Vec<(crate::sdt::BoundProp, String)> = Vec::new();
+        for (id, prop, text) in &self.bound_seen {
+            let changed = was
+                .iter()
+                .find(|(was_id, _, _)| was_id == id)
+                .is_some_and(|(_, _, old)| old != text);
+            if changed && !out.iter().any(|(p, _)| p == prop) {
+                out.push((*prop, text.clone()));
+            }
+        }
+        out
+    }
+
+    /// Show `text` in every document property control bound to `prop`
+    /// (#1433). From [`PropSource::Here`] it is one change with whatever edit
+    /// set the property in this editor: no undo step of its own, so undoing
+    /// that edit puts all of them back. From [`PropSource::Other`] (a header
+    /// or footer, the body) it is an undo step here, named for the property.
+    /// All the properties one step of the other editor changes, and the run of
+    /// them one typing run makes, are one step: while the newest step here is
+    /// the one pushed for that step of the other editor, a further
+    /// sync changes it in place, unless a redo is waiting (the step would no
+    /// longer be the end of the history). The caret and anchor follow the
+    /// text they stood after. True when a control changed.
+    pub fn set_bound_property(
+        &mut self,
+        prop: crate::sdt::BoundProp,
+        text: &str,
+        from: PropSource,
+    ) -> bool {
+        if let PropSource::Other { newest_step } = from {
+            if bound_controls_differ(&self.doc.body, prop, text) {
+                let mine = self.undo_serial();
+                let coalesce = self.redo.is_empty()
+                    && mine.is_some()
+                    && self.sync_step
+                        == mine.map(|serial| SyncStep {
+                            serial,
+                            source: newest_step,
+                        });
+                if !coalesce {
+                    self.checkpoint(EditKind::Structural);
+                    if let Some(step) = self.undo.back_mut() {
+                        step.name = StepName::Named(prop.label().to_string());
+                        self.sync_step = Some(SyncStep {
+                            serial: step.serial,
+                            source: newest_step,
+                        });
+                    }
+                }
+            }
+        }
+        let mut changed = false;
+        for path in all_paragraph_paths(&self.doc.body) {
+            let Some(p) = para_mut(&mut self.doc.body, &path) else {
+                continue;
+            };
+            let controls = crate::sdt::scan_paragraph(&p.content);
+            for c in controls.iter().rev().filter(|c| c.prop == prop) {
+                let before: usize = p.content.iter().map(inline_len).sum();
+                if !crate::sdt::set_control_text(&mut p.content, c, text) {
+                    continue;
+                }
+                changed = true;
+                let after: usize = p.content.iter().map(inline_len).sum();
+                for caret in std::iter::once(&mut self.caret).chain(self.anchor.as_mut()) {
+                    if caret.path == path && caret.offset >= c.end {
+                        caret.offset = (caret.offset + after).saturating_sub(before);
+                    }
+                }
+            }
+        }
+        if changed {
+            self.clamp();
+            self.bound_seen = bound_controls(&self.doc.body);
+        }
+        changed
+    }
+
     /// Delete the current selection. Handles a single paragraph and a range of
     /// sibling paragraphs (merging the ends). A selection spanning different
     /// containers (e.g. body into a table cell) just collapses to the start.
@@ -1861,8 +2012,9 @@ impl Editor {
     /// an equation is one offset (#1242): the clip carries it, so it goes.
     /// While tracking, a picture is recorded as deleted and an equation
     /// stays (a `w:del` cannot hold it whole), which the cut's clip then
-    /// leaves out. Paragraphs wholly inside the selection still go whole,
-    /// their objects with them. A host that cuts through its own plain-text
+    /// leaves out. Paragraphs wholly inside the selection still go whole;
+    /// the zero-width objects of those in the middle of a multi-paragraph cut
+    /// are kept at the seam (#1433). A host that cuts through its own plain-text
     /// copy calls [`Editor::cut_text`].
     pub fn delete_selection_keeping_objects(&mut self) -> bool {
         self.delete_selection_with(false, false)
@@ -1891,10 +2043,8 @@ impl Editor {
             self.checkpoint(EditKind::Structural);
             self.anchor = None;
             self.remove_loose_fields(&lo.path, &fields);
-            if drop_objects && self.track.is_none() {
-                if let Some(p) = para_mut(&mut self.doc.body, &lo.path) {
-                    drop_spanned_objects(&mut p.content, lo.offset, hi.offset, false, false);
-                }
+            if drop_objects {
+                self.drop_or_record_objects(&lo.path, lo.offset, hi.offset, false, false);
             }
             self.delete_chars(&lo.path, lo.offset, hi.offset, keep_units);
             self.caret = lo;
@@ -1914,7 +2064,7 @@ impl Editor {
         self.clear_placeholders_around(&hi.path);
         // Tracked: the text of each paragraph is recorded as deleted and the
         // paragraph marks stay (see the `track` module).
-        if self.delete_text_across_paragraphs(&lo, &hi, keep_units) {
+        if self.delete_text_across_paragraphs(&lo, &hi, keep_units, drop_objects) {
             self.caret = lo;
             return true;
         }
@@ -1956,6 +2106,21 @@ impl Editor {
             } else {
                 (Vec::new(), None)
             };
+            // A cut keeps the zero-width objects of the paragraphs it removes
+            // whole: the clip cannot carry them (#1433, r2-m4).
+            let mut kept: Vec<Inline> = Vec::new();
+            if !drop_objects {
+                for block in cont.iter().take(hii).skip(li + 1) {
+                    if let Block::Paragraph(p) = block {
+                        kept.extend(
+                            p.content
+                                .iter()
+                                .filter(|i| matches!(i, Inline::Raw(r) if is_spanned_object(r)))
+                                .cloned(),
+                        );
+                    }
+                }
+            }
             // Remove everything strictly between (and the now-empty last).
             let removed = (hii + 1).min(cont.len()).saturating_sub(li + 1);
             for _ in (li + 1)..=hii {
@@ -1965,6 +2130,7 @@ impl Editor {
             }
             // Merge the remainder onto the first paragraph.
             if let Some(Block::Paragraph(p)) = cont.get_mut(li) {
+                p.content.extend(kept);
                 join_paragraph_content(&mut p.content, remainder);
                 if let Some(gone) = last_props {
                     keep_section_mark(&mut p.props, gone);
@@ -4256,25 +4422,55 @@ fn drop_spanned_objects(
     from_before: bool,
     to_after: bool,
 ) {
+    let gone = spanned_object_indices(content, lo, hi, from_before, to_after);
+    remove_indices(content, &gone);
+}
+
+/// `content` without the inlines at the ascending indices `gone`.
+pub(crate) fn remove_indices(content: &mut Vec<Inline>, gone: &[usize]) {
+    if gone.is_empty() {
+        return;
+    }
+    let mut i = 0;
+    content.retain(|_| {
+        i += 1;
+        !gone.contains(&(i - 1))
+    });
+}
+
+/// The `content` indices of the drawing and positional-tab runs the delete
+/// spans; [`drop_spanned_objects`] removes them and a tracked delete records
+/// them (`Editor::drop_or_record_objects`).
+pub(crate) fn spanned_object_indices(
+    content: &[Inline],
+    lo: usize,
+    hi: usize,
+    from_before: bool,
+    to_after: bool,
+) -> Vec<usize> {
     let len: usize = content.iter().map(inline_len).sum();
     let lo_v = if from_before { -1 } else { lo as i64 };
     let hi_v = if to_after { len as i64 + 1 } else { hi as i64 };
     let whole = (from_before || lo == 0) && (to_after || hi >= len);
     if lo_v >= hi_v && !whole {
-        return;
+        return Vec::new();
     }
     let mut at = 0;
-    content.retain(|i| {
+    let mut found = Vec::new();
+    for (k, i) in content.iter().enumerate() {
         let p = at;
         at += inline_len(i);
         let Inline::Raw(raw) = i else {
-            return true;
+            continue;
         };
         let pv = p as i64;
         let inside = pv > lo_v && pv < hi_v;
         let edge = whole && (p == 0 || p == len);
-        !(is_spanned_object(raw) && (inside || edge))
-    });
+        if is_spanned_object(raw) && (inside || edge) {
+            found.push(k);
+        }
+    }
+    found
 }
 
 /// `clip` without its equations, a hyperlink's included.
@@ -5670,7 +5866,7 @@ mod tests {
         let mut ed = selected(vec![run("T: ", RunProps::default())], 3, 3);
         ed.anchor = None;
         let control = crate::sdt::core_property_control(
-            crate::sdt::CoreProp::Title,
+            crate::sdt::BoundProp::Title,
             "Report",
             1,
             &RunProps::default(),
@@ -5704,7 +5900,7 @@ mod tests {
         // each redo brings back its own state's place.
         let control = || {
             crate::sdt::core_property_control(
-                crate::sdt::CoreProp::Title,
+                crate::sdt::BoundProp::Title,
                 "R",
                 1,
                 &RunProps::default(),

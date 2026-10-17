@@ -575,6 +575,18 @@
     'Table(Style(9))': NOT_YET,
     'Table(TextDirection)': NOT_YET,
     'Table(ViewGridlines)': NOT_YET,
+    // Insert > Text: Date & Time and Quick Parts (#1433).
+    'Hf(DateTime)': NOT_YET,
+    'Hf(Menu(QuickParts))': NOT_YET,
+    'Hf(Property(Author))': NOT_YET,
+    'Hf(Property(Category))': NOT_YET,
+    'Hf(Property(Comments))': NOT_YET,
+    'Hf(Property(Company))': NOT_YET,
+    'Hf(Property(Keywords))': NOT_YET,
+    'Hf(Property(Manager))': NOT_YET,
+    'Hf(Property(Status))': NOT_YET,
+    'Hf(Property(Subject))': NOT_YET,
+    'Hf(Property(Title))': NOT_YET,
     // Header & Footer and Page Number menus (#641, #650).
     'Hf(Design { is_header: false, index: 0 })': NOT_YET,
     'Hf(Design { is_header: false, index: 1 })': NOT_YET,

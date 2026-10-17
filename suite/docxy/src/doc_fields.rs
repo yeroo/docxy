@@ -38,6 +38,38 @@ pub(crate) fn doc_field_key(key: &str, ctrl: bool, shift: bool, alt: bool) -> Op
     }
 }
 
+/// A key that inserts a date or time field (#1433).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InsertKey {
+    /// Alt+Shift+D: a DATE field in the short date.
+    Date,
+    /// Alt+Shift+T: a TIME field.
+    Time,
+}
+
+impl InsertKey {
+    /// The field's instruction, as Word's Alt+Shift+D / T write it.
+    pub(crate) fn instr(self) -> &'static str {
+        match self {
+            InsertKey::Date => "DATE \\@ \"M/d/yyyy\"",
+            InsertKey::Time => "TIME \\@ \"h:mm AM/PM\"",
+        }
+    }
+}
+
+/// The insert key `key` with these modifiers is: Alt+Shift+D and Alt+Shift+T
+/// and nothing with Ctrl or Cmd.
+pub(crate) fn doc_insert_key(key: &str, ctrl: bool, shift: bool, alt: bool) -> Option<InsertKey> {
+    if ctrl || !shift || !alt {
+        return None;
+    }
+    match key {
+        "d" => Some(InsertKey::Date),
+        "t" => Some(InsertKey::Time),
+        _ => None,
+    }
+}
+
 /// The status when Shift+F9 finds no field to edit.
 pub(crate) const NO_FIELD: &str = "There is no field at the insertion point";
 
@@ -137,6 +169,49 @@ impl Docxy {
 mod tests {
     use super::*;
     use ctlcore::json::Json;
+
+    #[test]
+    fn alt_shift_d_and_t_are_the_insert_keys_1433() {
+        assert_eq!(
+            doc_insert_key("d", false, true, true),
+            Some(InsertKey::Date)
+        );
+        assert_eq!(
+            doc_insert_key("t", false, true, true),
+            Some(InsertKey::Time)
+        );
+        // Not without Alt or Shift, not with Ctrl or Cmd, not another letter.
+        for (key, ctrl, shift, alt) in [
+            ("d", false, false, true),
+            ("d", false, true, false),
+            ("d", true, true, true),
+            ("x", false, true, true),
+        ] {
+            assert_eq!(doc_insert_key(key, ctrl, shift, alt), None, "{key}");
+        }
+        // The fields they insert show the date and the time.
+        let now = docxcore::field::DateTime {
+            year: 2026,
+            month: 6,
+            day: 23,
+            hour: 14,
+            min: 5,
+            sec: 0,
+            ..Default::default()
+        };
+        let ctx = docxcore::field::FieldContext {
+            now: Some(now),
+            ..Default::default()
+        };
+        assert_eq!(
+            docxcore::field::eval_field_ctx(InsertKey::Date.instr(), &ctx).as_deref(),
+            Some("6/23/2026")
+        );
+        assert_eq!(
+            docxcore::field::eval_field_ctx(InsertKey::Time.instr(), &ctx).as_deref(),
+            Some("2:05 PM")
+        );
+    }
 
     #[test]
     fn f9_alt_f9_and_shift_f9_are_the_field_keys_1241() {

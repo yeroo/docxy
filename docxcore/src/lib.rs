@@ -61,6 +61,7 @@ pub mod omath;
 pub mod package;
 pub mod page_bg;
 pub mod protection;
+pub mod ptab;
 pub mod render;
 pub mod review;
 pub mod sdt;
