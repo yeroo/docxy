@@ -1011,7 +1011,10 @@ fn an_alignment_tab_places_the_text_after_it() {
         assert_eq!(crate::ptab_of(&Inline::Raw(raw)).unwrap().leader, leader);
     }
     // In a header table cell the cell's width wins over the header's.
-    assert_eq!(crate::ptab_line_width(Some(600.0), Some(200.0)), Some(200.0));
+    assert_eq!(
+        crate::ptab_line_width(Some(600.0), Some(200.0)),
+        Some(200.0)
+    );
     assert_eq!(crate::ptab_line_width(Some(600.0), None), Some(600.0));
     assert_eq!(crate::ptab_line_width(None, Some(200.0)), Some(200.0));
     assert_eq!(crate::ptab_line_width(None, None), None);

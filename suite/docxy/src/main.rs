@@ -31815,7 +31815,9 @@ fn paragraph_el(
                 // line's margin or indent, where the line's width is known (a
                 // header or footer, or a body column or cell, #1433); it takes
                 // no caret offset.
-                if let (Some(ptab), Some(w)) = (ptab_of(inline), ptab_line_width(hf_width, line_width)) {
+                if let (Some(ptab), Some(w)) =
+                    (ptab_of(inline), ptab_line_width(hf_width, line_width))
+                {
                     let stop =
                         ptab_stop(ptab, w, tw_px(indent.left, zoom), tw_px(indent.right, zoom));
                     let gap = ptab_gap(ptab.align, stop, pad_l + x, seg_width(i + 1));
