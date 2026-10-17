@@ -263,6 +263,9 @@ pub struct Backstage {
     pub name_input: String,
     /// Caret position (char index) within `name_input`.
     pub name_cursor: usize,
+    /// The other end of a selection in `name_input`, in chars; the selection
+    /// runs between it and `name_cursor` (#1376).
+    pub name_anchor: Option<usize>,
     /// In Save As: true when the file-name field is focused (accepting edits).
     /// Save As has three focus targets: this field, the *Save as type* box
     /// ([`Backstage::type_focus`], when the host has types) and the folder
@@ -321,6 +324,7 @@ impl Backstage {
             preview_scroll: 0,
             name_input: String::new(),
             name_cursor: 0,
+            name_anchor: None,
             name_focus: false,
             items: ITEMS.to_vec(),
             options: Vec::new(),
@@ -454,12 +458,14 @@ impl Backstage {
         self.type_touched = true;
         self.name_input = with_extension(&self.name_input, t.ext);
         self.name_cursor = self.name_input.chars().count();
+        self.name_anchor = None;
     }
 
     /// Open Save As on `name`, with type `ty` picked (or the one the name's
     /// extension suggests).
     pub fn begin_save_as(&mut self, name: String, ty: Option<usize>) {
         self.name_cursor = name.chars().count();
+        self.name_anchor = None;
         self.name_input = name;
         self.name_focus = true;
         self.type_focus = false;
@@ -509,7 +515,7 @@ impl Backstage {
             value: Some(self.name_input.clone()),
             focused: self.pane == Pane::SaveAs && self.name_focus,
             caret: Some(self.name_cursor),
-            selection: None,
+            selection: self.name_selection(),
             at: Some((self.layout.name_x0, self.layout.name_top + 1)),
             kind: None,
         }
