@@ -384,6 +384,55 @@ fn italic_also_comes_from_the_post_angle_and_the_style_name() {
 }
 
 #[test]
+fn a_localized_style_name_listed_first_does_not_hide_the_english_one() {
+    let d = Dir::new("localstyle");
+    d.write(
+        "a-medium-italic.ttf",
+        &variant(
+            "Fam Medium Italic",
+            true,
+            Style {
+                subfamily: Some("Medium Italic".into()),
+                localized_subfamily: Some("\u{4e2d}\u{9ed1}\u{659c}\u{9ad4}".into()),
+                weight: 500,
+                ..Style::default()
+            },
+        ),
+    );
+    d.write(
+        "b-inclined.ttf",
+        &variant(
+            "Fam Inclined",
+            true,
+            Style {
+                subfamily: Some("Inclined".into()),
+                weight: 400,
+                ..Style::default()
+            },
+        ),
+    );
+    d.write(
+        "c-regular.ttf",
+        &variant("Fam Regular", true, Style::default()),
+    );
+    let set = d.set();
+    assert_eq!(
+        set.face("Fam", false, false).unwrap().ps_name(),
+        "FamRegular-Regular"
+    );
+    // Both are italic, so the 400 "Inclined" wins over the 500 face: the
+    // localized-first one is still known to be italic (it loses on weight).
+    assert_eq!(
+        set.face("Fam", false, true).unwrap().ps_name(),
+        "FamInclined-Inclined"
+    );
+    assert_eq!(
+        set.face("Fam", true, true).unwrap().ps_name(),
+        "FamMediumItalic-MediumItalic"
+    );
+}
+
+#[test]
 fn embedding_bits_decide_which_faces_are_offered() {
     let d = Dir::new("fstype");
     for (file, family, fs) in [

@@ -342,13 +342,16 @@ fn index_face(f: &mut File, path: &Path, idx: u32, base: u64) -> Option<Entry> {
     let names = ttf_parser::name::Table::parse(&name)?;
     let legacy = name_strings(&names, 1);
     let typographic = name_strings(&names, 16);
-    let style_name = name_strings(&names, 17)
-        .into_iter()
-        .chain(name_strings(&names, 2))
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    italic |= style_name.contains("italic") || style_name.contains("oblique");
+    // Every style name, not the first: localized ones come before English.
+    italic |= name_strings(&names, 17)
+        .iter()
+        .chain(&name_strings(&names, 2))
+        .any(|s| {
+            let s = s.to_ascii_lowercase();
+            ["italic", "oblique", "inclined"]
+                .iter()
+                .any(|w| s.contains(w))
+        });
     if legacy.is_empty() && typographic.is_empty() {
         return None;
     }

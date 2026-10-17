@@ -155,6 +155,9 @@ pub struct Style {
     pub subfamily: Option<String>,
     /// A `post` table with this italic angle in degrees (none when 0).
     pub italic_angle: i16,
+    /// A Windows subfamily (ID 2) in another language (0x404), listed before
+    /// the English one as table order puts it.
+    pub localized_subfamily: Option<String>,
 }
 
 /// `fs_type` is the OS/2 embedding bits; `units` the units per em.
@@ -173,6 +176,9 @@ fn name_table(style: &Style, family: &str) -> Vec<u8> {
     let sub = style.subfamily.as_deref().unwrap_or(derived);
     let ps = format!("{}-{}", family.replace(' ', ""), sub.replace(' ', ""));
     let mut strings = vec![(1u16, family.to_string()), (2, sub.to_string()), (6, ps)];
+    if let Some(l) = &style.localized_subfamily {
+        strings.insert(0, (0x4002, l.clone())); // 0x4000 marks language 0x404
+    }
     if let Some(t) = &style.typographic {
         strings.push((16, t.clone()));
     }
@@ -183,13 +189,18 @@ fn name_table(style: &Style, family: &str) -> Vec<u8> {
     let mut data = Vec::new();
     for (id, text) in &strings {
         let mac_record = style.mac_names || *id & 0x8000 != 0;
-        let id = &(*id & 0x7FFF);
+        let language = if *id & 0x4000 != 0 { 0x404 } else { 0x409 };
+        let id = &(*id & 0x3FFF);
         let utf16: Vec<u8> = if mac_record {
             text.bytes().collect()
         } else {
             text.encode_utf16().flat_map(|u| u.to_be_bytes()).collect()
         };
-        let (platform, encoding, language) = if mac_record { (1, 0, 0) } else { (3, 1, 0x409) };
+        let (platform, encoding, language) = if mac_record {
+            (1, 0, 0)
+        } else {
+            (3, 1, language)
+        };
         be16(&mut records, platform);
         be16(&mut records, encoding);
         be16(&mut records, language);

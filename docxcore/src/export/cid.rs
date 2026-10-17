@@ -15,7 +15,8 @@ use crate::pdf_font::{
 /// out the first time one of its glyphs is wanted (the file is read then, as
 /// embedding would read it anyway). Layout, the writer and the report then
 /// agree: a face that cannot be embedded is absent, so its characters go to a
-/// fallback, Courier, or a counted `.notdef`.
+/// fallback, to Courier (WinAnsi), or are counted: `.notdef` of the run's own
+/// face, or a Courier `?` when the run has none.
 #[derive(Debug)]
 struct CheckedFace {
     inner: Rc<dyn PdfFace>,
@@ -131,7 +132,7 @@ fn winansi_covers(ch: char) -> bool {
 }
 
 /// The run's own face, else a fallback face, else Courier (what WinAnsi
-/// covers), else `.notdef` of the own face.
+/// covers), else `.notdef` of the own face, or a Courier `?` without one.
 pub(super) fn resolve(p: &dyn PdfFontProvider, family: Option<&str>, font: u8, ch: char) -> Glyph {
     let own = p.face(family.unwrap_or(""), font & 1 != 0, font & 2 != 0);
     if let Some(face) = &own
