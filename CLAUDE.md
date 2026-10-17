@@ -461,6 +461,20 @@
   skips `plugin` controls. `uiharness/cases/project-plugin-ui.uit` drives
   the fixture through all of it; nothing changes without a UI plugin.
 
+## Project summary row (UID 0) is not a grid row (#1511)
+
+- `Editor::visible_rows` omits `Task::is_project_summary` (UID 0, summary)
+  unless the view flag `show_summary_task` is on (default off, no UI yet; it is
+  view state like `collapsed`, bumps `revision`). Hosts and the harness's
+  `rows` go through `visible_rows`, so the first task with UID != 0 is row 1,
+  as in a plan without UID 0. The row stays in the model, in saves and in
+  `task.list`; `rows` `total` still counts it.
+- While hidden, UID 0 cannot be collapsed (`set_collapsed` refuses), and
+  hiding it again expands it, so it never hides its tasks. A new session, and
+  an edit that leaves the selection on it, start on the first shown row; an
+  explicit `select` of it (automation) stays. `uiharness/cases/project-summary-row.uit`
+  asserts the same layout with and without it (not run on macOS).
+
 ## Sheet Home ribbon Font / Font Size boxes (#1344)
 
 - The two boxes are text fields: `Docxy::font_box` (`FontBoxEdit`, tied to the

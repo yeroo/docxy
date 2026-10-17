@@ -22,6 +22,9 @@ impl Editor {
         if !self.proj.is_outline_summary(i) {
             return Err("Only a summary task has subtasks to show or hide".into());
         }
+        if collapsed && !self.show_summary && self.proj.tasks[i].is_project_summary() {
+            return Err("The project summary task is hidden; its subtasks stay shown".into());
+        }
         if !collapsed {
             return Ok(self.collapsed.remove(&uid));
         }
@@ -69,7 +72,46 @@ impl Editor {
             .iter()
             .enumerate()
             .filter_map(|(i, owner)| owner.is_none().then_some(i))
+            .filter(|&i| self.show_summary || !self.proj.tasks[i].is_project_summary())
             .collect()
+    }
+
+    /// Whether the project summary row (UID 0) is a grid row. Off by default.
+    pub fn show_summary_task(&self) -> bool {
+        self.show_summary
+    }
+
+    /// Show or hide the project summary row. View state: not an edit. Hiding
+    /// it expands it, so its tasks stay shown, and moves a selection on it to
+    /// the first shown row.
+    pub fn set_show_summary_task(&mut self, show: bool) {
+        if self.show_summary == show {
+            return;
+        }
+        self.show_summary = show;
+        if !show {
+            if let Some(i) = self.proj.tasks.iter().position(|t| t.is_project_summary()) {
+                self.collapsed.remove(&self.proj.tasks[i].uid);
+            }
+            self.sel_off_hidden_summary();
+            self.sel_uid = self.selected_uid();
+        }
+        self.revision += 1;
+    }
+
+    /// Move a selection that sits on the hidden project summary row to the
+    /// first shown row (it stays when nothing else is shown).
+    pub(super) fn sel_off_hidden_summary(&mut self) {
+        if !self.show_summary
+            && self
+                .proj
+                .tasks
+                .get(self.sel)
+                .is_some_and(|t| t.is_project_summary())
+            && let Some(&first) = self.visible_rows().first()
+        {
+            self.sel = first;
+        }
     }
 
     /// The visible row `delta` visible rows from `from`, stopping at the first

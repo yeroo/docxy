@@ -5051,6 +5051,33 @@ mod tests {
     }
 
     #[test]
+    fn the_uid_0_summary_row_is_not_a_shown_row() {
+        let task = |uid: i32, name: &str, outline_level, summary| Task {
+            uid,
+            id: uid,
+            name: name.into(),
+            outline_level,
+            summary,
+            duration_min: 480,
+            ..Task::default()
+        };
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0)),
+            tasks: vec![
+                task(0, "Plan", 0, true),
+                task(1, "A", 1, false),
+                task(2, "B", 1, false),
+            ],
+            ..Project::default()
+        };
+        let mut app = App::new(proj, Some("plan.yppx".into()), false);
+        assert_eq!(app.ed.project().tasks.len(), 3, "kept in the model");
+        assert_eq!(app.ed.visible_rows(), [1, 2]);
+        let names: Vec<_> = shown_rows(&mut app).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["• A", "• B"]);
+    }
+
+    #[test]
     fn hiding_subtasks_removes_their_rows_and_bars() {
         let mut app = outline_app();
         press_key(&mut app, KeyCode::Char('-'));

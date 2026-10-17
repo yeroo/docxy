@@ -124,6 +124,10 @@ pub struct Editor {
     /// Collapsed summaries by UID: view state, outside the model, history and
     /// saved files (see [`Self::set_collapsed`]).
     collapsed: std::collections::BTreeSet<i32>,
+    /// Whether the project summary row (UID 0) is a grid row: view state,
+    /// off by default, as Project's "Show project summary task". While off
+    /// it is never in `collapsed`.
+    show_summary: bool,
     undo: Vec<Project>,
     redo: Vec<Project>,
     dirty: bool,
@@ -156,12 +160,17 @@ impl Editor {
     pub fn restored(mut proj: Project, dirty: bool) -> Self {
         recompute_summaries(&mut proj);
         let sched = schedule(&proj);
-        let sel_uid = proj.tasks.first().map(|t| t.uid);
+        // The project summary row is hidden: start on the first real row.
+        let sel = usize::from(
+            proj.tasks.len() > 1 && proj.tasks.first().is_some_and(|t| t.is_project_summary()),
+        );
+        let sel_uid = proj.tasks.get(sel).map(|t| t.uid);
         Self {
             proj,
-            sel: 0,
+            sel,
             sel_uid,
             collapsed: Default::default(),
+            show_summary: false,
             undo: Vec::new(),
             redo: Vec::new(),
             dirty,
@@ -201,8 +210,9 @@ impl Editor {
         self.proj = proj;
         self.revision += 1;
         self.sel = 0;
-        self.sel_uid = self.selected_uid();
         self.collapsed.clear();
+        self.sel_off_hidden_summary();
+        self.sel_uid = self.selected_uid();
         self.undo.clear();
         self.redo.clear();
         self.dirty = false;
@@ -420,6 +430,9 @@ impl Editor {
         } else if let Some(owner) = self.hidden_owners().get(self.sel).copied().flatten() {
             // A clamped or shifted index: keep the summaries collapsed.
             self.sel = owner;
+        }
+        if self.selected_uid() != self.sel_uid {
+            self.sel_off_hidden_summary();
         }
         self.sel_uid = self.selected_uid();
         self.reschedule();

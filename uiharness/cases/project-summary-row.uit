@@ -1,0 +1,21 @@
+test project a plan without a UID 0 row lays out from task 1
+  open ../fixtures/project-no-summary-row.xml
+  call rows {}
+  assert reply.count is 2
+  assert reply.total is 2
+  assert reply.rows.0.id is 1
+  assert reply.rows.0.row is 1
+  assert reply.rows.1.id is 2
+  assert cell C1 is Design
+  assert cell C2 is Build
+
+test project the UID 0 summary row is not grid row 1
+  open ../fixtures/project-summary-row.xml
+  call rows {}
+  assert reply.count is 2
+  assert reply.total is 3
+  assert reply.rows.0.id is 1
+  assert reply.rows.0.row is 1
+  assert reply.rows.1.id is 2
+  assert cell C1 is Design
+  assert cell C2 is Build
