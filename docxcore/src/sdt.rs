@@ -183,19 +183,19 @@ impl BoundProp {
 /// and `close` boundaries' indices, the editor offset `end` its text ends at, the property it is bound to and the text it holds (empty while it
 /// shows its placeholder).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ParaControl {
-    pub open: usize,
-    pub close: usize,
-    pub end: usize,
+pub(crate) struct ParaControl {
+    pub(crate) open: usize,
+    pub(crate) close: usize,
+    pub(crate) end: usize,
     /// The control's `w:id`, which pairs it across edits.
-    pub id: Option<i64>,
-    pub prop: BoundProp,
-    pub text: String,
+    pub(crate) id: Option<i64>,
+    pub(crate) prop: BoundProp,
+    pub(crate) text: String,
     pub(crate) placeholder: bool,
 }
 
 /// The document property controls among `content`, in order.
-pub fn scan_paragraph(content: &[Inline]) -> Vec<ParaControl> {
+pub(crate) fn scan_paragraph(content: &[Inline]) -> Vec<ParaControl> {
     let mut out = Vec::new();
     let mut at = 0;
     let mut open: Option<(usize, BoundProp, bool, Option<i64>)> = None;
@@ -250,7 +250,7 @@ fn binding_of(open: &str) -> Option<BoundProp> {
 /// `content` with the control `c` showing `text` instead (its placeholder
 /// when empty); true when anything changed. The text takes the properties of
 /// the control's first run.
-pub fn set_control_text(content: &mut Vec<Inline>, c: &ParaControl, text: &str) -> bool {
+pub(crate) fn set_control_text(content: &mut Vec<Inline>, c: &ParaControl, text: &str) -> bool {
     if c.text == text {
         return false;
     }

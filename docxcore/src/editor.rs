@@ -504,8 +504,12 @@ pub struct Editor {
     /// undo serial, which hosts read as "an edit happened" (#764).
     display_only: bool,
     /// The document property controls' texts as the host last saw them
-    /// ([`Editor::take_bound_edit`]).
+    /// ([`Editor::take_bound_edits`]), keyed by the control's `w:id`;
+    /// controls without one are not tracked.
     bound_seen: Vec<(i64, crate::sdt::BoundProp, String)>,
+    /// The step [`Editor::set_bound_property`] last pushed, with its
+    /// property: the one a further sync reuses while it is the newest.
+    sync_step: Option<(u64, crate::sdt::BoundProp)>,
 }
 
 /// Whether a control bound to `prop` in `body` shows other than `text`.
@@ -550,6 +554,7 @@ impl Editor {
         let bound_seen = bound_controls(&doc.body);
         Editor {
             bound_seen,
+            sync_step: None,
             doc,
             caret: Caret { path, offset: 0 },
             anchor: None,
@@ -594,6 +599,7 @@ impl Editor {
             settings: self.settings,
             display_only: true,
             bound_seen: self.bound_seen.clone(),
+            sync_step: None,
         }
     }
 
@@ -1912,7 +1918,21 @@ impl Editor {
         own_step: bool,
     ) -> bool {
         if own_step && bound_controls_differ(&self.doc.body, prop, text) {
-            self.checkpoint(EditKind::Structural);
+            // One step for a run of them: while the newest step is this
+            // property's, a further sync (the next character typed in the
+            // other editor) changes it in place. The push does not move the
+            // serial counter, so the other editor's Repeat record and typing
+            // run go on as if nothing happened.
+            let newest = self.undo_serial();
+            if self.sync_step != newest.map(|serial| (serial, prop)) {
+                let counter = LAST_SERIAL.with(|c| c.get());
+                self.checkpoint(EditKind::Structural);
+                LAST_SERIAL.with(|c| c.set(counter));
+                if let Some(step) = self.undo.back_mut() {
+                    step.name = StepName::Named(prop.label().to_string());
+                    self.sync_step = Some((step.serial, prop));
+                }
+            }
         }
         let mut changed = false;
         for path in all_paragraph_paths(&self.doc.body) {

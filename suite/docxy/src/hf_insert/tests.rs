@@ -404,20 +404,8 @@ fn typing_in_a_property_control_writes_the_property_back_1433() {
     let Surface::Doc(ed) = &mut t.surface else {
         panic!()
     };
-    let paths = (0..ed.doc.body.len()).map(|i| vec![i]);
-    let found = paths
-        .filter_map(|p| {
-            let Block::Paragraph(para) = &ed.doc.body[p[0]] else {
-                return None;
-            };
-            docxcore::sdt::scan_paragraph(&para.content)
-                .into_iter()
-                .find(|c| c.prop == BoundProp::Company)
-                .map(|c| (p, c))
-        })
-        .next()
-        .expect("a Company control");
-    ed.caret = docxcore::editor::Caret::at(found.0, found.1.end);
+    // The Company control is last in the paragraph: its end is the end.
+    ed.set_caret(docxcore::editor::Caret::at(vec![0], usize::MAX));
     ed.insert_char('X');
     t.set_dirty();
     let app = part(&t, "docProps/app.xml");
@@ -580,6 +568,58 @@ fn a_property_copied_to_the_other_editor_is_an_undo_step_there_1433() {
     assert!(!core(&t).contains('!'), "{}", core(&t));
 }
 
+/// #1433: typing several characters in a header's property control is one
+/// header typing step and one body step, and leaves Repeat available.
+#[test]
+fn typing_in_a_header_control_is_one_step_in_each_editor_1433() {
+    let mut t = with_core("write-back-steps", "Ann", "Quarterly Report");
+    let control = property_control(&t, BoundProp::Title);
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!()
+    };
+    ed.paste(&Clip {
+        paras: vec![control],
+    });
+    t.set_dirty();
+    open_header(&mut t);
+    let control = property_control(&t, BoundProp::Title);
+    hf_ed(&mut t).paste(&Clip {
+        paras: vec![control],
+    });
+    t.set_dirty();
+    let body_steps = |t: &DocTab| match &t.surface {
+        Surface::Doc(ed) => ed.undo_names().len(),
+        _ => panic!(),
+    };
+    let hf_steps = |t: &DocTab| t.hf_edit.as_ref().unwrap().editor.undo_names().len();
+    let (b0, h0) = (body_steps(&t), hf_steps(&t));
+    for c in "2025".chars() {
+        hf_ed(&mut t).insert_char(c);
+        t.set_dirty();
+    }
+    // One typing step in the header, one named step in the body, and the
+    // serial counter (what a Repeat record checks) untouched by the body's.
+    assert_eq!(hf_steps(&t) - h0, 1);
+    assert_eq!(body_steps(&t) - b0, 1);
+    let Surface::Doc(ed) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(ed.undo_names()[0], "Title");
+    // The newest serial issued is the header's typing step's: the body's
+    // push did not advance it.
+    assert_eq!(
+        Some(docxcore::editor::undo_serial_counter()),
+        t.hf_edit.as_ref().unwrap().editor.undo_serial()
+    );
+    let core = t
+        .pkg
+        .as_ref()
+        .unwrap()
+        .part_text("docProps/core.xml")
+        .unwrap();
+    assert!(core.contains("Quarterly Report2025"), "{core}");
+}
+
 /// #1433: two properties changed by one step both reach their parts.
 #[test]
 fn two_properties_changed_in_one_step_are_both_written_1433() {
@@ -599,14 +639,11 @@ fn two_properties_changed_in_one_step_are_both_written_1433() {
     let Surface::Doc(ed) = &mut t.surface else {
         panic!()
     };
-    // Both controls' text replaced at once, as a Replace All does.
-    let Block::Paragraph(p) = &mut ed.doc.body[0] else {
-        panic!()
-    };
-    for (k, text) in [(1, "Globex"), (0, "Annual Report")] {
-        let found = docxcore::sdt::scan_paragraph(&p.content);
-        docxcore::sdt::set_control_text(&mut p.content, &found[k], text);
-    }
+    // Both controls' text replaced in one step, as a Replace All does.
+    ed.one_step("Replace All", |e| {
+        e.replace_all("Quarterly Report", "Annual Report", true);
+        e.replace_all("Acme", "Globex", true);
+    });
     t.set_dirty();
     let part = |t: &DocTab, n: &str| t.pkg.as_ref().unwrap().part_text(n).unwrap();
     assert!(part(&t, "docProps/core.xml").contains("<dc:title>Annual Report</dc:title>"));
