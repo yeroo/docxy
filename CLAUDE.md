@@ -228,9 +228,19 @@
   first asked in `main`) from `<config root>/docxy/plugins` (`DOCXY_CONFIG_DIR`
   when set), then `$YPPX_PLUGIN_DIR`. That registry decides `is_project_path`,
   the Open dialog's lists (`open_extensions()`), every read and write, the
-  Save As dialog's types (`save_types()`, registry order), the harness's
-  `save-as` and `save-types`, and control `proj.save`. Unit tests load none;
-  `project_formats::tests::Override` swaps in a stand-in per thread.
+  Save As dialog's types (`save_types(path)`, the proposed type first, then
+  registry order), the harness's `save-as` and `save-types`, and control
+  `proj.save`. Unit tests load none; `project_formats::tests::Override` swaps
+  in a stand-in per thread.
+- A format plugin may be the default save type: `"default": true` on a
+  formats JSON entry (`FormatDecl::default`, `ProjectFormat::is_default`;
+  ABI still 1). Save As proposes `Registry::default_save_extension(opened)`:
+  the plan's own type when something writes it, else the last registered
+  default that still writes, else `.yppx`. Both hosts put it first
+  (`save_types_default_first`) and in the suggested name (`Project1.<ext>`,
+  `plan.<ext>`); Save in place and an extensionless `save_target` are
+  unchanged. The harness's `save-types` reports `default`, `proj.path`
+  `default_save_ext`; the fixture declares `.fakeproj` the default.
 - Imported-status rule: a Project type nothing writes is an import (status
   "…, imported from .<ext>; Save As .yppx or MSPDI to keep edits", Save goes
   to Save As, `proj.path`/`tab-list` `imported: true`). With a plugin that

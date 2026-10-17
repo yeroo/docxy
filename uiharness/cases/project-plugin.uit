@@ -2,19 +2,53 @@
 # fixture plugin (projcore/tests/plugin_fixture, built beside uiharness by
 # `cargo build --release -p uiharness -p plugin_fixture`) into the sandbox's
 # docxy/plugins before the suite starts. It declares one fake type,
-# `.fakeproj`, whose files are MSPDI passed through. save-as.uit checks the
-# same lists without it.
+# `.fakeproj`, whose files are MSPDI passed through, and declares it the
+# default save type ("default": true). save-as.uit checks the same lists
+# without it.
 plugin yppx_fixture
 
 test a format plugin adds its type to the Save As list after the built-ins
   open copy:../fixtures/schedule.xml
   call save-types {}
   assert reply.count is 3
-  assert reply.types.0.label is Project schedule
-  assert reply.types.0.extensions.0 is yppx
-  assert reply.types.1.label is MSPDI
+  # A plan opened from MSPDI keeps proposing MSPDI, the plugin's default or not.
+  assert reply.default is xml
+  assert reply.types.0.label is MSPDI
+  assert reply.types.0.extensions.0 is xml
+  assert reply.types.1.label is Project schedule
+  assert reply.types.1.extensions.0 is yppx
   assert reply.types.2.label is Fake Project
   assert reply.types.2.extensions.0 is fakeproj
+  call proj.path {}
+  assert reply.default_save_ext is xml
+
+test a plugin that declares itself the default is what a new plan's Save As proposes
+  call proj.new {}
+  call save-types {}
+  assert reply.count is 3
+  assert reply.default is fakeproj
+  assert reply.types.0.label is Fake Project
+  assert reply.types.0.extensions.0 is fakeproj
+  assert reply.types.1.extensions.0 is yppx
+  assert reply.types.2.extensions.0 is xml
+  call proj.path {}
+  assert reply.default_save_ext is fakeproj
+
+test a plan opened from the plugin's type proposes that type again
+  open copy:../fixtures/schedule.xml
+  call save-as {"path":"plan","format":"fakeproj"}
+  call open {"path":"plan.fakeproj"}
+  assert title is plan.fakeproj
+  call save-types {}
+  assert reply.default is fakeproj
+  assert reply.types.0.extensions.0 is fakeproj
+  call proj.path {}
+  assert reply.default_save_ext is fakeproj
+  assert reply.imported is false
+  # A bare name takes the type the dialog opens on.
+  call save-as {"path":"copy"}
+  assert reply.format is fakeproj
+  assert reply.title is copy.fakeproj
 
 test save-as writes the plugin's type and the plan saves back to it in place
   open copy:../fixtures/schedule.xml

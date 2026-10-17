@@ -828,13 +828,11 @@ pub(super) fn save_decision(tab: &DocTab, harness: bool, explicit_save_as: bool)
                 .into(),
         );
     }
-    let name = tab
-        .path
-        .as_deref()
-        .unwrap_or_else(|| Path::new(tab.title.as_ref()));
-    let stem = name.file_stem().unwrap_or_default().to_string_lossy();
+    // The type Save As proposes: the plan's own when something writes it,
+    // else a format plugin's declared default, else .yppx.
     SaveDecision::Dialog {
-        suggested: format!("{stem}.yppx"),
+        suggested: project_formats::global()
+            .suggested_name(tab.path.as_deref(), tab.title.as_ref()),
     }
 }
 
