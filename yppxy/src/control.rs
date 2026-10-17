@@ -36,8 +36,8 @@
 //! | `resource.add` | `{name, type?, …the resource fields}` | the new resource, one undo step (#1588) |
 //! | `resource.set` | `{uid, …the resource fields}` | the updated resource, one undo step (#1588) |
 //! | `resource.del` | `{uid}` | `{deleted, assignments:[uid…]}`: the resource with its assignments, one undo step (#1588) |
-//! | `proj.get` | `{}` | the plan's title, start, finish, status and current dates and calendar (#1587); see `projctl` |
-//! | `proj.set` | `{title?, start?, status_date?, current_date?, calendar?}` | the same after the change, one undo step (#1587); see `projctl` |
+//! | `proj.get` | `{}` | the plan's title, start, finish, status and current dates, calendar (#1587) and `new_tasks` mode (#1585); see `projctl` |
+//! | `proj.set` | `{title?, start?, status_date?, current_date?, calendar?, new_tasks?}` | the same after the change, one undo step (#1587, #1585); see `projctl` |
 //! | `proj.save` | `{path?}` (.yppx/.xml, or a type a format plugin writes; extensionless adds .yppx) | `{path, …}` with the actual saved path |
 //! | `proj.reload` | — | `{path, …}` |
 //! | `proj.open` | `{path}` | `{path, …}` |
