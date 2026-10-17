@@ -380,19 +380,59 @@ pub(crate) fn swatch_checked(v: &ProjectView, id: &str) -> bool {
 
 /// A dialog's prefill: `yppx_ui_state` with `dialog: {id, uid}`, every
 /// plugin's `values` merged (the first plugin naming a control wins).
-fn prefill(v: &ProjectView, dialog: &str, uid: Option<i32>) -> Vec<(String, Json)> {
+/// What the plugins' state gives a dialog about to open: values, items and
+/// enabled flags by control name, the first plugin to name a control
+/// winning (#1556).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct Prefill {
+    pub values: Vec<(String, Json)>,
+    pub items: Vec<(String, Vec<String>)>,
+    pub enabled: Vec<(String, bool)>,
+}
+
+impl Prefill {
+    fn value(&self, name: &str) -> Option<&Json> {
+        self.values.iter().find(|(n, _)| n == name).map(|(_, v)| v)
+    }
+
+    fn items(&self, name: &str) -> Option<&[String]> {
+        self.items
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_slice())
+    }
+
+    fn enabled(&self, name: &str) -> Option<bool> {
+        self.enabled
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, on)| *on)
+    }
+}
+
+fn prefill(v: &ProjectView, dialog: &str, uid: Option<i32>) -> Prefill {
     let ctx = StateCtx {
         plan: projcore::mspdi::write_mspdi(v.ed.project()),
         selection: selection_of(v),
         view: view_json(v),
         dialog: Some((dialog.to_string(), uid)),
     };
-    let mut out: Vec<(String, Json)> = Vec::new();
+    let mut out = Prefill::default();
     for p in plugins() {
         if let Ok(state) = p.state(&ctx) {
             for (name, value) in state.values {
-                if !out.iter().any(|(n, _)| *n == name) {
-                    out.push((name, value));
+                if out.value(&name).is_none() {
+                    out.values.push((name, value));
+                }
+            }
+            for (name, items) in state.items {
+                if out.items(&name).is_none() {
+                    out.items.push((name, items));
+                }
+            }
+            for (name, on) in state.enabled {
+                if out.enabled(&name).is_none() {
+                    out.enabled.push((name, on));
                 }
             }
         }
@@ -648,25 +688,25 @@ pub(crate) fn values_of(d: &Dialog) -> Json {
 }
 
 /// A spec's control as the dialog model holds it, on `page`, with the
-/// prefill's value when the plugin gave one.
+/// prefill's value, items and enabled flag when the plugin gave them.
 fn control_of_spec(
     c: &ui::DialogControl,
     page: Option<usize>,
-    prefill: &[(String, Json)],
+    prefill: &Prefill,
 ) -> dialog::Control {
     let kind = kind_of(&c.kind);
-    let value = prefill
-        .iter()
-        .find(|(n, _)| *n == c.name)
-        .map(|(_, v)| v)
-        .unwrap_or(&c.value);
+    let value = prefill.value(&c.name).unwrap_or(&c.value);
+    let items = prefill.items(&c.name).unwrap_or(&c.items);
     let mut out = dialog::Control::new(
         intern(&c.name),
         &c.label,
         kind,
-        value_of(kind, &c.items, value),
+        value_of(kind, items, value),
     );
-    out.items.clone_from(&c.items);
+    out.items = items.to_vec();
+    if let Some(on) = prefill.enabled(&c.name) {
+        out.enabled = on;
+    }
     out.columns = c.columns.iter().map(|col| col.name.clone()).collect();
     out.column_kinds = c.columns.iter().map(|col| kind_of(&col.kind)).collect();
     out.page = page;
@@ -742,11 +782,7 @@ pub(crate) fn extend_task_info(d: &mut Dialog, v: &ProjectView, uid: i32) {
 }
 
 /// [`extend_task_info`] from `spec`, prefilled with `values`.
-pub(crate) fn extend_task_info_with(
-    d: &mut Dialog,
-    spec: &ui::DialogSpec,
-    values: &[(String, Json)],
-) {
+pub(crate) fn extend_task_info_with(d: &mut Dialog, spec: &ui::DialogSpec, values: &Prefill) {
     for page in &spec.pages {
         let at = d
             .tabs

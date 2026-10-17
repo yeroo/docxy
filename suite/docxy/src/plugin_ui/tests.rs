@@ -212,7 +212,10 @@ fn task_information_pages_replace_by_name_or_follow_and_take_the_prefill() {
     let built_in_tabs = d.tabs.clone();
     let built_in_notes = d.controls.iter().filter(|c| c.page == Some(4)).count();
     assert_eq!(built_in_notes, 1);
-    let values = vec![("fx.note".to_string(), Json::str("from the plugin"))];
+    let values = Prefill {
+        values: vec![("fx.note".to_string(), Json::str("from the plugin"))],
+        ..Prefill::default()
+    };
     extend_task_info_with(&mut d, spec, &values);
     d.mark_opened();
     // "Fixture" is a new tab after the built-in five; "Notes" replaced the

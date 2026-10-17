@@ -158,6 +158,18 @@ test Task Information gains the plugin's page, prefilled, with a multiline and a
   call dialog-read {}
   assert reply.controls.1.rows.1.1 is false
   call-error dialog-set {"control":"fixture.grid[1].Done","value":"maybe"} => takes true or false
+  # The dropdown's items and a greyed control come from the state for this
+  # opening (#1556): the manifest's "none" is replaced by the plan's items.
+  assert reply.controls.2.name is fixture.pick
+  assert reply.controls.2.kind is dropdown
+  assert reply.controls.2.items.0 is task
+  assert reply.controls.2.items.1 is 2
+  assert reply.controls.2.value is 2
+  call-error dialog-set {"control":"fixture.pick","value":"none"} => has no item
+  call dialog-set {"control":"fixture.pick","value":"task"}
+  assert reply.controls.2.value is task
+  assert reply.controls.3.name is fixture.locked
+  assert reply.controls.3.enabled is false
   # Enter in the multiline is a new line, not OK.
   call pointer-click {"dialog-field":"fixture.note"}
   call real-key {"key":"end"}

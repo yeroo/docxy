@@ -36,7 +36,9 @@ const MANIFEST: &str = r##"{
   "dialogs":[
     {"id":"task-information","pages":[{"name":"Fixture","controls":[
       {"name":"fixture.note","label":"Fixture &note:","kind":"multiline","value":""},
-      {"name":"fixture.grid","label":"Fixture items","kind":"grid","columns":[{"name":"Name","kind":"text"},{"name":"Done","kind":"checkbox"}],"value":[["a","false"],["b","true"]]}]}]},
+      {"name":"fixture.grid","label":"Fixture items","kind":"grid","columns":[{"name":"Name","kind":"text"},{"name":"Done","kind":"checkbox"}],"value":[["a","false"],["b","true"]]},
+      {"name":"fixture.pick","label":"Fixture p&ick:","kind":"dropdown","items":["none"],"value":"none"},
+      {"name":"fixture.locked","label":"Fixture locked","kind":"checkbox","value":true}]}]},
     {"id":"fixture.options","title":"Fixture Options","pages":[{"name":"General","controls":[
       {"name":"n","label":"&Number:","kind":"number","value":"1"}]}],"buttons":["OK","Cancel"]}],
   "palettes":[
@@ -129,8 +131,10 @@ pub unsafe extern "C" fn yppx_ui_state(input: *const u8, len: usize, out: *mut Y
     if let Some(dialog) = req.get("dialog") {
         if dialog.get("id").and_then(Json::str) == Some("task-information") {
             let uid = dialog.get("uid").and_then(Json::num).unwrap_or(0.0) as i64;
+            // The values, the dropdown's items for this plan (#1556) and a
+            // control greyed by the state.
             reply.push_str(&format!(
-                r#","values":{{"fixture.note":{},"fixture.grid":[["task","false"],["{uid}","true"]]}}"#,
+                r#","values":{{"fixture.note":{},"fixture.grid":[["task","false"],["{uid}","true"]],"fixture.pick":"{uid}"}},"items":{{"fixture.pick":["task","{uid}"]}},"enabled":{{"fixture.locked":false}}"#,
                 quote(&format!("note for task {uid}"))
             ));
         }
