@@ -507,9 +507,28 @@ pub struct Editor {
     /// ([`Editor::take_bound_edits`]), keyed by the control's `w:id`;
     /// controls without one are not tracked.
     bound_seen: Vec<(i64, crate::sdt::BoundProp, String)>,
-    /// The step [`Editor::set_bound_property`] last pushed, with its
-    /// property: the one a further sync reuses while it is the newest.
-    sync_step: Option<(u64, crate::sdt::BoundProp)>,
+    /// The step [`Editor::set_bound_property`] last pushed: the one a further
+    /// sync reuses while it is the newest. Undo and redo forget it.
+    sync_step: Option<SyncStep>,
+}
+
+/// Where a document property came from, for [`Editor::set_bound_property`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PropSource {
+    /// This editor: its own edit set it.
+    Here,
+    /// Another editor, whose newest undo step (its serial, if it has one) is
+    /// the edit that set it.
+    Other { newest_step: Option<u64> },
+}
+
+/// The undo step a property sync pushed, with the property and the other
+/// editor's step it answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SyncStep {
+    serial: u64,
+    prop: crate::sdt::BoundProp,
+    source: Option<u64>,
 }
 
 /// Whether a control bound to `prop` in `body` shows other than `text`.
@@ -908,6 +927,7 @@ impl Editor {
             self.pending = prev.pending;
             self.after_object = prev.after_object;
             self.settings = prev.settings;
+            self.sync_step = None;
             self.last = EditKind::None;
             self.refresh_merge_preview();
             true
@@ -926,6 +946,7 @@ impl Editor {
             self.pending = next.pending;
             self.after_object = next.after_object;
             self.settings = next.settings;
+            self.sync_step = None;
             self.last = EditKind::None;
             self.refresh_merge_preview();
             true
@@ -1905,32 +1926,43 @@ impl Editor {
     }
 
     /// Show `text` in every document property control bound to `prop`
-    /// (#1433). With `own_step` false it is one change with whatever edit set
-    /// the property in this editor: no undo step of its own, so undoing that
-    /// edit puts all of them back. With `own_step` true the property was set
-    /// from another editor (a header or footer, the body), and this change
-    /// is an undo step here, named for the property. The caret and anchor
-    /// follow the text they stood after. True when a control changed.
+    /// (#1433). From [`PropSource::Here`] it is one change with whatever edit
+    /// set the property in this editor: no undo step of its own, so undoing
+    /// that edit puts all of them back. From [`PropSource::Other`] (a header
+    /// or footer, the body) it is an undo step here, named for the property.
+    /// The run of them one typing run of the other editor makes is one step:
+    /// while the newest step here is the one pushed for the same property and
+    /// the other editor's newest step is the one it was pushed for, a further
+    /// sync changes it in place, unless a redo is waiting (the step would no
+    /// longer be the end of the history). The caret and anchor follow the
+    /// text they stood after. True when a control changed.
     pub fn set_bound_property(
         &mut self,
         prop: crate::sdt::BoundProp,
         text: &str,
-        own_step: bool,
+        from: PropSource,
     ) -> bool {
-        if own_step && bound_controls_differ(&self.doc.body, prop, text) {
-            // One step for a run of them: while the newest step is this
-            // property's, a further sync (the next character typed in the
-            // other editor) changes it in place. The push does not move the
-            // serial counter, so the other editor's Repeat record and typing
-            // run go on as if nothing happened.
-            let newest = self.undo_serial();
-            if self.sync_step != newest.map(|serial| (serial, prop)) {
-                let counter = LAST_SERIAL.with(|c| c.get());
-                self.checkpoint(EditKind::Structural);
-                LAST_SERIAL.with(|c| c.set(counter));
-                if let Some(step) = self.undo.back_mut() {
-                    step.name = StepName::Named(prop.label().to_string());
-                    self.sync_step = Some((step.serial, prop));
+        if let PropSource::Other { newest_step } = from {
+            if bound_controls_differ(&self.doc.body, prop, text) {
+                let mine = self.undo_serial();
+                let coalesce = self.redo.is_empty()
+                    && mine.is_some()
+                    && self.sync_step
+                        == mine.map(|serial| SyncStep {
+                            serial,
+                            prop,
+                            source: newest_step,
+                        });
+                if !coalesce {
+                    self.checkpoint(EditKind::Structural);
+                    if let Some(step) = self.undo.back_mut() {
+                        step.name = StepName::Named(prop.label().to_string());
+                        self.sync_step = Some(SyncStep {
+                            serial: step.serial,
+                            prop,
+                            source: newest_step,
+                        });
+                    }
                 }
             }
         }

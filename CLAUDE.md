@@ -240,7 +240,11 @@
   its other controls with `Editor::set_bound_property` as part of the edit's
   own undo step; the other editor takes it as an undo step of its own (so
   its Ctrl+Z, like the source's, undoes the property everywhere through the
-  next sync). Controls
+  next sync). That step is one per step of the source editor (`PropSource`:
+  reused in place while it is the newest, no redo waits and the source's
+  newest step is the one it answered; undo and redo forget it), and it
+  advances the serial counter like any step, so the host refreshes the source's
+  Repeat record after the sync (`keep_current`). Controls
   in a header or footer that is not open, and a package without the part,
   are not reached; terminal `docxy` has no package sync.
 - Insert > Text has Date & Time... and Quick Parts (the H&F tab's commands,

@@ -568,8 +568,10 @@ fn a_property_copied_to_the_other_editor_is_an_undo_step_there_1433() {
     assert!(!core(&t).contains('!'), "{}", core(&t));
 }
 
-/// #1433: typing several characters in a header's property control is one
-/// header typing step and one body step, and leaves Repeat available.
+/// #1433: typing several characters in a header's property control, through
+/// the key handler's calls, is one header typing step and one body step, the
+/// header's Repeat record stays ready, and a command run in the body after
+/// the header closes is a step of its own beside the property's.
 #[test]
 fn typing_in_a_header_control_is_one_step_in_each_editor_1433() {
     let mut t = with_core("write-back-steps", "Ann", "Quarterly Report");
@@ -587,37 +589,49 @@ fn typing_in_a_header_control_is_one_step_in_each_editor_1433() {
         paras: vec![control],
     });
     t.set_dirty();
-    let body_steps = |t: &DocTab| match &t.surface {
-        Surface::Doc(ed) => ed.undo_names().len(),
+    let body_names = |t: &DocTab| match &t.surface {
+        Surface::Doc(ed) => ed.undo_names(),
         _ => panic!(),
     };
     let hf_steps = |t: &DocTab| t.hf_edit.as_ref().unwrap().editor.undo_names().len();
-    let (b0, h0) = (body_steps(&t), hf_steps(&t));
+    let (b0, h0) = (body_names(&t).len(), hf_steps(&t));
+    let mut repeat = None;
     for c in "2025".chars() {
-        hf_ed(&mut t).insert_char(c);
+        let since = docxcore::editor::undo_serial_counter();
+        let ed = hf_ed(&mut t);
+        let noted = crate::type_key_text(ed, &repeat, &c.to_string(), &Default::default());
+        let recorded = crate::note_edit(ed, &mut repeat, since, noted);
         t.set_dirty();
+        crate::keep_current(&mut repeat, recorded);
+        let ed = &t.hf_edit.as_ref().unwrap().editor;
+        assert!(recorded && crate::repeat_ready(ed, &repeat), "{c}");
     }
-    // One typing step in the header, one named step in the body, and the
-    // serial counter (what a Repeat record checks) untouched by the body's.
     assert_eq!(hf_steps(&t) - h0, 1);
-    assert_eq!(body_steps(&t) - b0, 1);
-    let Surface::Doc(ed) = &t.surface else {
+    assert_eq!(body_names(&t).len() - b0, 1);
+    assert_eq!(body_names(&t)[0], "Title");
+    let core = |t: &DocTab| {
+        t.pkg
+            .as_ref()
+            .unwrap()
+            .part_text("docProps/core.xml")
+            .unwrap()
+    };
+    assert!(core(&t).contains("Quarterly Report2025"), "{}", core(&t));
+    // The header closes; a named command in the body is its own step and
+    // its Ctrl+Z leaves the Title controls alone.
+    t.hf_edit = None;
+    let Surface::Doc(ed) = &mut t.surface else {
         panic!()
     };
-    assert_eq!(ed.undo_names()[0], "Title");
-    // The newest serial issued is the header's typing step's: the body's
-    // push did not advance it.
-    assert_eq!(
-        Some(docxcore::editor::undo_serial_counter()),
-        t.hf_edit.as_ref().unwrap().editor.undo_serial()
-    );
-    let core = t
-        .pkg
-        .as_ref()
-        .unwrap()
-        .part_text("docProps/core.xml")
-        .unwrap();
-    assert!(core.contains("Quarterly Report2025"), "{core}");
+    let since = docxcore::editor::undo_serial_counter();
+    ed.select_all();
+    ed.toggle_bold();
+    ed.name_command(since, "Bold");
+    assert_eq!(&ed.undo_names()[..2], ["Bold", "Title"]);
+    assert!(ed.undo());
+    t.set_dirty();
+    assert!(core(&t).contains("Quarterly Report2025"), "{}", core(&t));
+    assert_eq!(body_names(&t)[0], "Title");
 }
 
 /// #1433: two properties changed by one step both reach their parts.

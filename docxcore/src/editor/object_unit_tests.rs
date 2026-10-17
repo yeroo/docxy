@@ -878,10 +878,10 @@ fn typing_in_a_property_control_updates_the_others_1433() {
     assert_eq!(ed.take_bound_edits(), [(BoundProp::Title, "Old!".into())]);
     assert_eq!(ed.take_bound_edits(), []);
     // The other control, in another paragraph, takes the text.
-    assert!(ed.set_bound_property(BoundProp::Title, "Old!", false));
+    assert!(ed.set_bound_property(BoundProp::Title, "Old!", PropSource::Here));
     let text = |ed: &Editor, i: usize| para(ed, i).plain_text();
     assert_eq!(text(&ed, 1), "Old! end");
-    assert!(!ed.set_bound_property(BoundProp::Title, "Old!", false));
+    assert!(!ed.set_bound_property(BoundProp::Title, "Old!", PropSource::Here));
     assert_eq!(ed.take_bound_edits(), [], "the sync is not an edit");
     // Undoing the typing puts both back: the other control's change had no
     // step of its own. The host sees the old text as the edit.
@@ -891,14 +891,14 @@ fn typing_in_a_property_control_updates_the_others_1433() {
     assert_eq!(ed.take_bound_edits(), [(BoundProp::Title, "Old".into())]);
     // An emptied property shows the placeholder, flagged, and a value
     // clears the flag again.
-    ed.set_bound_property(BoundProp::Title, "", false);
+    ed.set_bound_property(BoundProp::Title, "", PropSource::Here);
     assert_eq!(text(&ed, 1), "[Title] end");
     assert!(saved(&ed).matches("<w:showingPlcHdr/>").count() >= 1);
-    ed.set_bound_property(BoundProp::Title, "Back", false);
+    ed.set_bound_property(BoundProp::Title, "Back", PropSource::Here);
     assert_eq!(text(&ed, 1), "Back end");
     assert!(!saved(&ed).contains("<w:showingPlcHdr/>"));
     // A control of another property is left alone.
-    assert!(!ed.set_bound_property(BoundProp::Author, "Ann", false));
+    assert!(!ed.set_bound_property(BoundProp::Author, "Ann", PropSource::Here));
 }
 
 /// #1433: a control inserted, or a change that leaves every control's text
@@ -988,4 +988,48 @@ fn bound_edits_pair_controls_by_id_1433() {
     set_control_text(c, &found[1], "A3");
     c.drain(0..3);
     assert_eq!(ed.take_bound_edits(), [(BoundProp::Author, "A3".into())]);
+}
+
+/// #1433: a property set from the other editor is an undo step here, named
+/// for it; one run of the other editor's typing is one step, a new step of
+/// the other editor is a new one, and after an undo a sync pushes a fresh
+/// step, clearing the redo it would otherwise leave behind.
+#[test]
+fn a_property_from_the_other_editor_is_one_step_per_source_step_1433() {
+    use crate::sdt::{BoundProp, core_property_control};
+    let control = |id| core_property_control(BoundProp::Title, "Old", id, &RunProps::default());
+    let mut ed = Editor::new(Document {
+        body: vec![
+            Block::Paragraph(Paragraph {
+                props: ParProps::default(),
+                content: control(1),
+            }),
+            Block::Paragraph(Paragraph {
+                props: ParProps::default(),
+                content: control(2),
+            }),
+        ],
+    });
+    let from = |step| PropSource::Other {
+        newest_step: Some(step),
+    };
+    let n0 = ed.undo_names().len();
+    assert!(ed.set_bound_property(BoundProp::Title, "A", from(10)));
+    assert!(ed.set_bound_property(BoundProp::Title, "AB", from(10)));
+    assert_eq!(ed.undo_names().len(), n0 + 1);
+    assert_eq!(ed.undo_names()[0], "Title");
+    // The other editor's next step is a step of ours.
+    assert!(ed.set_bound_property(BoundProp::Title, "ABC", from(11)));
+    assert_eq!(ed.undo_names().len(), n0 + 2);
+    // An undo brings the earlier text back; a sync then is a fresh step and
+    // leaves nothing to redo.
+    assert!(ed.undo());
+    assert_eq!(para(&ed, 0).plain_text(), "AB");
+    assert!(ed.can_redo());
+    assert!(ed.set_bound_property(BoundProp::Title, "Z", from(11)));
+    assert!(!ed.can_redo());
+    assert_eq!(ed.undo_names().len(), n0 + 2);
+    // A sync that changes nothing pushes nothing.
+    assert!(!ed.set_bound_property(BoundProp::Title, "Z", from(12)));
+    assert_eq!(ed.undo_names().len(), n0 + 2);
 }

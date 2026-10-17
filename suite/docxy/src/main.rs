@@ -160,7 +160,7 @@ use project::*;
 use std::path::PathBuf;
 
 use docxcore::comments::Comment;
-use docxcore::editor::{Caret, Clip, Editor, FoundMatch, step_found};
+use docxcore::editor::{Caret, Clip, Editor, FoundMatch, PropSource, step_found};
 use docxcore::markup::MarkupView;
 use docxcore::model::{
     Align, Block, BorderKind, Document, Inline, ParBorders, Paragraph, RunProps, Table, VertAlign,
@@ -5064,6 +5064,9 @@ impl DocTab {
                 edits.push((p, t, false));
             }
         }
+        // The newest step of the editor each edit came from, after the edit.
+        let body_step = body.undo_serial();
+        let hf_step = self.hf_edit.as_ref().and_then(|h| h.editor.undo_serial());
         for (prop, text, from_hf) in edits {
             let Some(xml) = pkg.part_text(prop.part_name()) else {
                 continue;
@@ -5072,9 +5075,23 @@ impl DocTab {
                 continue;
             };
             pkg.set_part_text(prop.part_name(), &new);
-            body.set_bound_property(prop, &text, from_hf);
+            let other = |newest_step| PropSource::Other { newest_step };
+            body.set_bound_property(
+                prop,
+                &text,
+                if from_hf {
+                    other(hf_step)
+                } else {
+                    PropSource::Here
+                },
+            );
             if let Some(h) = &mut self.hf_edit {
-                h.editor.set_bound_property(prop, &text, !from_hf);
+                let from = if from_hf {
+                    PropSource::Here
+                } else {
+                    other(body_step)
+                };
+                h.editor.set_bound_property(prop, &text, from);
             }
         }
     }
@@ -28055,6 +28072,9 @@ fn repeat_untouched(rec: &Option<RepeatRecord>) -> bool {
 fn keep_current(rec: &mut Option<RepeatRecord>, keep: bool) {
     if let (true, Some(r)) = (keep, rec.as_mut()) {
         r.generation = edit_generation();
+        // The only step pushed after the record was taken is the property
+        // sync's, in the other editor (#1433): none the record's editor made.
+        r.counter = docxcore::editor::undo_serial_counter();
     }
 }
 
