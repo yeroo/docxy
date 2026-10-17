@@ -19574,6 +19574,7 @@ mod tests {
         app.vim_key(KeyCode::Left, false, false, false);
         app.vim_key(KeyCode::Enter, false, false, false);
         assert!(app.vim.as_ref().unwrap().cmdline.is_none());
+        assert_eq!(app.status.as_deref(), Some("Not a command: :ab"));
     }
 
     #[test]
