@@ -362,7 +362,7 @@ pub(crate) fn paste_project_text(tab: &mut DocTab, text: &str) {
     let targets: Vec<i32> = if entry {
         Vec::new()
     } else {
-        let rows = v.ed.visible_rows();
+        let rows = v.ed.display_rows();
         rows[v.display_row().min(rows.len())..]
             .iter()
             .map(|&i| v.ed.project().tasks[i].uid)

@@ -232,7 +232,7 @@ impl ProjectView {
         if anchor_uid == cursor_uid && anchor_col == self.col {
             return None;
         }
-        let rows = self.ed.visible_rows();
+        let rows = self.ed.display_rows();
         let pos = |uid: i32| {
             rows.iter()
                 .position(|&i| self.ed.project().tasks[i].uid == uid)
@@ -270,7 +270,7 @@ impl ProjectView {
         let Some(uid) = self.selected_uid() else {
             return true;
         };
-        let rows = self.ed.visible_rows();
+        let rows = self.ed.display_rows();
         // Anchor where the cursor is: on the first extension, or when the
         // stored anchor's task is gone or hidden (a delete, an undo, a
         // collapse) — an anchor that cannot resolve selects nothing.
@@ -305,8 +305,9 @@ impl ProjectView {
     }
 
     pub fn reveal_col(&mut self) {
-        let left: f32 = WIDTHS[..self.col].iter().sum();
-        let right = left + WIDTHS[self.col];
+        let widths = self.widths();
+        let left: f32 = widths[..self.col].iter().sum();
+        let right = left + widths[self.col];
         let x = self.table_x.get();
         if left < x {
             self.table_x.set(left);
@@ -772,7 +773,7 @@ pub(crate) fn project_column_select(tab: &mut DocTab, col: usize) {
     v.drag_made_range = false;
     v.row_drag = false;
     v.row_header = false;
-    let rows = v.ed.visible_rows();
+    let rows = v.ed.display_rows();
     match (rows.first().copied(), rows.last().copied()) {
         (Some(first), Some(last)) => {
             let last_uid = v.ed.project().tasks[last].uid;

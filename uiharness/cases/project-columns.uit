@@ -1,0 +1,46 @@
+# #1533: the Project entry table's columns resize. Dragging the right edge of a
+# heading (`project-heading-edge:<Name>`) sets that column's width live, one
+# undo step records it on release; a double-click on the edge is Best Fit.
+# `rows` reports every column's width in px (the plan's own over the
+# defaults); the .yppx round trip is a unit test (columns/tests.rs).
+# project-filter.xml: Plan, Build, Test, Ship.
+
+test project dragging a heading edge resizes only that column and undo restores it
+  open copy:../fixtures/project-filter.xml
+  call rows {}
+  assert reply.widths.Name is 240
+  assert reply.widths.Duration is 80
+  # The heading is pressed where the frame on screen drew it: draw one first.
+  shot window
+  call pointer-drag {"from":"project-heading-edge:Name","to":"project-heading-edge:Name","offset":[-60,0]}
+  call rows {}
+  assert reply.widths.Name is 180
+  assert reply.widths.Duration is 80
+  assert reply.widths.Start is 100
+  # The press and the drag never selected the column or a cell.
+  assert selection is none
+  key ctrl+z
+  call rows {}
+  assert reply.widths.Name is 240
+  key ctrl+y
+  call rows {}
+  assert reply.widths.Name is 180
+
+test project a drag stops at the narrowest and widest a column may be
+  open copy:../fixtures/project-filter.xml
+  shot window
+  call pointer-drag {"from":"project-heading-edge:Duration","to":"project-heading-edge:Duration","offset":[-300,0]}
+  call rows {}
+  assert reply.widths.Duration is 24
+
+test project double-clicking a heading edge is Best Fit
+  open copy:../fixtures/project-filter.xml
+  shot window
+  call pointer-click {"region":"project-heading-edge:Duration","double":true}
+  call rows {}
+  assert reply.widths.Duration is not 80
+  assert reply.widths.Name is 240
+  assert status is Duration column set to Best Fit
+  key ctrl+z
+  call rows {}
+  assert reply.widths.Duration is 80

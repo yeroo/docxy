@@ -245,22 +245,22 @@ pub(crate) const OPERATORS: [(&str, &str, &str); 12] = [
     ("does not contain", "notEqual", "*{}*"),
 ];
 
-fn control<'a>(d: &'a Dialog, name: &str) -> Option<&'a Control> {
+pub(crate) fn control<'a>(d: &'a Dialog, name: &str) -> Option<&'a Control> {
     d.controls.iter().find(|c| c.name == name)
 }
 
-fn control_mut<'a>(d: &'a mut Dialog, name: &str) -> Option<&'a mut Control> {
+pub(crate) fn control_mut<'a>(d: &'a mut Dialog, name: &str) -> Option<&'a mut Control> {
     d.controls.iter_mut().find(|c| c.name == name)
 }
 
-fn text_of(d: &Dialog, name: &str) -> String {
+pub(crate) fn text_of(d: &Dialog, name: &str) -> String {
     match control(d, name).map(|c| &c.value) {
         Some(Value::Text(t)) => t.trim().to_string(),
         _ => String::new(),
     }
 }
 
-fn choice_of(d: &Dialog, name: &str) -> Option<String> {
+pub(crate) fn choice_of(d: &Dialog, name: &str) -> Option<String> {
     let c = control(d, name)?;
     match c.value {
         Value::Choice(Some(i)) => c.items.get(i).cloned(),
@@ -268,11 +268,11 @@ fn choice_of(d: &Dialog, name: &str) -> Option<String> {
     }
 }
 
-fn checked(d: &Dialog, name: &str) -> bool {
+pub(crate) fn checked(d: &Dialog, name: &str) -> bool {
     control(d, name).is_some_and(|c| c.value == Value::Bool(true))
 }
 
-fn dialog(
+pub(crate) fn dialog(
     id: DialogId,
     title: String,
     buttons: &[(&str, ButtonRole)],

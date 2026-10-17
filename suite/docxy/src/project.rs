@@ -24,6 +24,10 @@ mod timeline;
 pub(super) use timeline::*;
 mod rows;
 pub(super) use rows::*;
+mod columns;
+pub(super) use columns::{ARROW_W, EDGE_W, WidthDrag, project_width_release_all};
+mod autofilter;
+pub(super) use autofilter::{AUTO_FILTER_STATUS, autofilter_click};
 
 /// Whole rows a PageUp/PageDown steps by: the rows that fit in the
 /// `project-body` probe, less one, so the cursor's landing row stays on
@@ -107,6 +111,9 @@ pub(super) struct ProjectView {
     /// state by plan revision and selection, overlay shapes by revision and
     /// scale (`plugin_ui`).
     pub plugin_cache: std::cell::RefCell<crate::plugin_ui::PluginCache>,
+    /// A heading edge held down (#1533): the column follows the pointer and
+    /// one undo step records the width on release.
+    pub width_drag: Option<WidthDrag>,
 }
 
 impl ProjectView {
@@ -143,6 +150,7 @@ impl ProjectView {
             dragging: false,
             drag_made_range: false,
             plugin_cache: crate::plugin_ui::new_cache(),
+            width_drag: None,
             source: None,
         }
     }
@@ -165,7 +173,7 @@ impl ProjectView {
     }
 
     fn apply_widths(&mut self) {
-        self.table_w = split_table_width(self.width, self.split);
+        self.table_w = split_table_width_for(self.width, self.split, self.table_total());
         self.gantt_w = (self.width - self.table_w - GANTT_INSET - SCROLLBAR_W).max(0.);
         self.refresh_schedule_layout();
     }
@@ -173,7 +181,11 @@ impl ProjectView {
     /// Moves the split bar. It writes `table_w` itself, so the next frame's
     /// `layout` sees no resize and leaves the table where it was scrolled.
     pub fn set_split(&mut self, table_w: f32) {
-        self.split = Some(split_table_width(self.width, Some(table_w)));
+        self.split = Some(split_table_width_for(
+            self.width,
+            Some(table_w),
+            self.table_total(),
+        ));
         self.apply_widths();
     }
 
@@ -197,7 +209,7 @@ impl ProjectView {
     }
 
     fn clamp_offsets(&mut self) {
-        self.table_x.clamp(TABLE_W, self.table_w);
+        self.table_x.clamp(self.table_total(), self.table_w);
         self.gantt_x.clamp(self.scale.width(), self.gantt_w);
     }
 
@@ -230,7 +242,7 @@ impl ProjectView {
     /// The cursor's row as shown, where collapsed summaries hide rows: its
     /// position among the visible rows, or their count on the entry row.
     pub fn display_row(&self) -> usize {
-        let rows = self.ed.visible_rows();
+        let rows = self.ed.display_rows();
         if self.on_entry_row() {
             rows.len()
         } else {
@@ -278,7 +290,7 @@ impl ProjectView {
         // under collapsed summaries are skipped, and past the last task the
         // cursor lands on the entry row.
         if matches!(key, "pageup" | "pagedown") {
-            let rows = self.ed.visible_rows();
+            let rows = self.ed.display_rows();
             if rows.is_empty() {
                 return true;
             }
@@ -297,13 +309,13 @@ impl ProjectView {
             return true;
         }
         // Rows under collapsed summaries are skipped.
-        let last = self.ed.visible_rows().last().copied();
+        let last = self.ed.display_rows().last().copied();
         let index = match key {
             // From the entry row, Up goes to the last task.
             "up" if self.on_entry_row() => last.unwrap_or(0),
             "up" => self.ed.visible_step(self.ed.sel(), -1),
             // Down from the last task goes to the entry row, as in Project.
-            "down" if self.on_entry_row() || last.is_none_or(|last| self.ed.sel() >= last) => {
+            "down" if self.on_entry_row() || last.is_none_or(|last| self.ed.sel() == last) => {
                 self.enter_entry_row();
                 return true;
             }
@@ -328,7 +340,7 @@ impl ProjectView {
             "end" => (Some(COLUMN_COUNT - 1), false),
             _ => return false,
         };
-        let rows = self.ed.visible_rows();
+        let rows = self.ed.display_rows();
         let row = if first { rows.first() } else { rows.last() };
         if let Some(&row) = row {
             self.entry = false;
@@ -348,7 +360,7 @@ impl ProjectView {
         (
             PaneScroll {
                 offset: self.table_x.clone(),
-                content: TABLE_W,
+                content: self.table_total(),
                 viewport: self.table_w,
             },
             PaneScroll {
@@ -536,8 +548,16 @@ fn project_region(
             .ok_or_else(|| "the split bar has not been laid out".into());
     }
     let body = lookup(probes, "project-body").ok_or("the Project body has not been laid out")?;
-    if let harness::Region::ProjectHeading(col) = region {
-        let heading = lookup(probes, &format!("project-heading:{col}"))
+    if let harness::Region::ProjectHeading(col)
+    | harness::Region::ProjectHeadingArrow(col)
+    | harness::Region::ProjectHeadingEdge(col) = region
+    {
+        let part = match region {
+            harness::Region::ProjectHeadingArrow(_) => "project-heading-arrow",
+            harness::Region::ProjectHeadingEdge(_) => "project-heading-edge",
+            _ => "project-heading",
+        };
+        let heading = lookup(probes, &format!("{part}:{col}"))
             .ok_or("the entry table's headings have not been laid out")?;
         // The heading row sits above the body: clip to the table pane's
         // columns only.
@@ -606,7 +626,7 @@ pub(super) fn project_state(
     use ctlcore::json::Json;
     let scale = gantt_scale(&v.ed);
     let count = v.ed.project().tasks.len();
-    let shown = v.ed.visible_rows().len();
+    let shown = v.ed.display_rows().len();
     let scroll_y = -f32::from(v.scroll.0.borrow().base_handle.offset().y);
     let mut entries = vec![
         ("selected_task".into(), Json::Num(v.cursor_row() as f64)),
@@ -615,6 +635,8 @@ pub(super) fn project_state(
             Json::Num((v.display_row() + 1) as f64),
         ),
         ("tasks".into(), Json::Num(count as f64)),
+        ("widths".into(), widths_json(&v.widths())),
+        ("filtered".into(), Json::Bool(v.ed.is_filtered())),
         (
             "filler_rows".into(),
             Json::Num(body_h.map_or(0, |h| filler_rows(h, scroll_y, shown)) as f64),
@@ -998,6 +1020,11 @@ pub(crate) fn status_items(tab: &DocTab, app_dialog: bool) -> Vec<(&'static str,
             new_tasks_label(v.ed.project().new_tasks_are_manual),
         ));
     }
+    if let Surface::Project(v) = &tab.surface
+        && v.ed.is_filtered()
+    {
+        items.push(("filter", AUTO_FILTER_STATUS.to_string()));
+    }
     items.push(("message", tab.status.to_string()));
     // Manual calculation with values out of date (#674).
     if let Surface::Sheet(v) = &tab.surface {
@@ -1019,19 +1046,25 @@ pub(crate) fn project_row(ed: &ProjectEditor, task: &Task) -> [String; COLUMN_CO
 }
 
 pub(crate) const ROW_H: f32 = 28.;
-const WIDTHS: [f32; COLUMN_COUNT] = [48., 130., 240., 80., 100., 100., 150., 190.];
-const TABLE_W: f32 = sum_widths();
+/// The entry table's default column widths; a plan's own (`tableview.xml`,
+/// dragged on a heading's right edge) replace them per column.
+pub(crate) const DEFAULT_WIDTHS: [f32; COLUMN_COUNT] =
+    [48., 130., 240., 80., 100., 100., 150., 190.];
+/// The default widths' sum.
+#[cfg(test)]
+pub(crate) const TABLE_W: f32 = sum_widths();
 /// Includes the divider, leaving space between clipped table text and the chart.
 const GANTT_INSET: f32 = 6.;
 /// gpui-component's private scrollbar `WIDTH`: it paints the bar in the last 16px
 /// of its strip's cross axis, so a thinner strip clips the bar.
 const SCROLLBAR_W: f32 = 16.;
 
+#[cfg(test)]
 const fn sum_widths() -> f32 {
     let mut total = 0.;
     let mut i = 0;
-    while i < WIDTHS.len() {
-        total += WIDTHS[i];
+    while i < DEFAULT_WIDTHS.len() {
+        total += DEFAULT_WIDTHS[i];
         i += 1;
     }
     total
@@ -1042,6 +1075,7 @@ const fn sum_widths() -> f32 {
 /// (#1208).
 fn heading_cells(
     v: &ProjectView,
+    pal: Pal,
     index: usize,
     probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
     cx: &mut Context<Docxy>,
@@ -1053,16 +1087,19 @@ fn heading_cells(
         Some(style) => crate::plugin_ui::styled(row, style),
         None => row,
     };
+    let widths = v.widths();
     row.children(COLUMNS.iter().enumerate().map(|(col, name)| {
+        let filtered = v.ed.filter(ENTRY_FIELDS[col]).is_some();
         div()
             .id(("project-heading", col))
             .relative()
             .h_full()
             .flex()
             .items_center()
-            .w(px(WIDTHS[col]))
+            .w(px(widths[col]))
             .flex_none()
-            .px_2()
+            .pl_2()
+            .pr(px(ARROW_W + EDGE_W))
             .overflow_hidden()
             .whitespace_nowrap()
             .when(col == COL_NAME, |d| d.pl(px(8.)))
@@ -1076,6 +1113,67 @@ fn heading_cells(
                         let _ = this.open_column_menu(col, ev.position, window, cx);
                     }
                 }),
+            )
+            // The AutoFilter arrow (a funnel once the column filters): its
+            // press never selects or drags anything.
+            .child(
+                div()
+                    .id(("project-heading-arrow", col))
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right(px(EDGE_W))
+                    .w(px(ARROW_W))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .text_size(px(9.))
+                    .text_color(if filtered {
+                        hsla_u(crate::accent::brand())
+                    } else {
+                        pal.dim
+                    })
+                    .child(probe(probes, format!("project-heading-arrow:{col}")))
+                    .child(if filtered { "\u{29e9}" } else { "\u{25bc}" })
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        if this.active == index {
+                            let _ = this.open_project_filter(col, window, cx);
+                        }
+                    })),
+            )
+            // The right edge: drag to resize, double-click for Best Fit.
+            .child(
+                div()
+                    .id(("project-heading-edge", col))
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right_0()
+                    .w(px(EDGE_W))
+                    .cursor_col_resize()
+                    .child(probe(probes, format!("project-heading-edge:{col}")))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
+                            cx.stop_propagation();
+                            if this.active == index
+                                && let Some(Surface::Project(v)) =
+                                    this.tabs.get_mut(index).map(|t| &mut t.surface)
+                            {
+                                v.begin_width_drag(col, f32::from(ev.position.x));
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        if ev.click_count() >= 2 && this.active == index {
+                            this.best_fit_column(col, window, cx);
+                        }
+                    })),
             )
     }))
 }
@@ -1103,6 +1201,7 @@ fn editable_row_cells(
     let row_style = task.and_then(|t| crate::plugin_ui::row_style(v, t, critical, inactive));
     let probe_row = task.map_or_else(|| "entry".to_string(), |t| t.id.to_string());
     let cursor_row = v.cursor_row();
+    let widths = v.widths();
     // Once per row: which cells, if any, the range selection covers.
     let selection = v.selection();
     let selected_bg = |u: Option<i32>, col: usize| {
@@ -1127,7 +1226,7 @@ fn editable_row_cells(
         let content = if let Some(edit) = edit {
             let measure = Measurer::new(window);
             let offset =
-                edit.scroll_x(WIDTHS[col] - 24., |s| measure.width(s, 12., summary, false));
+                edit.scroll_x(widths[col] - 24., |s| measure.width(s, 12., summary, false));
             line_edit_view(edit, offset, 16.).into_any_element()
         } else if let Some(uid) = uid.filter(|_| summary && col == COL_NAME) {
             // A summary's outline glyph: a click shows or hides its
@@ -1166,7 +1265,7 @@ fn editable_row_cells(
             .relative()
             .flex()
             .items_center()
-            .w(px(WIDTHS[col]))
+            .w(px(widths[col]))
             .h(px(ROW_H))
             .flex_none()
             .px_2()
@@ -1291,7 +1390,7 @@ pub(super) fn project_el(
     cx: &mut Context<Docxy>,
 ) -> impl IntoElement {
     // Collapsed summaries hide their subtasks' rows.
-    let shown = view.ed.visible_rows().len();
+    let shown = view.ed.display_rows().len();
     let (table_w, gantt_w, table_x, gantt_x, scale) = (
         view.table_w,
         view.gantt_w,
@@ -1361,7 +1460,7 @@ pub(super) fn project_el(
                         .flex_none()
                         .bg(pal.panel)
                         .font_weight(FontWeight::BOLD)
-                        .child(pane(table_w, table_x, heading_cells(view, index, probes, cx)))
+                        .child(pane(table_w, table_x, heading_cells(view, pal, index, probes, cx)))
                         .child(chart_pane(
                             gantt_w,
                             gantt_x,
@@ -1425,7 +1524,7 @@ pub(super) fn project_el(
                                         };
                                         let cursor_row = v.cursor_row();
                                         let tasks = &v.ed.project().tasks;
-                                        let rows = v.ed.visible_rows();
+                                        let rows = v.ed.display_rows();
                                         // List rows are shown rows; `i` is the task index,
                                         // and past the last shown task the one entry row
                                         // (`None`, index `tasks.len()`).
