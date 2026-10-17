@@ -243,6 +243,9 @@ struct OverlayKey {
     origin_day: i64,
     days: i64,
     flags: (bool, bool, bool),
+    /// The shown rows' tasks: a collapsed or expanded summary changes the
+    /// rows (and their links) without a change of the plan.
+    shown: Vec<usize>,
 }
 
 /// The plugins' answers a view keeps between changes.
@@ -959,6 +962,7 @@ pub(crate) fn overlay_shapes(v: &ProjectView) -> Rc<Vec<Shape>> {
         origin_day: scale.origin_day,
         days: scale.days,
         flags: flags_of(v),
+        shown: v.ed.visible_rows(),
     };
     let mut cache = v.plugin_cache.borrow_mut();
     if cache.overlay_key.as_ref() != Some(&key) {
