@@ -237,6 +237,44 @@ impl Editor {
         true
     }
 
+    /// The drawing and positional-tab runs a delete spans in the paragraph
+    /// at `path` ([`super::spanned_object_indices`]): removed outright, or
+    /// while tracking recorded as a `w:del` each, with an id of its own
+    /// (#1433). Offsets do not move either way.
+    pub(super) fn drop_or_record_objects(
+        &mut self,
+        path: &[usize],
+        lo: usize,
+        hi: usize,
+        from_before: bool,
+        to_after: bool,
+    ) {
+        let Some(para) = resolve_para(&self.doc.body, path) else {
+            return;
+        };
+        let found = super::spanned_object_indices(&para.content, lo, hi, from_before, to_after);
+        if found.is_empty() {
+            return;
+        }
+        if self.track.is_none() {
+            if let Some(p) = para_mut(&mut self.doc.body, path) {
+                super::drop_spanned_objects(&mut p.content, lo, hi, from_before, to_after);
+            }
+            return;
+        }
+        for k in found {
+            let Some(meta) = self.fresh_revision_metadata() else {
+                return;
+            };
+            if let Some(p) = para_mut(&mut self.doc.body, path) {
+                let inner = p.content[k].clone();
+                p.content[k] = deletion_wrapper(meta, inner);
+            }
+            // Each wrapper takes its id before the next is made.
+            self.settle_revisions();
+        }
+    }
+
     /// Delete editor offsets `from..to` of the paragraph at `path` with
     /// [`Editor::delete_char_at`], stepping past what stays (an equation
     /// while tracking, and every equation or inline picture when
@@ -273,6 +311,7 @@ impl Editor {
         lo: &super::Caret,
         hi: &super::Caret,
         keep_units: bool,
+        drop_objects: bool,
     ) -> bool {
         if self.track.is_none() {
             return false;
@@ -310,6 +349,9 @@ impl Editor {
             };
             // Kept only where the selection starts and ends, as untracked.
             let keep = keep_units && (k == 0 || first + k == last);
+            if drop_objects {
+                self.drop_or_record_objects(path, from, to, k > 0, first + k < last);
+            }
             self.delete_chars(path, from, to, keep);
         }
         true

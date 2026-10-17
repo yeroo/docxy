@@ -1891,10 +1891,8 @@ impl Editor {
             self.checkpoint(EditKind::Structural);
             self.anchor = None;
             self.remove_loose_fields(&lo.path, &fields);
-            if drop_objects && self.track.is_none() {
-                if let Some(p) = para_mut(&mut self.doc.body, &lo.path) {
-                    drop_spanned_objects(&mut p.content, lo.offset, hi.offset, false, false);
-                }
+            if drop_objects {
+                self.drop_or_record_objects(&lo.path, lo.offset, hi.offset, false, false);
             }
             self.delete_chars(&lo.path, lo.offset, hi.offset, keep_units);
             self.caret = lo;
@@ -1914,7 +1912,7 @@ impl Editor {
         self.clear_placeholders_around(&hi.path);
         // Tracked: the text of each paragraph is recorded as deleted and the
         // paragraph marks stay (see the `track` module).
-        if self.delete_text_across_paragraphs(&lo, &hi, keep_units) {
+        if self.delete_text_across_paragraphs(&lo, &hi, keep_units, drop_objects) {
             self.caret = lo;
             return true;
         }
@@ -1956,6 +1954,21 @@ impl Editor {
             } else {
                 (Vec::new(), None)
             };
+            // A cut keeps the zero-width objects of the paragraphs it removes
+            // whole: the clip cannot carry them (#1433, r2-m4).
+            let mut kept: Vec<Inline> = Vec::new();
+            if !drop_objects {
+                for block in cont.iter().take(hii).skip(li + 1) {
+                    if let Block::Paragraph(p) = block {
+                        kept.extend(
+                            p.content
+                                .iter()
+                                .filter(|i| matches!(i, Inline::Raw(r) if is_spanned_object(r)))
+                                .cloned(),
+                        );
+                    }
+                }
+            }
             // Remove everything strictly between (and the now-empty last).
             let removed = (hii + 1).min(cont.len()).saturating_sub(li + 1);
             for _ in (li + 1)..=hii {
@@ -1965,6 +1978,7 @@ impl Editor {
             }
             // Merge the remainder onto the first paragraph.
             if let Some(Block::Paragraph(p)) = cont.get_mut(li) {
+                p.content.extend(kept);
                 join_paragraph_content(&mut p.content, remainder);
                 if let Some(gone) = last_props {
                     keep_section_mark(&mut p.props, gone);
@@ -4256,25 +4270,50 @@ fn drop_spanned_objects(
     from_before: bool,
     to_after: bool,
 ) {
+    let gone = spanned_object_indices(content, lo, hi, from_before, to_after);
+    if gone.is_empty() {
+        return;
+    }
+    let mut i = 0;
+    content.retain(|_| {
+        i += 1;
+        !gone.contains(&(i - 1))
+    });
+}
+
+/// The `content` indices of the drawing and positional-tab runs the delete
+/// spans; [`drop_spanned_objects`] removes them and a tracked delete records
+/// them (`Editor::record_spanned_objects`).
+pub(crate) fn spanned_object_indices(
+    content: &[Inline],
+    lo: usize,
+    hi: usize,
+    from_before: bool,
+    to_after: bool,
+) -> Vec<usize> {
     let len: usize = content.iter().map(inline_len).sum();
     let lo_v = if from_before { -1 } else { lo as i64 };
     let hi_v = if to_after { len as i64 + 1 } else { hi as i64 };
     let whole = (from_before || lo == 0) && (to_after || hi >= len);
     if lo_v >= hi_v && !whole {
-        return;
+        return Vec::new();
     }
     let mut at = 0;
-    content.retain(|i| {
+    let mut found = Vec::new();
+    for (k, i) in content.iter().enumerate() {
         let p = at;
         at += inline_len(i);
         let Inline::Raw(raw) = i else {
-            return true;
+            continue;
         };
         let pv = p as i64;
         let inside = pv > lo_v && pv < hi_v;
         let edge = whole && (p == 0 || p == len);
-        !(is_spanned_object(raw) && (inside || edge))
-    });
+        if is_spanned_object(raw) && (inside || edge) {
+            found.push(k);
+        }
+    }
+    found
 }
 
 /// `clip` without its equations, a hyperlink's included.

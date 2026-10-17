@@ -694,3 +694,145 @@ fn a_tracked_cut_of_cells_carries_their_equations_1242() {
             .any(|i| matches!(i, Inline::Equation { .. }))
     );
 }
+
+/// The `w:del` wrappers in the saved XML, each with its id.
+fn deleted_objects(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(at) = rest.find("<w:del ") {
+        let end = rest[at..].find("</w:del>").map_or(rest.len(), |e| at + e);
+        out.push(rest[at..end].to_string());
+        rest = &rest[end..];
+    }
+    out
+}
+
+/// #1433: a tracked delete over a floating picture or an alignment tab
+/// records each as a `w:del` with an id of its own (it kept them silently
+/// before); reject keeps them, accept removes them, and a save and reload
+/// keeps the records.
+#[test]
+fn a_tracked_delete_records_a_floating_picture_and_a_ptab_1433() {
+    let mut ed = Editor::new(doc(&[format!(
+        "{}{ANCHORED}{}{PTAB}{}",
+        t("ab"),
+        t("cd"),
+        t("ef")
+    )]));
+    track(&mut ed);
+    select(&mut ed, vec![0], 1, 5);
+    assert!(ed.delete_selection());
+    let xml = saved(&ed);
+    let dels = deleted_objects(&xml);
+    let with = |needle: &str| dels.iter().filter(|d| d.contains(needle)).count();
+    assert_eq!(with("<w:drawing"), 1, "{xml}");
+    assert_eq!(with("<w:ptab"), 1, "{xml}");
+    assert!(dels.iter().all(|d| d.contains("w:author=\"Ann\"")), "{xml}");
+    let ids: Vec<&str> = dels
+        .iter()
+        .filter(|d| d.contains("<w:drawing") || d.contains("<w:ptab"))
+        .map(|d| {
+            d.split("w:id=\"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1], "{xml}");
+
+    // A save and reload keeps the records.
+    let reloaded = parse_document_xml(&xml, &Relationships::default());
+    assert_eq!(
+        deleted_objects(&document_to_xml(&reloaded))
+            .iter()
+            .filter(|d| d.contains("<w:drawing") || d.contains("<w:ptab"))
+            .count(),
+        2
+    );
+
+    // Reject keeps both objects; accept removes them.
+    let mut rejected = Editor::new(ed.doc.clone());
+    rejected.reject_all_revisions();
+    let after = saved(&rejected);
+    assert!(
+        after.contains("<w:drawing") && after.contains("<w:ptab"),
+        "{after}"
+    );
+    assert!(!after.contains("<w:del "), "{after}");
+    ed.accept_all_revisions();
+    let after = saved(&ed);
+    assert!(
+        !after.contains("<w:drawing") && !after.contains("<w:ptab"),
+        "{after}"
+    );
+}
+
+/// #1433: tracked, across paragraphs, the middle paragraph's objects are
+/// recorded too; edge objects are kept as untracked.
+#[test]
+fn a_tracked_delete_across_paragraphs_records_middle_objects_1433() {
+    let mut ed = Editor::new(doc(&[
+        format!("{}{PTAB}", t("ab")),
+        format!("{ANCHORED}{}", t("cd")),
+        t("ef"),
+    ]));
+    track(&mut ed);
+    ed.anchor = Some(Caret::at(vec![0], 1));
+    ed.caret = Caret::at(vec![2], 1);
+    assert!(ed.delete_selection());
+    let xml = saved(&ed);
+    // The ptab is after "b" in the first paragraph: inside the range's
+    // end of that paragraph, so it is recorded; so is the picture.
+    assert_eq!(
+        deleted_objects(&xml)
+            .iter()
+            .filter(|d| d.contains("<w:drawing") || d.contains("<w:ptab"))
+            .count(),
+        2,
+        "{xml}"
+    );
+    ed.accept_all_revisions();
+    let after = saved(&ed);
+    assert!(
+        !after.contains("<w:drawing") && !after.contains("<w:ptab"),
+        "{after}"
+    );
+}
+
+/// #1433 (r2-m4): a cut over three paragraphs keeps the zero-width objects
+/// of the middle one, the clip not carrying them; a delete takes them.
+#[test]
+fn a_cut_keeps_the_objects_of_a_removed_middle_paragraph_1433() {
+    let content = || vec![t("ab"), format!("{ANCHORED}{PTAB}{}", t("mid")), t("cd")];
+    let at_end = |ed: &mut Editor| {
+        ed.anchor = Some(Caret::at(vec![0], 1));
+        ed.caret = Caret::at(vec![2], 1);
+    };
+    let mut ed = Editor::new(doc(&content()));
+    at_end(&mut ed);
+    let clip = ed.cut().expect("a clip");
+    assert_eq!(ed.doc.body.len(), 1);
+    assert_eq!(etext(&ed), "ad");
+    let xml = saved(&ed);
+    assert!(
+        xml.contains("<w:drawing") && xml.contains("<w:ptab"),
+        "{xml}"
+    );
+    assert_eq!(clip.paras.len(), 3);
+    // Undo restores all of it.
+    assert!(ed.undo());
+    assert_eq!(ed.doc.body.len(), 3);
+    assert_eq!(etext(&ed), "ab");
+    // A plain delete takes the objects with the paragraph.
+    let mut ed = Editor::new(doc(&content()));
+    at_end(&mut ed);
+    assert!(ed.delete_selection());
+    let xml = saved(&ed);
+    assert!(
+        !xml.contains("<w:drawing") && !xml.contains("<w:ptab"),
+        "{xml}"
+    );
+}
