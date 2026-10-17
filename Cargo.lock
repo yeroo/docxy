@@ -445,6 +445,7 @@ dependencies = [
  "htmlbundle",
  "image",
  "opccore",
+ "pdffont",
  "ratatui",
  "ratatui-image",
  "ribboncore",

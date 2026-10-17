@@ -21,9 +21,15 @@ mod layout_tab;
 mod line_edit;
 mod mcp;
 mod metafile;
+#[cfg(test)]
+#[path = "../../docxcore/tests/common/pdf_read.rs"]
+mod pdf_read;
 mod protection;
 mod ribbon;
 mod skill;
+#[cfg(test)]
+#[path = "../../docxcore/tests/common/synth_font.rs"]
+mod synth_font;
 #[cfg(test)]
 mod test_fixtures;
 mod watermark;
@@ -42,7 +48,9 @@ use backstage::BackstageHost as _;
 use docxcore::autocorrect::{AutoCorrectOptions, BuiltinFixes, ListKind};
 use docxcore::compare::{CompareOptions, CompareResult, CompareSkip, compare_packages};
 use docxcore::editor::{Caret, Clip, Editor, FoundMatch, TrackAuthor};
-use docxcore::export::{PdfOptions, to_pdf};
+#[cfg(test)]
+use docxcore::export::to_pdf;
+use docxcore::export::{PdfOptions, to_pdf_report};
 #[cfg(test)]
 use docxcore::load::parse_header_footer;
 use docxcore::load::{Relationships, parse_rels_xml};
@@ -57,6 +65,7 @@ use docxcore::package::{
     save_package_preserving_document,
 };
 use docxcore::page_bg::PageBackground;
+use docxcore::pdf_font::PdfFontProvider;
 use docxcore::render::{
     Color as DocColor, ImageBox, Line as DocLine, LineCaret, LineMap, PageParts, RenderOptions,
     Span as DocSpan, Style as DocStyle, render_with_images, render_with_page_layout,
@@ -410,6 +419,49 @@ enum HeadlessFormat {
     Docx,
 }
 
+/// The fonts the PDF export embeds: this machine's, in a build, or those under
+/// `$DOCXY_PDF_FONT_DIR` (a path list) when set, which may be empty for the
+/// built-in Courier only; a unit test sets its own (the machine's fonts must
+/// not change what tests see).
+fn pdf_fonts() -> Option<Rc<dyn PdfFontProvider>> {
+    #[cfg(test)]
+    {
+        TEST_PDF_FONTS.with(|f| f.borrow().clone())
+    }
+    #[cfg(not(test))]
+    {
+        match std::env::var_os("DOCXY_PDF_FONT_DIR") {
+            Some(dirs) => Some(Rc::new(pdffont::FontSet::from_dirs(
+                std::env::split_paths(&dirs).collect(),
+            ))),
+            None => Some(pdffont::FontSet::shared()),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PDF_FONTS: std::cell::RefCell<Option<Rc<dyn PdfFontProvider>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `opts` with the system fonts and the terminal's bidi order for PDF export.
+fn with_pdf_fonts(mut opts: PdfOptions) -> PdfOptions {
+    opts.fonts = pdf_fonts();
+    if opts.fonts.is_some() {
+        opts.bidi = Some(bidi::projector());
+    }
+    opts
+}
+
+fn missing_note(n: usize) -> String {
+    format!(
+        "{n} character{} no installed font covers {} not shown",
+        if n == 1 { "" } else { "s" },
+        if n == 1 { "is" } else { "are" }
+    )
+}
+
 fn convert_headless(
     pkg: &Package,
     source: &str,
@@ -422,10 +474,12 @@ fn convert_headless(
                 .part("word/styles.xml")
                 .map(|b| parse_styles_xml(std::str::from_utf8(b).unwrap_or("")))
                 .unwrap_or_default();
-            to_pdf(
-                &pkg.document,
-                &PdfOptions::from_package(pkg, Rc::new(styles)),
-            )
+            let opts = with_pdf_fonts(PdfOptions::from_package(pkg, Rc::new(styles)));
+            let (pdf, report) = to_pdf_report(&pkg.document, &opts);
+            if report.missing_chars > 0 {
+                eprintln!("warning: {}", missing_note(report.missing_chars));
+            }
+            pdf
         }
         HeadlessFormat::Markdown => {
             let numbering = pkg
@@ -2880,7 +2934,7 @@ impl App {
 
     /// PDF layout inputs from the package.
     fn pdf_options(&self) -> PdfOptions {
-        let mut opts = PdfOptions::from_package(&self.pkg, self.styles.clone());
+        let mut opts = with_pdf_fonts(PdfOptions::from_package(&self.pkg, self.styles.clone()));
         // Committed header/footer edits are already in their parts; one being
         // edited prints its live content.
         if let Some(hf) = &self.hf_edit {
@@ -2899,8 +2953,13 @@ impl App {
     /// Render the document to a PDF at `out` and report the result in the status
     /// line. Callers handle any overwrite confirmation first.
     fn write_pdf(&mut self, out: std::path::PathBuf) {
-        let pdf = to_pdf(self.pdf_document(), &self.pdf_options());
+        let (pdf, report) = to_pdf_report(self.pdf_document(), &self.pdf_options());
         self.status = match export_atomic(Some(Path::new(&self.path)), &out, &pdf) {
+            Ok(()) if report.missing_chars > 0 => Some(format!(
+                "exported {}; {}",
+                out.display(),
+                missing_note(report.missing_chars)
+            )),
             Ok(()) => Some(format!("exported {}", out.display())),
             Err(e) => Some(format!("export failed: {e}")),
         };
@@ -12137,6 +12196,119 @@ mod tests {
                 && status.contains("Relationships root"),
             "{status}"
         );
+    }
+
+    /// A font directory holding one synthetic face with these glyphs, and
+    /// the system fonts of the PDF export swapped for it while `run` runs.
+    fn with_test_pdf_font(glyphs: &[(char, u16)], run: impl FnOnce()) {
+        let dir = std::env::temp_dir().join(format!(
+            "docxy-pdf-font-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let synth: Vec<_> = glyphs
+            .iter()
+            .map(|&(c, a)| synth_font::glyph(c, a))
+            .collect();
+        let style = synth_font::Style {
+            family: Some("Arial".into()),
+            ..Default::default()
+        };
+        std::fs::write(
+            dir.join("a.ttf"),
+            synth_font::build_with(&synth, 1000, 0, &style),
+        )
+        .unwrap();
+        TEST_PDF_FONTS.with(|f| {
+            *f.borrow_mut() = Some(Rc::new(pdffont::FontSet::from_dirs(vec![dir.clone()])));
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+        TEST_PDF_FONTS.with(|f| *f.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
+    fn pdf_export_embeds_fonts_and_says_what_no_font_covers() {
+        let glyphs = [(' ', 250), ('a', 600), ('b', 600), ('Ж', 700)];
+        with_test_pdf_font(&glyphs, || {
+            let mut app = app_with(&["ab Ж \u{1D11E}"]);
+            assert!(app.pdf_options().fonts.is_some());
+            assert!(app.pdf_options().bidi.is_some());
+            let out =
+                std::env::temp_dir().join(format!("docxy-pdf-fonts-{}.pdf", std::process::id()));
+            let _ = std::fs::remove_file(&out);
+            app.write_pdf(out.clone());
+            let bytes = std::fs::read(&out).unwrap();
+            let _ = std::fs::remove_file(&out);
+            assert!(String::from_utf8_lossy(&bytes).contains("/Subtype /Type0"));
+            assert_eq!(pdf_read::body_text(&bytes), "abЖ\u{fffd}");
+            let status = app.status.clone().unwrap();
+            assert!(
+                status.ends_with("; 1 character no installed font covers is not shown"),
+                "{status}"
+            );
+        });
+        // Without a provider (the unit-test default) nothing is embedded.
+        let app = app_with(&["ab"]);
+        assert!(app.pdf_options().fonts.is_none() && app.pdf_options().bidi.is_none());
+    }
+
+    #[test]
+    fn pdf_export_puts_a_hebrew_line_in_unicode_bidi_visual_order() {
+        let glyphs = [
+            (' ', 250),
+            ('1', 550),
+            ('2', 550),
+            ('3', 550),
+            ('ש', 500),
+            ('ל', 500),
+            ('ו', 500),
+            ('ם', 500),
+        ];
+        with_test_pdf_font(&glyphs, || {
+            let app = App::new(
+                new_package(Document {
+                    body: vec![Block::Paragraph(MPara {
+                        props: ParProps {
+                            rtl: true,
+                            ..ParProps::default()
+                        },
+                        content: vec![Inline::Run(Run {
+                            text: "שלום 123".into(),
+                            props: RunProps::default(),
+                        })],
+                    })],
+                }),
+                "test.docx",
+                false,
+            );
+            let pdf = to_pdf(app.pdf_document(), &app.pdf_options());
+            let runs: Vec<_> = pdf_read::shown(&pdf)[0]
+                .iter()
+                .filter(|s| s.y > 60.0 && s.y < 735.0)
+                .cloned()
+                .collect();
+            let heb = runs
+                .iter()
+                .find(|s| s.text.contains('ש'))
+                .unwrap_or_else(|| panic!("{runs:?}"));
+            let num = runs.iter().find(|s| s.text.contains('1')).unwrap();
+            assert!(
+                heb.tj,
+                "right-to-left stretch drawn glyph by glyph: {heb:?}"
+            );
+            assert!(num.x < heb.x, "digits left of the Hebrew: {num:?} {heb:?}");
+            assert_eq!(
+                pdf_read::body_text(&pdf),
+                "שלום123",
+                "logical order for copy"
+            );
+        });
     }
 
     #[test]

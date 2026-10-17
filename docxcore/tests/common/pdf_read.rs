@@ -142,7 +142,19 @@ pub fn to_unicode(objs: &BTreeMap<usize, Obj>, font: &Obj) -> BTreeMap<u16, Stri
         .expect("ToUnicode ref");
     let cmap = String::from_utf8(decoded(&objs[&id])).unwrap();
     let mut map = BTreeMap::new();
+    let mut in_chars = false;
     for line in cmap.lines() {
+        if line.ends_with("beginbfchar") {
+            in_chars = true;
+            continue;
+        }
+        if line == "endbfchar" {
+            in_chars = false;
+            continue;
+        }
+        if !in_chars {
+            continue;
+        }
         let parts: Vec<&str> = line
             .split(['<', '>'])
             .filter(|p| !p.trim().is_empty())

@@ -7,6 +7,11 @@ use docxcore::zipwrite::write_zip;
 
 /// "Before", a page break, "After" — Word's Insert > Page Break.
 fn breaks_docx() -> Vec<u8> {
+    docx_with("Before")
+}
+
+/// [`breaks_docx`] with `first` on the first page.
+fn docx_with(first: &str) -> Vec<u8> {
     let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
     let root_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -21,7 +26,7 @@ fn breaks_docx() -> Vec<u8> {
         ("_rels/.rels".to_string(), root_rels.as_bytes().to_vec()),
         (
             "word/document.xml".to_string(),
-            document.as_bytes().to_vec(),
+            document.replace("Before", first).into_bytes(),
         ),
     ])
 }
@@ -36,6 +41,8 @@ fn a_page_break_gives_a_two_page_pdf() {
     let pdf = dir.join("out.pdf");
     let out = Command::new(env!("CARGO_BIN_EXE_docxy"))
         .args([docx.as_path(), Path::new("--pdf"), pdf.as_path()])
+        // No fonts: the plain Courier file, the same on every machine.
+        .env("DOCXY_PDF_FONT_DIR", dir.join("no-fonts"))
         .output()
         .expect("run docxy");
     assert!(
@@ -53,5 +60,48 @@ fn a_page_break_gives_a_two_page_pdf() {
         before < first_page && first_page < after,
         "After is on page 2"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[path = "../../docxcore/tests/common/pdf_read.rs"]
+mod pdf_read;
+#[path = "../../docxcore/tests/common/synth_font.rs"]
+mod synth_font;
+
+#[test]
+fn fonts_under_the_font_dir_are_embedded_and_copy_back_as_text() {
+    let dir = std::env::temp_dir().join(format!("docxy-pdf-cli-fonts-{}", std::process::id()));
+    let fonts = dir.join("fonts");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&fonts).unwrap();
+    let glyphs: Vec<_> = "Before After Привет 中文"
+        .chars()
+        .map(|c| synth_font::glyph(c, 600))
+        .collect();
+    let style = synth_font::Style {
+        family: Some("Arial".into()),
+        ..Default::default()
+    };
+    std::fs::write(
+        fonts.join("a.ttf"),
+        synth_font::build_with(&glyphs, 1000, 0, &style),
+    )
+    .unwrap();
+    let docx = dir.join("in.docx");
+    std::fs::write(&docx, docx_with("Привет 中文 Q")).unwrap();
+    let pdf = dir.join("out.pdf");
+    let out = Command::new(env!("CARGO_BIN_EXE_docxy"))
+        .args([docx.as_path(), Path::new("--pdf"), pdf.as_path()])
+        .env("DOCXY_PDF_FONT_DIR", &fonts)
+        .output()
+        .expect("run docxy");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let bytes = std::fs::read(&pdf).unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("/Subtype /Type0"));
+    assert_eq!(pdf_read::text_of(&bytes), "Привет中文QAfter");
     let _ = std::fs::remove_dir_all(&dir);
 }
