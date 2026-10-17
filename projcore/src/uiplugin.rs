@@ -247,6 +247,11 @@ pub struct RibbonTab {
 pub struct RibbonGroup {
     pub title: String,
     pub controls: Vec<Control>,
+    /// Where a new group goes: before or after the built-in group of this
+    /// title; empty, and the group is appended after the tab's own (#1574).
+    /// A group whose title is a built-in's joins it instead.
+    pub before: String,
+    pub after: String,
 }
 
 /// A ribbon control. Its `id` is what `yppx_ui_state` reports on and what
@@ -484,6 +489,8 @@ impl Manifest {
                 groups.push(RibbonGroup {
                     title: g.text("title"),
                     controls,
+                    before: g.text("before"),
+                    after: g.text("after"),
                 });
             }
             m.ribbon.push(RibbonTab {
@@ -593,7 +600,7 @@ impl Manifest {
                             t.groups
                                 .iter()
                                 .map(|g| {
-                                    Json::obj(vec![
+                                    let mut obj = Json::obj(vec![
                                         ("title", Json::str(g.title.clone())),
                                         (
                                             "controls",
@@ -655,7 +662,20 @@ impl Manifest {
                                                     .collect(),
                                             ),
                                         ),
-                                    ])
+                                    ]);
+                                    if let Json::Obj(pairs) = &mut obj {
+                                        if !g.before.is_empty() {
+                                            pairs.push((
+                                                "before".into(),
+                                                Json::str(g.before.clone()),
+                                            ));
+                                        }
+                                        if !g.after.is_empty() {
+                                            pairs
+                                                .push(("after".into(), Json::str(g.after.clone())));
+                                        }
+                                    }
+                                    obj
                                 })
                                 .collect(),
                         ),
@@ -1776,7 +1796,7 @@ mod tests {
     }
 
     const MANIFEST: &str = r##"{
-      "ribbon":[{"tab":"Task","groups":[{"title":"Fixture","controls":[
+      "ribbon":[{"tab":"Task","groups":[{"title":"Fixture","before":"Schedule","controls":[
          {"id":"fx.hello","kind":"button","label":"Hello","tip":"Say hello","keytip":"XH","large":true,"icon":"comment"},
          {"id":"fx.flag","kind":"toggle","label":"Flag"},
          {"id":"fx.more","kind":"split","label":"More","items":[{"id":"fx.a","label":"A"},{"id":"fx.b","label":"B","icon":"cut"}]},
@@ -1798,6 +1818,8 @@ mod tests {
         let m = Manifest::parse(MANIFEST).unwrap();
         let back = Manifest::parse(&m.json()).unwrap();
         assert_eq!(back, m);
+        assert_eq!(m.ribbon[0].groups[0].before, "Schedule");
+        assert_eq!(m.ribbon[0].groups[0].after, "");
         assert_eq!(
             Manifest::default().json(),
             r#"{"ribbon":[],"menus":[],"dialogs":[],"palettes":[],"text_style_categories":[]}"#

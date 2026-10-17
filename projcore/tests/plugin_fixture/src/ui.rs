@@ -33,7 +33,9 @@ const MANIFEST: &str = r##"{
     {"id":"fixture.palette","kind":"gallery","label":"Palette","tip":"Bar palettes","swatches":[
       {"id":"fixture.blue","label":"Blue","color":"#3366CC","preview":"fixture.blue"},
       {"id":"fixture.red","label":"Red","color":"#CC3333","preview":"fixture.red"}]},
-    {"id":"fixture.bold","kind":"toggle","label":"Bold","tip":"Bold on the selected cells (the view's cells)","keytip":"XB","icon":"bold"}]}]}],
+    {"id":"fixture.bold","kind":"toggle","label":"Bold","tip":"Bold on the selected cells (the view's cells)","keytip":"XB","icon":"bold"}]}]},
+    {"tab":"Gantt Chart Format","groups":[{"title":"Fixture Format","before":"Bar Styles","controls":[
+    {"id":"fixture.format","kind":"button","label":"Format (fixture)","tip":"A group placed before Bar Styles","icon":"font"}]}]}],
   "menus":[{"menu":"row","items":[{"id":"fixture.rename","label":"Rename (fixture)","icon":"comment","after":"Notes..."}]}],
   "dialogs":[
     {"id":"task-information","pages":[{"name":"Fixture","controls":[
@@ -186,6 +188,7 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
     };
     let id = req.get("id").and_then(Json::str).unwrap_or_default();
     let reply = match id {
+        "fixture.format" => r#"{"ops":[],"status":"Fixture: format"}"#.to_string(),
         "fixture.hello" => match req.get("values") {
             None => {
                 r#"{"ops":[],"dialog":"fixture.options","status":"Fixture: asking"}"#.to_string()

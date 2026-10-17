@@ -145,6 +145,9 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
     assert_eq!(ui.name(), info.file);
     let m = ui.manifest();
     assert_eq!(m.ribbon[0].tab, "Task");
+    // A second tab's group asks to go before a built-in group (#1574).
+    assert_eq!(m.ribbon[1].tab, "Gantt Chart Format");
+    assert_eq!(m.ribbon[1].groups[0].before, "Bar Styles");
     let group = &m.ribbon[0].groups[0];
     assert_eq!(group.title, "Fixture");
     assert_eq!(
