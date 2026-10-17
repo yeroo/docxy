@@ -22,7 +22,7 @@ workspace = true
 [dependencies]
 # Commit / last merged PR / build kind, for --version, app-info and the MCP version.
 buildinfo = { version = "0.5.0", path = "../buildinfo" }
-dirs = "5"
+dirs = "7"
 opccore = { version = "0.1.0", path = "../opccore" }
 projctl = { version = "0.1.0", path = "../projctl" }
 # The agent control surface (loopback-TCP + newline-JSON), used to drive the
