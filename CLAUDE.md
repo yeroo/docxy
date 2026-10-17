@@ -263,8 +263,9 @@
   target and five UI symbols (`projcore::plugin_abi`: `yppx_plugin_target`,
   `yppx_ui_abi`, `yppx_ui_manifest`, `yppx_ui_state`, `yppx_ui_command`,
   `yppx_ui_overlay`; JSON over `YppxBuf`). The hosts own the extension points
-  and call whatever library is present; nothing here names a plugin but the
-  fixture, and "Pro" or a private repository is never mentioned.
+  and call whatever library is present; no particular plugin, product
+  edition or private repository is ever named here: the fixture is the only
+  plugin this repository knows.
 - `load_plugins_for(dirs, Some(Host {name, version}))` checks the target for
   the host's name (`suite`, `yppxy`) against `CARGO_PKG_VERSION` before any
   other symbol: a mismatch skips the library with its reason among `errors`
