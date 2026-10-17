@@ -30,13 +30,13 @@
 //! | `assign.add` | `{task, resource, units?, work?, fields?}` | the new assignment (`resource` a uid, or a name; a new name is staged as a work resource; a new name that is a number or contains a comma is refused: pass a uid as a number) |
 //! | `assign.set` | `{uid, units?, work?, overtime_work?, contour?, rate_table?, delay?, actual_work? \| percent_work_complete?, fields?}` | the updated assignment, after its task is rescheduled |
 //! | `assign.del` | `{uid}` | `{deleted, task}` |
-//! | `proj.get` | `{}` | the plan's settings (#1587): `{title, start, finish, status_date, current_date, calendar: {uid, name}, calendars: [{uid, name}]}` (dates `YYYY-MM-DD HH:MM`, the status and current dates `null` when unset, `calendars` the base calendars) |
 //! | `resource.list` | `{}` | `{count, resources: [{uid, id, name, type, initials, group, code, email, material_label, max_units, standard_rate, overtime_rate, cost_per_use, accrue_at, base_calendar: {uid, name}, notes, assignments}]}` (#1588): `type` `work`/`material`/`cost`, `max_units` a fraction, the rates currency per hour (per unit for a material) and the cost per use in currency units, `accrue_at` `Start`/`End`/`Prorated`, `assignments` how many the resource has |
 //! | `resource.get` | `{uid}` | one resource |
 //! | `resource.add` | `{name, type?, initials?, group?, code?, email?, material_label?, max_units?, standard_rate?, overtime_rate?, cost_per_use?, accrue_at?, base_calendar?, notes?}` | the new resource (#1588): a work resource at 100%, costs prorated, unless given otherwise; the name is unique ignoring ASCII case, not a number, without a comma |
 //! | `resource.set` | `{uid, name?, type?, …the same fields}` | the updated resource (#1588): `null` or `""` clears an optional text or rate; `type` changes only while the resource has no assignments; a rate edit keeps cost rate table A's current row, and a `max_units` edit the availability period in effect, in step |
 //! | `resource.del` | `{uid}` | `{deleted, assignments: [uid…]}` (#1588): its assignments go with it, each as the Resource Names cell removes a name, and its own derived calendar when nothing else uses it; later resources move up one ID |
-//! | `proj.set` | `{title?, start?, status_date?, current_date?, calendar?}` | the same reply after the change (#1587): dates `YYYY-MM-DD` (the project calendar's day start; a bare status date is the day's end, as Project sets it) or `YYYY-MM-DDTHH:MM`, `null` clearing a status or current date, `calendar` a base calendar's name or uid. All apply in one undo step, or none does |
+//! | `proj.get` | `{}` | the plan's settings (#1587): `{title, start, finish, status_date, current_date, calendar: {uid, name}, calendars: [{uid, name}], new_tasks}` (dates `YYYY-MM-DD HH:MM`, the status and current dates `null` when unset, `calendars` the base calendars, `new_tasks` `auto` or `manual`: how tasks added to the plan are scheduled, #1585) |
+//! | `proj.set` | `{title?, start?, status_date?, current_date?, calendar?, new_tasks?}` | the same reply after the change (#1587): dates `YYYY-MM-DD` (the project calendar's day start; a bare status date is the day's end, as Project sets it) or `YYYY-MM-DDTHH:MM`, `null` clearing a status or current date, `calendar` a base calendar's name or uid, `new_tasks` `auto` or `manual` (Task > Tasks > Mode, #1585; existing tasks keep their own mode). All apply in one undo step, or none does |
 //!
 //! `fields` is a list of Project field names (`["% Complete", "Baseline1
 //! Finish"]`, matched ignoring ASCII case and surrounding space). The verbs
@@ -217,7 +217,20 @@ pub fn path_info(path: Option<&str>, ed: &Editor) -> Json {
         ("tasks", Json::Num(ed.project().tasks.len() as f64)),
         ("start", Json::Str(dt_str(ed.schedule().project_start))),
         ("finish", Json::Str(dt_str(ed.schedule().project_finish))),
+        ("new_tasks", new_tasks_json(ed)),
     ])
+}
+
+/// The plan's mode for new tasks (#1585): `auto` or `manual`.
+fn new_tasks_json(ed: &Editor) -> Json {
+    Json::Str(
+        if ed.project().new_tasks_are_manual {
+            "manual"
+        } else {
+            "auto"
+        }
+        .into(),
+    )
 }
 
 fn link_name(l: LinkType) -> &'static str {
@@ -807,6 +820,7 @@ fn proj_get(ed: &Editor) -> Json {
                     .collect(),
             ),
         ),
+        ("new_tasks", new_tasks_json(ed)),
     ])
 }
 
@@ -864,18 +878,34 @@ fn proj_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         Some(Json::Num(n)) => Some(*n as i32),
         Some(_) => return Err("'calendar' must be a base calendar's name or uid".into()),
     };
+    // Task > Tasks > Mode (#1585). Project's manual variants (On Project
+    // Start Date, On Project Finish Date, Without Dates) are not in the
+    // model, which places a new manual task at the project start.
+    let new_tasks = match args.get("new_tasks") {
+        None | Some(Json::Null) => None,
+        Some(Json::Str(mode)) => match mode.trim().to_ascii_lowercase().as_str() {
+            "auto" | "auto scheduled" => Some(false),
+            "manual" | "manually scheduled" => Some(true),
+            _ => return Err("'new_tasks' is \"auto\" or \"manual\"".into()),
+        },
+        Some(_) => return Err("'new_tasks' is \"auto\" or \"manual\"".into()),
+    };
     if title.is_none()
         && start.is_none()
         && status_date.is_none()
         && current_date.is_none()
         && calendar.is_none()
+        && new_tasks.is_none()
     {
         return Err(
-            "proj.set needs at least one of 'title', 'start', 'status_date', 'current_date' or 'calendar'"
+            "proj.set needs at least one of 'title', 'start', 'status_date', 'current_date', 'calendar' or 'new_tasks'"
                 .into(),
         );
     }
     ed.batch(|ed| {
+        if let Some(manual) = new_tasks {
+            ed.set_new_tasks_manual(manual);
+        }
         if let Some(t) = &title {
             ed.set_title(t)?;
         }
@@ -2693,7 +2723,7 @@ it"
         let ed = app();
         assert_eq!(
             path_info(Some("ctl-test.xml"), &ed).to_string(),
-            r#"{"path":"ctl-test.xml","modified":false,"name":"Project1","tasks":1,"start":"2026-01-05 08:00","finish":"2026-01-05 17:00"}"#
+            r#"{"path":"ctl-test.xml","modified":false,"name":"Project1","tasks":1,"start":"2026-01-05 08:00","finish":"2026-01-05 17:00","new_tasks":"auto"}"#
         );
         assert_eq!(path_info(None, &ed).get("path"), Some(&Json::Null));
     }
@@ -3150,6 +3180,18 @@ it"
         assert_eq!(bare.get_str("status_date"), Some("2026-03-20 17:00"));
         assert_eq!(bare.get_str("current_date"), Some("2026-03-20 08:00"));
         assert_eq!(ed.undo_depth(), 3);
+        // The new-task mode (#1585): proj.get, proj.path and new tasks follow.
+        assert_eq!(bare.get_str("new_tasks"), Some("auto"));
+        let manual = run(&mut ed, "proj.set", r#"{"new_tasks":"Manual"}"#).unwrap();
+        assert_eq!(manual.get_str("new_tasks"), Some("manual"));
+        assert!(ed.project().new_tasks_are_manual);
+        assert_eq!(ed.undo_depth(), 4);
+        assert_eq!(path_info(None, &ed).get_str("new_tasks"), Some("manual"));
+        let added = run(&mut ed, "task.add", r#"{"name":"By hand"}"#).unwrap();
+        assert_eq!(added.get("manual"), Some(&Json::Bool(true)));
+        // The mode the plan has records no step.
+        run(&mut ed, "proj.set", r#"{"new_tasks":"manual"}"#).unwrap();
+        assert_eq!(ed.undo_depth(), 5);
         // Refusals undo nothing.
         let before = ed.project().clone();
         for args in [
@@ -3157,11 +3199,13 @@ it"
             r#"{"start":"soon"}"#,
             r#"{"calendar":"Moon"}"#,
             r#"{"title":"x","calendar":"Moon"}"#,
+            r#"{"new_tasks":"sometimes"}"#,
+            r#"{"new_tasks":true}"#,
         ] {
             assert!(run(&mut ed, "proj.set", args).is_err(), "{args}");
         }
         assert_eq!(*ed.project(), before);
-        assert_eq!(ed.undo_depth(), 3);
+        assert_eq!(ed.undo_depth(), 5);
     }
 
     #[test]
