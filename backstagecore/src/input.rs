@@ -308,6 +308,12 @@ impl Backstage {
                 self.name_cursor = len;
                 self.name_anchor = Some(0);
             }
+            // Any other Ctrl chord types nothing (#1378); Ctrl+Alt is AltGr,
+            // which still types. Ctrl+C, X and V reach the clipboard through
+            // the host (`name_selected_text`, `name_cut`, `name_paste`).
+            KeyCode::Char(_)
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) => {}
             KeyCode::Char(c) => {
                 self.delete_name_selection();
                 let at = byte_index(&self.name_input, self.name_cursor);
@@ -366,6 +372,43 @@ impl Backstage {
         let a = self.name_anchor?.min(self.name_input.chars().count());
         let c = self.name_cursor;
         (a != c).then(|| (a.min(c), a.max(c)))
+    }
+
+    /// Whether the Save As file-name field has the keyboard (the host's
+    /// Ctrl+C, X and V act on it, #1378).
+    pub fn name_has_keyboard(&self) -> bool {
+        self.pane == Pane::SaveAs && self.name_focus && !self.type_focus
+    }
+
+    /// The selected part of the file name, if any (Ctrl+C).
+    pub fn name_selected_text(&self) -> Option<String> {
+        let (from, to) = self.name_selection()?;
+        let (a, b) = (
+            byte_index(&self.name_input, from),
+            byte_index(&self.name_input, to),
+        );
+        Some(self.name_input[a..b].to_string())
+    }
+
+    /// Removes the selected part of the file name and returns it (Ctrl+X).
+    pub fn name_cut(&mut self) -> Option<String> {
+        let text = self.name_selected_text()?;
+        self.delete_name_selection();
+        Some(text)
+    }
+
+    /// Inserts the first line of `text` at the caret, replacing a selection
+    /// (Ctrl+V); whether the name changed. An empty paste changes nothing.
+    pub fn name_paste(&mut self, text: &str) -> bool {
+        let line = first_line(text);
+        if line.is_empty() {
+            return false;
+        }
+        self.delete_name_selection();
+        let at = byte_index(&self.name_input, self.name_cursor);
+        self.name_input.insert_str(at, &line);
+        self.name_cursor += line.chars().count();
+        true
     }
 
     /// Removes the selected part of the file name, leaving the caret where it
@@ -608,6 +651,17 @@ impl Backstage {
         };
         self.preview_path = sel;
     }
+}
+
+/// The first line of clipboard `text` without control characters: what a
+/// one-line field takes of a paste (#1378).
+pub fn first_line(text: &str) -> String {
+    text.split(['\r', '\n'])
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
 }
 
 /// Byte offset of char index `char_idx` in `s` (its length if past the end).
@@ -893,6 +947,49 @@ mod tests {
         bs.pane = Pane::SaveAs;
         bs.begin_save_as(name.to_string(), None);
         bs
+    }
+
+    fn chord(c: char, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), mods)
+    }
+
+    #[test]
+    fn a_ctrl_chord_types_nothing_in_the_file_name_but_altgr_types() {
+        let mut bs = name_field("ab");
+        for c in ['c', 'v', 'x', 'z', 'q'] {
+            bs.key(chord(c, KeyModifiers::CONTROL), &TestHost);
+        }
+        assert_eq!(bs.name_input, "ab");
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        bs.key(chord('@', altgr), &TestHost);
+        assert_eq!(bs.name_input, "ab@");
+    }
+
+    #[test]
+    fn the_file_name_copies_cuts_and_pastes() {
+        let mut bs = name_field("abcd");
+        assert!(bs.name_has_keyboard());
+        assert_eq!(bs.name_selected_text(), None, "no selection copies nothing");
+        assert_eq!(bs.name_cut(), None);
+        bs.key(ctrl_a(), &TestHost);
+        assert_eq!(bs.name_selected_text().as_deref(), Some("abcd"));
+        assert_eq!(bs.name_cut().as_deref(), Some("abcd"));
+        assert_eq!(bs.name_input, "");
+        assert!(bs.name_paste("xy\nz\u{7}"));
+        assert_eq!(bs.name_input, "xy");
+        assert_eq!(bs.name_cursor, 2);
+        bs.key(ctrl_a(), &TestHost);
+        assert!(!bs.name_paste("\nignored"), "an empty paste changes nothing");
+        assert_eq!(bs.name_input, "xy");
+        assert_eq!(bs.save_as_name_field().selection, Some((0, 2)));
+        assert!(bs.name_paste("Q"));
+        assert_eq!(bs.name_input, "Q");
+    }
+
+    #[test]
+    fn first_line_drops_controls_and_later_lines() {
+        assert_eq!(first_line("a\tb\r\nc"), "ab");
+        assert_eq!(first_line("\nx"), "");
     }
 
     #[test]

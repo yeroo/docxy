@@ -10,6 +10,7 @@ mod render;
 mod start;
 mod state;
 pub use confirm::{Confirm, ConfirmOutcome};
+pub use input::first_line;
 pub use host::{BackstageEvent, BackstageHost};
 pub use menu::draw_menu_column;
 pub use render::draw;
