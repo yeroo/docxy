@@ -922,6 +922,11 @@ pub struct State {
     pub gallery: Vec<(String, String)>,
     /// A dialog's values by control name.
     pub values: Vec<(String, Json)>,
+    /// A dialog's dropdown, radio or list items by control name, replacing
+    /// the manifest's for this opening (#1556).
+    pub items: Vec<(String, Vec<String>)>,
+    /// A dialog's controls to enable or grey by name (#1556).
+    pub enabled: Vec<(String, bool)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -959,10 +964,22 @@ impl State {
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
+        let items = self
+            .items
+            .iter()
+            .map(|(name, items)| (name.clone(), Json::strs(items)))
+            .collect();
+        let enabled = self
+            .enabled
+            .iter()
+            .map(|(name, on)| (name.clone(), Json::Bool(*on)))
+            .collect();
         Json::obj(vec![
             ("controls", Json::Obj(controls)),
             ("gallery", Json::Obj(gallery)),
             ("values", Json::Obj(values)),
+            ("items", Json::Obj(items)),
+            ("enabled", Json::Obj(enabled)),
         ])
         .to_string()
     }
@@ -987,7 +1004,39 @@ impl State {
         for (name, value) in v.get("values").and_then(Json::as_object).unwrap_or(&[]) {
             state.values.push((name.clone(), value.clone()));
         }
+        for (name, items) in v.get("items").and_then(Json::as_object).unwrap_or(&[]) {
+            if let Some(items) = items.as_array() {
+                state.items.push((
+                    name.clone(),
+                    items
+                        .iter()
+                        .filter_map(|i| i.as_str().map(str::to_string))
+                        .collect(),
+                ));
+            }
+        }
+        for (name, on) in v.get("enabled").and_then(Json::as_object).unwrap_or(&[]) {
+            if let Some(on) = on.as_bool() {
+                state.enabled.push((name.clone(), on));
+            }
+        }
         Ok(state)
+    }
+
+    /// The items the state gives a dialog control, when it does.
+    pub fn items_of(&self, name: &str) -> Option<&[String]> {
+        self.items
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_slice())
+    }
+
+    /// Whether the state enables or greys a dialog control, when it says.
+    pub fn enabled_of(&self, name: &str) -> Option<bool> {
+        self.enabled
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, on)| *on)
     }
 
     pub fn control(&self, id: &str) -> ControlState {
@@ -1791,8 +1840,17 @@ mod tests {
             )],
             gallery: vec![("x.pal".into(), "x.blue".into())],
             values: vec![("note".into(), Json::str("hi"))],
+            items: vec![("pick".into(), vec!["a".into(), "b".into()])],
+            enabled: vec![("locked".into(), false)],
         };
         assert_eq!(State::parse(&state.json()).unwrap(), state);
+        assert_eq!(state.items_of("pick").map(<[String]>::len), Some(2));
+        assert_eq!(state.items_of("note"), None);
+        assert_eq!(state.enabled_of("locked"), Some(false));
+        assert_eq!(state.enabled_of("pick"), None);
+        // An older reply without them reads as none.
+        let old = State::parse(r#"{"controls":{},"gallery":{},"values":{}}"#).unwrap();
+        assert!(old.items.is_empty() && old.enabled.is_empty());
     }
 
     #[test]

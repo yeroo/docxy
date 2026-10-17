@@ -212,6 +212,17 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
             .len(),
         2
     );
+    // The dialog's dropdown items and a greyed control come from the state
+    // too (#1556).
+    assert_eq!(
+        state.items_of("fixture.pick"),
+        Some(&["task".to_string(), "3".to_string()][..])
+    );
+    assert_eq!(
+        state.value("fixture.pick").and_then(Json::as_str),
+        Some("3")
+    );
+    assert_eq!(state.enabled_of("fixture.locked"), Some(false));
 
     // Commands: the toggle flips and the state follows; the rename returns
     // one task.set op; a swatch sets the view's palette; an unknown id is
