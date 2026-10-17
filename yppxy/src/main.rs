@@ -1233,7 +1233,8 @@ impl App {
             .tasks
             .get(self.ed.sel())
             .map(|t| t.name.clone());
-        if let Some(name) = name {
+        // A blank row has nothing to copy, as a field with no selection.
+        if let Some(name) = name.filter(|n| !n.is_empty()) {
             self.field_copy(&name, false);
         }
     }
@@ -5301,6 +5302,18 @@ mod tests {
         let altgr = KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT);
         on_key(&mut app, altgr);
         assert_eq!(field_state(&app).0, "@");
+    }
+
+    #[test]
+    fn ctrl_c_on_a_task_with_no_name_copies_nothing_1378() {
+        let mut app = two_tasks();
+        app.os_clip = None;
+        app.insert_blank_row();
+        app.clip_text = Some("keep".into());
+        assert_eq!(app.ed.project().tasks[app.ed.sel()].name, "");
+        press_ctrl(&mut app, 'c');
+        assert_eq!(app.clip_text.as_deref(), Some("keep"));
+        assert_ne!(app.status, "Copied");
     }
 
     #[test]

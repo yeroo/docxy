@@ -125,13 +125,7 @@ impl LineEdit {
     /// the caret after it; control characters are dropped. Whether the text
     /// changed (#1377).
     pub fn paste(&mut self, text: &str) -> bool {
-        let line: String = text
-            .split(['\r', '\n'])
-            .next()
-            .unwrap_or("")
-            .chars()
-            .filter(|c| !c.is_control())
-            .collect();
+        let line = backstagecore::first_line(text);
         // An empty paste changes nothing, a selection included.
         if line.is_empty() {
             return false;

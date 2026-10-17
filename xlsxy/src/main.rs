@@ -2161,7 +2161,7 @@ impl Prompt {
     /// Inserts the first line of `text` at the caret, replacing a selection
     /// (#1377).
     fn paste(&mut self, text: &str) {
-        let line = first_line(text);
+        let line = backstage::first_line(text);
         // An empty paste changes nothing, a selection included.
         if line.is_empty() {
             return;
@@ -2171,17 +2171,6 @@ impl Prompt {
         self.text.insert_str(idx, &line);
         self.cursor += line.chars().count();
     }
-}
-
-/// The first line of clipboard `text` without control characters: what a
-/// one-line field takes of a paste (#1377).
-fn first_line(text: &str) -> String {
-    text.split(['\r', '\n'])
-        .next()
-        .unwrap_or("")
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect()
 }
 
 /// Vim editing modes for the grid (`--vim`).
@@ -4578,7 +4567,7 @@ impl App {
     fn field_paste_line(&mut self) -> Option<String> {
         let os = self.os_clip.as_mut().and_then(|cb| cb.get_text().ok());
         os.or_else(|| self.clip_text.clone())
-            .map(|t| first_line(&t))
+            .map(|t| backstage::first_line(&t))
     }
 
     fn paste(&mut self) {
