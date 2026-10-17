@@ -11,6 +11,7 @@ mod start;
 mod state;
 pub use confirm::{Confirm, ConfirmOutcome};
 pub use host::{BackstageEvent, BackstageHost};
+pub use input::first_line;
 pub use menu::draw_menu_column;
 pub use render::draw;
 pub use start::{Start, StartEvent, StartItem};

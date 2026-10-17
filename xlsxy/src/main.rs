@@ -2161,7 +2161,7 @@ impl Prompt {
     /// Inserts the first line of `text` at the caret, replacing a selection
     /// (#1377).
     fn paste(&mut self, text: &str) {
-        let line = first_line(text);
+        let line = backstage::first_line(text);
         // An empty paste changes nothing, a selection included.
         if line.is_empty() {
             return;
@@ -2171,17 +2171,6 @@ impl Prompt {
         self.text.insert_str(idx, &line);
         self.cursor += line.chars().count();
     }
-}
-
-/// The first line of clipboard `text` without control characters: what a
-/// one-line field takes of a paste (#1377).
-fn first_line(text: &str) -> String {
-    text.split(['\r', '\n'])
-        .next()
-        .unwrap_or("")
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect()
 }
 
 /// Vim editing modes for the grid (`--vim`).
@@ -4578,7 +4567,7 @@ impl App {
     fn field_paste_line(&mut self) -> Option<String> {
         let os = self.os_clip.as_mut().and_then(|cb| cb.get_text().ok());
         os.or_else(|| self.clip_text.clone())
-            .map(|t| first_line(&t))
+            .map(|t| backstage::first_line(&t))
     }
 
     fn paste(&mut self) {
@@ -8023,6 +8012,9 @@ impl App {
 
     /// Route a key to the backstage. Returns true when the app should exit.
     fn backstage_key(&mut self, key: KeyEvent) -> bool {
+        if self.backstage_name_clip(&key) {
+            return false;
+        }
         let mut bs = self.backstage.take();
         let ev = bs
             .as_mut()
@@ -8031,6 +8023,41 @@ impl App {
         self.backstage = bs;
         self.sync_backstage_options();
         self.apply_backstage_event(ev)
+    }
+
+    /// Ctrl+C, X or V in Save As's file name copies, cuts or pastes through
+    /// the clipboard (#1378); whether the key was one. The other Ctrl chords
+    /// are swallowed by the field itself.
+    fn backstage_name_clip(&mut self, key: &KeyEvent) -> bool {
+        let KeyCode::Char(k @ ('c' | 'x' | 'v')) = key.code else {
+            return false;
+        };
+        if !key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::ALT)
+            || !self
+                .backstage
+                .as_ref()
+                .is_some_and(|b| b.name_has_keyboard())
+        {
+            return false;
+        }
+        if k == 'v' {
+            if let Some(text) = self.field_paste_line() {
+                if let Some(b) = self.backstage.as_mut() {
+                    b.name_paste(&text);
+                }
+            }
+        } else if let Some(b) = self.backstage.as_mut() {
+            let text = if k == 'x' {
+                b.name_cut()
+            } else {
+                b.name_selected_text()
+            };
+            if let Some(text) = text {
+                self.field_copy(&text, k == 'x');
+            }
+        }
+        true
     }
 
     /// Route a left-click inside the File backstage. Row 0 is the ribbon tab
@@ -15597,6 +15624,41 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn save_as_name_copies_cuts_pastes_and_types_no_ctrl_letter_1378() {
+        let mut app = app_with_numbers(&[]);
+        app.os_clip = None;
+        let mut bs = backstage::Backstage::open(std::env::temp_dir(), app.extensions());
+        bs.begin_save_as("abcd".to_string(), None);
+        app.backstage = Some(bs);
+        let name = |app: &App| app.input_field("xlsxy-save-as").value;
+        app.backstage_key(ctrl('c'));
+        assert_eq!(app.clip_text, None, "no selection copies nothing");
+        for c in ['c', 'x', 'v', 'z'] {
+            app.backstage_key(ctrl(c));
+        }
+        assert_eq!(name(&app).as_deref(), Some("abcd"));
+        app.backstage_key(ctrl('a'));
+        app.backstage_key(ctrl('c'));
+        assert_eq!(app.clip_text.as_deref(), Some("abcd"));
+        app.clip_text = Some("\nX".into());
+        app.backstage_key(ctrl('v'));
+        assert_eq!(name(&app).as_deref(), Some("abcd"), "an empty paste");
+        app.clip_text = Some("xy\nz".into());
+        app.backstage_key(ctrl('v'));
+        assert_eq!(name(&app).as_deref(), Some("xy"));
+        app.backstage_key(ctrl('a'));
+        app.backstage_key(ctrl('x'));
+        assert_eq!(name(&app).as_deref(), Some(""));
+        assert_eq!(app.clip_text.as_deref(), Some("xy"));
+        let altgr = KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        app.backstage_key(altgr);
+        assert_eq!(name(&app).as_deref(), Some("@"));
     }
 
     /// #614: Ctrl+S on a workbook started from a template opens Save As

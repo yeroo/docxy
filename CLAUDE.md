@@ -362,9 +362,9 @@
   `field-read` reports it. In Find and Replace (#1375) Ctrl+A selects the
   focused field and Replace All is Alt+A (nothing in find-only mode). The
   comment bar and Compare's two paths take Ctrl+A too (#1376); the vim `:`
-  line does not. Find, Replace and Compare copy and paste (#1377, below);
-  the comment bar, the vim `:` line (#1378) and click-to-place (#1379)
-  are still not there.
+  line does not. Find, Replace and Compare copy and paste (#1377, below), and
+  so does the comment bar (#1378, below); the vim `:` line and
+  click-to-place (#1379) are still not there.
 
 ## Terminal editors: Ctrl+C/X/V in Find, Replace, Compare, the minibuffer and the cell editor (#1377)
 
@@ -388,6 +388,23 @@
   inserts at the caret, replacing the text under select-all; a paste is not
   typing (`typed_tail` false, so no AutoCorrect at commit, and no AutoComplete
   proposal), and an empty paste changes nothing.
+
+## Terminal editors: a Ctrl chord types nothing; copy and paste in the comment bar, Save As name and yppxy's prompt (#1378)
+
+- Ctrl+C/X/V (no Alt) copy, cut and paste as in #1377 in docxy's comment
+  bar (`comment_field_clip`), Backstage Save As's file name in all three
+  editors, and yppxy's `Prompt` (every prompt, the vim `:` line included). Any
+  other Ctrl chord without Alt types nothing there; Ctrl+Alt (AltGr) still
+  types. docxy's and xlsxy's vim `:` lines are unchanged.
+- `backstagecore` stays clipboard-free: `Backstage::name_has_keyboard`,
+  `name_selected_text`, `name_cut`, `name_paste` and `backstagecore::first_line`
+  (the one first-line, controls-dropped rule) serve the host, whose
+  `backstage_name_clip` runs before `backstage_key` takes the backstage and
+  passes every other key on. docxy and yppxy use `field_copy` /
+  `field_paste_text`; xlsxy `field_copy` / `field_paste_line`.
+- yppxy now has a clipboard (`arboard`, `os_clip`, else `clip_text`), and Ctrl+C
+  on the grid copies the selected task's name as plain text. There is no task
+  paste.
 
 ## Terminal editors: Ctrl+A in the other prompts (#1376)
 
@@ -428,5 +445,5 @@
   commits the whole text wherever the caret is. The edits clamp the caret, as
   tests assign `buf` directly. The drawn `▏` sits at the caret and `field-read
   yppxy-prompt` reports it. Ctrl+A selects the buffer (#1376; typing and the
-  edit keys replace or collapse it). Copy/paste and click-to-place are not
-  there (#1378); Backstage Save As's name field is separate.
+  edit keys replace or collapse it). Copy/paste is there (#1378, below);
+  click-to-place is not; Backstage Save As's name field is separate.

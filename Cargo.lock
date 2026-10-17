@@ -2508,6 +2508,7 @@ dependencies = [
 name = "yppxy"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "backstagecore",
  "buildinfo",
  "ctlcore",

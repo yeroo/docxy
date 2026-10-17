@@ -32,6 +32,8 @@ ctlcore = { version = "0.5.0", path = "../ctlcore" }
 projcore = { version = "0.1.0", path = "../projcore", features = ["plugins"] }
 # Reads the OLE2 container of legacy binary .mpp files (metadata for now).
 mppread = { version = "0.1.0", path = "../mppread" }
+# OS clipboard bridge (copy/paste across applications), same as docxy.
+arboard = "3"
 # ratatui re-exports crossterm, so we don't depend on crossterm separately.
 ratatui = "0.29"
 # Display-column widths for correct alignment + truncation with wide glyphs.

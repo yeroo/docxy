@@ -2555,6 +2555,9 @@ impl App {
 
     /// Returns true if the app should quit.
     fn backstage_key(&mut self, key: KeyEvent) -> bool {
+        if self.backstage_name_clip(&key) {
+            return false;
+        }
         let mut bs = self.backstage.take();
         let ev = bs
             .as_mut()
@@ -2562,6 +2565,42 @@ impl App {
             .unwrap_or(backstage::BackstageEvent::None);
         self.backstage = bs;
         self.apply_backstage_event(ev)
+    }
+
+    /// Ctrl+C, X or V in Save As's file name copies, cuts or pastes through
+    /// the clipboard (#1378); whether the key was one. The other Ctrl chords
+    /// are swallowed by the field itself.
+    fn backstage_name_clip(&mut self, key: &KeyEvent) -> bool {
+        let KeyCode::Char(k @ ('c' | 'x' | 'v')) = key.code else {
+            return false;
+        };
+        if !key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::ALT)
+            || !self
+                .backstage
+                .as_ref()
+                .is_some_and(|b| b.name_has_keyboard())
+        {
+            return false;
+        }
+        if k == 'v' {
+            if let Some(text) = self.field_paste_text() {
+                if let Some(b) = self.backstage.as_mut() {
+                    b.name_paste(&text);
+                }
+            }
+        } else if let Some(b) = self.backstage.as_mut() {
+            let text = if k == 'x' {
+                b.name_cut()
+            } else {
+                b.name_selected_text()
+            };
+            if let Some(text) = text {
+                self.field_copy(&text, k == 'x');
+            }
+        }
+        self.dirty = true;
+        true
     }
 
     /// Route a left-click inside the File backstage. Row 0 is the ribbon tab
@@ -3472,6 +3511,18 @@ impl App {
                 }
                 self.dirty = true;
             }
+            // Ctrl+C, X and V reach the clipboard (#1378); no other Ctrl chord
+            // types, but Ctrl+Alt (AltGr) does.
+            KeyCode::Char(c @ ('c' | 'x' | 'v'))
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.comment_field_clip(c);
+                self.dirty = true;
+            }
+            KeyCode::Char(_)
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) => {}
             KeyCode::Char(c) => {
                 if let Some(s) = self.comment_input.as_mut() {
                     s.insert(c);
@@ -3487,6 +3538,25 @@ impl App {
             _ => {}
         }
         false
+    }
+
+    /// Ctrl+C, X or V in the new-comment field (#1378).
+    fn comment_field_clip(&mut self, k: char) {
+        if k == 'v' {
+            if let Some(text) = self.field_paste_text() {
+                if let Some(s) = self.comment_input.as_mut() {
+                    s.paste(&text);
+                }
+            }
+            return;
+        }
+        let Some(s) = self.comment_input.as_mut() else {
+            return;
+        };
+        let text = if k == 'x' { s.cut() } else { s.selected_text() };
+        if let Some(text) = text {
+            self.field_copy(&text, k == 'x');
+        }
     }
 
     /// Move the comment selection by `delta`, reveal it in the panel, and jump the
@@ -10468,6 +10538,82 @@ mod tests {
         );
         assert_eq!(app.clip_text.as_deref(), Some("abc"));
         assert_eq!(app.status.as_deref(), Some("Cut"));
+    }
+
+    #[test]
+    fn comment_field_copies_cuts_pastes_and_types_no_ctrl_letter_1378() {
+        let body = vec![Block::Paragraph(docxcore::model::Paragraph::default())];
+        let mut app = App::new(new_package(Document { body }), "a.docx", false);
+        app.os_clip = None;
+        app.comment_input = Some("abcd".into());
+        app.comment_input_key(ctrl(KeyCode::Char('c')));
+        assert_eq!(app.clip_text, None, "no selection copies nothing");
+        for c in ['c', 'x', 'v', 'z', 'q'] {
+            app.comment_input_key(ctrl(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            app.input_field("docxy-comment").value.as_deref(),
+            Some("abcd")
+        );
+        app.comment_input_key(ctrl(KeyCode::Char('a')));
+        app.comment_input_key(ctrl(KeyCode::Char('c')));
+        assert_eq!(app.clip_text.as_deref(), Some("abcd"));
+        assert_eq!(app.status.as_deref(), Some("Copied"));
+        app.comment_input_key(key(KeyCode::End));
+        app.clip_text = Some("Q\nR".into());
+        app.comment_input_key(ctrl(KeyCode::Char('v')));
+        assert_eq!(
+            app.input_field("docxy-comment").value.as_deref(),
+            Some("abcdQ")
+        );
+        app.clip_text = Some("\nX".into());
+        app.comment_input_key(ctrl(KeyCode::Char('a')));
+        app.comment_input_key(ctrl(KeyCode::Char('v')));
+        assert_eq!(
+            app.input_field("docxy-comment").value.as_deref(),
+            Some("abcdQ"),
+            "an empty paste changes nothing"
+        );
+        app.comment_input_key(ctrl(KeyCode::Char('x')));
+        assert_eq!(app.input_field("docxy-comment").value.as_deref(), Some(""));
+        assert_eq!(app.clip_text.as_deref(), Some("abcdQ"));
+        assert_eq!(app.status.as_deref(), Some("Cut"));
+        let altgr = KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        app.comment_input_key(altgr);
+        assert_eq!(app.input_field("docxy-comment").value.as_deref(), Some("@"));
+    }
+
+    #[test]
+    fn save_as_name_copies_cuts_pastes_and_types_no_ctrl_letter_1378() {
+        let body = vec![Block::Paragraph(docxcore::model::Paragraph::default())];
+        let mut app = App::new(new_package(Document { body }), "a.docx", false);
+        app.os_clip = None;
+        let mut bs = backstage::Backstage::open(std::env::temp_dir(), app.extensions());
+        bs.begin_save_as("abcd".to_string(), None);
+        app.backstage = Some(bs);
+        let name = |app: &App| app.input_field("docxy-save-as").value;
+        app.backstage_key(ctrl(KeyCode::Char('c')));
+        assert_eq!(app.clip_text, None, "no selection copies nothing");
+        for c in ['c', 'x', 'v', 'z'] {
+            app.backstage_key(ctrl(KeyCode::Char(c)));
+        }
+        assert_eq!(name(&app).as_deref(), Some("abcd"));
+        app.backstage_key(ctrl(KeyCode::Char('a')));
+        app.backstage_key(ctrl(KeyCode::Char('c')));
+        assert_eq!(app.clip_text.as_deref(), Some("abcd"));
+        app.clip_text = Some("\nX".into());
+        app.backstage_key(ctrl(KeyCode::Char('v')));
+        assert_eq!(name(&app).as_deref(), Some("abcd"), "an empty paste");
+        app.clip_text = Some("xy\nz".into());
+        app.backstage_key(ctrl(KeyCode::Char('v')));
+        assert_eq!(name(&app).as_deref(), Some("xy"));
+        app.backstage_key(ctrl(KeyCode::Char('a')));
+        app.backstage_key(ctrl(KeyCode::Char('x')));
+        assert_eq!(name(&app).as_deref(), Some(""));
+        assert_eq!(app.clip_text.as_deref(), Some("xy"));
     }
 
     #[test]

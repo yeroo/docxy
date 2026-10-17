@@ -492,6 +492,33 @@ impl Prompt {
         true
     }
 
+    /// The selected text, if any (#1378).
+    fn selected_text(&self) -> Option<String> {
+        let (from, to) = self.selection()?;
+        Some(self.buf[self.byte_at(from)..self.byte_at(to)].to_string())
+    }
+
+    /// Removes the selection and returns its text (#1378).
+    fn cut(&mut self) -> Option<String> {
+        let text = self.selected_text()?;
+        self.delete_selection();
+        Some(text)
+    }
+
+    /// Inserts the first line of `text` at the caret, replacing a selection;
+    /// control characters are dropped and an empty paste changes nothing
+    /// (#1378).
+    fn paste(&mut self, text: &str) {
+        let line = backstage::first_line(text);
+        if line.is_empty() {
+            return;
+        }
+        self.clamp();
+        self.delete_selection();
+        self.buf.insert_str(self.byte_at(self.caret), &line);
+        self.caret += line.chars().count();
+    }
+
     fn insert(&mut self, ch: char) {
         self.clamp();
         self.delete_selection();
@@ -556,6 +583,11 @@ struct App {
     top: usize,   // first shown row, in visible-row space (collapsed subtasks skipped)
     hscroll: i64, // gantt horizontal scroll in days from the earliest displayed start
     prompt: Option<Prompt>,
+    /// The OS clipboard, when there is one (a headless Linux has none).
+    os_clip: Option<arboard::Clipboard>,
+    /// The last text yppxy put on the clipboard: what a paste takes without
+    /// an OS clipboard (#1378).
+    clip_text: Option<String>,
     status: String,
     quit: bool,
     /// The shared Yes/No modal, open while asking whether to quit (Ctrl+Q /
@@ -617,6 +649,8 @@ impl App {
             top: 0,
             hscroll: 0,
             prompt: None,
+            os_clip: arboard::Clipboard::new().ok(),
+            clip_text: None,
             status: String::new(),
             quit: false,
             confirm: None,
@@ -1141,6 +1175,73 @@ impl App {
         }
     }
 
+    /// A text field's or task's copy or cut: the OS clipboard's text, and the
+    /// last text yppxy put there (#1378).
+    fn field_copy(&mut self, text: &str, cut: bool) {
+        if let Some(cb) = &mut self.os_clip {
+            let _ = cb.set_text(text.to_string());
+        }
+        self.clip_text = Some(text.to_string());
+        self.status = if cut { "Cut" } else { "Copied" }.to_string();
+    }
+
+    /// The text a field pastes: the OS clipboard's, else the last text yppxy
+    /// put there.
+    fn field_paste_text(&mut self) -> Option<String> {
+        let os = self.os_clip.as_mut().and_then(|cb| cb.get_text().ok());
+        os.or_else(|| self.clip_text.clone())
+    }
+
+    /// Ctrl+C, X or V in Save As's file name copies, cuts or pastes through
+    /// the clipboard (#1378); whether the key was one. The other Ctrl chords
+    /// are swallowed by the field itself.
+    fn backstage_name_clip(&mut self, key: &KeyEvent) -> bool {
+        let KeyCode::Char(k @ ('c' | 'x' | 'v')) = key.code else {
+            return false;
+        };
+        if !key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::ALT)
+            || !self
+                .backstage
+                .as_ref()
+                .is_some_and(|b| b.name_has_keyboard())
+        {
+            return false;
+        }
+        if k == 'v' {
+            if let Some(text) = self.field_paste_text() {
+                if let Some(b) = self.backstage.as_mut() {
+                    b.name_paste(&text);
+                }
+            }
+        } else if let Some(b) = self.backstage.as_mut() {
+            let text = if k == 'x' {
+                b.name_cut()
+            } else {
+                b.name_selected_text()
+            };
+            if let Some(text) = text {
+                self.field_copy(&text, k == 'x');
+            }
+        }
+        true
+    }
+
+    /// Ctrl+C on the grid copies the selected task's name as plain text
+    /// (#1378); there is no task paste.
+    fn copy_task_name(&mut self) {
+        let name = self
+            .ed
+            .project()
+            .tasks
+            .get(self.ed.sel())
+            .map(|t| t.name.clone());
+        // A blank row has nothing to copy, as a field with no selection.
+        if let Some(name) = name.filter(|n| !n.is_empty()) {
+            self.field_copy(&name, false);
+        }
+    }
+
     fn rename(&mut self, text: &str) {
         if let Some(uid) = self.ed.selected_uid() {
             if let Err(message) = self.ed.rename(uid, text) {
@@ -1284,6 +1385,9 @@ impl App {
 
     /// Route a key to the backstage.
     fn backstage_key(&mut self, key: KeyEvent) {
+        if self.backstage_name_clip(&key) {
+            return;
+        }
         let mut bs = self.backstage.take();
         let ev = bs
             .as_mut()
@@ -1742,6 +1846,34 @@ fn on_key(app: &mut App, k: KeyEvent) {
                 prompt.select_all();
                 app.prompt = Some(prompt);
             }
+            // Ctrl+C, X and V reach the clipboard (#1378); no other Ctrl chord
+            // types, but Ctrl+Alt (AltGr) does.
+            KeyCode::Char(c @ ('c' | 'x' | 'v'))
+                if k.modifiers.contains(KeyModifiers::CONTROL)
+                    && !k.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if c == 'v' {
+                    if let Some(text) = app.field_paste_text() {
+                        prompt.paste(&text);
+                    }
+                } else {
+                    let text = if c == 'x' {
+                        prompt.cut()
+                    } else {
+                        prompt.selected_text()
+                    };
+                    if let Some(text) = text {
+                        app.field_copy(&text, c == 'x');
+                    }
+                }
+                app.prompt = Some(prompt);
+            }
+            KeyCode::Char(_)
+                if k.modifiers.contains(KeyModifiers::CONTROL)
+                    && !k.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                app.prompt = Some(prompt);
+            }
             KeyCode::Char(c) => {
                 prompt.insert(c);
                 app.prompt = Some(prompt);
@@ -1824,6 +1956,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
         match k.code {
             KeyCode::Char('s') => app.save(),
             KeyCode::Char('e') => app.export_md(),
+            KeyCode::Char('c') => app.copy_task_name(),
             KeyCode::Char('z') => app.undo(),
             KeyCode::Char('y') | KeyCode::Char('r') => app.redo(),
             KeyCode::Char('f') => app.find_prompt(),
@@ -5136,6 +5269,95 @@ mod tests {
             app,
             KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
         );
+    }
+
+    fn press_ctrl(app: &mut App, c: char) {
+        on_key(app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn prompt_copies_cuts_pastes_and_types_no_ctrl_letter_1378() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.os_clip = None;
+        open_prompt(&mut app, "abcd");
+        press_ctrl(&mut app, 'c');
+        assert_eq!(app.clip_text, None, "no selection copies nothing");
+        for c in ['c', 'x', 'v', 'z', 'q'] {
+            press_ctrl(&mut app, c);
+        }
+        assert_eq!(field_state(&app).0, "abcd");
+        press_ctrl(&mut app, 'a');
+        press_ctrl(&mut app, 'c');
+        assert_eq!(app.clip_text.as_deref(), Some("abcd"));
+        assert_eq!(app.status, "Copied");
+        press_key(&mut app, KeyCode::End);
+        app.clip_text = Some("Q\nR".into());
+        press_ctrl(&mut app, 'v');
+        assert_eq!(field_state(&app).0, "abcdQ");
+        app.clip_text = Some("\nX".into());
+        press_ctrl(&mut app, 'a');
+        press_ctrl(&mut app, 'v');
+        assert_eq!(
+            field_state(&app).0,
+            "abcdQ",
+            "an empty paste changes nothing"
+        );
+        press_ctrl(&mut app, 'x');
+        assert_eq!(field_state(&app).0, "");
+        assert_eq!(app.clip_text.as_deref(), Some("abcdQ"));
+        assert_eq!(app.status, "Cut");
+        let altgr = KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        on_key(&mut app, altgr);
+        assert_eq!(field_state(&app).0, "@");
+    }
+
+    #[test]
+    fn ctrl_c_on_a_task_with_no_name_copies_nothing_1378() {
+        let mut app = two_tasks();
+        app.os_clip = None;
+        app.insert_blank_row();
+        app.clip_text = Some("keep".into());
+        assert_eq!(app.ed.project().tasks[app.ed.sel()].name, "");
+        press_ctrl(&mut app, 'c');
+        assert_eq!(app.clip_text.as_deref(), Some("keep"));
+        assert_ne!(app.status, "Copied");
+    }
+
+    #[test]
+    fn ctrl_c_on_the_grid_copies_the_task_name_and_the_save_as_name_takes_it_1378() {
+        let mut app = two_tasks();
+        app.os_clip = None;
+        press_ctrl(&mut app, 'c');
+        press_key(&mut app, KeyCode::Down);
+        press_ctrl(&mut app, 'c');
+        assert_eq!(app.clip_text.as_deref(), Some("Build"));
+        press_key(&mut app, KeyCode::Up);
+        press_ctrl(&mut app, 'c');
+        let first = app.ed.project().tasks[app.ed.sel()].name.clone();
+        assert_eq!(app.clip_text.as_deref(), Some(first.as_str()));
+        let mut bs = Backstage::open(std::env::temp_dir(), app.extensions());
+        bs.begin_save_as("abcd".into(), None);
+        app.backstage = Some(bs);
+        let name = |app: &App| app.input_field("yppxy-save-as").value;
+        for c in ['x', 'z'] {
+            press_ctrl(&mut app, c);
+        }
+        assert_eq!(name(&app).as_deref(), Some("abcd"));
+        press_ctrl(&mut app, 'v');
+        assert_eq!(name(&app).as_deref(), Some(format!("abcd{first}").as_str()));
+        press_ctrl(&mut app, 'a');
+        press_ctrl(&mut app, 'x');
+        assert_eq!(name(&app).as_deref(), Some(""));
+        assert_eq!(app.status, "Cut");
+        let altgr = KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        on_key(&mut app, altgr);
+        assert_eq!(name(&app).as_deref(), Some("@"));
     }
 
     #[test]
