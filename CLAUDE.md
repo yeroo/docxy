@@ -334,3 +334,15 @@
   `set_priority`, `set_deadline`, `set_task_type`, `set_effort_driven`) are in
   `projcore/src/editor/props.rs`. The old `task-info` input of `inputs.rs` is
   gone; `uiharness/cases/project-task-info.uit` drives the dialog by hand.
+
+## Terminal docxy prompts edit at a caret (#1372)
+
+- Find, Replace, the comment bar, Compare's two paths and the vim `:` line are
+  `docxy/src/line_edit.rs`'s `LineEdit` (text plus a char caret, shared key set
+  in `handle`): Left, Right, Home, End, Delete and Backspace act at the caret
+  and typing inserts there, with no Ctrl or Alt (`plain_edit_key`). Only the
+  focused field draws the `▏` mark, at its caret; `replace_drawn` feeds both
+  the Replace status text and the `docxy-replace` `at`, and `compare_window`
+  keeps a long Compare path's caret in view. `field-read` reports the real
+  caret (`Field::with_caret`). Select-all, copy/paste and click-to-place are
+  still not there (#1375 to #1379).

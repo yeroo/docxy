@@ -4357,6 +4357,190 @@ mod tests {
         assert_eq!(all.get_usize("clicks"), Some(0), "{all}");
     }
 
+    /// Every prompt edits at a caret: `abcd`, Backspace, Home, Right, Delete,
+    /// End, Left, `X` is `aXc` with the caret at 2, and `field-read` says so
+    /// (#1372).
+    #[test]
+    fn field_read_follows_the_caret_in_each_prompt() {
+        use crossterm_keys::*;
+        let read = |app: &mut App, id: &str| {
+            dispatch(
+                app,
+                "field-read",
+                &Json::obj(vec![("input", Json::Str(id.into()))]),
+            )
+            .unwrap()
+        };
+        let edit = |app: &mut App, id: &str| {
+            for c in "abcd".chars() {
+                press(app, ch(c));
+            }
+            for code in [
+                KeyCode::Backspace,
+                KeyCode::Home,
+                KeyCode::Right,
+                KeyCode::Delete,
+                KeyCode::End,
+                KeyCode::Left,
+            ] {
+                press(app, key(code));
+            }
+            press(app, ch('X'));
+            let r = read(app, id);
+            assert_eq!(r.get_str("value"), Some("aXc"), "{id}: {r}");
+            assert_eq!(r.get_usize("caret"), Some(2), "{id}: {r}");
+        };
+        let mut app = app_with(&["alpha beta"]);
+        press(&mut app, ctrl('f'));
+        edit(&mut app, "docxy-find");
+        press(&mut app, key(KeyCode::Tab));
+        edit(&mut app, "docxy-replace");
+        assert_eq!(read(&mut app, "docxy-find").get_usize("caret"), Some(2));
+        press(&mut app, key(KeyCode::Esc));
+
+        app.editor.select_all();
+        app.start_comment();
+        edit(&mut app, "docxy-comment");
+        press(&mut app, key(KeyCode::Esc));
+
+        app.open_compare_dialog();
+        edit(&mut app, "docxy-compare-original");
+        press(&mut app, key(KeyCode::Tab));
+        edit(&mut app, "docxy-compare-revised");
+        assert_eq!(
+            read(&mut app, "docxy-compare-original").get_str("value"),
+            Some("aXc")
+        );
+        press(&mut app, key(KeyCode::Esc));
+
+        let mut vim = app_with(&["alpha beta"]);
+        vim.vim = Some(crate::VimState::new());
+        press(&mut vim, ch(':'));
+        edit(&mut vim, "docxy-vim-command");
+    }
+
+    /// The Find bar re-searches when the query changes, not when the caret
+    /// moves or the Replace field is edited; the Replace field's `at` follows
+    /// the query as drawn with the caret mark mid-text (#1372).
+    #[test]
+    fn find_edits_at_the_caret_and_replace_at_follows_the_drawn_query() {
+        use crossterm_keys::*;
+        let draw = |app: &mut App| {
+            let mut term: ratatui::Terminal<ratatui::backend::TestBackend> =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+            term.draw(|f| app.draw(f)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..120)
+                .map(|x| buf[(x, 39)].symbol().to_string())
+                .collect::<String>()
+        };
+        let col = |app: &mut App, id: &str| {
+            dispatch(
+                app,
+                "field-read",
+                &Json::obj(vec![("input", Json::Str(id.into()))]),
+            )
+            .unwrap()
+            .get("at")
+            .and_then(|a| a.get_usize("col"))
+        };
+        let mut app = app_with(&["alpha beta alpha"]);
+        press(&mut app, ctrl('f'));
+        for c in "alpa".chars() {
+            press(&mut app, ch(c));
+        }
+        assert_eq!(app.find.as_ref().unwrap().matches.len(), 0);
+        // Fix the typo in the middle: Left, then `h`.
+        press(&mut app, key(KeyCode::Left));
+        press(&mut app, ch('h'));
+        let f = app.find.as_ref().unwrap();
+        assert_eq!(f.query.as_str(), "alpha");
+        assert_eq!(f.query.caret(), 4);
+        assert_eq!(f.matches.len(), 2, "searched on every query edit");
+        let moved = app.find.as_ref().unwrap().idx;
+        press(&mut app, key(KeyCode::Home));
+        assert_eq!(app.find.as_ref().unwrap().matches.len(), 2);
+        assert_eq!(app.find.as_ref().unwrap().idx, moved, "a caret move");
+        assert!(
+            draw(&mut app).contains(" Find: ▏alpha"),
+            "mark at the caret"
+        );
+
+        // Replace: only the focused field carries the mark.
+        press(&mut app, key(KeyCode::Right));
+        press(&mut app, key(KeyCode::Tab));
+        for c in "zz".chars() {
+            press(&mut app, ch(c));
+        }
+        press(&mut app, key(KeyCode::Left));
+        let f = app.find.as_ref().unwrap();
+        assert_eq!(f.query.as_str(), "alpha", "the Replace field edits alone");
+        assert_eq!(f.matches.len(), 2);
+        let line = draw(&mut app);
+        assert!(line.contains(" Replace: alpha → z▏z"), "{line}");
+        assert_eq!(
+            col(&mut app, "docxy-replace"),
+            Some(" Replace: alpha → ".chars().count())
+        );
+        // Back on the query, its caret mark is drawn there instead.
+        press(&mut app, key(KeyCode::Tab));
+        let line = draw(&mut app);
+        assert!(line.contains(" Replace: a▏lpha → zz"), "{line}");
+        assert_eq!(
+            col(&mut app, "docxy-replace"),
+            Some(" Replace: a▏lpha → ".chars().count())
+        );
+        // Ctrl chords keep their meaning: Ctrl+Home is not a caret move.
+        let before = app.find.as_ref().unwrap().query.caret();
+        press(
+            &mut app,
+            KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.find.as_ref().unwrap().query.caret(), before);
+    }
+
+    /// A Compare path longer than its row is windowed so the caret stays in
+    /// view, and `at` is the first shown char's cell (#1372).
+    #[test]
+    fn compare_path_windows_around_the_caret() {
+        use crossterm_keys::*;
+        let mut app = app_with(&["x"]);
+        app.open_compare_dialog();
+        let long = "/very/long/directory/name/that/does/not/fit/in/the/dialog/row/file.docx";
+        for c in long.chars() {
+            press(&mut app, ch(c));
+        }
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        let rows = |app: &mut App, term: &mut ratatui::Terminal<ratatui::backend::TestBackend>| {
+            term.draw(|f| app.draw(f)).unwrap();
+            let buf = term.backend().buffer().clone();
+            let at = dispatch(
+                app,
+                "field-read",
+                &Json::obj(vec![("input", Json::Str("docxy-compare-original".into()))]),
+            )
+            .unwrap();
+            let at = at.get("at").unwrap();
+            let (c, r) = (at.get_usize("col").unwrap(), at.get_usize("row").unwrap());
+            let text: String = (0..60).map(|x| buf[(x, r as u16)].symbol()).collect();
+            (text, c)
+        };
+        let (text, _) = rows(&mut app, &mut term);
+        assert!(text.contains("file.docx▏"), "the tail at the end: {text}");
+        press(&mut app, key(KeyCode::Home));
+        let (text, col) = rows(&mut app, &mut term);
+        assert!(text.contains("Original: ▏/very/long"), "{text}");
+        assert!(!text.contains("file.docx"), "{text}");
+        let label = text.chars().take_while(|c| *c != ':').count() + 2;
+        assert_eq!(col, label + 1, "`at` is the first char, past the mark");
+        assert_eq!(text.chars().nth(col), Some('/'));
+        press(&mut app, key(KeyCode::End));
+        let (text, col) = rows(&mut app, &mut term);
+        assert!(text.contains("file.docx▏"), "{text}");
+        let label = text.chars().take_while(|c| *c != ':').count() + 2;
+        assert_eq!(col, label, "no mark before the first shown char: {text}");
+    }
+
     /// Keys as crossterm hands them to `handle_event`.
     mod crossterm_keys {
         pub use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

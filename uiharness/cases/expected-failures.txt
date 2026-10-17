@@ -32,12 +32,6 @@ backstage-inputs-typing.uit | rename sheet-tab-rename: pastes | #1365
 # docxy's prompts are append-only: no caret, so Home, End, Left, Right and
 # Delete do nothing (the Find bar's two fields, the new comment's text,
 # Compare's two paths and the vim `:` line; #1204 found it).
-terminal-docxy-inputs-typing.uit | docxy docxy-find: edits | #1372
-terminal-docxy-inputs-typing.uit | docxy docxy-replace: edits | #1372
-terminal-docxy-inputs-typing.uit | docxy docxy-comment: edits | #1372
-terminal-docxy-inputs-typing.uit | docxy docxy-compare-original: edits | #1372
-terminal-docxy-inputs-typing.uit | docxy docxy-compare-revised: edits | #1372
-terminal-docxy-vim-inputs-typing.uit | docxy docxy-vim-command: edits | #1372
 
 # xlsxy's vim `:` command line is append-only: no caret (#1204).
 terminal-xlsxy-vim-inputs-typing.uit | xlsxy xlsxy-vim-command: edits | #1373
