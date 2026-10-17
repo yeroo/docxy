@@ -35,7 +35,7 @@ pub trait PdfFontProvider: Debug {
     /// has none.
     fn face(&self, family: &str, bold: bool, italic: bool) -> Option<Rc<dyn PdfFace>>;
     /// Faces tried, in order, for a character the run's own face lacks.
-    fn fallbacks(&self) -> Vec<Rc<dyn PdfFace>>;
+    fn fallbacks(&self) -> &[Rc<dyn PdfFace>];
 }
 
 /// What an export had to leave out or approximate.
