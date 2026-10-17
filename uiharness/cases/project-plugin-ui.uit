@@ -168,3 +168,19 @@ test the overlay returns the fixture's shapes for the chart
   assert reply.shapes.0.text is fixture
   assert reply.shapes.1.kind is polyline
   assert reply.shapes.2.kind is arrow
+
+test the overlay follows a collapsed summary
+  # The shapes are cached by the plan's revision, the scale, the view's
+  # switches and the shown rows: collapsing a summary changes no plan but
+  # hides rows, and the overlay is asked again.
+  open ../fixtures/gantt-summary.xml
+  call project-overlay {}
+  assert reply.count is 3
+  click C1
+  call ribbon-click {"tab":"View","command":"Hide Subtasks"}
+  call project-overlay {}
+  assert reply.count is 1
+  assert reply.shapes.0.kind is text
+  call ribbon-click {"tab":"View","command":"Show Subtasks"}
+  call project-overlay {}
+  assert reply.count is 3
