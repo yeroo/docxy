@@ -29,6 +29,7 @@ pub mod clip_rtf;
 pub mod comments;
 pub mod compare;
 pub mod cover;
+pub mod deflate;
 pub mod editor;
 pub mod equation;
 pub mod export;
