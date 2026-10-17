@@ -17,9 +17,15 @@ pub fn fnv(bytes: &[u8]) -> u64 {
     h
 }
 
-/// A document with a header (text and a watermark), a footer PAGE field and
-/// the given body.
+/// A document with a header ("Running head"), a footer PAGE field and the
+/// given body.
 pub fn docx(body: &str) -> Vec<u8> {
+    docx_with_header(body, "")
+}
+
+/// [`docx`] with `header_extra` appended to the header part (for example a
+/// VML text watermark).
+pub fn docx_with_header(body: &str, header_extra: &str) -> Vec<u8> {
     let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/><Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/></Types>"#;
     let root_rels = format!(
@@ -36,7 +42,12 @@ pub fn docx(body: &str) -> Vec<u8> {
     );
     let header = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:hdr xmlns:w="{W}" xmlns:r="{R}"><w:p><w:r><w:t>Running head</w:t></w:r></w:p></w:hdr>"#
+<w:hdr xmlns:w="{W}" xmlns:r="{R}"{v}><w:p><w:r><w:t>Running head</w:t></w:r></w:p>{header_extra}</w:hdr>"#,
+        v = if header_extra.is_empty() {
+            ""
+        } else {
+            r#" xmlns:v="urn:schemas-microsoft-com:vml""#
+        }
     );
     let footer = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>

@@ -82,14 +82,16 @@ fn table<'a>(tables: &[([u8; 4], &'a [u8])], tag: &[u8; 4]) -> Option<&'a [u8]> 
 }
 
 /// The OS/2 `fsType` embedding bits, 0 when the face has no OS/2 table.
-pub fn embedding_bits(data: &[u8], index: u32) -> u16 {
+#[cfg(test)]
+pub(crate) fn embedding_bits(data: &[u8], index: u32) -> u16 {
     sfnt_tables(data, index)
         .and_then(|t| table(&t, b"OS/2").and_then(|os2| u16_at(os2, 8)))
         .unwrap_or(0)
 }
 
 /// Whether the face is a TrueType-outline font (`glyf`, not CFF).
-pub fn has_glyf(data: &[u8], index: u32) -> bool {
+#[cfg(test)]
+pub(crate) fn has_glyf(data: &[u8], index: u32) -> bool {
     sfnt_tables(data, index)
         .is_some_and(|t| table(&t, b"glyf").is_some() && table(&t, b"loca").is_some())
 }
@@ -315,7 +317,7 @@ mod synth_font;
 mod tests {
     use super::*;
 
-    use super::synth_font::{Shape, SynthGlyph, build, collection, glyph};
+    use super::synth_font::{Shape, Style, SynthGlyph, build, build_with, collection, glyph};
 
     fn font() -> Vec<u8> {
         build(
@@ -363,6 +365,43 @@ mod tests {
         let sub = subset_sfnt(&data, 0, &BTreeSet::from([4u16])).unwrap();
         assert!(glyph_bytes(&sub, 4) > 0);
         assert!(glyph_bytes(&sub, 1) > 0, "component A kept");
+        assert_eq!(glyph_bytes(&sub, 3), 0);
+    }
+
+    #[test]
+    fn multi_component_composites_with_byte_arguments_and_scales_are_kept() {
+        let mut glyphs: Vec<SynthGlyph> = "ABCD".chars().map(|c| glyph(c, 600)).collect();
+        glyphs.push(SynthGlyph {
+            ch: '\u{00C9}',
+            advance: 650,
+            // Byte arguments with a scale, an x/y scale, a 2x2 matrix, a scale.
+            shape: Shape::Mixed(vec![1, 2, 3, 4]),
+        });
+        let data = build(&glyphs, 1000, 0);
+        let sub = subset_sfnt(&data, 0, &BTreeSet::from([5u16])).unwrap();
+        for gid in 1..=5 {
+            assert!(glyph_bytes(&sub, gid) > 0, "glyph {gid} kept");
+        }
+        assert!(glyph_bytes(&sub, 0) > 0);
+    }
+
+    #[test]
+    fn short_loca_is_read_and_the_subset_is_written_long() {
+        let style = Style {
+            short_loca: true,
+            ..Style::default()
+        };
+        let glyphs = [glyph('A', 600), glyph('B', 700), glyph('C', 800)];
+        let data = build_with(&glyphs, 1000, 0, &style);
+        let t = sfnt_tables(&data, 0).unwrap();
+        assert_eq!(u16_at(table(&t, b"head").unwrap(), 50), Some(0), "short");
+        let loca = table(&t, b"loca").unwrap();
+        let source_len = 2 * (u16_at(loca, 2 * 3).unwrap() - u16_at(loca, 2 * 2).unwrap()) as usize;
+        let sub = subset_sfnt(&data, 0, &BTreeSet::from([2u16])).unwrap();
+        let st = sfnt_tables(&sub, 0).unwrap();
+        assert_eq!(u16_at(table(&st, b"head").unwrap(), 50), Some(1), "long");
+        assert_eq!(glyph_bytes(&sub, 2), source_len);
+        assert_eq!(glyph_bytes(&sub, 1), 0);
         assert_eq!(glyph_bytes(&sub, 3), 0);
     }
 

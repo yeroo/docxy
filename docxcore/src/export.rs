@@ -1,11 +1,13 @@
 //! PDF export ("print") — a from-scratch, dependency-free PDF writer.
 //!
-//! Phase 0 uses the **Courier** standard-14 base fonts (regular / bold /
-//! oblique / bold-oblique). Because Courier is monospaced (every glyph is
-//! 600/1000 em wide) we need no font embedding and no AFM width tables, and
-//! line-breaking is exact. Proportional output (Helvetica/Times with AFM
-//! metrics) is a later refinement. Output is deterministic, so it is golden-byte
-//! testable.
+//! Without a font provider it uses the **Courier** standard-14 base fonts
+//! (regular / bold / oblique / bold-oblique). Because Courier is monospaced
+//! (every glyph is 600/1000 em wide) we need no font embedding and no AFM
+//! width tables, and line-breaking is exact. That Courier file is the
+//! byte-stable path of hosts without fonts. With `PdfOptions::fonts` the text
+//! is embedded instead as subset CIDFontType2 fonts (`mod cid`) and lines
+//! break on the faces' real advances, through `Metrics`. Output is
+//! deterministic, so it is golden-byte testable.
 //!
 //! Covered now: paragraphs, runs (bold/italic/underline/strike/color),
 //! headings, lists, hyperlink annotations, and Word's page layout: page and
@@ -1013,8 +1015,8 @@ fn emit_band<'b>(
 }
 
 /// A frame's content width in twips as this exporter draws it, for a frame
-/// with no `w` (Word sizes it to its content): the longest line's printed
-/// characters plus one, at the monospace advance of each paragraph's size.
+/// with no `w` (Word sizes it to its content): the longest line's width plus
+/// one more character, as [`Metrics`] measures it at each paragraph's size.
 fn content_w(g: &crate::frame::FrameGroup, opts: &PdfOptions) -> i32 {
     if g.frame.w.is_some_and(|w| w > 0) {
         return 0; // frame_rect takes `w`.
@@ -1240,9 +1242,12 @@ fn visual_order(line: &[PCell], m: Metrics, base: BidiBaseDirection) -> Vec<usiz
     let Some(projector) = m.bidi else {
         return identity();
     };
-    if !line
-        .iter()
-        .any(|c| c.dir != BidiRunDirection::Natural || c.ch as u32 >= 0x590)
+    // A left-to-right base with no right-to-left text is already in order;
+    // under a right-to-left base even a Latin line has its edge neutrals moved.
+    if base != BidiBaseDirection::Rtl
+        && !line
+            .iter()
+            .any(|c| c.dir != BidiRunDirection::Natural || c.ch as u32 >= 0x590)
     {
         return identity();
     }
@@ -2654,7 +2659,8 @@ fn write_pdf(pages: &[Page], opts: &PdfOptions) -> (Vec<u8>, PdfReport) {
 /// The file for already-built page contents; `book` holds the embedded faces
 /// (and then the contents are Flate-compressed).
 fn serialize_pdf(pages: &[Page], contents: Vec<Vec<u8>>, book: Option<&cid::Book>) -> Vec<u8> {
-    // Object ids: 1=Catalog, 2=Pages, 3..6=Fonts, then per-page content/annot/page.
+    // Object ids: 1=Catalog, 2=Pages, 3..6=Courier fonts, then 5 objects per
+    // embedded face (Type0 first), then per-page content/annot/page.
     let mut objs: Vec<Vec<u8>> = vec![Vec::new(), Vec::new()];
     const FONTS: [&str; 4] = [
         "Courier",

@@ -7,6 +7,10 @@ pub enum Shape {
     Triangle,
     /// A composite of these (earlier) glyph ids.
     Composite(Vec<u16>),
+    /// A composite of these glyph ids written the way real accented glyphs
+    /// are: byte arguments, and a scale record that cycles through one scale,
+    /// an x/y scale and a 2x2 matrix.
+    Mixed(Vec<u16>),
 }
 
 pub struct SynthGlyph {
@@ -64,6 +68,28 @@ fn composite(parts: &[u16]) -> Vec<u8> {
     g
 }
 
+fn mixed(parts: &[u16]) -> Vec<u8> {
+    let mut g = Vec::new();
+    be16(&mut g, 0xFFFF);
+    for v in [0i16, 0, 500, 700] {
+        be16(&mut g, v as u16);
+    }
+    for (i, &p) in parts.iter().enumerate() {
+        let more = if i + 1 < parts.len() { 0x20 } else { 0 };
+        // ARGS_ARE_XY_VALUES with byte arguments, plus one scale form.
+        let (scale, extra) = match i % 3 {
+            0 => (0x0008, 2),
+            1 => (0x0040, 4),
+            _ => (0x0080, 8),
+        };
+        be16(&mut g, 0x0002 | more | scale);
+        be16(&mut g, p);
+        g.extend_from_slice(&[0, 0]);
+        g.extend(std::iter::repeat_n(0x40, extra));
+    }
+    g
+}
+
 fn checksum(d: &[u8]) -> u32 {
     let mut sum = 0u32;
     for c in d.chunks(4) {
@@ -111,6 +137,14 @@ pub struct Style {
     pub italic: bool,
     /// Outlines in a `CFF ` table instead of `glyf`/`loca`.
     pub cff: bool,
+    /// The typographic family (name ID 16); `family` stays the legacy ID 1.
+    pub typographic: Option<String>,
+    /// Names on the Macintosh platform (Roman) instead of Windows.
+    pub mac_names: bool,
+    /// OS/2 `usWeightClass`; 0 means 700 when bold, else 400.
+    pub weight: u16,
+    /// `loca` in the short format.
+    pub short_loca: bool,
 }
 
 /// `fs_type` is the OS/2 embedding bits; `units` the units per em.
@@ -118,7 +152,8 @@ pub fn build(glyphs: &[SynthGlyph], units: u16, fs_type: u16) -> Vec<u8> {
     build_with(glyphs, units, fs_type, &Style::default())
 }
 
-fn name_table(family: &str, bold: bool, italic: bool) -> Vec<u8> {
+fn name_table(style: &Style, family: &str) -> Vec<u8> {
+    let (bold, italic) = (style.bold, style.italic);
     let sub = match (bold, italic) {
         (true, true) => "Bold Italic",
         (true, false) => "Bold",
@@ -126,14 +161,26 @@ fn name_table(family: &str, bold: bool, italic: bool) -> Vec<u8> {
         (false, false) => "Regular",
     };
     let ps = format!("{}-{}", family.replace(' ', ""), sub.replace(' ', ""));
-    let strings = [(1u16, family.to_string()), (2, sub.to_string()), (6, ps)];
+    let mut strings = vec![(1u16, family.to_string()), (2, sub.to_string()), (6, ps)];
+    if let Some(t) = &style.typographic {
+        strings.push((16, t.clone()));
+    }
     let mut records = Vec::new();
     let mut data = Vec::new();
     for (id, text) in &strings {
-        let utf16: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
-        be16(&mut records, 3);
-        be16(&mut records, 1);
-        be16(&mut records, 0x409);
+        let utf16: Vec<u8> = if style.mac_names {
+            text.bytes().collect()
+        } else {
+            text.encode_utf16().flat_map(|u| u.to_be_bytes()).collect()
+        };
+        let (platform, encoding, language) = if style.mac_names {
+            (1, 0, 0)
+        } else {
+            (3, 1, 0x409)
+        };
+        be16(&mut records, platform);
+        be16(&mut records, encoding);
+        be16(&mut records, language);
         be16(&mut records, *id);
         be16(&mut records, utf16.len() as u16);
         be16(&mut records, data.len() as u16);
@@ -151,10 +198,10 @@ fn name_table(family: &str, bold: bool, italic: bool) -> Vec<u8> {
 pub fn build_with(glyphs: &[SynthGlyph], units: u16, fs_type: u16, style: &Style) -> Vec<u8> {
     let n = glyphs.len() + 1;
     let mut glyf = Vec::new();
-    let mut loca = Vec::new();
+    let mut offsets: Vec<u32> = Vec::new();
     let mut hmtx = Vec::new();
     let mut push = |g: Vec<u8>, adv: u16, glyf: &mut Vec<u8>| {
-        be32(&mut loca, glyf.len() as u32);
+        offsets.push(glyf.len() as u32);
         glyf.extend(g);
         while !glyf.len().is_multiple_of(4) {
             glyf.push(0);
@@ -167,10 +214,19 @@ pub fn build_with(glyphs: &[SynthGlyph], units: u16, fs_type: u16, style: &Style
         let bytes = match &g.shape {
             Shape::Triangle => triangle(g.advance.min(2000)),
             Shape::Composite(p) => composite(p),
+            Shape::Mixed(p) => mixed(p),
         };
         push(bytes, g.advance, &mut glyf);
     }
-    be32(&mut loca, glyf.len() as u32);
+    offsets.push(glyf.len() as u32);
+    let mut loca = Vec::new();
+    for off in &offsets {
+        if style.short_loca {
+            be16(&mut loca, (off / 2) as u16);
+        } else {
+            be32(&mut loca, *off);
+        }
+    }
 
     let mut head = Vec::new();
     be32(&mut head, 0x0001_0000);
@@ -189,7 +245,7 @@ pub fn build_with(glyphs: &[SynthGlyph], units: u16, fs_type: u16, style: &Style
     );
     be16(&mut head, 8);
     be16(&mut head, 2);
-    be16(&mut head, 1); // long loca
+    be16(&mut head, u16::from(!style.short_loca)); // indexToLocFormat
     be16(&mut head, 0);
 
     let mut hhea = Vec::new();
@@ -231,7 +287,17 @@ pub fn build_with(glyphs: &[SynthGlyph], units: u16, fs_type: u16, style: &Style
 
     let mut os2 = Vec::new();
     be16(&mut os2, 3);
-    os2.extend_from_slice(&[0; 6]);
+    be16(&mut os2, 0);
+    let default_weight = if style.bold { 700 } else { 400 };
+    be16(
+        &mut os2,
+        if style.weight == 0 {
+            default_weight
+        } else {
+            style.weight
+        },
+    );
+    be16(&mut os2, 0);
     be16(&mut os2, fs_type);
     os2.resize(96, 0);
 
@@ -250,7 +316,7 @@ pub fn build_with(glyphs: &[SynthGlyph], units: u16, fs_type: u16, style: &Style
         tables.push((b"loca", loca));
     }
     if let Some(family) = &style.family {
-        tables.push((b"name", name_table(family, style.bold, style.italic)));
+        tables.push((b"name", name_table(style, family)));
     }
     tables.sort_by_key(|(t, _)| **t);
     assemble_as(if style.cff { 0x4F54_544F } else { 0x0001_0000 }, &tables)

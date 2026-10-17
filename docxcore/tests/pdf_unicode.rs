@@ -20,7 +20,7 @@ mod pdf_read;
 #[path = "common/synth_font.rs"]
 mod synth_font;
 
-use docx_build::docx;
+use docx_build::{docx, docx_with_header};
 use pdf_read::{body_text, decoded, shown, text_of, validate};
 use synth_font::{SynthGlyph, build, glyph};
 
@@ -34,6 +34,26 @@ struct TestFace {
 }
 
 impl TestFace {
+    /// A face whose `alias` chars share the glyph of the char they map to
+    /// (a font that gives U+00A0 the glyph of U+0020), and whose font bytes
+    /// are `data` when given.
+    fn custom(
+        id: u64,
+        glyphs: &[(char, u16)],
+        alias: &[(char, char)],
+        data: Option<Vec<u8>>,
+    ) -> Rc<TestFace> {
+        let mut face = Rc::try_unwrap(TestFace::new(id, glyphs)).unwrap();
+        for &(extra, of) in alias {
+            let gid = face.map[&of];
+            face.map.insert(extra, gid);
+        }
+        if let Some(data) = data {
+            face.data = data.into();
+        }
+        Rc::new(face)
+    }
+
     fn new(id: u64, glyphs: &[(char, u16)]) -> Rc<TestFace> {
         let synth: Vec<SynthGlyph> = glyphs.iter().map(|&(c, a)| glyph(c, a)).collect();
         Rc::new(TestFace {
@@ -431,5 +451,161 @@ fn qpdf_accepts_the_file_when_installed() {
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn right_to_left_rows_are_in_the_provided_order_with_offsets_from_the_advances() {
+    // Hebrew letters are 500 units, the space 250, at the body's 11 pt.
+    let bidi = {
+        #[derive(Debug)]
+        struct Flip;
+        impl BidiProjector for Flip {
+            fn project_line(
+                &self,
+                _: BidiBaseDirection,
+                glyphs: &[BidiInputGlyph],
+            ) -> BidiVisualLine {
+                BidiVisualLine {
+                    clusters: (0..glyphs.len())
+                        .rev()
+                        .enumerate()
+                        .map(|(k, i)| BidiVisualCluster {
+                            glyphs: vec![i],
+                            logical: None,
+                            level: 1,
+                            cells: k..k + 1,
+                        })
+                        .collect(),
+                    width: glyphs.len(),
+                }
+            }
+        }
+        Rc::new(Flip)
+    };
+    let bytes = docx(
+        r#"<w:p><w:pPr><w:bidi/></w:pPr><w:r><w:t xml:space="preserve">שלום </w:t></w:r></w:p>"#,
+    );
+    let (mut opts, pkg) = opts_for(&bytes, Some(provider(&world_glyphs())));
+    opts.bidi = Some(bidi);
+    let pdf = to_pdf(&pkg.document, &opts);
+    let run = shown(&pdf)[0]
+        .iter()
+        .find(|s| s.text.contains('ש'))
+        .cloned()
+        .unwrap();
+    // Logical שלום + the trailing space is trimmed by wrapping: four letters.
+    assert_eq!(run.text, "שלום");
+    // From one glyph's end to the next one's start, to the left: (w + w).
+    assert_eq!(run.adjusts, [1000.0, 1000.0, 1000.0], "{run:?}");
+    assert_eq!(run.size, 11.0);
+}
+
+#[test]
+fn a_header_watermark_prints_through_the_embedded_fonts() {
+    let mark = r#"<w:p><w:r><w:pict><v:shape id="PowerPlusWaterMarkObject"><v:textpath string="Draft Ж"/></v:shape></w:pict></w:r></w:p>"#;
+    let bytes = docx_with_header(&para("body"), mark);
+    let (opts, pkg) = opts_for(&bytes, Some(provider(&world_glyphs())));
+    let (pdf, report) = to_pdf_report(&pkg.document, &opts);
+    assert_eq!(report.missing_chars, 0);
+    let objs = validate(&pdf);
+    let content = objs
+        .values()
+        .filter(|o| o.stream.is_some() && o.dict.contains("/FlateDecode"))
+        .map(|o| String::from_utf8_lossy(&decoded(o)).into_owned())
+        .find(|c| c.contains("cm"))
+        .expect("a page with a rotated watermark");
+    assert_eq!(
+        content.matches("\nq\n").count() + content.starts_with("q\n") as usize,
+        content.matches("\nQ\n").count(),
+        "q/Q balanced: {content}"
+    );
+    assert!(shown(&pdf)[0].iter().any(|s| s.text == "Draft Ж"));
+}
+
+#[test]
+fn a_glyph_shared_by_space_and_nbsp_extracts_as_a_space() {
+    // A no-break space comes first; the ordinary spaces share its glyph.
+    let face = TestFace::custom(
+        1,
+        &[(' ', 250), ('a', 600), ('b', 600)],
+        &[('\u{a0}', ' ')],
+        None,
+    );
+    let p = Rc::new(Provider {
+        main: Some(face),
+        fallbacks: Vec::new(),
+    });
+    let pdf = export(&para("a\u{a0}b a b"), Some(p));
+    let objs = validate(&pdf);
+    let cmap = objs
+        .values()
+        .filter(|o| o.stream.is_some() && o.dict.contains("/FlateDecode"))
+        .map(|o| String::from_utf8_lossy(&decoded(o)).into_owned())
+        .find(|c| c.contains("begincmap"))
+        .unwrap();
+    assert!(cmap.contains("<0001> <0020>"), "{cmap}");
+    assert!(!cmap.contains("00A0"), "{cmap}");
+}
+
+#[test]
+fn an_unsubsettable_font_is_never_embedded_as_garbage() {
+    let face = TestFace::custom(
+        1,
+        &[(' ', 250), ('a', 600)],
+        &[],
+        Some(b"not a font".to_vec()),
+    );
+    let p = Rc::new(Provider {
+        main: Some(face),
+        fallbacks: Vec::new(),
+    });
+    let pdf = export(&para("aa"), Some(p));
+    let s = String::from_utf8_lossy(&pdf);
+    assert!(
+        s.contains("/FontDescriptor") && !s.contains("/FontFile2"),
+        "no font file"
+    );
+    validate(&pdf);
+    assert_eq!(body_text(&pdf), "aa", "the text still extracts");
+}
+
+/// Counts the lines the projector is asked about.
+#[derive(Debug, Default)]
+struct Counting(std::cell::Cell<usize>);
+
+impl BidiProjector for Counting {
+    fn project_line(&self, _: BidiBaseDirection, glyphs: &[BidiInputGlyph]) -> BidiVisualLine {
+        self.0.set(self.0.get() + 1);
+        BidiVisualLine {
+            clusters: (0..glyphs.len())
+                .map(|i| BidiVisualCluster {
+                    glyphs: vec![i],
+                    logical: None,
+                    level: 0,
+                    cells: i..i + 1,
+                })
+                .collect(),
+            width: glyphs.len(),
+        }
+    }
+}
+
+#[test]
+fn a_latin_line_in_a_right_to_left_paragraph_is_still_projected() {
+    let calls = |body: &str| {
+        let bytes = docx(body);
+        let (mut opts, pkg) = opts_for(&bytes, Some(provider(&world_glyphs())));
+        let counting = Rc::new(Counting::default());
+        opts.bidi = Some(counting.clone());
+        to_pdf(&pkg.document, &opts);
+        counting.0.get()
+    };
+    let rtl = r#"<w:p><w:pPr><w:bidi/></w:pPr><w:r><w:t>Word 2016.</w:t></w:r></w:p>"#;
+    assert!(calls(rtl) > 0, "an RTL base moves the edge neutrals");
+    assert_eq!(
+        calls(&para("Word 2016.")),
+        0,
+        "plain Latin needs no projector"
     );
 }

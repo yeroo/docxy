@@ -1,5 +1,5 @@
 //! System fonts for PDF export: the [`PdfFontProvider`] that terminal `docxy`
-//! and the suite give `docxcore::export::to_pdf`.
+//! gives `docxcore::export::to_pdf`.
 //!
 //! `docxcore` embeds and subsets the font bytes it is handed; this crate finds
 //! them. [`FontSet`] indexes the font files of a few directories by reading
@@ -8,10 +8,12 @@
 //! (Arial Unicode, Noto, DejaVu, PingFang, Malgun, ...) for characters the
 //! run's own face lacks.
 //!
-//! Only TrueType-outline (`glyf`) faces are offered: `docxcore`'s subsetter
-//! reads `glyf`/`loca`, so a CFF face counts as no face. A face whose OS/2
-//! `fsType` forbids embedding is left out too. Either way the characters it
-//! would have shown land in the export's report.
+//! Only TrueType-outline (`glyf`) faces that `docxcore`'s subsetter can read
+//! (consistent `loca`/`glyf`) are offered, so a CFF face counts as no face. A
+//! face whose OS/2 `fsType` forbids embedding or subsetting is left out too
+//! (restricted licence unless a preview/editable bit lifts it; no subsetting;
+//! bitmap embedding only). Either way the characters it would have shown land
+//! in the export's report.
 
 use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
@@ -33,8 +35,8 @@ fn system_dirs() -> Vec<PathBuf> {
     if cfg!(target_os = "macos") {
         dirs.extend(
             [
+                // Supplemental is below it, and the scan recurses.
                 "/System/Library/Fonts",
-                "/System/Library/Fonts/Supplemental",
                 "/Library/Fonts",
             ]
             .map(PathBuf::from),
@@ -143,8 +145,8 @@ fn read_at(f: &mut File, at: u64, len: usize) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// The number of faces in `f` (1 for a plain sfnt) and the sfnt header offset
-/// of face `index`.
+/// The sfnt header offset of every face in `f` (one, 0, for a plain sfnt; at
+/// most 256 for a collection).
 fn face_offsets(f: &mut File) -> Option<Vec<u64>> {
     let head = read_at(f, 0, 12)?;
     if &head[..4] == b"ttcf" {
@@ -212,13 +214,78 @@ fn mini_sfnt(tables: &[([u8; 4], Vec<u8>)]) -> Vec<u8> {
     out
 }
 
+/// Every string of name `id`: Unicode and Windows records, else Macintosh
+/// Roman ones (older Apple faces carry their names on that platform only).
+/// Mac Roman is read as ASCII, which family and PostScript names are; a name
+/// with other bytes is skipped.
+fn name_strings(names: &ttf_parser::name::Table, id: u16) -> Vec<String> {
+    names
+        .names
+        .into_iter()
+        .filter(|n| n.name_id == id)
+        .filter_map(|n| {
+            if n.is_unicode() {
+                n.to_string()
+            } else if n.platform_id == ttf_parser::name::PlatformId::Macintosh
+                && n.encoding_id == 0
+                && n.name.is_ascii()
+            {
+                Some(String::from_utf8_lossy(n.name).into_owned())
+            } else {
+                None
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// A font file's face in the index.
 struct Entry {
     path: PathBuf,
     index: u32,
-    family: String,
-    bold: bool,
+    /// The legacy (ID 1) and typographic (ID 16) family names; a document may
+    /// use either.
+    families: Vec<String>,
+    /// OS/2 `usWeightClass` (400 regular, 700 bold).
+    weight: u16,
     italic: bool,
+}
+
+/// Whether OS/2 `fsType` lets the face be embedded as a subset: not "bitmap
+/// embedding only" (0x0200), not "no subsetting" (0x0100), and not "restricted
+/// licence" (0x0002) unless a preview or editable bit (0x0004, 0x0008) lifts it.
+fn embeddable(fs_type: u16) -> bool {
+    fs_type & 0x0300 == 0 && (fs_type & 0x0002 == 0 || fs_type & 0x000C != 0)
+}
+
+/// Whether `docxcore`'s subsetter can read the face: the tables it rewrites
+/// are there and `loca` points inside `glyf`, in order.
+fn subsettable(f: &mut File, dir: &[TableRef]) -> Option<()> {
+    for tag in [b"hhea", b"hmtx"] {
+        find_table(dir, tag)?;
+    }
+    let head = read_table(f, find_table(dir, b"head")?)?;
+    let maxp = read_table(f, find_table(dir, b"maxp")?)?;
+    let glyf_len = find_table(dir, b"glyf")?.len as usize;
+    let loca = read_table(f, find_table(dir, b"loca")?)?;
+    let count = u16_at(&maxp, 4)? as usize;
+    let long = u16_at(&head, 50)? != 0;
+    let at = |i: usize| -> Option<usize> {
+        if long {
+            Some(u32_at(&loca, 4 * i)? as usize)
+        } else {
+            Some(u16_at(&loca, 2 * i)? as usize * 2)
+        }
+    };
+    let mut last = 0;
+    for i in 0..=count {
+        let off = at(i)?;
+        if off < last || off > glyf_len {
+            return None;
+        }
+        last = off;
+    }
+    Some(())
 }
 
 /// The family and style of face `idx` of `path`, `None` when it is not a
@@ -227,29 +294,30 @@ fn index_face(f: &mut File, path: &Path, idx: u32, base: u64) -> Option<Entry> {
     let dir = read_directory(f, base)?;
     find_table(&dir, b"glyf")?;
     find_table(&dir, b"loca")?;
-    if let Some(os2) = find_table(&dir, b"OS/2") {
-        let os2 = read_at(f, os2.offset as u64, (os2.len as usize).min(10))?;
-        if u16_at(&os2, 8)? & 0x0002 != 0 {
-            return None; // restricted licence embedding
-        }
-    }
-    let name = read_table(f, find_table(&dir, b"name")?)?;
     let head = read_table(f, find_table(&dir, b"head")?)?;
     let mac_style = u16_at(&head, 44)?;
+    let mut weight = if mac_style & 1 != 0 { 700 } else { 400 };
+    if let Some(os2) = find_table(&dir, b"OS/2") {
+        let os2 = read_at(f, os2.offset as u64, (os2.len as usize).min(10))?;
+        if !embeddable(u16_at(&os2, 8)?) {
+            return None;
+        }
+        weight = u16_at(&os2, 4).filter(|w| *w > 0).unwrap_or(weight);
+    }
+    subsettable(f, &dir)?;
+    let name = read_table(f, find_table(&dir, b"name")?)?;
     let names = ttf_parser::name::Table::parse(&name)?;
-    let pick = |id: u16| {
-        names
-            .names
-            .into_iter()
-            .filter(|n| n.name_id == id && n.is_unicode())
-            .find_map(|n| n.to_string())
-    };
-    let family = pick(16).or_else(|| pick(1))?;
+    let mut families = name_strings(&names, 16);
+    families.extend(name_strings(&names, 1));
+    families.dedup();
+    if families.is_empty() {
+        return None;
+    }
     Some(Entry {
         path: path.to_path_buf(),
         index: idx,
-        family,
-        bold: mac_style & 1 != 0,
+        families,
+        weight,
         italic: mac_style & 2 != 0,
     })
 }
@@ -337,6 +405,11 @@ impl SysFace {
                 tables.push((*tag, read_table(&mut f, t)?));
             }
         }
+        let name_table = tables
+            .iter()
+            .find(|(tag, _)| tag == b"name")
+            .map(|(_, data)| data.clone())
+            .unwrap_or_default();
         let mini = mini_sfnt(&tables);
         let face = ttf_parser::Face::parse(&mini, 0).ok()?;
         let mut cmap = HashMap::new();
@@ -352,11 +425,8 @@ impl SysFace {
         let advances = (0..face.number_of_glyphs())
             .map(|g| face.glyph_hor_advance(ttf_parser::GlyphId(g)).unwrap_or(0))
             .collect();
-        let ps_name = face
-            .names()
-            .into_iter()
-            .filter(|n| n.name_id == 6 && n.is_unicode())
-            .find_map(|n| n.to_string())
+        let ps_name = ttf_parser::name::Table::parse(&name_table)
+            .and_then(|names| name_strings(&names, 6).into_iter().next())
             .unwrap_or_else(|| {
                 path.file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
@@ -402,9 +472,14 @@ impl PdfFace for SysFace {
         self.descent
     }
     fn sfnt(&self) -> Rc<[u8]> {
-        self.data
-            .get_or_init(|| std::fs::read(&self.path).unwrap_or_default().into())
-            .clone()
+        // A failed read is not kept, so a later call can try again.
+        if let Some(data) = self.data.get() {
+            return data.clone();
+        }
+        match std::fs::read(&self.path) {
+            Ok(bytes) if !bytes.is_empty() => self.data.get_or_init(|| bytes.into()).clone(),
+            _ => Rc::from(Vec::new()),
+        }
     }
     fn face_index(&self) -> u32 {
         self.index
@@ -478,7 +553,11 @@ impl FontSet {
 
     /// The families found, sorted.
     pub fn families(&self) -> Vec<String> {
-        let mut f: Vec<String> = self.entries().iter().map(|e| e.family.clone()).collect();
+        let mut f: Vec<String> = self
+            .entries()
+            .iter()
+            .flat_map(|e| e.families.iter().cloned())
+            .collect();
         f.sort();
         f.dedup();
         f
@@ -494,16 +573,19 @@ impl FontSet {
             .clone()
     }
 
-    /// The best face of `family` for the style: the style asked for, else the
-    /// closest.
+    /// The best face of `family` (its legacy or typographic name) for the
+    /// style: the slant asked for, then the weight nearest 400 (700 when bold),
+    /// then the first by path.
     fn best(&self, family: &str, bold: bool, italic: bool) -> Option<Rc<dyn PdfFace>> {
+        let target = if bold { 700 } else { 400 };
         let entry = self
             .entries()
             .iter()
-            .filter(|e| e.family.eq_ignore_ascii_case(family))
+            .filter(|e| e.families.iter().any(|f| f.eq_ignore_ascii_case(family)))
             .max_by_key(|e| {
                 (
-                    u8::from(e.bold == bold) * 2 + u8::from(e.italic == italic),
+                    e.italic == italic,
+                    std::cmp::Reverse((e.weight as i32 - target).abs()),
                     std::cmp::Reverse((&e.path, e.index)),
                 )
             })?;

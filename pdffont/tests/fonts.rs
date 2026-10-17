@@ -36,16 +36,24 @@ impl Drop for Dir {
 }
 
 fn font(family: &str, bold: bool, italic: bool, fs_type: u16, cff: bool) -> Vec<u8> {
-    build_with(
-        &[glyph('A', 600), glyph('i', 250), glyph('Ж', 700)],
-        1000,
+    styled(
         fs_type,
-        &Style {
+        Style {
             family: Some(family.into()),
             bold,
             italic,
             cff,
+            ..Style::default()
         },
+    )
+}
+
+fn styled(fs_type: u16, style: Style) -> Vec<u8> {
+    build_with(
+        &[glyph('A', 600), glyph('i', 250), glyph('Ж', 700)],
+        1000,
+        fs_type,
+        &style,
     )
 }
 
@@ -161,6 +169,116 @@ fn script_fallbacks_are_the_known_families_present() {
 }
 
 #[test]
+fn faces_named_on_the_mac_platform_only_are_indexed() {
+    let d = Dir::new("macnames");
+    d.write(
+        "helv.ttf",
+        &styled(
+            0,
+            Style {
+                family: Some("Helvetica".into()),
+                mac_names: true,
+                ..Style::default()
+            },
+        ),
+    );
+    let set = d.set();
+    assert_eq!(set.families(), ["Helvetica"]);
+    let face = set.face("Helvetica", false, false).unwrap();
+    assert_eq!(face.ps_name(), "Helvetica-Regular", "PostScript name too");
+}
+
+#[test]
+fn a_plain_request_takes_the_weight_nearest_regular_not_the_first_file() {
+    let d = Dir::new("weights");
+    let weight = |name: &str, w: u16, bold: bool| {
+        styled(
+            0,
+            Style {
+                family: Some(format!("Avenir Next {name}").trim().into()),
+                typographic: Some("Avenir Next".into()),
+                weight: w,
+                bold,
+                ..Style::default()
+            },
+        )
+    };
+    // The Demi Bold file sorts first, as Avenir Next.ttc's face 2 does.
+    d.write("a-demi.ttf", &weight("Demi Bold", 600, false));
+    d.write("b-regular.ttf", &weight("", 400, false));
+    d.write("c-black.ttf", &weight("Heavy", 900, false));
+    d.write("d-bold.ttf", &weight("Bold", 700, true));
+    let set = d.set();
+    let name = |bold| set.face("Avenir Next", bold, false).unwrap().ps_name();
+    assert_eq!(name(false), "AvenirNext-Regular");
+    assert_eq!(name(true), "AvenirNextBold-Bold");
+    // A document that names the legacy family finds that face.
+    assert_eq!(
+        set.face("Avenir Next Demi Bold", false, false)
+            .unwrap()
+            .ps_name(),
+        "AvenirNextDemiBold-Regular"
+    );
+    assert!(set.families().contains(&"Avenir Next Heavy".to_string()));
+}
+
+#[test]
+fn embedding_bits_decide_which_faces_are_offered() {
+    let d = Dir::new("fstype");
+    for (file, family, fs) in [
+        ("installable.ttf", "Installable", 0x0000),
+        ("restricted.ttf", "Restricted", 0x0002),
+        ("preview.ttf", "Preview", 0x0004),
+        ("editable.ttf", "Editable", 0x0008),
+        // Old OS/2 tables set 0x0002 beside a lifting bit.
+        ("lifted.ttf", "Lifted", 0x000A),
+        ("nosubset.ttf", "NoSubset", 0x0100),
+        ("bitmaponly.ttf", "BitmapOnly", 0x0200),
+    ] {
+        d.write(file, &font(family, false, false, fs, false));
+    }
+    assert_eq!(
+        d.set().families(),
+        ["Editable", "Installable", "Lifted", "Preview"]
+    );
+}
+
+#[test]
+fn a_face_the_subsetter_cannot_read_is_not_offered() {
+    let d = Dir::new("badloca");
+    let mut bytes = font("Broken", false, false, 0, false);
+    // loca entries past the end of glyf.
+    let tables = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+    for t in 0..tables {
+        let at = 12 + 16 * t;
+        if &bytes[at..at + 4] == b"loca" {
+            let off = u32::from_be_bytes(bytes[at + 8..at + 12].try_into().unwrap()) as usize;
+            bytes[off + 8..off + 12].copy_from_slice(&0x00FF_FFFFu32.to_be_bytes());
+        }
+    }
+    d.write("broken.ttf", &bytes);
+    d.write("fine.ttf", &font("Fine", false, false, 0, false));
+    assert_eq!(d.set().families(), ["Fine"]);
+}
+
+#[test]
+fn a_short_loca_face_is_offered() {
+    let d = Dir::new("shortloca");
+    d.write(
+        "short.ttf",
+        &styled(
+            0,
+            Style {
+                family: Some("Short".into()),
+                short_loca: true,
+                ..Style::default()
+            },
+        ),
+    );
+    assert_eq!(d.set().families(), ["Short"]);
+}
+
+#[test]
 fn an_empty_set_offers_nothing() {
     let set = FontSet::from_dirs(vec![PathBuf::from("/no/such/dir")]);
     assert!(set.is_empty());
@@ -212,18 +330,28 @@ fn this_machines_fonts_cover_latin_when_it_has_any() {
 }
 
 #[test]
-fn this_machines_fallbacks_reach_cyrillic_when_present() {
+fn this_machines_fallbacks_reach_cyrillic_when_it_has_such_a_face() {
     let set = FontSet::shared();
-    let any = set
+    // Skip only when no face on the machine covers Cyrillic at all.
+    let has_any = set.families().iter().any(|f| {
+        [false, true].iter().any(|&b| {
+            set.face(f, b, false)
+                .is_some_and(|face| face.glyph('Ж').is_some())
+        })
+    });
+    if !has_any {
+        eprintln!(
+            "this_machines_fallbacks_reach_cyrillic_when_it_has_such_a_face: skipped, no face with Cyrillic"
+        );
+        return;
+    }
+    let reach = set
         .fallbacks()
         .iter()
         .chain(set.face("Arial", false, false).iter())
         .any(|f| f.glyph('Ж').is_some());
-    if set.is_empty() || !any {
-        eprintln!(
-            "this_machines_fallbacks_reach_cyrillic_when_present: skipped, no face with Cyrillic"
-        );
-        return;
-    }
-    assert!(any);
+    assert!(
+        reach,
+        "a Cyrillic face exists but neither the default nor a fallback has it"
+    );
 }

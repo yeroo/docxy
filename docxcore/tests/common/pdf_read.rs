@@ -178,6 +178,10 @@ pub struct Shown {
     pub y: f32,
     pub text: String,
     pub tj: bool,
+    /// The numbers of a TJ array, in order: each moves the pen left by that
+    /// many thousandths of the font size.
+    pub adjusts: Vec<f32>,
+    pub size: f32,
 }
 
 /// Every show-text operation of each page's content, in stream order, with
@@ -209,7 +213,7 @@ pub fn shown(pdf: &[u8]) -> Vec<Vec<Shown>> {
         }
         let content = String::from_utf8_lossy(&decoded(&objs[&content_id])).into_owned();
         let mut out = Vec::new();
-        let (mut font, mut x, mut y) = (String::new(), 0.0, 0.0);
+        let (mut font, mut x, mut y, mut size) = (String::new(), 0.0, 0.0, 0.0);
         for line in content.lines() {
             let t: Vec<&str> = line.split_whitespace().collect();
             let Some(bt) = t.iter().position(|w| *w == "BT") else {
@@ -218,6 +222,7 @@ pub fn shown(pdf: &[u8]) -> Vec<Vec<Shown>> {
             let t = &t[bt + 1..];
             if let Some(i) = t.iter().position(|w| *w == "Tf") {
                 font = t[i - 2].trim_start_matches('/').to_string();
+                size = t[i - 1].parse().unwrap();
             }
             if let Some(i) = t.iter().position(|w| *w == "Td") {
                 x = t[i - 2].parse().unwrap();
@@ -233,6 +238,16 @@ pub fn shown(pdf: &[u8]) -> Vec<Vec<Shown>> {
                 .trim_end_matches("Tj")
                 .trim();
             let mut text = String::new();
+            let mut adjusts = Vec::new();
+            if tj {
+                let inner = shown_part.trim_start_matches('[').trim_end_matches(']');
+                // The number after each `<hex>` string.
+                adjusts = inner
+                    .split('>')
+                    .skip(1)
+                    .filter_map(|seg| seg.split('<').next()?.trim().parse::<f32>().ok())
+                    .collect();
+            }
             if let Some(map) = fonts.get(&font) {
                 let mut s = shown_part;
                 while let Some(open) = s.find('<') {
@@ -258,6 +273,8 @@ pub fn shown(pdf: &[u8]) -> Vec<Vec<Shown>> {
                 y,
                 text,
                 tj,
+                adjusts,
+                size,
             });
         }
         pages.push(out);

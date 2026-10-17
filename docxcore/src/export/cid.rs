@@ -144,7 +144,12 @@ pub(super) fn draw(out: &mut Vec<u8>, book: &mut Book, p: &dyn PdfFontProvider, 
             let used = &mut book.faces[slot];
             used.gids.insert(gid);
             if gid != 0 {
-                used.text.entry(gid).or_insert_with(|| vec![ch]);
+                // One ToUnicode entry per glyph: keep the plainest character,
+                // so U+0020 and U+00A0 sharing a glyph extract as a space.
+                let kept = used.text.entry(gid).or_insert_with(|| vec![ch]);
+                if ch.is_ascii() && !kept.iter().all(char::is_ascii) {
+                    *kept = vec![ch];
+                }
             }
         }
         pieces.push(Piece { class, gid, ch, w });
@@ -261,8 +266,12 @@ impl Book {
                 pdf_name(&face.ps_name())
             );
             let sfnt = face.sfnt();
-            let font_file =
-                subset_sfnt(&sfnt, face.face_index(), &used.gids).unwrap_or_else(|| sfnt.to_vec());
+            // Never embed what cannot be subset unless it is a whole plain font
+            // (a collection, or an empty read, would leave the glyphs unshown).
+            let font_file = subset_sfnt(&sfnt, face.face_index(), &used.gids).or_else(|| {
+                let plain = matches!(sfnt.get(..4), Some([0, 1, 0, 0] | b"true"));
+                (plain && face.face_index() == 0).then(|| sfnt.to_vec())
+            });
             let widths: Vec<(u16, u32)> = used
                 .gids
                 .iter()
@@ -289,16 +298,20 @@ impl Book {
             let (asc, desc) = (to1000(face.ascent() as f32), to1000(face.descent() as f32));
             objs.push(
                 format!(
-                    "<< /Type /FontDescriptor /FontName /{name} /Flags 4 /FontBBox [0 {desc} 1000 {asc}] /ItalicAngle 0 /Ascent {asc} /Descent {desc} /CapHeight {} /StemV 80 /FontFile2 {} 0 R >>",
+                    "<< /Type /FontDescriptor /FontName /{name} /Flags 4 /FontBBox [0 {desc} 1000 {asc}] /ItalicAngle 0 /Ascent {asc} /Descent {desc} /CapHeight {} /StemV 80{} >>",
                     asc * 7 / 10,
-                    id + 3
+                    if font_file.is_some() {
+                        format!(" /FontFile2 {} 0 R", id + 3)
+                    } else {
+                        String::new()
+                    }
                 )
                 .into_bytes(),
             );
-            objs.push(stream(
-                &format!("/Length1 {} ", font_file.len()),
-                &font_file,
-            ));
+            objs.push(match &font_file {
+                Some(file) => stream(&format!("/Length1 {} ", file.len()), file),
+                None => b"null".to_vec(),
+            });
             objs.push(stream("", to_unicode_cmap(&cmap_entries).as_bytes()));
         }
         objs

@@ -124,8 +124,10 @@
   only), writes the Type0/CIDFontType2/`/W`/ToUnicode objects
   (`export/cid.rs`) and Flate-compresses with its own `deflate`. Parsing fonts
   and finding them is `pdffont` (ttf-parser, system directories, Office
-  aliases, script fallbacks); CFF faces and faces whose OS/2 `fsType` forbids
-  embedding are not offered.
+  aliases, script fallbacks, names on the Mac platform too, faces indexed under
+  both their legacy and typographic family and chosen by slant, then the weight
+  nearest 400/700); CFF faces, faces the subsetter cannot read and faces whose
+  OS/2 `fsType` forbids embedding or subsetting are not offered.
 - Layout measures through `export::Metrics`: Courier is 0.6 em per cell
   (unchanged, pinned by `docxcore/tests/pdf_legacy_bytes.rs`), a provider gives
   each cell its face's advance. Per character: the run's family face, a
@@ -139,7 +141,8 @@
   the glyphs sit visually. Known limits: Arabic is not joined (isolated
   forms), brackets are not mirrored in right-to-left text.
 - Terminal `docxy` embeds the machine's fonts (`$DOCXY_PDF_FONT_DIR`, a path
-  list, replaces them; empty means Courier only). The suite has no PDF
+  list, replaces them, indexed once per value; empty means none, so the plain
+  Courier file). The suite has no PDF
   export yet and `docxwasm` passes `None`. Unit tests set
   `TEST_PDF_FONTS`; the machine's fonts never reach them.
 - Tests build their TrueType in code (`docxcore/tests/common/synth_font.rs`)

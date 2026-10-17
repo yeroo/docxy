@@ -322,13 +322,21 @@ honors font families, sizes, colors, and page geometry. It is a separate render
 target fed from the same document model, and it lives in **`docxcore`** so it's
 pure and unit-testable (PDF bytes are deterministic — ideal for golden tests).
 
-**No font embedding needed.** PDF guarantees 14 **standard base fonts** present
+**Embedding is optional (#1508).** Without a font provider no embedding is needed: PDF guarantees 14 **standard base fonts** present
 in every reader: Helvetica / Times / Courier, each in regular, **bold**,
 *italic*, and bold-italic, plus Symbol/ZapfDingbats. We map the document's fonts
 to a base family (sans→Helvetica, serif→Times, mono→Courier) and pick the
 variant from run properties. The only data we ship is the **AFM glyph-width
 tables** for those base fonts (fixed, well-known) — needed for line breaking.
 This keeps the PDF writer from-scratch and dependency-free.
+
+With `PdfOptions::fonts` (a host-provided `PdfFontProvider`; `pdffont` finds
+system fonts) the writer instead embeds **subset TrueType** fonts as Identity-H
+CIDFontType2 with a `/W` array and a ToUnicode CMap (`docxcore::pdf_font`,
+`export/cid.rs`), measures lines in the faces' real advances through the
+`Metrics` seam, and Flate-compresses with `docxcore::deflate`. Characters no
+face covers fall back to Courier (WinAnsi) or `.notdef`, and are counted. The
+Courier file stays the output of hosts without fonts.
 
 **Layout engine** (`export/pdf_layout.rs` → `export/pdf_write.rs`):
 - Page size + margins from `sect_pr` (defaults: Letter/A4, 1" margins).
@@ -344,7 +352,7 @@ This keeps the PDF writer from-scratch and dependency-free.
 - **Images:** embedded as XObjects — JPEG via `DCTDecode` passthrough (raw
   bytes, no re-encode); PNG/other decoded (the `image` crate) to an RGB stream.
   Streams may be written **uncompressed** initially (valid PDF); FlateDecode
-  reuses the Phase-3 DEFLATE encoder once it exists.
+  reuses `docxcore::deflate`.
 - **Output:** a minimal but valid PDF (header, object table, xref, trailer) —
   exactly the kind of structured byte format we already write well for ZIP/OOXML.
 
@@ -407,7 +415,7 @@ scriptable without a terminal).
 | Show invisible symbols | `render::invisibles` + `F3` |
 | Bidirectional DOCX layout | `docxy::bidi` + `RenderOptions::bidi` + `LineMap` |
 | Images (kitty/ghostty/sixel…) | `render::image` + `ratatui-image` (§7a) |
-| Print / export to PDF | `docxcore::export` (standard-14 fonts) + `--pdf` / `:export pdf` (§7b) |
+| Print / export to PDF | `docxcore::export` (standard-14 fonts, or embedded subset fonts from a host provider, `pdffont`) + `--pdf` / `:export pdf` (§7b) |
 
 Every requested feature maps to a concrete module — nothing in the list is
 blocked or infeasible.

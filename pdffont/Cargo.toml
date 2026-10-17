@@ -1,6 +1,6 @@
 [package]
 name = "pdffont"
-description = "System font discovery for PDF export: the PdfFontProvider docxy and the suite hand to docxcore."
+description = "System font discovery for PDF export: the PdfFontProvider terminal docxy hands to docxcore."
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true

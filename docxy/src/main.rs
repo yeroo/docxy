@@ -431,9 +431,7 @@ fn pdf_fonts() -> Option<Rc<dyn PdfFontProvider>> {
     #[cfg(not(test))]
     {
         match std::env::var_os("DOCXY_PDF_FONT_DIR") {
-            Some(dirs) => Some(Rc::new(pdffont::FontSet::from_dirs(
-                std::env::split_paths(&dirs).collect(),
-            ))),
+            Some(dirs) => env_pdf_fonts(&dirs),
             None => Some(pdffont::FontSet::shared()),
         }
     }
@@ -443,6 +441,33 @@ fn pdf_fonts() -> Option<Rc<dyn PdfFontProvider>> {
 thread_local! {
     static TEST_PDF_FONTS: std::cell::RefCell<Option<Rc<dyn PdfFontProvider>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// The fonts of `$DOCXY_PDF_FONT_DIR`, indexed once per value on this thread;
+/// none (the plain Courier file) when it names no directory.
+#[cfg_attr(test, allow(dead_code))]
+fn env_pdf_fonts(dirs: &std::ffi::OsStr) -> Option<Rc<dyn PdfFontProvider>> {
+    thread_local! {
+        static SET: std::cell::RefCell<Option<(std::ffi::OsString, Rc<pdffont::FontSet>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let paths: Vec<std::path::PathBuf> = std::env::split_paths(dirs)
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
+    if paths.is_empty() {
+        return None;
+    }
+    SET.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if cell.as_ref().is_none_or(|(key, _)| key != dirs) {
+            *cell = Some((
+                dirs.to_os_string(),
+                Rc::new(pdffont::FontSet::from_dirs(paths)),
+            ));
+        }
+        cell.as_ref()
+            .map(|(_, set)| set.clone() as Rc<dyn PdfFontProvider>)
+    })
 }
 
 /// `opts` with the system fonts and the terminal's bidi order for PDF export.
