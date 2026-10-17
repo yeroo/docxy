@@ -40,14 +40,27 @@ test the manifest's group is drawn after the Task tab's own, its controls marked
 
 test a toggle runs its command and reads back checked as the plugin says
   open copy:../fixtures/project-clipboard.xml
+  assert dirty is false
   call ribbon-click {"tab":"Task","command":"fixture.flag"}
   assert status is Fixture: flag on
+  call ribbon-read {}
+  assert reply.tabs.1.groups.-1.commands.1.checked is true
+  # The toggle is a view switch stored in the plan's formatting (#1553): the
+  # plan is dirty, the switch survives a save as .yppx and a reload, and undo
+  # takes it back.
+  assert dirty is true
+  call save-as {"path":"flagged","format":"yppx"}
+  assert dirty is false
+  call proj.reload {}
   call ribbon-read {}
   assert reply.tabs.1.groups.-1.commands.1.checked is true
   call ribbon-click {"tab":"Task","command":"fixture.flag"}
   assert status is Fixture: flag off
   call ribbon-read {}
   assert reply.tabs.1.groups.-1.commands.1.checked is false
+  key ctrl+z
+  call ribbon-read {}
+  assert reply.tabs.1.groups.-1.commands.1.checked is true
 
 test a swatch sets the plan's palette (an edit) and the gallery follows
   open copy:../fixtures/project-clipboard.xml

@@ -270,6 +270,7 @@ fn view_json(v: &ProjectView) -> Json {
         ("palette", text(&formatting.palette)),
         ("link_style", text(&formatting.link_style)),
         ("gridlines", text(&formatting.gridlines)),
+        ("switches", formatting.switches_json()),
     ])
 }
 
