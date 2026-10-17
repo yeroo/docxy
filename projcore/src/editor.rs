@@ -128,6 +128,9 @@ pub struct Editor {
     /// off by default, as Project's "Show project summary task". While off
     /// it is never in `collapsed`.
     show_summary: bool,
+    /// `select` put the selection on the hidden project summary row
+    /// (automation): edits leave it there. Any other arrival moves off it.
+    sel_pinned: bool,
     undo: Vec<Project>,
     redo: Vec<Project>,
     dirty: bool,
@@ -171,6 +174,7 @@ impl Editor {
             sel_uid,
             collapsed: Default::default(),
             show_summary: false,
+            sel_pinned: false,
             undo: Vec::new(),
             redo: Vec::new(),
             dirty,
@@ -210,6 +214,7 @@ impl Editor {
         self.proj = proj;
         self.revision += 1;
         self.sel = 0;
+        self.sel_pinned = false;
         self.collapsed.clear();
         self.sel_off_hidden_summary();
         self.sel_uid = self.selected_uid();
@@ -229,6 +234,11 @@ impl Editor {
     /// Select a row, expanding any collapsed summary that hides it.
     pub fn select(&mut self, index: usize) {
         self.sel = index.min(self.proj.tasks.len().saturating_sub(1));
+        self.sel_pinned = self
+            .proj
+            .tasks
+            .get(self.sel)
+            .is_some_and(|t| t.is_project_summary());
         self.reveal(self.sel);
         self.sel_uid = self.selected_uid();
     }
@@ -431,7 +441,7 @@ impl Editor {
             // A clamped or shifted index: keep the summaries collapsed.
             self.sel = owner;
         }
-        if self.selected_uid() != self.sel_uid {
+        if !self.sel_pinned {
             self.sel_off_hidden_summary();
         }
         self.sel_uid = self.selected_uid();
@@ -502,6 +512,9 @@ impl Editor {
         }
         for step in 0..n {
             let i = (first + step) % n;
+            if !self.show_summary && self.proj.tasks[i].is_project_summary() {
+                continue;
+            }
             if self.proj.tasks[i]
                 .name
                 .to_lowercase()

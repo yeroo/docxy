@@ -58,7 +58,11 @@ impl Editor {
             }
             let parent = self.proj.tasks[..i]
                 .iter()
-                .rfind(|t| !t.is_null && t.outline_level < task.outline_level)
+                .rfind(|t| {
+                    !t.is_null
+                        && t.outline_level < task.outline_level
+                        && (self.show_summary || !t.is_project_summary())
+                })
                 .ok_or("The task has no subtasks to hide")?;
             parent.uid
         };
@@ -111,6 +115,7 @@ impl Editor {
             && let Some(&first) = self.visible_rows().first()
         {
             self.sel = first;
+            self.sel_pinned = false;
         }
     }
 
@@ -121,8 +126,20 @@ impl Editor {
         let Some(last) = rows.len().checked_sub(1) else {
             return 0;
         };
-        let at = rows.iter().rposition(|&r| r <= from).unwrap_or(0);
-        rows[at.saturating_add_signed(delta).min(last)]
+        // `from` may sit before the first shown row (the hidden summary).
+        let before = rows.partition_point(|&r| r <= from);
+        let at = match before.checked_sub(1) {
+            Some(at) => at.saturating_add_signed(delta),
+            None if delta > 0 => (delta - 1) as usize,
+            None => 0,
+        };
+        rows[at.min(last)]
+    }
+
+    /// Select the first visible row (row 0 when nothing is shown).
+    pub fn select_first_visible(&mut self) {
+        let first = self.visible_rows().first().copied().unwrap_or(0);
+        self.select(first);
     }
 
     /// Select the last visible row, keeping every summary collapsed.

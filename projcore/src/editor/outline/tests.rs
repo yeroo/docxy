@@ -369,14 +369,61 @@ fn a_hidden_project_summary_never_hides_its_tasks() {
 }
 
 #[test]
-fn undo_keeps_the_selection_off_the_hidden_summary() {
-    let mut ed = with_summary();
+fn undoing_the_delete_of_the_only_child_keeps_the_selection_off_the_summary() {
+    let mut ed = outline(&[(0, "Plan", 1), (1, "A", 1)]);
+    let mut proj = ed.project().clone();
+    proj.tasks[0].outline_level = 0;
+    ed = Editor::new(proj);
+    assert!(ed.project().tasks[0].is_project_summary());
     ed.select(1);
-    ed.rename(1, "A2").unwrap();
-    ed.undo();
-    assert_ne!(ed.sel(), 0);
+    ed.delete_task(1).unwrap();
+    // UID 0 is childless now: a plain row, shown and selected.
+    assert_eq!(ed.visible_rows(), [0]);
+    assert!(ed.undo());
+    assert!(ed.project().tasks[0].is_project_summary());
+    assert_eq!(ed.sel(), 1, "not the hidden summary");
+}
+
+#[test]
+fn automation_can_still_select_the_hidden_summary() {
+    let mut ed = with_summary();
     ed.select(0);
-    assert_eq!(ed.sel(), 0, "automation can still select it");
+    assert_eq!(ed.sel(), 0);
+    ed.rename(0, "Renamed").unwrap();
+    assert_eq!(ed.sel(), 0, "an edit leaves an explicit selection");
+}
+
+#[test]
+fn find_skips_the_hidden_summary_row() {
+    let mut ed = with_summary();
+    assert_eq!(ed.find_from_top("plan"), FindOutcome::NotFound);
+    assert_eq!(ed.find("s"), FindOutcome::Found(2));
+    assert_eq!(ed.find("s"), FindOutcome::Found(3), "S1");
+    assert_ne!(ed.sel(), 0);
+    ed.set_show_summary_task(true);
+    assert_eq!(ed.find_from_top("plan"), FindOutcome::Found(0));
+}
+
+#[test]
+fn stepping_from_the_hidden_summary_lands_on_the_first_shown_row() {
+    let ed = with_summary();
+    assert_eq!(ed.visible_step(0, 1), 1);
+    assert_eq!(ed.visible_step(0, -1), 1);
+    assert_eq!(ed.visible_step(1, 1), 2);
+    let mut ed = with_summary();
+    ed.select(3);
+    ed.select_first_visible();
+    assert_eq!(ed.sel(), 1);
+}
+
+#[test]
+fn hide_subtasks_does_not_take_the_hidden_summary_as_a_parent() {
+    let mut ed = with_summary();
+    assert!(
+        ed.hide_subtasks(1).is_err(),
+        "A has no parent but the summary"
+    );
+    assert_eq!(ed.hide_subtasks(3), Ok(2), "S1 collapses S");
 }
 
 #[test]
