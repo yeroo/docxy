@@ -24,6 +24,8 @@ buildinfo = { version = "0.5.0", path = "../buildinfo" }
 opccore = { version = "0.1.0", path = "../opccore" }
 # Path + version so `docxy` can be published once `docxcore` is on crates.io.
 docxcore = { version = "0.5.0", path = "../docxcore" }
+# System fonts for embedding in PDF export.
+pdffont = { version = "0.1.0", path = "../pdffont" }
 # The agent control surface (loopback-TCP + newline-JSON), used to drive the
 # live document from a sibling agwinterm pane.
 ctlcore = { version = "0.5.0", path = "../ctlcore" }

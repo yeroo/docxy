@@ -1,11 +1,13 @@
 //! PDF export ("print") — a from-scratch, dependency-free PDF writer.
 //!
-//! Phase 0 uses the **Courier** standard-14 base fonts (regular / bold /
-//! oblique / bold-oblique). Because Courier is monospaced (every glyph is
-//! 600/1000 em wide) we need no font embedding and no AFM width tables, and
-//! line-breaking is exact. Proportional output (Helvetica/Times with AFM
-//! metrics) is a later refinement. Output is deterministic, so it is golden-byte
-//! testable.
+//! Without a font provider it uses the **Courier** standard-14 base fonts
+//! (regular / bold / oblique / bold-oblique). Because Courier is monospaced
+//! (every glyph is 600/1000 em wide) we need no font embedding and no AFM
+//! width tables, and line-breaking is exact. That Courier file is the
+//! byte-stable path of hosts without fonts. With `PdfOptions::fonts` the text
+//! is embedded instead as subset CIDFontType2 fonts (`mod cid`) and lines
+//! break on the faces' real advances, through `Metrics`. Output is
+//! deterministic, so it is golden-byte testable.
 //!
 //! Covered now: paragraphs, runs (bold/italic/underline/strike/color),
 //! headings, lists, hyperlink annotations, and Word's page layout: page and
@@ -29,8 +31,12 @@ use crate::load::{Relationships, xml_attr_value};
 use crate::model::*;
 use crate::numbering::Numbering;
 use crate::package::{HeaderVariant, Package, SectionParts, TextWatermark, section_header_parts};
+use crate::pdf_font::{PdfFontProvider, PdfReport};
+use crate::render::{BidiBaseDirection, BidiInputGlyph, BidiProjector, BidiRunDirection};
 use crate::sect::LnRestart;
 use crate::styles::{PprFlag, StyleSheet};
+
+mod cid;
 
 #[derive(Debug, Clone)]
 pub struct PdfOptions {
@@ -64,6 +70,12 @@ pub struct PdfOptions {
     /// The list definitions (`word/numbering.xml`): the heading numbers a
     /// page number's chapter prefix (`w:chapStyle`) shows.
     pub numbering: Rc<Numbering>,
+    /// Where embedded faces come from. `None` prints with the built-in
+    /// Courier font (WinAnsi only) and the output is byte-for-byte what it was
+    /// before fonts could be embedded.
+    pub fonts: Option<Rc<dyn PdfFontProvider>>,
+    /// Puts each laid-out line into visual order (used only with `fonts`).
+    pub bidi: Option<Rc<dyn BidiProjector>>,
 }
 
 impl Default for PdfOptions {
@@ -84,6 +96,8 @@ impl Default for PdfOptions {
             gutter_at_top: false,
             background: None,
             numbering: Rc::new(Numbering::default()),
+            fonts: None,
+            bidi: None,
         }
     }
 }
@@ -149,6 +163,24 @@ impl PdfOptions {
 
 /// Render a document to PDF bytes.
 pub fn to_pdf(doc: &Document, opts: &PdfOptions) -> Vec<u8> {
+    to_pdf_report(doc, opts).0
+}
+
+/// [`to_pdf`], and what the export had to leave out (characters no face
+/// covers).
+pub fn to_pdf_report(doc: &Document, opts: &PdfOptions) -> (Vec<u8>, PdfReport) {
+    // Faces whose font file cannot be embedded count as absent from the start,
+    // so layout and the writer agree.
+    let checked;
+    let opts = match &opts.fonts {
+        Some(fonts) => {
+            let mut o = opts.clone();
+            o.fonts = Some(Rc::new(cid::Checked::new(fonts.clone())));
+            checked = o;
+            &checked
+        }
+        None => opts,
+    };
     let pages = Pager::run(doc, opts);
     write_pdf(&pages, opts)
 }
@@ -612,6 +644,87 @@ fn page_field_kind(instr: &str) -> Option<PageField> {
     }
 }
 
+/// How wide text prints. Layout and the writer both measure through this, so
+/// they agree. Without a font provider the built-in Courier face is a fixed
+/// 0.6 em per character; with one, each character is as wide as the face that
+/// shows it.
+#[derive(Clone, Copy)]
+struct Metrics<'a> {
+    fonts: Option<&'a dyn PdfFontProvider>,
+    bidi: Option<&'a dyn BidiProjector>,
+}
+
+impl<'a> Metrics<'a> {
+    #[cfg(test)]
+    fn courier() -> Metrics<'static> {
+        Metrics {
+            fonts: None,
+            bidi: None,
+        }
+    }
+
+    fn of(opts: &'a PdfOptions) -> Metrics<'a> {
+        Metrics {
+            fonts: opts.fonts.as_deref(),
+            bidi: opts.bidi.as_deref(),
+        }
+    }
+
+    /// The advance of one cell at `size`, in points.
+    fn advance(self, cell: &PCell, size: f32) -> f32 {
+        match self.fonts {
+            None => 0.6 * size,
+            Some(p) => cid::advance(p, cell.family.as_deref(), cell.font, cell.ch, size),
+        }
+    }
+
+    /// The width of `cells` at `size`.
+    fn width(self, cells: &[PCell], size: f32) -> f32 {
+        match self.fonts {
+            None => cells.len() as f32 * (0.6 * size),
+            Some(_) => cells.iter().map(|c| self.advance(c, size)).sum(),
+        }
+    }
+
+    /// The width of `text` in the style of `font` and `family` at `size`.
+    fn text_width(self, text: &str, size: f32, font: u8, family: Option<&str>) -> f32 {
+        match self.fonts {
+            None => text.chars().count() as f32 * (0.6 * size),
+            Some(p) => text
+                .chars()
+                .map(|ch| cid::advance(p, family, font, ch, size))
+                .sum(),
+        }
+    }
+
+    /// How many leading cells fit in `max_w` (at least one).
+    fn fit(self, cells: &[PCell], max_w: f32, size: f32) -> usize {
+        match self.fonts {
+            None => ((max_w / (0.6 * size)).floor() as usize).max(1),
+            Some(_) => {
+                let mut used = 0.0;
+                let mut n = 0;
+                for cell in cells {
+                    used += self.advance(cell, size);
+                    if used > max_w {
+                        break;
+                    }
+                    n += 1;
+                }
+                n.max(1)
+            }
+        }
+    }
+
+    /// A frame's width with no `w`: its longest line plus one more character.
+    fn frame_width(self, cells: &[PCell], size: f32) -> f32 {
+        match self.fonts {
+            None => (cells.len() + 1) as f32 * 0.6 * size,
+            Some(_) => self.width(cells, size) + self.advance(&plain_cell(' '), size),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct PCell {
     ch: char,
@@ -623,6 +736,10 @@ struct PCell {
     /// Part of a page field's result; `true` on the result's first cell, which
     /// carries the substituted value (the rest of the result is dropped).
     field: Option<(PageField, bool)>,
+    /// The run's font family (`w:rFonts w:ascii`), for an embedded face.
+    family: Option<Rc<str>>,
+    /// The run's own direction hint, for the bidi projector.
+    dir: BidiRunDirection,
 }
 
 /// A run of cells up to a break; `brk` is the break that ended it.
@@ -648,6 +765,10 @@ struct Frag {
     /// The body section a field sits in (SECTIONPAGES); header and footer
     /// fields count the page's own section.
     sect: Option<usize>,
+    family: Option<Rc<str>>,
+    /// A right-to-left stretch laid out right to left: `text` is logical, its
+    /// first char the rightmost. `x` stays the left edge.
+    back: bool,
 }
 
 type Link = ((f32, f32, f32, f32), String);
@@ -667,12 +788,19 @@ struct WatermarkDraw {
 impl WatermarkDraw {
     /// Place `mark` in the margin box `(left, bottom, right, top)`, Word's
     /// default (`mso-position-*-relative:margin`, centred).
-    fn place(mark: &TextWatermark, (left, bottom, right, top): (f32, f32, f32, f32)) -> Self {
-        let chars = mark.text.chars().count().max(1) as f32;
+    fn place(
+        mark: &TextWatermark,
+        (left, bottom, right, top): (f32, f32, f32, f32),
+        m: Metrics,
+    ) -> Self {
+        // The text's width at a size of 1 pt.
+        let em = m
+            .text_width(&mark.text, 1.0, 0, None)
+            .max(m.text_width("x", 1.0, 0, None));
         // "Auto" size stretches the text to the shape's width; without one, to
         // most of the text width. A set font size caps it.
         let width = mark.width_pt.unwrap_or(0.8 * (right - left));
-        let mut size = width / (chars * 0.6);
+        let mut size = width / em;
         if let Some(pt) = mark.font_size_pt {
             size = size.min(pt);
         }
@@ -826,6 +954,18 @@ fn run_color(p: &RunProps) -> (f32, f32, f32) {
     }
 }
 
+/// The font family and direction hint a run's cells carry.
+fn run_face(eff: &RunProps) -> (Option<Rc<str>>, BidiRunDirection) {
+    (
+        eff.font.as_deref().map(Rc::from),
+        if eff.rtl {
+            BidiRunDirection::Rtl
+        } else {
+            BidiRunDirection::Natural
+        },
+    )
+}
+
 fn font_index(bold: bool, italic: bool) -> u8 {
     match (bold, italic) {
         (true, true) => 3,
@@ -887,8 +1027,8 @@ fn emit_band<'b>(
 }
 
 /// A frame's content width in twips as this exporter draws it, for a frame
-/// with no `w` (Word sizes it to its content): the longest line's printed
-/// characters plus one, at the monospace advance of each paragraph's size.
+/// with no `w` (Word sizes it to its content): the longest line's width plus
+/// one more character, as [`Metrics`] measures it at each paragraph's size.
 fn content_w(g: &crate::frame::FrameGroup, opts: &PdfOptions) -> i32 {
     if g.frame.w.is_some_and(|w| w > 0) {
         return 0; // frame_rect takes `w`.
@@ -898,8 +1038,12 @@ fn content_w(g: &crate::frame::FrameGroup, opts: &PdfOptions) -> i32 {
         .map(|(_, p)| {
             let size = heading_size(p, opts.base_font_size);
             let segs = flatten_segments(p, p.props.heading_level.is_some(), &opts.styles);
-            let chars = segs.iter().map(|s| s.cells.len()).max().unwrap_or(0) + 1;
-            (chars as f32 * 0.6 * size * 20.0).ceil() as i32
+            let m = Metrics::of(opts);
+            let width = segs
+                .iter()
+                .map(|s| m.frame_width(&s.cells, size))
+                .fold(m.frame_width(&[], size), f32::max);
+            (width * 20.0).ceil() as i32
         })
         .max()
         .unwrap_or(0)
@@ -953,7 +1097,20 @@ fn emit_paragraph(flow: &mut dyn Flow, p: &Paragraph, opts: &PdfOptions) {
         bullet.extend(std::mem::take(&mut segs[0].cells));
         segs[0].cells = bullet;
     }
-    emit_segments(flow, segs, size, p.props.align);
+    let m = Metrics::of(opts);
+    let base = if m.bidi.is_some() {
+        match opts
+            .styles
+            .paragraph_rtl_override(p.props.style_id.as_deref(), &p.props)
+        {
+            Some(true) => BidiBaseDirection::Rtl,
+            Some(false) => BidiBaseDirection::Ltr,
+            None => BidiBaseDirection::Auto,
+        }
+    } else {
+        BidiBaseDirection::Auto
+    };
+    emit_segments(flow, segs, size, p.props.align, (m, base));
 }
 
 fn emit_table(flow: &mut dyn Flow, t: &Table, opts: &PdfOptions) {
@@ -981,13 +1138,30 @@ fn emit_table(flow: &mut dyn Flow, t: &Table, opts: &PdfOptions) {
                 .collect(),
             brk: None,
         };
-        emit_segments(flow, vec![seg], opts.base_font_size, Align::Left);
+        emit_segments(
+            flow,
+            vec![seg],
+            opts.base_font_size,
+            Align::Left,
+            (Metrics::of(opts), BidiBaseDirection::Auto),
+        );
     }
 }
 
-fn emit_segments(flow: &mut dyn Flow, segs: Vec<Seg>, size: f32, align: Align) {
+fn emit_segments(
+    flow: &mut dyn Flow,
+    segs: Vec<Seg>,
+    size: f32,
+    align: Align,
+    (m, base): (Metrics, BidiBaseDirection),
+) {
     let line_height = size * 1.35;
-    let advance = 0.6 * size;
+    // A right-to-left paragraph sits at the right edge, as the terminal does.
+    let align = if m.fonts.is_some() && base == BidiBaseDirection::Rtl && align == Align::Left {
+        Align::Right
+    } else {
+        align
+    };
     for seg in segs {
         // Wrap one line at a time: the column (and its width) can change when a
         // line overflows to the next column or page.
@@ -998,11 +1172,14 @@ fn emit_segments(flow: &mut dyn Flow, segs: Vec<Seg>, size: f32, align: Align) {
                 break;
             }
             let (col_x, col_w, y) = flow.next_line(line_height);
-            let cpl = ((col_w / advance).floor() as usize).max(1);
-            let (line, used) = take_line(rest, cpl);
+            let (line, used) = take_line(rest, m.fit(rest, col_w, size));
             rest = &rest[used..];
             first = false;
-            place_line(flow, &line, col_x, col_w, y, size, align);
+            if m.fonts.is_some() {
+                place_line_fonts(flow, &line, (col_x, col_w, y), size, align, (m, base));
+            } else {
+                place_line(flow, &line, (col_x, col_w, y), size, align, m);
+            }
             if rest.is_empty() {
                 break;
             }
@@ -1018,14 +1195,12 @@ fn emit_segments(flow: &mut dyn Flow, segs: Vec<Seg>, size: f32, align: Align) {
 fn place_line(
     flow: &mut dyn Flow,
     line: &[PCell],
-    col_x: f32,
-    col_w: f32,
-    y: f32,
+    (col_x, col_w, y): (f32, f32, f32),
     size: f32,
     align: Align,
+    m: Metrics,
 ) {
-    let advance = 0.6 * size;
-    let line_w = line.len() as f32 * advance;
+    let line_w = m.width(line, size);
     let off = match align {
         Align::Center => (col_w - line_w).max(0.0) / 2.0,
         Align::Right => (col_w - line_w).max(0.0),
@@ -1041,8 +1216,8 @@ fn place_line(
         }
         let cells = &line[start..i];
         let text: String = cells.iter().map(|c| c.ch).collect();
-        let fx = x0 + start as f32 * advance;
-        let span_w = (i - start) as f32 * advance;
+        let fx = x0 + m.width(&line[..start], size);
+        let span_w = m.width(cells, size);
         let link = c0.link.as_ref().map(|link| {
             (
                 (fx, y - 2.0, fx + span_w, y + size * 0.85),
@@ -1064,9 +1239,135 @@ fn place_line(
                 strike: c0.strike,
                 field,
                 sect: None,
+                family: None,
+                back: false,
             },
             link,
         );
+    }
+}
+
+/// The cells of `line` in left-to-right order (indices into `line`), by the
+/// host's bidi projector; logical order without one.
+fn visual_order(line: &[PCell], m: Metrics, base: BidiBaseDirection) -> Vec<usize> {
+    let identity = || (0..line.len()).collect::<Vec<_>>();
+    let Some(projector) = m.bidi else {
+        return identity();
+    };
+    // A left-to-right base with no right-to-left text is already in order;
+    // under a right-to-left base even a Latin line has its edge neutrals moved.
+    if base != BidiBaseDirection::Rtl
+        && !line
+            .iter()
+            .any(|c| c.dir != BidiRunDirection::Natural || c.ch as u32 >= 0x590)
+    {
+        return identity();
+    }
+    let input: Vec<BidiInputGlyph> = line
+        .iter()
+        .enumerate()
+        .map(|(i, c)| BidiInputGlyph {
+            ch: c.ch,
+            display: None,
+            logical_offset: Some(i),
+            direction: c.dir,
+        })
+        .collect();
+    let visual = projector.project_line(base, &input);
+    let mut seen = vec![false; line.len()];
+    let mut order = Vec::with_capacity(line.len());
+    for &idx in visual.clusters.iter().flat_map(|c| &c.glyphs) {
+        if idx < line.len() && !seen[idx] {
+            seen[idx] = true;
+            order.push(idx);
+        }
+    }
+    // A projector that dropped a cell must not make it vanish.
+    order.extend((0..line.len()).filter(|&i| !seen[i]));
+    order
+}
+
+/// [`place_line`] with real advances and the line in visual order: a stretch
+/// of same-styled cells that stays contiguous on the page is one fragment (its
+/// text in logical order, so extraction reads logically), and a right-to-left
+/// stretch is `back`.
+fn place_line_fonts(
+    flow: &mut dyn Flow,
+    line: &[PCell],
+    (col_x, col_w, y): (f32, f32, f32),
+    size: f32,
+    align: Align,
+    (m, base): (Metrics, BidiBaseDirection),
+) {
+    let w: Vec<f32> = line.iter().map(|c| m.advance(c, size)).collect();
+    let line_w: f32 = w.iter().sum();
+    let off = match align {
+        Align::Center => (col_w - line_w).max(0.0) / 2.0,
+        Align::Right => (col_w - line_w).max(0.0),
+        _ => 0.0,
+    };
+    let mut x = vec![0.0f32; line.len()];
+    let mut at = col_x + off;
+    for i in visual_order(line, m, base) {
+        x[i] = at;
+        at += w[i];
+    }
+    let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+    let mut i = 0;
+    while i < line.len() {
+        let c0 = &line[i];
+        let mut j = i + 1;
+        let mut back = false;
+        while j < line.len() {
+            let c = &line[j];
+            if !same_style(c, c0) || c.family != c0.family {
+                break;
+            }
+            let forward = near(x[j], x[j - 1] + w[j - 1]);
+            let backward = near(x[j] + w[j], x[j - 1]);
+            if j == i + 1 {
+                if forward {
+                    back = false;
+                } else if backward {
+                    back = true;
+                } else {
+                    break;
+                }
+            } else if (back && !backward) || (!back && !forward) {
+                break;
+            }
+            j += 1;
+        }
+        let cells = &line[i..j];
+        let width: f32 = w[i..j].iter().sum();
+        let left = if back { x[j - 1] } else { x[i] };
+        let link = c0.link.as_ref().map(|link| {
+            (
+                (left, y - 2.0, left + width, y + size * 0.85),
+                link.to_string(),
+            )
+        });
+        let field = c0
+            .field
+            .map(|(kind, _)| (kind, cells.iter().any(|c| c.field.is_some_and(|f| f.1))));
+        flow.push(
+            Frag {
+                x: left,
+                y,
+                text: cells.iter().map(|c| c.ch).collect(),
+                size,
+                font: c0.font,
+                color: c0.color,
+                underline: c0.underline,
+                strike: c0.strike,
+                field,
+                sect: None,
+                family: c0.family.clone(),
+                back,
+            },
+            link,
+        );
+        i = j;
     }
 }
 
@@ -1275,7 +1576,7 @@ impl<'a> Pager<'a> {
             .and_then(|a| opts.watermarks.get(&a.part_name))
             .into_iter()
             .flatten()
-            .map(|mark| WatermarkDraw::place(mark, margin_box))
+            .map(|mark| WatermarkDraw::place(mark, margin_box, Metrics::of(opts)))
             .collect();
         let mut body_bottom = s.bottom;
         let mut hf_frags = Vec::new();
@@ -1768,7 +2069,7 @@ impl Flow for Pager<'_> {
             let text = n.to_string();
             let size = self.opts.base_font_size;
             page.frags.push(Frag {
-                x: x - distance - text.len() as f32 * 0.6 * size,
+                x: x - distance - Metrics::of(self.opts).text_width(&text, size, 0, None),
                 y: self.y,
                 text,
                 size,
@@ -1778,6 +2079,8 @@ impl Flow for Pager<'_> {
                 strike: false,
                 field: None,
                 sect: None,
+                family: None,
+                back: false,
             });
         }
         // Count the column set, and its section, only once a line lands, so a
@@ -1851,6 +2154,8 @@ fn plain_cell(ch: char) -> PCell {
         strike: false,
         link: None,
         field: None,
+        family: None,
+        dir: BidiRunDirection::Natural,
     }
 }
 
@@ -1926,6 +2231,7 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Se
                 let eff = styles.effective_run(pstyle, r.props.style_id.as_deref(), &r.props);
                 let font = font_index(eff.bold || heading, eff.italic);
                 let color = run_color(&eff);
+                let (family, dir) = run_face(&eff);
                 let outer = fields
                     .first_mut()
                     .filter(|f| f.separated && f.kind.is_some());
@@ -1948,6 +2254,8 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Se
                             strike: eff.strike,
                             link: None,
                             field,
+                            family: family.clone(),
+                            dir,
                         },
                     );
                 }
@@ -1986,6 +2294,7 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Se
                     };
                     let eff = styles.effective_run(pstyle, props.style_id.as_deref(), &props);
                     let (font, strike) = (font_index(eff.bold || heading, eff.italic), eff.strike);
+                    let (family, dir) = run_face(&eff);
                     for ch in text.chars() {
                         push(
                             &mut segs,
@@ -1997,6 +2306,8 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Se
                                 strike,
                                 link: Some(rc.clone()),
                                 field: None,
+                                family: family.clone(),
+                                dir,
                             },
                         );
                     }
@@ -2056,6 +2367,7 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Se
                     cell.underline = eff.underline;
                     cell.strike = eff.strike;
                     cell.field = kind.map(|k| (k, i == 0));
+                    (cell.family, cell.dir) = run_face(&eff);
                     push(&mut segs, cell);
                 }
             }
@@ -2197,7 +2509,8 @@ fn pdf_string_body(s: &str) -> Vec<u8> {
     out
 }
 
-fn build_content(page: &Page, opts: &PdfOptions) -> Vec<u8> {
+fn build_content(page: &Page, opts: &PdfOptions, mut book: Option<&mut cid::Book>) -> Vec<u8> {
+    let m = Metrics::of(opts);
     let mut s: Vec<u8> = Vec::new();
     if let Some(rgb) = opts.background {
         let (r, g, b) = rgb_f(rgb);
@@ -2212,7 +2525,7 @@ fn build_content(page: &Page, opts: &PdfOptions) -> Vec<u8> {
     for mark in &page.watermarks {
         let (sin, cos) = mark.angle.to_radians().sin_cos();
         let (r, g, b) = mark.color;
-        let width = mark.text.chars().count() as f32 * 0.6 * mark.size;
+        let width = m.text_width(&mark.text, mark.size, 0, None);
         s.extend(
             format!(
                 "q\n{r:.3} {g:.3} {b:.3} rg\n{cos:.4} {sin:.4} {:.4} {cos:.4} {:.2} {:.2} cm\n",
@@ -2221,17 +2534,32 @@ fn build_content(page: &Page, opts: &PdfOptions) -> Vec<u8> {
             .as_bytes(),
         );
         // Centred on the origin: half the width left, a third of the size down.
-        s.extend(
-            format!(
-                "BT /F0 {:.2} Tf {:.2} {:.2} Td (",
-                mark.size,
-                -width / 2.0,
-                -mark.size * 0.3
-            )
-            .as_bytes(),
-        );
-        s.extend(pdf_string_body(&mark.text));
-        s.extend(b") Tj ET\nQ\n");
+        if let (Some(book), Some(p)) = (book.as_deref_mut(), opts.fonts.as_deref()) {
+            let chars: Vec<char> = mark.text.chars().collect();
+            let text = cid::Text {
+                chars: &chars,
+                family: None,
+                font: 0,
+                size: mark.size,
+                left: -width / 2.0,
+                y: -mark.size * 0.3,
+                back: false,
+            };
+            cid::draw(&mut s, book, p, &text);
+            s.extend(b"Q\n");
+        } else {
+            s.extend(
+                format!(
+                    "BT /F0 {:.2} Tf {:.2} {:.2} Td (",
+                    mark.size,
+                    -width / 2.0,
+                    -mark.size * 0.3
+                )
+                .as_bytes(),
+            );
+            s.extend(pdf_string_body(&mark.text));
+            s.extend(b") Tj ET\nQ\n");
+        }
     }
     for rule in &page.rules {
         if !rule.dash.is_empty() {
@@ -2262,20 +2590,32 @@ fn build_content(page: &Page, opts: &PdfOptions) -> Vec<u8> {
             Some((kind, true)) => &page.values[kind as usize],
             None => &f.text,
         };
-        let n_chars = text.chars().count() as f32;
-        let advance = 0.6 * f.size;
-        let width = n_chars * advance;
+        let width = m.text_width(text, f.size, f.font, f.family.as_deref());
         // fill color for text
         s.extend(format!("{:.3} {:.3} {:.3} rg\n", f.color.0, f.color.1, f.color.2).as_bytes());
-        s.extend(
-            format!(
-                "BT /F{} {:.2} Tf {:.2} {:.2} Td (",
-                f.font, f.size, f.x, f.y
-            )
-            .as_bytes(),
-        );
-        s.extend(pdf_string_body(text));
-        s.extend(b") Tj ET\n");
+        if let (Some(book), Some(p)) = (book.as_deref_mut(), opts.fonts.as_deref()) {
+            let chars: Vec<char> = text.chars().collect();
+            let run = cid::Text {
+                chars: &chars,
+                family: f.family.as_deref(),
+                font: f.font,
+                size: f.size,
+                left: f.x,
+                y: f.y,
+                back: f.back,
+            };
+            cid::draw(&mut s, book, p, &run);
+        } else {
+            s.extend(
+                format!(
+                    "BT /F{} {:.2} Tf {:.2} {:.2} Td (",
+                    f.font, f.size, f.x, f.y
+                )
+                .as_bytes(),
+            );
+            s.extend(pdf_string_body(text));
+            s.extend(b") Tj ET\n");
+        }
         if f.underline || f.strike {
             s.extend(
                 format!(
@@ -2301,8 +2641,38 @@ fn build_content(page: &Page, opts: &PdfOptions) -> Vec<u8> {
     s
 }
 
-fn write_pdf(pages: &[Page], opts: &PdfOptions) -> Vec<u8> {
-    // Object ids: 1=Catalog, 2=Pages, 3..6=Fonts, then per-page content/annot/page.
+fn write_pdf(pages: &[Page], opts: &PdfOptions) -> (Vec<u8>, PdfReport) {
+    if opts.fonts.is_some() {
+        let mut book = cid::Book::default();
+        let contents: Vec<Vec<u8>> = pages
+            .iter()
+            .map(|page| build_content(page, opts, Some(&mut book)))
+            .collect();
+        let report = PdfReport {
+            missing_chars: book.missing,
+        };
+        if book.used() {
+            return (serialize_pdf(pages, contents, Some(&book)), report);
+        }
+        // No embedded face showed anything: the plain Courier file.
+        let contents = pages
+            .iter()
+            .map(|page| build_content(page, opts, None))
+            .collect();
+        return (serialize_pdf(pages, contents, None), report);
+    }
+    let contents = pages
+        .iter()
+        .map(|page| build_content(page, opts, None))
+        .collect();
+    (serialize_pdf(pages, contents, None), PdfReport::default())
+}
+
+/// The file for already-built page contents; `book` holds the embedded faces
+/// (and then the contents are Flate-compressed).
+fn serialize_pdf(pages: &[Page], contents: Vec<Vec<u8>>, book: Option<&cid::Book>) -> Vec<u8> {
+    // Object ids: 1=Catalog, 2=Pages, 3..6=Courier fonts, then 5 objects per
+    // embedded face (Type0 first), then per-page content/annot/page.
     let mut objs: Vec<Vec<u8>> = vec![Vec::new(), Vec::new()];
     const FONTS: [&str; 4] = [
         "Courier",
@@ -2319,17 +2689,34 @@ fn write_pdf(pages: &[Page], opts: &PdfOptions) -> Vec<u8> {
         );
     }
 
+    let mut face_fonts = String::new();
+    if let Some(book) = book {
+        let first = objs.len() + 1;
+        for (name, id) in book.resources(first) {
+            face_fonts.push_str(&format!(" /{name} {id} 0 R"));
+        }
+        objs.extend(book.objects(first));
+    }
+
     let mut page_ids: Vec<usize> = Vec::new();
-    for page in pages {
-        let content = build_content(page, opts);
-        objs.push(
+    for (page, content) in pages.iter().zip(contents) {
+        let content = if book.is_some() {
+            let z = crate::deflate::zlib(&content);
+            [
+                format!("<< /Length {} /Filter /FlateDecode >>\nstream\n", z.len()).into_bytes(),
+                z,
+                b"\nendstream".to_vec(),
+            ]
+            .concat()
+        } else {
             [
                 format!("<< /Length {} >>\nstream\n", content.len()).into_bytes(),
                 content,
                 b"\nendstream".to_vec(),
             ]
-            .concat(),
-        );
+            .concat()
+        };
+        objs.push(content);
         let content_id = objs.len();
 
         let mut annot_ids: Vec<usize> = Vec::new();
@@ -2346,7 +2733,7 @@ fn write_pdf(pages: &[Page], opts: &PdfOptions) -> Vec<u8> {
         }
 
         let mut page_obj = format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {:.2} {:.2}] /Resources << /Font << /F0 3 0 R /F1 4 0 R /F2 5 0 R /F3 6 0 R >> >> /Contents {content_id} 0 R",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {:.2} {:.2}] /Resources << /Font << /F0 3 0 R /F1 4 0 R /F2 5 0 R /F3 6 0 R{face_fonts} >> >> /Contents {content_id} 0 R",
             page.w, page.h
         );
         if !annot_ids.is_empty() {
@@ -4302,7 +4689,9 @@ mod tests {
 
     #[test]
     fn watermark_size_falls_back_to_the_text_width_and_caps_at_a_set_size() {
-        let place = |mark: &TextWatermark| WatermarkDraw::place(mark, (72.0, 72.0, 540.0, 720.0));
+        let place = |mark: &TextWatermark| {
+            WatermarkDraw::place(mark, (72.0, 72.0, 540.0, 720.0), Metrics::courier())
+        };
         // 80% of 468pt over five characters.
         assert!(close(place(&draft(None, None)).size, 0.8 * 468.0 / 3.0));
         assert!(close(place(&draft(Some(468.0), Some(36.0))).size, 36.0));

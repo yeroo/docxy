@@ -445,6 +445,7 @@ dependencies = [
  "htmlbundle",
  "image",
  "opccore",
+ "pdffont",
  "ratatui",
  "ratatui-image",
  "ribboncore",
@@ -1145,6 +1146,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pdffont"
+version = "0.1.0"
+dependencies = [
+ "docxcore",
+ "ttf-parser",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1801,6 +1810,12 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "ttf-parser"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
 name = "uiharness"
