@@ -4692,6 +4692,19 @@ fn row_menu_over_a_kept_range_is_the_clicked_rows() {
     assert!(!project_row_menu_press(&mut t, 2, Some(COL_START)));
 }
 
+/// #1370: a one-row range opens the Predecessor prompt and keeps the range;
+/// a right-click then must not keep it, or the menu's Copy/Cut/Paste would
+/// edit the prompt's buffer instead of the table.
+#[test]
+fn row_menu_press_with_a_prompt_open_cancels_it_and_keeps_no_range() {
+    let mut t = fill_tab();
+    range(&mut t, 0, COL_NAME, 0, COL_DURATION);
+    apply_project_act(&mut t, ProjectAct::AddLink);
+    assert!(v(&t).prompt.is_some(), "a one-row range opens the prompt");
+    assert!(!project_row_menu_press(&mut t, 0, Some(COL_NAME)));
+    assert!(v(&t).prompt.is_none());
+}
+
 /// #1213: outside the range, a right-click is a left click: the range goes
 /// and the clicked cell is selected.
 #[test]
@@ -4854,8 +4867,14 @@ fn prompt_bar_enter_commits_the_edited_text() {
 #[test]
 fn hyperlink_prompt_opens_with_the_caret_at_the_end() {
     let mut t = tab();
+    let uid = v(&t).selected_uid().unwrap();
+    vm(&mut t)
+        .ed
+        .set_hyperlink(uid, "docs", "https://x", "")
+        .unwrap();
     apply_project_act(&mut t, ProjectAct::Hyperlink);
     let p = prompt_of(&t);
+    assert!(!p.buf.is_empty());
     assert_eq!(p.caret, p.buf.len());
     assert!(p.selection().is_none());
 }

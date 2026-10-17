@@ -626,13 +626,14 @@ pub(crate) fn project_row_click(tab: &mut DocTab, row: usize, col: Option<usize>
 /// items (Cut, Copy, Paste, Fill Down, Clear Contents) act on it; a
 /// levelling pass asked for first still runs first. The menu's task items
 /// are still the clicked row's: the host selects that row before one runs.
-/// Anywhere else (no range, outside it, or with a cell edit open, which no
+/// Anywhere else (no range, outside it, or with a cell edit or prompt open, which no
 /// range sits beside) it is a left click: the edit commits and the clicked
 /// cell is selected. Returns whether the range was kept.
 pub(crate) fn project_row_menu_press(tab: &mut DocTab, row: usize, col: Option<usize>) -> bool {
     let inside = match &tab.surface {
         Surface::Project(v) => {
             v.cell.is_none()
+                && v.prompt.is_none()
                 && v.ed.project().tasks.get(row).is_some_and(|task| {
                     v.selection()
                         .is_some_and(|sel| sel.contains(task.uid, col.unwrap_or(v.col)))

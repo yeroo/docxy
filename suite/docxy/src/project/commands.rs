@@ -2139,12 +2139,11 @@ impl Docxy {
         // A pass already asked for runs first, so this act, and a second
         // levelling command above all, sees the plan it left.
         self.flush_project_passes(cx);
-        // With a cell editor open, Copy/Cut/Paste edit its buffer instead of
-        // the table (#561); committing first would break the edit.
+        // With a cell editor or the prompt bar open, Copy/Cut/Paste edit its
+        // buffer instead of the table (#561, #1370); committing or cancelling
+        // first would end the edit.
         if matches!(act, ProjectAct::Copy | ProjectAct::Cut | ProjectAct::Paste)
-            && self.tabs.get(self.active).is_some_and(|t| {
-                matches!(&t.surface, Surface::Project(v) if v.cell.is_some() || v.prompt.is_some())
-            })
+            && self.project_edit_open()
         {
             self.project_cell_clipboard(act, cx);
             return self.refocus(window, cx);
@@ -2286,8 +2285,8 @@ impl Docxy {
             project_cut(&mut self.tabs[self.active]);
         }
     }
-    /// Copy/Cut/Paste with a cell editor open take the buffer, not the table
-    /// (#561). Copy and Cut put the selection (else the whole buffer) on the system
+    /// Copy/Cut/Paste with a cell editor or the prompt bar open take the buffer,
+    /// not the table (#561, #1370). Copy and Cut put the selection (else the whole buffer) on the system
     /// clipboard; Cut removes it only when the read-
     /// back clipboard holds the cut text — a silently failed write (a
     /// busy OS clipboard) otherwise keeps the text and the status says so.
@@ -2388,9 +2387,7 @@ impl Docxy {
         // the selection tinted, scrolled to keep the caret in view (#1370).
         let measure = Measurer::new(window);
         let size = f32::from(window.text_style().font_size.to_pixels(window.rem_size()));
-        let sel = prompt.selection().unwrap_or(prompt.caret..prompt.caret);
-        let caret_bar = || div().flex_none().w(px(1.5)).h(px(14.)).bg(hsla_u(BRAND));
-        let offset = prompt.scroll_x(PROMPT_FIELD_W - 16., |s| {
+        let offset = prompt.scroll_x(PROMPT_FIELD_W - 18., |s| {
             measure.width(s, size, false, false)
         });
         Some(
@@ -2414,7 +2411,8 @@ impl Docxy {
                     h_flex()
                         .relative()
                         .min_w(px(180.))
-                        .max_w(px(500.))
+                        .max_w(px(PROMPT_FIELD_W))
+                        .flex_none()
                         .h(px(24.))
                         .px_2()
                         .items_center()
@@ -2423,26 +2421,7 @@ impl Docxy {
                         .border_color(hsla_u(BRAND))
                         .text_color(pal.fg)
                         .child(probe(&self.probes, "project-prompt-field"))
-                        .child(
-                            h_flex()
-                                .relative()
-                                .left(px(-offset))
-                                .flex_none()
-                                .items_center()
-                                .child(prompt.buf[..sel.start].to_owned())
-                                .when(prompt.caret == sel.start, |d| d.child(caret_bar()))
-                                .when(sel.start < sel.end, |d| {
-                                    let c = hsla_u(BRAND);
-                                    d.child(
-                                        div()
-                                            .flex_none()
-                                            .bg(hsla(c.h, c.s, c.l, 0.18))
-                                            .child(prompt.buf[sel.clone()].to_owned()),
-                                    )
-                                })
-                                .when(prompt.caret > sel.start, |d| d.child(caret_bar()))
-                                .child(prompt.buf[sel.end..].to_owned()),
-                        ),
+                        .child(line_edit_view(prompt, offset, 14.)),
                 )
                 .child(
                     div()
