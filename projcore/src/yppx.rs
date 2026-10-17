@@ -15,6 +15,7 @@ use crate::formats::Registry;
 use crate::formatting::{self, Formatting};
 use crate::model::{PackageParts, Project};
 use crate::mspdi::{read_mspdi, write_mspdi};
+use crate::tableview::{self, TableView};
 use opccore::xml::{Event, XmlParser};
 use opccore::zip::{ZipArchive, ZipEntry};
 use opccore::zipwrite::write_zip;
@@ -30,6 +31,10 @@ const CONTENT_TYPES_START: &str = concat!(
     "<Default Extension=\"xml\" ContentType=\"",
 );
 const CONTENT_TYPES_END: &str = "</Types>\n";
+
+/// The largest `tableview.xml` read into the model; a bigger one is kept as
+/// a retained extra instead.
+const MAX_TABLE_VIEW_PART: u64 = 1024 * 1024;
 
 /// Name of the main document part inside the package.
 pub const MAIN_PART: &str = "project.xml";
@@ -54,7 +59,12 @@ pub fn write_yppx(proj: &Project) -> Result<Vec<u8>, String> {
     let mut entries = vec![
         (
             CONTENT_TYPES_PART.to_string(),
-            build_content_types(&proj.package, !proj.formatting.is_empty()).into_bytes(),
+            build_content_types(
+                &proj.package,
+                !proj.formatting.is_empty(),
+                !proj.table_view.is_empty(),
+            )
+            .into_bytes(),
         ),
         (MAIN_PART.to_string(), write_mspdi(proj).into_bytes()),
     ];
@@ -63,6 +73,16 @@ pub fn write_yppx(proj: &Project) -> Result<Vec<u8>, String> {
         MAIN_PART.to_ascii_lowercase(),
         formatting::PART.to_ascii_lowercase(),
     ]);
+    // The table view part (#1533), only when a column has a width. A
+    // `tableview.xml` this build could not read stays a retained extra until
+    // then, so it is not lost.
+    if !proj.table_view.is_empty() {
+        seen.insert(tableview::PART.to_ascii_lowercase());
+        entries.push((
+            tableview::PART.to_string(),
+            proj.table_view.to_xml().into_bytes(),
+        ));
+    }
     // The formatting part (#1532), only when there is formatting to keep.
     if !proj.formatting.is_empty() {
         entries.push((
@@ -80,14 +100,25 @@ pub fn write_yppx(proj: &Project) -> Result<Vec<u8>, String> {
 
 /// XML parts default to the project type, and the main part is `/project.xml`.
 /// Insert retained declarations before closing the map, and the formatting
-/// part's own type when that part is written.
-fn build_content_types(package: &PackageParts, with_formatting: bool) -> String {
+/// part's own type (and the table view's) when that part is written.
+fn build_content_types(
+    package: &PackageParts,
+    with_formatting: bool,
+    with_table_view: bool,
+) -> String {
     let mut content_types = format!("{CONTENT_TYPES_START}{PROJECT_CONTENT_TYPE}\"/>");
     if with_formatting {
         content_types.push_str(&format!(
             "<Override PartName=\"/{}\" ContentType=\"{}\"/>",
             formatting::PART,
             formatting::CONTENT_TYPE
+        ));
+    }
+    if with_table_view {
+        content_types.push_str(&format!(
+            "<Override PartName=\"/{}\" ContentType=\"{}\"/>",
+            tableview::PART,
+            tableview::CONTENT_TYPE
         ));
     }
     for (extension, content_type) in &package.defaults {
@@ -101,9 +132,9 @@ fn build_content_types(package: &PackageParts, with_formatting: bool) -> String 
         ));
     }
     for (part_name, content_type) in &package.overrides {
-        if part_name
-            .trim_start_matches('/')
-            .eq_ignore_ascii_case(MAIN_PART)
+        let bare = part_name.trim_start_matches('/');
+        if bare.eq_ignore_ascii_case(MAIN_PART)
+            || (with_table_view && bare.eq_ignore_ascii_case(tableview::PART))
         {
             continue;
         }
@@ -295,6 +326,19 @@ fn read_yppx_within(bytes: &[u8], budget: u64) -> Result<Project, String> {
         .entries()
         .iter()
         .find(|entry| entry.name.eq_ignore_ascii_case(formatting::PART));
+    // The table view part (#1533) is the model's when this build reads it;
+    // one it cannot read (not UTF-8, not well-formed, oversized) is kept as
+    // a retained extra, never dropped.
+    let (table_view, table_part) = zip
+        .entries()
+        .iter()
+        .find(|entry| entry.name.eq_ignore_ascii_case(tableview::PART))
+        .filter(|entry| entry.uncomp_size <= MAX_TABLE_VIEW_PART)
+        .and_then(|entry| {
+            let text = String::from_utf8(zip.extract(entry)?).ok()?;
+            Some((TableView::from_xml(&text).ok()?, entry.name.as_str()))
+        })
+        .map_or((None, None), |(view, name)| (Some(view), Some(name)));
     let extras: Vec<_> = zip
         .entries()
         .iter()
@@ -304,6 +348,7 @@ fn read_yppx_within(bytes: &[u8], budget: u64) -> Result<Project, String> {
                 || name.eq_ignore_ascii_case(CONTENT_TYPES_PART)
                 || name.eq_ignore_ascii_case(MAIN_PART)
                 || name.eq_ignore_ascii_case(formatting::PART)
+                || table_part.is_some_and(|part| name == part)
                 || !seen.insert(name.to_ascii_lowercase()))
         })
         .collect();
@@ -334,6 +379,9 @@ fn read_yppx_within(bytes: &[u8], budget: u64) -> Result<Project, String> {
             .map_err(|_| format!("{} is not valid UTF-8", formatting::PART))?;
         project.formatting = Formatting::from_xml(&text)?;
     }
+    if let Some(view) = table_view {
+        project.table_view = view;
+    }
     for entry in extras {
         if let Some(bytes) = zip.extract(entry) {
             project
@@ -360,6 +408,55 @@ mod tests {
     use crate::model::*;
 
     const ORIGINAL_CONTENT_TYPES: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"xml\" ContentType=\"application/vnd.yppx.project+xml\"/></Types>\n";
+
+    /// The table view part (#1533): written only when a column has a width,
+    /// read back into the model (not kept as an extra part), absent from MSPDI.
+    #[test]
+    fn table_view_round_trips_through_its_own_part() {
+        let mut proj = Project::default();
+        let zip_bytes = write_yppx(&proj).unwrap();
+        let zip = ZipArchive::open(&zip_bytes).unwrap();
+        assert!(zip.read(crate::tableview::PART).is_none());
+        proj.table_view.set_width("Name", 310.);
+        let bytes = write_yppx(&proj).unwrap();
+        let zip = ZipArchive::open(&bytes).unwrap();
+        assert!(zip.read(crate::tableview::PART).is_some());
+        let map = String::from_utf8(zip.read(CONTENT_TYPES_PART).unwrap()).unwrap();
+        assert!(map.contains("/tableview.xml"), "{map}");
+        assert!(!write_mspdi(&proj).contains("310"));
+        let back = read_yppx(&bytes).unwrap();
+        assert_eq!(back.table_view, proj.table_view);
+        assert!(back.package.parts.is_empty());
+        assert_eq!(
+            read_yppx(&write_yppx(&back).unwrap()).unwrap().table_view,
+            proj.table_view
+        );
+    }
+
+    /// A `tableview.xml` this build cannot read keeps default widths and is
+    /// retained, not dropped, until a width replaces it.
+    #[test]
+    fn unreadable_table_view_part_is_retained() {
+        let map = "<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"xml\" ContentType=\"application/vnd.yppx.project+xml\"/><Override PartName=\"/tableview.xml\" ContentType=\"application/vnd.yppx.tableview+xml\"/></Types>";
+        let source = with_parts(map, &[("tableview.xml", b"<tableview><column")]);
+        let mut proj = read_yppx(&source).unwrap();
+        assert!(proj.table_view.is_empty());
+        assert_eq!(proj.package.parts.len(), 1);
+        let kept = write_yppx(&proj).unwrap();
+        let zip = ZipArchive::open(&kept).unwrap();
+        assert_eq!(
+            zip.read(crate::tableview::PART).unwrap(),
+            b"<tableview><column"
+        );
+        proj.table_view.set_width("ID", 70.);
+        let bytes = write_yppx(&proj).unwrap();
+        let zip = ZipArchive::open(&bytes).unwrap();
+        let part = String::from_utf8(zip.read(crate::tableview::PART).unwrap()).unwrap();
+        assert!(part.contains("width=\"70\""), "{part}");
+        let map = String::from_utf8(zip.read(CONTENT_TYPES_PART).unwrap()).unwrap();
+        assert_eq!(map.matches("/tableview.xml").count(), 1, "{map}");
+        assert_eq!(read_yppx(&bytes).unwrap().table_view, proj.table_view);
+    }
 
     /// The formatting part (#1532): written only when there is formatting,
     /// declared in the content types, read back into the model (not kept as

@@ -232,7 +232,7 @@ impl ProjectView {
         if anchor_uid == cursor_uid && anchor_col == self.col {
             return None;
         }
-        let rows = self.ed.visible_rows();
+        let rows = self.ed.display_rows();
         let pos = |uid: i32| {
             rows.iter()
                 .position(|&i| self.ed.project().tasks[i].uid == uid)
@@ -270,7 +270,7 @@ impl ProjectView {
         let Some(uid) = self.selected_uid() else {
             return true;
         };
-        let rows = self.ed.visible_rows();
+        let rows = self.ed.display_rows();
         // Anchor where the cursor is: on the first extension, or when the
         // stored anchor's task is gone or hidden (a delete, an undo, a
         // collapse) — an anchor that cannot resolve selects nothing.
@@ -305,8 +305,9 @@ impl ProjectView {
     }
 
     pub fn reveal_col(&mut self) {
-        let left: f32 = WIDTHS[..self.col].iter().sum();
-        let right = left + WIDTHS[self.col];
+        let widths = self.widths();
+        let left: f32 = widths[..self.col].iter().sum();
+        let right = left + widths[self.col];
         let x = self.table_x.get();
         if left < x {
             self.table_x.set(left);
@@ -374,8 +375,7 @@ impl ProjectView {
             else {
                 return Ok(None);
             };
-            self.entry = false;
-            self.ed.select(row);
+            self.place_cursor(row);
             return Ok(status);
         };
         apply_cell(&mut self.ed, uid, col, &buf)
@@ -772,7 +772,7 @@ pub(crate) fn project_column_select(tab: &mut DocTab, col: usize) {
     v.drag_made_range = false;
     v.row_drag = false;
     v.row_header = false;
-    let rows = v.ed.visible_rows();
+    let rows = v.ed.display_rows();
     match (rows.first().copied(), rows.last().copied()) {
         (Some(first), Some(last)) => {
             let last_uid = v.ed.project().tasks[last].uid;
@@ -922,18 +922,67 @@ pub(crate) fn project_cell_input(tab: &mut DocTab, key: &str, text: Option<&str>
     }
     // Up, Down, and Shift+Enter commit and move a row, as Enter does, in Project.
     if matches!(key, "enter" | "tab" | "up" | "down") {
+        // The cell edited is the entry row's: its commit appends a task that
+        // a sort or filter may put or hide anywhere, so Enter and Down go
+        // back to the entry row, not to the row after it in display order.
+        let was_entry = matches!(
+            &tab.surface,
+            Surface::Project(v) if v.cell.as_ref().is_some_and(|c| c.uid.is_none())
+        );
+        let edited = match &tab.surface {
+            Surface::Project(v) => v.cell.as_ref().and_then(|c| c.uid),
+            _ => None,
+        };
+        // The rows drawn before the commit and the edited row's place in
+        // them: after a commit that hides it, where the cursor landed says
+        // whether a drawn row took its place (a later one) or none did.
+        let before: Vec<i32> = match &tab.surface {
+            Surface::Project(v) if edited.is_some() => {
+                let tasks = &v.ed.project().tasks;
+                v.ed.display_rows().iter().map(|&i| tasks[i].uid).collect()
+            }
+            _ => Vec::new(),
+        };
+        let at = edited.and_then(|uid| before.iter().position(|&u| u == uid));
         if commit_project_cell(tab) {
             if let Surface::Project(v) = &mut tab.surface {
-                v.key(
-                    match key {
-                        "enter" if m.shift => "up",
-                        "enter" => "down",
-                        "up" | "down" => key,
-                        _ if m.shift => "left",
-                        _ => "right",
-                    },
-                    false,
-                );
+                // The commit may have hidden the edited task (a filter).
+                let hid_it = edited.is_some_and(|uid| {
+                    let tasks = &v.ed.project().tasks;
+                    !v.ed.display_rows().iter().any(|&i| tasks[i].uid == uid)
+                });
+                let moves_up = key == "up" || (key == "enter" && m.shift);
+                let followed = at.is_some_and(|at| {
+                    v.ed.selected_uid()
+                        .and_then(|uid| before.iter().position(|&u| u == uid))
+                        .is_some_and(|now| now > at)
+                });
+                if was_entry && (key == "down" || (key == "enter" && !m.shift)) {
+                    v.enter_entry_row();
+                } else if hid_it {
+                    // The cursor is on the drawn row that took its place, or
+                    // on the one before when none did (blank rows and rows
+                    // the same edit hid do not count): a move that row
+                    // already made is skipped, and down from the last row
+                    // drawn leaves the table for the entry row.
+                    let down = key == "down" || (key == "enter" && !m.shift);
+                    if down && !followed {
+                        v.enter_entry_row();
+                    } else if moves_up && followed {
+                        v.key("up", false);
+                    }
+                } else {
+                    v.key(
+                        match key {
+                            "enter" if m.shift => "up",
+                            "enter" => "down",
+                            "up" | "down" => key,
+                            _ if m.shift => "left",
+                            _ => "right",
+                        },
+                        false,
+                    );
+                }
             }
             complete_project(tab, key != "tab");
         }

@@ -2023,6 +2023,14 @@ test project task-information/notes: Escape cancels
   assert reply.value is not Esc9
   call real-key {"key":"escape"}
 
+test project project-filter-menu: matches the catalogue
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call pointer-click {"region":"project-heading-arrow:Name"}
+  assert dialog is project-filter-menu
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
 test project delete-summary: matches the catalogue
   open ../fixtures/gantt-summary.xml
   click A1

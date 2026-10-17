@@ -37,6 +37,9 @@ pub enum Act {
     // View
     ShowSubtasks,
     HideSubtasks,
+    /// View › Data › Sort... and Filter... (#1533).
+    Sort,
+    Filter,
     // Help (#1021)
     /// Help: the documentation is coming.
     Help,
@@ -345,18 +348,34 @@ fn view_groups() -> Vec<Group> {
     use Act::*;
     vec![Group {
         title: "Data",
-        width: 16,
+        width: 31,
         rows: [
-            vec![btn(
-                "▾ Show Subtasks",
-                ShowSubtasks,
-                "Show Subtasks — the selected summary's subtasks (+)",
-            )],
-            vec![btn(
-                "▸ Hide Subtasks",
-                HideSubtasks,
-                "Hide Subtasks — the selected summary's subtasks (-)",
-            )],
+            vec![
+                btn(
+                    "▾ Show Subtasks",
+                    ShowSubtasks,
+                    "Show Subtasks — the selected summary's subtasks (+)",
+                ),
+                Seg::Gap("  "),
+                btn(
+                    "⇅ Sort...",
+                    Sort,
+                    "Sort... — by a column, e.g. Finish desc (empty clears; :sort)",
+                ),
+            ],
+            vec![
+                btn(
+                    "▸ Hide Subtasks",
+                    HideSubtasks,
+                    "Hide Subtasks — the selected summary's subtasks (-)",
+                ),
+                Seg::Gap("  "),
+                btn(
+                    "⧩ Filter...",
+                    Filter,
+                    "Filter... — a column's values, e.g. Finish: 2026-03 (empty clears; :filter)",
+                ),
+            ],
         ],
     }]
 }
@@ -540,6 +559,8 @@ mod tests {
                 "Hide Subtasks",
                 HideSubtasks,
             ),
+            ("View", "Data", "Sort...", "Sort...", Sort),
+            ("View", "Data", "Filter...", "Filter...", Filter),
             // The Help tab every editor ends with (#1021).
             ("Help", "Help", "Help", "Help", Help),
             ("Help", "Help", "Feedback", "Feedback", Feedback),

@@ -15997,6 +15997,8 @@ impl Docxy {
             Region::Gantt
             | Region::Bar(_)
             | Region::ProjectHeading(_)
+            | Region::ProjectHeadingArrow(_)
+            | Region::ProjectHeadingEdge(_)
             | Region::ProjectHbarTable
             | Region::ProjectHbarChart
             | Region::ProjectVbar
@@ -38584,6 +38586,11 @@ impl Render for Docxy {
             }) => Some(v.ed.project().new_tasks_are_manual),
             _ => None,
         };
+        // The Project table's AutoFilter is on (#1533).
+        let auto_filter = matches!(
+            self.tabs.get(self.active),
+            Some(DocTab { surface: Surface::Project(v), .. }) if v.ed.is_filtered()
+        );
         let status = h_flex()
             .w_full()
             .px_4()
@@ -38610,6 +38617,10 @@ impl Render for Docxy {
                         })),
                 )
                 .child(div().child("·"))
+            })
+            .when(auto_filter, |d| {
+                d.child(div().id("auto-filter").child(AUTO_FILTER_STATUS))
+                    .child(div().child("·"))
             })
             .child(
                 self.tabs
@@ -38741,6 +38752,7 @@ impl Render for Docxy {
         // can outlive its tab's activation (a tab switch mid-drag, F11), and
         // the release that ends it must reach it wherever it lives.
         let released = cx.entity();
+        let sized = cx.entity();
         let pressed = cx.entity();
         let pen = cx.entity();
         let gesture_listeners = canvas(
@@ -38790,8 +38802,30 @@ impl Render for Docxy {
                 });
                 window.on_mouse_event(move |ev: &MouseUpEvent, phase, _window, cx| {
                     if phase == DispatchPhase::Capture && ev.button == MouseButton::Left {
-                        released.update(cx, |this, _cx| {
+                        released.update(cx, |this, cx| {
                             crate::project_cell_release_all(&mut this.tabs);
+                            // A heading edge's drag ends here, wherever the
+                            // pointer is (#1533).
+                            crate::project_width_release_all(&mut this.tabs);
+                            cx.notify();
+                        });
+                    }
+                });
+                window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _window, cx| {
+                    if phase == DispatchPhase::Capture
+                        && ev.pressed_button == Some(MouseButton::Left)
+                    {
+                        sized.update(cx, |this, cx| {
+                            let x = f32::from(ev.position.x);
+                            let mut moved = false;
+                            for tab in &mut this.tabs {
+                                if let Surface::Project(v) = &mut tab.surface {
+                                    moved |= v.move_width_drag(x);
+                                }
+                            }
+                            if moved {
+                                cx.notify();
+                            }
                         });
                     }
                 });

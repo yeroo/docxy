@@ -122,32 +122,38 @@ impl Editor {
         }
     }
 
-    /// The visible row `delta` visible rows from `from`, stopping at the first
-    /// and last. 0 in a plan without tasks.
+    /// The displayed row `delta` displayed rows from `from` (see
+    /// [`Self::display_rows`]), stopping at the first and last. 0 in a plan
+    /// without tasks.
     pub fn visible_step(&self, from: usize, delta: isize) -> usize {
-        let rows = self.visible_rows();
+        let rows = self.display_rows();
         let Some(last) = rows.len().checked_sub(1) else {
             return 0;
         };
-        // `from` may sit before the first shown row (the hidden summary).
-        let before = rows.partition_point(|&r| r <= from);
-        let at = match before.checked_sub(1) {
+        let at = match rows.iter().position(|&r| r == from) {
             Some(at) => at.saturating_add_signed(delta),
+            // `from` may sit before the first shown row (the hidden
+            // summary), or be a row the filter hides.
+            None if rows.is_sorted() => match rows.partition_point(|&r| r <= from).checked_sub(1) {
+                Some(at) => at.saturating_add_signed(delta),
+                None if delta > 0 => (delta - 1) as usize,
+                None => 0,
+            },
             None if delta > 0 => (delta - 1) as usize,
             None => 0,
         };
         rows[at.min(last)]
     }
 
-    /// Select the first visible row (row 0 when nothing is shown).
+    /// Select the first displayed row (row 0 when nothing is shown).
     pub fn select_first_visible(&mut self) {
-        let first = self.visible_rows().first().copied().unwrap_or(0);
+        let first = self.display_rows().first().copied().unwrap_or(0);
         self.select(first);
     }
 
-    /// Select the last visible row, keeping every summary collapsed.
+    /// Select the last displayed row, keeping every summary collapsed.
     pub fn select_last_visible(&mut self) {
-        if let Some(&last) = self.visible_rows().last() {
+        if let Some(&last) = self.display_rows().last() {
             self.select(last);
         }
     }

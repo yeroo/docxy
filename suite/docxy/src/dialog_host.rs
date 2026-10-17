@@ -163,6 +163,8 @@ fn apply_dialog(
         | DialogOwner::CustomFilter { .. }
         | DialogOwner::Top10Filter { .. }
         | DialogOwner::AdvancedFilter { .. } => Err("a filter applies through the Data tab".into()),
+        // Handled in `project::autofilter_click`, before this.
+        DialogOwner::ProjectFilter { .. } => Err("a filter applies through its OK".into()),
         DialogOwner::SortLevels { .. } | DialogOwner::SortWarning { .. } => {
             Err("a sort applies through the Data tab".into())
         }
@@ -340,6 +342,10 @@ fn dialog_press(tab: &mut DocTab, button: &str) -> Result<(), String> {
         return done;
     }
     if let Some(done) = crate::sheet_sort::click(tab, button) {
+        return done;
+    }
+    // The Project table's AutoFilter drop-down (#1533).
+    if let Some(done) = crate::project::autofilter_click(tab, button) {
         return done;
     }
     if let Some(done) = reopen_click(tab, button) {

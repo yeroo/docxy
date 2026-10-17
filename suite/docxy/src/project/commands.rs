@@ -1056,8 +1056,17 @@ impl ProjectView {
     }
     pub fn select_row(&mut self, row: usize) {
         self.cancel_prompt();
+        self.place_cursor(row);
+    }
+
+    /// Put the cursor on task `index`, a row an edit just made. A filter may
+    /// hide it; the cursor then goes to the entry row, never to a task the
+    /// grid does not draw (the selection ends on a displayed row either way).
+    pub fn place_cursor(&mut self, index: usize) {
         self.entry = false;
-        self.ed.select(row);
+        if !self.ed.select_shown(index) {
+            self.enter_entry_row();
+        }
     }
 
     /// Find the next match; an empty query repeats the last search. From the
@@ -1437,6 +1446,12 @@ pub(crate) fn complete_project(tab: &mut DocTab, reveal: bool) {
         tab.dirty = v.ed.dirty();
         crate::bump_edit_generation();
         v.latch_entry_row();
+        // The cursor is on a displayed row or the entry row: an edit that
+        // left every row hidden by a filter leaves only the entry row.
+        if v.ed.is_view_active() && !v.on_entry_row() && !v.ed.display_rows().contains(&v.ed.sel())
+        {
+            v.enter_entry_row();
+        }
         // The list always holds the entry row, so there is a row to reveal.
         if reveal {
             v.scroll
