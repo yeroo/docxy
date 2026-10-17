@@ -75,9 +75,13 @@ fn checksum(d: &[u8]) -> u32 {
 }
 
 pub fn assemble(tables: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+    assemble_as(0x0001_0000, tables)
+}
+
+pub fn assemble_as(version: u32, tables: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
     let n = tables.len();
     let mut out = Vec::new();
-    be32(&mut out, 0x0001_0000);
+    be32(&mut out, version);
     be16(&mut out, n as u16);
     be16(&mut out, 0);
     be16(&mut out, 0);
@@ -98,8 +102,53 @@ pub fn assemble(tables: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
     out
 }
 
+/// What else a synthetic font carries.
+#[derive(Default)]
+pub struct Style {
+    /// The family name (a `name` table is written when set).
+    pub family: Option<String>,
+    pub bold: bool,
+    pub italic: bool,
+    /// Outlines in a `CFF ` table instead of `glyf`/`loca`.
+    pub cff: bool,
+}
+
 /// `fs_type` is the OS/2 embedding bits; `units` the units per em.
 pub fn build(glyphs: &[SynthGlyph], units: u16, fs_type: u16) -> Vec<u8> {
+    build_with(glyphs, units, fs_type, &Style::default())
+}
+
+fn name_table(family: &str, bold: bool, italic: bool) -> Vec<u8> {
+    let sub = match (bold, italic) {
+        (true, true) => "Bold Italic",
+        (true, false) => "Bold",
+        (false, true) => "Italic",
+        (false, false) => "Regular",
+    };
+    let ps = format!("{}-{}", family.replace(' ', ""), sub.replace(' ', ""));
+    let strings = [(1u16, family.to_string()), (2, sub.to_string()), (6, ps)];
+    let mut records = Vec::new();
+    let mut data = Vec::new();
+    for (id, text) in &strings {
+        let utf16: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
+        be16(&mut records, 3);
+        be16(&mut records, 1);
+        be16(&mut records, 0x409);
+        be16(&mut records, *id);
+        be16(&mut records, utf16.len() as u16);
+        be16(&mut records, data.len() as u16);
+        data.extend(utf16);
+    }
+    let mut t = Vec::new();
+    be16(&mut t, 0);
+    be16(&mut t, strings.len() as u16);
+    be16(&mut t, 6 + records.len() as u16);
+    t.extend(records);
+    t.extend(data);
+    t
+}
+
+pub fn build_with(glyphs: &[SynthGlyph], units: u16, fs_type: u16, style: &Style) -> Vec<u8> {
     let n = glyphs.len() + 1;
     let mut glyf = Vec::new();
     let mut loca = Vec::new();
@@ -134,7 +183,10 @@ pub fn build(glyphs: &[SynthGlyph], units: u16, fs_type: u16) -> Vec<u8> {
     for v in [0i16, 0, 1000, 1000] {
         be16(&mut head, v as u16);
     }
-    be16(&mut head, 0);
+    be16(
+        &mut head,
+        u16::from(style.bold) | u16::from(style.italic) << 1,
+    );
     be16(&mut head, 8);
     be16(&mut head, 2);
     be16(&mut head, 1); // long loca
@@ -146,7 +198,6 @@ pub fn build(glyphs: &[SynthGlyph], units: u16, fs_type: u16) -> Vec<u8> {
     be16(&mut hhea, (-(units as i32) * 2 / 10) as u16);
     be16(&mut hhea, 0);
     hhea.extend_from_slice(&[0; 24]);
-    be16(&mut hhea, 0);
     be16(&mut hhea, n as u16);
 
     let mut maxp = Vec::new();
@@ -184,16 +235,25 @@ pub fn build(glyphs: &[SynthGlyph], units: u16, fs_type: u16) -> Vec<u8> {
     be16(&mut os2, fs_type);
     os2.resize(96, 0);
 
-    assemble(&[
+    let mut tables: Vec<(&[u8; 4], Vec<u8>)> = vec![
         (b"OS/2", os2),
         (b"cmap", cmap),
-        (b"glyf", glyf),
         (b"head", head),
         (b"hhea", hhea),
         (b"hmtx", hmtx),
-        (b"loca", loca),
         (b"maxp", maxp),
-    ])
+    ];
+    if style.cff {
+        tables.push((b"CFF ", vec![0; 16]));
+    } else {
+        tables.push((b"glyf", glyf));
+        tables.push((b"loca", loca));
+    }
+    if let Some(family) = &style.family {
+        tables.push((b"name", name_table(family, style.bold, style.italic)));
+    }
+    tables.sort_by_key(|(t, _)| **t);
+    assemble_as(if style.cff { 0x4F54_544F } else { 0x0001_0000 }, &tables)
 }
 
 /// A TrueType collection holding `fonts` (each a standalone sfnt).
