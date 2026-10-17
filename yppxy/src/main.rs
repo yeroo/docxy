@@ -2481,12 +2481,7 @@ fn draw_prompt(f: &mut Frame, area: Rect, app: &mut App) {
     // Inside the border, past the label: where the typed text starts.
     let label = format!(" {}: ", p.label);
     let text_x = rect.x + 1 + Line::from(label.as_str()).width() as u16;
-    let caret = p.caret.min(p.buf.chars().count());
-    let split = p
-        .buf
-        .char_indices()
-        .nth(caret)
-        .map_or(p.buf.len(), |(i, _)| i);
+    let split = p.byte_at(p.caret);
     let content = Line::from(vec![
         Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(p.buf[..split].to_string()),
@@ -2501,7 +2496,9 @@ fn draw_prompt(f: &mut Frame, area: Rect, app: &mut App) {
         ),
         rect,
     );
-    app.prompt_at = Some((text_x, rect.y + 1));
+    // At caret 0 the mark takes the first cell, so the text starts one on.
+    let lead = u16::from(p.caret == 0 && !p.buf.is_empty());
+    app.prompt_at = Some((text_x + lead, rect.y + 1));
 }
 
 impl App {
@@ -4965,8 +4962,10 @@ mod tests {
         press_key(&mut app, KeyCode::Enter);
         assert_eq!(prompt_state(&app), ("New task".into(), 8));
         press_key(&mut app, KeyCode::Esc);
+        app.set_constraint("SNET 2026-01-05");
         app.apply_act(Act::Constraint);
         let (buf, caret) = prompt_state(&app);
+        assert!(!buf.is_empty());
         assert_eq!(caret, buf.chars().count());
     }
 
@@ -5033,5 +5032,34 @@ mod tests {
         let f = app.input_field("yppxy-prompt");
         assert_eq!(f.caret, Some(2));
         assert_eq!(f.value.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn prompt_at_names_the_first_text_cell() {
+        use ratatui::backend::TestBackend;
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        let at = |app: &mut App| {
+            let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+            term.draw(|f| draw_prompt(f, f.area(), app)).unwrap();
+            let (x, y) = app.prompt_at.unwrap();
+            let sym = term
+                .backend()
+                .buffer()
+                .cell((x, y))
+                .unwrap()
+                .symbol()
+                .to_string();
+            (x, sym)
+        };
+        open_prompt(&mut app, "abc");
+        let (end_x, sym) = at(&mut app);
+        assert_eq!(sym, "a");
+        press_key(&mut app, KeyCode::Home);
+        let (home_x, sym) = at(&mut app);
+        assert_eq!((home_x, sym.as_str()), (end_x + 1, "a"));
+        // An empty buffer has no text: the mark is the cell.
+        open_prompt(&mut app, "");
+        let (empty_x, sym) = at(&mut app);
+        assert_eq!((empty_x, sym.as_str()), (end_x, "▏"));
     }
 }
