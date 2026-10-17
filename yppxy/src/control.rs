@@ -123,7 +123,8 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
                     None => Vec::new(),
                     Some(v) => v
                         .as_array()
-                        .ok_or("'values' must be an array of texts")?
+                        .filter(|a| !a.is_empty())
+                        .ok_or("'values' must be a non-empty array of texts (omit it to clear)")?
                         .iter()
                         .map(|v| {
                             v.as_str()
@@ -727,5 +728,57 @@ mod tests {
         .unwrap();
         let v = filter(&mut a, "Resource Names", &["(Blanks)"]).unwrap();
         assert_eq!(v.get_str("filter"), Some("All Tasks"));
+    }
+
+    #[test]
+    fn an_empty_values_array_is_refused_not_a_clear() {
+        let mut a = dated();
+        dispatch(
+            &mut a,
+            "proj.filter",
+            &obj(vec![
+                ("column", Json::Str("Name".into())),
+                ("values", Json::Arr(vec![Json::Str("Plan".into())])),
+            ]),
+        )
+        .unwrap();
+        let err = dispatch(
+            &mut a,
+            "proj.filter",
+            &obj(vec![
+                ("column", Json::Str("Name".into())),
+                ("values", Json::Arr(vec![])),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("non-empty array"), "{err}");
+        assert!(a.ed.is_filtered(), "the filter stands");
+    }
+
+    #[test]
+    fn selection_based_edits_act_only_on_a_drawn_row() {
+        let mut a = dated();
+        dispatch(
+            &mut a,
+            "proj.filter",
+            &obj(vec![
+                ("column", Json::Str("Name".into())),
+                ("values", Json::Arr(vec![Json::Str("Plan".into())])),
+            ]),
+        )
+        .unwrap();
+        // Add Task makes a row the filter hides: the selection stays drawn.
+        a.ed.select(0);
+        a.add_task();
+        assert!(a.ed.display_rows().contains(&a.ed.sel()));
+        assert_eq!(a.ed.project().tasks[a.ed.sel()].name, "Plan");
+        // Rename the only drawn task so nothing is drawn: no edit has a row.
+        a.ed.rename(1, "Gone").unwrap();
+        assert!(a.ed.display_rows().is_empty());
+        assert_eq!(a.ed.shown_selected_uid(), None);
+        let before = a.ed.project().tasks.len();
+        a.delete_task();
+        a.indent(1);
+        assert_eq!(a.ed.project().tasks.len(), before, "nothing was deleted");
     }
 }

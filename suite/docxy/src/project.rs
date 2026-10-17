@@ -316,7 +316,10 @@ impl ProjectView {
         let last = self.ed.display_rows().last().copied();
         let index = match key {
             // From the entry row, Up goes to the last task.
-            "up" if self.on_entry_row() => last.unwrap_or(0),
+            "up" if self.on_entry_row() => match last {
+                Some(last) => last,
+                None => return true,
+            },
             "up" => self.ed.visible_step(self.ed.sel(), -1),
             // Down from the last task goes to the entry row, as in Project.
             "down"

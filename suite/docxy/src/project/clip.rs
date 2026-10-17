@@ -230,8 +230,7 @@ pub(crate) fn paste_project_rows(tab: &mut DocTab, clip: &ProjectRowsClip) {
                 .and_then(|&uid| v.ed.project().tasks.iter().position(|t| t.uid == uid))
             {
                 // As typing into the entry row does: the cursor goes to the task.
-                v.entry = false;
-                v.ed.select(index);
+                v.place_cursor(index);
             }
             complete_project(tab, true);
         }
@@ -421,8 +420,7 @@ pub(crate) fn paste_project_text(tab: &mut DocTab, text: &str) {
             tab.status = status.unwrap_or_else(|| "Ready".into()).into();
             if let (true, Some(row)) = (entry, first_new) {
                 // As typing into the entry row does: the cursor goes to the task.
-                v.entry = false;
-                v.ed.select(row);
+                v.place_cursor(row);
             }
             complete_project(tab, true);
         }

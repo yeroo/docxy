@@ -43,7 +43,7 @@ test project filtering Finish to one month leaves its rows and Clear Filter rest
   call dialog-set {"control":"values","item":"March","checked":true}
   call dialog-click {"button":"OK"}
   assert dialog is none
-  assert status is AutoFilter Applied
+  assert status is Filtered by Finish
   call rows {}
   assert reply.filter is AutoFilter
   assert reply.count is 2

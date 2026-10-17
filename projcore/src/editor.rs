@@ -525,30 +525,34 @@ impl Editor {
     /// Find the next matching row, wrapping after the selected row. An empty
     /// query repeats the previous search. Searching never changes history.
     pub fn find(&mut self, query: &str) -> FindOutcome {
-        self.find_from(query, self.sel + 1)
+        self.find_from(query, Some(self.sel))
     }
 
     /// [`Self::find`], starting at the first task instead of after the
     /// selected one (as from docxy's entry row).
     pub fn find_from_top(&mut self, query: &str) -> FindOutcome {
-        self.find_from(query, 0)
+        self.find_from(query, None)
     }
 
     /// A hidden match expands the summaries that hide it.
-    fn find_from(&mut self, query: &str, first: usize) -> FindOutcome {
+    fn find_from(&mut self, query: &str, first: Option<usize>) -> FindOutcome {
         let query = query.trim().to_lowercase();
         if !query.is_empty() {
             self.last_find = query;
         }
-        let n = self.proj.tasks.len();
+        // In the order the grid draws, filtered rows left out; a collapsed
+        // summary's subtasks are still searched (and expanded on a match).
+        let rows = self.ordered_rows(false, true);
+        let n = rows.len();
         if self.last_find.is_empty() || n == 0 {
             return FindOutcome::Inactive;
         }
+        let start = match first {
+            Some(sel) => rows.iter().position(|&i| i == sel).map_or(0, |p| p + 1),
+            None => 0,
+        };
         for step in 0..n {
-            let i = (first + step) % n;
-            if !self.show_summary && self.proj.tasks[i].is_project_summary() {
-                continue;
-            }
+            let i = rows[(start + step) % n];
             if self.proj.tasks[i]
                 .name
                 .to_lowercase()
@@ -888,6 +892,11 @@ impl Editor {
             .iter()
             .map(|t| t.uid)
             .collect();
+        // Under a sort or filter the cursor keeps its place among the rows
+        // drawn, not its storage index.
+        let place = (self.is_view_active() && range.contains(&self.sel))
+            .then(|| self.display_rows().iter().position(|&i| i == self.sel))
+            .flatten();
         self.edit_structure(|proj| {
             proj.tasks.drain(range);
             for t in &mut proj.tasks {
@@ -896,6 +905,13 @@ impl Editor {
             // Remove assignments as well, so they cannot attach to a reused UID.
             proj.assignments.retain(|a| !removed.contains(&a.task_uid));
         })?;
+        if let Some(place) = place {
+            let rows = self.display_rows();
+            if let Some(&row) = rows.get(place.min(rows.len().saturating_sub(1))) {
+                self.sel = row;
+                self.sel_uid = self.selected_uid();
+            }
+        }
         Ok(removed)
     }
 

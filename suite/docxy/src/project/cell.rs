@@ -375,12 +375,7 @@ impl ProjectView {
             else {
                 return Ok(None);
             };
-            self.entry = false;
-            self.ed.select(row);
-            // A task the filter hides has no row to put the cursor on.
-            if !self.ed.display_rows().contains(&row) {
-                self.enter_entry_row();
-            }
+            self.place_cursor(row);
             return Ok(status);
         };
         apply_cell(&mut self.ed, uid, col, &buf)
@@ -934,10 +929,24 @@ pub(crate) fn project_cell_input(tab: &mut DocTab, key: &str, text: Option<&str>
             &tab.surface,
             Surface::Project(v) if v.cell.as_ref().is_some_and(|c| c.uid.is_none())
         );
+        let edited = match &tab.surface {
+            Surface::Project(v) => v.cell.as_ref().and_then(|c| c.uid),
+            _ => None,
+        };
         if commit_project_cell(tab) {
             if let Surface::Project(v) = &mut tab.surface {
+                // The commit may have hidden the edited task (a filter): the
+                // cursor is then on the row that took its place, so a move
+                // down or across would skip a row or edit another task.
+                let hid_it = edited.is_some_and(|uid| {
+                    let tasks = &v.ed.project().tasks;
+                    !v.ed.display_rows().iter().any(|&i| tasks[i].uid == uid)
+                });
+                let moves_up = key == "up" || (key == "enter" && m.shift);
                 if was_entry && (key == "down" || (key == "enter" && !m.shift)) {
                     v.enter_entry_row();
+                } else if hid_it && !moves_up {
+                    // Stay on the row that followed it.
                 } else {
                     v.key(
                         match key {

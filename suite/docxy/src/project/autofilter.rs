@@ -271,7 +271,7 @@ pub(crate) fn autofilter_click(tab: &mut DocTab, button: &str) -> Option<Result<
     tab.status = if all {
         format!("Filter cleared from {name}")
     } else {
-        AUTO_FILTER_STATUS.to_string()
+        format!("Filtered by {name}")
     }
     .into();
     Some(Ok(()))

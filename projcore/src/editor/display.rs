@@ -105,31 +105,87 @@ impl Editor {
         }
     }
 
-    /// Move a selection the filter hides to the first displayed row.
+    /// Put a selection the filter hides on a displayed row, the invariant
+    /// every operation keeps: the next displayed row after it in the order
+    /// (sorted, unfiltered) it was in, else the one before, a blank row only
+    /// when nothing else shows. Nothing displayed leaves it where it is, for
+    /// a host to meet with its entry row.
     pub(super) fn sel_into_display(&mut self) {
         let rows = self.display_rows();
         if rows.contains(&self.sel) || self.sel_pinned {
             return;
         }
         let tasks = &self.proj.tasks;
-        let first = rows.iter().find(|&&i| !tasks[i].is_null).or(rows.first());
-        if let Some(&first) = first {
-            self.sel = first;
-            self.sel_uid = Some(self.proj.tasks[first].uid);
+        let shown = |i: &usize| rows.contains(i) && !tasks[*i].is_null;
+        let order = self.ordered_rows(false, false);
+        let at = order.iter().position(|&i| i == self.sel);
+        let near = at.and_then(|at| {
+            order[at + 1..]
+                .iter()
+                .find(|i| shown(i))
+                .or_else(|| order[..at].iter().rev().find(|i| shown(i)))
+        });
+        let pick = near
+            .or_else(|| rows.iter().find(|&&i| !tasks[i].is_null))
+            .or_else(|| rows.first());
+        if let Some(&pick) = pick {
+            self.sel = pick;
+            self.sel_uid = Some(self.proj.tasks[pick].uid);
         }
+    }
+
+    /// [`Self::select`] for a row an edit made, which a filter may hide: the
+    /// selection ends on a displayed row either way, and the answer is
+    /// whether that is `index` itself.
+    pub fn select_shown(&mut self, index: usize) -> bool {
+        self.select(index);
+        let shown = self.display_rows().contains(&self.sel);
+        if !shown {
+            self.sel_into_display();
+        }
+        shown
+    }
+
+    /// The selected task's uid when it is displayed: what a host acts on, so
+    /// that nothing acts on a row the view hides.
+    pub fn shown_selected_uid(&self) -> Option<i32> {
+        let uid = self.selected_uid()?;
+        (!self.is_view_active() || self.display_rows().contains(&self.sel)).then_some(uid)
+    }
+
+    /// Whether a sort or a filter is on.
+    pub fn is_view_active(&self) -> bool {
+        self.sort.is_some() || !self.filters.is_empty()
     }
 
     /// The rows a grid draws, as task indexes: [`Self::visible_rows`], then
     /// the filter, then the sort. With neither, exactly `visible_rows`.
     pub fn display_rows(&self) -> Vec<usize> {
-        let rows = self.visible_rows();
-        if self.sort.is_none() && self.filters.is_empty() {
+        self.ordered_rows(true, true)
+    }
+
+    /// The rows in display order: with `collapse` those collapsed summaries
+    /// leave shown, with `filter` those the filters leave shown; sorted if a
+    /// sort is on. Find walks it with neither.
+    pub(super) fn ordered_rows(&self, collapse: bool, filter: bool) -> Vec<usize> {
+        let rows: Vec<usize> = if collapse {
+            self.visible_rows()
+        } else {
+            (0..self.proj.tasks.len())
+                .filter(|&i| self.show_summary || !self.proj.tasks[i].is_project_summary())
+                .collect()
+        };
+        let filtering = filter && !self.filters.is_empty();
+        if self.sort.is_none() && !filtering {
             return rows;
         }
         let tasks = &self.proj.tasks;
         let reader = FieldReader::new(self);
-        let shown = self.filter_pass(&reader, None);
-        let mut rows: Vec<usize> = rows.into_iter().filter(|&i| shown[i]).collect();
+        let mut rows = rows;
+        if filtering {
+            let shown = self.filter_pass(&reader, None);
+            rows.retain(|&i| shown[i]);
+        }
         if let Some(sort) = self.sort {
             let keys: Vec<SortKey> = (0..tasks.len())
                 .map(|i| SortKey::of(&tasks[i], &reader.read(&tasks[i], sort.field)))

@@ -841,7 +841,7 @@ impl App {
     }
 
     fn toggle_milestone(&mut self) {
-        if let Some(uid) = self.ed.selected_uid() {
+        if let Some(uid) = self.ed.shown_selected_uid() {
             if let Err(message) = self.ed.toggle_milestone(uid) {
                 self.status = message;
             }
@@ -850,7 +850,7 @@ impl App {
 
     /// Switch the selected task between Manually and Auto Scheduled.
     fn set_manual(&mut self, manual: bool) {
-        let Some(uid) = self.ed.selected_uid() else {
+        let Some(uid) = self.ed.shown_selected_uid() else {
             return;
         };
         self.status = match self.ed.set_manual(uid, manual) {
@@ -897,7 +897,7 @@ impl App {
     /// Set a date constraint on the selected task from text like
     /// `SNET 2026-03-05`, `MSO 2026-03-05`, or `none` / `asap`.
     fn set_constraint(&mut self, text: &str) {
-        if let Some(uid) = self.ed.selected_uid() {
+        if let Some(uid) = self.ed.shown_selected_uid() {
             self.status = match self.ed.set_constraint(uid, text) {
                 Ok(()) => format!(
                     "Constraint set: {}",
@@ -914,7 +914,7 @@ impl App {
     /// Assign a resource (by name, created on first use) to the selected task.
     /// An empty name clears the task's assignments.
     fn assign_resource(&mut self, name: &str) {
-        let Some(uid) = self.ed.selected_uid() else {
+        let Some(uid) = self.ed.shown_selected_uid() else {
             return;
         };
         let name = name.trim();
@@ -1023,7 +1023,7 @@ impl App {
                 self.prompt = Some(Prompt::new(PromptKind::Constraint, "Constraint", cur));
             }
             Act::Notes => {
-                let Some(uid) = self.ed.selected_uid() else {
+                let Some(uid) = self.ed.shown_selected_uid() else {
                     return;
                 };
                 // The one-line form: a stored newline prefills as `\n`, so
@@ -1172,7 +1172,7 @@ impl App {
 
     /// View › Data › Show Subtasks (`+`): expand the selected summary.
     fn show_subtasks(&mut self) {
-        if let Some(uid) = self.ed.selected_uid() {
+        if let Some(uid) = self.ed.shown_selected_uid() {
             if let Err(message) = self.ed.set_collapsed(uid, false) {
                 self.status = message;
             }
@@ -1182,7 +1182,7 @@ impl App {
     /// View › Data › Hide Subtasks (`-`): collapse the selected summary, or
     /// the summary of the selected subtask, as Project does.
     fn hide_subtasks(&mut self) {
-        if let Some(uid) = self.ed.selected_uid() {
+        if let Some(uid) = self.ed.shown_selected_uid() {
             if let Err(message) = self.ed.hide_subtasks(uid) {
                 self.status = message;
             }
@@ -1234,9 +1234,11 @@ impl App {
         let estimated = self.ed.project().new_tasks_estimated();
         match self
             .ed
-            .add_task(self.ed.selected_uid(), "New task", 480, estimated)
+            .add_task(self.ed.shown_selected_uid(), "New task", 480, estimated)
         {
-            Ok(at) => self.ed.select(at),
+            Ok(at) => {
+                self.ed.select_shown(at);
+            }
             Err(message) => self.status = message,
         }
     }
@@ -1244,8 +1246,10 @@ impl App {
     /// Insert a blank row above the selected row (Project's Insert Task ›
     /// Blank Row) and select it, so typing into it makes a task there.
     fn insert_blank_row(&mut self) {
-        match self.ed.insert_blank_row(self.ed.selected_uid()) {
-            Ok(at) => self.ed.select(at),
+        match self.ed.insert_blank_row(self.ed.shown_selected_uid()) {
+            Ok(at) => {
+                self.ed.select_shown(at);
+            }
             Err(message) => self.status = message,
         }
     }
@@ -1253,7 +1257,7 @@ impl App {
     /// Delete the selected task; a summary asks first, because its subtasks
     /// go with it.
     fn delete_task(&mut self) {
-        let Some(uid) = self.ed.selected_uid() else {
+        let Some(uid) = self.ed.shown_selected_uid() else {
             return;
         };
         match self.ed.subtree_len(uid) {
@@ -1304,7 +1308,7 @@ impl App {
     }
 
     fn indent(&mut self, delta: i32) {
-        if let Some(uid) = self.ed.selected_uid() {
+        if let Some(uid) = self.ed.shown_selected_uid() {
             if let Err(message) = self.ed.indent(uid, delta) {
                 self.status = message;
             }
@@ -1313,7 +1317,7 @@ impl App {
 
     fn set_duration(&mut self, text: &str) {
         // Keep invalid-input feedback even when there is no selected row.
-        if let Some(uid) = self.ed.selected_uid() {
+        if let Some(uid) = self.ed.shown_selected_uid() {
             if let Err(message) = self.ed.set_duration(uid, text) {
                 self.status = message;
             }
@@ -1390,7 +1394,7 @@ impl App {
     }
 
     fn rename(&mut self, text: &str) {
-        if let Some(uid) = self.ed.selected_uid() {
+        if let Some(uid) = self.ed.shown_selected_uid() {
             if let Err(message) = self.ed.rename(uid, text) {
                 self.status = message;
             }
@@ -1402,7 +1406,7 @@ impl App {
             self.status = "Predecessor must be a task ID (number)".into();
             return;
         };
-        let Some(uid) = self.ed.selected_uid() else {
+        let Some(uid) = self.ed.shown_selected_uid() else {
             self.status = "No task selected".into();
             return;
         };

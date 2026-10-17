@@ -233,7 +233,7 @@ fn filtering_a_month_keeps_its_rows_and_the_status_says_so() {
     // The summary stays for its March children; January's B goes.
     assert_eq!(names(&t), ["S", "A", "C"]);
     assert!(status_items(&t, false).contains(&("filter", AUTO_FILTER_STATUS.to_string())));
-    assert_eq!(t.status.as_ref(), AUTO_FILTER_STATUS);
+    assert_eq!(t.status.as_ref(), "Filtered by Finish");
 
     // Reopened, the March days are the checked ones.
     open(&mut t, COL_FINISH);
@@ -455,4 +455,131 @@ fn select_all_on_a_filtered_column_clears_the_filter() {
     assert!(!v(&t).ed.is_filtered());
     assert_eq!(t.status.as_ref(), "Filter cleared from Name");
     assert_eq!(names(&t), ["S", "B", "A", "C"]);
+}
+
+/// Names A..E (levels 1), Finish all on different March days.
+fn five() -> DocTab {
+    let task = |uid: i32, name: &str, day: u32| Task {
+        uid,
+        id: uid,
+        name: name.into(),
+        outline_level: 1,
+        duration_min: 480,
+        manual: true,
+        manual_start: Some(DateTime::from_ymd_hm(2026, 3, day, 8, 0)),
+        ..Task::default()
+    };
+    let project = Project {
+        start_date: Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0)),
+        tasks: vec![
+            task(1, "A", 2),
+            task(2, "B", 3),
+            task(3, "C", 4),
+            task(4, "D", 5),
+            task(5, "E", 6),
+        ],
+        ..Project::default()
+    };
+    let mut t = new_project_tab("Project1");
+    t.surface = Surface::Project(ProjectView::new(project, false));
+    t
+}
+
+fn filter_names(t: &mut DocTab, keep: &[usize]) {
+    open(t, COL_NAME);
+    let keep = keep.to_vec();
+    set_checks(t, move |checks, depths| {
+        gridcore::filter::check_tree(checks, depths, 0, false);
+        for k in keep {
+            gridcore::filter::check_tree(checks, depths, k, true);
+        }
+    });
+    dialog_click(t, "OK").unwrap();
+}
+
+#[test]
+fn a_commit_that_hides_the_edited_row_leaves_the_cursor_on_the_row_that_followed() {
+    let mut t = five();
+    filter_names(&mut t, &[1, 3, 5, 2]); // A, C, E, B shown; D hidden
+    assert_eq!(names(&t), ["A", "B", "C", "E"]);
+    // Rename C so it drops out; Enter must not skip E or jump to the top.
+    vm(&mut t).ed.select(2);
+    vm(&mut t).col = COL_NAME;
+    vm(&mut t).open_cell(Some("Zed")).unwrap();
+    project_cell_input(&mut t, "enter", None, Modifiers::default());
+    assert_eq!(names(&t), ["A", "B", "E"]);
+    let ed = &v(&t).ed;
+    assert_eq!(
+        ed.project().tasks[ed.sel()].name,
+        "E",
+        "the row that took its place"
+    );
+    assert_eq!(v(&t).col, COL_NAME);
+    // Tab does not carry the cursor across into another task's next column.
+    vm(&mut t).ed.select(1);
+    vm(&mut t).open_cell(Some("Yak")).unwrap();
+    project_cell_input(&mut t, "tab", None, Modifiers::default());
+    assert_eq!(v(&t).col, COL_NAME);
+    let ed = &v(&t).ed;
+    assert_eq!(ed.project().tasks[ed.sel()].name, "E");
+    // Shift+Enter goes up from the row that took its place.
+    vm(&mut t).open_cell(Some("Xi")).unwrap();
+    project_cell_input(
+        &mut t,
+        "enter",
+        None,
+        Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        },
+    );
+    assert_eq!(names(&t), ["A"]);
+}
+
+#[test]
+fn add_task_under_a_filter_that_hides_it_puts_the_cursor_on_the_entry_row() {
+    let mut t = five();
+    filter_names(&mut t, &[1]);
+    assert_eq!(names(&t), ["A"]);
+    vm(&mut t).ed.select(0);
+    apply_project_act(&mut t, ProjectAct::AddTask);
+    assert_eq!(v(&t).ed.project().tasks.len(), 6);
+    assert!(v(&t).on_entry_row());
+    assert!(v(&t).ed.display_rows().contains(&v(&t).ed.sel()));
+    assert_eq!(names(&t), ["A"]);
+}
+
+#[test]
+fn an_edit_that_hides_every_row_leaves_the_cursor_on_the_entry_row() {
+    let mut t = five();
+    filter_names(&mut t, &[1]);
+    vm(&mut t).ed.select(0);
+    vm(&mut t).col = COL_NAME;
+    vm(&mut t).open_cell(Some("Zed")).unwrap();
+    project_cell_input(&mut t, "tab", None, Modifiers::default());
+    assert!(names(&t).is_empty());
+    assert!(v(&t).on_entry_row());
+    // Up from the entry row with nothing drawn does nothing.
+    assert!(vm(&mut t).key("up", false));
+    assert!(v(&t).on_entry_row());
+}
+
+#[test]
+fn delete_under_a_filter_puts_the_cursor_on_the_next_drawn_row() {
+    let mut t = five();
+    filter_names(&mut t, &[1, 3, 5]); // A, C, E
+    vm(&mut t).ed.select(2);
+    apply_project_act(&mut t, ProjectAct::ClearCell);
+    let ed = &v(&t).ed;
+    assert_eq!(ed.project().tasks[ed.sel()].name, "E");
+}
+
+#[test]
+fn find_under_a_filter_only_finds_drawn_rows() {
+    let mut t = five();
+    filter_names(&mut t, &[1, 2]); // A, B
+    assert!(vm(&mut t).find("d").is_some());
+    assert_eq!(names(&t), ["A", "B"]);
+    let ed = &v(&t).ed;
+    assert!(ed.display_rows().contains(&ed.sel()));
 }

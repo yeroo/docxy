@@ -319,7 +319,7 @@ fn filter_texts_resolve_values_blanks_and_date_nodes() {
         ed.filter_texts(Field::Name, &specs(&["Zed"])),
         Err("No value 'Zed' in Name".to_string())
     );
-    // A text value that looks like a number is still a value first.
+    // (Blanks) names the blank value; a column with none refuses it.
     assert!(ed.filter_texts(Field::Name, &specs(&["(Blanks)"])).is_err());
 }
 
@@ -348,4 +348,104 @@ fn an_edit_that_hides_the_selected_task_moves_the_selection_to_a_displayed_row()
     ed.set_duration(1, "9d").unwrap();
     assert!(ed.display_rows().contains(&ed.sel()));
     assert_ne!(ed.selected_uid(), Some(1));
+}
+
+#[test]
+fn find_walks_the_drawn_rows_and_skips_filtered_ones() {
+    let mut ed = sample();
+    ed.set_filter(Field::Name, only(&["Cc", "bb", "S"]));
+    // "d" matches Dd and... only Dd (hidden): nothing to find.
+    assert_eq!(ed.find_from_top("dd"), FindOutcome::NotFound);
+    // "c" matches Cc only among the shown; it is found, not Dd or others.
+    assert_eq!(ed.find_from_top("c"), FindOutcome::Found(2));
+    ed.clear_filters();
+    // Sorted Z to A, F3 steps down the drawn rows: S, T, Dd, Cc, bb, B, A.
+    ed.set_sort(Some(Sort {
+        field: Field::Name,
+        descending: true,
+    }));
+    ed.select(1); // S
+    assert_eq!(ed.find("b"), FindOutcome::Found(3), "bb before B");
+    assert_eq!(ed.find(""), FindOutcome::Found(7), "then B");
+}
+
+#[test]
+fn a_hidden_selection_takes_the_row_that_followed_it_else_the_one_before() {
+    let mut ed = sample();
+    ed.set_filter(Field::Name, only(&["A", "Cc", "B"]));
+    // Storage: A, S, Cc, bb, T, Dd, blank, B. Shown: A, S (for Cc), Cc, B, blank.
+    // Rename Cc (shown, selected) to a name the filter hides: the next shown
+    // row after it in storage order is B.
+    ed.select(2);
+    ed.rename(3, "Qq").unwrap();
+    assert_eq!(ed.project().tasks[ed.sel()].name, "B");
+    // Hide B too: nothing after it is shown, the one before it is.
+    ed.rename(8, "Zz").unwrap();
+    assert!(ed.display_rows().contains(&ed.sel()));
+    assert_eq!(ed.project().tasks[ed.sel()].name, "A");
+}
+
+#[test]
+fn select_shown_reports_whether_the_row_is_shown_and_never_leaves_a_hidden_one() {
+    let mut ed = sample();
+    ed.set_filter(Field::Name, only(&["A"]));
+    assert!(ed.select_shown(0));
+    assert!(!ed.select_shown(7), "B is hidden");
+    assert!(ed.display_rows().contains(&ed.sel()));
+    assert_eq!(ed.shown_selected_uid(), ed.selected_uid());
+}
+
+#[test]
+fn a_filter_that_hides_everything_has_no_shown_selected_task() {
+    let mut ed = plan(&[(1, "A", 1, 1, (1, 6)), (2, "B", 1, 1, (1, 6))]);
+    ed.set_filter(Field::Name, only(&["A"]));
+    ed.select(0);
+    ed.rename(1, "C").unwrap();
+    assert!(ed.display_rows().is_empty());
+    assert_eq!(ed.shown_selected_uid(), None);
+}
+
+#[test]
+fn delete_under_a_filter_or_sort_keeps_the_place_among_the_drawn_rows() {
+    let mut ed = plan(&[
+        (1, "A", 1, 1, (1, 6)),
+        (2, "B", 1, 1, (1, 6)),
+        (3, "C", 1, 1, (1, 6)),
+        (4, "D", 1, 1, (1, 6)),
+        (5, "E", 1, 1, (1, 6)),
+    ]);
+    ed.set_filter(Field::Name, only(&["A", "C", "E"]));
+    ed.select(2);
+    ed.delete_task(3).unwrap();
+    assert_eq!(ed.project().tasks[ed.sel()].name, "E", "the next shown row");
+    ed.delete_task(5).unwrap();
+    assert_eq!(
+        ed.project().tasks[ed.sel()].name,
+        "A",
+        "the last row: the one before"
+    );
+    ed.clear_filters();
+    let mut ed = plan(&[
+        (1, "A", 1, 1, (1, 6)),
+        (2, "B", 1, 1, (1, 6)),
+        (3, "C", 1, 1, (1, 6)),
+    ]);
+    ed.set_sort(Some(Sort {
+        field: Field::Name,
+        descending: true,
+    }));
+    // Drawn C, B, A. Delete B: the cursor goes to A (the next drawn row).
+    ed.select(1);
+    ed.delete_task(2).unwrap();
+    assert_eq!(ed.project().tasks[ed.sel()].name, "A");
+}
+
+#[test]
+fn an_exact_value_wins_over_a_date_node() {
+    let mut ed = sample();
+    ed.rename(1, "2026").unwrap();
+    assert_eq!(
+        ed.filter_texts(Field::Name, &["2026".to_string()]),
+        Ok(BTreeSet::from(["2026".to_string()]))
+    );
 }

@@ -494,6 +494,13 @@
   Insert above/below, indent and outdent are refused while sorted ("Clear the
   sort first"); filtered, they act normally. Paste, fill and range selection
   walk the displayed rows.
+  One invariant keeps the cursor honest: after any operation the selection is
+  a displayed task (`Editor::sel_into_display`, run by `changed()`, takes the
+  next displayed row after it in the unfiltered order, else the one before;
+  `select_shown` is the post-edit select), and the suite's cursor is the entry
+  row when nothing is displayed or an edit's new task is hidden
+  (`ProjectView::place_cursor`, `complete_project`). Find and Delete walk the
+  drawn rows; yppxy's actions go through `shown_selected_uid`.
 - The suite's drop-down is a dialog like the sheet's filter button
   (`project-filter-menu`, `DialogOwner::ProjectFilter`, `project/autofilter.rs`),
   not a `MenuTarget`: Sort items (words by column type) apply and close, Group
