@@ -263,9 +263,34 @@ pub(crate) struct PluginCache {
 
 /// The view's switches as the plugins see them (`view` in every request),
 /// with the plan's formatting choices an overlay follows (#1548).
+/// The view JSON the state and overlay requests and a command carry: the
+/// view's switches, the plan's formatting (palette, link style, gridlines,
+/// the plugins' switches, every text style category, and the selected
+/// cells' styles, #1572) in the shape `Formatting::apply_view` reads.
 fn view_json(v: &ProjectView) -> Json {
     let formatting = &v.ed.project().formatting;
     let text = |s: &Option<String>| s.clone().map_or(Json::Null, Json::Str);
+    let selection = selection_of(v);
+    let text_styles = formatting
+        .text_styles
+        .iter()
+        .map(|c| (c.category.clone(), c.style.to_json()))
+        .collect();
+    let cells = formatting
+        .cell_styles
+        .iter()
+        .filter(|c| selection.uids.contains(&c.uid) && selection.cols.contains(&c.column))
+        .map(|c| {
+            let mut pairs = vec![
+                ("uid".to_string(), Json::Num(f64::from(c.uid))),
+                ("column".to_string(), Json::str(c.column.clone())),
+            ];
+            if let Json::Obj(style) = c.style.to_json() {
+                pairs.extend(style);
+            }
+            Json::Obj(pairs)
+        })
+        .collect();
     Json::obj(vec![
         ("critical", Json::Bool(v.show_critical)),
         ("baseline", Json::Bool(v.show_baseline)),
@@ -274,6 +299,8 @@ fn view_json(v: &ProjectView) -> Json {
         ("link_style", text(&formatting.link_style)),
         ("gridlines", text(&formatting.gridlines)),
         ("switches", formatting.switches_json()),
+        ("text_styles", Json::Obj(text_styles)),
+        ("cells", Json::Arr(cells)),
     ])
 }
 

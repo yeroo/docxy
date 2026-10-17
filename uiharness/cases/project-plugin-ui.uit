@@ -62,6 +62,30 @@ test a toggle runs its command and reads back checked as the plugin says
   call ribbon-read {}
   assert reply.tabs.1.groups.-1.commands.1.checked is true
 
+test a Bold toggle styles the selected cell and reads its state from the view's cells
+  # The view JSON carries the selected cells' styles (#1572): the fixture's
+  # Bold writes view.cells and shows checked where the cursor cell is bold.
+  open copy:../fixtures/project-clipboard.xml
+  click C2
+  call ribbon-read {}
+  assert reply.tabs.1.groups.-1.commands.-1.id is fixture.bold
+  assert reply.tabs.1.groups.-1.commands.-1.checked is false
+  call ribbon-click {"tab":"Task","command":"fixture.bold"}
+  assert status is Fixture: bold on
+  assert dirty is true
+  call ribbon-read {}
+  assert reply.tabs.1.groups.-1.commands.-1.checked is true
+  click C1
+  call ribbon-read {}
+  assert reply.tabs.1.groups.-1.commands.-1.checked is false
+  click C2
+  call ribbon-read {}
+  assert reply.tabs.1.groups.-1.commands.-1.checked is true
+  call ribbon-click {"tab":"Task","command":"fixture.bold"}
+  assert status is Fixture: bold off
+  call ribbon-read {}
+  assert reply.tabs.1.groups.-1.commands.-1.checked is false
+
 test a swatch sets the plan's palette (an edit) and the gallery follows
   open copy:../fixtures/project-clipboard.xml
   assert dirty is false

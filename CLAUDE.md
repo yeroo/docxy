@@ -326,7 +326,9 @@
   named `switches` a plugin owns, #1553: a command's `view.switches`
   `{name: bool|null}` sets or clears them, the state and overlay requests'
   view/flags carry them as `switches`, so a toggle's `checked` and what the
-  overlay draws follow the plan) is
+  overlay draws follow the plan; the view also carries every text style
+  category as `text_styles` and the selected cells' styles as `cells`,
+  #1572, so a Font toggle can show the cursor cell's style) is
   `Project::formatting`, edited as one undo step by `Editor::edit_formatting`
   (a command's `view` reply goes through `Formatting::apply_view`; yppxy's
   `--command` applies it too), saved in
