@@ -2216,7 +2216,7 @@ pub fn parse_duration(text: &str, proj: &Project) -> Option<i64> {
 }
 
 /// [`parse_duration`] with the unit it was typed in; a bare number is days.
-fn parse_duration_unit(text: &str, proj: &Project) -> Option<(i64, LagUnit)> {
+pub(crate) fn parse_duration_unit(text: &str, proj: &Project) -> Option<(i64, LagUnit)> {
     use LagUnit as Unit;
     let t = text.trim().to_lowercase();
     // Longest spellings first. The numeric remainder must parse in full, so

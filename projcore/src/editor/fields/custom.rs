@@ -202,3 +202,158 @@ fn lookup_value_list<'a>(definition: &'a XmlElement, guid: &str) -> Option<&'a s
         .and_then(|entry| entry.children.iter().find(|c| c.name == "Value"))
         .map(|c| c.text.as_str())
 }
+
+/// Project's task custom field ids start with these digits (resource fields
+/// with 2055, assignment fields with 2558): what tells the task `Text1`
+/// definition from the resource one of the same name when no value names
+/// it yet.
+const TASK_FIELD_ID_PREFIX: &str = "1887";
+
+/// The task definition of a custom field: the first whose `FieldName`
+/// matches and whose `FieldID` is a task field's.
+fn task_definition(proj: &Project, kind: CustomKind, n: u8) -> Option<&XmlElement> {
+    definitions(proj, kind, n)
+        .find(|def| child(def, "FieldID").is_some_and(|id| id.starts_with(TASK_FIELD_ID_PREFIX)))
+}
+
+/// The `ValueList` entries of a lookup-table definition: `(Value,
+/// FieldGUID)`.
+fn lookup_entries(definition: &XmlElement) -> Vec<(&str, Option<&str>)> {
+    definition
+        .children
+        .iter()
+        .find(|c| c.name == "ValueList")
+        .map(|list| {
+            list.children
+                .iter()
+                .filter(|entry| entry.name == "Value")
+                .filter_map(|entry| {
+                    let value = entry.children.iter().find(|c| c.name == "Value")?;
+                    Some((value.text.as_str(), child(entry, "FieldGUID")))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Money text in the plan's currency as units: the symbol, grouping commas
+/// and spaces dropped, a negative in parentheses or with a sign.
+fn parse_money(proj: &Project, text: &str) -> Option<f64> {
+    let currency = Currency::of(proj);
+    let mut t = text.trim().to_string();
+    if !currency.symbol.is_empty() {
+        t = t.replace(&currency.symbol, "");
+    }
+    let t = t.trim();
+    let negative = (t.starts_with('(') && t.ends_with(')')) || t.starts_with('-');
+    let digits: String = t
+        .chars()
+        .filter(|c| !matches!(c, '(' | ')' | '-' | ',' | ' '))
+        .collect();
+    let units = digits.parse::<f64>().ok().filter(|n| n.is_finite())?;
+    Some(if negative { -units } else { units })
+}
+
+/// The stored form of `text` typed into task `task`'s custom field `kind`
+/// `n`: the field's id and its value (`None` to clear). The field needs a
+/// task definition in the plan (Project's Custom Fields dialog makes one);
+/// a formula field is computed, not typed; a lookup-table field takes one
+/// of its table's values (by its text; the entry's guid is stored with it)
+/// unless the table appends new values. Text is kept; a number must parse;
+/// a cost is money in the plan's currency, stored in hundredths; a flag is
+/// Yes/No, true/false or 1/0; a date is `YYYY-MM-DD` (the task's day start)
+/// or `YYYY-MM-DDTHH:MM`; a duration is Project's spelling in working time
+/// (`3d`, `2.5 wks`), stored with the unit it was typed in.
+pub(super) fn value_for(
+    proj: &Project,
+    task: &Task,
+    kind: CustomKind,
+    n: u8,
+    text: &str,
+) -> Result<(String, Option<ExtendedAttributeValue>), String> {
+    let name = Field::Custom(kind, n).name();
+    let definition = task_definition(proj, kind, n).ok_or_else(|| {
+        format!("{name} has no definition in this plan: define it in Project's Custom Fields first")
+    })?;
+    let id = child(definition, "FieldID").unwrap_or_default().to_string();
+    if child(definition, "Formula").is_some_and(|f| !f.is_empty()) {
+        return Err(format!("{name} is computed by a formula"));
+    }
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok((id, None));
+    }
+    let value = |value: String| ExtendedAttributeValue {
+        field_id: id.clone(),
+        value: Some(value),
+        value_guid: None,
+        duration_format: None,
+    };
+    let entries = lookup_entries(definition);
+    if !entries.is_empty() {
+        if let Some((found, guid)) = entries
+            .iter()
+            .find(|(v, _)| v.trim().eq_ignore_ascii_case(text))
+        {
+            let mut stored = value(found.to_string());
+            stored.value_guid = guid.map(str::to_string);
+            return Ok((id, Some(stored)));
+        }
+        if child(definition, "AppendNewValues") != Some("1") {
+            let listed: Vec<&str> = entries.iter().map(|(v, _)| *v).collect();
+            return Err(format!(
+                "{name} takes one of its lookup table's values: {}",
+                listed.join(", ")
+            ));
+        }
+    }
+    let stored = match kind {
+        CustomKind::Text => value(text.to_string()),
+        CustomKind::Number => {
+            let number = text
+                .replace(',', "")
+                .parse::<f64>()
+                .ok()
+                .filter(|n| n.is_finite())
+                .ok_or_else(|| format!("{name} is a number, not '{text}'"))?;
+            value(number.to_string())
+        }
+        CustomKind::Cost => {
+            let units = parse_money(proj, text)
+                .ok_or_else(|| format!("{name} is an amount of money, not '{text}'"))?;
+            value(((units * 100.0).round()).to_string())
+        }
+        CustomKind::Flag => {
+            let lower = text.to_ascii_lowercase();
+            let on = match lower.as_str() {
+                "yes" | "true" | "1" => true,
+                "no" | "false" | "0" => false,
+                _ => return Err(format!("{name} is Yes or No, not '{text}'")),
+            };
+            value(if on { "1" } else { "0" }.to_string())
+        }
+        CustomKind::Date | CustomKind::Start | CustomKind::Finish => {
+            let at = match DateTime::parse_mspdi(text) {
+                Some(dt) if text.contains('T') => dt,
+                _ => super::cells::day_start(
+                    proj,
+                    task,
+                    super::cells::parse_cell_date(text)
+                        .map_err(|_| format!("{name} is a date (YYYY-MM-DD), not '{text}'"))?,
+                ),
+            };
+            value(at.to_mspdi())
+        }
+        CustomKind::Duration => {
+            let (min, unit) = crate::editor::parse_duration_unit(text, proj).ok_or_else(|| {
+                format!("{name} is a duration such as 3d or 2.5 wks, not '{text}'")
+            })?;
+            let mut stored = value(crate::mspdi::min_to_iso(min));
+            stored.duration_format = LagFormat::new(unit, false, false)
+                .map(|f| f.code())
+                .and_then(|c| u8::try_from(c).ok());
+            stored
+        }
+    };
+    Ok((id, Some(stored)))
+}

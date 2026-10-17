@@ -2694,7 +2694,7 @@ fn esc_into(text: &str, out: &mut String) {
     }
 }
 
-fn min_to_iso(min: i64) -> String {
+pub(crate) fn min_to_iso(min: i64) -> String {
     let (h, m) = (min / 60, min % 60);
     format!("PT{h}H{m}M0S")
 }

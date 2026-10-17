@@ -18,7 +18,7 @@
 //! | `task.list` | `{fields?}` | `{count, tasks:[{uid, id, outline_number, name, level, manual, duration, start, finish, critical, …}]}` |
 //! | `task.get` | `{uid, fields?}` | one task |
 //! | `task.fields` | — | `{count, fields:[name…]}`: the field names `fields` can read |
-//! | `task.set` | `{uid, name?, duration?, level?, manual?, percent_complete?, priority?, deadline?, constraint?, task_type?, effort_driven?, notes?, milestone?, calendar?, ignore_resource_calendar?, wbs?, earned_value_method?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled). The Task Information fields (#1550): `percent_complete` 0–100, `priority` 0–1000, `deadline` a date (`YYYY-MM-DD`, the day's last working time, or `YYYY-MM-DDTHH:MM`) or `null`, `constraint` `{type, date?}` with the type `ASAP`/`ALAP`/`MSO`/`MFO`/`SNET`/`SNLT`/`FNET`/`FNLT`, `task_type` `fixed-units`/`fixed-duration`/`fixed-work`, `effort_driven` and `milestone` booleans, `notes` text (`\n` line breaks), `calendar` a base calendar's name or uid or `null`, `ignore_resource_calendar` a boolean, `wbs` text, `earned_value_method` `percent-complete`/`physical-percent-complete`. Every argument is checked and all apply in one undo step, or none does |
+//! | `task.set` | `{uid, name?, duration?, level?, manual?, percent_complete?, priority?, deadline?, constraint?, task_type?, effort_driven?, notes?, milestone?, calendar?, ignore_resource_calendar?, wbs?, earned_value_method?, custom?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled). The Task Information fields (#1550): `percent_complete` 0–100, `priority` 0–1000, `deadline` a date (`YYYY-MM-DD`, the day's last working time, or `YYYY-MM-DDTHH:MM`) or `null`, `constraint` `{type, date?}` with the type `ASAP`/`ALAP`/`MSO`/`MFO`/`SNET`/`SNLT`/`FNET`/`FNLT`, `task_type` `fixed-units`/`fixed-duration`/`fixed-work`, `effort_driven` and `milestone` booleans, `notes` text (`\n` line breaks), `calendar` a base calendar's name or uid or `null`, `ignore_resource_calendar` a boolean, `wbs` text, `earned_value_method` `percent-complete`/`physical-percent-complete`. `custom` (#1554) is an object of Project custom field names to values as typed in the cell (`{"Text1": "Civil", "Flag3": true, "Date1": "2026-03-09", "Duration1": "3d", "Cost1": "$1,400", "Number1": null}`; `null` or `""` clears): the field needs a definition in the plan, a formula field is refused, a lookup-table field takes one of its values. Every argument is checked and all apply in one undo step, or none does |
 //! | `task.add` | `{after?, name?, duration?}` | the new task (without `duration`, 1 day, estimated when the plan's `NewTasksEstimated` is; inserted `after` a task that a finish-to-start link joins to the next, it is linked into that chain when the plan's `Autolink` is on, as it is by default) |
 //! | `task.del` | `{uid}` | `{deleted, removed:[uid…]}` (a summary takes its subtree) |
 //! | `link.add` | `{uid, pred, type?, lag?}` | the updated task (`lag` uses Predecessors cell spellings such as `4h`, `2ed`, `50%`; other duration spellings such as `1 month` are read as working-days lags) |
@@ -455,6 +455,8 @@ struct TaskInfoArgs {
     ignore_resource_calendar: Option<bool>,
     wbs: Option<String>,
     earned_value_method: Option<i32>,
+    /// Custom fields by Project's name, as typed (#1554).
+    custom: Vec<(Field, String)>,
 }
 
 impl TaskInfoArgs {
@@ -471,6 +473,7 @@ impl TaskInfoArgs {
             || self.ignore_resource_calendar.is_some()
             || self.wbs.is_some()
             || self.earned_value_method.is_some()
+            || !self.custom.is_empty()
     }
 
     /// Read the fields from `args`, for task `uid` of `ed`'s plan (dates
@@ -594,6 +597,29 @@ impl TaskInfoArgs {
             )),
             Some(_) => return Err("'calendar' must be a calendar name, uid or null".into()),
         };
+        let custom = match args.get("custom") {
+            None | Some(Json::Null) => Vec::new(),
+            Some(Json::Obj(pairs)) => pairs
+                .iter()
+                .map(|(name, value)| {
+                    let field = Field::parse(name)?;
+                    if !matches!(field, Field::Custom(..)) {
+                        return Err(format!("'custom' takes custom fields (Text1, Number2, Flag3, Date1, Start1, Finish1, Duration1, Cost1, ...), not '{name}'"));
+                    }
+                    let text = match value {
+                        Json::Str(s) => s.clone(),
+                        Json::Null => String::new(),
+                        Json::Bool(b) => b.to_string(),
+                        Json::Num(n) => n.to_string(),
+                        other => {
+                            return Err(format!("'custom.{name}' must be text, a number, a boolean or null, not {other}"));
+                        }
+                    };
+                    Ok((field, text))
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            Some(_) => return Err("'custom' must be an object of field name to value".into()),
+        };
         let earned_value_method = match args.get_str("earned_value_method") {
             None => None,
             Some(m) => Some(match m.trim().to_ascii_lowercase().as_str() {
@@ -621,6 +647,7 @@ impl TaskInfoArgs {
             ignore_resource_calendar: flag("ignore_resource_calendar")?,
             wbs: text("wbs")?,
             earned_value_method,
+            custom,
         })
     }
 
@@ -663,6 +690,9 @@ impl TaskInfoArgs {
         }
         if let Some(notes) = &self.notes {
             ed.set_notes(uid, &projcore::text::notes_from_line(notes))?;
+        }
+        for (field, text) in &self.custom {
+            ed.set_custom_field(uid, *field, text)?;
         }
         Ok(())
     }
@@ -2522,6 +2552,70 @@ it"
         let one = run(&mut ed, "task.get", r#"{"uid":1,"fields":["Work","Cost"]}"#).unwrap();
         assert_eq!(field(&one, "Work"), ("0 hrs", &Json::Num(0.0)));
         assert_eq!(field(&one, "Cost"), ("$0.00", &Json::Num(0.0)));
+    }
+
+    #[test]
+    fn task_set_writes_custom_fields_by_name() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Project xmlns="http://schemas.microsoft.com/project">
+  <StartDate>2026-03-02T08:00:00</StartDate>
+  <ExtendedAttributes>
+    <ExtendedAttribute><FieldID>188743731</FieldID><FieldName>Text1</FieldName><Alias>Trade</Alias>
+      <ValueList>
+        <Value><ID>1</ID><Value>Civil</Value><FieldGUID>7F2B5E61-7C21-4E0A-9B55-3C8D12A4E101</FieldGUID></Value>
+        <Value><ID>2</ID><Value>M&amp;E</Value><FieldGUID>7F2B5E61-7C21-4E0A-9B55-3C8D12A4E102</FieldGUID></Value>
+      </ValueList></ExtendedAttribute>
+    <ExtendedAttribute><FieldID>188743767</FieldID><FieldName>Number1</FieldName></ExtendedAttribute>
+    <ExtendedAttribute><FieldID>188743752</FieldID><FieldName>Flag1</FieldName></ExtendedAttribute>
+    <ExtendedAttribute><FieldID>188743737</FieldID><FieldName>Date1</FieldName></ExtendedAttribute>
+  </ExtendedAttributes>
+  <Tasks>
+    <Task><UID>1</UID><ID>1</ID><Name>Build</Name><OutlineLevel>1</OutlineLevel>
+      <Duration>PT16H0M0S</Duration>
+      <ExtendedAttribute><FieldID>188743731</FieldID><Value>Civil</Value></ExtendedAttribute></Task>
+  </Tasks>
+</Project>"#;
+        let mut ed = Editor::new(projcore::mspdi::read_mspdi(xml).unwrap());
+        let t = run(
+            &mut ed,
+            "task.set",
+            r#"{"uid":1,"wbs":"1.4","custom":{"Text1":"m&e","number1":12.5,"Flag1":true,"Date1":"2026-03-09"},"fields":["Text1","Number1","Flag1","Date1","WBS"]}"#,
+        )
+        .unwrap();
+        assert_eq!(field(&t, "Text1"), ("M&E", &Json::Str("M&E".into())));
+        assert_eq!(field(&t, "Number1"), ("12.5", &Json::Num(12.5)));
+        assert_eq!(field(&t, "Flag1"), ("Yes", &Json::Bool(true)));
+        assert_eq!(field(&t, "Date1").0, "Mon 3/9/26");
+        assert_eq!(field(&t, "WBS").0, "1.4");
+        // One undo step for the WBS and the four fields.
+        assert_eq!(ed.undo_depth(), 1);
+        // A cleared field, and a refusal that undoes the whole call.
+        let t = run(
+            &mut ed,
+            "task.set",
+            r#"{"uid":1,"custom":{"Number1":null},"fields":["Number1"]}"#,
+        )
+        .unwrap();
+        assert_eq!(field(&t, "Number1"), ("0", &Json::Null));
+        let before = ed.project().clone();
+        let err = run(
+            &mut ed,
+            "task.set",
+            r#"{"uid":1,"wbs":"9","custom":{"Text1":"Steel"}}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("Civil, M&E"), "{err}");
+        assert_eq!(*ed.project(), before);
+        for args in [
+            r#"{"uid":1,"custom":{"Name":"x"}}"#,
+            r#"{"uid":1,"custom":{"Text9":"x"}}"#,
+            r#"{"uid":1,"custom":{"Flag1":"maybe"}}"#,
+            r#"{"uid":1,"custom":{"Number1":[1]}}"#,
+            r#"{"uid":1,"custom":5}"#,
+        ] {
+            assert!(run(&mut ed, "task.set", args).is_err(), "{args}");
+        }
+        assert_eq!(*ed.project(), before);
     }
 
     #[test]
