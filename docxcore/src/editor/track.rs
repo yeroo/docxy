@@ -258,7 +258,7 @@ impl Editor {
         }
         if self.track.is_none() {
             if let Some(p) = para_mut(&mut self.doc.body, path) {
-                super::drop_spanned_objects(&mut p.content, lo, hi, from_before, to_after);
+                super::remove_indices(&mut p.content, &found);
             }
             return;
         }

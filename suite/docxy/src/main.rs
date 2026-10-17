@@ -5035,36 +5035,47 @@ impl DocTab {
     /// Typing in a document property control writes the property back to
     /// `docProps/core.xml` or `app.xml` and shows it in the other controls
     /// bound to it (#1433). Only an edit of a control's text counts
-    /// (`Editor::take_bound_edit`, in the open header or footer and in the
+    /// (`Editor::take_bound_edits`, in the open header or footer and in the
     /// body): a package-only change (Inspect Document's Remove All), a
     /// formatting change or a property another tool changed writes nothing.
     /// An undo or redo that puts the old text back writes the old value, and
     /// the other controls follow with no step of their own
-    /// (`Editor::set_bound_property`). A package without the part keeps the
+    /// (`Editor::set_bound_property`); the other editor takes it as an undo
+    /// step of its own. A package without the part keeps the
     /// text in its controls only, and controls in a header or footer that is
     /// not open are not reached.
     fn sync_bound_property(&mut self) {
         let (Surface::Doc(body), Some(pkg)) = (&mut self.surface, self.pkg.as_mut()) else {
             return;
         };
-        let from_body = body.take_bound_edit();
-        let from_hf = self
+        // Every edited property, the header or footer's first: where it was
+        // typed is its source, which takes the change with the edit's own
+        // undo step, and the other editor gets a step of its own.
+        let mut edits: Vec<(docxcore::sdt::BoundProp, String, bool)> = self
             .hf_edit
             .as_mut()
-            .and_then(|h| h.editor.take_bound_edit());
-        let Some((prop, text)) = from_hf.or(from_body) else {
-            return;
-        };
-        let Some(xml) = pkg.part_text(prop.part_name()) else {
-            return;
-        };
-        let Some(new) = prop.write(&xml, &text) else {
-            return;
-        };
-        pkg.set_part_text(prop.part_name(), &new);
-        body.set_bound_property(prop, &text);
-        if let Some(h) = &mut self.hf_edit {
-            h.editor.set_bound_property(prop, &text);
+            .map(|h| h.editor.take_bound_edits())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(p, t)| (p, t, true))
+            .collect();
+        for (p, t) in body.take_bound_edits() {
+            if !edits.iter().any(|(q, _, _)| *q == p) {
+                edits.push((p, t, false));
+            }
+        }
+        for (prop, text, from_hf) in edits {
+            let Some(xml) = pkg.part_text(prop.part_name()) else {
+                continue;
+            };
+            let Some(new) = prop.write(&xml, &text) else {
+                continue;
+            };
+            pkg.set_part_text(prop.part_name(), &new);
+            body.set_bound_property(prop, &text, from_hf);
+            if let Some(h) = &mut self.hf_edit {
+                h.editor.set_bound_property(prop, &text, !from_hf);
+            }
         }
     }
 

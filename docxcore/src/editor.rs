@@ -505,19 +505,30 @@ pub struct Editor {
     display_only: bool,
     /// The document property controls' texts as the host last saw them
     /// ([`Editor::take_bound_edit`]).
-    bound_seen: Vec<(crate::sdt::BoundProp, String)>,
+    bound_seen: Vec<(i64, crate::sdt::BoundProp, String)>,
 }
 
-/// Every document property control in `body` in document order, with the
-/// text it holds.
-fn bound_controls(body: &[Block]) -> Vec<(crate::sdt::BoundProp, String)> {
+/// Whether a control bound to `prop` in `body` shows other than `text`.
+fn bound_controls_differ(body: &[Block], prop: crate::sdt::BoundProp, text: &str) -> bool {
+    all_paragraph_paths(body).iter().any(|path| {
+        resolve_para(body, path).is_some_and(|p| {
+            crate::sdt::scan_paragraph(&p.content)
+                .iter()
+                .any(|c| c.prop == prop && c.text != text)
+        })
+    })
+}
+
+/// Every document property control with a content-control id in `body` in
+/// document order, with the text it holds.
+fn bound_controls(body: &[Block]) -> Vec<(i64, crate::sdt::BoundProp, String)> {
     let mut out = Vec::new();
     for path in all_paragraph_paths(body) {
         if let Some(p) = resolve_para(body, &path) {
             out.extend(
                 crate::sdt::scan_paragraph(&p.content)
                     .into_iter()
-                    .map(|c| (c.prop, c.text)),
+                    .filter_map(|c| Some((c.id?, c.prop, c.text))),
             );
         }
     }
@@ -1862,29 +1873,47 @@ impl Editor {
         out
     }
 
-    /// The document property a control's text was edited into since the host
-    /// last asked (#1433): the first control whose text differs from the one
-    /// it had then, with the new text. An edit, an undo or a redo of typing in
-    /// a control is that; a formatting change, a package-only change or a
-    /// control inserted or removed (the count changed) is not. The host
-    /// writes the property and calls [`Editor::set_bound_property`].
-    pub fn take_bound_edit(&mut self) -> Option<(crate::sdt::BoundProp, String)> {
+    /// The document properties whose controls' text was edited since the host
+    /// last asked (#1433): each with the new text, one per property, the
+    /// first changed control in document order giving it. A control is the
+    /// same one when its content-control id is, so a control inserted or
+    /// removed, or controls reordered, report nothing for themselves while
+    /// the ones present both times still report a change of text. An edit, an
+    /// undo or a redo of typing in a control is that; a formatting change or
+    /// a package-only change is not. The host writes each property and calls
+    /// [`Editor::set_bound_property`].
+    pub fn take_bound_edits(&mut self) -> Vec<(crate::sdt::BoundProp, String)> {
         let now = bound_controls(&self.doc.body);
         let was = std::mem::replace(&mut self.bound_seen, now);
-        if was.len() != self.bound_seen.len() {
-            return None;
+        let mut out: Vec<(crate::sdt::BoundProp, String)> = Vec::new();
+        for (id, prop, text) in &self.bound_seen {
+            let changed = was
+                .iter()
+                .find(|(was_id, _, _)| was_id == id)
+                .is_some_and(|(_, _, old)| old != text);
+            if changed && !out.iter().any(|(p, _)| p == prop) {
+                out.push((*prop, text.clone()));
+            }
         }
-        was.iter()
-            .zip(&self.bound_seen)
-            .find(|(a, b)| a != b)
-            .map(|(_, b)| b.clone())
+        out
     }
 
     /// Show `text` in every document property control bound to `prop`
-    /// (#1433), as one change with whatever edit set it: no undo step of its
-    /// own, so undoing that edit puts all of them back. The caret and anchor
+    /// (#1433). With `own_step` false it is one change with whatever edit set
+    /// the property in this editor: no undo step of its own, so undoing that
+    /// edit puts all of them back. With `own_step` true the property was set
+    /// from another editor (a header or footer, the body), and this change
+    /// is an undo step here, named for the property. The caret and anchor
     /// follow the text they stood after. True when a control changed.
-    pub fn set_bound_property(&mut self, prop: crate::sdt::BoundProp, text: &str) -> bool {
+    pub fn set_bound_property(
+        &mut self,
+        prop: crate::sdt::BoundProp,
+        text: &str,
+        own_step: bool,
+    ) -> bool {
+        if own_step && bound_controls_differ(&self.doc.body, prop, text) {
+            self.checkpoint(EditKind::Structural);
+        }
         let mut changed = false;
         for path in all_paragraph_paths(&self.doc.body) {
             let Some(p) = para_mut(&mut self.doc.body, &path) else {
@@ -4344,6 +4373,11 @@ fn drop_spanned_objects(
     to_after: bool,
 ) {
     let gone = spanned_object_indices(content, lo, hi, from_before, to_after);
+    remove_indices(content, &gone);
+}
+
+/// `content` without the inlines at the ascending indices `gone`.
+pub(crate) fn remove_indices(content: &mut Vec<Inline>, gone: &[usize]) {
     if gone.is_empty() {
         return;
     }

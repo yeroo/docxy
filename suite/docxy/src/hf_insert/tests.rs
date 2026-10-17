@@ -508,6 +508,111 @@ fn only_typing_in_a_control_writes_the_property_1433() {
     );
 }
 
+/// #1433: a property typed in the header is an undo step in the body too,
+/// so the body's Ctrl+Z undoes the property everywhere and the header takes
+/// it as a step of its own (and the other way round).
+#[test]
+fn a_property_copied_to_the_other_editor_is_an_undo_step_there_1433() {
+    let mut t = with_core("write-back-undo", "Ann", "Quarterly Report");
+    let control = property_control(&t, BoundProp::Title);
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!()
+    };
+    ed.paste(&Clip {
+        paras: vec![control],
+    });
+    t.set_dirty();
+    open_header(&mut t);
+    let control = property_control(&t, BoundProp::Title);
+    hf_ed(&mut t).paste(&Clip {
+        paras: vec![control],
+    });
+    t.set_dirty();
+    let core = |t: &DocTab| {
+        t.pkg
+            .as_ref()
+            .unwrap()
+            .part_text("docProps/core.xml")
+            .unwrap()
+    };
+    let body_text = |t: &DocTab| match &t.surface {
+        Surface::Doc(ed) => ed.doc.body[0].plain_text(),
+        _ => panic!(),
+    };
+    let hf_text = |t: &DocTab| t.hf_edit.as_ref().unwrap().editor.doc.body[0].plain_text();
+    hf_ed(&mut t).insert_char('!');
+    t.set_dirty();
+    assert!(core(&t).contains("Quarterly Report!"), "{}", core(&t));
+    assert!(
+        body_text(&t).contains("Quarterly Report!"),
+        "{}",
+        body_text(&t)
+    );
+    // The body's Ctrl+Z undoes the copy: the property is the old one
+    // everywhere, the header taking it as its own step.
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!()
+    };
+    assert!(ed.undo());
+    t.set_dirty();
+    assert!(
+        core(&t).contains("<dc:title>Quarterly Report</dc:title>"),
+        "{}",
+        core(&t)
+    );
+    assert!(!body_text(&t).contains('!'), "{}", body_text(&t));
+    assert!(!hf_text(&t).contains('!'), "{}", hf_text(&t));
+    // The header's Ctrl+Z undoes that step: the property is back, and the
+    // body takes it as a step of its own.
+    assert!(hf_ed(&mut t).undo());
+    t.set_dirty();
+    assert!(core(&t).contains("Quarterly Report!"), "{}", core(&t));
+    assert!(
+        body_text(&t).contains("Quarterly Report!"),
+        "{}",
+        body_text(&t)
+    );
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!()
+    };
+    assert!(ed.undo());
+    t.set_dirty();
+    assert!(!core(&t).contains('!'), "{}", core(&t));
+}
+
+/// #1433: two properties changed by one step both reach their parts.
+#[test]
+fn two_properties_changed_in_one_step_are_both_written_1433() {
+    let mut t = with_core("write-back-two", "Ann", "Quarterly Report");
+    for (prop, offset) in [(BoundProp::Title, 0), (BoundProp::Company, usize::MAX)] {
+        let control = property_control(&t, prop);
+        let Surface::Doc(ed) = &mut t.surface else {
+            panic!()
+        };
+        ed.set_caret(docxcore::editor::Caret::at(vec![0], offset));
+        ed.anchor = None;
+        ed.paste(&Clip {
+            paras: vec![control],
+        });
+    }
+    t.set_dirty();
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!()
+    };
+    // Both controls' text replaced at once, as a Replace All does.
+    let Block::Paragraph(p) = &mut ed.doc.body[0] else {
+        panic!()
+    };
+    for (k, text) in [(1, "Globex"), (0, "Annual Report")] {
+        let found = docxcore::sdt::scan_paragraph(&p.content);
+        docxcore::sdt::set_control_text(&mut p.content, &found[k], text);
+    }
+    t.set_dirty();
+    let part = |t: &DocTab, n: &str| t.pkg.as_ref().unwrap().part_text(n).unwrap();
+    assert!(part(&t, "docProps/core.xml").contains("<dc:title>Annual Report</dc:title>"));
+    assert!(part(&t, "docProps/app.xml").contains("<Company>Globex</Company>"));
+}
+
 /// A small PNG file in `dir`, `w` x `h` px.
 fn png_file(dir: &Path, name: &str, w: u32, h: u32) -> PathBuf {
     let mut b = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();

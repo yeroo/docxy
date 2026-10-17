@@ -67,7 +67,7 @@ impl BoundProp {
     }
 
     /// Whether the property lives in `docProps/app.xml`.
-    pub fn is_extended(self) -> bool {
+    fn is_extended(self) -> bool {
         matches!(self, Self::Company | Self::Manager)
     }
 
@@ -81,7 +81,7 @@ impl BoundProp {
     }
 
     /// The `w:storeItemID` of the property's data store.
-    pub fn store_id(self) -> &'static str {
+    fn store_id(self) -> &'static str {
         if self.is_extended() {
             EXTENDED_STORE_ID
         } else {
@@ -121,7 +121,7 @@ impl BoundProp {
     }
 
     /// The property a control's `w:dataBinding` names, if it is one of ours.
-    pub fn from_binding(store_id: &str, xpath: &str) -> Option<Self> {
+    fn from_binding(store_id: &str, xpath: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
             .find(|p| p.store_id().eq_ignore_ascii_case(store_id) && p.xpath() == xpath)
@@ -180,41 +180,46 @@ impl BoundProp {
 }
 
 /// A document property control in a paragraph's content (#1433): the `open`
-/// and `close` boundaries' indices, the editor offsets `start..end` its text
-/// spans, the property it is bound to and the text it holds (empty while it
+/// and `close` boundaries' indices, the editor offset `end` its text ends at, the property it is bound to and the text it holds (empty while it
 /// shows its placeholder).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParaControl {
     pub open: usize,
     pub close: usize,
-    pub start: usize,
     pub end: usize,
+    /// The control's `w:id`, which pairs it across edits.
+    pub id: Option<i64>,
     pub prop: BoundProp,
     pub text: String,
-    pub placeholder: bool,
+    pub(crate) placeholder: bool,
 }
 
 /// The document property controls among `content`, in order.
 pub fn scan_paragraph(content: &[Inline]) -> Vec<ParaControl> {
     let mut out = Vec::new();
     let mut at = 0;
-    let mut open: Option<(usize, usize, BoundProp, bool)> = None;
+    let mut open: Option<(usize, BoundProp, bool, Option<i64>)> = None;
     let mut text = String::new();
     for (k, inline) in content.iter().enumerate() {
         match inline {
             Inline::Raw(raw) if open.is_none() && raw.ends_with("<w:sdtContent>") => {
                 if let Some(prop) = binding_of(raw) {
-                    open = Some((k, at, prop, crate::sect::has_flag(raw, "w:showingPlcHdr")));
+                    open = Some((
+                        k,
+                        prop,
+                        crate::sect::has_flag(raw, "w:showingPlcHdr"),
+                        sdt_ids(raw).first().copied(),
+                    ));
                     text.clear();
                 }
             }
             Inline::Raw(raw) if open.is_some() && raw == crate::load::SDT_BLOCK_CLOSE => {
-                let (o, start, prop, placeholder) = open.take().expect("checked");
+                let (o, prop, placeholder, id) = open.take().expect("checked");
                 out.push(ParaControl {
                     open: o,
                     close: k,
-                    start,
                     end: at,
+                    id,
                     prop,
                     text: if placeholder {
                         String::new()

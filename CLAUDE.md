@@ -232,12 +232,15 @@
   `docProps/app.xml` under the extended-properties store item
   (`{55AF091B-…}`; unmeasured against Word). `DocTab::sync_bound_property`
   (in `set_dirty`) writes only an edit of a control's text
-  (`Editor::take_bound_edit`: a control's text differs from the host's last
-  look; formatting, inserting a control and package-only changes such as
-  Inspect Document's Remove All are not), in the open header/footer or the
-  body, to the part (`BoundProp::write`) and shows it in the other controls
-  with `Editor::set_bound_property`: no undo step of its own, so an undo puts
-  every control back and the next sync writes the old value back. Controls
+  (`Editor::take_bound_edits`: each control, paired by its `w:id`, whose text
+  differs from the host's last look, one per property; formatting, inserting,
+  removing or reordering controls and package-only changes such as Inspect
+  Document's Remove All are not), from the open header/footer and the body,
+  to the part (`BoundProp::write`). The editor the edit came from shows it in
+  its other controls with `Editor::set_bound_property` as part of the edit's
+  own undo step; the other editor takes it as an undo step of its own (so
+  its Ctrl+Z, like the source's, undoes the property everywhere through the
+  next sync). Controls
   in a header or footer that is not open, and a package without the part,
   are not reached; terminal `docxy` has no package sync.
 - Insert > Text has Date & Time... and Quick Parts (the H&F tab's commands,

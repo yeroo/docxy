@@ -872,36 +872,33 @@ fn typing_in_a_property_control_updates_the_others_1433() {
     let mut ed = Editor::new(Document { body });
     // Nothing was edited yet; a caret move or a formatting change is no edit.
     ed.set_caret(Caret::at(vec![0], 6));
-    assert_eq!(ed.take_bound_edit(), None);
+    assert_eq!(ed.take_bound_edits(), []);
     // Typing at the end of the control's text extends it.
     ed.insert_char('!');
-    assert_eq!(
-        ed.take_bound_edit(),
-        Some((BoundProp::Title, "Old!".into()))
-    );
-    assert_eq!(ed.take_bound_edit(), None);
+    assert_eq!(ed.take_bound_edits(), [(BoundProp::Title, "Old!".into())]);
+    assert_eq!(ed.take_bound_edits(), []);
     // The other control, in another paragraph, takes the text.
-    assert!(ed.set_bound_property(BoundProp::Title, "Old!"));
+    assert!(ed.set_bound_property(BoundProp::Title, "Old!", false));
     let text = |ed: &Editor, i: usize| para(ed, i).plain_text();
     assert_eq!(text(&ed, 1), "Old! end");
-    assert!(!ed.set_bound_property(BoundProp::Title, "Old!"));
-    assert_eq!(ed.take_bound_edit(), None, "the sync is not an edit");
+    assert!(!ed.set_bound_property(BoundProp::Title, "Old!", false));
+    assert_eq!(ed.take_bound_edits(), [], "the sync is not an edit");
     // Undoing the typing puts both back: the other control's change had no
     // step of its own. The host sees the old text as the edit.
     assert!(ed.undo());
     assert_eq!(text(&ed, 0), "T: Old");
     assert_eq!(text(&ed, 1), "Old end");
-    assert_eq!(ed.take_bound_edit(), Some((BoundProp::Title, "Old".into())));
+    assert_eq!(ed.take_bound_edits(), [(BoundProp::Title, "Old".into())]);
     // An emptied property shows the placeholder, flagged, and a value
     // clears the flag again.
-    ed.set_bound_property(BoundProp::Title, "");
+    ed.set_bound_property(BoundProp::Title, "", false);
     assert_eq!(text(&ed, 1), "[Title] end");
     assert!(saved(&ed).matches("<w:showingPlcHdr/>").count() >= 1);
-    ed.set_bound_property(BoundProp::Title, "Back");
+    ed.set_bound_property(BoundProp::Title, "Back", false);
     assert_eq!(text(&ed, 1), "Back end");
     assert!(!saved(&ed).contains("<w:showingPlcHdr/>"));
     // A control of another property is left alone.
-    assert!(!ed.set_bound_property(BoundProp::Author, "Ann"));
+    assert!(!ed.set_bound_property(BoundProp::Author, "Ann", false));
 }
 
 /// #1433: a control inserted, or a change that leaves every control's text
@@ -920,10 +917,75 @@ fn only_a_changed_control_text_is_a_bound_edit_1433() {
     ed.anchor = Some(Caret::at(vec![0], 0));
     ed.caret = Caret::at(vec![0], 3);
     ed.toggle_bold();
-    assert_eq!(ed.take_bound_edit(), None);
+    assert_eq!(ed.take_bound_edits(), []);
     // A second control pasted in: the count changed, not an edit.
     ed.set_caret(Caret::at(vec![0], 3));
     let other = core_property_control(BoundProp::Title, "Old", 2, &RunProps::default());
     ed.insert_object(other);
-    assert_eq!(ed.take_bound_edit(), None);
+    assert_eq!(ed.take_bound_edits(), []);
+}
+
+fn first_content(ed: &mut Editor) -> &mut Vec<Inline> {
+    match &mut ed.doc.body[0] {
+        Block::Paragraph(p) => &mut p.content,
+        _ => panic!(),
+    }
+}
+
+/// #1433: controls are paired by their content-control id. Two properties
+/// changed in one step both report; a swap, or a control replaced by another,
+/// reports nothing; a count change still reports a surviving control's text.
+#[test]
+fn bound_edits_pair_controls_by_id_1433() {
+    use crate::sdt::{BoundProp, core_property_control, scan_paragraph, set_control_text};
+    let two = || {
+        let mut content = core_property_control(BoundProp::Title, "T", 1, &RunProps::default());
+        content.extend(core_property_control(
+            BoundProp::Author,
+            "A",
+            2,
+            &RunProps::default(),
+        ));
+        Editor::new(Document {
+            body: vec![Block::Paragraph(Paragraph {
+                props: ParProps::default(),
+                content,
+            })],
+        })
+    };
+    // Both texts change in one step: one edit per property.
+    let mut ed = two();
+    let c = first_content(&mut ed);
+    for k in (0..2).rev() {
+        let found = scan_paragraph(c);
+        set_control_text(c, &found[k], if k == 0 { "T2" } else { "A2" });
+    }
+    assert_eq!(
+        ed.take_bound_edits(),
+        [
+            (BoundProp::Title, "T2".into()),
+            (BoundProp::Author, "A2".into())
+        ]
+    );
+    // The two swapped: no edit.
+    let mut ed = two();
+    let c = first_content(&mut ed);
+    let (title, author) = c.split_at(3);
+    *c = [author, title].concat();
+    assert_eq!(ed.take_bound_edits(), []);
+    // One replaced by another control of the same count and another id.
+    let mut ed = two();
+    let c = first_content(&mut ed);
+    c.splice(
+        0..3,
+        core_property_control(BoundProp::Title, "Other", 9, &RunProps::default()),
+    );
+    assert_eq!(ed.take_bound_edits(), []);
+    // One removed while the other's text changed: the survivor reports.
+    let mut ed = two();
+    let c = first_content(&mut ed);
+    let found = scan_paragraph(c);
+    set_control_text(c, &found[1], "A3");
+    c.drain(0..3);
+    assert_eq!(ed.take_bound_edits(), [(BoundProp::Author, "A3".into())]);
 }
