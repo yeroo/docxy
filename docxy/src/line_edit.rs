@@ -108,6 +108,40 @@ impl LineEdit {
         true
     }
 
+    /// The selected text, if any (#1377).
+    pub fn selected_text(&self) -> Option<String> {
+        let (from, to) = self.selection()?;
+        Some(self.buf[self.byte(from)..self.byte(to)].to_string())
+    }
+
+    /// Removes the selection and returns its text (#1377).
+    pub fn cut(&mut self) -> Option<String> {
+        let text = self.selected_text()?;
+        self.delete_selection();
+        Some(text)
+    }
+
+    /// Inserts the first line of `text` at the caret, replacing a selection,
+    /// the caret after it; control characters are dropped. Whether the text
+    /// changed (#1377).
+    pub fn paste(&mut self, text: &str) -> bool {
+        let line: String = text
+            .split(['\r', '\n'])
+            .next()
+            .unwrap_or("")
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        let had = self.delete_selection();
+        if line.is_empty() {
+            return had;
+        }
+        let at = self.byte(self.caret);
+        self.buf.insert_str(at, &line);
+        self.caret += line.chars().count();
+        true
+    }
+
     pub fn insert(&mut self, c: char) {
         self.delete_selection();
         let at = self.byte(self.caret);
@@ -245,6 +279,35 @@ mod tests {
             l.insert(c);
         }
         l
+    }
+
+    #[test]
+    fn copy_cut_and_paste_a_selection() {
+        let mut l = typed("abcd");
+        assert_eq!(l.selected_text(), None);
+        assert_eq!(l.cut(), None);
+        l.select_all();
+        assert_eq!(l.selected_text().as_deref(), Some("abcd"));
+        assert_eq!((l.as_str(), l.caret()), ("abcd", 4));
+        assert_eq!(l.cut().as_deref(), Some("abcd"));
+        assert_eq!((l.as_str(), l.caret()), ("", 0));
+        assert!(l.paste("xy"));
+        assert!(l.paste("z"));
+        l.home();
+        l.right();
+        l.anchor = Some(0);
+        assert!(l.paste("QQ"));
+        assert_eq!((l.as_str(), l.caret()), ("QQyz", 2));
+    }
+
+    #[test]
+    fn paste_takes_the_first_line() {
+        let mut l = LineEdit::default();
+        assert!(l.paste("North\n"));
+        assert!(l.paste("a\tb\r\nc"));
+        assert_eq!((l.as_str(), l.caret()), ("Northab", 7));
+        assert!(!l.paste("\nx"));
+        assert_eq!(l.as_str(), "Northab");
     }
 
     #[test]
