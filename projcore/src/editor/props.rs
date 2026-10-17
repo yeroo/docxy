@@ -180,6 +180,46 @@ impl Editor {
         Ok(true)
     }
 
+    /// Set a custom field (`Text1`, `Number3`, `Flag2`, `Date1`, `Start1`,
+    /// `Finish1`, `Duration1`, `Cost1`, ...) from its text, as typed in the
+    /// field's cell (#1554): the field needs a task definition in the plan,
+    /// a formula field is refused, a lookup-table field takes one of its
+    /// values, an empty text clears the value. `Ok(false)` when the stored
+    /// value is already what the text means. Outline codes are not custom
+    /// fields here.
+    pub fn set_custom_field(
+        &mut self,
+        uid: i32,
+        field: super::fields::Field,
+        text: &str,
+    ) -> Result<bool, String> {
+        let super::fields::Field::Custom(kind, n) = field else {
+            return Err(format!("{} is not a custom field", field.name()));
+        };
+        let i = self.property_row(uid)?;
+        let (id, next) =
+            super::fields::custom_value_for(&self.proj, &self.proj.tasks[i], kind, n, text)?;
+        let values = &self.proj.tasks[i].extended_attributes;
+        let at = values.iter().position(|v| v.field_id.trim() == id);
+        match (at, &next) {
+            (None, None) => return Ok(false),
+            (Some(at), Some(v)) if values[at] == *v => return Ok(false),
+            _ => {}
+        }
+        self.snapshot();
+        let values = &mut self.proj.tasks[i].extended_attributes;
+        match (at, next) {
+            (Some(at), None) => {
+                values.remove(at);
+            }
+            (Some(at), Some(v)) => values[at] = v,
+            (None, Some(v)) => values.push(v),
+            (None, None) => unreachable!(),
+        }
+        self.changed();
+        Ok(true)
+    }
+
     /// Set the task's earned value method ([`EV_PERCENT_COMPLETE`] or
     /// [`EV_PHYSICAL_PERCENT_COMPLETE`]).
     pub fn set_earned_value_method(&mut self, uid: i32, method: i32) -> Result<bool, String> {

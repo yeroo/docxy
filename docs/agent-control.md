@@ -72,7 +72,12 @@ new line), `milestone`, `calendar` (a base calendar's name or UID, `null` or
 (`percent-complete|physical-percent-complete`). A date is `YYYY-MM-DD` (a
 deadline, FNLT or MFO date ends the working day, the other types start it) or
 `YYYY-MM-DDTHH:MM`. Every field given applies with the patch as one undo step,
-and a refused field applies nothing.
+and a refused field applies nothing. `custom` (#1554) writes custom fields by
+Project's names, each value as typed in the field's cell: `{"custom":
+{"Text1": "Civil", "Flag3": true, "Date1": "2026-03-09", "Duration1": "3d",
+"Cost1": "$1,400", "Number1": null}}` (`null` or `""` clears). The field needs
+a definition in the plan (Project's Custom Fields dialog makes one), a formula
+field is refused, and a lookup-table field takes one of its table's values.
 
 Every task in `task.list`, `task.get` and `find` also reports its row `id` and
 its `outline_number` (`1.2`; `0` for the project summary row, `null` for a

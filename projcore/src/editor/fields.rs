@@ -539,6 +539,19 @@ impl<'a> FieldReader<'a> {
     }
 }
 
+/// The stored form of `text` typed into a task's custom field (`#1554`):
+/// the field's id and its value, `None` to clear. See
+/// [`Editor::set_custom_field`].
+pub(crate) fn custom_value_for(
+    proj: &Project,
+    task: &Task,
+    kind: CustomKind,
+    n: u8,
+    text: &str,
+) -> Result<(String, Option<crate::model::ExtendedAttributeValue>), String> {
+    custom::value_for(proj, task, kind, n, text)
+}
+
 /// A task's mode as Project's Task Mode column shows it.
 pub fn task_mode_name(manual: bool) -> &'static str {
     if manual {
