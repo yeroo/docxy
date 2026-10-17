@@ -884,6 +884,8 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
     let ed = &v.ed;
     let tasks = &ed.project().tasks;
     let shown = ed.visible_rows();
+    let sched = ed.schedule();
+    let reader = projcore::editor::FieldReader::new(ed);
     // An instant's x in chart pixels, within its day.
     let x_at = |d: projcore::DateTime| {
         (d.minutes() - scale.origin_day * 1440) as f32 / 1440.0 * crate::DAY_W
@@ -907,6 +909,7 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
                 projcore::ConstraintType::AsSoonAsPossible
                     | projcore::ConstraintType::AsLateAsPossible
             );
+            let result = sched.get(task.uid);
             Some(OverlayRow {
                 uid: task.uid,
                 row_y,
@@ -927,6 +930,25 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
                     .filter(|_| dated)
                     .map(|d| (task.constraint.abbrev().to_string(), x_at(d))),
                 resource_names: projcore::editor::format_resource_names(ed.project(), task.uid),
+                status: reader.read(task, projcore::editor::Field::Status).text,
+                late_start_x: result.map(|r| x_at(r.late_start)),
+                late_finish_x: result.map(|r| x_at(r.late_finish)),
+                slack_x: result
+                    .zip(ed.disp_finish(task.uid))
+                    .and_then(|(r, finish)| {
+                        ed.working_time_after(task.uid, finish, r.free_slack_min)
+                    })
+                    .map(x_at),
+                total_slack_min: result.map_or(0, |r| r.total_slack_min),
+                free_slack_min: result.map_or(0, |r| r.free_slack_min),
+                baselines: task
+                    .baselines
+                    .iter()
+                    .filter_map(|b| {
+                        let x = x_at(b.start?);
+                        Some((b.number, x, (x_at(b.finish?) - x).max(0.0)))
+                    })
+                    .collect(),
             })
         })
         .collect();
@@ -935,12 +957,14 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
         .iter()
         .filter(|t| shown_uids.contains(&t.uid))
         .flat_map(|t| {
+            let driving = ed.driving_predecessors(t.uid);
             t.predecessors
                 .iter()
                 .filter(|p| shown_uids.contains(&p.uid))
                 .map(move |p| OverlayLink {
                     pred: p.uid,
                     succ: t.uid,
+                    driving: driving.contains(&p.uid),
                     kind: match p.link {
                         projcore::LinkType::FinishStart => "FS",
                         projcore::LinkType::StartStart => "SS",
@@ -966,6 +990,9 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
         links,
         status_date,
         current_date,
+        selected: selection_of(v).uids,
+        project_start_x: Some(x_at(sched.project_start)),
+        project_finish_x: Some(x_at(sched.project_finish)),
         flags: view_json(v),
     }
 }

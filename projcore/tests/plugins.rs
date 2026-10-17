@@ -303,6 +303,7 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         status_date: None,
         current_date: None,
         flags: Json::Obj(Vec::new()),
+        ..OverlayCtx::default()
     };
     let shapes = ui.overlay(&overlay).unwrap();
     assert_eq!(shapes.len(), 3);

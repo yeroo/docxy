@@ -168,5 +168,75 @@ fn has_link_cycle(tasks: &[Task]) -> bool {
     done < edges.len()
 }
 
+impl Editor {
+    /// The predecessors that set `uid`'s dates, as Project's Task Path
+    /// marks its driving predecessors: the link's target (the predecessor's
+    /// early finish for FS and FF, early start for SS and SF, moved by the
+    /// lag on the successor's calendar) is the successor's early start (FS,
+    /// SS) or early finish (FF, SF). Ties all drive. A manual task, an
+    /// inactive predecessor and a lead (negative lag) drive nothing.
+    pub fn driving_predecessors(&self, uid: i32) -> Vec<i32> {
+        let proj = self.project();
+        let (Some(task), Some(own)) = (proj.task(uid), self.schedule().get(uid)) else {
+            return Vec::new();
+        };
+        if task.manual {
+            return Vec::new();
+        }
+        let cal = crate::assign::task_calendar(proj, task);
+        task.predecessors
+            .iter()
+            .filter(|p| {
+                let (Some(pred), Some(pr)) = (proj.task(p.uid), self.schedule().get(p.uid)) else {
+                    return false;
+                };
+                if pred.active == Some(false) {
+                    return false;
+                }
+                let Some(lag) = p.lag_minutes(pred.duration_min) else {
+                    return false;
+                };
+                if lag < 0 {
+                    return false;
+                }
+                let anchor = match p.link {
+                    LinkType::FinishStart | LinkType::FinishFinish => pr.early_finish,
+                    LinkType::StartStart | LinkType::StartFinish => pr.early_start,
+                };
+                let to_finish = matches!(p.link, LinkType::FinishFinish | LinkType::StartFinish);
+                let target = match p.lag_format.kind() {
+                    LagKind::Elapsed if to_finish => Some(anchor.add_minutes(lag)),
+                    LagKind::Elapsed => {
+                        crate::assign::advance(&cal, anchor.add_minutes(lag), 0, false)
+                    }
+                    _ => crate::assign::advance(&cal, anchor, lag, to_finish),
+                };
+                let actual = if to_finish {
+                    own.early_finish
+                } else {
+                    own.early_start
+                };
+                target == Some(actual)
+            })
+            .map(|p| p.uid)
+            .collect()
+    }
+
+    /// `minutes` of working time on `uid`'s calendar after `from`, as a
+    /// finish (an instant at a period's end stays there): where a chart ends
+    /// the task's slack. `None` for an unknown task or a calendar without
+    /// working time.
+    pub fn working_time_after(&self, uid: i32, from: DateTime, minutes: i64) -> Option<DateTime> {
+        let proj = self.project();
+        let task = proj.task(uid)?;
+        crate::assign::advance(
+            &crate::assign::task_calendar(proj, task),
+            from,
+            minutes,
+            true,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests;

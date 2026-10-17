@@ -471,11 +471,16 @@ without one nothing changes.
   `values`; `view` sets host view settings (the palette, flags). Code 1
   (unsupported) means "not my command", so several plugins can coexist.
 - **Overlay** (`yppx_ui_overlay`): the rows in view (`uid`, `row_y`, the bar
-  rectangle, kind flags, and since #1548 `name`, `percent_complete`,
-  `deadline_x`, `constraint {type, x}` and `resource_names`), the scale
-  (`origin_day`, `day_w`, `row_h`), the links, the status and current dates
-  and the view flags (the switches, the plan's `palette`, `link_style` and
-  `gridlines`) in; shapes in chart pixels out (`polyline`, `dashed`,
+  rectangle, kind flags, since #1548 `name`, `percent_complete`,
+  `deadline_x`, `constraint {type, x}` and `resource_names`, and since
+  #1552 `status` (Project's Status text), `late_start_x`, `late_finish_x`,
+  `slack_x` (where the free slack ends), `total_slack_min`,
+  `free_slack_min` and `baselines [{slot, x, w}]`), the scale
+  (`origin_day`, `day_w`, `row_h`), the links (each `driving` when it sets
+  the successor's dates, `Editor::driving_predecessors`), the status and
+  current dates, the `selected` UIDs (the cursor's first), the project
+  start and finish x and the view flags (the switches, the plan's
+  `palette`, `link_style` and `gridlines`) in; shapes in chart pixels out (`polyline`, `dashed`,
   `arrow`, `bracket`, `rect`, `text`, each with a colour and width), drawn
   over the bars.
 - **Loader.** `projcore::formats::plugin::load_plugins_for(dirs, Some(Host

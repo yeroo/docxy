@@ -285,3 +285,48 @@ fn outline_extents_match_subtree_end() {
         ]
     );
 }
+
+#[test]
+fn driving_predecessors_are_the_links_that_set_the_dates() {
+    // 1 (1d) and 2 (2d) both precede 3 (FS): 2 finishes later, so it alone
+    // drives 3. 4 starts with 2 (SS) and ends with 3 (FF, 1d lag): the SS
+    // sets its start, the FF its finish, so both drive. 5 is manual: none.
+    let mut proj = project(&[
+        (1, "A", 1),
+        (2, "B", 1),
+        (3, "C", 1),
+        (4, "D", 1),
+        (5, "E", 1),
+    ]);
+    proj.tasks[1].duration_min = 960;
+    link(&mut proj, 3, 1);
+    link(&mut proj, 3, 2);
+    proj.tasks[3].predecessors.push(Predecessor {
+        uid: 2,
+        link: LinkType::StartStart,
+        ..Predecessor::fs(2)
+    });
+    proj.tasks[3].predecessors.push(Predecessor {
+        uid: 3,
+        link: LinkType::FinishFinish,
+        lag: 480,
+        ..Predecessor::fs(3)
+    });
+    proj.tasks[3].duration_min = 1920;
+    link(&mut proj, 5, 1);
+    proj.tasks[4].manual = true;
+    let ed = Editor::new(proj);
+    assert_eq!(ed.driving_predecessors(3), [2]);
+    assert_eq!(ed.driving_predecessors(4), [2, 3]);
+    assert_eq!(ed.driving_predecessors(5), Vec::<i32>::new());
+    assert_eq!(ed.driving_predecessors(1), Vec::<i32>::new());
+    assert_eq!(ed.driving_predecessors(99), Vec::<i32>::new());
+    // Working time after a finish: a day after Monday 17:00 is Tuesday 17:00.
+    let monday_end = DateTime::from_ymd_hm(2026, 1, 5, 17, 0);
+    assert_eq!(
+        ed.working_time_after(1, monday_end, 480),
+        Some(DateTime::from_ymd_hm(2026, 1, 6, 17, 0))
+    );
+    assert_eq!(ed.working_time_after(1, monday_end, 0), Some(monday_end));
+    assert_eq!(ed.working_time_after(99, monday_end, 480), None);
+}
