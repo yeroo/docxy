@@ -246,6 +246,9 @@ struct OverlayKey {
     /// The shown rows' tasks: a collapsed or expanded summary changes the
     /// rows (and their links) without a change of the plan.
     shown: Vec<usize>,
+    /// The selection the request carries (#1552): a plugin may draw the
+    /// selected task's path, so moving the cursor asks again (#1565).
+    selected: Vec<i32>,
 }
 
 /// The plugins' answers a view keeps between changes.
@@ -1049,6 +1052,7 @@ pub(crate) fn overlay_shapes(v: &ProjectView) -> Rc<Vec<Shape>> {
         days: scale.days,
         flags: flags_of(v),
         shown: v.ed.visible_rows(),
+        selected: selection_of(v).uids,
     };
     let mut cache = v.plugin_cache.borrow_mut();
     if cache.overlay_key.as_ref() != Some(&key) {

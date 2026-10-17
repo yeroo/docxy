@@ -363,7 +363,8 @@
   `items` replace a dropdown, radio or list control's items for that
   opening and its `enabled` greys controls (#1556, `plugin_ui::Prefill`). The overlay (`gantt_overlay` in `gantt.rs`,
   a canvas after the rows, clipped to the chart, scrolled with it) paints
-  `overlay_shapes`, cached by revision, scale and flags; `bar_look` draws the
+  `overlay_shapes`, cached by revision, scale, flags, the shown rows and the
+  selection (#1565); `bar_look` draws the
   bars in the palette the plan's formatting names (`plugin_ui::palette`),
   and `row_style`/`cell_style`/`category_style` draw the formatting's text
   styles (`Column Titles` on the headings). The harness reports contributed
@@ -404,7 +405,8 @@
   `items` replace a dropdown, radio or list control's items for that
   opening and its `enabled` greys controls (#1556, `plugin_ui::Prefill`). The overlay (`gantt_overlay` in `gantt.rs`,
   a canvas after the rows, clipped to the chart, scrolled with it) paints
-  `overlay_shapes`, cached by revision, scale and flags; `bar_look` draws the
+  `overlay_shapes`, cached by revision, scale, flags, the shown rows and the
+  selection (#1565); `bar_look` draws the
   bars in the palette the plan's formatting names (`plugin_ui::palette`),
   and `row_style`/`cell_style`/`category_style` draw the formatting's text
   styles (`Column Titles` on the headings). The harness reports contributed
