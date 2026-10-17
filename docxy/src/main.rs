@@ -5826,6 +5826,7 @@ impl App {
     /// Handle a key while the find/replace bar is open. Never quits.
     fn on_find_key(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Esc => {
                 if let Some(q) = self.find.as_ref().map(|f| f.query.as_str().to_string()) {
@@ -5851,6 +5852,17 @@ impl App {
             }
             KeyCode::Char('f') if ctrl => self.find_step(1),
             KeyCode::Char('a') if ctrl => {
+                if let Some(f) = &mut self.find {
+                    match &mut f.replacement {
+                        Some(repl) if f.editing_replacement => repl.select_all(),
+                        _ => f.query.select_all(),
+                    }
+                }
+                self.dirty = true;
+            }
+            // Replace All is Word's Alt+A button accelerator (#1375); with no
+            // Replace field it does nothing, and it never types an `a`.
+            KeyCode::Char('a' | 'A') if alt && !ctrl => {
                 if let Some((q, Some(repl))) = self.find.as_ref().map(|f| {
                     (
                         f.query.as_str().to_string(),
@@ -6787,16 +6799,17 @@ impl App {
         use ctlcore::field::Field;
         let field = match id {
             "docxy-find" => self.find.as_ref().map(|f| {
-                Field::with_caret(
-                    f.query.as_str(),
-                    !(f.replacement.is_some() && f.editing_replacement),
-                    f.query.caret(),
-                )
+                let focused = !(f.replacement.is_some() && f.editing_replacement);
+                Field {
+                    selection: f.query.selection().filter(|_| focused),
+                    ..Field::with_caret(f.query.as_str(), focused, f.query.caret())
+                }
             }),
             "docxy-replace" => self.find.as_ref().and_then(|f| {
-                f.replacement
-                    .as_ref()
-                    .map(|r| Field::with_caret(r.as_str(), f.editing_replacement, r.caret()))
+                f.replacement.as_ref().map(|r| Field {
+                    selection: r.selection().filter(|_| f.editing_replacement),
+                    ..Field::with_caret(r.as_str(), f.editing_replacement, r.caret())
+                })
             }),
             "docxy-comment" => self
                 .comment_input
@@ -7216,7 +7229,7 @@ impl App {
                 Some(_) => {
                     let (q, repl) = replace_drawn(f);
                     format!(
-                        " Replace: {q} → {repl}  ({cur})  ·  ↵ replace · Ctrl-A all · Tab field · Esc done",
+                        " Replace: {q} → {repl}  ({cur})  ·  ↵ replace · Alt-A all · Tab field · Esc done",
                     )
                 }
             }
@@ -9671,6 +9684,9 @@ mod tests {
     }
     fn ctrl(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+    fn alt(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT)
     }
     fn alt_shift(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::ALT | KeyModifiers::SHIFT)
@@ -12272,7 +12288,7 @@ mod tests {
         app.on_key(key(KeyCode::Char('x')));
         app.on_key(key(KeyCode::Tab));
         app.on_key(key(KeyCode::Char('Z')));
-        app.on_key(ctrl(KeyCode::Char('a')));
+        app.on_key(alt(KeyCode::Char('a')));
         assert_eq!(first_line(&app), "x y x");
         assert!(!app.modified);
 
@@ -14772,8 +14788,52 @@ mod tests {
         app.on_key(key(KeyCode::Char('x'))); // query
         app.on_key(key(KeyCode::Tab)); // switch to replace field
         app.on_key(key(KeyCode::Char('Z'))); // replacement
-        app.on_key(ctrl(KeyCode::Char('a'))); // replace all
+        app.on_key(alt(KeyCode::Char('a'))); // replace all
         assert_eq!(first_line(&app), "Z y Z");
+    }
+
+    #[test]
+    fn ctrl_a_in_the_find_bar_selects_the_field_and_typing_replaces_it() {
+        let mut app = app_with(&["x y x"]);
+        app.on_key(ctrl(KeyCode::Char('f')));
+        app.on_key(key(KeyCode::Char('x')));
+        app.on_key(key(KeyCode::Char('y')));
+        app.on_key(ctrl(KeyCode::Char('a')));
+        assert_eq!(app.input_field("docxy-find").selection, Some((0, 2)));
+        app.on_key(key(KeyCode::Char('z')));
+        let f = app.find.as_ref().unwrap();
+        assert_eq!((f.query.as_str(), f.query.selection()), ("z", None));
+        assert!(!app.modified);
+    }
+
+    #[test]
+    fn ctrl_a_in_the_replace_field_selects_it_and_edits_nothing() {
+        let mut app = app_with(&["x y x"]);
+        app.on_key(ctrl(KeyCode::Char('f')));
+        app.on_key(key(KeyCode::Char('x')));
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Char('Z')));
+        app.on_key(key(KeyCode::Char('W')));
+        app.on_key(ctrl(KeyCode::Char('a')));
+        assert_eq!(app.input_field("docxy-replace").selection, Some((0, 2)));
+        assert_eq!(app.input_field("docxy-find").selection, None);
+        assert_eq!(first_line(&app), "x y x");
+        assert!(!app.modified);
+        app.on_key(key(KeyCode::Backspace));
+        let f = app.find.as_ref().unwrap();
+        assert_eq!(f.replacement.as_ref().unwrap().as_str(), "");
+        assert_eq!(first_line(&app), "x y x");
+    }
+
+    #[test]
+    fn alt_a_in_find_only_mode_does_nothing() {
+        let mut app = app_with(&["a y a"]);
+        app.on_key(ctrl(KeyCode::Char('f')));
+        app.on_key(key(KeyCode::Char('a')));
+        app.on_key(alt(KeyCode::Char('a')));
+        assert_eq!(app.find.as_ref().unwrap().query.as_str(), "a");
+        assert_eq!(first_line(&app), "a y a");
+        assert!(!app.modified);
     }
 
     /// `Alpha beta gamma delta.` with `new ` inserted and `beta ` deleted.
@@ -15071,7 +15131,7 @@ mod tests {
     fn find_bar_replace_all_reports_skipped_read_only_matches_211() {
         let mut app = app_with_tracked_x();
         find_x_replace_with_z(&mut app);
-        app.on_key(ctrl(KeyCode::Char('a')));
+        app.on_key(alt(KeyCode::Char('a')));
         assert_eq!(first_line(&app), "Z x Z", "the tracked `x` stays");
         assert_eq!(
             app.status.as_deref(),
@@ -15618,7 +15678,7 @@ mod tests {
         app.on_key(key(KeyCode::Char('x'))); // query
         app.on_key(key(KeyCode::Tab)); // to replace field
         app.on_key(key(KeyCode::Char('Z'))); // replacement
-        app.on_key(ctrl(KeyCode::Char('a'))); // replace all
+        app.on_key(alt(KeyCode::Char('a'))); // replace all
         assert_eq!(first_line(&app), "Z y Z");
     }
 

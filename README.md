@@ -181,7 +181,7 @@ in docxy for now: the browser shows those ribbon commands dimmed.
 | Ctrl-B / Ctrl-I / Ctrl-U | bold / italic / underline (the selection, or what is typed next) |
 | Ctrl-L / Ctrl-E / Ctrl-R | align left / center / right |
 | Ctrl-A · Ctrl-C · Ctrl-X · Ctrl-V | select all · copy · cut · paste |
-| Ctrl-F | find / replace (Tab toggles replace, Ctrl-A replaces all) |
+| Ctrl-F | find / replace (Tab toggles replace, Alt-A replaces all) |
 | Ctrl-S · Ctrl-Z · Ctrl-Y | save · undo · redo |
 | Ctrl-Q / Esc | quit |
 | F2 · F3 · F4 | page view · show marks · table borders |

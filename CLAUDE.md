@@ -346,8 +346,13 @@
   focused field draws the `▏` mark, at its caret; `replace_drawn` feeds both
   the Replace status text and the `docxy-replace` `at`, and `compare_window`
   keeps a long Compare path's caret in view. `field-read` reports the real
-  caret (`Field::with_caret`). Select-all, copy/paste and click-to-place are
-  still not there (#1375 to #1379).
+  caret (`Field::with_caret`). `LineEdit` also holds a selection
+  (`select_all`, `selection`, `delete_selection`; typing, Backspace and
+  Delete replace or remove it, the arrows, Home and End drop it) and
+  `field-read` reports it. Only Find and Replace use it so far (#1375): Ctrl+A
+  selects the focused field and Replace All is Alt+A (nothing in find-only
+  mode). Select-all in the other prompts (#1376), copy/paste (#1377) and
+  click-to-place (#1379) are still not there.
 
 ## xlsxy terminal vim `:` line edits at a caret (#1373)
 

@@ -29,13 +29,8 @@ backstage-inputs-typing.uit | rename sheet-tab-rename: select-all replaces | #13
 backstage-inputs-typing.uit | rename sheet-tab-rename: copies | #1365
 backstage-inputs-typing.uit | rename sheet-tab-rename: pastes | #1365
 
-# In docxy's Find bar in Replace mode Ctrl+A is Replace All: it edits the
-# document instead of selecting the field's text (#1204).
-terminal-docxy-inputs-typing.uit | docxy docxy-replace: select-all replaces | #1375
-
 # Ctrl+A selects nothing in the terminal editors' prompts, so typing after
 # it appends instead of replacing (#1204).
-terminal-docxy-inputs-typing.uit | docxy docxy-find: select-all replaces | #1376
 terminal-docxy-inputs-typing.uit | docxy docxy-comment: select-all replaces | #1376
 terminal-docxy-inputs-typing.uit | docxy docxy-compare-original: select-all replaces | #1376
 terminal-docxy-inputs-typing.uit | docxy docxy-compare-revised: select-all replaces | #1376

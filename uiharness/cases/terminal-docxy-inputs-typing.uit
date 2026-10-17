@@ -82,6 +82,16 @@ test docxy docxy-find: select-all replaces
   call field-read {"input":"docxy-find"}
   assert reply.value is exactly X
 
+test docxy docxy-find: select-all then Left goes to the start
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"ctrl+f"}
+  call real-type {"text":"abc"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"left"}
+  call real-type {"text":"X"}
+  call field-read {"input":"docxy-find"}
+  assert reply.value is exactly Xabc
+
 test docxy docxy-find: copies
   open copy:../fixtures/header-inherit.docx
   call real-key {"key":"ctrl+f"}
@@ -131,8 +141,8 @@ test docxy docxy-find: Escape cancels
 
 
 # ---- The Find bar's Replace field: Ctrl+H opens the bar, the steps find
-# "Two" (which the document holds) and Tab to Replace. In Replace mode
-# Ctrl+A is Replace All today, so select-all replaces also checks the
+# "Two" (which the document holds) and Tab to Replace. Ctrl+A selects the
+# field (Replace All is Alt+A, #1375), so select-all replaces also checks the
 # document did not change: Replace All would have edited "Two".
 test docxy docxy-replace: focus
   open copy:../fixtures/header-inherit.docx
@@ -204,6 +214,28 @@ test docxy docxy-replace: select-all replaces
   call real-type {"text":"X"}
   call field-read {"input":"docxy-replace"}
   assert reply.value is exactly X
+  call doc.path {}
+  assert reply.modified is false
+
+test docxy docxy-replace: Alt+A replaces all
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"ctrl+h"}
+  call real-type {"text":"Two"}
+  call real-key {"key":"tab"}
+  call real-type {"text":"Zed"}
+  call real-key {"key":"alt+a"}
+  call field-read {"input":"docxy-replace"}
+  assert reply.value is exactly Zed
+  call doc.path {}
+  assert reply.modified is true
+
+test docxy docxy-find: Alt+A does nothing
+  open copy:../fixtures/header-inherit.docx
+  call real-key {"key":"ctrl+f"}
+  call real-type {"text":"Two"}
+  call real-key {"key":"alt+a"}
+  call field-read {"input":"docxy-find"}
+  assert reply.value is exactly Two
   call doc.path {}
   assert reply.modified is false
 
