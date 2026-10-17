@@ -2162,6 +2162,10 @@ impl Prompt {
     /// (#1377).
     fn paste(&mut self, text: &str) {
         let line = first_line(text);
+        // An empty paste changes nothing, a selection included.
+        if line.is_empty() {
+            return;
+        }
         self.delete_selection();
         let idx = char_index(&self.text, self.cursor);
         self.text.insert_str(idx, &line);
@@ -25613,11 +25617,18 @@ mod tests {
         ctrl_key(&mut app, 'c');
         assert_eq!(app.clip_text.as_deref(), Some("abcd"));
         assert_eq!(prompt_state(&app), ("abcd".into(), Some(4), Some((0, 4))));
+        app.clip_text = Some("old".into());
+        app.status = None;
         ctrl_key(&mut app, 'x');
         assert_eq!(prompt_state(&app), ("".into(), Some(0), None));
+        assert_eq!(app.clip_text.as_deref(), Some("abcd"));
+        assert_eq!(app.status.as_deref(), Some("Cut"));
         ctrl_key(&mut app, 'v');
         assert_eq!(prompt_state(&app), ("abcd".into(), Some(4), None));
         ctrl_a(&mut app);
+        app.clip_text = Some("\nx".into());
+        ctrl_key(&mut app, 'v');
+        assert_eq!(prompt_state(&app), ("abcd".into(), Some(4), Some((0, 4))));
         app.clip_text = Some("North\n".into());
         ctrl_key(&mut app, 'v');
         assert_eq!(prompt_state(&app), ("North".into(), Some(5), None));

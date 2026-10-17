@@ -132,10 +132,11 @@ impl LineEdit {
             .chars()
             .filter(|c| !c.is_control())
             .collect();
-        let had = self.delete_selection();
+        // An empty paste changes nothing, a selection included.
         if line.is_empty() {
-            return had;
+            return false;
         }
+        self.delete_selection();
         let at = self.byte(self.caret);
         self.buf.insert_str(at, &line);
         self.caret += line.chars().count();
@@ -308,6 +309,9 @@ mod tests {
         assert_eq!((l.as_str(), l.caret()), ("Northab", 7));
         assert!(!l.paste("\nx"));
         assert_eq!(l.as_str(), "Northab");
+        l.select_all();
+        assert!(!l.paste("\u{1}\nx"));
+        assert_eq!((l.as_str(), l.selection()), ("Northab", Some((0, 7))));
     }
 
     #[test]

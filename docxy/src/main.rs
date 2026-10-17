@@ -10459,12 +10459,15 @@ mod tests {
         let r = app.input_field("docxy-compare-revised");
         assert_eq!((r.value.as_deref(), r.caret), (Some("abc"), Some(3)));
         app.compare_dialog_key(ctrl(KeyCode::Char('a')));
+        app.clip_text = Some("old".into());
+        app.status = None;
         app.compare_dialog_key(ctrl(KeyCode::Char('x')));
         assert_eq!(
             app.input_field("docxy-compare-revised").value.as_deref(),
             Some("")
         );
         assert_eq!(app.clip_text.as_deref(), Some("abc"));
+        assert_eq!(app.status.as_deref(), Some("Cut"));
     }
 
     #[test]

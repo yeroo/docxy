@@ -361,7 +361,8 @@
 - Ctrl+C copies the field's selection, Ctrl+X cuts it, Ctrl+V pastes the first
   line of the clipboard (control characters dropped) at the caret, over a
   selection. With no selection Ctrl+C and Ctrl+X do nothing, and none types a
-  letter. The text comes from the OS clipboard, else from `clip_text` (the last
+  letter. An empty paste (the clipboard starts with a line break or holds only
+  control characters) changes nothing in every editor, a selection included. The text comes from the OS clipboard, else from `clip_text` (the last
   text the editor put there: a headless Linux has no `os_clip`, which is the
   harness's path). docxy's `LineEdit` has `selected_text`, `cut`, `paste`;
   terminal docxy's `App::field_copy`/`field_paste_text` serve Find (a paste or cut in the
