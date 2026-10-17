@@ -222,6 +222,105 @@ fn a_plain_request_takes_the_weight_nearest_regular_not_the_first_file() {
     assert!(set.families().contains(&"Avenir Next Heavy".to_string()));
 }
 
+/// A face of family "Fam" (legacy name `legacy`) with the given slant bits.
+fn variant(legacy: &str, typographic: bool, style: Style) -> Vec<u8> {
+    styled(
+        0,
+        Style {
+            family: Some(legacy.into()),
+            typographic: typographic.then(|| "Fam".to_string()),
+            ..style
+        },
+    )
+}
+
+#[test]
+fn italic_comes_from_fs_selection_when_mac_style_is_clear() {
+    let d = Dir::new("italic");
+    // Apple's italics: macStyle 0, fsSelection italic; it sorts before the regular.
+    d.write(
+        "a-italic.ttf",
+        &variant(
+            "Fam Italic",
+            true,
+            Style {
+                fs_selection: 0x0001,
+                ..Style::default()
+            },
+        ),
+    );
+    d.write(
+        "b-oblique.ttf",
+        &variant(
+            "Fam Oblique",
+            true,
+            Style {
+                fs_selection: 0x0200,
+                weight: 700,
+                bold: true,
+                ..Style::default()
+            },
+        ),
+    );
+    d.write(
+        "c-regular.ttf",
+        &variant("Fam Regular", true, Style::default()),
+    );
+    let set = d.set();
+    assert_eq!(
+        set.face("Fam", false, false).unwrap().ps_name(),
+        "FamRegular-Regular"
+    );
+    assert_eq!(
+        set.face("Fam", false, true).unwrap().ps_name(),
+        "FamItalic-Regular"
+    );
+    assert_eq!(
+        set.face("Fam", true, true).unwrap().ps_name(),
+        "FamOblique-Bold",
+        "bold italic: the oblique at 700"
+    );
+}
+
+#[test]
+fn a_same_weight_width_variant_does_not_win_a_plain_request() {
+    let d = Dir::new("width");
+    d.write(
+        "a-condensed.ttf",
+        &variant(
+            "Fam Condensed",
+            true,
+            Style {
+                width_class: 3,
+                ..Style::default()
+            },
+        ),
+    );
+    d.write(
+        "b-regular.ttf",
+        &variant("Fam Regular", true, Style::default()),
+    );
+    assert_eq!(
+        d.set().face("Fam", false, false).unwrap().ps_name(),
+        "FamRegular-Regular"
+    );
+}
+
+#[test]
+fn a_face_whose_own_name_is_the_request_beats_a_sibling_in_the_typographic_family() {
+    let d = Dir::new("ornaments");
+    // Hoefler Text Ornaments shares the typographic family and sorts first.
+    d.write(
+        "a-ornaments.ttf",
+        &variant("Fam Ornaments", true, Style::default()),
+    );
+    d.write("b-text.ttf", &variant("Fam", true, Style::default()));
+    assert_eq!(
+        d.set().face("Fam", false, false).unwrap().ps_name(),
+        "Fam-Regular"
+    );
+}
+
 #[test]
 fn embedding_bits_decide_which_faces_are_offered() {
     let d = Dir::new("fstype");

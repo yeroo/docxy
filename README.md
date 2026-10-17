@@ -136,7 +136,9 @@ docxy                           # welcome screen (new .docx/.md, or open)
 docxy <file> --vim              # open with Vim keybindings
 
 # Headless conversion / export (no UI):
-docxy in.docx  --pdf  out.pdf   # export to PDF (embeds system fonts; any script)
+docxy in.docx  --pdf  out.pdf   # export to PDF (embeds system fonts: most scripts; Arabic is not joined)
+                                # DOCXY_PDF_FONT_DIR=<dirs> uses those font directories instead of the
+                                # system's (a path list; empty = plain Courier-only file)
 docxy in.docx  --md   out.md    # convert Word → Markdown
 docxy in.md    --docx out.docx  # convert Markdown → Word
 docxy in.docx  --html in.docx.html  # editable HTML (see below)

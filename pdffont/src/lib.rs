@@ -214,41 +214,54 @@ fn mini_sfnt(tables: &[([u8; 4], Vec<u8>)]) -> Vec<u8> {
     out
 }
 
-/// Every string of name `id`: Unicode and Windows records, else Macintosh
-/// Roman ones (older Apple faces carry their names on that platform only).
-/// Mac Roman is read as ASCII, which family and PostScript names are; a name
-/// with other bytes is skipped.
+/// Every string of name `id`: the Unicode and Windows records, else, when
+/// there are none, the Macintosh Roman ones (older Apple faces carry their
+/// names on that platform only). Mac Roman is read as ASCII, which family and
+/// PostScript names are; a name with other bytes is skipped.
 fn name_strings(names: &ttf_parser::name::Table, id: u16) -> Vec<String> {
-    names
-        .names
-        .into_iter()
-        .filter(|n| n.name_id == id)
-        .filter_map(|n| {
-            if n.is_unicode() {
-                n.to_string()
-            } else if n.platform_id == ttf_parser::name::PlatformId::Macintosh
-                && n.encoding_id == 0
-                && n.name.is_ascii()
-            {
-                Some(String::from_utf8_lossy(n.name).into_owned())
-            } else {
-                None
-            }
-        })
-        .filter(|s| !s.is_empty())
-        .collect()
+    let of = |mac: bool| -> Vec<String> {
+        names
+            .names
+            .into_iter()
+            .filter(|n| n.name_id == id)
+            .filter_map(|n| {
+                if !mac {
+                    n.to_string()
+                } else if n.platform_id == ttf_parser::name::PlatformId::Macintosh
+                    && n.encoding_id == 0
+                    && n.name.is_ascii()
+                {
+                    Some(String::from_utf8_lossy(n.name).into_owned())
+                } else {
+                    None
+                }
+            })
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let modern = of(false);
+    if modern.is_empty() { of(true) } else { modern }
 }
 
 /// A font file's face in the index.
 struct Entry {
     path: PathBuf,
     index: u32,
-    /// The legacy (ID 1) and typographic (ID 16) family names; a document may
-    /// use either.
-    families: Vec<String>,
+    /// The legacy (ID 1) family name, which Word's `w:rFonts` uses.
+    legacy: Vec<String>,
+    /// The typographic (ID 16) family, shared by a family's weights and widths.
+    typographic: Vec<String>,
     /// OS/2 `usWeightClass` (400 regular, 700 bold).
     weight: u16,
+    /// OS/2 `usWidthClass` (5 normal, 3 condensed).
+    width: u16,
     italic: bool,
+}
+
+impl Entry {
+    fn names(&self) -> impl Iterator<Item = &String> {
+        self.legacy.iter().chain(&self.typographic)
+    }
 }
 
 /// Whether OS/2 `fsType` lets the face be embedded as a subset: not "bitmap
@@ -297,28 +310,35 @@ fn index_face(f: &mut File, path: &Path, idx: u32, base: u64) -> Option<Entry> {
     let head = read_table(f, find_table(&dir, b"head")?)?;
     let mac_style = u16_at(&head, 44)?;
     let mut weight = if mac_style & 1 != 0 { 700 } else { 400 };
+    let (mut width, mut italic) = (5, mac_style & 2 != 0);
     if let Some(os2) = find_table(&dir, b"OS/2") {
-        let os2 = read_at(f, os2.offset as u64, (os2.len as usize).min(10))?;
+        // fsSelection (offset 62) is there from the first OS/2 version on.
+        let os2 = read_at(f, os2.offset as u64, (os2.len as usize).min(64))?;
         if !embeddable(u16_at(&os2, 8)?) {
             return None;
         }
         weight = u16_at(&os2, 4).filter(|w| *w > 0).unwrap_or(weight);
+        width = u16_at(&os2, 6).filter(|w| (1..=9).contains(w)).unwrap_or(5);
+        // macStyle is often clear on Apple's italics; fsSelection says
+        // italic (bit 0) or oblique (bit 9).
+        italic |= u16_at(&os2, 62).is_some_and(|sel| sel & 0x0201 != 0);
     }
     subsettable(f, &dir)?;
     let name = read_table(f, find_table(&dir, b"name")?)?;
     let names = ttf_parser::name::Table::parse(&name)?;
-    let mut families = name_strings(&names, 16);
-    families.extend(name_strings(&names, 1));
-    families.dedup();
-    if families.is_empty() {
+    let legacy = name_strings(&names, 1);
+    let typographic = name_strings(&names, 16);
+    if legacy.is_empty() && typographic.is_empty() {
         return None;
     }
     Some(Entry {
         path: path.to_path_buf(),
         index: idx,
-        families,
+        legacy,
+        typographic,
         weight,
-        italic: mac_style & 2 != 0,
+        width,
+        italic,
     })
 }
 
@@ -405,11 +425,6 @@ impl SysFace {
                 tables.push((*tag, read_table(&mut f, t)?));
             }
         }
-        let name_table = tables
-            .iter()
-            .find(|(tag, _)| tag == b"name")
-            .map(|(_, data)| data.clone())
-            .unwrap_or_default();
         let mini = mini_sfnt(&tables);
         let face = ttf_parser::Face::parse(&mini, 0).ok()?;
         let mut cmap = HashMap::new();
@@ -425,7 +440,9 @@ impl SysFace {
         let advances = (0..face.number_of_glyphs())
             .map(|g| face.glyph_hor_advance(ttf_parser::GlyphId(g)).unwrap_or(0))
             .collect();
-        let ps_name = ttf_parser::name::Table::parse(&name_table)
+        let ps_name = face
+            .tables()
+            .name
             .and_then(|names| name_strings(&names, 6).into_iter().next())
             .unwrap_or_else(|| {
                 path.file_stem()
@@ -542,21 +559,24 @@ impl FontSet {
         })
     }
 
-    /// How many embeddable faces were found.
+    /// How many embeddable faces were found (for tests).
+    #[doc(hidden)]
     pub fn len(&self) -> usize {
         self.entries().len()
     }
 
+    #[doc(hidden)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// The families found, sorted.
+    #[doc(hidden)]
     pub fn families(&self) -> Vec<String> {
         let mut f: Vec<String> = self
             .entries()
             .iter()
-            .flat_map(|e| e.families.iter().cloned())
+            .flat_map(|e| e.names().cloned())
             .collect();
         f.sort();
         f.dedup();
@@ -574,18 +594,22 @@ impl FontSet {
     }
 
     /// The best face of `family` (its legacy or typographic name) for the
-    /// style: the slant asked for, then the weight nearest 400 (700 when bold),
-    /// then the first by path.
+    /// style: the slant asked for, then the width nearest normal, then the
+    /// weight nearest 400 (700 when bold), then the face whose own (legacy)
+    /// name is the request (not an ornaments or other sibling sharing the
+    /// typographic family), then the first by path.
     fn best(&self, family: &str, bold: bool, italic: bool) -> Option<Rc<dyn PdfFace>> {
         let target = if bold { 700 } else { 400 };
         let entry = self
             .entries()
             .iter()
-            .filter(|e| e.families.iter().any(|f| f.eq_ignore_ascii_case(family)))
+            .filter(|e| e.names().any(|f| f.eq_ignore_ascii_case(family)))
             .max_by_key(|e| {
                 (
                     e.italic == italic,
+                    std::cmp::Reverse((e.width as i32 - 5).abs()),
                     std::cmp::Reverse((e.weight as i32 - target).abs()),
+                    e.legacy.iter().any(|f| f.eq_ignore_ascii_case(family)),
                     std::cmp::Reverse((&e.path, e.index)),
                 )
             })?;

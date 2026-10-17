@@ -169,6 +169,18 @@ pub fn to_pdf(doc: &Document, opts: &PdfOptions) -> Vec<u8> {
 /// [`to_pdf`], and what the export had to leave out (characters no face
 /// covers).
 pub fn to_pdf_report(doc: &Document, opts: &PdfOptions) -> (Vec<u8>, PdfReport) {
+    // Faces whose font file cannot be embedded count as absent from the start,
+    // so layout and the writer agree.
+    let checked;
+    let opts = match &opts.fonts {
+        Some(fonts) => {
+            let mut o = opts.clone();
+            o.fonts = Some(Rc::new(cid::Checked::new(fonts.clone())));
+            checked = o;
+            &checked
+        }
+        None => opts,
+    };
     let pages = Pager::run(doc, opts);
     write_pdf(&pages, opts)
 }

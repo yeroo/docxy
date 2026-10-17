@@ -456,7 +456,8 @@ fn qpdf_accepts_the_file_when_installed() {
 
 #[test]
 fn right_to_left_rows_are_in_the_provided_order_with_offsets_from_the_advances() {
-    // Hebrew letters are 500 units, the space 250, at the body's 11 pt.
+    // Letters of different widths, so each offset must pair the right two:
+    // ש 700, ל 400, ו 250, ם 600 units, at the body's 11 pt.
     let bidi = {
         #[derive(Debug)]
         struct Flip;
@@ -486,7 +487,8 @@ fn right_to_left_rows_are_in_the_provided_order_with_offsets_from_the_advances()
     let bytes = docx(
         r#"<w:p><w:pPr><w:bidi/></w:pPr><w:r><w:t xml:space="preserve">שלום </w:t></w:r></w:p>"#,
     );
-    let (mut opts, pkg) = opts_for(&bytes, Some(provider(&world_glyphs())));
+    let glyphs = [(' ', 250), ('ש', 700), ('ל', 400), ('ו', 250), ('ם', 600)];
+    let (mut opts, pkg) = opts_for(&bytes, Some(provider(&glyphs)));
     opts.bidi = Some(bidi);
     let pdf = to_pdf(&pkg.document, &opts);
     let run = shown(&pdf)[0]
@@ -496,8 +498,9 @@ fn right_to_left_rows_are_in_the_provided_order_with_offsets_from_the_advances()
         .unwrap();
     // Logical שלום + the trailing space is trimmed by wrapping: four letters.
     assert_eq!(run.text, "שלום");
-    // From one glyph's end to the next one's start, to the left: (w + w).
-    assert_eq!(run.adjusts, [1000.0, 1000.0, 1000.0], "{run:?}");
+    // From one glyph's end to the next one's start, to the left: the two
+    // advances summed, in thousandths of the size (units, here).
+    assert_eq!(run.adjusts, [1100.0, 650.0, 850.0], "{run:?}");
     assert_eq!(run.size, 11.0);
 }
 
@@ -549,10 +552,10 @@ fn a_glyph_shared_by_space_and_nbsp_extracts_as_a_space() {
 }
 
 #[test]
-fn an_unsubsettable_font_is_never_embedded_as_garbage() {
+fn a_face_whose_font_file_is_unusable_counts_as_absent() {
     let face = TestFace::custom(
         1,
-        &[(' ', 250), ('a', 600)],
+        &[(' ', 250), ('a', 600), ('Ж', 700)],
         &[],
         Some(b"not a font".to_vec()),
     );
@@ -560,14 +563,16 @@ fn an_unsubsettable_font_is_never_embedded_as_garbage() {
         main: Some(face),
         fallbacks: Vec::new(),
     });
-    let pdf = export(&para("aa"), Some(p));
+    let bytes = docx(&para("aa Ж"));
+    let (opts, pkg) = opts_for(&bytes, Some(p));
+    let (pdf, report) = to_pdf_report(&pkg.document, &opts);
+    // Latin falls to Courier, Cyrillic is a counted .notdef; no embedded font.
+    assert_eq!(report.missing_chars, 1);
     let s = String::from_utf8_lossy(&pdf);
-    assert!(
-        s.contains("/FontDescriptor") && !s.contains("/FontFile2"),
-        "no font file"
-    );
+    assert!(!s.contains("/Subtype /Type0") && !s.contains("/FontFile2"));
+    assert!(!s.contains("/C0"), "no embedded face is referenced");
     validate(&pdf);
-    assert_eq!(body_text(&pdf), "aa", "the text still extracts");
+    assert_eq!(body_text(&pdf), "aa?");
 }
 
 /// Counts the lines the projector is asked about.

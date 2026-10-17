@@ -81,21 +81,6 @@ fn table<'a>(tables: &[([u8; 4], &'a [u8])], tag: &[u8; 4]) -> Option<&'a [u8]> 
     tables.iter().find(|(t, _)| t == tag).map(|(_, d)| *d)
 }
 
-/// The OS/2 `fsType` embedding bits, 0 when the face has no OS/2 table.
-#[cfg(test)]
-pub(crate) fn embedding_bits(data: &[u8], index: u32) -> u16 {
-    sfnt_tables(data, index)
-        .and_then(|t| table(&t, b"OS/2").and_then(|os2| u16_at(os2, 8)))
-        .unwrap_or(0)
-}
-
-/// Whether the face is a TrueType-outline font (`glyf`, not CFF).
-#[cfg(test)]
-pub(crate) fn has_glyf(data: &[u8], index: u32) -> bool {
-    sfnt_tables(data, index)
-        .is_some_and(|t| table(&t, b"glyf").is_some() && table(&t, b"loca").is_some())
-}
-
 fn checksum(d: &[u8]) -> u32 {
     let mut sum = 0u32;
     for c in d.chunks(4) {
@@ -419,20 +404,11 @@ mod tests {
         let a = font();
         let b = build(&[glyph('Z', 300)], 1000, 0);
         let ttc = collection(&[a, b]);
-        assert!(has_glyf(&ttc, 1));
+        assert!(sfnt_tables(&ttc, 1).is_some());
         let sub = subset_sfnt(&ttc, 1, &BTreeSet::from([1u16])).unwrap();
         assert!(glyph_bytes(&sub, 1) > 0);
         assert!(subset_sfnt(&ttc, 2, &BTreeSet::new()).is_none());
         assert!(subset_sfnt(&font(), 1, &BTreeSet::new()).is_none());
-    }
-
-    #[test]
-    fn embedding_bits_and_flavour() {
-        let restricted = build(&[glyph('A', 600)], 1000, 0x0002);
-        assert_eq!(embedding_bits(&restricted, 0), 2);
-        assert_eq!(embedding_bits(&font(), 0), 0);
-        assert!(has_glyf(&font(), 0));
-        assert!(!has_glyf(b"OTTO\0\0\0\0\0\0\0\0\0\0\0\0", 0));
     }
 
     #[test]

@@ -145,6 +145,10 @@ pub struct Style {
     pub weight: u16,
     /// `loca` in the short format.
     pub short_loca: bool,
+    /// OS/2 `fsSelection` (bit 0 italic, bit 9 oblique).
+    pub fs_selection: u16,
+    /// OS/2 `usWidthClass`; 0 means 5 (normal).
+    pub width_class: u16,
 }
 
 /// `fs_type` is the OS/2 embedding bits; `units` the units per em.
@@ -297,9 +301,17 @@ pub fn build_with(glyphs: &[SynthGlyph], units: u16, fs_type: u16, style: &Style
             style.weight
         },
     );
-    be16(&mut os2, 0);
+    be16(
+        &mut os2,
+        if style.width_class == 0 {
+            5
+        } else {
+            style.width_class
+        },
+    );
     be16(&mut os2, fs_type);
     os2.resize(96, 0);
+    os2[62..64].copy_from_slice(&style.fs_selection.to_be_bytes());
 
     let mut tables: Vec<(&[u8; 4], Vec<u8>)> = vec![
         (b"OS/2", os2),

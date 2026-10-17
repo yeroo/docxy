@@ -2,6 +2,7 @@
 //! how wide it is, and the Identity-H text, subset font and ToUnicode objects
 //! written for the faces a document used.
 
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::*;
@@ -10,6 +11,111 @@ use crate::pdf_font::{
     PdfFace, PdfFontProvider, subset_sfnt, subset_tag, to_unicode_cmap, w_array,
 };
 
+/// A face that shows a glyph only if its font file parses and subsets, found
+/// out the first time one of its glyphs is wanted (the file is read then, as
+/// embedding would read it anyway). Layout, the writer and the report then
+/// agree: a face that cannot be embedded is absent, so its characters go to a
+/// fallback, Courier, or a counted `.notdef`.
+#[derive(Debug)]
+struct CheckedFace {
+    inner: Rc<dyn PdfFace>,
+    usable: OnceCell<bool>,
+}
+
+impl CheckedFace {
+    fn usable(&self) -> bool {
+        *self.usable.get_or_init(|| {
+            subset_sfnt(
+                &self.inner.sfnt(),
+                self.inner.face_index(),
+                &BTreeSet::new(),
+            )
+            .is_some()
+        })
+    }
+}
+
+impl PdfFace for CheckedFace {
+    fn id(&self) -> u64 {
+        self.inner.id()
+    }
+    fn ps_name(&self) -> String {
+        self.inner.ps_name()
+    }
+    fn units_per_em(&self) -> u16 {
+        self.inner.units_per_em()
+    }
+    fn glyph(&self, ch: char) -> Option<u16> {
+        self.inner.glyph(ch).filter(|_| self.usable())
+    }
+    fn advance(&self, gid: u16) -> u16 {
+        self.inner.advance(gid)
+    }
+    fn ascent(&self) -> i16 {
+        self.inner.ascent()
+    }
+    fn descent(&self) -> i16 {
+        self.inner.descent()
+    }
+    fn sfnt(&self) -> Rc<[u8]> {
+        self.inner.sfnt()
+    }
+    fn face_index(&self) -> u32 {
+        self.inner.face_index()
+    }
+}
+
+/// The host's provider with every face checked (see [`CheckedFace`]).
+#[derive(Debug)]
+pub(super) struct Checked {
+    inner: Rc<dyn PdfFontProvider>,
+    wrapped: RefCell<HashMap<u64, Rc<CheckedFace>>>,
+    fallbacks: OnceCell<Vec<Rc<dyn PdfFace>>>,
+}
+
+impl Checked {
+    pub(super) fn new(inner: Rc<dyn PdfFontProvider>) -> Checked {
+        Checked {
+            inner,
+            wrapped: RefCell::default(),
+            fallbacks: OnceCell::new(),
+        }
+    }
+
+    fn wrap(&self, face: Rc<dyn PdfFace>) -> Rc<dyn PdfFace> {
+        self.wrapped
+            .borrow_mut()
+            .entry(face.id())
+            .or_insert_with(|| {
+                Rc::new(CheckedFace {
+                    inner: face,
+                    usable: OnceCell::new(),
+                })
+            })
+            .clone()
+    }
+}
+
+impl PdfFontProvider for Checked {
+    fn face(&self, family: &str, bold: bool, italic: bool) -> Option<Rc<dyn PdfFace>> {
+        // The run's own face is about to be used, so it is checked now; the
+        // fallbacks are checked when one of them is first needed.
+        let face = self.wrap(self.inner.face(family, bold, italic)?);
+        let checked = self.wrapped.borrow()[&face.id()].clone();
+        checked.usable().then_some(face)
+    }
+
+    fn fallbacks(&self) -> &[Rc<dyn PdfFace>] {
+        self.fallbacks.get_or_init(|| {
+            self.inner
+                .fallbacks()
+                .iter()
+                .map(|f| self.wrap(f.clone()))
+                .collect()
+        })
+    }
+}
+
 /// What shows one character.
 pub(super) enum Glyph {
     /// A glyph of an embedded face.
@@ -17,7 +123,7 @@ pub(super) enum Glyph {
     /// The built-in Courier (WinAnsi) font, for what no face covers but
     /// WinAnsi does.
     Legacy,
-    /// Nothing covers it: `.notdef` of this face, or `?` without one.
+    /// Nothing covers it: `.notdef` of the run's own face, or `?` without one.
     Missing(Option<Rc<dyn PdfFace>>),
 }
 
@@ -25,7 +131,8 @@ fn winansi_covers(ch: char) -> bool {
     ch == '?' || winansi(ch) != b'?'
 }
 
-/// The run's own face, else a fallback face, else Courier, else `.notdef`.
+/// The run's own face, else a fallback face, else Courier (what WinAnsi
+/// covers), else `.notdef` of the own face.
 pub(super) fn resolve(p: &dyn PdfFontProvider, family: Option<&str>, font: u8, ch: char) -> Glyph {
     let own = p.face(family.unwrap_or(""), font & 1 != 0, font & 2 != 0);
     if let Some(face) = &own
@@ -41,7 +148,7 @@ pub(super) fn resolve(p: &dyn PdfFontProvider, family: Option<&str>, font: u8, c
     if winansi_covers(ch) {
         return Glyph::Legacy;
     }
-    Glyph::Missing(own.or_else(|| p.fallbacks().first().cloned()))
+    Glyph::Missing(own)
 }
 
 /// The advance of `ch` in points.
