@@ -1107,6 +1107,8 @@ fn editable_row_cells(
             let edit = v.cell.as_ref().filter(|c| c.uid == uid && c.col == col);
             let content = if let Some(edit) = edit {
                 let measure = Measurer::new(window);
+                let sel = edit.selection().unwrap_or(edit.caret..edit.caret);
+                let caret_bar = || div().flex_none().w(px(1.5)).h(px(16.)).bg(hsla_u(BRAND));
                 let offset =
                     edit.scroll_x(WIDTHS[col] - 24., |s| measure.width(s, 12., summary, false));
                 h_flex()
@@ -1114,9 +1116,19 @@ fn editable_row_cells(
                     .left(px(-offset))
                     .flex_none()
                     .items_center()
-                    .child(edit.buf[..edit.caret].to_owned())
-                    .child(div().flex_none().w(px(1.5)).h(px(16.)).bg(hsla_u(BRAND)))
-                    .child(edit.buf[edit.caret..].to_owned())
+                    .child(edit.buf[..sel.start].to_owned())
+                    .when(edit.caret == sel.start, |d| d.child(caret_bar()))
+                    .when(sel.start < sel.end, |d| {
+                        let c = hsla_u(BRAND);
+                        d.child(
+                            div()
+                                .flex_none()
+                                .bg(hsla(c.h, c.s, c.l, 0.18))
+                                .child(edit.buf[sel.clone()].to_owned()),
+                        )
+                    })
+                    .when(edit.caret > sel.start, |d| d.child(caret_bar()))
+                    .child(edit.buf[sel.end..].to_owned())
                     .into_any_element()
             } else if let Some(uid) = uid.filter(|_| summary && col == COL_NAME) {
                 // A summary's outline glyph: a click shows or hides its

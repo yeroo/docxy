@@ -86,7 +86,7 @@ pub(crate) enum ProjectAct {
     /// prompt. Keyboard and row-menu only; no ribbon command.
     Hyperlink,
     /// Ctrl+C / Ctrl+X / Ctrl+V: the cursor cell (or range) on the table, the
-    /// whole buffer in an open cell edit (#561); also the Task tab's
+    /// selection (else the whole buffer) in an open cell edit (#561); also the Task tab's
     /// Clipboard group. See `clip.rs`.
     Copy,
     Cut,
@@ -707,10 +707,10 @@ pub(crate) fn project_act_clears_range(act: ProjectAct) -> bool {
 }
 
 /// Whether an in-cell cut may empty the buffer: the read-back clipboard
-/// `now` holds the buffer's text `wrote`, compared CRLF-insensitively. A
+/// `now` holds the cut text `wrote`, compared CRLF-insensitively. A
 /// write can fail without a word — another process holds the OS clipboard —
 /// and it then reads as `Nothing` or someone else's item, never as our text;
-/// the buffer must not be lost to a copy that never landed (#561 r1/r2).
+/// the text must not be lost to a copy that never landed (#561 r1/r2).
 /// Cutting an empty buffer is harmless and the host skips the check.
 pub(crate) fn cell_cut_write_took(now: &ClipRead, wrote: &str) -> bool {
     match now {
@@ -1112,6 +1112,14 @@ pub(crate) fn project_input(
         // open cell first, as every command act does (#561).
         if let Some(act @ (ProjectAct::NewProject | ProjectAct::NewWindow)) = key_act(key, m) {
             return commit_project_cell(tab).then_some(act);
+        }
+        // Ctrl+A selects the buffer; the edit stays open, so the range anchor
+        // survives like it does for Copy.
+        if m.control && !m.alt && !m.platform && key == "a" {
+            if let Some(cell) = &mut v.cell {
+                cell.select_all();
+            }
+            return None;
         }
         // #561: the host edits the open cell's buffer in place; the edit
         // stays open, so the range anchor survives like it does for Copy.
@@ -2259,10 +2267,10 @@ impl Docxy {
         }
     }
     /// Copy/Cut/Paste with a cell editor open take the buffer, not the table
-    /// (#561). Copy and Cut put the whole buffer on the system clipboard (the
-    /// editor has no selection); Cut empties the buffer only when the read-
-    /// back clipboard holds the buffer's text — a silently failed write (a
-    /// busy OS clipboard) otherwise keeps the buffer and the status says so.
+    /// (#561). Copy and Cut put the selection (else the whole buffer) on the system
+    /// clipboard; Cut removes it only when the read-
+    /// back clipboard holds the cut text — a silently failed write (a
+    /// busy OS clipboard) otherwise keeps the text and the status says so.
     /// Paste inserts the clipboard's text at the caret. The edit stays open;
     /// the project, its undo stack and its dirty flag are untouched.
     fn project_cell_clipboard(&mut self, act: ProjectAct, cx: &mut Context<Self>) {
@@ -2277,7 +2285,7 @@ impl Docxy {
             return;
         }
         let text = self.tabs.get(self.active).and_then(|t| match &t.surface {
-            Surface::Project(v) => v.cell.as_ref().map(|c| c.buf.clone()),
+            Surface::Project(v) => v.cell.as_ref().map(|c| c.copy_text()),
             _ => None,
         });
         let Some(text) = text else {
