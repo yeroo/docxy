@@ -77,9 +77,7 @@ fn para(text: &str) -> String {
 const LOREM: &str = "The quick brown fox jumps over the lazy dog while Pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow, again and again until the line must wrap more than once on the page.";
 
 fn cases() -> Vec<(&'static str, Vec<u8>)> {
-    let styled = format!(
-        r#"<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Bold </w:t></w:r><w:r><w:rPr><w:i/><w:u w:val="single"/></w:rPr><w:t>italic under </w:t></w:r><w:r><w:rPr><w:strike/><w:color w:val="FF0000"/></w:rPr><w:t>struck</w:t></w:r><w:hyperlink r:id="rIdL"><w:r><w:t> link</w:t></w:r></w:hyperlink></w:p>"#
-    );
+    let styled = r#"<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Bold </w:t></w:r><w:r><w:rPr><w:i/><w:u w:val="single"/></w:rPr><w:t>italic under </w:t></w:r><w:r><w:rPr><w:strike/><w:color w:val="FF0000"/></w:rPr><w:t>struck</w:t></w:r><w:hyperlink r:id="rIdL"><w:r><w:t> link</w:t></w:r></w:hyperlink></w:p>"#.to_string();
     let aligned = format!(
         r#"<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>Centered line</w:t></w:r></w:p><w:p><w:pPr><w:jc w:val="right"/></w:pPr><w:r><w:t>Right line</w:t></w:r></w:p>{}"#,
         para(LOREM)

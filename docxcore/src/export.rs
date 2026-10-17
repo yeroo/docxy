@@ -612,6 +612,47 @@ fn page_field_kind(instr: &str) -> Option<PageField> {
     }
 }
 
+/// How wide text prints. Layout and the writer both measure through this, so
+/// they agree: the built-in Courier face is a fixed 0.6 em per character.
+#[derive(Clone, Copy)]
+enum Metrics {
+    Courier,
+}
+
+impl Metrics {
+    fn of(_opts: &PdfOptions) -> Metrics {
+        Metrics::Courier
+    }
+
+    /// The width of `cells` at `size`.
+    fn width(self, cells: &[PCell], size: f32) -> f32 {
+        match self {
+            Metrics::Courier => cells.len() as f32 * (0.6 * size),
+        }
+    }
+
+    /// The width of `text` in the style of `font` at `size`.
+    fn text_width(self, text: &str, size: f32, _font: u8) -> f32 {
+        match self {
+            Metrics::Courier => text.chars().count() as f32 * (0.6 * size),
+        }
+    }
+
+    /// How many leading cells fit in `max_w` (at least one).
+    fn fit(self, _cells: &[PCell], max_w: f32, size: f32) -> usize {
+        match self {
+            Metrics::Courier => ((max_w / (0.6 * size)).floor() as usize).max(1),
+        }
+    }
+
+    /// A frame's width with no `w`: its longest line plus one more character.
+    fn frame_width(self, cells: &[PCell], size: f32) -> f32 {
+        match self {
+            Metrics::Courier => (cells.len() + 1) as f32 * 0.6 * size,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct PCell {
     ch: char,
@@ -667,12 +708,19 @@ struct WatermarkDraw {
 impl WatermarkDraw {
     /// Place `mark` in the margin box `(left, bottom, right, top)`, Word's
     /// default (`mso-position-*-relative:margin`, centred).
-    fn place(mark: &TextWatermark, (left, bottom, right, top): (f32, f32, f32, f32)) -> Self {
-        let chars = mark.text.chars().count().max(1) as f32;
+    fn place(
+        mark: &TextWatermark,
+        (left, bottom, right, top): (f32, f32, f32, f32),
+        m: Metrics,
+    ) -> Self {
+        // The text's width at a size of 1 pt.
+        let em = m
+            .text_width(&mark.text, 1.0, 0)
+            .max(m.text_width("x", 1.0, 0));
         // "Auto" size stretches the text to the shape's width; without one, to
         // most of the text width. A set font size caps it.
         let width = mark.width_pt.unwrap_or(0.8 * (right - left));
-        let mut size = width / (chars * 0.6);
+        let mut size = width / em;
         if let Some(pt) = mark.font_size_pt {
             size = size.min(pt);
         }
@@ -898,8 +946,12 @@ fn content_w(g: &crate::frame::FrameGroup, opts: &PdfOptions) -> i32 {
         .map(|(_, p)| {
             let size = heading_size(p, opts.base_font_size);
             let segs = flatten_segments(p, p.props.heading_level.is_some(), &opts.styles);
-            let chars = segs.iter().map(|s| s.cells.len()).max().unwrap_or(0) + 1;
-            (chars as f32 * 0.6 * size * 20.0).ceil() as i32
+            let m = Metrics::of(opts);
+            let width = segs
+                .iter()
+                .map(|s| m.frame_width(&s.cells, size))
+                .fold(m.frame_width(&[], size), f32::max);
+            (width * 20.0).ceil() as i32
         })
         .max()
         .unwrap_or(0)
@@ -953,7 +1005,7 @@ fn emit_paragraph(flow: &mut dyn Flow, p: &Paragraph, opts: &PdfOptions) {
         bullet.extend(std::mem::take(&mut segs[0].cells));
         segs[0].cells = bullet;
     }
-    emit_segments(flow, segs, size, p.props.align);
+    emit_segments(flow, segs, size, p.props.align, Metrics::of(opts));
 }
 
 fn emit_table(flow: &mut dyn Flow, t: &Table, opts: &PdfOptions) {
@@ -981,13 +1033,18 @@ fn emit_table(flow: &mut dyn Flow, t: &Table, opts: &PdfOptions) {
                 .collect(),
             brk: None,
         };
-        emit_segments(flow, vec![seg], opts.base_font_size, Align::Left);
+        emit_segments(
+            flow,
+            vec![seg],
+            opts.base_font_size,
+            Align::Left,
+            Metrics::of(opts),
+        );
     }
 }
 
-fn emit_segments(flow: &mut dyn Flow, segs: Vec<Seg>, size: f32, align: Align) {
+fn emit_segments(flow: &mut dyn Flow, segs: Vec<Seg>, size: f32, align: Align, m: Metrics) {
     let line_height = size * 1.35;
-    let advance = 0.6 * size;
     for seg in segs {
         // Wrap one line at a time: the column (and its width) can change when a
         // line overflows to the next column or page.
@@ -998,11 +1055,10 @@ fn emit_segments(flow: &mut dyn Flow, segs: Vec<Seg>, size: f32, align: Align) {
                 break;
             }
             let (col_x, col_w, y) = flow.next_line(line_height);
-            let cpl = ((col_w / advance).floor() as usize).max(1);
-            let (line, used) = take_line(rest, cpl);
+            let (line, used) = take_line(rest, m.fit(rest, col_w, size));
             rest = &rest[used..];
             first = false;
-            place_line(flow, &line, col_x, col_w, y, size, align);
+            place_line(flow, &line, (col_x, col_w, y), size, align, m);
             if rest.is_empty() {
                 break;
             }
@@ -1018,14 +1074,12 @@ fn emit_segments(flow: &mut dyn Flow, segs: Vec<Seg>, size: f32, align: Align) {
 fn place_line(
     flow: &mut dyn Flow,
     line: &[PCell],
-    col_x: f32,
-    col_w: f32,
-    y: f32,
+    (col_x, col_w, y): (f32, f32, f32),
     size: f32,
     align: Align,
+    m: Metrics,
 ) {
-    let advance = 0.6 * size;
-    let line_w = line.len() as f32 * advance;
+    let line_w = m.width(line, size);
     let off = match align {
         Align::Center => (col_w - line_w).max(0.0) / 2.0,
         Align::Right => (col_w - line_w).max(0.0),
@@ -1041,8 +1095,8 @@ fn place_line(
         }
         let cells = &line[start..i];
         let text: String = cells.iter().map(|c| c.ch).collect();
-        let fx = x0 + start as f32 * advance;
-        let span_w = (i - start) as f32 * advance;
+        let fx = x0 + m.width(&line[..start], size);
+        let span_w = m.width(cells, size);
         let link = c0.link.as_ref().map(|link| {
             (
                 (fx, y - 2.0, fx + span_w, y + size * 0.85),
@@ -1275,7 +1329,7 @@ impl<'a> Pager<'a> {
             .and_then(|a| opts.watermarks.get(&a.part_name))
             .into_iter()
             .flatten()
-            .map(|mark| WatermarkDraw::place(mark, margin_box))
+            .map(|mark| WatermarkDraw::place(mark, margin_box, Metrics::of(opts)))
             .collect();
         let mut body_bottom = s.bottom;
         let mut hf_frags = Vec::new();
@@ -2198,6 +2252,7 @@ fn pdf_string_body(s: &str) -> Vec<u8> {
 }
 
 fn build_content(page: &Page, opts: &PdfOptions) -> Vec<u8> {
+    let m = Metrics::of(opts);
     let mut s: Vec<u8> = Vec::new();
     if let Some(rgb) = opts.background {
         let (r, g, b) = rgb_f(rgb);
@@ -2212,7 +2267,7 @@ fn build_content(page: &Page, opts: &PdfOptions) -> Vec<u8> {
     for mark in &page.watermarks {
         let (sin, cos) = mark.angle.to_radians().sin_cos();
         let (r, g, b) = mark.color;
-        let width = mark.text.chars().count() as f32 * 0.6 * mark.size;
+        let width = m.text_width(&mark.text, mark.size, 0);
         s.extend(
             format!(
                 "q\n{r:.3} {g:.3} {b:.3} rg\n{cos:.4} {sin:.4} {:.4} {cos:.4} {:.2} {:.2} cm\n",
@@ -2262,9 +2317,7 @@ fn build_content(page: &Page, opts: &PdfOptions) -> Vec<u8> {
             Some((kind, true)) => &page.values[kind as usize],
             None => &f.text,
         };
-        let n_chars = text.chars().count() as f32;
-        let advance = 0.6 * f.size;
-        let width = n_chars * advance;
+        let width = m.text_width(text, f.size, f.font);
         // fill color for text
         s.extend(format!("{:.3} {:.3} {:.3} rg\n", f.color.0, f.color.1, f.color.2).as_bytes());
         s.extend(
@@ -4302,7 +4355,9 @@ mod tests {
 
     #[test]
     fn watermark_size_falls_back_to_the_text_width_and_caps_at_a_set_size() {
-        let place = |mark: &TextWatermark| WatermarkDraw::place(mark, (72.0, 72.0, 540.0, 720.0));
+        let place = |mark: &TextWatermark| {
+            WatermarkDraw::place(mark, (72.0, 72.0, 540.0, 720.0), Metrics::Courier)
+        };
         // 80% of 468pt over five characters.
         assert!(close(place(&draft(None, None)).size, 0.8 * 468.0 / 3.0));
         assert!(close(place(&draft(Some(468.0), Some(36.0))).size, 36.0));
