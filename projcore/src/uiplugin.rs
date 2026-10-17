@@ -562,6 +562,239 @@ impl Manifest {
         Ok(m)
     }
 
+    /// The manifest JSON, as [`Manifest::parse`] reads it: what a plugin
+    /// written in Rust returns from `yppx_ui_manifest`.
+    pub fn json(&self) -> String {
+        let color = |c: Option<u32>| c.map_or(Json::Null, |c| Json::str(format!("#{c:06X}")));
+        let items = |items: &[Item]| {
+            Json::Arr(
+                items
+                    .iter()
+                    .map(|it| {
+                        Json::obj(vec![
+                            ("id", Json::str(it.id.clone())),
+                            ("label", Json::str(it.label.clone())),
+                            ("tip", Json::str(it.tip.clone())),
+                            ("icon", Json::str(it.icon.clone())),
+                        ])
+                    })
+                    .collect(),
+            )
+        };
+        let ribbon = self
+            .ribbon
+            .iter()
+            .map(|t| {
+                Json::obj(vec![
+                    ("tab", Json::str(t.tab.clone())),
+                    (
+                        "groups",
+                        Json::Arr(
+                            t.groups
+                                .iter()
+                                .map(|g| {
+                                    Json::obj(vec![
+                                        ("title", Json::str(g.title.clone())),
+                                        (
+                                            "controls",
+                                            Json::Arr(
+                                                g.controls
+                                                    .iter()
+                                                    .map(|c| {
+                                                        Json::obj(vec![
+                                                            ("id", Json::str(c.id.clone())),
+                                                            ("kind", Json::str(c.kind.name())),
+                                                            ("label", Json::str(c.label.clone())),
+                                                            ("tip", Json::str(c.tip.clone())),
+                                                            ("keytip", Json::str(c.keytip.clone())),
+                                                            ("icon", Json::str(c.icon.clone())),
+                                                            ("large", Json::Bool(c.large)),
+                                                            ("items", items(&c.items)),
+                                                            (
+                                                                "swatches",
+                                                                Json::Arr(
+                                                                    c.swatches
+                                                                        .iter()
+                                                                        .map(|sw| {
+                                                                            Json::obj(vec![
+                                                                                (
+                                                                                    "id",
+                                                                                    Json::str(
+                                                                                        sw.id
+                                                                                            .clone(
+                                                                                            ),
+                                                                                    ),
+                                                                                ),
+                                                                                (
+                                                                                    "label",
+                                                                                    Json::str(
+                                                                                        sw.label
+                                                                                            .clone(
+                                                                                            ),
+                                                                                    ),
+                                                                                ),
+                                                                                (
+                                                                                    "color",
+                                                                                    color(sw.color),
+                                                                                ),
+                                                                                (
+                                                                                    "preview",
+                                                                                    Json::str(
+                                                                                        sw.preview
+                                                                                            .clone(
+                                                                                            ),
+                                                                                    ),
+                                                                                ),
+                                                                            ])
+                                                                        })
+                                                                        .collect(),
+                                                                ),
+                                                            ),
+                                                        ])
+                                                    })
+                                                    .collect(),
+                                            ),
+                                        ),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
+                ])
+            })
+            .collect();
+        let menus = self
+            .menus
+            .iter()
+            .map(|m| {
+                Json::obj(vec![
+                    ("menu", Json::str(m.menu.clone())),
+                    (
+                        "items",
+                        Json::Arr(
+                            m.items
+                                .iter()
+                                .map(|it| {
+                                    Json::obj(vec![
+                                        ("id", Json::str(it.id.clone())),
+                                        ("label", Json::str(it.label.clone())),
+                                        ("icon", Json::str(it.icon.clone())),
+                                        ("after", Json::str(it.after.clone())),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
+                ])
+            })
+            .collect();
+        let dialogs = self
+            .dialogs
+            .iter()
+            .map(|d| {
+                Json::obj(vec![
+                    ("id", Json::str(d.id.clone())),
+                    ("title", Json::str(d.title.clone())),
+                    (
+                        "pages",
+                        Json::Arr(
+                            d.pages
+                                .iter()
+                                .map(|pg| {
+                                    Json::obj(vec![
+                                        ("name", Json::str(pg.name.clone())),
+                                        (
+                                            "controls",
+                                            Json::Arr(
+                                                pg.controls
+                                                    .iter()
+                                                    .map(|c| {
+                                                        Json::obj(vec![
+                                                            ("name", Json::str(c.name.clone())),
+                                                            ("label", Json::str(c.label.clone())),
+                                                            ("kind", Json::str(c.kind.clone())),
+                                                            ("items", Json::strs(&c.items)),
+                                                            (
+                                                                "columns",
+                                                                Json::Arr(
+                                                                    c.columns
+                                                                        .iter()
+                                                                        .map(|col| {
+                                                                            Json::obj(vec![
+                                                                                (
+                                                                                    "name",
+                                                                                    Json::str(
+                                                                                        col.name
+                                                                                            .clone(
+                                                                                            ),
+                                                                                    ),
+                                                                                ),
+                                                                                (
+                                                                                    "kind",
+                                                                                    Json::str(
+                                                                                        col.kind
+                                                                                            .clone(
+                                                                                            ),
+                                                                                    ),
+                                                                                ),
+                                                                            ])
+                                                                        })
+                                                                        .collect(),
+                                                                ),
+                                                            ),
+                                                            ("value", c.value.clone()),
+                                                        ])
+                                                    })
+                                                    .collect(),
+                                            ),
+                                        ),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    ("buttons", Json::strs(&d.buttons)),
+                ])
+            })
+            .collect();
+        let palettes = self
+            .palettes
+            .iter()
+            .map(|pal| {
+                Json::obj(vec![
+                    ("id", Json::str(pal.id.clone())),
+                    ("label", Json::str(pal.label.clone())),
+                    (
+                        "bars",
+                        Json::Arr(
+                            pal.bars
+                                .iter()
+                                .map(|b| {
+                                    Json::obj(vec![
+                                        ("kind", Json::str(b.kind.clone())),
+                                        ("color", Json::str(format!("#{:06X}", b.color))),
+                                        ("shape", Json::str(b.shape.clone())),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
+                ])
+            })
+            .collect();
+        Json::obj(vec![
+            ("ribbon", Json::Arr(ribbon)),
+            ("menus", Json::Arr(menus)),
+            ("dialogs", Json::Arr(dialogs)),
+            ("palettes", Json::Arr(palettes)),
+            (
+                "text_style_categories",
+                Json::strs(&self.text_style_categories),
+            ),
+        ])
+        .to_string()
+    }
+
     /// Every control id in the ribbon, menus included (a split or drop-down
     /// item's too).
     pub fn command_ids(&self) -> Vec<&str> {
@@ -598,6 +831,18 @@ pub struct Selection {
 }
 
 impl Selection {
+    /// From the `selection` object of a request.
+    pub fn from_json(v: &Json) -> Selection {
+        Selection {
+            uids: v
+                .list("uids")
+                .iter()
+                .filter_map(|u| u.as_i64().and_then(|u| i32::try_from(u).ok()))
+                .collect(),
+            cols: v.texts("cols"),
+        }
+    }
+
     fn json(&self) -> Json {
         Json::obj(vec![
             (
@@ -622,6 +867,28 @@ pub struct StateCtx {
 }
 
 impl StateCtx {
+    /// A plugin's side: the request `yppx_ui_state` received.
+    pub fn parse(json: &str) -> Result<StateCtx, String> {
+        let v = Json::parse(json).map_err(|e| format!("the state request JSON: {e}"))?;
+        if v.as_object().is_none() {
+            return Err("the state request is not an object".into());
+        }
+        Ok(StateCtx {
+            plan: v.text("plan"),
+            selection: v
+                .get("selection")
+                .map(Selection::from_json)
+                .unwrap_or_default(),
+            view: v.get("view").cloned().unwrap_or(Json::Obj(Vec::new())),
+            dialog: v.get("dialog").filter(|d| !d.is_null()).map(|d| {
+                (
+                    d.text("id"),
+                    d.int("uid").and_then(|u| i32::try_from(u).ok()),
+                )
+            }),
+        })
+    }
+
     pub fn json(&self) -> String {
         let mut pairs = vec![
             ("plan", Json::str(self.plan.clone())),
@@ -665,6 +932,41 @@ pub struct ControlState {
 }
 
 impl State {
+    /// The state JSON, as [`State::parse`] reads it: a plugin's reply to
+    /// `yppx_ui_state`.
+    pub fn json(&self) -> String {
+        let controls = self
+            .controls
+            .iter()
+            .map(|(id, st)| {
+                let mut pairs = Vec::new();
+                if let Some(e) = st.enabled {
+                    pairs.push(("enabled", Json::Bool(e)));
+                }
+                if let Some(c) = st.checked {
+                    pairs.push(("checked", Json::Bool(c)));
+                }
+                (id.clone(), Json::obj(pairs))
+            })
+            .collect();
+        let gallery = self
+            .gallery
+            .iter()
+            .map(|(id, item)| (id.clone(), Json::str(item.clone())))
+            .collect();
+        let values = self
+            .values
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        Json::obj(vec![
+            ("controls", Json::Obj(controls)),
+            ("gallery", Json::Obj(gallery)),
+            ("values", Json::Obj(values)),
+        ])
+        .to_string()
+    }
+
     pub fn parse(json: &str) -> Result<State, String> {
         let v = Json::parse(json).map_err(|e| format!("the state JSON: {e}"))?;
         let mut state = State::default();
@@ -721,6 +1023,25 @@ pub struct Command {
 }
 
 impl Command {
+    /// A plugin's side: the request `yppx_ui_command` received.
+    pub fn parse(json: &str) -> Result<Command, String> {
+        let v = Json::parse(json).map_err(|e| format!("the command request JSON: {e}"))?;
+        let id = v.text("id");
+        if id.is_empty() {
+            return Err("the command request has no id".into());
+        }
+        Ok(Command {
+            id,
+            plan: v.text("plan"),
+            selection: v
+                .get("selection")
+                .map(Selection::from_json)
+                .unwrap_or_default(),
+            view: v.get("view").cloned().unwrap_or(Json::Obj(Vec::new())),
+            values: v.get("values").filter(|w| !w.is_null()).cloned(),
+        })
+    }
+
     pub fn json(&self) -> String {
         let mut pairs = vec![
             ("id", Json::str(self.id.clone())),
@@ -858,6 +1179,64 @@ pub struct OverlayLink {
 }
 
 impl OverlayCtx {
+    /// A plugin's side: the request `yppx_ui_overlay` received.
+    pub fn parse(json: &str) -> Result<OverlayCtx, String> {
+        let v = Json::parse(json).map_err(|e| format!("the overlay request JSON: {e}"))?;
+        if v.as_object().is_none() {
+            return Err("the overlay request is not an object".into());
+        }
+        let f = |o: &Json, key: &str| o.num(key).map(|n| n as f32);
+        let rows = v
+            .list("rows")
+            .iter()
+            .map(|r| {
+                let bar = r
+                    .get("bar")
+                    .filter(|b| !b.is_null())
+                    .and_then(|b| Some((f(b, "x")?, f(b, "y")?, f(b, "w")?, f(b, "h")?)));
+                OverlayRow {
+                    uid: r
+                        .int("uid")
+                        .and_then(|u| i32::try_from(u).ok())
+                        .unwrap_or(0),
+                    row_y: f(r, "row_y").unwrap_or(0.0),
+                    bar,
+                    kind: r.text("kind"),
+                    summary: r.flag("summary"),
+                    milestone: r.flag("milestone"),
+                    critical: r.flag("critical"),
+                    inactive: r.flag("inactive"),
+                }
+            })
+            .collect();
+        let links = v
+            .list("links")
+            .iter()
+            .map(|l| OverlayLink {
+                pred: l
+                    .int("pred")
+                    .and_then(|u| i32::try_from(u).ok())
+                    .unwrap_or(0),
+                succ: l
+                    .int("succ")
+                    .and_then(|u| i32::try_from(u).ok())
+                    .unwrap_or(0),
+                kind: l.text("type"),
+                lag: l.text("lag"),
+            })
+            .collect();
+        let scale = v.get("scale").cloned().unwrap_or(Json::Obj(Vec::new()));
+        Ok(OverlayCtx {
+            rows,
+            origin_day: scale.int("origin_day").unwrap_or(0),
+            day_w: f(&scale, "day_w").unwrap_or(22.0),
+            row_h: f(&scale, "row_h").unwrap_or(28.0),
+            links,
+            status_date: v.get_str("status_date").map(str::to_string),
+            flags: v.get("flags").cloned().unwrap_or(Json::Obj(Vec::new())),
+        })
+    }
+
     pub fn json(&self) -> String {
         let num = |f: f32| Json::Num(f64::from(f));
         let rows = self
@@ -966,6 +1345,99 @@ pub enum Shape {
         color: u32,
         size: f32,
     },
+}
+
+/// The overlay reply for `shapes`, as [`parse_shapes`] reads it: a plugin's
+/// reply to `yppx_ui_overlay`.
+pub fn shapes_json(shapes: &[Shape]) -> String {
+    let num = |f: f32| Json::Num(f64::from(f));
+    let pt = |(x, y): (f32, f32)| Json::Arr(vec![num(x), num(y)]);
+    let pts = |points: &[(f32, f32)]| Json::Arr(points.iter().map(|p| pt(*p)).collect());
+    let color = |c: u32| Json::str(format!("#{c:06X}"));
+    let items = shapes
+        .iter()
+        .map(|s| match s {
+            Shape::Polyline {
+                points,
+                color: c,
+                width,
+            } => Json::obj(vec![
+                ("kind", Json::str("polyline")),
+                ("points", pts(points)),
+                ("color", color(*c)),
+                ("width", num(*width)),
+            ]),
+            Shape::Dashed {
+                points,
+                color: c,
+                width,
+            } => Json::obj(vec![
+                ("kind", Json::str("dashed")),
+                ("points", pts(points)),
+                ("color", color(*c)),
+                ("width", num(*width)),
+            ]),
+            Shape::Arrow {
+                from,
+                to,
+                color: c,
+                width,
+            } => Json::obj(vec![
+                ("kind", Json::str("arrow")),
+                ("from", pt(*from)),
+                ("to", pt(*to)),
+                ("color", color(*c)),
+                ("width", num(*width)),
+            ]),
+            Shape::Bracket {
+                x0,
+                x1,
+                y,
+                tick,
+                color: c,
+                width,
+            } => Json::obj(vec![
+                ("kind", Json::str("bracket")),
+                ("x0", num(*x0)),
+                ("x1", num(*x1)),
+                ("y", num(*y)),
+                ("tick", num(*tick)),
+                ("color", color(*c)),
+                ("width", num(*width)),
+            ]),
+            Shape::Rect {
+                x,
+                y,
+                w,
+                h,
+                color: c,
+                filled,
+            } => Json::obj(vec![
+                ("kind", Json::str("rect")),
+                ("x", num(*x)),
+                ("y", num(*y)),
+                ("w", num(*w)),
+                ("h", num(*h)),
+                ("color", color(*c)),
+                ("filled", Json::Bool(*filled)),
+            ]),
+            Shape::Text {
+                x,
+                y,
+                text,
+                color: c,
+                size,
+            } => Json::obj(vec![
+                ("kind", Json::str("text")),
+                ("x", num(*x)),
+                ("y", num(*y)),
+                ("text", Json::str(text.clone())),
+                ("color", color(*c)),
+                ("size", num(*size)),
+            ]),
+        })
+        .collect();
+    Json::obj(vec![("shapes", Json::Arr(items))]).to_string()
 }
 
 /// Parse `yppx_ui_overlay`'s reply: `{"shapes":[...]}` or a bare array.
@@ -1143,6 +1615,130 @@ mod tests {
       "text_style_categories":["Late Tasks"],
       "since":{"abi":2}
     }"##;
+
+    #[test]
+    fn the_manifest_serializes_as_it_parses() {
+        let m = Manifest::parse(MANIFEST).unwrap();
+        let back = Manifest::parse(&m.json()).unwrap();
+        assert_eq!(back, m);
+        assert_eq!(
+            Manifest::default().json(),
+            r#"{"ribbon":[],"menus":[],"dialogs":[],"palettes":[],"text_style_categories":[]}"#
+        );
+    }
+
+    #[test]
+    fn requests_parse_on_the_plugins_side() {
+        let ctx = StateCtx {
+            plan: "<Project/>".into(),
+            selection: Selection {
+                uids: vec![3],
+                cols: vec!["Name".into()],
+            },
+            view: Json::obj(vec![("critical", Json::Bool(true))]),
+            dialog: Some(("task-information".into(), Some(3))),
+        };
+        assert_eq!(StateCtx::parse(&ctx.json()).unwrap(), ctx);
+        let no_dialog = StateCtx {
+            dialog: None,
+            ..ctx.clone()
+        };
+        assert_eq!(StateCtx::parse(&no_dialog.json()).unwrap(), no_dialog);
+        assert!(StateCtx::parse("[]").is_err());
+        let cmd = Command {
+            id: "x".into(),
+            plan: "<Project/>".into(),
+            selection: Selection::default(),
+            view: Json::Obj(Vec::new()),
+            values: Some(Json::obj(vec![("n", Json::Num(2.0))])),
+        };
+        assert_eq!(Command::parse(&cmd.json()).unwrap(), cmd);
+        assert!(Command::parse(r#"{"plan":""}"#).is_err());
+        let state = State {
+            controls: vec![(
+                "x.flag".into(),
+                ControlState {
+                    enabled: Some(true),
+                    checked: Some(false),
+                },
+            )],
+            gallery: vec![("x.pal".into(), "x.blue".into())],
+            values: vec![("note".into(), Json::str("hi"))],
+        };
+        assert_eq!(State::parse(&state.json()).unwrap(), state);
+    }
+
+    #[test]
+    fn the_overlay_request_and_shapes_serialize_both_ways() {
+        let ctx = OverlayCtx {
+            rows: vec![OverlayRow {
+                uid: 1,
+                row_y: 0.0,
+                bar: Some((22.0, 5.0, 66.0, 14.0)),
+                kind: "critical".into(),
+                summary: false,
+                milestone: false,
+                critical: true,
+                inactive: false,
+            }],
+            origin_day: 20000,
+            day_w: 22.0,
+            row_h: 28.0,
+            links: vec![OverlayLink {
+                pred: 1,
+                succ: 2,
+                kind: "FS".into(),
+                lag: "2d".into(),
+            }],
+            status_date: Some("2026-01-05T08:00".into()),
+            flags: Json::obj(vec![("critical", Json::Bool(true))]),
+        };
+        assert_eq!(OverlayCtx::parse(&ctx.json()).unwrap(), ctx);
+        assert!(OverlayCtx::parse("1").is_err());
+        let shapes = vec![
+            Shape::Polyline {
+                points: vec![(1.0, 2.0), (3.5, 4.0)],
+                color: 0x112233,
+                width: 1.5,
+            },
+            Shape::Dashed {
+                points: vec![(0.0, 0.0), (0.0, 9.0)],
+                color: 0xDC322F,
+                width: 1.0,
+            },
+            Shape::Arrow {
+                from: (1.0, 1.0),
+                to: (9.0, 1.0),
+                color: 0,
+                width: 1.0,
+            },
+            Shape::Bracket {
+                x0: 0.0,
+                x1: 50.0,
+                y: 4.0,
+                tick: 6.0,
+                color: 0x333333,
+                width: 2.0,
+            },
+            Shape::Rect {
+                x: 1.0,
+                y: 2.0,
+                w: 3.0,
+                h: 4.0,
+                color: 0x2AA79B,
+                filled: false,
+            },
+            Shape::Text {
+                x: 5.0,
+                y: 6.0,
+                text: "Alice".into(),
+                color: 0x333333,
+                size: 11.0,
+            },
+        ];
+        assert_eq!(parse_shapes(&shapes_json(&shapes)).unwrap(), shapes);
+        assert_eq!(shapes_json(&[]), r#"{"shapes":[]}"#);
+    }
 
     #[test]
     fn the_manifest_parses_every_contribution() {
