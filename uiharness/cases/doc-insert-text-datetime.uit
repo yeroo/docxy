@@ -1,0 +1,47 @@
+# #1433: Insert > Text has Date & Time... and Quick Parts beside Field, acting
+# on the body when no header or footer is open, and Alt+Shift+D / Alt+Shift+T
+# insert a DATE / TIME field as Word's do. A field is one editor offset.
+
+test the Insert Text group lists Date & Time and Quick Parts
+  open copy:../fixtures/basic.docx
+  call ribbon-read {}
+  assert reply.tabs.2.name is Insert
+  assert reply.tabs.2.groups.3.title is Text
+  assert reply.tabs.2.groups.3.commands.0.label is Field
+  assert reply.tabs.2.groups.3.commands.1.label is Date & Time...
+  assert reply.tabs.2.groups.3.commands.1.key_tip is D
+  assert reply.tabs.2.groups.3.commands.2.label is Quick Parts
+  assert reply.tabs.2.groups.3.commands.2.key_tip is K
+
+test Date & Time on the Insert tab inserts into the body
+  open copy:../fixtures/basic.docx
+  type ab
+  call ribbon-click {"tab":"Insert","command":"hf-datetime"}
+  assert dialog is hf-date-time
+  call dialog-click {"button":"OK"}
+  assert dialog is none
+  assert hf_edit is false
+  assert dirty is true
+  assert caret.offset is 3
+
+test alt+shift+d and alt+shift+t insert a date and a time field
+  open copy:../fixtures/basic.docx
+  assert dirty is false
+  call real-key {"key":"alt+shift+d"}
+  assert dirty is true
+  assert keytips_up is false
+  assert caret.offset is 1
+  call real-key {"key":"alt+shift+t"}
+  assert caret.offset is 2
+  call real-key {"key":"ctrl+z"}
+  assert caret.offset is 1
+
+# On macOS the ⌥ key-down reaches the window first and raises the KeyTips,
+# which must not take the D.
+test alt+shift+d past the keytips the alt raised
+  open copy:../fixtures/basic.docx
+  call real-key {"key":"alt"}
+  assert keytips_up is true
+  call real-key {"key":"alt+shift+d"}
+  assert keytips_up is false
+  assert caret.offset is 1

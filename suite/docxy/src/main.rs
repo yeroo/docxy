@@ -25174,6 +25174,19 @@ impl Docxy {
             self.keytips = KeyTip::Off;
             return self.doc_field_key_press(doc_fields::FieldKey::ToggleCodes, window, cx);
         }
+        // Alt+Shift+D / Alt+Shift+T insert the date / time field (#1433): the
+        // Alt key-down raised the KeyTips, which would take the letter, so
+        // they go down unasked. On macOS ⌥⇧D is text AppKit commits, which
+        // `ImeState::commit` replays as this key.
+        if self.active_is_doc() && !self.entry_owns_keys() {
+            if let Some(insert) = doc_fields::doc_insert_key(&key, ctrl, shift, m.alt) {
+                self.keytips = KeyTip::Off;
+                if self.protected_refused(cx) {
+                    return self.refocus(window, cx);
+                }
+                return self.insert_field(insert.instr(), "", window, cx);
+            }
+        }
         // KeyTips (Alt / F10 access keys): toggle the overlay; while it's showing,
         // letters pick a tab / run a command instead of typing.
         if (key == "alt" || key == "f10") && !ctrl {
@@ -29458,9 +29471,11 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                 rs::group(
                     "Text",
                     30,
-                    vec![Control::Large(
-                        cmdt("field", "case", "Field", InsertField, "").key("Q"),
-                    )],
+                    vec![
+                        Control::Large(cmdt("field", "case", "Field", InsertField, "").key("Q")),
+                        hf_tab::date_time_control("D"),
+                        hf_tab::quick_parts_control("K"),
+                    ],
                 ),
                 rs::group(
                     "Symbols",

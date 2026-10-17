@@ -312,7 +312,7 @@ fn property_cmds(ids: &[&'static str; 9], labels: &[&'static str; 9]) -> Vec<rs:
     BoundProp::ALL
         .iter()
         .zip(ids.iter().zip(labels))
-        .map(|(p, (id, label))| rs::cmd(id, "", label, hf(HfAct::Property(*p))))
+        .map(|(p, (id, label))| rs::cmd(id, "info", label, hf(HfAct::Property(*p))))
         .collect()
 }
 
@@ -338,6 +338,46 @@ fn quick_parts_cmds() -> Vec<rs::Cmd<Act>> {
     out
 }
 
+/// Date & Time...: on the Header & Footer tab and, since #1433, Insert ›
+/// Text, where it inserts into the body when no header or footer is open.
+pub(crate) fn date_time_control(key: &'static str) -> Control<Act> {
+    Control::Large(
+        cmdt(
+            "hf-datetime",
+            "mail-update",
+            "Date & Time...",
+            hf(HfAct::DateTime),
+            "",
+        )
+        .tip(
+            "Insert Date and Time",
+            "Add the current date or time to the document, header or footer.",
+            "",
+        )
+        .key(key),
+    )
+}
+
+/// Quick Parts: the same two places as [`date_time_control`].
+pub(crate) fn quick_parts_control(key: &'static str) -> Control<Act> {
+    Control::Dropdown {
+        cmd: cmdt(
+            "hf-quickparts",
+            "case",
+            "Quick Parts",
+            hf(HfAct::Menu(HfMenu::QuickParts)),
+            "",
+        )
+        .tip(
+            "Explore Quick Parts",
+            "Insert a document property or a field.",
+            "",
+        )
+        .key(key),
+        items: quick_parts_cmds(),
+    }
+}
+
 /// The contextual Header & Footer tab.
 pub(crate) fn hf_tab() -> rs::Tab<Act> {
     rs::tab(
@@ -349,21 +389,7 @@ pub(crate) fn hf_tab() -> rs::Tab<Act> {
                 "Insert",
                 20,
                 vec![
-                    Control::Large(
-                        cmdt(
-                            "hf-datetime",
-                            "mail-update",
-                            "Date & Time...",
-                            hf(HfAct::DateTime),
-                            "",
-                        )
-                        .tip(
-                            "Insert Date and Time",
-                            "Add the current date or time to the header or footer.",
-                            "",
-                        )
-                        .key("D"),
-                    ),
+                    date_time_control("D"),
                     Control::Dropdown {
                         cmd: cmdt(
                             "hf-docinfo",
@@ -380,22 +406,7 @@ pub(crate) fn hf_tab() -> rs::Tab<Act> {
                         .key("I"),
                         items: doc_info_cmds(),
                     },
-                    Control::Dropdown {
-                        cmd: cmdt(
-                            "hf-quickparts",
-                            "case",
-                            "Quick Parts",
-                            hf(HfAct::Menu(HfMenu::QuickParts)),
-                            "",
-                        )
-                        .tip(
-                            "Explore Quick Parts",
-                            "Insert a document property or a field.",
-                            "",
-                        )
-                        .key("Q"),
-                        items: quick_parts_cmds(),
-                    },
+                    quick_parts_control("Q"),
                     Control::Large(
                         cmdt(
                             "hf-pictures",

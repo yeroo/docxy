@@ -1229,6 +1229,158 @@
                   "shortcut": ""
                 }
               }
+            },
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "hf-datetime",
+                "label": "Date & Time...",
+                "icon": "mail-update",
+                "act": "Hf(DateTime)",
+                "keyTip": "D",
+                "tip": {
+                  "title": "Insert Date and Time",
+                  "body": "Add the current date or time to the document, header or footer.",
+                  "shortcut": ""
+                }
+              }
+            },
+            {
+              "kind": "dropdown",
+              "cmd": {
+                "id": "hf-quickparts",
+                "label": "Quick Parts",
+                "icon": "case",
+                "act": "Hf(Menu(QuickParts))",
+                "keyTip": "K",
+                "tip": {
+                  "title": "Explore Quick Parts",
+                  "body": "Insert a document property or a field.",
+                  "shortcut": ""
+                }
+              },
+              "items": [
+                {
+                  "id": "hf-qp-prop-author",
+                  "label": "Document Property: Author",
+                  "icon": "info",
+                  "act": "Hf(Property(Author))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "hf-qp-prop-category",
+                  "label": "Document Property: Category",
+                  "icon": "info",
+                  "act": "Hf(Property(Category))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "hf-qp-prop-comments",
+                  "label": "Document Property: Comments",
+                  "icon": "info",
+                  "act": "Hf(Property(Comments))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "hf-qp-prop-company",
+                  "label": "Document Property: Company",
+                  "icon": "info",
+                  "act": "Hf(Property(Company))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "hf-qp-prop-keywords",
+                  "label": "Document Property: Keywords",
+                  "icon": "info",
+                  "act": "Hf(Property(Keywords))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "hf-qp-prop-manager",
+                  "label": "Document Property: Manager",
+                  "icon": "info",
+                  "act": "Hf(Property(Manager))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "hf-qp-prop-status",
+                  "label": "Document Property: Status",
+                  "icon": "info",
+                  "act": "Hf(Property(Status))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "hf-qp-prop-subject",
+                  "label": "Document Property: Subject",
+                  "icon": "info",
+                  "act": "Hf(Property(Subject))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "hf-qp-prop-title",
+                  "label": "Document Property: Title",
+                  "icon": "info",
+                  "act": "Hf(Property(Title))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "hf-qp-field",
+                  "label": "Field...",
+                  "icon": "case",
+                  "act": "InsertField",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                }
+              ]
             }
           ]
         },
