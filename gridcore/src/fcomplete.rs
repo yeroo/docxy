@@ -250,7 +250,7 @@ fn names(prefix: &str, wb: &Workbook, sheet: usize) -> Vec<Item> {
     for d in &wb.defined_names {
         // Excel lists none of the `_xl…` names: the `_xlnm.` built-ins
         // (Print_Area, _FilterDatabase) and the `_xlfn.`/`_xlpm.` spellings.
-        if d.name.starts_with("_xl") || !d.scope.is_none_or(|s| s == sheet) || !starts(&d.name) {
+        if d.name.starts_with("_xl") || d.scope.is_some_and(|s| s != sheet) || !starts(&d.name) {
             continue;
         }
         if items.iter().any(|i| i.label.eq_ignore_ascii_case(&d.name)) {

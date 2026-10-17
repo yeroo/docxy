@@ -705,7 +705,7 @@ fn two_initial_caps(word: &str) -> Option<String> {
         return None;
     }
     let rest = &cs[2..];
-    if !(cs[0].is_uppercase() && cs[1].is_uppercase()) || !rest.iter().all(|c| c.is_lowercase()) {
+    if !cs[0].is_uppercase() || !cs[1].is_uppercase() || !rest.iter().all(|c| c.is_lowercase()) {
         return None;
     }
     if rest == ['s'] {
