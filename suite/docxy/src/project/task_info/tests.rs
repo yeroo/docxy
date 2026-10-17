@@ -199,7 +199,11 @@ fn ok_writes_every_changed_field_as_one_undo_step() {
     assert_eq!(task.priority, Some(700));
     assert_eq!(task.predecessors.len(), 1);
     assert_eq!(task.constraint, projcore::ConstraintType::FinishNoLaterThan);
-    assert_eq!(task.deadline, Some(DateTime::from_ymd_hm(2026, 5, 1, 0, 0)));
+    assert_eq!(
+        task.deadline,
+        Some(DateTime::from_ymd_hm(2026, 5, 1, 17, 0)),
+        "a bare date is the end of that working day"
+    );
     assert_eq!(task.task_type, Some(TaskType::FixedDuration));
     assert_eq!(task.effort_driven, Some(true));
     assert_eq!(task.notes.as_deref(), Some("first\nsecond"));
@@ -346,4 +350,162 @@ fn a_double_click_on_a_task_id_opens_it_and_a_single_click_does_not() {
     project_cell_click(&mut t, 1, Some(COL_NAME), true);
     assert!(!t.dialogs.is_open());
     assert!(v(&t).cell.is_some());
+}
+
+fn plain_task(t: &DocTab) -> projcore::Task {
+    v(t).ed.project().task(2).unwrap().clone()
+}
+
+#[test]
+fn a_task_finishing_on_its_deadline_day_does_not_miss_it() {
+    let mut t = tab();
+    // Second is 2d from Mon 2026-01-05: it finishes Tue 2026-01-06 17:00.
+    open(&mut t, ProjectAct::Constraint);
+    put(&mut t, "deadline", "2026-01-06");
+    dialog_click(&mut t, "OK").unwrap();
+    let task = plain_task(&t);
+    let finish = v(&t).ed.disp_finish(2).unwrap();
+    assert_eq!(task.deadline, Some(finish), "the day's last working time");
+    assert!(!task.misses_deadline(finish));
+    // The day before it does miss.
+    open(&mut t, ProjectAct::Constraint);
+    put(&mut t, "deadline", "2026-01-05");
+    dialog_click(&mut t, "OK").unwrap();
+    assert!(plain_task(&t).misses_deadline(finish));
+}
+
+#[test]
+fn a_deadline_with_a_time_keeps_it_and_the_field_round_trips() {
+    let mut t = tab();
+    open(&mut t, ProjectAct::Constraint);
+    put(&mut t, "deadline", "2026-03-02T12:30");
+    dialog_click(&mut t, "OK").unwrap();
+    assert_eq!(
+        plain_task(&t).deadline,
+        Some(DateTime::from_ymd_hm(2026, 3, 2, 12, 30))
+    );
+    open(&mut t, ProjectAct::Constraint);
+    assert_eq!(read(&t, "deadline"), "2026-03-02T12:30");
+    dialog_click(&mut t, "OK").unwrap();
+    assert_eq!(v(&t).ed.undo_depth(), 1, "an untouched field writes nothing");
+    // The end of the day shows as the bare date.
+    t.dialogs.clear();
+    open(&mut t, ProjectAct::Constraint);
+    put(&mut t, "deadline", "2026-03-02");
+    dialog_click(&mut t, "OK").unwrap();
+    open(&mut t, ProjectAct::Constraint);
+    assert_eq!(read(&t, "deadline"), "2026-03-02");
+    put(&mut t, "deadline", "2026-03-02T25:00");
+    assert!(dialog_click(&mut t, "OK").is_err());
+}
+
+#[test]
+fn start_and_finish_together_are_refused_on_an_auto_task_and_taken_on_a_manual_one() {
+    let mut t = tab();
+    let before = state(&t);
+    open(&mut t, ProjectAct::Constraint);
+    put(&mut t, "start", "2026-02-02");
+    put(&mut t, "finish", "2026-02-06");
+    let err = dialog_click(&mut t, "OK").unwrap_err();
+    assert!(err.contains("not both"), "{err}");
+    assert_eq!(t.dialogs.top_id(), "task-information");
+    assert_eq!(state(&t), before);
+    t.dialogs.clear();
+    vm(&mut t).ed.set_manual(2, true).unwrap();
+    open(&mut t, ProjectAct::Constraint);
+    put(&mut t, "start", "2026-02-02");
+    put(&mut t, "finish", "2026-02-06");
+    dialog_click(&mut t, "OK").unwrap();
+    let ed = &v(&t).ed;
+    assert_eq!(ed.disp_start(2).unwrap().parts().day, 2);
+    assert_eq!(ed.disp_finish(2).unwrap().parts().day, 6);
+}
+
+#[test]
+fn a_type_only_change_keeps_the_stored_constraint_instant() {
+    let mut t = tab();
+    let at = DateTime::from_ymd_hm(2026, 3, 5, 17, 0);
+    vm(&mut t)
+        .ed
+        .set_constraint_typed(2, projcore::ConstraintType::FinishNoEarlierThan, Some(at))
+        .unwrap();
+    open(&mut t, ProjectAct::Constraint);
+    assert_eq!(read(&t, "cdate"), "2026-03-05T17:00", "FNET is not a day-end type");
+    put(&mut t, "ctype", "Must Finish On");
+    dialog_click(&mut t, "OK").unwrap();
+    let task = plain_task(&t);
+    assert_eq!(task.constraint, projcore::ConstraintType::MustFinishOn);
+    assert_eq!(task.constraint_date, Some(at));
+}
+
+#[test]
+fn a_typed_bare_date_gets_the_start_or_end_of_the_day_for_its_type() {
+    for (kind, hour) in [
+        ("Finish No Later Than", 17),
+        ("Must Finish On", 17),
+        ("Start No Later Than", 8),
+        ("Must Start On", 8),
+    ] {
+        let mut t = tab();
+        open(&mut t, ProjectAct::Constraint);
+        put(&mut t, "ctype", kind);
+        put(&mut t, "cdate", "2026-03-05");
+        dialog_click(&mut t, "OK").unwrap();
+        let date = plain_task(&t).constraint_date.unwrap();
+        assert_eq!(date, DateTime::from_ymd_hm(2026, 3, 5, hour, 0), "{kind}");
+        // And what it shows now is the bare date.
+        open(&mut t, ProjectAct::Constraint);
+        assert_eq!(read(&t, "cdate"), "2026-03-05", "{kind}");
+    }
+    let mut t = tab();
+    open(&mut t, ProjectAct::Constraint);
+    put(&mut t, "ctype", "Must Start On");
+    put(&mut t, "cdate", "2026-03-05T10:15");
+    dialog_click(&mut t, "OK").unwrap();
+    assert_eq!(
+        plain_task(&t).constraint_date,
+        Some(DateTime::from_ymd_hm(2026, 3, 5, 10, 15))
+    );
+}
+
+#[test]
+fn unchecking_effort_driven_applies_before_a_resource_is_added() {
+    let mut t = tab();
+    {
+        let ed = &mut vm(&mut t).ed;
+        ed.set_effort_driven(2, true).unwrap();
+        ed.set_resources(2, &["Ann".into()]).unwrap();
+    }
+    let duration = plain_task(&t).duration_min;
+    open(&mut t, ProjectAct::Constraint);
+    put(&mut t, "resources", "Ann, Bo");
+    set(&mut t, "effort", Json::Bool(false));
+    dialog_click(&mut t, "OK").unwrap();
+    let task = plain_task(&t);
+    assert_eq!(task.effort_driven, Some(false));
+    assert_eq!(task.duration_min, duration, "no longer effort driven");
+    assert_eq!(v(&t).ed.project().assignments.len(), 2);
+}
+
+#[test]
+fn a_percent_that_contradicts_the_actuals_is_refused() {
+    let mut t = tab();
+    let mut p = v(&t).ed.project().clone();
+    p.tasks[1].actual_start = Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0));
+    vm(&mut t).ed = ProjectEditor::new(p);
+    vm(&mut t).ed.select(1);
+    let before = state(&t);
+    open(&mut t, ProjectAct::Constraint);
+    put(&mut t, "name", "Renamed");
+    put(&mut t, "percent", "0");
+    // Already 0 shown: unchanged, so nothing to refuse.
+    dialog_click(&mut t, "OK").unwrap();
+    assert_eq!(plain_task(&t).name, "Renamed");
+    vm(&mut t).ed.set_percent_complete(2, 20).unwrap();
+    let before = (state(&t), before);
+    open(&mut t, ProjectAct::Constraint);
+    put(&mut t, "percent", "0");
+    let err = dialog_click(&mut t, "OK").unwrap_err();
+    assert!(err.contains("actual start"), "{err}");
+    assert_eq!(state(&t), before.0);
 }

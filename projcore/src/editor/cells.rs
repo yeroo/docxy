@@ -1111,7 +1111,7 @@ pub(super) use crate::assign::task_calendar;
 /// Start of a typed date: its first working time, or 08:00 (Project's default
 /// start time) on a non-working day or holiday, where a manual task may still
 /// start.
-pub(crate) fn day_start(proj: &Project, task: &Task, date: DateTime) -> DateTime {
+pub fn day_start(proj: &Project, task: &Task, date: DateTime) -> DateTime {
     let from = task_calendar(proj, task)
         .day(date.day_number())
         .first()
@@ -1121,7 +1121,7 @@ pub(crate) fn day_start(proj: &Project, task: &Task, date: DateTime) -> DateTime
 
 /// Finish of a typed date: its last working time, or 17:00 on a non-working
 /// day or holiday, where a manual task may still finish.
-fn day_end(proj: &Project, task: &Task, date: DateTime) -> DateTime {
+pub fn day_end(proj: &Project, task: &Task, date: DateTime) -> DateTime {
     let to = task_calendar(proj, task)
         .day(date.day_number())
         .last()

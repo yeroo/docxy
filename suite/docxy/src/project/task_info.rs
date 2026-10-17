@@ -9,8 +9,11 @@
 use super::*;
 use crate::dialog::catalog;
 use crate::dialog::{Control, ControlKind, Dialog, DialogOwner, Reaction, Value};
-use crate::page_setup::{choice, ok_cancel};
-use projcore::editor::{PRIORITY_DEFAULT, PRIORITY_MAX, format_date_field};
+use crate::page_setup::{choice, chosen, ok_cancel, text_of};
+use projcore::DateTime;
+use projcore::editor::{
+    PRIORITY_DEFAULT, PRIORITY_MAX, day_end, day_start, format_date_field, parse_cell_date,
+};
 use projcore::{ConstraintType, TaskType};
 
 /// The page the dialog opens on: Information... opens General, Notes...
@@ -150,8 +153,9 @@ pub(crate) fn task_info_dialog(
             "cdate",
             "Constraint &date:",
             ControlKind::Date,
-            task.constraint_date
-                .map_or_else(String::new, |d| format_date_field(Some(d))),
+            task.constraint_date.map_or_else(String::new, |d| {
+                stamp_text(proj, task, d, constraint_ends_day(task.constraint))
+            }),
             3,
         ),
         field(
@@ -159,7 +163,7 @@ pub(crate) fn task_info_dialog(
             "Dea&dline:",
             ControlKind::Date,
             task.deadline
-                .map_or_else(String::new, |d| format_date_field(Some(d))),
+                .map_or_else(String::new, |d| stamp_text(proj, task, d, true)),
             3,
         ),
         choice(
@@ -224,18 +228,63 @@ fn react(d: &mut Dialog, i: usize, _before: &Value) {
     }
 }
 
-fn text_of(d: &Dialog, name: &str) -> String {
-    d.controls
-        .iter()
-        .find(|c| c.name == name)
-        .map_or_else(String::new, Control::text)
+/// Whether a constraint's date-only form means the end of that day: the
+/// finish-bound types that fall on a day's last working time.
+fn constraint_ends_day(constraint: ConstraintType) -> bool {
+    matches!(
+        constraint,
+        ConstraintType::FinishNoLaterThan | ConstraintType::MustFinishOn
+    )
 }
 
-fn choice_of(d: &Dialog, name: &str) -> Option<usize> {
-    match d.value(name) {
-        Some(Value::Choice(i)) => *i,
-        _ => None,
+/// A stored instant as the field shows it: the bare date when that is the
+/// day's start (or end, `ends_day`) a bare date means, else with its time, so
+/// retyping what is shown gives the same instant.
+fn stamp_text(proj: &projcore::Project, task: &Task, at: DateTime, ends_day: bool) -> String {
+    let day = at.start_of_day();
+    let bare = if ends_day {
+        day_end(proj, task, day)
+    } else {
+        day_start(proj, task, day)
+    };
+    let date = format_date_field(Some(at));
+    if at == bare {
+        date
+    } else {
+        let p = at.parts();
+        format!("{date}T{:02}:{:02}", p.hour, p.minute)
     }
+}
+
+/// A typed date or `date`T`hh:mm`: a bare date is the day's start (or end,
+/// `ends_day`) in the task's calendar, a time is taken as typed.
+fn parse_stamp(
+    ed: &ProjectEditor,
+    uid: i32,
+    text: &str,
+    ends_day: bool,
+) -> Result<DateTime, String> {
+    let text = text.trim();
+    let bad = || "Expected a valid date: YYYY-MM-DD or YYYY-MM-DDThh:mm".to_string();
+    if let Some((day, time)) = text.split_once('T') {
+        let day = parse_cell_date(day)?;
+        let (h, m) = time.split_once(':').ok_or_else(bad)?;
+        let (h, m) = (h.parse::<i64>(), m.parse::<i64>());
+        return match (h, m) {
+            (Ok(h), Ok(m)) if (0..24).contains(&h) && (0..60).contains(&m) => {
+                Ok(day.add_minutes(h * 60 + m))
+            }
+            _ => Err(bad()),
+        };
+    }
+    let day = parse_cell_date(text)?;
+    let proj = ed.project();
+    let task = proj.task(uid).ok_or("The edited task no longer exists")?;
+    Ok(if ends_day {
+        day_end(proj, task, day)
+    } else {
+        day_start(proj, task, day)
+    })
 }
 
 /// A whole number within `lo..=hi`, or the refusal naming the field.
@@ -255,9 +304,31 @@ pub(crate) fn apply_task_info(
     uid: i32,
     d: &Dialog,
 ) -> Result<bool, String> {
-    let before = ed.project().clone();
+    let stored = ed.project().task(uid).and_then(|t| t.constraint_date);
     let changed = |name: &str| d.changed(name);
     ed.batch(|ed| {
+        // Task type and Effort driven first: a resource added below rescales
+        // work or duration by them.
+        if changed("ttype") {
+            let kind = chosen(d, "ttype")
+                .and_then(|k| TASK_TYPES.get(k))
+                .map(|(t, _)| *t)
+                .ok_or("Pick a task type")?;
+            ed.set_task_type(uid, kind)?;
+        }
+        if changed("effort") {
+            ed.set_effort_driven(uid, d.value("effort") == Some(&Value::Bool(true)))?;
+        }
+        if changed("start")
+            && changed("finish")
+            && !ed.project().task(uid).is_some_and(|t| t.manual)
+        {
+            // Each would replace the other's constraint on an auto task.
+            return Err(
+                "Change Start or Finish, not both, on an auto-scheduled task; change Duration for the span"
+                    .into(),
+            );
+        }
         for (name, col) in [
             ("name", COL_NAME),
             ("duration", COL_DURATION),
@@ -277,53 +348,43 @@ pub(crate) fn apply_task_info(
             ed.set_priority(uid, whole(d, "priority", "Priority", 0, PRIORITY_MAX)?)?;
         }
         // After Start and Finish, which add their own constraint to an auto
-        // task: the person's explicit choice here wins.
+        // task: the person's explicit choice here wins. A change of type
+        // alone keeps the stored instant.
         if changed("ctype") || changed("cdate") {
-            let kind = choice_of(d, "ctype")
+            let kind = chosen(d, "ctype")
                 .and_then(|k| CONSTRAINTS.get(k))
                 .map(|(c, _)| *c)
                 .ok_or("Pick a constraint type")?;
-            let abbrev = kind.abbrev();
-            let date = text_of(d, "cdate");
-            let date = date.trim();
-            let typed = if !needs_date(kind) {
-                abbrev.to_string()
-            } else if date.is_empty() {
-                return Err(format!("{abbrev} needs a constraint date"));
+            let date = if !needs_date(kind) {
+                None
+            } else if changed("cdate") {
+                let typed = text_of(d, "cdate");
+                if typed.trim().is_empty() {
+                    return Err(format!("{} needs a constraint date", kind.abbrev()));
+                }
+                Some(parse_stamp(ed, uid, &typed, constraint_ends_day(kind))?)
             } else {
-                format!(
-                    "{abbrev} {}",
-                    projcore::editor::parse_cell_date(date).map(|_| date)?
-                )
+                Some(stored.ok_or_else(|| format!("{} needs a constraint date", kind.abbrev()))?)
             };
-            ed.set_constraint(uid, &typed)?;
+            ed.set_constraint_typed(uid, kind, date)?;
         }
         if changed("deadline") {
-            let deadline = text_of(d, "deadline");
-            let deadline = deadline.trim();
-            let deadline = if deadline.is_empty() {
+            let typed = text_of(d, "deadline");
+            let deadline = if typed.trim().is_empty() {
                 None
             } else {
-                Some(projcore::editor::parse_cell_date(deadline)?)
+                Some(parse_stamp(ed, uid, &typed, true)?)
             };
             ed.set_deadline(uid, deadline)?;
-        }
-        if changed("ttype") {
-            let kind = choice_of(d, "ttype")
-                .and_then(|k| TASK_TYPES.get(k))
-                .map(|(t, _)| *t)
-                .ok_or("Pick a task type")?;
-            ed.set_task_type(uid, kind)?;
-        }
-        if changed("effort") {
-            ed.set_effort_driven(uid, d.value("effort") == Some(&Value::Bool(true)))?;
         }
         if changed("notes") {
             ed.set_notes(uid, &projcore::text::notes_from_line(&text_of(d, "notes")))?;
         }
         Ok(())
     })?;
-    Ok(ed.project() != &before)
+    // The tab's dirty flag and edit generation follow the editor
+    // (`complete_project`), as for a summary delete.
+    Ok(false)
 }
 
 #[cfg(test)]

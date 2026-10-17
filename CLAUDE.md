@@ -308,8 +308,15 @@
 - OK writes only the fields that changed (`Dialog::changed`), inside
   `Editor::batch`: one undo step, an unchanged OK leaves the plan clean, and a
   refused field applies nothing and keeps the dialog open with the message in
-  the status line. Duration, Start, Finish and % Complete of an auto summary
-  are disabled. The new projcore setters (`set_percent_complete`,
+  the status line. Duration, Start and Finish of an auto summary, and
+  % Complete of any summary, are disabled. A bare Deadline or constraint date
+  is the day's last working time (FNLT, MFO, Deadline) or first (the other
+  types), `YYYY-MM-DDThh:mm` takes a time, and the field shows a stored
+  instant bare only when it is that boundary. A change of constraint type
+  alone keeps the stored instant. Start and Finish together on an auto task
+  are refused (each would replace the other's constraint). Task type and
+  Effort driven apply before the rest, since a resource added in the same OK
+  rescales by them. The new projcore setters (`set_percent_complete`,
   `set_priority`, `set_deadline`, `set_task_type`, `set_effort_driven`) are in
   `projcore/src/editor/props.rs`. The old `task-info` input of `inputs.rs` is
   gone; `uiharness/cases/project-task-info.uit` drives the dialog by hand.

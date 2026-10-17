@@ -50,6 +50,30 @@ fn percent_complete_range_unchanged_undo_and_round_trip() {
 }
 
 #[test]
+fn percent_complete_cannot_contradict_the_actuals() {
+    let day = DateTime::from_ymd_hm(2026, 1, 5, 8, 0);
+    let with = |start, finish| {
+        let mut proj = editor().project().clone();
+        let task = proj.tasks.iter_mut().find(|t| t.uid == 2).unwrap();
+        (task.actual_start, task.actual_finish) = (start, finish);
+        Editor::new(proj)
+    };
+    let mut started = with(Some(day), None);
+    assert!(
+        started.set_percent_complete(2, 0).is_err(),
+        "started, not 0%"
+    );
+    assert_eq!(started.set_percent_complete(2, 10), Ok(true));
+    let mut finished = with(Some(day), Some(day));
+    assert!(
+        finished.set_percent_complete(2, 50).is_err(),
+        "finished: 100%"
+    );
+    assert_eq!(finished.undo_depth(), 0);
+    assert_eq!(finished.set_percent_complete(2, 100), Ok(true));
+}
+
+#[test]
 fn priority_range_default_and_round_trip() {
     let mut ed = editor();
     assert_eq!(ed.set_priority(2, PRIORITY_DEFAULT), Ok(false));

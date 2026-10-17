@@ -45,7 +45,15 @@ test project task information: OK writes General, Advanced and Notes as one undo
   call task.get {"uid":2,"fields":["Priority","Deadline","Notes"]}
   assert reply.start is 2026-01-19 08:00
   assert reply.fields.Priority.value is 800
-  assert reply.fields.Deadline.value is 2026-02-27 00:00
+  assert reply.fields.Deadline.value is 2026-02-27 17:00
+  # The dialog reads back what OK wrote.
+  key alt t c
+  call field-read {"dialog-field":"percent"}
+  assert reply.value is 50
+  call pointer-click {"dialog-tab":"Notes"}
+  call field-read {"dialog-field":"notes"}
+  assert reply.value is check\nit
+  call real-key {"key":"escape"}
   key ctrl+z
   assert selected_name is B
   assert undo_depth is 0
@@ -53,6 +61,11 @@ test project task information: OK writes General, Advanced and Notes as one undo
   assert reply.start is 2026-01-05 08:00
   assert reply.fields.Priority.value is 500
   assert reply.fields.Deadline.value is null
+  assert reply.fields.Notes.value is null
+  key alt t c
+  call field-read {"dialog-field":"percent"}
+  assert reply.value is 0
+  call real-key {"key":"escape"}
 
 test project task information: Notes... opens on the Notes page and an unchanged OK stays clean
   open copy:../fixtures/project-clipboard.xml

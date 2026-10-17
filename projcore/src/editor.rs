@@ -25,8 +25,9 @@ mod fields;
 mod links;
 pub use assignments::{AssignmentPatch, ResourceRef};
 pub use cells::{
-    day_finish, format_duration_exact, format_predecessors, format_resource_names, parse_cell_date,
-    parse_lag, parse_task_predecessors, split_resource_names,
+    day_end, day_finish, day_start, format_duration_exact, format_predecessors,
+    format_resource_names, parse_cell_date, parse_lag, parse_task_predecessors,
+    split_resource_names,
 };
 pub use fields::assignment::{
     AssignmentField, assignment_dates, assignment_field_names, rate_table_letter,
@@ -41,7 +42,7 @@ pub(crate) use fields::{format_work, two_decimals};
 // keeps links shown in a fallback unit; the plain parser stays internal.
 #[cfg(test)]
 use cells::parse_predecessors;
-use cells::{bracket_units, day_start, parse_resource_token, same_shown_units};
+use cells::{bracket_units, parse_resource_token, same_shown_units};
 mod moving;
 mod outline;
 mod props;

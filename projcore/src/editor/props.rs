@@ -31,6 +31,14 @@ impl Editor {
         if task.summary {
             return Err("Summary % Complete is computed from its subtasks".into());
         }
+        // The task's actuals say how far it is: a lower value would contradict
+        // them.
+        if task.actual_finish.is_some() && percent < 100 {
+            return Err("The task has an actual finish, so it is 100% complete".into());
+        }
+        if task.actual_start.is_some() && percent == 0 {
+            return Err("The task has an actual start, so it is more than 0% complete".into());
+        }
         if task.percent_complete.unwrap_or(0) == percent {
             return Ok(false);
         }
