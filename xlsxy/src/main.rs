@@ -2119,6 +2119,34 @@ struct Prompt {
     label: &'static str,
     text: String,
     cursor: usize,
+    /// The other end of a selection, in chars; the selection runs between it
+    /// and `cursor` (#1376).
+    anchor: Option<usize>,
+}
+
+impl Prompt {
+    /// The selected span `(from, to)` in chars, `from < to`, if any. Tests
+    /// assign `text` directly, so both ends clamp to it.
+    fn selection(&self) -> Option<(usize, usize)> {
+        let len = self.text.chars().count();
+        let a = self.anchor?.min(len);
+        let c = self.cursor.min(len);
+        (a != c).then(|| (a.min(c), a.max(c)))
+    }
+
+    /// Removes the selection, leaving the caret where it began; whether
+    /// there was one.
+    fn delete_selection(&mut self) -> bool {
+        let sel = self.selection();
+        self.anchor = None;
+        let Some((from, to)) = sel else {
+            return false;
+        };
+        let (a, b) = (char_index(&self.text, from), char_index(&self.text, to));
+        self.text.replace_range(a..b, "");
+        self.cursor = from;
+        true
+    }
 }
 
 /// Vim editing modes for the grid (`--vim`).
@@ -9996,6 +10024,7 @@ impl App {
             label,
             text,
             cursor,
+            anchor: None,
         });
     }
 
@@ -12060,6 +12089,7 @@ impl App {
                     value: Some(p.text.clone()),
                     focused: true,
                     caret: Some(p.cursor),
+                    selection: p.selection(),
                     ..Field::default()
                 }
                 .kind(format!("{:?}", p.kind))
@@ -12233,29 +12263,47 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 }
             }
             KeyCode::Enter => app.commit_prompt(),
+            // Word's select-all in the field; it never types an `a` (#1376).
+            KeyCode::Char('a') if ctrl => {
+                if let Some(p) = &mut app.prompt {
+                    p.cursor = p.text.chars().count();
+                    p.anchor = Some(0);
+                }
+            }
+            // With a selection, Left and Right collapse to its edges.
             KeyCode::Left => {
                 if let Some(p) = &mut app.prompt {
-                    p.cursor = p.cursor.saturating_sub(1);
+                    p.cursor = match p.selection() {
+                        Some((from, _)) => from,
+                        None => p.cursor.saturating_sub(1),
+                    };
+                    p.anchor = None;
                 }
             }
             KeyCode::Right => {
                 if let Some(p) = &mut app.prompt {
-                    p.cursor = (p.cursor + 1).min(p.text.chars().count());
+                    p.cursor = match p.selection() {
+                        Some((_, to)) => to,
+                        None => (p.cursor + 1).min(p.text.chars().count()),
+                    };
+                    p.anchor = None;
                 }
             }
             KeyCode::Home => {
                 if let Some(p) = &mut app.prompt {
                     p.cursor = 0;
+                    p.anchor = None;
                 }
             }
             KeyCode::End => {
                 if let Some(p) = &mut app.prompt {
                     p.cursor = p.text.chars().count();
+                    p.anchor = None;
                 }
             }
             KeyCode::Backspace => {
                 if let Some(p) = &mut app.prompt {
-                    if p.cursor > 0 {
+                    if !p.delete_selection() && p.cursor > 0 {
                         let idx = char_index(&p.text, p.cursor - 1);
                         p.text.remove(idx);
                         p.cursor -= 1;
@@ -12264,7 +12312,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             }
             KeyCode::Delete => {
                 if let Some(p) = &mut app.prompt {
-                    if p.cursor < p.text.chars().count() {
+                    if !p.delete_selection() && p.cursor < p.text.chars().count() {
                         let idx = char_index(&p.text, p.cursor);
                         p.text.remove(idx);
                     }
@@ -12272,6 +12320,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             }
             KeyCode::Char(ch) if !ctrl => {
                 if let Some(p) = &mut app.prompt {
+                    p.delete_selection();
                     let idx = char_index(&p.text, p.cursor);
                     p.text.insert(idx, ch);
                     p.cursor += 1;
@@ -12348,7 +12397,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             }
             KeyCode::Left => {
                 if let Some(e) = &mut app.edit {
-                    e.cursor = e.cursor.saturating_sub(1);
+                    // A selection collapses to its start, as Word's does.
+                    e.cursor = if e.select_all {
+                        0
+                    } else {
+                        e.cursor.saturating_sub(1)
+                    };
                 }
             }
             KeyCode::Right => {
@@ -12364,6 +12418,16 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             KeyCode::End => {
                 if let Some(e) = &mut app.edit {
                     e.cursor = e.text.chars().count();
+                }
+            }
+            // Selects the whole text, the caret at its end; typing, Backspace
+            // and Delete then replace or remove it (#1376).
+            KeyCode::Char('a') if ctrl => {
+                app.drop_proposal();
+                if let Some(e) = &mut app.edit {
+                    e.cursor = e.text.chars().count();
+                    e.select_all = true;
+                    e.complete = None;
                 }
             }
             KeyCode::Backspace => {
@@ -12422,10 +12486,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         // Any other change to the text or caret ends a correction's Ctrl+Z
         // (the typed character set its own), and moves the formula list.
         let now = app.edit.as_ref().map(|e| (e.text.clone(), e.cursor));
-        // Any key but Ctrl+Z ends the revert's toggle and its selection (#1147).
+        // Any key but Ctrl+Z ends the revert's toggle and its selection (#1147);
+        // Ctrl+A makes one.
+        let selects = key.code == KeyCode::Char('a') && ctrl;
         if let Some(e) = &mut app.edit {
             e.redo_text = None;
-            e.select_all = false;
+            e.select_all &= selects;
         }
         if now.is_some() && now != was {
             if !matches!(key.code, KeyCode::Char(_)) {
@@ -20894,6 +20960,7 @@ mod tests {
             label: "",
             text: "Sales[PID] = Products[ID]".into(),
             cursor: 0,
+            anchor: None,
         });
         app.commit_prompt();
         assert_eq!(app.model_rels.len(), 1, "{:?}", app.status);
@@ -20902,6 +20969,7 @@ mod tests {
             label: "",
             text: "Total = SUM(Sales[Amount])".into(),
             cursor: 0,
+            anchor: None,
         });
         app.commit_prompt();
         assert_eq!(app.model_measures.len(), 1);
@@ -20911,6 +20979,7 @@ mod tests {
             label: "",
             text: "Sales[Nope] = Products[ID]".into(),
             cursor: 0,
+            anchor: None,
         });
         app.commit_prompt();
         assert_eq!(app.model_rels.len(), 1);
@@ -20921,6 +20990,7 @@ mod tests {
             label: "",
             text: "Sales; Products[Cat]; Total".into(),
             cursor: 0,
+            anchor: None,
         });
         app.commit_prompt();
         let idx = app
@@ -25305,6 +25375,104 @@ mod tests {
         assert!(app.sheet_picker.is_none());
         assert!(USAGE.contains("F4 / Ctrl-Y redo or repeat"));
         assert!(USAGE.contains("Shift-F4 sheet list"));
+    }
+
+    // --- #1376: Ctrl+A selects the prompt and the cell editor ------------------
+
+    fn ctrl_a(app: &mut App) {
+        press_mod(app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+    }
+
+    /// An empty prompt (Add Sheet opens seeded with a name).
+    fn open_empty_prompt(app: &mut App) {
+        app.open_prompt(PromptKind::AddSheet);
+        let p = app.prompt.as_mut().expect("a prompt");
+        p.text.clear();
+        p.cursor = 0;
+    }
+
+    fn prompt_state(app: &App) -> (String, Option<usize>, Option<(usize, usize)>) {
+        let f = app.input_field("xlsxy-prompt");
+        (f.value.unwrap(), f.caret, f.selection)
+    }
+
+    #[test]
+    fn ctrl_a_selects_the_prompt_and_typing_replaces_it() {
+        let mut app = opts_app();
+        open_empty_prompt(&mut app);
+        type_text(&mut app, "abcd");
+        ctrl_a(&mut app);
+        assert_eq!(prompt_state(&app), ("abcd".into(), Some(4), Some((0, 4))));
+        type_text(&mut app, "X");
+        assert_eq!(prompt_state(&app), ("X".into(), Some(1), None));
+        for code in [KeyCode::Backspace, KeyCode::Delete] {
+            type_text(&mut app, "yz");
+            ctrl_a(&mut app);
+            press(&mut app, code);
+            assert_eq!(prompt_state(&app), ("".into(), Some(0), None));
+            type_text(&mut app, "q");
+            press(&mut app, KeyCode::Backspace);
+        }
+        ctrl_a(&mut app);
+        assert_eq!(prompt_state(&app).2, None, "an empty field selects nothing");
+    }
+
+    #[test]
+    fn arrows_collapse_the_prompt_selection_and_home_end_drop_it() {
+        let mut app = opts_app();
+        open_empty_prompt(&mut app);
+        type_text(&mut app, "abcd");
+        ctrl_a(&mut app);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(prompt_state(&app), ("abcd".into(), Some(0), None));
+        ctrl_a(&mut app);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(prompt_state(&app), ("abcd".into(), Some(4), None));
+        for (code, at) in [(KeyCode::Home, 0), (KeyCode::End, 4)] {
+            ctrl_a(&mut app);
+            press(&mut app, code);
+            assert_eq!(prompt_state(&app), ("abcd".into(), Some(at), None));
+            type_text(&mut app, "z");
+            assert_eq!(prompt_state(&app).0.chars().count(), 5, "inserts");
+            press(&mut app, KeyCode::Backspace);
+        }
+    }
+
+    fn cell_state(app: &App) -> (String, Option<(usize, usize)>) {
+        let f = app.input_field("xlsxy-cell");
+        (f.value.unwrap(), f.selection)
+    }
+
+    #[test]
+    fn ctrl_a_selects_the_cell_editor_text() {
+        let mut app = opts_app();
+        app.cur = (0, 0);
+        press(&mut app, KeyCode::F(2));
+        type_text(&mut app, "abcd");
+        ctrl_a(&mut app);
+        assert_eq!(cell_state(&app), ("abcd".into(), Some((0, 4))), "no `a`");
+        type_text(&mut app, "X");
+        assert_eq!(cell_state(&app), ("X".into(), None));
+        for code in [KeyCode::Backspace, KeyCode::Delete] {
+            type_text(&mut app, "yz");
+            ctrl_a(&mut app);
+            press(&mut app, code);
+            assert_eq!(cell_state(&app), ("".into(), None));
+        }
+        type_text(&mut app, "abc");
+        ctrl_a(&mut app);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.input_field("xlsxy-cell").caret, Some(0));
+        assert_eq!(cell_state(&app).1, None);
+        ctrl_a(&mut app);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.input_field("xlsxy-cell").caret, Some(3));
+        assert_eq!(cell_state(&app).1, None);
+        ctrl_a(&mut app);
+        press(&mut app, KeyCode::Home);
+        assert_eq!(cell_state(&app).1, None);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(text_at(&app, 0, 0), "abc");
     }
 }
 
