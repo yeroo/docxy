@@ -430,6 +430,73 @@ struct Prompt {
     kind: PromptKind,
     label: String,
     buf: String,
+    /// The caret, in chars into `buf`.
+    caret: usize,
+}
+
+impl Prompt {
+    /// A prompt holding `buf`, the caret at its end.
+    fn new(kind: PromptKind, label: &str, buf: String) -> Prompt {
+        let caret = buf.chars().count();
+        Prompt {
+            kind,
+            label: label.to_string(),
+            buf,
+            caret,
+        }
+    }
+
+    /// `buf` can be assigned directly, so every edit starts from a caret
+    /// held inside it.
+    fn clamp(&mut self) {
+        self.caret = self.caret.min(self.buf.chars().count());
+    }
+
+    fn byte_at(&self, chars: usize) -> usize {
+        self.buf
+            .char_indices()
+            .nth(chars)
+            .map_or(self.buf.len(), |(i, _)| i)
+    }
+
+    fn insert(&mut self, ch: char) {
+        self.clamp();
+        self.buf.insert(self.byte_at(self.caret), ch);
+        self.caret += 1;
+    }
+
+    fn backspace(&mut self) {
+        self.clamp();
+        if self.caret > 0 {
+            self.buf.remove(self.byte_at(self.caret - 1));
+            self.caret -= 1;
+        }
+    }
+
+    fn delete(&mut self) {
+        self.clamp();
+        if self.caret < self.buf.chars().count() {
+            self.buf.remove(self.byte_at(self.caret));
+        }
+    }
+
+    fn left(&mut self) {
+        self.clamp();
+        self.caret = self.caret.saturating_sub(1);
+    }
+
+    fn right(&mut self) {
+        self.clamp();
+        self.caret = (self.caret + 1).min(self.buf.chars().count());
+    }
+
+    fn home(&mut self) {
+        self.caret = 0;
+    }
+
+    fn end(&mut self) {
+        self.caret = self.buf.chars().count();
+    }
 }
 
 struct App {
@@ -807,11 +874,11 @@ impl App {
             Act::Indent => self.indent(1),
             Act::Outdent => self.indent(-1),
             Act::AddLink => {
-                self.prompt = Some(Prompt {
-                    kind: PromptKind::AddPredecessor,
-                    label: "Predecessor ID".into(),
-                    buf: String::new(),
-                });
+                self.prompt = Some(Prompt::new(
+                    PromptKind::AddPredecessor,
+                    "Predecessor ID",
+                    String::new(),
+                ));
             }
             Act::Constraint => {
                 let cur = self
@@ -821,11 +888,7 @@ impl App {
                     .get(self.ed.sel())
                     .map(constraint_hint)
                     .unwrap_or_default();
-                self.prompt = Some(Prompt {
-                    kind: PromptKind::Constraint,
-                    label: "Constraint".into(),
-                    buf: cur,
-                });
+                self.prompt = Some(Prompt::new(PromptKind::Constraint, "Constraint", cur));
             }
             Act::Notes => {
                 let Some(uid) = self.ed.selected_uid() else {
@@ -839,11 +902,7 @@ impl App {
                     .task(uid)
                     .map(|t| projcore::text::notes_to_line(t.notes.as_deref().unwrap_or("")))
                     .unwrap_or_default();
-                self.prompt = Some(Prompt {
-                    kind: PromptKind::Notes(uid),
-                    label: "Notes".into(),
-                    buf: cur,
-                });
+                self.prompt = Some(Prompt::new(PromptKind::Notes(uid), "Notes", cur));
             }
             Act::Find => self.find_prompt(),
             Act::Baseline => self.set_baseline(),
@@ -855,11 +914,11 @@ impl App {
             Act::LevelAll => self.set_level(true),
             Act::ClearLeveling => self.set_level(false),
             Act::Assign => {
-                self.prompt = Some(Prompt {
-                    kind: PromptKind::Assign,
-                    label: "Assign resource (empty clears)".into(),
-                    buf: String::new(),
-                });
+                self.prompt = Some(Prompt::new(
+                    PromptKind::Assign,
+                    "Assign resource (empty clears)",
+                    String::new(),
+                ));
             }
             Act::ShowSubtasks => self.show_subtasks(),
             Act::HideSubtasks => self.hide_subtasks(),
@@ -908,11 +967,7 @@ impl App {
 
     /// Open the Find prompt (Ctrl+F and Task › Editing › Find).
     fn find_prompt(&mut self) {
-        self.prompt = Some(Prompt {
-            kind: PromptKind::Find,
-            label: "Find".into(),
-            buf: String::new(),
-        });
+        self.prompt = Some(Prompt::new(PromptKind::Find, "Find", String::new()));
     }
 
     /// `L`: flip resource leveling.
@@ -1084,11 +1139,7 @@ impl App {
                 }
             }
             None => {
-                self.prompt = Some(Prompt {
-                    kind: PromptKind::SaveAs,
-                    label: "Save as".into(),
-                    buf: String::new(),
-                });
+                self.prompt = Some(Prompt::new(PromptKind::SaveAs, "Save as", String::new()));
             }
         }
     }
@@ -1636,11 +1687,27 @@ fn on_key(app: &mut App, k: KeyEvent) {
                 }
             }
             KeyCode::Backspace => {
-                prompt.buf.pop();
+                prompt.backspace();
                 app.prompt = Some(prompt);
             }
             KeyCode::Char(c) => {
-                prompt.buf.push(c);
+                prompt.insert(c);
+                app.prompt = Some(prompt);
+            }
+            // Caret keys act only unmodified, so a Ctrl or Alt chord keeps
+            // being swallowed as before.
+            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End | KeyCode::Delete
+                if !k
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                match k.code {
+                    KeyCode::Left => prompt.left(),
+                    KeyCode::Right => prompt.right(),
+                    KeyCode::Home => prompt.home(),
+                    KeyCode::End => prompt.end(),
+                    _ => prompt.delete(),
+                }
                 app.prompt = Some(prompt);
             }
             _ => app.prompt = Some(prompt),
@@ -1733,26 +1800,18 @@ fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::BackTab | KeyCode::Char('<') => app.indent(-1),
         KeyCode::Enter | KeyCode::F(2) => {
             if let Some(t) = app.ed.project().tasks.get(app.ed.sel()) {
-                app.prompt = Some(Prompt {
-                    kind: PromptKind::Rename,
-                    label: "Rename".into(),
-                    buf: t.name.clone(),
-                });
+                app.prompt = Some(Prompt::new(PromptKind::Rename, "Rename", t.name.clone()));
             }
         }
         KeyCode::Char('d') => {
-            app.prompt = Some(Prompt {
-                kind: PromptKind::Duration,
-                label: "Duration".into(),
-                buf: String::new(),
-            });
+            app.prompt = Some(Prompt::new(PromptKind::Duration, "Duration", String::new()));
         }
         KeyCode::Char('p') => {
-            app.prompt = Some(Prompt {
-                kind: PromptKind::AddPredecessor,
-                label: "Predecessor ID".into(),
-                buf: String::new(),
-            });
+            app.prompt = Some(Prompt::new(
+                PromptKind::AddPredecessor,
+                "Predecessor ID",
+                String::new(),
+            ));
         }
         KeyCode::Char('c') => {
             let cur = app
@@ -1762,11 +1821,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
                 .get(app.ed.sel())
                 .map(constraint_hint)
                 .unwrap_or_default();
-            app.prompt = Some(Prompt {
-                kind: PromptKind::Constraint,
-                label: "Constraint".into(),
-                buf: cur,
-            });
+            app.prompt = Some(Prompt::new(PromptKind::Constraint, "Constraint", cur));
         }
         KeyCode::Char('b') => app.set_baseline(),
         KeyCode::Char('L') => app.toggle_level(),
@@ -1774,29 +1829,21 @@ fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char('M') => app.toggle_new_tasks_manual(),
         KeyCode::Char('T') => app.theme_toggle(),
         KeyCode::Char('a') => {
-            app.prompt = Some(Prompt {
-                kind: PromptKind::Assign,
-                label: "Assign resource (empty clears)".into(),
-                buf: String::new(),
-            });
+            app.prompt = Some(Prompt::new(
+                PromptKind::Assign,
+                "Assign resource (empty clears)",
+                String::new(),
+            ));
         }
         KeyCode::F(3) => app.find(""), // repeat the last search
         KeyCode::F(9) => app.rfocus = ribbon::Focus::Tab(app.ribbon.active_tab()),
         // Vim niceties (only when launched with --vim).
         KeyCode::Char(':') if app.vim => {
-            app.prompt = Some(Prompt {
-                kind: PromptKind::VimCommand,
-                label: ":".into(),
-                buf: String::new(),
-            });
+            app.prompt = Some(Prompt::new(PromptKind::VimCommand, ":", String::new()));
         }
         KeyCode::Char('u') if app.vim => app.undo(),
         KeyCode::Char('/') if app.vim => {
-            app.prompt = Some(Prompt {
-                kind: PromptKind::Find,
-                label: "/".into(),
-                buf: String::new(),
-            });
+            app.prompt = Some(Prompt::new(PromptKind::Find, "/", String::new()));
         }
         _ => {}
     }
@@ -2434,10 +2481,12 @@ fn draw_prompt(f: &mut Frame, area: Rect, app: &mut App) {
     // Inside the border, past the label: where the typed text starts.
     let label = format!(" {}: ", p.label);
     let text_x = rect.x + 1 + Line::from(label.as_str()).width() as u16;
+    let split = p.byte_at(p.caret);
     let content = Line::from(vec![
         Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(p.buf.clone()),
+        Span::raw(p.buf[..split].to_string()),
         Span::styled("▏", Style::default().fg(Color::Gray)),
+        Span::raw(p.buf[split..].to_string()),
     ]);
     f.render_widget(
         Paragraph::new(content).block(
@@ -2447,15 +2496,16 @@ fn draw_prompt(f: &mut Frame, area: Rect, app: &mut App) {
         ),
         rect,
     );
-    app.prompt_at = Some((text_x, rect.y + 1));
+    // At caret 0 the mark takes the first cell, so the text starts one on.
+    let lead = u16::from(p.caret == 0 && !p.buf.is_empty());
+    app.prompt_at = Some((text_x + lead, rect.y + 1));
 }
 
 impl App {
     /// A prompt field, as `field-read {"input":id}` reports it (#1204): the
     /// prompt every command shares (Rename, Duration, Find, the vim `:` line,
     /// Save As on a new project and the rest; its `kind` says which is
-    /// open), and Backstage Save As's file name. The prompt only appends and
-    /// pops, so its caret is its end.
+    /// open), and Backstage Save As's file name.
     fn input_field(&self, id: &str) -> ctlcore::field::Field {
         use ctlcore::field::Field;
         match id {
@@ -2463,7 +2513,7 @@ impl App {
                 Some(p) => {
                     let kind = format!("{:?}", p.kind);
                     let kind = kind.split('(').next().unwrap_or_default().to_string();
-                    Field::append_only(&p.buf, true)
+                    Field::with_caret(&p.buf, true, p.caret.min(p.buf.chars().count()))
                         .kind(kind)
                         .at(self.prompt_at)
                 }
@@ -4824,5 +4874,192 @@ mod tests {
             app.status,
             "Only a summary task has subtasks to show or hide"
         );
+    }
+
+    fn open_prompt(app: &mut App, text: &str) {
+        app.prompt = Some(Prompt::new(PromptKind::Find, "Find", text.to_string()));
+    }
+
+    fn prompt_state(app: &App) -> (String, usize) {
+        let p = app.prompt.as_ref().unwrap();
+        (p.buf.clone(), p.caret)
+    }
+
+    fn prompt_row(app: &mut App) -> String {
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw_prompt(f, f.area(), app)).unwrap();
+        let (_, y) = app.prompt_at.unwrap();
+        let buf = term.backend().buffer();
+        (0..100u16)
+            .filter_map(|x| buf.cell((x, y)))
+            .map(|c| c.symbol())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn prompt_edits_at_the_caret() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        open_prompt(&mut app, "abc");
+        assert_eq!(prompt_state(&app), ("abc".into(), 3));
+        press_key(&mut app, KeyCode::Home);
+        assert_eq!(prompt_state(&app).1, 0);
+        press_key(&mut app, KeyCode::Right);
+        press_key(&mut app, KeyCode::Delete);
+        assert_eq!(prompt_state(&app), ("ac".into(), 1));
+        press_key(&mut app, KeyCode::End);
+        press_key(&mut app, KeyCode::Left);
+        assert_eq!(prompt_state(&app).1, 1);
+        press(&mut app, 'X');
+        assert_eq!(prompt_state(&app), ("aXc".into(), 2));
+        press_key(&mut app, KeyCode::Backspace);
+        assert_eq!(prompt_state(&app), ("ac".into(), 1));
+        // The ends are no-ops.
+        press_key(&mut app, KeyCode::Home);
+        press_key(&mut app, KeyCode::Left);
+        press_key(&mut app, KeyCode::Backspace);
+        assert_eq!(prompt_state(&app), ("ac".into(), 0));
+        press_key(&mut app, KeyCode::End);
+        press_key(&mut app, KeyCode::Right);
+        press_key(&mut app, KeyCode::Delete);
+        assert_eq!(prompt_state(&app), ("ac".into(), 2));
+    }
+
+    #[test]
+    fn prompt_caret_counts_chars() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        open_prompt(&mut app, "é日b");
+        assert_eq!(prompt_state(&app).1, 3);
+        press_key(&mut app, KeyCode::Left);
+        press_key(&mut app, KeyCode::Left);
+        press_key(&mut app, KeyCode::Delete);
+        assert_eq!(prompt_state(&app), ("éb".into(), 1));
+        press_key(&mut app, KeyCode::Backspace);
+        assert_eq!(prompt_state(&app), ("b".into(), 0));
+        press(&mut app, '日');
+        assert_eq!(prompt_state(&app), ("日b".into(), 1));
+    }
+
+    #[test]
+    fn prompt_caret_survives_a_replaced_buffer() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        open_prompt(&mut app, "long text");
+        app.prompt.as_mut().unwrap().buf = "ab".into();
+        press_key(&mut app, KeyCode::Backspace);
+        assert_eq!(prompt_state(&app), ("a".into(), 1));
+        app.prompt.as_mut().unwrap().buf = "".into();
+        press_key(&mut app, KeyCode::Delete);
+        press(&mut app, 'z');
+        assert_eq!(prompt_state(&app), ("z".into(), 1));
+    }
+
+    #[test]
+    fn seeded_prompts_open_with_the_caret_at_the_end() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        // Rename seeds the task's name.
+        press_key(&mut app, KeyCode::Enter);
+        assert_eq!(prompt_state(&app), ("New task".into(), 8));
+        press_key(&mut app, KeyCode::Esc);
+        app.set_constraint("SNET 2026-01-05");
+        app.apply_act(Act::Constraint);
+        let (buf, caret) = prompt_state(&app);
+        assert!(!buf.is_empty());
+        assert_eq!(caret, buf.chars().count());
+    }
+
+    #[test]
+    fn enter_commits_the_whole_text_from_mid_text() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        press_key(&mut app, KeyCode::Enter);
+        for _ in 0..app.prompt.as_ref().unwrap().buf.chars().count() {
+            press_key(&mut app, KeyCode::Backspace);
+        }
+        for c in "Plan B".chars() {
+            press(&mut app, c);
+        }
+        press_key(&mut app, KeyCode::Home);
+        press_key(&mut app, KeyCode::Right);
+        assert_eq!(prompt_state(&app).1, 1);
+        press_key(&mut app, KeyCode::Enter);
+        assert!(app.prompt.is_none());
+        assert_eq!(app.ed.project().task(1).unwrap().name, "Plan B");
+    }
+
+    #[test]
+    fn prompt_ignores_ctrl_and_alt_caret_keys() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        open_prompt(&mut app, "abc");
+        for code in [
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Delete,
+        ] {
+            for m in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+                on_key(&mut app, KeyEvent::new(code, m));
+                assert_eq!(prompt_state(&app), ("abc".into(), 3), "{code:?} {m:?}");
+            }
+        }
+        press_key(&mut app, KeyCode::Home);
+        on_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL),
+        );
+        assert_eq!(prompt_state(&app), ("abc".into(), 0));
+    }
+
+    #[test]
+    fn prompt_draws_the_mark_at_the_caret() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        open_prompt(&mut app, "abc");
+        assert!(prompt_row(&mut app).contains("Find: abc▏"));
+        press_key(&mut app, KeyCode::Left);
+        assert!(prompt_row(&mut app).contains("Find: ab▏c"));
+        press_key(&mut app, KeyCode::Home);
+        assert!(prompt_row(&mut app).contains("Find: ▏abc"));
+        open_prompt(&mut app, "");
+        assert!(prompt_row(&mut app).contains("Find: ▏"));
+    }
+
+    #[test]
+    fn prompt_field_reports_the_caret() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        open_prompt(&mut app, "abc");
+        press_key(&mut app, KeyCode::Left);
+        let f = app.input_field("yppxy-prompt");
+        assert_eq!(f.caret, Some(2));
+        assert_eq!(f.value.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn prompt_at_names_the_first_text_cell() {
+        use ratatui::backend::TestBackend;
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        let at = |app: &mut App| {
+            let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+            term.draw(|f| draw_prompt(f, f.area(), app)).unwrap();
+            let (x, y) = app.prompt_at.unwrap();
+            let sym = term
+                .backend()
+                .buffer()
+                .cell((x, y))
+                .unwrap()
+                .symbol()
+                .to_string();
+            (x, sym)
+        };
+        open_prompt(&mut app, "abc");
+        let (end_x, sym) = at(&mut app);
+        assert_eq!(sym, "a");
+        press_key(&mut app, KeyCode::Home);
+        let (home_x, sym) = at(&mut app);
+        assert_eq!((home_x, sym.as_str()), (end_x + 1, "a"));
+        // An empty buffer has no text: the mark is the cell.
+        open_prompt(&mut app, "");
+        let (empty_x, sym) = at(&mut app);
+        assert_eq!((empty_x, sym.as_str()), (end_x, "▏"));
     }
 }
