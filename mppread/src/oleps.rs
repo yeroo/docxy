@@ -70,23 +70,50 @@ pub fn parse(stream: &[u8]) -> Option<HashMap<u32, Prop>> {
         return None;
     }
     let count = u32le(stream, sec + 4) as usize;
+    let entries: Vec<(u32, usize)> = (0..count)
+        .map(|i| sec + 8 + i * 8)
+        .take_while(|idx| idx + 8 <= stream.len())
+        .map(|idx| (u32le(stream, idx), sec + u32le(stream, idx + 4) as usize))
+        .collect();
+    // The code page of the section's VT_LPSTR values (PID_CODEPAGE, property
+    // 1, a VT_I2 Project writes before the strings), 1252 when absent.
+    let page = entries
+        .iter()
+        .find(|(pid, _)| *pid == PID_CODEPAGE)
+        .and_then(|(_, off)| read_value(stream, *off, DEFAULT_CODEPAGE))
+        .and_then(|p| match p {
+            Prop::Int(n) => Some(n),
+            _ => None,
+        })
+        .unwrap_or(DEFAULT_CODEPAGE);
     let mut out = HashMap::new();
-    for i in 0..count {
-        let idx = sec + 8 + i * 8;
-        if idx + 8 > stream.len() {
-            break;
-        }
-        let pid = u32le(stream, idx);
-        let off = sec + u32le(stream, idx + 4) as usize;
-        if let Some(p) = read_value(stream, off) {
+    for (pid, off) in entries {
+        if let Some(p) = read_value(stream, off, page) {
             out.insert(pid, p);
         }
     }
     Some(out)
 }
 
-/// Read one typed value at `off` (the 4-byte type tag followed by its payload).
-fn read_value(b: &[u8], off: usize) -> Option<Prop> {
+/// `PID_CODEPAGE`: the code page of the section's `VT_LPSTR` strings.
+const PID_CODEPAGE: u32 = 1;
+/// The code page assumed when a section names none (Windows-1252, what
+/// Project writes on a Western-locale machine).
+const DEFAULT_CODEPAGE: i32 = 1252;
+
+/// A `VT_LPSTR` string's bytes in code page `page`: through
+/// `opccore::codepage` for the pages it knows (a byte the page leaves
+/// undefined, or a page it does not know, reads as Latin-1, as before).
+fn decode_lpstr(bytes: &[u8], page: i32) -> String {
+    bytes
+        .iter()
+        .map(|&c| opccore::codepage::decode(page, c).unwrap_or(char::from(c)))
+        .collect()
+}
+
+/// Read one typed value at `off` (the 4-byte type tag followed by its
+/// payload); `page` decodes a `VT_LPSTR`.
+fn read_value(b: &[u8], off: usize, page: i32) -> Option<Prop> {
     if off + 4 > b.len() {
         return None;
     }
@@ -101,10 +128,11 @@ fn read_value(b: &[u8], off: usize) -> Option<Prop> {
             let n = u32le(b, v) as usize;
             let s = v + 4;
             (s + n <= b.len()).then(|| {
-                // code-page string; decode as Latin-1 (fine for ASCII), drop NUL
+                // A code-page string (the section's PID_CODEPAGE: an em dash
+                // is 0x97 in 1252, not U+0097), up to its NUL.
                 let bytes = &b[s..s + n];
                 let end = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
-                Prop::Str(bytes[..end].iter().map(|&c| c as char).collect())
+                Prop::Str(decode_lpstr(&bytes[..end], page))
             })
         }
         VT_LPWSTR => {
@@ -124,35 +152,58 @@ fn read_value(b: &[u8], off: usize) -> Option<Prop> {
 mod tests {
     use super::*;
 
+    /// A value as a test writes it: a `Prop`, or a `VT_LPSTR` of the given
+    /// bytes (a code-page string a `Prop::Str` cannot spell), or a `VT_I2`.
+    enum Raw {
+        Prop(Prop),
+        Lpstr(Vec<u8>),
+        I2(i16),
+    }
+
     /// Build a one-section property-set stream from `(id, Prop)` pairs.
     fn build(props: &[(u32, Prop)]) -> Vec<u8> {
+        let raw: Vec<(u32, Raw)> = props
+            .iter()
+            .map(|(id, p)| (*id, Raw::Prop(p.clone())))
+            .collect();
+        build_raw(&raw)
+    }
+
+    fn build_raw(props: &[(u32, Raw)]) -> Vec<u8> {
         // Section body: [cb u32][count u32][index: (id,off) …][values …]
         let count = props.len();
         let index_len = 8 + count * 8;
         let mut body_index = Vec::new();
         let mut values = Vec::new();
+        let lpstr = |values: &mut Vec<u8>, text: &[u8]| {
+            let mut bytes: Vec<u8> = text.to_vec();
+            bytes.push(0);
+            while !bytes.len().is_multiple_of(4) {
+                bytes.push(0);
+            }
+            values.extend_from_slice(&VT_LPSTR.to_le_bytes());
+            values.extend_from_slice(&((text.len() + 1) as u32).to_le_bytes());
+            values.extend_from_slice(&bytes);
+        };
         for (id, p) in props {
             let off = index_len + values.len();
             body_index.extend_from_slice(&id.to_le_bytes());
             body_index.extend_from_slice(&(off as u32).to_le_bytes());
             match p {
-                Prop::Int(i) => {
+                Raw::Prop(Prop::Int(i)) => {
                     values.extend_from_slice(&VT_I4.to_le_bytes());
                     values.extend_from_slice(&(*i as u32).to_le_bytes());
                 }
-                Prop::Time(t) => {
+                Raw::Prop(Prop::Time(t)) => {
                     values.extend_from_slice(&VT_FILETIME.to_le_bytes());
                     values.extend_from_slice(&t.to_le_bytes());
                 }
-                Prop::Str(s) => {
-                    let mut bytes: Vec<u8> = s.bytes().collect();
-                    bytes.push(0);
-                    while !bytes.len().is_multiple_of(4) {
-                        bytes.push(0);
-                    }
-                    values.extend_from_slice(&VT_LPSTR.to_le_bytes());
-                    values.extend_from_slice(&((s.len() + 1) as u32).to_le_bytes());
-                    values.extend_from_slice(&bytes);
+                Raw::Prop(Prop::Str(s)) => lpstr(&mut values, s.as_bytes()),
+                Raw::Lpstr(bytes) => lpstr(&mut values, bytes),
+                Raw::I2(n) => {
+                    values.extend_from_slice(&VT_I2.to_le_bytes());
+                    values.extend_from_slice(&(*n as u16).to_le_bytes());
+                    values.extend_from_slice(&[0, 0]);
                 }
             }
         }
@@ -189,6 +240,36 @@ mod tests {
         assert_eq!(m[&4].as_str(), Some("Alice"));
         assert_eq!(m[&14], Prop::Int(42));
         assert_eq!(m[&12].as_time(), Some(132_000_000_000_000_000));
+    }
+
+    /// Project writes the strings in the section's code page (`PID_CODEPAGE`,
+    /// a `VT_I2`): an em dash is 0x97 and curly quotes 0x93 0x94 in 1252,
+    /// which Latin-1 read as C1 controls (issue 1514, a real Project file).
+    #[test]
+    fn lpstr_reads_through_the_sections_code_page() {
+        let title = b"Plan \x97 \x93Phase 2\x94 caf\xe9".to_vec();
+        let stream = build_raw(&[(1, Raw::I2(1252)), (2, Raw::Lpstr(title.clone()))]);
+        let m = parse(&stream).unwrap();
+        assert_eq!(
+            m[&2].as_str(),
+            Some("Plan \u{2014} \u{201c}Phase 2\u{201d} caf\u{e9}")
+        );
+        assert_eq!(m[&1], Prop::Int(1252));
+        // Another page reads its own characters: 0xe9 is Cyrillic in 1251.
+        let stream = build_raw(&[
+            (1, Raw::I2(1251)),
+            (2, Raw::Lpstr(b"caf\xe9 \x97".to_vec())),
+        ]);
+        assert_eq!(
+            parse(&stream).unwrap()[&2].as_str(),
+            Some("caf\u{0439} \u{2014}")
+        );
+        // No PID_CODEPAGE: 1252 is assumed.
+        let stream = build_raw(&[(2, Raw::Lpstr(title))]);
+        assert_eq!(
+            parse(&stream).unwrap()[&2].as_str(),
+            Some("Plan \u{2014} \u{201c}Phase 2\u{201d} caf\u{e9}")
+        );
     }
 
     #[test]
