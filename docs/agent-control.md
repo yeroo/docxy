@@ -77,8 +77,8 @@ Project's Project Information dialog shows them (#1587): `title`, `start`,
 `finish` (the schedule's), `status_date` and `current_date` (`null` when
 unset), `calendar` and the base `calendars`; `proj.set` writes `title`,
 `start`, `status_date`, `current_date` (a date `YYYY-MM-DD`, the project
-calendar's day start, or `YYYY-MM-DDTHH:MM`; `null` clears a status or
-current date) and `calendar` (a base calendar's name or uid) as one undo
+calendar's day start, the day's end for a status date as Project sets one,
+or `YYYY-MM-DDTHH:MM`; `null` clears a status or current date) and `calendar` (a base calendar's name or uid) as one undo
 step, and replies like `proj.get`. `custom` (#1554) writes custom fields by
 Project's names, each value as typed in the field's cell: `{"custom":
 {"Text1": "Civil", "Flag3": true, "Date1": "2026-03-09", "Duration1": "3d",

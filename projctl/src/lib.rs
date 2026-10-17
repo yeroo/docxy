@@ -31,7 +31,7 @@
 //! | `assign.set` | `{uid, units?, work?, overtime_work?, contour?, rate_table?, delay?, actual_work? \| percent_work_complete?, fields?}` | the updated assignment, after its task is rescheduled |
 //! | `assign.del` | `{uid}` | `{deleted, task}` |
 //! | `proj.get` | `{}` | the plan's settings (#1587): `{title, start, finish, status_date, current_date, calendar: {uid, name}, calendars: [{uid, name}]}` (dates `YYYY-MM-DD HH:MM`, the status and current dates `null` when unset, `calendars` the base calendars) |
-//! | `proj.set` | `{title?, start?, status_date?, current_date?, calendar?}` | the same reply after the change (#1587): dates `YYYY-MM-DD` (the project calendar's day start) or `YYYY-MM-DDTHH:MM`, `null` clearing a status or current date, `calendar` a base calendar's name or uid. All apply in one undo step, or none does |
+//! | `proj.set` | `{title?, start?, status_date?, current_date?, calendar?}` | the same reply after the change (#1587): dates `YYYY-MM-DD` (the project calendar's day start; a bare status date is the day's end, as Project sets it) or `YYYY-MM-DDTHH:MM`, `null` clearing a status or current date, `calendar` a base calendar's name or uid. All apply in one undo step, or none does |
 //!
 //! `fields` is a list of Project field names (`["% Complete", "Baseline1
 //! Finish"]`, matched ignoring ASCII case and surrounding space). The verbs
@@ -793,9 +793,10 @@ fn proj_get(ed: &Editor) -> Json {
     ])
 }
 
-/// A `proj.set` date: `YYYY-MM-DD` at the project calendar's day start, or
+/// A `proj.set` date: `YYYY-MM-DD` at the project calendar's day start (its
+/// day end for the status date, as Project sets one typed bare), or
 /// `YYYY-MM-DDTHH:MM`.
-fn plan_date(name: &str, text: &str, ed: &Editor) -> Result<DateTime, String> {
+fn plan_date(name: &str, text: &str, ed: &Editor, ends_day: bool) -> Result<DateTime, String> {
     let text = text.trim();
     if text.contains('T') {
         return DateTime::parse_mspdi(text)
@@ -804,7 +805,11 @@ fn plan_date(name: &str, text: &str, ed: &Editor) -> Result<DateTime, String> {
     let day = parse_cell_date(text)
         .map_err(|_| format!("'{name}' is YYYY-MM-DD or YYYY-MM-DDTHH:MM, not '{text}'"))?;
     let probe = Task::default();
-    Ok(day_start(ed.project(), &probe, day))
+    Ok(if ends_day {
+        day_end(ed.project(), &probe, day)
+    } else {
+        day_start(ed.project(), &probe, day)
+    })
 }
 
 /// `proj.set`: the plan's settings as one undo step (#1587).
@@ -812,7 +817,7 @@ fn proj_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
     let title = args.get_str("title").map(str::to_string);
     let start = match args.get("start") {
         None | Some(Json::Null) => None,
-        Some(Json::Str(s)) => Some(plan_date("start", s, ed)?),
+        Some(Json::Str(s)) => Some(plan_date("start", s, ed, false)?),
         Some(_) => return Err("'start' must be a date".into()),
     };
     let dated = |key: &str| -> Result<Option<Option<DateTime>>, String> {
@@ -820,7 +825,7 @@ fn proj_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
             None => Ok(None),
             Some(Json::Null) => Ok(Some(None)),
             Some(Json::Str(s)) if s.trim().is_empty() => Ok(Some(None)),
-            Some(Json::Str(s)) => Ok(Some(Some(plan_date(key, s, ed)?))),
+            Some(Json::Str(s)) => Ok(Some(Some(plan_date(key, s, ed, key == "status_date")?))),
             Some(_) => Err(format!("'{key}' must be a date or null")),
         }
     };
@@ -2773,6 +2778,16 @@ it"
         let cleared = run(&mut ed, "proj.set", r#"{"status_date":null}"#).unwrap();
         assert_eq!(cleared.get("status_date"), Some(&Json::Null));
         assert_eq!(ed.undo_depth(), 2);
+        // A bare status date is the day's end, a bare current date its start.
+        let bare = run(
+            &mut ed,
+            "proj.set",
+            r#"{"status_date":"2026-03-20","current_date":"2026-03-20"}"#,
+        )
+        .unwrap();
+        assert_eq!(bare.get_str("status_date"), Some("2026-03-20 17:00"));
+        assert_eq!(bare.get_str("current_date"), Some("2026-03-20 08:00"));
+        assert_eq!(ed.undo_depth(), 3);
         // Refusals undo nothing.
         let before = ed.project().clone();
         for args in [
@@ -2784,7 +2799,7 @@ it"
             assert!(run(&mut ed, "proj.set", args).is_err(), "{args}");
         }
         assert_eq!(*ed.project(), before);
-        assert_eq!(ed.undo_depth(), 2);
+        assert_eq!(ed.undo_depth(), 3);
     }
 
     #[test]
