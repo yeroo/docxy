@@ -481,7 +481,7 @@ fn with_pdf_fonts(mut opts: PdfOptions) -> PdfOptions {
 
 fn missing_note(n: usize) -> String {
     format!(
-        "{n} character{} no installed font covers {} not shown",
+        "{n} character{} no installed font covers {} shown as a placeholder",
         if n == 1 { "" } else { "s" },
         if n == 1 { "is" } else { "are" }
     )
@@ -12274,7 +12274,8 @@ mod tests {
             assert_eq!(pdf_read::body_text(&bytes), "abЖ\u{fffd}");
             let status = app.status.clone().unwrap();
             assert!(
-                status.ends_with("; 1 character no installed font covers is not shown"),
+                status
+                    .ends_with("; 1 character no installed font covers is shown as a placeholder"),
                 "{status}"
             );
         });

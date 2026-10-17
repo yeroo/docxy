@@ -82,7 +82,7 @@ impl Checked {
         }
     }
 
-    fn wrap(&self, face: Rc<dyn PdfFace>) -> Rc<dyn PdfFace> {
+    fn wrap(&self, face: Rc<dyn PdfFace>) -> Rc<CheckedFace> {
         self.wrapped
             .borrow_mut()
             .entry(face.id())
@@ -101,8 +101,7 @@ impl PdfFontProvider for Checked {
         // The run's own face is about to be used, so it is checked now; the
         // fallbacks are checked when one of them is first needed.
         let face = self.wrap(self.inner.face(family, bold, italic)?);
-        let checked = self.wrapped.borrow()[&face.id()].clone();
-        checked.usable().then_some(face)
+        face.usable().then_some(face as Rc<dyn PdfFace>)
     }
 
     fn fallbacks(&self) -> &[Rc<dyn PdfFace>] {
@@ -110,7 +109,7 @@ impl PdfFontProvider for Checked {
             self.inner
                 .fallbacks()
                 .iter()
-                .map(|f| self.wrap(f.clone()))
+                .map(|f| self.wrap(f.clone()) as Rc<dyn PdfFace>)
                 .collect()
         })
     }

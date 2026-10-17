@@ -149,6 +149,12 @@ pub struct Style {
     pub fs_selection: u16,
     /// OS/2 `usWidthClass`; 0 means 5 (normal).
     pub width_class: u16,
+    /// An extra Macintosh-platform family name (ID 1), beside the Windows ones.
+    pub mac_family: Option<String>,
+    /// The subfamily (ID 2) instead of the one derived from bold/italic.
+    pub subfamily: Option<String>,
+    /// A `post` table with this italic angle in degrees (none when 0).
+    pub italic_angle: i16,
 }
 
 /// `fs_type` is the OS/2 embedding bits; `units` the units per em.
@@ -158,30 +164,32 @@ pub fn build(glyphs: &[SynthGlyph], units: u16, fs_type: u16) -> Vec<u8> {
 
 fn name_table(style: &Style, family: &str) -> Vec<u8> {
     let (bold, italic) = (style.bold, style.italic);
-    let sub = match (bold, italic) {
+    let derived = match (bold, italic) {
         (true, true) => "Bold Italic",
         (true, false) => "Bold",
         (false, true) => "Italic",
         (false, false) => "Regular",
     };
+    let sub = style.subfamily.as_deref().unwrap_or(derived);
     let ps = format!("{}-{}", family.replace(' ', ""), sub.replace(' ', ""));
     let mut strings = vec![(1u16, family.to_string()), (2, sub.to_string()), (6, ps)];
     if let Some(t) = &style.typographic {
         strings.push((16, t.clone()));
     }
+    if let Some(m) = &style.mac_family {
+        strings.push((0x8001, m.clone())); // 0x8000 marks a Mac record
+    }
     let mut records = Vec::new();
     let mut data = Vec::new();
     for (id, text) in &strings {
-        let utf16: Vec<u8> = if style.mac_names {
+        let mac_record = style.mac_names || *id & 0x8000 != 0;
+        let id = &(*id & 0x7FFF);
+        let utf16: Vec<u8> = if mac_record {
             text.bytes().collect()
         } else {
             text.encode_utf16().flat_map(|u| u.to_be_bytes()).collect()
         };
-        let (platform, encoding, language) = if style.mac_names {
-            (1, 0, 0)
-        } else {
-            (3, 1, 0x409)
-        };
+        let (platform, encoding, language) = if mac_record { (1, 0, 0) } else { (3, 1, 0x409) };
         be16(&mut records, platform);
         be16(&mut records, encoding);
         be16(&mut records, language);
@@ -329,6 +337,13 @@ pub fn build_with(glyphs: &[SynthGlyph], units: u16, fs_type: u16, style: &Style
     }
     if let Some(family) = &style.family {
         tables.push((b"name", name_table(style, family)));
+    }
+    if style.italic_angle != 0 {
+        let mut post = Vec::new();
+        be32(&mut post, 0x0003_0000);
+        be32(&mut post, (style.italic_angle as i32 as u32) << 16);
+        post.resize(32, 0);
+        tables.push((b"post", post));
     }
     tables.sort_by_key(|(t, _)| **t);
     assemble_as(if style.cff { 0x4F54_544F } else { 0x0001_0000 }, &tables)

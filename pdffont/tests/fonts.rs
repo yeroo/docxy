@@ -322,6 +322,68 @@ fn a_face_whose_own_name_is_the_request_beats_a_sibling_in_the_typographic_famil
 }
 
 #[test]
+fn an_english_mac_name_is_found_beside_localized_windows_names() {
+    // Geeza Pro's shape: Windows records only in other languages, the English
+    // family on the Macintosh platform.
+    let d = Dir::new("geeza");
+    d.write(
+        "geeza.ttf",
+        &styled(
+            0,
+            Style {
+                family: Some("\u{67}\u{64}\u{627}".into()),
+                mac_family: Some("Geeza Pro".into()),
+                ..Style::default()
+            },
+        ),
+    );
+    let set = d.set();
+    assert!(set.face("Geeza Pro", false, false).is_some());
+    assert!(set.families().contains(&"Geeza Pro".to_string()));
+}
+
+#[test]
+fn italic_also_comes_from_the_post_angle_and_the_style_name() {
+    let d = Dir::new("italicangle");
+    let regular = variant("Fam Regular", true, Style::default());
+    // Neither macStyle nor fsSelection, as Apple's Ultra Light Italic.
+    let angle = variant(
+        "Fam Light Italic",
+        true,
+        Style {
+            italic_angle: -10,
+            ..Style::default()
+        },
+    );
+    let named = variant(
+        "Fam Heavy Italic",
+        true,
+        Style {
+            subfamily: Some("Heavy Italic".into()),
+            weight: 900,
+            ..Style::default()
+        },
+    );
+    d.write("a-angle.ttf", &angle);
+    d.write("b-named.ttf", &named);
+    d.write("c-regular.ttf", &regular);
+    let set = d.set();
+    assert_eq!(
+        set.face("Fam", false, false).unwrap().ps_name(),
+        "FamRegular-Regular"
+    );
+    // Both are italic; the weight nearest 400 wins between them.
+    assert_eq!(
+        set.face("Fam", false, true).unwrap().ps_name(),
+        "FamLightItalic-Regular"
+    );
+    assert_eq!(
+        set.face("Fam", true, true).unwrap().ps_name(),
+        "FamHeavyItalic-HeavyItalic"
+    );
+}
+
+#[test]
 fn embedding_bits_decide_which_faces_are_offered() {
     let d = Dir::new("fstype");
     for (file, family, fs) in [

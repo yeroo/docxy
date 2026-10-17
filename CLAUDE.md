@@ -124,16 +124,23 @@
   only), writes the Type0/CIDFontType2/`/W`/ToUnicode objects
   (`export/cid.rs`) and Flate-compresses with its own `deflate`. Parsing fonts
   and finding them is `pdffont` (ttf-parser, system directories, Office
-  aliases, script fallbacks, names on the Mac platform too, faces indexed under
-  both their legacy and typographic family and chosen by slant, then the weight
-  nearest 400/700); CFF faces, faces the subsetter cannot read and faces whose
-  OS/2 `fsType` forbids embedding or subsetting are not offered.
+  aliases, script fallbacks). A face is indexed under both its legacy (ID 1)
+  and typographic (ID 16) family; Macintosh Roman names follow the Windows
+  ones, so an English name kept only on the Mac platform still matches. Italic
+  is macStyle, OS/2 fsSelection, `post` angle or the style name. A request
+  takes, in order: the slant, the width nearest normal, the weight nearest
+  400 (700 when bold), the face whose legacy name is the request, then the
+  first path. CFF faces, faces the subsetter cannot read and faces whose OS/2
+  `fsType` forbids embedding or subsetting are not offered.
 - Layout measures through `export::Metrics`: Courier is 0.6 em per cell
   (unchanged, pinned by `docxcore/tests/pdf_legacy_bytes.rs`), a provider gives
   each cell its face's advance. Per character: the run's family face, a
-  fallback face, Courier when WinAnsi covers it, else `.notdef` (counted in
+  fallback face, Courier when WinAnsi covers it, else `.notdef` of the run's
+  face, or a Courier `?` when the run has no usable face (counted in
   `to_pdf_report`'s `PdfReport::missing_chars`; terminal `docxy` says so on
-  the status line). If no embedded face showed anything, the file is the plain
+  the status line). `cid::Checked` wraps the provider for one export: a face
+  whose font file does not subset counts as absent for layout, writer and
+  report alike. If no embedded face showed anything, the file is the plain
   Courier one.
 - Bidi: a line wraps in logical order, then `place_line_fonts` puts its cells
   in the projector's visual order. A right-to-left stretch is one show-text

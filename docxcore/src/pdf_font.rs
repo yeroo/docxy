@@ -41,7 +41,8 @@ pub trait PdfFontProvider: Debug {
 /// What an export had to leave out or approximate.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PdfReport {
-    /// Characters no face covered, printed as `.notdef`.
+    /// Characters no face covered: printed as `.notdef` of the run's face, or
+    /// as a Courier `?` when the run has no usable face.
     pub missing_chars: usize,
 }
 

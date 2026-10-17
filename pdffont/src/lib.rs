@@ -214,10 +214,10 @@ fn mini_sfnt(tables: &[([u8; 4], Vec<u8>)]) -> Vec<u8> {
     out
 }
 
-/// Every string of name `id`: the Unicode and Windows records, else, when
-/// there are none, the Macintosh Roman ones (older Apple faces carry their
-/// names on that platform only). Mac Roman is read as ASCII, which family and
-/// PostScript names are; a name with other bytes is skipped.
+/// Every string of name `id`: the Unicode and Windows records, then the
+/// Macintosh Roman ones not already in the list (older Apple faces carry their
+/// English names on that platform only). Mac Roman is read as ASCII, which
+/// family and PostScript names are; a name with other bytes is skipped.
 fn name_strings(names: &ttf_parser::name::Table, id: u16) -> Vec<String> {
     let of = |mac: bool| -> Vec<String> {
         names
@@ -239,8 +239,16 @@ fn name_strings(names: &ttf_parser::name::Table, id: u16) -> Vec<String> {
             .filter(|s| !s.is_empty())
             .collect()
     };
-    let modern = of(false);
-    if modern.is_empty() { of(true) } else { modern }
+    // Unicode and Windows first (a PostScript name takes the first); Mac Roman
+    // after them, as some faces keep their English family only there and have
+    // localized Windows names.
+    let mut all = of(false);
+    for name in of(true) {
+        if !all.contains(&name) {
+            all.push(name);
+        }
+    }
+    all
 }
 
 /// A font file's face in the index.
@@ -323,11 +331,24 @@ fn index_face(f: &mut File, path: &Path, idx: u32, base: u64) -> Option<Entry> {
         // italic (bit 0) or oblique (bit 9).
         italic |= u16_at(&os2, 62).is_some_and(|sel| sel & 0x0201 != 0);
     }
+    // Some Apple italics set neither bit: the post angle or the style name says.
+    if let Some(post) = find_table(&dir, b"post")
+        && let Some(post) = read_at(f, post.offset as u64, (post.len as usize).min(8))
+    {
+        italic |= u32_at(&post, 4).is_some_and(|angle| angle != 0);
+    }
     subsettable(f, &dir)?;
     let name = read_table(f, find_table(&dir, b"name")?)?;
     let names = ttf_parser::name::Table::parse(&name)?;
     let legacy = name_strings(&names, 1);
     let typographic = name_strings(&names, 16);
+    let style_name = name_strings(&names, 17)
+        .into_iter()
+        .chain(name_strings(&names, 2))
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    italic |= style_name.contains("italic") || style_name.contains("oblique");
     if legacy.is_empty() && typographic.is_empty() {
         return None;
     }
