@@ -15,7 +15,9 @@ const MANIFEST: &str = r##"{
       {"id":"fx.palette","kind":"gallery","label":"Palette","swatches":[
         {"id":"fx.blue","label":"Blue","color":"#3366CC"},{"id":"fx.red","label":"Red","color":"#CC3333"}]}]},
     {"title":"Schedule","controls":[{"id":"fx.in-schedule","kind":"button","label":"Extra"}]},
-    {"title":"Anywhere","controls":[{"id":"pr-indent","kind":"button","label":"Indent (plugin)","tip":"Replaced","keytip":"ZZ"}]}]}],
+    {"title":"Anywhere","controls":[{"id":"pr-indent","kind":"button","label":"Indent (plugin)","tip":"Replaced","keytip":"ZZ"}]},
+    {"title":"Placed","before":"Schedule","controls":[{"id":"fx.placed","kind":"button","label":"Placed"}]},
+    {"title":"Trailing","after":"Clipboard","controls":[{"id":"fx.trailing","kind":"button","label":"Trailing"}]}]}],
   "menus":[{"menu":"row","items":[
     {"id":"fx.rename","label":"Rename (fixture)","after":"Notes..."},
     {"id":"rm-hyperlink","label":"Hyperlink (plugin)"},
@@ -134,9 +136,14 @@ fn contributions_append_merge_and_replace_in_place() {
     let after = ids(task);
     // The built-in groups keep their order; "Fixture" is appended after
     // them; "Schedule" gained a control; no "Anywhere" group was made,
-    // because its one control replaced a built-in in place.
-    assert_eq!(after.len(), before.len() + 1);
+    // because its one control replaced a built-in in place; "Placed" goes
+    // before Schedule and "Trailing" after Clipboard (#1574).
+    assert_eq!(after.len(), before.len() + 3);
     assert_eq!(after.last().unwrap().0, "Fixture");
+    let titles: Vec<&str> = after.iter().map(|(t, _)| t.as_str()).collect();
+    let at = |t: &str| titles.iter().position(|x| *x == t).unwrap();
+    assert_eq!(at("Placed") + 1, at("Schedule"));
+    assert_eq!(at("Clipboard") + 1, at("Trailing"));
     assert_eq!(
         after.last().unwrap().1,
         [

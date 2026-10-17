@@ -382,7 +382,9 @@
   code paths only: `project_ribbon()` and `gantt_format_tab()` end with
   `extend_tab` (a contributed control whose id is a built-in command's
   replaces that command in place, keeping the control's shape; the rest go
-  into the group of that title or a new group after the tab's own; small
+  into the group of that title or a new group after the tab's own, or
+  before/after the built-in group the manifest's `before`/`after` names,
+  #1574; small
   buttons stack in columns of three; a gallery's swatches carry their colour
   in the tile preview as `#RRGGBB` and draw as `Docxy::swatch_gallery`; a
   combo draws as a drop-down); the row, bar, column and the new chart menu
@@ -424,7 +426,9 @@
   code paths only: `project_ribbon()` and `gantt_format_tab()` end with
   `extend_tab` (a contributed control whose id is a built-in command's
   replaces that command in place, keeping the control's shape; the rest go
-  into the group of that title or a new group after the tab's own; small
+  into the group of that title or a new group after the tab's own, or
+  before/after the built-in group the manifest's `before`/`after` names,
+  #1574; small
   buttons stack in columns of three; a gallery's swatches carry their colour
   in the tile preview as `#RRGGBB` and draw as `Docxy::swatch_gallery`; a
   combo draws as a drop-down); the row, bar, column and the new chart menu

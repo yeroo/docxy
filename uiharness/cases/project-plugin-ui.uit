@@ -38,6 +38,19 @@ test the manifest's group is drawn after the Task tab's own, its controls marked
   assert reply.tabs.1.groups.-1.galleries.0.items.0 is Blue
   assert reply.tabs.1.groups.-1.galleries.0.items.1 is Red
 
+test a contributed group goes before the built-in group its manifest names
+  # The fixture's "Fixture Format" group asks for `before: Bar Styles` on the
+  # Gantt Chart Format tab (#1574); without the hint a new group is appended.
+  open copy:../fixtures/project-clipboard.xml
+  call ribbon-read {}
+  assert reply.tabs.-1.name is Gantt Chart Format
+  assert reply.tabs.-1.groups.0.title is Fixture Format
+  assert reply.tabs.-1.groups.0.commands.0.id is fixture.format
+  assert reply.tabs.-1.groups.0.commands.0.plugin is true
+  assert reply.tabs.-1.groups.1.title is Bar Styles
+  call ribbon-click {"tab":"Gantt Chart Format","command":"fixture.format"}
+  assert status is Fixture: format
+
 test a toggle runs its command and reads back checked as the plugin says
   open copy:../fixtures/project-clipboard.xml
   assert dirty is false

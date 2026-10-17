@@ -214,12 +214,31 @@ pub(crate) fn extend_tab_with(tab: &mut rs::Tab<Act>, manifests: &[&ui::Manifest
                     .find(|g| g.title.eq_ignore_ascii_case(&group.title))
                 {
                     Some(g) => g.items.extend(controls),
-                    None => tab.groups.push(rs::Group {
-                        title: intern(&group.title),
-                        launcher: None,
-                        priority: 50,
-                        items: controls,
-                    }),
+                    None => {
+                        // Before or after the built-in group the manifest
+                        // names (#1574), else after the tab's own.
+                        let position = |title: &str| {
+                            tab.groups
+                                .iter()
+                                .position(|g| g.title.eq_ignore_ascii_case(title))
+                        };
+                        let at = if let Some(i) = position(&group.before) {
+                            i
+                        } else if let Some(i) = position(&group.after) {
+                            i + 1
+                        } else {
+                            tab.groups.len()
+                        };
+                        tab.groups.insert(
+                            at,
+                            rs::Group {
+                                title: intern(&group.title),
+                                launcher: None,
+                                priority: 50,
+                                items: controls,
+                            },
+                        );
+                    }
                 }
             }
         }
