@@ -432,6 +432,9 @@ struct Prompt {
     buf: String,
     /// The caret, in chars into `buf`.
     caret: usize,
+    /// The other end of a selection, in chars; the selection runs between it
+    /// and the caret (#1376).
+    anchor: Option<usize>,
 }
 
 impl Prompt {
@@ -443,6 +446,7 @@ impl Prompt {
             label: label.to_string(),
             buf,
             caret,
+            anchor: None,
         }
     }
 
@@ -459,15 +463,45 @@ impl Prompt {
             .map_or(self.buf.len(), |(i, _)| i)
     }
 
+    /// Selects the whole text, the caret at its end. An empty field selects
+    /// nothing.
+    fn select_all(&mut self) {
+        self.caret = self.buf.chars().count();
+        self.anchor = Some(0);
+    }
+
+    /// The selected span `(from, to)` in chars, `from < to`, if any.
+    fn selection(&self) -> Option<(usize, usize)> {
+        let len = self.buf.chars().count();
+        let a = self.anchor?.min(len);
+        let c = self.caret.min(len);
+        (a != c).then(|| (a.min(c), a.max(c)))
+    }
+
+    /// Removes the selection, leaving the caret where it began; whether
+    /// there was one.
+    fn delete_selection(&mut self) -> bool {
+        let sel = self.selection();
+        self.anchor = None;
+        let Some((from, to)) = sel else {
+            return false;
+        };
+        let (a, b) = (self.byte_at(from), self.byte_at(to));
+        self.buf.replace_range(a..b, "");
+        self.caret = from;
+        true
+    }
+
     fn insert(&mut self, ch: char) {
         self.clamp();
+        self.delete_selection();
         self.buf.insert(self.byte_at(self.caret), ch);
         self.caret += 1;
     }
 
     fn backspace(&mut self) {
         self.clamp();
-        if self.caret > 0 {
+        if !self.delete_selection() && self.caret > 0 {
             self.buf.remove(self.byte_at(self.caret - 1));
             self.caret -= 1;
         }
@@ -475,26 +509,38 @@ impl Prompt {
 
     fn delete(&mut self) {
         self.clamp();
-        if self.caret < self.buf.chars().count() {
+        if !self.delete_selection() && self.caret < self.buf.chars().count() {
             self.buf.remove(self.byte_at(self.caret));
         }
     }
 
+    /// With a selection, Left collapses to its start instead of stepping.
     fn left(&mut self) {
         self.clamp();
-        self.caret = self.caret.saturating_sub(1);
+        self.caret = match self.selection() {
+            Some((from, _)) => from,
+            None => self.caret.saturating_sub(1),
+        };
+        self.anchor = None;
     }
 
+    /// With a selection, Right collapses to its end instead of stepping.
     fn right(&mut self) {
         self.clamp();
-        self.caret = (self.caret + 1).min(self.buf.chars().count());
+        self.caret = match self.selection() {
+            Some((_, to)) => to,
+            None => (self.caret + 1).min(self.buf.chars().count()),
+        };
+        self.anchor = None;
     }
 
     fn home(&mut self) {
+        self.anchor = None;
         self.caret = 0;
     }
 
     fn end(&mut self) {
+        self.anchor = None;
         self.caret = self.buf.chars().count();
     }
 }
@@ -1690,6 +1736,11 @@ fn on_key(app: &mut App, k: KeyEvent) {
                 prompt.backspace();
                 app.prompt = Some(prompt);
             }
+            // Word's select-all in the field; it never types an `a` (#1376).
+            KeyCode::Char('a') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                prompt.select_all();
+                app.prompt = Some(prompt);
+            }
             KeyCode::Char(c) => {
                 prompt.insert(c);
                 app.prompt = Some(prompt);
@@ -2513,9 +2564,12 @@ impl App {
                 Some(p) => {
                     let kind = format!("{:?}", p.kind);
                     let kind = kind.split('(').next().unwrap_or_default().to_string();
-                    Field::with_caret(&p.buf, true, p.caret.min(p.buf.chars().count()))
-                        .kind(kind)
-                        .at(self.prompt_at)
+                    Field {
+                        selection: p.selection(),
+                        ..Field::with_caret(&p.buf, true, p.caret.min(p.buf.chars().count()))
+                    }
+                    .kind(kind)
+                    .at(self.prompt_at)
                 }
                 None => Field::closed(),
             },
@@ -5032,6 +5086,58 @@ mod tests {
         let f = app.input_field("yppxy-prompt");
         assert_eq!(f.caret, Some(2));
         assert_eq!(f.value.as_deref(), Some("abc"));
+    }
+
+    fn field_state(app: &App) -> (String, Option<usize>, Option<(usize, usize)>) {
+        let f = app.input_field("yppxy-prompt");
+        (f.value.unwrap(), f.caret, f.selection)
+    }
+
+    fn press_ctrl_a(app: &mut App) {
+        on_key(
+            app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+    }
+
+    #[test]
+    fn ctrl_a_selects_the_prompt_and_typing_replaces_it() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        open_prompt(&mut app, "abcd");
+        press_ctrl_a(&mut app);
+        assert_eq!(field_state(&app), ("abcd".into(), Some(4), Some((0, 4))));
+        press_key(&mut app, KeyCode::Char('X'));
+        assert_eq!(field_state(&app), ("X".into(), Some(1), None));
+        for code in [KeyCode::Backspace, KeyCode::Delete] {
+            press_key(&mut app, KeyCode::Char('y'));
+            press_ctrl_a(&mut app);
+            press_key(&mut app, code);
+            assert_eq!(field_state(&app), ("".into(), Some(0), None));
+            press_key(&mut app, KeyCode::Char('q'));
+        }
+        press_key(&mut app, KeyCode::Backspace);
+        press_ctrl_a(&mut app);
+        assert_eq!(field_state(&app).2, None, "an empty field selects nothing");
+    }
+
+    #[test]
+    fn arrows_collapse_the_prompt_selection_and_home_end_drop_it() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        open_prompt(&mut app, "abcd");
+        press_ctrl_a(&mut app);
+        press_key(&mut app, KeyCode::Left);
+        assert_eq!(field_state(&app), ("abcd".into(), Some(0), None));
+        press_ctrl_a(&mut app);
+        press_key(&mut app, KeyCode::Right);
+        assert_eq!(field_state(&app), ("abcd".into(), Some(4), None));
+        for (code, at) in [(KeyCode::Home, 0), (KeyCode::End, 4)] {
+            press_ctrl_a(&mut app);
+            press_key(&mut app, code);
+            assert_eq!(field_state(&app), ("abcd".into(), Some(at), None));
+            press_key(&mut app, KeyCode::Char('z'));
+            assert_eq!(field_state(&app).0.chars().count(), 5, "inserts");
+            press_key(&mut app, KeyCode::Backspace);
+        }
     }
 
     #[test]
