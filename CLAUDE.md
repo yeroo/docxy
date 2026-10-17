@@ -467,6 +467,50 @@
   skips `plugin` controls. `uiharness/cases/project-plugin-ui.uit` drives
   the fixture through all of it; nothing changes without a UI plugin.
 
+## Project table: resizable columns and AutoFilter (#1533)
+
+- Column widths are the plan's: `projcore::tableview::TableView` (px by field
+  name, 24 to 600), `Project::table_view`, one undo step through
+  `Editor::edit_table_view`, saved in the `.yppx` part `tableview.xml` (own
+  content type, omitted when empty, never in MSPDI). It is not the issue's
+  "views part": `views.xml` is an opaque retained part we do not own. A
+  `tableview.xml` this build cannot read keeps default widths and stays a
+  retained extra until a width replaces it. The suite's `ProjectView::widths()`
+  is the drag's live width, else the plan's, else `DEFAULT_WIDTHS`; every
+  width user (headings, cells, rules, scroll range, the default pane width,
+  Best Fit) reads it, `TABLE_W` is only the default sum.
+- A heading's right 6 px (`project-heading-edge:<Name>`) drag-resizes (window
+  mouse move/up in `main.rs`, `WidthDrag`; one undo step on release) and
+  double-click is Best Fit (`columns::best_fit`); the 16 px arrow left of it
+  (`project-heading-arrow:<Name>`) opens the AutoFilter. The edge is drawn
+  last so it wins; neither press selects the column.
+- Sort and filters are view state on `Editor` (like `collapsed`; not saved, not
+  undone, cleared by `replace_project`). `visible_rows()` stays in storage
+  order (collapse only) and every edit acts on task indexes; what a grid draws
+  and a cursor steps through is `Editor::display_rows()`: filtered (a summary
+  stays while it or a task below passes; blank rows and UID 0 always pass),
+  then sorted among siblings with each subtree kept together (text
+  case-insensitive, numbers, dates by value, blanks last; UID 0 stays first).
+  Insert above/below, indent and outdent are refused while sorted ("Clear the
+  sort first"); filtered, they act normally. Paste, fill and range selection
+  walk the displayed rows.
+- The suite's drop-down is a dialog like the sheet's filter button
+  (`project-filter-menu`, `DialogOwner::ProjectFilter`, `project/autofilter.rs`),
+  not a `MenuTarget`: Sort items (words by column type) apply and close, Group
+  by and Filters are drawn disabled (follow-ups), `Clear Filter from <Field>`
+  is enabled only while filtered, the checklist is the dialog check list (a
+  Year > Month > Day tree on dates, two-state boxes), OK applies (all checked
+  is no filter; none is refused), Cancel discards. `menu-open {"target":
+  {"filter":"Finish"}}` opens it; `rows` reports `filter`, `filters`, `sort`,
+  `sort_descending` and `widths`, `tab-list`-style state reports `widths`; the
+  status bar adds `AutoFilter Applied` while filtered.
+- yppxy (terminal) has View > Data > Sort... / Filter... prompts, `:sort` and
+  `:filter`, and the control verbs `proj.view`, `proj.sort`, `proj.filter`
+  (`Editor::filter_texts` resolves a value, `(Blanks)` or `YYYY[-MM[-DD]]`);
+  no mouse resize.
+- `uiharness/cases/project-columns.uit` and `project-autofilter.uit` drive it;
+  they cannot run on macOS (the window belongs to another process there).
+
 ## Project summary row (UID 0) is not a grid row (#1511)
 
 - `Editor::visible_rows` omits `Task::is_project_summary` (UID 0, summary)

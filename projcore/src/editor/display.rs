@@ -177,6 +177,44 @@ impl Editor {
             .collect()
     }
 
+    /// The display texts `specs` name in column `field`'s checklist, for a
+    /// host with no checklist to click (a command line, an agent). A spec is
+    /// a value as the cell shows it (any case), `(Blanks)` for a blank cell,
+    /// or on a date column `YYYY`, `YYYY-MM` or `YYYY-MM-DD`: every value
+    /// of that year, month or day, as ticking a node of the Year > Month >
+    /// Day tree does. A spec that names nothing is the error.
+    pub fn filter_texts(&self, field: Field, specs: &[String]) -> Result<BTreeSet<String>, String> {
+        let values = self.column_values(field);
+        let mut out = BTreeSet::new();
+        for spec in specs {
+            let spec = spec.trim();
+            let exact = |v: &&ValueItem| {
+                v.text.eq_ignore_ascii_case(spec)
+                    || (v.text.is_empty() && spec.eq_ignore_ascii_case("(Blanks)"))
+            };
+            let before = out.len();
+            if let Some(v) = values.iter().find(exact) {
+                out.insert(v.text.clone());
+                continue;
+            }
+            let parts: Vec<&str> = spec.split('-').collect();
+            let nums: Option<Vec<i64>> = parts.iter().map(|p| p.parse().ok()).collect();
+            if let Some(n) = nums.filter(|n| (1..=3).contains(&n.len())) {
+                for v in &values {
+                    let Some((y, m, d)) = v.date else { continue };
+                    let ymd = [y, i64::from(m), i64::from(d)];
+                    if n.iter().zip(ymd).all(|(a, b)| *a == b) {
+                        out.insert(v.text.clone());
+                    }
+                }
+            }
+            if out.len() == before {
+                return Err(format!("No value '{spec}' in {}", field.name()));
+            }
+        }
+        Ok(out)
+    }
+
     /// The distinct values of column `field` for its checklist, sorted by the
     /// column's own type, a blank last. Rows other columns' filters hide are
     /// left out; the column's own filter is ignored, so it can be widened.

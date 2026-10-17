@@ -293,3 +293,32 @@ fn widths_are_one_undo_step_and_no_change_records_nothing() {
     assert!(ed.redo());
     assert_eq!(ed.project().table_view.width("Name"), Some(300.));
 }
+
+#[test]
+fn filter_texts_resolve_values_blanks_and_date_nodes() {
+    let ed = sample();
+    let specs = |s: &[&str]| s.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        ed.filter_texts(Field::Name, &specs(&["a", " DD "])),
+        Ok(BTreeSet::from(["A".to_string(), "Dd".to_string()]))
+    );
+    // A month names every day in it, a year every month, a day one.
+    let march = ed.filter_texts(Field::Start, &specs(&["2026-03"])).unwrap();
+    assert_eq!(march.len(), 3);
+    let all = ed.filter_texts(Field::Start, &specs(&["2026"])).unwrap();
+    assert_eq!(all.len(), 7);
+    let day = ed
+        .filter_texts(Field::Start, &specs(&["2026-03-09"]))
+        .unwrap();
+    assert_eq!(day.len(), 1);
+    assert_eq!(
+        ed.filter_texts(Field::Start, &specs(&["2026-05"])),
+        Err("No value '2026-05' in Start".to_string())
+    );
+    assert_eq!(
+        ed.filter_texts(Field::Name, &specs(&["Zed"])),
+        Err("No value 'Zed' in Name".to_string())
+    );
+    // A text value that looks like a number is still a value first.
+    assert!(ed.filter_texts(Field::Name, &specs(&["(Blanks)"])).is_err());
+}
