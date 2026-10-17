@@ -84,6 +84,9 @@ fn tool_verb(name: &str) -> Option<&'static str> {
         "yppxy_resource_add" => "resource.add",
         "yppxy_resource_set" => "resource.set",
         "yppxy_resource_del" => "resource.del",
+        "yppxy_level_all" => "level.all",
+        "yppxy_level_clear" => "level.clear",
+        "yppxy_level_overallocations" => "level.overallocations",
         _ => return None,
     })
 }
@@ -491,6 +494,29 @@ fn tool_defs() -> Json {
             vec![resource_uid(), target(), tab()],
             &["uid"],
         ),
+        tool(
+            "yppxy_level_all",
+            "Show the plan resource-leveled, as Resource > Level > Level All: tasks are delayed \
+             so no work resource is booked past its capacity. A display overlay, not an undo \
+             step; the reply is {leveled: true, overallocated} (resources still over capacity).",
+            vec![target(), tab()],
+            &[],
+        ),
+        tool(
+            "yppxy_level_clear",
+            "Show the plan as scheduled again, as Clear Leveling; the reply is {leveled: false, \
+             overallocated}.",
+            vec![target(), tab()],
+            &[],
+        ),
+        tool(
+            "yppxy_level_overallocations",
+            "List the work resources booked past their capacity on the plan as shown: uid, \
+             name, max_units, peak_units (1.0 = 100%) and first (the first overallocated \
+             instant), earliest first.",
+            vec![target(), tab()],
+            &[],
+        ),
     ])
 }
 
@@ -720,6 +746,9 @@ mod tests {
             "yppxy_resource_add",
             "yppxy_resource_set",
             "yppxy_resource_del",
+            "yppxy_level_all",
+            "yppxy_level_clear",
+            "yppxy_level_overallocations",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
@@ -747,6 +776,9 @@ mod tests {
             ("yppxy_resource_add", "resource.add"),
             ("yppxy_resource_set", "resource.set"),
             ("yppxy_resource_del", "resource.del"),
+            ("yppxy_level_all", "level.all"),
+            ("yppxy_level_clear", "level.clear"),
+            ("yppxy_level_overallocations", "level.overallocations"),
         ] {
             assert_eq!(tool_verb(name), Some(verb));
         }

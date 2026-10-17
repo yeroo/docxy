@@ -466,7 +466,7 @@ without one nothing changes.
 - **Commands** (`yppx_ui_command`): `{id, plan, selection, view, values?}` in,
   `{ops, status, dialog?, view?}` out. `ops` are `projctl`'s editor verbs
   (`task.set`, `task.add`, `task.del`, `link.add`, `link.del`, `assign.*`,
-  `resource.*`, `proj.set`, ...) as `{verb, args}`, applied by `projctl::apply_ops` in one
+  `resource.*`, `proj.set`, `level.all`, ...) as `{verb, args}`, applied by `projctl::apply_ops` in one
   `Editor::batch`: one undo step, all or nothing, the refusal on the status
   line. `dialog` names a spec to open, whose OK sends the same id again with
   `values`; `view` sets host view settings (the palette, flags). Code 1

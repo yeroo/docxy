@@ -327,6 +327,15 @@ impl Editor {
         self.pre_view = None;
     }
 
+    /// Show the plan leveled (`on`) or as scheduled; a state it already shows
+    /// changes nothing. Not an undo step: leveling is a display overlay
+    /// (#1589, #1594).
+    pub fn set_leveled(&mut self, on: bool) {
+        if self.leveled != on {
+            self.toggle_level();
+        }
+    }
+
     pub fn disp_start(&self, uid: i32) -> Option<DateTime> {
         match &self.level {
             Some(lv) => lv.start(uid),

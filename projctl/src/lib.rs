@@ -36,6 +36,10 @@
 //! | `resource.set` | `{uid, name?, type?, …the same fields}` | the updated resource (#1588): `null` or `""` clears an optional text or rate; `type` changes only while the resource has no assignments; a rate edit keeps cost rate table A's current row, and a `max_units` edit the availability period in effect, in step |
 //! | `resource.del` | `{uid}` | `{deleted, assignments: [uid…]}` (#1588): its assignments go with it, each as the Resource Names cell removes a name, and its own derived calendar when nothing else uses it; later resources move up one ID |
 //! | `proj.get` | `{}` | the plan's settings (#1587): `{title, start, finish, status_date, current_date, calendar: {uid, name}, calendars: [{uid, name}], new_tasks}` (dates `YYYY-MM-DD HH:MM`, the status and current dates `null` when unset, `calendars` the base calendars, `new_tasks` `auto` or `manual`: how tasks added to the plan are scheduled, #1585) |
+//! | `level.all` | `{}` | `{leveled: true, overallocated}` (#1589): show the plan leveled, as Resource > Level > Level All; `overallocated` counts the work resources still booked past their capacity. Not an undo step: leveling is a display overlay |
+//! | `level.clear` | `{}` | `{leveled: false, overallocated}` (#1589): show the plan as scheduled, as Clear Leveling |
+//! | `level.overallocations` | `{}` | `{count, resources: [{uid, name, max_units, peak_units, first}]}` (#1589): the work resources booked past their capacity on the plan as shown, each with its peak (1.0 = 100%) and the first overallocated instant, earliest first (Next Overallocation) |
+//! | `level.selection`, `level.resource`, `level.options` | — | refused: the model levels the whole plan (#1594) |
 //! | `proj.set` | `{title?, start?, status_date?, current_date?, calendar?, new_tasks?}` | the same reply after the change (#1587): dates `YYYY-MM-DD` (the project calendar's day start; a bare status date is the day's end, as Project sets it) or `YYYY-MM-DDTHH:MM`, `null` clearing a status or current date, `calendar` a base calendar's name or uid, `new_tasks` `auto` or `manual` (Task > Tasks > Mode, #1585; existing tasks keep their own mode). All apply in one undo step, or none does |
 //!
 //! `fields` is a list of Project field names (`["% Complete", "Baseline1
@@ -100,6 +104,7 @@ use projcore::model::{
     AccrueAt, Assignment, ConstraintType, LagFormat, LagUnit, LinkType, Predecessor, Rate,
     Resource, ResourceType, Task, TaskType,
 };
+use projcore::schedule::overbookings;
 
 /// Successful calls to these verbs signal agent editing activity.
 pub const MUTATING: &[&str] = &[
@@ -115,6 +120,8 @@ pub const MUTATING: &[&str] = &[
     "resource.add",
     "resource.set",
     "resource.del",
+    "level.all",
+    "level.clear",
 ];
 
 /// Recognize editor verbs before a host resolves its target document.
@@ -132,6 +139,10 @@ pub fn is_editor_verb(verb: &str) -> bool {
                 | "assign.fields"
                 | "resource.list"
                 | "resource.get"
+                | "level.overallocations"
+                | "level.selection"
+                | "level.resource"
+                | "level.options"
         )
 }
 
@@ -187,6 +198,14 @@ pub fn dispatch_editor(ed: &mut Editor, verb: &str, args: &Json) -> Option<Resul
         "resource.add" => resource_add(ed, args),
         "resource.set" => resource_set(ed, args),
         "resource.del" => resource_del(ed, args),
+        "level.all" => Ok(level_set(ed, true)),
+        "level.clear" => Ok(level_set(ed, false)),
+        "level.overallocations" => Ok(level_overallocations(ed)),
+        // (`apply_ops` prefixes the verb itself.)
+        "level.selection" | "level.resource" | "level.options" => Err(
+            "the model levels the whole plan (yeroo/docxy #1594); level.all and level.clear switch it"
+                .into(),
+        ),
         _ => return None,
     })
 }
@@ -258,6 +277,60 @@ pub fn path_info(path: Option<&str>, ed: &Editor) -> Json {
         ("start", Json::Str(dt_str(ed.schedule().project_start))),
         ("finish", Json::Str(dt_str(ed.schedule().project_finish))),
         ("new_tasks", new_tasks_json(ed)),
+        ("leveled", Json::Bool(ed.leveled())),
+    ])
+}
+
+// ---------------------------------------------------------------------------
+// Leveling (#1589): the display overlay, as Resource > Level switches it
+// ---------------------------------------------------------------------------
+
+/// The work resources booked past their capacity on the plan as shown.
+fn shown_overbookings(ed: &Editor) -> Vec<(i32, projcore::schedule::Overbooking)> {
+    let mut over: Vec<_> = overbookings(ed.project(), |uid| {
+        Some((ed.disp_start(uid)?, ed.disp_finish(uid)?))
+    })
+    .into_iter()
+    .collect();
+    over.sort_by_key(|(uid, o)| (o.first, *uid));
+    over
+}
+
+/// `level.all` / `level.clear`: show the plan leveled or as scheduled.
+fn level_set(ed: &mut Editor, on: bool) -> Json {
+    ed.set_leveled(on);
+    Json::obj(vec![
+        ("leveled", Json::Bool(ed.leveled())),
+        (
+            "overallocated",
+            Json::Num(shown_overbookings(ed).len() as f64),
+        ),
+    ])
+}
+
+/// `level.overallocations`: each overallocated work resource with its peak
+/// and the first overallocated instant, earliest first.
+fn level_overallocations(ed: &Editor) -> Json {
+    let proj = ed.project();
+    let resources: Vec<Json> = shown_overbookings(ed)
+        .into_iter()
+        .filter_map(|(uid, o)| {
+            let r = proj.resources.iter().find(|r| r.uid == uid)?;
+            Some(Json::obj(vec![
+                ("uid", Json::Num(f64::from(uid))),
+                ("name", Json::Str(r.name.clone())),
+                (
+                    "max_units",
+                    Json::Num(if r.max_units > 0.0 { r.max_units } else { 1.0 }),
+                ),
+                ("peak_units", Json::Num(o.peak)),
+                ("first", Json::Str(dt_str(o.first))),
+            ]))
+        })
+        .collect();
+    Json::obj(vec![
+        ("count", Json::Num(resources.len() as f64)),
+        ("resources", Json::Arr(resources)),
     ])
 }
 
@@ -2763,7 +2836,7 @@ it"
         let ed = app();
         assert_eq!(
             path_info(Some("ctl-test.xml"), &ed).to_string(),
-            r#"{"path":"ctl-test.xml","modified":false,"name":"Project1","tasks":1,"start":"2026-01-05 08:00","finish":"2026-01-05 17:00","new_tasks":"auto"}"#
+            r#"{"path":"ctl-test.xml","modified":false,"name":"Project1","tasks":1,"start":"2026-01-05 08:00","finish":"2026-01-05 17:00","new_tasks":"auto","leveled":false}"#
         );
         assert_eq!(path_info(None, &ed).get("path"), Some(&Json::Null));
     }
@@ -2904,6 +2977,71 @@ it"
         assert!(run(&mut ed, "resource.get", r#"{"uid":1}"#).is_err());
         assert!(ed.undo());
         assert_eq!(ed.project().assignments.len(), 1);
+    }
+
+    #[test]
+    fn level_verbs_switch_the_overlay_and_list_the_overallocations() {
+        for verb in ["level.all", "level.clear"] {
+            assert!(is_editor_verb(verb) && MUTATING.contains(&verb), "{verb}");
+        }
+        for verb in [
+            "level.overallocations",
+            "level.selection",
+            "level.resource",
+            "level.options",
+        ] {
+            assert!(is_editor_verb(verb) && !MUTATING.contains(&verb), "{verb}");
+        }
+        // Ann on two parallel tasks is overallocated from their shared start.
+        let mut ed = staffed(projcore::model::TaskType::FixedUnits, false);
+        run(&mut ed, "task.add", r#"{"name":"Paint","duration":"2d"}"#).unwrap();
+        run(&mut ed, "assign.add", r#"{"task":1,"resource":1}"#).unwrap();
+        run(&mut ed, "assign.add", r#"{"task":2,"resource":1}"#).unwrap();
+        let depth = ed.undo_depth();
+        let over = run(&mut ed, "level.overallocations", "{}").unwrap();
+        assert_eq!(num(&over, "count"), 1.0);
+        let ann = &over.get("resources").and_then(Json::as_array).unwrap()[0];
+        assert_eq!(ann.get_str("name"), Some("Ann"));
+        assert_eq!(num(ann, "peak_units"), 2.0);
+        assert_eq!(num(ann, "max_units"), 1.0);
+        assert_eq!(ann.get_str("first"), Some("2026-01-05 08:00"));
+        assert_eq!(
+            path_info(None, &ed).get("leveled"),
+            Some(&Json::Bool(false))
+        );
+        // Level All delays Paint behind Build; the overlay is no undo step.
+        let on = run(&mut ed, "level.all", "{}").unwrap();
+        assert_eq!(on.get("leveled"), Some(&Json::Bool(true)));
+        assert_eq!(num(&on, "overallocated"), 0.0);
+        assert!(ed.leveled());
+        assert_eq!(ed.undo_depth(), depth);
+        assert_eq!(
+            num(
+                &run(&mut ed, "level.overallocations", "{}").unwrap(),
+                "count"
+            ),
+            0.0
+        );
+        assert!(ed.disp_start(2).unwrap() > ed.disp_finish(1).unwrap());
+        assert_eq!(path_info(None, &ed).get("leveled"), Some(&Json::Bool(true)));
+        let off = run(&mut ed, "level.clear", "{}").unwrap();
+        assert_eq!(off.get("leveled"), Some(&Json::Bool(false)));
+        assert_eq!(num(&off, "overallocated"), 1.0);
+        assert!(!ed.leveled());
+        // A plugin op's batch keeps the switch, although the plan is unchanged.
+        let ops = [projcore::uiplugin::Op {
+            verb: "level.all".into(),
+            args: projcore::json::Json::Obj(Vec::new()),
+        }];
+        apply_ops(&mut ed, &ops).unwrap();
+        assert!(ed.leveled());
+        assert_eq!(ed.undo_depth(), depth);
+        // The rest of Project's Level group waits for the leveler (#1594).
+        for verb in ["level.selection", "level.resource", "level.options"] {
+            let err = run(&mut ed, verb, r#"{"uids":[1]}"#).unwrap_err();
+            assert!(err.contains("whole plan") && err.contains("#1594"), "{err}");
+        }
+        assert!(ed.leveled());
     }
 
     #[test]

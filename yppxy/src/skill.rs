@@ -101,11 +101,20 @@ where instance is `yppxy-<AGWINTERM_SESSION_ID>` — the pane id shown by
 Verbs: `proj.path`, `task.list`, `task.get`, `task.fields`, `task.set`, `task.add`,
 `task.del`, `link.add`, `link.del`, `find`, `assign.list`, `assign.get`,
 `assign.fields`, `assign.add`, `assign.set`, `assign.del`, `resource.list`,
-`resource.get`, `resource.add`, `resource.set`, `resource.del`, `proj.save`,
-`proj.reload`, `proj.open`, and the grid's view: `proj.view`,
+`resource.get`, `resource.add`, `resource.set`, `resource.del`, `level.all`,
+`level.clear`, `level.overallocations`, `proj.save`, `proj.reload`,
+`proj.open`, and the grid's view: `proj.view`,
 `proj.sort {column?, descending?}`, `proj.filter {column, values? | clear}` (`values` are
 cell texts, `(Blanks)` for an empty cell, or on a date column `YYYY`, `YYYY-MM`,
 `YYYY-MM-DD`).
+
+Leveling is a display overlay: `level.all {}` shows the plan leveled (tasks
+delayed to fit resource capacity, as Resource > Level > Level All),
+`level.clear {}` shows it as scheduled; neither is an undo step, and both reply
+`{leveled, overallocated}`. `level.overallocations {}` lists the work resources
+booked past their capacity as shown, each with `peak_units` and the `first`
+overallocated instant, earliest first. `level.selection`, `level.resource` and
+`level.options` are refused: the model levels the whole plan.
 
 Resources are addressed by their own UID, as `resource.list {}` reports it
 (`uid, id, name, type, initials, group, code, email, material_label,
