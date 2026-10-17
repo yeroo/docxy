@@ -36,8 +36,8 @@
 //! | `resource.add` | `{name, type?, …the resource fields}` | the new resource, one undo step (#1588) |
 //! | `resource.set` | `{uid, …the resource fields}` | the updated resource, one undo step (#1588) |
 //! | `resource.del` | `{uid}` | `{deleted, assignments:[uid…]}`: the resource with its assignments, one undo step (#1588) |
-//! | `proj.get` | `{}` | the plan's title, start, finish, status and current dates and calendar (#1587); see `projctl` |
-//! | `proj.set` | `{title?, start?, status_date?, current_date?, calendar?}` | the same after the change, one undo step (#1587); see `projctl` |
+//! | `proj.get` | `{}` | the plan's title, start, finish, status and current dates, calendar (#1587) and `new_tasks` mode (#1585); see `projctl` |
+//! | `proj.set` | `{title?, start?, status_date?, current_date?, calendar?, new_tasks?}` | the same after the change, one undo step (#1587, #1585); see `projctl` |
 //! | `proj.view` | — | the grid's order (#1533): `{sort, sort_descending, filter, filters:[{column, values}], count, rows:[uid…]}`, the rows in the order the table draws them |
 //! | `proj.sort` | `{column?, descending?}` (no `column` clears) | the same as `proj.view`; view state, not an edit |
 //! | `proj.filter` | `{column, values?}` or `{clear:true}` | the same as `proj.view`; `values` are the cell texts (one may contain `|`), `(Blanks)`, or on a date column `YYYY`, `YYYY-MM`, `YYYY-MM-DD`; no `values` clears that column |

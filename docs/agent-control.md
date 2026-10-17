@@ -80,7 +80,13 @@ unset), `calendar` and the base `calendars`; `proj.set` writes `title`,
 `start`, `status_date`, `current_date` (a date `YYYY-MM-DD`, the project
 calendar's day start, the day's end for a status date as Project sets one,
 or `YYYY-MM-DDTHH:MM`; `null` clears a status or current date) and `calendar` (a base calendar's name or uid) as one undo
-step, and replies like `proj.get`. `custom` (#1554) writes custom fields by
+step, and replies like `proj.get`. Both carry `new_tasks` (#1585), how tasks
+added to the plan are scheduled, as Task > Tasks > Mode and the status bar's
+New Tasks chip set it: `proj.set {"new_tasks": "auto"|"manual"}` is one undo
+step (the mode the plan has records none), existing tasks keep their own mode,
+and `proj.path` reports `new_tasks` too. Project's manual variants (On Project
+Start Date, On Project Finish Date, Without Dates) are not in the model, which
+places a new manual task at the project start. `custom` (#1554) writes custom fields by
 Project's names, each value as typed in the field's cell: `{"custom":
 {"Text1": "Civil", "Flag3": true, "Date1": "2026-03-09", "Duration1": "3d",
 "Cost1": "$1,400", "Number1": null}}` (`null` or `""` clears). The field needs
