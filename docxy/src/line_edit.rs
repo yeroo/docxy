@@ -19,6 +19,9 @@ pub(crate) struct LineEdit {
     buf: String,
     /// The caret, in chars.
     caret: usize,
+    /// The other end of a selection, in chars; the selection runs between it
+    /// and the caret (#1375).
+    anchor: Option<usize>,
 }
 
 impl From<&str> for LineEdit {
@@ -27,6 +30,7 @@ impl From<&str> for LineEdit {
         LineEdit {
             buf: s.to_string(),
             caret: s.chars().count(),
+            anchor: None,
         }
     }
 }
@@ -34,7 +38,11 @@ impl From<&str> for LineEdit {
 impl From<String> for LineEdit {
     fn from(s: String) -> Self {
         let caret = s.chars().count();
-        LineEdit { buf: s, caret }
+        LineEdit {
+            buf: s,
+            caret,
+            anchor: None,
+        }
     }
 }
 
@@ -73,13 +81,44 @@ impl LineEdit {
         format!("{}{mark}{}", self.before(), self.after())
     }
 
+    /// Selects the whole text, the caret at its end. An empty field selects
+    /// nothing.
+    pub fn select_all(&mut self) {
+        self.caret = self.len();
+        self.anchor = Some(0);
+    }
+
+    /// The selected span `(from, to)` in chars, `from < to`, if any.
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        let a = self.anchor?;
+        (a != self.caret).then(|| (a.min(self.caret), a.max(self.caret)))
+    }
+
+    /// Removes the selection, leaving the caret where it began; whether
+    /// there was one.
+    pub fn delete_selection(&mut self) -> bool {
+        let sel = self.selection();
+        self.anchor = None;
+        let Some((from, to)) = sel else {
+            return false;
+        };
+        let (a, b) = (self.byte(from), self.byte(to));
+        self.buf.replace_range(a..b, "");
+        self.caret = from;
+        true
+    }
+
     pub fn insert(&mut self, c: char) {
+        self.delete_selection();
         let at = self.byte(self.caret);
         self.buf.insert(at, c);
         self.caret += 1;
     }
 
     pub fn backspace(&mut self) -> bool {
+        if self.delete_selection() {
+            return true;
+        }
         if self.caret == 0 {
             return false;
         }
@@ -90,6 +129,9 @@ impl LineEdit {
     }
 
     pub fn delete(&mut self) -> bool {
+        if self.delete_selection() {
+            return true;
+        }
         if self.caret >= self.len() {
             return false;
         }
@@ -99,18 +141,22 @@ impl LineEdit {
     }
 
     pub fn left(&mut self) {
+        self.anchor = None;
         self.caret = self.caret.saturating_sub(1);
     }
 
     pub fn right(&mut self) {
+        self.anchor = None;
         self.caret = (self.caret + 1).min(self.len());
     }
 
     pub fn home(&mut self) {
+        self.anchor = None;
         self.caret = 0;
     }
 
     pub fn end(&mut self) {
+        self.anchor = None;
         self.caret = self.len();
     }
 
@@ -228,5 +274,43 @@ mod tests {
         l.end();
         assert!(!l.delete());
         assert_eq!(LineEdit::from("日本").caret(), 2);
+    }
+
+    #[test]
+    fn select_all_is_replaced_by_typing_and_deleted_by_backspace_and_delete() {
+        let mut l = typed("é日ñ");
+        assert_eq!(l.selection(), None);
+        l.select_all();
+        assert_eq!(l.selection(), Some((0, 3)));
+        l.insert('X');
+        assert_eq!((l.as_str(), l.caret(), l.selection()), ("X", 1, None));
+        for code in [KeyCode::Backspace, KeyCode::Delete] {
+            let mut l = typed("é日ñ");
+            l.select_all();
+            assert_eq!(l.handle(code), Edit::Changed);
+            assert_eq!((l.as_str(), l.caret(), l.selection()), ("", 0, None));
+        }
+    }
+
+    #[test]
+    fn moving_drops_the_selection() {
+        for code in [KeyCode::Left, KeyCode::Right, KeyCode::Home, KeyCode::End] {
+            let mut l = typed("abc");
+            l.select_all();
+            assert_eq!(l.handle(code), Edit::Moved);
+            assert_eq!((l.as_str(), l.selection()), ("abc", None));
+        }
+        let mut l = typed("abc");
+        l.select_all();
+        l.left();
+        assert_eq!(l.caret(), 2);
+    }
+
+    #[test]
+    fn selecting_an_empty_field_selects_nothing() {
+        let mut l = LineEdit::default();
+        l.select_all();
+        assert_eq!(l.selection(), None);
+        assert_eq!(l.handle(KeyCode::Backspace), Edit::Moved);
     }
 }
