@@ -707,12 +707,20 @@ pub(crate) fn gantt_format_tab() -> rs::Tab<Act> {
 /// it, and Delete clears the range's cells and consumes it. The rule lives
 /// here, one place, so keys, the ribbon, the QAT and Backstage cannot drift
 /// apart. Fill Down fills the range and keeps it; Clear Contents clears it
-/// and consumes it, as Delete does.
+/// and consumes it, as Delete does. A UI plugin's command keeps it too: the
+/// range is what its request's selection carries (#1571).
 pub(crate) fn project_act_clears_range(act: ProjectAct) -> bool {
     use ProjectAct::*;
     !matches!(
         act,
-        Copy | Cut | Paste | AddLink | UnlinkTasks | ClearCell | FillDown | ClearContents
+        Copy | Cut
+            | Paste
+            | AddLink
+            | UnlinkTasks
+            | ClearCell
+            | FillDown
+            | ClearContents
+            | Plugin(_)
     )
 }
 

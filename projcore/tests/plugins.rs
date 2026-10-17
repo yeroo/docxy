@@ -277,7 +277,10 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
     assert_eq!(renamed.ops[0].verb, "task.set");
     assert_eq!(renamed.ops[0].args.int("uid"), Some(3));
     assert_eq!(renamed.ops[0].args.text("name"), "Renamed by fixture");
-    assert_eq!(renamed.status.as_deref(), Some("Fixture: renamed task 3"));
+    assert_eq!(
+        renamed.status.as_deref(),
+        Some("Fixture: renamed task 3 of 2 selected")
+    );
     let none = ui
         .command(&cmd("fixture.rename", vec![], None))
         .unwrap()

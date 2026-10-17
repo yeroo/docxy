@@ -4201,7 +4201,15 @@ fn the_range_clearing_rule_is_one_place_and_covers_host_handled_acts() {
     ] {
         assert!(project_act_clears_range(act), "{act:?}");
     }
-    for act in [Copy, Cut, Paste, AddLink, UnlinkTasks, ClearCell] {
+    for act in [
+        Copy,
+        Cut,
+        Paste,
+        AddLink,
+        UnlinkTasks,
+        ClearCell,
+        Plugin("fixture.rename"),
+    ] {
         assert!(!project_act_clears_range(act), "{act:?}");
     }
     // project_input maps the chord without touching the range; the clearing
