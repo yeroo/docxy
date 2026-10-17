@@ -356,8 +356,13 @@ impl Backstage {
         }
     }
 
-    /// The selected span of the file name `(from, to)` in chars, `from < to`.
+    /// The selected span of the file name `(from, to)` in chars, `from < to`,
+    /// while the name has the keyboard. Tabbing away keeps the anchor but
+    /// hides the selection, which comes back when the name is focused again.
     pub fn name_selection(&self) -> Option<(usize, usize)> {
+        if !(self.pane == Pane::SaveAs && self.name_focus) {
+            return None;
+        }
         let a = self.name_anchor?.min(self.name_input.chars().count());
         let c = self.name_cursor;
         (a != c).then(|| (a.min(c), a.max(c)))
@@ -951,6 +956,18 @@ mod tests {
         bs.key(ctrl_a(), &TestHost);
         assert_eq!(bs.save_as_name_field().selection, None);
         assert_eq!(bs.name_input, "");
+    }
+
+    #[test]
+    fn the_file_name_selection_shows_only_while_the_name_is_focused() {
+        let mut bs = name_field("abcd");
+        bs.key(ctrl_a(), &TestHost);
+        bs.key(key(KeyCode::Tab), &TestHost);
+        assert!(!bs.name_focus);
+        assert_eq!(bs.save_as_name_field().selection, None);
+        bs.key(key(KeyCode::Tab), &TestHost);
+        assert!(bs.name_focus);
+        assert_eq!(bs.save_as_name_field().selection, Some((0, 4)));
     }
 
     #[test]

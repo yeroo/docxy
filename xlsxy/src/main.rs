@@ -1847,8 +1847,10 @@ struct EditState {
     /// The typing a Ctrl+Z set aside (text, caret), for an immediate second
     /// Ctrl+Z to put back. Any other key drops it.
     redo_text: Option<Redo>,
-    /// Typing over a cell, the restored text is selected: the next typed
-    /// character replaces it, Backspace or Delete empties it.
+    /// The whole text is selected (Ctrl+A, or the text Ctrl+Z restored when
+    /// typing over a cell): the next typed character replaces it, Backspace
+    /// or Delete empties it, Left collapses it to the start and any other
+    /// key drops it.
     select_all: bool,
     /// AutoComplete's proposal (#672): the char index its selected suffix
     /// starts at (the caret stays there) and the value it completes to. Any
@@ -12493,7 +12495,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             e.redo_text = None;
             e.select_all &= selects;
         }
-        if now.is_some() && now != was {
+        // Ctrl+A moves the caret but is no edit: it leaves the correction and
+        // the formula list alone.
+        if !selects && now.is_some() && now != was {
             if !matches!(key.code, KeyCode::Char(_)) {
                 if let Some(e) = &mut app.edit {
                     e.correction = None;
@@ -25441,6 +25445,36 @@ mod tests {
     fn cell_state(app: &App) -> (String, Option<(usize, usize)>) {
         let f = app.input_field("xlsxy-cell");
         (f.value.unwrap(), f.selection)
+    }
+
+    #[test]
+    fn ctrl_a_in_the_cell_editor_keeps_the_correction_and_clears_the_list() {
+        let mut app = opts_app();
+        app.cur = (0, 0);
+        press(&mut app, KeyCode::F(2));
+        type_text(&mut app, "=SU");
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Left);
+        assert!(
+            app.edit.as_ref().unwrap().complete.is_some(),
+            "a list opens"
+        );
+        ctrl_a(&mut app);
+        assert!(app.edit.as_ref().unwrap().complete.is_none());
+        assert_eq!(cell_state(&app).1, Some((0, 3)));
+
+        // A correction's Ctrl+Z survives Ctrl+A.
+        press(&mut app, KeyCode::Esc);
+        put(&mut app, 2, 0, "x");
+        app.cur = (2, 0);
+        press(&mut app, KeyCode::F(2));
+        type_text(&mut app, " teh ");
+        assert_eq!(cell_state(&app).0, "x the ");
+        ctrl_a(&mut app);
+        assert!(app.edit.as_ref().unwrap().correction.is_some());
+        press_mod(&mut app, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert_eq!(cell_state(&app).0, "x teh ");
     }
 
     #[test]

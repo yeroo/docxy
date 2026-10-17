@@ -349,10 +349,10 @@
   caret (`Field::with_caret`). `LineEdit` also holds a selection
   (`select_all`, `selection`, `delete_selection`; typing, Backspace and
   Delete replace or remove it, the arrows, Home and End drop it) and
-  `field-read` reports it. Only Find and Replace use it so far (#1375): Ctrl+A
-  selects the focused field and Replace All is Alt+A (nothing in find-only
-  mode). The comment bar and Compare's two paths take Ctrl+A too (#1376);
-  the vim `:` line does not. Copy/paste (#1377) and click-to-place (#1379)
+  `field-read` reports it. In Find and Replace (#1375) Ctrl+A selects the
+  focused field and Replace All is Alt+A (nothing in find-only mode). The
+  comment bar and Compare's two paths take Ctrl+A too (#1376); the vim `:`
+  line does not. Copy/paste (#1377) and click-to-place (#1379)
   are still not there.
 
 ## Terminal editors: Ctrl+A in the other prompts (#1376)
@@ -364,10 +364,15 @@
   anchor (no shared line-edit crate): docxy's comment bar and Compare use
   `LineEdit`; xlsxy's minibuffer `Prompt` and yppxy's `Prompt` have
   `anchor`/`selection`/`delete_selection`; the cell editor reuses
-  `Edit.select_all` (Ctrl+A sets it, Left collapses to 0; the end-of-branch
-  reset keeps it for that key). Backstage Save As's name, shared by the
-  three, has `Backstage::name_anchor`, drawn reversed; every write of
-  `name_cursor` clears it. The xlsxy vim `:` line has no select-all.
+  `EditState.select_all` (Ctrl+A sets it, Left collapses to 0; the
+  end-of-branch reset keeps it for that key, and Ctrl+A skips the tail that
+  ends a correction and refreshes the formula list). Left/Right collapse
+  only when editing in place (F2); in type-over mode they still commit and
+  move, as in Excel. Backstage Save As's name, shared by the
+  three, has `Backstage::name_anchor`, drawn reversed and reported only while
+  the name is focused (Tab away hides it, Tab back shows it again); every
+  write of `name_cursor` clears it. yppxy's vim `:` line is a `Prompt`, so it
+  takes Ctrl+A. The xlsxy vim `:` line has no select-all.
 
 ## xlsxy terminal vim `:` line edits at a caret (#1373)
 
