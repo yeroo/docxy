@@ -374,8 +374,9 @@
   equal to `clip_text` as its own clip).
 - The xlsxy cell editor has only a select-all selection, so Ctrl+C/X take the
   text only while it is all selected (Ctrl+C keeps the selection); Ctrl+V
-  inserts at the caret like typing (`typed_tail`, `propose()`), replacing the
-  text under select-all.
+  inserts at the caret, replacing the text under select-all; a paste is not
+  typing (`typed_tail` false, so no AutoCorrect at commit, and no AutoComplete
+  proposal), and an empty paste changes nothing.
 
 ## Terminal editors: Ctrl+A in the other prompts (#1376)
 

@@ -12507,7 +12507,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 }
             }
             // Ctrl+C and Ctrl+X take the text only while it is all selected;
-            // Ctrl+V inserts at the caret like typing, over a selection (#1377).
+            // Ctrl+V inserts at the caret, over a selection; a paste is not
+            // typing, so nothing is AutoCorrected or AutoCompleted (#1377).
             KeyCode::Char(k @ ('c' | 'x')) if ctrl => {
                 if let Some(e) = &mut app.edit {
                     if e.select_all && !e.text.is_empty() {
@@ -12541,7 +12542,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                         e.cursor += line.chars().count();
                         e.correction = None;
                     }
-                    app.propose();
                 }
             }
             KeyCode::Backspace => {
@@ -25691,6 +25691,20 @@ mod tests {
         ctrl_key(&mut app, 'x');
         assert_eq!(cell_state(&app), ("".into(), None));
         assert_eq!(app.clip_text.as_deref(), Some("xyxyzz"));
+    }
+
+    #[test]
+    fn a_pasted_prefix_is_not_autocompleted() {
+        let mut app = opts_app();
+        app.os_clip = None;
+        put(&mut app, 0, 0, "apple");
+        app.cur = (1, 0);
+        press(&mut app, KeyCode::F(2));
+        app.clip_text = Some("ap".into());
+        ctrl_key(&mut app, 'v');
+        assert_eq!(app.edit.as_ref().unwrap().proposal, None);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(value_at(&app, 1, 0), CellValue::Text("ap".into()));
     }
 
     #[test]
