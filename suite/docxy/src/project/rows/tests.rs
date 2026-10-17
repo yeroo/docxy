@@ -220,7 +220,9 @@ fn an_external_task_reads_external_even_as_a_summary_but_a_blank_stays_blank() {
 }
 
 fn fixture(name: &str) -> ProjectEditor {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures").join(name);
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../uiharness/fixtures")
+        .join(name);
     ProjectEditor::new(mspdi::read_mspdi(&std::fs::read_to_string(path).unwrap()).unwrap())
 }
 
@@ -231,6 +233,10 @@ fn the_uid_0_summary_row_is_not_grid_row_1() {
     assert_eq!(ids(&with), [1, 2]);
     assert_eq!(ids(&with), ids(&without));
     assert_eq!(num(&with, "count"), num(&without, "count"));
-    assert_eq!(num(&with, "total"), num(&without, "total") + 1, "the model keeps it");
-    assert_eq!(num(&row(&with, 0), "row"), 1);
+    assert_eq!(
+        num(&with, "total"),
+        num(&without, "total") + 1,
+        "the model keeps it"
+    );
+    assert_eq!(num(row(&with, 0), "row"), 1);
 }
