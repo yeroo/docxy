@@ -956,6 +956,9 @@ impl PromptKind {
     }
 }
 
+/// The prompt field's widest size; a longer buffer scrolls under it.
+const PROMPT_FIELD_W: f32 = 500.;
+
 /// The prompt bar's label.
 pub(crate) fn prompt_label(p: &ProjectPrompt) -> SharedString {
     p.kind.label().into()
@@ -964,8 +967,21 @@ pub(crate) fn prompt_label(p: &ProjectPrompt) -> SharedString {
 #[derive(Clone, Debug)]
 pub(crate) struct ProjectPrompt {
     pub kind: PromptKind,
-    pub buf: String,
+    pub line: LineEdit,
     pub uid: Option<i32>,
+}
+
+impl std::ops::Deref for ProjectPrompt {
+    type Target = LineEdit;
+    fn deref(&self) -> &LineEdit {
+        &self.line
+    }
+}
+
+impl std::ops::DerefMut for ProjectPrompt {
+    fn deref_mut(&mut self) -> &mut LineEdit {
+        &mut self.line
+    }
 }
 
 impl ProjectView {
@@ -981,7 +997,7 @@ impl ProjectView {
         };
         self.prompt = Some(ProjectPrompt {
             kind,
-            buf,
+            line: LineEdit::new(buf),
             uid: (kind != PromptKind::Find)
                 .then(|| self.selected_uid())
                 .flatten(),
@@ -1133,23 +1149,28 @@ pub(crate) fn project_input(
         return None;
     }
     if let Some(mut prompt) = v.prompt.take() {
+        // #1370: the bar edits at a caret like the cell editor. Ctrl+A selects
+        // the buffer and Copy/Cut/Paste go to the host, which edits it in
+        // place; any other chord is dropped.
         if m.control || m.alt || m.platform {
+            let mut act = None;
+            if m.control && !m.alt && !m.platform && key == "a" {
+                prompt.select_all();
+            } else if let Some(a @ (ProjectAct::Copy | ProjectAct::Cut | ProjectAct::Paste)) =
+                key_act(key, m)
+            {
+                act = Some(a);
+            }
             v.prompt = Some(prompt);
-            return None;
+            return act;
         }
         v.anchor = None;
         match key {
             "escape" => {}
             "enter" => commit_prompt(tab, prompt),
-            "backspace" => {
-                prompt.buf.pop();
-                v.prompt = Some(prompt);
-            }
             "tab" => v.prompt = Some(prompt),
             _ => {
-                if let Some(text) = text {
-                    prompt.buf.extend(text.chars().filter(|c| !c.is_control()));
-                }
+                prompt.key(key, text);
                 v.prompt = Some(prompt);
             }
         }
@@ -2118,13 +2139,11 @@ impl Docxy {
         // A pass already asked for runs first, so this act, and a second
         // levelling command above all, sees the plan it left.
         self.flush_project_passes(cx);
-        // With a cell editor open, Copy/Cut/Paste edit its buffer instead of
-        // the table (#561); committing first would break the edit.
+        // With a cell editor or the prompt bar open, Copy/Cut/Paste edit its
+        // buffer instead of the table (#561, #1370); committing or cancelling
+        // first would end the edit.
         if matches!(act, ProjectAct::Copy | ProjectAct::Cut | ProjectAct::Paste)
-            && self
-                .tabs
-                .get(self.active)
-                .is_some_and(|t| matches!(&t.surface, Surface::Project(v) if v.cell.is_some()))
+            && self.project_edit_open()
         {
             self.project_cell_clipboard(act, cx);
             return self.refocus(window, cx);
@@ -2266,28 +2285,39 @@ impl Docxy {
             project_cut(&mut self.tabs[self.active]);
         }
     }
-    /// Copy/Cut/Paste with a cell editor open take the buffer, not the table
-    /// (#561). Copy and Cut put the selection (else the whole buffer) on the system
+    /// Copy/Cut/Paste with a cell editor or the prompt bar open take the buffer,
+    /// not the table (#561, #1370). Copy and Cut put the selection (else the whole buffer) on the system
     /// clipboard; Cut removes it only when the read-
     /// back clipboard holds the cut text — a silently failed write (a
     /// busy OS clipboard) otherwise keeps the text and the status says so.
     /// Paste inserts the clipboard's text at the caret. The edit stays open;
     /// the project, its undo stack and its dirty flag are untouched.
     fn project_cell_clipboard(&mut self, act: ProjectAct, cx: &mut Context<Self>) {
+        // The open editor's buffer: the cell's, else the prompt bar's (#1370).
+        fn open_line(tab: &mut DocTab) -> Option<&mut LineEdit> {
+            match &mut tab.surface {
+                Surface::Project(v) => match (&mut v.cell, &mut v.prompt) {
+                    (Some(cell), _) => Some(&mut cell.line),
+                    (None, Some(prompt)) => Some(&mut prompt.line),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
         if act == ProjectAct::Paste {
             let now = self.clipboard_read(cx);
             if let (Some(tab), Some(text)) = (self.tabs.get_mut(self.active), now.text())
-                && let Surface::Project(v) = &mut tab.surface
-                && let Some(cell) = &mut v.cell
+                && let Some(line) = open_line(tab)
             {
-                cell.paste(text);
+                line.paste(text);
             }
             return;
         }
-        let text = self.tabs.get(self.active).and_then(|t| match &t.surface {
-            Surface::Project(v) => v.cell.as_ref().map(|c| c.copy_text()),
-            _ => None,
-        });
+        let text = self
+            .tabs
+            .get_mut(self.active)
+            .and_then(open_line)
+            .map(|l| l.copy_text());
         let Some(text) = text else {
             return;
         };
@@ -2307,10 +2337,8 @@ impl Docxy {
         }
         // A sheet pastes its own clipboard first; this copy is newer.
         self.grid_clip = None;
-        if let Some(Surface::Project(v)) = self.tabs.get_mut(self.active).map(|t| &mut t.surface)
-            && let Some(cell) = &mut v.cell
-        {
-            cell.cut();
+        if let Some(line) = self.tabs.get_mut(self.active).and_then(open_line) {
+            line.cut();
         }
     }
     pub(crate) fn project_key(
@@ -2347,6 +2375,7 @@ impl Docxy {
     }
     pub(crate) fn project_prompt_bar(
         &self,
+        window: &Window,
         pal: Pal,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
@@ -2354,6 +2383,13 @@ impl Docxy {
             return None;
         };
         let prompt = v.prompt.as_ref()?;
+        // The field draws its buffer like the cell editor does: a caret bar,
+        // the selection tinted, scrolled to keep the caret in view (#1370).
+        let measure = Measurer::new(window);
+        let size = f32::from(window.text_style().font_size.to_pixels(window.rem_size()));
+        let offset = prompt.scroll_x(PROMPT_FIELD_W - 18., |s| {
+            measure.width(s, size, false, false)
+        });
         Some(
             h_flex()
                 .w_full()
@@ -2375,7 +2411,8 @@ impl Docxy {
                     h_flex()
                         .relative()
                         .min_w(px(180.))
-                        .max_w(px(500.))
+                        .max_w(px(PROMPT_FIELD_W))
+                        .flex_none()
                         .h(px(24.))
                         .px_2()
                         .items_center()
@@ -2384,8 +2421,7 @@ impl Docxy {
                         .border_color(hsla_u(BRAND))
                         .text_color(pal.fg)
                         .child(probe(&self.probes, "project-prompt-field"))
-                        .child(prompt.buf.clone())
-                        .child(div().w(px(1.5)).h(px(14.)).bg(hsla_u(BRAND))),
+                        .child(line_edit_view(prompt, offset, 14.)),
                 )
                 .child(
                     div()

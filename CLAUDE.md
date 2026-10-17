@@ -290,6 +290,19 @@
   and `field-read comment-editor` reports the caret and the `[0,len]`
   selection. Click-to-place and Shift+arrows are not there.
 
+## Project prompt bar editing (#1370)
+
+- The prompt bar (Predecessor, Move, Assign, Hyperlink, Find) edits at a caret
+  like the cell editor: both embed `LineEdit` (`project/cell.rs`: `buf`,
+  `caret`, `anchor`, `key`, `select_all`, `paste`, `copy_text`, `cut`,
+  `scroll_x`) and deref to it. Left/Right/Home/End/Delete/Backspace move and
+  edit, Ctrl+A selects the buffer, and typing or paste replaces a selection.
+  Ctrl+C/X/V come back from `project_input` as acts and `project_act` hands
+  them to `project_cell_clipboard`, which edits the open cell's, else the
+  prompt's, buffer on the system clipboard (the cut read-back gate applies)
+  and leaves the prompt open. Other chords are still dropped. Shift+arrows and
+  click-to-place are not there. The state JSON still reports `kind:buf`.
+
 ## Project Task Information dialog (#1368)
 
 - Task > Properties > Information..., Notes... (same dialog, on its Notes

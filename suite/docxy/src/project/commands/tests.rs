@@ -1030,7 +1030,7 @@ fn prompts_bind_uid_cancel_and_edit_unicode_without_dispatching_commands() {
     commit_prompt(
         &mut t,
         ProjectPrompt {
-            buf: "1d".into(),
+            line: LineEdit::new("1d"),
             ..p
         },
     );
@@ -4692,6 +4692,19 @@ fn row_menu_over_a_kept_range_is_the_clicked_rows() {
     assert!(!project_row_menu_press(&mut t, 2, Some(COL_START)));
 }
 
+/// #1370: a one-row range opens the Predecessor prompt and keeps the range;
+/// a right-click then must not keep it, or the menu's Copy/Cut/Paste would
+/// edit the prompt's buffer instead of the table.
+#[test]
+fn row_menu_press_with_a_prompt_open_cancels_it_and_keeps_no_range() {
+    let mut t = fill_tab();
+    range(&mut t, 0, COL_NAME, 0, COL_DURATION);
+    apply_project_act(&mut t, ProjectAct::AddLink);
+    assert!(v(&t).prompt.is_some(), "a one-row range opens the prompt");
+    assert!(!project_row_menu_press(&mut t, 0, Some(COL_NAME)));
+    assert!(v(&t).prompt.is_none());
+}
+
 /// #1213: outside the range, a right-click is a left click: the range goes
 /// and the clicked cell is selected.
 #[test]
@@ -4742,4 +4755,126 @@ fn the_project_view_tab_has_the_theme_button() {
         .find(|c| c.label == "Theme")
         .expect("Project's View tab has a Theme button");
     assert_eq!(theme.act, Act::Project(ProjectAct::Theme));
+}
+
+fn prompt_of(t: &DocTab) -> &ProjectPrompt {
+    v(t).prompt.as_ref().unwrap()
+}
+
+fn type_str(t: &mut DocTab, s: &str) {
+    for c in s.chars() {
+        let k = c.to_string();
+        project_input(t, &k, Some(&k), Modifiers::default());
+    }
+}
+
+#[test]
+fn prompt_bar_edits_at_a_caret() {
+    let mut t = tab();
+    apply_project_act(&mut t, ProjectAct::Assign);
+    type_str(&mut t, "Anx");
+    let k = |t: &mut DocTab, key: &str| {
+        assert!(project_input(t, key, None, Modifiers::default()).is_none());
+    };
+    k(&mut t, "left");
+    type_str(&mut t, "λ");
+    assert_eq!(prompt_of(&t).buf, "Anλx");
+    k(&mut t, "home");
+    k(&mut t, "delete");
+    assert_eq!(prompt_of(&t).buf, "nλx");
+    k(&mut t, "end");
+    k(&mut t, "backspace");
+    assert_eq!(prompt_of(&t).buf, "nλ");
+    k(&mut t, "home");
+    k(&mut t, "backspace");
+    assert_eq!(prompt_of(&t).buf, "nλ", "nothing before the caret");
+    k(&mut t, "right");
+    k(&mut t, "right");
+    k(&mut t, "delete");
+    assert_eq!(prompt_of(&t).buf, "nλ", "nothing after the caret");
+    assert_eq!(prompt_of(&t).caret, "nλ".len());
+}
+
+#[test]
+fn prompt_bar_ctrl_a_selects_and_typing_or_delete_replaces() {
+    let mut t = tab();
+    apply_project_act(&mut t, ProjectAct::Assign);
+    type_str(&mut t, "abc");
+    assert!(project_input(&mut t, "a", Some("a"), ctrl()).is_none());
+    assert_eq!(prompt_of(&t).selection(), Some(0..3));
+    type_str(&mut t, "Z");
+    assert_eq!(prompt_of(&t).buf, "Z");
+    project_input(&mut t, "a", Some("a"), ctrl());
+    project_input(&mut t, "backspace", None, Modifiers::default());
+    assert_eq!(prompt_of(&t).buf, "");
+    type_str(&mut t, "xy");
+    project_input(&mut t, "a", Some("a"), ctrl());
+    project_input(&mut t, "left", None, Modifiers::default());
+    assert_eq!((prompt_of(&t).selection(), prompt_of(&t).caret), (None, 0));
+    project_input(&mut t, "a", Some("a"), ctrl());
+    project_input(&mut t, "delete", None, Modifiers::default());
+    assert_eq!(prompt_of(&t).buf, "");
+}
+
+#[test]
+fn prompt_bar_clipboard_chords_return_their_act_and_keep_the_prompt() {
+    let mut t = tab();
+    apply_project_act(&mut t, ProjectAct::Assign);
+    type_str(&mut t, "Ana");
+    for (key, act) in [
+        ("c", ProjectAct::Copy),
+        ("x", ProjectAct::Cut),
+        ("v", ProjectAct::Paste),
+    ] {
+        assert_eq!(project_input(&mut t, key, Some(key), ctrl()), Some(act));
+        assert_eq!(prompt_of(&t).buf, "Ana");
+    }
+    // Other chords are still dropped.
+    assert!(project_input(&mut t, "z", Some("z"), ctrl()).is_none());
+    assert_eq!(prompt_of(&t).buf, "Ana");
+}
+
+#[test]
+fn prompt_bar_paste_replaces_the_selection_on_one_line() {
+    let mut line = LineEdit::new("abc");
+    line.select_all();
+    line.paste("x\r\ny\tz\u{7}\n");
+    assert_eq!(line.buf, "x y z");
+    assert_eq!(line.caret, 5);
+}
+
+#[test]
+fn prompt_bar_enter_commits_the_edited_text() {
+    let mut t = tab();
+    apply_project_act(&mut t, ProjectAct::Assign);
+    type_str(&mut t, "Anx");
+    project_input(&mut t, "backspace", None, Modifiers::default());
+    type_str(&mut t, "a");
+    assert_eq!(prompt_of(&t).buf, "Ana");
+    project_input(&mut t, "left", None, Modifiers::default());
+    project_input(&mut t, "enter", None, Modifiers::default());
+    assert!(v(&t).prompt.is_none());
+    let names: Vec<_> = v(&t)
+        .ed
+        .project()
+        .resources
+        .iter()
+        .map(|r| r.name.clone())
+        .collect();
+    assert!(names.iter().any(|n| n == "Ana"), "{names:?}");
+}
+
+#[test]
+fn hyperlink_prompt_opens_with_the_caret_at_the_end() {
+    let mut t = tab();
+    let uid = v(&t).selected_uid().unwrap();
+    vm(&mut t)
+        .ed
+        .set_hyperlink(uid, "docs", "https://x", "")
+        .unwrap();
+    apply_project_act(&mut t, ProjectAct::Hyperlink);
+    let p = prompt_of(&t);
+    assert!(!p.buf.is_empty());
+    assert_eq!(p.caret, p.buf.len());
+    assert!(p.selection().is_none());
 }

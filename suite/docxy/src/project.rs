@@ -1107,29 +1107,9 @@ fn editable_row_cells(
             let edit = v.cell.as_ref().filter(|c| c.uid == uid && c.col == col);
             let content = if let Some(edit) = edit {
                 let measure = Measurer::new(window);
-                let sel = edit.selection().unwrap_or(edit.caret..edit.caret);
-                let caret_bar = || div().flex_none().w(px(1.5)).h(px(16.)).bg(hsla_u(BRAND));
                 let offset =
                     edit.scroll_x(WIDTHS[col] - 24., |s| measure.width(s, 12., summary, false));
-                h_flex()
-                    .relative()
-                    .left(px(-offset))
-                    .flex_none()
-                    .items_center()
-                    .child(edit.buf[..sel.start].to_owned())
-                    .when(edit.caret == sel.start, |d| d.child(caret_bar()))
-                    .when(sel.start < sel.end, |d| {
-                        let c = hsla_u(BRAND);
-                        d.child(
-                            div()
-                                .flex_none()
-                                .bg(hsla(c.h, c.s, c.l, 0.18))
-                                .child(edit.buf[sel.clone()].to_owned()),
-                        )
-                    })
-                    .when(edit.caret > sel.start, |d| d.child(caret_bar()))
-                    .child(edit.buf[sel.end..].to_owned())
-                    .into_any_element()
+                line_edit_view(edit, offset, 16.).into_any_element()
             } else if let Some(uid) = uid.filter(|_| summary && col == COL_NAME) {
                 // A summary's outline glyph: a click shows or hides its
                 // subtasks without editing the cell or moving the cursor.
@@ -1649,6 +1629,38 @@ fn hbar_strip(
                 .id(SharedString::from(id))
                 .scrollbar_show(ScrollbarShow::Always),
         )
+}
+
+/// A [`LineEdit`] drawn as text with the caret bar and the tinted selection,
+/// shifted left by `offset` (its [`LineEdit::scroll_x`]); shared by the cell
+/// editor and the prompt bar.
+pub(crate) fn line_edit_view(edit: &LineEdit, offset: f32, caret_h: f32) -> Div {
+    let sel = edit.selection().unwrap_or(edit.caret..edit.caret);
+    let caret_bar = || {
+        div()
+            .flex_none()
+            .w(px(1.5))
+            .h(px(caret_h))
+            .bg(hsla_u(BRAND))
+    };
+    h_flex()
+        .relative()
+        .left(px(-offset))
+        .flex_none()
+        .items_center()
+        .child(edit.buf[..sel.start].to_owned())
+        .when(edit.caret == sel.start, |d| d.child(caret_bar()))
+        .when(sel.start < sel.end, |d| {
+            let c = hsla_u(BRAND);
+            d.child(
+                div()
+                    .flex_none()
+                    .bg(hsla(c.h, c.s, c.l, 0.18))
+                    .child(edit.buf[sel.clone()].to_owned()),
+            )
+        })
+        .when(edit.caret > sel.start, |d| d.child(caret_bar()))
+        .child(edit.buf[sel.end..].to_owned())
 }
 
 #[cfg(test)]

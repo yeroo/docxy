@@ -874,9 +874,12 @@ Project edits are committed before hot-exit persistence; invalid buffers are
 discarded on exit while their last committed project state is still saved.
 
 An open Project prompt owns input before KeyTips: Enter commits, Escape cancels,
-Backspace removes one character, and printable text appends. Tab/Shift+Tab do
-nothing while it is open. Control, Alt, and platform-modified prompt events are
-ignored (including modified Enter/Escape/Backspace); no AltGr input is supported.
+and it edits at a caret like the cell editor (Left/Right/Home/End, Backspace,
+Delete, printable text inserts; Ctrl+A selects the buffer and typing replaces
+the selection). Ctrl+C/X/V and Copy/Cut/Paste edit its buffer on the system
+clipboard and leave it open. Tab/Shift+Tab do nothing while it is open. Other
+Control, Alt, and platform-modified prompt events are ignored (including modified
+Enter/Escape/Backspace); no AltGr input is supported.
 Outside editors and prompts, the Ctrl and Alt chords listed above are handled;
 other Control/Alt/platform chords are ignored. Changing tasks, documents, or commands
 cancels the prompt. The `project-cells`, `project-invalid`, `project-ribbon`, and
