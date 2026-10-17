@@ -364,7 +364,10 @@
   comment bar and Compare's two paths take Ctrl+A too (#1376); the vim `:`
   line does not. Find, Replace and Compare copy and paste (#1377, below), and
   so does the comment bar (#1378, below); the vim `:` line and
-  click-to-place (#1379) are still not there.
+  click-to-place are still not there. A click on the Find bar's Find or
+  Replace box focuses it (#1379): `replace_hit` records the status row and the
+  `→` / Replace columns as drawn; the click only switches `editing_replacement`
+  and does not place the caret.
 
 ## Terminal editors: Ctrl+C/X/V in Find, Replace, Compare, the minibuffer and the cell editor (#1377)
 

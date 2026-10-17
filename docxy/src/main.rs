@@ -1555,6 +1555,10 @@ struct App {
     /// Where each prompt field's text starts, as this frame drew it: the
     /// `field-read` input id and the cell (#1204).
     drawn_fields: Vec<(&'static str, (u16, u16))>,
+    /// The Replace bar as this frame drew it, for a click to focus a field
+    /// (#1379): the status row, the column where the `→` starts and the column
+    /// where the Replace field starts. None for Find alone or no bar.
+    replace_hit: Option<(u16, u16, u16)>,
     /// First comment row shown in the panel (scroll offset).
     comments_scroll: usize,
     /// The comments panel rect (set by draw() for wheel hit-testing).
@@ -1773,6 +1777,7 @@ impl App {
             comment_input: None,
             counts: Default::default(),
             drawn_fields: Vec::new(),
+            replace_hit: None,
             comments_scroll: 0,
             comments_rect: Rect::default(),
             notes,
@@ -5721,6 +5726,17 @@ impl App {
             }
             return;
         }
+        // A click on the Find or the Replace box focuses it (#1379); the `→`
+        // between them is neither (an empty Find box is one cell wide here).
+        if m.kind == MouseEventKind::Down(MouseButton::Left) {
+            if let (Some(f), Some((y, arrow, repl))) = (self.find.as_mut(), self.replace_hit) {
+                if m.row == y && (m.column <= arrow || m.column >= repl) {
+                    f.editing_replacement = m.column >= repl;
+                    self.dirty = true;
+                    return;
+                }
+            }
+        }
         let mrow = m.row as usize;
         let col =
             (m.column as usize).saturating_sub(self.doc_x0 as usize) + self.doc_hscroll as usize;
@@ -6942,6 +6958,7 @@ impl App {
     fn draw(&mut self, f: &mut Frame) {
         self.counts.frames += 1;
         self.drawn_fields.clear();
+        self.replace_hit = None;
         self.draw_screen(f);
     }
 
@@ -7443,6 +7460,7 @@ impl App {
         let col = |prefix: &str| status.x + RLine::from(prefix).width() as u16;
         // `lead` is 1 when the caret mark sits before a non-empty field's
         // first char, so `at` names that char, not the mark.
+        let mut hit = None;
         let mut at = |id: &'static str, prefix: &str, lead: u16| {
             self.drawn_fields.push((id, (col(prefix) + lead, status.y)));
         };
@@ -7461,11 +7479,17 @@ impl App {
                     at("docxy-find", " Replace: ", q_lead);
                     let (q, _) = replace_drawn(f);
                     at("docxy-replace", &format!(" Replace: {q} → "), r_lead);
+                    hit = Some((
+                        status.y,
+                        col(&format!(" Replace: {q}")),
+                        col(&format!(" Replace: {q} → ")),
+                    ));
                 }
             }
         } else if let Some(c) = self.vim.as_ref().and_then(|v| v.cmdline.as_ref()) {
             at("docxy-vim-command", ":", c.mark_lead());
         }
+        self.replace_hit = hit;
         let status_widget =
             Paragraph::new(status_text).style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_widget(status_widget, status);
@@ -14611,6 +14635,33 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    /// A click on the Find or the Replace box focuses it; Tab is not the only
+    /// way (#1379).
+    #[test]
+    fn click_focuses_the_find_or_the_replace_field() {
+        let mut app = app_with(&["alpha"]);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Char('x')));
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(app.find.as_ref().unwrap().editing_replacement);
+        let click = |app: &mut App, id: &str| {
+            let (x, y) = app.drawn_at(id).unwrap();
+            app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        };
+        click(&mut app, "docxy-find");
+        assert!(!app.find.as_ref().unwrap().editing_replacement);
+        term.draw(|f| app.draw(f)).unwrap();
+        click(&mut app, "docxy-replace");
+        assert!(app.find.as_ref().unwrap().editing_replacement);
+        // The arrow between the boxes changes nothing.
+        term.draw(|f| app.draw(f)).unwrap();
+        let (y, arrow, _) = app.replace_hit.unwrap();
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), arrow + 2, y));
+        assert!(app.find.as_ref().unwrap().editing_replacement);
     }
 
     #[test]

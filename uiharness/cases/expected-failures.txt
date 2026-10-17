@@ -30,5 +30,3 @@ backstage-inputs-typing.uit | rename sheet-tab-rename: copies | #1365
 backstage-inputs-typing.uit | rename sheet-tab-rename: pastes | #1365
 
 # A click on a docxy Find bar field does not move the focus to it (#1204).
-terminal-docxy-inputs-typing.uit | docxy docxy-find: focus by click | #1379
-terminal-docxy-inputs-typing.uit | docxy docxy-replace: focus by click | #1379
