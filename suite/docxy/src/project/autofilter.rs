@@ -12,7 +12,7 @@ use super::*;
 use crate::dialog::catalog;
 use crate::dialog::{ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
 use crate::sheet_filter::{control, dialog};
-use projcore::editor::{Sort, ValueItem};
+use projcore::editor::{Field, Sort, ValueItem};
 use std::collections::BTreeSet;
 
 /// The status bar's word while any column is filtered.
@@ -41,10 +41,10 @@ pub(crate) enum ColumnKind {
     Date,
 }
 
-pub(crate) fn column_kind(col: usize) -> ColumnKind {
-    match ENTRY_FIELDS[col].name().as_str() {
-        "ID" | "Duration" => ColumnKind::Number,
-        "Start" | "Finish" => ColumnKind::Date,
+pub(crate) fn column_kind(field: Field) -> ColumnKind {
+    match field {
+        Field::Id | Field::Duration => ColumnKind::Number,
+        Field::Start | Field::Finish => ColumnKind::Date,
         _ => ColumnKind::Text,
     }
 }
@@ -154,7 +154,7 @@ pub(crate) fn tree_checks(tree: &Tree, allowed: Option<&BTreeSet<String>>) -> Ve
 pub(crate) fn menu_dialog(v: &ProjectView, col: usize) -> Dialog {
     let field = ENTRY_FIELDS[col];
     let name = COLUMNS[col];
-    let kind = column_kind(col);
+    let kind = column_kind(field);
     let [asc, desc] = sort_labels(kind);
     let clear = format!("Clear Filter from {name}");
     let mut d = dialog(
@@ -195,12 +195,7 @@ pub(crate) fn menu_dialog(v: &ProjectView, col: usize) -> Dialog {
 }
 
 fn sort_words(sort: Sort) -> String {
-    let [asc, desc] = sort_labels(column_kind(
-        ENTRY_FIELDS
-            .iter()
-            .position(|&f| f == sort.field)
-            .unwrap_or(0),
-    ));
+    let [asc, desc] = sort_labels(column_kind(sort.field));
     let label = if sort.descending { desc } else { asc };
     format!(
         "{} by {}",
@@ -218,7 +213,7 @@ pub(crate) fn autofilter_click(tab: &mut DocTab, button: &str) -> Option<Result<
     };
     let name = COLUMNS[col];
     let field = ENTRY_FIELDS[col];
-    let [asc, desc] = sort_labels(column_kind(col));
+    let [asc, desc] = sort_labels(column_kind(field));
     let clear = format!("Clear Filter from {name}");
     let pressed = |label: &str| {
         button.replace('&', "").trim().eq_ignore_ascii_case(label)
@@ -258,7 +253,7 @@ pub(crate) fn autofilter_click(tab: &mut DocTab, button: &str) -> Option<Result<
     };
     let tree = build_tree(
         &v.ed.column_values(field),
-        column_kind(col) == ColumnKind::Date,
+        column_kind(field) == ColumnKind::Date,
     );
     let allowed = tree.checked_texts(&checks);
     if allowed.is_empty() {

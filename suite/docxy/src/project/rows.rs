@@ -113,32 +113,19 @@ pub(crate) fn rows_json(ed: &ProjectEditor) -> Json {
         .enumerate()
         .map(|(row, i)| row_json(ed, &tasks[i], row + 1))
         .collect();
-    Json::obj(vec![
+    let mut fields = vec![
         ("view", Json::Str("Gantt Chart".into())),
         ("table", Json::Str("Entry".into())),
-        (
-            "filter",
-            Json::Str(if ed.is_filtered() {
-                "AutoFilter".into()
-            } else {
-                "All Tasks".into()
-            }),
-        ),
-        ("filters", filters_json(ed)),
         ("group", Json::Str("No Group".into())),
-        (
-            "sort",
-            Json::Str(ed.sort().map_or_else(|| "ID".into(), |s| s.field.name())),
-        ),
-        (
-            "sort_descending",
-            Json::Bool(ed.sort().is_some_and(|s| s.descending)),
-        ),
+    ];
+    fields.extend(projctl::view_fields(ed));
+    fields.extend([
         ("widths", widths_json(&committed_widths(ed))),
         ("count", Json::Num(rows.len() as f64)),
         ("total", Json::Num(tasks.len() as f64)),
         ("rows", Json::Arr(rows)),
-    ])
+    ]);
+    Json::obj(fields)
 }
 
 /// `{column: px}` for every entry column.
@@ -148,26 +135,6 @@ pub(crate) fn widths_json(widths: &[f32; COLUMN_COUNT]) -> Json {
             .iter()
             .zip(widths)
             .map(|(name, &w)| (*name, Json::Num(f64::from(w))))
-            .collect(),
-    )
-}
-
-/// `[{column, values}]` for each filtered column, in the order they were
-/// filtered.
-fn filters_json(ed: &ProjectEditor) -> Json {
-    Json::Arr(
-        ed.filtered_fields()
-            .into_iter()
-            .filter_map(|field| {
-                let values = ed.filter(field)?;
-                Some(Json::obj(vec![
-                    ("column", Json::Str(field.name())),
-                    (
-                        "values",
-                        Json::Arr(values.iter().cloned().map(Json::Str).collect()),
-                    ),
-                ]))
-            })
             .collect(),
     )
 }

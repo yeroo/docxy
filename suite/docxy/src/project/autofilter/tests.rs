@@ -10,10 +10,10 @@ fn item(text: &str, date: Option<(i64, u32, u32)>) -> ValueItem {
 
 #[test]
 fn sort_words_follow_the_columns_type() {
-    assert_eq!(column_kind(COL_NAME), ColumnKind::Text);
-    assert_eq!(column_kind(COL_ID), ColumnKind::Number);
-    assert_eq!(column_kind(COL_DURATION), ColumnKind::Number);
-    assert_eq!(column_kind(COL_FINISH), ColumnKind::Date);
+    assert_eq!(column_kind(Field::Name), ColumnKind::Text);
+    assert_eq!(column_kind(Field::Id), ColumnKind::Number);
+    assert_eq!(column_kind(Field::Duration), ColumnKind::Number);
+    assert_eq!(column_kind(Field::Finish), ColumnKind::Date);
     assert_eq!(
         sort_labels(ColumnKind::Text),
         ["Sort A to Z", "Sort Z to A"]
@@ -534,6 +534,8 @@ fn a_commit_that_hides_the_edited_row_leaves_the_cursor_on_the_row_that_followed
         },
     );
     assert_eq!(names(&t), ["A"]);
+    let ed = &v(&t).ed;
+    assert_eq!(ed.project().tasks[ed.sel()].name, "A");
 }
 
 #[test]
@@ -565,13 +567,64 @@ fn an_edit_that_hides_every_row_leaves_the_cursor_on_the_entry_row() {
 }
 
 #[test]
-fn delete_under_a_filter_puts_the_cursor_on_the_next_drawn_row() {
+fn delete_under_a_filter_or_sort_puts_the_cursor_on_the_next_drawn_row() {
     let mut t = five();
     filter_names(&mut t, &[1, 3, 5]); // A, C, E
     vm(&mut t).ed.select(2);
+    vm(&mut t).col = COL_ID; // Delete on the ID column deletes the task
     apply_project_act(&mut t, ProjectAct::ClearCell);
     let ed = &v(&t).ed;
+    assert_eq!(ed.project().tasks.len(), 4);
+    assert!(
+        ed.project().tasks.iter().all(|x| x.name != "C"),
+        "C is gone"
+    );
     assert_eq!(ed.project().tasks[ed.sel()].name, "E");
+    // Sorted Z to A (E, D, C, B, A minus nothing filtered): delete the
+    // middle one and the next drawn row is the cursor.
+    let mut t = five();
+    open(&mut t, COL_NAME);
+    dialog_click(&mut t, "Sort Z to A").unwrap();
+    assert_eq!(names(&t), ["E", "D", "C", "B", "A"]);
+    vm(&mut t).ed.select(2); // C
+    vm(&mut t).col = COL_ID;
+    apply_project_act(&mut t, ProjectAct::ClearCell);
+    let ed = &v(&t).ed;
+    assert_eq!(ed.project().tasks.len(), 4);
+    assert_eq!(ed.project().tasks[ed.sel()].name, "B");
+}
+
+#[test]
+fn hiding_the_last_drawn_row_goes_to_the_entry_row_on_enter_and_stays_up_on_shift_enter() {
+    let mut t = five();
+    filter_names(&mut t, &[1, 2, 3]); // A, B, C
+    let rename_last = |t: &mut DocTab, key: &str, shift: bool| {
+        vm(t).ed.select(2);
+        vm(t).col = COL_NAME;
+        vm(t).open_cell(Some("Zed")).unwrap();
+        project_cell_input(
+            t,
+            key,
+            None,
+            Modifiers {
+                shift,
+                ..Modifiers::default()
+            },
+        );
+    };
+    rename_last(&mut t, "enter", true);
+    let ed = &v(&t).ed;
+    assert_eq!(
+        ed.project().tasks[ed.sel()].name,
+        "B",
+        "not A: no second step up"
+    );
+    assert!(!v(&t).on_entry_row());
+    // Undo, then Enter: the table is left for the entry row.
+    assert!(vm(&mut t).ed.undo());
+    vm(&mut t).ed.select(2);
+    rename_last(&mut t, "enter", false);
+    assert!(v(&t).on_entry_row());
 }
 
 #[test]

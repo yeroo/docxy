@@ -138,6 +138,10 @@ pub struct Editor {
     /// the model, history and saved files (see [`Self::display_rows`]).
     sort: Option<Sort>,
     filters: Vec<display::Filter>,
+    /// The displayed rows (uids) and the selection's place in them, as they
+    /// were just before the edit in flight, while a filter is on: where a
+    /// selection the edit hides goes ([`Self::sel_into_display`]).
+    pre_view: Option<display::PreView>,
     undo: Vec<Project>,
     redo: Vec<Project>,
     dirty: bool,
@@ -184,6 +188,7 @@ impl Editor {
             sel_pinned: false,
             sort: None,
             filters: Vec::new(),
+            pre_view: None,
             undo: Vec::new(),
             redo: Vec::new(),
             dirty,
@@ -431,6 +436,7 @@ impl Editor {
     }
 
     fn snapshot(&mut self) {
+        self.capture_view();
         self.push_undo(self.proj.clone());
     }
 
@@ -480,6 +486,7 @@ impl Editor {
         if !self.sel_pinned && !self.filters.is_empty() {
             self.sel_into_display();
         }
+        self.pre_view = None;
     }
 
     /// Validate newly created/exposed leaves before touching history or UI state.
@@ -487,6 +494,7 @@ impl Editor {
     /// links, and is refused when it makes a cycle-free plan cyclic (see
     /// `links`).
     fn edit_structure(&mut self, edit: impl FnOnce(&mut Project)) -> Result<(), String> {
+        self.capture_view();
         let mut next = self.proj.clone();
         edit(&mut next);
         links::follow_outline(&self.proj.tasks, &mut next.tasks)?;
@@ -507,6 +515,7 @@ impl Editor {
             return false;
         };
         self.pending = None;
+        self.pre_view = None;
         self.redo.push(std::mem::replace(&mut self.proj, prev));
         self.changed();
         true
@@ -517,6 +526,7 @@ impl Editor {
             return false;
         };
         self.pending = None;
+        self.pre_view = None;
         self.undo.push(std::mem::replace(&mut self.proj, next));
         self.changed();
         true
@@ -892,10 +902,11 @@ impl Editor {
             .iter()
             .map(|t| t.uid)
             .collect();
-        // Under a sort or filter the cursor keeps its place among the rows
-        // drawn, not its storage index.
-        let place = (self.is_view_active() && range.contains(&self.sel))
-            .then(|| self.display_rows().iter().position(|&i| i == self.sel))
+        // Under a sort or filter the cursor goes to the row drawn after the
+        // deleted ones (else before them), by uid: a summary shown only
+        // through the deleted task drops out with it.
+        let pre = (self.is_view_active() && range.contains(&self.sel))
+            .then(|| self.view_before())
             .flatten();
         self.edit_structure(|proj| {
             proj.tasks.drain(range);
@@ -905,12 +916,8 @@ impl Editor {
             // Remove assignments as well, so they cannot attach to a reused UID.
             proj.assignments.retain(|a| !removed.contains(&a.task_uid));
         })?;
-        if let Some(place) = place {
-            let rows = self.display_rows();
-            if let Some(&row) = rows.get(place.min(rows.len().saturating_sub(1))) {
-                self.sel = row;
-                self.sel_uid = self.selected_uid();
-            }
+        if let Some(pre) = pre {
+            self.reselect_near(&pre);
         }
         Ok(removed)
     }

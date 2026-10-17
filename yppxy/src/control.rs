@@ -167,41 +167,12 @@ fn view_json(app: &App) -> Json {
         .into_iter()
         .map(|i| Json::Num(f64::from(tasks[i].uid)))
         .collect();
-    let filters = ed
-        .filtered_fields()
-        .into_iter()
-        .filter_map(|field| {
-            let values = ed.filter(field)?;
-            Some(Json::obj(vec![
-                ("column", Json::Str(field.name())),
-                (
-                    "values",
-                    Json::Arr(values.iter().cloned().map(Json::Str).collect()),
-                ),
-            ]))
-        })
-        .collect();
-    Json::obj(vec![
-        (
-            "sort",
-            Json::Str(ed.sort().map_or_else(|| "ID".into(), |s| s.field.name())),
-        ),
-        (
-            "sort_descending",
-            Json::Bool(ed.sort().is_some_and(|s| s.descending)),
-        ),
-        (
-            "filter",
-            Json::Str(if ed.is_filtered() {
-                "AutoFilter".into()
-            } else {
-                "All Tasks".into()
-            }),
-        ),
-        ("filters", Json::Arr(filters)),
+    let mut fields = projctl::view_fields(ed);
+    fields.extend([
         ("count", Json::Num(rows.len() as f64)),
         ("rows", Json::Arr(rows)),
-    ])
+    ]);
+    Json::obj(fields)
 }
 
 fn path_info(app: &App) -> Json {

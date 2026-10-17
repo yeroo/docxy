@@ -359,14 +359,15 @@ fn find_walks_the_drawn_rows_and_skips_filtered_ones() {
     // "c" matches Cc only among the shown; it is found, not Dd or others.
     assert_eq!(ed.find_from_top("c"), FindOutcome::Found(2));
     ed.clear_filters();
-    // Sorted Z to A, F3 steps down the drawn rows: S, T, Dd, Cc, bb, B, A.
+    // Sorted A to Z the drawn order is A, B, S, bb, Cc, T, Dd (storage order
+    // differs): from A, "b" finds B (index 7), not bb (3).
     ed.set_sort(Some(Sort {
         field: Field::Name,
-        descending: true,
+        descending: false,
     }));
-    ed.select(1); // S
-    assert_eq!(ed.find("b"), FindOutcome::Found(3), "bb before B");
-    assert_eq!(ed.find(""), FindOutcome::Found(7), "then B");
+    ed.select(0);
+    assert_eq!(ed.find("b"), FindOutcome::Found(7), "B, not bb");
+    assert_eq!(ed.find(""), FindOutcome::Found(3), "then bb");
 }
 
 #[test]
@@ -448,4 +449,48 @@ fn an_exact_value_wins_over_a_date_node() {
         ed.filter_texts(Field::Name, &["2026".to_string()]),
         Ok(BTreeSet::from(["2026".to_string()]))
     );
+}
+
+#[test]
+fn the_row_after_comes_from_the_order_before_the_edit_even_when_it_re_sorts() {
+    let mut ed = plan(&[
+        (1, "Alpha", 1, 1, (1, 6)),
+        (2, "Beta", 1, 1, (1, 6)),
+        (3, "Gamma", 1, 1, (1, 6)),
+        (4, "Delta", 1, 1, (1, 6)),
+    ]);
+    ed.set_filter(Field::Name, only(&["Alpha", "Beta", "Gamma"]));
+    ed.set_sort(Some(Sort {
+        field: Field::Name,
+        descending: false,
+    }));
+    assert_eq!(names(&ed), ["Alpha", "Beta", "Gamma"]);
+    // Renamed to sort last, Alpha leaves the view: the cursor goes to Beta,
+    // the row that followed it, not to Gamma (the row before its new place).
+    ed.select(0);
+    ed.rename(1, "Zulu").unwrap();
+    assert_eq!(ed.project().tasks[ed.sel()].name, "Beta");
+    // Undo brings Alpha back; a rename of Gamma, the last drawn, goes back
+    // to the row before it.
+    assert!(ed.undo());
+    ed.select(2);
+    ed.rename(3, "Zulu").unwrap();
+    assert_eq!(ed.project().tasks[ed.sel()].name, "Beta");
+}
+
+#[test]
+fn delete_goes_to_the_row_drawn_after_even_when_a_summary_drops_out() {
+    let mut ed = plan(&[
+        (1, "P", 1, 1, (1, 6)),
+        (2, "S", 1, 1, (1, 6)),
+        (3, "X", 2, 1, (1, 6)),
+        (4, "Y", 1, 1, (1, 6)),
+        (5, "Z", 1, 1, (1, 6)),
+    ]);
+    ed.set_filter(Field::Name, only(&["P", "X", "Y", "Z"]));
+    assert_eq!(names(&ed), ["P", "S", "X", "Y", "Z"]);
+    ed.select(2);
+    ed.delete_task(3).unwrap();
+    assert_eq!(names(&ed), ["P", "Y", "Z"]);
+    assert_eq!(ed.project().tasks[ed.sel()].name, "Y", "not Z");
 }

@@ -933,11 +933,21 @@ pub(crate) fn project_cell_input(tab: &mut DocTab, key: &str, text: Option<&str>
             Surface::Project(v) => v.cell.as_ref().and_then(|c| c.uid),
             _ => None,
         };
+        // Whether a drawn row follows the edited one: if the commit hides it,
+        // the cursor lands on that row, else on the one before.
+        let followed = match &tab.surface {
+            Surface::Project(v) => edited.is_some_and(|uid| {
+                let rows = v.ed.display_rows();
+                let tasks = &v.ed.project().tasks;
+                rows.iter()
+                    .position(|&i| tasks[i].uid == uid)
+                    .is_some_and(|at| at + 1 < rows.len())
+            }),
+            _ => false,
+        };
         if commit_project_cell(tab) {
             if let Surface::Project(v) = &mut tab.surface {
-                // The commit may have hidden the edited task (a filter): the
-                // cursor is then on the row that took its place, so a move
-                // down or across would skip a row or edit another task.
+                // The commit may have hidden the edited task (a filter).
                 let hid_it = edited.is_some_and(|uid| {
                     let tasks = &v.ed.project().tasks;
                     !v.ed.display_rows().iter().any(|&i| tasks[i].uid == uid)
@@ -945,8 +955,17 @@ pub(crate) fn project_cell_input(tab: &mut DocTab, key: &str, text: Option<&str>
                 let moves_up = key == "up" || (key == "enter" && m.shift);
                 if was_entry && (key == "down" || (key == "enter" && !m.shift)) {
                     v.enter_entry_row();
-                } else if hid_it && !moves_up {
-                    // Stay on the row that followed it.
+                } else if hid_it {
+                    // The cursor is on the row that took its place, or on the
+                    // one before when none followed: a move that row already
+                    // made is skipped, and down from the last row drawn
+                    // leaves the table for the entry row.
+                    let down = key == "down" || (key == "enter" && !m.shift);
+                    if down && !followed {
+                        v.enter_entry_row();
+                    } else if moves_up && followed {
+                        v.key("up", false);
+                    }
                 } else {
                     v.key(
                         match key {

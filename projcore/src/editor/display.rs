@@ -25,6 +25,13 @@ pub(super) struct Filter {
     allowed: BTreeSet<String>,
 }
 
+/// The displayed rows (uids) before an edit and the selection's place in them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PreView {
+    uids: Vec<i32>,
+    at: usize,
+}
+
 /// A distinct value of a column, for the AutoFilter checklist.
 #[derive(Clone, PartialEq, Debug)]
 pub struct ValueItem {
@@ -71,9 +78,11 @@ impl Editor {
 
     /// Filter `field` to the rows whose display text is in `allowed`
     /// (`None` clears that column's filter). Filters on several columns AND.
-    /// A selection the filter hides moves to the first displayed row.
+    /// A selection the filter hides moves to a displayed row (see
+    /// [`Self::sel_into_display`]).
     pub fn set_filter(&mut self, field: Field, allowed: Option<BTreeSet<String>>) {
         let before = self.filters.clone();
+        self.pre_view = None;
         match allowed {
             Some(allowed) => match self.filters.iter_mut().find(|f| f.field == field) {
                 Some(f) => f.allowed = allowed,
@@ -105,14 +114,61 @@ impl Editor {
         }
     }
 
+    /// The displayed rows and the selection's place, just before an edit.
+    pub(super) fn view_before(&self) -> Option<PreView> {
+        let rows = self.display_rows();
+        let at = rows.iter().position(|&i| i == self.sel)?;
+        let uids = rows.iter().map(|&i| self.proj.tasks[i].uid).collect();
+        Some(PreView { uids, at })
+    }
+
+    /// Remember the view an edit starts from, when a filter could hide the
+    /// selection (see [`Self::sel_into_display`]).
+    pub(super) fn capture_view(&mut self) {
+        self.pre_view = if self.filters.is_empty() {
+            None
+        } else {
+            self.view_before()
+        };
+    }
+
+    /// Put the selection on the row drawn after where it was in `pre` that is
+    /// still drawn, else the nearest one before it. False when none is.
+    pub(super) fn reselect_near(&mut self, pre: &PreView) -> bool {
+        let rows = self.display_rows();
+        let tasks = &self.proj.tasks;
+        let drawn = |uid: &i32| {
+            tasks
+                .iter()
+                .position(|t| t.uid == *uid)
+                .filter(|i| rows.contains(i) && !tasks[*i].is_null)
+        };
+        let pick = pre.uids[pre.at + 1..]
+            .iter()
+            .find_map(drawn)
+            .or_else(|| pre.uids[..pre.at].iter().rev().find_map(drawn));
+        if let Some(pick) = pick {
+            self.sel = pick;
+            self.sel_uid = Some(self.proj.tasks[pick].uid);
+        }
+        pick.is_some()
+    }
+
     /// Put a selection the filter hides on a displayed row, the invariant
-    /// every operation keeps: the next displayed row after it in the order
-    /// (sorted, unfiltered) it was in, else the one before, a blank row only
-    /// when nothing else shows. Nothing displayed leaves it where it is, for
-    /// a host to meet with its entry row.
+    /// every operation keeps: after an edit, the row drawn after it before
+    /// the edit (else the one before) that is still drawn; for a filter just
+    /// set, the next displayed row after it in the sorted, unfiltered order,
+    /// else the one before. A blank row is picked only when nothing else
+    /// shows, and nothing displayed leaves the selection where it is, for a
+    /// host to meet with its entry row.
     pub(super) fn sel_into_display(&mut self) {
         let rows = self.display_rows();
         if rows.contains(&self.sel) || self.sel_pinned {
+            return;
+        }
+        if let Some(pre) = self.pre_view.take()
+            && self.reselect_near(&pre)
+        {
             return;
         }
         let tasks = &self.proj.tasks;
@@ -166,7 +222,8 @@ impl Editor {
 
     /// The rows in display order: with `collapse` those collapsed summaries
     /// leave shown, with `filter` those the filters leave shown; sorted if a
-    /// sort is on. Find walks it with neither.
+    /// sort is on. Find walks it without `collapse`; `sel_into_display` with
+    /// neither.
     pub(super) fn ordered_rows(&self, collapse: bool, filter: bool) -> Vec<usize> {
         let rows: Vec<usize> = if collapse {
             self.visible_rows()

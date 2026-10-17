@@ -43,11 +43,6 @@ impl TableView {
         }
     }
 
-    /// Forget a column's saved width (it draws at its default again).
-    pub fn clear_width(&mut self, name: &str) {
-        self.widths.retain(|(n, _)| n != name);
-    }
-
     /// The `tableview.xml` part.
     pub fn to_xml(&self) -> String {
         let mut out = String::from(
@@ -116,8 +111,6 @@ mod tests {
         assert_eq!(v.width("Finish & co"), Some(MIN_WIDTH));
         assert_eq!(v.width("Start"), Some(MAX_WIDTH));
         assert_eq!(TableView::from_xml(&v.to_xml()).unwrap(), v);
-        v.clear_width("Name");
-        assert_eq!(v.width("Name"), None);
     }
 
     #[test]

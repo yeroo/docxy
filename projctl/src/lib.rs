@@ -186,6 +186,46 @@ fn dt_str(dt: DateTime) -> String {
     )
 }
 
+/// The grid's sort and AutoFilter as both hosts report them (#1533):
+/// `filter` (`All Tasks`, or `AutoFilter` while a column is filtered),
+/// `filters` (`[{column, values}]`, in the order they were filtered), `sort`
+/// (`ID`, or the sorted column) and `sort_descending`.
+pub fn view_fields(ed: &Editor) -> Vec<(&'static str, Json)> {
+    let filters = ed
+        .filtered_fields()
+        .into_iter()
+        .filter_map(|field| {
+            let values = ed.filter(field)?;
+            Some(Json::obj(vec![
+                ("column", Json::Str(field.name())),
+                (
+                    "values",
+                    Json::Arr(values.iter().cloned().map(Json::Str).collect()),
+                ),
+            ]))
+        })
+        .collect();
+    vec![
+        (
+            "filter",
+            Json::Str(if ed.is_filtered() {
+                "AutoFilter".into()
+            } else {
+                "All Tasks".into()
+            }),
+        ),
+        ("filters", Json::Arr(filters)),
+        (
+            "sort",
+            Json::Str(ed.sort().map_or_else(|| "ID".into(), |s| s.field.name())),
+        ),
+        (
+            "sort_descending",
+            Json::Bool(ed.sort().is_some_and(|s| s.descending)),
+        ),
+    ]
+}
+
 pub fn path_info(path: Option<&str>, ed: &Editor) -> Json {
     Json::obj(vec![
         (
