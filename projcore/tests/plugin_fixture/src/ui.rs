@@ -16,7 +16,8 @@
 //!   renaming the first selected task to "Renamed by fixture"), and
 //!   `task-information` (the page's OK: a status with the note's length).
 //! - Overlay: a polyline with an arrowhead from the first bar's end to the
-//!   second bar's start, and a text label at the first bar.
+//!   second bar's start, a text label at the first bar, and a `selected N`
+//!   label at the selected task's bar when the request names one (#1565).
 
 use crate::json::{Json, quote};
 use crate::{OK, UNSUPPORTED_EXTENSION, YppxBuf, bytes, fail, give};
@@ -261,6 +262,29 @@ pub unsafe extern "C" fn yppx_ui_overlay(input: *const u8, len: usize, out: *mut
             r##"{{"kind":"arrow","from":[{},{yc1}],"to":[{x1},{yc1}],"color":"#000000","width":1}}"##,
             xe + 6.0
         ));
+    }
+    // The selected task's bar, when the request names one and it is shown.
+    let selected = req
+        .get("selected")
+        .map(Json::list)
+        .and_then(|l| l.first())
+        .and_then(Json::num);
+    if let Some(uid) = selected {
+        let row = req
+            .get("rows")
+            .map(Json::list)
+            .unwrap_or(&[])
+            .iter()
+            .find(|row| row.get("uid").and_then(Json::num) == Some(uid));
+        if let Some(bar) = row.and_then(|r| r.get("bar")).filter(|b| !b.is_null()) {
+            let f = |k: &str| bar.get(k).and_then(Json::num).unwrap_or(0.0);
+            shapes.push(format!(
+                r##"{{"kind":"text","x":{},"y":{},"text":"selected {}","color":"#333333","size":10}}"##,
+                f("x") + f("w") + 6.0,
+                f("y"),
+                uid as i64
+            ));
+        }
     }
     let reply = format!(r#"{{"shapes":[{}]}}"#, shapes.join(","));
     // SAFETY: the ABI's contract.
