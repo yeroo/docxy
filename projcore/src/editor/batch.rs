@@ -12,6 +12,7 @@ struct Saved {
     pending: Option<Schedule>,
     sched: Schedule,
     level: Option<Leveled>,
+    leveled: bool,
 }
 
 impl Editor {
@@ -43,6 +44,7 @@ impl Editor {
             pending: self.pending.clone(),
             sched: self.sched.clone(),
             level: self.level.clone(),
+            leveled: self.leveled,
         };
         let undo = std::mem::take(&mut self.undo);
         let redo = std::mem::take(&mut self.redo);
@@ -62,7 +64,13 @@ impl Editor {
                 Ok(value)
             }
             result => {
+                // The leveling overlay is not plan state: a batch that only
+                // switched it (a plugin's Level All, #1589) keeps the switch.
+                let leveled = result.is_ok().then_some(self.leveled);
                 self.restore(saved, undo, redo);
+                if let Some(on) = leveled {
+                    self.set_leveled(on);
+                }
                 result
             }
         }
@@ -78,6 +86,7 @@ impl Editor {
         self.pending = saved.pending;
         self.sched = saved.sched;
         self.level = saved.level;
+        self.leveled = saved.leveled;
         self.undo = undo;
         self.redo = redo;
     }
