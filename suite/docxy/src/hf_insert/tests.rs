@@ -371,6 +371,9 @@ fn typing_in_a_property_control_writes_the_property_back_1433() {
         "{}",
         body_text(&t)
     );
+    // Inserting controls is no edit of a property.
+    t.set_dirty();
+    assert!(part(&t, "docProps/core.xml").contains("<dc:title>Quarterly Report</dc:title>"));
     // Type in the header's control (the caret is at its end).
     hf_ed(&mut t).insert_char('!');
     t.set_dirty();
@@ -421,6 +424,88 @@ fn typing_in_a_property_control_writes_the_property_back_1433() {
     assert!(app.contains("<Company>AcmeX</Company>"), "{app}");
     assert!(app.contains("<Application>docxy</Application>"), "{app}");
     assert!(!part(&t, "docProps/core.xml").contains("Company"));
+}
+
+/// #1433: only an edit of a control's text writes the property. A
+/// package-only change with the caret in a Title control (Inspect
+/// Document's Remove All), a stale control beside a newer core.xml, and a
+/// formatting change leave the property alone.
+#[test]
+fn only_typing_in_a_control_writes_the_property_1433() {
+    let mut t = with_core("write-back-only", "Ann", "Quarterly Report");
+    let control = property_control(&t, BoundProp::Title);
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!()
+    };
+    ed.set_caret(docxcore::editor::Caret::at(vec![0], 0));
+    ed.anchor = None;
+    ed.paste(&Clip {
+        paras: vec![control],
+    });
+    // The caret stands in the control's text.
+    ed.set_caret(docxcore::editor::Caret::at(vec![0], 4));
+    t.set_dirty();
+    let core = |t: &DocTab| {
+        t.pkg
+            .as_ref()
+            .unwrap()
+            .part_text("docProps/core.xml")
+            .unwrap()
+    };
+    // Another tool (or Remove All) changed the property under the control.
+    let stripped = core(&t).replace("Quarterly Report", "");
+    t.pkg
+        .as_mut()
+        .unwrap()
+        .set_part_text("docProps/core.xml", &stripped);
+    t.set_dirty();
+    assert!(!core(&t).contains("Quarterly Report"), "{}", core(&t));
+    // Bold over the control's text writes nothing either.
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!()
+    };
+    ed.anchor = Some(docxcore::editor::Caret::at(vec![0], 0));
+    ed.caret = docxcore::editor::Caret::at(vec![0], 8);
+    ed.toggle_bold();
+    t.set_dirty();
+    assert!(!core(&t).contains("Quarterly Report"), "{}", core(&t));
+    // Typing does.
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!()
+    };
+    ed.anchor = None;
+    ed.set_caret(docxcore::editor::Caret::at(vec![0], 8));
+    ed.insert_char('!');
+    t.set_dirty();
+    assert!(
+        core(&t).contains("<dc:title>Quarterl!y Report</dc:title>"),
+        "{}",
+        core(&t)
+    );
+    // With a header open and its caret outside a control, a body control
+    // is not typed in.
+    let mut t = with_core("write-back-hf", "Ann", "Quarterly Report");
+    let control = property_control(&t, BoundProp::Title);
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!()
+    };
+    ed.paste(&Clip {
+        paras: vec![control],
+    });
+    t.set_dirty();
+    open_header(&mut t);
+    let newer = core(&t).replace("Quarterly Report", "New");
+    t.pkg
+        .as_mut()
+        .unwrap()
+        .set_part_text("docProps/core.xml", &newer);
+    hf_ed(&mut t).insert_str("x");
+    t.set_dirty();
+    assert!(
+        core(&t).contains("<dc:title>New</dc:title>"),
+        "{}",
+        core(&t)
+    );
 }
 
 /// A small PNG file in `dir`, `w` x `h` px.

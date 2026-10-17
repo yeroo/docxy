@@ -5034,31 +5034,27 @@ impl DocTab {
 
     /// Typing in a document property control writes the property back to
     /// `docProps/core.xml` or `app.xml` and shows it in the other controls
-    /// bound to it (#1433). The control at the caret, in the open header or
-    /// footer else the body, is the one typed in; the property is what the
-    /// package holds, so an undo or redo that puts the old text back writes
-    /// the old value, and the other controls follow with no step of their
-    /// own (`Editor::set_bound_property`). A package without the part keeps
-    /// the text in its controls only, and controls in a header or footer
-    /// that is not open are not reached.
+    /// bound to it (#1433). Only an edit of a control's text counts
+    /// (`Editor::take_bound_edit`, in the open header or footer and in the
+    /// body): a package-only change (Inspect Document's Remove All), a
+    /// formatting change or a property another tool changed writes nothing.
+    /// An undo or redo that puts the old text back writes the old value, and
+    /// the other controls follow with no step of their own
+    /// (`Editor::set_bound_property`). A package without the part keeps the
+    /// text in its controls only, and controls in a header or footer that is
+    /// not open are not reached.
     fn sync_bound_property(&mut self) {
         let (Surface::Doc(body), Some(pkg)) = (&mut self.surface, self.pkg.as_mut()) else {
             return;
         };
-        let typed = match &self.hf_edit {
-            Some(h) => h.editor.bound_property_at_caret(),
-            None => None,
-        }
-        .or_else(|| body.bound_property_at_caret());
-        let Some((prop, text)) = typed else {
+        let from_body = body.take_bound_edit();
+        let from_hf = self
+            .hf_edit
+            .as_mut()
+            .and_then(|h| h.editor.take_bound_edit());
+        let Some((prop, text)) = from_hf.or(from_body) else {
             return;
         };
-        let part = |name: &str| pkg.part_text(name).unwrap_or_default();
-        let props =
-            docxcore::field::parse_app_props(&part("docProps/core.xml"), &part("docProps/app.xml"));
-        if prop.value(&props) == text {
-            return;
-        }
         let Some(xml) = pkg.part_text(prop.part_name()) else {
             return;
         };

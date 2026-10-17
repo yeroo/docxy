@@ -503,6 +503,25 @@ pub struct Editor {
     /// A [`Editor::preview_copy`]: its edits keep no history and issue no
     /// undo serial, which hosts read as "an edit happened" (#764).
     display_only: bool,
+    /// The document property controls' texts as the host last saw them
+    /// ([`Editor::take_bound_edit`]).
+    bound_seen: Vec<(crate::sdt::BoundProp, String)>,
+}
+
+/// Every document property control in `body` in document order, with the
+/// text it holds.
+fn bound_controls(body: &[Block]) -> Vec<(crate::sdt::BoundProp, String)> {
+    let mut out = Vec::new();
+    for path in all_paragraph_paths(body) {
+        if let Some(p) = resolve_para(body, &path) {
+            out.extend(
+                crate::sdt::scan_paragraph(&p.content)
+                    .into_iter()
+                    .map(|c| (c.prop, c.text)),
+            );
+        }
+    }
+    out
 }
 
 /// Whether `lo` and `hi` sit in different containers (a body paragraph and
@@ -517,7 +536,9 @@ impl Editor {
     pub fn new(mut doc: Document) -> Self {
         doc.initialize_revision_targets();
         let path = first_paragraph_path(&doc.body).unwrap_or_else(|| vec![0]);
+        let bound_seen = bound_controls(&doc.body);
         Editor {
+            bound_seen,
             doc,
             caret: Caret { path, offset: 0 },
             anchor: None,
@@ -561,6 +582,7 @@ impl Editor {
             after_object: self.after_object.clone(),
             settings: self.settings,
             display_only: true,
+            bound_seen: self.bound_seen.clone(),
         }
     }
 
@@ -1840,15 +1862,22 @@ impl Editor {
         out
     }
 
-    /// The document property control the caret is in (or at the end of) and
-    /// the text it holds (#1433): what a host compares with the property to
-    /// see that typing changed it.
-    pub fn bound_property_at_caret(&self) -> Option<(crate::sdt::BoundProp, String)> {
-        let para = resolve_para(&self.doc.body, &self.caret.path)?;
-        crate::sdt::scan_paragraph(&para.content)
-            .into_iter()
-            .find(|c| c.start <= self.caret.offset && self.caret.offset <= c.end)
-            .map(|c| (c.prop, c.text))
+    /// The document property a control's text was edited into since the host
+    /// last asked (#1433): the first control whose text differs from the one
+    /// it had then, with the new text. An edit, an undo or a redo of typing in
+    /// a control is that; a formatting change, a package-only change or a
+    /// control inserted or removed (the count changed) is not. The host
+    /// writes the property and calls [`Editor::set_bound_property`].
+    pub fn take_bound_edit(&mut self) -> Option<(crate::sdt::BoundProp, String)> {
+        let now = bound_controls(&self.doc.body);
+        let was = std::mem::replace(&mut self.bound_seen, now);
+        if was.len() != self.bound_seen.len() {
+            return None;
+        }
+        was.iter()
+            .zip(&self.bound_seen)
+            .find(|(a, b)| a != b)
+            .map(|(_, b)| b.clone())
     }
 
     /// Show `text` in every document property control bound to `prop`
@@ -1878,6 +1907,7 @@ impl Editor {
         }
         if changed {
             self.clamp();
+            self.bound_seen = bound_controls(&self.doc.body);
         }
         changed
     }
@@ -1903,8 +1933,9 @@ impl Editor {
     /// an equation is one offset (#1242): the clip carries it, so it goes.
     /// While tracking, a picture is recorded as deleted and an equation
     /// stays (a `w:del` cannot hold it whole), which the cut's clip then
-    /// leaves out. Paragraphs wholly inside the selection still go whole,
-    /// their objects with them. A host that cuts through its own plain-text
+    /// leaves out. Paragraphs wholly inside the selection still go whole;
+    /// the zero-width objects of those in the middle of a multi-paragraph cut
+    /// are kept at the seam (#1433). A host that cuts through its own plain-text
     /// copy calls [`Editor::cut_text`].
     pub fn delete_selection_keeping_objects(&mut self) -> bool {
         self.delete_selection_with(false, false)
@@ -4325,7 +4356,7 @@ fn drop_spanned_objects(
 
 /// The `content` indices of the drawing and positional-tab runs the delete
 /// spans; [`drop_spanned_objects`] removes them and a tracked delete records
-/// them (`Editor::record_spanned_objects`).
+/// them (`Editor::drop_or_record_objects`).
 pub(crate) fn spanned_object_indices(
     content: &[Inline],
     lo: usize,

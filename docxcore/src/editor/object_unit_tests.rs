@@ -870,32 +870,28 @@ fn typing_in_a_property_control_updates_the_others_1433() {
         }),
     ];
     let mut ed = Editor::new(Document { body });
-    // The caret at the end of "Old" in the first control: seen, unchanged.
+    // Nothing was edited yet; a caret move or a formatting change is no edit.
     ed.set_caret(Caret::at(vec![0], 6));
-    assert_eq!(
-        ed.bound_property_at_caret(),
-        Some((BoundProp::Title, "Old".into()))
-    );
+    assert_eq!(ed.take_bound_edit(), None);
+    // Typing at the end of the control's text extends it.
     ed.insert_char('!');
     assert_eq!(
-        ed.bound_property_at_caret(),
+        ed.take_bound_edit(),
         Some((BoundProp::Title, "Old!".into()))
     );
+    assert_eq!(ed.take_bound_edit(), None);
     // The other control, in another paragraph, takes the text.
     assert!(ed.set_bound_property(BoundProp::Title, "Old!"));
     let text = |ed: &Editor, i: usize| para(ed, i).plain_text();
     assert_eq!(text(&ed, 1), "Old! end");
     assert!(!ed.set_bound_property(BoundProp::Title, "Old!"));
+    assert_eq!(ed.take_bound_edit(), None, "the sync is not an edit");
     // Undoing the typing puts both back: the other control's change had no
-    // step of its own. The caret's control then reads as the old value, which
-    // is what the host writes back to the property.
+    // step of its own. The host sees the old text as the edit.
     assert!(ed.undo());
     assert_eq!(text(&ed, 0), "T: Old");
     assert_eq!(text(&ed, 1), "Old end");
-    assert_eq!(
-        ed.bound_property_at_caret().map(|(_, t)| t),
-        Some("Old".into())
-    );
+    assert_eq!(ed.take_bound_edit(), Some((BoundProp::Title, "Old".into())));
     // An emptied property shows the placeholder, flagged, and a value
     // clears the flag again.
     ed.set_bound_property(BoundProp::Title, "");
@@ -906,4 +902,28 @@ fn typing_in_a_property_control_updates_the_others_1433() {
     assert!(!saved(&ed).contains("<w:showingPlcHdr/>"));
     // A control of another property is left alone.
     assert!(!ed.set_bound_property(BoundProp::Author, "Ann"));
+}
+
+/// #1433: a control inserted, or a change that leaves every control's text
+/// alone, is not an edit of a property.
+#[test]
+fn only_a_changed_control_text_is_a_bound_edit_1433() {
+    use crate::sdt::{BoundProp, core_property_control};
+    let control = core_property_control(BoundProp::Title, "Old", 1, &RunProps::default());
+    let mut ed = Editor::new(Document {
+        body: vec![Block::Paragraph(Paragraph {
+            props: ParProps::default(),
+            content: control,
+        })],
+    });
+    // Bold over the control's text: no edit.
+    ed.anchor = Some(Caret::at(vec![0], 0));
+    ed.caret = Caret::at(vec![0], 3);
+    ed.toggle_bold();
+    assert_eq!(ed.take_bound_edit(), None);
+    // A second control pasted in: the count changed, not an edit.
+    ed.set_caret(Caret::at(vec![0], 3));
+    let other = core_property_control(BoundProp::Title, "Old", 2, &RunProps::default());
+    ed.insert_object(other);
+    assert_eq!(ed.take_bound_edit(), None);
 }

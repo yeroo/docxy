@@ -204,7 +204,7 @@ pub fn scan_paragraph(content: &[Inline]) -> Vec<ParaControl> {
         match inline {
             Inline::Raw(raw) if open.is_none() && raw.ends_with("<w:sdtContent>") => {
                 if let Some(prop) = binding_of(raw) {
-                    open = Some((k, at, prop, raw.contains("<w:showingPlcHdr")));
+                    open = Some((k, at, prop, crate::sect::has_flag(raw, "w:showingPlcHdr")));
                     text.clear();
                 }
             }
@@ -262,12 +262,14 @@ pub fn set_control_text(content: &mut Vec<Inline>, c: &ParaControl, text: &str) 
         text.to_string()
     };
     if let Inline::Raw(open) = &mut content[c.open] {
-        let flag = "<w:showingPlcHdr/>";
-        if text.is_empty() && !open.contains(flag) {
-            *open = open.replacen("<w:dataBinding", &format!("{flag}<w:dataBinding"), 1);
-        } else if !text.is_empty() {
-            *open = open.replace(flag, "");
-        }
+        // The flag as the file has it (`w:val` and all) goes; an empty
+        // control gets Word's bare one back.
+        let bare = crate::sect::remove_element(open, "w:showingPlcHdr");
+        *open = if text.is_empty() {
+            bare.replacen("<w:dataBinding", "<w:showingPlcHdr/><w:dataBinding", 1)
+        } else {
+            bare
+        };
     }
     content.splice(
         c.open + 1..c.close,
@@ -521,5 +523,49 @@ mod tests {
             "<Properties><CompanyX>no</CompanyX><Company>Acme</Company></Properties>"
         );
         assert_eq!(BoundProp::Company.write("", "x"), None);
+    }
+
+    #[test]
+    fn the_placeholder_flag_is_read_by_its_value_1433() {
+        let open = |flag: &str| {
+            Inline::Raw(format!(
+                "<w:sdt><w:sdtPr><w:alias w:val=\"Title\"/>{flag}<w:dataBinding \
+                 w:prefixMappings=\"xmlns:ns0='http://purl.org/dc/elements/1.1/' \
+                 xmlns:ns1='http://schemas.openxmlformats.org/package/2006/metadata/core-properties'\" \
+                 w:xpath=\"/ns1:coreProperties[1]/ns0:title[1]\" \
+                 w:storeItemID=\"{CORE_STORE_ID}\"/></w:sdtPr><w:sdtContent>"
+            ))
+        };
+        let control = |flag: &str| {
+            vec![
+                open(flag),
+                Inline::Run(Run {
+                    text: "[Title]".into(),
+                    props: RunProps::default(),
+                }),
+                Inline::Raw(crate::load::SDT_BLOCK_CLOSE.to_string()),
+            ]
+        };
+        // `w:val="0"` is off: the text is a value, not a placeholder.
+        let off = scan_paragraph(&control("<w:showingPlcHdr w:val=\"0\"/>"));
+        assert!(!off[0].placeholder);
+        assert_eq!(off[0].text, "[Title]");
+        let on = scan_paragraph(&control("<w:showingPlcHdr w:val=\"1\"/>"));
+        assert!(on[0].placeholder);
+        assert_eq!(on[0].text, "");
+        // Writing text drops the flag whatever its spelling; writing none
+        // leaves exactly one bare flag.
+        for flag in ["<w:showingPlcHdr w:val=\"1\"/>", "<w:showingPlcHdr/>", ""] {
+            let mut c = control(flag);
+            let found = scan_paragraph(&c).remove(0);
+            assert!(set_control_text(&mut c, &found, "Hello"));
+            let Inline::Raw(o) = &c[0] else { panic!() };
+            assert!(!o.contains("showingPlcHdr"), "{o}");
+            let found = scan_paragraph(&c).remove(0);
+            assert!(set_control_text(&mut c, &found, ""));
+            let Inline::Raw(o) = &c[0] else { panic!() };
+            assert_eq!(o.matches("<w:showingPlcHdr/>").count(), 1, "{o}");
+            assert_eq!(o.matches("showingPlcHdr").count(), 1, "{o}");
+        }
     }
 }

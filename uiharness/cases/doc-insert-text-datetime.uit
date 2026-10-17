@@ -15,14 +15,15 @@ test the Insert Text group lists Date & Time and Quick Parts
 
 test Date & Time on the Insert tab inserts into the body
   open copy:../fixtures/basic.docx
-  type ab
+  assert dirty is false
+  assert caret.offset is 0
   call ribbon-click {"tab":"Insert","command":"hf-datetime"}
   assert dialog is hf-date-time
   call dialog-click {"button":"OK"}
   assert dialog is none
   assert hf_edit is false
   assert dirty is true
-  assert caret.offset is not 2
+  assert caret.offset is not 0
 
 test alt+shift+d and alt+shift+t insert a date and a time field
   open copy:../fixtures/basic.docx
