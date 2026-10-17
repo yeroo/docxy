@@ -419,8 +419,9 @@ fn stepping_from_the_hidden_summary_lands_on_the_first_shown_row() {
 #[test]
 fn hide_subtasks_does_not_take_the_hidden_summary_as_a_parent() {
     let mut ed = with_summary();
-    assert!(
-        ed.hide_subtasks(1).is_err(),
+    assert_eq!(
+        ed.hide_subtasks(1),
+        Err("The task has no subtasks to hide".into()),
         "A has no parent but the summary"
     );
     assert_eq!(ed.hide_subtasks(3), Ok(2), "S1 collapses S");
@@ -434,4 +435,14 @@ fn a_childless_uid_0_row_is_no_summary_and_stays_shown() {
     assert!(!ed.project().tasks[0].is_project_summary());
     assert_eq!(ed.visible_rows(), [0]);
     assert_eq!(ed.sel(), 0);
+}
+
+#[test]
+fn replace_project_starts_below_a_uid_0_row_whose_summary_flag_is_recomputed() {
+    let mut proj = with_summary().project().clone();
+    proj.tasks[0].summary = false;
+    let mut ed = outline(&[(1, "X", 1)]);
+    ed.replace_project(proj);
+    assert!(ed.project().tasks[0].is_project_summary());
+    assert_eq!(ed.sel(), 1);
 }

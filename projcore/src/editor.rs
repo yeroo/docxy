@@ -216,13 +216,14 @@ impl Editor {
         self.sel = 0;
         self.sel_pinned = false;
         self.collapsed.clear();
-        self.sel_off_hidden_summary();
-        self.sel_uid = self.selected_uid();
         self.undo.clear();
         self.redo.clear();
         self.dirty = false;
         self.pending = None;
         self.reschedule();
+        // After the summaries are recomputed: only then is UID 0 a summary.
+        self.sel_off_hidden_summary();
+        self.sel_uid = self.selected_uid();
     }
 
     pub fn project(&self) -> &Project {
