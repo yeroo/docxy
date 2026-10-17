@@ -313,8 +313,16 @@ impl Editor {
 
     pub fn toggle_level(&mut self) {
         self.pending = None;
+        self.capture_view();
         self.leveled = !self.leveled;
         self.reschedule();
+        // Leveled dates are what a Start or Finish filter reads, so the
+        // toggle can move the selected task out of the checked values.
+        self.revision += 1;
+        if !self.sel_pinned && !self.filters.is_empty() {
+            self.sel_into_display();
+        }
+        self.pre_view = None;
     }
 
     pub fn disp_start(&self, uid: i32) -> Option<DateTime> {

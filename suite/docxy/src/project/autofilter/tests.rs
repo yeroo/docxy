@@ -636,3 +636,93 @@ fn find_under_a_filter_only_finds_drawn_rows() {
     let ed = &v(&t).ed;
     assert!(ed.display_rows().contains(&ed.sel()));
 }
+
+fn rename_and_press(t: &mut DocTab, index: usize, key: &str, shift: bool) {
+    vm(t).ed.select(index);
+    vm(t).col = COL_NAME;
+    vm(t).open_cell(Some("Zed")).unwrap();
+    project_cell_input(
+        t,
+        key,
+        None,
+        Modifiers {
+            shift,
+            ..Modifiers::default()
+        },
+    );
+}
+
+#[test]
+fn a_trailing_blank_row_does_not_count_as_a_row_that_followed() {
+    for (key, shift) in [("enter", false), ("enter", true)] {
+        let mut t = five();
+        // A blank row after E, which no filter hides.
+        let Surface::Project(pv) = &mut t.surface else {
+            panic!()
+        };
+        pv.ed.insert_blank_row(None).unwrap();
+        filter_names(&mut t, &[1, 2, 3]); // A, B, C
+        assert_eq!(names(&t), ["A", "B", "C", ""]);
+        rename_and_press(&mut t, 2, key, shift);
+        let ed = &v(&t).ed;
+        if shift {
+            assert_eq!(ed.project().tasks[ed.sel()].name, "B", "up from C, once");
+            assert!(!v(&t).on_entry_row());
+        } else {
+            assert!(v(&t).on_entry_row(), "no drawn task followed C");
+        }
+    }
+}
+
+#[test]
+fn a_task_hidden_by_the_same_edit_does_not_count_as_a_row_that_followed() {
+    use projcore::Predecessor;
+    let task = |uid: i32, name: &str, days: i64, pred: Option<i32>| Task {
+        uid,
+        id: uid,
+        name: name.into(),
+        outline_level: 1,
+        duration_min: days * 480,
+        predecessors: pred.map(Predecessor::fs).into_iter().collect(),
+        ..Task::default()
+    };
+    // D finishes 1/6; A 1/5, B (after A) 1/6, C (after B) 1/7.
+    let project = Project {
+        start_date: Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0)),
+        tasks: vec![
+            task(4, "D", 2, None),
+            task(1, "A", 1, None),
+            task(2, "B", 1, Some(1)),
+            task(3, "C", 1, Some(2)),
+        ],
+        ..Project::default()
+    };
+    for (key, shift) in [("enter", false), ("enter", true)] {
+        let mut t = new_project_tab("Project1");
+        t.surface = Surface::Project(ProjectView::new(project.clone(), false));
+        let wanted = BTreeSet::from(["Tue 1/6/26".to_string(), "Wed 1/7/26".to_string()]);
+        vm(&mut t).ed.set_filter(Field::Finish, Some(wanted));
+        assert_eq!(names(&t), ["D", "B", "C"]);
+        // Lengthen B: it and C (its successor) both leave the view.
+        vm(&mut t).ed.select(2);
+        vm(&mut t).col = COL_DURATION;
+        vm(&mut t).open_cell(Some("5d")).unwrap();
+        project_cell_input(
+            &mut t,
+            key,
+            None,
+            Modifiers {
+                shift,
+                ..Modifiers::default()
+            },
+        );
+        assert_eq!(names(&t), ["D"]);
+        if shift {
+            let ed = &v(&t).ed;
+            assert_eq!(ed.project().tasks[ed.sel()].name, "D");
+            assert!(!v(&t).on_entry_row());
+        } else {
+            assert!(v(&t).on_entry_row(), "C went with B: none followed");
+        }
+    }
+}

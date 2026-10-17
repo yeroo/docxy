@@ -933,18 +933,17 @@ pub(crate) fn project_cell_input(tab: &mut DocTab, key: &str, text: Option<&str>
             Surface::Project(v) => v.cell.as_ref().and_then(|c| c.uid),
             _ => None,
         };
-        // Whether a drawn row follows the edited one: if the commit hides it,
-        // the cursor lands on that row, else on the one before.
-        let followed = match &tab.surface {
-            Surface::Project(v) => edited.is_some_and(|uid| {
-                let rows = v.ed.display_rows();
+        // The rows drawn before the commit and the edited row's place in
+        // them: after a commit that hides it, where the cursor landed says
+        // whether a drawn row took its place (a later one) or none did.
+        let before: Vec<i32> = match &tab.surface {
+            Surface::Project(v) if edited.is_some() => {
                 let tasks = &v.ed.project().tasks;
-                rows.iter()
-                    .position(|&i| tasks[i].uid == uid)
-                    .is_some_and(|at| at + 1 < rows.len())
-            }),
-            _ => false,
+                v.ed.display_rows().iter().map(|&i| tasks[i].uid).collect()
+            }
+            _ => Vec::new(),
         };
+        let at = edited.and_then(|uid| before.iter().position(|&u| u == uid));
         if commit_project_cell(tab) {
             if let Surface::Project(v) = &mut tab.surface {
                 // The commit may have hidden the edited task (a filter).
@@ -953,13 +952,19 @@ pub(crate) fn project_cell_input(tab: &mut DocTab, key: &str, text: Option<&str>
                     !v.ed.display_rows().iter().any(|&i| tasks[i].uid == uid)
                 });
                 let moves_up = key == "up" || (key == "enter" && m.shift);
+                let followed = at.is_some_and(|at| {
+                    v.ed.selected_uid()
+                        .and_then(|uid| before.iter().position(|&u| u == uid))
+                        .is_some_and(|now| now > at)
+                });
                 if was_entry && (key == "down" || (key == "enter" && !m.shift)) {
                     v.enter_entry_row();
                 } else if hid_it {
-                    // The cursor is on the row that took its place, or on the
-                    // one before when none followed: a move that row already
-                    // made is skipped, and down from the last row drawn
-                    // leaves the table for the entry row.
+                    // The cursor is on the drawn row that took its place, or
+                    // on the one before when none did (blank rows and rows
+                    // the same edit hid do not count): a move that row
+                    // already made is skipped, and down from the last row
+                    // drawn leaves the table for the entry row.
                     let down = key == "down" || (key == "enter" && !m.shift);
                     if down && !followed {
                         v.enter_entry_row();

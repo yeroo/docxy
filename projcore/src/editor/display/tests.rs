@@ -494,3 +494,38 @@ fn delete_goes_to_the_row_drawn_after_even_when_a_summary_drops_out() {
     assert_eq!(names(&ed), ["P", "Y", "Z"]);
     assert_eq!(ed.project().tasks[ed.sel()].name, "Y", "not Z");
 }
+
+#[test]
+fn toggling_leveling_bumps_the_revision_and_keeps_the_selection_displayed() {
+    // A resource-free plan levels to nothing, so this pins the bookkeeping
+    // (revision, the invariant), not a date that actually moves.
+    use crate::Predecessor;
+    let task = |uid: i32, name: &str, pred: Option<i32>| Task {
+        uid,
+        id: uid,
+        name: name.into(),
+        outline_level: 1,
+        duration_min: 480,
+        predecessors: pred.map(Predecessor::fs).into_iter().collect(),
+        ..Task::default()
+    };
+    let mut ed = Editor::new(Project {
+        start_date: Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0)),
+        tasks: vec![
+            task(1, "A", None),
+            task(2, "B", Some(1)),
+            task(3, "C", Some(2)),
+        ],
+        ..Project::default()
+    });
+    let starts = ed.column_values(Field::Start);
+    let all: BTreeSet<String> = starts.iter().map(|v| v.text.clone()).collect();
+    ed.set_filter(Field::Start, Some(all));
+    ed.select(1);
+    let rev = ed.revision();
+    ed.toggle_level();
+    assert!(ed.revision() > rev, "the displayed rows may have changed");
+    assert!(ed.display_rows().contains(&ed.sel()));
+    ed.toggle_level();
+    assert!(ed.display_rows().contains(&ed.sel()));
+}

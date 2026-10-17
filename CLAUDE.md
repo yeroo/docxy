@@ -495,12 +495,21 @@
   sort first"); filtered, they act normally. Paste, fill and range selection
   walk the displayed rows.
   One invariant keeps the cursor honest: after any operation the selection is
-  a displayed task (`Editor::sel_into_display`, run by `changed()`, takes the
-  next displayed row after it in the unfiltered order, else the one before;
-  `select_shown` is the post-edit select), and the suite's cursor is the entry
-  row when nothing is displayed or an edit's new task is hidden
-  (`ProjectView::place_cursor`, `complete_project`). Find and Delete walk the
-  drawn rows; yppxy's actions go through `shown_selected_uid`.
+  a displayed task. `snapshot()`/`edit_structure()` capture the drawn rows
+  (uids) before an edit (`Editor::pre_view`); `sel_into_display`, run by
+  `changed()` and `toggle_level`, then takes the row drawn after the selection
+  there that is still drawn, else the one before, by uid, so an edit that
+  re-sorts the task cannot move the cursor to its new neighbours. With no
+  capture (a filter just set, undo/redo) it takes the next displayed row in the
+  sorted, unfiltered order. Delete uses the same rule (`reselect_near`), so a
+  summary shown only through the deleted task drops out cleanly.
+  `select_shown` is the post-edit select. The suite's cursor is the entry row
+  when nothing is displayed or an edit's new task is hidden
+  (`ProjectView::place_cursor`, `complete_project`); after a commit that hides
+  the edited row, Enter/Tab keep the cursor where it landed, or go to the entry
+  row when no drawn task took the row's place (`project_cell_input` compares
+  the landing row with the pre-commit list). Find and Delete walk the drawn
+  rows; yppxy's actions go through `shown_selected_uid`.
 - The suite's drop-down is a dialog like the sheet's filter button
   (`project-filter-menu`, `DialogOwner::ProjectFilter`, `project/autofilter.rs`),
   not a `MenuTarget`: Sort items (words by column type) apply and close, Group
