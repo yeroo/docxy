@@ -1946,7 +1946,9 @@ python3 scripts/ui-linux-sweep.py                                # every script
 python3 scripts/ui-linux-sweep.py uiharness/cases/doc-state.uit  # just these
 ```
 
-It runs `scripts/ui-linux.py -- uiharness run <script>` per script with
+It runs `scripts/ui-linux.py -- uiharness run <script>` per script (on
+Windows, `uiharness --desktop sweep-<stem> run <script>` with no Xvfb, so no
+`x11/` logs: each suite starts on a Win32 desktop of its own) with
 absolute `--suite`, script and `--run` paths, prints a line per script as it
 finishes and a table at the end, and exits non-zero unless every script is
 `PASS` or `XFAIL`. `--suite` and `--uiharness` default to the release builds;
@@ -1989,7 +1991,9 @@ are run.
 
 CI's `ui sweep (linux)` job runs the sweep on `ubuntu-latest` after release
 builds, and uploads the run directory as the `ui-sweep-linux` artifact when
-it fails.
+it fails. The `ui sweep (windows)` job runs the same script on
+`windows-latest` and uploads `ui-sweep-windows`; it is `continue-on-error`
+until a Windows baseline exists (the expected-failures list is the Linux one).
 
 ### Capture on macOS
 

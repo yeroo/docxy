@@ -36,7 +36,7 @@ impl Instance {
 
     /// Whether the server is currently accepting connections.
     pub fn is_live(&self) -> bool {
-        TcpStream::connect_timeout(&self.addr(), Duration::from_millis(200)).is_ok()
+        self.probe().is_some()
     }
 
     /// A client bound to this instance.
@@ -44,6 +44,39 @@ impl Instance {
         Client {
             instance: self.clone(),
             conn: Mutex::new(None),
+        }
+    }
+
+    /// Open a connection, giving up after `timeout`.
+    fn open(&self, timeout: Duration) -> Result<Conn, String> {
+        let stream = TcpStream::connect_timeout(&self.addr(), timeout)
+            .map_err(|e| format!("connect failed: {e}"))?;
+        stream.set_read_timeout(Some(READ_TIMEOUT)).ok();
+        let reader = BufReader::new(
+            stream
+                .try_clone()
+                .map_err(|e| format!("connect failed: {e}"))?,
+        );
+        Ok(Conn {
+            reader,
+            writer: stream,
+            token: self.token.clone(),
+        })
+    }
+
+    /// The liveness probe: a connection when the server accepts one, which a
+    /// caller that goes on to talk to it keeps (a probe it drops costs a
+    /// TIME_WAIT port on Windows).
+    fn probe(&self) -> Option<Conn> {
+        self.open(Duration::from_millis(200)).ok()
+    }
+
+    /// A client whose first call uses `conn`, a connection to this instance
+    /// from [`probe`](Instance::probe).
+    fn client_with(&self, conn: Conn) -> Client {
+        Client {
+            instance: self.clone(),
+            conn: Mutex::new(Some(conn)),
         }
     }
 }
@@ -87,13 +120,14 @@ pub fn discover_live(dir: &Path) -> Vec<Instance> {
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A request/response client. Its [`call`](Client::call)s share one
-/// connection, opened on the first call and kept for as long as the `Client`
-/// lives: one connection per call left a client port in TIME_WAIT per verb,
+/// connection, opened on the first call (unless the client was primed with the
+/// connection of the liveness probe that found it) and kept for as long as the
+/// `Client` lives: one connection per call left a client port in TIME_WAIT per verb,
 /// and a UI harness sweep ran Windows' ephemeral ports out (#1234).
 pub struct Client {
     instance: Instance,
-    /// The cached connection; `None` before the first call and after a
-    /// transport failure. The lock also keeps one request in flight at a time.
+    /// The cached connection; `None` for an unprimed client before its first
+    /// call, and after a transport failure. The lock also keeps one request in flight at a time.
     conn: Mutex<Option<Conn>>,
 }
 
@@ -132,19 +166,7 @@ impl Client {
     /// on its own (the UI harness polling a terminal editor's counters,
     /// #1204).
     pub fn connect(&self) -> Result<Conn, String> {
-        let stream = TcpStream::connect_timeout(&self.instance.addr(), Duration::from_millis(500))
-            .map_err(|e| format!("connect failed: {e}"))?;
-        stream.set_read_timeout(Some(READ_TIMEOUT)).ok();
-        let reader = BufReader::new(
-            stream
-                .try_clone()
-                .map_err(|e| format!("connect failed: {e}"))?,
-        );
-        Ok(Conn {
-            reader,
-            writer: stream,
-            token: self.instance.token.clone(),
-        })
+        self.instance.open(Duration::from_millis(500))
     }
 }
 
@@ -211,17 +233,22 @@ pub struct Source<'a> {
     pub app: &'a str,
 }
 
-fn candidates<'a>(sources: &[Source<'a>]) -> Vec<(Instance, &'a str)> {
+/// The live instances of `sources` with the connection each probe made, so
+/// the one chosen is not connected to a second time.
+fn candidates<'a>(sources: &[Source<'a>]) -> Vec<(Instance, &'a str, Conn)> {
     let mut found = Vec::new();
     for source in sources {
         let prefix = format!("{}-", source.app);
         for instance in discover(source.dir) {
-            if instance.instance.starts_with(&prefix) && instance.is_live() {
-                found.push((instance, source.app));
+            if !instance.instance.starts_with(&prefix) {
+                continue;
+            }
+            if let Some(conn) = instance.probe() {
+                found.push((instance, source.app, conn));
             }
         }
     }
-    found.sort_by(|(a, _), (b, _)| a.instance.cmp(&b.instance));
+    found.sort_by(|(a, ..), (b, ..)| a.instance.cmp(&b.instance));
     found
 }
 
@@ -230,7 +257,7 @@ fn candidates<'a>(sources: &[Source<'a>]) -> Vec<(Instance, &'a str)> {
 pub fn list_running_in(sources: &[Source<'_>]) -> Json {
     let running = candidates(sources)
         .into_iter()
-        .map(|(i, app)| {
+        .map(|(i, app, _)| {
             Json::obj(vec![
                 ("instance", Json::Str(i.instance)),
                 ("port", Json::Num(i.port as f64)),
@@ -255,7 +282,7 @@ pub fn resolve_target_in<'a>(
 ) -> Result<(Client, &'a str), String> {
     let mut live = candidates(sources);
     if let Some(target) = target {
-        live.retain(|(i, _)| i.instance.contains(target));
+        live.retain(|(i, ..)| i.instance.contains(target));
     }
     let apps = sources.iter().map(|s| s.app).collect::<Vec<_>>().join("/");
     match live.len() {
@@ -263,13 +290,13 @@ pub fn resolve_target_in<'a>(
             "no running {apps} found — open a document in a {apps} pane first"
         )),
         1 => {
-            let (instance, app) = live.remove(0);
-            Ok((instance.client(), app))
+            let (instance, app, conn) = live.remove(0);
+            Ok((instance.client_with(conn), app))
         }
         _ => {
             let names = live
                 .iter()
-                .map(|(i, _)| i.instance.as_str())
+                .map(|(i, ..)| i.instance.as_str())
                 .collect::<Vec<_>>();
             Err(format!(
                 "several {apps} instances are running ({}); pass \"target\" with a distinguishing substring (e.g. the pane id)",
@@ -293,22 +320,21 @@ pub fn resolve_target_for_new(
     app: &str,
     target: Option<&str>,
 ) -> Result<Option<Client>, String> {
-    let prefix = format!("{app}-");
-    let mut live: Vec<_> = discover_live(dir)
-        .into_iter()
-        .filter(|i| i.instance.starts_with(&prefix))
-        .collect();
+    let mut live = candidates(&[Source { dir, app }]);
     if let Some(target) = target {
-        live.retain(|i| i.instance.contains(target));
+        live.retain(|(i, ..)| i.instance.contains(target));
         if live.is_empty() {
             return Err(format!("no running {app} matches target \"{target}\""));
         }
     }
     match live.len() {
         0 => Ok(None),
-        1 => Ok(Some(live.remove(0).client())),
+        1 => {
+            let (instance, _, conn) = live.remove(0);
+            Ok(Some(instance.client_with(conn)))
+        }
         _ => {
-            let names: Vec<&str> = live.iter().map(|i| i.instance.as_str()).collect();
+            let names: Vec<&str> = live.iter().map(|(i, ..)| i.instance.as_str()).collect();
             Err(format!(
                 "several {app} instances are running ({}); pass \"target\" with a distinguishing substring (e.g. the pane id)",
                 names.join(", ")
@@ -436,6 +462,53 @@ mod tests {
         std::fs::remove_dir(a).unwrap();
         std::fs::remove_dir(b).unwrap();
         std::fs::remove_dir(root).unwrap();
+    }
+
+    /// A resolved client's first call rides the connection the liveness probe
+    /// made, so resolving and calling costs one connection (#1405).
+    #[test]
+    fn a_resolved_client_reuses_the_probe_connection() {
+        let dir = std::env::temp_dir().join(format!("ctlcore_prime_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("docxy-prime.json"),
+            format!(r#"{{"instance":"docxy-prime","port":{port},"token":"t","pid":1}}"#),
+        )
+        .unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                count.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut writer = stream;
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                        line.clear();
+                        let _ = writer.write_all(b"{\"ok\":true,\"result\":1}\n");
+                    }
+                });
+            }
+        });
+        let sources = [Source {
+            dir: &dir,
+            app: "docxy",
+        }];
+        let (client, _) = resolve_target_in(&sources, None).unwrap();
+        assert_eq!(client.call("v", Json::Null).unwrap().as_f64(), Some(1.0));
+        assert_eq!(client.call("v", Json::Null).unwrap().as_f64(), Some(1.0));
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        let client = resolve_target_for_new(&dir, "docxy", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(client.call("v", Json::Null).unwrap().as_f64(), Some(1.0));
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// One connection answers many calls, in order (#1204).

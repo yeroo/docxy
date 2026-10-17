@@ -236,5 +236,38 @@ class Table(unittest.TestCase):
         self.assertTrue(text.endswith('3 scripts: 1 pass, 1 xfail, 0 fail, 0 xpass, 1 error\n'))
 
 
+class ScriptCommandTests(unittest.TestCase):
+    ARGS = (Path('/c/doc-state.uit'), Path('/b/uiharness'), Path('/b/suite'),
+            Path('/b'), Path('/r/doc-state'))
+
+    def test_linux_runs_under_the_xvfb_wrapper(self):
+        cmd = sweep.script_command('linux', *self.ARGS)
+        self.assertEqual(cmd[1], str(sweep.UI_LINUX))
+        self.assertEqual(cmd[2:5], ['--logs', str(Path('/r/doc-state/x11')), '--'])
+        self.assertEqual(cmd[5:8], [str(Path('/b/uiharness')), 'run', str(Path('/c/doc-state.uit'))])
+        self.assertNotIn('--desktop', cmd)
+
+    def test_windows_runs_on_its_own_desktop_without_a_wrapper(self):
+        cmd = sweep.script_command('win32', *self.ARGS)
+        self.assertEqual(cmd[:4], [str(Path('/b/uiharness')), '--desktop', 'sweep-doc-state', 'run'])
+        self.assertNotIn(str(sweep.UI_LINUX), cmd)
+        self.assertEqual(cmd[-2:], ['--run', str(Path('/r/doc-state/harness'))])
+
+
+class KillTreeTests(unittest.TestCase):
+    class Proc:
+        pid = 4242
+
+    def test_windows_kills_the_process_tree(self):
+        calls = []
+        sweep.kill_tree(self.Proc(), 'win32', lambda cmd, **kw: calls.append(cmd))
+        self.assertEqual(calls, [['taskkill', '/T', '/F', '/PID', '4242']])
+
+    def test_linux_runs_nothing(self):
+        calls = []
+        sweep.kill_tree(self.Proc(), 'linux', lambda cmd, **kw: calls.append(cmd))
+        self.assertEqual(calls, [])
+
+
 if __name__ == '__main__':
     unittest.main()

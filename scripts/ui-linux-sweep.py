@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Run every uiharness case script on Linux, each in a fresh suite instance.
+"""Run every uiharness case script on Linux or Windows, each in a fresh suite instance.
 
-Each script gets its own private Xvfb + Openbox display (scripts/ui-linux.py)
-and its own `uiharness run`, so no script inherits another's tabs or view
+On Linux each script gets its own private Xvfb + Openbox display
+(scripts/ui-linux.py); on Windows no wrapper, and `uiharness --desktop
+sweep-<stem>` starts the suite on a Win32 desktop of its own (no x11/ logs).
+Each has its own `uiharness run`, so no script inherits another's tabs or view
 settings. Results are checked against uiharness/cases/expected-failures.txt:
 the run fails on a failure that is not listed and on a listed case that passes.
 
@@ -321,11 +323,29 @@ def table(results):
     return '\n'.join(lines) + '\n'
 
 
+def script_command(platform, script, uiharness, suite, term_bin, out):
+    """The command that runs one script, its files under `out`.
+
+    Linux wraps it in a private Xvfb display (ui-linux.py). Windows has no
+    such wrapper: the harness starts the suite on a Win32 desktop of its own,
+    named for the script, which is never shown (#1405).
+    """
+    run = [str(uiharness)]
+    if platform == 'win32':
+        run += ['--desktop', f'sweep-{script.stem}']
+    run += ['run', str(script), '--suite', str(suite),
+            '--term-bin', str(term_bin), '--run', str(out / 'harness')]
+    if platform == 'win32':
+        return run
+    return [sys.executable, str(UI_LINUX), '--logs', str(out / 'x11'), '--'] + run
+
+
 def run_one(cmd, transcript_path, timeout):
     """Run cmd with its output in transcript_path; return (exit code, timed out).
 
     ui-linux.py stays in our process group, so a Ctrl-C reaches it directly,
-    and turns SIGTERM into stopping its command, Openbox and Xvfb.
+    and turns SIGTERM into stopping its command, Openbox and Xvfb. On Windows
+    cmd is uiharness itself, whose suite child `stop` ends with it.
     """
     with transcript_path.open('wb') as out:
         proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, cwd=REPO)
@@ -342,8 +362,24 @@ def run_one(cmd, transcript_path, timeout):
             raise
 
 
+def kill_tree(proc, platform=None, run=subprocess.run):
+    """On Windows, end proc and its children (uiharness's suite) with taskkill.
+
+    `proc.terminate()` there is TerminateProcess on uiharness alone and leaves
+    its suite running on the hidden desktop. Elsewhere this does nothing.
+    """
+    if (platform or sys.platform) == 'win32':
+        run(['taskkill', '/T', '/F', '/PID', str(proc.pid)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
 def stop(proc, signalled=False):
-    """Stop ui-linux.py, letting its SIGTERM/SIGINT teardown run where it can."""
+    """Stop the script's command, letting its SIGTERM/SIGINT teardown run where it can.
+
+    On Windows its whole process tree is killed first (`kill_tree`), while
+    uiharness is alive for taskkill /T to find its children.
+    """
+    kill_tree(proc)
     sends = [proc.terminate]
     if signalled:
         # Already signalled: first wait, and only then send SIGTERM.
@@ -434,9 +470,7 @@ def main(argv=None):
         out = run / path.stem
         out.mkdir()
         print(f'[{i}/{len(scripts)}] {path.stem} ... ', end='', flush=True)
-        cmd = [sys.executable, str(UI_LINUX), '--logs', str(out / 'x11'), '--',
-               str(uiharness), 'run', str(path), '--suite', str(suite),
-               '--term-bin', str(term_bin), '--run', str(out / 'harness')]
+        cmd = script_command(sys.platform, path, uiharness, suite, term_bin, out)
         began = time.monotonic()
         try:
             code, timed_out = run_one(cmd, out / 'transcript.txt', args.timeout)
