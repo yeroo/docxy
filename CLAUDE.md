@@ -351,8 +351,23 @@
   Delete replace or remove it, the arrows, Home and End drop it) and
   `field-read` reports it. Only Find and Replace use it so far (#1375): Ctrl+A
   selects the focused field and Replace All is Alt+A (nothing in find-only
-  mode). Select-all in the other prompts (#1376), copy/paste (#1377) and
-  click-to-place (#1379) are still not there.
+  mode). The comment bar and Compare's two paths take Ctrl+A too (#1376);
+  the vim `:` line does not. Copy/paste (#1377) and click-to-place (#1379)
+  are still not there.
+
+## Terminal editors: Ctrl+A in the other prompts (#1376)
+
+- Ctrl+A selects the whole field, the caret at its end, and typing, Backspace
+  and Delete replace or remove it; Left/Right collapse it to an edge and
+  Home/End drop it; `field-read` reports `selection`. An empty field selects
+  nothing, and the key never types an `a`. Each editor keeps its own small
+  anchor (no shared line-edit crate): docxy's comment bar and Compare use
+  `LineEdit`; xlsxy's minibuffer `Prompt` and yppxy's `Prompt` have
+  `anchor`/`selection`/`delete_selection`; the cell editor reuses
+  `Edit.select_all` (Ctrl+A sets it, Left collapses to 0; the end-of-branch
+  reset keeps it for that key). Backstage Save As's name, shared by the
+  three, has `Backstage::name_anchor`, drawn reversed; every write of
+  `name_cursor` clears it. The xlsxy vim `:` line has no select-all.
 
 ## xlsxy terminal vim `:` line edits at a caret (#1373)
 
@@ -361,8 +376,8 @@
   no Ctrl or Alt (`vim_key` passes `ctrl || alt`), and typing inserts there
   (any modifier, as before). The hint line draws a reversed block at the
   caret, as the minibuffer prompt does, and `field-read xlsxy-vim-command`
-  reports the real caret. Select-all, copy/paste and click-to-place are not
-  there.
+  reports the real caret. Copy/paste and click-to-place are not there;
+  nor is select-all (#1376 covers the minibuffer prompt, not this line).
 
 ## yppxy terminal prompt edits at a caret (#1374)
 
@@ -373,5 +388,6 @@
   (such chords are still swallowed), Backspace and typing act there, and Enter
   commits the whole text wherever the caret is. The edits clamp the caret, as
   tests assign `buf` directly. The drawn `▏` sits at the caret and `field-read
-  yppxy-prompt` reports it. Select-all, copy/paste and click-to-place are not
-  there (#1376, #1378); Backstage Save As's name field is separate.
+  yppxy-prompt` reports it. Ctrl+A selects the buffer (#1376; typing and the
+  edit keys replace or collapse it). Copy/paste and click-to-place are not
+  there (#1378); Backstage Save As's name field is separate.

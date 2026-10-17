@@ -29,18 +29,6 @@ backstage-inputs-typing.uit | rename sheet-tab-rename: select-all replaces | #13
 backstage-inputs-typing.uit | rename sheet-tab-rename: copies | #1365
 backstage-inputs-typing.uit | rename sheet-tab-rename: pastes | #1365
 
-# Ctrl+A selects nothing in the terminal editors' prompts, so typing after
-# it appends instead of replacing (#1204).
-terminal-docxy-inputs-typing.uit | docxy docxy-comment: select-all replaces | #1376
-terminal-docxy-inputs-typing.uit | docxy docxy-compare-original: select-all replaces | #1376
-terminal-docxy-inputs-typing.uit | docxy docxy-compare-revised: select-all replaces | #1376
-terminal-docxy-inputs-typing.uit | docxy docxy-save-as: select-all replaces | #1376
-terminal-xlsxy-inputs-typing.uit | xlsxy xlsxy-prompt: select-all replaces | #1376
-terminal-xlsxy-inputs-typing.uit | xlsxy xlsxy-cell: select-all replaces | #1376
-terminal-xlsxy-inputs-typing.uit | xlsxy xlsxy-save-as: select-all replaces | #1376
-terminal-yppxy-inputs-typing.uit | yppxy yppxy-prompt: select-all replaces | #1376
-terminal-yppxy-inputs-typing.uit | yppxy yppxy-save-as: select-all replaces | #1376
-
 # Ctrl+C and Ctrl+V do nothing in these terminal prompts: no copy or paste
 # (#1204).
 terminal-docxy-inputs-typing.uit | docxy docxy-find: copies | #1377
