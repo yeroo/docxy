@@ -348,3 +348,13 @@
   keeps a long Compare path's caret in view. `field-read` reports the real
   caret (`Field::with_caret`). Select-all, copy/paste and click-to-place are
   still not there (#1375 to #1379).
+
+## xlsxy terminal vim `:` line edits at a caret (#1373)
+
+- `VimState::cmdline` is `xlsxy/src/main.rs`'s `CmdLine` (text plus a char
+  caret): Left, Right, Home, End, Delete and Backspace act at the caret, with
+  no Ctrl or Alt (`vim_key` passes `ctrl || alt`), and typing inserts there
+  (any modifier, as before). The hint line draws a reversed block at the
+  caret, as the minibuffer prompt does, and `field-read xlsxy-vim-command`
+  reports the real caret. Select-all, copy/paste and click-to-place are not
+  there.

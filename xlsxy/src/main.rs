@@ -2134,7 +2134,50 @@ enum VimMode {
 struct VimState {
     mode: VimMode,
     pending: char,
-    cmdline: Option<String>,
+    cmdline: Option<CmdLine>,
+}
+
+/// The `:` command line: text plus a caret counted in chars (#1373).
+#[derive(Default)]
+struct CmdLine {
+    text: String,
+    caret: usize,
+}
+
+impl CmdLine {
+    fn insert(&mut self, ch: char) {
+        self.text.insert(char_index(&self.text, self.caret), ch);
+        self.caret += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.caret > 0 {
+            self.text.remove(char_index(&self.text, self.caret - 1));
+            self.caret -= 1;
+        }
+    }
+
+    fn delete(&mut self) {
+        if self.caret < self.text.chars().count() {
+            self.text.remove(char_index(&self.text, self.caret));
+        }
+    }
+
+    fn left(&mut self) {
+        self.caret = self.caret.saturating_sub(1);
+    }
+
+    fn right(&mut self) {
+        self.caret = (self.caret + 1).min(self.text.chars().count());
+    }
+
+    fn home(&mut self) {
+        self.caret = 0;
+    }
+
+    fn end(&mut self) {
+        self.caret = self.text.chars().count();
+    }
 }
 
 /// Which formatting popup is open.
@@ -9651,9 +9694,9 @@ impl App {
     }
 
     /// Route a key while in vim mode (not editing). Returns true to exit.
-    fn vim_key(&mut self, code: KeyCode, ctrl: bool, _shift: bool) -> bool {
+    fn vim_key(&mut self, code: KeyCode, ctrl: bool, alt: bool, _shift: bool) -> bool {
         if self.vim.as_ref().and_then(|v| v.cmdline.as_ref()).is_some() {
-            return self.vim_cmdline_key(code);
+            return self.vim_cmdline_key(code, ctrl || alt);
         }
         let pending = self.vim.as_ref().map(|v| v.pending).unwrap_or('\0');
         if let Some(v) = &mut self.vim {
@@ -9702,7 +9745,7 @@ impl App {
         match code {
             KeyCode::Char(':') => {
                 if let Some(v) = &mut self.vim {
-                    v.cmdline = Some(String::new());
+                    v.cmdline = Some(CmdLine::default());
                 }
             }
             KeyCode::Char('h') | KeyCode::Left => self.move_cur(0, -1, visual),
@@ -9778,7 +9821,7 @@ impl App {
         false
     }
 
-    fn vim_cmdline_key(&mut self, code: KeyCode) -> bool {
+    fn vim_cmdline_key(&mut self, code: KeyCode, modified: bool) -> bool {
         match code {
             KeyCode::Esc => {
                 if let Some(v) = &mut self.vim {
@@ -9791,16 +9834,31 @@ impl App {
                     .as_mut()
                     .and_then(|v| v.cmdline.take())
                     .unwrap_or_default();
-                return self.vim_run_command(&cmd);
-            }
-            KeyCode::Backspace => {
-                if let Some(Some(c)) = self.vim.as_mut().map(|v| v.cmdline.as_mut()) {
-                    c.pop();
-                }
+                return self.vim_run_command(&cmd.text);
             }
             KeyCode::Char(ch) => {
-                if let Some(Some(c)) = self.vim.as_mut().map(|v| v.cmdline.as_mut()) {
-                    c.push(ch);
+                if let Some(c) = self.vim.as_mut().and_then(|v| v.cmdline.as_mut()) {
+                    c.insert(ch);
+                }
+            }
+            // Ctrl and Alt chords are not edits.
+            KeyCode::Backspace
+            | KeyCode::Delete
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Home
+            | KeyCode::End
+                if !modified =>
+            {
+                if let Some(c) = self.vim.as_mut().and_then(|v| v.cmdline.as_mut()) {
+                    match code {
+                        KeyCode::Backspace => c.backspace(),
+                        KeyCode::Delete => c.delete(),
+                        KeyCode::Left => c.left(),
+                        KeyCode::Right => c.right(),
+                        KeyCode::Home => c.home(),
+                        _ => c.end(),
+                    }
                 }
             }
             _ => {}
@@ -10941,7 +10999,24 @@ fn draw_screen(app: &mut App, f: &mut Frame) {
     }
     let hint = if let Some(v) = app.vim.as_ref().filter(|_| app.prompt.is_none()) {
         match &v.cmdline {
-            Some(c) => format!(":{c}"),
+            Some(c) => {
+                let chars: Vec<char> = c.text.chars().collect();
+                let at = chars
+                    .get(c.caret)
+                    .map_or(" ".to_string(), |ch| ch.to_string());
+                f.render_widget(
+                    Paragraph::new(RLine::from(vec![
+                        RSpan::raw(format!(
+                            ":{}",
+                            chars[..c.caret.min(chars.len())].iter().collect::<String>()
+                        )),
+                        RSpan::styled(at, Style::new().add_modifier(Modifier::REVERSED)),
+                        RSpan::raw(chars.iter().skip(c.caret + 1).collect::<String>()),
+                    ])),
+                    hint_line,
+                );
+                return;
+            }
             None => match v.mode {
                 VimMode::Normal => {
                     "-- NORMAL --  hjkl move · i edit · v visual · :w :q".to_string()
@@ -12008,7 +12083,7 @@ impl App {
                 .vim
                 .as_ref()
                 .and_then(|v| v.cmdline.as_ref())
-                .map(|c| Field::append_only(c, self.prompt.is_none())),
+                .map(|c| Field::with_caret(&c.text, self.prompt.is_none(), c.caret)),
             "xlsxy-save-as" => {
                 return self
                     .backstage
@@ -12366,7 +12441,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
 
     // --- vim mode (normal / visual / command-line) ------------------------------
     if app.vim.is_some() {
-        return app.vim_key(key.code, ctrl, shift);
+        return app.vim_key(key.code, ctrl, alt, shift);
     }
 
     // Protected View lets through only keys that move, read or copy (#894).
@@ -19439,6 +19514,70 @@ mod tests {
     }
 
     #[test]
+    fn vim_cmdline_edits_at_the_caret() {
+        let mut c = CmdLine::default();
+        for ch in "abc".chars() {
+            c.insert(ch);
+        }
+        c.home();
+        c.right();
+        c.delete();
+        assert_eq!((c.text.as_str(), c.caret), ("ac", 1));
+        c.end();
+        c.left();
+        assert_eq!(c.caret, 1);
+        c.insert('X');
+        assert_eq!((c.text.as_str(), c.caret), ("aXc", 2));
+        c.home();
+        c.backspace();
+        c.left();
+        assert_eq!((c.text.as_str(), c.caret), ("aXc", 0));
+        c.end();
+        c.right();
+        c.delete();
+        assert_eq!((c.text.as_str(), c.caret), ("aXc", 3));
+    }
+
+    #[test]
+    fn vim_cmdline_counts_multibyte_chars_as_one() {
+        let mut c = CmdLine::default();
+        for ch in "é€x".chars() {
+            c.insert(ch);
+        }
+        c.left();
+        c.backspace();
+        assert_eq!((c.text.as_str(), c.caret), ("éx", 1));
+        c.home();
+        c.delete();
+        assert_eq!((c.text.as_str(), c.caret), ("x", 0));
+    }
+
+    #[test]
+    fn vim_cmdline_modified_edit_keys_are_not_edits_and_enter_runs_all() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.vim = Some(VimState {
+            mode: VimMode::Normal,
+            pending: '\0',
+            cmdline: None,
+        });
+        app.vim_key(KeyCode::Char(':'), false, false, false);
+        for ch in "ab".chars() {
+            app.vim_key(KeyCode::Char(ch), false, false, false);
+        }
+        app.vim_key(KeyCode::Left, true, false, false);
+        app.vim_key(KeyCode::Backspace, false, true, false);
+        app.vim_key(KeyCode::Home, true, false, false);
+        let c = app.vim.as_ref().unwrap().cmdline.as_ref().unwrap();
+        assert_eq!((c.text.as_str(), c.caret), ("ab", 2));
+        app.vim_key(KeyCode::Left, false, false, false);
+        app.vim_key(KeyCode::Left, false, false, false);
+        app.vim_key(KeyCode::Enter, false, false, false);
+        assert!(app.vim.as_ref().unwrap().cmdline.is_none());
+        assert_eq!(app.status.as_deref(), Some("Not a command: :ab"));
+    }
+
+    #[test]
     fn vim_mode_navigation_and_commands() {
         let mut app = App::new(new_xlsx(), "t.xlsx");
         app.os_clip = None;
@@ -19448,28 +19587,28 @@ mod tests {
             cmdline: None,
         });
         // l l j → right, right, down.
-        app.vim_key(KeyCode::Char('l'), false, false);
-        app.vim_key(KeyCode::Char('l'), false, false);
-        app.vim_key(KeyCode::Char('j'), false, false);
+        app.vim_key(KeyCode::Char('l'), false, false, false);
+        app.vim_key(KeyCode::Char('l'), false, false, false);
+        app.vim_key(KeyCode::Char('j'), false, false, false);
         assert_eq!(app.cur, (1, 2));
         // gg → first row.
-        app.vim_key(KeyCode::Char('g'), false, false);
-        app.vim_key(KeyCode::Char('g'), false, false);
+        app.vim_key(KeyCode::Char('g'), false, false, false);
+        app.vim_key(KeyCode::Char('g'), false, false, false);
         assert_eq!(app.cur.0, 0);
         // Visual select + yank returns to Normal.
-        app.vim_key(KeyCode::Char('v'), false, false);
+        app.vim_key(KeyCode::Char('v'), false, false, false);
         assert_eq!(app.vim_mode(), VimMode::Visual);
-        app.vim_key(KeyCode::Char('l'), false, false);
-        app.vim_key(KeyCode::Char('y'), false, false);
+        app.vim_key(KeyCode::Char('l'), false, false, false);
+        app.vim_key(KeyCode::Char('y'), false, false, false);
         assert_eq!(app.vim_mode(), VimMode::Normal);
         // `i` enters insert (edit) mode.
-        app.vim_key(KeyCode::Char('i'), false, false);
+        app.vim_key(KeyCode::Char('i'), false, false, false);
         assert!(app.edit.is_some());
         app.cancel_edit();
         // :q on an unmodified sheet exits.
-        app.vim_key(KeyCode::Char(':'), false, false);
-        app.vim_key(KeyCode::Char('q'), false, false);
-        assert!(app.vim_key(KeyCode::Enter, false, false));
+        app.vim_key(KeyCode::Char(':'), false, false, false);
+        app.vim_key(KeyCode::Char('q'), false, false, false);
+        assert!(app.vim_key(KeyCode::Enter, false, false, false));
     }
 
     #[test]
