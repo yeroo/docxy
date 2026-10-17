@@ -100,8 +100,20 @@ where instance is `yppxy-<AGWINTERM_SESSION_ID>` — the pane id shown by
 
 Verbs: `proj.path`, `task.list`, `task.get`, `task.fields`, `task.set`, `task.add`,
 `task.del`, `link.add`, `link.del`, `find`, `assign.list`, `assign.get`,
-`assign.fields`, `assign.add`, `assign.set`, `assign.del`, `proj.save`,
+`assign.fields`, `assign.add`, `assign.set`, `assign.del`, `resource.list`,
+`resource.get`, `resource.add`, `resource.set`, `resource.del`, `proj.save`,
 `proj.reload`, `proj.open`.
+
+Resources are addressed by their own UID, as `resource.list {}` reports it
+(`uid, id, name, type, initials, group, code, email, material_label,
+max_units, standard_rate, overtime_rate, cost_per_use, accrue_at,
+base_calendar, notes, assignments`). `resource.add {name, type?, ...}` makes a
+work resource at 100% unless told otherwise; `resource.set {uid, ...}` changes
+any of the same fields (`null` clears a text or rate; `type` only while the
+resource has no assignments); `resource.del {uid}` removes it with its
+assignments. Rates are currency per hour (per unit for a material), the cost
+per use currency units, `max_units` a fraction or `"50%"`, `accrue_at` Start,
+End or Prorated, `base_calendar` a base calendar's name or uid.
 
 Assignments are addressed by their own UID, as `assign.list {uid?, resource?}`
 reports it. `assign.add {task, resource, units?, work?}` takes a resource uid or
