@@ -1642,6 +1642,9 @@ pub struct Project {
     /// The plan's formatting (#1532): the `.yppx` `formatting.xml` part;
     /// MSPDI carries none.
     pub formatting: crate::formatting::Formatting,
+    /// The Project table's column widths (#1533): the `.yppx`
+    /// `tableview.xml` part; MSPDI carries none.
+    pub table_view: crate::tableview::TableView,
 }
 
 impl Default for Project {
@@ -1649,6 +1652,7 @@ impl Default for Project {
         Project {
             package: PackageParts::default(),
             formatting: crate::formatting::Formatting::default(),
+            table_view: crate::tableview::TableView::default(),
             name: String::new(),
             title: String::new(),
             start_date: None,

@@ -43,10 +43,12 @@ pub(crate) use fields::{format_work, two_decimals};
 #[cfg(test)]
 use cells::parse_predecessors;
 use cells::{bracket_units, parse_resource_token, same_shown_units};
+mod display;
 mod moving;
 mod outline;
 mod plan;
 mod props;
+pub use display::{Sort, ValueItem};
 use outline::subtree_end;
 pub use props::{
     EV_PERCENT_COMPLETE, EV_PHYSICAL_PERCENT_COMPLETE, PRIORITY_DEFAULT, PRIORITY_MAX,
@@ -132,6 +134,10 @@ pub struct Editor {
     /// `select` put the selection on the hidden project summary row
     /// (automation): edits leave it there. Any other arrival moves off it.
     sel_pinned: bool,
+    /// The grid's sort and AutoFilter checklists (#1533): view state, outside
+    /// the model, history and saved files (see [`Self::display_rows`]).
+    sort: Option<Sort>,
+    filters: Vec<display::Filter>,
     undo: Vec<Project>,
     redo: Vec<Project>,
     dirty: bool,
@@ -176,6 +182,8 @@ impl Editor {
             collapsed: Default::default(),
             show_summary: false,
             sel_pinned: false,
+            sort: None,
+            filters: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
             dirty,
@@ -210,6 +218,20 @@ impl Editor {
         self.changed();
     }
 
+    /// Edit the Project table's saved view ([`crate::tableview::TableView`],
+    /// the column widths) as one undo step; an edit that changes nothing
+    /// records nothing.
+    pub fn edit_table_view(&mut self, edit: impl FnOnce(&mut crate::tableview::TableView)) {
+        let mut next = self.proj.table_view.clone();
+        edit(&mut next);
+        if next == self.proj.table_view {
+            return;
+        }
+        self.snapshot();
+        self.proj.table_view = next;
+        self.changed();
+    }
+
     /// Begin a new document session, retaining find and leveling preferences.
     pub fn replace_project(&mut self, proj: Project) {
         self.proj = proj;
@@ -217,6 +239,8 @@ impl Editor {
         self.sel = 0;
         self.sel_pinned = false;
         self.collapsed.clear();
+        self.sort = None;
+        self.filters.clear();
         self.undo.clear();
         self.redo.clear();
         self.dirty = false;
@@ -549,6 +573,9 @@ impl Editor {
         estimated: bool,
     ) -> Result<usize, String> {
         validate_duration(duration_min)?;
+        if after.is_some() {
+            self.refuse_while_sorted()?;
+        }
         let at = match after {
             Some(uid) => self.index(uid)? + 1,
             None => self.proj.tasks.len(),
@@ -615,6 +642,9 @@ impl Editor {
     /// takes the level of the task above where it sits then (see
     /// [`materialized`]). The returned row is not automatically selected.
     pub fn insert_blank_row(&mut self, before: Option<i32>) -> Result<usize, String> {
+        if before.is_some() {
+            self.refuse_while_sorted()?;
+        }
         let at = match before {
             Some(uid) => self.index(uid)?,
             None => self.proj.tasks.len(),
@@ -660,6 +690,9 @@ impl Editor {
         let Some(top) = rows.iter().map(|t| t.outline_level).min() else {
             return Ok(Vec::new());
         };
+        if before.is_some() {
+            self.refuse_while_sorted()?;
+        }
         let at = match before {
             Some(uid) => self.index(uid)?,
             None => self.proj.tasks.len(),
@@ -861,6 +894,7 @@ impl Editor {
     }
 
     pub fn indent(&mut self, uid: i32, delta: i32) -> Result<(), String> {
+        self.refuse_while_sorted()?;
         let i = self.index(uid)?;
         self.edit_row(i, |proj, _| {
             let t = &mut proj.tasks[i];

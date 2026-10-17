@@ -446,7 +446,7 @@ fn parse_color(v: Option<&Json>) -> Option<u32> {
 }
 
 /// `size` without a trailing `.0`.
-fn trim_num(n: f32) -> String {
+pub(crate) fn trim_num(n: f32) -> String {
     if n.fract() == 0.0 {
         format!("{}", n as i64)
     } else {
@@ -454,7 +454,7 @@ fn trim_num(n: f32) -> String {
     }
 }
 
-fn push_attr(out: &mut String, name: &str, value: &str) {
+pub(crate) fn push_attr(out: &mut String, name: &str, value: &str) {
     out.push(' ');
     out.push_str(name);
     out.push_str("=\"");
@@ -471,7 +471,7 @@ fn push_attr(out: &mut String, name: &str, value: &str) {
 }
 
 /// An attribute's raw text with the XML entities decoded.
-fn decode(raw: &str) -> String {
+pub(crate) fn decode(raw: &str) -> String {
     if !raw.contains('&') {
         return raw.to_string();
     }
