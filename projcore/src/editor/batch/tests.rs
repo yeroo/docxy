@@ -118,6 +118,34 @@ fn a_failed_batch_restores_every_piece_of_state() {
 }
 
 #[test]
+fn a_batch_inside_a_batch_is_part_of_the_outer_step() {
+    let mut ed = editor();
+    let proj = ed.project().clone();
+    let depth = ed.undo_depth();
+    ed.batch(|ed| {
+        ed.rename(3, "Build")?;
+        ed.batch(|ed| ed.rename(4, "Test"))?;
+        assert!(ed.batching);
+        Ok(())
+    })
+    .unwrap();
+    assert!(!ed.batching);
+    assert_eq!(ed.undo_depth(), depth + 1);
+    assert_eq!(names(&ed), ["S", "A", "Build", "Test"]);
+    assert!(ed.undo());
+    assert_eq!(ed.project(), &proj);
+    // The inner batch's refusal is the outer's: everything rolls back.
+    let err = ed.batch(|ed| {
+        ed.rename(3, "Build")?;
+        ed.batch(|ed| ed.set_duration(4, "soon"))
+    });
+    assert!(err.is_err());
+    assert_eq!(ed.project(), &proj);
+    assert_eq!(ed.undo_depth(), depth);
+    assert!(!ed.batching);
+}
+
+#[test]
 fn a_batch_that_changes_nothing_records_nothing_and_keeps_redo() {
     let mut ed = editor();
     ed.rename(4, "Seed").unwrap();
