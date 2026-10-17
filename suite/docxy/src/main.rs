@@ -37489,7 +37489,7 @@ impl Render for Docxy {
                 self.sheet_ribbon_body(window, pal, cx)
             }
         });
-        let project_prompt = self.project_prompt_bar(pal, cx);
+        let project_prompt = self.project_prompt_bar(window, pal, cx);
         // Protected View's bar comes first; once editing is enabled, a
         // document marked as final shows Word's bar (#617).
         let protected_bar = protected.then(|| {

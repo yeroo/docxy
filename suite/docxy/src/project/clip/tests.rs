@@ -69,10 +69,14 @@ fn ctrl_c_x_v_map_to_the_clipboard_acts() {
             assert_ne!(key_act(key, m), Some(act), "{key} {m:?}");
         }
     }
-    // A prompt keeps the chords; an open cell editor passes them to the host
-    // (#561), which edits the buffer itself — nothing commits here.
+    // An open prompt (#1370) or cell editor (#561) passes them to the host,
+    // which edits the buffer itself — nothing commits here.
     vm(&mut t).open_prompt(PromptKind::Move);
-    assert_eq!(project_input(&mut t, "c", None, ctrl(false, false)), None);
+    assert_eq!(
+        project_input(&mut t, "c", None, ctrl(false, false)),
+        Some(Copy)
+    );
+    assert!(v(&t).prompt.is_some());
     vm(&mut t).cancel_prompt();
     vm(&mut t).open_cell(None).unwrap();
     assert_eq!(

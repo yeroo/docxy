@@ -28,22 +28,52 @@ pub(crate) const COLUMNS: [&str; COLUMN_COUNT] = [
     "Resource Names",
 ];
 
-#[derive(Clone, Debug)]
-pub(crate) struct CellEdit {
-    /// The edited task; `None` on the entry row, where committing appends one.
-    pub uid: Option<i32>,
-    pub col: usize,
-    pub initial: String,
+/// A single-line text buffer with a caret and a selection, edited in place by
+/// the cell editor and the prompt bar.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LineEdit {
     pub buf: String,
     /// UTF-8 byte boundary.
     pub caret: usize,
     /// The other end of the selection (a UTF-8 byte boundary); the selection
     /// runs between it and `caret`, and is empty when they meet.
     pub anchor: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CellEdit {
+    /// The edited task; `None` on the entry row, where committing appends one.
+    pub uid: Option<i32>,
+    pub col: usize,
+    pub initial: String,
+    pub line: LineEdit,
     pub last_error: Option<String>,
 }
 
-impl CellEdit {
+impl std::ops::Deref for CellEdit {
+    type Target = LineEdit;
+    fn deref(&self) -> &LineEdit {
+        &self.line
+    }
+}
+
+impl std::ops::DerefMut for CellEdit {
+    fn deref_mut(&mut self) -> &mut LineEdit {
+        &mut self.line
+    }
+}
+
+impl LineEdit {
+    /// A buffer holding `buf`, the caret at its end.
+    pub fn new(buf: impl Into<String>) -> Self {
+        let buf = buf.into();
+        LineEdit {
+            caret: buf.len(),
+            anchor: None,
+            buf,
+        }
+    }
+
     pub fn key(&mut self, key: &str, text: Option<&str>) {
         let prev = || {
             self.buf[..self.caret]
@@ -322,9 +352,7 @@ impl ProjectView {
             uid,
             col: self.col,
             initial,
-            caret: buf.len(),
-            anchor: None,
-            buf,
+            line: LineEdit::new(buf),
         });
         self.reveal_col();
         Ok(())

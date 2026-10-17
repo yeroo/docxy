@@ -603,9 +603,11 @@ fn caret_edits_utf8_and_long_buffer_window_tracks_it() {
         uid: Some(1),
         col: COL_NAME,
         initial: String::new(),
-        buf: "aλ🙂z".into(),
-        caret: 8,
-        anchor: None,
+        line: LineEdit {
+            buf: "aλ🙂z".into(),
+            caret: 8,
+            anchor: None,
+        },
     };
     c.key("left", None);
     c.key("backspace", None);
@@ -635,9 +637,11 @@ fn cell_edit_paste_inserts_at_the_caret_and_moves_it() {
         uid: Some(1),
         col: COL_NAME,
         initial: "ac".into(),
-        buf: "ac".into(),
-        caret: 1,
-        anchor: None,
+        line: LineEdit {
+            buf: "ac".into(),
+            caret: 1,
+            anchor: None,
+        },
     };
     c.paste("b");
     assert_eq!(c.buf, "abc");
@@ -655,9 +659,11 @@ fn cell_edit_paste_spaces_tabs_and_line_breaks_and_drops_the_trailing_ones() {
         uid: Some(1),
         col: COL_NAME,
         initial: String::new(),
-        buf: String::new(),
-        caret: 0,
-        anchor: None,
+        line: LineEdit {
+            buf: String::new(),
+            caret: 0,
+            anchor: None,
+        },
     };
     // As a copied cell's text: the trailing line break is dropped and every
     // remaining tab or line break becomes a space.
@@ -677,9 +683,11 @@ fn cell_edit_paste_counts_a_crlf_pair_as_one_break() {
         uid: Some(1),
         col: COL_NAME,
         initial: String::new(),
-        buf: String::new(),
-        caret: 0,
-        anchor: None,
+        line: LineEdit {
+            buf: String::new(),
+            caret: 0,
+            anchor: None,
+        },
     };
     c.paste("Line 1\r\nLine 2");
     assert_eq!(c.buf, "Line 1 Line 2");
@@ -693,9 +701,11 @@ fn cell_edit_paste_drops_control_characters_a_copy_can_carry() {
         uid: Some(1),
         col: COL_NAME,
         initial: String::new(),
-        buf: String::new(),
-        caret: 0,
-        anchor: None,
+        line: LineEdit {
+            buf: String::new(),
+            caret: 0,
+            anchor: None,
+        },
     };
     // Word copies can carry \x0b, \x0c, \x1b or NUL; typed text drops controls
     // in key(), and a paste must not land them in the project either — the
@@ -725,9 +735,11 @@ fn cell_edit_cut_takes_the_whole_buffer_and_empties_it() {
         uid: Some(1),
         col: COL_NAME,
         initial: "Task 2".into(),
-        buf: "Task 2".into(),
-        caret: 3,
-        anchor: None,
+        line: LineEdit {
+            buf: "Task 2".into(),
+            caret: 3,
+            anchor: None,
+        },
     };
     assert_eq!(c.cut(), "Task 2");
     assert!(c.buf.is_empty());
@@ -2373,9 +2385,11 @@ fn cell_with(buf: &str, caret: usize) -> CellEdit {
         uid: Some(1),
         col: COL_NAME,
         initial: buf.into(),
-        buf: buf.into(),
-        caret,
-        anchor: None,
+        line: LineEdit {
+            buf: buf.into(),
+            caret,
+            anchor: None,
+        },
     }
 }
 
