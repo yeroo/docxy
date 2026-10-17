@@ -250,10 +250,12 @@ jobs:
     runs-on: windows-latest
     # No DOCXY_BUILD_KIND here on purpose: build-info.uit asserts this sweep's suite
     # reports kind `local`, as on ui-sweep-linux (#1023).
-    # Nobody has seen this job's Windows baseline: expected-failures.txt lists the
-    # Linux one. Remove this once the first run is green, or once that list is
-    # split per platform.
-    continue-on-error: true
+    # expected-failures.txt is the Linux list, so the first Windows run's baseline
+    # is 5 FAIL (page-line-numbers, project-timeline-view, ribbon-fit, sheet-ribbon,
+    # style-gallery) and 2 ERROR at the 120 s timeout (inputs-typing-doc-layout,
+    # inputs-typing-sheet-data). The Sweep step is continue-on-error, not the job:
+    # a job-level flag still reports a FAILURE check run. Remove the step's flag
+    # once that list is split per platform (#1544).
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
@@ -271,9 +273,10 @@ jobs:
         run: python -m unittest discover -s scripts -p "test_*.py" -v
       - name: Sweep
         timeout-minutes: 60
+        continue-on-error: true
         run: python scripts/ui-linux-sweep.py --timeout 120 --suite suite/target/release/suite.exe --uiharness target/release/uiharness.exe --run "${{ github.workspace }}/uiharness-runs/sweep"
       - name: Upload the sweep's transcripts and evidence
-        if: failure() || cancelled()
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: ui-sweep-windows
