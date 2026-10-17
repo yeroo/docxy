@@ -322,9 +322,14 @@
   (`projcore/tests/plugin_fixture/src/ui.rs`) exports one of everything;
   `projcore/tests/plugins.rs` and `yppxy/tests/plugins.rs` cover it.
 - The plan's formatting (`projcore::formatting::Formatting`: palette id,
-  text styles per category and per cell, gridlines, link style) is
+  text styles per category and per cell, gridlines, link style, and the
+  named `switches` a plugin owns, #1553: a command's `view.switches`
+  `{name: bool|null}` sets or clears them, the state and overlay requests'
+  view/flags carry them as `switches`, so a toggle's `checked` and what the
+  overlay draws follow the plan) is
   `Project::formatting`, edited as one undo step by `Editor::edit_formatting`
-  (a command's `view` reply goes through `Formatting::apply_view`), saved in
+  (a command's `view` reply goes through `Formatting::apply_view`; yppxy's
+  `--command` applies it too), saved in
   the `.yppx` part `formatting.xml` (own content-type override, never kept as
   an extra part, absent when empty) and never in MSPDI. `Editor::revision()`
   moves on every change of the plan, for hosts caching what they derive from

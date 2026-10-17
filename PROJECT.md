@@ -44,7 +44,7 @@ Built bottom-up, each a pure module:
 | `gantt` | export a scheduled project as a Markdown/Mermaid Gantt chart, with a task table (dates, Deadline with a missed-deadline `⚠`, duration, slack) |
 | `report` | Project's Report › View Reports as Markdown, from the plan's stored values |
 | `yppx` | the native `.yppx` OPC package (ZIP + `[Content_Types].xml` + `project.xml`, plus `formatting.xml` when the plan has formatting) |
-| `formatting` | the plan's formatting (#1532, #1390): bar palette id, text styles per category and per cell, gridline and link-line styles; `Project::formatting`, edited as one undo step by `Editor::edit_formatting`, saved in `formatting.xml`, never in MSPDI |
+| `formatting` | the plan's formatting (#1532, #1390): bar palette id, text styles per category and per cell, gridline and link-line styles, and the named view switches a UI plugin owns (#1553, `<switch name on>`); `Project::formatting`, edited as one undo step by `Editor::edit_formatting`, saved in `formatting.xml`, never in MSPDI |
 | `formats` | the `ProjectFormat` trait and the `Registry` of formats hosts open and save (built-in `.yppx` and `.xml`), and, behind the `plugins` feature, the format and UI plugin loader |
 | `plugin_abi` | the C ABI a format plugin implements, with the optional version-target and UI symbols (see [Format plugins](#format-plugins) and [UI plugins](#ui-plugins-1532)) |
 | `json` | the hand-written JSON value the plugin ABI's payloads use |
@@ -285,6 +285,7 @@ task: its bookings are placed first, and auto tasks level around them.
   rename, and Project opens it — while giving us a container to grow. The first
   growth is `formatting.xml` (`projcore::formatting`, #1532): the plan's bar
   palette, text styles per category and per cell, gridlines and link style,
+  and a UI plugin's named view switches (#1553),
   written only when the plan has any, declared in the content types with its
   own override, and read back into `Project::formatting`; MSPDI carries none
   of it, as in Project.

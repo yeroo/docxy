@@ -261,14 +261,33 @@ impl Formats {
                 uids: ed.selected_uid().into_iter().collect(),
                 cols: vec!["Name".to_string()],
             },
-            view: projcore::json::Json::Obj(Vec::new()),
+            view: projcore::json::Json::obj(vec![(
+                "switches",
+                ed.project().formatting.switches_json(),
+            )]),
             values,
         };
         for plugin in &self.ui {
             let Some(result) = plugin.command(&command)? else {
                 continue;
             };
-            projctl::apply_ops(ed, &result.ops)?;
+            // The ops and the view's formatting (a plugin's switch, a
+            // palette) as one step, as the suite applies them.
+            ed.batch(|ed| {
+                projctl::apply_ops_in(ed, &result.ops)?;
+                if let Some(view) = &result.view {
+                    let mut failed = None;
+                    ed.edit_formatting(|f| {
+                        if let Err(e) = f.apply_view(view) {
+                            failed = Some(e);
+                        }
+                    });
+                    if let Some(e) = failed {
+                        return Err(e);
+                    }
+                }
+                Ok(())
+            })?;
             let mut status = result.status.unwrap_or_default();
             if let Some(dialog) = result.dialog {
                 if !status.is_empty() {

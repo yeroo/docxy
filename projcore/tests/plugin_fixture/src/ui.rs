@@ -10,7 +10,8 @@
 //!   and a dialog `fixture.options` (one number) that `fixture.hello` opens;
 //!   OK sends `fixture.hello` again with the values.
 //! - Commands: `fixture.hello` (the dialog, then a status with its number),
-//!   `fixture.flag` (flips the toggle), the swatches (set the palette,
+//!   `fixture.flag` (flips the toggle: a view switch of the same name the
+//!   host stores in the plan's formatting, #1553), the swatches (set the palette,
 //!   returned as `view.palette`), `fixture.rename` (one `task.set` op
 //!   renaming the first selected task to "Renamed by fixture"), and
 //!   `task-information` (the page's OK: a status with the note's length).
@@ -44,12 +45,16 @@ const MANIFEST: &str = r##"{
   "text_style_categories":["Fixture Tasks"]
 }"##;
 
-/// The toggle's state and the chosen palette, kept across calls.
-static FLAG: Mutex<bool> = Mutex::new(false);
+/// The chosen palette, kept across calls.
 static PALETTE: Mutex<String> = Mutex::new(String::new());
 
-fn flag() -> bool {
-    *FLAG.lock().unwrap_or_else(|e| e.into_inner())
+/// The toggle's state: the `fixture.flag` switch of the request's view.
+fn flag(req: &Json) -> bool {
+    req.get("view")
+        .and_then(|v| v.get("switches"))
+        .and_then(|s| s.get("fixture.flag"))
+        .and_then(Json::bool)
+        .unwrap_or(false)
 }
 
 fn palette() -> String {
@@ -117,7 +122,7 @@ pub unsafe extern "C" fn yppx_ui_state(input: *const u8, len: usize, out: *mut Y
     let selected = first_uid(&req).is_some();
     let mut reply = format!(
         r#"{{"controls":{{"fixture.flag":{{"enabled":true,"checked":{}}},"fixture.rename":{{"enabled":{selected}}}}},"gallery":{{"fixture.palette":{}}}"#,
-        flag(),
+        flag(&req),
         quote(&palette())
     );
     // A Task Information dialog about to open: the page's values.
@@ -164,11 +169,10 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
             }
         },
         "fixture.flag" => {
-            let mut f = FLAG.lock().unwrap_or_else(|e| e.into_inner());
-            *f = !*f;
+            let on = !flag(&req);
             format!(
-                r#"{{"ops":[],"status":"Fixture: flag {}"}}"#,
-                if *f { "on" } else { "off" }
+                r#"{{"ops":[],"status":"Fixture: flag {}","view":{{"switches":{{"fixture.flag":{on}}}}}}}"#,
+                if on { "on" } else { "off" }
             )
         }
         "fixture.blue" | "fixture.red" => {

@@ -233,14 +233,31 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         .unwrap();
     assert_eq!(flipped.status.as_deref(), Some("Fixture: flag on"));
     assert!(flipped.ops.is_empty());
+    // The toggle is a view switch (#1553): the reply sets it, and the state
+    // reads it back from the view the host sends.
+    let view = flipped.view.clone().unwrap();
     assert_eq!(
-        ui.state(&ctx(Vec::new(), None))
-            .unwrap()
-            .control("fixture.flag")
-            .checked,
+        view.get("switches")
+            .and_then(|s| s.get("fixture.flag"))
+            .and_then(Json::as_bool),
         Some(true)
     );
-    ui.command(&cmd("fixture.flag", vec![], None)).unwrap();
+    let on = StateCtx {
+        view: view.clone(),
+        ..ctx(Vec::new(), None)
+    };
+    assert_eq!(
+        ui.state(&on).unwrap().control("fixture.flag").checked,
+        Some(true)
+    );
+    let off = ui
+        .command(&Command {
+            view,
+            ..cmd("fixture.flag", vec![], None)
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(off.status.as_deref(), Some("Fixture: flag off"));
     let renamed = ui
         .command(&cmd("fixture.rename", vec![3, 4], None))
         .unwrap()

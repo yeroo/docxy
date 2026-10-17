@@ -168,11 +168,43 @@ pub struct Formatting {
     pub cell_styles: Vec<CellStyle>,
     pub gridlines: Option<String>,
     pub link_style: Option<String>,
+    /// Named view switches a UI plugin owns (Project's per-view toggles
+    /// such as Slack, Late Tasks or a Task Path kind), sorted by name
+    /// (#1553). The hosts keep none of their own here: `critical`,
+    /// `baseline` and `timeline` stay the view's.
+    pub switches: Vec<(String, bool)>,
 }
 
 impl Formatting {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// A switch's state, when one is stored.
+    pub fn switch(&self, name: &str) -> Option<bool> {
+        self.switches
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, on)| *on)
+    }
+
+    /// Set a switch, or clear it with `None`; the list stays sorted.
+    pub fn set_switch(&mut self, name: &str, on: Option<bool>) {
+        self.switches.retain(|(n, _)| n != name);
+        if let Some(on) = on {
+            self.switches.push((name.to_string(), on));
+            self.switches.sort();
+        }
+    }
+
+    /// The switches as the view JSON carries them: `{"name": true, ...}`.
+    pub fn switches_json(&self) -> Json {
+        Json::Obj(
+            self.switches
+                .iter()
+                .map(|(n, on)| (n.clone(), Json::Bool(*on)))
+                .collect(),
+        )
     }
 
     /// The style of `category`, when one is set.
@@ -249,6 +281,19 @@ impl Formatting {
         if let Some(l) = text(view, "link_style")? {
             self.link_style = l;
         }
+        match view.get("switches") {
+            None | Some(Json::Null) => {}
+            Some(Json::Obj(pairs)) => {
+                for (name, on) in pairs {
+                    match on {
+                        Json::Bool(on) => self.set_switch(name, Some(*on)),
+                        Json::Null => self.set_switch(name, None),
+                        _ => return Err(format!("view.switches.{name} is not a boolean or null")),
+                    }
+                }
+            }
+            Some(_) => return Err("view.switches is not an object".into()),
+        }
         match view.get("text_styles") {
             None | Some(Json::Null) => {}
             Some(Json::Obj(pairs)) => {
@@ -305,6 +350,12 @@ impl Formatting {
             c.style.attrs(&mut out);
             out.push_str("/>\n");
         }
+        for (name, on) in &self.switches {
+            out.push_str("  <switch");
+            push_attr(&mut out, "name", name);
+            push_attr(&mut out, "on", if *on { "1" } else { "0" });
+            out.push_str("/>\n");
+        }
         out.push_str("</formatting>\n");
         out
     }
@@ -345,6 +396,17 @@ impl Formatting {
                                 let column = decode(parser.attr("column"));
                                 if let Some(uid) = uid.filter(|_| !column.is_empty()) {
                                     out.set_cell(uid, &column, TextStyle::from_attrs(&parser));
+                                }
+                            }
+                            "switch" => {
+                                let name = decode(parser.attr("name"));
+                                let on = match decode(parser.attr("on")).trim() {
+                                    "1" | "true" => Some(true),
+                                    "0" | "false" => Some(false),
+                                    _ => None,
+                                };
+                                if let Some(on) = on.filter(|_| !name.is_empty()) {
+                                    out.set_switch(&name, Some(on));
                                 }
                             }
                             _ => {}
@@ -456,6 +518,8 @@ mod tests {
             link_style: None,
             ..Formatting::default()
         };
+        f.set_switch("fx.slack", Some(true));
+        f.set_switch("fx.late", Some(false));
         f.set_category(
             "Summary Tasks",
             TextStyle {
@@ -501,6 +565,8 @@ mod tests {
             xml.contains(r##"<cell uid="3" column="Name" color="#FF0000"/>"##),
             "{xml}"
         );
+        assert!(xml.contains(r#"<switch name="fx.late" on="0"/>"#), "{xml}");
+        assert!(xml.contains(r#"<switch name="fx.slack" on="1"/>"#), "{xml}");
         assert_eq!(Formatting::from_xml(&xml).unwrap(), f);
         assert_eq!(
             Formatting::from_xml("<formatting/>").unwrap(),
@@ -549,6 +615,41 @@ mod tests {
         assert_eq!(f.category("All").unwrap().size, Some(9.0));
         assert_eq!(f.cell(2, "Duration").unwrap().italic, Some(true));
         assert_eq!(f.link_style.as_deref(), Some("rectilinear"));
+        // Switches: set, kept sorted, cleared by null, refused when not a
+        // boolean; the host's own flags (`critical`) are not stored.
+        assert!(
+            f.apply_view(
+                &Json::parse(r#"{"switches":{"fx.slack":true,"fx.late":false}}"#).unwrap()
+            )
+            .unwrap()
+        );
+        assert_eq!(f.switch("fx.slack"), Some(true));
+        assert_eq!(f.switch("fx.late"), Some(false));
+        assert_eq!(f.switch("critical"), None);
+        assert_eq!(
+            f.switches,
+            [
+                ("fx.late".to_string(), false),
+                ("fx.slack".to_string(), true)
+            ]
+        );
+        assert_eq!(
+            f.switches_json().to_string(),
+            r#"{"fx.late":false,"fx.slack":true}"#
+        );
+        assert!(
+            f.apply_view(&Json::parse(r#"{"switches":{"fx.late":null}}"#).unwrap())
+                .unwrap()
+        );
+        assert_eq!(f.switch("fx.late"), None);
+        assert!(
+            f.apply_view(&Json::parse(r#"{"switches":{"fx.late":"yes"}}"#).unwrap())
+                .is_err()
+        );
+        assert!(
+            f.apply_view(&Json::parse(r#"{"switches":[]}"#).unwrap())
+                .is_err()
+        );
         // Nulls clear; an unchanged view changes nothing.
         let clear =
             Json::parse(r#"{"palette":null,"text_styles":{"All":null},"gridlines":null}"#).unwrap();
