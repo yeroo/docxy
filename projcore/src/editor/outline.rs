@@ -1,7 +1,9 @@
 //! View › Data › Outline: Show/Hide Subtasks. A collapsed summary hides its
 //! whole subtree from the grid and the Gantt. It is view state: not in the
 //! model, the undo history or a saved file, and a new document starts with
-//! every summary expanded. The selected row is never hidden.
+//! every summary expanded. The selected row is never hidden by a collapsed
+//! summary; the hidden project summary row (UID 0) is the exception when an
+//! explicit `select` put the selection on it (`sel_pinned`).
 use super::*;
 use std::collections::BTreeSet;
 
@@ -70,7 +72,8 @@ impl Editor {
         Ok(summary)
     }
 
-    /// Task indexes in outline order, without the rows collapsed summaries hide.
+    /// Task indexes in outline order, without the rows collapsed summaries hide
+    /// or, unless [`Self::show_summary_task`], the project summary row (UID 0).
     pub fn visible_rows(&self) -> Vec<usize> {
         self.hidden_owners()
             .iter()

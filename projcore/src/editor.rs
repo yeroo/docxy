@@ -232,7 +232,9 @@ impl Editor {
     pub fn sel(&self) -> usize {
         self.sel
     }
-    /// Select a row, expanding any collapsed summary that hides it.
+    /// Select a row, expanding any collapsed summary that hides it. The hidden
+    /// project summary row (UID 0) can be selected too, and an edit leaves the
+    /// selection there (`sel_pinned`); any other move off it is automatic.
     pub fn select(&mut self, index: usize) {
         self.sel = index.min(self.proj.tasks.len().saturating_sub(1));
         self.sel_pinned = self
