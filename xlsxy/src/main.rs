@@ -8034,7 +8034,10 @@ impl App {
         };
         if !key.modifiers.contains(KeyModifiers::CONTROL)
             || key.modifiers.contains(KeyModifiers::ALT)
-            || !self.backstage.as_ref().is_some_and(|b| b.name_has_keyboard())
+            || !self
+                .backstage
+                .as_ref()
+                .is_some_and(|b| b.name_has_keyboard())
         {
             return false;
         }
@@ -15650,7 +15653,10 @@ mod tests {
         app.backstage_key(ctrl('x'));
         assert_eq!(name(&app).as_deref(), Some(""));
         assert_eq!(app.clip_text.as_deref(), Some("xy"));
-        let altgr = KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let altgr = KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
         app.backstage_key(altgr);
         assert_eq!(name(&app).as_deref(), Some("@"));
     }

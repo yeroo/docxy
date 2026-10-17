@@ -979,7 +979,10 @@ mod tests {
         assert_eq!(bs.name_input, "xy");
         assert_eq!(bs.name_cursor, 2);
         bs.key(ctrl_a(), &TestHost);
-        assert!(!bs.name_paste("\nignored"), "an empty paste changes nothing");
+        assert!(
+            !bs.name_paste("\nignored"),
+            "an empty paste changes nothing"
+        );
         assert_eq!(bs.name_input, "xy");
         assert_eq!(bs.save_as_name_field().selection, Some((0, 2)));
         assert!(bs.name_paste("Q"));

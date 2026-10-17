@@ -1201,7 +1201,10 @@ impl App {
         };
         if !key.modifiers.contains(KeyModifiers::CONTROL)
             || key.modifiers.contains(KeyModifiers::ALT)
-            || !self.backstage.as_ref().is_some_and(|b| b.name_has_keyboard())
+            || !self
+                .backstage
+                .as_ref()
+                .is_some_and(|b| b.name_has_keyboard())
         {
             return false;
         }
@@ -5294,12 +5297,19 @@ mod tests {
         app.clip_text = Some("\nX".into());
         press_ctrl(&mut app, 'a');
         press_ctrl(&mut app, 'v');
-        assert_eq!(field_state(&app).0, "abcdQ", "an empty paste changes nothing");
+        assert_eq!(
+            field_state(&app).0,
+            "abcdQ",
+            "an empty paste changes nothing"
+        );
         press_ctrl(&mut app, 'x');
         assert_eq!(field_state(&app).0, "");
         assert_eq!(app.clip_text.as_deref(), Some("abcdQ"));
         assert_eq!(app.status, "Cut");
-        let altgr = KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let altgr = KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
         on_key(&mut app, altgr);
         assert_eq!(field_state(&app).0, "@");
     }
@@ -5342,7 +5352,10 @@ mod tests {
         press_ctrl(&mut app, 'x');
         assert_eq!(name(&app).as_deref(), Some(""));
         assert_eq!(app.status, "Cut");
-        let altgr = KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let altgr = KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
         on_key(&mut app, altgr);
         assert_eq!(name(&app).as_deref(), Some("@"));
     }

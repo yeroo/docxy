@@ -2576,7 +2576,10 @@ impl App {
         };
         if !key.modifiers.contains(KeyModifiers::CONTROL)
             || key.modifiers.contains(KeyModifiers::ALT)
-            || !self.backstage.as_ref().is_some_and(|b| b.name_has_keyboard())
+            || !self
+                .backstage
+                .as_ref()
+                .is_some_and(|b| b.name_has_keyboard())
         {
             return false;
         }
@@ -10548,7 +10551,10 @@ mod tests {
         for c in ['c', 'x', 'v', 'z', 'q'] {
             app.comment_input_key(ctrl(KeyCode::Char(c)));
         }
-        assert_eq!(app.input_field("docxy-comment").value.as_deref(), Some("abcd"));
+        assert_eq!(
+            app.input_field("docxy-comment").value.as_deref(),
+            Some("abcd")
+        );
         app.comment_input_key(ctrl(KeyCode::Char('a')));
         app.comment_input_key(ctrl(KeyCode::Char('c')));
         assert_eq!(app.clip_text.as_deref(), Some("abcd"));
@@ -10556,7 +10562,10 @@ mod tests {
         app.comment_input_key(key(KeyCode::End));
         app.clip_text = Some("Q\nR".into());
         app.comment_input_key(ctrl(KeyCode::Char('v')));
-        assert_eq!(app.input_field("docxy-comment").value.as_deref(), Some("abcdQ"));
+        assert_eq!(
+            app.input_field("docxy-comment").value.as_deref(),
+            Some("abcdQ")
+        );
         app.clip_text = Some("\nX".into());
         app.comment_input_key(ctrl(KeyCode::Char('a')));
         app.comment_input_key(ctrl(KeyCode::Char('v')));
@@ -10569,7 +10578,10 @@ mod tests {
         assert_eq!(app.input_field("docxy-comment").value.as_deref(), Some(""));
         assert_eq!(app.clip_text.as_deref(), Some("abcdQ"));
         assert_eq!(app.status.as_deref(), Some("Cut"));
-        let altgr = KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let altgr = KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
         app.comment_input_key(altgr);
         assert_eq!(app.input_field("docxy-comment").value.as_deref(), Some("@"));
     }
