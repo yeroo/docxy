@@ -114,6 +114,16 @@ test the row menu's item comes after Notes..., needs a task and renames it as on
   call menu-click {"label":"Rename (fixture)"}
   assert selected_name is Renamed by fixture
   assert status is Fixture: renamed task 2
+  # A shift+down range reaches the command whole (#1571): the status counts
+  # the two selected tasks, and the range is still there afterwards.
+  key ctrl+z
+  click C1
+  key shift+down
+  call menu-open {"target":{"row":1}}
+  call menu-click {"label":"Rename (fixture)"}
+  assert status is Fixture: renamed task 2 of 2 selected
+  call proj.path {}
+  assert reply.selection is 2
   assert dirty is true
   key ctrl+z
   assert selected_name is B

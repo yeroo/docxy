@@ -204,10 +204,23 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
             )
         }
         "fixture.rename" => match first_uid(&req) {
-            Some(uid) => format!(
-                r#"{{"ops":[{{"verb":"task.set","args":{{"uid":{uid},"name":"Renamed by fixture"}}}}],"status":{}}}"#,
-                quote(&format!("Fixture: renamed task {uid}"))
-            ),
+            Some(uid) => {
+                // The selection's size shows the host kept the range (#1571).
+                let selected = req
+                    .get("selection")
+                    .and_then(|s| s.get("uids"))
+                    .map(|u| u.list().len())
+                    .unwrap_or(1);
+                let status = if selected > 1 {
+                    format!("Fixture: renamed task {uid} of {selected} selected")
+                } else {
+                    format!("Fixture: renamed task {uid}")
+                };
+                format!(
+                    r#"{{"ops":[{{"verb":"task.set","args":{{"uid":{uid},"name":"Renamed by fixture"}}}}],"status":{}}}"#,
+                    quote(&status)
+                )
+            }
             None => r#"{"ops":[],"status":"Fixture: select a task first"}"#.to_string(),
         },
         _ => {
