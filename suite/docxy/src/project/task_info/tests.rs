@@ -387,7 +387,11 @@ fn a_deadline_with_a_time_keeps_it_and_the_field_round_trips() {
     open(&mut t, ProjectAct::Constraint);
     assert_eq!(read(&t, "deadline"), "2026-03-02T12:30");
     dialog_click(&mut t, "OK").unwrap();
-    assert_eq!(v(&t).ed.undo_depth(), 1, "an untouched field writes nothing");
+    assert_eq!(
+        v(&t).ed.undo_depth(),
+        1,
+        "an untouched field writes nothing"
+    );
     // The end of the day shows as the bare date.
     t.dialogs.clear();
     open(&mut t, ProjectAct::Constraint);

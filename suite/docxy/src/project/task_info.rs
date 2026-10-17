@@ -299,11 +299,7 @@ fn whole(d: &Dialog, name: &str, what: &str, lo: i32, hi: i32) -> Result<i32, St
 
 /// Write what the person changed in `d` to task `uid`, as one undo step.
 /// A refused field changes nothing.
-pub(crate) fn apply_task_info(
-    ed: &mut ProjectEditor,
-    uid: i32,
-    d: &Dialog,
-) -> Result<(), String> {
+pub(crate) fn apply_task_info(ed: &mut ProjectEditor, uid: i32, d: &Dialog) -> Result<(), String> {
     let changed = |name: &str| d.changed(name);
     ed.batch(|ed| {
         // Task type and Effort driven first: a resource added below rescales
