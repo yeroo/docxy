@@ -3196,7 +3196,7 @@ fn menu_open(
                     .ok_or_else(|| format!("no task with uid {uid}"))?;
                 if !v.ed.display_rows().contains(&row) {
                     return Err(format!(
-                        "task {uid} is hidden (under a collapsed summary or by the AutoFilter); there is no row to right-click"
+                        "task {uid} is hidden under a collapsed summary or by the AutoFilter; there is no row to right-click"
                     ));
                 }
                 let probe = format!("project-cell:{}:{}", tasks[row].id, v.col);
@@ -3219,7 +3219,7 @@ fn menu_open(
                     .ok_or_else(|| format!("no task with uid {uid}"))?;
                 if !v.ed.display_rows().contains(&row) {
                     return Err(format!(
-                        "task {uid} is hidden (under a collapsed summary or by the AutoFilter); there is no bar to right-click"
+                        "task {uid} is hidden under a collapsed summary or by the AutoFilter; there is no bar to right-click"
                     ));
                 }
                 let task = &tasks[row];
@@ -3254,9 +3254,10 @@ fn menu_open(
                     .center();
                 app.open_column_menu(col, at, window, cx)
             }
-            // A click on that heading's AutoFilter arrow (#1533): its
-            // drop-down opens as a dialog (read it with `dialog-read`), as
-            // the sheet's filter button's does.
+            // That heading's AutoFilter drop-down (#1533), as its arrow opens
+            // it, whether or not the heading is scrolled into view: it opens
+            // as a dialog (read it with `dialog-read`), as the sheet's filter
+            // button's does.
             "filter" => {
                 let name = fields[0]
                     .1
@@ -3269,7 +3270,6 @@ fn menu_open(
                 ) {
                     return Err("a filter menu needs a Project tab".into());
                 }
-                app.region_bounds_live(Region::ProjectHeadingArrow(col), window)?;
                 app.open_project_filter(col, window, cx)
             }
             "ribbon" => {
@@ -5261,7 +5261,7 @@ fn dispatch_verb(
                 }
                 if target.row.is_none() {
                     return Err(
-                        "that task is hidden (under a collapsed summary or by the AutoFilter); expand or clear the filter to click it"
+                        "that task is hidden under a collapsed summary or by the AutoFilter; expand or clear the filter to click it"
                             .into(),
                     );
                 }
