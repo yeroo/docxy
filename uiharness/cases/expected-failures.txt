@@ -31,7 +31,6 @@ backstage-inputs-typing.uit | rename sheet-tab-rename: pastes | #1365
 
 # The Project cell editor has no selection: Ctrl+A is ignored, so typing
 # after it appends instead of replacing (#1203 found it).
-project-inputs-typing.uit | project project-cell: select-all replaces | #1369
 
 # docxy's prompts are append-only: no caret, so Home, End, Left, Right and
 # Delete do nothing (the Find bar's two fields, the new comment's text,

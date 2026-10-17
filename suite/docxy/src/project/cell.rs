@@ -37,6 +37,9 @@ pub(crate) struct CellEdit {
     pub buf: String,
     /// UTF-8 byte boundary.
     pub caret: usize,
+    /// The other end of the selection (a UTF-8 byte boundary); the selection
+    /// runs between it and `caret`, and is empty when they meet.
+    pub anchor: Option<usize>,
     pub last_error: Option<String>,
 }
 
@@ -57,23 +60,40 @@ impl CellEdit {
                     .map(char::len_utf8)
                     .unwrap_or(0)
         };
+        let (p, n) = (prev(), next());
+        let selection = self.selection();
         match key {
-            "left" => self.caret = prev(),
-            "right" => self.caret = next(),
-            "home" => self.caret = 0,
-            "end" => self.caret = self.buf.len(),
+            "left" => {
+                self.caret = selection.map_or(p, |r| r.start);
+                self.anchor = None;
+            }
+            "right" => {
+                self.caret = selection.map_or(n, |r| r.end);
+                self.anchor = None;
+            }
+            "home" => {
+                self.caret = 0;
+                self.anchor = None;
+            }
+            "end" => {
+                self.caret = self.buf.len();
+                self.anchor = None;
+            }
             "backspace" => {
-                let p = prev();
-                self.buf.replace_range(p..self.caret, "");
-                self.caret = p;
+                if !self.delete_selection() {
+                    self.buf.replace_range(p..self.caret, "");
+                    self.caret = p;
+                }
             }
             "delete" => {
-                let n = next();
-                self.buf.replace_range(self.caret..n, "");
+                if !self.delete_selection() {
+                    self.buf.replace_range(self.caret..n, "");
+                }
             }
             _ => {
                 if let Some(text) = text {
                     let text: String = text.chars().filter(|c| !c.is_control()).collect();
+                    self.delete_selection();
                     self.buf.insert_str(self.caret, &text);
                     self.caret += text.len();
                 }
@@ -81,26 +101,63 @@ impl CellEdit {
         }
     }
 
+    /// The selected byte range, or `None` when it is empty.
+    pub fn selection(&self) -> Option<std::ops::Range<usize>> {
+        let a = self.anchor?;
+        (a != self.caret).then(|| a.min(self.caret)..a.max(self.caret))
+    }
+
+    /// Ctrl+A: select the whole buffer, the caret at its end.
+    pub fn select_all(&mut self) {
+        self.anchor = Some(0);
+        self.caret = self.buf.len();
+    }
+
+    /// Remove the selection, the caret at its start; false when there is none.
+    fn delete_selection(&mut self) -> bool {
+        let selection = self.selection();
+        self.anchor = None;
+        let Some(r) = selection else {
+            return false;
+        };
+        self.caret = r.start;
+        self.buf.replace_range(r, "");
+        true
+    }
+
     /// Paste at the caret: a CRLF pair counts as one break; trailing line
     /// breaks are dropped (a copied cell's) and every remaining tab or line
     /// break becomes a space, as [`project_copy_text`] sanitises a field.
     /// Control characters a copy can carry (from Word, say) are dropped, as
     /// [`Self::key`] drops typed ones — committed they would write invalid
-    /// XML. The caret follows the inserted bytes.
+    /// XML. The caret follows the inserted bytes; a selection is replaced.
     pub fn paste(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n");
         let text = text.trim_end_matches(['\r', '\n']);
         let text = text.replace(['\t', '\r', '\n'], " ");
         let text: String = text.chars().filter(|c| !c.is_control()).collect();
+        self.delete_selection();
         self.buf.insert_str(self.caret, &text);
         self.caret += text.len();
     }
 
-    /// Cut: the whole buffer leaves with the caller (the editor has no
-    /// selection); the edit continues empty, the caret at the start.
+    /// What Copy and Cut take: the selection, else the whole buffer (#561).
+    pub fn copy_text(&self) -> String {
+        match self.selection() {
+            Some(r) => self.buf[r].to_owned(),
+            None => self.buf.clone(),
+        }
+    }
+
+    /// Cut: the selection leaves with the caller, else the whole buffer; the
+    /// edit continues without it, the caret where it was.
     pub fn cut(&mut self) -> String {
-        self.caret = 0;
-        std::mem::take(&mut self.buf)
+        let text = self.copy_text();
+        if !self.delete_selection() {
+            self.caret = 0;
+            self.buf.clear();
+        }
+        text
     }
 
     /// Scroll the buffer by its measured width, leaving room for the caret.
@@ -265,6 +322,7 @@ impl ProjectView {
             col: self.col,
             initial,
             caret: buf.len(),
+            anchor: None,
             buf,
         });
         self.reveal_col();

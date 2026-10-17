@@ -693,17 +693,23 @@ fn project_double(id: &str) -> Option<bool> {
 }
 
 /// `field-read {"input":id}` for a Project input, in the sheet inputs'
-/// shape. The cell editor's caret is a byte offset, read in chars; it has
-/// no selection. Idle, it reads the text the cursor's cell would open with
+/// shape. The cell editor's caret is a byte offset, read in chars, as is its
+/// selection (null when empty). Idle, it reads the text the cursor's cell would open with
 /// (none on the entry row).
 fn read_project(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
     let v = crate::harness::project(app)?;
-    let (value, focused, caret) = match i.id {
+    let (value, focused, caret, selection) = match i.id {
         "project-cell" => match &v.cell {
             Some(c) => (
                 Json::Str(c.buf.clone()),
                 true,
                 Json::Num(char_caret(&c.buf, c.caret) as f64),
+                c.selection().map_or(Json::Null, |r| {
+                    Json::Arr(vec![
+                        Json::Num(char_caret(&c.buf, r.start) as f64),
+                        Json::Num(char_caret(&c.buf, r.end) as f64),
+                    ])
+                }),
             ),
             None => {
                 let text =
@@ -711,12 +717,17 @@ fn read_project(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
                         .tasks
                         .get(v.cursor_row())
                         .map(|t| crate::cell_edit_text(&v.ed, t, v.col));
-                (text.map_or(Json::Null, Json::Str), false, Json::Null)
+                (
+                    text.map_or(Json::Null, Json::Str),
+                    false,
+                    Json::Null,
+                    Json::Null,
+                )
             }
         },
         _ => return Err(not_covered(i)),
     };
-    Ok(field_json(i.id, value, focused, caret, Json::Null))
+    Ok(field_json(i.id, value, focused, caret, selection))
 }
 
 /// A byte offset into `buf` as the chars before it, the unit `field-read`

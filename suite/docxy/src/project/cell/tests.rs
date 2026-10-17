@@ -605,6 +605,7 @@ fn caret_edits_utf8_and_long_buffer_window_tracks_it() {
         initial: String::new(),
         buf: "aλ🙂z".into(),
         caret: 8,
+        anchor: None,
     };
     c.key("left", None);
     c.key("backspace", None);
@@ -636,6 +637,7 @@ fn cell_edit_paste_inserts_at_the_caret_and_moves_it() {
         initial: "ac".into(),
         buf: "ac".into(),
         caret: 1,
+        anchor: None,
     };
     c.paste("b");
     assert_eq!(c.buf, "abc");
@@ -655,6 +657,7 @@ fn cell_edit_paste_spaces_tabs_and_line_breaks_and_drops_the_trailing_ones() {
         initial: String::new(),
         buf: String::new(),
         caret: 0,
+        anchor: None,
     };
     // As a copied cell's text: the trailing line break is dropped and every
     // remaining tab or line break becomes a space.
@@ -676,6 +679,7 @@ fn cell_edit_paste_counts_a_crlf_pair_as_one_break() {
         initial: String::new(),
         buf: String::new(),
         caret: 0,
+        anchor: None,
     };
     c.paste("Line 1\r\nLine 2");
     assert_eq!(c.buf, "Line 1 Line 2");
@@ -691,6 +695,7 @@ fn cell_edit_paste_drops_control_characters_a_copy_can_carry() {
         initial: String::new(),
         buf: String::new(),
         caret: 0,
+        anchor: None,
     };
     // Word copies can carry \x0b, \x0c, \x1b or NUL; typed text drops controls
     // in key(), and a paste must not land them in the project either — the
@@ -722,6 +727,7 @@ fn cell_edit_cut_takes_the_whole_buffer_and_empties_it() {
         initial: "Task 2".into(),
         buf: "Task 2".into(),
         caret: 3,
+        anchor: None,
     };
     assert_eq!(c.cut(), "Task 2");
     assert!(c.buf.is_empty());
@@ -2359,4 +2365,93 @@ fn a_heading_press_reveals_its_column_but_scrolls_no_row_into_view() {
     project_cell_press(&mut t, 2, COL_ID, false);
     assert_eq!(take_reveal(&t), Some(2));
     assert_eq!(v(&t).table_x.get(), 0.);
+}
+
+fn cell_with(buf: &str, caret: usize) -> CellEdit {
+    CellEdit {
+        last_error: None,
+        uid: Some(1),
+        col: COL_NAME,
+        initial: buf.into(),
+        buf: buf.into(),
+        caret,
+        anchor: None,
+    }
+}
+
+#[test]
+fn select_all_then_text_paste_backspace_and_delete_replace_it() {
+    let mut c = cell_with("abcd", 4);
+    c.select_all();
+    assert_eq!(c.selection(), Some(0..4));
+    c.key("x", Some("X"));
+    assert_eq!((c.buf.as_str(), c.caret, c.selection()), ("X", 1, None));
+    let mut c = cell_with("abcd", 2);
+    c.select_all();
+    c.paste("Z\n");
+    assert_eq!((c.buf.as_str(), c.caret), ("Z", 1));
+    for k in ["backspace", "delete"] {
+        let mut c = cell_with("abcd", 2);
+        c.select_all();
+        c.key(k, None);
+        assert_eq!((c.buf.as_str(), c.caret, c.selection()), ("", 0, None));
+    }
+}
+
+#[test]
+fn select_all_collapses_on_arrows_and_is_none_when_empty() {
+    for (k, caret) in [("left", 0), ("home", 0), ("right", 4), ("end", 4)] {
+        let mut c = cell_with("abcd", 2);
+        c.select_all();
+        c.key(k, None);
+        assert_eq!((c.caret, c.selection()), (caret, None), "{k}");
+    }
+    let mut c = cell_with("", 0);
+    c.select_all();
+    assert_eq!(c.selection(), None);
+}
+
+#[test]
+fn copy_and_cut_take_the_selection_else_the_buffer() {
+    let mut c = cell_with("abcd", 4);
+    assert_eq!(c.copy_text(), "abcd");
+    c.anchor = Some(1);
+    c.caret = 3;
+    assert_eq!(c.copy_text(), "bc");
+    assert_eq!(c.cut(), "bc");
+    assert_eq!((c.buf.as_str(), c.caret, c.selection()), ("ad", 1, None));
+    assert_eq!(c.cut(), "ad");
+    assert_eq!((c.buf.as_str(), c.caret), ("", 0));
+}
+
+#[test]
+fn selection_offsets_stay_on_char_boundaries() {
+    let mut c = cell_with("a\u{e9}\u{65e5}", 6);
+    c.select_all();
+    assert_eq!(c.selection(), Some(0..6));
+    c.anchor = Some(1);
+    c.caret = 3;
+    assert_eq!(c.copy_text(), "\u{e9}");
+    c.key("backspace", None);
+    assert_eq!(c.buf, "a\u{65e5}");
+}
+
+#[test]
+fn ctrl_a_in_an_open_cell_selects_and_keeps_the_range_anchor() {
+    let mut t = tab();
+    let Surface::Project(pv) = &mut t.surface else {
+        panic!()
+    };
+    pv.open_cell(Some("abcd")).unwrap();
+    pv.anchor = Some((10, COL_NAME));
+    let m = Modifiers {
+        control: true,
+        ..Modifiers::default()
+    };
+    assert!(project_input(&mut t, "a", None, m).is_none());
+    let Surface::Project(pv) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(pv.cell.as_ref().unwrap().selection(), Some(0..4));
+    assert!(pv.anchor.is_some());
 }

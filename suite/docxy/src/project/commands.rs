@@ -1113,6 +1113,14 @@ pub(crate) fn project_input(
         if let Some(act @ (ProjectAct::NewProject | ProjectAct::NewWindow)) = key_act(key, m) {
             return commit_project_cell(tab).then_some(act);
         }
+        // Ctrl+A selects the buffer; the edit stays open, so the range anchor
+        // survives like it does for Copy.
+        if m.control && !m.alt && !m.platform && key == "a" {
+            if let Some(cell) = &mut v.cell {
+                cell.select_all();
+            }
+            return None;
+        }
         // #561: the host edits the open cell's buffer in place; the edit
         // stays open, so the range anchor survives like it does for Copy.
         if let Some(act @ (ProjectAct::Copy | ProjectAct::Cut | ProjectAct::Paste)) =
@@ -2259,8 +2267,8 @@ impl Docxy {
         }
     }
     /// Copy/Cut/Paste with a cell editor open take the buffer, not the table
-    /// (#561). Copy and Cut put the whole buffer on the system clipboard (the
-    /// editor has no selection); Cut empties the buffer only when the read-
+    /// (#561). Copy and Cut put the selection (else the whole buffer) on the system
+    /// clipboard; Cut removes it only when the read-
     /// back clipboard holds the buffer's text — a silently failed write (a
     /// busy OS clipboard) otherwise keeps the buffer and the status says so.
     /// Paste inserts the clipboard's text at the caret. The edit stays open;
@@ -2277,7 +2285,7 @@ impl Docxy {
             return;
         }
         let text = self.tabs.get(self.active).and_then(|t| match &t.surface {
-            Surface::Project(v) => v.cell.as_ref().map(|c| c.buf.clone()),
+            Surface::Project(v) => v.cell.as_ref().map(|c| c.copy_text()),
             _ => None,
         });
         let Some(text) = text else {
