@@ -1,7 +1,8 @@
 //! A format plugin for tests: it declares one type, `.fakeproj`, whose files
 //! are MSPDI XML passed through unchanged, over the C ABI that
 //! `projcore::plugin_abi` documents. It is dependency-free on purpose, so it
-//! exercises the ABI as a plugin in any language would.
+//! exercises the ABI as a plugin in any language would. It declares the type
+//! `"default": true`, so hosts propose `.fakeproj` for a new plan's Save As.
 //!
 //! Two behaviours exist to test the host's plumbing:
 //! - reading an empty file fails with code 2 and the message "empty
@@ -24,7 +25,8 @@ const OK: i32 = 0;
 const UNSUPPORTED_EXTENSION: i32 = 1;
 const MALFORMED_INPUT: i32 = 2;
 
-const FORMATS: &str = r#"[{"ext":"fakeproj","label":"Fake Project","read":true,"write":true}]"#;
+const FORMATS: &str =
+    r#"[{"ext":"fakeproj","label":"Fake Project","read":true,"write":true,"default":true}]"#;
 
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
 

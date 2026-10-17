@@ -13,7 +13,7 @@
 //! typedef struct { uint8_t* ptr; size_t len; } YppxBuf;
 //!
 //! uint32_t yppx_plugin_abi(void);                         // returns 1
-//! int32_t  yppx_plugin_formats(YppxBuf* out);             // JSON array of {ext, label, read, write}
+//! int32_t  yppx_plugin_formats(YppxBuf* out);             // JSON array of {ext, label, read, write, default}
 //! int32_t  yppx_plugin_read (const char* ext, const uint8_t* file, size_t len, YppxBuf* mspdi_out);
 //! int32_t  yppx_plugin_write(const char* ext, const uint8_t* mspdi, size_t len,
 //!                            const uint8_t* source_file, size_t source_len,   // bytes of the file this plan
@@ -167,7 +167,7 @@ pub type FreeFn = unsafe extern "C" fn(buf: *mut YppxBuf);
 pub type LastErrorFn = unsafe extern "C" fn(utf8_out: *mut YppxBuf) -> i32;
 
 /// One entry of the formats JSON: a file type the plugin reads and/or writes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FormatDecl {
     /// The extension, lower-case, without the dot.
     pub ext: String,
@@ -177,6 +177,10 @@ pub struct FormatDecl {
     pub read: bool,
     /// The plugin writes this type (`yppx_plugin_write`).
     pub write: bool,
+    /// The plugin asks for this type to be the default save type: written,
+    /// it is what Save As proposes for a new plan (see
+    /// [`crate::formats::Registry::default_save_extension`]).
+    pub default: bool,
 }
 
 /// Parse the formats JSON `yppx_plugin_formats` returns: an array of
@@ -188,8 +192,11 @@ pub struct FormatDecl {
 ///
 /// `ext` (the extension, with or without its dot, any case; letters, digits,
 /// `_` and `-`) and `label` (a non-empty name for Open and Save As lists) are
-/// required strings; `read` and `write` are booleans, false when absent.
-/// Other keys are ignored, so a later ABI can add some.
+/// required strings; `read`, `write` and `default` are booleans, false when
+/// absent. `"default": true` on a type the plugin writes makes it the type
+/// Save As proposes for a new plan
+/// ([`crate::formats::Registry::default_save_extension`]). Other keys are
+/// ignored, so a later ABI can add some.
 pub fn parse_formats(json: &str) -> Result<Vec<FormatDecl>, String> {
     let mut parser = Parser {
         s: json.as_bytes(),
@@ -221,7 +228,11 @@ pub fn formats_json(decls: &[FormatDecl]) -> String {
         quote(&mut out, &d.ext);
         out.push_str(",\"label\":");
         quote(&mut out, &d.label);
-        out.push_str(&format!(",\"read\":{},\"write\":{}}}", d.read, d.write));
+        out.push_str(&format!(",\"read\":{},\"write\":{}", d.read, d.write));
+        if d.default {
+            out.push_str(",\"default\":true");
+        }
+        out.push('}');
     }
     out.push(']');
     out
@@ -277,6 +288,7 @@ fn decl(n: usize, item: Json) -> Result<FormatDecl, String> {
         label,
         read: flag("read")?,
         write: flag("write")?,
+        default: flag("default")?,
     })
 }
 
@@ -487,6 +499,7 @@ mod tests {
             label: label.into(),
             read,
             write,
+            default: false,
         }
     }
 
@@ -510,6 +523,27 @@ mod tests {
             ]
         );
         assert_eq!(parse_formats("[]").unwrap(), vec![]);
+    }
+
+    #[test]
+    fn reads_the_default_flag_and_ignores_unknown_keys() {
+        let json = r#"[{"ext":"mpp","label":"Project","read":true,"write":true,"default":true,
+                "since":{"abi":2,"note":["later"]}},
+            {"ext":"mpx","label":"Exchange","write":true,"default":false,"icon":null},
+            {"ext":"p6","label":"P6","read":true,"default":null,"rank":-1.5}]"#;
+        assert_eq!(
+            parse_formats(json).unwrap(),
+            vec![
+                FormatDecl {
+                    default: true,
+                    ..decl("mpp", "Project", true, true)
+                },
+                decl("mpx", "Exchange", false, true),
+                decl("p6", "P6", true, false),
+            ]
+        );
+        let got = parse_formats(r#"[{"ext":"x","label":"X","default":"yes"}]"#).unwrap_err();
+        assert!(got.contains("\"default\" is not true or false"), "{got}");
     }
 
     #[test]
@@ -562,9 +596,18 @@ mod tests {
     fn formats_json_round_trips() {
         let decls = vec![
             decl("mpp", "Project \"2024\"\\\n\u{1}", true, true),
-            decl("fakeproj", "Fake", false, true),
+            FormatDecl {
+                default: true,
+                ..decl("fakeproj", "Fake", false, true)
+            },
         ];
         assert_eq!(parse_formats(&formats_json(&decls)).unwrap(), decls);
+        // A type that is not the default is written as before the flag.
+        assert_eq!(
+            formats_json(&[decl("mpp", "P", true, false)]),
+            r#"[{"ext":"mpp","label":"P","read":true,"write":false}]"#
+        );
+        assert!(formats_json(&decls).ends_with(r#""write":true,"default":true}]"#));
     }
 
     #[test]

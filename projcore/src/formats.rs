@@ -6,7 +6,8 @@
 //! more: `mppread`'s read-only `.mpp` import, and the format plugins
 //! `plugin::load_plugins` finds (behind the `plugins` feature, so the
 //! default build stays dependency-free). The registry is what the Open
-//! filter, the Save As list and the save-path check
+//! filter, the Save As list and the type it proposes
+//! ([`Registry::save_types_default_first`]) and the save-path check
 //! ([`Registry::save_target`]) consult.
 
 use crate::model::Project;
@@ -21,7 +22,9 @@ pub mod plugin;
 /// package and MSPDI XML.
 pub const NATIVE_EXTENSIONS: [&str; 2] = ["yppx", "xml"];
 
-/// The extension a save path without one is given.
+/// The extension a save path without one is given, and the type Save As
+/// proposes for a new plan when no format plugin declares itself the
+/// default ([`Registry::default_save_extension`]).
 pub const DEFAULT_SAVE_EXTENSION: &str = "yppx";
 
 /// A file format project schedules are read from and/or written to.
@@ -45,6 +48,13 @@ pub trait ProjectFormat: Send + Sync {
     /// writer can carry over what the model does not hold; the built-in
     /// formats ignore it.
     fn write(&self, project: &Project, source: Option<&[u8]>) -> Result<Vec<u8>, String>;
+    /// Whether this type asks to be the default save type, what Save As
+    /// proposes for a new plan ([`Registry::default_save_extension`]); it
+    /// counts only while this format writes the type. A format plugin
+    /// declares it with `"default": true`; the built-ins never do.
+    fn is_default(&self) -> bool {
+        false
+    }
 }
 
 /// The native `.yppx` package ([`crate::yppx`]).
@@ -220,6 +230,40 @@ impl Registry {
             .collect()
     }
 
+    /// The type Save As proposes for a plan opened from a file of extension
+    /// `opened` (any case, with or without the dot; `None` for a new plan),
+    /// lower-case and without the dot: `opened` itself when some format
+    /// writes it, so a plan is saved as what it was opened from; else the
+    /// first extension the last registered format that
+    /// [`ProjectFormat::is_default`] still writes (a format plugin that
+    /// declared itself the default); else [`DEFAULT_SAVE_EXTENSION`].
+    pub fn default_save_extension(&self, opened: Option<&str>) -> &str {
+        if let Some(slot) = opened
+            .and_then(|ext| self.slot(ext))
+            .filter(|s| s.writer.is_some())
+        {
+            return &slot.ext;
+        }
+        (0..self.formats.len())
+            .rev()
+            .filter(|&i| self.formats[i].is_default())
+            .find_map(|i| self.slots.iter().find(|s| s.writer == Some(i)))
+            .map_or(DEFAULT_SAVE_EXTENSION, |s| s.ext.as_str())
+    }
+
+    /// [`Registry::save_types`] in the order a Save As dialog lists them for
+    /// a plan opened from a file of extension `opened` (`None` for a new
+    /// plan): [`Registry::default_save_extension`] first, as the type the
+    /// dialog opens on, then the others in registry order.
+    pub fn save_types_default_first(&self, opened: Option<&str>) -> Vec<(&str, &str)> {
+        let default = self.default_save_extension(opened);
+        let mut types = self.save_types();
+        if let Some(i) = types.iter().position(|(ext, _)| *ext == default) {
+            types[..=i].rotate_right(1);
+        }
+        types
+    }
+
     /// Whether something beyond the built-ins writes: the hosts' Save As
     /// lists stay as they are without it.
     pub fn has_extra_writers(&self) -> bool {
@@ -313,6 +357,7 @@ mod tests {
         label: &'static str,
         reads: bool,
         writes: bool,
+        default: bool,
     }
 
     impl ProjectFormat for Named {
@@ -338,6 +383,9 @@ mod tests {
             let source = source.map_or("none".into(), String::from_utf8_lossy);
             Ok(format!("{}:{}:{source}", self.label, project.name).into_bytes())
         }
+        fn is_default(&self) -> bool {
+            self.default
+        }
     }
 
     fn named(
@@ -351,6 +399,20 @@ mod tests {
             label,
             reads,
             writes,
+            default: false,
+        })
+    }
+
+    /// [`named`], declaring itself the default save type.
+    fn defaulting(
+        exts: &'static [&'static str],
+        label: &'static str,
+        reads: bool,
+        writes: bool,
+    ) -> Box<Named> {
+        Box::new(Named {
+            default: true,
+            ..*named(exts, label, reads, writes)
         })
     }
 
@@ -476,6 +538,101 @@ mod tests {
             [("mpp", "Plugin"), ("fakeproj", "Fake"), ("fp2", "Fake")]
         );
         assert_eq!(registry.for_extension("mpp").unwrap().label(), "Plugin");
+    }
+
+    #[test]
+    fn built_ins_propose_yppx_or_the_type_the_plan_was_opened_from() {
+        let mut registry = Registry::new();
+        assert!(!Yppx.is_default() && !Mspdi.is_default());
+        assert_eq!(registry.default_save_extension(None), "yppx");
+        for opened in ["xml", ".XML", "Xml"] {
+            assert_eq!(registry.default_save_extension(Some(opened)), "xml");
+        }
+        assert_eq!(registry.default_save_extension(Some("yppx")), "yppx");
+        // Nothing writes these: the plan is saved as .yppx.
+        for opened in ["mpp", "", ".", "txt"] {
+            assert_eq!(registry.default_save_extension(Some(opened)), "yppx");
+        }
+        let built_in = [("yppx", "Project schedule"), ("xml", "MSPDI")];
+        assert_eq!(registry.save_types_default_first(None), built_in);
+        assert_eq!(registry.save_types_default_first(Some("yppx")), built_in);
+        assert_eq!(
+            registry.save_types_default_first(Some("xml")),
+            [("xml", "MSPDI"), ("yppx", "Project schedule")]
+        );
+        // A read-only import opened is saved as .yppx too.
+        registry.register(named(&["mpp"], "Import", true, false));
+        assert_eq!(registry.default_save_extension(Some("MPP")), "yppx");
+        assert_eq!(registry.save_types_default_first(Some("mpp")), built_in);
+        assert_eq!(registry.save_types(), built_in);
+    }
+
+    #[test]
+    fn a_writer_declaring_itself_the_default_is_proposed_for_new_plans() {
+        let mut registry = Registry::new();
+        registry.register(named(&["mpp"], "Import", true, false));
+        // A writer that is not the default changes only the list.
+        registry.register(named(&["mpx"], "Exchange", true, true));
+        assert_eq!(registry.default_save_extension(None), "yppx");
+        assert_eq!(registry.default_save_extension(Some("mpx")), "mpx");
+
+        registry.register(defaulting(&["fakeproj", "fp2"], "Fake", true, true));
+        // A new plan and a plan from a type nothing writes: the default.
+        assert_eq!(registry.default_save_extension(None), "fakeproj");
+        assert_eq!(registry.default_save_extension(Some("mpp")), "fakeproj");
+        assert_eq!(registry.default_save_extension(Some("txt")), "fakeproj");
+        // A plan from a writable type keeps it, built-in or not.
+        assert_eq!(registry.default_save_extension(Some("xml")), "xml");
+        assert_eq!(registry.default_save_extension(Some("FP2")), "fp2");
+        assert_eq!(registry.default_save_extension(Some("mpx")), "mpx");
+        // The list keeps registry order; the dialog's puts the default first.
+        assert_eq!(
+            registry.save_extensions(),
+            ["yppx", "xml", "mpx", "fakeproj", "fp2"]
+        );
+        let exts = |opened| {
+            registry
+                .save_types_default_first(opened)
+                .into_iter()
+                .map(|(ext, _)| ext)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(exts(None), ["fakeproj", "yppx", "xml", "mpx", "fp2"]);
+        assert_eq!(exts(Some("mpp")), ["fakeproj", "yppx", "xml", "mpx", "fp2"]);
+        assert_eq!(exts(Some("xml")), ["xml", "yppx", "mpx", "fakeproj", "fp2"]);
+        assert_eq!(exts(Some("fp2")), ["fp2", "yppx", "xml", "mpx", "fakeproj"]);
+        assert_eq!(
+            registry.save_types_default_first(None)[0],
+            ("fakeproj", "Fake")
+        );
+        // Save on an extensionless name is still .yppx.
+        assert_eq!(
+            registry.save_target(Path::new("plan")).unwrap(),
+            PathBuf::from("plan.yppx")
+        );
+    }
+
+    #[test]
+    fn the_last_default_that_still_writes_wins() {
+        let mut registry = Registry::new();
+        registry.register(defaulting(&["aa"], "A", true, true));
+        registry.register(defaulting(&["bb"], "B", false, true));
+        assert_eq!(registry.default_save_extension(None), "bb");
+        // A default that does not write is no save type.
+        registry.register(defaulting(&["ro"], "Read only", true, false));
+        assert_eq!(registry.default_save_extension(None), "bb");
+        // A later writer of .bb that is not the default takes the slot, so
+        // the default goes back to the last one still writing.
+        registry.register(named(&["bb"], "Other B", false, true));
+        assert_eq!(registry.default_save_extension(None), "aa");
+        assert_eq!(registry.default_save_extension(Some("bb")), "bb");
+        // A default that replaces the .yppx writer keeps its place first.
+        registry.register(defaulting(&["yppx"], "Own yppx", true, true));
+        assert_eq!(registry.default_save_extension(None), "yppx");
+        assert_eq!(
+            registry.save_types_default_first(None)[..2],
+            [("yppx", "Own yppx"), ("xml", "MSPDI")]
+        );
     }
 
     #[test]
