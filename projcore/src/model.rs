@@ -1807,6 +1807,17 @@ impl Project {
             .map(|(_, v)| v.as_str())
     }
 
+    /// Set an option's stored text in place (or append it), or remove it
+    /// with `None` (#1587).
+    pub fn set_option(&mut self, name: &str, value: Option<&str>) {
+        match (self.options.iter_mut().find(|(n, _)| n == name), value) {
+            (Some(slot), Some(v)) => slot.1 = v.to_string(),
+            (None, Some(v)) => self.options.push((name.to_string(), v.to_string())),
+            (Some(_), None) => self.options.retain(|(n, _)| n != name),
+            (None, None) => {}
+        }
+    }
+
     /// How a task with no `FixedCostAccrual` of its own accrues its fixed
     /// cost: the `DefaultFixedCostAccrual` option, else Prorated (also for
     /// an Invalid or unparsable default).

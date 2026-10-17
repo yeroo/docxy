@@ -31,6 +31,8 @@
 //! | `assign.add` | `{task, resource, units?, work?, fields?}` | the new assignment |
 //! | `assign.set` | `{uid, units?, work?, overtime_work?, contour?, rate_table?, delay?, actual_work? \| percent_work_complete?, fields?}` | the updated assignment |
 //! | `assign.del` | `{uid}` | `{deleted, task}` |
+//! | `proj.get` | `{}` | the plan's title, start, finish, status and current dates and calendar (#1587); see `projctl` |
+//! | `proj.set` | `{title?, start?, status_date?, current_date?, calendar?}` | the same after the change, one undo step (#1587); see `projctl` |
 //! | `proj.save` | `{path?}` (.yppx/.xml, or a type a format plugin writes; extensionless adds .yppx) | `{path, …}` with the actual saved path |
 //! | `proj.reload` | — | `{path, …}` |
 //! | `proj.open` | `{path}` | `{path, …}` |

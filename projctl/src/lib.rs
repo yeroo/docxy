@@ -30,6 +30,8 @@
 //! | `assign.add` | `{task, resource, units?, work?, fields?}` | the new assignment (`resource` a uid, or a name; a new name is staged as a work resource; a new name that is a number or contains a comma is refused: pass a uid as a number) |
 //! | `assign.set` | `{uid, units?, work?, overtime_work?, contour?, rate_table?, delay?, actual_work? \| percent_work_complete?, fields?}` | the updated assignment, after its task is rescheduled |
 //! | `assign.del` | `{uid}` | `{deleted, task}` |
+//! | `proj.get` | `{}` | the plan's settings (#1587): `{title, start, finish, status_date, current_date, calendar: {uid, name}, calendars: [{uid, name}]}` (dates `YYYY-MM-DD HH:MM`, the status and current dates `null` when unset, `calendars` the base calendars) |
+//! | `proj.set` | `{title?, start?, status_date?, current_date?, calendar?}` | the same reply after the change (#1587): dates `YYYY-MM-DD` (the project calendar's day start) or `YYYY-MM-DDTHH:MM`, `null` clearing a status or current date, `calendar` a base calendar's name or uid. All apply in one undo step, or none does |
 //!
 //! `fields` is a list of Project field names (`["% Complete", "Baseline1
 //! Finish"]`, matched ignoring ASCII case and surrounding space). The verbs
@@ -94,6 +96,7 @@ use projcore::model::{
 
 /// Successful calls to these verbs signal agent editing activity.
 pub const MUTATING: &[&str] = &[
+    "proj.set",
     "task.set",
     "task.add",
     "task.del",
@@ -109,7 +112,8 @@ pub fn is_editor_verb(verb: &str) -> bool {
     MUTATING.contains(&verb)
         || matches!(
             verb,
-            "task.list"
+            "proj.get"
+                | "task.list"
                 | "task.get"
                 | "task.fields"
                 | "find"
@@ -149,6 +153,8 @@ pub fn apply_ops_in(ed: &mut Editor, ops: &[projcore::uiplugin::Op]) -> Result<(
 /// verb belongs to the host (or is unknown).
 pub fn dispatch_editor(ed: &mut Editor, verb: &str, args: &Json) -> Option<Result<Json, String>> {
     Some(match verb {
+        "proj.get" => Ok(proj_get(ed)),
+        "proj.set" => proj_set(ed, args),
         "task.list" => task_list(ed, args),
         "task.get" => task_get(ed, args),
         "task.fields" => Ok(task_fields()),
@@ -747,6 +753,125 @@ fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         info.apply(ed, uid)
     })?;
     task_reply(ed, uid, asked.as_deref())
+}
+
+/// `proj.get`: the plan's settings (#1587).
+fn proj_get(ed: &Editor) -> Json {
+    let proj = ed.project();
+    let option_date = |name: &str| {
+        proj.option(name)
+            .and_then(DateTime::parse_mspdi)
+            .map_or(Json::Null, |d| Json::Str(dt_str(d)))
+    };
+    let calendar = |c: &projcore::model::Calendar| {
+        Json::obj(vec![
+            ("uid", Json::Num(f64::from(c.uid))),
+            ("name", Json::Str(c.name.clone())),
+        ])
+    };
+    Json::obj(vec![
+        ("title", Json::Str(proj.title.clone())),
+        ("start", Json::Str(dt_str(ed.schedule().project_start))),
+        ("finish", Json::Str(dt_str(ed.schedule().project_finish))),
+        ("status_date", option_date("StatusDate")),
+        ("current_date", option_date("CurrentDate")),
+        (
+            "calendar",
+            proj.calendar(proj.default_calendar_uid)
+                .map_or(Json::Null, calendar),
+        ),
+        (
+            "calendars",
+            Json::Arr(
+                proj.calendars
+                    .iter()
+                    .filter(|c| c.base_calendar_uid.is_none())
+                    .map(calendar)
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+/// A `proj.set` date: `YYYY-MM-DD` at the project calendar's day start, or
+/// `YYYY-MM-DDTHH:MM`.
+fn plan_date(name: &str, text: &str, ed: &Editor) -> Result<DateTime, String> {
+    let text = text.trim();
+    if text.contains('T') {
+        return DateTime::parse_mspdi(text)
+            .ok_or_else(|| format!("'{name}' is YYYY-MM-DD or YYYY-MM-DDTHH:MM, not '{text}'"));
+    }
+    let day = parse_cell_date(text)
+        .map_err(|_| format!("'{name}' is YYYY-MM-DD or YYYY-MM-DDTHH:MM, not '{text}'"))?;
+    let probe = Task::default();
+    Ok(day_start(ed.project(), &probe, day))
+}
+
+/// `proj.set`: the plan's settings as one undo step (#1587).
+fn proj_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
+    let title = args.get_str("title").map(str::to_string);
+    let start = match args.get("start") {
+        None | Some(Json::Null) => None,
+        Some(Json::Str(s)) => Some(plan_date("start", s, ed)?),
+        Some(_) => return Err("'start' must be a date".into()),
+    };
+    let dated = |key: &str| -> Result<Option<Option<DateTime>>, String> {
+        match args.get(key) {
+            None => Ok(None),
+            Some(Json::Null) => Ok(Some(None)),
+            Some(Json::Str(s)) if s.trim().is_empty() => Ok(Some(None)),
+            Some(Json::Str(s)) => Ok(Some(Some(plan_date(key, s, ed)?))),
+            Some(_) => Err(format!("'{key}' must be a date or null")),
+        }
+    };
+    let status_date = dated("status_date")?;
+    let current_date = dated("current_date")?;
+    let calendar = match args.get("calendar") {
+        None | Some(Json::Null) => None,
+        Some(Json::Str(name)) => {
+            let name = name.trim();
+            let found = ed
+                .project()
+                .calendars
+                .iter()
+                .find(|c| c.base_calendar_uid.is_none() && c.name.eq_ignore_ascii_case(name))
+                .map(|c| c.uid)
+                .or_else(|| name.parse::<i32>().ok());
+            Some(found.ok_or_else(|| format!("no base calendar named '{name}'"))?)
+        }
+        Some(Json::Num(n)) => Some(*n as i32),
+        Some(_) => return Err("'calendar' must be a base calendar's name or uid".into()),
+    };
+    if title.is_none()
+        && start.is_none()
+        && status_date.is_none()
+        && current_date.is_none()
+        && calendar.is_none()
+    {
+        return Err(
+            "proj.set needs at least one of 'title', 'start', 'status_date', 'current_date' or 'calendar'"
+                .into(),
+        );
+    }
+    ed.batch(|ed| {
+        if let Some(t) = &title {
+            ed.set_title(t)?;
+        }
+        if let Some(s) = start {
+            ed.set_project_start(s)?;
+        }
+        if let Some(d) = status_date {
+            ed.set_status_date(d)?;
+        }
+        if let Some(d) = current_date {
+            ed.set_current_date(d)?;
+        }
+        if let Some(c) = calendar {
+            ed.set_default_calendar(c)?;
+        }
+        Ok(())
+    })?;
+    Ok(proj_get(ed))
 }
 
 fn task_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
@@ -2616,6 +2741,50 @@ it"
             assert!(run(&mut ed, "task.set", args).is_err(), "{args}");
         }
         assert_eq!(*ed.project(), before);
+    }
+
+    #[test]
+    fn proj_get_and_set_read_and_write_the_plans_settings() {
+        let mut ed = Editor::new(new_project());
+        let got = run(&mut ed, "proj.get", "{}").unwrap();
+        assert_eq!(got.get("status_date"), Some(&Json::Null));
+        assert!(got.get_str("start").is_some());
+        let calendars = got.get("calendars").and_then(Json::as_array).unwrap();
+        assert!(!calendars.is_empty());
+        let standard = calendars[0].get_str("name").unwrap().to_string();
+        let set = run(
+            &mut ed,
+            "proj.set",
+            &format!(
+                r#"{{"title":"Build","start":"2026-03-09","status_date":"2026-03-16T17:00","current_date":"2026-03-10","calendar":"{standard}"}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(set.get_str("title"), Some("Build"));
+        assert_eq!(set.get_str("start"), Some("2026-03-09 08:00"));
+        assert_eq!(set.get_str("status_date"), Some("2026-03-16 17:00"));
+        assert_eq!(set.get_str("current_date"), Some("2026-03-10 08:00"));
+        assert_eq!(
+            set.get("calendar").unwrap().get_str("name"),
+            Some(standard.as_str())
+        );
+        // One undo step for all of them.
+        assert_eq!(ed.undo_depth(), 1);
+        let cleared = run(&mut ed, "proj.set", r#"{"status_date":null}"#).unwrap();
+        assert_eq!(cleared.get("status_date"), Some(&Json::Null));
+        assert_eq!(ed.undo_depth(), 2);
+        // Refusals undo nothing.
+        let before = ed.project().clone();
+        for args in [
+            r#"{}"#,
+            r#"{"start":"soon"}"#,
+            r#"{"calendar":"Moon"}"#,
+            r#"{"title":"x","calendar":"Moon"}"#,
+        ] {
+            assert!(run(&mut ed, "proj.set", args).is_err(), "{args}");
+        }
+        assert_eq!(*ed.project(), before);
+        assert_eq!(ed.undo_depth(), 2);
     }
 
     #[test]
