@@ -1555,6 +1555,11 @@ struct App {
     /// Where each prompt field's text starts, as this frame drew it: the
     /// `field-read` input id and the cell (#1204).
     drawn_fields: Vec<(&'static str, (u16, u16))>,
+    /// The Replace bar as this frame drew it, for a click to focus a field
+    /// (#1379): the status row, then the cells of the Find box and of the
+    /// Replace box (half-open column ranges, caret mark included, an empty
+    /// box one cell). None for Find alone or no bar.
+    replace_hit: Option<(u16, std::ops::Range<u16>, std::ops::Range<u16>)>,
     /// First comment row shown in the panel (scroll offset).
     comments_scroll: usize,
     /// The comments panel rect (set by draw() for wheel hit-testing).
@@ -1773,6 +1778,7 @@ impl App {
             comment_input: None,
             counts: Default::default(),
             drawn_fields: Vec::new(),
+            replace_hit: None,
             comments_scroll: 0,
             comments_rect: Rect::default(),
             notes,
@@ -5721,6 +5727,30 @@ impl App {
             }
             return;
         }
+        // A click on the Find or the Replace box focuses it (#1379); the label,
+        // the `→` between the boxes and the cells after them are neither. A
+        // drag or release on the row is consumed, so a sloppy click does not
+        // select or scroll the document.
+        if let (Some(f), Some((y, find, repl))) = (self.find.as_mut(), self.replace_hit.as_ref()) {
+            if m.row == *y {
+                match m.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if find.contains(&m.column) {
+                            f.editing_replacement = false;
+                            self.dirty = true;
+                            return;
+                        } else if repl.contains(&m.column) {
+                            f.editing_replacement = true;
+                            self.dirty = true;
+                            return;
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left)
+                    | MouseEventKind::Up(MouseButton::Left) => return,
+                    _ => {}
+                }
+            }
+        }
         let mrow = m.row as usize;
         let col =
             (m.column as usize).saturating_sub(self.doc_x0 as usize) + self.doc_hscroll as usize;
@@ -6942,6 +6972,7 @@ impl App {
     fn draw(&mut self, f: &mut Frame) {
         self.counts.frames += 1;
         self.drawn_fields.clear();
+        self.replace_hit = None;
         self.draw_screen(f);
     }
 
@@ -7443,6 +7474,7 @@ impl App {
         let col = |prefix: &str| status.x + RLine::from(prefix).width() as u16;
         // `lead` is 1 when the caret mark sits before a non-empty field's
         // first char, so `at` names that char, not the mark.
+        let mut hit = None;
         let mut at = |id: &'static str, prefix: &str, lead: u16| {
             self.drawn_fields.push((id, (col(prefix) + lead, status.y)));
         };
@@ -7461,11 +7493,19 @@ impl App {
                     at("docxy-find", " Replace: ", q_lead);
                     let (q, _) = replace_drawn(f);
                     at("docxy-replace", &format!(" Replace: {q} → "), r_lead);
+                    let (find_x, repl_x) = (col(" Replace: "), col(&format!(" Replace: {q} → ")));
+                    let (_, r) = replace_drawn(f);
+                    hit = Some((
+                        status.y,
+                        find_x..col(&format!(" Replace: {q}")).max(find_x + 1),
+                        repl_x..col(&format!(" Replace: {q} → {r}")).max(repl_x + 1),
+                    ));
                 }
             }
         } else if let Some(c) = self.vim.as_ref().and_then(|v| v.cmdline.as_ref()) {
             at("docxy-vim-command", ":", c.mark_lead());
         }
+        self.replace_hit = hit;
         let status_widget =
             Paragraph::new(status_text).style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_widget(status_widget, status);
@@ -14610,6 +14650,66 @@ mod tests {
             column: col,
             row,
             modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// A click on the Find or the Replace box focuses it; Tab is not the only
+    /// way (#1379).
+    #[test]
+    fn click_focuses_the_find_or_the_replace_field() {
+        let mut app = app_with(&["alpha"]);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Char('x')));
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(app.find.as_ref().unwrap().editing_replacement);
+        let click = |app: &mut App, id: &str| {
+            let (x, y) = app.drawn_at(id).unwrap();
+            app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        };
+        click(&mut app, "docxy-find");
+        assert!(!app.find.as_ref().unwrap().editing_replacement);
+        term.draw(|f| app.draw(f)).unwrap();
+        click(&mut app, "docxy-replace");
+        assert!(app.find.as_ref().unwrap().editing_replacement);
+        // The label, the arrow (its space, glyph and the space after it) and
+        // the cells right of the Replace box change nothing, and a drag or
+        // release on the row neither selects nor scrolls the document.
+        term.draw(|f| app.draw(f)).unwrap();
+        let (y, find, repl) = app.replace_hit.clone().unwrap();
+        let scroll = app.scroll;
+        for x in [
+            find.start - 1,
+            find.end,
+            find.end + 1,
+            find.end + 2,
+            repl.end,
+        ] {
+            app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+            assert!(app.find.as_ref().unwrap().editing_replacement, "x={x}");
+        }
+        app.on_key(key(KeyCode::Esc));
+        term.draw(|f| app.draw(f)).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        app.on_key(key(KeyCode::Tab));
+        term.draw(|f| app.draw(f)).unwrap();
+        let (y2, find2, repl2) = app.replace_hit.clone().unwrap();
+        assert_eq!(y, y2);
+        app.on_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            find2.start,
+            y2,
+        ));
+        assert!(!app.find.as_ref().unwrap().editing_replacement);
+        for kind in [
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.on_mouse(mouse(kind, repl2.start, y2));
+            assert!(!app.find.as_ref().unwrap().editing_replacement);
+            assert!(!app.body_editor().has_selection());
+            assert_eq!(app.scroll, scroll);
         }
     }
 
