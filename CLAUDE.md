@@ -358,3 +358,15 @@
   caret, as the minibuffer prompt does, and `field-read xlsxy-vim-command`
   reports the real caret. Select-all, copy/paste and click-to-place are not
   there.
+
+## yppxy terminal prompt edits at a caret (#1374)
+
+- `Prompt` in `yppxy/src/main.rs` (Rename, Duration, Predecessor, Constraint,
+  Assign, Find, Notes, Save As on a new project and the vim `:` line) is text
+  plus a char caret, built through `Prompt::new` (caret at the end of the
+  seed). Left, Right, Home, End and Delete act at the caret with no Ctrl or Alt
+  (such chords are still swallowed), Backspace and typing act there, and Enter
+  commits the whole text wherever the caret is. The edits clamp the caret, as
+  tests assign `buf` directly. The drawn `▏` sits at the caret and `field-read
+  yppxy-prompt` reports it. Select-all, copy/paste and click-to-place are not
+  there (#1376, #1378); Backstage Save As's name field is separate.

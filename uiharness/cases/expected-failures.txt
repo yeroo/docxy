@@ -29,9 +29,6 @@ backstage-inputs-typing.uit | rename sheet-tab-rename: select-all replaces | #13
 backstage-inputs-typing.uit | rename sheet-tab-rename: copies | #1365
 backstage-inputs-typing.uit | rename sheet-tab-rename: pastes | #1365
 
-# yppxy's prompt (every kind) is append-only: no caret (#1204).
-terminal-yppxy-inputs-typing.uit | yppxy yppxy-prompt: edits | #1374
-
 # In docxy's Find bar in Replace mode Ctrl+A is Replace All: it edits the
 # document instead of selecting the field's text (#1204).
 terminal-docxy-inputs-typing.uit | docxy docxy-replace: select-all replaces | #1375
