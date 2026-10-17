@@ -317,3 +317,132 @@ fn adding_after_a_shown_blank_row_below_a_collapsed_summary_makes_its_sibling() 
     assert_eq!(ed.project().tasks[2].outline_level, 1);
     assert!(ed.is_collapsed(1));
 }
+
+/// Project's summary row (UID 0, level 0) over A, S { S1 }, B.
+fn with_summary() -> Editor {
+    let mut ed = outline(&[
+        (0, "Plan", 1),
+        (1, "A", 1),
+        (2, "S", 1),
+        (3, "S1", 2),
+        (4, "B", 1),
+    ]);
+    let mut proj = ed.project().clone();
+    proj.tasks[0].outline_level = 0;
+    proj.tasks[0].summary = true;
+    ed = Editor::new(proj);
+    assert!(ed.project().tasks[0].is_project_summary());
+    ed
+}
+
+#[test]
+fn the_project_summary_row_is_hidden_by_default() {
+    let mut ed = with_summary();
+    assert_eq!(ed.visible_rows(), [1, 2, 3, 4]);
+    assert_eq!(ed.sel(), 1, "a new session starts on the first shown row");
+    assert_eq!(ed.project().tasks[0].uid, 0, "still in the model");
+    ed.set_show_summary_task(true);
+    assert_eq!(ed.visible_rows(), [0, 1, 2, 3, 4]);
+    ed.set_show_summary_task(false);
+    assert_eq!(ed.visible_rows(), [1, 2, 3, 4]);
+}
+
+#[test]
+fn a_plan_without_the_summary_row_is_unchanged() {
+    let ed = plan();
+    assert_eq!(ed.visible_rows(), (0..8).collect::<Vec<_>>());
+    assert_eq!(ed.sel(), 0);
+}
+
+#[test]
+fn a_hidden_project_summary_never_hides_its_tasks() {
+    let mut ed = with_summary();
+    assert!(ed.set_collapsed(0, true).is_err());
+    assert_eq!(ed.visible_rows(), [1, 2, 3, 4]);
+    // Shown, it collapses; hiding it again expands it.
+    ed.set_show_summary_task(true);
+    assert_eq!(ed.set_collapsed(0, true), Ok(true));
+    assert_eq!(ed.visible_rows(), [0]);
+    ed.set_show_summary_task(false);
+    assert_eq!(ed.visible_rows(), [1, 2, 3, 4]);
+    assert!(!ed.is_collapsed(0));
+}
+
+#[test]
+fn undoing_the_delete_of_the_only_child_keeps_the_selection_off_the_summary() {
+    let mut ed = outline(&[(0, "Plan", 1), (1, "A", 1)]);
+    let mut proj = ed.project().clone();
+    proj.tasks[0].outline_level = 0;
+    ed = Editor::new(proj);
+    assert!(ed.project().tasks[0].is_project_summary());
+    ed.select(1);
+    ed.delete_task(1).unwrap();
+    // UID 0 is childless now: a plain row, shown and selected.
+    assert_eq!(ed.visible_rows(), [0]);
+    assert!(ed.undo());
+    assert!(ed.project().tasks[0].is_project_summary());
+    assert_eq!(ed.sel(), 1, "not the hidden summary");
+}
+
+#[test]
+fn automation_can_still_select_the_hidden_summary() {
+    let mut ed = with_summary();
+    ed.select(0);
+    assert_eq!(ed.sel(), 0);
+    ed.rename(0, "Renamed").unwrap();
+    assert_eq!(ed.sel(), 0, "an edit leaves an explicit selection");
+}
+
+#[test]
+fn find_skips_the_hidden_summary_row() {
+    let mut ed = with_summary();
+    assert_eq!(ed.find_from_top("plan"), FindOutcome::NotFound);
+    assert_eq!(ed.find("s"), FindOutcome::Found(2));
+    assert_eq!(ed.find("s"), FindOutcome::Found(3), "S1");
+    assert_ne!(ed.sel(), 0);
+    ed.set_show_summary_task(true);
+    assert_eq!(ed.find_from_top("plan"), FindOutcome::Found(0));
+}
+
+#[test]
+fn stepping_from_the_hidden_summary_lands_on_the_first_shown_row() {
+    let ed = with_summary();
+    assert_eq!(ed.visible_step(0, 1), 1);
+    assert_eq!(ed.visible_step(0, -1), 1);
+    assert_eq!(ed.visible_step(1, 1), 2);
+    let mut ed = with_summary();
+    ed.select(3);
+    ed.select_first_visible();
+    assert_eq!(ed.sel(), 1);
+}
+
+#[test]
+fn hide_subtasks_does_not_take_the_hidden_summary_as_a_parent() {
+    let mut ed = with_summary();
+    assert_eq!(
+        ed.hide_subtasks(1),
+        Err("The task has no subtasks to hide".into()),
+        "A has no parent but the summary"
+    );
+    assert_eq!(ed.hide_subtasks(3), Ok(2), "S1 collapses S");
+}
+
+#[test]
+fn a_childless_uid_0_row_is_no_summary_and_stays_shown() {
+    let mut proj = with_summary().project().clone();
+    proj.tasks.truncate(1);
+    let ed = Editor::new(proj);
+    assert!(!ed.project().tasks[0].is_project_summary());
+    assert_eq!(ed.visible_rows(), [0]);
+    assert_eq!(ed.sel(), 0);
+}
+
+#[test]
+fn replace_project_starts_below_a_uid_0_row_whose_summary_flag_is_recomputed() {
+    let mut proj = with_summary().project().clone();
+    proj.tasks[0].summary = false;
+    let mut ed = outline(&[(1, "X", 1)]);
+    ed.replace_project(proj);
+    assert!(ed.project().tasks[0].is_project_summary());
+    assert_eq!(ed.sel(), 1);
+}

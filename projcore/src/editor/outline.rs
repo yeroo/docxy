@@ -1,7 +1,9 @@
 //! View › Data › Outline: Show/Hide Subtasks. A collapsed summary hides its
 //! whole subtree from the grid and the Gantt. It is view state: not in the
 //! model, the undo history or a saved file, and a new document starts with
-//! every summary expanded. The selected row is never hidden.
+//! every summary expanded. The selected row is never hidden by a collapsed
+//! summary; the hidden project summary row (UID 0) is the exception when an
+//! explicit `select` put the selection on it (`sel_pinned`).
 use super::*;
 use std::collections::BTreeSet;
 
@@ -21,6 +23,9 @@ impl Editor {
         let i = self.index(uid)?;
         if !self.proj.is_outline_summary(i) {
             return Err("Only a summary task has subtasks to show or hide".into());
+        }
+        if collapsed && !self.show_summary && self.proj.tasks[i].is_project_summary() {
+            return Err("The project summary task is hidden; its subtasks stay shown".into());
         }
         if !collapsed {
             return Ok(self.collapsed.remove(&uid));
@@ -55,7 +60,11 @@ impl Editor {
             }
             let parent = self.proj.tasks[..i]
                 .iter()
-                .rfind(|t| !t.is_null && t.outline_level < task.outline_level)
+                .rfind(|t| {
+                    !t.is_null
+                        && t.outline_level < task.outline_level
+                        && (self.show_summary || !t.is_project_summary())
+                })
                 .ok_or("The task has no subtasks to hide")?;
             parent.uid
         };
@@ -63,13 +72,54 @@ impl Editor {
         Ok(summary)
     }
 
-    /// Task indexes in outline order, without the rows collapsed summaries hide.
+    /// Task indexes in outline order, without the rows collapsed summaries hide
+    /// or, unless [`Self::show_summary_task`], the project summary row (UID 0).
     pub fn visible_rows(&self) -> Vec<usize> {
         self.hidden_owners()
             .iter()
             .enumerate()
             .filter_map(|(i, owner)| owner.is_none().then_some(i))
+            .filter(|&i| self.show_summary || !self.proj.tasks[i].is_project_summary())
             .collect()
+    }
+
+    /// Whether the project summary row (UID 0) is a grid row. Off by default.
+    pub fn show_summary_task(&self) -> bool {
+        self.show_summary
+    }
+
+    /// Show or hide the project summary row. View state: not an edit. Hiding
+    /// it expands it, so its tasks stay shown, and moves a selection on it to
+    /// the first shown row.
+    pub fn set_show_summary_task(&mut self, show: bool) {
+        if self.show_summary == show {
+            return;
+        }
+        self.show_summary = show;
+        if !show {
+            if let Some(i) = self.proj.tasks.iter().position(|t| t.is_project_summary()) {
+                self.collapsed.remove(&self.proj.tasks[i].uid);
+            }
+            self.sel_off_hidden_summary();
+            self.sel_uid = self.selected_uid();
+        }
+        self.revision += 1;
+    }
+
+    /// Move a selection that sits on the hidden project summary row to the
+    /// first shown row (it stays when nothing else is shown).
+    pub(super) fn sel_off_hidden_summary(&mut self) {
+        if !self.show_summary
+            && self
+                .proj
+                .tasks
+                .get(self.sel)
+                .is_some_and(|t| t.is_project_summary())
+            && let Some(&first) = self.visible_rows().first()
+        {
+            self.sel = first;
+            self.sel_pinned = false;
+        }
     }
 
     /// The visible row `delta` visible rows from `from`, stopping at the first
@@ -79,8 +129,20 @@ impl Editor {
         let Some(last) = rows.len().checked_sub(1) else {
             return 0;
         };
-        let at = rows.iter().rposition(|&r| r <= from).unwrap_or(0);
-        rows[at.saturating_add_signed(delta).min(last)]
+        // `from` may sit before the first shown row (the hidden summary).
+        let before = rows.partition_point(|&r| r <= from);
+        let at = match before.checked_sub(1) {
+            Some(at) => at.saturating_add_signed(delta),
+            None if delta > 0 => (delta - 1) as usize,
+            None => 0,
+        };
+        rows[at.min(last)]
+    }
+
+    /// Select the first visible row (row 0 when nothing is shown).
+    pub fn select_first_visible(&mut self) {
+        let first = self.visible_rows().first().copied().unwrap_or(0);
+        self.select(first);
     }
 
     /// Select the last visible row, keeping every summary collapsed.

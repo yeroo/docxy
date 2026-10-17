@@ -2013,7 +2013,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char('q') | KeyCode::Char('Q') => app.request_exit(),
         KeyCode::Up | KeyCode::Char('k') => app.step(-1),
         KeyCode::Down | KeyCode::Char('j') => app.step(1),
-        KeyCode::Home | KeyCode::Char('g') => app.ed.select(0),
+        KeyCode::Home | KeyCode::Char('g') => app.ed.select_first_visible(),
         KeyCode::End | KeyCode::Char('G') => app.ed.select_last_visible(),
         KeyCode::Char('-') => app.hide_subtasks(),
         KeyCode::Char('+') | KeyCode::Char('=') => app.show_subtasks(),
@@ -5048,6 +5048,60 @@ mod tests {
             })
             .filter(|(name, _)| !name.is_empty())
             .collect()
+    }
+
+    #[test]
+    fn the_uid_0_summary_row_is_not_a_shown_row() {
+        let task = |uid: i32, name: &str, outline_level, summary| Task {
+            uid,
+            id: uid,
+            name: name.into(),
+            outline_level,
+            summary,
+            duration_min: 480,
+            ..Task::default()
+        };
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0)),
+            tasks: vec![
+                task(0, "Plan", 0, true),
+                task(1, "A", 1, false),
+                task(2, "B", 1, false),
+            ],
+            ..Project::default()
+        };
+        let mut app = App::new(proj, Some("plan.yppx".into()), false);
+        assert_eq!(app.ed.project().tasks.len(), 3, "kept in the model");
+        assert_eq!(app.ed.visible_rows(), [1, 2]);
+        let names: Vec<_> = shown_rows(&mut app).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["• A", "• B"]);
+    }
+
+    #[test]
+    fn home_selects_the_first_shown_row_not_the_uid_0_summary() {
+        let task = |uid: i32, name: &str, outline_level, summary| Task {
+            uid,
+            id: uid,
+            name: name.into(),
+            outline_level,
+            summary,
+            duration_min: 480,
+            ..Task::default()
+        };
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0)),
+            tasks: vec![
+                task(0, "Plan", 0, true),
+                task(1, "A", 1, false),
+                task(2, "B", 1, false),
+            ],
+            ..Project::default()
+        };
+        let mut app = App::new(proj, Some("plan.yppx".into()), false);
+        press_key(&mut app, KeyCode::End);
+        assert_eq!(app.ed.sel(), 2);
+        press_key(&mut app, KeyCode::Home);
+        assert_eq!(app.ed.sel(), 1);
     }
 
     #[test]
