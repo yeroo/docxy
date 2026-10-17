@@ -316,6 +316,8 @@ fn reads_and_rejected_edits_preserve_prompt_selection_history_and_scroll() {
         ("assign.list", Json::Null),
         ("assign.get", args(&format!(r#"{{"uid":{assigned}}}"#))),
         ("assign.fields", Json::Null),
+        ("resource.list", Json::Null),
+        ("resource.get", args(r#"{"uid":1}"#)),
     ] {
         let (_, effect) = call(&mut tabs, 0, verb, a).unwrap();
         assert_eq!(effect, Effect::default());
@@ -331,6 +333,9 @@ fn reads_and_rejected_edits_preserve_prompt_selection_history_and_scroll() {
         ("assign.add", args(r#"{"task":1,"resource":999}"#)),
         ("assign.set", args(r#"{"uid":999,"units":1}"#)),
         ("assign.del", args(r#"{"uid":999}"#)),
+        ("resource.add", args(r#"{"name":"Ann"}"#)),
+        ("resource.set", args(r#"{"uid":999,"name":"X"}"#)),
+        ("resource.del", args(r#"{"uid":999}"#)),
     ] {
         assert!(call(&mut tabs, 0, verb, a).is_err());
         assert_eq!(snapshot(&tabs[0]), before);
@@ -372,6 +377,12 @@ fn each_agent_edit_is_undoable_and_changes_only_its_inactive_target() {
         ("assign.add", r#"{"tab":1,"task":1,"resource":"Agent"}"#),
         ("assign.set", r#"{"tab":1,"uid":1,"units":0.5}"#),
         ("assign.del", r#"{"tab":1,"uid":1}"#),
+        (
+            "resource.add",
+            r#"{"tab":1,"name":"Agent","max_units":"50%"}"#,
+        ),
+        ("resource.set", r#"{"tab":1,"uid":1,"group":"Crew"}"#),
+        ("resource.del", r#"{"tab":1,"uid":1}"#),
     ] {
         let mut tabs = vec![tab(), tab()];
         if verb == "link.del" {
@@ -380,7 +391,10 @@ fn each_agent_edit_is_undoable_and_changes_only_its_inactive_target() {
                 .add_predecessor(2, 1, LinkType::FinishStart, 0)
                 .unwrap();
         }
-        if matches!(verb, "assign.set" | "assign.del") {
+        if matches!(
+            verb,
+            "assign.set" | "assign.del" | "resource.set" | "resource.del"
+        ) {
             let (ed, name) = (&mut vm(&mut tabs[1]).ed, ResourceRef::Name("Ann"));
             assert_eq!(ed.add_assignment(1, name, None, None), Ok(1));
             ed.mark_saved();

@@ -79,6 +79,11 @@ fn tool_verb(name: &str) -> Option<&'static str> {
         "yppxy_assign_add" => "assign.add",
         "yppxy_assign_set" => "assign.set",
         "yppxy_assign_del" => "assign.del",
+        "yppxy_resource_list" => "resource.list",
+        "yppxy_resource_get" => "resource.get",
+        "yppxy_resource_add" => "resource.add",
+        "yppxy_resource_set" => "resource.set",
+        "yppxy_resource_del" => "resource.del",
         _ => return None,
     })
 }
@@ -419,7 +424,144 @@ fn tool_defs() -> Json {
             vec![assign_uid(), target(), tab()],
             &["uid"],
         ),
+        tool(
+            "yppxy_resource_list",
+            "List the plan's resources: uid, id, name, type (work, material or cost), initials, \
+             group, code, email, material_label, max_units (a fraction; null for a material or \
+             cost resource), standard_rate and overtime_rate (currency per hour, per unit for a \
+             material), cost_per_use (currency units), accrue_at (Start, End or Prorated), \
+             base_calendar {uid, name}, notes, and assignments (how many it has).",
+            vec![target(), tab()],
+            &[],
+        ),
+        tool(
+            "yppxy_resource_get",
+            "Read one resource by its UID (from yppxy_resource_list), with the fields \
+             yppxy_resource_list reports.",
+            vec![resource_uid(), target(), tab()],
+            &["uid"],
+        ),
+        tool(
+            "yppxy_resource_add",
+            "Add a resource: a work resource at 100%, costs prorated, unless the fields say \
+             otherwise. The name is unique (ASCII case ignored), not a number and holds no \
+             comma. Returns the new resource with its uid. One undo step.",
+            [
+                vec![(
+                    "name",
+                    prop(
+                        "string",
+                        "The resource's name, as the Resource Names cell spells it.",
+                    ),
+                )],
+                resource_fields(),
+                vec![target(), tab()],
+            ]
+            .concat(),
+            &["name"],
+        ),
+        tool(
+            "yppxy_resource_set",
+            "Edit a resource's fields by its UID. null clears a text or a rate; type changes \
+             only while the resource has no assignments (they are priced and scheduled by it); \
+             a rate edit keeps cost rate table A's current row in step, and a max_units edit \
+             the availability period in effect. Every argument is checked before the edit, so \
+             a rejected call changes nothing. Returns the updated resource. One undo step; the \
+             assignments' costs follow.",
+            [
+                vec![resource_uid()],
+                vec![(
+                    "name",
+                    prop(
+                        "string",
+                        "A new name: unique (ASCII case ignored), not a number, no comma.",
+                    ),
+                )],
+                resource_fields(),
+                vec![target(), tab()],
+            ]
+            .concat(),
+            &["uid"],
+        ),
+        tool(
+            "yppxy_resource_del",
+            "Delete a resource by its UID with its assignments (each removed as the Resource \
+             Names cell removes a name, so its task follows its type); the reply is {deleted, \
+             assignments: [uid…]}. One undo step.",
+            vec![resource_uid(), target(), tab()],
+            &["uid"],
+        ),
     ])
+}
+
+/// The resource's own UID argument.
+fn resource_uid() -> (&'static str, Json) {
+    (
+        "uid",
+        prop(
+            "integer",
+            "The resource's own UID (from yppxy_resource_list).",
+        ),
+    )
+}
+
+/// The fields yppxy_resource_add and yppxy_resource_set share.
+fn resource_fields() -> Vec<(&'static str, Json)> {
+    let text = |desc: &str| prop_types(&["string", "null"], desc);
+    let rate = |desc: &str| prop_types(&["number", "string", "null"], desc);
+    vec![
+        (
+            "type",
+            prop(
+                "string",
+                "\"work\", \"material\" or \"cost\" (ASCII case ignored).",
+            ),
+        ),
+        ("initials", text("Initials; null clears.")),
+        ("group", text("Group; null clears.")),
+        ("code", text("Code; null clears.")),
+        ("email", text("Email address; null clears.")),
+        (
+            "material_label",
+            text("A material's unit label (such as \"t\" or \"m³\"); null clears."),
+        ),
+        (
+            "max_units",
+            prop_types(
+                &["number", "string"],
+                "A work resource's Max. Units: a fraction (0.5) or a percent string (\"50%\").",
+            ),
+        ),
+        (
+            "standard_rate",
+            rate(
+                "Currency per hour (per unit for a material), a number or numeric string; null clears.",
+            ),
+        ),
+        (
+            "overtime_rate",
+            rate("Currency per hour, a number or numeric string; null clears."),
+        ),
+        (
+            "cost_per_use",
+            rate("Currency units charged per use, a number or numeric string; null clears."),
+        ),
+        (
+            "accrue_at",
+            prop(
+                "string",
+                "When costs accrue: \"Start\", \"End\" or \"Prorated\".",
+            ),
+        ),
+        (
+            "base_calendar",
+            prop_types(
+                &["integer", "string"],
+                "A base calendar of the plan, by name or uid; the resource's own calendar derives from it.",
+            ),
+        ),
+        ("notes", text("Notes; null clears.")),
+    ]
 }
 
 /// A JSON-schema property that accepts any of `types`.
@@ -573,6 +715,11 @@ mod tests {
             "yppxy_assign_add",
             "yppxy_assign_set",
             "yppxy_assign_del",
+            "yppxy_resource_list",
+            "yppxy_resource_get",
+            "yppxy_resource_add",
+            "yppxy_resource_set",
+            "yppxy_resource_del",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
@@ -595,6 +742,11 @@ mod tests {
             ("yppxy_assign_add", "assign.add"),
             ("yppxy_assign_set", "assign.set"),
             ("yppxy_assign_del", "assign.del"),
+            ("yppxy_resource_list", "resource.list"),
+            ("yppxy_resource_get", "resource.get"),
+            ("yppxy_resource_add", "resource.add"),
+            ("yppxy_resource_set", "resource.set"),
+            ("yppxy_resource_del", "resource.del"),
         ] {
             assert_eq!(tool_verb(name), Some(verb));
         }

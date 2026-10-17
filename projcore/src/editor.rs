@@ -49,10 +49,12 @@ mod outline;
 mod plan;
 mod props;
 pub use display::{Sort, ValueItem};
+mod resources;
 use outline::subtree_end;
 pub use props::{
     EV_PERCENT_COMPLETE, EV_PHYSICAL_PERCENT_COMPLETE, PRIORITY_DEFAULT, PRIORITY_MAX,
 };
+pub use resources::{ResourcePatch, kind_name, resource_base_calendar};
 #[cfg(test)]
 mod refresh_tests;
 

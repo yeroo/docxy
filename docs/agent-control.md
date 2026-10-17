@@ -44,6 +44,7 @@ Explicit targets do not activate that tab. Task/link arguments use stable
 Supported verbs are `proj.path`, `proj.get`, `proj.set`, `task.list`, `task.get`, `task.fields`, `task.set`,
 `task.add`, `task.del`, `link.add`, `link.del`, `find`, `assign.list`,
 `assign.get`, `assign.fields`, `assign.add`, `assign.set`, `assign.del`,
+`resource.list`, `resource.get`, `resource.add`, `resource.set`, `resource.del`,
 `proj.save`, `proj.reload`, `proj.open` and `proj.new`, with the yppxy
 argument/result shapes, plus `app-info` (the build: version, commit, last merged PR, kind, `manual`; #1023). `proj.path` additionally
 reports `tab`, `imported`, `default_save_ext` (the type Save As proposes, see
@@ -233,6 +234,47 @@ reading is not verified against Project. Among the definitions paired by
 table holds it. Otherwise the task rules
 apply: no resolvable definition reads unset, and an unparseable value reads as
 its raw text and `null`. An assignment never shows its task's value.
+
+Resources are addressed by their own UID (#1588). `resource.list {}` reports
+every resource and `resource.get {uid}` one: `uid, id, name, type` (`work`,
+`material` or `cost`), `initials, group, code, email, material_label`,
+`max_units` (a fraction; `null` for a material or cost resource, which has
+none), `standard_rate` and `overtime_rate` (currency per hour, per unit for a
+material), `cost_per_use` (currency units), `accrue_at` (`Start`, `End` or
+`Prorated`), `base_calendar` (`{uid, name}`: the base calendar the resource's
+own calendar derives from, or is; the plan's default when it has none),
+`notes`, and `assignments` (how many it has).
+
+```json
+{"verb": "resource.add", "args": {"name": "Bob", "max_units": "50%", "standard_rate": 30, "group": "Crew"}}
+{"verb": "resource.add", "args": {"name": "Steel", "type": "material", "material_label": "t", "standard_rate": 120}}
+{"verb": "resource.set", "args": {"uid": 2, "overtime_rate": 45, "cost_per_use": 100, "accrue_at": "End"}}
+{"verb": "resource.set", "args": {"uid": 2, "base_calendar": "Night Shift", "notes": null}}
+{"verb": "resource.del", "args": {"uid": 2}}
+```
+
+`resource.add {name, type?, ...}` makes a work resource at 100%, costs prorated,
+unless the fields say otherwise, and replies with the resource. `resource.set
+{uid, ...}` changes any of `name, type, initials, group, code, email,
+material_label, max_units, standard_rate, overtime_rate, cost_per_use,
+accrue_at, base_calendar, notes` (at least one): `null` or `""` clears a text
+or a rate, `max_units` is a number or `"50%"` (a work resource's only), a rate
+a number or numeric string of currency units, `base_calendar` a base calendar's
+name or uid. The name is what the Resource Names cell and `assign.add` go by,
+so it is unique ignoring ASCII case, not a number and holds no comma. The type
+prices and schedules the resource's assignments, so it changes only while it
+has none. A rate edit keeps cost rate table A's row in effect in step (the
+assignments cost from the table when it has rows), and a `max_units` edit the
+availability period in effect (the leveler takes capacity from the periods when
+there are any); "in effect" is at the plan's current date, else its status
+date, else its start. The assignments' costs and the task and resource totals
+refresh as after any edit. `resource.del {uid}` removes the resource with its
+assignments, each as the Resource Names cell removes a name (so an
+effort-driven task keeps its work across the assignments left), and its own
+derived calendar when nothing else uses it; the resources after it move up one
+ID. The reply is `{deleted, assignments: [uid…]}`. Each verb is one undo step,
+a value the resource already has records none, and every argument is checked
+first, so a rejected call leaves the plan untouched.
 
 File handling differs from the TUI:
 
