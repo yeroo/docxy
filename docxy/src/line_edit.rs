@@ -1,7 +1,7 @@
 //! A one-line text buffer with an editing caret, shared by the terminal
 //! prompts (Find, Replace, comment, Compare, vim `:`; #1372).
 
-use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// What a key did to a [`LineEdit`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +112,29 @@ impl LineEdit {
 
     pub fn end(&mut self) {
         self.caret = self.len();
+    }
+
+    /// 1 when the caret mark drawn before the first char of a non-empty field
+    /// would otherwise be the cell `field-read`'s `at` names.
+    pub fn mark_lead(&self) -> u16 {
+        u16::from(self.caret == 0 && !self.buf.is_empty())
+    }
+
+    /// Whether `key` is one [`LineEdit::handle`] takes: Backspace, Delete, the
+    /// arrows, Home or End, with no Ctrl or Alt, so the chords the prompts and
+    /// the document own keep their meaning.
+    pub fn is_edit_key(key: &KeyEvent) -> bool {
+        matches!(
+            key.code,
+            KeyCode::Backspace
+                | KeyCode::Delete
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End
+        ) && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     }
 
     /// The shared plain-key set: Backspace, Delete, Left, Right, Home, End.

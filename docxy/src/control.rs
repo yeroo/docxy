@@ -4458,7 +4458,10 @@ mod tests {
         assert_eq!(f.query.caret(), 4);
         assert_eq!(f.matches.len(), 2, "searched on every query edit");
         let moved = app.find.as_ref().unwrap().idx;
+        // A re-search would select the match again.
+        app.editor.clear_selection();
         press(&mut app, key(KeyCode::Home));
+        assert!(!app.editor.has_selection(), "a caret move does not search");
         assert_eq!(app.find.as_ref().unwrap().matches.len(), 2);
         assert_eq!(app.find.as_ref().unwrap().idx, moved, "a caret move");
         assert!(
@@ -4473,6 +4476,10 @@ mod tests {
             press(&mut app, ch(c));
         }
         press(&mut app, key(KeyCode::Left));
+        assert!(
+            !app.editor.has_selection(),
+            "a Replace edit does not search"
+        );
         let f = app.find.as_ref().unwrap();
         assert_eq!(f.query.as_str(), "alpha", "the Replace field edits alone");
         assert_eq!(f.matches.len(), 2);
@@ -4497,6 +4504,76 @@ mod tests {
             KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL),
         );
         assert_eq!(app.find.as_ref().unwrap().query.caret(), before);
+    }
+
+    /// With the caret at 0 on a non-empty prompt, `at` names the first char,
+    /// past the `▏` mark, as Compare's does (#1372).
+    #[test]
+    fn status_prompt_at_skips_a_caret_mark_before_the_first_char() {
+        use crossterm_keys::*;
+        let at = |app: &mut App, id: &str| {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+            term.draw(|f| app.draw(f)).unwrap();
+            dispatch(
+                app,
+                "field-read",
+                &Json::obj(vec![("input", Json::Str(id.into()))]),
+            )
+            .unwrap()
+            .get("at")
+            .and_then(|a| a.get_usize("col"))
+        };
+        let typed = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                press(app, ch(c));
+            }
+        };
+        let mut app = app_with(&["alpha"]);
+        press(&mut app, ctrl('f'));
+        assert_eq!(at(&mut app, "docxy-find"), Some(" Find: ".len()), "empty");
+        typed(&mut app, "ab");
+        assert_eq!(
+            at(&mut app, "docxy-find"),
+            Some(" Find: ".len()),
+            "caret at end"
+        );
+        press(&mut app, key(KeyCode::Home));
+        assert_eq!(at(&mut app, "docxy-find"), Some(" Find: ".len() + 1));
+        // Replace: the focused field's `at` shifts, the other's does not.
+        press(&mut app, key(KeyCode::Tab));
+        typed(&mut app, "zz");
+        press(&mut app, key(KeyCode::Home));
+        assert_eq!(at(&mut app, "docxy-find"), Some(" Replace: ".len()));
+        assert_eq!(
+            at(&mut app, "docxy-replace"),
+            Some(" Replace: ab → ".chars().count() + 1)
+        );
+        press(&mut app, key(KeyCode::Tab));
+        assert_eq!(at(&mut app, "docxy-find"), Some(" Replace: ".len() + 1));
+        assert_eq!(
+            at(&mut app, "docxy-replace"),
+            Some(" Replace: ▏ab → ".chars().count())
+        );
+        press(&mut app, key(KeyCode::Esc));
+
+        app.editor.select_all();
+        app.start_comment();
+        typed(&mut app, "hi");
+        press(&mut app, key(KeyCode::Home));
+        assert_eq!(
+            at(&mut app, "docxy-comment"),
+            Some(" New comment: ".len() + 1)
+        );
+        press(&mut app, key(KeyCode::Esc));
+
+        let mut vim = app_with(&["alpha"]);
+        vim.vim = Some(crate::VimState::new());
+        press(&mut vim, ch(':'));
+        typed(&mut vim, "wq");
+        assert_eq!(at(&mut vim, "docxy-vim-command"), Some(1));
+        press(&mut vim, key(KeyCode::Home));
+        assert_eq!(at(&mut vim, "docxy-vim-command"), Some(2));
     }
 
     /// A Compare path longer than its row is windowed so the caret stays in

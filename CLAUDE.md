@@ -339,8 +339,10 @@
 
 - Find, Replace, the comment bar, Compare's two paths and the vim `:` line are
   `docxy/src/line_edit.rs`'s `LineEdit` (text plus a char caret, shared key set
-  in `handle`): Left, Right, Home, End, Delete and Backspace act at the caret
-  and typing inserts there, with no Ctrl or Alt (`plain_edit_key`). Only the
+  in `handle`): Left, Right, Home, End, Delete and Backspace act at the caret,
+  with no Ctrl or Alt (`LineEdit::is_edit_key`, so Ctrl chords keep their
+  meaning), and typing inserts there (each prompt's Char arm keeps its own
+  modifier rule). Only the
   focused field draws the `▏` mark, at its caret; `replace_drawn` feeds both
   the Replace status text and the `docxy-replace` `at`, and `compare_window`
   keeps a long Compare path's caret in view. `field-read` reports the real

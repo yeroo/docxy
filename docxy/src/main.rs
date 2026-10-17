@@ -108,10 +108,6 @@ impl DocFormat {
     }
 }
 
-/// Pick a format from a path's extension: any `.html`/`.htm` is an editable-HTML
-/// bundle (opened by its content, so `sample.docx (1).html` works, and never
-/// written as anything else); Markdown for `.md`/`.markdown`/`.mdown`; `.docx`
-/// otherwise.
 /// The Replace bar's two fields as drawn: the focused one carries the caret
 /// mark at its caret. The status text and `field-read`'s `at` both read this.
 fn replace_drawn(f: &FindState) -> (String, String) {
@@ -145,13 +141,10 @@ fn compare_window(value: &LineEdit, room: usize, focused: bool) -> (String, u16)
     (format!("{before}▏{after}"), lead)
 }
 
-/// A prompt's editing key (Backspace, Delete, arrows, Home, End) with no Ctrl
-/// or Alt, so the chords the prompts and the document own keep their meaning.
-fn plain_edit_key(key: &KeyEvent) -> bool {
-    !key.modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-}
-
+/// Pick a format from a path's extension: any `.html`/`.htm` is an editable-HTML
+/// bundle (opened by its content, so `sample.docx (1).html` works, and never
+/// written as anything else); Markdown for `.md`/`.markdown`/`.mdown`; `.docx`
+/// otherwise.
 fn format_for(path: &str) -> DocFormat {
     let lower = path.to_ascii_lowercase();
     if htmlbundle::is_html_path(&lower) {
@@ -3478,7 +3471,7 @@ impl App {
                 }
                 self.dirty = true;
             }
-            code if plain_edit_key(&key) => {
+            code if LineEdit::is_edit_key(&key) => {
                 if let Some(s) = self.comment_input.as_mut() {
                     s.handle(code);
                 }
@@ -4905,14 +4898,7 @@ impl App {
         match key.code {
             KeyCode::Up | KeyCode::BackTab => d.field = 0,
             KeyCode::Down | KeyCode::Tab => d.field = 1,
-            code @ (KeyCode::Backspace
-            | KeyCode::Delete
-            | KeyCode::Left
-            | KeyCode::Right
-            | KeyCode::Home
-            | KeyCode::End)
-                if plain_edit_key(&key) =>
-            {
+            code if LineEdit::is_edit_key(&key) => {
                 d.focused().handle(code);
             }
             KeyCode::Char(c)
@@ -5929,14 +5915,7 @@ impl App {
             }
             KeyCode::Down => self.find_step(1),
             KeyCode::Up => self.find_step(-1),
-            code @ (KeyCode::Backspace
-            | KeyCode::Delete
-            | KeyCode::Left
-            | KeyCode::Right
-            | KeyCode::Home
-            | KeyCode::End)
-                if plain_edit_key(&key) =>
-            {
+            code if LineEdit::is_edit_key(&key) => {
                 let mut query_changed = false;
                 if let Some(f) = &mut self.find {
                     match &mut f.replacement {
@@ -6405,7 +6384,7 @@ impl App {
                 }
                 self.dirty = true;
             }
-            code if plain_edit_key(&key) => {
+            code if LineEdit::is_edit_key(&key) => {
                 if let Some(s) = self.vim.as_mut().and_then(|v| v.cmdline.as_mut()) {
                     s.handle(code);
                 }
@@ -7285,23 +7264,30 @@ impl App {
         // Where each prompt's text starts on the status line, for a click on
         // it (`field-read`'s `at`).
         let col = |prefix: &str| status.x + RLine::from(prefix).width() as u16;
-        let mut at = |id: &'static str, prefix: &str| {
-            self.drawn_fields.push((id, (col(prefix), status.y)));
+        // `lead` is 1 when the caret mark sits before a non-empty field's
+        // first char, so `at` names that char, not the mark.
+        let mut at = |id: &'static str, prefix: &str, lead: u16| {
+            self.drawn_fields.push((id, (col(prefix) + lead, status.y)));
         };
-        if self.comment_input.is_some() {
-            at("docxy-comment", " New comment: ");
+        if let Some(c) = &self.comment_input {
+            at("docxy-comment", " New comment: ", c.mark_lead());
         } else if self.pending_link.is_some() {
         } else if let Some(f) = &self.find {
             match &f.replacement {
-                None => at("docxy-find", " Find: "),
-                Some(_) => {
-                    at("docxy-find", " Replace: ");
+                None => at("docxy-find", " Find: ", f.query.mark_lead()),
+                Some(repl) => {
+                    let (q_lead, r_lead) = if f.editing_replacement {
+                        (0, repl.mark_lead())
+                    } else {
+                        (f.query.mark_lead(), 0)
+                    };
+                    at("docxy-find", " Replace: ", q_lead);
                     let (q, _) = replace_drawn(f);
-                    at("docxy-replace", &format!(" Replace: {q} → "));
+                    at("docxy-replace", &format!(" Replace: {q} → "), r_lead);
                 }
             }
-        } else if self.vim.as_ref().is_some_and(|v| v.cmdline.is_some()) {
-            at("docxy-vim-command", ":");
+        } else if let Some(c) = self.vim.as_ref().and_then(|v| v.cmdline.as_ref()) {
+            at("docxy-vim-command", ":", c.mark_lead());
         }
         let status_widget =
             Paragraph::new(status_text).style(Style::default().add_modifier(Modifier::REVERSED));
