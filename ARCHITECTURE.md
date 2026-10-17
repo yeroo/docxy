@@ -51,6 +51,10 @@ world. Page geometry is optional pseudographics, not a pixel-accurate page.
 - **DOCX I/O:** ported from `rust365` (see §4), extended with a writer.
 - **PDF export:** a from-scratch writer in `docxcore` (std-only) using the
   standard-14 base fonts — no new runtime dependency, fully unit-testable (§7b).
+  A host may hand it a `PdfFontProvider` (`pdffont` finds system fonts): text
+  is then embedded as subset Identity-H fonts with a ToUnicode map, so every
+  script prints and copies (#1508); without one the output is the Courier file
+  described in §7b.
 - **Images:** `ratatui-image` (+ the `image` crate for decoding) to render inline
   pictures using whatever graphics protocol the host terminal supports —
   Kitty, iTerm2, or Sixel — with a Unicode half-block fallback and a text
