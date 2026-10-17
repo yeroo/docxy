@@ -2269,8 +2269,8 @@ impl Docxy {
     /// Copy/Cut/Paste with a cell editor open take the buffer, not the table
     /// (#561). Copy and Cut put the selection (else the whole buffer) on the system
     /// clipboard; Cut removes it only when the read-
-    /// back clipboard holds the buffer's text — a silently failed write (a
-    /// busy OS clipboard) otherwise keeps the buffer and the status says so.
+    /// back clipboard holds the cut text — a silently failed write (a
+    /// busy OS clipboard) otherwise keeps the text and the status says so.
     /// Paste inserts the clipboard's text at the caret. The edit stays open;
     /// the project, its undo stack and its dirty flag are untouched.
     fn project_cell_clipboard(&mut self, act: ProjectAct, cx: &mut Context<Self>) {
