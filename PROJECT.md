@@ -338,9 +338,9 @@ ships** with the workspace; without one, every list, status line and save
 refusal is what it was before plugins existed.
 
 - **`projcore::formats`** holds the `ProjectFormat` trait (extensions, label,
-  reads/writes, `read(bytes)`, `write(project, source)`) and the `Registry`
-  hosts consult for Open's file list, Save As's types, reads and writes, and
-  the save-path check. The built-in `.yppx` and `.xml` (MSPDI) come first,
+  reads/writes, `read(bytes)`, `write(project, source)`, `is_default`) and the
+  `Registry` hosts consult for Open's file list, Save As's types, reads and
+  writes, and the save-path check. The built-in `.yppx` and `.xml` (MSPDI) come first,
   then what the host registers: `mppread::project::MppImport`, the read-only
   `.mpp` import, then the plugins. A later registration for an extension
   replaces, in place, its reader (when it reads) and its writer (when it
@@ -349,14 +349,25 @@ refusal is what it was before plugins existed.
   the built-in registry's, so its refusal ("Project schedules can only be
   saved as .yppx or .xml (MSPDI)") is unchanged; a registry with a plugin
   writer lists that type too.
+- **A format plugin may be the default save type**: a formats JSON entry
+  with `"default": true` on a type the plugin writes. Save As proposes
+  `Registry::default_save_extension(opened)`: the type the plan was opened
+  from when something writes it, else the type of the last registered
+  format declaring itself the default that still writes it, else `.yppx`.
+  Both hosts list it first (`Registry::save_types_default_first`) and give
+  the suggested name its extension (`Project1.<ext>` for a new plan,
+  `plan.<ext>` for an import nothing writes); Save of a plan from a writable
+  type still writes in place, and a save path without an extension is
+  still `.yppx`.
 - **`projcore::plugin_abi`** is the C ABI, version 1: six `extern "C"`
   functions (`yppx_plugin_abi`, `yppx_plugin_formats`, `yppx_plugin_read`,
   `yppx_plugin_write`, `yppx_plugin_free`, `yppx_plugin_last_error`), a
   `YppxBuf { ptr, len }` the plugin owns and frees, return codes (0 ok, 1
   unsupported extension, 2 malformed input, 3 unsupported content, 4 internal
   error) and the formats JSON
-  (`[{"ext":"mpp","label":"Project","read":true,"write":true}]`). MSPDI XML
-  text crosses the boundary, never model structs. A save to the type the
+  (`[{"ext":"mpp","label":"Project","read":true,"write":true,"default":true}]`;
+  `read`, `write` and `default` are false when absent, other keys are
+  ignored). MSPDI XML text crosses the boundary, never model structs. A save to the type the
   plan was opened from passes the plugin that file's bytes, so it can carry
   over what the model does not hold.
 - **`projcore::formats::plugin`**, behind the cargo feature `plugins` (it
@@ -378,8 +389,9 @@ refusal is what it was before plugins existed.
   registry, built at start before any tab loads, drives what opens as a
   Project tab (the Open dialog's lists, the command line, Recent), every
   read, Save and Save As (the native dialog's types are the registry's
-  writable ones, in its order), the harness's `save-as` and the control
-  `proj.save`. A type nothing writes is an import: its status says
+  writable ones, the proposed type first and the dialog opening on it, then
+  in its order), the harness's `save-as` and `save-types` (`default`) and the
+  control `proj.save` and `proj.path` (`default_save_ext`). A type nothing writes is an import: its status says
   "imported from .<ext>; Save As .yppx or MSPDI to keep edits", Save goes to
   Save As and `proj.path` reports `imported: true`; with a plugin that
   writes `.mpp`, an opened `.mpp` is a plan like any other and Save writes it
@@ -389,7 +401,7 @@ refusal is what it was before plugins existed.
   first window's status line, never in a dialog.
 - **The fixture**: `projcore/tests/plugin_fixture` is a dependency-free cdylib
   (`publish = false`) that implements the ABI by hand for a fake `.fakeproj`
-  type, passing MSPDI through. `projcore/tests/plugins.rs` (run with
+  type, passing MSPDI through, and declares it the default save type. `projcore/tests/plugins.rs` (run with
   `--features plugins`) and `yppxy/tests/plugins.rs` build it with cargo, copy
   it into a plugin directory as `yppx_fixture.<dll|so|dylib>`, and round-trip
   a plan through it, `yppxy plan.xml --save out.fakeproj` included. The

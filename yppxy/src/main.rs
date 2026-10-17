@@ -684,10 +684,12 @@ impl App {
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         let mut backstage = Backstage::open(dir, self.extensions());
         // A plugin that writes adds a Save as type list (and Export's Change
-        // File Type); without one the backstage is as it always was.
-        if !self.formats.save_types.is_empty() {
+        // File Type), the type Save As proposes first; without one the
+        // backstage is as it always was.
+        let save_types = self.formats.save_types_for(self.path.as_deref());
+        if !save_types.is_empty() {
             backstage = backstage.with_save_types(
-                self.formats.save_types,
+                save_types,
                 "Export the Gantt chart as Markdown next to the plan",
             );
         }
@@ -1328,8 +1330,7 @@ impl App {
         let picked = self
             .backstage
             .as_ref()
-            .and_then(|b| b.chosen_type())
-            .and_then(|t| self.formats.save_types.get(t));
+            .and_then(|b| b.save_types.get(b.chosen_type()?));
         let name = match picked {
             Some(t)
                 if !projcore::formats::extension(Path::new(name)).eq_ignore_ascii_case(t.ext) =>
@@ -1407,8 +1408,8 @@ fn project_preview(proj: &Project, sched: &Schedule, path: Option<&Path>) -> Vec
 
 /// Format-specific content the shared File backstage needs from yppxy: only
 /// project files are listed/opened, the Save As default is the current
-/// file's name, the preview/Info panes render a project summary, and the
-/// accent matches yppxy's ribbon (yellow).
+/// file's name in the type Save As proposes, the preview/Info panes render a
+/// project summary, and the accent matches yppxy's ribbon (yellow).
 impl backstage::BackstageHost for App {
     fn extensions(&self) -> &'static [&'static str] {
         self.formats.open_exts
@@ -1418,12 +1419,12 @@ impl backstage::BackstageHost for App {
         self.formats.save_type_of(self.path.as_deref()?)
     }
 
+    /// The plan's file name, in the type Save As proposes: the one it was
+    /// opened from when something writes it, else a format plugin's declared
+    /// default, else `.yppx` (`Project1.yppx` for a new plan).
     fn default_save_name(&self) -> String {
-        self.path
-            .as_deref()
-            .and_then(|p| std::path::Path::new(p).file_name())
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| format!("{NEW_PROJECT_NAME}.yppx"))
+        self.formats
+            .default_save_name(self.path.as_deref(), NEW_PROJECT_NAME)
     }
 
     /// Render a quick summary of the highlighted project.
@@ -2916,14 +2917,17 @@ mod tests {
                 .contains("<!--")
         );
 
-        // Save As lists the plugin's type; picking it names the file.
+        // Save As lists the plugin's type, first for a plan opened from it;
+        // picking it names the file.
         app.path = Some(plan_path.into());
-        assert_eq!(app.default_save_type(), Some(2));
+        assert_eq!(app.default_save_type(), Some(0));
+        assert_eq!(app.default_save_name(), "plan.mpp");
         app.open_backstage();
         let backstage = app.backstage.as_mut().unwrap();
         assert_eq!(backstage.save_types.len(), 3);
-        assert_eq!(backstage.save_types[2].label, "Project");
-        backstage.begin_save_as("picked".into(), Some(2));
+        assert_eq!(backstage.save_types[0].label, "Project");
+        assert_eq!(backstage.save_types[2].label, "MSPDI");
+        backstage.begin_save_as("picked".into(), Some(0));
         app.commit_save_as(dir.clone(), "picked".into());
         let picked = dir.join("picked.mpp");
         assert_eq!(app.path.as_deref(), picked.to_str());
@@ -3425,6 +3429,40 @@ mod tests {
             App::new(new_project(), Some("old.yppx".into()), false).default_save_name(),
             "old.yppx"
         );
+        // An import nothing writes proposes .yppx, not its own refused type.
+        assert_eq!(
+            App::new(new_project(), Some("dir/old.mpp".into()), false).default_save_name(),
+            "old.yppx"
+        );
+    }
+
+    /// A format plugin that declares itself the default save type is what a
+    /// new plan's Save As proposes, its name and its type list first.
+    #[test]
+    fn a_default_plugin_type_names_a_new_plans_save_as() {
+        let mut app = App::new(new_project(), None, false);
+        app.formats = formats::tests::with_plugin(formats::tests::Passthrough {
+            ext: &["fakeproj"],
+            label: "Fake Project",
+            reads: true,
+            default: true,
+        });
+        let name = app.default_save_name();
+        assert_eq!(name, "Project1.fakeproj");
+        assert_eq!(app.default_save_type(), None);
+        app.open_backstage();
+        let backstage = app.backstage.as_mut().unwrap();
+        let exts: Vec<_> = backstage.save_types.iter().map(|t| t.ext).collect();
+        assert_eq!(exts, ["fakeproj", "yppx", "xml"]);
+        backstage.begin_save_as(name, None);
+        assert_eq!(backstage.type_sel, 0);
+        // A plan opened from MSPDI keeps proposing MSPDI.
+        app.backstage = None;
+        app.path = Some("plan.xml".into());
+        assert_eq!(app.default_save_name(), "plan.xml");
+        assert_eq!(app.default_save_type(), Some(0));
+        app.open_backstage();
+        assert_eq!(app.backstage.as_ref().unwrap().save_types[0].ext, "xml");
     }
 
     #[test]

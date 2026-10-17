@@ -342,7 +342,8 @@ The runner copies each one, built beside uiharness (`yppx_fixture.dll`,
 `docxy/plugins` as `<name>.<dll|so|dylib>`, the name the loader takes, before
 it launches the suite; a missing one is an error before anything launches.
 `yppx_fixture` is the test fixture `projcore/tests/plugin_fixture` builds
-(a fake `.fakeproj` type, MSPDI passed through): `cargo build --release -p
+(a fake `.fakeproj` type, MSPDI passed through, declared the default save
+type): `cargo build --release -p
 uiharness -p plugin_fixture`, which the Linux sweep's build step does. A
 harness instance never inherits `$YPPX_PLUGIN_DIR`, so without `plugin`
 lines it loads none, whatever the machine has installed.
@@ -945,7 +946,7 @@ pointer on a few pixels, each driven through the app's own handlers (#699).
 | `mail-attach {"path":"list.csv"}` | Mailings › Select Recipients › Use an Existing List… without the native dialog (#628): the path goes to the same attach the dialog's answer feeds, on the active Word document. A relative path resolves against the tab's folder. The reply is `{rows, columns, status}`; a file that is not a `.csv`/`.txt` list, cannot be read or has no header row is refused |
 | `hf-insert-picture {"path":"logo.png"}` | Header & Footer › Pictures… without the native dialog (#768): the picture at `path` goes to the same insert the dialog's answer feeds, at the caret of the open header or footer, related from that part's own rels. A relative path resolves against the tab's folder. The reply is `{status}`; with no header or footer open, in Protected View, or for a file that is not a PNG, JPEG, GIF or BMP, nothing is inserted and the verb is refused |
 | `save-as {"path":"out.md"}` | Save As the active tab to `path` without the native dialog: the path goes to the same save function the dialog's answer feeds (`save_doc_to`, `save_sheet_as`, `save_project_to`), and the tab is rebound (title, path, clean, a document's Markdown flag) exactly as after a dialog Save As. Optional `format` and `overwrite` |
-| `save-types {}` | what the Save As dialog lists for the active tab, which a harness instance never opens: `{count, types: [{label, extensions}]}` in the dialog's order. A document's types, the workbook type, or a Project's writable types: `Project schedule` (`yppx`) and `MSPDI` (`xml`), then any a format plugin writes. A read |
+| `save-types {}` | what the Save As dialog lists for the active tab, which a harness instance never opens: `{count, default, types: [{label, extensions}]}` in the dialog's order, `default` the first type's first extension, the one the dialog opens on. A document's types, the workbook type, or a Project's writable types: the one its Save As proposes first (the plan's own type when something writes it, else a format plugin's declared default, else `yppx`), then `Project schedule` (`yppx`) and `MSPDI` (`xml`) and any a format plugin writes. A read |
 | `new-from-template {"path":"Letter.dotx"}` | File › New › Personal templates without the click (#636): a new, untitled document from the `.dotx`/`.dotm` at `path` (a relative one resolves against the active tab's folder and is refused when that tab was never saved), the way opening a template makes one. Replies `{path: null, title, dirty, status}`; a file that is not a Word template, or one that will not load, opens nothing and is refused |
 | `clipboard {"action":"read"}` | the clipboard's text, its RTF (`rtf`, null without one) and the text of that RTF's bold runs (`rtf_bold`, #1074), its HTML table (`html`, null without one) and the texts of that table's bold cells (`html_bold`, #1248), and what the active tab's paste would use |
 | `clipboard {"action":"write","text":"a\tb\n"}` | put text on the clipboard, as another app's copy would; an optional `rtf` goes beside it, as a rich copy's does (#1074). An optional `html` (a table fragment) goes beside it too, as a sheet copy's does (#1248). A write without `rtf` or `html` leaves none |
@@ -968,7 +969,8 @@ MSPDI `.xml` or a type a [format plugin](#format-plugins) writes. A path with
 no extension takes `format`'s (`docx`, `docm`, `dotx`, `dotm`, `rtf`, `txt`,
 `md`, `html` → `.docx.html`, `xlsx`, `xlsm`, `xltx`, `xltm`, `yppx`, `xml`, a
 plugin's extension) or the kind's
-first (`.docx`, `.xlsx`, `.yppx`). The reply is
+first (`.docx`, `.xlsx`, a Project's `save-types` `default`: `.yppx` unless
+the plan's own type or a format plugin's default is proposed). The reply is
 `{path, format, title, dirty, status}`. Refused in words, with nothing written
 and the tab unchanged:
 

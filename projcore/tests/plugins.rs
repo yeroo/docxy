@@ -28,6 +28,8 @@ fn the_fixture_plugin_round_trips_a_project() {
     assert_eq!(format.extensions(), ["fakeproj"]);
     assert_eq!(format.label(), "Fake Project");
     assert!(format.reads() && format.writes());
+    // It declares itself the default save type.
+    assert!(format.is_default());
 
     let mut registry = Registry::new();
     for format in formats {
@@ -36,6 +38,17 @@ fn the_fixture_plugin_round_trips_a_project() {
     assert_eq!(registry.open_extensions(), ["yppx", "xml", "fakeproj"]);
     assert_eq!(registry.save_extensions(), ["yppx", "xml", "fakeproj"]);
     assert_eq!(registry.save_types()[2], ("fakeproj", "Fake Project"));
+    // So a new plan's Save As proposes it, first; an opened .xml stays .xml.
+    assert_eq!(registry.default_save_extension(None), "fakeproj");
+    assert_eq!(registry.default_save_extension(Some("xml")), "xml");
+    assert_eq!(
+        registry.save_types_default_first(None),
+        [
+            ("fakeproj", "Fake Project"),
+            ("yppx", "Project schedule"),
+            ("xml", "MSPDI")
+        ]
+    );
     assert_eq!(
         registry.save_target(Path::new("plan.mpp")).unwrap_err(),
         "Project schedules can only be saved as .yppx, .xml (MSPDI) or .fakeproj"

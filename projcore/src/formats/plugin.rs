@@ -126,6 +126,7 @@ pub fn load_plugin(path: &Path) -> Result<Vec<Box<dyn ProjectFormat>>, String> {
                 label: decl.label,
                 read: decl.read,
                 write: decl.write,
+                default: decl.default,
             }) as Box<dyn ProjectFormat>
         })
         .collect())
@@ -211,6 +212,8 @@ struct PluginFormat {
     label: String,
     read: bool,
     write: bool,
+    /// Declared `"default": true`: the type Save As proposes for a new plan.
+    default: bool,
 }
 
 impl ProjectFormat for PluginFormat {
@@ -228,6 +231,10 @@ impl ProjectFormat for PluginFormat {
 
     fn writes(&self) -> bool {
         self.write
+    }
+
+    fn is_default(&self) -> bool {
+        self.default
     }
 
     fn read(&self, bytes: &[u8]) -> Result<Project, String> {

@@ -10,7 +10,9 @@
 //! A type nothing writes is an import: its tab says so and Save goes to Save
 //! As. A type a plugin writes saves back in place, and the file the plan was
 //! opened from goes to that plugin as the source of each save of its type
-//! ([`Source`]), as in yppxy.
+//! ([`Source`]), as in yppxy. Save As proposes, first in its list, the type
+//! the plan was opened from when something writes it, else the type a plugin
+//! declared the default, else `.yppx` ([`Formats::default_save_extension`]).
 
 use projcore::Project;
 use projcore::formats::plugin::load_plugins_with_errors;
@@ -192,13 +194,35 @@ impl Formats {
         self.source(path, std::fs::read(path).ok()?)
     }
 
-    /// The Save As dialog's types, in registry order: (label, extension).
-    pub fn save_types(&self) -> Vec<(&str, &str)> {
+    /// The type Save As proposes for a plan bound to `path` (`None` for a
+    /// new plan): its own when something writes it, else the type a format
+    /// plugin declared the default, else `.yppx`
+    /// (`Registry::default_save_extension`).
+    pub fn default_save_extension(&self, path: Option<&Path>) -> &str {
+        self.registry.default_save_extension(path.map(extension))
+    }
+
+    /// The Save As dialog's types for a plan bound to `path` (`None` for a
+    /// new plan), (label, extension): the one it proposes first, as the
+    /// type the dialog opens on, then the others in registry order.
+    pub fn save_types(&self, path: Option<&Path>) -> Vec<(&str, &str)> {
         self.registry
-            .save_types()
+            .save_types_default_first(path.map(extension))
             .into_iter()
             .map(|(ext, label)| (label, ext))
             .collect()
+    }
+
+    /// The file name Save As suggests for a plan bound to `path`, or for a
+    /// new one titled `title`: the stem, with the extension of the type it
+    /// proposes ([`Formats::default_save_extension`]).
+    pub fn suggested_name(&self, path: Option<&Path>, title: &str) -> String {
+        let stem = path
+            .unwrap_or_else(|| Path::new(title))
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy();
+        format!("{stem}.{}", self.default_save_extension(path))
     }
 
     /// The writable extensions as prose (`.yppx or .xml` with the built-ins).
@@ -243,6 +267,8 @@ pub(crate) mod tests {
         pub ext: &'static [&'static str],
         pub label: &'static str,
         pub reads: bool,
+        /// Declared the default save type, as `"default": true` does.
+        pub default: bool,
     }
 
     impl ProjectFormat for Passthrough {
@@ -257,6 +283,9 @@ pub(crate) mod tests {
         }
         fn writes(&self) -> bool {
             true
+        }
+        fn is_default(&self) -> bool {
+            self.default
         }
         fn read(&self, bytes: &[u8]) -> Result<Project, String> {
             read_mspdi(std::str::from_utf8(bytes).map_err(|e| e.to_string())?)
@@ -276,6 +305,18 @@ pub(crate) mod tests {
             ext: &["mpp"],
             label: "Project",
             reads: true,
+            default: false,
+        })
+    }
+
+    /// A plugin-like format for `.fakeproj` that declares itself the default
+    /// save type, as the fixture plugin does.
+    pub(crate) fn default_writer() -> Box<dyn ProjectFormat> {
+        Box::new(Passthrough {
+            ext: &["fakeproj"],
+            label: "Fake Project",
+            reads: true,
+            default: true,
         })
     }
 
@@ -285,9 +326,32 @@ pub(crate) mod tests {
         assert!(formats.errors.is_empty());
         assert_eq!(formats.registry.open_extensions(), ["yppx", "xml", "mpp"]);
         assert_eq!(
-            formats.save_types(),
+            formats.save_types(None),
             [("Project schedule", "yppx"), ("MSPDI", "xml")]
         );
+        // An import nothing writes proposes .yppx; an MSPDI plan its own type.
+        assert_eq!(
+            formats.save_types(Some(Path::new("a.mpp"))),
+            formats.save_types(None)
+        );
+        assert_eq!(
+            formats.save_types(Some(Path::new("a.xml"))),
+            [("MSPDI", "xml"), ("Project schedule", "yppx")]
+        );
+        assert_eq!(formats.default_save_extension(None), "yppx");
+        for (path, title, name) in [
+            (None, "Project2", "Project2.yppx"),
+            (None, "Untitled.yppx", "Untitled.yppx"),
+            (Some("dir/plan.mpp"), "plan.mpp", "plan.yppx"),
+            (Some("dir/plan.XML"), "plan.XML", "plan.xml"),
+            (Some("dir/plan.yppx"), "plan.yppx", "plan.yppx"),
+        ] {
+            assert_eq!(
+                formats.suggested_name(path.map(Path::new), title),
+                name,
+                "{path:?}"
+            );
+        }
         assert_eq!(formats.save_list(), ".yppx or .xml");
         for name in ["a.yppx", "a.XML", "a.Mpp"] {
             assert!(formats.is_project_path(Path::new(name)), "{name}");
@@ -315,13 +379,27 @@ pub(crate) mod tests {
         let formats = global();
         assert_eq!(formats.registry.open_extensions(), ["yppx", "xml", "mpp"]);
         assert_eq!(
-            formats.save_types(),
+            formats.save_types(None),
             [
                 ("Project schedule", "yppx"),
                 ("MSPDI", "xml"),
                 ("Project", "mpp")
             ]
         );
+        // An opened .mpp proposes its own type now that something writes it.
+        assert_eq!(
+            formats.save_types(Some(Path::new("a.MPP"))),
+            [
+                ("Project", "mpp"),
+                ("Project schedule", "yppx"),
+                ("MSPDI", "xml")
+            ]
+        );
+        assert_eq!(
+            formats.suggested_name(Some(Path::new("dir/a.mpp")), "a.mpp"),
+            "a.mpp"
+        );
+        assert_eq!(formats.suggested_name(None, "Project1"), "Project1.yppx");
         assert_eq!(formats.save_list(), ".yppx, .xml or .mpp");
         assert!(!formats.is_import(Path::new("a.mpp")));
         assert_eq!(formats.import_note(Path::new("a.mpp")), None);
@@ -338,6 +416,7 @@ pub(crate) mod tests {
             ext: &["mpp"],
             label: "Project",
             reads: false,
+            default: false,
         })]);
         let formats = global();
         assert!(formats.builtin_mpp);
@@ -346,6 +425,43 @@ pub(crate) mod tests {
             formats.registry.reader("mpp").unwrap().label(),
             "Microsoft Project"
         );
+    }
+
+    #[test]
+    fn a_default_plugin_type_is_proposed_first_for_new_plans_and_imports() {
+        let _plugins = Override::new(vec![default_writer()]);
+        let formats = global();
+        let first = |path: Option<&str>| formats.save_types(path.map(Path::new))[0];
+        // A new plan and an .mpp import (nothing writes .mpp) propose it.
+        assert_eq!(formats.default_save_extension(None), "fakeproj");
+        assert_eq!(first(None), ("Fake Project", "fakeproj"));
+        assert_eq!(first(Some("a.mpp")), ("Fake Project", "fakeproj"));
+        assert_eq!(first(Some("a.fakeproj")), ("Fake Project", "fakeproj"));
+        // A writable type the plan came from stays its own.
+        assert_eq!(first(Some("a.xml")), ("MSPDI", "xml"));
+        assert_eq!(first(Some("a.yppx")), ("Project schedule", "yppx"));
+        assert_eq!(
+            formats.save_types(None),
+            [
+                ("Fake Project", "fakeproj"),
+                ("Project schedule", "yppx"),
+                ("MSPDI", "xml")
+            ]
+        );
+        // The prose list keeps registry order.
+        assert_eq!(formats.save_list(), ".yppx, .xml or .fakeproj");
+        for (path, title, name) in [
+            (None, "Project1", "Project1.fakeproj"),
+            (Some("dir/plan.mpp"), "plan.mpp", "plan.fakeproj"),
+            (Some("dir/plan.fakeproj"), "plan.fakeproj", "plan.fakeproj"),
+            (Some("dir/plan.xml"), "plan.xml", "plan.xml"),
+        ] {
+            assert_eq!(
+                formats.suggested_name(path.map(Path::new), title),
+                name,
+                "{path:?}"
+            );
+        }
     }
 
     #[test]

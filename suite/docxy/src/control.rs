@@ -101,6 +101,10 @@ fn path_info(tab: &DocTab, index: usize) -> Json {
     };
     fields.push(("tab".into(), Json::Num(index as f64)));
     fields.push(("imported".into(), Json::Bool(is_imported(tab))));
+    // The type Save As proposes: the plan's own when something writes it,
+    // else a format plugin's declared default, else yppx.
+    let default_ext = crate::project_formats::global().default_save_extension(tab.path.as_deref());
+    fields.push(("default_save_ext".into(), Json::Str(default_ext.into())));
     fields.extend(project_cell_state(v));
     Json::Obj(fields)
 }

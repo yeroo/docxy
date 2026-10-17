@@ -4,7 +4,9 @@
 //! `<config>/yppxy/plugins` and `$YPPX_PLUGIN_DIR`, in that order, so a
 //! plugin in the second takes over an extension one in the first claims too.
 //! With no plugin the lists, the status lines and the save refusal are what
-//! they were before plugins existed.
+//! they were before plugins existed. Save As proposes the type a plan was
+//! opened from when something writes it, else the type a plugin declared the
+//! default, else `.yppx` (`Registry::default_save_extension`).
 
 use crate::backstage::SaveType;
 use projcore::formats::plugin::load_plugins_with_errors;
@@ -22,9 +24,12 @@ pub(crate) struct Formats {
     pub registry: &'static Registry,
     /// The extensions the Open browser lists.
     pub open_exts: &'static [&'static str],
-    /// Save As's *Save as type* list: empty unless a plugin writes, so the
-    /// backstage stays as it was without one.
+    /// Save As's *Save as type* list in registry order: empty unless a
+    /// plugin writes, so the backstage stays as it was without one. The
+    /// backstage shows [`Formats::save_types_for`] the plan.
     pub save_types: &'static [SaveType],
+    /// The list once per writable type, that type first.
+    by_default: &'static [&'static [SaveType]],
     /// Why each plugin that did not load was skipped.
     pub errors: Vec<String>,
 }
@@ -91,21 +96,69 @@ impl Formats {
     pub fn new(registry: Registry, errors: Vec<String>) -> &'static Formats {
         let registry: &'static Registry = Box::leak(Box::new(registry));
         let open_exts = Box::leak(registry.open_extensions().into_boxed_slice());
-        let save_types: Vec<SaveType> = if registry.has_extra_writers() {
-            registry
-                .save_types()
+        let list = |types: Vec<(&'static str, &'static str)>| -> &'static [SaveType] {
+            let types: Vec<SaveType> = types
                 .into_iter()
                 .map(|(ext, label)| SaveType { label, ext })
-                .collect()
+                .collect();
+            Box::leak(types.into_boxed_slice())
+        };
+        let (save_types, by_default) = if registry.has_extra_writers() {
+            let by_default: Vec<&'static [SaveType]> = registry
+                .save_extensions()
+                .into_iter()
+                .map(|ext| list(registry.save_types_default_first(Some(ext))))
+                .collect();
+            (list(registry.save_types()), by_default)
         } else {
-            Vec::new()
+            (list(Vec::new()), Vec::new())
         };
         Box::leak(Box::new(Formats {
             registry,
             open_exts,
-            save_types: Box::leak(save_types.into_boxed_slice()),
+            save_types,
+            by_default: Box::leak(by_default.into_boxed_slice()),
             errors,
         }))
+    }
+
+    /// The type Save As proposes for the plan bound to `path` (`None` for a
+    /// new plan): see `Registry::default_save_extension`.
+    pub fn default_save_extension(&self, path: Option<&str>) -> &'static str {
+        self.registry
+            .default_save_extension(path.map(|p| extension(Path::new(p))))
+    }
+
+    /// Save As's *Save as type* list for the plan bound to `path` (`None`
+    /// for a new plan): [`Formats::save_types`] with the type Save As
+    /// proposes first. Empty unless a plugin writes.
+    pub fn save_types_for(&self, path: Option<&str>) -> &'static [SaveType] {
+        let default = self.default_save_extension(path);
+        self.by_default
+            .iter()
+            .copied()
+            .find(|types| types.first().is_some_and(|t| t.ext == default))
+            .unwrap_or(self.save_types)
+    }
+
+    /// The name Save As proposes for the plan bound to `path` (`None` for a
+    /// new plan, named `new_name`): the file's own name when its type is
+    /// the one proposed, else its stem (or `new_name`) with that type's
+    /// extension.
+    pub fn default_save_name(&self, path: Option<&str>, new_name: &str) -> String {
+        let ext = self.default_save_extension(path);
+        let Some(path) = path.map(Path::new) else {
+            return format!("{new_name}.{ext}");
+        };
+        match path.file_name() {
+            Some(name) if extension(path).eq_ignore_ascii_case(ext) => {
+                name.to_string_lossy().into_owned()
+            }
+            _ => {
+                let stem = path.file_stem().map(|s| s.to_string_lossy());
+                format!("{}.{ext}", stem.as_deref().unwrap_or(new_name))
+            }
+        }
     }
 
     /// Whether a plugin, not a built-in, writes `ext`: then a file of that
@@ -137,10 +190,10 @@ impl Formats {
     }
 
     /// The Save As type the plan bound to `path` is saved as, if the list
-    /// has one.
+    /// has one: its index in [`Formats::save_types_for`] the plan.
     pub fn save_type_of(&self, path: &str) -> Option<usize> {
         let ext = extension(Path::new(path));
-        self.save_types
+        self.save_types_for(Some(path))
             .iter()
             .position(|t| t.ext.eq_ignore_ascii_case(ext))
     }
@@ -165,6 +218,8 @@ pub(crate) mod tests {
         pub ext: &'static [&'static str],
         pub label: &'static str,
         pub reads: bool,
+        /// Declared the default save type, as `"default": true` does.
+        pub default: bool,
     }
 
     impl ProjectFormat for Passthrough {
@@ -179,6 +234,9 @@ pub(crate) mod tests {
         }
         fn writes(&self) -> bool {
             true
+        }
+        fn is_default(&self) -> bool {
+            self.default
         }
         fn read(&self, bytes: &[u8]) -> Result<Project, String> {
             let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
@@ -195,13 +253,24 @@ pub(crate) mod tests {
 
     /// The host's formats plus a plugin-like writer (and reader) for `.mpp`.
     pub(crate) fn with_mpp_writer() -> &'static Formats {
-        let mut registry = host_registry();
-        registry.register(Box::new(Passthrough {
+        with_plugin(Passthrough {
             ext: &["mpp"],
             label: "Project",
             reads: true,
-        }));
+            default: false,
+        })
+    }
+
+    /// The host's formats plus `plugin`.
+    pub(crate) fn with_plugin(plugin: Passthrough) -> &'static Formats {
+        let mut registry = host_registry();
+        registry.register(Box::new(plugin));
         Formats::new(registry, Vec::new())
+    }
+
+    /// The extensions of a Save as type list, in its order.
+    fn exts(types: &[SaveType]) -> Vec<&str> {
+        types.iter().map(|t| t.ext).collect()
     }
 
     #[test]
@@ -209,8 +278,13 @@ pub(crate) mod tests {
         let formats = global();
         assert_eq!(formats.open_exts, ["yppx", "xml", "mpp"]);
         assert!(formats.save_types.is_empty());
+        assert!(formats.save_types_for(None).is_empty());
+        assert!(formats.save_types_for(Some("plan.xml")).is_empty());
         assert!(formats.errors.is_empty());
         assert_eq!(formats.save_type_of("plan.yppx"), None);
+        assert_eq!(formats.default_save_extension(None), "yppx");
+        assert_eq!(formats.default_save_extension(Some("a.XML")), "xml");
+        assert_eq!(formats.default_save_extension(Some("a.mpp")), "yppx");
         assert_eq!(formats.source("plan.mpp", b"x".to_vec()), None);
         assert_eq!(formats.opened_status("a.xml", 3), "Opened a.xml");
         assert_eq!(formats.opened_status("a.YPPX", 3), "Opened a.YPPX");
@@ -242,13 +316,83 @@ pub(crate) mod tests {
                 ("mpp", "Project")
             ]
         );
-        assert_eq!(formats.save_type_of("dir/plan.MPP"), Some(2));
+        // An opened .mpp proposes its own type, first.
+        assert_eq!(formats.save_type_of("dir/plan.MPP"), Some(0));
+        assert_eq!(
+            exts(formats.save_types_for(Some("dir/plan.MPP"))),
+            ["mpp", "yppx", "xml"]
+        );
+        // A writer that is not the default leaves new plans on .yppx.
+        assert_eq!(exts(formats.save_types_for(None)), ["yppx", "xml", "mpp"]);
+        assert_eq!(formats.save_type_of("plan.xml"), Some(0));
+        assert_eq!(
+            exts(formats.save_types_for(Some("a.xml"))),
+            ["xml", "yppx", "mpp"]
+        );
         assert_eq!(formats.opened_status("a.mpp", 3), "Opened a.mpp — 3 tasks");
         assert_eq!(formats.opened_status("a.mpp", 0), "Opened a.mpp — 0 tasks");
         let source = formats.source("a.MPP", b"abc".to_vec()).unwrap();
         assert_eq!(source.for_target(Path::new("b.mpp")), Some(&b"abc"[..]));
         assert_eq!(source.for_target(Path::new("b.xml")), None);
         assert_eq!(formats.source("a.xml", b"abc".to_vec()), None);
+    }
+
+    #[test]
+    fn a_default_plugin_type_is_proposed_for_new_plans_and_imports() {
+        let formats = with_plugin(Passthrough {
+            ext: &["fakeproj"],
+            label: "Fake Project",
+            reads: true,
+            default: true,
+        });
+        assert_eq!(formats.default_save_extension(None), "fakeproj");
+        assert_eq!(
+            exts(formats.save_types_for(None)),
+            ["fakeproj", "yppx", "xml"]
+        );
+        // The list in registry order is unchanged.
+        assert_eq!(exts(formats.save_types), ["yppx", "xml", "fakeproj"]);
+        // A plan from a type nothing writes (the .mpp import) takes it too;
+        // one from a writable type keeps its own.
+        assert_eq!(formats.default_save_extension(Some("a.mpp")), "fakeproj");
+        assert_eq!(formats.save_type_of("a.mpp"), None);
+        assert_eq!(
+            exts(formats.save_types_for(Some("a.xml"))),
+            ["xml", "yppx", "fakeproj"]
+        );
+        assert_eq!(formats.save_type_of("dir/a.yppx"), Some(0));
+        let names = [
+            (None, "Project1.fakeproj"),
+            (Some("dir/plan.mpp"), "plan.fakeproj"),
+            (Some("plan.XML"), "plan.XML"),
+            (Some("dir/plan.fakeproj"), "plan.fakeproj"),
+            (Some("plan"), "plan.fakeproj"),
+        ];
+        for (path, name) in names {
+            assert_eq!(
+                formats.default_save_name(path, "Project1"),
+                name,
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_a_default_plugin_new_plans_and_imports_propose_yppx() {
+        let formats = global();
+        let names = [
+            (None, "Project1.yppx"),
+            (Some("dir/plan.mpp"), "plan.yppx"),
+            (Some("plan.xml"), "plan.xml"),
+            (Some("old.yppx"), "old.yppx"),
+        ];
+        for (path, name) in names {
+            assert_eq!(
+                formats.default_save_name(path, "Project1"),
+                name,
+                "{path:?}"
+            );
+        }
     }
 
     #[test]

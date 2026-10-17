@@ -17172,11 +17172,13 @@ impl Docxy {
             }
             SaveDecision::Dialog { suggested } => {
                 let start = doc_import::save_start_dir_of(tab);
+                // The registry's writable types: the one Save As proposes
+                // first (the dialog opens on the first filter), then the
+                // built-ins and any a format plugin writes, in its order.
+                let types = project_formats::global().save_types(tab.path.as_deref());
                 let target = macos_menu::native_modal(|| {
-                    // The registry's writable types, in its order: the
-                    // built-ins, then any a format plugin writes.
                     let mut dialog = rfd::FileDialog::new();
-                    for (label, ext) in project_formats::global().save_types() {
+                    for (label, ext) in types {
                         dialog = dialog.add_filter(label, &[ext]);
                     }
                     let mut dialog = dialog.set_file_name(suggested);

@@ -46,7 +46,8 @@ Supported verbs are `proj.path`, `task.list`, `task.get`, `task.fields`, `task.s
 `assign.get`, `assign.fields`, `assign.add`, `assign.set`, `assign.del`,
 `proj.save`, `proj.reload`, `proj.open` and `proj.new`, with the yppxy
 argument/result shapes, plus `app-info` (the build: version, commit, last merged PR, kind, `manual`; #1023). `proj.path` additionally
-reports `tab`, `imported`, `cell` (active column name), `cell_row` (zero-based row),
+reports `tab`, `imported`, `default_save_ext` (the type Save As proposes, see
+[Format plugins](#format-plugins-yppxy-and-the-desktop-suite)), `cell` (active column name), `cell_row` (zero-based row),
 `cell_edit` (pending cell buffer, or `null` when closed), `selection` (the
 entry-table range's cell count, or `null`; #560) and `cell_drag` (whether a
 cell drag gesture is armed, #560 r4). Reads and rejected
@@ -1133,6 +1134,11 @@ behaves as described above.
   `proj.open` and `proj.reload` read a plugin's types through it. A plugin
   that does not load is reported on stderr, in `<config>/docxy/crash.log`
   and on the first window's status line.
+- A format plugin may be the default save type (`"default": true` in its
+  formats JSON): Save As then proposes its type for a new plan and for an
+  import nothing writes, while a plan opened from a writable type keeps
+  proposing its own; `proj.path`'s `default_save_ext` is that type (`yppx`
+  without such a plugin).
 
 The ABI (C, MSPDI XML text across the boundary) is `projcore::plugin_abi`;
 the loader is `projcore::formats::plugin` (cargo feature `plugins`). See

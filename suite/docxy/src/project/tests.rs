@@ -1,5 +1,5 @@
 use super::*;
-use crate::project_formats::tests::{Override, mpp_writer};
+use crate::project_formats::tests::{Override, default_writer, mpp_writer};
 use core::prelude::v1::test;
 use projcore::{mspdi, yppx};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -154,6 +154,41 @@ fn blank_plan_save_as_proposes_its_title() {
         SaveDecision::Dialog {
             suggested: "Project2.yppx".into()
         }
+    );
+}
+
+/// With a format plugin that declares itself the default save type, a new
+/// plan's Save As proposes that type, and so does an import nothing writes;
+/// a plan opened from a writable type proposes its own, and Save on it still
+/// writes in place.
+#[test]
+fn save_as_proposes_a_default_plugins_type() {
+    let _plugins = Override::new(vec![default_writer()]);
+    let mut tab = new_project_tab("Project2");
+    assert_eq!(
+        save_decision(&tab, false, true),
+        SaveDecision::Dialog {
+            suggested: "Project2.fakeproj".into()
+        }
+    );
+    for (path, suggested) in [
+        ("dir/plan.mpp", "plan.fakeproj"),
+        ("dir/plan.fakeproj", "plan.fakeproj"),
+        ("dir/plan.xml", "plan.xml"),
+    ] {
+        tab.path = Some(PathBuf::from(path));
+        assert_eq!(
+            save_decision(&tab, false, true),
+            SaveDecision::Dialog {
+                suggested: suggested.into()
+            },
+            "{path}"
+        );
+    }
+    tab.path = Some(PathBuf::from("dir/plan.fakeproj"));
+    assert_eq!(
+        save_decision(&tab, false, false),
+        SaveDecision::InPlace(PathBuf::from("dir/plan.fakeproj"))
     );
 }
 
@@ -1096,6 +1131,7 @@ fn a_plugin_type_is_a_project_only_while_its_plugin_is_loaded() {
         ext: &["fakeproj"],
         label: "Fake Project",
         reads: true,
+        default: false,
     })]);
     let dir = Scratch::new();
     let path = dir.path("plan.fakeproj");
