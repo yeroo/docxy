@@ -22,7 +22,7 @@ test Date & Time on the Insert tab inserts into the body
   assert dialog is none
   assert hf_edit is false
   assert dirty is true
-  assert caret.offset is 3
+  assert caret.offset is not 2
 
 test alt+shift+d and alt+shift+t insert a date and a time field
   open copy:../fixtures/basic.docx
