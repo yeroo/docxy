@@ -93,7 +93,7 @@ pub(super) struct ProjectView {
     /// and the cursor's columns are pinned) while the drag moves over rows.
     pub row_drag: bool,
     /// The range was made by a press on a task's ID cell (Project's row
-    /// header), and nothing has reshaped it since: Delete over it deletes
+    /// header) or by Shift+Space (#1534), and nothing has reshaped it since: Delete over it deletes
     /// the cursor's task rather than clearing cells (#1260). Only meaningful
     /// while `anchor` is set.
     pub row_header: bool,

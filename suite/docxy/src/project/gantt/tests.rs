@@ -255,7 +255,7 @@ fn set_split_moves_the_divider_and_keeps_the_width_invariant() {
 fn a_split_drag_does_not_reveal_the_selected_column() {
     let mut v = ProjectView::new(editor(vec![task(1, 60, 1)]).project().clone(), false);
     v.layout(900.);
-    // The default columns leave only the ID column (0..44) to scroll out.
+    // At this width only the ID column (0..46) can scroll wholly out of view.
     v.col = COL_ID;
     // Scroll the ID column out of view, then drag the split.
     v.table_x.set(TABLE_W - v.table_w);
@@ -355,13 +355,13 @@ fn table_and_chart_scrollbars_move_only_their_own_pane() {
 fn a_table_scrollbar_drag_is_not_undone_by_the_next_frame() {
     let mut v = ProjectView::new(editor(vec![task(1, 60, 1)]).project().clone(), false);
     v.layout(600.);
-    // The ID column (0..44) is the one a scrolled table hides.
+    // The ID column (0..46) is the one a scrolled table hides.
     v.col = COL_ID;
     v.table_x.set(TABLE_W - v.table_w);
     v.layout(600.);
     assert_eq!(v.table_x.get(), TABLE_W - v.table_w);
     // A resize still brings the selected column back: clamping alone would
-    // leave the table at TABLE_W - 700, ID still hidden.
+    // leave the table at TABLE_W - 750, ID still hidden.
     v.layout(NARROW);
     assert_eq!(v.table_x.get(), 0.);
 }
