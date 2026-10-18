@@ -172,7 +172,7 @@ impl TimelineSpan {
 
     /// Days since the span's first, where chart offset `x` falls.
     fn day_at(self, scale: GanttScale, x: f32) -> f32 {
-        (scale.origin_day - self.first) as f32 + x / DAY_W
+        (scale.origin_day - self.first) as f32 + x / scale.day_w
     }
 }
 
@@ -255,8 +255,8 @@ pub(crate) fn view_days(
     let last = span.first + span.days - 1;
     let clamp = |d: i64| d.clamp(span.first, last);
     (
-        clamp(scale.origin_day + (gantt_x / DAY_W).floor() as i64),
-        clamp(scale.origin_day + ((gantt_x + gantt_w) / DAY_W).ceil() as i64 - 1),
+        clamp(scale.origin_day + (gantt_x / scale.day_w).floor() as i64),
+        clamp(scale.origin_day + ((gantt_x + gantt_w) / scale.day_w).ceil() as i64 - 1),
     )
 }
 
@@ -280,7 +280,7 @@ pub(crate) fn drag_gantt_x(
     if w <= 0. || lo > hi {
         return start_x;
     }
-    let x = start_x + dx * span.days as f32 * DAY_W / w;
+    let x = start_x + dx * span.days as f32 * scale.day_w / w;
     x.clamp(lo.min(start_x), hi.max(start_x))
 }
 

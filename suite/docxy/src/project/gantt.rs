@@ -1,7 +1,9 @@
 //! Day-scale geometry shared by the renderer and harness.
 use super::*;
 
-pub(crate) const DAY_W: f32 = 22.;
+/// The pixels one day is wide at the default zoom (the Days level); a view's live
+/// value is [`GanttScale::day_w`].
+pub(crate) const DEFAULT_DAY_W: f32 = 22.;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum BarKind {
@@ -38,12 +40,12 @@ pub(crate) fn bar_kind_name(kind: BarKind) -> &'static str {
 
 /// The rectangle `gantt_strip` draws `bar` in, `(x, y, w, h)` within its
 /// row: a leaf bar, a summary's thinner bar, or a milestone's diamond box.
-pub(crate) fn bar_rect(bar: &GanttBar) -> (f32, f32, f32, f32) {
-    let w = (bar.end - bar.start + 1).max(1) as f32 * DAY_W;
+pub(crate) fn bar_rect(bar: &GanttBar, day_w: f32) -> (f32, f32, f32, f32) {
+    let w = (bar.end - bar.start + 1).max(1) as f32 * day_w;
     match bar.kind {
-        BarKind::Summary => (bar.start as f32 * DAY_W, 9., w, 10.),
-        BarKind::Milestone => (bar.start as f32 * DAY_W + 4., 5., 14., 14.),
-        BarKind::Critical | BarKind::OnTrack => (bar.start as f32 * DAY_W, 5., w, 14.),
+        BarKind::Summary => (bar.start as f32 * day_w, 9., w, 10.),
+        BarKind::Milestone => (bar.start as f32 * day_w + 4., 5., 14., 14.),
+        BarKind::Critical | BarKind::OnTrack => (bar.start as f32 * day_w, 5., w, 14.),
     }
 }
 
@@ -128,16 +130,18 @@ impl GanttBar {
 pub(crate) struct GanttScale {
     pub origin_day: i64,
     pub days: i64,
+    /// Pixels per day: [`DEFAULT_DAY_W`] until the view is zoomed.
+    pub day_w: f32,
 }
 
 impl GanttScale {
     pub fn width(self) -> f32 {
-        self.days as f32 * DAY_W
+        self.days as f32 * self.day_w
     }
 
     /// The chart offset at which day number `day` starts.
     pub fn x(self, day: i64) -> f32 {
-        (day - self.origin_day) as f32 * DAY_W
+        (day - self.origin_day) as f32 * self.day_w
     }
 
     fn date(self, day: i64) -> projcore::DateTime {
@@ -155,8 +159,8 @@ impl GanttScale {
     }
 
     fn visible(self, offset: f32, width: f32) -> std::ops::Range<i64> {
-        (offset / DAY_W).floor().max(0.) as i64
-            ..(((offset + width) / DAY_W).ceil() as i64).min(self.days)
+        (offset / self.day_w).floor().max(0.) as i64
+            ..(((offset + width) / self.day_w).ceil() as i64).min(self.days)
     }
 }
 
@@ -180,6 +184,7 @@ pub(crate) fn gantt_scale(ed: &ProjectEditor) -> GanttScale {
     GanttScale {
         origin_day: first,
         days: (last - first + 1 + 7).max(30),
+        day_w: DEFAULT_DAY_W,
     }
 }
 
@@ -327,7 +332,7 @@ pub(crate) fn shaded_days(
 pub(crate) fn day_lines(scale: GanttScale, offset: f32, width: f32) -> Vec<f32> {
     scale
         .visible(offset, width)
-        .map(|day| day as f32 * DAY_W - offset)
+        .map(|day| day as f32 * scale.day_w - offset)
         .filter(|x| (0. ..width).contains(x))
         .collect()
 }
@@ -366,8 +371,8 @@ fn backdrop(
             for day in shaded_days(scale, cal.as_ref(), offset, width) {
                 window.paint_quad(fill(
                     Bounds {
-                        origin: point(bounds.origin.x + px(day as f32 * DAY_W), bounds.origin.y),
-                        size: size(px(DAY_W), bounds.size.height),
+                        origin: point(bounds.origin.x + px(day as f32 * scale.day_w), bounds.origin.y),
+                        size: size(px(scale.day_w), bounds.size.height),
                     },
                     nonworking_fill(pal),
                 ));
@@ -451,10 +456,10 @@ pub(crate) fn body_grid(view: &ProjectView, pal: Pal) -> impl IntoElement {
                     window.paint_quad(fill(
                         Bounds {
                             origin: point(
-                                chart.origin.x + px(day as f32 * DAY_W - gantt_x),
+                                chart.origin.x + px(day as f32 * scale.day_w - gantt_x),
                                 chart.origin.y,
                             ),
-                            size: size(px(DAY_W), chart.size.height),
+                            size: size(px(scale.day_w), chart.size.height),
                         },
                         nonworking_fill(pal),
                     ));
@@ -486,12 +491,12 @@ pub(crate) fn gantt_header(
         .child(backdrop(scale, cal, offset, width, pal))
         .children(
             scale
-                .ticks(scale.visible((offset - DAY_W * 2.).max(0.), width + DAY_W * 2.))
+                .ticks(scale.visible((offset - scale.day_w * 2.).max(0.), width + scale.day_w * 2.))
                 .into_iter()
                 .map(|(day, label)| {
                     div()
                         .absolute()
-                        .left(px(day as f32 * DAY_W))
+                        .left(px(day as f32 * scale.day_w))
                         .top(px(5.))
                         .child(label)
                 }),
@@ -522,12 +527,13 @@ pub(crate) fn gantt_strip(
         return strip;
     };
     let (color, shape) = bar_look(bar.kind, palette);
+    let dw = scale.day_w;
     let span = |s: i64, e: i64, y: f32, h: f32, color: Hsla, hollow: bool| {
         div()
             .absolute()
-            .left(px(s as f32 * DAY_W))
+            .left(px(s as f32 * dw))
             .top(px(y))
-            .w(px((e - s + 1).max(1) as f32 * DAY_W))
+            .w(px((e - s + 1).max(1) as f32 * dw))
             .h(px(h))
             .when(hollow, |d| d.border_1().border_color(color))
             .when(!hollow, |d| d.bg(color))
@@ -537,9 +543,9 @@ pub(crate) fn gantt_strip(
         strip = strip.child(
             div()
                 .absolute()
-                .left(px(s as f32 * DAY_W))
+                .left(px(s as f32 * dw))
                 .top(px(8.))
-                .w(px((e - s).max(0) as f32 * DAY_W))
+                .w(px((e - s).max(0) as f32 * dw))
                 .h(px(8.))
                 .bg(Hsla { a: 0.4, ..pal.dim }),
         );
@@ -558,7 +564,7 @@ pub(crate) fn gantt_strip(
         let outline = if shape == BarShape::Diamond {
             div()
                 .absolute()
-                .left(px(bar.start as f32 * DAY_W + 4.))
+                .left(px(bar.start as f32 * dw + 4.))
                 .top(px(5.))
                 .size(px(14.))
                 .child(milestone_diamond(color, true))
@@ -602,9 +608,9 @@ pub(crate) fn gantt_strip(
         BarShape::Thin => span(bar.start, bar.end, 11., 6., hsla_u(color), false).child(marker),
         BarShape::Summary => div()
             .absolute()
-            .left(px(bar.start as f32 * DAY_W))
+            .left(px(bar.start as f32 * dw))
             .top(px(9.))
-            .w(px((bar.end - bar.start + 1).max(1) as f32 * DAY_W))
+            .w(px((bar.end - bar.start + 1).max(1) as f32 * dw))
             .h(px(10.))
             .child(
                 div()
@@ -633,7 +639,7 @@ pub(crate) fn gantt_strip(
             .child(marker),
         BarShape::Diamond => div()
             .absolute()
-            .left(px(bar.start as f32 * DAY_W + 4.))
+            .left(px(bar.start as f32 * dw + 4.))
             .top(px(5.))
             .size(px(14.))
             .child(milestone_diamond(color, false))

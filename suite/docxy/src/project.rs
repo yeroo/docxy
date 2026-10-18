@@ -76,6 +76,9 @@ pub(super) struct ProjectView {
     /// The table pane width the user dragged the split bar to; `None` is the
     /// default. Window view state, never saved.
     pub split: Option<f32>,
+    /// The Gantt's zoom in pixels per day; `None` is [`DEFAULT_DAY_W`] (the
+    /// Days level). Window view state, never saved or undone.
+    pub zoom_day_w: Option<f32>,
     /// A resource-levelling pass that has been asked for but not yet run:
     /// its token and the leveled state it sets. The status bar says `Busy`
     /// while it is here; see [`request_level_pass`].
@@ -143,6 +146,7 @@ impl ProjectView {
             show_critical: true,
             show_baseline: true,
             split: None,
+            zoom_day_w: None,
             busy: None,
             scheduled: None,
             anchor: None,
@@ -198,7 +202,10 @@ impl ProjectView {
     }
 
     pub fn refresh_schedule_layout(&mut self) {
-        self.scale = gantt_scale(&self.ed);
+        self.scale = GanttScale {
+            day_w: self.zoom_day_w.unwrap_or(DEFAULT_DAY_W),
+            ..gantt_scale(&self.ed)
+        };
         self.clamp_offsets();
     }
 
@@ -206,7 +213,7 @@ impl ProjectView {
     /// days to its right edge. Scrolling clamps to the plan's own scale, not this one.
     pub fn chart_scale(&self) -> GanttScale {
         GanttScale {
-            days: self.scale.days.max((self.gantt_w / DAY_W).ceil() as i64),
+            days: self.scale.days.max((self.gantt_w / self.scale.day_w).ceil() as i64),
             ..self.scale
         }
     }
@@ -385,7 +392,7 @@ impl ProjectView {
 
     pub fn pan_gantt(&mut self, right: bool) {
         self.gantt_x
-            .set(self.gantt_x.get() + if right { DAY_W } else { -DAY_W });
+            .set(self.gantt_x.get() + if right { self.scale.day_w } else { -self.scale.day_w });
         self.clamp_offsets();
     }
 
@@ -399,7 +406,7 @@ impl ProjectView {
             .and_then(|uid| self.ed.project().task(uid))
             .and_then(|task| gantt_bar(&self.ed, task, self.scale));
         if let Some(bar) = bar {
-            self.gantt_x.set((bar.start - 1).max(0) as f32 * DAY_W);
+            self.gantt_x.set((bar.start - 1).max(0) as f32 * self.scale.day_w);
             self.clamp_offsets();
         }
     }
@@ -636,7 +643,10 @@ pub(super) fn project_state(
     body_h: Option<f32>,
 ) -> Vec<(String, ctlcore::json::Json)> {
     use ctlcore::json::Json;
-    let scale = gantt_scale(&v.ed);
+    let scale = GanttScale {
+        day_w: v.scale.day_w,
+        ..gantt_scale(&v.ed)
+    };
     let count = v.ed.project().tasks.len();
     let shown = v.ed.display_rows().len();
     let scroll_y = -f32::from(v.scroll.0.borrow().base_handle.offset().y);

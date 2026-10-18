@@ -1258,7 +1258,7 @@ fn assignment_find_leveling_recalc_and_navigation_statuses() {
     apply_project_act(&mut t, ProjectAct::Recalc);
     assert_eq!(t.status.as_ref(), "Rescheduled (automatic on every edit)");
     apply_project_act(&mut t, ProjectAct::ScrollRight);
-    assert_eq!(v(&t).gantt_x.get(), DAY_W);
+    assert_eq!(v(&t).gantt_x.get(), DEFAULT_DAY_W);
     apply_project_act(&mut t, ProjectAct::ScrollLeft);
     assert_eq!(v(&t).gantt_x.get(), 0.);
     apply_project_act(&mut t, ProjectAct::ScrollRight);
@@ -2076,7 +2076,7 @@ fn scroll_to_task_puts_the_bar_a_day_in_from_the_left_edge() {
     let status = t.status.clone();
     apply_project_act(&mut t, ProjectAct::ScrollToTask);
     // Monday 2026-01-05 + 56 days, less the one-day margin.
-    assert_eq!(v(&t).gantt_x.get(), 55. * DAY_W);
+    assert_eq!(v(&t).gantt_x.get(), 55. * DEFAULT_DAY_W);
     assert_eq!(v(&t).ed.project(), &before);
     assert_eq!(v(&t).ed.undo_depth(), 1);
     assert_eq!(t.status, status);

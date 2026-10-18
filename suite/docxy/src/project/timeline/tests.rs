@@ -192,13 +192,15 @@ const SPAN: TimelineSpan = TimelineSpan {
 const SCALE: GanttScale = GanttScale {
     origin_day: 100,
     days: 47,
+    day_w: DEFAULT_DAY_W,
 };
 /// A baseline that starts 5 days before the displayed plan widens the scale.
 const LEAD_SCALE: GanttScale = GanttScale {
     origin_day: 95,
     days: 52,
+    day_w: DEFAULT_DAY_W,
 };
-const VIEW_W: f32 = 10. * DAY_W;
+const VIEW_W: f32 = 10. * DEFAULT_DAY_W;
 const RULER_W: f32 = 400.;
 
 fn assert_near(got: (f32, f32), want: (f32, f32)) {
@@ -211,9 +213,9 @@ fn assert_near(got: (f32, f32), want: (f32, f32)) {
 #[test]
 fn the_view_box_is_the_charts_visible_days_on_the_span() {
     // The chart shows the whole plan.
-    assert_eq!(view_box(SPAN, SCALE, 0., 50. * DAY_W), (0., 1.));
+    assert_eq!(view_box(SPAN, SCALE, 0., 50. * DEFAULT_DAY_W), (0., 1.));
     // Scrolled mid-plan: days 10..20 of 40.
-    assert_near(view_box(SPAN, SCALE, 10. * DAY_W, VIEW_W), (0.25, 0.5));
+    assert_near(view_box(SPAN, SCALE, 10. * DEFAULT_DAY_W, VIEW_W), (0.25, 0.5));
     // Scrolled to the end of the scale, into the padding past the finish.
     let end = SCALE.width() - VIEW_W;
     assert_near(view_box(SPAN, SCALE, end, VIEW_W), (37. / 40., 1.));
@@ -234,9 +236,9 @@ fn the_view_box_keeps_a_grabbable_width_inside_the_ruler() {
 
 #[test]
 fn the_view_days_are_the_first_and_last_day_the_chart_shows() {
-    assert_eq!(view_days(SPAN, SCALE, 10. * DAY_W, VIEW_W), (110, 119));
+    assert_eq!(view_days(SPAN, SCALE, 10. * DEFAULT_DAY_W, VIEW_W), (110, 119));
     // A day partly in view counts at either end.
-    assert_eq!(view_days(SPAN, SCALE, 10.5 * DAY_W, VIEW_W), (110, 120));
+    assert_eq!(view_days(SPAN, SCALE, 10.5 * DEFAULT_DAY_W, VIEW_W), (110, 120));
     // Clamped to the span: the padding past the finish and the baseline lead-in.
     assert_eq!(
         view_days(SPAN, SCALE, SCALE.width() - VIEW_W, VIEW_W),
@@ -248,12 +250,12 @@ fn the_view_days_are_the_first_and_last_day_the_chart_shows() {
 #[test]
 fn dragging_the_box_scrolls_the_chart_by_the_days_it_covers() {
     let drag = |start_x, dx| drag_gantt_x(SPAN, SCALE, VIEW_W, RULER_W, start_x, dx);
-    let mid = 10. * DAY_W;
-    assert_eq!(drag(mid, 50.), 15. * DAY_W);
-    assert_eq!(drag(mid, -30.), 7. * DAY_W);
+    let mid = 10. * DEFAULT_DAY_W;
+    assert_eq!(drag(mid, 50.), 15. * DEFAULT_DAY_W);
+    assert_eq!(drag(mid, -30.), 7. * DEFAULT_DAY_W);
     assert_eq!(drag(mid, 0.), mid);
     // The box stops at either end of the Timeline.
-    assert_eq!(drag(mid, 1000.), 30. * DAY_W);
+    assert_eq!(drag(mid, 1000.), 30. * DEFAULT_DAY_W);
     assert_eq!(drag(mid, -1000.), 0.);
     // No ruler, nothing to drag.
     assert_eq!(drag_gantt_x(SPAN, SCALE, VIEW_W, 0., mid, 50.), mid);
@@ -270,11 +272,12 @@ fn a_chart_wider_than_the_plan_has_nothing_to_drag() {
     let scale = GanttScale {
         origin_day: 100,
         days: 30,
+        day_w: DEFAULT_DAY_W,
     };
     for dx in [-100., 30., 100.] {
         assert_eq!(
-            drag_gantt_x(span, scale, 20. * DAY_W, RULER_W, 5. * DAY_W, dx),
-            5. * DAY_W
+            drag_gantt_x(span, scale, 20. * DEFAULT_DAY_W, RULER_W, 5. * DEFAULT_DAY_W, dx),
+            5. * DEFAULT_DAY_W
         );
     }
 }
@@ -286,13 +289,13 @@ fn a_chart_outside_the_span_moves_towards_it_and_never_snaps() {
     let lead = |dx| drag_gantt_x(SPAN, LEAD_SCALE, VIEW_W, RULER_W, 0., dx);
     assert_eq!(lead(0.), 0.);
     assert_eq!(lead(-10.), 0.);
-    assert_eq!(lead(10.), DAY_W);
+    assert_eq!(lead(10.), DEFAULT_DAY_W);
     // Scrolled into the padding past the finish: right is blocked, left moves.
     let end = SCALE.width() - VIEW_W;
     let pad = |dx| drag_gantt_x(SPAN, SCALE, VIEW_W, RULER_W, end, dx);
     assert_eq!(pad(0.), end);
     assert_eq!(pad(1.), end);
-    assert_eq!(pad(-10.), end - DAY_W);
+    assert_eq!(pad(-10.), end - DEFAULT_DAY_W);
 }
 
 // The view: a 60-working-day plan whose last task starts 40 days in, in a
@@ -321,7 +324,7 @@ fn dragging_the_box_moves_only_the_chart() {
     let v = vm(&mut t);
     let span = TimelineSpan::of(&v.ed);
     assert!(
-        v.gantt_w < span.days as f32 * DAY_W,
+        v.gantt_w < span.days as f32 * DEFAULT_DAY_W,
         "the chart shows part of the plan"
     );
     let (f0, f1) = v.timeline_box();
@@ -335,14 +338,14 @@ fn dragging_the_box_moves_only_the_chart() {
     assert_eq!(v.gantt_x.get(), 0., "held still, the chart stays");
     v.drag_timeline(press + 5. * px_per_day);
     assert!(
-        (v.gantt_x.get() - 5. * DAY_W).abs() < 1e-3,
+        (v.gantt_x.get() - 5. * DEFAULT_DAY_W).abs() < 1e-3,
         "{}",
         v.gantt_x.get()
     );
     assert!(v.timeline_box().0 > 0.);
     // Absolute from the press: a second move event to the same x adds nothing.
     v.drag_timeline(press + 5. * px_per_day);
-    assert!((v.gantt_x.get() - 5. * DAY_W).abs() < 1e-3);
+    assert!((v.gantt_x.get() - 5. * DEFAULT_DAY_W).abs() < 1e-3);
     v.drag_timeline(press + 1e6);
     let (_, f1) = v.timeline_box();
     assert!((f1 - 1.).abs() < 1e-4, "stops at the finish: {f1}");
@@ -350,7 +353,7 @@ fn dragging_the_box_moves_only_the_chart() {
     // the finish is forgotten; stepping from the last move would not be.
     v.drag_timeline(press + 5. * px_per_day);
     assert!(
-        (v.gantt_x.get() - 5. * DAY_W).abs() < 1e-3,
+        (v.gantt_x.get() - 5. * DEFAULT_DAY_W).abs() < 1e-3,
         "{}",
         v.gantt_x.get()
     );
@@ -359,7 +362,7 @@ fn dragging_the_box_moves_only_the_chart() {
     let end = v.gantt_x.get();
     v.press_timeline(100.);
     v.drag_timeline(100. - 2. * px_per_day);
-    assert!((v.gantt_x.get() - (end - 2. * DAY_W)).abs() < 1e-3);
+    assert!((v.gantt_x.get() - (end - 2. * DEFAULT_DAY_W)).abs() < 1e-3);
     v.drag_timeline(-1e6);
     assert_eq!(v.gantt_x.get(), 0.);
     assert!(!v.ed.dirty());
@@ -397,7 +400,7 @@ fn the_box_follows_every_way_the_chart_scrolls() {
     apply_project_act(&mut t, ProjectAct::GoToStart);
     let v = vm(&mut t);
     let chart = v.table_w + GANTT_INSET + 10.;
-    assert!(v.wheel(chart, -3. * DAY_W));
+    assert!(v.wheel(chart, -3. * DEFAULT_DAY_W));
     assert_ne!(v.timeline_box(), at_start, "Shift+wheel");
 }
 
