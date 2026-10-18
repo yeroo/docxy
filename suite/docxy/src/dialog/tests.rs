@@ -1229,9 +1229,9 @@ fn a_date_combo_types_like_a_date_and_drops_a_calendar_down() {
     // A click on a day picks it; the button toggles; a blank field opens on today.
     d.toggle_calendar_on(i, today).unwrap();
     d.calendar_move(-1, true).unwrap();
-    d.calendar_day(3, true).unwrap();
+    d.calendar_day(3).unwrap();
     assert_eq!(text_of_control(&d, "finish"), "2026-09-03");
-    assert!(d.calendar_day(3, true).is_err(), "no calendar open");
+    assert!(d.calendar_day(3).is_err(), "no calendar open");
     d.set("finish", &args(r#"{"value":""}"#)).unwrap();
     d.toggle_calendar_on(i, today).unwrap();
     assert_eq!(d.calendar.unwrap().text(), "2026-03-09");
@@ -1489,4 +1489,42 @@ fn a_typed_date_is_not_overwritten_by_an_open_calendar() {
     d.type_char('x').unwrap();
     assert!(!d.calendar_key("enter").unwrap());
     assert_eq!(text_of_control(&d, "finish"), "x");
+}
+
+// ---- FIX r3 (#1536) ----
+
+/// The calendar closes whenever its field's text changes by any path but its
+/// own pick (typing, paste, `dialog-set`); select-all alone does not.
+#[test]
+fn a_pasted_or_set_date_closes_the_calendar_so_enter_cannot_overwrite_it() {
+    let make = || {
+        let mut d = form();
+        let mut c = Control::new(
+            "finish",
+            "Finish:",
+            ControlKind::DateCombo,
+            Value::Text("2026-10-20".into()),
+        );
+        c.page = Some(0);
+        d.controls.push(c);
+        let i = d.controls.len() - 1;
+        d.toggle_calendar(i).unwrap();
+        (d, i)
+    };
+    let (mut d, _) = make();
+    d.select_all();
+    assert!(d.calendar.is_some(), "select-all alone leaves it open");
+    d.insert_text("2027-01-02").unwrap();
+    assert!(d.calendar.is_none(), "a paste closes it");
+    assert!(!d.calendar_key("enter").unwrap());
+    assert_eq!(text_of_control(&d, "finish"), "2027-01-02");
+    let (mut d, _) = make();
+    d.set("finish", &args(r#"{"value":"2028-03-04"}"#)).unwrap();
+    assert!(d.calendar.is_none(), "dialog-set closes it");
+    assert!(!d.calendar_key("enter").unwrap());
+    assert_eq!(text_of_control(&d, "finish"), "2028-03-04");
+    // Its own pick still writes.
+    let (mut d, _) = make();
+    d.calendar_day(25).unwrap();
+    assert_eq!(text_of_control(&d, "finish"), "2026-10-25");
 }

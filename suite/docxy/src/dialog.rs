@@ -552,8 +552,10 @@ pub(crate) struct Control {
     /// an editable grid resolves a dropdown or combo column against its items
     /// and keeps a label column read-only; a plugin's grid stores what is typed.
     pub editable_grid: bool,
-    /// A grid's items per column for its [`ControlKind::Dropdown`] and
-    /// [`ControlKind::Combo`] columns (empty for the other columns).
+    /// A grid's items per column. A [`ControlKind::Dropdown`] or
+    /// [`ControlKind::Combo`] column's are what it offers (only the column's
+    /// kind decides that); another column's may hold the owner's data lined up
+    /// with a combo's items (Predecessors' IDs, Resources' kinds).
     pub column_items: Vec<Vec<String>>,
     /// The item of a combo cell's narrowed list the arrows have reached,
     /// which Enter takes over the typed text.
@@ -1424,6 +1426,11 @@ impl Dialog {
     /// Every change to a control's value comes here: its input handler, then
     /// the owner's reaction (Page Setup's paper size follows its width).
     fn set_at(&mut self, i: usize, args: &Json) -> Result<(), String> {
+        // A change to a date combo's text by typing, a paste or `dialog-set`
+        // ends its calendar's pick (the calendar's own pick closed it first).
+        if self.calendar.is_some_and(|k| k.control == i) {
+            self.calendar = None;
+        }
         let before = self.controls[i].value.clone();
         self.controls[i].set(args)?;
         if self.controls[i].editable_grid {
@@ -2113,17 +2120,13 @@ impl Dialog {
         Ok(())
     }
 
-    /// Put the open calendar's cursor on day `day` of the shown month, and
-    /// pick it when `pick`.
-    pub fn calendar_day(&mut self, day: u32, pick: bool) -> Result<(), String> {
+    /// Pick day `day` of the open calendar's shown month.
+    pub fn calendar_day(&mut self, day: u32) -> Result<(), String> {
         let k = self.calendar.as_mut().ok_or(NO_CALENDAR)?;
         if !k.pick_day(day) {
             return Err(format!("{} has no day {day}", k.title()));
         }
-        if pick {
-            self.calendar_pick()?;
-        }
-        Ok(())
+        self.calendar_pick()
     }
 
     /// Write the open calendar's cursor day into its date combo and close it.

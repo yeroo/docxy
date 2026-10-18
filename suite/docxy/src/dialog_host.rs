@@ -850,7 +850,7 @@ impl Docxy {
             .and_then(|d| match act {
                 CalendarAct::Toggle => d.toggle_calendar(index),
                 CalendarAct::Month(n) => d.calendar_move(n, true),
-                CalendarAct::Day(day) => d.calendar_day(day, true),
+                CalendarAct::Day(day) => d.calendar_day(day),
             });
         if let Err(e) = done {
             self.set_status(e);

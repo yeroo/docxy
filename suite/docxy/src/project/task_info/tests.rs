@@ -750,7 +750,7 @@ fn start_and_finish_are_date_combos_that_pick_from_a_calendar() {
     );
     d.calendar_move(1, true).unwrap();
     // A Wednesday: a weekend pick would start on the Monday after.
-    d.calendar_day(18, true).unwrap();
+    d.calendar_day(18).unwrap();
     let picked = read(&t, "start");
     assert!(picked.ends_with("-18"), "{picked}");
     dialog_click(&mut t, "OK").unwrap();
