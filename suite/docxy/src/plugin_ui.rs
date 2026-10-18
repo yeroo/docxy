@@ -261,6 +261,8 @@ struct OverlayKey {
     revision: u64,
     origin_day: i64,
     days: i64,
+    /// The zoom: `f32::to_bits` of the scale's pixels per day.
+    day_w: u32,
     flags: (bool, bool, bool),
     /// The shown rows' tasks: a collapsed or expanded summary changes the
     /// rows (and their links) without a change of the plan.
@@ -1189,7 +1191,7 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
     let reader = projcore::editor::FieldReader::new(ed);
     // An instant's x in chart pixels, within its day.
     let x_at = |d: projcore::DateTime| {
-        (d.minutes() - scale.origin_day * 1440) as f32 / 1440.0 * crate::DAY_W
+        (d.minutes() - scale.origin_day * 1440) as f32 / 1440.0 * scale.day_w
     };
     let stamp = |d: projcore::DateTime| {
         let p = d.parts();
@@ -1215,7 +1217,7 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
                 uid: task.uid,
                 row_y,
                 bar: bar.map(|b| {
-                    let (x, y, w, h) = crate::bar_rect(&b);
+                    let (x, y, w, h) = crate::bar_rect(&b, scale.day_w);
                     (x, row_y + y, w, h)
                 }),
                 kind: bar.map_or("", |b| crate::bar_kind_name(b.kind)).to_string(),
@@ -1286,7 +1288,7 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
     OverlayCtx {
         rows,
         origin_day: scale.origin_day,
-        day_w: crate::DAY_W,
+        day_w: scale.day_w,
         row_h: crate::ROW_H,
         links,
         status_date,
@@ -1298,6 +1300,20 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
     }
 }
 
+/// What the overlay's shapes depend on: they are asked for again when it changes.
+fn overlay_key(v: &ProjectView) -> OverlayKey {
+    let scale = v.chart_scale();
+    OverlayKey {
+        revision: v.ed.revision(),
+        origin_day: scale.origin_day,
+        days: scale.days,
+        day_w: scale.day_w.to_bits(),
+        flags: flags_of(v),
+        shown: v.ed.display_rows(),
+        selected: selection_of(v).uids,
+    }
+}
+
 /// The shapes every plugin's overlay draws for the chart as it is, asked
 /// again only when the plan's revision, the scale or the view's switches
 /// changed. Empty without a UI plugin.
@@ -1306,15 +1322,7 @@ pub(crate) fn overlay_shapes(v: &ProjectView) -> Rc<Vec<Shape>> {
     if plugins.is_empty() {
         return Rc::new(Vec::new());
     }
-    let scale = v.chart_scale();
-    let key = OverlayKey {
-        revision: v.ed.revision(),
-        origin_day: scale.origin_day,
-        days: scale.days,
-        flags: flags_of(v),
-        shown: v.ed.display_rows(),
-        selected: selection_of(v).uids,
-    };
+    let key = overlay_key(v);
     let mut cache = v.plugin_cache.borrow_mut();
     if cache.overlay_key.as_ref() != Some(&key) {
         let ctx = overlay_ctx(v);

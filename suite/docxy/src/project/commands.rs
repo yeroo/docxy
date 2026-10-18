@@ -37,6 +37,19 @@ pub(crate) enum ProjectAct {
     Find,
     ScrollToTask,
     Timeline,
+    /// View › Zoom › Timescale (#1535): choose the timescale level `zoom::COMBO[i]`;
+    /// Hours and Minutes are listed and cannot be chosen.
+    Timescale(usize),
+    /// View › Zoom › Zoom ▸ Zoom In / Zoom Out: one level, the left-edge date kept.
+    ZoomIn,
+    ZoomOut,
+    /// View › Zoom › Zoom ▸ Zoom... and the chart menu's: the Zoom dialog.
+    ZoomDialog,
+    /// The chart menu's Timescale...: the Timescale dialog.
+    TimescaleDialog,
+    /// View › Zoom › Entire Project, Selected Tasks.
+    ZoomEntire,
+    ZoomSelected,
     /// Gantt Chart Format › Bar Styles › Critical Tasks.
     CriticalTasks,
     /// Gantt Chart Format › Bar Styles › Baseline.
@@ -135,6 +148,21 @@ impl ProjectAct {
         Self::Find,
         Self::ScrollToTask,
         Self::Timeline,
+        Self::Timescale(0),
+        Self::Timescale(1),
+        Self::Timescale(2),
+        Self::Timescale(3),
+        Self::Timescale(4),
+        Self::Timescale(5),
+        Self::Timescale(6),
+        Self::Timescale(7),
+        Self::Timescale(8),
+        Self::ZoomIn,
+        Self::ZoomOut,
+        Self::ZoomDialog,
+        Self::TimescaleDialog,
+        Self::ZoomEntire,
+        Self::ZoomSelected,
         Self::CriticalTasks,
         Self::BaselineBars,
         Self::Paste,
@@ -274,6 +302,20 @@ fn report_dropdown(menu: ReportMenu) -> Control<Act> {
             .collect(),
     }
 }
+
+/// The Timescale combo's items in `zoom::COMBO` order: command id, KeyTip in
+/// its list, and shortcut text.
+const TIMESCALE_IDS: [(&str, &str, &str); 9] = [
+    ("pr-timescale-years", "Y", "Alt, W, Q, Y"),
+    ("pr-timescale-half-years", "H", "Alt, W, Q, H"),
+    ("pr-timescale-quarters", "Q", "Alt, W, Q, Q"),
+    ("pr-timescale-months", "M", "Alt, W, Q, M"),
+    ("pr-timescale-thirds", "T", "Alt, W, Q, T"),
+    ("pr-timescale-weeks", "W", "Alt, W, Q, W"),
+    ("pr-timescale-days", "D", "Alt, W, Q, D"),
+    ("pr-timescale-hours", "O", "Alt, W, Q, O"),
+    ("pr-timescale-minutes", "N", "Alt, W, Q, N"),
+];
 
 /// The Project document ribbon. Tabs, groups, command labels and screentips
 /// follow Microsoft Project 2024, so written instructions can be followed as
@@ -606,6 +648,93 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                     ])],
                 ),
                 rs::group(
+                    "Zoom",
+                    75,
+                    vec![
+                        // The Timescale combo: its button opens the Timescale
+                        // dialog, its list picks a level (Hours and Minutes are
+                        // listed and disabled).
+                        Control::Dropdown {
+                            cmd: cmdt(
+                                "pr-timescale",
+                                "rule",
+                                "Timescale",
+                                Act::Project(TimescaleDialog),
+                                "Alt, W, Q",
+                            )
+                            .key("Q"),
+                            items: zoom::COMBO
+                                .iter()
+                                .enumerate()
+                                .map(|(i, (name, _))| {
+                                    cmdt(
+                                        TIMESCALE_IDS[i].0,
+                                        "rule",
+                                        name,
+                                        Act::Project(Timescale(i)),
+                                        TIMESCALE_IDS[i].2,
+                                    )
+                                    .key(TIMESCALE_IDS[i].1)
+                                })
+                                .collect(),
+                        },
+                        Control::Split {
+                            primary: cmdt(
+                                "pr-zoom",
+                                "find",
+                                "Zoom",
+                                Act::Project(ZoomDialog),
+                                "Alt, W, J  (Ctrl+wheel)",
+                            )
+                            .key("J"),
+                            menu: vec![
+                                cmdt(
+                                    "pr-zoom-in",
+                                    "find",
+                                    "Zoom In",
+                                    Act::Project(ZoomIn),
+                                    "Alt, W, J, I  (Ctrl+wheel up)",
+                                )
+                                .key("I"),
+                                cmdt(
+                                    "pr-zoom-out",
+                                    "find",
+                                    "Zoom Out",
+                                    Act::Project(ZoomOut),
+                                    "Alt, W, J, O  (Ctrl+wheel down)",
+                                )
+                                .key("O"),
+                                cmdt(
+                                    "pr-zoom-dialog",
+                                    "find",
+                                    "Zoom...",
+                                    Act::Project(ZoomDialog),
+                                    "Alt, W, J, Z",
+                                )
+                                .key("Z"),
+                            ],
+                        },
+                        rs::column(vec![
+                            cmd(
+                                "pr-zoom-entire",
+                                "align-left",
+                                "Entire Project",
+                                ZoomEntire,
+                                "Alt, W, G",
+                                "G",
+                            ),
+                            cmd(
+                                "pr-zoom-selected",
+                                "align-left",
+                                "Selected Tasks",
+                                ZoomSelected,
+                                "Alt, W, K",
+                                "K",
+                            ),
+                        ]),
+                    ],
+                ),
+                rs::group(
                     "Split View",
                     70,
                     vec![rs::column(vec![cmds(
@@ -749,6 +878,10 @@ fn task_act_active(v: &ProjectView, act: ProjectAct, uid: Option<i32>) -> bool {
     match act {
         ProjectAct::LevelAll => v.ed.leveled(),
         ProjectAct::Timeline => v.timeline,
+        // The timescale in force: a free width (a view box drag) checks none.
+        ProjectAct::Timescale(i) => {
+            zoom::is_preset(v.day_w()) && i < zoom::LEVELS.len() && zoom::nearest(v.day_w()) == i
+        }
         ProjectAct::CriticalTasks => v.show_critical,
         ProjectAct::BaselineBars => v.show_baseline,
         ProjectAct::Inactivate => task_inactive(v, uid),
@@ -909,16 +1042,29 @@ pub(crate) fn project_bar_menu(v: &ProjectView) -> Vec<crate::menu::MenuItem> {
 }
 
 /// The Gantt chart's own context menu (#1532), opened by a right-press on
-/// the chart beside the bars, in Project's order (its chart formatting
-/// dialogs are not built, so the items are drawn disabled), then what a UI
-/// plugin adds to the `chart` menu.
+/// the chart beside the bars, in Project's order: Timescale... and Zoom...
+/// open their dialogs (#1535); the rest of its chart formatting is not built, so
+/// those items are drawn disabled; then what a UI plugin adds to the `chart` menu.
 pub(crate) fn project_chart_menu(v: &ProjectView) -> Vec<crate::menu::MenuItem> {
     use crate::menu::{
         Entry,
         MenuItem::{Item, Separator},
     };
     let none = |id, label| Item(Entry::unavailable(id, label));
+    let item = |id, label, icon, act: ProjectAct| {
+        Item(Entry::new(id, label, icon, Act::Project(act), true))
+    };
     let mut items = vec![
+        item(
+            "ch-timescale",
+            "Timescale...",
+            "rule",
+            ProjectAct::TimescaleDialog,
+        ),
+        item("ch-zoom", "Zoom...", "find", ProjectAct::ZoomDialog),
+        none("ch-working-time", "Change Working Time..."),
+        none("ch-show-bar-styles", "Show/Hide Bar Styles"),
+        Separator,
         none("ch-gridlines", "Gridlines..."),
         none("ch-bar-styles", "Bar Styles..."),
         none("ch-layout", "Layout..."),
@@ -1973,6 +2119,18 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             }
             ScrollToTask => v.scroll_to_task(),
             Timeline => v.timeline = !v.timeline,
+            Timescale(i) => {
+                if !zoom::available(i) {
+                    return Err("Hours and Minutes timescales are not available".into());
+                }
+                status = Some(v.zoom_to_level(i));
+            }
+            ZoomIn => status = Some(v.zoom_step(1, 0.)),
+            ZoomOut => status = Some(v.zoom_step(-1, 0.)),
+            ZoomEntire => status = Some(v.zoom_entire()),
+            ZoomSelected => status = Some(v.zoom_selected()?),
+            ZoomDialog => dialog = Some(zoom_dialogs::zoom_dialog(v)),
+            TimescaleDialog => dialog = Some(zoom_dialogs::timescale_dialog(v)),
             CriticalTasks => v.show_critical = !v.show_critical,
             BaselineBars => v.show_baseline = !v.show_baseline,
             // A UI plugin's command (#1532): its ops as one undo step, its

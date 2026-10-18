@@ -58,6 +58,8 @@ const TWELVE_COLUMNS: &[&str] = &[
     r#"call pointer-click {"dialog-control":"equal"}"#,
 ];
 const CHAPTER_ON: &[&str] = &[r#"call pointer-click {"dialog-control":"chapter"}"#];
+// The Zoom dialog opens on Days; Custom is three radios down.
+const PICK_ZOOM_CUSTOM: &[&str] = pick!("zoom", 3);
 const START_AT: &[&str] = pick!("numbering", 1);
 const SEPARATE_WITH_OTHER: &[&str] = pick!("sep", 2);
 const TWO_COLORS: &[&str] = pick!("colors", 1);
@@ -1647,6 +1649,37 @@ dialogs! {
             checkbox("effort").on("Advanced"),
             Field::text("notes").on("Notes").kept("Ab1"),
         ],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
+    ZOOM = "zoom" {
+        surface: Surface::Project,
+        file: "project",
+        fixture: PROJECT_DOC,
+        open: &[
+            "click C1",
+            r#"call menu-open {"target":"chart"}"#,
+            r#"call menu-click {"label":"Zoom..."}"#,
+        ],
+        fields: &[
+            radio("zoom"),
+            Field::number("custom", "30").prep(PICK_ZOOM_CUSTOM).kept("30"),
+        ],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
+    TIMESCALE = "timescale" {
+        surface: Surface::Project,
+        file: "project",
+        fixture: PROJECT_DOC,
+        open: &[
+            "click C1",
+            r#"call menu-open {"target":"chart"}"#,
+            r#"call menu-click {"label":"Timescale..."}"#,
+        ],
+        fields: &[dropdown("level")],
         reopen: &[],
         accept_closes: true,
         unreachable: None,

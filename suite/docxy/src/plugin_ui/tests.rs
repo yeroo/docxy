@@ -401,3 +401,19 @@ fn the_palette_is_the_manifests_by_id() {
     assert!(palette_with("fx.green", &[&m]).is_none());
     assert!(palette_with("fx.blue", &[]).is_none());
 }
+
+#[test]
+fn the_overlay_is_asked_again_when_the_zoom_changes() {
+    let mut tab = tab();
+    let Surface::Project(v) = &mut tab.surface else {
+        unreachable!()
+    };
+    v.layout(1180.);
+    let before = overlay_key(v);
+    assert_eq!(before, overlay_key(v));
+    v.zoom_step(-1, 0.);
+    let zoomed = overlay_key(v);
+    assert_ne!(before, zoomed, "a zoom moves every shape");
+    v.zoom_step(1, 0.);
+    assert_eq!(before, overlay_key(v));
+}

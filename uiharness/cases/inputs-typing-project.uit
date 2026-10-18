@@ -2023,6 +2023,260 @@ test project task-information/notes: Escape cancels
   assert reply.value is not Esc9
   call real-key {"key":"escape"}
 
+test project zoom: matches the catalogue
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test project zoom/custom: focus by click
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call pointer-click {"dialog-field":"custom"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test project zoom/custom: focus by Tab
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"tab","to-field":"custom"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test project zoom/custom: types
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call pointer-click {"dialog-field":"custom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"30"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.value is 30
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test project zoom/custom: edits
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call pointer-click {"dialog-field":"custom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test project zoom/custom: select-all replaces
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call pointer-click {"dialog-field":"custom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test project zoom/custom: pastes
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"custom"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test project zoom/custom: copies
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"custom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test project zoom/custom: OK applies
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call pointer-click {"dialog-field":"custom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"30"}
+  call real-key {"key":"enter"}
+  assert dialog is not zoom
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call field-read {"dialog-field":"custom"}
+  assert reply.value is 30
+  call real-key {"key":"escape"}
+
+test project zoom/custom: Escape cancels
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call pointer-click {"dialog-field":"custom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not zoom
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call field-read {"dialog-field":"custom"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test project zoom/custom: refuses invalid
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call pointer-click {"dialog-field":"custom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"30"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.value is 30
+  call real-key {"key":"escape"}
+
+test project timescale: matches the catalogue
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Timescale..."}
+  assert dialog is timescale
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test project timescale/level: focus by click
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Timescale..."}
+  assert dialog is timescale
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"level"}
+  call field-read {"dialog-field":"level"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test project timescale/level: Up and Down step
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Timescale..."}
+  assert dialog is timescale
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"level"}
+  call field-read {"dialog-field":"level"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"level"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"level"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"level"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
 test project project-filter-menu: matches the catalogue
   open copy:../fixtures/project-clipboard.xml
   click C1

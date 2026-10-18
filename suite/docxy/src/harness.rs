@@ -887,6 +887,11 @@ pub enum Region {
     ProjectVbar,
     /// The Project Timeline pane above the Gantt view, when it is shown.
     ProjectTimeline,
+    /// The Timeline view box's left and right edge strips (#1535).
+    ProjectTimelineBoxLeft,
+    ProjectTimelineBoxRight,
+    /// The strip under the Timeline that drags its height (#1535).
+    ProjectTimelineGrip,
     /// The Project split bar between the entry table and the Gantt chart.
     ProjectSplit,
     /// The Home ribbon's Styles gallery: the well its tiles sit in.
@@ -979,6 +984,9 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
         "project-hbar-chart" if arg.is_none() => Ok(Region::ProjectHbarChart),
         "project-vbar" if arg.is_none() => Ok(Region::ProjectVbar),
         "project-timeline" if arg.is_none() => Ok(Region::ProjectTimeline),
+        "project-timeline-box-left" if arg.is_none() => Ok(Region::ProjectTimelineBoxLeft),
+        "project-timeline-box-right" if arg.is_none() => Ok(Region::ProjectTimelineBoxRight),
+        "project-timeline-grip" if arg.is_none() => Ok(Region::ProjectTimelineGrip),
         "project-split" if arg.is_none() => Ok(Region::ProjectSplit),
         "gallery" if arg.is_none() => Ok(Region::Gallery),
         "ribbon" if arg.is_none() => Ok(Region::Ribbon),
@@ -1134,6 +1142,9 @@ pub fn region_name(region: Region) -> String {
         Region::ProjectHbarChart => "project-hbar-chart".into(),
         Region::ProjectVbar => "project-vbar".into(),
         Region::ProjectTimeline => "project-timeline".into(),
+        Region::ProjectTimelineBoxLeft => "project-timeline-box-left".into(),
+        Region::ProjectTimelineBoxRight => "project-timeline-box-right".into(),
+        Region::ProjectTimelineGrip => "project-timeline-grip".into(),
         Region::ProjectSplit => "project-split".into(),
         Region::Gallery => "gallery".into(),
         Region::Ribbon => "ribbon".into(),
@@ -1328,13 +1339,16 @@ fn double_click_events(p: Point<Pixels>) -> Vec<PlatformInput> {
 /// The wheel notch a `pointer-wheel` dispatches at `p`: the pointer moves
 /// there first, as it would before a real wheel turn. A negative `dy` scrolls
 /// the content down (gpui's own sign).
-fn wheel_events(p: Point<Pixels>, dy: f32) -> Vec<PlatformInput> {
+fn wheel_events(p: Point<Pixels>, dy: f32, ctrl: bool) -> Vec<PlatformInput> {
     vec![
         mouse_move(p, None),
         PlatformInput::ScrollWheel(ScrollWheelEvent {
             position: p,
             delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
-            modifiers: Modifiers::default(),
+            modifiers: Modifiers {
+                control: ctrl,
+                ..Modifiers::default()
+            },
             touch_phase: TouchPhase::Moved,
         }),
     ]
@@ -5621,7 +5635,11 @@ fn dispatch_verb(
                 ("y", Json::Num(f64::from(p.y))),
                 ("dy", Json::Num(f64::from(dy))),
             ]))?;
-            done.input = wheel_events(p, dy);
+            done.input = wheel_events(
+                p,
+                dy,
+                args.get("ctrl").and_then(Json::as_bool).unwrap_or(false),
+            );
             Ok(done)
         }
         // Switch the File screen's page (#1028): `new`, `info` and `export`
@@ -9468,6 +9486,9 @@ mod tests {
             Region::ProjectHbarChart,
             Region::ProjectVbar,
             Region::ProjectTimeline,
+            Region::ProjectTimelineBoxLeft,
+            Region::ProjectTimelineBoxRight,
+            Region::ProjectTimelineGrip,
             Region::ProjectSplit,
             Region::Gallery,
             Region::Ribbon,

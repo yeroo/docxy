@@ -1,0 +1,76 @@
+# #1535: the Gantt's timescale. View > Zoom (the Timescale list, Zoom In/Out,
+# Entire Project, Selected Tasks), Ctrl+wheel over the chart and the chart menu's
+# dialogs set the pixels per day (`gantt_day_w`) and the level it is nearest
+# (`gantt_zoom`; `Custom (<level>)` for a width no level has). The chart's own
+# width is not the zoom's: the unit tests pin `gantt_w` across a zoom. The
+# window cannot be driven on macOS, so these were not run there.
+# project-timeline-view.xml: 82 days from Mon 1/5/26; the chart shows 15 of them.
+
+test project Zoom Out and Zoom In step a level and keep the left-edge date
+  open ../fixtures/project-timeline-view.xml
+  shot window
+  assert gantt_day_w is 22
+  assert gantt_zoom is Days
+  call ribbon-click {"tab":"View","command":"pr-zoom-out"}
+  assert gantt_day_w is 12
+  assert gantt_zoom is Weeks
+  assert timeline_view_start is Mon 1/5/26
+  shot window
+  call ribbon-click {"tab":"View","command":"pr-zoom-in"}
+  assert gantt_day_w is 22
+  assert timeline_view_start is Mon 1/5/26
+  assert dirty is false
+
+test project the Timescale list picks a level
+  open ../fixtures/project-timeline-view.xml
+  shot window
+  call ribbon-click {"tab":"View","command":"pr-timescale-months"}
+  assert gantt_day_w is 3
+  assert gantt_zoom is Months
+  shot window
+  call ribbon-click {"tab":"View","command":"pr-timescale-days"}
+  assert gantt_day_w is 22
+
+test project Entire Project fits the plan and Selected Tasks fits the selection
+  open ../fixtures/project-timeline-view.xml
+  shot window
+  call ribbon-click {"tab":"View","command":"pr-zoom-entire"}
+  assert gantt_zoom is Custom (Months)
+  assert timeline_view_start is Mon 1/5/26
+  assert timeline_view_finish is Fri 3/27/26
+  shot window
+  key ctrl+down
+  call ribbon-click {"tab":"View","command":"pr-zoom-selected"}
+  assert gantt_day_w is not 22
+  assert dirty is false
+
+test project Ctrl+wheel over the chart zooms a level and the wheel alone does not
+  open ../fixtures/project-timeline-view.xml
+  shot window
+  call pointer-wheel {"region":"gantt","dy":-120}
+  assert gantt_day_w is 22
+  # Below the step threshold (40 px) the chart takes the wheel without a step.
+  call pointer-wheel {"region":"gantt","dy":-10,"ctrl":true}
+  assert gantt_day_w is 22
+  call pointer-wheel {"region":"gantt","dy":-120,"ctrl":true}
+  assert gantt_day_w is 12
+  call pointer-wheel {"region":"gantt","dy":-120,"ctrl":true}
+  assert gantt_day_w is 6
+  call pointer-wheel {"region":"gantt","dy":120,"ctrl":true}
+  assert gantt_day_w is 12
+  assert dirty is false
+
+test project the chart menu's Zoom and Timescale dialogs open and cancel
+  open ../fixtures/project-timeline-view.xml
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  key escape
+  assert dialog is none
+  assert gantt_day_w is 22
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Timescale..."}
+  assert dialog is timescale
+  key escape
+  assert dialog is none
+  assert gantt_day_w is 22

@@ -330,8 +330,8 @@ reported like the built-ins, marked `"plugin": true`: `ribbon-read`'s
 commands and gallery tiles (a contributed control with a built-in's id
 replaces it in place, so the built-in's slot then reads `plugin: true`),
 `menu-read`'s items (the row, bar, column and chart menus; `menu-open
-{"target":"chart"}` opens the chart's own menu beside the bars, whose
-Project items are drawn greyed), and `dialog-read`'s controls (a dialog a
+{"target":"chart"}` opens the chart's own menu beside the bars: Timescale... and
+Zoom... are live and open their dialogs, the rest of Project's items are drawn greyed), and `dialog-read`'s controls (a dialog a
 plugin command opened is `plugin`; Task Information gains the plugin's
 pages). A contributed command runs through `ribbon-click` and `menu-click`
 like a built-in, as one undo step with its status on the status line.
@@ -430,6 +430,8 @@ State keys, as the app reports them after every driving verb:
 | `table_w`, `gantt_w` | Project: entry-table pane and Gantt chart widths in px. Split-bar drags move them; `table_w + 6 + gantt_w + 16` is the window width |
 | `timeline`, `timeline_start`, `timeline_finish` | Project: `shown`/`hidden`, and the Timeline's Start/Finish labels (`Mon 3/2/26`; the displayed span, leveled while leveling is on) |
 | `timeline_view_start`, `timeline_view_finish` | Project: the first and last day the Gantt chart shows, which the Timeline's view box highlights, clamped to the Timeline's span (`Mon 3/2/26`) |
+| `gantt_day_w`, `gantt_zoom` | Project (#1535): the chart's zoom in px per day (22 at the default Days level) and the level it is at (`Days`, `Weeks`, ...; `Custom (Weeks)` for a width no level has, such as a view-box drag or Entire Project). `gantt_w` does not change with it |
+| `timeline_h` | Project (#1535): the Timeline pane's height in px: 84 by default, 60 to half the window once the grip under it is dragged. Window view state, never saved |
 | `nonworking` | Project: Timeline's inclusive, merged shaded day runs as `[[first, last], ...]` in Project date form (`Wed 3/4/26`). Empty when each day is narrower than 2 px or the project calendar has no weekly working time. Reported even while the Timeline is hidden |
 | `filler_rows` | Project: ruled empty rows visible below the last task, from the last drawn frame's `project-body` height (0 before the first layout). Unlike the other keys it trails a driving verb by a frame, so settle with a `shot` before asserting it |
 | `ribbon_tab` | current kind-aware ribbon tab name (`Task`, `Resource`, `View`, `Home`, etc.; the contextual table tabs are `Table Design` and `Table Layout`, though the strip draws the second as plain "Layout", as Word does) |
@@ -592,7 +594,7 @@ footer editor; `selection-set` refuses while it is open.
 | `fill-handle-into {"probe":"tab-more-item:*","except":["tab-more-item:23"],"inset":4,"within":"A1:T30"}` | select a cell of `within` whose fill-handle point (its bottom-right corner, where `pointer-click {"at":"fill-handle"}` presses) lies inside a probe's drawn bounds inset by `inset` logical pixels on every edge, edges included (#1149). `probe` names one probe, or ends in `*` for every drawn probe it starts, less those in `except`; of several fits, the one nearest its probe's centre. A wildcard lets a case aim at whichever more-tabs item a row line crosses: items and rows differ in height, so one item's inset band can miss every row line. Only cells fully on screen count, and `within` caps the search at 4000 cells, so a case can `snapshot` them all. The selection is set as a click's would be, without a click: an open list stays open and the grid does not scroll. It draws first, like the pointer verbs. Replies `{cell, x, y, probe, item}`, `item` being the more-tabs item under the point as `pointer-click` reports it. With no fit it is refused, giving the probe's bounds raw and inset (a wildcard's: the item nearest a handle) and the nearest cell's handle point and distance |
 | `pointer-drag {"from":"tab-chip:0","to":"tab-chip:2","offset":[6,0]}` | dispatch a real press, 9 pressed moves and a release from the `from` region's centre to the `to` region's centre — plus the optional logical-pixel `offset` on the target. The ninth pressed move lands at the destination, so the drag's handlers see the final cell before the release. gpui arms a drag once a pressed move lands more than 2px from the press, so a from→to distance (including `offset`) of 2px or less acts as a click; longer drags (chip reorder) happen exactly as by pointer. Replies `{from:[x,y], to:[x,y]}` |
 | `pointer-move {"to":"cell:C2"}` | dispatch a real hover (a move with no button held) at the region's centre through gpui's hit testing, as between gestures. Replies `{to:[x,y]}` |
-| `pointer-wheel {"region":"backstage-content","dy":-600}` | dispatch a real mouse move and wheel notch at the region's centre through gpui's hit testing (#1028); a negative `dy` (logical pixels) scrolls the content down. Replies `{x, y, dy}`. Refuses under a dialog; does not pre-close menus |
+| `pointer-wheel {"region":"backstage-content","dy":-600}` | dispatch a real mouse move and wheel notch at the region's centre through gpui's hit testing (#1028); a negative `dy` (logical pixels) scrolls the content down. Replies `{x, y, dy}`. `"ctrl":true` holds Ctrl for the notch (Ctrl+wheel zooms the Project chart, #1535; a positive `dy` is wheel up). Refuses under a dialog; does not pre-close menus |
 | `backstage-layout {}` | read the File screen's scroll state (refused while it is closed): `page` (`open`, `new`, `info`, `account`, `export`), the content pane's `viewport_h`, `content_h`, `scroll_y`, `scrollable`, `at_top`, `scrolled`, `last_item_visible` (true when the page fits or has been scrolled to its end), and the rail's `rail_viewport_h`, `rail_content_h`, `rail_scrollable`, `rail_last_item_visible`. Settle with `shot window` first; regions `backstage-content` and `backstage-rail` name the two columns |
 | `backstage-page {"page":"new"}` | switch the File screen's page: `new`, `info` and `export` (a document tab only; Export is Change File Type, #635) and `account` call the rail's handler; `open` (the default page) is a setup shortcut with no rail counterpart (the user closes and reopens File; the rail's Open… opens a file picker). Every page starts scrolled to the top. Replies like `backstage-layout`, whose sizes come from the last drawn frame: `shot window` before reading them |
 | `recent-files {}` | read the recent files (#1194), newest first, from `<DOCXY_CONFIG_DIR>/docxy/recent.json` as it is now: `{files:[{index, path, name, kind, exists}], message}`, where `message` is what the Recent list shows under its heading (a missing file's row was clicked) or null; reopening the File screen clears it. A path is stored absolute and canonical, compared as text (ignoring case on Windows). `kind` is the tab the file opens as (`docx`, `xlsx`, `project`). A file is recorded when an open leaves a tab bound to it (not a failed load, a template, a restored session or a kept draft) and when a save moves a tab to a new file (Save As, a first save), including `proj.open` and `proj.save {path}`. At most 25 files; one file appears once however it was spelled. Every case in a run shares the store, so assert by position and `name`, not by count |
@@ -1609,7 +1611,8 @@ have. `word-header-footer.uit` drives these over a three-section document.
 `project-heading:Duration`), `project-heading-arrow:<heading>` and
 `project-heading-edge:<heading>` (a heading's AutoFilter arrow and resize zone,
 clipped as the heading is; #1533), `project-hbar-table`, `project-hbar-chart`,
-`project-vbar`, `project-timeline`, `project-split`, `gallery`, `ribbon`,
+`project-vbar`, `project-timeline`, `project-timeline-box-left`,
+`project-timeline-box-right`, `project-timeline-grip`, `project-split`, `gallery`, `ribbon`,
 `ribbon-flyout`, `ribbon-group:<index>`, `ribbon-launch:<group title>`, `title-tabs`,
 `tab-prev`, `tab-next`, `tab-more`, `tab-more-item:<index>` (the last exists while
 the more-tabs list is open), `tab-chip:<index>` — a visible title-bar chip by
@@ -1621,7 +1624,7 @@ in any case (`project-heading:resource names` too), clipped to the table pane's
 columns and an error once it is scrolled wholly out of them (#1208). The `project-hbar-*` and `project-vbar` regions are the Project tab's three
 scrollbar strips: under the table, under the chart, and down the right edge of the rows.
 `project-timeline` is the Timeline pane above the Gantt view, and is an error while
-View > Split View > Timeline has it hidden. `project-split` is the draggable bar
+View > Split View > Timeline has it hidden; `project-timeline-box-left` and `-right` are the 6 px strips on the view box's edges (a drag zooms the chart so the box's span fills it) and `project-timeline-grip` the strip under the pane (a drag sets its height, a double-click restores it; #1535). `project-split` is the draggable bar
 between the entry table and the chart; its drags show in the `table_w` and `gantt_w`
 state entries. `gallery` is the Home ribbon's Styles gallery well on a
 document tab, and is an error while another ribbon tab, the Backstage or a
