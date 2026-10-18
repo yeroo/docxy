@@ -1172,3 +1172,25 @@ fn respelling_a_kept_links_lag_unit_or_estimate_is_applied() {
     dialog_click(&mut t, "OK").unwrap();
     assert_eq!(state(&t), before);
 }
+
+#[test]
+fn picking_the_other_task_of_the_same_name_when_the_row_shows_that_name() {
+    let mut t = tab3();
+    {
+        let mut p = v(&t).ed.project().clone();
+        p.tasks[2].name = "First".into();
+        vm(&mut t).ed = ProjectEditor::new(p);
+        vm(&mut t).ed.select(1);
+    }
+    open(&mut t, ProjectAct::Constraint);
+    cell(&mut t, "predecessors[0].id", "1");
+    assert_eq!(grid(&t, "predecessors")[0][..2], ["1", "First"]);
+    t.dialogs.select_row("predecessors", 0).unwrap();
+    let d = t.dialogs.top_dialog_mut().unwrap();
+    let i = d.focus.unwrap();
+    d.controls[i].col = 1;
+    d.grid_key("f", Some("f")).unwrap();
+    d.click_control(i, Some(crate::dialog::SUGGESTION_BASE + 1))
+        .unwrap();
+    assert_eq!(grid(&t, "predecessors")[0][..2], ["3", "First"]);
+}

@@ -394,8 +394,10 @@ pub(crate) enum ControlKind {
     /// [`ControlKind::Date`], and a pick writes `YYYY-MM-DD`.
     DateCombo,
     /// A grid column of a typed cell with a list of items to pick from
-    /// (#1536, `Control::column_items`): typing narrows the list, and a text
-    /// that names one item (exactly, or as the only match) becomes it.
+    /// (#1536, `Control::column_items`): typing narrows the list; a text that
+    /// names an item exactly becomes it, any other text stays as typed, and
+    /// only a pick completes it. ([`ControlKind::Dropdown`] columns also take
+    /// the only item that contains the text.)
     Combo,
     Duration,
     Checkbox,
@@ -413,7 +415,9 @@ pub(crate) enum ControlKind {
     /// (`Control::edit`, committed by Enter, dropped by Escape) and Space
     /// toggles a check cell. A built-in dialog's grid is read-only, edited by
     /// `dialog-set` alone, unless it is an [`Control::editable_grid`] (#1536),
-    /// which is interactive the same way.
+    /// which is interactive the same way, except that a cell being typed into
+    /// is committed, not dropped, when the cursor leaves it
+    /// ([`Dialog::commit_pending`]).
     Grid,
     Label,
     /// A text field of several lines: Enter is a new line, not OK (#1532).
@@ -1452,8 +1456,10 @@ impl Dialog {
         Ok(())
     }
 
-    /// Select row `row` of grid `name` (#1602), the focus moving to it; an
-    /// edit of a cell in progress is dropped.
+    /// Select row `row` of grid `name` (#1602), the focus moving to it. A cell
+    /// being typed into in an editable grid is committed first
+    /// ([`Dialog::commit_pending`]; a refusal keeps the edit and the
+    /// selection); a plugin grid's is dropped.
     pub fn select_row(&mut self, name: &str, row: usize) -> Result<(), String> {
         let i = self.control_index(name)?;
         let c = &self.controls[i];
@@ -1463,11 +1469,12 @@ impl Dialog {
         if !self.focusable().contains(&i) {
             return Err(format!("'{}' cannot be edited", shown(&c.label)));
         }
+        self.commit_pending()?;
+        let c = &self.controls[i];
         let rows = c.row_count();
         if row >= rows {
             return Err(no_row(&shown(&c.label), row, rows));
         }
-        self.commit_pending()?;
         self.focus = Some(i);
         self.close_calendar_unless(i);
         let c = &mut self.controls[i];
@@ -1629,6 +1636,9 @@ impl Dialog {
                 if editable && editing.is_some() {
                     self.commit_pending()?;
                 }
+                // The commit may have grown or shrunk the rows (the blank
+                // last row), so they are counted again.
+                let rows = self.controls[i].row_count();
                 if rows > 0 {
                     let next = match (row, key) {
                         (None, _) => 0,
@@ -2125,8 +2135,8 @@ impl Dialog {
 
     /// A key while a calendar is open and its field has the focus: the
     /// arrows move its cursor a day or a week, Page Up and Down a month,
-    /// Enter picks, Escape or F4 closes; Tab closes it and goes on. Any other
-    /// key is the field's: `Ok(false)`.
+    /// Enter picks, Escape or F4 closes. Any other key (Tab, typing) closes it
+    /// and is the field's: `Ok(false)`.
     pub fn calendar_key(&mut self, key: &str) -> Result<bool, String> {
         match self.calendar {
             Some(k) if self.focus == Some(k.control) => {}
@@ -2141,11 +2151,12 @@ impl Dialog {
             "pagedown" => self.calendar_move(1, true)?,
             "enter" => self.calendar_pick()?,
             "escape" | "f4" => self.calendar = None,
-            "tab" => {
+            // Any other key is the field's, and typing there ends the
+            // calendar's pick: Enter then presses OK, not the cursor day.
+            _ => {
                 self.calendar = None;
                 return Ok(false);
             }
-            _ => return Ok(false),
         }
         Ok(true)
     }

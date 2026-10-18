@@ -89,17 +89,25 @@ pub(super) fn follow(d: &mut Dialog, i: usize, before: &Value) {
     let (Value::Rows(old), Value::Rows(new)) = (before, d.controls[i].value.clone()) else {
         return;
     };
-    let Some((r, c)) = (0..new.len()).find_map(|r| {
-        let (was, now) = (old.get(r)?, &new[r]);
-        (0..COLUMNS.len())
-            .find(|&c| was.get(c) != now.get(c))
-            .map(|c| (r, c))
-    }) else {
+    // A pick acts on the selected row's Task Name even when it shows that
+    // name already (of two tasks with one name, the other was picked).
+    let picked = d.controls[i].picked;
+    let Some((r, c)) = picked
+        .and(d.controls[i].row.filter(|&r| r < new.len()))
+        .map(|r| (r, NAME))
+        .or_else(|| {
+            (0..new.len()).find_map(|r| {
+                let (was, now) = (old.get(r)?, &new[r]);
+                (0..COLUMNS.len())
+                    .find(|&c| was.get(c) != now.get(c))
+                    .map(|c| (r, c))
+            })
+        })
+    else {
         return;
     };
     let ids = d.controls[i].column_items[ID].clone();
     let names = d.controls[i].column_items[NAME].clone();
-    let picked = d.controls[i].picked;
     let Value::Rows(rows) = &mut d.controls[i].value else {
         return;
     };
@@ -133,7 +141,9 @@ pub(super) fn follow(d: &mut Dialog, i: usize, before: &Value) {
 /// The links the grid's rows say, for task `uid`. A blank row is skipped; a
 /// row names its task by ID (the cell's grammar: a local ID, a cross-project
 /// reference) or, without one, by Task Name. A link whose task, type and lag
-/// are what is stored keeps the stored link, lag format and all.
+/// are what is stored keeps the stored link, lag format and all, when its lag
+/// is spelled as the grid showed it or parses to the stored format; a lag
+/// re-spelled in another unit or with `?` is an edit.
 pub(super) fn parse(
     ed: &ProjectEditor,
     uid: i32,

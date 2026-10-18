@@ -629,10 +629,10 @@
   selected row (a plugin grid's clears the cell). Column kinds: `Combo`
   (`Control::column_items`: typing narrows the list drawn under the grid, the
   arrows reach into it (`pick`), Enter takes the pick, a click on an item
-  commits it, a text naming one item exactly or as its only match becomes it,
-  any other text stays as typed: a new resource named Ann beside a Joanne is
-  new; only a pick completes), `Dropdown` (Space or a click steps the
-  cell; typed text must name one item), and `Label` (read-only: `dialog-set`
+  commits it, a text naming one item exactly (case aside) becomes it, any
+  other text stays as typed: a new resource named Ann beside a Joanne is new;
+  only a pick completes it), `Dropdown` (Space or a click steps the
+  cell; typed text must name one item, or be contained in only one), and `Label` (read-only: `dialog-set`
   refuses it and typing starts nothing). All three apply to an editable grid
   only; a plugin grid's columns store what is typed. A cell being typed into
   is committed by Up/Down, a click elsewhere, Tab, a tab change and OK
@@ -657,7 +657,8 @@
   with the cell's own grammar (`parse_task_predecessors` for the ID, so a
   cross-project reference and `?uid` work; `parse_lag` for the lag) and keeps
   a link whose task, type and lag are as stored exactly as stored (lag format,
-  cross-project fields). `set_predecessors` refuses a cycle, a duplicate or a
+  cross-project fields) when its lag is spelled as shown or parses to the
+  stored format (`16h` for `2d`, or `2d?`, is an edit). `set_predecessors` refuses a cycle, a duplicate or a
   self link, and the dialog stays open. The Resources grid
   (`project/task_info/resources.rs`) has Resource Name, Assignment Owner
   (`assn_owner`) and Cost read-only, Units typed; OK turns the rows into the

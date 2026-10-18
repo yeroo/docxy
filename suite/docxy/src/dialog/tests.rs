@@ -1336,8 +1336,10 @@ fn a_calendar_closes_when_the_focus_moves_and_leaves_other_keys_to_the_field() {
     d.toggle_calendar(i).unwrap();
     // A key it does not handle goes on to the field.
     assert!(!d.calendar_key("a").unwrap());
+    assert!(d.calendar.is_none(), "a key it does not handle closes it");
+    d.toggle_calendar(i).unwrap();
     assert!(!d.calendar_key("backspace").unwrap());
-    assert!(d.calendar.is_some());
+    d.toggle_calendar(i).unwrap();
     // A click on another control closes it.
     d.click_control(0, None).unwrap();
     assert!(d.calendar.is_none());
@@ -1429,4 +1431,62 @@ fn the_combo_pick_stays_within_the_drawn_items() {
         d.grid_key("down", None).unwrap();
     }
     assert_eq!(d.controls[i].pick, Some(5));
+}
+
+// ---- FIX r2 (#1536) ----
+
+#[test]
+fn down_after_a_commit_that_grows_or_shrinks_the_rows_uses_the_new_count() {
+    let mut d = link_grid();
+    d.select_row("links", 1).unwrap();
+    let i = d.focus.unwrap();
+    d.controls[i].col = 0;
+    // Typing in the blank last row, then Down: the row it made stays, and
+    // the cursor moves to the new blank one.
+    d.grid_key("5", Some("5")).unwrap();
+    d.grid_key("down", None).unwrap();
+    assert_eq!(rows(&d)[1][0], "5");
+    assert_eq!(d.controls[i].row, Some(2));
+    d.grid_key("6", Some("6")).unwrap();
+    d.grid_key("down", None).unwrap();
+    assert_eq!(
+        (rows(&d)[1][0].as_str(), rows(&d)[2][0].as_str()),
+        ("5", "6")
+    );
+    // A commit that shrinks the grid does not carry Down past its end.
+    d.select_row("links", 2).unwrap();
+    d.controls[i].col = 0;
+    d.grid_key("7", Some("7")).unwrap();
+    d.grid_key("backspace", None).unwrap();
+    d.grid_key("down", None).unwrap();
+    assert!(d.controls[i].row.unwrap() < rows(&d).len());
+    // select_row counts the rows after the commit too: typing in the blank
+    // last row makes one more, which can then be selected.
+    d.select_row("links", rows(&d).len() - 1).unwrap();
+    d.controls[i].col = 0;
+    d.grid_key("9", Some("9")).unwrap();
+    let n = rows(&d).len();
+    d.select_row("links", n).unwrap();
+    assert_eq!(d.controls[i].row, Some(n));
+}
+
+#[test]
+fn a_typed_date_is_not_overwritten_by_an_open_calendar() {
+    let mut d = form();
+    let mut c = Control::new(
+        "finish",
+        "Finish:",
+        ControlKind::DateCombo,
+        Value::Text("2026-10-20".into()),
+    );
+    c.page = Some(0);
+    d.controls.push(c);
+    let i = d.controls.len() - 1;
+    d.toggle_calendar(i).unwrap();
+    assert!(!d.calendar_key("1").unwrap());
+    assert!(d.calendar.is_none(), "typing closes the calendar");
+    d.select_all();
+    d.type_char('x').unwrap();
+    assert!(!d.calendar_key("enter").unwrap());
+    assert_eq!(text_of_control(&d, "finish"), "x");
 }
