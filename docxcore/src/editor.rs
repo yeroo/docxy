@@ -4119,6 +4119,21 @@ fn link_part(h: &Hyperlink, local: usize) -> LinkPart {
     }
 }
 
+/// A link with no editable text left goes, as in Word. Its bookmarks and
+/// proofing marks stay where it was; anything still showing inside it (a
+/// tracked change, an anchored drawing, an empty field) keeps the link,
+/// zero-width. A field with a result, an equation or an inline picture is one
+/// offset, so its link is not empty (#1242). `content[i]` is the link.
+pub(crate) fn drop_emptied_link(content: &mut Vec<Inline>, i: usize) {
+    let Some(Inline::Hyperlink(h)) = content.get_mut(i) else {
+        return;
+    };
+    if h.runs.is_empty() && h.content.iter().all(is_marker) {
+        let kept = std::mem::take(&mut h.content);
+        content.splice(i..=i, kept);
+    }
+}
+
 /// A zero-width child that shows nothing: a bookmark, proofing or permission
 /// mark, a comment range, a smart tag's boundary, or an empty `w:r` (#1217).
 /// These may leave a link whose text is all deleted.
@@ -4531,16 +4546,7 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
                         content_delete(&mut h.content, local - runs_len);
                         h.content_changed = true;
                     }
-                    // A link with no editable text left goes, as in Word. Its
-                    // bookmarks and proofing marks stay where it was; anything
-                    // still showing inside it (a tracked change, an anchored
-                    // drawing, an empty field) keeps the link, zero-width. A
-                    // field with a result, an equation or an inline picture is
-                    // one offset, so its link is not empty (#1242).
-                    if h.runs.is_empty() && h.content.iter().all(is_marker) {
-                        let kept = std::mem::take(&mut h.content);
-                        content.splice(i..=i, kept);
-                    }
+                    drop_emptied_link(content, i);
                 }
                 Inline::Tab(_)
                 | Inline::Break(..)

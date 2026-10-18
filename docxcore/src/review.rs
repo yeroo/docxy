@@ -330,7 +330,8 @@ fn sweep_inlines(
             n += 1;
         }
     }
-    for inline in content.iter_mut() {
+    let mut emptied = Vec::new();
+    for (index, inline) in content.iter_mut().enumerate() {
         match inline {
             Inline::Revision {
                 content,
@@ -347,12 +348,17 @@ fn sweep_inlines(
                 let swept = sweep_link(h, target, action);
                 if swept > 0 {
                     h.content_changed = true;
+                    emptied.push(index);
                 }
                 n += swept;
             }
             Inline::TextBox { blocks, .. } => n += sweep_tracked_inserts(blocks, target, action),
             _ => {}
         }
+    }
+    // A link the sweep emptied goes, as when its last text is deleted.
+    for index in emptied.into_iter().rev() {
+        crate::editor::drop_emptied_link(content, index);
     }
     // A deletion of text that was in a rejected insertion has nothing left.
     content.retain(|i| !matches!(i, Inline::Revision { kind: RevisionKind::Delete, content, content_changed: true, .. } if content.is_empty()));
@@ -651,6 +657,9 @@ fn transform_inlines(
 
         let result = transform_inline(&mut content[index], target, action);
         if result.is_some() {
+            if matches!(result, Some(Ok(_))) {
+                crate::editor::drop_emptied_link(content, index);
+            }
             return result;
         }
         index += 1;

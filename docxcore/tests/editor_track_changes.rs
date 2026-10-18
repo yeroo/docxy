@@ -1177,6 +1177,14 @@ fn para_mut_at(doc: &mut Document, index: usize) -> &mut docxcore::model::Paragr
     p
 }
 
+/// Whether the first paragraph holds no link.
+fn no_link(doc: &Document) -> bool {
+    !para_at(doc, 0)
+        .content
+        .iter()
+        .any(|i| matches!(i, Inline::Hyperlink(_)))
+}
+
 fn ins_in_link(saved: &str) -> bool {
     let link = &saved[saved.find("<w:hyperlink").unwrap()..saved.find("</w:hyperlink>").unwrap()];
     link.contains("<w:ins ")
@@ -1476,6 +1484,7 @@ fn copying_text_recorded_in_a_link_and_pasting_it_1465() {
             .all(|o| o.is_applied())
     );
     assert_eq!(rejected.plain_text().trim_end(), "zz");
+    assert!(no_link(&rejected));
     // Pasting back into the source document: Reject of the pasted text only.
     let mut again = Editor::new(ed.doc.clone());
     as_author(&mut again, "Bo");
@@ -1508,4 +1517,35 @@ fn a_pasted_multi_run_link_is_one_revision_1465() {
     assert!(ed.reject_revision(revisions[0].target).is_applied());
     assert_eq!(text(&ed), "zz");
     assert!(ed.doc.revisions().is_empty());
+    assert!(no_link(&ed.doc), "{}", xml(&ed));
+    // Typing where the link was lands as plain text, not in an empty link.
+    ed.set_track_changes(None);
+    at(&mut ed, 1);
+    ed.insert_str("q");
+    assert!(no_link(&ed.doc), "{}", xml(&ed));
+    assert!(!xml(&ed).contains("<w:hyperlink"), "{}", xml(&ed));
+}
+
+/// Rejecting the only insertion of a loaded `w:hyperlink` takes the emptied
+/// link with it, by Reject All and by its one target; Accept keeps the link
+/// (#1465).
+#[test]
+fn rejecting_a_links_only_insertion_drops_the_link_1465() {
+    let inner = "<w:p><w:hyperlink w:anchor=\"x\"><w:ins w:id=\"7\" w:author=\"Bo\" w:date=\"2024-01-01T00:00:00Z\"><w:r><w:t>new</w:t></w:r></w:ins></w:hyperlink></w:p>";
+    let mut all = parse(inner);
+    assert!(all.reject_all_revisions().iter().all(|o| o.is_applied()));
+    assert!(no_link(&all));
+    let mut ed = Editor::new(parse(inner));
+    let target = ed.doc.revisions()[0].target;
+    assert!(ed.reject_revision(target).is_applied());
+    assert!(no_link(&ed.doc), "{}", xml(&ed));
+    at(&mut ed, 0);
+    ed.insert_str("q");
+    assert!(!xml(&ed).contains("<w:hyperlink"), "{}", xml(&ed));
+    assert_eq!(text(&ed), "q");
+    let mut kept = Editor::new(parse(inner));
+    let target = kept.doc.revisions()[0].target;
+    assert!(kept.accept_revision(target).is_applied());
+    assert!(!no_link(&kept.doc), "{}", xml(&kept));
+    assert_eq!(text(&kept), "new");
 }
