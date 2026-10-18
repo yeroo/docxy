@@ -1,5 +1,15 @@
 # CLAUDE.md
 
+## How work is done (every machine, every session)
+
+- Read `docs/WORKFLOW.md` before starting an issue. In short: one issue → one `issue-<n>-*` branch → one
+  PR merged by `merge-check`, through agworkbench.
+- Before starting an issue, skip it if it has the `in-progress` label, a **Grabbed** comment, a PR or a
+  remote branch. Otherwise claim it: add the label and comment `Grabbed by <machine>`.
+- Claude only, never OpenAI models. Auto permission mode. Cross-machine comments start with `**[<machine>]**`.
+- Stuck on another machine? Ask the coordinator, the Mac session `docxy-6c`: the user talks to the machines only
+  through it.
+
 ## DOCX Bidi Rendering
 
 - Keep `docxcore` dependency-free. It exposes `RenderOptions::bidi` and the
