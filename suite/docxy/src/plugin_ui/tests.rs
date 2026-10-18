@@ -401,3 +401,45 @@ fn the_palette_is_the_manifests_by_id() {
     assert!(palette_with("fx.green", &[&m]).is_none());
     assert!(palette_with("fx.blue", &[]).is_none());
 }
+
+#[test]
+fn help_is_the_hosts_never_the_default_and_never_a_command() {
+    // #1609: a spec's `help` button loses `default`, so Enter cannot name
+    // it, and a press through the dialog path says the documentation is
+    // coming without sending the plugin anything; a disabled one refuses.
+    let spec = ui::DialogButton {
+        id: "help".into(),
+        label: "Help".into(),
+        default: true,
+        cancel: false,
+    };
+    let b = button_of_spec(&spec, dialog::ButtonRole::Apply);
+    assert!(!b.default && b.id == "help");
+    let ok = button_of_spec(&ui::DialogButton::named("OK"), dialog::ButtonRole::Accept);
+    assert!(ok.default);
+    let mut t = tab();
+    let mut d = Dialog::message(
+        catalog::PLUGIN,
+        "Fixture",
+        String::new(),
+        &[],
+        DialogOwner::Plugin {
+            command: intern("fixture.hello"),
+            spec: intern("fixture.options"),
+        },
+    );
+    d.text = None;
+    d.buttons = vec![
+        dialog::Button::new("OK", dialog::ButtonRole::Accept),
+        button_of_spec(&spec, dialog::ButtonRole::Apply),
+    ];
+    t.dialogs.push(d);
+    assert_eq!(dialog_click(&mut t, "Help"), Some(Ok(())));
+    assert_eq!(t.status.as_str(), crate::help_tab::DOCS_COMING);
+    assert!(t.dialogs.is_open(), "the dialog stays");
+    t.dialogs.top_dialog_mut().unwrap().buttons[1].enabled = false;
+    assert_eq!(
+        dialog_click(&mut t, "Help"),
+        Some(Err("'Help' is disabled".into()))
+    );
+}

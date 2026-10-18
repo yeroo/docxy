@@ -977,7 +977,7 @@ fn rows_json(rows: &[Vec<String>]) -> Json {
 }
 
 /// A label as it is drawn: without its `&` accelerator mark.
-fn shown(label: &str) -> String {
+pub(crate) fn shown(label: &str) -> String {
     label.replace('&', "")
 }
 
@@ -1170,10 +1170,11 @@ impl Dialog {
     }
 
     /// The shown controls laid out as Project's (#1609): the header first
-    /// (its own band, one row of all its controls), then the page's
-    /// controls in rows of [`Dialog::columns`], a control's `span` taking
-    /// that many columns (clamped to the row), consecutive controls of one
-    /// `group` title in one band.
+    /// (one band of one row holding every header control, as wide as the
+    /// sum of their spans; a header control's `group` is ignored), then the
+    /// page's controls in rows of [`Dialog::columns`], a control's `span`
+    /// taking that many columns (clamped to the row), consecutive controls
+    /// of one `group` title in one band.
     pub fn layout_rows(&self) -> Vec<LayoutBand> {
         let mut shown = self.shown_indices();
         shown.sort_by_key(|&i| !self.controls[i].header);
@@ -1181,20 +1182,22 @@ impl Dialog {
         let header_columns = shown
             .iter()
             .filter(|&&i| self.controls[i].header)
-            .count()
+            .map(|&i| (self.controls[i].span as usize).max(1))
+            .sum::<usize>()
             .max(1);
         let mut bands: Vec<LayoutBand> = Vec::new();
         let mut k = 0;
         while k < shown.len() {
             let first = &self.controls[shown[k]];
-            let (header, title) = (first.header, first.group.clone());
+            let header = first.header;
+            let title = if header { None } else { first.group.clone() };
             let columns = if header { header_columns } else { page_columns };
             let mut rows: Vec<Vec<(usize, usize)>> = Vec::new();
             let mut row: Vec<(usize, usize)> = Vec::new();
             let mut used = 0;
             while k < shown.len() {
                 let c = &self.controls[shown[k]];
-                if c.header != header || c.group != title {
+                if c.header != header || (!header && c.group != title) {
                     break;
                 }
                 let span = (c.span as usize).clamp(1, columns);
@@ -1641,12 +1644,17 @@ impl Dialog {
 
     /// The controls Tab steps through on the current tab, in order.
     fn focusable(&self) -> Vec<usize> {
-        (0..self.controls.len())
+        // A plugin spec's header controls are drawn first and come first
+        // in the Tab order too (#1609); they are listed last so the pages'
+        // controls keep their indices.
+        let mut order: Vec<usize> = (0..self.controls.len())
             .filter(|&i| {
                 let c = &self.controls[i];
                 self.on_page(c) && c.visible && c.enabled && c.interactive()
             })
-            .collect()
+            .collect();
+        order.sort_by_key(|&i| !self.controls[i].header);
+        order
     }
 
     /// How many Tab presses move the focus from where it is now to control

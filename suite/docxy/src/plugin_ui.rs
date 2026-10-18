@@ -773,16 +773,6 @@ fn control_of_spec(
     page: Option<usize>,
     prefill: &Prefill,
 ) -> dialog::Control {
-    control_of_spec_in(c, page, prefill, false)
-}
-
-/// [`control_of_spec`], `header` for a spec's header control (#1609).
-fn control_of_spec_in(
-    c: &ui::DialogControl,
-    page: Option<usize>,
-    prefill: &Prefill,
-    header: bool,
-) -> dialog::Control {
     let kind = kind_of(&c.kind);
     let value = prefill.value(&c.name).unwrap_or(&c.value);
     let items = prefill.items(&c.name).unwrap_or(&c.items);
@@ -804,10 +794,17 @@ fn control_of_spec_in(
     // The layout hints (#1609).
     out.group = (!c.group.is_empty()).then(|| c.group.clone());
     out.span = u8::try_from(c.span.max(1)).unwrap_or(u8::MAX);
-    out.min_rows = (c.min_rows > 0).then_some((c.min_rows as usize).min(64));
+    // projcore bounds min_rows (64) when it parses the spec.
+    out.min_rows = (c.min_rows > 0).then_some(c.min_rows as usize);
     out.fill = c.fill;
-    out.header = header;
     apply_selected_row(&mut out, prefill);
+    out
+}
+
+/// A spec's header control (#1609): on every page, drawn first.
+fn header_control_of_spec(c: &ui::DialogControl, prefill: &Prefill) -> dialog::Control {
+    let mut out = control_of_spec(c, None, prefill);
+    out.header = true;
     out
 }
 
@@ -848,6 +845,17 @@ fn apply_selected_row(c: &mut dialog::Control, prefill: &Prefill) {
         Json::Num(n) if *n >= 0.0 && rows > 0 => Some((*n as usize).min(rows - 1)),
         _ => None,
     };
+}
+
+/// A spec's button as the dialog holds it (#1602): a `help` button is the
+/// host's and never the default, so Enter cannot name it (#1609).
+fn button_of_spec(b: &ui::DialogButton, role: dialog::ButtonRole) -> dialog::Button {
+    let help = b.id.eq_ignore_ascii_case("help");
+    dialog::Button {
+        id: b.id.clone(),
+        default: b.default && !help,
+        ..dialog::Button::new(&b.label, role)
+    }
 }
 
 /// The dialog spec `spec_id` of any loaded plugin.
@@ -908,7 +916,7 @@ fn open_dialog(v: &ProjectView, spec_id: &str, command: &str) -> Result<Dialog, 
         .chain(
             spec.header
                 .iter()
-                .map(|c| control_of_spec_in(c, None, values, true)),
+                .map(|c| header_control_of_spec(c, values)),
         )
         .collect();
     // OK and Cancel, or the spec's own buttons (#1602): `ok` accepts (the
@@ -931,11 +939,7 @@ fn open_dialog(v: &ProjectView, spec_id: &str, command: &str) -> Result<Dialog, 
                 } else {
                     dialog::ButtonRole::Apply
                 };
-                dialog::Button {
-                    id: b.id.clone(),
-                    default: b.default,
-                    ..dialog::Button::new(&b.label, role)
-                }
+                button_of_spec(b, role)
             })
             .collect()
     };
@@ -1125,7 +1129,7 @@ pub(crate) fn extend_task_info_with(d: &mut Dialog, spec: &ui::DialogSpec, value
     d.controls.extend(
         spec.header
             .iter()
-            .map(|c| control_of_spec_in(c, None, values, true)),
+            .map(|c| header_control_of_spec(c, values)),
     );
 }
 
@@ -1145,6 +1149,22 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Option<Result<(), 
         crate::dialog::fold_label(&b.label) == crate::dialog::fold_label(button)
             || b.id.eq_ignore_ascii_case(button.trim())
     });
+    // Help is the host's (#1609): the window's press opens the spec's page
+    // (`Docxy::plugin_help_click`, before this); any other path (Enter on
+    // a Help the spec marked default, a harness press) says the
+    // documentation is coming. Nothing reaches the plugin.
+    if let Some(b) = pressed
+        && b.id.eq_ignore_ascii_case("help")
+    {
+        if !b.enabled {
+            return Some(Err(format!(
+                "'{}' is disabled",
+                crate::dialog::shown(&b.label)
+            )));
+        }
+        tab.status = crate::help_tab::DOCS_COMING.into();
+        return Some(Ok(()));
+    }
     let (is_accept, own) = match pressed {
         Some(b) => (
             matches!(

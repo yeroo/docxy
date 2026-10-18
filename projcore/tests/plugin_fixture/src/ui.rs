@@ -18,8 +18,10 @@
 //!   "Bumped by fixture", the dialog kept open), Help is the host's (#1609: the
 //!   dialog names no `help` URL, so the host says its documentation is
 //!   coming). A header text `fixture.title` sits above the page and the
-//!   echo label repeats its value, which the state sees at open. The modeless `fixture.sheet` has its buttons down the right
-//!   and a grid of six rows.
+//!   echo label repeats its value, which the state sees at open; the header
+//!   text spans two columns beside a tag field. The modeless `fixture.sheet`
+//!   has its buttons down the right (Help last, opening its `help` page) and
+//!   a grid of six rows.
 //! - Commands: `fixture.hello` (the dialog, then a status with its number),
 //!   `fixture.flag` (flips the toggle: a view switch of the same name the
 //!   host stores in the plan's formatting, #1553), the swatches (set the palette,
@@ -56,16 +58,16 @@ const MANIFEST: &str = r##"{
       {"name":"fixture.grid","label":"Fixture items","kind":"grid","columns":[{"name":"Name","kind":"text"},{"name":"Done","kind":"checkbox"}],"value":[["a","false"],["b","true"]]},
       {"name":"fixture.pick","label":"Fixture p&ick:","kind":"dropdown","items":["none"],"value":"none"},
       {"name":"fixture.locked","label":"Fixture locked","kind":"checkbox","value":true}]}]},
-    {"id":"fixture.options","title":"Fixture Options","size":[460,400],"header":[{"name":"fixture.title","label":"&Title:","kind":"text","value":"Fixture"}],"pages":[{"name":"General","columns":2,"controls":[
+    {"id":"fixture.options","title":"Fixture Options","size":[460,400],"header":[{"name":"fixture.title","label":"&Title:","kind":"text","value":"Fixture","span":2},{"name":"fixture.tag","label":"Ta&g:","kind":"text","value":""}],"pages":[{"name":"General","columns":2,"controls":[
       {"name":"n","label":"&Number:","kind":"number","value":"1","group":"Numbers"},
       {"name":"fixture.echo","label":"","kind":"label","value":"","group":"Numbers"},
       {"name":"fixture.tasks","label":"Tasks","kind":"grid","columns":[{"name":"Name","kind":"text"}],"value":[],"min_rows":3},
       {"name":"fixture.sample","label":"Sample","kind":"sample","value":{"text":"AaBbYyZz"}},
       {"name":"fixture.memo","label":"&Memo:","kind":"multiline","value":"","span":2,"fill":true}]}],
      "buttons":["OK","Cancel","Help",{"id":"bump","label":"&Bump"}]},
-    {"id":"fixture.sheet","title":"Fixture Sheet","modeless":true,"placement":"right","pages":[{"name":"Sheet","controls":[
+    {"id":"fixture.sheet","title":"Fixture Sheet","modeless":true,"placement":"right","help":"https://example.test/fixture-help","pages":[{"name":"Sheet","controls":[
       {"name":"fixture.rows","label":"Tasks","kind":"grid","commit_command":true,"min_rows":6,"columns":[{"name":"Pick","kind":"check"},{"name":"Name","kind":"text"},{"name":"Units","kind":"number"}],"value":[]}]}],
-     "buttons":[{"id":"apply","label":"&Apply","default":true},{"id":"clear","label":"Clear"},{"id":"close","label":"Close","cancel":true}]}],
+     "buttons":[{"id":"apply","label":"&Apply","default":true},{"id":"clear","label":"Clear"},{"id":"close","label":"Close","cancel":true},"Help"]}],
   "palettes":[
     {"id":"fixture.blue","label":"Blue","bars":[{"kind":"on-track","color":"#3366CC","shape":"bar"},{"kind":"critical","color":"#1F3763","shape":"bar"}]},
     {"id":"fixture.red","label":"Red","bars":[{"kind":"on-track","color":"#CC3333","shape":"bar"},{"kind":"critical","color":"#7F0000","shape":"bar"}]}],

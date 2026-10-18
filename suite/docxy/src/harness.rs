@@ -2281,6 +2281,53 @@ fn sheet_command_json(
 
 /// `last-url`: the URL, the page it opens (before `?`), and whether its
 /// decoded body names this build's commit and leaves the host out (#1021).
+/// `dialog-read`'s reply with the scroll of each scrolling grid
+/// (`first_visible_row`) and filling multiline (`first_visible_line`) of the
+/// top dialog (#1609), from the handles the window keeps; the scroll lands
+/// at the next frame, so settle with a `shot` before reading it.
+fn dialog_read_with_scrolls(app: &mut crate::Docxy) -> Json {
+    let mut json = app.active_dialogs_mut().to_json();
+    let Some(id) = app
+        .active_dialogs()
+        .and_then(|s| s.top())
+        .map(|d| d.id.as_str())
+    else {
+        return json;
+    };
+    let grids = app.dialog_grids.borrow();
+    let Json::Obj(pairs) = &mut json else {
+        return json;
+    };
+    let Some(Json::Arr(controls)) = pairs
+        .iter_mut()
+        .find(|(k, _)| k == "controls")
+        .map(|(_, v)| v)
+    else {
+        return json;
+    };
+    for control in controls.iter_mut() {
+        let name = control.get_str("name").unwrap_or("").to_string();
+        let kind = control.get_str("kind").unwrap_or("").to_string();
+        let Some((handle, _)) = grids
+            .iter()
+            .find(|((d, n), _)| *d == id && **n == *name)
+            .map(|(_, v)| v)
+        else {
+            continue;
+        };
+        let first = (-f32::from(handle.offset().y) / 18.).round().max(0.) as usize;
+        let key = if kind == "grid" {
+            "first_visible_row"
+        } else {
+            "first_visible_line"
+        };
+        if let Json::Obj(fields) = control {
+            fields.push((key.into(), Json::Num(first as f64)));
+        }
+    }
+    json
+}
+
 fn last_url_json(url: Option<&str>) -> Json {
     let Some(url) = url else {
         return Json::obj(vec![
@@ -4502,7 +4549,7 @@ fn dispatch_verb(
         }
         // Dialogs (#393). There is no `dialog-open`: a dialog opens through
         // the verb a person would use (`key`, `ribbon-click`, `click-cell`).
-        "dialog-read" => Done::ok(app.active_dialogs_mut().to_json()),
+        "dialog-read" => Done::ok(dialog_read_with_scrolls(app)),
         // One field of the open dialog as it is edited and drawn: its text,
         // focus, caret and selection (#1029).
         // A sheet input outside the dialogs (#1200), or the open dialog's

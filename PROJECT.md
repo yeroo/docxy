@@ -454,7 +454,7 @@ without one nothing changes.
   `chart`, `heading-filter` menu with an `after` label hint), `dialogs`
   (specs by id: pages of controls with kinds `text`, `number`, `date`,
   `duration`, `checkbox`, `radio`, `dropdown`, `list`, `grid` with per-column
-  kinds, `multiline`, `label`, `color`, `font`; the `task-information` spec's
+  kinds, `multiline`, `label`, `sample` (a read-only preview box the state feeds, #1609), `color`, `font`; the `task-information` spec's
   pages add to the host's Task Information dialog, one named like a built-in
   page replacing it), `palettes` (bar colours and shapes per kind) and
   `text_style_categories`. A contributed control, menu item or page whose id
@@ -502,7 +502,9 @@ without one nothing changes.
   underline, color, background}`, the formatting model's text style). A
   `Help` button is the host's: it opens the spec's `help` URL (recorded for
   the harness's `last-url`), else says the documentation is coming; it is
-  never sent to the plugin. A `task-information` spec's pages take
+  never sent to the plugin and never the default. A tabbed dialog without a
+  `size` sizes to the shown page, so switching pages may resize it: a stable
+  size needs an explicit `size`. A `task-information` spec's pages take
   `columns`, `group`, `span` and `min_rows`; `size`, `placement` and `fill`
   belong to a plugin's own dialog.
 - **Overlay** (`yppx_ui_overlay`): the rows in view (`uid`, `row_y`, the bar

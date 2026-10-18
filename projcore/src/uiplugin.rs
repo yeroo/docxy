@@ -386,8 +386,9 @@ pub struct DialogSpec {
     /// then says its documentation is coming). Help is the host's: it is
     /// never sent to the plugin as a command.
     pub help: String,
-    /// Controls drawn above every page (#1609): Task Information's Name,
-    /// Duration and Estimated row.
+    /// Controls drawn above every page (#1609) as one row: Task Information's
+    /// Name, Duration and Estimated. A header control's `span` widens it
+    /// within that row; its `group` is ignored.
     pub header: Vec<DialogControl>,
 }
 
@@ -395,7 +396,9 @@ pub struct DialogSpec {
 /// command with `button` set to the id and the current `values`; the
 /// dialog stays open unless the reply says `close` (a `cancel` button
 /// closes it without sending anything; a `default` one is what Enter
-/// presses). The state greys a button like a control, by its id.
+/// presses). A `help` button is the host's (see [`DialogSpec::help`],
+/// #1609) and sends nothing; it is never the default. The state greys a
+/// button like a control, by its id.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DialogButton {
     pub id: String,
@@ -940,7 +943,6 @@ impl Manifest {
                         }),
                     ),
                     ("placement", Json::str(d.placement.clone())),
-                    ("help", Json::str(d.help.clone())),
                     ("help", Json::str(d.help.clone())),
                     (
                         "header",
@@ -2261,16 +2263,7 @@ mod tests {
         assert!(Manifest::parse(r#"{"dialogs":[{"id":"x","size":480}]}"#).is_err());
         assert!(Manifest::parse(r#"{"dialogs":[{"id":"x","size":[480,9000]}]}"#).is_err());
         assert_eq!(opts.help, "https://example.test/help");
-        assert_eq!(opts.pages[0].controls[2].min_rows, 4);
-        let big = Manifest::parse(
-            r#"{"dialogs":[{"id":"x","pages":[{"name":"p","controls":[{"name":"g","kind":"grid","min_rows":1000000}]}]}]}"#,
-        )
-        .unwrap();
-        assert_eq!(big.dialog("x").unwrap().pages[0].controls[0].min_rows, 64);
-        assert!(Manifest::parse(r#"{"dialogs":[{"id":"x","size":480}]}"#).is_err());
-        assert!(Manifest::parse(r#"{"dialogs":[{"id":"x","size":[480,9000]}]}"#).is_err());
-        assert_eq!(opts.help, "https://example.test/help");
-        assert_eq!(opts.pages[0].controls[2].min_rows, 4);
+        assert_eq!(m.json().matches("\"help\":").count(), m.dialogs.len());
         let big = Manifest::parse(
             r#"{"dialogs":[{"id":"x","pages":[{"name":"p","controls":[{"name":"g","kind":"grid","min_rows":1000000}]}]}]}"#,
         )

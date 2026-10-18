@@ -13,25 +13,42 @@ pub(crate) type ListScrolls = std::collections::HashMap<
     (UniformListScrollHandle, Option<usize>),
 >;
 
-/// Each scrolling grid of the top dialog (#1609): its scroll, and the row
-/// last scrolled to.
+/// Each scrolling grid or filling multiline of the top dialog (#1609): its
+/// scroll, and the row (or caret line) last scrolled to.
 pub(crate) type GridScrolls =
     std::collections::HashMap<(&'static str, &'static str), (ScrollHandle, Option<usize>)>;
 
-/// The scroll for grid `name` of dialog `id`, kept across frames; the
-/// selected row is scrolled into view when it is not the one last seen, as
-/// [`list_scroll`] does for a list.
+/// The scroll for grid or multiline `name` of dialog `id`, kept across
+/// frames; when `row` (the selected row, the caret's line) is not the one
+/// last seen it is brought into view: the offset is set outright from the
+/// row height and the view's height (`view_h`, else the element's last
+/// bounds), the least that shows the row, as [`list_scroll`] does for a
+/// list. A wheel scroll that leaves the row alone is not undone.
 fn grid_scroll(
     grids: &mut GridScrolls,
     key: (&'static str, &'static str),
     row: Option<usize>,
+    row_h: f32,
+    view_h: Option<f32>,
 ) -> ScrollHandle {
     let (handle, seen) = grids
         .entry(key)
         .or_insert_with(|| (ScrollHandle::new(), None));
     if row != *seen {
         if let Some(r) = row {
-            handle.scroll_to_item(r);
+            let view = view_h
+                .unwrap_or_else(|| f32::from(handle.bounds().size.height))
+                .max(row_h);
+            let shown = -f32::from(handle.offset().y);
+            let (top, bottom) = (r as f32 * row_h, (r + 1) as f32 * row_h);
+            let next = if top < shown {
+                top
+            } else if bottom > shown + view {
+                bottom - view
+            } else {
+                shown
+            };
+            handle.set_offset(point(px(0.), px(-next)));
         }
         *seen = row;
     }
@@ -799,6 +816,12 @@ impl Docxy {
         if !pressed.id.eq_ignore_ascii_case("help") {
             return None;
         }
+        if !pressed.enabled {
+            return Some(Err(format!(
+                "'{}' is disabled",
+                dialog::shown(&pressed.label)
+            )));
+        }
         match crate::plugin_ui::help_url(spec) {
             Some(url) => self.open_help_url(url, cx),
             None => self.set_status(crate::help_tab::DOCS_COMING.to_string()),
@@ -931,15 +954,17 @@ impl Docxy {
                 let (from, to) = d.selection().unwrap_or((caret, caret));
                 let mut lines: Vec<AnyElement> = Vec::new();
                 let mut start = 0;
+                let mut caret_line = 0;
                 let line_count = text.split('\n').count();
                 for (n, line) in text.split('\n').enumerate() {
                     let len = line.chars().count();
                     let end = start + len;
-                    let shown: AnyElement = if focused
-                        && caret >= start
-                        && caret <= end
-                        && (n + 1 == line_count || caret < end + 1)
-                    {
+                    let on_line =
+                        caret >= start && caret <= end && (n + 1 == line_count || caret < end + 1);
+                    if on_line {
+                        caret_line = n;
+                    }
+                    let shown: AnyElement = if focused && on_line {
                         let part = |a: usize, b: usize| {
                             SharedString::from(
                                 chars[a.min(end)..b.min(end)].iter().collect::<String>(),
@@ -965,6 +990,16 @@ impl Docxy {
                     lines.push(shown);
                     start = end + 1;
                 }
+                // The lines are 16 px each; the box's height is the frame's.
+                let scroll = fill.then(|| {
+                    grid_scroll(
+                        &mut self.dialog_grids.borrow_mut(),
+                        (d.id.as_str(), c.name),
+                        Some(caret_line),
+                        16.,
+                        None,
+                    )
+                });
                 v_flex()
                     .id(("dialog-control", i))
                     .gap_1()
@@ -974,24 +1009,55 @@ impl Docxy {
                     .child(probe(&self.probes, format!("dialog-control:{}", c.name)))
                     .when(!label.is_empty(), |v| v.child(label))
                     .child(
-                        v_flex()
-                            .id(("dialog-multiline", i))
+                        div()
                             .relative()
-                            .min_w(px(240.))
-                            .min_h(px(16. * 3. + 4.))
-                            .when(fill, |v| v.flex_1().w_full().overflow_hidden())
-                            .px_1()
-                            .border_1()
-                            .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
-                            .bg(pal.panel)
-                            .child(probe(&self.probes, format!("dialog-field:{name}")))
-                            .children(lines)
-                            .when(editable, |r| {
-                                r.cursor_text().on_click(cx.listener(
-                                    move |this, ev: &ClickEvent, window, cx| {
-                                        this.dialog_field_click(i, ev.position(), window, cx)
-                                    },
-                                ))
+                            .when(fill, |v| v.flex_1().min_h_0().w_full())
+                            .child(
+                                v_flex()
+                                    .id(("dialog-multiline", i))
+                                    .relative()
+                                    .min_w(px(240.))
+                                    .min_h(px(16. * 3. + 4.))
+                                    // A filling box scrolls its lines, the
+                                    // caret's kept in view (#1609).
+                                    .when_some(scroll.clone(), |v, h| {
+                                        v.h_full().w_full().overflow_y_scroll().track_scroll(&h)
+                                    })
+                                    .px_1()
+                                    .border_1()
+                                    .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
+                                    .bg(pal.panel)
+                                    .child(probe(&self.probes, format!("dialog-field:{name}")))
+                                    .children(lines)
+                                    .when(editable, |r| {
+                                        r.cursor_text().on_click(cx.listener(
+                                            move |this, ev: &ClickEvent, window, cx| {
+                                                this.dialog_field_click(
+                                                    i,
+                                                    ev.position(),
+                                                    window,
+                                                    cx,
+                                                )
+                                            },
+                                        ))
+                                    }),
+                            )
+                            .when_some(scroll, |b, h| {
+                                b.child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .right_0()
+                                        .bottom_0()
+                                        .w(px(8.))
+                                        .child(
+                                            Scrollbar::vertical(&h)
+                                                .id(SharedString::from(format!(
+                                                    "dialog-multiline-scroll:{name}"
+                                                )))
+                                                .scrollbar_show(ScrollbarShow::Always),
+                                        ),
+                                )
                             }),
                     )
                     .into_any_element()
@@ -1081,14 +1147,16 @@ impl Docxy {
                         }))
                 });
                 let scrolls = rows.len() > min_rows;
+                let body_h = 18. * min_rows as f32;
                 let scroll = scrolls.then(|| {
                     grid_scroll(
                         &mut self.dialog_grids.borrow_mut(),
                         (d.id.as_str(), c.name),
                         sel_row,
+                        18.,
+                        Some(body_h),
                     )
                 });
-                let body_h = 18. * min_rows as f32;
                 v_flex()
                     .id(("dialog-control", i))
                     .gap_1()
@@ -1141,11 +1209,16 @@ impl Docxy {
             // A sample box (#1609): the text in the style the state gives, the
             // formatting model's text style plus `text`.
             ControlKind::Sample => {
-                let sample = c.sample();
-                let text = sample.get_str("text").unwrap_or("AaBbYyZz").to_string();
-                let style = projcore::json::Json::parse(&sample.to_string())
-                    .map(|j| projcore::formatting::TextStyle::from_json(&j))
-                    .unwrap_or_default();
+                let (text, style) = match &c.value {
+                    dialog::Value::Text(raw) => match projcore::json::Json::parse(raw) {
+                        Ok(j @ projcore::json::Json::Obj(_)) => (
+                            j.get_str("text").unwrap_or("AaBbYyZz").to_string(),
+                            projcore::formatting::TextStyle::from_json(&j),
+                        ),
+                        _ => (raw.clone(), projcore::formatting::TextStyle::default()),
+                    },
+                    _ => (String::new(), projcore::formatting::TextStyle::default()),
+                };
                 v_flex()
                     .id(("dialog-control", i))
                     .gap_1()

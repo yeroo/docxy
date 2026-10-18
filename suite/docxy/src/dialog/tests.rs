@@ -1152,26 +1152,53 @@ fn layout_rows_put_the_header_first_then_groups_and_spans_in_columns() {
         }
         d.controls.push(c);
     };
-    ctl("h1", None, 1, true);
-    ctl("h2", None, 1, true);
+    // The header: a span-2 control and a grouped one still make one row.
+    ctl("h1", None, 2, true);
+    ctl("h2", Some("ignored"), 1, true);
     ctl("h3", None, 1, true);
     ctl("a", Some("G"), 1, false);
     ctl("b", Some("G"), 1, false);
     ctl("c", Some("G"), 3, false);
     ctl("d", None, 1, false);
+    // A span that does not fit the rest of the row starts a new one.
+    ctl("e", Some("H"), 1, false);
+    ctl("f", Some("H"), 2, false);
     let bands = d.layout_rows();
     let name = |i: usize| d.controls[i].name;
     let header = &bands[0];
     assert!(header.header && header.title.is_none());
-    assert_eq!(header.columns, 3);
+    assert_eq!(header.columns, 4, "the spans' sum");
     assert_eq!(header.rows.len(), 1);
     assert_eq!(
         header.rows[0]
             .iter()
             .map(|&(i, col)| (name(i), col))
             .collect::<Vec<_>>(),
-        [("h1", 0), ("h2", 1), ("h3", 2)]
+        [("h1", 0), ("h2", 2), ("h3", 3)]
     );
+    let h = bands
+        .iter()
+        .find(|b| b.title.as_deref() == Some("H"))
+        .unwrap();
+    assert_eq!(h.rows.len(), 2, "a span of 2 does not fit beside e");
+    assert_eq!(
+        h.rows[0]
+            .iter()
+            .map(|&(i, col)| (name(i), col))
+            .collect::<Vec<_>>(),
+        [("e", 0)]
+    );
+    assert_eq!(
+        h.rows[1]
+            .iter()
+            .map(|&(i, col)| (name(i), col))
+            .collect::<Vec<_>>(),
+        [("f", 0)]
+    );
+    // Tab reaches the header first.
+    let order = d.focusable();
+    assert_eq!(name(order[0]), "h1");
+    assert_eq!(name(order[2]), "h3");
     // The form's own controls on page 0 come next, ungrouped, two a row.
     let group = bands
         .iter()
@@ -1191,15 +1218,10 @@ fn layout_rows_put_the_header_first_then_groups_and_spans_in_columns() {
         group.rows[1],
         vec![(d.controls.iter().position(|c| c.name == "c").unwrap(), 0)]
     );
-    let last = bands.last().unwrap();
-    assert_eq!(
-        last.rows
-            .last()
-            .unwrap()
-            .iter()
-            .map(|&(i, _)| name(i))
-            .collect::<Vec<_>>(),
-        ["d"]
-    );
+    let d_band = bands
+        .iter()
+        .find(|b| b.rows.iter().flatten().any(|&(i, _)| name(i) == "d"))
+        .unwrap();
+    assert!(d_band.title.is_none() && !d_band.header);
     assert!(!d.fills(&d.controls[0]));
 }

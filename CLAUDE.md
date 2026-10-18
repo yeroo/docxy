@@ -398,7 +398,8 @@
   `apply_project_act`: ops and `view` in one `Editor::batch`, the view's
   switches set, the status and dialog returned. `plugin_ui::dialog_click`
   runs before the generic dialog path: a plugin dialog's OK sends its command
-  again with `values_of` (every `plugin` control); Task Information with
+  again with `values_of` (every `plugin` control but a `sample`, which is
+  read-only); Task Information with
   plugin pages applies the built-in fields (`apply_task_info_in`) and the
   `task-information` command's ops in one step.
 - State (`enabled`, `checked`, `swatch_checked`) comes from `yppx_ui_state`,
@@ -428,16 +429,25 @@
   `plugin` controls.
   A plugin dialog may be laid out as Project's (#1609): `Dialog::size`
   (fixed, every page), `buttons_right` (else Help bottom left, the rest
-  bottom right), `page_columns` (controls per row; `Docxy::dialog_body`
-  chunks the shown controls into rows, consecutive same-`Control::group`
-  controls into a titled box, `span` columns each, the labels of a column
-  one width), `Control::min_rows` (a grid's visible rows; a plugin grid
-  draws 8, more scroll), `Control::fill` (a multiline fills a sized
-  dialog), `ControlKind::Sample` (a read-only styled box, `Control::sample`),
-  and a header (`page: None` plugin controls, drawn first on every page).
-  A plugin dialog may declare its own buttons (`Button::id`; a press sends
-  the command with `button`, the dialog stays open unless the reply's
-  `close`; `help` is drawn and sent like any other), be `modeless` (no backdrop, `Dialog::active` decides who has
+  bottom right), `page_columns` (controls per row; `Dialog::layout_rows`
+  lays the bands out and `Docxy::dialog_body` draws them: the header band
+  first as one row, consecutive same-`Control::group` controls as a titled
+  box, rows of `columns` with `span` each, the labels of a column one
+  width), `Control::min_rows` (a grid's visible rows; a plugin grid draws
+  8, more scroll behind a `Scrollbar`), `Control::fill` (`Dialog::fills`: a
+  multiline fills a sized dialog and scrolls its lines, the caret's kept in
+  view; grids and filling multilines share `GridScrolls`, which
+  `dialog-read` reports as `first_visible_row` / `first_visible_line`),
+  `ControlKind::Sample` (a read-only box drawn by `plugin_ui::styled` from
+  the formatting model's `TextStyle`) and `Control::header` (a spec's
+  header control, listed last, drawn first on every page and first in the
+  Tab order). A plugin dialog may declare its own buttons (`Button::id`; a
+  press sends the command with `button`, the dialog stays open unless the
+  reply's `close`); `help` is the host's: the window's press opens the
+  spec's `help` URL through `open_help_url` (recorded for `last-url`), else
+  says `DOCS_COMING`, `plugin_ui::dialog_click` answers any other path the
+  same way, and it is never the default, so it never reaches the plugin. It
+  may be `modeless` (no backdrop, `Dialog::active` decides who has
   the keys: a press in the table takes them, a dialog press gives them
   back; mutating control verbs `clear_modal` and keep it; `refuse_under_dialog`
   ignores it), and every plugin control change marks the dialog `stale`:

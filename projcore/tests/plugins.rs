@@ -189,7 +189,8 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         [
             ("apply", true, false),
             ("clear", false, false),
-            ("close", false, true)
+            ("close", false, true),
+            ("help", false, false)
         ]
     );
     assert_eq!(sheet.pages[0].controls[0].columns[0].kind, "check");
@@ -515,7 +516,11 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         Some(&Json::Bool(true))
     );
     assert_eq!(opts.header[0].name, "fixture.title");
+    assert_eq!(opts.header[0].span, 2);
     assert_eq!(opts.help, "");
+    let sheet = ui.manifest().dialog("fixture.sheet").unwrap();
+    assert_eq!(sheet.help, "https://example.test/fixture-help");
+    assert_eq!(sheet.buttons.last().map(|b| b.id.as_str()), Some("help"));
     assert_eq!(
         ui.manifest().dialog("task-information").unwrap().pages[0].columns,
         2

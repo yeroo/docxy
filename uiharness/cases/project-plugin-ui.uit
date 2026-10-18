@@ -155,9 +155,36 @@ test the button's command opens the plugin's dialog, whose OK sends the values b
   assert reply.controls.1.kind is label
   # The header text's declared value reached the state at open (#1609).
   assert reply.controls.1.value is Number 1 for A (Fixture)
-  assert reply.controls.-1.name is fixture.title
-  assert reply.controls.-1.header is true
-  assert reply.controls.-1.value is Fixture
+  assert reply.controls.-2.name is fixture.title
+  assert reply.controls.-2.header is true
+  assert reply.controls.-2.span is 2
+  assert reply.controls.-2.value is Fixture
+  assert reply.controls.-1.name is fixture.tag
+  # Tab from the opened dialog reaches the header first.
+  call real-key {"key":"tab"}
+  call field-read {"dialog-field":"fixture.title"}
+  assert reply.focused is true
+  # A filling memo scrolls: more lines than fit keep the caret in view.
+  call pointer-click {"dialog-field":"fixture.memo"}
+  call real-type {"text":"one"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"two"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"three"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"four"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"five"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"six"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"seven"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"eight"}
+  shot window
+  call dialog-read {}
+  # Eight lines in a box of about four: the caret's line is in view.
+  assert reply.controls.4.first_visible_line is 4
   # The grid lists the plan's tasks with the selected one's row selected
   # (the state's name.selected_row).
   assert reply.controls.2.name is fixture.tasks
@@ -431,9 +458,10 @@ test a modeless dialog with a grid and buttons of its own follows the plan and r
 
 test a plugin grid with more rows than it shows scrolls and keeps the selected row in view
   # Fixture Sheet's grid asks for six rows (#1609); a plan of ten tasks
+  # (corpus/mspdi/27-manual-summary.xml, copied beside the fixtures)
   # fills more, so the body scrolls with a scrollbar and a row picked past
   # the fold is scrolled into view.
-  open copy:../../corpus/mspdi/27-manual-summary.xml
+  open copy:../fixtures/project-ten-tasks.xml
   click C1
   call ribbon-click {"tab":"Task","command":"Sheet (fixture)"}
   assert dialog is plugin
@@ -444,9 +472,22 @@ test a plugin grid with more rows than it shows scrolls and keeps the selected r
   call dialog-read {}
   assert reply.controls.0.selected_row is 9
   shot window
+  # The scroll lands at the next frame: settle one more before reading it.
+  shot window
+  call dialog-read {}
+  assert reply.controls.0.first_visible_row is 4
   call dialog-select {"control":"fixture.rows","row":0}
   call dialog-read {}
   assert reply.controls.0.selected_row is 0
   shot window
+  shot window
+  call dialog-read {}
+  assert reply.controls.0.first_visible_row is 0
+  # The sheet's Help opens the spec's page (recorded, no browser in a
+  # harness run) and the dialog stays.
+  call dialog-click {"button":"Help"}
+  assert dialog is plugin
+  call last-url {}
+  assert reply.url is https://example.test/fixture-help
   call dialog-click {"button":"Close"}
   assert dialog is none
