@@ -47,6 +47,7 @@ pub mod report;
 pub mod schedule;
 pub mod tableview;
 pub mod text;
+pub mod timeline;
 pub mod uiplugin;
 pub mod yppx;
 
