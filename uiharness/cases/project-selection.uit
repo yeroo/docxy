@@ -63,6 +63,8 @@ test project Ctrl+Home and Ctrl+End go to the first and last cell
 
 test project the default window shows the whole Entry table and a narrowed pane does not
   open copy:../fixtures/project-filter.xml
+  # The view is laid out by a drawn frame: draw one first.
+  shot window
   assert table_fits is true
   call pointer-drag {"from":"project-split","to":"cell:B1"}
   assert table_fits is false

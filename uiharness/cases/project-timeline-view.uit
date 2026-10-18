@@ -3,6 +3,8 @@ test project timeline highlights the chart's visible range and follows its scrol
   # (the table takes 847 px of the 1180 px window; pinned by the unit test
   # the_view_box_of_the_timeline_view_fixture_at_the_default_window).
   open ../fixtures/project-timeline-view.xml
+  # The chart is laid out by a drawn frame: draw one first.
+  shot window
   assert timeline_start is Mon 1/5/26
   assert timeline_finish is Fri 3/27/26
   assert timeline_view_start is Mon 1/5/26

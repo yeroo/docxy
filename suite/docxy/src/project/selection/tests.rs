@@ -197,7 +197,13 @@ fn the_colours_are_washes_of_the_accent() {
 #[test]
 fn the_whole_entry_table_fits_the_default_window_and_a_narrow_one_scrolls() {
     let mut p = ProjectView::new(Project::default(), false);
-    p.layout(1180.);
+    // The first window's width, which the harness's windows share: `table_fits`
+    // is true there once a frame has laid the view out. Before it the pane
+    // holds its 590 px placeholder, so `uiharness` cases draw one with
+    // `shot window` first.
+    assert_eq!(p.table_w, 590.);
+    assert!(p.table_total() > p.table_w);
+    p.layout(crate::DEFAULT_WINDOW.0);
     assert!(
         p.table_total() <= p.table_w,
         "{} > {}",
