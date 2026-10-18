@@ -93,5 +93,5 @@ test project an arrow press does not select the column or resize it
   assert dialog is none
   assert selection is none
   call rows {}
-  assert reply.widths.Duration is 80
+  assert reply.widths.Duration is 90
   call-error menu-open {"target":{"filter":"Nope"}} => no Project column 'Nope'

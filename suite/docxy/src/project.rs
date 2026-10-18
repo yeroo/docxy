@@ -25,6 +25,7 @@ pub(super) use timeline::*;
 mod rows;
 pub(super) use rows::*;
 mod columns;
+mod selection;
 pub(super) use columns::{ARROW_W, EDGE_W, WidthDrag, committed_widths, project_width_release_all};
 mod autofilter;
 pub(super) use autofilter::{AUTO_FILTER_STATUS, autofilter_click};
@@ -92,7 +93,7 @@ pub(super) struct ProjectView {
     /// and the cursor's columns are pinned) while the drag moves over rows.
     pub row_drag: bool,
     /// The range was made by a press on a task's ID cell (Project's row
-    /// header), and nothing has reshaped it since: Delete over it deletes
+    /// header) or by Shift+Space (#1534), and nothing has reshaped it since: Delete over it deletes
     /// the cursor's task rather than clearing cells (#1260). Only meaningful
     /// while `anchor` is set.
     pub row_header: bool,
@@ -675,6 +676,11 @@ pub(super) fn project_state(
             Json::Str(v.exported.clone().unwrap_or_else(|| "none".into())),
         ),
         ("table_w".into(), Json::Num(f64::from(v.table_w))),
+        // Whether the pane shows every column, no table scrolling needed (#1534).
+        (
+            "table_fits".into(),
+            Json::Bool(v.table_total() <= v.table_w),
+        ),
         ("gantt_w".into(), Json::Num(f64::from(v.gantt_w))),
     ];
     // What the Gantt draws, after the Gantt Chart Format toggles.
@@ -695,6 +701,7 @@ pub(super) fn project_state(
         ]
     }));
     entries.extend(project_cell_state(v));
+    entries.extend(selection::selection_state(v));
     entries.extend(timeline_state(v));
     entries.push(("undo_depth".into(), Json::Num(v.ed.undo_depth() as f64)));
     entries.push(("redo_depth".into(), Json::Num(v.ed.redo_depth() as f64)));
@@ -1059,8 +1066,7 @@ pub(crate) fn project_row(ed: &ProjectEditor, task: &Task) -> [String; COLUMN_CO
 pub(crate) const ROW_H: f32 = 28.;
 /// The entry table's default column widths; a plan's own (`tableview.xml`,
 /// dragged on a heading's right edge) replace them per column.
-pub(crate) const DEFAULT_WIDTHS: [f32; COLUMN_COUNT] =
-    [48., 130., 240., 80., 100., 100., 150., 190.];
+pub(crate) const DEFAULT_WIDTHS: [f32; COLUMN_COUNT] = [46., 132., 140., 90., 94., 94., 118., 133.];
 /// The default widths' sum.
 #[cfg(test)]
 pub(crate) const TABLE_W: f32 = sum_widths();
@@ -1099,6 +1105,7 @@ fn heading_cells(
         None => row,
     };
     let widths = v.widths();
+    let look = v.look();
     row.children(COLUMNS.iter().enumerate().map(|(col, name)| {
         let filtered = v.ed.filter(ENTRY_FIELDS[col]).is_some();
         div()
@@ -1114,8 +1121,25 @@ fn heading_cells(
             .overflow_hidden()
             .whitespace_nowrap()
             .when(col == COL_NAME, |d| d.pl(px(8.)))
+            .when(look.heading_hot(col), |d| {
+                d.bg(selection::header_tint_color())
+            })
             .child(probe(probes, format!("project-heading:{col}")))
             .child(*name)
+            // A left press selects the column (#1534); the arrow and the
+            // edge, drawn after, stop their own presses.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    if this.active == index
+                        && let Some(tab) = this.tabs.get_mut(index)
+                    {
+                        project_column_select(tab, col);
+                    }
+                    this.refocus(window, cx);
+                    cx.notify();
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
@@ -1213,12 +1237,14 @@ fn editable_row_cells(
     let probe_row = task.map_or_else(|| "entry".to_string(), |t| t.id.to_string());
     let cursor_row = v.cursor_row();
     let widths = v.widths();
-    // Once per row: which cells, if any, the range selection covers.
-    let selection = v.selection();
+    // Once per row: which cells the selection fills and which ID cell is
+    // tinted (#1534).
+    let look = v.look();
     let selected_bg = |u: Option<i32>, col: usize| {
-        if u.is_some_and(|u| selection.as_ref().is_some_and(|s| s.contains(u, col))) {
-            let c = hsla_u(BRAND);
-            hsla(c.h, c.s, c.l, 0.18)
+        if look.fill(u, col) {
+            selection::cell_fill_color()
+        } else if col == COL_ID && u.is_some_and(|u| look.id_hot(u)) {
+            selection::header_tint_color()
         } else {
             hsla(0., 0., 0., 0.)
         }
@@ -1371,8 +1397,15 @@ fn pane(width: f32, offset: f32, content: impl IntoElement) -> impl IntoElement 
         .child(div().absolute().left(px(-offset)).top_0().child(content))
 }
 
-fn chart_pane(width: f32, offset: f32, pal: Pal, content: impl IntoElement) -> impl IntoElement {
+fn chart_pane(
+    width: f32,
+    offset: f32,
+    pal: Pal,
+    hot: bool,
+    content: impl IntoElement,
+) -> impl IntoElement {
     h_flex()
+        .when(hot, |d| d.bg(pal.sel))
         .w(px(width + GANTT_INSET))
         .h(px(ROW_H))
         .flex_none()
@@ -1476,6 +1509,7 @@ pub(super) fn project_el(
                             gantt_w,
                             gantt_x,
                             pal,
+                            false,
                             gantt_header(
                                 scale,
                                 view.ed.project().project_shading_calendar(),
@@ -1558,7 +1592,7 @@ pub(super) fn project_el(
                                                     .when(task.is_some_and(|t| t.summary), |d| {
                                                         d.font_weight(FontWeight::BOLD)
                                                     })
-                                                    .when(i == cursor_row, |d| d.bg(pal.sel))
+                                                    .when(i == cursor_row && task.is_none(), |d| d.bg(pal.sel))
                                                     // The row's menu opens on its table,
                                                     // past the cells too; the chart's bars
                                                     // open their own (#1207).
@@ -1605,6 +1639,9 @@ pub(super) fn project_el(
                                                         gantt_w,
                                                         gantt_x,
                                                         pal,
+                                                        // The table's selection is cell-wise
+                                                        // (#1534); the chart keeps the row.
+                                                        task.is_some() && i == cursor_row,
                                                         // The entry row has no bar, so no `bar:` probe.
                                                         gantt_strip(
                                                             task.and_then(|t| {

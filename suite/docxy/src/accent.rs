@@ -45,6 +45,13 @@ pub(crate) fn brand() -> u32 {
     CURRENT.load(Ordering::Relaxed)
 }
 
+/// The accent as a translucent wash of opacity `alpha` (#1534), the project
+/// table's selection colours: it reads on the light and the dark theme.
+pub(crate) fn wash(alpha: f32) -> gpui::Hsla {
+    let c: gpui::Hsla = gpui::rgb(brand()).into();
+    gpui::hsla(c.h, c.s, c.l, alpha)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,6 +1,10 @@
 use super::*;
 use core::prelude::v1::test;
 
+/// A window narrow enough that the default columns need the table scrollbar
+/// (the table pane is `NARROW * DEFAULT_TABLE_SHARE` = 750 px).
+const NARROW: f32 = 1000.;
+
 fn task(uid: i32, days: i64, level: u32) -> Task {
     Task {
         uid,
@@ -153,8 +157,8 @@ fn leveling_delays_leaves_and_rolls_up_the_summary() {
 #[test]
 fn horizontal_offsets_clamp_on_keys_resize_and_schedule_changes() {
     let mut v = ProjectView::new(editor(vec![task(1, 60, 1)]).project().clone(), false);
-    v.layout(1180.);
-    assert_eq!(v.table_w, 590.);
+    v.layout(NARROW);
+    assert_eq!(v.table_w, 750.);
     v.pan_gantt(true);
     assert_eq!(v.gantt_x.get(), DAY_W);
     assert!(v.key("right", false));
@@ -164,12 +168,12 @@ fn horizontal_offsets_clamp_on_keys_resize_and_schedule_changes() {
         v.pan_gantt(true);
         v.key("right", false);
     }
-    assert_eq!(v.table_x.get(), TABLE_W - 590.);
-    assert_eq!(v.gantt_w, 568.);
-    assert_eq!(v.gantt_x.get(), v.scale.width() - 568.);
+    assert_eq!(v.table_x.get(), TABLE_W - 750.);
+    assert_eq!(v.gantt_w, 228.);
+    assert_eq!(v.gantt_x.get(), v.scale.width() - 228.);
     v.ed.set_duration(1, "1d").unwrap();
-    v.layout(1180.);
-    assert_eq!(v.gantt_x.get(), 92.);
+    v.layout(NARROW);
+    assert_eq!(v.gantt_x.get(), 432.);
     // Wide enough for the whole table: nothing left to scroll.
     v.layout(2. * TABLE_W + 400.);
     assert_eq!((v.table_x.get(), v.gantt_x.get()), (0., 0.));
@@ -179,10 +183,11 @@ fn horizontal_offsets_clamp_on_keys_resize_and_schedule_changes() {
     }
     assert_eq!((v.table_x.get(), v.gantt_x.get()), (0., 0.));
     for (width, table) in [
-        (460., 320.),
-        (800., 400.),
-        (1180., 590.),
-        (2000., 1000.),
+        (600., 450.),
+        (800., 600.),
+        (1180., TABLE_W),
+        (1000., 750.),
+        (2000., TABLE_W),
         (2400., TABLE_W),
     ] {
         assert_eq!(table_pane_width(width), table);
@@ -230,7 +235,7 @@ fn split_table_width_clamps_to_the_table_and_chart_minimums() {
 fn set_split_moves_the_divider_and_keeps_the_width_invariant() {
     let mut v = ProjectView::new(editor(vec![task(1, 60, 1)]).project().clone(), false);
     v.layout(1180.);
-    assert_eq!((v.split, v.table_w), (None, 590.));
+    assert_eq!((v.split, v.table_w), (None, TABLE_W));
     for (split, table) in [(690., 690.), (-500., MIN_TABLE_W), (5000., TABLE_W)] {
         v.set_split(split);
         assert_eq!((v.split, v.table_w), (Some(table), table));
@@ -241,7 +246,7 @@ fn set_split_moves_the_divider_and_keeps_the_width_invariant() {
     assert_eq!((v.table_w, v.gantt_w), (330., MIN_CHART_W));
     // ...and a window too narrow for both keeps the ID column.
     v.layout(100.);
-    assert_eq!((v.table_w, v.gantt_w), (MIN_TABLE_W, 30.));
+    assert_eq!((v.table_w, v.gantt_w), (MIN_TABLE_W, 32.));
     v.layout(1180.);
     assert_eq!(v.table_w, TABLE_W);
 }
@@ -249,12 +254,13 @@ fn set_split_moves_the_divider_and_keeps_the_width_invariant() {
 #[test]
 fn a_split_drag_does_not_reveal_the_selected_column() {
     let mut v = ProjectView::new(editor(vec![task(1, 60, 1)]).project().clone(), false);
-    v.layout(1180.);
-    assert_eq!(v.col, COL_NAME);
-    // Scroll the Name column (178..418) out of view, then drag the split.
+    v.layout(900.);
+    // At this width only the ID column (0..46) can scroll wholly out of view.
+    v.col = COL_ID;
+    // Scroll the ID column out of view, then drag the split.
     v.table_x.set(TABLE_W - v.table_w);
     v.set_split(700.);
-    // Only clamped to the wider pane's range, not brought back to 178.
+    // Only clamped to the wider pane's range, not brought back to 0.
     assert_eq!(v.table_x.get(), TABLE_W - 700.);
     v.layout(1180.);
     assert_eq!(v.table_x.get(), TABLE_W - 700.);
@@ -264,7 +270,7 @@ fn a_split_drag_does_not_reveal_the_selected_column() {
     // One that narrows the table pane does.
     v.layout(700.);
     assert_eq!(v.table_w, 630.);
-    assert_eq!(v.table_x.get(), 178.);
+    assert_eq!(v.table_x.get(), 0.);
 }
 
 #[test]
@@ -281,7 +287,7 @@ fn a_split_survives_frames_and_resizes_and_double_click_resets_it() {
     assert!(state.contains(&("table_w".into(), ctlcore::json::Json::Num(700.))));
     assert!(state.contains(&("gantt_w".into(), ctlcore::json::Json::Num(458.))));
     v.reset_split();
-    assert_eq!((v.split, v.table_w), (None, 590.));
+    assert_eq!((v.split, v.table_w), (None, TABLE_W));
     v.layout(2000.);
     assert_eq!(v.table_w, table_pane_width(2000.));
     // Window view state: nothing to undo, nothing to save.
@@ -319,7 +325,7 @@ fn pane_scroll_maps_gpui_offsets_and_clamps_both_ends() {
 #[test]
 fn table_and_chart_scrollbars_move_only_their_own_pane() {
     let mut v = ProjectView::new(editor(vec![task(1, 60, 1)]).project().clone(), false);
-    v.layout(1180.);
+    v.layout(NARROW);
     // The handles project_el renders.
     let (table, chart) = v.pane_scrolls();
     assert_eq!(
@@ -332,31 +338,32 @@ fn table_and_chart_scrollbars_move_only_their_own_pane() {
         (v.scale.width(), v.gantt_w),
         "the chart bar spans the timescale"
     );
-    table.set_offset(point(px(-100.), px(0.)));
-    assert_eq!((v.table_x.get(), v.gantt_x.get()), (100., 0.));
+    table.set_offset(point(px(-90.), px(0.)));
+    assert_eq!((v.table_x.get(), v.gantt_x.get()), (90., 0.));
     chart.set_offset(point(px(-200.), px(0.)));
-    assert_eq!((v.table_x.get(), v.gantt_x.get()), (100., 200.));
+    assert_eq!((v.table_x.get(), v.gantt_x.get()), (90., 200.));
     // Offsets changed by keys show on the bars.
     v.pan_gantt(true);
     assert_eq!(chart.offset(), point(px(-(200. + DAY_W)), px(0.)));
-    assert_eq!(table.offset(), point(px(-100.), px(0.)));
+    assert_eq!(table.offset(), point(px(-90.), px(0.)));
     // The next frame's layout keeps both where they were put.
-    v.layout(1180.);
-    assert_eq!((v.table_x.get(), v.gantt_x.get()), (100., 200. + DAY_W));
+    v.layout(NARROW);
+    assert_eq!((v.table_x.get(), v.gantt_x.get()), (90., 200. + DAY_W));
 }
 
 #[test]
 fn a_table_scrollbar_drag_is_not_undone_by_the_next_frame() {
     let mut v = ProjectView::new(editor(vec![task(1, 60, 1)]).project().clone(), false);
-    v.layout(1180.);
-    assert_eq!(v.col, COL_NAME);
-    // Drag the Name column (178..418) out of view to the left.
+    v.layout(600.);
+    // The ID column (0..46) is the one a scrolled table hides.
+    v.col = COL_ID;
     v.table_x.set(TABLE_W - v.table_w);
-    v.layout(1180.);
+    v.layout(600.);
     assert_eq!(v.table_x.get(), TABLE_W - v.table_w);
-    // A resize still brings the selected column back.
-    v.layout(1000.);
-    assert_eq!(v.table_x.get(), 178.);
+    // A resize still brings the selected column back: clamping alone would
+    // leave the table at TABLE_W - 750, ID still hidden.
+    v.layout(NARROW);
+    assert_eq!(v.table_x.get(), 0.);
 }
 
 #[test]
@@ -424,7 +431,7 @@ fn regions_use_body_origin_clip_both_axes_and_reject_hidden_bars() {
     };
     assert_eq!(
         project_region(&v, &probes, harness::Region::Gantt, Probes::get).unwrap(),
-        rect(416., 80., 378., 400.)
+        rect(616., 80., 178., 400.)
     );
     assert!(
         project_region(&v, &probes, harness::Region::Bar(1), Probes::get)
@@ -438,16 +445,16 @@ fn regions_use_body_origin_clip_both_axes_and_reject_hidden_bars() {
     );
     probes
         .last
-        .push(("bar:1".into(), rect(400., 75., 40., 14.)));
+        .push(("bar:1".into(), rect(600., 75., 40., 14.)));
     assert_eq!(
         project_region(&v, &probes, harness::Region::Bar(1), Probes::get).unwrap(),
-        rect(416., 80., 24., 9.)
+        rect(616., 80., 24., 9.)
     );
     for r in [
-        rect(350., 100., 40., 14.),
-        rect(410., 100., 6., 14.), // divider/inset is outside the chart viewport
-        rect(420., 60., 40., 14.),
-        rect(420., 480., 40., 14.),
+        rect(550., 100., 40., 14.),
+        rect(610., 100., 6., 14.), // divider/inset is outside the chart viewport
+        rect(620., 60., 40., 14.),
+        rect(620., 480., 40., 14.),
         rect(796., 100., 10., 14.), // under the vertical scrollbar, right of the chart
         rect(810., 100., 40., 14.),
     ] {
@@ -1029,19 +1036,19 @@ fn wheel_routes_to_the_pane_under_the_pointer_at_the_split_bar_middle() {
 #[test]
 fn wheel_clamps_like_clamp_offsets_and_reports_no_change_at_an_edge() {
     let mut v = ProjectView::new(editor(vec![task(1, 60, 1)]).project().clone(), false);
-    v.layout(1180.);
-    assert_eq!((v.table_w, v.gantt_w), (590., 568.));
+    v.layout(NARROW);
+    assert_eq!((v.table_w, v.gantt_w), (750., 228.));
     // At the left edge a leftward wheel is a no-op.
     assert!(!v.wheel(10., 40.));
-    assert!(!v.wheel(700., 40.));
+    assert!(!v.wheel(800., 40.));
     assert_eq!((v.table_x.get(), v.gantt_x.get()), (0., 0.));
     // Far right clamps to content - viewport.
     assert!(v.wheel(10., -100_000.));
-    assert!(v.wheel(700., -100_000.));
-    assert_eq!(v.table_x.get(), TABLE_W - 590.);
-    assert_eq!(v.gantt_x.get(), v.scale.width() - 568.);
+    assert!(v.wheel(800., -100_000.));
+    assert_eq!(v.table_x.get(), TABLE_W - 750.);
+    assert_eq!(v.gantt_x.get(), v.scale.width() - 228.);
     assert!(!v.wheel(10., -10.));
-    assert!(!v.wheel(700., -10.));
+    assert!(!v.wheel(800., -10.));
     // Wide enough for the whole table: the table has nothing to scroll.
     v.layout(2. * TABLE_W + 400.);
     assert_eq!(v.table_x.get(), 0.);

@@ -30444,6 +30444,9 @@ mod move_vert_tests {
 
 // ---- doc rendering (theme-aware) -------------------------------------------
 
+/// The size of the first window (and of the harness's), in px.
+const DEFAULT_WINDOW: (f32, f32) = (1180., 800.);
+
 fn hsla_u(c: u32) -> Hsla {
     rgb(c).into()
 }
@@ -43098,7 +43101,7 @@ fn main() {
         // After the registry: Dock Quit's answer reads its handles (#1229).
         #[cfg(target_os = "macos")]
         macos_menu::install(cx);
-        let bounds = Bounds::centered(None, size(px(1180.), px(800.)), cx);
+        let bounds = Bounds::centered(None, size(px(DEFAULT_WINDOW.0), px(DEFAULT_WINDOW.1)), cx);
         let options = window_options(bounds, want_harness);
         open_docxy_window(
             cx,

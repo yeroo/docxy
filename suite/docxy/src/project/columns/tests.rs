@@ -117,9 +117,9 @@ fn resizing_a_column_does_not_scroll_the_table_back_to_the_cursor_column() {
     let mut v = view();
     v.layout(900.);
     v.col = COL_ID;
-    v.table_x.set(200.);
+    v.table_x.set(150.);
     assert!(v.set_column_width(COL_RESOURCES, 150.));
-    assert_eq!(v.table_x.get(), 200., "the offset stays (only re-clamped)");
+    assert_eq!(v.table_x.get(), 150., "the offset stays (only re-clamped)");
 }
 
 #[test]

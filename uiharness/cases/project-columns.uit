@@ -8,23 +8,23 @@
 test project dragging a heading edge resizes only that column and undo restores it
   open copy:../fixtures/project-filter.xml
   call rows {}
-  assert reply.widths.Name is 240
-  assert reply.widths.Duration is 80
+  assert reply.widths.Name is 140
+  assert reply.widths.Duration is 90
   # The heading is pressed where the frame on screen drew it: draw one first.
   shot window
   call pointer-drag {"from":"project-heading-edge:Name","to":"project-heading-edge:Name","offset":[-60,0]}
   call rows {}
-  assert reply.widths.Name is 180
-  assert reply.widths.Duration is 80
-  assert reply.widths.Start is 100
+  assert reply.widths.Name is 80
+  assert reply.widths.Duration is 90
+  assert reply.widths.Start is 94
   # The press and the drag never selected the column or a cell.
   assert selection is none
   key ctrl+z
   call rows {}
-  assert reply.widths.Name is 240
+  assert reply.widths.Name is 140
   key ctrl+y
   call rows {}
-  assert reply.widths.Name is 180
+  assert reply.widths.Name is 80
 
 test project a drag stops at the narrowest and widest a column may be
   open copy:../fixtures/project-filter.xml
@@ -38,9 +38,9 @@ test project double-clicking a heading edge is Best Fit
   shot window
   call pointer-click {"region":"project-heading-edge:Duration","double":true}
   call rows {}
-  assert reply.widths.Duration is not 80
-  assert reply.widths.Name is 240
+  assert reply.widths.Duration is not 90
+  assert reply.widths.Name is 140
   assert status is Duration column set to Best Fit
   key ctrl+z
   call rows {}
-  assert reply.widths.Duration is 80
+  assert reply.widths.Duration is 90

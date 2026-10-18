@@ -751,7 +751,8 @@ pub(crate) fn project_cell_press(tab: &mut DocTab, row: usize, col: usize, shift
     complete_project(tab, true);
 }
 
-/// A right press on column `col`'s heading (#1208), before its menu opens:
+/// A left (#1534) or right (#1208) press on column `col`'s heading, before
+/// the right press's menu opens:
 /// it commits an open cell edit as any press does (a refused commit keeps
 /// the edit and its status, and selects nothing), then selects the column over
 /// every shown task, as Project does. The cursor is the column's first
@@ -768,24 +769,8 @@ pub(crate) fn project_column_select(tab: &mut DocTab, col: usize) {
     let Surface::Project(v) = &mut tab.surface else {
         return;
     };
-    let col = col.min(COLUMN_COUNT - 1);
     v.drag_made_range = false;
-    v.row_drag = false;
-    v.row_header = false;
-    let rows = v.ed.display_rows();
-    match (rows.first().copied(), rows.last().copied()) {
-        (Some(first), Some(last)) => {
-            let last_uid = v.ed.project().tasks[last].uid;
-            v.select_row(first);
-            v.anchor = Some((last_uid, col));
-        }
-        _ => {
-            v.anchor = None;
-            v.enter_entry_row();
-        }
-    }
-    v.col = col;
-    v.reveal_col();
+    v.select_column(col);
     complete_project(tab, false);
 }
 

@@ -400,3 +400,27 @@ fn the_box_follows_every_way_the_chart_scrolls() {
     assert!(v.wheel(chart, -3. * DAY_W));
     assert_ne!(v.timeline_box(), at_start, "Shift+wheel");
 }
+
+/// `uiharness/cases/project-timeline-view.uit` asserts these at the harness
+/// window (1180 px): the table takes its 847 px, so the chart shows 15 days.
+#[test]
+fn the_view_box_of_the_timeline_view_fixture_at_the_default_window() {
+    let xml = include_str!("../../../../../uiharness/fixtures/project-timeline-view.xml");
+    let project = projcore::mspdi::read_mspdi(xml).unwrap();
+    let mut t = new_project_tab("Project1");
+    t.surface = Surface::Project(ProjectView::new(project, false));
+    vm(&mut t).layout(1180.);
+    let view = |t: &mut DocTab| {
+        let v = vm(t);
+        let (first, last) = view_days(TimelineSpan::of(&v.ed), v.scale, v.gantt_x.get(), v.gantt_w);
+        let date = |d: i64| project_date(DateTime::from_minutes(d * 1440));
+        (date(first), date(last))
+    };
+    assert_eq!(vm(&mut t).gantt_w, 311.);
+    assert_eq!(view(&mut t), ("Mon 1/5/26".into(), "Mon 1/19/26".into()));
+    let last = vm(&mut t).ed.project().tasks.len() - 1;
+    vm(&mut t).ed.select(last);
+    apply_project_act(&mut t, ProjectAct::ScrollToTask);
+    assert_eq!(vm(&mut t).ed.project().tasks[last].name, "Late");
+    assert_eq!(view(&mut t), ("Sun 3/1/26".into(), "Sun 3/15/26".into()));
+}
