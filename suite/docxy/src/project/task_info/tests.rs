@@ -43,9 +43,12 @@ fn set(t: &mut DocTab, name: &str, value: Json) {
         .controls
         .iter()
         .find(|c| c.name == name)
-        .and_then(|c| c.page)
-        .unwrap();
-    t.dialogs.select_tab(TABS[page]).unwrap();
+        .unwrap()
+        .page;
+    // The top row (Name, Duration, Estimated) is on every page.
+    if let Some(page) = page {
+        t.dialogs.select_tab(TABS[page]).unwrap();
+    }
     t.dialogs
         .set(name, &Json::obj(vec![("value", value)]))
         .unwrap();
@@ -529,4 +532,204 @@ fn a_percent_that_contradicts_the_actuals_is_refused() {
     let err = dialog_click(&mut t, "OK").unwrap_err();
     assert!(err.contains("actual start"), "{err}");
     assert_eq!(state(&t), before.0);
+}
+
+fn tab_named(t: &DocTab) -> String {
+    t.dialogs.top().unwrap().tabs[t.dialogs.top().unwrap().tab].clone()
+}
+
+#[test]
+fn the_top_row_is_one_value_on_every_page() {
+    let mut t = tab();
+    open(&mut t, ProjectAct::Constraint);
+    let top = ["name", "duration", "estimated"];
+    for name in top {
+        let c = t
+            .dialogs
+            .top()
+            .unwrap()
+            .controls
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap();
+        assert_eq!(c.page, None, "{name} sits on every page");
+    }
+    put(&mut t, "name", "Renamed");
+    for tab in TABS {
+        t.dialogs.select_tab(tab).unwrap();
+        let shown: Vec<_> = t
+            .dialogs
+            .top()
+            .unwrap()
+            .page_controls()
+            .map(|c| c.name)
+            .collect();
+        for name in top {
+            assert!(shown.contains(&name), "{name} on {tab}");
+        }
+        assert_eq!(read(&t, "name"), "Renamed", "{tab}");
+    }
+    assert_eq!(tab_named(&t), "Notes");
+    dialog_click(&mut t, "OK").unwrap();
+    assert_eq!(v(&t).ed.project().task(2).unwrap().name, "Renamed");
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+}
+
+#[test]
+fn estimated_is_the_question_mark_on_the_duration() {
+    let mut t = tab();
+    open(&mut t, ProjectAct::Constraint);
+    assert_eq!(read(&t, "estimated"), "unchecked");
+    set(&mut t, "estimated", Json::Bool(true));
+    assert_eq!(read(&t, "duration"), "2d?");
+    // Typing the mark ticks the box, and removing it clears the box.
+    put(&mut t, "duration", "3d");
+    assert_eq!(read(&t, "estimated"), "unchecked");
+    put(&mut t, "duration", "3d?");
+    assert_eq!(read(&t, "estimated"), "checked");
+    set(&mut t, "estimated", Json::Bool(false));
+    assert_eq!(read(&t, "duration"), "3d");
+    set(&mut t, "estimated", Json::Bool(true));
+    dialog_click(&mut t, "OK").unwrap();
+    let task = v(&t).ed.project().task(2).unwrap();
+    assert_eq!((task.duration_min, task.estimated), (3 * 480, Some(true)));
+    // An estimated duration opens with its box ticked, and clearing it
+    // writes a committed duration.
+    open(&mut t, ProjectAct::Constraint);
+    assert_eq!(read(&t, "estimated"), "checked");
+    set(&mut t, "estimated", Json::Bool(false));
+    dialog_click(&mut t, "OK").unwrap();
+    assert_eq!(v(&t).ed.project().task(2).unwrap().estimated, Some(false));
+    // Nothing to estimate: the box refuses to tick a blank duration.
+    open(&mut t, ProjectAct::Constraint);
+    put(&mut t, "duration", "");
+    set(&mut t, "estimated", Json::Bool(true));
+    assert_eq!(read(&t, "estimated"), "unchecked");
+}
+
+#[test]
+fn schedule_mode_and_inactive_apply_and_a_refusal_takes_the_rest_back() {
+    let mut t = tab();
+    open(&mut t, ProjectAct::Constraint);
+    assert_eq!(read(&t, "mode"), "Auto Scheduled");
+    put(&mut t, "mode", "Manually Scheduled");
+    set(&mut t, "inactive", Json::Bool(true));
+    dialog_click(&mut t, "OK").unwrap();
+    let task = v(&t).ed.project().task(2).unwrap();
+    assert!(task.manual && !task.is_active());
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    open(&mut t, ProjectAct::Constraint);
+    assert_eq!(read(&t, "mode"), "Manually Scheduled");
+    assert_eq!(read(&t, "inactive"), "checked");
+    set(&mut t, "inactive", Json::Bool(false));
+    put(&mut t, "mode", "Auto Scheduled");
+    dialog_click(&mut t, "OK").unwrap();
+    let task = v(&t).ed.project().task(2).unwrap();
+    assert!(!task.manual && task.is_active());
+    // A task under an inactive summary cannot be made active again.
+    let mut t = tab();
+    vm(&mut t).ed.indent(2, 1).unwrap();
+    vm(&mut t).ed.set_active(1, false).unwrap();
+    vm(&mut t).ed.select(2);
+    vm(&mut t).ed.mark_saved();
+    t.dirty = false;
+    let before = state(&t);
+    open(&mut t, ProjectAct::Constraint);
+    assert_eq!(read(&t, "inactive"), "checked");
+    set(&mut t, "inactive", Json::Bool(false));
+    put(&mut t, "name", "Kept out");
+    let err = dialog_click(&mut t, "OK").unwrap_err();
+    assert!(err.contains("inactive"), "{err}");
+    assert_eq!(t.dialogs.top_id(), "task-information");
+    assert_eq!(state(&t), before);
+}
+
+#[test]
+fn display_on_timeline_hide_bar_and_rollup_apply() {
+    let mut t = tab();
+    open(&mut t, ProjectAct::Constraint);
+    for name in ["ontimeline", "hidebar", "rollup"] {
+        assert_eq!(read(&t, name), "unchecked", "{name}");
+    }
+    set(&mut t, "ontimeline", Json::Bool(true));
+    set(&mut t, "hidebar", Json::Bool(true));
+    set(&mut t, "rollup", Json::Bool(true));
+    dialog_click(&mut t, "OK").unwrap();
+    let task = v(&t).ed.project().task(2).unwrap();
+    assert_eq!(
+        (task.display_on_timeline, task.hide_bar, task.rollup),
+        (Some(true), Some(true), Some(true))
+    );
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    open(&mut t, ProjectAct::Constraint);
+    for name in ["ontimeline", "hidebar", "rollup"] {
+        assert_eq!(read(&t, name), "checked", "{name}");
+    }
+    set(&mut t, "hidebar", Json::Bool(false));
+    dialog_click(&mut t, "OK").unwrap();
+    let task = v(&t).ed.project().task(2).unwrap();
+    assert_eq!(
+        (task.display_on_timeline, task.hide_bar, task.rollup),
+        (Some(true), Some(false), Some(true))
+    );
+}
+
+#[test]
+fn start_and_finish_are_date_combos_that_pick_from_a_calendar() {
+    let mut t = tab();
+    open(&mut t, ProjectAct::Constraint);
+    let d = t.dialogs.top().unwrap();
+    for name in ["start", "finish"] {
+        let c = d.controls.iter().find(|c| c.name == name).unwrap();
+        assert_eq!(c.kind, ControlKind::DateCombo, "{name}");
+    }
+    assert!(
+        d.controls
+            .iter()
+            .find(|c| c.name == "finish")
+            .unwrap()
+            .beside
+    );
+    let i = d.controls.iter().position(|c| c.name == "start").unwrap();
+    let d = t.dialogs.top_dialog_mut().unwrap();
+    d.toggle_calendar(i).unwrap();
+    let opened_on = d.calendar.unwrap();
+    assert_eq!(
+        opened_on.text(),
+        read_text(d, "start"),
+        "opens on the field"
+    );
+    d.calendar_move(1, true).unwrap();
+    // A Wednesday: a weekend pick would start on the Monday after.
+    d.calendar_day(18, true).unwrap();
+    let picked = read(&t, "start");
+    assert!(picked.ends_with("-18"), "{picked}");
+    dialog_click(&mut t, "OK").unwrap();
+    let ed = &v(&t).ed;
+    let task = ed.project().task(2).unwrap();
+    assert_eq!(cell_edit_text(ed, task, COL_START), picked);
+}
+
+fn read_text(d: &Dialog, name: &str) -> String {
+    d.controls.iter().find(|c| c.name == name).unwrap().text()
+}
+
+#[test]
+fn help_says_what_f1_says_and_leaves_the_dialog_open() {
+    let mut t = tab();
+    open(&mut t, ProjectAct::Constraint);
+    let before = state(&t);
+    let help = t
+        .dialogs
+        .top()
+        .unwrap()
+        .buttons
+        .iter()
+        .find(|b| b.id == "help")
+        .expect("a Help button");
+    assert!(help.enabled);
+    dialog_click(&mut t, "help").unwrap();
+    assert_eq!(t.dialogs.top_id(), "task-information");
+    assert_eq!(t.status.to_string(), crate::help_tab::DOCS_COMING);
+    assert_eq!(state(&t), before, "Help writes nothing");
 }

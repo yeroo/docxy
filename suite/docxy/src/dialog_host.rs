@@ -367,6 +367,10 @@ fn dialog_press(tab: &mut DocTab, button: &str) -> Result<(), String> {
     if let Some(done) = crate::design_dialogs::click(tab, button) {
         return done;
     }
+    // Task Information's Help (#1536).
+    if let Some(done) = crate::project::help_click(tab, button) {
+        return done;
+    }
     // A UI plugin's dialog, or Task Information with plugin pages (#1532).
     if let Some(done) = crate::plugin_ui::dialog_click(tab, button) {
         return done;
