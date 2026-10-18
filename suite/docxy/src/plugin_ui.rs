@@ -817,7 +817,16 @@ fn spec(spec_id: &str) -> Option<&'static ui::DialogSpec> {
 /// its OK sends `command` again with the values.
 fn open_dialog(v: &ProjectView, spec_id: &str, command: &str) -> Result<Dialog, String> {
     let spec = spec(spec_id).ok_or_else(|| format!("No plugin declares the dialog '{spec_id}'"))?;
-    let values = prefill(v, spec_id, v.selected_uid());
+    // The state sees the spec's declared values as the dialog's, so a label
+    // that follows another control reads right from the start (#1610).
+    let declared = Json::Obj(
+        spec.pages
+            .iter()
+            .flat_map(|p| p.controls.iter())
+            .map(|c| (c.name.clone(), c.value.clone()))
+            .collect(),
+    );
+    let values = prefill_with(v, spec_id, v.selected_uid(), Some(declared));
     let values = &values;
     let mut d = Dialog::message(
         catalog::PLUGIN,
@@ -947,8 +956,11 @@ pub(crate) fn refresh_dialog(tab: &mut DocTab) {
         }
         _ => return,
     };
+    // The plan or the selection moved since the dialog last saw them (#1610:
+    // under a modal dialog only its own command moves them, so the state's
+    // values clobber nothing a person is typing).
     let now = (v.ed.revision(), v.selected_uid());
-    let moved = d.modeless && d.seen != Some(now);
+    let moved = d.seen != Some(now);
     if !d.stale && !moved {
         return;
     }
@@ -970,7 +982,11 @@ pub(crate) fn refresh_dialog(tab: &mut DocTab) {
                 );
             }
         }
-        if moved && let Some(value) = p.value(c.name) {
+        // The state's values: every control when the plan moved, a label
+        // (display only) on any refresh, so one may follow another control
+        // (#1610); an editable control keeps what it holds otherwise.
+        let follows = moved || c.kind == dialog::ControlKind::Label;
+        if follows && let Some(value) = p.value(c.name) {
             c.value = value_of(c.kind, &c.items, value);
             if c.kind == dialog::ControlKind::Grid {
                 let rows = match &c.value {
@@ -980,11 +996,10 @@ pub(crate) fn refresh_dialog(tab: &mut DocTab) {
                 c.row = c.row.filter(|r| *r < rows);
             }
         }
-        if moved {
-            // The plugin may keep the selection on the same row of a grid
-            // whose rows just moved (`name.selected_row`).
-            apply_selected_row(c, &p);
-        }
+        // The plugin may keep the selection on the same row of a grid whose
+        // rows just moved, or drop it when a row of another grid was picked
+        // (`name.selected_row`, #1610).
+        apply_selected_row(c, &p);
     }
     for b in &mut d.buttons {
         if let Some(on) = p.enabled(&b.id) {
@@ -1005,6 +1020,9 @@ pub(crate) fn extend_task_info(d: &mut Dialog, v: &ProjectView, uid: i32) {
     };
     let values = prefill(v, "task-information", Some(uid));
     extend_task_info_with(d, spec, &values);
+    // The dialog has seen this plan: a control change applies the state's
+    // items, enabled flags and labels, not its values (#1610).
+    d.seen = Some((v.ed.revision(), v.selected_uid()));
 }
 
 /// [`extend_task_info`] from `spec`, prefilled with `values`.

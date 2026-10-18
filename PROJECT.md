@@ -478,12 +478,17 @@ without one nothing changes.
   state again, with the dialog's `values`, whenever the plan's revision or
   the selection changes and applies its values, items and enabled flags),
   and its `grid` rows select (`values` carry `name.selected_row`, and the
-  state's `values` may move the selection with the same key) and edit
+  state's `values` may move or drop the selection with the same key) and edit
   by hand (a `check` column kind is Project's check mark; a grid with
   `commit_command` sends the command on every cell commit with `edit:
   {control, row, col, value}`, its ops applying at once). A change of any
   plugin control asks the state again with `dialog.values` (#1567) and
-  applies the items and enabled flags.
+  applies the items, the enabled flags, the `label` controls' values (a
+  label may follow another control, #1610; at open the state sees the
+  spec's declared values as `dialog.values`) and `name.selected_row`; when
+  the plan or the selection moved since the dialog last saw them (under a
+  modal dialog, through its own command) every value the state gives
+  applies, so a modal dialog's grid shows the rows its ops made.
 - **Overlay** (`yppx_ui_overlay`): the rows in view (`uid`, `row_y`, the bar
   rectangle, kind flags, since #1548 `name`, `percent_complete`,
   `deadline_x`, `constraint {type, x}` and `resource_names`, and since
