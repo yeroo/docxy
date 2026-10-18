@@ -1284,7 +1284,13 @@ buttons, modeless, active, size, placement, columns}` (the last three the
 layout hints of #1609: `size` `[w, h]` or null, `placement` `bottom` or
 `right`, `columns` the current page's controls per row; a control adds
 `group`, `span`, `min_rows`, `fill` when set, `header: true` when it is
-drawn above every page, and a `sample` control its parsed `sample` style). `id` is stable (`delete-summary`), `depth` counts from 1, `text` is
+drawn above every page, and a `sample` control its parsed `sample` style). A
+grid that scrolls (more rows than `min_rows`) reports `first_visible_row`, and
+a filling `multiline` `first_visible_line`: the row or line at the top of its
+scroll as of the last frame, present only while the control scrolls; the
+scroll is applied at the next paint, so take a `shot window` before reading
+them (#1609). The same fields come back from `dialog-set`, `dialog-select` and
+`dialog-tab`; a greyed Help is refused like any button. `id` is stable (`delete-summary`), `depth` counts from 1, `text` is
 a message box's message (null otherwise), and `tab` is the current tab's label
 (null for a dialog without tabs). Each button is `{id, label, enabled, default}`
 (`id` the folded label, or the one a UI plugin's spec gives; `dialog-click`

@@ -300,12 +300,15 @@ pub unsafe extern "C" fn yppx_ui_state(input: *const u8, len: usize, out: *mut Y
                 })
                 .map_or("null".to_string(), |i| i.to_string());
             let n_val: f64 = n.parse().unwrap_or(0.0);
+            // Help is greyed while the number is 0 (#1609: the host refuses a
+            // disabled Help like any button).
             reply.push_str(&format!(
-                r#","values":{{"fixture.echo":{},"fixture.tasks":[{}],"fixture.tasks.selected_row":{selected},"fixture.sample":{{"text":"AaBbYyZz","bold":{},"size":{}}}}}"#,
+                r#","values":{{"fixture.echo":{},"fixture.tasks":[{}],"fixture.tasks.selected_row":{selected},"fixture.sample":{{"text":"AaBbYyZz","bold":{},"size":{}}}}},"enabled":{{"help":{}}}"#,
                 quote(&format!("Number {n} for {name} ({title})")),
                 rows.join(","),
                 n_val as i64 % 2 == 1,
-                12 + (n_val as i64).clamp(0, 12)
+                12 + (n_val as i64).clamp(0, 12),
+                n_val != 0.0
             ));
         }
         if dialog.get("id").and_then(Json::str) == Some("task-information") {

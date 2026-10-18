@@ -2279,19 +2279,14 @@ fn sheet_command_json(
     Json::obj(fields)
 }
 
-/// `last-url`: the URL, the page it opens (before `?`), and whether its
-/// decoded body names this build's commit and leaves the host out (#1021).
-/// `dialog-read`'s reply with the scroll of each scrolling grid
-/// (`first_visible_row`) and filling multiline (`first_visible_line`) of the
-/// top dialog (#1609), from the handles the window keeps; the scroll lands
-/// at the next frame, so settle with a `shot` before reading it.
-fn dialog_read_with_scrolls(app: &mut crate::Docxy) -> Json {
+/// A dialog verb's reply (#1609): `dialog-read`'s JSON with the scroll of
+/// each scrolling grid (`first_visible_row`) and filling multiline
+/// (`first_visible_line`) of the top dialog, from the handles the window
+/// keeps and the row height each was drawn with; the scroll lands at the
+/// next frame, so settle with a `shot` before reading it.
+fn dialog_json(app: &mut crate::Docxy) -> Json {
     let mut json = app.active_dialogs_mut().to_json();
-    let Some(id) = app
-        .active_dialogs()
-        .and_then(|s| s.top())
-        .map(|d| d.id.as_str())
-    else {
+    let Some(epoch) = app.active_dialogs().and_then(|s| s.top()).map(|d| d.epoch) else {
         return json;
     };
     let grids = app.dialog_grids.borrow();
@@ -2308,14 +2303,14 @@ fn dialog_read_with_scrolls(app: &mut crate::Docxy) -> Json {
     for control in controls.iter_mut() {
         let name = control.get_str("name").unwrap_or("").to_string();
         let kind = control.get_str("kind").unwrap_or("").to_string();
-        let Some((handle, _)) = grids
+        let Some(entry) = grids
             .iter()
-            .find(|((d, n), _)| *d == id && **n == *name)
+            .find(|((e, n), _)| *e == epoch && **n == *name)
             .map(|(_, v)| v)
         else {
             continue;
         };
-        let first = (-f32::from(handle.offset().y) / 18.).round().max(0.) as usize;
+        let first = crate::dialog_host::first_visible(entry);
         let key = if kind == "grid" {
             "first_visible_row"
         } else {
@@ -2328,6 +2323,8 @@ fn dialog_read_with_scrolls(app: &mut crate::Docxy) -> Json {
     json
 }
 
+/// `last-url`: the URL, the page it opens (before `?`), and whether its
+/// decoded body names this build's commit and leaves the host out (#1021).
 fn last_url_json(url: Option<&str>) -> Json {
     let Some(url) = url else {
         return Json::obj(vec![
@@ -4549,7 +4546,7 @@ fn dispatch_verb(
         }
         // Dialogs (#393). There is no `dialog-open`: a dialog opens through
         // the verb a person would use (`key`, `ribbon-click`, `click-cell`).
-        "dialog-read" => Done::ok(dialog_read_with_scrolls(app)),
+        "dialog-read" => Done::ok(dialog_json(app)),
         // One field of the open dialog as it is edited and drawn: its text,
         // focus, caret and selection (#1029).
         // A sheet input outside the dialogs (#1200), or the open dialog's
@@ -4589,7 +4586,7 @@ fn dispatch_verb(
             dialogs.set(&control, args)?;
             dialogs.activate(true);
             app.refresh_plugin_dialog();
-            let reply = app.active_dialogs_mut().to_json();
+            let reply = dialog_json(app);
             cx.notify();
             Done::ok(reply)
         }
@@ -4604,7 +4601,7 @@ fn dispatch_verb(
             dialogs.select_row(&control, row)?;
             dialogs.activate(true);
             app.refresh_plugin_dialog();
-            let reply = app.active_dialogs_mut().to_json();
+            let reply = dialog_json(app);
             cx.notify();
             Done::ok(reply)
         }
@@ -4613,7 +4610,7 @@ fn dispatch_verb(
             let dialogs = open_dialogs(app)?;
             dialogs.select_tab(&tab)?;
             dialogs.activate(true);
-            let reply = dialogs.to_json();
+            let reply = dialog_json(app);
             cx.notify();
             Done::ok(reply)
         }

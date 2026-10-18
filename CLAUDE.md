@@ -436,8 +436,10 @@
   width), `Control::min_rows` (a grid's visible rows; a plugin grid draws
   8, more scroll behind a `Scrollbar`), `Control::fill` (`Dialog::fills`: a
   multiline fills a sized dialog and scrolls its lines, the caret's kept in
-  view; grids and filling multilines share `GridScrolls`, which
-  `dialog-read` reports as `first_visible_row` / `first_visible_line`),
+  view; grids and filling multilines share `GridScrolls`, keyed by
+  `Dialog::epoch` so a reopened dialog starts afresh, each entry with the
+  row height it was drawn with; the dialog verbs report them as
+  `first_visible_row` / `first_visible_line`),
   `ControlKind::Sample` (a read-only box drawn by `plugin_ui::styled` from
   the formatting model's `TextStyle`) and `Control::header` (a spec's
   header control, listed last, drawn first on every page and first in the
@@ -445,8 +447,8 @@
   press sends the command with `button`, the dialog stays open unless the
   reply's `close`); `help` is the host's: the window's press opens the
   spec's `help` URL through `open_help_url` (recorded for `last-url`), else
-  says `DOCS_COMING`, `plugin_ui::dialog_click` answers any other path the
-  same way, and it is never the default, so it never reaches the plugin. It
+  says `DOCS_COMING`, any direct `dialog_click` press says `DOCS_COMING`, and it is
+  never the default or the cancel button, so it never reaches the plugin. It
   may be `modeless` (no backdrop, `Dialog::active` decides who has
   the keys: a press in the table takes them, a dialog press gives them
   back; mutating control verbs `clear_modal` and keep it; `refuse_under_dialog`

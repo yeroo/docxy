@@ -144,7 +144,15 @@ test the button's command opens the plugin's dialog, whose OK sends the values b
   assert reply.controls.4.fill is true
   shot window
   # Help is the host's: this spec names no page, so the status says so and
-  # the dialog stays.
+  # the dialog stays. The state greys Help while the number is 0, and the
+  # press is refused like any disabled button.
+  call dialog-set {"control":"n","value":0}
+  call dialog-read {}
+  assert reply.buttons.2.enabled is false
+  call-error dialog-click {"button":"Help"} => 'Help' is disabled
+  call last-url {}
+  assert reply.url is null
+  call dialog-set {"control":"n","value":1}
   call dialog-click {"button":"Help"}
   assert dialog is plugin
   assert status is Help: the documentation is coming soon
@@ -181,10 +189,28 @@ test the button's command opens the plugin's dialog, whose OK sends the values b
   call real-type {"text":"seven"}
   call real-key {"key":"enter"}
   call real-type {"text":"eight"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"nine"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"ten"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"eleven"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"twelve"}
   shot window
   call dialog-read {}
-  # Eight lines in a box of about four: the caret's line is in view.
-  assert reply.controls.4.first_visible_line is 4
+  # Twelve lines of 16 px in a box of about four: the caret's line is in
+  # view (a grid's 18 px divisor would say 8).
+  assert reply.controls.4.first_visible_line is 9
+  # Focus elsewhere leaves the box's scroll alone, and coming back keeps it.
+  call real-key {"key":"tab"}
+  shot window
+  call dialog-read {}
+  assert reply.controls.4.first_visible_line is 9
+  call real-key {"key":"shift+tab"}
+  shot window
+  call dialog-read {}
+  assert reply.controls.4.first_visible_line is 9
   # The grid lists the plan's tasks with the selected one's row selected
   # (the state's name.selected_row).
   assert reply.controls.2.name is fixture.tasks

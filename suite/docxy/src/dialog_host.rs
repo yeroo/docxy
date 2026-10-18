@@ -7,16 +7,27 @@ use crate::dialog::{self, ControlKind, Dialog, DialogOwner, DialogStack, NONE_OP
 use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Each list of the top dialog: its scroll, and the choice last scrolled to.
-pub(crate) type ListScrolls = std::collections::HashMap<
-    (&'static str, &'static str),
-    (UniformListScrollHandle, Option<usize>),
->;
+/// Each list of the top dialog, by the dialog's epoch and the control's
+/// name: its scroll, and the choice last scrolled to.
+pub(crate) type ListScrolls =
+    std::collections::HashMap<(u64, &'static str), (UniformListScrollHandle, Option<usize>)>;
 
-/// Each scrolling grid or filling multiline of the top dialog (#1609): its
-/// scroll, and the row (or caret line) last scrolled to.
+/// Each scrolling grid or filling multiline of the top dialog (#1609), by the
+/// dialog's epoch and the control's name: its scroll, the row (or caret
+/// line) last scrolled to, and the row height the offset counts in, so a
+/// read-back (`first_visible_row` / `first_visible_line`) divides by what
+/// the draw code laid out.
 pub(crate) type GridScrolls =
-    std::collections::HashMap<(&'static str, &'static str), (ScrollHandle, Option<usize>)>;
+    std::collections::HashMap<(u64, &'static str), (ScrollHandle, Option<usize>, f32)>;
+
+/// The first row (or line) a scrolling control shows, from its handle's
+/// offset and the row height it was drawn with (#1609).
+pub(crate) fn first_visible(entry: &(ScrollHandle, Option<usize>, f32)) -> usize {
+    let (handle, _, row_h) = entry;
+    (-f32::from(handle.offset().y) / row_h.max(1.))
+        .round()
+        .max(0.) as usize
+}
 
 /// The scroll for grid or multiline `name` of dialog `id`, kept across
 /// frames; when `row` (the selected row, the caret's line) is not the one
@@ -26,14 +37,15 @@ pub(crate) type GridScrolls =
 /// list. A wheel scroll that leaves the row alone is not undone.
 fn grid_scroll(
     grids: &mut GridScrolls,
-    key: (&'static str, &'static str),
+    key: (u64, &'static str),
     row: Option<usize>,
     row_h: f32,
     view_h: Option<f32>,
 ) -> ScrollHandle {
-    let (handle, seen) = grids
+    let (handle, seen, stored_h) = grids
         .entry(key)
-        .or_insert_with(|| (ScrollHandle::new(), None));
+        .or_insert_with(|| (ScrollHandle::new(), None, row_h));
+    *stored_h = row_h;
     if row != *seen {
         if let Some(r) = row {
             let view = view_h
@@ -67,7 +79,7 @@ fn est_text_w(chars: usize) -> f32 {
 /// while a wheel scroll that leaves the choice alone is not undone.
 fn list_scroll(
     lists: &mut ListScrolls,
-    key: (&'static str, &'static str),
+    key: (u64, &'static str),
     chosen: Option<usize>,
 ) -> UniformListScrollHandle {
     let (handle, seen) = lists
@@ -809,18 +821,12 @@ impl Docxy {
         let DialogOwner::Plugin { spec, .. } = top.owner else {
             return None;
         };
-        let pressed = top.buttons.iter().find(|b| {
-            dialog::fold_label(&b.label) == dialog::fold_label(button)
-                || b.id.eq_ignore_ascii_case(button.trim())
-        })?;
+        let pressed = top.find_button(button)?;
         if !pressed.id.eq_ignore_ascii_case("help") {
             return None;
         }
-        if !pressed.enabled {
-            return Some(Err(format!(
-                "'{}' is disabled",
-                dialog::shown(&pressed.label)
-            )));
+        if let Err(e) = Dialog::refuse_disabled(pressed) {
+            return Some(Err(e));
         }
         match crate::plugin_ui::help_url(spec) {
             Some(url) => self.open_help_url(url, cx),
@@ -991,15 +997,21 @@ impl Docxy {
                     start = end + 1;
                 }
                 // The lines are 16 px each; the box's height is the frame's.
+                // Only this box's own caret, while it is focused, drives the
+                // scroll (`caret_at` is the focused control's); unfocused it
+                // keeps its offset.
                 let scroll = fill.then(|| {
                     grid_scroll(
                         &mut self.dialog_grids.borrow_mut(),
-                        (d.id.as_str(), c.name),
-                        Some(caret_line),
+                        (d.epoch, c.name),
+                        focused.then_some(caret_line),
                         16.,
                         None,
                     )
                 });
+                if !fill {
+                    self.dialog_grids.borrow_mut().remove(&(d.epoch, c.name));
+                }
                 v_flex()
                     .id(("dialog-control", i))
                     .gap_1()
@@ -1151,12 +1163,17 @@ impl Docxy {
                 let scroll = scrolls.then(|| {
                     grid_scroll(
                         &mut self.dialog_grids.borrow_mut(),
-                        (d.id.as_str(), c.name),
+                        (d.epoch, c.name),
                         sel_row,
                         18.,
                         Some(body_h),
                     )
                 });
+                // A grid that stopped scrolling (rows deleted under it) reports
+                // no scroll.
+                if !scrolls {
+                    self.dialog_grids.borrow_mut().remove(&(d.epoch, c.name));
+                }
                 v_flex()
                     .id(("dialog-control", i))
                     .gap_1()
@@ -1391,7 +1408,7 @@ impl Docxy {
                 };
                 let scroll = list_scroll(
                     &mut self.dialog_lists.borrow_mut(),
-                    (d.id.as_str(), c.name),
+                    (d.epoch, c.name),
                     chosen,
                 );
                 let list = uniform_list(
@@ -1557,13 +1574,14 @@ impl Docxy {
     /// so the pointer cannot reach anything under it.
     pub(crate) fn dialog_overlay(&self, pal: Pal, cx: &mut Context<Self>) -> Option<AnyElement> {
         let d = self.active_dialogs()?.top()?;
-        // Another dialog's lists start again at the top when it next shows.
+        // The scrolls belong to this opening of this dialog (#1609: every
+        // plugin dialog shares one id, and a reopened dialog starts afresh).
         self.dialog_lists
             .borrow_mut()
-            .retain(|(id, _), _| *id == d.id.as_str());
+            .retain(|(epoch, _), _| *epoch == d.epoch);
         self.dialog_grids
             .borrow_mut()
-            .retain(|(id, _), _| *id == d.id.as_str());
+            .retain(|(epoch, _), _| *epoch == d.epoch);
         let tabs = (!d.tabs.is_empty()).then(|| {
             h_flex()
                 .gap_3()
@@ -1780,7 +1798,7 @@ mod tests {
     #[test]
     fn a_list_scrolls_a_changed_choice_into_view_once() {
         let mut lists = ListScrolls::default();
-        let key = ("consolidate", "refs");
+        let key = (1, "refs");
         let pending = |h: &UniformListScrollHandle| {
             h.0.borrow_mut()
                 .deferred_scroll_to_item
@@ -1796,7 +1814,7 @@ mod tests {
         assert_eq!(pending(&again), None, "the same choice: left alone");
         let h = list_scroll(&mut lists, key, Some(0));
         assert_eq!(pending(&h), Some(0));
-        let other = list_scroll(&mut lists, ("goto", "names"), Some(3));
+        let other = list_scroll(&mut lists, (2, "names"), Some(3));
         assert!(!std::rc::Rc::ptr_eq(&h.0, &other.0));
     }
 

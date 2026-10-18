@@ -977,7 +977,7 @@ fn rows_json(rows: &[Vec<String>]) -> Json {
 }
 
 /// A label as it is drawn: without its `&` accelerator mark.
-pub(crate) fn shown(label: &str) -> String {
+fn shown(label: &str) -> String {
     label.replace('&', "")
 }
 
@@ -990,11 +990,6 @@ fn fold(label: &str) -> String {
         .trim_end_matches(':')
         .trim()
         .to_lowercase()
-}
-
-/// [`fold`], for the dialogs' owners outside this module.
-pub(crate) fn fold_label(label: &str) -> String {
-    fold(label)
 }
 
 /// One band of a laid-out dialog page (#1609, [`Dialog::layout_rows`]): the
@@ -1068,6 +1063,16 @@ pub(crate) struct Dialog {
     pub buttons_right: bool,
     /// Controls per row, per page (#1609): a page not listed has one.
     pub page_columns: Vec<u8>,
+    /// Which opening of a dialog this is (#1609): every dialog built gets
+    /// the next number, so the window's per-dialog state (list and grid
+    /// scrolls) belongs to one opening and starts afresh on the next.
+    pub epoch: u64,
+}
+
+/// The next dialog epoch (see [`Dialog::epoch`]).
+fn next_epoch() -> u64 {
+    static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// See [`Dialog::react`]. Two dialogs compare equal whatever their
@@ -1155,6 +1160,7 @@ impl Dialog {
             size: None,
             buttons_right: false,
             page_columns: Vec::new(),
+            epoch: next_epoch(),
         }
     }
 
@@ -1992,6 +1998,23 @@ impl Dialog {
         Ok(())
     }
 
+    /// The button `want` names (#1602): its label as a person reads it,
+    /// `&` and case aside, or its id.
+    pub fn find_button(&self, want: &str) -> Option<&Button> {
+        self.buttons
+            .iter()
+            .find(|b| fold(&b.label) == fold(want) || b.id.eq_ignore_ascii_case(want.trim()))
+    }
+
+    /// The one refusal a disabled button gives, whatever pressed it.
+    pub fn refuse_disabled(b: &Button) -> Result<(), String> {
+        if b.enabled {
+            Ok(())
+        } else {
+            Err(format!("'{}' is disabled", shown(&b.label)))
+        }
+    }
+
     fn button_index(&self, want: &str) -> Result<usize, String> {
         let i = self
             .buttons
@@ -2001,9 +2024,7 @@ impl Dialog {
                 let labels: Vec<String> = self.buttons.iter().map(|b| shown(&b.label)).collect();
                 format!("no button '{want}'; buttons: {}", labels.join(", "))
             })?;
-        if !self.buttons[i].enabled {
-            return Err(format!("'{}' is disabled", shown(&self.buttons[i].label)));
-        }
+        Self::refuse_disabled(&self.buttons[i])?;
         Ok(i)
     }
 
@@ -2295,6 +2316,7 @@ mod tests_support {
             size: None,
             buttons_right: false,
             page_columns: Vec::new(),
+            epoch: next_epoch(),
         }
     }
 }

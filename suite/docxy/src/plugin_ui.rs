@@ -848,9 +848,16 @@ fn apply_selected_row(c: &mut dialog::Control, prefill: &Prefill) {
 }
 
 /// A spec's button as the dialog holds it (#1602): a `help` button is the
-/// host's and never the default, so Enter cannot name it (#1609).
+/// host's, never the default and never the cancel button, so neither Enter
+/// nor Escape can name it (#1609); the spec's `default` and `cancel` on it
+/// are ignored.
 fn button_of_spec(b: &ui::DialogButton, role: dialog::ButtonRole) -> dialog::Button {
     let help = b.id.eq_ignore_ascii_case("help");
+    let role = if help {
+        dialog::ButtonRole::Apply
+    } else {
+        role
+    };
     dialog::Button {
         id: b.id.clone(),
         default: b.default && !help,
@@ -1145,22 +1152,17 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Option<Result<(), 
         DialogOwner::TaskInfo { .. } if top.controls.iter().any(|c| c.plugin) => None,
         _ => return None,
     };
-    let pressed = top.buttons.iter().find(|b| {
-        crate::dialog::fold_label(&b.label) == crate::dialog::fold_label(button)
-            || b.id.eq_ignore_ascii_case(button.trim())
-    });
-    // Help is the host's (#1609): the window's press opens the spec's page
-    // (`Docxy::plugin_help_click`, before this); any other path (Enter on
-    // a Help the spec marked default, a harness press) says the
-    // documentation is coming. Nothing reaches the plugin.
+    let pressed = top.find_button(button);
+    // Help is the host's (#1609): the window's press, which the harness's
+    // `dialog-click` goes through too, opens the spec's page first
+    // (`Docxy::plugin_help_click`), and Help is never the default or the
+    // cancel button, so no key reaches here. A direct press that still does
+    // says the documentation is coming and never becomes a command.
     if let Some(b) = pressed
         && b.id.eq_ignore_ascii_case("help")
     {
-        if !b.enabled {
-            return Some(Err(format!(
-                "'{}' is disabled",
-                crate::dialog::shown(&b.label)
-            )));
+        if let Err(e) = Dialog::refuse_disabled(b) {
+            return Some(Err(e));
         }
         tab.status = crate::help_tab::DOCS_COMING.into();
         return Some(Ok(()));

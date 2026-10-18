@@ -121,6 +121,7 @@ fn form() -> Dialog {
         size: None,
         buttons_right: false,
         page_columns: Vec::new(),
+        epoch: 0,
     };
     d.controls = d.controls.into_iter().map(general).collect();
     preds.page = Some(1);

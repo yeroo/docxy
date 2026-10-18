@@ -415,6 +415,15 @@ fn help_is_the_hosts_never_the_default_and_never_a_command() {
     };
     let b = button_of_spec(&spec, dialog::ButtonRole::Apply);
     assert!(!b.default && b.id == "help");
+    // Nor the cancel button: Escape names nothing when Help is the only
+    // one a spec marked cancel.
+    let cancelling = ui::DialogButton {
+        cancel: true,
+        default: false,
+        ..spec.clone()
+    };
+    let c = button_of_spec(&cancelling, dialog::ButtonRole::Cancel);
+    assert_eq!(c.role, dialog::ButtonRole::Apply);
     let ok = button_of_spec(&ui::DialogButton::named("OK"), dialog::ButtonRole::Accept);
     assert!(ok.default);
     let mut t = tab();
@@ -434,6 +443,11 @@ fn help_is_the_hosts_never_the_default_and_never_a_command() {
         button_of_spec(&spec, dialog::ButtonRole::Apply),
     ];
     t.dialogs.push(d);
+    assert_eq!(
+        t.dialogs.key_button("escape", true),
+        None,
+        "Escape names no Help"
+    );
     assert_eq!(dialog_click(&mut t, "Help"), Some(Ok(())));
     assert_eq!(t.status.as_str(), crate::help_tab::DOCS_COMING);
     assert!(t.dialogs.is_open(), "the dialog stays");

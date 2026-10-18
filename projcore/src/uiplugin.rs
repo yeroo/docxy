@@ -397,8 +397,9 @@ pub struct DialogSpec {
 /// dialog stays open unless the reply says `close` (a `cancel` button
 /// closes it without sending anything; a `default` one is what Enter
 /// presses). A `help` button is the host's (see [`DialogSpec::help`],
-/// #1609) and sends nothing; it is never the default. The state greys a
-/// button like a control, by its id.
+/// #1609) and sends nothing; its `default` and `cancel` are ignored, so
+/// neither Enter nor Escape names it. The state greys a button like a
+/// control, by its id.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DialogButton {
     pub id: String,
