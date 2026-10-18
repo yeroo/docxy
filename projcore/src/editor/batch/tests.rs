@@ -99,6 +99,7 @@ fn a_failed_batch_restores_every_piece_of_state() {
     let proj = ed.project().clone();
     let (undo, redo) = (ed.undo.clone(), ed.redo.clone());
     let state = (ed.sel, ed.sel_uid, ed.dirty, ed.pushes, ed.leveled);
+    let revision = ed.revision();
     let shown = dates(&ed);
     let err = ed.batch(|ed| {
         ed.rename(3, "Build")?;
@@ -111,6 +112,11 @@ fn a_failed_batch_restores_every_piece_of_state() {
     assert_eq!(ed.project(), &proj);
     assert_eq!((&ed.undo, &ed.redo), (&undo, &redo));
     assert_eq!((ed.sel, ed.sel_uid, ed.dirty, ed.pushes, ed.leveled), state);
+    assert_eq!(
+        ed.revision(),
+        revision,
+        "a rolled-back batch moves no revision"
+    );
     assert!(ed.is_collapsed(1));
     assert_eq!(results(ed.schedule()), results(&schedule(&proj)));
     assert_eq!(dates(&ed), shown);
