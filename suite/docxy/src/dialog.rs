@@ -1607,7 +1607,7 @@ impl Dialog {
             return Ok(false);
         }
         let c = &self.controls[i];
-        let (rows, cols) = (c.row_count(), c.columns.len());
+        let cols = c.columns.len();
         let (row, col, editing) = (c.row, c.col, c.edit.clone());
         let kind = c.column_kind(col);
         let toggles = kind.toggles();
