@@ -20,6 +20,7 @@ pub mod cfb;
 pub mod codepage;
 pub mod fsio;
 pub mod inflate;
+pub mod parts;
 pub mod xml;
 pub mod zip;
 pub mod zipwrite;
