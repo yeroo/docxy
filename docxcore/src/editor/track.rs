@@ -397,20 +397,18 @@ impl Editor {
     }
 }
 
-/// [`with_props`], also reaching the runs and children of a link (a clip's
-/// link, which is new content, is marked changed when `f` may have touched it).
+/// [`with_props`], also reaching the runs and children of a link. A link that
+/// kept its `raw` is marked changed, so a save writes what `f` did.
 pub(super) fn with_props_deep(inline: &mut Inline, f: &impl Fn(&mut RunProps)) {
     match inline {
         Inline::Hyperlink(h) => {
-            if link_has_record(h) {
-                h.content_changed = true;
-            }
             for r in &mut h.runs {
                 f(&mut r.props);
             }
             for inner in &mut h.content {
                 with_props_deep(inner, f);
             }
+            h.content_changed |= h.raw.is_some();
         }
         other => with_props(other, |props| f(props)),
     }

@@ -1500,7 +1500,12 @@ fn assign_tracked_insert_block(
                 Inline::Run(run) => props(&mut run.props, next, by_id),
                 Inline::Tab(p) | Inline::Break(_, p) => props(p, next, by_id),
                 Inline::Revision { content, .. } => inlines(content, next, by_id),
-                Inline::Hyperlink(h) => inlines(&mut h.content, next, by_id),
+                Inline::Hyperlink(h) => {
+                    for r in &mut h.runs {
+                        props(&mut r.props, next, by_id);
+                    }
+                    inlines(&mut h.content, next, by_id);
+                }
                 Inline::TextBox { blocks, .. } => {
                     for block in blocks {
                         assign_tracked_insert_block(block, next, by_id);

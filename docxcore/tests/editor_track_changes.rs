@@ -1444,8 +1444,8 @@ fn a_sweep_leaves_an_untouched_raw_kept_link_alone_1465() {
 }
 
 /// A copy of text typed inside a link is plain, and pasted it is plain
-/// (tracking off) or a revision of its own (tracking on), whose Reject All
-/// leaves the original (#1465).
+/// (tracking off) or a revision of its own (tracking on, written inside the
+/// pasted link), and Reject All gives back the paragraph's own text (#1465).
 #[test]
 fn copying_text_recorded_in_a_link_and_pasting_it_1465() {
     let mut ed = tracked(SEE_HERE);
@@ -1467,6 +1467,15 @@ fn copying_text_recorded_in_a_link_and_pasting_it_1465() {
     assert!(kinds_now.iter().all(|k| *k == RevisionKind::Insert) && !kinds_now.is_empty());
     let saved = xml(&tracked_paste);
     assert!(!saved.contains("w:author=\"Ada\""), "{saved}");
+    assert!(ins_in_link(&saved), "{saved}");
+    let mut rejected = tracked_paste.doc.clone();
+    assert!(
+        rejected
+            .reject_all_revisions()
+            .iter()
+            .all(|o| o.is_applied())
+    );
+    assert_eq!(rejected.plain_text().trim_end(), "zz");
     // Pasting back into the source document: Reject of the pasted text only.
     let mut again = Editor::new(ed.doc.clone());
     as_author(&mut again, "Bo");
@@ -1476,4 +1485,27 @@ fn copying_text_recorded_in_a_link_and_pasting_it_1465() {
     let unique: std::collections::HashSet<_> = ids.iter().collect();
     assert_eq!(ids.len(), unique.len(), "{}", xml(&again));
     assert!(ids.len() >= 2, "{}", xml(&again));
+}
+
+/// Text pasted into a tracked document as a multi-run link is one revision,
+/// listed once and rejected by its one target; the pasted text is in the
+/// link's own `w:ins` (#1465).
+#[test]
+fn a_pasted_multi_run_link_is_one_revision_1465() {
+    let mut src = tracked(SEE_HERE);
+    at(&mut src, 5);
+    src.insert_str("XY");
+    select(&mut src, 4, 7); // "hXY": a plain run and a recorded one, in the link
+    let clip = src.copy().expect("clip");
+    let mut ed = Editor::new(parse(&para("zz")));
+    as_author(&mut ed, "Bo");
+    at(&mut ed, 1);
+    ed.paste(&clip);
+    assert_eq!(text(&ed), "zhXYz");
+    assert!(ins_in_link(&xml(&ed)), "{}", xml(&ed));
+    let revisions = ed.doc.revisions();
+    assert_eq!(revisions.len(), 1, "{}", xml(&ed));
+    assert!(ed.reject_revision(revisions[0].target).is_applied());
+    assert_eq!(text(&ed), "zz");
+    assert!(ed.doc.revisions().is_empty());
 }
