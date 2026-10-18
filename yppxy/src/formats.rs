@@ -266,6 +266,7 @@ impl Formats {
                 ed.project().formatting.switches_json(),
             )]),
             values,
+            button: None,
         };
         for plugin in &self.ui {
             let Some(result) = plugin.command(&command)? else {

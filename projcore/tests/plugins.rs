@@ -161,6 +161,7 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
             ("fixture.flag", ControlKind::Toggle),
             ("fixture.palette", ControlKind::Gallery),
             ("fixture.bold", ControlKind::Toggle),
+            ("fixture.sheet", ControlKind::Button),
         ]
     );
     assert!(group.controls[0].large && group.controls[0].keytip == "XH");
@@ -176,6 +177,22 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         m.dialog("fixture.options").unwrap().title,
         "Fixture Options"
     );
+    // A modeless dialog with buttons of its own and a check column (#1602).
+    let sheet = m.dialog("fixture.sheet").unwrap();
+    assert!(sheet.modeless);
+    assert_eq!(
+        sheet
+            .buttons
+            .iter()
+            .map(|b| (b.id.as_str(), b.default, b.cancel))
+            .collect::<Vec<_>>(),
+        [
+            ("apply", true, false),
+            ("clear", false, false),
+            ("close", false, true)
+        ]
+    );
+    assert_eq!(sheet.pages[0].controls[0].columns[0].kind, "check");
     assert_eq!(m.palettes.len(), 2);
     assert_eq!(m.text_style_categories, ["Fixture Tasks"]);
 
@@ -190,6 +207,7 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         },
         view: Json::Obj(Vec::new()),
         dialog,
+        dialog_values: None,
     };
     let state = ui.state(&ctx(Vec::new(), None)).unwrap();
     assert_eq!(state.control("fixture.flag").checked, Some(false));
@@ -228,6 +246,41 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         Some("3")
     );
     assert_eq!(state.enabled_of("fixture.locked"), Some(false));
+    // The Fixture Sheet (#1602): a row per task, Clear greyed until a row is
+    // picked; asked again with the dialog's values, the picks stay by name.
+    let sheet_ctx = ctx(Vec::new(), Some(("fixture.sheet".into(), None)));
+    let state = ui.state(&sheet_ctx).unwrap();
+    let rows = state
+        .value("fixture.rows")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .to_vec();
+    assert!(!rows.is_empty());
+    let first = rows[0].as_array().unwrap()[1].clone();
+    assert_eq!(rows[0].as_array().unwrap()[0], Json::str("false"));
+    assert_eq!(state.enabled_of("clear"), Some(false));
+    let again = StateCtx {
+        dialog_values: Some(Json::obj(vec![(
+            "fixture.rows",
+            Json::Arr(vec![Json::Arr(vec![
+                Json::str("true"),
+                first.clone(),
+                Json::str("100"),
+            ])]),
+        )])),
+        ..sheet_ctx
+    };
+    let state = ui.state(&again).unwrap();
+    assert_eq!(state.enabled_of("clear"), Some(true));
+    let rows = state
+        .value("fixture.rows")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .to_vec();
+    assert_eq!(rows[0].as_array().unwrap()[0], Json::str("true"));
+    assert_eq!(rows[0].as_array().unwrap()[1], first);
 
     // Commands: the toggle flips and the state follows; the rename returns
     // one task.set op; a swatch sets the view's palette; an unknown id is
@@ -242,7 +295,48 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         },
         view: Json::Obj(Vec::new()),
         values,
+        button: None,
     };
+    // The sheet command: without a button it opens the dialog; Apply
+    // reports the picks and the selected row and stays open; Clear closes
+    // from the reply (#1602).
+    let opened = ui
+        .command(&cmd("fixture.sheet", vec![], None))
+        .unwrap()
+        .unwrap();
+    assert_eq!(opened.dialog.as_deref(), Some("fixture.sheet"));
+    assert!(!opened.close);
+    let applied = ui
+        .command(&Command {
+            button: Some("apply".into()),
+            ..cmd(
+                "fixture.sheet",
+                vec![],
+                Some(Json::obj(vec![
+                    (
+                        "fixture.rows",
+                        Json::Arr(vec![Json::strs(["true", "A", "50"])]),
+                    ),
+                    ("fixture.rows.selected_row", Json::Num(0.0)),
+                ])),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        applied.status.as_deref(),
+        Some("Fixture: applied 1 picked, row 0")
+    );
+    assert!(!applied.close);
+    let cleared = ui
+        .command(&Command {
+            button: Some("clear".into()),
+            ..cmd("fixture.sheet", vec![], Some(Json::Obj(Vec::new())))
+        })
+        .unwrap()
+        .unwrap();
+    assert!(cleared.close);
+    assert_eq!(cleared.status.as_deref(), Some("Fixture: cleared"));
     let flipped = ui
         .command(&cmd("fixture.flag", vec![], None))
         .unwrap()

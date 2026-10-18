@@ -1475,6 +1475,8 @@ pub(crate) fn commit_prompt(tab: &mut DocTab, prompt: ProjectPrompt) {
 
 /// Sync dirty state; reveal only when the caller requested selection visibility.
 pub(crate) fn complete_project(tab: &mut DocTab, reveal: bool) {
+    // A modeless plugin dialog follows the plan and the selection (#1602).
+    crate::plugin_ui::refresh_dialog(tab);
     if let Surface::Project(v) = &mut tab.surface {
         tab.dirty = v.ed.dirty();
         crate::bump_edit_generation();
@@ -1976,7 +1978,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             // A UI plugin's command (#1532): its ops as one undo step, its
             // status, and the dialog it asks for.
             Plugin(id) => {
-                let outcome = crate::plugin_ui::run_command(v, id, None)?;
+                let outcome = crate::plugin_ui::run_command(v, id, None, None)?;
                 status = outcome.status;
                 dialog = outcome.dialog;
             }

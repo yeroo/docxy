@@ -113,6 +113,10 @@ fn form() -> Dialog {
         caret_for: None,
         opened: Vec::new(),
         react: None,
+        modeless: false,
+        active: true,
+        stale: false,
+        seen: None,
     };
     d.controls = d.controls.into_iter().map(general).collect();
     preds.page = Some(1);
@@ -955,4 +959,92 @@ fn the_focus_moving_resets_the_caret() {
     let d = s.top().unwrap();
     assert_eq!(d.selection(), None);
     assert_eq!(d.caret_at(), 1, "the end of '0'");
+}
+
+/// A grid takes the focus, selects rows and edits cells by key and click
+/// (#1602); buttons carry ids `dialog-click` takes.
+#[test]
+fn a_grid_selects_rows_and_edits_cells_by_key_and_click() {
+    let mut s = stack();
+    s.select_tab("Predecessors").unwrap();
+    let d = s.top_dialog_mut().unwrap();
+    assert!(d.tabs_to("predecessors").is_ok());
+    d.select_row("predecessors", 0).unwrap();
+    assert_eq!(
+        d.select_row("predecessors", 1).unwrap_err(),
+        "'Predecessors' has no row 1; rows 0..0"
+    );
+    assert!(d.select_row("name", 0).is_err());
+    let i = d.focus.unwrap();
+    assert_eq!(d.controls[i].row, Some(0));
+    // Right moves to the Type column; typing edits it; Enter commits the
+    // text through the input handler.
+    assert!(d.grid_key("right", None).unwrap());
+    assert_eq!(d.controls[i].col, 1);
+    assert!(d.grid_key("s", Some("S")).unwrap());
+    assert!(d.grid_key("s", Some("S")).unwrap());
+    assert_eq!(d.controls[i].edit.as_deref(), Some("SS"));
+    assert!(d.grid_key("enter", None).unwrap());
+    assert_eq!(d.controls[i].edit, None);
+    assert_eq!(
+        d.value("predecessors"),
+        Some(&Value::Rows(vec![vec!["1".into(), "SS".into()]]))
+    );
+    // Backspace shortens the cell, Escape drops the edit; with no edit
+    // open Enter and Escape are the dialog's.
+    assert!(d.grid_key("backspace", None).unwrap());
+    assert_eq!(d.controls[i].edit.as_deref(), Some("S"));
+    assert!(d.grid_key("escape", None).unwrap());
+    assert_eq!(d.controls[i].edit, None);
+    assert!(!d.grid_key("escape", None).unwrap());
+    assert!(!d.grid_key("enter", None).unwrap());
+    assert!(!d.grid_key("tab", None).unwrap());
+    // Delete clears the cell; Up and Down stay in the rows.
+    assert!(d.grid_key("delete", None).unwrap());
+    assert_eq!(
+        d.value("predecessors"),
+        Some(&Value::Rows(vec![vec!["1".into(), String::new()]]))
+    );
+    assert!(d.grid_key("down", None).unwrap());
+    assert_eq!(d.controls[i].row, Some(0));
+    // A click on a cell selects its row and column; off the rows it is
+    // refused.
+    d.click_control(i, Some(0)).unwrap();
+    assert_eq!((d.controls[i].row, d.controls[i].col), (Some(0), 0));
+    assert!(d.click_control(i, Some(5 * 256)).is_err());
+    // `dialog-read` says so; buttons carry ids, which `click` takes too.
+    let json = s.to_json();
+    let grid = &json.get("controls").unwrap().as_array().unwrap()[0];
+    assert_eq!(grid.get("selected_row"), Some(&Json::Num(0.0)));
+    assert_eq!(grid.get("column"), Some(&Json::Num(0.0)));
+    assert_eq!(grid.get("editing"), Some(&Json::Null));
+    assert_eq!(json.get("modeless"), Some(&Json::Bool(false)));
+    assert_eq!(json.get("active"), Some(&Json::Bool(true)));
+    let buttons = json.get("buttons").unwrap().as_array().unwrap();
+    assert_eq!(buttons[0].get_str("id"), Some("ok"));
+    assert_eq!(buttons[1].get_str("id"), Some("cancel"));
+    assert!(s.click("ok", |_| Ok(())).is_ok());
+    assert!(!s.is_open());
+}
+
+/// A modeless dialog lets the keys through while it is not active, and a
+/// mutating edit under it keeps it (#1602).
+#[test]
+fn a_modeless_dialog_keeps_the_keys_only_while_active_and_survives_clear_modal() {
+    let mut s = stack();
+    assert!(s.modal_open());
+    assert!(s.top_takes_keys());
+    s.top_dialog_mut().unwrap().modeless = true;
+    assert!(!s.modal_open());
+    assert!(s.top_takes_keys());
+    s.activate(false);
+    assert!(!s.top_takes_keys());
+    s.activate(true);
+    assert!(s.top_takes_keys());
+    s.clear_modal();
+    assert!(s.is_open());
+    assert!(s.top().unwrap().stale);
+    s.top_dialog_mut().unwrap().modeless = false;
+    s.clear_modal();
+    assert!(!s.is_open());
 }

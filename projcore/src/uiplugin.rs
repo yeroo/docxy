@@ -361,8 +361,70 @@ pub struct DialogSpec {
     pub id: String,
     pub title: String,
     pub pages: Vec<DialogPage>,
-    /// `OK`, `Cancel`, `Help`, in order; OK and Cancel when empty.
-    pub buttons: Vec<String>,
+    /// The dialog's buttons, in order; OK and Cancel when empty (#1602). In
+    /// the JSON a button is `{id, label, default?, cancel?}` or a bare
+    /// label (`"OK"`, `"Cancel"`, `"Help"`: its id is the label in lower
+    /// case, OK is the default, Cancel cancels).
+    pub buttons: Vec<DialogButton>,
+    /// The dialog stays open while the plan and the selection change under
+    /// it (#1602): the host asks `yppx_ui_state` again with the dialog id
+    /// and applies the reply's values, items and enabled flags.
+    pub modeless: bool,
+}
+
+/// One button of a plugin's dialog (#1602). A press sends the dialog's
+/// command with `button` set to the id and the current `values`; the
+/// dialog stays open unless the reply says `close` (a `cancel` button
+/// closes it without sending anything; a `default` one is what Enter
+/// presses). The state greys a button like a control, by its id.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DialogButton {
+    pub id: String,
+    pub label: String,
+    pub default: bool,
+    pub cancel: bool,
+}
+
+impl DialogButton {
+    /// A button from its label alone: `OK` is the default, `Cancel`
+    /// cancels, and the id is the label in lower case.
+    pub fn named(label: &str) -> DialogButton {
+        DialogButton {
+            id: label.to_ascii_lowercase(),
+            label: label.to_string(),
+            default: label.eq_ignore_ascii_case("OK"),
+            cancel: label.eq_ignore_ascii_case("Cancel"),
+        }
+    }
+
+    fn from_json(v: &Json) -> DialogButton {
+        match v {
+            Json::Str(label) => DialogButton::named(label),
+            _ => {
+                let label = v.text("label");
+                let id = v.text("id");
+                DialogButton {
+                    id: if id.is_empty() {
+                        label.to_ascii_lowercase()
+                    } else {
+                        id
+                    },
+                    default: v.flag("default"),
+                    cancel: v.flag("cancel"),
+                    label,
+                }
+            }
+        }
+    }
+
+    fn json(&self) -> Json {
+        Json::obj(vec![
+            ("id", Json::str(self.id.clone())),
+            ("label", Json::str(self.label.clone())),
+            ("default", Json::Bool(self.default)),
+            ("cancel", Json::Bool(self.cancel)),
+        ])
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -547,7 +609,12 @@ impl Manifest {
                             .collect(),
                     })
                     .collect(),
-                buttons: d.texts("buttons"),
+                buttons: d
+                    .list("buttons")
+                    .iter()
+                    .map(DialogButton::from_json)
+                    .collect(),
+                modeless: d.flag("modeless"),
             });
         }
         for p in v.list("palettes") {
@@ -773,7 +840,11 @@ impl Manifest {
                                 .collect(),
                         ),
                     ),
-                    ("buttons", Json::strs(&d.buttons)),
+                    (
+                        "buttons",
+                        Json::Arr(d.buttons.iter().map(DialogButton::json).collect()),
+                    ),
+                    ("modeless", Json::Bool(d.modeless)),
                 ])
             })
             .collect();
@@ -882,8 +953,12 @@ pub struct StateCtx {
     pub selection: Selection,
     pub view: Json,
     /// `(dialog id, task uid)` when the host is about to open a dialog and
-    /// wants its values prefilled.
+    /// wants its values prefilled, or asks again for an open one (#1602).
     pub dialog: Option<(String, Option<i32>)>,
+    /// The open dialog's current values when the host asks again after a
+    /// control changed or the plan moved under a modeless dialog (#1602);
+    /// `None` for a dialog about to open.
+    pub dialog_values: Option<Json>,
 }
 
 impl StateCtx {
@@ -906,6 +981,11 @@ impl StateCtx {
                     d.int("uid").and_then(|u| i32::try_from(u).ok()),
                 )
             }),
+            dialog_values: v
+                .get("dialog")
+                .and_then(|d| d.get("values"))
+                .filter(|w| !w.is_null())
+                .cloned(),
         })
     }
 
@@ -916,13 +996,14 @@ impl StateCtx {
             ("view", self.view.clone()),
         ];
         if let Some((id, uid)) = &self.dialog {
-            pairs.push((
-                "dialog",
-                Json::obj(vec![
-                    ("id", Json::str(id.clone())),
-                    ("uid", uid.map_or(Json::Null, |u| Json::Num(f64::from(u)))),
-                ]),
-            ));
+            let mut dialog = vec![
+                ("id", Json::str(id.clone())),
+                ("uid", uid.map_or(Json::Null, |u| Json::Num(f64::from(u)))),
+            ];
+            if let Some(values) = &self.dialog_values {
+                dialog.push(("values", values.clone()));
+            }
+            pairs.push(("dialog", Json::obj(dialog)));
         }
         Json::obj(pairs).to_string()
     }
@@ -1081,7 +1162,9 @@ impl State {
 // ---- commands ----------------------------------------------------------------
 
 /// What the host sends `yppx_ui_command`: the command's id, the plan
-/// (MSPDI), the selection, the view, and a dialog's values on its OK.
+/// (MSPDI), the selection, the view, and a dialog's values on its OK, with
+/// the id of the button pressed when it is one of the dialog's own (#1602;
+/// `None` for OK and for a command run from the ribbon or a menu).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Command {
     pub id: String,
@@ -1089,6 +1172,7 @@ pub struct Command {
     pub selection: Selection,
     pub view: Json,
     pub values: Option<Json>,
+    pub button: Option<String>,
 }
 
 impl Command {
@@ -1108,6 +1192,7 @@ impl Command {
                 .unwrap_or_default(),
             view: v.get("view").cloned().unwrap_or(Json::Obj(Vec::new())),
             values: v.get("values").filter(|w| !w.is_null()).cloned(),
+            button: v.get_str("button").map(str::to_string),
         })
     }
 
@@ -1120,6 +1205,9 @@ impl Command {
         ];
         if let Some(values) = &self.values {
             pairs.push(("values", values.clone()));
+        }
+        if let Some(button) = &self.button {
+            pairs.push(("button", Json::str(button.clone())));
         }
         Json::obj(pairs).to_string()
     }
@@ -1148,6 +1236,9 @@ pub struct CommandResult {
     pub dialog: Option<String>,
     /// View settings to apply (palette id, text styles, flags), by key.
     pub view: Option<Json>,
+    /// Close the dialog whose button sent the command (#1602); a button of
+    /// the dialog's own leaves it open otherwise.
+    pub close: bool,
 }
 
 impl CommandResult {
@@ -1173,6 +1264,7 @@ impl CommandResult {
         out.status = v.get_str("status").map(str::to_string);
         out.dialog = v.get_str("dialog").map(str::to_string);
         out.view = v.get("view").filter(|w| !w.is_null()).cloned();
+        out.close = v.flag("close");
         Ok(out)
     }
 
@@ -1199,6 +1291,9 @@ impl CommandResult {
         }
         if let Some(w) = &self.view {
             pairs.push(("view", w.clone()));
+        }
+        if self.close {
+            pairs.push(("close", Json::Bool(true)));
         }
         Json::obj(pairs).to_string()
     }
@@ -1807,7 +1902,9 @@ mod tests {
       "dialogs":[{"id":"task-information","pages":[{"name":"Fixture","controls":[
          {"name":"fx.note","label":"&Note:","kind":"multiline","value":""},
          {"name":"fx.grid","label":"Items","kind":"grid","columns":[{"name":"Name","kind":"text"},{"name":"Done","kind":"checkbox"}],"value":[["a","false"]]}]}]},
-         {"id":"fx.options","title":"Fixture Options","pages":[{"name":"General","controls":[{"name":"n","label":"N:","kind":"number"}]}],"buttons":["OK","Cancel","Help"]}],
+         {"id":"fx.options","title":"Fixture Options","pages":[{"name":"General","controls":[{"name":"n","label":"N:","kind":"number"}]}],"buttons":["OK","Cancel","Help"]},
+         {"id":"fx.sheet","title":"Fixture Sheet","modeless":true,"pages":[{"name":"Sheet","controls":[{"name":"g","label":"","kind":"grid","columns":[{"name":"Pick","kind":"check"},{"name":"Name","kind":"text"}]}]}],
+          "buttons":[{"id":"apply","label":"&Apply","default":true},{"id":"clear","label":"Clear"},{"id":"close","label":"Close","cancel":true}]}],
       "palettes":[{"id":"fx.blue","label":"Blue","bars":[{"kind":"on-track","color":"#3366CC","shape":"bar"},{"kind":"critical","color":"#CC3333"}]}],
       "text_style_categories":["Late Tasks"],
       "since":{"abi":2}
@@ -1836,6 +1933,7 @@ mod tests {
             },
             view: Json::obj(vec![("critical", Json::Bool(true))]),
             dialog: Some(("task-information".into(), Some(3))),
+            dialog_values: None,
         };
         assert_eq!(StateCtx::parse(&ctx.json()).unwrap(), ctx);
         let no_dialog = StateCtx {
@@ -1843,6 +1941,12 @@ mod tests {
             ..ctx.clone()
         };
         assert_eq!(StateCtx::parse(&no_dialog.json()).unwrap(), no_dialog);
+        // Asked again for an open dialog: its values ride along (#1602).
+        let again = StateCtx {
+            dialog_values: Some(Json::obj(vec![("n", Json::Num(2.0))])),
+            ..ctx.clone()
+        };
+        assert_eq!(StateCtx::parse(&again.json()).unwrap(), again);
         assert!(StateCtx::parse("[]").is_err());
         let cmd = Command {
             id: "x".into(),
@@ -1850,8 +1954,21 @@ mod tests {
             selection: Selection::default(),
             view: Json::Obj(Vec::new()),
             values: Some(Json::obj(vec![("n", Json::Num(2.0))])),
+            button: Some("apply".into()),
         };
         assert_eq!(Command::parse(&cmd.json()).unwrap(), cmd);
+        assert_eq!(
+            Command::parse(
+                &Command {
+                    button: None,
+                    ..cmd.clone()
+                }
+                .json()
+            )
+            .unwrap()
+            .button,
+            None
+        );
         assert!(Command::parse(r#"{"plan":""}"#).is_err());
         let state = State {
             controls: vec![(
@@ -2003,8 +2120,42 @@ mod tests {
         );
         assert_eq!(
             m.dialog("fx.options").unwrap().buttons,
-            ["OK", "Cancel", "Help"]
+            [
+                DialogButton::named("OK"),
+                DialogButton::named("Cancel"),
+                DialogButton::named("Help")
+            ]
         );
+        assert!(m.dialog("fx.options").unwrap().buttons[0].default);
+        assert!(m.dialog("fx.options").unwrap().buttons[1].cancel);
+        assert!(!m.dialog("fx.options").unwrap().modeless);
+        // Buttons of the dialog's own and a modeless dialog (#1602).
+        let sheet = m.dialog("fx.sheet").unwrap();
+        assert!(sheet.modeless);
+        assert_eq!(
+            sheet.buttons,
+            [
+                DialogButton {
+                    id: "apply".into(),
+                    label: "&Apply".into(),
+                    default: true,
+                    cancel: false
+                },
+                DialogButton {
+                    id: "clear".into(),
+                    label: "Clear".into(),
+                    default: false,
+                    cancel: false
+                },
+                DialogButton {
+                    id: "close".into(),
+                    label: "Close".into(),
+                    default: false,
+                    cancel: true
+                },
+            ]
+        );
+        assert_eq!(sheet.pages[0].controls[0].columns[0].kind, "check");
         assert_eq!(m.palettes[0].bars[0].color, 0x3366CC);
         assert_eq!(m.palettes[0].bars[1].shape, "");
         assert_eq!(m.text_style_categories, ["Late Tasks"]);
@@ -2039,6 +2190,7 @@ mod tests {
             },
             view: Json::obj(vec![("critical", Json::Bool(true))]),
             dialog: Some(("task-information".into(), Some(3))),
+            dialog_values: None,
         };
         let j = Json::parse(&ctx.json()).unwrap();
         assert_eq!(j.text("plan"), "<Project/>");
@@ -2071,10 +2223,12 @@ mod tests {
             selection: Selection::default(),
             view: Json::Obj(Vec::new()),
             values: Some(Json::obj(vec![("n", Json::Num(2.0))])),
+            button: None,
         };
         let j = Json::parse(&cmd.json()).unwrap();
         assert_eq!(j.text("id"), "fx.rename");
         assert_eq!(j.get("values").unwrap().int("n"), Some(2));
+        assert!(j.get("button").is_none());
         let result = CommandResult::parse(
             r#"{"ops":[{"verb":"task.set","args":{"uid":3,"name":"Renamed"}},{"verb":"task.del","args":{"uid":4}}],
                 "status":"Renamed task 3","dialog":"fx.options","view":{"palette":"fx.blue"}}"#,
@@ -2086,7 +2240,11 @@ mod tests {
         assert_eq!(result.status.as_deref(), Some("Renamed task 3"));
         assert_eq!(result.dialog.as_deref(), Some("fx.options"));
         assert_eq!(result.view.as_ref().unwrap().text("palette"), "fx.blue");
+        assert!(!result.close);
         assert_eq!(CommandResult::parse(&result.json()).unwrap(), result);
+        let closing = CommandResult::parse(r#"{"ops":[],"close":true}"#).unwrap();
+        assert!(closing.close);
+        assert_eq!(CommandResult::parse(&closing.json()).unwrap(), closing);
         assert_eq!(
             CommandResult::parse("{}").unwrap(),
             CommandResult::default()

@@ -41,6 +41,9 @@ pub(crate) enum DialogOwner {
     /// again with the values (`plugin_ui::dialog_click`).
     Plugin {
         command: &'static str,
+        /// The plugin's dialog spec id, asked again for the dialog's state
+        /// (#1602).
+        spec: &'static str,
     },
     /// Word's Page Setup, for the caret's sections (#649).
     PageSetup,
@@ -356,6 +359,9 @@ pub(crate) enum ButtonRole {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Button {
+    /// Stable, for scripts and a plugin's own buttons (#1602): the folded
+    /// label unless the builder gives one. `dialog-click` takes either.
+    pub id: String,
     pub label: String,
     pub enabled: bool,
     /// Enter presses it.
@@ -366,6 +372,7 @@ pub(crate) struct Button {
 impl Button {
     pub fn new(label: &str, role: ButtonRole) -> Self {
         Self {
+            id: fold(label),
             label: label.into(),
             enabled: true,
             default: false,
@@ -381,12 +388,18 @@ pub(crate) enum ControlKind {
     Date,
     Duration,
     Checkbox,
+    /// A grid column drawn as Project's check mark (#1602): `true` or
+    /// `false`, toggled by a click or Space, never typed into.
+    Check,
     Radio,
     Dropdown,
     List,
     /// Rows of cells, one column kind each (`Control::column_kinds`, text
     /// when unset); `dialog-set` addresses a cell as `name[row].column`
-    /// (#1532). Drawn as a table, edited by `dialog-set` only.
+    /// (#1532). Drawn as a table whose rows the pointer and Up/Down select
+    /// (`Control::row`, `dialog-select`) and whose cells the person types
+    /// into (`Control::edit`, committed by Enter, dropped by Escape; Space
+    /// toggles a check cell) (#1602).
     Grid,
     Label,
     /// A text field of several lines: Enter is a new line, not OK (#1532).
@@ -405,6 +418,7 @@ impl ControlKind {
             Self::Date => "date",
             Self::Duration => "duration",
             Self::Checkbox => "checkbox",
+            Self::Check => "check",
             Self::Radio => "radio",
             Self::Dropdown => "dropdown",
             Self::List => "list",
@@ -414,7 +428,7 @@ impl ControlKind {
             Self::CheckList => "checklist",
         }
     }
-    fn has_items(self) -> bool {
+    pub fn has_items(self) -> bool {
         matches!(self, Self::Radio | Self::Dropdown | Self::List)
     }
     /// A field typed into.
@@ -424,15 +438,27 @@ impl ControlKind {
             Self::Text | Self::Number | Self::Date | Self::Duration | Self::Multiline
         )
     }
-    /// A control the keyboard and pointer can edit: a grid is still a
-    /// read-only widget, and a label is never edited. A list's item is
-    /// chosen by a click or Up/Down/Home/End (#988).
+    /// A control the keyboard and pointer can edit: a label is never
+    /// edited. A list's item is chosen by a click or Up/Down/Home/End
+    /// (#988); a grid's row and cell by a click, the arrows and typing
+    /// (#1602).
     pub fn is_editable(self) -> bool {
         self.is_text()
             || matches!(
                 self,
-                Self::Checkbox | Self::Radio | Self::Dropdown | Self::List | Self::CheckList
+                Self::Checkbox
+                    | Self::Check
+                    | Self::Radio
+                    | Self::Dropdown
+                    | Self::List
+                    | Self::CheckList
+                    | Self::Grid
             )
+    }
+
+    /// A cell kind a click or Space toggles.
+    pub fn toggles(self) -> bool {
+        matches!(self, Self::Checkbox | Self::Check)
     }
 }
 
@@ -483,6 +509,13 @@ pub(crate) struct Control {
     /// Contributed by a UI plugin (#1532): `dialog-read` says `"plugin":
     /// true`, and the catalogue check leaves it out.
     pub plugin: bool,
+    /// A grid's selected row (#1602), `None` for none.
+    pub row: Option<usize>,
+    /// A grid's active column, the cell Space and typing act on (#1602).
+    pub col: usize,
+    /// The text typed into the grid's active cell so far (#1602): Enter
+    /// commits it through the input handler, Escape drops it.
+    pub edit: Option<String>,
 }
 
 impl Control {
@@ -500,6 +533,29 @@ impl Control {
             column_kinds: Vec::new(),
             depths: Vec::new(),
             plugin: false,
+            row: None,
+            col: 0,
+            edit: None,
+        }
+    }
+
+    /// A grid's cell text, empty off the rows.
+    fn cell(&self, row: usize, col: usize) -> String {
+        match &self.value {
+            Value::Rows(rows) => rows
+                .get(row)
+                .and_then(|r| r.get(col))
+                .cloned()
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    /// A grid's row count.
+    fn row_count(&self) -> usize {
+        match &self.value {
+            Value::Rows(rows) => rows.len(),
+            _ => 0,
         }
     }
 
@@ -576,6 +632,12 @@ impl Control {
                 ),
             ));
             out.push(("rows", rows_json(rows)));
+            out.push((
+                "selected_row",
+                self.row.map_or(Json::Null, |r| Json::Num(r as f64)),
+            ));
+            out.push(("column", Json::Num(self.col as f64)));
+            out.push(("editing", self.edit.clone().map_or(Json::Null, Json::Str)));
         }
         if self.plugin {
             out.push(("plugin", Json::Bool(true)));
@@ -630,7 +692,7 @@ impl Control {
                 }
                 _ => return Err(format!("'{label}' takes a number")),
             },
-            ControlKind::Checkbox => match value()? {
+            ControlKind::Checkbox | ControlKind::Check => match value()? {
                 Json::Bool(b) => Value::Bool(*b),
                 _ => return Err(format!("'{label}' takes true or false")),
             },
@@ -788,13 +850,13 @@ impl Control {
         let kind = self.column_kind(column);
         let heading = self.columns.get(column).map_or("", String::as_str);
         let value = match (kind, args.get("value")) {
-            (ControlKind::Checkbox, Some(Json::Bool(b))) => b.to_string(),
-            (ControlKind::Checkbox, Some(Json::Str(s)))
+            (ControlKind::Checkbox | ControlKind::Check, Some(Json::Bool(b))) => b.to_string(),
+            (ControlKind::Checkbox | ControlKind::Check, Some(Json::Str(s)))
                 if s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("false") =>
             {
                 s.to_ascii_lowercase()
             }
-            (ControlKind::Checkbox, _) => {
+            (ControlKind::Checkbox | ControlKind::Check, _) => {
                 return Err(format!("'{label}' column '{heading}' takes true or false"));
             }
             (ControlKind::Number, Some(Json::Num(n))) if n.is_finite() => n.to_string(),
@@ -897,6 +959,20 @@ pub(crate) struct Dialog {
     /// `before`): Page Setup's paper size following its sides, say. Set by the
     /// dialog's builder.
     pub react: Option<Reaction>,
+    /// The dialog stays open while the document and the selection change
+    /// under it (#1602): no backdrop, the pointer reaches the document, and
+    /// the keys reach the dialog only while it is `active` (the last click
+    /// was in it). Only a UI plugin's dialog is one so far.
+    pub modeless: bool,
+    /// Whether a modeless dialog has the keyboard (#1602); a modal one
+    /// always has.
+    pub active: bool,
+    /// A plugin control changed since the plugin's state was last asked
+    /// (#1602, #1567): the host asks again before the next read or frame.
+    pub stale: bool,
+    /// The plan revision and selected task a modeless plugin dialog's values
+    /// were last asked for (#1602).
+    pub seen: Option<(u64, Option<i32>)>,
 }
 
 /// See [`Dialog::react`]. Two dialogs compare equal whatever their
@@ -976,6 +1052,10 @@ impl Dialog {
             caret_for: None,
             opened: Vec::new(),
             react: None,
+            modeless: false,
+            active: true,
+            stale: false,
+            seen: None,
         }
     }
 
@@ -1186,10 +1266,172 @@ impl Dialog {
         self.controls[i].set(args)?;
         self.caret = None;
         self.anchor = None;
+        if self.controls[i].plugin {
+            // The plugin's state is asked again before the next read (#1602).
+            self.stale = true;
+        }
         if let Some(Reaction(react)) = self.react {
             react(self, i, &before);
         }
         Ok(())
+    }
+
+    /// Select row `row` of grid `name` (#1602), the focus moving to it; an
+    /// edit of a cell in progress is dropped.
+    pub fn select_row(&mut self, name: &str, row: usize) -> Result<(), String> {
+        let i = self.control_index(name)?;
+        let c = &self.controls[i];
+        if c.kind != ControlKind::Grid {
+            return Err(format!("'{}' is not a grid", shown(&c.label)));
+        }
+        if !self.focusable().contains(&i) {
+            return Err(format!("'{}' cannot be edited", shown(&c.label)));
+        }
+        let rows = c.row_count();
+        if row >= rows {
+            return Err(no_row(&shown(&c.label), row, rows));
+        }
+        self.focus = Some(i);
+        let c = &mut self.controls[i];
+        c.row = Some(row);
+        c.edit = None;
+        Ok(())
+    }
+
+    /// Toggle the selected row's cell in the active column of grid `i`, a
+    /// check or checkbox column; nothing otherwise.
+    fn grid_toggle(&mut self, i: usize) -> Result<(), String> {
+        let c = &self.controls[i];
+        let Some(row) = c.row else {
+            return Ok(());
+        };
+        let col = c.col;
+        if !c.column_kind(col).toggles() {
+            return Ok(());
+        }
+        let on = c.cell(row, col) != "true";
+        self.controls[i].edit = None;
+        self.set_at(
+            i,
+            &Json::obj(vec![
+                ("row", Json::Num(row as f64)),
+                ("column", Json::Num(col as f64)),
+                ("value", Json::Bool(on)),
+            ]),
+        )
+    }
+
+    /// Commit `text` into the selected row's active cell of grid `i` through
+    /// the input handler (the column's kind checks it); the edit in progress
+    /// ends when it takes.
+    fn grid_commit(&mut self, i: usize, text: &str) -> Result<(), String> {
+        let c = &self.controls[i];
+        let Some(row) = c.row else {
+            return Ok(());
+        };
+        let col = c.col;
+        self.set_at(
+            i,
+            &Json::obj(vec![
+                ("row", Json::Num(row as f64)),
+                ("column", Json::Num(col as f64)),
+                ("value", Json::Str(text.to_string())),
+            ]),
+        )?;
+        self.controls[i].edit = None;
+        Ok(())
+    }
+
+    /// A key on a focused grid (#1602): Up and Down select a row, Left and
+    /// Right the active column, Space toggles a check cell, typing starts
+    /// (and goes on) editing the cell, Enter commits the edit, Escape drops
+    /// it, Backspace shortens the cell's text, Delete clears the cell.
+    /// `Ok(false)` when the focus is not on a grid or the key is not a
+    /// grid's: Enter and Escape with no edit open press the dialog's
+    /// buttons, Tab moves the focus.
+    pub fn grid_key(&mut self, key: &str, typed: Option<&str>) -> Result<bool, String> {
+        let Some(i) = self.focus.filter(|i| self.focusable().contains(i)) else {
+            return Ok(false);
+        };
+        if self.controls[i].kind != ControlKind::Grid {
+            return Ok(false);
+        }
+        let c = &self.controls[i];
+        let (rows, cols) = (c.row_count(), c.columns.len());
+        let (row, col, editing) = (c.row, c.col, c.edit.clone());
+        let toggles = c.column_kind(col).toggles();
+        match key {
+            "up" | "down" => {
+                if rows > 0 {
+                    let next = match (row, key) {
+                        (None, _) => 0,
+                        (Some(r), "down") => (r + 1).min(rows - 1),
+                        (Some(r), _) => r.saturating_sub(1),
+                    };
+                    let c = &mut self.controls[i];
+                    c.edit = None;
+                    c.row = Some(next);
+                }
+                Ok(true)
+            }
+            "left" | "right" => {
+                if editing.is_none() && cols > 0 {
+                    self.controls[i].col = if key == "right" {
+                        (col + 1).min(cols - 1)
+                    } else {
+                        col.saturating_sub(1)
+                    };
+                }
+                Ok(true)
+            }
+            "space" if toggles => {
+                self.grid_toggle(i)?;
+                Ok(true)
+            }
+            "enter" => match editing {
+                Some(buf) => {
+                    self.grid_commit(i, &buf)?;
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
+            "escape" => match editing {
+                Some(_) => {
+                    self.controls[i].edit = None;
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
+            "backspace" => {
+                if let Some(r) = row
+                    && !toggles
+                {
+                    let mut buf = editing.unwrap_or_else(|| self.controls[i].cell(r, col));
+                    buf.pop();
+                    self.controls[i].edit = Some(buf);
+                }
+                Ok(true)
+            }
+            "delete" => {
+                if editing.is_none() && row.is_some() && !toggles {
+                    self.grid_commit(i, "")?;
+                }
+                Ok(true)
+            }
+            "tab" | "home" | "end" => Ok(false),
+            _ => {
+                let Some(t) = typed.filter(|t| t.chars().all(|c| !c.is_control())) else {
+                    return Ok(false);
+                };
+                if row.is_some() && !toggles {
+                    // Typing replaces the cell's text, as in a sheet.
+                    let mut buf = editing.unwrap_or_default();
+                    buf.push_str(t);
+                    self.controls[i].edit = Some(buf);
+                }
+                Ok(true)
+            }
+        }
     }
 
     /// Whether a control's value differs from the one the dialog opened on.
@@ -1428,7 +1670,28 @@ impl Dialog {
         }
         self.focus = Some(index);
         let value = match (c.kind, &c.value) {
-            (ControlKind::Checkbox, Value::Bool(b)) => Json::Bool(!b),
+            // A grid cell (#1602): `item` is `row * 256 + column`; the row
+            // and column are selected, and a check cell toggles.
+            (ControlKind::Grid, Value::Rows(rows)) => {
+                let Some(code) = item else {
+                    return Ok(());
+                };
+                let (row, col) = (code / 256, code % 256);
+                if row >= rows.len() || col >= c.columns.len().max(1) {
+                    return Err("no such cell".into());
+                }
+                let c = &mut self.controls[index];
+                if c.row != Some(row) || c.col != col {
+                    c.edit = None;
+                }
+                c.row = Some(row);
+                c.col = col;
+                if c.column_kind(col).toggles() {
+                    return self.grid_toggle(index);
+                }
+                return Ok(());
+            }
+            (ControlKind::Checkbox | ControlKind::Check, Value::Bool(b)) => Json::Bool(!b),
             (ControlKind::CheckList, Value::Checks(c)) => {
                 let Some(k) = item else {
                     return Ok(());
@@ -1502,9 +1765,13 @@ impl Dialog {
     /// Space: toggles a focused checkbox; a field takes it as a character.
     pub fn space(&mut self) -> Result<(), String> {
         match self.focused().map(|c| c.kind) {
-            Some(ControlKind::Checkbox) => {
+            Some(ControlKind::Checkbox | ControlKind::Check) => {
                 let i = self.focus.unwrap_or_default();
                 self.click_control(i, None)
+            }
+            Some(ControlKind::Grid) => {
+                self.grid_key("space", Some(" "))?;
+                Ok(())
             }
             _ => self.type_char(' '),
         }
@@ -1530,7 +1797,7 @@ impl Dialog {
         let i = self
             .buttons
             .iter()
-            .position(|b| fold(&b.label) == fold(want))
+            .position(|b| fold(&b.label) == fold(want) || b.id.eq_ignore_ascii_case(want.trim()))
             .ok_or_else(|| {
                 let labels: Vec<String> = self.buttons.iter().map(|b| shown(&b.label)).collect();
                 format!("no button '{want}'; buttons: {}", labels.join(", "))
@@ -1575,6 +1842,7 @@ impl Dialog {
                         .iter()
                         .map(|b| {
                             Json::obj(vec![
+                                ("id", Json::Str(b.id.clone())),
                                 ("label", Json::Str(shown(&b.label))),
                                 ("enabled", Json::Bool(b.enabled)),
                                 ("default", Json::Bool(b.default)),
@@ -1583,6 +1851,8 @@ impl Dialog {
                         .collect(),
                 ),
             ),
+            ("modeless", Json::Bool(self.modeless)),
+            ("active", Json::Bool(self.active)),
         ])
     }
 }
@@ -1613,9 +1883,44 @@ impl DialogStack {
         self.0.pop();
     }
     /// Dismiss every dialog without applying any: the document under them
-    /// changed some other way (an agent's edit, a reload).
+    /// changed some other way (a reload, a save).
     pub fn clear(&mut self) {
         self.0.clear();
+    }
+
+    /// Dismiss the modal dialogs without applying any: the document under
+    /// them changed some other way (an agent's edit). A modeless dialog
+    /// stays, marked stale so its plugin's state is asked again (#1602).
+    pub fn clear_modal(&mut self) {
+        self.0.retain(|d| d.modeless);
+        for d in &mut self.0 {
+            d.stale = true;
+        }
+    }
+
+    /// Whether a dialog that blocks the window is on top: a modeless one
+    /// lets the pointer and the automation through (#1602).
+    pub fn modal_open(&self) -> bool {
+        self.top().is_some_and(|d| !d.modeless)
+    }
+
+    /// Whether the top dialog takes the keys: a modal one always, a
+    /// modeless one while it is active (#1602).
+    pub fn top_takes_keys(&self) -> bool {
+        self.top().is_some_and(|d| !d.modeless || d.active)
+    }
+
+    /// Give the top dialog the keyboard, or take it away (a click in the
+    /// document): a modeless dialog's `active` (#1602).
+    pub fn activate(&mut self, on: bool) {
+        if let Some(d) = self.0.last_mut() {
+            d.active = on;
+        }
+    }
+
+    /// `dialog-select`: row `row` of grid `control` on the top dialog.
+    pub fn select_row(&mut self, control: &str, row: usize) -> Result<(), String> {
+        self.top_mut()?.select_row(control, row)
     }
 
     fn top_mut(&mut self) -> Result<&mut Dialog, String> {
@@ -1704,6 +2009,14 @@ impl DialogStack {
         {
             return None;
         }
+        // A grid cell being typed into takes Enter and Escape (#1602).
+        if matches!(key, "enter" | "escape")
+            && top
+                .focused()
+                .is_some_and(|c| c.kind == ControlKind::Grid && c.edit.is_some())
+        {
+            return None;
+        }
         let b = match key {
             "enter" => top.buttons.iter().find(|b| b.default),
             "escape" => top.buttons.iter().find(|b| b.role == ButtonRole::Cancel),
@@ -1756,6 +2069,10 @@ mod tests_support {
             caret_for: None,
             opened: Vec::new(),
             react: None,
+            modeless: false,
+            active: true,
+            stale: false,
+            seen: None,
         }
     }
 }

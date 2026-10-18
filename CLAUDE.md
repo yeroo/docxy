@@ -419,8 +419,19 @@
   addresses a grid cell as `name[row].column` (checked against the column's
   kind). `ControlKind::Multiline` (Enter is a new line; `key_button` leaves
   Enter alone with one focused) and `Grid` (per-column `column_kinds`, drawn
-  as a table, edited by `dialog-set` only) are generic; the catalogue check
-  skips `plugin` controls. `uiharness/cases/project-plugin-ui.uit` drives
+  as a table; a click, Up/Down or `dialog-select` picks a row (`Control::row`),
+  Left/Right the active column, typing edits the cell (`Control::edit`, Enter
+  commits through the input handler, Escape drops it), Space toggles a
+  `Check` cell) are generic; the catalogue check skips `plugin` controls.
+  A plugin dialog may declare its own buttons (`Button::id`; a press sends
+  the command with `button`, the dialog stays open unless the reply's
+  `close`), be `modeless` (no backdrop, `Dialog::active` decides who has
+  the keys: a press in the table takes them, a dialog press gives them
+  back; mutating control verbs `clear_modal` and keep it; `refuse_under_dialog`
+  ignores it), and every plugin control change marks the dialog `stale`:
+  `plugin_ui::refresh_dialog` asks `yppx_ui_state` again with `dialog.values`
+  from `complete_project`, the harness dialog verbs, typing and clicks
+  (#1602, #1567). `uiharness/cases/project-plugin-ui.uit` drives
   the fixture through all of it; nothing changes without a UI plugin.
 
 ## Project table: resizable columns and AutoFilter (#1533)

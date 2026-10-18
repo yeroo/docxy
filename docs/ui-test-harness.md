@@ -1275,13 +1275,22 @@ point. Four verbs read and drive it:
 |---|---|---|
 | `dialog-read` | `{}` | the top dialog, or `{open: false}` |
 | `dialog-set` | `{control, value}`; a grid takes `{control, row, column, value}`, `{control, insert_row: n}` or `{control, delete_row: n}`, or names the cell as `{"control": "name[row].column", value}` (#1532; `column` a heading or an index, the value checked against the column's kind: a checkbox column true or false, a number column a number); a check list `{control, value: true\|false\|[labels]}`, `{control, item, checked}` or `{control, index, checked}` | the dialog after the edit |
+| `dialog-select` | `{control, row}` | the dialog, row `row` of the grid `control` selected (#1602); the dialog takes the keyboard |
 | `dialog-tab` | `{tab}` | the dialog on that tab |
 | `dialog-click` | `{button}` | `state` after the button's handler, with `dialog` set to the dialog now on top (the child it opened, the parent, or `{open: false}`) |
 
 `dialog-read` replies `{open, id, depth, title, text, tabs, tab, controls,
-buttons}`. `id` is stable (`delete-summary`), `depth` counts from 1, `text` is
+buttons, modeless, active}`. `id` is stable (`delete-summary`), `depth` counts from 1, `text` is
 a message box's message (null otherwise), and `tab` is the current tab's label
-(null for a dialog without tabs). Each button is `{label, enabled, default}`.
+(null for a dialog without tabs). Each button is `{id, label, enabled, default}`
+(`id` the folded label, or the one a UI plugin's spec gives; `dialog-click`
+takes either). A `modeless` dialog (#1602) has no backdrop: the document under
+it takes verbs, keys (while the dialog is not `active`: a press in the table
+takes the keyboard, a press in the dialog or any dialog verb gives it back)
+and mutating control verbs, which keep it open. A grid control also reports
+`selected_row`, `column` (the active cell's) and `editing` (the text typed
+into the cell so far, null otherwise); its `column_kinds` may say `check`, a
+column drawn as Project's check mark that a click or Space toggles.
 Each control is `{name, label, kind, value, text, enabled, visible}`:
 
 - `kind` is one of `text`, `number`, `date`, `duration`, `multiline`,

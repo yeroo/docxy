@@ -3456,6 +3456,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "open-draft"
             | "recent-open"
             | "dialog-set"
+            | "dialog-select"
             | "dialog-tab"
             | "dialog-click"
             | "enable-editing"
@@ -4539,7 +4540,24 @@ fn dispatch_verb(
             let control = arg_str(args, "control")?.to_string();
             let dialogs = open_dialogs(app)?;
             dialogs.set(&control, args)?;
-            let reply = dialogs.to_json();
+            dialogs.activate(true);
+            app.refresh_plugin_dialog();
+            let reply = app.active_dialogs_mut().to_json();
+            cx.notify();
+            Done::ok(reply)
+        }
+        // Select row `row` of the grid `control` on the top dialog (#1602).
+        "dialog-select" => {
+            let control = arg_str(args, "control")?.to_string();
+            let row = args
+                .get("row")
+                .and_then(Json::as_usize)
+                .ok_or("dialog-select needs a 'row' (a whole number)")?;
+            let dialogs = open_dialogs(app)?;
+            dialogs.select_row(&control, row)?;
+            dialogs.activate(true);
+            app.refresh_plugin_dialog();
+            let reply = app.active_dialogs_mut().to_json();
             cx.notify();
             Done::ok(reply)
         }
@@ -4547,6 +4565,7 @@ fn dispatch_verb(
             let tab = arg_str(args, "tab")?.to_string();
             let dialogs = open_dialogs(app)?;
             dialogs.select_tab(&tab)?;
+            dialogs.activate(true);
             let reply = dialogs.to_json();
             cx.notify();
             Done::ok(reply)

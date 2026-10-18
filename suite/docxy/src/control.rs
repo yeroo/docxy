@@ -269,11 +269,14 @@ pub(crate) fn project_verb(
                     tab.dirty = v.ed.dirty();
                     crate::bump_edit_generation();
                     v.cancel_prompt();
-                    tab.dialogs.clear();
                     v.cell = None;
                     v.latch_entry_row();
                     effect.repaint = true;
                     effect.activity = true;
+                    // A modal dialog cannot outlive the plan it asked about;
+                    // a modeless one follows the plan (#1602).
+                    tab.dialogs.clear_modal();
+                    crate::plugin_ui::refresh_dialog(tab);
                 }
                 Ok((result, effect))
             }
