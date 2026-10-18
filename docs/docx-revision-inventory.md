@@ -90,7 +90,7 @@ comment-marker id in the document.
 - **Typing, paste and Replace** record a tracked insertion: ordinary editable
   text whose runs carry `RunProps::tracked_insert`. Inside a hyperlink the
   insertion is recorded inside the link too (`<w:hyperlink><w:ins>`, a link
-  edge ends an insertion; #1465), for typing, Replace and AutoCorrect.
+  edge ends an insertion; #1465), for typing and Replace.
   Consecutive typing extends
   one insertion; a save writes it as one `<w:ins>`; it is listed as one
   revision and Accept / Reject act on all its runs. An insertion that is

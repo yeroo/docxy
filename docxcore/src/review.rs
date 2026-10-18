@@ -359,8 +359,8 @@ fn sweep_inlines(
     n
 }
 
-/// [`sweep_inlines`] over a link's `content` and its `runs`, whose swept runs
-/// are moved into `content` only when something in them was swept.
+/// [`sweep_inlines`] over a link's `content` and its `runs`; the runs are
+/// rebuilt in place only when something in them was swept.
 fn sweep_link(
     h: &mut crate::model::Hyperlink,
     target: RevisionTarget,

@@ -16,7 +16,7 @@
 //!
 //! * Deleting text inside a hyperlink records the deletion inside the link,
 //!   as Word does: a wrapper never straddles the link's boundary (#1462).
-//!   Typing, Replace and AutoCorrect inside a link record the insertion
+//!   Typing and Replace inside a link record the insertion
 //!   inside it too (#1465).
 //!
 //! Not recorded (they change the document as without tracking): paragraph
@@ -186,7 +186,7 @@ impl Editor {
         // A deletion inside a link is recorded among the link's children, so a
         // simple link's `runs` move into its `content` first.
         if let Some(p) = para_mut(&mut self.doc.body, path) {
-            link_runs_into_content(&mut p.content, idx);
+            links_runs_into_content(&mut p.content, idx, idx + 1);
         }
         let Some(para) = resolve_para(&self.doc.body, path) else {
             return true;
@@ -378,7 +378,7 @@ impl Editor {
         match self.fresh_revision_metadata() {
             Some(meta) => {
                 for inline in out.paras.iter_mut().flatten() {
-                    with_props(inline, |props| record_insert(props, &meta));
+                    with_props_deep(inline, &|props| record_insert(props, &meta));
                 }
                 // Each picture's `w:ins` has an id of its own, after the
                 // text's (which `unshare_insert_ids` then keeps clear of).
@@ -389,11 +389,30 @@ impl Editor {
             }
             None => {
                 for inline in out.paras.iter_mut().flatten() {
-                    with_props(inline, clear_insert_record);
+                    with_props_deep(inline, &clear_insert_record);
                 }
             }
         }
         out
+    }
+}
+
+/// [`with_props`], also reaching the runs and children of a link (a clip's
+/// link, which is new content, is marked changed when `f` may have touched it).
+pub(super) fn with_props_deep(inline: &mut Inline, f: &impl Fn(&mut RunProps)) {
+    match inline {
+        Inline::Hyperlink(h) => {
+            if link_has_record(h) {
+                h.content_changed = true;
+            }
+            for r in &mut h.runs {
+                f(&mut r.props);
+            }
+            for inner in &mut h.content {
+                with_props_deep(inner, f);
+            }
+        }
+        other => with_props(other, |props| f(props)),
     }
 }
 
@@ -487,12 +506,13 @@ fn has_record(i: &Inline) -> bool {
 /// [`has_record`], also for anything inside a link.
 fn has_record_deep(i: &Inline) -> bool {
     match i {
-        Inline::Hyperlink(h) => {
-            h.runs.iter().any(|r| r.props.tracked_insert.is_some())
-                || h.content.iter().any(has_record_deep)
-        }
+        Inline::Hyperlink(h) => link_has_record(h),
         other => has_record(other),
     }
+}
+
+fn link_has_record(h: &Hyperlink) -> bool {
+    h.runs.iter().any(|r| r.props.tracked_insert.is_some()) || h.content.iter().any(has_record_deep)
 }
 
 /// Visit the recorded runs of `content` in order, a link's too. A link's edge
@@ -584,7 +604,7 @@ fn plan_delete(content: &[Inline], idx: usize, author: &str) -> Plan {
                 Inline::Run(r) => (&r.props, idx - acc + 1 == len),
                 Inline::Tab(props) | Inline::Break(_, props) => (props, true),
                 // Planned among the link's own children; `runs` were moved
-                // into `content` by `link_runs_into_content`.
+                // into `content` by `links_runs_into_content`.
                 Inline::Hyperlink(h) if h.runs.is_empty() => {
                     return plan_delete(&h.content, idx - acc, author);
                 }
@@ -616,31 +636,10 @@ fn plan_delete(content: &[Inline], idx: usize, author: &str) -> Plan {
     Plan::Remove
 }
 
-/// Move the `runs` of the link at offset `idx` of `content` (and of any link
-/// nested in it there) to the front of its `content`, where a tracked deletion
-/// can sit beside them. Offsets are unchanged: `runs` come first.
-fn link_runs_into_content(content: &mut [Inline], idx: usize) {
-    let mut acc = 0;
-    for inline in content.iter_mut() {
-        let len = inline_len(inline);
-        if idx < acc + len {
-            if let Inline::Hyperlink(h) = inline {
-                if !h.runs.is_empty() {
-                    let runs = std::mem::take(&mut h.runs).into_iter().map(Inline::Run);
-                    h.content.splice(0..0, runs);
-                    h.content_changed = true;
-                }
-                link_runs_into_content(&mut h.content, idx - acc);
-            }
-            return;
-        }
-        acc += len;
-    }
-}
-
-/// [`link_runs_into_content`] for every link the range `[start, end)` touches,
-/// so a record put on (or taken off) its text lands where the serializer
-/// groups it.
+/// Move the `runs` of every link the range `[start, end)` touches (and of any
+/// link nested in it there) to the front of its `content`, where a tracked
+/// deletion or insertion can sit beside them. Offsets are unchanged: `runs`
+/// come first.
 fn links_runs_into_content(content: &mut [Inline], start: usize, end: usize) {
     let mut acc = 0;
     for inline in content.iter_mut() {

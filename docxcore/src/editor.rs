@@ -2203,7 +2203,7 @@ impl Editor {
                 // A copy of a recorded insertion is plain text, not a second
                 // record of it.
                 for inline in &mut inlines {
-                    track::with_props(inline, track::clear_insert_record);
+                    track::with_props_deep(inline, &track::clear_insert_record);
                 }
                 paras.push(inlines);
             }

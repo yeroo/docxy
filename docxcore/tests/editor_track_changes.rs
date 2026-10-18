@@ -1239,7 +1239,7 @@ fn typing_in_a_toc_entry_link_is_recorded_and_rejects_after_reload_1465() {
     assert_eq!(para_at(&accepted, 0).plain_text(), "Inzztro\t1");
 }
 
-/// Replace and AutoCorrect inside a link record the text put in, so Reject
+/// Replace inside a link records the text put in, so Reject
 /// All gives back the original, not both (#1465).
 #[test]
 fn replace_in_a_link_rejects_to_the_original_1465() {
@@ -1368,16 +1368,6 @@ fn accept_and_reject_in_a_raw_kept_link_survive_a_save_1465() {
         saved.contains("new") && !saved.contains("<w:ins "),
         "{saved}"
     );
-    // A link nothing was swept in keeps its raw XML verbatim.
-    let untouched = parse_document_xml(
-        &format!(
-            "<w:document {W}><w:body><w:p><w:hyperlink w:anchor=\"a\"><w:r><w:t>x</w:t></w:r><w:r><w:tab/></w:r></w:hyperlink></w:p></w:body></w:document>"
-        ),
-        &Relationships::default(),
-    );
-    let mut swept = untouched.clone();
-    swept.accept_all_revisions();
-    assert_eq!(document_to_xml(&swept), document_to_xml(&untouched));
 }
 
 /// A recorded insertion inside a link that kept its raw XML, with the link
@@ -1413,4 +1403,77 @@ fn sweeping_a_recorded_insertion_marks_a_raw_kept_link_changed_1465() {
     );
     let saved = document_to_xml(&accepted);
     assert!(!saved.contains("STALE") && saved.contains("zz"), "{saved}");
+}
+
+/// Accept All sweeps through a link nothing was recorded in: it keeps its raw
+/// XML verbatim and is not marked changed (#1465).
+#[test]
+fn a_sweep_leaves_an_untouched_raw_kept_link_alone_1465() {
+    let rels = docxcore::load::parse_rels_xml(
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId9\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"https://example.com/\" TargetMode=\"External\"/></Relationships>",
+    );
+    let doc = parse_document_xml(
+        &format!(
+            "<w:document {W} xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><w:body><w:p><w:hyperlink r:id=\"rId9\" w:history=\"1\"><w:r><w:t>Go</w:t></w:r><w:r><w:tab/></w:r></w:hyperlink></w:p><w:p><w:r><w:t>b</w:t></w:r></w:p></w:body></w:document>"
+        ),
+        &rels,
+    );
+    let before = document_to_xml(&doc);
+    let mut ed = Editor::new(doc);
+    as_author(&mut ed, "Ada");
+    ed.caret = Caret {
+        path: vec![1],
+        offset: 1,
+    };
+    ed.insert_str("q");
+    assert_eq!(kinds(&ed.doc), [RevisionKind::Insert]);
+    let mut accepted = ed.doc.clone();
+    assert!(
+        accepted
+            .accept_all_revisions()
+            .iter()
+            .all(|o| o.is_applied())
+    );
+    let Inline::Hyperlink(h) = &para_at(&accepted, 0).content[0] else {
+        panic!("link")
+    };
+    assert!(h.raw.is_some() && !h.content_changed);
+    let link =
+        |x: &str| x[x.find("<w:hyperlink").unwrap()..x.find("</w:hyperlink>").unwrap()].to_string();
+    assert_eq!(link(&document_to_xml(&accepted)), link(&before));
+}
+
+/// A copy of text typed inside a link is plain, and pasted it is plain
+/// (tracking off) or a revision of its own (tracking on), whose Reject All
+/// leaves the original (#1465).
+#[test]
+fn copying_text_recorded_in_a_link_and_pasting_it_1465() {
+    let mut ed = tracked(SEE_HERE);
+    at(&mut ed, 5);
+    ed.insert_str("XY");
+    select(&mut ed, 0, 8); // "See hXYe": the whole link run's start through the insertion
+    let clip = ed.copy().expect("clip");
+    // Copy is plain.
+    let mut plain = Editor::new(parse(&para("zz")));
+    at(&mut plain, 1);
+    plain.paste(&clip);
+    assert!(plain.doc.revisions().is_empty(), "{}", xml(&plain));
+    // Paste with tracking on is a revision of its own.
+    let mut tracked_paste = Editor::new(parse(&para("zz")));
+    as_author(&mut tracked_paste, "Bo");
+    at(&mut tracked_paste, 1);
+    tracked_paste.paste(&clip);
+    let kinds_now = kinds(&tracked_paste.doc);
+    assert!(kinds_now.iter().all(|k| *k == RevisionKind::Insert) && !kinds_now.is_empty());
+    let saved = xml(&tracked_paste);
+    assert!(!saved.contains("w:author=\"Ada\""), "{saved}");
+    // Pasting back into the source document: Reject of the pasted text only.
+    let mut again = Editor::new(ed.doc.clone());
+    as_author(&mut again, "Bo");
+    at(&mut again, 0);
+    again.paste(&clip);
+    let ids = insert_ids(&xml(&again));
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(ids.len(), unique.len(), "{}", xml(&again));
+    assert!(ids.len() >= 2, "{}", xml(&again));
 }
