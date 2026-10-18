@@ -1104,8 +1104,6 @@ fn parse_active_tab(xml: &str) -> usize {
     }
 }
 
-/// Plain text of each `<si>` (rich-text runs concatenated), each `<t>` read
-/// as Excel reads it ([`TextRun`]).
 /// The indices of the entries whose loaded text another entry shares: after
 /// the edge trim a rich `<si>` and a plain one can read alike, and the text
 /// alone no longer names the entry a cell used (#1188).
@@ -1126,6 +1124,8 @@ fn ambiguous_shared(shared: &[String]) -> HashSet<usize> {
     out
 }
 
+/// Plain text of each `<si>` (rich-text runs concatenated), each `<t>` read
+/// as Excel reads it ([`TextRun`]).
 fn parse_shared_strings(xml: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut p = XmlParser::new(xml);
@@ -1168,8 +1168,16 @@ fn parse_shared_strings(xml: &str) -> Vec<String> {
 /// The concatenated text of every `<t>` in `frag` (a note's `<text>`), each
 /// read as Excel reads it ([`TextRun`]); phonetic runs are skipped, as in
 /// [`parse_shared_strings`].
-pub(crate) fn runs_text(frag: &str) -> String {
+pub(crate) fn runs_text(frag: &str, inherited_preserve: bool) -> String {
     let mut out = String::new();
+    // Wrapped, the fragment resolves `xml:space` from its ancestors too.
+    let wrapped;
+    let frag = if inherited_preserve {
+        wrapped = format!("<x xml:space=\"preserve\">{frag}</x>");
+        &wrapped
+    } else {
+        frag
+    };
     let mut p = XmlParser::new(frag);
     let mut run: Option<TextRun> = None;
     let mut in_rph = false;
@@ -2528,8 +2536,6 @@ fn written_col_defs(defs: &[ColDef]) -> Vec<ColDef> {
     out
 }
 
-/// One worksheet: `<sheetData>`, `<cols>`, `<mergeCells>`; everything else is
-/// preserved through the source-splice on save.
 #[cfg(test)]
 fn parse_worksheet(
     xml: &str,
@@ -2539,9 +2545,11 @@ fn parse_worksheet(
     parse_worksheet_with(xml, shared, &HashSet::new(), hlink_targets)
 }
 
-/// [`parse_worksheet`], with the shared-string indices whose text another
-/// entry also loads as ([`ambiguous_shared`]): a plain text cell on one keeps
-/// its index ([`CellMeta::sst`]).
+/// One worksheet: `<sheetData>`, `<cols>`, `<mergeCells>`; everything else is
+/// preserved through the source-splice on save. `ambiguous` is the
+/// shared-string indices whose text another entry also loads as
+/// ([`ambiguous_shared`]): a plain text cell on one keeps its index
+/// ([`CellMeta::sst`]).
 fn parse_worksheet_with(
     xml: &str,
     shared: &[String],
@@ -12296,6 +12304,23 @@ mod tests {
         assert!(xml.contains(r#"<c r="A1" t="s"><v>2</v></c>"#), "{xml}");
         assert!(xml.contains(r#"<c r="A2" t="s"><v>0</v></c>"#), "{xml}");
         assert!(xml.contains(r#"<c r="A3" t="s"><v>0</v></c>"#), "{xml}");
+    }
+
+    /// #1188: a cell whose text changed under its kept index (the value set
+    /// in place, its meta left) falls back to the text lookup.
+    #[test]
+    fn a_stale_sst_index_is_not_written() {
+        let mut pkg = load_xlsx(&twin_strings_xlsx()).unwrap();
+        let cell = pkg.workbook.sheets[0].cells.get_mut(&(1, 0)).unwrap();
+        assert_eq!(cell.meta.as_deref().map(|m| m.sst), Some(Some(1)));
+        cell.value = CellValue::Text("z".into());
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let xml = part_text(&re, "xl/worksheets/sheet1.xml");
+        assert!(xml.contains(r#"<c r="A2" t="s"><v>2</v></c>"#), "{xml}");
+        assert_eq!(
+            re.workbook.sheets[0].cell(1, 0).unwrap().value,
+            CellValue::Text("z".into())
+        );
     }
 
     /// #761: a CR written as a reference is a real CR. §2.11 normalises the
