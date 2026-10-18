@@ -13,6 +13,7 @@ struct Saved {
     sched: Schedule,
     level: Option<Leveled>,
     leveled: bool,
+    revision: u64,
 }
 
 impl Editor {
@@ -21,8 +22,8 @@ impl Editor {
     /// and the undo cap work unchanged; the batch then records the state
     /// before it once, which clears redo. A batch that ends where it began
     /// records nothing and keeps redo. On `Err` every piece of editor state
-    /// (the plan, history, redo, dirty flag, selection, collapsed summaries
-    /// and the derived schedule) is restored exactly, whatever `edit` had
+    /// (the plan, history, redo, dirty flag, selection, collapsed summaries,
+    /// the derived schedule and the revision) is restored exactly, whatever `edit` had
     /// already applied. A batch opened inside another (a control verb that
     /// batches its own setters, run as one of a plugin command's ops) is
     /// part of the outer step: it runs `edit` and leaves the rollback to
@@ -45,6 +46,7 @@ impl Editor {
             sched: self.sched.clone(),
             level: self.level.clone(),
             leveled: self.leveled,
+            revision: self.revision,
         };
         let undo = std::mem::take(&mut self.undo);
         let redo = std::mem::take(&mut self.redo);
@@ -87,6 +89,9 @@ impl Editor {
         self.sched = saved.sched;
         self.level = saved.level;
         self.leveled = saved.leveled;
+        // The revision too: a rolled-back batch changed nothing a host
+        // caches by it (a plugin dialog's values, #1610).
+        self.revision = saved.revision;
         self.undo = undo;
         self.redo = redo;
     }

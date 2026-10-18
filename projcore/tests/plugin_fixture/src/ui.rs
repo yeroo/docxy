@@ -7,8 +7,13 @@
 //!   of two swatches (`fixture.blue`, `fixture.red`).
 //! - Menus: a row-menu item `fixture.rename` after "Notes...".
 //! - Dialogs: a Task Information page "Fixture" with a multiline and a grid,
-//!   and a dialog `fixture.options` (one number) that `fixture.hello` opens;
-//!   OK sends `fixture.hello` again with the values.
+//!   and a dialog `fixture.options` (a number, a label the state fills from
+//!   the number and the first selected task's name, a grid of the plan's
+//!   task names whose selected row the state keeps on the selected task,
+//!   and a Bump button, #1610)
+//!   that `fixture.hello` opens; OK sends `fixture.hello` again with the
+//!   values, Bump sends it with `button: "bump"` (one `task.set` op naming
+//!   the task "Bumped by fixture", the dialog kept open).
 //! - Commands: `fixture.hello` (the dialog, then a status with its number),
 //!   `fixture.flag` (flips the toggle: a view switch of the same name the
 //!   host stores in the plan's formatting, #1553), the swatches (set the palette,
@@ -45,7 +50,9 @@ const MANIFEST: &str = r##"{
       {"name":"fixture.pick","label":"Fixture p&ick:","kind":"dropdown","items":["none"],"value":"none"},
       {"name":"fixture.locked","label":"Fixture locked","kind":"checkbox","value":true}]}]},
     {"id":"fixture.options","title":"Fixture Options","pages":[{"name":"General","controls":[
-      {"name":"n","label":"&Number:","kind":"number","value":"1"}]}],"buttons":["OK","Cancel"]},
+      {"name":"n","label":"&Number:","kind":"number","value":"1"},
+      {"name":"fixture.echo","label":"","kind":"label","value":""},
+      {"name":"fixture.tasks","label":"Tasks","kind":"grid","columns":[{"name":"Name","kind":"text"}],"value":[]}]}],"buttons":["OK","Cancel",{"id":"bump","label":"&Bump"}]},
     {"id":"fixture.sheet","title":"Fixture Sheet","modeless":true,"pages":[{"name":"Sheet","controls":[
       {"name":"fixture.rows","label":"Tasks","kind":"grid","commit_command":true,"columns":[{"name":"Pick","kind":"check"},{"name":"Name","kind":"text"},{"name":"Units","kind":"number"}],"value":[]}]}],
      "buttons":[{"id":"apply","label":"&Apply","default":true},{"id":"clear","label":"Clear"},{"id":"close","label":"Close","cancel":true}]}],
@@ -165,6 +172,23 @@ fn task_names(req: &Json) -> Vec<String> {
     task_field(req, "Name")
 }
 
+/// The name of the plan's task `uid`.
+fn task_name_of(req: &Json, uid: i64) -> Option<String> {
+    let uids = task_field(req, "UID");
+    let at = uids.iter().position(|u| u.trim() == uid.to_string())?;
+    task_names(req).get(at).cloned()
+}
+
+/// A number control's value as text: the host sends what was typed, a
+/// test may send a number.
+fn number_text(n: &Json) -> String {
+    match n {
+        Json::Str(s) => s.clone(),
+        Json::Num(x) => x.to_string(),
+        _ => String::new(),
+    }
+}
+
 /// The Fixture Sheet dialog's rows (#1602): one per task, `Pick` kept from
 /// the open dialog's values by name, `Units` 100.
 fn sheet_rows(req: &Json, values: Option<&Json>) -> String {
@@ -234,6 +258,34 @@ pub unsafe extern "C" fn yppx_ui_state(input: *const u8, len: usize, out: *mut Y
                 picked_count(values) > 0
             ));
         }
+        // Fixture Options (#1610): the label says the number typed and the
+        // first selected task's name, so it follows the number (a control
+        // change) and Bump's rename (the plan moved under a modal dialog).
+        if dialog.get("id").and_then(Json::str) == Some("fixture.options") {
+            let n = dialog
+                .get("values")
+                .and_then(|v| v.get("n"))
+                .map_or_else(String::new, number_text);
+            let name = first_uid(&req)
+                .and_then(|uid| task_name_of(&req, uid))
+                .unwrap_or_default();
+            // The grid: one row per task, the selected task's row selected
+            // (a modal dialog's grid follows the plan, #1610).
+            let names = task_names(&req);
+            let rows: Vec<String> = names.iter().map(|n| format!("[{}]", quote(n))).collect();
+            let selected = first_uid(&req)
+                .and_then(|uid| {
+                    task_field(&req, "UID")
+                        .iter()
+                        .position(|u| u.trim() == uid.to_string())
+                })
+                .map_or("null".to_string(), |i| i.to_string());
+            reply.push_str(&format!(
+                r#","values":{{"fixture.echo":{},"fixture.tasks":[{}],"fixture.tasks.selected_row":{selected}}}"#,
+                quote(&format!("Number {n} for {name}")),
+                rows.join(",")
+            ));
+        }
         if dialog.get("id").and_then(Json::str) == Some("task-information") {
             let uid = dialog.get("uid").and_then(Json::num).unwrap_or(0.0) as i64;
             // The values, the dropdown's items for this plan (#1556) and a
@@ -262,16 +314,21 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
     let id = req.get("id").and_then(Json::str).unwrap_or_default();
     let reply = match id {
         "fixture.format" => r#"{"ops":[],"status":"Fixture: format"}"#.to_string(),
-        "fixture.hello" => match req.get("values") {
-            None => {
+        "fixture.hello" => match (req.get("button").and_then(Json::str), req.get("values")) {
+            // Bump (#1610): one op on the first selected task, the dialog
+            // kept open.
+            (Some("bump"), _) => match first_uid(&req) {
+                Some(uid) => format!(
+                    r#"{{"ops":[{{"verb":"task.set","args":{{"uid":{uid},"name":"Bumped by fixture"}}}}],"status":{}}}"#,
+                    quote(&format!("Fixture: bumped task {uid}"))
+                ),
+                None => r#"{"ops":[],"status":"Fixture: select a task first"}"#.to_string(),
+            },
+            (_, None) => {
                 r#"{"ops":[],"dialog":"fixture.options","status":"Fixture: asking"}"#.to_string()
             }
-            Some(values) => {
-                let n = values.get("n").map_or_else(String::new, |n| match n {
-                    Json::Str(s) => s.clone(),
-                    Json::Num(x) => x.to_string(),
-                    _ => String::new(),
-                });
+            (_, Some(values)) => {
+                let n = values.get("n").map_or_else(String::new, number_text);
                 format!(
                     r#"{{"ops":[],"status":{}}}"#,
                     quote(&format!("Fixture: hello {n}"))

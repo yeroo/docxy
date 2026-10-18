@@ -115,6 +115,7 @@ test a swatch sets the plan's palette (an edit) and the gallery follows
 
 test the button's command opens the plugin's dialog, whose OK sends the values back
   open copy:../fixtures/project-clipboard.xml
+  click C1
   call ribbon-click {"tab":"Task","command":"Hello"}
   assert dialog is plugin
   call dialog-read {}
@@ -125,10 +126,37 @@ test the button's command opens the plugin's dialog, whose OK sends the values b
   assert reply.controls.0.plugin is true
   assert reply.buttons.0.label is OK
   assert reply.buttons.1.label is Cancel
+  assert reply.buttons.2.id is bump
+  # The label follows the number: a control change applies the state's
+  # labels (#1610), and the task's name from the plan.
+  assert reply.controls.1.name is fixture.echo
+  assert reply.controls.1.kind is label
+  assert reply.controls.1.value is Number 1 for A
+  # The grid lists the plan's tasks with the selected one's row selected
+  # (the state's name.selected_row).
+  assert reply.controls.2.name is fixture.tasks
+  assert reply.controls.2.rows.0.0 is A
+  assert reply.controls.2.selected_row is 0
   call dialog-set {"control":"n","value":7}
+  call dialog-read {}
+  assert reply.controls.1.value is Number 7 for A
+  # Bump renames the task under the modal dialog: the plan moved, so the
+  # state's values apply (the label), while the typed number stays.
+  call dialog-click {"button":"Bump"}
+  assert dialog is plugin
+  assert status is Fixture: bumped task 1
+  call dialog-read {}
+  assert reply.controls.0.value is 7
+  assert reply.controls.1.value is Number 7 for Bumped by fixture
+  # The modal dialog's grid shows the renamed task and keeps its row.
+  assert reply.controls.2.rows.0.0 is Bumped by fixture
+  assert reply.controls.2.selected_row is 0
   call dialog-click {"button":"OK"}
   assert dialog is none
   assert status is Fixture: hello 7
+  assert selected_name is Bumped by fixture
+  key ctrl+z
+  assert selected_name is A
   # Cancel sends nothing.
   call ribbon-click {"tab":"Task","command":"Hello"}
   assert dialog is plugin

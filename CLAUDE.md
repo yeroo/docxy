@@ -434,7 +434,12 @@
   ignores it), and every plugin control change marks the dialog `stale`:
   `plugin_ui::refresh_dialog` asks `yppx_ui_state` again with `dialog.values`
   from `complete_project`, the harness dialog verbs, typing and clicks
-  (#1602, #1567). `uiharness/cases/project-plugin-ui.uit` drives
+  (#1602, #1567) and applies its items, enabled flags, `Label` values and
+  `name.selected_row`; every value applies when the plan or the selection
+  moved since `Dialog::seen` (set at open, and by `extend_task_info`), modal
+  or not (#1610). A rolled-back `Editor::batch` restores the revision with
+  the rest of the editor's state (a refused plugin OK is no move).
+  `uiharness/cases/project-plugin-ui.uit` drives
   the fixture through all of it; nothing changes without a UI plugin.
 
 ## Project table: resizable columns and AutoFilter (#1533)

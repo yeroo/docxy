@@ -562,8 +562,8 @@ impl Docxy {
     }
 
     /// Ask the plugin's state again for the active tab's dialog when it is
-    /// stale or the plan moved under a modeless one (#1602): before a reply
-    /// is written.
+    /// stale or the plan or the selection moved under it (#1602, #1610):
+    /// before a reply is written.
     pub(crate) fn refresh_plugin_dialog(&mut self) {
         if !self.app_dialogs.is_open()
             && let Some(tab) = self.tabs.get_mut(self.active)

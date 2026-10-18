@@ -474,6 +474,28 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         .unwrap();
     assert_eq!(said.status.as_deref(), Some("Fixture: hello 7"));
     assert_eq!(said.dialog, None);
+    // The dialog's label follows the number and the selected task (#1610),
+    // and Bump renames that task with the dialog kept open.
+    let options = StateCtx {
+        dialog_values: Some(Json::obj(vec![("n", Json::Num(7.0))])),
+        ..ctx(vec![1], Some(("fixture.options".into(), None)))
+    };
+    let state = ui.state(&options).unwrap();
+    assert_eq!(
+        state.value("fixture.echo"),
+        Some(&Json::str("Number 7 for Phase"))
+    );
+    let bumped = ui
+        .command(&Command {
+            button: Some("bump".into()),
+            ..cmd("fixture.hello", vec![1], Some(Json::Obj(Vec::new())))
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(bumped.ops.len(), 1);
+    assert_eq!(bumped.ops[0].verb, "task.set");
+    assert_eq!(bumped.status.as_deref(), Some("Fixture: bumped task 1"));
+    assert!(!bumped.close);
 
     // The overlay: a label at the first bar, a link from the first bar's
     // end to the second bar's start.

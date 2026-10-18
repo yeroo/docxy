@@ -1292,7 +1292,10 @@ interactive (a built-in dialog's grid stays read-only, edited by `dialog-set`
 alone): its rows select and its cells are typed into. A plugin grid declared with
 `commit_command` sends its dialog's command on every cell commit (Enter on a
 typed cell, Space or a click on a check cell, `dialog-set` of a cell), whose
-ops apply at once. A grid control also reports
+ops apply at once; the dialog's grids then show the rows the plugin's state
+gives for the moved plan, modal or not (#1610). A plugin `label` follows the
+state on every control change, so a `dialog-read` after a `dialog-set` reads
+what the plugin says about the new value. A grid control also reports
 `selected_row`, `column` (the active cell's) and `editing` (the text typed
 into the cell so far, null otherwise); its `column_kinds` may say `check`, a
 column drawn as Project's check mark that a click or Space toggles.
