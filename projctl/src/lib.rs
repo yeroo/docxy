@@ -43,11 +43,11 @@
 //! | `cal.list` | `{}` | `{count, calendars: [{uid, name, base: {uid, name} \| null, default, resources: [uid…], tasks: [uid…]}]}` (#1605), base calendars first |
 //! | `cal.get` | `{calendar}` | the calendar (`calendar` a uid or a name) with its resolved `week` (`[{day, working, times: [["08:00","12:00"], …], stated}]`), `exceptions: [{index, name, from, to, working, times, recurring}]` and `work_weeks: [{index, name, from, to, week}]` |
 //! | `cal.day` | `{calendar, date}` | `{date, working, times, based_on: {kind: exception \| work_week \| default, calendar, name}}`: Change Working Time's "Working times for" and "Based on" |
-//! | `cal.add` | `{name, base?, copy?}` | the new calendar: derived from `base`, else a base calendar with Project's standard week, or a copy of `copy` |
+//! | `cal.add` | `{name, base?, copy?}` | the new calendar: derived from `base`, else a base calendar with Project's standard week, or a copy of the base calendar `copy` |
 //! | `cal.set` | `{calendar, name?, base?, week?}` | the calendar after the change: `week` `{"Mon": {"working": true, "times": [["08:00","12:00"],["13:00","17:00"]]}, "Sat": {"working": false}}` for the days given (`null` for a derived calendar's day inherits the base again) |
-//! | `cal.exception.set` | `{calendar, index?, name?, from, to, working?, times?}` | the calendar; no `index` adds a date-range exception (non-working unless `times`), an `index` replaces that one (a repeating exception, `recurring` in `cal.get`, is refused) |
-//! | `cal.exception.del` | `{calendar, index}` | the calendar |
-//! | `cal.workweek.set` | `{calendar, index?, name?, from, to, week}` | the calendar; `week` as `cal.set`'s, the days the work week states |
+//! | `cal.exception.set` | `{calendar, index?, name?, from, to, working?, times?}` | the calendar; no `index` adds a date-range exception (non-working unless `times`), an `index` replaces that one's dates and day, keeping its name unless `name` is given (a repeating exception, `recurring` in `cal.get`, is read only) |
+//! | `cal.exception.del` | `{calendar, index}` | the calendar (a repeating exception is read only) |
+//! | `cal.workweek.set` | `{calendar, index?, name?, from, to, week}` | the calendar; `week` as `cal.set`'s, the days the work week states (`{}` for none; required, as a replace drops the days not given); the name is kept unless given |
 //! | `cal.workweek.del` | `{calendar, index}` | the calendar |
 //! | `cal.del` | `{calendar}` | `{deleted}`: refused for the project calendar, one a task or resource uses, or one another derives from |
 //! | `proj.set` | `{title?, start?, status_date?, current_date?, calendar?, new_tasks?}` | the same reply after the change (#1587): dates `YYYY-MM-DD` (the project calendar's day start; a bare status date is the day's end, as Project sets it) or `YYYY-MM-DDTHH:MM`, `null` clearing a status or current date, `calendar` a base calendar's name or uid, `new_tasks` `auto` or `manual` (Task > Tasks > Mode, #1585; existing tasks keep their own mode). All apply in one undo step, or none does |
@@ -1595,8 +1595,8 @@ fn calendar_json(ed: &Editor, c: &Calendar) -> Json {
 /// The calendar `args` names: `calendar` as a uid or a name, or `uid`.
 fn calendar_arg(ed: &Editor, args: &Json) -> Result<i32, String> {
     match args.get("calendar").or_else(|| args.get("uid")) {
-        Some(Json::Num(n)) => {
-            let uid = *n as i32;
+        Some(Json::Num(_)) => {
+            let uid = calendar_uid(args.get("calendar").or_else(|| args.get("uid")), "calendar")?;
             ed.project()
                 .calendar(uid)
                 .map(|_| uid)
@@ -1607,12 +1607,21 @@ fn calendar_arg(ed: &Editor, args: &Json) -> Result<i32, String> {
     }
 }
 
+/// A calendar reference given as a number: a whole number in i32 range
+/// (2.9 is not calendar 2).
+fn calendar_uid(value: Option<&Json>, key: &str) -> Result<i32, String> {
+    value
+        .and_then(Json::as_i64)
+        .and_then(|n| i32::try_from(n).ok())
+        .ok_or_else(|| format!("'{key}' must be a whole-number calendar uid or a name"))
+}
+
 /// An optional calendar reference under `key`, a uid or a name.
 fn calendar_opt(ed: &Editor, args: &Json, key: &str) -> Result<Option<i32>, String> {
     match args.get(key) {
         None | Some(Json::Null) => Ok(None),
-        Some(Json::Num(n)) => {
-            let uid = *n as i32;
+        Some(Json::Num(_)) => {
+            let uid = calendar_uid(args.get(key), key)?;
             ed.project()
                 .calendar(uid)
                 .map(|_| Some(uid))
@@ -1807,6 +1816,11 @@ fn cal_workweek_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
     let uid = calendar_arg(ed, args)?;
     let index = index_arg(args)?;
     let (from, to) = range_args(args)?;
+    // The week is the work week: without it a replace would drop every
+    // day the work week states. `{}` states none on purpose.
+    if matches!(args.get("week"), None | Some(Json::Null)) {
+        return Err("needs a 'week' (the days the work week states; {} for none)".into());
+    }
     let mut week: [DayPatch; 7] = Default::default();
     for (d, pattern) in week_arg(args, "week")? {
         week[d] = pattern;
@@ -3445,6 +3459,14 @@ it"
                 "cal.workweek.set",
                 r#"{"calendar":"Standard","from":"2026-03-09","to":"2026-03-13","week":{"Mon":"08:00-17:00"}}"#,
             ),
+            // A work week needs its week; a calendar uid is a whole number.
+            (
+                "cal.workweek.set",
+                r#"{"calendar":"Standard","from":"2026-03-09","to":"2026-03-13"}"#,
+            ),
+            ("cal.get", r#"{"calendar":1.5}"#),
+            ("cal.del", r#"{"calendar":2.9}"#),
+            ("cal.add", r#"{"name":"Half","base":1.5}"#),
             ("cal.set", r#"{"calendar":"Standard","base":"Night Shift"}"#),
             ("cal.add", r#"{"name":"standard"}"#),
             (

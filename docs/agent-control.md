@@ -324,8 +324,9 @@ and where that comes from, as Change Working Time's "Working times for" and
 
 `cal.add {name, base?, copy?}` adds a calendar: derived from `base` (it states
 no day of its own until `cal.set` does), else a base calendar with Project's
-standard week, or a copy of `copy`'s week (as it resolves: the copy is a base
-calendar), exceptions and work weeks; names are
+standard week, or a copy of the base calendar `copy` (its week, exceptions
+and work weeks; a derived calendar is refused, as Project's Create New Base
+Calendar offers base calendars only); names are
 unique ignoring ASCII case. `cal.set {calendar, name?, base?, week?}` renames,
 rebases a derived calendar (never a base one, never onto itself) and sets days
 of the default week: `week` is an object of weekdays (`Mon`, `monday`, …) to
@@ -334,10 +335,13 @@ overlapping; `working: false` a non-working day; `working: true` without times
 Project's standard day; `null` on a derived calendar's day inherits the base
 again). `cal.exception.set {calendar, index?, name?, from, to, working?,
 times?}` adds (no `index`) or replaces (by `index`) a date-range exception as
-Project writes one (non-working unless given times; a repeating exception,
-`recurring: true`, is read only and replacing it is refused), `cal.exception.del
-{calendar, index}` removes it; `cal.workweek.set {calendar, index?, name?,
-from, to, week}` and `cal.workweek.del {calendar, index}` do the same for work
+Project writes one (non-working unless given times); a replace sets the dates
+and the day and keeps the name unless `name` is given; a repeating exception
+(`recurring: true`) is read only: neither replaced nor removed. `cal.exception.del
+{calendar, index}` removes a date-range exception; `cal.workweek.set {calendar,
+index?, name?, from, to, week}` (`week` required: the days the work week
+states, `{}` for none, since a replace drops the days not given) and
+`cal.workweek.del {calendar, index}` do the same for work
 weeks. `cal.del {calendar}` removes a calendar nothing uses: not the project
 calendar, no task's or resource's, no other calendar's base. Each edit is one
 undo step, a value the calendar already has records none, every argument is

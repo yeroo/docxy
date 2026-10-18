@@ -558,9 +558,10 @@ fn tool_defs() -> Json {
         tool(
             "yppxy_cal_add",
             "Add a calendar: derived from `base`, else a base calendar with Project's standard \
-             week (Monday to Friday, 08:00-12:00 and 13:00-17:00), or a copy of `copy`'s week, \
-             exceptions and work weeks. Names are unique (ASCII case ignored). Returns the \
-             calendar. One undo step.",
+             week (Monday to Friday, 08:00-12:00 and 13:00-17:00), or a copy of the base \
+             calendar `copy` (its week, exceptions and work weeks; a derived calendar is \
+             refused). Names are unique (ASCII case ignored). Returns the calendar. One undo \
+             step.",
             vec![
                 ("name", prop("string", "The new calendar's name.")),
                 (
@@ -614,9 +615,9 @@ fn tool_defs() -> Json {
         tool(
             "yppxy_cal_exception_set",
             "Add (no index) or replace (index) a date-range exception of a calendar: from and \
-             to dates, non-working unless `times` (or working true, the standard day) are given. \
-             A repeating exception (recurring in yppxy_cal_get) is read only; replacing it is \
-             refused. Returns the calendar. One undo step.",
+             to dates, non-working unless `times` (or working true, the standard day) are given; \
+             a replace keeps the name unless given. A repeating exception (recurring in \
+             yppxy_cal_get) is read only. Returns the calendar. One undo step.",
             vec![
                 calendar(),
                 (
@@ -640,11 +641,12 @@ fn tool_defs() -> Json {
                 target(),
                 tab(),
             ],
-            &["calendar", "from", "to"],
+            &["calendar", "from", "to", "week"],
         ),
         tool(
             "yppxy_cal_exception_del",
-            "Remove exception `index` of a calendar. Returns the calendar. One undo step.",
+            "Remove exception `index` of a calendar (a repeating exception is read only). \
+             Returns the calendar. One undo step.",
             vec![
                 calendar(),
                 (
@@ -659,7 +661,8 @@ fn tool_defs() -> Json {
         tool(
             "yppxy_cal_workweek_set",
             "Add (no index) or replace (index) a work week of a calendar: from and to dates and \
-             the days it states, as yppxy_cal_set's `week`. Returns the calendar. One undo step.",
+             the days it states, as yppxy_cal_set's `week` ({} states none; a replace keeps the \
+             name unless given). Returns the calendar. One undo step.",
             vec![
                 calendar(),
                 (

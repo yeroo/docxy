@@ -62,7 +62,7 @@ pub fn weekday_index(name: &str) -> Option<usize> {
 
 /// Check a day's working times: each from before to, within the day, in
 /// order and not overlapping.
-pub fn checked_times(times: &[WorkingTime]) -> Result<(), String> {
+pub(super) fn checked_times(times: &[WorkingTime]) -> Result<(), String> {
     let mut last = 0;
     for (n, t) in times.iter().enumerate() {
         if t.from >= t.to {
@@ -179,6 +179,9 @@ impl Editor {
         if let Some(error) = crate::schedule::calendar_error(&next) {
             return Err(error);
         }
+        // The selection's neighbour is chosen from the order before the
+        // edit, as every editor verb does (a holiday may move a task).
+        self.capture_view();
         let prev = std::mem::replace(&mut self.proj, next);
         self.push_undo(prev);
         self.changed();
@@ -201,12 +204,22 @@ impl Editor {
             return Err(format!("no calendar with uid {b} to derive from"));
         }
         let copied = match copy {
-            Some(c) => Some(
-                self.proj
+            Some(c) => {
+                let from = self
+                    .proj
                     .calendar(c)
-                    .cloned()
-                    .ok_or_else(|| format!("no calendar with uid {c} to copy"))?,
-            ),
+                    .ok_or_else(|| format!("no calendar with uid {c} to copy"))?;
+                // Project's Create New Base Calendar copies base calendars
+                // only: a derived one's holidays and work weeks live up its
+                // chain and would not come along.
+                if let Some(base) = from.base_calendar_uid.and_then(|b| self.proj.calendar(b)) {
+                    return Err(format!(
+                        "'{}' derives from '{}'; copy a base calendar",
+                        from.name, base.name
+                    ));
+                }
+                Some(from.clone())
+            }
             None => None,
         };
         let uid = self
@@ -228,19 +241,12 @@ impl Editor {
                 exceptions: Vec::new(),
                 work_weeks: Vec::new(),
             },
-            // A copy is a base calendar (Project's Create New Base Calendar):
-            // a derived calendar's week is copied as it resolves.
-            (None, Some(from)) => {
-                let week = self.proj.resolved_week(&from).map(Some);
-                Calendar {
-                    uid,
-                    name,
-                    is_baseline_calendar: false,
-                    base_calendar_uid: None,
-                    week,
-                    ..from
-                }
-            }
+            (None, Some(from)) => Calendar {
+                uid,
+                name,
+                is_baseline_calendar: false,
+                ..from
+            },
             (None, None) => Calendar::base(uid, &name, Calendar::standard_week()),
         };
         self.edit_calendars(|proj| {
@@ -347,7 +353,12 @@ impl Editor {
             Some(i) => i,
             None => cal.exceptions.len(),
         };
-        let name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+        // A replaced exception keeps its name unless one is given, as
+        // `cal.set` keeps the calendar's.
+        let name = match name.map(str::trim) {
+            Some(n) if !n.is_empty() => Some(n.to_string()),
+            _ => cal.exceptions.get(at).and_then(|e| e.name.clone()),
+        };
         self.edit_calendars(|proj| {
             let cal = proj.calendar_mut(uid).ok_or("the calendar is gone")?;
             let mut e = CalendarException::date_range(from, to, day);
@@ -373,6 +384,12 @@ impl Editor {
                 "'{}' has {} exceptions; no exception {index}",
                 cal.name,
                 cal.exceptions.len()
+            ));
+        }
+        if cal.exceptions[index].scheduled().is_none() {
+            return Err(format!(
+                "exception {index} of '{}' repeats; a repeating exception is read only",
+                cal.name
             ));
         }
         self.edit_calendars(|proj| {
@@ -413,7 +430,10 @@ impl Editor {
             Some(i) => i,
             None => cal.work_weeks.len(),
         };
-        let name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+        let name = match name.map(str::trim) {
+            Some(n) if !n.is_empty() => Some(n.to_string()),
+            _ => cal.work_weeks.get(at).and_then(|w| w.name.clone()),
+        };
         self.edit_calendars(|proj| {
             let cal = proj.calendar_mut(uid).ok_or("the calendar is gone")?;
             let w = WorkWeek {
@@ -680,16 +700,19 @@ mod tests {
         assert!(ed.set_default_calendar(night).is_err());
         assert_eq!(ed.project().tasks[0].calendar_uid, None);
         assert_eq!(ed.project().default_calendar_uid, standard);
-        // A copy of a derived calendar is a base calendar with its resolved
-        // week.
+        // Only a base calendar is copied (Project's Create New Base
+        // Calendar); a derived one's holidays live up its chain.
         let bob = ed.add_calendar("Bob", Some(standard), None).unwrap();
-        ed.set_calendar(bob, None, None, &[(1, Some(times(&[(9 * 60, 13 * 60)])))])
+        assert_eq!(
+            ed.add_calendar("Bob copy", None, Some(bob)),
+            Err("'Bob' derives from 'Standard'; copy a base calendar".into())
+        );
+        let copy = ed
+            .add_calendar("Standard copy", None, Some(standard))
             .unwrap();
-        let copy = ed.add_calendar("Bob copy", None, Some(bob)).unwrap();
         let c = ed.project().calendar(copy).unwrap();
         assert_eq!(c.base_calendar_uid, None);
-        assert_eq!(c.week[1].as_ref().unwrap().times.len(), 1);
-        assert_eq!(c.week[2].as_ref().unwrap().times.len(), 2);
+        assert_eq!(c.week[1].as_ref().unwrap().times.len(), 2);
         // Two calendars with one UID: the edit lands on the one the reads
         // and the scheduler use (the last).
         let mut dup = ed.project().calendar(standard).unwrap().clone();
@@ -845,7 +868,20 @@ mod tests {
             )
             .is_err()
         );
-        ed.delete_calendar_exception(standard, 2).unwrap();
+        assert!(ed.delete_calendar_exception(standard, 2).is_err());
+        assert_eq!(ed.project().calendar(standard).unwrap().exceptions.len(), 3);
+        assert_eq!(ed.undo_depth(), 0);
+        // A replaced exception keeps its name unless one is given.
+        assert_eq!(
+            ed.set_calendar_exception(standard, Some(0), None, day(3), day(4), times(&[])),
+            Ok(0)
+        );
+        assert_eq!(
+            ed.project().calendar(standard).unwrap().exceptions[0]
+                .name
+                .as_deref(),
+            Some("Holiday")
+        );
         // Edits and deletes by index; a bad index is refused.
         assert_eq!(
             ed.set_calendar_exception(
@@ -865,8 +901,8 @@ mod tests {
             Some("Half")
         );
         ed.delete_calendar_exception(standard, 0).unwrap();
-        assert_eq!(ed.project().calendar(standard).unwrap().exceptions.len(), 1);
-        assert!(ed.delete_calendar_exception(standard, 1).is_err());
+        assert_eq!(ed.project().calendar(standard).unwrap().exceptions.len(), 2);
+        assert!(ed.delete_calendar_exception(standard, 2).is_err());
         ed.delete_calendar_work_week(standard, 0).unwrap();
         assert!(ed.delete_calendar_work_week(standard, 0).is_err());
         // Every edit since the repeating exception was a step.
