@@ -330,8 +330,8 @@ reported like the built-ins, marked `"plugin": true`: `ribbon-read`'s
 commands and gallery tiles (a contributed control with a built-in's id
 replaces it in place, so the built-in's slot then reads `plugin: true`),
 `menu-read`'s items (the row, bar, column and chart menus; `menu-open
-{"target":"chart"}` opens the chart's own menu beside the bars, whose
-Project items are drawn greyed), and `dialog-read`'s controls (a dialog a
+{"target":"chart"}` opens the chart's own menu beside the bars: Timescale... and
+Zoom... are live and open their dialogs, the rest of Project's items are drawn greyed), and `dialog-read`'s controls (a dialog a
 plugin command opened is `plugin`; Task Information gains the plugin's
 pages). A contributed command runs through `ribbon-click` and `menu-click`
 like a built-in, as one undo step with its status on the status line.

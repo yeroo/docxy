@@ -744,7 +744,14 @@
   the clamp); the middle still pans. The grip under the pane (`project-timeline-grip`)
   sets `ProjectView::timeline_h` (`MIN_TIMELINE_H` = one band plus padding, 60;
   at most half the window, `ProjectView::height`); a double-click restores 84.
-  Like `split` it lives for the window session and is not written to disk.
+  Like `split` it lives for the window session and is not written to disk. The
+  Timeline's "Add tasks with dates to the timeline" placeholder now shows only
+  for a plan with no tasks: it used to sit clipped below the bar row, which a
+  taller pane would have exposed over a plan that has tasks.
+- Ctrl+wheel steps once per notch (a line delta); smooth pixel deltas sum in
+  `wheel_acc` and step per `WHEEL_STEP` (40 px), so a swipe is not a jump of
+  every level. A view-box edge drag is measured against the edges as the box
+  draws them (clamped to the Timeline's span) and moves within the span.
 - The chart menu opens the Timescale and Zoom dialogs (`project/zoom_dialogs.rs`,
   `DialogOwner::Zoom`/`Timescale`, catalogue ids `zoom`, `timescale`). The
   Timescale dialog's tier rows are read-only (Count is 1): the tier editor and

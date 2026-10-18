@@ -73,16 +73,9 @@ fn apply_dialog(
             crate::project::apply_task_info(&mut v.ed, uid, dialog)?;
             Ok(false)
         }
+        // Applied in `dialog_click`, which also puts the status on the tab.
         DialogOwner::Zoom | DialogOwner::Timescale => {
-            let Surface::Project(v) = surface else {
-                return Err("this dialog belongs to a Project".into());
-            };
-            if dialog.owner == DialogOwner::Zoom {
-                crate::project::apply_zoom(v, dialog)?;
-            } else {
-                crate::project::apply_timescale(v, dialog)?;
-            }
-            Ok(false)
+            Err("Zoom and Timescale apply through dialog_click".into())
         }
         // Handled in `plugin_ui::dialog_click`, before this: OK sends the
         // plugin its command again with the values.
@@ -386,7 +379,20 @@ fn dialog_press(tab: &mut DocTab, button: &str) -> Result<(), String> {
         ..
     } = tab;
     let mut changed = false;
+    let mut status = None;
     dialogs.click(button, |d| {
+        // The Gantt's zoom is view state: its OK says the new timescale.
+        if matches!(d.owner, DialogOwner::Zoom | DialogOwner::Timescale) {
+            let Surface::Project(v) = surface else {
+                return Err("this dialog belongs to a Project".into());
+            };
+            status = Some(if d.owner == DialogOwner::Zoom {
+                crate::project::apply_zoom(v, d)?
+            } else {
+                crate::project::apply_timescale(v, d)?
+            });
+            return Ok(());
+        }
         changed = apply_dialog(
             surface,
             pkg.as_mut(),
@@ -399,6 +405,9 @@ fn dialog_press(tab: &mut DocTab, button: &str) -> Result<(), String> {
         tab.set_dirty();
     }
     complete_project(tab, true);
+    if let Some(status) = status {
+        tab.status = status.into();
+    }
     Ok(())
 }
 

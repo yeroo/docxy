@@ -190,7 +190,10 @@ fn geometry_follows_the_scales_own_width() {
         kind: BarKind::Milestone,
         ..bar
     };
-    assert_eq!(bar_rect(&milestone, 6.).0, 64.);
+    // The diamond is centred in its day at any zoom.
+    assert_eq!(bar_rect(&milestone, 6.).0, 10. * 6. + 3. - 7.);
+    assert_eq!(bar_rect(&milestone, 22.).0, 10. * 22. + 11. - 7.);
+    assert_eq!(bar_rect(&milestone, 22.).0, 224.);
 }
 
 #[test]
@@ -309,19 +312,19 @@ fn ctrl_wheel_zooms_around_the_pointer_over_the_chart_only() {
     v.gantt_x.set(2000.);
     let chart_left = v.table_w + GANTT_INSET;
     // Over the table: not the chart's wheel.
-    assert_eq!(v.wheel_zoom(10., 5.), None);
+    assert_eq!(v.wheel_zoom(10., 5., true), None);
     assert_eq!(v.day_w(), DEFAULT_DAY_W);
     // Wheel up zooms in, down out; the day under the pointer stays.
     let pointer = 150.;
     let before = (v.gantt_x.get() + pointer) / v.day_w();
     assert_eq!(
-        v.wheel_zoom(chart_left + pointer, -5.),
+        v.wheel_zoom(chart_left + pointer, -5., true),
         Some("Timescale: Weeks".into())
     );
     assert_eq!(v.day_w(), 12.);
     assert!(((v.gantt_x.get() + pointer) / v.day_w() - before).abs() < 1e-3);
-    assert_eq!(v.wheel_zoom(chart_left + pointer, 0.), None);
-    assert!(v.wheel_zoom(chart_left + pointer, 5.).is_some());
+    assert_eq!(v.wheel_zoom(chart_left + pointer, 0., true), None);
+    assert!(v.wheel_zoom(chart_left + pointer, 5., true).is_some());
     assert_eq!(v.day_w(), DEFAULT_DAY_W);
 }
 
@@ -459,4 +462,45 @@ fn the_chart_menu_opens_the_timescale_and_zoom_dialogs() {
     assert!(!find("Change Working Time...").unwrap().enabled);
     assert!(!find("Show/Hide Bar Styles").unwrap().enabled);
     assert!(!find("Gridlines...").unwrap().enabled);
+}
+
+#[test]
+fn smooth_wheel_deltas_add_up_to_one_step_per_threshold() {
+    let mut v = view(vec![task(1, 400)]);
+    let x = v.table_w + GANTT_INSET + 100.;
+    // Many small same-direction deltas: nothing until the sum crosses the step.
+    for _ in 0..7 {
+        assert_eq!(v.wheel_zoom(x, -5., false), None);
+    }
+    assert_eq!(v.day_w(), DEFAULT_DAY_W);
+    assert!(v.wheel_zoom(x, -5., false).is_some());
+    assert_eq!(v.day_w(), 12., "one level for the first 40 px");
+    // The sum starts afresh: another 40 px is one more step, not a swipe's worth.
+    for _ in 0..7 {
+        v.wheel_zoom(x, -5., false);
+    }
+    assert_eq!(v.day_w(), 12.);
+    v.wheel_zoom(x, -5., false);
+    assert_eq!(v.day_w(), 6.);
+    // A change of direction drops what was summed.
+    v.wheel_zoom(x, -30., false);
+    assert_eq!(v.wheel_zoom(x, 30., false), None);
+    assert_eq!(v.day_w(), 6.);
+    assert!(v.wheel_zoom(x, 5., false).is_none());
+    assert!(v.wheel_zoom(x, 30., false).is_some());
+    assert_eq!(v.day_w(), 12.);
+    // One notch is one step whatever its size, and clears the sum.
+    v.wheel_zoom(x, 20., false);
+    assert!(v.wheel_zoom(x, 1., true).is_some());
+    assert_eq!(v.day_w(), 22.);
+    assert_eq!(v.wheel_acc, 0.);
+    // A large pixel delta (the harness's) is one step, not several.
+    assert!(v.wheel_zoom(x, -120., false).is_some());
+    assert_eq!(v.day_w(), 12.);
+}
+
+#[test]
+fn only_the_listed_timescales_can_be_chosen() {
+    assert!((0..7).all(available));
+    assert!(!available(7) && !available(8) && !available(9));
 }

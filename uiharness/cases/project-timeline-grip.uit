@@ -16,9 +16,14 @@ test project dragging the grip sets the Timeline height and a double-click resto
   assert timeline_h is 84
   assert dirty is false
 
-test project the grip stops at half the window
+test project the grip stops at half the window and follows the window's height
   open ../fixtures/project-timeline.xml
+  call window-size {"w":1180,"h":800}
   shot window
   call pointer-drag {"from":"project-timeline-grip","to":"project-timeline-grip","offset":[0,3000]}
-  assert timeline_h is not 84
+  assert timeline_h is 400
   shot window
+  # A shorter window pulls the pane back to its half.
+  call window-size {"w":1180,"h":500}
+  shot window
+  assert timeline_h is 250

@@ -313,17 +313,26 @@ pub(crate) struct EdgePress {
 /// The zoom after dragging `edge` of the visible span `[left, right)` (days
 /// from the scale's origin) by `dd` days: `(day_w, left)`. The span the box
 /// then covers fills `gantt_w`; the far edge stays put, also when the width
-/// clamps. The span never shrinks below the day count the widest zoom shows.
-pub(crate) fn drag_edge(edge: BoxEdge, left: f32, right: f32, dd: f32, gantt_w: f32) -> (f32, f32) {
+/// clamps. The moved edge stays inside `[lo, hi]` (the days the Timeline draws,
+/// so the box edge follows the pointer) and the span never shrinks below the
+/// day count the widest zoom shows.
+pub(crate) fn drag_edge(
+    edge: BoxEdge,
+    left: f32,
+    right: f32,
+    dd: f32,
+    gantt_w: f32,
+    (lo, hi): (f32, f32),
+) -> (f32, f32) {
     let least = gantt_w.max(1.) / zoom::MAX_DAY_W;
     match edge {
         BoxEdge::Left => {
-            let l = (left + dd).min(right - least);
+            let l = (left + dd).max(lo).min(right - least);
             let day_w = zoom::fit(right - l, gantt_w);
             (day_w, right - gantt_w / day_w)
         }
         BoxEdge::Right => {
-            let r = (right + dd).max(left + least);
+            let r = (right + dd).min(hi).max(left + least);
             (zoom::fit(r - left, gantt_w), left)
         }
     }
@@ -360,15 +369,27 @@ impl ProjectView {
     }
 
     /// Mouse-down on a box edge at `x`.
+    /// The edges are taken as the box draws them: the chart may show days
+    /// outside the Timeline's span (a short plan in a wide chart), and the box
+    /// is clamped to the span.
     pub fn press_timeline_edge(&mut self, edge: BoxEdge, x: f32) {
         let day_w = self.day_w();
+        let (lo, hi) = self.timeline_bounds();
         let left = self.gantt_x.get() / day_w;
+        let right = left + self.gantt_w / day_w;
         self.timeline_edge = Some(EdgePress {
             edge,
             x,
-            left,
-            right: left + self.gantt_w / day_w,
+            left: left.clamp(lo, hi),
+            right: right.clamp(lo, hi),
         });
+    }
+
+    /// The Timeline's span as days from the scale's origin.
+    fn timeline_bounds(&self) -> (f32, f32) {
+        let span = TimelineSpan::of(&self.ed);
+        let lo = (span.first - self.scale.origin_day) as f32;
+        (lo, lo + span.days as f32)
     }
 
     /// The pointer is at `x` in a drag of a box edge: the edge moves the days
@@ -384,7 +405,15 @@ impl ProjectView {
             return;
         }
         let dd = (x - press.x) * span.days as f32 / w;
-        let (day_w, left) = drag_edge(press.edge, press.left, press.right, dd, self.gantt_w);
+        let bounds = self.timeline_bounds();
+        let (day_w, left) = drag_edge(
+            press.edge,
+            press.left,
+            press.right,
+            dd,
+            self.gantt_w,
+            bounds,
+        );
         self.set_zoom(day_w, left, 0.);
     }
 
@@ -676,8 +705,20 @@ pub(crate) fn timeline_el(
                                 .on_mouse_up(MouseButton::Left, release_timeline(index, cx))
                                 .on_mouse_up_out(MouseButton::Left, release_timeline(index, cx))
                                 .on_drag(TimelineDrag(index, None), |d, _, _, cx| cx.new(|_| *d))
-                                .child(box_edge(BoxEdge::Left, index, probes, cx))
-                                .child(box_edge(BoxEdge::Right, index, probes, cx)),
+                                .child(box_edge(
+                                    BoxEdge::Left,
+                                    edge_strip_w(box_w),
+                                    index,
+                                    probes,
+                                    cx,
+                                ))
+                                .child(box_edge(
+                                    BoxEdge::Right,
+                                    edge_strip_w(box_w),
+                                    index,
+                                    probes,
+                                    cx,
+                                )),
                         ),
                 )
                 .when(view.ed.project().tasks.is_empty(), |d| {
@@ -698,8 +739,15 @@ pub(crate) fn timeline_el(
 
 /// One of the view box's edge strips, drawn last so it wins over the box. A
 /// drag of it moves that edge of the span and zooms the chart to fit it.
+/// The width of a box edge strip: 6 px, but a third of a narrow box at most, so
+/// the middle (which pans) is always there.
+pub(crate) fn edge_strip_w(box_w: f32) -> f32 {
+    BOX_EDGE_W.min(box_w / 3.)
+}
+
 fn box_edge(
     edge: BoxEdge,
+    strip_w: f32,
     index: usize,
     probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
     cx: &mut Context<Docxy>,
@@ -719,7 +767,7 @@ fn box_edge(
         .absolute()
         .top_0()
         .bottom_0()
-        .w(px(BOX_EDGE_W))
+        .w(px(strip_w))
         .when(edge == BoxEdge::Left, |d| d.left(px(-1.)))
         .when(edge == BoxEdge::Right, |d| d.right(px(-1.)))
         .cursor(CursorStyle::ResizeLeftRight)

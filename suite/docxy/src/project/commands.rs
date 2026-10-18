@@ -1042,9 +1042,9 @@ pub(crate) fn project_bar_menu(v: &ProjectView) -> Vec<crate::menu::MenuItem> {
 }
 
 /// The Gantt chart's own context menu (#1532), opened by a right-press on
-/// the chart beside the bars, in Project's order (its chart formatting
-/// dialogs are not built, so the items are drawn disabled), then what a UI
-/// plugin adds to the `chart` menu.
+/// the chart beside the bars, in Project's order: Timescale... and Zoom...
+/// open their dialogs (#1535); the rest of its chart formatting is not built, so
+/// those items are drawn disabled; then what a UI plugin adds to the `chart` menu.
 pub(crate) fn project_chart_menu(v: &ProjectView) -> Vec<crate::menu::MenuItem> {
     use crate::menu::{
         Entry,
@@ -2118,7 +2118,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             ScrollToTask => v.scroll_to_task(),
             Timeline => v.timeline = !v.timeline,
             Timescale(i) => {
-                if i >= zoom::LEVELS.len() {
+                if !zoom::available(i) {
                     return Err("Hours and Minutes timescales are not available".into());
                 }
                 status = Some(v.zoom_to_level(i));

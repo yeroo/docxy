@@ -38,13 +38,18 @@ pub(crate) fn bar_kind_name(kind: BarKind) -> &'static str {
     }
 }
 
+/// The left of a milestone's 14 px diamond: centred in its day.
+pub(crate) fn milestone_x(start: i64, day_w: f32) -> f32 {
+    start as f32 * day_w + day_w / 2. - 7.
+}
+
 /// The rectangle `gantt_strip` draws `bar` in, `(x, y, w, h)` within its
 /// row: a leaf bar, a summary's thinner bar, or a milestone's diamond box.
 pub(crate) fn bar_rect(bar: &GanttBar, day_w: f32) -> (f32, f32, f32, f32) {
     let w = (bar.end - bar.start + 1).max(1) as f32 * day_w;
     match bar.kind {
         BarKind::Summary => (bar.start as f32 * day_w, 9., w, 10.),
-        BarKind::Milestone => (bar.start as f32 * day_w + 4., 5., 14., 14.),
+        BarKind::Milestone => (milestone_x(bar.start, day_w), 5., 14., 14.),
         BarKind::Critical | BarKind::OnTrack => (bar.start as f32 * day_w, 5., w, 14.),
     }
 }
@@ -614,7 +619,7 @@ pub(crate) fn gantt_strip(
         let outline = if shape == BarShape::Diamond {
             div()
                 .absolute()
-                .left(px(bar.start as f32 * dw + 4.))
+                .left(px(milestone_x(bar.start, dw)))
                 .top(px(5.))
                 .size(px(14.))
                 .child(milestone_diamond(color, true))
@@ -689,7 +694,7 @@ pub(crate) fn gantt_strip(
             .child(marker),
         BarShape::Diamond => div()
             .absolute()
-            .left(px(bar.start as f32 * dw + 4.))
+            .left(px(milestone_x(bar.start, dw)))
             .top(px(5.))
             .size(px(14.))
             .child(milestone_diamond(color, false))

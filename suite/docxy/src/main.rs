@@ -36053,7 +36053,7 @@ impl Docxy {
                     |t| matches!(&t.surface, Surface::Project(v) if plugin_ui::enabled(v, id)),
                 ),
                 // Hours and Minutes are listed and cannot be chosen (#1535).
-                Act::Project(ProjectAct::Timescale(i)) => i < TIMESCALE_LEVELS.len(),
+                Act::Project(ProjectAct::Timescale(i)) => timescale_available(i),
                 _ => true,
             }
     }

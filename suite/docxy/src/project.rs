@@ -24,7 +24,7 @@ mod timeline;
 mod zoom;
 mod zoom_dialogs;
 pub(super) use timeline::*;
-pub(super) use zoom::LEVELS as TIMESCALE_LEVELS;
+pub(super) use zoom::available as timescale_available;
 pub(super) use zoom_dialogs::{apply_timescale, apply_zoom};
 mod rows;
 pub(super) use rows::*;
@@ -80,6 +80,8 @@ pub(super) struct ProjectView {
     /// The press on the Timeline's grip while its button is held: the
     /// pointer's y and the pane's height then.
     pub grip_press: Option<(f32, f32)>,
+    /// Smooth Ctrl+wheel deltas not yet worth a zoom step (`wheel_zoom`).
+    pub wheel_acc: f32,
     /// The window's height, which bounds the Timeline's (half of it at most).
     pub height: f32,
     /// Gantt Chart Format › Bar Styles › Critical Tasks: critical bars drawn in
@@ -161,6 +163,7 @@ impl ProjectView {
             timeline_edge: None,
             timeline_h: None,
             grip_press: None,
+            wheel_acc: 0.,
             height: 700.,
             show_critical: true,
             show_baseline: true,
@@ -1533,6 +1536,7 @@ pub(super) fn project_el(
                     // Ctrl+wheel over the chart zooms the timescale around the
                     // pointer (#1535). The rows' own handler has already moved
                     // them by the same wheel turn; put them back.
+                    let notch = matches!(ev.delta, ScrollDelta::Lines(_));
                     if ev.modifiers.control && !delta.y.is_zero() {
                         let Some(body) = this.probes.borrow().current("project-body") else {
                             return;
@@ -1541,7 +1545,11 @@ pub(super) fn project_el(
                         if let Some(tab) = this.tabs.get_mut(index)
                             && let Surface::Project(v) = &mut tab.surface
                             && let Some(status) =
-                                v.wheel_zoom(f32::from(ev.position.x - body.left()), f32::from(delta.y))
+                                v.wheel_zoom(
+                                    f32::from(ev.position.x - body.left()),
+                                    f32::from(delta.y),
+                                    notch,
+                                )
                         {
                             v.scroll.0.borrow().base_handle.set_offset(held_scroll);
                             tab.status = status.into();

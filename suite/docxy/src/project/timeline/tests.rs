@@ -444,41 +444,108 @@ fn the_view_box_of_the_timeline_view_fixture_at_the_default_window() {
     assert_eq!(view(&mut t), ("Sun 3/1/26".into(), "Sun 3/15/26".into()));
 }
 
+const ALL: (f32, f32) = (0., 1000.);
+
 #[test]
 fn dragging_the_left_edge_keeps_the_right_date_and_fills_the_chart() {
     // A chart 440 px wide at 22 px/day shows days 10 to 30.
-    let (day_w, left) = drag_edge(BoxEdge::Left, 10., 30., 5., 440.);
+    let (day_w, left) = drag_edge(BoxEdge::Left, 10., 30., 5., 440., ALL);
     // The box now covers days 15 to 30: 15 days fill 440 px.
     assert!((day_w - 440. / 15.).abs() < 1e-3);
     assert!((left - 15.).abs() < 1e-3);
     // Dragging out widens the span.
-    let (day_w, left) = drag_edge(BoxEdge::Left, 10., 30., -10., 440.);
+    let (day_w, left) = drag_edge(BoxEdge::Left, 10., 30., -10., 440., ALL);
     assert!((day_w - 440. / 30.).abs() < 1e-3 && (left - 0.).abs() < 1e-3);
 }
 
 #[test]
 fn dragging_the_right_edge_keeps_the_left_date() {
-    let (day_w, left) = drag_edge(BoxEdge::Right, 10., 30., 20., 440.);
+    let (day_w, left) = drag_edge(BoxEdge::Right, 10., 30., 20., 440., ALL);
     assert!((day_w - 440. / 40.).abs() < 1e-3);
     assert_eq!(left, 10.);
-    let (day_w, left) = drag_edge(BoxEdge::Right, 10., 30., -10., 440.);
+    let (day_w, left) = drag_edge(BoxEdge::Right, 10., 30., -10., 440., ALL);
     assert!((day_w - 440. / 10.).abs() < 1e-3);
     assert_eq!(left, 10.);
 }
 
 #[test]
-fn an_edge_cannot_cross_the_other_or_zoom_past_the_clamp() {
-    // Past the opposite edge the span stays one clamp-wide.
-    let (day_w, left) = drag_edge(BoxEdge::Left, 10., 30., 500., 440.);
+fn an_edge_cannot_cross_the_other_or_leave_the_timeline() {
+    // Past the opposite edge the span stays one clamp-wide, the far edge put.
+    let (day_w, left) = drag_edge(BoxEdge::Left, 10., 30., 500., 440., ALL);
     assert!((day_w - zoom::MAX_DAY_W).abs() < 1e-3);
     assert!((left - (30. - 440. / zoom::MAX_DAY_W)).abs() < 1e-3);
-    let (day_w, left) = drag_edge(BoxEdge::Right, 10., 30., -500., 440.);
+    let (day_w, left) = drag_edge(BoxEdge::Right, 10., 30., -500., 440., ALL);
     assert!((day_w - zoom::MAX_DAY_W).abs() < 1e-3);
     assert_eq!(left, 10.);
-    // Widening past the narrowest zoom keeps the far edge fixed.
-    let (day_w, left) = drag_edge(BoxEdge::Left, 0., 30., -4000., 440.);
-    assert_eq!(day_w, zoom::MIN_DAY_W);
-    assert!((left + 440. / zoom::MIN_DAY_W - 30.).abs() < 1e-2);
+    // The moved edge stops at the Timeline's ends: the left at day 0, the right
+    // at the span's last, so the far edge never has to move to make room.
+    let (day_w, left) = drag_edge(BoxEdge::Left, 10., 30., -4000., 440., (0., 60.));
+    assert!((left - 0.).abs() < 1e-3);
+    assert!((day_w - 440. / 30.).abs() < 1e-3);
+    let (day_w, left) = drag_edge(BoxEdge::Right, 10., 30., 4000., 440., (0., 60.));
+    assert_eq!(left, 10.);
+    assert!((day_w - 440. / 50.).abs() < 1e-3);
+}
+
+#[test]
+fn a_short_plan_in_a_wide_chart_has_edges_that_follow_the_pointer() {
+    // 6 days of plan in a chart that shows 15 at 22 px/day.
+    let mut v = ProjectView::new(project_with_days(6), false);
+    v.layout(1180.);
+    let span = TimelineSpan::of(&v.ed);
+    assert!(v.gantt_w / v.day_w() > span.days as f32 + 5.);
+    let w = ruler_width(v.width);
+    let (f0, f1) = v.timeline_box();
+    assert_eq!((f0, f1), (0., 1.), "the box fills the ruler");
+    // Press the drawn right edge and drag it back across a quarter of the ruler.
+    v.press_timeline_edge(BoxEdge::Right, w);
+    v.drag_timeline_edge(w * 0.75);
+    let (g0, g1) = v.timeline_box();
+    assert!(
+        (g1 - 0.75).abs() < 0.02,
+        "the drawn edge is at the pointer: {g1}"
+    );
+    assert!(g0.abs() < 1e-3, "the left edge did not move");
+    assert!((v.visible_days() - 0.75 * span.days as f32).abs() < 0.2);
+    // Dragging the right edge past the end of the ruler stays at the end.
+    v.drag_timeline_edge(w * 3.);
+    let (h0, h1) = v.timeline_box();
+    assert!(h0.abs() < 1e-3 && (h1 - 1.).abs() < 1e-3);
+}
+
+#[test]
+fn an_overshoot_leaves_the_other_edge_fixed() {
+    let mut v = ProjectView::new(project_with_days(60), false);
+    v.layout(1180.);
+    let w = ruler_width(v.width);
+    let (f0, f1) = v.timeline_box();
+    let (left, box_w) = box_px(f0, f1, w);
+    // Drag the left edge far past the left end of the ruler.
+    v.press_timeline_edge(BoxEdge::Left, left);
+    let right_before = f1;
+    v.drag_timeline_edge(left - w * 5.);
+    let (g0, g1) = v.timeline_box();
+    assert!(g0.abs() < 1e-3, "the edge stops at the first day");
+    assert!((g1 - right_before).abs() < 0.01, "{right_before} -> {g1}");
+    // And the right edge far past the right end.
+    v.release_timeline();
+    let (f0, f1) = v.timeline_box();
+    let (left, box_w2) = box_px(f0, f1, w);
+    let _ = box_w;
+    v.press_timeline_edge(BoxEdge::Right, left + box_w2);
+    v.drag_timeline_edge(left + box_w2 + w * 5.);
+    let (h0, h1) = v.timeline_box();
+    assert!((h0 - f0).abs() < 0.01, "{f0} -> {h0}");
+    assert!((h1 - 1.).abs() < 0.01);
+}
+
+#[test]
+fn the_edge_strips_leave_the_middle_of_a_narrow_box_to_pan() {
+    assert_eq!(edge_strip_w(100.), BOX_EDGE_W);
+    assert_eq!(edge_strip_w(MIN_BOX_W), MIN_BOX_W / 3.);
+    for w in [MIN_BOX_W, 9., 18., 40.] {
+        assert!(w - 2. * edge_strip_w(w) >= w / 3. - 1e-3, "{w}");
+    }
 }
 
 #[test]

@@ -1,6 +1,6 @@
 //! The Gantt's timescale (#1535): Project's zoom levels, the two header tiers
 //! each draws, and the view's zoom commands. The maths is pure (`Level`,
-//! `nearest`, `step`, `fit`, `zoom_about`, `tiers`) so it is tested without a
+//! `nearest`, `step`, `fit`, `tiers`) so it is tested without a
 //! window; [`ProjectView::set_zoom`] is the one place a zoom reaches the view.
 use super::*;
 use projcore::DateTime;
@@ -8,6 +8,9 @@ use projcore::DateTime;
 /// The narrowest and widest a day is drawn.
 pub(crate) const MIN_DAY_W: f32 = 0.25;
 pub(crate) const MAX_DAY_W: f32 = 96.;
+
+/// The pixel deltas of a smooth wheel that make one zoom step.
+pub(crate) const WHEEL_STEP: f32 = 40.;
 
 /// A header tier's unit: where one starts and what it is called.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +192,11 @@ pub(crate) const COMBO: [(&str, bool); 9] = [
     ("Minutes", false),
 ];
 
+/// Whether combo entry `i` can be chosen: every level, not Hours or Minutes.
+pub(crate) fn available(i: usize) -> bool {
+    COMBO.get(i).is_some_and(|(_, on)| *on)
+}
+
 /// The level whose pixels per day are nearest `day_w` on a log scale.
 pub(crate) fn nearest(day_w: f32) -> usize {
     let d = day_w.max(MIN_DAY_W).ln();
@@ -336,14 +344,30 @@ impl ProjectView {
     }
 
     /// Ctrl+wheel over the split area at `x` (px from its left edge): zoom one
-    /// level around the pointer, in for a wheel turned up (`dy` > 0). `None`
-    /// when the pointer is not over the chart, so the wheel is not the chart's.
-    pub fn wheel_zoom(&mut self, x: f32, dy: f32) -> Option<String> {
+    /// level around the pointer, in for a wheel turned up (`dy` > 0). A notch
+    /// (`notch`, a line delta) steps once; a trackpad's pixel deltas add up in
+    /// `wheel_acc` and step once per [`WHEEL_STEP`] px, so a swipe does not jump
+    /// every level. A change of direction starts the sum afresh. `None` when the
+    /// pointer is not over the chart, so the wheel is not the chart's.
+    pub fn wheel_zoom(&mut self, x: f32, dy: f32, notch: bool) -> Option<String> {
         if dy == 0. || self.pane_at(x) != ProjectPane::Chart {
             return None;
         }
+        let dir = if dy > 0. { 1 } else { -1 };
+        if notch {
+            self.wheel_acc = 0.;
+        } else {
+            if self.wheel_acc * dy < 0. {
+                self.wheel_acc = 0.;
+            }
+            self.wheel_acc += dy;
+            if self.wheel_acc.abs() < WHEEL_STEP {
+                return None;
+            }
+            self.wheel_acc = 0.;
+        }
         let pointer = (x - self.table_w - GANTT_INSET).clamp(0., self.gantt_w);
-        Some(self.zoom_step(if dy > 0. { 1 } else { -1 }, pointer))
+        Some(self.zoom_step(dir, pointer))
     }
 
     /// Entire Project: the plan's span fills the chart.
