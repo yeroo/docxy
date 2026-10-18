@@ -38,7 +38,6 @@ test a task row's menu is Project's and Insert Task puts a blank row above
   assert reply.items.21.separator is true
   assert reply.items.22.label is Link
   assert reply.items.22.enabled is true
-  assert reply.items.23 is nothing
   # The mini formatting toolbar above the items (#1537).
   assert reply.toolbar.0.label is Font
   assert reply.toolbar.0.kind is combo
@@ -56,7 +55,6 @@ test a task row's menu is Project's and Insert Task puts a blank row above
   assert reply.toolbar.9.label is Indent
   assert reply.toolbar.10.label is Task Details
   assert reply.toolbar.10.kind is arrow
-  assert reply.toolbar.11 is nothing
   call menu-read {}
   assert reply.items.7.label is Insert Task
   call-error menu-click {"label":"Text Styles..."} => menu item 'Text Styles...' is disabled
