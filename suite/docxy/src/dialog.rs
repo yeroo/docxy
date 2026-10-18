@@ -22,6 +22,7 @@
 use ctlcore::json::Json;
 use unicode_segmentation::UnicodeSegmentation;
 
+pub(crate) mod calendar;
 pub(crate) mod catalog;
 pub(crate) use catalog::DialogId;
 
@@ -389,6 +390,13 @@ pub(crate) enum ControlKind {
     Text,
     Number,
     Date,
+    /// A date field with a ▾ that drops a calendar down (#1536): typed as
+    /// [`ControlKind::Date`], and a pick writes `YYYY-MM-DD`.
+    DateCombo,
+    /// A grid column of a typed cell with a list of items to pick from
+    /// (#1536, `Control::column_items`): typing narrows the list, and a text
+    /// that names one item (exactly, or as the only match) becomes it.
+    Combo,
     Duration,
     Checkbox,
     /// A grid column drawn as Project's check mark (#1602): `true` or
@@ -421,6 +429,8 @@ impl ControlKind {
             Self::Text => "text",
             Self::Number => "number",
             Self::Date => "date",
+            Self::DateCombo => "datecombo",
+            Self::Combo => "combo",
             Self::Duration => "duration",
             Self::Checkbox => "checkbox",
             Self::Check => "check",
@@ -440,7 +450,12 @@ impl ControlKind {
     pub fn is_text(self) -> bool {
         matches!(
             self,
-            Self::Text | Self::Number | Self::Date | Self::Duration | Self::Multiline
+            Self::Text
+                | Self::Number
+                | Self::Date
+                | Self::DateCombo
+                | Self::Duration
+                | Self::Multiline
         )
     }
     /// A control the keyboard and pointer can edit: a grid is a read-only
@@ -523,6 +538,19 @@ pub(crate) struct Control {
     /// A plugin grid whose cell commits send the dialog's command at once
     /// (#1602): see [`Dialog::committed`].
     pub commit_command: bool,
+    /// Drawn on the same row as the control before it (#1536): Duration and
+    /// its Estimated box, Start and Finish.
+    pub beside: bool,
+    /// A built-in dialog's grid the person edits (#1536), as a plugin's
+    /// (#1602): rows select, cells are typed into, and a blank row always
+    /// ends the rows for the next entry. Delete clears the selected row.
+    pub editable_grid: bool,
+    /// A grid's items per column for its [`ControlKind::Dropdown`] and
+    /// [`ControlKind::Combo`] columns (empty for the other columns).
+    pub column_items: Vec<Vec<String>>,
+    /// The item of a combo cell's narrowed list the arrows have reached,
+    /// which Enter takes over the typed text.
+    pub pick: Option<usize>,
 }
 
 impl Control {
@@ -544,6 +572,10 @@ impl Control {
             col: 0,
             edit: None,
             commit_command: false,
+            beside: false,
+            editable_grid: false,
+            column_items: Vec::new(),
+            pick: None,
         }
     }
 
@@ -571,7 +603,8 @@ impl Control {
     /// kind, and a UI plugin's grid (#1602), whose rows select and whose
     /// cells are typed into.
     pub fn interactive(&self) -> bool {
-        self.kind.is_editable() || (self.kind == ControlKind::Grid && self.plugin)
+        self.kind.is_editable()
+            || (self.kind == ControlKind::Grid && (self.plugin || self.editable_grid))
     }
 
     /// The kind of a grid's column `col` (text when none is set).
@@ -580,6 +613,79 @@ impl Control {
             .get(col)
             .copied()
             .unwrap_or(ControlKind::Text)
+    }
+
+    /// A grid cell's typed `text` as its column takes it (#1536): a dropdown
+    /// column takes one of its items, a combo column an item or any text.
+    /// An item is named exactly (case aside), else by the only item that
+    /// contains the text.
+    fn resolve_cell(&self, col: usize, text: &str) -> Result<String, String> {
+        let kind = self.column_kind(col);
+        if !matches!(kind, ControlKind::Dropdown | ControlKind::Combo) || text.trim().is_empty() {
+            return Ok(text.to_string());
+        }
+        let items = self.column_items.get(col).map_or(&[][..], Vec::as_slice);
+        let want = text.trim().to_lowercase();
+        if let Some(item) = items.iter().find(|i| i.to_lowercase() == want) {
+            return Ok(item.clone());
+        }
+        let hits: Vec<&String> = items
+            .iter()
+            .filter(|i| i.to_lowercase().contains(&want))
+            .collect();
+        match (hits.as_slice(), kind) {
+            ([one], _) => Ok((*one).clone()),
+            (_, ControlKind::Combo) => Ok(text.to_string()),
+            ([], _) => Err(format!(
+                "'{}' has no '{text}'; choose {}",
+                self.columns.get(col).map_or("", String::as_str),
+                items.join(", ")
+            )),
+            (_, _) => Err(format!(
+                "'{text}' matches more than one of: {}",
+                items.join(", ")
+            )),
+        }
+    }
+
+    /// The items a combo cell being typed into offers: those containing the
+    /// typed text (all of them for none), as indexes into the column's items.
+    pub fn suggestions(&self) -> Vec<usize> {
+        let (Some(buf), true) = (&self.edit, self.kind == ControlKind::Grid) else {
+            return Vec::new();
+        };
+        if self.column_kind(self.col) != ControlKind::Combo {
+            return Vec::new();
+        }
+        let want = buf.trim().to_lowercase();
+        self.column_items
+            .get(self.col)
+            .map(|items| {
+                (0..items.len())
+                    .filter(|&k| items[k].to_lowercase().contains(&want))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// An editable grid ends in exactly one blank row (#1536), the next
+    /// entry; the selection stays on a row.
+    fn keep_blank_row(&mut self) {
+        let width = self.columns.len();
+        let Value::Rows(rows) = &mut self.value else {
+            return;
+        };
+        let blank = |r: &Vec<String>| r.iter().all(|c| c.trim().is_empty());
+        while rows.len() > 1 && rows[rows.len() - 2..].iter().all(blank) {
+            rows.pop();
+        }
+        if !rows.last().is_some_and(blank) {
+            rows.push(vec![String::new(); width]);
+        }
+        let last = rows.len() - 1;
+        if self.row.is_some_and(|r| r > last) {
+            self.row = Some(last);
+        }
     }
 
     /// What the control shows.
@@ -693,8 +799,10 @@ impl Control {
         };
         self.value = match self.kind {
             ControlKind::Label => return Err(format!("'{label}' is a label; it cannot be set")),
+            ControlKind::Combo => return Err(format!("'{label}' is a grid column kind")),
             ControlKind::Text
             | ControlKind::Date
+            | ControlKind::DateCombo
             | ControlKind::Duration
             | ControlKind::Multiline => Value::Text(text()?),
             ControlKind::Number => match value()? {
@@ -887,6 +995,7 @@ impl Control {
             (_, Some(Json::Num(n))) => n.to_string(),
             _ => return Err(format!("'{label}' cells take text")),
         };
+        let value = self.resolve_cell(column, &value)?;
         if rows[row].len() < self.columns.len() {
             rows[row].resize(self.columns.len(), String::new());
         }
@@ -905,6 +1014,10 @@ pub(crate) fn grid_address(control: &str) -> Option<(&str, usize, &str)> {
     let column = control[close + 1..].strip_prefix('.')?.trim();
     (!name.is_empty() && !column.is_empty()).then_some((name, row, column))
 }
+
+/// The item code of a narrowed combo list's first item in
+/// [`Dialog::click_control`], above any `row * 256 + column`.
+pub(crate) const SUGGESTION_BASE: usize = 1 << 24;
 
 fn no_row(label: &str, row: usize, len: usize) -> String {
     match len {
@@ -993,6 +1106,8 @@ pub(crate) struct Dialog {
     /// control index, row, column and the cell's text now. The host sends
     /// the dialog's command with it before the next read or frame.
     pub committed: Option<(usize, usize, usize, String)>,
+    /// The calendar a date combo has dropped down (#1536), if one is open.
+    pub calendar: Option<calendar::Calendar>,
 }
 
 /// See [`Dialog::react`]. Two dialogs compare equal whatever their
@@ -1077,6 +1192,7 @@ impl Dialog {
             stale: false,
             seen: None,
             committed: None,
+            calendar: None,
         }
     }
 
@@ -1285,6 +1401,9 @@ impl Dialog {
     fn set_at(&mut self, i: usize, args: &Json) -> Result<(), String> {
         let before = self.controls[i].value.clone();
         self.controls[i].set(args)?;
+        if self.controls[i].editable_grid {
+            self.controls[i].keep_blank_row();
+        }
         self.caret = None;
         self.anchor = None;
         if self.controls[i].plugin {
@@ -1384,7 +1503,24 @@ impl Dialog {
             ]),
         )?;
         self.controls[i].edit = None;
+        self.controls[i].pick = None;
         Ok(())
+    }
+
+    /// Step the selected row's active cell of grid `i` to the next item of
+    /// its dropdown column, the first after the last.
+    fn grid_step_item(&mut self, i: usize) -> Result<(), String> {
+        let c = &self.controls[i];
+        let (Some(row), col) = (c.row, c.col) else {
+            return Ok(());
+        };
+        let items = c.column_items.get(col).cloned().unwrap_or_default();
+        if items.is_empty() {
+            return Ok(());
+        }
+        let at = items.iter().position(|item| *item == c.cell(row, col));
+        let next = at.map_or(0, |k| (k + 1) % items.len());
+        self.grid_commit(i, &items[next])
     }
 
     /// A key on a focused grid (#1602): Up and Down select a row, Left and
@@ -1405,7 +1541,21 @@ impl Dialog {
         let (rows, cols) = (c.row_count(), c.columns.len());
         let (row, col, editing) = (c.row, c.col, c.edit.clone());
         let toggles = c.column_kind(col).toggles();
+        let kind = c.column_kind(col);
+        let suggestions = c.suggestions();
         match key {
+            // The arrows reach into a combo cell's narrowed list while it is
+            // typed into (#1536).
+            "up" | "down" if !suggestions.is_empty() => {
+                let c = &mut self.controls[i];
+                c.pick = Some(match (c.pick, key) {
+                    (None, "down") => 0,
+                    (None, _) => suggestions.len() - 1,
+                    (Some(k), "down") => (k + 1).min(suggestions.len() - 1),
+                    (Some(k), _) => k.saturating_sub(1),
+                });
+                Ok(true)
+            }
             "up" | "down" => {
                 if rows > 0 {
                     let next = match (row, key) {
@@ -1434,16 +1584,26 @@ impl Dialog {
                 self.grid_toggle(i)?;
                 Ok(true)
             }
+            // Space steps a dropdown cell to its next item (#1536).
+            "space" if kind == ControlKind::Dropdown && editing.is_none() && row.is_some() => {
+                self.grid_step_item(i)?;
+                Ok(true)
+            }
             "enter" => match editing {
                 Some(buf) => {
-                    self.grid_commit(i, &buf)?;
+                    let picked = self.controls[i]
+                        .pick
+                        .and_then(|k| suggestions.get(k).copied())
+                        .and_then(|k| self.controls[i].column_items[col].get(k).cloned());
+                    self.grid_commit(i, &picked.unwrap_or(buf))?;
                     Ok(true)
                 }
                 None => Ok(false),
             },
             "escape" => match editing {
                 Some(_) => {
-                    self.controls[i].edit = None;
+                    let c = &mut self.controls[i];
+                    (c.edit, c.pick) = (None, None);
                     Ok(true)
                 }
                 None => Ok(false),
@@ -1455,6 +1615,15 @@ impl Dialog {
                     let mut buf = editing.unwrap_or_else(|| self.controls[i].cell(r, col));
                     buf.pop();
                     self.controls[i].edit = Some(buf);
+                    self.controls[i].pick = None;
+                }
+                Ok(true)
+            }
+            // Delete clears an editable grid's row (#1536), a plugin
+            // grid's cell.
+            "delete" if self.controls[i].editable_grid => {
+                if let (None, Some(r)) = (&editing, row) {
+                    self.set_at(i, &Json::obj(vec![("delete_row", Json::Num(r as f64))]))?;
                 }
                 Ok(true)
             }
@@ -1474,6 +1643,7 @@ impl Dialog {
                     let mut buf = editing.unwrap_or_default();
                     buf.push_str(t);
                     self.controls[i].edit = Some(buf);
+                    self.controls[i].pick = None;
                 }
                 Ok(true)
             }
@@ -1554,6 +1724,7 @@ impl Dialog {
         self.focus = Some(order[next]);
         self.caret = None;
         self.anchor = None;
+        self.calendar = None;
     }
 
     /// The focused text field's text, when the focus is on one.
@@ -1722,6 +1893,16 @@ impl Dialog {
                 let Some(code) = item else {
                     return Ok(());
                 };
+                // A narrowed combo list's item (#1536) is a code of its own.
+                if let Some(k) = code.checked_sub(SUGGESTION_BASE) {
+                    let picked = c
+                        .suggestions()
+                        .get(k)
+                        .and_then(|&n| c.column_items.get(c.col).and_then(|v| v.get(n)))
+                        .cloned()
+                        .ok_or("no such item")?;
+                    return self.grid_commit(index, &picked);
+                }
                 let (row, col) = (code / 256, code % 256);
                 if row >= rows.len() || col >= c.columns.len().max(1) {
                     return Err("no such cell".into());
@@ -1736,6 +1917,12 @@ impl Dialog {
                 self.row_moved(index);
                 if toggles {
                     return self.grid_toggle(index);
+                }
+                // A click on a dropdown cell steps it, as on a dropdown.
+                if self.controls[index].column_kind(col) == ControlKind::Dropdown
+                    && self.controls[index].editable_grid
+                {
+                    return self.grid_step_item(index);
                 }
                 return Ok(());
             }
@@ -1771,6 +1958,96 @@ impl Dialog {
             _ => return Ok(()),
         };
         self.set_at(index, &Json::obj(vec![("value", value)]))
+    }
+
+    /// Drop the calendar of date combo `index` down, on the date its text
+    /// starts with (today for none), the focus moving to it. Open already,
+    /// it closes.
+    pub fn toggle_calendar(&mut self, index: usize) -> Result<(), String> {
+        self.toggle_calendar_on(index, calendar::today())
+    }
+
+    /// [`Dialog::toggle_calendar`] with the day `today` is.
+    pub fn toggle_calendar_on(
+        &mut self,
+        index: usize,
+        today: projcore::DateTime,
+    ) -> Result<(), String> {
+        let c = self.controls.get(index).ok_or("no such control")?;
+        if c.kind != ControlKind::DateCombo {
+            return Err(format!("'{}' has no calendar", shown(&c.label)));
+        }
+        if !self.focusable().contains(&index) {
+            return Err(format!("'{}' cannot be edited", shown(&c.label)));
+        }
+        if self.calendar.is_some_and(|k| k.control == index) {
+            self.calendar = None;
+            return Ok(());
+        }
+        let text = c.text();
+        if self.focus != Some(index) {
+            self.caret = None;
+            self.anchor = None;
+        }
+        self.focus = Some(index);
+        self.calendar = Some(calendar::Calendar::open(index, &text, today));
+        Ok(())
+    }
+
+    /// Move the open calendar's cursor: by days, or by months (`months`).
+    pub fn calendar_move(&mut self, amount: i32, months: bool) -> Result<(), String> {
+        let k = self.calendar.as_mut().ok_or(NO_CALENDAR)?;
+        if months {
+            k.move_months(amount);
+        } else {
+            k.move_days(i64::from(amount));
+        }
+        Ok(())
+    }
+
+    /// Put the open calendar's cursor on day `day` of the shown month, and
+    /// pick it when `pick`.
+    pub fn calendar_day(&mut self, day: u32, pick: bool) -> Result<(), String> {
+        let k = self.calendar.as_mut().ok_or(NO_CALENDAR)?;
+        if !k.pick_day(day) {
+            return Err(format!("{} has no day {day}", k.title()));
+        }
+        if pick {
+            self.calendar_pick()?;
+        }
+        Ok(())
+    }
+
+    /// Write the open calendar's cursor day into its date combo and close it.
+    pub fn calendar_pick(&mut self) -> Result<(), String> {
+        let k = self.calendar.ok_or(NO_CALENDAR)?;
+        self.calendar = None;
+        self.set_at(k.control, &Json::obj(vec![("value", Json::Str(k.text()))]))
+    }
+
+    /// A key while a calendar is open: the arrows move its cursor a day or
+    /// a week, Page Up and Down a month, Enter picks, Escape closes; Tab
+    /// closes it and goes on. `Ok(false)` for a key it leaves alone.
+    pub fn calendar_key(&mut self, key: &str) -> Result<bool, String> {
+        if self.calendar.is_none() {
+            return Ok(false);
+        }
+        match key {
+            "left" => self.calendar_move(-1, false)?,
+            "right" => self.calendar_move(1, false)?,
+            "up" => self.calendar_move(-7, false)?,
+            "down" => self.calendar_move(7, false)?,
+            "pageup" => self.calendar_move(-1, true)?,
+            "pagedown" => self.calendar_move(1, true)?,
+            "enter" => self.calendar_pick()?,
+            "escape" | "f4" => self.calendar = None,
+            "tab" => {
+                self.calendar = None;
+                return Ok(false);
+            }
+            _ => {}
+        }
+        Ok(true)
     }
 
     /// Up or Down on the focused radio group, dropdown or list: the item
@@ -1835,6 +2112,7 @@ impl Dialog {
             .iter()
             .position(|t| fold(t) == fold(want))
             .ok_or_else(|| format!("no tab '{want}'; tabs: {}", self.tabs.join(", ")))?;
+        self.calendar = None;
         if self.focused().is_none() {
             self.focus = None;
         }
@@ -1901,6 +2179,20 @@ impl Dialog {
             ),
             ("modeless", Json::Bool(self.modeless)),
             ("active", Json::Bool(self.active)),
+            ("calendar_open", Json::Bool(self.calendar.is_some())),
+            (
+                "calendar",
+                self.calendar.map_or(Json::Null, |k| {
+                    Json::obj(vec![
+                        ("control", Json::Str(self.controls[k.control].name.into())),
+                        (
+                            "month",
+                            Json::Str(format!("{:04}-{:02}", k.year(), k.month())),
+                        ),
+                        ("day", Json::Num(f64::from(k.day()))),
+                    ])
+                }),
+            ),
         ])
     }
 }
@@ -2057,6 +2349,10 @@ impl DialogStack {
         {
             return None;
         }
+        // An open calendar takes Enter and Escape (#1536).
+        if matches!(key, "enter" | "escape") && top.calendar.is_some() {
+            return None;
+        }
         // A grid cell being typed into takes Enter and Escape (#1602).
         if matches!(key, "enter" | "escape")
             && top
@@ -2073,6 +2369,8 @@ impl DialogStack {
         b.enabled.then(|| b.label.clone())
     }
 }
+
+pub(crate) const NO_CALENDAR: &str = "no calendar is open";
 
 pub(crate) const NONE_OPEN: &str = "no dialog is open";
 
@@ -2122,6 +2420,7 @@ mod tests_support {
             stale: false,
             seen: None,
             committed: None,
+            calendar: None,
         }
     }
 }

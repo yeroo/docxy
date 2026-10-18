@@ -118,6 +118,7 @@ fn form() -> Dialog {
         stale: false,
         seen: None,
         committed: None,
+        calendar: None,
     };
     d.controls = d.controls.into_iter().map(general).collect();
     preds.page = Some(1);
@@ -1061,4 +1062,221 @@ fn a_modeless_dialog_keeps_the_keys_only_while_active_and_survives_clear_modal()
     s.top_dialog_mut().unwrap().modeless = false;
     s.clear_modal();
     assert!(!s.is_open());
+}
+
+/// A grid the person edits (#1536): a combo column offering items, a
+/// dropdown column, and a free one.
+fn link_grid() -> Dialog {
+    let mut d = form();
+    let mut g = Control::new(
+        "links",
+        "Links",
+        ControlKind::Grid,
+        Value::Rows(vec![
+            vec!["2".into(), "Design".into(), "Finish-to-Start (FS)".into()],
+            vec![String::new(); 3],
+        ]),
+    );
+    g.page = Some(1);
+    g.columns = vec!["ID".into(), "Task Name".into(), "Type".into()];
+    g.column_kinds = vec![ControlKind::Text, ControlKind::Combo, ControlKind::Dropdown];
+    g.column_items = vec![
+        Vec::new(),
+        vec!["Design".into(), "Build".into(), "Deploy".into()],
+        vec![
+            "Finish-to-Start (FS)".into(),
+            "Start-to-Start (SS)".into(),
+            "Finish-to-Finish (FF)".into(),
+        ],
+    ];
+    g.editable_grid = true;
+    d.controls.push(g);
+    d.tab = 1;
+    d.mark_opened();
+    d
+}
+
+fn rows(d: &Dialog) -> Vec<Vec<String>> {
+    match d.value("links") {
+        Some(Value::Rows(r)) => r.clone(),
+        other => panic!("not rows: {other:?}"),
+    }
+}
+
+#[test]
+fn an_editable_grid_is_reached_by_tab_and_keeps_one_blank_row() {
+    let mut d = link_grid();
+    assert_eq!(d.tabs_to("links"), Ok(1));
+    assert!(!d.changed("links"));
+    d.select_row("links", 1).unwrap();
+    // Typing a cell of the blank row makes the next blank row.
+    d.set("links[1].id", &args(r#"{"value":"3"}"#)).unwrap();
+    assert_eq!(rows(&d).len(), 3);
+    assert!(rows(&d)[2].iter().all(String::is_empty));
+    assert!(d.changed("links"));
+    // Clearing it again leaves a single blank row, as opened.
+    d.set("links[1].id", &args(r#"{"value":""}"#)).unwrap();
+    assert_eq!(rows(&d).len(), 2);
+    assert!(!d.changed("links"));
+}
+
+#[test]
+fn a_dropdown_column_takes_an_item_or_the_only_match() {
+    let mut d = link_grid();
+    d.set("links[1].type", &args(r#"{"value":"ss"}"#)).unwrap();
+    assert_eq!(rows(&d)[1][2], "Start-to-Start (SS)");
+    d.set(
+        "links[1].type",
+        &args(r#"{"value":"FINISH-TO-FINISH (ff)"}"#),
+    )
+    .unwrap();
+    assert_eq!(rows(&d)[1][2], "Finish-to-Finish (FF)");
+    let both = d
+        .set("links[1].type", &args(r#"{"value":"finish"}"#))
+        .unwrap_err();
+    assert!(both.contains("more than one"), "{both}");
+    let none = d
+        .set("links[1].type", &args(r#"{"value":"zz"}"#))
+        .unwrap_err();
+    assert!(none.contains("choose Finish-to-Start (FS)"), "{none}");
+    // Blank clears it.
+    d.set("links[1].type", &args(r#"{"value":""}"#)).unwrap();
+}
+
+#[test]
+fn a_combo_cell_narrows_its_list_while_typed_into_and_takes_the_pick() {
+    let mut d = link_grid();
+    d.select_row("links", 1).unwrap();
+    let i = d.focus.unwrap();
+    d.controls[i].col = 1;
+    assert!(d.controls[i].suggestions().is_empty(), "nothing typed yet");
+    d.grid_key("d", Some("d")).unwrap();
+    assert_eq!(d.controls[i].suggestions(), vec![0, 1, 2], "each has a d");
+    d.grid_key("e", Some("e")).unwrap();
+    assert_eq!(d.controls[i].suggestions(), vec![0, 2], "Design, Deploy");
+    d.grid_key("p", Some("p")).unwrap();
+    assert_eq!(d.controls[i].suggestions(), vec![2]);
+    // The arrows reach into the list, not the rows; Enter takes the pick.
+    assert!(d.grid_key("down", None).unwrap());
+    assert_eq!((d.controls[i].row, d.controls[i].pick), (Some(1), Some(0)));
+    assert!(d.grid_key("enter", None).unwrap());
+    assert_eq!(rows(&d)[1][1], "Deploy");
+    assert_eq!(d.controls[i].edit, None);
+    // A click on a listed item commits it as well.
+    d.grid_key("b", Some("b")).unwrap();
+    d.click_control(i, Some(SUGGESTION_BASE)).unwrap();
+    assert_eq!(rows(&d)[1][1], "Build");
+    // A name that is no item stays as typed (the owner resolves it on OK).
+    d.set("links[1].task name", &args(r#"{"value":"Launch"}"#))
+        .unwrap();
+    assert_eq!(rows(&d)[1][1], "Launch");
+}
+
+#[test]
+fn space_and_a_click_step_a_dropdown_cell_and_delete_removes_the_row() {
+    let mut d = link_grid();
+    d.select_row("links", 0).unwrap();
+    let i = d.focus.unwrap();
+    d.controls[i].col = 2;
+    d.grid_key("space", Some(" ")).unwrap();
+    assert_eq!(rows(&d)[0][2], "Start-to-Start (SS)");
+    d.click_control(i, Some(2)).unwrap();
+    assert_eq!(rows(&d)[0][2], "Finish-to-Finish (FF)");
+    d.grid_key("space", Some(" ")).unwrap();
+    assert_eq!(rows(&d)[0][2], "Finish-to-Start (FS)", "wraps around");
+    // Delete clears the whole row, leaving the blank one.
+    assert!(d.grid_key("delete", None).unwrap());
+    assert_eq!(rows(&d), vec![vec![String::new(); 3]]);
+    assert!(d.changed("links"));
+}
+
+#[test]
+fn a_date_combo_types_like_a_date_and_drops_a_calendar_down() {
+    let mut d = form();
+    let mut c = Control::new(
+        "finish",
+        "Finish:",
+        ControlKind::DateCombo,
+        Value::Text("2026-10-18T17:00".into()),
+    );
+    c.page = Some(0);
+    d.controls.push(c);
+    let i = d.controls.len() - 1;
+    let today = projcore::DateTime::from_ymd_hm(2026, 3, 9, 0, 0);
+    assert!(ControlKind::DateCombo.is_text());
+    d.set("finish", &args(r#"{"value":"2026-10-20"}"#)).unwrap();
+    // Opening it focuses the field and shows the field's month.
+    d.toggle_calendar_on(i, today).unwrap();
+    assert_eq!(d.focus, Some(i));
+    let k = d.calendar.unwrap();
+    assert_eq!((k.year(), k.month(), k.day()), (2026, 10, 20));
+    // The arrows move the cursor, Page Down a month; a key it leaves
+    // alone stays the calendar's.
+    d.calendar_key("right").unwrap();
+    d.calendar_key("up").unwrap();
+    assert_eq!(d.calendar.unwrap().day(), 14);
+    d.calendar_key("pagedown").unwrap();
+    assert_eq!(d.calendar.unwrap().text(), "2026-11-14");
+    // Escape closes it without a change; reopened, Enter picks.
+    assert!(d.calendar_key("escape").unwrap());
+    assert!(d.calendar.is_none());
+    assert_eq!(text_of_control(&d, "finish"), "2026-10-20");
+    d.toggle_calendar_on(i, today).unwrap();
+    d.calendar_key("down").unwrap();
+    d.calendar_key("enter").unwrap();
+    assert!(d.calendar.is_none());
+    assert_eq!(text_of_control(&d, "finish"), "2026-10-27");
+    // A click on a day picks it; the button toggles; a blank field opens on today.
+    d.toggle_calendar_on(i, today).unwrap();
+    d.calendar_move(-1, true).unwrap();
+    d.calendar_day(3, true).unwrap();
+    assert_eq!(text_of_control(&d, "finish"), "2026-09-03");
+    assert!(d.calendar_day(3, true).is_err(), "no calendar open");
+    d.set("finish", &args(r#"{"value":""}"#)).unwrap();
+    d.toggle_calendar_on(i, today).unwrap();
+    assert_eq!(d.calendar.unwrap().text(), "2026-03-09");
+    d.toggle_calendar_on(i, today).unwrap();
+    assert!(d.calendar.is_none());
+    // Not a date combo: no calendar. Tab closes it and moves on.
+    assert!(d.toggle_calendar_on(0, today).is_err());
+    d.toggle_calendar_on(i, today).unwrap();
+    assert!(!d.calendar_key("tab").unwrap());
+    assert!(d.calendar.is_none());
+}
+
+#[test]
+fn an_open_calendar_keeps_enter_and_escape_from_the_buttons() {
+    let mut s = stack();
+    {
+        let d = s.top_dialog_mut().unwrap();
+        let mut c = Control::new(
+            "finish",
+            "Finish:",
+            ControlKind::DateCombo,
+            Value::Text(String::new()),
+        );
+        c.page = Some(0);
+        d.controls.push(c);
+        let i = d.controls.len() - 1;
+        d.toggle_calendar(i).unwrap();
+    }
+    assert_eq!(s.key_button("enter", true), None);
+    assert_eq!(s.key_button("escape", true), None);
+    let json = s.to_json();
+    assert_eq!(json.get("calendar_open"), Some(&Json::Bool(true)));
+    assert_eq!(
+        json.get("calendar").unwrap().get_str("control"),
+        Some("finish")
+    );
+    s.top_dialog_mut().unwrap().calendar_key("escape").unwrap();
+    assert_eq!(s.key_button("enter", true), Some("OK".to_string()));
+    assert_eq!(s.to_json().get("calendar_open"), Some(&Json::Bool(false)));
+}
+
+fn text_of_control(d: &Dialog, name: &str) -> String {
+    d.controls
+        .iter()
+        .find(|c| c.name == name)
+        .map(Control::text)
+        .unwrap_or_default()
 }
