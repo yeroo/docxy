@@ -161,17 +161,10 @@ impl Editor {
         {
             return Ok(c.uid);
         }
-        if let Ok(uid) = key.parse::<i32>()
-            && self.proj.calendar(uid).is_some()
-        {
-            return Ok(uid);
+        match key.parse::<i32>() {
+            Ok(uid) if self.proj.calendar(uid).is_some() => Ok(uid),
+            _ => Err(format!("no calendar named '{key}'")),
         }
-        self.proj
-            .calendars
-            .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(key))
-            .map(|c| c.uid)
-            .ok_or_else(|| format!("no calendar named '{key}'"))
     }
 
     /// Apply `edit` to a copy of the plan as one undo step, unless it changes
@@ -913,11 +906,15 @@ mod tests {
         assert_eq!(ed.undo_depth(), 10);
         // A calendar named like a number is found by its name; a uid still
         // works for a name no calendar has.
-        let seven = ed.add_calendar("7", None, None).unwrap();
-        assert_ne!(seven, 7);
-        assert_eq!(ed.calendar_by("7"), Ok(seven));
-        ed.delete_calendar(seven).unwrap();
-        assert_eq!(ed.calendar_by(&standard.to_string()), Ok(standard));
+        // A calendar named "1" while Standard is UID 1: the name wins.
+        assert_eq!(standard, 1);
+        let one = ed.add_calendar("1", None, None).unwrap();
+        assert_ne!(one, 1);
+        assert_eq!(ed.calendar_by("1"), Ok(one));
+        assert_eq!(ed.calendar_by(&one.to_string()), Ok(one));
+        ed.delete_calendar(one).unwrap();
+        assert_eq!(ed.calendar_by("1"), Ok(standard));
+        assert!(ed.calendar_by("9").is_err());
         // An out-of-range hour is refused, not computed.
         assert_eq!(parse_clock("4294967295:00"), None);
         assert_eq!(parse_clock("25:00"), None);
