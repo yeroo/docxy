@@ -784,7 +784,28 @@ fn control_of_spec(
     out.commit_command = c.commit_command;
     out.page = page;
     out.plugin = true;
+    apply_selected_row(&mut out, prefill);
     out
+}
+
+/// A grid's selected row as the plugin's state gives it under
+/// `name.selected_row` (#1602): a number selects that row (clamped to the
+/// rows), null none; absent leaves the selection alone.
+fn apply_selected_row(c: &mut dialog::Control, prefill: &Prefill) {
+    if c.kind != dialog::ControlKind::Grid {
+        return;
+    }
+    let Some(v) = prefill.value(&format!("{}.selected_row", c.name)) else {
+        return;
+    };
+    let rows = match &c.value {
+        dialog::Value::Rows(rows) => rows.len(),
+        _ => 0,
+    };
+    c.row = match v {
+        Json::Num(n) if *n >= 0.0 && rows > 0 => Some((*n as usize).min(rows - 1)),
+        _ => None,
+    };
 }
 
 /// The dialog spec `spec_id` of any loaded plugin.
@@ -958,6 +979,11 @@ pub(crate) fn refresh_dialog(tab: &mut DocTab) {
                 };
                 c.row = c.row.filter(|r| *r < rows);
             }
+        }
+        if moved {
+            // The plugin may keep the selection on the same row of a grid
+            // whose rows just moved (`name.selected_row`).
+            apply_selected_row(c, &p);
         }
     }
     for b in &mut d.buttons {

@@ -477,7 +477,8 @@ without one nothing changes.
   greys a button by its id), be `modeless` (no backdrop; the host asks the
   state again, with the dialog's `values`, whenever the plan's revision or
   the selection changes and applies its values, items and enabled flags),
-  and its `grid` rows select (`values` carry `name.selected_row`) and edit
+  and its `grid` rows select (`values` carry `name.selected_row`, and the
+  state's `values` may move the selection with the same key) and edit
   by hand (a `check` column kind is Project's check mark; a grid with
   `commit_command` sends the command on every cell commit with `edit:
   {control, row, col, value}`, its ops applying at once). A change of any
