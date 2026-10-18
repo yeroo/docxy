@@ -148,17 +148,7 @@ impl GanttScale {
         projcore::DateTime::from_minutes((self.origin_day + day) * 1440)
     }
 
-    pub fn ticks(self, visible: std::ops::Range<i64>) -> Vec<(i64, String)> {
-        visible
-            .filter_map(|day| {
-                let date = self.date(day);
-                let p = date.parts();
-                (date.weekday() == 1).then(|| (day, format!("{}/{}", p.month, p.day)))
-            })
-            .collect()
-    }
-
-    fn visible(self, offset: f32, width: f32) -> std::ops::Range<i64> {
+    pub(super) fn visible(self, offset: f32, width: f32) -> std::ops::Range<i64> {
         (offset / self.day_w).floor().max(0.) as i64
             ..(((offset + width) / self.day_w).ceil() as i64).min(self.days)
     }
@@ -328,8 +318,38 @@ pub(crate) fn shaded_days(
         .collect()
 }
 
+/// Below this many pixels per day the day lines are left out: they would
+/// be a wash of rules, and the header's tiers say where the days are.
+pub(crate) const MIN_LINE_DAY_W: f32 = 8.;
+/// Below this many pixels per day non-working days are not shaded one by one.
+pub(crate) const MIN_SHADE_DAY_W: f32 = 3.;
+
+/// The runs `(first, last)` of consecutive non-working days in view, one
+/// rectangle each; none when a day is too narrow to tell apart.
+pub(crate) fn shaded_runs(
+    scale: GanttScale,
+    cal: Option<&projcore::WorkCalendar>,
+    offset: f32,
+    width: f32,
+) -> Vec<(i64, i64)> {
+    if scale.day_w < MIN_SHADE_DAY_W {
+        return Vec::new();
+    }
+    let mut runs: Vec<(i64, i64)> = Vec::new();
+    for day in shaded_days(scale, cal, offset, width) {
+        match runs.last_mut() {
+            Some(run) if run.1 + 1 == day => run.1 = day,
+            _ => runs.push((day, day)),
+        }
+    }
+    runs
+}
+
 /// The left edge of each visible day, relative to the chart viewport.
 pub(crate) fn day_lines(scale: GanttScale, offset: f32, width: f32) -> Vec<f32> {
+    if scale.day_w < MIN_LINE_DAY_W {
+        return Vec::new();
+    }
     scale
         .visible(offset, width)
         .map(|day| day as f32 * scale.day_w - offset)
@@ -368,11 +388,17 @@ fn backdrop(
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
-            for day in shaded_days(scale, cal.as_ref(), offset, width) {
+            for (first, last) in shaded_runs(scale, cal.as_ref(), offset, width) {
                 window.paint_quad(fill(
                     Bounds {
-                        origin: point(bounds.origin.x + px(day as f32 * scale.day_w), bounds.origin.y),
-                        size: size(px(scale.day_w), bounds.size.height),
+                        origin: point(
+                            bounds.origin.x + px(first as f32 * scale.day_w),
+                            bounds.origin.y,
+                        ),
+                        size: size(
+                            px((last - first + 1) as f32 * scale.day_w),
+                            bounds.size.height,
+                        ),
                     },
                     nonworking_fill(pal),
                 ));
@@ -452,14 +478,17 @@ pub(crate) fn body_grid(view: &ProjectView, pal: Pal) -> impl IntoElement {
             };
             let width = f32::from(chart.size.width);
             window.with_content_mask(Some(ContentMask { bounds: chart }), |window| {
-                for day in shaded_days(scale, cal.as_ref(), gantt_x, width) {
+                for (first, last) in shaded_runs(scale, cal.as_ref(), gantt_x, width) {
                     window.paint_quad(fill(
                         Bounds {
                             origin: point(
-                                chart.origin.x + px(day as f32 * scale.day_w - gantt_x),
+                                chart.origin.x + px(first as f32 * scale.day_w - gantt_x),
                                 chart.origin.y,
                             ),
-                            size: size(px(scale.day_w), chart.size.height),
+                            size: size(
+                                px((last - first + 1) as f32 * scale.day_w),
+                                chart.size.height,
+                            ),
                         },
                         nonworking_fill(pal),
                     ));
@@ -489,18 +518,38 @@ pub(crate) fn gantt_header(
         .w(px(scale.width()))
         .h(px(ROW_H))
         .child(backdrop(scale, cal, offset, width, pal))
-        .children(
-            scale
-                .ticks(scale.visible((offset - scale.day_w * 2.).max(0.), width + scale.day_w * 2.))
-                .into_iter()
-                .map(|(day, label)| {
-                    div()
-                        .absolute()
-                        .left(px(day as f32 * scale.day_w))
-                        .top(px(5.))
-                        .child(label)
-                }),
-        )
+        .children(header_cells(scale, offset, width, pal))
+}
+
+/// The header's two tiers, 14 px each: the major unit over the minor, each
+/// cell ruled on its left and labelled when the label fits.
+fn header_cells(scale: GanttScale, offset: f32, width: f32, pal: Pal) -> Vec<Div> {
+    let level = &zoom::LEVELS[zoom::nearest(scale.day_w)];
+    let (major, minor) = zoom::tiers(scale, level, offset, width);
+    let half = ROW_H / 2.;
+    let rule = Hsla {
+        a: pal.border.a * 0.6,
+        ..pal.border
+    };
+    let cell = |c: zoom::Cell, top: f32, bold: bool| {
+        div()
+            .absolute()
+            .left(px(c.x))
+            .top(px(top))
+            .w(px(c.w))
+            .h(px(half))
+            .border_l_1()
+            .border_color(rule)
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_size(px(10.))
+            .line_height(px(half))
+            .when(bold, |d| d.font_weight(FontWeight::BOLD))
+            .child(div().absolute().left(px(c.at - c.x + 2.)).child(c.label))
+    };
+    let mut cells: Vec<Div> = major.into_iter().map(|c| cell(c, 0., true)).collect();
+    cells.extend(minor.into_iter().map(|c| cell(c, half, false).border_t_1()));
+    cells
 }
 
 /// One row's Gantt strip. `on_right` is the bar's own right-press (#1207):

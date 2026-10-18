@@ -215,7 +215,10 @@ fn the_view_box_is_the_charts_visible_days_on_the_span() {
     // The chart shows the whole plan.
     assert_eq!(view_box(SPAN, SCALE, 0., 50. * DEFAULT_DAY_W), (0., 1.));
     // Scrolled mid-plan: days 10..20 of 40.
-    assert_near(view_box(SPAN, SCALE, 10. * DEFAULT_DAY_W, VIEW_W), (0.25, 0.5));
+    assert_near(
+        view_box(SPAN, SCALE, 10. * DEFAULT_DAY_W, VIEW_W),
+        (0.25, 0.5),
+    );
     // Scrolled to the end of the scale, into the padding past the finish.
     let end = SCALE.width() - VIEW_W;
     assert_near(view_box(SPAN, SCALE, end, VIEW_W), (37. / 40., 1.));
@@ -236,9 +239,15 @@ fn the_view_box_keeps_a_grabbable_width_inside_the_ruler() {
 
 #[test]
 fn the_view_days_are_the_first_and_last_day_the_chart_shows() {
-    assert_eq!(view_days(SPAN, SCALE, 10. * DEFAULT_DAY_W, VIEW_W), (110, 119));
+    assert_eq!(
+        view_days(SPAN, SCALE, 10. * DEFAULT_DAY_W, VIEW_W),
+        (110, 119)
+    );
     // A day partly in view counts at either end.
-    assert_eq!(view_days(SPAN, SCALE, 10.5 * DEFAULT_DAY_W, VIEW_W), (110, 120));
+    assert_eq!(
+        view_days(SPAN, SCALE, 10.5 * DEFAULT_DAY_W, VIEW_W),
+        (110, 120)
+    );
     // Clamped to the span: the padding past the finish and the baseline lead-in.
     assert_eq!(
         view_days(SPAN, SCALE, SCALE.width() - VIEW_W, VIEW_W),
@@ -276,7 +285,14 @@ fn a_chart_wider_than_the_plan_has_nothing_to_drag() {
     };
     for dx in [-100., 30., 100.] {
         assert_eq!(
-            drag_gantt_x(span, scale, 20. * DEFAULT_DAY_W, RULER_W, 5. * DEFAULT_DAY_W, dx),
+            drag_gantt_x(
+                span,
+                scale,
+                20. * DEFAULT_DAY_W,
+                RULER_W,
+                5. * DEFAULT_DAY_W,
+                dx
+            ),
             5. * DEFAULT_DAY_W
         );
     }

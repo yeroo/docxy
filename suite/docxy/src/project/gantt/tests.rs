@@ -117,12 +117,15 @@ fn slot_one_alone_does_not_show_a_bar_or_extend_the_scale() {
 }
 
 #[test]
-fn date_ticks_are_mondays_and_weekend_columns_are_saturday_sunday() {
+fn week_cells_start_on_mondays_and_weekend_columns_are_saturday_sunday() {
     let scale = gantt_scale(&editor(vec![]));
+    let weeks = zoom::tier(scale, zoom::Unit::Week, 0., 15. * DEFAULT_DAY_W);
     assert_eq!(
-        scale.ticks(0..15),
-        vec![(0, "1/5".into()), (7, "1/12".into()), (14, "1/19".into())]
+        weeks.iter().map(|c| c.x).collect::<Vec<_>>(),
+        [0., 7. * 22., 14. * 22.]
     );
+    assert_eq!(zoom::Unit::Week.labels(scale.origin_day)[2], "1/5");
+    assert_eq!(zoom::Unit::Week.labels(scale.origin_day + 14)[2], "1/19");
     for day in 0..14 {
         assert_eq!(
             editor(vec![])
@@ -348,7 +351,10 @@ fn table_and_chart_scrollbars_move_only_their_own_pane() {
     assert_eq!(table.offset(), point(px(-90.), px(0.)));
     // The next frame's layout keeps both where they were put.
     v.layout(NARROW);
-    assert_eq!((v.table_x.get(), v.gantt_x.get()), (90., 200. + DEFAULT_DAY_W));
+    assert_eq!(
+        (v.table_x.get(), v.gantt_x.get()),
+        (90., 200. + DEFAULT_DAY_W)
+    );
 }
 
 #[test]
@@ -692,9 +698,15 @@ fn day_lines_follow_horizontal_scroll_and_stay_in_the_viewport() {
     let scale = monday_scale(30);
     assert_eq!(day_lines(scale, 0., 110.), [0., 22., 44., 66., 88.]);
     assert_eq!(day_lines(scale, 11., 110.), [11., 33., 55., 77., 99.]);
-    assert_eq!(day_lines(scale, DEFAULT_DAY_W, 2. * DEFAULT_DAY_W), [0., 22.]);
+    assert_eq!(
+        day_lines(scale, DEFAULT_DAY_W, 2. * DEFAULT_DAY_W),
+        [0., 22.]
+    );
     // No lines past the scale's last day.
-    assert_eq!(day_lines(scale, 28. * DEFAULT_DAY_W, 10. * DEFAULT_DAY_W), [0., 22.]);
+    assert_eq!(
+        day_lines(scale, 28. * DEFAULT_DAY_W, 10. * DEFAULT_DAY_W),
+        [0., 22.]
+    );
     assert!(day_lines(scale, 0., 0.).is_empty());
 }
 
@@ -706,8 +718,14 @@ fn shaded_days_are_the_visible_weekends() {
         shaded_days(scale, Some(&cal), 0., 14. * DEFAULT_DAY_W),
         [5, 6, 12, 13]
     );
-    assert_eq!(shaded_days(scale, Some(&cal), 6. * DEFAULT_DAY_W, 2. * DEFAULT_DAY_W), [6]);
-    assert_eq!(shaded_days(scale, Some(&cal), 5.5 * DEFAULT_DAY_W, DEFAULT_DAY_W), [5, 6]);
+    assert_eq!(
+        shaded_days(scale, Some(&cal), 6. * DEFAULT_DAY_W, 2. * DEFAULT_DAY_W),
+        [6]
+    );
+    assert_eq!(
+        shaded_days(scale, Some(&cal), 5.5 * DEFAULT_DAY_W, DEFAULT_DAY_W),
+        [5, 6]
+    );
     assert_eq!(
         shaded_days(scale, Some(&cal), 26. * DEFAULT_DAY_W, 10. * DEFAULT_DAY_W),
         [26, 27]
@@ -734,7 +752,12 @@ fn shaded_days_follow_project_calendar_exceptions_and_week() {
     ));
     p.calendars = vec![cal];
     assert_eq!(
-        shaded_days(scale, p.project_shading_calendar().as_ref(), 0., 7. * DEFAULT_DAY_W),
+        shaded_days(
+            scale,
+            p.project_shading_calendar().as_ref(),
+            0.,
+            7. * DEFAULT_DAY_W
+        ),
         [2, 6]
     );
 
@@ -742,13 +765,23 @@ fn shaded_days_follow_project_calendar_exceptions_and_week() {
     p.calendars[0].week[0] = p.calendars[0].week[1].clone();
     p.calendars[0].week[5] = Some(DayWorking::default());
     assert_eq!(
-        shaded_days(scale, p.project_shading_calendar().as_ref(), 0., 7. * DEFAULT_DAY_W),
+        shaded_days(
+            scale,
+            p.project_shading_calendar().as_ref(),
+            0.,
+            7. * DEFAULT_DAY_W
+        ),
         [4, 5]
     );
 
     p.default_calendar_uid = 99;
     assert_eq!(
-        shaded_days(scale, p.project_shading_calendar().as_ref(), 0., 7. * DEFAULT_DAY_W),
+        shaded_days(
+            scale,
+            p.project_shading_calendar().as_ref(),
+            0.,
+            7. * DEFAULT_DAY_W
+        ),
         [5, 6]
     );
 }
@@ -805,7 +838,15 @@ fn closed_project_week_has_no_global_shading() {
     leaf.calendar_uid = Some(3);
     p.tasks = vec![leaf];
     let scale = gantt_scale(&ProjectEditor::new(p.clone()));
-    assert!(shaded_days(scale, p.project_shading_calendar().as_ref(), 0., 7. * DEFAULT_DAY_W).is_empty());
+    assert!(
+        shaded_days(
+            scale,
+            p.project_shading_calendar().as_ref(),
+            0.,
+            7. * DEFAULT_DAY_W
+        )
+        .is_empty()
+    );
 }
 
 #[test]

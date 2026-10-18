@@ -21,6 +21,7 @@ pub(super) use task_info::*;
 mod clip;
 pub(super) use clip::*;
 mod timeline;
+mod zoom;
 pub(super) use timeline::*;
 mod rows;
 pub(super) use rows::*;
@@ -213,7 +214,10 @@ impl ProjectView {
     /// days to its right edge. Scrolling clamps to the plan's own scale, not this one.
     pub fn chart_scale(&self) -> GanttScale {
         GanttScale {
-            days: self.scale.days.max((self.gantt_w / self.scale.day_w).ceil() as i64),
+            days: self
+                .scale
+                .days
+                .max((self.gantt_w / self.scale.day_w).ceil() as i64),
             ..self.scale
         }
     }
@@ -391,8 +395,14 @@ impl ProjectView {
     }
 
     pub fn pan_gantt(&mut self, right: bool) {
-        self.gantt_x
-            .set(self.gantt_x.get() + if right { self.scale.day_w } else { -self.scale.day_w });
+        self.gantt_x.set(
+            self.gantt_x.get()
+                + if right {
+                    self.scale.day_w
+                } else {
+                    -self.scale.day_w
+                },
+        );
         self.clamp_offsets();
     }
 
@@ -406,7 +416,8 @@ impl ProjectView {
             .and_then(|uid| self.ed.project().task(uid))
             .and_then(|task| gantt_bar(&self.ed, task, self.scale));
         if let Some(bar) = bar {
-            self.gantt_x.set((bar.start - 1).max(0) as f32 * self.scale.day_w);
+            self.gantt_x
+                .set((bar.start - 1).max(0) as f32 * self.scale.day_w);
             self.clamp_offsets();
         }
     }
