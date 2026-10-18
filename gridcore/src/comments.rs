@@ -65,6 +65,7 @@ fn unescape(s: &str) -> String {
 /// Concatenated text of every `<t>…</t>` inside `frag`, read as Excel reads
 /// it: line ends as LF (XML 1.0 §2.11) and, outside `xml:space="preserve"`,
 /// no edge whitespace (#1188).
+#[cfg(test)]
 fn collect_t(frag: &str) -> String {
     collect_t_in(frag, false)
 }
