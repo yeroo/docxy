@@ -142,6 +142,14 @@ impl Field {
         }
     }
 
+    /// A date field with a calendar button (#1536): typed as a date.
+    pub const fn date_combo(name: &'static str, sample: &'static str, bad: &'static str) -> Self {
+        Self {
+            kind: ControlKind::DateCombo,
+            ..Self::date(name, sample, bad)
+        }
+    }
+
     pub const fn duration(name: &'static str, sample: &'static str, bad: &'static str) -> Self {
         Self {
             kind: ControlKind::Duration,

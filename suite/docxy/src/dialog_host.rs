@@ -876,7 +876,7 @@ impl Docxy {
                 .relative()
                 .px_2()
                 .cursor_pointer()
-                .child(probe(&self.probes, format!("dialog-calendar-{id}:{name}")))
+                .child(probe(&self.probes, format!("dialog-calendar:{id}:{name}")))
                 .child(label)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.dialog_calendar(i, CalendarAct::Month(by), cx)
@@ -903,7 +903,7 @@ impl Docxy {
                         })
                         .child(probe(
                             &self.probes,
-                            format!("dialog-calendar-day:{name}:{day}"),
+                            format!("dialog-calendar:day:{name}:{day}"),
                         ))
                         .child(SharedString::from(day.to_string()))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -922,7 +922,7 @@ impl Docxy {
             .border_1()
             .border_color(pal.dim)
             .bg(pal.panel)
-            .child(probe(&self.probes, format!("dialog-calendar:{name}")))
+            .child(probe(&self.probes, format!("dialog-calendar:popup:{name}")))
             .child(
                 h_flex()
                     .justify_between()
@@ -1077,6 +1077,7 @@ impl Docxy {
                     .collect();
                 let cell = |content: AnyElement, w: f32, head: bool, active: bool| {
                     div()
+                        .relative()
                         .w(px(w))
                         .h(px(18.))
                         .px_1()
@@ -1123,6 +1124,14 @@ impl Docxy {
                                 },
                             };
                             cell(content, widths[col], false, active)
+                                .child(probe(
+                                    &self.probes,
+                                    format!(
+                                        "dialog-cell:{}[{r}].{}",
+                                        c.name,
+                                        c.columns[col].to_lowercase()
+                                    ),
+                                ))
                                 .id(("dialog-grid-cell", (i * 1024 + r) * 256 + col))
                                 .when(c.enabled && (c.plugin || c.editable_grid), |d| {
                                     d.cursor_pointer().on_click(on_widget(
@@ -1171,6 +1180,11 @@ impl Docxy {
                                         .when(pick == Some(k), |r| {
                                             r.bg(hsla_u(BRAND).opacity(0.35))
                                         })
+                                        .relative()
+                                        .child(probe(
+                                            &self.probes,
+                                            format!("dialog-cell:{name}[suggest].{k}"),
+                                        ))
                                         .child(SharedString::from(offered[n].clone()))
                                         .on_click(on_widget(
                                             cx,
@@ -1225,7 +1239,7 @@ impl Docxy {
                                 .border_color(pal.dim)
                                 .child(probe(
                                     &self.probes,
-                                    format!("dialog-calendar-button:{name}"),
+                                    format!("dialog-calendar:button:{name}"),
                                 ))
                                 .child("\u{25BE}")
                                 .when(editable, |b| {

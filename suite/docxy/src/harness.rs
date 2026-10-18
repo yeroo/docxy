@@ -1517,13 +1517,15 @@ fn to_field_arg(args: &Json) -> Result<Option<&str>, String> {
 }
 
 /// The targets `pointer-click` takes; a call names exactly one (#1029).
-const POINTER_TARGETS: [&str; 7] = [
+const POINTER_TARGETS: [&str; 9] = [
     "region",
     "at",
     "dialog-field",
     "dialog-tab",
     "dialog-button",
     "dialog-control",
+    "dialog-calendar",
+    "dialog-cell",
     "input",
 ];
 
@@ -5343,6 +5345,13 @@ fn dispatch_verb(
                 ("dialog-tab", "a tab label"),
                 ("dialog-button", "a button label"),
                 ("dialog-control", "a control name"),
+                // A date combo's calendar part (#1536): `button:<field>`,
+                // `prev:<field>`, `next:<field>`, `day:<field>:<n>`.
+                ("dialog-calendar", "a calendar part"),
+                // An editable grid's cell, `name[row].column` with the
+                // column's heading in lower case, or a narrowed combo
+                // list's item `name[suggest].<n>` (#1536).
+                ("dialog-cell", "a grid cell"),
             ]
             .into_iter()
             .find_map(|(key, what)| args.get(key).map(|v| (key, what, v)));
