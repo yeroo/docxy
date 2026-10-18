@@ -1,7 +1,9 @@
 //! Day-scale geometry shared by the renderer and harness.
 use super::*;
 
-pub(crate) const DAY_W: f32 = 22.;
+/// The pixels one day is wide at the default zoom (the Days level); a view's live
+/// value is [`GanttScale::day_w`].
+pub(crate) const DEFAULT_DAY_W: f32 = 22.;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum BarKind {
@@ -36,14 +38,19 @@ pub(crate) fn bar_kind_name(kind: BarKind) -> &'static str {
     }
 }
 
+/// The left of a milestone's 14 px diamond: centred in its day.
+pub(crate) fn milestone_x(start: i64, day_w: f32) -> f32 {
+    start as f32 * day_w + day_w / 2. - 7.
+}
+
 /// The rectangle `gantt_strip` draws `bar` in, `(x, y, w, h)` within its
 /// row: a leaf bar, a summary's thinner bar, or a milestone's diamond box.
-pub(crate) fn bar_rect(bar: &GanttBar) -> (f32, f32, f32, f32) {
-    let w = (bar.end - bar.start + 1).max(1) as f32 * DAY_W;
+pub(crate) fn bar_rect(bar: &GanttBar, day_w: f32) -> (f32, f32, f32, f32) {
+    let w = (bar.end - bar.start + 1).max(1) as f32 * day_w;
     match bar.kind {
-        BarKind::Summary => (bar.start as f32 * DAY_W, 9., w, 10.),
-        BarKind::Milestone => (bar.start as f32 * DAY_W + 4., 5., 14., 14.),
-        BarKind::Critical | BarKind::OnTrack => (bar.start as f32 * DAY_W, 5., w, 14.),
+        BarKind::Summary => (bar.start as f32 * day_w, 9., w, 10.),
+        BarKind::Milestone => (milestone_x(bar.start, day_w), 5., 14., 14.),
+        BarKind::Critical | BarKind::OnTrack => (bar.start as f32 * day_w, 5., w, 14.),
     }
 }
 
@@ -128,35 +135,28 @@ impl GanttBar {
 pub(crate) struct GanttScale {
     pub origin_day: i64,
     pub days: i64,
+    /// Pixels per day: [`DEFAULT_DAY_W`] until the view is zoomed.
+    pub day_w: f32,
 }
 
 impl GanttScale {
     pub fn width(self) -> f32 {
-        self.days as f32 * DAY_W
+        self.days as f32 * self.day_w
     }
 
     /// The chart offset at which day number `day` starts.
     pub fn x(self, day: i64) -> f32 {
-        (day - self.origin_day) as f32 * DAY_W
+        (day - self.origin_day) as f32 * self.day_w
     }
 
+    #[cfg(test)]
     fn date(self, day: i64) -> projcore::DateTime {
         projcore::DateTime::from_minutes((self.origin_day + day) * 1440)
     }
 
-    pub fn ticks(self, visible: std::ops::Range<i64>) -> Vec<(i64, String)> {
-        visible
-            .filter_map(|day| {
-                let date = self.date(day);
-                let p = date.parts();
-                (date.weekday() == 1).then(|| (day, format!("{}/{}", p.month, p.day)))
-            })
-            .collect()
-    }
-
-    fn visible(self, offset: f32, width: f32) -> std::ops::Range<i64> {
-        (offset / DAY_W).floor().max(0.) as i64
-            ..(((offset + width) / DAY_W).ceil() as i64).min(self.days)
+    pub(super) fn visible(self, offset: f32, width: f32) -> std::ops::Range<i64> {
+        (offset / self.day_w).floor().max(0.) as i64
+            ..(((offset + width) / self.day_w).ceil() as i64).min(self.days)
     }
 }
 
@@ -180,6 +180,7 @@ pub(crate) fn gantt_scale(ed: &ProjectEditor) -> GanttScale {
     GanttScale {
         origin_day: first,
         days: (last - first + 1 + 7).max(30),
+        day_w: DEFAULT_DAY_W,
     }
 }
 
@@ -323,11 +324,41 @@ pub(crate) fn shaded_days(
         .collect()
 }
 
+/// Below this many pixels per day the day lines are left out: they would
+/// be a wash of rules, and the header's tiers say where the days are.
+pub(crate) const MIN_LINE_DAY_W: f32 = 8.;
+/// Below this many pixels per day non-working days are not shaded one by one.
+pub(crate) const MIN_SHADE_DAY_W: f32 = 3.;
+
+/// The runs `(first, last)` of consecutive non-working days in view, one
+/// rectangle each; none when a day is too narrow to tell apart.
+pub(crate) fn shaded_runs(
+    scale: GanttScale,
+    cal: Option<&projcore::WorkCalendar>,
+    offset: f32,
+    width: f32,
+) -> Vec<(i64, i64)> {
+    if scale.day_w < MIN_SHADE_DAY_W {
+        return Vec::new();
+    }
+    let mut runs: Vec<(i64, i64)> = Vec::new();
+    for day in shaded_days(scale, cal, offset, width) {
+        match runs.last_mut() {
+            Some(run) if run.1 + 1 == day => run.1 = day,
+            _ => runs.push((day, day)),
+        }
+    }
+    runs
+}
+
 /// The left edge of each visible day, relative to the chart viewport.
 pub(crate) fn day_lines(scale: GanttScale, offset: f32, width: f32) -> Vec<f32> {
+    if scale.day_w < MIN_LINE_DAY_W {
+        return Vec::new();
+    }
     scale
         .visible(offset, width)
-        .map(|day| day as f32 * DAY_W - offset)
+        .map(|day| day as f32 * scale.day_w - offset)
         .filter(|x| (0. ..width).contains(x))
         .collect()
 }
@@ -363,11 +394,17 @@ fn backdrop(
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
-            for day in shaded_days(scale, cal.as_ref(), offset, width) {
+            for (first, last) in shaded_runs(scale, cal.as_ref(), offset, width) {
                 window.paint_quad(fill(
                     Bounds {
-                        origin: point(bounds.origin.x + px(day as f32 * DAY_W), bounds.origin.y),
-                        size: size(px(DAY_W), bounds.size.height),
+                        origin: point(
+                            bounds.origin.x + px(first as f32 * scale.day_w),
+                            bounds.origin.y,
+                        ),
+                        size: size(
+                            px((last - first + 1) as f32 * scale.day_w),
+                            bounds.size.height,
+                        ),
                     },
                     nonworking_fill(pal),
                 ));
@@ -447,14 +484,17 @@ pub(crate) fn body_grid(view: &ProjectView, pal: Pal) -> impl IntoElement {
             };
             let width = f32::from(chart.size.width);
             window.with_content_mask(Some(ContentMask { bounds: chart }), |window| {
-                for day in shaded_days(scale, cal.as_ref(), gantt_x, width) {
+                for (first, last) in shaded_runs(scale, cal.as_ref(), gantt_x, width) {
                     window.paint_quad(fill(
                         Bounds {
                             origin: point(
-                                chart.origin.x + px(day as f32 * DAY_W - gantt_x),
+                                chart.origin.x + px(first as f32 * scale.day_w - gantt_x),
                                 chart.origin.y,
                             ),
-                            size: size(px(DAY_W), chart.size.height),
+                            size: size(
+                                px((last - first + 1) as f32 * scale.day_w),
+                                chart.size.height,
+                            ),
                         },
                         nonworking_fill(pal),
                     ));
@@ -484,18 +524,38 @@ pub(crate) fn gantt_header(
         .w(px(scale.width()))
         .h(px(ROW_H))
         .child(backdrop(scale, cal, offset, width, pal))
-        .children(
-            scale
-                .ticks(scale.visible((offset - DAY_W * 2.).max(0.), width + DAY_W * 2.))
-                .into_iter()
-                .map(|(day, label)| {
-                    div()
-                        .absolute()
-                        .left(px(day as f32 * DAY_W))
-                        .top(px(5.))
-                        .child(label)
-                }),
-        )
+        .children(header_cells(scale, offset, width, pal))
+}
+
+/// The header's two tiers, 14 px each: the major unit over the minor, each
+/// cell ruled on its left and labelled when the label fits.
+fn header_cells(scale: GanttScale, offset: f32, width: f32, pal: Pal) -> Vec<Div> {
+    let level = &zoom::LEVELS[zoom::nearest(scale.day_w)];
+    let (major, minor) = zoom::tiers(scale, level, offset, width);
+    let half = ROW_H / 2.;
+    let rule = Hsla {
+        a: pal.border.a * 0.6,
+        ..pal.border
+    };
+    let cell = |c: zoom::Cell, top: f32, bold: bool| {
+        div()
+            .absolute()
+            .left(px(c.x))
+            .top(px(top))
+            .w(px(c.w))
+            .h(px(half))
+            .border_l_1()
+            .border_color(rule)
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_size(px(10.))
+            .line_height(px(half))
+            .when(bold, |d| d.font_weight(FontWeight::BOLD))
+            .child(div().absolute().left(px(c.at - c.x + 2.)).child(c.label))
+    };
+    let mut cells: Vec<Div> = major.into_iter().map(|c| cell(c, 0., true)).collect();
+    cells.extend(minor.into_iter().map(|c| cell(c, half, false).border_t_1()));
+    cells
 }
 
 /// One row's Gantt strip. `on_right` is the bar's own right-press (#1207):
@@ -522,12 +582,13 @@ pub(crate) fn gantt_strip(
         return strip;
     };
     let (color, shape) = bar_look(bar.kind, palette);
+    let dw = scale.day_w;
     let span = |s: i64, e: i64, y: f32, h: f32, color: Hsla, hollow: bool| {
         div()
             .absolute()
-            .left(px(s as f32 * DAY_W))
+            .left(px(s as f32 * dw))
             .top(px(y))
-            .w(px((e - s + 1).max(1) as f32 * DAY_W))
+            .w(px((e - s + 1).max(1) as f32 * dw))
             .h(px(h))
             .when(hollow, |d| d.border_1().border_color(color))
             .when(!hollow, |d| d.bg(color))
@@ -537,9 +598,9 @@ pub(crate) fn gantt_strip(
         strip = strip.child(
             div()
                 .absolute()
-                .left(px(s as f32 * DAY_W))
+                .left(px(s as f32 * dw))
                 .top(px(8.))
-                .w(px((e - s).max(0) as f32 * DAY_W))
+                .w(px((e - s).max(0) as f32 * dw))
                 .h(px(8.))
                 .bg(Hsla { a: 0.4, ..pal.dim }),
         );
@@ -558,7 +619,7 @@ pub(crate) fn gantt_strip(
         let outline = if shape == BarShape::Diamond {
             div()
                 .absolute()
-                .left(px(bar.start as f32 * DAY_W + 4.))
+                .left(px(milestone_x(bar.start, dw)))
                 .top(px(5.))
                 .size(px(14.))
                 .child(milestone_diamond(color, true))
@@ -602,9 +663,9 @@ pub(crate) fn gantt_strip(
         BarShape::Thin => span(bar.start, bar.end, 11., 6., hsla_u(color), false).child(marker),
         BarShape::Summary => div()
             .absolute()
-            .left(px(bar.start as f32 * DAY_W))
+            .left(px(bar.start as f32 * dw))
             .top(px(9.))
-            .w(px((bar.end - bar.start + 1).max(1) as f32 * DAY_W))
+            .w(px((bar.end - bar.start + 1).max(1) as f32 * dw))
             .h(px(10.))
             .child(
                 div()
@@ -633,7 +694,7 @@ pub(crate) fn gantt_strip(
             .child(marker),
         BarShape::Diamond => div()
             .absolute()
-            .left(px(bar.start as f32 * DAY_W + 4.))
+            .left(px(milestone_x(bar.start, dw)))
             .top(px(5.))
             .size(px(14.))
             .child(milestone_diamond(color, false))

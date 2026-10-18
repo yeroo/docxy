@@ -58,6 +58,8 @@ const TWELVE_COLUMNS: &[&str] = &[
     r#"call pointer-click {"dialog-control":"equal"}"#,
 ];
 const CHAPTER_ON: &[&str] = &[r#"call pointer-click {"dialog-control":"chapter"}"#];
+// The Zoom dialog opens on Days; Custom is three radios down.
+const PICK_ZOOM_CUSTOM: &[&str] = pick!("zoom", 3);
 const START_AT: &[&str] = pick!("numbering", 1);
 const SEPARATE_WITH_OTHER: &[&str] = pick!("sep", 2);
 const TWO_COLORS: &[&str] = pick!("colors", 1);
@@ -1632,14 +1634,18 @@ dialogs! {
         fixture: PROJECT_DOC,
         open: &["click C1", "key alt t c"],
         fields: &[
-            Field::text("name").on("General").applied(&["assert selected_name is Ab1"]).kept("Ab1"),
-            Field::duration("duration", "3d", "x").on("General").kept("3d"),
+            Field::text("name").applied(&["assert selected_name is Ab1"]).kept("Ab1"),
+            Field::duration("duration", "3d", "x").kept("3d"),
+            checkbox("estimated"),
+            radio("mode").on("General"),
+            checkbox("inactive").on("General"),
+            Field::date_combo("start", "2026-01-12", "x").on("General").kept("2026-01-12"),
+            Field::date_combo("finish", "2026-01-30", "x").on("General").kept("2026-01-30"),
             Field::number("percent", "40").on("General").kept("40"),
             Field::number("priority", "700").on("General").kept("700"),
-            Field::date("start", "2026-01-12", "x").on("General").kept("2026-01-12"),
-            Field::date("finish", "2026-01-30", "x").on("General").kept("2026-01-30"),
-            Field::text("predecessors").sample("2").on("Predecessors").kept("2"),
-            Field::text("resources").on("Resources").kept("Ab1"),
+            checkbox("ontimeline").on("General"),
+            checkbox("hidebar").on("General"),
+            checkbox("rollup").on("General"),
             dropdown("ctype").on("Advanced"),
             Field::date("cdate", "2026-02-02", "x").on("Advanced").prep(PICK_SNET).kept("2026-02-02"),
             Field::date("deadline", "2026-03-02", "x").on("Advanced").kept("2026-03-02"),
@@ -1647,6 +1653,37 @@ dialogs! {
             checkbox("effort").on("Advanced"),
             Field::text("notes").on("Notes").kept("Ab1"),
         ],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
+    ZOOM = "zoom" {
+        surface: Surface::Project,
+        file: "project",
+        fixture: PROJECT_DOC,
+        open: &[
+            "click C1",
+            r#"call menu-open {"target":"chart"}"#,
+            r#"call menu-click {"label":"Zoom..."}"#,
+        ],
+        fields: &[
+            radio("zoom"),
+            Field::number("custom", "30").prep(PICK_ZOOM_CUSTOM).kept("30"),
+        ],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
+    TIMESCALE = "timescale" {
+        surface: Surface::Project,
+        file: "project",
+        fixture: PROJECT_DOC,
+        open: &[
+            "click C1",
+            r#"call menu-open {"target":"chart"}"#,
+            r#"call menu-click {"label":"Timescale..."}"#,
+        ],
+        fields: &[dropdown("level")],
         reopen: &[],
         accept_closes: true,
         unreachable: None,

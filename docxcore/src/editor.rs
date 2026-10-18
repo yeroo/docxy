@@ -1489,8 +1489,9 @@ impl Editor {
         is_field
     }
 
-    /// Whether the selection is one equation while tracking: a `w:del`
-    /// cannot record it, so Backspace and Delete leave it selected (#1242).
+    /// Whether the selection is one equation, or one field a `w:del` cannot
+    /// hold, while tracking ([`kept_while_tracking`]): Backspace and Delete
+    /// leave it selected (#1242).
     fn selects_kept_equation(&self) -> bool {
         let Some((lo, hi)) = self.selection_range() else {
             return false;
@@ -1500,7 +1501,7 @@ impl Editor {
             && hi.offset == lo.offset + 1
             && resolve_para(&self.doc.body, &lo.path)
                 .and_then(|p| inline_covering(&p.content, lo.offset))
-                .is_some_and(|i| matches!(i, Inline::Equation { .. }))
+                .is_some_and(kept_while_tracking)
     }
 
     pub fn backspace(&mut self) {
@@ -2203,7 +2204,7 @@ impl Editor {
                 // A copy of a recorded insertion is plain text, not a second
                 // record of it.
                 for inline in &mut inlines {
-                    track::with_props(inline, track::clear_insert_record);
+                    track::with_props_deep(inline, &track::clear_insert_record);
                 }
                 paras.push(inlines);
             }
@@ -2223,12 +2224,13 @@ impl Editor {
     pub fn cut(&mut self) -> Option<Clip> {
         self.widen_selection_over_loose_fields();
         let mut clip = self.copy()?;
-        // A tracked delete keeps every equation (a cell range's aside), so
-        // the clip leaves them out: a paste must not add a second (#1242).
+        // A tracked delete keeps every equation and every field a `w:del`
+        // cannot hold ([`kept_while_tracking`]; a cell range's aside), so the
+        // clip leaves them out: a paste must not add a second (#1242).
         if self.delete_keeps_equations_in(&self.caret.path, false) {
-            clip = without_equations(&clip);
+            clip = without_kept(&clip);
         }
-        // Nothing left to cut (a lone equation while tracking, which
+        // Nothing left to cut (a lone equation or kept field while tracking, which
         // stays): no clip and no step, as `cut_text` refuses one.
         let empty =
             clip.paras.len() <= 1 && clip.paras.iter().flatten().all(|i| inline_len(i) == 0);
@@ -2247,7 +2249,9 @@ impl Editor {
     /// in the paragraphs where it starts and ends, every equation while
     /// tracking, none over a cell range (which clears the cells). It leaves
     /// out the text of the equations it keeps, so a paste does not bring
-    /// one back as text beside the one kept. A loose field the selection cuts is
+    /// one back as text beside the one kept; so does a field a tracked delete
+    /// keeps ([`kept_while_tracking`]), while untracked it is cut with its
+    /// text. A loose field the selection cuts is
     /// copied and deleted whole (#1240). `None`, and nothing done, when the
     /// selection holds no text (only kept objects, say).
     pub fn cut_text(&mut self) -> Option<String> {
@@ -2857,14 +2861,17 @@ impl Editor {
 
     /// [`Editor::selection_text`]; `for_plain_text_cut` leaves out the text
     /// of the equations a plain-text cut keeps in place ([`Editor::cut_text`],
-    /// see [`Editor::delete_keeps_equations_in`]). A copy leaves out none.
+    /// see [`Editor::delete_keeps_equations_in`]), and, while tracking, of the
+    /// fields a tracked delete keeps ([`kept_while_tracking`]; untracked, the
+    /// delete takes them, so their text is cut). A copy leaves out none.
     fn selection_text_with(&self, for_plain_text_cut: bool) -> String {
+        let fields_kept = for_plain_text_cut && self.track.is_some() && self.cell_range().is_none();
         self.selection_spans()
             .iter()
             .filter_map(|(path, s, e)| {
                 let equations = !(for_plain_text_cut && self.delete_keeps_equations_in(path, true));
                 resolve_para(&self.doc.body, path)
-                    .map(|p| display_text(&p.content, *s, *e, equations))
+                    .map(|p| display_text(&p.content, *s, *e, equations, fields_kept))
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -3834,9 +3841,23 @@ fn inline_covering(content: &[Inline], idx: usize) -> Option<&Inline> {
 /// editor text, with each field's result or equation's text in place of its
 /// [`FIELD_CHAR`]; an inline picture gives none. `equations` false leaves
 /// out the equations' text too.
-fn display_text(content: &[Inline], start: usize, end: usize, equations: bool) -> String {
+fn display_text(
+    content: &[Inline],
+    start: usize,
+    end: usize,
+    equations: bool,
+    fields_kept: bool,
+) -> String {
     let mut out = String::new();
-    push_display_text(content, start, end, equations, &mut 0, &mut out);
+    push_display_text(
+        content,
+        start,
+        end,
+        equations,
+        fields_kept,
+        &mut 0,
+        &mut out,
+    );
     out
 }
 
@@ -3845,6 +3866,7 @@ fn push_display_text(
     start: usize,
     end: usize,
     equations: bool,
+    fields_kept: bool,
     pos: &mut usize,
     out: &mut String,
 ) {
@@ -3860,10 +3882,12 @@ fn push_display_text(
                 );
                 out.extend(runs.chars().skip(s - a).take(e.saturating_sub(s)));
                 *pos = a + runs.chars().count();
-                push_display_text(&h.content, start, end, equations, pos, out);
+                push_display_text(&h.content, start, end, equations, fields_kept, pos, out);
             }
             Inline::Field { text, .. } | Inline::Equation { text, .. } if len == 1 => {
-                let shown = equations || matches!(inline, Inline::Field { .. });
+                let shown = equations
+                    || (matches!(inline, Inline::Field { .. })
+                        && !(fields_kept && kept_while_tracking(inline)));
                 if shown && start <= a && a < end {
                     out.push_str(text);
                 }
@@ -4116,6 +4140,21 @@ fn link_part(h: &Hyperlink, local: usize) -> LinkPart {
         LinkPart::Runs(local)
     } else {
         LinkPart::Content(local - runs_len)
+    }
+}
+
+/// A link with no editable text left goes, as in Word. Its bookmarks and
+/// proofing marks stay where it was; anything still showing inside it (a
+/// tracked change, an anchored drawing, an empty field) keeps the link,
+/// zero-width. A field with a result, an equation or an inline picture is one
+/// offset, so its link is not empty (#1242). `content[i]` is the link.
+pub(crate) fn drop_emptied_link(content: &mut Vec<Inline>, i: usize) {
+    let Some(Inline::Hyperlink(h)) = content.get_mut(i) else {
+        return;
+    };
+    if h.runs.is_empty() && h.content.iter().all(is_marker) {
+        let kept = std::mem::take(&mut h.content);
+        content.splice(i..=i, kept);
     }
 }
 
@@ -4473,24 +4512,43 @@ pub(crate) fn spanned_object_indices(
     found
 }
 
+/// An inline a tracked delete leaves in place (#1242, #1470): an equation, or
+/// a field whose result a `w:del` cannot hold (a link in it, say), which
+/// [`track`]'s `plan_delete` keeps.
+pub(crate) fn kept_while_tracking(inline: &Inline) -> bool {
+    match inline {
+        Inline::Equation { .. } => true,
+        Inline::Field { raw, .. } => {
+            !crate::compare::is_run_level(&crate::compare::run_level_field(raw))
+        }
+        _ => false,
+    }
+}
+
 /// `clip` without its equations, a hyperlink's included.
 fn without_equations(clip: &Clip) -> Clip {
-    fn strip(content: &mut Vec<Inline>) {
-        content.retain(|i| !matches!(i, Inline::Equation { .. }));
+    without(clip, |i| matches!(i, Inline::Equation { .. }))
+}
+
+/// `clip` without what a tracked delete keeps ([`kept_while_tracking`]).
+fn without_kept(clip: &Clip) -> Clip {
+    without(clip, kept_while_tracking)
+}
+
+fn without(clip: &Clip, drop: fn(&Inline) -> bool) -> Clip {
+    fn strip(content: &mut Vec<Inline>, drop: fn(&Inline) -> bool) {
+        content.retain(|i| !drop(i));
         for inline in content.iter_mut() {
             if let Inline::Hyperlink(h) = inline {
-                if h.content
-                    .iter()
-                    .any(|i| matches!(i, Inline::Equation { .. }))
-                {
+                if h.content.iter().any(drop) {
                     h.content_changed = true;
                 }
-                strip(&mut h.content);
+                strip(&mut h.content, drop);
             }
         }
     }
     let mut out = clip.clone();
-    out.paras.iter_mut().for_each(strip);
+    out.paras.iter_mut().for_each(|p| strip(p, drop));
     out
 }
 
@@ -4531,16 +4589,7 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
                         content_delete(&mut h.content, local - runs_len);
                         h.content_changed = true;
                     }
-                    // A link with no editable text left goes, as in Word. Its
-                    // bookmarks and proofing marks stay where it was; anything
-                    // still showing inside it (a tracked change, an anchored
-                    // drawing, an empty field) keeps the link, zero-width. A
-                    // field with a result, an equation or an inline picture is
-                    // one offset, so its link is not empty (#1242).
-                    if h.runs.is_empty() && h.content.iter().all(is_marker) {
-                        let kept = std::mem::take(&mut h.content);
-                        content.splice(i..=i, kept);
-                    }
+                    drop_emptied_link(content, i);
                 }
                 Inline::Tab(_)
                 | Inline::Break(..)

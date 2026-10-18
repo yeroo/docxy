@@ -21,14 +21,18 @@ pub(super) use task_info::*;
 mod clip;
 pub(super) use clip::*;
 mod timeline;
+mod zoom;
+mod zoom_dialogs;
 pub(super) use timeline::*;
+pub(super) use zoom::{WheelZoom, available as timescale_available};
+pub(super) use zoom_dialogs::{apply_timescale, apply_zoom};
 mod rows;
 pub(super) use rows::*;
 mod columns;
 mod selection;
 pub(super) use columns::{ARROW_W, EDGE_W, WidthDrag, committed_widths, project_width_release_all};
 mod autofilter;
-pub(super) use autofilter::{AUTO_FILTER_STATUS, autofilter_click};
+pub(super) use autofilter::{AUTO_FILTER_STATUS, MENU_ROW_H, autofilter_click, menu_json};
 
 /// Whole rows a PageUp/PageDown steps by: the rows that fit in the
 /// `project-body` probe, less one, so the cursor's landing row stays on
@@ -67,6 +71,19 @@ pub(super) struct ProjectView {
     /// pointer's x and the chart offset then. A drag of the box is measured
     /// from it; `None` when no press is held, and a drag without one does nothing.
     pub timeline_press: Option<(f32, f32)>,
+    /// The press on one of the view box's edges while its button is held;
+    /// see [`timeline::EdgePress`]. A drag of it sets the chart's zoom.
+    pub timeline_edge: Option<timeline::EdgePress>,
+    /// The Timeline's height the user dragged its grip to; `None` is
+    /// [`timeline::TIMELINE_H`]. Window view state, never saved (like `split`).
+    pub timeline_h: Option<f32>,
+    /// The press on the Timeline's grip while its button is held: the
+    /// pointer's y and the pane's height then.
+    pub grip_press: Option<(f32, f32)>,
+    /// Smooth Ctrl+wheel deltas not yet worth a zoom step (`wheel_zoom`).
+    pub wheel_acc: f32,
+    /// The window's height, which bounds the Timeline's (half of it at most).
+    pub height: f32,
     /// Gantt Chart Format › Bar Styles › Critical Tasks: critical bars drawn in
     /// the critical colour. Window view state, never saved.
     pub show_critical: bool,
@@ -76,6 +93,9 @@ pub(super) struct ProjectView {
     /// The table pane width the user dragged the split bar to; `None` is the
     /// default. Window view state, never saved.
     pub split: Option<f32>,
+    /// The Gantt's zoom in pixels per day; `None` is [`DEFAULT_DAY_W`] (the
+    /// Days level). Window view state, never saved or undone.
+    pub zoom_day_w: Option<f32>,
     /// A resource-levelling pass that has been asked for but not yet run:
     /// its token and the leveled state it sets. The status bar says `Busy`
     /// while it is here; see [`request_level_pass`].
@@ -140,9 +160,15 @@ impl ProjectView {
             width: 590. + SCROLLBAR_W,
             timeline: true,
             timeline_press: None,
+            timeline_edge: None,
+            timeline_h: None,
+            grip_press: None,
+            wheel_acc: 0.,
+            height: 700.,
             show_critical: true,
             show_baseline: true,
             split: None,
+            zoom_day_w: None,
             busy: None,
             scheduled: None,
             anchor: None,
@@ -198,7 +224,10 @@ impl ProjectView {
     }
 
     pub fn refresh_schedule_layout(&mut self) {
-        self.scale = gantt_scale(&self.ed);
+        self.scale = GanttScale {
+            day_w: self.zoom_day_w.unwrap_or(DEFAULT_DAY_W),
+            ..gantt_scale(&self.ed)
+        };
         self.clamp_offsets();
     }
 
@@ -206,7 +235,10 @@ impl ProjectView {
     /// days to its right edge. Scrolling clamps to the plan's own scale, not this one.
     pub fn chart_scale(&self) -> GanttScale {
         GanttScale {
-            days: self.scale.days.max((self.gantt_w / DAY_W).ceil() as i64),
+            days: self
+                .scale
+                .days
+                .max((self.gantt_w / self.scale.day_w).ceil() as i64),
             ..self.scale
         }
     }
@@ -384,8 +416,14 @@ impl ProjectView {
     }
 
     pub fn pan_gantt(&mut self, right: bool) {
-        self.gantt_x
-            .set(self.gantt_x.get() + if right { DAY_W } else { -DAY_W });
+        self.gantt_x.set(
+            self.gantt_x.get()
+                + if right {
+                    self.scale.day_w
+                } else {
+                    -self.scale.day_w
+                },
+        );
         self.clamp_offsets();
     }
 
@@ -399,7 +437,8 @@ impl ProjectView {
             .and_then(|uid| self.ed.project().task(uid))
             .and_then(|task| gantt_bar(&self.ed, task, self.scale));
         if let Some(bar) = bar {
-            self.gantt_x.set((bar.start - 1).max(0) as f32 * DAY_W);
+            self.gantt_x
+                .set((bar.start - 1).max(0) as f32 * self.scale.day_w);
             self.clamp_offsets();
         }
     }
@@ -540,7 +579,11 @@ fn project_region(
     lookup: fn(&Probes, &str) -> Option<Bounds<Pixels>>,
 ) -> Result<Bounds<Pixels>, String> {
     // The strips are probed under their region names; they need no Gantt viewport.
-    if let harness::Region::ProjectTimeline = region {
+    if let harness::Region::ProjectTimeline
+    | harness::Region::ProjectTimelineBoxLeft
+    | harness::Region::ProjectTimelineBoxRight
+    | harness::Region::ProjectTimelineGrip = region
+    {
         if !v.timeline {
             return Err("the Timeline is hidden (View > Split View > Timeline)".into());
         }
@@ -636,7 +679,10 @@ pub(super) fn project_state(
     body_h: Option<f32>,
 ) -> Vec<(String, ctlcore::json::Json)> {
     use ctlcore::json::Json;
-    let scale = gantt_scale(&v.ed);
+    let scale = GanttScale {
+        day_w: v.scale.day_w,
+        ..gantt_scale(&v.ed)
+    };
     let count = v.ed.project().tasks.len();
     let shown = v.ed.display_rows().len();
     let scroll_y = -f32::from(v.scroll.0.borrow().base_handle.offset().y);
@@ -648,6 +694,8 @@ pub(super) fn project_state(
         ),
         ("tasks".into(), Json::Num(count as f64)),
         ("widths".into(), widths_json(&v.widths())),
+        ("gantt_day_w".into(), Json::Num(f64::from(v.day_w()))),
+        ("gantt_zoom".into(), Json::Str(zoom::label(v.day_w()))),
         ("filtered".into(), Json::Bool(v.ed.is_filtered())),
         (
             "filler_rows".into(),
@@ -1443,6 +1491,8 @@ pub(super) fn project_el(
         view.chart_scale(),
     );
     let (table_bar, chart_bar) = view.pane_scrolls();
+    // The rows' scroll as drawn, which a Ctrl+wheel zoom puts back.
+    let held_scroll = view.scroll.0.borrow().base_handle.offset();
     let vbar = harness::region_name(harness::Region::ProjectVbar);
     let row_probes = probes.clone();
     // The bar palette the plan's formatting names (#1532), once per render.
@@ -1483,6 +1533,38 @@ pub(super) fn project_el(
                 // scrolls the pane under the pointer; the rows keep the vertical wheel.
                 .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, window, cx| {
                     let delta = ev.delta.pixel_delta(window.line_height());
+                    // Ctrl+wheel over the chart zooms the timescale around the
+                    // pointer (#1535). The rows' own handler has already moved
+                    // them by the same wheel turn; put them back.
+                    // Only a whole line is a notch; fractional lines (hi-res
+                    // wheels, touchpads) are summed like pixels.
+                    let notch = zoom::is_notch(&ev.delta);
+                    if ev.modifiers.control
+                        && (!delta.y.is_zero() || ev.touch_phase != TouchPhase::Moved)
+                    {
+                        let Some(body) = this.probes.borrow().current("project-body") else {
+                            return;
+                        };
+                        cx.stop_propagation();
+                        if let Some(tab) = this.tabs.get_mut(index)
+                            && let Surface::Project(v) = &mut tab.surface
+                        {
+                            let zoom = v.wheel_zoom(
+                                f32::from(ev.position.x - body.left()),
+                                f32::from(delta.y),
+                                notch,
+                                ev.touch_phase,
+                            );
+                            if zoom != WheelZoom::NotChart {
+                                v.scroll.0.borrow().base_handle.set_offset(held_scroll);
+                                if let WheelZoom::Stepped(status) = zoom {
+                                    tab.status = status.into();
+                                }
+                                cx.notify();
+                            }
+                        }
+                        return;
+                    }
                     if delta.x.is_zero() {
                         return;
                     }

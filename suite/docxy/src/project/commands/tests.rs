@@ -503,6 +503,40 @@ fn project_instruction_paths_exist() {
             "Hide Subtasks",
             HideSubtasks,
         ),
+        ("View", "Zoom", "Timescale", "Timescale", TimescaleDialog),
+        ("View", "Zoom", "Years", "Years", Timescale(0)),
+        ("View", "Zoom", "Half Years", "Half Years", Timescale(1)),
+        ("View", "Zoom", "Quarters", "Quarters", Timescale(2)),
+        ("View", "Zoom", "Months", "Months", Timescale(3)),
+        (
+            "View",
+            "Zoom",
+            "Thirds of Months",
+            "Thirds of Months",
+            Timescale(4),
+        ),
+        ("View", "Zoom", "Weeks", "Weeks", Timescale(5)),
+        ("View", "Zoom", "Days", "Days", Timescale(6)),
+        ("View", "Zoom", "Hours", "Hours", Timescale(7)),
+        ("View", "Zoom", "Minutes", "Minutes", Timescale(8)),
+        ("View", "Zoom", "Zoom", "Zoom", ZoomDialog),
+        ("View", "Zoom", "Zoom...", "Zoom...", ZoomDialog),
+        ("View", "Zoom", "Zoom In", "Zoom In", ZoomIn),
+        ("View", "Zoom", "Zoom Out", "Zoom Out", ZoomOut),
+        (
+            "View",
+            "Zoom",
+            "Entire Project",
+            "Entire Project",
+            ZoomEntire,
+        ),
+        (
+            "View",
+            "Zoom",
+            "Selected Tasks",
+            "Selected Tasks",
+            ZoomSelected,
+        ),
         ("View", "Split View", "Timeline", "Timeline View", Timeline),
         ("View", "Appearance", "Theme", "Theme", Theme),
         ("View", "Window", "New Window", "New Window", NewWindow),
@@ -875,7 +909,7 @@ fn project_act_active_checks_level_all_timeline_bar_styles_and_the_task_mode_onl
     for act in ProjectAct::RIBBON.iter().copied().filter(|a| {
         !matches!(
             a,
-            LevelAll | Timeline | AutoSchedule | CriticalTasks | BaselineBars
+            LevelAll | Timeline | AutoSchedule | CriticalTasks | BaselineBars | Timescale(6)
         )
     }) {
         assert!(!project_act_active(v(&t), act), "{act:?}");
@@ -1258,7 +1292,7 @@ fn assignment_find_leveling_recalc_and_navigation_statuses() {
     apply_project_act(&mut t, ProjectAct::Recalc);
     assert_eq!(t.status.as_ref(), "Rescheduled (automatic on every edit)");
     apply_project_act(&mut t, ProjectAct::ScrollRight);
-    assert_eq!(v(&t).gantt_x.get(), DAY_W);
+    assert_eq!(v(&t).gantt_x.get(), DEFAULT_DAY_W);
     apply_project_act(&mut t, ProjectAct::ScrollLeft);
     assert_eq!(v(&t).gantt_x.get(), 0.);
     apply_project_act(&mut t, ProjectAct::ScrollRight);
@@ -2076,7 +2110,7 @@ fn scroll_to_task_puts_the_bar_a_day_in_from_the_left_edge() {
     let status = t.status.clone();
     apply_project_act(&mut t, ProjectAct::ScrollToTask);
     // Monday 2026-01-05 + 56 days, less the one-day margin.
-    assert_eq!(v(&t).gantt_x.get(), 55. * DAY_W);
+    assert_eq!(v(&t).gantt_x.get(), 55. * DEFAULT_DAY_W);
     assert_eq!(v(&t).ed.project(), &before);
     assert_eq!(v(&t).ed.undo_depth(), 1);
     assert_eq!(t.status, status);
@@ -3686,16 +3720,12 @@ fn the_row_menu_lists_projects_items_in_order() {
             "Assign Resources...",
             "-",
             "Text Styles...",
-            "Font...",
-            "-",
-            "Fill Down",
-            "Clear Contents",
             "-",
             "Information...",
             "Notes...",
             "Add to Timeline",
             "-",
-            "Hyperlink...",
+            "Link",
         ]
     );
     // Every drawn icon is one the window can load.
@@ -3731,27 +3761,19 @@ fn the_row_menu_enables_by_the_row_under_the_cursor() {
         "Manually Schedule",
         "Auto Schedule",
         "Assign Resources...",
-        "Clear Contents",
         "Information...",
         "Notes...",
-        "Hyperlink...",
+        "Link",
     ];
     assert_eq!(enabled_items(&t), all_task);
-    // A blank row can be inserted above, deleted and cleared, not scheduled.
+    // A blank row can be inserted above and deleted, not scheduled.
     let blank = v(&t).ed.project().tasks.len();
     vm(&mut t).ed.insert_blank_row(None).unwrap();
     vm(&mut t).ed.select(blank);
     assert!(v(&t).selected_uid().is_some());
     assert_eq!(
         enabled_items(&t),
-        [
-            "Cut",
-            "Copy",
-            "Paste",
-            "Insert Task",
-            "Delete Task",
-            "Clear Contents"
-        ]
+        ["Cut", "Copy", "Paste", "Insert Task", "Delete Task"]
     );
     // The entry row has no task to delete.
     vm(&mut t).enter_entry_row();
@@ -3814,7 +3836,7 @@ fn the_bar_menu_lists_projects_items_in_order() {
             ),
         ]
     );
-    for label in ["Information...", "Notes...", "Hyperlink..."] {
+    for label in ["Information...", "Notes...", "Link"] {
         assert!(
             enabled_items(&t).contains(&label.to_string()),
             "the row menu runs {label} too"
@@ -3914,12 +3936,12 @@ fn the_column_menu_lists_projects_items_in_order() {
     }
 }
 
-/// #418: the row menu's Hyperlink... opens the prompt on a task row only,
+/// #418: the row menu's Link opens the prompt on a task row only,
 /// like Information....
 #[test]
 fn row_menu_hyperlink_is_enabled_on_a_task_row() {
     let mut t = tab();
-    let enabled = |t: &DocTab| enabled_items(t).contains(&"Hyperlink...".to_string());
+    let enabled = |t: &DocTab| enabled_items(t).contains(&"Link".to_string());
     assert!(enabled(&t), "a task row links");
     // A blank row in the middle of the plan has no task to link.
     let i = vm(&mut t).ed.insert_blank_row(Some(2)).unwrap();
@@ -4443,33 +4465,17 @@ fn durations(t: &DocTab) -> Vec<i64> {
         .collect()
 }
 
-/// #1213: Fill Down needs a range of two shown rows over a column other than
-/// ID; Clear Contents follows the row, as Delete Task does.
+/// #1537: Fill Down, Clear Contents and Font... are not Project's row items
+/// (Ctrl+D stays); the items with no command yet stay drawn disabled.
 #[test]
-fn row_menu_fill_down_needs_a_range() {
+fn row_menu_has_no_fill_clear_or_font_and_keeps_its_placeholders_disabled() {
     let mut t = fill_tab();
-    let enabled = |t: &DocTab, label: &str| enabled_items(t).contains(&label.to_string());
-    assert!(!enabled(&t, "Fill Down"), "no range");
-    range(&mut t, 0, COL_NAME, 0, COL_DURATION);
-    assert!(!enabled(&t, "Fill Down"), "one row");
     range(&mut t, 0, COL_NAME, 1, COL_NAME);
-    assert!(enabled(&t, "Fill Down"), "two rows");
-    range(&mut t, 0, COL_ID, 2, COL_ID);
-    assert!(!enabled(&t, "Fill Down"), "the ID column alone");
-    assert!(enabled(&t, "Clear Contents"), "a task row");
-    vm(&mut t).anchor = None;
-    let blank = vm(&mut t).ed.insert_blank_row(None).unwrap();
-    vm(&mut t).ed.select(blank);
-    assert!(enabled(&t, "Clear Contents"), "a blank row");
-    vm(&mut t).enter_entry_row();
-    assert!(!enabled(&t, "Clear Contents"), "the entry row");
-    // The items with no command yet stay drawn disabled.
-    for label in [
-        "Paste Special...",
-        "Text Styles...",
-        "Font...",
-        "Add to Timeline",
-    ] {
+    let labels: Vec<_> = row_menu(&t).into_iter().map(|(l, ..)| l).collect();
+    for gone in ["Fill Down", "Clear Contents", "Font...", "Hyperlink..."] {
+        assert!(!labels.contains(&gone.to_string()), "{gone}");
+    }
+    for label in ["Paste Special...", "Text Styles...", "Add to Timeline"] {
         let (_, on, _) = row_menu(&t).into_iter().find(|(l, ..)| l == label).unwrap();
         assert!(!on, "{label}");
     }
@@ -4601,66 +4607,13 @@ fn fill_down_without_a_range_says_so() {
     assert_eq!(names(&t), ["First", "Second", "Third"]);
 }
 
-/// #1213: Clear Contents is Delete's clear without its deletion.
-#[test]
-fn clear_contents_never_deletes() {
-    let mut t = fill_tab();
-    let uids: Vec<i32> = v(&t).ed.project().tasks.iter().map(|t| t.uid).collect();
-    for &uid in &uids[1..] {
-        apply_cell(&mut vm(&mut t).ed, uid, COL_PREDECESSORS, "1").unwrap();
-        apply_cell(&mut vm(&mut t).ed, uid, COL_RESOURCES, "Ann").unwrap();
-    }
-    let fields = |t: &DocTab, row: usize| {
-        let task = &v(t).ed.project().tasks[row];
-        [COL_NAME, COL_PREDECESSORS, COL_RESOURCES].map(|c| cell_edit_text(&v(t).ed, task, c))
-    };
-    assert_eq!(fields(&t, 1), ["Second", "1", "Ann"]);
-    // On the ID column, without a range: the row's three fields.
-    vm(&mut t).ed.select(1);
-    vm(&mut t).col = COL_ID;
-    apply_project_act(&mut t, ProjectAct::ClearContents);
-    assert_eq!(v(&t).ed.project().tasks.len(), 3, "{}", t.status);
-    assert!(t.dialogs.top().is_none(), "no delete question");
-    assert_eq!(fields(&t, 1), ["", "", ""]);
-    assert_eq!(fields(&t, 2), ["Third", "1", "Ann"]);
-    // A row-header range: every row's three fields, as one undo step, and
-    // the range is consumed.
-    {
-        let v = vm(&mut t);
-        v.anchor = Some((uids[0], COLUMN_COUNT - 1));
-        v.row_header = true;
-        v.ed.select(2);
-        v.col = COL_ID;
-    }
-    let depth = v(&t).ed.undo_depth();
-    apply_project_act(&mut t, ProjectAct::ClearContents);
-    assert_eq!(v(&t).ed.project().tasks.len(), 3);
-    for row in 0..3 {
-        assert_eq!(fields(&t, row), ["", "", ""], "row {row}");
-    }
-    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
-    assert!(v(&t).selection().is_none(), "the range is consumed");
-    // A column that cannot clear says so.
-    vm(&mut t).col = COL_DURATION;
-    apply_project_act(&mut t, ProjectAct::ClearContents);
-    assert_eq!(t.status.as_ref(), "Duration can't be cleared");
-    // A blank row: nothing to clear.
-    let blank = vm(&mut t).ed.insert_blank_row(None).unwrap();
-    vm(&mut t).ed.select(blank);
-    vm(&mut t).col = COL_NAME;
-    t.status = "x".into();
-    apply_project_act(&mut t, ProjectAct::ClearContents);
-    assert_eq!(t.status.as_ref(), "Ready");
-    assert!(v(&t).ed.project().tasks[blank].is_null);
-}
-
 /// The range as (uids, cols), comparable.
 fn sel_of(t: &DocTab) -> Option<(Vec<i32>, std::ops::RangeInclusive<usize>)> {
     v(t).selection().map(|s| (s.uids, s.cols))
 }
 
 /// #1213: a right-click inside the range keeps it and the cursor, so the
-/// row menu's Fill Down and Clear Contents act on it.
+/// row menu's Cut, Copy and Paste act on it.
 #[test]
 fn row_menu_press_inside_keeps_the_range() {
     let mut t = fill_tab();
@@ -4885,4 +4838,222 @@ fn hyperlink_prompt_opens_with_the_caret_at_the_end() {
     assert!(!p.buf.is_empty());
     assert_eq!(p.caret, p.buf.len());
     assert!(p.selection().is_none());
+}
+
+/// The toolbar's items as (label, kind, enabled, act).
+fn toolbar_of(t: &DocTab) -> Vec<(String, &'static str, bool, Option<Act>)> {
+    project_toolbar(v(t), v(t).selected_uid())
+        .into_iter()
+        .map(|i| (i.entry.label, i.kind.name(), i.entry.enabled, i.entry.act))
+        .collect()
+}
+
+/// #1537: the mini toolbar lists Project's controls in order, the task
+/// buttons run the existing acts, and the formatting ones open choices.
+#[test]
+fn the_toolbar_lists_projects_controls_in_order() {
+    let t = fill_tab();
+    let bar = toolbar_of(&t);
+    let labels: Vec<_> = bar.iter().map(|(l, ..)| l.as_str()).collect();
+    assert_eq!(
+        labels,
+        [
+            "Font",
+            "Size",
+            "Bold",
+            "Italic",
+            "Fill Color",
+            "Font Color",
+            "Link Tasks",
+            "Unlink Tasks",
+            "Outdent",
+            "Indent",
+            "Task Details"
+        ]
+    );
+    let kinds: Vec<_> = bar.iter().map(|(_, k, ..)| *k).collect();
+    assert_eq!(kinds[..2], ["combo", "combo"]);
+    assert_eq!(kinds[10], "arrow");
+    let act = |label: &str| bar.iter().find(|(l, ..)| l == label).and_then(|(.., a)| *a);
+    assert_eq!(act("Link Tasks"), Some(Act::Project(ProjectAct::AddLink)));
+    assert_eq!(
+        act("Unlink Tasks"),
+        Some(Act::Project(ProjectAct::UnlinkTasks))
+    );
+    assert_eq!(act("Outdent"), Some(Act::Project(ProjectAct::Outdent)));
+    assert_eq!(act("Indent"), Some(Act::Project(ProjectAct::Indent)));
+    assert_eq!(
+        act("Task Details"),
+        Some(Act::Project(ProjectAct::Constraint))
+    );
+    assert_eq!(
+        act("Bold"),
+        Some(Act::Project(ProjectAct::CellStyle(StyleEdit::Bold)))
+    );
+    // The combos show Project's defaults on a cell with no direct style.
+    let items = project_toolbar(v(&t), v(&t).selected_uid());
+    assert_eq!(items[0].value.as_deref(), Some("Calibri"));
+    assert_eq!(items[1].value.as_deref(), Some("11"));
+    assert!(bar.iter().all(|(.., on, _)| *on), "a task row enables all");
+}
+
+/// #1537: the toolbar is disabled on the entry row and a blank row, as the
+/// matching row items are.
+#[test]
+fn the_toolbar_is_disabled_without_a_task() {
+    let mut t = fill_tab();
+    let blank = vm(&mut t).ed.insert_blank_row(None).unwrap();
+    vm(&mut t).ed.select(blank);
+    assert!(toolbar_of(&t).iter().all(|(.., on, _)| !on), "blank row");
+    vm(&mut t).enter_entry_row();
+    assert!(toolbar_of(&t).iter().all(|(.., on, _)| !on), "entry row");
+}
+
+/// #1537: Bold over a range styles every cell in it, as one undo step, and
+/// a second Bold (the cursor cell is bold now) turns them all off.
+#[test]
+fn toolbar_bold_styles_the_whole_range_in_one_undo_step() {
+    let mut t = fill_tab();
+    range(&mut t, 0, COL_NAME, 1, COL_NAME);
+    let (a, b) = (
+        v(&t).ed.project().tasks[0].uid,
+        v(&t).ed.project().tasks[1].uid,
+    );
+    let depth = v(&t).ed.undo_depth();
+    apply_project_act(&mut t, ProjectAct::CellStyle(StyleEdit::Bold));
+    let bold = |t: &DocTab, uid| {
+        v(t).ed
+            .project()
+            .formatting
+            .cell(uid, "Name")
+            .and_then(|s| s.bold)
+    };
+    assert_eq!((bold(&t, a), bold(&t, b)), (Some(true), Some(true)));
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1, "one step");
+    assert!(v(&t).selection().is_some(), "the range stays");
+    let ticked = project_toolbar(v(&t), v(&t).selected_uid());
+    assert!(ticked[2].entry.checked, "Bold shows on");
+    apply_project_act(&mut t, ProjectAct::CellStyle(StyleEdit::Bold));
+    assert_eq!((bold(&t, a), bold(&t, b)), (Some(false), Some(false)));
+    vm(&mut t).ed.undo();
+    vm(&mut t).ed.undo();
+    assert_eq!((bold(&t, a), bold(&t, b)), (None, None));
+}
+
+/// #1537: Font, Size and the colours merge into the cell's own style, a
+/// cleared colour leaves the rest, and a blank row refuses.
+#[test]
+fn toolbar_choices_merge_into_the_cells_direct_style() {
+    let mut t = fill_tab();
+    let a = v(&t).ed.project().tasks[0].uid;
+    vm(&mut t).ed.select(0);
+    for edit in [
+        StyleEdit::Font("Arial"),
+        StyleEdit::Size(14),
+        StyleEdit::Color(Some(0xFF0000)),
+        StyleEdit::Fill(Some(0xFFFF00)),
+        StyleEdit::Italic,
+    ] {
+        apply_project_act(&mut t, ProjectAct::CellStyle(edit));
+    }
+    let style = |t: &DocTab| {
+        v(t).ed
+            .project()
+            .formatting
+            .cell(a, crate::COLUMNS[v(t).col])
+            .cloned()
+            .unwrap()
+    };
+    let s = style(&t);
+    assert_eq!(s.font.as_deref(), Some("Arial"));
+    assert_eq!(s.size, Some(14.0));
+    assert_eq!((s.color, s.background), (Some(0xFF0000), Some(0xFFFF00)));
+    assert_eq!(s.italic, Some(true));
+    let items = project_toolbar(v(&t), Some(a));
+    assert_eq!(items[0].value.as_deref(), Some("Arial"));
+    assert_eq!(items[1].value.as_deref(), Some("14"));
+    apply_project_act(&mut t, ProjectAct::CellStyle(StyleEdit::Color(None)));
+    let s = style(&t);
+    assert_eq!((s.color, s.font.as_deref()), (None, Some("Arial")));
+    // A blank row has no cell to style.
+    let blank = vm(&mut t).ed.insert_blank_row(None).unwrap();
+    vm(&mut t).ed.select(blank);
+    apply_project_act(&mut t, ProjectAct::CellStyle(StyleEdit::Bold));
+    assert_eq!(t.status.as_ref(), "Select task cells to format");
+}
+
+/// #1537: the drop-downs' choices are menu items that run the style act, and
+/// the current value is ticked.
+#[test]
+fn toolbar_drop_downs_list_choices_with_the_current_ticked() {
+    use crate::menu::MenuItem;
+    let t = fill_tab();
+    let items = project_toolbar(v(&t), v(&t).selected_uid());
+    let choices = |i: usize| -> Vec<(String, bool, Option<Act>)> {
+        items[i]
+            .entry
+            .submenu
+            .iter()
+            .map(|m| match m {
+                MenuItem::Item(e) => (e.label.clone(), e.checked, e.act),
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    };
+    let fonts = choices(0);
+    assert!(fonts.iter().any(|(l, on, _)| l == "Calibri" && *on));
+    assert!(fonts.iter().filter(|(_, on, _)| *on).count() == 1);
+    let sizes = choices(1);
+    assert!(sizes.iter().any(|(l, on, _)| l == "11" && *on));
+    assert_eq!(
+        sizes.last().unwrap().2,
+        Some(Act::Project(ProjectAct::CellStyle(StyleEdit::Size(72))))
+    );
+    assert_eq!(choices(4)[0].0, "No Fill");
+    assert_eq!(choices(5)[0].0, "Automatic");
+    assert!(choices(5)[0].1, "no colour set ticks Automatic");
+}
+
+/// #1537: a toolbar choice that changes no cell records no undo step.
+#[test]
+fn a_toolbar_choice_that_changes_nothing_is_no_undo_step() {
+    let mut t = fill_tab();
+    apply_project_act(&mut t, ProjectAct::CellStyle(StyleEdit::Size(14)));
+    let depth = v(&t).ed.undo_depth();
+    apply_project_act(&mut t, ProjectAct::CellStyle(StyleEdit::Size(14)));
+    assert_eq!(v(&t).ed.undo_depth(), depth, "same size again");
+    apply_project_act(&mut t, ProjectAct::CellStyle(StyleEdit::Fill(None)));
+    assert_eq!(v(&t).ed.undo_depth(), depth, "clearing what is not set");
+}
+
+/// #1537: Bold and the toolbar's values follow the style the grid draws: a
+/// summary row is bold, a plan category style sits under the cell's own.
+#[test]
+fn the_toolbar_reads_the_effective_style() {
+    let mut t = fill_tab();
+    let uid = v(&t).ed.project().tasks[0].uid;
+    vm(&mut t).ed.edit_formatting(|f| {
+        f.set_category(
+            "All",
+            projcore::formatting::TextStyle {
+                font: Some("Verdana".into()),
+                bold: Some(true),
+                ..Default::default()
+            },
+        )
+    });
+    let items = project_toolbar(v(&t), Some(uid));
+    assert_eq!(items[0].value.as_deref(), Some("Verdana"));
+    assert!(items[2].entry.checked, "bold from the category shows");
+    // Bold flips the effective value: the cell becomes not bold.
+    apply_project_act(&mut t, ProjectAct::CellStyle(StyleEdit::Bold));
+    let own = v(&t)
+        .ed
+        .project()
+        .formatting
+        .cell(uid, "Name")
+        .cloned()
+        .unwrap();
+    assert_eq!(own.bold, Some(false));
+    assert!(!project_toolbar(v(&t), Some(uid))[2].entry.checked);
 }

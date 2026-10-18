@@ -1,9 +1,10 @@
 # #1533: every Project entry-table heading has an AutoFilter arrow
 # (`project-heading-arrow:<Name>`, or `menu-open {"target":{"filter":<Name>}}`).
-# Like the sheet's filter button it opens a dialog (`project-filter-menu`):
-# Sort items, a disabled Group by and Filters, `Clear Filter from <Field>`
-# (enabled only while that column is filtered), and the value checklist, a
-# Year > Month > Day tree on a date column. A filtered heading draws a funnel,
+# It opens Project's popup under the arrow (#1607; a `project-filter-menu`
+# dialog drawn as a popup, no title): Sort items, a disabled Group by, No Group
+# and Filters, `Clear Filter from <Field>` (enabled only while that column is
+# filtered), the value checklist (a Year > Month > Day tree on a date column),
+# then OK / Cancel; `menu-read` reports the rows as `items` in that order. A filtered heading draws a funnel,
 # the status bar says `AutoFilter Applied`, and `rows` reports the live
 # filter and sort. project-filter.xml finishes Plan on 1/12, Build on 3/2,
 # Test on 3/17 and Ship on 4/6.
@@ -14,8 +15,9 @@ test project the arrow opens the menu and Finish sorts latest first
   shot window
   call pointer-click {"region":"project-heading-arrow:Name"}
   assert dialog is project-filter-menu
+  shot window
   call dialog-read {}
-  assert reply.title is Filter: Name
+  assert reply.popup is true
   assert reply.buttons.0.label is Sort A to Z
   assert reply.buttons.1.label is Sort Z to A
   assert reply.buttons.4.label is Clear Filter from Name
@@ -24,18 +26,30 @@ test project the arrow opens the menu and Finish sorts latest first
   assert dialog is none
   # Finish is opened as its arrow would open it (menu-open works scrolled out).
   call menu-open {"target":{"filter":"Finish"}}
-  assert reply.title is Filter: Finish
-  assert reply.buttons.0.label is Sort Earliest to Latest
-  assert reply.buttons.1.label is Sort Latest to Earliest
-  assert reply.buttons.2.label is Group by
-  assert reply.buttons.2.enabled is false
-  assert reply.buttons.3.label is Filters
-  assert reply.buttons.3.enabled is false
-  assert reply.buttons.4.label is Clear Filter from Finish
-  assert reply.buttons.4.enabled is false
+  shot window
+  assert reply.open is true
+  assert reply.items.0.label is Sort Earliest to Latest
+  call menu-read {}
+  assert reply.open is true
+  assert reply.target.filter is Finish
+  assert reply.items.0.label is Sort Earliest to Latest
+  assert reply.items.0.icon is sort-az
+  assert reply.items.1.label is Sort Latest to Earliest
+  assert reply.items.2.separator is true
+  assert reply.items.3.label is Group by
+  assert reply.items.3.enabled is false
+  assert reply.items.4.label is No Group
+  assert reply.items.4.enabled is false
+  assert reply.items.5.separator is true
+  assert reply.items.6.label is Clear Filter from Finish
+  assert reply.items.6.enabled is false
+  assert reply.items.7.label is Filters
+  assert reply.items.7.enabled is false
   assert reply.controls.0.items.0 is (Select All)
   assert reply.controls.0.items.1 is 2026
   assert reply.controls.0.items.2 is January
+  assert reply.buttons.0.label is OK
+  assert reply.buttons.1.label is Cancel
   call dialog-click {"button":"Sort Latest to Earliest"}
   assert dialog is none
   call rows {}
@@ -43,6 +57,17 @@ test project the arrow opens the menu and Finish sorts latest first
   assert reply.sort_descending is true
   assert reply.rows.0.cells.2 is Ship
   assert reply.rows.3.cells.2 is Plan
+
+test project Escape closes the popup and changes nothing
+  open copy:../fixtures/project-filter.xml
+  call menu-open {"target":{"filter":"Finish"}}
+  shot window
+  assert dialog is project-filter-menu
+  call real-key {"key":"escape"}
+  assert dialog is none
+  call rows {}
+  assert reply.filter is All Tasks
+  assert reply.count is 4
 
 test project filtering Finish to one month leaves its rows and Clear Filter restores them
   open copy:../fixtures/project-filter.xml
@@ -62,7 +87,7 @@ test project filtering Finish to one month leaves its rows and Clear Filter rest
   assert reply.filters.0.column is Finish
   # Clear Filter is enabled on the filtered column only.
   call menu-open {"target":{"filter":"Finish"}}
-  assert reply.buttons.4.enabled is true
+  assert reply.items.6.enabled is true
   call dialog-click {"button":"Clear Filter from Finish"}
   assert dialog is none
   call rows {}

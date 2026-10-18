@@ -258,11 +258,11 @@ test the row menu's item comes after Notes..., needs a task and renames it as on
   call menu-open {"target":{"row":2}}
   call menu-read {}
   # After Notes..., before Add to Timeline, as the manifest's `after` says.
-  assert reply.items.23.label is Notes...
-  assert reply.items.24.label is Rename (fixture)
-  assert reply.items.24.plugin is true
-  assert reply.items.24.enabled is true
-  assert reply.items.25.label is Add to Timeline
+  assert reply.items.19.label is Notes...
+  assert reply.items.20.label is Rename (fixture)
+  assert reply.items.20.plugin is true
+  assert reply.items.20.enabled is true
+  assert reply.items.21.label is Add to Timeline
   call menu-click {"label":"Rename (fixture)"}
   assert selected_name is Renamed by fixture
   assert status is Fixture: renamed task 2
@@ -283,17 +283,22 @@ test the row menu's item comes after Notes..., needs a task and renames it as on
   click C3
   call menu-open {"target":{"row":null}}
   call menu-read {}
-  assert reply.items.24.label is Rename (fixture)
-  assert reply.items.24.enabled is false
+  assert reply.items.20.label is Rename (fixture)
+  assert reply.items.20.enabled is false
   key escape
 
-test the chart menu opens beside the bars with Project's items greyed
+test the chart menu opens beside the bars with Project's unbuilt items greyed
   open copy:../fixtures/project-clipboard.xml
   call menu-open {"target":"chart"}
   call menu-read {}
   assert reply.target is chart
-  assert reply.items.0.label is Gridlines...
-  assert reply.items.0.enabled is false
+  # #1535: the timescale and zoom dialogs lead the menu and are live.
+  assert reply.items.0.label is Timescale...
+  assert reply.items.0.enabled is true
+  assert reply.items.1.label is Zoom...
+  assert reply.items.1.enabled is true
+  assert reply.items.5.label is Gridlines...
+  assert reply.items.5.enabled is false
   key escape
 
 test Task Information gains the plugin's page, prefilled, with a multiline and a grid
@@ -316,34 +321,38 @@ test Task Information gains the plugin's page, prefilled, with a multiline and a
   assert reply.columns is 2
   assert reply.controls.-1.header is true
   shot window
-  call dialog-read {}
-  assert reply.controls.0.name is fixture.note
-  assert reply.controls.0.kind is multiline
-  assert reply.controls.0.value is note for task 2
-  assert reply.controls.0.plugin is true
-  assert reply.controls.1.name is fixture.grid
-  assert reply.controls.1.kind is grid
-  assert reply.controls.1.columns.1 is Done
-  assert reply.controls.1.column_kinds.1 is checkbox
-  assert reply.controls.1.rows.1.0 is 2
-  assert reply.controls.1.rows.1.1 is true
+  # The top row (Name, Duration, Estimated) is on every page, so the page's
+  # own controls follow it (#1536).
+  assert reply.controls.0.name is name
+  assert reply.controls.1.name is duration
+  assert reply.controls.2.name is estimated
+  assert reply.controls.3.name is fixture.note
+  assert reply.controls.3.kind is multiline
+  assert reply.controls.3.value is note for task 2
+  assert reply.controls.3.plugin is true
+  assert reply.controls.4.name is fixture.grid
+  assert reply.controls.4.kind is grid
+  assert reply.controls.4.columns.1 is Done
+  assert reply.controls.4.column_kinds.1 is checkbox
+  assert reply.controls.4.rows.1.0 is 2
+  assert reply.controls.4.rows.1.1 is true
   # A grid cell by its address, checked against the column's kind.
   call dialog-set {"control":"fixture.grid[1].Done","value":false}
   call dialog-read {}
-  assert reply.controls.1.rows.1.1 is false
+  assert reply.controls.4.rows.1.1 is false
   call-error dialog-set {"control":"fixture.grid[1].Done","value":"maybe"} => takes true or false
   # The dropdown's items and a greyed control come from the state for this
   # opening (#1556): the manifest's "none" is replaced by the plan's items.
-  assert reply.controls.2.name is fixture.pick
-  assert reply.controls.2.kind is dropdown
-  assert reply.controls.2.items.0 is task
-  assert reply.controls.2.items.1 is 2
-  assert reply.controls.2.value is 2
+  assert reply.controls.5.name is fixture.pick
+  assert reply.controls.5.kind is dropdown
+  assert reply.controls.5.items.0 is task
+  assert reply.controls.5.items.1 is 2
+  assert reply.controls.5.value is 2
   call-error dialog-set {"control":"fixture.pick","value":"none"} => has no item
   call dialog-set {"control":"fixture.pick","value":"task"}
-  assert reply.controls.2.value is task
-  assert reply.controls.3.name is fixture.locked
-  assert reply.controls.3.enabled is false
+  assert reply.controls.5.value is task
+  assert reply.controls.6.name is fixture.locked
+  assert reply.controls.6.enabled is false
   # Enter in the multiline is a new line, not OK.
   call pointer-click {"dialog-field":"fixture.note"}
   call real-key {"key":"end"}

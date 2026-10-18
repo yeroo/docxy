@@ -457,3 +457,19 @@ fn help_is_the_hosts_never_the_default_and_never_a_command() {
         Some(Err("'Help' is disabled".into()))
     );
 }
+
+#[test]
+fn the_overlay_is_asked_again_when_the_zoom_changes() {
+    let mut tab = tab();
+    let Surface::Project(v) = &mut tab.surface else {
+        unreachable!()
+    };
+    v.layout(1180.);
+    let before = overlay_key(v);
+    assert_eq!(before, overlay_key(v));
+    v.zoom_step(-1, 0.);
+    let zoomed = overlay_key(v);
+    assert_ne!(before, zoomed, "a zoom moves every shape");
+    v.zoom_step(1, 0.);
+    assert_eq!(before, overlay_key(v));
+}

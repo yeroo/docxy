@@ -1,0 +1,26 @@
+# #1535: dragging either edge of the Timeline's view box changes the visible
+# span, so the chart zooms to make that span fill it; the box mirrors the span
+# (`timeline_view_start`/`_finish`). The middle of the box still pans (covered
+# by project-timeline-view.uit and the unit tests). Not run on macOS.
+# project-timeline-view.xml: 82 days from Mon 1/5/26; the chart shows 15 of them.
+
+test project dragging the box's right edge out widens the span and narrows the days
+  open ../fixtures/project-timeline-view.xml
+  shot window
+  assert gantt_day_w is 22
+  assert timeline_view_start is Mon 1/5/26
+  assert timeline_view_finish is Mon 1/19/26
+  call pointer-drag {"from":"project-timeline-box-right","to":"project-timeline-box-right","offset":[120,0]}
+  assert gantt_day_w is not 22
+  assert timeline_view_start is Mon 1/5/26
+  assert timeline_view_finish is not Mon 1/19/26
+  shot project-timeline
+  assert dirty is false
+
+test project dragging the box's left edge in narrows the span and widens the days
+  open ../fixtures/project-timeline-view.xml
+  shot window
+  call pointer-drag {"from":"project-timeline-box-right","to":"project-timeline-box-right","offset":[200,0]}
+  call pointer-drag {"from":"project-timeline-box-left","to":"project-timeline-box-left","offset":[60,0]}
+  assert timeline_view_start is not Mon 1/5/26
+  shot project-timeline

@@ -887,6 +887,11 @@ pub enum Region {
     ProjectVbar,
     /// The Project Timeline pane above the Gantt view, when it is shown.
     ProjectTimeline,
+    /// The Timeline view box's left and right edge strips (#1535).
+    ProjectTimelineBoxLeft,
+    ProjectTimelineBoxRight,
+    /// The strip under the Timeline that drags its height (#1535).
+    ProjectTimelineGrip,
     /// The Project split bar between the entry table and the Gantt chart.
     ProjectSplit,
     /// The Home ribbon's Styles gallery: the well its tiles sit in.
@@ -979,6 +984,9 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
         "project-hbar-chart" if arg.is_none() => Ok(Region::ProjectHbarChart),
         "project-vbar" if arg.is_none() => Ok(Region::ProjectVbar),
         "project-timeline" if arg.is_none() => Ok(Region::ProjectTimeline),
+        "project-timeline-box-left" if arg.is_none() => Ok(Region::ProjectTimelineBoxLeft),
+        "project-timeline-box-right" if arg.is_none() => Ok(Region::ProjectTimelineBoxRight),
+        "project-timeline-grip" if arg.is_none() => Ok(Region::ProjectTimelineGrip),
         "project-split" if arg.is_none() => Ok(Region::ProjectSplit),
         "gallery" if arg.is_none() => Ok(Region::Gallery),
         "ribbon" if arg.is_none() => Ok(Region::Ribbon),
@@ -1134,6 +1142,9 @@ pub fn region_name(region: Region) -> String {
         Region::ProjectHbarChart => "project-hbar-chart".into(),
         Region::ProjectVbar => "project-vbar".into(),
         Region::ProjectTimeline => "project-timeline".into(),
+        Region::ProjectTimelineBoxLeft => "project-timeline-box-left".into(),
+        Region::ProjectTimelineBoxRight => "project-timeline-box-right".into(),
+        Region::ProjectTimelineGrip => "project-timeline-grip".into(),
         Region::ProjectSplit => "project-split".into(),
         Region::Gallery => "gallery".into(),
         Region::Ribbon => "ribbon".into(),
@@ -1328,13 +1339,16 @@ fn double_click_events(p: Point<Pixels>) -> Vec<PlatformInput> {
 /// The wheel notch a `pointer-wheel` dispatches at `p`: the pointer moves
 /// there first, as it would before a real wheel turn. A negative `dy` scrolls
 /// the content down (gpui's own sign).
-fn wheel_events(p: Point<Pixels>, dy: f32) -> Vec<PlatformInput> {
+fn wheel_events(p: Point<Pixels>, dy: f32, ctrl: bool) -> Vec<PlatformInput> {
     vec![
         mouse_move(p, None),
         PlatformInput::ScrollWheel(ScrollWheelEvent {
             position: p,
             delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
-            modifiers: Modifiers::default(),
+            modifiers: Modifiers {
+                control: ctrl,
+                ..Modifiers::default()
+            },
             touch_phase: TouchPhase::Moved,
         }),
     ]
@@ -1503,13 +1517,15 @@ fn to_field_arg(args: &Json) -> Result<Option<&str>, String> {
 }
 
 /// The targets `pointer-click` takes; a call names exactly one (#1029).
-const POINTER_TARGETS: [&str; 7] = [
+const POINTER_TARGETS: [&str; 9] = [
     "region",
     "at",
     "dialog-field",
     "dialog-tab",
     "dialog-button",
     "dialog-control",
+    "dialog-calendar",
+    "dialog-cell",
     "input",
 ];
 
@@ -4958,13 +4974,21 @@ fn dispatch_verb(
             refuse_under_cover(app)?;
             let target = args.get("target").ok_or("menu-open needs a 'target'")?;
             menu_open(app, target, window, cx)?;
-            // The Project AutoFilter drop-down is a dialog: reply with it.
+            // The Project AutoFilter popup is a dialog: reply as `menu-read` does.
             if target.get("filter").is_some() {
-                return Done::ok(app.active_dialogs_mut().to_json());
+                if let Some(d) = app.active_dialogs().and_then(|s| s.top()) {
+                    return Done::ok(crate::project::menu_json(d));
+                }
             }
             Done::ok(crate::menu::read_json(app.menu.as_ref()))
         }
-        "menu-read" => Done::ok(crate::menu::read_json(app.menu.as_ref())),
+        "menu-read" => Done::ok(match app.active_dialogs().and_then(|s| s.top()) {
+            // The AutoFilter popup (#1607) is a dialog drawn as a menu.
+            Some(d) if matches!(d.owner, crate::dialog::DialogOwner::ProjectFilter { .. }) => {
+                crate::project::menu_json(d)
+            }
+            _ => crate::menu::read_json(app.menu.as_ref()),
+        }),
         // The UI plugins' overlay shapes for the active Project's chart
         // (#1532), as the chart paints them: `{count, shapes}`.
         "project-overlay" => {
@@ -5052,7 +5076,37 @@ fn dispatch_verb(
                     return Err("menu-click takes 'label', 'path' or 'index'".into());
                 }
                 Some(_) => crate::menu::resolve_index(&menu.items, arg_usize(args, "index")?)?,
-                None => crate::menu::resolve(&menu.items, &menu_path(args)?)?,
+                None => {
+                    let labels = menu_path(args)?;
+                    // A mini toolbar item (#1537) is named by its label: a
+                    // button runs; a drop-down opens its choices, and the rest
+                    // of a path walks them.
+                    if let Some(i) = labels.first().and_then(|l| menu.toolbar_index(l)) {
+                        if menu.toolbar[i].entry.submenu.is_empty() {
+                            if labels.len() > 1 {
+                                return Err(format!("'{}' has no choices", labels[0]));
+                            }
+                            app.menu_activate_toolbar(i, window, cx)?;
+                        } else {
+                            // Resolve the choice before entering, so a bad
+                            // path leaves the menu as it was.
+                            let sub = &menu.toolbar[i].entry.submenu;
+                            let path = match labels.len() > 1 {
+                                true => Some(crate::menu::resolve(sub, &labels[1..])?),
+                                false => None,
+                            };
+                            let m = app.menu.as_mut().ok_or("no menu is open")?;
+                            if !m.enter_toolbar(i, false) {
+                                return Err(format!("toolbar item '{}' is disabled", labels[0]));
+                            }
+                            if let Some(path) = path {
+                                app.menu_activate(&path, window, cx)?;
+                            }
+                        }
+                        return Done::ok(state(app, window, cx));
+                    }
+                    crate::menu::resolve(&menu.items, &labels)?
+                }
             };
             app.menu_activate(&path, window, cx)?;
             Done::ok(state(app, window, cx))
@@ -5373,6 +5427,13 @@ fn dispatch_verb(
                 ("dialog-tab", "a tab label"),
                 ("dialog-button", "a button label"),
                 ("dialog-control", "a control name"),
+                // A date combo's calendar part (#1536): `button:<field>`,
+                // `prev:<field>`, `next:<field>`, `day:<field>:<n>`.
+                ("dialog-calendar", "a calendar part"),
+                // An editable grid's cell, `name[row].column` with the
+                // column's heading in lower case, or a narrowed combo
+                // list's item `name[suggest].<n>` (#1536).
+                ("dialog-cell", "a grid cell"),
             ]
             .into_iter()
             .find_map(|(key, what)| args.get(key).map(|v| (key, what, v)));
@@ -5665,7 +5726,11 @@ fn dispatch_verb(
                 ("y", Json::Num(f64::from(p.y))),
                 ("dy", Json::Num(f64::from(dy))),
             ]))?;
-            done.input = wheel_events(p, dy);
+            done.input = wheel_events(
+                p,
+                dy,
+                args.get("ctrl").and_then(Json::as_bool).unwrap_or(false),
+            );
             Ok(done)
         }
         // Switch the File screen's page (#1028): `new`, `info` and `export`
@@ -9512,6 +9577,9 @@ mod tests {
             Region::ProjectHbarChart,
             Region::ProjectVbar,
             Region::ProjectTimeline,
+            Region::ProjectTimelineBoxLeft,
+            Region::ProjectTimelineBoxRight,
+            Region::ProjectTimelineGrip,
             Region::ProjectSplit,
             Region::Gallery,
             Region::Ribbon,

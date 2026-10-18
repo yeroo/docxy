@@ -16006,6 +16006,9 @@ impl Docxy {
             | Region::ProjectHbarChart
             | Region::ProjectVbar
             | Region::ProjectTimeline
+            | Region::ProjectTimelineBoxLeft
+            | Region::ProjectTimelineBoxRight
+            | Region::ProjectTimelineGrip
             | Region::ProjectSplit => self.project_region_bounds(region, lookup),
             Region::Grid => self.grid_bounds(),
             Region::BackstageContent | Region::BackstageRail => lookup(
@@ -32742,13 +32745,25 @@ impl Docxy {
         items: Vec<menu::MenuItem>,
         cx: &mut Context<Self>,
     ) {
+        self.open_menu_with_toolbar(target, at, items, Vec::new(), cx);
+    }
+
+    /// [`Self::open_menu`] with the mini formatting toolbar above the items
+    /// (#1537).
+    fn open_menu_with_toolbar(
+        &mut self,
+        target: menu::MenuTarget,
+        at: Point<Pixels>,
+        items: Vec<menu::MenuItem>,
+        toolbar: Vec<menu::ToolbarItem>,
+        cx: &mut Context<Self>,
+    ) {
         self.mini_bar = None;
         self.menu_scroll = ScrollHandle::new();
-        self.menu = Some(menu::Menu::new(
-            target,
-            (f32::from(at.x), f32::from(at.y)),
-            items,
-        ));
+        self.menu = Some(
+            menu::Menu::new(target, (f32::from(at.x), f32::from(at.y)), items)
+                .with_toolbar(toolbar),
+        );
         cx.notify();
     }
 
@@ -32893,7 +32908,8 @@ impl Docxy {
         };
         let target = menu::MenuTarget::Row(clicked);
         let items = project_row_menu(v, clicked);
-        self.open_menu(target, at, items, cx);
+        let toolbar = project_toolbar(v, clicked);
+        self.open_menu_with_toolbar(target, at, items, toolbar, cx);
         Ok(())
     }
 
@@ -32952,7 +32968,8 @@ impl Docxy {
         let mut items = project_column_menu();
         // What a UI plugin adds to the column menu (#1532).
         plugin_ui::extend_menu(v, "column", &mut items);
-        self.open_menu(menu::MenuTarget::Column(col), at, items, cx);
+        let toolbar = project_toolbar(v, v.selected_uid());
+        self.open_menu_with_toolbar(menu::MenuTarget::Column(col), at, items, toolbar, cx);
         Ok(())
     }
 
@@ -33146,6 +33163,97 @@ impl Docxy {
         })
     }
 
+    /// A click on toolbar drop-down `i` (#1537): its choices replace the items.
+    fn menu_enter_toolbar(&mut self, i: usize, cx: &mut Context<Self>) {
+        if let Some(menu) = self.menu.as_mut()
+            && menu.enter_toolbar(i, false)
+        {
+            self.menu_scroll = ScrollHandle::new();
+        }
+        cx.notify();
+    }
+
+    /// The mini formatting toolbar drawn above a row or column menu's items
+    /// (#1537): each item is its icon (a combo its value) and, when it opens
+    /// choices, a small arrow.
+    fn menu_toolbar_el(&self, menu: &menu::Menu, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        use menu::ToolbarKind;
+        let mut bar = h_flex()
+            .items_center()
+            .gap(px(1.))
+            .p_0p5()
+            .mb_0p5()
+            .rounded_md()
+            .bg(pal.panel)
+            .border_1()
+            .border_color(pal.border)
+            .shadow_lg()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation());
+        for (i, t) in menu.toolbar.iter().enumerate() {
+            let e = &t.entry;
+            let color = if e.enabled { pal.fg } else { pal.dim };
+            let opens = !e.submenu.is_empty();
+            let face: AnyElement = match t.kind {
+                ToolbarKind::Combo => div()
+                    .min_w(if e.label == "Font" { px(84.) } else { px(28.) })
+                    .px_1()
+                    .text_size(px(12.))
+                    .child(SharedString::from(format!(
+                        "{} ▾",
+                        t.value.clone().unwrap_or_default()
+                    )))
+                    .into_any_element(),
+                ToolbarKind::Arrow => div().text_size(px(12.)).child("▾").into_any_element(),
+                ToolbarKind::Button if !e.icon.is_empty() => {
+                    icon_svg(e.icon, 15., color).into_any_element()
+                }
+                ToolbarKind::Button => div()
+                    .text_size(px(12.))
+                    .child(match e.label.as_str() {
+                        "Link Tasks" => "⛓",
+                        "Unlink Tasks" => "✂",
+                        _ => "·",
+                    })
+                    .into_any_element(),
+            };
+            bar = bar.child(
+                div()
+                    .id(SharedString::from(e.id.clone()))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_0p5()
+                    .h(px(24.))
+                    .min_w(px(24.))
+                    .rounded(px(3.))
+                    .text_color(color)
+                    .when(e.checked, |d| {
+                        d.bg(Hsla {
+                            a: 0.20,
+                            ..hsla_u(accent::brand())
+                        })
+                    })
+                    .child(face)
+                    .when(opens && t.kind == ToolbarKind::Button, |d| {
+                        d.child(div().text_size(px(9.)).child("▾"))
+                    })
+                    .when(e.enabled, |d| {
+                        d.cursor_pointer()
+                            .hover(|d| d.bg(pal.hover))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if opens {
+                                    this.menu_enter_toolbar(i, cx);
+                                } else {
+                                    let _ = this.menu_activate_toolbar(i, window, cx);
+                                }
+                            }))
+                    }),
+            );
+        }
+        bar.into_any_element()
+    }
+
     /// Open the submenu of the open menu's item `i` in the menu's place (the
     /// Page Number menu's galleries): the pointer's way into a submenu, which
     /// enters with nothing highlighted as the click leaves it.
@@ -33298,6 +33406,28 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        self.menu_pick(Err(path), window, cx)
+    }
+
+    /// Run toolbar button `i` of the open menu (#1537). A drop-down opens
+    /// its choices instead ([`Self::menu_enter_toolbar`]); this refuses it.
+    pub(crate) fn menu_activate_toolbar(
+        &mut self,
+        i: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        self.menu_pick(Ok(i), window, cx)
+    }
+
+    /// [`Self::menu_activate`]: `Err(path)` names an item, `Ok(i)` a toolbar
+    /// item.
+    fn menu_pick(
+        &mut self,
+        pick: Result<usize, &[usize]>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
         let menu = self.menu.as_ref().ok_or("no menu is open")?;
         // A row menu opened inside the selected range kept the range and the
         // cursor (#1213): it still stands while the range holds its row.
@@ -33308,7 +33438,15 @@ impl Docxy {
         if kept_row.is_none() {
             menu::target_stands(&menu.target, self.project_selection())?;
         }
-        let entry = menu::entry_at(&menu.items, path).ok_or("no such menu item")?;
+        let entry = match pick {
+            Err(path) => menu::entry_at(&menu.items, path).ok_or("no such menu item")?,
+            Ok(i) => menu
+                .toolbar
+                .get(i)
+                .filter(|_| menu.depth() == 0)
+                .map(|t| &t.entry)
+                .ok_or("no such toolbar item")?,
+        };
         if !entry.enabled {
             return Err(format!("menu item '{}' is disabled", entry.label));
         }
@@ -33320,7 +33458,8 @@ impl Docxy {
         // Its task items are the clicked row's: one that drops the range
         // anyway first selects that row as a left click does, so it acts on
         // the row exactly as before #1213. The range items (Cut, Copy,
-        // Paste, Fill Down, Clear Contents) run on the kept range.
+        // Paste, and the toolbar's CellStyle, Link and Unlink) run on the
+        // kept range.
         if let (Some(uid), Some(Act::Project(a))) = (kept_row, act)
             && project_act_clears_range(a)
             && self.project_selection().and_then(|(sel, _)| sel) != Some(uid)
@@ -33453,7 +33592,13 @@ impl Docxy {
                 anchored()
                     .position(point(px(menu.at.0), px(menu.at.1)))
                     .snap_to_window_with_margin(px(4.))
-                    .child(list),
+                    .child(
+                        v_flex()
+                            .when(menu.depth() == 0 && !menu.toolbar.is_empty(), |d| {
+                                d.child(self.menu_toolbar_el(menu, pal, cx))
+                            })
+                            .child(list),
+                    ),
             )
             .into_any_element()
     }
@@ -36052,6 +36197,8 @@ impl Docxy {
                 Act::Project(ProjectAct::Plugin(id)) => self.tabs.get(self.active).is_some_and(
                     |t| matches!(&t.surface, Surface::Project(v) if plugin_ui::enabled(v, id)),
                 ),
+                // Hours and Minutes are listed and cannot be chosen (#1535).
+                Act::Project(ProjectAct::Timescale(i)) => timescale_available(i),
                 _ => true,
             }
     }
@@ -37301,6 +37448,7 @@ impl Render for Docxy {
         }
 
         if let Some(Surface::Project(v)) = self.tabs.get_mut(self.active).map(|t| &mut t.surface) {
+            v.height = f32::from(window.viewport_size().height);
             v.layout(f32::from(window.viewport_size().width));
         }
         // Spreadsheet horizontal scroll: reconcile the column offset so the

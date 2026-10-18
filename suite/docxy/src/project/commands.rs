@@ -2,8 +2,22 @@
 use super::*;
 use crate::dialog::catalog;
 use crate::dialog::{ButtonRole, Dialog, DialogOwner};
+use crate::menu::ToolbarItem;
 use projcore::editor::{AssignOutcome, FindOutcome};
 use projcore::report::ReportKind;
+
+/// One change to the direct style of the selected cells (#1537). Bold and
+/// Italic flip the cursor cell's value over every cell; the others set a
+/// value from the toolbar's fixed lists (`None` clears the field).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StyleEdit {
+    Bold,
+    Italic,
+    Font(&'static str),
+    Size(u16),
+    Fill(Option<u32>),
+    Color(Option<u32>),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProjectAct {
@@ -37,6 +51,19 @@ pub(crate) enum ProjectAct {
     Find,
     ScrollToTask,
     Timeline,
+    /// View › Zoom › Timescale (#1535): choose the timescale level `zoom::COMBO[i]`;
+    /// Hours and Minutes are listed and cannot be chosen.
+    Timescale(usize),
+    /// View › Zoom › Zoom ▸ Zoom In / Zoom Out: one level, the left-edge date kept.
+    ZoomIn,
+    ZoomOut,
+    /// View › Zoom › Zoom ▸ Zoom... and the chart menu's: the Zoom dialog.
+    ZoomDialog,
+    /// The chart menu's Timescale...: the Timescale dialog.
+    TimescaleDialog,
+    /// View › Zoom › Entire Project, Selected Tasks.
+    ZoomEntire,
+    ZoomSelected,
     /// Gantt Chart Format › Bar Styles › Critical Tasks.
     CriticalTasks,
     /// Gantt Chart Format › Bar Styles › Baseline.
@@ -69,22 +96,20 @@ pub(crate) enum ProjectAct {
     /// Ctrl+Delete: clear the active cell, or reset it to its default; never
     /// deletes the task.
     ResetCell,
-    /// Ctrl+D and a task row's context menu › Fill Down: each column of the
+    /// Ctrl+D: each column of the
     /// range but ID takes its top row's value into every shown row below it,
     /// as one undo step; the range stays. See `clip.rs`.
     FillDown,
-    /// A task row's context menu › Clear Contents: Delete's clear without
-    /// its deletion. Name, Predecessors and Resource Names clear (all three
-    /// on the ID column or a row-header range); never resets another field
-    /// to a default and never deletes the task.
-    ClearContents,
     /// A task row's context menu › Delete Task: the selected task, whatever
     /// column the cursor is on; a summary asks first, as Delete on its ID does.
     DeleteTask,
-    /// Ctrl+K and a task row's context menu › Hyperlink...: the selected
+    /// Ctrl+K and a task row's context menu › Link (the bar's › Hyperlink...): the selected
     /// task's hyperlink (display text, address, in-file location) in one
     /// prompt. Keyboard and row-menu only; no ribbon command.
     Hyperlink,
+    /// The mini toolbar's formatting buttons and drop-downs (#1537): one
+    /// edit of the selected cells' direct style, one undo step.
+    CellStyle(StyleEdit),
     /// Ctrl+C / Ctrl+X / Ctrl+V: the cursor cell (or range) on the table, the
     /// selection (else the whole buffer) in an open cell edit (#561); also the Task tab's
     /// Clipboard group. See `clip.rs`.
@@ -135,6 +160,21 @@ impl ProjectAct {
         Self::Find,
         Self::ScrollToTask,
         Self::Timeline,
+        Self::Timescale(0),
+        Self::Timescale(1),
+        Self::Timescale(2),
+        Self::Timescale(3),
+        Self::Timescale(4),
+        Self::Timescale(5),
+        Self::Timescale(6),
+        Self::Timescale(7),
+        Self::Timescale(8),
+        Self::ZoomIn,
+        Self::ZoomOut,
+        Self::ZoomDialog,
+        Self::TimescaleDialog,
+        Self::ZoomEntire,
+        Self::ZoomSelected,
         Self::CriticalTasks,
         Self::BaselineBars,
         Self::Paste,
@@ -274,6 +314,20 @@ fn report_dropdown(menu: ReportMenu) -> Control<Act> {
             .collect(),
     }
 }
+
+/// The Timescale combo's items in `zoom::COMBO` order: command id, KeyTip in
+/// its list, and shortcut text.
+const TIMESCALE_IDS: [(&str, &str, &str); 9] = [
+    ("pr-timescale-years", "Y", "Alt, W, Q, Y"),
+    ("pr-timescale-half-years", "H", "Alt, W, Q, H"),
+    ("pr-timescale-quarters", "Q", "Alt, W, Q, Q"),
+    ("pr-timescale-months", "M", "Alt, W, Q, M"),
+    ("pr-timescale-thirds", "T", "Alt, W, Q, T"),
+    ("pr-timescale-weeks", "W", "Alt, W, Q, W"),
+    ("pr-timescale-days", "D", "Alt, W, Q, D"),
+    ("pr-timescale-hours", "O", "Alt, W, Q, O"),
+    ("pr-timescale-minutes", "N", "Alt, W, Q, N"),
+];
 
 /// The Project document ribbon. Tabs, groups, command labels and screentips
 /// follow Microsoft Project 2024, so written instructions can be followed as
@@ -606,6 +660,93 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                     ])],
                 ),
                 rs::group(
+                    "Zoom",
+                    75,
+                    vec![
+                        // The Timescale combo: its button opens the Timescale
+                        // dialog, its list picks a level (Hours and Minutes are
+                        // listed and disabled).
+                        Control::Dropdown {
+                            cmd: cmdt(
+                                "pr-timescale",
+                                "rule",
+                                "Timescale",
+                                Act::Project(TimescaleDialog),
+                                "Alt, W, Q",
+                            )
+                            .key("Q"),
+                            items: zoom::COMBO
+                                .iter()
+                                .enumerate()
+                                .map(|(i, (name, _))| {
+                                    cmdt(
+                                        TIMESCALE_IDS[i].0,
+                                        "rule",
+                                        name,
+                                        Act::Project(Timescale(i)),
+                                        TIMESCALE_IDS[i].2,
+                                    )
+                                    .key(TIMESCALE_IDS[i].1)
+                                })
+                                .collect(),
+                        },
+                        Control::Split {
+                            primary: cmdt(
+                                "pr-zoom",
+                                "find",
+                                "Zoom",
+                                Act::Project(ZoomDialog),
+                                "Alt, W, J  (Ctrl+wheel)",
+                            )
+                            .key("J"),
+                            menu: vec![
+                                cmdt(
+                                    "pr-zoom-in",
+                                    "find",
+                                    "Zoom In",
+                                    Act::Project(ZoomIn),
+                                    "Alt, W, J, I  (Ctrl+wheel up)",
+                                )
+                                .key("I"),
+                                cmdt(
+                                    "pr-zoom-out",
+                                    "find",
+                                    "Zoom Out",
+                                    Act::Project(ZoomOut),
+                                    "Alt, W, J, O  (Ctrl+wheel down)",
+                                )
+                                .key("O"),
+                                cmdt(
+                                    "pr-zoom-dialog",
+                                    "find",
+                                    "Zoom...",
+                                    Act::Project(ZoomDialog),
+                                    "Alt, W, J, Z",
+                                )
+                                .key("Z"),
+                            ],
+                        },
+                        rs::column(vec![
+                            cmd(
+                                "pr-zoom-entire",
+                                "align-left",
+                                "Entire Project",
+                                ZoomEntire,
+                                "Alt, W, G",
+                                "G",
+                            ),
+                            cmd(
+                                "pr-zoom-selected",
+                                "align-left",
+                                "Selected Tasks",
+                                ZoomSelected,
+                                "Alt, W, K",
+                                "K",
+                            ),
+                        ]),
+                    ],
+                ),
+                rs::group(
                     "Split View",
                     70,
                     vec![rs::column(vec![cmds(
@@ -706,8 +847,8 @@ pub(crate) fn gantt_format_tab() -> rs::Tab<Act> {
 /// highlight, Cut and Paste clear it when they run, Link and Unlink act on
 /// it, and Delete clears the range's cells and consumes it. The rule lives
 /// here, one place, so keys, the ribbon, the QAT and Backstage cannot drift
-/// apart. Fill Down fills the range and keeps it; Clear Contents clears it
-/// and consumes it, as Delete does. A UI plugin's command keeps it too: the
+/// apart. Fill Down fills the range and keeps it, and so does CellStyle
+/// (#1537), which styles it. A UI plugin's command keeps it too: the
 /// range is what its request's selection carries (#1571).
 pub(crate) fn project_act_clears_range(act: ProjectAct) -> bool {
     use ProjectAct::*;
@@ -719,7 +860,7 @@ pub(crate) fn project_act_clears_range(act: ProjectAct) -> bool {
             | UnlinkTasks
             | ClearCell
             | FillDown
-            | ClearContents
+            | CellStyle(_)
             | Plugin(_)
     )
 }
@@ -749,6 +890,10 @@ fn task_act_active(v: &ProjectView, act: ProjectAct, uid: Option<i32>) -> bool {
     match act {
         ProjectAct::LevelAll => v.ed.leveled(),
         ProjectAct::Timeline => v.timeline,
+        // The timescale in force: a free width (a view box drag) checks none.
+        ProjectAct::Timescale(i) => {
+            zoom::is_preset(v.day_w()) && i < zoom::LEVELS.len() && zoom::nearest(v.day_w()) == i
+        }
         ProjectAct::CriticalTasks => v.show_critical,
         ProjectAct::BaselineBars => v.show_baseline,
         ProjectAct::Inactivate => task_inactive(v, uid),
@@ -771,8 +916,9 @@ fn task_act_active(v: &ProjectView, act: ProjectAct, uid: Option<i32>) -> bool {
 /// delete). That is the cursor's row, except after a right-click inside the
 /// selected range, which keeps the range and the cursor (#1213): the task
 /// items still act on the clicked row (the host selects it before one runs),
-/// while the range items (Cut, Copy, Paste, Fill Down, Clear Contents)
-/// follow the range and the cursor.
+/// while the range items (Cut, Copy, Paste, and the toolbar's CellStyle,
+/// Link and Unlink) follow the range and the cursor. Fill Down (Ctrl+D) and
+/// Font are not Project's row items (#1537).
 pub(crate) fn project_row_menu(
     v: &ProjectView,
     clicked: Option<i32>,
@@ -838,23 +984,6 @@ pub(crate) fn project_row_menu(
         item("rm-assign", "Assign Resources...", "comment", Assign, task),
         Separator,
         none("rm-text-styles", "Text Styles..."),
-        none("rm-font", "Font..."),
-        Separator,
-        // No fill icon in the set yet; the item still runs its command.
-        item(
-            "rm-fill-down",
-            "Fill Down",
-            "",
-            FillDown,
-            fill_down_enabled(v),
-        ),
-        item(
-            "rm-clear",
-            "Clear Contents",
-            "clear-format",
-            ClearContents,
-            v.selected_uid().is_some(),
-        ),
         Separator,
         item(
             "rm-info",
@@ -868,7 +997,7 @@ pub(crate) fn project_row_menu(
         Separator,
         // No link icon in the set yet; Project's chain is drawn by the
         // column-chooser follow-up. The item still runs its command.
-        item("rm-hyperlink", "Hyperlink...", "", Hyperlink, task),
+        item("rm-hyperlink", "Link", "", Hyperlink, task),
     ];
     crate::plugin_ui::extend_menu(v, "row", &mut items);
     items
@@ -909,16 +1038,29 @@ pub(crate) fn project_bar_menu(v: &ProjectView) -> Vec<crate::menu::MenuItem> {
 }
 
 /// The Gantt chart's own context menu (#1532), opened by a right-press on
-/// the chart beside the bars, in Project's order (its chart formatting
-/// dialogs are not built, so the items are drawn disabled), then what a UI
-/// plugin adds to the `chart` menu.
+/// the chart beside the bars, in Project's order: Timescale... and Zoom...
+/// open their dialogs (#1535); the rest of its chart formatting is not built, so
+/// those items are drawn disabled; then what a UI plugin adds to the `chart` menu.
 pub(crate) fn project_chart_menu(v: &ProjectView) -> Vec<crate::menu::MenuItem> {
     use crate::menu::{
         Entry,
         MenuItem::{Item, Separator},
     };
     let none = |id, label| Item(Entry::unavailable(id, label));
+    let item = |id, label, icon, act: ProjectAct| {
+        Item(Entry::new(id, label, icon, Act::Project(act), true))
+    };
     let mut items = vec![
+        item(
+            "ch-timescale",
+            "Timescale...",
+            "rule",
+            ProjectAct::TimescaleDialog,
+        ),
+        item("ch-zoom", "Zoom...", "find", ProjectAct::ZoomDialog),
+        none("ch-working-time", "Change Working Time..."),
+        none("ch-show-bar-styles", "Show/Hide Bar Styles"),
+        Separator,
         none("ch-gridlines", "Gridlines..."),
         none("ch-bar-styles", "Bar Styles..."),
         none("ch-layout", "Layout..."),
@@ -930,6 +1072,282 @@ pub(crate) fn project_chart_menu(v: &ProjectView) -> Vec<crate::menu::MenuItem> 
     ];
     crate::plugin_ui::extend_menu(v, "chart", &mut items);
     items
+}
+
+/// The fonts the mini toolbar's Font drop-down lists: a fixed short list, as
+/// the suite has no font enumeration.
+const TOOLBAR_FONTS: [&str; 8] = [
+    "Calibri",
+    "Arial",
+    "Times New Roman",
+    "Courier New",
+    "Verdana",
+    "Georgia",
+    "Segoe UI",
+    "Consolas",
+];
+/// The sizes (points) its Size drop-down lists.
+const TOOLBAR_SIZES: [u16; 16] = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48, 56, 64, 72];
+/// Swatches (name, `0xRRGGBB`) of the two colour drop-downs.
+const TOOLBAR_COLORS: [(&str, u32); 8] = [
+    ("Black", 0x000000),
+    ("Red", 0xFF0000),
+    ("Orange", 0xFFC000),
+    ("Yellow", 0xFFFF00),
+    ("Green", 0x00B050),
+    ("Blue", 0x0070C0),
+    ("Purple", 0x7030A0),
+    ("Gray", 0xD9D9D9),
+];
+/// What a cell with no direct font or size shows in the toolbar's combos.
+const DEFAULT_FONT: &str = "Calibri";
+const DEFAULT_SIZE: u16 = 11;
+
+/// The cells a toolbar format acts on: the selected range, else the cursor
+/// cell, on real tasks only (a blank row or the entry row has no cell to
+/// style). Task uid and column name.
+fn format_cells(v: &ProjectView) -> Vec<(i32, &'static str)> {
+    let cells: Vec<(i32, usize)> = match v.selection() {
+        Some(sel) => sel
+            .uids
+            .iter()
+            .flat_map(|&u| sel.cols.clone().map(move |c| (u, c)))
+            .collect(),
+        None => v.selected_uid().map(|u| (u, v.col)).into_iter().collect(),
+    };
+    cells
+        .into_iter()
+        .filter(|&(u, _)| v.ed.project().task(u).is_some_and(|t| !t.is_null))
+        .filter_map(|(u, c)| crate::COLUMNS.get(c).map(|&name| (u, name)))
+        .collect()
+}
+
+/// The style the grid draws for task `uid`'s cell in column `col`: the
+/// plan's row categories under the cell's own style, and bold on a summary.
+fn effective_style(v: &ProjectView, uid: i32, col: &str) -> projcore::formatting::TextStyle {
+    let Some((row, task)) =
+        v.ed.project()
+            .tasks
+            .iter()
+            .enumerate()
+            .find(|(_, t)| t.uid == uid)
+    else {
+        return Default::default();
+    };
+    let critical = v.ed.schedule().get(uid).is_some_and(|r| r.critical);
+    let inactive = inactive_row(v.ed.project(), row);
+    let row_style = crate::plugin_ui::row_style(v, task, critical, inactive);
+    let mut style =
+        crate::plugin_ui::cell_style(v, row_style.as_ref(), Some(uid), col).unwrap_or_default();
+    if style.bold.is_none() && task.summary {
+        style.bold = Some(true);
+    }
+    style
+}
+
+/// The cursor cell's effective style (empty off a task cell).
+fn cursor_style(v: &ProjectView) -> projcore::formatting::TextStyle {
+    v.selected_uid()
+        .zip(crate::COLUMNS.get(v.col))
+        .map(|(uid, &col)| effective_style(v, uid, col))
+        .unwrap_or_default()
+}
+
+/// Apply `edit` to every cell [`format_cells`] names as one undo step (none
+/// when no cell changes); the status line says what changed.
+fn apply_cell_style(v: &mut ProjectView, edit: StyleEdit) -> Result<String, String> {
+    let cells = format_cells(v);
+    if cells.is_empty() {
+        return Err("Select task cells to format".into());
+    }
+    let cursor = cursor_style(v);
+    let flip = |on: Option<bool>| Some(on != Some(true));
+    // Bold and Italic make every cell what the cursor cell is not.
+    let bold = flip(cursor.bold);
+    let italic = flip(cursor.italic);
+    v.ed.edit_formatting(|f| {
+        for &(uid, col) in &cells {
+            let old = f.cell(uid, col).cloned().unwrap_or_default();
+            let mut s = old.clone();
+            match edit {
+                StyleEdit::Bold => s.bold = bold,
+                StyleEdit::Italic => s.italic = italic,
+                StyleEdit::Font(name) => s.font = Some(name.to_string()),
+                StyleEdit::Size(pt) => s.size = Some(f32::from(pt)),
+                StyleEdit::Fill(c) => s.background = c,
+                StyleEdit::Color(c) => s.color = c,
+            }
+            if s != old {
+                f.set_cell(uid, col, s);
+            }
+        }
+    });
+    let n = cells.len();
+    Ok(if n == 1 {
+        "Formatted 1 cell".into()
+    } else {
+        format!("Formatted {n} cells")
+    })
+}
+
+/// The mini formatting toolbar above the row and column-heading menus
+/// (#1537), in Project's order. `uid` is the task the menu is for: the task
+/// buttons follow it as the row items do; the formatting follows the
+/// selected cells.
+pub(crate) fn project_toolbar(v: &ProjectView, uid: Option<i32>) -> Vec<ToolbarItem> {
+    use crate::menu::{
+        Entry,
+        MenuItem::Item,
+        ToolbarKind::{Arrow, Button, Combo},
+    };
+    use ProjectAct::*;
+    let task = uid
+        .and_then(|uid| v.ed.project().task(uid))
+        .is_some_and(|t| !t.is_null);
+    let can_format = !format_cells(v).is_empty();
+    let cur = cursor_style(v);
+    let font = cur.font.clone().unwrap_or_else(|| DEFAULT_FONT.into());
+    let size = cur.size.map_or(DEFAULT_SIZE, |s| s.round() as u16);
+    let choice = |id: String, label: String, edit: StyleEdit, on: bool| {
+        Item(Entry::new(&id, &label, "", Act::Project(CellStyle(edit)), true).checked(on))
+    };
+    let drop = |id: &str, label: &str, icon, choices: Vec<crate::menu::MenuItem>| {
+        let mut e = Entry::unavailable(id, label);
+        e.icon = icon;
+        e.enabled = can_format;
+        e.submenu = choices;
+        e
+    };
+    let button = |id, label, icon, act: ProjectAct, enabled, on| {
+        ToolbarItem::new(
+            Button,
+            Entry::new(id, label, icon, Act::Project(act), enabled).checked(on),
+        )
+    };
+    let swatches = |prefix: &str,
+                    none_label: &str,
+                    current: Option<u32>,
+                    edit: fn(Option<u32>) -> StyleEdit| {
+        let mut v = vec![choice(
+            format!("{prefix}-none"),
+            none_label.into(),
+            edit(None),
+            current.is_none(),
+        )];
+        v.extend(TOOLBAR_COLORS.iter().map(|&(name, rgb)| {
+            choice(
+                format!("{prefix}-{}", name.to_lowercase()),
+                name.into(),
+                edit(Some(rgb)),
+                current == Some(rgb),
+            )
+        }));
+        v
+    };
+    vec![
+        ToolbarItem::new(
+            Combo,
+            drop(
+                "tb-font",
+                "Font",
+                "",
+                TOOLBAR_FONTS
+                    .iter()
+                    .map(|&f| {
+                        choice(
+                            format!("tb-font-{}", f.to_lowercase().replace(' ', "-")),
+                            f.into(),
+                            StyleEdit::Font(f),
+                            f == font,
+                        )
+                    })
+                    .collect(),
+            ),
+        )
+        .value(&font),
+        ToolbarItem::new(
+            Combo,
+            drop(
+                "tb-size",
+                "Size",
+                "",
+                TOOLBAR_SIZES
+                    .iter()
+                    .map(|&n| {
+                        choice(
+                            format!("tb-size-{n}"),
+                            n.to_string(),
+                            StyleEdit::Size(n),
+                            n == size,
+                        )
+                    })
+                    .collect(),
+            ),
+        )
+        .value(&size.to_string()),
+        button(
+            "tb-bold",
+            "Bold",
+            "bold",
+            CellStyle(StyleEdit::Bold),
+            can_format,
+            cur.bold == Some(true),
+        ),
+        button(
+            "tb-italic",
+            "Italic",
+            "italic",
+            CellStyle(StyleEdit::Italic),
+            can_format,
+            cur.italic == Some(true),
+        ),
+        ToolbarItem::new(
+            Button,
+            drop(
+                "tb-fill",
+                "Fill Color",
+                "highlight",
+                swatches("tb-fill", "No Fill", cur.background, StyleEdit::Fill),
+            ),
+        ),
+        ToolbarItem::new(
+            Button,
+            drop(
+                "tb-color",
+                "Font Color",
+                "text-color",
+                swatches("tb-color", "Automatic", cur.color, StyleEdit::Color),
+            ),
+        ),
+        button("tb-link", "Link Tasks", "", AddLink, task, false),
+        button("tb-unlink", "Unlink Tasks", "", UnlinkTasks, task, false),
+        button(
+            "tb-outdent",
+            "Outdent",
+            "indent-decrease",
+            Outdent,
+            task,
+            false,
+        ),
+        button(
+            "tb-indent",
+            "Indent",
+            "indent-increase",
+            Indent,
+            task,
+            false,
+        ),
+        ToolbarItem::new(
+            Arrow,
+            Entry::new(
+                "tb-details",
+                "Task Details",
+                "",
+                Act::Project(Constraint),
+                task,
+            ),
+        ),
+    ]
 }
 
 /// A column heading's context menu (#1208), in Project's order (CUS-035).
@@ -1770,41 +2188,6 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                 };
                 status = Some(applied);
             }
-            ClearContents => {
-                // Delete's clear without its deletion. A row-header range
-                // spans every column, so it clears all three fields. The
-                // range is consumed, as Delete consumes it.
-                let sel = v.selection();
-                v.anchor = None;
-                let cleared = if let Some(sel) = sel {
-                    let cols = range_clear_cols(&sel);
-                    if cols.is_empty() {
-                        Some("Selection's columns can't be cleared".into())
-                    } else {
-                        clear_range_cells(&mut v.ed, &sel, &cols)?
-                    }
-                } else if let Some(uid) = v.selected_uid() {
-                    let blank = v.ed.project().task(uid).ok_or("No task selected")?.is_null;
-                    match v.col {
-                        _ if blank => None,
-                        COL_ID => {
-                            let row = Selection {
-                                uids: vec![uid],
-                                cols: COL_ID..=COL_ID,
-                            };
-                            let cols = [COL_NAME, COL_PREDECESSORS, COL_RESOURCES];
-                            clear_range_cells(&mut v.ed, &row, &cols)?
-                        }
-                        COL_NAME | COL_PREDECESSORS | COL_RESOURCES => {
-                            apply_cell(&mut v.ed, uid, v.col, "")?
-                        }
-                        _ => Some(format!("{} can't be cleared", COLUMNS[v.col])),
-                    }
-                } else {
-                    None
-                };
-                status = Some(cleared.unwrap_or_else(|| "Ready".into()));
-            }
             Milestone => {
                 if let Some(uid) = v.selected_uid() {
                     v.ed.toggle_milestone(uid)?;
@@ -1904,6 +2287,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             Notes => dialog = open_task_info(v, InfoPage::Notes)?,
             Assign => v.open_prompt(PromptKind::Assign),
             Hyperlink => v.open_prompt(PromptKind::Hyperlink),
+            CellStyle(edit) => status = Some(apply_cell_style(v, edit)?),
             Find => v.open_prompt(PromptKind::Find),
             Baseline => {
                 if !v.ed.project().tasks.is_empty() {
@@ -1973,6 +2357,18 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             }
             ScrollToTask => v.scroll_to_task(),
             Timeline => v.timeline = !v.timeline,
+            Timescale(i) => {
+                if !zoom::available(i) {
+                    return Err("Hours and Minutes timescales are not available".into());
+                }
+                status = Some(v.zoom_to_level(i));
+            }
+            ZoomIn => status = Some(v.zoom_step(1, 0.)),
+            ZoomOut => status = Some(v.zoom_step(-1, 0.)),
+            ZoomEntire => status = Some(v.zoom_entire()),
+            ZoomSelected => status = Some(v.zoom_selected()?),
+            ZoomDialog => dialog = Some(zoom_dialogs::zoom_dialog(v)),
+            TimescaleDialog => dialog = Some(zoom_dialogs::timescale_dialog(v)),
             CriticalTasks => v.show_critical = !v.show_critical,
             BaselineBars => v.show_baseline = !v.show_baseline,
             // A UI plugin's command (#1532): its ops as one undo step, its

@@ -623,7 +623,7 @@ pub(crate) fn project_row_click(tab: &mut DocTab, row: usize, col: Option<usize>
 /// (row `row` in task order, column `col`; `None` keeps the cursor's column,
 /// as a click does). Inside the selected range it keeps the range and the
 /// cursor, as Project and the sheet's cell menu do, so the menu's range
-/// items (Cut, Copy, Paste, Fill Down, Clear Contents) act on it; a
+/// items (Cut, Copy, Paste, and the toolbar's CellStyle, Link and Unlink) act on it; a
 /// levelling pass asked for first still runs first. The menu's task items
 /// are still the clicked row's: the host selects that row before one runs.
 /// Anywhere else (no range, outside it, or with a cell edit or prompt open, which no

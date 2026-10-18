@@ -4,7 +4,16 @@
 use super::*;
 use projcore::DateTime;
 
+/// The Timeline's default height.
 pub(crate) const TIMELINE_H: f32 = 84.;
+/// The ruler and the bar row, the Timeline's content.
+pub(crate) const BAND_H: f32 = RULER_H + BAR_H;
+const PAD_V: f32 = 7.;
+/// The shortest the grip leaves the Timeline: one band and its padding.
+pub(crate) const MIN_TIMELINE_H: f32 = BAND_H + 2. * PAD_V;
+/// The grip under the pane: its height, and the edge strips of the view box.
+const GRIP_H: f32 = 6.;
+const BOX_EDGE_W: f32 = 6.;
 /// The column that carries `TIMELINE` down the pane's left edge.
 const LABEL_W: f32 = 22.;
 const PAD: f32 = 10.;
@@ -172,7 +181,7 @@ impl TimelineSpan {
 
     /// Days since the span's first, where chart offset `x` falls.
     fn day_at(self, scale: GanttScale, x: f32) -> f32 {
-        (scale.origin_day - self.first) as f32 + x / DAY_W
+        (scale.origin_day - self.first) as f32 + x / scale.day_w
     }
 }
 
@@ -255,8 +264,8 @@ pub(crate) fn view_days(
     let last = span.first + span.days - 1;
     let clamp = |d: i64| d.clamp(span.first, last);
     (
-        clamp(scale.origin_day + (gantt_x / DAY_W).floor() as i64),
-        clamp(scale.origin_day + ((gantt_x + gantt_w) / DAY_W).ceil() as i64 - 1),
+        clamp(scale.origin_day + (gantt_x / scale.day_w).floor() as i64),
+        clamp(scale.origin_day + ((gantt_x + gantt_w) / scale.day_w).ceil() as i64 - 1),
     )
 }
 
@@ -280,11 +289,156 @@ pub(crate) fn drag_gantt_x(
     if w <= 0. || lo > hi {
         return start_x;
     }
-    let x = start_x + dx * span.days as f32 * DAY_W / w;
+    let x = start_x + dx * span.days as f32 * scale.day_w / w;
     x.clamp(lo.min(start_x), hi.max(start_x))
 }
 
+/// The view box's edge a drag holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BoxEdge {
+    Left,
+    Right,
+}
+
+/// The press on a box edge: the pointer's x, and the chart's visible span
+/// then as days from the scale's origin.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EdgePress {
+    pub edge: BoxEdge,
+    pub x: f32,
+    pub left: f32,
+    pub right: f32,
+}
+
+/// The zoom after dragging `edge` of the visible span `[left, right)` (days
+/// from the scale's origin) by `dd` days: `(day_w, left)`. The span the box
+/// then covers fills `gantt_w`; the far edge stays put, also when the width
+/// clamps. The moved edge stays inside `[lo, hi]` (the days the Timeline draws,
+/// so the box edge follows the pointer) and the span never shrinks below the
+/// day count the widest zoom shows, or the Timeline's own length if less.
+/// `end` is the scale's last day, the end of the chart's scroll range
+/// (`scale.days`). A Left drag holds the far edge at `right.min(end)`: when the
+/// chart showed days past `end`, its real right edge moves to `end` (the scroll
+/// clamp could not keep it elsewhere) while the drawn box edge, already clamped
+/// to the Timeline, stays put.
+pub(crate) fn drag_edge(
+    edge: BoxEdge,
+    left: f32,
+    right: f32,
+    dd: f32,
+    gantt_w: f32,
+    (lo, hi): (f32, f32),
+    end: f32,
+) -> (f32, f32) {
+    // The span cannot be asked to shrink below what the Timeline holds.
+    let least = (gantt_w.max(1.) / zoom::MAX_DAY_W).min((hi - lo).max(1.));
+    // `left` and `right` are the chart's real edges; the box draws them clamped
+    // to `[lo, hi]`, and the pointer moves that drawn edge. An edge the pointer
+    // has not moved from where it is drawn stays at its real place, so a press
+    // (or an outward drag at the Timeline's end) never changes the zoom.
+    let moved = |real: f32| {
+        let drawn = real.clamp(lo, hi);
+        let target = (drawn + dd).clamp(lo, hi);
+        ((target - drawn).abs() >= 1e-6).then_some(target)
+    };
+    match edge {
+        BoxEdge::Left => {
+            // The far edge is held where the scroll range can: a chart showing
+            // days past the scale's `end` cannot keep its right edge there once
+            // the left one moves, so it is held at `end`.
+            let (l, right) = match moved(left) {
+                Some(target) => (target, right.min(end)),
+                None => (left, right),
+            };
+            let l = l.min(right - least);
+            let day_w = zoom::fit(right - l, gantt_w);
+            (day_w, right - gantt_w / day_w)
+        }
+        BoxEdge::Right => {
+            let r = moved(right).unwrap_or(right).max(left + least);
+            (zoom::fit(r - left, gantt_w), left)
+        }
+    }
+}
+
+/// The Timeline's height for a request `h` in a window `window_h` tall: one band
+/// and its padding at least, half the window at most.
+pub(crate) fn clamp_timeline_h(h: f32, window_h: f32) -> f32 {
+    h.min(window_h / 2.).max(MIN_TIMELINE_H)
+}
+
 impl ProjectView {
+    /// The Timeline's height now.
+    pub fn timeline_height(&self) -> f32 {
+        clamp_timeline_h(self.timeline_h.unwrap_or(TIMELINE_H), self.height)
+    }
+
+    /// Mouse-down on the grip: remember the pointer's `y` and the height.
+    pub fn press_grip(&mut self, y: f32) {
+        self.grip_press = Some((y, self.timeline_height()));
+    }
+
+    /// The pointer is at `y` in a drag of the grip. Without a press, nothing moves.
+    pub fn drag_grip(&mut self, y: f32) {
+        let Some((press, start_h)) = self.grip_press else {
+            return;
+        };
+        self.timeline_h = Some(clamp_timeline_h(start_h + y - press, self.height));
+    }
+
+    /// Double-click on the grip: the default height.
+    pub fn reset_timeline_h(&mut self) {
+        self.timeline_h = None;
+    }
+
+    /// Mouse-down on a box edge at `x`.
+    /// The chart's real edges are kept: it may show days outside the Timeline's
+    /// span (a short plan in a wide chart), where the box is drawn clamped to
+    /// the span; [`drag_edge`] maps the pointer through the drawn edge.
+    pub fn press_timeline_edge(&mut self, edge: BoxEdge, x: f32) {
+        let day_w = self.day_w();
+        let left = self.gantt_x.get() / day_w;
+        self.timeline_edge = Some(EdgePress {
+            edge,
+            x,
+            left,
+            right: left + self.gantt_w / day_w,
+        });
+    }
+
+    /// The Timeline's span as days from the scale's origin.
+    fn timeline_bounds(&self) -> (f32, f32) {
+        let span = TimelineSpan::of(&self.ed);
+        let lo = (span.first - self.scale.origin_day) as f32;
+        (lo, lo + span.days as f32)
+    }
+
+    /// The pointer is at `x` in a drag of a box edge: the edge moves the days
+    /// the pointer has covered since the press and the chart zooms so the box's
+    /// span fills it. Absolute from the press, so nothing accumulates.
+    pub fn drag_timeline_edge(&mut self, x: f32) {
+        let Some(press) = self.timeline_edge else {
+            return;
+        };
+        let span = TimelineSpan::of(&self.ed);
+        let w = ruler_width(self.width);
+        if w <= 0. {
+            return;
+        }
+        let dd = (x - press.x) * span.days as f32 / w;
+        let bounds = self.timeline_bounds();
+        let (day_w, left) = drag_edge(
+            press.edge,
+            press.left,
+            press.right,
+            dd,
+            self.gantt_w,
+            bounds,
+            self.scale.days as f32,
+        );
+        self.set_zoom(day_w, left, 0.);
+    }
+
     pub fn timeline_box(&self) -> (f32, f32) {
         view_box(
             TimelineSpan::of(&self.ed),
@@ -303,6 +457,8 @@ impl ProjectView {
     /// The button came up: the press, and any drag, is over.
     pub fn release_timeline(&mut self) {
         self.timeline_press = None;
+        self.timeline_edge = None;
+        self.grip_press = None;
     }
 
     /// The pointer is at `x` in a drag of the view box: move the chart by the
@@ -353,6 +509,10 @@ pub(crate) fn timeline_state(v: &ProjectView) -> Vec<(String, ctlcore::json::Jso
         ("timeline_view_start".into(), date(first)),
         ("timeline_view_finish".into(), date(last)),
         ("nonworking".into(), Json::Arr(nonworking)),
+        (
+            "timeline_h".into(),
+            Json::Num(f64::from(v.timeline_height())),
+        ),
     ]
 }
 
@@ -362,7 +522,17 @@ pub(crate) fn timeline_state(v: &ProjectView) -> Vec<(String, ctlcore::json::Jso
 /// the frame that takes the mouse-down need not be the one whose payload the
 /// drag uses.
 #[derive(Clone, Copy)]
-struct TimelineDrag(usize);
+struct TimelineDrag(usize, Option<BoxEdge>);
+
+/// The drag payload for the Timeline's grip.
+#[derive(Clone, Copy)]
+struct GripDrag(usize);
+
+impl Render for GripDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
 
 impl Render for TimelineDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -461,7 +631,7 @@ pub(crate) fn timeline_el(
     h_flex()
         .id(("project-timeline", index))
         .relative()
-        .h(px(TIMELINE_H))
+        .h(px(view.timeline_height()))
         .flex_none()
         .bg(pal.panel)
         .border_t_1()
@@ -475,7 +645,23 @@ pub(crate) fn timeline_el(
                 }
                 if let Some(Surface::Project(v)) = this.tabs.get_mut(index).map(|t| &mut t.surface)
                 {
-                    v.drag_timeline(f32::from(e.event.position.x));
+                    match e.drag(cx).1 {
+                        Some(_) => v.drag_timeline_edge(f32::from(e.event.position.x)),
+                        None => v.drag_timeline(f32::from(e.event.position.x)),
+                    }
+                    cx.notify();
+                }
+            },
+        ))
+        .on_drag_move::<GripDrag>(cx.listener(
+            move |this, e: &DragMoveEvent<GripDrag>, window, cx| {
+                cx.set_active_drag_cursor_style(CursorStyle::ResizeUpDown, window);
+                if e.drag(cx).0 != index {
+                    return;
+                }
+                if let Some(Surface::Project(v)) = this.tabs.get_mut(index).map(|t| &mut t.surface)
+                {
+                    v.drag_grip(f32::from(e.event.position.y));
                     cx.notify();
                 }
             },
@@ -540,20 +726,129 @@ pub(crate) fn timeline_el(
                                 // Wherever the button comes up, on the box or off it.
                                 .on_mouse_up(MouseButton::Left, release_timeline(index, cx))
                                 .on_mouse_up_out(MouseButton::Left, release_timeline(index, cx))
-                                .on_drag(TimelineDrag(index), |d, _, _, cx| cx.new(|_| *d)),
+                                .on_drag(TimelineDrag(index, None), |d, _, _, cx| cx.new(|_| *d))
+                                .child(box_edge(
+                                    BoxEdge::Left,
+                                    edge_strip_w(box_w),
+                                    index,
+                                    probes,
+                                    cx,
+                                ))
+                                .child(box_edge(
+                                    BoxEdge::Right,
+                                    edge_strip_w(box_w),
+                                    index,
+                                    probes,
+                                    cx,
+                                )),
                         ),
                 )
-                .child(
-                    div()
-                        .flex()
-                        .flex_1()
-                        .items_center()
-                        .justify_center()
-                        .text_color(pal.dim)
-                        .italic()
-                        .child(PLACEHOLDER),
-                ),
+                .when(view.ed.project().tasks.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .items_center()
+                            .justify_center()
+                            .text_color(pal.dim)
+                            .italic()
+                            .child(PLACEHOLDER),
+                    )
+                }),
         )
+        .child(timeline_grip(index, probes, cx))
+}
+
+/// The width of a box edge strip: 6 px, but a third of a narrow box at most, so
+/// the middle (which pans) is always there.
+pub(crate) fn edge_strip_w(box_w: f32) -> f32 {
+    BOX_EDGE_W.min(box_w / 3.)
+}
+
+/// One of the view box's edge strips, drawn last so it wins over the box. A
+/// drag of it moves that edge of the span and zooms the chart to fit it.
+fn box_edge(
+    edge: BoxEdge,
+    strip_w: f32,
+    index: usize,
+    probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
+    cx: &mut Context<Docxy>,
+) -> impl IntoElement {
+    let name = match edge {
+        BoxEdge::Left => harness::Region::ProjectTimelineBoxLeft,
+        BoxEdge::Right => harness::Region::ProjectTimelineBoxRight,
+    };
+    div()
+        .id((
+            match edge {
+                BoxEdge::Left => "project-timeline-box-left",
+                BoxEdge::Right => "project-timeline-box-right",
+            },
+            index,
+        ))
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .w(px(strip_w))
+        .when(edge == BoxEdge::Left, |d| d.left(px(-1.)))
+        .when(edge == BoxEdge::Right, |d| d.right(px(-1.)))
+        .cursor(CursorStyle::ResizeLeftRight)
+        .child(probe(probes, harness::region_name(name)))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                // The box's own press (a pan) must not also begin.
+                cx.stop_propagation();
+                if let Some(Surface::Project(v)) = this.tabs.get_mut(index).map(|t| &mut t.surface)
+                {
+                    v.press_timeline_edge(edge, f32::from(e.position.x));
+                }
+            }),
+        )
+        .on_mouse_up(MouseButton::Left, release_timeline(index, cx))
+        .on_mouse_up_out(MouseButton::Left, release_timeline(index, cx))
+        .on_drag(TimelineDrag(index, Some(edge)), |d, _, _, cx| {
+            cx.new(|_| *d)
+        })
+}
+
+/// The strip along the Timeline's bottom edge: a drag sets the pane's height,
+/// a double-click restores the default.
+fn timeline_grip(
+    index: usize,
+    probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
+    cx: &mut Context<Docxy>,
+) -> impl IntoElement {
+    div()
+        .id(("project-timeline-grip", index))
+        .absolute()
+        .left_0()
+        .right_0()
+        .bottom(px(-1.))
+        .h(px(GRIP_H))
+        .cursor(CursorStyle::ResizeUpDown)
+        .child(probe(
+            probes,
+            harness::region_name(harness::Region::ProjectTimelineGrip),
+        ))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                if let Some(Surface::Project(v)) = this.tabs.get_mut(index).map(|t| &mut t.surface)
+                {
+                    if e.click_count >= 2 {
+                        v.reset_timeline_h();
+                        cx.notify();
+                    } else {
+                        v.press_grip(f32::from(e.position.y));
+                    }
+                }
+            }),
+        )
+        .on_mouse_up(MouseButton::Left, release_timeline(index, cx))
+        .on_mouse_up_out(MouseButton::Left, release_timeline(index, cx))
+        .on_drag(GripDrag(index), |d, _, _, cx| cx.new(|_| *d))
 }
 
 #[cfg(test)]

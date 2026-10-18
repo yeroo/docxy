@@ -22,7 +22,6 @@ test project task-information/name: focus by click
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call pointer-click {"dialog-field":"name"}
   call field-read {"dialog-field":"name"}
   assert reply.focused is true
@@ -34,7 +33,6 @@ test project task-information/name: focus by Tab
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call pointer-click {"dialog-field":"duration"}
   call field-read {"dialog-field":"name"}
   assert reply.focused is false
@@ -49,7 +47,6 @@ test project task-information/name: types
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call pointer-click {"dialog-field":"name"}
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"Ab1 "}
@@ -64,7 +61,6 @@ test project task-information/name: edits
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call pointer-click {"dialog-field":"name"}
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"abcd"}
@@ -94,7 +90,6 @@ test project task-information/name: select-all replaces
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call pointer-click {"dialog-field":"name"}
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"abcd"}
@@ -113,7 +108,6 @@ test project task-information/name: pastes
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call clipboard {"action":"write","text":"Pasted"}
   call pointer-click {"dialog-field":"name"}
   call real-key {"key":"ctrl+a"}
@@ -128,7 +122,6 @@ test project task-information/name: copies
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call clipboard {"action":"write","text":"before"}
   call pointer-click {"dialog-field":"name"}
   call real-key {"key":"ctrl+a"}
@@ -145,7 +138,6 @@ test project task-information/name: OK applies
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call pointer-click {"dialog-field":"name"}
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"Ab1 "}
@@ -156,7 +148,6 @@ test project task-information/name: OK applies
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call field-read {"dialog-field":"name"}
   assert reply.value is Ab1
   call real-key {"key":"escape"}
@@ -167,7 +158,6 @@ test project task-information/name: Escape cancels
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call pointer-click {"dialog-field":"name"}
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"Esc9"}
@@ -177,7 +167,6 @@ test project task-information/name: Escape cancels
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call field-read {"dialog-field":"name"}
   assert reply.value is not Esc9
   call real-key {"key":"escape"}
@@ -188,7 +177,6 @@ test project task-information/duration: focus by click
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call pointer-click {"dialog-field":"duration"}
   call field-read {"dialog-field":"duration"}
   assert reply.focused is true
@@ -200,7 +188,6 @@ test project task-information/duration: focus by Tab
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call pointer-click {"dialog-field":"name"}
   call field-read {"dialog-field":"duration"}
   assert reply.focused is false
@@ -215,7 +202,6 @@ test project task-information/duration: types
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call pointer-click {"dialog-field":"duration"}
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"3d"}
@@ -230,7 +216,6 @@ test project task-information/duration: edits
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call pointer-click {"dialog-field":"duration"}
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"abcd"}
@@ -260,7 +245,6 @@ test project task-information/duration: select-all replaces
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call pointer-click {"dialog-field":"duration"}
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"abcd"}
@@ -279,7 +263,6 @@ test project task-information/duration: pastes
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call clipboard {"action":"write","text":"Pasted"}
   call pointer-click {"dialog-field":"duration"}
   call real-key {"key":"ctrl+a"}
@@ -294,7 +277,6 @@ test project task-information/duration: copies
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call clipboard {"action":"write","text":"before"}
   call pointer-click {"dialog-field":"duration"}
   call real-key {"key":"ctrl+a"}
@@ -311,7 +293,6 @@ test project task-information/duration: OK applies
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call pointer-click {"dialog-field":"duration"}
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"3d"}
@@ -321,7 +302,6 @@ test project task-information/duration: OK applies
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call field-read {"dialog-field":"duration"}
   assert reply.value is 3d
   call real-key {"key":"escape"}
@@ -332,7 +312,6 @@ test project task-information/duration: Escape cancels
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call pointer-click {"dialog-field":"duration"}
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"Esc9"}
@@ -342,7 +321,6 @@ test project task-information/duration: Escape cancels
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call field-read {"dialog-field":"duration"}
   assert reply.value is not Esc9
   call real-key {"key":"escape"}
@@ -353,8 +331,365 @@ test project task-information/duration: refuses invalid
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
   call pointer-click {"dialog-field":"duration"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"x"}
+  call real-key {"key":"enter"}
+  assert dialog is task-information
+  call real-key {"key":"escape"}
+
+test project task-information/start: focus by click
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call pointer-click {"dialog-field":"start"}
+  call field-read {"dialog-field":"start"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test project task-information/start: focus by Tab
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call pointer-click {"dialog-field":"finish"}
+  call field-read {"dialog-field":"start"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"start"}
+  call field-read {"dialog-field":"start"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test project task-information/start: types
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call pointer-click {"dialog-field":"start"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2026-01-12"}
+  call field-read {"dialog-field":"start"}
+  assert reply.value is 2026-01-12
+  assert reply.caret is 10
+  call real-key {"key":"escape"}
+
+test project task-information/start: edits
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call pointer-click {"dialog-field":"start"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"start"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"start"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"start"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"start"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"start"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test project task-information/start: select-all replaces
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call pointer-click {"dialog-field":"start"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"start"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"start"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test project task-information/start: pastes
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"start"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"start"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test project task-information/start: copies
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"start"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test project task-information/start: OK applies
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call pointer-click {"dialog-field":"start"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2026-01-12"}
+  call real-key {"key":"enter"}
+  assert dialog is not task-information
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call field-read {"dialog-field":"start"}
+  assert reply.value is 2026-01-12
+  call real-key {"key":"escape"}
+
+test project task-information/start: Escape cancels
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call pointer-click {"dialog-field":"start"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not task-information
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call field-read {"dialog-field":"start"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test project task-information/start: refuses invalid
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call pointer-click {"dialog-field":"start"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"x"}
+  call real-key {"key":"enter"}
+  assert dialog is task-information
+  call real-key {"key":"escape"}
+
+test project task-information/finish: focus by click
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call pointer-click {"dialog-field":"finish"}
+  call field-read {"dialog-field":"finish"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test project task-information/finish: focus by Tab
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call pointer-click {"dialog-field":"start"}
+  call field-read {"dialog-field":"finish"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"finish"}
+  call field-read {"dialog-field":"finish"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test project task-information/finish: types
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call pointer-click {"dialog-field":"finish"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2026-01-30"}
+  call field-read {"dialog-field":"finish"}
+  assert reply.value is 2026-01-30
+  assert reply.caret is 10
+  call real-key {"key":"escape"}
+
+test project task-information/finish: edits
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call pointer-click {"dialog-field":"finish"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"finish"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"finish"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"finish"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"finish"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"finish"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test project task-information/finish: select-all replaces
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call pointer-click {"dialog-field":"finish"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"finish"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"finish"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test project task-information/finish: pastes
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"finish"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"finish"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test project task-information/finish: copies
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"finish"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test project task-information/finish: OK applies
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call pointer-click {"dialog-field":"finish"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2026-01-30"}
+  call real-key {"key":"enter"}
+  assert dialog is not task-information
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call field-read {"dialog-field":"finish"}
+  assert reply.value is 2026-01-30
+  call real-key {"key":"escape"}
+
+test project task-information/finish: Escape cancels
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call pointer-click {"dialog-field":"finish"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not task-information
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call field-read {"dialog-field":"finish"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test project task-information/finish: refuses invalid
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  key alt t c
+  assert dialog is task-information
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-tab":"General"}
+  call pointer-click {"dialog-field":"finish"}
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"x"}
   call real-key {"key":"enter"}
@@ -380,7 +715,7 @@ test project task-information/percent: focus by Tab
   assert dialog is task-information
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"name"}
+  call pointer-click {"dialog-field":"start"}
   call field-read {"dialog-field":"percent"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"percent"}
@@ -560,7 +895,7 @@ test project task-information/priority: focus by Tab
   assert dialog is task-information
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"name"}
+  call pointer-click {"dialog-field":"start"}
   call field-read {"dialog-field":"priority"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"priority"}
@@ -719,688 +1054,6 @@ test project task-information/priority: refuses invalid
   call real-type {"text":"x"}
   call field-read {"dialog-field":"priority"}
   assert reply.value is 700
-  call real-key {"key":"escape"}
-
-test project task-information/start: focus by click
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"start"}
-  call field-read {"dialog-field":"start"}
-  assert reply.focused is true
-  call real-key {"key":"escape"}
-
-test project task-information/start: focus by Tab
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"name"}
-  call field-read {"dialog-field":"start"}
-  assert reply.focused is false
-  call real-key {"key":"tab","to-field":"start"}
-  call field-read {"dialog-field":"start"}
-  assert reply.focused is true
-  call real-key {"key":"escape"}
-
-test project task-information/start: types
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"start"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"2026-01-12"}
-  call field-read {"dialog-field":"start"}
-  assert reply.value is 2026-01-12
-  assert reply.caret is 10
-  call real-key {"key":"escape"}
-
-test project task-information/start: edits
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"start"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"abcd"}
-  call real-key {"key":"backspace"}
-  call field-read {"dialog-field":"start"}
-  assert reply.value is abc
-  call real-key {"key":"home"}
-  call field-read {"dialog-field":"start"}
-  assert reply.caret is 0
-  call real-key {"key":"right"}
-  call real-key {"key":"delete"}
-  call field-read {"dialog-field":"start"}
-  assert reply.value is ac
-  call real-key {"key":"end"}
-  call real-key {"key":"left"}
-  call field-read {"dialog-field":"start"}
-  assert reply.caret is 1
-  call real-type {"text":"X"}
-  call field-read {"dialog-field":"start"}
-  assert reply.value is aXc
-  assert reply.caret is 2
-  call real-key {"key":"escape"}
-
-test project task-information/start: select-all replaces
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"start"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"abcd"}
-  call real-key {"key":"ctrl+a"}
-  call field-read {"dialog-field":"start"}
-  assert reply.selection.0 is 0
-  assert reply.selection.1 is 4
-  call real-type {"text":"X"}
-  call field-read {"dialog-field":"start"}
-  assert reply.value is X
-  call real-key {"key":"escape"}
-
-test project task-information/start: pastes
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call clipboard {"action":"write","text":"Pasted"}
-  call pointer-click {"dialog-field":"start"}
-  call real-key {"key":"ctrl+a"}
-  call real-key {"key":"ctrl+v"}
-  call field-read {"dialog-field":"start"}
-  assert reply.value is Pasted
-  call real-key {"key":"escape"}
-
-test project task-information/start: copies
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call clipboard {"action":"write","text":"before"}
-  call pointer-click {"dialog-field":"start"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"abcd"}
-  call real-key {"key":"ctrl+a"}
-  call real-key {"key":"ctrl+c"}
-  call clipboard {"action":"read"}
-  assert reply.text is abcd
-  call real-key {"key":"escape"}
-
-test project task-information/start: OK applies
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"start"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"2026-01-12"}
-  call real-key {"key":"enter"}
-  assert dialog is not task-information
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call field-read {"dialog-field":"start"}
-  assert reply.value is 2026-01-12
-  call real-key {"key":"escape"}
-
-test project task-information/start: Escape cancels
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"start"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"Esc9"}
-  call real-key {"key":"escape"}
-  assert dialog is not task-information
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call field-read {"dialog-field":"start"}
-  assert reply.value is not Esc9
-  call real-key {"key":"escape"}
-
-test project task-information/start: refuses invalid
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"start"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"x"}
-  call real-key {"key":"enter"}
-  assert dialog is task-information
-  call real-key {"key":"escape"}
-
-test project task-information/finish: focus by click
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"finish"}
-  call field-read {"dialog-field":"finish"}
-  assert reply.focused is true
-  call real-key {"key":"escape"}
-
-test project task-information/finish: focus by Tab
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"name"}
-  call field-read {"dialog-field":"finish"}
-  assert reply.focused is false
-  call real-key {"key":"tab","to-field":"finish"}
-  call field-read {"dialog-field":"finish"}
-  assert reply.focused is true
-  call real-key {"key":"escape"}
-
-test project task-information/finish: types
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"finish"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"2026-01-30"}
-  call field-read {"dialog-field":"finish"}
-  assert reply.value is 2026-01-30
-  assert reply.caret is 10
-  call real-key {"key":"escape"}
-
-test project task-information/finish: edits
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"finish"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"abcd"}
-  call real-key {"key":"backspace"}
-  call field-read {"dialog-field":"finish"}
-  assert reply.value is abc
-  call real-key {"key":"home"}
-  call field-read {"dialog-field":"finish"}
-  assert reply.caret is 0
-  call real-key {"key":"right"}
-  call real-key {"key":"delete"}
-  call field-read {"dialog-field":"finish"}
-  assert reply.value is ac
-  call real-key {"key":"end"}
-  call real-key {"key":"left"}
-  call field-read {"dialog-field":"finish"}
-  assert reply.caret is 1
-  call real-type {"text":"X"}
-  call field-read {"dialog-field":"finish"}
-  assert reply.value is aXc
-  assert reply.caret is 2
-  call real-key {"key":"escape"}
-
-test project task-information/finish: select-all replaces
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"finish"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"abcd"}
-  call real-key {"key":"ctrl+a"}
-  call field-read {"dialog-field":"finish"}
-  assert reply.selection.0 is 0
-  assert reply.selection.1 is 4
-  call real-type {"text":"X"}
-  call field-read {"dialog-field":"finish"}
-  assert reply.value is X
-  call real-key {"key":"escape"}
-
-test project task-information/finish: pastes
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call clipboard {"action":"write","text":"Pasted"}
-  call pointer-click {"dialog-field":"finish"}
-  call real-key {"key":"ctrl+a"}
-  call real-key {"key":"ctrl+v"}
-  call field-read {"dialog-field":"finish"}
-  assert reply.value is Pasted
-  call real-key {"key":"escape"}
-
-test project task-information/finish: copies
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call clipboard {"action":"write","text":"before"}
-  call pointer-click {"dialog-field":"finish"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"abcd"}
-  call real-key {"key":"ctrl+a"}
-  call real-key {"key":"ctrl+c"}
-  call clipboard {"action":"read"}
-  assert reply.text is abcd
-  call real-key {"key":"escape"}
-
-test project task-information/finish: OK applies
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"finish"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"2026-01-30"}
-  call real-key {"key":"enter"}
-  assert dialog is not task-information
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call field-read {"dialog-field":"finish"}
-  assert reply.value is 2026-01-30
-  call real-key {"key":"escape"}
-
-test project task-information/finish: Escape cancels
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"finish"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"Esc9"}
-  call real-key {"key":"escape"}
-  assert dialog is not task-information
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call field-read {"dialog-field":"finish"}
-  assert reply.value is not Esc9
-  call real-key {"key":"escape"}
-
-test project task-information/finish: refuses invalid
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"finish"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"x"}
-  call real-key {"key":"enter"}
-  assert dialog is task-information
-  call real-key {"key":"escape"}
-
-test project task-information/predecessors: focus by click
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Predecessors"}
-  call pointer-click {"dialog-field":"predecessors"}
-  call field-read {"dialog-field":"predecessors"}
-  assert reply.focused is true
-  call real-key {"key":"escape"}
-
-test project task-information/predecessors: focus by Tab
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Predecessors"}
-  call real-key {"key":"tab","to-field":"predecessors"}
-  call field-read {"dialog-field":"predecessors"}
-  assert reply.focused is true
-  call real-key {"key":"escape"}
-
-test project task-information/predecessors: types
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Predecessors"}
-  call pointer-click {"dialog-field":"predecessors"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"2"}
-  call field-read {"dialog-field":"predecessors"}
-  assert reply.value is 2
-  assert reply.caret is 1
-  call real-key {"key":"escape"}
-
-test project task-information/predecessors: edits
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Predecessors"}
-  call pointer-click {"dialog-field":"predecessors"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"abcd"}
-  call real-key {"key":"backspace"}
-  call field-read {"dialog-field":"predecessors"}
-  assert reply.value is abc
-  call real-key {"key":"home"}
-  call field-read {"dialog-field":"predecessors"}
-  assert reply.caret is 0
-  call real-key {"key":"right"}
-  call real-key {"key":"delete"}
-  call field-read {"dialog-field":"predecessors"}
-  assert reply.value is ac
-  call real-key {"key":"end"}
-  call real-key {"key":"left"}
-  call field-read {"dialog-field":"predecessors"}
-  assert reply.caret is 1
-  call real-type {"text":"X"}
-  call field-read {"dialog-field":"predecessors"}
-  assert reply.value is aXc
-  assert reply.caret is 2
-  call real-key {"key":"escape"}
-
-test project task-information/predecessors: select-all replaces
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Predecessors"}
-  call pointer-click {"dialog-field":"predecessors"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"abcd"}
-  call real-key {"key":"ctrl+a"}
-  call field-read {"dialog-field":"predecessors"}
-  assert reply.selection.0 is 0
-  assert reply.selection.1 is 4
-  call real-type {"text":"X"}
-  call field-read {"dialog-field":"predecessors"}
-  assert reply.value is X
-  call real-key {"key":"escape"}
-
-test project task-information/predecessors: pastes
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Predecessors"}
-  call clipboard {"action":"write","text":"Pasted"}
-  call pointer-click {"dialog-field":"predecessors"}
-  call real-key {"key":"ctrl+a"}
-  call real-key {"key":"ctrl+v"}
-  call field-read {"dialog-field":"predecessors"}
-  assert reply.value is Pasted
-  call real-key {"key":"escape"}
-
-test project task-information/predecessors: copies
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Predecessors"}
-  call clipboard {"action":"write","text":"before"}
-  call pointer-click {"dialog-field":"predecessors"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"abcd"}
-  call real-key {"key":"ctrl+a"}
-  call real-key {"key":"ctrl+c"}
-  call clipboard {"action":"read"}
-  assert reply.text is abcd
-  call real-key {"key":"escape"}
-
-test project task-information/predecessors: OK applies
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Predecessors"}
-  call pointer-click {"dialog-field":"predecessors"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"2"}
-  call real-key {"key":"enter"}
-  assert dialog is not task-information
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Predecessors"}
-  call field-read {"dialog-field":"predecessors"}
-  assert reply.value is 2
-  call real-key {"key":"escape"}
-
-test project task-information/predecessors: Escape cancels
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Predecessors"}
-  call pointer-click {"dialog-field":"predecessors"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"Esc9"}
-  call real-key {"key":"escape"}
-  assert dialog is not task-information
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Predecessors"}
-  call field-read {"dialog-field":"predecessors"}
-  assert reply.value is not Esc9
-  call real-key {"key":"escape"}
-
-test project task-information/resources: focus by click
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Resources"}
-  call pointer-click {"dialog-field":"resources"}
-  call field-read {"dialog-field":"resources"}
-  assert reply.focused is true
-  call real-key {"key":"escape"}
-
-test project task-information/resources: focus by Tab
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Resources"}
-  call real-key {"key":"tab","to-field":"resources"}
-  call field-read {"dialog-field":"resources"}
-  assert reply.focused is true
-  call real-key {"key":"escape"}
-
-test project task-information/resources: types
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Resources"}
-  call pointer-click {"dialog-field":"resources"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"Ab1 "}
-  call field-read {"dialog-field":"resources"}
-  assert reply.value is "Ab1 "
-  assert reply.caret is 4
-  call real-key {"key":"escape"}
-
-test project task-information/resources: edits
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Resources"}
-  call pointer-click {"dialog-field":"resources"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"abcd"}
-  call real-key {"key":"backspace"}
-  call field-read {"dialog-field":"resources"}
-  assert reply.value is abc
-  call real-key {"key":"home"}
-  call field-read {"dialog-field":"resources"}
-  assert reply.caret is 0
-  call real-key {"key":"right"}
-  call real-key {"key":"delete"}
-  call field-read {"dialog-field":"resources"}
-  assert reply.value is ac
-  call real-key {"key":"end"}
-  call real-key {"key":"left"}
-  call field-read {"dialog-field":"resources"}
-  assert reply.caret is 1
-  call real-type {"text":"X"}
-  call field-read {"dialog-field":"resources"}
-  assert reply.value is aXc
-  assert reply.caret is 2
-  call real-key {"key":"escape"}
-
-test project task-information/resources: select-all replaces
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Resources"}
-  call pointer-click {"dialog-field":"resources"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"abcd"}
-  call real-key {"key":"ctrl+a"}
-  call field-read {"dialog-field":"resources"}
-  assert reply.selection.0 is 0
-  assert reply.selection.1 is 4
-  call real-type {"text":"X"}
-  call field-read {"dialog-field":"resources"}
-  assert reply.value is X
-  call real-key {"key":"escape"}
-
-test project task-information/resources: pastes
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Resources"}
-  call clipboard {"action":"write","text":"Pasted"}
-  call pointer-click {"dialog-field":"resources"}
-  call real-key {"key":"ctrl+a"}
-  call real-key {"key":"ctrl+v"}
-  call field-read {"dialog-field":"resources"}
-  assert reply.value is Pasted
-  call real-key {"key":"escape"}
-
-test project task-information/resources: copies
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Resources"}
-  call clipboard {"action":"write","text":"before"}
-  call pointer-click {"dialog-field":"resources"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"abcd"}
-  call real-key {"key":"ctrl+a"}
-  call real-key {"key":"ctrl+c"}
-  call clipboard {"action":"read"}
-  assert reply.text is abcd
-  call real-key {"key":"escape"}
-
-test project task-information/resources: OK applies
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Resources"}
-  call pointer-click {"dialog-field":"resources"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"Ab1 "}
-  call real-key {"key":"enter"}
-  assert dialog is not task-information
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Resources"}
-  call field-read {"dialog-field":"resources"}
-  assert reply.value is Ab1
-  call real-key {"key":"escape"}
-
-test project task-information/resources: Escape cancels
-  open copy:../fixtures/project-clipboard.xml
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Resources"}
-  call pointer-click {"dialog-field":"resources"}
-  call real-key {"key":"ctrl+a"}
-  call real-type {"text":"Esc9"}
-  call real-key {"key":"escape"}
-  assert dialog is not task-information
-  click C1
-  key alt t c
-  assert dialog is task-information
-  call dialog-catalog-check {}
-  call pointer-click {"dialog-tab":"Resources"}
-  call field-read {"dialog-field":"resources"}
-  assert reply.value is not Esc9
   call real-key {"key":"escape"}
 
 test project task-information/ctype: focus by click
@@ -2021,6 +1674,260 @@ test project task-information/notes: Escape cancels
   call pointer-click {"dialog-tab":"Notes"}
   call field-read {"dialog-field":"notes"}
   assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test project zoom: matches the catalogue
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test project zoom/custom: focus by click
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call pointer-click {"dialog-field":"custom"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test project zoom/custom: focus by Tab
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call real-key {"key":"tab","to-field":"custom"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test project zoom/custom: types
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call pointer-click {"dialog-field":"custom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"30"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.value is 30
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test project zoom/custom: edits
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call pointer-click {"dialog-field":"custom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test project zoom/custom: select-all replaces
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call pointer-click {"dialog-field":"custom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test project zoom/custom: pastes
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"custom"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test project zoom/custom: copies
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"custom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test project zoom/custom: OK applies
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call pointer-click {"dialog-field":"custom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"30"}
+  call real-key {"key":"enter"}
+  assert dialog is not zoom
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call field-read {"dialog-field":"custom"}
+  assert reply.value is 30
+  call real-key {"key":"escape"}
+
+test project zoom/custom: Escape cancels
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call pointer-click {"dialog-field":"custom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not zoom
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call field-read {"dialog-field":"custom"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test project zoom/custom: refuses invalid
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Zoom..."}
+  assert dialog is zoom
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"zoom"}
+  call real-key {"key":"down","times":3}
+  call pointer-click {"dialog-field":"custom"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"30"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"custom"}
+  assert reply.value is 30
+  call real-key {"key":"escape"}
+
+test project timescale: matches the catalogue
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Timescale..."}
+  assert dialog is timescale
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test project timescale/level: focus by click
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Timescale..."}
+  assert dialog is timescale
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"level"}
+  call field-read {"dialog-field":"level"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test project timescale/level: Up and Down step
+  open copy:../fixtures/project-clipboard.xml
+  click C1
+  call menu-open {"target":"chart"}
+  call menu-click {"label":"Timescale..."}
+  assert dialog is timescale
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"level"}
+  call field-read {"dialog-field":"level"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"level"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"level"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"level"}
+  assert reply.index is 1
   call real-key {"key":"escape"}
 
 test project project-filter-menu: matches the catalogue

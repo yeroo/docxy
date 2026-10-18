@@ -49,6 +49,11 @@ test a heading's menu is Project's and selects its column
   # Data Type is disabled for a fixed-type field, which every Entry column is.
   assert reply.items.13.label is Data Type
   assert reply.items.13.enabled is false
+  # The mini formatting toolbar sits above the column menu too (#1537).
+  assert reply.toolbar.0.label is Font
+  assert reply.toolbar.2.label is Bold
+  assert reply.toolbar.2.enabled is true
+  assert reply.toolbar.10.label is Task Details
   call-error menu-click {"label":"Hide Column"} => menu item 'Hide Column' is disabled
   call-error menu-click {"label":"Delete Task"} => no menu item 'Delete Task'
   # Esc closes the menu and leaves the column selected.

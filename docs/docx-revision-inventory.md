@@ -88,10 +88,10 @@ stamped with the time of the edit (UTC), with a `w:id` above every revision and
 comment-marker id in the document.
 
 - **Typing, paste and Replace** record a tracked insertion: ordinary editable
-  text whose runs carry `RunProps::tracked_insert`. Not inside a hyperlink:
-  typing there is not recorded, and a Replace or AutoCorrect there records the
-  deletion of the old text but not the text put in, so Reject All keeps both
-  until insertions inside links are recorded. Consecutive typing extends
+  text whose runs carry `RunProps::tracked_insert`. Inside a hyperlink the
+  insertion is recorded inside the link too (`<w:hyperlink><w:ins>`, a link
+  edge ends an insertion; #1465), for typing and Replace.
+  Consecutive typing extends
   one insertion; a save writes it as one `<w:ins>`; it is listed as one
   revision and Accept / Reject act on all its runs. An insertion that is
   split (Enter, a table or a section break in the middle of it, a
@@ -101,16 +101,22 @@ comment-marker id in the document.
   loaded `w:ins` text is still not addressable by the caret.
 - **Deletions** (Backspace, Delete, Cut, a selection) move the text into a
   `<w:del>` with `<w:delText>`; the editor counts it as zero-width, so the caret
-  steps over it, and adjacent deletions by the author merge into one.
+  steps over it, and adjacent deletions by the author merge into one (a
+  deleted field or picture is a `<w:del>` of its own that never merges, #1242,
+  #1470). A field is written as run-level XML in it (`w:delInstrText`,
+  `w:delText`; a `w:fldSimple` becomes begin/instruction/separate/result/end
+  runs) that Reject restores. A field with a link or other paragraph-level
+  content in its result stays, as an equation does.
   Deleting text inside the author's own insertion removes it outright, as Word
   does. Text deleted inside a hyperlink is recorded inside the link, each
   `<w:del>` on its own side of the link's boundary (#1462).
 - **Undo** of a recorded edit restores the exact prior document in one step
   (typing coalesces into one step as it always has).
 - **Not recorded**, and edited as without tracking: paragraph marks (Enter, and
-  Backspace / Delete across a paragraph boundary), typing inside a hyperlink, a
-  field or other one-unit inline, formatting, table structure and a table cell
-  range's Delete. A selection across paragraphs records the deletion of its
+  Backspace / Delete across a paragraph boundary), an Update Field or Edit
+  Field rewrite (#1241), inserting an equation (a tracked delete keeps one in
+  place), formatting, table structure and a table
+  cell range's Delete. A selection across paragraphs records the deletion of its
   text in each paragraph (the paragraphs of a table between them included; the
   table stays) and keeps the paragraph marks. Text deleted from another
   reviewer's recorded insertion stays inside it (`<w:ins><w:del>`), so Reject

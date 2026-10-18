@@ -508,8 +508,18 @@
   rows; yppxy's actions go through `shown_selected_uid`.
 - The suite's drop-down is a dialog like the sheet's filter button
   (`project-filter-menu`, `DialogOwner::ProjectFilter`, `project/autofilter.rs`),
-  not a `MenuTarget`: Sort items (words by column type) apply and close, Group
-  by and Filters are drawn disabled (follow-ups), `Clear Filter from <Field>`
+  not a `MenuTarget`, drawn as Project's popup (#1607, `Dialog::popup`): no
+  title and an undimmed backdrop (it blocks the window like any modal), 250 px wide under the heading's arrow (`place`: flipped
+  above when the room below cannot hold the menu and a usable list, clamped into
+  the window both ways so OK / Cancel stay on screen; anchored on the frame on
+  screen's `project-heading:<col>` probe, its left edge clamped into the table pane), `Apply` buttons as
+  menu rows (icon, `▸`, rule above) in Project's order (Sort asc/desc, Group by
+  ▸, No Group, Clear Filter, Filters ▸), the value list with a scrollbar, then
+  OK / Cancel; a press outside presses Cancel and Escape closes it.
+  `menu-read` and `menu-open` answer alike from the dialog (`items` with
+  `{"separator":true}` entries, `controls`, `buttons` = OK / Cancel).
+  Sort items (words by column type) apply and close, Group
+  by, No Group and Filters are drawn disabled (follow-ups), `Clear Filter from <Field>`
   is enabled only while filtered, the checklist is the dialog check list (a
   Year > Month > Day tree on dates, two-state boxes), OK applies (all checked
   is no filter; none is refused), Cancel discards. `menu-open {"target":
@@ -605,7 +615,7 @@
   on a Gantt bar does not open it (the bar has only a right-press handler).
 - Each field is the grid cell's own text (`cell_edit_text` to prefill,
   `apply_cell` to write), so Predecessors and Resources are one text field each
-  in the column's grammar, not tables. Notes is one line, `\n` = new line (no
+  in the column's grammar, not tables (until #1536, below). Notes is one line, `\n` = new line (no
   multiline control). Constraint type + date go through `Editor::set_constraint_typed`
   (the date resolved by `parse_stamp`); the
   date follows the type (ASAP and ALAP disable it).
@@ -625,6 +635,71 @@
   `set_priority`, `set_deadline`, `set_task_type`, `set_effort_driven`) are in
   `projcore/src/editor/props.rs`. The old `task-info` input of `inputs.rs` is
   gone; `uiharness/cases/project-task-info.uit` drives the dialog by hand.
+
+## Task Information: top row, grids and date combos (#1536)
+
+- Name, Duration and Estimated have `page: None`: one control each, drawn on
+  every page. Estimated is the duration's `?`, not a value of its own: ticking
+  it adds the mark to the Duration text, clearing it removes it, typing the
+  mark ticks the box (`follow_estimated`, `react`), so only `duration` is
+  written (a blank duration refuses the tick). General adds Schedule Mode
+  (`set_manual`, applied first), Inactive (`set_active`, which refuses under
+  an inactive summary), Display on Timeline, Hide Bar and Rollup
+  (`Editor::set_display_on_timeline`/`set_hide_bar`/`set_rollup`, one undo step
+  each, off when absent) and a Help button (`id == "help"`, drawn bottom
+  left) that says what F1 says (`help_tab::DOCS_COMING`, #1022) and writes
+  nothing. Display on Timeline, Hide Bar and Rollup are stored; nothing draws
+  or reads them yet (the Timeline pane does not consult Display on Timeline). MSPDI has no Display on Timeline element, so it is saved only in
+  the `.yppx` package's `timeline.xml` part (`projcore::timeline`, written only
+  when a task states a value, an unreadable one kept as a retained extra like
+  `tableview.xml`).
+- `Control::editable_grid` makes a built-in grid interactive as a UI plugin's
+  is (#1602): rows select, cells are typed into, Enter commits. It keeps
+  exactly one blank row last (`keep_blank_row`, so an untouched grid equals
+  the opened one and `Dialog::changed` is false), and Delete removes the
+  selected row (a plugin grid's clears the cell). Column kinds: `Combo`
+  (`Control::column_items`: typing narrows the list drawn under the grid, the
+  arrows reach into it (`pick`), Enter takes the pick, a click on an item
+  commits it, a text naming one item exactly (case aside) becomes it, any
+  other text stays as typed: a new resource named Ann beside a Joanne is new;
+  only a pick completes it), `Dropdown` (Space or a click steps the
+  cell; typed text must name one item, or be contained in only one), and `Label` (read-only: `dialog-set`
+  refuses it and typing starts nothing). All three apply to an editable grid
+  only; a plugin grid's columns store what is typed. A cell being typed into
+  is committed by Up/Down, a click elsewhere, Tab, a tab change and OK
+  (`commit_pending`; a refusal keeps the edit and the dialog open). A pick
+  carries its item's index (`Control::picked`), so of two tasks with one name
+  the one picked is linked.
+- `ControlKind::DateCombo` is typed as `Date`; its ▾ button, Alt+Down or F4
+  opens `dialog::calendar::Calendar` (month grid, Sunday first) under the
+  field: arrows move the cursor a day or a week, Page Up/Down a month, Enter
+  or a click on a day writes `YYYY-MM-DD` into the field, Escape or Tab closes
+  it (Enter and Escape are the calendar's while it is open,
+  `DialogStack::key_button`). `dialog-read` reports `calendar_open` and
+  `calendar` (`control`, `month`, `day`). `pointer-click` takes
+  `dialog-calendar` (`button:<field>`, `prev:<field>`, `next:<field>`,
+  `day:<field>:<n>`) and `dialog-cell` (`name[row].column heading in lower
+  case`, or `name[suggest].<n>` for a narrowed combo list's item). A control
+  with `beside` shares the row of the one before it (Duration/Estimated,
+  Start/Finish).
+- The Predecessors grid (`project/task_info/preds.rs`) has ID, Task Name,
+  Type and Lag. A name fills the ID and an ID the name (`follow`, from the
+  ID column's `column_items`, which line up with the names); OK reads the rows
+  with the cell's own grammar (`parse_task_predecessors` for the ID, so a
+  cross-project reference and `?uid` work; `parse_lag` for the lag) and keeps
+  a link whose task, type and lag are as stored exactly as stored (lag format,
+  cross-project fields) when its lag is spelled as shown or parses to the
+  stored format (`16h` for `2d`, or `2d?`, is an edit). `set_predecessors` refuses a cycle, a duplicate or a
+  self link, and the dialog stays open. The Resources grid
+  (`project/task_info/resources.rs`) has Resource Name, Assignment Owner
+  (`assn_owner`) and Cost read-only, Units typed; OK turns the rows into the
+  Resource Names cell's tokens (`Ann`, `Bo[50%]`, `Cement[5 tons]`; 100% is the
+  bare name) and applies them through `set_resources`, so a row left as shown
+  changes nothing and a new name makes a resource. Rows without a name are
+  ignored. The old text fields (`predecessors`, `resources`) are gone from
+  the catalogue; the grids are not catalogued fields (`Grid` is not an editable
+  kind). The `project-task-info.uit` cases were written without being run on
+  macOS, like the others.
 
 ## Terminal docxy prompts edit at a caret (#1372)
 
@@ -758,3 +833,73 @@
   `selected_columns`, `selected_rows`, `filled_cells` (`"<row>:<column>"`),
   `hot_headings`, `cursor_border` and `table_fits`;
   `uiharness/cases/project-selection.uit` (not run on macOS).
+
+## Project timescale and Timeline pane (#1535)
+
+- `GanttScale` carries `day_w` (px per day); `DEFAULT_DAY_W` (22, the Days
+  level) is only its initial value, and no geometry reads it. The view's zoom is
+  `ProjectView::zoom_day_w` (`None` = default): view state like `split`, never
+  saved or undone. Every change goes through `ProjectView::set_zoom(day_w,
+  anchor_day, anchor_px)`, which clamps to 0.25..96, refreshes the scale and
+  re-derives `gantt_x` from the anchor date; the plugin overlay's cache key
+  includes `day_w`. `gantt_w` never depends on the zoom.
+- `project/zoom.rs` holds the pure maths: `LEVELS` (Years, Half Years, Quarters,
+  Months, Thirds of Months, Weeks, Days) with their (major, minor) `Unit`s,
+  `nearest`/`step`/`fit`, and `tier`/`tiers` (header cells, labels fitted to
+  their width). The header is two 14 px tiers inside the old 28 px row. Hours
+  and Minutes are listed in the Timescale list and cannot be chosen (bars are
+  whole-day geometry); day lines draw from 8 px/day and non-working days are
+  shaded as merged runs from 3 px/day. Zoom In/Out step one level around the
+  left edge; Ctrl+wheel (Ctrl on every platform; the rows' scroll is put back)
+  steps around the pointer; Entire Project and Selected Tasks fit a span to the
+  chart. A free width shows as `Custom (<nearest level>)`.
+- Dragging a Timeline view-box edge (`BoxEdge`, 6 px strips drawn last, region
+  `project-timeline-box-left/right`) moves that boundary and sets the zoom so
+  the box's span fills the chart (`drag_edge`; the other edge stays put, also at
+  the zoom clamp, except that a Left drag on a chart showing days past the
+  scale's end moves its real right edge to that end while the drawn edge stays put); the middle still pans. The grip under the pane (`project-timeline-grip`)
+  sets `ProjectView::timeline_h` (`MIN_TIMELINE_H` = one band plus padding, 60;
+  at most half the window, `ProjectView::height`); a double-click restores 84.
+  Like `split` it lives for the window session and is not written to disk. The
+  Timeline's "Add tasks with dates to the timeline" placeholder now shows only
+  for a plan with no tasks: it used to sit clipped below the bar row, which a
+  taller pane would have exposed over a plan that has tasks.
+- Ctrl+wheel: every delta sums in `wheel_acc` and steps one level per
+  `WHEEL_STEP` (40 px); only a whole-line delta (|lines| >= 1) is a notch that
+  steps at once, fractional lines (hi-res wheels, touchpads) sum, and touch
+  phases Started/Ended clear the sum. The chart takes every Ctrl+wheel event
+  over it (`WheelZoom::Absorbed`/`Stepped`) and puts the rows' scroll back, so a
+  swipe never scrolls the rows. A view-box edge drag is measured against the edges as the box
+  draws them (clamped to the Timeline's span) and moves within the span.
+- The chart menu opens the Timescale and Zoom dialogs (`project/zoom_dialogs.rs`,
+  `DialogOwner::Zoom`/`Timescale`, catalogue ids `zoom`, `timescale`). The
+  Timescale dialog's tier rows are read-only (Count is 1): the tier editor and
+  the non-working-time page are not built.
+
+## Project row menu and mini toolbar (#1537)
+
+- `project_row_menu` lists Project 2024's task row items in its order, Notes...
+  kept: Cut, Copy, Paste, Paste Special..., Scroll to Task, Insert/Delete/
+  Inactivate Task, Manually/Auto Schedule, Assign Resources..., Text Styles...,
+  Information..., Notes..., Add to Timeline, Link. Fill Down, Clear Contents
+  and Font... are not row items (Ctrl+D stays; `ProjectAct::ClearContents` was
+  removed, nothing else reached it); `Link` is `ProjectAct::Hyperlink` (the bar menu keeps
+  `Hyperlink...`). Paste Special..., Text Styles... and Add to Timeline are
+  disabled placeholders until #1389/#1390/#1391.
+- `Menu::toolbar` (`menu::ToolbarItem`: an `Entry` plus `ToolbarKind`
+  combo/button/arrow and a combo's `value`) is the mini formatting toolbar
+  drawn above the row and column-heading menus (`project_toolbar`, opened by
+  `open_menu_with_toolbar`); every other menu has none. `menu-read`/`menu-open`
+  report `toolbar: [{id,label,kind,enabled,checked,value?,submenu?}]` (`[]`
+  when absent). `menu-click {"label"}` or `{"path":["Font Color","Red"]}`
+  finds a toolbar label first; a drop-down's choices replace the items
+  (`Menu::enter_toolbar`, depth 1, the toolbar hidden) and Esc/Left backs out.
+- Formatting items are `ProjectAct::CellStyle(StyleEdit)`: one
+  `Editor::edit_formatting` over the selected cells (the range, else the
+  cursor cell, real tasks only; the range survives), merged into each cell's
+  direct `TextStyle`; a choice that changes no cell records no step.
+  Bold/Italic set every cell to the opposite of the cursor cell's effective
+  value (row categories under the cell's own, a summary bold), which is also
+  what the toolbar's ticks and combo values show. The lists are fixed (8 fonts, sizes 8 to 72, 8 colours): the
+  suite has no font enumeration. The task buttons dispatch AddLink,
+  UnlinkTasks, Outdent, Indent and Task Details (`Constraint`).

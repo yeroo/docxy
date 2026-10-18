@@ -8,7 +8,9 @@
 //! refused leaves the plan exactly as it was with the dialog open.
 use super::*;
 use crate::dialog::catalog;
-use crate::dialog::{Control, ControlKind, Dialog, DialogOwner, Reaction, Value};
+use crate::dialog::{
+    Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Reaction, Value,
+};
 use crate::page_setup::{choice, chosen, ok_cancel, text_of};
 use projcore::DateTime;
 use projcore::editor::{
@@ -69,6 +71,21 @@ fn field(name: &'static str, label: &str, kind: ControlKind, text: String, page:
     c
 }
 
+/// A control drawn on every page: the top row (#1536).
+fn top_field(name: &'static str, label: &str, kind: ControlKind, text: String) -> Control {
+    let mut c = Control::new(name, label, kind, Value::Text(text));
+    c.page = None;
+    c
+}
+
+fn check(name: &'static str, label: &str, on: bool, page: usize) -> Control {
+    let mut c = Control::new(name, label, ControlKind::Checkbox, Value::Bool(on));
+    c.page = Some(page);
+    c
+}
+
+const MODES: [&str; 2] = ["Manually Scheduled", "Auto Scheduled"];
+
 /// The dialog for task `uid`, opened on `page`. A blank row has no task to
 /// describe.
 pub(crate) fn task_info_dialog(
@@ -103,14 +120,61 @@ pub(crate) fn task_info_dialog(
         .unwrap_or(0);
     let effort = task.effort_driven.unwrap_or(proj.new_tasks_effort_driven());
     d.controls = vec![
-        field("name", "&Name:", ControlKind::Text, text(COL_NAME), 0),
-        field(
+        top_field("name", "&Name:", ControlKind::Text, text(COL_NAME)),
+        top_field(
             "duration",
             "&Duration:",
             ControlKind::Duration,
             text(COL_DURATION),
+        ),
+        {
+            let mut c = check(
+                "estimated",
+                "&Estimated",
+                text(COL_DURATION).trim_end().ends_with('?'),
+                0,
+            );
+            c.page = None;
+            c.beside = true;
+            c
+        },
+        choice(
+            "mode",
+            "Schedule Mode:",
+            ControlKind::Radio,
+            &MODES,
+            Some(usize::from(!task.manual)),
+            Some(0),
+        ),
+        check("inactive", "&Inactive", !task.is_active(), 0),
+        {
+            let mut c = Control::new(
+                "dates",
+                "Dates",
+                ControlKind::Label,
+                Value::Text(String::new()),
+            );
+            c.page = Some(0);
+            c
+        },
+        field(
+            "start",
+            "&Start:",
+            ControlKind::DateCombo,
+            text(COL_START),
             0,
         ),
+        {
+            let mut c = field(
+                "finish",
+                "&Finish:",
+                ControlKind::DateCombo,
+                text(COL_FINISH),
+                0,
+            );
+            c.beside = true;
+            c
+        },
         field(
             "percent",
             "&Percent complete:",
@@ -118,29 +182,27 @@ pub(crate) fn task_info_dialog(
             task.percent_complete.unwrap_or(0).to_string(),
             0,
         ),
-        field(
-            "priority",
-            "P&riority:",
-            ControlKind::Number,
-            task.priority.unwrap_or(PRIORITY_DEFAULT).to_string(),
+        {
+            let mut c = field(
+                "priority",
+                "P&riority:",
+                ControlKind::Number,
+                task.priority.unwrap_or(PRIORITY_DEFAULT).to_string(),
+                0,
+            );
+            c.beside = true;
+            c
+        },
+        check(
+            "ontimeline",
+            "Display on &Timeline",
+            task.display_on_timeline.unwrap_or(false),
             0,
         ),
-        field("start", "&Start:", ControlKind::Date, text(COL_START), 0),
-        field("finish", "&Finish:", ControlKind::Date, text(COL_FINISH), 0),
-        field(
-            "predecessors",
-            "&Predecessors:",
-            ControlKind::Text,
-            text(COL_PREDECESSORS),
-            1,
-        ),
-        field(
-            "resources",
-            "&Resource names:",
-            ControlKind::Text,
-            text(COL_RESOURCES),
-            2,
-        ),
+        check("hidebar", "&Hide Bar", task.hide_bar.unwrap_or(false), 0),
+        check("rollup", "Roll&up", task.rollup.unwrap_or(false), 0),
+        preds::grid(proj, task),
+        resources::grid(ed, task),
         choice(
             "ctype",
             "Constraint &type:",
@@ -207,8 +269,11 @@ pub(crate) fn task_info_dialog(
         enabled(&mut d, name, !read_only(col));
     }
     enabled(&mut d, "percent", !task.summary);
+    enabled(&mut d, "estimated", !read_only(COL_DURATION));
     enabled(&mut d, "cdate", needs_date(task.constraint));
     d.buttons = ok_cancel();
+    // Help (#1536) sits at the bottom left; it says what F1 says.
+    d.buttons.insert(0, Button::new("&Help", ButtonRole::Apply));
     d.react = Some(Reaction(react));
     d.mark_opened();
     Ok(d)
@@ -229,10 +294,26 @@ pub(crate) fn task_info_dialog_for(
     Ok(d)
 }
 
-/// ASAP and ALAP take no date: the constraint date field follows the type.
-fn react(d: &mut Dialog, i: usize, _before: &Value) {
-    if d.controls[i].name != "ctype" {
-        return;
+/// A control changed (`before` is its old value): ASAP and ALAP take no date,
+/// so the constraint date field follows the type; Estimated and the
+/// Duration's `?` follow each other; a Predecessors or Resources grid cell
+/// fills its row's other cells ([`preds::follow`], [`resources::follow`]).
+fn react(d: &mut Dialog, i: usize, before: &Value) {
+    match d.controls[i].name {
+        "ctype" => {}
+        "predecessors" => return preds::follow(d, i, before),
+        "resources" => return resources::follow(d, i, before),
+        // Estimated is the duration's `?`: ticking it adds the mark, clearing
+        // it removes it, and typing the mark (or not) follows in the box.
+        "estimated" => return follow_estimated(d, i),
+        "duration" => {
+            let marked = d.controls[i].text().trim_end().ends_with('?');
+            if let Some(c) = d.controls.iter_mut().find(|c| c.name == "estimated") {
+                c.value = Value::Bool(marked);
+            }
+            return;
+        }
+        _ => return,
     }
     let on = match &d.controls[i].value {
         Value::Choice(Some(k)) => CONSTRAINTS.get(*k).is_some_and(|(c, _)| needs_date(*c)),
@@ -241,6 +322,22 @@ fn react(d: &mut Dialog, i: usize, _before: &Value) {
     if let Some(c) = d.controls.iter_mut().find(|c| c.name == "cdate") {
         c.enabled = on;
     }
+}
+
+/// The Estimated box `i` changed: put its mark on the duration text, or take
+/// it off. A blank duration has nothing to estimate, so the box clears.
+fn follow_estimated(d: &mut Dialog, i: usize) {
+    let on = d.controls[i].value == Value::Bool(true);
+    let Some(j) = d.controls.iter().position(|c| c.name == "duration") else {
+        return;
+    };
+    let text = d.controls[j].text();
+    let bare = text.trim_end().trim_end_matches('?').trim_end().to_string();
+    if on && bare.is_empty() {
+        d.controls[i].value = Value::Bool(false);
+        return;
+    }
+    d.controls[j].value = Value::Text(if on { format!("{bare}?") } else { bare });
 }
 
 /// Whether a constraint's date-only form means the end of that day: the
@@ -339,6 +436,25 @@ pub(crate) fn apply_task_info_in(
         if changed("effort") {
             ed.set_effort_driven(uid, d.value("effort") == Some(&Value::Bool(true)))?;
         }
+        // The schedule mode first: a manual task takes Start and Finish
+        // together, and the dates below are typed in the mode chosen.
+        if changed("mode") {
+            let manual = chosen(d, "mode") == Some(0);
+            ed.set_manual(uid, manual)?;
+        }
+        if changed("inactive") {
+            ed.set_active(uid, d.value("inactive") != Some(&Value::Bool(true)))?;
+        }
+        let on = |name: &str| d.value(name) == Some(&Value::Bool(true));
+        if changed("ontimeline") {
+            ed.set_display_on_timeline(uid, on("ontimeline"))?;
+        }
+        if changed("hidebar") {
+            ed.set_hide_bar(uid, on("hidebar"))?;
+        }
+        if changed("rollup") {
+            ed.set_rollup(uid, on("rollup"))?;
+        }
         if changed("start")
             && changed("finish")
             && !ed.project().task(uid).is_some_and(|t| t.manual)
@@ -352,14 +468,25 @@ pub(crate) fn apply_task_info_in(
         for (name, col) in [
             ("name", COL_NAME),
             ("duration", COL_DURATION),
-            ("predecessors", COL_PREDECESSORS),
-            ("resources", COL_RESOURCES),
             ("start", COL_START),
             ("finish", COL_FINISH),
         ] {
             if changed(name) {
                 apply_cell(ed, uid, col, &text_of(d, name))?;
             }
+        }
+        if changed("predecessors") {
+            let Some(Value::Rows(rows)) = d.value("predecessors") else {
+                return Err("The Predecessors grid has no rows".into());
+            };
+            let links = preds::parse(ed, uid, rows)?;
+            ed.set_predecessors(uid, links)?;
+        }
+        if changed("resources") {
+            let Some(Value::Rows(rows)) = d.value("resources") else {
+                return Err("The Resources grid has no rows".into());
+            };
+            ed.set_resources(uid, &resources::tokens(ed, rows))?;
         }
         if changed("percent") {
             ed.set_percent_complete(uid, whole(d, "percent", "% Complete", 0, 100)?)?;
@@ -402,6 +529,22 @@ pub(crate) fn apply_task_info_in(
         Ok(())
     })()
 }
+
+/// Task Information's Help button (#1536): what F1 says, the documentation
+/// being #1022, and the dialog stays as it is. `None` for any other press.
+pub(crate) fn help_click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>> {
+    let top = tab.dialogs.top()?;
+    if !matches!(top.owner, DialogOwner::TaskInfo { .. })
+        || crate::dialog::fold_label(button) != "help"
+    {
+        return None;
+    }
+    tab.status = crate::help_tab::DOCS_COMING.into();
+    Some(Ok(()))
+}
+
+mod preds;
+mod resources;
 
 #[cfg(test)]
 mod tests;

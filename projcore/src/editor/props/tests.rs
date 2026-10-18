@@ -126,6 +126,35 @@ fn task_type_and_effort_driven_round_trip_and_undo() {
 }
 
 #[test]
+fn bar_flags_set_undo_and_ignore_an_unchanged_value() {
+    let mut ed = editor();
+    assert_eq!(ed.set_hide_bar(2, false), Ok(false));
+    assert_eq!(ed.set_rollup(2, false), Ok(false));
+    assert_eq!(ed.set_display_on_timeline(2, false), Ok(false));
+    assert_eq!(ed.undo_depth(), 0);
+    assert_eq!(ed.set_hide_bar(2, true), Ok(true));
+    assert_eq!(ed.set_rollup(2, true), Ok(true));
+    assert_eq!(ed.set_display_on_timeline(2, true), Ok(true));
+    assert_eq!(ed.set_hide_bar(2, true), Ok(false));
+    assert_eq!(ed.undo_depth(), 3);
+    let task = ed.project().task(2).unwrap();
+    assert_eq!(
+        (task.hide_bar, task.rollup, task.display_on_timeline),
+        (Some(true), Some(true), Some(true))
+    );
+    let back = round_trip(&ed);
+    assert_eq!(back.task(2).unwrap().hide_bar, Some(true));
+    assert_eq!(back.task(2).unwrap().rollup, Some(true));
+    assert!(ed.undo() && ed.undo() && ed.undo());
+    let task = ed.project().task(2).unwrap();
+    assert_eq!(
+        (task.hide_bar, task.rollup, task.display_on_timeline),
+        (None, None, None)
+    );
+    assert!(ed.set_hide_bar(99, true).is_err());
+}
+
+#[test]
 fn a_batch_of_property_edits_is_one_undo_step_and_an_error_applies_none() {
     let mut ed = editor();
     ed.batch(|ed| {

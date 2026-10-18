@@ -135,6 +135,10 @@ fn apply_dialog(
             crate::project::apply_task_info(&mut v.ed, uid, dialog)?;
             Ok(false)
         }
+        // Applied in `dialog_click`, which also puts the status on the tab.
+        DialogOwner::Zoom | DialogOwner::Timescale => {
+            Err("Zoom and Timescale apply through dialog_click".into())
+        }
         // Handled in `plugin_ui::dialog_click`, before this: OK sends the
         // plugin its command again with the values.
         DialogOwner::Plugin { .. } => Err("a plugin's dialog applies through its OK".into()),
@@ -425,6 +429,10 @@ fn dialog_press(tab: &mut DocTab, button: &str) -> Result<(), String> {
     if let Some(done) = crate::design_dialogs::click(tab, button) {
         return done;
     }
+    // Task Information's Help (#1536).
+    if let Some(done) = crate::project::help_click(tab, button) {
+        return done;
+    }
     // A UI plugin's dialog, or Task Information with plugin pages (#1532).
     if let Some(done) = crate::plugin_ui::dialog_click(tab, button) {
         return done;
@@ -437,7 +445,20 @@ fn dialog_press(tab: &mut DocTab, button: &str) -> Result<(), String> {
         ..
     } = tab;
     let mut changed = false;
+    let mut status = None;
     dialogs.click(button, |d| {
+        // The Gantt's zoom is view state: its OK says the new timescale.
+        if matches!(d.owner, DialogOwner::Zoom | DialogOwner::Timescale) {
+            let Surface::Project(v) = surface else {
+                return Err("this dialog belongs to a Project".into());
+            };
+            status = Some(if d.owner == DialogOwner::Zoom {
+                crate::project::apply_zoom(v, d)?
+            } else {
+                crate::project::apply_timescale(v, d)?
+            });
+            return Ok(());
+        }
         changed = apply_dialog(
             surface,
             pkg.as_mut(),
@@ -450,6 +471,9 @@ fn dialog_press(tab: &mut DocTab, button: &str) -> Result<(), String> {
         tab.set_dirty();
     }
     complete_project(tab, true);
+    if let Some(status) = status {
+        tab.status = status.into();
+    }
     Ok(())
 }
 
@@ -508,6 +532,15 @@ pub(crate) fn edit_key(
         return Ok(());
     };
     if m.alt {
+        // Alt+Down drops a date combo's calendar down, as in Windows (#1536).
+        if key == "down"
+            && let Some(i) = d
+                .focused()
+                .filter(|c| c.kind == dialog::ControlKind::DateCombo)
+                .and(d.focus)
+        {
+            return d.toggle_calendar(i);
+        }
         return Ok(());
     }
     if m.control || m.platform {
@@ -541,6 +574,19 @@ pub(crate) fn edit_key(
             _ => None,
         }
     });
+    // F4 (Alt+Down was returned above) drops a date combo's calendar down;
+    // an open one takes the arrows, Page Up and Down, Enter and Escape (#1536).
+    if d.calendar_key(key)? {
+        return Ok(());
+    }
+    if key == "f4"
+        && let Some(i) = d
+            .focused()
+            .filter(|c| c.kind == dialog::ControlKind::DateCombo)
+            .and(d.focus)
+    {
+        return d.toggle_calendar(i);
+    }
     // A focused grid takes the arrows, Space, typing, Enter and Escape of a
     // cell edit, Backspace and Delete (#1602).
     if d.grid_key(key, typed.as_deref())? {
@@ -548,6 +594,7 @@ pub(crate) fn edit_key(
     }
     match key {
         "tab" => {
+            d.commit_pending()?;
             d.focus_step(m.shift);
             Ok(())
         }
@@ -901,6 +948,109 @@ impl Docxy {
         cx.notify();
     }
 
+    /// A press in the calendar of date combo `index` (#1536).
+    fn dialog_calendar(&mut self, index: usize, act: CalendarAct, cx: &mut Context<Self>) {
+        let done = self
+            .active_dialogs_mut()
+            .top_dialog_mut()
+            .and_then(|d| match act {
+                CalendarAct::Toggle => d.toggle_calendar(index),
+                CalendarAct::Month(n) => d.calendar_move(n, true),
+                CalendarAct::Day(day) => d.calendar_day(day),
+            });
+        if let Err(e) = done {
+            self.set_status(e);
+        }
+        self.dialog_touched();
+        cx.notify();
+    }
+
+    /// The month a date combo's calendar shows: its title between the
+    /// previous and next month buttons, the weekday headings, and the days,
+    /// the cursor's shaded and today's outlined.
+    fn calendar_popup(
+        &self,
+        i: usize,
+        name: &'static str,
+        k: dialog::calendar::Calendar,
+        pal: Pal,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let today = dialog::calendar::today();
+        let step = |id: &'static str, label: &'static str, by: i32, cx: &mut Context<Self>| {
+            div()
+                .id((id, i))
+                .relative()
+                .px_2()
+                .cursor_pointer()
+                .child(probe(&self.probes, format!("dialog-calendar:{id}:{name}")))
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.dialog_calendar(i, CalendarAct::Month(by), cx)
+                }))
+        };
+        let mut rows = Vec::new();
+        for (w, week) in k.weeks().into_iter().enumerate() {
+            let mut days = Vec::new();
+            for (n, day) in week.into_iter().enumerate() {
+                let cell = div()
+                    .relative()
+                    .w(px(26.))
+                    .h(px(18.))
+                    .flex()
+                    .justify_center();
+                days.push(match day {
+                    None => cell.into_any_element(),
+                    Some(day) => cell
+                        .id(("dialog-calendar-day", (i * 8 + w) * 8 + n))
+                        .cursor_pointer()
+                        .when(day == k.day(), |c| c.bg(hsla_u(BRAND).opacity(0.35)))
+                        .when(k.is_today(day, today), |c| {
+                            c.border_1().border_color(hsla_u(BRAND))
+                        })
+                        .child(probe(
+                            &self.probes,
+                            format!("dialog-calendar:day:{name}:{day}"),
+                        ))
+                        .child(SharedString::from(day.to_string()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.dialog_calendar(i, CalendarAct::Day(day), cx)
+                        }))
+                        .into_any_element(),
+                });
+            }
+            rows.push(h_flex().children(days));
+        }
+        v_flex()
+            .id(("dialog-calendar", i))
+            .relative()
+            .p_1()
+            .gap_1()
+            .border_1()
+            .border_color(pal.dim)
+            .bg(pal.panel)
+            .child(probe(&self.probes, format!("dialog-calendar:popup:{name}")))
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(step("prev", "\u{25C0}", -1, cx))
+                    .child(SharedString::from(k.title()))
+                    .child(step("next", "\u{25B6}", 1, cx)),
+            )
+            .child(
+                h_flex().children(dialog::calendar::WEEKDAYS.iter().map(|w| {
+                    div()
+                        .w(px(26.))
+                        .flex()
+                        .justify_center()
+                        .text_color(pal.dim)
+                        .child(*w)
+                })),
+            )
+            .children(rows)
+            .into_any_element()
+    }
+
     /// A press on the top dialog's tab strip.
     fn dialog_tab_click(&mut self, label: &str, cx: &mut Context<Self>) {
         if let Err(e) = self.active_dialogs_mut().select_tab(label) {
@@ -1105,11 +1255,13 @@ impl Docxy {
                             )
                             .max()
                             .unwrap_or(1);
-                        est_text_w(longest).clamp(40., 200.)
+                        let floor = if c.editable_grid { 56. } else { 40. };
+                        est_text_w(longest).clamp(floor, 220.)
                     })
                     .collect();
                 let cell = |content: AnyElement, w: f32, head: bool, active: bool| {
                     div()
+                        .relative()
                         .w(px(w))
                         .h(px(18.))
                         .px_1()
@@ -1151,17 +1303,31 @@ impl Docxy {
                                 // Project's check mark column: a mark or nothing.
                                 (ControlKind::Check, "true") => text_cell("\u{2713}".into()),
                                 (ControlKind::Check, _) => text_cell(String::new()),
-                                _ => match (&editing, active) {
+                                (kind, _) => match (&editing, active) {
                                     (Some(buf), true) => h_flex()
                                         .child(SharedString::from(buf.clone()))
                                         .child(caret_bar(pal.fg))
                                         .into_any_element(),
+                                    _ if kind == ControlKind::Dropdown
+                                        && c.editable_grid
+                                        && selected =>
+                                    {
+                                        text_cell(format!("{text} \u{25BE}"))
+                                    }
                                     _ => text_cell(text),
                                 },
                             };
                             cell(content, widths[col], false, active)
+                                .child(probe(
+                                    &self.probes,
+                                    format!(
+                                        "dialog-cell:{}[{r}].{}",
+                                        c.name,
+                                        c.columns[col].to_lowercase()
+                                    ),
+                                ))
                                 .id(("dialog-grid-cell", (i * 1024 + r) * 256 + col))
-                                .when(c.enabled && c.plugin, |d| {
+                                .when(c.enabled && (c.plugin || c.editable_grid), |d| {
                                     d.cursor_pointer().on_click(on_widget(
                                         cx,
                                         i,
@@ -1186,6 +1352,11 @@ impl Docxy {
                 if !scrolls {
                     self.dialog_grids.borrow_mut().remove(&(d.epoch, c.name));
                 }
+                // The items a combo cell being typed into offers (#1536).
+                let suggestions = c.suggestions();
+                let offered = c.column_items.get(sel_col).cloned().unwrap_or_default();
+                let pick = c.pick;
+                let name = c.name;
                 v_flex()
                     .id(("dialog-control", i))
                     .gap_1()
@@ -1233,6 +1404,44 @@ impl Docxy {
                                     }),
                             ),
                     )
+                    .when(!suggestions.is_empty(), |v| {
+                        v.child(
+                            v_flex()
+                                .border_1()
+                                .border_color(pal.dim)
+                                .bg(pal.panel)
+                                .max_h(px(18. * 6.))
+                                .overflow_hidden()
+                                .child(probe(&self.probes, format!("dialog-suggestions:{name}")))
+                                .children(
+                                    suggestions
+                                        .iter()
+                                        .take(dialog::SUGGESTIONS_DRAWN)
+                                        .enumerate()
+                                        .map(|(k, &n)| {
+                                            h_flex()
+                                                .id(("dialog-suggestion", i * 1024 + k))
+                                                .h(px(18.))
+                                                .px_1()
+                                                .cursor_pointer()
+                                                .when(pick == Some(k), |r| {
+                                                    r.bg(hsla_u(BRAND).opacity(0.35))
+                                                })
+                                                .relative()
+                                                .child(probe(
+                                                    &self.probes,
+                                                    format!("dialog-cell:{name}[suggest].{k}"),
+                                                ))
+                                                .child(SharedString::from(offered[n].clone()))
+                                                .on_click(on_widget(
+                                                    cx,
+                                                    i,
+                                                    Some(dialog::SUGGESTION_BASE + k),
+                                                ))
+                                        }),
+                                ),
+                        )
+                    })
                     .into_any_element()
             }
             // A sample box (#1609): the text in the style the state gives, the
@@ -1295,21 +1504,53 @@ impl Docxy {
                 } else {
                     SharedString::from(text).into_any_element()
                 };
-                row.child(aligned(label))
+                let combo = k == ControlKind::DateCombo;
+                let calendar = d.calendar.filter(|k| k.control == i);
+                let field = row
+                    .child(aligned(label))
                     .child(
                         boxed_with(shown)
                             .relative()
                             .when(label_w.is_some(), |b| b.flex_1())
                             .child(probe(&self.probes, format!("dialog-field:{name}"))),
                     )
+                    .when(combo, |r| {
+                        r.child(
+                            div()
+                                .id(("dialog-calendar-button", i))
+                                .relative()
+                                .px_1()
+                                .border_1()
+                                .border_color(pal.dim)
+                                .child(probe(
+                                    &self.probes,
+                                    format!("dialog-calendar:button:{name}"),
+                                ))
+                                .child("\u{25BE}")
+                                .when(editable, |b| {
+                                    b.cursor_pointer().on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.dialog_calendar(i, CalendarAct::Toggle, cx)
+                                        },
+                                    ))
+                                }),
+                        )
+                    })
                     .when(editable, |r| {
                         r.cursor_text().on_click(cx.listener(
                             move |this, ev: &ClickEvent, window, cx| {
                                 this.dialog_field_click(i, ev.position(), window, cx)
                             },
                         ))
-                    })
-                    .into_any_element()
+                    });
+                match calendar {
+                    Some(k) => v_flex()
+                        .gap_1()
+                        .child(field)
+                        .child(self.calendar_popup(i, name, k, pal, cx))
+                        .into_any_element(),
+                    None => field.into_any_element(),
+                }
             }
             ControlKind::Checkbox => {
                 let on = matches!(c.value, dialog::Value::Bool(true));
@@ -1357,6 +1598,8 @@ impl Docxy {
             ControlKind::CheckList => {
                 // Virtualised: an AutoFilter list holds up to 10,000 values.
                 let n = c.items.len();
+                let scroll =
+                    list_scroll(&mut self.dialog_lists.borrow_mut(), (d.epoch, c.name), None);
                 let list = uniform_list(
                     ("dialog-checklist", i),
                     n,
@@ -1391,7 +1634,8 @@ impl Docxy {
                             .collect()
                     }),
                 )
-                .h(px(220.))
+                .track_scroll(&scroll)
+                .h(px(d.popup.map_or(220., |p| p.list_h)))
                 .w_full();
                 v_flex()
                     .id(("dialog-control", i))
@@ -1399,13 +1643,29 @@ impl Docxy {
                     .text_size(px(12.))
                     .text_color(fg)
                     .child(probe(&self.probes, format!("dialog-control:{}", c.name)))
-                    .child(label)
+                    .when(d.popup.is_none(), |e| e.child(label))
                     .child(
                         div()
                             .border_1()
                             .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
                             .bg(pal.panel)
-                            .child(list),
+                            .relative()
+                            .child(list)
+                            .when(d.popup.is_some(), |b| {
+                                b.child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .right_0()
+                                        .bottom_0()
+                                        .w(px(12.))
+                                        .child(
+                                            Scrollbar::vertical(&scroll)
+                                                .id(("dialog-checklist-bar", i))
+                                                .scrollbar_show(ScrollbarShow::Always),
+                                        ),
+                                )
+                            }),
                     )
                     .into_any_element()
             }
@@ -1522,7 +1782,7 @@ impl Docxy {
             let mut drawn: Vec<AnyElement> = Vec::new();
             for row in band.rows {
                 let fills = row.iter().any(|&(i, _)| d.fills(&d.controls[i]));
-                if columns == 1 || (row.len() == 1 && d.controls[row[0].0].span as usize >= columns)
+                if row.len() == 1 && (columns == 1 || d.controls[row[0].0].span as usize >= columns)
                 {
                     let (i, _) = row[0];
                     let el = self.dialog_widget(d, i, None, pal, cx);
@@ -1536,6 +1796,22 @@ impl Docxy {
                     } else {
                         el
                     });
+                    continue;
+                }
+                if row.len() > columns {
+                    // Controls marked `beside` share the row of the one before
+                    // them (#1536): Duration with Estimated, Start with Finish.
+                    let widgets: Vec<AnyElement> = row
+                        .into_iter()
+                        .map(|(i, _)| self.dialog_widget(d, i, None, pal, cx))
+                        .collect();
+                    drawn.push(
+                        h_flex()
+                            .gap_3()
+                            .items_center()
+                            .children(widgets)
+                            .into_any_element(),
+                    );
                     continue;
                 }
                 let cells = row.into_iter().map(|(i, col)| {
@@ -1583,7 +1859,8 @@ impl Docxy {
     }
 
     /// The top dialog, centred over a backdrop that covers the whole window,
-    /// so the pointer cannot reach anything under it.
+    /// so the pointer cannot reach anything under it. A popup (#1607) is
+    /// placed at its [`dialog::Popup`] instead, over an undimmed backdrop.
     pub(crate) fn dialog_overlay(&self, pal: Pal, cx: &mut Context<Self>) -> Option<AnyElement> {
         let d = self.active_dialogs()?.top()?;
         // The scrolls belong to this opening of this dialog (#1609: every
@@ -1618,7 +1895,7 @@ impl Docxy {
         let buttons_right = d.buttons_right;
         let is_help = |b: &dialog::Button| b.id.eq_ignore_ascii_case("help");
         let help_count = d.buttons.iter().filter(|b| is_help(b)).count();
-        let buttons = d.buttons.iter().enumerate().map(|(i, b)| {
+        let button = |i: usize, b: &dialog::Button| {
             let label = b.label.clone();
             div()
                 .id(("dialog-button", i))
@@ -1642,7 +1919,106 @@ impl Docxy {
                             this.dialog_button_click(&label, window, cx)
                         }))
                 })
-        });
+        };
+        // A dialog drawn as a popup (#1607): menu rows, the value list, then
+        // OK / Cancel, under the heading it opened from.
+        if let Some(p) = d.popup {
+            let rows = d
+                .buttons
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.role == dialog::ButtonRole::Apply)
+                .map(|(i, b)| {
+                    let label = b.label.clone();
+                    let color = if b.enabled { pal.fg } else { pal.dim };
+                    v_flex()
+                        .child(div().when(b.rule, |r| r.h(px(1.)).mx_2().my(px(3.)).bg(pal.border)))
+                        .child(
+                            h_flex()
+                                .id(("dialog-button", i))
+                                .relative()
+                                .h(px(crate::project::MENU_ROW_H))
+                                .px_2()
+                                .gap_2()
+                                .items_center()
+                                .text_size(px(12.))
+                                .text_color(color)
+                                .child(probe(&self.probes, format!("dialog-button:{}", b.label)))
+                                .child(div().w(px(16.)).flex_none().when(!b.icon.is_empty(), |d| {
+                                    d.child(icon_svg(b.icon, 16., color))
+                                }))
+                                .child(div().flex_1().child(SharedString::from(b.label.clone())))
+                                .when(b.submenu, |r| r.child("\u{25b8}"))
+                                .when(b.enabled, |r| {
+                                    r.cursor_pointer().hover(|r| r.bg(pal.hover)).on_click(
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.dialog_button_click(&label, window, cx)
+                                        }),
+                                    )
+                                }),
+                        )
+                })
+                .collect::<Vec<_>>();
+            let foot = d
+                .buttons
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.role != dialog::ButtonRole::Apply)
+                .map(|(i, b)| button(i, b))
+                .collect::<Vec<_>>();
+            return Some(
+                deferred(
+                    div()
+                        .id("dialog-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        // A press anywhere else closes it as Cancel.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.dialog_button_click("Cancel", window, cx)
+                            }),
+                        )
+                        .child(
+                            v_flex()
+                                .id("dialog")
+                                .absolute()
+                                .left(px(p.x))
+                                .top(px(p.y))
+                                .w(px(p.width))
+                                .py_1()
+                                .bg(pal.panel)
+                                .border_1()
+                                .border_color(pal.border)
+                                .shadow_lg()
+                                .occlude()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(probe(&self.probes, "dialog"))
+                                .children(rows)
+                                .child(div().h(px(1.)).mx_2().my(px(3.)).bg(pal.border))
+                                .children(controls.into_iter().map(|c| div().px_2().child(c)))
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .px_2()
+                                        .pt_2()
+                                        .pb_1()
+                                        .justify_end()
+                                        .children(foot),
+                                ),
+                        ),
+                )
+                .with_priority(2)
+                .into_any_element(),
+            );
+        }
+        let buttons: Vec<_> = d
+            .buttons
+            .iter()
+            .enumerate()
+            .map(|(i, b)| button(i, b))
+            .collect();
         // A modeless dialog (#1602) has no backdrop: the pointer reaches the
         // document, and a press in the panel gives the dialog the keyboard.
         let modeless = d.modeless;
@@ -1759,6 +2135,17 @@ impl Docxy {
             .into_any_element(),
         )
     }
+}
+
+/// A press in a date combo's calendar.
+#[derive(Clone, Copy)]
+enum CalendarAct {
+    /// The ▾ button: open the calendar, or close it.
+    Toggle,
+    /// Previous or next month.
+    Month(i32),
+    /// A day of the shown month, which is picked.
+    Day(u32),
 }
 
 /// How far in from the left of a field's `dialog-field` probe its text
