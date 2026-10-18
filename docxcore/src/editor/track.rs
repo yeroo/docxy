@@ -610,6 +610,9 @@ fn plan_delete(content: &[Inline], idx: usize, author: &str) -> Plan {
                 // (#1242); an equation, which a `w:del` cannot hold whole,
                 // stays.
                 Inline::Raw(_) => return Plan::Record { merges: false },
+                // A field likewise (#1470): its runs go in a `w:del` of its
+                // own, which Reject restores.
+                Inline::Field { .. } => return Plan::Record { merges: false },
                 Inline::Equation { .. } => return Plan::Keep,
                 _ => return Plan::Remove,
             };
@@ -806,15 +809,27 @@ fn record_deletion(
             pieces.push(deleted.clone());
             deleted
         }
+        // A field (#1470): as run-level XML with deleted text, the form a
+        // `w:del` holds (a `w:fldSimple` may not sit in one).
+        Inline::Field { raw, text } => {
+            wrapper_at = 0;
+            let deleted = Inline::Field {
+                raw: crate::compare::deleted_text_xml(&crate::compare::run_level_field(raw)),
+                text: text.clone(),
+            };
+            pieces.push(deleted.clone());
+            deleted
+        }
         _ => return,
     };
     let insert = insert_id_of(&deleted).flatten();
-    let picture = matches!(deleted, Inline::Raw(_));
+    let own_revision = matches!(deleted, Inline::Raw(_) | Inline::Field { .. });
     pieces[wrapper_at] = deletion_wrapper(meta.unwrap_or_default(), deleted);
     content.splice(i..=i, pieces);
     let mut at = i + wrapper_at;
-    // A picture's deletion stays a revision of its own: no run joins it.
-    if picture {
+    // A picture's or field's deletion stays a revision of its own: no run
+    // joins it.
+    if own_revision {
         return;
     }
 

@@ -1196,7 +1196,7 @@ fn deletable_object(inline: &Inline) -> Option<Inline> {
 /// `w:fldSimple` (paragraph-level content) becomes the equivalent complex
 /// field — begin, instruction, separate, its result runs, end. Other field
 /// forms (complex fields, `w:sym` runs) are already runs.
-fn run_level_field(raw: &str) -> String {
+pub(crate) fn run_level_field(raw: &str) -> String {
     let mut parser = XmlParser::new(raw);
     if parser.next() != Event::Start || parser.name() != "w:fldSimple" {
         return raw.to_string();
@@ -1227,7 +1227,7 @@ fn has_relationship(raw: &str) -> bool {
         .any(|attr| raw.contains(attr))
 }
 
-fn deleted_text_xml(raw: &str) -> String {
+pub(crate) fn deleted_text_xml(raw: &str) -> String {
     raw.replace("<w:t>", "<w:delText>")
         .replace("<w:t ", "<w:delText ")
         .replace("</w:t>", "</w:delText>")
