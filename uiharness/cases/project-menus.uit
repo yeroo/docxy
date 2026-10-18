@@ -29,18 +29,40 @@ test a task row's menu is Project's and Insert Task puts a blank row above
   assert reply.items.12.checked is true
   assert reply.items.14.label is Assign Resources...
   assert reply.items.16.label is Text Styles...
-  assert reply.items.17.label is Font...
-  assert reply.items.19.label is Fill Down
-  assert reply.items.20.label is Clear Contents
-  assert reply.items.22.label is Information...
-  assert reply.items.23.label is Notes...
-  assert reply.items.23.enabled is true
-  assert reply.items.24.label is Add to Timeline
-  assert reply.items.26.label is Hyperlink...
+  assert reply.items.17.separator is true
+  assert reply.items.18.label is Information...
+  assert reply.items.19.label is Notes...
+  assert reply.items.19.enabled is true
+  assert reply.items.20.label is Add to Timeline
+  assert reply.items.20.enabled is false
+  assert reply.items.21.separator is true
+  assert reply.items.22.label is Link
+  assert reply.items.22.enabled is true
+  assert reply.items.23 is nothing
+  # The mini formatting toolbar above the items (#1537).
+  assert reply.toolbar.0.label is Font
+  assert reply.toolbar.0.kind is combo
+  assert reply.toolbar.0.value is Calibri
+  assert reply.toolbar.1.label is Size
+  assert reply.toolbar.1.value is 11
+  assert reply.toolbar.2.label is Bold
+  assert reply.toolbar.2.kind is button
+  assert reply.toolbar.3.label is Italic
+  assert reply.toolbar.4.label is Fill Color
+  assert reply.toolbar.5.label is Font Color
+  assert reply.toolbar.6.label is Link Tasks
+  assert reply.toolbar.7.label is Unlink Tasks
+  assert reply.toolbar.8.label is Outdent
+  assert reply.toolbar.9.label is Indent
+  assert reply.toolbar.10.label is Task Details
+  assert reply.toolbar.10.kind is arrow
+  assert reply.toolbar.11 is nothing
   call menu-read {}
   assert reply.items.7.label is Insert Task
-  call-error menu-click {"label":"Font..."} => menu item 'Font...' is disabled
-  call-error menu-click {"label":"Bold"} => no menu item 'Bold'
+  call-error menu-click {"label":"Text Styles..."} => menu item 'Text Styles...' is disabled
+  call-error menu-click {"label":"Font..."} => no menu item 'Font...'
+  call-error menu-click {"label":"Fill Down"} => no menu item 'Fill Down'
+  call-error menu-click {"label":"Clear Contents"} => no menu item 'Clear Contents'
   call menu-click {"label":"Insert Task"}
   assert reply.menu is nothing
   assert menu is nothing
@@ -56,8 +78,7 @@ test the document's Bold menu never opens on a Project, and Esc closes the row m
   call-error menu-open {"target":{"cell":"C3"}} => the cell menu opens on a sheet tab
   call-error menu-open {"target":{"row":99}} => no task with uid 99
   call menu-open {"target":{"row":1}}
-  call-error menu-click {"label":"Bold"} => no menu item 'Bold'
-  call-error menu-click {"label":"Italic"} => no menu item 'Italic'
+  call-error menu-click {"label":"Underline"} => no menu item 'Underline'
   key escape
   assert menu is nothing
   assert selected_name is Task 1
@@ -223,18 +244,19 @@ test the entry row's menu is the row menu for no task
   assert reply.items.8.enabled is false
   assert reply.items.5.label is Scroll to Task
   assert reply.items.5.enabled is false
+  assert reply.toolbar.2.label is Bold
+  assert reply.toolbar.2.enabled is false
+  assert reply.toolbar.6.enabled is false
+  call-error menu-click {"label":"Bold"} => menu item 'Bold' is disabled
   call-error menu-click {"label":"Delete Task"} => menu item 'Delete Task' is disabled
   call menu-click {"label":"Insert Task"}
   assert tasks is 4
   call-error menu-open {"target":{"row":"x"}} => 'row' must be a task uid, or null for the entry row
 
-test Fill Down and Clear Contents on a row's menu act on the range a right-click inside keeps (#1213)
+test the row menu has no Fill Down; Ctrl+D fills the range a right-click inside keeps (#1213, #1537)
   open copy:../fixtures/project-clipboard.xml
   call menu-open {"target":{"row":1}}
-  assert reply.items.19.label is Fill Down
-  assert reply.items.19.enabled is false
-  assert reply.items.20.label is Clear Contents
-  assert reply.items.20.enabled is true
+  call-error menu-click {"label":"Fill Down"} => no menu item 'Fill Down'
   key escape
   call click-cell {"cell":"C1"}
   key shift+down
@@ -244,9 +266,8 @@ test Fill Down and Clear Contents on a row's menu act on the range a right-click
   call menu-open {"target":{"row":1}}
   assert selection is 4
   assert cell_row is 1
-  assert reply.items.19.enabled is true
-  call menu-click {"label":"Fill Down"}
-  assert selection is 4
+  key escape
+  key ctrl+d
   call task.list {}
   assert reply.tasks.1.name is A
   assert tasks is 2
@@ -254,25 +275,44 @@ test Fill Down and Clear Contents on a row's menu act on the range a right-click
   key ctrl+z
   call task.list {}
   assert reply.tasks.1.name is B
-  # Clear Contents clears the range's names and deletes no task.
-  call click-cell {"cell":"C1"}
-  key shift+down
-  call menu-open {"target":{"row":2}}
-  assert selection is 2
-  call menu-click {"label":"Clear Contents"}
-  assert tasks is 2
-  assert selection is none
-  call task.list {}
-  assert reply.tasks.0.name is empty
-  assert reply.tasks.1.name is empty
   # A right-click outside the range is a left click: the range goes.
-  key ctrl+z
   call click-cell {"cell":"C1"}
   key shift+right
   assert selection is 2
   call menu-open {"target":{"row":2}}
   assert selection is none
   assert selected_name is B
+
+test the toolbar's Bold styles the kept range in one undo step and its drop-downs open choices (#1537)
+  open copy:../fixtures/gantt-summary.xml
+  call click-cell {"cell":"C2"}
+  key shift+down
+  assert selection is 2
+  call menu-open {"target":{"row":2}}
+  assert selection is 2
+  shot window
+  call menu-click {"label":"Bold"}
+  assert menu is nothing
+  assert selection is 2
+  call menu-open {"target":{"row":2}}
+  assert reply.toolbar.2.checked is true
+  key escape
+  key ctrl+z
+  call menu-open {"target":{"row":2}}
+  assert reply.toolbar.2.checked is false
+  # A drop-down opens its choices in the menu's place; Esc backs out.
+  call menu-click {"label":"Size"}
+  call menu-read {}
+  assert reply.depth is 1
+  call menu-click {"label":"14"}
+  assert menu is nothing
+  call menu-open {"target":{"row":2}}
+  assert reply.toolbar.1.value is 14
+  call menu-click {"path":["Font Color","Red"]}
+  assert menu is nothing
+  call menu-open {"target":{"row":2}}
+  call menu-click {"label":"Indent"}
+  assert menu is nothing
 
 test a row menu over a kept range is the clicked row's: its task items act on that row (#1213 r1)
   open copy:../fixtures/gantt-summary.xml

@@ -5024,7 +5024,31 @@ fn dispatch_verb(
                     return Err("menu-click takes 'label', 'path' or 'index'".into());
                 }
                 Some(_) => crate::menu::resolve_index(&menu.items, arg_usize(args, "index")?)?,
-                None => crate::menu::resolve(&menu.items, &menu_path(args)?)?,
+                None => {
+                    let labels = menu_path(args)?;
+                    // A mini toolbar item (#1537) is named by its label: a
+                    // button runs; a drop-down opens its choices, and the rest
+                    // of a path walks them.
+                    if let Some(i) = labels.first().and_then(|l| menu.toolbar_index(l)) {
+                        if menu.toolbar[i].entry.submenu.is_empty() {
+                            if labels.len() > 1 {
+                                return Err(format!("'{}' has no choices", labels[0]));
+                            }
+                            app.menu_activate_toolbar(i, window, cx)?;
+                        } else {
+                            let m = app.menu.as_mut().ok_or("no menu is open")?;
+                            if !m.enter_toolbar(i, false) {
+                                return Err(format!("toolbar item '{}' is disabled", labels[0]));
+                            }
+                            if labels.len() > 1 {
+                                let path = crate::menu::resolve(&m.items, &labels[1..])?;
+                                app.menu_activate(&path, window, cx)?;
+                            }
+                        }
+                        return Done::ok(state(app, window, cx));
+                    }
+                    crate::menu::resolve(&menu.items, &labels)?
+                }
             };
             app.menu_activate(&path, window, cx)?;
             Done::ok(state(app, window, cx))

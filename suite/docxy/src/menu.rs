@@ -196,6 +196,52 @@ impl Entry {
     }
 }
 
+/// How a mini-toolbar item (#1537) is drawn and read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolbarKind {
+    /// A text box with a drop-down: its `value` is shown, a click opens the
+    /// choices as the menu's submenu.
+    Combo,
+    /// An icon button that runs its command (or opens a submenu of choices).
+    Button,
+    /// The small down-arrow that opens a dialog.
+    Arrow,
+}
+
+impl ToolbarKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Combo => "combo",
+            Self::Button => "button",
+            Self::Arrow => "arrow",
+        }
+    }
+}
+
+/// One item of the mini formatting toolbar drawn above a context menu
+/// (#1537). The command, enabled and checked state, and the choices of a
+/// drop-down are the [`Entry`]'s; a combo's shown text is `value`.
+#[derive(Debug, Clone)]
+pub(crate) struct ToolbarItem {
+    pub entry: Entry,
+    pub kind: ToolbarKind,
+    pub value: Option<String>,
+}
+
+impl ToolbarItem {
+    pub fn new(kind: ToolbarKind, entry: Entry) -> Self {
+        Self {
+            entry,
+            kind,
+            value: None,
+        }
+    }
+    pub fn value(mut self, value: &str) -> Self {
+        self.value = Some(value.into());
+        self
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum MenuItem {
     Item(Entry),
@@ -222,6 +268,9 @@ pub(crate) struct Menu {
     pub target: MenuTarget,
     pub at: (f32, f32),
     pub items: Vec<MenuItem>,
+    /// The mini toolbar above the items (#1537); empty for most menus. It is
+    /// drawn and clickable at the level the menu opened on only.
+    pub toolbar: Vec<ToolbarItem>,
     /// The highlighted item (an index into `items`), for Enter to run:
     /// moved by Up/Down, set by entering or leaving a submenu; `None`
     /// until the first arrow, and after a pointer-clicked submenu.
@@ -239,9 +288,48 @@ impl Menu {
             target,
             at,
             items,
+            toolbar: Vec::new(),
             hi: None,
             parents: Vec::new(),
         }
+    }
+
+    /// The menu with a mini toolbar above its items.
+    pub fn with_toolbar(mut self, toolbar: Vec<ToolbarItem>) -> Self {
+        self.toolbar = toolbar;
+        self
+    }
+
+    /// The index of the toolbar item named `label`, at the level the menu
+    /// opened on (a submenu hides the toolbar).
+    pub fn toolbar_index(&self, label: &str) -> Option<usize> {
+        if self.depth() > 0 {
+            return None;
+        }
+        self.toolbar.iter().position(|t| t.entry.label == label)
+    }
+
+    /// Open the choices of the enabled toolbar item `i` in the menu's place,
+    /// as [`Menu::enter`] does for an item. `false`, changing nothing, when
+    /// the item is not enabled or has no choices.
+    pub fn enter_toolbar(&mut self, i: usize, highlight_first: bool) -> bool {
+        if self.depth() > 0 {
+            return false;
+        }
+        let Some(t) = self.toolbar.get(i) else {
+            return false;
+        };
+        if !t.entry.enabled || t.entry.submenu.is_empty() {
+            return false;
+        }
+        let submenu = t.entry.submenu.clone();
+        self.parents.push((std::mem::take(&mut self.items), None));
+        self.items = submenu;
+        self.hi = None;
+        if highlight_first {
+            self.step(true);
+        }
+        true
     }
 
     /// The menu as `menu-open` and `menu-read` report it.
@@ -250,6 +338,7 @@ impl Menu {
             ("open", Json::Bool(true)),
             ("target", self.target.to_json()),
             ("items", items_json(&self.items)),
+            ("toolbar", toolbar_json(&self.toolbar)),
             (
                 "highlight",
                 self.hi.map_or(Json::Null, |i| Json::Num(i as f64)),
@@ -339,6 +428,31 @@ impl Menu {
             .map_or(0, |p| p + 1);
         self.hi = (0..n).map(|k| order[(from + k) % n]).find(|&i| usable(i));
     }
+}
+
+fn toolbar_json(toolbar: &[ToolbarItem]) -> Json {
+    Json::Arr(
+        toolbar
+            .iter()
+            .map(|t| {
+                let e = &t.entry;
+                let mut fields = vec![
+                    ("id", Json::Str(e.id.clone())),
+                    ("label", Json::Str(e.label.clone())),
+                    ("kind", Json::Str(t.kind.name().into())),
+                    ("enabled", Json::Bool(e.enabled)),
+                    ("checked", Json::Bool(e.checked)),
+                ];
+                if let Some(value) = &t.value {
+                    fields.push(("value", Json::Str(value.clone())));
+                }
+                if !e.submenu.is_empty() {
+                    fields.push(("submenu", items_json(&e.submenu)));
+                }
+                Json::obj(fields)
+            })
+            .collect(),
+    )
 }
 
 fn items_json(items: &[MenuItem]) -> Json {
@@ -977,6 +1091,51 @@ mod tests {
         assert!(resolve(&items, &[""]).is_err());
         assert!(resolve(&items, &["-"]).is_err());
         assert!(resolve(&items, &[]).is_err());
+    }
+
+    /// #1537: a menu without a toolbar reports an empty array; one with it
+    /// lists its items in order with kind and value, and a drop-down's
+    /// choices replace the items, hide the toolbar and come back on leave.
+    #[test]
+    fn menu_json_reports_the_toolbar_and_a_dropdown_enters_its_choices() {
+        let plain = Menu::new(MenuTarget::Chart, (0., 0.), sample());
+        assert_eq!(
+            plain
+                .to_json()
+                .get("toolbar")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        let mut size = Entry::unavailable("tb-size", "Size");
+        size.enabled = true;
+        size.submenu = vec![MenuItem::Item(Entry::new("s8", "8", "", Act::Bold, true))];
+        let mut m = Menu::new(MenuTarget::Row(Some(1)), (0., 0.), sample()).with_toolbar(vec![
+            ToolbarItem::new(ToolbarKind::Combo, size).value("11"),
+            ToolbarItem::new(
+                ToolbarKind::Button,
+                Entry::new("tb-bold", "Bold", "bold", Act::Bold, false),
+            ),
+        ]);
+        let json = m.to_json();
+        let bar = json.get("toolbar").unwrap().as_array().unwrap();
+        assert_eq!(bar[0].get_str("label"), Some("Size"));
+        assert_eq!(bar[0].get_str("kind"), Some("combo"));
+        assert_eq!(bar[0].get_str("value"), Some("11"));
+        assert_eq!(bar[1].get_str("kind"), Some("button"));
+        assert_eq!(bar[1].get("enabled"), Some(&Json::Bool(false)));
+        assert_eq!(bar[1].get("value"), None);
+        assert_eq!(m.toolbar_index("Bold"), Some(1));
+        // A disabled item opens nothing; the combo does.
+        assert!(!m.enter_toolbar(1, false));
+        assert!(m.enter_toolbar(0, true));
+        assert_eq!(m.depth(), 1);
+        assert_eq!(m.toolbar_index("Size"), None, "hidden in a submenu");
+        assert!(!m.enter_toolbar(0, false));
+        assert!(m.leave());
+        assert_eq!(m.items.len(), sample().len());
     }
 
     #[test]

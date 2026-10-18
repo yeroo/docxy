@@ -454,13 +454,6 @@ pub(crate) fn fill_cols(sel: &Selection) -> impl Iterator<Item = usize> {
     sel.cols.clone().filter(|&c| c != COL_ID)
 }
 
-/// Whether Fill Down has something to fill: a range of two or more shown
-/// rows over a column other than ID.
-pub(crate) fn fill_down_enabled(v: &ProjectView) -> bool {
-    v.selection()
-        .is_some_and(|sel| sel.uids.len() >= 2 && fill_cols(&sel).next().is_some())
-}
-
 /// Fill Down over `sel`, as one undo step: every row below the top takes the
 /// top row's value in each of the range's columns but ID, by the paste's
 /// rule for one field ([`apply_field`]). The top's value is what a copy of

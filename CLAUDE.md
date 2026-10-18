@@ -844,3 +844,29 @@
   `DialogOwner::Zoom`/`Timescale`, catalogue ids `zoom`, `timescale`). The
   Timescale dialog's tier rows are read-only (Count is 1): the tier editor and
   the non-working-time page are not built.
+
+## Project row menu and mini toolbar (#1537)
+
+- `project_row_menu` lists Project 2024's task row items in its order, Notes...
+  kept: Cut, Copy, Paste, Paste Special..., Scroll to Task, Insert/Delete/
+  Inactivate Task, Manually/Auto Schedule, Assign Resources..., Text Styles...,
+  Information..., Notes..., Add to Timeline, Link. Fill Down, Clear Contents
+  and Font... are not row items (Ctrl+D stays; `ProjectAct::ClearContents` has
+  no UI now); `Link` is `ProjectAct::Hyperlink` (the bar menu keeps
+  `Hyperlink...`). Paste Special..., Text Styles... and Add to Timeline are
+  disabled placeholders until #1389/#1390/#1391.
+- `Menu::toolbar` (`menu::ToolbarItem`: an `Entry` plus `ToolbarKind`
+  combo/button/arrow and a combo's `value`) is the mini formatting toolbar
+  drawn above the row and column-heading menus (`project_toolbar`, opened by
+  `open_menu_with_toolbar`); every other menu has none. `menu-read`/`menu-open`
+  report `toolbar: [{id,label,kind,enabled,checked,value?,submenu?}]` (`[]`
+  when absent). `menu-click {"label"}` or `{"path":["Font Color","Red"]}`
+  finds a toolbar label first; a drop-down's choices replace the items
+  (`Menu::enter_toolbar`, depth 1, the toolbar hidden) and Esc/Left backs out.
+- Formatting items are `ProjectAct::CellStyle(StyleEdit)`: one
+  `Editor::edit_formatting` over the selected cells (the range, else the
+  cursor cell, real tasks only; the range survives), merged into each cell's
+  direct `TextStyle`. Bold/Italic set every cell to the opposite of the cursor
+  cell's value. The lists are fixed (8 fonts, sizes 8 to 72, 8 colours): the
+  suite has no font enumeration. The task buttons dispatch AddLink,
+  UnlinkTasks, Outdent, Indent and Task Details (`Constraint`).
