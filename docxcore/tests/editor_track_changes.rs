@@ -1169,3 +1169,248 @@ fn a_tracked_delete_in_a_raw_kept_external_link_saves_inside_it_1462() {
         "{saved}"
     );
 }
+
+fn para_mut_at(doc: &mut Document, index: usize) -> &mut docxcore::model::Paragraph {
+    let Block::Paragraph(p) = &mut doc.body[index] else {
+        panic!("paragraph {index}")
+    };
+    p
+}
+
+fn ins_in_link(saved: &str) -> bool {
+    let link = &saved[saved.find("<w:hyperlink").unwrap()..saved.find("</w:hyperlink>").unwrap()];
+    link.contains("<w:ins ")
+}
+
+/// Typing in the middle of a simple link records the text inside it, as one
+/// insertion; Reject All and Accept All act on it, also after a reload
+/// (#1465).
+#[test]
+fn typing_in_a_simple_link_is_recorded_inside_it_1465() {
+    let mut ed = tracked(SEE_HERE);
+    at(&mut ed, 5); // "h|ere"
+    ed.insert_str("XY");
+    assert_eq!(text(&ed), "See hXYere.");
+    assert_eq!(kinds(&ed.doc), [RevisionKind::Insert]);
+    let saved = xml(&ed);
+    assert!(
+        saved.contains("<w:hyperlink w:anchor=\"x\">") && ins_in_link(&saved),
+        "{saved}"
+    );
+    let mut back = reload(&ed);
+    assert_eq!(kinds(&back), [RevisionKind::Insert]);
+    assert!(back.reject_all_revisions().iter().all(|o| o.is_applied()));
+    assert_eq!(back.plain_text().trim_end(), "See here.");
+    let mut accepted = reload(&ed);
+    assert!(
+        accepted
+            .accept_all_revisions()
+            .iter()
+            .all(|o| o.is_applied())
+    );
+    assert_eq!(accepted.plain_text().trim_end(), "See hXYere.");
+    assert!(accepted.revisions().is_empty());
+    // The same, on the live document.
+    let mut live = ed.doc.clone();
+    assert!(live.reject_all_revisions().iter().all(|o| o.is_applied()));
+    assert_eq!(live.plain_text().trim_end(), "See here.");
+}
+
+/// A TOC entry's link (complex form, a tab inside) records typing too, and a
+/// Reject All after a save and reload restores the entry (#1465).
+#[test]
+fn typing_in_a_toc_entry_link_is_recorded_and_rejects_after_reload_1465() {
+    let mut ed = tracked(TOC_ENTRY);
+    at(&mut ed, 2); // "In|tro"
+    ed.insert_str("zz");
+    assert_eq!(kinds(&ed.doc), [RevisionKind::Insert]);
+    assert!(ins_in_link(&xml(&ed)), "{}", xml(&ed));
+    let mut back = reload(&ed);
+    assert_eq!(kinds(&back), [RevisionKind::Insert]);
+    assert!(back.reject_all_revisions().iter().all(|o| o.is_applied()));
+    assert_eq!(para_at(&back, 0).plain_text(), "Intro\t1");
+    let mut accepted = reload(&ed);
+    assert!(
+        accepted
+            .accept_all_revisions()
+            .iter()
+            .all(|o| o.is_applied())
+    );
+    assert_eq!(para_at(&accepted, 0).plain_text(), "Inzztro\t1");
+}
+
+/// Replace and AutoCorrect inside a link record the text put in, so Reject
+/// All gives back the original, not both (#1465).
+#[test]
+fn replace_in_a_link_rejects_to_the_original_1465() {
+    let mut ed = tracked(TOC_ENTRY);
+    select(&mut ed, 2, 4); // "tr"
+    ed.replace_current_with("XY");
+    assert_eq!(text(&ed).lines().next().unwrap(), "InXYo\t1");
+    let mut rejected = ed.doc.clone();
+    assert!(
+        rejected
+            .reject_all_revisions()
+            .iter()
+            .all(|o| o.is_applied())
+    );
+    assert_eq!(para_at(&rejected, 0).plain_text(), "Intro\t1");
+    let mut back = reload(&ed);
+    assert!(back.reject_all_revisions().iter().all(|o| o.is_applied()));
+    assert_eq!(para_at(&back, 0).plain_text(), "Intro\t1");
+}
+
+/// A Replace across a link's edge records the text on both sides.
+#[test]
+fn replace_across_a_link_edge_records_both_sides_1465() {
+    let mut ed = tracked(SEE_HERE);
+    select(&mut ed, 2, 6); // "e " outside, "he" inside
+    ed.replace_current_with("QQ");
+    let mut rejected = ed.doc.clone();
+    assert!(
+        rejected
+            .reject_all_revisions()
+            .iter()
+            .all(|o| o.is_applied())
+    );
+    assert_eq!(rejected.plain_text().trim_end(), "See here.");
+    let mut accepted = ed.doc.clone();
+    assert!(
+        accepted
+            .accept_all_revisions()
+            .iter()
+            .all(|o| o.is_applied())
+    );
+    assert_eq!(accepted.plain_text().trim_end(), "SeQQre.");
+}
+
+/// Typing that extends the author's own insertion in a link adds no revision.
+#[test]
+fn typing_on_in_a_link_extends_one_insertion_1465() {
+    let mut ed = tracked(SEE_HERE);
+    at(&mut ed, 5);
+    ed.insert_str("a");
+    ed.insert_str("b");
+    ed.insert_str("c");
+    assert_eq!(text(&ed), "See habcere.");
+    assert_distinct_ins(&ed, "typing in a link", 1);
+}
+
+/// With tracking off, typing in a link stays plain, and in the middle of an
+/// insertion in a link it interrupts it.
+#[test]
+fn untracked_typing_in_a_link_interrupts_an_insertion_1465() {
+    let mut ed = tracked(SEE_HERE);
+    at(&mut ed, 5);
+    ed.insert_str("abcd");
+    ed.set_track_changes(None);
+    at(&mut ed, 7); // "ab|cd"
+    ed.insert_str("--");
+    assert_eq!(text(&ed), "See hab--cdere.");
+    assert_distinct_ins(&ed, "interrupted", 2);
+    let mut rejected = ed.doc.clone();
+    assert!(
+        rejected
+            .reject_all_revisions()
+            .iter()
+            .all(|o| o.is_applied())
+    );
+    assert_eq!(rejected.plain_text().trim_end(), "See h--ere.");
+    // Plain typing in a link without any insertion records nothing.
+    let mut plain = Editor::new(parse(SEE_HERE));
+    at(&mut plain, 5);
+    plain.insert_str("zz");
+    assert!(plain.doc.revisions().is_empty());
+}
+
+fn raw_kept_link_with_insert() -> Document {
+    let rels = docxcore::load::parse_rels_xml(
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId9\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"https://example.com/\" TargetMode=\"External\"/></Relationships>",
+    );
+    parse_document_xml(
+        &format!(
+            "<w:document {W} xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><w:body><w:p><w:hyperlink r:id=\"rId9\"><w:r><w:t>Go</w:t></w:r><w:r><w:tab/></w:r><w:ins w:id=\"7\" w:author=\"Bo\" w:date=\"2024-01-01T00:00:00Z\"><w:r><w:t>new</w:t></w:r></w:ins></w:hyperlink><w:p/></w:p></w:body></w:document>"
+        ),
+        &rels,
+    )
+}
+
+/// Accept or Reject All of an insertion inside a link that kept its raw XML
+/// is written: the save does not fall back to the stale raw (#1465).
+#[test]
+fn accept_and_reject_in_a_raw_kept_link_survive_a_save_1465() {
+    let doc = raw_kept_link_with_insert();
+    let Inline::Hyperlink(h) = &para_at(&doc, 0).content[0] else {
+        panic!("link")
+    };
+    assert!(h.raw.is_some() && !h.content_changed);
+    let mut rejected = doc.clone();
+    assert!(
+        rejected
+            .reject_all_revisions()
+            .iter()
+            .all(|o| o.is_applied())
+    );
+    let saved = document_to_xml(&rejected);
+    assert!(
+        !saved.contains("new") && saved.contains("r:id=\"rId9\""),
+        "{saved}"
+    );
+    let mut accepted = doc.clone();
+    assert!(
+        accepted
+            .accept_all_revisions()
+            .iter()
+            .all(|o| o.is_applied())
+    );
+    let saved = document_to_xml(&accepted);
+    assert!(
+        saved.contains("new") && !saved.contains("<w:ins "),
+        "{saved}"
+    );
+    // A link nothing was swept in keeps its raw XML verbatim.
+    let untouched = parse_document_xml(
+        &format!(
+            "<w:document {W}><w:body><w:p><w:hyperlink w:anchor=\"a\"><w:r><w:t>x</w:t></w:r><w:r><w:tab/></w:r></w:hyperlink></w:p></w:body></w:document>"
+        ),
+        &Relationships::default(),
+    );
+    let mut swept = untouched.clone();
+    swept.accept_all_revisions();
+    assert_eq!(document_to_xml(&swept), document_to_xml(&untouched));
+}
+
+/// A recorded insertion inside a link that kept its raw XML, with the link
+/// not yet marked changed (as a document built in memory can be): Accept and
+/// Reject All must mark it, or the save writes the stale raw (#1465).
+#[test]
+fn sweeping_a_recorded_insertion_marks_a_raw_kept_link_changed_1465() {
+    let mut ed = tracked(TOC_ENTRY);
+    at(&mut ed, 2);
+    ed.insert_str("zz");
+    let mut doc = ed.doc.clone();
+    let Inline::Hyperlink(h) = &mut para_mut_at(&mut doc, 0).content[0] else {
+        panic!("link")
+    };
+    h.raw =
+        Some("<w:hyperlink w:anchor=\"_Toc1\"><w:r><w:t>STALE</w:t></w:r></w:hyperlink>".into());
+    h.content_changed = false;
+    let mut rejected = doc.clone();
+    assert!(
+        rejected
+            .reject_all_revisions()
+            .iter()
+            .all(|o| o.is_applied())
+    );
+    let saved = document_to_xml(&rejected);
+    assert!(!saved.contains("STALE") && !saved.contains("zz"), "{saved}");
+    let mut accepted = doc.clone();
+    assert!(
+        accepted
+            .accept_all_revisions()
+            .iter()
+            .all(|o| o.is_applied())
+    );
+    let saved = document_to_xml(&accepted);
+    assert!(!saved.contains("STALE") && saved.contains("zz"), "{saved}");
+}

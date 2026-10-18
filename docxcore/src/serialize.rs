@@ -1285,6 +1285,17 @@ fn write_inline_with_text_kind(s: &mut String, item: &Inline, text_kind: RunText
 /// A link's runs and then its other content, as one sequence: a run and the
 /// tab after it may share a `w:r` (#1216).
 fn write_link_items(s: &mut String, h: &Hyperlink, text_kind: RunTextKind) {
+    // Recorded insertions inside the link are wrapped in `w:ins` inside it,
+    // as Word writes them (#1465).
+    let inserted = h.runs.iter().any(|r| r.props.tracked_insert.is_some())
+        || h.content.iter().any(|i| tracked_insert_of(i).is_some());
+    if inserted && matches!(text_kind, RunTextKind::Normal) {
+        let all: Vec<Inline> = (h.runs.iter().cloned().map(Inline::Run))
+            .chain(h.content.iter().cloned())
+            .collect();
+        write_inlines_tracking_inserts(s, &all);
+        return;
+    }
     let content = balanced_smart_tags(&h.content);
     let runs = h.runs.iter().map(|r| Item::Piece(Piece::Run(r)));
     write_items(s, runs.chain(content.iter().map(Item::of)), text_kind);

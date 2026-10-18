@@ -16,21 +16,21 @@
 //!
 //! * Deleting text inside a hyperlink records the deletion inside the link,
 //!   as Word does: a wrapper never straddles the link's boundary (#1462).
+//!   Typing, Replace and AutoCorrect inside a link record the insertion
+//!   inside it too (#1465).
 //!
 //! Not recorded (they change the document as without tracking): paragraph
-//! marks (Enter, and a Backspace or Delete that joins paragraphs), typing
-//! inside a hyperlink, fields and other one-unit inlines (an Update Field or
+//! marks (Enter, and a Backspace or Delete that joins paragraphs), fields and other one-unit inlines (an Update Field or
 //! Edit Field rewrites a field's result and code outright, #1241),
 //! formatting, and table structure. A selection across paragraphs records the deletion of its text
-//! in each paragraph and keeps the paragraph marks. Inside a hyperlink, a
-//! Replace or AutoCorrect records the deletion of the old text but not the
-//! text put in, so Reject All keeps both until insertions inside links are
-//! recorded.
+//! in each paragraph and keeps the paragraph marks.
 
 use super::{
     Editor, content_delete, content_insert_at, inline_len, map_prop_range, para_mut, resolve_para,
 };
-use crate::model::{Inline, RevisionKind, RevisionMetadata, Run, RunProps, TrackedInsert};
+use crate::model::{
+    Hyperlink, Inline, RevisionKind, RevisionMetadata, Run, RunProps, TrackedInsert,
+};
 
 /// Who Track Changes records edits as, and the clock that stamps each one.
 /// A plain function keeps `docxcore` free of a time dependency and the tests
@@ -104,13 +104,13 @@ impl Editor {
         };
         let at = what_is_at(&para.content, start);
         match (&self.track, at) {
-            (Some(_), What::InLink) => {}
             (Some(track), What::Recorded(by)) if by.as_deref() == Some(track.author.as_str()) => {}
             (Some(_), _) => {
                 let Some(meta) = self.fresh_revision_metadata() else {
                     return;
                 };
                 if let Some(p) = para_mut(&mut self.doc.body, path) {
+                    links_runs_into_content(&mut p.content, start, start + len);
                     map_prop_range(&mut p.content, start, start + len, &|props| {
                         record_insert(props, &meta)
                     });
@@ -120,6 +120,7 @@ impl Editor {
             }
             (None, What::Recorded(_)) => {
                 if let Some(p) = para_mut(&mut self.doc.body, path) {
+                    links_runs_into_content(&mut p.content, start, start + len);
                     map_prop_range(&mut p.content, start, start + len, &|props| {
                         clear_insert_record(props)
                     });
@@ -148,14 +149,9 @@ impl Editor {
     /// stretch with an id already used gets a fresh one, above every id in the
     /// document.
     fn unshare_insert_ids(&mut self) {
-        let has_record = |i: &Inline| match i {
-            Inline::Run(r) => r.props.tracked_insert.is_some(),
-            Inline::Tab(p) | Inline::Break(_, p) => p.tracked_insert.is_some(),
-            _ => false,
-        };
         let paths = super::all_paragraph_paths(&self.doc.body);
         let any = paths.iter().any(|p| {
-            resolve_para(&self.doc.body, p).is_some_and(|p| p.content.iter().any(has_record))
+            resolve_para(&self.doc.body, p).is_some_and(|p| p.content.iter().any(has_record_deep))
         });
         if !any {
             return;
@@ -170,22 +166,7 @@ impl Editor {
                 continue;
             };
             state.open = None;
-            for inline in &mut para.content {
-                match inline {
-                    // A deletion of part of an insertion sits inside it.
-                    Inline::Revision {
-                        kind: RevisionKind::Delete,
-                        content,
-                        ..
-                    } if !content.is_empty() && content.iter().all(has_record) => {
-                        for inner in content.iter_mut() {
-                            with_props(inner, |p| state.visit(p));
-                        }
-                    }
-                    i if has_record(i) => with_props(i, |p| state.visit(p)),
-                    _ => state.open = None,
-                }
-            }
+            visit_stretches(&mut para.content, &mut state);
         }
     }
 
@@ -456,8 +437,6 @@ enum What {
     Plain,
     /// A run of a tracked insertion, by this author.
     Recorded(Option<String>),
-    /// Inside a hyperlink: not recorded.
-    InLink,
 }
 
 fn what_is_at(content: &[Inline], idx: usize) -> What {
@@ -468,7 +447,7 @@ fn what_is_at(content: &[Inline], idx: usize) -> What {
             let props = match inline {
                 Inline::Run(r) => &r.props,
                 Inline::Tab(props) | Inline::Break(_, props) => props,
-                Inline::Hyperlink(_) => return What::InLink,
+                Inline::Hyperlink(h) => return what_is_in_link(h, idx - acc),
                 _ => return What::Plain,
             };
             return match &props.tracked_insert {
@@ -479,6 +458,70 @@ fn what_is_at(content: &[Inline], idx: usize) -> What {
         acc += len;
     }
     What::Plain
+}
+
+/// What is at offset `local` of a link: its `runs` come first, then `content`
+/// (the order `link_part` and `inline_len` count them in).
+fn what_is_in_link(h: &Hyperlink, local: usize) -> What {
+    let mut acc = 0;
+    for r in &h.runs {
+        acc += r.text.chars().count();
+        if local < acc {
+            return match &r.props.tracked_insert {
+                Some(t) => What::Recorded(t.metadata.author.clone()),
+                None => What::Plain,
+            };
+        }
+    }
+    what_is_at(&h.content, local - acc)
+}
+
+fn has_record(i: &Inline) -> bool {
+    match i {
+        Inline::Run(r) => r.props.tracked_insert.is_some(),
+        Inline::Tab(p) | Inline::Break(_, p) => p.tracked_insert.is_some(),
+        _ => false,
+    }
+}
+
+/// [`has_record`], also for anything inside a link.
+fn has_record_deep(i: &Inline) -> bool {
+    match i {
+        Inline::Hyperlink(h) => {
+            h.runs.iter().any(|r| r.props.tracked_insert.is_some())
+                || h.content.iter().any(has_record_deep)
+        }
+        other => has_record(other),
+    }
+}
+
+/// Visit the recorded runs of `content` in order, a link's too. A link's edge
+/// ends a stretch: its `w:ins` is written inside the link (#1465).
+fn visit_stretches(content: &mut [Inline], state: &mut Stretches) {
+    for inline in content.iter_mut() {
+        match inline {
+            // A deletion of part of an insertion sits inside it.
+            Inline::Revision {
+                kind: RevisionKind::Delete,
+                content,
+                ..
+            } if !content.is_empty() && content.iter().all(has_record) => {
+                for inner in content.iter_mut() {
+                    with_props(inner, |p| state.visit(p));
+                }
+            }
+            Inline::Hyperlink(h) => {
+                state.open = None;
+                for r in &mut h.runs {
+                    state.visit(&mut r.props);
+                }
+                visit_stretches(&mut h.content, state);
+                state.open = None;
+            }
+            i if has_record(i) => with_props(i, |p| state.visit(p)),
+            _ => state.open = None,
+        }
+    }
 }
 
 enum Plan {
@@ -590,6 +633,31 @@ fn link_runs_into_content(content: &mut [Inline], idx: usize) {
                 link_runs_into_content(&mut h.content, idx - acc);
             }
             return;
+        }
+        acc += len;
+    }
+}
+
+/// [`link_runs_into_content`] for every link the range `[start, end)` touches,
+/// so a record put on (or taken off) its text lands where the serializer
+/// groups it.
+fn links_runs_into_content(content: &mut [Inline], start: usize, end: usize) {
+    let mut acc = 0;
+    for inline in content.iter_mut() {
+        let len = inline_len(inline);
+        if let Inline::Hyperlink(h) = inline {
+            if start < acc + len && acc < end {
+                if !h.runs.is_empty() {
+                    let runs = std::mem::take(&mut h.runs).into_iter().map(Inline::Run);
+                    h.content.splice(0..0, runs);
+                    h.content_changed = true;
+                }
+                links_runs_into_content(
+                    &mut h.content,
+                    start.saturating_sub(acc),
+                    end.saturating_sub(acc),
+                );
+            }
         }
         acc += len;
     }
