@@ -64,7 +64,7 @@ const MANIFEST: &str = r##"{
       {"name":"fixture.tasks","label":"Tasks","kind":"grid","columns":[{"name":"Name","kind":"text"}],"value":[],"min_rows":3},
       {"name":"fixture.sample","label":"Sample","kind":"sample","value":{"text":"AaBbYyZz"}},
       {"name":"fixture.memo","label":"&Memo:","kind":"multiline","value":"","span":2,"fill":true}]}],
-     "buttons":["OK","Cancel","Help",{"id":"bump","label":"&Bump"}]},
+     "buttons":["OK","Cancel",{"id":"help","label":"Help","cancel":true},{"id":"bump","label":"&Bump"}]},
     {"id":"fixture.sheet","title":"Fixture Sheet","modeless":true,"placement":"right","help":"https://example.test/fixture-help","pages":[{"name":"Sheet","controls":[
       {"name":"fixture.rows","label":"Tasks","kind":"grid","commit_command":true,"min_rows":6,"columns":[{"name":"Pick","kind":"check"},{"name":"Name","kind":"text"},{"name":"Units","kind":"number"}],"value":[]}]}],
      "buttons":[{"id":"apply","label":"&Apply","default":true},{"id":"clear","label":"Clear"},{"id":"close","label":"Close","cancel":true},"Help"]}],

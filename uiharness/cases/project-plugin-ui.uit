@@ -238,10 +238,16 @@ test the button's command opens the plugin's dialog, whose OK sends the values b
   assert selected_name is Bumped by fixture
   key ctrl+z
   assert selected_name is A
-  # Cancel sends nothing.
+  # Cancel sends nothing. Escape closes through Cancel: the spec marks Help
+  # `cancel` too, which the host ignores.
   call ribbon-click {"tab":"Task","command":"Hello"}
   assert dialog is plugin
   call dialog-click {"button":"Cancel"}
+  assert dialog is none
+  assert status is Fixture: asking
+  call ribbon-click {"tab":"Task","command":"Hello"}
+  assert dialog is plugin
+  key escape
   assert dialog is none
   assert status is Fixture: asking
 

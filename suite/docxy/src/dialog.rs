@@ -2016,16 +2016,16 @@ impl Dialog {
     }
 
     fn button_index(&self, want: &str) -> Result<usize, String> {
-        let i = self
+        let b = self.find_button(want).ok_or_else(|| {
+            let labels: Vec<String> = self.buttons.iter().map(|b| shown(&b.label)).collect();
+            format!("no button '{want}'; buttons: {}", labels.join(", "))
+        })?;
+        Self::refuse_disabled(b)?;
+        Ok(self
             .buttons
             .iter()
-            .position(|b| fold(&b.label) == fold(want) || b.id.eq_ignore_ascii_case(want.trim()))
-            .ok_or_else(|| {
-                let labels: Vec<String> = self.buttons.iter().map(|b| shown(&b.label)).collect();
-                format!("no button '{want}'; buttons: {}", labels.join(", "))
-            })?;
-        Self::refuse_disabled(&self.buttons[i])?;
-        Ok(i)
+            .position(|x| std::ptr::eq(x, b))
+            .unwrap_or_default())
     }
 
     /// The staged value of a control, by name, for the owner applying it.

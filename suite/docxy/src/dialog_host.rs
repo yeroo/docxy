@@ -73,10 +73,11 @@ fn est_text_w(chars: usize) -> f32 {
     chars as f32 * 7. + 12.
 }
 
-/// The scroll for list `name` of dialog `id`, kept across frames. When the
-/// choice is not the one last seen it is scrolled into view (only if it is
-/// out of it), so a key that moves it past the shown rows brings it back,
-/// while a wheel scroll that leaves the choice alone is not undone.
+/// The scroll for list `name` of the dialog opening `epoch`, kept across
+/// frames. When the choice is not the one last seen it is scrolled into view
+/// (only if it is out of it), so a key that moves it past the shown rows
+/// brings it back, while a wheel scroll that leaves the choice alone is not
+/// undone.
 fn list_scroll(
     lists: &mut ListScrolls,
     key: (u64, &'static str),
@@ -875,6 +876,10 @@ impl Docxy {
         };
         // The probe is already inside the border: the text starts a padding in.
         let x = f32::from(at.x - bounds.left()) - FIELD_INSET;
+        // A multiline's probe is its first line's neighbour and scrolls with
+        // the lines (#1609), so the distance down from it is the line, the
+        // scroll already counted.
+        let y = f32::from(at.y - bounds.top());
         let measurer = Measurer::new(window);
         if let Some(d) = self
             .active_dialogs_mut()
@@ -882,8 +887,15 @@ impl Docxy {
             .ok()
             .filter(|d| d.focus == Some(index))
         {
-            let text = d.focused().map(|c| c.text()).unwrap_or_default();
-            let to = char_at_x(&text, x, |s| measurer.width(s, 12., false, false));
+            let (text, multiline) = d
+                .focused()
+                .map(|c| (c.text(), c.kind == ControlKind::Multiline))
+                .unwrap_or_default();
+            let to = if multiline {
+                char_at_line_x(&text, y, x, |s| measurer.width(s, 12., false, false))
+            } else {
+                char_at_x(&text, x, |s| measurer.width(s, 12., false, false))
+            };
             d.move_caret_to(to, false);
         }
         cx.notify();
@@ -1754,6 +1766,16 @@ impl Docxy {
 /// the box's border, so the one-pixel border is already outside it.
 const FIELD_INSET: f32 = 4.;
 
+/// The character gap of a multiline's `text` nearest to `x` pixels along
+/// the line `y` pixels down from its first line (lines are 16 px, #1609):
+/// the gaps of the lines above plus [`char_at_x`] on that line.
+fn char_at_line_x(text: &str, y: f32, x: f32, width: impl Fn(&str) -> f32) -> usize {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let line = ((y / 16.).floor().max(0.) as usize).min(lines.len().saturating_sub(1));
+    let before: usize = lines[..line].iter().map(|l| l.chars().count() + 1).sum();
+    before + char_at_x(lines[line], x, width)
+}
+
 /// The character gap nearest to `x` pixels along `text` (a gap is between
 /// characters, i.e. grapheme clusters, never inside one), whose prefixes
 /// measure as `width` says.
@@ -1795,6 +1817,33 @@ mod tests {
     /// #988 r1: a list's choice that moves is scrolled into view once; a
     /// frame with the same choice asks for no scroll (a wheel scroll stays),
     /// and the handle is the same one frame to frame.
+    /// #1609: a click in a multiline lands on the line under the pointer,
+    /// the gaps of the lines above counted, however far the box scrolled
+    /// (the distance is measured from the first line, which scrolls too).
+    #[test]
+    fn a_multiline_click_lands_on_its_line() {
+        let width = |s: &str| s.chars().count() as f32 * 7.;
+        let text = "one\ntwo\nthree";
+        assert_eq!(char_at_line_x(text, 0., 0., width), 0);
+        assert_eq!(
+            char_at_line_x(text, 20., 0., width),
+            4,
+            "line 1 starts after 'one' and its break"
+        );
+        assert_eq!(
+            char_at_line_x(text, 20., 100., width),
+            7,
+            "past the end of 'two'"
+        );
+        assert_eq!(char_at_line_x(text, 40., 10., width), 9, "'th|ree'");
+        assert_eq!(
+            char_at_line_x(text, 400., 0., width),
+            8,
+            "below the last line: its start"
+        );
+        assert_eq!(char_at_line_x("", 50., 50., width), 0);
+    }
+
     #[test]
     fn a_list_scrolls_a_changed_choice_into_view_once() {
         let mut lists = ListScrolls::default();

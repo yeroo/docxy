@@ -440,13 +440,13 @@ fn help_is_the_hosts_never_the_default_and_never_a_command() {
     d.text = None;
     d.buttons = vec![
         dialog::Button::new("OK", dialog::ButtonRole::Accept),
-        button_of_spec(&spec, dialog::ButtonRole::Apply),
+        button_of_spec(&cancelling, dialog::ButtonRole::Cancel),
     ];
     t.dialogs.push(d);
     assert_eq!(
         t.dialogs.key_button("escape", true),
         None,
-        "Escape names no Help"
+        "Escape names no Help, cancel on it or not"
     );
     assert_eq!(dialog_click(&mut t, "Help"), Some(Ok(())));
     assert_eq!(t.status.as_str(), crate::help_tab::DOCS_COMING);
