@@ -117,8 +117,7 @@ test a right-click on a heading opens its menu
   call menu-read {}
   assert reply.items.0.label is Cut
   key escape
-  # Start runs past the table's right edge: the press lands on what the
-  # table shows of it.
+  # A heading right of Name: the press lands on what the table shows of it.
   call pointer-click {"region":"project-heading:Start","button":"right"}
   assert menu.target.column is Start
   assert cell is Start

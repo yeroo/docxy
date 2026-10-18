@@ -244,7 +244,7 @@ pub(crate) fn table_pane_width(width: f32) -> f32 {
 
 /// The share of the window the table pane takes by default (#1534): the Entry
 /// table's default columns fit it at the default 1180 px window.
-pub(crate) const DEFAULT_TABLE_SHARE: f32 = 0.70;
+pub(crate) const DEFAULT_TABLE_SHARE: f32 = 0.75;
 
 /// [`table_pane_width`] for columns `total` px wide in all: the pane follows
 /// them, so narrowing columns brings the right-hand ones into view.

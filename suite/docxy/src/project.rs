@@ -1067,7 +1067,7 @@ pub(crate) const ROW_H: f32 = 28.;
 /// The entry table's default column widths; a plan's own (`tableview.xml`,
 /// dragged on a heading's right edge) replace them per column.
 pub(crate) const DEFAULT_WIDTHS: [f32; COLUMN_COUNT] =
-    [44., 130., 126., 86., 96., 96., 114., 126.];
+    [46., 132., 140., 90., 94., 94., 118., 133.];
 /// The default widths' sum.
 #[cfg(test)]
 pub(crate) const TABLE_W: f32 = sum_widths();

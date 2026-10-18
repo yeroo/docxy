@@ -710,7 +710,7 @@
   and Shift+Space (row, `row_header`) are in `project_input` before the Ctrl
   navigation; Ctrl+Home/End go to the first/last shown task's first/last
   column. Ctrl+Space may be the OS's input-source switch on macOS.
-- Defaults: `DEFAULT_WIDTHS` sum 818 and `DEFAULT_TABLE_SHARE` 0.70 make the
+- Defaults: `DEFAULT_WIDTHS` sum 847 and `DEFAULT_TABLE_SHARE` 0.75 make the
   whole Entry table visible at the default 1180 px window, every column
   holding its heading beside the arrow and its usual cell text (unit tests pin
   both, the second from per-character estimates). The table

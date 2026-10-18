@@ -185,8 +185,6 @@ fn the_whole_entry_table_fits_the_default_window_and_a_narrow_one_scrolls() {
     assert!(p.table_total() <= p.table_w, "{} > {}", p.table_total(), p.table_w);
     assert_eq!(p.table_x.get(), 0.);
     assert!(project_state(&p, None).contains(&("table_fits".into(), Json::Bool(true))));
-    // Every heading still holds its text, the arrow and the edge, but the two
-    // longest names: those are cut off by the cell (overflow hidden).
     p.layout(900.);
     assert!(p.table_total() > p.table_w, "the table bar has a range");
     let (table, _) = p.pane_scrolls();
@@ -200,11 +198,11 @@ fn the_whole_entry_table_fits_the_default_window_and_a_narrow_one_scrolls() {
 
 /// Each default width holds its heading beside the AutoFilter arrow and edge
 /// (`pl_2` 8 + text + `ARROW_W` + `EDGE_W`) and the usual cell text with its
-/// padding. Text widths are estimated per character at 12 px (6.8 bold
-/// headings, 6.3 cells); the real measure needs a window.
+/// padding and 1 px borders (18). Text widths are estimated per character at
+/// 12 px (7.3 bold headings, 6.3 cells); the real measure needs a window.
 #[test]
 fn every_default_width_holds_its_heading_and_usual_cell_text() {
-    const HEADING_CHAR: f32 = 6.8;
+    const HEADING_CHAR: f32 = 7.3;
     const CELL_CHAR: f32 = 6.3;
     let cell_samples = [
         "9999",
@@ -218,7 +216,7 @@ fn every_default_width_holds_its_heading_and_usual_cell_text() {
     ];
     for col in 0..COLUMN_COUNT {
         let heading = 8. + COLUMNS[col].len() as f32 * HEADING_CHAR + ARROW_W + EDGE_W;
-        let cell = cell_samples[col].len() as f32 * CELL_CHAR + 16.;
+        let cell = cell_samples[col].len() as f32 * CELL_CHAR + 18.;
         assert!(
             DEFAULT_WIDTHS[col] >= heading.max(cell),
             "{}: {} < heading {heading} / cell {cell}",
