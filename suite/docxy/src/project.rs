@@ -31,8 +31,8 @@ pub(super) use rows::*;
 mod columns;
 mod selection;
 pub(super) use columns::{ARROW_W, EDGE_W, WidthDrag, committed_widths, project_width_release_all};
-pub(crate) mod autofilter;
-pub(super) use autofilter::{AUTO_FILTER_STATUS, autofilter_click};
+mod autofilter;
+pub(super) use autofilter::{AUTO_FILTER_STATUS, MENU_ROW_H, autofilter_click, menu_json};
 
 /// Whole rows a PageUp/PageDown steps by: the rows that fit in the
 /// `project-body` probe, less one, so the cursor's landing row stays on

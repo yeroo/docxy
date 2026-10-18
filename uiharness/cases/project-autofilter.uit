@@ -31,7 +31,7 @@ test project the arrow opens the menu and Finish sorts latest first
   assert reply.items.0.label is Sort Earliest to Latest
   call menu-read {}
   assert reply.open is true
-  assert reply.target is filter
+  assert reply.target.filter is Finish
   assert reply.items.0.label is Sort Earliest to Latest
   assert reply.items.0.icon is sort-az
   assert reply.items.1.label is Sort Latest to Earliest

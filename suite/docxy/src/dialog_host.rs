@@ -1567,7 +1567,7 @@ impl Docxy {
                             h_flex()
                                 .id(("dialog-button", i))
                                 .relative()
-                                .h(px(crate::project::autofilter::ROW_H))
+                                .h(px(crate::project::MENU_ROW_H))
                                 .px_2()
                                 .gap_2()
                                 .items_center()

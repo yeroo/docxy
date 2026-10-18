@@ -4933,7 +4933,7 @@ fn dispatch_verb(
             // The Project AutoFilter popup is a dialog: reply as `menu-read` does.
             if target.get("filter").is_some() {
                 if let Some(d) = app.active_dialogs().and_then(|s| s.top()) {
-                    return Done::ok(crate::project::autofilter::menu_json(d));
+                    return Done::ok(crate::project::menu_json(d));
                 }
             }
             Done::ok(crate::menu::read_json(app.menu.as_ref()))
@@ -4941,7 +4941,7 @@ fn dispatch_verb(
         "menu-read" => Done::ok(match app.active_dialogs().and_then(|s| s.top()) {
             // The AutoFilter popup (#1607) is a dialog drawn as a menu.
             Some(d) if matches!(d.owner, crate::dialog::DialogOwner::ProjectFilter { .. }) => {
-                crate::project::autofilter::menu_json(d)
+                crate::project::menu_json(d)
             }
             _ => crate::menu::read_json(app.menu.as_ref()),
         }),

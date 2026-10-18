@@ -1,11 +1,12 @@
 //! The entry table's AutoFilter heading menu (#1533): a heading's arrow opens
-//! a drop-down with Sort, `Clear Filter from <Field>`, and the column's value
-//! checklist (a Year > Month > Day tree on a date column) over
-//! `Editor::column_values`. Like the sheet's drop-down it sits on the tab's
-//! dialog stack, so the harness's `dialog-*` verbs drive it.
+//! Project's popup under the heading (#1607) with Sort, `Clear Filter from
+//! <Field>`, and the column's value checklist (a Year > Month > Day tree on a
+//! date column) over `Editor::column_values`. Like the sheet's drop-down it
+//! sits on the tab's dialog stack (drawn as a popup by `Dialog::popup`), so
+//! the harness's `dialog-*` verbs drive it.
 //!
-//! Group by and Filters are drawn disabled, so the menu keeps Project's shape;
-//! both are follow-ups. Sort applies at once, like a menu item; OK applies the
+//! Group by, No Group and Filters are drawn disabled, so the menu keeps
+//! Project's shape; all are follow-ups. Sort applies at once, like a menu item; OK applies the
 //! checklist; Cancel discards it. Checked boxes are two-state (the dialog
 //! check list's rule: a parent is checked when all its children are).
 use super::*;
@@ -164,9 +165,9 @@ pub(crate) struct Anchor {
 /// of everything but the value list (menu rows, rules, the OK / Cancel row
 /// and padding).
 pub(crate) const POPUP_W: f32 = 250.;
-pub(crate) const ROW_H: f32 = 26.;
+pub(crate) const MENU_ROW_H: f32 = 26.;
 pub(crate) const RULE_H: f32 = 7.;
-pub(crate) const FIXED_H: f32 = 6. * ROW_H + 3. * RULE_H + 40. + 8.;
+pub(crate) const FIXED_H: f32 = 6. * MENU_ROW_H + 3. * RULE_H + 40. + 8.;
 const MIN_LIST_H: f32 = 80.;
 const MAX_LIST_H: f32 = 220.;
 const MARGIN: f32 = 4.;
@@ -296,6 +297,8 @@ pub(crate) fn menu_json(d: &Dialog) -> Json {
             ("id", Json::Str(b.id.clone())),
             ("label", Json::Str(b.label.clone())),
             ("enabled", Json::Bool(b.enabled)),
+            ("checked", Json::Bool(false)),
+            ("key_tip", Json::Str(String::new())),
             (
                 "submenu",
                 if b.submenu {
@@ -312,9 +315,14 @@ pub(crate) fn menu_json(d: &Dialog) -> Json {
     }
     Json::obj(vec![
         ("open", Json::Bool(true)),
-        ("target", Json::Str("filter".into())),
-        ("column", Json::Str(column.into())),
+        (
+            "target",
+            Json::obj(vec![("filter", Json::Str(column.into()))]),
+        ),
+        ("highlight", Json::Null),
+        ("depth", Json::Num(0.)),
         ("items", Json::Arr(items)),
+        ("toolbar", Json::Arr(Vec::new())),
         ("controls", field("controls")),
         ("buttons", Json::Arr(foot)),
     ])

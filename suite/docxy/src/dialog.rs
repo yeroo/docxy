@@ -379,8 +379,8 @@ pub(crate) struct Button {
 }
 
 /// Where a dialog drawn as a popup (#1607) sits, decided when it opens:
-/// the panel's top-left in window pixels, its width, the value list's height
-
+/// the panel's top-left in window pixels, its width and the value list's
+/// height.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Popup {
     pub x: f32,
