@@ -171,11 +171,11 @@ test the row menu's item comes after Notes..., needs a task and renames it as on
   call menu-open {"target":{"row":2}}
   call menu-read {}
   # After Notes..., before Add to Timeline, as the manifest's `after` says.
-  assert reply.items.23.label is Notes...
-  assert reply.items.24.label is Rename (fixture)
-  assert reply.items.24.plugin is true
-  assert reply.items.24.enabled is true
-  assert reply.items.25.label is Add to Timeline
+  assert reply.items.19.label is Notes...
+  assert reply.items.20.label is Rename (fixture)
+  assert reply.items.20.plugin is true
+  assert reply.items.20.enabled is true
+  assert reply.items.21.label is Add to Timeline
   call menu-click {"label":"Rename (fixture)"}
   assert selected_name is Renamed by fixture
   assert status is Fixture: renamed task 2
@@ -196,8 +196,8 @@ test the row menu's item comes after Notes..., needs a task and renames it as on
   click C3
   call menu-open {"target":{"row":null}}
   call menu-read {}
-  assert reply.items.24.label is Rename (fixture)
-  assert reply.items.24.enabled is false
+  assert reply.items.20.label is Rename (fixture)
+  assert reply.items.20.enabled is false
   key escape
 
 test the chart menu opens beside the bars with Project's unbuilt items greyed
