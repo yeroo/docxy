@@ -4607,59 +4607,6 @@ fn fill_down_without_a_range_says_so() {
     assert_eq!(names(&t), ["First", "Second", "Third"]);
 }
 
-/// #1213: Clear Contents is Delete's clear without its deletion.
-#[test]
-fn clear_contents_never_deletes() {
-    let mut t = fill_tab();
-    let uids: Vec<i32> = v(&t).ed.project().tasks.iter().map(|t| t.uid).collect();
-    for &uid in &uids[1..] {
-        apply_cell(&mut vm(&mut t).ed, uid, COL_PREDECESSORS, "1").unwrap();
-        apply_cell(&mut vm(&mut t).ed, uid, COL_RESOURCES, "Ann").unwrap();
-    }
-    let fields = |t: &DocTab, row: usize| {
-        let task = &v(t).ed.project().tasks[row];
-        [COL_NAME, COL_PREDECESSORS, COL_RESOURCES].map(|c| cell_edit_text(&v(t).ed, task, c))
-    };
-    assert_eq!(fields(&t, 1), ["Second", "1", "Ann"]);
-    // On the ID column, without a range: the row's three fields.
-    vm(&mut t).ed.select(1);
-    vm(&mut t).col = COL_ID;
-    apply_project_act(&mut t, ProjectAct::ClearContents);
-    assert_eq!(v(&t).ed.project().tasks.len(), 3, "{}", t.status);
-    assert!(t.dialogs.top().is_none(), "no delete question");
-    assert_eq!(fields(&t, 1), ["", "", ""]);
-    assert_eq!(fields(&t, 2), ["Third", "1", "Ann"]);
-    // A row-header range: every row's three fields, as one undo step, and
-    // the range is consumed.
-    {
-        let v = vm(&mut t);
-        v.anchor = Some((uids[0], COLUMN_COUNT - 1));
-        v.row_header = true;
-        v.ed.select(2);
-        v.col = COL_ID;
-    }
-    let depth = v(&t).ed.undo_depth();
-    apply_project_act(&mut t, ProjectAct::ClearContents);
-    assert_eq!(v(&t).ed.project().tasks.len(), 3);
-    for row in 0..3 {
-        assert_eq!(fields(&t, row), ["", "", ""], "row {row}");
-    }
-    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
-    assert!(v(&t).selection().is_none(), "the range is consumed");
-    // A column that cannot clear says so.
-    vm(&mut t).col = COL_DURATION;
-    apply_project_act(&mut t, ProjectAct::ClearContents);
-    assert_eq!(t.status.as_ref(), "Duration can't be cleared");
-    // A blank row: nothing to clear.
-    let blank = vm(&mut t).ed.insert_blank_row(None).unwrap();
-    vm(&mut t).ed.select(blank);
-    vm(&mut t).col = COL_NAME;
-    t.status = "x".into();
-    apply_project_act(&mut t, ProjectAct::ClearContents);
-    assert_eq!(t.status.as_ref(), "Ready");
-    assert!(v(&t).ed.project().tasks[blank].is_null);
-}
-
 /// The range as (uids, cols), comparable.
 fn sel_of(t: &DocTab) -> Option<(Vec<i32>, std::ops::RangeInclusive<usize>)> {
     v(t).selection().map(|s| (s.uids, s.cols))
@@ -5065,4 +5012,48 @@ fn toolbar_drop_downs_list_choices_with_the_current_ticked() {
     assert_eq!(choices(4)[0].0, "No Fill");
     assert_eq!(choices(5)[0].0, "Automatic");
     assert!(choices(5)[0].1, "no colour set ticks Automatic");
+}
+
+/// #1537: a toolbar choice that changes no cell records no undo step.
+#[test]
+fn a_toolbar_choice_that_changes_nothing_is_no_undo_step() {
+    let mut t = fill_tab();
+    apply_project_act(&mut t, ProjectAct::CellStyle(StyleEdit::Size(14)));
+    let depth = v(&t).ed.undo_depth();
+    apply_project_act(&mut t, ProjectAct::CellStyle(StyleEdit::Size(14)));
+    assert_eq!(v(&t).ed.undo_depth(), depth, "same size again");
+    apply_project_act(&mut t, ProjectAct::CellStyle(StyleEdit::Fill(None)));
+    assert_eq!(v(&t).ed.undo_depth(), depth, "clearing what is not set");
+}
+
+/// #1537: Bold and the toolbar's values follow the style the grid draws: a
+/// summary row is bold, a plan category style sits under the cell's own.
+#[test]
+fn the_toolbar_reads_the_effective_style() {
+    let mut t = fill_tab();
+    let uid = v(&t).ed.project().tasks[0].uid;
+    vm(&mut t).ed.edit_formatting(|f| {
+        f.set_category(
+            "All",
+            projcore::formatting::TextStyle {
+                font: Some("Verdana".into()),
+                bold: Some(true),
+                ..Default::default()
+            },
+        )
+    });
+    let items = project_toolbar(v(&t), Some(uid));
+    assert_eq!(items[0].value.as_deref(), Some("Verdana"));
+    assert!(items[2].entry.checked, "bold from the category shows");
+    // Bold flips the effective value: the cell becomes not bold.
+    apply_project_act(&mut t, ProjectAct::CellStyle(StyleEdit::Bold));
+    let own = v(&t)
+        .ed
+        .project()
+        .formatting
+        .cell(uid, "Name")
+        .cloned()
+        .unwrap();
+    assert_eq!(own.bold, Some(false));
+    assert!(!project_toolbar(v(&t), Some(uid))[2].entry.checked);
 }

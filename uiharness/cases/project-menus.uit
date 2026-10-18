@@ -304,6 +304,11 @@ test the toolbar's Bold styles the kept range in one undo step and its drop-down
   call menu-click {"label":"Size"}
   call menu-read {}
   assert reply.depth is 1
+  key escape
+  call menu-read {}
+  assert reply.depth is 0
+  assert reply.toolbar.1.label is Size
+  call menu-click {"label":"Size"}
   call menu-click {"label":"14"}
   assert menu is nothing
   call menu-open {"target":{"row":2}}

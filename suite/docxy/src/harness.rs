@@ -5036,12 +5036,18 @@ fn dispatch_verb(
                             }
                             app.menu_activate_toolbar(i, window, cx)?;
                         } else {
+                            // Resolve the choice before entering, so a bad
+                            // path leaves the menu as it was.
+                            let sub = &menu.toolbar[i].entry.submenu;
+                            let path = match labels.len() > 1 {
+                                true => Some(crate::menu::resolve(sub, &labels[1..])?),
+                                false => None,
+                            };
                             let m = app.menu.as_mut().ok_or("no menu is open")?;
                             if !m.enter_toolbar(i, false) {
                                 return Err(format!("toolbar item '{}' is disabled", labels[0]));
                             }
-                            if labels.len() > 1 {
-                                let path = crate::menu::resolve(&m.items, &labels[1..])?;
+                            if let Some(path) = path {
                                 app.menu_activate(&path, window, cx)?;
                             }
                         }

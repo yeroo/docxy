@@ -851,8 +851,8 @@
   kept: Cut, Copy, Paste, Paste Special..., Scroll to Task, Insert/Delete/
   Inactivate Task, Manually/Auto Schedule, Assign Resources..., Text Styles...,
   Information..., Notes..., Add to Timeline, Link. Fill Down, Clear Contents
-  and Font... are not row items (Ctrl+D stays; `ProjectAct::ClearContents` has
-  no UI now); `Link` is `ProjectAct::Hyperlink` (the bar menu keeps
+  and Font... are not row items (Ctrl+D stays; `ProjectAct::ClearContents` was
+  removed, nothing else reached it); `Link` is `ProjectAct::Hyperlink` (the bar menu keeps
   `Hyperlink...`). Paste Special..., Text Styles... and Add to Timeline are
   disabled placeholders until #1389/#1390/#1391.
 - `Menu::toolbar` (`menu::ToolbarItem`: an `Entry` plus `ToolbarKind`
@@ -866,7 +866,9 @@
 - Formatting items are `ProjectAct::CellStyle(StyleEdit)`: one
   `Editor::edit_formatting` over the selected cells (the range, else the
   cursor cell, real tasks only; the range survives), merged into each cell's
-  direct `TextStyle`. Bold/Italic set every cell to the opposite of the cursor
-  cell's value. The lists are fixed (8 fonts, sizes 8 to 72, 8 colours): the
+  direct `TextStyle`; a choice that changes no cell records no step.
+  Bold/Italic set every cell to the opposite of the cursor cell's effective
+  value (row categories under the cell's own, a summary bold), which is also
+  what the toolbar's ticks and combo values show. The lists are fixed (8 fonts, sizes 8 to 72, 8 colours): the
   suite has no font enumeration. The task buttons dispatch AddLink,
   UnlinkTasks, Outdent, Indent and Task Details (`Constraint`).

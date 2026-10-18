@@ -33160,9 +33160,6 @@ impl Docxy {
         })
     }
 
-    /// Open the submenu of the open menu's item `i` in the menu's place (the
-    /// Page Number menu's galleries): the pointer's way into a submenu, which
-    /// enters with nothing highlighted as the click leaves it.
     /// A click on toolbar drop-down `i` (#1537): its choices replace the items.
     fn menu_enter_toolbar(&mut self, i: usize, cx: &mut Context<Self>) {
         if let Some(menu) = self.menu.as_mut()
@@ -33254,6 +33251,9 @@ impl Docxy {
         bar.into_any_element()
     }
 
+    /// Open the submenu of the open menu's item `i` in the menu's place (the
+    /// Page Number menu's galleries): the pointer's way into a submenu, which
+    /// enters with nothing highlighted as the click leaves it.
     fn menu_enter_submenu(&mut self, i: usize, cx: &mut Context<Self>) {
         if let Some(menu) = self.menu.as_mut() {
             if menu.enter(i, false) {
@@ -33406,8 +33406,8 @@ impl Docxy {
         self.menu_pick(Err(path), window, cx)
     }
 
-    /// Run toolbar item `i` of the open menu (#1537): a button runs its
-    /// command, a drop-down opens its choices in the menu's place.
+    /// Run toolbar button `i` of the open menu (#1537). A drop-down opens
+    /// its choices instead ([`Self::menu_enter_toolbar`]); this refuses it.
     pub(crate) fn menu_activate_toolbar(
         &mut self,
         i: usize,
@@ -33455,7 +33455,8 @@ impl Docxy {
         // Its task items are the clicked row's: one that drops the range
         // anyway first selects that row as a left click does, so it acts on
         // the row exactly as before #1213. The range items (Cut, Copy,
-        // Paste, Fill Down, Clear Contents) run on the kept range.
+        // Paste, and the toolbar's CellStyle, Link and Unlink) run on the
+        // kept range.
         if let (Some(uid), Some(Act::Project(a))) = (kept_row, act)
             && project_act_clears_range(a)
             && self.project_selection().and_then(|(sel, _)| sel) != Some(uid)

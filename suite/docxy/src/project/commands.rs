@@ -96,16 +96,10 @@ pub(crate) enum ProjectAct {
     /// Ctrl+Delete: clear the active cell, or reset it to its default; never
     /// deletes the task.
     ResetCell,
-    /// Ctrl+D and a task row's context menu › Fill Down: each column of the
+    /// Ctrl+D: each column of the
     /// range but ID takes its top row's value into every shown row below it,
     /// as one undo step; the range stays. See `clip.rs`.
     FillDown,
-    /// Delete's clear without its deletion (the row menu's Clear Contents
-    /// until #1537 dropped it; no menu reaches it now). Name, Predecessors and Resource Names clear (all three
-    /// on the ID column or a row-header range); never resets another field
-    /// to a default and never deletes the task.
-    #[cfg_attr(not(test), allow(dead_code))]
-    ClearContents,
     /// A task row's context menu › Delete Task: the selected task, whatever
     /// column the cursor is on; a summary asks first, as Delete on its ID does.
     DeleteTask,
@@ -853,8 +847,8 @@ pub(crate) fn gantt_format_tab() -> rs::Tab<Act> {
 /// highlight, Cut and Paste clear it when they run, Link and Unlink act on
 /// it, and Delete clears the range's cells and consumes it. The rule lives
 /// here, one place, so keys, the ribbon, the QAT and Backstage cannot drift
-/// apart. Fill Down fills the range and keeps it; Clear Contents clears it
-/// and consumes it, as Delete does. A UI plugin's command keeps it too: the
+/// apart. Fill Down fills the range and keeps it, and so does CellStyle
+/// (#1537), which styles it. A UI plugin's command keeps it too: the
 /// range is what its request's selection carries (#1571).
 pub(crate) fn project_act_clears_range(act: ProjectAct) -> bool {
     use ProjectAct::*;
@@ -866,7 +860,6 @@ pub(crate) fn project_act_clears_range(act: ProjectAct) -> bool {
             | UnlinkTasks
             | ClearCell
             | FillDown
-            | ClearContents
             | CellStyle(_)
             | Plugin(_)
     )
@@ -923,9 +916,9 @@ fn task_act_active(v: &ProjectView, act: ProjectAct, uid: Option<i32>) -> bool {
 /// delete). That is the cursor's row, except after a right-click inside the
 /// selected range, which keeps the range and the cursor (#1213): the task
 /// items still act on the clicked row (the host selects it before one runs),
-/// while the range items (Cut, Copy, Paste, Fill Down, Clear Contents)
-/// follow the range and the cursor. Fill Down, Clear Contents and Font are
-/// not Project's row items (#1537); their keys and the ribbon stay.
+/// while the range items (Cut, Copy, Paste, and the toolbar's CellStyle,
+/// Link and Unlink) follow the range and the cursor. Fill Down (Ctrl+D) and
+/// Font are not Project's row items (#1537).
 pub(crate) fn project_row_menu(
     v: &ProjectView,
     clicked: Option<i32>,
@@ -1129,16 +1122,39 @@ fn format_cells(v: &ProjectView) -> Vec<(i32, &'static str)> {
         .collect()
 }
 
-/// The cursor cell's direct style (empty when it has none).
+/// The style the grid draws for task `uid`'s cell in column `col`: the
+/// plan's row categories under the cell's own style, and bold on a summary.
+fn effective_style(v: &ProjectView, uid: i32, col: &str) -> projcore::formatting::TextStyle {
+    let Some((row, task)) =
+        v.ed.project()
+            .tasks
+            .iter()
+            .enumerate()
+            .find(|(_, t)| t.uid == uid)
+    else {
+        return Default::default();
+    };
+    let critical = v.ed.schedule().get(uid).is_some_and(|r| r.critical);
+    let inactive = inactive_row(v.ed.project(), row);
+    let row_style = crate::plugin_ui::row_style(v, task, critical, inactive);
+    let mut style =
+        crate::plugin_ui::cell_style(v, row_style.as_ref(), Some(uid), col).unwrap_or_default();
+    if style.bold.is_none() && task.summary {
+        style.bold = Some(true);
+    }
+    style
+}
+
+/// The cursor cell's effective style (empty off a task cell).
 fn cursor_style(v: &ProjectView) -> projcore::formatting::TextStyle {
     v.selected_uid()
         .zip(crate::COLUMNS.get(v.col))
-        .and_then(|(uid, &col)| v.ed.project().formatting.cell(uid, col).cloned())
+        .map(|(uid, &col)| effective_style(v, uid, col))
         .unwrap_or_default()
 }
 
-/// Apply `edit` to every cell [`format_cells`] names as one undo step; the
-/// status line says what changed.
+/// Apply `edit` to every cell [`format_cells`] names as one undo step (none
+/// when no cell changes); the status line says what changed.
 fn apply_cell_style(v: &mut ProjectView, edit: StyleEdit) -> Result<String, String> {
     let cells = format_cells(v);
     if cells.is_empty() {
@@ -1151,7 +1167,8 @@ fn apply_cell_style(v: &mut ProjectView, edit: StyleEdit) -> Result<String, Stri
     let italic = flip(cursor.italic);
     v.ed.edit_formatting(|f| {
         for &(uid, col) in &cells {
-            let mut s = f.cell(uid, col).cloned().unwrap_or_default();
+            let old = f.cell(uid, col).cloned().unwrap_or_default();
+            let mut s = old.clone();
             match edit {
                 StyleEdit::Bold => s.bold = bold,
                 StyleEdit::Italic => s.italic = italic,
@@ -1160,7 +1177,9 @@ fn apply_cell_style(v: &mut ProjectView, edit: StyleEdit) -> Result<String, Stri
                 StyleEdit::Fill(c) => s.background = c,
                 StyleEdit::Color(c) => s.color = c,
             }
-            f.set_cell(uid, col, s);
+            if s != old {
+                f.set_cell(uid, col, s);
+            }
         }
     });
     let n = cells.len();
@@ -2168,41 +2187,6 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                     _ => "Select cells below to fill down".into(),
                 };
                 status = Some(applied);
-            }
-            ClearContents => {
-                // Delete's clear without its deletion. A row-header range
-                // spans every column, so it clears all three fields. The
-                // range is consumed, as Delete consumes it.
-                let sel = v.selection();
-                v.anchor = None;
-                let cleared = if let Some(sel) = sel {
-                    let cols = range_clear_cols(&sel);
-                    if cols.is_empty() {
-                        Some("Selection's columns can't be cleared".into())
-                    } else {
-                        clear_range_cells(&mut v.ed, &sel, &cols)?
-                    }
-                } else if let Some(uid) = v.selected_uid() {
-                    let blank = v.ed.project().task(uid).ok_or("No task selected")?.is_null;
-                    match v.col {
-                        _ if blank => None,
-                        COL_ID => {
-                            let row = Selection {
-                                uids: vec![uid],
-                                cols: COL_ID..=COL_ID,
-                            };
-                            let cols = [COL_NAME, COL_PREDECESSORS, COL_RESOURCES];
-                            clear_range_cells(&mut v.ed, &row, &cols)?
-                        }
-                        COL_NAME | COL_PREDECESSORS | COL_RESOURCES => {
-                            apply_cell(&mut v.ed, uid, v.col, "")?
-                        }
-                        _ => Some(format!("{} can't be cleared", COLUMNS[v.col])),
-                    }
-                } else {
-                    None
-                };
-                status = Some(cleared.unwrap_or_else(|| "Ready".into()));
             }
             Milestone => {
                 if let Some(uid) = v.selected_uid() {
