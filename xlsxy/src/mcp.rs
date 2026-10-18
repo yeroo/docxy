@@ -569,7 +569,7 @@ fn tool_defs() -> Json {
                 ),
                 (
                     "width",
-                    prop("number", "New column width; must be positive."),
+                    prop("number", "New column width; must not be negative."),
                 ),
                 sheet(),
                 target(),

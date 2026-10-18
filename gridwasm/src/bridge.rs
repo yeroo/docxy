@@ -2526,8 +2526,8 @@ impl Session {
             .get("width")
             .and_then(json::Json::as_f64)
             .ok_or("col.width needs a 'width' number")?;
-        if !(width.is_finite() && width > 0.0) {
-            return Err("col.width: 'width' must be positive".to_string());
+        if !(width.is_finite() && width >= 0.0) {
+            return Err("col.width: 'width' must not be negative".to_string());
         }
         let prior = self.pkg.workbook.sheets[si].col_width(col);
         self.pkg.workbook.sheets[si].set_col_width(col, width);
@@ -6487,12 +6487,26 @@ mod tests {
     }
 
     #[test]
-    fn ctl_col_width_rejects_non_positive_width() {
+    fn ctl_col_width_rejects_negative_width() {
         let mut s = Session::open(&sample_xlsx()).expect("open");
-        let out = s.ctl(r#"{"verb":"col.width","args":{"col":"A","width":0}}"#);
-        assert!(out.contains("'width' must be positive"), "{out}");
-        let out2 = s.ctl(r#"{"verb":"col.width","args":{"col":"A","width":-5}}"#);
-        assert!(out2.contains("'width' must be positive"), "{out2}");
+        let out = s.ctl(r#"{"verb":"col.width","args":{"col":"A","width":-5}}"#);
+        assert!(out.contains("'width' must not be negative"), "{out}");
+    }
+
+    #[test]
+    fn ctl_col_width_accepts_zero_and_undo_restores_from_zero() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.pkg.workbook.sheets[0].set_col_width(0, 0.0);
+        let out = s.ctl(r#"{"verb":"col.width","args":{"col":"A","width":20}}"#);
+        assert_eq!(s.pkg.workbook.sheets[0].col_width(0), 20.0, "{out}");
+        let inv_reply = s.ctl(&extract_inverse(&out));
+        assert!(!inv_reply.contains("\"ok\":false"), "{inv_reply}");
+        assert_eq!(s.pkg.workbook.sheets[0].col_width(0), 0.0);
+        s.ctl(&extract_inverse(&inv_reply));
+        assert_eq!(s.pkg.workbook.sheets[0].col_width(0), 20.0);
+        let zero = s.ctl(r#"{"verb":"col.width","args":{"col":"B","width":0}}"#);
+        assert!(!zero.contains("\"ok\":false"), "{zero}");
+        assert_eq!(s.pkg.workbook.sheets[0].col_width(1), 0.0);
     }
 
     #[test]
