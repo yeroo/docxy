@@ -1192,17 +1192,66 @@ fn deletable_object(inline: &Inline) -> Option<Inline> {
     }
 }
 
-/// A field as run-level XML, which `w:ins`/`w:del` may contain: a
-/// `w:fldSimple` (paragraph-level content) becomes the equivalent complex
-/// field — begin, instruction, separate, its result runs, end. Other field
-/// forms (complex fields, `w:sym` runs) are already runs.
+/// A field as run-level XML, which `w:ins`/`w:del` may contain: every
+/// `w:fldSimple` (paragraph-level content), a nested one included, becomes the
+/// equivalent complex field — begin, instruction, separate, its result runs,
+/// end. Other field forms (complex fields, `w:sym` runs) are already runs.
 pub(crate) fn run_level_field(raw: &str) -> String {
+    let mut out = raw.to_string();
+    // The last start tag has no `w:fldSimple` inside it, so its first close
+    // tag is its own; convert it and look again.
+    while let Some(start) = out.rfind("<w:fldSimple") {
+        let open_end = out[start..].find('>').map_or(out.len(), |e| start + e + 1);
+        let end = if out[..open_end].ends_with("/>") {
+            open_end
+        } else {
+            out[open_end..]
+                .find("</w:fldSimple>")
+                .map_or(out.len(), |e| open_end + e + "</w:fldSimple>".len())
+        };
+        let runs = simple_field_runs(&out[start..end]);
+        out.replace_range(start..end, &runs);
+    }
+    out
+}
+
+/// Whether `runs` (see [`run_level_field`]) holds only what a `w:del` may:
+/// runs, proofing marks and smart tags at its top level. A `w:hyperlink` or
+/// `w:sdt` in a field's result stays out.
+pub(crate) fn is_run_level(runs: &str) -> bool {
+    let mut parser = XmlParser::new(runs);
+    let mut depth = 0usize;
+    loop {
+        match parser.next() {
+            Event::Start => {
+                if depth == 0 && !matches!(parser.name(), "w:r" | "w:proofErr" | "w:smartTag") {
+                    return false;
+                }
+                depth += 1;
+            }
+            Event::End => depth = depth.saturating_sub(1),
+            Event::Text => {}
+            Event::Eof => return !parser.is_malformed(),
+        }
+    }
+}
+
+/// One `w:fldSimple` element as a complex field's runs; the lock and dirty
+/// flags move onto its begin marker.
+fn simple_field_runs(raw: &str) -> String {
     let mut parser = XmlParser::new(raw);
     if parser.next() != Event::Start || parser.name() != "w:fldSimple" {
         return raw.to_string();
     }
     let mut instr = String::new();
     XmlParser::append_decoded(parser.attr("w:instr"), &mut instr);
+    let mut flags = String::new();
+    for flag in ["w:fldLock", "w:dirty"] {
+        let value = parser.attr(flag);
+        if !value.is_empty() {
+            flags.push_str(&format!(" {flag}=\"{value}\""));
+        }
+    }
     let open_end = parser.pos();
     let self_closing = raw[..open_end].trim_end().ends_with("/>");
     let result = if self_closing {
@@ -1211,8 +1260,8 @@ pub(crate) fn run_level_field(raw: &str) -> String {
         let close = raw.rfind("</w:fldSimple>").unwrap_or(raw.len());
         &raw[open_end.min(close)..close]
     };
-    let mut out = String::from(
-        "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r><w:r><w:instrText xml:space=\"preserve\">",
+    let mut out = format!(
+        "<w:r><w:fldChar w:fldCharType=\"begin\"{flags}/></w:r><w:r><w:instrText xml:space=\"preserve\">"
     );
     esc_attr(&instr, &mut out);
     out.push_str("</w:instrText></w:r><w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>");

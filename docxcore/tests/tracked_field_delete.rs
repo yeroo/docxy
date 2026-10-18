@@ -184,14 +184,87 @@ fn a_selection_over_text_field_text_records_all_three() {
     ed.caret = Caret::at(vec![0], 4);
     assert!(ed.delete_selection());
     let x = xml(&ed);
-    assert_eq!(deletions(&ed), 1, "{x}");
-    assert!(x.matches("<w:del ").count() >= 2, "{x}");
+    assert_eq!(x.matches("<w:del ").count(), 3, "{x}");
+    let ids: std::collections::HashSet<&str> = x
+        .split("<w:del w:id=\"")
+        .skip(1)
+        .map(|r| &r[..r.find('"').unwrap()])
+        .collect();
+    assert_eq!(ids.len(), 3, "distinct ids: {x}");
+    let field_del = x
+        .split("<w:del ")
+        .find(|d| d.contains("delInstrText"))
+        .unwrap();
+    let field_del = &field_del[..field_del.find("</w:del>").unwrap()];
+    assert!(
+        !field_del.contains(">b<") && !field_del.contains(">c<"),
+        "{field_del}"
+    );
     let mut accepted = Editor::new(ed.doc.clone());
     accepted.accept_all_revisions();
     assert_eq!(text(&accepted), "ad");
     ed.reject_all_revisions();
     assert_eq!(text(&ed), "ab7cd");
     assert_eq!(fields(&ed), 1);
+}
+
+#[test]
+fn a_nested_simple_field_is_flattened_inside_the_deletion() {
+    let nested = "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+        <w:r><w:instrText> QUOTE </w:instrText></w:r>\
+        <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+        <w:fldSimple w:instr=\" SEQ n \"><w:r><w:t>2</w:t></w:r></w:fldSimple>\
+        <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
+    let mut ed = editor(nested);
+    assert_eq!(fields(&ed), 1, "the nested field collapses into the outer");
+    ed.set_caret(Caret::at(vec![0], 3));
+    ed.backspace();
+    if ed.has_selection() {
+        ed.backspace();
+    }
+    assert_eq!(deletions(&ed), 1, "{}", xml(&ed));
+    let x = xml(&ed);
+    let del = &x[x.find("<w:del ").unwrap()..x.find("</w:del>").unwrap()];
+    assert!(
+        !del.contains("fldSimple") && !del.contains("hyperlink"),
+        "{del}"
+    );
+    assert_eq!(del.matches("fldCharType=\"begin\"").count(), 2, "{del}");
+}
+
+#[test]
+fn a_field_whose_result_holds_a_link_is_kept() {
+    let linked = "<w:fldSimple w:instr=\" REF x \"><w:hyperlink w:anchor=\"x\">\
+        <w:r><w:t>7</w:t></w:r></w:hyperlink></w:fldSimple>";
+    let mut ed = editor(linked);
+    assert_eq!(fields(&ed), 1, "a fldSimple loads as one field");
+    ed.set_caret(Caret::at(vec![0], 3));
+    ed.backspace();
+    if ed.has_selection() {
+        ed.backspace();
+    }
+    assert_eq!(fields(&ed), 1, "{}", xml(&ed));
+    assert!(!xml(&ed).contains("<w:del "), "{}", xml(&ed));
+}
+
+#[test]
+fn a_locked_field_stays_locked_through_delete_and_reject() {
+    let locked = "<w:fldSimple w:instr=\" PAGE \" w:fldLock=\"1\" w:dirty=\"true\">\
+        <w:r><w:t>7</w:t></w:r></w:fldSimple>";
+    let mut ed = editor(locked);
+    ed.set_caret(Caret::at(vec![0], 3));
+    ed.backspace();
+    if ed.has_selection() {
+        ed.backspace();
+    }
+    assert_eq!(deletions(&ed), 1);
+    assert!(xml(&ed).contains("w:fldLock=\"1\""), "{}", xml(&ed));
+    ed.reject_all_revisions();
+    let x = xml(&ed);
+    assert!(
+        x.contains("w:fldLock=\"1\"") && x.contains("w:dirty=\"true\""),
+        "{x}"
+    );
 }
 
 #[test]

@@ -20,9 +20,11 @@
 //!   inside it too (#1465).
 //!
 //! Not recorded (they change the document as without tracking): paragraph
-//! marks (Enter, and a Backspace or Delete that joins paragraphs), fields and other one-unit inlines (an Update Field or
-//! Edit Field rewrites a field's result and code outright, #1241),
-//! formatting, and table structure. A selection across paragraphs records the deletion of its text
+//! marks (Enter, and a Backspace or Delete that joins paragraphs), an Update
+//! Field or Edit Field rewrite of a field's result and code (#1241), an
+//! equation, formatting, and table structure. A deleted field or picture gets
+//! a `w:del` of its own that never merges with a neighbour (#1242, #1470); a
+//! field whose result a `w:del` cannot hold (a link) stays. A selection across paragraphs records the deletion of its text
 //! in each paragraph and keeps the paragraph marks.
 
 use super::{
@@ -612,7 +614,15 @@ fn plan_delete(content: &[Inline], idx: usize, author: &str) -> Plan {
                 Inline::Raw(_) => return Plan::Record { merges: false },
                 // A field likewise (#1470): its runs go in a `w:del` of its
                 // own, which Reject restores.
-                Inline::Field { .. } => return Plan::Record { merges: false },
+                // One a `w:del` cannot hold (a link or content control in its
+                // result) stays, as an equation does.
+                Inline::Field { raw, .. } => {
+                    return if crate::compare::is_run_level(&crate::compare::run_level_field(raw)) {
+                        Plan::Record { merges: false }
+                    } else {
+                        Plan::Keep
+                    };
+                }
                 Inline::Equation { .. } => return Plan::Keep,
                 _ => return Plan::Remove,
             };
