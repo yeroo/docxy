@@ -1306,7 +1306,8 @@ column drawn as Project's check mark that a click or Space toggles.
 Each control is `{name, label, kind, value, text, enabled, visible}`:
 
 - `kind` is one of `text`, `number`, `date`, `duration`, `multiline`,
-  `checkbox`, `radio`, `dropdown`, `list`, `grid`, `checklist` and `label`.
+  `checkbox`, `radio`, `dropdown`, `list`, `grid`, `checklist`, `label` and
+  `sample` (read-only like a label: `dialog-set` refuses it, #1609).
   A `multiline` field (#1532) is typed into like a text field, and Enter in
   it is a new line rather than OK; Ctrl+V keeps a pasted text's line breaks.
 - `value` is typed: a checkbox's is a bool, a number's a number, an item

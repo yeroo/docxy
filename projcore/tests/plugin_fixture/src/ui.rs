@@ -15,8 +15,10 @@
 //!   fixed size, two columns, Help bottom left, #1609; a Bump button) that
 //!   `fixture.hello` opens; OK sends `fixture.hello` again with the values,
 //!   Bump sends it with `button: "bump"` (one `task.set` op naming the task
-//!   "Bumped by fixture", the dialog kept open), Help with `button: "help"`
-//!   (a status). The modeless `fixture.sheet` has its buttons down the right
+//!   "Bumped by fixture", the dialog kept open), Help is the host's (#1609: the
+//!   dialog names no `help` URL, so the host says its documentation is
+//!   coming). A header text `fixture.title` sits above the page and the
+//!   echo label repeats its value, which the state sees at open. The modeless `fixture.sheet` has its buttons down the right
 //!   and a grid of six rows.
 //! - Commands: `fixture.hello` (the dialog, then a status with its number),
 //!   `fixture.flag` (flips the toggle: a view switch of the same name the
@@ -49,12 +51,12 @@ const MANIFEST: &str = r##"{
   "menus":[{"menu":"row","items":[{"id":"fixture.rename","label":"Rename (fixture)","icon":"comment","after":"Notes..."}]}],
   "dialogs":[
     {"id":"task-information","header":[{"name":"fixture.head","label":"Fixture head:","kind":"label","value":"on every page"}],
-     "pages":[{"name":"Fixture","controls":[
+     "pages":[{"name":"Fixture","columns":2,"controls":[
       {"name":"fixture.note","label":"Fixture &note:","kind":"multiline","value":""},
       {"name":"fixture.grid","label":"Fixture items","kind":"grid","columns":[{"name":"Name","kind":"text"},{"name":"Done","kind":"checkbox"}],"value":[["a","false"],["b","true"]]},
       {"name":"fixture.pick","label":"Fixture p&ick:","kind":"dropdown","items":["none"],"value":"none"},
       {"name":"fixture.locked","label":"Fixture locked","kind":"checkbox","value":true}]}]},
-    {"id":"fixture.options","title":"Fixture Options","size":[460,400],"pages":[{"name":"General","columns":2,"controls":[
+    {"id":"fixture.options","title":"Fixture Options","size":[460,400],"header":[{"name":"fixture.title","label":"&Title:","kind":"text","value":"Fixture"}],"pages":[{"name":"General","columns":2,"controls":[
       {"name":"n","label":"&Number:","kind":"number","value":"1","group":"Numbers"},
       {"name":"fixture.echo","label":"","kind":"label","value":"","group":"Numbers"},
       {"name":"fixture.tasks","label":"Tasks","kind":"grid","columns":[{"name":"Name","kind":"text"}],"value":[],"min_rows":3},
@@ -274,6 +276,12 @@ pub unsafe extern "C" fn yppx_ui_state(input: *const u8, len: usize, out: *mut Y
                 .get("values")
                 .and_then(|v| v.get("n"))
                 .map_or_else(String::new, number_text);
+            // The header's declared value reaches the state at open (#1609).
+            let title = dialog
+                .get("values")
+                .and_then(|v| v.get("fixture.title"))
+                .and_then(Json::str)
+                .unwrap_or("?");
             let name = first_uid(&req)
                 .and_then(|uid| task_name_of(&req, uid))
                 .unwrap_or_default();
@@ -292,7 +300,7 @@ pub unsafe extern "C" fn yppx_ui_state(input: *const u8, len: usize, out: *mut Y
             let n_val: f64 = n.parse().unwrap_or(0.0);
             reply.push_str(&format!(
                 r#","values":{{"fixture.echo":{},"fixture.tasks":[{}],"fixture.tasks.selected_row":{selected},"fixture.sample":{{"text":"AaBbYyZz","bold":{},"size":{}}}}}"#,
-                quote(&format!("Number {n} for {name}")),
+                quote(&format!("Number {n} for {name} ({title})")),
                 rows.join(","),
                 n_val as i64 % 2 == 1,
                 12 + (n_val as i64).clamp(0, 12)
@@ -327,8 +335,6 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
     let reply = match id {
         "fixture.format" => r#"{"ops":[],"status":"Fixture: format"}"#.to_string(),
         "fixture.hello" => match (req.get("button").and_then(Json::str), req.get("values")) {
-            // Help (#1609): a sentence on the status line, the dialog kept open.
-            (Some("help"), _) => r#"{"ops":[],"status":"Fixture: help"}"#.to_string(),
             // Bump (#1610): one op on the first selected task, the dialog
             // kept open.
             (Some("bump"), _) => match first_uid(&req) {

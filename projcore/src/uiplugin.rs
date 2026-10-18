@@ -378,10 +378,14 @@ pub struct DialogSpec {
     /// A fixed size in logical pixels, shared by every page, so switching
     /// pages does not resize the dialog (#1609); `None` sizes to the content.
     pub size: Option<(u32, u32)>,
-    /// Where the buttons go (#1609): `bottom` (the default: a Help button
-    /// bottom left, the rest bottom right, as Project's) or `right` (a
-    /// column down the right side, as Assign Resources').
+    /// Where the buttons go (#1609): empty (the default, `bottom` in the
+    /// JSON: a Help button bottom left, the rest bottom right, as Project's)
+    /// or `right` (a column down the right side, as Assign Resources').
     pub placement: String,
+    /// The page a Help button opens (#1609), a URL; empty for none (the host
+    /// then says its documentation is coming). Help is the host's: it is
+    /// never sent to the plugin as a command.
+    pub help: String,
     /// Controls drawn above every page (#1609): Task Information's Name,
     /// Duration and Estimated row.
     pub header: Vec<DialogControl>,
@@ -446,9 +450,9 @@ impl DialogButton {
 pub struct DialogPage {
     pub name: String,
     pub controls: Vec<DialogControl>,
-    /// Controls per row (#1609): 1 (the default, one control a row) or
-    /// more, filled in order, label widths aligned per column; a control's
-    /// `span` takes that many columns.
+    /// Controls per row (#1609): 0 or 1 is one control a row (the default),
+    /// more are filled in order, label widths aligned per column; a
+    /// control's `span` takes that many columns.
     pub columns: u32,
 }
 
@@ -481,7 +485,8 @@ pub struct DialogControl {
     /// one.
     pub span: u32,
     /// A grid's visible rows (#1609): the body is at least this tall, empty
-    /// rows drawn, more rows scroll; 0 is the host's default (8).
+    /// rows drawn, more rows scroll; 0 is the host's default (8), at most
+    /// 64.
     pub min_rows: u32,
     /// A multiline that fills the page's remaining height (#1609), in a
     /// dialog with a `size`.
@@ -518,7 +523,8 @@ impl DialogControl {
             commit_command: c.flag("commit_command"),
             group: c.text("group"),
             span: c.get("span").and_then(as_u32).unwrap_or(0),
-            min_rows: c.get("min_rows").and_then(as_u32).unwrap_or(0),
+            // Bounded: a typo would draw that many filler rows a frame.
+            min_rows: c.get("min_rows").and_then(as_u32).unwrap_or(0).min(64),
             fill: c.flag("fill"),
         }
     }
@@ -700,24 +706,23 @@ impl Manifest {
                     .map(DialogButton::from_json)
                     .collect(),
                 modeless: d.flag("modeless"),
-                size: match d.get("size").and_then(Json::as_array) {
-                    Some([w, h]) => match (as_u32(w), as_u32(h)) {
-                        (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
-                        _ => {
-                            return Err(format!(
-                                "dialog '{}': size is [width, height]",
-                                d.text("id")
-                            ));
-                        }
-                    },
+                size: match d.get("size") {
+                    None | Some(Json::Null) => None,
+                    Some(Json::Arr(wh))
+                        if matches!(wh.as_slice(), [w, h]
+                        if as_u32(w).is_some_and(|w| (1..=4000).contains(&w))
+                            && as_u32(h).is_some_and(|h| (1..=4000).contains(&h))) =>
+                    {
+                        Some((as_u32(&wh[0]).unwrap_or(0), as_u32(&wh[1]).unwrap_or(0)))
+                    }
                     Some(_) => {
                         return Err(format!(
-                            "dialog '{}': size is [width, height]",
+                            "dialog '{}': size is [width, height], each 1 to 4000",
                             d.text("id")
                         ));
                     }
-                    None => None,
                 },
+                help: d.text("help"),
                 placement: match d.text("placement").as_str() {
                     "" | "bottom" => String::new(),
                     "right" => "right".into(),
@@ -935,6 +940,8 @@ impl Manifest {
                         }),
                     ),
                     ("placement", Json::str(d.placement.clone())),
+                    ("help", Json::str(d.help.clone())),
+                    ("help", Json::str(d.help.clone())),
                     (
                         "header",
                         Json::Arr(d.header.iter().map(DialogControl::json).collect()),
@@ -2003,7 +2010,7 @@ mod tests {
       "dialogs":[{"id":"task-information","pages":[{"name":"Fixture","controls":[
          {"name":"fx.note","label":"&Note:","kind":"multiline","value":""},
          {"name":"fx.grid","label":"Items","kind":"grid","columns":[{"name":"Name","kind":"text"},{"name":"Done","kind":"checkbox"}],"value":[["a","false"]]}]}]},
-         {"id":"fx.options","title":"Fixture Options","size":[480,360],"placement":"right","header":[{"name":"h","label":"H:","kind":"label","value":"top"}],
+         {"id":"fx.options","title":"Fixture Options","size":[480,360],"placement":"right","help":"https://example.test/help","header":[{"name":"h","label":"H:","kind":"label","value":"top"}],
           "pages":[{"name":"General","columns":2,"controls":[{"name":"n","label":"N:","kind":"number","group":"Numbers","span":2},{"name":"s","label":"","kind":"sample","value":{"text":"Aa","bold":true}},{"name":"g","kind":"grid","min_rows":4},{"name":"m","kind":"multiline","fill":true}]}],"buttons":["OK","Cancel","Help"]},
          {"id":"fx.sheet","title":"Fixture Sheet","modeless":true,"pages":[{"name":"Sheet","controls":[{"name":"g","label":"","kind":"grid","commit_command":true,"columns":[{"name":"Pick","kind":"check"},{"name":"Name","kind":"text"}]}]}],
           "buttons":[{"id":"apply","label":"&Apply","default":true},{"id":"clear","label":"Clear"},{"id":"close","label":"Close","cancel":true}]}],
@@ -2251,6 +2258,24 @@ mod tests {
         assert_eq!(m.dialog("fx.sheet").unwrap().size, None);
         assert_eq!(m.dialog("fx.sheet").unwrap().placement, "");
         assert!(Manifest::parse(r#"{"dialogs":[{"id":"x","size":[0,10]}]}"#).is_err());
+        assert!(Manifest::parse(r#"{"dialogs":[{"id":"x","size":480}]}"#).is_err());
+        assert!(Manifest::parse(r#"{"dialogs":[{"id":"x","size":[480,9000]}]}"#).is_err());
+        assert_eq!(opts.help, "https://example.test/help");
+        assert_eq!(opts.pages[0].controls[2].min_rows, 4);
+        let big = Manifest::parse(
+            r#"{"dialogs":[{"id":"x","pages":[{"name":"p","controls":[{"name":"g","kind":"grid","min_rows":1000000}]}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(big.dialog("x").unwrap().pages[0].controls[0].min_rows, 64);
+        assert!(Manifest::parse(r#"{"dialogs":[{"id":"x","size":480}]}"#).is_err());
+        assert!(Manifest::parse(r#"{"dialogs":[{"id":"x","size":[480,9000]}]}"#).is_err());
+        assert_eq!(opts.help, "https://example.test/help");
+        assert_eq!(opts.pages[0].controls[2].min_rows, 4);
+        let big = Manifest::parse(
+            r#"{"dialogs":[{"id":"x","pages":[{"name":"p","controls":[{"name":"g","kind":"grid","min_rows":1000000}]}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(big.dialog("x").unwrap().pages[0].controls[0].min_rows, 64);
         assert!(Manifest::parse(r#"{"dialogs":[{"id":"x","placement":"left"}]}"#).is_err());
         // Buttons of the dialog's own and a modeless dialog (#1602).
         let sheet = m.dialog("fx.sheet").unwrap();

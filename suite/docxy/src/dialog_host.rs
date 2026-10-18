@@ -4,7 +4,7 @@
 //! buttons call the same [`dialog_click`].
 use super::*;
 use crate::dialog::{self, ControlKind, Dialog, DialogOwner, DialogStack, NONE_OPEN};
-use ctlcore::json::Json;
+use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Each list of the top dialog: its scroll, and the choice last scrolled to.
@@ -12,6 +12,37 @@ pub(crate) type ListScrolls = std::collections::HashMap<
     (&'static str, &'static str),
     (UniformListScrollHandle, Option<usize>),
 >;
+
+/// Each scrolling grid of the top dialog (#1609): its scroll, and the row
+/// last scrolled to.
+pub(crate) type GridScrolls =
+    std::collections::HashMap<(&'static str, &'static str), (ScrollHandle, Option<usize>)>;
+
+/// The scroll for grid `name` of dialog `id`, kept across frames; the
+/// selected row is scrolled into view when it is not the one last seen, as
+/// [`list_scroll`] does for a list.
+fn grid_scroll(
+    grids: &mut GridScrolls,
+    key: (&'static str, &'static str),
+    row: Option<usize>,
+) -> ScrollHandle {
+    let (handle, seen) = grids
+        .entry(key)
+        .or_insert_with(|| (ScrollHandle::new(), None));
+    if row != *seen {
+        if let Some(r) = row {
+            handle.scroll_to_item(r);
+        }
+        *seen = row;
+    }
+    handle.clone()
+}
+
+/// A 12 px text's estimated width from its character count, for the label
+/// columns and the grid columns alike (#1609).
+fn est_text_w(chars: usize) -> f32 {
+    chars as f32 * 7. + 12.
+}
 
 /// The scroll for list `name` of dialog `id`, kept across frames. When the
 /// choice is not the one last seen it is scrolled into view (only if it is
@@ -597,6 +628,11 @@ impl Docxy {
         if let Some(done) = self.user_name_click(button, cx) {
             return done;
         }
+        // A plugin dialog's Help is the host's (#1609): it opens the spec's
+        // help page, or says the documentation is coming; the dialog stays.
+        if let Some(done) = self.plugin_help_click(button, cx) {
+            return done;
+        }
         // So is Document Recovery, which replaces tabs (#1225).
         if let Some(done) = self.document_recovery_click(button, cx) {
             return done;
@@ -742,6 +778,34 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    /// The top dialog's Help pressed on a plugin dialog (#1609): the spec's
+    /// `help` URL opens (recorded for `last-url`), else the status line says
+    /// the documentation is coming, as the Help tab does. `None` for any
+    /// other dialog or button.
+    fn plugin_help_click(
+        &mut self,
+        button: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<Result<(), String>> {
+        let dialogs = self.active_dialogs()?;
+        let top = dialogs.top()?;
+        let DialogOwner::Plugin { spec, .. } = top.owner else {
+            return None;
+        };
+        let pressed = top.buttons.iter().find(|b| {
+            dialog::fold_label(&b.label) == dialog::fold_label(button)
+                || b.id.eq_ignore_ascii_case(button.trim())
+        })?;
+        if !pressed.id.eq_ignore_ascii_case("help") {
+            return None;
+        }
+        match crate::plugin_ui::help_url(spec) {
+            Some(url) => self.open_help_url(url, cx),
+            None => self.set_status(crate::help_tab::DOCS_COMING.to_string()),
+        }
+        Some(Ok(()))
+    }
+
     /// A press on one of the top dialog's widgets: see [`Dialog::click_control`].
     fn dialog_control_click(&mut self, index: usize, item: Option<usize>, cx: &mut Context<Self>) {
         let done = self
@@ -806,7 +870,10 @@ impl Docxy {
     }
 
     /// One control's widget: a field, checkbox, radio group, dropdown or list
-    /// that takes the pointer, or a grid or label drawn as text.
+    /// that takes the pointer, a grid, a label drawn as text, or a sample box
+    /// drawn in the style its value names (#1609). `label_w` is the label's
+    /// width when the page's columns align labels, `None` for its natural
+    /// width.
     fn dialog_widget(
         &self,
         d: &Dialog,
@@ -834,7 +901,7 @@ impl Docxy {
             }
         };
         // A multiline that fills the page (#1609) in a dialog of fixed size.
-        let fill = c.fill && d.size.is_some();
+        let fill = d.fills(c);
         let editable = c.enabled && c.kind.is_editable();
         let row = h_flex()
             .id(("dialog-control", i))
@@ -948,7 +1015,7 @@ impl Docxy {
                             )
                             .max()
                             .unwrap_or(1);
-                        (longest as f32 * 7. + 12.).clamp(40., 200.)
+                        est_text_w(longest).clamp(40., 200.)
                     })
                     .collect();
                 let cell = |content: AnyElement, w: f32, head: bool, active: bool| {
@@ -1014,6 +1081,14 @@ impl Docxy {
                         }))
                 });
                 let scrolls = rows.len() > min_rows;
+                let scroll = scrolls.then(|| {
+                    grid_scroll(
+                        &mut self.dialog_grids.borrow_mut(),
+                        (d.id.as_str(), c.name),
+                        sel_row,
+                    )
+                });
+                let body_h = 18. * min_rows as f32;
                 v_flex()
                     .id(("dialog-control", i))
                     .gap_1()
@@ -1028,36 +1103,49 @@ impl Docxy {
                             .bg(pal.panel)
                             .child(header)
                             .child(
-                                v_flex()
-                                    .id(("dialog-grid-body", i))
-                                    .when(scrolls, |b| {
-                                        b.h(px(18. * min_rows as f32)).overflow_y_scroll()
-                                    })
-                                    .children(body)
-                                    .children(fillers),
+                                div()
+                                    .relative()
+                                    .child(
+                                        v_flex()
+                                            .id(("dialog-grid-body", i))
+                                            .when_some(scroll.clone(), |b, h| {
+                                                b.h(px(body_h)).overflow_y_scroll().track_scroll(&h)
+                                            })
+                                            .children(body)
+                                            .children(fillers),
+                                    )
+                                    // The scrollbar Project draws beside a grid
+                                    // that holds more rows than it shows.
+                                    .when_some(scroll, |b, h| {
+                                        b.child(
+                                            div()
+                                                .absolute()
+                                                .top_0()
+                                                .right_0()
+                                                .h(px(body_h))
+                                                .w(px(8.))
+                                                .child(
+                                                    Scrollbar::vertical(&h)
+                                                        .id(SharedString::from(format!(
+                                                            "dialog-grid-scroll:{}",
+                                                            c.name
+                                                        )))
+                                                        .scrollbar_show(ScrollbarShow::Always),
+                                                ),
+                                        )
+                                    }),
                             ),
                     )
                     .into_any_element()
             }
-            // A sample box (#1609): the text in the style the state gives.
+            // A sample box (#1609): the text in the style the state gives, the
+            // formatting model's text style plus `text`.
             ControlKind::Sample => {
-                let s = c.sample();
-                let text = s.get_str("text").unwrap_or("AaBbYyZz").to_string();
-                let font = s.get_str("font").map(str::to_string);
-                let size = s
-                    .get("size")
-                    .and_then(Json::as_f64)
-                    .map(|n| n as f32)
-                    .filter(|n| *n >= 6.);
-                let color = s
-                    .get_str("color")
-                    .and_then(|c| u32::from_str_radix(c.trim_start_matches('#'), 16).ok());
-                let background = s
-                    .get_str("background")
-                    .and_then(|c| u32::from_str_radix(c.trim_start_matches('#'), 16).ok());
-                let bold = s.get("bold").and_then(Json::as_bool) == Some(true);
-                let italic = s.get("italic").and_then(Json::as_bool) == Some(true);
-                let underline = s.get("underline").and_then(Json::as_bool) == Some(true);
+                let sample = c.sample();
+                let text = sample.get_str("text").unwrap_or("AaBbYyZz").to_string();
+                let style = projcore::json::Json::parse(&sample.to_string())
+                    .map(|j| projcore::formatting::TextStyle::from_json(&j))
+                    .unwrap_or_default();
                 v_flex()
                     .id(("dialog-control", i))
                     .gap_1()
@@ -1075,14 +1163,7 @@ impl Docxy {
                             .border_color(pal.dim)
                             .bg(pal.panel)
                             .child(
-                                div()
-                                    .when_some(font, |t, f| t.font_family(f))
-                                    .when_some(size, |t, n| t.text_size(px(n * 96. / 72.)))
-                                    .when_some(color, |t, c| t.text_color(hsla_u(c)))
-                                    .when_some(background, |t, c| t.bg(hsla_u(c)))
-                                    .when(bold, |t| t.font_weight(FontWeight::BOLD))
-                                    .when(italic, |t| t.italic())
-                                    .when(underline, |t| t.underline())
+                                crate::plugin_ui::styled(div(), &style)
                                     .child(SharedString::from(text)),
                             ),
                     )
@@ -1293,63 +1374,27 @@ impl Docxy {
                     )
                     .into_any_element()
             }
+            // A plugin label with no caption draws its text alone; a built-in
+            // one keeps the empty caption's indent.
             _ => row
-                .when(!label.is_empty(), |r| r.child(aligned(label)))
+                .when(!(c.plugin && label.is_empty()), |r| r.child(aligned(label)))
                 .child(SharedString::from(c.text()))
                 .into_any_element(),
         }
     }
-}
 
-/// Rows of (control index, column) a dialog page is laid out in (#1609).
-type LayoutRows = Vec<Vec<(usize, usize)>>;
-
-impl Docxy {
-    /// The controls of the top dialog laid out as Project's (#1609): the
-    /// header controls (a plugin's, on every page) first, then the page's
-    /// controls in rows of `Dialog::columns`, consecutive controls of one
-    /// `group` inside a titled box, a control's `span` taking that many
-    /// columns, the labels of one column sharing a width.
+    /// The controls of the top dialog drawn as [`Dialog::layout_rows`] lays
+    /// them out (#1609): the header band first, each titled group in a box,
+    /// a row of several controls side by side with the labels of a column
+    /// sharing a width, a filling multiline's row and band growing.
     fn dialog_body(&self, d: &Dialog, pal: Pal, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let mut shown = d.shown_indices();
-        if !d.tabs.is_empty() {
-            // A plugin's header (page None) draws above the page.
-            shown.sort_by_key(|&i| !(d.controls[i].plugin && d.controls[i].page.is_none()));
-        }
-        let columns = d.columns();
-        // Rows of (control, column), grouped by group title.
-        let mut groups: Vec<(Option<String>, LayoutRows)> = Vec::new();
-        let mut k = 0;
-        while k < shown.len() {
-            let title = d.controls[shown[k]].group.clone();
-            let mut rows: Vec<Vec<(usize, usize)>> = Vec::new();
-            let mut row: Vec<(usize, usize)> = Vec::new();
-            let mut used = 0;
-            while k < shown.len() && d.controls[shown[k]].group == title {
-                let c = &d.controls[shown[k]];
-                let span = (c.span as usize).clamp(1, columns);
-                if used + span > columns && !row.is_empty() {
-                    rows.push(std::mem::take(&mut row));
-                    used = 0;
-                }
-                row.push((shown[k], used));
-                used += span;
-                if used >= columns {
-                    rows.push(std::mem::take(&mut row));
-                    used = 0;
-                }
-                k += 1;
-            }
-            if !row.is_empty() {
-                rows.push(row);
-            }
-            groups.push((title, rows));
-        }
-        // The label width per column: the longest label in it.
-        let mut label_w = vec![0f32; columns];
-        if columns > 1 {
-            for (_, rows) in &groups {
-                for row in rows {
+        let mut out: Vec<AnyElement> = Vec::new();
+        for band in d.layout_rows() {
+            let columns = band.columns;
+            // The label width per column: the longest label in it.
+            let mut label_w = vec![0f32; columns];
+            if columns > 1 {
+                for row in &band.rows {
                     for &(i, col) in row {
                         let c = &d.controls[i];
                         if !matches!(
@@ -1361,31 +1406,29 @@ impl Docxy {
                                 | ControlKind::CheckList
                                 | ControlKind::Checkbox
                         ) {
-                            let w = c.label.replace('&', "").chars().count() as f32 * 6.5 + 4.;
+                            let w = est_text_w(c.label.replace('&', "").chars().count()) - 8.;
                             label_w[col] = label_w[col].max(w);
                         }
                     }
                 }
             }
-        }
-        let mut out: Vec<AnyElement> = Vec::new();
-        for (title, rows) in groups {
+            let band_fills = band
+                .rows
+                .iter()
+                .flatten()
+                .any(|&(i, _)| d.fills(&d.controls[i]));
             let mut drawn: Vec<AnyElement> = Vec::new();
-            for row in rows {
-                let fills = row
-                    .iter()
-                    .any(|&(i, _)| d.controls[i].fill && d.size.is_some());
+            for row in band.rows {
+                let fills = row.iter().any(|&(i, _)| d.fills(&d.controls[i]));
                 if columns == 1 || (row.len() == 1 && d.controls[row[0].0].span as usize >= columns)
                 {
                     let (i, _) = row[0];
                     let el = self.dialog_widget(d, i, None, pal, cx);
                     drawn.push(if fills {
-                        div()
+                        v_flex()
                             .flex_1()
                             .min_h_0()
                             .w_full()
-                            .flex()
-                            .flex_col()
                             .child(el)
                             .into_any_element()
                     } else {
@@ -1395,12 +1438,10 @@ impl Docxy {
                 }
                 let cells = row.into_iter().map(|(i, col)| {
                     let span = (d.controls[i].span as usize).clamp(1, columns);
-                    let w = (columns > 1).then_some(label_w[col]).filter(|w| *w > 0.);
-                    div()
+                    let w = Some(label_w[col]).filter(|w| *w > 0.);
+                    v_flex()
                         .w(relative(span as f32 / columns as f32))
                         .pr_2()
-                        .flex()
-                        .flex_col()
                         .when(fills, |c| c.h_full())
                         .child(self.dialog_widget(d, i, w, pal, cx))
                 });
@@ -1414,7 +1455,7 @@ impl Docxy {
                         .into_any_element(),
                 );
             }
-            match title {
+            match band.title {
                 Some(t) => out.push(
                     v_flex()
                         .w_full()
@@ -1423,6 +1464,7 @@ impl Docxy {
                         .border_1()
                         .border_color(pal.border)
                         .rounded_sm()
+                        .when(band_fills, |g| g.flex_1().min_h_0())
                         .child(
                             div()
                                 .text_size(px(11.))
@@ -1444,6 +1486,9 @@ impl Docxy {
         let d = self.active_dialogs()?.top()?;
         // Another dialog's lists start again at the top when it next shows.
         self.dialog_lists
+            .borrow_mut()
+            .retain(|(id, _), _| *id == d.id.as_str());
+        self.dialog_grids
             .borrow_mut()
             .retain(|(id, _), _| *id == d.id.as_str());
         let tabs = (!d.tabs.is_empty()).then(|| {

@@ -1084,6 +1084,7 @@ fn layout_hints_are_read_back_and_a_sample_cannot_be_set() {
     sample.group = Some("Numbers".into());
     sample.span = 2;
     sample.plugin = true;
+    sample.header = true;
     d.controls.push(sample);
     let mut grid = Control::new("rows", "", ControlKind::Grid, Value::Rows(Vec::new()));
     grid.min_rows = Some(6);
@@ -1130,4 +1131,75 @@ fn layout_hints_are_read_back_and_a_sample_cannot_be_set() {
     assert!(s.set("look", &args(r#"{"value":"x"}"#)).is_err());
     s.select_tab("Predecessors").unwrap();
     assert_eq!(s.to_json().get_usize("columns"), Some(1));
+}
+
+#[test]
+fn layout_rows_put_the_header_first_then_groups_and_spans_in_columns() {
+    // Dialog::layout_rows (#1609): the header is its own band of one row,
+    // groups are bands, a span wider than the row is clamped, a span that
+    // does not fit starts a new row.
+    let mut d = form();
+    d.page_columns = vec![2];
+    let mut ctl = |name: &'static str, group: Option<&str>, span: u8, header: bool| {
+        let mut c = Control::new(name, name, ControlKind::Text, Value::Text(String::new()));
+        c.page = Some(0);
+        c.plugin = true;
+        c.group = group.map(str::to_string);
+        c.span = span;
+        c.header = header;
+        if header {
+            c.page = None;
+        }
+        d.controls.push(c);
+    };
+    ctl("h1", None, 1, true);
+    ctl("h2", None, 1, true);
+    ctl("h3", None, 1, true);
+    ctl("a", Some("G"), 1, false);
+    ctl("b", Some("G"), 1, false);
+    ctl("c", Some("G"), 3, false);
+    ctl("d", None, 1, false);
+    let bands = d.layout_rows();
+    let name = |i: usize| d.controls[i].name;
+    let header = &bands[0];
+    assert!(header.header && header.title.is_none());
+    assert_eq!(header.columns, 3);
+    assert_eq!(header.rows.len(), 1);
+    assert_eq!(
+        header.rows[0]
+            .iter()
+            .map(|&(i, col)| (name(i), col))
+            .collect::<Vec<_>>(),
+        [("h1", 0), ("h2", 1), ("h3", 2)]
+    );
+    // The form's own controls on page 0 come next, ungrouped, two a row.
+    let group = bands
+        .iter()
+        .find(|b| b.title.as_deref() == Some("G"))
+        .unwrap();
+    assert!(!group.header);
+    assert_eq!(group.columns, 2);
+    assert_eq!(group.rows.len(), 2, "a and b share a row; c spans the next");
+    assert_eq!(
+        group.rows[0]
+            .iter()
+            .map(|&(i, _)| name(i))
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    assert_eq!(
+        group.rows[1],
+        vec![(d.controls.iter().position(|c| c.name == "c").unwrap(), 0)]
+    );
+    let last = bands.last().unwrap();
+    assert_eq!(
+        last.rows
+            .last()
+            .unwrap()
+            .iter()
+            .map(|&(i, _)| name(i))
+            .collect::<Vec<_>>(),
+        ["d"]
+    );
+    assert!(!d.fills(&d.controls[0]));
 }

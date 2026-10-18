@@ -483,7 +483,7 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
     let state = ui.state(&options).unwrap();
     assert_eq!(
         state.value("fixture.echo"),
-        Some(&Json::str("Number 7 for Phase"))
+        Some(&Json::str("Number 7 for Phase (?)"))
     );
     let bumped = ui
         .command(&Command {
@@ -514,14 +514,24 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         state.value("fixture.sample").and_then(|v| v.get("bold")),
         Some(&Json::Bool(true))
     );
-    let help = ui
-        .command(&Command {
-            button: Some("help".into()),
-            ..cmd("fixture.hello", vec![1], Some(Json::Obj(Vec::new())))
-        })
-        .unwrap()
-        .unwrap();
-    assert_eq!(help.status.as_deref(), Some("Fixture: help"));
+    assert_eq!(opts.header[0].name, "fixture.title");
+    assert_eq!(opts.help, "");
+    assert_eq!(
+        ui.manifest().dialog("task-information").unwrap().pages[0].columns,
+        2
+    );
+    // The header's declared value reaches the echo label.
+    let with_title = StateCtx {
+        dialog_values: Some(Json::obj(vec![
+            ("n", Json::Num(7.0)),
+            ("fixture.title", Json::str("Plan")),
+        ])),
+        ..ctx(vec![1], Some(("fixture.options".into(), None)))
+    };
+    assert_eq!(
+        ui.state(&with_title).unwrap().value("fixture.echo"),
+        Some(&Json::str("Number 7 for Phase (Plan)"))
+    );
 
     // The overlay: a label at the first bar, a link from the first bar's
     // end to the second bar's start.

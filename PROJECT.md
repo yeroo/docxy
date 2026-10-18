@@ -495,11 +495,16 @@ without one nothing changes.
   (controls drawn above every page); a page's `columns: n` (controls per
   row, labels aligned per column); a control's `group` (a titled box
   around consecutive controls naming it), `span` (columns it takes),
-  `min_rows` (a grid's visible rows, empty rows drawn, more scroll; a
-  plugin grid's default is 8), `fill` (a multiline fills the page), and
-  the `sample` kind (a read-only box drawing `{text, font, size, bold,
-  italic, underline, color, background}`). A `Help` button is drawn and
-  sends the command with `button: "help"`.
+  `min_rows` (a grid's visible rows, 1 to 64, empty rows drawn, more
+  scroll with a scrollbar; a plugin grid's default is 8), `fill` (a
+  multiline fills the remaining height of a dialog with a `size`), and the
+  `sample` kind (a read-only box drawing `{text, font, size, bold, italic,
+  underline, color, background}`, the formatting model's text style). A
+  `Help` button is the host's: it opens the spec's `help` URL (recorded for
+  the harness's `last-url`), else says the documentation is coming; it is
+  never sent to the plugin. A `task-information` spec's pages take
+  `columns`, `group`, `span` and `min_rows`; `size`, `placement` and `fill`
+  belong to a plugin's own dialog.
 - **Overlay** (`yppx_ui_overlay`): the rows in view (`uid`, `row_y`, the bar
   rectangle, kind flags, since #1548 `name`, `percent_complete`,
   `deadline_x`, `constraint {type, x}` and `resource_names`, and since

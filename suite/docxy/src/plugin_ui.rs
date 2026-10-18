@@ -750,7 +750,11 @@ fn value_back(c: &dialog::Control) -> Json {
 /// (#1602).
 pub(crate) fn values_of(d: &Dialog) -> Json {
     let mut out = Vec::new();
-    for c in d.controls.iter().filter(|c| c.plugin) {
+    for c in d
+        .controls
+        .iter()
+        .filter(|c| c.plugin && c.kind != dialog::ControlKind::Sample)
+    {
         out.push((c.name.to_string(), value_back(c)));
         if c.kind == dialog::ControlKind::Grid {
             out.push((
@@ -768,6 +772,16 @@ fn control_of_spec(
     c: &ui::DialogControl,
     page: Option<usize>,
     prefill: &Prefill,
+) -> dialog::Control {
+    control_of_spec_in(c, page, prefill, false)
+}
+
+/// [`control_of_spec`], `header` for a spec's header control (#1609).
+fn control_of_spec_in(
+    c: &ui::DialogControl,
+    page: Option<usize>,
+    prefill: &Prefill,
+    header: bool,
 ) -> dialog::Control {
     let kind = kind_of(&c.kind);
     let value = prefill.value(&c.name).unwrap_or(&c.value);
@@ -790,10 +804,30 @@ fn control_of_spec(
     // The layout hints (#1609).
     out.group = (!c.group.is_empty()).then(|| c.group.clone());
     out.span = u8::try_from(c.span.max(1)).unwrap_or(u8::MAX);
-    out.min_rows = (c.min_rows > 0).then_some(c.min_rows as usize);
+    out.min_rows = (c.min_rows > 0).then_some((c.min_rows as usize).min(64));
     out.fill = c.fill;
+    out.header = header;
     apply_selected_row(&mut out, prefill);
     out
+}
+
+/// The spec's declared values as the state sees them at open (#1610,
+/// #1609): the header's and every page's controls.
+fn declared_values(spec: &ui::DialogSpec) -> Json {
+    Json::Obj(
+        spec.header
+            .iter()
+            .chain(spec.pages.iter().flat_map(|p| p.controls.iter()))
+            .map(|c| (c.name.clone(), c.value.clone()))
+            .collect(),
+    )
+}
+
+/// The URL a plugin dialog's Help opens (#1609), when its spec names one.
+pub(crate) fn help_url(spec_id: &str) -> Option<String> {
+    spec(spec_id)
+        .map(|s| s.help.clone())
+        .filter(|u| !u.is_empty())
 }
 
 /// A grid's selected row as the plugin's state gives it under
@@ -827,14 +861,7 @@ fn open_dialog(v: &ProjectView, spec_id: &str, command: &str) -> Result<Dialog, 
     let spec = spec(spec_id).ok_or_else(|| format!("No plugin declares the dialog '{spec_id}'"))?;
     // The state sees the spec's declared values as the dialog's, so a label
     // that follows another control reads right from the start (#1610).
-    let declared = Json::Obj(
-        spec.pages
-            .iter()
-            .flat_map(|p| p.controls.iter())
-            .map(|c| (c.name.clone(), c.value.clone()))
-            .collect(),
-    );
-    let values = prefill_with(v, spec_id, v.selected_uid(), Some(declared));
+    let values = prefill_with(v, spec_id, v.selected_uid(), Some(declared_values(spec)));
     let values = &values;
     let mut d = Dialog::message(
         catalog::PLUGIN,
@@ -866,22 +893,31 @@ fn open_dialog(v: &ProjectView, spec_id: &str, command: &str) -> Result<Dialog, 
     if tabbed {
         d.tabs = spec.pages.iter().map(|p| p.name.clone()).collect();
     }
+    // The pages' controls, then the header's (drawn first, listed last so
+    // the pages' controls keep their places, as Task Information's do).
     d.controls = spec
-        .header
+        .pages
         .iter()
-        .map(|c| control_of_spec(c, None, values))
-        .chain(spec.pages.iter().enumerate().flat_map(|(i, p)| {
+        .enumerate()
+        .flat_map(|(i, p)| {
             let page = tabbed.then_some(i);
             p.controls
                 .iter()
                 .map(move |c| control_of_spec(c, page, values))
-        }))
+        })
+        .chain(
+            spec.header
+                .iter()
+                .map(|c| control_of_spec_in(c, None, values, true)),
+        )
         .collect();
     // OK and Cancel, or the spec's own buttons (#1602): `ok` accepts (the
     // command gets the values and the dialog closes), a cancel button
     // closes, any other sends the command with its id and stays open
-    // unless the reply closes it; `help` is such a button, drawn bottom
-    // left as Project's (#1609). The state greys a button by its id.
+    // unless the reply closes it. `help` is the host's (#1609): drawn
+    // bottom left as Project's, it opens the spec's `help` URL (else says
+    // the documentation is coming) and never reaches the plugin. The state
+    // greys a button by its id.
     let mut buttons = if spec.buttons.is_empty() {
         ok_cancel()
     } else {
@@ -1040,16 +1076,14 @@ pub(crate) fn extend_task_info(d: &mut Dialog, v: &ProjectView, uid: i32) {
     let Some(spec) = spec("task-information") else {
         return;
     };
-    // The state sees the pages' declared values as the dialog's, as a
-    // plugin's own dialog does at open (#1610).
-    let declared = Json::Obj(
-        spec.pages
-            .iter()
-            .flat_map(|p| p.controls.iter())
-            .map(|c| (c.name.clone(), c.value.clone()))
-            .collect(),
+    // The state sees the header's and the pages' declared values as the
+    // dialog's, as a plugin's own dialog does at open (#1610).
+    let values = prefill_with(
+        v,
+        "task-information",
+        Some(uid),
+        Some(declared_values(spec)),
     );
-    let values = prefill_with(v, "task-information", Some(uid), Some(declared));
     extend_task_info_with(d, spec, &values);
     // The dialog has seen this plan: a control change applies the state's
     // items, enabled flags and labels, not its values (#1610).
@@ -1078,11 +1112,21 @@ pub(crate) fn extend_task_info_with(d: &mut Dialog, spec: &ui::DialogSpec, value
                 .iter()
                 .map(|c| control_of_spec(c, Some(index), values)),
         );
+        // The plugin page's columns (#1609); built-in pages keep one.
+        if d.page_columns.len() < d.tabs.len() {
+            d.page_columns.resize(d.tabs.len(), 1);
+        }
+        if let Some(slot) = d.page_columns.get_mut(index) {
+            *slot = u8::try_from(page.columns.max(1)).unwrap_or(u8::MAX);
+        }
     }
     // The spec's header controls draw above every page (#1609); they come
     // last in the list, so the pages' controls keep their places.
-    d.controls
-        .extend(spec.header.iter().map(|c| control_of_spec(c, None, values)));
+    d.controls.extend(
+        spec.header
+            .iter()
+            .map(|c| control_of_spec_in(c, None, values, true)),
+    );
 }
 
 /// A press on a dialog with plugin controls: a plugin's own dialog

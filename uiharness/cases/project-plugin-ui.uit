@@ -143,15 +143,21 @@ test the button's command opens the plugin's dialog, whose OK sends the values b
   assert reply.controls.4.name is fixture.memo
   assert reply.controls.4.fill is true
   shot window
+  # Help is the host's: this spec names no page, so the status says so and
+  # the dialog stays.
   call dialog-click {"button":"Help"}
   assert dialog is plugin
-  assert status is Fixture: help
+  assert status is Help: the documentation is coming soon
   call dialog-read {}
   # The label follows the number: a control change applies the state's
   # labels (#1610), and the task's name from the plan.
   assert reply.controls.1.name is fixture.echo
   assert reply.controls.1.kind is label
-  assert reply.controls.1.value is Number 1 for A
+  # The header text's declared value reached the state at open (#1609).
+  assert reply.controls.1.value is Number 1 for A (Fixture)
+  assert reply.controls.-1.name is fixture.title
+  assert reply.controls.-1.header is true
+  assert reply.controls.-1.value is Fixture
   # The grid lists the plan's tasks with the selected one's row selected
   # (the state's name.selected_row).
   assert reply.controls.2.name is fixture.tasks
@@ -159,7 +165,7 @@ test the button's command opens the plugin's dialog, whose OK sends the values b
   assert reply.controls.2.selected_row is 0
   call dialog-set {"control":"n","value":7}
   call dialog-read {}
-  assert reply.controls.1.value is Number 7 for A
+  assert reply.controls.1.value is Number 7 for A (Fixture)
   # The sample follows the number too (odd: bold, size 12 + n).
   assert reply.controls.3.sample.size is 19
   # Bump renames the task under the modal dialog: the plan moved, so the
@@ -169,7 +175,7 @@ test the button's command opens the plugin's dialog, whose OK sends the values b
   assert status is Fixture: bumped task 1
   call dialog-read {}
   assert reply.controls.0.value is 7
-  assert reply.controls.1.value is Number 7 for Bumped by fixture
+  assert reply.controls.1.value is Number 7 for Bumped by fixture (Fixture)
   # The modal dialog's grid shows the renamed task and keeps its row.
   assert reply.controls.2.rows.0.0 is Bumped by fixture
   assert reply.controls.2.selected_row is 0
@@ -241,9 +247,16 @@ test Task Information gains the plugin's page, prefilled, with a multiline and a
   assert reply.controls.-1.name is fixture.head
   assert reply.controls.-1.header is true
   assert reply.controls.-1.value is on every page
+  assert reply.columns is 1
+  shot window
   call dialog-read {}
   assert reply.tabs.5 is Fixture
   call dialog-tab {"tab":"Fixture"}
+  call dialog-read {}
+  # The plugin page's two columns (#1609); the built-in pages keep one.
+  assert reply.columns is 2
+  assert reply.controls.-1.header is true
+  shot window
   call dialog-read {}
   assert reply.controls.0.name is fixture.note
   assert reply.controls.0.kind is multiline
@@ -415,3 +428,25 @@ test a modeless dialog with a grid and buttons of its own follows the plan and r
   call dialog-click {"button":"Clear"}
   assert dialog is none
   assert status is Fixture: cleared
+
+test a plugin grid with more rows than it shows scrolls and keeps the selected row in view
+  # Fixture Sheet's grid asks for six rows (#1609); a plan of ten tasks
+  # fills more, so the body scrolls with a scrollbar and a row picked past
+  # the fold is scrolled into view.
+  open copy:../../corpus/mspdi/27-manual-summary.xml
+  click C1
+  call ribbon-click {"tab":"Task","command":"Sheet (fixture)"}
+  assert dialog is plugin
+  call dialog-read {}
+  assert reply.controls.0.min_rows is 6
+  assert reply.controls.0.rows.9.1 is Z
+  call dialog-select {"control":"fixture.rows","row":9}
+  call dialog-read {}
+  assert reply.controls.0.selected_row is 9
+  shot window
+  call dialog-select {"control":"fixture.rows","row":0}
+  call dialog-read {}
+  assert reply.controls.0.selected_row is 0
+  shot window
+  call dialog-click {"button":"Close"}
+  assert dialog is none

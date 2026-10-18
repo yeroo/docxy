@@ -537,6 +537,8 @@ pub(crate) struct Control {
     /// A multiline that fills the page's remaining height (#1609) in a
     /// dialog with a fixed `size`.
     pub fill: bool,
+    /// Drawn above every page (#1609): a plugin spec's `header` control.
+    pub header: bool,
 }
 
 impl Control {
@@ -562,6 +564,7 @@ impl Control {
             span: 1,
             min_rows: None,
             fill: false,
+            header: false,
         }
     }
 
@@ -699,6 +702,9 @@ impl Control {
         }
         if self.fill {
             out.push(("fill", Json::Bool(true)));
+        }
+        if self.header {
+            out.push(("header", Json::Bool(true)));
         }
         if self.kind == ControlKind::Sample {
             out.push(("sample", self.sample()));
@@ -991,6 +997,18 @@ pub(crate) fn fold_label(label: &str) -> String {
     fold(label)
 }
 
+/// One band of a laid-out dialog page (#1609, [`Dialog::layout_rows`]): the
+/// header, a titled group box, or ungrouped controls; its rows hold
+/// (control index, first column) and `columns` is the band's width in
+/// columns.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LayoutBand {
+    pub header: bool,
+    pub title: Option<String>,
+    pub columns: usize,
+    pub rows: Vec<Vec<(usize, usize)>>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Dialog {
     /// Stable, for scripts: `delete-summary`. Only [`catalog`] makes one, so
@@ -1143,6 +1161,66 @@ impl Dialog {
     /// Controls per row on the current page (#1609), at least 1.
     pub fn columns(&self) -> usize {
         self.page_columns.get(self.tab).copied().unwrap_or(1).max(1) as usize
+    }
+
+    /// Whether `c` fills the page's remaining height (#1609): a `fill`
+    /// multiline in a dialog with a fixed size.
+    pub fn fills(&self, c: &Control) -> bool {
+        c.fill && c.kind == ControlKind::Multiline && self.size.is_some()
+    }
+
+    /// The shown controls laid out as Project's (#1609): the header first
+    /// (its own band, one row of all its controls), then the page's
+    /// controls in rows of [`Dialog::columns`], a control's `span` taking
+    /// that many columns (clamped to the row), consecutive controls of one
+    /// `group` title in one band.
+    pub fn layout_rows(&self) -> Vec<LayoutBand> {
+        let mut shown = self.shown_indices();
+        shown.sort_by_key(|&i| !self.controls[i].header);
+        let page_columns = self.columns();
+        let header_columns = shown
+            .iter()
+            .filter(|&&i| self.controls[i].header)
+            .count()
+            .max(1);
+        let mut bands: Vec<LayoutBand> = Vec::new();
+        let mut k = 0;
+        while k < shown.len() {
+            let first = &self.controls[shown[k]];
+            let (header, title) = (first.header, first.group.clone());
+            let columns = if header { header_columns } else { page_columns };
+            let mut rows: Vec<Vec<(usize, usize)>> = Vec::new();
+            let mut row: Vec<(usize, usize)> = Vec::new();
+            let mut used = 0;
+            while k < shown.len() {
+                let c = &self.controls[shown[k]];
+                if c.header != header || c.group != title {
+                    break;
+                }
+                let span = (c.span as usize).clamp(1, columns);
+                if used + span > columns && !row.is_empty() {
+                    rows.push(std::mem::take(&mut row));
+                    used = 0;
+                }
+                row.push((shown[k], used));
+                used += span;
+                if used >= columns {
+                    rows.push(std::mem::take(&mut row));
+                    used = 0;
+                }
+                k += 1;
+            }
+            if !row.is_empty() {
+                rows.push(row);
+            }
+            bands.push(LayoutBand {
+                header,
+                title,
+                columns,
+                rows,
+            });
+        }
+        bands
     }
 
     /// The controls on the current tab, as a person sees them.
@@ -1946,20 +2024,7 @@ impl Dialog {
             ),
             (
                 "controls",
-                Json::Arr(
-                    self.page_controls()
-                        .map(|c| {
-                            let mut j = c.to_json();
-                            if !self.tabs.is_empty()
-                                && c.page.is_none()
-                                && let Json::Obj(pairs) = &mut j
-                            {
-                                pairs.push(("header".into(), Json::Bool(true)));
-                            }
-                            j
-                        })
-                        .collect(),
-                ),
+                Json::Arr(self.page_controls().map(Control::to_json).collect()),
             ),
             (
                 "buttons",
