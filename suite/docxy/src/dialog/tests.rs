@@ -1280,3 +1280,153 @@ fn text_of_control(d: &Dialog, name: &str) -> String {
         .map(Control::text)
         .unwrap_or_default()
 }
+
+// ---- FIX r1 (#1536) ----
+
+/// A plugin's grid (no `editable_grid`) with a dropdown and a label column
+/// behaves as it did before editable grids: nothing is resolved against
+/// items it never had, Space types, and a label cell takes `dialog-set`.
+#[test]
+fn a_plugin_grid_with_dropdown_and_label_columns_is_unchanged() {
+    let mut d = link_grid();
+    let i = d.controls.iter().position(|c| c.name == "links").unwrap();
+    d.controls[i].editable_grid = false;
+    d.controls[i].plugin = true;
+    d.controls[i].column_items = Vec::new();
+    d.controls[i].column_kinds = vec![ControlKind::Text, ControlKind::Label, ControlKind::Dropdown];
+    d.set("links[0].type", &args(r#"{"value":"anything"}"#))
+        .unwrap();
+    d.set("links[0].task name", &args(r#"{"value":"shown"}"#))
+        .unwrap();
+    assert_eq!(rows(&d)[0][1..], ["shown", "anything"]);
+    assert_eq!(rows(&d).len(), 2, "no blank row is kept for it");
+    d.select_row("links", 0).unwrap();
+    d.controls[i].col = 2;
+    d.grid_key("space", Some(" ")).unwrap();
+    assert_eq!(d.controls[i].edit.as_deref(), Some(" "), "Space types");
+    d.grid_key("escape", None).unwrap();
+    d.controls[i].col = 1;
+    d.grid_key("x", Some("x")).unwrap();
+    assert_eq!(
+        d.controls[i].edit.as_deref(),
+        Some("x"),
+        "a label cell types"
+    );
+    // Delete clears the cell, and a pending edit is not committed by Down.
+    d.grid_key("escape", None).unwrap();
+    d.grid_key("delete", None).unwrap();
+    assert_eq!(rows(&d)[0][1], "");
+    d.grid_key("y", Some("y")).unwrap();
+    d.grid_key("down", None).unwrap();
+    assert_eq!(rows(&d)[0][1], "");
+}
+
+#[test]
+fn a_calendar_closes_when_the_focus_moves_and_leaves_other_keys_to_the_field() {
+    let mut d = form();
+    let mut c = Control::new(
+        "finish",
+        "Finish:",
+        ControlKind::DateCombo,
+        Value::Text("2026-10-20".into()),
+    );
+    c.page = Some(0);
+    d.controls.push(c);
+    let i = d.controls.len() - 1;
+    d.toggle_calendar(i).unwrap();
+    // A key it does not handle goes on to the field.
+    assert!(!d.calendar_key("a").unwrap());
+    assert!(!d.calendar_key("backspace").unwrap());
+    assert!(d.calendar.is_some());
+    // A click on another control closes it.
+    d.click_control(0, None).unwrap();
+    assert!(d.calendar.is_none());
+    assert!(!d.calendar_key("enter").unwrap());
+    assert_eq!(text_of_control(&d, "finish"), "2026-10-20");
+    // So does selecting a grid row.
+    let mut g = link_grid();
+    g.controls.push(Control {
+        page: Some(1),
+        ..Control::new(
+            "when",
+            "When:",
+            ControlKind::DateCombo,
+            Value::Text(String::new()),
+        )
+    });
+    let w = g.controls.len() - 1;
+    g.toggle_calendar(w).unwrap();
+    g.select_row("links", 0).unwrap();
+    assert!(g.calendar.is_none());
+}
+
+#[test]
+fn a_combo_keeps_the_typed_name_unless_it_is_an_item_and_a_dropdown_completes() {
+    let mut d = link_grid();
+    d.set("links[1].task name", &args(r#"{"value":"Des"}"#))
+        .unwrap();
+    assert_eq!(rows(&d)[1][1], "Des", "a part of Design stays as typed");
+    d.set("links[1].task name", &args(r#"{"value":"DESIGN"}"#))
+        .unwrap();
+    assert_eq!(rows(&d)[1][1], "Design", "an exact name, case aside");
+    d.set("links[1].type", &args(r#"{"value":"ss"}"#)).unwrap();
+    assert_eq!(rows(&d)[1][2], "Start-to-Start (SS)");
+}
+
+#[test]
+fn a_pending_cell_edit_is_committed_by_the_arrows_a_click_tab_and_ok() {
+    let mut s = DialogStack::default();
+    s.push(link_grid());
+    let d = s.top_dialog_mut().unwrap();
+    d.select_row("links", 1).unwrap();
+    let i = d.focus.unwrap();
+    d.controls[i].col = 0;
+    d.grid_key("7", Some("7")).unwrap();
+    d.grid_key("up", None).unwrap();
+    assert_eq!(rows(d)[1][0], "7", "Up commits");
+    assert_eq!(d.controls[i].edit, None);
+    d.select_row("links", 1).unwrap();
+    d.grid_key("down", None).unwrap();
+    d.controls[i].col = 0;
+    d.select_row("links", 2).unwrap();
+    d.grid_key("8", Some("8")).unwrap();
+    d.click_control(i, Some(0)).unwrap();
+    assert_eq!(rows(d)[2][0], "8", "a click on another cell commits");
+    d.grid_key("9", Some("9")).unwrap();
+    let before = d.controls[i].edit.clone();
+    assert_eq!(before.as_deref(), Some("9"));
+    // OK commits it, and a refused one keeps the dialog open.
+    let mut seen = None;
+    s.click("ok", |d| {
+        seen = Some(rows(d)[0][0].clone());
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(seen.as_deref(), Some("9"));
+    let mut s = DialogStack::default();
+    let mut d = link_grid();
+    d.select_row("links", 1).unwrap();
+    let i = d.focus.unwrap();
+    d.controls[i].col = 2;
+    d.grid_key("z", Some("z")).unwrap();
+    s.push(d);
+    assert!(s.click("ok", |_| Ok(())).is_err());
+    assert!(s.is_open());
+    assert_eq!(s.top().unwrap().controls[i].edit.as_deref(), Some("z"));
+}
+
+#[test]
+fn the_combo_pick_stays_within_the_drawn_items() {
+    let mut d = link_grid();
+    let i = d.controls.iter().position(|c| c.name == "links").unwrap();
+    d.controls[i].column_items[1] = (0..9).map(|n| format!("Task {n}")).collect();
+    d.select_row("links", 1).unwrap();
+    d.controls[i].col = 1;
+    d.grid_key("t", Some("t")).unwrap();
+    d.grid_key("up", None).unwrap();
+    assert_eq!(d.controls[i].pick, Some(5));
+    for _ in 0..9 {
+        d.grid_key("down", None).unwrap();
+    }
+    assert_eq!(d.controls[i].pick, Some(5));
+}

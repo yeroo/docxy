@@ -532,6 +532,7 @@ pub(crate) fn edit_key(
     }
     match key {
         "tab" => {
+            d.commit_pending()?;
             d.focus_step(m.shift);
             Ok(())
         }
@@ -1171,27 +1172,33 @@ impl Docxy {
                                 .max_h(px(18. * 6.))
                                 .overflow_hidden()
                                 .child(probe(&self.probes, format!("dialog-suggestions:{name}")))
-                                .children(suggestions.iter().take(6).enumerate().map(|(k, &n)| {
-                                    h_flex()
-                                        .id(("dialog-suggestion", i * 1024 + k))
-                                        .h(px(18.))
-                                        .px_1()
-                                        .cursor_pointer()
-                                        .when(pick == Some(k), |r| {
-                                            r.bg(hsla_u(BRAND).opacity(0.35))
-                                        })
-                                        .relative()
-                                        .child(probe(
-                                            &self.probes,
-                                            format!("dialog-cell:{name}[suggest].{k}"),
-                                        ))
-                                        .child(SharedString::from(offered[n].clone()))
-                                        .on_click(on_widget(
-                                            cx,
-                                            i,
-                                            Some(dialog::SUGGESTION_BASE + k),
-                                        ))
-                                })),
+                                .children(
+                                    suggestions
+                                        .iter()
+                                        .take(dialog::SUGGESTIONS_DRAWN)
+                                        .enumerate()
+                                        .map(|(k, &n)| {
+                                            h_flex()
+                                                .id(("dialog-suggestion", i * 1024 + k))
+                                                .h(px(18.))
+                                                .px_1()
+                                                .cursor_pointer()
+                                                .when(pick == Some(k), |r| {
+                                                    r.bg(hsla_u(BRAND).opacity(0.35))
+                                                })
+                                                .relative()
+                                                .child(probe(
+                                                    &self.probes,
+                                                    format!("dialog-cell:{name}[suggest].{k}"),
+                                                ))
+                                                .child(SharedString::from(offered[n].clone()))
+                                                .on_click(on_widget(
+                                                    cx,
+                                                    i,
+                                                    Some(dialog::SUGGESTION_BASE + k),
+                                                ))
+                                        }),
+                                ),
                         )
                     })
                     .into_any_element()

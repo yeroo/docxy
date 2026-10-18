@@ -361,7 +361,7 @@ fn read_yppx_within(bytes: &[u8], budget: u64) -> Result<Project, String> {
         .entries()
         .iter()
         .find(|entry| entry.name.eq_ignore_ascii_case(tableview::PART))
-        .filter(|entry| entry.uncomp_size <= MAX_TIMELINE_PART)
+        .filter(|entry| entry.uncomp_size <= MAX_TABLE_VIEW_PART)
         .and_then(|entry| {
             let text = String::from_utf8(zip.extract(entry)?).ok()?;
             Some((TableView::from_xml(&text).ok()?, entry.name.as_str()))
@@ -373,7 +373,7 @@ fn read_yppx_within(bytes: &[u8], budget: u64) -> Result<Project, String> {
         .entries()
         .iter()
         .find(|entry| entry.name.eq_ignore_ascii_case(timeline::PART))
-        .filter(|entry| entry.uncomp_size <= MAX_TABLE_VIEW_PART)
+        .filter(|entry| entry.uncomp_size <= MAX_TIMELINE_PART)
         .and_then(|entry| {
             let text = String::from_utf8(zip.extract(entry)?).ok()?;
             Some((timeline::from_xml(&text).ok()?, entry.name.as_str()))
@@ -502,9 +502,6 @@ mod tests {
         assert_eq!(read_yppx(&bytes).unwrap().table_view, proj.table_view);
     }
 
-    /// The formatting part (#1532): written only when there is formatting,
-    /// declared in the content types, read back into the model (not kept as
-    /// an extra part), and a plan without any writes no part.
     /// Display on Timeline (#1536): MSPDI has none, so it rides in
     /// `timeline.xml`, written only when a task states a value.
     #[test]
@@ -530,6 +527,30 @@ mod tests {
         assert!(!map.contains("timeline.xml"), "{map}");
     }
 
+    /// The two parts have their own size bounds: a 2 MiB `timeline.xml`
+    /// (many flagged tasks) still reads, a 2 MiB `tableview.xml` stays a
+    /// retained extra.
+    #[test]
+    fn the_timeline_and_table_view_parts_have_their_own_size_bounds() {
+        let pad = " ".repeat(2 * 1024 * 1024);
+        let timeline = format!("<timeline><task uid=\"1\" show=\"1\"/>{pad}</timeline>");
+        let source = with_parts(
+            ORIGINAL_CONTENT_TYPES,
+            &[("timeline.xml", timeline.as_bytes())],
+        );
+        let proj = read_yppx(&source).unwrap();
+        assert_eq!(proj.tasks[0].display_on_timeline, Some(true));
+        assert!(proj.package.parts.is_empty());
+        let view = format!("<tableview><column field=\"ID\" width=\"60\"/>{pad}</tableview>");
+        let source = with_parts(
+            ORIGINAL_CONTENT_TYPES,
+            &[("tableview.xml", view.as_bytes())],
+        );
+        let proj = read_yppx(&source).unwrap();
+        assert!(proj.table_view.is_empty());
+        assert_eq!(proj.package.parts[0].0, "tableview.xml");
+    }
+
     #[test]
     fn unreadable_timeline_part_is_retained() {
         let map = ORIGINAL_CONTENT_TYPES.replace(
@@ -546,6 +567,9 @@ mod tests {
         assert_eq!(map.matches("/timeline.xml").count(), 1, "{map}");
     }
 
+    /// The formatting part (#1532): written only when there is formatting,
+    /// declared in the content types, read back into the model (not kept as
+    /// an extra part), and a plan without any writes no part.
     #[test]
     fn formatting_round_trips_through_its_own_part() {
         let mut proj = Project::default();

@@ -99,6 +99,7 @@ pub(super) fn follow(d: &mut Dialog, i: usize, before: &Value) {
     };
     let ids = d.controls[i].column_items[ID].clone();
     let names = d.controls[i].column_items[NAME].clone();
+    let picked = d.controls[i].picked;
     let Value::Rows(rows) = &mut d.controls[i].value else {
         return;
     };
@@ -106,7 +107,9 @@ pub(super) fn follow(d: &mut Dialog, i: usize, before: &Value) {
     match c {
         NAME => {
             let want = row[NAME].trim().to_lowercase();
-            let hit = names.iter().position(|n| n.to_lowercase() == want);
+            // A pick carries its item: of two tasks with one name, the one
+            // picked.
+            let hit = picked.or_else(|| names.iter().position(|n| n.to_lowercase() == want));
             row[ID] = hit.map_or_else(String::new, |k| ids[k].clone());
             if let Some(k) = hit {
                 row[NAME] = names[k].clone();
@@ -180,12 +183,15 @@ pub(super) fn parse(
             cross_project: target.cross_project,
             cross_project_name: target.cross_project_name.clone(),
         };
+        // The stored link stays when the row says it again: the same task,
+        // type and lag, in the same format or spelled as the grid opened.
+        // A lag re-spelled in another unit or with `?` is an edit.
         out.push(
-            match task
-                .predecessors
-                .iter()
-                .find(|p| (p.uid, p.link, p.lag) == (parsed.uid, link, lag))
-            {
+            match task.predecessors.iter().find(|p| {
+                (p.uid, p.link, p.lag) == (parsed.uid, link, lag)
+                    && (p.lag_format == lag_format
+                        || cell(LAG).trim_start_matches('+') == lag_text(p, proj))
+            }) {
                 Some(stored) => stored.clone(),
                 None => parsed,
             },

@@ -630,9 +630,15 @@
   (`Control::column_items`: typing narrows the list drawn under the grid, the
   arrows reach into it (`pick`), Enter takes the pick, a click on an item
   commits it, a text naming one item exactly or as its only match becomes it,
-  any other text stays as typed), `Dropdown` (Space or a click steps the
+  any other text stays as typed: a new resource named Ann beside a Joanne is
+  new; only a pick completes), `Dropdown` (Space or a click steps the
   cell; typed text must name one item), and `Label` (read-only: `dialog-set`
-  refuses it and typing starts nothing).
+  refuses it and typing starts nothing). All three apply to an editable grid
+  only; a plugin grid's columns store what is typed. A cell being typed into
+  is committed by Up/Down, a click elsewhere, Tab, a tab change and OK
+  (`commit_pending`; a refusal keeps the edit and the dialog open). A pick
+  carries its item's index (`Control::picked`), so of two tasks with one name
+  the one picked is linked.
 - `ControlKind::DateCombo` is typed as `Date`; its ▾ button, Alt+Down or F4
   opens `dialog::calendar::Calendar` (month grid, Sunday first) under the
   field: arrows move the cursor a day or a week, Page Up/Down a month, Enter
@@ -654,7 +660,7 @@
   cross-project fields). `set_predecessors` refuses a cycle, a duplicate or a
   self link, and the dialog stays open. The Resources grid
   (`project/task_info/resources.rs`) has Resource Name, Assignment Owner
-  (`assn_owner`), Units and Cost (both read-only); OK turns the rows into the
+  (`assn_owner`) and Cost read-only, Units typed; OK turns the rows into the
   Resource Names cell's tokens (`Ann`, `Bo[50%]`, `Cement[5 tons]`; 100% is the
   bare name) and applies them through `set_resources`, so a row left as shown
   changes nothing and a new name makes a resource. Rows without a name are

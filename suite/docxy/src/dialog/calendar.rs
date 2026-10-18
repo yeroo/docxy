@@ -31,12 +31,14 @@ pub(crate) struct Calendar {
     day: u32,
 }
 
-/// Today, by the system clock.
+/// Today on the local clock, as DATE fields read it (#768): the system
+/// clock plus the OS's zone offset.
 pub(crate) fn today() -> DateTime {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    DateTime::from_minutes((secs / 60) as i64).start_of_day()
+        .map_or(0, |d| d.as_secs() as i64);
+    DateTime::from_minutes(secs.div_euclid(60) + gridcore::clock::local_offset_minutes())
+        .start_of_day()
 }
 
 fn days_in(year: i64, month: u32) -> u32 {

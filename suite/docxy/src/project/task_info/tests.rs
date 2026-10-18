@@ -1110,3 +1110,65 @@ fn bad_units_are_refused_and_an_untouched_grid_writes_nothing() {
     assert_eq!(state(&t), before);
     assert_eq!(t.dialogs.top_id(), "task-information");
 }
+
+#[test]
+fn picking_the_second_of_two_tasks_with_one_name_links_that_one() {
+    let mut t = tab3();
+    {
+        let mut p = v(&t).ed.project().clone();
+        p.tasks[2].name = "First".into();
+        vm(&mut t).ed = ProjectEditor::new(p);
+        vm(&mut t).ed.select(1);
+    }
+    open(&mut t, ProjectAct::Constraint);
+    t.dialogs.select_tab("Predecessors").unwrap();
+    t.dialogs.select_row("predecessors", 0).unwrap();
+    let d = t.dialogs.top_dialog_mut().unwrap();
+    let i = d.focus.unwrap();
+    d.controls[i].col = 1;
+    d.grid_key("f", Some("f")).unwrap();
+    assert_eq!(d.controls[i].suggestions().len(), 2);
+    d.click_control(i, Some(crate::dialog::SUGGESTION_BASE + 1))
+        .unwrap();
+    assert_eq!(grid(&t, "predecessors")[0][..2], ["3", "First"]);
+    dialog_click(&mut t, "OK").unwrap();
+    assert_eq!(preds(&t, 2), [(3, projcore::LinkType::FinishStart, 0)]);
+}
+
+#[test]
+fn respelling_a_kept_links_lag_unit_or_estimate_is_applied() {
+    let mut t = tab3();
+    {
+        let ed = &mut vm(&mut t).ed;
+        let links = parse_preds(ed, "1FS+2d");
+        ed.set_predecessors(2, links).unwrap();
+    }
+    for (lag, want_format) in [
+        (
+            "16h",
+            projcore::LagFormat::new(projcore::LagUnit::Hour, false, false),
+        ),
+        (
+            "2d?",
+            projcore::LagFormat::new(projcore::LagUnit::Day, false, true),
+        ),
+    ] {
+        open(&mut t, ProjectAct::Constraint);
+        cell(&mut t, "predecessors[0].lag", lag);
+        dialog_click(&mut t, "OK").unwrap();
+        let p = &v(&t).ed.project().task(2).unwrap().predecessors[0];
+        assert_eq!((p.lag, Some(p.lag_format)), (2 * 480, want_format), "{lag}");
+        // Back to plain days for the next spelling.
+        open(&mut t, ProjectAct::Constraint);
+        cell(&mut t, "predecessors[0].lag", "2d");
+        dialog_click(&mut t, "OK").unwrap();
+    }
+    // The same text as shown keeps the stored link.
+    vm(&mut t).ed.mark_saved();
+    t.dirty = false;
+    let before = state(&t);
+    open(&mut t, ProjectAct::Constraint);
+    cell(&mut t, "predecessors[0].lag", "2d");
+    dialog_click(&mut t, "OK").unwrap();
+    assert_eq!(state(&t), before);
+}

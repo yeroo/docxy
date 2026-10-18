@@ -294,12 +294,15 @@ pub(crate) fn task_info_dialog_for(
     Ok(d)
 }
 
-/// ASAP and ALAP take no date: the constraint date field follows the type.
-fn react(d: &mut Dialog, i: usize, _before: &Value) {
+/// A control changed (`before` is its old value): ASAP and ALAP take no date,
+/// so the constraint date field follows the type; Estimated and the
+/// Duration's `?` follow each other; a Predecessors or Resources grid cell
+/// fills its row's other cells ([`preds::follow`], [`resources::follow`]).
+fn react(d: &mut Dialog, i: usize, before: &Value) {
     match d.controls[i].name {
         "ctype" => {}
-        "predecessors" => return preds::follow(d, i, _before),
-        "resources" => return resources::follow(d, i, _before),
+        "predecessors" => return preds::follow(d, i, before),
+        "resources" => return resources::follow(d, i, before),
         // Estimated is the duration's `?`: ticking it adds the mark, clearing
         // it removes it, and typing the mark (or not) follows in the box.
         "estimated" => return follow_estimated(d, i),
