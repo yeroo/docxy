@@ -174,6 +174,11 @@ pub(crate) enum DialogOwner {
         sheet: usize,
         col: u32,
     },
+    /// The Project table's AutoFilter drop-down on entry column `col`
+    /// (#1533); its buttons apply in `project::autofilter_click`.
+    ProjectFilter {
+        col: usize,
+    },
     /// Custom AutoFilter and Top 10 AutoFilter for that column.
     CustomFilter {
         sheet: usize,

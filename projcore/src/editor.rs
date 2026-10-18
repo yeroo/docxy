@@ -43,10 +43,12 @@ pub(crate) use fields::{format_work, two_decimals};
 #[cfg(test)]
 use cells::parse_predecessors;
 use cells::{bracket_units, parse_resource_token, same_shown_units};
+mod display;
 mod moving;
 mod outline;
 mod plan;
 mod props;
+pub use display::{Sort, ValueItem};
 mod resources;
 use outline::subtree_end;
 pub use props::{
@@ -134,6 +136,14 @@ pub struct Editor {
     /// `select` put the selection on the hidden project summary row
     /// (automation): edits leave it there. Any other arrival moves off it.
     sel_pinned: bool,
+    /// The grid's sort and AutoFilter checklists (#1533): view state, outside
+    /// the model, history and saved files (see [`Self::display_rows`]).
+    sort: Option<Sort>,
+    filters: Vec<display::Filter>,
+    /// The displayed rows (uids) and the selection's place in them, as they
+    /// were just before the edit in flight, while a filter is on: where a
+    /// selection the edit hides goes ([`Self::sel_into_display`]).
+    pre_view: Option<display::PreView>,
     undo: Vec<Project>,
     redo: Vec<Project>,
     dirty: bool,
@@ -178,6 +188,9 @@ impl Editor {
             collapsed: Default::default(),
             show_summary: false,
             sel_pinned: false,
+            sort: None,
+            filters: Vec::new(),
+            pre_view: None,
             undo: Vec::new(),
             redo: Vec::new(),
             dirty,
@@ -212,6 +225,20 @@ impl Editor {
         self.changed();
     }
 
+    /// Edit the Project table's saved view ([`crate::tableview::TableView`],
+    /// the column widths) as one undo step; an edit that changes nothing
+    /// records nothing.
+    pub fn edit_table_view(&mut self, edit: impl FnOnce(&mut crate::tableview::TableView)) {
+        let mut next = self.proj.table_view.clone();
+        edit(&mut next);
+        if next == self.proj.table_view {
+            return;
+        }
+        self.snapshot();
+        self.proj.table_view = next;
+        self.changed();
+    }
+
     /// Begin a new document session, retaining find and leveling preferences.
     pub fn replace_project(&mut self, proj: Project) {
         self.proj = proj;
@@ -219,6 +246,8 @@ impl Editor {
         self.sel = 0;
         self.sel_pinned = false;
         self.collapsed.clear();
+        self.sort = None;
+        self.filters.clear();
         self.undo.clear();
         self.redo.clear();
         self.dirty = false;
@@ -286,8 +315,16 @@ impl Editor {
 
     pub fn toggle_level(&mut self) {
         self.pending = None;
+        self.capture_view();
         self.leveled = !self.leveled;
         self.reschedule();
+        // Leveled dates are what a Start or Finish filter reads, so the
+        // toggle can move the selected task out of the checked values.
+        self.revision += 1;
+        if !self.sel_pinned && !self.filters.is_empty() {
+            self.sel_into_display();
+        }
+        self.pre_view = None;
     }
 
     /// Show the plan leveled (`on`) or as scheduled; a state it already shows
@@ -418,6 +455,7 @@ impl Editor {
     }
 
     fn snapshot(&mut self) {
+        self.capture_view();
         self.push_undo(self.proj.clone());
     }
 
@@ -461,6 +499,13 @@ impl Editor {
         }
         self.sel_uid = self.selected_uid();
         self.reschedule();
+        // The edit may have made the selected task fail a filter (its Finish
+        // moved, its name changed): the displayed rows depend on the new
+        // schedule, so this comes after it.
+        if !self.sel_pinned && !self.filters.is_empty() {
+            self.sel_into_display();
+        }
+        self.pre_view = None;
     }
 
     /// Validate newly created/exposed leaves before touching history or UI state.
@@ -468,6 +513,7 @@ impl Editor {
     /// links, and is refused when it makes a cycle-free plan cyclic (see
     /// `links`).
     fn edit_structure(&mut self, edit: impl FnOnce(&mut Project)) -> Result<(), String> {
+        self.capture_view();
         let mut next = self.proj.clone();
         edit(&mut next);
         links::follow_outline(&self.proj.tasks, &mut next.tasks)?;
@@ -488,6 +534,7 @@ impl Editor {
             return false;
         };
         self.pending = None;
+        self.pre_view = None;
         self.redo.push(std::mem::replace(&mut self.proj, prev));
         self.changed();
         true
@@ -498,6 +545,7 @@ impl Editor {
             return false;
         };
         self.pending = None;
+        self.pre_view = None;
         self.undo.push(std::mem::replace(&mut self.proj, next));
         self.changed();
         true
@@ -506,30 +554,34 @@ impl Editor {
     /// Find the next matching row, wrapping after the selected row. An empty
     /// query repeats the previous search. Searching never changes history.
     pub fn find(&mut self, query: &str) -> FindOutcome {
-        self.find_from(query, self.sel + 1)
+        self.find_from(query, Some(self.sel))
     }
 
     /// [`Self::find`], starting at the first task instead of after the
     /// selected one (as from docxy's entry row).
     pub fn find_from_top(&mut self, query: &str) -> FindOutcome {
-        self.find_from(query, 0)
+        self.find_from(query, None)
     }
 
     /// A hidden match expands the summaries that hide it.
-    fn find_from(&mut self, query: &str, first: usize) -> FindOutcome {
+    fn find_from(&mut self, query: &str, first: Option<usize>) -> FindOutcome {
         let query = query.trim().to_lowercase();
         if !query.is_empty() {
             self.last_find = query;
         }
-        let n = self.proj.tasks.len();
+        // In the order the grid draws, filtered rows left out; a collapsed
+        // summary's subtasks are still searched (and expanded on a match).
+        let rows = self.ordered_rows(false, true);
+        let n = rows.len();
         if self.last_find.is_empty() || n == 0 {
             return FindOutcome::Inactive;
         }
+        let start = match first {
+            Some(sel) => rows.iter().position(|&i| i == sel).map_or(0, |p| p + 1),
+            None => 0,
+        };
         for step in 0..n {
-            let i = (first + step) % n;
-            if !self.show_summary && self.proj.tasks[i].is_project_summary() {
-                continue;
-            }
+            let i = rows[(start + step) % n];
             if self.proj.tasks[i]
                 .name
                 .to_lowercase()
@@ -560,6 +612,9 @@ impl Editor {
         estimated: bool,
     ) -> Result<usize, String> {
         validate_duration(duration_min)?;
+        if after.is_some() {
+            self.refuse_while_sorted()?;
+        }
         let at = match after {
             Some(uid) => self.index(uid)? + 1,
             None => self.proj.tasks.len(),
@@ -626,6 +681,9 @@ impl Editor {
     /// takes the level of the task above where it sits then (see
     /// [`materialized`]). The returned row is not automatically selected.
     pub fn insert_blank_row(&mut self, before: Option<i32>) -> Result<usize, String> {
+        if before.is_some() {
+            self.refuse_while_sorted()?;
+        }
         let at = match before {
             Some(uid) => self.index(uid)?,
             None => self.proj.tasks.len(),
@@ -671,6 +729,9 @@ impl Editor {
         let Some(top) = rows.iter().map(|t| t.outline_level).min() else {
             return Ok(Vec::new());
         };
+        if before.is_some() {
+            self.refuse_while_sorted()?;
+        }
         let at = match before {
             Some(uid) => self.index(uid)?,
             None => self.proj.tasks.len(),
@@ -860,6 +921,12 @@ impl Editor {
             .iter()
             .map(|t| t.uid)
             .collect();
+        // Under a sort or filter the cursor goes to the row drawn after the
+        // deleted ones (else before them), by uid: a summary shown only
+        // through the deleted task drops out with it.
+        let pre = (self.is_view_active() && range.contains(&self.sel))
+            .then(|| self.view_before())
+            .flatten();
         self.edit_structure(|proj| {
             proj.tasks.drain(range);
             for t in &mut proj.tasks {
@@ -868,10 +935,14 @@ impl Editor {
             // Remove assignments as well, so they cannot attach to a reused UID.
             proj.assignments.retain(|a| !removed.contains(&a.task_uid));
         })?;
+        if let Some(pre) = pre {
+            self.reselect_near(&pre);
+        }
         Ok(removed)
     }
 
     pub fn indent(&mut self, uid: i32, delta: i32) -> Result<(), String> {
+        self.refuse_while_sorted()?;
         let i = self.index(uid)?;
         self.edit_row(i, |proj, _| {
             let t = &mut proj.tasks[i];

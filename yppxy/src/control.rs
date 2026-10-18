@@ -40,6 +40,9 @@
 //! | `resource.del` | `{uid}` | `{deleted, assignments:[uid…]}`: the resource with its assignments, one undo step (#1588) |
 //! | `proj.get` | `{}` | the plan's title, start, finish, status and current dates, calendar (#1587) and `new_tasks` mode (#1585); see `projctl` |
 //! | `proj.set` | `{title?, start?, status_date?, current_date?, calendar?, new_tasks?}` | the same after the change, one undo step (#1587, #1585); see `projctl` |
+//! | `proj.view` | — | the grid's order (#1533): `{sort, sort_descending, filter, filters:[{column, values}], count, rows:[uid…]}`, the rows in the order the table draws them |
+//! | `proj.sort` | `{column?, descending?}` (no `column` clears) | the same as `proj.view`; view state, not an edit |
+//! | `proj.filter` | `{column, values?}` or `{clear:true}` | the same as `proj.view`; `values` are the cell texts (one may contain `|`), `(Blanks)`, or on a date column `YYYY`, `YYYY-MM`, `YYYY-MM-DD`; no `values` clears that column |
 //! | `proj.save` | `{path?}` (.yppx/.xml, or a type a format plugin writes; extensionless adds .yppx) | `{path, …}` with the actual saved path |
 //! | `proj.reload` | — | `{path, …}` |
 //! | `proj.open` | `{path}` | `{path, …}` |
@@ -103,6 +106,44 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
             app.open_file(&p);
             Ok(path_info(app))
         }
+        "proj.view" => Ok(view_json(app)),
+        "proj.sort" => {
+            let text = match args.get_str("column") {
+                Some(column) if args.get("descending").and_then(Json::as_bool) == Some(true) => {
+                    format!("{column} desc")
+                }
+                Some(column) => column.to_string(),
+                None => String::new(),
+            };
+            app.apply_sort(&text)?;
+            Ok(view_json(app))
+        }
+        "proj.filter" => {
+            if args.get("clear").and_then(Json::as_bool) == Some(true) {
+                app.apply_filter("")?;
+            } else {
+                let field = crate::entry_field(
+                    args.get_str("column")
+                        .ok_or("proj.filter needs a 'column' (or {\"clear\": true})")?,
+                )?;
+                let values: Vec<String> = match args.get("values") {
+                    None => Vec::new(),
+                    Some(v) => v
+                        .as_array()
+                        .filter(|a| !a.is_empty())
+                        .ok_or("'values' must be a non-empty array of texts (omit it to clear)")?
+                        .iter()
+                        .map(|v| {
+                            v.as_str()
+                                .map(str::to_string)
+                                .ok_or("'values' must be an array of texts")
+                        })
+                        .collect::<Result<_, _>>()?,
+                };
+                app.filter_values(field, &values)?;
+            }
+            Ok(view_json(app))
+        }
         "field-read" => ctlcore::field::reply(args, INPUTS, app.counts, app.ed.dirty(), |id| {
             app.input_field(id)
         }),
@@ -124,13 +165,30 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
     out
 }
 
+/// The grid's sort, filters and the rows as drawn (#1533).
+fn view_json(app: &App) -> Json {
+    let ed = &app.ed;
+    let tasks = &ed.project().tasks;
+    let rows: Vec<Json> = ed
+        .display_rows()
+        .into_iter()
+        .map(|i| Json::Num(f64::from(tasks[i].uid)))
+        .collect();
+    let mut fields = projctl::view_fields(ed);
+    fields.extend([
+        ("count", Json::Num(rows.len() as f64)),
+        ("rows", Json::Arr(rows)),
+    ]);
+    Json::obj(fields)
+}
+
 fn path_info(app: &App) -> Json {
     projctl::path_info(app.path.as_deref(), &app.ed)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::new_project;
+    use crate::{Act, PromptKind, new_project, on_key, view_note};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     fn app() -> App {
         App::new(new_project(), Some("ctl-test.xml".to_string()), false)
@@ -425,5 +483,280 @@ mod tests {
         assert_eq!(at.get_usize("col"), Some(30 + 1 + " Rename: ".len()), "{r}");
         let all = dispatch(&mut app, "field-read", &Json::obj(vec![])).unwrap();
         assert_eq!(all.get_usize("frames"), Some(2), "{all}");
+    }
+
+    /// Plan, Build, Test, Ship finish on 1/12, 3/2, 3/17 and 4/6 (the suite's
+    /// `project-filter.xml`).
+    fn dated() -> App {
+        let task = |uid: u32, name: &str, days: u32, date: &str| {
+            format!(
+                "<Task><UID>{uid}</UID><ID>{uid}</ID><Name>{name}</Name><OutlineLevel>1</OutlineLevel>\
+                 <Duration>PT{}H0M0S</Duration><ConstraintType>4</ConstraintType>\
+                 <ConstraintDate>{date}T08:00:00</ConstraintDate></Task>",
+                days * 8
+            )
+        };
+        let xml = format!(
+            "<?xml version=\"1.0\"?><Project xmlns=\"http://schemas.microsoft.com/project\">\
+             <Name>d</Name><StartDate>2026-01-05T08:00:00</StartDate>\
+             <MinutesPerDay>480</MinutesPerDay><MinutesPerWeek>2400</MinutesPerWeek><Tasks>{}{}{}{}</Tasks></Project>",
+            task(1, "Plan", 1, "2026-01-12"),
+            task(2, "Build", 1, "2026-03-02"),
+            task(3, "Test", 2, "2026-03-16"),
+            task(4, "Ship", 1, "2026-04-06"),
+        );
+        App::new(
+            projcore::mspdi::read_mspdi(&xml).unwrap(),
+            Some("dated.xml".to_string()),
+            false,
+        )
+    }
+
+    fn obj(pairs: Vec<(&str, Json)>) -> Json {
+        Json::obj(pairs)
+    }
+
+    fn uids(view: &Json) -> Vec<i64> {
+        view.get("rows")
+            .and_then(Json::as_array)
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn sort_reorders_the_rows_and_clears() {
+        let mut a = dated();
+        let v = dispatch(&mut a, "proj.view", &Json::Null).unwrap();
+        assert_eq!(uids(&v), [1, 2, 3, 4]);
+        assert_eq!(v.get_str("sort"), Some("ID"));
+        let v = dispatch(
+            &mut a,
+            "proj.sort",
+            &obj(vec![
+                ("column", Json::Str("Finish".into())),
+                ("descending", Json::Bool(true)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(uids(&v), [4, 3, 2, 1]);
+        assert_eq!(v.get_str("sort"), Some("Finish"));
+        assert_eq!(v.get("sort_descending").and_then(Json::as_bool), Some(true));
+        let v = dispatch(
+            &mut a,
+            "proj.sort",
+            &obj(vec![("column", Json::Str("name".into()))]),
+        )
+        .unwrap();
+        assert_eq!(uids(&v), [2, 1, 4, 3], "Build, Plan, Ship, Test");
+        let v = dispatch(&mut a, "proj.sort", &Json::Null).unwrap();
+        assert_eq!(uids(&v), [1, 2, 3, 4]);
+        // Sorting is view state: the plan is not dirty.
+        assert!(!a.ed.dirty());
+    }
+
+    #[test]
+    fn filtering_finish_to_a_month_and_anding_a_second_column() {
+        let mut a = dated();
+        let filter =
+            |a: &mut App, pairs: Vec<(&str, Json)>| dispatch(a, "proj.filter", &obj(pairs));
+        let v = filter(
+            &mut a,
+            vec![
+                ("column", Json::Str("Finish".into())),
+                ("values", Json::Arr(vec![Json::Str("2026-03".into())])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(uids(&v), [2, 3]);
+        assert_eq!(v.get_str("filter"), Some("AutoFilter"));
+        let v = filter(
+            &mut a,
+            vec![
+                ("column", Json::Str("Name".into())),
+                ("values", Json::Arr(vec![Json::Str("test".into())])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(uids(&v), [3]);
+        assert_eq!(
+            v.get("filters").and_then(Json::as_array).map(<[Json]>::len),
+            Some(2)
+        );
+        // Sorted and filtered compose.
+        dispatch(
+            &mut a,
+            "proj.sort",
+            &obj(vec![("column", Json::Str("Name".into()))]),
+        )
+        .unwrap();
+        // A column alone clears its filter.
+        let v = filter(&mut a, vec![("column", Json::Str("Name".into()))]).unwrap();
+        assert_eq!(uids(&v), [2, 3]);
+        let v = filter(&mut a, vec![("clear", Json::Bool(true))]).unwrap();
+        assert_eq!(uids(&v), [2, 1, 4, 3]);
+        assert_eq!(v.get_str("filter"), Some("All Tasks"));
+        // Every value is no filter.
+        let v = filter(
+            &mut a,
+            vec![
+                ("column", Json::Str("Finish".into())),
+                ("values", Json::Arr(vec![Json::Str("2026".into())])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(v.get_str("filter"), Some("All Tasks"));
+    }
+
+    #[test]
+    fn a_bad_column_or_value_is_refused_and_changes_nothing() {
+        let mut a = dated();
+        let err = dispatch(
+            &mut a,
+            "proj.sort",
+            &obj(vec![("column", Json::Str("Nope".into()))]),
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("No column 'Nope' (ID, Task Mode, Name"),
+            "{err}"
+        );
+        let err = dispatch(
+            &mut a,
+            "proj.filter",
+            &obj(vec![
+                ("column", Json::Str("Finish".into())),
+                ("values", Json::Arr(vec![Json::Str("2026-05".into())])),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(err, "No value '2026-05' in Finish");
+        assert!(!a.ed.is_filtered());
+        assert!(dispatch(&mut a, "proj.filter", &Json::Null).is_err());
+    }
+
+    #[test]
+    fn the_prompts_and_vim_commands_do_the_same() {
+        let mut a = dated();
+        a.apply_act(Act::Sort);
+        let p = a.prompt.as_mut().unwrap();
+        assert!(matches!(p.kind, PromptKind::Sort));
+        p.buf = "Finish desc".into();
+        on_key(&mut a, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(a.status, "Sorted by Finish desc");
+        assert_eq!(view_note(&a.ed), " · ↓ Finish");
+        a.apply_act(Act::Filter);
+        let p = a.prompt.as_mut().unwrap();
+        assert!(matches!(p.kind, PromptKind::Filter));
+        p.buf = "Finish: 2026-03".into();
+        on_key(&mut a, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(a.status, "AutoFilter Applied");
+        assert_eq!(view_note(&a.ed), " · ↓ Finish · ⧩ AutoFilter Applied");
+        let rows: Vec<_> = a.ed.display_rows();
+        assert_eq!(rows, [2, 1], "Test then Build, the March rows latest first");
+        // The sort refuses position-dependent edits until it is cleared.
+        a.ed.select(2);
+        a.indent(1);
+        assert_eq!(a.status, "Clear the sort first");
+        a.vim_run("sort");
+        assert_eq!(a.status, "Sort cleared");
+        a.vim_run("filter");
+        assert_eq!(a.status, "Filter cleared");
+        assert_eq!(a.ed.display_rows(), [0, 1, 2, 3]);
+        a.vim_run("sort Task desc");
+        assert_eq!(
+            a.ed.sort().map(|s| (s.field.name(), s.descending)),
+            Some(("Name".into(), true))
+        );
+    }
+
+    #[test]
+    fn filter_values_may_hold_a_bar_and_an_empty_text_is_a_blank_cell() {
+        let mut a = dated();
+        a.ed.rename(2, "Build | Test").unwrap();
+        let filter = |a: &mut App, column: &str, values: &[&str]| {
+            dispatch(
+                a,
+                "proj.filter",
+                &obj(vec![
+                    ("column", Json::Str(column.into())),
+                    (
+                        "values",
+                        Json::Arr(values.iter().map(|v| Json::Str((*v).into())).collect()),
+                    ),
+                ]),
+            )
+        };
+        let v = filter(&mut a, "Name", &["Build | Test"]).unwrap();
+        assert_eq!(uids(&v), [2]);
+        // No task has an empty Name: asking for it is refused, not a clear.
+        let err = filter(&mut a, "Name", &[""]).unwrap_err();
+        assert_eq!(err, "No value '' in Name");
+        assert_eq!(
+            uids(&dispatch(&mut a, "proj.view", &Json::Null).unwrap()),
+            [2]
+        );
+        // Every task has no resource: (Blanks) is every value, so no filter.
+        dispatch(
+            &mut a,
+            "proj.filter",
+            &obj(vec![("clear", Json::Bool(true))]),
+        )
+        .unwrap();
+        let v = filter(&mut a, "Resource Names", &["(Blanks)"]).unwrap();
+        assert_eq!(v.get_str("filter"), Some("All Tasks"));
+    }
+
+    #[test]
+    fn an_empty_values_array_is_refused_not_a_clear() {
+        let mut a = dated();
+        dispatch(
+            &mut a,
+            "proj.filter",
+            &obj(vec![
+                ("column", Json::Str("Name".into())),
+                ("values", Json::Arr(vec![Json::Str("Plan".into())])),
+            ]),
+        )
+        .unwrap();
+        let err = dispatch(
+            &mut a,
+            "proj.filter",
+            &obj(vec![
+                ("column", Json::Str("Name".into())),
+                ("values", Json::Arr(vec![])),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("non-empty array"), "{err}");
+        assert!(a.ed.is_filtered(), "the filter stands");
+    }
+
+    #[test]
+    fn selection_based_edits_act_only_on_a_drawn_row() {
+        let mut a = dated();
+        dispatch(
+            &mut a,
+            "proj.filter",
+            &obj(vec![
+                ("column", Json::Str("Name".into())),
+                ("values", Json::Arr(vec![Json::Str("Plan".into())])),
+            ]),
+        )
+        .unwrap();
+        // Add Task makes a row the filter hides: the selection stays drawn.
+        a.ed.select(0);
+        a.add_task();
+        assert!(a.ed.display_rows().contains(&a.ed.sel()));
+        assert_eq!(a.ed.project().tasks[a.ed.sel()].name, "Plan");
+        // Rename the only drawn task so nothing is drawn: no edit has a row.
+        a.ed.rename(1, "Gone").unwrap();
+        assert!(a.ed.display_rows().is_empty());
+        assert_eq!(a.ed.shown_selected_uid(), None);
+        let before = a.ed.project().tasks.len();
+        a.delete_task();
+        a.indent(1);
+        assert_eq!(a.ed.project().tasks.len(), before, "nothing was deleted");
     }
 }

@@ -44,8 +44,8 @@ use ribbon::{Act, Ribbon};
 
 use projcore::datetime::DateTime;
 use projcore::editor::{
-    AssignOutcome, DURATION_HINT, Editor, FindOutcome, NEW_PROJECT_NAME, constraint_hint,
-    duration_suffix, format_resource_names, parse_task_duration,
+    AssignOutcome, DURATION_HINT, ENTRY_FIELDS, Editor, Field, FindOutcome, NEW_PROJECT_NAME, Sort,
+    constraint_hint, duration_suffix, format_resource_names, parse_task_duration,
 };
 use projcore::formats::Registry;
 #[cfg(test)]
@@ -451,6 +451,11 @@ enum PromptKind {
     VimCommand,
     Constraint,
     Assign,
+    /// View › Data › Sort... (#1533): `<column> [desc]`, empty clears.
+    Sort,
+    /// View › Data › Filter... (#1533): `<column>: <value> | <value>`, a
+    /// column alone clears its filter, empty clears them all.
+    Filter,
     /// The task the prompt opened on: selecting another row while the
     /// prompt is open must not redirect the commit.
     Notes(i32),
@@ -836,7 +841,7 @@ impl App {
     }
 
     fn toggle_milestone(&mut self) {
-        if let Some(uid) = self.ed.selected_uid() {
+        if let Some(uid) = self.ed.shown_selected_uid() {
             if let Err(message) = self.ed.toggle_milestone(uid) {
                 self.status = message;
             }
@@ -845,7 +850,7 @@ impl App {
 
     /// Switch the selected task between Manually and Auto Scheduled.
     fn set_manual(&mut self, manual: bool) {
-        let Some(uid) = self.ed.selected_uid() else {
+        let Some(uid) = self.ed.shown_selected_uid() else {
             return;
         };
         self.status = match self.ed.set_manual(uid, manual) {
@@ -892,7 +897,7 @@ impl App {
     /// Set a date constraint on the selected task from text like
     /// `SNET 2026-03-05`, `MSO 2026-03-05`, or `none` / `asap`.
     fn set_constraint(&mut self, text: &str) {
-        if let Some(uid) = self.ed.selected_uid() {
+        if let Some(uid) = self.ed.shown_selected_uid() {
             self.status = match self.ed.set_constraint(uid, text) {
                 Ok(()) => format!(
                     "Constraint set: {}",
@@ -909,7 +914,7 @@ impl App {
     /// Assign a resource (by name, created on first use) to the selected task.
     /// An empty name clears the task's assignments.
     fn assign_resource(&mut self, name: &str) {
-        let Some(uid) = self.ed.selected_uid() else {
+        let Some(uid) = self.ed.shown_selected_uid() else {
             return;
         };
         let name = name.trim();
@@ -972,6 +977,10 @@ impl App {
                 }
             }
             "" => {}
+            "sort" => self.sort_text(""),
+            "filter" => self.filter_text(""),
+            other if other.starts_with("sort ") => self.sort_text(&other[5..]),
+            other if other.starts_with("filter ") => self.filter_text(&other[7..]),
             other => self.status = format!("Not a command: :{other}"),
         }
     }
@@ -1014,7 +1023,7 @@ impl App {
                 self.prompt = Some(Prompt::new(PromptKind::Constraint, "Constraint", cur));
             }
             Act::Notes => {
-                let Some(uid) = self.ed.selected_uid() else {
+                let Some(uid) = self.ed.shown_selected_uid() else {
                     return;
                 };
                 // The one-line form: a stored newline prefills as `\n`, so
@@ -1043,6 +1052,21 @@ impl App {
                     String::new(),
                 ));
             }
+            Act::Sort => {
+                let cur = self.ed.sort().map(sort_text_of).unwrap_or_default();
+                self.prompt = Some(Prompt::new(
+                    PromptKind::Sort,
+                    "Sort by column [desc] (empty clears)",
+                    cur,
+                ));
+            }
+            Act::Filter => {
+                self.prompt = Some(Prompt::new(
+                    PromptKind::Filter,
+                    "Filter column: value | value (column alone clears it, empty clears all)",
+                    String::new(),
+                ));
+            }
             Act::ShowSubtasks => self.show_subtasks(),
             Act::HideSubtasks => self.hide_subtasks(),
             Act::Help => self.status = HELP_COMING.into(),
@@ -1064,9 +1088,91 @@ impl App {
         }
     }
 
+    /// Sort the rows by `text`: `<column> [asc|desc]`, empty to clear (#1533).
+    fn sort_text(&mut self, text: &str) {
+        match self.apply_sort(text) {
+            Ok(status) => self.status = status,
+            Err(message) => self.status = message,
+        }
+    }
+
+    /// The sort `text` names, applied; the status line says it.
+    fn apply_sort(&mut self, text: &str) -> Result<String, String> {
+        let text = text.trim();
+        if text.is_empty() {
+            self.ed.set_sort(None);
+            return Ok("Sort cleared".into());
+        }
+        let (column, descending) = match text.rsplit_once(char::is_whitespace) {
+            Some((rest, word))
+                if matches!(word.to_ascii_lowercase().as_str(), "desc" | "descending") =>
+            {
+                (rest, true)
+            }
+            Some((rest, word))
+                if matches!(word.to_ascii_lowercase().as_str(), "asc" | "ascending") =>
+            {
+                (rest, false)
+            }
+            _ => (text, false),
+        };
+        let sort = Sort {
+            field: entry_field(column)?,
+            descending,
+        };
+        self.ed.set_sort(Some(sort));
+        Ok(format!("Sorted by {}", sort_text_of(sort)))
+    }
+
+    /// Filter the rows by `text`: `<column>: <value> | <value>`; a column
+    /// alone clears its filter, empty clears them all (#1533).
+    fn filter_text(&mut self, text: &str) {
+        match self.apply_filter(text) {
+            Ok(status) => self.status = status,
+            Err(message) => self.status = message,
+        }
+    }
+
+    fn apply_filter(&mut self, text: &str) -> Result<String, String> {
+        let text = text.trim();
+        if text.is_empty() {
+            self.ed.clear_filters();
+            return Ok("Filter cleared".into());
+        }
+        let (column, values) = match text.split_once(':') {
+            Some((column, values)) => (column, Some(values)),
+            None => (text, None),
+        };
+        let field = entry_field(column)?;
+        let specs: Vec<String> = values
+            .into_iter()
+            .flat_map(|v| v.split('|'))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .collect();
+        self.filter_values(field, &specs)
+    }
+
+    /// Filter `field` to `specs` (see `Editor::filter_texts`); none clears
+    /// the column's filter, and every value is no filter at all.
+    fn filter_values(&mut self, field: Field, specs: &[String]) -> Result<String, String> {
+        if specs.is_empty() {
+            self.ed.set_filter(field, None);
+            return Ok(format!("Filter cleared from {}", field.name()));
+        }
+        let allowed = self.ed.filter_texts(field, specs)?;
+        // Every value allowed is no filter at all.
+        if allowed.len() == self.ed.column_values(field).len() {
+            self.ed.set_filter(field, None);
+            return Ok(format!("Filter cleared from {}", field.name()));
+        }
+        self.ed.set_filter(field, Some(allowed));
+        Ok("AutoFilter Applied".into())
+    }
+
     /// View › Data › Show Subtasks (`+`): expand the selected summary.
     fn show_subtasks(&mut self) {
-        if let Some(uid) = self.ed.selected_uid() {
+        if let Some(uid) = self.ed.shown_selected_uid() {
             if let Err(message) = self.ed.set_collapsed(uid, false) {
                 self.status = message;
             }
@@ -1076,7 +1182,7 @@ impl App {
     /// View › Data › Hide Subtasks (`-`): collapse the selected summary, or
     /// the summary of the selected subtask, as Project does.
     fn hide_subtasks(&mut self) {
-        if let Some(uid) = self.ed.selected_uid() {
+        if let Some(uid) = self.ed.shown_selected_uid() {
             if let Err(message) = self.ed.hide_subtasks(uid) {
                 self.status = message;
             }
@@ -1128,9 +1234,11 @@ impl App {
         let estimated = self.ed.project().new_tasks_estimated();
         match self
             .ed
-            .add_task(self.ed.selected_uid(), "New task", 480, estimated)
+            .add_task(self.ed.shown_selected_uid(), "New task", 480, estimated)
         {
-            Ok(at) => self.ed.select(at),
+            Ok(at) => {
+                self.ed.select_shown(at);
+            }
             Err(message) => self.status = message,
         }
     }
@@ -1138,8 +1246,10 @@ impl App {
     /// Insert a blank row above the selected row (Project's Insert Task ›
     /// Blank Row) and select it, so typing into it makes a task there.
     fn insert_blank_row(&mut self) {
-        match self.ed.insert_blank_row(self.ed.selected_uid()) {
-            Ok(at) => self.ed.select(at),
+        match self.ed.insert_blank_row(self.ed.shown_selected_uid()) {
+            Ok(at) => {
+                self.ed.select_shown(at);
+            }
             Err(message) => self.status = message,
         }
     }
@@ -1147,7 +1257,7 @@ impl App {
     /// Delete the selected task; a summary asks first, because its subtasks
     /// go with it.
     fn delete_task(&mut self) {
-        let Some(uid) = self.ed.selected_uid() else {
+        let Some(uid) = self.ed.shown_selected_uid() else {
             return;
         };
         match self.ed.subtree_len(uid) {
@@ -1198,7 +1308,7 @@ impl App {
     }
 
     fn indent(&mut self, delta: i32) {
-        if let Some(uid) = self.ed.selected_uid() {
+        if let Some(uid) = self.ed.shown_selected_uid() {
             if let Err(message) = self.ed.indent(uid, delta) {
                 self.status = message;
             }
@@ -1207,7 +1317,7 @@ impl App {
 
     fn set_duration(&mut self, text: &str) {
         // Keep invalid-input feedback even when there is no selected row.
-        if let Some(uid) = self.ed.selected_uid() {
+        if let Some(uid) = self.ed.shown_selected_uid() {
             if let Err(message) = self.ed.set_duration(uid, text) {
                 self.status = message;
             }
@@ -1284,7 +1394,7 @@ impl App {
     }
 
     fn rename(&mut self, text: &str) {
-        if let Some(uid) = self.ed.selected_uid() {
+        if let Some(uid) = self.ed.shown_selected_uid() {
             if let Err(message) = self.ed.rename(uid, text) {
                 self.status = message;
             }
@@ -1296,7 +1406,7 @@ impl App {
             self.status = "Predecessor must be a task ID (number)".into();
             return;
         };
-        let Some(uid) = self.ed.selected_uid() else {
+        let Some(uid) = self.ed.shown_selected_uid() else {
             self.status = "No task selected".into();
             return;
         };
@@ -1837,7 +1947,7 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
             // or hide its subtasks.
             if x < app.list_left_w && y >= app.list_y0 {
                 let shown = app.top + (y - app.list_y0) as usize;
-                if let Some(&idx) = app.ed.visible_rows().get(shown) {
+                if let Some(&idx) = app.ed.display_rows().get(shown) {
                     let t = &app.ed.project().tasks[idx];
                     if t.summary && x == bullet_x(app.list_x0, t) {
                         if let Err(message) = app.ed.toggle_collapsed(t.uid) {
@@ -1868,6 +1978,8 @@ fn on_key(app: &mut App, k: KeyEvent) {
                     PromptKind::VimCommand => app.vim_run(&text),
                     PromptKind::Constraint => app.set_constraint(&text),
                     PromptKind::Assign => app.assign_resource(&text),
+                    PromptKind::Sort => app.sort_text(&text),
+                    PromptKind::Filter => app.filter_text(&text),
                     PromptKind::Notes(uid) => app.set_notes(uid, &text),
                     PromptKind::SaveAs => {
                         if !text.trim().is_empty() {
@@ -2325,7 +2437,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
     // visible task rows (inner height minus borders and the column-header row)
     let inner_h = left.height.saturating_sub(3) as usize; // 2 border + 1 header
     // Rows collapsed summaries hide are skipped; `top` counts shown rows.
-    let rows = app.ed.visible_rows();
+    let rows = app.ed.display_rows();
     let sel = rows.iter().position(|&i| i == app.ed.sel()).unwrap_or(0);
     app.top = app.top.min(rows.len().saturating_sub(1));
     if sel < app.top {
@@ -2438,7 +2550,11 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
         left_lines.push(line);
     }
     f.render_widget(
-        Paragraph::new(left_lines).block(Block::default().borders(Borders::ALL).title(" Tasks ")),
+        Paragraph::new(left_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Tasks{} ", view_note(&app.ed))),
+        ),
         left,
     );
 
@@ -2758,6 +2874,49 @@ impl App {
 }
 
 // ---- small helpers ----------------------------------------------------------
+
+/// The entry column named `name` (its heading, in any case; `Task` is the
+/// table's Name and `Dur` its Duration).
+fn entry_field(name: &str) -> Result<Field, String> {
+    let name = name.trim();
+    let alias = match name.to_ascii_lowercase().as_str() {
+        "task" => "Name",
+        "dur" => "Duration",
+        _ => name,
+    };
+    ENTRY_FIELDS
+        .into_iter()
+        .find(|f| f.name().eq_ignore_ascii_case(alias))
+        .ok_or_else(|| {
+            let names: Vec<_> = ENTRY_FIELDS.iter().map(|f| f.name()).collect();
+            format!("No column '{name}' ({})", names.join(", "))
+        })
+}
+
+/// A sort as the Sort prompt takes it: `Finish desc`.
+fn sort_text_of(sort: Sort) -> String {
+    format!(
+        "{}{}",
+        sort.field.name(),
+        if sort.descending { " desc" } else { "" }
+    )
+}
+
+/// What the Tasks box's title says of the sort and filter in force.
+fn view_note(ed: &Editor) -> String {
+    let mut note = String::new();
+    if let Some(sort) = ed.sort() {
+        note.push_str(&format!(
+            " · {} {}",
+            if sort.descending { "↓" } else { "↑" },
+            sort.field.name()
+        ));
+    }
+    if ed.is_filtered() {
+        note.push_str(" · ⧩ AutoFilter Applied");
+    }
+    note
+}
 
 /// Names of the resources assigned to task `uid`, in assignment order.
 fn task_resources(proj: &Project, uid: i32) -> Vec<String> {
@@ -4007,7 +4166,7 @@ mod tests {
         assert!(app.hscroll > 0);
         assert_eq!(app.ed.sel(), 0, "the selection stays");
         on_key(&mut app, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
-        assert_eq!(app.ed.sel(), app.ed.visible_rows().len() - 1);
+        assert_eq!(app.ed.sel(), app.ed.display_rows().len() - 1);
         assert_eq!(
             app.hscroll,
             finish - origin - 40 + 1,
@@ -5072,7 +5231,7 @@ mod tests {
         };
         let mut app = App::new(proj, Some("plan.yppx".into()), false);
         assert_eq!(app.ed.project().tasks.len(), 3, "kept in the model");
-        assert_eq!(app.ed.visible_rows(), [1, 2]);
+        assert_eq!(app.ed.display_rows(), [1, 2]);
         let names: Vec<_> = shown_rows(&mut app).into_iter().map(|(n, _)| n).collect();
         assert_eq!(names, ["• A", "• B"]);
     }

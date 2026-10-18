@@ -20,6 +20,8 @@
 //! - [`formatting`] — the plan's formatting (bar palette, text styles per
 //!   category and cell, gridlines, link style), saved in the `.yppx`
 //!   `formatting.xml` part.
+//! - [`tableview`] — the Project table's saved view state (column widths), in
+//!   the `.yppx` `tableview.xml` part.
 //! - [`json`] — the small JSON value the plugin ABI's payloads use.
 //! - [`plugin_abi`] — the C ABI a format plugin implements (MSPDI XML text
 //!   across the boundary), with the optional version-target and UI symbols.
@@ -43,6 +45,7 @@ pub mod mspdi;
 pub mod plugin_abi;
 pub mod report;
 pub mod schedule;
+pub mod tableview;
 pub mod text;
 pub mod uiplugin;
 pub mod yppx;

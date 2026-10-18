@@ -969,7 +969,7 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
     let scale = v.chart_scale();
     let ed = &v.ed;
     let tasks = &ed.project().tasks;
-    let shown = ed.visible_rows();
+    let shown = ed.display_rows();
     let sched = ed.schedule();
     let reader = projcore::editor::FieldReader::new(ed);
     // An instant's x in chart pixels, within its day.
@@ -1097,7 +1097,7 @@ pub(crate) fn overlay_shapes(v: &ProjectView) -> Rc<Vec<Shape>> {
         origin_day: scale.origin_day,
         days: scale.days,
         flags: flags_of(v),
-        shown: v.ed.visible_rows(),
+        shown: v.ed.display_rows(),
         selected: selection_of(v).uids,
     };
     let mut cache = v.plugin_cache.borrow_mut();

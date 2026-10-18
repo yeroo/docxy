@@ -245,7 +245,7 @@ pub(crate) const OPERATORS: [(&str, &str, &str); 12] = [
     ("does not contain", "notEqual", "*{}*"),
 ];
 
-fn control<'a>(d: &'a Dialog, name: &str) -> Option<&'a Control> {
+pub(crate) fn control<'a>(d: &'a Dialog, name: &str) -> Option<&'a Control> {
     d.controls.iter().find(|c| c.name == name)
 }
 
@@ -272,7 +272,7 @@ fn checked(d: &Dialog, name: &str) -> bool {
     control(d, name).is_some_and(|c| c.value == Value::Bool(true))
 }
 
-fn dialog(
+pub(crate) fn dialog(
     id: DialogId,
     title: String,
     buttons: &[(&str, ButtonRole)],

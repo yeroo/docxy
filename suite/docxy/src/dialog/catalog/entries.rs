@@ -1651,6 +1651,19 @@ dialogs! {
         accept_closes: true,
         unreachable: None,
     }
+    PROJECT_FILTER_MENU = "project-filter-menu" {
+        surface: Surface::Project,
+        file: "project",
+        fixture: PROJECT_DOC,
+        open: &[
+            "click C1",
+            r#"call pointer-click {"region":"project-heading-arrow:Name"}"#,
+        ],
+        fields: &[Field::other("values", ControlKind::CheckList)],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
     DELETE_SUMMARY = "delete-summary" {
         surface: Surface::Project,
         file: "project",

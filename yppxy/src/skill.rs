@@ -103,7 +103,10 @@ Verbs: `proj.path`, `task.list`, `task.get`, `task.fields`, `task.set`, `task.ad
 `assign.fields`, `assign.add`, `assign.set`, `assign.del`, `resource.list`,
 `resource.get`, `resource.add`, `resource.set`, `resource.del`, `level.all`,
 `level.clear`, `level.overallocations`, `proj.save`, `proj.reload`,
-`proj.open`.
+`proj.open`, and the grid's view: `proj.view`,
+`proj.sort {column?, descending?}`, `proj.filter {column, values? | clear}` (`values` are
+cell texts, `(Blanks)` for an empty cell, or on a date column `YYYY`, `YYYY-MM`,
+`YYYY-MM-DD`).
 
 Leveling is a display overlay: `level.all {}` shows the plan leveled (tasks
 delayed to fit resource capacity, as Resource > Level > Level All),

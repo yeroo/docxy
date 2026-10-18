@@ -1,0 +1,97 @@
+# #1533: every Project entry-table heading has an AutoFilter arrow
+# (`project-heading-arrow:<Name>`, or `menu-open {"target":{"filter":<Name>}}`).
+# Like the sheet's filter button it opens a dialog (`project-filter-menu`):
+# Sort items, a disabled Group by and Filters, `Clear Filter from <Field>`
+# (enabled only while that column is filtered), and the value checklist, a
+# Year > Month > Day tree on a date column. A filtered heading draws a funnel,
+# the status bar says `AutoFilter Applied`, and `rows` reports the live
+# filter and sort. project-filter.xml finishes Plan on 1/12, Build on 3/2,
+# Test on 3/17 and Ship on 4/6.
+
+test project the arrow opens the menu and Finish sorts latest first
+  open copy:../fixtures/project-filter.xml
+  # The default table pane cuts Finish off, so the arrow press is on Name's.
+  shot window
+  call pointer-click {"region":"project-heading-arrow:Name"}
+  assert dialog is project-filter-menu
+  call dialog-read {}
+  assert reply.title is Filter: Name
+  assert reply.buttons.0.label is Sort A to Z
+  assert reply.buttons.1.label is Sort Z to A
+  assert reply.buttons.4.label is Clear Filter from Name
+  assert reply.buttons.4.enabled is false
+  call dialog-click {"button":"Cancel"}
+  assert dialog is none
+  # Finish is opened as its arrow would open it (menu-open works scrolled out).
+  call menu-open {"target":{"filter":"Finish"}}
+  assert reply.title is Filter: Finish
+  assert reply.buttons.0.label is Sort Earliest to Latest
+  assert reply.buttons.1.label is Sort Latest to Earliest
+  assert reply.buttons.2.label is Group by
+  assert reply.buttons.2.enabled is false
+  assert reply.buttons.3.label is Filters
+  assert reply.buttons.3.enabled is false
+  assert reply.buttons.4.label is Clear Filter from Finish
+  assert reply.buttons.4.enabled is false
+  assert reply.controls.0.items.0 is (Select All)
+  assert reply.controls.0.items.1 is 2026
+  assert reply.controls.0.items.2 is January
+  call dialog-click {"button":"Sort Latest to Earliest"}
+  assert dialog is none
+  call rows {}
+  assert reply.sort is Finish
+  assert reply.sort_descending is true
+  assert reply.rows.0.cells.2 is Ship
+  assert reply.rows.3.cells.2 is Plan
+
+test project filtering Finish to one month leaves its rows and Clear Filter restores them
+  open copy:../fixtures/project-filter.xml
+  shot window
+  call menu-open {"target":{"filter":"Finish"}}
+  assert dialog is project-filter-menu
+  call dialog-set {"control":"values","value":false}
+  call dialog-set {"control":"values","item":"March","checked":true}
+  call dialog-click {"button":"OK"}
+  assert dialog is none
+  assert status is Filtered by Finish
+  call rows {}
+  assert reply.filter is AutoFilter
+  assert reply.count is 2
+  assert reply.rows.0.cells.2 is Build
+  assert reply.rows.1.cells.2 is Test
+  assert reply.filters.0.column is Finish
+  # Clear Filter is enabled on the filtered column only.
+  call menu-open {"target":{"filter":"Finish"}}
+  assert reply.buttons.4.enabled is true
+  call dialog-click {"button":"Clear Filter from Finish"}
+  assert dialog is none
+  call rows {}
+  assert reply.filter is All Tasks
+  assert reply.count is 4
+
+test project filters on two columns and together
+  open copy:../fixtures/project-filter.xml
+  shot window
+  call menu-open {"target":{"filter":"Finish"}}
+  call dialog-set {"control":"values","value":false}
+  call dialog-set {"control":"values","item":"March","checked":true}
+  call dialog-click {"button":"OK"}
+  call menu-open {"target":{"filter":"Name"}}
+  call dialog-set {"control":"values","value":["Test"]}
+  call dialog-click {"button":"OK"}
+  call rows {}
+  assert reply.count is 1
+  assert reply.rows.0.cells.2 is Test
+  assert reply.filters.1.column is Name
+
+test project an arrow press does not select the column or resize it
+  open copy:../fixtures/project-filter.xml
+  shot window
+  call pointer-click {"region":"project-heading-arrow:Duration"}
+  assert dialog is project-filter-menu
+  call dialog-click {"button":"Cancel"}
+  assert dialog is none
+  assert selection is none
+  call rows {}
+  assert reply.widths.Duration is 80
+  call-error menu-open {"target":{"filter":"Nope"}} => no Project column 'Nope'

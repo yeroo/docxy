@@ -17,7 +17,7 @@ pub(crate) enum ShownRow {
 /// The zero-based drawn row `row`: a task, the entry row just below the last
 /// one, or `None` past it.
 pub(crate) fn shown_task(ed: &ProjectEditor, row: usize) -> Option<ShownRow> {
-    let rows = ed.visible_rows();
+    let rows = ed.display_rows();
     match rows.get(row) {
         Some(&i) => Some(ShownRow::Task(i)),
         None if row == rows.len() => Some(ShownRow::Entry),
@@ -26,15 +26,15 @@ pub(crate) fn shown_task(ed: &ProjectEditor, row: usize) -> Option<ShownRow> {
 }
 
 /// The zero-based drawn row of task `index`; `None` while a collapsed summary
-/// hides it.
+/// or the AutoFilter hides it.
 pub(crate) fn shown_row_of(ed: &ProjectEditor, index: usize) -> Option<usize> {
-    ed.visible_rows().iter().position(|&i| i == index)
+    ed.display_rows().iter().position(|&i| i == index)
 }
 
 /// A Project cell a harness verb addresses, by A1 drawn row or by `{uid, column}`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CellTarget {
-    /// The zero-based drawn row; `None` for a task a collapsed summary hides.
+    /// The zero-based drawn row; `None` for a task a collapsed summary or the AutoFilter hides.
     pub row: Option<usize>,
     /// What that row holds; `None` past the entry row.
     pub at: Option<ShownRow>,
@@ -100,26 +100,43 @@ fn column_arg(args: &Json) -> Result<usize, String> {
 }
 
 /// The `rows` reply: the drawn task rows, top to bottom, without the entry row.
-/// View, table, filter, group and sort are Project's names for the only ones
-/// the tab has today.
+/// View, table and group are Project's names for the only ones the tab has
+/// today. `filter` is `All Tasks`, or `AutoFilter` while a column is filtered
+/// (`filters` lists each column and the texts it keeps); `sort` is `ID`, or the
+/// sorted column (`sort_descending` says which way); `widths` are the
+/// columns' px, the plan's own over the defaults.
 pub(crate) fn rows_json(ed: &ProjectEditor) -> Json {
     let tasks = &ed.project().tasks;
     let rows: Vec<Json> = ed
-        .visible_rows()
+        .display_rows()
         .into_iter()
         .enumerate()
         .map(|(row, i)| row_json(ed, &tasks[i], row + 1))
         .collect();
-    Json::obj(vec![
+    let mut fields = vec![
         ("view", Json::Str("Gantt Chart".into())),
         ("table", Json::Str("Entry".into())),
-        ("filter", Json::Str("All Tasks".into())),
         ("group", Json::Str("No Group".into())),
-        ("sort", Json::Str("ID".into())),
+    ];
+    fields.extend(projctl::view_fields(ed));
+    fields.extend([
+        ("widths", widths_json(&committed_widths(ed))),
         ("count", Json::Num(rows.len() as f64)),
         ("total", Json::Num(tasks.len() as f64)),
         ("rows", Json::Arr(rows)),
-    ])
+    ]);
+    Json::obj(fields)
+}
+
+/// `{column: px}` for every entry column.
+pub(crate) fn widths_json(widths: &[f32; COLUMN_COUNT]) -> Json {
+    Json::obj(
+        COLUMNS
+            .iter()
+            .zip(widths)
+            .map(|(name, &w)| (*name, Json::Num(f64::from(w))))
+            .collect(),
+    )
 }
 
 fn row_json(ed: &ProjectEditor, task: &Task, row: usize) -> Json {

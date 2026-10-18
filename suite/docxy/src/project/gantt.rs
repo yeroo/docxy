@@ -237,23 +237,45 @@ pub(crate) fn styled_bar(bar: GanttBar, show_critical: bool, show_baseline: bool
     }
 }
 
+#[cfg(test)]
 pub(crate) fn table_pane_width(width: f32) -> f32 {
-    (width * 0.5).clamp(320., TABLE_W).min(width.max(0.))
+    table_pane_width_for(width, TABLE_W)
 }
 
-/// The split bar never hides the ID column, and leaves the chart some days.
-pub(crate) const MIN_TABLE_W: f32 = WIDTHS[0];
+/// [`table_pane_width`] for columns `total` px wide in all: the pane follows
+/// them, so narrowing columns brings the right-hand ones into view.
+pub(crate) fn table_pane_width_for(width: f32, total: f32) -> f32 {
+    (width * 0.5).max(320.).min(total).min(width.max(0.))
+}
+
+/// The split bar never narrows the table below the ID column's default width
+/// (the live width, `ProjectView::widths()[0]`, in production), and leaves the
+/// chart some days.
+#[cfg(test)]
+pub(crate) const MIN_TABLE_W: f32 = DEFAULT_WIDTHS[0];
 pub(crate) const MIN_CHART_W: f32 = 48.;
 
 /// The table pane's width for a user split, or the default without one. When the
 /// window is too narrow for both minimums the chart's yields first.
+#[cfg(test)]
 pub(crate) fn split_table_width(width: f32, split: Option<f32>) -> f32 {
+    split_table_width_for(width, split, TABLE_W, MIN_TABLE_W)
+}
+
+/// [`split_table_width`] for columns `total` px wide in all, whose ID column
+/// is `min_table` wide: the split bar never hides it.
+pub(crate) fn split_table_width_for(
+    width: f32,
+    split: Option<f32>,
+    total: f32,
+    min_table: f32,
+) -> f32 {
     let Some(w) = split else {
-        return table_pane_width(width);
+        return table_pane_width_for(width, total);
     };
-    w.min(TABLE_W)
+    w.min(total)
         .min(width - GANTT_INSET - SCROLLBAR_W - MIN_CHART_W)
-        .max(MIN_TABLE_W)
+        .max(min_table)
         .min(width.max(0.))
 }
 
@@ -363,6 +385,7 @@ pub(crate) fn body_grid(view: &ProjectView, pal: Pal) -> impl IntoElement {
         view.gantt_x.get(),
         view.chart_scale(),
     );
+    let widths = view.widths();
     let rule = Hsla {
         a: pal.border.a * 0.6,
         ..pal.border
@@ -402,7 +425,7 @@ pub(crate) fn body_grid(view: &ProjectView, pal: Pal) -> impl IntoElement {
             };
             window.with_content_mask(Some(ContentMask { bounds: table }), |window| {
                 let mut edge = 0.;
-                for w in WIDTHS {
+                for w in widths {
                     edge += w;
                     vline(window, bounds.origin.x + px(edge - table_x - 1.), rule);
                 }

@@ -873,6 +873,12 @@ pub enum Region {
     /// Visible part of a Project entry-table column heading, by column index
     /// (named by its heading, e.g. `project-heading:Duration`; #1208).
     ProjectHeading(usize),
+    /// The AutoFilter arrow on a Project column heading (#1533), by column
+    /// (`project-heading-arrow:Finish`).
+    ProjectHeadingArrow(usize),
+    /// The resize grab zone on a heading's right edge (#1533), by column
+    /// (`project-heading-edge:Finish`).
+    ProjectHeadingEdge(usize),
     /// The Project table's horizontal scrollbar strip.
     ProjectHbarTable,
     /// The Project chart's horizontal scrollbar strip.
@@ -1050,6 +1056,18 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
                 .ok_or("'project-heading' needs a column, e.g. project-heading:Duration")?;
             project_column(a).map(Region::ProjectHeading)
         }
+        "project-heading-arrow" => {
+            let a = arg.filter(|a| !a.is_empty()).ok_or(
+                "'project-heading-arrow' needs a column, e.g. project-heading-arrow:Finish",
+            )?;
+            project_column(a).map(Region::ProjectHeadingArrow)
+        }
+        "project-heading-edge" => {
+            let a = arg
+                .filter(|a| !a.is_empty())
+                .ok_or("'project-heading-edge' needs a column, e.g. project-heading-edge:Finish")?;
+            project_column(a).map(Region::ProjectHeadingEdge)
+        }
         "filter-button" => {
             let a = arg
                 .filter(|a| !a.is_empty())
@@ -1070,7 +1088,7 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
             Ok(Region::Chart(i))
         }
         other => Err(format!(
-            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-heading:Duration, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, ribbon-launch:Number, filter-button:B)"
+            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-heading:Duration, project-heading-arrow:Duration, project-heading-edge:Duration, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, ribbon-launch:Number, filter-button:B)"
         )),
     }
 }
@@ -1102,6 +1120,14 @@ pub fn region_name(region: Region) -> String {
         Region::Bar(id) => format!("bar:{id}"),
         Region::ProjectHeading(c) => format!(
             "project-heading:{}",
+            crate::COLUMNS.get(c).copied().unwrap_or_default()
+        ),
+        Region::ProjectHeadingArrow(c) => format!(
+            "project-heading-arrow:{}",
+            crate::COLUMNS.get(c).copied().unwrap_or_default()
+        ),
+        Region::ProjectHeadingEdge(c) => format!(
+            "project-heading-edge:{}",
             crate::COLUMNS.get(c).copied().unwrap_or_default()
         ),
         Region::ProjectHbarTable => "project-hbar-table".into(),
@@ -3168,9 +3194,9 @@ fn menu_open(
                     .iter()
                     .position(|t| i64::from(t.uid) == uid)
                     .ok_or_else(|| format!("no task with uid {uid}"))?;
-                if !v.ed.visible_rows().contains(&row) {
+                if !v.ed.display_rows().contains(&row) {
                     return Err(format!(
-                        "task {uid} is hidden under a collapsed summary; there is no row to right-click"
+                        "task {uid} is hidden under a collapsed summary or by the AutoFilter; there is no row to right-click"
                     ));
                 }
                 let probe = format!("project-cell:{}:{}", tasks[row].id, v.col);
@@ -3191,9 +3217,9 @@ fn menu_open(
                     .iter()
                     .position(|t| i64::from(t.uid) == uid)
                     .ok_or_else(|| format!("no task with uid {uid}"))?;
-                if !v.ed.visible_rows().contains(&row) {
+                if !v.ed.display_rows().contains(&row) {
                     return Err(format!(
-                        "task {uid} is hidden under a collapsed summary; there is no bar to right-click"
+                        "task {uid} is hidden under a collapsed summary or by the AutoFilter; there is no bar to right-click"
                     ));
                 }
                 let task = &tasks[row];
@@ -3227,6 +3253,24 @@ fn menu_open(
                     .region_bounds_live(Region::ProjectHeading(col), window)?
                     .center();
                 app.open_column_menu(col, at, window, cx)
+            }
+            // That heading's AutoFilter drop-down (#1533), as its arrow opens
+            // it, whether or not the heading is scrolled into view: it opens
+            // as a dialog (read it with `dialog-read`), as the sheet's filter
+            // button's does.
+            "filter" => {
+                let name = fields[0]
+                    .1
+                    .as_str()
+                    .ok_or("'filter' must be a column name")?;
+                let col = project_column(name)?;
+                if !matches!(
+                    app.tabs.get(app.active).map(|t| &t.surface),
+                    Some(crate::Surface::Project(_))
+                ) {
+                    return Err("a filter menu needs a Project tab".into());
+                }
+                app.open_project_filter(col, window, cx)
             }
             "ribbon" => {
                 let path: Vec<&str> = fields[0]
@@ -3277,7 +3321,7 @@ fn menu_open(
                 }
             }
             other => Err(format!(
-                "no menu target '{other}' (document, cell, pick-list, flash-fill, ribbon-bar, row, bar, column, ribbon, grid and qat)"
+                "no menu target '{other}' (document, cell, pick-list, flash-fill, ribbon-bar, row, bar, column, filter, ribbon, grid and qat)"
             )),
         },
         _ => Err(r#"'target' must be "document" or one key such as {"row": uid}"#.into()),
@@ -4851,6 +4895,10 @@ fn dispatch_verb(
             refuse_under_cover(app)?;
             let target = args.get("target").ok_or("menu-open needs a 'target'")?;
             menu_open(app, target, window, cx)?;
+            // The Project AutoFilter drop-down is a dialog: reply with it.
+            if target.get("filter").is_some() {
+                return Done::ok(app.active_dialogs_mut().to_json());
+            }
             Done::ok(crate::menu::read_json(app.menu.as_ref()))
         }
         "menu-read" => Done::ok(crate::menu::read_json(app.menu.as_ref())),
@@ -5213,7 +5261,7 @@ fn dispatch_verb(
                 }
                 if target.row.is_none() {
                     return Err(
-                        "that task is hidden under a collapsed summary; expand it to click it"
+                        "that task is hidden under a collapsed summary or by the AutoFilter; expand or clear the filter to click it"
                             .into(),
                     );
                 }
@@ -5387,7 +5435,12 @@ fn dispatch_verb(
                     Json::Num(item_at_point(&app.probes.borrow(), p) as f64),
                 ),
             ]))?;
-            done.input = click_events_with(p, button);
+            // `"double": true` is a double-click (a heading edge's Best Fit).
+            done.input = if arg_flag(args, "double")? && button == MouseButton::Left {
+                double_click_events(p)
+            } else {
+                click_events_with(p, button)
+            };
             Ok(done)
         }
         // Select the cell whose fill-handle point lies inside a probe's drawn
@@ -6323,7 +6376,7 @@ fn dispatch_verb(
                 let text = task
                     .map(|t| crate::project_row(&v.ed, t)[c].clone())
                     .unwrap_or_default();
-                // A task a collapsed summary hides has no drawn row to name.
+                // A task a collapsed summary or the AutoFilter hides has no drawn row to name.
                 let row = target.row;
                 let mut out = vec![
                     (
@@ -9390,6 +9443,8 @@ mod tests {
             Region::ProjectHeading(0),
             Region::ProjectHeading(3),
             Region::ProjectHeading(7),
+            Region::ProjectHeadingArrow(5),
+            Region::ProjectHeadingEdge(2),
             Region::ProjectHbarTable,
             Region::ProjectHbarChart,
             Region::ProjectVbar,
