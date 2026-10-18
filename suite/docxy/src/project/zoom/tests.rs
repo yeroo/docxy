@@ -421,7 +421,7 @@ fn the_timescale_dialog_picks_a_level_and_shows_its_tiers() {
     let text = |d: &crate::dialog::Dialog, name: &str| crate::page_setup::text_of(d, name);
     assert_eq!(
         (text(&d, "major").as_str(), text(&d, "minor").as_str()),
-        ("Weeks", "Days")
+        ("Major tier units: Weeks", "Minor tier units: Days")
     );
     assert_eq!(crate::page_setup::chosen(&d, "level"), Some(6));
     // Choosing a level moves the read-only tier rows with it.
@@ -430,17 +430,17 @@ fn the_timescale_dialog_picks_a_level_and_shows_its_tiers() {
     (d.react.unwrap().0)(&mut d, i, &Value::Choice(Some(6)));
     assert_eq!(
         (text(&d, "major").as_str(), text(&d, "minor").as_str()),
-        ("Quarters", "Months")
+        ("Major tier units: Quarters", "Minor tier units: Months")
     );
-    assert_eq!(text(&d, "minor-label"), "Mar 2026");
+    assert_eq!(text(&d, "minor-label"), "Minor tier label: Mar 2026");
     zoom_dialogs::apply_timescale(&mut v, &d).unwrap();
     assert_eq!(v.day_w(), 3.);
+    // The tier rows are labels, which the catalogue does not list as fields.
     for name in ["major", "major-label", "minor", "minor-label", "count"] {
-        assert!(
-            !d.controls.iter().find(|c| c.name == name).unwrap().enabled,
-            "{name}"
-        );
+        let kind = d.controls.iter().find(|c| c.name == name).unwrap().kind;
+        assert!(!kind.is_editable(), "{name}");
     }
+    assert_eq!(text(&d, "count"), "Count: 1");
 }
 
 fn timescale_dialog_for(v: &ProjectView) -> crate::dialog::Dialog {

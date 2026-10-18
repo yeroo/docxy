@@ -124,11 +124,6 @@ pub(crate) fn timescale_dialog(v: &ProjectView) -> Dialog {
     let names: Vec<&str> = zoom::LEVELS.iter().map(|l| l.name).collect();
     let today = example_day();
     let [major, major_label, minor, minor_label] = shown(&zoom::LEVELS[level], today);
-    let read_only = |name: &'static str, label: &str, text: String| {
-        let mut c = Control::new(name, label, ControlKind::Text, Value::Text(text));
-        c.enabled = false;
-        c
-    };
     d.controls = vec![
         choice(
             "level",
@@ -138,16 +133,35 @@ pub(crate) fn timescale_dialog(v: &ProjectView) -> Dialog {
             Some(level),
             None,
         ),
-        read_only("major", "Major tier units:", major),
-        read_only("major-label", "Major tier label:", major_label),
-        read_only("minor", "Minor tier units:", minor),
-        read_only("minor-label", "Minor tier label:", minor_label),
-        read_only("count", "Count:", "1".into()),
+        info("major", 0, major),
+        info("major-label", 1, major_label),
+        info("minor", 2, minor),
+        info("minor-label", 3, minor_label),
+        info("count", 4, "1".into()),
     ];
     d.buttons = ok_cancel();
     d.react = Some(Reaction(react_timescale));
     d.mark_opened();
     d
+}
+
+/// The read-only rows under the level: what its tiers show. They are labels
+/// (the text drawn is the whole row), so the catalogue lists no field for them.
+const ROWS: [&str; 5] = [
+    "Major tier units: ",
+    "Major tier label: ",
+    "Minor tier units: ",
+    "Minor tier label: ",
+    "Count: ",
+];
+
+fn info(name: &'static str, row: usize, text: String) -> Control {
+    Control::new(
+        name,
+        "",
+        ControlKind::Label,
+        Value::Text(format!("{}{text}", ROWS[row])),
+    )
 }
 
 fn react_timescale(d: &mut Dialog, i: usize, _before: &Value) {
@@ -158,12 +172,13 @@ fn react_timescale(d: &mut Dialog, i: usize, _before: &Value) {
         return;
     };
     let rows = shown(level, example_day());
-    for (name, text) in ["major", "major-label", "minor", "minor-label"]
+    for (row, (name, text)) in ["major", "major-label", "minor", "minor-label"]
         .into_iter()
         .zip(rows)
+        .enumerate()
     {
         if let Some(c) = d.controls.iter_mut().find(|c| c.name == name) {
-            c.value = Value::Text(text);
+            c.value = Value::Text(format!("{}{text}", ROWS[row]));
         }
     }
 }
