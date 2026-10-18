@@ -11,11 +11,8 @@ use projcore::model::ResourceType;
 const COLUMNS: [&str; 4] = ["Resource Name", "Assignment Owner", "Units", "Cost"];
 
 const NAME: usize = 0;
+const OWNER: usize = 1;
 const UNITS: usize = 2;
-
-fn blank(row: &[String]) -> bool {
-    row.iter().all(|c| c.trim().is_empty())
-}
 
 /// A resource's kind as a letter, kept beside the names it belongs to.
 fn kind_letter(kind: ResourceType) -> &'static str {
@@ -66,15 +63,13 @@ pub(super) fn grid(ed: &ProjectEditor, task: &Task) -> Control {
     ];
     // The plan's resources, and (in the owner column, which offers nothing)
     // their kinds, item for item.
-    c.column_items = vec![
-        known.iter().map(|r| r.name.clone()).collect(),
-        known
-            .iter()
-            .map(|r| kind_letter(r.kind).to_string())
-            .collect(),
-        Vec::new(),
-        Vec::new(),
-    ];
+    let mut items = vec![Vec::new(); COLUMNS.len()];
+    items[NAME] = known.iter().map(|r| r.name.clone()).collect();
+    items[OWNER] = known
+        .iter()
+        .map(|r| kind_letter(r.kind).to_string())
+        .collect();
+    c.column_items = items;
     c.editable_grid = true;
     c
 }
@@ -90,20 +85,18 @@ pub(super) fn follow(d: &mut Dialog, i: usize, before: &Value) {
     else {
         return;
     };
-    let names = d.controls[i].column_items[0].clone();
-    let kinds = d.controls[i].column_items[1].clone();
+    let names = d.controls[i].column_items[NAME].clone();
+    let kinds = d.controls[i].column_items[OWNER].clone();
     let Value::Rows(rows) = &mut d.controls[i].value else {
         return;
     };
     let row = &mut rows[r];
     let want = row[NAME].trim().to_lowercase();
-    if let Some(k) = names.iter().position(|n| n.to_lowercase() == want) {
+    let hit = names.iter().position(|n| n.to_lowercase() == want);
+    if let Some(k) = hit {
         row[NAME] = names[k].clone();
     }
-    let work = names
-        .iter()
-        .position(|n| n.to_lowercase() == want)
-        .is_none_or(|k| kinds[k] == "w");
+    let work = hit.is_none_or(|k| kinds[k] == "w");
     if !want.is_empty() && row[UNITS].trim().is_empty() && work {
         row[UNITS] = "100%".into();
     }
@@ -116,7 +109,6 @@ pub(super) fn follow(d: &mut Dialog, i: usize, before: &Value) {
 pub(super) fn tokens(ed: &ProjectEditor, rows: &[Vec<String>]) -> Vec<String> {
     let proj = ed.project();
     rows.iter()
-        .filter(|r| !blank(r))
         .filter_map(|row| {
             let name = row.get(NAME)?.trim();
             if name.is_empty() {

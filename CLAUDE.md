@@ -617,8 +617,8 @@
   (`Editor::set_display_on_timeline`/`set_hide_bar`/`set_rollup`, one undo step
   each, off when absent) and a Help button (`id == "help"`, drawn bottom
   left) that says what F1 says (`help_tab::DOCS_COMING`, #1022) and writes
-  nothing. Hide Bar and Rollup are stored and saved in MSPDI; nothing draws
-  them yet. MSPDI has no Display on Timeline element, so it is saved only in
+  nothing. Display on Timeline, Hide Bar and Rollup are stored; nothing draws
+  or reads them yet (the Timeline pane does not consult Display on Timeline). MSPDI has no Display on Timeline element, so it is saved only in
   the `.yppx` package's `timeline.xml` part (`projcore::timeline`, written only
   when a task states a value, an unreadable one kept as a retained extra like
   `tableview.xml`).

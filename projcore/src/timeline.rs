@@ -2,7 +2,8 @@
 //! Timeline, #1536). MSPDI has no element for it, so it is saved only in the
 //! `.yppx` package's `timeline.xml` part ([`crate::yppx`]), one `<task>` per
 //! task that states a value; the task's [`crate::model::Task::display_on_timeline`]
-//! holds it in the model.
+//! holds it in the model. The flag is only stored: the Timeline pane does not
+//! read it yet.
 
 use crate::formatting::{decode, push_attr};
 use crate::model::Task;

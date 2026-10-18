@@ -1194,3 +1194,26 @@ fn picking_the_other_task_of_the_same_name_when_the_row_shows_that_name() {
         .unwrap();
     assert_eq!(grid(&t, "predecessors")[0][..2], ["3", "First"]);
 }
+
+#[test]
+fn a_row_with_a_type_or_lag_but_no_task_is_no_link() {
+    let mut t = tab3();
+    open(&mut t, ProjectAct::Constraint);
+    // Touching the blank row's Type cell and changing something else: OK
+    // applies, with no link.
+    cell(&mut t, "predecessors[0].type", "ss");
+    cell(&mut t, "predecessors[0].lag", "1d");
+    put(&mut t, "name", "Renamed");
+    dialog_click(&mut t, "OK").unwrap();
+    assert_eq!(v(&t).ed.project().task(2).unwrap().name, "Renamed");
+    assert!(preds(&t, 2).is_empty());
+    // Clearing a link's ID drops the link.
+    vm(&mut t)
+        .ed
+        .set_predecessors(2, vec![projcore::Predecessor::fs(1)])
+        .unwrap();
+    open(&mut t, ProjectAct::Constraint);
+    cell(&mut t, "predecessors[0].id", "");
+    dialog_click(&mut t, "OK").unwrap();
+    assert!(preds(&t, 2).is_empty());
+}

@@ -21,10 +21,6 @@ pub(super) const TYPES: [(LinkType, &str); 4] = [
     (LinkType::StartFinish, "Start-to-Finish (SF)"),
 ];
 
-fn blank(row: &[String]) -> bool {
-    row.iter().all(|c| c.trim().is_empty())
-}
-
 /// A link's lag as the grid shows it: the cell's spelling without the `+`.
 fn lag_text(p: &Predecessor, proj: &projcore::Project) -> String {
     format_lag(p, proj).trim_start_matches('+').to_string()
@@ -138,7 +134,7 @@ pub(super) fn follow(d: &mut Dialog, i: usize, before: &Value) {
     }
 }
 
-/// The links the grid's rows say, for task `uid`. A blank row is skipped; a
+/// The links the grid's rows say, for task `uid`. A row with no task is skipped; a
 /// row names its task by ID (the cell's grammar: a local ID, a cross-project
 /// reference) or, without one, by Task Name. A link whose task, type and lag
 /// are what is stored keeps the stored link, lag format and all, when its lag
@@ -152,8 +148,10 @@ pub(super) fn parse(
     let proj = ed.project();
     let task = proj.task(uid).ok_or("The edited task no longer exists")?;
     let mut out = Vec::new();
-    for row in rows.iter().filter(|r| !blank(r)) {
+    for row in rows {
         let cell = |c: usize| row.get(c).map_or("", |s| s.trim());
+        // A row names its task by ID or Task Name; with neither (a Type or
+        // Lag alone, or a cleared ID) it is no link.
         let target = if !cell(ID).is_empty() {
             match parse_task_predecessors(cell(ID), task, proj)?.as_slice() {
                 [one] => one.clone(),
@@ -168,7 +166,7 @@ pub(super) fn parse(
                 .ok_or_else(|| format!("No task named '{}'", cell(NAME)))?;
             Predecessor::fs(hit.uid)
         } else {
-            return Err("Name the task each link comes from (ID or Task Name)".into());
+            continue;
         };
         let link = if cell(TYPE).is_empty() {
             LinkType::FinishStart
