@@ -366,3 +366,20 @@ fn a_kept_field_is_not_cut_and_pushes_no_undo_step() {
     assert_eq!(ed.cut_text().as_deref(), Some("bc"));
     assert_eq!(fields(&ed), 1);
 }
+
+#[test]
+fn an_untracked_plain_text_cut_takes_a_link_fields_text() {
+    let mut ed = editor(LINKED);
+    ed.set_track_changes(None);
+    ed.anchor = Some(Caret::at(vec![0], 1));
+    ed.caret = Caret::at(vec![0], 4);
+    assert_eq!(ed.cut_text().as_deref(), Some("b7c"));
+    assert_eq!(fields(&ed), 0);
+
+    let mut ed = editor(LINKED);
+    ed.set_track_changes(None);
+    ed.anchor = Some(Caret::at(vec![0], 2));
+    ed.caret = Caret::at(vec![0], 3);
+    assert_eq!(ed.cut_text().as_deref(), Some("7"));
+    assert_eq!(fields(&ed), 0);
+}

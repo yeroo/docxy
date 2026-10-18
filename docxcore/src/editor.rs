@@ -2248,7 +2248,9 @@ impl Editor {
     /// in the paragraphs where it starts and ends, every equation while
     /// tracking, none over a cell range (which clears the cells). It leaves
     /// out the text of the equations it keeps, so a paste does not bring
-    /// one back as text beside the one kept. A loose field the selection cuts is
+    /// one back as text beside the one kept; so does a field a tracked delete
+    /// keeps ([`kept_while_tracking`]), while untracked it is cut with its
+    /// text. A loose field the selection cuts is
     /// copied and deleted whole (#1240). `None`, and nothing done, when the
     /// selection holds no text (only kept objects, say).
     pub fn cut_text(&mut self) -> Option<String> {
@@ -2858,14 +2860,17 @@ impl Editor {
 
     /// [`Editor::selection_text`]; `for_plain_text_cut` leaves out the text
     /// of the equations a plain-text cut keeps in place ([`Editor::cut_text`],
-    /// see [`Editor::delete_keeps_equations_in`]). A copy leaves out none.
+    /// see [`Editor::delete_keeps_equations_in`]), and, while tracking, of the
+    /// fields a tracked delete keeps ([`kept_while_tracking`]; untracked, the
+    /// delete takes them, so their text is cut). A copy leaves out none.
     fn selection_text_with(&self, for_plain_text_cut: bool) -> String {
+        let fields_kept = for_plain_text_cut && self.track.is_some() && self.cell_range().is_none();
         self.selection_spans()
             .iter()
             .filter_map(|(path, s, e)| {
                 let equations = !(for_plain_text_cut && self.delete_keeps_equations_in(path, true));
                 resolve_para(&self.doc.body, path)
-                    .map(|p| display_text(&p.content, *s, *e, equations))
+                    .map(|p| display_text(&p.content, *s, *e, equations, fields_kept))
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -3835,9 +3840,23 @@ fn inline_covering(content: &[Inline], idx: usize) -> Option<&Inline> {
 /// editor text, with each field's result or equation's text in place of its
 /// [`FIELD_CHAR`]; an inline picture gives none. `equations` false leaves
 /// out the equations' text too.
-fn display_text(content: &[Inline], start: usize, end: usize, equations: bool) -> String {
+fn display_text(
+    content: &[Inline],
+    start: usize,
+    end: usize,
+    equations: bool,
+    fields_kept: bool,
+) -> String {
     let mut out = String::new();
-    push_display_text(content, start, end, equations, &mut 0, &mut out);
+    push_display_text(
+        content,
+        start,
+        end,
+        equations,
+        fields_kept,
+        &mut 0,
+        &mut out,
+    );
     out
 }
 
@@ -3846,6 +3865,7 @@ fn push_display_text(
     start: usize,
     end: usize,
     equations: bool,
+    fields_kept: bool,
     pos: &mut usize,
     out: &mut String,
 ) {
@@ -3861,11 +3881,12 @@ fn push_display_text(
                 );
                 out.extend(runs.chars().skip(s - a).take(e.saturating_sub(s)));
                 *pos = a + runs.chars().count();
-                push_display_text(&h.content, start, end, equations, pos, out);
+                push_display_text(&h.content, start, end, equations, fields_kept, pos, out);
             }
             Inline::Field { text, .. } | Inline::Equation { text, .. } if len == 1 => {
                 let shown = equations
-                    || (matches!(inline, Inline::Field { .. }) && !kept_while_tracking(inline));
+                    || (matches!(inline, Inline::Field { .. })
+                        && !(fields_kept && kept_while_tracking(inline)));
                 if shown && start <= a && a < end {
                     out.push_str(text);
                 }

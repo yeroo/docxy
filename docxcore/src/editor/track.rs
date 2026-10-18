@@ -614,15 +614,11 @@ fn plan_delete(content: &[Inline], idx: usize, author: &str) -> Plan {
                 Inline::Raw(_) => return Plan::Record { merges: false },
                 // A field likewise (#1470): its runs go in a `w:del` of its
                 // own, which Reject restores.
-                // One a `w:del` cannot hold (a link or content control in its
-                // result) stays, as an equation does.
-                Inline::Field { raw, .. } => {
-                    return if crate::compare::is_run_level(&crate::compare::run_level_field(raw)) {
-                        Plan::Record { merges: false }
-                    } else {
-                        Plan::Keep
-                    };
-                }
+                // One whose result a `w:del` cannot hold (a link or other
+                // paragraph-level content in its result) stays, as an equation
+                // does.
+                Inline::Field { .. } if super::kept_while_tracking(inline) => return Plan::Keep,
+                Inline::Field { .. } => return Plan::Record { merges: false },
                 Inline::Equation { .. } => return Plan::Keep,
                 _ => return Plan::Remove,
             };
