@@ -419,7 +419,8 @@
   addresses a grid cell as `name[row].column` (checked against the column's
   kind). `ControlKind::Multiline` (Enter is a new line; `key_button` leaves
   Enter alone with one focused) and `Grid` (per-column `column_kinds`, drawn
-  as a table; a click, Up/Down or `dialog-select` picks a row (`Control::row`),
+  as a table; a plugin's grid is interactive, `Control::interactive`, a
+  built-in dialog's stays read-only: a click, Up/Down or `dialog-select` picks a row (`Control::row`),
   Left/Right the active column, typing edits the cell (`Control::edit`, Enter
   commits through the input handler, Escape drops it), Space toggles a
   `Check` cell; a `commit_command` grid's commit sends the command with

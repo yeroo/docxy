@@ -969,6 +969,15 @@ fn a_grid_selects_rows_and_edits_cells_by_key_and_click() {
     let mut s = stack();
     s.select_tab("Predecessors").unwrap();
     let d = s.top_dialog_mut().unwrap();
+    // A built-in grid is read-only; a plugin's is interactive (#1602).
+    assert!(d.tabs_to("predecessors").is_err());
+    assert!(d.select_row("predecessors", 0).is_err());
+    let gi = d
+        .controls
+        .iter()
+        .position(|c| c.name == "predecessors")
+        .unwrap();
+    d.controls[gi].plugin = true;
     assert!(d.tabs_to("predecessors").is_ok());
     d.select_row("predecessors", 0).unwrap();
     assert_eq!(

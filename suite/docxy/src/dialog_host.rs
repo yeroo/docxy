@@ -968,7 +968,7 @@ impl Docxy {
                             };
                             cell(content, widths[col], false, active)
                                 .id(("dialog-grid-cell", (i * 1024 + r) * 256 + col))
-                                .when(c.enabled, |d| {
+                                .when(c.enabled && c.plugin, |d| {
                                     d.cursor_pointer().on_click(on_widget(
                                         cx,
                                         i,

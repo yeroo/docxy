@@ -396,10 +396,12 @@ pub(crate) enum ControlKind {
     List,
     /// Rows of cells, one column kind each (`Control::column_kinds`, text
     /// when unset); `dialog-set` addresses a cell as `name[row].column`
-    /// (#1532). Drawn as a table whose rows the pointer and Up/Down select
-    /// (`Control::row`, `dialog-select`) and whose cells the person types
-    /// into (`Control::edit`, committed by Enter, dropped by Escape; Space
-    /// toggles a check cell) (#1602).
+    /// (#1532). Drawn as a table. A UI plugin's grid is interactive
+    /// (#1602, [`Control::interactive`]): the pointer and Up/Down select a
+    /// row (`Control::row`, `dialog-select`), the person types into a cell
+    /// (`Control::edit`, committed by Enter, dropped by Escape) and Space
+    /// toggles a check cell; a built-in dialog's grid stays read-only, edited
+    /// by `dialog-set` alone, so its Tab order and catalogue do not move.
     Grid,
     Label,
     /// A text field of several lines: Enter is a new line, not OK (#1532).
@@ -438,10 +440,10 @@ impl ControlKind {
             Self::Text | Self::Number | Self::Date | Self::Duration | Self::Multiline
         )
     }
-    /// A control the keyboard and pointer can edit: a label is never
-    /// edited. A list's item is chosen by a click or Up/Down/Home/End
-    /// (#988); a grid's row and cell by a click, the arrows and typing
-    /// (#1602).
+    /// A control the keyboard and pointer can edit: a grid is a read-only
+    /// widget unless a plugin's ([`Control::interactive`]), and a label is
+    /// never edited. A list's item is chosen by a click or Up/Down/Home/End
+    /// (#988).
     pub fn is_editable(self) -> bool {
         self.is_text()
             || matches!(
@@ -452,7 +454,6 @@ impl ControlKind {
                     | Self::Dropdown
                     | Self::List
                     | Self::CheckList
-                    | Self::Grid
             )
     }
 
@@ -561,6 +562,13 @@ impl Control {
             Value::Rows(rows) => rows.len(),
             _ => 0,
         }
+    }
+
+    /// Whether the keyboard and pointer edit this control: every editable
+    /// kind, and a UI plugin's grid (#1602), whose rows select and whose
+    /// cells are typed into.
+    pub fn interactive(&self) -> bool {
+        self.kind.is_editable() || (self.kind == ControlKind::Grid && self.plugin)
     }
 
     /// The kind of a grid's column `col` (text when none is set).
@@ -1489,7 +1497,7 @@ impl Dialog {
         (0..self.controls.len())
             .filter(|&i| {
                 let c = &self.controls[i];
-                self.on_page(c) && c.visible && c.enabled && c.kind.is_editable()
+                self.on_page(c) && c.visible && c.enabled && c.interactive()
             })
             .collect()
     }
