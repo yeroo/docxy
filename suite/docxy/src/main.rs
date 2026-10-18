@@ -33950,7 +33950,14 @@ impl Docxy {
             });
             multiunzip(rows)
         };
-        let fit = ribbon_fit::fit(&specs, width);
+        // Project's ribbon collapses whole groups (#1608); the document's
+        // and the sheet's drop labels first (#1020).
+        let policy = if self.active_is_project() {
+            ribbon_fit::Policy::WholeGroups
+        } else {
+            ribbon_fit::Policy::LabelsFirst
+        };
+        let fit = ribbon_fit::fit_with(&specs, width, policy);
         RibbonFitNow {
             width,
             titles,
@@ -35659,7 +35666,8 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match c {
-            Control::Toggle(cmd) => self.icon_btn(cmd, false, pal, cx),
+            // A toggle with no icon draws its label (#1608).
+            Control::Toggle(cmd) => self.icon_btn(cmd, cmd.icon.0.is_empty(), pal, cx),
             Control::Large(cmd) => self.large_btn(cmd, pal, cx),
             Control::Split { primary, .. } => self.split_btn(primary, pal, cx),
             Control::Dropdown { cmd, .. } => self.dropdown_btn(cmd, pal, cx),

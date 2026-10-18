@@ -117,26 +117,48 @@ impl Fit {
     }
 }
 
+/// How a ribbon degrades when its tab does not fit (#1020, #1608).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Policy {
+    /// Word's and Excel's: groups drop their labels one at a time, lowest
+    /// priority first, and only then collapse.
+    LabelsFirst,
+    /// Project's: a group keeps its labels until it collapses whole into
+    /// one labelled button; the lowest priority (rightmost among equals)
+    /// goes first, and only while the tab still overflows.
+    WholeGroups,
+}
+
+/// The tab's groups fitted into a ribbon `width` px wide, labels first.
+pub(crate) fn fit(specs: &[Spec], width: f32) -> Fit {
+    fit_with(specs, width, Policy::LabelsFirst)
+}
+
 /// The tab's groups fitted into a ribbon `width` px wide.
 ///
-/// Two passes, as the issue orders them: groups go icon-only one at a time,
-/// lowest priority first, until the tab fits; only then do groups collapse,
-/// in the same order. Among equal priorities the rightmost goes first. If the
-/// collapsed buttons still overflow, the lowest-priority ones move to the
-/// chevron, but one group always stays drawn.
-pub(crate) fn fit(specs: &[Spec], width: f32) -> Fit {
+/// Under [`Policy::LabelsFirst`], two passes, as #1020 orders them: groups
+/// go icon-only one at a time, lowest priority first, until the tab fits;
+/// only then do groups collapse, in the same order. Under
+/// [`Policy::WholeGroups`] (the Project ribbon, #1608) the first pass is
+/// skipped: nothing loses a label, groups collapse whole. Among equal
+/// priorities the rightmost goes first. If the collapsed buttons still
+/// overflow, the lowest-priority ones move to the chevron, but one group
+/// always stays drawn.
+pub(crate) fn fit_with(specs: &[Spec], width: f32, policy: Policy) -> Fit {
     let avail = width - GUTTER;
     let mut states = vec![State::Full; specs.len()];
     let mut order: Vec<usize> = (0..specs.len()).collect();
     order.sort_by_key(|&i| (specs[i].priority, std::cmp::Reverse(i)));
     let total =
         |states: &[State]| -> f32 { specs.iter().zip(states).map(|(s, st)| s.width(*st)).sum() };
-    for &i in &order {
-        if total(&states) <= avail {
-            break;
-        }
-        if specs[i].icon < specs[i].full {
-            states[i] = State::IconOnly;
+    if policy == Policy::LabelsFirst {
+        for &i in &order {
+            if total(&states) <= avail {
+                break;
+            }
+            if specs[i].icon < specs[i].full {
+                states[i] = State::IconOnly;
+            }
         }
     }
     for &i in &order {
@@ -289,7 +311,9 @@ pub(crate) fn model_control_w<A>(
     tw: TextWidth,
 ) -> f32 {
     match c {
-        Control::Toggle(_) => model_icon_btn_w(None, tw),
+        // A toggle draws its icon alone, or its label when it has no icon
+        // (#1608: a contributed toggle may name none).
+        Control::Toggle(cmd) => model_icon_btn_w(cmd.icon.0.is_empty().then_some(cmd.label), tw),
         // `large_btn`: `px_2` around the 26px icon or the label's lines.
         Control::Large(cmd) => 16.0 + lines_w(cmd.label, 11.0, tw).max(26.0),
         // `split_btn` and `dropdown_btn`: `px_1` around the icon or the
@@ -570,14 +594,46 @@ mod tests {
     /// Every ribbon tab the suite draws, by name: the document's and the
     /// Project's (contextual tabs too) from the model, the workbook's from
     /// the sheet table, each as its groups' specs.
+    /// Every tab, with the policy its ribbon fits under (#1608): Project's
+    /// tabs and the Gantt Chart Format tab collapse whole groups.
+    fn every_tab_with_policy() -> Vec<(String, Vec<Spec>, Policy)> {
+        let project: Vec<(String, Vec<Spec>)> = crate::ribbon_for(Kind::Project)
+            .tabs
+            .iter()
+            .chain(std::iter::once(&crate::gantt_format_tab()))
+            .map(|t| {
+                let specs = t.groups.iter().map(|g| model_spec(g, &tw)).collect();
+                (format!("project {}", t.name), specs)
+            })
+            .collect();
+        let mut out: Vec<(String, Vec<Spec>, Policy)> = every_tab()
+            .into_iter()
+            .filter(|(name, _)| !name.starts_with("project "))
+            .map(|(name, specs)| (name, specs, Policy::LabelsFirst))
+            .collect();
+        out.extend(
+            project
+                .into_iter()
+                .map(|(name, specs)| (name, specs, Policy::WholeGroups)),
+        );
+        out
+    }
+
     fn every_tab() -> Vec<(String, Vec<Spec>)> {
         let mut model: Vec<rs::Tab<Act>> = Vec::new();
         model.extend(crate::ribbon_for(Kind::Docx).tabs);
-        model.extend(crate::ribbon_for(Kind::Project).tabs);
         model.push(crate::table_tab::table_design_tab());
         model.push(crate::table_tab::table_layout_tab());
         model.push(crate::hf_tab::hf_tab());
-        model.push(crate::gantt_format_tab());
+        let project: Vec<(String, Vec<Spec>)> = crate::ribbon_for(Kind::Project)
+            .tabs
+            .iter()
+            .chain(std::iter::once(&crate::gantt_format_tab()))
+            .map(|t| {
+                let specs = t.groups.iter().map(|g| model_spec(g, &tw)).collect();
+                (format!("project {}", t.name), specs)
+            })
+            .collect();
         let mut out: Vec<(String, Vec<Spec>)> = model
             .iter()
             .map(|t| {
@@ -585,6 +641,7 @@ mod tests {
                 (format!("model {}", t.name), specs)
             })
             .collect();
+        out.extend(project);
         for t in sheet_ribbon::SHEET_RIBBON {
             let specs = t
                 .groups
@@ -719,7 +776,10 @@ mod tests {
     /// another that could be is still full.
     #[test]
     fn icon_only_comes_before_collapse_and_is_per_group() {
-        for (name, specs) in every_tab() {
+        for (name, specs, policy) in every_tab_with_policy() {
+            if policy != Policy::LabelsFirst {
+                continue;
+            }
             for width in widths() {
                 let fit = fit(&specs, width);
                 if fit.states.contains(&State::Collapsed) {
@@ -732,8 +792,8 @@ mod tests {
                 }
             }
         }
-        let task = model_tab(Kind::Project, "Task");
-        let specs: Vec<Spec> = task.groups.iter().map(|g| model_spec(g, &tw)).collect();
+        let home = model_tab(Kind::Docx, "Home");
+        let specs: Vec<Spec> = home.groups.iter().map(|g| model_spec(g, &tw)).collect();
         let one_at_a_time = widths().any(|w| {
             let fit = fit(&specs, w);
             fit.states.contains(&State::IconOnly)
@@ -741,6 +801,76 @@ mod tests {
                     .any(|i| fit.states[i] == State::Full && specs[i].icon < specs[i].full)
         });
         assert!(one_at_a_time);
+    }
+
+    /// #1608: Project's ribbon never strips a label. A group keeps its
+    /// labels until it collapses whole, the lowest priority (rightmost among
+    /// equals) first, only while the tab overflows, and a narrower window
+    /// never un-collapses a group a wider one collapsed.
+    #[test]
+    fn project_groups_collapse_whole_lowest_priority_first() {
+        for (name, specs, policy) in every_tab_with_policy() {
+            if policy != Policy::WholeGroups {
+                continue;
+            }
+            let mut collapsed_before: Vec<usize> = Vec::new();
+            for width in widths().collect::<Vec<_>>().into_iter().rev() {
+                let fit = fit_with(&specs, width, policy);
+                assert!(
+                    !fit.states.contains(&State::IconOnly),
+                    "{name} at {width}: a group lost its labels"
+                );
+                let collapsed: Vec<usize> = (0..specs.len())
+                    .filter(|&i| fit.states[i] == State::Collapsed)
+                    .collect();
+                for &i in &collapsed_before {
+                    assert!(
+                        collapsed.contains(&i),
+                        "{name} at {width}: group {i} came back"
+                    );
+                }
+                // Every collapsed group has a priority no higher than every
+                // full one (rightmost first among equals).
+                for &c in &collapsed {
+                    for i in 0..specs.len() {
+                        if fit.states[i] == State::Full {
+                            assert!(
+                                (specs[c].priority, std::cmp::Reverse(c))
+                                    <= (specs[i].priority, std::cmp::Reverse(i)),
+                                "{name} at {width}: group {c} collapsed before group {i}"
+                            );
+                        }
+                    }
+                }
+                // Nothing collapses while the whole tab fits.
+                let full: f32 = specs.iter().map(|s| s.full).sum();
+                if full <= width - GUTTER {
+                    assert!(
+                        collapsed.is_empty(),
+                        "{name} at {width}: collapsed while fitting"
+                    );
+                }
+                collapsed_before = collapsed;
+            }
+        }
+        // The Task tab: Editing (the lowest priority) goes first, Clipboard last.
+        let task = model_tab(Kind::Project, "Task");
+        let specs: Vec<Spec> = task.groups.iter().map(|g| model_spec(g, &tw)).collect();
+        let first_collapse = widths()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .find_map(|w| {
+                let fit = fit_with(&specs, w, Policy::WholeGroups);
+                fit.states.iter().position(|s| *s == State::Collapsed)
+            })
+            .unwrap();
+        assert_eq!(task.groups[first_collapse].title, "Editing");
+        // At 400 px every group is collapsed and some are in the chevron;
+        // Clipboard, the highest priority, is the one still drawn.
+        let narrow = fit_with(&specs, 400., Policy::WholeGroups);
+        assert!(!narrow.overflow.contains(&0), "Clipboard stays drawn");
+        assert!(narrow.states.iter().all(|s| *s == State::Collapsed));
     }
 
     fn spec(priority: u8, full: f32) -> Spec {

@@ -442,6 +442,21 @@
   `uiharness/cases/project-plugin-ui.uit` drives
   the fixture through all of it; nothing changes without a UI plugin.
 
+## Ribbon fit per ribbon (#1020, #1608)
+
+- `ribbon_fit::fit_with(specs, width, policy)`: `Policy::LabelsFirst` (the
+  document's and the sheet's ribbons, Word's and Excel's way) lets groups
+  drop their labels one at a time, lowest priority first, before any
+  collapses; `Policy::WholeGroups` (the Project ribbon, Project's way) skips
+  that pass: a group keeps icon and label until it collapses whole into one
+  labelled button, lowest priority (rightmost among equals) first, only
+  while the tab overflows. `ribbon_fit_now` picks the policy from the
+  active tab's kind; `ribbon-layout` never reports `icon-only` on a
+  Project tab. A toggle with no icon (a contributed one may name none)
+  draws and is estimated with its label. `uiharness/cases/ribbon-fit.uit`
+  pins the document and sheet order, `project-plugin-ui.uit` the Project
+  one with the fixture's group at 1180 and 1600 px.
+
 ## Project table: resizable columns and AutoFilter (#1533)
 
 - Column widths are the plan's: `projcore::tableview::TableView` (px by field
