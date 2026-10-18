@@ -119,6 +119,7 @@ fn form() -> Dialog {
         seen: None,
         committed: None,
         calendar: None,
+        popup: None,
     };
     d.controls = d.controls.into_iter().map(general).collect();
     preds.page = Some(1);

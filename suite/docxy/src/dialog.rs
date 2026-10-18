@@ -371,6 +371,23 @@ pub(crate) struct Button {
     /// Enter presses it.
     pub default: bool,
     pub role: ButtonRole,
+    /// A popup's menu row (#1607): an icon under `assets/icons`, a submenu
+    /// arrow, and a rule drawn above the row. Empty/false for a push button.
+    pub icon: &'static str,
+    pub submenu: bool,
+    pub rule: bool,
+}
+
+/// Where a dialog drawn as a popup (#1607) sits, decided when it opens:
+/// the panel's top-left in window pixels, its width, the value list's height
+/// and whether it opened above its anchor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Popup {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub list_h: f32,
+    pub above: bool,
 }
 
 impl Button {
@@ -381,6 +398,9 @@ impl Button {
             enabled: true,
             default: false,
             role,
+            icon: "",
+            submenu: false,
+            rule: false,
         }
     }
 }
@@ -1135,6 +1155,9 @@ pub(crate) struct Dialog {
     pub committed: Option<(usize, usize, usize, String)>,
     /// The calendar a date combo has dropped down (#1536), if one is open.
     pub calendar: Option<calendar::Calendar>,
+    /// Drawn as a popup anchored on a control instead of a centred modal
+    /// (#1607): no title, no backdrop, a press outside closes it as Cancel.
+    pub popup: Option<Popup>,
 }
 
 /// See [`Dialog::react`]. Two dialogs compare equal whatever their
@@ -1220,6 +1243,7 @@ impl Dialog {
             seen: None,
             committed: None,
             calendar: None,
+            popup: None,
         }
     }
 
@@ -2257,7 +2281,7 @@ impl Dialog {
             .map(|c| &c.value)
     }
 
-    fn to_json(&self, depth: usize) -> Json {
+    pub(crate) fn to_json(&self, depth: usize) -> Json {
         Json::obj(vec![
             ("open", Json::Bool(true)),
             ("id", Json::Str(self.id.as_str().into())),
@@ -2282,17 +2306,28 @@ impl Dialog {
                     self.buttons
                         .iter()
                         .map(|b| {
-                            Json::obj(vec![
+                            let mut f = vec![
                                 ("id", Json::Str(b.id.clone())),
                                 ("label", Json::Str(shown(&b.label))),
                                 ("enabled", Json::Bool(b.enabled)),
                                 ("default", Json::Bool(b.default)),
-                            ])
+                            ];
+                            if !b.icon.is_empty() {
+                                f.push(("icon", Json::Str(b.icon.into())));
+                            }
+                            if b.submenu {
+                                f.push(("submenu", Json::Bool(true)));
+                            }
+                            if b.rule {
+                                f.push(("separator", Json::Bool(true)));
+                            }
+                            Json::obj(f)
                         })
                         .collect(),
                 ),
             ),
             ("modeless", Json::Bool(self.modeless)),
+            ("popup", Json::Bool(self.popup.is_some())),
             ("active", Json::Bool(self.active)),
             ("calendar_open", Json::Bool(self.calendar.is_some())),
             (
@@ -2540,6 +2575,7 @@ mod tests_support {
             seen: None,
             committed: None,
             calendar: None,
+            popup: None,
         }
     }
 }

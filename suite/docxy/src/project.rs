@@ -31,7 +31,7 @@ pub(super) use rows::*;
 mod columns;
 mod selection;
 pub(super) use columns::{ARROW_W, EDGE_W, WidthDrag, committed_widths, project_width_release_all};
-mod autofilter;
+pub(crate) mod autofilter;
 pub(super) use autofilter::{AUTO_FILTER_STATUS, autofilter_click};
 
 /// Whole rows a PageUp/PageDown steps by: the rows that fit in the

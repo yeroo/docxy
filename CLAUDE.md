@@ -487,8 +487,16 @@
   rows; yppxy's actions go through `shown_selected_uid`.
 - The suite's drop-down is a dialog like the sheet's filter button
   (`project-filter-menu`, `DialogOwner::ProjectFilter`, `project/autofilter.rs`),
-  not a `MenuTarget`: Sort items (words by column type) apply and close, Group
-  by and Filters are drawn disabled (follow-ups), `Clear Filter from <Field>`
+  not a `MenuTarget`, drawn as Project's popup (#1607, `Dialog::popup`): no
+  title and no backdrop, 250 px wide under the heading's arrow (`place`: flipped
+  above when the room below cannot hold the menu and a usable list, clamped into
+  the window; anchored on the `project-heading:<col>` probe), `Apply` buttons as
+  menu rows (icon, `▸`, rule above) in Project's order (Sort asc/desc, Group by
+  ▸, No Group, Clear Filter, Filters ▸), the value list with a scrollbar, then
+  OK / Cancel; a press outside presses Cancel and Escape closes it.
+  `menu-read` answers from the dialog (`items`, `controls`, `buttons`).
+  Sort items (words by column type) apply and close, Group
+  by, No Group and Filters are drawn disabled (follow-ups), `Clear Filter from <Field>`
   is enabled only while filtered, the checklist is the dialog check list (a
   Year > Month > Day tree on dates, two-state boxes), OK applies (all checked
   is no filter; none is refused), Cancel discards. `menu-open {"target":

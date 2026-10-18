@@ -140,7 +140,15 @@ fn names(t: &DocTab) -> Vec<String> {
 }
 
 fn open(t: &mut DocTab, col: usize) {
-    let d = menu_dialog(v(t), col);
+    let popup = place(
+        Anchor {
+            left: 100.,
+            top: 80.,
+            bottom: 108.,
+        },
+        (1180., 800.),
+    );
+    let d = menu_dialog(v(t), col, popup);
     t.dialogs.push(d);
 }
 
@@ -169,7 +177,8 @@ fn the_menu_lists_sort_disabled_group_and_filters_and_clear_only_while_filtered(
     let mut t = tab();
     open(&mut t, COL_FINISH);
     let d = t.dialogs.top().unwrap();
-    assert_eq!(d.title, "Filter: Finish");
+    assert_eq!(d.title, "", "a popup has no title");
+    assert!(d.popup.is_some());
     let labels: Vec<_> = d.buttons.iter().map(|b| b.label.as_str()).collect();
     assert_eq!(
         labels,
@@ -177,13 +186,19 @@ fn the_menu_lists_sort_disabled_group_and_filters_and_clear_only_while_filtered(
             "Sort Earliest to Latest",
             "Sort Latest to Earliest",
             "Group by",
-            "Filters",
+            "No Group",
             "Clear Filter from Finish",
+            "Filters",
             "OK",
             "Cancel"
         ]
     );
-    assert!(!button(&t, "Group by").enabled && !button(&t, "Filters").enabled);
+    for label in ["Group by", "No Group", "Filters"] {
+        assert!(!button(&t, label).enabled, "{label}");
+    }
+    assert!(button(&t, "Group by").submenu && button(&t, "Filters").submenu);
+    assert!(button(&t, "Clear Filter from Finish").rule && button(&t, "Group by").rule);
+    assert_eq!(button(&t, "Sort Earliest to Latest").icon, "sort-az");
     assert!(!button(&t, "Clear Filter from Finish").enabled);
     assert!(button(&t, "Sort Latest to Earliest").enabled);
 
@@ -725,4 +740,85 @@ fn a_task_hidden_by_the_same_edit_does_not_count_as_a_row_that_followed() {
             assert!(v(&t).on_entry_row(), "C went with B: none followed");
         }
     }
+}
+
+#[test]
+fn the_popup_opens_below_the_heading_and_flips_above_when_there_is_no_room() {
+    let a = Anchor {
+        left: 100.,
+        top: 80.,
+        bottom: 108.,
+    };
+    let p = place(a, (1180., 800.));
+    assert!(!p.above);
+    assert_eq!((p.x, p.y, p.width), (100., 108., POPUP_W));
+    assert_eq!(p.list_h, MAX_LIST_H);
+
+    // Little room below, plenty above: the popup ends at the heading's top.
+    let low = Anchor {
+        left: 100.,
+        top: 600.,
+        bottom: 628.,
+    };
+    let p = place(low, (1180., 700.));
+    assert!(p.above);
+    assert_eq!(p.y + FIXED_H + p.list_h, 600.);
+
+    // Room on neither side: the list shrinks to its floor, below.
+    let p = place(a, (1180., 300.));
+    assert!(!p.above || p.y >= 4.);
+    assert!(p.list_h >= MIN_LIST_H);
+
+    // Clamped into the window on both sides.
+    let right = Anchor { left: 1100., ..a };
+    assert_eq!(place(right, (1180., 800.)).x, 1180. - POPUP_W - 4.);
+    let left = Anchor { left: -30., ..a };
+    assert_eq!(place(left, (1180., 800.)).x, 4.);
+}
+
+#[test]
+fn the_popup_fits_its_labels_at_the_fixed_width() {
+    // 12 px text at about 6.2 px a character, beside the 16 px icon, its gap
+    // and the row's padding.
+    for label in [
+        "Sort Smallest to Largest",
+        "Sort Latest to Earliest",
+        "Clear Filter from Resource Names",
+    ] {
+        assert!(
+            label.chars().count() as f32 * 6.2 + 40. <= POPUP_W,
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn menu_read_lists_the_rows_as_items_and_ok_cancel_as_buttons() {
+    let mut t = tab();
+    open(&mut t, COL_FINISH);
+    let j = menu_json(t.dialogs.top().unwrap());
+    let labels = |k: &str| -> Vec<String> {
+        let Some(Json::Arr(a)) = j.get(k) else {
+            panic!("{k}")
+        };
+        a.iter()
+            .map(|b| match b.get("label") {
+                Some(Json::Str(l)) => l.clone(),
+                _ => panic!("label"),
+            })
+            .collect()
+    };
+    assert_eq!(
+        labels("items"),
+        [
+            "Sort Earliest to Latest",
+            "Sort Latest to Earliest",
+            "Group by",
+            "No Group",
+            "Clear Filter from Finish",
+            "Filters"
+        ]
+    );
+    assert_eq!(labels("buttons"), ["OK", "Cancel"]);
+    assert_eq!(j.get("open"), Some(&Json::Bool(true)));
 }

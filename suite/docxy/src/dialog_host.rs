@@ -4,6 +4,7 @@
 //! buttons call the same [`dialog_click`].
 use super::*;
 use crate::dialog::{self, ControlKind, Dialog, DialogOwner, DialogStack, NONE_OPEN};
+use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Each list of the top dialog: its scroll, and the choice last scrolled to.
@@ -1318,6 +1319,11 @@ impl Docxy {
             ControlKind::CheckList => {
                 // Virtualised: an AutoFilter list holds up to 10,000 values.
                 let n = c.items.len();
+                let scroll = list_scroll(
+                    &mut self.dialog_lists.borrow_mut(),
+                    (d.id.as_str(), c.name),
+                    None,
+                );
                 let list = uniform_list(
                     ("dialog-checklist", i),
                     n,
@@ -1352,7 +1358,8 @@ impl Docxy {
                             .collect()
                     }),
                 )
-                .h(px(220.))
+                .track_scroll(&scroll)
+                .h(px(d.popup.map_or(220., |p| p.list_h)))
                 .w_full();
                 v_flex()
                     .id(("dialog-control", i))
@@ -1360,13 +1367,29 @@ impl Docxy {
                     .text_size(px(12.))
                     .text_color(fg)
                     .child(probe(&self.probes, format!("dialog-control:{}", c.name)))
-                    .child(label)
+                    .when(d.popup.is_none(), |e| e.child(label))
                     .child(
                         div()
                             .border_1()
                             .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
                             .bg(pal.panel)
-                            .child(list),
+                            .relative()
+                            .child(list)
+                            .when(d.popup.is_some(), |b| {
+                                b.child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .right_0()
+                                        .bottom_0()
+                                        .w(px(12.))
+                                        .child(
+                                            Scrollbar::vertical(&scroll)
+                                                .id(("dialog-checklist-bar", i))
+                                                .scrollbar_show(ScrollbarShow::Always),
+                                        ),
+                                )
+                            }),
                     )
                     .into_any_element()
             }
@@ -1518,6 +1541,99 @@ impl Docxy {
                         }))
                 })
         };
+        // A dialog drawn as a popup (#1607): menu rows, the value list, then
+        // OK / Cancel, under the heading it opened from.
+        if let Some(p) = d.popup {
+            let rows = d
+                .buttons
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.role == dialog::ButtonRole::Apply)
+                .map(|(i, b)| {
+                    let label = b.label.clone();
+                    let color = if b.enabled { pal.fg } else { pal.dim };
+                    v_flex()
+                        .child(div().when(b.rule, |r| r.h(px(1.)).mx_2().my(px(3.)).bg(pal.border)))
+                        .child(
+                            h_flex()
+                                .id(("dialog-button", i))
+                                .relative()
+                                .h(px(crate::project::autofilter::ROW_H))
+                                .px_2()
+                                .gap_2()
+                                .items_center()
+                                .text_size(px(12.))
+                                .text_color(color)
+                                .child(probe(&self.probes, format!("dialog-button:{}", b.label)))
+                                .child(div().w(px(16.)).flex_none().when(!b.icon.is_empty(), |d| {
+                                    d.child(icon_svg(b.icon, 16., color))
+                                }))
+                                .child(div().flex_1().child(SharedString::from(b.label.clone())))
+                                .when(b.submenu, |r| r.child("\u{25b8}"))
+                                .when(b.enabled, |r| {
+                                    r.cursor_pointer().hover(|r| r.bg(pal.hover)).on_click(
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.dialog_button_click(&label, window, cx)
+                                        }),
+                                    )
+                                }),
+                        )
+                })
+                .collect::<Vec<_>>();
+            let foot = d
+                .buttons
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.role != dialog::ButtonRole::Apply)
+                .map(|(i, b)| button(i, b))
+                .collect::<Vec<_>>();
+            return Some(
+                deferred(
+                    div()
+                        .id("dialog-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        // A press anywhere else closes it as Cancel.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.dialog_button_click("Cancel", window, cx)
+                            }),
+                        )
+                        .child(
+                            v_flex()
+                                .id("dialog")
+                                .absolute()
+                                .left(px(p.x))
+                                .top(px(p.y))
+                                .w(px(p.width))
+                                .py_1()
+                                .bg(pal.panel)
+                                .border_1()
+                                .border_color(pal.border)
+                                .shadow_lg()
+                                .occlude()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(probe(&self.probes, "dialog"))
+                                .children(rows)
+                                .child(div().h(px(1.)).mx_2().my(px(3.)).bg(pal.border))
+                                .children(controls.into_iter().map(|c| div().px_2().child(c)))
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .px_2()
+                                        .pt_2()
+                                        .pb_1()
+                                        .justify_end()
+                                        .children(foot),
+                                ),
+                        ),
+                )
+                .with_priority(2)
+                .into_any_element(),
+            );
+        }
         // A Help button (#1536) sits at the bottom left.
         let (help, buttons): (Vec<_>, Vec<_>) = d
             .buttons
