@@ -13,6 +13,11 @@ pub(crate) type ListScrolls = std::collections::HashMap<
     (UniformListScrollHandle, Option<usize>),
 >;
 
+/// Forget every list but those of dialog `open` (none: all of them).
+fn prune_lists(lists: &mut ListScrolls, open: Option<&str>) {
+    lists.retain(|(id, _), _| Some(*id) == open);
+}
+
 /// The scroll for list `name` of dialog `id`, kept across frames. When the
 /// choice is not the one last seen it is scrolled into view (only if it is
 /// out of it), so a key that moves it past the shown rows brings it back,
@@ -1468,13 +1473,17 @@ impl Docxy {
     }
 
     /// The top dialog, centred over a backdrop that covers the whole window,
-    /// so the pointer cannot reach anything under it.
+    /// so the pointer cannot reach anything under it. A popup (#1607) is
+    /// placed at its [`dialog::Popup`] instead, over an undimmed backdrop.
     pub(crate) fn dialog_overlay(&self, pal: Pal, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let d = self.active_dialogs()?.top()?;
-        // Another dialog's lists start again at the top when it next shows.
-        self.dialog_lists
-            .borrow_mut()
-            .retain(|(id, _), _| *id == d.id.as_str());
+        let top = self.active_dialogs().and_then(|s| s.top());
+        // Another dialog's lists start again at the top when it next shows,
+        // and so do all of them once no dialog is open.
+        prune_lists(
+            &mut self.dialog_lists.borrow_mut(),
+            top.map(|d| d.id.as_str()),
+        );
+        let d = top?;
         let tabs = (!d.tabs.is_empty()).then(|| {
             h_flex()
                 .gap_3()
@@ -1795,6 +1804,18 @@ mod tests {
         assert_eq!(pending(&h), Some(0));
         let other = list_scroll(&mut lists, ("goto", "names"), Some(3));
         assert!(!std::rc::Rc::ptr_eq(&h.0, &other.0));
+    }
+
+    /// A closed dialog's lists are forgotten, so the next one opens at the top.
+    #[test]
+    fn lists_are_forgotten_when_their_dialog_closes() {
+        let mut lists = ListScrolls::default();
+        list_scroll(&mut lists, ("project-filter-menu", "values"), None);
+        list_scroll(&mut lists, ("goto", "names"), None);
+        prune_lists(&mut lists, Some("goto"));
+        assert_eq!(lists.len(), 1);
+        prune_lists(&mut lists, None);
+        assert!(lists.is_empty());
     }
 
     /// A document tab with a two-field form open: Top (a number) and Note.

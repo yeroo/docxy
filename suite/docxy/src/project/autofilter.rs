@@ -174,7 +174,8 @@ const MARGIN: f32 = 4.;
 /// Where the popup goes for `anchor` in a window of `window` pixels: below the
 /// heading, else above when the room below cannot hold the menu and a
 /// usable value list and there is more room above; clamped into the window
-/// horizontally, the value list as tall as the room allows.
+/// (the end of the menu stays on screen even where the room is short), the
+/// value list as tall as the room allows.
 pub(crate) fn place(anchor: Anchor, window: (f32, f32)) -> Popup {
     let below = window.1 - anchor.bottom - MARGIN;
     let above_room = anchor.top - MARGIN;
@@ -182,17 +183,18 @@ pub(crate) fn place(anchor: Anchor, window: (f32, f32)) -> Popup {
     let room = if above { above_room } else { below };
     let list_h = (room - FIXED_H).clamp(MIN_LIST_H, MAX_LIST_H);
     let x = anchor.left.min(window.0 - POPUP_W - MARGIN).max(MARGIN);
-    let y = if above {
-        (anchor.top - FIXED_H - list_h).max(MARGIN)
+    let wanted = if above {
+        anchor.top - FIXED_H - list_h
     } else {
         anchor.bottom
     };
+    // Whatever the room, OK / Cancel stay inside the window.
+    let y = wanted.min(window.1 - FIXED_H - list_h - MARGIN).max(MARGIN);
     Popup {
         x,
         y,
         width: POPUP_W,
         list_h,
-        above,
     }
 }
 
@@ -263,26 +265,55 @@ fn sort_words(sort: Sort) -> String {
     )
 }
 
-/// `menu-read` of the popup (#1607): its menu rows as `items` in the order
-/// they are drawn, the value list as `controls`, and OK / Cancel as `buttons`.
+/// `menu-read` / `menu-open` of the popup (#1607), shaped like every menu's
+/// reply: `items` are the menu rows in the order drawn, a `{"separator":true}`
+/// entry of its own where a rule is drawn, `submenu` `[]` on a row that opens
+/// one (none is built) and null otherwise; `controls` is the value list and
+/// `buttons` OK / Cancel.
 pub(crate) fn menu_json(d: &Dialog) -> Json {
     let all = d.to_json(0);
     let field = |k: &str| all.get(k).cloned().unwrap_or(Json::Null);
-    let buttons = match field("buttons") {
-        Json::Arr(b) => b,
-        _ => Vec::new(),
-    };
-    let is_row =
-        |b: &Json| !matches!(b.get("id"), Some(Json::Str(id)) if id == "ok" || id == "cancel");
-    let (items, foot): (Vec<_>, Vec<_>) = buttons.into_iter().partition(is_row);
-    let target = match d.owner {
+    let column = match d.owner {
         DialogOwner::ProjectFilter { col } => COLUMNS[col],
         _ => "",
     };
+    let mut items = Vec::new();
+    let mut foot = Vec::new();
+    for b in &d.buttons {
+        if b.role != ButtonRole::Apply {
+            foot.push(Json::obj(vec![
+                ("id", Json::Str(b.id.clone())),
+                ("label", Json::Str(b.label.clone())),
+                ("enabled", Json::Bool(b.enabled)),
+                ("default", Json::Bool(b.default)),
+            ]));
+            continue;
+        }
+        if b.rule {
+            items.push(Json::obj(vec![("separator", Json::Bool(true))]));
+        }
+        let mut f = vec![
+            ("id", Json::Str(b.id.clone())),
+            ("label", Json::Str(b.label.clone())),
+            ("enabled", Json::Bool(b.enabled)),
+            (
+                "submenu",
+                if b.submenu {
+                    Json::Arr(Vec::new())
+                } else {
+                    Json::Null
+                },
+            ),
+        ];
+        if !b.icon.is_empty() {
+            f.push(("icon", Json::Str(b.icon.into())));
+        }
+        items.push(Json::obj(f));
+    }
     Json::obj(vec![
         ("open", Json::Bool(true)),
         ("target", Json::Str("filter".into())),
-        ("column", Json::Str(target.into())),
+        ("column", Json::Str(column.into())),
         ("items", Json::Arr(items)),
         ("controls", field("controls")),
         ("buttons", Json::Arr(foot)),
@@ -357,28 +388,29 @@ pub(crate) fn autofilter_click(tab: &mut DocTab, button: &str) -> Option<Result<
     Some(Ok(()))
 }
 
-/// The anchor of column `col`'s heading from the last frame's probes. A
-/// heading scrolled out of view (or not drawn yet) has no probe: the row of
-/// headings' top and bottom, from any heading that is drawn, with the left
-/// edge of the first one, stand in; with none, the window's top left.
-fn anchor_of(probes: &crate::Probes, col: usize) -> Anchor {
-    let rect = |b: gpui::Bounds<gpui::Pixels>| Anchor {
-        left: f32::from(b.origin.x),
-        top: f32::from(b.origin.y),
-        bottom: f32::from(b.origin.y + b.size.height),
-    };
-    if let Some(b) = probes.get(&format!("project-heading:{col}")) {
-        return rect(b);
-    }
-    let any = (0..COLUMNS.len()).find_map(|c| probes.get(&format!("project-heading:{c}")));
-    any.map_or(
-        Anchor {
+/// The anchor of column `col`'s heading in the frame on screen. Every heading
+/// is laid out and clipped by the table pane, so its probe holds bounds
+/// outside the pane when it is scrolled out of view: the left edge is clamped
+/// into the pane (`project-body` and the table's width). With no heading
+/// probe yet (the surface's first frame), the window's top left stands in.
+fn anchor_of(probes: &crate::Probes, col: usize, table_w: f32) -> Anchor {
+    let Some(b) = probes.current(&format!("project-heading:{col}")) else {
+        return Anchor {
             left: 0.,
             top: 0.,
             bottom: 0.,
-        },
-        rect,
-    )
+        };
+    };
+    let mut left = f32::from(b.origin.x);
+    if let Some(body) = probes.current("project-body") {
+        let pane_left = f32::from(body.origin.x);
+        left = left.clamp(pane_left, pane_left + table_w);
+    }
+    Anchor {
+        left,
+        top: f32::from(b.origin.y),
+        bottom: f32::from(b.origin.y + b.size.height),
+    }
 }
 
 impl Docxy {
@@ -399,7 +431,7 @@ impl Docxy {
         let Surface::Project(v) = &tab.surface else {
             return Err("the active tab is not a Project".into());
         };
-        let popup = place(anchor_of(&self.probes.borrow(), col), {
+        let popup = place(anchor_of(&self.probes.borrow(), col, v.table_w), {
             let size = window.viewport_size();
             (f32::from(size.width), f32::from(size.height))
         });

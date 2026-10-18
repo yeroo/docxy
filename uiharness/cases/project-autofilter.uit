@@ -27,24 +27,24 @@ test project the arrow opens the menu and Finish sorts latest first
   # Finish is opened as its arrow would open it (menu-open works scrolled out).
   call menu-open {"target":{"filter":"Finish"}}
   shot window
+  assert reply.open is true
+  assert reply.items.0.label is Sort Earliest to Latest
   call menu-read {}
   assert reply.open is true
   assert reply.target is filter
   assert reply.items.0.label is Sort Earliest to Latest
   assert reply.items.0.icon is sort-az
   assert reply.items.1.label is Sort Latest to Earliest
-  assert reply.items.2.label is Group by
-  assert reply.items.2.enabled is false
-  assert reply.items.2.submenu is true
   assert reply.items.2.separator is true
-  assert reply.items.3.label is No Group
+  assert reply.items.3.label is Group by
   assert reply.items.3.enabled is false
-  assert reply.items.4.label is Clear Filter from Finish
+  assert reply.items.4.label is No Group
   assert reply.items.4.enabled is false
-  assert reply.items.4.separator is true
-  assert reply.items.5.label is Filters
-  assert reply.items.5.enabled is false
-  assert reply.items.5.submenu is true
+  assert reply.items.5.separator is true
+  assert reply.items.6.label is Clear Filter from Finish
+  assert reply.items.6.enabled is false
+  assert reply.items.7.label is Filters
+  assert reply.items.7.enabled is false
   assert reply.controls.0.items.0 is (Select All)
   assert reply.controls.0.items.1 is 2026
   assert reply.controls.0.items.2 is January
@@ -87,7 +87,7 @@ test project filtering Finish to one month leaves its rows and Clear Filter rest
   assert reply.filters.0.column is Finish
   # Clear Filter is enabled on the filtered column only.
   call menu-open {"target":{"filter":"Finish"}}
-  assert reply.buttons.4.enabled is true
+  assert reply.items.6.enabled is true
   call dialog-click {"button":"Clear Filter from Finish"}
   assert dialog is none
   call rows {}

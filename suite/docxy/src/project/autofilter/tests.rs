@@ -750,7 +750,6 @@ fn the_popup_opens_below_the_heading_and_flips_above_when_there_is_no_room() {
         bottom: 108.,
     };
     let p = place(a, (1180., 800.));
-    assert!(!p.above);
     assert_eq!((p.x, p.y, p.width), (100., 108., POPUP_W));
     assert_eq!(p.list_h, MAX_LIST_H);
 
@@ -761,13 +760,34 @@ fn the_popup_opens_below_the_heading_and_flips_above_when_there_is_no_room() {
         bottom: 628.,
     };
     let p = place(low, (1180., 700.));
-    assert!(p.above);
     assert_eq!(p.y + FIXED_H + p.list_h, 600.);
 
-    // Room on neither side: the list shrinks to its floor, below.
-    let p = place(a, (1180., 300.));
-    assert!(!p.above || p.y >= 4.);
-    assert!(p.list_h >= MIN_LIST_H);
+    // Short windows: the end of the menu (OK / Cancel) stays inside.
+    for (bottom, height) in [(268., 560.), (170., 450.), (108., 420.), (600., 700.)] {
+        let anchor = Anchor {
+            left: 100.,
+            top: bottom - 28.,
+            bottom,
+        };
+        let p = place(anchor, (1180., height));
+        assert!(p.list_h >= MIN_LIST_H);
+        assert!(p.y >= 4., "{bottom} in {height}: y {}", p.y);
+        assert!(
+            p.y + FIXED_H + p.list_h <= height - 4.,
+            "{bottom} in {height}: ends at {}",
+            p.y + FIXED_H + p.list_h
+        );
+    }
+    // The 268-in-560 case opens below and is pushed up to fit.
+    let p = place(
+        Anchor {
+            left: 100.,
+            top: 240.,
+            bottom: 268.,
+        },
+        (1180., 560.),
+    );
+    assert_eq!(p.y, 560. - FIXED_H - p.list_h - 4.);
 
     // Clamped into the window on both sides.
     let right = Anchor { left: 1100., ..a };
@@ -802,9 +822,9 @@ fn menu_read_lists_the_rows_as_items_and_ok_cancel_as_buttons() {
             panic!("{k}")
         };
         a.iter()
-            .map(|b| match b.get("label") {
-                Some(Json::Str(l)) => l.clone(),
-                _ => panic!("label"),
+            .filter_map(|b| match b.get("label") {
+                Some(Json::Str(l)) => Some(l.clone()),
+                _ => None,
             })
             .collect()
     };
@@ -820,5 +840,16 @@ fn menu_read_lists_the_rows_as_items_and_ok_cancel_as_buttons() {
         ]
     );
     assert_eq!(labels("buttons"), ["OK", "Cancel"]);
+    // Separators are entries of their own, as in every menu.
+    let Some(Json::Arr(items)) = j.get("items") else {
+        panic!("items")
+    };
+    let kinds: Vec<_> = items.iter().map(|i| i.get("separator").is_some()).collect();
+    assert_eq!(
+        kinds,
+        [false, false, true, false, false, true, false, false]
+    );
+    assert_eq!(items[3].get("submenu"), Some(&Json::Arr(Vec::new())));
+    assert_eq!(items[4].get("submenu"), Some(&Json::Null));
     assert_eq!(j.get("open"), Some(&Json::Bool(true)));
 }

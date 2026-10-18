@@ -4930,9 +4930,11 @@ fn dispatch_verb(
             refuse_under_cover(app)?;
             let target = args.get("target").ok_or("menu-open needs a 'target'")?;
             menu_open(app, target, window, cx)?;
-            // The Project AutoFilter drop-down is a dialog: reply with it.
+            // The Project AutoFilter popup is a dialog: reply as `menu-read` does.
             if target.get("filter").is_some() {
-                return Done::ok(app.active_dialogs_mut().to_json());
+                if let Some(d) = app.active_dialogs().and_then(|s| s.top()) {
+                    return Done::ok(crate::project::autofilter::menu_json(d));
+                }
             }
             Done::ok(crate::menu::read_json(app.menu.as_ref()))
         }

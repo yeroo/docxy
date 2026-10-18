@@ -380,14 +380,13 @@ pub(crate) struct Button {
 
 /// Where a dialog drawn as a popup (#1607) sits, decided when it opens:
 /// the panel's top-left in window pixels, its width, the value list's height
-/// and whether it opened above its anchor.
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Popup {
     pub x: f32,
     pub y: f32,
     pub width: f32,
     pub list_h: f32,
-    pub above: bool,
 }
 
 impl Button {
@@ -1156,7 +1155,8 @@ pub(crate) struct Dialog {
     /// The calendar a date combo has dropped down (#1536), if one is open.
     pub calendar: Option<calendar::Calendar>,
     /// Drawn as a popup anchored on a control instead of a centred modal
-    /// (#1607): no title, no backdrop, a press outside closes it as Cancel.
+    /// (#1607): no title, an undimmed backdrop that still blocks the window
+    /// (a press outside closes it as Cancel).
     pub popup: Option<Popup>,
 }
 
