@@ -24,7 +24,7 @@ mod timeline;
 mod zoom;
 mod zoom_dialogs;
 pub(super) use timeline::*;
-pub(super) use zoom::available as timescale_available;
+pub(super) use zoom::{WheelZoom, available as timescale_available};
 pub(super) use zoom_dialogs::{apply_timescale, apply_zoom};
 mod rows;
 pub(super) use rows::*;
@@ -1536,7 +1536,9 @@ pub(super) fn project_el(
                     // Ctrl+wheel over the chart zooms the timescale around the
                     // pointer (#1535). The rows' own handler has already moved
                     // them by the same wheel turn; put them back.
-                    let notch = matches!(ev.delta, ScrollDelta::Lines(_));
+                    // Only a whole line is a notch; fractional lines (hi-res
+                    // wheels, touchpads) are summed like pixels.
+                    let notch = matches!(ev.delta, ScrollDelta::Lines(l) if l.y.abs() >= 1.);
                     if ev.modifiers.control && !delta.y.is_zero() {
                         let Some(body) = this.probes.borrow().current("project-body") else {
                             return;
@@ -1544,16 +1546,20 @@ pub(super) fn project_el(
                         cx.stop_propagation();
                         if let Some(tab) = this.tabs.get_mut(index)
                             && let Surface::Project(v) = &mut tab.surface
-                            && let Some(status) =
-                                v.wheel_zoom(
-                                    f32::from(ev.position.x - body.left()),
-                                    f32::from(delta.y),
-                                    notch,
-                                )
                         {
-                            v.scroll.0.borrow().base_handle.set_offset(held_scroll);
-                            tab.status = status.into();
-                            cx.notify();
+                            let zoom = v.wheel_zoom(
+                                f32::from(ev.position.x - body.left()),
+                                f32::from(delta.y),
+                                notch,
+                                ev.touch_phase,
+                            );
+                            if zoom != WheelZoom::NotChart {
+                                v.scroll.0.borrow().base_handle.set_offset(held_scroll);
+                                if let WheelZoom::Stepped(status) = zoom {
+                                    tab.status = status.into();
+                                }
+                                cx.notify();
+                            }
                         }
                         return;
                     }

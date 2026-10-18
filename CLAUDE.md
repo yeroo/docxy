@@ -748,9 +748,12 @@
   Timeline's "Add tasks with dates to the timeline" placeholder now shows only
   for a plan with no tasks: it used to sit clipped below the bar row, which a
   taller pane would have exposed over a plan that has tasks.
-- Ctrl+wheel steps once per notch (a line delta); smooth pixel deltas sum in
-  `wheel_acc` and step per `WHEEL_STEP` (40 px), so a swipe is not a jump of
-  every level. A view-box edge drag is measured against the edges as the box
+- Ctrl+wheel: every delta sums in `wheel_acc` and steps one level per
+  `WHEEL_STEP` (40 px); only a whole-line delta (|lines| >= 1) is a notch that
+  steps at once, fractional lines (hi-res wheels, touchpads) sum, and touch
+  phases Started/Ended clear the sum. The chart takes every Ctrl+wheel event
+  over it (`WheelZoom::Absorbed`/`Stepped`) and puts the rows' scroll back, so a
+  swipe never scrolls the rows. A view-box edge drag is measured against the edges as the box
   draws them (clamped to the Timeline's span) and moves within the span.
 - The chart menu opens the Timescale and Zoom dialogs (`project/zoom_dialogs.rs`,
   `DialogOwner::Zoom`/`Timescale`, catalogue ids `zoom`, `timescale`). The

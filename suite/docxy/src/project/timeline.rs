@@ -315,7 +315,7 @@ pub(crate) struct EdgePress {
 /// then covers fills `gantt_w`; the far edge stays put, also when the width
 /// clamps. The moved edge stays inside `[lo, hi]` (the days the Timeline draws,
 /// so the box edge follows the pointer) and the span never shrinks below the
-/// day count the widest zoom shows.
+/// day count the widest zoom shows, or the Timeline's own length if less.
 pub(crate) fn drag_edge(
     edge: BoxEdge,
     left: f32,
@@ -324,15 +324,29 @@ pub(crate) fn drag_edge(
     gantt_w: f32,
     (lo, hi): (f32, f32),
 ) -> (f32, f32) {
-    let least = gantt_w.max(1.) / zoom::MAX_DAY_W;
+    // The span cannot be asked to shrink below what the Timeline holds.
+    let least = (gantt_w.max(1.) / zoom::MAX_DAY_W).min((hi - lo).max(1.));
+    // `left` and `right` are the chart's real edges; the box draws them clamped
+    // to `[lo, hi]`, and the pointer moves that drawn edge. An edge the pointer
+    // has not moved from where it is drawn stays at its real place, so a press
+    // (or an outward drag at the Timeline's end) never changes the zoom.
+    let moved = |real: f32| {
+        let drawn = real.clamp(lo, hi);
+        let target = (drawn + dd).clamp(lo, hi);
+        if (target - drawn).abs() < 1e-6 {
+            real
+        } else {
+            target
+        }
+    };
     match edge {
         BoxEdge::Left => {
-            let l = (left + dd).max(lo).min(right - least);
+            let l = moved(left).min(right - least);
             let day_w = zoom::fit(right - l, gantt_w);
             (day_w, right - gantt_w / day_w)
         }
         BoxEdge::Right => {
-            let r = (right + dd).min(hi).max(left + least);
+            let r = moved(right).max(left + least);
             (zoom::fit(r - left, gantt_w), left)
         }
     }
@@ -369,19 +383,17 @@ impl ProjectView {
     }
 
     /// Mouse-down on a box edge at `x`.
-    /// The edges are taken as the box draws them: the chart may show days
-    /// outside the Timeline's span (a short plan in a wide chart), and the box
-    /// is clamped to the span.
+    /// The chart's real edges are kept: it may show days outside the Timeline's
+    /// span (a short plan in a wide chart), where the box is drawn clamped to
+    /// the span; [`drag_edge`] maps the pointer through the drawn edge.
     pub fn press_timeline_edge(&mut self, edge: BoxEdge, x: f32) {
         let day_w = self.day_w();
-        let (lo, hi) = self.timeline_bounds();
         let left = self.gantt_x.get() / day_w;
-        let right = left + self.gantt_w / day_w;
         self.timeline_edge = Some(EdgePress {
             edge,
             x,
-            left: left.clamp(lo, hi),
-            right: right.clamp(lo, hi),
+            left,
+            right: left + self.gantt_w / day_w,
         });
     }
 
@@ -737,14 +749,14 @@ pub(crate) fn timeline_el(
         .child(timeline_grip(index, probes, cx))
 }
 
-/// One of the view box's edge strips, drawn last so it wins over the box. A
-/// drag of it moves that edge of the span and zooms the chart to fit it.
 /// The width of a box edge strip: 6 px, but a third of a narrow box at most, so
 /// the middle (which pans) is always there.
 pub(crate) fn edge_strip_w(box_w: f32) -> f32 {
     BOX_EDGE_W.min(box_w / 3.)
 }
 
+/// One of the view box's edge strips, drawn last so it wins over the box. A
+/// drag of it moves that edge of the span and zooms the chart to fit it.
 fn box_edge(
     edge: BoxEdge,
     strip_w: f32,

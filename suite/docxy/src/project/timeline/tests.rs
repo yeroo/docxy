@@ -645,3 +645,66 @@ fn the_grip_drags_the_height_and_a_double_click_restores_it() {
     v.height = 600.;
     assert_eq!(v.timeline_height(), 300.);
 }
+
+#[test]
+fn a_press_and_an_unmoved_edge_never_change_the_zoom() {
+    for days in [1, 2, 6, 60] {
+        for edge in [BoxEdge::Left, BoxEdge::Right] {
+            let mut v = ProjectView::new(project_with_days(days), false);
+            v.layout(1180.);
+            v.zoom_step(-1, 0.);
+            let held = (v.day_w(), v.gantt_x.get());
+            let w = ruler_width(v.width);
+            v.press_timeline_edge(edge, 100.);
+            v.drag_timeline_edge(100.);
+            assert!(
+                (v.day_w() - held.0).abs() < 1e-3 && (v.gantt_x.get() - held.1).abs() < 1e-2,
+                "{days} days, {edge:?}: {held:?} -> {} {}",
+                v.day_w(),
+                v.gantt_x.get()
+            );
+            let _ = w;
+        }
+    }
+}
+
+#[test]
+fn an_outward_drag_at_the_timelines_end_does_not_zoom_in() {
+    // A 6-day plan in a chart that shows 15: the right edge is drawn at the end.
+    let mut v = ProjectView::new(project_with_days(6), false);
+    v.layout(1180.);
+    let w = ruler_width(v.width);
+    let held = v.day_w();
+    v.press_timeline_edge(BoxEdge::Right, w);
+    v.drag_timeline_edge(w + 200.);
+    assert!((v.day_w() - held).abs() < 1e-3);
+    // The same for the left edge at the start.
+    v.release_timeline();
+    v.press_timeline_edge(BoxEdge::Left, 0.);
+    v.drag_timeline_edge(-200.);
+    assert!((v.day_w() - held).abs() < 1e-3);
+}
+
+#[test]
+fn a_one_day_or_empty_plan_does_not_pin_the_zoom_or_move_the_fixed_edge() {
+    for tasks in [project_with_days(1), untitled_project()] {
+        let mut v = ProjectView::new(tasks, false);
+        v.layout(1180.);
+        let (day_w, x) = (v.day_w(), v.gantt_x.get());
+        let w = ruler_width(v.width);
+        let left_before = v.gantt_x.get() / v.day_w();
+        v.press_timeline_edge(BoxEdge::Right, w);
+        v.drag_timeline_edge(w / 2.);
+        assert!(v.day_w() <= zoom::MAX_DAY_W);
+        assert_eq!(
+            v.gantt_x.get() / v.day_w(),
+            left_before,
+            "the left edge is fixed"
+        );
+        v.release_timeline();
+        v.set_zoom(day_w, x / day_w, 0.);
+        // A pure function: a span shorter than the least keeps the least.
+        let (d, l) = drag_edge(BoxEdge::Left, 0., 20., 50., 440., (0., 1.));
+        assert!(d <= zoom::MAX_DAY_W + 1e-3 && l >= 0.);
+    }
+}

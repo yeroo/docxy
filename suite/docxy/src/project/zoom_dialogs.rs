@@ -31,7 +31,7 @@ pub(crate) fn zoom_dialog(v: &ProjectView) -> Dialog {
     } else {
         custom
     };
-    let mut radio = choice(
+    let radio = choice(
         "zoom",
         "&Zoom to",
         ControlKind::Radio,
@@ -39,7 +39,6 @@ pub(crate) fn zoom_dialog(v: &ProjectView) -> Dialog {
         Some(on),
         None,
     );
-    radio.items = items.iter().map(|s| s.to_string()).collect();
     let mut days = Control::new(
         "custom",
         "&Custom (days across the chart):",
@@ -96,20 +95,15 @@ fn example_day() -> i64 {
     projcore::DateTime::parse_mspdi("2026-03-02T08:00:00").map_or(0, |d| d.day_number())
 }
 
-/// What a tier of `level` shows, for the Timescale dialog's read-only rows.
-fn unit_row(unit: zoom::Unit) -> String {
-    unit.name().to_string()
-}
-
 fn label_example(unit: zoom::Unit, day: i64) -> String {
     unit.labels(day).first().cloned().unwrap_or_default()
 }
 
 fn shown(level: &zoom::Level, today: i64) -> [String; 4] {
     [
-        unit_row(level.major),
+        level.major.name().to_string(),
         label_example(level.major, level.major.start_at_or_before(today)),
-        unit_row(level.minor),
+        level.minor.name().to_string(),
         label_example(level.minor, level.minor.start_at_or_before(today)),
     ]
 }

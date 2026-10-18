@@ -9,6 +9,17 @@ use projcore::DateTime;
 pub(crate) const MIN_DAY_W: f32 = 0.25;
 pub(crate) const MAX_DAY_W: f32 = 96.;
 
+/// What a Ctrl+wheel event did ([`ProjectView::wheel_zoom`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WheelZoom {
+    /// Not over the chart: the wheel is not the zoom's.
+    NotChart,
+    /// Over the chart and counted towards a step that has not come yet.
+    Absorbed,
+    /// A level was stepped; the status says which.
+    Stepped(String),
+}
+
 /// The pixel deltas of a smooth wheel that make one zoom step.
 pub(crate) const WHEEL_STEP: f32 = 40.;
 
@@ -343,31 +354,45 @@ impl ProjectView {
         format!("Timescale: {}", label(self.day_w()))
     }
 
-    /// Ctrl+wheel over the split area at `x` (px from its left edge): zoom one
-    /// level around the pointer, in for a wheel turned up (`dy` > 0). A notch
-    /// (`notch`, a line delta) steps once; a trackpad's pixel deltas add up in
-    /// `wheel_acc` and step once per [`WHEEL_STEP`] px, so a swipe does not jump
-    /// every level. A change of direction starts the sum afresh. `None` when the
-    /// pointer is not over the chart, so the wheel is not the chart's.
-    pub fn wheel_zoom(&mut self, x: f32, dy: f32, notch: bool) -> Option<String> {
+    /// Ctrl+wheel over the split area at `x` (px from its left edge), `dy` px
+    /// of it (gpui's sign: up is positive): zoom one level around the pointer,
+    /// in for a wheel turned up. Every delta adds into `wheel_acc` and a level
+    /// steps per [`WHEEL_STEP`] px, so a trackpad swipe or a hi-res wheel does
+    /// not jump levels; only a whole-line `notch` steps at once. A change of
+    /// direction starts the sum afresh, and the touch phases `Started` and
+    /// `Ended` clear it. The chart takes every event over it ([`WheelZoom`]).
+    pub fn wheel_zoom(&mut self, x: f32, dy: f32, notch: bool, phase: TouchPhase) -> WheelZoom {
         if dy == 0. || self.pane_at(x) != ProjectPane::Chart {
-            return None;
+            return WheelZoom::NotChart;
+        }
+        if phase == TouchPhase::Started {
+            self.wheel_acc = 0.;
         }
         let dir = if dy > 0. { 1 } else { -1 };
-        if notch {
+        let step = if notch {
             self.wheel_acc = 0.;
+            true
         } else {
             if self.wheel_acc * dy < 0. {
                 self.wheel_acc = 0.;
             }
             self.wheel_acc += dy;
-            if self.wheel_acc.abs() < WHEEL_STEP {
-                return None;
+            let step = self.wheel_acc.abs() >= WHEEL_STEP;
+            if step {
+                self.wheel_acc = 0.;
             }
+            step
+        };
+        let out = if step {
+            let pointer = (x - self.table_w - GANTT_INSET).clamp(0., self.gantt_w);
+            WheelZoom::Stepped(self.zoom_step(dir, pointer))
+        } else {
+            WheelZoom::Absorbed
+        };
+        if phase == TouchPhase::Ended {
             self.wheel_acc = 0.;
         }
-        let pointer = (x - self.table_w - GANTT_INSET).clamp(0., self.gantt_w);
-        Some(self.zoom_step(dir, pointer))
+        out
     }
 
     /// Entire Project: the plan's span fills the chart.
