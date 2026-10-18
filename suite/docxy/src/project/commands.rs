@@ -1295,8 +1295,6 @@ pub(crate) fn project_input(
     None
 }
 
-/// Run a cursor move and, when it handled the key, complete it, revealing the
-/// row only when it changed.
 /// A table selection chord (#1534).
 #[derive(Clone, Copy)]
 enum Chord {
@@ -1305,6 +1303,8 @@ enum Chord {
     Row,
 }
 
+/// Run a cursor move and, when it handled the key, complete it, revealing the
+/// row only when it changed.
 fn navigate(tab: &mut DocTab, step: impl FnOnce(&mut ProjectView) -> bool) {
     let Surface::Project(v) = &mut tab.surface else {
         return;

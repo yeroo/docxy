@@ -68,22 +68,7 @@ impl ProjectView {
     /// and the anchor on the last. With no task the cursor goes to the entry
     /// row.
     pub fn select_all_cells(&mut self) {
-        self.row_header = false;
-        self.row_drag = false;
-        let rows = self.ed.display_rows();
-        match (rows.first().copied(), rows.last().copied()) {
-            (Some(first), Some(last)) => {
-                let last_uid = self.ed.project().tasks[last].uid;
-                self.select_row(first);
-                self.anchor = Some((last_uid, COLUMN_COUNT - 1));
-            }
-            _ => {
-                self.anchor = None;
-                self.enter_entry_row();
-            }
-        }
-        self.col = 0;
-        self.reveal_col();
+        self.select_span(COLUMN_COUNT - 1, 0);
     }
 
     /// Ctrl+Space (and a heading's left press): column `col` over every shown
@@ -91,6 +76,12 @@ impl ProjectView {
     /// task is no range, the cursor cell being the selection.
     pub fn select_column(&mut self, col: usize) {
         let col = col.min(COLUMN_COUNT - 1);
+        self.select_span(col, col);
+    }
+
+    /// Every shown task from the first (the cursor, in `cursor_col`) to the
+    /// last (the anchor, in `anchor_col`); the entry row when none is shown.
+    fn select_span(&mut self, anchor_col: usize, cursor_col: usize) {
         self.row_header = false;
         self.row_drag = false;
         let rows = self.ed.display_rows();
@@ -98,14 +89,14 @@ impl ProjectView {
             (Some(first), Some(last)) => {
                 let last_uid = self.ed.project().tasks[last].uid;
                 self.select_row(first);
-                self.anchor = Some((last_uid, col));
+                self.anchor = Some((last_uid, anchor_col));
             }
             _ => {
                 self.anchor = None;
                 self.enter_entry_row();
             }
         }
-        self.col = col;
+        self.col = cursor_col;
         self.reveal_col();
     }
 

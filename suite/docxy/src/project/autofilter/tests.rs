@@ -320,7 +320,7 @@ fn rows_report_the_live_filter_sort_and_widths() {
     let plain = json(&t);
     assert!(plain.contains(r#""filter":"All Tasks""#), "{plain}");
     assert!(plain.contains(r#""sort":"ID""#), "{plain}");
-    assert!(plain.contains(r#""Name":160"#), "{plain}");
+    assert!(plain.contains(r#""Name":126"#), "{plain}");
     open(&mut t, COL_NAME);
     dialog_click(&mut t, "Sort Z to A").unwrap();
     let Surface::Project(pv) = &mut t.surface else {

@@ -422,50 +422,6 @@
   as a table, edited by `dialog-set` only) are generic; the catalogue check
   skips `plugin` controls. `uiharness/cases/project-plugin-ui.uit` drives
   the fixture through all of it; nothing changes without a UI plugin.
-- The suite's side is `suite/docxy/src/plugin_ui.rs`, asked from the Project
-  code paths only: `project_ribbon()` and `gantt_format_tab()` end with
-  `extend_tab` (a contributed control whose id is a built-in command's
-  replaces that command in place, keeping the control's shape; the rest go
-  into the group of that title or a new group after the tab's own, or
-  before/after the built-in group the manifest's `before`/`after` names,
-  #1574; small
-  buttons stack in columns of three; a gallery's swatches carry their colour
-  in the tile preview as `#RRGGBB` and draw as `Docxy::swatch_gallery`; a
-  combo draws as a drop-down); the row, bar, column and the new chart menu
-  (`project_chart_menu`, `MenuTarget::Chart`, a right-press on the strip
-  beside the bar, `menu-open "chart"`) end with `extend_menu` (replace by
-  id, else after the `after` label, else appended after a separator);
-  `task_info_dialog_for` adds the `task-information` spec's pages (replace
-  by name, else appended); a command's dialog is `catalog::PLUGIN`
-  (`"plugin"`) with `DialogOwner::Plugin { command }`. Every contributed
-  command is `ProjectAct::Plugin(id)` (interned), run by `run_command` in
-  `apply_project_act`: ops and `view` in one `Editor::batch`, the view's
-  switches set, the status and dialog returned. `plugin_ui::dialog_click`
-  runs before the generic dialog path: a plugin dialog's OK sends its command
-  again with `values_of` (every `plugin` control); Task Information with
-  plugin pages applies the built-in fields (`apply_task_info_in`) and the
-  `task-information` command's ops in one step.
-- State (`enabled`, `checked`, `swatch_checked`) comes from `yppx_ui_state`,
-  cached in `ProjectView::plugin_cache` by `Editor::revision`, the cursor and
-  the view flags (never per frame); `act_enabled_now` and
-  `project_act_active` read it. A dialog about to open asks it once more
-  with `dialog`: the reply's `values` prefill the plugin's controls, its
-  `items` replace a dropdown, radio or list control's items for that
-  opening and its `enabled` greys controls (#1556, `plugin_ui::Prefill`). The overlay (`gantt_overlay` in `gantt.rs`,
-  a canvas after the rows, clipped to the chart, scrolled with it) paints
-  `overlay_shapes`, cached by revision, scale, flags, the shown rows and the
-  selection (#1565); `bar_look` draws the
-  bars in the palette the plan's formatting names (`plugin_ui::palette`),
-  and `row_style`/`cell_style`/`category_style` draw the formatting's text
-  styles (`Column Titles` on the headings). The harness reports contributed
-  items with `"plugin": true` in `ribbon-read`, `menu-read` and
-  `dialog-read`, `project-overlay` lists the shapes, and `dialog-set`
-  addresses a grid cell as `name[row].column` (checked against the column's
-  kind). `ControlKind::Multiline` (Enter is a new line; `key_button` leaves
-  Enter alone with one focused) and `Grid` (per-column `column_kinds`, drawn
-  as a table, edited by `dialog-set` only) are generic; the catalogue check
-  skips `plugin` controls. `uiharness/cases/project-plugin-ui.uit` drives
-  the fixture through all of it; nothing changes without a UI plugin.
 
 ## Project table: resizable columns and AutoFilter (#1533)
 
@@ -754,9 +710,10 @@
   and Shift+Space (row, `row_header`) are in `project_input` before the Ctrl
   navigation; Ctrl+Home/End go to the first/last shown task's first/last
   column. Ctrl+Space may be the OS's input-source switch on macOS.
-- Defaults: `DEFAULT_WIDTHS` sum 760 and `DEFAULT_TABLE_SHARE` 0.65 make the
-  whole Entry table visible at the default 1180 px window (a unit test pins
-  it); "Predecessors" and "Resource Names" headings are tight. The table
+- Defaults: `DEFAULT_WIDTHS` sum 818 and `DEFAULT_TABLE_SHARE` 0.70 make the
+  whole Entry table visible at the default 1180 px window, every column
+  holding its heading beside the arrow and its usual cell text (unit tests pin
+  both, the second from per-character estimates). The table
   scrollbar was already always shown. The harness `state` reports
   `selected_columns`, `selected_rows`, `filled_cells` (`"<row>:<column>"`),
   `hot_headings`, `cursor_border` and `table_fits`;

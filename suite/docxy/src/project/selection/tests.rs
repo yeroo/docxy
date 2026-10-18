@@ -139,8 +139,10 @@ fn ctrl_a_in_an_open_cell_still_selects_the_buffer() {
     let mut t = tab();
     project_cell_press(&mut t, 1, COL_NAME, false);
     vm(&mut t).open_cell(None).unwrap();
+    let len = v(&t).cell.as_ref().unwrap().buf.len();
+    assert!(len > 0, "Task 2");
     chord(&mut t, "a", true, false);
-    assert!(v(&t).cell.is_some());
+    assert_eq!(v(&t).cell.as_ref().unwrap().selection(), Some(0..len));
     assert!(v(&t).selection().is_none());
 }
 
@@ -194,4 +196,34 @@ fn the_whole_entry_table_fits_the_default_window_and_a_narrow_one_scrolls() {
     assert!(state.iter().any(|(k, _)| k == "selected_columns"));
     assert!(state.iter().any(|(k, _)| k == "selected_rows"));
     assert!(state.contains(&("table_w".into(), Json::Num(f64::from(p.table_w)))));
+}
+
+/// Each default width holds its heading beside the AutoFilter arrow and edge
+/// (`pl_2` 8 + text + `ARROW_W` + `EDGE_W`) and the usual cell text with its
+/// padding. Text widths are estimated per character at 12 px (6.8 bold
+/// headings, 6.3 cells); the real measure needs a window.
+#[test]
+fn every_default_width_holds_its_heading_and_usual_cell_text() {
+    const HEADING_CHAR: f32 = 6.8;
+    const CELL_CHAR: f32 = 6.3;
+    let cell_samples = [
+        "9999",
+        "Manually Scheduled",
+        "",
+        "999 days",
+        "Mon 10/20/26",
+        "Mon 10/20/26",
+        "99FS+10 days",
+        "",
+    ];
+    for col in 0..COLUMN_COUNT {
+        let heading = 8. + COLUMNS[col].len() as f32 * HEADING_CHAR + ARROW_W + EDGE_W;
+        let cell = cell_samples[col].len() as f32 * CELL_CHAR + 16.;
+        assert!(
+            DEFAULT_WIDTHS[col] >= heading.max(cell),
+            "{}: {} < heading {heading} / cell {cell}",
+            COLUMNS[col],
+            DEFAULT_WIDTHS[col]
+        );
+    }
 }
