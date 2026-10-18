@@ -478,7 +478,9 @@ without one nothing changes.
   state again, with the dialog's `values`, whenever the plan's revision or
   the selection changes and applies its values, items and enabled flags),
   and its `grid` rows select (`values` carry `name.selected_row`) and edit
-  by hand (a `check` column kind is Project's check mark). A change of any
+  by hand (a `check` column kind is Project's check mark; a grid with
+  `commit_command` sends the command on every cell commit with `edit:
+  {control, row, col, value}`, its ops applying at once). A change of any
   plugin control asks the state again with `dialog.values` (#1567) and
   applies the items and enabled flags.
 - **Overlay** (`yppx_ui_overlay`): the rows in view (`uid`, `row_y`, the bar

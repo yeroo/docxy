@@ -516,6 +516,9 @@ pub(crate) struct Control {
     /// The text typed into the grid's active cell so far (#1602): Enter
     /// commits it through the input handler, Escape drops it.
     pub edit: Option<String>,
+    /// A plugin grid whose cell commits send the dialog's command at once
+    /// (#1602): see [`Dialog::committed`].
+    pub commit_command: bool,
 }
 
 impl Control {
@@ -536,6 +539,7 @@ impl Control {
             row: None,
             col: 0,
             edit: None,
+            commit_command: false,
         }
     }
 
@@ -973,6 +977,10 @@ pub(crate) struct Dialog {
     /// The plan revision and selected task a modeless plugin dialog's values
     /// were last asked for (#1602).
     pub seen: Option<(u64, Option<i32>)>,
+    /// A cell of a `commit_command` grid just committed (#1602): the
+    /// control index, row, column and the cell's text now. The host sends
+    /// the dialog's command with it before the next read or frame.
+    pub committed: Option<(usize, usize, usize, String)>,
 }
 
 /// See [`Dialog::react`]. Two dialogs compare equal whatever their
@@ -1056,6 +1064,7 @@ impl Dialog {
             active: true,
             stale: false,
             seen: None,
+            committed: None,
         }
     }
 
@@ -1269,6 +1278,21 @@ impl Dialog {
         if self.controls[i].plugin {
             // The plugin's state is asked again before the next read (#1602).
             self.stale = true;
+        }
+        // A cell of a grid whose commits send the command (#1602).
+        let c = &self.controls[i];
+        if c.kind == ControlKind::Grid
+            && c.commit_command
+            && let (Some(row), Some(col)) = (
+                args.get("row").and_then(Json::as_usize),
+                args.get("column").and_then(|v| match v {
+                    Json::Num(_) => v.as_usize(),
+                    Json::Str(name) => c.columns.iter().position(|h| fold(h) == fold(name)),
+                    _ => None,
+                }),
+            )
+        {
+            self.committed = Some((i, row, col, c.cell(row, col)));
         }
         if let Some(Reaction(react)) = self.react {
             react(self, i, &before);
@@ -2073,6 +2097,7 @@ mod tests_support {
             active: true,
             stale: false,
             seen: None,
+            committed: None,
         }
     }
 }

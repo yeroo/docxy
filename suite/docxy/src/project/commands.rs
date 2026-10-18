@@ -1978,7 +1978,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             // A UI plugin's command (#1532): its ops as one undo step, its
             // status, and the dialog it asks for.
             Plugin(id) => {
-                let outcome = crate::plugin_ui::run_command(v, id, None, None)?;
+                let outcome = crate::plugin_ui::run_command(v, id, None, None, None)?;
                 status = outcome.status;
                 dialog = outcome.dialog;
             }

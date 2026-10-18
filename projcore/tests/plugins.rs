@@ -296,6 +296,7 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         view: Json::Obj(Vec::new()),
         values,
         button: None,
+        edit: None,
     };
     // The sheet command: without a button it opens the dialog; Apply
     // reports the picks and the selected row and stays open; Clear closes
@@ -337,6 +338,24 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         .unwrap();
     assert!(cleared.close);
     assert_eq!(cleared.status.as_deref(), Some("Fixture: cleared"));
+    // A committed Name cell renames the row's task at once (#1602).
+    let typed = ui
+        .command(&Command {
+            edit: Some(Json::obj(vec![
+                ("control", Json::str("fixture.rows")),
+                ("row", Json::Num(0.0)),
+                ("col", Json::Num(1.0)),
+                ("value", Json::str("Z")),
+            ])),
+            ..cmd("fixture.sheet", vec![], Some(Json::Obj(Vec::new())))
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(typed.ops.len(), 1);
+    assert_eq!(typed.ops[0].verb, "task.set");
+    assert_eq!(typed.ops[0].args.text("name"), "Z");
+    assert_eq!(typed.status.as_deref(), Some("Fixture: renamed row 0"));
+    assert!(!typed.close);
     let flipped = ui
         .command(&cmd("fixture.flag", vec![], None))
         .unwrap()

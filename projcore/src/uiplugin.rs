@@ -447,6 +447,12 @@ pub struct DialogControl {
     pub columns: Vec<GridColumn>,
     /// The value the control opens on when `yppx_ui_state` gives none.
     pub value: Json,
+    /// A grid whose cell commits (a typed cell's Enter, a toggled check
+    /// cell, a `dialog-set` of a cell) send the dialog's command at once
+    /// with `edit: {control, row, col, value}` beside the values, the
+    /// dialog staying open (#1602): Project applies a typed Units cell
+    /// without a button press.
+    pub commit_command: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -605,6 +611,7 @@ impl Manifest {
                                     })
                                     .collect(),
                                 value: c.get("value").cloned().unwrap_or(Json::Null),
+                                commit_command: c.flag("commit_command"),
                             })
                             .collect(),
                     })
@@ -830,6 +837,10 @@ impl Manifest {
                                                                 ),
                                                             ),
                                                             ("value", c.value.clone()),
+                                                            (
+                                                                "commit_command",
+                                                                Json::Bool(c.commit_command),
+                                                            ),
                                                         ])
                                                     })
                                                     .collect(),
@@ -1173,6 +1184,9 @@ pub struct Command {
     pub view: Json,
     pub values: Option<Json>,
     pub button: Option<String>,
+    /// The grid cell just committed, `{control, row, col, value}`, when a
+    /// grid with `commit_command` sent the command (#1602).
+    pub edit: Option<Json>,
 }
 
 impl Command {
@@ -1193,6 +1207,7 @@ impl Command {
             view: v.get("view").cloned().unwrap_or(Json::Obj(Vec::new())),
             values: v.get("values").filter(|w| !w.is_null()).cloned(),
             button: v.get_str("button").map(str::to_string),
+            edit: v.get("edit").filter(|w| !w.is_null()).cloned(),
         })
     }
 
@@ -1208,6 +1223,9 @@ impl Command {
         }
         if let Some(button) = &self.button {
             pairs.push(("button", Json::str(button.clone())));
+        }
+        if let Some(edit) = &self.edit {
+            pairs.push(("edit", edit.clone()));
         }
         Json::obj(pairs).to_string()
     }
@@ -1903,7 +1921,7 @@ mod tests {
          {"name":"fx.note","label":"&Note:","kind":"multiline","value":""},
          {"name":"fx.grid","label":"Items","kind":"grid","columns":[{"name":"Name","kind":"text"},{"name":"Done","kind":"checkbox"}],"value":[["a","false"]]}]}]},
          {"id":"fx.options","title":"Fixture Options","pages":[{"name":"General","controls":[{"name":"n","label":"N:","kind":"number"}]}],"buttons":["OK","Cancel","Help"]},
-         {"id":"fx.sheet","title":"Fixture Sheet","modeless":true,"pages":[{"name":"Sheet","controls":[{"name":"g","label":"","kind":"grid","columns":[{"name":"Pick","kind":"check"},{"name":"Name","kind":"text"}]}]}],
+         {"id":"fx.sheet","title":"Fixture Sheet","modeless":true,"pages":[{"name":"Sheet","controls":[{"name":"g","label":"","kind":"grid","commit_command":true,"columns":[{"name":"Pick","kind":"check"},{"name":"Name","kind":"text"}]}]}],
           "buttons":[{"id":"apply","label":"&Apply","default":true},{"id":"clear","label":"Clear"},{"id":"close","label":"Close","cancel":true}]}],
       "palettes":[{"id":"fx.blue","label":"Blue","bars":[{"kind":"on-track","color":"#3366CC","shape":"bar"},{"kind":"critical","color":"#CC3333"}]}],
       "text_style_categories":["Late Tasks"],
@@ -1955,6 +1973,12 @@ mod tests {
             view: Json::Obj(Vec::new()),
             values: Some(Json::obj(vec![("n", Json::Num(2.0))])),
             button: Some("apply".into()),
+            edit: Some(Json::obj(vec![
+                ("control", Json::str("g")),
+                ("row", Json::Num(0.0)),
+                ("col", Json::Num(1.0)),
+                ("value", Json::str("Z")),
+            ])),
         };
         assert_eq!(Command::parse(&cmd.json()).unwrap(), cmd);
         assert_eq!(
@@ -2156,6 +2180,8 @@ mod tests {
             ]
         );
         assert_eq!(sheet.pages[0].controls[0].columns[0].kind, "check");
+        assert!(sheet.pages[0].controls[0].commit_command);
+        assert!(!m.dialog("fx.options").unwrap().pages[0].controls[0].commit_command);
         assert_eq!(m.palettes[0].bars[0].color, 0x3366CC);
         assert_eq!(m.palettes[0].bars[1].shape, "");
         assert_eq!(m.text_style_categories, ["Late Tasks"]);
@@ -2224,6 +2250,7 @@ mod tests {
             view: Json::Obj(Vec::new()),
             values: Some(Json::obj(vec![("n", Json::Num(2.0))])),
             button: None,
+            edit: None,
         };
         let j = Json::parse(&cmd.json()).unwrap();
         assert_eq!(j.text("id"), "fx.rename");

@@ -117,6 +117,7 @@ fn form() -> Dialog {
         active: true,
         stale: false,
         seen: None,
+        committed: None,
     };
     d.controls = d.controls.into_iter().map(general).collect();
     preds.page = Some(1);
@@ -984,8 +985,12 @@ fn a_grid_selects_rows_and_edits_cells_by_key_and_click() {
     assert!(d.grid_key("s", Some("S")).unwrap());
     assert!(d.grid_key("s", Some("S")).unwrap());
     assert_eq!(d.controls[i].edit.as_deref(), Some("SS"));
+    // A grid whose commits send the command records the cell (#1602).
+    d.controls[i].commit_command = true;
     assert!(d.grid_key("enter", None).unwrap());
     assert_eq!(d.controls[i].edit, None);
+    assert_eq!(d.committed.take(), Some((i, 0, 1, "SS".to_string())));
+    d.controls[i].commit_command = false;
     assert_eq!(
         d.value("predecessors"),
         Some(&Value::Rows(vec![vec!["1".into(), "SS".into()]]))

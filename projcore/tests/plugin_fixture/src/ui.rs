@@ -47,7 +47,7 @@ const MANIFEST: &str = r##"{
     {"id":"fixture.options","title":"Fixture Options","pages":[{"name":"General","controls":[
       {"name":"n","label":"&Number:","kind":"number","value":"1"}]}],"buttons":["OK","Cancel"]},
     {"id":"fixture.sheet","title":"Fixture Sheet","modeless":true,"pages":[{"name":"Sheet","controls":[
-      {"name":"fixture.rows","label":"Tasks","kind":"grid","columns":[{"name":"Pick","kind":"check"},{"name":"Name","kind":"text"},{"name":"Units","kind":"number"}],"value":[]}]}],
+      {"name":"fixture.rows","label":"Tasks","kind":"grid","commit_command":true,"columns":[{"name":"Pick","kind":"check"},{"name":"Name","kind":"text"},{"name":"Units","kind":"number"}],"value":[]}]}],
      "buttons":[{"id":"apply","label":"&Apply","default":true},{"id":"clear","label":"Clear"},{"id":"close","label":"Close","cancel":true}]}],
   "palettes":[
     {"id":"fixture.blue","label":"Blue","bars":[{"kind":"on-track","color":"#3366CC","shape":"bar"},{"kind":"critical","color":"#1F3763","shape":"bar"}]},
@@ -137,26 +137,32 @@ unsafe fn request(input: *const u8, len: usize) -> Result<Json, i32> {
     Json::parse(text).map_err(|e| fail(crate::MALFORMED_INPUT, &format!("bad request JSON: {e}")))
 }
 
-/// The plan's task names, in order, read off the MSPDI text (the fixture
-/// parses no plan): each `<Task>`'s first `<Name>`.
-fn task_names(req: &Json) -> Vec<String> {
+/// Each `<Task>`'s first `<tag>` text, in order, read off the MSPDI text
+/// (the fixture parses no plan).
+fn task_field(req: &Json, tag: &str) -> Vec<String> {
     let plan = req.get("plan").and_then(Json::str).unwrap_or_default();
-    let mut names = Vec::new();
+    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+    let mut out = Vec::new();
     let mut rest = plan;
     while let Some(at) = rest.find("<Task>") {
         rest = &rest[at + 6..];
         let end = rest.find("</Task>").unwrap_or(rest.len());
         let task = &rest[..end];
-        if let Some(n) = task.find("<Name>") {
-            let after = &task[n + 6..];
-            let close = after.find("</Name>").unwrap_or(after.len());
-            names.push(after[..close].to_string());
-        } else {
-            names.push(String::new());
-        }
+        out.push(match task.find(&open) {
+            Some(n) => {
+                let after = &task[n + open.len()..];
+                after[..after.find(&close).unwrap_or(after.len())].to_string()
+            }
+            None => String::new(),
+        });
         rest = &rest[end..];
     }
-    names
+    out
+}
+
+/// The plan's task names, in order.
+fn task_names(req: &Json) -> Vec<String> {
+    task_field(req, "Name")
 }
 
 /// The Fixture Sheet dialog's rows (#1602): one per task, `Pick` kept from
@@ -314,6 +320,29 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
         // The Fixture Sheet (#1602): the button pressed sends the command
         // with its id; Apply reports and stays open, Clear closes.
         "fixture.sheet" => match req.get("button").and_then(Json::str) {
+            // A committed cell (#1602): a Name cell renames its task at once.
+            None if req.get("edit").is_some() => {
+                let edit = req.get("edit").unwrap();
+                let row = edit.get("row").and_then(Json::num).unwrap_or(0.0) as usize;
+                let col = edit.get("col").and_then(Json::num).unwrap_or(0.0) as usize;
+                let value = edit.get("value").and_then(Json::str).unwrap_or_default();
+                let uid = task_field(&req, "UID")
+                    .get(row)
+                    .cloned()
+                    .unwrap_or_default();
+                if col == 1 && !uid.is_empty() {
+                    format!(
+                        r#"{{"ops":[{{"verb":"task.set","args":{{"uid":{uid},"name":{}}}}}],"status":{}}}"#,
+                        quote(value),
+                        quote(&format!("Fixture: renamed row {row}"))
+                    )
+                } else {
+                    format!(
+                        r#"{{"ops":[],"status":{}}}"#,
+                        quote(&format!("Fixture: edited row {row} col {col} to {value}"))
+                    )
+                }
+            }
             None => r#"{"ops":[],"dialog":"fixture.sheet","status":"Fixture: sheet"}"#.to_string(),
             Some("apply") => {
                 let values = req.get("values");

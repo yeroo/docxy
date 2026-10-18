@@ -1287,7 +1287,10 @@ a message box's message (null otherwise), and `tab` is the current tab's label
 takes either). A `modeless` dialog (#1602) has no backdrop: the document under
 it takes verbs, keys (while the dialog is not `active`: a press in the table
 takes the keyboard, a press in the dialog or any dialog verb gives it back)
-and mutating control verbs, which keep it open. A grid control also reports
+and mutating control verbs, which keep it open. A plugin grid declared with
+`commit_command` sends its dialog's command on every cell commit (Enter on a
+typed cell, Space or a click on a check cell, `dialog-set` of a cell), whose
+ops apply at once. A grid control also reports
 `selected_row`, `column` (the active cell's) and `editing` (the text typed
 into the cell so far, null otherwise); its `column_kinds` may say `check`, a
 column drawn as Project's check mark that a click or Space toggles.

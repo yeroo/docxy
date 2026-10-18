@@ -511,12 +511,14 @@ pub(crate) struct Outcome {
 /// owns the id answers; its ops and its `view` (the plan's formatting) are
 /// one undo step, its view switches set the view, and its dialog is built
 /// with the plugin's prefill. `values` are a dialog's on its OK, `button`
-/// the id of one of the dialog's own buttons when one sent them (#1602).
+/// the id of one of the dialog's own buttons when one sent them, `edit` the
+/// grid cell just committed when a `commit_command` grid did (#1602).
 pub(crate) fn run_command(
     v: &mut ProjectView,
     id: &str,
     values: Option<Json>,
     button: Option<&str>,
+    edit: Option<Json>,
 ) -> Result<Outcome, String> {
     let command = Command {
         id: id.to_string(),
@@ -525,6 +527,7 @@ pub(crate) fn run_command(
         view: view_json(v),
         values,
         button: button.map(str::to_string),
+        edit,
     };
     let mut answer = None;
     for plugin in plugins() {
@@ -778,6 +781,7 @@ fn control_of_spec(
     }
     out.columns = c.columns.iter().map(|col| col.name.clone()).collect();
     out.column_kinds = c.columns.iter().map(|col| kind_of(&col.kind)).collect();
+    out.commit_command = c.commit_command;
     out.page = page;
     out.plugin = true;
     out
@@ -872,11 +876,46 @@ fn open_dialog(v: &ProjectView, spec_id: &str, command: &str) -> Result<Dialog, 
 /// reply is written, so a read sees the state the plugin would show.
 pub(crate) fn refresh_dialog(tab: &mut DocTab) {
     let DocTab {
-        dialogs, surface, ..
+        dialogs,
+        surface,
+        status,
+        ..
     } = tab;
     let Surface::Project(v) = surface else {
         return;
     };
+    // A committed cell of a `commit_command` grid sends the command first
+    // (#1602): its ops apply at once, the dialog stays unless the reply
+    // closes it.
+    let committed = dialogs.top_dialog_mut().ok().and_then(|d| {
+        let (i, row, col, value) = d.committed.take()?;
+        let DialogOwner::Plugin { command, .. } = d.owner else {
+            return None;
+        };
+        let edit = Json::obj(vec![
+            ("control", Json::str(d.controls[i].name)),
+            ("row", Json::Num(row as f64)),
+            ("col", Json::Num(col as f64)),
+            ("value", Json::str(value)),
+        ]);
+        Some((command, values_of(d), edit))
+    });
+    if let Some((command, values, edit)) = committed {
+        match run_command(v, command, Some(values), None, Some(edit)) {
+            Ok(outcome) => {
+                if let Some(s) = outcome.status {
+                    *status = s.into();
+                }
+                if outcome.close {
+                    dialogs.pop();
+                }
+                if let Some(dialog) = outcome.dialog {
+                    dialogs.push(dialog);
+                }
+            }
+            Err(e) => *status = e.into(),
+        }
+    }
     let Ok(d) = dialogs.top_dialog_mut() else {
         return;
     };
@@ -1008,7 +1047,7 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Option<Result<(), 
     let done = dialogs.click(button, |d| {
         let values = values_of(d);
         let result = match (command, d.owner) {
-            (Some(command), _) => run_command(v, command, Some(values), own.as_deref())?,
+            (Some(command), _) => run_command(v, command, Some(values), own.as_deref(), None)?,
             (None, DialogOwner::TaskInfo { uid }) => {
                 // The built-in fields and the plugins' ops as one step:
                 // the command first (it reads the plan as it is), then both.
@@ -1063,6 +1102,7 @@ fn task_info_ops(
         view: view_json(v),
         values: Some(values),
         button: None,
+        edit: None,
     };
     for plugin in plugins() {
         if let Some(result) = plugin.command(&command)? {

@@ -422,7 +422,9 @@
   as a table; a click, Up/Down or `dialog-select` picks a row (`Control::row`),
   Left/Right the active column, typing edits the cell (`Control::edit`, Enter
   commits through the input handler, Escape drops it), Space toggles a
-  `Check` cell) are generic; the catalogue check skips `plugin` controls.
+  `Check` cell; a `commit_command` grid's commit sends the command with
+  `edit` through `Dialog::committed`) are generic; the catalogue check skips
+  `plugin` controls.
   A plugin dialog may declare its own buttons (`Button::id`; a press sends
   the command with `button`, the dialog stays open unless the reply's
   `close`), be `modeless` (no backdrop, `Dialog::active` decides who has

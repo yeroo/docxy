@@ -267,6 +267,7 @@ impl Formats {
             )]),
             values,
             button: None,
+            edit: None,
         };
         for plugin in &self.ui {
             let Some(result) = plugin.command(&command)? else {

@@ -334,6 +334,21 @@ test a modeless dialog with a grid and buttons of its own follows the plan and r
   assert reply.controls.0.rows.1.0 is false
   assert reply.buttons.1.enabled is false
   call real-key {"key":"space"}
+  # The grid commits through the command (commit_command): a Name cell typed
+  # and entered renames the task at once, no button pressed, and the rows
+  # follow the plan.
+  call dialog-select {"control":"fixture.rows","row":0}
+  call real-key {"key":"right"}
+  call real-type {"text":"Z"}
+  call real-key {"key":"enter"}
+  assert dialog is plugin
+  assert status is Fixture: renamed row 0
+  call task.get {"uid":1}
+  assert reply.name is Z
+  call dialog-read {}
+  assert reply.controls.0.rows.0.1 is Z
+  assert reply.controls.0.rows.1.0 is true
+  call dialog-select {"control":"fixture.rows","row":1}
   # Apply: the command gets the button and the values; the dialog stays.
   call dialog-click {"button":"apply"}
   assert dialog is plugin
