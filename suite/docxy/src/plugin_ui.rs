@@ -460,10 +460,6 @@ impl Prefill {
     }
 }
 
-fn prefill(v: &ProjectView, dialog: &str, uid: Option<i32>) -> Prefill {
-    prefill_with(v, dialog, uid, None)
-}
-
 /// [`prefill`] for an open dialog asked again (#1602): `values` are the
 /// dialog's current values, sent as `dialog.values`.
 fn prefill_with(v: &ProjectView, dialog: &str, uid: Option<i32>, values: Option<Json>) -> Prefill {
