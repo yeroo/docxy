@@ -49,7 +49,9 @@ mod outline;
 mod plan;
 mod props;
 pub use display::{Sort, ValueItem};
+mod calendars;
 mod resources;
+pub use calendars::{DayPatch, DaySource, WEEKDAYS, clock, parse_clock, weekday_index};
 use outline::subtree_end;
 pub use props::{
     EV_PERCENT_COMPLETE, EV_PHYSICAL_PERCENT_COMPLETE, PRIORITY_DEFAULT, PRIORITY_MAX,

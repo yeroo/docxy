@@ -33,6 +33,9 @@
 //! | `assign.del` | `{uid}` | `{deleted, task}` |
 //! | `level.all` / `level.clear` | `{}` | `{leveled, overallocated}`: show the plan leveled or as scheduled (the display overlay, not an undo step, #1589); see `projctl` |
 //! | `level.overallocations` | `{}` | `{count, resources:[{uid, name, max_units, peak_units, first}]}`: the work resources booked past their capacity as shown (#1589) |
+//! | `cal.list` / `cal.get` / `cal.day` | `{}` / `{calendar}` / `{calendar, date}` | the plan's calendars, one with its week, exceptions and work weeks, a day's working times and their source (#1605); see `projctl` |
+//! | `cal.add` / `cal.set` / `cal.del` | `{name, base?, copy?}` / `{calendar, name?, base?, week?}` / `{calendar}` | a calendar added, changed or deleted, one undo step (#1605) |
+//! | `cal.exception.set` / `cal.exception.del` / `cal.workweek.set` / `cal.workweek.del` | `{calendar, index?, name?, from, to, working?, times?}` / `{calendar, index}` / `{calendar, index?, name?, from, to, week}` / `{calendar, index}` | an exception or work week added, changed or removed, one undo step (#1605) |
 //! | `resource.list` | `{}` | `{count, resources:[{uid, id, name, type, initials, group, code, email, material_label, max_units, standard_rate, overtime_rate, cost_per_use, accrue_at, base_calendar, notes, assignments}]}` (#1588); see `projctl` |
 //! | `resource.get` | `{uid}` | one resource |
 //! | `resource.add` | `{name, type?, …the resource fields}` | the new resource, one undo step (#1588) |

@@ -45,7 +45,9 @@ Supported verbs are `proj.path`, `proj.get`, `proj.set`, `task.list`, `task.get`
 `task.add`, `task.del`, `link.add`, `link.del`, `find`, `assign.list`,
 `assign.get`, `assign.fields`, `assign.add`, `assign.set`, `assign.del`,
 `resource.list`, `resource.get`, `resource.add`, `resource.set`, `resource.del`,
-`level.all`, `level.clear`, `level.overallocations`,
+`level.all`, `level.clear`, `level.overallocations`, `cal.list`, `cal.get`,
+`cal.day`, `cal.add`, `cal.set`, `cal.exception.set`, `cal.exception.del`,
+`cal.workweek.set`, `cal.workweek.del`, `cal.del`,
 `proj.save`, `proj.reload`, `proj.open` and `proj.new`, with the yppxy
 argument/result shapes, plus `app-info` (the build: version, commit, last merged PR, kind, `manual`; #1023). `proj.path` additionally
 reports `tab`, `imported`, `default_save_ext` (the type Save As proposes, see
@@ -294,6 +296,60 @@ each with `uid, name, max_units, peak_units` (1.0 = 100%) and `first`, the
 first overallocated instant, where Project's Next Overallocation goes.
 `level.selection`, `level.resource` and `level.options` are refused by name:
 the model levels the whole plan (#1594 is the leveler work).
+
+Calendars are addressed by `calendar`, a uid or a name (ASCII case ignored; a
+name wins when a calendar is named like a number, a JSON number is always a
+uid) (#1605). `cal.list {}` lists them, base calendars first: `uid, name, base`
+(`{uid, name}` of the calendar a derived one inherits from, `null` for a base
+calendar), `default` (the project calendar), `resources` and `tasks` (the uids
+of what uses it). `cal.get {calendar}` reads one: its resolved `week` (seven
+days from `Sun`, each `day, working, times` as `[["08:00","12:00"], …]` and
+`stated`, whether the calendar states that day itself), its `exceptions`
+(`index, name, from, to` as `YYYY-MM-DD`, `working, times`, and `recurring`
+for a repeating pattern the model keeps but does not schedule) and its
+`work_weeks` (`index, name, from, to, week`: the days the work week states,
+`stated: true`, the rest shown from the calendar's default week chain; what a
+date in the week works, a base's covering work week included, is `cal.day`'s
+answer). `cal.day {calendar, date}` says what the calendar works on a date
+and where that comes from, as Change Working Time's "Working times for" and
+"Based on" do: `{date, working, times, based_on: {kind, calendar, name}}` with
+`kind` `exception`, `work_week` or `default`.
+
+```json
+{"verb": "cal.add", "args": {"name": "Night Shift", "base": "Standard"}}
+{"verb": "cal.set", "args": {"calendar": "Night Shift", "week": {"Fri": {"working": false}, "Sat": {"times": [["09:00","13:00"]]}}}}
+{"verb": "cal.exception.set", "args": {"calendar": "Standard", "name": "Founders' Day", "from": "2026-03-03", "to": "2026-03-03"}}
+{"verb": "cal.workweek.set", "args": {"calendar": "Standard", "name": "Crunch", "from": "2026-03-09", "to": "2026-03-13", "week": {"Sat": {"times": [["08:00","12:00"]]}}}}
+{"verb": "cal.del", "args": {"calendar": "Night Shift"}}
+```
+
+`cal.add {name, base?, copy?}` adds a calendar: derived from `base` (it states
+no day of its own until `cal.set` does), else a base calendar with Project's
+standard week, or a copy of the base calendar `copy` (its week, exceptions
+and work weeks; a derived calendar is refused, as Project's Create New Base
+Calendar offers base calendars only); names are
+unique ignoring ASCII case. `cal.set {calendar, name?, base?, week?}` renames,
+rebases a derived calendar (never a base one, never onto itself) and sets days
+of the default week: `week` is an object of weekdays (`Mon`, `monday`, …) to
+`{working?, times?}` (`times` the day's working times, in order and not
+overlapping; `working: false` a non-working day; `working: true` without times
+Project's standard day; `null` on a derived calendar's day inherits the base
+again). `cal.exception.set {calendar, index?, name?, from, to, working?,
+times?}` adds (no `index`) or replaces (by `index`) a date-range exception as
+Project writes one (non-working unless given times); a replace sets the dates
+and the day and keeps the name unless `name` is given (`""` clears it); a repeating exception
+(`recurring: true`) is read only: neither replaced nor removed. `cal.exception.del
+{calendar, index}` removes a date-range exception; `cal.workweek.set {calendar,
+index?, name?, from, to, week}` (`week` required: the days the work week
+states, `{}` for none, since a replace drops the days not given) and
+`cal.workweek.del {calendar, index}` do the same for work
+weeks. `cal.del {calendar}` removes a calendar nothing uses: not the project
+calendar, no task's or resource's, no other calendar's base. Each edit is one
+undo step, a value the calendar already has records none, every argument is
+checked first (a day that is not `{working?, times?}` or `null` is refused,
+never read as a non-working day), and an edit that would leave a calendar a
+task schedules on without working time is refused, as is `task.set` or
+`proj.set` adopting a calendar that has none.
 
 File handling differs from the TUI:
 

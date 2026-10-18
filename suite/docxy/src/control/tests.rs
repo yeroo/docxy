@@ -319,6 +319,12 @@ fn reads_and_rejected_edits_preserve_prompt_selection_history_and_scroll() {
         ("resource.list", Json::Null),
         ("resource.get", args(r#"{"uid":1}"#)),
         ("level.overallocations", Json::Null),
+        ("cal.list", Json::Null),
+        ("cal.get", args(r#"{"calendar":"Standard"}"#)),
+        (
+            "cal.day",
+            args(r#"{"calendar":"Standard","date":"2026-03-02"}"#),
+        ),
     ] {
         let (_, effect) = call(&mut tabs, 0, verb, a).unwrap();
         assert_eq!(effect, Effect::default());
@@ -337,6 +343,9 @@ fn reads_and_rejected_edits_preserve_prompt_selection_history_and_scroll() {
         ("resource.add", args(r#"{"name":"Ann"}"#)),
         ("resource.set", args(r#"{"uid":999,"name":"X"}"#)),
         ("resource.del", args(r#"{"uid":999}"#)),
+        ("cal.add", args(r#"{"name":"Standard"}"#)),
+        ("cal.set", args(r#"{"calendar":"Moon","name":"X"}"#)),
+        ("cal.del", args(r#"{"calendar":"Standard"}"#)),
     ] {
         assert!(call(&mut tabs, 0, verb, a).is_err());
         assert_eq!(snapshot(&tabs[0]), before);
@@ -411,6 +420,18 @@ fn each_agent_edit_is_undoable_and_changes_only_its_inactive_target() {
         ),
         ("resource.set", r#"{"tab":1,"uid":1,"group":"Crew"}"#),
         ("resource.del", r#"{"tab":1,"uid":1}"#),
+        (
+            "cal.add",
+            r#"{"tab":1,"name":"Night Shift","base":"Standard"}"#,
+        ),
+        (
+            "cal.set",
+            r#"{"tab":1,"calendar":"Standard","name":"Office"}"#,
+        ),
+        (
+            "cal.exception.set",
+            r#"{"tab":1,"calendar":"Standard","from":"2026-03-03","to":"2026-03-03"}"#,
+        ),
     ] {
         let mut tabs = vec![tab(), tab()];
         if verb == "link.del" {

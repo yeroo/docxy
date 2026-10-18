@@ -72,8 +72,15 @@ impl Editor {
         if self.proj.default_calendar_uid == uid {
             return Ok(false);
         }
-        self.snapshot();
-        self.proj.default_calendar_uid = uid;
+        // A calendar without working time cannot be the plan's (#1605).
+        let mut next = self.proj.clone();
+        next.default_calendar_uid = uid;
+        if let Some(error) = crate::schedule::calendar_error(&next) {
+            return Err(error);
+        }
+        self.capture_view();
+        let prev = std::mem::replace(&mut self.proj, next);
+        self.push_undo(prev);
         self.changed();
         Ok(true)
     }
