@@ -201,13 +201,7 @@ pub(crate) fn task_info_dialog(
         ),
         check("hidebar", "&Hide Bar", task.hide_bar.unwrap_or(false), 0),
         check("rollup", "Roll&up", task.rollup.unwrap_or(false), 0),
-        field(
-            "predecessors",
-            "&Predecessors:",
-            ControlKind::Text,
-            text(COL_PREDECESSORS),
-            1,
-        ),
+        preds::grid(proj, task),
         field(
             "resources",
             "&Resource names:",
@@ -310,6 +304,7 @@ pub(crate) fn task_info_dialog_for(
 fn react(d: &mut Dialog, i: usize, _before: &Value) {
     match d.controls[i].name {
         "ctype" => {}
+        "predecessors" => return preds::follow(d, i, _before),
         // Estimated is the duration's `?`: ticking it adds the mark, clearing
         // it removes it, and typing the mark (or not) follows in the box.
         "estimated" => return follow_estimated(d, i),
@@ -475,7 +470,6 @@ pub(crate) fn apply_task_info_in(
         for (name, col) in [
             ("name", COL_NAME),
             ("duration", COL_DURATION),
-            ("predecessors", COL_PREDECESSORS),
             ("resources", COL_RESOURCES),
             ("start", COL_START),
             ("finish", COL_FINISH),
@@ -483,6 +477,13 @@ pub(crate) fn apply_task_info_in(
             if changed(name) {
                 apply_cell(ed, uid, col, &text_of(d, name))?;
             }
+        }
+        if changed("predecessors") {
+            let Some(Value::Rows(rows)) = d.value("predecessors") else {
+                return Err("The Predecessors grid has no rows".into());
+            };
+            let links = preds::parse(ed, uid, rows)?;
+            ed.set_predecessors(uid, links)?;
         }
         if changed("percent") {
             ed.set_percent_complete(uid, whole(d, "percent", "% Complete", 0, 100)?)?;
@@ -538,6 +539,8 @@ pub(crate) fn help_click(tab: &mut DocTab, button: &str) -> Option<Result<(), St
     tab.status = crate::help_tab::DOCS_COMING.into();
     Some(Ok(()))
 }
+
+mod preds;
 
 #[cfg(test)]
 mod tests;

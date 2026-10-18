@@ -54,6 +54,41 @@ fn set(t: &mut DocTab, name: &str, value: Json) {
         .unwrap();
 }
 
+/// Set a grid cell (`name[row].column`) on the grid's page.
+fn cell(t: &mut DocTab, address: &str, value: &str) {
+    let name = address.split('[').next().unwrap();
+    let page = t
+        .dialogs
+        .top()
+        .unwrap()
+        .controls
+        .iter()
+        .find(|c| c.name == name)
+        .and_then(|c| c.page)
+        .unwrap();
+    t.dialogs.select_tab(TABS[page]).unwrap();
+    t.dialogs
+        .set(
+            address,
+            &Json::obj(vec![("value", Json::Str(value.into()))]),
+        )
+        .unwrap();
+}
+
+fn rows_of<const N: usize>(rows: &[[&str; N]]) -> Vec<Vec<String>> {
+    rows.iter()
+        .map(|r| r.iter().map(|c| c.to_string()).collect())
+        .collect()
+}
+
+/// A grid's rows, as strings.
+fn grid(t: &DocTab, name: &str) -> Vec<Vec<String>> {
+    match t.dialogs.top().unwrap().value(name) {
+        Some(crate::dialog::Value::Rows(rows)) => rows.clone(),
+        other => panic!("{name} is not a grid: {other:?}"),
+    }
+}
+
 fn put(t: &mut DocTab, name: &str, value: &str) {
     set(t, name, Json::Str(value.into()));
 }
@@ -137,14 +172,19 @@ fn the_pages_open_prefilled_in_the_grid_cells_grammar() {
         ("duration", COL_DURATION),
         ("start", COL_START),
         ("finish", COL_FINISH),
-        ("predecessors", COL_PREDECESSORS),
         ("resources", COL_RESOURCES),
     ] {
         assert_eq!(read(&t, name), cell_edit_text(ed, task, col), "{name}");
     }
     assert_eq!(read(&t, "name"), "Second");
     assert_eq!(read(&t, "duration"), "2d");
-    assert_eq!(read(&t, "predecessors"), "1FS+1d");
+    assert_eq!(
+        grid(&t, "predecessors"),
+        rows_of(&[
+            ["1", "First", "Finish-to-Start (FS)", "1d"],
+            ["", "", "", ""]
+        ])
+    );
     assert_eq!(read(&t, "resources"), "Ann, Bo");
     assert_eq!(read(&t, "percent"), "30");
     assert_eq!(read(&t, "priority"), "800");
@@ -185,7 +225,7 @@ fn ok_writes_every_changed_field_as_one_undo_step() {
     put(&mut t, "duration", "3d");
     put(&mut t, "percent", "40");
     put(&mut t, "priority", "700");
-    put(&mut t, "predecessors", "1");
+    cell(&mut t, "predecessors[0].id", "1");
     put(&mut t, "resources", "Ann");
     put(&mut t, "ctype", "Finish No Later Than");
     put(&mut t, "cdate", "2026-04-01");
@@ -239,7 +279,6 @@ fn a_refused_field_keeps_the_dialog_open_and_applies_nothing() {
         ("percent", "101"),
         ("priority", "1001"),
         ("start", "tomorrow"),
-        ("predecessors", "99"),
         ("deadline", "soon"),
     ] {
         let mut t = tab();
@@ -732,4 +771,196 @@ fn help_says_what_f1_says_and_leaves_the_dialog_open() {
     assert_eq!(t.dialogs.top_id(), "task-information");
     assert_eq!(t.status.to_string(), crate::help_tab::DOCS_COMING);
     assert_eq!(state(&t), before, "Help writes nothing");
+}
+
+/// Tasks First, Second (selected, uid 2) and Third.
+fn tab3() -> DocTab {
+    let mut t = tab();
+    vm(&mut t).ed.add_task(None, "Third", 480, false).unwrap();
+    let p = v(&t).ed.project().clone();
+    t.surface = Surface::Project(ProjectView::new(p, false));
+    vm(&mut t).ed.select(1);
+    t
+}
+
+fn preds(t: &DocTab, uid: i32) -> Vec<(i32, projcore::LinkType, i64)> {
+    v(t).ed
+        .project()
+        .task(uid)
+        .unwrap()
+        .predecessors
+        .iter()
+        .map(|p| (p.uid, p.link, p.lag))
+        .collect()
+}
+
+#[test]
+fn the_predecessors_page_is_a_grid_of_the_links_and_a_blank_row() {
+    let mut t = tab3();
+    open(&mut t, ProjectAct::Constraint);
+    let d = t.dialogs.top().unwrap();
+    let c = d
+        .controls
+        .iter()
+        .find(|c| c.name == "predecessors")
+        .unwrap();
+    assert_eq!(c.kind, ControlKind::Grid);
+    assert!(c.editable_grid);
+    assert_eq!(c.columns, ["ID", "Task Name", "Type", "Lag"]);
+    assert_eq!(
+        c.column_kinds,
+        [
+            ControlKind::Text,
+            ControlKind::Combo,
+            ControlKind::Dropdown,
+            ControlKind::Text
+        ]
+    );
+    // Every other task, by name; the edited one is not offered.
+    assert_eq!(c.column_items[1], ["First", "Third"]);
+    assert_eq!(c.column_items[0], ["1", "3"]);
+    assert_eq!(
+        c.column_items[2],
+        [
+            "Finish-to-Start (FS)",
+            "Start-to-Start (SS)",
+            "Finish-to-Finish (FF)",
+            "Start-to-Finish (SF)"
+        ]
+    );
+    assert_eq!(grid(&t, "predecessors"), rows_of(&[["", "", "", ""]]));
+}
+
+#[test]
+fn a_row_added_edited_and_deleted_is_applied_as_one_undo_step() {
+    let mut t = tab3();
+    open(&mut t, ProjectAct::Constraint);
+    // Picking the name fills the ID and the usual type.
+    cell(&mut t, "predecessors[0].task name", "first");
+    assert_eq!(
+        grid(&t, "predecessors")[0],
+        ["1", "First", "Finish-to-Start (FS)", ""]
+    );
+    cell(&mut t, "predecessors[0].lag", "2d");
+    // Typing an ID fills the name.
+    cell(&mut t, "predecessors[1].id", "3");
+    assert_eq!(grid(&t, "predecessors")[1][1], "Third");
+    cell(&mut t, "predecessors[1].type", "ss");
+    cell(&mut t, "predecessors[1].lag", "-1d");
+    assert_eq!(grid(&t, "predecessors").len(), 3, "a blank row follows");
+    dialog_click(&mut t, "OK").unwrap();
+    assert_eq!(
+        preds(&t, 2),
+        [
+            (1, projcore::LinkType::FinishStart, 2 * 480),
+            (3, projcore::LinkType::StartStart, -480)
+        ]
+    );
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    // Reopened, the rows read back as they were entered.
+    open(&mut t, ProjectAct::Constraint);
+    assert_eq!(
+        grid(&t, "predecessors"),
+        rows_of(&[
+            ["1", "First", "Finish-to-Start (FS)", "2d"],
+            ["3", "Third", "Start-to-Start (SS)", "-1d"],
+            ["", "", "", ""]
+        ])
+    );
+    // Delete removes the selected row.
+    t.dialogs.select_tab("Predecessors").unwrap();
+    t.dialogs.select_row("predecessors", 0).unwrap();
+    assert!(dialog_key(
+        &mut t,
+        "delete",
+        None,
+        gpui::Modifiers::default()
+    ));
+    dialog_click(&mut t, "OK").unwrap();
+    assert_eq!(preds(&t, 2), [(3, projcore::LinkType::StartStart, -480)]);
+    assert_eq!(v(&t).ed.undo_depth(), 2);
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(preds(&t, 2).len(), 2);
+}
+
+#[test]
+fn a_link_that_would_make_a_cycle_is_refused_and_the_dialog_stays_open() {
+    let mut t = tab3();
+    vm(&mut t)
+        .ed
+        .set_predecessors(2, vec![projcore::Predecessor::fs(1)])
+        .unwrap();
+    vm(&mut t).ed.select(0);
+    vm(&mut t).ed.mark_saved();
+    t.dirty = false;
+    let before = state(&t);
+    open(&mut t, ProjectAct::Constraint);
+    put(&mut t, "name", "Kept out");
+    cell(&mut t, "predecessors[0].task name", "Second");
+    let err = dialog_click(&mut t, "OK").unwrap_err();
+    assert!(
+        err.to_lowercase().contains("circular") || err.to_lowercase().contains("cycle"),
+        "{err}"
+    );
+    assert_eq!(t.dialogs.top_id(), "task-information");
+    assert_eq!(state(&t), before);
+}
+
+#[test]
+fn bad_rows_are_refused_with_what_is_wrong() {
+    for (address, value, wants) in [
+        ("predecessors[0].id", "9", "No task with ID 9"),
+        (
+            "predecessors[0].task name",
+            "Nobody",
+            "No task named 'Nobody'",
+        ),
+        ("predecessors[0].lag", "soon", "Invalid predecessor lag"),
+    ] {
+        let mut t = tab3();
+        let before = state(&t);
+        open(&mut t, ProjectAct::Constraint);
+        if address != "predecessors[0].id" && address != "predecessors[0].task name" {
+            cell(&mut t, "predecessors[0].id", "1");
+        }
+        cell(&mut t, address, value);
+        let err = dialog_click(&mut t, "OK").unwrap_err();
+        assert!(err.contains(wants), "{address}: {err}");
+        assert_eq!(state(&t), before, "{address}");
+    }
+    // A link to the task itself and a link twice.
+    let mut t = tab3();
+    open(&mut t, ProjectAct::Constraint);
+    cell(&mut t, "predecessors[0].id", "2");
+    assert!(dialog_click(&mut t, "OK").unwrap_err().contains("itself"));
+    cell(&mut t, "predecessors[0].id", "1");
+    cell(&mut t, "predecessors[1].id", "1");
+    assert!(
+        dialog_click(&mut t, "OK")
+            .unwrap_err()
+            .contains("Duplicate")
+    );
+}
+
+#[test]
+fn a_link_kept_as_shown_keeps_its_stored_form_through_another_rows_edit() {
+    let mut t = tab3();
+    let kept = projcore::Predecessor {
+        cross_project: Some(true),
+        cross_project_name: Some("Other.mpp\\4".into()),
+        lag: 90,
+        lag_format: projcore::LagFormat::from_code(3).unwrap(),
+        ..projcore::Predecessor::fs(1)
+    };
+    vm(&mut t)
+        .ed
+        .set_predecessors(2, vec![kept.clone()])
+        .unwrap();
+    open(&mut t, ProjectAct::Constraint);
+    assert_eq!(grid(&t, "predecessors")[0][0], "Other.mpp\\4");
+    cell(&mut t, "predecessors[1].id", "3");
+    dialog_click(&mut t, "OK").unwrap();
+    let task = v(&t).ed.project().task(2).unwrap();
+    assert_eq!(task.predecessors[0], kept, "the cross link, as it was");
+    assert_eq!(task.predecessors[1].uid, 3);
 }
