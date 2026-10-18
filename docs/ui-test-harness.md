@@ -430,6 +430,8 @@ State keys, as the app reports them after every driving verb:
 | `table_w`, `gantt_w` | Project: entry-table pane and Gantt chart widths in px. Split-bar drags move them; `table_w + 6 + gantt_w + 16` is the window width |
 | `timeline`, `timeline_start`, `timeline_finish` | Project: `shown`/`hidden`, and the Timeline's Start/Finish labels (`Mon 3/2/26`; the displayed span, leveled while leveling is on) |
 | `timeline_view_start`, `timeline_view_finish` | Project: the first and last day the Gantt chart shows, which the Timeline's view box highlights, clamped to the Timeline's span (`Mon 3/2/26`) |
+| `gantt_day_w`, `gantt_zoom` | Project (#1535): the chart's zoom in px per day (22 at the default Days level) and the level it is at (`Days`, `Weeks`, ...; `Custom (Weeks)` for a width no level has, such as a view-box drag or Entire Project). `gantt_w` does not change with it |
+| `timeline_h` | Project (#1535): the Timeline pane's height in px: 84 by default, 60 to half the window once the grip under it is dragged. Window view state, never saved |
 | `nonworking` | Project: Timeline's inclusive, merged shaded day runs as `[[first, last], ...]` in Project date form (`Wed 3/4/26`). Empty when each day is narrower than 2 px or the project calendar has no weekly working time. Reported even while the Timeline is hidden |
 | `filler_rows` | Project: ruled empty rows visible below the last task, from the last drawn frame's `project-body` height (0 before the first layout). Unlike the other keys it trails a driving verb by a frame, so settle with a `shot` before asserting it |
 | `ribbon_tab` | current kind-aware ribbon tab name (`Task`, `Resource`, `View`, `Home`, etc.; the contextual table tabs are `Table Design` and `Table Layout`, though the strip draws the second as plain "Layout", as Word does) |
@@ -1592,7 +1594,8 @@ have. `word-header-footer.uit` drives these over a three-section document.
 `project-heading:Duration`), `project-heading-arrow:<heading>` and
 `project-heading-edge:<heading>` (a heading's AutoFilter arrow and resize zone,
 clipped as the heading is; #1533), `project-hbar-table`, `project-hbar-chart`,
-`project-vbar`, `project-timeline`, `project-split`, `gallery`, `ribbon`,
+`project-vbar`, `project-timeline`, `project-timeline-box-left`,
+`project-timeline-box-right`, `project-timeline-grip`, `project-split`, `gallery`, `ribbon`,
 `ribbon-flyout`, `ribbon-group:<index>`, `ribbon-launch:<group title>`, `title-tabs`,
 `tab-prev`, `tab-next`, `tab-more`, `tab-more-item:<index>` (the last exists while
 the more-tabs list is open), `tab-chip:<index>` — a visible title-bar chip by
@@ -1604,7 +1607,7 @@ in any case (`project-heading:resource names` too), clipped to the table pane's
 columns and an error once it is scrolled wholly out of them (#1208). The `project-hbar-*` and `project-vbar` regions are the Project tab's three
 scrollbar strips: under the table, under the chart, and down the right edge of the rows.
 `project-timeline` is the Timeline pane above the Gantt view, and is an error while
-View > Split View > Timeline has it hidden. `project-split` is the draggable bar
+View > Split View > Timeline has it hidden; `project-timeline-box-left` and `-right` are the 6 px strips on the view box's edges (a drag zooms the chart so the box's span fills it) and `project-timeline-grip` the strip under the pane (a drag sets its height, a double-click restores it; #1535). `project-split` is the draggable bar
 between the entry table and the chart; its drags show in the `table_w` and `gantt_w`
 state entries. `gallery` is the Home ribbon's Styles gallery well on a
 document tab, and is an error while another ribbon tab, the Backstage or a

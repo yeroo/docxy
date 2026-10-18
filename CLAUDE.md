@@ -718,3 +718,34 @@
   `selected_columns`, `selected_rows`, `filled_cells` (`"<row>:<column>"`),
   `hot_headings`, `cursor_border` and `table_fits`;
   `uiharness/cases/project-selection.uit` (not run on macOS).
+
+## Project timescale and Timeline pane (#1535)
+
+- `GanttScale` carries `day_w` (px per day); `DEFAULT_DAY_W` (22, the Days
+  level) is only its initial value, and no geometry reads it. The view's zoom is
+  `ProjectView::zoom_day_w` (`None` = default): view state like `split`, never
+  saved or undone. Every change goes through `ProjectView::set_zoom(day_w,
+  anchor_day, anchor_px)`, which clamps to 0.25..96, refreshes the scale and
+  re-derives `gantt_x` from the anchor date; the plugin overlay's cache key
+  includes `day_w`. `gantt_w` never depends on the zoom.
+- `project/zoom.rs` holds the pure maths: `LEVELS` (Years, Half Years, Quarters,
+  Months, Thirds of Months, Weeks, Days) with their (major, minor) `Unit`s,
+  `nearest`/`step`/`fit`, and `tier`/`tiers` (header cells, labels fitted to
+  their width). The header is two 14 px tiers inside the old 28 px row. Hours
+  and Minutes are listed in the Timescale list and cannot be chosen (bars are
+  whole-day geometry); day lines draw from 8 px/day and non-working days are
+  shaded as merged runs from 3 px/day. Zoom In/Out step one level around the
+  left edge; Ctrl+wheel (Ctrl on every platform; the rows' scroll is put back)
+  steps around the pointer; Entire Project and Selected Tasks fit a span to the
+  chart. A free width shows as `Custom (<nearest level>)`.
+- Dragging a Timeline view-box edge (`BoxEdge`, 6 px strips drawn last, region
+  `project-timeline-box-left/right`) moves that boundary and sets the zoom so
+  the box's span fills the chart (`drag_edge`; the other edge stays put, also at
+  the clamp); the middle still pans. The grip under the pane (`project-timeline-grip`)
+  sets `ProjectView::timeline_h` (`MIN_TIMELINE_H` = one band plus padding, 60;
+  at most half the window, `ProjectView::height`); a double-click restores 84.
+  Like `split` it lives for the window session and is not written to disk.
+- The chart menu opens the Timescale and Zoom dialogs (`project/zoom_dialogs.rs`,
+  `DialogOwner::Zoom`/`Timescale`, catalogue ids `zoom`, `timescale`). The
+  Timescale dialog's tier rows are read-only (Count is 1): the tier editor and
+  the non-working-time page are not built.

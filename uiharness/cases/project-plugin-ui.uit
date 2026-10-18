@@ -172,13 +172,18 @@ test the row menu's item comes after Notes..., needs a task and renames it as on
   assert reply.items.24.enabled is false
   key escape
 
-test the chart menu opens beside the bars with Project's items greyed
+test the chart menu opens beside the bars with Project's unbuilt items greyed
   open copy:../fixtures/project-clipboard.xml
   call menu-open {"target":"chart"}
   call menu-read {}
   assert reply.target is chart
-  assert reply.items.0.label is Gridlines...
-  assert reply.items.0.enabled is false
+  # #1535: the timescale and zoom dialogs lead the menu and are live.
+  assert reply.items.0.label is Timescale...
+  assert reply.items.0.enabled is true
+  assert reply.items.1.label is Zoom...
+  assert reply.items.1.enabled is true
+  assert reply.items.5.label is Gridlines...
+  assert reply.items.5.enabled is false
   key escape
 
 test Task Information gains the plugin's page, prefilled, with a multiline and a grid
