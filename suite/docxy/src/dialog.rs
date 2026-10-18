@@ -1319,7 +1319,16 @@ impl Dialog {
         let c = &mut self.controls[i];
         c.row = Some(row);
         c.edit = None;
+        self.row_moved(i);
         Ok(())
+    }
+
+    /// A grid's selected row changed (#1602): a plugin grid's selection is
+    /// part of the dialog's values, so the plugin's state is asked again.
+    fn row_moved(&mut self, i: usize) {
+        if self.controls[i].plugin {
+            self.stale = true;
+        }
     }
 
     /// Toggle the selected row's cell in the active column of grid `i`, a
@@ -1395,6 +1404,7 @@ impl Dialog {
                     let c = &mut self.controls[i];
                     c.edit = None;
                     c.row = Some(next);
+                    self.row_moved(i);
                 }
                 Ok(true)
             }
@@ -1710,7 +1720,9 @@ impl Dialog {
                 }
                 c.row = Some(row);
                 c.col = col;
-                if c.column_kind(col).toggles() {
+                let toggles = c.column_kind(col).toggles();
+                self.row_moved(index);
+                if toggles {
                     return self.grid_toggle(index);
                 }
                 return Ok(());
