@@ -316,6 +316,11 @@ pub(crate) struct EdgePress {
 /// clamps. The moved edge stays inside `[lo, hi]` (the days the Timeline draws,
 /// so the box edge follows the pointer) and the span never shrinks below the
 /// day count the widest zoom shows, or the Timeline's own length if less.
+/// `end` is the scale's last day, the end of the chart's scroll range
+/// (`scale.days`). A Left drag holds the far edge at `right.min(end)`: when the
+/// chart showed days past `end`, its real right edge moves to `end` (the scroll
+/// clamp could not keep it elsewhere) while the drawn box edge, already clamped
+/// to the Timeline, stays put.
 pub(crate) fn drag_edge(
     edge: BoxEdge,
     left: f32,

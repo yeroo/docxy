@@ -741,7 +741,8 @@
 - Dragging a Timeline view-box edge (`BoxEdge`, 6 px strips drawn last, region
   `project-timeline-box-left/right`) moves that boundary and sets the zoom so
   the box's span fills the chart (`drag_edge`; the other edge stays put, also at
-  the clamp); the middle still pans. The grip under the pane (`project-timeline-grip`)
+  the zoom clamp, except that a Left drag on a chart showing days past the
+  scale's end moves its real right edge to that end while the drawn edge stays put); the middle still pans. The grip under the pane (`project-timeline-grip`)
   sets `ProjectView::timeline_h` (`MIN_TIMELINE_H` = one band plus padding, 60;
   at most half the window, `ProjectView::height`); a double-click restores 84.
   Like `split` it lives for the window session and is not written to disk. The
