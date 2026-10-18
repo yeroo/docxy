@@ -102,8 +102,25 @@ Verbs: `proj.path`, `task.list`, `task.get`, `task.fields`, `task.set`, `task.ad
 `task.del`, `link.add`, `link.del`, `find`, `assign.list`, `assign.get`,
 `assign.fields`, `assign.add`, `assign.set`, `assign.del`, `resource.list`,
 `resource.get`, `resource.add`, `resource.set`, `resource.del`, `level.all`,
-`level.clear`, `level.overallocations`, `proj.save`, `proj.reload`,
-`proj.open`, and the grid's view: `proj.view`,
+`level.clear`, `level.overallocations`, `cal.list`, `cal.get`, `cal.day`,
+`cal.add`, `cal.set`, `cal.exception.set`, `cal.exception.del`,
+`cal.workweek.set`, `cal.workweek.del`, `cal.del`, `proj.save`,
+`proj.reload`, `proj.open`, and the grid's view: `proj.view`,
+
+Calendars are addressed by `calendar`, a uid or a name. `cal.list {}` lists
+them (base calendars first: `uid, name, base, default, resources, tasks`),
+`cal.get {calendar}` reads one with its resolved `week` (seven days, each
+`day, working, times, stated`), `exceptions` and `work_weeks`, and `cal.day
+{calendar, date}` says what a date works and where that comes from
+(`based_on`: an exception, a work week or a calendar's default week). `cal.add
+{name, base?, copy?}` adds a derived calendar (`base`), a copy, or a base
+calendar with Project's standard week; `cal.set {calendar, name?, base?,
+week?}` renames, rebases a derived calendar or sets days of the default week
+(`{"Mon": {"working": true, "times": [["08:00","12:00"],["13:00","17:00"]]},
+"Sat": {"working": false}}`; `null` for a derived calendar's day inherits);
+`cal.exception.set` / `cal.workweek.set` add (no `index`) or replace one by
+`index`, `.del` removes it; `cal.del` removes an unused calendar. Each is one
+undo step.
 `proj.sort {column?, descending?}`, `proj.filter {column, values? | clear}` (`values` are
 cell texts, `(Blanks)` for an empty cell, or on a date column `YYYY`, `YYYY-MM`,
 `YYYY-MM-DD`).

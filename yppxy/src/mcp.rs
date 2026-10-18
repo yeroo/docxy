@@ -87,6 +87,16 @@ fn tool_verb(name: &str) -> Option<&'static str> {
         "yppxy_level_all" => "level.all",
         "yppxy_level_clear" => "level.clear",
         "yppxy_level_overallocations" => "level.overallocations",
+        "yppxy_cal_list" => "cal.list",
+        "yppxy_cal_get" => "cal.get",
+        "yppxy_cal_day" => "cal.day",
+        "yppxy_cal_add" => "cal.add",
+        "yppxy_cal_set" => "cal.set",
+        "yppxy_cal_exception_set" => "cal.exception.set",
+        "yppxy_cal_exception_del" => "cal.exception.del",
+        "yppxy_cal_workweek_set" => "cal.workweek.set",
+        "yppxy_cal_workweek_del" => "cal.workweek.del",
+        "yppxy_cal_del" => "cal.del",
         _ => return None,
     })
 }
@@ -517,7 +527,195 @@ fn tool_defs() -> Json {
             vec![target(), tab()],
             &[],
         ),
+        tool(
+            "yppxy_cal_list",
+            "List the plan's calendars, base calendars first: uid, name, base {uid, name} or \
+             null, default (the project calendar), resources and tasks (the uids using it).",
+            vec![target(), tab()],
+            &[],
+        ),
+        tool(
+            "yppxy_cal_get",
+            "Read one calendar: its resolved week (seven days: day, working, times as \
+             [\"HH:MM\",\"HH:MM\"] pairs, stated), exceptions (index, name, from, to, working, \
+             times, recurring) and work weeks (index, name, from, to, week).",
+            vec![calendar(), target(), tab()],
+            &["calendar"],
+        ),
+        tool(
+            "yppxy_cal_day",
+            "What a calendar works on a date and where that comes from: {date, working, times, \
+             based_on: {kind: exception | work_week | default, calendar, name}}, as Change \
+             Working Time's 'Working times for' and 'Based on' show it.",
+            vec![
+                calendar(),
+                ("date", prop("string", "The date, YYYY-MM-DD.")),
+                target(),
+                tab(),
+            ],
+            &["calendar", "date"],
+        ),
+        tool(
+            "yppxy_cal_add",
+            "Add a calendar: derived from `base`, else a base calendar with Project's standard \
+             week (Monday to Friday, 08:00-12:00 and 13:00-17:00), or a copy of `copy`'s week, \
+             exceptions and work weeks. Names are unique (ASCII case ignored). Returns the \
+             calendar. One undo step.",
+            vec![
+                ("name", prop("string", "The new calendar's name.")),
+                (
+                    "base",
+                    prop_types(
+                        &["integer", "string"],
+                        "A calendar to derive from, by uid or name.",
+                    ),
+                ),
+                (
+                    "copy",
+                    prop_types(
+                        &["integer", "string"],
+                        "A calendar to copy, by uid or name.",
+                    ),
+                ),
+                target(),
+                tab(),
+            ],
+            &["name"],
+        ),
+        tool(
+            "yppxy_cal_set",
+            "Rename a calendar, rebase a derived one, or set days of its default week: `week` \
+             is an object of weekdays (Mon..Sun) to {working?, times?: [[\"08:00\",\"12:00\"], \
+             ...]}; working false is a non-working day; null for a derived calendar's day \
+             inherits the base again. A calendar a task schedules on cannot lose all its \
+             working time. Returns the calendar. One undo step.",
+            vec![
+                calendar(),
+                ("name", prop("string", "A new name.")),
+                (
+                    "base",
+                    prop_types(
+                        &["integer", "string"],
+                        "A derived calendar's new base, by uid or name.",
+                    ),
+                ),
+                (
+                    "week",
+                    prop(
+                        "object",
+                        "Weekdays to set: {\"Mon\": {\"working\": true, \"times\": [[\"08:00\",\"12:00\"]]}, \"Sat\": {\"working\": false}}.",
+                    ),
+                ),
+                target(),
+                tab(),
+            ],
+            &["calendar"],
+        ),
+        tool(
+            "yppxy_cal_exception_set",
+            "Add (no index) or replace (index) a date-range exception of a calendar: from and \
+             to dates, non-working unless `times` (or working true, the standard day) are given. \
+             Returns the calendar. One undo step.",
+            vec![
+                calendar(),
+                (
+                    "index",
+                    prop(
+                        "integer",
+                        "The exception to replace (from yppxy_cal_get); absent adds one.",
+                    ),
+                ),
+                ("name", prop("string", "The exception's name.")),
+                ("from", prop("string", "First day, YYYY-MM-DD.")),
+                ("to", prop("string", "Last day, YYYY-MM-DD.")),
+                ("working", prop("boolean", "Whether the days work.")),
+                (
+                    "times",
+                    prop_array(
+                        item_ty("array"),
+                        "Working times as [\"HH:MM\",\"HH:MM\"] pairs.",
+                    ),
+                ),
+                target(),
+                tab(),
+            ],
+            &["calendar", "from", "to"],
+        ),
+        tool(
+            "yppxy_cal_exception_del",
+            "Remove exception `index` of a calendar. Returns the calendar. One undo step.",
+            vec![
+                calendar(),
+                (
+                    "index",
+                    prop("integer", "The exception's index (from yppxy_cal_get)."),
+                ),
+                target(),
+                tab(),
+            ],
+            &["calendar", "index"],
+        ),
+        tool(
+            "yppxy_cal_workweek_set",
+            "Add (no index) or replace (index) a work week of a calendar: from and to dates and \
+             the days it states, as yppxy_cal_set's `week`. Returns the calendar. One undo step.",
+            vec![
+                calendar(),
+                (
+                    "index",
+                    prop(
+                        "integer",
+                        "The work week to replace (from yppxy_cal_get); absent adds one.",
+                    ),
+                ),
+                ("name", prop("string", "The work week's name.")),
+                ("from", prop("string", "First day, YYYY-MM-DD.")),
+                ("to", prop("string", "Last day, YYYY-MM-DD.")),
+                (
+                    "week",
+                    prop(
+                        "object",
+                        "The days the work week states, as yppxy_cal_set's week.",
+                    ),
+                ),
+                target(),
+                tab(),
+            ],
+            &["calendar", "from", "to"],
+        ),
+        tool(
+            "yppxy_cal_workweek_del",
+            "Remove work week `index` of a calendar. Returns the calendar. One undo step.",
+            vec![
+                calendar(),
+                (
+                    "index",
+                    prop("integer", "The work week's index (from yppxy_cal_get)."),
+                ),
+                target(),
+                tab(),
+            ],
+            &["calendar", "index"],
+        ),
+        tool(
+            "yppxy_cal_del",
+            "Delete a calendar nothing uses (not the project calendar, no task's or resource's, \
+             no other calendar's base); the reply is {deleted}. One undo step.",
+            vec![calendar(), target(), tab()],
+            &["calendar"],
+        ),
     ])
+}
+
+/// The calendar argument of the cal.* tools.
+fn calendar() -> (&'static str, Json) {
+    (
+        "calendar",
+        prop_types(
+            &["integer", "string"],
+            "The calendar, by uid or name (from yppxy_cal_list).",
+        ),
+    )
 }
 
 /// The resource's own UID argument.
@@ -749,6 +947,16 @@ mod tests {
             "yppxy_level_all",
             "yppxy_level_clear",
             "yppxy_level_overallocations",
+            "yppxy_cal_list",
+            "yppxy_cal_get",
+            "yppxy_cal_day",
+            "yppxy_cal_add",
+            "yppxy_cal_set",
+            "yppxy_cal_exception_set",
+            "yppxy_cal_exception_del",
+            "yppxy_cal_workweek_set",
+            "yppxy_cal_workweek_del",
+            "yppxy_cal_del",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
@@ -779,6 +987,16 @@ mod tests {
             ("yppxy_level_all", "level.all"),
             ("yppxy_level_clear", "level.clear"),
             ("yppxy_level_overallocations", "level.overallocations"),
+            ("yppxy_cal_list", "cal.list"),
+            ("yppxy_cal_get", "cal.get"),
+            ("yppxy_cal_day", "cal.day"),
+            ("yppxy_cal_add", "cal.add"),
+            ("yppxy_cal_set", "cal.set"),
+            ("yppxy_cal_exception_set", "cal.exception.set"),
+            ("yppxy_cal_exception_del", "cal.exception.del"),
+            ("yppxy_cal_workweek_set", "cal.workweek.set"),
+            ("yppxy_cal_workweek_del", "cal.workweek.del"),
+            ("yppxy_cal_del", "cal.del"),
         ] {
             assert_eq!(tool_verb(name), Some(verb));
         }

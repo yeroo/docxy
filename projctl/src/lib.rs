@@ -40,6 +40,16 @@
 //! | `level.clear` | `{}` | `{leveled: false, overallocated}` (#1589): show the plan as scheduled, as Clear Leveling |
 //! | `level.overallocations` | `{}` | `{count, resources: [{uid, name, max_units, peak_units, first}]}` (#1589): the work resources booked past their capacity on the plan as shown, each with its peak (1.0 = 100%) and the first overallocated instant, earliest first (Next Overallocation) |
 //! | `level.selection`, `level.resource`, `level.options` | — | refused: the model levels the whole plan (#1594) |
+//! | `cal.list` | `{}` | `{count, calendars: [{uid, name, base: {uid, name} \| null, default, resources: [uid…], tasks: [uid…]}]}` (#1605), base calendars first |
+//! | `cal.get` | `{calendar}` | the calendar (`calendar` a uid or a name) with its resolved `week` (`[{day, working, times: [["08:00","12:00"], …], stated}]`), `exceptions: [{index, name, from, to, working, times, recurring}]` and `work_weeks: [{index, name, from, to, week}]` |
+//! | `cal.day` | `{calendar, date}` | `{date, working, times, based_on: {kind: exception \| work_week \| default, calendar, name}}`: Change Working Time's "Working times for" and "Based on" |
+//! | `cal.add` | `{name, base?, copy?}` | the new calendar: derived from `base`, else a base calendar with Project's standard week, or a copy of `copy` |
+//! | `cal.set` | `{calendar, name?, base?, week?}` | the calendar after the change: `week` `{"Mon": {"working": true, "times": [["08:00","12:00"],["13:00","17:00"]]}, "Sat": {"working": false}}` for the days given (`null` for a derived calendar's day inherits the base again) |
+//! | `cal.exception.set` | `{calendar, index?, name?, from, to, working?, times?}` | the calendar; no `index` adds a date-range exception (non-working unless `times`), an `index` replaces that one |
+//! | `cal.exception.del` | `{calendar, index}` | the calendar |
+//! | `cal.workweek.set` | `{calendar, index?, name?, from, to, week}` | the calendar; `week` as `cal.set`'s, the days the work week states |
+//! | `cal.workweek.del` | `{calendar, index}` | the calendar |
+//! | `cal.del` | `{calendar}` | `{deleted}`: refused for the project calendar, one a task or resource uses, or one another derives from |
 //! | `proj.set` | `{title?, start?, status_date?, current_date?, calendar?, new_tasks?}` | the same reply after the change (#1587): dates `YYYY-MM-DD` (the project calendar's day start; a bare status date is the day's end, as Project sets it) or `YYYY-MM-DDTHH:MM`, `null` clearing a status or current date, `calendar` a base calendar's name or uid, `new_tasks` `auto` or `manual` (Task > Tasks > Mode, #1585; existing tasks keep their own mode). All apply in one undo step, or none does |
 //!
 //! `fields` is a list of Project field names (`["% Complete", "Baseline1
@@ -93,16 +103,16 @@
 use ctlcore::json::Json;
 use projcore::datetime::DateTime;
 use projcore::editor::{
-    AssignmentField, AssignmentPatch, DURATION_HINT, EV_PERCENT_COMPLETE,
+    AssignmentField, AssignmentPatch, DURATION_HINT, DayPatch, DaySource, EV_PERCENT_COMPLETE,
     EV_PHYSICAL_PERCENT_COMPLETE, Editor, Field, FieldReader, FieldValue, ResourcePatch,
-    ResourceRef, TaskPatch, assignment_dates, assignment_field_names, day_end, day_start,
-    duration_format_code, field_names, kind_name, parse_cell_date, parse_duration, parse_lag,
-    parse_task_duration_unit, rate_table_letter, read_assignment_field, resource_base_calendar,
-    work_contour_name,
+    ResourceRef, TaskPatch, WEEKDAYS, assignment_dates, assignment_field_names, clock, day_end,
+    day_start, duration_format_code, field_names, kind_name, parse_cell_date, parse_clock,
+    parse_duration, parse_lag, parse_task_duration_unit, rate_table_letter, read_assignment_field,
+    resource_base_calendar, weekday_index, work_contour_name,
 };
 use projcore::model::{
-    AccrueAt, Assignment, ConstraintType, LagFormat, LagUnit, LinkType, Predecessor, Rate,
-    Resource, ResourceType, Task, TaskType,
+    AccrueAt, Assignment, Calendar, ConstraintType, DayWorking, LagFormat, LagUnit, LinkType,
+    Predecessor, Rate, Resource, ResourceType, Task, TaskType, WorkingTime,
 };
 use projcore::schedule::overbookings;
 
@@ -122,6 +132,13 @@ pub const MUTATING: &[&str] = &[
     "resource.del",
     "level.all",
     "level.clear",
+    "cal.add",
+    "cal.set",
+    "cal.exception.set",
+    "cal.exception.del",
+    "cal.workweek.set",
+    "cal.workweek.del",
+    "cal.del",
 ];
 
 /// Recognize editor verbs before a host resolves its target document.
@@ -143,6 +160,9 @@ pub fn is_editor_verb(verb: &str) -> bool {
                 | "level.selection"
                 | "level.resource"
                 | "level.options"
+                | "cal.list"
+                | "cal.get"
+                | "cal.day"
         )
 }
 
@@ -206,6 +226,16 @@ pub fn dispatch_editor(ed: &mut Editor, verb: &str, args: &Json) -> Option<Resul
             "the model levels the whole plan (yeroo/docxy #1594); level.all and level.clear switch it"
                 .into(),
         ),
+        "cal.list" => Ok(cal_list(ed)),
+        "cal.get" => cal_get(ed, args),
+        "cal.day" => cal_day(ed, args),
+        "cal.add" => cal_add(ed, args),
+        "cal.set" => cal_set(ed, args),
+        "cal.exception.set" => cal_exception_set(ed, args),
+        "cal.exception.del" => cal_exception_del(ed, args),
+        "cal.workweek.set" => cal_workweek_set(ed, args),
+        "cal.workweek.del" => cal_workweek_del(ed, args),
+        "cal.del" => cal_del(ed, args),
         _ => return None,
     })
 }
@@ -1419,6 +1449,377 @@ fn assign_del(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         ("deleted", Json::Num(uid as f64)),
         ("task", Json::Num(task as f64)),
     ]))
+}
+
+// ---------------------------------------------------------------------------
+// Calendars (#1605)
+// ---------------------------------------------------------------------------
+
+/// `{uid, name}` of a calendar.
+fn cal_ref(c: &Calendar) -> Json {
+    Json::obj(vec![
+        ("uid", Json::Num(f64::from(c.uid))),
+        ("name", Json::Str(c.name.clone())),
+    ])
+}
+
+/// Working times as `[["08:00","12:00"], …]`.
+fn times_json(times: &[WorkingTime]) -> Json {
+    Json::Arr(
+        times
+            .iter()
+            .map(|t| Json::Arr(vec![Json::Str(clock(t.from)), Json::Str(clock(t.to))]))
+            .collect(),
+    )
+}
+
+/// A week's seven days: `{day, working, times, stated}`; `stated` whether
+/// the calendar states the day itself (a derived calendar inherits the
+/// rest), `resolved` what the day works.
+fn week_json(stated: &[Option<DayWorking>; 7], resolved: &[DayWorking; 7]) -> Json {
+    Json::Arr(
+        (0..7)
+            .map(|d| {
+                Json::obj(vec![
+                    ("day", Json::Str(WEEKDAYS[d][..3].into())),
+                    ("working", Json::Bool(resolved[d].working())),
+                    ("times", times_json(&resolved[d].times)),
+                    ("stated", Json::Bool(stated[d].is_some())),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn date_json(d: Option<DateTime>) -> Json {
+    d.map_or(Json::Null, |d| {
+        let p = d.parts();
+        Json::Str(format!("{:04}-{:02}-{:02}", p.year, p.month, p.day))
+    })
+}
+
+/// One calendar's listing: `cal.list`'s row.
+fn calendar_row(ed: &Editor, c: &Calendar) -> Vec<(&'static str, Json)> {
+    let proj = ed.project();
+    vec![
+        ("uid", Json::Num(f64::from(c.uid))),
+        ("name", Json::Str(c.name.clone())),
+        (
+            "base",
+            c.base_calendar_uid
+                .and_then(|b| proj.calendar(b))
+                .map_or(Json::Null, cal_ref),
+        ),
+        ("default", Json::Bool(proj.default_calendar_uid == c.uid)),
+        (
+            "resources",
+            Json::Arr(
+                proj.resources
+                    .iter()
+                    .filter(|r| r.calendar_uid == Some(c.uid))
+                    .map(|r| Json::Num(f64::from(r.uid)))
+                    .collect(),
+            ),
+        ),
+        (
+            "tasks",
+            Json::Arr(
+                proj.tasks
+                    .iter()
+                    .filter(|t| t.calendar_uid == Some(c.uid))
+                    .map(|t| Json::Num(f64::from(t.uid)))
+                    .collect(),
+            ),
+        ),
+    ]
+}
+
+/// `cal.get`'s calendar: the row, the resolved week, the exceptions and
+/// the work weeks.
+fn calendar_json(ed: &Editor, c: &Calendar) -> Json {
+    let proj = ed.project();
+    let mut out = calendar_row(ed, c);
+    let resolved = proj.resolved_week(c);
+    out.push(("week", week_json(&c.week, &resolved)));
+    out.push((
+        "exceptions",
+        Json::Arr(
+            c.exceptions
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    Json::obj(vec![
+                        ("index", Json::Num(i as f64)),
+                        ("name", e.name.clone().map_or(Json::Null, Json::Str)),
+                        ("from", date_json(e.from)),
+                        ("to", date_json(e.to)),
+                        ("working", Json::Bool(e.day.working())),
+                        ("times", times_json(&e.day.times)),
+                        ("recurring", Json::Bool(e.scheduled().is_none())),
+                    ])
+                })
+                .collect(),
+        ),
+    ));
+    out.push((
+        "work_weeks",
+        Json::Arr(
+            c.work_weeks
+                .iter()
+                .enumerate()
+                .map(|(i, w)| {
+                    // A work week's unstated day falls back to the calendar.
+                    let mut shown = resolved.clone();
+                    for (d, day) in w.week.iter().enumerate() {
+                        if let Some(day) = day {
+                            shown[d] = day.clone();
+                        }
+                    }
+                    Json::obj(vec![
+                        ("index", Json::Num(i as f64)),
+                        ("name", w.name.clone().map_or(Json::Null, Json::Str)),
+                        ("from", date_json(w.from)),
+                        ("to", date_json(w.to)),
+                        ("week", week_json(&w.week, &shown)),
+                    ])
+                })
+                .collect(),
+        ),
+    ));
+    Json::obj(out)
+}
+
+/// The calendar `args` names: `calendar` as a uid or a name, or `uid`.
+fn calendar_arg(ed: &Editor, args: &Json) -> Result<i32, String> {
+    match args.get("calendar").or_else(|| args.get("uid")) {
+        Some(Json::Num(n)) => {
+            let uid = *n as i32;
+            ed.project()
+                .calendar(uid)
+                .map(|_| uid)
+                .ok_or_else(|| format!("no calendar with uid {uid}"))
+        }
+        Some(Json::Str(s)) => ed.calendar_by(s),
+        _ => Err("needs a 'calendar' (a calendar uid or name)".into()),
+    }
+}
+
+/// An optional calendar reference under `key`, a uid or a name.
+fn calendar_opt(ed: &Editor, args: &Json, key: &str) -> Result<Option<i32>, String> {
+    match args.get(key) {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::Num(n)) => {
+            let uid = *n as i32;
+            ed.project()
+                .calendar(uid)
+                .map(|_| Some(uid))
+                .ok_or_else(|| format!("no calendar with uid {uid}"))
+        }
+        Some(Json::Str(s)) => ed.calendar_by(s).map(Some),
+        Some(_) => Err(format!("'{key}' must be a calendar uid or name")),
+    }
+}
+
+/// A day's working times from `[["08:00","12:00"], …]`.
+fn times_arg(value: &Json) -> Result<Vec<WorkingTime>, String> {
+    let bad = || "'times' is a list of [\"HH:MM\",\"HH:MM\"] pairs".to_string();
+    let mut out = Vec::new();
+    for pair in value.as_array().ok_or_else(bad)? {
+        let pair = pair.as_array().ok_or_else(bad)?;
+        let [from, to] = pair else {
+            return Err(bad());
+        };
+        let from = from.as_str().and_then(parse_clock).ok_or_else(bad)?;
+        let to = to.as_str().and_then(parse_clock).ok_or_else(bad)?;
+        out.push(WorkingTime { from, to });
+    }
+    Ok(out)
+}
+
+/// A day's pattern from `{working?, times?}`: `times` given is the day,
+/// `working: false` (or no times) a non-working day, `null` inherits.
+fn day_arg(value: &Json) -> Result<DayPatch, String> {
+    if matches!(value, Json::Null) {
+        return Ok(None);
+    }
+    let working = value.get("working").and_then(Json::as_bool);
+    let times = match value.get("times") {
+        Some(t) if !matches!(t, Json::Null) => times_arg(t)?,
+        _ => Vec::new(),
+    };
+    if working == Some(false) {
+        return Ok(Some(DayWorking { times: Vec::new() }));
+    }
+    if working == Some(true) && times.is_empty() {
+        return Ok(Some(DayWorking {
+            times: Calendar::standard_week()[1].times.clone(),
+        }));
+    }
+    Ok(Some(DayWorking { times }))
+}
+
+/// A week's days from `{"Mon": {...}, "Sat": null, …}`.
+fn week_arg(args: &Json, key: &str) -> Result<Vec<(usize, DayPatch)>, String> {
+    let Some(week) = args.get(key) else {
+        return Ok(Vec::new());
+    };
+    let Json::Obj(days) = week else {
+        return Err(format!("'{key}' is an object of weekdays"));
+    };
+    let mut out = Vec::new();
+    for (day, pattern) in days {
+        let d = weekday_index(day).ok_or_else(|| format!("'{day}' is not a weekday"))?;
+        out.push((d, day_arg(pattern)?));
+    }
+    Ok(out)
+}
+
+/// `from` and `to` as dates.
+fn range_args(args: &Json) -> Result<(DateTime, DateTime), String> {
+    let date = |key: &str| {
+        let text = args
+            .get_str(key)
+            .ok_or_else(|| format!("needs '{key}' (YYYY-MM-DD)"))?;
+        parse_cell_date(text).map_err(|_| format!("'{key}' is not a date (YYYY-MM-DD)"))
+    };
+    Ok((date("from")?, date("to")?))
+}
+
+fn index_arg(args: &Json) -> Result<Option<usize>, String> {
+    match args.get("index") {
+        None | Some(Json::Null) => Ok(None),
+        Some(v) => v
+            .as_usize()
+            .map(Some)
+            .ok_or_else(|| "'index' must be a whole number".to_string()),
+    }
+}
+
+fn cal_reply(ed: &Editor, uid: i32) -> Result<Json, String> {
+    ed.project()
+        .calendar(uid)
+        .map(|c| calendar_json(ed, c))
+        .ok_or_else(|| format!("no calendar with uid {uid}"))
+}
+
+fn cal_list(ed: &Editor) -> Json {
+    let proj = ed.project();
+    let mut cals: Vec<&Calendar> = proj.calendars.iter().collect();
+    cals.sort_by_key(|c| c.base_calendar_uid.is_some());
+    let rows: Vec<Json> = cals
+        .iter()
+        .map(|c| Json::obj(calendar_row(ed, c)))
+        .collect();
+    Json::obj(vec![
+        ("count", Json::Num(rows.len() as f64)),
+        ("calendars", Json::Arr(rows)),
+    ])
+}
+
+fn cal_get(ed: &Editor, args: &Json) -> Result<Json, String> {
+    cal_reply(ed, calendar_arg(ed, args)?)
+}
+
+fn cal_day(ed: &Editor, args: &Json) -> Result<Json, String> {
+    let uid = calendar_arg(ed, args)?;
+    let text = args.get_str("date").ok_or("needs a 'date' (YYYY-MM-DD)")?;
+    let date = parse_cell_date(text).map_err(|_| format!("'{text}' is not a date (YYYY-MM-DD)"))?;
+    let (times, source) = ed.calendar_day(uid, date)?;
+    let (kind, calendar, name) = match source {
+        DaySource::Exception { calendar, name } => ("exception", calendar, name),
+        DaySource::WorkWeek { calendar, name } => ("work_week", calendar, name),
+        DaySource::Default { calendar } => ("default", calendar, None),
+    };
+    Ok(Json::obj(vec![
+        ("date", date_json(Some(date))),
+        ("working", Json::Bool(!times.is_empty())),
+        ("times", times_json(&times)),
+        (
+            "based_on",
+            Json::obj(vec![
+                ("kind", Json::Str(kind.into())),
+                ("calendar", Json::Str(calendar)),
+                ("name", name.map_or(Json::Null, Json::Str)),
+            ]),
+        ),
+    ]))
+}
+
+fn cal_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
+    let name = args
+        .get_str("name")
+        .ok_or("cal.add needs a 'name'")?
+        .to_string();
+    let base = calendar_opt(ed, args, "base")?;
+    let copy = calendar_opt(ed, args, "copy")?;
+    if base.is_some() && copy.is_some() {
+        return Err(
+            "'base' (a derived calendar) and 'copy' (a copied base calendar) exclude each other"
+                .into(),
+        );
+    }
+    let uid = ed.add_calendar(&name, base, copy)?;
+    cal_reply(ed, uid)
+}
+
+fn cal_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
+    let uid = calendar_arg(ed, args)?;
+    let name = args.get_str("name").map(str::to_string);
+    let base = calendar_opt(ed, args, "base")?;
+    let week = week_arg(args, "week")?;
+    if name.is_none() && base.is_none() && week.is_empty() {
+        return Err("cal.set needs at least one of 'name', 'base' or 'week'".into());
+    }
+    ed.set_calendar(uid, name.as_deref(), base, &week)?;
+    cal_reply(ed, uid)
+}
+
+fn cal_exception_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
+    let uid = calendar_arg(ed, args)?;
+    let index = index_arg(args)?;
+    let (from, to) = range_args(args)?;
+    let day = day_arg(&Json::obj(vec![
+        (
+            "working",
+            args.get("working").cloned().unwrap_or(Json::Null),
+        ),
+        ("times", args.get("times").cloned().unwrap_or(Json::Null)),
+    ]))?
+    .unwrap_or_default();
+    ed.set_calendar_exception(uid, index, args.get_str("name"), from, to, day)?;
+    cal_reply(ed, uid)
+}
+
+fn cal_exception_del(ed: &mut Editor, args: &Json) -> Result<Json, String> {
+    let uid = calendar_arg(ed, args)?;
+    let index = index_arg(args)?.ok_or("needs an 'index'")?;
+    ed.delete_calendar_exception(uid, index)?;
+    cal_reply(ed, uid)
+}
+
+fn cal_workweek_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
+    let uid = calendar_arg(ed, args)?;
+    let index = index_arg(args)?;
+    let (from, to) = range_args(args)?;
+    let mut week: [DayPatch; 7] = Default::default();
+    for (d, pattern) in week_arg(args, "week")? {
+        week[d] = pattern;
+    }
+    ed.set_calendar_work_week(uid, index, args.get_str("name"), from, to, week)?;
+    cal_reply(ed, uid)
+}
+
+fn cal_workweek_del(ed: &mut Editor, args: &Json) -> Result<Json, String> {
+    let uid = calendar_arg(ed, args)?;
+    let index = index_arg(args)?.ok_or("needs an 'index'")?;
+    ed.delete_calendar_work_week(uid, index)?;
+    cal_reply(ed, uid)
+}
+
+fn cal_del(ed: &mut Editor, args: &Json) -> Result<Json, String> {
+    let uid = calendar_arg(ed, args)?;
+    ed.delete_calendar(uid)?;
+    Ok(Json::obj(vec![("deleted", Json::Num(f64::from(uid)))]))
 }
 
 // ---------------------------------------------------------------------------
@@ -2879,6 +3280,166 @@ it"
         });
         p.resources = vec![ann, resource(2, "Bob", "30")];
         Editor::new(p)
+    }
+
+    #[test]
+    fn calendar_verbs_read_and_edit_calendars() {
+        for verb in ["cal.list", "cal.get", "cal.day"] {
+            assert!(is_editor_verb(verb) && !MUTATING.contains(&verb), "{verb}");
+        }
+        for verb in [
+            "cal.add",
+            "cal.set",
+            "cal.exception.set",
+            "cal.exception.del",
+            "cal.workweek.set",
+            "cal.workweek.del",
+            "cal.del",
+        ] {
+            assert!(is_editor_verb(verb) && MUTATING.contains(&verb), "{verb}");
+        }
+        let mut ed = Editor::new(new_project());
+        let list = run(&mut ed, "cal.list", "{}").unwrap();
+        assert_eq!(num(&list, "count"), 1.0);
+        let std = &list.get("calendars").and_then(Json::as_array).unwrap()[0];
+        assert_eq!(std.get_str("name"), Some("Standard"));
+        assert_eq!(std.get("default"), Some(&Json::Bool(true)));
+        let got = run(&mut ed, "cal.get", r#"{"calendar":"Standard"}"#).unwrap();
+        let week = got.get("week").and_then(Json::as_array).unwrap();
+        assert_eq!(week.len(), 7);
+        assert_eq!(week[0].get_str("day"), Some("Sun"));
+        assert_eq!(week[0].get("working"), Some(&Json::Bool(false)));
+        assert_eq!(week[1].get("working"), Some(&Json::Bool(true)));
+        assert_eq!(
+            week[1].get("times").unwrap().to_string(),
+            r#"[["08:00","12:00"],["13:00","17:00"]]"#
+        );
+        // A derived calendar with Fridays off, a holiday, a work week.
+        let night = run(
+            &mut ed,
+            "cal.add",
+            r#"{"name":"Night Shift","base":"Standard"}"#,
+        )
+        .unwrap();
+        let night_uid = num(&night, "uid") as i32;
+        assert_eq!(night.get("base").unwrap().get_str("name"), Some("Standard"));
+        assert_eq!(
+            night.get("week").and_then(Json::as_array).unwrap()[1].get("stated"),
+            Some(&Json::Bool(false))
+        );
+        let set = run(
+            &mut ed,
+            "cal.set",
+            &format!(r#"{{"calendar":{night_uid},"week":{{"Fri":{{"working":false}},"Sat":{{"times":[["09:00","13:00"]]}}}}}}"#),
+        )
+        .unwrap();
+        let week = set.get("week").and_then(Json::as_array).unwrap();
+        assert_eq!(week[5].get("working"), Some(&Json::Bool(false)));
+        assert_eq!(week[5].get("stated"), Some(&Json::Bool(true)));
+        assert_eq!(
+            week[6].get("times").unwrap().to_string(),
+            r#"[["09:00","13:00"]]"#
+        );
+        let holiday = run(
+            &mut ed,
+            "cal.exception.set",
+            r#"{"calendar":"Standard","name":"Founders' Day","from":"2026-03-03","to":"2026-03-03"}"#,
+        )
+        .unwrap();
+        let exc = &holiday.get("exceptions").and_then(Json::as_array).unwrap()[0];
+        assert_eq!(exc.get_str("name"), Some("Founders' Day"));
+        assert_eq!(exc.get("working"), Some(&Json::Bool(false)));
+        assert_eq!(exc.get_str("from"), Some("2026-03-03"));
+        // The derived calendar inherits it; cal.day says so.
+        let day = run(
+            &mut ed,
+            "cal.day",
+            &format!(r#"{{"calendar":{night_uid},"date":"2026-03-03"}}"#),
+        )
+        .unwrap();
+        assert_eq!(day.get("working"), Some(&Json::Bool(false)));
+        let based = day.get("based_on").unwrap();
+        assert_eq!(based.get_str("kind"), Some("exception"));
+        assert_eq!(based.get_str("calendar"), Some("Standard"));
+        assert_eq!(based.get_str("name"), Some("Founders' Day"));
+        let day = run(
+            &mut ed,
+            "cal.day",
+            r#"{"calendar":"Night Shift","date":"2026-03-06"}"#,
+        )
+        .unwrap();
+        assert_eq!(day.get("working"), Some(&Json::Bool(false)));
+        assert_eq!(
+            day.get("based_on").unwrap().get_str("kind"),
+            Some("default")
+        );
+        assert_eq!(
+            day.get("based_on").unwrap().get_str("calendar"),
+            Some("Night Shift")
+        );
+        let ww = run(
+            &mut ed,
+            "cal.workweek.set",
+            r#"{"calendar":"Standard","name":"Crunch","from":"2026-03-09","to":"2026-03-15","week":{"Sat":{"times":[["08:00","12:00"]]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ww.get("work_weeks").and_then(Json::as_array).unwrap().len(),
+            1
+        );
+        let day = run(
+            &mut ed,
+            "cal.day",
+            r#"{"calendar":"Standard","date":"2026-03-14"}"#,
+        )
+        .unwrap();
+        assert_eq!(day.get("working"), Some(&Json::Bool(true)));
+        assert_eq!(
+            day.get("based_on").unwrap().get_str("kind"),
+            Some("work_week")
+        );
+        // Each edit was one step; deletes by index; refusals change nothing.
+        assert_eq!(ed.undo_depth(), 4);
+        run(
+            &mut ed,
+            "cal.workweek.del",
+            r#"{"calendar":"Standard","index":0}"#,
+        )
+        .unwrap();
+        run(
+            &mut ed,
+            "cal.exception.del",
+            r#"{"calendar":"Standard","index":0}"#,
+        )
+        .unwrap();
+        assert_eq!(ed.undo_depth(), 6);
+        let before = ed.project().clone();
+        for (verb, args) in [
+            ("cal.set", r#"{"calendar":"Standard"}"#),
+            (
+                "cal.set",
+                r#"{"calendar":"Standard","week":{"Mon":{"times":[["12:00","08:00"]]}}}"#,
+            ),
+            (
+                "cal.set",
+                r#"{"calendar":"Standard","week":{"Someday":{"working":false}}}"#,
+            ),
+            ("cal.set", r#"{"calendar":"Standard","base":"Night Shift"}"#),
+            ("cal.add", r#"{"name":"standard"}"#),
+            (
+                "cal.exception.set",
+                r#"{"calendar":"Standard","from":"2026-03-09","to":"2026-03-08"}"#,
+            ),
+            ("cal.exception.del", r#"{"calendar":"Standard","index":3}"#),
+            ("cal.del", r#"{"calendar":"Standard"}"#),
+            ("cal.get", r#"{"calendar":"Moon"}"#),
+        ] {
+            assert!(run(&mut ed, verb, args).is_err(), "{verb} {args}");
+        }
+        assert_eq!(*ed.project(), before);
+        let del = run(&mut ed, "cal.del", r#"{"calendar":"Night Shift"}"#).unwrap();
+        assert_eq!(num(&del, "deleted"), f64::from(night_uid));
+        assert_eq!(num(&run(&mut ed, "cal.list", "{}").unwrap(), "count"), 1.0);
     }
 
     #[test]
