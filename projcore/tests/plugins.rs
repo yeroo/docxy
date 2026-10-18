@@ -496,6 +496,32 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
     assert_eq!(bumped.ops[0].verb, "task.set");
     assert_eq!(bumped.status.as_deref(), Some("Fixture: bumped task 1"));
     assert!(!bumped.close);
+    // The layout hints (#1609) and Help.
+    let opts = ui.manifest().dialog("fixture.options").unwrap();
+    assert_eq!(opts.size, Some((460, 400)));
+    assert_eq!(opts.pages[0].columns, 2);
+    assert_eq!(opts.pages[0].controls[0].group, "Numbers");
+    assert!(opts.pages[0].controls[4].fill);
+    assert_eq!(
+        ui.manifest().dialog("fixture.sheet").unwrap().placement,
+        "right"
+    );
+    assert_eq!(
+        ui.manifest().dialog("task-information").unwrap().header[0].name,
+        "fixture.head"
+    );
+    assert_eq!(
+        state.value("fixture.sample").and_then(|v| v.get("bold")),
+        Some(&Json::Bool(true))
+    );
+    let help = ui
+        .command(&Command {
+            button: Some("help".into()),
+            ..cmd("fixture.hello", vec![1], Some(Json::Obj(Vec::new())))
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(help.status.as_deref(), Some("Fixture: help"));
 
     // The overlay: a label at the first bar, a link from the first bar's
     // end to the second bar's start.

@@ -219,8 +219,13 @@ fn comparator_holds(part: &str, v: Version) -> Result<bool, String> {
 /// {"ribbon":[{"tab":"Task","groups":[{"title":"Extras","controls":[
 ///     {"id":"x.hello","kind":"button","label":"Hello","tip":"Say hello","keytip":"XH","large":true}]}]}],
 ///  "menus":[{"menu":"row","items":[{"id":"x.hello","label":"Hello","after":"Notes..."}]}],
-///  "dialogs":[{"id":"x.options","title":"Options","pages":[{"name":"General","controls":[
-///     {"name":"note","label":"&Note:","kind":"multiline"}]}]}],
+///  "dialogs":[{"id":"x.options","title":"Options","size":[480,360],"placement":"bottom",
+///     "header":[{"name":"name","label":"&Name:","kind":"text"}],
+///     "pages":[{"name":"General","columns":2,"controls":[
+///     {"name":"start","label":"&Start:","kind":"date","group":"Dates"},
+///     {"name":"finish","label":"&Finish:","kind":"date","group":"Dates"},
+///     {"name":"note","label":"&Note:","kind":"multiline","span":2,"fill":true}]}],
+///     "buttons":["OK","Cancel","Help"]}],
 ///  "palettes":[{"id":"x.blue","label":"Blue","bars":[{"kind":"on-track","color":"#3366CC","shape":"bar"}]}],
 ///  "text_style_categories":["Late Tasks"]}
 /// ```
@@ -370,6 +375,16 @@ pub struct DialogSpec {
     /// it (#1602): the host asks `yppx_ui_state` again with the dialog id
     /// and applies the reply's values, items and enabled flags.
     pub modeless: bool,
+    /// A fixed size in logical pixels, shared by every page, so switching
+    /// pages does not resize the dialog (#1609); `None` sizes to the content.
+    pub size: Option<(u32, u32)>,
+    /// Where the buttons go (#1609): `bottom` (the default: a Help button
+    /// bottom left, the rest bottom right, as Project's) or `right` (a
+    /// column down the right side, as Assign Resources').
+    pub placement: String,
+    /// Controls drawn above every page (#1609): Task Information's Name,
+    /// Duration and Estimated row.
+    pub header: Vec<DialogControl>,
 }
 
 /// One button of a plugin's dialog (#1602). A press sends the dialog's
@@ -431,10 +446,16 @@ impl DialogButton {
 pub struct DialogPage {
     pub name: String,
     pub controls: Vec<DialogControl>,
+    /// Controls per row (#1609): 1 (the default, one control a row) or
+    /// more, filled in order, label widths aligned per column; a control's
+    /// `span` takes that many columns.
+    pub columns: u32,
 }
 
 /// A dialog control. `kind` is one of `text`, `number`, `date`, `duration`,
 /// `checkbox`, `radio`, `dropdown`, `list`, `grid`, `multiline`, `label`,
+/// `sample` (a read-only preview box, #1609: its `value` is `{text, font,
+/// size, bold, italic, underline, color, background}` or a bare text),
 /// `color`, `font`; the host draws the ones it has and the rest as text.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DialogControl {
@@ -453,12 +474,83 @@ pub struct DialogControl {
     /// dialog staying open (#1602): Project applies a typed Units cell
     /// without a button press.
     pub commit_command: bool,
+    /// The titled group box this control sits in (#1609); consecutive
+    /// controls naming the same group share one box.
+    pub group: String,
+    /// Columns this control takes in a page of several (#1609); 0 or 1 is
+    /// one.
+    pub span: u32,
+    /// A grid's visible rows (#1609): the body is at least this tall, empty
+    /// rows drawn, more rows scroll; 0 is the host's default (8).
+    pub min_rows: u32,
+    /// A multiline that fills the page's remaining height (#1609), in a
+    /// dialog with a `size`.
+    pub fill: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct GridColumn {
     pub name: String,
     pub kind: String,
+}
+
+/// A whole number in u32 range, else `None`.
+fn as_u32(v: &Json) -> Option<u32> {
+    v.as_i64().and_then(|n| u32::try_from(n).ok())
+}
+
+impl DialogControl {
+    fn from_json(c: &Json) -> DialogControl {
+        DialogControl {
+            name: c.text("name"),
+            label: c.text("label"),
+            kind: c.text("kind"),
+            items: c.texts("items"),
+            columns: c
+                .list("columns")
+                .iter()
+                .map(|col| GridColumn {
+                    name: col.text("name"),
+                    kind: col.text("kind"),
+                })
+                .collect(),
+            value: c.get("value").cloned().unwrap_or(Json::Null),
+            commit_command: c.flag("commit_command"),
+            group: c.text("group"),
+            span: c.get("span").and_then(as_u32).unwrap_or(0),
+            min_rows: c.get("min_rows").and_then(as_u32).unwrap_or(0),
+            fill: c.flag("fill"),
+        }
+    }
+
+    fn json(&self) -> Json {
+        Json::obj(vec![
+            ("name", Json::str(self.name.clone())),
+            ("label", Json::str(self.label.clone())),
+            ("kind", Json::str(self.kind.clone())),
+            ("items", Json::strs(&self.items)),
+            (
+                "columns",
+                Json::Arr(
+                    self.columns
+                        .iter()
+                        .map(|col| {
+                            Json::obj(vec![
+                                ("name", Json::str(col.name.clone())),
+                                ("kind", Json::str(col.kind.clone())),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            ("value", self.value.clone()),
+            ("commit_command", Json::Bool(self.commit_command)),
+            ("group", Json::str(self.group.clone())),
+            ("span", Json::Num(f64::from(self.span))),
+            ("min_rows", Json::Num(f64::from(self.min_rows))),
+            ("fill", Json::Bool(self.fill)),
+        ])
+    }
 }
 
 /// A bar palette preset for the gallery and the plan's formatting.
@@ -597,23 +689,9 @@ impl Manifest {
                         controls: p
                             .list("controls")
                             .iter()
-                            .map(|c| DialogControl {
-                                name: c.text("name"),
-                                label: c.text("label"),
-                                kind: c.text("kind"),
-                                items: c.texts("items"),
-                                columns: c
-                                    .list("columns")
-                                    .iter()
-                                    .map(|col| GridColumn {
-                                        name: col.text("name"),
-                                        kind: col.text("kind"),
-                                    })
-                                    .collect(),
-                                value: c.get("value").cloned().unwrap_or(Json::Null),
-                                commit_command: c.flag("commit_command"),
-                            })
+                            .map(DialogControl::from_json)
                             .collect(),
+                        columns: p.get("columns").and_then(as_u32).unwrap_or(0),
                     })
                     .collect(),
                 buttons: d
@@ -622,6 +700,39 @@ impl Manifest {
                     .map(DialogButton::from_json)
                     .collect(),
                 modeless: d.flag("modeless"),
+                size: match d.get("size").and_then(Json::as_array) {
+                    Some([w, h]) => match (as_u32(w), as_u32(h)) {
+                        (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+                        _ => {
+                            return Err(format!(
+                                "dialog '{}': size is [width, height]",
+                                d.text("id")
+                            ));
+                        }
+                    },
+                    Some(_) => {
+                        return Err(format!(
+                            "dialog '{}': size is [width, height]",
+                            d.text("id")
+                        ));
+                    }
+                    None => None,
+                },
+                placement: match d.text("placement").as_str() {
+                    "" | "bottom" => String::new(),
+                    "right" => "right".into(),
+                    other => {
+                        return Err(format!(
+                            "dialog '{}': placement is bottom or right, not '{other}'",
+                            d.text("id")
+                        ));
+                    }
+                },
+                header: d
+                    .list("header")
+                    .iter()
+                    .map(DialogControl::from_json)
+                    .collect(),
             });
         }
         for p in v.list("palettes") {
@@ -802,50 +913,11 @@ impl Manifest {
                                             Json::Arr(
                                                 pg.controls
                                                     .iter()
-                                                    .map(|c| {
-                                                        Json::obj(vec![
-                                                            ("name", Json::str(c.name.clone())),
-                                                            ("label", Json::str(c.label.clone())),
-                                                            ("kind", Json::str(c.kind.clone())),
-                                                            ("items", Json::strs(&c.items)),
-                                                            (
-                                                                "columns",
-                                                                Json::Arr(
-                                                                    c.columns
-                                                                        .iter()
-                                                                        .map(|col| {
-                                                                            Json::obj(vec![
-                                                                                (
-                                                                                    "name",
-                                                                                    Json::str(
-                                                                                        col.name
-                                                                                            .clone(
-                                                                                            ),
-                                                                                    ),
-                                                                                ),
-                                                                                (
-                                                                                    "kind",
-                                                                                    Json::str(
-                                                                                        col.kind
-                                                                                            .clone(
-                                                                                            ),
-                                                                                    ),
-                                                                                ),
-                                                                            ])
-                                                                        })
-                                                                        .collect(),
-                                                                ),
-                                                            ),
-                                                            ("value", c.value.clone()),
-                                                            (
-                                                                "commit_command",
-                                                                Json::Bool(c.commit_command),
-                                                            ),
-                                                        ])
-                                                    })
+                                                    .map(DialogControl::json)
                                                     .collect(),
                                             ),
                                         ),
+                                        ("columns", Json::Num(f64::from(pg.columns))),
                                     ])
                                 })
                                 .collect(),
@@ -856,6 +928,17 @@ impl Manifest {
                         Json::Arr(d.buttons.iter().map(DialogButton::json).collect()),
                     ),
                     ("modeless", Json::Bool(d.modeless)),
+                    (
+                        "size",
+                        d.size.map_or(Json::Null, |(w, h)| {
+                            Json::Arr(vec![Json::Num(f64::from(w)), Json::Num(f64::from(h))])
+                        }),
+                    ),
+                    ("placement", Json::str(d.placement.clone())),
+                    (
+                        "header",
+                        Json::Arr(d.header.iter().map(DialogControl::json).collect()),
+                    ),
                 ])
             })
             .collect();
@@ -1920,7 +2003,8 @@ mod tests {
       "dialogs":[{"id":"task-information","pages":[{"name":"Fixture","controls":[
          {"name":"fx.note","label":"&Note:","kind":"multiline","value":""},
          {"name":"fx.grid","label":"Items","kind":"grid","columns":[{"name":"Name","kind":"text"},{"name":"Done","kind":"checkbox"}],"value":[["a","false"]]}]}]},
-         {"id":"fx.options","title":"Fixture Options","pages":[{"name":"General","controls":[{"name":"n","label":"N:","kind":"number"}]}],"buttons":["OK","Cancel","Help"]},
+         {"id":"fx.options","title":"Fixture Options","size":[480,360],"placement":"right","header":[{"name":"h","label":"H:","kind":"label","value":"top"}],
+          "pages":[{"name":"General","columns":2,"controls":[{"name":"n","label":"N:","kind":"number","group":"Numbers","span":2},{"name":"s","label":"","kind":"sample","value":{"text":"Aa","bold":true}},{"name":"g","kind":"grid","min_rows":4},{"name":"m","kind":"multiline","fill":true}]}],"buttons":["OK","Cancel","Help"]},
          {"id":"fx.sheet","title":"Fixture Sheet","modeless":true,"pages":[{"name":"Sheet","controls":[{"name":"g","label":"","kind":"grid","commit_command":true,"columns":[{"name":"Pick","kind":"check"},{"name":"Name","kind":"text"}]}]}],
           "buttons":[{"id":"apply","label":"&Apply","default":true},{"id":"clear","label":"Clear"},{"id":"close","label":"Close","cancel":true}]}],
       "palettes":[{"id":"fx.blue","label":"Blue","bars":[{"kind":"on-track","color":"#3366CC","shape":"bar"},{"kind":"critical","color":"#CC3333"}]}],
@@ -2153,6 +2237,21 @@ mod tests {
         assert!(m.dialog("fx.options").unwrap().buttons[0].default);
         assert!(m.dialog("fx.options").unwrap().buttons[1].cancel);
         assert!(!m.dialog("fx.options").unwrap().modeless);
+        // Layout hints (#1609).
+        let opts = m.dialog("fx.options").unwrap();
+        assert_eq!(opts.size, Some((480, 360)));
+        assert_eq!(opts.placement, "right");
+        assert_eq!(opts.header[0].name, "h");
+        assert_eq!(opts.pages[0].columns, 2);
+        assert_eq!(opts.pages[0].controls[0].group, "Numbers");
+        assert_eq!(opts.pages[0].controls[0].span, 2);
+        assert_eq!(opts.pages[0].controls[1].kind, "sample");
+        assert_eq!(opts.pages[0].controls[2].min_rows, 4);
+        assert!(opts.pages[0].controls[3].fill);
+        assert_eq!(m.dialog("fx.sheet").unwrap().size, None);
+        assert_eq!(m.dialog("fx.sheet").unwrap().placement, "");
+        assert!(Manifest::parse(r#"{"dialogs":[{"id":"x","size":[0,10]}]}"#).is_err());
+        assert!(Manifest::parse(r#"{"dialogs":[{"id":"x","placement":"left"}]}"#).is_err());
         // Buttons of the dialog's own and a modeless dialog (#1602).
         let sheet = m.dialog("fx.sheet").unwrap();
         assert!(sheet.modeless);

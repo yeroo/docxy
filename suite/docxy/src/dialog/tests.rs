@@ -118,6 +118,9 @@ fn form() -> Dialog {
         stale: false,
         seen: None,
         committed: None,
+        size: None,
+        buttons_right: false,
+        page_columns: Vec::new(),
     };
     d.controls = d.controls.into_iter().map(general).collect();
     preds.page = Some(1);
@@ -1061,4 +1064,70 @@ fn a_modeless_dialog_keeps_the_keys_only_while_active_and_survives_clear_modal()
     s.top_dialog_mut().unwrap().modeless = false;
     s.clear_modal();
     assert!(!s.is_open());
+}
+
+#[test]
+fn layout_hints_are_read_back_and_a_sample_cannot_be_set() {
+    // The layout hints of #1609: a fixed size, the buttons' side, the
+    // columns per page, a control's group, span, min_rows and fill, and a
+    // sample's parsed style; a header control is one on every page.
+    let mut d = form();
+    d.size = Some((460., 340.));
+    d.buttons_right = true;
+    d.page_columns = vec![2, 1];
+    let mut sample = Control::new(
+        "look",
+        "Sample",
+        ControlKind::Sample,
+        Value::Text(r#"{"text":"Aa","bold":true,"size":14}"#.into()),
+    );
+    sample.group = Some("Numbers".into());
+    sample.span = 2;
+    sample.plugin = true;
+    d.controls.push(sample);
+    let mut grid = Control::new("rows", "", ControlKind::Grid, Value::Rows(Vec::new()));
+    grid.min_rows = Some(6);
+    grid.page = Some(0);
+    d.controls.push(grid);
+    let mut memo = Control::new(
+        "memo",
+        "Memo",
+        ControlKind::Multiline,
+        Value::Text(String::new()),
+    );
+    memo.fill = true;
+    memo.page = Some(0);
+    d.controls.push(memo);
+    assert_eq!(d.columns(), 2);
+    let mut s = DialogStack::default();
+    s.push(d);
+    let json = s.to_json();
+    assert_eq!(
+        json.get("size"),
+        Some(&Json::Arr(vec![Json::Num(460.), Json::Num(340.)]))
+    );
+    assert_eq!(json.get_str("placement"), Some("right"));
+    assert_eq!(json.get_usize("columns"), Some(2));
+    let controls = json.get("controls").unwrap().as_array().unwrap();
+    let by = |n: &str| {
+        controls
+            .iter()
+            .find(|c| c.get_str("name") == Some(n))
+            .unwrap()
+    };
+    assert_eq!(by("look").get_str("kind"), Some("sample"));
+    assert_eq!(by("look").get_str("group"), Some("Numbers"));
+    assert_eq!(by("look").get_usize("span"), Some(2));
+    assert_eq!(by("look").get("header"), Some(&Json::Bool(true)));
+    assert_eq!(
+        by("look").get("sample").and_then(|s| s.get("bold")),
+        Some(&Json::Bool(true))
+    );
+    assert_eq!(by("rows").get_usize("min_rows"), Some(6));
+    assert_eq!(by("rows").get("header"), None);
+    assert_eq!(by("memo").get("fill"), Some(&Json::Bool(true)));
+    assert_eq!(by("locked").get("span"), None);
+    assert!(s.set("look", &args(r#"{"value":"x"}"#)).is_err());
+    s.select_tab("Predecessors").unwrap();
+    assert_eq!(s.to_json().get_usize("columns"), Some(1));
 }

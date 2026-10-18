@@ -426,9 +426,18 @@
   `Check` cell; a `commit_command` grid's commit sends the command with
   `edit` through `Dialog::committed`) are generic; the catalogue check skips
   `plugin` controls.
+  A plugin dialog may be laid out as Project's (#1609): `Dialog::size`
+  (fixed, every page), `buttons_right` (else Help bottom left, the rest
+  bottom right), `page_columns` (controls per row; `Docxy::dialog_body`
+  chunks the shown controls into rows, consecutive same-`Control::group`
+  controls into a titled box, `span` columns each, the labels of a column
+  one width), `Control::min_rows` (a grid's visible rows; a plugin grid
+  draws 8, more scroll), `Control::fill` (a multiline fills a sized
+  dialog), `ControlKind::Sample` (a read-only styled box, `Control::sample`),
+  and a header (`page: None` plugin controls, drawn first on every page).
   A plugin dialog may declare its own buttons (`Button::id`; a press sends
   the command with `button`, the dialog stays open unless the reply's
-  `close`), be `modeless` (no backdrop, `Dialog::active` decides who has
+  `close`; `help` is drawn and sent like any other), be `modeless` (no backdrop, `Dialog::active` decides who has
   the keys: a press in the table takes them, a dialog press gives them
   back; mutating control verbs `clear_modal` and keep it; `refuse_under_dialog`
   ignores it), and every plugin control change marks the dialog `stale`:

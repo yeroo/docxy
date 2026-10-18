@@ -404,6 +404,10 @@ pub(crate) enum ControlKind {
     /// by `dialog-set` alone, so its Tab order and catalogue do not move.
     Grid,
     Label,
+    /// A read-only preview box (#1609): the value is the sample's JSON
+    /// (`{text, font, size, bold, italic, underline, color, background}`, or
+    /// a bare text), drawn in that style. Never edited, never focused.
+    Sample,
     /// A text field of several lines: Enter is a new line, not OK (#1532).
     Multiline,
     /// Items each checked or not, a tree by `Control::depths`: checking an
@@ -426,6 +430,7 @@ impl ControlKind {
             Self::List => "list",
             Self::Grid => "grid",
             Self::Label => "label",
+            Self::Sample => "sample",
             Self::Multiline => "multiline",
             Self::CheckList => "checklist",
         }
@@ -520,6 +525,18 @@ pub(crate) struct Control {
     /// A plugin grid whose cell commits send the dialog's command at once
     /// (#1602): see [`Dialog::committed`].
     pub commit_command: bool,
+    /// The titled group box the control is drawn in (#1609): consecutive
+    /// controls of one page with the same title share one box.
+    pub group: Option<String>,
+    /// Columns the control takes on a page of several (#1609); at least 1.
+    pub span: u8,
+    /// A grid's visible rows (#1609): the body is at least this tall, empty
+    /// rows drawn, more rows scroll. `None` is the kind's default (8 for a
+    /// plugin's grid, the rows themselves for a built-in dialog's).
+    pub min_rows: Option<usize>,
+    /// A multiline that fills the page's remaining height (#1609) in a
+    /// dialog with a fixed `size`.
+    pub fill: bool,
 }
 
 impl Control {
@@ -541,6 +558,22 @@ impl Control {
             col: 0,
             edit: None,
             commit_command: false,
+            group: None,
+            span: 1,
+            min_rows: None,
+            fill: false,
+        }
+    }
+
+    /// A sample's style (#1609): the value's JSON object, or a bare text as
+    /// `{text}`.
+    pub fn sample(&self) -> Json {
+        match &self.value {
+            Value::Text(s) => match Json::parse(s) {
+                Ok(j @ Json::Obj(_)) => j,
+                _ => Json::obj(vec![("text", Json::Str(s.clone()))]),
+            },
+            _ => Json::Obj(Vec::new()),
         }
     }
 
@@ -654,6 +687,22 @@ impl Control {
         if self.plugin {
             out.push(("plugin", Json::Bool(true)));
         }
+        // The layout hints (#1609), reported only when set.
+        if let Some(g) = &self.group {
+            out.push(("group", Json::Str(g.clone())));
+        }
+        if self.span > 1 {
+            out.push(("span", Json::Num(f64::from(self.span))));
+        }
+        if let Some(n) = self.min_rows {
+            out.push(("min_rows", Json::Num(n as f64)));
+        }
+        if self.fill {
+            out.push(("fill", Json::Bool(true)));
+        }
+        if self.kind == ControlKind::Sample {
+            out.push(("sample", self.sample()));
+        }
         if self.kind == ControlKind::CheckList {
             out.push(("items", strs(&self.items)));
             out.push((
@@ -690,6 +739,9 @@ impl Control {
         };
         self.value = match self.kind {
             ControlKind::Label => return Err(format!("'{label}' is a label; it cannot be set")),
+            ControlKind::Sample => {
+                return Err(format!("'{label}' is a sample; it cannot be set"));
+            }
             ControlKind::Text
             | ControlKind::Date
             | ControlKind::Duration
@@ -990,6 +1042,14 @@ pub(crate) struct Dialog {
     /// control index, row, column and the cell's text now. The host sends
     /// the dialog's command with it before the next read or frame.
     pub committed: Option<(usize, usize, usize, String)>,
+    /// A fixed size in logical pixels (#1609), shared by every page; `None`
+    /// sizes the dialog to its content.
+    pub size: Option<(f32, f32)>,
+    /// The buttons go down the right side (#1609); else along the bottom
+    /// (Help bottom left, the rest bottom right).
+    pub buttons_right: bool,
+    /// Controls per row, per page (#1609): a page not listed has one.
+    pub page_columns: Vec<u8>,
 }
 
 /// See [`Dialog::react`]. Two dialogs compare equal whatever their
@@ -1074,7 +1134,15 @@ impl Dialog {
             stale: false,
             seen: None,
             committed: None,
+            size: None,
+            buttons_right: false,
+            page_columns: Vec::new(),
         }
+    }
+
+    /// Controls per row on the current page (#1609), at least 1.
+    pub fn columns(&self) -> usize {
+        self.page_columns.get(self.tab).copied().unwrap_or(1).max(1) as usize
     }
 
     /// The controls on the current tab, as a person sees them.
@@ -1878,7 +1946,20 @@ impl Dialog {
             ),
             (
                 "controls",
-                Json::Arr(self.page_controls().map(Control::to_json).collect()),
+                Json::Arr(
+                    self.page_controls()
+                        .map(|c| {
+                            let mut j = c.to_json();
+                            if !self.tabs.is_empty()
+                                && c.page.is_none()
+                                && let Json::Obj(pairs) = &mut j
+                            {
+                                pairs.push(("header".into(), Json::Bool(true)));
+                            }
+                            j
+                        })
+                        .collect(),
+                ),
             ),
             (
                 "buttons",
@@ -1898,6 +1979,25 @@ impl Dialog {
             ),
             ("modeless", Json::Bool(self.modeless)),
             ("active", Json::Bool(self.active)),
+            // The layout hints (#1609).
+            (
+                "size",
+                self.size.map_or(Json::Null, |(w, h)| {
+                    Json::Arr(vec![Json::Num(f64::from(w)), Json::Num(f64::from(h))])
+                }),
+            ),
+            (
+                "placement",
+                Json::Str(
+                    if self.buttons_right {
+                        "right"
+                    } else {
+                        "bottom"
+                    }
+                    .into(),
+                ),
+            ),
+            ("columns", Json::Num(self.columns() as f64)),
         ])
     }
 }
@@ -2119,6 +2219,9 @@ mod tests_support {
             stale: false,
             seen: None,
             committed: None,
+            size: None,
+            buttons_right: false,
+            page_columns: Vec::new(),
         }
     }
 }

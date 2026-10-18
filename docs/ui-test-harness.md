@@ -1280,7 +1280,11 @@ point. Four verbs read and drive it:
 | `dialog-click` | `{button}` | `state` after the button's handler, with `dialog` set to the dialog now on top (the child it opened, the parent, or `{open: false}`) |
 
 `dialog-read` replies `{open, id, depth, title, text, tabs, tab, controls,
-buttons, modeless, active}`. `id` is stable (`delete-summary`), `depth` counts from 1, `text` is
+buttons, modeless, active, size, placement, columns}` (the last three the
+layout hints of #1609: `size` `[w, h]` or null, `placement` `bottom` or
+`right`, `columns` the current page's controls per row; a control adds
+`group`, `span`, `min_rows`, `fill` when set, `header: true` when it is
+drawn above every page, and a `sample` control its parsed `sample` style). `id` is stable (`delete-summary`), `depth` counts from 1, `text` is
 a message box's message (null otherwise), and `tab` is the current tab's label
 (null for a dialog without tabs). Each button is `{id, label, enabled, default}`
 (`id` the folded label, or the one a UI plugin's spec gives; `dialog-click`

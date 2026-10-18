@@ -489,6 +489,17 @@ without one nothing changes.
   the plan or the selection moved since the dialog last saw them (under a
   modal dialog, through its own command) every value the state gives
   applies, so a modal dialog's grid shows the rows its ops made.
+  Layout hints (#1609), all optional: a dialog's `size: [w, h]` (fixed,
+  shared by every page), `placement: "bottom" | "right"` (Help bottom left
+  and the rest bottom right, or a column down the right), `header: [...]`
+  (controls drawn above every page); a page's `columns: n` (controls per
+  row, labels aligned per column); a control's `group` (a titled box
+  around consecutive controls naming it), `span` (columns it takes),
+  `min_rows` (a grid's visible rows, empty rows drawn, more scroll; a
+  plugin grid's default is 8), `fill` (a multiline fills the page), and
+  the `sample` kind (a read-only box drawing `{text, font, size, bold,
+  italic, underline, color, background}`). A `Help` button is drawn and
+  sends the command with `button: "help"`.
 - **Overlay** (`yppx_ui_overlay`): the rows in view (`uid`, `row_y`, the bar
   rectangle, kind flags, since #1548 `name`, `percent_complete`,
   `deadline_x`, `constraint {type, x}` and `resource_names`, and since

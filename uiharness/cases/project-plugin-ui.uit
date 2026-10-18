@@ -126,7 +126,27 @@ test the button's command opens the plugin's dialog, whose OK sends the values b
   assert reply.controls.0.plugin is true
   assert reply.buttons.0.label is OK
   assert reply.buttons.1.label is Cancel
-  assert reply.buttons.2.id is bump
+  assert reply.buttons.2.id is help
+  assert reply.buttons.3.id is bump
+  # The layout hints (#1609): a fixed size, two columns, the Numbers group,
+  # a sample the state styles, a memo that fills, Help bottom left.
+  assert reply.size.0 is 460
+  assert reply.size.1 is 400
+  assert reply.placement is bottom
+  assert reply.columns is 2
+  assert reply.controls.0.group is Numbers
+  assert reply.controls.1.group is Numbers
+  assert reply.controls.3.name is fixture.sample
+  assert reply.controls.3.kind is sample
+  assert reply.controls.3.sample.bold is true
+  assert reply.controls.3.sample.size is 13
+  assert reply.controls.4.name is fixture.memo
+  assert reply.controls.4.fill is true
+  shot window
+  call dialog-click {"button":"Help"}
+  assert dialog is plugin
+  assert status is Fixture: help
+  call dialog-read {}
   # The label follows the number: a control change applies the state's
   # labels (#1610), and the task's name from the plan.
   assert reply.controls.1.name is fixture.echo
@@ -140,6 +160,8 @@ test the button's command opens the plugin's dialog, whose OK sends the values b
   call dialog-set {"control":"n","value":7}
   call dialog-read {}
   assert reply.controls.1.value is Number 7 for A
+  # The sample follows the number too (odd: bold, size 12 + n).
+  assert reply.controls.3.sample.size is 19
   # Bump renames the task under the modal dialog: the plan moved, so the
   # state's values apply (the label), while the typed number stays.
   call dialog-click {"button":"Bump"}
@@ -214,6 +236,11 @@ test Task Information gains the plugin's page, prefilled, with a multiline and a
   click C2
   key alt t c
   assert dialog is task-information
+  # The spec's header control draws above every page (#1609).
+  call dialog-read {}
+  assert reply.controls.-1.name is fixture.head
+  assert reply.controls.-1.header is true
+  assert reply.controls.-1.value is on every page
   call dialog-read {}
   assert reply.tabs.5 is Fixture
   call dialog-tab {"tab":"Fixture"}
@@ -312,6 +339,9 @@ test a modeless dialog with a grid and buttons of its own follows the plan and r
   assert reply.active is true
   assert reply.buttons.0.id is apply
   assert reply.buttons.0.label is Apply
+  assert reply.placement is right
+  assert reply.controls.0.min_rows is 6
+  shot window
   assert reply.buttons.0.default is true
   assert reply.buttons.1.id is clear
   assert reply.buttons.1.enabled is false

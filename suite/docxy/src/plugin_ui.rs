@@ -669,6 +669,7 @@ fn kind_of(kind: &str) -> dialog::ControlKind {
         "list" => K::List,
         "grid" => K::Grid,
         "label" => K::Label,
+        "sample" => K::Sample,
         // `color` and `font` are typed as text until the host has pickers.
         _ => K::Text,
     }
@@ -678,6 +679,12 @@ fn kind_of(kind: &str) -> dialog::ControlKind {
 fn value_of(kind: dialog::ControlKind, items: &[String], value: &Json) -> dialog::Value {
     use dialog::{ControlKind as K, Value};
     match kind {
+        // A sample's style travels as its JSON (#1609).
+        K::Sample => Value::Text(match value {
+            Json::Obj(_) => value.to_string(),
+            Json::Str(s) => s.clone(),
+            _ => String::new(),
+        }),
         K::Checkbox | K::Check => Value::Bool(value.as_bool().unwrap_or(false)),
         K::Radio | K::Dropdown | K::List => Value::Choice(match value {
             Json::Num(n) => Some(*n as usize).filter(|i| *i < items.len()),
@@ -780,6 +787,11 @@ fn control_of_spec(
     out.commit_command = c.commit_command;
     out.page = page;
     out.plugin = true;
+    // The layout hints (#1609).
+    out.group = (!c.group.is_empty()).then(|| c.group.clone());
+    out.span = u8::try_from(c.span.max(1)).unwrap_or(u8::MAX);
+    out.min_rows = (c.min_rows > 0).then_some(c.min_rows as usize);
+    out.fill = c.fill;
     apply_selected_row(&mut out, prefill);
     out
 }
@@ -841,32 +853,40 @@ fn open_dialog(v: &ProjectView, spec_id: &str, command: &str) -> Result<Dialog, 
     d.text = None;
     d.modeless = spec.modeless;
     d.seen = Some((v.ed.revision(), v.selected_uid()));
+    // The layout hints (#1609): a fixed size, the buttons' side, the
+    // columns per page, the header drawn above every page.
+    d.size = spec.size.map(|(w, h)| (w as f32, h as f32));
+    d.buttons_right = spec.placement == "right";
+    d.page_columns = spec
+        .pages
+        .iter()
+        .map(|p| u8::try_from(p.columns.max(1)).unwrap_or(u8::MAX))
+        .collect();
     let tabbed = spec.pages.len() > 1;
     if tabbed {
         d.tabs = spec.pages.iter().map(|p| p.name.clone()).collect();
     }
     d.controls = spec
-        .pages
+        .header
         .iter()
-        .enumerate()
-        .flat_map(|(i, p)| {
+        .map(|c| control_of_spec(c, None, values))
+        .chain(spec.pages.iter().enumerate().flat_map(|(i, p)| {
             let page = tabbed.then_some(i);
             p.controls
                 .iter()
                 .map(move |c| control_of_spec(c, page, values))
-        })
+        }))
         .collect();
     // OK and Cancel, or the spec's own buttons (#1602): `ok` accepts (the
     // command gets the values and the dialog closes), a cancel button
     // closes, any other sends the command with its id and stays open
-    // unless the reply closes it. Help is not drawn: the host has no help
-    // pages for a plugin. The state greys a button by its id.
+    // unless the reply closes it; `help` is such a button, drawn bottom
+    // left as Project's (#1609). The state greys a button by its id.
     let mut buttons = if spec.buttons.is_empty() {
         ok_cancel()
     } else {
         spec.buttons
             .iter()
-            .filter(|b| !b.id.eq_ignore_ascii_case("help"))
             .map(|b| {
                 let role = if b.cancel {
                     dialog::ButtonRole::Cancel
@@ -979,10 +999,15 @@ pub(crate) fn refresh_dialog(tab: &mut DocTab) {
                 );
             }
         }
-        // The state's values: every control when the plan moved, a label
-        // (display only) on any refresh, so one may follow another control
-        // (#1610); an editable control keeps what it holds otherwise.
-        let follows = moved || c.kind == dialog::ControlKind::Label;
+        // The state's values: every control when the plan moved, a label or
+        // a sample (display only) on any refresh, so one may follow another
+        // control (#1610, #1609); an editable control keeps what it holds
+        // otherwise.
+        let follows = moved
+            || matches!(
+                c.kind,
+                dialog::ControlKind::Label | dialog::ControlKind::Sample
+            );
         if follows && let Some(value) = p.value(c.name) {
             c.value = value_of(c.kind, &c.items, value);
             if c.kind == dialog::ControlKind::Grid {
@@ -1054,6 +1079,10 @@ pub(crate) fn extend_task_info_with(d: &mut Dialog, spec: &ui::DialogSpec, value
                 .map(|c| control_of_spec(c, Some(index), values)),
         );
     }
+    // The spec's header controls draw above every page (#1609); they come
+    // last in the list, so the pages' controls keep their places.
+    d.controls
+        .extend(spec.header.iter().map(|c| control_of_spec(c, None, values)));
 }
 
 /// A press on a dialog with plugin controls: a plugin's own dialog
