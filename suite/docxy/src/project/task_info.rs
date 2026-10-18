@@ -202,13 +202,7 @@ pub(crate) fn task_info_dialog(
         check("hidebar", "&Hide Bar", task.hide_bar.unwrap_or(false), 0),
         check("rollup", "Roll&up", task.rollup.unwrap_or(false), 0),
         preds::grid(proj, task),
-        field(
-            "resources",
-            "&Resource names:",
-            ControlKind::Text,
-            text(COL_RESOURCES),
-            2,
-        ),
+        resources::grid(ed, task),
         choice(
             "ctype",
             "Constraint &type:",
@@ -305,6 +299,7 @@ fn react(d: &mut Dialog, i: usize, _before: &Value) {
     match d.controls[i].name {
         "ctype" => {}
         "predecessors" => return preds::follow(d, i, _before),
+        "resources" => return resources::follow(d, i, _before),
         // Estimated is the duration's `?`: ticking it adds the mark, clearing
         // it removes it, and typing the mark (or not) follows in the box.
         "estimated" => return follow_estimated(d, i),
@@ -470,7 +465,6 @@ pub(crate) fn apply_task_info_in(
         for (name, col) in [
             ("name", COL_NAME),
             ("duration", COL_DURATION),
-            ("resources", COL_RESOURCES),
             ("start", COL_START),
             ("finish", COL_FINISH),
         ] {
@@ -484,6 +478,12 @@ pub(crate) fn apply_task_info_in(
             };
             let links = preds::parse(ed, uid, rows)?;
             ed.set_predecessors(uid, links)?;
+        }
+        if changed("resources") {
+            let Some(Value::Rows(rows)) = d.value("resources") else {
+                return Err("The Resources grid has no rows".into());
+            };
+            ed.set_resources(uid, &resources::tokens(ed, rows))?;
         }
         if changed("percent") {
             ed.set_percent_complete(uid, whole(d, "percent", "% Complete", 0, 100)?)?;
@@ -541,6 +541,7 @@ pub(crate) fn help_click(tab: &mut DocTab, button: &str) -> Option<Result<(), St
 }
 
 mod preds;
+mod resources;
 
 #[cfg(test)]
 mod tests;

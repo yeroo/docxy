@@ -972,6 +972,10 @@ impl Control {
         // true or false, the rest text.
         let kind = self.column_kind(column);
         let heading = self.columns.get(column).map_or("", String::as_str);
+        // A label column shows what the owner computed (#1536).
+        if kind == ControlKind::Label {
+            return Err(format!("'{label}' column '{heading}' is read-only"));
+        }
         let value = match (kind, args.get("value")) {
             (ControlKind::Checkbox | ControlKind::Check, Some(Json::Bool(b))) => b.to_string(),
             (ControlKind::Checkbox | ControlKind::Check, Some(Json::Str(s)))
@@ -1540,8 +1544,10 @@ impl Dialog {
         let c = &self.controls[i];
         let (rows, cols) = (c.row_count(), c.columns.len());
         let (row, col, editing) = (c.row, c.col, c.edit.clone());
-        let toggles = c.column_kind(col).toggles();
         let kind = c.column_kind(col);
+        let toggles = kind.toggles();
+        // A cell nothing is typed into: a check or a label column.
+        let fixed = toggles || kind == ControlKind::Label;
         let suggestions = c.suggestions();
         match key {
             // The arrows reach into a combo cell's narrowed list while it is
@@ -1610,7 +1616,7 @@ impl Dialog {
             },
             "backspace" => {
                 if let Some(r) = row
-                    && !toggles
+                    && !fixed
                 {
                     let mut buf = editing.unwrap_or_else(|| self.controls[i].cell(r, col));
                     buf.pop();
@@ -1628,7 +1634,7 @@ impl Dialog {
                 Ok(true)
             }
             "delete" => {
-                if editing.is_none() && row.is_some() && !toggles {
+                if editing.is_none() && row.is_some() && !fixed {
                     self.grid_commit(i, "")?;
                 }
                 Ok(true)
@@ -1638,7 +1644,7 @@ impl Dialog {
                 let Some(t) = typed.filter(|t| t.chars().all(|c| !c.is_control())) else {
                     return Ok(false);
                 };
-                if row.is_some() && !toggles {
+                if row.is_some() && !fixed {
                     // Typing replaces the cell's text, as in a sheet.
                     let mut buf = editing.unwrap_or_default();
                     buf.push_str(t);

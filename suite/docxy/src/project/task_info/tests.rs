@@ -172,7 +172,6 @@ fn the_pages_open_prefilled_in_the_grid_cells_grammar() {
         ("duration", COL_DURATION),
         ("start", COL_START),
         ("finish", COL_FINISH),
-        ("resources", COL_RESOURCES),
     ] {
         assert_eq!(read(&t, name), cell_edit_text(ed, task, col), "{name}");
     }
@@ -185,7 +184,18 @@ fn the_pages_open_prefilled_in_the_grid_cells_grammar() {
             ["", "", "", ""]
         ])
     );
-    assert_eq!(read(&t, "resources"), "Ann, Bo");
+    let cost = |k: usize| {
+        let a = &ed.project().assignments[k];
+        projcore::editor::read_assignment_field(ed, a, projcore::editor::AssignmentField::Cost).text
+    };
+    assert_eq!(
+        grid(&t, "resources"),
+        vec![
+            vec!["Ann".to_string(), String::new(), "100%".into(), cost(0)],
+            vec!["Bo".to_string(), String::new(), "100%".into(), cost(1)],
+            vec![String::new(); 4],
+        ]
+    );
     assert_eq!(read(&t, "percent"), "30");
     assert_eq!(read(&t, "priority"), "800");
     assert_eq!(read(&t, "ctype"), "Start No Earlier Than");
@@ -226,7 +236,7 @@ fn ok_writes_every_changed_field_as_one_undo_step() {
     put(&mut t, "percent", "40");
     put(&mut t, "priority", "700");
     cell(&mut t, "predecessors[0].id", "1");
-    put(&mut t, "resources", "Ann");
+    cell(&mut t, "resources[0].resource name", "Ann");
     put(&mut t, "ctype", "Finish No Later Than");
     put(&mut t, "cdate", "2026-04-01");
     put(&mut t, "deadline", "2026-05-01");
@@ -541,7 +551,7 @@ fn unchecking_effort_driven_applies_before_a_resource_is_added() {
     }
     let duration = plain_task(&t).duration_min;
     open(&mut t, ProjectAct::Constraint);
-    put(&mut t, "resources", "Ann, Bo");
+    cell(&mut t, "resources[1].resource name", "Bo");
     set(&mut t, "effort", Json::Bool(false));
     dialog_click(&mut t, "OK").unwrap();
     let task = plain_task(&t);
@@ -963,4 +973,140 @@ fn a_link_kept_as_shown_keeps_its_stored_form_through_another_rows_edit() {
     let task = v(&t).ed.project().task(2).unwrap();
     assert_eq!(task.predecessors[0], kept, "the cross link, as it was");
     assert_eq!(task.predecessors[1].uid, 3);
+}
+
+fn assigned(t: &DocTab, uid: i32) -> Vec<(String, f64)> {
+    let proj = v(t).ed.project();
+    proj.assignments
+        .iter()
+        .filter(|a| a.task_uid == uid)
+        .map(|a| {
+            let r = proj.resources.iter().find(|r| r.uid == a.resource_uid);
+            (r.map_or(String::new(), |r| r.name.clone()), a.units)
+        })
+        .collect()
+}
+
+#[test]
+fn the_resources_page_is_a_grid_with_read_only_owner_and_cost() {
+    let mut t = tab();
+    vm(&mut t)
+        .ed
+        .set_resources(2, &["Ann".into(), "Bo[50%]".into()])
+        .unwrap();
+    {
+        let proj = v(&t).ed.project().clone();
+        let mut p = proj;
+        p.assignments[0].assn_owner = Some("Owner One".into());
+        vm(&mut t).ed = ProjectEditor::new(p);
+        vm(&mut t).ed.select(1);
+    }
+    open(&mut t, ProjectAct::Constraint);
+    let d = t.dialogs.top().unwrap();
+    let c = d.controls.iter().find(|c| c.name == "resources").unwrap();
+    assert!(c.editable_grid);
+    assert_eq!(
+        c.columns,
+        ["Resource Name", "Assignment Owner", "Units", "Cost"]
+    );
+    assert_eq!(
+        c.column_kinds,
+        [
+            ControlKind::Combo,
+            ControlKind::Label,
+            ControlKind::Text,
+            ControlKind::Label
+        ]
+    );
+    assert_eq!(c.column_items[0], ["Ann", "Bo"]);
+    let rows = grid(&t, "resources");
+    assert_eq!(rows.len(), 3, "two assignments and a blank row");
+    assert_eq!(
+        (&rows[0][0], &rows[0][1], &rows[0][2]),
+        (
+            &"Ann".to_string(),
+            &"Owner One".to_string(),
+            &"100%".to_string()
+        )
+    );
+    assert_eq!(rows[1][2], "50%");
+    t.dialogs.select_tab("Resources").unwrap();
+    for column in ["assignment owner", "cost"] {
+        let err = t
+            .dialogs
+            .set(
+                &format!("resources[0].{column}"),
+                &Json::obj(vec![("value", Json::Str("x".into()))]),
+            )
+            .unwrap_err();
+        assert!(err.contains("read-only"), "{column}: {err}");
+    }
+    // Typing into one with the keys starts nothing either.
+    t.dialogs.select_row("resources", 0).unwrap();
+    let d = t.dialogs.top_dialog_mut().unwrap();
+    let i = d.focus.unwrap();
+    d.controls[i].col = 3;
+    d.grid_key("x", Some("x")).unwrap();
+    assert_eq!(d.controls[i].edit, None);
+}
+
+#[test]
+fn resource_rows_add_a_name_change_units_and_delete() {
+    let mut t = tab();
+    vm(&mut t).ed.set_resources(2, &["Ann".into()]).unwrap();
+    vm(&mut t).ed.mark_saved();
+    t.dirty = false;
+    let depth = v(&t).ed.undo_depth();
+    open(&mut t, ProjectAct::Constraint);
+    // A new name gets 100% to start with.
+    cell(&mut t, "resources[1].resource name", "Bo");
+    assert_eq!(grid(&t, "resources")[1][2], "100%");
+    cell(&mut t, "resources[0].units", "50%");
+    cell(&mut t, "resources[1].units", "25");
+    dialog_click(&mut t, "OK").unwrap();
+    assert_eq!(assigned(&t, 2), [("Ann".into(), 0.5), ("Bo".into(), 0.25)]);
+    assert_eq!(v(&t).ed.project().resources.len(), 2, "Bo is new");
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+    // Back to 100% resets the units, and a row with no name is ignored.
+    open(&mut t, ProjectAct::Constraint);
+    assert_eq!(grid(&t, "resources")[0][2], "50%");
+    cell(&mut t, "resources[0].units", "100%");
+    cell(&mut t, "resources[2].units", "10%");
+    dialog_click(&mut t, "OK").unwrap();
+    assert_eq!(assigned(&t, 2), [("Ann".into(), 1.0), ("Bo".into(), 0.25)]);
+    // Delete drops the row's assignment.
+    open(&mut t, ProjectAct::Constraint);
+    t.dialogs.select_tab("Resources").unwrap();
+    t.dialogs.select_row("resources", 1).unwrap();
+    assert!(dialog_key(
+        &mut t,
+        "delete",
+        None,
+        gpui::Modifiers::default()
+    ));
+    dialog_click(&mut t, "OK").unwrap();
+    assert_eq!(assigned(&t, 2), [("Ann".into(), 1.0)]);
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(assigned(&t, 2).len(), 2);
+}
+
+#[test]
+fn bad_units_are_refused_and_an_untouched_grid_writes_nothing() {
+    let mut t = tab();
+    vm(&mut t)
+        .ed
+        .set_resources(2, &["Ann[50%]".into()])
+        .unwrap();
+    vm(&mut t).ed.mark_saved();
+    t.dirty = false;
+    let before = state(&t);
+    open(&mut t, ProjectAct::Constraint);
+    dialog_click(&mut t, "OK").unwrap();
+    assert_eq!(state(&t), before, "units shown as 50% stay 50%");
+    open(&mut t, ProjectAct::Constraint);
+    cell(&mut t, "resources[0].units", "lots");
+    let err = dialog_click(&mut t, "OK").unwrap_err();
+    assert!(err.contains("Invalid units"), "{err}");
+    assert_eq!(state(&t), before);
+    assert_eq!(t.dialogs.top_id(), "task-information");
 }
