@@ -1195,36 +1195,59 @@ fn deletable_object(inline: &Inline) -> Option<Inline> {
 /// A field as run-level XML, which `w:ins`/`w:del` may contain: every
 /// `w:fldSimple` (paragraph-level content), a nested one included, becomes the
 /// equivalent complex field — begin, instruction, separate, its result runs,
-/// end. Other field forms (complex fields, `w:sym` runs) are already runs.
+/// end. Other field forms (complex fields, `w:sym` runs) are already runs. A
+/// `w:fldSimple` that is not a complete element is left as it is (and
+/// [`is_run_level`] then refuses the result).
 pub(crate) fn run_level_field(raw: &str) -> String {
     let mut out = raw.to_string();
-    // The last start tag has no `w:fldSimple` inside it, so its first close
-    // tag is its own; convert it and look again.
-    while let Some(start) = out.rfind("<w:fldSimple") {
-        let open_end = out[start..].find('>').map_or(out.len(), |e| start + e + 1);
-        let end = if out[..open_end].ends_with("/>") {
-            open_end
-        } else {
-            out[open_end..]
-                .find("</w:fldSimple>")
-                .map_or(out.len(), |e| open_end + e + "</w:fldSimple>".len())
-        };
+    // Each pass looks only before the start tag it tried last, so it always
+    // ends. The last start tag has none inside it, so its element holds no
+    // `w:fldSimple`: nested ones were converted before their outer.
+    let mut limit = out.len();
+    while let Some(start) = out[..limit].rfind("<w:fldSimple") {
+        limit = start;
+        let mut parser = XmlParser::new(&out[start..]);
+        if parser.next() != Event::Start
+            || parser.name() != "w:fldSimple"
+            || !parser.skip_element_complete()
+            || parser.is_malformed()
+        {
+            continue;
+        }
+        let end = start + parser.pos();
         let runs = simple_field_runs(&out[start..end]);
         out.replace_range(start..end, &runs);
     }
     out
 }
 
-/// Whether `runs` (see [`run_level_field`]) holds only what a `w:del` may:
-/// runs, proofing marks and smart tags at its top level. A `w:hyperlink` or
-/// `w:sdt` in a field's result stays out.
+/// Whether `runs` (see [`run_level_field`]) holds only what a `w:del` may
+/// (CT_RunTrackChange: run-level content) at its top level: runs, smart tags,
+/// content controls, custom XML, proofing marks, and bookmark, comment-range
+/// and permission markers. A `w:hyperlink` or other paragraph-level content, or
+/// a `w:fldSimple` left unconverted, is not.
 pub(crate) fn is_run_level(runs: &str) -> bool {
     let mut parser = XmlParser::new(runs);
     let mut depth = 0usize;
     loop {
         match parser.next() {
             Event::Start => {
-                if depth == 0 && !matches!(parser.name(), "w:r" | "w:proofErr" | "w:smartTag") {
+                if depth == 0
+                    && !matches!(
+                        parser.name(),
+                        "w:r"
+                            | "w:proofErr"
+                            | "w:smartTag"
+                            | "w:sdt"
+                            | "w:customXml"
+                            | "w:bookmarkStart"
+                            | "w:bookmarkEnd"
+                            | "w:commentRangeStart"
+                            | "w:commentRangeEnd"
+                            | "w:permStart"
+                            | "w:permEnd"
+                    )
+                {
                     return false;
                 }
                 depth += 1;
@@ -1522,6 +1545,34 @@ fn normalize_changes(ops: Vec<Op>) -> Vec<Op> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn run_level_field_ends_on_input_that_is_not_a_simple_field_1470() {
+        for raw in [
+            "<w:fldSimpleExt/>",
+            "<w:fldSimple w:instr=\"x",
+            "<w:fldSimple w:instr=\" a \"><w:r><w:t>x</w:t></w:r>",
+        ] {
+            // Left as found, and refused as run-level content.
+            assert_eq!(run_level_field(raw), raw);
+            assert!(!is_run_level(&run_level_field(raw)), "{raw}");
+        }
+        // A comment is no element: it ends too, and is left as found.
+        assert_eq!(
+            run_level_field("<!-- <w:fldSimple -->"),
+            "<!-- <w:fldSimple -->"
+        );
+        let quoted = "<w:fldSimple w:instr=\" QUOTE &quot;a/&gt;b&quot; \"><w:r><w:t>x</w:t></w:r></w:fldSimple>";
+        let out = run_level_field(quoted);
+        assert!(
+            !out.contains("<w:fldSimple") && out.contains("<w:t>x</w:t>"),
+            "{out}"
+        );
+        assert!(is_run_level(&out));
+        let raw =
+            "<w:fldSimple w:instr=\" a \" w:instrText=\"/>\"><w:r><w:t>y</w:t></w:r></w:fldSimple>";
+        assert!(!run_level_field(raw).contains("<w:fldSimple"));
+    }
+
     use super::*;
 
     fn script(a: &str, b: &str) -> String {

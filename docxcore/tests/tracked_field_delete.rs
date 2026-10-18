@@ -280,3 +280,89 @@ fn an_untracked_delete_still_removes_the_field() {
     assert_eq!(deletions(&ed), 0);
     assert!(!xml(&ed).contains("<w:del "));
 }
+
+const LINKED: &str = "<w:fldSimple w:instr=\" REF x \"><w:hyperlink w:anchor=\"x\">\
+    <w:r><w:t>7</w:t></w:r></w:hyperlink></w:fldSimple>";
+
+fn press_backspace_twice(ed: &mut Editor) {
+    ed.set_caret(Caret::at(vec![0], 3));
+    ed.backspace();
+    ed.backspace();
+}
+
+#[test]
+fn a_nested_self_closing_field_with_a_greater_than_in_its_code() {
+    let inner = "<w:fldSimple w:instr=\" IF a > b \"/>";
+    let in_simple =
+        format!("<w:fldSimple w:instr=\" QUOTE \"><w:r><w:t>x</w:t></w:r>{inner}</w:fldSimple>");
+    let in_complex = format!(
+        "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r><w:r><w:instrText> QUOTE </w:instrText></w:r>\
+         <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r><w:r><w:t>x</w:t></w:r>{inner}\
+         <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>"
+    );
+    for field in [in_simple, in_complex] {
+        let mut ed = editor(&field);
+        assert_eq!(fields(&ed), 1);
+        press_backspace_twice(&mut ed);
+        let x = xml(&ed);
+        assert_eq!(deletions(&ed), 1, "{x}");
+        let del = &x[x.find("<w:del ").unwrap()..x.find("</w:del>").unwrap()];
+        assert!(!del.contains("fldSimple"), "{del}");
+        assert!(del.contains("<w:delText>x</w:delText>"), "{del}");
+        assert!(
+            del.contains("IF a &gt; b") || del.contains("IF a > b"),
+            "{del}"
+        );
+        assert_eq!(
+            del.matches("fldCharType=\"begin\"").count(),
+            del.matches("fldCharType=\"end\"").count(),
+            "{del}"
+        );
+    }
+}
+
+#[test]
+fn a_bookmark_in_a_simple_fields_result_is_recorded() {
+    let field = "<w:fldSimple w:instr=\" REF x \"><w:bookmarkStart w:id=\"3\" w:name=\"bk\"/>\
+        <w:r><w:t>7</w:t></w:r><w:bookmarkEnd w:id=\"3\"/></w:fldSimple>";
+    let mut ed = editor(field);
+    assert_eq!(fields(&ed), 1);
+    press_backspace_twice(&mut ed);
+    assert_eq!(deletions(&ed), 1, "{}", xml(&ed));
+}
+
+#[test]
+fn a_kept_field_is_not_cut_and_pushes_no_undo_step() {
+    let mut ed = editor(LINKED);
+    assert_eq!(fields(&ed), 1);
+    press_backspace_twice(&mut ed);
+    assert_eq!(fields(&ed), 1);
+    assert!(!ed.undo(), "the second Backspace pushed an empty step");
+
+    // Ctrl+X on the field alone: nothing to cut, no step.
+    let mut ed = editor(LINKED);
+    ed.anchor = Some(Caret::at(vec![0], 2));
+    ed.caret = Caret::at(vec![0], 3);
+    assert!(ed.cut().is_none());
+    assert_eq!(fields(&ed), 1);
+    assert!(!ed.undo());
+
+    // Over text, field, text: the text goes and the clip leaves the field
+    // out, so a paste does not duplicate it.
+    let mut ed = editor(LINKED);
+    ed.anchor = Some(Caret::at(vec![0], 1));
+    ed.caret = Caret::at(vec![0], 4);
+    let clip = ed.cut().expect("the text is cut");
+    assert_eq!(fields(&ed), 1);
+    ed.set_track_changes(None);
+    ed.set_caret(Caret::at(vec![0], 0));
+    ed.paste(&clip);
+    assert_eq!(fields(&ed), 1, "{}", xml(&ed));
+
+    // The plain-text cut leaves the field's result out of its text.
+    let mut ed = editor(LINKED);
+    ed.anchor = Some(Caret::at(vec![0], 1));
+    ed.caret = Caret::at(vec![0], 4);
+    assert_eq!(ed.cut_text().as_deref(), Some("bc"));
+    assert_eq!(fields(&ed), 1);
+}

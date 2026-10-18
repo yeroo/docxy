@@ -1489,8 +1489,9 @@ impl Editor {
         is_field
     }
 
-    /// Whether the selection is one equation while tracking: a `w:del`
-    /// cannot record it, so Backspace and Delete leave it selected (#1242).
+    /// Whether the selection is one equation, or one field a `w:del` cannot
+    /// hold, while tracking ([`kept_while_tracking`]): Backspace and Delete
+    /// leave it selected (#1242).
     fn selects_kept_equation(&self) -> bool {
         let Some((lo, hi)) = self.selection_range() else {
             return false;
@@ -1500,7 +1501,7 @@ impl Editor {
             && hi.offset == lo.offset + 1
             && resolve_para(&self.doc.body, &lo.path)
                 .and_then(|p| inline_covering(&p.content, lo.offset))
-                .is_some_and(|i| matches!(i, Inline::Equation { .. }))
+                .is_some_and(kept_while_tracking)
     }
 
     pub fn backspace(&mut self) {
@@ -2226,7 +2227,7 @@ impl Editor {
         // A tracked delete keeps every equation (a cell range's aside), so
         // the clip leaves them out: a paste must not add a second (#1242).
         if self.delete_keeps_equations_in(&self.caret.path, false) {
-            clip = without_equations(&clip);
+            clip = without_kept(&clip);
         }
         // Nothing left to cut (a lone equation while tracking, which
         // stays): no clip and no step, as `cut_text` refuses one.
@@ -3863,7 +3864,8 @@ fn push_display_text(
                 push_display_text(&h.content, start, end, equations, pos, out);
             }
             Inline::Field { text, .. } | Inline::Equation { text, .. } if len == 1 => {
-                let shown = equations || matches!(inline, Inline::Field { .. });
+                let shown = equations
+                    || (matches!(inline, Inline::Field { .. }) && !kept_while_tracking(inline));
                 if shown && start <= a && a < end {
                     out.push_str(text);
                 }
@@ -4488,24 +4490,43 @@ pub(crate) fn spanned_object_indices(
     found
 }
 
+/// An inline a tracked delete leaves in place (#1242, #1470): an equation, or
+/// a field whose result a `w:del` cannot hold (a link in it, say), which
+/// [`track`]'s `plan_delete` keeps.
+pub(crate) fn kept_while_tracking(inline: &Inline) -> bool {
+    match inline {
+        Inline::Equation { .. } => true,
+        Inline::Field { raw, .. } => {
+            !crate::compare::is_run_level(&crate::compare::run_level_field(raw))
+        }
+        _ => false,
+    }
+}
+
 /// `clip` without its equations, a hyperlink's included.
 fn without_equations(clip: &Clip) -> Clip {
-    fn strip(content: &mut Vec<Inline>) {
-        content.retain(|i| !matches!(i, Inline::Equation { .. }));
+    without(clip, |i| matches!(i, Inline::Equation { .. }))
+}
+
+/// `clip` without what a tracked delete keeps ([`kept_while_tracking`]).
+fn without_kept(clip: &Clip) -> Clip {
+    without(clip, kept_while_tracking)
+}
+
+fn without(clip: &Clip, drop: fn(&Inline) -> bool) -> Clip {
+    fn strip(content: &mut Vec<Inline>, drop: fn(&Inline) -> bool) {
+        content.retain(|i| !drop(i));
         for inline in content.iter_mut() {
             if let Inline::Hyperlink(h) = inline {
-                if h.content
-                    .iter()
-                    .any(|i| matches!(i, Inline::Equation { .. }))
-                {
+                if h.content.iter().any(drop) {
                     h.content_changed = true;
                 }
-                strip(&mut h.content);
+                strip(&mut h.content, drop);
             }
         }
     }
     let mut out = clip.clone();
-    out.paras.iter_mut().for_each(strip);
+    out.paras.iter_mut().for_each(|p| strip(p, drop));
     out
 }
 
