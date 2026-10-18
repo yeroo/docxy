@@ -1955,6 +1955,13 @@ impl Project {
         self.calendars.iter().rev().find(|c| c.uid == uid)
     }
 
+    /// [`Project::calendar`] for editing: the same calendar the reads and the
+    /// scheduler use (the last with the UID), so an edit never lands on a
+    /// duplicate they ignore (#1605).
+    pub fn calendar_mut(&mut self, uid: i32) -> Option<&mut Calendar> {
+        self.calendars.iter_mut().rev().find(|c| c.uid == uid)
+    }
+
     /// `cal`'s working week, resolved through its base chain in this project.
     /// Exceptions are ignored; see [`Project::resolved_calendar`].
     pub fn resolved_week(&self, cal: &Calendar) -> Week {

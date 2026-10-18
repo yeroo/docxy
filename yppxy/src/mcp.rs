@@ -615,7 +615,8 @@ fn tool_defs() -> Json {
             "yppxy_cal_exception_set",
             "Add (no index) or replace (index) a date-range exception of a calendar: from and \
              to dates, non-working unless `times` (or working true, the standard day) are given. \
-             Returns the calendar. One undo step.",
+             A repeating exception (recurring in yppxy_cal_get) is read only; replacing it is \
+             refused. Returns the calendar. One undo step.",
             vec![
                 calendar(),
                 (

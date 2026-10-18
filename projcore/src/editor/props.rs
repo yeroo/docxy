@@ -143,8 +143,16 @@ impl Editor {
         if self.proj.tasks[i].calendar_uid == calendar {
             return Ok(false);
         }
-        self.snapshot();
-        self.proj.tasks[i].calendar_uid = calendar;
+        // A calendar without working time cannot be adopted (#1605: the
+        // saved plan could not be read back).
+        let mut next = self.proj.clone();
+        next.tasks[i].calendar_uid = calendar;
+        if let Some(error) = crate::schedule::calendar_error(&next) {
+            return Err(error);
+        }
+        self.capture_view();
+        let prev = std::mem::replace(&mut self.proj, next);
+        self.push_undo(prev);
         self.changed();
         Ok(true)
     }

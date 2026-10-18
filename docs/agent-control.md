@@ -306,8 +306,10 @@ days from `Sun`, each `day, working, times` as `[["08:00","12:00"], …]` and
 `stated`, whether the calendar states that day itself), its `exceptions`
 (`index, name, from, to` as `YYYY-MM-DD`, `working, times`, and `recurring`
 for a repeating pattern the model keeps but does not schedule) and its
-`work_weeks` (`index, name, from, to, week`, the unstated days shown from the
-calendar). `cal.day {calendar, date}` says what the calendar works on a date
+`work_weeks` (`index, name, from, to, week`: the days the work week states,
+`stated: true`, the rest shown from the calendar's default week chain; what a
+date in the week works, a base's covering work week included, is `cal.day`'s
+answer). `cal.day {calendar, date}` says what the calendar works on a date
 and where that comes from, as Change Working Time's "Working times for" and
 "Based on" do: `{date, working, times, based_on: {kind, calendar, name}}` with
 `kind` `exception`, `work_week` or `default`.
@@ -322,7 +324,8 @@ and where that comes from, as Change Working Time's "Working times for" and
 
 `cal.add {name, base?, copy?}` adds a calendar: derived from `base` (it states
 no day of its own until `cal.set` does), else a base calendar with Project's
-standard week, or a copy of `copy`'s week, exceptions and work weeks; names are
+standard week, or a copy of `copy`'s week (as it resolves: the copy is a base
+calendar), exceptions and work weeks; names are
 unique ignoring ASCII case. `cal.set {calendar, name?, base?, week?}` renames,
 rebases a derived calendar (never a base one, never onto itself) and sets days
 of the default week: `week` is an object of weekdays (`Mon`, `monday`, …) to
@@ -331,14 +334,17 @@ overlapping; `working: false` a non-working day; `working: true` without times
 Project's standard day; `null` on a derived calendar's day inherits the base
 again). `cal.exception.set {calendar, index?, name?, from, to, working?,
 times?}` adds (no `index`) or replaces (by `index`) a date-range exception as
-Project writes one (non-working unless given times), `cal.exception.del
+Project writes one (non-working unless given times; a repeating exception,
+`recurring: true`, is read only and replacing it is refused), `cal.exception.del
 {calendar, index}` removes it; `cal.workweek.set {calendar, index?, name?,
 from, to, week}` and `cal.workweek.del {calendar, index}` do the same for work
 weeks. `cal.del {calendar}` removes a calendar nothing uses: not the project
 calendar, no task's or resource's, no other calendar's base. Each edit is one
 undo step, a value the calendar already has records none, every argument is
-checked first, and an edit that would leave a calendar a task schedules on
-without working time is refused.
+checked first (a day that is not `{working?, times?}` or `null` is refused,
+never read as a non-working day), and an edit that would leave a calendar a
+task schedules on without working time is refused, as is `task.set` or
+`proj.set` adopting a calendar that has none.
 
 File handling differs from the TUI:
 

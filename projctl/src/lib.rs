@@ -45,7 +45,7 @@
 //! | `cal.day` | `{calendar, date}` | `{date, working, times, based_on: {kind: exception \| work_week \| default, calendar, name}}`: Change Working Time's "Working times for" and "Based on" |
 //! | `cal.add` | `{name, base?, copy?}` | the new calendar: derived from `base`, else a base calendar with Project's standard week, or a copy of `copy` |
 //! | `cal.set` | `{calendar, name?, base?, week?}` | the calendar after the change: `week` `{"Mon": {"working": true, "times": [["08:00","12:00"],["13:00","17:00"]]}, "Sat": {"working": false}}` for the days given (`null` for a derived calendar's day inherits the base again) |
-//! | `cal.exception.set` | `{calendar, index?, name?, from, to, working?, times?}` | the calendar; no `index` adds a date-range exception (non-working unless `times`), an `index` replaces that one |
+//! | `cal.exception.set` | `{calendar, index?, name?, from, to, working?, times?}` | the calendar; no `index` adds a date-range exception (non-working unless `times`), an `index` replaces that one (a repeating exception, `recurring` in `cal.get`, is refused) |
 //! | `cal.exception.del` | `{calendar, index}` | the calendar |
 //! | `cal.workweek.set` | `{calendar, index?, name?, from, to, week}` | the calendar; `week` as `cal.set`'s, the days the work week states |
 //! | `cal.workweek.del` | `{calendar, index}` | the calendar |
@@ -1568,7 +1568,10 @@ fn calendar_json(ed: &Editor, c: &Calendar) -> Json {
                 .iter()
                 .enumerate()
                 .map(|(i, w)| {
-                    // A work week's unstated day falls back to the calendar.
+                    // A work week's unstated day is shown from the calendar's
+                    // default week chain (`stated: false`); what a date in the
+                    // week works, a base's covering work week included, is
+                    // `cal.day`'s answer.
                     let mut shown = resolved.clone();
                     for (d, day) in w.week.iter().enumerate() {
                         if let Some(day) = day {
@@ -1638,11 +1641,19 @@ fn times_arg(value: &Json) -> Result<Vec<WorkingTime>, String> {
 
 /// A day's pattern from `{working?, times?}`: `times` given is the day,
 /// `working: false` (or no times) a non-working day, `null` inherits.
+/// Anything else is refused (a bare `true` or a times list is not a day).
 fn day_arg(value: &Json) -> Result<DayPatch, String> {
     if matches!(value, Json::Null) {
         return Ok(None);
     }
-    let working = value.get("working").and_then(Json::as_bool);
+    if !matches!(value, Json::Obj(_)) {
+        return Err("a day is {working?, times?} or null".into());
+    }
+    let working = match value.get("working") {
+        None | Some(Json::Null) => None,
+        Some(Json::Bool(b)) => Some(*b),
+        Some(_) => return Err("'working' is true or false".into()),
+    };
     let times = match value.get("times") {
         Some(t) if !matches!(t, Json::Null) => times_arg(t)?,
         _ => Vec::new(),
@@ -1669,7 +1680,7 @@ fn week_arg(args: &Json, key: &str) -> Result<Vec<(usize, DayPatch)>, String> {
     let mut out = Vec::new();
     for (day, pattern) in days {
         let d = weekday_index(day).ok_or_else(|| format!("'{day}' is not a weekday"))?;
-        out.push((d, day_arg(pattern)?));
+        out.push((d, day_arg(pattern).map_err(|e| format!("'{day}': {e}"))?));
     }
     Ok(out)
 }
@@ -1778,14 +1789,9 @@ fn cal_exception_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
     let uid = calendar_arg(ed, args)?;
     let index = index_arg(args)?;
     let (from, to) = range_args(args)?;
-    let day = day_arg(&Json::obj(vec![
-        (
-            "working",
-            args.get("working").cloned().unwrap_or(Json::Null),
-        ),
-        ("times", args.get("times").cloned().unwrap_or(Json::Null)),
-    ]))?
-    .unwrap_or_default();
+    // The exception's day is the arguments' own `working` and `times`;
+    // neither given is a non-working day.
+    let day = day_arg(args)?.unwrap_or_default();
     ed.set_calendar_exception(uid, index, args.get_str("name"), from, to, day)?;
     cal_reply(ed, uid)
 }
@@ -3423,6 +3429,21 @@ it"
             (
                 "cal.set",
                 r#"{"calendar":"Standard","week":{"Someday":{"working":false}}}"#,
+            ),
+            // A day is an object: a bare flag, a times list or a text
+            // working is refused, never read as a non-working day.
+            ("cal.set", r#"{"calendar":"Standard","week":{"Mon":true}}"#),
+            (
+                "cal.set",
+                r#"{"calendar":"Standard","week":{"Mon":[["08:00","12:00"]]}}"#,
+            ),
+            (
+                "cal.set",
+                r#"{"calendar":"Standard","week":{"Mon":{"working":"yes"}}}"#,
+            ),
+            (
+                "cal.workweek.set",
+                r#"{"calendar":"Standard","from":"2026-03-09","to":"2026-03-13","week":{"Mon":"08:00-17:00"}}"#,
             ),
             ("cal.set", r#"{"calendar":"Standard","base":"Night Shift"}"#),
             ("cal.add", r#"{"name":"standard"}"#),

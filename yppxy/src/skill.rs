@@ -106,6 +106,9 @@ Verbs: `proj.path`, `task.list`, `task.get`, `task.fields`, `task.set`, `task.ad
 `cal.add`, `cal.set`, `cal.exception.set`, `cal.exception.del`,
 `cal.workweek.set`, `cal.workweek.del`, `cal.del`, `proj.save`,
 `proj.reload`, `proj.open`, and the grid's view: `proj.view`,
+`proj.sort {column?, descending?}`, `proj.filter {column, values? | clear}` (`values` are
+cell texts, `(Blanks)` for an empty cell, or on a date column `YYYY`, `YYYY-MM`,
+`YYYY-MM-DD`).
 
 Calendars are addressed by `calendar`, a uid or a name. `cal.list {}` lists
 them (base calendars first: `uid, name, base, default, resources, tasks`),
@@ -121,9 +124,6 @@ week?}` renames, rebases a derived calendar or sets days of the default week
 `cal.exception.set` / `cal.workweek.set` add (no `index`) or replace one by
 `index`, `.del` removes it; `cal.del` removes an unused calendar. Each is one
 undo step.
-`proj.sort {column?, descending?}`, `proj.filter {column, values? | clear}` (`values` are
-cell texts, `(Blanks)` for an empty cell, or on a date column `YYYY`, `YYYY-MM`,
-`YYYY-MM-DD`).
 
 Leveling is a display overlay: `level.all {}` shows the plan leveled (tasks
 delayed to fit resource capacity, as Resource > Level > Level All),
