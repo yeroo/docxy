@@ -49,6 +49,9 @@ test project Ctrl+wheel over the chart zooms a level and the wheel alone does no
   shot window
   call pointer-wheel {"region":"gantt","dy":-120}
   assert gantt_day_w is 22
+  # Below the step threshold (40 px) the chart takes the wheel without a step.
+  call pointer-wheel {"region":"gantt","dy":-10,"ctrl":true}
+  assert gantt_day_w is 22
   call pointer-wheel {"region":"gantt","dy":-120,"ctrl":true}
   assert gantt_day_w is 12
   call pointer-wheel {"region":"gantt","dy":-120,"ctrl":true}

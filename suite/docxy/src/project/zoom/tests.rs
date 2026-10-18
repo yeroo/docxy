@@ -528,7 +528,8 @@ fn fractional_lines_accumulate_and_a_touch_phase_clears_the_sum() {
         WheelZoom::Absorbed
     );
     assert_eq!(v.wheel_acc, -30.);
-    v.wheel_zoom(x, -5., false, TouchPhase::Ended);
+    // The end of a swipe is a zero delta: it still clears the sum.
+    v.wheel_zoom(x, 0., false, TouchPhase::Ended);
     assert_eq!(v.wheel_acc, 0.);
     assert_eq!(v.day_w(), 12.);
 }
@@ -537,4 +538,14 @@ fn fractional_lines_accumulate_and_a_touch_phase_clears_the_sum() {
 fn only_the_listed_timescales_can_be_chosen() {
     assert!((0..7).all(available));
     assert!(!available(7) && !available(8) && !available(9));
+}
+
+#[test]
+fn only_a_whole_line_is_a_notch() {
+    let lines = |y: f32| ScrollDelta::Lines(point(0., y));
+    assert!(!is_notch(&lines(0.25)));
+    assert!(!is_notch(&lines(-0.99)));
+    assert!(is_notch(&lines(1.)));
+    assert!(is_notch(&lines(-3.)));
+    assert!(!is_notch(&ScrollDelta::Pixels(point(px(0.), px(120.)))));
 }

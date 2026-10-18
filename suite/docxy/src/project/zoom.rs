@@ -20,6 +20,12 @@ pub(crate) enum WheelZoom {
     Stepped(String),
 }
 
+/// Whether a wheel delta is a notch: a whole line or more. Fractional lines (a
+/// hi-res wheel, a touchpad) and pixel deltas are summed instead.
+pub(crate) fn is_notch(delta: &ScrollDelta) -> bool {
+    matches!(delta, ScrollDelta::Lines(l) if l.y.abs() >= 1.)
+}
+
 /// The pixel deltas of a smooth wheel that make one zoom step.
 pub(crate) const WHEEL_STEP: f32 = 40.;
 
@@ -360,34 +366,35 @@ impl ProjectView {
     /// steps per [`WHEEL_STEP`] px, so a trackpad swipe or a hi-res wheel does
     /// not jump levels; only a whole-line `notch` steps at once. A change of
     /// direction starts the sum afresh, and the touch phases `Started` and
-    /// `Ended` clear it. The chart takes every event over it ([`WheelZoom`]).
+    /// `Ended` clear it (even on a zero delta, which is how a gesture ends). The chart takes every event over it ([`WheelZoom`]).
     pub fn wheel_zoom(&mut self, x: f32, dy: f32, notch: bool, phase: TouchPhase) -> WheelZoom {
-        if dy == 0. || self.pane_at(x) != ProjectPane::Chart {
-            return WheelZoom::NotChart;
-        }
         if phase == TouchPhase::Started {
             self.wheel_acc = 0.;
         }
-        let dir = if dy > 0. { 1 } else { -1 };
-        let step = if notch {
-            self.wheel_acc = 0.;
-            true
+        let out = if dy == 0. || self.pane_at(x) != ProjectPane::Chart {
+            WheelZoom::NotChart
         } else {
-            if self.wheel_acc * dy < 0. {
+            let dir = if dy > 0. { 1 } else { -1 };
+            let step = if notch {
                 self.wheel_acc = 0.;
-            }
-            self.wheel_acc += dy;
-            let step = self.wheel_acc.abs() >= WHEEL_STEP;
+                true
+            } else {
+                if self.wheel_acc * dy < 0. {
+                    self.wheel_acc = 0.;
+                }
+                self.wheel_acc += dy;
+                let step = self.wheel_acc.abs() >= WHEEL_STEP;
+                if step {
+                    self.wheel_acc = 0.;
+                }
+                step
+            };
             if step {
-                self.wheel_acc = 0.;
+                let pointer = (x - self.table_w - GANTT_INSET).clamp(0., self.gantt_w);
+                WheelZoom::Stepped(self.zoom_step(dir, pointer))
+            } else {
+                WheelZoom::Absorbed
             }
-            step
-        };
-        let out = if step {
-            let pointer = (x - self.table_w - GANTT_INSET).clamp(0., self.gantt_w);
-            WheelZoom::Stepped(self.zoom_step(dir, pointer))
-        } else {
-            WheelZoom::Absorbed
         };
         if phase == TouchPhase::Ended {
             self.wheel_acc = 0.;

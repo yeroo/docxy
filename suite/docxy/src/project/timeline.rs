@@ -323,6 +323,7 @@ pub(crate) fn drag_edge(
     dd: f32,
     gantt_w: f32,
     (lo, hi): (f32, f32),
+    end: f32,
 ) -> (f32, f32) {
     // The span cannot be asked to shrink below what the Timeline holds.
     let least = (gantt_w.max(1.) / zoom::MAX_DAY_W).min((hi - lo).max(1.));
@@ -333,20 +334,23 @@ pub(crate) fn drag_edge(
     let moved = |real: f32| {
         let drawn = real.clamp(lo, hi);
         let target = (drawn + dd).clamp(lo, hi);
-        if (target - drawn).abs() < 1e-6 {
-            real
-        } else {
-            target
-        }
+        ((target - drawn).abs() >= 1e-6).then_some(target)
     };
     match edge {
         BoxEdge::Left => {
-            let l = moved(left).min(right - least);
+            // The far edge is held where the scroll range can: a chart showing
+            // days past the scale's `end` cannot keep its right edge there once
+            // the left one moves, so it is held at `end`.
+            let (l, right) = match moved(left) {
+                Some(target) => (target, right.min(end)),
+                None => (left, right),
+            };
+            let l = l.min(right - least);
             let day_w = zoom::fit(right - l, gantt_w);
             (day_w, right - gantt_w / day_w)
         }
         BoxEdge::Right => {
-            let r = moved(right).max(left + least);
+            let r = moved(right).unwrap_or(right).max(left + least);
             (zoom::fit(r - left, gantt_w), left)
         }
     }
@@ -425,6 +429,7 @@ impl ProjectView {
             dd,
             self.gantt_w,
             bounds,
+            self.scale.days as f32,
         );
         self.set_zoom(day_w, left, 0.);
     }

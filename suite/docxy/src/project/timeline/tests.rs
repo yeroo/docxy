@@ -449,21 +449,21 @@ const ALL: (f32, f32) = (0., 1000.);
 #[test]
 fn dragging_the_left_edge_keeps_the_right_date_and_fills_the_chart() {
     // A chart 440 px wide at 22 px/day shows days 10 to 30.
-    let (day_w, left) = drag_edge(BoxEdge::Left, 10., 30., 5., 440., ALL);
+    let (day_w, left) = drag_edge(BoxEdge::Left, 10., 30., 5., 440., ALL, 1000.);
     // The box now covers days 15 to 30: 15 days fill 440 px.
     assert!((day_w - 440. / 15.).abs() < 1e-3);
     assert!((left - 15.).abs() < 1e-3);
     // Dragging out widens the span.
-    let (day_w, left) = drag_edge(BoxEdge::Left, 10., 30., -10., 440., ALL);
+    let (day_w, left) = drag_edge(BoxEdge::Left, 10., 30., -10., 440., ALL, 1000.);
     assert!((day_w - 440. / 30.).abs() < 1e-3 && (left - 0.).abs() < 1e-3);
 }
 
 #[test]
 fn dragging_the_right_edge_keeps_the_left_date() {
-    let (day_w, left) = drag_edge(BoxEdge::Right, 10., 30., 20., 440., ALL);
+    let (day_w, left) = drag_edge(BoxEdge::Right, 10., 30., 20., 440., ALL, 1000.);
     assert!((day_w - 440. / 40.).abs() < 1e-3);
     assert_eq!(left, 10.);
-    let (day_w, left) = drag_edge(BoxEdge::Right, 10., 30., -10., 440., ALL);
+    let (day_w, left) = drag_edge(BoxEdge::Right, 10., 30., -10., 440., ALL, 1000.);
     assert!((day_w - 440. / 10.).abs() < 1e-3);
     assert_eq!(left, 10.);
 }
@@ -471,18 +471,18 @@ fn dragging_the_right_edge_keeps_the_left_date() {
 #[test]
 fn an_edge_cannot_cross_the_other_or_leave_the_timeline() {
     // Past the opposite edge the span stays one clamp-wide, the far edge put.
-    let (day_w, left) = drag_edge(BoxEdge::Left, 10., 30., 500., 440., ALL);
+    let (day_w, left) = drag_edge(BoxEdge::Left, 10., 30., 500., 440., ALL, 1000.);
     assert!((day_w - zoom::MAX_DAY_W).abs() < 1e-3);
     assert!((left - (30. - 440. / zoom::MAX_DAY_W)).abs() < 1e-3);
-    let (day_w, left) = drag_edge(BoxEdge::Right, 10., 30., -500., 440., ALL);
+    let (day_w, left) = drag_edge(BoxEdge::Right, 10., 30., -500., 440., ALL, 1000.);
     assert!((day_w - zoom::MAX_DAY_W).abs() < 1e-3);
     assert_eq!(left, 10.);
     // The moved edge stops at the Timeline's ends: the left at day 0, the right
     // at the span's last, so the far edge never has to move to make room.
-    let (day_w, left) = drag_edge(BoxEdge::Left, 10., 30., -4000., 440., (0., 60.));
+    let (day_w, left) = drag_edge(BoxEdge::Left, 10., 30., -4000., 440., (0., 60.), 1000.);
     assert!((left - 0.).abs() < 1e-3);
     assert!((day_w - 440. / 30.).abs() < 1e-3);
-    let (day_w, left) = drag_edge(BoxEdge::Right, 10., 30., 4000., 440., (0., 60.));
+    let (day_w, left) = drag_edge(BoxEdge::Right, 10., 30., 4000., 440., (0., 60.), 1000.);
     assert_eq!(left, 10.);
     assert!((day_w - 440. / 50.).abs() < 1e-3);
 }
@@ -654,7 +654,6 @@ fn a_press_and_an_unmoved_edge_never_change_the_zoom() {
             v.layout(1180.);
             v.zoom_step(-1, 0.);
             let held = (v.day_w(), v.gantt_x.get());
-            let w = ruler_width(v.width);
             v.press_timeline_edge(edge, 100.);
             v.drag_timeline_edge(100.);
             assert!(
@@ -663,7 +662,6 @@ fn a_press_and_an_unmoved_edge_never_change_the_zoom() {
                 v.day_w(),
                 v.gantt_x.get()
             );
-            let _ = w;
         }
     }
 }
@@ -686,25 +684,56 @@ fn an_outward_drag_at_the_timelines_end_does_not_zoom_in() {
 }
 
 #[test]
+fn a_span_shorter_than_the_least_keeps_the_least_not_the_clamp() {
+    // A one-day timeline: dragging the left edge in stops at its end (day 1),
+    // and the far edge stays at 20, so the chart is 19 days wide, not pinned.
+    let (day_w, l) = drag_edge(BoxEdge::Left, 0., 20., 50., 440., (0., 1.), 30.);
+    assert_eq!(l, 1.);
+    assert!((day_w - 440. / 19.).abs() < 1e-3 && day_w < zoom::MAX_DAY_W);
+}
+
+#[test]
 fn a_one_day_or_empty_plan_does_not_pin_the_zoom_or_move_the_fixed_edge() {
     for tasks in [project_with_days(1), untitled_project()] {
-        let mut v = ProjectView::new(tasks, false);
-        v.layout(1180.);
-        let (day_w, x) = (v.day_w(), v.gantt_x.get());
-        let w = ruler_width(v.width);
-        let left_before = v.gantt_x.get() / v.day_w();
-        v.press_timeline_edge(BoxEdge::Right, w);
-        v.drag_timeline_edge(w / 2.);
-        assert!(v.day_w() <= zoom::MAX_DAY_W);
-        assert_eq!(
-            v.gantt_x.get() / v.day_w(),
-            left_before,
-            "the left edge is fixed"
-        );
-        v.release_timeline();
-        v.set_zoom(day_w, x / day_w, 0.);
-        // A pure function: a span shorter than the least keeps the least.
-        let (d, l) = drag_edge(BoxEdge::Left, 0., 20., 50., 440., (0., 1.));
-        assert!(d <= zoom::MAX_DAY_W + 1e-3 && l >= 0.);
+        for edge in [BoxEdge::Left, BoxEdge::Right] {
+            let mut v = ProjectView::new(tasks.clone(), false);
+            v.layout(1180.);
+            let (day_w, left) = (v.day_w(), v.gantt_x.get() / v.day_w());
+            let w = ruler_width(v.width);
+            let x = if edge == BoxEdge::Left { 0. } else { w };
+            v.press_timeline_edge(edge, x);
+            v.drag_timeline_edge(x);
+            assert!(v.day_w() < zoom::MAX_DAY_W, "{}", v.day_w());
+            assert!((v.day_w() - day_w).abs() < 1e-3);
+            assert!((v.gantt_x.get() / v.day_w() - left).abs() < 1e-3);
+        }
     }
+}
+
+#[test]
+fn a_left_drag_in_a_short_plan_after_zooming_out_follows_the_pointer() {
+    // 6 days of plan in a wide window; two Zoom Outs put the chart's real right
+    // edge far past the scale's end, where the scroll range cannot hold it.
+    let mut v = ProjectView::new(project_with_days(6), false);
+    v.layout(3000.);
+    v.zoom_step(-1, 0.);
+    v.zoom_step(-1, 0.);
+    assert!(
+        v.gantt_w / v.day_w() > v.scale.days as f32,
+        "the right edge is out of range"
+    );
+    let w = ruler_width(v.width);
+    let (f0, f1) = v.timeline_box();
+    assert_eq!((f0, f1), (0., 1.));
+    // Drag the left edge to the middle of the ruler.
+    v.press_timeline_edge(BoxEdge::Left, 0.);
+    v.drag_timeline_edge(w / 2.);
+    let (g0, g1) = v.timeline_box();
+    assert!(
+        (g0 - 0.5).abs() < 0.03,
+        "the drawn left edge is at the pointer: {g0}"
+    );
+    assert!((g1 - 1.).abs() < 1e-3, "the right edge did not move: {g1}");
+    // And the chart really scrolled there, not pinned to its start.
+    assert!(v.gantt_x.get() > 0.);
 }
