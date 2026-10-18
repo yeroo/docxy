@@ -2224,12 +2224,13 @@ impl Editor {
     pub fn cut(&mut self) -> Option<Clip> {
         self.widen_selection_over_loose_fields();
         let mut clip = self.copy()?;
-        // A tracked delete keeps every equation (a cell range's aside), so
-        // the clip leaves them out: a paste must not add a second (#1242).
+        // A tracked delete keeps every equation and every field a `w:del`
+        // cannot hold ([`kept_while_tracking`]; a cell range's aside), so the
+        // clip leaves them out: a paste must not add a second (#1242).
         if self.delete_keeps_equations_in(&self.caret.path, false) {
             clip = without_kept(&clip);
         }
-        // Nothing left to cut (a lone equation while tracking, which
+        // Nothing left to cut (a lone equation or kept field while tracking, which
         // stays): no clip and no step, as `cut_text` refuses one.
         let empty =
             clip.paras.len() <= 1 && clip.paras.iter().flatten().all(|i| inline_len(i) == 0);

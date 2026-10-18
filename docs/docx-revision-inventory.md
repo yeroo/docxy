@@ -114,7 +114,8 @@ comment-marker id in the document.
   (typing coalesces into one step as it always has).
 - **Not recorded**, and edited as without tracking: paragraph marks (Enter, and
   Backspace / Delete across a paragraph boundary), an Update Field or Edit
-  Field rewrite (#1241), an equation, formatting, table structure and a table
+  Field rewrite (#1241), inserting an equation (a tracked delete keeps one in
+  place), formatting, table structure and a table
   cell range's Delete. A selection across paragraphs records the deletion of its
   text in each paragraph (the paragraphs of a table between them included; the
   table stays) and keeps the paragraph marks. Text deleted from another

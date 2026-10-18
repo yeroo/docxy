@@ -22,7 +22,8 @@
 //! Not recorded (they change the document as without tracking): paragraph
 //! marks (Enter, and a Backspace or Delete that joins paragraphs), an Update
 //! Field or Edit Field rewrite of a field's result and code (#1241), an
-//! equation, formatting, and table structure. A deleted field or picture gets
+//! inserting an equation (a tracked delete keeps one in place), formatting, and
+//! table structure. A deleted field or picture gets
 //! a `w:del` of its own that never merges with a neighbour (#1242, #1470); a
 //! field whose result a `w:del` cannot hold (a link) stays. A selection across paragraphs records the deletion of its text
 //! in each paragraph and keeps the paragraph marks.
