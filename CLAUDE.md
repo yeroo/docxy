@@ -736,3 +736,28 @@
   yppxy-prompt` reports it. Ctrl+A selects the buffer (#1376; typing and the
   edit keys replace or collapse it). Copy/paste is there (#1378, below);
   click-to-place is not; Backstage Save As's name field is separate.
+
+## Project selection look (#1534)
+
+- `suite/docxy/src/project/selection.rs`: one pure `Look` per frame
+  (`ProjectView::look`, from `selection()` or the cursor) decides the Entry
+  table's selection drawing, as Project 2024 does. A selected cell is filled
+  itself (a wash of the accent, `accent::wash`, 0.30) with the cursor's 1px
+  outline; the ID cell of every selected row and the heading of every selected
+  column carry a lighter wash (0.16). A row selection (ID press, Shift+Space)
+  is a range over all eight columns, so it fills the row; the table no longer
+  highlights the whole cursor row (the chart side still does, and the entry
+  row keeps its row background).
+- A heading's left press selects the column (`project_column_select`, as the
+  right press); the arrow and edge stop their own presses. Ctrl+A (whole
+  table, cursor on the first cell, anchor on the last), Ctrl+Space (column)
+  and Shift+Space (row, `row_header`) are in `project_input` before the Ctrl
+  navigation; Ctrl+Home/End go to the first/last shown task's first/last
+  column. Ctrl+Space may be the OS's input-source switch on macOS.
+- Defaults: `DEFAULT_WIDTHS` sum 760 and `DEFAULT_TABLE_SHARE` 0.65 make the
+  whole Entry table visible at the default 1180 px window (a unit test pins
+  it); "Predecessors" and "Resource Names" headings are tight. The table
+  scrollbar was already always shown. The harness `state` reports
+  `selected_columns`, `selected_rows`, `filled_cells` (`"<row>:<column>"`),
+  `hot_headings`, `cursor_border` and `table_fits`;
+  `uiharness/cases/project-selection.uit` (not run on macOS).

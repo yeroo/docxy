@@ -242,10 +242,14 @@ pub(crate) fn table_pane_width(width: f32) -> f32 {
     table_pane_width_for(width, TABLE_W)
 }
 
+/// The share of the window the table pane takes by default (#1534): the Entry
+/// table's default columns fit it at the default 1180 px window.
+pub(crate) const DEFAULT_TABLE_SHARE: f32 = 0.65;
+
 /// [`table_pane_width`] for columns `total` px wide in all: the pane follows
 /// them, so narrowing columns brings the right-hand ones into view.
 pub(crate) fn table_pane_width_for(width: f32, total: f32) -> f32 {
-    (width * 0.5).max(320.).min(total).min(width.max(0.))
+    (width * DEFAULT_TABLE_SHARE).max(320.).min(total).min(width.max(0.))
 }
 
 /// The split bar never narrows the table below the ID column's default width

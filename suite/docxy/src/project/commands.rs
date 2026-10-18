@@ -1236,6 +1236,31 @@ pub(crate) fn project_input(
     if let Some(act) = key_act(key, m) {
         return Some(act);
     }
+    // #1534: Ctrl+A the whole table, Ctrl+Space the cursor's column,
+    // Shift+Space its row. Ctrl+Space may be the OS's input-source switch
+    // (macOS); it is not remapped.
+    if !m.alt && !m.platform {
+        let chord = match (key, m.control, m.shift) {
+            ("a", true, false) => Some(Chord::All),
+            ("space", true, false) => Some(Chord::Column),
+            ("space", false, true) => Some(Chord::Row),
+            _ => None,
+        };
+        if let Some(chord) = chord {
+            navigate(tab, |v| match chord {
+                Chord::All => {
+                    v.select_all_cells();
+                    true
+                }
+                Chord::Column => {
+                    v.select_column(v.col);
+                    true
+                }
+                Chord::Row => v.select_cursor_row(),
+            });
+            return None;
+        }
+    }
     if m.control && !m.alt && !m.platform {
         // Shift+Ctrl+arrows and Shift+Ctrl+Home/End extend the range, as in
         // Project; any other Ctrl key moves the cursor and clears it.
@@ -1272,6 +1297,14 @@ pub(crate) fn project_input(
 
 /// Run a cursor move and, when it handled the key, complete it, revealing the
 /// row only when it changed.
+/// A table selection chord (#1534).
+#[derive(Clone, Copy)]
+enum Chord {
+    All,
+    Column,
+    Row,
+}
+
 fn navigate(tab: &mut DocTab, step: impl FnOnce(&mut ProjectView) -> bool) {
     let Surface::Project(v) = &mut tab.surface else {
         return;

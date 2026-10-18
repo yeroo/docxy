@@ -1,0 +1,68 @@
+# #1534: the Project entry table draws its selection as Project does. A cell
+# fills itself (`filled_cells`, "<shown row>:<column>"), the ID cell of its
+# row and its column's heading carry a lighter tint (`selected_rows`,
+# `hot_headings`); a row or column selection fills every cell of it.
+# `cursor_border` is the cell with the 1px outline. The default columns fit
+# the default window (`table_fits`).
+# project-filter.xml: Plan, Build, Test, Ship.
+
+test project a clicked cell fills only itself, not its row
+  open copy:../fixtures/project-filter.xml
+  call click-cell {"cell":"D2"}
+  assert cell is Duration
+  assert filled_cells is ["2:Duration"]
+  assert cursor_border is 2:Duration
+  assert selected_columns is ["Duration"]
+  assert selected_rows is [2]
+  assert hot_headings is ["Duration"]
+  assert selection is none
+
+test project an ID press selects the row and fills every column
+  open copy:../fixtures/project-filter.xml
+  call click-cell {"cell":"A2"}
+  assert selected_rows is [2]
+  assert selected_columns is ["ID","Task Mode","Name","Duration","Start","Finish","Predecessors","Resource Names"]
+  assert selection is 8
+
+test project a heading press selects the column
+  open copy:../fixtures/project-filter.xml
+  shot window
+  call pointer-click {"region":"project-heading:Duration"}
+  assert selected_columns is ["Duration"]
+  assert selected_rows is [1,2,3,4]
+  assert selection is 4
+  assert cell is Duration
+  assert cell_row is 0
+
+test project Shift+Space selects the row, Ctrl+Space the column, Ctrl+A the table
+  open copy:../fixtures/project-filter.xml
+  call click-cell {"cell":"E3"}
+  key shift+space
+  assert selected_rows is [3]
+  assert selection is 8
+  assert cell is ID
+  call click-cell {"cell":"E3"}
+  key ctrl+space
+  assert selected_columns is ["Start"]
+  assert selected_rows is [1,2,3,4]
+  key ctrl+a
+  assert selection is 32
+  assert selected_rows is [1,2,3,4]
+  assert cell is ID
+  assert cell_row is 0
+
+test project Ctrl+Home and Ctrl+End go to the first and last cell
+  open copy:../fixtures/project-filter.xml
+  call click-cell {"cell":"C2"}
+  key ctrl+end
+  assert cell is Resource Names
+  assert selected_name is Ship
+  key ctrl+home
+  assert cell is ID
+  assert selected_name is Plan
+
+test project the default window shows the whole Entry table and a narrowed pane does not
+  open copy:../fixtures/project-filter.xml
+  assert table_fits is true
+  call pointer-drag {"from":"project-split","to":"cell:B1"}
+  assert table_fits is false
