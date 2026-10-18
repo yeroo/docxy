@@ -443,3 +443,138 @@ fn the_view_box_of_the_timeline_view_fixture_at_the_default_window() {
     assert_eq!(vm(&mut t).ed.project().tasks[last].name, "Late");
     assert_eq!(view(&mut t), ("Sun 3/1/26".into(), "Sun 3/15/26".into()));
 }
+
+#[test]
+fn dragging_the_left_edge_keeps_the_right_date_and_fills_the_chart() {
+    // A chart 440 px wide at 22 px/day shows days 10 to 30.
+    let (day_w, left) = drag_edge(BoxEdge::Left, 10., 30., 5., 440.);
+    // The box now covers days 15 to 30: 15 days fill 440 px.
+    assert!((day_w - 440. / 15.).abs() < 1e-3);
+    assert!((left - 15.).abs() < 1e-3);
+    // Dragging out widens the span.
+    let (day_w, left) = drag_edge(BoxEdge::Left, 10., 30., -10., 440.);
+    assert!((day_w - 440. / 30.).abs() < 1e-3 && (left - 0.).abs() < 1e-3);
+}
+
+#[test]
+fn dragging_the_right_edge_keeps_the_left_date() {
+    let (day_w, left) = drag_edge(BoxEdge::Right, 10., 30., 20., 440.);
+    assert!((day_w - 440. / 40.).abs() < 1e-3);
+    assert_eq!(left, 10.);
+    let (day_w, left) = drag_edge(BoxEdge::Right, 10., 30., -10., 440.);
+    assert!((day_w - 440. / 10.).abs() < 1e-3);
+    assert_eq!(left, 10.);
+}
+
+#[test]
+fn an_edge_cannot_cross_the_other_or_zoom_past_the_clamp() {
+    // Past the opposite edge the span stays one clamp-wide.
+    let (day_w, left) = drag_edge(BoxEdge::Left, 10., 30., 500., 440.);
+    assert!((day_w - zoom::MAX_DAY_W).abs() < 1e-3);
+    assert!((left - (30. - 440. / zoom::MAX_DAY_W)).abs() < 1e-3);
+    let (day_w, left) = drag_edge(BoxEdge::Right, 10., 30., -500., 440.);
+    assert!((day_w - zoom::MAX_DAY_W).abs() < 1e-3);
+    assert_eq!(left, 10.);
+    // Widening past the narrowest zoom keeps the far edge fixed.
+    let (day_w, left) = drag_edge(BoxEdge::Left, 0., 30., -4000., 440.);
+    assert_eq!(day_w, zoom::MIN_DAY_W);
+    assert!((left + 440. / zoom::MIN_DAY_W - 30.).abs() < 1e-2);
+}
+
+#[test]
+fn an_edge_drag_zooms_the_chart_and_the_box_mirrors_the_visible_span() {
+    let mut v = ProjectView::new(project_with_days(60), false);
+    v.layout(1180.);
+    let span = TimelineSpan::of(&v.ed);
+    let w = ruler_width(v.width);
+    let width_before = v.gantt_w;
+    let (f0, f1) = v.timeline_box();
+    let (left, box_w) = box_px(f0, f1, w);
+    // Press the right edge and drag it a quarter of the ruler right.
+    v.press_timeline_edge(BoxEdge::Right, left + box_w);
+    v.drag_timeline_edge(left + box_w + w / 4.);
+    assert!(v.day_w() < DEFAULT_DAY_W, "a wider span is a narrower day");
+    assert_eq!(
+        v.gantt_w, width_before,
+        "the chart's width is not the zoom's"
+    );
+    // The box's right edge followed the pointer.
+    let (g0, g1) = v.timeline_box();
+    assert!(
+        (g1 - (f1 + 0.25)).abs() < 0.03 || g1 >= 0.99,
+        "{f1} -> {g1}"
+    );
+    assert!((g0 - f0).abs() < 0.03);
+    // The span the chart shows is what the box says.
+    let (first, last) = view_days(span, v.scale, v.gantt_x.get(), v.gantt_w);
+    assert!(last > first);
+    // Without a press a drag moves nothing; a release ends it.
+    v.release_timeline();
+    let held = v.day_w();
+    v.drag_timeline_edge(0.);
+    assert_eq!(v.day_w(), held);
+}
+
+#[test]
+fn the_middle_of_the_box_still_pans_without_zooming() {
+    let mut v = ProjectView::new(project_with_days(60), false);
+    v.layout(1180.);
+    v.zoom_step(-1, 0.);
+    let day_w = v.day_w();
+    v.press_timeline(100.);
+    v.drag_timeline(140.);
+    assert_eq!(v.day_w(), day_w);
+    assert!(v.timeline_edge.is_none());
+}
+
+fn project_with_days(days: i64) -> Project {
+    let mut p = untitled_project();
+    p.tasks = vec![Task {
+        uid: 1,
+        id: 1,
+        name: "Task".into(),
+        duration_min: days * 480,
+        outline_level: 1,
+        ..Task::default()
+    }];
+    p
+}
+
+#[test]
+fn the_pane_height_clamps_between_one_band_and_half_the_window() {
+    assert_eq!(MIN_TIMELINE_H, BAND_H + 2. * PAD_V);
+    const { assert!(MIN_TIMELINE_H <= TIMELINE_H) };
+    const { assert!(BAND_H < TIMELINE_H) };
+    assert_eq!(clamp_timeline_h(10., 800.), MIN_TIMELINE_H);
+    assert_eq!(clamp_timeline_h(500., 800.), 400.);
+    assert_eq!(clamp_timeline_h(120., 800.), 120.);
+    // A window too short for the minimum still gets the minimum.
+    assert_eq!(clamp_timeline_h(120., 40.), MIN_TIMELINE_H);
+}
+
+#[test]
+fn the_grip_drags_the_height_and_a_double_click_restores_it() {
+    let mut v = ProjectView::new(project_with_days(10), false);
+    v.height = 800.;
+    assert_eq!(v.timeline_height(), TIMELINE_H);
+    // A drag is measured from the press, so it does not accumulate.
+    v.press_grip(100.);
+    v.drag_grip(140.);
+    assert_eq!(v.timeline_height(), TIMELINE_H + 40.);
+    v.drag_grip(150.);
+    assert_eq!(v.timeline_height(), TIMELINE_H + 50.);
+    v.drag_grip(-1000.);
+    assert_eq!(v.timeline_height(), MIN_TIMELINE_H);
+    v.drag_grip(5000.);
+    assert_eq!(v.timeline_height(), 400.);
+    v.release_timeline();
+    // Without a press a drag moves nothing.
+    v.drag_grip(120.);
+    assert_eq!(v.timeline_height(), 400.);
+    v.reset_timeline_h();
+    assert_eq!(v.timeline_height(), TIMELINE_H);
+    // The window shrinking pulls a tall pane back to its half.
+    v.timeline_h = Some(500.);
+    v.height = 600.;
+    assert_eq!(v.timeline_height(), 300.);
+}

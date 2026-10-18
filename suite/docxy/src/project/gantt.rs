@@ -144,6 +144,7 @@ impl GanttScale {
         (day - self.origin_day) as f32 * self.day_w
     }
 
+    #[cfg(test)]
     fn date(self, day: i64) -> projcore::DateTime {
         projcore::DateTime::from_minutes((self.origin_day + day) * 1440)
     }

@@ -88,15 +88,6 @@ fn fit_fills_the_width_and_clamps() {
 }
 
 #[test]
-fn zoom_about_keeps_the_day_under_the_pointer() {
-    let (x, p, old, new) = (440., 300., 22., 12.);
-    let after = zoom_about(old, x, p, new);
-    assert!(((x + p) / old - (after + p) / new).abs() < 1e-4);
-    // Pointer at the left edge: the left-edge date stays.
-    assert!((zoom_about(22., 220., 0., 12.) - 120.).abs() < 1e-4);
-}
-
-#[test]
 fn tier_boundaries_follow_the_calendar() {
     assert!(Unit::Month.starts(day("2026-03-01")) && !Unit::Month.starts(day("2026-03-02")));
     assert!(Unit::Week.starts(day("2026-03-02")) && !Unit::Week.starts(day("2026-03-03")));
@@ -273,14 +264,17 @@ fn selected_tasks_fill_the_chart_and_need_a_selection() {
     let mut v = view(vec![task(1, 5), task(2, 30)]);
     v.select_row(1);
     let bar = gantt_bar(&v.ed, v.ed.project().task(2).unwrap(), v.scale).unwrap();
-    v.zoom_selected();
+    v.zoom_selected().unwrap();
     let days = (bar.end - bar.start + 1) as f32;
     assert!((v.day_w() * days - v.gantt_w).abs() < 1.0 || v.day_w() == MAX_DAY_W);
     assert!((v.gantt_x.get() / v.day_w() - bar.start as f32).abs() < 0.6);
     // No selected task: nothing changes and the status says why.
     let mut empty = view(vec![]);
     let before = empty.day_w();
-    assert_eq!(empty.zoom_selected(), "Select one or more tasks to zoom to");
+    assert_eq!(
+        empty.zoom_selected(),
+        Err("Select one or more tasks to zoom to".into())
+    );
     assert_eq!(empty.day_w(), before);
 }
 
@@ -293,7 +287,7 @@ fn the_combo_choice_keeps_the_left_edge_and_a_free_width_is_custom() {
     assert_eq!(v.gantt_x.get(), 120.);
     v.set_zoom(14., 10., 0.);
     assert_eq!(label(v.day_w()), "Custom (Weeks)");
-    assert_eq!(v.zoom_level().name, "Weeks");
+    assert_eq!(LEVELS[nearest(v.day_w())].name, "Weeks");
     assert!((v.visible_days() - v.gantt_w / 14.).abs() < 1e-3);
 }
 
@@ -307,4 +301,162 @@ fn set_zoom_clamps_and_refreshes_the_scale() {
     assert_eq!(v.day_w(), MIN_DAY_W);
     v.set_zoom(DEFAULT_DAY_W, 0., 0.);
     assert_eq!(v.zoom_day_w, None);
+}
+
+#[test]
+fn ctrl_wheel_zooms_around_the_pointer_over_the_chart_only() {
+    let mut v = view(vec![task(1, 400)]);
+    v.gantt_x.set(2000.);
+    let chart_left = v.table_w + GANTT_INSET;
+    // Over the table: not the chart's wheel.
+    assert_eq!(v.wheel_zoom(10., 5.), None);
+    assert_eq!(v.day_w(), DEFAULT_DAY_W);
+    // Wheel up zooms in, down out; the day under the pointer stays.
+    let pointer = 150.;
+    let before = (v.gantt_x.get() + pointer) / v.day_w();
+    assert_eq!(
+        v.wheel_zoom(chart_left + pointer, -5.),
+        Some("Timescale: Weeks".into())
+    );
+    assert_eq!(v.day_w(), 12.);
+    assert!(((v.gantt_x.get() + pointer) / v.day_w() - before).abs() < 1e-3);
+    assert_eq!(v.wheel_zoom(chart_left + pointer, 0.), None);
+    assert!(v.wheel_zoom(chart_left + pointer, 5.).is_some());
+    assert_eq!(v.day_w(), DEFAULT_DAY_W);
+}
+
+#[test]
+fn the_state_reports_the_zoom() {
+    let mut v = view(vec![task(1, 30)]);
+    let find = |v: &ProjectView, key: &str| {
+        project_state(v, None)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, j)| j)
+    };
+    use ctlcore::json::Json;
+    assert_eq!(find(&v, "gantt_day_w"), Some(Json::Num(22.)));
+    assert_eq!(find(&v, "gantt_zoom"), Some(Json::Str("Days".into())));
+    v.set_zoom(14., 0., 0.);
+    assert_eq!(find(&v, "gantt_day_w"), Some(Json::Num(14.)));
+    assert_eq!(
+        find(&v, "gantt_zoom"),
+        Some(Json::Str("Custom (Weeks)".into()))
+    );
+    assert_eq!(
+        find(&v, "timeline_h"),
+        Some(Json::Num(f64::from(timeline::TIMELINE_H)))
+    );
+}
+
+#[test]
+fn the_zoom_dialog_applies_a_level_a_fit_or_a_custom_span() {
+    use crate::dialog::Value;
+    let mut v = view(vec![task(1, 60), task(2, 5)]);
+    let mut d = zoom_dialogs::zoom_dialog(&v);
+    // It opens on the level in force; Custom is off.
+    assert_eq!(crate::page_setup::chosen(&d, "zoom"), Some(6));
+    assert!(
+        !d.controls
+            .iter()
+            .find(|c| c.name == "custom")
+            .unwrap()
+            .enabled
+    );
+    let set = |d: &mut crate::dialog::Dialog, name: &str, value: Value| {
+        d.controls
+            .iter_mut()
+            .find(|c| c.name == name)
+            .unwrap()
+            .value = value;
+    };
+    set(&mut d, "zoom", Value::Choice(Some(3)));
+    zoom_dialogs::apply_zoom(&mut v, &d).unwrap();
+    assert_eq!(v.day_w(), 3.);
+    set(&mut d, "zoom", Value::Choice(Some(7)));
+    zoom_dialogs::apply_zoom(&mut v, &d).unwrap();
+    let span = timeline::TimelineSpan::of(&v.ed);
+    assert!((v.day_w() * span.days as f32 - v.gantt_w).abs() < 0.5 || v.day_w() == MAX_DAY_W);
+    // Custom: this many days across the chart.
+    set(&mut d, "zoom", Value::Choice(Some(9)));
+    set(&mut d, "custom", Value::Text("40".into()));
+    zoom_dialogs::apply_zoom(&mut v, &d).unwrap();
+    assert!((v.visible_days() - 40.).abs() < 0.5);
+    // A refused Custom changes nothing.
+    let held = v.day_w();
+    set(&mut d, "custom", Value::Text("0".into()));
+    assert!(zoom_dialogs::apply_zoom(&mut v, &d).is_err());
+    set(&mut d, "custom", Value::Text("x".into()));
+    assert!(zoom_dialogs::apply_zoom(&mut v, &d).is_err());
+    assert_eq!(v.day_w(), held);
+    // The dialog opened on a free width starts on Custom, with the span shown.
+    let d = zoom_dialogs::zoom_dialog(&v);
+    assert_eq!(crate::page_setup::chosen(&d, "zoom"), Some(9));
+    assert!(
+        d.controls
+            .iter()
+            .find(|c| c.name == "custom")
+            .unwrap()
+            .enabled
+    );
+}
+
+#[test]
+fn the_timescale_dialog_picks_a_level_and_shows_its_tiers() {
+    use crate::dialog::Value;
+    let mut v = view(vec![task(1, 60)]);
+    let mut d = timescale_dialog_for(&v);
+    let text = |d: &crate::dialog::Dialog, name: &str| crate::page_setup::text_of(d, name);
+    assert_eq!(
+        (text(&d, "major").as_str(), text(&d, "minor").as_str()),
+        ("Weeks", "Days")
+    );
+    assert_eq!(crate::page_setup::chosen(&d, "level"), Some(6));
+    // Choosing a level moves the read-only tier rows with it.
+    let i = d.controls.iter().position(|c| c.name == "level").unwrap();
+    d.controls[i].value = Value::Choice(Some(3));
+    (d.react.unwrap().0)(&mut d, i, &Value::Choice(Some(6)));
+    assert_eq!(
+        (text(&d, "major").as_str(), text(&d, "minor").as_str()),
+        ("Quarters", "Months")
+    );
+    assert_eq!(text(&d, "minor-label"), "Mar 2026");
+    zoom_dialogs::apply_timescale(&mut v, &d).unwrap();
+    assert_eq!(v.day_w(), 3.);
+    for name in ["major", "major-label", "minor", "minor-label", "count"] {
+        assert!(
+            !d.controls.iter().find(|c| c.name == name).unwrap().enabled,
+            "{name}"
+        );
+    }
+}
+
+fn timescale_dialog_for(v: &ProjectView) -> crate::dialog::Dialog {
+    zoom_dialogs::timescale_dialog(v)
+}
+
+#[test]
+fn the_chart_menu_opens_the_timescale_and_zoom_dialogs() {
+    let v = view(vec![task(1, 5)]);
+    let items = project_chart_menu(&v);
+    let find = |label: &str| {
+        items.iter().find_map(|i| match i {
+            crate::menu::MenuItem::Item(e) if e.label == label => Some(e),
+            _ => None,
+        })
+    };
+    let acts = ["Timescale...", "Zoom..."].map(|l| find(l).unwrap_or_else(|| panic!("{l}")));
+    assert!(acts.iter().all(|e| e.enabled));
+    assert!(matches!(
+        acts[0].act,
+        Some(Act::Project(ProjectAct::TimescaleDialog))
+    ));
+    assert!(matches!(
+        acts[1].act,
+        Some(Act::Project(ProjectAct::ZoomDialog))
+    ));
+    // Project's order: the two dialogs lead; the rest is still not built.
+    assert!(!find("Change Working Time...").unwrap().enabled);
+    assert!(!find("Show/Hide Bar Styles").unwrap().enabled);
+    assert!(!find("Gridlines...").unwrap().enabled);
 }

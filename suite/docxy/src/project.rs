@@ -22,8 +22,10 @@ mod clip;
 pub(super) use clip::*;
 mod timeline;
 mod zoom;
+mod zoom_dialogs;
 pub(super) use timeline::*;
 pub(super) use zoom::LEVELS as TIMESCALE_LEVELS;
+pub(super) use zoom_dialogs::{apply_timescale, apply_zoom};
 mod rows;
 pub(super) use rows::*;
 mod columns;
@@ -689,6 +691,8 @@ pub(super) fn project_state(
         ),
         ("tasks".into(), Json::Num(count as f64)),
         ("widths".into(), widths_json(&v.widths())),
+        ("gantt_day_w".into(), Json::Num(f64::from(v.day_w()))),
+        ("gantt_zoom".into(), Json::Str(zoom::label(v.day_w()))),
         ("filtered".into(), Json::Bool(v.ed.is_filtered())),
         (
             "filler_rows".into(),
@@ -1484,6 +1488,8 @@ pub(super) fn project_el(
         view.chart_scale(),
     );
     let (table_bar, chart_bar) = view.pane_scrolls();
+    // The rows' scroll as drawn, which a Ctrl+wheel zoom puts back.
+    let held_scroll = view.scroll.0.borrow().base_handle.offset();
     let vbar = harness::region_name(harness::Region::ProjectVbar);
     let row_probes = probes.clone();
     // The bar palette the plan's formatting names (#1532), once per render.
@@ -1524,6 +1530,25 @@ pub(super) fn project_el(
                 // scrolls the pane under the pointer; the rows keep the vertical wheel.
                 .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, window, cx| {
                     let delta = ev.delta.pixel_delta(window.line_height());
+                    // Ctrl+wheel over the chart zooms the timescale around the
+                    // pointer (#1535). The rows' own handler has already moved
+                    // them by the same wheel turn; put them back.
+                    if ev.modifiers.control && !delta.y.is_zero() {
+                        let Some(body) = this.probes.borrow().current("project-body") else {
+                            return;
+                        };
+                        cx.stop_propagation();
+                        if let Some(tab) = this.tabs.get_mut(index)
+                            && let Surface::Project(v) = &mut tab.surface
+                            && let Some(status) =
+                                v.wheel_zoom(f32::from(ev.position.x - body.left()), f32::from(delta.y))
+                        {
+                            v.scroll.0.borrow().base_handle.set_offset(held_scroll);
+                            tab.status = status.into();
+                            cx.notify();
+                        }
+                        return;
+                    }
                     if delta.x.is_zero() {
                         return;
                     }

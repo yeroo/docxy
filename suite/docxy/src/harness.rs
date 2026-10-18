@@ -1339,13 +1339,16 @@ fn double_click_events(p: Point<Pixels>) -> Vec<PlatformInput> {
 /// The wheel notch a `pointer-wheel` dispatches at `p`: the pointer moves
 /// there first, as it would before a real wheel turn. A negative `dy` scrolls
 /// the content down (gpui's own sign).
-fn wheel_events(p: Point<Pixels>, dy: f32) -> Vec<PlatformInput> {
+fn wheel_events(p: Point<Pixels>, dy: f32, ctrl: bool) -> Vec<PlatformInput> {
     vec![
         mouse_move(p, None),
         PlatformInput::ScrollWheel(ScrollWheelEvent {
             position: p,
             delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
-            modifiers: Modifiers::default(),
+            modifiers: Modifiers {
+                control: ctrl,
+                ..Modifiers::default()
+            },
             touch_phase: TouchPhase::Moved,
         }),
     ]
@@ -5613,7 +5616,11 @@ fn dispatch_verb(
                 ("y", Json::Num(f64::from(p.y))),
                 ("dy", Json::Num(f64::from(dy))),
             ]))?;
-            done.input = wheel_events(p, dy);
+            done.input = wheel_events(
+                p,
+                dy,
+                args.get("ctrl").and_then(Json::as_bool).unwrap_or(false),
+            );
             Ok(done)
         }
         // Switch the File screen's page (#1028): `new`, `info` and `export`

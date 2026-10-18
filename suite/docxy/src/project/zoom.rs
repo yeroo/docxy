@@ -236,12 +236,6 @@ pub(crate) fn fit(days: f32, width: f32) -> f32 {
     (width / days.max(1.)).clamp(MIN_DAY_W, MAX_DAY_W)
 }
 
-/// The chart offset after changing the width from `old` to `new` that keeps
-/// the day under `pointer_x` (px from the chart's left edge) where it is.
-pub(crate) fn zoom_about(old: f32, gantt_x: f32, pointer_x: f32, new: f32) -> f32 {
-    (gantt_x + pointer_x) / old * new - pointer_x
-}
-
 /// One cell of a header tier: `x` and `w` in chart pixels from the scale's
 /// origin, the label already fitted to `w` (empty when none fits), and `at`
 /// where the label starts (held at the visible edge while the cell runs past it).
@@ -309,11 +303,6 @@ impl ProjectView {
         self.scale.day_w
     }
 
-    /// The level whose tiers the header draws.
-    pub fn zoom_level(&self) -> &'static Level {
-        &LEVELS[nearest(self.day_w())]
-    }
-
     /// Days the chart shows across its width, as the Zoom dialog's Custom field.
     pub fn visible_days(&self) -> f32 {
         self.gantt_w / self.day_w()
@@ -346,6 +335,17 @@ impl ProjectView {
         format!("Timescale: {}", label(self.day_w()))
     }
 
+    /// Ctrl+wheel over the split area at `x` (px from its left edge): zoom one
+    /// level around the pointer, in for a wheel turned up (`dy` > 0). `None`
+    /// when the pointer is not over the chart, so the wheel is not the chart's.
+    pub fn wheel_zoom(&mut self, x: f32, dy: f32) -> Option<String> {
+        if dy == 0. || self.pane_at(x) != ProjectPane::Chart {
+            return None;
+        }
+        let pointer = (x - self.table_w - GANTT_INSET).clamp(0., self.gantt_w);
+        Some(self.zoom_step(if dy > 0. { 1 } else { -1 }, pointer))
+    }
+
     /// Entire Project: the plan's span fills the chart.
     pub fn zoom_entire(&mut self) -> String {
         self.refresh_schedule_layout();
@@ -356,7 +356,7 @@ impl ProjectView {
     }
 
     /// Selected Tasks: the selected tasks' span fills the chart.
-    pub fn zoom_selected(&mut self) -> String {
+    pub fn zoom_selected(&mut self) -> Result<String, String> {
         self.refresh_schedule_layout();
         let uids = self.look().uids;
         let span = uids
@@ -369,10 +369,17 @@ impl ProjectView {
                 }))
             });
         let Some((start, end)) = span else {
-            return "Select one or more tasks to zoom to".into();
+            return Err("Select one or more tasks to zoom to".into());
         };
         let days = (end - start + 1) as f32;
         self.set_zoom(fit(days, self.gantt_w), start as f32, 0.);
+        Ok(format!("Timescale: {}", label(self.day_w())))
+    }
+
+    /// Zoom dialog's Custom: `days` days across the chart, the left-edge date kept.
+    pub fn zoom_to_days(&mut self, days: f32) -> String {
+        let day = self.gantt_x.get() / self.day_w();
+        self.set_zoom(fit(days, self.gantt_w), day, 0.);
         format!("Timescale: {}", label(self.day_w()))
     }
 

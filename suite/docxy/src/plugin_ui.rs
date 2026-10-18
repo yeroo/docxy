@@ -1085,6 +1085,20 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
     }
 }
 
+/// What the overlay's shapes depend on: they are asked for again when it changes.
+fn overlay_key(v: &ProjectView) -> OverlayKey {
+    let scale = v.chart_scale();
+    OverlayKey {
+        revision: v.ed.revision(),
+        origin_day: scale.origin_day,
+        days: scale.days,
+        day_w: scale.day_w.to_bits(),
+        flags: flags_of(v),
+        shown: v.ed.display_rows(),
+        selected: selection_of(v).uids,
+    }
+}
+
 /// The shapes every plugin's overlay draws for the chart as it is, asked
 /// again only when the plan's revision, the scale or the view's switches
 /// changed. Empty without a UI plugin.
@@ -1093,16 +1107,7 @@ pub(crate) fn overlay_shapes(v: &ProjectView) -> Rc<Vec<Shape>> {
     if plugins.is_empty() {
         return Rc::new(Vec::new());
     }
-    let scale = v.chart_scale();
-    let key = OverlayKey {
-        revision: v.ed.revision(),
-        origin_day: scale.origin_day,
-        days: scale.days,
-        day_w: scale.day_w.to_bits(),
-        flags: flags_of(v),
-        shown: v.ed.display_rows(),
-        selected: selection_of(v).uids,
-    };
+    let key = overlay_key(v);
     let mut cache = v.plugin_cache.borrow_mut();
     if cache.overlay_key.as_ref() != Some(&key) {
         let ctx = overlay_ctx(v);

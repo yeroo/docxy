@@ -73,6 +73,17 @@ fn apply_dialog(
             crate::project::apply_task_info(&mut v.ed, uid, dialog)?;
             Ok(false)
         }
+        DialogOwner::Zoom | DialogOwner::Timescale => {
+            let Surface::Project(v) = surface else {
+                return Err("this dialog belongs to a Project".into());
+            };
+            if dialog.owner == DialogOwner::Zoom {
+                crate::project::apply_zoom(v, dialog)?;
+            } else {
+                crate::project::apply_timescale(v, dialog)?;
+            }
+            Ok(false)
+        }
         // Handled in `plugin_ui::dialog_click`, before this: OK sends the
         // plugin its command again with the values.
         DialogOwner::Plugin { .. } => Err("a plugin's dialog applies through its OK".into()),

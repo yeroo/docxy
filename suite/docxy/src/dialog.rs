@@ -37,6 +37,9 @@ pub(crate) enum DialogOwner {
     TaskInfo {
         uid: i32,
     },
+    /// Project's Zoom and Timescale dialogs, on the Gantt chart (#1535).
+    Zoom,
+    Timescale,
     /// A dialog a UI plugin's command asked for (#1532): OK sends `command`
     /// again with the values (`plugin_ui::dialog_click`).
     Plugin {

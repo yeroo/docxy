@@ -1051,7 +1051,20 @@ pub(crate) fn project_chart_menu(v: &ProjectView) -> Vec<crate::menu::MenuItem> 
         MenuItem::{Item, Separator},
     };
     let none = |id, label| Item(Entry::unavailable(id, label));
+    let item = |id, label, icon, act: ProjectAct| {
+        Item(Entry::new(id, label, icon, Act::Project(act), true))
+    };
     let mut items = vec![
+        item(
+            "ch-timescale",
+            "Timescale...",
+            "rule",
+            ProjectAct::TimescaleDialog,
+        ),
+        item("ch-zoom", "Zoom...", "find", ProjectAct::ZoomDialog),
+        none("ch-working-time", "Change Working Time..."),
+        none("ch-show-bar-styles", "Show/Hide Bar Styles"),
+        Separator,
         none("ch-gridlines", "Gridlines..."),
         none("ch-bar-styles", "Bar Styles..."),
         none("ch-layout", "Layout..."),
@@ -2113,8 +2126,9 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             ZoomIn => status = Some(v.zoom_step(1, 0.)),
             ZoomOut => status = Some(v.zoom_step(-1, 0.)),
             ZoomEntire => status = Some(v.zoom_entire()),
-            ZoomSelected => status = Some(v.zoom_selected()),
-            ZoomDialog | TimescaleDialog => {}
+            ZoomSelected => status = Some(v.zoom_selected()?),
+            ZoomDialog => dialog = Some(zoom_dialogs::zoom_dialog(v)),
+            TimescaleDialog => dialog = Some(zoom_dialogs::timescale_dialog(v)),
             CriticalTasks => v.show_critical = !v.show_critical,
             BaselineBars => v.show_baseline = !v.show_baseline,
             // A UI plugin's command (#1532): its ops as one undo step, its
