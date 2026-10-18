@@ -83,7 +83,10 @@ fn an_id_press_fills_every_column_of_the_row() {
         assert!(!look.fill(Some(20), col));
     }
     assert_eq!(state(&t, "selected_rows"), "[1]");
-    assert_eq!(state(&t, "filled_cells").matches("1:").count(), COLUMN_COUNT);
+    assert_eq!(
+        state(&t, "filled_cells").matches("1:").count(),
+        COLUMN_COUNT
+    );
 }
 
 #[test]
@@ -97,7 +100,10 @@ fn shift_space_selects_the_row_as_an_id_press_does() {
         v(&u).look()
     });
     assert_eq!(a, b);
-    assert!(v(&t).row_header, "Delete deletes the row, as for an ID press");
+    assert!(
+        v(&t).row_header,
+        "Delete deletes the row, as for an ID press"
+    );
     assert_eq!(v(&t).col, COL_ID);
     assert!(a.fill(Some(20), COL_RESOURCES));
     // Nothing was typed into a cell.
@@ -112,7 +118,11 @@ fn ctrl_space_and_a_heading_press_select_the_column() {
     let look = v(&t).look();
     assert_eq!(look.uids, [10, 20, 30]);
     assert_eq!(look.cols, COL_FINISH..=COL_FINISH);
-    assert_eq!(v(&t).selected_uid(), Some(10), "the cursor is the first task");
+    assert_eq!(
+        v(&t).selected_uid(),
+        Some(10),
+        "the cursor is the first task"
+    );
     assert_eq!(state(&t, "selected_rows"), "[1,2,3]");
     assert!(look.heading_hot(COL_FINISH) && !look.heading_hot(COL_START));
     // The heading's left press is the same selection.
@@ -131,7 +141,10 @@ fn ctrl_a_selects_the_whole_table_cursor_first_anchor_last() {
     assert_eq!((v(&t).selected_uid(), v(&t).col), (Some(10), 0));
     assert_eq!(v(&t).anchor, Some((30, COLUMN_COUNT - 1)));
     assert_eq!(state(&t, "selected_rows"), "[1,2,3]");
-    assert_eq!(state(&t, "selected_columns").matches('"').count(), 2 * COLUMN_COUNT);
+    assert_eq!(
+        state(&t, "selected_columns").matches('"').count(),
+        2 * COLUMN_COUNT
+    );
 }
 
 #[test]
@@ -151,7 +164,10 @@ fn ctrl_home_and_end_go_to_the_first_and_last_cell() {
     let mut t = tab();
     project_cell_press(&mut t, 1, COL_NAME, false);
     chord(&mut t, "end", true, false);
-    assert_eq!((v(&t).selected_uid(), v(&t).col), (Some(30), COLUMN_COUNT - 1));
+    assert_eq!(
+        (v(&t).selected_uid(), v(&t).col),
+        (Some(30), COLUMN_COUNT - 1)
+    );
     chord(&mut t, "home", true, false);
     assert_eq!((v(&t).selected_uid(), v(&t).col), (Some(10), COL_ID));
 }
@@ -182,7 +198,12 @@ fn the_colours_are_washes_of_the_accent() {
 fn the_whole_entry_table_fits_the_default_window_and_a_narrow_one_scrolls() {
     let mut p = ProjectView::new(Project::default(), false);
     p.layout(1180.);
-    assert!(p.table_total() <= p.table_w, "{} > {}", p.table_total(), p.table_w);
+    assert!(
+        p.table_total() <= p.table_w,
+        "{} > {}",
+        p.table_total(),
+        p.table_w
+    );
     assert_eq!(p.table_x.get(), 0.);
     assert!(project_state(&p, None).contains(&("table_fits".into(), Json::Bool(true))));
     p.layout(900.);

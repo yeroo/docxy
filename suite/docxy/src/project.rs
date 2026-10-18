@@ -24,8 +24,8 @@ mod timeline;
 pub(super) use timeline::*;
 mod rows;
 pub(super) use rows::*;
-mod selection;
 mod columns;
+mod selection;
 pub(super) use columns::{ARROW_W, EDGE_W, WidthDrag, committed_widths, project_width_release_all};
 mod autofilter;
 pub(super) use autofilter::{AUTO_FILTER_STATUS, autofilter_click};
@@ -1066,8 +1066,7 @@ pub(crate) fn project_row(ed: &ProjectEditor, task: &Task) -> [String; COLUMN_CO
 pub(crate) const ROW_H: f32 = 28.;
 /// The entry table's default column widths; a plan's own (`tableview.xml`,
 /// dragged on a heading's right edge) replace them per column.
-pub(crate) const DEFAULT_WIDTHS: [f32; COLUMN_COUNT] =
-    [46., 132., 140., 90., 94., 94., 118., 133.];
+pub(crate) const DEFAULT_WIDTHS: [f32; COLUMN_COUNT] = [46., 132., 140., 90., 94., 94., 118., 133.];
 /// The default widths' sum.
 #[cfg(test)]
 pub(crate) const TABLE_W: f32 = sum_widths();
