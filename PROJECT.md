@@ -471,6 +471,19 @@ without one nothing changes.
   line. `dialog` names a spec to open, whose OK sends the same id again with
   `values`; `view` sets host view settings (the palette, flags). Code 1
   (unsupported) means "not my command", so several plugins can coexist.
+  A dialog spec may list buttons of its own (#1602: `{id, label, default?,
+  cancel?}`; a press sends the command with `button: <id>` and the values,
+  and the dialog stays open unless the reply says `close: true`; the state
+  greys a button by its id), be `modeless` (no backdrop; the host asks the
+  state again, with the dialog's `values`, whenever the plan's revision or
+  the selection changes and applies its values, items and enabled flags),
+  and its `grid` rows select (`values` carry `name.selected_row`, and the
+  state's `values` may move the selection with the same key) and edit
+  by hand (a `check` column kind is Project's check mark; a grid with
+  `commit_command` sends the command on every cell commit with `edit:
+  {control, row, col, value}`, its ops applying at once). A change of any
+  plugin control asks the state again with `dialog.values` (#1567) and
+  applies the items and enabled flags.
 - **Overlay** (`yppx_ui_overlay`): the rows in view (`uid`, `row_y`, the bar
   rectangle, kind flags, since #1548 `name`, `percent_complete`,
   `deadline_x`, `constraint {type, x}` and `resource_names`, and since

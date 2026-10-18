@@ -414,7 +414,9 @@ pub(crate) fn dialog_key_with(
     m: Modifiers,
     clip: Option<&str>,
 ) -> bool {
-    if !tab.dialogs.is_open() {
+    // A modeless dialog that is not active leaves the keys to the document
+    // (#1602).
+    if !tab.dialogs.top_takes_keys() {
         return false;
     }
     let plain = !m.control && !m.alt && !m.platform;
@@ -427,6 +429,8 @@ pub(crate) fn dialog_key_with(
     if let Err(e) = edit_key(&mut tab.dialogs, key, typed, m, clip) {
         tab.status = e.into();
     }
+    // A plugin control typed into: its state is asked again (#1602).
+    crate::plugin_ui::refresh_dialog(tab);
     true
 }
 
@@ -475,6 +479,11 @@ pub(crate) fn edit_key(
             _ => None,
         }
     });
+    // A focused grid takes the arrows, Space, typing, Enter and Escape of a
+    // cell edit, Backspace and Delete (#1602).
+    if d.grid_key(key, typed.as_deref())? {
+        return Ok(());
+    }
     match key {
         "tab" => {
             d.focus_step(m.shift);
@@ -541,9 +550,37 @@ impl Docxy {
     /// active tab's or the app's): its backdrop covers the whole window, title bar and
     /// ribbon included. Shared by the harness and the Project control server.
     pub(crate) fn refuse_under_dialog(&self) -> Result<(), String> {
-        match self.active_dialogs().and_then(|d| d.top()) {
+        // A modeless dialog covers nothing (#1602).
+        match self
+            .active_dialogs()
+            .filter(|s| s.modal_open())
+            .and_then(|d| d.top())
+        {
             Some(d) => Err(format!("a dialog is open: {}", d.title)),
             None => Ok(()),
+        }
+    }
+
+    /// Ask the plugin's state again for the active tab's dialog when it is
+    /// stale or the plan moved under a modeless one (#1602): before a reply
+    /// is written.
+    pub(crate) fn refresh_plugin_dialog(&mut self) {
+        if !self.app_dialogs.is_open()
+            && let Some(tab) = self.tabs.get_mut(self.active)
+        {
+            crate::plugin_ui::refresh_dialog(tab);
+        }
+    }
+
+    /// A press in the open dialog gives it the keyboard (a modeless one may
+    /// have lost it to the document), then the plugin's state is asked again
+    /// when a control of its changed (#1602).
+    fn dialog_touched(&mut self) {
+        self.active_dialogs_mut().activate(true);
+        if !self.app_dialogs.is_open()
+            && let Some(tab) = self.tabs.get_mut(self.active)
+        {
+            crate::plugin_ui::refresh_dialog(tab);
         }
     }
 
@@ -700,6 +737,7 @@ impl Docxy {
                 tab.status = e.into();
             }
         }
+        self.dialog_touched();
         self.refocus(window, cx);
     }
 
@@ -712,6 +750,7 @@ impl Docxy {
         if let Err(e) = done {
             self.set_status(e);
         }
+        self.dialog_touched();
         cx.notify();
     }
 
@@ -761,6 +800,7 @@ impl Docxy {
         if let Err(e) = self.active_dialogs_mut().select_tab(label) {
             self.set_status(e);
         }
+        self.dialog_touched();
         cx.notify();
     }
 
@@ -863,13 +903,16 @@ impl Docxy {
                     )
                     .into_any_element()
             }
-            // A grid (#1532): its headings and rows as a table, edited by
-            // `dialog-set` (a cell is `name[row].column`).
+            // A grid (#1532): its headings and rows as a table; a click
+            // selects a row and its cell (a check cell toggles), the
+            // selected row is shaded, the active cell outlined, and a cell
+            // being typed into shows its text with a caret (#1602).
             ControlKind::Grid => {
                 let rows = match &c.value {
                     dialog::Value::Rows(rows) => rows.clone(),
                     _ => Vec::new(),
                 };
+                let (sel_row, sel_col, editing) = (c.row, c.col, c.edit.clone());
                 let widths: Vec<f32> = (0..c.columns.len())
                     .map(|col| {
                         let longest = std::iter::once(c.columns[col].chars().count())
@@ -882,7 +925,7 @@ impl Docxy {
                         (longest as f32 * 7. + 12.).clamp(40., 200.)
                     })
                     .collect();
-                let cell = |text: String, w: f32, head: bool| {
+                let cell = |content: AnyElement, w: f32, head: bool, active: bool| {
                     div()
                         .w(px(w))
                         .h(px(18.))
@@ -893,26 +936,46 @@ impl Docxy {
                         .border_b_1()
                         .border_color(pal.border)
                         .when(head, |d| d.font_weight(FontWeight::BOLD).bg(pal.hover))
-                        .child(SharedString::from(text))
+                        .when(active, |d| d.border_1().border_color(hsla_u(BRAND)))
+                        .child(content)
                 };
-                let header = h_flex().children(
-                    c.columns
-                        .iter()
-                        .enumerate()
-                        .map(|(col, name)| cell(name.clone(), widths[col], true)),
-                );
+                let text_cell = |text: String| SharedString::from(text).into_any_element();
+                let header =
+                    h_flex().children(c.columns.iter().enumerate().map(|(col, name)| {
+                        cell(text_cell(name.clone()), widths[col], true, false)
+                    }));
                 let body = rows.iter().enumerate().map(|(r, row)| {
-                    h_flex().id(("dialog-grid-row", i * 1024 + r)).children(
-                        (0..c.columns.len()).map(|col| {
+                    let selected = sel_row == Some(r);
+                    h_flex()
+                        .id(("dialog-grid-row", i * 1024 + r))
+                        .when(selected, |h| h.bg(pal.hover))
+                        .children((0..c.columns.len()).map(|col| {
                             let text = row.get(col).cloned().unwrap_or_default();
-                            let text = match (c.column_kind(col), text.as_str()) {
-                                (ControlKind::Checkbox, "true") => "\u{2611}".to_string(),
-                                (ControlKind::Checkbox, _) => "\u{2610}".to_string(),
-                                _ => text,
+                            let active = selected && sel_col == col && focused;
+                            let content: AnyElement = match (c.column_kind(col), text.as_str()) {
+                                (ControlKind::Checkbox, "true") => text_cell("\u{2611}".into()),
+                                (ControlKind::Checkbox, _) => text_cell("\u{2610}".into()),
+                                // Project's check mark column: a mark or nothing.
+                                (ControlKind::Check, "true") => text_cell("\u{2713}".into()),
+                                (ControlKind::Check, _) => text_cell(String::new()),
+                                _ => match (&editing, active) {
+                                    (Some(buf), true) => h_flex()
+                                        .child(SharedString::from(buf.clone()))
+                                        .child(caret_bar(pal.fg))
+                                        .into_any_element(),
+                                    _ => text_cell(text),
+                                },
                             };
-                            cell(text, widths[col], false)
-                        }),
-                    )
+                            cell(content, widths[col], false, active)
+                                .id(("dialog-grid-cell", (i * 1024 + r) * 256 + col))
+                                .when(c.enabled && c.plugin, |d| {
+                                    d.cursor_pointer().on_click(on_widget(
+                                        cx,
+                                        i,
+                                        Some(r * 256 + col),
+                                    ))
+                                })
+                        }))
                 });
                 v_flex()
                     .id(("dialog-control", i))
@@ -1195,16 +1258,20 @@ impl Docxy {
                         }))
                 })
         });
+        // A modeless dialog (#1602) has no backdrop: the pointer reaches the
+        // document, and a press in the panel gives the dialog the keyboard.
+        let modeless = d.modeless;
         Some(
             deferred(
                 div()
                     .id("dialog-backdrop")
                     .absolute()
                     .inset_0()
-                    .occlude()
-                    .bg(Hsla {
-                        a: 0.25,
-                        ..hsla_u(0x000000)
+                    .when(!modeless, |b| {
+                        b.occlude().bg(Hsla {
+                            a: 0.25,
+                            ..hsla_u(0x000000)
+                        })
                     })
                     .flex()
                     .items_center()
@@ -1219,8 +1286,21 @@ impl Docxy {
                             .gap_3()
                             .bg(pal.panel)
                             .border_1()
-                            .border_color(pal.border)
+                            .border_color(if modeless && !d.active {
+                                pal.dim
+                            } else {
+                                pal.border
+                            })
                             .shadow_lg()
+                            .when(modeless, |p| {
+                                p.occlude().on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.active_dialogs_mut().activate(true);
+                                        cx.notify();
+                                    }),
+                                )
+                            })
                             .child(probe(&self.probes, "dialog"))
                             .child(
                                 div()

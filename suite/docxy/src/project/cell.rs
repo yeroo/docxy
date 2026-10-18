@@ -692,6 +692,8 @@ pub(crate) fn project_below_click(tab: &mut DocTab) {
 /// the release-click through `drag_made_range`, so the gesture survives the
 /// `on_click` gpui delivers on release.
 pub(crate) fn project_cell_press(tab: &mut DocTab, row: usize, col: usize, shift: bool) {
+    // A press in the table takes the keyboard from a modeless dialog (#1602).
+    tab.dialogs.activate(false);
     // A levelling pass asked for first runs first, as on any click; see
     // [`flush_level_pass`].
     flush_level_pass(tab);

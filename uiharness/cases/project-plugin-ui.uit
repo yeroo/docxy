@@ -81,23 +81,23 @@ test a Bold toggle styles the selected cell and reads its state from the view's 
   open copy:../fixtures/project-clipboard.xml
   click C2
   call ribbon-read {}
-  assert reply.tabs.1.groups.-1.commands.-1.id is fixture.bold
-  assert reply.tabs.1.groups.-1.commands.-1.checked is false
+  assert reply.tabs.1.groups.-1.commands.-2.id is fixture.bold
+  assert reply.tabs.1.groups.-1.commands.-2.checked is false
   call ribbon-click {"tab":"Task","command":"fixture.bold"}
   assert status is Fixture: bold on
   assert dirty is true
   call ribbon-read {}
-  assert reply.tabs.1.groups.-1.commands.-1.checked is true
+  assert reply.tabs.1.groups.-1.commands.-2.checked is true
   click C1
   call ribbon-read {}
-  assert reply.tabs.1.groups.-1.commands.-1.checked is false
+  assert reply.tabs.1.groups.-1.commands.-2.checked is false
   click C2
   call ribbon-read {}
-  assert reply.tabs.1.groups.-1.commands.-1.checked is true
+  assert reply.tabs.1.groups.-1.commands.-2.checked is true
   call ribbon-click {"tab":"Task","command":"fixture.bold"}
   assert status is Fixture: bold off
   call ribbon-read {}
-  assert reply.tabs.1.groups.-1.commands.-1.checked is false
+  assert reply.tabs.1.groups.-1.commands.-2.checked is false
 
 test a swatch sets the plan's palette (an edit) and the gallery follows
   open copy:../fixtures/project-clipboard.xml
@@ -267,3 +267,93 @@ test the overlay follows a collapsed summary
   call ribbon-click {"tab":"View","command":"Show Subtasks"}
   call project-overlay {}
   assert reply.count is 4
+
+test a modeless dialog with a grid and buttons of its own follows the plan and re-asks its state
+  # The fixture's Sheet (#1602): no backdrop, so the document under it still
+  # takes verbs and presses; its rows follow the plan; a change of its
+  # controls asks the plugin's state again (Clear enables with a pick);
+  # Apply sends the command with the button's id and stays open; Clear
+  # closes from the reply.
+  open copy:../fixtures/project-clipboard.xml
+  call ribbon-click {"tab":"Task","command":"fixture.sheet"}
+  assert dialog is plugin
+  assert status is Fixture: sheet
+  call dialog-read {}
+  assert reply.title is Fixture Sheet
+  assert reply.modeless is true
+  assert reply.active is true
+  assert reply.buttons.0.id is apply
+  assert reply.buttons.0.label is Apply
+  assert reply.buttons.0.default is true
+  assert reply.buttons.1.id is clear
+  assert reply.buttons.1.enabled is false
+  assert reply.buttons.2.id is close
+  assert reply.controls.0.name is fixture.rows
+  assert reply.controls.0.kind is grid
+  assert reply.controls.0.column_kinds.0 is check
+  assert reply.controls.0.column_kinds.2 is number
+  assert reply.controls.0.rows.0.1 is A
+  assert reply.controls.0.rows.1.1 is B
+  assert reply.controls.0.selected_row is null
+  # An edit behind the dialog: it stays, and its rows follow the plan.
+  call task.set {"uid":1,"name":"Renamed under the sheet"}
+  assert dialog is plugin
+  call dialog-read {}
+  assert reply.controls.0.rows.0.1 is Renamed under the sheet
+  # A press in the table takes the keyboard; a dialog verb gives it back.
+  click C2
+  call dialog-read {}
+  assert reply.active is false
+  call dialog-select {"control":"fixture.rows","row":1}
+  call dialog-read {}
+  assert reply.active is true
+  assert reply.controls.0.selected_row is 1
+  assert reply.buttons.1.enabled is false
+  call dialog-set {"control":"fixture.rows[1].Pick","value":true}
+  call dialog-read {}
+  assert reply.controls.0.rows.1.0 is true
+  assert reply.buttons.1.enabled is true
+  # Typing into the Units cell: Right twice reaches it, Enter commits.
+  call real-key {"key":"right"}
+  call real-key {"key":"right"}
+  call dialog-read {}
+  assert reply.controls.0.column is 2
+  call real-type {"text":"50"}
+  call dialog-read {}
+  assert reply.controls.0.editing is 50
+  call real-key {"key":"enter"}
+  call dialog-read {}
+  assert reply.controls.0.editing is null
+  assert reply.controls.0.rows.1.2 is 50
+  assert dialog is plugin
+  # Space toggles the check cell back and forth.
+  call real-key {"key":"left"}
+  call real-key {"key":"left"}
+  call real-key {"key":"space"}
+  call dialog-read {}
+  assert reply.controls.0.rows.1.0 is false
+  assert reply.buttons.1.enabled is false
+  call real-key {"key":"space"}
+  # The grid commits through the command (commit_command): a Name cell typed
+  # and entered renames the task at once, no button pressed, and the rows
+  # follow the plan.
+  call dialog-select {"control":"fixture.rows","row":0}
+  call real-key {"key":"right"}
+  call real-type {"text":"Z"}
+  call real-key {"key":"enter"}
+  assert dialog is plugin
+  assert status is Fixture: renamed row 0
+  call task.get {"uid":1}
+  assert reply.name is Z
+  call dialog-read {}
+  assert reply.controls.0.rows.0.1 is Z
+  assert reply.controls.0.rows.1.0 is true
+  call dialog-select {"control":"fixture.rows","row":1}
+  # Apply: the command gets the button and the values; the dialog stays.
+  call dialog-click {"button":"apply"}
+  assert dialog is plugin
+  assert status is Fixture: applied 1 picked, row 1
+  # Clear closes it from the reply.
+  call dialog-click {"button":"Clear"}
+  assert dialog is none
+  assert status is Fixture: cleared

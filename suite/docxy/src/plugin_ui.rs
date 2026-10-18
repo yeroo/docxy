@@ -374,6 +374,7 @@ fn with_states<T>(v: &ProjectView, f: impl FnOnce(&[State]) -> T) -> T {
             selection: selection_of(v),
             view: view_json(v),
             dialog: None,
+            dialog_values: None,
         };
         cache.states = plugins
             .iter()
@@ -460,11 +461,18 @@ impl Prefill {
 }
 
 fn prefill(v: &ProjectView, dialog: &str, uid: Option<i32>) -> Prefill {
+    prefill_with(v, dialog, uid, None)
+}
+
+/// [`prefill`] for an open dialog asked again (#1602): `values` are the
+/// dialog's current values, sent as `dialog.values`.
+fn prefill_with(v: &ProjectView, dialog: &str, uid: Option<i32>, values: Option<Json>) -> Prefill {
     let ctx = StateCtx {
         plan: projcore::mspdi::write_mspdi(v.ed.project()),
         selection: selection_of(v),
         view: view_json(v),
         dialog: Some((dialog.to_string(), uid)),
+        dialog_values: values,
     };
     let mut out = Prefill::default();
     for p in plugins() {
@@ -491,20 +499,26 @@ fn prefill(v: &ProjectView, dialog: &str, uid: Option<i32>) -> Prefill {
 
 // ---- commands ----------------------------------------------------------------
 
-/// What a command left: the status and the dialog to open.
+/// What a command left: the status, the dialog to open, and whether the
+/// dialog whose button sent it closes (#1602).
 pub(crate) struct Outcome {
     pub status: Option<String>,
     pub dialog: Option<Dialog>,
+    pub close: bool,
 }
 
 /// Run the plugin command `id` on the view's plan: the first plugin that
 /// owns the id answers; its ops and its `view` (the plan's formatting) are
 /// one undo step, its view switches set the view, and its dialog is built
-/// with the plugin's prefill. `values` are a dialog's on its OK.
+/// with the plugin's prefill. `values` are a dialog's on its OK, `button`
+/// the id of one of the dialog's own buttons when one sent them, `edit` the
+/// grid cell just committed when a `commit_command` grid did (#1602).
 pub(crate) fn run_command(
     v: &mut ProjectView,
     id: &str,
     values: Option<Json>,
+    button: Option<&str>,
+    edit: Option<Json>,
 ) -> Result<Outcome, String> {
     let command = Command {
         id: id.to_string(),
@@ -512,6 +526,8 @@ pub(crate) fn run_command(
         selection: selection_of(v),
         view: view_json(v),
         values,
+        button: button.map(str::to_string),
+        edit,
     };
     let mut answer = None;
     for plugin in plugins() {
@@ -563,6 +579,7 @@ pub(crate) fn run_command(
     Ok(Outcome {
         status: result.status,
         dialog,
+        close: result.close,
     })
 }
 
@@ -650,6 +667,7 @@ fn kind_of(kind: &str) -> dialog::ControlKind {
         "duration" => K::Duration,
         "multiline" => K::Multiline,
         "checkbox" => K::Checkbox,
+        "check" => K::Check,
         "radio" => K::Radio,
         "dropdown" => K::Dropdown,
         "list" => K::List,
@@ -664,7 +682,7 @@ fn kind_of(kind: &str) -> dialog::ControlKind {
 fn value_of(kind: dialog::ControlKind, items: &[String], value: &Json) -> dialog::Value {
     use dialog::{ControlKind as K, Value};
     match kind {
-        K::Checkbox => Value::Bool(value.as_bool().unwrap_or(false)),
+        K::Checkbox | K::Check => Value::Bool(value.as_bool().unwrap_or(false)),
         K::Radio | K::Dropdown | K::List => Value::Choice(match value {
             Json::Num(n) => Some(*n as usize).filter(|i| *i < items.len()),
             Json::Str(s) => items.iter().position(|i| i == s),
@@ -725,15 +743,20 @@ fn value_back(c: &dialog::Control) -> Json {
 }
 
 /// The plugin controls of `d` (every page), by name, for a command's
-/// `values`.
+/// `values`; a grid's selected row rides along as `name.selected_row`
+/// (#1602).
 pub(crate) fn values_of(d: &Dialog) -> Json {
-    Json::Obj(
-        d.controls
-            .iter()
-            .filter(|c| c.plugin)
-            .map(|c| (c.name.to_string(), value_back(c)))
-            .collect(),
-    )
+    let mut out = Vec::new();
+    for c in d.controls.iter().filter(|c| c.plugin) {
+        out.push((c.name.to_string(), value_back(c)));
+        if c.kind == dialog::ControlKind::Grid {
+            out.push((
+                format!("{}.selected_row", c.name),
+                c.row.map_or(Json::Null, |r| Json::Num(r as f64)),
+            ));
+        }
+    }
+    Json::Obj(out)
 }
 
 /// A spec's control as the dialog model holds it, on `page`, with the
@@ -758,9 +781,31 @@ fn control_of_spec(
     }
     out.columns = c.columns.iter().map(|col| col.name.clone()).collect();
     out.column_kinds = c.columns.iter().map(|col| kind_of(&col.kind)).collect();
+    out.commit_command = c.commit_command;
     out.page = page;
     out.plugin = true;
+    apply_selected_row(&mut out, prefill);
     out
+}
+
+/// A grid's selected row as the plugin's state gives it under
+/// `name.selected_row` (#1602): a number selects that row (clamped to the
+/// rows), null none; absent leaves the selection alone.
+fn apply_selected_row(c: &mut dialog::Control, prefill: &Prefill) {
+    if c.kind != dialog::ControlKind::Grid {
+        return;
+    }
+    let Some(v) = prefill.value(&format!("{}.selected_row", c.name)) else {
+        return;
+    };
+    let rows = match &c.value {
+        dialog::Value::Rows(rows) => rows.len(),
+        _ => 0,
+    };
+    c.row = match v {
+        Json::Num(n) if *n >= 0.0 && rows > 0 => Some((*n as usize).min(rows - 1)),
+        _ => None,
+    };
 }
 
 /// The dialog spec `spec_id` of any loaded plugin.
@@ -785,9 +830,12 @@ fn open_dialog(v: &ProjectView, spec_id: &str, command: &str) -> Result<Dialog, 
         &[],
         DialogOwner::Plugin {
             command: intern(command),
+            spec: intern(spec_id),
         },
     );
     d.text = None;
+    d.modeless = spec.modeless;
+    d.seen = Some((v.ed.revision(), v.selected_uid()));
     let tabbed = spec.pages.len() > 1;
     if tabbed {
         d.tabs = spec.pages.iter().map(|p| p.name.clone()).collect();
@@ -803,19 +851,148 @@ fn open_dialog(v: &ProjectView, spec_id: &str, command: &str) -> Result<Dialog, 
                 .map(move |c| control_of_spec(c, page, values))
         })
         .collect();
-    // OK and Cancel; a spec naming only some keeps those (Help is not
-    // drawn: the host has no help pages for a plugin).
-    let mut buttons = ok_cancel();
-    if !spec.buttons.is_empty() {
-        buttons.retain(|b| {
-            spec.buttons
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(&b.label))
-        });
+    // OK and Cancel, or the spec's own buttons (#1602): `ok` accepts (the
+    // command gets the values and the dialog closes), a cancel button
+    // closes, any other sends the command with its id and stays open
+    // unless the reply closes it. Help is not drawn: the host has no help
+    // pages for a plugin. The state greys a button by its id.
+    let mut buttons = if spec.buttons.is_empty() {
+        ok_cancel()
+    } else {
+        spec.buttons
+            .iter()
+            .filter(|b| !b.id.eq_ignore_ascii_case("help"))
+            .map(|b| {
+                let role = if b.cancel {
+                    dialog::ButtonRole::Cancel
+                } else if b.id.eq_ignore_ascii_case("ok") {
+                    dialog::ButtonRole::Accept
+                } else {
+                    dialog::ButtonRole::Apply
+                };
+                dialog::Button {
+                    id: b.id.clone(),
+                    default: b.default,
+                    ..dialog::Button::new(&b.label, role)
+                }
+            })
+            .collect()
+    };
+    for b in &mut buttons {
+        if let Some(on) = values.enabled(&b.id) {
+            b.enabled = on;
+        }
     }
     d.buttons = buttons;
     d.mark_opened();
     Ok(d)
+}
+
+/// Ask the plugin's state again for the top dialog when a plugin control
+/// changed since (#1567) or, for a modeless dialog, the plan or the
+/// selection moved under it (#1602), and apply the reply: items and enabled
+/// flags always (a chosen item that is still there stays chosen), the
+/// values only when the plan or selection moved (a grid keeps its selected
+/// row and the cell being typed into). Called before a frame is drawn or a
+/// reply is written, so a read sees the state the plugin would show.
+pub(crate) fn refresh_dialog(tab: &mut DocTab) {
+    let DocTab {
+        dialogs,
+        surface,
+        status,
+        ..
+    } = tab;
+    let Surface::Project(v) = surface else {
+        return;
+    };
+    // A committed cell of a `commit_command` grid sends the command first
+    // (#1602): its ops apply at once, the dialog stays unless the reply
+    // closes it.
+    let committed = dialogs.top_dialog_mut().ok().and_then(|d| {
+        let (i, row, col, value) = d.committed.take()?;
+        let DialogOwner::Plugin { command, .. } = d.owner else {
+            return None;
+        };
+        let edit = Json::obj(vec![
+            ("control", Json::str(d.controls[i].name)),
+            ("row", Json::Num(row as f64)),
+            ("col", Json::Num(col as f64)),
+            ("value", Json::str(value)),
+        ]);
+        Some((command, values_of(d), edit))
+    });
+    if let Some((command, values, edit)) = committed {
+        match run_command(v, command, Some(values), None, Some(edit)) {
+            Ok(outcome) => {
+                if let Some(s) = outcome.status {
+                    *status = s.into();
+                }
+                if outcome.close {
+                    dialogs.pop();
+                }
+                if let Some(dialog) = outcome.dialog {
+                    dialogs.push(dialog);
+                }
+            }
+            Err(e) => *status = e.into(),
+        }
+    }
+    let Ok(d) = dialogs.top_dialog_mut() else {
+        return;
+    };
+    let (spec_id, uid) = match d.owner {
+        DialogOwner::Plugin { spec, .. } => (spec, v.selected_uid()),
+        DialogOwner::TaskInfo { uid } if d.controls.iter().any(|c| c.plugin) => {
+            ("task-information", Some(uid))
+        }
+        _ => return,
+    };
+    let now = (v.ed.revision(), v.selected_uid());
+    let moved = d.modeless && d.seen != Some(now);
+    if !d.stale && !moved {
+        return;
+    }
+    let values = values_of(d);
+    let p = prefill_with(v, spec_id, uid, Some(values));
+    for c in d.controls.iter_mut().filter(|c| c.plugin) {
+        if let Some(on) = p.enabled(c.name) {
+            c.enabled = on;
+        }
+        if let Some(items) = p.items(c.name) {
+            let chosen = match &c.value {
+                dialog::Value::Choice(Some(i)) => c.items.get(*i).cloned(),
+                _ => None,
+            };
+            c.items = items.to_vec();
+            if c.kind.has_items() {
+                c.value = dialog::Value::Choice(
+                    chosen.and_then(|was| c.items.iter().position(|it| *it == was)),
+                );
+            }
+        }
+        if moved && let Some(value) = p.value(c.name) {
+            c.value = value_of(c.kind, &c.items, value);
+            if c.kind == dialog::ControlKind::Grid {
+                let rows = match &c.value {
+                    dialog::Value::Rows(rows) => rows.len(),
+                    _ => 0,
+                };
+                c.row = c.row.filter(|r| *r < rows);
+            }
+        }
+        if moved {
+            // The plugin may keep the selection on the same row of a grid
+            // whose rows just moved (`name.selected_row`).
+            apply_selected_row(c, &p);
+        }
+    }
+    for b in &mut d.buttons {
+        if let Some(on) = p.enabled(&b.id) {
+            b.enabled = on;
+        }
+    }
+    d.stale = false;
+    d.seen = Some(now);
 }
 
 /// Add the plugins' Task Information pages for task `uid` to `d`, whose
@@ -863,20 +1040,26 @@ pub(crate) fn extend_task_info_with(d: &mut Dialog, spec: &ui::DialogSpec, value
 pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>> {
     let top = tab.dialogs.top()?;
     let command = match top.owner {
-        DialogOwner::Plugin { command } => Some(command),
+        DialogOwner::Plugin { command, .. } => Some(command),
         DialogOwner::TaskInfo { .. } if top.controls.iter().any(|c| c.plugin) => None,
         _ => return None,
     };
-    let is_accept = top
-        .buttons
-        .iter()
-        .find(|b| crate::dialog::fold_label(&b.label) == crate::dialog::fold_label(button))
-        .is_some_and(|b| {
+    let pressed = top.buttons.iter().find(|b| {
+        crate::dialog::fold_label(&b.label) == crate::dialog::fold_label(button)
+            || b.id.eq_ignore_ascii_case(button.trim())
+    });
+    let (is_accept, own) = match pressed {
+        Some(b) => (
             matches!(
                 b.role,
                 dialog::ButtonRole::Accept | dialog::ButtonRole::Apply
-            )
-        });
+            ),
+            // One of the dialog's own buttons (#1602): the command learns
+            // which; OK sends the values alone, as before.
+            (b.role == dialog::ButtonRole::Apply && command.is_some()).then(|| b.id.clone()),
+        ),
+        None => (false, None),
+    };
     if !is_accept {
         return None;
     }
@@ -890,7 +1073,7 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Option<Result<(), 
     let done = dialogs.click(button, |d| {
         let values = values_of(d);
         let result = match (command, d.owner) {
-            (Some(command), _) => run_command(v, command, Some(values))?,
+            (Some(command), _) => run_command(v, command, Some(values), own.as_deref(), None)?,
             (None, DialogOwner::TaskInfo { uid }) => {
                 // The built-in fields and the plugins' ops as one step:
                 // the command first (it reads the plan as it is), then both.
@@ -903,6 +1086,7 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Option<Result<(), 
                 Outcome {
                     status,
                     dialog: None,
+                    close: false,
                 }
             }
             _ => return Err("this dialog is not a plugin's".into()),
@@ -913,6 +1097,11 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Option<Result<(), 
     if let Some(outcome) = outcome {
         if let Some(status) = outcome.status {
             tab.status = status.into();
+        }
+        // A button of the dialog's own stays open unless the reply closes
+        // it (#1602); OK closed it already.
+        if outcome.close && own.is_some() {
+            tab.dialogs.pop();
         }
         if let Some(dialog) = outcome.dialog {
             tab.dialogs.push(dialog);
@@ -938,6 +1127,8 @@ fn task_info_ops(
         },
         view: view_json(v),
         values: Some(values),
+        button: None,
+        edit: None,
     };
     for plugin in plugins() {
         if let Some(result) = plugin.command(&command)? {
