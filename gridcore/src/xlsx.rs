@@ -417,6 +417,7 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
             .unwrap_or_default(),
         None => Vec::new(),
     };
+    let ambiguous = ambiguous_shared(&shared);
     let styles = rels
         .iter()
         .find(|(_, ty, _)| ty.ends_with("/styles"))
@@ -457,7 +458,7 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
         // External hyperlink URLs keyed by relationship id.
         let hlink_targets = hyperlinks::hyperlink_targets(&ws_rels);
 
-        let mut sheet = parse_worksheet(&xml, &shared, &hlink_targets);
+        let mut sheet = parse_worksheet_with(&xml, &shared, &ambiguous, &hlink_targets);
         sheet.name = name;
         sheet.hidden = hidden;
         sheet.filter_mode = Some(read_filter_mode(&xml));
@@ -1103,6 +1104,26 @@ fn parse_active_tab(xml: &str) -> usize {
     }
 }
 
+/// The indices of the entries whose loaded text another entry shares: after
+/// the edge trim a rich `<si>` and a plain one can read alike, and the text
+/// alone no longer names the entry a cell used (#1188).
+fn ambiguous_shared(shared: &[String]) -> HashSet<usize> {
+    let mut first: HashMap<&str, usize> = HashMap::new();
+    let mut out = HashSet::new();
+    for (i, s) in shared.iter().enumerate() {
+        match first.entry(s.as_str()) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(i);
+            }
+            std::collections::hash_map::Entry::Occupied(o) => {
+                out.insert(*o.get());
+                out.insert(i);
+            }
+        }
+    }
+    out
+}
+
 /// Plain text of each `<si>` (rich-text runs concatenated), each `<t>` read
 /// as Excel reads it ([`TextRun`]).
 fn parse_shared_strings(xml: &str) -> Vec<String> {
@@ -1133,6 +1154,49 @@ fn parse_shared_strings(xml: &str) -> Vec<String> {
                 "t" => {
                     if let (Some(run), Some(s)) = (run.take(), &mut cur) {
                         run.finish(s);
+                    }
+                }
+                "rPh" => in_rph = false,
+                _ => {}
+            },
+            Event::Eof => break,
+        }
+    }
+    out
+}
+
+/// The concatenated text of every `<t>` in `frag` (a note's `<text>`), each
+/// read as Excel reads it ([`TextRun`]); phonetic runs are skipped, as in
+/// [`parse_shared_strings`].
+pub(crate) fn runs_text(frag: &str, inherited_preserve: bool) -> String {
+    let mut out = String::new();
+    // Wrapped, the fragment resolves `xml:space` from its ancestors too.
+    let wrapped;
+    let frag = if inherited_preserve {
+        wrapped = format!("<x xml:space=\"preserve\">{frag}</x>");
+        &wrapped
+    } else {
+        frag
+    };
+    let mut p = XmlParser::new(frag);
+    let mut run: Option<TextRun> = None;
+    let mut in_rph = false;
+    loop {
+        match p.next() {
+            Event::Start => match local(p.name()) {
+                "t" if !in_rph => run = Some(TextRun::start(&p)),
+                "rPh" => in_rph = true,
+                _ => {}
+            },
+            Event::Text => {
+                if let Some(run) = &mut run {
+                    run.push(&p);
+                }
+            }
+            Event::End => match local(p.name()) {
+                "t" => {
+                    if let Some(run) = run.take() {
+                        run.finish(&mut out);
                     }
                 }
                 "rPh" => in_rph = false,
@@ -2472,11 +2536,24 @@ fn written_col_defs(defs: &[ColDef]) -> Vec<ColDef> {
     out
 }
 
-/// One worksheet: `<sheetData>`, `<cols>`, `<mergeCells>`; everything else is
-/// preserved through the source-splice on save.
+#[cfg(test)]
 fn parse_worksheet(
     xml: &str,
     shared: &[String],
+    hlink_targets: &std::collections::HashMap<String, String>,
+) -> Sheet {
+    parse_worksheet_with(xml, shared, &HashSet::new(), hlink_targets)
+}
+
+/// One worksheet: `<sheetData>`, `<cols>`, `<mergeCells>`; everything else is
+/// preserved through the source-splice on save. `ambiguous` is the
+/// shared-string indices whose text another entry also loads as
+/// ([`ambiguous_shared`]): a plain text cell on one keeps its index
+/// ([`CellMeta::sst`]).
+fn parse_worksheet_with(
+    xml: &str,
+    shared: &[String],
+    ambiguous: &HashSet<usize>,
     hlink_targets: &std::collections::HashMap<String, String>,
 ) -> Sheet {
     let mut sheet = Sheet::default();
@@ -2625,6 +2702,7 @@ fn parse_worksheet(
                         &ctype,
                         style,
                         shared,
+                        ambiguous,
                         row,
                         col,
                         &mut shared_masters,
@@ -2634,6 +2712,7 @@ fn parse_worksheet(
                     // written) on anything but an array `<f>`.
                     let array_f = cell.f_attrs.as_deref().is_some_and(is_array_f);
                     let meta = CellMeta {
+                        sst: cell.meta.take().and_then(|m| m.sst),
                         cm: (!cm.is_empty() && array_f).then_some(cm),
                         vm: (!vm.is_empty()).then(|| (vm, cell.value.clone())),
                         ph,
@@ -3097,6 +3176,7 @@ fn parse_cell_body(
     ctype: &str,
     style: u32,
     shared: &[String],
+    ambiguous: &HashSet<usize>,
     row: u32,
     col: u32,
     shared_masters: &mut BTreeMap<u32, (u32, u32, String, String)>,
@@ -3210,6 +3290,7 @@ fn parse_cell_body(
 
     // An inline string with no text as read (`<t> </t>`) is no value, as
     // `<is><t/></is>` already was.
+    let mut sst = None;
     let value = if let Some(t) = is_text.filter(|t| !t.is_empty()) {
         CellValue::Text(t)
     } else {
@@ -3217,6 +3298,9 @@ fn parse_cell_body(
             (_, None) => CellValue::Empty,
             ("s", Some(v)) => {
                 let idx: usize = v.trim().parse().unwrap_or(usize::MAX);
+                if formula.is_none() && ambiguous.contains(&idx) {
+                    sst = u32::try_from(idx).ok();
+                }
                 CellValue::Text(shared.get(idx).cloned().unwrap_or_default())
             }
             ("str", Some(v)) => CellValue::Text(v),
@@ -3251,7 +3335,12 @@ fn parse_cell_body(
         f_attrs,
         style,
         spill,
-        meta: None,
+        meta: sst.map(|i| {
+            Box::new(CellMeta {
+                sst: Some(i),
+                ..CellMeta::default()
+            })
+        }),
     }
 }
 
@@ -3870,7 +3959,13 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
         string_index.entry(s.as_str()).or_insert(i);
     }
     let mut new_list: Vec<String> = Vec::new();
-    let mut index_of = |text: &str| -> usize {
+    let mut index_of = |text: &str, sst: Option<u32>| -> usize {
+        // A loaded cell on one of several entries that read alike keeps its own.
+        if let Some(i) = sst.map(|i| i as usize) {
+            if pkg.shared.get(i).is_some_and(|s| s == text) {
+                return i;
+            }
+        }
         if let Some(&i) = string_index.get(text) {
             return i;
         }
@@ -4182,7 +4277,7 @@ fn attr_tail(attrs: &str) -> std::borrow::Cow<'_, str> {
 /// with values/formulas/styles.
 fn sheet_data_xml(
     sheet: &Sheet,
-    index_of: &mut impl FnMut(&str) -> usize,
+    index_of: &mut impl FnMut(&str, Option<u32>) -> usize,
     any_formulas: &mut bool,
     new_cm: Option<&str>,
 ) -> String {
@@ -4514,7 +4609,7 @@ fn cell_xml(
     row: u32,
     col: u32,
     cell: &Cell,
-    index_of: &mut impl FnMut(&str) -> usize,
+    index_of: &mut impl FnMut(&str, Option<u32>) -> usize,
     any_formulas: &mut bool,
     new_cm: Option<&str>,
     block_taken: bool,
@@ -4552,7 +4647,13 @@ fn cell_xml(
             if has_formula {
                 (" t=\"str\"", format!("<v>{}</v>", esc_text(s)))
             } else {
-                (" t=\"s\"", format!("<v>{}</v>", index_of(s)))
+                (
+                    " t=\"s\"",
+                    format!(
+                        "<v>{}</v>",
+                        index_of(s, cell.meta.as_deref().and_then(|m| m.sst))
+                    ),
+                )
             }
         }
     };
@@ -12145,6 +12246,81 @@ mod tests {
         assert_eq!(value(1), Some(CellValue::Text("a\nb".into())));
         assert_eq!(value(2), Some(CellValue::Text("a\nb".into())));
         assert_eq!(value(3), Some(CellValue::Text("a\n\nb\n".into())));
+    }
+
+    /// A workbook whose shared strings 0 (bold, ` x ` as a rich run) and 1
+    /// (plain `x`) both load as `x` (#1153), A1 on 0, A2 on 1, A3 on 0.
+    fn twin_strings_xlsx() -> Vec<u8> {
+        let sst = "<si><r><rPr><b/></rPr><t> x </t></r></si><si><t>x</t></si>";
+        let rows = "<row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c></row>\
+            <row r=\"2\"><c r=\"A2\" t=\"s\"><v>1</v></c></row>\
+            <row r=\"3\"><c r=\"A3\" t=\"s\"><v>0</v></c></row>";
+        whitespace_xlsx(rows, sst)
+    }
+
+    /// #1188: an unchanged cell saves on the shared string it loaded from,
+    /// not the first entry of its text: A2's plain `x` must not gain the bold
+    /// of entry 0.
+    #[test]
+    fn duplicate_loaded_text_keeps_its_sst_index() {
+        let pkg = load_xlsx(&twin_strings_xlsx()).unwrap();
+        let sheet = &pkg.workbook.sheets[0];
+        for row in 0..3 {
+            assert_eq!(
+                sheet.cell(row, 0).unwrap().value,
+                CellValue::Text("x".into())
+            );
+        }
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let xml = part_text(&re, "xl/worksheets/sheet1.xml");
+        assert!(xml.contains(r#"<c r="A1" t="s"><v>0</v></c>"#), "{xml}");
+        assert!(xml.contains(r#"<c r="A2" t="s"><v>1</v></c>"#), "{xml}");
+        assert!(xml.contains(r#"<c r="A3" t="s"><v>0</v></c>"#), "{xml}");
+        let sst = part_text(&re, "xl/sharedStrings.xml");
+        assert_eq!(sst.matches("<si>").count(), 2, "{sst}");
+        assert_eq!(sst.matches("<b/>").count(), 1, "{sst}");
+        // The cell holds nothing it did not load with.
+        assert_eq!(
+            re.workbook.sheets[0]
+                .cell(1, 0)
+                .unwrap()
+                .meta
+                .as_deref()
+                .map(|m| m.sst),
+            Some(Some(1))
+        );
+    }
+
+    /// #1188: typing into such a cell goes by the text again (the first
+    /// entry of that text), and new text appends.
+    #[test]
+    fn edited_cell_with_duplicate_text_uses_text_lookup() {
+        let mut pkg = load_xlsx(&twin_strings_xlsx()).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        assert!(eng.set_cell(&mut pkg.workbook, (0, 1, 0), crate::sheet::Cell::text("x")));
+        assert!(eng.set_cell(&mut pkg.workbook, (0, 0, 0), crate::sheet::Cell::text("y")));
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let xml = part_text(&re, "xl/worksheets/sheet1.xml");
+        assert!(xml.contains(r#"<c r="A1" t="s"><v>2</v></c>"#), "{xml}");
+        assert!(xml.contains(r#"<c r="A2" t="s"><v>0</v></c>"#), "{xml}");
+        assert!(xml.contains(r#"<c r="A3" t="s"><v>0</v></c>"#), "{xml}");
+    }
+
+    /// #1188: a cell whose text changed under its kept index (the value set
+    /// in place, its meta left) falls back to the text lookup.
+    #[test]
+    fn a_stale_sst_index_is_not_written() {
+        let mut pkg = load_xlsx(&twin_strings_xlsx()).unwrap();
+        let cell = pkg.workbook.sheets[0].cells.get_mut(&(1, 0)).unwrap();
+        assert_eq!(cell.meta.as_deref().map(|m| m.sst), Some(Some(1)));
+        cell.value = CellValue::Text("z".into());
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let xml = part_text(&re, "xl/worksheets/sheet1.xml");
+        assert!(xml.contains(r#"<c r="A2" t="s"><v>2</v></c>"#), "{xml}");
+        assert_eq!(
+            re.workbook.sheets[0].cell(1, 0).unwrap().value,
+            CellValue::Text("z".into())
+        );
     }
 
     /// #761: a CR written as a reference is a real CR. §2.11 normalises the
