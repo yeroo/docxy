@@ -503,6 +503,40 @@ fn project_instruction_paths_exist() {
             "Hide Subtasks",
             HideSubtasks,
         ),
+        ("View", "Zoom", "Timescale", "Timescale", TimescaleDialog),
+        ("View", "Zoom", "Years", "Years", Timescale(0)),
+        ("View", "Zoom", "Half Years", "Half Years", Timescale(1)),
+        ("View", "Zoom", "Quarters", "Quarters", Timescale(2)),
+        ("View", "Zoom", "Months", "Months", Timescale(3)),
+        (
+            "View",
+            "Zoom",
+            "Thirds of Months",
+            "Thirds of Months",
+            Timescale(4),
+        ),
+        ("View", "Zoom", "Weeks", "Weeks", Timescale(5)),
+        ("View", "Zoom", "Days", "Days", Timescale(6)),
+        ("View", "Zoom", "Hours", "Hours", Timescale(7)),
+        ("View", "Zoom", "Minutes", "Minutes", Timescale(8)),
+        ("View", "Zoom", "Zoom", "Zoom", ZoomDialog),
+        ("View", "Zoom", "Zoom...", "Zoom...", ZoomDialog),
+        ("View", "Zoom", "Zoom In", "Zoom In", ZoomIn),
+        ("View", "Zoom", "Zoom Out", "Zoom Out", ZoomOut),
+        (
+            "View",
+            "Zoom",
+            "Entire Project",
+            "Entire Project",
+            ZoomEntire,
+        ),
+        (
+            "View",
+            "Zoom",
+            "Selected Tasks",
+            "Selected Tasks",
+            ZoomSelected,
+        ),
         ("View", "Split View", "Timeline", "Timeline View", Timeline),
         ("View", "Appearance", "Theme", "Theme", Theme),
         ("View", "Window", "New Window", "New Window", NewWindow),
@@ -875,7 +909,7 @@ fn project_act_active_checks_level_all_timeline_bar_styles_and_the_task_mode_onl
     for act in ProjectAct::RIBBON.iter().copied().filter(|a| {
         !matches!(
             a,
-            LevelAll | Timeline | AutoSchedule | CriticalTasks | BaselineBars
+            LevelAll | Timeline | AutoSchedule | CriticalTasks | BaselineBars | Timescale(6)
         )
     }) {
         assert!(!project_act_active(v(&t), act), "{act:?}");

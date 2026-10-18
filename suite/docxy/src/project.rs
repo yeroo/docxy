@@ -23,6 +23,7 @@ pub(super) use clip::*;
 mod timeline;
 mod zoom;
 pub(super) use timeline::*;
+pub(super) use zoom::LEVELS as TIMESCALE_LEVELS;
 mod rows;
 pub(super) use rows::*;
 mod columns;
@@ -68,6 +69,17 @@ pub(super) struct ProjectView {
     /// pointer's x and the chart offset then. A drag of the box is measured
     /// from it; `None` when no press is held, and a drag without one does nothing.
     pub timeline_press: Option<(f32, f32)>,
+    /// The press on one of the view box's edges while its button is held;
+    /// see [`timeline::EdgePress`]. A drag of it sets the chart's zoom.
+    pub timeline_edge: Option<timeline::EdgePress>,
+    /// The Timeline's height the user dragged its grip to; `None` is
+    /// [`timeline::TIMELINE_H`]. Window view state, never saved (like `split`).
+    pub timeline_h: Option<f32>,
+    /// The press on the Timeline's grip while its button is held: the
+    /// pointer's y and the pane's height then.
+    pub grip_press: Option<(f32, f32)>,
+    /// The window's height, which bounds the Timeline's (half of it at most).
+    pub height: f32,
     /// Gantt Chart Format › Bar Styles › Critical Tasks: critical bars drawn in
     /// the critical colour. Window view state, never saved.
     pub show_critical: bool,
@@ -144,6 +156,10 @@ impl ProjectView {
             width: 590. + SCROLLBAR_W,
             timeline: true,
             timeline_press: None,
+            timeline_edge: None,
+            timeline_h: None,
+            grip_press: None,
+            height: 700.,
             show_critical: true,
             show_baseline: true,
             split: None,
@@ -558,7 +574,11 @@ fn project_region(
     lookup: fn(&Probes, &str) -> Option<Bounds<Pixels>>,
 ) -> Result<Bounds<Pixels>, String> {
     // The strips are probed under their region names; they need no Gantt viewport.
-    if let harness::Region::ProjectTimeline = region {
+    if let harness::Region::ProjectTimeline
+    | harness::Region::ProjectTimelineBoxLeft
+    | harness::Region::ProjectTimelineBoxRight
+    | harness::Region::ProjectTimelineGrip = region
+    {
         if !v.timeline {
             return Err("the Timeline is hidden (View > Split View > Timeline)".into());
         }

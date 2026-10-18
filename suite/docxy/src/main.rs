@@ -16003,6 +16003,9 @@ impl Docxy {
             | Region::ProjectHbarChart
             | Region::ProjectVbar
             | Region::ProjectTimeline
+            | Region::ProjectTimelineBoxLeft
+            | Region::ProjectTimelineBoxRight
+            | Region::ProjectTimelineGrip
             | Region::ProjectSplit => self.project_region_bounds(region, lookup),
             Region::Grid => self.grid_bounds(),
             Region::BackstageContent | Region::BackstageRail => lookup(
@@ -36049,6 +36052,8 @@ impl Docxy {
                 Act::Project(ProjectAct::Plugin(id)) => self.tabs.get(self.active).is_some_and(
                     |t| matches!(&t.surface, Surface::Project(v) if plugin_ui::enabled(v, id)),
                 ),
+                // Hours and Minutes are listed and cannot be chosen (#1535).
+                Act::Project(ProjectAct::Timescale(i)) => i < TIMESCALE_LEVELS.len(),
                 _ => true,
             }
     }
@@ -37298,6 +37303,7 @@ impl Render for Docxy {
         }
 
         if let Some(Surface::Project(v)) = self.tabs.get_mut(self.active).map(|t| &mut t.surface) {
+            v.height = f32::from(window.viewport_size().height);
             v.layout(f32::from(window.viewport_size().width));
         }
         // Spreadsheet horizontal scroll: reconcile the column offset so the

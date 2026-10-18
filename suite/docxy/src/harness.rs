@@ -887,6 +887,11 @@ pub enum Region {
     ProjectVbar,
     /// The Project Timeline pane above the Gantt view, when it is shown.
     ProjectTimeline,
+    /// The Timeline view box's left and right edge strips (#1535).
+    ProjectTimelineBoxLeft,
+    ProjectTimelineBoxRight,
+    /// The strip under the Timeline that drags its height (#1535).
+    ProjectTimelineGrip,
     /// The Project split bar between the entry table and the Gantt chart.
     ProjectSplit,
     /// The Home ribbon's Styles gallery: the well its tiles sit in.
@@ -979,6 +984,9 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
         "project-hbar-chart" if arg.is_none() => Ok(Region::ProjectHbarChart),
         "project-vbar" if arg.is_none() => Ok(Region::ProjectVbar),
         "project-timeline" if arg.is_none() => Ok(Region::ProjectTimeline),
+        "project-timeline-box-left" if arg.is_none() => Ok(Region::ProjectTimelineBoxLeft),
+        "project-timeline-box-right" if arg.is_none() => Ok(Region::ProjectTimelineBoxRight),
+        "project-timeline-grip" if arg.is_none() => Ok(Region::ProjectTimelineGrip),
         "project-split" if arg.is_none() => Ok(Region::ProjectSplit),
         "gallery" if arg.is_none() => Ok(Region::Gallery),
         "ribbon" if arg.is_none() => Ok(Region::Ribbon),
@@ -1134,6 +1142,9 @@ pub fn region_name(region: Region) -> String {
         Region::ProjectHbarChart => "project-hbar-chart".into(),
         Region::ProjectVbar => "project-vbar".into(),
         Region::ProjectTimeline => "project-timeline".into(),
+        Region::ProjectTimelineBoxLeft => "project-timeline-box-left".into(),
+        Region::ProjectTimelineBoxRight => "project-timeline-box-right".into(),
+        Region::ProjectTimelineGrip => "project-timeline-grip".into(),
         Region::ProjectSplit => "project-split".into(),
         Region::Gallery => "gallery".into(),
         Region::Ribbon => "ribbon".into(),
@@ -9449,6 +9460,9 @@ mod tests {
             Region::ProjectHbarChart,
             Region::ProjectVbar,
             Region::ProjectTimeline,
+            Region::ProjectTimelineBoxLeft,
+            Region::ProjectTimelineBoxRight,
+            Region::ProjectTimelineGrip,
             Region::ProjectSplit,
             Region::Gallery,
             Region::Ribbon,
