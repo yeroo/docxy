@@ -297,8 +297,9 @@ first overallocated instant, where Project's Next Overallocation goes.
 `level.selection`, `level.resource` and `level.options` are refused by name:
 the model levels the whole plan (#1594 is the leveler work).
 
-Calendars are addressed by `calendar`, a uid or a name (ASCII case ignored)
-(#1605). `cal.list {}` lists them, base calendars first: `uid, name, base`
+Calendars are addressed by `calendar`, a uid or a name (ASCII case ignored; a
+name wins when a calendar is named like a number, a JSON number is always a
+uid) (#1605). `cal.list {}` lists them, base calendars first: `uid, name, base`
 (`{uid, name}` of the calendar a derived one inherits from, `null` for a base
 calendar), `default` (the project calendar), `resources` and `tasks` (the uids
 of what uses it). `cal.get {calendar}` reads one: its resolved `week` (seven
@@ -336,7 +337,7 @@ Project's standard day; `null` on a derived calendar's day inherits the base
 again). `cal.exception.set {calendar, index?, name?, from, to, working?,
 times?}` adds (no `index`) or replaces (by `index`) a date-range exception as
 Project writes one (non-working unless given times); a replace sets the dates
-and the day and keeps the name unless `name` is given; a repeating exception
+and the day and keeps the name unless `name` is given (`""` clears it); a repeating exception
 (`recurring: true`) is read only: neither replaced nor removed. `cal.exception.del
 {calendar, index}` removes a date-range exception; `cal.workweek.set {calendar,
 index?, name?, from, to, week}` (`week` required: the days the work week

@@ -97,7 +97,7 @@ pub fn clock(min: u32) -> String {
 pub fn parse_clock(text: &str) -> Option<u32> {
     let (h, m) = text.trim().split_once(':')?;
     let (h, m): (u32, u32) = (h.trim().parse().ok()?, m.trim().parse().ok()?);
-    (h <= 24 && m < 60 && (h < 24 || m == 0)).then_some(h * 60 + m)
+    (h <= 24 && m < 60 && (h < 24 || m == 0)).then(|| h * 60 + m)
 }
 
 /// The name a calendar may take: trimmed, not empty, no other calendar's
@@ -148,9 +148,19 @@ fn range_instants(from: DateTime, to: DateTime) -> Result<(DateTime, DateTime), 
 }
 
 impl Editor {
-    /// The calendar `key` names: a uid, else a name ignoring ASCII case.
+    /// The calendar `key` names: a name ignoring ASCII case, else a uid (a
+    /// calendar named `1` is the name, as `proj.set` and `task.set` read
+    /// it; a JSON number is always a uid).
     pub fn calendar_by(&self, key: &str) -> Result<i32, String> {
         let key = key.trim();
+        if let Some(c) = self
+            .proj
+            .calendars
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(key))
+        {
+            return Ok(c.uid);
+        }
         if let Ok(uid) = key.parse::<i32>()
             && self.proj.calendar(uid).is_some()
         {
@@ -354,10 +364,11 @@ impl Editor {
             None => cal.exceptions.len(),
         };
         // A replaced exception keeps its name unless one is given, as
-        // `cal.set` keeps the calendar's.
+        // `cal.set` keeps the calendar's; a blank one given clears it.
         let name = match name.map(str::trim) {
-            Some(n) if !n.is_empty() => Some(n.to_string()),
-            _ => cal.exceptions.get(at).and_then(|e| e.name.clone()),
+            Some("") => None,
+            Some(n) => Some(n.to_string()),
+            None => cal.exceptions.get(at).and_then(|e| e.name.clone()),
         };
         self.edit_calendars(|proj| {
             let cal = proj.calendar_mut(uid).ok_or("the calendar is gone")?;
@@ -430,9 +441,11 @@ impl Editor {
             Some(i) => i,
             None => cal.work_weeks.len(),
         };
+        // The name as for an exception: kept unless given, cleared by "".
         let name = match name.map(str::trim) {
-            Some(n) if !n.is_empty() => Some(n.to_string()),
-            _ => cal.work_weeks.get(at).and_then(|w| w.name.clone()),
+            Some("") => None,
+            Some(n) => Some(n.to_string()),
+            None => cal.work_weeks.get(at).and_then(|w| w.name.clone()),
         };
         self.edit_calendars(|proj| {
             let cal = proj.calendar_mut(uid).ok_or("the calendar is gone")?;
@@ -774,9 +787,10 @@ mod tests {
                 calendar: "Standard".into()
             }
         );
-        // A work week over 3/9..3/13 with Fridays off.
+        // A work week over 3/9..3/13 with Fridays off and an early Monday.
         let mut week: [DayPatch; 7] = Default::default();
         week[5] = Some(times(&[]));
+        week[1] = Some(times(&[(6 * 60, 10 * 60)]));
         assert_eq!(
             ed.set_calendar_work_week(standard, None, Some("Short"), day(9), day(13), week.clone()),
             Ok(0)
@@ -790,14 +804,60 @@ mod tests {
                 name: Some("Short".into())
             }
         );
-        // Monday of that week is not stated by the work week: the default.
+        // Monday of that week is the work week's early one; Tuesday is not
+        // stated by it: the default.
         let (t, src) = ed.calendar_day(standard, day(9)).unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].from, 6 * 60);
+        assert_eq!(
+            src,
+            DaySource::WorkWeek {
+                calendar: "Standard".into(),
+                name: Some("Short".into())
+            }
+        );
+        let (t, src) = ed.calendar_day(standard, day(10)).unwrap();
         assert_eq!(t.len(), 2);
         assert_eq!(
             src,
             DaySource::Default {
                 calendar: "Standard".into()
             }
+        );
+        // A by-index replace keeps the name unless one is given, "" clears
+        // it, and a bad index is refused.
+        assert_eq!(
+            ed.set_calendar_work_week(standard, Some(0), None, day(9), day(13), week.clone()),
+            Ok(0)
+        );
+        assert_eq!(
+            ed.project().calendar(standard).unwrap().work_weeks[0]
+                .name
+                .as_deref(),
+            Some("Short")
+        );
+        assert!(
+            ed.set_calendar_work_week(standard, Some(5), None, day(9), day(13), week.clone())
+                .is_err()
+        );
+        assert_eq!(
+            ed.set_calendar_work_week(standard, Some(0), Some(""), day(9), day(13), week.clone()),
+            Ok(0)
+        );
+        assert_eq!(
+            ed.project().calendar(standard).unwrap().work_weeks[0].name,
+            None
+        );
+        assert_eq!(
+            ed.set_calendar_work_week(
+                standard,
+                Some(0),
+                Some("Short"),
+                day(9),
+                day(13),
+                week.clone()
+            ),
+            Ok(0)
         );
         // A derived calendar inherits the exception and names the base.
         let ann = ed.add_calendar("Ann", Some(standard), None).unwrap();
@@ -810,8 +870,9 @@ mod tests {
             }
         );
         // The source follows the scheduler's order. Ann's own Monday beats
-        // Standard's work week covering 3/9 (the times are Ann's), and
-        // Standard's holiday beats Ann's work week stating Tuesday 3/3.
+        // Standard's work week covering 3/9, which states an early Monday
+        // (the times are Ann's), and Standard's holiday beats Ann's work
+        // week stating Tuesday 3/3.
         ed.set_calendar(ann, None, None, &[(1, Some(times(&[(9 * 60, 13 * 60)])))])
             .unwrap();
         let (t, src) = ed.calendar_day(ann, day(9)).unwrap();
@@ -849,7 +910,17 @@ mod tests {
         ed.delete_calendar_work_week(ann, 0).unwrap();
         ed.set_calendar(ann, None, None, &[(1, None)]).unwrap();
         // Every edit so far was a step.
-        assert_eq!(ed.undo_depth(), 8);
+        assert_eq!(ed.undo_depth(), 10);
+        // A calendar named like a number is found by its name; a uid still
+        // works for a name no calendar has.
+        let seven = ed.add_calendar("7", None, None).unwrap();
+        assert_ne!(seven, 7);
+        assert_eq!(ed.calendar_by("7"), Ok(seven));
+        ed.delete_calendar(seven).unwrap();
+        assert_eq!(ed.calendar_by(&standard.to_string()), Ok(standard));
+        // An out-of-range hour is refused, not computed.
+        assert_eq!(parse_clock("4294967295:00"), None);
+        assert_eq!(parse_clock("25:00"), None);
         // A repeating exception is read, not replaced.
         let mut proj = ed.project().clone();
         let mut yearly = CalendarException::date_range(day(25), day(25), times(&[]));

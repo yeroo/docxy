@@ -641,7 +641,7 @@ fn tool_defs() -> Json {
                 target(),
                 tab(),
             ],
-            &["calendar", "from", "to", "week"],
+            &["calendar", "from", "to"],
         ),
         tool(
             "yppxy_cal_exception_del",
@@ -685,7 +685,7 @@ fn tool_defs() -> Json {
                 target(),
                 tab(),
             ],
-            &["calendar", "from", "to"],
+            &["calendar", "from", "to", "week"],
         ),
         tool(
             "yppxy_cal_workweek_del",
@@ -1085,6 +1085,38 @@ mod tests {
             .iter()
             .map(|r| r.as_str().unwrap().into())
             .collect()
+    }
+
+    #[test]
+    fn every_required_field_is_a_declared_property() {
+        let defs = tool_defs();
+        let tools = defs.as_array().unwrap();
+        for t in tools {
+            let schema = t.get("inputSchema").unwrap();
+            let props: Vec<&str> = match schema.get("properties") {
+                Some(Json::Obj(pairs)) => pairs.iter().map(|(k, _)| k.as_str()).collect(),
+                _ => Vec::new(),
+            };
+            for r in required_of(schema) {
+                assert!(
+                    props.contains(&r.as_str()),
+                    "{}: required '{r}' is not a property",
+                    t.get_str("name").unwrap_or("?")
+                );
+            }
+        }
+        let by = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.get_str("name") == Some(name))
+                .map(|t| required_of(t.get("inputSchema").unwrap()))
+                .unwrap()
+        };
+        assert_eq!(by("yppxy_cal_exception_set"), ["calendar", "from", "to"]);
+        assert_eq!(
+            by("yppxy_cal_workweek_set"),
+            ["calendar", "from", "to", "week"]
+        );
     }
 
     #[test]

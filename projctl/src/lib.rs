@@ -45,7 +45,7 @@
 //! | `cal.day` | `{calendar, date}` | `{date, working, times, based_on: {kind: exception \| work_week \| default, calendar, name}}`: Change Working Time's "Working times for" and "Based on" |
 //! | `cal.add` | `{name, base?, copy?}` | the new calendar: derived from `base`, else a base calendar with Project's standard week, or a copy of the base calendar `copy` |
 //! | `cal.set` | `{calendar, name?, base?, week?}` | the calendar after the change: `week` `{"Mon": {"working": true, "times": [["08:00","12:00"],["13:00","17:00"]]}, "Sat": {"working": false}}` for the days given (`null` for a derived calendar's day inherits the base again) |
-//! | `cal.exception.set` | `{calendar, index?, name?, from, to, working?, times?}` | the calendar; no `index` adds a date-range exception (non-working unless `times`), an `index` replaces that one's dates and day, keeping its name unless `name` is given (a repeating exception, `recurring` in `cal.get`, is read only) |
+//! | `cal.exception.set` | `{calendar, index?, name?, from, to, working?, times?}` | the calendar; no `index` adds a date-range exception (non-working unless `times`), an `index` replaces that one's dates and day, keeping its name unless `name` is given (`""` clears it; a repeating exception, `recurring` in `cal.get`, is read only) |
 //! | `cal.exception.del` | `{calendar, index}` | the calendar (a repeating exception is read only) |
 //! | `cal.workweek.set` | `{calendar, index?, name?, from, to, week}` | the calendar; `week` as `cal.set`'s, the days the work week states (`{}` for none; required, as a replace drops the days not given); the name is kept unless given |
 //! | `cal.workweek.del` | `{calendar, index}` | the calendar |
