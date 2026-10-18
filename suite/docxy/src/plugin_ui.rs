@@ -898,12 +898,13 @@ fn open_dialog(v: &ProjectView, spec_id: &str, command: &str) -> Result<Dialog, 
 }
 
 /// Ask the plugin's state again for the top dialog when a plugin control
-/// changed since (#1567) or, for a modeless dialog, the plan or the
-/// selection moved under it (#1602), and apply the reply: items and enabled
-/// flags always (a chosen item that is still there stays chosen), the
-/// values only when the plan or selection moved (a grid keeps its selected
-/// row and the cell being typed into). Called before a frame is drawn or a
-/// reply is written, so a read sees the state the plugin would show.
+/// changed since (#1567) or the plan or the selection moved under it
+/// (#1602, modal or not since #1610), and apply the reply: items, enabled
+/// flags, label values and `name.selected_row` always (a chosen item that
+/// is still there stays chosen), every value when the plan or selection
+/// moved (a grid keeps the cell being typed into). Called before a frame is
+/// drawn or a reply is written, so a read sees the state the plugin would
+/// show.
 pub(crate) fn refresh_dialog(tab: &mut DocTab) {
     let DocTab {
         dialogs,
@@ -1018,7 +1019,16 @@ pub(crate) fn extend_task_info(d: &mut Dialog, v: &ProjectView, uid: i32) {
     let Some(spec) = spec("task-information") else {
         return;
     };
-    let values = prefill(v, "task-information", Some(uid));
+    // The state sees the pages' declared values as the dialog's, as a
+    // plugin's own dialog does at open (#1610).
+    let declared = Json::Obj(
+        spec.pages
+            .iter()
+            .flat_map(|p| p.controls.iter())
+            .map(|c| (c.name.clone(), c.value.clone()))
+            .collect(),
+    );
+    let values = prefill_with(v, "task-information", Some(uid), Some(declared));
     extend_task_info_with(d, spec, &values);
     // The dialog has seen this plan: a control change applies the state's
     // items, enabled flags and labels, not its values (#1610).

@@ -966,9 +966,9 @@ pub struct StateCtx {
     /// `(dialog id, task uid)` when the host is about to open a dialog and
     /// wants its values prefilled, or asks again for an open one (#1602).
     pub dialog: Option<(String, Option<i32>)>,
-    /// The open dialog's current values when the host asks again after a
-    /// control changed or the plan moved under a modeless dialog (#1602);
-    /// `None` for a dialog about to open.
+    /// The dialog's values: the spec's declared ones for a dialog about to
+    /// open, the current ones when the host asks again after a control
+    /// changed or the plan or the selection moved under it (#1602, #1610).
     pub dialog_values: Option<Json>,
 }
 

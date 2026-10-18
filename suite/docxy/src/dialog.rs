@@ -982,8 +982,9 @@ pub(crate) struct Dialog {
     /// A plugin control changed since the plugin's state was last asked
     /// (#1602, #1567): the host asks again before the next read or frame.
     pub stale: bool,
-    /// The plan revision and selected task a modeless plugin dialog's values
-    /// were last asked for (#1602).
+    /// The plan revision and selected task a plugin dialog's values were
+    /// last asked for (#1602; any plugin dialog since #1610): a change of
+    /// either makes the state's values apply again.
     pub seen: Option<(u64, Option<i32>)>,
     /// A cell of a `commit_command` grid just committed (#1602): the
     /// control index, row, column and the cell's text now. The host sends

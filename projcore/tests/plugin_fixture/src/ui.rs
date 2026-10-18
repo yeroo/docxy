@@ -8,7 +8,9 @@
 //! - Menus: a row-menu item `fixture.rename` after "Notes...".
 //! - Dialogs: a Task Information page "Fixture" with a multiline and a grid,
 //!   and a dialog `fixture.options` (a number, a label the state fills from
-//!   the number and the first selected task's name, and a Bump button, #1610)
+//!   the number and the first selected task's name, a grid of the plan's
+//!   task names whose selected row the state keeps on the selected task,
+//!   and a Bump button, #1610)
 //!   that `fixture.hello` opens; OK sends `fixture.hello` again with the
 //!   values, Bump sends it with `button: "bump"` (one `task.set` op naming
 //!   the task "Bumped by fixture", the dialog kept open).
@@ -49,7 +51,8 @@ const MANIFEST: &str = r##"{
       {"name":"fixture.locked","label":"Fixture locked","kind":"checkbox","value":true}]}]},
     {"id":"fixture.options","title":"Fixture Options","pages":[{"name":"General","controls":[
       {"name":"n","label":"&Number:","kind":"number","value":"1"},
-      {"name":"fixture.echo","label":"","kind":"label","value":""}]}],"buttons":["OK","Cancel",{"id":"bump","label":"&Bump"}]},
+      {"name":"fixture.echo","label":"","kind":"label","value":""},
+      {"name":"fixture.tasks","label":"Tasks","kind":"grid","columns":[{"name":"Name","kind":"text"}],"value":[]}]}],"buttons":["OK","Cancel",{"id":"bump","label":"&Bump"}]},
     {"id":"fixture.sheet","title":"Fixture Sheet","modeless":true,"pages":[{"name":"Sheet","controls":[
       {"name":"fixture.rows","label":"Tasks","kind":"grid","commit_command":true,"columns":[{"name":"Pick","kind":"check"},{"name":"Name","kind":"text"},{"name":"Units","kind":"number"}],"value":[]}]}],
      "buttons":[{"id":"apply","label":"&Apply","default":true},{"id":"clear","label":"Clear"},{"id":"close","label":"Close","cancel":true}]}],
@@ -266,9 +269,21 @@ pub unsafe extern "C" fn yppx_ui_state(input: *const u8, len: usize, out: *mut Y
             let name = first_uid(&req)
                 .and_then(|uid| task_name_of(&req, uid))
                 .unwrap_or_default();
+            // The grid: one row per task, the selected task's row selected
+            // (a modal dialog's grid follows the plan, #1610).
+            let names = task_names(&req);
+            let rows: Vec<String> = names.iter().map(|n| format!("[{}]", quote(n))).collect();
+            let selected = first_uid(&req)
+                .and_then(|uid| {
+                    task_field(&req, "UID")
+                        .iter()
+                        .position(|u| u.trim() == uid.to_string())
+                })
+                .map_or("null".to_string(), |i| i.to_string());
             reply.push_str(&format!(
-                r#","values":{{"fixture.echo":{}}}"#,
-                quote(&format!("Number {n} for {name}"))
+                r#","values":{{"fixture.echo":{},"fixture.tasks":[{}],"fixture.tasks.selected_row":{selected}}}"#,
+                quote(&format!("Number {n} for {name}")),
+                rows.join(",")
             ));
         }
         if dialog.get("id").and_then(Json::str) == Some("task-information") {
