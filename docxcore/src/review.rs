@@ -330,7 +330,8 @@ fn sweep_inlines(
             n += 1;
         }
     }
-    for inline in content.iter_mut() {
+    let mut emptied = Vec::new();
+    for (index, inline) in content.iter_mut().enumerate() {
         match inline {
             Inline::Revision {
                 content,
@@ -343,13 +344,47 @@ fn sweep_inlines(
                 }
                 n += swept;
             }
-            Inline::Hyperlink(h) => n += sweep_inlines(&mut h.content, target, action),
+            Inline::Hyperlink(h) => {
+                let swept = sweep_link(h, target, action);
+                if swept > 0 {
+                    h.content_changed = true;
+                    emptied.push(index);
+                }
+                n += swept;
+            }
             Inline::TextBox { blocks, .. } => n += sweep_tracked_inserts(blocks, target, action),
             _ => {}
         }
     }
+    // A link the sweep emptied goes, as when its last text is deleted.
+    for index in emptied.into_iter().rev() {
+        crate::editor::drop_emptied_link(content, index);
+    }
     // A deletion of text that was in a rejected insertion has nothing left.
     content.retain(|i| !matches!(i, Inline::Revision { kind: RevisionKind::Delete, content, content_changed: true, .. } if content.is_empty()));
+    n
+}
+
+/// [`sweep_inlines`] over a link's `content` and its `runs`; the runs are
+/// rebuilt in place only when something in them was swept.
+fn sweep_link(
+    h: &mut crate::model::Hyperlink,
+    target: RevisionTarget,
+    action: RevisionAction,
+) -> usize {
+    let mut n = sweep_inlines(&mut h.content, target, action);
+    let mut runs: Vec<Inline> = h.runs.iter().cloned().map(Inline::Run).collect();
+    let swept = sweep_inlines(&mut runs, target, action);
+    if swept > 0 {
+        h.runs = runs
+            .into_iter()
+            .filter_map(|i| match i {
+                Inline::Run(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        n += swept;
+    }
     n
 }
 
@@ -622,6 +657,9 @@ fn transform_inlines(
 
         let result = transform_inline(&mut content[index], target, action);
         if result.is_some() {
+            if matches!(result, Some(Ok(_))) {
+                crate::editor::drop_emptied_link(content, index);
+            }
             return result;
         }
         index += 1;
