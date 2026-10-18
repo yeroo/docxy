@@ -399,6 +399,9 @@ pub struct Task {
     pub recurring: Option<bool>,
     pub hide_bar: Option<bool>,
     pub rollup: Option<bool>,
+    /// Display on Timeline. MSPDI has no element for it, so it is saved
+    /// only in the `.yppx` package's `timeline.xml` ([`crate::timeline`]).
+    pub display_on_timeline: Option<bool>,
     pub external_task: Option<bool>,
     pub external_task_project: Option<String>,
     pub is_subproject: Option<bool>,

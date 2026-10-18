@@ -1,5 +1,6 @@
 # Task > Properties > Information... is the Task Information dialog (#1368):
-# General, Predecessors, Resources, Advanced and Notes. Every key and click
+# General, Predecessors, Resources, Advanced and Notes (#1536: the top row,
+# schedule mode, date combos and the two grids). Every key and click
 # into the dialog is real input (`real-key`, `real-type`, `pointer-click`);
 # `open`, `click <cell>` and the KeyTips that open it are setup. The generated
 # `inputs-typing-project.uit` types into each field; these cases cover what
@@ -118,3 +119,198 @@ test project task information: a double-click on a task's ID opens it, the entry
   click A3 double
   assert dialog is none
   assert status is ID is read-only
+
+test project task information: the top row is one value on every page, and Estimated is the duration's question mark
+  open copy:../fixtures/project-clipboard.xml
+  click C2
+  key alt t c
+  call pointer-click {"dialog-field":"name"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Build"}
+  call pointer-click {"dialog-tab":"Resources"}
+  call dialog-read {}
+  assert reply.tab is Resources
+  assert reply.controls.0.name is name
+  assert reply.controls.0.text is Build
+  assert reply.controls.1.name is duration
+  assert reply.controls.1.text is 2d
+  assert reply.controls.2.name is estimated
+  assert reply.controls.2.value is false
+  call pointer-click {"dialog-control":"estimated"}
+  call dialog-read {}
+  assert reply.controls.1.text is 2d?
+  assert reply.controls.2.value is true
+  call pointer-click {"dialog-tab":"General"}
+  call pointer-click {"dialog-field":"duration"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace"}
+  call dialog-read {}
+  assert reply.controls.1.text is 2d
+  assert reply.controls.2.value is false
+  call real-type {"text":"?"}
+  call real-key {"key":"enter"}
+  assert dialog is none
+  assert selected_name is Build
+  assert undo_depth is 1
+  call task.get {"uid":2,"fields":["Estimated"]}
+  assert reply.fields.Estimated.value is true
+
+test project task information: schedule mode, inactive, the timeline, bar and rollup boxes apply as one undo step
+  open copy:../fixtures/project-clipboard.xml
+  click C2
+  key alt t c
+  call dialog-read {}
+  assert reply.controls.3.name is mode
+  assert reply.controls.3.text is Auto Scheduled
+  call real-key {"key":"tab","to-field":"mode"}
+  call real-key {"key":"up"}
+  call dialog-read {}
+  assert reply.controls.3.text is Manually Scheduled
+  call pointer-click {"dialog-control":"inactive"}
+  call pointer-click {"dialog-control":"ontimeline"}
+  call pointer-click {"dialog-control":"hidebar"}
+  call pointer-click {"dialog-control":"rollup"}
+  call real-key {"key":"enter"}
+  assert dialog is none
+  assert undo_depth is 1
+  call task.get {"uid":2,"fields":["Task Mode","Active"]}
+  assert reply.fields.Active.value is false
+  key alt t c
+  call dialog-read {}
+  assert reply.controls.3.text is Manually Scheduled
+  assert reply.controls.4.value is true
+  assert reply.controls.10.name is ontimeline
+  assert reply.controls.10.value is true
+  assert reply.controls.11.name is hidebar
+  assert reply.controls.11.value is true
+  assert reply.controls.12.name is rollup
+  assert reply.controls.12.value is true
+  call real-key {"key":"escape"}
+  assert dialog is none
+  key ctrl+z
+  assert undo_depth is 0
+  key alt t c
+  call dialog-read {}
+  assert reply.controls.3.text is Auto Scheduled
+  assert reply.controls.4.value is false
+  assert reply.controls.11.value is false
+  call real-key {"key":"escape"}
+
+test project task information: Finish is a date combo, its calendar opens from the button and a day picks
+  open copy:../fixtures/project-clipboard.xml
+  click C2
+  key alt t c
+  call dialog-read {}
+  assert reply.calendar_open is false
+  call pointer-click {"dialog-calendar":"button:finish"}
+  call dialog-read {}
+  assert reply.calendar_open is true
+  assert reply.calendar.control is finish
+  assert reply.calendar.month is 2026-01
+  call pointer-click {"dialog-calendar":"next:finish"}
+  call dialog-read {}
+  assert reply.calendar.month is 2026-02
+  call pointer-click {"dialog-calendar":"prev:finish"}
+  call pointer-click {"dialog-calendar":"day:finish:14"}
+  call dialog-read {}
+  assert reply.calendar_open is false
+  assert reply.controls.7.name is finish
+  assert reply.controls.7.text is 2026-01-14
+  # Escape closes an open calendar, not the dialog; typing still works.
+  call pointer-click {"dialog-calendar":"button:finish"}
+  call real-key {"key":"escape"}
+  assert dialog is task-information
+  call dialog-read {}
+  assert reply.calendar_open is false
+  call real-key {"key":"enter"}
+  assert dialog is none
+  assert undo_depth is 1
+  call task.get {"uid":2}
+  assert reply.finish is 2026-01-14 17:00
+
+test project task information: Predecessors rows add, edit, delete and a cycle is refused
+  open copy:../fixtures/project-clipboard.xml
+  click C2
+  key alt t c
+  call pointer-click {"dialog-tab":"Predecessors"}
+  call dialog-read {}
+  assert reply.controls.3.name is predecessors
+  assert reply.controls.3.columns.1 is Task Name
+  assert reply.controls.3.text is 1 row
+  call pointer-click {"dialog-cell":"predecessors[0].task name"}
+  call real-type {"text":"a"}
+  call real-key {"key":"enter"}
+  call dialog-read {}
+  assert reply.controls.3.rows.0.0 is 1
+  assert reply.controls.3.rows.0.1 is A
+  assert reply.controls.3.rows.0.2 is Finish-to-Start (FS)
+  call pointer-click {"dialog-cell":"predecessors[0].type"}
+  call pointer-click {"dialog-cell":"predecessors[0].lag"}
+  call real-type {"text":"2d"}
+  call real-key {"key":"enter"}
+  call dialog-read {}
+  assert reply.controls.3.rows.0.2 is Start-to-Start (SS)
+  assert reply.controls.3.rows.0.3 is 2d
+  assert reply.controls.3.text is 2 rows
+  call real-key {"key":"enter"}
+  assert dialog is none
+  assert undo_depth is 1
+  assert cell G2 is 1SS+2d
+  # A also depending on B would be a cycle: refused, the dialog stays.
+  click C1
+  key alt t c
+  call pointer-click {"dialog-tab":"Predecessors"}
+  call pointer-click {"dialog-cell":"predecessors[0].id"}
+  call real-type {"text":"2"}
+  call real-key {"key":"enter"}
+  call real-key {"key":"enter"}
+  assert dialog is task-information
+  assert undo_depth is 1
+  call real-key {"key":"escape"}
+  assert dialog is none
+  # Delete removes the selected row.
+  click C2
+  key alt t c
+  call pointer-click {"dialog-tab":"Predecessors"}
+  call pointer-click {"dialog-cell":"predecessors[0].id"}
+  call real-key {"key":"delete"}
+  call real-key {"key":"enter"}
+  assert dialog is none
+  assert undo_depth is 2
+  assert cell G2 is empty
+
+test project task information: Resources rows add a name, change units and keep owner and cost read-only
+  open copy:../fixtures/project-clipboard.xml
+  click C2
+  key alt t c
+  call pointer-click {"dialog-tab":"Resources"}
+  call pointer-click {"dialog-cell":"resources[0].resource name"}
+  call real-type {"text":"Ann"}
+  call real-key {"key":"enter"}
+  call dialog-read {}
+  assert reply.controls.3.rows.0.0 is Ann
+  assert reply.controls.3.rows.0.2 is 100%
+  call pointer-click {"dialog-cell":"resources[0].units"}
+  call real-type {"text":"50%"}
+  call real-key {"key":"enter"}
+  call pointer-click {"dialog-cell":"resources[0].cost"}
+  call real-type {"text":"9"}
+  call dialog-read {}
+  assert reply.controls.3.column_kinds.3 is label
+  call real-key {"key":"enter"}
+  assert dialog is none
+  assert undo_depth is 1
+  assert cell H2 is Ann[50%]
+
+test project task information: Help says what F1 says and leaves the dialog open
+  open copy:../fixtures/project-clipboard.xml
+  click C2
+  key alt t c
+  call dialog-read {}
+  assert reply.buttons.0.id is help
+  call pointer-click {"dialog-button":"Help"}
+  assert dialog is task-information
+  assert status is Help: the documentation is coming soon
+  call real-key {"key":"escape"}
+  assert dialog is none
+  assert undo_depth is 0

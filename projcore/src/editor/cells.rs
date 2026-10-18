@@ -835,17 +835,24 @@ fn shown_name(p: &Predecessor) -> Option<&str> {
     Some(name)
 }
 
-/// One link as the Predecessors cell shows it. A cross-project link shows
-/// its external reference (the trimmed `CrossProjectName`), as Microsoft
-/// Project does, instead of the local placeholder's ID.
-fn format_link(p: &Predecessor, proj: &Project) -> String {
-    let id = match shown_name(p) {
+/// The part of a link a Predecessors cell starts with: the task's ID, a
+/// cross-project link's external reference, or `?uid` for a task the plan
+/// does not have. Task Information's Predecessors grid shows it as ID.
+pub fn format_link_id(p: &Predecessor, proj: &Project) -> String {
+    match shown_name(p) {
         Some(name) => name.to_string(),
         None => proj
             .task(p.uid)
             .map(|t| t.id.to_string())
             .unwrap_or_else(|| format!("?{}", p.uid)),
-    };
+    }
+}
+
+/// One link as the Predecessors cell shows it. A cross-project link shows
+/// its external reference (the trimmed `CrossProjectName`), as Microsoft
+/// Project does, instead of the local placeholder's ID.
+fn format_link(p: &Predecessor, proj: &Project) -> String {
+    let id = format_link_id(p, proj);
     // A zero lag in days is the default and shows nothing; any other
     // format shows, so re-entering the cell keeps it.
     let plain = p.lag == 0 && p.lag_format == LagFormat::DAYS;

@@ -112,6 +112,39 @@ impl Editor {
         Ok(true)
     }
 
+    /// Set Hide Bar (the Gantt bar is not drawn).
+    pub fn set_hide_bar(&mut self, uid: i32, on: bool) -> Result<bool, String> {
+        self.set_bar_flag(uid, on, |t| &mut t.hide_bar)
+    }
+
+    /// Set Rollup (the task's bar is drawn on its summary).
+    pub fn set_rollup(&mut self, uid: i32, on: bool) -> Result<bool, String> {
+        self.set_bar_flag(uid, on, |t| &mut t.rollup)
+    }
+
+    /// Set Display on Timeline (saved in the `.yppx` timeline part only).
+    pub fn set_display_on_timeline(&mut self, uid: i32, on: bool) -> Result<bool, String> {
+        self.set_bar_flag(uid, on, |t| &mut t.display_on_timeline)
+    }
+
+    /// A task's yes/no flag that is off when absent: one undo step, and
+    /// `Ok(false)` when it already reads `on`.
+    fn set_bar_flag(
+        &mut self,
+        uid: i32,
+        on: bool,
+        flag: fn(&mut Task) -> &mut Option<bool>,
+    ) -> Result<bool, String> {
+        let i = self.property_row(uid)?;
+        if flag(&mut self.proj.tasks[i]).unwrap_or(false) == on {
+            return Ok(false);
+        }
+        self.snapshot();
+        *flag(&mut self.proj.tasks[i]) = Some(on);
+        self.changed();
+        Ok(true)
+    }
+
     /// Mark the task a milestone (a zero duration) or not (a day, as
     /// Project's Mark task as milestone unticked restores a duration).
     pub fn set_milestone(&mut self, uid: i32, on: bool) -> Result<bool, String> {

@@ -234,7 +234,10 @@ fn every_field_entry_is_complete() {
             assert!(!f.sample.is_empty(), "{at}: a typed field has a sample");
             let wants_refusal = matches!(
                 f.kind,
-                ControlKind::Number | ControlKind::Date | ControlKind::Duration
+                ControlKind::Number
+                    | ControlKind::Date
+                    | ControlKind::DateCombo
+                    | ControlKind::Duration
             );
             assert_eq!(
                 f.invalid.is_some(),
