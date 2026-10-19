@@ -1604,7 +1604,21 @@ fn ref_to_string(r: &CellRef) -> String {
 }
 
 /// Print an AST back to formula text (no leading `=`), with minimal parens.
+///
+/// Numbers are printed so they read back as the same `f64` (a reprint after a
+/// structural edit must not round constants); [`to_string_display`] is the
+/// 15-digit General spelling.
 pub fn to_string(e: &Expr) -> String {
+    Printer {
+        exact_nums: true,
+        ..Printer::default()
+    }
+    .print(e)
+}
+
+/// [`to_string`] with numbers as General shows them (15 significant digits):
+/// for text shown to the user, such as the values Evaluate Formula steps to.
+pub fn to_string_display(e: &Expr) -> String {
     Printer::default().print(e)
 }
 
@@ -1639,6 +1653,9 @@ struct Printer {
     /// `A1#`, `_xlfn.SINGLE(…)` for `@x`, `_xlpm.` on LET/LAMBDA names, and
     /// numbers that read back exactly.
     file: bool,
+    /// Numbers that read back exactly, in the in-memory spelling
+    /// ([`to_string`]); `file` implies it.
+    exact_nums: bool,
     /// The LET/LAMBDA names bound around the expression being printed
     /// (file spelling only), without their `_xlpm.` prefix, and whether each
     /// may hold a lambda (see [`Printer::func`]).
@@ -1819,7 +1836,7 @@ impl Printer {
     }
 
     fn num(&self, n: f64) -> String {
-        if self.file {
+        if self.file || self.exact_nums {
             file_num(n)
         } else {
             fmt_general(n)
@@ -6862,10 +6879,13 @@ pub(crate) fn future_prefix(name: &str) -> Option<&'static str> {
 /// is. Text that doesn't parse only gets its function prefixes (LET and
 /// LAMBDA included); its `#`, `@` and LET/LAMBDA names stay as they are.
 ///
-/// The save runs every formula through this, loaded ones too, since there is
-/// no record of which text is still as loaded. So a bare post-2007 name in a
-/// file (a producer that left the prefix off, or a VBA function an old Excel
-/// file named `TEXTJOIN`) is saved as the builtin.
+/// A structured `[@Col]` / `Table[@Col]` is written `[#This Row],[Col]`, as
+/// the file grammar has no `@`.
+///
+/// The save runs every typed or edited formula through this. A formula still
+/// as loaded is written back as loaded ([`crate::sheet::CellMeta::loaded_f`]),
+/// since a bare post-2007 name in a file may be a VBA function named
+/// `TEXTJOIN`, which this would turn into the builtin.
 pub fn file_formula(src: &str) -> Cow<'_, str> {
     let mut lex = Lexer::new(src);
     let mut toks: Vec<(usize, Tok)> = Vec::new();
@@ -6886,6 +6906,8 @@ pub fn file_formula(src: &str) -> Cow<'_, str> {
     for (i, (start, t)) in toks.iter().enumerate() {
         match t {
             Tok::Hash | Tok::At => reprint = true,
+            // The file grammar has no `@`: `[@Col]` is `[#This Row],[Col]`.
+            Tok::Bracket(spec) if spec.starts_with('@') => reprint = true,
             Tok::Ident(id) if matches!(toks.get(i + 1), Some((_, Tok::LParen))) => {
                 // These change shape (`SINGLE(x)` is `@x`) or bind names,
                 // which only the AST can see; the splice prefixes them only
@@ -17004,14 +17026,62 @@ mod tests {
         // The operators typed as their function spelling.
         assert_eq!(file("SINGLE(A1:A3)"), "_xlfn.SINGLE(A1:A3)");
         assert_eq!(file("ANCHORARRAY(B2)"), "_xlfn.ANCHORARRAY(B2)");
-        // A structured `@` is this-row, not the operator.
-        for src in [
-            "Sales[@Amount]*2",
-            "[@Amount]*2",
-            "Sales[[#This Row],[Amount]]",
+        // A structured `@` is this-row, not the operator, and the file
+        // grammar spells it `[#This Row]`.
+        for (typed, saved) in [
+            ("Sales[@Amount]*2", "Sales[[#This Row],[Amount]]*2"),
+            ("[@Amount]*2", "[[#This Row],[Amount]]*2"),
+            ("[@[Col A]]+1", "[[#This Row],[Col A]]+1"),
         ] {
-            assert!(matches!(file_formula(src), Cow::Borrowed(_)), "{src}");
+            assert_eq!(file(typed), saved, "{typed}");
+            assert_eq!(file(saved), saved, "{saved} is already file spelling");
         }
+        assert!(matches!(
+            file_formula("Sales[[#This Row],[Amount]]"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn to_string_keeps_every_digit_of_a_constant() {
+        for src in [
+            "A1*1.23456789E-12",
+            "1/0.30000000000000004",
+            "A1+123456789012345680000",
+        ] {
+            let ast = parse(src).unwrap();
+            assert_eq!(parse(&to_string(&ast)).unwrap(), ast, "{src}");
+        }
+        assert_eq!(
+            to_string(&parse("A1*1.23456789E-12").unwrap()),
+            "A1*1.23456789E-12"
+        );
+        // Ordinary numbers print as before.
+        assert_eq!(to_string(&parse("0.1+1.5*100").unwrap()), "0.1+1.5*100");
+        // The display spelling still rounds.
+        let e = Expr::Num(0.1 + 0.2);
+        assert_eq!(to_string_display(&e), "0.3");
+        assert_eq!(to_string(&e), "0.30000000000000004");
+        // The lexer keeps 15 digits, as Excel does a typed constant.
+        for n in [
+            1e-5,
+            1e21,
+            123456789012345000000.0,
+            1.5e25,
+            1e-12,
+            0.1,
+            100.0,
+        ] {
+            let back = parse(&file_num(n)).unwrap();
+            assert!(matches!(back, Expr::Num(m) if m == n), "{n}");
+        }
+    }
+
+    #[test]
+    fn structural_edit_keeps_constant_digits() {
+        // The reprint behind a fill, a shared formula and a row insert.
+        let out = translate_formula("A1*1.23456789E-12", 1, 0).unwrap();
+        assert_eq!(out, "A2*1.23456789E-12");
     }
 
     #[test]

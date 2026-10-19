@@ -164,6 +164,11 @@ pub struct CellMeta {
     pub vm_body: Option<String>,
     /// `ph="1"`: show phonetic text.
     pub ph: bool,
+    /// The formula text as loaded, kept only when [`crate::formula::file_formula`]
+    /// would change it (a bare post-2007 name: a UDF named like a builtin).
+    /// Save writes it back while the cell still holds exactly that text; any
+    /// edit or reprint changes the text and the save translates it again.
+    pub loaded_f: Option<String>,
     /// The formula was typed here: set when [`crate::engine::Engine::set_cell`]
     /// gets new formula text (the same text keeps what the formula was), and
     /// carried by copies ([`crate::edit`]'s rebase). Evaluated with spill

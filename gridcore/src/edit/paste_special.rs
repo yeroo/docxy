@@ -10,7 +10,7 @@
 //! a multi-area copy and a transposed paste all read relative to their own
 //! cells.
 
-use crate::formula::{Expr, Transposed, to_string, translate_formula, transpose_formula};
+use crate::formula::{Expr, Transposed, to_string_display, translate_formula, transpose_formula};
 use crate::sheet::{Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Workbook, cell_name};
 
 use super::{Area, rects_overlap as overlaps};
@@ -496,7 +496,7 @@ fn operand_of(cell: &Cell, formula: Option<String>) -> Operand {
 }
 
 fn num_text(n: f64) -> String {
-    to_string(&Expr::Num(n))
+    to_string_display(&Expr::Num(n))
 }
 
 /// What a Paste Special operation writes in a cell.
