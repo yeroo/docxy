@@ -22929,6 +22929,8 @@ impl Docxy {
             return self.refocus(window, cx);
         }
         if let Some(tab) = self.tabs.get_mut(self.active) {
+            // Bold and Italic read the package's styles (#1427).
+            tab.sync_editor_styles();
             // Route to the header/footer editor while it's open, else the body.
             // A host edit never grows the typing (or deleting) run before it:
             // it is a step of its own, which also makes a Repeat record of
@@ -25115,6 +25117,11 @@ impl Docxy {
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Ctrl+B / Ctrl+I read the package's styles (#1427), also before the
+        // first frame has handed them over.
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.sync_editor_styles();
+        }
         if self.modal_takes_key(ev, window, cx) {
             return;
         }
