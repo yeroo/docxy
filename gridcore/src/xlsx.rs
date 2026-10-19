@@ -10021,7 +10021,8 @@ impl SheetPackage {
             if d.scope == Some(idx) {
                 continue;
             }
-            let rewrite = |e: &crate::formula::Expr| crate::formula::remove_sheet_refs_in_expr(e, &gone);
+            let rewrite =
+                |e: &crate::formula::Expr| crate::formula::remove_sheet_refs_in_expr(e, &gone);
             if let Some(text) = crate::formula::rewrite_defined_name(&d.formula, rewrite, None) {
                 d.formula = text;
             }
@@ -13933,8 +13934,10 @@ b",
                 .cells
                 .insert((0, 0), crate::sheet::Cell::text(name));
         }
-        pkg.add_table(0, (0, 0, 2, 1), true, "TableStyleLight1").unwrap();
-        pkg.add_table(2, (0, 0, 2, 1), true, "TableStyleLight1").unwrap();
+        pkg.add_table(0, (0, 0, 2, 1), true, "TableStyleLight1")
+            .unwrap();
+        pkg.add_table(2, (0, 0, 2, 1), true, "TableStyleLight1")
+            .unwrap();
         pkg.workbook.active_tab = 0;
         assert!(pkg.move_sheet(0, 2));
         let order: Vec<_> = pkg.workbook.sheets.iter().map(|s| s.name.clone()).collect();
@@ -19513,22 +19516,20 @@ mod print_setup_tests {
     fn sheet_sort_state_translates_with_the_grid() {
         let (ws, _) = edited("", SORT, |w| insert_rows(w, 0, 0, 2));
         assert!(
-            ws.contains(
-                r#"<sortState ref="A4:C11"><sortCondition ref="B4:B11"/></sortState>"#
-            ),
+            ws.contains(r#"<sortState ref="A4:C11"><sortCondition ref="B4:B11"/></sortState>"#),
             "{ws}"
         );
         let (ws, _) = edited("", SORT, |w| insert_cols(w, 0, 0, 2));
         assert!(
-            ws.contains(
-                r#"<sortState ref="C2:E9"><sortCondition ref="D2:D9"/></sortState>"#
-            ),
+            ws.contains(r#"<sortState ref="C2:E9"><sortCondition ref="D2:D9"/></sortState>"#),
             "{ws}"
         );
         // A delete of rows above it shifts it up.
-        let (ws, _) = edited("", "<sortState ref=\"A5:C9\"><sortCondition ref=\"B5:B9\"/></sortState>", |w| {
-            delete_rows(w, 0, 0, 2)
-        });
+        let (ws, _) = edited(
+            "",
+            "<sortState ref=\"A5:C9\"><sortCondition ref=\"B5:B9\"/></sortState>",
+            |w| delete_rows(w, 0, 0, 2),
+        );
         assert!(
             ws.contains(r#"<sortState ref="A3:C7"><sortCondition ref="B3:B7"/></sortState>"#),
             "{ws}"
@@ -19562,12 +19563,18 @@ mod print_setup_tests {
             |w| delete_cols(w, 0, 10, 1),
         ] {
             let (ws, _) = edited("", SORT, edit);
-            assert!(ws.contains(&SORT[SORT.find("<sortState").unwrap()..]), "{ws}");
+            assert!(
+                ws.contains(&SORT[SORT.find("<sortState").unwrap()..]),
+                "{ws}"
+            );
         }
         // No structural edit at all.
         let pkg = report("", SORT);
         let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
-        assert!(ws.contains(&SORT[SORT.find("<sortState").unwrap()..]), "{ws}");
+        assert!(
+            ws.contains(&SORT[SORT.find("<sortState").unwrap()..]),
+            "{ws}"
+        );
     }
 
     #[test]
@@ -19658,7 +19665,9 @@ mod print_setup_tests {
         ] {
             let mut pkg = three_sheets(names);
             for (i, sheet) in pkg.workbook.sheets.iter_mut().enumerate() {
-                sheet.cells.insert((0, 0), crate::sheet::Cell::number(i as f64 + 1.0));
+                sheet
+                    .cells
+                    .insert((0, 0), crate::sheet::Cell::number(i as f64 + 1.0));
             }
             assert!(pkg.move_sheet(from, to));
             let (re, wb) = saved(&pkg, "xl/workbook.xml");
@@ -19666,21 +19675,45 @@ mod print_setup_tests {
             assert_eq!(got, order, "{from}->{to}: {wb}");
             // Each sheet's cell travelled with it (Data 1, Other 2, DataX 3).
             for (i, name) in order.iter().enumerate() {
-                let want = ["Data", "Other", "DataX"].iter().position(|n| n == name).unwrap();
+                let want = ["Data", "Other", "DataX"]
+                    .iter()
+                    .position(|n| n == name)
+                    .unwrap();
                 let v = re.workbook.sheets[i].cell(0, 0).map(|c| c.value.clone());
-                assert_eq!(v, Some(CellValue::Number(want as f64 + 1.0)), "{from}->{to} {name}");
+                assert_eq!(
+                    v,
+                    Some(CellValue::Number(want as f64 + 1.0)),
+                    "{from}->{to} {name}"
+                );
             }
             // Every scoped name still sits on the sheet it names.
-            for (name, scope) in [("Mine", "DataX"), ("_xlnm.Print_Area", "Data"), ("_xlnm.Print_Area", "Other")] {
+            for (name, scope) in [
+                ("Mine", "DataX"),
+                ("_xlnm.Print_Area", "Data"),
+                ("_xlnm.Print_Area", "Other"),
+            ] {
                 let d = re
                     .workbook
                     .defined_names
                     .iter()
-                    .find(|d| d.name == name && d.formula.starts_with(scope) && d.formula.as_bytes().get(scope.len()) == Some(&b'!'))
+                    .find(|d| {
+                        d.name == name
+                            && d.formula.starts_with(scope)
+                            && d.formula.as_bytes().get(scope.len()) == Some(&b'!')
+                    })
                     .unwrap_or_else(|| panic!("{name} on {scope}: {wb}"));
-                assert_eq!(d.scope.map(|s| re.workbook.sheets[s].name.as_str()), Some(scope), "{from}->{to}");
+                assert_eq!(
+                    d.scope.map(|s| re.workbook.sheets[s].name.as_str()),
+                    Some(scope),
+                    "{from}->{to}"
+                );
             }
-            assert!(re.workbook.defined_names.iter().any(|d| d.name == "Global" && d.scope.is_none()));
+            assert!(
+                re.workbook
+                    .defined_names
+                    .iter()
+                    .any(|d| d.name == "Global" && d.scope.is_none())
+            );
         }
     }
 

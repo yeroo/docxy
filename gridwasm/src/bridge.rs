@@ -140,6 +140,27 @@ struct RemovedSheetStash {
     /// its pivot. Reconstituted on restore via `ctl_reregister_pivot`,
     /// `.sheet` re-pointed at the restored sheet's NEW index.
     pivots: Vec<gridcore::pivot::Pivot>,
+    /// Where the sheet stood in the tab order (its index at removal), so a
+    /// restore puts it back there (`SheetPackage::move_sheet`) and not at
+    /// the end.
+    index: usize,
+    /// The defined names (global, or scoped to another sheet) whose text
+    /// `SheetPackage::remove_sheet` rewrote to `#REF!`: their position among
+    /// the names that survive the removal, the scope's sheet NAME (an index
+    /// moves), and the text before and after. A restore puts `before` back
+    /// on a name still at that position, with that scope, still reading
+    /// `after`.
+    rewritten_names: Vec<RewrittenName>,
+}
+
+/// One defined name `remove_sheet` rewrote (see
+/// [`RemovedSheetStash::rewritten_names`]).
+struct RewrittenName {
+    position: usize,
+    name: String,
+    scope_sheet: Option<String>,
+    before: String,
+    after: String,
 }
 
 /// A live editing session over one `.xlsx`.
@@ -2206,10 +2227,8 @@ impl Session {
     //     external agent calling it through `CtlServer` still gets "unknown
     //     verb"), backed by the bridge-level `Session::removed_sheet_stash`
     //     ([`RemovedSheetStash`]) captured just before removal: cells,
-    //     formulas, drawings, and comments all round-trip losslessly. The
-    //     one documented gap is the sheet's numeric INDEX — see
-    //     `ctl_sheet_restore_removed`'s doc comment for why a bridge-only
-    //     change can't splice it back into its original position. (An
+    //     formulas, drawings, and comments all round-trip losslessly, the
+    //     sheet back at its original index. (An
     //     earlier version of this bucket used a lossy `sheet.add`-by-name
     //     inverse instead — replaced after review flagged that it would
     //     silently resurrect an EMPTY sheet as "undo".)
@@ -2636,9 +2655,39 @@ impl Session {
             .filter(|p| p.sheet == si)
             .cloned()
             .collect();
+        // The names that survive the removal, to find which of them it
+        // rewrites to `#REF!`.
+        let surviving: Vec<DefinedName> = self
+            .pkg
+            .workbook
+            .defined_names
+            .iter()
+            .filter(|d| d.scope != Some(si))
+            .cloned()
+            .collect();
+        let scope_names: Vec<Option<String>> = surviving
+            .iter()
+            .map(|d| d.scope.map(|s| self.pkg.workbook.sheets[s].name.clone()))
+            .collect();
         if !self.pkg.remove_sheet(si) {
             return Err("cannot remove the last sheet".into());
         }
+        let rewritten_names: Vec<RewrittenName> = surviving
+            .iter()
+            .zip(&scope_names)
+            .zip(&self.pkg.workbook.defined_names)
+            .enumerate()
+            .filter(|(_, ((before, _), after))| {
+                before.name == after.name && before.formula != after.formula
+            })
+            .map(|(position, ((before, scope_sheet), after))| RewrittenName {
+                position,
+                name: before.name.clone(),
+                scope_sheet: scope_sheet.clone(),
+                before: before.formula.clone(),
+                after: after.formula.clone(),
+            })
+            .collect();
         if self.active > si {
             self.active -= 1;
         } else if removed_active {
@@ -2669,6 +2718,8 @@ impl Session {
             defined_names,
             removed_active,
             pivots,
+            index: si,
+            rewritten_names,
         });
         let mut out = String::from(
             "{\"removed\":true,\"inverse\":{\"verb\":\"sheet.restore-removed\",\"args\":{\"name\":",
@@ -2722,24 +2773,17 @@ impl Session {
     /// reverse: if the removed sheet WAS the active one, the restored sheet
     /// becomes active again (with a fresh cursor/viewport, matching the
     /// removal's own reset); otherwise `active`/`cur`/`anchor`/the viewport
-    /// are left completely untouched — appending a sheet at the end never
-    /// changes any other sheet's index, so no compensating shift is needed
-    /// either way (verified by the removed-before-active and removed-active
-    /// tests below).
+    /// are left as they are, except that `active` moves up a place when the
+    /// restored sheet lands at or before it (verified by the
+    /// removed-before-active and removed-active tests below).
     ///
-    /// **Documented limitation**: the restored sheet is always appended at
-    /// the END of the sheet list, not spliced back into its original
-    /// numeric index, whenever other sheets existed after it.
-    /// `SheetPackage::sheet_parts` — which must stay in lockstep,
-    /// index-for-index, with `workbook.sheets` for `save_xlsx` to write each
-    /// sheet's regenerated cell data into the correct XML part — is
-    /// `pub(crate)` in gridcore, invisible outside that crate. Reordering
-    /// `workbook.sheets` alone (the only piece gridwasm can reach) without
-    /// also reordering `sheet_parts` would desync the two and corrupt the
-    /// next save (wrong sheet's cells written into another sheet's XML
-    /// part). True positional restore needs a small new gridcore primitive
-    /// (e.g. an `insert_sheet_at`); genuinely out of reach from
-    /// `gridwasm/src/bridge.rs` alone, which is this task's explicit scope.
+    /// The sheet comes back at its original index (`RemovedSheetStash::index`,
+    /// clamped to the end): added at the end, then moved there with
+    /// `SheetPackage::move_sheet`, which keeps the part list, the `<sheet>`
+    /// elements and every stored sheet index in step. When that shifts other
+    /// sheets the undo and redo history, which names sheets by index, is
+    /// cleared (as `sheet.remove` does). The global names the removal turned
+    /// into `#REF!` get their text back.
     fn ctl_sheet_restore_removed(&mut self, args: &json::Json) -> Result<String, String> {
         // Peek at the stash name WITHOUT consuming it, so a mismatch (or a
         // name collision) leaves the stash intact for a correct later restore.
@@ -2773,7 +2817,22 @@ impl Session {
             .removed_sheet_stash
             .take()
             .expect("stash presence verified above");
-        let new_idx = self.pkg.add_sheet(&stash.name);
+        let appended = self.pkg.add_sheet(&stash.name);
+        // Back to its old place in the tab order. `move_sheet` carries the
+        // part, the `<sheet>` element and every stored sheet index (names,
+        // tables, pivots) with it, so what follows uses the final index.
+        let mut new_idx = appended;
+        let target = stash.index.min(appended);
+        if target != appended && self.pkg.move_sheet(appended, target) {
+            new_idx = target;
+            // The sheets from there on moved up a place, and the history
+            // names sheets by index.
+            if self.active >= new_idx {
+                self.active += 1;
+            }
+            self.undo.clear();
+            self.redo.clear();
+        }
         self.pkg.workbook.sheets[new_idx] = stash.sheet;
         for cm in &stash.comments {
             if cm.threaded {
@@ -2783,6 +2842,18 @@ impl Session {
             } else {
                 self.pkg
                     .set_comment(new_idx, cm.row, cm.col, &cm.author, &cm.text);
+            }
+        }
+        // The names the removal rewrote to `#REF!` read as they did, unless
+        // they changed since.
+        for r in &stash.rewritten_names {
+            let wb = &mut self.pkg.workbook;
+            let Some(d) = wb.defined_names.get(r.position) else {
+                continue;
+            };
+            let scope = d.scope.map(|s| wb.sheets[s].name.as_str());
+            if d.name == r.name && d.formula == r.after && scope == r.scope_sheet.as_deref() {
+                wb.defined_names[r.position].formula = r.before.clone();
             }
         }
         // Re-point each name's scope at the NEW index — the old one may no
@@ -5689,7 +5760,10 @@ mod tests {
 
         s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"Report"}}"#);
         let out = s.ctl(r#"{"verb":"sheet.restore-removed","args":{}}"#);
-        assert!(out.contains("\"sheet\":2"), "restored at the end: {out}");
+        assert!(
+            out.contains("\"sheet\":1"),
+            "restored in its old place: {out}"
+        );
 
         let re = load_xlsx(&s.save()).expect("saved file reloads");
         let scoped = |i: usize| {
@@ -5703,11 +5777,11 @@ mod tests {
             v.sort();
             v
         };
-        // The restored sheet's names, scoped to its new index, and its
+        // The restored sheet's names, scoped to its old index, and its
         // autoFilter, written into its fresh part with its `_FilterDatabase`
         // (#690: a save writes a filter the model holds).
         assert_eq!(
-            scoped(2),
+            scoped(1),
             vec![
                 ("Mine".to_string(), "Report!$B$2".to_string()),
                 (
@@ -5721,16 +5795,16 @@ mod tests {
             ]
         );
         assert_eq!(
-            re.workbook.sheets[2].auto_filter.as_ref().map(|a| a.range),
+            re.workbook.sheets[1].auto_filter.as_ref().map(|a| a.range),
             Some((0, 0, 4, 1))
         );
         assert_eq!(
-            scoped(1),
+            scoped(2),
             vec![("Mine".to_string(), "Tail!$C$3".to_string())]
         );
         let wb = String::from_utf8_lossy(re.part("xl/workbook.xml").unwrap()).into_owned();
         assert!(
-            wb.contains(r#"<definedName name="_xlnm._FilterDatabase" localSheetId="2" hidden="1">Report!$A$1:$B$5</definedName>"#),
+            wb.contains(r#"<definedName name="_xlnm._FilterDatabase" localSheetId="1" hidden="1">Report!$A$1:$B$5</definedName>"#),
             "{wb}"
         );
         assert_eq!(wb.matches("<definedName ").count(), 4, "{wb}");
@@ -5771,8 +5845,8 @@ mod tests {
     fn ctl_sheet_restore_removed_adjusts_active_index_removed_before_active_case() {
         // sheets = [Sheet1, Sheet2, Sheet3], active = Sheet3 (index 2).
         // Removing Sheet2 (index 1, BELOW active) decrements active to 1,
-        // still correctly pointing at Sheet3. Restoring (append-only) must
-        // NOT touch active again — it already correctly tracks Sheet3.
+        // still correctly pointing at Sheet3. Restoring Sheet2 at index 1
+        // pushes Sheet3 back to 2, and active follows it.
         let mut s = two_sheet_session();
         s.ctl(r#"{"verb":"sheet.add","args":{"name":"Sheet3"}}"#);
         s.active = 2;
@@ -5783,16 +5857,101 @@ mod tests {
         let v = s.view_json(None);
         assert!(v.contains("\"active\":1"), "{v}"); // Sheet3 shifted down to index 1
 
+        let out = s.ctl(r#"{"verb":"sheet.restore-removed","args":{}}"#);
+        assert!(out.contains("\"sheet\":1"), "{out}");
+        let v = s.view_json(None);
+        assert!(
+            v.contains("\"active\":2"),
+            "active stays on Sheet3, now at 2: {v}"
+        );
+        assert!(
+            v.contains("\"sheets\":[\"Sheet1\",\"Sheet2\",\"Sheet3\"]"),
+            "Sheet2 comes back in its middle slot: {v}"
+        );
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_puts_a_middle_sheet_back_at_its_index_through_a_save() {
+        let mut s = two_sheet_session();
+        s.ctl(r#"{"verb":"sheet.add","args":{"name":"Sheet3"}}"#);
+        for (sheet, v) in [(0, 1), (1, 2), (2, 3)] {
+            s.active = sheet;
+            s.dispatch(&format!("set\t0\t0\t{v}"));
+        }
+        s.active = 0;
+        // Names: scoped to Sheet3 (its index changes on removal and restore),
+        // scoped to the removed sheet, and global ones naming it or not.
+        let names = [
+            ("Three", Some(2), "Sheet3!$A$1"),
+            ("Two", Some(1), "Sheet2!$A$1"),
+            ("Total", None, "Sheet2!$A$1"),
+            ("Other", None, "Sheet3!$A$1"),
+        ];
+        for (name, scope, formula) in names {
+            s.pkg.workbook.defined_names.push(DefinedName {
+                name: name.into(),
+                scope,
+                formula: formula.into(),
+            });
+        }
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"Sheet2"}}"#);
+        let total = |s: &Session| {
+            s.pkg
+                .workbook
+                .defined_names
+                .iter()
+                .find(|d| d.name == "Total")
+                .map(|d| d.formula.clone())
+        };
+        assert_eq!(total(&s).as_deref(), Some("#REF!"));
         s.ctl(r#"{"verb":"sheet.restore-removed","args":{}}"#);
         let v = s.view_json(None);
         assert!(
-            v.contains("\"active\":1"),
-            "restoring (append-only) must not move active off Sheet3: {v}"
+            v.contains("\"sheets\":[\"Sheet1\",\"Sheet2\",\"Sheet3\"]"),
+            "{v}"
         );
-        assert!(
-            v.contains("\"sheets\":[\"Sheet1\",\"Sheet3\",\"Sheet2\"]"),
-            "Sheet2 comes back at the END, not spliced into its old middle slot: {v}"
-        );
+        assert_eq!(total(&s).as_deref(), Some("Sheet2!$A$1"));
+        let scope_of = |s: &Session, n: &str| {
+            let d = s.pkg.workbook.defined_names.iter().find(|d| d.name == n);
+            d.and_then(|d| d.scope)
+        };
+        assert_eq!(scope_of(&s, "Three"), Some(2));
+        assert_eq!(scope_of(&s, "Two"), Some(1));
+        // Save and reload: each sheet's cell is in its own part.
+        let bytes = s.save();
+        let re = Session::open(&bytes).expect("reopen");
+        let wb = &re.pkg.workbook;
+        let names: Vec<_> = wb.sheets.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, ["Sheet1", "Sheet2", "Sheet3"]);
+        for (i, want) in [1.0, 2.0, 3.0].into_iter().enumerate() {
+            let v = wb.sheets[i].cell(0, 0).map(|c| c.value.clone());
+            assert_eq!(
+                v,
+                Some(gridcore::sheet::CellValue::Number(want)),
+                "sheet {i}"
+            );
+        }
+        let d = wb.defined_names.iter().find(|d| d.name == "Total").unwrap();
+        assert_eq!(d.formula, "Sheet2!$A$1");
+        let d = wb.defined_names.iter().find(|d| d.name == "Three").unwrap();
+        assert_eq!(d.scope, Some(2));
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_of_the_last_sheet_stays_last_and_keeps_a_changed_name() {
+        let mut s = two_sheet_session();
+        s.pkg.workbook.defined_names.push(DefinedName {
+            name: "Total".into(),
+            scope: None,
+            formula: "Sheet2!$A$1".into(),
+        });
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"Sheet2"}}"#);
+        // Someone redefines the name meanwhile: the restore leaves it alone.
+        s.pkg.workbook.defined_names[0].formula = "Sheet1!$B$2".into();
+        s.ctl(r#"{"verb":"sheet.restore-removed","args":{}}"#);
+        let v = s.view_json(None);
+        assert!(v.contains("\"sheets\":[\"Sheet1\",\"Sheet2\"]"), "{v}");
+        assert_eq!(s.pkg.workbook.defined_names[0].formula, "Sheet1!$B$2");
     }
 
     #[test]
