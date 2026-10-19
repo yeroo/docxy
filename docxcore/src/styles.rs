@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use crate::model::{
     Align, BorderKind, ParBorders, ParProps, RunProps, TabAlign, TabLeader, TabStop,
 };
+use crate::table_styles::RunLook;
 use crate::xml::{Event, XmlParser};
 
 #[derive(Debug, Clone, Default)]
@@ -173,6 +174,56 @@ impl StyleSheet {
             style_id: direct.style_id.clone(),
             ..Default::default()
         }
+    }
+
+    /// A run as the suite draws it (#1427): the table style's look below the
+    /// paragraph style's `basedOn` chain, below the character style's, below
+    /// the run's direct formatting. Unlike [`StyleSheet::effective_run`] it
+    /// starts from nothing (no document defaults, no default paragraph
+    /// style), so an unstyled run comes back as it is, and a direct
+    /// explicit-off (`<w:b w:val="0"/>`, kept in `raw_props`) beats every
+    /// style. The character style beats the paragraph style outright, the
+    /// toggle-property XOR Word applies between them is not modelled. Only
+    /// the drawn fields change; the rest is the direct run's.
+    pub fn shown_run(
+        &self,
+        table: Option<&RunLook>,
+        para_style: Option<&str>,
+        run_style: Option<&str>,
+        direct: &RunProps,
+    ) -> RunProps {
+        let mut agg = PartialRun::default();
+        let mut table_color = None;
+        if let Some(t) = table {
+            agg.bold = t.bold;
+            agg.italic = t.italic;
+            table_color = t.color.clone();
+        }
+        for s in [para_style, run_style].into_iter().flatten() {
+            self.fold(&mut agg, s, &mut HashSet::new());
+        }
+        let mut out = direct.clone();
+        if !direct.bold {
+            out.bold = !has_raw_child(&direct.raw_props, "b") && agg.bold.unwrap_or(false);
+        }
+        if !direct.italic {
+            out.italic = !has_raw_child(&direct.raw_props, "i") && agg.italic.unwrap_or(false);
+        }
+        out.underline = direct.underline || agg.underline.unwrap_or(false);
+        out.strike = direct.strike || agg.strike.unwrap_or(false);
+        // An explicit `auto` colour loads as no colour, its element kept in
+        // the shadow: it beats the styles too.
+        let explicit_auto = direct.shadow.iter().any(|x| {
+            crate::table_props::element_name(x) == "w:color"
+                && crate::table_props::element_attr(x, "w:val")
+                    .is_none_or(|v| v.is_empty() || v == "auto")
+        });
+        if direct.color.is_none() && !explicit_auto {
+            out.color = agg.color.clone().or(table_color.flatten());
+        }
+        out.size_half_pts = direct.size_half_pts.or(agg.size);
+        out.font = direct.font.clone().or_else(|| agg.font.clone());
+        out
     }
 
     /// Whether a run is hidden text (`w:vanish`) once its styles are
@@ -699,6 +750,118 @@ mod tests {
                 ("Normal".to_string(), "Normal".to_string()),
             ]
         );
+    }
+
+    fn shown_sheet() -> StyleSheet {
+        parse_styles_xml(
+            r#"<w:styles>
+            <w:style w:type="paragraph" w:styleId="Heading1"><w:rPr><w:b/>
+              <w:rFonts w:ascii="Georgia"/><w:color w:val="1F3864"/><w:sz w:val="32"/></w:rPr></w:style>
+            <w:style w:type="paragraph" w:styleId="Plain"><w:rPr><w:b w:val="0"/></w:rPr></w:style>
+            <w:style w:type="character" w:styleId="Strong"><w:rPr><w:b/></w:rPr></w:style>
+            <w:style w:type="character" w:styleId="Red"><w:rPr><w:color w:val="FF0000"/></w:rPr></w:style>
+            <w:style w:type="character" w:styleId="Lite"><w:basedOn w:val="Strong"/>
+              <w:rPr><w:i/></w:rPr></w:style>
+            <w:style w:type="paragraph" w:styleId="A"><w:basedOn w:val="B"/><w:rPr><w:i/></w:rPr></w:style>
+            <w:style w:type="paragraph" w:styleId="B"><w:basedOn w:val="A"/></w:style>
+            </w:styles>"#,
+        )
+    }
+
+    fn off(local: &str) -> RunProps {
+        RunProps {
+            raw_props: vec![format!("<w:{local} w:val=\"0\"/>")],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn shown_run_paragraph_style_bold_size_color() {
+        let r = shown_sheet().shown_run(None, Some("Heading1"), None, &RunProps::default());
+        assert!(r.bold);
+        assert_eq!(r.size_half_pts, Some(32));
+        assert_eq!(r.color.as_deref(), Some("1F3864"));
+        assert_eq!(r.font.as_deref(), Some("Georgia"));
+        let direct = RunProps {
+            size_half_pts: Some(20),
+            color: Some("00FF00".into()),
+            font: Some("Arial".into()),
+            ..Default::default()
+        };
+        let r = shown_sheet().shown_run(None, Some("Heading1"), None, &direct);
+        assert_eq!(r.size_half_pts, Some(20));
+        assert_eq!(r.color.as_deref(), Some("00FF00"));
+        assert_eq!(r.font.as_deref(), Some("Arial"));
+    }
+
+    #[test]
+    fn shown_run_char_style_beats_paragraph_style() {
+        let ss = shown_sheet();
+        let r = ss.shown_run(None, Some("Plain"), Some("Strong"), &RunProps::default());
+        assert!(r.bold, "the character style's bold beats the paragraph's off");
+        let r = ss.shown_run(None, Some("Heading1"), Some("Red"), &RunProps::default());
+        assert!(r.bold, "layers merge");
+        assert_eq!(r.color.as_deref(), Some("FF0000"));
+        let r = ss.shown_run(None, None, Some("Lite"), &RunProps::default());
+        assert!(r.bold && r.italic, "basedOn is followed");
+    }
+
+    #[test]
+    fn shown_run_direct_explicit_off_beats_style() {
+        let ss = shown_sheet();
+        let r = ss.shown_run(None, Some("Heading1"), Some("Strong"), &off("b"));
+        assert!(!r.bold);
+        let look = RunLook {
+            italic: Some(true),
+            ..Default::default()
+        };
+        let r = ss.shown_run(Some(&look), None, None, &off("i"));
+        assert!(!r.italic);
+    }
+
+    #[test]
+    fn shown_run_table_below_paragraph() {
+        let ss = shown_sheet();
+        let look = RunLook {
+            bold: Some(true),
+            ..Default::default()
+        };
+        let r = ss.shown_run(Some(&look), None, None, &RunProps::default());
+        assert!(r.bold);
+        let r = ss.shown_run(Some(&look), Some("Plain"), None, &RunProps::default());
+        assert!(!r.bold, "the paragraph style's off beats the table's bold");
+        let coloured = RunLook {
+            color: Some(Some("0000FF".into())),
+            ..Default::default()
+        };
+        let r = ss.shown_run(Some(&coloured), Some("Heading1"), None, &RunProps::default());
+        assert_eq!(r.color.as_deref(), Some("1F3864"));
+    }
+
+    #[test]
+    fn shown_run_no_styles_leaves_run_unchanged_and_ignores_doc_defaults() {
+        let ss = parse_styles_xml(
+            r#"<w:styles><w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="40"/><w:b/>
+            </w:rPr></w:rPrDefault></w:docDefaults>
+            <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
+            <w:rPr><w:i/></w:rPr></w:style></w:styles>"#,
+        );
+        let run = RunProps {
+            underline: true,
+            color: Some("123456".into()),
+            ..Default::default()
+        };
+        assert_eq!(ss.shown_run(None, None, None, &run), run);
+        assert_eq!(
+            ss.shown_run(None, None, None, &RunProps::default()),
+            RunProps::default()
+        );
+    }
+
+    #[test]
+    fn shown_run_basedon_cycle_terminates() {
+        let r = shown_sheet().shown_run(None, Some("A"), None, &RunProps::default());
+        assert!(r.italic);
     }
 
     #[test]
