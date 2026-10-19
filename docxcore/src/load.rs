@@ -138,11 +138,15 @@ const PART_ROOTS: [&str; 6] = [
 /// root down has the root's value: the saved root keeps it, and nothing the
 /// save writes back in between (a `w:p`'s or a `w:tbl`'s declarations) can
 /// bind the prefix to another namespace. The innermost binding of each
-/// prefix, as `(prefix, namespace)`.
+/// prefix, as `(prefix, namespace)`; the default namespace is the empty
+/// prefix (`xmlns=""` is `("", "")`), declared below the root or reset there.
 fn rebuilt_bindings(p: &XmlParser) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for scoped in p.namespace_scoped_attrs() {
-        let Some(prefix) = scoped.attr.name.strip_prefix("xmlns:") else {
+        let Some(prefix) = (scoped.attr.name == "xmlns")
+            .then_some("")
+            .or_else(|| scoped.attr.name.strip_prefix("xmlns:"))
+        else {
             continue;
         };
         if PART_ROOTS.contains(&scoped.element_name) {
@@ -181,7 +185,9 @@ fn mce_value_prefixes<'a>(name: &str, value: &'a str) -> impl Iterator<Item = &'
 
 /// The prefixes `raw` (an element captured verbatim) uses in element and
 /// attribute names, or names in markup-compatibility attribute values, and
-/// those its own start tag declares.
+/// those its own start tag declares. The empty prefix stands for the default
+/// namespace: used by an unprefixed element name no `xmlns` inside `raw`
+/// binds (an unprefixed attribute has no namespace).
 fn prefixes_of(raw: &str) -> (Vec<String>, Vec<String>) {
     let (mut used, mut own): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
     let add = |name: &str, used: &mut Vec<String>| {
@@ -197,8 +203,18 @@ fn prefixes_of(raw: &str) -> (Vec<String>, Vec<String>) {
         match q.next() {
             Event::Start => {
                 add(q.name(), &mut used);
+                if !q.name().contains(':')
+                    && !q.namespace_attrs().iter().any(|a| a.name == "xmlns")
+                    && !used.iter().any(|u| u.is_empty())
+                {
+                    used.push(String::new());
+                }
                 for a in q.attrs() {
-                    if let Some(prefix) = a.name.strip_prefix("xmlns:") {
+                    if a.name == "xmlns" {
+                        if first {
+                            own.push(String::new());
+                        }
+                    } else if let Some(prefix) = a.name.strip_prefix("xmlns:") {
                         if first {
                             own.push(prefix.to_string());
                         }
@@ -230,7 +246,8 @@ fn declare_rebuilt(raw: &str, bindings: &[(String, String)]) -> String {
     let mut decls = String::new();
     for (prefix, ns) in bindings {
         if used.contains(prefix) && !own.contains(prefix) {
-            decls.push_str(&format!(" xmlns:{prefix}=\""));
+            let colon = if prefix.is_empty() { "" } else { ":" };
+            decls.push_str(&format!(" xmlns{colon}{prefix}=\""));
             crate::serialize::esc_attr(ns, &mut decls);
             decls.push('"');
         }
