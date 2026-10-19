@@ -8569,10 +8569,12 @@ mod line_end_hit_tests {
     /// Fill the frame's thread-locals as a render would: `words` are body and
     /// cell paragraphs (path, pieces as (x, y, w, offset, len)), `rows` the
     /// painted table rows (path, cells as (column, x, y, w, h)).
-    fn seed(
-        words: &[(&[usize], &[(f32, f32, f32, usize, usize)])],
-        rows: &[(&[usize], &[(usize, f32, f32, f32, f32)])],
-    ) {
+    /// A test paragraph's pieces as (x, y, w, offset, len).
+    type SeedPieces<'a> = &'a [(f32, f32, f32, usize, usize)];
+    /// A test table row's cells as (column, x, y, w, h).
+    type SeedCells<'a> = &'a [(usize, f32, f32, f32, f32)];
+
+    fn seed(words: &[(&[usize], SeedPieces)], rows: &[(&[usize], SeedCells)]) {
         DOC_WORDS.with(|d| {
             let mut d = d.borrow_mut();
             d.clear();
