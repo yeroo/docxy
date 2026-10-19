@@ -168,6 +168,8 @@ mod tests {
     #[test]
     fn one_line_drops_line_breaks_and_control_characters() {
         assert_eq!(super::one_line("a\r\nb\nc"), "abc");
+        // A sheet copy's TSV pastes into the tab rename as one name.
+        assert_eq!(super::one_line("a\tb\r\n"), "ab");
         assert_eq!(super::one_line("\r\n"), "");
         assert_eq!(super::one_line("a\x0bb\x0cc\x1bd\0e\tf"), "abcdef");
         assert_eq!(super::one_line("é日 \u{1F600}"), "é日 \u{1F600}");

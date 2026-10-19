@@ -5530,7 +5530,7 @@ struct Docxy {
     clipboard: ClipboardStore,
     // Open sheet colour-swatch picker (fill or font), None = closed.
     sheet_pick: Option<SheetPick>,
-    // Inline sheet-tab rename in progress: (tab index, edit buffer). None = idle.
+    /// The sheet tab's inline rename while it has the keyboard (#1202, #1365), None = idle.
     sheet_rename: Option<SheetRename>,
     /// The sheet's Name Box while it has the keyboard (#1343).
     name_box: Option<NameBoxEdit>,
@@ -17889,10 +17889,10 @@ impl Docxy {
                     }
                 }
                 "v" => {
-                    // A one-line field: line breaks drop out.
+                    // A one-line field: line breaks and tabs (a sheet copy's TSV)
+                    // drop out, as in the comment bar.
                     if let ClipRead::Text(text) = self.clipboard_read(cx) {
-                        let line: String =
-                            text.chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
+                        let line = field_edit::one_line(&text);
                         if !line.is_empty() {
                             if let Some(r) = self.sheet_rename.as_mut() {
                                 edit(r, Op::Insert(&line));
