@@ -10013,6 +10013,19 @@ impl SheetPackage {
                 p.sheet -= 1;
             }
         }
+        // A name that refers to the sheet reads `#REF!` from now on, as in
+        // Excel; the removed sheet's own scoped names are dropped below.
+        // Cell formulas are left to the caller (`edit::remove_sheet_refs`).
+        let gone = [self.workbook.sheets[idx].name.clone()];
+        for d in &mut self.workbook.defined_names {
+            if d.scope == Some(idx) {
+                continue;
+            }
+            let rewrite = |e: &crate::formula::Expr| crate::formula::remove_sheet_refs_in_expr(e, &gone);
+            if let Some(text) = crate::formula::rewrite_defined_name(&d.formula, rewrite, None) {
+                d.formula = text;
+            }
+        }
         let part_name = self.sheet_parts.remove(idx);
         self.workbook.sheets.remove(idx);
         let active = &mut self.workbook.active_tab;
@@ -19419,6 +19432,65 @@ mod print_setup_tests {
         insert_rows(&mut pkg.workbook, 0, 0, 2);
         let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
         assert!(ws.contains(r#"<sortState ref="A2:C9">"#), "{ws}");
+    }
+
+    fn three_sheets(names: &str) -> SheetPackage {
+        let body = Some(r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#);
+        load_xlsx(&book(
+            names,
+            &[("Data", body), ("Other", body), ("DataX", body)],
+        ))
+        .expect("fixture loads")
+    }
+
+    fn names_of(wb: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = wb;
+        while let Some(i) = rest.find("<definedName ") {
+            let end = rest[i..].find("</definedName>").unwrap() + i;
+            out.push(rest[i..end].to_string());
+            rest = &rest[end..];
+        }
+        out
+    }
+
+    #[test]
+    fn removing_a_sheet_turns_global_names_that_refer_to_it_into_ref_errors() {
+        let names = concat!(
+            r#"<definedName name="Total">Data!$B$2</definedName>"#,
+            r#"<definedName name="Cols">Data!$A:$A,Data!$1:$2</definedName>"#,
+            r#"<definedName name="Keep">Other!$B$2</definedName>"#,
+            r#"<definedName name="Prefix">DataX!$B$2</definedName>"#,
+            r#"<definedName name="Mixed">Data!$A$1+Other!$A$1</definedName>"#,
+            r#"<definedName name="OnOther" localSheetId="1">Other!$C$3</definedName>"#,
+            r#"<definedName name="Mine" localSheetId="0">Data!$C$3</definedName>"#,
+        );
+        let mut pkg = three_sheets(names);
+        assert!(pkg.remove_sheet(0));
+        let text = |n: &str| {
+            pkg.workbook
+                .defined_names
+                .iter()
+                .find(|d| d.name == n)
+                .map(|d| d.formula.clone())
+        };
+        assert_eq!(text("Total").as_deref(), Some("#REF!"));
+        assert_eq!(text("Cols").as_deref(), Some("#REF!,#REF!"));
+        assert_eq!(text("Keep").as_deref(), Some("Other!$B$2"));
+        assert_eq!(text("Prefix").as_deref(), Some("DataX!$B$2"));
+        assert_eq!(text("Mixed").as_deref(), Some("#REF!+Other!$A$1"));
+        assert_eq!(text("OnOther").as_deref(), Some("Other!$C$3"));
+        assert_eq!(text("Mine"), None);
+        let (re, wb) = saved(&pkg, "xl/workbook.xml");
+        let all = names_of(&wb);
+        let has = |t: &str| all.iter().any(|n| n.ends_with(t));
+        assert!(has(r#"name="Total">#REF!"#), "{wb}");
+        assert!(has(r#"name="Cols">#REF!,#REF!"#), "{wb}");
+        assert!(has(r#"name="Keep">Other!$B$2"#), "{wb}");
+        assert!(has(r#"localSheetId="0">Other!$C$3"#), "{wb}");
+        assert!(!wb.contains("Mine"), "{wb}");
+        let total = re.workbook.defined_names.iter().find(|d| d.name == "Total");
+        assert_eq!(total.map(|d| d.formula.as_str()), Some("#REF!"));
     }
 
     #[test]
