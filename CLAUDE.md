@@ -49,6 +49,13 @@
   may land after later keys' text, or in the next field after a Tab. A plain
   Windows dead key still types its accent into a dialog field.
   `edit_key` still swallows every ⌥ key, and Windows' plain Alt is never text.
+- The Project cell editor and prompt take ⌥ and AltGr text the same way
+  (#1312): `project_key` runs `text_input::dialog_stroke` while an edit is
+  open (`project_stroke`; with none open the key is untouched), and the AltGr
+  debt is the field's when a dialog or a Project edit is open at the key-down.
+  On Windows a plain dead key (`plain_dead_key`: `prefer_character_input`, no
+  Ctrl/Alt/Win) never reaches `on_key`: it owes nothing and its accent comes
+  composed with the next key, so no field types it twice.
 
 ## macOS menu bar (#1071)
 

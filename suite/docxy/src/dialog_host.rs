@@ -1937,6 +1937,10 @@ mod tests {
     /// its WM_CHAR `wm_char`, if one comes at once.
     fn windows_key(t: &mut DocTab, ime: &mut ImeState, ev: &KeyDownEvent, wm_char: Option<&str>) {
         let open = t.dialogs.is_open();
+        // `route_key` never hands `on_key` a plain dead key (#1312).
+        if crate::text_input::plain_dead_key(ev) {
+            return;
+        }
         assert!(platform_key(t, ev, false));
         ime.typed_key(ev, std::time::Instant::now(), open);
         if let Some(text) = wm_char {
@@ -2075,6 +2079,25 @@ mod tests {
         assert_eq!(windows_char(&mut t, &mut ime, "@"), 0);
         // The tilde dead key's debt alone is left, to lapse.
         assert_eq!(ime.owed(), 1);
+    }
+
+    /// Windows (#1312): a plain dead key types no accent into a field; the
+    /// next key's composed text is the only text.
+    #[test]
+    fn a_plain_dead_key_types_nothing_into_a_dialog_field() {
+        let mut t = tab_with_form();
+        assert!(key(&mut t, "tab", None));
+        assert!(key(&mut t, "tab", None));
+        let mut ime = ImeState::default();
+        let dead = KeyDownEvent {
+            prefer_character_input: true,
+            ..key_down("´", Some("´"), Modifiers::default())
+        };
+        windows_key(&mut t, &mut ime, &dead, None);
+        assert_eq!(value(&t, "note"), Value::Text(String::new()));
+        let n = key_down("n", Some("ñ"), Modifiers::default());
+        windows_key(&mut t, &mut ime, &n, Some("ñ"));
+        assert_eq!(value(&t, "note"), Value::Text("ñ".into()));
     }
 
     /// Ctrl+A selects the field's text and typing replaces it; Ctrl+V pastes

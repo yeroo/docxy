@@ -1512,6 +1512,17 @@ pub(crate) fn project_alt_key(key: &str, m: Modifiers) -> bool {
 /// Ctrl (#1071), as it is on every other surface (`on_key`'s `ctrl`), so
 /// ⌘S, ⌘Z, ⌘C and the menu bar's items reach Project. Off macOS, and for
 /// a chord already holding Ctrl, nothing changes.
+/// The keystroke the Project surface takes for a key-down: with a cell or
+/// prompt open, the plain typed key a ⌥ character stands for on macOS
+/// (#1312, as a dialog's), else the key-down's own.
+pub(crate) fn project_stroke(ev: &KeyDownEvent, edit_open: bool, macos: bool) -> Keystroke {
+    if edit_open {
+        crate::text_input::dialog_stroke(ev, macos)
+    } else {
+        ev.keystroke.clone()
+    }
+}
+
 pub(crate) fn project_mods(m: Modifiers, macos: bool) -> Modifiers {
     if macos && m.platform && !m.control {
         Modifiers {
@@ -2851,6 +2862,8 @@ impl Docxy {
         if self.backstage {
             return;
         }
+        // ⌥ makes a character in a cell or prompt as in a dialog (#1312).
+        let edit_open = self.project_edit_open();
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
@@ -2864,11 +2877,12 @@ impl Docxy {
         if let (Some(body_h), Surface::Project(v)) = (body_h, &mut tab.surface) {
             v.page_rows = page_rows_for(body_h);
         }
+        let stroke = project_stroke(ev, edit_open, crate::text_input::MACOS);
         if let Some(act) = project_input(
             tab,
-            ev.keystroke.key.as_str(),
-            ev.keystroke.key_char.as_deref(),
-            project_mods(ev.keystroke.modifiers, crate::text_input::MACOS),
+            stroke.key.as_str(),
+            stroke.key_char.as_deref(),
+            project_mods(stroke.modifiers, crate::text_input::MACOS),
         ) {
             return self.project_act(act, window, cx);
         }

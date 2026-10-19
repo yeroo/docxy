@@ -188,6 +188,24 @@ pub(crate) fn owed_text(ev: &KeyDownEvent) -> Option<String> {
         .filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
 }
 
+/// Whether a key-down is a plain dead key on Windows (#1312): gpui flags a
+/// key whose ToUnicode is dead as preferring character input, and with no
+/// Ctrl, Alt or Win held nothing else sets that flag. It owes no WM_CHAR
+/// ([`owed_text`]) and its accent is part of the next key's composed text,
+/// so `on_key` must not type it.
+pub(crate) fn plain_dead_key(ev: &KeyDownEvent) -> bool {
+    let m = &ev.keystroke.modifiers;
+    ev.prefer_character_input
+        && !m.control
+        && !m.alt
+        && !m.platform
+        && ev
+            .keystroke
+            .key_char
+            .as_deref()
+            .is_some_and(|c| !c.is_empty())
+}
+
 /// Whether a key-down's debt may never be paid: a key gpui flags as preferring
 /// character input under Ctrl, Alt or Win, which is every AltGr character and
 /// also an AltGr dead key, whose WM_DEADCHAR is no WM_CHAR (#1139).
@@ -271,12 +289,14 @@ pub(crate) fn dialog_stroke(ev: &KeyDownEvent, macos: bool) -> Keystroke {
     modifier_char(ev, macos).unwrap_or_else(|| ev.keystroke.clone())
 }
 
-/// Whether a Windows key-down is AltGr under an open dialog (#1162):
-/// Ctrl+Alt that gpui flags as changing the character. The dialog swallows
-/// it, as it does every Alt key, and the key-down cannot tell a character
-/// from an AltGr dead key (whose accent then joins the next letter). So it
-/// owes no WM_CHAR ([`ImeState::typed_key`]), and the WM_CHAR, which only
-/// a character sends, types the character into the dialog.
+/// Whether a Windows key-down is AltGr under an open text field that
+/// swallows it (#1162, #1312): a dialog, or the Project cell editor or
+/// prompt (`dialog_open` is true for any of them). It is Ctrl+Alt that gpui
+/// flags as changing the character. The field swallows it, as it does every
+/// Alt key, and the key-down cannot tell a character from an AltGr dead key
+/// (whose accent then joins the next letter). So it owes no WM_CHAR
+/// ([`ImeState::typed_key`]), and the WM_CHAR, which only a character
+/// sends, types the character into the field.
 pub(crate) fn dialog_altgr(ev: &KeyDownEvent, dialog_open: bool) -> bool {
     let m = &ev.keystroke.modifiers;
     dialog_open && m.control && m.alt && !m.platform && ev.prefer_character_input
@@ -489,7 +509,12 @@ impl Docxy {
                 self.ime.forget_key();
                 // Whether a dialog took the key is decided before on_key,
                 // which may close it.
-                let dialog_open = self.dialog_open();
+                let dialog_open = self.dialog_open() || self.project_edit_open();
+                // A Windows dead key types nothing: the composed text comes
+                // with the next key (#1312).
+                if cfg!(windows) && plain_dead_key(ev) {
+                    return;
+                }
                 self.on_key(ev, window, cx);
                 // After on_key, which may run long (a save): the debt's
                 // keeping time starts once the key is typed.
@@ -509,9 +534,11 @@ impl Docxy {
     /// typed only while the app takes it; under KeyTips or a menu its
     /// letters would be commands.
     pub(crate) fn windows_char(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let keys = self
-            .ime
-            .char_message(text, Instant::now(), self.dialog_open());
+        let keys = self.ime.char_message(
+            text,
+            Instant::now(),
+            self.dialog_open() || self.project_edit_open(),
+        );
         if !keys.is_empty() && self.takes_text() {
             self.type_committed(keys, window, cx);
         }
@@ -1010,6 +1037,39 @@ mod tests {
         let a_acute = modifier_char(&typed(stroke("y", Some("Á"), alt_shift)), true);
         assert_eq!(a_acute, char_stroke('Á'));
         assert_eq!(a_acute.and_then(|k| k.key_char).as_deref(), Some("Á"));
+    }
+
+    /// Windows (#1312): a plain dead key is flagged and bare; nothing with a
+    /// modifier, no accent or no flag is.
+    #[test]
+    fn a_plain_dead_key_is_found_by_its_flag_and_bare_modifiers() {
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert!(plain_dead_key(&dead("´", "´", Modifiers::default())));
+        assert!(plain_dead_key(&dead("6", "^", shift)));
+        assert!(!plain_dead_key(&dead("g", "g", alt())));
+        assert!(!plain_dead_key(&dead("4", "~", ctrl_alt())));
+        assert!(!plain_dead_key(&altgr("e", "€")));
+        assert!(!plain_dead_key(&typed(plain("n", "ñ"))));
+        let mut empty = dead("´", "", Modifiers::default());
+        assert!(!plain_dead_key(&empty));
+        empty.keystroke.key_char = None;
+        assert!(!plain_dead_key(&empty));
+    }
+
+    /// Windows (#1312): AltGr with a Project cell or prompt open is typed
+    /// once from its WM_CHAR, and nothing once the edit closed.
+    #[test]
+    fn altgr_in_a_project_edit_is_typed_by_its_wm_char() {
+        let at = t0();
+        let mut ime = ImeState::default();
+        ime.typed_key(&altgr("q", "@"), at, true);
+        assert_eq!(key_chars(&ime.char_message("@", at, true)), ["@"]);
+        ime.typed_key(&altgr("q", "@"), at, true);
+        assert!(ime.char_message("@", at, false).is_empty());
+        assert_eq!(ime.owed(), 0);
     }
 
     /// Windows (#1162): under a dialog an AltGr key, character or dead key
