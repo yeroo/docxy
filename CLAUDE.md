@@ -174,10 +174,11 @@
   decides, `Startup::StartScreen`), brought up through `open_backstage` so the
   lists are filled. A restored session keeps its tabs; files on the command
   line open over it (a file that cannot be read opens as a failed-load tab, so
-  one tab always exists). With no tab, Back and Esc on File go from New to
+  one tab always exists). With no tab, Back on File goes from New to
   its default page (Recent, Settings) and stay in File, Close, Save and Save
-  As do nothing, and a status said with no tab (the plugin notice) waits in
-  `pending_status` for the first tab (`land_status`). The New page's cards are `NEW_CARDS`
+  As do nothing, and the startup plugin notice waits in `pending_status` for the first
+  tab (`land_status`; a tab's own status wins). A failed Open pick with no tab
+  keeps File up and says why under Recent (`recent_message`). The New page's cards are `NEW_CARDS`
   (the Spreadsheet one reads "Blank workbook").
 - A harness instance keeps the sample document as tab 0 (the cases assume it)
   unless the script says `start screen`: the runner writes the marker

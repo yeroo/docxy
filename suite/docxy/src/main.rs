@@ -5337,8 +5337,9 @@ struct Docxy {
     /// shown under the Recent heading until the backstage reopens: the tab
     /// status is hidden behind the backstage, and there may be no tab.
     recent_message: Option<String>,
-    /// A status said while no tab existed (the startup plugin notice, #806):
-    /// the first tab to exist takes it ([`land_status`], each frame).
+    /// The startup plugin notice said while no tab existed (#806): the first
+    /// tab to exist takes it if it still shows its initial status
+    /// ([`land_status`], each frame).
     pending_status: Option<SharedString>,
     /// When the hot-exit state was last written by any `persist`, or an
     /// AutoRecover tick last found nothing to write: the timer's clock. A
@@ -12955,7 +12956,7 @@ mod session_union_tests {
 
     /// #806: a status said with no tab waits for the first one, once.
     #[test]
-    fn a_status_said_with_no_tab_lands_on_the_first_tab() {
+    fn the_startup_notice_lands_on_the_first_tab_unless_the_opener_spoke() {
         let mut pending = Some(SharedString::from("Plugin not loaded: x"));
         land_status(&mut pending, None);
         assert!(pending.is_some(), "no tab yet: kept");
@@ -12966,6 +12967,12 @@ mod session_union_tests {
         let mut later = SharedString::from("saved");
         land_status(&mut pending, Some(&mut later));
         assert_eq!(later.as_ref(), "saved");
+        // A tab with a status of its own keeps it; the notice is spent.
+        let mut pending = Some(SharedString::from("Plugin not loaded: x"));
+        let mut opened = SharedString::from("could not read x.docx");
+        land_status(&mut pending, Some(&mut opened));
+        assert_eq!(opened.as_ref(), "could not read x.docx");
+        assert!(pending.is_none());
     }
 
     /// #806: the window with no tab writes a session with none, and reading it
@@ -14129,10 +14136,14 @@ const NEW_CARDS: [NewCard; 4] = [
     },
 ];
 
-/// Hand `pending` to the tab's status once there is a tab (#806).
+/// Hand `pending` to the first tab's status (#806), once there is one, but
+/// only while that still shows the status it was made with: whatever its
+/// opener said (a read error, a draft, Protected View) wins, and `pending`
+/// is spent either way.
 fn land_status(pending: &mut Option<SharedString>, status: Option<&mut SharedString>) {
     if let Some(status) = status
         && let Some(msg) = pending.take()
+        && (status.is_empty() || status.as_ref() == "new")
     {
         *status = msg;
     }
@@ -14226,7 +14237,12 @@ impl Docxy {
         // A format plugin that did not load (`main` logged each one): the
         // first says so on the status line.
         if let Some(error) = project_formats::global().errors.first() {
-            this.set_status(format!("Plugin not loaded: {error}"));
+            let notice = format!("Plugin not loaded: {error}");
+            if this.tabs.is_empty() {
+                this.pending_status = Some(notice.into());
+            } else {
+                this.set_status(notice);
+            }
         }
         // win_id is 0 until the window registers: the write below behaves
         // exactly like the single-window write this was (no union, base 0).
@@ -15696,10 +15712,8 @@ impl Docxy {
 
     /// Put a message on the active tab's status line.
     fn set_status(&mut self, msg: impl Into<SharedString>) {
-        match self.tabs.get_mut(self.active) {
-            Some(t) => t.status = msg.into(),
-            // No tab (the Start screen): the first one takes it (#806).
-            None => self.pending_status = Some(msg.into()),
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            t.status = msg.into();
         }
     }
 
@@ -23513,14 +23527,18 @@ impl Docxy {
             info_status: self.bs_info_status.take(),
         }
         .after_open_pick(path.as_deref());
-        if let Some(path) = path {
-            self.open_picked(&path, mode);
-        }
+        let failed = path.and_then(|path| self.open_picked(&path, mode));
         self.backstage = page.backstage;
         self.bs_new = page.new;
         self.bs_export = page.export;
         self.bs_info = page.info;
         self.bs_info_status = page.info_status;
+        // A pick that failed with no tab to say so on: File stays up and the
+        // Recent heading says why (#806).
+        if self.tabs.is_empty() {
+            self.backstage = true;
+            self.recent_message = failed;
+        }
         self.persist(cx);
         self.refocus(window, cx);
     }
@@ -23538,11 +23556,13 @@ impl Docxy {
 
     /// Open a path a person picked; a copy that could not be written says
     /// why on the tab that was active.
-    fn open_picked(&mut self, path: &std::path::Path, mode: OpenMode) {
-        if let Err(e) = self.open_path(path, mode, Reopen::Ask) {
-            self.set_status(e);
+    fn open_picked(&mut self, path: &std::path::Path, mode: OpenMode) -> Option<String> {
+        let failed = self.open_path(path, mode, Reopen::Ask).err();
+        if let Some(e) = &failed {
+            self.set_status(e.clone());
         }
         self.drop_grid_state();
+        failed
     }
 
     /// Open `path` in `mode`: the one way every open goes (#610), so the
