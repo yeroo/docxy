@@ -549,14 +549,7 @@ impl RunLook {
         {
             out.italic = i;
         }
-        // An explicit `auto` colour loads as no colour, its element kept in
-        // the shadow. A shadow entry is written back only while it still
-        // matches the model, so only an `auto` one counts with no colour.
-        let explicit_auto = run.shadow.iter().any(|x| {
-            crate::table_props::element_name(x) == "w:color"
-                && crate::table_props::element_attr(x, "w:val")
-                    .is_none_or(|v| v.is_empty() || v == "auto")
-        });
+        let explicit_auto = explicit_auto_color(run);
         if run.color.is_none() && !explicit_auto {
             if let Some(c) = &self.color {
                 out.color = c.clone();
@@ -697,6 +690,18 @@ pub fn parse_table_style(xml: &str) -> TableStyle {
     }
     s.whole = read_part(rpr, tblpr, tcpr);
     s
+}
+
+/// Whether a run's own `w:color` is an explicit `auto`: it loads as no
+/// colour, its element kept in the shadow, and a shadow entry is written
+/// back only while it still matches the model, so only an `auto` one counts
+/// with no colour. Such a run keeps automatic colour over every style.
+pub fn explicit_auto_color(run: &RunProps) -> bool {
+    run.shadow.iter().any(|x| {
+        crate::table_props::element_name(x) == "w:color"
+            && crate::table_props::element_attr(x, "w:val")
+                .is_none_or(|v| v.is_empty() || v == "auto")
+    })
 }
 
 /// The table style `id`, from `styles_xml` (following `w:basedOn`) or the

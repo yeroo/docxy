@@ -2142,8 +2142,8 @@ fn col_width(app: &mut App, args: &Json) -> Result<Json, String> {
         .get("width")
         .and_then(Json::as_f64)
         .ok_or("col.width needs a 'width' number")?;
-    if !(width.is_finite() && width > 0.0) {
-        return Err("col.width: 'width' must be positive".to_string());
+    if !(width.is_finite() && width >= 0.0) {
+        return Err("col.width: 'width' must not be negative".to_string());
     }
     if app.pkg.workbook.sheets[si].is_protected() {
         return Err("col.width: the sheet is protected".into());
@@ -5751,18 +5751,8 @@ mod tests {
     }
 
     #[test]
-    fn col_width_rejects_non_positive_width() {
+    fn col_width_rejects_negative_width() {
         let mut a = app();
-        let err = dispatch(
-            &mut a,
-            "col.width",
-            &Json::obj(vec![
-                ("col", Json::Str("A".into())),
-                ("width", Json::Num(0.0)),
-            ]),
-        )
-        .unwrap_err();
-        assert!(err.contains("positive"), "{err}");
         let err = dispatch(
             &mut a,
             "col.width",
@@ -5772,7 +5762,22 @@ mod tests {
             ]),
         )
         .unwrap_err();
-        assert!(err.contains("positive"), "{err}");
+        assert!(err.contains("must not be negative"), "{err}");
+    }
+
+    #[test]
+    fn col_width_accepts_zero() {
+        let mut a = app();
+        dispatch(
+            &mut a,
+            "col.width",
+            &Json::obj(vec![
+                ("col", Json::Str("A".into())),
+                ("width", Json::Num(0.0)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(a.pkg.workbook.sheets[0].col_width(0), 0.0);
     }
 
     #[test]

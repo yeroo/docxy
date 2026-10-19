@@ -1,0 +1,22 @@
+# Run formatting from table, paragraph and character styles (#1427). The fixture
+# is a header-bold table first, then a Heading 1 paragraph, then a Strong run.
+
+test a table style's bold shows in its header row and Bold off over it stays off
+  open copy:../fixtures/run-styles.docx
+  key ctrl+home
+  assert run.shown_bold is true
+  assert run.bold is false
+  key shift+end
+  key ctrl+b
+  assert run.shown_bold is false
+  key ctrl+b
+  assert run.shown_bold is true
+
+test a paragraph style's and a character style's bold show on runs
+  open copy:../fixtures/run-styles.docx
+  key ctrl+end
+  assert run.shown_bold is true
+  assert run.bold is false
+  key up
+  assert run.shown_bold is true
+  assert run.bold is false

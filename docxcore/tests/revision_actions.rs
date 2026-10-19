@@ -462,7 +462,7 @@ fn preserved_self_closing_hyperlink_rebuilds_as_balanced_xml() {
 }
 
 #[test]
-fn split_toc_hyperlink_preserves_opener_attributes_on_each_segment() {
+fn toc_hyperlink_with_a_tab_keeps_its_opener_attributes_once_920() {
     let xml = format!(
         concat!(
             "<w:document xmlns:w=\"{W_NS}\"><w:body><w:p>",
@@ -476,13 +476,15 @@ fn split_toc_hyperlink_preserves_opener_attributes_on_each_segment() {
     let document = parse(&xml);
     assert_eq!(document.plain_text(), "Intro\t9\n");
     let once = document_to_xml(&document);
-    assert_eq!(once.matches("w:history=\"1\"").count(), 2, "{once}");
-    assert_eq!(once.matches("w:tooltip=\"toc\"").count(), 2, "{once}");
+    assert_eq!(once.matches("w:history=\"1\"").count(), 1, "{once}");
+    assert_eq!(once.matches("w:tooltip=\"toc\"").count(), 1, "{once}");
+    assert_eq!(once.matches("<w:hyperlink").count(), 1, "{once}");
     assert!(once.contains("<w:tab/>"), "{once}");
 
     let twice = document_to_xml(&parse(&once));
-    assert_eq!(twice.matches("w:history=\"1\"").count(), 2, "{twice}");
-    assert_eq!(twice.matches("w:tooltip=\"toc\"").count(), 2, "{twice}");
+    assert_eq!(twice.matches("w:history=\"1\"").count(), 1, "{twice}");
+    assert_eq!(twice.matches("w:tooltip=\"toc\"").count(), 1, "{twice}");
+    assert_eq!(twice.matches("<w:hyperlink").count(), 1, "{twice}");
     assert!(twice.contains("<w:tab/>"), "{twice}");
 }
 

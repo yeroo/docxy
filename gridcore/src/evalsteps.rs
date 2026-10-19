@@ -177,7 +177,7 @@ impl Evaluation {
                 let node = get(&shown, p);
                 formula::to_string_marked(&shown, node)
             }
-            None => (formula::to_string(&shown), None),
+            None => (formula::to_string_display(&shown), None),
         };
         // A finished evaluation is the value itself; a formula has its `=`.
         if path.is_some() && !self.constant {
@@ -848,6 +848,14 @@ mod tests {
     }
 
     #[test]
+    fn a_step_shows_a_value_as_general_rounds_it() {
+        // #816: a reprint keeps every digit of a constant, but the values
+        // Evaluate Formula steps to are shown as the cell shows them.
+        let w = wb(&[("A1", f("0.1+0.2"))]);
+        assert_eq!(steps(&w, "A1"), ["=[0.1+0.2]", "0.3"]);
+    }
+
+    #[test]
     fn a_whole_call_that_binds_names_is_one_step() {
         let w = wb(&[("A1", num(2.0)), ("B1", f("LET(x,A1,x*x)"))]);
         assert_eq!(steps(&w, "B1"), ["=[LET(x,A1,x*x)]", "4"]);
@@ -860,7 +868,7 @@ mod tests {
             panic!("a product")
         };
         let (text, span) = formula::to_string_marked(&e, r);
-        assert_eq!(text, formula::to_string(&e));
+        assert_eq!(text, formula::to_string_display(&e));
         assert_eq!(&text[span.unwrap()], "SUM(C1:C2)");
         let other = formula::parse("1").unwrap();
         assert_eq!(

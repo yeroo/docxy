@@ -1565,7 +1565,7 @@
         },
         "width": {
           "type": "number",
-          "description": "New column width; must be positive."
+          "description": "New column width; must not be negative."
         },
         "sheet": {
           "type": "string",

@@ -983,21 +983,17 @@ fn a_tracked_selection_across_paragraphs_records_link_text_1462() {
     ed.backspace();
     assert_eq!(
         shape(para_at(&ed.doc, 0)),
-        [
-            "link _Toc1 \"\" del \"Intro\"",
-            "deleted \"\\t\"",
-            "link _Toc1 \"\" del \"1\""
-        ],
+        ["link _Toc1 \"\" del \"Intro\\t1\""],
         "{}",
         xml(&ed)
     );
-    assert_eq!(kinds(&ed.doc), [RevisionKind::Delete; 4]);
+    assert_eq!(kinds(&ed.doc), [RevisionKind::Delete; 2]);
     let saved = without_ids(&xml(&ed));
     let del = format!("<w:del w:id=\"\" w:author=\"Ada\" w:date=\"{NOW}\">");
+    // The entry stays one link, its tab recorded inside the same deletion (#920).
     let p0 = format!(
-        "<w:hyperlink w:anchor=\"_Toc1\">{del}<w:r><w:delText xml:space=\"preserve\">Intro</w:delText></w:r></w:del></w:hyperlink>\
-         {del}<w:r><w:tab/></w:r></w:del>\
-         <w:hyperlink w:anchor=\"_Toc1\">{del}<w:r><w:delText xml:space=\"preserve\">1</w:delText></w:r></w:del></w:hyperlink></w:p>"
+        "<w:hyperlink w:anchor=\"_Toc1\">{del}<w:r><w:delText xml:space=\"preserve\">Intro</w:delText></w:r>\
+         <w:r><w:tab/></w:r><w:r><w:delText xml:space=\"preserve\">1</w:delText></w:r></w:del></w:hyperlink></w:p>"
     );
     assert!(saved.contains(&p0), "{saved}");
     assert!(
@@ -1016,11 +1012,7 @@ fn a_tracked_selection_across_paragraphs_records_link_text_1462() {
     );
     assert_eq!(
         shape(para_at(&rejected, 0)),
-        [
-            "link _Toc1 \"Intro\" del \"\"",
-            "tab",
-            "link _Toc1 \"1\" del \"\""
-        ]
+        ["link _Toc1 \"Intro\\t1\" del \"\""]
     );
     assert_eq!(para_at(&rejected, 1).plain_text(), "After");
 
@@ -1048,7 +1040,7 @@ fn a_tracked_link_deletion_saves_and_reloads_1462() {
     select_toc_into_after(&mut ed);
     ed.delete_selection();
     let mut back = reload(&ed);
-    assert_eq!(kinds(&back), [RevisionKind::Delete; 4]);
+    assert_eq!(kinds(&back), [RevisionKind::Delete; 2]);
     assert_eq!(shape(para_at(&back, 0)), shape(para_at(&ed.doc, 0)));
     assert!(back.reject_all_revisions().iter().all(|o| o.is_applied()));
     let rejected = Editor::new(back);
@@ -1056,11 +1048,7 @@ fn a_tracked_link_deletion_saves_and_reloads_1462() {
     assert!(again.revisions().is_empty(), "{}", xml(&rejected));
     assert_eq!(
         shape(para_at(&again, 0)),
-        [
-            "link _Toc1 \"Intro\" del \"\"",
-            "tab",
-            "link _Toc1 \"1\" del \"\""
-        ]
+        ["link _Toc1 \"Intro\\t1\" del \"\""]
     );
     assert_eq!(para_at(&again, 1).plain_text(), "After");
 }

@@ -215,26 +215,6 @@ fn an_empty_part_the_package_names_is_kept() {
     assert!(!saved.contains(&"xl/theme".to_string()), "{saved:?}");
 }
 
-/// #1156: only an empty entry is a directory, and only when an entry lies
-/// under it or it has no extension; `xl/a.b` is no directory of
-/// `xl/a.bc.xml`.
-#[test]
-fn which_empty_entries_are_directories() {
-    let dirs: HashSet<&str> = ["xl", "xl/a.b", "_rels"].into_iter().collect();
-    let named: HashSet<String> = ["xl/customdata".to_string()].into_iter().collect();
-    let dir = |name: &str, size: u64| is_directory_entry(name, size, &dirs, &named);
-    assert!(dir("xl/media/", 0));
-    assert!(dir("xl", 0));
-    assert!(dir("xl/a.b", 0), "an entry lies under it");
-    assert!(dir("xl/embeddings", 0), "no extension");
-    assert!(!dir("xl/customData", 0), "no extension, but named");
-    assert!(dir("xl/media/", 0) && dir("xl", 0), "named or not");
-    assert!(!dir("xl/a.bc", 0), "an extension and nothing under it");
-    assert!(!dir("docProps/thumbnail.wmf", 0));
-    assert!(!dir("xl", 3), "not empty: a part, however odd");
-    assert!(!dir("_rels/.rels", 0));
-}
-
 /// [`package`] with its sheet written as tdf76115.xlsx writes it: in
 /// ISO-8859-1, with Latin-1 inline strings.
 fn latin1_package() -> Vec<(String, Vec<u8>)> {

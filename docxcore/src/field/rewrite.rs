@@ -97,9 +97,27 @@ fn rpr_of(run: &str) -> &str {
         .unwrap_or("")
 }
 
-/// One run holding `text`, formatted with the verbatim `rpr`.
-fn result_run(rpr: &str, text: &str) -> String {
-    let mut s = String::from("<w:r>");
+/// The namespace declarations of run `run`'s start tag, verbatim, so the
+/// rebuilt run keeps the prefixes its `w:rPr` uses (#1397).
+fn xmlns_of(run: &str) -> String {
+    let mut p = XmlParser::new(run);
+    let mut out = String::new();
+    if p.next() == Event::Start {
+        for a in p.attrs().iter().filter(|a| a.name.starts_with("xmlns:")) {
+            out.push_str(&format!(
+                " {}=\"{}\"",
+                a.name,
+                a.value.replace('"', "&quot;")
+            ));
+        }
+    }
+    out
+}
+
+/// One run holding `text`, formatted with the verbatim `rpr` and declaring
+/// `xmlns` (see [`xmlns_of`]).
+fn result_run(xmlns: &str, rpr: &str, text: &str) -> String {
+    let mut s = format!("<w:r{xmlns}>");
     s.push_str(rpr);
     let edge_space = text.starts_with(char::is_whitespace) || text.ends_with(char::is_whitespace);
     s.push_str(if edge_space {
@@ -116,17 +134,18 @@ fn result_run(rpr: &str, text: &str) -> String {
 /// of: one run with `text` and the first run's formatting. `None` when the
 /// region holds anything but plain runs and proofing marks.
 fn new_result(raw: &str, region: &[El<'_>], text: &str) -> Option<String> {
-    let mut rpr = None;
+    let mut first = None;
     for el in region {
         match el.name {
             "w:proofErr" => {}
             "w:r" if plain_result_run(&raw[el.start..el.end]) => {
-                rpr.get_or_insert_with(|| rpr_of(&raw[el.start..el.end]));
+                first.get_or_insert(&raw[el.start..el.end]);
             }
             _ => return None,
         }
     }
-    Some(result_run(rpr.unwrap_or(""), text))
+    let xmlns = first.map(xmlns_of).unwrap_or_default();
+    Some(result_run(&xmlns, first.map_or("", rpr_of), text))
 }
 
 /// Whether `raw` is a `w:fldSimple` element (else a complex field's runs, or a

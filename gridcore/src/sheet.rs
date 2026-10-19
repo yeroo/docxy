@@ -147,6 +147,11 @@ pub struct Cell {
 /// whether it is a dynamic array (`dynamic`), for which save resolves a `cm`.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct CellMeta {
+    /// The shared-string index a plain text cell was loaded from, kept only
+    /// when another entry loads as the same text (a rich and a plain `<si>`
+    /// that differ in edge whitespace): save writes it back while the cell
+    /// still holds that entry's text, instead of the first entry of that text.
+    pub sst: Option<u32>,
     /// Cell-metadata index; written only on an array `<f>`.
     pub cm: Option<String>,
     /// Value-metadata index and the value it was loaded with: it describes
@@ -159,6 +164,15 @@ pub struct CellMeta {
     pub vm_body: Option<String>,
     /// `ph="1"`: show phonetic text.
     pub ph: bool,
+    /// The formula text as loaded, kept only when [`crate::formula::file_formula`]
+    /// would change it by function prefixes alone (a bare post-2007 name: a UDF
+    /// named like a builtin); text it must print again (`A1#`, `@x`, bare
+    /// LET/LAMBDA names) is repaired on save and keeps nothing. A shared
+    /// group's followers (reprints of the master) keep it only when the master
+    /// has no `_xlfn.`/`_xlws.`/`_xlpm.` name.
+    /// Save writes it back while the cell still holds exactly that text; any
+    /// edit or reprint changes the text and the save translates it again.
+    pub loaded_f: Option<String>,
     /// The formula was typed here: set when [`crate::engine::Engine::set_cell`]
     /// gets new formula text (the same text keeps what the formula was), and
     /// carried by copies ([`crate::edit`]'s rebase). Evaluated with spill

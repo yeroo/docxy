@@ -10,7 +10,8 @@
 use crate::sheet::{cell_name, parse_col};
 use crate::xlsx::{
     SheetPackage, add_content_type_override, add_rel, add_workbook_rel, normalise_eol, parse_rels,
-    put_worksheet_child, remove_worksheet_singleton, resolve_relative, worksheet_child_span,
+    put_worksheet_child, remove_worksheet_singleton, resolve_relative, runs_text,
+    worksheet_child_span,
 };
 
 const COMMENTS_CT: &str =
@@ -61,38 +62,39 @@ fn unescape(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
-/// Concatenated, decoded text of every `<t>…</t>` inside `frag`, its line
-/// ends read as LF (XML 1.0 §2.11).
+/// Concatenated text of every `<t>…</t>` inside `frag`, read as Excel reads
+/// it: line ends as LF (XML 1.0 §2.11) and, outside `xml:space="preserve"`,
+/// no edge whitespace (#1188).
+#[cfg(test)]
 fn collect_t(frag: &str) -> String {
-    let mut out = String::new();
-    let mut rest = frag;
-    while let Some(open) = rest.find("<t") {
-        // Skip `<t` that isn't the text element (e.g. `<text>`).
-        let after = &rest[open + 2..];
-        let gt = match after.find('>') {
-            Some(g) => g,
-            None => break,
-        };
-        let is_text_el = after.as_bytes().first() == Some(&b'>')
-            || after.as_bytes().first() == Some(&b' ')
-            || after[..gt].starts_with('/');
-        if !is_text_el {
-            rest = &after[gt..];
+    collect_t_in(frag, false)
+}
+
+/// [`collect_t`] for a fragment inside an element that resolves
+/// `xml:space="preserve"` (`inherited`), which the fragment cannot show.
+fn collect_t_in(frag: &str, inherited: bool) -> String {
+    runs_text(frag, inherited)
+}
+
+/// Whether the part's `<comments>` or `<commentList>` (the nearer) opens with
+/// `xml:space="preserve"`, which every `<comment>` below it inherits.
+fn comments_preserve(xml: &str) -> bool {
+    let mut preserve = false;
+    for name in ["<comments", "<commentList"] {
+        let Some(at) = xml.find(name) else { continue };
+        let rest = &xml[at + name.len()..];
+        if !matches!(
+            rest.chars().next(),
+            Some(' ' | '>' | '/' | '\t' | '\n' | '\r')
+        ) {
             continue;
         }
-        if after[..gt].ends_with('/') {
-            rest = &after[gt + 1..];
-            continue;
+        let tag = &rest[..rest.find('>').unwrap_or(rest.len())];
+        if let Some(v) = attr(tag, "xml:space") {
+            preserve = v == "preserve";
         }
-        let body_start = open + 2 + gt + 1;
-        let close = match rest[body_start..].find("</t>") {
-            Some(c) => body_start + c,
-            None => break,
-        };
-        out.push_str(&unescape(&normalise_eol(&rest[body_start..close])));
-        rest = &rest[close + 4..];
     }
-    out
+    preserve
 }
 
 /// Iterate `<tag …>…</tag>` (or self-closing) elements, yielding each element's
@@ -215,6 +217,7 @@ fn parse_legacy(xml: &str, sheet: usize, out: &mut Vec<Comment>) {
             authors.push(unescape(body));
         });
     }
+    let preserve = comments_preserve(xml);
     for_each_element(xml, "comment", |el| {
         let Some(cell) = attr(el, "ref").and_then(ref_to_rc) else {
             return;
@@ -233,7 +236,7 @@ fn parse_legacy(xml: &str, sheet: usize, out: &mut Vec<Comment>) {
             row: cell.0,
             col: cell.1,
             author,
-            text: collect_t(el),
+            text: collect_t_in(el, preserve),
             threaded: false,
         });
     });
@@ -929,12 +932,142 @@ mod tests {
             Some("B2")
         );
         assert_eq!(
-            collect_t("<text><r><t>Hello</t></r><r><t> world</t></r></text>"),
+            collect_t(
+                "<text><r><t xml:space=\"preserve\">Hello</t></r><r><t xml:space=\"preserve\"> world</t></r></text>"
+            ),
             "Hello world"
         );
         // #761: a note's CR LF or lone CR is a line break, read as LF.
         assert_eq!(collect_t("<text><r><t>a\r\nb\rc</t></r></text>"), "a\nb\nc");
         assert_eq!(ref_to_rc("C3"), Some((2, 2)));
+    }
+
+    /// #1188: a note's `<t>` reads as Excel reads it, as a shared string's
+    /// does (#1153): no edge whitespace outside `xml:space="preserve"`,
+    /// which also resolves from an ancestor; phonetic runs are no text.
+    #[test]
+    fn collect_t_resolves_xml_space() {
+        assert_eq!(
+            collect_t("<text><r><t>Hello </t></r><r><t>world</t></r></text>"),
+            "Helloworld"
+        );
+        assert_eq!(
+            collect_t(
+                "<text><r><t xml:space=\"preserve\">Hello </t></r><r><t>world</t></r></text>"
+            ),
+            "Hello world"
+        );
+        assert_eq!(
+            collect_t("<text xml:space=\"preserve\"><r><t> in </t></r></text>"),
+            " in "
+        );
+        assert_eq!(
+            collect_t("<text><r xml:space=\"preserve\"><t> in </t></r><r><t> out </t></r></text>"),
+            " in out"
+        );
+        assert_eq!(collect_t("<text><t> </t></text>"), "");
+        assert_eq!(
+            collect_t("<text><t>base</t><rPh sb=\"0\" eb=\"1\"><t>ベース</t></rPh></text>"),
+            "base"
+        );
+        assert_eq!(
+            collect_t("<text><t>a &amp; <![CDATA[b&amp;]]></t></text>"),
+            "a & b&amp;"
+        );
+    }
+
+    /// #1188: `xml:space="preserve"` on `<comments>` or `<commentList>` covers
+    /// every note below it, though a note is read on its own.
+    #[test]
+    fn collect_t_in_inherits_preserve_from_the_comment_list() {
+        assert_eq!(collect_t_in("<text><t> lead</t></text>", true), " lead");
+        assert_eq!(collect_t_in("<text><t> lead</t></text>", false), "lead");
+        assert_eq!(
+            collect_t_in("<text><t xml:space=\"default\"> lead</t></text>", true),
+            "lead"
+        );
+        assert!(comments_preserve(
+            "<comments xml:space=\"preserve\"><commentList>"
+        ));
+        assert!(comments_preserve(
+            "<comments><commentList xml:space=\"preserve\">"
+        ));
+        assert!(!comments_preserve(
+            "<comments xml:space=\"preserve\"><commentList xml:space=\"default\">"
+        ));
+        assert!(!comments_preserve("<comments><commentList>"));
+    }
+
+    /// #1188: so a note under such a list keeps its leading space on load and
+    /// after another note's edit.
+    #[test]
+    fn preserved_comment_list_note_survives_another_notes_edit() {
+        let mut pkg = blank();
+        pkg.set_comment(0, 0, 0, "Ann", "AAAA");
+        pkg.set_comment(0, 1, 0, "Bo", "BBBB");
+        let mut pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        for (name, bytes) in pkg.parts.iter_mut() {
+            if name.starts_with("xl/comments") {
+                let xml = String::from_utf8(std::mem::take(bytes)).unwrap();
+                let at = xml.find("AAAA").unwrap();
+                let from = xml[..at].rfind("<text>").unwrap();
+                let to = xml[at..].find("</text>").unwrap() + at + "</text>".len();
+                let xml = format!("{}<text><t> lead</t></text>{}", &xml[..from], &xml[to..])
+                    .replacen("<commentList>", "<commentList xml:space=\"preserve\">", 1);
+                assert!(xml.contains("<commentList xml:space"), "{xml}");
+                *bytes = xml.into_bytes();
+            }
+        }
+        let mut pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let text_at = |p: &SheetPackage, row| {
+            p.comments()
+                .into_iter()
+                .find(|c| c.row == row)
+                .unwrap()
+                .text
+        };
+        assert_eq!(text_at(&pkg, 0), " lead");
+        pkg.set_comment(0, 1, 0, "Bo", "edited");
+        let again = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(text_at(&again, 0), " lead");
+    }
+
+    /// #1188: an untouched note is rewritten from what the loader read, so a
+    /// note whose runs Excel shows as "Helloworld" must not become "Hello
+    /// world" when another note is edited.
+    #[test]
+    fn untouched_note_survives_another_notes_edit() {
+        let mut pkg = blank();
+        pkg.set_comment(0, 0, 0, "Ann", "AAAA");
+        pkg.set_comment(0, 1, 0, "Bo", "BBBB");
+        let mut pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        for (name, bytes) in pkg.parts.iter_mut() {
+            if name.starts_with("xl/comments") {
+                let xml = String::from_utf8(std::mem::take(bytes)).unwrap();
+                let at = xml.find("AAAA").unwrap();
+                let from = xml[..at].rfind("<text>").unwrap();
+                let to = xml[at..].find("</text>").unwrap() + at + "</text>".len();
+                *bytes = format!(
+                    "{}<text><r><t>Hello </t></r><r><t>world</t></r></text>{}",
+                    &xml[..from],
+                    &xml[to..]
+                )
+                .into_bytes();
+            }
+        }
+        let mut pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let text_at = |p: &SheetPackage, row| {
+            p.comments()
+                .into_iter()
+                .find(|c| c.row == row)
+                .unwrap()
+                .text
+        };
+        assert_eq!(text_at(&pkg, 0), "Helloworld");
+        pkg.set_comment(0, 1, 0, "Bo", "edited");
+        let again = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(text_at(&again, 0), "Helloworld");
+        assert_eq!(text_at(&again, 1), "edited");
     }
 
     #[test]

@@ -1084,7 +1084,7 @@ function xlsxyToolDefs() {
             'Column letter (e.g. "C") or 0-based index; the reply echoes the numeric index.',
           ),
         ],
-        ['width', prop('number', 'New column width; must be positive.')],
+        ['width', prop('number', 'New column width; must not be negative.')],
         sheet(),
         target(),
       ]),

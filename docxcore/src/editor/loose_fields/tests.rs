@@ -287,12 +287,8 @@ fn typing_at_a_spanning_fields_edges_lands_outside_it_1240() {
         let (mut ed, e) = toc("", false);
         ed.set_caret(e);
         insert(&mut ed);
-        // (The loader splits a link around its tab.)
-        assert_eq!(
-            kinds(&ed, &[2]),
-            ["link", "tab", "link", "end", kind],
-            "{kind} at e"
-        );
+        // (The entry is one link; its tab stays inside it, #920.)
+        assert_eq!(kinds(&ed, &[2]), ["link", "end", kind], "{kind} at e");
         assert_markers(&ed, 1);
     }
 }
@@ -487,7 +483,16 @@ fn tracked_delete_of_a_spanning_field_keeps_its_markers_1240() {
     ed.backspace();
     assert_markers(&ed, 1);
     let xml = saved(&ed);
+    // Each entry is one link holding its tab (#920), so the link closes
+    // after the page number.
     for text in ["Intro", "1", "Body", "2"] {
+        assert!(
+            xml.contains(&format!(">{text}</w:delText>")),
+            "{text}: {xml}"
+        );
+    }
+    assert_eq!(xml.matches("<w:hyperlink").count(), 2, "{xml}");
+    for text in ["1", "2"] {
         assert!(
             xml.contains(&format!(">{text}</w:delText></w:r></w:del></w:hyperlink>")),
             "{text}: {xml}"
