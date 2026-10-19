@@ -95,7 +95,7 @@
       <Milestone>0</Milestone>
       <Duration>PT16H0M0S</Duration><DurationFormat>7</DurationFormat>
       <Start>2026-03-02T08:00:00</Start><Finish>2026-03-03T17:00:00</Finish>
-      <TotalSlack>4200</TotalSlack><Critical>0</Critical>
+      <TotalSlack>0</TotalSlack><Critical>1</Critical>
       <GUID>0B6F1C20-4D3E-4A51-9C7B-000000000002</GUID>
       <CreateDate>2026-02-27T09:30:00</CreateDate>
       <Active>1</Active>

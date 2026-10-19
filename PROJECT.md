@@ -286,8 +286,12 @@ links, constraints and leveled predecessors drive it to, so a task that only
 follows a delayed predecessor records none, as Project does; in tenths of a
 minute with `LevelingDelayFormat` 8, as Project 2024 stores it) and
 `PreLeveledStart`/`Finish` (its unleveled dates), one undo step, settled so
-the stored delays reproduce the leveled dates exactly. Level All stays the
-display overlay (no `level.all` edit yet). The scheduler honours a
+the stored delays reproduce the leveled dates exactly (a plan that cannot be
+reproduced is refused). A task outside the scope takes no delay of its own
+but still follows its links; an ALAP task is never delayed (Project 2024
+refuses a delay on one); a delayed task's predecessors have the zero slack
+Project shows them. Level All stays the display overlay (no `level.all` edit
+yet). The scheduler honours a
 stored `LevelingDelay` (the task starts that much elapsed time after its
 links and constraints allow, snapped to working time; measured against
 Project 2024 over COM: a delay typed by hand moves Start, and Level All's

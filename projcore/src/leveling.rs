@@ -165,7 +165,8 @@ impl LevelOptions {
 /// What a leveling pass may move: Resource > Level's three commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LevelTarget {
-    /// Level All: every task.
+    /// Level All as an edit: every task. No host or control verb constructs
+    /// it yet (Level All stays the display overlay); the editor's tests do.
     All,
     /// Level Selection: these tasks (a summary stands for its subtasks).
     Selection(Vec<i32>),

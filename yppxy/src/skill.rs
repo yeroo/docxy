@@ -131,8 +131,10 @@ delayed to fit resource capacity, as Resource > Level > Level All),
 `{leveled, overallocated}`. `level.overallocations {}` lists the work resources
 booked past their capacity as shown, each with `peak_units` and the `first`
 overallocated instant, earliest first. Leveling as a plan edit (one undo step
-each): `level.selection {uids}` and `level.resource {resource}` write the
-moved tasks' `LevelingDelay` (reported as `leveling_delay_min`), `level.clear
+each): `level.selection {uids, options?}` and `level.resource {resource,
+options?}` write the moved tasks' own `LevelingDelay` (reported as
+`leveling_delay_min`; `options` is a `level.options` object for that pass
+only), `level.clear
 {uids}` or `{all: true}` removes them, and `level.options {order?,
 within_slack?, adjust_assignments?, split?, clear_first?}` reads or sets
 Project's Leveling Options (`order` ID, Standard or Priority).

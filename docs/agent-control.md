@@ -298,8 +298,9 @@ the first overallocated instant, where Project's Next Overallocation goes.
 Leveling as a plan edit (#1594): `level.selection {uids: [uid…], options?}`
 (Level Selection; a summary stands for its subtasks) and `level.resource
 {resource, options?}` (Level Resource, a uid or a name) run the leveler with
-only those tasks free to move, every other task keeping its dates and still
-booking its resources, and write each moved task's own `LevelingDelay`
+only those tasks free to move, every other task taking no delay of its own
+(an automatic one still follows its links) and still booking its resources,
+and write each moved task's own `LevelingDelay`
 (elapsed minutes from the start its leveled predecessors drive it to, so a
 task that only follows a delayed predecessor records none, as Project does;
 stored in tenths of a minute as Project does) and pre-leveled dates (its

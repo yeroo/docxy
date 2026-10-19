@@ -1559,19 +1559,24 @@ impl<'a> Scheduler<'a> {
             // late-start instant, even in a nonworking gap. So do binding
             // MFO/FNLT/SNLT and SNET/FNET milestones. Later start-type
             // links/constraints still snap.
-            // A stored LevelingDelay (Project's last leveling, or docxy's
-            // own, #1594) holds the task past its driven start by that
-            // elapsed time; the delayed instant snaps like any other.
-            let start_abs = match t.leveling_delay.filter(|d| *d > 0) {
-                Some(tenths) => start_abs.saturating_add(tenths / 10),
-                None => start_abs,
-            };
             let s_abs =
                 if fs_milestone_start == Some(start_abs) || held_milestone == Some(start_abs) {
                     start_abs
                 } else {
                     tl.snap(start_abs)
                 };
+            // A stored LevelingDelay (Project's last leveling, or docxy's
+            // own, #1594) holds the task past its driven start, once that is
+            // on working time, by that elapsed time; the delayed instant
+            // snaps again. An ALAP task carries none: Project 2024 refuses a
+            // delay on one ("You cannot enter a delay value here", measured
+            // over COM), so a stored one is ignored.
+            let s_abs = match t.leveling_delay.filter(|d| *d > 0) {
+                Some(tenths) if !self.schedulable_alap(t) => {
+                    tl.snap(s_abs.saturating_add(tenths / 10))
+                }
+                _ => s_abs,
+            };
             let s_idx = tl.to_index(s_abs);
             // A delayed flat-work assignment finishes past the task's stored
             // Duration: the task finishes with it (issue #469).
@@ -1655,9 +1660,21 @@ impl<'a> Scheduler<'a> {
                     }
                     let suid = edge.uid;
                     let successor = &self.proj.tasks[graph.by_uid[&suid]];
+                    // A successor's stored LevelingDelay (#1594) holds it
+                    // that much past what its links drive, so its
+                    // predecessors are bound that much earlier: Project 2024
+                    // reports zero slack on the FS predecessor of a task
+                    // with a typed delay (measured over COM).
+                    let held_by_delay = successor
+                        .leveling_delay
+                        .filter(|d| {
+                            *d > 0 && !fixed(successor) && !self.schedulable_alap(successor)
+                        })
+                        .map_or(0, |d| d / 10);
                     if let Some((sls, slf)) = edge
                         .fixed
                         .or_else(|| ls_abs.get(&suid).copied().zip(lf_abs.get(&suid).copied()))
+                        .map(|(sls, slf)| (sls - held_by_delay, slf - held_by_delay))
                     {
                         let offset = self.percent_offset(
                             edge.offset,
@@ -3871,9 +3888,26 @@ impl Scheduler<'_> {
         let graph = self.leaf_graph_ordered(scope.ready_order());
         let leaves = &graph.leaves;
         let order = &graph.order;
-        // A task the pass never moves: manual or tracked, or held by the
-        // scope (#1594).
-        let held = |t: &Task| fixed(t) || scope.held(t);
+        // A task the pass never delays: manual or tracked, held by the scope
+        // (#1594), or ALAP (Project 2024 refuses a leveling delay on one).
+        let held = |t: &Task| fixed(t) || scope.held(t) || self.schedulable_alap(t);
+        // A held automatic task that follows a moved task through its links
+        // moves with it, as the committed plan will schedule it, taking no
+        // delay of its own; it is booked where it lands, not at its CPM
+        // dates (#1594 r2). Movable tasks count as moved for this.
+        let mut shifted: std::collections::HashSet<i32> = std::collections::HashSet::new();
+        for &i in order {
+            let t = &self.proj.tasks[i];
+            let follows = graph
+                .incoming
+                .get(&t.uid)
+                .into_iter()
+                .flatten()
+                .any(|p| shifted.contains(&p.uid));
+            if !held(t) || (!fixed(t) && follows) {
+                shifted.insert(t.uid);
+            }
+        }
 
         // Work-resource capacities and per-task assignments. An assignment
         // books its resource from its `Delay` into the task on; its stored
@@ -3904,7 +3938,7 @@ impl Scheduler<'_> {
         // over its own assignment's window only, as it would if placed.
         for &i in order {
             let t = &self.proj.tasks[i];
-            if !held(t) {
+            if !held(t) || shifted.contains(&t.uid) {
                 continue;
             }
             let cpm = base.get(t.uid).expect("leaf scheduled");
@@ -3922,8 +3956,10 @@ impl Scheduler<'_> {
             let t = &self.proj.tasks[i];
             let cpm = base.get(t.uid).expect("leaf scheduled");
             // A manual or tracked task keeps its dates and passes no delay
-            // on; so does a task the scope holds.
-            if held(t) {
+            // on; so does a held task nothing moved ahead of it. A held task
+            // that follows a moved one goes on below: placed where its links
+            // drive it, delayed no further.
+            if held(t) && !shifted.contains(&t.uid) {
                 delay.insert(t.uid, 0);
                 start.insert(t.uid, cpm.early_start);
                 finish.insert(t.uid, cpm.early_finish);
@@ -4006,7 +4042,10 @@ impl Scheduler<'_> {
             // past its CPM late start (its CPM start plus its total slack,
             // which a leveled predecessor's delay has already eaten into)
             // stays at its earliest start, overallocated.
-            if scope.within_slack && placed > cpm_start_idx + cpm.total_slack_min.max(0) {
+            if held(t) {
+                // Follows its moved predecessor and takes no delay of its own.
+                placed = earliest;
+            } else if scope.within_slack && placed > cpm_start_idx + cpm.total_slack_min.max(0) {
                 placed = earliest;
             }
             delay.insert(t.uid, placed - cpm_start_idx);
@@ -9332,6 +9371,91 @@ mod tests {
     fn dates(s: &Schedule, uid: i32) -> (String, String) {
         let r = s.get(uid).unwrap();
         (r.early_start.to_mspdi(), r.early_finish.to_mspdi())
+    }
+
+    /// #1594 r2, measured on Project 2024 over COM: the FS predecessor of a
+    /// task carrying a typed LevelingDelay has zero slack and is critical
+    /// (the delay is no slack of the predecessor's), and so is the delayed
+    /// task; a parallel task keeps the slack to the moved finish.
+    #[test]
+    fn a_delayed_tasks_predecessor_has_no_slack() {
+        let mut b = task(2, "B", 480);
+        b.predecessors.push(fs(1));
+        b.leveling_delay = Some(1440 * 10);
+        b.leveling_delay_format = Some(8);
+        let s = schedule(&march2(vec![task(1, "A", 480), b, task(3, "C", 480)]));
+        let (a, b, c) = (s.get(1).unwrap(), s.get(2).unwrap(), s.get(3).unwrap());
+        assert_eq!(
+            b.early_start,
+            at(4, 8),
+            "Tuesday 08:00 plus one elapsed day"
+        );
+        assert_eq!((a.total_slack_min, a.critical), (0, true));
+        assert_eq!((b.total_slack_min, b.critical), (0, true));
+        assert_eq!((c.total_slack_min, c.critical), (2 * 480, false));
+        assert_eq!(s.project_finish, at(4, 17));
+    }
+
+    /// #1594 r2: an ALAP task takes no leveling delay (Project 2024 refuses
+    /// one, measured over COM): a stored delay is ignored by the schedule
+    /// and the leveler holds the task, delaying the other one.
+    #[test]
+    fn an_alap_task_ignores_a_stored_delay_and_is_not_leveled() {
+        let mut d = task(1, "D", 480);
+        d.constraint = ConstraintType::AsLateAsPossible;
+        let plain = schedule(&march2(vec![d.clone(), task(2, "E", 3 * 480)]));
+        assert_eq!(plain.get(1).unwrap().early_start, at(4, 8), "late start");
+        d.leveling_delay = Some(1440 * 10);
+        let delayed = schedule(&march2(vec![d.clone(), task(2, "E", 3 * 480)]));
+        assert_eq!(delayed.get(1).unwrap().early_start, at(4, 8));
+        // G follows H onto Wednesday, D's late day, on D's resource: D holds.
+        let mut g = task(3, "G", 480);
+        g.predecessors.push(fs(4));
+        let proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![d, task(2, "E", 3 * 480), g, task(4, "H", 2 * 480)],
+            resources: vec![worker(1, "R1", 1.0)],
+            assignments: vec![assign(1, 1, 1, 1.0), assign(2, 3, 1, 1.0)],
+            ..Project::default()
+        };
+        let lv = level(&proj);
+        assert_eq!(lv.start(1), Some(at(4, 8)));
+        assert_eq!(lv.delay_min(1), Some(0));
+        assert_eq!(lv.start(3), Some(at(5, 8)));
+    }
+
+    /// #1594 r2: a held automatic task that follows a moved task through a
+    /// link goes where the link drives it, with no delay of its own and no
+    /// stale booking at its CPM dates: A, B and C on one resource, C after
+    /// B, only B free to move: B takes Tuesday and C Wednesday, as the
+    /// committed plan will schedule them.
+    #[test]
+    fn a_held_follower_moves_with_its_predecessor() {
+        let mut c = task(3, "C", 480);
+        c.predecessors.push(fs(2));
+        let proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![task(1, "A", 480), task(2, "B", 480), c],
+            resources: vec![worker(1, "R1", 1.0)],
+            assignments: vec![
+                assign(1, 1, 1, 1.0),
+                assign(2, 2, 1, 1.0),
+                assign(3, 3, 1, 1.0),
+            ],
+            ..Project::default()
+        };
+        let only_b: std::collections::HashSet<i32> = [2].into_iter().collect();
+        let lv = level_with(
+            &proj,
+            &LevelScope {
+                movable: Some(&only_b),
+                ..LevelScope::default()
+            },
+        );
+        assert_eq!(lv.start(2), Some(at(3, 8)));
+        assert_eq!(lv.delay_min(2), Some(1440));
+        assert_eq!(lv.start(3), Some(at(4, 8)));
+        assert_eq!(lv.delay_min(3), Some(0));
     }
 
     fn march2(tasks: Vec<Task>) -> Project {
