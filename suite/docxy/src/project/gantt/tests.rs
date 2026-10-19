@@ -663,15 +663,21 @@ fn monday_scale(days: i64) -> GanttScale {
 
 #[test]
 fn row_rules_fill_the_body_and_follow_the_scroll_phase() {
-    assert_eq!(row_rules(100., 0.), [27., 55., 83.]);
-    assert_eq!(row_rules(84., 0.), [27., 55., 83.]);
-    assert_eq!(row_rules(83., 0.), [27., 55.]);
-    assert!(row_rules(0., 0.).is_empty());
+    let rules = |body_h: f32, scroll_y: f32| -> Vec<f32> {
+        ruled_rows(body_h, scroll_y)
+            .into_iter()
+            .map(|(_, y)| y)
+            .collect()
+    };
+    assert_eq!(rules(100., 0.), [27., 55., 83.]);
+    assert_eq!(rules(84., 0.), [27., 55., 83.]);
+    assert_eq!(rules(83., 0.), [27., 55.]);
+    assert!(rules(0., 0.).is_empty());
     // A scrolled list moves the rules up by the offset modulo a row, never off the grid.
-    assert_eq!(row_rules(100., 10.), [17., 45., 73.]);
-    assert_eq!(row_rules(100., 10. + ROW_H * 7.), row_rules(100., 10.));
-    assert_eq!(row_rules(100., 27.), [0., 28., 56., 84.]);
-    assert_eq!(row_rules(100., 28.), row_rules(100., 0.));
+    assert_eq!(rules(100., 10.), [17., 45., 73.]);
+    assert_eq!(rules(100., 10. + ROW_H * 7.), rules(100., 10.));
+    assert_eq!(rules(100., 27.), [0., 28., 56., 84.]);
+    assert_eq!(rules(100., 28.), rules(100., 0.));
 }
 
 /// #1575: each rule knows its row, so a gridline's interval lands on every
@@ -696,16 +702,21 @@ fn ruled_rows_carry_their_row_and_tier_lines_follow_the_timescale() {
         days: 60,
         day_w: 22.,
     };
+    // The minor tier at the Days level is the days, each line carrying its
+    // day's index from the scale's origin, so a scroll of 11 px shows the
+    // same lines under the same indexes (#1575 r1).
     assert_eq!(
         tier_lines(scale, 0., 110., true),
-        day_lines(scale, 0., 110.),
-        "the minor tier at the Days level is the days"
+        [(0, 0.), (1, 22.), (2, 44.), (3, 66.), (4, 88.)]
     );
     assert_eq!(
         tier_lines(scale, 11., 110., true),
-        day_lines(scale, 11., 110.)
+        [(1, 11.), (2, 33.), (3, 55.), (4, 77.), (5, 99.)]
     );
-    let weeks = tier_lines(scale, 0., 22. * 21., false);
+    let weeks: Vec<f32> = tier_lines(scale, 0., 22. * 21., false)
+        .into_iter()
+        .map(|(_, x)| x)
+        .collect();
     assert!(
         weeks.len() <= 4 && weeks.windows(2).all(|w| w[1] - w[0] == 22. * 7.),
         "{weeks:?}"
@@ -737,6 +748,15 @@ fn filler_rows_count_the_ruled_space_below_the_last_task() {
         8,
         "scrolling uncovers more empty rows"
     );
+}
+
+/// The default Bottom Tier Column at the Days level: the day lines (#1575).
+fn day_lines(scale: GanttScale, offset: f32, width: f32) -> Vec<f32> {
+    let default = projcore::formatting::gridlines::Line::BottomTierColumn.default_style();
+    bottom_tier_lines(scale, offset, width, &default)
+        .into_iter()
+        .map(|(_, x)| x)
+        .collect()
 }
 
 #[test]

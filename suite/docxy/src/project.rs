@@ -11,6 +11,7 @@ use std::cell::Cell;
 use std::path::Path;
 use std::rc::Rc;
 mod gantt;
+pub(crate) use gantt::instant_x;
 pub(super) use gantt::*;
 mod commands;
 pub(super) use commands::*;
@@ -673,7 +674,6 @@ fn project_region(
     }
 }
 
-/// `body_h` is the last frame's `project-body` height; `None` before the first layout.
 /// The plan's set gridlines for the harness state (#1575).
 fn gridlines_json(grid: &projcore::formatting::Gridlines) -> ctlcore::json::Json {
     let mut text = String::new();
@@ -692,6 +692,7 @@ fn gridlines_json(grid: &projcore::formatting::Gridlines) -> ctlcore::json::Json
     ctlcore::json::Json::parse(&text).unwrap_or(ctlcore::json::Json::Null)
 }
 
+/// `body_h` is the last frame's `project-body` height; `None` before the first layout.
 pub(super) fn project_state(
     v: &ProjectView,
     body_h: Option<f32>,
@@ -748,17 +749,6 @@ pub(super) fn project_state(
             Json::Bool(v.table_total() <= v.table_w),
         ),
         ("gantt_w".into(), Json::Num(f64::from(v.gantt_w))),
-        // The gridlines set away from their default (#1575), in Project's
-        // list order, each `{line, type, color, interval, interval_type,
-        // interval_color}`; `gridlines_set` counts them.
-        (
-            "gridlines".into(),
-            gridlines_json(&v.ed.project().formatting.gridlines),
-        ),
-        (
-            "gridlines_set".into(),
-            Json::Num(v.ed.project().formatting.gridlines.set_lines().count() as f64),
-        ),
         // The gridlines set away from their default (#1575), in Project's
         // list order, each `{line, type, color, interval, interval_type,
         // interval_color}`; `gridlines_set` counts them.

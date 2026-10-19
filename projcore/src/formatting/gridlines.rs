@@ -383,16 +383,6 @@ impl Gridlines {
         )
     }
 
-    /// Only the lines set away from their default, by name.
-    pub fn set_json(&self) -> Json {
-        Json::Obj(
-            self.set
-                .iter()
-                .map(|(l, g)| (l.name().to_string(), g.to_json()))
-                .collect(),
-        )
-    }
-
     /// A `view.gridlines` reply: `null` puts every line back to its default;
     /// an object names lines (Project's names), each `null` (its default) or
     /// an object of the keys [`Gridline::updated`] reads, over the line as
@@ -557,12 +547,12 @@ mod tests {
         .unwrap();
         assert_eq!(g.get(Line::GanttRows).color, None);
         assert_eq!(g.get(Line::GanttRows).line_type, LineType::Dotted);
-        // The JSON out carries every line as drawn; only the set ones in set_json.
+        // The JSON out carries every line as drawn; `set_lines` only the set.
         let all = g.to_json();
         assert_eq!(all.as_object().unwrap().len(), 14);
         assert_eq!(all.get("Bar Rows").unwrap().text("type"), "none");
         assert_eq!(all.get("Sheet Columns").unwrap().text("type"), "solid");
-        assert_eq!(g.set_json().as_object().unwrap().len(), 3);
+        assert_eq!(g.set_lines().count(), 3);
         // A null line is its default; a null reply clears all.
         g.apply(
             &Json::parse(r#"{"Sheet Rows":null}"#).unwrap(),

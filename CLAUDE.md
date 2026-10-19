@@ -832,9 +832,12 @@
   fourteen as drawn.
 - The suite draws from it in `project/gantt.rs`: `body_grid` paints the
   table's Sheet Rows and Sheet Columns, the chart's Gantt Rows, the tier
-  columns (`tier_lines`: bottom = the minor tier, middle and top = the major;
-  a bottom tier left at its default keeps the old rule of no day lines under
-  8 px per day) and the date lines (`date_lines`: Current Date from the
+  columns (`tier_lines`: bottom = the minor tier, middle and top = the major,
+  each line's interval index counted from the scale's origin so the pattern
+  stays put as the chart scrolls; `bottom_tier_lines` follows the bottom
+  tier's unit, so at the Weeks level it draws a line per week where the old
+  chart drew one per day, and a bottom tier left at its default keeps the
+  old rule of no lines under 8 px per day) and the date lines (`date_lines`: Current Date from the
   `CurrentDate` option, Project Start and Finish from the schedule, Status
   Date), each rule through `paint_rule` (`LineType::segments` as quads, an
   interval line's style on every Nth row or column, `gridline_color` falling

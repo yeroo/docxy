@@ -198,10 +198,26 @@ fn geometry_follows_the_scales_own_width() {
 
 #[test]
 fn day_lines_and_shading_thin_out_when_days_get_narrow() {
+    use crate::project::gantt::{bottom_tier_lines, tier_lines};
+    use projcore::formatting::gridlines::Line;
+    let default = Line::BottomTierColumn.default_style();
     let wide = scale_at("2026-03-02", 100, 22.);
-    assert_eq!(day_lines(wide, 0., 100.).len(), 5);
+    assert_eq!(bottom_tier_lines(wide, 0., 100., &default).len(), 5);
     let mid = scale_at("2026-03-02", 100, 6.);
-    assert!(day_lines(mid, 0., 100.).is_empty());
+    assert!(bottom_tier_lines(mid, 0., 100., &default).is_empty());
+    // #1575 r1: at Weeks (12 px per day) the default bottom tier draws the
+    // tier's cells, one line per week where the old chart drew one per day.
+    let weeks = scale_at("2026-03-02", 100, 12.);
+    let weekly = bottom_tier_lines(weeks, 0., 100., &default);
+    assert!(weekly.len() <= 2, "{weekly:?}");
+    assert!(weekly.iter().all(|(_, x)| x % 84. == 0.), "{weekly:?}");
+    // The interval index counts from the scale's origin, not the viewport:
+    // day 1's line is index 1 whether the chart is scrolled 0 or 11 px.
+    let at0 = tier_lines(wide, 0., 110., true);
+    let at11 = tier_lines(wide, 11., 110., true);
+    assert_eq!(at0.iter().find(|(_, x)| *x == 22.), Some(&(1, 22.)));
+    assert_eq!(at11.iter().find(|(_, x)| *x == 11.), Some(&(1, 11.)));
+    assert_eq!(at11[0], (1, 11.), "the first line in view is not index 0");
     let p = untitled_project();
     let cal = p.project_shading_calendar();
     // Saturday and Sunday are one run, not two rectangles, where days are wide enough.

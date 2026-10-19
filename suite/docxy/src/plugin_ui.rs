@@ -1190,10 +1190,8 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
     let shown = ed.display_rows();
     let sched = ed.schedule();
     let reader = projcore::editor::FieldReader::new(ed);
-    // An instant's x in chart pixels, within its day.
-    let x_at = |d: projcore::DateTime| {
-        (d.minutes() - scale.origin_day * 1440) as f32 / 1440.0 * scale.day_w
-    };
+    // An instant's x in chart pixels, within its day: the chart's own rule.
+    let x_at = |d: projcore::DateTime| crate::project::instant_x(scale, 0., d);
     let stamp = |d: projcore::DateTime| {
         let p = d.parts();
         format!(

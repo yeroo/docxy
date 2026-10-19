@@ -352,32 +352,10 @@ pub(crate) fn shaded_runs(
     runs
 }
 
-/// The left edge of each visible day, relative to the chart viewport: what
-/// the Bottom Tier Column draws at the Days level (`tier_lines`, #1575).
-#[cfg(test)]
-pub(crate) fn day_lines(scale: GanttScale, offset: f32, width: f32) -> Vec<f32> {
-    if scale.day_w < MIN_LINE_DAY_W {
-        return Vec::new();
-    }
-    scale
-        .visible(offset, width)
-        .map(|day| day as f32 * scale.day_w - offset)
-        .filter(|x| (0. ..width).contains(x))
-        .collect()
-}
-
-/// The bottom rule of each row in view, in body pixels. `scroll_y` grows downward, so the
-/// rules follow the list's scroll phase whether a row holds a task or not.
-#[cfg(test)]
-pub(crate) fn row_rules(body_h: f32, scroll_y: f32) -> Vec<f32> {
-    ruled_rows(body_h, scroll_y)
-        .into_iter()
-        .map(|(_, y)| y)
-        .collect()
-}
-
-/// [`row_rules`] with each rule's row (0 for the first row of the body), for
-/// a gridline's interval (#1575).
+/// The bottom rule of each row in view, in body pixels, with its row (0 for
+/// the first row of the body) for a gridline's interval (#1575). `scroll_y`
+/// grows downward, so the rules follow the list's scroll phase whether a row
+/// holds a task or not.
 pub(crate) fn ruled_rows(body_h: f32, scroll_y: f32) -> Vec<(usize, f32)> {
     let scroll_y = scroll_y.max(0.);
     ((scroll_y / ROW_H).floor().max(0.) as usize..)
@@ -417,15 +395,39 @@ pub(crate) fn paint_rule(
 /// chart viewport (#1575): the Top, Middle and Bottom Tier Column lines. The
 /// chart's header draws two tiers (`zoom::tiers`), so the top tier is the
 /// major one and the middle tier the same; the bottom tier is the minor.
-pub(crate) fn tier_lines(scale: GanttScale, offset: f32, width: f32, minor: bool) -> Vec<f32> {
+pub(crate) fn tier_lines(
+    scale: GanttScale,
+    offset: f32,
+    width: f32,
+    minor: bool,
+) -> Vec<(usize, f32)> {
     let level = &zoom::LEVELS[zoom::nearest(scale.day_w)];
-    let (major, minor_cells) = zoom::tiers(scale, level, offset, width);
-    let cells = if minor { minor_cells } else { major };
-    cells
+    let unit = if minor { level.minor } else { level.major };
+    // Within the viewport, and never past the scale's last day.
+    zoom::tier(scale, unit, offset, width)
         .into_iter()
-        .map(|c| c.x - offset)
-        .filter(|x| (0. ..width).contains(x))
+        .filter(|c| c.x < scale.width())
+        .map(|c| (zoom::tier_index(scale, unit, c.x), c.x - offset))
+        .filter(|(_, x)| (0. ..width).contains(x))
         .collect()
+}
+
+/// The Bottom Tier Column's lines (#1575): the bottom tier's cells, so a
+/// line per day at the Days level and one per week at Weeks, as Project
+/// draws them. A bottom tier left at its default keeps the rule from before
+/// the model: nothing below [`MIN_LINE_DAY_W`] px per day, where day lines
+/// would be a wash.
+pub(crate) fn bottom_tier_lines(
+    scale: GanttScale,
+    offset: f32,
+    width: f32,
+    style: &Gridline,
+) -> Vec<(usize, f32)> {
+    let default = *style == Line::BottomTierColumn.default_style();
+    if !style.draws() || (default && scale.day_w < MIN_LINE_DAY_W) {
+        return Vec::new();
+    }
+    tier_lines(scale, offset, width, true)
 }
 
 /// The chart x of an instant, within its day, relative to the viewport.
@@ -625,32 +627,23 @@ pub(crate) fn body_grid(view: &ProjectView, pal: Pal) -> impl IntoElement {
                         nonworking_fill(pal),
                     ));
                 }
-                // The tier columns (#1575). A bottom tier left at its default
-                // keeps the rule from before the model: no day lines below
-                // `MIN_LINE_DAY_W` px per day, where they would be a wash.
+                // The tier columns (#1575): each line's interval index counts
+                // from the scale's origin, so the pattern stays put as the
+                // chart scrolls.
                 let bottom = grid.get(Line::BottomTierColumn);
-                let bottom_default = bottom == Line::BottomTierColumn.default_style();
-                if bottom.draws() && !(bottom_default && scale.day_w < MIN_LINE_DAY_W) {
-                    for (k, x) in tier_lines(scale, gantt_x, width, true)
-                        .into_iter()
-                        .enumerate()
-                    {
-                        let (t, c) = bottom.style_at(k);
-                        vline(
-                            window,
-                            chart.origin.x + px(x),
-                            t,
-                            gridline_color(c, day_rule),
-                        );
-                    }
+                for (k, x) in bottom_tier_lines(scale, gantt_x, width, &bottom) {
+                    let (t, c) = bottom.style_at(k);
+                    vline(
+                        window,
+                        chart.origin.x + px(x),
+                        t,
+                        gridline_color(c, day_rule),
+                    );
                 }
                 for line in [Line::MiddleTierColumn, Line::TopTierColumn] {
                     let style = grid.get(line);
                     if style.draws() {
-                        for (k, x) in tier_lines(scale, gantt_x, width, false)
-                            .into_iter()
-                            .enumerate()
-                        {
+                        for (k, x) in tier_lines(scale, gantt_x, width, false) {
                             let (t, c) = style.style_at(k);
                             vline(window, chart.origin.x + px(x), t, gridline_color(c, rule));
                         }
@@ -735,10 +728,20 @@ fn header_cells(
             .child(div().absolute().left(px(c.at - c.x + 2.)).child(c.label))
     };
     let mut cells: Vec<Div> = major.into_iter().map(|c| cell(c, 0., true)).collect();
+    // The Title Horizontal rule is a child of its own: gpui's border colour
+    // is one value for all four sides, so a top border would recolour the
+    // cell's Title Vertical left rule.
     cells.extend(minor.into_iter().map(|c| {
         cell(c, half, false).when(horizontal.line_type != LineType::None, |d| {
-            d.border_t_1()
-                .border_color(gridline_color(horizontal.color, rule))
+            d.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(1.))
+                    .bg(gridline_color(horizontal.color, rule)),
+            )
         })
     }));
     cells
