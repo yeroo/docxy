@@ -527,6 +527,16 @@
   explicit `select` of it (automation) stays. `uiharness/cases/project-summary-row.uit`
   asserts the same layout with and without it (not run on macOS).
 
+## Sheet tab rename (#1365)
+
+- `SheetRename` (`idx`, `text`, `caret`, `sel`) is the inline rename's state,
+  edited through `field_edit` like the Name Box: it opens with the whole name
+  selected, Left/Right/Home/End/Delete/Backspace act at the caret, Ctrl+A/C/X/V
+  copy and paste one line (Ctrl+Alt is text, any other chord types nothing).
+  Enter and the exit path still commit `text`; Escape keeps the old name.
+  `field-read sheet-tab-rename` reports the caret and `[0,len]` selection.
+  Click-to-place and Shift+arrows are not there.
+
 ## Sheet Home ribbon Font / Font Size boxes (#1344)
 
 - The two boxes are text fields: `Docxy::font_box` (`FontBoxEdit`, tied to the
