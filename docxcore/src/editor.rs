@@ -11,6 +11,7 @@
 
 use crate::model::*;
 use crate::review::{RevisionAction, RevisionOutcome};
+use crate::table_styles::RunLook;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -257,16 +258,28 @@ struct PendingFormat {
     /// The toggle's own undo step. Any later step, from whatever edit,
     /// leaves the toggles behind.
     serial: Option<u64>,
-    /// The value each property is toggled to, by [`ToggleProp`]: one slot
-    /// each, however often it is toggled.
+    /// The direct value each toggled property is set to, by [`ToggleProp`]:
+    /// one slot each, however often it is toggled. With a style context
+    /// (`styled`) `false` may mean "inherit the style's" (`Over::Inherit`), "off
+    /// over it" (`Over::Off`) or plain off (`Over::Plain`); `over` says which.
     toggles: [Option<bool>; ToggleProp::ALL.len()],
+    /// Whether a style context decided the toggles (#1427): they were then
+    /// set over what the styles give, so the property's explicit-off
+    /// element is the pending format's to drop.
+    styled: bool,
+    /// What each toggled property's `false` stands for under the styles.
+    over: [Over; ToggleProp::ALL.len()],
 }
 
 impl PendingFormat {
     fn apply(&self, props: &mut RunProps) {
         for prop in ToggleProp::ALL {
             if let Some(value) = self.toggles[prop as usize] {
-                prop.set()(props, value);
+                if self.styled {
+                    prop.set_over_style(props, value, self.over[prop as usize]);
+                } else {
+                    prop.set()(props, value);
+                }
             }
         }
     }
@@ -308,7 +321,161 @@ impl ToggleProp {
             ToggleProp::Strike => RunProps::set_user_strike,
         }
     }
+
+    /// The `w:rPr` child Bold or Italic is written as; the others have no
+    /// explicit-off model.
+    fn local(self) -> Option<&'static str> {
+        match self {
+            ToggleProp::Bold => Some("b"),
+            ToggleProp::Italic => Some("i"),
+            ToggleProp::Underline | ToggleProp::Strike => None,
+        }
+    }
+
+    /// Set the property over the styles: `direct` is its direct value and
+    /// `over` what a `false` one stands for (an explicit `<w:b w:val="0"/>`
+    /// turns a style's bold off). A run that already has both is left as it
+    /// is. A change replaces the loaded primary and its complex-script twin
+    /// together (`w:b` with `w:bCs`: a lone twin would be written back for
+    /// the primary, #1063) and keeps the twin if the run had it: written
+    /// beside the primary when on, as the loader keeps an explicit-off (the
+    /// primary also in `raw_props`, the twin's off in the shadow alone, so a
+    /// later edit regenerates the pair), and as an off twin on plain text.
+    /// Inheriting (`Over::Inherit`) drops the pair, twin and all: the style
+    /// is assumed to supply it.
+    fn set_over_style(self, props: &mut RunProps, direct: bool, over: Over) {
+        let Some(local) = self.local() else {
+            self.set()(props, direct);
+            return;
+        };
+        let (primary, twin) = (format!("w:{local}"), format!("w:{local}Cs"));
+        let raw_is = |r: &String, l: &str| {
+            crate::styles::has_raw_child(std::slice::from_ref(r), l.trim_start_matches("w:"))
+        };
+        let had_off = props.raw_props.iter().any(|r| raw_is(r, &primary));
+        // Plain off over a loaded explicit-off is already what it asks.
+        if self.get()(props) == direct && (had_off == (over == Over::Off) || over == Over::Plain) {
+            return;
+        }
+        self.set()(props, direct);
+        let had_twin = props
+            .shadow
+            .iter()
+            .any(|x| crate::table_props::element_name(x) == twin);
+        props
+            .raw_props
+            .retain(|r| !raw_is(r, &primary) && !raw_is(r, &twin));
+        props.shadow.retain(|x| {
+            let name = crate::table_props::element_name(x);
+            name != primary && name != twin
+        });
+        let off = |name: &str| format!("<{name} w:val=\"0\"/>");
+        match (direct, over) {
+            (true, _) if had_twin => {
+                props.shadow.push(format!("<{primary}/>"));
+                props.shadow.push(format!("<{twin}/>"));
+            }
+            (false, Over::Off) => {
+                props.raw_props.push(off(&primary));
+                props.shadow.push(off(&primary));
+                if had_twin {
+                    props.shadow.push(off(&twin));
+                }
+            }
+            (false, Over::Plain) if had_twin => props.shadow.push(off(&twin)),
+            _ => {}
+        }
+    }
 }
+
+/// What a property's `false` stands for under the styles (#1427).
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Over {
+    /// Off, and the styles give nothing to turn off.
+    #[default]
+    Plain,
+    /// Inherit what the styles give.
+    Inherit,
+    /// Off over a style that turns it on: an explicit `w:val="0"`.
+    Off,
+}
+
+impl Over {
+    /// The direct value and `Over` for `value` shown over styles that give
+    /// the property `under`.
+    fn of(value: bool, under: bool) -> (bool, Over) {
+        match (value, under) {
+            (true, false) => (true, Over::Plain),
+            (true, true) => (false, Over::Inherit),
+            (false, true) => (false, Over::Off),
+            (false, false) => (false, Over::Plain),
+        }
+    }
+}
+
+/// What the styles lay below a paragraph's runs (#1427): the stylesheet, the
+/// run formatting of the table cell around it and its paragraph style.
+struct ShownBase {
+    styles: Arc<EditStyles>,
+    look: Option<RunLook>,
+    pstyle: Option<String>,
+}
+
+impl ShownBase {
+    /// `run` as drawn: its direct formatting over the styles.
+    fn shown(&self, run: &RunProps) -> RunProps {
+        self.styles.sheet.shown_run(
+            self.look.as_ref(),
+            self.pstyle.as_deref(),
+            run.style_id.as_deref(),
+            run,
+        )
+    }
+
+    /// What the styles alone give `run` (its character style included):
+    /// bold and italic.
+    fn base_of(&self, run: &RunProps) -> (bool, bool) {
+        let s = self.shown(&RunProps {
+            style_id: run.style_id.clone(),
+            ..Default::default()
+        });
+        (s.bold, s.italic)
+    }
+
+    fn base(&self, prop: ToggleProp, run: &RunProps) -> bool {
+        let (bold, italic) = self.base_of(run);
+        match prop {
+            ToggleProp::Bold => bold,
+            _ => italic,
+        }
+    }
+}
+
+/// The styles part an editor shows runs over (#1427): its text, for the
+/// table styles, and the parsed sheet.
+struct EditStyles {
+    xml: Arc<str>,
+    sheet: crate::styles::StyleSheet,
+    /// Table styles looked up so far, by id (`None`: no such style).
+    tables: std::sync::Mutex<
+        std::collections::HashMap<String, Option<crate::table_styles::TableStyle>>,
+    >,
+}
+
+impl EditStyles {
+    fn table_style(&self, id: &str) -> Option<crate::table_styles::TableStyle> {
+        self.tables
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(id.to_string())
+            .or_insert_with(|| crate::table_styles::lookup_style(Some(&self.xml), id))
+            .clone()
+    }
+}
+
+/// The resolved looks of the tables one edit has met, by table path, so a
+/// selection over many cells resolves each table once.
+type LookMemo = std::collections::HashMap<Vec<usize>, Vec<Vec<crate::table_styles::CellLook>>>;
 
 /// An undo step's name. Typing is named by its text as it coalesces; a host
 /// names a command's steps with [`Editor::name_command`]; anything else
@@ -469,6 +636,8 @@ pub struct DocSettings {
 /// An editing session over a [`Document`].
 pub struct Editor {
     pub doc: Document,
+    /// The styles part runs are shown over (#1427); not undo state.
+    styles: Option<Arc<EditStyles>>,
     pub caret: Caret,
     /// Selection anchor (the fixed end); the moving end is the caret.
     pub anchor: Option<Caret>,
@@ -572,6 +741,7 @@ impl Editor {
         let path = first_paragraph_path(&doc.body).unwrap_or_else(|| vec![0]);
         let bound_seen = bound_controls(&doc.body);
         Editor {
+            styles: None,
             bound_seen,
             sync_step: None,
             doc,
@@ -601,6 +771,7 @@ impl Editor {
     /// typing run go on as if nothing happened.
     pub fn preview_copy(&self) -> Editor {
         Editor {
+            styles: self.styles.clone(),
             doc: self.doc.clone(),
             caret: self.caret.clone(),
             anchor: self.anchor.clone(),
@@ -2913,29 +3084,61 @@ impl Editor {
             }
             return;
         }
+        // With a styles context, Bold and Italic are read and written over
+        // what the table, paragraph and character styles give each run
+        // (#1427); without one, over the direct formatting alone.
+        let mut memo = LookMemo::new();
+        let bases: Vec<Option<ShownBase>> = spans
+            .iter()
+            .map(|(path, _, _)| prop.local().and_then(|_| self.shown_base(path, &mut memo)))
+            .collect();
         self.checkpoint(EditKind::Structural);
         let mut all = true;
-        for (path, s, e) in &spans {
+        for ((path, s, e), base) in spans.iter().zip(&bases) {
             if let Some(p) = resolve_para(&self.doc.body, path) {
-                if !range_all_have(&p.content, *s, *e, get) {
+                let have = match base {
+                    Some(b) => range_all_have(&p.content, *s, *e, |r| get(&b.shown(r))),
+                    None => range_all_have(&p.content, *s, *e, get),
+                };
+                if !have {
                     all = false;
                     break;
                 }
             }
         }
         let value = !all;
-        for (path, s, e) in &spans {
+        for ((path, s, e), base) in spans.iter().zip(&bases) {
             if let Some(p) = para_mut(&mut self.doc.body, path) {
-                set_prop_range(&mut p.content, *s, *e, set, value);
+                match base {
+                    Some(b) => map_prop_range(&mut p.content, *s, *e, &|props| {
+                        let (direct, over) = Over::of(value, b.base(prop, props));
+                        prop.set_over_style(props, direct, over);
+                    }),
+                    None => set_prop_range(&mut p.content, *s, *e, set, value),
+                }
             }
         }
         self.doc.initialize_revision_targets();
     }
 
     fn toggle_at_caret(&mut self, prop: ToggleProp) {
-        let value = !prop.get()(&self.caret_props());
-        let mut toggles = self.pending_format().map(|p| p.toggles).unwrap_or_default();
-        toggles[prop as usize] = Some(value);
+        let base = prop
+            .local()
+            .and_then(|_| self.shown_base(&self.caret.path, &mut LookMemo::new()));
+        let (value, under) = match &base {
+            Some(b) => (
+                !prop.get()(&b.shown(&self.caret_props())),
+                b.base(prop, &self.text_props_at_caret()),
+            ),
+            None => (!prop.get()(&self.caret_props()), false),
+        };
+        let pending_now = self.pending_format();
+        let mut toggles = pending_now.map(|p| p.toggles).unwrap_or_default();
+        let mut over = pending_now.map(|p| p.over).unwrap_or_default();
+        let (direct, kind) = Over::of(value, under);
+        toggles[prop as usize] = Some(direct);
+        over[prop as usize] = kind;
+        let styled = base.is_some() || pending_now.is_some_and(|p| p.styled);
         let after_object = self.typing_after_object().is_some();
         // The step holds the state before the toggle, pending format and all.
         self.checkpoint(EditKind::Structural);
@@ -2951,6 +3154,8 @@ impl Editor {
             caret: self.caret.clone(),
             serial: self.undo_serial(),
             toggles,
+            styled,
+            over,
         };
         // Toggles that cancel out (Bold twice) leave nothing to apply, so
         // the text typed next joins the run it is typed in.
@@ -2958,6 +3163,63 @@ impl Editor {
         let mut toggled = base.clone();
         pending.apply(&mut toggled);
         self.pending = (toggled != base).then_some(pending);
+    }
+
+    /// Give the editor the document's `word/styles.xml` (or `None`), so
+    /// Bold and Italic read and write over the styles' bold and italic: a
+    /// toggle off in a text the table, paragraph or character style makes
+    /// bold writes `<w:b w:val="0"/>` as Word does (#1427). Not undo state
+    /// and never cloned into a snapshot. The same text again keeps the
+    /// parsed sheet.
+    pub fn set_styles_xml(&mut self, xml: Option<Arc<str>>) {
+        match (&self.styles, xml) {
+            (Some(s), Some(x)) if Arc::ptr_eq(&s.xml, &x) || *s.xml == *x => {}
+            (_, Some(x)) => {
+                let sheet = crate::styles::parse_styles_xml(&x);
+                self.styles = Some(Arc::new(EditStyles {
+                    xml: x,
+                    sheet,
+                    tables: Default::default(),
+                }));
+            }
+            (_, None) => self.styles = None,
+        }
+    }
+
+    /// What the styles lay below the runs of the paragraph `path` names; `None`
+    /// without a styles context.
+    fn shown_base(&self, path: &[usize], memo: &mut LookMemo) -> Option<ShownBase> {
+        let styles = self.styles.clone()?;
+        let para = resolve_para(&self.doc.body, path)?;
+        // The innermost table around the paragraph decides the look.
+        let look = tables::table_steps(&self.doc.body, path)
+            .last()
+            .and_then(|pos| {
+                let table = tables::table_at(&self.doc.body, &pos.table)?;
+                let looks = memo.entry(pos.table.clone()).or_insert_with(|| {
+                    let style = crate::table::table_props(table)
+                        .attr("w:tblStyle", "w:val")
+                        .and_then(|id| styles.table_style(&id));
+                    crate::table_styles::resolve(table, style.as_ref())
+                });
+                looks.get(pos.row)?.get(pos.cell).map(|c| c.run.clone())
+            });
+        Some(ShownBase {
+            styles,
+            look,
+            pstyle: para.props.style_id.clone(),
+        })
+    }
+
+    /// [`Editor::caret_props`] as drawn: over the styles' bold and italic
+    /// when the editor has a styles context (#1427), for the ribbon's
+    /// on-states; the same as `caret_props` without one.
+    pub fn caret_props_shown(&self) -> RunProps {
+        let props = self.caret_props();
+        match self.shown_base(&self.caret.path, &mut LookMemo::new()) {
+            Some(b) => b.shown(&props),
+            None => props,
+        }
     }
 
     // ---- find / replace ----
@@ -5029,7 +5291,7 @@ fn range_all_have(
     content: &[Inline],
     start: usize,
     end: usize,
-    get: fn(&RunProps) -> bool,
+    get: impl Fn(&RunProps) -> bool + Copy,
 ) -> bool {
     let (mut pos, mut saw) = (0, false);
     range_all_have_at(content, start, end, get, &mut pos, &mut saw) && saw
@@ -5041,7 +5303,7 @@ fn range_all_have_at(
     content: &[Inline],
     start: usize,
     end: usize,
-    get: fn(&RunProps) -> bool,
+    get: impl Fn(&RunProps) -> bool + Copy,
     pos: &mut usize,
     saw: &mut bool,
 ) -> bool {

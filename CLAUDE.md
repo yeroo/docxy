@@ -910,3 +910,38 @@
 - Out of scope: anchored pictures, `a:srcRect` cropping, rotation, alt text,
   the flow view's non-inline cases, PDF export, wasm hosts. The harness reports
   no pictures, so there is no `.uit` case.
+
+## Run styles (#1427)
+
+- The suite draws a run through `run_look::RunStyler` (sheet, the cell's table
+  `RunLook`, the paragraph's style), i.e. `StyleSheet::shown_run`: table style <
+  paragraph style (basedOn) < character style (basedOn) < direct, for bold,
+  italic, underline, strike, colour, size and font family. It starts from
+  nothing: `docDefaults` and the default paragraph style (Normal) are NOT
+  applied, except to a paragraph whose `pStyle` names Normal; the paragraph
+  chain stops before Normal when reached through `basedOn` (a visible change to every document, left for its own issue). A
+  direct explicit-off (`<w:b w:val="0"/>`, in `raw_props`) beats every style;
+  the character style beats the paragraph style outright (Word's toggle XOR
+  between them is not modelled). `emit_words` and `Measurer::width_in` use the
+  run's font family and `run_look::run_size_px` (a style's or direct `w:sz`,
+  scaled by zoom), so tab positions match what is drawn; an unavailable
+  family falls back in gpui (`resolve_font`).
+- `DocTab::run_styles` (`run_look::Cache`) parses `word/styles.xml` once per
+  change of the part (a moved `Package::parts_stamp` with other part text does
+  not reparse). `Docxy::render` hands the same text to the body and open
+  header/footer editor with `Editor::set_styles_xml`.
+- With a styles context, Bold/Italic read and write over the styles
+  (`Editor::toggle_run_prop`, per run): off over a style that makes the text
+  bold writes `<w:b w:val="0"/>` (also at a caret, via `PendingFormat`'s
+  `over`: `Over::Off`), on again drops it and inherits. Without a context (terminal
+  `docxy`, wasm hosts) toggles are unchanged. `Editor::caret_props_shown` is
+  the ribbon on-state; the harness `run` reports `shown_bold`/`shown_italic`.
+  Twins: turning on writes `w:b` with `w:bCs` when the run had the twin; off
+  over a style keeps the twin's `w:val="0"` in the shadow only (the primary's
+  also in `raw_props`, as the loader keeps it); inheriting drops both. The
+  sheet has no complex-script model, so off then on under a style with `w:b`
+  but no `w:bCs` drops the run's direct `w:bCs` (known gap).
+  Out of scope: underline/strike explicit-off, caps/highlight/spacing from
+  styles, table style size/font, `block_height_est` for styled sizes.
+  `uiharness/cases/doc-run-styles.uit` was written without being run (macOS
+  cannot drive the window).

@@ -93,6 +93,7 @@ mod ribbon_export;
 mod ribbon_fit;
 mod ribbon_layout;
 mod rich_clip;
+mod run_look;
 #[cfg(test)]
 mod save_preserve_tests;
 #[cfg(test)]
@@ -4931,6 +4932,8 @@ struct DocTab {
     pkg: Option<Package>,
     /// The pictures read from `pkg` for drawing, until its parts change.
     pictures: std::cell::RefCell<pictures::Cache>,
+    /// The package's parsed styles, kept across frames (#1427).
+    run_styles: std::cell::RefCell<run_look::Cache>,
     /// Footnotes / endnotes parsed from the package (display-only side panel).
     notes: Vec<docxcore::notes::Note>,
     /// This tab is Markdown-backed (opened from a `.md`); Save writes Markdown.
@@ -4984,6 +4987,19 @@ struct DocTab {
 }
 
 impl DocTab {
+    /// Hand the body and the open header/footer editor the package's styles
+    /// part, so Bold and Italic toggle over what the table, paragraph and
+    /// character styles give (#1427). Free while the part is unchanged.
+    fn sync_editor_styles(&mut self) {
+        let xml = self.run_styles.borrow_mut().current(self.pkg.as_ref()).0;
+        if let Surface::Doc(ed) = &mut self.surface {
+            ed.set_styles_xml(xml.clone());
+        }
+        if let Some(hf) = self.hf_edit.as_mut() {
+            hf.editor.set_styles_xml(xml);
+        }
+    }
+
     /// What the tab strip shows for this tab: its file name, then Excel's
     /// `[Protected View]`, `[Repaired]` or `[Read-Only]` (#610), or Word's
     /// `[Compatibility Mode]` (#634). `title` itself stays the plain name,
@@ -7773,6 +7789,9 @@ struct RenderCtx<'a> {
 /// style parsed once per frame, and whether borderless edges show gridlines.
 struct TableCtx<'a> {
     styles_xml: Option<&'a str>,
+    /// The package's styles parsed, for the runs' paragraph and character
+    /// styles (#1427).
+    sheet: Option<std::rc::Rc<docxcore::styles::StyleSheet>>,
     cache: std::cell::RefCell<
         std::collections::HashMap<String, Option<docxcore::table_styles::TableStyle>>,
     >,
@@ -7783,8 +7802,13 @@ struct TableCtx<'a> {
 }
 
 impl<'a> TableCtx<'a> {
-    fn new(pkg: Option<&'a Package>, gridlines: bool) -> Self {
+    fn new(
+        pkg: Option<&'a Package>,
+        sheet: Option<std::rc::Rc<docxcore::styles::StyleSheet>>,
+        gridlines: bool,
+    ) -> Self {
         TableCtx {
+            sheet,
             styles_xml: pkg
                 .and_then(|p| p.part("word/styles.xml"))
                 .and_then(|b| std::str::from_utf8(b).ok()),
@@ -8099,6 +8123,7 @@ fn blank_docx_tab(title: &str) -> DocTab {
         comments_removed_all: false,
         used_comment_ids: Default::default(),
         pictures: Default::default(),
+        run_styles: Default::default(),
         pkg: None,
         notes: vec![],
         markdown: false,
@@ -8175,6 +8200,7 @@ impl Loaded {
             comments_removed_all: false,
             used_comment_ids: Default::default(),
             pictures: Default::default(),
+            run_styles: Default::default(),
             mail: mailings_tab::MailState::from_pkg(self.pkg.as_ref()),
             field_codes: false,
             pkg: self.pkg,
@@ -8655,6 +8681,7 @@ fn sheet_tab_from_path(path: &PathBuf, repair: bool) -> DocTab {
         comments_removed_all: false,
         used_comment_ids: Default::default(),
         pictures: Default::default(),
+        run_styles: Default::default(),
         pkg: None,
         notes: vec![],
         markdown: false,
@@ -12806,6 +12833,7 @@ fn restore_tab_content(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 comments_removed_all: false,
                 used_comment_ids: Default::default(),
                 pictures: Default::default(),
+                run_styles: Default::default(),
                 pkg: None,
                 notes: vec![],
                 markdown: false,
@@ -12853,6 +12881,7 @@ fn restore_tab_content(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 comments_removed_all: false,
                 used_comment_ids: Default::default(),
                 pictures: Default::default(),
+                run_styles: Default::default(),
                 mail: mailings_tab::MailState::from_pkg(pkg.as_ref()),
                 field_codes: false,
                 import: Default::default(),
@@ -14311,6 +14340,7 @@ impl Docxy {
             comments_removed_all: false,
             used_comment_ids: Default::default(),
             pictures: Default::default(),
+            run_styles: Default::default(),
             pkg: None,
             notes: vec![],
             markdown: false,
@@ -22899,6 +22929,8 @@ impl Docxy {
             return self.refocus(window, cx);
         }
         if let Some(tab) = self.tabs.get_mut(self.active) {
+            // Bold and Italic read the package's styles (#1427).
+            tab.sync_editor_styles();
             // Route to the header/footer editor while it's open, else the body.
             // A host edit never grows the typing (or deleting) run before it:
             // it is a step of its own, which also makes a Repeat record of
@@ -25085,6 +25117,11 @@ impl Docxy {
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Ctrl+B / Ctrl+I read the package's styles (#1427), also before the
+        // first frame has handed them over.
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.sync_editor_styles();
+        }
         if self.modal_takes_key(ev, window, cx) {
             return;
         }
@@ -26935,6 +26972,7 @@ mod sheet_save_tests {
             comments_removed_all: false,
             used_comment_ids: Default::default(),
             pictures: Default::default(),
+            run_styles: Default::default(),
             pkg: None,
             notes: vec![],
             markdown: true,
@@ -30617,10 +30655,26 @@ impl Measurer {
     /// Rendered pixel width of `text` at `size` px in the base font (bold/italic
     /// applied), matching how `emit_words` shapes it.
     fn width(&self, text: &str, size: f32, bold: bool, italic: bool) -> f32 {
+        self.width_in(text, size, bold, italic, None)
+    }
+
+    /// [`Measurer::width`] in the font family `family` (a run's `w:rFonts`,
+    /// #1427); an unavailable one falls back as drawing does.
+    fn width_in(
+        &self,
+        text: &str,
+        size: f32,
+        bold: bool,
+        italic: bool,
+        family: Option<&str>,
+    ) -> f32 {
         if text.is_empty() {
             return 0.0;
         }
         let mut font = self.base.clone();
+        if let Some(family) = family {
+            font.family = SharedString::from(family.to_string());
+        }
         if bold {
             font.weight = FontWeight::BOLD;
         }
@@ -30652,6 +30706,7 @@ fn emit_words(
     click: Option<Click>,
     seg_start: usize,
     pal: Pal,
+    zoom: f32,
 ) {
     let mut off = seg_start;
     for word in text.split_inclusive(' ') {
@@ -30660,10 +30715,7 @@ fn emit_words(
         }
         let word_off = off;
         off += word.chars().count();
-        let mut size = props
-            .size_half_pts
-            .map(|h| h as f32 / 2.0 * 1.333)
-            .unwrap_or(base);
+        let mut size = run_look::run_size_px(props, base, zoom);
         // Superscript / subscript render ~0.7× and are nudged up/down.
         let vshift = match props.vert_align {
             VertAlign::Superscript => {
@@ -30704,6 +30756,7 @@ fn emit_words(
                 .child(styled)
                 .text_size(px(size))
                 .text_color(color)
+                .when_some(props.font.clone(), |d, family| d.font_family(family))
                 .when(props.bold, |d| d.font_weight(FontWeight::BOLD))
                 .when(props.italic, |d| d.italic())
                 .when(props.underline || is_link, |d| d.underline())
@@ -30788,6 +30841,7 @@ fn emit_run(
     click: Option<Click>,
     pal: Pal,
     caret_h: f32,
+    zoom: f32,
 ) {
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
@@ -30828,6 +30882,7 @@ fn emit_run(
             click,
             start + a,
             pal,
+            zoom,
         );
     }
     if *caret == Some(end) {
@@ -31103,13 +31158,14 @@ fn hf_els(
     pal: Pal,
     meas: &Measurer,
     hf_width: f32,
+    sheet: Option<&docxcore::styles::StyleSheet>,
     pics: Option<pictures::Scope>,
 ) -> Vec<AnyElement> {
     docxcore::frame::split_framed(blocks)
         .0
         .into_iter()
         .filter_map(|(_, b)| match b {
-            Block::Paragraph(p) => Some(hf_para_el(p, pal, meas, hf_width, 1.0, pics)),
+            Block::Paragraph(p) => Some(hf_para_el(p, pal, meas, hf_width, 1.0, sheet, pics)),
             _ => None,
         })
         .collect()
@@ -31166,15 +31222,25 @@ mod field_shown_tests {
 /// A frame group's content width in twips, measured as `hf_para_el` draws
 /// it at `zoom` (1 px = 15 / zoom twips), for a frame with no `w` (Word sizes
 /// it to its content): the widest paragraph, plus a space of slack.
-fn frame_content_w(g: &docxcore::frame::FrameGroup, meas: &Measurer, zoom: f32) -> i32 {
+fn frame_content_w(
+    g: &docxcore::frame::FrameGroup,
+    meas: &Measurer,
+    zoom: f32,
+    sheet: Option<&docxcore::styles::StyleSheet>,
+) -> i32 {
     if g.frame.w.is_some_and(|w| w > 0) {
         return 0; // frame_rect takes `w`.
     }
     let para_w = |p: &Paragraph| -> f32 {
         let base = para_base(p, zoom);
+        let styler = run_look::RunStyler {
+            sheet,
+            ..Default::default()
+        }
+        .for_paragraph(p.props.style_id.as_deref());
         let items: f32 = flat_inlines(&p.content)
             .iter()
-            .map(|(i, _)| inline_width(i, base, zoom, meas, None, false))
+            .map(|(i, _)| inline_width(i, base, zoom, meas, styler, false))
             .sum();
         items + meas.width(" ", base, false, false)
     };
@@ -31280,17 +31346,14 @@ fn inline_width(
     base: f32,
     zoom: f32,
     m: &Measurer,
-    cell_run: Option<&docxcore::table_styles::RunLook>,
+    styler: run_look::RunStyler,
     field_codes: bool,
 ) -> f32 {
     match it {
         Inline::Run(r) => {
-            let props = shown_in(cell_run, r);
-            let sz = props
-                .size_half_pts
-                .map(|h| h as f32 / 2.0 * 1.333)
-                .unwrap_or(base);
-            m.width(&r.text, sz, props.bold, props.italic)
+            let props = styler.shown(r);
+            let sz = run_look::run_size_px(&props, base, zoom);
+            m.width_in(&r.text, sz, props.bold, props.italic, props.font.as_deref())
         }
         // Its shown text ([`field_shown`]) and its 2 px padding each side.
         Inline::Field { raw, text } => {
@@ -31316,6 +31379,7 @@ fn hf_para_el(
     meas: &Measurer,
     width: f32,
     zoom: f32,
+    sheet: Option<&docxcore::styles::StyleSheet>,
     pics: Option<pictures::Scope>,
 ) -> AnyElement {
     paragraph_el(
@@ -31335,7 +31399,10 @@ fn hf_para_el(
         // Header/footer text is never line-numbered (#746).
         None,
         None,
-        None,
+        run_look::RunStyler {
+            sheet,
+            ..Default::default()
+        },
         pics,
     )
 }
@@ -31508,7 +31575,8 @@ fn emit_revision_text(
     content: &[Inline],
     base: f32,
     pal: Pal,
-    cell_run: Option<&docxcore::table_styles::RunLook>,
+    styler: run_look::RunStyler,
+    zoom: f32,
 ) {
     for inline in content {
         match inline {
@@ -31519,7 +31587,7 @@ fn emit_revision_text(
                 emit_run(
                     out,
                     &r.text,
-                    &shown_in(cell_run, r),
+                    &styler.shown(r),
                     base,
                     false,
                     &mut idx,
@@ -31528,6 +31596,7 @@ fn emit_revision_text(
                     None,
                     pal,
                     19.0,
+                    zoom,
                 );
             }
             Inline::Hyperlink(h) => {
@@ -31536,7 +31605,7 @@ fn emit_revision_text(
                     emit_run(
                         out,
                         &r.text,
-                        &shown_in(cell_run, r),
+                        &styler.shown(r),
                         base,
                         true,
                         &mut idx,
@@ -31545,26 +31614,16 @@ fn emit_revision_text(
                         None,
                         pal,
                         19.0,
+                        zoom,
                     );
                 }
-                emit_revision_text(out, &h.content, base, pal, cell_run);
+                emit_revision_text(out, &h.content, base, pal, styler, zoom);
             }
             Inline::Revision { content, .. } => {
-                emit_revision_text(out, content, base, pal, cell_run)
+                emit_revision_text(out, content, base, pal, styler, zoom)
             }
             _ => {}
         }
-    }
-}
-
-/// A run's formatting as drawn: in a table cell, over its style's (#765).
-fn shown_in<'r>(
-    cell_run: Option<&docxcore::table_styles::RunLook>,
-    r: &'r docxcore::model::Run,
-) -> Cow<'r, RunProps> {
-    match cell_run {
-        Some(look) => Cow::Owned(look.under(&r.props)),
-        None => Cow::Borrowed(&r.props),
     }
 }
 
@@ -31680,10 +31739,11 @@ fn paragraph_el(
     field_codes: bool,
     lines: Option<LineSlot>,
     overlay: Option<AnyElement>,
-    cell_run: Option<&docxcore::table_styles::RunLook>,
+    styler: run_look::RunStyler,
     pics: Option<pictures::Scope>,
 ) -> AnyElement {
     use docxcore::model::TabAlign;
+    let styler = styler.for_paragraph(p.props.style_id.as_deref());
     let base = para_base(p, zoom);
     let is_heading = p.props.heading_level.is_some();
     let mut spans: Vec<AnyElement> = Vec::new();
@@ -31737,12 +31797,9 @@ fn paragraph_el(
     let run_w = |r: &docxcore::model::Run| -> f32 {
         match m {
             Some(m) => {
-                let props = shown_in(cell_run, r);
-                let sz = props
-                    .size_half_pts
-                    .map(|h| h as f32 / 2.0 * 1.333)
-                    .unwrap_or(base);
-                m.width(&r.text, sz, props.bold, props.italic)
+                let props = styler.shown(r);
+                let sz = run_look::run_size_px(&props, base, zoom);
+                m.width_in(&r.text, sz, props.bold, props.italic, props.font.as_deref())
             }
             None => 0.0,
         }
@@ -31752,7 +31809,7 @@ fn paragraph_el(
     // other inlines with no measurable text contribute 0.
     let inline_w = |it: &Inline| -> f32 {
         m.map_or(0.0, |m| {
-            inline_width(it, base, zoom, m, cell_run, field_codes)
+            inline_width(it, base, zoom, m, styler, field_codes)
         })
     };
     // Total width of content from index `from` up to the next tab, alignment
@@ -31806,7 +31863,7 @@ fn paragraph_el(
                 emit_run(
                     &mut spans,
                     &r.text,
-                    &shown_in(cell_run, r),
+                    &styler.shown(r),
                     base,
                     in_link,
                     &mut idx,
@@ -31815,6 +31872,7 @@ fn paragraph_el(
                     click,
                     pal,
                     caret_h,
+                    zoom,
                 );
                 x += run_w(r);
             }
@@ -31844,7 +31902,7 @@ fn paragraph_el(
                 // A tracked change is shown, not edited here: its text takes no
                 // caret offsets (the engine counts it as none), and carries the
                 // underline / strike cue the loader gave its runs.
-                emit_revision_text(&mut spans, content, base, pal, cell_run);
+                emit_revision_text(&mut spans, content, base, pal, styler, zoom);
             }
             Inline::Raw(xml) => {
                 // An alignment tab (#768) places the text after it against the
@@ -32560,7 +32618,11 @@ fn block_el_numbered(
                 ctx.field_codes,
                 lines,
                 overlay,
-                ctx.cell_run,
+                run_look::RunStyler {
+                    sheet: ctx.tbl.sheet.as_deref(),
+                    cell: ctx.cell_run,
+                    pstyle: None,
+                },
                 ctx.pics,
             )
         }
@@ -36246,8 +36308,9 @@ impl Docxy {
             Project(act) => self.tabs.get(self.active).is_some_and(
                 |t| matches!(&t.surface, Surface::Project(v) if project_act_active(v, act)),
             ),
-            Bold => rp.is_some_and(|p| p.bold),
-            Italic => rp.is_some_and(|p| p.italic),
+            // Over the styles' bold and italic (#1427).
+            Bold => doc.is_some_and(|ed| ed.caret_props_shown().bold),
+            Italic => doc.is_some_and(|ed| ed.caret_props_shown().italic),
             Underline => rp.is_some_and(|p| p.user_underline()),
             Strike => rp.is_some_and(|p| p.user_strike()),
             Super => rp.is_some_and(|p| p.vert_align == VertAlign::Superscript),
@@ -37413,6 +37476,10 @@ impl Render for Docxy {
         // A tab created since the last frame holds the app's Editing options
         // before anything can reach it (#672), and its AutoCorrect (#667).
         stamp_edit_opts(&mut self.tabs, self.edit_opts);
+        // Bold and Italic read and write over the package's styles (#1427).
+        for tab in &mut self.tabs {
+            tab.sync_editor_styles();
+        }
         sheet_autocorrect::stamp_autocorrect(&mut self.tabs, &self.autocorrect);
         sheet_flashfill::retire_stale_previews(&mut self.tabs);
         sheet_complete::sync_lists(&mut self.tabs);
@@ -37969,7 +38036,11 @@ impl Render for Docxy {
                     // While a header/footer is being edited the body is inactive
                     // (no caret, clicks inert) so it visually recedes.
                     let hf = tab.hf_edit.as_ref();
-                    let mut tbl = TableCtx::new(tab.pkg.as_ref(), self.view_gridlines);
+                    let mut tbl = TableCtx::new(
+                        tab.pkg.as_ref(),
+                        tab.run_styles.borrow_mut().current(tab.pkg.as_ref()).1,
+                        self.view_gridlines,
+                    );
                     if self.draw_tool().is_some() {
                         tbl.draw = Some(self.draw_geom.clone());
                     }
@@ -38280,6 +38351,7 @@ impl Render for Docxy {
                                                     doc_pal,
                                                     &measurer,
                                                     hf_w,
+                                                    tbl.sheet.as_deref(),
                                                     pictures::scope(
                                                         pictures.as_ref(),
                                                         Some(h.part_name.as_str()),
@@ -38293,6 +38365,7 @@ impl Render for Docxy {
                                         doc_pal,
                                         &measurer,
                                         hf_w,
+                                        tbl.sheet.as_deref(),
                                         pictures::scope(pictures.as_ref(), page_part(pi, is_h)),
                                     )
                                 };
@@ -38537,7 +38610,12 @@ impl Render for Docxy {
                                         let r = docxcore::frame::frame_rect(
                                             g.frame,
                                             &geom,
-                                            frame_content_w(g, &measurer, zoom),
+                                            frame_content_w(
+                                                g,
+                                                &measurer,
+                                                zoom,
+                                                tbl.sheet.as_deref(),
+                                            ),
                                             g.content_h(),
                                         );
                                         let width = zoom * r.w.max(0) as f32 / 15.0;
@@ -38560,6 +38638,7 @@ impl Render for Docxy {
                                                     &measurer,
                                                     width,
                                                     zoom,
+                                                    tbl.sheet.as_deref(),
                                                     pictures::scope(
                                                         pictures.as_ref(),
                                                         match edited {
