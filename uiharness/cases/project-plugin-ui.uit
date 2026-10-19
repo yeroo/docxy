@@ -143,6 +143,25 @@ test the button's command opens the plugin's dialog, whose OK sends the values b
   assert reply.controls.4.name is fixture.memo
   assert reply.controls.4.fill is true
   shot window
+  # The Styles page (#1609 r8): three side-by-side lists in three columns,
+  # the dialog's size unchanged across the switch.
+  call dialog-tab {"tab":"Styles"}
+  call dialog-read {}
+  assert reply.tab is 1
+  assert reply.columns is 3
+  assert reply.size.0 is 460
+  assert reply.size.1 is 400
+  assert reply.controls.5.name is fixture.font
+  assert reply.controls.5.kind is list
+  assert reply.controls.5.items.1 is Segoe UI
+  assert reply.controls.6.name is fixture.style
+  assert reply.controls.6.items.3 is Bold Italic
+  assert reply.controls.7.name is fixture.size
+  assert reply.controls.7.items.5 is 14
+  shot window
+  call dialog-tab {"tab":"General"}
+  call dialog-read {}
+  assert reply.columns is 2
   # Help is the host's: this spec names no page, so the status says so and
   # the dialog stays. The state greys Help while the number is 0, and the
   # press is refused like any disabled button.

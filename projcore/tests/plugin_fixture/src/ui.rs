@@ -63,7 +63,11 @@ const MANIFEST: &str = r##"{
       {"name":"fixture.echo","label":"","kind":"label","value":"","group":"Numbers"},
       {"name":"fixture.tasks","label":"Tasks","kind":"grid","columns":[{"name":"Name","kind":"text"}],"value":[],"min_rows":3},
       {"name":"fixture.sample","label":"Sample","kind":"sample","value":{"text":"AaBbYyZz"}},
-      {"name":"fixture.memo","label":"&Memo:","kind":"multiline","value":"","span":2,"fill":true}]}],
+      {"name":"fixture.memo","label":"&Memo:","kind":"multiline","value":"","span":2,"fill":true}]},
+      {"name":"Styles","columns":3,"controls":[
+      {"name":"fixture.font","label":"&Font:","kind":"list","items":["Calibri","Segoe UI","Times New Roman"],"value":"Segoe UI"},
+      {"name":"fixture.style","label":"Font st&yle:","kind":"list","items":["Regular","Italic","Bold","Bold Italic"],"value":"Regular"},
+      {"name":"fixture.size","label":"&Size:","kind":"list","items":["8","9","10","11","12","14"],"value":"11"}]}],
      "buttons":["OK","Cancel",{"id":"help","label":"Help","cancel":true},{"id":"bump","label":"&Bump"}]},
     {"id":"fixture.sheet","title":"Fixture Sheet","modeless":true,"placement":"right","help":"https://example.test/fixture-help","pages":[{"name":"Sheet","controls":[
       {"name":"fixture.rows","label":"Tasks","kind":"grid","commit_command":true,"min_rows":6,"columns":[{"name":"Pick","kind":"check"},{"name":"Name","kind":"text"},{"name":"Units","kind":"number"}],"value":[]}]}],

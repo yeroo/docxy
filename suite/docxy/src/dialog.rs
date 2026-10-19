@@ -390,6 +390,16 @@ pub(crate) struct Popup {
 }
 
 impl Button {
+    /// The host's Help button (#1609): the one id every path tests, here.
+    pub fn is_help(&self) -> bool {
+        Self::is_help_id(&self.id)
+    }
+
+    /// Whether a button id (a spec's, before it becomes a [`Button`]) is Help.
+    pub fn is_help_id(id: &str) -> bool {
+        id.eq_ignore_ascii_case("help")
+    }
+
     pub fn new(label: &str, role: ButtonRole) -> Self {
         Self {
             id: fold(label),
@@ -2457,9 +2467,16 @@ impl Dialog {
     /// The button `want` names (#1602): its label as a person reads it,
     /// `&` and case aside, or its id.
     pub fn find_button(&self, want: &str) -> Option<&Button> {
+        self.find_button_index(want)
+            .and_then(|i| self.buttons.get(i))
+    }
+
+    /// The index of the button named `want` (its label as drawn, `&` and
+    /// case aside, or its id).
+    fn find_button_index(&self, want: &str) -> Option<usize> {
         self.buttons
             .iter()
-            .find(|b| fold(&b.label) == fold(want) || b.id.eq_ignore_ascii_case(want.trim()))
+            .position(|b| fold(&b.label) == fold(want) || b.id.eq_ignore_ascii_case(want.trim()))
     }
 
     /// The one refusal a disabled button gives, whatever pressed it.
@@ -2472,16 +2489,12 @@ impl Dialog {
     }
 
     fn button_index(&self, want: &str) -> Result<usize, String> {
-        let b = self.find_button(want).ok_or_else(|| {
+        let i = self.find_button_index(want).ok_or_else(|| {
             let labels: Vec<String> = self.buttons.iter().map(|b| shown(&b.label)).collect();
             format!("no button '{want}'; buttons: {}", labels.join(", "))
         })?;
-        Self::refuse_disabled(b)?;
-        Ok(self
-            .buttons
-            .iter()
-            .position(|x| std::ptr::eq(x, b))
-            .unwrap_or_default())
+        Self::refuse_disabled(&self.buttons[i])?;
+        Ok(i)
     }
 
     /// The staged value of a control, by name, for the owner applying it.

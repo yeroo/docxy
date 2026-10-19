@@ -888,7 +888,7 @@ impl Docxy {
             return None;
         };
         let pressed = top.find_button(button)?;
-        if !pressed.id.eq_ignore_ascii_case("help") {
+        if !pressed.is_help() {
             return None;
         }
         if let Err(e) = Dialog::refuse_disabled(pressed) {
@@ -1749,7 +1749,12 @@ impl Docxy {
                     .child(label)
                     .child(
                         div()
-                            .min_w(px(160.))
+                            // A built-in dialog's list keeps its width; on a
+                            // page of several columns (#1609 r8) the list is
+                            // its cell's width, so side-by-side pickers do
+                            // not overflow into each other.
+                            .when(d.columns() == 1, |l| l.min_w(px(160.)))
+                            .when(d.columns() > 1, |l| l.w_full())
                             .border_1()
                             .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
                             .bg(pal.panel)
@@ -1921,7 +1926,7 @@ impl Docxy {
         // Project's button places (#1609): Help bottom left, the rest bottom
         // right; or every button down the right side.
         let buttons_right = d.buttons_right;
-        let is_help = |b: &dialog::Button| b.id.eq_ignore_ascii_case("help");
+        let is_help = |b: &dialog::Button| b.is_help();
         let help_count = d.buttons.iter().filter(|b| is_help(b)).count();
         let button = |i: usize, b: &dialog::Button| {
             let label = b.label.clone();

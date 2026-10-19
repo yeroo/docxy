@@ -854,7 +854,7 @@ fn apply_selected_row(c: &mut dialog::Control, prefill: &Prefill) {
 /// nor Escape can name it (#1609); the spec's `default` and `cancel` on it
 /// are ignored.
 fn button_of_spec(b: &ui::DialogButton, role: dialog::ButtonRole) -> dialog::Button {
-    let help = b.id.eq_ignore_ascii_case("help");
+    let help = crate::dialog::Button::is_help_id(&b.id);
     let role = if help {
         dialog::ButtonRole::Apply
     } else {
@@ -965,9 +965,9 @@ fn open_dialog(v: &ProjectView, spec_id: &str, command: &str) -> Result<Dialog, 
 /// Ask the plugin's state again for the top dialog when a plugin control
 /// changed since (#1567) or the plan or the selection moved under it
 /// (#1602, modal or not since #1610), and apply the reply: items, enabled
-/// flags, label values and `name.selected_row` always (a chosen item that
-/// is still there stays chosen), every value when the plan or selection
-/// moved (a grid keeps the cell being typed into). Called before a frame is
+/// flags, label and sample values and `name.selected_row` always (a chosen
+/// item that is still there stays chosen), every value when the plan or
+/// selection moved (a grid keeps the cell being typed into). Called before a frame is
 /// drawn or a reply is written, so a read sees the state the plugin would
 /// show.
 pub(crate) fn refresh_dialog(tab: &mut DocTab) {
@@ -1161,7 +1161,7 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Option<Result<(), 
     // cancel button, so no key reaches here. A direct press that still does
     // says the documentation is coming and never becomes a command.
     if let Some(b) = pressed
-        && b.id.eq_ignore_ascii_case("help")
+        && b.is_help()
     {
         if let Err(e) = Dialog::refuse_disabled(b) {
             return Some(Err(e));
