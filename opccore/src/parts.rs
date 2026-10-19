@@ -16,6 +16,10 @@ use crate::zip::ZipArchive;
 /// classification inflate much, however many such entries it lists (#1167).
 pub const MAX_NAMING_PART: u64 = 8 << 20;
 
+/// The most bytes of relationship directories and targets resolved, in
+/// total, while naming parts (#1167).
+const MAX_RESOLVE_WORK: usize = 64 << 20;
+
 /// For each entry of `zip`, in order, whether it is a part. `names` are the
 /// entries' names with `/` separators, one per entry.
 ///
@@ -24,41 +28,94 @@ pub const MAX_NAMING_PART: u64 = 8 << 20;
 /// (an empty `xl/media`) and is named by nothing. An empty entry with an
 /// extension (`docProps/thumbnail.wmf`), or one an `Override` in
 /// `[Content_Types].xml` or an internal relationship names, is a part.
+///
+/// The work is bounded by the entries, not by the shapes of their names or
+/// relationships: only an empty entry without an extension and with nothing
+/// under it can be named into a part, and nothing else is looked up. Naming
+/// reads the first `[Content_Types].xml` before any `.rels`, then the rest
+/// in ZIP order, and stops when the declared sizes of what it read pass
+/// [`MAX_NAMING_PART`] in total (an External relationship's part counts
+/// too): later parts name nothing, so a package with more than that in
+/// relationships can lose a part kept only by them.
 pub fn part_flags(zip: &ZipArchive, names: &[String]) -> Vec<bool> {
-    let dirs: HashSet<&str> = names
-        .iter()
-        .flat_map(|n| n.match_indices('/').map(|(i, _)| &n[..i]))
-        .collect();
-    let named = named_parts(zip, names);
-    zip.entries()
+    let mut sorted: Vec<&str> = names.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let has_under = |name: &str| {
+        let under = format!("{name}/");
+        let at = sorted.partition_point(|n| *n < under.as_str());
+        sorted.get(at).is_some_and(|n| n.starts_with(&under))
+    };
+    // Per entry: a directory already, a part for sure, or only a part if named.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Kind {
+        Directory,
+        Part,
+        Candidate,
+    }
+    let kinds: Vec<Kind> = zip
+        .entries()
         .iter()
         .zip(names)
-        .map(|(e, name)| !is_directory_entry(name, e.uncomp_size, &dirs, &named))
+        .map(|(e, name)| {
+            let leaf = name.rsplit('/').next().unwrap_or(name);
+            if name.ends_with('/') {
+                Kind::Directory
+            } else if e.uncomp_size != 0 {
+                Kind::Part
+            } else if has_under(name) {
+                Kind::Directory
+            } else if leaf.contains('.') {
+                Kind::Part
+            } else {
+                Kind::Candidate
+            }
+        })
+        .collect();
+    let candidates: HashSet<String> = kinds
+        .iter()
+        .zip(names)
+        .filter(|(kind, _)| **kind == Kind::Candidate)
+        .map(|(_, name)| name.to_ascii_lowercase())
+        .collect();
+    let named = if candidates.is_empty() {
+        HashSet::new()
+    } else {
+        named_parts(zip, names, &candidates)
+    };
+    kinds
+        .iter()
+        .zip(names)
+        .map(|(kind, name)| match kind {
+            Kind::Directory => false,
+            Kind::Part => true,
+            Kind::Candidate => named.contains(&name.to_ascii_lowercase()),
+        })
         .collect()
 }
 
-/// Whether the entry `name` (with `/` separators) of `size` bytes is a
-/// directory. `named` holds the part names, in lower case, the package names;
-/// `dirs` every directory an entry name lies in.
-fn is_directory_entry(
-    name: &str,
-    size: u64,
-    dirs: &HashSet<&str>,
-    named: &HashSet<String>,
-) -> bool {
-    let leaf = name.rsplit('/').next().unwrap_or(name);
-    let unnamed = || !leaf.contains('.') && !named.contains(&name.to_ascii_lowercase());
-    name.ends_with('/') || (size == 0 && (dirs.contains(name) || unnamed()))
-}
-
-/// The part names, in lower case, that the package names: an `Override` in
-/// `[Content_Types].xml` or an internal relationship's target. A stream that
-/// cannot be read names nothing.
-fn named_parts(zip: &ZipArchive, names: &[String]) -> HashSet<String> {
-    let mut named = HashSet::new();
-    let mut read = 0u64;
+/// Which of `candidates` (lower-case names) the package names: an `Override`
+/// in `[Content_Types].xml` or an internal relationship's target. A stream
+/// that cannot be read names nothing.
+fn named_parts(
+    zip: &ZipArchive,
+    names: &[String],
+    candidates: &HashSet<String>,
+) -> HashSet<String> {
+    // (entry, directory of a relationship source or None for content types)
+    let mut sources: Vec<(&crate::zip::ZipEntry, Option<&str>)> = Vec::new();
+    let mut first_types = true;
+    let mut rels = Vec::new();
     for (e, name) in zip.entries().iter().zip(names) {
         let lower = name.to_ascii_lowercase();
+        if lower == "[content_types].xml" {
+            if first_types {
+                sources.push((e, None));
+                first_types = false;
+            } else {
+                rels.push((e, None));
+            }
+            continue;
+        }
         let source = match lower.rsplit_once('/') {
             Some((dir, _)) if lower.ends_with(".rels") => match dir.rsplit_once('/') {
                 Some((parent, "_rels")) => Some(&name[..parent.len()]),
@@ -67,9 +124,15 @@ fn named_parts(zip: &ZipArchive, names: &[String]) -> HashSet<String> {
             },
             _ => None,
         };
-        if source.is_none() && lower != "[content_types].xml" {
-            continue;
+        if source.is_some() {
+            rels.push((e, source));
         }
+    }
+    sources.extend(rels);
+    let mut named = HashSet::new();
+    let mut read = 0u64;
+    let mut work = 0usize;
+    for (e, source) in sources {
         read = read.saturating_add(e.uncomp_size);
         if read > MAX_NAMING_PART {
             continue;
@@ -84,14 +147,22 @@ fn named_parts(zip: &ZipArchive, names: &[String]) -> HashSet<String> {
                 Event::Start => match (source, local(p.name())) {
                     (Some(dir), "Relationship") if p.attr("TargetMode").is_empty() => {
                         let target = decode(p.attr("Target")).replace('\\', "/");
-                        named.insert(resolve_relative(dir, &target).to_ascii_lowercase());
+                        work = work.saturating_add(dir.len() + target.len());
+                        if work > MAX_RESOLVE_WORK {
+                            break;
+                        }
+                        let target = resolve_relative(dir, &target).to_ascii_lowercase();
+                        if candidates.contains(&target) {
+                            named.insert(target);
+                        }
                     }
                     (None, "Override") => {
-                        named.insert(
-                            decode(p.attr("PartName"))
-                                .trim_start_matches('/')
-                                .to_ascii_lowercase(),
-                        );
+                        let part = decode(p.attr("PartName"))
+                            .trim_start_matches('/')
+                            .to_ascii_lowercase();
+                        if candidates.contains(&part) {
+                            named.insert(part);
+                        }
                     }
                     _ => {}
                 },
@@ -245,18 +316,77 @@ mod tests {
     /// `xl/a.bc.xml`.
     #[test]
     fn which_empty_entries_are_directories() {
-        let dirs: HashSet<&str> = ["xl", "xl/a.b", "_rels"].into_iter().collect();
-        let named: HashSet<String> = ["xl/customdata".to_string()].into_iter().collect();
-        let dir = |name: &str, size: u64| is_directory_entry(name, size, &dirs, &named);
-        assert!(dir("xl/media/", 0));
-        assert!(dir("xl", 0));
-        assert!(dir("xl/a.b", 0), "an entry lies under it");
-        assert!(dir("xl/embeddings", 0), "no extension");
-        assert!(!dir("xl/customData", 0), "no extension, but named");
-        assert!(dir("xl/media/", 0) && dir("xl", 0), "named or not");
-        assert!(!dir("xl/a.bc", 0), "an extension and nothing under it");
-        assert!(!dir("docProps/thumbnail.wmf", 0));
-        assert!(!dir("xl", 3), "not empty: a part, however odd");
-        assert!(!dir("_rels/.rels", 0));
+        let types = "<Types><Override PartName=\"/xl/customData\" ContentType=\"a\"/></Types>";
+        let f = flags(&[
+            ("[Content_Types].xml", types),
+            ("xl/media/", ""),
+            ("xl", ""),
+            ("xl/a.b", ""),
+            ("xl/a.b/c.xml", "x"),
+            ("xl/embeddings", ""),
+            ("xl/customData", ""),
+            ("xl/a.bc", ""),
+            ("docProps/thumbnail.wmf", ""),
+            ("_rels/.rels", ""),
+        ]);
+        assert!(!is_part(&f, "xl/media/"));
+        assert!(!is_part(&f, "xl"));
+        assert!(!is_part(&f, "xl/a.b"), "an entry lies under it");
+        assert!(!is_part(&f, "xl/embeddings"), "no extension");
+        assert!(is_part(&f, "xl/customData"), "no extension, but named");
+        assert!(is_part(&f, "xl/a.bc"), "an extension and nothing under it");
+        assert!(is_part(&f, "docProps/thumbnail.wmf"));
+        assert!(is_part(&f, "_rels/.rels"));
+    }
+
+    /// A name with tens of thousands of `/` costs no more than its length
+    /// in comparisons; hashing each of its prefixes was quadratic.
+    #[test]
+    fn a_name_with_many_slashes_is_classified() {
+        let deep = "a/".repeat(20_000) + "leaf";
+        let dir = "a/".repeat(20_000).trim_end_matches('/').to_string();
+        let f = flags(&[(&deep, "x"), (&dir, ""), ("b", "")]);
+        assert!(is_part(&f, &deep));
+        assert!(!is_part(&f, &dir), "an entry lies under it");
+        assert!(!is_part(&f, "b"));
+    }
+
+    /// Relationships from a long directory name only entries that are
+    /// candidates: thousands of targets that are no entry are dropped, the
+    /// one that is an empty entry makes it a part.
+    #[test]
+    fn long_relationship_directories_name_only_candidates() {
+        let dir = "d/".repeat(5_000) + "e";
+        let mut rels = String::from("<Relationships>");
+        for i in 0..2_000 {
+            rels += &format!("<Relationship Id=\"{i}\" Type=\"t\" Target=\"no{i}\"/>");
+        }
+        rels += "<Relationship Id=\"x\" Type=\"t\" Target=\"yes\"/></Relationships>";
+        let (source, owner, target) = (
+            format!("{dir}/_rels/p.xml.rels"),
+            format!("{dir}/p.xml"),
+            format!("{dir}/yes"),
+        );
+        let f = flags(&[(&source, &rels), (&owner, "x"), (&target, ""), ("yes", "")]);
+        assert!(is_part(&f, &target), "named by the relationship");
+        assert!(!is_part(&f, "yes"), "a different part, named by nothing");
+    }
+
+    /// The first `[Content_Types].xml` is read before any `.rels`: a big
+    /// rels ahead of it cannot use up the total first.
+    #[test]
+    fn content_types_are_read_before_a_big_rels() {
+        let types = "<Types><Override PartName=\"/named\" ContentType=\"a\"/></Types>";
+        let head = "<Relationships><Relationship Id=\"1\" Type=\"t\" Target=\"/other\"/>";
+        let pad = MAX_NAMING_PART as usize - head.len() - "</Relationships>".len() - 10;
+        let rels = format!("{head}{}</Relationships>", " ".repeat(pad));
+        let f = flags(&[
+            ("_rels/.rels", &rels),
+            ("[Content_Types].xml", types),
+            ("named", ""),
+            ("other", ""),
+        ]);
+        assert!(is_part(&f, "named"), "the types were read first");
+        assert!(!is_part(&f, "other"), "the rels was past the total");
     }
 }
