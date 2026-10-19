@@ -3331,8 +3331,10 @@ impl Leveled {
     pub fn start(&self, uid: i32) -> Option<DateTime> {
         self.start.get(&uid).copied()
     }
-    /// A leaf's leveling delay in elapsed minutes (#1594); `None` for a
-    /// summary, an external leaf or an unknown uid.
+    /// A leaf's own leveling delay in elapsed minutes (#1594): from the
+    /// start its leveled predecessors drive it to, so a task that only
+    /// follows a delayed predecessor reports 0; `None` for a summary, an
+    /// external leaf or an unknown uid.
     pub fn delay_min(&self, uid: i32) -> Option<i64> {
         self.delay_min.get(&uid).copied()
     }
@@ -3887,14 +3889,19 @@ impl Scheduler<'_> {
         let assign = self.demands(&graph, &caps);
 
         let mut delay: HashMap<i32, i64> = HashMap::new();
+        // The instant each placed task's links, constraints and leveled
+        // predecessors drive it to, before its own delay (#1594).
+        let mut driven: HashMap<i32, i64> = HashMap::new();
         let mut bookings: HashMap<i32, Vec<Booking>> = HashMap::new();
         let mut start: HashMap<i32, DateTime> = HashMap::new();
         let mut finish: HashMap<i32, DateTime> = HashMap::new();
 
-        // Manual and tracked tasks never move, so book them before placing
-        // anything else: auto tasks earlier in topological order must level
-        // around them. An in-progress task is booked through its Stop..Resume
-        // gap too.
+        // Held tasks never move, so book them before placing anything else:
+        // auto tasks earlier in topological order must level around them. A
+        // manual or tracked task is booked through its whole span (an
+        // in-progress one through its Stop..Resume gap too); an automatic
+        // task the scope or its priority holds (#1594) books each resource
+        // over its own assignment's window only, as it would if placed.
         for &i in order {
             let t = &self.proj.tasks[i];
             if !held(t) {
@@ -3902,9 +3909,13 @@ impl Scheduler<'_> {
             }
             let cpm = base.get(t.uid).expect("leaf scheduled");
             let s_idx = tl.to_index(cpm.early_start.minutes());
-            let f_idx = tl.to_index(cpm.early_finish.minutes());
             let res = assign.get(&t.uid).map_or(&[][..], Vec::as_slice);
-            book(&mut bookings, res, s_idx, f_idx);
+            if fixed(t) {
+                let f_idx = tl.to_index(cpm.early_finish.minutes());
+                book(&mut bookings, res, s_idx, f_idx);
+            } else {
+                book_demands(&mut bookings, res, s_idx);
+            }
         }
 
         for &i in order {
@@ -3991,12 +4002,15 @@ impl Scheduler<'_> {
             // (#469).
             let span = self.scheduled_span(i);
             let mut placed = place_all(&res, &bookings, &caps, earliest);
-            // Within available slack only (#1594): a task that would move
-            // past its total slack stays at its earliest start, overallocated.
-            if scope.within_slack && placed > earliest + cpm.total_slack_min.max(0) {
+            // Within available slack only (#1594): a task that would start
+            // past its CPM late start (its CPM start plus its total slack,
+            // which a leveled predecessor's delay has already eaten into)
+            // stays at its earliest start, overallocated.
+            if scope.within_slack && placed > cpm_start_idx + cpm.total_slack_min.max(0) {
                 placed = earliest;
             }
             delay.insert(t.uid, placed - cpm_start_idx);
+            driven.insert(t.uid, tl.abs_start(earliest));
             book_demands(&mut bookings, &res, placed);
             // A predecessor can move only its instant, keeping its working
             // index (an elapsed lag into nonworking time, #104); a successor
@@ -4147,15 +4161,23 @@ impl Scheduler<'_> {
             .map(DateTime::from_minutes)
             .unwrap_or(base.project_finish);
 
-        // Each leaf's delay as `LevelingDelay` stores it: elapsed, from the
-        // CPM start to the leveled one (#1594).
+        // Each leaf's own delay as `LevelingDelay` stores it (#1594):
+        // elapsed, from the start its links, constraints and leveled
+        // predecessors drive it to, to its leveled start. A task that only
+        // follows a delayed predecessor records none, as Project 2024 does
+        // (measured over COM: the FS successor of a leveled task keeps
+        // LevelingDelay 0); a held task reports 0.
         let delay_min = leaves
             .iter()
             .map(|&i| self.proj.tasks[i].uid)
             .filter_map(|uid| {
                 let cpm = base.get(uid)?;
                 let leveled = start.get(&uid)?;
-                Some((uid, leveled.minutes() - cpm.early_start.minutes()))
+                let from = driven
+                    .get(&uid)
+                    .copied()
+                    .unwrap_or(cpm.early_start.minutes());
+                Some((uid, (leveled.minutes() - from).max(0)))
             })
             .collect();
 
@@ -8715,6 +8737,18 @@ mod tests {
             (lv.start(2), lv.finish(2)),
             (Some(at(4, 8)), Some(at(4, 17)))
         );
+        // #1594 r1: with only U free to move, T is held by the scope, and
+        // its R1 booking still ends with its own assignment: U lands on
+        // Wednesday as before, not Thursday.
+        let only_u: std::collections::HashSet<i32> = [2].into_iter().collect();
+        let lv = level_with(
+            &proj,
+            &LevelScope {
+                movable: Some(&only_u),
+                ..LevelScope::default()
+            },
+        );
+        assert_eq!(lv.start(2), Some(at(4, 8)));
     }
 
     #[test]

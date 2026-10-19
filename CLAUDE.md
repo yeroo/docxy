@@ -442,6 +442,35 @@
   `uiharness/cases/project-plugin-ui.uit` drives
   the fixture through all of it; nothing changes without a UI plugin.
 
+## Project leveling as a plan edit (#1594)
+
+- `projcore::schedule::level_with(proj, &LevelScope {movable, order,
+  within_slack})` levels a scope: tasks outside it, and priority 1000, are
+  held at their CPM dates and pass no delay on (a held automatic task books
+  each resource over its own assignment's window, a manual or tracked one
+  its whole span); `within_slack` leaves a task that would start past its
+  CPM late start at its earliest start, overallocated. `Leveled::delay_min`
+  is each leaf's own delay in elapsed minutes, from the start its leveled
+  predecessors drive it to, so a task that only follows a delayed
+  predecessor records none (Project 2024 over COM: the FS successor of a
+  leveled task keeps LevelingDelay 0). The CPM forward pass adds a stored
+  task `LevelingDelay` (tenths of a minute, elapsed) after links and
+  constraints, before the snap to working time.
+- `Editor::level_tasks(&LevelTarget::{All, Selection, Resource})`
+  (`level_tasks_with` takes `LevelOptions` for one pass) writes
+  `leveling_delay` (format 8) and `pre_leveled_start/finish` (from the plan
+  without the scope's delays, whatever `clear_first` says, so a repeated
+  pass records no step) as one undo step, settled against a rescheduled
+  trial so the committed dates equal the leveled ones exactly. With
+  `clear_first` a priority-1000 task's stored delay is cleared too and the
+  task holds at its unleveled start (measured). `clear_leveling(uids | all)`
+  is one step. `LevelOptions` are the plan options `LevelingOrder`,
+  `LevelWithinSlack`, `LevelAdjustAssignments`, `LevelCanSplit`,
+  `LevelClearBeforeLeveling`. Level All stays the display overlay in both
+  hosts; the edits are `projctl`'s `level.selection {uids, options?}`,
+  `level.resource {resource, options?}`, `level.options` and `level.clear
+  {uids | all}`; `LevelOutcome::targeted` lists the leaves a reply reports.
+
 ## Project table: resizable columns and AutoFilter (#1533)
 
 - Column widths are the plan's: `projcore::tableview::TableView` (px by field

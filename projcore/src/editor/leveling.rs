@@ -23,6 +23,17 @@ struct DelayEdit {
     pre_finish: Option<DateTime>,
 }
 
+/// Write `edits` into `proj`'s tasks.
+fn apply_delay_edits(proj: &mut crate::model::Project, edits: &[DelayEdit]) {
+    for e in edits {
+        let t = &mut proj.tasks[e.row];
+        t.leveling_delay = e.value;
+        t.leveling_delay_format = e.value.map(|_| ELAPSED_DAYS_CODE);
+        t.pre_leveled_start = e.pre_start;
+        t.pre_leveled_finish = e.pre_finish;
+    }
+}
+
 impl Editor {
     /// The plan's Leveling Options.
     pub fn level_options(&self) -> LevelOptions {
@@ -41,27 +52,57 @@ impl Editor {
         Ok(true)
     }
 
-    /// Level the plan's tasks as `target` says, writing each task's
-    /// `LevelingDelay` (elapsed, from its unleveled start to its leveled
-    /// one) and pre-leveled dates as one undo step. Tasks outside the
-    /// target keep their dates and still book their resources. With
-    /// `clear_first`, the targeted tasks' stored delays are dropped before
-    /// the pass. An unchanged plan records no step.
+    /// Level the plan's tasks as `target` says, writing each task's own
+    /// `LevelingDelay` (elapsed, from the start its links, constraints and
+    /// leveled predecessors drive it to, to its leveled one: a task that
+    /// only follows a delayed predecessor records none, as Project does)
+    /// and its pre-leveled dates (its unleveled start and finish) as one
+    /// undo step. Tasks outside the target keep their dates and still book
+    /// their resources. With `clear_first` the targeted tasks' stored
+    /// delays are dropped before the pass (a priority-1000 task's too, as
+    /// measured on Project 2024; it then holds at its unleveled start),
+    /// otherwise the pass builds on them. The stored delays reproduce the
+    /// leveled dates exactly. An unchanged plan records no step.
     pub fn level_tasks(&mut self, target: &LevelTarget) -> Result<LevelOutcome, String> {
+        self.level_tasks_with(target, None)
+    }
+
+    /// [`level_tasks`](Self::level_tasks) under `options` for this pass
+    /// only (the plan's Leveling Options stay as they are), else the plan's.
+    pub fn level_tasks_with(
+        &mut self,
+        target: &LevelTarget,
+        options: Option<&LevelOptions>,
+    ) -> Result<LevelOutcome, String> {
         let movable = self.level_movable(target)?;
         let in_scope = |uid: i32| movable.as_ref().is_none_or(|m| m.contains(&uid));
-        let options = self.level_options();
-        let mut probe = self.proj.clone();
-        if options.clear_first {
-            for t in &mut probe.tasks {
-                if in_scope(t.uid) {
-                    t.leveling_delay = None;
-                }
+        let options = options.copied().unwrap_or_else(|| self.level_options());
+        let is_leaf = |t: &crate::model::Task| !t.summary && !t.is_null && !t.is_external_leaf();
+        let targeted: Vec<i32> = self
+            .proj
+            .tasks
+            .iter()
+            .filter(|t| is_leaf(t) && in_scope(t.uid))
+            .map(|t| t.uid)
+            .collect();
+        // The plan without the scope's delays. The pre-leveled dates come
+        // from it whatever `clear_first` says, so a pass that keeps the
+        // stored delays still records the unleveled start, and a repeated
+        // pass changes nothing.
+        let mut cleared = self.proj.clone();
+        for t in &mut cleared.tasks {
+            if in_scope(t.uid) {
+                t.leveling_delay = None;
             }
         }
-        let base = schedule(&probe);
+        let pre_base = schedule(&cleared);
+        let probe = if options.clear_first {
+            &cleared
+        } else {
+            &self.proj
+        };
         let leveled = level_with(
-            &probe,
+            probe,
             &LevelScope {
                 movable: movable.as_ref(),
                 order: options.order,
@@ -69,9 +110,8 @@ impl Editor {
             },
         );
         let mut edits: Vec<DelayEdit> = Vec::new();
-        let mut delayed = 0;
         for (i, t) in self.proj.tasks.iter().enumerate() {
-            if t.summary || t.is_null || t.is_external_leaf() || !in_scope(t.uid) {
+            if !is_leaf(t) || !in_scope(t.uid) {
                 continue;
             }
             let Some(delay) = leveled.delay_min(t.uid) else {
@@ -86,12 +126,9 @@ impl Editor {
             };
             let delay = kept + delay;
             let value = (delay > 0).then_some(delay * 10);
-            if value.is_some() {
-                delayed += 1;
-            }
-            let cpm = base.get(t.uid);
+            let pre = pre_base.get(t.uid);
             let (pre_start, pre_finish) = match value {
-                Some(_) => (cpm.map(|r| r.early_start), cpm.map(|r| r.early_finish)),
+                Some(_) => (pre.map(|r| r.early_start), pre.map(|r| r.early_finish)),
                 None => (None, None),
             };
             let now = (
@@ -108,33 +145,63 @@ impl Editor {
                 });
             }
         }
+        let count_delayed = |proj: &crate::model::Project| {
+            proj.tasks
+                .iter()
+                .filter(|t| is_leaf(t) && in_scope(t.uid))
+                .filter(|t| t.leveling_delay.is_some_and(|d| d > 0))
+                .count()
+        };
         if edits.is_empty() {
             return Ok(LevelOutcome {
                 changed: 0,
-                delayed,
+                delayed: count_delayed(&self.proj),
                 overallocated: self.shown_overallocated(),
+                targeted,
             });
+        }
+        // The stored delays must give the leveled dates exactly. The
+        // leveler's driven start is an estimate where a constraint rather
+        // than a link drove the task, so settle on a trial of the plan:
+        // reschedule it and move each edited delay by what its start still
+        // misses, a few rounds at most.
+        let mut trial = self.proj.clone();
+        apply_delay_edits(&mut trial, &edits);
+        for _ in 0..4 {
+            let sched = schedule(&trial);
+            let mut moved = false;
+            for e in &mut edits {
+                let uid = trial.tasks[e.row].uid;
+                let (Some(want), Some(got)) = (leveled.start(uid), sched.get(uid)) else {
+                    continue;
+                };
+                let miss = want.minutes() - got.early_start.minutes();
+                if miss == 0 {
+                    continue;
+                }
+                let delay = (e.value.unwrap_or(0) / 10 + miss).max(0);
+                e.value = (delay > 0).then_some(delay * 10);
+                if e.value.is_some() && e.pre_start.is_none() {
+                    let pre = pre_base.get(uid);
+                    e.pre_start = pre.map(|r| r.early_start);
+                    e.pre_finish = pre.map(|r| r.early_finish);
+                }
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+            apply_delay_edits(&mut trial, &edits);
         }
         self.snapshot();
         let changed = edits.len();
-        for DelayEdit {
-            row,
-            value,
-            pre_start,
-            pre_finish,
-        } in edits
-        {
-            let t = &mut self.proj.tasks[row];
-            t.leveling_delay = value;
-            t.leveling_delay_format = value.map(|_| ELAPSED_DAYS_CODE);
-            t.pre_leveled_start = pre_start;
-            t.pre_leveled_finish = pre_finish;
-        }
+        apply_delay_edits(&mut self.proj, &edits);
         self.changed();
         Ok(LevelOutcome {
             changed,
-            delayed,
+            delayed: count_delayed(&self.proj),
             overallocated: self.shown_overallocated(),
+            targeted,
         })
     }
 
@@ -155,6 +222,9 @@ impl Editor {
                         .ok_or_else(|| format!("no task with uid {uid}"))?;
                     rows.push(i);
                 }
+                // A uid named twice is one task.
+                rows.sort_unstable();
+                rows.dedup();
                 rows
             }
         };
@@ -235,7 +305,7 @@ impl Editor {
 mod tests {
     use super::*;
     use crate::leveling::{LevelOptions, LevelOrder, LevelTarget};
-    use crate::model::{Assignment, Resource, Task};
+    use crate::model::{Assignment, Predecessor, Resource, Task};
 
     /// Ann on three parallel two-day tasks: Build (1), Paint (2), Trim (3).
     fn staffed() -> Editor {
@@ -489,5 +559,161 @@ mod tests {
             Some(3 * 1440 * 10)
         );
         assert!(start(&ed, 3) >= finish(&ed, 2));
+        // The pre-leveled dates are the unleveled ones, not the kept
+        // delay's, and a second pass without clearing changes nothing and
+        // records no step (#1594 r1).
+        assert_eq!(
+            ed.project().task(2).unwrap().pre_leveled_start,
+            Some(start(&ed, 1))
+        );
+        let depth = ed.undo_depth();
+        let again = ed.level_tasks(&LevelTarget::All).unwrap();
+        assert_eq!(again.changed, 0);
+        assert_eq!(ed.undo_depth(), depth);
+    }
+
+    /// #1594 r1: a task that only follows a leveled predecessor records no
+    /// delay of its own (Project 2024 over COM: the FS successor of a
+    /// leveled task keeps LevelingDelay 0), and the stored delays reproduce
+    /// the leveled dates exactly, committed and reloaded.
+    #[test]
+    fn a_successor_follows_a_leveled_predecessor_without_a_delay_of_its_own() {
+        let mut p = staffed().project().clone();
+        // Build and Paint share Ann for a day each; Trim follows Paint.
+        for t in &mut p.tasks {
+            t.duration_min = 480;
+        }
+        p.assignments.retain(|a| a.task_uid != 3);
+        p.tasks[2].predecessors.push(Predecessor::fs(2));
+        let mut ed = Editor::new(p);
+        let anchor = start(&ed, 1);
+        let leveled = level_with(ed.project(), &LevelScope::default());
+        let out = ed.level_tasks(&LevelTarget::All).unwrap();
+        assert_eq!((out.changed, out.delayed), (1, 1));
+        assert_eq!(out.targeted, vec![1, 2, 3]);
+        assert_eq!(
+            ed.project().task(2).unwrap().leveling_delay,
+            Some(1440 * 10)
+        );
+        assert_eq!(ed.project().task(3).unwrap().leveling_delay, None);
+        assert_eq!(
+            start(&ed, 2),
+            DateTime::from_minutes(anchor.minutes() + 1440)
+        );
+        assert!(start(&ed, 3) >= finish(&ed, 2));
+        for uid in 1..=3 {
+            assert_eq!(start(&ed, uid), leveled.start(uid).unwrap(), "task {uid}");
+        }
+        let back = crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(ed.project())).unwrap();
+        let sched = crate::schedule::schedule(&back);
+        for uid in 1..=3 {
+            assert_eq!(
+                sched.get(uid).unwrap().early_start,
+                start(&ed, uid),
+                "reloaded task {uid}"
+            );
+        }
+    }
+
+    /// #1594 r1: within slack is measured against the CPM late start, so a
+    /// successor whose leveled predecessor used the shared slack cannot
+    /// use it again and move the project finish.
+    #[test]
+    fn within_slack_counts_the_slack_a_leveled_predecessor_used() {
+        let mut p = untitled_project();
+        // A and B share R1 for a day each; C on R2 follows B; D holds R2
+        // for three days. B and C have a day of slack, D none.
+        for (uid, name, days, res) in [
+            (1, "A", 1, 1),
+            (2, "B", 1, 1),
+            (3, "C", 1, 2),
+            (4, "D", 3, 2),
+        ] {
+            p.tasks.push(Task {
+                uid,
+                id: uid,
+                name: name.into(),
+                outline_level: 1,
+                duration_min: days * 480,
+                ..Task::default()
+            });
+            p.assignments.push(Assignment {
+                uid,
+                task_uid: uid,
+                resource_uid: res,
+                units: 1.0,
+                ..Assignment::default()
+            });
+        }
+        p.tasks[2].predecessors.push(Predecessor::fs(2));
+        for (uid, name) in [(1, "R1"), (2, "R2")] {
+            p.resources.push(Resource {
+                uid,
+                id: uid,
+                name: name.into(),
+                max_units: 1.0,
+                ..Resource::default()
+            });
+        }
+        let mut ed = Editor::new(p);
+        let finish_before = ed.schedule().project_finish;
+        ed.set_level_options(&LevelOptions {
+            within_slack: true,
+            ..LevelOptions::default()
+        })
+        .unwrap();
+        let out = ed.level_tasks(&LevelTarget::All).unwrap();
+        // B takes its day of slack behind A; C, driven to Wednesday by B,
+        // would need Thursday for R2 and stays, overallocated with D.
+        assert_eq!(
+            ed.project().task(2).unwrap().leveling_delay,
+            Some(1440 * 10)
+        );
+        assert_eq!(ed.project().task(3).unwrap().leveling_delay, None);
+        assert_eq!(ed.schedule().project_finish, finish_before);
+        assert_eq!(out.overallocated, 1);
+    }
+
+    /// #1594 r1, measured on Project 2024 over COM: with clear-before-
+    /// leveling on, a priority-1000 task's stored delay is cleared like any
+    /// other's and the task then sits at its unleveled start, held there
+    /// while the others level around it; with it off, it keeps its delay.
+    #[test]
+    fn clear_first_clears_a_do_not_level_tasks_delay_and_holds_it_there() {
+        let mut p = staffed().project().clone();
+        p.tasks[2].priority = Some(1000);
+        p.tasks[2].leveling_delay = Some(1440 * 10);
+        p.tasks[2].leveling_delay_format = Some(8);
+        let mut ed = Editor::new(p);
+        let anchor = start(&ed, 1);
+        assert_eq!(
+            start(&ed, 3),
+            DateTime::from_minutes(anchor.minutes() + 1440)
+        );
+        ed.level_tasks(&LevelTarget::All).unwrap();
+        assert_eq!(ed.project().task(3).unwrap().leveling_delay, None);
+        assert_eq!(start(&ed, 3), anchor);
+        assert!(start(&ed, 1) >= finish(&ed, 3));
+        assert!(start(&ed, 2) >= finish(&ed, 1));
+        let mut p = staffed().project().clone();
+        p.tasks[2].priority = Some(1000);
+        p.tasks[2].leveling_delay = Some(1440 * 10);
+        let mut ed = Editor::new(p);
+        ed.set_level_options(&LevelOptions {
+            clear_first: false,
+            ..LevelOptions::default()
+        })
+        .unwrap();
+        ed.level_tasks(&LevelTarget::All).unwrap();
+        assert_eq!(
+            ed.project().task(3).unwrap().leveling_delay,
+            Some(1440 * 10)
+        );
+        assert_eq!(
+            start(&ed, 3),
+            DateTime::from_minutes(anchor.minutes() + 1440)
+        );
+        // A uid named twice in Clear Leveling is one task.
+        assert_eq!(ed.clear_leveling(Some(&[3, 3])).unwrap(), 1);
     }
 }

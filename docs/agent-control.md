@@ -295,13 +295,16 @@ reports `leveled`. `level.overallocations {}` lists those resources, earliest
 first, each with `uid, name, max_units, peak_units` (1.0 = 100%) and `first`,
 the first overallocated instant, where Project's Next Overallocation goes.
 
-Leveling as a plan edit (#1594): `level.selection {uids: [uid…]}` (Level
-Selection; a summary stands for its subtasks) and `level.resource {resource}`
-(Level Resource, a uid or a name) run the leveler with only those tasks free
-to move, every other task keeping its dates and still booking its resources,
-and write each moved task's `LevelingDelay` (elapsed minutes from its
-unleveled start, stored in tenths of a minute as Project does) and pre-leveled
-dates as one undo step. The scheduler honours a stored delay, so the leveled
+Leveling as a plan edit (#1594): `level.selection {uids: [uid…], options?}`
+(Level Selection; a summary stands for its subtasks) and `level.resource
+{resource, options?}` (Level Resource, a uid or a name) run the leveler with
+only those tasks free to move, every other task keeping its dates and still
+booking its resources, and write each moved task's own `LevelingDelay`
+(elapsed minutes from the start its leveled predecessors drive it to, so a
+task that only follows a delayed predecessor records none, as Project does;
+stored in tenths of a minute as Project does) and pre-leveled dates (its
+unleveled start and finish) as one undo step. `options` is a `level.options`
+object applied to that pass only; the plan's options stay as they are. The scheduler honours a stored delay, so the leveled
 dates are the plan's dates and a save writes them; a task carrying one reports
 `leveling_delay_min` in `task.get`/`task.list`. The reply is `{changed,
 delayed, overallocated, tasks: [{uid, leveling_delay_min, start}]}`: `changed`

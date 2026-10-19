@@ -1529,7 +1529,8 @@ pub(crate) fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// external placeholders, tasks the schedule skips and auto summaries with
 /// nothing scheduled below them, and for every task of a plan with an input
 /// Project schedules by and docxy's schedule ignores: `ScheduleFromStart` 0,
-/// a non-zero task or assignment `LevelingDelay`, an
+/// a non-zero assignment `LevelingDelay` (a task's is part of the schedule
+/// since #1594), an
 /// elapsed task `DurationFormat`, or a work resource whose calendar differs
 /// from its task's. See `scheduled_dates` and `schedule_reproduces`.
 ///
@@ -1789,8 +1790,8 @@ fn scheduled_dates(
 /// stored dates. The inputs checked, each cheap and objective:
 ///
 /// - `ScheduleFromStart` 0: docxy schedules forward;
-/// - a non-zero task or assignment `LevelingDelay`: Project's leveling result,
-///   which the unleveled schedule ignores;
+/// - a non-zero assignment `LevelingDelay`: Project's leveling result on the
+///   assignment, which the schedule ignores (a task's is part of it, #1594);
 /// - an elapsed `DurationFormat` on a task: the schedule counts every duration
 ///   in working time;
 /// - a work assignment whose resource's calendar has other working time than

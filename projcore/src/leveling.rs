@@ -174,7 +174,7 @@ pub enum LevelTarget {
 }
 
 /// What a leveling pass did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LevelOutcome {
     /// Tasks whose stored delay or pre-leveled dates changed.
     pub changed: usize,
@@ -182,6 +182,9 @@ pub struct LevelOutcome {
     pub delayed: usize,
     /// Work resources still booked past their capacity afterwards.
     pub overallocated: usize,
+    /// The leaves the pass targeted (a summary's subtasks, a resource's
+    /// tasks), in row order: what a reply reports.
+    pub targeted: Vec<i32>,
 }
 
 #[cfg(test)]

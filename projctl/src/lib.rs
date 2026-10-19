@@ -39,8 +39,8 @@
 //! | `level.all` | `{}` | `{leveled: true, overallocated}` (#1589): show the plan leveled, as Resource > Level > Level All's display overlay; `overallocated` counts the work resources still booked past their capacity. Not an undo step: the overlay is a display setting |
 //! | `level.clear` | `{}` | `{leveled: false, overallocated}` (#1589): show the plan as scheduled again. With `{uids: [uid…]}` or `{all: true}` (#1594) it is Clear Leveling as a plan edit instead: the tasks' stored `LevelingDelay` and pre-leveled dates are removed, one undo step, replying `{cleared, overallocated}` |
 //! | `level.overallocations` | `{}` | `{count, resources: [{uid, name, max_units, peak_units, first}]}` (#1589): the work resources booked past their capacity on the plan as shown, each with its peak (1.0 = 100%) and the first overallocated instant, earliest first (Next Overallocation) |
-//! | `level.selection` | `{uids: [uid…]}` | `{changed, delayed, overallocated, tasks: [{uid, leveling_delay_min, start}]}` (#1594): Level Selection as a plan edit. The leveler runs over the plan with only these tasks (a summary stands for its subtasks) free to move, every other task keeping its dates and still booking its resources, and writes each moved task's `LevelingDelay` (elapsed minutes from its unleveled start, stored in tenths of a minute as Project does) and pre-leveled dates, one undo step. `changed` counts the tasks whose stored values changed (0 records no step), `delayed` those left with a delay, `tasks` every targeted leaf with its delay and start after the pass. The plan's Leveling Options apply |
-//! | `level.resource` | `{resource}` | the same reply (#1594): Level Resource, over the tasks the resource (a uid or a name) is assigned to |
+//! | `level.selection` | `{uids: [uid…], options?}` | `{changed, delayed, overallocated, tasks: [{uid, leveling_delay_min, start}]}` (#1594): Level Selection as a plan edit. The leveler runs over the plan with only these tasks (a summary stands for its subtasks) free to move, every other task keeping its dates and still booking its resources, and writes each moved task's `LevelingDelay` (elapsed minutes from its unleveled start, stored in tenths of a minute as Project does) and pre-leveled dates, one undo step. `changed` counts the tasks whose stored values changed (0 records no step), `delayed` those left with a delay, `tasks` every targeted leaf with its delay and start after the pass. The plan's Leveling Options apply |
+//! | `level.resource` | `{resource, options?}` | the same reply (#1594): Level Resource, over the tasks the resource (a uid or a name) is assigned to. `options` (both verbs) is a `level.options` object applied to this pass only; the plan's options stay as they are. A task that only follows a delayed predecessor records no delay of its own, as Project does |
 //! | `level.options` | `{order?, within_slack?, adjust_assignments?, split?, clear_first?}` | `{order, within_slack, adjust_assignments, split, clear_first}` (#1594): Project's Leveling Options as plan options, read with `{}`, set as one undo step (an unchanged setting records none). `order` is `ID`, `Standard` (the default: dependencies, then the plan's row order) or `Priority` (the highest priority first; priority 1000 is never leveled); `within_slack` never delays a task past its total slack; `clear_first` (default true) drops the targeted tasks' stored delays before a pass, else it builds on them; `adjust_assignments` and `split` are kept with the plan, the leveler delaying whole tasks |
 //! | `cal.list` | `{}` | `{count, calendars: [{uid, name, base: {uid, name} \| null, default, resources: [uid…], tasks: [uid…]}]}` (#1605), base calendars first |
 //! | `cal.get` | `{calendar}` | the calendar (`calendar` a uid or a name) with its resolved `week` (`[{day, working, times: [["08:00","12:00"], …], stated}]`), `exceptions: [{index, name, from, to, working, times, recurring}]` and `work_weeks: [{index, name, from, to, week}]` |
@@ -400,42 +400,22 @@ fn level_edit(ed: &mut Editor, args: &Json, by_resource: bool) -> Result<Json, S
         };
         LevelTarget::Selection(uids)
     };
-    let before: std::collections::HashSet<i32> = ed.project().tasks.iter().map(|t| t.uid).collect();
-    let out = ed.level_tasks(&target)?;
-    // The targeted leaves after the pass.
-    let targeted: Vec<i32> = match &target {
-        LevelTarget::Selection(uids) => {
-            let mut all = Vec::new();
-            for &uid in uids {
-                let n = ed.subtree_len(uid).unwrap_or(0);
-                let i = ed
-                    .project()
-                    .tasks
-                    .iter()
-                    .position(|t| t.uid == uid)
-                    .unwrap_or(0);
-                all.extend(
-                    ed.project().tasks[i..=(i + n).min(ed.project().tasks.len() - 1)]
-                        .iter()
-                        .map(|t| t.uid),
-                );
-            }
-            all
+    // Options for this pass only (#1594 r1), over the plan's.
+    let options = match args.get("options") {
+        None | Some(Json::Null) => None,
+        Some(o @ Json::Obj(_)) => {
+            let o = projcore::json::Json::parse(&o.to_string())
+                .map_err(|e| format!("'options': {e}"))?;
+            Some(ed.level_options().updated(&o, "options")?)
         }
-        LevelTarget::Resource(uid) => ed
-            .project()
-            .assignments
-            .iter()
-            .filter(|a| a.resource_uid == *uid)
-            .map(|a| a.task_uid)
-            .collect(),
-        LevelTarget::All => before.iter().copied().collect(),
+        Some(_) => return Err("'options' must be an object".into()),
     };
-    let mut seen = std::collections::HashSet::new();
-    let tasks: Vec<Json> = targeted
-        .into_iter()
-        .filter(|uid| seen.insert(*uid))
-        .filter_map(|uid| {
+    let out = ed.level_tasks_with(&target, options.as_ref())?;
+    // The leaves the pass targeted, in row order, after the pass.
+    let tasks: Vec<Json> = out
+        .targeted
+        .iter()
+        .filter_map(|&uid| {
             let t = ed.project().task(uid)?;
             if t.summary || t.is_null {
                 return None;
@@ -3851,6 +3831,32 @@ it"
         let off = run(&mut ed, "level.clear", "{}").unwrap();
         assert_eq!(off.get("leveled"), Some(&Json::Bool(false)));
         assert_eq!(ed.undo_depth(), depth);
+        // Options for one pass only (#1594 r1): within slack, Paint (no
+        // slack beside Build) cannot move and stays overallocated; the
+        // plan's options are untouched, and a bad `options` is refused.
+        let once = run(
+            &mut ed,
+            "level.selection",
+            r#"{"uids":[2],"options":{"within_slack":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(num(&once, "changed"), 0.0);
+        assert_eq!(num(&once, "overallocated"), 1.0);
+        assert_eq!(
+            run(&mut ed, "level.options", "{}")
+                .unwrap()
+                .get("within_slack"),
+            Some(&Json::Bool(false))
+        );
+        let err = run(&mut ed, "level.selection", r#"{"uids":[2],"options":3}"#).unwrap_err();
+        assert!(err.contains("'options' must be an object"), "{err}");
+        let err = run(
+            &mut ed,
+            "level.selection",
+            r#"{"uids":[2],"options":{"order":"slack"}}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("not ID, Standard or Priority"), "{err}");
     }
 
     #[test]
