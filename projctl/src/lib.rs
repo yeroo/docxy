@@ -36,10 +36,12 @@
 //! | `resource.set` | `{uid, name?, type?, …the same fields}` | the updated resource (#1588): `null` or `""` clears an optional text or rate; `type` changes only while the resource has no assignments; a rate edit keeps cost rate table A's current row, and a `max_units` edit the availability period in effect, in step |
 //! | `resource.del` | `{uid}` | `{deleted, assignments: [uid…]}` (#1588): its assignments go with it, each as the Resource Names cell removes a name, and its own derived calendar when nothing else uses it; later resources move up one ID |
 //! | `proj.get` | `{}` | the plan's settings (#1587): `{title, start, finish, status_date, current_date, calendar: {uid, name}, calendars: [{uid, name}], new_tasks}` (dates `YYYY-MM-DD HH:MM`, the status and current dates `null` when unset, `calendars` the base calendars, `new_tasks` `auto` or `manual`: how tasks added to the plan are scheduled, #1585) |
-//! | `level.all` | `{}` | `{leveled: true, overallocated}` (#1589): show the plan leveled, as Resource > Level > Level All; `overallocated` counts the work resources still booked past their capacity. Not an undo step: leveling is a display overlay |
-//! | `level.clear` | `{}` | `{leveled: false, overallocated}` (#1589): show the plan as scheduled, as Clear Leveling |
+//! | `level.all` | `{}` | `{leveled: true, overallocated}` (#1589): show the plan leveled, as Resource > Level > Level All's display overlay; `overallocated` counts the work resources still booked past their capacity. Not an undo step: the overlay is a display setting |
+//! | `level.clear` | `{}` | `{leveled: false, overallocated}` (#1589): show the plan as scheduled again. With `{uids: [uid…]}` or `{all: true}` (#1594) it is Clear Leveling as a plan edit instead: the tasks' stored `LevelingDelay` and pre-leveled dates are removed, one undo step, replying `{cleared, overallocated}` |
 //! | `level.overallocations` | `{}` | `{count, resources: [{uid, name, max_units, peak_units, first}]}` (#1589): the work resources booked past their capacity on the plan as shown, each with its peak (1.0 = 100%) and the first overallocated instant, earliest first (Next Overallocation) |
-//! | `level.selection`, `level.resource`, `level.options` | — | refused: the model levels the whole plan (#1594) |
+//! | `level.selection` | `{uids: [uid…]}` | `{changed, delayed, overallocated, tasks: [{uid, leveling_delay_min, start}]}` (#1594): Level Selection as a plan edit. The leveler runs over the plan with only these tasks (a summary stands for its subtasks) free to move, every other task keeping its dates and still booking its resources, and writes each moved task's `LevelingDelay` (elapsed minutes from its unleveled start, stored in tenths of a minute as Project does) and pre-leveled dates, one undo step. `changed` counts the tasks whose stored values changed (0 records no step), `delayed` those left with a delay, `tasks` every targeted leaf with its delay and start after the pass. The plan's Leveling Options apply |
+//! | `level.resource` | `{resource}` | the same reply (#1594): Level Resource, over the tasks the resource (a uid or a name) is assigned to |
+//! | `level.options` | `{order?, within_slack?, adjust_assignments?, split?, clear_first?}` | `{order, within_slack, adjust_assignments, split, clear_first}` (#1594): Project's Leveling Options as plan options, read with `{}`, set as one undo step (an unchanged setting records none). `order` is `ID`, `Standard` (the default: dependencies, then the plan's row order) or `Priority` (the highest priority first; priority 1000 is never leveled); `within_slack` never delays a task past its total slack; `clear_first` (default true) drops the targeted tasks' stored delays before a pass, else it builds on them; `adjust_assignments` and `split` are kept with the plan, the leveler delaying whole tasks |
 //! | `cal.list` | `{}` | `{count, calendars: [{uid, name, base: {uid, name} \| null, default, resources: [uid…], tasks: [uid…]}]}` (#1605), base calendars first |
 //! | `cal.get` | `{calendar}` | the calendar (`calendar` a uid or a name) with its resolved `week` (`[{day, working, times: [["08:00","12:00"], …], stated}]`), `exceptions: [{index, name, from, to, working, times, recurring}]` and `work_weeks: [{index, name, from, to, week}]` |
 //! | `cal.day` | `{calendar, date}` | `{date, working, times, based_on: {kind: exception \| work_week \| default, calendar, name}}`: Change Working Time's "Working times for" and "Based on" |
@@ -132,6 +134,9 @@ pub const MUTATING: &[&str] = &[
     "resource.del",
     "level.all",
     "level.clear",
+    "level.selection",
+    "level.resource",
+    "level.options",
     "cal.add",
     "cal.set",
     "cal.exception.set",
@@ -157,9 +162,6 @@ pub fn is_editor_verb(verb: &str) -> bool {
                 | "resource.list"
                 | "resource.get"
                 | "level.overallocations"
-                | "level.selection"
-                | "level.resource"
-                | "level.options"
                 | "cal.list"
                 | "cal.get"
                 | "cal.day"
@@ -219,13 +221,11 @@ pub fn dispatch_editor(ed: &mut Editor, verb: &str, args: &Json) -> Option<Resul
         "resource.set" => resource_set(ed, args),
         "resource.del" => resource_del(ed, args),
         "level.all" => Ok(level_set(ed, true)),
-        "level.clear" => Ok(level_set(ed, false)),
+        "level.clear" => level_clear(ed, args),
         "level.overallocations" => Ok(level_overallocations(ed)),
-        // (`apply_ops` prefixes the verb itself.)
-        "level.selection" | "level.resource" | "level.options" => Err(
-            "the model levels the whole plan (yeroo/docxy #1594); level.all and level.clear switch it"
-                .into(),
-        ),
+        "level.selection" => level_edit(ed, args, false),
+        "level.resource" => level_edit(ed, args, true),
+        "level.options" => level_options(ed, args),
         "cal.list" => Ok(cal_list(ed)),
         "cal.get" => cal_get(ed, args),
         "cal.day" => cal_day(ed, args),
@@ -336,6 +336,141 @@ fn level_set(ed: &mut Editor, on: bool) -> Json {
             Json::Num(shown_overbookings(ed).len() as f64),
         ),
     ])
+}
+
+/// `level.clear`: with `uids` or `all`, Clear Leveling as a plan edit
+/// (#1594); else the overlay off (#1589).
+fn level_clear(ed: &mut Editor, args: &Json) -> Result<Json, String> {
+    let all = args.get("all").and_then(Json::as_bool).unwrap_or(false);
+    let uids = match args.get("uids") {
+        None | Some(Json::Null) => None,
+        Some(Json::Arr(items)) => Some(
+            items
+                .iter()
+                .map(|u| {
+                    u.as_i64()
+                        .and_then(|n| i32::try_from(n).ok())
+                        .ok_or_else(|| "'uids' must be task uids".to_string())
+                })
+                .collect::<Result<Vec<i32>, String>>()?,
+        ),
+        Some(_) => return Err("'uids' must be a list of task uids".into()),
+    };
+    if !all && uids.is_none() {
+        return Ok(level_set(ed, false));
+    }
+    let cleared = ed.clear_leveling(uids.as_deref().filter(|_| !all))?;
+    Ok(Json::obj(vec![
+        ("cleared", Json::Num(cleared as f64)),
+        (
+            "overallocated",
+            Json::Num(shown_overbookings(ed).len() as f64),
+        ),
+    ]))
+}
+
+/// `level.selection` / `level.resource` (#1594): Level Selection or Level
+/// Resource as a plan edit, one undo step.
+fn level_edit(ed: &mut Editor, args: &Json, by_resource: bool) -> Result<Json, String> {
+    use projcore::leveling::LevelTarget;
+    let target = if by_resource {
+        let r = resource_arg(args)?.ok_or("'resource' is required: a uid or a name")?;
+        let uid = match r {
+            ResourceRef::Uid(uid) => uid,
+            ResourceRef::Name(name) => ed
+                .project()
+                .resources
+                .iter()
+                .find(|r| r.name.eq_ignore_ascii_case(name.trim()))
+                .map(|r| r.uid)
+                .ok_or_else(|| format!("no resource named '{name}'"))?,
+        };
+        LevelTarget::Resource(uid)
+    } else {
+        let uids = match args.get("uids") {
+            Some(Json::Arr(items)) => items
+                .iter()
+                .map(|u| {
+                    u.as_i64()
+                        .and_then(|n| i32::try_from(n).ok())
+                        .ok_or_else(|| "'uids' must be task uids".to_string())
+                })
+                .collect::<Result<Vec<i32>, String>>()?,
+            _ => return Err("'uids' is required: the task uids to level".into()),
+        };
+        LevelTarget::Selection(uids)
+    };
+    let before: std::collections::HashSet<i32> = ed.project().tasks.iter().map(|t| t.uid).collect();
+    let out = ed.level_tasks(&target)?;
+    // The targeted leaves after the pass.
+    let targeted: Vec<i32> = match &target {
+        LevelTarget::Selection(uids) => {
+            let mut all = Vec::new();
+            for &uid in uids {
+                let n = ed.subtree_len(uid).unwrap_or(0);
+                let i = ed
+                    .project()
+                    .tasks
+                    .iter()
+                    .position(|t| t.uid == uid)
+                    .unwrap_or(0);
+                all.extend(
+                    ed.project().tasks[i..=(i + n).min(ed.project().tasks.len() - 1)]
+                        .iter()
+                        .map(|t| t.uid),
+                );
+            }
+            all
+        }
+        LevelTarget::Resource(uid) => ed
+            .project()
+            .assignments
+            .iter()
+            .filter(|a| a.resource_uid == *uid)
+            .map(|a| a.task_uid)
+            .collect(),
+        LevelTarget::All => before.iter().copied().collect(),
+    };
+    let mut seen = std::collections::HashSet::new();
+    let tasks: Vec<Json> = targeted
+        .into_iter()
+        .filter(|uid| seen.insert(*uid))
+        .filter_map(|uid| {
+            let t = ed.project().task(uid)?;
+            if t.summary || t.is_null {
+                return None;
+            }
+            Some(Json::obj(vec![
+                ("uid", Json::Num(f64::from(uid))),
+                (
+                    "leveling_delay_min",
+                    Json::Num(t.leveling_delay.unwrap_or(0) as f64 / 10.),
+                ),
+                (
+                    "start",
+                    ed.disp_start(uid)
+                        .map_or(Json::Null, |d| Json::Str(dt_str(d))),
+                ),
+            ]))
+        })
+        .collect();
+    Ok(Json::obj(vec![
+        ("changed", Json::Num(out.changed as f64)),
+        ("delayed", Json::Num(out.delayed as f64)),
+        ("overallocated", Json::Num(out.overallocated as f64)),
+        ("tasks", Json::Arr(tasks)),
+    ]))
+}
+
+/// `level.options` (#1594): read, or set as one undo step, the plan's
+/// Leveling Options.
+fn level_options(ed: &mut Editor, args: &Json) -> Result<Json, String> {
+    // The options speak projcore's JSON; this crate's is ctlcore's.
+    let args = projcore::json::Json::parse(&args.to_string())
+        .map_err(|e| format!("level.options: {e}"))?;
+    let options = ed.level_options().updated(&args, "level.options")?;
+    ed.set_level_options(&options)?;
+    Json::parse(&options.to_json().to_string()).map_err(|e| format!("level.options: {e}"))
 }
 
 /// `level.overallocations`: each overallocated work resource with its peak
@@ -517,6 +652,11 @@ fn task_json(
     }
     if t.summary && t.manual {
         fields.push(("warning", Json::Bool(ed.summary_warning(t.uid))));
+    }
+    // A stored leveling delay (#1594), in elapsed minutes, when the task
+    // has one.
+    if let Some(d) = t.leveling_delay.filter(|d| *d != 0) {
+        fields.push(("leveling_delay_min", Json::Num(d as f64 / 10.)));
     }
     if let Some(r) = ed.schedule().get(t.uid) {
         fields.push(("critical", Json::Bool(r.critical)));
@@ -3588,14 +3728,9 @@ it"
         for verb in ["level.all", "level.clear"] {
             assert!(is_editor_verb(verb) && MUTATING.contains(&verb), "{verb}");
         }
-        for verb in [
-            "level.overallocations",
-            "level.selection",
-            "level.resource",
-            "level.options",
-        ] {
-            assert!(is_editor_verb(verb) && !MUTATING.contains(&verb), "{verb}");
-        }
+        assert!(
+            is_editor_verb("level.overallocations") && !MUTATING.contains(&"level.overallocations")
+        );
         // Ann on two parallel tasks is overallocated from their shared start.
         let mut ed = staffed(projcore::model::TaskType::FixedUnits, false);
         run(&mut ed, "task.add", r#"{"name":"Paint","duration":"2d"}"#).unwrap();
@@ -3640,12 +3775,82 @@ it"
         apply_ops(&mut ed, &ops).unwrap();
         assert!(ed.leveled());
         assert_eq!(ed.undo_depth(), depth);
-        // The rest of Project's Level group waits for the leveler (#1594).
-        for verb in ["level.selection", "level.resource", "level.options"] {
-            let err = run(&mut ed, verb, r#"{"uids":[1]}"#).unwrap_err();
-            assert!(err.contains("whole plan") && err.contains("#1594"), "{err}");
-        }
         assert!(ed.leveled());
+    }
+
+    /// #1594: Level Selection, Level Resource, Leveling Options and Clear
+    /// Leveling as plan edits: each one undo step, the delays stored and
+    /// scheduled, the overlay untouched.
+    #[test]
+    fn level_edits_write_the_delays_as_undo_steps() {
+        for verb in ["level.selection", "level.resource", "level.options"] {
+            assert!(is_editor_verb(verb) && MUTATING.contains(&verb), "{verb}");
+        }
+        let mut ed = staffed(projcore::model::TaskType::FixedUnits, false);
+        run(&mut ed, "task.add", r#"{"name":"Paint","duration":"2d"}"#).unwrap();
+        run(&mut ed, "assign.add", r#"{"task":1,"resource":1}"#).unwrap();
+        run(&mut ed, "assign.add", r#"{"task":2,"resource":1}"#).unwrap();
+        let depth = ed.undo_depth();
+        let build_finish = ed.schedule().get(1).unwrap().early_finish;
+        // Options: read, then set (one step); a bad order is named.
+        let opts = run(&mut ed, "level.options", "{}").unwrap();
+        assert_eq!(opts.get_str("order"), Some("Standard"));
+        assert_eq!(opts.get("clear_first"), Some(&Json::Bool(true)));
+        assert_eq!(ed.undo_depth(), depth);
+        let set = run(
+            &mut ed,
+            "level.options",
+            r#"{"order":"priority","within_slack":true}"#,
+        )
+        .unwrap();
+        assert_eq!(set.get_str("order"), Some("Priority"));
+        assert_eq!(ed.undo_depth(), depth + 1);
+        assert_eq!(ed.project().option("LevelingOrder"), Some("Priority"));
+        let err = run(&mut ed, "level.options", r#"{"order":"slack"}"#).unwrap_err();
+        assert!(err.contains("not ID, Standard or Priority"), "{err}");
+        run(
+            &mut ed,
+            "level.options",
+            r#"{"order":"standard","within_slack":false}"#,
+        )
+        .unwrap();
+        assert_eq!(ed.undo_depth(), depth + 2);
+        // Level Selection on Paint: it follows Build, with its delay stored.
+        let out = run(&mut ed, "level.selection", r#"{"uids":[2]}"#).unwrap();
+        assert_eq!(num(&out, "changed"), 1.0);
+        assert_eq!(num(&out, "delayed"), 1.0);
+        assert_eq!(num(&out, "overallocated"), 0.0);
+        let tasks = out.get("tasks").and_then(Json::as_array).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(num(&tasks[0], "uid"), 2.0);
+        assert!(num(&tasks[0], "leveling_delay_min") > 0.0);
+        assert_eq!(ed.undo_depth(), depth + 3);
+        assert!(ed.schedule().get(2).unwrap().early_start >= build_finish);
+        assert!(!ed.leveled(), "the overlay is not switched");
+        let paint = run(&mut ed, "task.get", r#"{"uid":2}"#).unwrap();
+        assert!(num(&paint, "leveling_delay_min") > 0.0);
+        // Clear Leveling as an edit: the delay goes, the dates come back.
+        let cleared = run(&mut ed, "level.clear", r#"{"uids":[2]}"#).unwrap();
+        assert_eq!(num(&cleared, "cleared"), 1.0);
+        assert_eq!(num(&cleared, "overallocated"), 1.0);
+        assert_eq!(ed.undo_depth(), depth + 4);
+        assert!(ed.schedule().get(2).unwrap().early_start < build_finish);
+        // Level Resource by name, then clear all; refusals name the problem.
+        let out = run(&mut ed, "level.resource", r#"{"resource":"ann"}"#).unwrap();
+        assert_eq!(num(&out, "delayed"), 1.0);
+        assert_eq!(out.get("tasks").and_then(Json::as_array).unwrap().len(), 2);
+        let err = run(&mut ed, "level.resource", r#"{"resource":"Bob"}"#).unwrap_err();
+        assert!(err.contains("no assignments"), "{err}");
+        let err = run(&mut ed, "level.selection", "{}").unwrap_err();
+        assert!(err.contains("'uids' is required"), "{err}");
+        let cleared = run(&mut ed, "level.clear", r#"{"all":true}"#).unwrap();
+        assert_eq!(num(&cleared, "cleared"), 1.0);
+        // A plain level.clear still switches the overlay off, no step.
+        let depth = ed.undo_depth();
+        run(&mut ed, "level.all", "{}").unwrap();
+        let off = run(&mut ed, "level.clear", "{}").unwrap();
+        assert_eq!(off.get("leveled"), Some(&Json::Bool(false)));
+        assert_eq!(ed.undo_depth(), depth);
     }
 
     #[test]

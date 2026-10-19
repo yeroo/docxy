@@ -813,7 +813,9 @@ mod tests {
             .into_iter()
             .find(|row| row[0] == "Pour")
             .unwrap();
-        assert_eq!(pour[2..4], ["2026-03-04 17:00:00", "2026-03-20 17:00:00"]);
+        // Pour's stored LevelingDelay (480 minutes, elapsed) is part of its
+        // schedule (#1594): it starts at 16:00 and finishes the next day.
+        assert_eq!(pour[2..4], ["2026-03-05 16:00:00", "2026-03-20 17:00:00"]);
     }
 
     #[test]

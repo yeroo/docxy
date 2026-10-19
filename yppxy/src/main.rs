@@ -3342,8 +3342,9 @@ mod tests {
         let (above, blank) = (app.list_y0 + 1, app.list_y0 + 2);
         assert_eq!(
             row(above, 1..45).split_whitespace().collect::<Vec<_>>(),
-            // Excavate is saved `Estimated` (#159).
-            ["•", "Excavate", "2d?", "0d"]
+            // Excavate is saved `Estimated` (#159); Pour's stored leveling
+            // delay gives it 7 hours of slack (#1594).
+            ["•", "Excavate", "2d?", "0.9d"]
         );
         assert_eq!(row(blank, 1..45).trim(), "");
         // No bar or milestone in the Gantt; weekend shading only.
@@ -3377,8 +3378,10 @@ mod tests {
                 .unwrap();
         let sched = projcore::schedule::schedule(&proj);
         let lines = project_preview(&proj, &sched, None);
+        // Pour's stored leveling delay leaves Excavate off the critical path
+        // (#1594).
         assert!(
-            lines.contains(&"Tasks:   3 (2 critical)".to_string()),
+            lines.contains(&"Tasks:   3 (1 critical)".to_string()),
             "{lines:?}"
         );
         let rows: Vec<_> = lines.iter().skip(5).map(|l| l.trim()).collect();

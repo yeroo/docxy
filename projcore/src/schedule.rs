@@ -982,6 +982,12 @@ impl<'a> Scheduler<'a> {
     }
 
     fn leaf_graph(&self) -> LeafGraph {
+        self.leaf_graph_ordered(ReadyOrder::Fifo)
+    }
+
+    /// The leaf graph with its topological order's ties broken as
+    /// `ready_order` says (a leveling pass's order, #1594).
+    fn leaf_graph_ordered(&self, ready_order: ReadyOrder) -> LeafGraph {
         // Exclude unschedulable leaves before either pass so they cannot
         // affect dependencies, project finish, or summary dates.
         let leaves: Vec<usize> = (0..self.proj.tasks.len())
@@ -1159,7 +1165,7 @@ impl<'a> Scheduler<'a> {
             &succs,
             &groups,
             &groups_by_source,
-            ReadyOrder::Fifo,
+            ready_order,
         );
         LeafGraph {
             leaves,
@@ -1553,6 +1559,13 @@ impl<'a> Scheduler<'a> {
             // late-start instant, even in a nonworking gap. So do binding
             // MFO/FNLT/SNLT and SNET/FNET milestones. Later start-type
             // links/constraints still snap.
+            // A stored LevelingDelay (Project's last leveling, or docxy's
+            // own, #1594) holds the task past its driven start by that
+            // elapsed time; the delayed instant snaps like any other.
+            let start_abs = match t.leveling_delay.filter(|d| *d > 0) {
+                Some(tenths) => start_abs.saturating_add(tenths / 10),
+                None => start_abs,
+            };
             let s_abs =
                 if fs_milestone_start == Some(start_abs) || held_milestone == Some(start_abs) {
                     start_abs
@@ -2624,16 +2637,22 @@ pub fn calendar_error(proj: &Project) -> Option<String> {
     None
 }
 
-/// FIFO for CPM; highest row first when importer pin removal reverses the result.
+/// FIFO for CPM; highest row first when importer pin removal reverses the
+/// result; the lowest ID or the highest priority first among the ready tasks
+/// for a leveling pass's order (#1594, [`crate::leveling::LevelOrder`]).
 #[derive(Clone, Copy)]
 enum ReadyOrder {
     Fifo,
     HighestRowFirst,
+    LowestIdFirst,
+    PriorityFirst,
 }
 
 enum ReadyQueue {
     Fifo(std::collections::VecDeque<i32>),
     HighestRowFirst(std::collections::BTreeSet<std::cmp::Reverse<usize>>),
+    /// Ready tasks by a sort key, then ID, then row.
+    Keyed(std::collections::BTreeSet<(i64, i32, usize)>, ReadyOrder),
 }
 
 impl ReadyQueue {
@@ -2643,14 +2662,26 @@ impl ReadyQueue {
             Self::HighestRowFirst(rows) => rows
                 .pop_first()
                 .map(|std::cmp::Reverse(index)| proj.tasks[index].uid),
+            Self::Keyed(set, _) => set.pop_first().map(|(_, _, index)| proj.tasks[index].uid),
         }
     }
 
-    fn push(&mut self, uid: i32, idx_of: &HashMap<i32, usize>) {
+    fn push(&mut self, uid: i32, idx_of: &HashMap<i32, usize>, proj: &Project) {
         match self {
             Self::Fifo(queue) => queue.push_back(uid),
             Self::HighestRowFirst(rows) => {
                 rows.insert(std::cmp::Reverse(idx_of[&uid]));
+            }
+            Self::Keyed(set, order) => {
+                let index = idx_of[&uid];
+                let t = &proj.tasks[index];
+                // Project's priority runs 0..=1000 (500 by default), the
+                // highest leveled first.
+                let key = match order {
+                    ReadyOrder::PriorityFirst => -i64::from(t.priority.unwrap_or(500)),
+                    _ => 0,
+                };
+                set.insert((key, t.id, index));
             }
         }
     }
@@ -2701,6 +2732,13 @@ fn topo_order(
                 .map(|uid| std::cmp::Reverse(idx_of[&uid]))
                 .collect(),
         ),
+        ReadyOrder::LowestIdFirst | ReadyOrder::PriorityFirst => {
+            let mut queue = ReadyQueue::Keyed(Default::default(), ready_order);
+            for uid in initial {
+                queue.push(uid, idx_of, proj);
+            }
+            queue
+        }
     };
     while let Some(u) = ready.pop(proj) {
         order.push(idx_of[&u]);
@@ -2709,7 +2747,7 @@ fn topo_order(
                 let d = indeg.get_mut(&v).unwrap();
                 *d -= 1;
                 if *d == 0 {
-                    ready.push(v, idx_of);
+                    ready.push(v, idx_of, proj);
                 }
             }
         }
@@ -2720,7 +2758,7 @@ fn topo_order(
                     if let Some(degree) = indeg.get_mut(&target) {
                         *degree -= 1;
                         if *degree == 0 {
-                            ready.push(target, idx_of);
+                            ready.push(target, idx_of, proj);
                         }
                     }
                 }
@@ -3253,12 +3291,50 @@ pub struct Leveled {
     start: HashMap<i32, DateTime>,
     finish: HashMap<i32, DateTime>,
     rollups: HashMap<i32, (DateTime, DateTime)>,
+    /// Each leaf's delay in elapsed minutes, from its CPM start to its
+    /// leveled one (#1594): what `LevelingDelay` stores.
+    delay_min: HashMap<i32, i64>,
     pub project_finish: DateTime,
+}
+
+/// What a leveling pass may move and in what order (#1594, Project's Level
+/// Selection, Level Resource and Leveling Options); the default is the
+/// whole plan in the plan's order, as [`level`] has always levelled.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LevelScope<'a> {
+    /// The tasks the pass may delay; `None` for all. Every other task keeps
+    /// its dates and still books its resources.
+    pub movable: Option<&'a std::collections::HashSet<i32>>,
+    pub order: crate::leveling::LevelOrder,
+    /// Never delay a task past its total slack: a task that would be is
+    /// left at its earliest start, overallocated.
+    pub within_slack: bool,
+}
+
+impl LevelScope<'_> {
+    fn ready_order(&self) -> ReadyOrder {
+        match self.order {
+            crate::leveling::LevelOrder::Standard => ReadyOrder::Fifo,
+            crate::leveling::LevelOrder::IdOnly => ReadyOrder::LowestIdFirst,
+            crate::leveling::LevelOrder::PriorityStandard => ReadyOrder::PriorityFirst,
+        }
+    }
+
+    /// A task the pass never moves: outside the movable set, or Project's
+    /// priority 1000 ("do not level").
+    fn held(&self, t: &Task) -> bool {
+        t.priority == Some(1000) || self.movable.is_some_and(|m| !m.contains(&t.uid))
+    }
 }
 
 impl Leveled {
     pub fn start(&self, uid: i32) -> Option<DateTime> {
         self.start.get(&uid).copied()
+    }
+    /// A leaf's leveling delay in elapsed minutes (#1594); `None` for a
+    /// summary, an external leaf or an unknown uid.
+    pub fn delay_min(&self, uid: i32) -> Option<i64> {
+        self.delay_min.get(&uid).copied()
     }
     pub fn finish(&self, uid: i32) -> Option<DateTime> {
         self.finish.get(&uid).copied()
@@ -3290,8 +3366,17 @@ impl Leveled {
 /// other. Multi-calendar leveling and task splitting are out of scope.
 /// If the default calendar has no working time, return the CPM dates unchanged.
 pub fn level(proj: &Project) -> Leveled {
+    level_with(proj, &LevelScope::default())
+}
+
+/// [`level`] over `scope`'s movable tasks, in its order (#1594): a task
+/// outside the set, or of priority 1000, is placed and booked at its CPM
+/// dates like a manual one, and the movable tasks level around it. A stored
+/// `LevelingDelay` is part of the CPM dates the pass starts from and never
+/// moves a task earlier; the editor's pass clears the movable tasks' first.
+pub fn level_with(proj: &Project, scope: &LevelScope) -> Leveled {
     let clean = without_unscheduled_rows(proj);
-    let mut main = level_local(&clean);
+    let mut main = level_local(&clean, scope);
     for task in &proj.tasks {
         if task.is_external_leaf() {
             if let Some(start) = task.stored_start {
@@ -3345,15 +3430,15 @@ pub fn overbookings(
     Scheduler::new(&active).overbookings(shown)
 }
 
-fn level_local(proj: &Project) -> Leveled {
+fn level_local(proj: &Project, scope: &LevelScope) -> Leveled {
     let dormant = dormant_uids(proj);
     if dormant.is_empty() {
-        return Scheduler::new(proj).level();
+        return Scheduler::new(proj).level(scope);
     }
     let active = without_tasks(proj, &dormant);
     let active_scheduler = Scheduler::new(&active);
     let active_result = active_scheduler.run();
-    let mut main = active_scheduler.level_from_base(&active_result);
+    let mut main = active_scheduler.level_from_base(&active_result, scope);
     let (other, dormant_bounds) = dormant_pass(proj, &dormant, &active_scheduler, &active_result);
     if dormant_bounds {
         main.project_finish = other.project_finish;
@@ -3760,12 +3845,12 @@ impl Scheduler<'_> {
         over
     }
 
-    fn level(&self) -> Leveled {
+    fn level(&self, scope: &LevelScope) -> Leveled {
         let base = self.run();
-        self.level_from_base(&base)
+        self.level_from_base(&base, scope)
     }
 
-    fn level_from_base(&self, base: &Schedule) -> Leveled {
+    fn level_from_base(&self, base: &Schedule, scope: &LevelScope) -> Leveled {
         let tl = self
             .timelines
             .get(&self.default_cal)
@@ -3776,13 +3861,17 @@ impl Scheduler<'_> {
                 start: base.results().map(|r| (r.uid, r.early_start)).collect(),
                 finish: base.results().map(|r| (r.uid, r.early_finish)).collect(),
                 rollups: base.rollups.clone(),
+                delay_min: HashMap::new(),
                 project_finish: base.project_finish,
             };
         }
 
-        let graph = self.leaf_graph();
+        let graph = self.leaf_graph_ordered(scope.ready_order());
         let leaves = &graph.leaves;
         let order = &graph.order;
+        // A task the pass never moves: manual or tracked, or held by the
+        // scope (#1594).
+        let held = |t: &Task| fixed(t) || scope.held(t);
 
         // Work-resource capacities and per-task assignments. An assignment
         // books its resource from its `Delay` into the task on; its stored
@@ -3808,7 +3897,7 @@ impl Scheduler<'_> {
         // gap too.
         for &i in order {
             let t = &self.proj.tasks[i];
-            if !fixed(t) {
+            if !held(t) {
                 continue;
             }
             let cpm = base.get(t.uid).expect("leaf scheduled");
@@ -3821,8 +3910,9 @@ impl Scheduler<'_> {
         for &i in order {
             let t = &self.proj.tasks[i];
             let cpm = base.get(t.uid).expect("leaf scheduled");
-            // A manual or tracked task keeps its dates and passes no delay on.
-            if fixed(t) {
+            // A manual or tracked task keeps its dates and passes no delay
+            // on; so does a task the scope holds.
+            if held(t) {
                 delay.insert(t.uid, 0);
                 start.insert(t.uid, cpm.early_start);
                 finish.insert(t.uid, cpm.early_finish);
@@ -3900,7 +3990,12 @@ impl Scheduler<'_> {
             // resource is booked only over its own assignment's window
             // (#469).
             let span = self.scheduled_span(i);
-            let placed = place_all(&res, &bookings, &caps, earliest);
+            let mut placed = place_all(&res, &bookings, &caps, earliest);
+            // Within available slack only (#1594): a task that would move
+            // past its total slack stays at its earliest start, overallocated.
+            if scope.within_slack && placed > earliest + cpm.total_slack_min.max(0) {
+                placed = earliest;
+            }
             delay.insert(t.uid, placed - cpm_start_idx);
             book_demands(&mut bookings, &res, placed);
             // A predecessor can move only its instant, keeping its working
@@ -4052,10 +4147,23 @@ impl Scheduler<'_> {
             .map(DateTime::from_minutes)
             .unwrap_or(base.project_finish);
 
+        // Each leaf's delay as `LevelingDelay` stores it: elapsed, from the
+        // CPM start to the leveled one (#1594).
+        let delay_min = leaves
+            .iter()
+            .map(|&i| self.proj.tasks[i].uid)
+            .filter_map(|uid| {
+                let cpm = base.get(uid)?;
+                let leveled = start.get(&uid)?;
+                Some((uid, leveled.minutes() - cpm.early_start.minutes()))
+            })
+            .collect();
+
         Leveled {
             start,
             finish,
             rollups,
+            delay_min,
             project_finish,
         }
     }

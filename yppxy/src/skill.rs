@@ -125,13 +125,17 @@ week?}` renames, rebases a derived calendar or sets days of the default week
 `index`, `.del` removes it; `cal.del` removes an unused calendar. Each is one
 undo step.
 
-Leveling is a display overlay: `level.all {}` shows the plan leveled (tasks
+Leveling as a display overlay: `level.all {}` shows the plan leveled (tasks
 delayed to fit resource capacity, as Resource > Level > Level All),
 `level.clear {}` shows it as scheduled; neither is an undo step, and both reply
 `{leveled, overallocated}`. `level.overallocations {}` lists the work resources
 booked past their capacity as shown, each with `peak_units` and the `first`
-overallocated instant, earliest first. `level.selection`, `level.resource` and
-`level.options` are refused: the model levels the whole plan.
+overallocated instant, earliest first. Leveling as a plan edit (one undo step
+each): `level.selection {uids}` and `level.resource {resource}` write the
+moved tasks' `LevelingDelay` (reported as `leveling_delay_min`), `level.clear
+{uids}` or `{all: true}` removes them, and `level.options {order?,
+within_slack?, adjust_assignments?, split?, clear_first?}` reads or sets
+Project's Leveling Options (`order` ID, Standard or Priority).
 
 Resources are addressed by their own UID, as `resource.list {}` reports it
 (`uid, id, name, type, initials, group, code, email, material_label,

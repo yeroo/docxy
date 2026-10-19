@@ -44,6 +44,7 @@ pub(crate) use fields::{format_work, two_decimals};
 use cells::parse_predecessors;
 use cells::{bracket_units, parse_resource_token, same_shown_units};
 mod display;
+mod leveling;
 mod moving;
 mod outline;
 mod plan;
@@ -4726,15 +4727,15 @@ mod tests {
         edited[0].lag = 480;
         ed.set_predecessors(4, edited.clone()).unwrap();
         assert_eq!(ed.project().task(4).unwrap().predecessors, edited);
-        // The blank row still does not drive Pour: only the new lag does.
+        // The blank row still does not drive Pour: only the new lag does,
+        // plus Pour's stored LevelingDelay of 480 minutes, elapsed (#1594).
         assert_eq!(
             ed.schedule().get(4).unwrap().early_start,
-            DateTime::from_ymd_hm(2026, 3, 5, 8, 0)
+            DateTime::from_ymd_hm(2026, 3, 5, 16, 0)
         );
         let back = crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(ed.project())).unwrap();
-        // Pour is leveled (LevelingDelay 4800), which the schedule does not
-        // model: the plan saves the dates Project wrote (#343).
-        assert_eq!(back.tasks, ed.project().tasks);
+        assert_eq!(back.task(4).unwrap().predecessors, edited);
+        assert_eq!(back.task(4).unwrap().leveling_delay, Some(4800));
         // A new link to the blank row is still refused.
         let mut added = ed.project().task(2).unwrap().predecessors.clone();
         added.push(links[1].clone());

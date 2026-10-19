@@ -285,17 +285,38 @@ ID. The reply is `{deleted, assignments: [uid…]}`. Each verb is one undo step,
 a value the resource already has records none, and every argument is checked
 first, so a rejected call leaves the plan untouched.
 
-Leveling is a display overlay (#1589): `level.all {}` shows the plan leveled,
-as Resource > Level > Level All does (tasks delayed so no work resource is
-booked past its capacity; see the leveler's rules in PROJECT.md), and
-`level.clear {}` shows it as scheduled again. Neither is an undo step, neither
-dirties the plan, and both reply `{leveled, overallocated}`, the count of work
-resources still booked past their capacity as shown; `proj.path` reports
-`leveled`. `level.overallocations {}` lists those resources, earliest first,
-each with `uid, name, max_units, peak_units` (1.0 = 100%) and `first`, the
-first overallocated instant, where Project's Next Overallocation goes.
-`level.selection`, `level.resource` and `level.options` are refused by name:
-the model levels the whole plan (#1594 is the leveler work).
+Leveling has two modes. The display overlay (#1589): `level.all {}` shows the
+plan leveled, as Resource > Level > Level All does (tasks delayed so no work
+resource is booked past its capacity; see the leveler's rules in PROJECT.md),
+and `level.clear {}` shows it as scheduled again. Neither is an undo step,
+neither dirties the plan, and both reply `{leveled, overallocated}`, the count
+of work resources still booked past their capacity as shown; `proj.path`
+reports `leveled`. `level.overallocations {}` lists those resources, earliest
+first, each with `uid, name, max_units, peak_units` (1.0 = 100%) and `first`,
+the first overallocated instant, where Project's Next Overallocation goes.
+
+Leveling as a plan edit (#1594): `level.selection {uids: [uid…]}` (Level
+Selection; a summary stands for its subtasks) and `level.resource {resource}`
+(Level Resource, a uid or a name) run the leveler with only those tasks free
+to move, every other task keeping its dates and still booking its resources,
+and write each moved task's `LevelingDelay` (elapsed minutes from its
+unleveled start, stored in tenths of a minute as Project does) and pre-leveled
+dates as one undo step. The scheduler honours a stored delay, so the leveled
+dates are the plan's dates and a save writes them; a task carrying one reports
+`leveling_delay_min` in `task.get`/`task.list`. The reply is `{changed,
+delayed, overallocated, tasks: [{uid, leveling_delay_min, start}]}`: `changed`
+counts the tasks whose stored values changed (0 records no step), `delayed`
+those left with a delay. `level.clear {uids: [uid…]}` or `{all: true}` is Clear
+Leveling as an edit, removing the delays and replying `{cleared,
+overallocated}`. `level.options {}` reads Project's Leveling Options as plan
+options and `level.options {order?, within_slack?, adjust_assignments?,
+split?, clear_first?}` sets them, one undo step: `order` is `ID`, `Standard`
+(the default: dependencies, then the plan's row order) or `Priority` (the
+highest priority first; priority 1000 is never leveled); `within_slack` never
+delays a task past its total slack; `clear_first` (default true) drops the
+targeted tasks' stored delays before a pass, else the pass builds on them;
+`adjust_assignments` and `split` are kept with the plan, the leveler delaying
+whole tasks.
 
 Calendars are addressed by `calendar`, a uid or a name (ASCII case ignored; a
 name wins when a calendar is named like a number, a JSON number is always a

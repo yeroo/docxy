@@ -1818,10 +1818,12 @@ fn schedule_reproduces(proj: &Project) -> bool {
             .and_then(|code| LagFormat::from_code(i64::from(code)))
             .is_some_and(|f| f.kind() == LagKind::Elapsed)
     };
+    // A task's LevelingDelay is part of the schedule since #1594; an
+    // assignment's still only moves the assignment.
     if proj
         .tasks
         .iter()
-        .any(|t| nonzero(t.leveling_delay) || (!t.is_null && !t.summary && elapsed(t)))
+        .any(|t| !t.is_null && !t.summary && elapsed(t))
     {
         return false;
     }
@@ -4904,7 +4906,6 @@ mod tests {
         // calendar's own elements, whether the plan keeps its dates)
         let cases = [
             ("", "", "", false),
-            ("<LevelingDelay>4800</LevelingDelay>", "", "", true),
             ("", "<LevelingDelay>4800</LevelingDelay>", "", true),
             ("<LevelingDelay>0</LevelingDelay>", "", "", false),
             ("<DurationFormat>8</DurationFormat>", "", "", true),

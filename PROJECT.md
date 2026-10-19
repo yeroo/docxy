@@ -275,6 +275,56 @@ and task splitting are future work. Leveling never moves a manual
 task: its bookings are placed first, and auto tasks level around them.
 `yppxy` toggles the overlay with `L` (View ▸ Level).
 
+Leveling is also a plan edit (#1594, `projcore::leveling`, `Editor::level_tasks`):
+Level All, Level Selection (a summary stands for its subtasks) and Level
+Resource run the same leveler over a scope (`schedule::level_with`: the
+tasks outside it keep their dates and still book their resources, as a
+manual task does; a task of priority 1000 is never leveled) and write each
+leveled task's `LevelingDelay` (elapsed minutes from its unleveled start, in
+tenths of a minute with `LevelingDelayFormat` 8, as Project 2024 stores
+it) and `PreLeveledStart`/`Finish`, one undo step. The scheduler honours a
+stored `LevelingDelay` (the task starts that much elapsed time after its
+links and constraints allow, snapped to working time; measured against
+Project 2024 over COM: a delay typed by hand moves Start, and Level All's
+delay is the elapsed gap), so the leveled dates are the plan's dates, a
+save writes them, and `schedule_reproduces` no longer treats a task delay
+as an input the schedule ignores. Clear Leveling removes the delays, one
+undo step. Leveling Options (`LevelOptions`) are plan options
+(`LevelingOrder`, `LevelWithinSlack`, `LevelAdjustAssignments`,
+`LevelCanSplit`, `LevelClearBeforeLeveling`, a default stored as nothing):
+the order is `Standard` (the topological order above), `ID` (the lowest ID
+first among the ready tasks) or `Priority` (the highest priority first);
+within slack never delays a task past its total slack; clear-first (the
+default) drops the scope's stored delays before the pass, else the pass
+builds on them. Adjusting assignments and splitting are kept as settings
+only. The display overlay stays for the display-only mode; `level.*`
+control verbs drive both (docs/agent-control.md).
+
+Leveling is also a plan edit (#1594, `projcore::leveling`, `Editor::level_tasks`):
+Level All, Level Selection (a summary stands for its subtasks) and Level
+Resource run the same leveler over a scope (`schedule::level_with`: the
+tasks outside it keep their dates and still book their resources, as a
+manual task does; a task of priority 1000 is never leveled) and write each
+leveled task's `LevelingDelay` (elapsed minutes from its unleveled start, in
+tenths of a minute with `LevelingDelayFormat` 8, as Project 2024 stores
+it) and `PreLeveledStart`/`Finish`, one undo step. The scheduler honours a
+stored `LevelingDelay` (the task starts that much elapsed time after its
+links and constraints allow, snapped to working time; measured against
+Project 2024 over COM: a delay typed by hand moves Start, and Level All's
+delay is the elapsed gap), so the leveled dates are the plan's dates, a
+save writes them, and `schedule_reproduces` no longer treats a task delay
+as an input the schedule ignores. Clear Leveling removes the delays, one
+undo step. Leveling Options (`LevelOptions`) are plan options
+(`LevelingOrder`, `LevelWithinSlack`, `LevelAdjustAssignments`,
+`LevelCanSplit`, `LevelClearBeforeLeveling`, a default stored as nothing):
+the order is `Standard` (the topological order above), `ID` (the lowest ID
+first among the ready tasks) or `Priority` (the highest priority first);
+within slack never delays a task past its total slack; clear-first (the
+default) drops the scope's stored delays before the pass, else the pass
+builds on them. Adjusting assignments and splitting are kept as settings
+only. The display overlay stays for the display-only mode; `level.*`
+control verbs drive both (docs/agent-control.md).
+
 ## Formats
 
 - **MSPDI** (`.xml`) — Project's documented interchange format. `projcore` reads

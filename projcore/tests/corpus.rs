@@ -641,12 +641,13 @@ fn task_fields_fixture_keeps_fields_and_a_blank_row() {
     assert_eq!((blank.id, blank.outline_level), (3, 0));
     assert!(blank.guid.is_some() && blank.create_date.is_some());
     // The blank row is not scheduled, and Pour follows Excavate as if it
-    // were not there.
+    // were not there, held 480 elapsed minutes by its stored LevelingDelay
+    // (#1594).
     let sched = schedule(&proj);
     assert!(sched.get(3).is_none());
     assert_eq!(
         sched.get(4).unwrap().early_start,
-        DateTime::from_ymd_hm(2026, 3, 4, 8, 0)
+        DateTime::from_ymd_hm(2026, 3, 4, 16, 0)
     );
     let saved = write_mspdi(&proj);
     assert_eq!(saved.matches("<IsNull>1</IsNull>").count(), 1);
