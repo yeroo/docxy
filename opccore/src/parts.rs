@@ -29,14 +29,16 @@ const MAX_RESOLVE_WORK: usize = 64 << 20;
 /// extension (`docProps/thumbnail.wmf`), or one an `Override` in
 /// `[Content_Types].xml` or an internal relationship names, is a part.
 ///
-/// The work is bounded by the entries, not by the shapes of their names or
-/// relationships: only an empty entry without an extension and with nothing
-/// under it can be named into a part, and nothing else is looked up. Naming
-/// reads the first `[Content_Types].xml` before any `.rels`, then the rest
-/// in ZIP order, and stops when the declared sizes of what it read pass
-/// [`MAX_NAMING_PART`] in total (an External relationship's part counts
-/// too): later parts name nothing, so a package with more than that in
-/// relationships can lose a part kept only by them.
+/// The work is bounded by the entries, not by the shapes of their names:
+/// only an empty entry without an extension and with nothing under it can be
+/// named into a part, and nothing else is looked up. Naming reads the first
+/// `[Content_Types].xml` before any `.rels`, then the rest in ZIP order. It
+/// stops when the declared sizes of what it read pass [`MAX_NAMING_PART`] in
+/// total (an External relationship's part counts too), and a relationship
+/// stops all naming once the directories and targets it resolved pass
+/// `MAX_RESOLVE_WORK` (64 MiB) in total: later parts name nothing, so a
+/// package with more than that in relationships can lose a part kept only by
+/// them.
 pub fn part_flags(zip: &ZipArchive, names: &[String]) -> Vec<bool> {
     let mut sorted: Vec<&str> = names.iter().map(String::as_str).collect();
     sorted.sort_unstable();
@@ -132,7 +134,7 @@ fn named_parts(
     let mut named = HashSet::new();
     let mut read = 0u64;
     let mut work = 0usize;
-    for (e, source) in sources {
+    'sources: for (e, source) in sources {
         read = read.saturating_add(e.uncomp_size);
         if read > MAX_NAMING_PART {
             continue;
@@ -149,7 +151,7 @@ fn named_parts(
                         let target = decode(p.attr("Target")).replace('\\', "/");
                         work = work.saturating_add(dir.len() + target.len());
                         if work > MAX_RESOLVE_WORK {
-                            break;
+                            break 'sources;
                         }
                         let target = resolve_relative(dir, &target).to_ascii_lowercase();
                         if candidates.contains(&target) {
@@ -328,7 +330,10 @@ mod tests {
             ("xl/a.bc", ""),
             ("docProps/thumbnail.wmf", ""),
             ("_rels/.rels", ""),
+            ("docx", "x"),
+            ("docx/inner.xml", "x"),
         ]);
+        assert!(is_part(&f, "docx"), "not empty: a part, however odd");
         assert!(!is_part(&f, "xl/media/"));
         assert!(!is_part(&f, "xl"));
         assert!(!is_part(&f, "xl/a.b"), "an entry lies under it");
