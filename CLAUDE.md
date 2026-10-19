@@ -933,9 +933,14 @@
 - With a styles context, Bold/Italic read and write over the styles
   (`Editor::toggle_run_prop`, per run): off over a style that makes the text
   bold writes `<w:b w:val="0"/>` (also at a caret, via `PendingFormat`'s
-  `explicit_off`), on again drops it and inherits. Without a context (terminal
+  `over`: `Over::Off`), on again drops it and inherits. Without a context (terminal
   `docxy`, wasm hosts) toggles are unchanged. `Editor::caret_props_shown` is
   the ribbon on-state; the harness `run` reports `shown_bold`/`shown_italic`.
+  Twins: turning on writes `w:b` with `w:bCs` when the run had the twin; off
+  over a style keeps the twin's `w:val="0"` in the shadow only (the primary's
+  also in `raw_props`, as the loader keeps it); inheriting drops both. The
+  sheet has no complex-script model, so off then on under a style with `w:b`
+  but no `w:bCs` drops the run's direct `w:bCs` (known gap).
   Out of scope: underline/strike explicit-off, caps/highlight/spacing from
   styles, table style size/font, `block_height_est` for styled sizes.
   `uiharness/cases/doc-run-styles.uit` was written without being run (macOS

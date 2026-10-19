@@ -260,8 +260,8 @@ struct PendingFormat {
     serial: Option<u64>,
     /// The direct value each toggled property is set to, by [`ToggleProp`]:
     /// one slot each, however often it is toggled. With a style context
-    /// (`styled`) `false` may mean "inherit the style's" or "off over it";
-    /// `over` says which.
+    /// (`styled`) `false` may mean "inherit the style's" (`Over::Inherit`), "off
+    /// over it" (`Over::Off`) or plain off (`Over::Plain`); `over` says which.
     toggles: [Option<bool>; ToggleProp::ALL.len()],
     /// Whether a style context decided the toggles (#1427): they were then
     /// set over what the styles give, so the property's explicit-off
@@ -341,6 +341,8 @@ impl ToggleProp {
     /// beside the primary when on, as the loader keeps an explicit-off (the
     /// primary also in `raw_props`, the twin's off in the shadow alone, so a
     /// later edit regenerates the pair), and as an off twin on plain text.
+    /// Inheriting (`Over::Inherit`) drops the pair, twin and all: the style
+    /// is assumed to supply it.
     fn set_over_style(self, props: &mut RunProps, direct: bool, over: Over) {
         let Some(local) = self.local() else {
             self.set()(props, direct);
@@ -351,7 +353,8 @@ impl ToggleProp {
             crate::styles::has_raw_child(std::slice::from_ref(r), l.trim_start_matches("w:"))
         };
         let had_off = props.raw_props.iter().any(|r| raw_is(r, &primary));
-        if self.get()(props) == direct && had_off == (over == Over::Off) {
+        // Plain off over a loaded explicit-off is already what it asks.
+        if self.get()(props) == direct && (had_off == (over == Over::Off) || over == Over::Plain) {
             return;
         }
         self.set()(props, direct);
