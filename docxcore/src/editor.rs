@@ -260,16 +260,15 @@ struct PendingFormat {
     serial: Option<u64>,
     /// The direct value each toggled property is set to, by [`ToggleProp`]:
     /// one slot each, however often it is toggled. With a style context
-    /// (`styled`) `false` may mean "inherit the style's"; `explicit_off`
-    /// says when it means "off over it".
+    /// (`styled`) `false` may mean "inherit the style's" or "off over it";
+    /// `over` says which.
     toggles: [Option<bool>; ToggleProp::ALL.len()],
     /// Whether a style context decided the toggles (#1427): they were then
     /// set over what the styles give, so the property's explicit-off
     /// element is the pending format's to drop.
     styled: bool,
-    /// The properties toggled off under a style that turns them on, which
-    /// type as an explicit `w:val="0"` over it.
-    explicit_off: [bool; ToggleProp::ALL.len()],
+    /// What each toggled property's `false` stands for under the styles.
+    over: [Over; ToggleProp::ALL.len()],
 }
 
 impl PendingFormat {
@@ -277,7 +276,7 @@ impl PendingFormat {
         for prop in ToggleProp::ALL {
             if let Some(value) = self.toggles[prop as usize] {
                 if self.styled {
-                    prop.set_over_style(props, value, self.explicit_off[prop as usize]);
+                    prop.set_over_style(props, value, self.over[prop as usize]);
                 } else {
                     prop.set()(props, value);
                 }
@@ -334,12 +333,15 @@ impl ToggleProp {
     }
 
     /// Set the property over the styles: `direct` is its direct value and
-    /// `off` writes the explicit `<w:b w:val="0"/>` that turns a style's
-    /// bold off. A run that already has both is left as it is, and a change
-    /// replaces the loaded primary and its complex-script twin together
-    /// (`w:b` with `w:bCs`: a lone twin would be written back for the
-    /// primary, #1063), writing the twin's explicit-off when it was there.
-    fn set_over_style(self, props: &mut RunProps, direct: bool, off: bool) {
+    /// `over` what a `false` one stands for (an explicit `<w:b w:val="0"/>`
+    /// turns a style's bold off). A run that already has both is left as it
+    /// is. A change replaces the loaded primary and its complex-script twin
+    /// together (`w:b` with `w:bCs`: a lone twin would be written back for
+    /// the primary, #1063) and keeps the twin if the run had it: written
+    /// beside the primary when on, as the loader keeps an explicit-off (the
+    /// primary also in `raw_props`, the twin's off in the shadow alone, so a
+    /// later edit regenerates the pair), and as an off twin on plain text.
+    fn set_over_style(self, props: &mut RunProps, direct: bool, over: Over) {
         let Some(local) = self.local() else {
             self.set()(props, direct);
             return;
@@ -349,7 +351,7 @@ impl ToggleProp {
             crate::styles::has_raw_child(std::slice::from_ref(r), l.trim_start_matches("w:"))
         };
         let had_off = props.raw_props.iter().any(|r| raw_is(r, &primary));
-        if self.get()(props) == direct && had_off == off {
+        if self.get()(props) == direct && had_off == (over == Over::Off) {
             return;
         }
         self.set()(props, direct);
@@ -364,11 +366,46 @@ impl ToggleProp {
             let name = crate::table_props::element_name(x);
             name != primary && name != twin
         });
-        if off {
-            props.raw_props.push(format!("<{primary} w:val=\"0\"/>"));
-            if had_twin {
-                props.raw_props.push(format!("<{twin} w:val=\"0\"/>"));
+        let off = |name: &str| format!("<{name} w:val=\"0\"/>");
+        match (direct, over) {
+            (true, _) if had_twin => {
+                props.shadow.push(format!("<{primary}/>"));
+                props.shadow.push(format!("<{twin}/>"));
             }
+            (false, Over::Off) => {
+                props.raw_props.push(off(&primary));
+                props.shadow.push(off(&primary));
+                if had_twin {
+                    props.shadow.push(off(&twin));
+                }
+            }
+            (false, Over::Plain) if had_twin => props.shadow.push(off(&twin)),
+            _ => {}
+        }
+    }
+}
+
+/// What a property's `false` stands for under the styles (#1427).
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Over {
+    /// Off, and the styles give nothing to turn off.
+    #[default]
+    Plain,
+    /// Inherit what the styles give.
+    Inherit,
+    /// Off over a style that turns it on: an explicit `w:val="0"`.
+    Off,
+}
+
+impl Over {
+    /// The direct value and `Over` for `value` shown over styles that give
+    /// the property `under`.
+    fn of(value: bool, under: bool) -> (bool, Over) {
+        match (value, under) {
+            (true, false) => (true, Over::Plain),
+            (true, true) => (false, Over::Inherit),
+            (false, true) => (false, Over::Off),
+            (false, false) => (false, Over::Plain),
         }
     }
 }
@@ -3070,14 +3107,9 @@ impl Editor {
         for ((path, s, e), base) in spans.iter().zip(&bases) {
             if let Some(p) = para_mut(&mut self.doc.body, path) {
                 match base {
-                    Some(b) => edit_run_range(&mut p.content, *s, *e, &|text, props| {
-                        let under = b.base(prop, props);
-                        let mut p = props.clone();
-                        prop.set_over_style(&mut p, value && !under, !value && under);
-                        Run {
-                            text: text.to_string(),
-                            props: p,
-                        }
+                    Some(b) => map_prop_range(&mut p.content, *s, *e, &|props| {
+                        let (direct, over) = Over::of(value, b.base(prop, props));
+                        prop.set_over_style(props, direct, over);
                     }),
                     None => set_prop_range(&mut p.content, *s, *e, set, value),
                 }
@@ -3099,9 +3131,10 @@ impl Editor {
         };
         let pending_now = self.pending_format();
         let mut toggles = pending_now.map(|p| p.toggles).unwrap_or_default();
-        let mut explicit_off = pending_now.map(|p| p.explicit_off).unwrap_or_default();
-        toggles[prop as usize] = Some(value && !under);
-        explicit_off[prop as usize] = !value && under;
+        let mut over = pending_now.map(|p| p.over).unwrap_or_default();
+        let (direct, kind) = Over::of(value, under);
+        toggles[prop as usize] = Some(direct);
+        over[prop as usize] = kind;
         let styled = base.is_some() || pending_now.is_some_and(|p| p.styled);
         let after_object = self.typing_after_object().is_some();
         // The step holds the state before the toggle, pending format and all.
@@ -3119,7 +3152,7 @@ impl Editor {
             serial: self.undo_serial(),
             toggles,
             styled,
-            explicit_off,
+            over,
         };
         // Toggles that cancel out (Bold twice) leave nothing to apply, so
         // the text typed next joins the run it is typed in.

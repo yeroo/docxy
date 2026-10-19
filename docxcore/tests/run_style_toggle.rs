@@ -340,3 +340,98 @@ fn caret_toggles_over_a_pair_keep_it_whole() {
     );
     assert!(run_props(&ed, &[0], 'x').bold);
 }
+
+const PAIR: &str =
+    "<w:p><w:r><w:rPr><w:b/><w:bCs/><w:i/><w:iCs/></w:rPr><w:t>Arab</w:t></w:r></w:p>";
+
+fn pairs_whole(out: &str) {
+    assert_eq!(out.matches("<w:b/>").count(), 1, "{out}");
+    assert_eq!(out.matches("<w:bCs/>").count(), 1, "{out}");
+    assert_eq!(out.matches("<w:i/>").count(), 1, "{out}");
+    assert_eq!(out.matches("<w:iCs/>").count(), 1, "{out}");
+    assert!(!out.contains("w:val=\"0\""), "{out}");
+}
+
+#[test]
+fn off_then_on_restores_the_pair_unstyled() {
+    let mut ed = editor(PAIR, true);
+    select(&mut ed, &[0], 0, 4);
+    ed.toggle_bold();
+    ed.toggle_italic();
+    ed.toggle_bold();
+    ed.toggle_italic();
+    pairs_whole(&xml(&ed));
+}
+
+#[test]
+fn caret_off_then_on_restores_the_pair() {
+    let mut ed = editor(PAIR, true);
+    ed.caret = Caret::at(vec![0], 4);
+    ed.toggle_bold();
+    ed.toggle_bold();
+    ed.toggle_italic();
+    ed.toggle_italic();
+    ed.insert_str("x");
+    pairs_whole(&xml(&ed).replace("<w:t xml:space=\"preserve\">Arab", "<w:t>Arab"));
+}
+
+#[test]
+fn on_over_a_loaded_explicit_off_pair_writes_the_pair() {
+    let mut ed = editor(
+        "<w:p><w:r><w:rPr><w:b w:val=\"0\"/><w:bCs w:val=\"0\"/><w:i w:val=\"0\"/>\
+         <w:iCs w:val=\"0\"/></w:rPr><w:t>Arab</w:t></w:r></w:p>",
+        true,
+    );
+    select(&mut ed, &[0], 0, 4);
+    ed.toggle_bold();
+    ed.toggle_italic();
+    pairs_whole(&xml(&ed));
+}
+
+#[test]
+fn heading_off_then_on_restores_the_pair() {
+    let mut ed = editor(
+        "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr><w:r><w:rPr>\
+         <w:b/><w:bCs/><w:i/><w:iCs/></w:rPr><w:t>Arab</w:t></w:r></w:p>",
+        true,
+    );
+    select(&mut ed, &[0], 0, 4);
+    ed.toggle_bold();
+    ed.toggle_italic();
+    ed.toggle_bold();
+    ed.toggle_italic();
+    // Inherits the style again: no direct elements left.
+    let out = xml(&ed);
+    assert!(
+        !out.contains("<w:b/>") && !out.contains("<w:b ") && !out.contains("<w:i/>"),
+        "{out}"
+    );
+    assert!(!out.contains("w:val=\"0\"") && !out.contains("Cs"), "{out}");
+}
+
+#[test]
+fn an_agent_bold_after_the_style_off_writes_the_pair() {
+    let mut ed = editor(
+        "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr><w:r><w:rPr>\
+         <w:b/><w:bCs/></w:rPr><w:t>Title</w:t></w:r></w:p>",
+        true,
+    );
+    select(&mut ed, &[0], 0, 5);
+    ed.toggle_bold();
+    let out = xml(&ed);
+    assert!(
+        out.contains("<w:b w:val=\"0\"/>") && out.contains("<w:bCs w:val=\"0\"/>"),
+        "{out}"
+    );
+    // What `doc.format bold:true` does: set the model's bold directly.
+    if let Block::Paragraph(p) = &mut ed.doc.body[0] {
+        for i in &mut p.content {
+            if let Inline::Run(r) = i {
+                r.props.bold = true;
+            }
+        }
+    }
+    let out = xml(&ed);
+    assert!(out.contains("<w:b/>") && out.contains("<w:bCs/>"), "{out}");
+    assert!(!out.contains("w:val=\"0\""), "{out}");
+}
