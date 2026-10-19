@@ -450,7 +450,9 @@
   collapses; `Policy::WholeGroups` (the Project ribbon, Project's way) skips
   that pass: a group keeps icon and label until it collapses whole into one
   labelled button, lowest priority (rightmost among equals) first, only
-  while the tab overflows. `ribbon_fit_now` picks the policy from the
+  while the tab overflows; the issue's "rightmost first" is read as the
+  tie rule, and Project 2024's own collapse order across its priorities is
+  not measured. `ribbon_fit_now` picks the policy from the
   active tab's kind; `ribbon-layout` never reports `icon-only` on a
   Project tab. A toggle with no icon (a contributed one may name none)
   draws and is estimated with its label. `ribbon-read`'s group states fit

@@ -735,6 +735,43 @@ mod tests {
         );
     }
 
+    /// #1608 r1: a contributed group of the lowest priority collapses before
+    /// any built-in group of the Task tab; at a width where only one group
+    /// must go, Editing (the lowest built-in priority) stays full. Pinned
+    /// here rather than in the harness case, whose 1180 px reaches Editing
+    /// on one CI display and not another.
+    #[test]
+    fn a_contributed_group_of_lowest_priority_collapses_before_editing() {
+        let task = model_tab(Kind::Project, "Task");
+        let mut specs: Vec<Spec> = task.groups.iter().map(|g| model_spec(g, &tw)).collect();
+        let editing = task
+            .groups
+            .iter()
+            .position(|g| g.title == "Editing")
+            .unwrap();
+        specs.push(Spec {
+            priority: 50,
+            full: 180.,
+            icon: 180.,
+            collapsed: 70.,
+        });
+        let all: f32 = specs.iter().map(|s| s.full).sum();
+        // Just too narrow for every group: the fixture's goes, Editing stays.
+        let fit = fit_with(&specs, all + GUTTER - 40., Policy::WholeGroups);
+        assert_eq!(fit.states.last(), Some(&State::Collapsed));
+        assert_eq!(fit.states[editing], State::Full);
+        assert!(fit.states[..editing].iter().all(|s| *s == State::Full));
+        // Narrower still: Editing is the next to collapse, nothing else yet.
+        let fit = fit_with(
+            &specs,
+            all + GUTTER - 40. - specs[editing].full,
+            Policy::WholeGroups,
+        );
+        assert_eq!(fit.states[editing], State::Collapsed);
+        assert_eq!(fit.states.last(), Some(&State::Collapsed));
+        assert!(fit.states[..editing].iter().all(|s| *s == State::Full));
+    }
+
     fn model_tab(kind: Kind, name: &str) -> rs::Tab<Act> {
         crate::ribbon_for(kind)
             .tabs

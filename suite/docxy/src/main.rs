@@ -34720,10 +34720,6 @@ impl Docxy {
         self.active_is_doc() || self.active_is_project()
     }
 
-    /// The active ribbon tab fitted to the window now (#1020): each group's
-    /// widths and where it went. The ribbon draws from this, and
-    /// `ribbon-read`, `ribbon-layout` and `ribbon-click` ask it too, so a verb
-    /// run straight after a resize sees the layout the next frame draws.
     /// How the active ribbon fits (#1608): Project's collapses whole groups,
     /// the document's and the sheet's drop labels first (#1020). The live
     /// fit and `ribbon-read`'s group states both ask this, so they agree.
@@ -34735,6 +34731,10 @@ impl Docxy {
         }
     }
 
+    /// The active ribbon tab fitted to the window now (#1020): each group's
+    /// widths and where it went. The ribbon draws from this, and
+    /// `ribbon-read`, `ribbon-layout` and `ribbon-click` ask it too, so a verb
+    /// run straight after a resize sees the layout the next frame draws.
     pub(crate) fn ribbon_fit_now(&self, window: &Window) -> RibbonFitNow {
         let tw = ribbon_text_width(window);
         let width = ribbon_width(window);

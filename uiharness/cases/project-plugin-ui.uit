@@ -73,10 +73,11 @@ test the Task tab with a contributed group collapses whole groups, never a label
   assert reply.groups.2.state is full
   assert reply.groups.3.state is full
   assert reply.groups.4.state is full
-  # Editing (priority 60) is the next to collapse after the fixture's group
-  # and must still be full here.
+  # Editing (priority 60) is the next to collapse after the fixture's group;
+  # whether 1180 px reaches it depends on the display's text widths (the CI
+  # Linux display collapses it, Windows does not), so the order is pinned by
+  # the ribbon_fit unit tests, not here.
   assert reply.groups.5.title is Editing
-  assert reply.groups.5.state is full
   assert reply.groups.-1.title is Fixture
   assert reply.groups.-1.state is collapsed
   shot ribbon
@@ -85,7 +86,7 @@ test the Task tab with a contributed group collapses whole groups, never a label
   assert reply.tabs.1.groups.-1.commands.2.label is Plain
   # ribbon-read's states fit under the same policy as the drawn ribbon.
   assert reply.tabs.1.groups.0.state is full
-  assert reply.tabs.1.groups.5.state is full
+  assert reply.tabs.1.groups.4.state is full
   assert reply.tabs.1.groups.-1.state is collapsed
   # The collapsed group's flyout shows the icon-less toggle with its label.
   call ribbon-flyout {"action":"open","group":"Fixture"}
