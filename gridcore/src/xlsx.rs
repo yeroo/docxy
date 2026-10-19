@@ -5494,42 +5494,54 @@ fn set_sort_state(mut xml: String, model: Option<(u32, u32, u32, u32)>) -> Strin
     let Some(held) = attr_at(&element, 0, "ref").and_then(crate::sheet::parse_range_name) else {
         return xml;
     };
+    let same_size = |(r1, c1, r2, c2): (u32, u32, u32, u32)| {
+        r2 - r1 == held.2 - held.0 && c2 - c1 == held.3 - held.1
+    };
+    let Some((r1, c1, r2, c2)) = model.filter(|&m| same_size(m)) else {
+        return remove_worksheet_child(&xml, "sortState");
+    };
+    let dr = i64::from(r1) - i64::from(held.0);
+    let dc = i64::from(c1) - i64::from(held.1);
+    // Each condition moves with the range and must stay inside it (and on
+    // the sheet); one that doesn't, or doesn't read as a range, can't be kept
+    // honest, so the whole element goes. Also for a range that didn't move.
+    let mut edits: Vec<(usize, String)> = Vec::new();
+    for (name, s, _) in element_children(&element) {
+        if name != "sortCondition" {
+            continue;
+        }
+        let moved = attr_at(&element, s, "ref")
+            .and_then(crate::sheet::parse_range_name)
+            .filter(|&(a, b, c, d)| a >= held.0 && b >= held.1 && c <= held.2 && d <= held.3)
+            .and_then(|(a, b, c, d)| {
+                let m = |v: u32, d: i64, max: u32| {
+                    u32::try_from(i64::from(v) + d).ok().filter(|&x| x < max)
+                };
+                Some((
+                    m(a, dr, 1_048_576)?,
+                    m(b, dc, 16_384)?,
+                    m(c, dr, 1_048_576)?,
+                    m(d, dc, 16_384)?,
+                ))
+            });
+        match moved {
+            Some((a, b, c, d)) => {
+                if (dr, dc) != (0, 0) {
+                    edits.push((s, format!("{}:{}", cell_name(a, b), cell_name(c, d))));
+                }
+            }
+            None => return remove_worksheet_child(&xml, "sortState"),
+        }
+    }
     if model == Some(held) {
         return xml;
     }
-    let block = match model {
-        Some((r1, c1, r2, c2)) if r2 - r1 == held.2 - held.0 && c2 - c1 == held.3 - held.1 => {
-            let dr = i64::from(r1) - i64::from(held.0);
-            let dc = i64::from(c1) - i64::from(held.1);
-            let mut block = element.clone();
-            let mut edits: Vec<(usize, String)> = Vec::new();
-            for (name, s, _) in element_children(&element) {
-                if name != "sortCondition" {
-                    continue;
-                }
-                let moved = attr_at(&element, s, "ref")
-                    .and_then(crate::sheet::parse_range_name)
-                    .and_then(|(a, b, c, d)| {
-                        let m = |v: u32, d: i64| u32::try_from(i64::from(v) + d).ok();
-                        Some((m(a, dr)?, m(b, dc)?, m(c, dr)?, m(d, dc)?))
-                    });
-                match moved {
-                    Some((a, b, c, d)) => {
-                        edits.push((s, format!("{}:{}", cell_name(a, b), cell_name(c, d))))
-                    }
-                    // A condition outside the range, or one that can't move,
-                    // can't be kept honest: drop the whole element.
-                    None => return remove_worksheet_child(&xml, "sortState"),
-                }
-            }
-            for (s, r) in edits.into_iter().rev() {
-                block = set_tag_attr(&block, s, "ref", Some(&r));
-            }
-            let r = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
-            set_tag_attr(&block, 0, "ref", Some(&r))
-        }
-        _ => String::new(),
-    };
+    let mut block = element;
+    for (s, r) in edits.into_iter().rev() {
+        block = set_tag_attr(&block, s, "ref", Some(&r));
+    }
+    let r = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
+    let block = set_tag_attr(&block, 0, "ref", Some(&r));
     xml.replace_range(start..end, &block);
     xml
 }
@@ -19575,6 +19587,25 @@ mod print_setup_tests {
             ws.contains(&SORT[SORT.find("<sortState").unwrap()..]),
             "{ws}"
         );
+    }
+
+    #[test]
+    fn a_sort_condition_outside_the_sort_range_drops_the_element() {
+        let stray = r#"<sortState ref="A2:C9"><sortCondition ref="E2:E9"/></sortState>"#;
+        // Untouched sheet, moved sheet: either way it goes.
+        let pkg = report("", stray);
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(!ws.contains("sortState"), "{ws}");
+        let (ws, _) = edited("", stray, |w| insert_rows(w, 0, 0, 2));
+        assert!(!ws.contains("sortState"), "{ws}");
+        // A condition inside it keeps the bytes.
+        let fine = r#"<sortState ref="A2:C9" xmlns:x="u"><sortCondition ref="C2:C9" descending="1"/></sortState>"#;
+        let pkg = report("", fine);
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(ws.contains(fine), "{ws}");
+        // Moved to the very last row it still fits, and stays.
+        let (ws, _) = edited("", SORT, |w| insert_rows(w, 0, 0, 1_048_576 - 9));
+        assert!(ws.contains("sortState"), "{ws}");
     }
 
     #[test]
