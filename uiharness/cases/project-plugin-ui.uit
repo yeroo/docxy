@@ -51,6 +51,38 @@ test a contributed group goes before the built-in group its manifest names
   call ribbon-click {"tab":"Gantt Chart Format","command":"fixture.format"}
   assert status is Fixture: format
 
+test a command's view.gridlines draws the table and chart rules from the plan (#1575)
+  # A plan without gridlines draws as before. The fixture's Format sets dotted
+  # red Gantt rows with every second one solid blue, no Sheet Rows and a red
+  # Project Start line (one undo step); the state lists the three lines (a `#`
+  # starts a comment, so the colours are pinned by the projcore test) and the
+  # shots show the rules (the default rules are too faint for `border`). A
+  # second press clears them all.
+  open copy:../fixtures/project-clipboard.xml
+  assert gridlines_set is 0
+  shot window
+  call ribbon-click {"tab":"Gantt Chart Format","command":"fixture.format"}
+  assert status is Fixture: format
+  assert dirty is true
+  assert gridlines_set is 3
+  assert gridlines.0.line is Gantt Rows
+  assert gridlines.0.type is dotted
+  assert gridlines.0.interval is 2
+  assert gridlines.0.interval_type is solid
+  assert gridlines.1.line is Sheet Rows
+  assert gridlines.1.type is none
+  assert gridlines.2.line is Project Start
+  assert gridlines.2.type is solid
+  shot window
+  shot gantt
+  call ribbon-click {"tab":"Gantt Chart Format","command":"fixture.format"}
+  assert gridlines_set is 0
+  shot window
+  key ctrl+z
+  assert gridlines_set is 3
+  key ctrl+z
+  assert gridlines_set is 0
+
 test a toggle runs its command and reads back checked as the plugin says
   open copy:../fixtures/project-clipboard.xml
   assert dirty is false

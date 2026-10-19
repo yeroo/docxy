@@ -434,6 +434,7 @@ State keys, as the app reports them after every driving verb:
 | `timeline_h` | Project (#1535): the Timeline pane's height in px: 84 by default, 60 to half the window once the grip under it is dragged. Window view state, never saved |
 | `nonworking` | Project: Timeline's inclusive, merged shaded day runs as `[[first, last], ...]` in Project date form (`Wed 3/4/26`). Empty when each day is narrower than 2 px or the project calendar has no weekly working time. Reported even while the Timeline is hidden |
 | `filler_rows` | Project: ruled empty rows visible below the last task, from the last drawn frame's `project-body` height (0 before the first layout). Unlike the other keys it trails a driving verb by a frame, so settle with a `shot` before asserting it |
+| `gridlines`, `gridlines_set` | Project (#1575): the plan's gridlines set away from their default, in Project's list order, each `{line, type, color, interval, interval_type, interval_color}` (`gridlines.0.line is Gantt Rows`), and how many there are (0 on a plan drawn as before the model) |
 | `ribbon_tab` | current kind-aware ribbon tab name (`Task`, `Resource`, `View`, `Home`, etc.; the contextual table tabs are `Table Design` and `Table Layout`, though the strip draws the second as plain "Layout", as Word does) |
 
 Dotted keys traverse objects, and numeric components index arrays: `assert

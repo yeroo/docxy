@@ -19,7 +19,11 @@
 //!   host stores in the plan's formatting, #1553), the swatches (set the palette,
 //!   returned as `view.palette`), `fixture.rename` (one `task.set` op
 //!   renaming the first selected task to "Renamed by fixture"), and
-//!   `task-information` (the page's OK: a status with the note's length).
+//!   `task-information` (the page's OK: a status with the note's length),
+//!   and `fixture.format` (#1575: sets the plan's gridlines through
+//!   `view.gridlines`: dotted red Gantt rows with every second one solid
+//!   blue, no sheet rows and a solid red project start line; a second press,
+//!   seeing the view's Gantt Rows dotted, clears them all with null).
 //! - Overlay: a polyline with an arrowhead from the first bar's end to the
 //!   second bar's start, a text label at the first bar, and a `selected N`
 //!   label at the selected task's bar when the request names one (#1565).
@@ -41,7 +45,7 @@ const MANIFEST: &str = r##"{
     {"id":"fixture.bold","kind":"toggle","label":"Bold","tip":"Bold on the selected cells (the view's cells)","keytip":"XB","icon":"bold"},
     {"id":"fixture.sheet","kind":"button","label":"Sheet (fixture)","tip":"A modeless dialog with a grid and buttons of its own","keytip":"XS","icon":"numbers"}]}]},
     {"tab":"Gantt Chart Format","groups":[{"title":"Fixture Format","before":"Bar Styles","controls":[
-    {"id":"fixture.format","kind":"button","label":"Format (fixture)","tip":"A group placed before Bar Styles","icon":"font"}]}]}],
+    {"id":"fixture.format","kind":"button","label":"Format (fixture)","tip":"A group placed before Bar Styles; sets or clears the plan's gridlines","icon":"font"}]}]}],
   "menus":[{"menu":"row","items":[{"id":"fixture.rename","label":"Rename (fixture)","icon":"comment","after":"Notes..."}]}],
   "dialogs":[
     {"id":"task-information","pages":[{"name":"Fixture","controls":[
@@ -313,7 +317,26 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
     };
     let id = req.get("id").and_then(Json::str).unwrap_or_default();
     let reply = match id {
-        "fixture.format" => r#"{"ops":[],"status":"Fixture: format"}"#.to_string(),
+        // The gridlines (#1575): set them, or, seeing them set in the
+        // view, put every line back to its default.
+        "fixture.format" => {
+            let set = req
+                .get("view")
+                .and_then(|v| v.get("gridlines"))
+                .and_then(|g| g.get("Gantt Rows"))
+                .and_then(|g| g.get("type"))
+                .and_then(Json::str)
+                == Some("dotted");
+            if set {
+                r#"{"ops":[],"status":"Fixture: format","view":{"gridlines":null}}"#.to_string()
+            } else {
+                r##"{"ops":[],"status":"Fixture: format","view":{"gridlines":{
+                    "Gantt Rows":{"type":"dotted","color":"#CC3333","interval":2,"interval_type":"solid","interval_color":"#3366CC"},
+                    "Sheet Rows":{"type":"none"},
+                    "Project Start":{"type":"solid","color":"#CC3333"}}}}"##
+                    .to_string()
+            }
+        }
         "fixture.hello" => match (req.get("button").and_then(Json::str), req.get("values")) {
             // Bump (#1610): one op on the first selected task, the dialog
             // kept open.

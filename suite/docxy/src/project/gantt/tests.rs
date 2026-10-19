@@ -674,6 +674,52 @@ fn row_rules_fill_the_body_and_follow_the_scroll_phase() {
     assert_eq!(row_rules(100., 28.), row_rules(100., 0.));
 }
 
+/// #1575: each rule knows its row, so a gridline's interval lands on every
+/// Nth row however the body is scrolled; the bottom tier's lines at the Days
+/// level are the day lines, and the major tier's start at the weeks.
+#[test]
+fn ruled_rows_carry_their_row_and_tier_lines_follow_the_timescale() {
+    assert_eq!(ruled_rows(84., 0.), [(0, 27.), (1, 55.), (2, 83.)]);
+    assert_eq!(ruled_rows(60., ROW_H * 3. + 10.), [(3, 17.), (4, 45.)]);
+    let two = projcore::formatting::Gridline {
+        interval: 2,
+        ..projcore::formatting::Gridline::solid()
+    };
+    let at: Vec<usize> = ruled_rows(84., 0.)
+        .into_iter()
+        .filter(|(row, _)| two.at_interval(*row))
+        .map(|(row, _)| row)
+        .collect();
+    assert_eq!(at, [1], "the second row of the body");
+    let scale = GanttScale {
+        origin_day: 0,
+        days: 60,
+        day_w: 22.,
+    };
+    assert_eq!(
+        tier_lines(scale, 0., 110., true),
+        day_lines(scale, 0., 110.),
+        "the minor tier at the Days level is the days"
+    );
+    assert_eq!(
+        tier_lines(scale, 11., 110., true),
+        day_lines(scale, 11., 110.)
+    );
+    let weeks = tier_lines(scale, 0., 22. * 21., false);
+    assert!(
+        weeks.len() <= 4 && weeks.windows(2).all(|w| w[1] - w[0] == 22. * 7.),
+        "{weeks:?}"
+    );
+    assert_eq!(
+        instant_x(scale, 0., projcore::DateTime::from_minutes(1440 + 720)),
+        33.
+    );
+    assert_eq!(
+        instant_x(scale, 10., projcore::DateTime::from_minutes(1440 + 720)),
+        23.
+    );
+}
+
 #[test]
 fn filler_rows_count_the_ruled_space_below_the_last_task() {
     assert_eq!(filler_rows(280., 0., 0), 10);
