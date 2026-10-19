@@ -1036,6 +1036,11 @@ fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
 struct FieldCollapse {
     /// The open fields, outermost first.
     open: Vec<OpenFieldSpan>,
+    /// While a field is open: each child that needed declarations for
+    /// prefixes a save does not keep, as `(start, end, declared source)`. A
+    /// declaration on the begin run does not reach its sibling runs, so the
+    /// collapsed slice takes these in place of the children's bare source.
+    declared: Vec<(usize, usize, String)>,
 }
 
 struct OpenFieldSpan {
@@ -1061,7 +1066,15 @@ impl FieldCollapse {
         use crate::field::FieldEvent;
         let pushed = &out[n.min(out.len())..];
         let run = p.raw_slice(start, p.pos());
+        // The child has ended, so the scope is its container's, shared by the
+        // siblings; a field this child opens is open from here on (a code run may).
         let code_run = is_run && is_field_code_run(run, pushed);
+        if !self.open.is_empty() || code_run {
+            let declared = declare_rebuilt(run, &rebuilt_bindings(p));
+            if declared != run {
+                self.declared.push((start, p.pos(), declared));
+            }
+        }
         // Content is inside every open field, so it rules on all of them.
         let taints = if code_run {
             !is_clean_code_run(run)
@@ -1101,12 +1114,35 @@ impl FieldCollapse {
                             outer.broken = true;
                         }
                     } else {
-                        collapse_field(out, open.idx, p.raw_slice(open.start, p.pos()));
+                        let raw = self.declared_slice(p, open.start);
+                        collapse_field(out, open.idx, &raw);
                     }
                 }
                 FieldEvent::Instr(_) | FieldEvent::Separate => {}
             }
         }
+        if self.open.is_empty() {
+            self.declared.clear();
+        }
+    }
+
+    /// The source from `from` to the parser's position, with the children
+    /// inside it that needed declarations replaced by their declared form.
+    fn declared_slice(&self, p: &XmlParser, from: usize) -> String {
+        let end = p.pos();
+        let mut raw = String::new();
+        let mut at = from;
+        for (a, b, declared) in self
+            .declared
+            .iter()
+            .filter(|(a, b, _)| *a >= from && *b <= end)
+        {
+            raw.push_str(p.raw_slice(at, *a));
+            raw.push_str(declared);
+            at = *b;
+        }
+        raw.push_str(p.raw_slice(at, end));
+        raw
     }
 }
 
@@ -1321,10 +1357,10 @@ fn collapse_field(out: &mut Vec<Inline>, idx: usize, raw: &str) {
 fn parse_fld_simple(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {
     // Capture the instruction (e.g. `= 2+2 \# "0.00"`) before advancing.
     let instr = decode_attr(p.attr("w:instr"));
-    let start = p.start_pos();
+    let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
     let mut inner = Vec::new();
     parse_inlines_into(p, rels, &mut inner);
-    let raw = p.raw_slice(start, p.pos()).to_string();
+    let raw = declare_rebuilt(p.raw_slice(start, p.pos()), &bindings);
     let cached: String = inner.iter().map(Inline::text).collect();
     // Recompute the value where we can (formula fields); otherwise show what Word
     // last cached. The original XML is kept verbatim for a lossless save.
@@ -1463,10 +1499,10 @@ fn parse_smart_tag(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline
 /// and distinguishable. The `content` is display-only — save re-emits `raw`.
 fn parse_revision(p: &mut XmlParser, rels: &Relationships, kind: RevisionKind) -> Inline {
     let metadata = parse_revision_metadata(p);
-    let start = p.start_pos();
+    let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
     let mut content = Vec::new();
     parse_inlines_into(p, rels, &mut content);
-    let raw = p.raw_slice(start, p.pos()).to_string();
+    let raw = declare_rebuilt(p.raw_slice(start, p.pos()), &bindings);
     for inl in &mut content {
         mark_revision(inl, kind);
     }
@@ -2424,10 +2460,10 @@ pub(crate) fn ppr_of_children(children: &[String]) -> ParProps {
     props
 }
 
-/// Parse a `<w:hyperlink>`, pushing into `out`. External links and internal
-/// anchors with complex children stay as one lossless [`Inline::Hyperlink`].
-/// Simple internal TOC links are split around tabs/breaks so leader stops keep
-/// rendering while each run segment remains navigable.
+/// Parse a `<w:hyperlink>`, pushing into `out`. External links, and internal
+/// anchors whose children are not all plain runs (a TOC entry's tab, a break,
+/// a field), stay as one lossless [`Inline::Hyperlink`] with `content` and
+/// `raw`; an internal anchor of plain runs keeps them in `runs`.
 fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {
     let raw_start = p.start_pos();
     // The prefixes declared below the part root, which the retained `raw`
@@ -2446,83 +2482,14 @@ fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<I
     };
     let rel_id = (!rid.is_empty()).then_some(rid);
     let anchor = (!anchor_attr.is_empty()).then_some(anchor_attr);
-    if target.is_none() {
-        // An internal anchor link (a cross-reference, or a TOC entry). Make it
-        // navigable so a click can jump to the bookmark. Each maximal run of
-        // `Inline::Run` becomes a `Hyperlink`; tabs/breaks are emitted at top
-        // level so TOC leader-dot tab stops still render — the surrounding link
-        // segments keep the whole entry clickable.
-        if let Some(anchor) = anchor {
-            let mut inner = Vec::new();
-            parse_inlines_into(p, rels, &mut inner);
-            let raw = declare_rebuilt(p.raw_slice(raw_start, p.pos()), &bindings);
-            if inner.iter().any(|inline| {
-                !matches!(inline, Inline::Run(_) | Inline::Tab(_) | Inline::Break(..))
-            }) {
-                out.push(Inline::Hyperlink(Hyperlink {
-                    target: None,
-                    anchor: Some(anchor),
-                    rel_id,
-                    runs: Vec::new(),
-                    content: inner,
-                    raw: Some(raw),
-                    content_changed: false,
-                }));
-                return;
-            }
-            if inner.iter().all(|inline| matches!(inline, Inline::Run(_))) {
-                let runs = inner
-                    .into_iter()
-                    .map(|inline| match inline {
-                        Inline::Run(run) => run,
-                        _ => unreachable!(),
-                    })
-                    .collect();
-                out.push(Inline::Hyperlink(Hyperlink {
-                    target: None,
-                    anchor: Some(anchor),
-                    rel_id,
-                    runs,
-                    content: Vec::new(),
-                    raw: preserve_opener.then_some(raw),
-                    content_changed: preserve_opener,
-                }));
-                return;
-            }
-            let mut runs: Vec<Run> = Vec::new();
-            for it in inner {
-                match it {
-                    Inline::Run(r) => runs.push(r),
-                    other => {
-                        if !runs.is_empty() {
-                            out.push(Inline::Hyperlink(Hyperlink {
-                                target: None,
-                                anchor: Some(anchor.clone()),
-                                rel_id: rel_id.clone(),
-                                runs: std::mem::take(&mut runs),
-                                content: Vec::new(),
-                                raw: preserve_opener.then(|| raw.clone()),
-                                content_changed: preserve_opener,
-                            }));
-                        }
-                        out.push(other);
-                    }
-                }
-            }
-            if !runs.is_empty() {
-                out.push(Inline::Hyperlink(Hyperlink {
-                    target: None,
-                    anchor: Some(anchor),
-                    rel_id,
-                    runs,
-                    content: Vec::new(),
-                    raw: preserve_opener.then_some(raw),
-                    content_changed: preserve_opener,
-                }));
-            }
-        } else {
-            parse_inlines_into(p, rels, out);
-        }
+    // An internal anchor link (a cross-reference, or a TOC entry) is made
+    // navigable so a click can jump to the bookmark. Anything but plain runs
+    // (a TOC entry's tab, a break, a field) stays inside the one `Hyperlink`
+    // as `content`, retained raw until an edit, so the entry saves as the
+    // single `w:hyperlink` it was and the renderer still lays the tab out as a
+    // leader-dot tab stop.
+    if target.is_none() && anchor.is_none() {
+        parse_inlines_into(p, rels, out);
         return;
     }
 

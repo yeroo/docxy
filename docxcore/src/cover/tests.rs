@@ -163,3 +163,47 @@ fn ids_avoid_the_used_ones() {
         vec![2, 4, 5]
     );
 }
+
+#[test]
+fn cell_level_controls_carry_their_typed_text() {
+    let sdt = |alias: &str, id: u32, cells: &str| {
+        format!(
+            "<w:sdt><w:sdtPr><w:alias w:val=\"{alias}\"/><w:id w:val=\"{id}\"/>\
+             <w:showingPlcHdr/></w:sdtPr><w:sdtContent>{cells}</w:sdtContent></w:sdt>"
+        )
+    };
+    let cell = |t: &str| format!("<w:tc><w:p><w:r><w:t>{t}</w:t></w:r></w:p></w:tc>");
+    let table = |abs: &str, date: &str| {
+        format!(
+            "<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w=\"2000\"/><w:gridCol w:w=\"2000\"/>\
+             <w:gridCol w:w=\"2000\"/></w:tblGrid><w:tr>{}{}{}</w:tr></w:tbl>",
+            sdt("Abstract", 1, &cell(abs)),
+            cell("plain"),
+            sdt("Date", 2, &cell(date)),
+        )
+    };
+    let typed = typed_placeholders(&body_blocks(&table("Typed abstract", "2026-10-02")));
+    assert_eq!(
+        typed.get(&Placeholder::Abstract).map(String::as_str),
+        Some("Typed abstract")
+    );
+    assert_eq!(
+        typed.get(&Placeholder::Date).map(String::as_str),
+        Some("2026-10-02")
+    );
+    assert_eq!(typed.len(), 2, "the plain cell is no placeholder");
+    // Prompts are left out, as for the other levels.
+    let prompts = typed_placeholders(&body_blocks(&table("[Type the abstract]", "[Pick]")));
+    assert!(prompts.is_empty(), "{prompts:?}");
+    // One control over two cells joins their text.
+    let two = body_blocks(&format!(
+        "<w:tbl><w:tblPr/><w:tblGrid/><w:tr>{}</w:tr></w:tbl>",
+        sdt("Abstract", 3, &format!("{}{}", cell("a"), cell("b")))
+    ));
+    assert_eq!(
+        typed_placeholders(&two)
+            .get(&Placeholder::Abstract)
+            .map(String::as_str),
+        Some("a\nb")
+    );
+}

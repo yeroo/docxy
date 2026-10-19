@@ -390,7 +390,7 @@ mod tests {
         let mut pkg = doc_pkg();
         let before = pkg.parts.clone();
         pkg.set_main_kind(DocKind::Template);
-        for ((n, b), (n0, b0)) in pkg.parts.iter().zip(&before) {
+        for ((n, b), (n0, b0)) in pkg.parts.iter().zip(before.iter()) {
             assert_eq!(n, n0);
             if n != "[Content_Types].xml" {
                 assert_eq!(b, b0, "{n}");
@@ -500,7 +500,7 @@ mod tests {
         let before = pkg.parts.clone();
         let change = pkg.set_main_kind(DocKind::MacroTemplate);
         assert!(change.retyped && !change.macros_dropped);
-        for ((n, b), (_, b0)) in pkg.parts.iter().zip(&before) {
+        for ((n, b), (_, b0)) in pkg.parts.iter().zip(before.iter()) {
             if n != "[Content_Types].xml" {
                 assert_eq!(b, b0, "{n}");
             }

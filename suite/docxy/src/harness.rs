@@ -1785,6 +1785,8 @@ fn doc_state(editor: &Editor, flags: &ViewFlags) -> Json {
     };
     let p = editor.caret_para_props();
     let r = editor.caret_props();
+    // Over the table, paragraph and character styles (#1427).
+    let shown = editor.caret_props_shown();
     let alignment = match p.align {
         Align::Left => "left",
         Align::Center => "center",
@@ -1831,6 +1833,8 @@ fn doc_state(editor: &Editor, flags: &ViewFlags) -> Json {
     let run = Json::obj(vec![
         ("bold", Json::Bool(r.bold)),
         ("italic", Json::Bool(r.italic)),
+        ("shown_bold", Json::Bool(shown.bold)),
+        ("shown_italic", Json::Bool(shown.italic)),
         ("underline", Json::Bool(r.underline)),
         ("strike", Json::Bool(r.strike)),
         ("font", str_or_null(r.font)),
@@ -7002,6 +7006,8 @@ mod tests {
             tracked_comment_ids: Default::default(),
             comments_removed_all: false,
             used_comment_ids: Default::default(),
+            pictures: Default::default(),
+            run_styles: Default::default(),
             pkg: None,
             notes: vec![],
             markdown: false,

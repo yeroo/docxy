@@ -1139,8 +1139,8 @@ Errors: an empty patch → `"patch needs at least one key"`; an unknown key →
 a known key → a key-specific message (e.g. `"bad numFmt code '<code>'"`,
 `"bad color '<value>' (want \"#RRGGBB\")"`). A rejected patch applies
 nothing. `col.width`'s `width` is a fractional **number** (Excel
-column-width units, e.g. `20.5`), not an integer; a non-positive width
-errors `"col.width: 'width' must be positive"`. In terminal xlsxy, a
+column-width units, e.g. `20.5`), not an integer; a negative or non-finite width
+errors `"col.width: 'width' must not be negative"`. In terminal xlsxy, a
 protected target sheet errors `"col.width: the sheet is protected"`.
 
 `col.width`'s undo behavior differs from `cell.format`'s: `cell.format` lands

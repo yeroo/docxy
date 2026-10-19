@@ -113,7 +113,7 @@ impl Package {
             .collect();
         // What every other `.rels` file targets, resolved against the folder
         // of the part it belongs to.
-        for (name, _) in &self.parts {
+        for (name, _) in self.parts.iter() {
             if !name.ends_with(".rels")
                 || name.eq_ignore_ascii_case(&rels_name)
                 || own_rels.iter().any(|r| r.eq_ignore_ascii_case(name))

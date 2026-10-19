@@ -379,12 +379,20 @@ fn read_yppx_within(bytes: &[u8], budget: u64) -> Result<Project, String> {
             Some((timeline::from_xml(&text).ok()?, entry.name.as_str()))
         })
         .map_or((None, None), |(flags, name)| (Some(flags), Some(name)));
+    // A directory entry, even one without a trailing `/`, is no part (#1167).
+    let names: Vec<String> = zip
+        .entries()
+        .iter()
+        .map(|entry| entry.name.replace('\\', "/"))
+        .collect();
+    let is_part = opccore::parts::part_flags(&zip, &names);
     let extras: Vec<_> = zip
         .entries()
         .iter()
-        .filter(|entry| {
+        .zip(is_part)
+        .filter(|(entry, part)| {
             let name = &entry.name;
-            !(name.ends_with('/')
+            !(!part
                 || name.eq_ignore_ascii_case(CONTENT_TYPES_PART)
                 || name.eq_ignore_ascii_case(MAIN_PART)
                 || name.eq_ignore_ascii_case(formatting::PART)
@@ -392,6 +400,7 @@ fn read_yppx_within(bytes: &[u8], budget: u64) -> Result<Project, String> {
                 || timeline_part.is_some_and(|part| name == part)
                 || !seen.insert(name.to_ascii_lowercase()))
         })
+        .map(|(entry, _)| entry)
         .collect();
     let content_types = zip
         .entries()
@@ -857,6 +866,60 @@ mod tests {
             read_yppx_within(&source, 0).unwrap_err(),
             ".yppx package is missing its project.xml part"
         );
+    }
+
+    /// #1167: directory entries without a trailing `/` are not retained
+    /// extras, so a save does not write them back; an empty part with an
+    /// extension is kept.
+    #[test]
+    fn directory_entries_are_no_extras() {
+        let source = with_parts(
+            ORIGINAL_CONTENT_TYPES,
+            &[
+                ("media", b""),
+                ("media/one.bin", b"one"),
+                ("customXml", b""),
+                ("empty.bin", b""),
+            ],
+        );
+        let project = read_yppx(&source).unwrap();
+        let kept: Vec<&str> = project
+            .package
+            .parts
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(kept, ["media/one.bin", "empty.bin"]);
+        let saved = write_yppx(&project).unwrap();
+        let zip = ZipArchive::open(&saved).unwrap();
+        assert!(zip.find("media").is_none());
+        assert!(zip.find("customXml").is_none());
+    }
+
+    /// #1167: a `.rels` over the naming limit names nothing, so an empty
+    /// extensionless entry only it names is a directory, not an extra.
+    #[test]
+    fn an_oversize_rels_part_names_nothing() {
+        let rels = |pad: usize| {
+            format!(
+                "<Relationships><Relationship Id=\"1\" Type=\"t\" Target=\"/media/ghost\"/>{}</Relationships>",
+                " ".repeat(pad)
+            )
+        };
+        let kept = |rels: String| {
+            let source = with_parts(
+                ORIGINAL_CONTENT_TYPES,
+                &[("_rels/.rels", rels.as_bytes()), ("media/ghost", b"")],
+            );
+            let project = read_yppx(&source).unwrap();
+            project
+                .package
+                .parts
+                .iter()
+                .any(|(n, _)| n == "media/ghost")
+        };
+        assert!(kept(rels(0)), "named by a small rels");
+        assert!(!kept(rels(opccore::parts::MAX_NAMING_PART as usize)));
     }
 
     #[test]
