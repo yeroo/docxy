@@ -4929,6 +4929,8 @@ struct DocTab {
     /// only document.xml back into it and preserves every other part (footnotes,
     /// headers/footers, images, themes, …). `None` for a new empty document.
     pkg: Option<Package>,
+    /// The pictures read from `pkg` for drawing, until its parts change.
+    pictures: std::cell::RefCell<pictures::Cache>,
     /// Footnotes / endnotes parsed from the package (display-only side panel).
     notes: Vec<docxcore::notes::Note>,
     /// This tab is Markdown-backed (opened from a `.md`); Save writes Markdown.
@@ -8096,6 +8098,7 @@ fn blank_docx_tab(title: &str) -> DocTab {
         tracked_comment_ids: Default::default(),
         comments_removed_all: false,
         used_comment_ids: Default::default(),
+        pictures: Default::default(),
         pkg: None,
         notes: vec![],
         markdown: false,
@@ -8171,6 +8174,7 @@ impl Loaded {
             tracked_comment_ids: Default::default(),
             comments_removed_all: false,
             used_comment_ids: Default::default(),
+            pictures: Default::default(),
             mail: mailings_tab::MailState::from_pkg(self.pkg.as_ref()),
             field_codes: false,
             pkg: self.pkg,
@@ -8650,6 +8654,7 @@ fn sheet_tab_from_path(path: &PathBuf, repair: bool) -> DocTab {
         tracked_comment_ids: Default::default(),
         comments_removed_all: false,
         used_comment_ids: Default::default(),
+        pictures: Default::default(),
         pkg: None,
         notes: vec![],
         markdown: false,
@@ -12800,6 +12805,7 @@ fn restore_tab_content(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 tracked_comment_ids: Default::default(),
                 comments_removed_all: false,
                 used_comment_ids: Default::default(),
+                pictures: Default::default(),
                 pkg: None,
                 notes: vec![],
                 markdown: false,
@@ -12846,6 +12852,7 @@ fn restore_tab_content(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 tracked_comment_ids: Default::default(),
                 comments_removed_all: false,
                 used_comment_ids: Default::default(),
+                pictures: Default::default(),
                 mail: mailings_tab::MailState::from_pkg(pkg.as_ref()),
                 field_codes: false,
                 import: Default::default(),
@@ -14303,6 +14310,7 @@ impl Docxy {
             tracked_comment_ids: Default::default(),
             comments_removed_all: false,
             used_comment_ids: Default::default(),
+            pictures: Default::default(),
             pkg: None,
             notes: vec![],
             markdown: false,
@@ -26926,6 +26934,7 @@ mod sheet_save_tests {
             tracked_comment_ids: Default::default(),
             comments_removed_all: false,
             used_comment_ids: Default::default(),
+            pictures: Default::default(),
             pkg: None,
             notes: vec![],
             markdown: true,
@@ -37965,8 +37974,11 @@ impl Render for Docxy {
                         tbl.draw = Some(self.draw_geom.clone());
                     }
                     let body_range = editor.cell_range();
-                    // Inline pictures (#1432): read once per frame, per story part.
-                    let pictures = tab.pkg.as_ref().map(pictures::Pictures::new);
+                    // Inline pictures (#1432), kept across frames in the tab.
+                    let pictures = tab
+                        .pkg
+                        .as_ref()
+                        .map(|pkg| pictures::Pictures::new(pkg, &tab.pictures));
                     let ctx = RenderCtx {
                         caret_path: &editor.caret.path,
                         caret_off: editor.caret.offset,

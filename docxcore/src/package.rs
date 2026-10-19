@@ -901,11 +901,63 @@ fn vml_color(value: &str) -> Option<(u8, u8, u8)> {
     })
 }
 
+/// The package's parts, stamped: every mutable access takes a fresh stamp
+/// from one process-wide counter, so two states of any packages never share
+/// one unless one was cloned from the other unchanged ([`Package::parts_stamp`]).
+#[derive(Debug, Clone)]
+struct Parts {
+    list: Vec<(String, Vec<u8>)>,
+    stamp: u64,
+}
+
+impl<'a> IntoIterator for &'a Parts {
+    type Item = &'a (String, Vec<u8>);
+    type IntoIter = std::slice::Iter<'a, (String, Vec<u8>)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.list.iter()
+    }
+}
+
+/// Equal when the parts are, whatever their stamps.
+impl PartialEq for Parts {
+    fn eq(&self, other: &Self) -> bool {
+        self.list == other.list
+    }
+}
+
+fn next_parts_stamp() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl From<Vec<(String, Vec<u8>)>> for Parts {
+    fn from(list: Vec<(String, Vec<u8>)>) -> Self {
+        Parts {
+            list,
+            stamp: next_parts_stamp(),
+        }
+    }
+}
+
+impl std::ops::Deref for Parts {
+    type Target = Vec<(String, Vec<u8>)>;
+    fn deref(&self) -> &Self::Target {
+        &self.list
+    }
+}
+
+impl std::ops::DerefMut for Parts {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.stamp = next_parts_stamp();
+        &mut self.list
+    }
+}
+
 /// A loaded `.docx`: the editable [`Document`] plus all original parts so save
 /// can preserve what isn't modeled.
 #[derive(Debug, Clone)]
 pub struct Package {
-    parts: Vec<(String, Vec<u8>)>,
+    parts: Parts,
     doc_index: usize,
     sect_pr: String,
     /// The editable document. Mutate this, then [`save_package`].
@@ -1269,6 +1321,26 @@ impl Package {
             .and_then(decode_xml_part)
             .map(|xml| parse_rels_xml(&xml))
             .unwrap_or_default()
+    }
+
+    /// A stamp that changes whenever any part may have changed (and is the
+    /// same for a package and its unchanged clone): a cache of what is read
+    /// from the parts stays valid while it holds.
+    pub fn parts_stamp(&self) -> u64 {
+        self.parts.stamp
+    }
+
+    /// The package part a relationship of `part` names, for a target inside
+    /// the package: relative to `word/`, a leading `/` from the package root,
+    /// `..` and `.` resolved. `None` for an unknown id, an external target
+    /// or a malformed one.
+    pub fn part_rel_target(&self, part: &str, rid: &str) -> Option<String> {
+        let rels = self.part_rels(part);
+        let (_, target, external) = rels.iter().find(|(id, _, _)| *id == rid)?;
+        if external {
+            return None;
+        }
+        resolve_document_relationship_target(target)
     }
 
     /// The raw bytes of a part by name.
@@ -3769,7 +3841,7 @@ pub fn load_package(data: &[u8]) -> Result<Package, LoadError> {
     let (document, sect_pr) = parse_main_document(&parts, doc_index)?;
 
     Ok(Package {
-        parts,
+        parts: parts.into(),
         doc_index,
         sect_pr,
         document,
@@ -3843,7 +3915,7 @@ pub fn new_package(document: Document) -> Package {
     ];
     let doc_index = 2;
     Package {
-        parts,
+        parts: parts.into(),
         doc_index,
         sect_pr: String::new(),
         document,
@@ -6434,6 +6506,53 @@ mod tests {
     /// #768: a picture in a header is related from the header's own rels,
     /// created when it has none, never from `document.xml.rels`; a JPEG
     /// declares `image/jpeg` once, whatever letter case a Default has.
+    #[test]
+    fn the_parts_stamp_moves_on_a_change_and_survives_a_clone() {
+        let mut pkg = new_package(Document { body: vec![] });
+        let first = pkg.parts_stamp();
+        assert_eq!(pkg.parts_stamp(), first, "reads leave it");
+        assert!(pkg.part("word/styles.xml").is_some());
+        assert_eq!(pkg.clone().parts_stamp(), first);
+        assert!(pkg.set_part("word/styles.xml", b"<w:styles/>".to_vec()));
+        let second = pkg.parts_stamp();
+        assert_ne!(second, first);
+        assert_ne!(new_package(Document { body: vec![] }).parts_stamp(), second);
+    }
+
+    #[test]
+    fn part_rel_target_resolves_inside_the_package_only() {
+        let mut pkg = new_package(Document { body: vec![] });
+        let (_, header) = pkg.create_hf_part(true, "<w:p/>").unwrap();
+        let rels = |target: &str, mode: &str| {
+            format!(
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+                 <Relationship Id=\"rId1\" Type=\"t\" Target=\"{target}\"{mode}/></Relationships>"
+            )
+        };
+        let name = part_rels_name(&header).unwrap();
+        let mut target = |t: &str, mode: &str| {
+            if pkg.part(&name).is_some() {
+                assert!(pkg.set_part(&name, rels(t, mode).into_bytes()));
+            } else {
+                pkg.parts.push((name.clone(), rels(t, mode).into_bytes()));
+            }
+            pkg.part_rel_target(&header, "rId1")
+        };
+        assert_eq!(target("media/a.png", ""), Some("word/media/a.png".into()));
+        assert_eq!(
+            target("../word/media/a.png", ""),
+            Some("word/media/a.png".into())
+        );
+        assert_eq!(
+            target("/word/media/a.png", ""),
+            Some("word/media/a.png".into())
+        );
+        assert_eq!(target("../../x.png", ""), None);
+        assert_eq!(target("media/a.png", " TargetMode=\"External\""), None);
+        assert_eq!(target("http://x/a.png", ""), None);
+        assert_eq!(pkg.part_rel_target(&header, "rId9"), None);
+    }
+
     #[test]
     fn add_part_image_relates_from_the_parts_own_rels() {
         let mut pkg = new_package(Document { body: vec![] });

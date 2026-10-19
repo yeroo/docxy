@@ -120,9 +120,24 @@ pub fn inline_extent(raw: &str) -> Option<(i64, i64)> {
 
 /// An inline picture run's `r:embed` relationship id, from its `a:blip`,
 /// under the guards of [`inline_extent`] (inline only, never `wp:anchor`).
+/// Only a drawing whose `a:graphicData` is a picture has one: a group, canvas
+/// or shape holds blips of members that are not the whole drawing.
 pub fn inline_embed(raw: &str) -> Option<String> {
+    const PICTURE_URI: &str = "http://schemas.openxmlformats.org/drawingml/2006/picture";
     inline_extent(raw)?;
-    let at = raw.find("<a:blip")?;
+    let data = raw.find("<a:graphicData")?;
+    let data_end = data + raw[data..].find('>')?;
+    if crate::load::xml_attr_value(&raw[data..data_end], "uri")? != PICTURE_URI {
+        return None;
+    }
+    let mut from = data_end;
+    let at = loop {
+        let at = from + raw[from..].find("<a:blip")?;
+        match raw.as_bytes().get(at + "<a:blip".len()) {
+            Some(b' ' | b'/' | b'>' | b'\t' | b'\r' | b'\n') => break at,
+            _ => from = at + 1,
+        }
+    };
     let end = at + raw[at..].find('>')?;
     crate::load::xml_attr_value(&raw[at..end], "r:embed").filter(|rid| !rid.is_empty())
 }
@@ -335,6 +350,16 @@ mod tests {
             ),
             None
         );
+        // A group holding a picture member is not itself a picture, and a
+        // longer element name is not a blip.
+        let group = run.replace(
+            "http://schemas.openxmlformats.org/drawingml/2006/picture\"",
+            "http://schemas.microsoft.com/office/word/2010/wordprocessingGroup\"",
+        );
+        assert_ne!(group, run);
+        assert_eq!(inline_embed(&group), None);
+        let lookalike = run.replace("<a:blip ", "<a:blipFill ");
+        assert_eq!(inline_embed(&lookalike), None);
         // An inline drawing with no blip (a shape) has no picture to draw.
         assert_eq!(
             inline_embed(

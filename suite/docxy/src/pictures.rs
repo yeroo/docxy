@@ -13,15 +13,9 @@ use gpui::{Image, ImageFormat};
 
 /// The media behind `rid` in `part`'s relationships: the extension
 /// [`docxcore::image::sniff`] found and the bytes. `None` when the rid, its
-/// target part or a recognisable image is missing.
+/// target part (an external one is none) or a recognisable image is missing.
 pub fn resolve(pkg: &Package, part: &str, rid: &str) -> Option<(&'static str, Vec<u8>)> {
-    let rels = pkg.part_rels(part);
-    let target = rels.target(rid)?;
-    let name = match target.strip_prefix('/') {
-        Some(root) => root.to_string(),
-        None => format!("word/{}", target.trim_start_matches("./")),
-    };
-    let bytes = pkg.part(&name)?;
+    let bytes = pkg.part(&pkg.part_rel_target(part, rid)?)?;
     let kind = docxcore::image::sniff(bytes)?;
     Some((kind.ext, bytes.to_vec()))
 }
@@ -39,31 +33,44 @@ fn format_of(ext: &str) -> Option<ImageFormat> {
 /// A picture's story part and relationship id.
 type PictureKey = (String, String);
 
-/// The pictures one frame draws, each read and sniffed once per (part, rid).
+/// What a tab has read of its package's pictures, kept across frames so a
+/// frame resolves, copies and hashes each picture once. It is valid for one
+/// [`Package::parts_stamp`]: any change to the package's parts empties it.
+#[derive(Default)]
+pub struct Cache {
+    stamp: u64,
+    images: HashMap<PictureKey, Option<Arc<Image>>>,
+}
+
+/// The pictures one frame draws, through the tab's [`Cache`].
 pub struct Pictures<'a> {
     pkg: &'a Package,
-    cache: RefCell<HashMap<PictureKey, Option<Arc<Image>>>>,
+    cache: &'a RefCell<Cache>,
 }
 
 impl<'a> Pictures<'a> {
-    pub fn new(pkg: &'a Package) -> Self {
-        Pictures {
-            pkg,
-            cache: Default::default(),
+    pub fn new(pkg: &'a Package, cache: &'a RefCell<Cache>) -> Self {
+        let stamp = pkg.parts_stamp();
+        let mut held = cache.borrow_mut();
+        if held.stamp != stamp {
+            held.images.clear();
+            held.stamp = stamp;
         }
+        drop(held);
+        Pictures { pkg, cache }
     }
 
-    /// The decoded-by-gpui image of an inline picture run `raw` in `part`;
-    /// `None` keeps the frame.
+    /// The image of an inline picture run `raw` in `part`, as gpui will
+    /// decode it; `None` keeps the frame. Only a miss reads the package.
     pub fn image(&self, part: &str, raw: &str) -> Option<Arc<Image>> {
         let rid = docxcore::image::inline_embed(raw)?;
         let key = (part.to_string(), rid);
-        if let Some(hit) = self.cache.borrow().get(&key) {
+        if let Some(hit) = self.cache.borrow().images.get(&key) {
             return hit.clone();
         }
         let found = resolve(self.pkg, part, &key.1)
             .and_then(|(ext, bytes)| Some(Arc::new(Image::from_bytes(format_of(ext)?, bytes))));
-        self.cache.borrow_mut().insert(key, found.clone());
+        self.cache.borrow_mut().images.insert(key, found.clone());
         found
     }
 }
@@ -169,7 +176,8 @@ mod tests {
     #[test]
     fn only_an_inline_picture_run_gives_an_image_and_it_is_cached() {
         let (pkg, header, body_rid, _) = package();
-        let pics = Pictures::new(&pkg);
+        let cache = RefCell::default();
+        let pics = Pictures::new(&pkg, &cache);
         let run = docxcore::image::inline_picture_run(&body_rid, 9525, 9525, 1, "a.png");
         let (a, b) = (
             pics.image("word/document.xml", &run).unwrap(),
@@ -183,5 +191,43 @@ mod tests {
             .replace("<wp:inline", "<wp:anchor")
             .replace("</wp:inline>", "</wp:anchor>");
         assert!(pics.image("word/document.xml", &anchored).is_none());
+    }
+
+    #[test]
+    fn a_later_frame_reuses_the_image_until_the_package_changes() {
+        let (mut pkg, header, _, rid) = package();
+        let run = docxcore::image::inline_picture_run(&rid, 9525, 9525, 1, "a.png");
+        let cache = RefCell::default();
+        let first = Pictures::new(&pkg, &cache).image(&header, &run).unwrap();
+        let again = Pictures::new(&pkg, &cache).image(&header, &run).unwrap();
+        assert!(Arc::ptr_eq(&first, &again), "a new frame does not rebuild");
+        // A part changes: the next frame reads the new media.
+        assert!(pkg.set_part("word/media/image2.png", png(9)));
+        let changed = Pictures::new(&pkg, &cache).image(&header, &run).unwrap();
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert_eq!(changed.bytes, png(9));
+        // A clone is the same state; an unrelated read changes nothing.
+        let copy = pkg.clone();
+        let from_copy = Pictures::new(&copy, &cache).image(&header, &run).unwrap();
+        assert!(Arc::ptr_eq(&changed, &from_copy));
+    }
+
+    #[test]
+    fn dot_dot_and_external_targets_follow_the_package_rules() {
+        let (mut pkg, header, _, rid) = package();
+        let rels = pkg.part_text("word/_rels/header1.xml.rels").unwrap();
+        let up = rels.replace("media/image2.png", "../word/media/image2.png");
+        assert!(pkg.set_part("word/_rels/header1.xml.rels", up.into_bytes()));
+        assert_eq!(resolve(&pkg, &header, &rid), Some(("png", png(2))));
+        let external = rels.replace(
+            "Target=\"media/image2.png\"",
+            "Target=\"media/image2.png\" TargetMode=\"External\"",
+        );
+        assert_ne!(external, rels);
+        assert!(pkg.set_part("word/_rels/header1.xml.rels", external.into_bytes()));
+        assert_eq!(resolve(&pkg, &header, &rid), None);
+        let away = rels.replace("media/image2.png", "../../etc/x.png");
+        assert!(pkg.set_part("word/_rels/header1.xml.rels", away.into_bytes()));
+        assert_eq!(resolve(&pkg, &header, &rid), None);
     }
 }
