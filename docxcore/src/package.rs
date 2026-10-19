@@ -3750,7 +3750,15 @@ pub fn load_package(data: &[u8]) -> Result<Package, LoadError> {
 
     let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
     let mut doc_index = None;
-    for e in zip.entries() {
+    // A directory entry, even one without a trailing `/`, is no part: kept, a
+    // save would write it with no content type (#1167).
+    let names: Vec<String> = zip
+        .entries()
+        .iter()
+        .map(|e| e.name.replace('\\', "/"))
+        .collect();
+    let is_part = opccore::parts::part_flags(&zip, &names);
+    for (e, _) in zip.entries().iter().zip(is_part).filter(|(_, p)| *p) {
         let bytes = zip.extract(e).ok_or(LoadError::CorruptPart)?;
         if e.name == "word/document.xml" {
             doc_index = Some(parts.len());
