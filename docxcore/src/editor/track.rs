@@ -63,22 +63,7 @@ impl Editor {
 
     /// The highest numeric `w:id` of any revision or comment marker.
     fn max_annotation_id(&self) -> u64 {
-        let mut max = 0u64;
-        let numeric = |id: &str| id.parse::<u64>().ok();
-        for revision in self.doc.revisions() {
-            max = max.max(
-                revision
-                    .metadata
-                    .id
-                    .as_deref()
-                    .and_then(numeric)
-                    .unwrap_or(0),
-            );
-        }
-        for id in crate::inspect::comment_marker_ids(&self.doc) {
-            max = max.max(numeric(&id).unwrap_or(0));
-        }
-        max
+        self.doc.max_annotation_id()
     }
 
     /// The metadata of the next revision recorded: an id above every revision

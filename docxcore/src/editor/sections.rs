@@ -1740,12 +1740,25 @@ mod tests {
             .map(|c| c.raw.clone())
     }
 
+    /// `raw` without its `w:id`: the copies differ in nothing else.
+    fn same_id(raw: &Option<String>) -> Option<String> {
+        raw.as_ref().map(|r| {
+            let at = r.find(" w:id=\"").expect("an id");
+            let end = at + 7 + r[at + 7..].find('"').unwrap() + 1;
+            format!("{}{}", &r[..at], &r[end..])
+        })
+    }
+
     /// Paragraphs `at` all carry the original pPrChange raw, each with its
     /// own revision target.
     fn assert_ppr_change_on(e: &Editor, raw: &Option<String>, at: &[usize], what: &str) {
         let mut targets = Vec::new();
         for &i in at {
-            assert_eq!(&ppr_change_raw(e, i), raw, "{what}: para {i}");
+            assert_eq!(
+                same_id(&ppr_change_raw(e, i)),
+                same_id(raw),
+                "{what}: para {i}"
+            );
             assert_eq!(
                 props_of(e, i).align,
                 crate::model::Align::Center,
@@ -1846,7 +1859,7 @@ mod tests {
         let mut targets = Vec::new();
         for p in pieces {
             let c = p.props.property_change.as_ref().expect("pPrChange kept");
-            assert_eq!(Some(c.raw.clone()), raw);
+            assert_eq!(same_id(&Some(c.raw.clone())), same_id(&raw));
             targets.push(c.metadata.target);
         }
         assert_ne!(targets[0], targets[1]);
@@ -1865,5 +1878,102 @@ mod tests {
         assert_eq!(props_of(&e, 2).align, crate::model::Align::Left);
         assert!(props_of(&e, 0).property_change.is_some());
         assert_eq!(props_of(&e, 0).align, crate::model::Align::Center);
+    }
+
+    /// Every `w:id` of the pPrChange elements in `xml`.
+    fn ppr_change_ids(xml: &str) -> Vec<String> {
+        xml.split("<w:pPrChange w:id=\"")
+            .skip(1)
+            .map(|rest| rest[..rest.find('"').unwrap()].to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_split_paragraph_saves_distinct_ppr_change_ids_829() {
+        let mut e = ppr_change_editor();
+        e.caret = Caret::top(0, 2);
+        e.insert_newline();
+        e.caret = Caret::top(1, 1);
+        e.insert_newline();
+        let xml = crate::serialize::document_to_xml(&e.doc);
+        let mut ids = ppr_change_ids(&xml);
+        assert_eq!(ids.len(), 3, "{xml}");
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 3, "{xml}");
+        assert!(ids.contains(&"9".to_string()));
+        for i in 0..3 {
+            let c = props_of(&e, i).property_change.as_ref().unwrap();
+            assert!(
+                c.raw
+                    .contains(&format!("w:id=\"{}\"", c.metadata.id.as_ref().unwrap())),
+                "para {i}"
+            );
+        }
+        // A reload keeps them apart.
+        let again = crate::load::parse_document_xml(&xml, &crate::load::Relationships::default());
+        let mut reloaded = ppr_change_ids(&crate::serialize::document_to_xml(&again));
+        reloaded.sort();
+        ids.sort();
+        assert_eq!(reloaded, ids);
+        assert!(e.undo());
+    }
+
+    #[test]
+    fn a_pr_change_id_is_found_whatever_the_spacing_829() {
+        use super::super::super::model::tests_with_revision_id as f;
+        assert_eq!(
+            f("<w:pPrChange\n  w:id=\"9\" w:author=\"A\"/>", "10").unwrap(),
+            "<w:pPrChange\n  w:id=\"10\" w:author=\"A\"/>"
+        );
+        assert_eq!(
+            f("<w:pPrChange w:id = '9'/>", "10").unwrap(),
+            "<w:pPrChange w:id = '10'/>"
+        );
+        assert_eq!(
+            f("<w:pPrChange w:author='Bob w:id=\"5\"' w:id=\"9\"/>", "10").unwrap(),
+            "<w:pPrChange w:author='Bob w:id=\"5\"' w:id=\"10\"/>"
+        );
+        assert_eq!(
+            f("<w:pPrChange w:author=\"A>B\" w:id=\"9\"/>", "10").unwrap(),
+            "<w:pPrChange w:author=\"A>B\" w:id=\"10\"/>"
+        );
+        assert_eq!(f("<w:pPrChange/>", "10"), None);
+    }
+
+    #[test]
+    fn deleting_across_a_section_break_drops_the_start_paragraphs_break_829() {
+        let mut e = three();
+        assert!(props_of(&e, 0).section_break.is_some());
+        assert_eq!(e.sections().len(), 3);
+        e.anchor = Some(Caret::top(0, 1));
+        e.caret = Caret::top(1, 1);
+        assert!(e.delete_selection());
+        assert_eq!(text_of(&e, 0), "owo");
+        assert_eq!(props_of(&e, 0).section_break, None);
+        assert_eq!(e.sections().len(), 2);
+    }
+
+    #[test]
+    fn a_split_run_saves_distinct_rpr_change_ids_829() {
+        let xml = concat!(
+            "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">",
+            "<w:body><w:p><w:r><w:rPr><w:b/><w:rPrChange w:id=\"7\"><w:rPr/></w:rPrChange></w:rPr>",
+            "<w:t>abcd</w:t></w:r></w:p></w:body></w:document>"
+        );
+        let doc = crate::load::parse_document_xml(xml, &crate::load::Relationships::default());
+        let mut e = Editor::new(doc);
+        e.caret = Caret::top(0, 2);
+        e.insert_newline();
+        let out = crate::serialize::document_to_xml(&e.doc);
+        let mut ids: Vec<&str> = out
+            .split("<w:rPrChange w:id=\"")
+            .skip(1)
+            .map(|r| &r[..r.find('"').unwrap()])
+            .collect();
+        assert_eq!(ids.len(), 2, "{out}");
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 2, "{out}");
     }
 }
