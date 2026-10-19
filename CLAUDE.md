@@ -459,9 +459,11 @@
   under the same policy (`Docxy::ribbon_policy`), so they agree with
   `ribbon-layout`. `uiharness/cases/ribbon-fit.uit` pins the document and
   sheet order, `project-plugin-ui.uit` the Project one with the fixture's
-  group at 1180 px only: the CI displays cannot show that tab in full, so
-  the widening back to full groups is pinned by `ribbon-fit.uit` and the
-  `ribbon_fit` unit tests.
+  Task group at 1180 px only (the CI displays cannot show that tab in full,
+  so the widening back to full groups is pinned by `ribbon-fit.uit` and the
+  `ribbon_fit` unit tests) and the Gantt Chart Format tab, whose two groups
+  fit at every CI width, where the fixture's icon-less `fixture.flat` toggle
+  keeps `estimates_ok` true only while its label is drawn.
 
 ## Project table: resizable columns and AutoFilter (#1533)
 

@@ -661,9 +661,9 @@ mod tests {
     /// every command of the tab is reachable; and what is laid out fits.
     #[test]
     fn fit_never_hides_a_command() {
-        for (name, specs) in every_tab() {
+        for (name, specs, policy) in every_tab_with_policy() {
             for width in widths() {
-                let fit = fit(&specs, width);
+                let fit = fit_with(&specs, width, policy);
                 assert_eq!(fit.states.len(), specs.len(), "{name} at {width}");
                 for &i in &fit.overflow {
                     assert!(fit.in_flyout(i), "{name} at {width}: chevron group {i}");
@@ -698,16 +698,16 @@ mod tests {
         }
     }
 
-    /// The order groups collapse in, narrowing one px at a time down to where
-    /// all are collapsed. At every width the collapsed groups are the first
-    /// of the priority order (lowest first, the rightmost of a tie), and a
-    /// group once collapsed stays so.
-    fn collapse_order(name: &str, specs: &[Spec]) -> Vec<usize> {
+    /// The order groups collapse in under `policy`, narrowing one px at a
+    /// time down to where all are collapsed. At every width the collapsed
+    /// groups are the first of the priority order (lowest first, the
+    /// rightmost of a tie), and a group once collapsed stays so.
+    fn collapse_order(name: &str, specs: &[Spec], policy: Policy) -> Vec<usize> {
         let mut order: Vec<usize> = (0..specs.len()).collect();
         order.sort_by_key(|&i| (specs[i].priority, std::cmp::Reverse(i)));
         let mut was = 0;
         for width in (100..=3000).rev() {
-            let fit = fit(specs, width as f32);
+            let fit = fit_with(specs, width as f32, policy);
             let n = (0..specs.len()).filter(|&i| fit.in_flyout(i)).count();
             assert!(n >= was, "{name}: a group came back at {width}");
             assert!(
@@ -780,9 +780,9 @@ mod tests {
             .unwrap()
     }
 
-    /// #1020: groups collapse in priority order, and on Home Clipboard and
-    /// Font are the last to go (Clipboard last); on Project's Task tab,
-    /// Clipboard is.
+    /// #1020: groups collapse in priority order (each ribbon under its own
+    /// policy, #1608), and on Home Clipboard and Font are the last to go
+    /// (Clipboard last); on Project's Task tab, Clipboard is.
     #[test]
     fn collapse_order_follows_priority() {
         let doc = model_tab(Kind::Docx, "Home");
@@ -810,7 +810,12 @@ mod tests {
             ),
         ];
         for (name, titles, specs) in cases {
-            let order = collapse_order(name, &specs);
+            let policy = if name.starts_with("Project") {
+                Policy::WholeGroups
+            } else {
+                Policy::LabelsFirst
+            };
+            let order = collapse_order(name, &specs, policy);
             let last: Vec<&str> = order.iter().rev().map(|&i| titles[i]).collect();
             assert_eq!(last[0], "Clipboard", "{name}: {last:?}");
             if name != "Project Task" {

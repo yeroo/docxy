@@ -96,6 +96,19 @@ test the Task tab with a contributed group collapses whole groups, never a label
   assert reply.group is Fixture
   shot window
   call ribbon-flyout {"action":"close"}
+  # The Gantt Chart Format tab holds the fixture's other group and fits at
+  # every CI width: its icon-less toggle draws with its label, so the drawn
+  # widths match the estimates (a label dropped in the renderer would not).
+  call ribbon-layout {"tab":"Gantt Chart Format"}
+  shot window
+  call ribbon-layout {"tab":"Gantt Chart Format"}
+  assert reply.settled is true
+  assert reply.estimates_ok is true
+  assert reply.groups.0.title is Fixture Format
+  assert reply.groups.0.state is full
+  assert reply.groups.1.title is Bar Styles
+  assert reply.groups.1.state is full
+  shot ribbon
   call ribbon-click {"tab":"Task","command":"Plain"}
   assert status is Fixture: plain on
   call ribbon-read {}

@@ -4,6 +4,7 @@
 //!
 //! - Ribbon: on the Task tab a group "Fixture" with a large button
 //!   `fixture.hello`, a toggle `fixture.flag`, a toggle `fixture.plain` with
+//!   no icon (and `fixture.flat`, the same on the Gantt Chart Format tab),
 //!   no icon (its label is drawn, #1608) and a gallery `fixture.palette`
 //!   of two swatches (`fixture.blue`, `fixture.red`).
 //! - Menus: a row-menu item `fixture.rename` after "Notes...".
@@ -43,7 +44,8 @@ const MANIFEST: &str = r##"{
     {"id":"fixture.bold","kind":"toggle","label":"Bold","tip":"Bold on the selected cells (the view's cells)","keytip":"XB","icon":"bold"},
     {"id":"fixture.sheet","kind":"button","label":"Sheet (fixture)","tip":"A modeless dialog with a grid and buttons of its own","keytip":"XS","icon":"table"}]}]},
     {"tab":"Gantt Chart Format","groups":[{"title":"Fixture Format","before":"Bar Styles","controls":[
-    {"id":"fixture.format","kind":"button","label":"Format (fixture)","tip":"A group placed before Bar Styles","icon":"font-name"}]}]}],
+    {"id":"fixture.format","kind":"button","label":"Format (fixture)","tip":"A group placed before Bar Styles","icon":"font-name"},
+    {"id":"fixture.flat","kind":"toggle","label":"Flat","tip":"A toggle with no icon on a tab that fits: its drawn label is measured (#1608)","icon":""}]}]}],
   "menus":[{"menu":"row","items":[{"id":"fixture.rename","label":"Rename (fixture)","icon":"comment","after":"Notes..."}]}],
   "dialogs":[
     {"id":"task-information","pages":[{"name":"Fixture","controls":[
@@ -247,9 +249,10 @@ pub unsafe extern "C" fn yppx_ui_state(input: *const u8, len: usize, out: *mut Y
     };
     let selected = first_uid(&req).is_some();
     let mut reply = format!(
-        r#"{{"controls":{{"fixture.flag":{{"enabled":true,"checked":{}}},"fixture.plain":{{"enabled":true,"checked":{}}},"fixture.bold":{{"enabled":{selected},"checked":{}}},"fixture.rename":{{"enabled":{selected}}}}},"gallery":{{"fixture.palette":{}}}"#,
+        r#"{{"controls":{{"fixture.flag":{{"enabled":true,"checked":{}}},"fixture.plain":{{"enabled":true,"checked":{}}},"fixture.flat":{{"enabled":true,"checked":{}}},"fixture.bold":{{"enabled":{selected},"checked":{}}},"fixture.rename":{{"enabled":{selected}}}}},"gallery":{{"fixture.palette":{}}}"#,
         flag(&req),
         switch_on(&req, "fixture.plain"),
+        switch_on(&req, "fixture.flat"),
         bold(&req),
         quote(&palette())
     );
@@ -425,12 +428,12 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
             }
             Some(_) => r#"{"ops":[],"status":"Fixture: cleared","close":true}"#.to_string(),
         },
-        "fixture.flag" | "fixture.plain" => {
+        "fixture.flag" | "fixture.plain" | "fixture.flat" => {
             let on = !switch_on(&req, id);
-            let word = if id == "fixture.flag" {
-                "flag"
-            } else {
-                "plain"
+            let word = match id {
+                "fixture.flag" => "flag",
+                "fixture.plain" => "plain",
+                _ => "flat",
             };
             format!(
                 r#"{{"ops":[],"status":"Fixture: {word} {}","view":{{"switches":{{"{id}":{on}}}}}}}"#,
