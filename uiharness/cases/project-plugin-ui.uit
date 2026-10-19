@@ -73,13 +73,28 @@ test the Task tab with a contributed group collapses whole groups, never a label
   assert reply.groups.2.state is full
   assert reply.groups.3.state is full
   assert reply.groups.4.state is full
+  # Editing (priority 60) is the next to collapse after the fixture's group
+  # and must still be full here.
+  assert reply.groups.5.title is Editing
+  assert reply.groups.5.state is full
   assert reply.groups.-1.title is Fixture
   assert reply.groups.-1.state is collapsed
   shot ribbon
   call ribbon-read {}
   assert reply.tabs.1.groups.-1.commands.2.id is fixture.plain
   assert reply.tabs.1.groups.-1.commands.2.label is Plain
-  shot ribbon
+  # ribbon-read's states fit under the same policy as the drawn ribbon.
+  assert reply.tabs.1.groups.0.state is full
+  assert reply.tabs.1.groups.5.state is full
+  assert reply.tabs.1.groups.-1.state is collapsed
+  # The collapsed group's flyout shows the icon-less toggle with its label.
+  call ribbon-flyout {"action":"open","group":"Fixture"}
+  shot window
+  call ribbon-flyout {}
+  assert reply.open is true
+  assert reply.group is Fixture
+  shot window
+  call ribbon-flyout {"action":"close"}
   call ribbon-click {"tab":"Task","command":"Plain"}
   assert status is Fixture: plain on
   call ribbon-read {}

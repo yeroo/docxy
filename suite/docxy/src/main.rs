@@ -34724,6 +34724,17 @@ impl Docxy {
     /// widths and where it went. The ribbon draws from this, and
     /// `ribbon-read`, `ribbon-layout` and `ribbon-click` ask it too, so a verb
     /// run straight after a resize sees the layout the next frame draws.
+    /// How the active ribbon fits (#1608): Project's collapses whole groups,
+    /// the document's and the sheet's drop labels first (#1020). The live
+    /// fit and `ribbon-read`'s group states both ask this, so they agree.
+    pub(crate) fn ribbon_policy(&self) -> ribbon_fit::Policy {
+        if self.active_is_project() {
+            ribbon_fit::Policy::WholeGroups
+        } else {
+            ribbon_fit::Policy::LabelsFirst
+        }
+    }
+
     pub(crate) fn ribbon_fit_now(&self, window: &Window) -> RibbonFitNow {
         let tw = ribbon_text_width(window);
         let width = ribbon_width(window);
@@ -34749,14 +34760,7 @@ impl Docxy {
             });
             multiunzip(rows)
         };
-        // Project's ribbon collapses whole groups (#1608); the document's
-        // and the sheet's drop labels first (#1020).
-        let policy = if self.active_is_project() {
-            ribbon_fit::Policy::WholeGroups
-        } else {
-            ribbon_fit::Policy::LabelsFirst
-        };
-        let fit = ribbon_fit::fit_with(&specs, width, policy);
+        let fit = ribbon_fit::fit_with(&specs, width, self.ribbon_policy());
         RibbonFitNow {
             width,
             titles,
@@ -34871,9 +34875,11 @@ impl Docxy {
     }
 
     /// The ribbon body for the active tab, rendered from the shared ribbonspec
-    /// model with Fluent icons, fitted to the window (#1020): groups drop their
-    /// labels, then collapse to a button whose flyout holds the whole group,
-    /// lowest `priority` first; what still does not fit goes in the chevron.
+    /// model with Fluent icons, fitted to the window under `ribbon_policy`
+    /// (#1020): the document's groups drop their labels, then collapse to a
+    /// button whose flyout holds the whole group; Project's collapse whole
+    /// (#1608); lowest `priority` first, and what still does not fit goes in
+    /// the chevron.
     fn ribbon_body(&self, window: &Window, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let tab = &self.active_ribbon_tab_def();
         let now = self.ribbon_fit_now(window);

@@ -2542,7 +2542,8 @@ fn open_flyout_of(app: &mut crate::Docxy, group: Option<&'static str>, window: &
 
 /// Give every group of every tab in a `ribbon-read` reply its `state` at the
 /// window's width now (#1020): `full`, `icon-only` or `collapsed`. A tab
-/// fits as it would if it were shown.
+/// fits as it would if it were shown, under the active ribbon's policy
+/// (#1608: a Project tab's states are `ribbon_fit_now`'s).
 fn add_group_states(json: &mut Json, app: &crate::Docxy, window: &Window) {
     let tw = crate::ribbon_text_width(window);
     let width = crate::ribbon_width(window);
@@ -2575,7 +2576,7 @@ fn add_group_states(json: &mut Json, app: &crate::Docxy, window: &Window) {
                 .map(|g| crate::ribbon_fit::model_spec(g, &tw))
                 .collect()
         };
-        let fit = crate::ribbon_fit::fit(&specs, width);
+        let fit = crate::ribbon_fit::fit_with(&specs, width, app.ribbon_policy());
         let Json::Obj(tab) = tab else { continue };
         let Some((_, Json::Arr(groups))) = tab.iter_mut().find(|(k, _)| k == "groups") else {
             continue;

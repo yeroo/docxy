@@ -1,13 +1,16 @@
 //! How a ribbon tab's groups fit the window (#1020).
 //!
 //! Office scales a ribbon in steps as the window narrows, and never hides a
-//! command: first groups drop their button labels (icon-only), one at a time,
-//! lowest priority first; then groups collapse, lowest priority first, each to
-//! one large button whose flyout shows the whole group; and when even the
-//! collapsed buttons do not fit, the leftovers go into one trailing chevron
-//! whose flyout lists them. Both suite ribbons (the ribbonspec model of the
-//! document and Project ribbons, and the spreadsheet's `sheet_ribbon` table)
-//! fit through [`fit`], from widths estimated here.
+//! command. Word and Excel ([`Policy::LabelsFirst`]): first groups drop their
+//! button labels (icon-only), one at a time, lowest priority first; then
+//! groups collapse, lowest priority first, each to one large button whose
+//! flyout shows the whole group. Project ([`Policy::WholeGroups`], #1608):
+//! no label is dropped, groups collapse whole in the same order, only while
+//! the tab overflows. Under both, when even the collapsed buttons do not fit,
+//! the leftovers go into one trailing chevron whose flyout lists them. Every
+//! suite ribbon (the ribbonspec model of the document and Project ribbons,
+//! and the spreadsheet's `sheet_ribbon` table) fits through [`fit_with`]
+//! under the policy `Docxy::ribbon_policy` names, from widths estimated here.
 //!
 //! The estimates are the renderers' own arithmetic: each control's padding,
 //! gaps and fixed sizes as `Docxy::render_group` / `Docxy::sheet_group` draw
@@ -129,8 +132,11 @@ pub(crate) enum Policy {
     WholeGroups,
 }
 
-/// The tab's groups fitted into a ribbon `width` px wide, labels first.
-pub(crate) fn fit(specs: &[Spec], width: f32) -> Fit {
+/// The tab's groups fitted into a ribbon `width` px wide, labels first: the
+/// document's and the sheet's policy, for the tests (the renderers and the
+/// harness go through [`fit_with`] with `Docxy::ribbon_policy`).
+#[cfg(test)]
+fn fit(specs: &[Spec], width: f32) -> Fit {
     fit_with(specs, width, Policy::LabelsFirst)
 }
 
@@ -591,34 +597,26 @@ mod tests {
         assert!(sheet_cmd_w(freeze, false, &on, &tw) > sheet_cmd_w(freeze, false, &off, &tw));
     }
 
+    /// Every tab, with the policy its ribbon fits under (#1608): Project's
+    /// tabs and the Gantt Chart Format tab (named `project …`) collapse
+    /// whole groups, the rest drop labels first.
+    fn every_tab_with_policy() -> Vec<(String, Vec<Spec>, Policy)> {
+        every_tab()
+            .into_iter()
+            .map(|(name, specs)| {
+                let policy = if name.starts_with("project ") {
+                    Policy::WholeGroups
+                } else {
+                    Policy::LabelsFirst
+                };
+                (name, specs, policy)
+            })
+            .collect()
+    }
+
     /// Every ribbon tab the suite draws, by name: the document's and the
     /// Project's (contextual tabs too) from the model, the workbook's from
     /// the sheet table, each as its groups' specs.
-    /// Every tab, with the policy its ribbon fits under (#1608): Project's
-    /// tabs and the Gantt Chart Format tab collapse whole groups.
-    fn every_tab_with_policy() -> Vec<(String, Vec<Spec>, Policy)> {
-        let project: Vec<(String, Vec<Spec>)> = crate::ribbon_for(Kind::Project)
-            .tabs
-            .iter()
-            .chain(std::iter::once(&crate::gantt_format_tab()))
-            .map(|t| {
-                let specs = t.groups.iter().map(|g| model_spec(g, &tw)).collect();
-                (format!("project {}", t.name), specs)
-            })
-            .collect();
-        let mut out: Vec<(String, Vec<Spec>, Policy)> = every_tab()
-            .into_iter()
-            .filter(|(name, _)| !name.starts_with("project "))
-            .map(|(name, specs)| (name, specs, Policy::LabelsFirst))
-            .collect();
-        out.extend(
-            project
-                .into_iter()
-                .map(|(name, specs)| (name, specs, Policy::WholeGroups)),
-        );
-        out
-    }
-
     fn every_tab() -> Vec<(String, Vec<Spec>)> {
         let mut model: Vec<rs::Tab<Act>> = Vec::new();
         model.extend(crate::ribbon_for(Kind::Docx).tabs);
@@ -723,6 +721,20 @@ mod tests {
         order
     }
 
+    /// #1608: a toggle without an icon (a contributed one may name none)
+    /// draws its label, so it is estimated wider than one with an icon by
+    /// the label's width; the live fit counts it.
+    #[test]
+    fn a_toggle_without_an_icon_is_estimated_with_its_label() {
+        let with_icon = Control::Toggle(rs::cmd("plain", "bold", "Plain", Act::Paste));
+        let no_icon = Control::Toggle(rs::cmd("plain", "", "Plain", Act::Paste));
+        assert_eq!(model_control_w(&with_icon, false, None, &tw), 34.0);
+        assert_eq!(
+            model_control_w(&no_icon, false, None, &tw),
+            34.0 + 6.0 + tw("Plain", 12.0)
+        );
+    }
+
     fn model_tab(kind: Kind, name: &str) -> rs::Tab<Act> {
         crate::ribbon_for(kind)
             .tabs
@@ -770,10 +782,11 @@ mod tests {
         }
     }
 
-    /// #1020: labels go first, one group at a time. No group collapses while
-    /// another could still drop its labels, and on Project's Task tab (whose
-    /// button columns have labels) some width has one group icon-only while
-    /// another that could be is still full.
+    /// #1020: labels go first, one group at a time, under the labels-first
+    /// policy. No group collapses while another could still drop its labels,
+    /// and on the document's Home tab (whose button columns have labels)
+    /// some width has one group icon-only while another that could be is
+    /// still full. (Project's tabs never go icon-only, #1608.)
     #[test]
     fn icon_only_comes_before_collapse_and_is_per_group() {
         for (name, specs, policy) in every_tab_with_policy() {

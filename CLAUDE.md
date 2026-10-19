@@ -453,9 +453,13 @@
   while the tab overflows. `ribbon_fit_now` picks the policy from the
   active tab's kind; `ribbon-layout` never reports `icon-only` on a
   Project tab. A toggle with no icon (a contributed one may name none)
-  draws and is estimated with its label. `uiharness/cases/ribbon-fit.uit`
-  pins the document and sheet order, `project-plugin-ui.uit` the Project
-  one with the fixture's group at 1180 and 1600 px.
+  draws and is estimated with its label. `ribbon-read`'s group states fit
+  under the same policy (`Docxy::ribbon_policy`), so they agree with
+  `ribbon-layout`. `uiharness/cases/ribbon-fit.uit` pins the document and
+  sheet order, `project-plugin-ui.uit` the Project one with the fixture's
+  group at 1180 px only: the CI displays cannot show that tab in full, so
+  the widening back to full groups is pinned by `ribbon-fit.uit` and the
+  `ribbon_fit` unit tests.
 
 ## Project table: resizable columns and AutoFilter (#1533)
 
