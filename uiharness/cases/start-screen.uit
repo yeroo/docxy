@@ -17,12 +17,22 @@ test issue 806 an empty launch has no tab and the New page up
   assert reply.cards.2.name is Project
   assert reply.cards.3.name is Mail
 
-test issue 806 Back and Close keep the Start screen while there is no tab
+test issue 806 Back leaves New for the default File page and Close does nothing
   call backstage {"action":"close"}
   call backstage {"action":"read"}
   assert reply.open is true
-  assert reply.new is true
+  assert reply.new is false
+  call backstage {"action":"close"}
+  call backstage {"action":"read"}
+  assert reply.open is true
+  assert reply.new is false
   call backstage-page {"page":"new"}
+  call backstage {"action":"read"}
+  assert reply.new is true
+  call backstage-page {"page":"close"}
+  call backstage {"action":"read"}
+  assert reply.open is true
+  assert reply.new is true
   call tab-list {}
   assert reply.tabs is []
 

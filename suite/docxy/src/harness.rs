@@ -5762,7 +5762,11 @@ fn dispatch_verb(
                     app.backstage_rail_action(crate::BackstageRailAction::ExportDoc, window, cx)
                 }
                 "open" => app.show_backstage_open_page(),
-                _ => return Err("'page' must be new, info, account, export or open".into()),
+                // The rail's Close item (#806: with no tab it does nothing).
+                "close" => app.backstage_rail_action(crate::BackstageRailAction::Close, window, cx),
+                _ => {
+                    return Err("'page' must be new, info, account, export, open or close".into());
+                }
             }
             Done::ok(backstage_layout_json(app))
         }

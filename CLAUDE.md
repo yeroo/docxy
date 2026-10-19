@@ -171,10 +171,13 @@
 
 - A suite launch with nothing to restore and no file on the command line has
   no tab and the File > New page up (`Docxy::show_start_screen`; `startup_tabs`
-  decides, `Startup::StartScreen`). A restored session keeps its tabs; files on
-  the command line open over it, and if every one is refused the Start screen
-  comes back. With no tab, Back, Close and Esc on File stay on it
-  (`backstage_back`, `backstage_close`). The New page's cards are `NEW_CARDS`
+  decides, `Startup::StartScreen`), brought up through `open_backstage` so the
+  lists are filled. A restored session keeps its tabs; files on the command
+  line open over it (a file that cannot be read opens as a failed-load tab, so
+  one tab always exists). With no tab, Back and Esc on File go from New to
+  its default page (Recent, Settings) and stay in File, Close, Save and Save
+  As do nothing, and a status said with no tab (the plugin notice) waits in
+  `pending_status` for the first tab (`land_status`). The New page's cards are `NEW_CARDS`
   (the Spreadsheet one reads "Blank workbook").
 - A harness instance keeps the sample document as tab 0 (the cases assume it)
   unless the script says `start screen`: the runner writes the marker

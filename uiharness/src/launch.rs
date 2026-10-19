@@ -954,9 +954,6 @@ mod tests {
         assert_eq!(environment_block(&[]), [0, 0]);
     }
 
-    /// A script's `plugin` lines copy the built libraries into the sandbox's
-    /// `docxy/plugins` under the name the suite loads; a missing one says
-    /// how to build it.
     /// #806: the marker the suite looks for in its config root.
     #[test]
     fn a_start_screen_request_is_a_marker_in_the_sandboxs_config_root() {
@@ -971,6 +968,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&sandbox);
     }
 
+    /// A script's `plugin` lines copy the built libraries into the sandbox's
+    /// `docxy/plugins` under the name the suite loads; a missing one says
+    /// how to build it.
     #[test]
     fn plugins_are_copied_into_the_sandbox_under_the_loaders_name() {
         let base = std::env::temp_dir().join(format!(

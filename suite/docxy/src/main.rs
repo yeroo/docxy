@@ -5337,6 +5337,9 @@ struct Docxy {
     /// shown under the Recent heading until the backstage reopens: the tab
     /// status is hidden behind the backstage, and there may be no tab.
     recent_message: Option<String>,
+    /// A status said while no tab existed (the startup plugin notice, #806):
+    /// the first tab to exist takes it ([`land_status`], each frame).
+    pending_status: Option<SharedString>,
     /// When the hot-exit state was last written by any `persist`, or an
     /// AutoRecover tick last found nothing to write: the timer's clock. A
     /// `Cell` because `persist` takes `&self`.
@@ -12834,9 +12837,9 @@ fn reopens_from_file(t: &DocTab) -> bool {
 #[cfg(test)]
 mod session_union_tests {
     use super::{
-        DocTab, EditOptions, Kind, Prefs, Session, SessionWrite, Startup, ThemePref,
-        restore_session_noting, sample_doc, session_path_in, startup_session, startup_tabs,
-        trusted, write_session_with,
+        DocTab, EditOptions, Kind, Prefs, Session, SessionWrite, SharedString, Startup, ThemePref,
+        land_status, restore_session_noting, sample_doc, session_path_in, startup_session,
+        startup_tabs, trusted, write_session_with,
     };
 
     #[test]
@@ -12948,6 +12951,21 @@ mod session_union_tests {
                 Startup::StartScreen => panic!("a restored tab is never replaced"),
             }
         }
+    }
+
+    /// #806: a status said with no tab waits for the first one, once.
+    #[test]
+    fn a_status_said_with_no_tab_lands_on_the_first_tab() {
+        let mut pending = Some(SharedString::from("Plugin not loaded: x"));
+        land_status(&mut pending, None);
+        assert!(pending.is_some(), "no tab yet: kept");
+        let mut status = SharedString::from("new");
+        land_status(&mut pending, Some(&mut status));
+        assert_eq!(status.as_ref(), "Plugin not loaded: x");
+        assert!(pending.is_none());
+        let mut later = SharedString::from("saved");
+        land_status(&mut pending, Some(&mut later));
+        assert_eq!(later.as_ref(), "saved");
     }
 
     /// #806: the window with no tab writes a session with none, and reading it
@@ -14111,6 +14129,15 @@ const NEW_CARDS: [NewCard; 4] = [
     },
 ];
 
+/// Hand `pending` to the tab's status once there is a tab (#806).
+fn land_status(pending: &mut Option<SharedString>, status: Option<&mut SharedString>) {
+    if let Some(status) = status
+        && let Some(msg) = pending.take()
+    {
+        *status = msg;
+    }
+}
+
 /// What the first window starts with (#806).
 enum Startup {
     /// The restored tabs, or the sample document a harness instance falls back to.
@@ -14157,7 +14184,7 @@ impl Docxy {
         let active = session.active.min(tabs.len().saturating_sub(1));
         let mut this = Self::build(tabs, active, session.theme, session.ask_on_close, cx);
         if start_screen {
-            this.show_start_screen();
+            this.show_start_screen(cx);
         }
         // New documents continue past the restored ones (#631).
         // The untitled counter is the run's (#587 r2 m10): seed the shared
@@ -14263,6 +14290,7 @@ impl Docxy {
             trusted_error: None,
             recent_files: Vec::new(),
             recent_message: None,
+            pending_status: None,
             last_persist: std::cell::Cell::new(std::time::Instant::now()),
             unregistered_own: Default::default(),
             applied: None,
@@ -14603,15 +14631,19 @@ impl Docxy {
     }
 
     /// The Start screen (#806): the New page over a window with no tab.
-    fn show_start_screen(&mut self) {
-        self.backstage = true;
+    /// Brought up as File is (drafts, recent files, trusted count), so Back
+    /// reaches the usual pages with their lists filled.
+    fn show_start_screen(&mut self, cx: &mut Context<Self>) {
+        self.open_backstage(cx);
         self.show_backstage_new_page();
     }
 
     fn backstage_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // With no tab there is nothing to go back to: the Start screen stays.
+        // With no tab there is no tab to go back to: File stays up, on its
+        // default page (Recent, Settings) instead of the New page (#806).
         if self.tabs.is_empty() {
-            self.show_start_screen();
+            self.show_backstage_open_page();
+            cx.notify();
             return self.refocus(window, cx);
         }
         self.backstage = false;
@@ -15664,8 +15696,10 @@ impl Docxy {
 
     /// Put a message on the active tab's status line.
     fn set_status(&mut self, msg: impl Into<SharedString>) {
-        if let Some(t) = self.tabs.get_mut(self.active) {
-            t.status = msg.into();
+        match self.tabs.get_mut(self.active) {
+            Some(t) => t.status = msg.into(),
+            // No tab (the Start screen): the first one takes it (#806).
+            None => self.pending_status = Some(msg.into()),
         }
     }
 
@@ -23205,6 +23239,10 @@ impl Docxy {
     }
 
     fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Nothing to save on the Start screen (#806).
+        if self.tabs.is_empty() {
+            return self.refocus(window, cx);
+        }
         if self.active_is_project() {
             return self.save_project(false, window, cx);
         }
@@ -23383,6 +23421,10 @@ impl Docxy {
     }
 
     fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // No file dialog for nothing to write (#806).
+        if self.tabs.is_empty() {
+            return self.refocus(window, cx);
+        }
         if self.active_is_project() {
             return self.save_project(true, window, cx);
         }
@@ -23671,10 +23713,6 @@ impl Docxy {
         }
         if changed {
             self.backstage = false;
-            // Every file refused: back to the Start screen, not a bare window.
-            if self.tabs.is_empty() {
-                self.show_start_screen();
-            }
             // The tab under the panel/bar state just changed (or was replaced).
             self.drop_grid_state();
             self.persist(cx);
@@ -38343,6 +38381,10 @@ impl Render for Docxy {
         // (#1473); set it before any of them is built.
         self.drawn_accent = self.accent_now();
         accent::set(self.drawn_accent);
+        land_status(
+            &mut self.pending_status,
+            self.tabs.get_mut(self.active).map(|t| &mut t.status),
+        );
         HL_CURSOR.store(
             self.hl_mode.as_ref().is_some_and(|m| m.tab == self.active),
             std::sync::atomic::Ordering::Relaxed,
