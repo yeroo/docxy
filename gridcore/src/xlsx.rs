@@ -34,6 +34,8 @@ mod page;
 mod repair;
 pub use repair::{Repairs, load_xlsx_repair};
 
+use std::borrow::Cow;
+
 use crate::formula::{file_formula, translate_formula};
 use crate::sheet::{
     CalcMode, CalcSettings, Cell, CellMeta, CellValue, ColDef, DefinedName, NumFmt, Sheet, Styles,
@@ -2642,6 +2644,7 @@ fn parse_worksheet_with(
                         cm: (!cm.is_empty() && array_f).then_some(cm),
                         vm: (!vm.is_empty()).then(|| (vm, cell.value.clone())),
                         ph,
+                        loaded_f: unchanged_f(cell.formula.as_deref()),
                         ..CellMeta::default()
                     };
                     if meta != CellMeta::default() {
@@ -2943,7 +2946,17 @@ fn parse_worksheet_with(
         let translated = translate_formula(src, dr, dc);
         if let Some(cell) = sheet.cells.get_mut(&(row, col)) {
             match &translated {
-                Some(f) => cell.formula = Some(f.clone()),
+                Some(f) => {
+                    cell.formula = Some(f.clone());
+                    // The follower is a reprint of the master, which drops any
+                    // `_xl` prefix: it is kept only when the master is kept
+                    // and has none, so every prefix the master had is absent.
+                    let kept =
+                        !crate::formula::has_file_prefix(src) && unchanged_f(Some(src)).is_some();
+                    if let Some(l) = unchanged_f(Some(f)).filter(|_| kept) {
+                        cell.meta.get_or_insert_with(Default::default).loaded_f = Some(l);
+                    }
+                }
                 None => {
                     cell.formula = Some(String::new());
                     cell.f_attrs = Some(format!(" t=\"shared\" si=\"{si}\""));
@@ -3267,6 +3280,22 @@ fn parse_cell_body(
                 ..CellMeta::default()
             })
         }),
+    }
+}
+
+/// The formula text to keep as loaded ([`CellMeta::loaded_f`]): `f` when
+/// save's [`file_formula`] would only add function prefixes to it.
+fn unchanged_f(f: Option<&str>) -> Option<String> {
+    f.filter(|f| crate::formula::only_prefixes_added(f))
+        .map(str::to_string)
+}
+
+/// The formula text save writes for `cell`'s formula `src`: as loaded while
+/// the cell still holds the loaded text, else the file spelling of `src`.
+fn saved_formula<'a>(cell: &Cell, src: &'a str) -> Cow<'a, str> {
+    match cell.meta.as_deref().and_then(|m| m.loaded_f.as_deref()) {
+        Some(l) if l == src => Cow::Borrowed(src),
+        _ => file_formula(src),
     }
 }
 
@@ -4600,7 +4629,7 @@ fn cell_xml(
                 "<f t=\"array\" ref=\"{}:{}\">{}</f>",
                 cell_name(row, col),
                 cell_name(row + h - 1, col + w - 1),
-                esc_text(&file_formula(src))
+                esc_text(&saved_formula(cell, src))
             );
             (f, true)
         }
@@ -4611,11 +4640,14 @@ fn cell_xml(
         (Some(src), None) if dynamic && !src.is_empty() => (
             format!(
                 "<f t=\"array\" ref=\"{anchor}\">{}</f>",
-                esc_text(&file_formula(src))
+                esc_text(&saved_formula(cell, src))
             ),
             true,
         ),
-        (Some(src), None) => (format!("<f>{}</f>", esc_text(&file_formula(src))), false),
+        (Some(src), None) => (
+            format!("<f>{}</f>", esc_text(&saved_formula(cell, src))),
+            false,
+        ),
         (Some(src), Some(fa)) if src.is_empty() => (format!("<f{fa}/>"), is_array_f(fa)),
         // A non-spilling array covers its anchor alone when its stored ref
         // is stale: a dynamic array's cells were cleared since load, and a
@@ -4631,13 +4663,13 @@ fn cell_xml(
                 format!(
                     "<f{}>{}</f>",
                     with_ref(fa, &anchor),
-                    esc_text(&file_formula(src))
+                    esc_text(&saved_formula(cell, src))
                 ),
                 true,
             )
         }
         (Some(src), Some(fa)) => (
-            format!("<f{fa}>{}</f>", esc_text(&file_formula(src))),
+            format!("<f{fa}>{}</f>", esc_text(&saved_formula(cell, src))),
             is_array_f(fa),
         ),
         (None, _) => (String::new(), false),
@@ -14421,6 +14453,167 @@ b",
             eng.set_cell(&mut pkg.workbook, (0, r, c), Cell::formula(src));
         }
         (pkg, eng)
+    }
+
+    /// A package whose sheet `<sheetData>` is `rows`, as a producer wrote it
+    /// (the rest is what `new_xlsx` saves), loaded.
+    fn book_with_rows(rows: &str) -> SheetPackage {
+        let base = load_xlsx(&save_xlsx(&new_xlsx())).unwrap();
+        let sheet = part_text(&base, "xl/worksheets/sheet1.xml");
+        let (head, tail) = (
+            &sheet[..sheet.find("<sheetData").unwrap()],
+            &sheet[sheet.find("</sheetData>").map_or_else(
+                || sheet.find("<sheetData/>").unwrap() + "<sheetData/>".len(),
+                |i| i + "</sheetData>".len(),
+            )..],
+        );
+        let sheet = format!("{head}<sheetData>{rows}</sheetData>{tail}");
+        let parts: Vec<(String, Vec<u8>)> = base
+            .part_names()
+            .into_iter()
+            .map(|n| {
+                let bytes = if n == "xl/worksheets/sheet1.xml" {
+                    sheet.clone().into_bytes()
+                } else {
+                    base.part(n).unwrap().to_vec()
+                };
+                (n.to_string(), bytes)
+            })
+            .collect();
+        load_xlsx(&write_zip(&parts)).unwrap()
+    }
+
+    #[test]
+    fn a_loaded_bare_future_name_is_saved_as_loaded_until_it_is_edited() {
+        // #816 r1-m1: a VBA function named TEXTJOIN is a call to the UDF, not
+        // the builtin. Plain, spilling-array and legacy-array `<f>`s all keep it.
+        let rows = concat!(
+            r#"<row r="1"><c r="C1"><f>TEXTJOIN(",",TRUE,A1:A3)</f><v>1,2,3</v></c>"#,
+            r#"<c r="D1"><f t="array" ref="D1">IFS(A1=1,"a")</f><v>a</v></c>"#,
+            r#"<c r="E1"><f>XLOOKUP(2,A1:A3,A1:A3)</f><v>2</v></c></row>"#,
+            r#"<row r="2"><c r="C2"><f>_xlfn.TEXTJOIN(",",TRUE,A1:A3)</f><v>1,2,3</v></c></row>"#
+        );
+        let mut pkg = book_with_rows(rows);
+        let (_, ws) = resaved(&pkg);
+        for f in [
+            r#"<f>TEXTJOIN(",",TRUE,A1:A3)</f>"#,
+            r#"IFS(A1=1,"a")</f>"#,
+            r#"<f>XLOOKUP(2,A1:A3,A1:A3)</f>"#,
+            r#"<f>_xlfn.TEXTJOIN(",",TRUE,A1:A3)</f>"#,
+        ] {
+            assert!(ws.contains(f), "{f} in {ws}");
+        }
+        assert!(
+            !ws.contains("_xlfn.IFS") && !ws.contains("_xlfn.XLOOKUP"),
+            "{ws}"
+        );
+
+        // Typed over (even with the same shape of text elsewhere) it is the
+        // builtin: the text changed, so the save translates it.
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.set_cell(
+            &mut pkg.workbook,
+            (0, 0, 2),
+            Cell::formula(r#"TEXTJOIN(";",TRUE,A1:A3)"#),
+        );
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<f>_xlfn.TEXTJOIN(";",TRUE,A1:A3)</f>"#),
+            "{ws}"
+        );
+        // The untouched ones are still as loaded.
+        assert!(ws.contains(r#"<f>XLOOKUP(2,A1:A3,A1:A3)</f>"#), "{ws}");
+    }
+
+    #[test]
+    fn a_loaded_formula_that_a_structural_edit_reprints_is_translated() {
+        let mut pkg = book_with_rows(
+            r#"<row r="1"><c r="C1"><f>TEXTJOIN(",",TRUE,A1:A3)</f><v>1,2,3</v></c></row>"#,
+        );
+        let mut cell = pkg.workbook.sheets[0].cell(0, 2).unwrap().clone();
+        // What a row insert makes of it: new text, so no longer as loaded.
+        cell.formula = Some(r#"TEXTJOIN(",",TRUE,A2:A4)"#.to_string());
+        pkg.workbook.sheets[0].set_cell(0, 2, cell);
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<f>_xlfn.TEXTJOIN(",",TRUE,A2:A4)</f>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn shared_group_followers_keep_the_masters_prefixes_or_its_bare_names() {
+        // A follower is the master's reprint, which has no `_xlfn.`/`_xlpm.`:
+        // it must still be saved with them. A group of bare names (a UDF)
+        // stays bare, master and followers alike.
+        let rows = concat!(
+            r#"<row r="1"><c r="C1"><f t="shared" ref="C1:C3" si="0">_xlfn.XLOOKUP(A1,$A$1:$A$3,$A$1:$A$3)</f><v>1</v></c>"#,
+            r#"<c r="D1"><f t="shared" ref="D1:D3" si="1">_xlfn.LET(_xlpm.x,A1,_xlpm.x+1)</f><v>2</v></c>"#,
+            r#"<c r="E1"><f t="shared" ref="E1:E3" si="2">TEXTJOIN(",",TRUE,A1:B1)</f><v>1</v></c>"#,
+            r#"<c r="F1"><f t="shared" ref="F1:F3" si="3">TEXTJOIN(",",TRUE,A1)+_xlfn.IFS(TRUE,1)</f><v>2</v></c>"#,
+            r#"<c r="G1"><f t="shared" ref="G1:G3" si="4">TEXTJOIN("_xl",TRUE,A1:B1)</f><v>1</v></c></row>"#,
+            r#"<row r="2"><c r="C2"><f t="shared" si="0"/><v>2</v></c><c r="D2"><f t="shared" si="1"/><v>3</v></c>"#,
+            r#"<c r="E2"><f t="shared" si="2"/><v>1</v></c><c r="F2"><f t="shared" si="3"/><v>2</v></c><c r="G2"><f t="shared" si="4"/><v>1</v></c></row>"#,
+            r#"<row r="3"><c r="C3"><f t="shared" si="0"/><v>3</v></c><c r="D3"><f t="shared" si="1"/><v>4</v></c>"#,
+            r#"<c r="E3"><f t="shared" si="2"/><v>1</v></c><c r="F3"><f t="shared" si="3"/><v>3</v></c><c r="G3"><f t="shared" si="4"/><v>1</v></c></row>"#
+        );
+        let pkg = book_with_rows(rows);
+        let (_, ws) = resaved(&pkg);
+        for f in [
+            "<f>_xlfn.XLOOKUP(A2,$A$1:$A$3,$A$1:$A$3)</f>",
+            "<f>_xlfn.XLOOKUP(A3,$A$1:$A$3,$A$1:$A$3)</f>",
+            "<f>_xlfn.LET(_xlpm.x,A2,_xlpm.x+1)</f>",
+            "<f>_xlfn.LET(_xlpm.x,A3,_xlpm.x+1)</f>",
+            r#"<f>TEXTJOIN(",",TRUE,A1:B1)</f>"#,
+            r#"<f>TEXTJOIN(",",TRUE,A2:B2)</f>"#,
+            r#"<f>TEXTJOIN(",",TRUE,A3:B3)</f>"#,
+        ] {
+            assert!(ws.contains(f), "{f} in {ws}");
+        }
+        // A master mixing a bare UDF with a prefixed builtin: it is kept as
+        // loaded, its followers are reprints and are saved prefixed whole.
+        for f in [
+            r#"<f>TEXTJOIN(",",TRUE,A1)+_xlfn.IFS(TRUE,1)</f>"#,
+            r#"<f>_xlfn.TEXTJOIN(",",TRUE,A2)+_xlfn.IFS(TRUE,1)</f>"#,
+            r#"<f>_xlfn.TEXTJOIN(",",TRUE,A3)+_xlfn.IFS(TRUE,1)</f>"#,
+            // `_xl` inside a string literal is no prefix: the group stays bare.
+            r#"<f>TEXTJOIN("_xl",TRUE,A1:B1)</f>"#,
+            r#"<f>TEXTJOIN("_xl",TRUE,A2:B2)</f>"#,
+            r#"<f>TEXTJOIN("_xl",TRUE,A3:B3)</f>"#,
+        ] {
+            assert!(ws.contains(f), "{f} in {ws}");
+        }
+    }
+
+    #[test]
+    fn loaded_text_that_needs_a_reprint_is_still_repaired_on_save() {
+        // A bare LET, `A1#` or `@x` is not a bare UDF name: save fixes it.
+        let rows = concat!(
+            r#"<row r="1"><c r="C1"><f>LET(x,A1,x+1)</f><v>2</v></c>"#,
+            r#"<c r="D1"><f>SUM(C1#)</f><v>2</v></c></row>"#,
+        );
+        let pkg = book_with_rows(rows);
+        for c in [2, 3] {
+            let cell = pkg.workbook.sheets[0].cell(0, c).unwrap();
+            assert!(cell.meta.as_ref().is_none_or(|m| m.loaded_f.is_none()));
+        }
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains("<f>_xlfn.LET(_xlpm.x,A1,_xlpm.x+1)</f>"),
+            "{ws}"
+        );
+        assert!(ws.contains("<f>SUM(_xlfn.ANCHORARRAY(C1))</f>"), "{ws}");
+    }
+
+    #[test]
+    fn an_ordinary_loaded_formula_keeps_no_copy_of_its_text() {
+        let pkg = book_with_rows(
+            r#"<row r="1"><c r="C1"><f>_xlfn.TEXTJOIN(",",TRUE,A1:A3)</f><v>x</v></c><c r="D1"><f>SUM(A1:A3)</f><v>6</v></c></row>"#,
+        );
+        for c in [2, 3] {
+            let cell = pkg.workbook.sheets[0].cell(0, c).unwrap();
+            assert!(cell.meta.as_ref().is_none_or(|m| m.loaded_f.is_none()));
+        }
     }
 
     #[test]
