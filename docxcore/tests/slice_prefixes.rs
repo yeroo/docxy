@@ -134,3 +134,34 @@ fn a_revision_declares_a_prefix_bound_below_the_part_root() {
         assert!(out.contains(&format!("<{tag} xmlns:x=\"urn:x\"")), "{out}");
     }
 }
+
+/// Update Field (F9) rewrites the result run and Edit Field the code: the
+/// rebuilt runs keep the prefixes the field's runs declare.
+#[test]
+fn updating_or_editing_a_field_keeps_its_runs_prefixes_bound() {
+    use docxcore::field::{with_instr, with_result};
+    use docxcore::model::{Block, Inline};
+
+    let mut doc = parse_document_xml(
+        &cell(&format!("<w:p>{}</w:p>", field_runs(X_RPR))),
+        &Relationships::default(),
+    );
+    let Block::Table(table) = &mut doc.body[0] else {
+        panic!("expected a table");
+    };
+    let para = &mut table.rows[0].cells[0].blocks[0];
+    let Block::Paragraph(para) = para else {
+        panic!("expected a paragraph");
+    };
+    let Inline::Field { raw, .. } = &mut para.content[0] else {
+        panic!("expected a collapsed field: {:?}", para.content);
+    };
+    let updated = with_result(raw, "4").expect("result rewritten");
+    *raw = with_instr(&updated, " NUMPAGES ").expect("instruction rewritten");
+    let out = document_to_xml(&doc);
+    assert_bound(&out);
+    assert!(
+        out.contains("<w:t>4</w:t>") && out.contains("NUMPAGES"),
+        "{out}"
+    );
+}

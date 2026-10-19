@@ -1067,15 +1067,14 @@ impl FieldCollapse {
         let pushed = &out[n.min(out.len())..];
         let run = p.raw_slice(start, p.pos());
         // The child has ended, so the scope is its container's, shared by the
-        // siblings; a field this child opens is open from here on.
-        let opens_field = is_run && is_field_code_run(run, pushed) && run.contains("fldCharType");
-        if !self.open.is_empty() || opens_field {
+        // siblings; a field this child opens is open from here on (a code run may).
+        let code_run = is_run && is_field_code_run(run, pushed);
+        if !self.open.is_empty() || code_run {
             let declared = declare_rebuilt(run, &rebuilt_bindings(p));
             if declared != run {
                 self.declared.push((start, p.pos(), declared));
             }
         }
-        let code_run = is_run && is_field_code_run(run, pushed);
         // Content is inside every open field, so it rules on all of them.
         let taints = if code_run {
             !is_clean_code_run(run)
@@ -1086,9 +1085,6 @@ impl FieldCollapse {
             self.open.iter_mut().for_each(|open| open.broken = true);
         }
         if !code_run {
-            if self.open.is_empty() {
-                self.declared.clear();
-            }
             return;
         }
         let events = crate::field::field_events(run);
