@@ -4224,6 +4224,27 @@ fn empty_sdt_at(content: &[Inline], o: usize) -> Option<usize> {
     None
 }
 
+/// The hyperlink holding an empty content control at caret offset `o` among
+/// its `content` children (the same control [`empty_sdt_at`] finds at the top
+/// level): its index and the offset within its content. Only when no empty
+/// control sits at `o` outside a link, which the caller has checked.
+fn empty_sdt_in_link(content: &[Inline], o: usize) -> Option<(usize, usize)> {
+    let mut acc = 0;
+    for (i, inline) in content.iter().enumerate() {
+        let len = inline_len(inline);
+        if let Inline::Hyperlink(h) = inline {
+            if !h.content.is_empty() && acc <= o && o <= acc + len {
+                let local = o - acc - link_runs_len(h);
+                if empty_sdt_at(&h.content, local).is_some() {
+                    return Some((i, local));
+                }
+            }
+        }
+        acc += len;
+    }
+    None
+}
+
 /// The formatting of text typed into the empty content control whose
 /// content starts at `at` (see [`empty_sdt_at`]): the control's own run
 /// properties (`w:sdtPr/w:rPr`, which Word and our cover placeholders write),
@@ -4268,6 +4289,13 @@ fn content_insert_with(content: &mut Vec<Inline>, o: usize, ch: char, typing: bo
         );
         clear_showing_placeholder(content, at - 1);
         return;
+    }
+    if let Some((i, local)) = empty_sdt_in_link(content, o).filter(|_| typing) {
+        if let Inline::Hyperlink(h) = &mut content[i] {
+            content_insert_with(&mut h.content, local, ch, true);
+            h.content_changed = true;
+            return;
+        }
     }
     let Some((i, local)) = locate(content, o) else {
         if let Some(Inline::Run(r)) = content.last_mut() {
@@ -4679,6 +4707,14 @@ fn insert_inlines(
     before_opens: bool,
     placeholders: bool,
 ) -> usize {
+    if empty_sdt_at(content, o).is_none() {
+        if let Some((i, local)) = empty_sdt_in_link(content, o) {
+            if let Inline::Hyperlink(h) = &mut content[i] {
+                h.content_changed = true;
+                return insert_inlines(&mut h.content, local, ins, before_opens, placeholders);
+            }
+        }
+    }
     let tail = match empty_sdt_at(content, o) {
         Some(at) => {
             clear_showing_placeholder(content, at - 1);
@@ -5258,6 +5294,11 @@ fn source_props_at(content: &[Inline], offset: usize) -> RunProps {
     // Typing into an emptied content control takes the control's formatting.
     if let Some(at) = empty_sdt_at(content, offset) {
         return sdt_typing_props(content, at);
+    }
+    if let Some((i, local)) = empty_sdt_in_link(content, offset) {
+        if let Inline::Hyperlink(h) = &content[i] {
+            return source_props_at(&h.content, local);
+        }
     }
     let Some((i, local)) = locate(content, offset) else {
         return match content.last() {

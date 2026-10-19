@@ -406,8 +406,8 @@ fn block_placeholders(blocks: &[Block], out: &mut Pieces) {
     }
 }
 
-/// Collect the text of every placeholder control around cells of `row` (Word's
-/// Abstract and Year, `w:sdt` around `w:tc`) into `out`: the paragraphs of its
+/// Collect the text of every placeholder control around cells of `row` (such as
+/// Word's Abstract, `w:sdt` around `w:tc`) into `out`: the paragraphs of its
 /// cells, joined with line breaks.
 fn row_placeholders(row: &Row, out: &mut Pieces) {
     for (c, cell) in row.cells.iter().enumerate() {
