@@ -408,3 +408,46 @@ fn a_split_paragraph_keeps_its_rule_on_both_halves() {
     assert_eq!(out.matches("<w:p ").count(), 2, "{out}");
     assert_eq!(out.matches("mc:Ignorable=\"ux\"").count(), 2, "{out}");
 }
+
+/// Rejecting a property change restores its snapshot, whose `ux:` attribute
+/// needs the rule the rebuilt `w:body` declared (the snapshot is read apart
+/// from the part root that binds `mc`).
+#[test]
+fn rejected_property_changes_restore_the_inherited_rule() {
+    let ancestor = " xmlns:ux=\"urn:ux\" mc:Ignorable=\"ux\"";
+    let cases = [
+        (
+            "w:b",
+            "<w:p><w:r><w:rPr><w:i/><w:rPrChange w:id=\"1\" w:author=\"a\">\
+             <w:rPr><w:b ux:a=\"1\"/></w:rPr></w:rPrChange></w:rPr><w:t>a</w:t></w:r></w:p>",
+        ),
+        (
+            "w:keepNext",
+            "<w:p><w:pPr><w:jc w:val=\"center\"/><w:pPrChange w:id=\"1\" w:author=\"a\">\
+             <w:pPr><w:keepNext ux:a=\"1\"/></w:pPr></w:pPrChange></w:pPr></w:p>",
+        ),
+        (
+            "w:tblStyle",
+            "<w:tbl><w:tblPr><w:tblW w:w=\"0\"/><w:tblPrChange w:id=\"1\" w:author=\"a\">\
+             <w:tblPr><w:tblStyle w:val=\"Old\" ux:a=\"1\"/></w:tblPr></w:tblPrChange></w:tblPr>\
+             <w:tblGrid/><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl><w:p/>",
+        ),
+    ];
+    for (element, body) in cases {
+        let src = doc(ancestor, body);
+        let out = saved_after(&src, |editor| {
+            editor.reject_all_revisions();
+        });
+        assert!(out.contains("ux:a=\"1\""), "{element} restored: {out}");
+        assert_eq!(
+            ignorable_at(&out, element),
+            [vec!["ux".to_string()]],
+            "{element}: {out}"
+        );
+        assert!(ux_bound_at(&out, element), "{element}: {out}");
+        // Left alone, the change keeps the same.
+        let kept = saved(&src);
+        assert_eq!(kept, saved(&kept), "{element} stable: {kept}");
+        assert!(kept.contains("ux:a=\"1\""), "{element} kept: {kept}");
+    }
+}

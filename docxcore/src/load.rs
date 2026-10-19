@@ -327,7 +327,7 @@ fn declare_rebuilt(raw: &str, rebuilt: &Rebuilt) -> String {
     if rebuilt.ns.is_empty() && rebuilt.mce.is_empty() {
         return raw.to_string();
     }
-    let (mut used, own) = prefixes_of(raw);
+    let (used, mut own) = prefixes_of(raw);
     let rules = rules_for_prefixes(&rebuilt.mce, &used);
     let own_rules = own_rules(raw);
     let mut out = raw.to_string();
@@ -353,8 +353,14 @@ fn declare_rebuilt(raw: &str, rebuilt: &Rebuilt) -> String {
         decls.push_str(&format!(" {name}=\""));
         crate::serialize::esc_attr(value, &mut decls);
         decls.push('"');
+        // The rule's prefix is declared on the tag itself, as the markup-
+        // compatibility namespace: the tag may be read apart from the part
+        // root that binds it (a property-change snapshot).
         if let Some((prefix, _)) = name.split_once(':') {
-            used.push(prefix.to_string());
+            if !own.iter().any(|o| o == prefix) {
+                decls.push_str(&format!(" xmlns:{prefix}=\"{MC_NS}\""));
+                own.push(prefix.to_string());
+            }
         }
     }
     // Last first, so the earlier ranges stay valid.

@@ -1751,6 +1751,28 @@ mod tests {
         assert_eq!(xml.matches("keep").count(), 2, "{xml}");
     }
 
+    /// Review r2: a rule declared inside the drawing run is added by the
+    /// loader to the modeled copy's `ux:` carrier; the copies stay twins.
+    #[test]
+    fn a_rule_declared_in_the_drawing_run_keeps_the_copies_twins() {
+        let content = "<w:p ux:l=\"1\"><w:r><w:t xml:space=\"preserve\">keep</w:t></w:r>\
+            <w:r><w:rPr><w:b ux:a=\"1\"/><w:vanish/></w:rPr><w:t xml:space=\"preserve\">gone</w:t></w:r></w:p>";
+        let boxed = format!(
+            "<w:p><w:r><mc:AlternateContent xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" \
+             xmlns:ux=\"urn:ux\" mc:Ignorable=\"ux\"><mc:Choice Requires=\"wps\"><w:drawing><wps:txbx>\
+             <w:txbxContent>{content}</w:txbxContent></wps:txbx></w:drawing></mc:Choice>\
+             <mc:Fallback><w:pict><v:shape><v:textbox><w:txbxContent>{content}</w:txbxContent>\
+             </v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent></w:r></w:p>"
+        );
+        let xml = document_to_xml(&parse(&boxed));
+        let body = &xml[xml.find("<w:body>").unwrap() + 8..xml.find("</w:body>").unwrap()];
+        let mut reopened = parse(body);
+        assert_eq!(remove_hidden_text(&mut reopened, None), 1);
+        let xml = document_to_xml(&reopened);
+        assert!(!xml.contains("gone"), "{xml}");
+        assert_eq!(xml.matches("keep").count(), 2, "{xml}");
+    }
+
     /// SmartArt and equation runs are kept whole as their raw and written
     /// back verbatim, so a comment reference sharing one is found and
     /// removed there, and the drawing stays.
