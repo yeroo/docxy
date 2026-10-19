@@ -2460,10 +2460,10 @@ pub(crate) fn ppr_of_children(children: &[String]) -> ParProps {
     props
 }
 
-/// Parse a `<w:hyperlink>`, pushing into `out`. External links and internal
-/// anchors with complex children stay as one lossless [`Inline::Hyperlink`].
-/// Simple internal TOC links are split around tabs/breaks so leader stops keep
-/// rendering while each run segment remains navigable.
+/// Parse a `<w:hyperlink>`, pushing into `out`. External links, and internal
+/// anchors whose children are not all plain runs (a TOC entry's tab, a break,
+/// a field), stay as one lossless [`Inline::Hyperlink`] with `content` and
+/// `raw`; an internal anchor of plain runs keeps them in `runs`.
 fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {
     let raw_start = p.start_pos();
     // The prefixes declared below the part root, which the retained `raw`
@@ -2482,83 +2482,14 @@ fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<I
     };
     let rel_id = (!rid.is_empty()).then_some(rid);
     let anchor = (!anchor_attr.is_empty()).then_some(anchor_attr);
-    if target.is_none() {
-        // An internal anchor link (a cross-reference, or a TOC entry). Make it
-        // navigable so a click can jump to the bookmark. Each maximal run of
-        // `Inline::Run` becomes a `Hyperlink`; tabs/breaks are emitted at top
-        // level so TOC leader-dot tab stops still render — the surrounding link
-        // segments keep the whole entry clickable.
-        if let Some(anchor) = anchor {
-            let mut inner = Vec::new();
-            parse_inlines_into(p, rels, &mut inner);
-            let raw = declare_rebuilt(p.raw_slice(raw_start, p.pos()), &bindings);
-            if inner.iter().any(|inline| {
-                !matches!(inline, Inline::Run(_) | Inline::Tab(_) | Inline::Break(..))
-            }) {
-                out.push(Inline::Hyperlink(Hyperlink {
-                    target: None,
-                    anchor: Some(anchor),
-                    rel_id,
-                    runs: Vec::new(),
-                    content: inner,
-                    raw: Some(raw),
-                    content_changed: false,
-                }));
-                return;
-            }
-            if inner.iter().all(|inline| matches!(inline, Inline::Run(_))) {
-                let runs = inner
-                    .into_iter()
-                    .map(|inline| match inline {
-                        Inline::Run(run) => run,
-                        _ => unreachable!(),
-                    })
-                    .collect();
-                out.push(Inline::Hyperlink(Hyperlink {
-                    target: None,
-                    anchor: Some(anchor),
-                    rel_id,
-                    runs,
-                    content: Vec::new(),
-                    raw: preserve_opener.then_some(raw),
-                    content_changed: preserve_opener,
-                }));
-                return;
-            }
-            let mut runs: Vec<Run> = Vec::new();
-            for it in inner {
-                match it {
-                    Inline::Run(r) => runs.push(r),
-                    other => {
-                        if !runs.is_empty() {
-                            out.push(Inline::Hyperlink(Hyperlink {
-                                target: None,
-                                anchor: Some(anchor.clone()),
-                                rel_id: rel_id.clone(),
-                                runs: std::mem::take(&mut runs),
-                                content: Vec::new(),
-                                raw: preserve_opener.then(|| raw.clone()),
-                                content_changed: preserve_opener,
-                            }));
-                        }
-                        out.push(other);
-                    }
-                }
-            }
-            if !runs.is_empty() {
-                out.push(Inline::Hyperlink(Hyperlink {
-                    target: None,
-                    anchor: Some(anchor),
-                    rel_id,
-                    runs,
-                    content: Vec::new(),
-                    raw: preserve_opener.then_some(raw),
-                    content_changed: preserve_opener,
-                }));
-            }
-        } else {
-            parse_inlines_into(p, rels, out);
-        }
+    // An internal anchor link (a cross-reference, or a TOC entry) is made
+    // navigable so a click can jump to the bookmark. Anything but plain runs
+    // (a TOC entry's tab, a break, a field) stays inside the one `Hyperlink`
+    // as `content`, retained raw until an edit, so the entry saves as the
+    // single `w:hyperlink` it was and the renderer still lays the tab out as a
+    // leader-dot tab stop.
+    if target.is_none() && anchor.is_none() {
+        parse_inlines_into(p, rels, out);
         return;
     }
 

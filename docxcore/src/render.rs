@@ -5241,6 +5241,41 @@ mod tests {
     }
 
     #[test]
+    fn a_tab_inside_a_toc_link_still_renders_its_dot_leader_920() {
+        let tabs = vec![TabStop {
+            pos: 8630,
+            align: TabAlign::Right,
+            leader: TabLeader::Dot,
+        }];
+        let entry = |inlines: Vec<Inline>| {
+            Block::Paragraph(Paragraph {
+                props: ParProps {
+                    tabs: tabs.clone(),
+                    ..Default::default()
+                },
+                content: inlines,
+            })
+        };
+        let flat = entry(vec![
+            run("Intro", RunProps::default()),
+            Inline::Tab(RunProps::default()),
+            run("9", RunProps::default()),
+        ]);
+        let linked = entry(vec![Inline::Hyperlink(Hyperlink {
+            anchor: Some("_Toc1".into()),
+            content: vec![
+                run("Intro", RunProps::default()),
+                Inline::Tab(RunProps::default()),
+                run("9", RunProps::default()),
+            ],
+            ..Default::default()
+        })]);
+        let line = render(&doc(vec![linked]), &opts(50))[0].plain();
+        assert!(line.contains("...."), "no dot leader: {line:?}");
+        assert_eq!(line, render(&doc(vec![flat]), &opts(50))[0].plain());
+    }
+
+    #[test]
     fn direct_ppr_tabs_render_dot_leader() {
         // A deeper TOC entry (e.g. "1.1 Motivation") carries its tab stops on the
         // paragraph's own `pPr`, not its style. The direct stops must drive the
