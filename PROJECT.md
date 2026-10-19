@@ -278,18 +278,22 @@ task: its bookings are placed first, and auto tasks level around them.
 
 Leveling is also a plan edit (#1594, `projcore::leveling`, `Editor::level_tasks`):
 Level Selection (a summary stands for its subtasks) and Level Resource run
-the leveler over a scope (`schedule::level_with`: the tasks outside it keep
-their dates and still book their resources, an automatic one over each
-assignment's own window; a task of priority 1000 is never leveled) and write
+the leveler over a scope (`schedule::level_with`: the tasks outside it take
+no delay of their own and are booked at the dates the plan gives them now,
+an automatic one over each assignment's own window; a task of priority 1000
+is never leveled) and write
 each leveled task's own `LevelingDelay` (elapsed minutes from the start its
 links, constraints and leveled predecessors drive it to, so a task that only
 follows a delayed predecessor records none, as Project does; in tenths of a
 minute with `LevelingDelayFormat` 8, as Project 2024 stores it) and
 `PreLeveledStart`/`Finish` (its unleveled dates), one undo step, settled so
 the stored delays reproduce the leveled dates exactly (a plan that cannot be
-reproduced is refused). A task outside the scope takes no delay of its own
-but still follows its links; an ALAP task is never delayed (Project 2024
-refuses a delay on one); a delayed task's predecessors have the zero slack
+reproduced is refused). An automatic task outside the scope still follows
+its links once the delays are written, so a conflict that leaves is reported
+as overallocated for a further pass; an ALAP task is neither delayed nor
+booked (Project 2024 refuses a delay on one, and its late dates float with
+the finish, so an overallocation it causes stays); a delayed task's
+predecessors have the zero slack
 Project shows them. Level All stays the display overlay (no `level.all` edit
 yet). The scheduler honours a
 stored `LevelingDelay` (the task starts that much elapsed time after its

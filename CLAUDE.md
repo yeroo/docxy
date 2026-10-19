@@ -446,28 +446,33 @@
 
 - `projcore::schedule::level_with(proj, &LevelScope {movable, order,
   within_slack})` levels a scope: tasks outside it, and priority 1000, are
-  never delayed (a held automatic task books each resource over its own
-  assignment's window, a manual or tracked one its whole span; a held
-  automatic task that follows a moved one through its links moves with it
-  and is booked where it lands); an ALAP task is never delayed either
-  (Project 2024 refuses a delay on one, measured, so the schedule ignores a
-  stored one); `within_slack` leaves a task that would start past its CPM
-  late start at its earliest start, overallocated. `Leveled::delay_min`
+  never delayed and are booked at the dates the plan gives them now (a held
+  automatic task over each assignment's own window, a manual or tracked one
+  its whole span; an automatic follower of a moved task still follows its
+  links once the delays are written, so a conflict that leaves is reported
+  as overallocated for a further pass); an ALAP task is neither delayed nor
+  booked (Project 2024 refuses a delay on one, measured, so the schedule
+  ignores a stored one, and its late dates float with the finish);
+  `within_slack` leaves a task that would start past its CPM late start at
+  its earliest start, overallocated. `Leveled::delay_min`
   is each leaf's own delay in elapsed minutes, from the start its leveled
   predecessors drive it to, so a task that only follows a delayed
   predecessor records none (Project 2024 over COM: the FS successor of a
   leveled task keeps LevelingDelay 0). The CPM forward pass adds a stored
   task `LevelingDelay` (tenths of a minute, elapsed) to the snapped driven
   start and snaps again; the backward pass bounds a delayed task's
-  predecessors that much earlier, so they report the zero slack Project
-  2024 shows them (measured).
+  predecessors by its late start less the delay, the late finish following
+  through the task's working span (`late_bounds_before_delay`, on direct and
+  summary links alike), so they report the zero slack Project 2024 shows
+  them (measured).
 - `Editor::level_tasks(&LevelTarget::{All, Selection, Resource})`
   (`level_tasks_with` takes `LevelOptions` for one pass) writes
   `leveling_delay` (format 8) and `pre_leveled_start/finish` (from the plan
   without the scope's delays, whatever `clear_first` says, so a repeated
-  pass records no step) as one undo step, every targeted leaf settled
-  against a rescheduled trial so the committed dates equal the leveled ones
-  exactly (a plan that does not settle is refused with nothing changed). With
+  pass records no step) as one undo step, every targeted leaf that can
+  carry a delay (not ALAP, not priority 1000) settled against a rescheduled
+  trial so the committed dates equal the leveled ones exactly (a plan that
+  does not settle is refused with nothing changed). With
   `clear_first` a priority-1000 task's stored delay is cleared too and the
   task holds at its unleveled start (measured). `clear_leveling(uids | all)`
   is one step. `LevelOptions` are the plan options `LevelingOrder`,

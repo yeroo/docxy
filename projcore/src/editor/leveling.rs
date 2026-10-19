@@ -58,10 +58,12 @@ impl Editor {
     /// only follows a delayed predecessor records none, as Project does)
     /// and its pre-leveled dates (its unleveled start and finish) as one
     /// undo step. Tasks outside the target take no delay of their own and
-    /// still book their resources; an automatic one still follows its
-    /// links, so it moves with a targeted predecessor as the committed plan
-    /// schedules it. An ALAP task is never delayed (Project 2024 refuses a
-    /// delay on one). With `clear_first` the targeted tasks' stored
+    /// are booked at the dates the plan gives them now; an automatic one
+    /// still follows its links once the delays are written, so a conflict
+    /// that leaves is reported as overallocated for a further pass. An ALAP
+    /// task is never delayed nor booked (Project 2024 refuses a delay on
+    /// one; its late dates float with the finish), so an overallocation it
+    /// causes stays. With `clear_first` the targeted tasks' stored
     /// delays are dropped before the pass (a priority-1000 task's too, as
     /// measured on Project 2024; it then holds at its unleveled start),
     /// otherwise the pass builds on them. The stored delays reproduce the
@@ -127,8 +129,22 @@ impl Editor {
                 continue;
             }
             // An ALAP task carries no delay (Project 2024 refuses one) and
-            // floats with the finish, so nothing is written or settled for it.
+            // floats with the finish, so nothing is written or settled for
+            // it. A priority-1000 task is never delayed either: with
+            // `clear_first` its stored delay is cleared (as Project does,
+            // measured) and nothing else is written or settled for it.
             if t.constraint == crate::model::ConstraintType::AsLateAsPossible {
+                continue;
+            }
+            if t.priority == Some(1000) {
+                if options.clear_first {
+                    plan.push(DelayEdit {
+                        row: i,
+                        value: None,
+                        pre_start: None,
+                        pre_finish: None,
+                    });
+                }
                 continue;
             }
             let Some(delay) = leveled.delay_min(t.uid) else {
@@ -165,6 +181,10 @@ impl Editor {
             let mut moved = false;
             for e in &mut plan {
                 let uid = trial.tasks[e.row].uid;
+                // A held task is never written a delay, whatever it misses.
+                if trial.tasks[e.row].priority == Some(1000) {
+                    continue;
+                }
                 let (Some(want), Some(got)) = (leveled.start(uid), sched.get(uid)) else {
                     continue;
                 };
@@ -746,12 +766,14 @@ mod tests {
         assert_eq!(ed.clear_leveling(Some(&[3, 3])).unwrap(), 1);
     }
 
-    /// #1594 r2: with only Paint selected on a chain Build, Paint, Trim (one
-    /// day each on Ann, Trim after Paint), Paint takes Tuesday and Trim,
-    /// outside the selection, follows it to Wednesday with no delay of its
-    /// own: the leveler's dates are the committed plan's.
+    /// #1594 r3: with only Paint selected on a chain Build, Paint, Trim (one
+    /// day each on Ann, Trim after Paint), Trim is booked where the plan has
+    /// it (Tuesday), so Paint levels past it to Wednesday, takes no delay of
+    /// its own beyond that, and the committed plan moves Trim to Thursday
+    /// after it: the targeted task lands where the leveler put it, the
+    /// follower where its link drives it, and nothing is double-booked.
     #[test]
-    fn a_held_successor_follows_its_moved_predecessor() {
+    fn a_held_successor_is_booked_where_the_plan_has_it() {
         let mut p = staffed().project().clone();
         for t in &mut p.tasks {
             t.duration_min = 480;
@@ -768,23 +790,21 @@ mod tests {
             },
         );
         let out = ed.level_tasks(&LevelTarget::Selection(vec![2])).unwrap();
-        assert_eq!((out.changed, out.delayed), (1, 1));
+        assert_eq!((out.changed, out.delayed, out.overallocated), (1, 1, 0));
         assert_eq!(
             ed.project().task(2).unwrap().leveling_delay,
-            Some(1440 * 10)
+            Some(2 * 1440 * 10)
         );
         assert_eq!(ed.project().task(3).unwrap().leveling_delay, None);
+        assert_eq!(start(&ed, 2), leveled.start(2).unwrap());
         assert_eq!(
             start(&ed, 2),
-            DateTime::from_minutes(anchor.minutes() + 1440)
+            DateTime::from_minutes(anchor.minutes() + 2 * 1440)
         );
         assert_eq!(
             start(&ed, 3),
-            DateTime::from_minutes(anchor.minutes() + 2 * 1440)
+            DateTime::from_minutes(anchor.minutes() + 3 * 1440)
         );
-        for uid in 1..=3 {
-            assert_eq!(start(&ed, uid), leveled.start(uid).unwrap(), "task {uid}");
-        }
     }
 
     /// #1594 r2: settlement covers every targeted leaf, not only those whose
@@ -879,20 +899,24 @@ mod tests {
         assert_eq!(out.overallocated, 1);
     }
 
-    /// #1594 r2: an ALAP task is never delayed by the editor's pass either.
+    /// #1594 r3: an ALAP task is neither delayed nor booked by a pass: Build
+    /// and Paint level between themselves, Trim (ALAP) floats onto the new
+    /// finish over Paint, and the overallocation that leaves is reported, as
+    /// Project reports it cannot level an ALAP task.
     #[test]
     fn an_alap_task_is_not_leveled() {
         let mut p = staffed().project().clone();
         p.tasks[2].constraint = crate::model::ConstraintType::AsLateAsPossible;
         let mut ed = Editor::new(p);
+        let anchor = start(&ed, 1);
         let out = ed.level_tasks(&LevelTarget::All).unwrap();
-        // Trim sits as late as possible over Build's and Paint's days, held
-        // there: both of them level around it and it takes no delay.
-        assert_eq!(out.delayed, 2);
+        assert_eq!((out.delayed, out.overallocated), (1, 1));
         assert_eq!(ed.project().task(3).unwrap().leveling_delay, None);
-        // Still as late as possible: its start is the schedule's late start,
-        // which moved with the finish the leveled tasks pushed.
+        assert_eq!(start(&ed, 1), anchor);
+        assert!(start(&ed, 2) >= finish(&ed, 1));
+        // Still as late as possible: its start is the schedule's late start.
         let trim = ed.schedule().get(3).unwrap();
         assert_eq!(trim.early_start, trim.late_start);
+        assert_eq!(trim.early_start, start(&ed, 2), "over Paint");
     }
 }
