@@ -7555,6 +7555,11 @@ thread_local! {
     /// every render.
     static DOC_WORDS: std::cell::RefCell<Vec<(Vec<usize>, WordSpans)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The painted cells of each top-level table's rows in the frame last
+    /// rendered, with the row's path `[block, row]` and each cell's column
+    /// index, for the margin drag (#1477). Emptied with `DOC_WORDS`.
+    static DOC_ROWS: std::cell::RefCell<Vec<RowCells>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// A painted piece's bounds with its first and one-past-last paragraph
@@ -7710,128 +7715,167 @@ fn words_line_end_hit(words: &WordSpans, pos: Point<Pixels>, para_end: usize) ->
     line_end_hit(&word_boxes(words), pos, tail_end, para_end)
 }
 
-/// One paragraph as the margin drag sees it: its path, painted pieces, where
-/// its last piece ends and the paragraph's end (#1477).
+/// One paragraph as the margin drag sees it: its path, painted pieces and
+/// where its last piece ends (#1477).
 struct MarginPara {
     path: Vec<usize>,
     boxes: Vec<WordBox>,
     tail: usize,
 }
 
-/// A paragraph's row key: a table cell's paragraph (`table_path ++ [row,
-/// cell, k]`) belongs to its table row `path[..len - 2]`, nested tables
-/// included; a body paragraph is its own.
-fn margin_key(path: &[usize]) -> &[usize] {
-    if path.len() >= 4 {
-        &path[..path.len() - 2]
-    } else {
-        path
-    }
-}
-
-/// Where a text drag lands when its pointer is on no paragraph (#1472, #1477).
-/// A body paragraph: the first or last stop of the row it is level with
-/// ([`line_end_hit`]). A table row: when the pointer is level with the row's
-/// band and left of its leftmost piece, the first stop of that cell paragraph
-/// (the row nearest the pointer); right of its rightmost piece, that row's
-/// last stop. Anywhere between (cell padding, gaps, a short cell's blank
-/// area) is nothing.
-fn margin_hit_in(paras: &[MarginPara], pos: Point<Pixels>) -> Option<(Vec<usize>, usize)> {
-    let mut keys: Vec<&[usize]> = Vec::new();
-    for p in paras {
-        let k = margin_key(&p.path);
-        if !keys.contains(&k) {
-            keys.push(k);
-        }
-    }
-    for key in keys {
-        let group: Vec<&MarginPara> = paras
-            .iter()
-            .filter(|p| margin_key(&p.path) == key)
-            .collect();
-        if group[0].path.len() < 4 {
-            // A body paragraph.
-            let p = group[0];
-            if let Some(off) = line_end_hit(&p.boxes, pos, p.tail, p.tail) {
-                return Some((p.path.clone(), off));
-            }
-            continue;
-        }
-        let all = || {
-            group
+impl MarginPara {
+    fn of(path: &[usize], words: &WordSpans) -> Self {
+        MarginPara {
+            path: path.to_vec(),
+            boxes: word_boxes(words),
+            tail: words
+                .borrow()
                 .iter()
-                .flat_map(|p| p.boxes.iter().map(move |b| (*p, b)))
-        };
-        let top = all()
-            .map(|(_, b)| b.bounds.top())
-            .fold(px(f32::MAX), Pixels::min);
-        let bottom = all()
-            .map(|(_, b)| b.bounds.bottom())
-            .fold(px(f32::MIN), Pixels::max);
-        if pos.y < top || pos.y > bottom {
-            continue;
+                .map(|w| w.off + w.len)
+                .max()
+                .unwrap_or(0),
         }
-        let left = all().min_by(|a, b| {
-            a.1.bounds
-                .left()
-                .partial_cmp(&b.1.bounds.left())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let right = all().max_by(|a, b| {
-            a.1.bounds
-                .right()
-                .partial_cmp(&b.1.bounds.right())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let (Some((lp, lb)), Some((rp, rb))) = (left, right) else {
-            continue;
-        };
-        let (p, far) = if pos.x <= lb.bounds.left() {
-            (lp, px(f32::MIN))
-        } else if pos.x >= rb.bounds.right() {
-            (rp, px(f32::MAX))
-        } else {
-            return None;
-        };
-        // The paragraph's row nearest the pointer.
-        let gap = |b: &WordBox| {
-            if pos.y < b.bounds.top() {
-                b.bounds.top() - pos.y
-            } else if pos.y > b.bounds.bottom() {
-                pos.y - b.bounds.bottom()
-            } else {
-                px(0.)
-            }
-        };
-        let near = p.boxes.iter().min_by(|a, b| {
-            gap(a)
-                .partial_cmp(&gap(b))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })?;
-        let at = point(far, near.bounds.center().y);
-        return line_end_hit(&p.boxes, at, p.tail, p.tail).map(|off| (p.path.clone(), off));
     }
-    None
+
+    /// How far the paragraph's nearest painted row is from height `y`; none
+    /// when nothing is painted.
+    fn gap(&self, y: Pixels) -> Option<Pixels> {
+        self.boxes
+            .iter()
+            .map(|b| {
+                if y < b.bounds.top() {
+                    b.bounds.top() - y
+                } else if y > b.bounds.bottom() {
+                    y - b.bounds.bottom()
+                } else {
+                    px(0.)
+                }
+            })
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    }
 }
 
-/// [`margin_hit_in`] over the paragraphs of the frame last rendered.
-fn margin_drag_hit(pos: Point<Pixels>) -> Option<(Vec<usize>, usize)> {
-    let paras: Vec<MarginPara> = DOC_WORDS.with(|d| {
-        d.borrow()
+/// A table row as painted: each cell's column index (`path[2]` of its
+/// paragraphs) and bounds. A cell whose bounds are not painted yet is ignored.
+struct RowArea {
+    cells: Vec<(usize, Bounds<Pixels>)>,
+}
+
+impl RowArea {
+    fn extent(&self) -> Option<Bounds<Pixels>> {
+        self.cells
             .iter()
-            .map(|(path, words)| MarginPara {
-                path: path.clone(),
-                boxes: word_boxes(words),
-                tail: words
-                    .borrow()
-                    .iter()
-                    .map(|w| w.off + w.len)
-                    .max()
-                    .unwrap_or(0),
-            })
-            .collect()
-    });
-    margin_hit_in(&paras, pos)
+            .map(|(_, b)| *b)
+            .filter(|b| b.size.width > px(0.) && b.size.height > px(0.))
+            .reduce(|a, b| a.union(&b))
+    }
+}
+
+/// The table row whose painted area holds height `y`: its path and area.
+fn row_at_height(y: Pixels) -> Option<(Vec<usize>, RowArea)> {
+    DOC_ROWS.with(|d| {
+        d.borrow().iter().find_map(|(path, cells)| {
+            let area = RowArea {
+                cells: cells.iter().map(|(c, b)| (*c, b.get())).collect(),
+            };
+            let e = area.extent()?;
+            (e.top() <= y && y <= e.bottom()).then(|| (path.clone(), area))
+        })
+    })
+}
+
+/// Where a text drag lands when its pointer is level with a table row but
+/// outside it (#1477): left of the row, the first stop of the leftmost cell's
+/// paragraph nearest the pointer's height; right of it, the last stop of the
+/// rightmost cell's. `paras` are the row's paragraphs (a nested table's
+/// belong to the outer cell). Anywhere inside the row's painted cells,
+/// padding, empty cells and merged continuations included, is nothing.
+fn table_margin_hit(
+    row: &RowArea,
+    paras: &[MarginPara],
+    pos: Point<Pixels>,
+) -> Option<(Vec<usize>, usize)> {
+    let e = row.extent()?;
+    if pos.y < e.top() || pos.y > e.bottom() {
+        return None;
+    }
+    let left = if pos.x <= e.left() {
+        true
+    } else if pos.x >= e.right() {
+        false
+    } else {
+        return None;
+    };
+    // The edge cell that holds paragraphs.
+    let has = |c: usize| paras.iter().any(|p| p.path.get(2) == Some(&c));
+    let sized = row
+        .cells
+        .iter()
+        .filter(|(c, b)| b.size.width > px(0.) && has(*c));
+    let cell = if left {
+        sized.min_by(|a, b| {
+            a.1.left()
+                .partial_cmp(&b.1.left())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    } else {
+        sized.max_by(|a, b| {
+            a.1.right()
+                .partial_cmp(&b.1.right())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    }?
+    .0;
+    // Its paragraph nearest the pointer's height (the first, or last, one
+    // when none is painted).
+    let in_cell = || paras.iter().filter(|p| p.path.get(2) == Some(&cell));
+    let near = in_cell()
+        .filter_map(|p| p.gap(pos.y).map(|g| (p, g)))
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(p, _)| p);
+    let Some(p) = near else {
+        let p = if left {
+            in_cell().next()
+        } else {
+            in_cell().next_back()
+        }?;
+        return Some((p.path.clone(), if left { 0 } else { p.tail }));
+    };
+    let row_y = p
+        .boxes
+        .iter()
+        .min_by(|a, b| {
+            let d = |x: &WordBox| (x.bounds.center().y - pos.y).abs();
+            d(a).partial_cmp(&d(b)).unwrap_or(std::cmp::Ordering::Equal)
+        })?
+        .bounds
+        .center()
+        .y;
+    let x = if left { px(f32::MIN) } else { px(f32::MAX) };
+    line_end_hit(&p.boxes, point(x, row_y), p.tail, p.tail).map(|off| (p.path.clone(), off))
+}
+
+/// Where a text drag lands when its pointer is on no paragraph (#1472,
+/// #1477): beside a table row ([`table_margin_hit`]), else level with a
+/// top-level body paragraph's row ([`line_end_hit`]).
+fn margin_drag_hit(pos: Point<Pixels>) -> Option<(Vec<usize>, usize)> {
+    if let Some((row, area)) = row_at_height(pos.y) {
+        let paras: Vec<MarginPara> = DOC_WORDS.with(|d| {
+            d.borrow()
+                .iter()
+                .filter(|(p, _)| p.len() >= 4 && p[..2] == row[..])
+                .map(|(p, w)| MarginPara::of(p, w))
+                .collect()
+        });
+        return table_margin_hit(&area, &paras, pos);
+    }
+    DOC_WORDS.with(|d| {
+        d.borrow().iter().find_map(|(path, words)| {
+            let &[_] = path.as_slice() else { return None };
+            let tail = words.borrow().iter().map(|w| w.off + w.len).max()?;
+            words_line_end_hit(words, pos, tail).map(|off| (path.clone(), off))
+        })
+    })
 }
 
 /// Which side of a unit's `bounds` a pointer at `at` is on: the unit's offset
@@ -7846,6 +7890,9 @@ fn unit_offset(bounds: Bounds<Pixels>, pos: usize, at: Point<Pixels>) -> usize {
 }
 
 type UnitCell = std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>;
+
+/// A table row's path `[block, row]` and its cells' column indexes and bounds.
+type RowCells = (Vec<usize>, Vec<(usize, UnitCell)>);
 
 /// Record a unit (a tab, field, picture or equation) at `off` as one caret
 /// stop of the paragraph, and give back the probe to put inside it (its parent
@@ -8255,70 +8302,159 @@ mod line_end_hit_tests {
         }
     }
 
-    fn margin(paras: &[MarginPara], x: f32, y: f32) -> Option<(Vec<usize>, usize)> {
-        margin_hit_in(paras, point(px(x), px(y)))
+    fn cell(c: usize, x: f32, y: f32, w: f32, h: f32) -> (usize, Bounds<Pixels>) {
+        (
+            c,
+            Bounds {
+                origin: point(px(x), px(y)),
+                size: size(px(w), px(h)),
+            },
+        )
     }
 
-    /// A table row of two cells: cell 1 wraps to three rows, cell 2 has one.
-    fn table_row() -> Vec<MarginPara> {
-        vec![
-            para(
-                &[2, 0, 0, 0],
-                vec![
-                    piece(100., 0., 40., 0, 4, true),
-                    piece(100., 20., 40., 4, 8, true),
-                    piece(100., 40., 40., 8, 12, false),
-                ],
-            ),
-            para(&[2, 0, 1, 0], vec![piece(300., 0., 50., 0, 5, false)]),
-        ]
+    fn margin(
+        cells: Vec<(usize, Bounds<Pixels>)>,
+        paras: &[MarginPara],
+        x: f32,
+        y: f32,
+    ) -> Option<(Vec<usize>, usize)> {
+        table_margin_hit(&RowArea { cells }, paras, point(px(x), px(y)))
+    }
+
+    /// A row of two cells (x 50..250 and 250..450, y 0..60): cell 0 wraps to
+    /// three rows with its text at x 100, cell 1 has one row at x 300.
+    fn row() -> (Vec<(usize, Bounds<Pixels>)>, Vec<MarginPara>) {
+        (
+            vec![cell(0, 50., 0., 200., 60.), cell(1, 250., 0., 200., 60.)],
+            vec![
+                para(
+                    &[2, 0, 0, 0],
+                    vec![
+                        piece(100., 0., 40., 0, 4, true),
+                        piece(100., 20., 40., 4, 8, true),
+                        piece(100., 40., 40., 8, 12, false),
+                    ],
+                ),
+                para(&[2, 0, 1, 0], vec![piece(300., 0., 50., 0, 5, false)]),
+            ],
+        )
     }
 
     #[test]
     fn a_margin_beside_a_table_row_is_its_first_or_last_stop_1477() {
-        let t = table_row();
-        assert_eq!(margin(&t, 20., 10.), Some((vec![2, 0, 0, 0], 0)));
-        assert_eq!(margin(&t, 20., 50.), Some((vec![2, 0, 0, 0], 8)));
-        assert_eq!(margin(&t, 600., 10.), Some((vec![2, 0, 1, 0], 5)));
+        let (c, p) = row();
+        assert_eq!(margin(c.clone(), &p, 20., 10.), Some((vec![2, 0, 0, 0], 0)));
+        assert_eq!(margin(c.clone(), &p, 20., 50.), Some((vec![2, 0, 0, 0], 8)));
+        assert_eq!(margin(c, &p, 600., 10.), Some((vec![2, 0, 1, 0], 5)));
     }
 
     #[test]
-    fn inside_a_table_row_is_nothing_1477() {
-        let t = table_row();
-        // Cell padding, the gap between cells, a short cell's blank area.
-        assert_eq!(margin(&t, 105., 10.), None);
-        assert_eq!(margin(&t, 200., 10.), None);
-        assert_eq!(margin(&t, 320., 10.), None);
-        assert_eq!(margin(&t, 320., 30.), None);
+    fn inside_the_painted_row_is_nothing_1477() {
+        let (c, p) = row();
+        // The first cell's left padding (50..100), the cell gap, a short
+        // cell's blank area, the last cell's right padding.
+        for (x, y) in [
+            (53., 10.),
+            (105., 10.),
+            (260., 10.),
+            (320., 30.),
+            (440., 10.),
+        ] {
+            assert_eq!(margin(c.clone(), &p, x, y), None, "{x},{y}");
+        }
     }
 
     #[test]
-    fn a_short_cell_is_never_the_taller_cells_end_1477() {
-        let t = table_row();
-        // Level with cell 1's second row only; right of the table lands on
-        // cell 2 (its nearest row), never on cell 1's row end.
-        assert_eq!(margin(&t, 600., 30.), Some((vec![2, 0, 1, 0], 5)));
-        assert_eq!(margin(&t, 200., 30.), None);
-    }
-
-    #[test]
-    fn outside_a_table_rows_band_is_nothing_1477() {
-        let t = table_row();
-        assert_eq!(margin(&t, 600., 70.), None);
-        assert_eq!(margin(&t, 600., -5.), None);
-    }
-
-    #[test]
-    fn a_nested_tables_rows_group_by_their_own_row_1477() {
-        // Two cells of an inner table inside outer cell [1,0,0]; the inner
-        // row is [1,0,0, 0], its cells [1,0,0,0,0,0] and [1,0,0,0,1,0].
-        let t = vec![
-            para(&[1, 0, 0, 0, 0, 0], vec![piece(100., 0., 30., 0, 3, false)]),
-            para(&[1, 0, 0, 0, 1, 0], vec![piece(200., 0., 30., 0, 3, false)]),
+    fn an_empty_edge_cell_or_a_merged_continuation_is_inside_1477() {
+        // Cell 0 is empty (no sized boxes) and cell 2 continues a vertical
+        // merge (no paragraphs): the pointer in either is inside the row.
+        let c = vec![
+            cell(0, 50., 0., 100., 20.),
+            cell(1, 150., 0., 100., 20.),
+            cell(2, 250., 0., 100., 20.),
         ];
-        assert_eq!(margin(&t, 20., 10.), Some((vec![1, 0, 0, 0, 0, 0], 0)));
-        assert_eq!(margin(&t, 400., 10.), Some((vec![1, 0, 0, 0, 1, 0], 3)));
-        assert_eq!(margin(&t, 150., 10.), None);
+        let p = vec![
+            para(&[2, 0, 0, 0], vec![]),
+            para(&[2, 0, 1, 0], vec![piece(160., 0., 40., 0, 4, false)]),
+        ];
+        assert_eq!(margin(c.clone(), &p, 80., 10.), None);
+        assert_eq!(margin(c.clone(), &p, 300., 10.), None);
+        // Beside the row: left lands in the empty cell, right in the last
+        // cell holding paragraphs.
+        assert_eq!(margin(c.clone(), &p, 20., 10.), Some((vec![2, 0, 0, 0], 0)));
+        assert_eq!(margin(c, &p, 600., 10.), Some((vec![2, 0, 1, 0], 4)));
+    }
+
+    #[test]
+    fn outside_the_rows_band_is_nothing_1477() {
+        let (c, p) = row();
+        assert_eq!(margin(c.clone(), &p, 600., 70.), None);
+        assert_eq!(margin(c, &p, 600., -5.), None);
+    }
+
+    #[test]
+    fn the_edge_cells_paragraph_is_the_one_level_with_the_pointer_1477() {
+        // Left cell: two paragraphs of equal indent; right cell: a long
+        // first paragraph and a short second.
+        let c = vec![cell(0, 50., 0., 200., 80.), cell(1, 250., 0., 200., 80.)];
+        let p = vec![
+            para(&[2, 0, 0, 0], vec![piece(100., 0., 40., 0, 4, false)]),
+            para(&[2, 0, 0, 1], vec![piece(100., 40., 40., 0, 6, false)]),
+            para(&[2, 0, 1, 0], vec![piece(300., 0., 120., 0, 30, false)]),
+            para(&[2, 0, 1, 1], vec![piece(300., 40., 20., 0, 2, false)]),
+        ];
+        assert_eq!(margin(c.clone(), &p, 20., 50.), Some((vec![2, 0, 0, 1], 0)));
+        assert_eq!(margin(c.clone(), &p, 20., 10.), Some((vec![2, 0, 0, 0], 0)));
+        assert_eq!(
+            margin(c.clone(), &p, 600., 50.),
+            Some((vec![2, 0, 1, 1], 2))
+        );
+        assert_eq!(margin(c, &p, 600., 10.), Some((vec![2, 0, 1, 0], 30)));
+    }
+
+    #[test]
+    fn a_nested_tables_paragraphs_belong_to_the_outer_cell_1477() {
+        // Outer row [1, 0]: cell 0 holds a nested table (rows at y 0 and 30,
+        // real 7-element paths) and cell 1 a plain paragraph.
+        let c = vec![cell(0, 50., 0., 200., 60.), cell(1, 250., 0., 200., 60.)];
+        let p = vec![
+            para(
+                &[1, 0, 0, 0, 0, 0, 0],
+                vec![piece(100., 0., 30., 0, 3, false)],
+            ),
+            para(
+                &[1, 0, 0, 0, 0, 1, 0],
+                vec![piece(160., 0., 30., 0, 3, false)],
+            ),
+            para(
+                &[1, 0, 0, 0, 1, 0, 0],
+                vec![piece(100., 30., 30., 0, 5, false)],
+            ),
+            para(&[1, 0, 1, 0], vec![piece(300., 0., 40., 0, 4, false)]),
+        ];
+        // Inside the outer row, even between nested cells: nothing.
+        assert_eq!(margin(c.clone(), &p, 140., 10.), None);
+        assert_eq!(margin(c.clone(), &p, 240., 10.), None);
+        // Beside the outer row: the left edge cell is the nested table's
+        // paragraph level with the pointer; the right edge is the sibling cell.
+        assert_eq!(
+            margin(c.clone(), &p, 20., 35.),
+            Some((vec![1, 0, 0, 0, 1, 0, 0], 0))
+        );
+        assert_eq!(
+            margin(c.clone(), &p, 20., 5.),
+            Some((vec![1, 0, 0, 0, 0, 0, 0], 0))
+        );
+        assert_eq!(margin(c, &p, 600., 35.), Some((vec![1, 0, 1, 0], 4)));
+    }
+
+    #[test]
+    fn a_body_paragraph_margin_is_line_end_hit_1477() {
+        let body = rows();
+        assert_eq!(hit(&body, 400., 10., 25), Some(16));
+        assert_eq!(hit(&body, 400., 30., 25), Some(25));
+        assert_eq!(hit(&body, 2., 30., 25), Some(17));
+        assert_eq!(hit(&body, 60., 10., 25), None);
     }
 
     #[test]
@@ -8347,24 +8483,6 @@ mod line_end_hit_tests {
         let at = doc_line_point(3, 0, false).map(|b| (b.origin.x, b.origin.y));
         DOC_WORDS.with(|d| d.borrow_mut().clear());
         assert_eq!(at, Some((px(10.), px(10.))));
-    }
-
-    #[test]
-    fn a_body_paragraph_margin_is_unchanged_1477() {
-        let body = vec![para(&[3], rows())];
-        assert_eq!(margin(&body, 400., 10.), Some((vec![3], 16)));
-        assert_eq!(margin(&body, 400., 30.), Some((vec![3], 25)));
-        assert_eq!(margin(&body, 2., 30.), Some((vec![3], 17)));
-        assert_eq!(margin(&body, 60., 10.), None);
-        assert_eq!(margin(&body, 400., 80.), None);
-        // A table cell with the same leading index does not shadow it.
-        let mut both = body;
-        both.push(para(
-            &[3, 0, 0, 0],
-            vec![piece(100., 200., 30., 0, 3, false)],
-        ));
-        assert_eq!(margin(&both, 400., 10.), Some((vec![3], 16)));
-        assert_eq!(margin(&both, 400., 205.), Some((vec![3, 0, 0, 0], 3)));
     }
 }
 
@@ -23168,9 +23286,9 @@ impl Docxy {
         }
     }
 
-    /// Click-to-caret on an element that starts no drag (a tab, a field, a
-    /// picture): place the caret at an explicit paragraph path +
-    /// char offset. With `extend` (Shift-click) it keeps/starts an anchor so
+    /// Click-to-caret that starts no drag (a press in a paragraph beside no
+    /// line, which lands at its end): place the caret at an explicit
+    /// paragraph path + char offset. With `extend` (Shift-click) it keeps/starts an anchor so
     /// the click extends the selection; otherwise it collapses any selection,
     /// and a click inside a content control still showing its placeholder
     /// selects the placeholder (#1102): with no drag, the press is the click.
@@ -31090,10 +31208,10 @@ fn emit_words(
         // Render each word as a StyledText so its TextLayout gives pixel-exact
         // hit-testing (index_for_position), for a true click-anywhere caret.
         let word_str = word.to_string();
+        let probe = click.is_some_and(|c| c.probe_only);
         let styled = StyledText::new(word_str.clone());
         let layout = styled.layout().clone();
         if let Some(c) = click {
-            let probe = c.probe_only;
             c.words.borrow_mut().push(WordSpan {
                 shape: SpanShape::Text(layout.clone()),
                 off: if probe { seg_start } else { word_off },
@@ -31126,13 +31244,18 @@ fn emit_words(
                 // Click / drag-to-caret: place the caret at the exact character under
                 // the pointer (byte index from the layout → char count within the
                 // word), and while the button is held extend the selection.
-                .when_some(click.filter(|c| !c.probe_only), |d, c| {
+                .when_some(click, |d, c| {
                     let ent = c.ent.clone();
                     let path = c.path.to_vec();
                     let off_at = {
                         let layout = layout.clone();
                         let word_str = word_str.clone();
                         move |pos| {
+                            // A tracked change's word takes no offsets: it
+                            // acts as the blank area beside it does.
+                            if probe {
+                                return seg_start;
+                            }
                             let byte = layout
                                 .index_for_position(pos)
                                 .unwrap_or_else(|e| e)
@@ -32636,10 +32759,14 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
             ent.update(cx, |this, cx| this.table_click(&path, what, window, cx));
         }
     };
+    // A top-level table's painted cells, for a drag in the margin beside it
+    // (#1477).
+    let margin_rows = ctx.active && !hf && path.len() == 1;
     let mut rows = Vec::new();
     for (ri, rb) in boxes.iter().enumerate() {
         let row = &t.rows[ri];
         let mut cells: Vec<AnyElement> = Vec::new();
+        let mut row_cells: Vec<(usize, UnitCell)> = Vec::new();
         // Strips placed on the row, not in a cell, so an exact-height
         // row's clipped cell never hides them: (x twips, width twips, column).
         let mut column_strips: Vec<(u32, u32, usize)> = Vec::new();
@@ -32756,6 +32883,18 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
                 .into_any_element()
             });
             let is_selected = selected.contains(&(ri, cb.cell));
+            let probe = margin_rows.then(|| {
+                let at = UnitCell::default();
+                row_cells.push((cb.cell, at.clone()));
+                canvas(
+                    move |b: Bounds<Pixels>, _w: &mut Window, _a: &mut App| at.set(b),
+                    |_b, _s, _w, _a| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+            });
             let sel_bg = Hsla {
                 a: 0.25,
                 ..ctx.pal.sel
@@ -32792,6 +32931,7 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
                 .children(inner)
                 .children(edges)
                 .children(diagonals)
+                .children(probe)
                 .when(is_selected, |d| {
                     d.child(div().absolute().size_full().top_0().left_0().bg(sel_bg))
                 })
@@ -32810,6 +32950,10 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
                 );
             }
             cells.push(el.into_any_element());
+        }
+        if margin_rows {
+            let row_path = vec![path[0], ri];
+            DOC_ROWS.with(|d| d.borrow_mut().push((row_path, row_cells)));
         }
         let mut row_el = div()
             .relative()
@@ -37825,6 +37969,7 @@ impl Render for Docxy {
         // record itself again.
         self.frame = self.frame.wrapping_add(1);
         DOC_WORDS.with(|d| d.borrow_mut().clear());
+        DOC_ROWS.with(|d| d.borrow_mut().clear());
         // The live preview (#764), first, before any early return (the
         // backstage): every frame reports what it draws in place of the
         // document, none unless it draws one, and a preview found stale or
