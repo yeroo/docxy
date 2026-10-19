@@ -147,17 +147,20 @@ test the button's command opens the plugin's dialog, whose OK sends the values b
   # the dialog's size unchanged across the switch.
   call dialog-tab {"tab":"Styles"}
   call dialog-read {}
-  assert reply.tab is 1
+  # `tab` is the page's name and `controls` the page's own (the header's
+  # two last), so the lists are the first three.
+  assert reply.tab is Styles
   assert reply.columns is 3
   assert reply.size.0 is 460
   assert reply.size.1 is 400
-  assert reply.controls.5.name is fixture.font
-  assert reply.controls.5.kind is list
-  assert reply.controls.5.items.1 is Segoe UI
-  assert reply.controls.6.name is fixture.style
-  assert reply.controls.6.items.3 is Bold Italic
-  assert reply.controls.7.name is fixture.size
-  assert reply.controls.7.items.5 is 14
+  assert reply.controls.0.name is fixture.font
+  assert reply.controls.0.kind is list
+  assert reply.controls.0.items.1 is Segoe UI
+  assert reply.controls.1.name is fixture.style
+  assert reply.controls.1.items.3 is Bold Italic
+  assert reply.controls.2.name is fixture.size
+  assert reply.controls.2.items.5 is 14
+  assert reply.controls.-1.name is fixture.tag
   shot window
   call dialog-tab {"tab":"General"}
   call dialog-read {}

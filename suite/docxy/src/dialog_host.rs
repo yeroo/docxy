@@ -1214,7 +1214,11 @@ impl Docxy {
                                 v_flex()
                                     .id(("dialog-multiline", i))
                                     .relative()
-                                    .min_w(px(240.))
+                                    // A built-in dialog's box keeps its
+                                    // width; in a cell of several columns
+                                    // (#1609 r9) it is the cell's width.
+                                    .when(d.cell_columns(c) == 1, |v| v.min_w(px(240.)))
+                                    .when(d.cell_columns(c) > 1, |v| v.w_full())
                                     .min_h(px(16. * 3. + 4.))
                                     // A filling box scrolls its lines, the
                                     // caret's kept in view (#1609).
@@ -1749,12 +1753,13 @@ impl Docxy {
                     .child(label)
                     .child(
                         div()
-                            // A built-in dialog's list keeps its width; on a
-                            // page of several columns (#1609 r8) the list is
-                            // its cell's width, so side-by-side pickers do
-                            // not overflow into each other.
-                            .when(d.columns() == 1, |l| l.min_w(px(160.)))
-                            .when(d.columns() > 1, |l| l.w_full())
+                            // A built-in dialog's list keeps its width; in a
+                            // cell of several columns (#1609 r8, the header
+                            // band's own count since r9) the list is its
+                            // cell's width, so side-by-side pickers do not
+                            // overflow into each other.
+                            .when(d.cell_columns(c) == 1, |l| l.min_w(px(160.)))
+                            .when(d.cell_columns(c) > 1, |l| l.w_full())
                             .border_1()
                             .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
                             .bg(pal.panel)

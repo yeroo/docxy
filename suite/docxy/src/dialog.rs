@@ -1359,6 +1359,29 @@ impl Dialog {
         self.page_columns.get(self.tab).copied().unwrap_or(1).max(1) as usize
     }
 
+    /// The header band's columns (#1609): the sum of the header controls'
+    /// spans, at least 1; the same on every page.
+    pub fn header_columns(&self) -> usize {
+        self.controls
+            .iter()
+            .filter(|c| c.header && c.visible)
+            .map(|c| (c.span as usize).max(1))
+            .sum::<usize>()
+            .max(1)
+    }
+
+    /// The columns of the band `c` sits in (#1609 r9): the header's for a
+    /// header control, else the current page's. A control in a band of one
+    /// column keeps its built-in minimum width; in a cell of several it is
+    /// the cell's width.
+    pub fn cell_columns(&self, c: &Control) -> usize {
+        if c.header {
+            self.header_columns()
+        } else {
+            self.columns()
+        }
+    }
+
     /// Whether `c` fills the page's remaining height (#1609): a `fill`
     /// multiline in a dialog with a fixed size.
     pub fn fills(&self, c: &Control) -> bool {
@@ -1382,12 +1405,7 @@ impl Dialog {
         shown.sort_by_key(|&i| !self.controls[i].header);
         let page_columns = self.columns();
         let mixed = self.controls.iter().any(|c| c.plugin);
-        let header_columns = shown
-            .iter()
-            .filter(|&&i| self.controls[i].header)
-            .map(|&i| (self.controls[i].span as usize).max(1))
-            .sum::<usize>()
-            .max(1);
+        let header_columns = self.header_columns();
         let mut bands: Vec<LayoutBand> = Vec::new();
         let mut k = 0;
         while k < shown.len() {
