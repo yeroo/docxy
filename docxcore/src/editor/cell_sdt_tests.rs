@@ -605,3 +605,37 @@ fn typing_or_pasting_inside_an_inline_placeholder_clears_its_flag() {
         assert!(inline_flagged(&ed), "edge {edge}");
     }
 }
+
+/// A paragraph `Go: <hyperlink>[sdt placeholder]</hyperlink> end`, the control
+/// inside the link's children.
+fn link_editor(flag: bool) -> Editor {
+    let xml = format!(
+        "<w:document><w:body><w:p><w:r><w:t xml:space=\"preserve\">Go: </w:t></w:r>\
+         <w:hyperlink w:anchor=\"top\">{}<w:r><w:t>[Link text]</w:t></w:r>{CLOSE}\
+         </w:hyperlink><w:r><w:t xml:space=\"preserve\"> end</w:t></w:r></w:p></w:body></w:document>",
+        open("Link", 9, flag),
+    );
+    Editor::new(parse_document_xml(&xml, &Relationships::default()))
+}
+
+#[test]
+fn a_placeholder_inside_a_hyperlink_is_selected_by_a_click() {
+    let ed = link_editor(true);
+    let at = |o| Caret::at(vec![0], o);
+    assert_eq!(ed.placeholder_range_at(&at(8)), Some((at(4), at(15))));
+    assert_eq!(ed.placeholder_range_at(&at(1)), None);
+    // Typing over it replaces it and clears the flag, saved from the link's
+    // children, not from its original XML.
+    let mut ed = link_editor(true);
+    ed.set_caret(at(8));
+    assert!(ed.select_placeholder_at_caret());
+    ed.insert_str("Docs");
+    let xml = document_to_xml(&ed.doc);
+    assert!(
+        xml.contains("Docs") && !xml.contains("[Link text]"),
+        "{xml}"
+    );
+    assert!(!xml.contains("showingPlcHdr"), "{xml}");
+    // Without the flag a click selects nothing.
+    assert_eq!(link_editor(false).placeholder_range_at(&at(8)), None);
+}
