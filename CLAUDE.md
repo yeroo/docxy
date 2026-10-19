@@ -856,6 +856,52 @@
   `hot_headings`, `cursor_border` and `table_fits`;
   `uiharness/cases/project-selection.uit` (not run on macOS).
 
+## Project gridlines from the formatting model (#1575)
+
+- `projcore::formatting::gridlines` is Project's Gridlines dialog as data:
+  `Line` (the fourteen "Line to change" entries, Project's names and order),
+  `LineType` (none, solid, dotted, short-dashed, long-dashed; `segments` is
+  the one dash pattern), `Gridline` (type, colour or Automatic, and for the
+  row and column lines an interval with its own type and colour) and
+  `Gridlines` (only lines set away from `Line::default_style` are stored:
+  solid Automatic for Gantt Rows, Bottom Tier Column, Sheet Rows, Sheet
+  Columns, Title Vertical and Title Horizontal, none for the rest, which is
+  what the hosts drew before). `Formatting::gridlines` replaces the old
+  opaque string; `formatting.xml` carries `<gridline>` children (an older
+  root `gridlines` attribute is ignored). A plugin command's `view.gridlines`
+  is an object of line name to `{type, color, interval, interval_type,
+  interval_color}` (partial objects keep the rest; null is the default; a
+  null reply clears all), and every request's `view.gridlines` carries all
+  fourteen as drawn.
+- The suite draws from it in `project/gantt.rs`: `body_grid` paints the
+  table's Sheet Rows and Sheet Columns, the chart's Gantt Rows, the tier
+  columns (`tier_lines`: bottom = the minor tier, middle = the major, the
+  header's two tiers being Project's middle and bottom, so the Top Tier
+  Column is kept undrawn like Bar Rows until a three-tier header exists;
+  each line's interval index counted from the scale's origin so the pattern
+  stays put as the chart scrolls; `bottom_tier_lines` follows the bottom
+  tier's unit, so at the Weeks level it draws a line per week where the old
+  chart drew one per day, and a bottom tier left at its default keeps the
+  old rule of no lines under 8 px per day) and the date lines (`date_lines`: Current Date from the
+  `CurrentDate` option, Project Start and Finish from the schedule, Status
+  Date), each rule through `paint_rule` (`LineType::segments` as quads, an
+  interval line's style on every Nth row or column, `gridline_color` falling
+  back to the host's colour). The timescale's title lines are the header
+  cells' borders (solid whatever the type, in the line's colour). Bar Rows
+  (one bar row per task) and Page Breaks (no pagination) are kept, never
+  drawn. The chart menu's Gridlines... item stays disabled: no built-in
+  dialog yet. The harness state reports `gridlines` and `gridlines_set`.
+- yppxy draws the date lines only (`gridline_marks`: `│` or `┆` in an empty
+  day cell, in the line's colour), as a terminal cell is a day and a row a
+  task. The fixture's `fixture.format` sets dotted red Gantt rows (every
+  second solid blue), no sheet rows, green sheet columns and a red project
+  start line, and clears them on the next press;
+  `uiharness/cases/project-plugin-ui.uit` asserts the state, reads the green
+  Sheet Columns rule off an unselected cell's right edge with a `border`
+  assertion (the one step whose `#` colour is not a comment; an `is` value
+  cannot carry one, so the colours are pinned by `projcore/tests/plugins.rs`)
+  and shoots the rest (the default rules are too faint for a `border`).
+
 ## Project timescale and Timeline pane (#1535)
 
 - `GanttScale` carries `day_w` (px per day); `DEFAULT_DAY_W` (22, the Days
