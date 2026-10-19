@@ -7510,9 +7510,10 @@ struct Click<'a> {
     /// The paragraph's painted words, for a press or drag in the blank area
     /// beside its lines (#1472).
     words: &'a WordSpans,
-    /// Record words as zero-length spans at the first word's offset and
-    /// attach no handlers: a tracked change's text takes no caret offsets but
-    /// still makes a row to press or drag beside (#1477).
+    /// Record words as zero-length spans at the change's anchor (`seg_start`);
+    /// a press or drag on one begins at or extends to that anchor, as the
+    /// blank area beside it does: a tracked change's text takes no caret
+    /// offsets but still makes a row (#1477).
     probe_only: bool,
 }
 
@@ -7737,21 +7738,35 @@ impl MarginPara {
         }
     }
 
-    /// How far the paragraph's nearest painted row is from height `y`; none
-    /// when nothing is painted.
-    fn gap(&self, y: Pixels) -> Option<Pixels> {
-        self.boxes
+    /// How far the paragraph's nearest painted row is from height `y`, and
+    /// how far out that row reaches: its smallest left (`left`) or largest
+    /// right edge; none when nothing is painted.
+    fn nearest(&self, y: Pixels, left: bool) -> Option<(Pixels, Pixels)> {
+        let gap = |b: &WordBox| {
+            if y < b.bounds.top() {
+                b.bounds.top() - y
+            } else if y > b.bounds.bottom() {
+                y - b.bounds.bottom()
+            } else {
+                px(0.)
+            }
+        };
+        let least = self
+            .boxes
             .iter()
-            .map(|b| {
-                if y < b.bounds.top() {
-                    b.bounds.top() - y
-                } else if y > b.bounds.bottom() {
-                    y - b.bounds.bottom()
-                } else {
-                    px(0.)
-                }
-            })
-            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(gap)
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))?;
+        let edges = self.boxes.iter().filter(|b| gap(b) == least);
+        let edge = if left {
+            edges
+                .map(|b| b.bounds.left())
+                .fold(px(f32::MAX), Pixels::min)
+        } else {
+            edges
+                .map(|b| b.bounds.right())
+                .fold(px(f32::MIN), Pixels::max)
+        };
+        Some((least, edge))
     }
 }
 
@@ -7769,18 +7784,34 @@ impl RowArea {
             .filter(|b| b.size.width > px(0.) && b.size.height > px(0.))
             .reduce(|a, b| a.union(&b))
     }
+
+    /// How far `x` is outside the row's painted cells; zero inside them.
+    fn x_gap(&self, x: Pixels) -> Option<Pixels> {
+        let e = self.extent()?;
+        Some(if x <= e.left() {
+            e.left() - x
+        } else if x >= e.right() {
+            x - e.right()
+        } else {
+            px(0.)
+        })
+    }
 }
 
-/// The table row whose painted area holds height `y`: its path and area.
-fn row_at_height(y: Pixels) -> Option<(Vec<usize>, RowArea)> {
+/// Every top-level table row whose painted area holds height `y`: its path
+/// and area (several in a multi-column section).
+fn rows_at_height(y: Pixels) -> Vec<(Vec<usize>, RowArea)> {
     DOC_ROWS.with(|d| {
-        d.borrow().iter().find_map(|(path, cells)| {
-            let area = RowArea {
-                cells: cells.iter().map(|(c, b)| (*c, b.get())).collect(),
-            };
-            let e = area.extent()?;
-            (e.top() <= y && y <= e.bottom()).then(|| (path.clone(), area))
-        })
+        d.borrow()
+            .iter()
+            .filter_map(|(path, cells)| {
+                let area = RowArea {
+                    cells: cells.iter().map(|(c, b)| (*c, b.get())).collect(),
+                };
+                let e = area.extent()?;
+                (e.top() <= y && y <= e.bottom()).then(|| (path.clone(), area))
+            })
+            .collect()
     })
 }
 
@@ -7829,9 +7860,22 @@ fn table_margin_hit(
     // Its paragraph nearest the pointer's height (the first, or last, one
     // when none is painted).
     let in_cell = || paras.iter().filter(|p| p.path.get(2) == Some(&cell));
+    // Equal gaps (the cells of one nested row) go to the one reaching furthest
+    // out: the smallest left edge on the left, the largest right on the right.
     let near = in_cell()
-        .filter_map(|p| p.gap(pos.y).map(|g| (p, g)))
-        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .filter_map(|p| p.nearest(pos.y, left).map(|n| (p, n)))
+        .min_by(|a, b| {
+            let (ga, ea) = a.1;
+            let (gb, eb) = b.1;
+            let edge = if left {
+                ea.partial_cmp(&eb)
+            } else {
+                eb.partial_cmp(&ea)
+            };
+            ga.partial_cmp(&gb)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(edge.unwrap_or(std::cmp::Ordering::Equal))
+        })
         .map(|(p, _)| p);
     let Some(p) = near else {
         let p = if left {
@@ -7856,10 +7900,22 @@ fn table_margin_hit(
 }
 
 /// Where a text drag lands when its pointer is on no paragraph (#1472,
-/// #1477): beside a table row ([`table_margin_hit`]), else level with a
-/// top-level body paragraph's row ([`line_end_hit`]).
+/// #1477): beside a table row ([`table_margin_hit`]) or level with a
+/// top-level body paragraph's row ([`line_end_hit`]). A multi-column section
+/// can put several of those level with the pointer: inside any table row is
+/// nothing, else the one nearest the pointer in x wins.
 fn margin_drag_hit(pos: Point<Pixels>) -> Option<(Vec<usize>, usize)> {
-    if let Some((row, area)) = row_at_height(pos.y) {
+    let rows = rows_at_height(pos.y);
+    if rows.iter().any(|(_, a)| a.x_gap(pos.x) == Some(px(0.))) {
+        return None;
+    }
+    let mut best: Option<(Pixels, (Vec<usize>, usize))> = None;
+    let mut offer = |gap: Pixels, hit: (Vec<usize>, usize)| {
+        if best.as_ref().is_none_or(|(g, _)| gap < *g) {
+            best = Some((gap, hit));
+        }
+    };
+    for (row, area) in &rows {
         let paras: Vec<MarginPara> = DOC_WORDS.with(|d| {
             d.borrow()
                 .iter()
@@ -7867,15 +7923,38 @@ fn margin_drag_hit(pos: Point<Pixels>) -> Option<(Vec<usize>, usize)> {
                 .map(|(p, w)| MarginPara::of(p, w))
                 .collect()
         });
-        return table_margin_hit(&area, &paras, pos);
+        if let (Some(hit), Some(gap)) = (table_margin_hit(area, &paras, pos), area.x_gap(pos.x)) {
+            offer(gap, hit);
+        }
     }
     DOC_WORDS.with(|d| {
-        d.borrow().iter().find_map(|(path, words)| {
-            let &[_] = path.as_slice() else { return None };
-            let tail = words.borrow().iter().map(|w| w.off + w.len).max()?;
-            words_line_end_hit(words, pos, tail).map(|off| (path.clone(), off))
-        })
-    })
+        for (path, words) in d.borrow().iter() {
+            let &[_] = path.as_slice() else { continue };
+            let p = MarginPara::of(path, words);
+            let Some(off) = line_end_hit(&p.boxes, pos, p.tail, p.tail) else {
+                continue;
+            };
+            // The pointer's distance from the row it is beside.
+            let row = row_of(&p.boxes, pos.y);
+            let left = row
+                .iter()
+                .map(|b| b.bounds.left())
+                .fold(px(f32::MAX), Pixels::min);
+            let right = row
+                .iter()
+                .map(|b| b.bounds.right())
+                .fold(px(f32::MIN), Pixels::max);
+            offer(
+                if pos.x <= left {
+                    left - pos.x
+                } else {
+                    pos.x - right
+                },
+                (path.clone(), off),
+            );
+        }
+    });
+    best.map(|(_, hit)| hit)
 }
 
 /// Which side of a unit's `bounds` a pointer at `at` is on: the unit's offset
@@ -8449,12 +8528,158 @@ mod line_end_hit_tests {
     }
 
     #[test]
-    fn a_body_paragraph_margin_is_line_end_hit_1477() {
-        let body = rows();
-        assert_eq!(hit(&body, 400., 10., 25), Some(16));
-        assert_eq!(hit(&body, 400., 30., 25), Some(25));
-        assert_eq!(hit(&body, 2., 30., 25), Some(17));
-        assert_eq!(hit(&body, 60., 10., 25), None);
+    fn equal_gaps_in_a_nested_row_go_to_the_outermost_cell_1477() {
+        // The outer row's rightmost cell holds a nested row of two cells, A
+        // (x 100..140) and B (x 300..340), both level with the pointer.
+        let c = vec![cell(0, 50., 0., 100., 20.), cell(1, 150., 0., 300., 20.)];
+        let p = vec![
+            para(&[1, 0, 0, 0], vec![piece(60., 0., 30., 0, 2, false)]),
+            para(
+                &[1, 0, 1, 0, 0, 0, 0],
+                vec![piece(160., 0., 40., 0, 3, false)],
+            ),
+            para(
+                &[1, 0, 1, 0, 0, 1, 0],
+                vec![piece(300., 0., 40., 0, 4, false)],
+            ),
+        ];
+        assert_eq!(
+            margin(c.clone(), &p, 600., 10.),
+            Some((vec![1, 0, 1, 0, 0, 1, 0], 4))
+        );
+        // The left side: nested cells in the leftmost outer cell.
+        let c = vec![cell(0, 50., 0., 300., 20.), cell(1, 350., 0., 100., 20.)];
+        let p = vec![
+            para(
+                &[1, 0, 0, 0, 0, 0, 0],
+                vec![piece(160., 0., 40., 0, 3, false)],
+            ),
+            para(
+                &[1, 0, 0, 0, 0, 1, 0],
+                vec![piece(300., 0., 40., 0, 4, false)],
+            ),
+            para(&[1, 0, 1, 0], vec![piece(360., 0., 30., 0, 2, false)]),
+        ];
+        assert_eq!(
+            margin(c, &p, 10., 10.),
+            Some((vec![1, 0, 0, 0, 0, 0, 0], 0))
+        );
+    }
+
+    /// Fill the frame's thread-locals as a render would: `words` are body and
+    /// cell paragraphs (path, pieces as (x, y, w, offset, len)), `rows` the
+    /// painted table rows (path, cells as (column, x, y, w, h)).
+    fn seed(
+        words: &[(&[usize], &[(f32, f32, f32, usize, usize)])],
+        rows: &[(&[usize], &[(usize, f32, f32, f32, f32)])],
+    ) {
+        DOC_WORDS.with(|d| {
+            let mut d = d.borrow_mut();
+            d.clear();
+            for (path, pieces) in words {
+                let spans = WordSpans::default();
+                for &(x, y, w, off, len) in *pieces {
+                    spans.borrow_mut().push(WordSpan {
+                        shape: SpanShape::Unit(std::rc::Rc::new(std::cell::Cell::new(Bounds {
+                            origin: point(px(x), px(y)),
+                            size: size(px(w), px(20.)),
+                        }))),
+                        off,
+                        len,
+                        trailing_space: false,
+                    });
+                }
+                d.push((path.to_vec(), spans));
+            }
+        });
+        DOC_ROWS.with(|d| {
+            let mut d = d.borrow_mut();
+            d.clear();
+            for (path, cells) in rows {
+                let cells = cells
+                    .iter()
+                    .map(|&(c, x, y, w, h)| {
+                        let at = UnitCell::default();
+                        at.set(Bounds {
+                            origin: point(px(x), px(y)),
+                            size: size(px(w), px(h)),
+                        });
+                        (c, at)
+                    })
+                    .collect();
+                d.push((path.to_vec(), cells));
+            }
+        });
+    }
+
+    fn clear_frame() {
+        DOC_WORDS.with(|d| d.borrow_mut().clear());
+        DOC_ROWS.with(|d| d.borrow_mut().clear());
+    }
+
+    #[test]
+    fn a_margin_drag_beside_a_body_row_never_answers_a_cell_paragraph_1477() {
+        seed(
+            &[
+                (&[0], &[(100., 0., 60., 0, 6)]),
+                (&[1, 0, 0, 0], &[(100., 100., 40., 0, 4)]),
+            ],
+            &[(&[1, 0], &[(0, 50., 100., 200., 20.)])],
+        );
+        let at = |x: f32, y: f32| margin_drag_hit(point(px(x), px(y)));
+        let (body_end, body_start, cell_end, cell_start, inside) = (
+            at(400., 10.),
+            at(10., 10.),
+            at(400., 110.),
+            at(10., 110.),
+            at(80., 110.),
+        );
+        clear_frame();
+        assert_eq!(body_end, Some((vec![0], 6)));
+        assert_eq!(body_start, Some((vec![0], 0)));
+        assert_eq!(cell_end, Some((vec![1, 0, 0, 0], 4)));
+        assert_eq!(cell_start, Some((vec![1, 0, 0, 0], 0)));
+        assert_eq!(inside, None);
+    }
+
+    #[test]
+    fn in_two_columns_the_nearest_row_in_x_wins_1477() {
+        // Column 1 (x 50..250) holds a table row, column 2 (x 300..500) a
+        // paragraph at the same height.
+        seed(
+            &[
+                (&[1, 0, 0, 0], &[(60., 0., 40., 0, 4)]),
+                (&[2], &[(310., 0., 60., 0, 6)]),
+            ],
+            &[(&[1, 0], &[(0, 50., 0., 200., 20.)])],
+        );
+        let at = |x: f32, y: f32| margin_drag_hit(point(px(x), px(y)));
+        // The column gap and the page's right margin: column 2's paragraph.
+        let (gap, right, left_of_table) = (at(290., 10.), at(600., 10.), at(10., 10.));
+        clear_frame();
+        assert_eq!(gap, Some((vec![2], 0)));
+        assert_eq!(right, Some((vec![2], 6)));
+        assert_eq!(left_of_table, Some((vec![1, 0, 0, 0], 0)));
+    }
+
+    #[test]
+    fn in_two_table_columns_the_second_ones_padding_is_inside_1477() {
+        seed(
+            &[
+                (&[1, 0, 0, 0], &[(60., 0., 40., 0, 4)]),
+                (&[2, 0, 0, 0], &[(310., 0., 40., 0, 4)]),
+            ],
+            &[
+                (&[1, 0], &[(0, 50., 0., 200., 20.)]),
+                (&[2, 0], &[(0, 300., 0., 200., 20.)]),
+            ],
+        );
+        let at = |x: f32, y: f32| margin_drag_hit(point(px(x), px(y)));
+        let (padding, between, right) = (at(305., 10.), at(270., 10.), at(600., 10.));
+        clear_frame();
+        assert_eq!(padding, None);
+        assert_eq!(between, Some((vec![1, 0, 0, 0], 4)));
+        assert_eq!(right, Some((vec![2, 0, 0, 0], 4)));
     }
 
     #[test]
@@ -32606,7 +32831,7 @@ fn paragraph_el(
     // indent gutter): it lands at the end or start of the line it is beside, else
     // at the paragraph end. Word, tab, field and picture presses fire first and
     // stop propagation, so this only runs on a press beside the text, or on a
-    // piece that takes no offset or press of its own (tracked-change text, a
+    // piece that takes no offset or press of its own (a
     // footnote number, a comment badge, an empty field), which stays a plain
     // caret at the paragraph end.
     let para_end = idx;
