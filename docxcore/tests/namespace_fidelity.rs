@@ -451,3 +451,44 @@ fn rejected_property_changes_restore_the_inherited_rule() {
         assert!(kept.contains("ux:a=\"1\""), "{element} kept: {kept}");
     }
 }
+
+/// Review r3: a change wrapper or a property container that carries a rule of
+/// its own gets the inherited one merged in, with the MC prefix declared on
+/// the tag, so the snapshot read apart from the root keeps both.
+#[test]
+fn rejected_changes_under_a_wrapper_with_its_own_rule_keep_both_rules() {
+    let ancestor = " xmlns:ux=\"urn:ux\" mc:Ignorable=\"ux\"";
+    let own = "mc:Ignorable=\"vy\" xmlns:vy=\"urn:vy\"";
+    let cases = [
+        (
+            "w:b",
+            format!(
+                "<w:p><w:r><w:rPr><w:i/><w:rPrChange w:id=\"1\" w:author=\"a\" {own}>\
+                 <w:rPr><w:b ux:a=\"1\" vy:b=\"2\"/></w:rPr></w:rPrChange></w:rPr>\
+                 <w:t>a</w:t></w:r></w:p>"
+            ),
+        ),
+        (
+            "w:tblStyle",
+            format!(
+                "<w:tbl><w:tblPr {own}><w:tblW w:w=\"0\"/><w:tblPrChange w:id=\"1\" w:author=\"a\">\
+                 <w:tblPr><w:tblStyle w:val=\"Old\" ux:a=\"1\" vy:b=\"2\"/></w:tblPr>\
+                 </w:tblPrChange></w:tblPr><w:tblGrid/><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl><w:p/>"
+            ),
+        ),
+    ];
+    for (element, body) in cases {
+        let src = doc(ancestor, &body);
+        let out = saved_after(&src, |editor| {
+            editor.reject_all_revisions();
+        });
+        assert!(out.contains("ux:a=\"1\""), "{element} restored: {out}");
+        let rule = ignorable_at(&out, element);
+        assert_eq!(
+            rule,
+            [vec!["ux".to_string(), "vy".to_string()]],
+            "{element}: {out}"
+        );
+        assert!(ux_bound_at(&out, element), "{element}: {out}");
+    }
+}

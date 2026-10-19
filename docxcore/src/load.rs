@@ -195,6 +195,8 @@ fn inherited_markup_compatibility(p: &XmlParser) -> Vec<(String, String)> {
         if !is_rule_name(name)
             || PART_ROOTS.contains(&scoped.element_name)
             || WRITTEN_BACK.contains(&scoped.element_name)
+            // The element's own rule is its tag's, not inherited.
+            || scoped.element_name == p.name()
         {
             continue;
         }
@@ -203,20 +205,14 @@ fn inherited_markup_compatibility(p: &XmlParser) -> Vec<(String, String)> {
     merged
 }
 
-/// Add `value`'s tokens to the rule named like `name` in `merged` (matched by
-/// local name), or start it.
-fn merge_rule(merged: &mut Vec<(String, String)>, name: &str, value: &str) {
-    let local = name.split_once(':').map_or(name, |(_, local)| local);
-    let found = merged.iter_mut().find(|(existing, _)| {
-        existing
-            .split_once(':')
-            .map_or(existing.as_str(), |(_, l)| l)
-            == local
-    });
-    let Some((_, existing)) = found else {
-        merged.push((name.to_string(), value.to_string()));
-        return;
-    };
+/// The local name of an attribute name (`Ignorable` of `mc:Ignorable`): what
+/// two spellings of one rule share.
+fn rule_local(name: &str) -> &str {
+    name.split_once(':').map_or(name, |(_, local)| local)
+}
+
+/// Add `value`'s tokens to `existing`, a rule's token list, once each.
+fn union_tokens(existing: &mut String, value: &str) {
     for token in value.split_whitespace() {
         if !existing.split_whitespace().any(|item| item == token) {
             if !existing.is_empty() {
@@ -224,6 +220,18 @@ fn merge_rule(merged: &mut Vec<(String, String)>, name: &str, value: &str) {
             }
             existing.push_str(token);
         }
+    }
+}
+
+/// Add `value`'s tokens to the rule named like `name` in `merged` (matched by
+/// local name), or start it.
+fn merge_rule(merged: &mut Vec<(String, String)>, name: &str, value: &str) {
+    match merged
+        .iter_mut()
+        .find(|(existing, _)| rule_local(existing) == rule_local(name))
+    {
+        Some((_, existing)) => union_tokens(existing, value),
+        None => merged.push((name.to_string(), value.to_string())),
     }
 }
 
@@ -327,41 +335,40 @@ fn declare_rebuilt(raw: &str, rebuilt: &Rebuilt) -> String {
     if rebuilt.ns.is_empty() && rebuilt.mce.is_empty() {
         return raw.to_string();
     }
-    let (used, mut own) = prefixes_of(raw);
-    let rules = rules_for_prefixes(&rebuilt.mce, &used);
     let own_rules = own_rules(raw);
+    let (used, mut own) = prefixes_of(raw);
     let mut out = raw.to_string();
     let mut decls = String::new();
-    let mut merges: Vec<(std::ops::Range<usize>, String)> = Vec::new();
-    for (name, value) in &rules {
-        let local = name.split_once(':').map_or(name.as_str(), |(_, l)| l);
-        let found = own_rules.iter().find(|(_, own_name, _)| {
-            own_name
-                .split_once(':')
-                .map_or(own_name.as_str(), |(_, l)| l)
-                == local
-        });
-        if let Some((range, own_name, own_value)) = found {
-            let mut merged = vec![(own_name.clone(), own_value.clone())];
-            merge_rule(&mut merged, own_name, value);
-            let mut text = format!(" {own_name}=\"");
-            crate::serialize::esc_attr(&merged[0].1, &mut text);
-            text.push('"');
-            merges.push((range.clone(), text));
-            continue;
-        }
-        decls.push_str(&format!(" {name}=\""));
-        crate::serialize::esc_attr(value, &mut decls);
-        decls.push('"');
-        // The rule's prefix is declared on the tag itself, as the markup-
-        // compatibility namespace: the tag may be read apart from the part
-        // root that binds it (a property-change snapshot).
+    // A rule's prefix is declared on the tag itself, as the markup-
+    // compatibility namespace: the tag may be read apart from the part root
+    // that binds it (a property-change snapshot, a split container).
+    let mut declare_mc = |name: &str, decls: &mut String| {
         if let Some((prefix, _)) = name.split_once(':') {
             if !own.iter().any(|o| o == prefix) {
                 decls.push_str(&format!(" xmlns:{prefix}=\"{MC_NS}\""));
                 own.push(prefix.to_string());
             }
         }
+    };
+    let mut merges: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    for (name, value) in rules_for_prefixes(&rebuilt.mce, &used) {
+        let found = own_rules
+            .iter()
+            .find(|(_, own_name, _)| rule_local(own_name) == rule_local(&name));
+        if let Some((range, own_name, own_value)) = found {
+            let mut merged = own_value.clone();
+            union_tokens(&mut merged, &value);
+            let mut text = format!(" {own_name}=\"");
+            crate::serialize::esc_attr(&merged, &mut text);
+            text.push('"');
+            merges.push((range.clone(), text));
+            declare_mc(own_name, &mut decls);
+            continue;
+        }
+        decls.push_str(&format!(" {name}=\""));
+        crate::serialize::esc_attr(&value, &mut decls);
+        decls.push('"');
+        declare_mc(&name, &mut decls);
     }
     // Last first, so the earlier ranges stay valid.
     merges.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
@@ -416,7 +423,10 @@ pub(crate) fn is_rule_name(name: &str) -> bool {
 /// The start tag's attributes at the parser's current Start event, decoded,
 /// with a declaration for each prefix they use that a save does not keep
 /// (see [`rebuilt_bindings`]), and the inherited markup-compatibility rules
-/// naming a prefix they use, joined into the tag's own rule of that name.
+/// naming a prefix they use, joined into the tag's own rule of that name. The
+/// MC prefix needs no declaration of its own here: the serializer writes the
+/// tag inside the saved part, whose root binds it, or `prefixes` below
+/// declares it from the rebuilt scope.
 fn element_attrs(p: &XmlParser) -> ElementAttrs {
     let mut attrs: Vec<(String, String)> = p
         .attrs()
@@ -444,14 +454,11 @@ fn element_attrs(p: &XmlParser) -> ElementAttrs {
         if let Some((prefix, _)) = name.split_once(':') {
             prefixes.push(prefix.to_string());
         }
-        let local = name.split_once(':').map_or(name.as_str(), |(_, l)| l);
-        let own = attrs.iter().position(|(n, _)| {
-            is_rule_name(n) && n.split_once(':').is_some_and(|(_, l)| l == local)
-        });
-        let mut merged: Vec<(String, String)> = own.map(|i| attrs[i].clone()).into_iter().collect();
-        merge_rule(&mut merged, &name, &value);
+        let own = attrs
+            .iter()
+            .position(|(n, _)| is_rule_name(n) && rule_local(n) == rule_local(&name));
         match own {
-            Some(i) => attrs[i] = merged.remove(0),
+            Some(i) => union_tokens(&mut attrs[i].1, &value),
             None => attrs.push((name, value)),
         }
     }
