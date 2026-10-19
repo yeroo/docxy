@@ -4,9 +4,9 @@
 //!
 //! - Ribbon: on the Task tab a group "Fixture" with a large button
 //!   `fixture.hello`, a toggle `fixture.flag`, a toggle `fixture.plain` with
-//!   no icon (and `fixture.flat`, the same on the Gantt Chart Format tab),
-//!   no icon (its label is drawn, #1608) and a gallery `fixture.palette`
-//!   of two swatches (`fixture.blue`, `fixture.red`).
+//!   no icon (its label is drawn, #1608; `fixture.flat` on the Gantt Chart
+//!   Format tab is the same) and a gallery `fixture.palette` of two swatches
+//!   (`fixture.blue`, `fixture.red`).
 //! - Menus: a row-menu item `fixture.rename` after "Notes...".
 //! - Dialogs: a Task Information page "Fixture" with a multiline and a grid,
 //!   and a dialog `fixture.options` (a number, a label the state fills from
@@ -17,8 +17,9 @@
 //!   values, Bump sends it with `button: "bump"` (one `task.set` op naming
 //!   the task "Bumped by fixture", the dialog kept open).
 //! - Commands: `fixture.hello` (the dialog, then a status with its number),
-//!   `fixture.flag` (flips the toggle: a view switch of the same name the
-//!   host stores in the plan's formatting, #1553), the swatches (set the palette,
+//!   `fixture.flag`, `fixture.plain` and `fixture.flat` (each flips its
+//!   toggle: a view switch of its own name the host stores in the plan's
+//!   formatting, #1553), the swatches (set the palette,
 //!   returned as `view.palette`), `fixture.rename` (one `task.set` op
 //!   renaming the first selected task to "Renamed by fixture"), and
 //!   `task-information` (the page's OK: a status with the note's length).
