@@ -1419,15 +1419,21 @@ fn dialog_field_point(
     if app.active_dialogs().is_none() {
         return Err(crate::dialog::NONE_OPEN.into());
     }
-    let b = app
-        .probes
-        .borrow()
+    let probes = app.probes.borrow();
+    let b = probes
         .on_screen(&format!("dialog-field:{name}"))
         .ok_or_else(|| format!("no field '{name}' is drawn in the open dialog"))?;
     let at = x.map_or_else(|| b.center().x, |x| b.left() + px(x as f32));
     // A multiline's probe scrolls with its lines (#1609), so `y` counts from
-    // its first line and reaches a line of a scrolled box.
-    let down = y.map_or_else(|| b.center().y, |y| b.top() + px(y as f32));
+    // its first line and reaches a line of a scrolled box; without `y` the
+    // click lands mid-height of the box as drawn (`dialog-field-box`), not of
+    // the scrolled content, so a scrolled memo is still hit (r7).
+    let down = match y {
+        Some(y) => b.top() + px(y as f32),
+        None => probes
+            .on_screen(&format!("dialog-field-box:{name}"))
+            .map_or(b.center().y, |box_b| box_b.center().y),
+    };
     Ok(point(at, down))
 }
 
@@ -1562,7 +1568,6 @@ fn pointer_button(args: &Json) -> Result<MouseButton, String> {
     }
 }
 
-/// `pointer-click`'s optional `"x"`: pixels in from a dialog field's left edge.
 /// The optional number `key` of a dialog-field click (`x` from the field's
 /// left edge, `y` from its top, #1609).
 fn field_num(args: &Json, key: &str) -> Result<Option<f64>, String> {

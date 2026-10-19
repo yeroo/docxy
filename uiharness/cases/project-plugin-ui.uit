@@ -220,6 +220,17 @@ test the button's command opens the plugin's dialog, whose OK sends the values b
   assert reply.caret is 49
   call dialog-read {}
   assert reply.controls.4.first_visible_line is 9
+  # A click without y lands mid-height of the box as drawn, so a scrolled
+  # memo is refocused by a plain click (r7); the box stays where it was.
+  call real-key {"key":"tab"}
+  call field-read {"dialog-field":"fixture.memo"}
+  assert reply.focused is false
+  call pointer-click {"dialog-field":"fixture.memo"}
+  shot window
+  call field-read {"dialog-field":"fixture.memo"}
+  assert reply.focused is true
+  call dialog-read {}
+  assert reply.controls.4.first_visible_line is 9
   # The grid lists the plan's tasks with the selected one's row selected
   # (the state's name.selected_row).
   assert reply.controls.2.name is fixture.tasks

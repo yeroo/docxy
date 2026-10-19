@@ -1206,6 +1206,10 @@ impl Docxy {
                         div()
                             .relative()
                             .when(fill, |v| v.flex_1().min_h_0().w_full())
+                            // The box as a person sees it (#1609 r7): the
+                            // field probe inside scrolls with the lines, so a
+                            // click aimed at "the box" takes this one.
+                            .child(probe(&self.probes, format!("dialog-field-box:{name}")))
                             .child(
                                 v_flex()
                                     .id(("dialog-multiline", i))
@@ -1835,11 +1839,15 @@ impl Docxy {
                     );
                     continue;
                 }
+                // Each cell is its share of the row with its own right
+                // padding and no flex gap, so a row with a spanning control
+                // puts its columns where a row of singles does (#1609 r7).
                 let cells = row.into_iter().map(|(i, col)| {
                     let span = (d.controls[i].span as usize).clamp(1, columns);
                     let w = Some(label_w[col]).filter(|w| *w > 0.);
                     v_flex()
                         .w(relative(span as f32 / columns as f32))
+                        .flex_shrink_0()
                         .pr_2()
                         .when(fills, |c| c.h_full())
                         .child(self.dialog_widget(d, i, w, pal, cx))
@@ -1847,7 +1855,6 @@ impl Docxy {
                 drawn.push(
                     h_flex()
                         .w_full()
-                        .gap_2()
                         .items_start()
                         .when(fills, |r| r.flex_1().min_h_0())
                         .children(cells)
@@ -2128,15 +2135,21 @@ impl Docxy {
                                         rest.push(el.into_any_element());
                                     }
                                 }
+                                // A message box has no controls: no empty
+                                // container, so its button row keeps the gap
+                                // it always had (#1609 r7).
+                                let has_controls = !controls.is_empty();
                                 v_flex()
                                     .gap_3()
                                     .when(sized, |v| v.flex_1().min_h_0())
-                                    .child(
-                                        v_flex()
-                                            .gap_3()
-                                            .when(sized, |v| v.flex_1().min_h_0())
-                                            .children(controls),
-                                    )
+                                    .when(has_controls, |v| {
+                                        v.child(
+                                            v_flex()
+                                                .gap_3()
+                                                .when(sized, |v| v.flex_1().min_h_0())
+                                                .children(controls),
+                                        )
+                                    })
                                     .child(
                                         h_flex()
                                             .w_full()
