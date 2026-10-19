@@ -118,6 +118,15 @@ pub fn inline_extent(raw: &str) -> Option<(i64, i64)> {
     Some((cx, cy))
 }
 
+/// An inline picture run's `r:embed` relationship id, from its `a:blip`,
+/// under the guards of [`inline_extent`] (inline only, never `wp:anchor`).
+pub fn inline_embed(raw: &str) -> Option<String> {
+    inline_extent(raw)?;
+    let at = raw.find("<a:blip")?;
+    let end = at + raw[at..].find('>')?;
+    crate::load::xml_attr_value(&raw[at..end], "r:embed").filter(|rid| !rid.is_empty())
+}
+
 fn be16(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from(u16::from_be_bytes(
         b.get(at..at + 2)?.try_into().ok()?,
@@ -310,6 +319,26 @@ mod tests {
         assert_eq!(
             inline_extent(
                 "<w:drawing><wp:inline><wp:extent cx=\"2\" cy=\"2\"/></wp:inline></w:drawing>"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn inline_embed_reads_the_blip_rid_of_an_inline_picture_only() {
+        let run = inline_picture_run("rId7", 952_500, 476_250, 3, "a.png");
+        assert_eq!(inline_embed(&run).as_deref(), Some("rId7"));
+        assert_eq!(inline_embed("<w:r><w:ptab/></w:r>"), None);
+        assert_eq!(
+            inline_embed(
+                "<w:r><w:drawing><wp:anchor><wp:extent cx=\"1\" cy=\"1\"/><a:blip r:embed=\"rId1\"/></wp:anchor></w:drawing></w:r>"
+            ),
+            None
+        );
+        // An inline drawing with no blip (a shape) has no picture to draw.
+        assert_eq!(
+            inline_embed(
+                "<w:r><w:drawing><wp:inline><wp:extent cx=\"2\" cy=\"2\"/></wp:inline></w:drawing></w:r>"
             ),
             None
         );

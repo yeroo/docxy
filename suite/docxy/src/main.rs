@@ -82,6 +82,7 @@ mod open_mode_tests;
 mod page_flow;
 mod page_number;
 mod page_setup;
+mod pictures;
 mod plugin_ui;
 mod project;
 mod project_formats;
@@ -7761,6 +7762,8 @@ struct RenderCtx<'a> {
     /// In a table cell: its table style's run formatting, laid below each
     /// run's own (#765). A nested table sets its own.
     cell_run: Option<&'a docxcore::table_styles::RunLook>,
+    /// The story's inline pictures (#1432); `None` draws their frames only.
+    pics: Option<pictures::Scope<'a>>,
 }
 
 /// What drawing a table needs beyond the table: the package's styles part
@@ -31086,12 +31089,18 @@ fn parse_hf_part(pkg: &Package, part_name: &str) -> Vec<Block> {
 
 /// A header or footer's band flow, read-only: its paragraphs, less the
 /// framed ones, which Print Layout draws at their frame.
-fn hf_els(blocks: &[Block], pal: Pal, meas: &Measurer, hf_width: f32) -> Vec<AnyElement> {
+fn hf_els(
+    blocks: &[Block],
+    pal: Pal,
+    meas: &Measurer,
+    hf_width: f32,
+    pics: Option<pictures::Scope>,
+) -> Vec<AnyElement> {
     docxcore::frame::split_framed(blocks)
         .0
         .into_iter()
         .filter_map(|(_, b)| match b {
-            Block::Paragraph(p) => Some(hf_para_el(p, pal, meas, hf_width, 1.0)),
+            Block::Paragraph(p) => Some(hf_para_el(p, pal, meas, hf_width, 1.0, pics)),
             _ => None,
         })
         .collect()
@@ -31292,7 +31301,14 @@ fn inline_width(
 
 /// One read-only header/footer paragraph at `width` px, drawn at `zoom`
 /// (the band draws at 1; a frame at the view's zoom, as its box is).
-fn hf_para_el(p: &Paragraph, pal: Pal, meas: &Measurer, width: f32, zoom: f32) -> AnyElement {
+fn hf_para_el(
+    p: &Paragraph,
+    pal: Pal,
+    meas: &Measurer,
+    width: f32,
+    zoom: f32,
+    pics: Option<pictures::Scope>,
+) -> AnyElement {
     paragraph_el(
         p,
         None,
@@ -31311,6 +31327,7 @@ fn hf_para_el(p: &Paragraph, pal: Pal, meas: &Measurer, width: f32, zoom: f32) -
         None,
         None,
         None,
+        pics,
     )
 }
 
@@ -31655,6 +31672,7 @@ fn paragraph_el(
     lines: Option<LineSlot>,
     overlay: Option<AnyElement>,
     cell_run: Option<&docxcore::table_styles::RunLook>,
+    pics: Option<pictures::Scope>,
 ) -> AnyElement {
     use docxcore::model::TabAlign;
     let base = para_base(p, zoom);
@@ -31835,17 +31853,19 @@ fn paragraph_el(
                         x += gap;
                     }
                 }
-                // An inline picture (#768): a frame of its size, drawn in the
-                // line; the picture itself is not drawn here yet. It is one
-                // offset (#1242).
+                // An inline picture (#768): a box of its size, drawn in the
+                // line. It holds the picture when its media resolves to an
+                // image gpui can show (#1432), else a bordered frame. It is
+                // one offset (#1242).
                 if let Some((cx_emu, cy_emu)) = docxcore::image::inline_extent(xml) {
                     let (w, h) = picture_frame_px(cx_emu, cy_emu, zoom);
-                    let frame = div()
-                        .flex_none()
-                        .w(px(w))
-                        .h(px(h))
-                        .border_1()
-                        .border_color(pal.dim);
+                    let frame = div().flex_none().w(px(w)).h(px(h));
+                    let frame = match pics.and_then(|p| p.image(xml)) {
+                        Some(image) => {
+                            frame.child(img(image).w(px(w)).h(px(h)).object_fit(ObjectFit::Fill))
+                        }
+                        None => frame.border_1().border_color(pal.dim),
+                    };
                     emit_object_unit(
                         &mut spans, frame, &mut idx, &mut caret, sel, click, pal, caret_h,
                     );
@@ -32532,6 +32552,7 @@ fn block_el_numbered(
                 lines,
                 overlay,
                 ctx.cell_run,
+                ctx.pics,
             )
         }
         Block::Table(t) => table_el(t, &path, ctx),
@@ -37944,6 +37965,8 @@ impl Render for Docxy {
                         tbl.draw = Some(self.draw_geom.clone());
                     }
                     let body_range = editor.cell_range();
+                    // Inline pictures (#1432): read once per frame, per story part.
+                    let pictures = tab.pkg.as_ref().map(pictures::Pictures::new);
                     let ctx = RenderCtx {
                         caret_path: &editor.caret.path,
                         caret_off: editor.caret.offset,
@@ -37961,6 +37984,7 @@ impl Render for Docxy {
                         merge_hl: tab.mail.highlight,
                         field_codes: tab.field_codes,
                         cell_run: None,
+                        pics: pictures::scope(pictures.as_ref(), Some("word/document.xml")),
                     };
                     let body = &shown.body;
                     if self.page_view {
@@ -38218,6 +38242,7 @@ impl Render for Docxy {
                                     // their results, so the live one does too.
                                     field_codes: false,
                                     cell_run: None,
+                                    pics: pictures::scope(pictures.as_ref(), Some(&h.part_name)),
                                 });
                                 // One region's margin content for this page: the live
                                 // editor blocks (editable on the edit page, read-only on
@@ -38243,11 +38268,21 @@ impl Render for Docxy {
                                                     doc_pal,
                                                     &measurer,
                                                     hf_w,
+                                                    pictures::scope(
+                                                        pictures.as_ref(),
+                                                        Some(h.part_name.as_str()),
+                                                    ),
                                                 );
                                             }
                                         }
                                     }
-                                    hf_els(page_blocks(pi, is_h), doc_pal, &measurer, hf_w)
+                                    hf_els(
+                                        page_blocks(pi, is_h),
+                                        doc_pal,
+                                        &measurer,
+                                        hf_w,
+                                        pictures::scope(pictures.as_ref(), page_part(pi, is_h)),
+                                    )
                                 };
                                 // One child per band, each with its own
                                 // section's left/right margins; the first band
@@ -38507,9 +38542,20 @@ impl Render for Docxy {
                                                         ..ctx
                                                     },
                                                 ),
-                                                None => {
-                                                    hf_para_el(p, doc_pal, &measurer, width, zoom)
-                                                }
+                                                None => hf_para_el(
+                                                    p,
+                                                    doc_pal,
+                                                    &measurer,
+                                                    width,
+                                                    zoom,
+                                                    pictures::scope(
+                                                        pictures.as_ref(),
+                                                        match edited {
+                                                            Some(h) => Some(h.part_name.as_str()),
+                                                            None => page_part(pi, is_h),
+                                                        },
+                                                    ),
+                                                ),
                                             }
                                         });
                                         let exact = g.frame.h_rule.as_deref() == Some("exact");
