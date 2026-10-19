@@ -30,7 +30,9 @@ impl<'a> RunStyler<'a> {
     pub fn shown<'r>(&self, r: &'r Run) -> Cow<'r, RunProps> {
         match self.sheet {
             // Nothing lies below it: the run is its own.
-            Some(_) if self.cell.is_none() && self.pstyle.is_none() && r.props.style_id.is_none() => {
+            Some(_)
+                if self.cell.is_none() && self.pstyle.is_none() && r.props.style_id.is_none() =>
+            {
                 Cow::Borrowed(&r.props)
             }
             Some(sheet) => Cow::Owned(sheet.shown_run(

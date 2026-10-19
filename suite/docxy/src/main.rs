@@ -83,7 +83,6 @@ mod page_flow;
 mod page_number;
 mod page_setup;
 mod pictures;
-mod run_look;
 mod plugin_ui;
 mod project;
 mod project_formats;
@@ -94,6 +93,7 @@ mod ribbon_export;
 mod ribbon_fit;
 mod ribbon_layout;
 mod rich_clip;
+mod run_look;
 #[cfg(test)]
 mod save_preserve_tests;
 #[cfg(test)]
@@ -38603,7 +38603,12 @@ impl Render for Docxy {
                                         let r = docxcore::frame::frame_rect(
                                             g.frame,
                                             &geom,
-                                            frame_content_w(g, &measurer, zoom, tbl.sheet.as_deref()),
+                                            frame_content_w(
+                                                g,
+                                                &measurer,
+                                                zoom,
+                                                tbl.sheet.as_deref(),
+                                            ),
                                             g.content_h(),
                                         );
                                         let width = zoom * r.w.max(0) as f32 / 15.0;
