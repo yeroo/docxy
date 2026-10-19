@@ -11,6 +11,7 @@
 
 use crate::model::*;
 use crate::review::{RevisionAction, RevisionOutcome};
+use crate::table_styles::RunLook;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -260,6 +261,13 @@ struct PendingFormat {
     /// The value each property is toggled to, by [`ToggleProp`]: one slot
     /// each, however often it is toggled.
     toggles: [Option<bool>; ToggleProp::ALL.len()],
+    /// Whether a style context decided the toggles (#1427): they were then
+    /// set over what the styles give, so the property's explicit-off
+    /// element is the pending format's to drop.
+    styled: bool,
+    /// The properties toggled off under a style that turns them on, which
+    /// type as an explicit `w:val="0"` over it.
+    explicit_off: [bool; ToggleProp::ALL.len()],
 }
 
 impl PendingFormat {
@@ -267,6 +275,9 @@ impl PendingFormat {
         for prop in ToggleProp::ALL {
             if let Some(value) = self.toggles[prop as usize] {
                 prop.set()(props, value);
+                if self.styled {
+                    prop.set_explicit_off(props, self.explicit_off[prop as usize]);
+                }
             }
         }
     }
@@ -308,6 +319,81 @@ impl ToggleProp {
             ToggleProp::Strike => RunProps::set_user_strike,
         }
     }
+
+    /// The `w:rPr` child Bold or Italic is written as; the others have no
+    /// explicit-off model.
+    fn local(self) -> Option<&'static str> {
+        match self {
+            ToggleProp::Bold => Some("b"),
+            ToggleProp::Italic => Some("i"),
+            ToggleProp::Underline | ToggleProp::Strike => None,
+        }
+    }
+
+    /// Write (or drop) the explicit `<w:b w:val="0"/>` that turns a style's
+    /// bold off, keeping at most that one element for the property.
+    fn set_explicit_off(self, props: &mut RunProps, off: bool) {
+        let Some(local) = self.local() else {
+            return;
+        };
+        props
+            .raw_props
+            .retain(|r| !crate::styles::has_raw_child(std::slice::from_ref(r), local));
+        // A loaded explicit-off is in the shadow too, and would be written
+        // beside (or instead of) the model's choice.
+        let tag = format!("w:{local}");
+        props
+            .shadow
+            .retain(|x| crate::table_props::element_name(x) != tag);
+        if off {
+            props.raw_props.push(format!("<w:{local} w:val=\"0\"/>"));
+        }
+    }
+}
+
+/// What the styles lay below a paragraph's runs (#1427): the stylesheet, the
+/// run formatting of the table cell around it and its paragraph style.
+struct ShownBase {
+    styles: Arc<EditStyles>,
+    look: Option<RunLook>,
+    pstyle: Option<String>,
+}
+
+impl ShownBase {
+    /// `run` as drawn: its direct formatting over the styles.
+    fn shown(&self, run: &RunProps) -> RunProps {
+        self.styles.sheet.shown_run(
+            self.look.as_ref(),
+            self.pstyle.as_deref(),
+            run.style_id.as_deref(),
+            run,
+        )
+    }
+
+    /// What the styles alone give `run` (its character style included):
+    /// bold and italic.
+    fn base_of(&self, run: &RunProps) -> (bool, bool) {
+        let s = self.shown(&RunProps {
+            style_id: run.style_id.clone(),
+            ..Default::default()
+        });
+        (s.bold, s.italic)
+    }
+
+    fn base(&self, prop: ToggleProp, run: &RunProps) -> bool {
+        let (bold, italic) = self.base_of(run);
+        match prop {
+            ToggleProp::Bold => bold,
+            _ => italic,
+        }
+    }
+}
+
+/// The styles part an editor shows runs over (#1427): its text, for the
+/// table styles, and the parsed sheet.
+struct EditStyles {
+    xml: Arc<str>,
+    sheet: crate::styles::StyleSheet,
 }
 
 /// An undo step's name. Typing is named by its text as it coalesces; a host
@@ -469,6 +555,8 @@ pub struct DocSettings {
 /// An editing session over a [`Document`].
 pub struct Editor {
     pub doc: Document,
+    /// The styles part runs are shown over (#1427); not undo state.
+    styles: Option<Arc<EditStyles>>,
     pub caret: Caret,
     /// Selection anchor (the fixed end); the moving end is the caret.
     pub anchor: Option<Caret>,
@@ -572,6 +660,7 @@ impl Editor {
         let path = first_paragraph_path(&doc.body).unwrap_or_else(|| vec![0]);
         let bound_seen = bound_controls(&doc.body);
         Editor {
+            styles: None,
             bound_seen,
             sync_step: None,
             doc,
@@ -601,6 +690,7 @@ impl Editor {
     /// typing run go on as if nothing happened.
     pub fn preview_copy(&self) -> Editor {
         Editor {
+            styles: self.styles.clone(),
             doc: self.doc.clone(),
             caret: self.caret.clone(),
             anchor: self.anchor.clone(),
@@ -2913,29 +3003,63 @@ impl Editor {
             }
             return;
         }
+        // With a styles context, Bold and Italic are read and written over
+        // what the table, paragraph and character styles give each run
+        // (#1427); without one, over the direct formatting alone.
+        let bases: Vec<Option<ShownBase>> = spans
+            .iter()
+            .map(|(path, _, _)| prop.local().and_then(|_| self.shown_base(path)))
+            .collect();
         self.checkpoint(EditKind::Structural);
         let mut all = true;
-        for (path, s, e) in &spans {
+        for ((path, s, e), base) in spans.iter().zip(&bases) {
             if let Some(p) = resolve_para(&self.doc.body, path) {
-                if !range_all_have(&p.content, *s, *e, get) {
+                let have = match base {
+                    Some(b) => range_all_have(&p.content, *s, *e, |r| get(&b.shown(r))),
+                    None => range_all_have(&p.content, *s, *e, get),
+                };
+                if !have {
                     all = false;
                     break;
                 }
             }
         }
         let value = !all;
-        for (path, s, e) in &spans {
+        for ((path, s, e), base) in spans.iter().zip(&bases) {
             if let Some(p) = para_mut(&mut self.doc.body, path) {
-                set_prop_range(&mut p.content, *s, *e, set, value);
+                match base {
+                    Some(b) => edit_run_range(&mut p.content, *s, *e, &|text, props| {
+                        let under = b.base(prop, props);
+                        let mut p = props.clone();
+                        set(&mut p, value && !under);
+                        prop.set_explicit_off(&mut p, !value && under);
+                        Run {
+                            text: text.to_string(),
+                            props: p,
+                        }
+                    }),
+                    None => set_prop_range(&mut p.content, *s, *e, set, value),
+                }
             }
         }
         self.doc.initialize_revision_targets();
     }
 
     fn toggle_at_caret(&mut self, prop: ToggleProp) {
-        let value = !prop.get()(&self.caret_props());
-        let mut toggles = self.pending_format().map(|p| p.toggles).unwrap_or_default();
-        toggles[prop as usize] = Some(value);
+        let base = prop.local().and_then(|_| self.shown_base(&self.caret.path));
+        let (value, under) = match &base {
+            Some(b) => (
+                !prop.get()(&b.shown(&self.caret_props())),
+                b.base(prop, &self.text_props_at_caret()),
+            ),
+            None => (!prop.get()(&self.caret_props()), false),
+        };
+        let pending_now = self.pending_format();
+        let mut toggles = pending_now.map(|p| p.toggles).unwrap_or_default();
+        let mut explicit_off = pending_now.map(|p| p.explicit_off).unwrap_or_default();
+        toggles[prop as usize] = Some(value && !under);
+        explicit_off[prop as usize] = !value && under;
+        let styled = base.is_some() || pending_now.is_some_and(|p| p.styled);
         let after_object = self.typing_after_object().is_some();
         // The step holds the state before the toggle, pending format and all.
         self.checkpoint(EditKind::Structural);
@@ -2951,6 +3075,8 @@ impl Editor {
             caret: self.caret.clone(),
             serial: self.undo_serial(),
             toggles,
+            styled,
+            explicit_off,
         };
         // Toggles that cancel out (Bold twice) leave nothing to apply, so
         // the text typed next joins the run it is typed in.
@@ -2958,6 +3084,70 @@ impl Editor {
         let mut toggled = base.clone();
         pending.apply(&mut toggled);
         self.pending = (toggled != base).then_some(pending);
+    }
+
+    /// Give the editor the document's `word/styles.xml` (or `None`), so
+    /// Bold and Italic read and write over the styles' bold and italic: a
+    /// toggle off in a text the table, paragraph or character style makes
+    /// bold writes `<w:b w:val="0"/>` as Word does (#1427). Not undo state
+    /// and never cloned into a snapshot. The same text again keeps the
+    /// parsed sheet.
+    pub fn set_styles_xml(&mut self, xml: Option<Arc<str>>) {
+        match (&self.styles, xml) {
+            (Some(s), Some(x)) if Arc::ptr_eq(&s.xml, &x) || *s.xml == *x => {}
+            (_, Some(x)) => {
+                let sheet = crate::styles::parse_styles_xml(&x);
+                self.styles = Some(Arc::new(EditStyles { xml: x, sheet }));
+            }
+            (_, None) => self.styles = None,
+        }
+    }
+
+    /// What the styles lay below the runs of the paragraph `path` names; `None`
+    /// without a styles context.
+    fn shown_base(&self, path: &[usize]) -> Option<ShownBase> {
+        let styles = self.styles.clone()?;
+        let para = resolve_para(&self.doc.body, path)?;
+        // The innermost table around the paragraph decides the look.
+        let (mut blocks, mut rest) = (&self.doc.body[..], path);
+        let mut look = None;
+        while let Some(block) = rest.first().and_then(|i| blocks.get(*i)) {
+            match (block, &rest[1..]) {
+                (Block::Table(t), [row, cell, inner @ ..]) => {
+                    look = Some(crate::table_styles::cell_run_look(
+                        t,
+                        Some(&styles.xml),
+                        *row,
+                        *cell,
+                    ));
+                    let Some(c) = t.rows.get(*row).and_then(|r| r.cells.get(*cell)) else {
+                        break;
+                    };
+                    (blocks, rest) = (&c.blocks, inner);
+                }
+                (Block::Paragraph(p), [k, inner @ ..]) => match p.content.get(*k) {
+                    Some(Inline::TextBox { blocks: b, .. }) => (blocks, rest) = (b, inner),
+                    _ => break,
+                },
+                _ => break,
+            }
+        }
+        Some(ShownBase {
+            styles,
+            look,
+            pstyle: para.props.style_id.clone(),
+        })
+    }
+
+    /// [`Editor::caret_props`] as drawn: over the styles' bold and italic
+    /// when the editor has a styles context (#1427), for the ribbon's
+    /// on-states; the same as `caret_props` without one.
+    pub fn caret_props_shown(&self) -> RunProps {
+        let props = self.caret_props();
+        match self.shown_base(&self.caret.path) {
+            Some(b) => b.shown(&props),
+            None => props,
+        }
     }
 
     // ---- find / replace ----
@@ -5029,7 +5219,7 @@ fn range_all_have(
     content: &[Inline],
     start: usize,
     end: usize,
-    get: fn(&RunProps) -> bool,
+    get: impl Fn(&RunProps) -> bool + Copy,
 ) -> bool {
     let (mut pos, mut saw) = (0, false);
     range_all_have_at(content, start, end, get, &mut pos, &mut saw) && saw
@@ -5041,7 +5231,7 @@ fn range_all_have_at(
     content: &[Inline],
     start: usize,
     end: usize,
-    get: fn(&RunProps) -> bool,
+    get: impl Fn(&RunProps) -> bool + Copy,
     pos: &mut usize,
     saw: &mut bool,
 ) -> bool {

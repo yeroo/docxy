@@ -798,7 +798,10 @@ mod tests {
     fn shown_run_char_style_beats_paragraph_style() {
         let ss = shown_sheet();
         let r = ss.shown_run(None, Some("Plain"), Some("Strong"), &RunProps::default());
-        assert!(r.bold, "the character style's bold beats the paragraph's off");
+        assert!(
+            r.bold,
+            "the character style's bold beats the paragraph's off"
+        );
         let r = ss.shown_run(None, Some("Heading1"), Some("Red"), &RunProps::default());
         assert!(r.bold, "layers merge");
         assert_eq!(r.color.as_deref(), Some("FF0000"));
@@ -834,7 +837,12 @@ mod tests {
             color: Some(Some("0000FF".into())),
             ..Default::default()
         };
-        let r = ss.shown_run(Some(&coloured), Some("Heading1"), None, &RunProps::default());
+        let r = ss.shown_run(
+            Some(&coloured),
+            Some("Heading1"),
+            None,
+            &RunProps::default(),
+        );
         assert_eq!(r.color.as_deref(), Some("1F3864"));
     }
 
