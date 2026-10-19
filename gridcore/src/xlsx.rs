@@ -2948,7 +2948,11 @@ fn parse_worksheet_with(
             match &translated {
                 Some(f) => {
                     cell.formula = Some(f.clone());
-                    if let Some(l) = unchanged_f(Some(f)) {
+                    // The follower is a reprint of the master, which drops any
+                    // `_xl` prefix: it is kept only when the master is kept
+                    // and has none, so every prefix the master had is absent.
+                    let kept = !src.contains("_xl") && unchanged_f(Some(src)).is_some();
+                    if let Some(l) = unchanged_f(Some(f)).filter(|_| kept) {
                         cell.meta.get_or_insert_with(Default::default).loaded_f = Some(l);
                     }
                 }
@@ -3279,9 +3283,10 @@ fn parse_cell_body(
 }
 
 /// The formula text to keep as loaded ([`CellMeta::loaded_f`]): `f` when
-/// save's [`file_formula`] would change it, else nothing to keep.
+/// save's [`file_formula`] would only add function prefixes to it.
 fn unchanged_f(f: Option<&str>) -> Option<String> {
-    f.filter(|f| file_formula(f) != *f).map(str::to_string)
+    f.filter(|f| crate::formula::only_prefixes_added(f))
+        .map(str::to_string)
 }
 
 /// The formula text save writes for `cell`'s formula `src`: as loaded while
@@ -14533,6 +14538,60 @@ b",
             ws.contains(r#"<f>_xlfn.TEXTJOIN(",",TRUE,A2:A4)</f>"#),
             "{ws}"
         );
+    }
+
+    #[test]
+    fn shared_group_followers_keep_the_masters_prefixes_or_its_bare_names() {
+        // A follower is the master's reprint, which has no `_xlfn.`/`_xlpm.`:
+        // it must still be saved with them. A group of bare names (a UDF)
+        // stays bare, master and followers alike.
+        let rows = concat!(
+            r#"<row r="1"><c r="C1"><f t="shared" ref="C1:C3" si="0">_xlfn.XLOOKUP(A1,$A$1:$A$3,$A$1:$A$3)</f><v>1</v></c>"#,
+            r#"<c r="D1"><f t="shared" ref="D1:D3" si="1">_xlfn.LET(_xlpm.x,A1,_xlpm.x+1)</f><v>2</v></c>"#,
+            r#"<c r="E1"><f t="shared" ref="E1:E3" si="2">TEXTJOIN(",",TRUE,A1:B1)</f><v>1</v></c>"#,
+            r#"<c r="F1"><f t="shared" ref="F1:F3" si="3">TEXTJOIN(",",TRUE,A1)+_xlfn.IFS(TRUE,1)</f><v>2</v></c></row>"#,
+            r#"<row r="2"><c r="C2"><f t="shared" si="0"/><v>2</v></c><c r="D2"><f t="shared" si="1"/><v>3</v></c>"#,
+            r#"<c r="E2"><f t="shared" si="2"/><v>1</v></c><c r="F2"><f t="shared" si="3"/><v>2</v></c></row>"#,
+            r#"<row r="3"><c r="C3"><f t="shared" si="0"/><v>3</v></c><c r="D3"><f t="shared" si="1"/><v>4</v></c>"#,
+            r#"<c r="E3"><f t="shared" si="2"/><v>1</v></c><c r="F3"><f t="shared" si="3"/><v>3</v></c></row>"#
+        );
+        let pkg = book_with_rows(rows);
+        let (_, ws) = resaved(&pkg);
+        for f in [
+            "<f>_xlfn.XLOOKUP(A2,$A$1:$A$3,$A$1:$A$3)</f>",
+            "<f>_xlfn.XLOOKUP(A3,$A$1:$A$3,$A$1:$A$3)</f>",
+            "<f>_xlfn.LET(_xlpm.x,A2,_xlpm.x+1)</f>",
+            "<f>_xlfn.LET(_xlpm.x,A3,_xlpm.x+1)</f>",
+            r#"<f>TEXTJOIN(",",TRUE,A1:B1)</f>"#,
+            r#"<f>TEXTJOIN(",",TRUE,A2:B2)</f>"#,
+            r#"<f>TEXTJOIN(",",TRUE,A3:B3)</f>"#,
+        ] {
+            assert!(ws.contains(f), "{f} in {ws}");
+        }
+        // A master mixing a bare UDF with a prefixed builtin: its followers
+        // are saved with the builtin prefixed and may not strip it.
+        assert!(!ws.contains("<f>TEXTJOIN(\",\",TRUE,A2)+IFS"), "{ws}");
+        assert!(ws.contains("_xlfn.IFS(TRUE,1)"), "{ws}");
+    }
+
+    #[test]
+    fn loaded_text_that_needs_a_reprint_is_still_repaired_on_save() {
+        // A bare LET, `A1#` or `@x` is not a bare UDF name: save fixes it.
+        let rows = concat!(
+            r#"<row r="1"><c r="C1"><f>LET(x,A1,x+1)</f><v>2</v></c>"#,
+            r#"<c r="D1"><f>SUM(C1#)</f><v>2</v></c></row>"#,
+        );
+        let pkg = book_with_rows(rows);
+        for c in [2, 3] {
+            let cell = pkg.workbook.sheets[0].cell(0, c).unwrap();
+            assert!(cell.meta.as_ref().is_none_or(|m| m.loaded_f.is_none()));
+        }
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains("<f>_xlfn.LET(_xlpm.x,A1,_xlpm.x+1)</f>"),
+            "{ws}"
+        );
+        assert!(ws.contains("<f>SUM(_xlfn.ANCHORARRAY(C1))</f>"), "{ws}");
     }
 
     #[test]
