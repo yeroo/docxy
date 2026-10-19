@@ -75,7 +75,7 @@ impl<'a> Pictures<'a> {
     }
 }
 
-/// A story's pictures: the frame's cache and the part the story came from.
+/// A story's pictures: the tab's pictures and the part the story came from.
 #[derive(Clone, Copy)]
 pub struct Scope<'a> {
     pub pictures: &'a Pictures<'a>,

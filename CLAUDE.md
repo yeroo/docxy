@@ -894,8 +894,8 @@
 - `docxcore::image::inline_embed` is the rid (same inline-only guards as
   `inline_extent`, and only when `a:graphicData` is a picture: a group or shape
   holding blips is not one). `suite/docxy/src/pictures.rs` resolves it through
-  the story part's own relationships (`Package::part_rel_target`: `..`,
-  absolute and external targets by the package's rules): the same rid names
+  the story part's own relationships (`Package::part_rel_target`: relative to
+  the part's own folder, `..`, absolute; external or escaping targets none): the same rid names
   different media in `document.xml.rels` and a header's, so `RenderCtx::pics` /
   `pictures::Scope` carry the story's part name (the body's, the open
   header/footer's `HfEdit::part_name`, or the page's header/footer part).

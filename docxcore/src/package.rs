@@ -572,13 +572,21 @@ fn part_rels_name(part: &str) -> Option<String> {
 /// (`header1.xml` -> `word/header1.xml`), or `None` for an external or
 /// malformed target.
 pub(crate) fn resolve_document_relationship_target(target: &str) -> Option<String> {
+    resolve_relationship_target("word", target)
+}
+
+/// The package part a relationship target names from a part in `dir` (no
+/// trailing slash, empty for the root): a leading `/` is from the package
+/// root, `.` and `..` resolve, and a `..` past the root, an external target
+/// or a malformed one is `None`.
+fn resolve_relationship_target(dir: &str, target: &str) -> Option<String> {
     if target.contains('\\') || target.contains("://") {
         return None;
     }
-    let mut components = if target.starts_with('/') {
+    let mut components: Vec<&str> = if target.starts_with('/') || dir.is_empty() {
         Vec::new()
     } else {
-        vec!["word"]
+        dir.split('/').collect()
     };
     for component in target.trim_start_matches('/').split('/') {
         match component {
@@ -908,14 +916,6 @@ fn vml_color(value: &str) -> Option<(u8, u8, u8)> {
 struct Parts {
     list: Vec<(String, Vec<u8>)>,
     stamp: u64,
-}
-
-impl<'a> IntoIterator for &'a Parts {
-    type Item = &'a (String, Vec<u8>);
-    type IntoIter = std::slice::Iter<'a, (String, Vec<u8>)>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.list.iter()
-    }
 }
 
 /// Equal when the parts are, whatever their stamps.
@@ -1331,16 +1331,16 @@ impl Package {
     }
 
     /// The package part a relationship of `part` names, for a target inside
-    /// the package: relative to `word/`, a leading `/` from the package root,
-    /// `..` and `.` resolved. `None` for an unknown id, an external target
-    /// or a malformed one.
+    /// the package: relative to the folder of `part`, a leading `/` from the
+    /// package root, `..` and `.` resolved. `None` for an unknown id, an
+    /// external target, one that climbs out of the package or a malformed one.
     pub fn part_rel_target(&self, part: &str, rid: &str) -> Option<String> {
         let rels = self.part_rels(part);
         let (_, target, external) = rels.iter().find(|(id, _, _)| *id == rid)?;
         if external {
             return None;
         }
-        resolve_document_relationship_target(target)
+        resolve_relationship_target(part.rsplit_once('/').map_or("", |(dir, _)| dir), target)
     }
 
     /// The raw bytes of a part by name.
@@ -6503,9 +6503,6 @@ mod tests {
         assert!(pkg.part("word/media/image1.png").is_some());
     }
 
-    /// #768: a picture in a header is related from the header's own rels,
-    /// created when it has none, never from `document.xml.rels`; a JPEG
-    /// declares `image/jpeg` once, whatever letter case a Default has.
     #[test]
     fn the_parts_stamp_moves_on_a_change_and_survives_a_clone() {
         let mut pkg = new_package(Document { body: vec![] });
@@ -6551,8 +6548,23 @@ mod tests {
         assert_eq!(target("media/a.png", " TargetMode=\"External\""), None);
         assert_eq!(target("http://x/a.png", ""), None);
         assert_eq!(pkg.part_rel_target(&header, "rId9"), None);
+
+        // A part in a subfolder resolves against its own folder.
+        let mut deep = |t: &str| {
+            let rels = rels(t, "").into_bytes();
+            pkg.parts.push(("word/sub/_rels/h.xml.rels".into(), rels));
+            let found = pkg.part_rel_target("word/sub/h.xml", "rId1");
+            pkg.parts.retain(|(n, _)| n != "word/sub/_rels/h.xml.rels");
+            found
+        };
+        assert_eq!(deep("media/a.png"), Some("word/sub/media/a.png".into()));
+        assert_eq!(deep("../media/x.png"), Some("word/media/x.png".into()));
+        assert_eq!(deep("../../../x.png"), None);
     }
 
+    /// #768: a picture in a header is related from the header's own rels,
+    /// created when it has none, never from `document.xml.rels`; a JPEG
+    /// declares `image/jpeg` once, whatever letter case a Default has.
     #[test]
     fn add_part_image_relates_from_the_parts_own_rels() {
         let mut pkg = new_package(Document { body: vec![] });
