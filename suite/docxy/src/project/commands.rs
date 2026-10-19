@@ -1508,10 +1508,6 @@ pub(crate) fn project_alt_key(key: &str, m: Modifiers) -> bool {
     m.alt && !m.control && !m.platform && key_act(key, m).is_some()
 }
 
-/// The modifiers a Project tab's keys are read with: on macOS ⌘ is their
-/// Ctrl (#1071), as it is on every other surface (`on_key`'s `ctrl`), so
-/// ⌘S, ⌘Z, ⌘C and the menu bar's items reach Project. Off macOS, and for
-/// a chord already holding Ctrl, nothing changes.
 /// The keystroke the Project surface takes for a key-down: with a cell or
 /// prompt open, the plain typed key a ⌥ character stands for on macOS
 /// (#1312, as a dialog's), else the key-down's own.
@@ -1523,6 +1519,10 @@ pub(crate) fn project_stroke(ev: &KeyDownEvent, edit_open: bool, macos: bool) ->
     }
 }
 
+/// The modifiers a Project tab's keys are read with: on macOS ⌘ is their
+/// Ctrl (#1071), as it is on every other surface (`on_key`'s `ctrl`), so
+/// ⌘S, ⌘Z, ⌘C and the menu bar's items reach Project. Off macOS, and for
+/// a chord already holding Ctrl, nothing changes.
 pub(crate) fn project_mods(m: Modifiers, macos: bool) -> Modifiers {
     if macos && m.platform && !m.control {
         Modifiers {

@@ -421,6 +421,12 @@ fn dialog_press(tab: &mut DocTab, button: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Types `text` into the focused control one character at a time, as
+/// single keys would.
+fn type_text(d: &mut dialog::Dialog, text: &str) -> Result<(), String> {
+    text.chars().try_for_each(|c| d.type_char(c))
+}
+
 /// [`dialog_key_with`] with nothing on the clipboard, for the tests.
 #[cfg(test)]
 pub(crate) fn dialog_key(tab: &mut DocTab, key: &str, typed: Option<&str>, m: Modifiers) -> bool {
@@ -554,17 +560,25 @@ pub(crate) fn edit_key(
             }
             Ok(())
         }
-        "space" => d.space(),
+        // A dead key's accent then Space arrives as Space with the accent as
+        // its text (#1312): that text, not a blank, is what was typed.
+        "space" => match typed
+            .as_deref()
+            .filter(|t| *t != " " && !t.chars().any(char::is_control))
+        {
+            Some(text) => type_text(d, text),
+            None => d.space(),
+        },
         // Enter reaches here only with a multiline field focused
         // (`DialogStack::key_button`): a new line (#1532).
         "enter" => d.insert_text("\n"),
         "up" => d.step_focused(false),
         "down" => d.step_focused(true),
-        _ => match typed
-            .as_deref()
-            .map(|t| (t.chars().next(), t.chars().count()))
-        {
-            Some((Some(c), 1)) if !c.is_control() => d.type_char(c),
+        // Several characters: a dead key's accent composed with the letter.
+        _ => match typed.as_deref() {
+            Some(text) if !text.is_empty() && !text.chars().any(char::is_control) => {
+                type_text(d, text)
+            }
             _ => Ok(()),
         },
     }
@@ -1938,7 +1952,7 @@ mod tests {
     fn windows_key(t: &mut DocTab, ime: &mut ImeState, ev: &KeyDownEvent, wm_char: Option<&str>) {
         let open = t.dialogs.is_open();
         // `route_key` never hands `on_key` a plain dead key (#1312).
-        if crate::text_input::plain_dead_key(ev) {
+        if !crate::text_input::passes_to_on_key(ev, true) {
             return;
         }
         assert!(platform_key(t, ev, false));
@@ -2098,6 +2112,23 @@ mod tests {
         let n = key_down("n", Some("ñ"), Modifiers::default());
         windows_key(&mut t, &mut ime, &n, Some("ñ"));
         assert_eq!(value(&t, "note"), Value::Text("ñ".into()));
+        // The accent then Space arrives as Space carrying "´"; then X as a
+        // two-character "´x": both type in full.
+        let space = key_down("space", Some("´"), Modifiers::default());
+        windows_key(&mut t, &mut ime, &dead, None);
+        windows_key(&mut t, &mut ime, &space, Some("´"));
+        let x = key_down("x", Some("´x"), Modifiers::default());
+        windows_key(&mut t, &mut ime, &dead, None);
+        windows_key(&mut t, &mut ime, &x, Some("´x"));
+        assert_eq!(value(&t, "note"), Value::Text("ñ´´x".into()));
+        // A plain Space still types a space.
+        windows_key(
+            &mut t,
+            &mut ime,
+            &key_down("space", Some(" "), Modifiers::default()),
+            Some(" "),
+        );
+        assert_eq!(value(&t, "note"), Value::Text("ñ´´x ".into()));
     }
 
     /// Ctrl+A selects the field's text and typing replaces it; Ctrl+V pastes

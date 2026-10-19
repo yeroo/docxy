@@ -55,13 +55,14 @@
 //! type its character, but a dialog field swallows ⌥ keys, so the dialog is
 //! handed the plain typed key ⌥ made instead ([`modifier_char`], #1162). A
 //! Windows AltGr key (Ctrl+Alt) is swallowed there too, and its key-down
-//! cannot tell a character from an AltGr dead key, so under a dialog its
-//! debt is the dialog's ([`dialog_altgr`]): the WM_CHAR, which an AltGr dead
+//! cannot tell a character from an AltGr dead key, so under a dialog or a Project edit its
+//! debt is the field's ([`dialog_altgr`]): the WM_CHAR, which an AltGr dead
 //! key never sends, types the character while a dialog is open, and nothing
 //! once none is. Under load that WM_CHAR may land after keys typed after it
 //! ("a", AltGr+Q, "b" giving "ab@"), or in the next field after a Tab, as
-//! packet text may. (Only AltGr dead keys compose there: a plain dead key's
-//! accent is still typed into a dialog field.)
+//! packet text may. A Project cell or prompt is such a field too (#1312). A
+//! plain dead key never reaches `on_key` ([`passes_to_on_key`]): the next
+//! key-down carries the composed text, whole, in its `key_char`.
 //!
 //! Linux registers no handler: it would hand it every unhandled printable
 //! key, which `on_key` has already typed. Off macOS the root also leaves
@@ -206,6 +207,13 @@ pub(crate) fn plain_dead_key(ev: &KeyDownEvent) -> bool {
             .is_some_and(|c| !c.is_empty())
 }
 
+/// Whether `route_key` hands a key-down to `on_key`: not a plain dead key on
+/// Windows (#1312), whose accent comes composed with the next key-down (a
+/// space then carries "´" as its text, a letter "´x").
+pub(crate) fn passes_to_on_key(ev: &KeyDownEvent, windows: bool) -> bool {
+    !(windows && plain_dead_key(ev))
+}
+
 /// Whether a key-down's debt may never be paid: a key gpui flags as preferring
 /// character input under Ctrl, Alt or Win, which is every AltGr character and
 /// also an AltGr dead key, whose WM_DEADCHAR is no WM_CHAR (#1139).
@@ -291,15 +299,15 @@ pub(crate) fn dialog_stroke(ev: &KeyDownEvent, macos: bool) -> Keystroke {
 
 /// Whether a Windows key-down is AltGr under an open text field that
 /// swallows it (#1162, #1312): a dialog, or the Project cell editor or
-/// prompt (`dialog_open` is true for any of them). It is Ctrl+Alt that gpui
+/// prompt (`field_open` is true for any of them). It is Ctrl+Alt that gpui
 /// flags as changing the character. The field swallows it, as it does every
 /// Alt key, and the key-down cannot tell a character from an AltGr dead key
 /// (whose accent then joins the next letter). So it owes no WM_CHAR
 /// ([`ImeState::typed_key`]), and the WM_CHAR, which only a character
 /// sends, types the character into the field.
-pub(crate) fn dialog_altgr(ev: &KeyDownEvent, dialog_open: bool) -> bool {
+pub(crate) fn dialog_altgr(ev: &KeyDownEvent, field_open: bool) -> bool {
     let m = &ev.keystroke.modifiers;
-    dialog_open && m.control && m.alt && !m.platform && ev.prefer_character_input
+    field_open && m.control && m.alt && !m.platform && ev.prefer_character_input
 }
 
 fn typed(keystroke: Keystroke) -> KeyDownEvent {
@@ -323,9 +331,9 @@ struct Debt {
     at: Instant,
     /// [`may_not_come`]: a newer debt's match drops it.
     may_not_come: bool,
-    /// An AltGr key a dialog swallowed ([`dialog_altgr`]): its WM_CHAR types
-    /// the character while a dialog is open, and nothing once none is.
-    dialog: bool,
+    /// An AltGr key a text field swallowed ([`dialog_altgr`]): its WM_CHAR types
+    /// the character while a dialog or a Project edit is open, and nothing once none is.
+    field: bool,
 }
 
 /// The composition in progress and the key AppKit has been handed, and on
@@ -362,16 +370,16 @@ impl ImeState {
         self.owe(ev, now, false);
     }
 
-    /// Windows: a key-down `on_key` typed at `now`, `dialog_open` when it
-    /// was; its WM_CHAR is on the way, maybe behind the WM_CHARs of keys
+    /// Windows: a key-down `on_key` typed at `now`, `field_open` when a dialog
+    /// or a Project cell or prompt was; its WM_CHAR is on the way, maybe behind the WM_CHARs of keys
     /// before it. AltGr under a dialog, which `on_key` did not type
-    /// ([`dialog_altgr`]), owes the dialog: its WM_CHAR types the character
+    /// ([`dialog_altgr`]), owes the field: its WM_CHAR types the character
     /// only while a dialog is still open.
-    pub(crate) fn typed_key(&mut self, ev: &KeyDownEvent, now: Instant, dialog_open: bool) {
-        self.owe(ev, now, dialog_altgr(ev, dialog_open));
+    pub(crate) fn typed_key(&mut self, ev: &KeyDownEvent, now: Instant, field_open: bool) {
+        self.owe(ev, now, dialog_altgr(ev, field_open));
     }
 
-    fn owe(&mut self, ev: &KeyDownEvent, now: Instant, dialog: bool) {
+    fn owe(&mut self, ev: &KeyDownEvent, now: Instant, field: bool) {
         self.lapse(now);
         if let Some(text) = owed_text(ev) {
             if self.owed.len() == WM_CHAR_MAX_DEBTS {
@@ -381,7 +389,7 @@ impl ImeState {
                 text,
                 at: now,
                 may_not_come: may_not_come(ev),
-                dialog,
+                field,
             });
         }
     }
@@ -400,13 +408,13 @@ impl ImeState {
     /// of the WM_CHARs older debts still wait for (an older AltGr debt among
     /// them). A character no debt starts with (a packet's) is typed and
     /// leaves the debts as they are. A character that pays a dialog's
-    /// AltGr debt is typed when `dialog_open`, else dropped (#1162). Empty
+    /// AltGr debt is typed when `field_open`, else dropped (#1162). Empty
     /// text (an IME message gpui forwards) changes nothing.
     pub(crate) fn char_message(
         &mut self,
         text: &str,
         now: Instant,
-        dialog_open: bool,
+        field_open: bool,
     ) -> Vec<KeyDownEvent> {
         self.lapse(now);
         let mut keys = Vec::new();
@@ -422,7 +430,7 @@ impl ImeState {
                 continue;
             };
             let debt = &mut self.owed[i];
-            if debt.dialog && dialog_open {
+            if debt.field && field_open {
                 keys.extend(char_stroke(c).map(typed));
             }
             debt.text.drain(..c.len_utf8());
@@ -509,16 +517,16 @@ impl Docxy {
                 self.ime.forget_key();
                 // Whether a dialog took the key is decided before on_key,
                 // which may close it.
-                let dialog_open = self.dialog_open() || self.project_edit_open();
+                let field_open = self.text_field_open();
                 // A Windows dead key types nothing: the composed text comes
                 // with the next key (#1312).
-                if cfg!(windows) && plain_dead_key(ev) {
+                if !passes_to_on_key(ev, cfg!(windows)) {
                     return;
                 }
                 self.on_key(ev, window, cx);
                 // After on_key, which may run long (a save): the debt's
                 // keeping time starts once the key is typed.
-                self.ime.typed_key(ev, Instant::now(), dialog_open);
+                self.ime.typed_key(ev, Instant::now(), field_open);
             }
             Route::MenuBar => self.ime.forget_key(),
         }
@@ -534,14 +542,18 @@ impl Docxy {
     /// typed only while the app takes it; under KeyTips or a menu its
     /// letters would be commands.
     pub(crate) fn windows_char(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let keys = self.ime.char_message(
-            text,
-            Instant::now(),
-            self.dialog_open() || self.project_edit_open(),
-        );
+        let keys = self
+            .ime
+            .char_message(text, Instant::now(), self.text_field_open());
         if !keys.is_empty() && self.takes_text() {
             self.type_committed(keys, window, cx);
         }
+    }
+
+    /// A text field that swallows AltGr is open: a dialog, or the Project
+    /// cell editor or prompt (#1312).
+    fn text_field_open(&self) -> bool {
+        self.dialog_open() || self.project_edit_open()
     }
 
     fn dialog_open(&self) -> bool {
@@ -1039,6 +1051,17 @@ mod tests {
         assert_eq!(a_acute.and_then(|k| k.key_char).as_deref(), Some("Á"));
     }
 
+    /// Windows only: `route_key` withholds a plain dead key from `on_key`.
+    #[test]
+    fn only_windows_withholds_a_plain_dead_key_from_on_key() {
+        let d = dead("´", "´", Modifiers::default());
+        assert!(!passes_to_on_key(&d, true));
+        assert!(passes_to_on_key(&d, false));
+        assert!(passes_to_on_key(&altgr("e", "€"), true));
+        assert!(passes_to_on_key(&typed(plain("n", "ñ")), true));
+        assert!(passes_to_on_key(&dead("4", "~", ctrl_alt()), true));
+    }
+
     /// Windows (#1312): a plain dead key is flagged and bare; nothing with a
     /// modifier, no accent or no flag is.
     #[test]
@@ -1059,10 +1082,11 @@ mod tests {
         assert!(!plain_dead_key(&empty));
     }
 
-    /// Windows (#1312): AltGr with a Project cell or prompt open is typed
-    /// once from its WM_CHAR, and nothing once the edit closed.
+    /// Windows (#1312): the debt is the field's whatever the field is (a
+    /// dialog, a Project cell or prompt): typed once from the WM_CHAR, and
+    /// nothing once it closed.
     #[test]
-    fn altgr_in_a_project_edit_is_typed_by_its_wm_char() {
+    fn altgr_under_any_text_field_is_typed_by_its_wm_char() {
         let at = t0();
         let mut ime = ImeState::default();
         ime.typed_key(&altgr("q", "@"), at, true);
