@@ -882,3 +882,66 @@
   what the toolbar's ticks and combo values show. The lists are fixed (8 fonts, sizes 8 to 72, 8 colours): the
   suite has no font enumeration. The task buttons dispatch AddLink,
   UnlinkTasks, Outdent, Indent and Task Details (`Constraint`).
+
+## Suite inline pictures (#1432)
+
+- The suite's `paragraph_el` Raw arm draws an inline `w:drawing` picture as
+  `gpui::img` (`ObjectFit::Fill`) inside the same one-offset box #768 drew as a
+  frame; box size, offsets, caret and `block_height_est` are unchanged. The
+  border shows only when no pixels do: the rid does not resolve, or the bytes
+  are not PNG/JPEG/GIF/BMP by `docxcore::image::sniff` (WMF/EMF/SVG/TIFF keep
+  the frame). Pixels that sniff but fail to decode in gpui draw nothing.
+- `docxcore::image::inline_embed` is the rid (same inline-only guards as
+  `inline_extent`, and only when `a:graphicData` is a picture: a group or shape
+  holding blips is not one). `suite/docxy/src/pictures.rs` resolves it through
+  the story part's own relationships (`Package::part_rel_target`: relative to
+  the part's own folder, `..`, absolute; external or escaping targets none): the same rid names
+  different media in `document.xml.rels` and a header's, so `RenderCtx::pics` /
+  `pictures::Scope` carry the story's part name (the body's, the open
+  header/footer's `HfEdit::part_name`, or the page's header/footer part).
+- `DocTab::pictures` keeps the `Arc<gpui::Image>`s per (part, rid) across
+  frames, so only a miss reads, copies and hashes media. It is valid for one
+  `Package::parts_stamp` (a fresh value from a process-wide counter on every
+  mutable access to the parts, equal in an unchanged clone): any package change
+  empties it, so a header edit re-reads that tab's pictures once. Decoded
+  images stay in gpui's asset cache for the process (no `remove_asset`).
+  A run whose rid is missing from its story's relationships (pasted from
+  another story keeps its source rid) keeps its frame.
+- Out of scope: anchored pictures, `a:srcRect` cropping, rotation, alt text,
+  the flow view's non-inline cases, PDF export, wasm hosts. The harness reports
+  no pictures, so there is no `.uit` case.
+
+## Run styles (#1427)
+
+- The suite draws a run through `run_look::RunStyler` (sheet, the cell's table
+  `RunLook`, the paragraph's style), i.e. `StyleSheet::shown_run`: table style <
+  paragraph style (basedOn) < character style (basedOn) < direct, for bold,
+  italic, underline, strike, colour, size and font family. It starts from
+  nothing: `docDefaults` and the default paragraph style (Normal) are NOT
+  applied, except to a paragraph whose `pStyle` names Normal; the paragraph
+  chain stops before Normal when reached through `basedOn` (a visible change to every document, left for its own issue). A
+  direct explicit-off (`<w:b w:val="0"/>`, in `raw_props`) beats every style;
+  the character style beats the paragraph style outright (Word's toggle XOR
+  between them is not modelled). `emit_words` and `Measurer::width_in` use the
+  run's font family and `run_look::run_size_px` (a style's or direct `w:sz`,
+  scaled by zoom), so tab positions match what is drawn; an unavailable
+  family falls back in gpui (`resolve_font`).
+- `DocTab::run_styles` (`run_look::Cache`) parses `word/styles.xml` once per
+  change of the part (a moved `Package::parts_stamp` with other part text does
+  not reparse). `Docxy::render` hands the same text to the body and open
+  header/footer editor with `Editor::set_styles_xml`.
+- With a styles context, Bold/Italic read and write over the styles
+  (`Editor::toggle_run_prop`, per run): off over a style that makes the text
+  bold writes `<w:b w:val="0"/>` (also at a caret, via `PendingFormat`'s
+  `over`: `Over::Off`), on again drops it and inherits. Without a context (terminal
+  `docxy`, wasm hosts) toggles are unchanged. `Editor::caret_props_shown` is
+  the ribbon on-state; the harness `run` reports `shown_bold`/`shown_italic`.
+  Twins: turning on writes `w:b` with `w:bCs` when the run had the twin; off
+  over a style keeps the twin's `w:val="0"` in the shadow only (the primary's
+  also in `raw_props`, as the loader keeps it); inheriting drops both. The
+  sheet has no complex-script model, so off then on under a style with `w:b`
+  but no `w:bCs` drops the run's direct `w:bCs` (known gap).
+  Out of scope: underline/strike explicit-off, caps/highlight/spacing from
+  styles, table style size/font, `block_height_est` for styled sizes.
+  `uiharness/cases/doc-run-styles.uit` was written without being run (macOS
+  cannot drive the window).

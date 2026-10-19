@@ -1604,11 +1604,25 @@ fn ref_to_string(r: &CellRef) -> String {
 }
 
 /// Print an AST back to formula text (no leading `=`), with minimal parens.
+///
+/// Numbers are printed so they read back as the same `f64` (a reprint after a
+/// structural edit must not round constants); [`to_string_display`] is the
+/// 15-digit General spelling.
 pub fn to_string(e: &Expr) -> String {
+    Printer {
+        exact_nums: true,
+        ..Printer::default()
+    }
+    .print(e)
+}
+
+/// [`to_string`] with numbers as General shows them (15 significant digits):
+/// for text shown to the user, such as the values Evaluate Formula steps to.
+pub fn to_string_display(e: &Expr) -> String {
     Printer::default().print(e)
 }
 
-/// [`to_string`] of `e`, and where in that text `target` (a node inside `e`,
+/// [`to_string_display`] of `e`, and where in that text `target` (a node inside `e`,
 /// found by address) is printed: the byte range of its own text, without any
 /// parentheses its parent put round it. Evaluate Formula underlines it.
 /// `None` when `target` is not a node of `e`.
@@ -1639,6 +1653,9 @@ struct Printer {
     /// `A1#`, `_xlfn.SINGLE(…)` for `@x`, `_xlpm.` on LET/LAMBDA names, and
     /// numbers that read back exactly.
     file: bool,
+    /// Numbers that read back exactly, in the in-memory spelling
+    /// ([`to_string`]); `file` implies it.
+    exact_nums: bool,
     /// The LET/LAMBDA names bound around the expression being printed
     /// (file spelling only), without their `_xlpm.` prefix, and whether each
     /// may hold a lambda (see [`Printer::func`]).
@@ -1821,6 +1838,15 @@ impl Printer {
     fn num(&self, n: f64) -> String {
         if self.file {
             file_num(n)
+        } else if self.exact_nums {
+            // As General lays it out (plain digits from 1e-10 to 1e21), with
+            // every digit.
+            let a = n.abs();
+            if n.is_finite() && (1e-10..1e21).contains(&a) {
+                format!("{n}")
+            } else {
+                file_num(n)
+            }
         } else {
             fmt_general(n)
         }
@@ -6849,43 +6875,51 @@ pub(crate) fn future_prefix(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Turn formula text as held in memory (the user's spelling) into the text a
-/// file stores: the inverse of [`display_formula`]. Post-2007 functions get
-/// their `_xlfn.` prefix, `A1#` becomes `_xlfn.ANCHORARRAY(A1)`, `@x` becomes
-/// `_xlfn.SINGLE(x)`, and LET/LAMBDA names get `_xlpm.`.
-///
-/// Text that needs nothing, including text already in file spelling, comes
-/// back unchanged (borrowed). A formula that only needs function prefixes has
-/// them inserted in place (and those names uppercased), keeping the rest byte
-/// for byte; one with `#`, `@`, LET or LAMBDA is parsed and printed again
-/// (spacing is not kept, values are). Text that doesn't lex is returned as it
-/// is. Text that doesn't parse only gets its function prefixes (LET and
-/// LAMBDA included); its `#`, `@` and LET/LAMBDA names stay as they are.
-///
-/// The save runs every formula through this, loaded ones too, since there is
-/// no record of which text is still as loaded. So a bare post-2007 name in a
-/// file (a producer that left the prefix off, or a VBA function an old Excel
-/// file named `TEXTJOIN`) is saved as the builtin.
-pub fn file_formula(src: &str) -> Cow<'_, str> {
+/// The tokens of `src` with their start offsets; `None` when it doesn't lex.
+fn lex_all(src: &str) -> Option<Vec<(usize, Tok)>> {
     let mut lex = Lexer::new(src);
-    let mut toks: Vec<(usize, Tok)> = Vec::new();
+    let mut toks = Vec::new();
     loop {
         while lex.pos < lex.src.len() && (lex.src[lex.pos] as char).is_whitespace() {
             lex.pos += 1;
         }
         let start = lex.pos;
         match lex.next_tok() {
-            Ok(Tok::Eof) => break,
+            Ok(Tok::Eof) => return Some(toks),
             Ok(t) => toks.push((start, t)),
-            Err(_) => return Cow::Borrowed(src),
+            Err(_) => return None,
         }
     }
+}
+
+/// Does `src` name a function or LET/LAMBDA parameter in file spelling
+/// (`_xlfn.`, `_xlws.`, `_xlpm.`)? Text that doesn't lex counts as one.
+pub fn has_file_prefix(src: &str) -> bool {
+    lex_all(src).is_none_or(|toks| {
+        toks.iter().any(|(_, t)| {
+            matches!(t, Tok::Ident(id) if ["_xlfn", "_xlws", "_xlpm"]
+                .iter()
+                .any(|p| id.get(..5).is_some_and(|h| h.eq_ignore_ascii_case(p))))
+        })
+    })
+}
+
+/// A function name's `(start, end, prefix)` in formula text.
+type Splice = (usize, usize, &'static str);
+
+/// What [`file_formula`] has to do to `src`: whether the AST must be printed
+/// again, and the `(start, end, prefix)` of each function name that needs a
+/// prefix. `None` when the text doesn't lex.
+fn file_scan(src: &str) -> Option<(bool, Vec<Splice>)> {
+    let toks = lex_all(src)?;
     let mut reprint = false;
     // (start, end, prefix) of each function name that needs a prefix.
-    let mut splices: Vec<(usize, usize, &str)> = Vec::new();
+    let mut splices: Vec<Splice> = Vec::new();
     for (i, (start, t)) in toks.iter().enumerate() {
         match t {
             Tok::Hash | Tok::At => reprint = true,
+            // The file grammar has no `@`: `[@Col]` is `[#This Row],[Col]`.
+            Tok::Bracket(spec) if spec.starts_with('@') => reprint = true,
             Tok::Ident(id) if matches!(toks.get(i + 1), Some((_, Tok::LParen))) => {
                 // These change shape (`SINGLE(x)` is `@x`) or bind names,
                 // which only the AST can see; the splice prefixes them only
@@ -6903,6 +6937,44 @@ pub fn file_formula(src: &str) -> Cow<'_, str> {
             _ => {}
         }
     }
+    Some((reprint, splices))
+}
+
+/// Does save's [`file_formula`] change `src` by function-name prefixes alone
+/// (a bare post-2007 name)? A formula that needs its AST printed again (`#`,
+/// `@`, LET, LAMBDA, ...) is not one.
+pub fn only_prefixes_added(src: &str) -> bool {
+    matches!(file_scan(src), Some((false, splices)) if !splices.is_empty())
+}
+
+/// Turn formula text as held in memory (the user's spelling) into the text a
+/// file stores: the inverse of [`display_formula`]. Post-2007 functions get
+/// their `_xlfn.` prefix, `A1#` becomes `_xlfn.ANCHORARRAY(A1)`, `@x` becomes
+/// `_xlfn.SINGLE(x)`, and LET/LAMBDA names get `_xlpm.`.
+///
+/// Text that needs nothing, including text already in file spelling, comes
+/// back unchanged (borrowed). A formula that only needs function prefixes has
+/// them inserted in place (and those names uppercased), keeping the rest byte
+/// for byte; one with `#`, `@`, LET or LAMBDA is parsed and printed again
+/// (spacing is not kept, values are). Text that doesn't lex is returned as it
+/// is. Text that doesn't parse only gets its function prefixes (LET and
+/// LAMBDA included); its `#`, `@` and LET/LAMBDA names stay as they are.
+///
+/// A structured `[@Col]` / `Table[@Col]` is written `[#This Row],[Col]`, as
+/// the file grammar has no `@`.
+///
+/// The save runs every formula through this, with one exception: a worksheet
+/// cell's `<f>` still as loaded and differing only by function prefixes is
+/// written back as loaded ([`crate::sheet::CellMeta::loaded_f`]), since a bare
+/// post-2007 name there may be a VBA function named `TEXTJOIN`. Defined
+/// names, conditional formatting, validation and table formulas are always
+/// run through this, so a bare post-2007 name in one is saved as the builtin.
+/// A shared group whose master already holds a prefixed name is not kept as
+/// loaded either (its followers are reprints, which drop the prefix).
+pub fn file_formula(src: &str) -> Cow<'_, str> {
+    let Some((reprint, splices)) = file_scan(src) else {
+        return Cow::Borrowed(src);
+    };
     if reprint {
         if let Ok(e) = parse(src) {
             let mut p = Printer {
@@ -17004,14 +17076,80 @@ mod tests {
         // The operators typed as their function spelling.
         assert_eq!(file("SINGLE(A1:A3)"), "_xlfn.SINGLE(A1:A3)");
         assert_eq!(file("ANCHORARRAY(B2)"), "_xlfn.ANCHORARRAY(B2)");
-        // A structured `@` is this-row, not the operator.
-        for src in [
-            "Sales[@Amount]*2",
-            "[@Amount]*2",
-            "Sales[[#This Row],[Amount]]",
+        // A structured `@` is this-row, not the operator, and the file
+        // grammar spells it `[#This Row]`.
+        for (typed, saved) in [
+            ("Sales[@Amount]*2", "Sales[[#This Row],[Amount]]*2"),
+            ("[@Amount]*2", "[[#This Row],[Amount]]*2"),
+            ("[@[Col A]]+1", "[[#This Row],[Col A]]+1"),
         ] {
-            assert!(matches!(file_formula(src), Cow::Borrowed(_)), "{src}");
+            assert_eq!(file(typed), saved, "{typed}");
+            assert_eq!(file(saved), saved, "{saved} is already file spelling");
         }
+        assert!(matches!(
+            file_formula("Sales[[#This Row],[Amount]]"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn to_string_keeps_every_digit_of_a_constant() {
+        for src in [
+            "A1*1.23456789E-12",
+            "1/0.30000000000000004",
+            "A1+123456789012345680000",
+        ] {
+            let ast = parse(src).unwrap();
+            assert_eq!(parse(&to_string(&ast)).unwrap(), ast, "{src}");
+        }
+        assert_eq!(
+            to_string(&parse("A1*1.23456789E-12").unwrap()),
+            "A1*1.23456789E-12"
+        );
+        // Ordinary numbers print as before.
+        assert_eq!(to_string(&parse("0.1+1.5*100").unwrap()), "0.1+1.5*100");
+        // The display spelling still rounds.
+        let e = Expr::Num(0.1 + 0.2);
+        assert_eq!(to_string_display(&e), "0.3");
+        assert_eq!(to_string(&e), "0.30000000000000004");
+        // The lexer keeps 15 digits, as Excel does a typed constant.
+        for n in [
+            1e-5,
+            1e21,
+            123456789012345000000.0,
+            1.5e25,
+            1e-12,
+            0.1,
+            100.0,
+        ] {
+            let back = parse(&file_num(n)).unwrap();
+            assert!(matches!(back, Expr::Num(m) if m == n), "{n}");
+        }
+    }
+
+    #[test]
+    fn a_reprint_shows_small_constants_as_plain_decimals() {
+        // General's layout (plain from 1e-10), only with every digit.
+        assert_eq!(
+            translate_formula("A1*0.000001", 1, 0).unwrap(),
+            "A2*0.000001"
+        );
+        assert_eq!(
+            to_string(&parse("0.000001234567").unwrap()),
+            "0.000001234567"
+        );
+        assert_eq!(to_string(&parse("1E-11").unwrap()), "1E-11");
+        assert_eq!(to_string(&parse("1.5E+25").unwrap()), "1.5E+25");
+        // The file spelling keeps its own cut-off.
+        assert_eq!(file("A1*0.000001"), "A1*0.000001");
+        assert_eq!(file("A1*0.000001").len(), "A1*0.000001".len());
+    }
+
+    #[test]
+    fn structural_edit_keeps_constant_digits() {
+        // The reprint behind a fill, a shared formula and a row insert.
+        let out = translate_formula("A1*1.23456789E-12", 1, 0).unwrap();
+        assert_eq!(out, "A2*1.23456789E-12");
     }
 
     #[test]

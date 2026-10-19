@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 
 use crate::hf::{doc_part_gallery, is_sdt_close, is_sdt_open, matching_close};
-use crate::model::{Block, Inline};
+use crate::model::{Block, Inline, Row};
 
 /// The `w:docPartGallery` value of a cover page.
 pub const COVER_GALLERY: &str = "Cover Pages";
@@ -394,11 +394,36 @@ fn block_placeholders(blocks: &[Block], out: &mut Pieces) {
             }
             Block::Paragraph(p) => inline_placeholders(&p.content, out),
             Block::Table(t) => {
-                for cell in t.rows.iter().flat_map(|r| &r.cells) {
-                    block_placeholders(&cell.blocks, out);
+                for row in &t.rows {
+                    row_placeholders(row, out);
+                    for cell in &row.cells {
+                        block_placeholders(&cell.blocks, out);
+                    }
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// Collect the text of every placeholder control around cells of `row` (such as
+/// Word's Abstract, `w:sdt` around `w:tc`) into `out`: the paragraphs of its
+/// cells, joined with line breaks.
+fn row_placeholders(row: &Row, out: &mut Pieces) {
+    for (c, cell) in row.cells.iter().enumerate() {
+        for (k, open) in cell.sdt_open.iter().enumerate() {
+            let Some(field) = placeholder_of(open) else {
+                continue;
+            };
+            let last = row.cell_control_end(c, k);
+            let text = row.cells[c..=last]
+                .iter()
+                .flat_map(|cell| &cell.blocks)
+                .filter(|b| matches!(b, Block::Paragraph(_) | Block::Table(_)))
+                .map(Block::plain_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            out.entry(field).or_default().push(text);
         }
     }
 }
