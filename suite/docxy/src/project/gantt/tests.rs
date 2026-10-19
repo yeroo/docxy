@@ -731,6 +731,49 @@ fn ruled_rows_carry_their_row_and_tier_lines_follow_the_timescale() {
     );
 }
 
+/// #1575 r2: the Status Date line is the plan's `StatusDate` option alone;
+/// a plan with a current date and no status date draws the Current Date line
+/// and no Status Date line, however the latter is styled.
+#[test]
+fn a_status_date_line_needs_a_status_date() {
+    use projcore::formatting::gridlines::{Gridline, Gridlines, Line};
+    // Two days after the plan's start, inside a 2000 px chart.
+    let p = untitled_project();
+    let start = p.start_date.unwrap();
+    let day = |n: i64| projcore::DateTime::from_minutes(start.minutes() + n * 1440).to_mspdi();
+    let view = |status: Option<i64>| {
+        let mut p = untitled_project();
+        p.tasks = vec![task(1, 1, 1)];
+        p.set_option("CurrentDate", Some(&day(2)));
+        if let Some(n) = status {
+            p.set_option("StatusDate", Some(&day(n)));
+        }
+        let mut v = ProjectView::new(p, false);
+        v.layout(2000.);
+        v
+    };
+    let v = view(None);
+    let scale = v.chart_scale();
+    let mut grid = Gridlines::default();
+    grid.set(Line::CurrentDate, Gridline::solid());
+    grid.set(Line::StatusDate, Gridline::solid());
+    let lines: Vec<Line> = date_lines(&v.ed, &grid, scale, 0., scale.width())
+        .into_iter()
+        .map(|(line, _, _)| line)
+        .collect();
+    assert!(lines.contains(&Line::CurrentDate), "{lines:?}");
+    assert!(!lines.contains(&Line::StatusDate), "{lines:?}");
+    // With a status date of its own the line draws there.
+    let v = view(Some(1));
+    let xs: Vec<(Line, f32)> = date_lines(&v.ed, &grid, scale, 0., scale.width())
+        .into_iter()
+        .map(|(line, _, x)| (line, x))
+        .collect();
+    let at = |l: Line| xs.iter().find(|(line, _)| *line == l).map(|(_, x)| *x);
+    assert!(at(Line::StatusDate).is_some());
+    assert!(at(Line::StatusDate) < at(Line::CurrentDate), "{xs:?}");
+}
+
 #[test]
 fn filler_rows_count_the_ruled_space_below_the_last_task() {
     assert_eq!(filler_rows(280., 0., 0), 10);

@@ -23,14 +23,6 @@ pub enum LineType {
 }
 
 impl LineType {
-    pub const ALL: [LineType; 5] = [
-        LineType::None,
-        LineType::Solid,
-        LineType::Dotted,
-        LineType::ShortDashed,
-        LineType::LongDashed,
-    ];
-
     pub fn name(self) -> &'static str {
         match self {
             LineType::None => "none",
@@ -441,7 +433,13 @@ mod tests {
         assert_eq!(Line::ALL[0].name(), "Gantt Rows");
         assert_eq!(Line::ALL[9].name(), "Page Breaks");
         assert_eq!(Line::parse("Rows"), None);
-        for t in LineType::ALL {
+        for t in [
+            LineType::None,
+            LineType::Solid,
+            LineType::Dotted,
+            LineType::ShortDashed,
+            LineType::LongDashed,
+        ] {
             assert_eq!(LineType::parse(t.name()), Some(t));
         }
         assert_eq!(LineType::parse(""), Some(LineType::None));

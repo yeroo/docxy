@@ -832,7 +832,9 @@
   fourteen as drawn.
 - The suite draws from it in `project/gantt.rs`: `body_grid` paints the
   table's Sheet Rows and Sheet Columns, the chart's Gantt Rows, the tier
-  columns (`tier_lines`: bottom = the minor tier, middle and top = the major,
+  columns (`tier_lines`: bottom = the minor tier, middle = the major, the
+  header's two tiers being Project's middle and bottom, so the Top Tier
+  Column is kept undrawn like Bar Rows until a three-tier header exists;
   each line's interval index counted from the scale's origin so the pattern
   stays put as the chart scrolls; `bottom_tier_lines` follows the bottom
   tier's unit, so at the Weeks level it draws a line per week where the old

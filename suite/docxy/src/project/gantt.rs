@@ -392,9 +392,11 @@ pub(crate) fn paint_rule(
 }
 
 /// The left edge of each visible cell of a timescale tier, relative to the
-/// chart viewport (#1575): the Top, Middle and Bottom Tier Column lines. The
-/// chart's header draws two tiers (`zoom::tiers`), so the top tier is the
-/// major one and the middle tier the same; the bottom tier is the minor.
+/// chart viewport, with the cell's ordinal from the scale's origin (#1575):
+/// the Middle and Bottom Tier Column lines. The chart's header draws two
+/// tiers (`zoom::tiers`, Project's middle and bottom), so the middle tier is
+/// the major unit and the bottom the minor; the Top Tier Column has no tier
+/// to draw on and is kept in the model undrawn, like Bar Rows.
 pub(crate) fn tier_lines(
     scale: GanttScale,
     offset: f32,
@@ -403,11 +405,21 @@ pub(crate) fn tier_lines(
 ) -> Vec<(usize, f32)> {
     let level = &zoom::LEVELS[zoom::nearest(scale.day_w)];
     let unit = if minor { level.minor } else { level.major };
-    // Within the viewport, and never past the scale's last day.
-    zoom::tier(scale, unit, offset, width)
+    // Within the viewport, and never past the scale's last day. The cells
+    // are consecutive unit starts, so the walk from the origin happens once,
+    // for the first, and the rest count up from it.
+    let cells: Vec<zoom::Cell> = zoom::tier(scale, unit, offset, width)
         .into_iter()
         .filter(|c| c.x < scale.width())
-        .map(|c| (zoom::tier_index(scale, unit, c.x), c.x - offset))
+        .collect();
+    let Some(first) = cells.first() else {
+        return Vec::new();
+    };
+    let base = zoom::tier_index(scale, unit, first.x);
+    cells
+        .into_iter()
+        .enumerate()
+        .map(|(k, c)| (base + k, c.x - offset))
         .filter(|(_, x)| (0. ..width).contains(x))
         .collect()
 }
@@ -437,8 +449,9 @@ pub(crate) fn instant_x(scale: GanttScale, offset: f32, at: projcore::DateTime) 
 
 /// The chart's date lines (#1575): each line that draws, with its x in the
 /// viewport, in list order. The current date is Project's `CurrentDate`
-/// option, the status date the plan's, the project start and finish the
-/// schedule's.
+/// option, the status date the plan's `StatusDate` option (no fallback to
+/// the current date: a plan without a status date draws no Status Date
+/// line), the project start and finish the schedule's.
 pub(crate) fn date_lines(
     ed: &projcore::editor::Editor,
     grid: &Gridlines,
@@ -448,14 +461,12 @@ pub(crate) fn date_lines(
 ) -> Vec<(Line, Gridline, f32)> {
     let proj = ed.project();
     let sched = ed.schedule();
-    let current = proj
-        .option("CurrentDate")
-        .and_then(projcore::DateTime::parse_mspdi);
+    let date_option = |name: &str| proj.option(name).and_then(projcore::DateTime::parse_mspdi);
     [
-        (Line::CurrentDate, current),
+        (Line::CurrentDate, date_option("CurrentDate")),
         (Line::ProjectStart, Some(sched.project_start)),
         (Line::ProjectFinish, Some(sched.project_finish)),
-        (Line::StatusDate, proj.status_date()),
+        (Line::StatusDate, date_option("StatusDate")),
     ]
     .into_iter()
     .filter_map(|(line, at)| {
@@ -640,13 +651,14 @@ pub(crate) fn body_grid(view: &ProjectView, pal: Pal) -> impl IntoElement {
                         gridline_color(c, day_rule),
                     );
                 }
-                for line in [Line::MiddleTierColumn, Line::TopTierColumn] {
-                    let style = grid.get(line);
-                    if style.draws() {
-                        for (k, x) in tier_lines(scale, gantt_x, width, false) {
-                            let (t, c) = style.style_at(k);
-                            vline(window, chart.origin.x + px(x), t, gridline_color(c, rule));
-                        }
+                // The major tier is the header's upper tier, Project's
+                // middle; the Top Tier Column stays undrawn until a header
+                // with three tiers exists.
+                let middle = grid.get(Line::MiddleTierColumn);
+                if middle.draws() {
+                    for (k, x) in tier_lines(scale, gantt_x, width, false) {
+                        let (t, c) = middle.style_at(k);
+                        vline(window, chart.origin.x + px(x), t, gridline_color(c, rule));
                     }
                 }
                 hlines(

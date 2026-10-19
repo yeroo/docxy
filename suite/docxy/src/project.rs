@@ -11,7 +11,6 @@ use std::cell::Cell;
 use std::path::Path;
 use std::rc::Rc;
 mod gantt;
-pub(crate) use gantt::instant_x;
 pub(super) use gantt::*;
 mod commands;
 pub(super) use commands::*;

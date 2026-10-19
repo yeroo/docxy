@@ -209,8 +209,7 @@ fn day_lines_and_shading_thin_out_when_days_get_narrow() {
     // tier's cells, one line per week where the old chart drew one per day.
     let weeks = scale_at("2026-03-02", 100, 12.);
     let weekly = bottom_tier_lines(weeks, 0., 100., &default);
-    assert!(weekly.len() <= 2, "{weekly:?}");
-    assert!(weekly.iter().all(|(_, x)| x % 84. == 0.), "{weekly:?}");
+    assert_eq!(weekly, [(0, 0.), (1, 84.)], "Monday the 2nd and the 9th");
     // The interval index counts from the scale's origin, not the viewport:
     // day 1's line is index 1 whether the chart is scrolled 0 or 11 px.
     let at0 = tier_lines(wide, 0., 110., true);

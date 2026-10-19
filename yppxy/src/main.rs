@@ -2660,21 +2660,20 @@ struct DateMark {
 
 /// The chart's date gridlines from the plan's formatting (#1575): the
 /// current date (Project's `CurrentDate` option), the project start and
-/// finish and the status date, each when its line is not `none`, in the
-/// line's colour or the scale's. The row and column lines of the model are
-/// not drawn: a terminal cell is a day and a row is a task.
+/// finish and the status date (the `StatusDate` option alone, no fallback to
+/// the current date), each when its line is not `none`, in the line's colour
+/// or the scale's. The row and column lines of the model are not drawn: a
+/// terminal cell is a day and a row is a task.
 fn gridline_marks(ed: &projcore::editor::Editor, origin: i64) -> Vec<DateMark> {
     use projcore::formatting::{LineType, gridlines::Line};
     let proj = ed.project();
     let sched = ed.schedule();
-    let current = proj
-        .option("CurrentDate")
-        .and_then(projcore::DateTime::parse_mspdi);
+    let date_option = |name: &str| proj.option(name).and_then(projcore::DateTime::parse_mspdi);
     [
-        (Line::CurrentDate, current),
+        (Line::CurrentDate, date_option("CurrentDate")),
         (Line::ProjectStart, Some(sched.project_start)),
         (Line::ProjectFinish, Some(sched.project_finish)),
-        (Line::StatusDate, proj.status_date()),
+        (Line::StatusDate, date_option("StatusDate")),
     ]
     .into_iter()
     .filter_map(|(line, at)| {
