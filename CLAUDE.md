@@ -918,11 +918,13 @@
   paragraph style (basedOn) < character style (basedOn) < direct, for bold,
   italic, underline, strike, colour, size and font family. It starts from
   nothing: `docDefaults` and the default paragraph style (Normal) are NOT
-  applied (a visible change to every document, left for its own issue). A
+  applied, except to a paragraph whose `pStyle` names Normal; the paragraph
+  chain stops before Normal when reached through `basedOn` (a visible change to every document, left for its own issue). A
   direct explicit-off (`<w:b w:val="0"/>`, in `raw_props`) beats every style;
   the character style beats the paragraph style outright (Word's toggle XOR
   between them is not modelled). `emit_words` and `Measurer::width_in` use the
-  run's font family, so tab positions match what is drawn; an unavailable
+  run's font family and `run_look::run_size_px` (a style's or direct `w:sz`,
+  scaled by zoom), so tab positions match what is drawn; an unavailable
   family falls back in gpui (`resolve_font`).
 - `DocTab::run_styles` (`run_look::Cache`) parses `word/styles.xml` once per
   change of the part (a moved `Package::parts_stamp` with other part text does

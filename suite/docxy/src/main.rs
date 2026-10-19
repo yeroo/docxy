@@ -30699,6 +30699,7 @@ fn emit_words(
     click: Option<Click>,
     seg_start: usize,
     pal: Pal,
+    zoom: f32,
 ) {
     let mut off = seg_start;
     for word in text.split_inclusive(' ') {
@@ -30707,10 +30708,7 @@ fn emit_words(
         }
         let word_off = off;
         off += word.chars().count();
-        let mut size = props
-            .size_half_pts
-            .map(|h| h as f32 / 2.0 * 1.333)
-            .unwrap_or(base);
+        let mut size = run_look::run_size_px(props, base, zoom);
         // Superscript / subscript render ~0.7× and are nudged up/down.
         let vshift = match props.vert_align {
             VertAlign::Superscript => {
@@ -30836,6 +30834,7 @@ fn emit_run(
     click: Option<Click>,
     pal: Pal,
     caret_h: f32,
+    zoom: f32,
 ) {
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
@@ -30876,6 +30875,7 @@ fn emit_run(
             click,
             start + a,
             pal,
+            zoom,
         );
     }
     if *caret == Some(end) {
@@ -31345,10 +31345,7 @@ fn inline_width(
     match it {
         Inline::Run(r) => {
             let props = styler.shown(r);
-            let sz = props
-                .size_half_pts
-                .map(|h| h as f32 / 2.0 * 1.333)
-                .unwrap_or(base);
+            let sz = run_look::run_size_px(&props, base, zoom);
             m.width_in(&r.text, sz, props.bold, props.italic, props.font.as_deref())
         }
         // Its shown text ([`field_shown`]) and its 2 px padding each side.
@@ -31572,6 +31569,7 @@ fn emit_revision_text(
     base: f32,
     pal: Pal,
     styler: run_look::RunStyler,
+    zoom: f32,
 ) {
     for inline in content {
         match inline {
@@ -31591,6 +31589,7 @@ fn emit_revision_text(
                     None,
                     pal,
                     19.0,
+                    zoom,
                 );
             }
             Inline::Hyperlink(h) => {
@@ -31608,12 +31607,13 @@ fn emit_revision_text(
                         None,
                         pal,
                         19.0,
+                        zoom,
                     );
                 }
-                emit_revision_text(out, &h.content, base, pal, styler);
+                emit_revision_text(out, &h.content, base, pal, styler, zoom);
             }
             Inline::Revision { content, .. } => {
-                emit_revision_text(out, content, base, pal, styler)
+                emit_revision_text(out, content, base, pal, styler, zoom)
             }
             _ => {}
         }
@@ -31791,10 +31791,7 @@ fn paragraph_el(
         match m {
             Some(m) => {
                 let props = styler.shown(r);
-                let sz = props
-                    .size_half_pts
-                    .map(|h| h as f32 / 2.0 * 1.333)
-                    .unwrap_or(base);
+                let sz = run_look::run_size_px(&props, base, zoom);
                 m.width_in(&r.text, sz, props.bold, props.italic, props.font.as_deref())
             }
             None => 0.0,
@@ -31868,6 +31865,7 @@ fn paragraph_el(
                     click,
                     pal,
                     caret_h,
+                    zoom,
                 );
                 x += run_w(r);
             }
@@ -31897,7 +31895,7 @@ fn paragraph_el(
                 // A tracked change is shown, not edited here: its text takes no
                 // caret offsets (the engine counts it as none), and carries the
                 // underline / strike cue the loader gave its runs.
-                emit_revision_text(&mut spans, content, base, pal, styler);
+                emit_revision_text(&mut spans, content, base, pal, styler, zoom);
             }
             Inline::Raw(xml) => {
                 // An alignment tab (#768) places the text after it against the

@@ -47,6 +47,15 @@ impl<'a> RunStyler<'a> {
     }
 }
 
+/// A run's text size in px at `zoom`: its own or its styles' `w:sz` (half
+/// points, 96 dpi), else `base` (the paragraph's, already zoomed). The one
+/// conversion drawing, tab widths and inline widths share (#1427).
+pub fn run_size_px(props: &RunProps, base: f32, zoom: f32) -> f32 {
+    props
+        .size_half_pts
+        .map_or(base, |h| zoom * h as f32 / 2.0 * 1.333)
+}
+
 /// A tab's parsed `word/styles.xml`, kept across frames. It is read again
 /// only when the package's parts moved ([`Package::parts_stamp`]) and the
 /// styles part is not the text already held, so a body edit parses nothing.
@@ -55,18 +64,18 @@ pub struct Cache {
     stamp: Option<u64>,
     xml: Option<Arc<str>>,
     sheet: Option<Rc<StyleSheet>>,
-    /// How often the part was parsed (tests).
-    pub parses: usize,
+    /// How often the part was parsed.
+    #[cfg(test)]
+    parses: usize,
 }
 
 impl Cache {
     /// The styles text and sheet of `pkg`; `None`s without a package or part.
     pub fn current(&mut self, pkg: Option<&Package>) -> (Option<Arc<str>>, Option<Rc<StyleSheet>>) {
         let Some(pkg) = pkg else {
-            *self = Cache {
-                parses: self.parses,
-                ..Cache::default()
-            };
+            self.stamp = None;
+            self.xml = None;
+            self.sheet = None;
             return (None, None);
         };
         let stamp = pkg.parts_stamp();
@@ -77,10 +86,11 @@ impl Cache {
                 .and_then(|b| std::str::from_utf8(b).ok());
             if self.xml.as_deref() != text {
                 self.xml = text.map(Arc::from);
-                self.sheet = text.map(|t| {
+                #[cfg(test)]
+                if text.is_some() {
                     self.parses += 1;
-                    Rc::new(parse_styles_xml(t))
-                });
+                }
+                self.sheet = text.map(|t| Rc::new(parse_styles_xml(t)));
             }
         }
         (self.xml.clone(), self.sheet.clone())
@@ -131,6 +141,17 @@ mod tests {
         assert!(plain.shown(&strong).bold);
         assert!(!plain.shown(&plain_run).bold, "no style, no change");
         assert!(matches!(plain.shown(&plain_run), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn a_runs_size_scales_with_zoom_and_falls_back_to_the_paragraphs() {
+        let styled = RunProps {
+            size_half_pts: Some(32),
+            ..Default::default()
+        };
+        assert!((run_size_px(&styled, 14.5, 1.0) - 21.328).abs() < 1e-3);
+        assert!((run_size_px(&styled, 29.0, 2.0) - 42.656).abs() < 1e-3);
+        assert_eq!(run_size_px(&RunProps::default(), 29.0, 2.0), 29.0);
     }
 
     #[test]
