@@ -1036,6 +1036,11 @@ fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
 struct FieldCollapse {
     /// The open fields, outermost first.
     open: Vec<OpenFieldSpan>,
+    /// While a field is open: each child that needed declarations for
+    /// prefixes a save does not keep, as `(start, end, declared source)`. A
+    /// declaration on the begin run does not reach its sibling runs, so the
+    /// collapsed slice takes these in place of the children's bare source.
+    declared: Vec<(usize, usize, String)>,
 }
 
 struct OpenFieldSpan {
@@ -1061,6 +1066,15 @@ impl FieldCollapse {
         use crate::field::FieldEvent;
         let pushed = &out[n.min(out.len())..];
         let run = p.raw_slice(start, p.pos());
+        // The child has ended, so the scope is its container's, shared by the
+        // siblings; a field this child opens is open from here on.
+        let opens_field = is_run && is_field_code_run(run, pushed) && run.contains("fldCharType");
+        if !self.open.is_empty() || opens_field {
+            let declared = declare_rebuilt(run, &rebuilt_bindings(p));
+            if declared != run {
+                self.declared.push((start, p.pos(), declared));
+            }
+        }
         let code_run = is_run && is_field_code_run(run, pushed);
         // Content is inside every open field, so it rules on all of them.
         let taints = if code_run {
@@ -1072,6 +1086,9 @@ impl FieldCollapse {
             self.open.iter_mut().for_each(|open| open.broken = true);
         }
         if !code_run {
+            if self.open.is_empty() {
+                self.declared.clear();
+            }
             return;
         }
         let events = crate::field::field_events(run);
@@ -1101,12 +1118,35 @@ impl FieldCollapse {
                             outer.broken = true;
                         }
                     } else {
-                        collapse_field(out, open.idx, p.raw_slice(open.start, p.pos()));
+                        let raw = self.declared_slice(p, open.start);
+                        collapse_field(out, open.idx, &raw);
                     }
                 }
                 FieldEvent::Instr(_) | FieldEvent::Separate => {}
             }
         }
+        if self.open.is_empty() {
+            self.declared.clear();
+        }
+    }
+
+    /// The source from `from` to the parser's position, with the children
+    /// inside it that needed declarations replaced by their declared form.
+    fn declared_slice(&self, p: &XmlParser, from: usize) -> String {
+        let end = p.pos();
+        let mut raw = String::new();
+        let mut at = from;
+        for (a, b, declared) in self
+            .declared
+            .iter()
+            .filter(|(a, b, _)| *a >= from && *b <= end)
+        {
+            raw.push_str(p.raw_slice(at, *a));
+            raw.push_str(declared);
+            at = *b;
+        }
+        raw.push_str(p.raw_slice(at, end));
+        raw
     }
 }
 
@@ -1321,10 +1361,10 @@ fn collapse_field(out: &mut Vec<Inline>, idx: usize, raw: &str) {
 fn parse_fld_simple(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {
     // Capture the instruction (e.g. `= 2+2 \# "0.00"`) before advancing.
     let instr = decode_attr(p.attr("w:instr"));
-    let start = p.start_pos();
+    let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
     let mut inner = Vec::new();
     parse_inlines_into(p, rels, &mut inner);
-    let raw = p.raw_slice(start, p.pos()).to_string();
+    let raw = declare_rebuilt(p.raw_slice(start, p.pos()), &bindings);
     let cached: String = inner.iter().map(Inline::text).collect();
     // Recompute the value where we can (formula fields); otherwise show what Word
     // last cached. The original XML is kept verbatim for a lossless save.
@@ -1463,10 +1503,10 @@ fn parse_smart_tag(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline
 /// and distinguishable. The `content` is display-only — save re-emits `raw`.
 fn parse_revision(p: &mut XmlParser, rels: &Relationships, kind: RevisionKind) -> Inline {
     let metadata = parse_revision_metadata(p);
-    let start = p.start_pos();
+    let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
     let mut content = Vec::new();
     parse_inlines_into(p, rels, &mut content);
-    let raw = p.raw_slice(start, p.pos()).to_string();
+    let raw = declare_rebuilt(p.raw_slice(start, p.pos()), &bindings);
     for inl in &mut content {
         mark_revision(inl, kind);
     }
