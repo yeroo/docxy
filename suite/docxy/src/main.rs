@@ -12834,8 +12834,9 @@ fn reopens_from_file(t: &DocTab) -> bool {
 #[cfg(test)]
 mod session_union_tests {
     use super::{
-        DocTab, EditOptions, Kind, Prefs, Session, SessionWrite, ThemePref, sample_doc,
-        session_path_in, write_session_with,
+        DocTab, EditOptions, Kind, Prefs, Session, SessionWrite, Startup, ThemePref,
+        restore_session_noting, sample_doc, session_path_in, startup_session, startup_tabs,
+        trusted, write_session_with,
     };
 
     #[test]
@@ -12923,6 +12924,48 @@ mod session_union_tests {
         for h in &hots {
             assert!(std::path::Path::new(h).exists(), "sidecar written: {h}");
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #806: nothing restored gives the Start screen in a product run and the
+    /// sample document in a harness instance; a restored session is kept.
+    #[test]
+    fn an_empty_start_is_the_start_screen_unless_a_harness_wants_the_sample() {
+        assert!(matches!(
+            startup_tabs(Vec::new(), false),
+            Startup::StartScreen
+        ));
+        match startup_tabs(Vec::new(), true) {
+            Startup::Tabs(tabs) => {
+                assert_eq!(tabs.len(), 1);
+                assert_eq!(tabs[0].title.as_ref(), "sample.docx");
+            }
+            Startup::StartScreen => panic!("the harness fallback is the sample"),
+        }
+        for fallback in [false, true] {
+            match startup_tabs(vec![doc_tab("one.docx", false)], fallback) {
+                Startup::Tabs(tabs) => assert_eq!(tabs.len(), 1),
+                Startup::StartScreen => panic!("a restored tab is never replaced"),
+            }
+        }
+    }
+
+    /// #806: the window with no tab writes a session with none, and reading it
+    /// back restores none (the Start screen again), not a stale sample.
+    #[test]
+    fn a_window_with_no_tab_round_trips_to_the_start_screen() {
+        let root = fresh_root("start-screen");
+        write_session_with(&root, &[], 0, prefs(), SessionWrite::All, &[], 0);
+        let session = startup_session(&root, std::time::SystemTime::now());
+        assert!(session.tabs.is_empty());
+        let (tabs, recovered) = restore_session_noting(
+            &session,
+            false,
+            std::time::SystemTime::now(),
+            &trusted::TrustStore::default(),
+        );
+        assert!(recovered.is_empty());
+        assert!(matches!(startup_tabs(tabs, false), Startup::StartScreen));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -14033,8 +14076,70 @@ mod frame_border_tests {
     }
 }
 
+/// One card of File > New (and of the Start screen).
+struct NewCard {
+    id: &'static str,
+    name: &'static str,
+    sub: &'static str,
+    kind: Kind,
+}
+
+const NEW_CARDS: [NewCard; 4] = [
+    NewCard {
+        id: "new-doc-card",
+        name: "Document",
+        sub: "Blank .docx",
+        kind: Kind::Docx,
+    },
+    NewCard {
+        id: "new-xls-card",
+        name: "Spreadsheet",
+        sub: "Blank workbook",
+        kind: Kind::Xlsx,
+    },
+    NewCard {
+        id: "new-project-card",
+        name: "Project",
+        sub: "Blank schedule",
+        kind: Kind::Project,
+    },
+    NewCard {
+        id: "new-mail-card",
+        name: "Mail",
+        sub: "New message",
+        kind: Kind::Look,
+    },
+];
+
+/// What the first window starts with (#806).
+enum Startup {
+    /// The restored tabs, or the sample document a harness instance falls back to.
+    Tabs(Vec<DocTab>),
+    /// Nothing to restore and no sample: no tab, the File > New page up.
+    StartScreen,
+}
+
+/// The tabs the first window starts with. A restored session is kept whole; an
+/// empty one gives the Start screen, except that a harness instance keeps the
+/// sample document its cases assume (`sample_fallback`, see
+/// [`harness::start_screen_requested`]).
+fn startup_tabs(restored: Vec<DocTab>, sample_fallback: bool) -> Startup {
+    if !restored.is_empty() {
+        Startup::Tabs(restored)
+    } else if sample_fallback {
+        Startup::Tabs(vec![sample_doc().into_tab(
+            Kind::Docx,
+            "sample.docx".into(),
+            None,
+            false,
+        )])
+    } else {
+        Startup::StartScreen
+    }
+}
+
 impl Docxy {
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn new(sample_fallback: bool, cx: &mut Context<Self>) -> Self {
         let root = config_root();
         let session = startup_session(&root, std::time::SystemTime::now());
         set_configured_identity(&session.user_name, &session.user_initials);
@@ -14043,13 +14148,17 @@ impl Docxy {
         recover::mark_running(&root);
 
         let now = std::time::SystemTime::now();
-        let (mut tabs, recovered) =
+        let (tabs, recovered) =
             restore_session_noting(&session, crashed, now, &trusted::TrustStore::load(&root));
-        if tabs.is_empty() {
-            tabs.push(sample_doc().into_tab(Kind::Docx, "sample.docx".into(), None, false));
-        }
+        let (tabs, start_screen) = match startup_tabs(tabs, sample_fallback) {
+            Startup::Tabs(tabs) => (tabs, false),
+            Startup::StartScreen => (Vec::new(), true),
+        };
         let active = session.active.min(tabs.len().saturating_sub(1));
         let mut this = Self::build(tabs, active, session.theme, session.ask_on_close, cx);
+        if start_screen {
+            this.show_start_screen();
+        }
         // New documents continue past the restored ones (#631).
         // The untitled counter is the run's (#587 r2 m10): seed the shared
         // one from the restored titles, then every window mints from it.
@@ -14482,7 +14591,29 @@ impl Docxy {
         self.bs_scroll.set_offset(point(px(0.), px(0.)));
     }
 
+    /// File > New's page: the Document / Spreadsheet / Project / Mail cards.
+    fn show_backstage_new_page(&mut self) {
+        self.bs_new = true;
+        self.bs_export = false;
+        self.bs_templates = doc_templates::personal_templates(&doc_templates::templates_dir());
+        self.bs_account = false;
+        self.bs_info = false;
+        self.bs_info_status = None;
+        self.reset_backstage_scroll();
+    }
+
+    /// The Start screen (#806): the New page over a window with no tab.
+    fn show_start_screen(&mut self) {
+        self.backstage = true;
+        self.show_backstage_new_page();
+    }
+
     fn backstage_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // With no tab there is nothing to go back to: the Start screen stays.
+        if self.tabs.is_empty() {
+            self.show_start_screen();
+            return self.refocus(window, cx);
+        }
         self.backstage = false;
         self.show_backstage_open_page();
         self.refocus(window, cx);
@@ -14545,14 +14676,7 @@ impl Docxy {
             }
             BackstageRailAction::Account => self.open_account(cx),
             BackstageRailAction::New => {
-                self.bs_new = true;
-                self.bs_export = false;
-                self.bs_templates =
-                    doc_templates::personal_templates(&doc_templates::templates_dir());
-                self.bs_account = false;
-                self.bs_info = false;
-                self.bs_info_status = None;
-                self.reset_backstage_scroll();
+                self.show_backstage_new_page();
                 cx.notify();
             }
             BackstageRailAction::Open => self.open_file(window, cx),
@@ -23242,6 +23366,9 @@ impl Docxy {
             self.refocus(window, cx);
             return Err(self.tabs[self.active].status.to_string());
         }
+        if self.tabs.get(self.active).is_none() {
+            return Err("no tab is open".into());
+        }
         let prev = self.tabs[self.active].path.clone();
         let result = apply_save(&mut self.tabs[self.active], target);
         self.note_recent_if_moved(prev);
@@ -23544,6 +23671,10 @@ impl Docxy {
         }
         if changed {
             self.backstage = false;
+            // Every file refused: back to the Start screen, not a bare window.
+            if self.tabs.is_empty() {
+                self.show_start_screen();
+            }
             // The tab under the panel/bar state just changed (or was replaced).
             self.drop_grid_state();
             self.persist(cx);
@@ -37529,42 +37660,9 @@ impl Docxy {
                         .text_color(fg)
                         .child("New"),
                 )
-                .child(
-                    h_flex()
-                        .gap_4()
-                        .child(card(
-                            cx,
-                            "new-doc-card",
-                            Kind::Docx.glyph(),
-                            "Document",
-                            "Blank .docx",
-                            Kind::Docx,
-                        ))
-                        .child(card(
-                            cx,
-                            "new-xls-card",
-                            Kind::Xlsx.glyph(),
-                            "Spreadsheet",
-                            "Blank .xlsx",
-                            Kind::Xlsx,
-                        ))
-                        .child(card(
-                            cx,
-                            "new-project-card",
-                            Kind::Project.glyph(),
-                            "Project",
-                            "Blank schedule",
-                            Kind::Project,
-                        ))
-                        .child(card(
-                            cx,
-                            "new-mail-card",
-                            Kind::Look.glyph(),
-                            "Mail",
-                            "New message",
-                            Kind::Look,
-                        )),
-                )
+                .child(h_flex().gap_4().children(
+                    NEW_CARDS.map(|c| card(cx, c.id, c.kind.glyph(), c.name, c.sub, c.kind)),
+                ))
                 .child(self.personal_templates_section(fg, dim, cx))
                 .into_any_element()
         } else if let Some(page) = self.account_page(bg, fg, dim, cx) {
@@ -43964,7 +44062,7 @@ fn open_docxy_window(
             startup_files,
             read_only,
         } => (
-            cx.new(Docxy::new),
+            cx.new(|cx| Docxy::new(want_harness && !harness::start_screen_requested(), cx)),
             ctl,
             want_harness,
             startup_files,

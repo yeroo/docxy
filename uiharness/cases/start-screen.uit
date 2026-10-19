@@ -1,0 +1,40 @@
+# #806: a launch with nothing to restore and no file shows the Start screen
+# (no tab, the File > New page), not a sample document. `start screen` has the
+# runner start the instance without the sample fallback every other case
+# assumes. Excel FIL-CASE-055 step 1.
+start screen
+
+test issue 806 an empty launch has no tab and the New page up
+  call tab-list {}
+  assert reply.tabs is []
+  assert reply.title_label is doc
+  call backstage {"action":"read"}
+  assert reply.open is true
+  assert reply.new is true
+  assert reply.cards.0.name is Document
+  assert reply.cards.1.name is Spreadsheet
+  assert reply.cards.1.sub is "Blank workbook"
+  assert reply.cards.2.name is Project
+  assert reply.cards.3.name is Mail
+
+test issue 806 Back and Close keep the Start screen while there is no tab
+  call backstage {"action":"close"}
+  call backstage {"action":"read"}
+  assert reply.open is true
+  assert reply.new is true
+  call backstage-page {"page":"new"}
+  call tab-list {}
+  assert reply.tabs is []
+
+test issue 806 the Blank workbook card adds the one workbook tab
+  call new-card {"card":"new-xls-card"}
+  call tab-list {}
+  assert reply.tabs.0.kind is xlsx
+  assert reply.tabs.0.title is Untitled.xlsx
+  assert reply.active is 0
+  call backstage {"action":"read"}
+  assert reply.open is false
+  open copy:../fixtures/basic.xlsx
+  call tab-list {}
+  assert reply.tabs.1.kind is xlsx
+  assert reply.active is 1

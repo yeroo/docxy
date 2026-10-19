@@ -167,6 +167,25 @@
   validation and ToUnicode extraction), so nothing depends on `qpdf` (used too
   when installed) or on fonts being installed.
 
+## Start screen (#806)
+
+- A suite launch with nothing to restore and no file on the command line has
+  no tab and the File > New page up (`Docxy::show_start_screen`; `startup_tabs`
+  decides, `Startup::StartScreen`). A restored session keeps its tabs; files on
+  the command line open over it, and if every one is refused the Start screen
+  comes back. With no tab, Back, Close and Esc on File stay on it
+  (`backstage_back`, `backstage_close`). The New page's cards are `NEW_CARDS`
+  (the Spreadsheet one reads "Blank workbook").
+- A harness instance keeps the sample document as tab 0 (the cases assume it)
+  unless the script says `start screen`: the runner writes the marker
+  `<config root>/docxy/start-screen` into the sandbox, which only a harness
+  instance reads (`harness::start_screen_requested`). `start-screen.uit` drives
+  it (`backstage` read reports `new` and `cards`, `new-card` clicks one).
+- `Docxy` cannot be built in a unit test (no gpui test context), so the
+  zero-tab guards are checked by reading the sites that index
+  `self.tabs[self.active]`: each follows a `tabs.get`/`is_empty` guard, and
+  `save_project_to`, the one that did not, now refuses with "no tab is open".
+
 ## Build info
 
 - `buildinfo` is the one place that stamps binaries (commit, last merged PR, kind,

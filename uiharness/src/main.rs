@@ -476,6 +476,13 @@ fn run_scripts(a: &Args) -> Result<String, String> {
             out.push_str(&format!("  ERROR {e}\n"));
             break;
         }
+        if script.start_screen
+            && let Err(e) = uiharness::launch::request_start_screen(&sandbox)
+        {
+            all_passed = false;
+            out.push_str(&format!("  ERROR {e}\n"));
+            break;
+        }
         // A launch or connect failure stops the run rather than skipping to
         // the next file: the harness or the app is broken, not a case, and
         // the remaining files would hit the same wall. The error lands under

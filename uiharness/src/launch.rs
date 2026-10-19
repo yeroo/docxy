@@ -668,6 +668,19 @@ pub fn built_plugin_name(name: &str) -> String {
     format!("{DLL_PREFIX}{name}{DLL_SUFFIX}")
 }
 
+/// Ask the suite started in `sandbox` for the Start screen (no tab, the
+/// File > New page) instead of the sample document (#806): a marker file in its
+/// config root, which a harness instance reads once at start. The same
+/// sandbox route as [`install_plugins`], so nothing travels in the environment
+/// and a product run has no way to see it.
+pub fn request_start_screen(sandbox: &Path) -> Result<(), String> {
+    let marker = sandbox.join("docxy").join("start-screen");
+    if let Some(dir) = marker.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    std::fs::write(&marker, b"").map_err(|e| format!("{}: {e}", marker.display()))
+}
+
 /// Where the suite started in `sandbox` loads format plugins from: its
 /// config root's `docxy/plugins`.
 pub fn plugins_dir(sandbox: &Path) -> PathBuf {
@@ -944,6 +957,20 @@ mod tests {
     /// A script's `plugin` lines copy the built libraries into the sandbox's
     /// `docxy/plugins` under the name the suite loads; a missing one says
     /// how to build it.
+    /// #806: the marker the suite looks for in its config root.
+    #[test]
+    fn a_start_screen_request_is_a_marker_in_the_sandboxs_config_root() {
+        let sandbox = std::env::temp_dir().join(format!(
+            "uiharness-start-screen-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&sandbox);
+        request_start_screen(&sandbox).unwrap();
+        assert!(sandbox.join("docxy").join("start-screen").is_file());
+        let _ = std::fs::remove_dir_all(&sandbox);
+    }
+
     #[test]
     fn plugins_are_copied_into_the_sandbox_under_the_loaders_name() {
         let base = std::env::temp_dir().join(format!(
