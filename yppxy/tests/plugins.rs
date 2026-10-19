@@ -146,6 +146,44 @@ fn a_ui_plugin_command_runs_headless() {
             .all(|t| t.name != "Renamed by fixture")
     );
 
+    // #1575 r1: the request's `view.gridlines` carries the plan's lines, so
+    // the fixture's `fixture.format` sets them on a plain plan and, seeing
+    // them set in a saved `.yppx`, clears them again.
+    let set = dir.join("set.yppx");
+    let output = yppxy(
+        Some(&plugins),
+        &[
+            &input,
+            Path::new("--command"),
+            Path::new("fixture.format"),
+            Path::new("--save"),
+            &set,
+        ],
+    );
+    ok(&output);
+    let plan = projcore::yppx::read_yppx(&std::fs::read(&set).unwrap()).unwrap();
+    assert_eq!(
+        plan.formatting
+            .gridlines
+            .get(projcore::formatting::gridlines::Line::GanttRows)
+            .line_type,
+        projcore::formatting::LineType::Dotted
+    );
+    let cleared = dir.join("cleared.yppx");
+    let output = yppxy(
+        Some(&plugins),
+        &[
+            &set,
+            Path::new("--command"),
+            Path::new("fixture.format"),
+            Path::new("--save"),
+            &cleared,
+        ],
+    );
+    ok(&output);
+    let plan = projcore::yppx::read_yppx(&std::fs::read(&cleared).unwrap()).unwrap();
+    assert_eq!(plan.formatting.gridlines.set_lines().count(), 0);
+
     // A status-only command saves nothing and says what the plugin said.
     let output = yppxy(
         Some(&plugins),

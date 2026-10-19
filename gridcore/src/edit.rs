@@ -1591,6 +1591,23 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
         }
     }
 
+    // The sheet-level `<sortState>` only ever translates with the grid: an
+    // edit that changes its size (inside it, or through its rows or columns)
+    // or pushes it off the sheet leaves its conditions naming other cells,
+    // so it goes, as does one a delete took whole.
+    if let Some((r1, c1, r2, c2)) = sheet.sort_state {
+        let (lo, hi) = if shift.rows { (r1, r2) } else { (c1, c2) };
+        let far_off = shift.delta > 0 && point(hi, &shift).is_none();
+        sheet.sort_state = match span(lo, hi, &shift) {
+            Some((nlo, nhi)) if !far_off && nhi - nlo == hi - lo => Some(if shift.rows {
+                (nlo, c1, nhi, c2)
+            } else {
+                (r1, nlo, r2, nhi)
+            }),
+            _ => None,
+        };
+    }
+
     // Chart refs follow the grid too. They are WRITTEN back out as `<c:f>` now,
     // so a stale one doesn't just mis-draw our card: Excel re-reads it and plots
     // whatever moved into those cells. A delete is the worse half — the ref can

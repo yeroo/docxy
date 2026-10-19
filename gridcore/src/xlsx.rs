@@ -393,6 +393,9 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
         calc.transition_eval |= read_transition_evaluation(&xml);
         sheet.auto_filter = sheet_auto_filter_span(&xml)
             .and_then(|(s, e)| auto_filter_position(&xml[s..e], &styles.dxfs));
+        sheet.sort_state = sheet_sort_state_span(&xml)
+            .and_then(|(s, _)| attr_at(&xml, s, "ref"))
+            .and_then(crate::sheet::parse_range_name);
         let sheet_idx = sheets.len();
         if let Some(af) = crate::filter::parse_auto_filter(&xml, &styles.dxfs) {
             auto_filters.push((sheet_idx, af));
@@ -4831,6 +4834,8 @@ fn splice_worksheet(
     // rewritten from the model, added or dropped (see set_auto_filter).
     let out = set_auto_filter(out, sheet.auto_filter.as_ref(), dxfs, dxf_for);
     let out = set_filter_mode(out, sheet.filter_mode);
+    // The sheet-level sortState: kept, moved with the grid, or dropped.
+    let out = set_sort_state(out, sheet.sort_state);
     // Conditional formatting and data validation: likewise.
     let out = set_cond_formats(out, sheet);
     let out = set_validations(out, sheet);
@@ -5465,6 +5470,80 @@ fn sheet_auto_filter_span(xml: &str) -> Option<(usize, usize)> {
         return None;
     }
     worksheet_child_span(xml, "autoFilter")
+}
+
+/// The span of the sheet's own top-level `<sortState>`.
+fn sheet_sort_state_span(xml: &str) -> Option<(usize, usize)> {
+    if !xml.contains("sortState") {
+        return None;
+    }
+    worksheet_child_span(xml, "sortState")
+}
+
+/// Sync the sheet's top-level `<sortState>` with the model's range. It is
+/// left alone while it holds that range (or its `ref` isn't a range), moved
+/// when the model's range is the same size elsewhere (a structural edit
+/// translated it: its `ref` and each `<sortCondition ref>` shift by the same
+/// rows and columns), and dropped otherwise, as the model drops it when an
+/// edit changed its size.
+fn set_sort_state(mut xml: String, model: Option<(u32, u32, u32, u32)>) -> String {
+    let Some((start, end)) = sheet_sort_state_span(&xml) else {
+        return xml;
+    };
+    let element = xml[start..end].to_string();
+    let Some(held) = attr_at(&element, 0, "ref").and_then(crate::sheet::parse_range_name) else {
+        return xml;
+    };
+    let same_size = |(r1, c1, r2, c2): (u32, u32, u32, u32)| {
+        r2 - r1 == held.2 - held.0 && c2 - c1 == held.3 - held.1
+    };
+    let Some((r1, c1, r2, c2)) = model.filter(|&m| same_size(m)) else {
+        return remove_worksheet_child(&xml, "sortState");
+    };
+    let dr = i64::from(r1) - i64::from(held.0);
+    let dc = i64::from(c1) - i64::from(held.1);
+    // Each condition moves with the range and must stay inside it (and on
+    // the sheet); one that doesn't, or doesn't read as a range, can't be kept
+    // honest, so the whole element goes. Also for a range that didn't move.
+    let mut edits: Vec<(usize, String)> = Vec::new();
+    for (name, s, _) in element_children(&element) {
+        if name != "sortCondition" {
+            continue;
+        }
+        let moved = attr_at(&element, s, "ref")
+            .and_then(crate::sheet::parse_range_name)
+            .filter(|&(a, b, c, d)| a >= held.0 && b >= held.1 && c <= held.2 && d <= held.3)
+            .and_then(|(a, b, c, d)| {
+                let m = |v: u32, d: i64, max: u32| {
+                    u32::try_from(i64::from(v) + d).ok().filter(|&x| x < max)
+                };
+                Some((
+                    m(a, dr, 1_048_576)?,
+                    m(b, dc, 16_384)?,
+                    m(c, dr, 1_048_576)?,
+                    m(d, dc, 16_384)?,
+                ))
+            });
+        match moved {
+            Some((a, b, c, d)) => {
+                if (dr, dc) != (0, 0) {
+                    edits.push((s, format!("{}:{}", cell_name(a, b), cell_name(c, d))));
+                }
+            }
+            None => return remove_worksheet_child(&xml, "sortState"),
+        }
+    }
+    if model == Some(held) {
+        return xml;
+    }
+    let mut block = element;
+    for (s, r) in edits.into_iter().rev() {
+        block = set_tag_attr(&block, s, "ref", Some(&r));
+    }
+    let r = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
+    let block = set_tag_attr(&block, 0, "ref", Some(&r));
+    xml.replace_range(start..end, &block);
+    xml
 }
 
 /// The position and criteria an `<autoFilter>` element (the whole element,
@@ -9946,6 +10025,20 @@ impl SheetPackage {
                 p.sheet -= 1;
             }
         }
+        // A name that refers to the sheet reads `#REF!` from now on, as in
+        // Excel; the removed sheet's own scoped names are dropped below.
+        // Cell formulas are left to the caller (`edit::remove_sheet_refs`).
+        let gone = [self.workbook.sheets[idx].name.clone()];
+        for d in &mut self.workbook.defined_names {
+            if d.scope == Some(idx) {
+                continue;
+            }
+            let rewrite =
+                |e: &crate::formula::Expr| crate::formula::remove_sheet_refs_in_expr(e, &gone);
+            if let Some(text) = crate::formula::rewrite_defined_name(&d.formula, rewrite, None) {
+                d.formula = text;
+            }
+        }
         let part_name = self.sheet_parts.remove(idx);
         self.workbook.sheets.remove(idx);
         let active = &mut self.workbook.active_tab;
@@ -10009,6 +10102,111 @@ impl SheetPackage {
         }
         true
     }
+
+    /// Move the sheet at `from` to index `to`, the others keeping their order.
+    /// What belongs to a sheet moves with it: its part, its `<sheet>` element
+    /// (rId and sheetId stay), the names scoped to it (model and
+    /// `localSheetId`), its tables and pivots. `false`, with nothing changed,
+    /// when an index is out of range or the `<sheet>` elements don't line up
+    /// with the model's sheets one-to-one (a sheet whose part was missing).
+    pub fn move_sheet(&mut self, from: usize, to: usize) -> bool {
+        let n = self.workbook.sheets.len();
+        if from >= n || to >= n || self.sheet_parts.len() != n {
+            return false;
+        }
+        if from == to {
+            return true;
+        }
+        let wb_part = workbook_part_name(&self.parts);
+        let Some(p) = self.parts.iter_mut().find(|(name, _)| *name == wb_part) else {
+            return false;
+        };
+        let xml = String::from_utf8_lossy(&p.1).into_owned();
+        let Some(reordered) = reorder_sheet_elements(&xml, from, to, n) else {
+            return false;
+        };
+        p.1 = remap_local_sheet_ids(&reordered, |i| moved_index(i, from, to)).into_bytes();
+
+        let sheet = self.workbook.sheets.remove(from);
+        self.workbook.sheets.insert(to, sheet);
+        let part = self.sheet_parts.remove(from);
+        self.sheet_parts.insert(to, part);
+        let wb = &mut self.workbook;
+        wb.active_tab = moved_index(wb.active_tab, from, to);
+        for d in &mut wb.defined_names {
+            d.scope = d.scope.map(|s| moved_index(s, from, to));
+        }
+        for p in &mut wb.pivots {
+            p.sheet = moved_index(p.sheet, from, to);
+        }
+        let removed = wb.removed_tables.iter_mut().map(|r| &mut r.table);
+        for t in wb.tables.iter_mut().chain(removed) {
+            t.sheet = moved_index(t.sheet, from, to);
+        }
+        true
+    }
+}
+
+/// Where the sheet at `i` sits after the one at `from` moved to `to`.
+fn moved_index(i: usize, from: usize, to: usize) -> usize {
+    if i == from {
+        to
+    } else if from < to && i > from && i <= to {
+        i - 1
+    } else if to < from && i >= to && i < from {
+        i + 1
+    } else {
+        i
+    }
+}
+
+/// `xml` with its `<sheet>` elements permuted so the one at `from` sits at
+/// `to`; each element keeps its text. `None` unless there are exactly `n`.
+fn reorder_sheet_elements(xml: &str, from: usize, to: usize, n: usize) -> Option<String> {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0;
+    while let Some(rel) = xml[at..].find("<sheet ") {
+        let start = at + rel;
+        let end = start + xml[start..].find("/>")? + 2;
+        spans.push((start, end));
+        at = end;
+    }
+    if spans.len() != n {
+        return None;
+    }
+    let mut texts: Vec<&str> = spans.iter().map(|&(s, e)| &xml[s..e]).collect();
+    let moved = texts.remove(from);
+    texts.insert(to, moved);
+    let mut out = String::with_capacity(xml.len());
+    let mut last = 0;
+    for (&(s, e), text) in spans.iter().zip(texts) {
+        out.push_str(&xml[last..s]);
+        out.push_str(text);
+        last = e;
+    }
+    out.push_str(&xml[last..]);
+    Some(out)
+}
+
+/// `xml` with each `localSheetId` run through `f`.
+fn remap_local_sheet_ids(xml: &str, f: impl Fn(usize) -> usize) -> String {
+    const KEY: &str = "localSheetId=\"";
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(pos) = rest.find(KEY) {
+        let vs = pos + KEY.len();
+        let Some(ve) = rest[vs..].find('"') else {
+            break;
+        };
+        out.push_str(&rest[..vs]);
+        match rest[vs..vs + ve].parse::<usize>() {
+            Ok(id) => out.push_str(&f(id).to_string()),
+            Err(_) => out.push_str(&rest[vs..vs + ve]),
+        }
+        rest = &rest[vs + ve..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Remove `part`, its own rels part, and, following those relationships, each
@@ -13736,6 +13934,52 @@ b",
         let saved = load_xlsx(&save_xlsx(&pkg)).expect("reload");
         assert_eq!(saved.workbook.sheets.len(), 1);
         assert_eq!(saved.workbook.sheets[0].name, "Two");
+    }
+
+    #[test]
+    fn move_sheet_takes_its_tables_and_pivots_along() {
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Two");
+        pkg.add_sheet("Three");
+        for (sheet, name) in [(0, "A"), (1, "B"), (2, "C")] {
+            pkg.workbook.sheets[sheet]
+                .cells
+                .insert((0, 0), crate::sheet::Cell::text(name));
+        }
+        pkg.add_table(0, (0, 0, 2, 1), true, "TableStyleLight1")
+            .unwrap();
+        pkg.add_table(2, (0, 0, 2, 1), true, "TableStyleLight1")
+            .unwrap();
+        pkg.workbook.active_tab = 0;
+        assert!(pkg.move_sheet(0, 2));
+        let order: Vec<_> = pkg.workbook.sheets.iter().map(|s| s.name.clone()).collect();
+        assert_eq!(order, ["Two", "Three", "Sheet1"]);
+        assert_eq!(pkg.workbook.active_tab, 2);
+        let tables: Vec<_> = pkg.workbook.tables.iter().map(|t| t.sheet).collect();
+        assert_eq!(tables, [2, 1]);
+        let re = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+        let order: Vec<_> = re.workbook.sheets.iter().map(|s| s.name.clone()).collect();
+        assert_eq!(order, ["Two", "Three", "Sheet1"]);
+        let cell = |i: usize| re.workbook.sheets[i].cell(0, 0).map(|c| c.value.clone());
+        assert_eq!(cell(0), Some(CellValue::Text("B".into())));
+        assert_eq!(cell(1), Some(CellValue::Text("C".into())));
+        assert_eq!(cell(2), Some(CellValue::Text("A".into())));
+        let mut tables: Vec<_> = re.workbook.tables.iter().map(|t| t.sheet).collect();
+        tables.sort();
+        assert_eq!(tables, [1, 2]);
+        assert!(!pkg.move_sheet(0, 3) && !pkg.move_sheet(3, 0));
+    }
+
+    #[test]
+    fn move_sheet_re_points_a_pivot_at_its_sheet() {
+        let mut pkg = load_xlsx(&pivot_fixture()).unwrap();
+        assert_eq!(pkg.workbook.pivots[0].sheet, 1);
+        assert!(pkg.move_sheet(1, 0));
+        assert_eq!(pkg.workbook.pivots[0].sheet, 0);
+        let re = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+        assert_eq!(re.workbook.sheets[0].name, "Report");
+        assert_eq!(re.workbook.pivots[0].sheet, 0);
+        assert!(re.workbook.sheets[0].cell(3, 1).is_some());
     }
 
     #[test]
@@ -19276,6 +19520,232 @@ mod print_setup_tests {
         let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
         let (_, wb) = saved(&pkg, "xl/workbook.xml");
         (ws, wb)
+    }
+
+    const SORT: &str = r#"<autoFilter ref="A1:C9"/><sortState ref="A2:C9"><sortCondition ref="B2:B9"/></sortState>"#;
+
+    #[test]
+    fn sheet_sort_state_translates_with_the_grid() {
+        let (ws, _) = edited("", SORT, |w| insert_rows(w, 0, 0, 2));
+        assert!(
+            ws.contains(r#"<sortState ref="A4:C11"><sortCondition ref="B4:B11"/></sortState>"#),
+            "{ws}"
+        );
+        let (ws, _) = edited("", SORT, |w| insert_cols(w, 0, 0, 2));
+        assert!(
+            ws.contains(r#"<sortState ref="C2:E9"><sortCondition ref="D2:D9"/></sortState>"#),
+            "{ws}"
+        );
+        // A delete of rows above it shifts it up.
+        let (ws, _) = edited(
+            "",
+            "<sortState ref=\"A5:C9\"><sortCondition ref=\"B5:B9\"/></sortState>",
+            |w| delete_rows(w, 0, 0, 2),
+        );
+        assert!(
+            ws.contains(r#"<sortState ref="A3:C7"><sortCondition ref="B3:B7"/></sortState>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn sheet_sort_state_is_dropped_when_an_edit_changes_its_size() {
+        type Edit = fn(&mut Workbook);
+        let cases: [(&str, Edit); 7] = [
+            ("insert inside", |w| insert_rows(w, 0, 4, 1)),
+            ("delete inside", |w| delete_rows(w, 0, 4, 1)),
+            ("delete all", |w| delete_rows(w, 0, 0, 20)),
+            ("column inside", |w| insert_cols(w, 0, 1, 1)),
+            ("column delete inside", |w| delete_cols(w, 0, 1, 1)),
+            ("overlapping top", |w| delete_rows(w, 0, 0, 3)),
+            ("off the sheet", |w| insert_rows(w, 0, 0, 1_048_576 - 8)),
+        ];
+        for (what, edit) in cases {
+            let (ws, _) = edited("", SORT, edit);
+            assert!(!ws.contains("sortState"), "{what}: {ws}");
+        }
+    }
+
+    #[test]
+    fn sheet_sort_state_outside_the_edit_keeps_its_bytes() {
+        for edit in [
+            (|w: &mut Workbook| delete_rows(w, 0, 20, 3)) as fn(&mut Workbook),
+            |w| insert_rows(w, 0, 20, 3),
+            |w| insert_cols(w, 0, 10, 1),
+            |w| delete_cols(w, 0, 10, 1),
+        ] {
+            let (ws, _) = edited("", SORT, edit);
+            assert!(
+                ws.contains(&SORT[SORT.find("<sortState").unwrap()..]),
+                "{ws}"
+            );
+        }
+        // No structural edit at all.
+        let pkg = report("", SORT);
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(
+            ws.contains(&SORT[SORT.find("<sortState").unwrap()..]),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn a_sort_condition_outside_the_sort_range_drops_the_element() {
+        let stray = r#"<sortState ref="A2:C9"><sortCondition ref="E2:E9"/></sortState>"#;
+        // Untouched sheet, moved sheet: either way it goes.
+        let pkg = report("", stray);
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(!ws.contains("sortState"), "{ws}");
+        let (ws, _) = edited("", stray, |w| insert_rows(w, 0, 0, 2));
+        assert!(!ws.contains("sortState"), "{ws}");
+        // A condition inside it keeps the bytes.
+        let fine = r#"<sortState ref="A2:C9" xmlns:x="u"><sortCondition ref="C2:C9" descending="1"/></sortState>"#;
+        let pkg = report("", fine);
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(ws.contains(fine), "{ws}");
+        // Moved to the very last row it still fits, and stays.
+        let (ws, _) = edited("", SORT, |w| insert_rows(w, 0, 0, 1_048_576 - 9));
+        assert!(ws.contains("sortState"), "{ws}");
+    }
+
+    #[test]
+    fn nested_and_custom_view_sort_states_are_not_the_sheets() {
+        let nested = r#"<autoFilter ref="A1:C9"><sortState ref="A2:C9"><sortCondition ref="B2:B9"/></sortState></autoFilter>"#;
+        let pkg = report("", nested);
+        assert_eq!(pkg.workbook.sheets[0].sort_state, None);
+        let view = r#"<customSheetViews><customSheetView guid="{00000000-0000-0000-0000-000000000001}"><sortState ref="A2:C9"><sortCondition ref="B2:B9"/></sortState></customSheetView></customSheetViews>"#;
+        let mut pkg = report("", view);
+        assert_eq!(pkg.workbook.sheets[0].sort_state, None);
+        insert_rows(&mut pkg.workbook, 0, 0, 2);
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(ws.contains(r#"<sortState ref="A2:C9">"#), "{ws}");
+    }
+
+    fn three_sheets(names: &str) -> SheetPackage {
+        let body = Some(r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#);
+        load_xlsx(&book(
+            names,
+            &[("Data", body), ("Other", body), ("DataX", body)],
+        ))
+        .expect("fixture loads")
+    }
+
+    fn names_of(wb: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = wb;
+        while let Some(i) = rest.find("<definedName ") {
+            let end = rest[i..].find("</definedName>").unwrap() + i;
+            out.push(rest[i..end].to_string());
+            rest = &rest[end..];
+        }
+        out
+    }
+
+    #[test]
+    fn removing_a_sheet_turns_global_names_that_refer_to_it_into_ref_errors() {
+        let names = concat!(
+            r#"<definedName name="Total">Data!$B$2</definedName>"#,
+            r#"<definedName name="Cols">Data!$A:$A,Data!$1:$2</definedName>"#,
+            r#"<definedName name="Keep">Other!$B$2</definedName>"#,
+            r#"<definedName name="Prefix">DataX!$B$2</definedName>"#,
+            r#"<definedName name="Mixed">Data!$A$1+Other!$A$1</definedName>"#,
+            r#"<definedName name="OnOther" localSheetId="1">Other!$C$3</definedName>"#,
+            r#"<definedName name="Mine" localSheetId="0">Data!$C$3</definedName>"#,
+        );
+        let mut pkg = three_sheets(names);
+        assert!(pkg.remove_sheet(0));
+        let text = |n: &str| {
+            pkg.workbook
+                .defined_names
+                .iter()
+                .find(|d| d.name == n)
+                .map(|d| d.formula.clone())
+        };
+        assert_eq!(text("Total").as_deref(), Some("#REF!"));
+        assert_eq!(text("Cols").as_deref(), Some("#REF!,#REF!"));
+        assert_eq!(text("Keep").as_deref(), Some("Other!$B$2"));
+        assert_eq!(text("Prefix").as_deref(), Some("DataX!$B$2"));
+        assert_eq!(text("Mixed").as_deref(), Some("#REF!+Other!$A$1"));
+        assert_eq!(text("OnOther").as_deref(), Some("Other!$C$3"));
+        assert_eq!(text("Mine"), None);
+        let (re, wb) = saved(&pkg, "xl/workbook.xml");
+        let all = names_of(&wb);
+        let has = |t: &str| all.iter().any(|n| n.ends_with(t));
+        assert!(has(r#"name="Total">#REF!"#), "{wb}");
+        assert!(has(r#"name="Cols">#REF!,#REF!"#), "{wb}");
+        assert!(has(r#"name="Keep">Other!$B$2"#), "{wb}");
+        assert!(has(r#"localSheetId="0">Other!$C$3"#), "{wb}");
+        assert!(!wb.contains("Mine"), "{wb}");
+        let total = re.workbook.defined_names.iter().find(|d| d.name == "Total");
+        assert_eq!(total.map(|d| d.formula.as_str()), Some("#REF!"));
+    }
+
+    #[test]
+    fn move_sheet_keeps_scoped_names_and_the_sheet_order_in_workbook_xml() {
+        let names = concat!(
+            r#"<definedName name="_xlnm.Print_Area" localSheetId="0">Data!$A$1:$B$2</definedName>"#,
+            r#"<definedName name="_xlnm.Print_Area" localSheetId="1">Other!$A$1:$B$2</definedName>"#,
+            r#"<definedName name="Mine" localSheetId="2">DataX!$C$3</definedName>"#,
+            r#"<definedName name="Global">Other!$A$1</definedName>"#,
+        );
+        for (from, to, order) in [
+            (0, 2, ["Other", "DataX", "Data"]),
+            (2, 0, ["DataX", "Data", "Other"]),
+            (0, 1, ["Other", "Data", "DataX"]),
+            (1, 1, ["Data", "Other", "DataX"]),
+        ] {
+            let mut pkg = three_sheets(names);
+            for (i, sheet) in pkg.workbook.sheets.iter_mut().enumerate() {
+                sheet
+                    .cells
+                    .insert((0, 0), crate::sheet::Cell::number(i as f64 + 1.0));
+            }
+            assert!(pkg.move_sheet(from, to));
+            let (re, wb) = saved(&pkg, "xl/workbook.xml");
+            let got: Vec<_> = re.workbook.sheets.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(got, order, "{from}->{to}: {wb}");
+            // Each sheet's cell travelled with it (Data 1, Other 2, DataX 3).
+            for (i, name) in order.iter().enumerate() {
+                let want = ["Data", "Other", "DataX"]
+                    .iter()
+                    .position(|n| n == name)
+                    .unwrap();
+                let v = re.workbook.sheets[i].cell(0, 0).map(|c| c.value.clone());
+                assert_eq!(
+                    v,
+                    Some(CellValue::Number(want as f64 + 1.0)),
+                    "{from}->{to} {name}"
+                );
+            }
+            // Every scoped name still sits on the sheet it names.
+            for (name, scope) in [
+                ("Mine", "DataX"),
+                ("_xlnm.Print_Area", "Data"),
+                ("_xlnm.Print_Area", "Other"),
+            ] {
+                let d = re
+                    .workbook
+                    .defined_names
+                    .iter()
+                    .find(|d| {
+                        d.name == name
+                            && d.formula.starts_with(scope)
+                            && d.formula.as_bytes().get(scope.len()) == Some(&b'!')
+                    })
+                    .unwrap_or_else(|| panic!("{name} on {scope}: {wb}"));
+                assert_eq!(
+                    d.scope.map(|s| re.workbook.sheets[s].name.as_str()),
+                    Some(scope),
+                    "{from}->{to}"
+                );
+            }
+            assert!(
+                re.workbook
+                    .defined_names
+                    .iter()
+                    .any(|d| d.name == "Global" && d.scope.is_none())
+            );
+        }
     }
 
     #[test]

@@ -460,6 +460,42 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         .unwrap()
         .unwrap();
     assert_eq!(red.view.as_ref().unwrap().text("palette"), "fixture.red");
+    // The format command sets the gridlines through the view (#1575), and
+    // clears them once the view shows them set; the model takes both.
+    let format = ui
+        .command(&cmd("fixture.format", vec![], None))
+        .unwrap()
+        .unwrap();
+    assert_eq!(format.status.as_deref(), Some("Fixture: format"));
+    let mut formatting = projcore::formatting::Formatting::default();
+    assert!(
+        formatting
+            .apply_view(format.view.as_ref().unwrap())
+            .unwrap()
+    );
+    let rows = formatting
+        .gridlines
+        .get(projcore::formatting::gridlines::Line::GanttRows);
+    assert_eq!(rows.line_type, projcore::formatting::LineType::Dotted);
+    assert_eq!(rows.interval, 2);
+    assert_eq!(rows.interval_color, Some(0x3366CC));
+    assert_eq!(formatting.gridlines.set_lines().count(), 4);
+    assert_eq!(
+        formatting
+            .gridlines
+            .get(projcore::formatting::gridlines::Line::SheetColumns)
+            .color,
+        Some(0x33AA33)
+    );
+    let mut seen = cmd("fixture.format", vec![], None);
+    seen.view = Json::obj(vec![("gridlines", formatting.gridlines.to_json())]);
+    let cleared = ui.command(&seen).unwrap().unwrap();
+    assert!(
+        formatting
+            .apply_view(cleared.view.as_ref().unwrap())
+            .unwrap()
+    );
+    assert!(formatting.gridlines.is_empty());
     assert_eq!(
         ui.state(&ctx(Vec::new(), None))
             .unwrap()

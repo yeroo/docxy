@@ -3479,14 +3479,21 @@ fn markdown_style_def(id: &str) -> Option<String> {
 fn markdown_list_levels(bullet: bool) -> String {
     let mut out = String::new();
     for lvl in 0..9 {
+        // Word's built-in lists indent each level 720 twips further with a
+        // 360 hanging indent; without it Pages lays the item out at the margin.
+        let ind = format!(
+            "<w:pPr><w:ind w:left=\"{}\" w:hanging=\"360\"/></w:pPr>",
+            720 * (lvl + 1)
+        );
         if bullet {
             out.push_str(&format!(
-                "<w:lvl w:ilvl=\"{lvl}\"><w:numFmt w:val=\"bullet\"/><w:lvlText w:val=\"•\"/></w:lvl>"
+                "<w:lvl w:ilvl=\"{lvl}\"><w:numFmt w:val=\"bullet\"/><w:lvlText w:val=\"•\"/>\
+                 <w:lvlJc w:val=\"left\"/>{ind}</w:lvl>"
             ));
         } else {
             out.push_str(&format!(
                 "<w:lvl w:ilvl=\"{lvl}\"><w:start w:val=\"1\"/><w:numFmt w:val=\"decimal\"/>\
-                 <w:lvlText w:val=\"%{}.\"/></w:lvl>",
+                 <w:lvlText w:val=\"%{}.\"/><w:lvlJc w:val=\"left\"/>{ind}</w:lvl>",
                 lvl + 1
             ));
         }
@@ -6234,6 +6241,64 @@ mod tests {
             !styles.contains("NotARealStyle"),
             "an id outside the Markdown-mapped set must be silently ignored: {styles}"
         );
+    }
+
+    #[test]
+    fn list_levels_carry_alignment_and_indent_in_schema_order() {
+        use crate::numbering::parse_numbering_xml;
+
+        let mut existing = new_package(Document {
+            body: vec![Block::Paragraph(crate::model::Paragraph::default())],
+        });
+        existing.set_part(
+            "word/numbering.xml",
+            b"<w:numbering xmlns:w=\"x\"></w:numbering>".to_vec(),
+        );
+        for bullet in [true, false] {
+            let levels = markdown_list_levels(bullet);
+            for lvl in 0..9 {
+                let at = levels
+                    .find(&format!("<w:lvl w:ilvl=\"{lvl}\">"))
+                    .unwrap_or_else(|| panic!("level {lvl} missing"));
+                let end = at + levels[at..].find("</w:lvl>").unwrap();
+                let one = &levels[at..end];
+                let pos = |t: &str| one.find(t).unwrap_or_else(|| panic!("{t} in {one}"));
+                let ind = format!(
+                    "<w:pPr><w:ind w:left=\"{}\" w:hanging=\"360\"/></w:pPr>",
+                    720 * (lvl + 1)
+                );
+                assert!(pos("<w:lvlText") < pos("<w:lvlJc w:val=\"left\"/>"));
+                assert!(pos("<w:lvlJc") < pos(&ind), "{one}");
+            }
+
+            // Both writers emit the same level XML.
+            let mut fresh = new_package(Document {
+                body: vec![Block::Paragraph(crate::model::Paragraph::default())],
+            });
+            let id = fresh.ensure_list(bullet);
+            let mut spliced = existing.clone();
+            spliced.ensure_list(bullet);
+            let md = new_markdown_package(Document { body: vec![] });
+            for pkg in [&fresh, &spliced, &md] {
+                let xml =
+                    String::from_utf8_lossy(pkg.part("word/numbering.xml").unwrap()).into_owned();
+                assert!(xml.contains(&levels), "bullet={bullet}: {xml}");
+            }
+
+            // The renderer's markers are unchanged.
+            let xml =
+                String::from_utf8_lossy(fresh.part("word/numbering.xml").unwrap()).into_owned();
+            let numbering = parse_numbering_xml(&xml);
+            for lvl in 0..9 {
+                let want = if bullet {
+                    "•".to_string()
+                } else {
+                    format!("%{}.", lvl + 1)
+                };
+                let got = numbering.level(id, lvl).map(|l| l.text);
+                assert_eq!(got.as_deref(), Some(want.as_str()));
+            }
+        }
     }
 
     #[test]

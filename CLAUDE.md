@@ -47,8 +47,18 @@
   WM_CHAR types it while a dialog is open and nothing once none is, and an
   AltGr dead key, which sends none, types nothing. Under load that WM_CHAR
   may land after later keys' text, or in the next field after a Tab. A plain
-  Windows dead key still types its accent into a dialog field.
+  Windows dead key never reaches `on_key` (`passes_to_on_key`): the next
+  key-down carries the composed text whole in its `key_char` (Space with
+  "´", a letter with "´x"), which a dialog field types in full.
   `edit_key` still swallows every ⌥ key, and Windows' plain Alt is never text.
+- The Project cell editor and prompt take ⌥ and AltGr text the same way
+  (#1312): `project_key` runs `text_input::dialog_stroke` while an edit is
+  open (`project_stroke`; with none open the key is untouched), and the AltGr
+  debt is the field's (`text_field_open`) when a dialog or a Project edit
+  is open at the key-down.
+  On Windows a plain dead key (`plain_dead_key`: `prefer_character_input`, no
+  Ctrl/Alt/Win) never reaches `on_key`: it owes nothing and its accent comes
+  composed with the next key, so no field types it twice.
 
 ## macOS menu bar (#1071)
 
@@ -156,6 +166,29 @@
   and read PDFs back with `common/pdf_read.rs` (xref/length/reference
   validation and ToUnicode extraction), so nothing depends on `qpdf` (used too
   when installed) or on fonts being installed.
+
+## Start screen (#806)
+
+- A suite launch with nothing to restore and no file on the command line has
+  no tab and the File > New page up (`Docxy::show_start_screen`; `startup_tabs`
+  decides, `Startup::StartScreen`), brought up through `open_backstage` so the
+  lists are filled. A restored session keeps its tabs; files on the command
+  line open over it (a file that cannot be read opens as a failed-load tab, so
+  one tab always exists). With no tab, Back on File goes from New to
+  its default page (Recent, Settings) and stay in File, Close, Save and Save
+  As do nothing, and the startup plugin notice waits in `pending_status` for the first
+  tab (`land_status`; a tab's own status wins). A failed Open pick with no tab
+  keeps File up and says why under Recent (`recent_message`). The New page's cards are `NEW_CARDS`
+  (the Spreadsheet one reads "Blank workbook").
+- A harness instance keeps the sample document as tab 0 (the cases assume it)
+  unless the script says `start screen`: the runner writes the marker
+  `<config root>/docxy/start-screen` into the sandbox, which only a harness
+  instance reads (`harness::start_screen_requested`). `start-screen.uit` drives
+  it (`backstage` read reports `new` and `cards`, `new-card` clicks one).
+- `Docxy` cannot be built in a unit test (no gpui test context), so the
+  zero-tab guards are checked by reading the sites that index
+  `self.tabs[self.active]`: each follows a `tabs.get`/`is_empty` guard, and
+  `save_project_to`, the one that did not, now refuses with "no tab is open".
 
 ## Build info
 
@@ -550,6 +583,16 @@
   explicit `select` of it (automation) stays. `uiharness/cases/project-summary-row.uit`
   asserts the same layout with and without it (not run on macOS).
 
+## Sheet tab rename (#1365)
+
+- `SheetRename` (`idx`, `text`, `caret`, `sel`) is the inline rename's state,
+  edited through `field_edit` like the Name Box: it opens with the whole name
+  selected, Left/Right/Home/End/Delete/Backspace act at the caret, Ctrl+A/C/X/V
+  copy and paste one line (Ctrl+Alt is text, any other chord types nothing).
+  Enter and the exit path still commit `text`; Escape keeps the old name.
+  `field-read sheet-tab-rename` reports the caret and `[0,len]` selection.
+  Click-to-place and Shift+arrows are not there.
+
 ## Sheet Home ribbon Font / Font Size boxes (#1344)
 
 - The two boxes are text fields: `Docxy::font_box` (`FontBoxEdit`, tied to the
@@ -835,6 +878,52 @@
   `selected_columns`, `selected_rows`, `filled_cells` (`"<row>:<column>"`),
   `hot_headings`, `cursor_border` and `table_fits`;
   `uiharness/cases/project-selection.uit` (not run on macOS).
+
+## Project gridlines from the formatting model (#1575)
+
+- `projcore::formatting::gridlines` is Project's Gridlines dialog as data:
+  `Line` (the fourteen "Line to change" entries, Project's names and order),
+  `LineType` (none, solid, dotted, short-dashed, long-dashed; `segments` is
+  the one dash pattern), `Gridline` (type, colour or Automatic, and for the
+  row and column lines an interval with its own type and colour) and
+  `Gridlines` (only lines set away from `Line::default_style` are stored:
+  solid Automatic for Gantt Rows, Bottom Tier Column, Sheet Rows, Sheet
+  Columns, Title Vertical and Title Horizontal, none for the rest, which is
+  what the hosts drew before). `Formatting::gridlines` replaces the old
+  opaque string; `formatting.xml` carries `<gridline>` children (an older
+  root `gridlines` attribute is ignored). A plugin command's `view.gridlines`
+  is an object of line name to `{type, color, interval, interval_type,
+  interval_color}` (partial objects keep the rest; null is the default; a
+  null reply clears all), and every request's `view.gridlines` carries all
+  fourteen as drawn.
+- The suite draws from it in `project/gantt.rs`: `body_grid` paints the
+  table's Sheet Rows and Sheet Columns, the chart's Gantt Rows, the tier
+  columns (`tier_lines`: bottom = the minor tier, middle = the major, the
+  header's two tiers being Project's middle and bottom, so the Top Tier
+  Column is kept undrawn like Bar Rows until a three-tier header exists;
+  each line's interval index counted from the scale's origin so the pattern
+  stays put as the chart scrolls; `bottom_tier_lines` follows the bottom
+  tier's unit, so at the Weeks level it draws a line per week where the old
+  chart drew one per day, and a bottom tier left at its default keeps the
+  old rule of no lines under 8 px per day) and the date lines (`date_lines`: Current Date from the
+  `CurrentDate` option, Project Start and Finish from the schedule, Status
+  Date), each rule through `paint_rule` (`LineType::segments` as quads, an
+  interval line's style on every Nth row or column, `gridline_color` falling
+  back to the host's colour). The timescale's title lines are the header
+  cells' borders (solid whatever the type, in the line's colour). Bar Rows
+  (one bar row per task) and Page Breaks (no pagination) are kept, never
+  drawn. The chart menu's Gridlines... item stays disabled: no built-in
+  dialog yet. The harness state reports `gridlines` and `gridlines_set`.
+- yppxy draws the date lines only (`gridline_marks`: `│` or `┆` in an empty
+  day cell, in the line's colour), as a terminal cell is a day and a row a
+  task. The fixture's `fixture.format` sets dotted red Gantt rows (every
+  second solid blue), no sheet rows, green sheet columns and a red project
+  start line, and clears them on the next press;
+  `uiharness/cases/project-plugin-ui.uit` asserts the state, reads the green
+  Sheet Columns rule off an unselected cell's right edge with a `border`
+  assertion (the one step whose `#` colour is not a comment; an `is` value
+  cannot carry one, so the colours are pinned by `projcore/tests/plugins.rs`)
+  and shoots the rest (the default rules are too faint for a `border`).
 
 ## Project timescale and Timeline pane (#1535)
 
