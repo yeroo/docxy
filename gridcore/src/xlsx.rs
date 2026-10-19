@@ -393,6 +393,9 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
         calc.transition_eval |= read_transition_evaluation(&xml);
         sheet.auto_filter = sheet_auto_filter_span(&xml)
             .and_then(|(s, e)| auto_filter_position(&xml[s..e], &styles.dxfs));
+        sheet.sort_state = sheet_sort_state_span(&xml)
+            .and_then(|(s, _)| attr_at(&xml, s, "ref"))
+            .and_then(crate::sheet::parse_range_name);
         let sheet_idx = sheets.len();
         if let Some(af) = crate::filter::parse_auto_filter(&xml, &styles.dxfs) {
             auto_filters.push((sheet_idx, af));
@@ -4831,6 +4834,8 @@ fn splice_worksheet(
     // rewritten from the model, added or dropped (see set_auto_filter).
     let out = set_auto_filter(out, sheet.auto_filter.as_ref(), dxfs, dxf_for);
     let out = set_filter_mode(out, sheet.filter_mode);
+    // The sheet-level sortState: kept, moved with the grid, or dropped.
+    let out = set_sort_state(out, sheet.sort_state);
     // Conditional formatting and data validation: likewise.
     let out = set_cond_formats(out, sheet);
     let out = set_validations(out, sheet);
@@ -5465,6 +5470,68 @@ fn sheet_auto_filter_span(xml: &str) -> Option<(usize, usize)> {
         return None;
     }
     worksheet_child_span(xml, "autoFilter")
+}
+
+/// The span of the sheet's own top-level `<sortState>`.
+fn sheet_sort_state_span(xml: &str) -> Option<(usize, usize)> {
+    if !xml.contains("sortState") {
+        return None;
+    }
+    worksheet_child_span(xml, "sortState")
+}
+
+/// Sync the sheet's top-level `<sortState>` with the model's range. It is
+/// left alone while it holds that range (or its `ref` isn't a range), moved
+/// when the model's range is the same size elsewhere (a structural edit
+/// translated it: its `ref` and each `<sortCondition ref>` shift by the same
+/// rows and columns), and dropped otherwise, as the model drops it when an
+/// edit changed its size.
+fn set_sort_state(mut xml: String, model: Option<(u32, u32, u32, u32)>) -> String {
+    let Some((start, end)) = sheet_sort_state_span(&xml) else {
+        return xml;
+    };
+    let element = xml[start..end].to_string();
+    let Some(held) = attr_at(&element, 0, "ref").and_then(crate::sheet::parse_range_name) else {
+        return xml;
+    };
+    if model == Some(held) {
+        return xml;
+    }
+    let block = match model {
+        Some((r1, c1, r2, c2)) if r2 - r1 == held.2 - held.0 && c2 - c1 == held.3 - held.1 => {
+            let dr = i64::from(r1) - i64::from(held.0);
+            let dc = i64::from(c1) - i64::from(held.1);
+            let mut block = element.clone();
+            let mut edits: Vec<(usize, String)> = Vec::new();
+            for (name, s, _) in element_children(&element) {
+                if name != "sortCondition" {
+                    continue;
+                }
+                let moved = attr_at(&element, s, "ref")
+                    .and_then(crate::sheet::parse_range_name)
+                    .and_then(|(a, b, c, d)| {
+                        let m = |v: u32, d: i64| u32::try_from(i64::from(v) + d).ok();
+                        Some((m(a, dr)?, m(b, dc)?, m(c, dr)?, m(d, dc)?))
+                    });
+                match moved {
+                    Some((a, b, c, d)) => {
+                        edits.push((s, format!("{}:{}", cell_name(a, b), cell_name(c, d))))
+                    }
+                    // A condition outside the range, or one that can't move,
+                    // can't be kept honest: drop the whole element.
+                    None => return remove_worksheet_child(&xml, "sortState"),
+                }
+            }
+            for (s, r) in edits.into_iter().rev() {
+                block = set_tag_attr(&block, s, "ref", Some(&r));
+            }
+            let r = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
+            set_tag_attr(&block, 0, "ref", Some(&r))
+        }
+        _ => String::new(),
+    };
+    xml.replace_range(start..end, &block);
+    xml
 }
 
 /// The position and criteria an `<autoFilter>` element (the whole element,
@@ -19276,6 +19343,82 @@ mod print_setup_tests {
         let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
         let (_, wb) = saved(&pkg, "xl/workbook.xml");
         (ws, wb)
+    }
+
+    const SORT: &str = r#"<autoFilter ref="A1:C9"/><sortState ref="A2:C9"><sortCondition ref="B2:B9"/></sortState>"#;
+
+    #[test]
+    fn sheet_sort_state_translates_with_the_grid() {
+        let (ws, _) = edited("", SORT, |w| insert_rows(w, 0, 0, 2));
+        assert!(
+            ws.contains(
+                r#"<sortState ref="A4:C11"><sortCondition ref="B4:B11"/></sortState>"#
+            ),
+            "{ws}"
+        );
+        let (ws, _) = edited("", SORT, |w| insert_cols(w, 0, 0, 2));
+        assert!(
+            ws.contains(
+                r#"<sortState ref="C2:E9"><sortCondition ref="D2:D9"/></sortState>"#
+            ),
+            "{ws}"
+        );
+        // A delete of rows above it shifts it up.
+        let (ws, _) = edited("", "<sortState ref=\"A5:C9\"><sortCondition ref=\"B5:B9\"/></sortState>", |w| {
+            delete_rows(w, 0, 0, 2)
+        });
+        assert!(
+            ws.contains(r#"<sortState ref="A3:C7"><sortCondition ref="B3:B7"/></sortState>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn sheet_sort_state_is_dropped_when_an_edit_changes_its_size() {
+        type Edit = fn(&mut Workbook);
+        let cases: [(&str, Edit); 7] = [
+            ("insert inside", |w| insert_rows(w, 0, 4, 1)),
+            ("delete inside", |w| delete_rows(w, 0, 4, 1)),
+            ("delete all", |w| delete_rows(w, 0, 0, 20)),
+            ("column inside", |w| insert_cols(w, 0, 1, 1)),
+            ("column delete inside", |w| delete_cols(w, 0, 1, 1)),
+            ("overlapping top", |w| delete_rows(w, 0, 0, 3)),
+            ("off the sheet", |w| insert_rows(w, 0, 0, 1_048_576 - 8)),
+        ];
+        for (what, edit) in cases {
+            let (ws, _) = edited("", SORT, edit);
+            assert!(!ws.contains("sortState"), "{what}: {ws}");
+        }
+    }
+
+    #[test]
+    fn sheet_sort_state_outside_the_edit_keeps_its_bytes() {
+        for edit in [
+            (|w: &mut Workbook| delete_rows(w, 0, 20, 3)) as fn(&mut Workbook),
+            |w| insert_rows(w, 0, 20, 3),
+            |w| insert_cols(w, 0, 10, 1),
+            |w| delete_cols(w, 0, 10, 1),
+        ] {
+            let (ws, _) = edited("", SORT, edit);
+            assert!(ws.contains(&SORT[SORT.find("<sortState").unwrap()..]), "{ws}");
+        }
+        // No structural edit at all.
+        let pkg = report("", SORT);
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(ws.contains(&SORT[SORT.find("<sortState").unwrap()..]), "{ws}");
+    }
+
+    #[test]
+    fn nested_and_custom_view_sort_states_are_not_the_sheets() {
+        let nested = r#"<autoFilter ref="A1:C9"><sortState ref="A2:C9"><sortCondition ref="B2:B9"/></sortState></autoFilter>"#;
+        let pkg = report("", nested);
+        assert_eq!(pkg.workbook.sheets[0].sort_state, None);
+        let view = r#"<customSheetViews><customSheetView guid="{00000000-0000-0000-0000-000000000001}"><sortState ref="A2:C9"><sortCondition ref="B2:B9"/></sortState></customSheetView></customSheetViews>"#;
+        let mut pkg = report("", view);
+        assert_eq!(pkg.workbook.sheets[0].sort_state, None);
+        insert_rows(&mut pkg.workbook, 0, 0, 2);
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(ws.contains(r#"<sortState ref="A2:C9">"#), "{ws}");
     }
 
     #[test]
