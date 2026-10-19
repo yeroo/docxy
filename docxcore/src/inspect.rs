@@ -501,8 +501,9 @@ struct TextBoxCopy {
     /// Byte range of its inner XML.
     inner: Range<usize>,
     /// Whether its inner XML equals the first copy's apart from `w14:paraId`
-    /// attributes and prefixed namespace declarations (see `twin_key`), so it
-    /// shows the same `blocks`.
+    /// attributes, namespace declarations and markup-compatibility rules (see
+    /// `twin_key`), and the names in both resolve to the same namespaces (see
+    /// `bindings_used`), so it shows the same `blocks`.
     /// The first copy is its own twin. Only twins may be rewritten
     /// from `blocks`; another box of a group keeps its own content.
     twin: bool,
@@ -551,8 +552,8 @@ fn text_box_copies(raw: &str) -> Vec<TextBoxCopy> {
 }
 
 /// For each of `inners` (ranges of `raw`), the namespaces its element and
-/// attribute names (not `w14:paraId`; and markup-compatibility values) resolve to: sorted
-/// `prefix=namespace` lines, the default namespace as the empty prefix,
+/// attribute names (not `w14:paraId` or a markup-compatibility rule) resolve
+/// to: sorted `prefix=namespace` lines, the default namespace as the empty prefix,
 /// bindings inherited from outside the range included. An unbound prefix
 /// resolves to nothing.
 fn bindings_used(raw: &str, inners: &[Range<usize>]) -> Vec<String> {
@@ -587,7 +588,11 @@ fn bindings_used(raw: &str, inners: &[Range<usize>]) -> Vec<String> {
                     name.split_once(':').map(|(p, _)| p).into_iter().collect();
                 for a in p.attrs() {
                     // `twin_key` cuts the ids a save may drop from one copy.
-                    if a.name == "w14:paraId" || a.name == "xmlns" || a.name.starts_with("xmlns:") {
+                    if a.name == "w14:paraId"
+                        || a.name == "xmlns"
+                        || a.name.starts_with("xmlns:")
+                        || crate::load::is_rule_name(a.name)
+                    {
                         continue;
                     }
                     prefixes.extend(a.name.split_once(':').map(|(p, _)| p));
@@ -607,10 +612,12 @@ fn bindings_used(raw: &str, inners: &[Range<usize>]) -> Vec<String> {
 }
 
 /// `xml` as text-box copies are compared: without the `w14:paraId`
-/// attributes and the prefixed namespace declarations (`xmlns:p`) of its
-/// start tags; text is left alone. A save may drop a repeated id from one copy
-/// only, and the loader declares on a modeled copy's property elements the
-/// prefixes they inherit (#1063), which the raw copy inherits unchanged.
+/// attributes, the namespace declarations (`xmlns:p`, `xmlns`) and the
+/// markup-compatibility rules (`mc:Ignorable`, …) of its start tags; text is
+/// left alone. A save may drop a repeated id from one copy only, and the
+/// loader declares on a modeled copy's property elements the prefixes, default
+/// namespace and rules they inherit (#1063, #1089), which the raw copy
+/// inherits unchanged; [`bindings_used`] compares what the names resolve to.
 /// Malformed XML is returned as it is.
 fn twin_key(xml: &str) -> String {
     use crate::xml::{Event, XmlParser};
@@ -619,11 +626,12 @@ fn twin_key(xml: &str) -> String {
     loop {
         match p.next() {
             Event::Start => {
-                for a in p
-                    .attrs()
-                    .iter()
-                    .filter(|a| a.name == "w14:paraId" || a.name.starts_with("xmlns:"))
-                {
+                for a in p.attrs().iter().filter(|a| {
+                    a.name == "w14:paraId"
+                        || a.name == "xmlns"
+                        || a.name.starts_with("xmlns:")
+                        || crate::load::is_rule_name(a.name)
+                }) {
                     let Some(cut) = crate::serialize::attr_source_range(xml, a) else {
                         return xml.to_string();
                     };
@@ -1711,6 +1719,30 @@ mod tests {
         );
         let xml = document_to_xml(&parse(&boxed));
         assert!(xml.contains("<w:lang xmlns:ux=\"urn:ux\""), "{xml}");
+        let body = &xml[xml.find("<w:body>").unwrap() + 8..xml.find("</w:body>").unwrap()];
+        let mut reopened = parse(body);
+        assert_eq!(remove_hidden_text(&mut reopened, None), 1);
+        let xml = document_to_xml(&reopened);
+        assert!(!xml.contains("gone"), "{xml}");
+        assert_eq!(xml.matches("keep").count(), 2, "{xml}");
+    }
+
+    /// Review r1: a default namespace (and a rule) declared on the drawing run
+    /// is declared on the modeled copy's property elements by the loader;
+    /// after a save and reopen the Fallback keeps its bytes, and the copies
+    /// are still twins, so a removal reaches both.
+    #[test]
+    fn a_default_namespace_on_the_drawing_run_keeps_the_copies_twins() {
+        let content = "<w:p><w:r><w:rPr><effect/></w:rPr><w:t xml:space=\"preserve\">keep</w:t></w:r>\
+            <w:r><w:rPr><w:vanish/><effect/></w:rPr><w:t xml:space=\"preserve\">gone</w:t></w:r></w:p>";
+        let boxed = format!(
+            "<w:p><w:r xmlns=\"urn:vendor\" xmlns:ux=\"urn:ux\" mc:Ignorable=\"ux\">\
+             <mc:AlternateContent><mc:Choice Requires=\"wps\"><w:drawing><wps:txbx>\
+             <w:txbxContent>{content}</w:txbxContent></wps:txbx></w:drawing></mc:Choice>\
+             <mc:Fallback><w:pict><v:shape><v:textbox><w:txbxContent>{content}</w:txbxContent>\
+             </v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent></w:r></w:p>"
+        );
+        let xml = document_to_xml(&parse(&boxed));
         let body = &xml[xml.find("<w:body>").unwrap() + 8..xml.find("</w:body>").unwrap()];
         let mut reopened = parse(body);
         assert_eq!(remove_hidden_text(&mut reopened, None), 1);

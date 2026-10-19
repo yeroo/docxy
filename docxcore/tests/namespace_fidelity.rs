@@ -1,6 +1,7 @@
 //! Namespace fidelity of captured subtrees on save: a default namespace and
 //! markup-compatibility rules declared below the part root (#1089).
 
+use docxcore::editor::{Caret, Editor};
 use docxcore::package::{load_package, save_package};
 use docxcore::zip::ZipArchive;
 use docxcore::zipwrite::write_zip;
@@ -12,6 +13,11 @@ const MC_NS: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006
 /// `document` as `word/document.xml` of a minimal package, loaded and saved
 /// again (a part root is written back as loaded), then its saved part.
 fn saved(document: &str) -> String {
+    saved_after(document, |_| {})
+}
+
+/// [`saved`] with `edit` applied to an editor on the document first.
+fn saved_after(document: &str, edit: impl FnOnce(&mut Editor)) -> String {
     let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
     let root_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -27,7 +33,10 @@ fn saved(document: &str) -> String {
             document.as_bytes().to_vec(),
         ),
     ]);
-    let pkg = load_package(&bytes).expect("fixture loads");
+    let mut pkg = load_package(&bytes).expect("fixture loads");
+    let mut editor = Editor::new(pkg.document.clone());
+    edit(&mut editor);
+    pkg.document = editor.doc;
     let out = save_package(&pkg);
     let archive = ZipArchive::open(&out).expect("saved package is a ZIP");
     String::from_utf8(archive.read("word/document.xml").expect("document part"))
@@ -203,7 +212,7 @@ fn ignorable_at(xml: &str, name: &str) -> Vec<Vec<String>> {
                 let own: Vec<String> = p
                     .attrs()
                     .iter()
-                    .filter(|a| a.name == "mc:Ignorable")
+                    .filter(|a| a.name.ends_with(":Ignorable"))
                     .flat_map(|a| a.value.split_whitespace().map(str::to_string))
                     .collect();
                 scopes.push(own);
@@ -271,7 +280,7 @@ fn mce_ignorable_from_body_reaches_paragraph_attr() {
 }
 
 #[test]
-fn mce_ignorable_from_tc_reaches_run_and_row() {
+fn mce_ignorable_from_tc_reaches_run() {
     let src = doc(
         "",
         "<w:tbl><w:tblGrid><w:gridCol w:w=\"2000\"/></w:tblGrid>\
@@ -306,11 +315,96 @@ fn mce_rule_redeclares_only_the_prefixes_the_element_uses() {
 
 #[test]
 fn mce_without_extension_attrs_is_byte_identical() {
+    let body = "<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>a</w:t></w:r></w:p>";
+    let with = saved(&doc(" xmlns:ux=\"urn:ux\" mc:Ignorable=\"ux\"", body));
+    assert_eq!(with, saved(&doc("", body)));
+}
+
+/// `src` has a rebuilt ancestor's rule (`ux`) and the captured element's own
+/// (`vy`); both stay in effect at `element` after a save and a resave.
+fn assert_both_rules(src: &str, element: &str) {
+    let both = vec!["ux".to_string(), "vy".to_string()];
+    let once = saved(src);
+    assert_eq!(ignorable_at(&once, element), [both], "saved: {once}");
+    assert_eq!(once, saved(&once), "stable: {once}");
+}
+
+const OWN_RULE: &str = "mc:Ignorable=\"vy\" xmlns:vy=\"urn:vy\" ux:a=\"1\" vy:b=\"2\"";
+
+#[test]
+fn an_inherited_rule_joins_the_captured_elements_own_rule() {
+    let ancestor = " xmlns:ux=\"urn:ux\" mc:Ignorable=\"ux\"";
+    assert_both_rules(
+        &doc(
+            ancestor,
+            &format!("<w:p><w:r><w:rPr><w:b {OWN_RULE}/></w:rPr><w:t>a</w:t></w:r></w:p>"),
+        ),
+        "w:b",
+    );
+    assert_both_rules(
+        &doc(
+            ancestor,
+            &format!("<w:p><w:pPr><w:keepNext {OWN_RULE}/></w:pPr></w:p>"),
+        ),
+        "w:keepNext",
+    );
+    for (wrapper, inner) in [
+        (
+            "w:tblPr",
+            "<w:tblPr><x:p {OWN}/></w:tblPr><w:tblGrid/><w:tr><w:tc><w:p/></w:tc></w:tr>",
+        ),
+        (
+            "w:trPr",
+            "<w:tblGrid/><w:tr><w:trPr><x:p {OWN}/></w:trPr><w:tc><w:p/></w:tc></w:tr>",
+        ),
+        (
+            "w:tcPr",
+            "<w:tblGrid/><w:tr><w:tc><w:tcPr><x:p {OWN}/></w:tcPr><w:p/></w:tc></w:tr>",
+        ),
+    ] {
+        let body = format!("<w:tbl>{}</w:tbl><w:p/>", inner.replace("{OWN}", OWN_RULE));
+        let src = doc(ancestor, &body);
+        let once = saved(&src);
+        assert_eq!(
+            ignorable_at(&once, "x:p"),
+            [vec!["ux".to_string(), "vy".to_string()]],
+            "{wrapper}: {once}"
+        );
+    }
+}
+
+#[test]
+fn an_inherited_rule_joins_an_own_rule_spelled_with_another_prefix() {
     let src = doc(
         " xmlns:ux=\"urn:ux\" mc:Ignorable=\"ux\"",
-        "<w:p><w:r><w:t>a</w:t></w:r></w:p>",
+        "<w:p><w:r><w:rPr><w:b ve:Ignorable=\"vy\" xmlns:ve=\"{MC}\" xmlns:vy=\"urn:vy\" \
+         ux:a=\"1\" vy:b=\"2\"/></w:rPr><w:t>a</w:t></w:r></w:p>"
+            .replace("{MC}", MC_NS)
+            .as_str(),
     );
     let out = saved(&src);
-    assert!(!out.contains("Ignorable"), "{out}");
-    assert!(!out.contains("urn:ux"), "{out}");
+    assert_eq!(
+        ignorable_at(&out, "w:b"),
+        [vec!["ux".to_string(), "vy".to_string()]],
+        "{out}"
+    );
+    assert_eq!(out.matches("Ignorable=").count(), 1, "{out}");
+}
+
+/// A rule on a `w:p` start tag is written back on both halves of a split
+/// paragraph, so a captured child that depends on it stays covered (the
+/// reason `w:p` is not an ancestor to redeclare from).
+#[test]
+fn a_split_paragraph_keeps_its_rule_on_both_halves() {
+    let src = doc(
+        "",
+        "<w:p xmlns:ux=\"urn:ux\" mc:Ignorable=\"ux\"><w:r><w:rPr><w:b ux:a=\"1\"/></w:rPr>\
+         <w:t>HelloWorld</w:t></w:r></w:p>",
+    );
+    let out = saved_after(&src, |editor| {
+        editor.set_caret(Caret::top(0, 5));
+        editor.insert_newline();
+    });
+    assert_eq!(out.matches("<w:p ").count(), 2, "{out}");
+    assert_eq!(out.matches("mc:Ignorable=\"ux\"").count(), 2, "{out}");
 }

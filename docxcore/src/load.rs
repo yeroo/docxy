@@ -140,6 +140,8 @@ const PART_ROOTS: [&str; 6] = [
 /// bind the prefix to another namespace. The innermost binding of each
 /// prefix, as `(prefix, namespace)`; the default namespace is the empty
 /// prefix (`xmlns=""` is `("", "")`), declared below the root or reset there.
+/// With them go the markup-compatibility rules inherited from such an
+/// ancestor ([`inherited_markup_compatibility`]).
 fn rebuilt_bindings(p: &XmlParser) -> Rebuilt {
     let mut out: Vec<(String, String)> = Vec::new();
     for scoped in p.namespace_scoped_attrs() {
@@ -190,11 +192,7 @@ fn inherited_markup_compatibility(p: &XmlParser) -> Vec<(String, String)> {
     let mut merged: Vec<(String, String)> = Vec::new();
     for scoped in p.markup_compatibility_attrs() {
         let name = scoped.attr.name;
-        let local = name.split_once(':').map_or(name, |(_, local)| local);
-        if !matches!(
-            local,
-            "Ignorable" | "ProcessContent" | "PreserveElements" | "PreserveAttributes"
-        ) || !name.contains(':')
+        if !is_rule_name(name)
             || PART_ROOTS.contains(&scoped.element_name)
             || WRITTEN_BACK.contains(&scoped.element_name)
         {
@@ -317,19 +315,39 @@ fn prefixes_of(raw: &str) -> (Vec<String>, Vec<String>) {
     (used, own)
 }
 
-/// `raw` with a declaration on its start tag for each prefix it uses that is
-/// bound in `bindings` (see [`rebuilt_bindings`]) and not declared there
-/// already, so it stays well-formed wherever a save writes it (#1063).
+/// `raw` (an element captured verbatim) with what its start tag needs to
+/// mean what it did where it was loaded, given the scope a save does not keep
+/// ([`Rebuilt`], from [`rebuilt_bindings`]): a declaration for each prefix it
+/// uses that is bound there and not declared on the tag already (#1063), the
+/// default namespace included, and the inherited markup-compatibility rules
+/// naming a prefix it uses. A rule the tag already has (by local name,
+/// whatever its prefix) takes the union of the tokens and keeps its spelling;
+/// otherwise it is added.
 fn declare_rebuilt(raw: &str, rebuilt: &Rebuilt) -> String {
     if rebuilt.ns.is_empty() && rebuilt.mce.is_empty() {
         return raw.to_string();
     }
     let (mut used, own) = prefixes_of(raw);
     let rules = rules_for_prefixes(&rebuilt.mce, &used);
+    let own_rules = own_rules(raw);
+    let mut out = raw.to_string();
     let mut decls = String::new();
+    let mut merges: Vec<(std::ops::Range<usize>, String)> = Vec::new();
     for (name, value) in &rules {
-        // The element's own rule of that name wins.
-        if own_attr(raw, name) {
+        let local = name.split_once(':').map_or(name.as_str(), |(_, l)| l);
+        let found = own_rules.iter().find(|(_, own_name, _)| {
+            own_name
+                .split_once(':')
+                .map_or(own_name.as_str(), |(_, l)| l)
+                == local
+        });
+        if let Some((range, own_name, own_value)) = found {
+            let mut merged = vec![(own_name.clone(), own_value.clone())];
+            merge_rule(&mut merged, own_name, value);
+            let mut text = format!(" {own_name}=\"");
+            crate::serialize::esc_attr(&merged[0].1, &mut text);
+            text.push('"');
+            merges.push((range.clone(), text));
             continue;
         }
         decls.push_str(&format!(" {name}=\""));
@@ -338,6 +356,11 @@ fn declare_rebuilt(raw: &str, rebuilt: &Rebuilt) -> String {
         if let Some((prefix, _)) = name.split_once(':') {
             used.push(prefix.to_string());
         }
+    }
+    // Last first, so the earlier ranges stay valid.
+    merges.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+    for (range, text) in merges {
+        out.replace_range(range, &text);
     }
     for (prefix, ns) in &rebuilt.ns {
         if used.contains(prefix) && !own.contains(prefix) {
@@ -348,23 +371,46 @@ fn declare_rebuilt(raw: &str, rebuilt: &Rebuilt) -> String {
         }
     }
     if decls.is_empty() {
-        return raw.to_string();
+        return out;
     }
-    let name_end = raw[1..]
+    let name_end = out[1..]
         .find([' ', '\t', '\n', '\r', '/', '>'])
-        .map_or(raw.len(), |i| i + 1);
-    format!("{}{decls}{}", &raw[..name_end], &raw[name_end..])
+        .map_or(out.len(), |i| i + 1);
+    format!("{}{decls}{}", &out[..name_end], &out[name_end..])
 }
 
-/// Whether `raw`'s own start tag has the attribute `name`.
-fn own_attr(raw: &str, name: &str) -> bool {
+/// The markup-compatibility rules (`mc:Ignorable`, …) on `raw`'s own start
+/// tag: source range, name and decoded value.
+fn own_rules(raw: &str) -> Vec<(std::ops::Range<usize>, String, String)> {
     let mut q = XmlParser::new(raw);
-    q.next() == Event::Start && q.attrs().iter().any(|a| a.name == name)
+    if q.next() != Event::Start {
+        return Vec::new();
+    }
+    q.attrs()
+        .iter()
+        .filter(|a| is_rule_name(a.name))
+        .filter_map(|a| {
+            let range = crate::serialize::attr_source_range(raw, a)?;
+            Some((range, a.name.to_string(), decode_attr(a.value)))
+        })
+        .collect()
+}
+
+/// A prefixed `Ignorable`, `ProcessContent`, `PreserveElements` or
+/// `PreserveAttributes`: the rules a descendant inherits.
+pub(crate) fn is_rule_name(name: &str) -> bool {
+    name.split_once(':').is_some_and(|(_, local)| {
+        matches!(
+            local,
+            "Ignorable" | "ProcessContent" | "PreserveElements" | "PreserveAttributes"
+        )
+    })
 }
 
 /// The start tag's attributes at the parser's current Start event, decoded,
 /// with a declaration for each prefix they use that a save does not keep
-/// (see [`rebuilt_bindings`]).
+/// (see [`rebuilt_bindings`]), and the inherited markup-compatibility rules
+/// naming a prefix they use, joined into the tag's own rule of that name.
 fn element_attrs(p: &XmlParser) -> ElementAttrs {
     let mut attrs: Vec<(String, String)> = p
         .attrs()
@@ -392,7 +438,10 @@ fn element_attrs(p: &XmlParser) -> ElementAttrs {
         if let Some((prefix, _)) = name.split_once(':') {
             prefixes.push(prefix.to_string());
         }
-        let own = attrs.iter().position(|(n, _)| *n == name);
+        let local = name.split_once(':').map_or(name.as_str(), |(_, l)| l);
+        let own = attrs.iter().position(|(n, _)| {
+            is_rule_name(n) && n.split_once(':').is_some_and(|(_, l)| l == local)
+        });
         let mut merged: Vec<(String, String)> = own.map(|i| attrs[i].clone()).into_iter().collect();
         merge_rule(&mut merged, &name, &value);
         match own {
