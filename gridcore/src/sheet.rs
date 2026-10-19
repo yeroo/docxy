@@ -637,6 +637,14 @@ pub struct Sheet {
     /// otherwise writes it from the model (adding one the filter commands
     /// created).
     pub auto_filter: Option<SheetAutoFilter>,
+    /// The range (r1, c1, r2, c2, 0-based) of the sheet's own top-level
+    /// `<sortState>` (not the one nested in an `<autoFilter>` or a table, nor
+    /// a custom view's). Structural edits move it while it only translates;
+    /// any other change (an edit inside it, a delete through it, an insert
+    /// pushing it off the sheet) makes it `None`. A save moves the element by
+    /// the same translation, or drops it once this is `None`; an element
+    /// whose `ref` doesn't read as a range is left alone.
+    pub sort_state: Option<(u32, u32, u32, u32)>,
     /// `<sheetPr filterMode>` (some rows are filtered): what the part said at
     /// load, then what a filter command last left. A save writes it when it
     /// differs from the part. `None` for a sheet built in memory that no

@@ -663,15 +663,115 @@ fn monday_scale(days: i64) -> GanttScale {
 
 #[test]
 fn row_rules_fill_the_body_and_follow_the_scroll_phase() {
-    assert_eq!(row_rules(100., 0.), [27., 55., 83.]);
-    assert_eq!(row_rules(84., 0.), [27., 55., 83.]);
-    assert_eq!(row_rules(83., 0.), [27., 55.]);
-    assert!(row_rules(0., 0.).is_empty());
+    let rules = |body_h: f32, scroll_y: f32| -> Vec<f32> {
+        ruled_rows(body_h, scroll_y)
+            .into_iter()
+            .map(|(_, y)| y)
+            .collect()
+    };
+    assert_eq!(rules(100., 0.), [27., 55., 83.]);
+    assert_eq!(rules(84., 0.), [27., 55., 83.]);
+    assert_eq!(rules(83., 0.), [27., 55.]);
+    assert!(rules(0., 0.).is_empty());
     // A scrolled list moves the rules up by the offset modulo a row, never off the grid.
-    assert_eq!(row_rules(100., 10.), [17., 45., 73.]);
-    assert_eq!(row_rules(100., 10. + ROW_H * 7.), row_rules(100., 10.));
-    assert_eq!(row_rules(100., 27.), [0., 28., 56., 84.]);
-    assert_eq!(row_rules(100., 28.), row_rules(100., 0.));
+    assert_eq!(rules(100., 10.), [17., 45., 73.]);
+    assert_eq!(rules(100., 10. + ROW_H * 7.), rules(100., 10.));
+    assert_eq!(rules(100., 27.), [0., 28., 56., 84.]);
+    assert_eq!(rules(100., 28.), rules(100., 0.));
+}
+
+/// #1575: each rule knows its row, so a gridline's interval lands on every
+/// Nth row however the body is scrolled; the bottom tier's lines at the Days
+/// level are the day lines, and the major tier's start at the weeks.
+#[test]
+fn ruled_rows_carry_their_row_and_tier_lines_follow_the_timescale() {
+    assert_eq!(ruled_rows(84., 0.), [(0, 27.), (1, 55.), (2, 83.)]);
+    assert_eq!(ruled_rows(60., ROW_H * 3. + 10.), [(3, 17.), (4, 45.)]);
+    let two = projcore::formatting::Gridline {
+        interval: 2,
+        ..projcore::formatting::Gridline::solid()
+    };
+    let at: Vec<usize> = ruled_rows(84., 0.)
+        .into_iter()
+        .filter(|(row, _)| two.at_interval(*row))
+        .map(|(row, _)| row)
+        .collect();
+    assert_eq!(at, [1], "the second row of the body");
+    let scale = GanttScale {
+        origin_day: 0,
+        days: 60,
+        day_w: 22.,
+    };
+    // The minor tier at the Days level is the days, each line carrying its
+    // day's index from the scale's origin, so a scroll of 11 px shows the
+    // same lines under the same indexes (#1575 r1).
+    assert_eq!(
+        tier_lines(scale, 0., 110., true),
+        [(0, 0.), (1, 22.), (2, 44.), (3, 66.), (4, 88.)]
+    );
+    assert_eq!(
+        tier_lines(scale, 11., 110., true),
+        [(1, 11.), (2, 33.), (3, 55.), (4, 77.), (5, 99.)]
+    );
+    let weeks: Vec<f32> = tier_lines(scale, 0., 22. * 21., false)
+        .into_iter()
+        .map(|(_, x)| x)
+        .collect();
+    assert!(
+        weeks.len() <= 4 && weeks.windows(2).all(|w| w[1] - w[0] == 22. * 7.),
+        "{weeks:?}"
+    );
+    assert_eq!(
+        instant_x(scale, 0., projcore::DateTime::from_minutes(1440 + 720)),
+        33.
+    );
+    assert_eq!(
+        instant_x(scale, 10., projcore::DateTime::from_minutes(1440 + 720)),
+        23.
+    );
+}
+
+/// #1575 r2: the Status Date line is the plan's `StatusDate` option alone;
+/// a plan with a current date and no status date draws the Current Date line
+/// and no Status Date line, however the latter is styled.
+#[test]
+fn a_status_date_line_needs_a_status_date() {
+    use projcore::formatting::gridlines::{Gridline, Gridlines, Line};
+    // Two days after the plan's start, inside a 2000 px chart.
+    let p = untitled_project();
+    let start = p.start_date.unwrap();
+    let day = |n: i64| projcore::DateTime::from_minutes(start.minutes() + n * 1440).to_mspdi();
+    let view = |status: Option<i64>| {
+        let mut p = untitled_project();
+        p.tasks = vec![task(1, 1, 1)];
+        p.set_option("CurrentDate", Some(&day(2)));
+        if let Some(n) = status {
+            p.set_option("StatusDate", Some(&day(n)));
+        }
+        let mut v = ProjectView::new(p, false);
+        v.layout(2000.);
+        v
+    };
+    let v = view(None);
+    let scale = v.chart_scale();
+    let mut grid = Gridlines::default();
+    grid.set(Line::CurrentDate, Gridline::solid());
+    grid.set(Line::StatusDate, Gridline::solid());
+    let lines: Vec<Line> = date_lines(&v.ed, &grid, scale, 0., scale.width())
+        .into_iter()
+        .map(|(line, _, _)| line)
+        .collect();
+    assert!(lines.contains(&Line::CurrentDate), "{lines:?}");
+    assert!(!lines.contains(&Line::StatusDate), "{lines:?}");
+    // With a status date of its own the line draws there.
+    let v = view(Some(1));
+    let xs: Vec<(Line, f32)> = date_lines(&v.ed, &grid, scale, 0., scale.width())
+        .into_iter()
+        .map(|(line, _, x)| (line, x))
+        .collect();
+    let at = |l: Line| xs.iter().find(|(line, _)| *line == l).map(|(_, x)| *x);
+    assert!(at(Line::StatusDate).is_some());
+    assert!(at(Line::StatusDate) < at(Line::CurrentDate), "{xs:?}");
 }
 
 #[test]
@@ -691,6 +791,15 @@ fn filler_rows_count_the_ruled_space_below_the_last_task() {
         8,
         "scrolling uncovers more empty rows"
     );
+}
+
+/// The default Bottom Tier Column at the Days level: the day lines (#1575).
+fn day_lines(scale: GanttScale, offset: f32, width: f32) -> Vec<f32> {
+    let default = projcore::formatting::gridlines::Line::BottomTierColumn.default_style();
+    bottom_tier_lines(scale, offset, width, &default)
+        .into_iter()
+        .map(|(_, x)| x)
+        .collect()
 }
 
 #[test]

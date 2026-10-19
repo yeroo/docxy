@@ -6,10 +6,14 @@
 //! ([`crate::yppx`]) and drawn by the hosts' table and chart. MSPDI carries
 //! none of it, as in Project. The dialogs that edit it may come from a UI
 //! plugin (a command's `view` reply, [`Formatting::apply_view`]) or later from
-//! the built-ins.
+//! the built-ins. The gridlines are Project's Gridlines dialog as data
+//! ([`gridlines`], #1575).
 
 use crate::json::Json;
 use opccore::xml::{Event, XmlParser};
+
+pub mod gridlines;
+pub use gridlines::{Gridline, Gridlines, LineType};
 
 /// The `.yppx` part the formatting is saved in.
 pub const PART: &str = "formatting.xml";
@@ -166,7 +170,8 @@ pub struct Formatting {
     pub palette: Option<String>,
     pub text_styles: Vec<CategoryStyle>,
     pub cell_styles: Vec<CellStyle>,
-    pub gridlines: Option<String>,
+    /// The lines set away from their default (#1575); see [`gridlines`].
+    pub gridlines: Gridlines,
     pub link_style: Option<String>,
     /// Named view switches a UI plugin owns (Project's per-view toggles
     /// such as Slack, Late Tasks or a Task Path kind), sorted by name
@@ -259,9 +264,10 @@ impl Formatting {
     /// Apply a UI plugin command's `view` reply: `palette` (a string, or
     /// null to clear), `text_styles` (an object of category to style, a
     /// null clearing one), `cells` (an array of `{uid, column, ...style}`,
-    /// an empty style clearing one), `gridlines` and `link_style` (strings
-    /// or null). Other keys are the host's (its view switches) and ignored
-    /// here. `true` when something changed.
+    /// an empty style clearing one), `gridlines` (an object of line name to
+    /// its drawing, or null for every default: [`Gridlines::apply`], #1575)
+    /// and `link_style` (a string or null). Other keys are the host's (its
+    /// view switches) and ignored here. `true` when something changed.
     pub fn apply_view(&mut self, view: &Json) -> Result<bool, String> {
         let before = self.clone();
         let text = |v: &Json, key: &str| -> Result<Option<Option<String>>, String> {
@@ -275,8 +281,8 @@ impl Formatting {
         if let Some(p) = text(view, "palette")? {
             self.palette = p.filter(|p| !p.is_empty());
         }
-        if let Some(g) = text(view, "gridlines")? {
-            self.gridlines = g;
+        if let Some(g) = view.get("gridlines") {
+            self.gridlines.apply(g, "view.gridlines")?;
         }
         if let Some(l) = text(view, "link_style")? {
             self.link_style = l;
@@ -330,9 +336,6 @@ impl Formatting {
         if let Some(p) = &self.palette {
             push_attr(&mut out, "palette", p);
         }
-        if let Some(g) = &self.gridlines {
-            push_attr(&mut out, "gridlines", g);
-        }
         if let Some(l) = &self.link_style {
             push_attr(&mut out, "link-style", l);
         }
@@ -356,6 +359,7 @@ impl Formatting {
             push_attr(&mut out, "on", if *on { "1" } else { "0" });
             out.push_str("/>\n");
         }
+        self.gridlines.to_xml(&mut out);
         out.push_str("</formatting>\n");
         out
     }
@@ -381,7 +385,8 @@ impl Formatting {
                             (!v.is_empty()).then_some(v)
                         };
                         out.palette = attr("palette");
-                        out.gridlines = attr("gridlines");
+                        // An older build's `gridlines` root attribute (an
+                        // opaque word nothing drew) is ignored.
                         out.link_style = attr("link-style");
                     } else if depth == 1 {
                         match name {
@@ -409,6 +414,7 @@ impl Formatting {
                                     out.set_switch(&name, Some(on));
                                 }
                             }
+                            "gridline" => out.gridlines.read_xml(&parser),
                             _ => {}
                         }
                     }
@@ -514,10 +520,21 @@ mod tests {
     fn sample() -> Formatting {
         let mut f = Formatting {
             palette: Some("fx.blue".into()),
-            gridlines: Some("dotted".into()),
             link_style: None,
             ..Formatting::default()
         };
+        f.gridlines.set(
+            gridlines::Line::GanttRows,
+            Gridline {
+                line_type: LineType::Dotted,
+                color: Some(0xCC3333),
+                interval: 2,
+                interval_type: LineType::Solid,
+                interval_color: None,
+            },
+        );
+        f.gridlines
+            .set(gridlines::Line::SheetRows, Gridline::default());
         f.set_switch("fx.slack", Some(true));
         f.set_switch("fx.late", Some(false));
         f.set_category(
@@ -555,8 +572,15 @@ mod tests {
         let f = sample();
         let xml = f.to_xml();
         assert!(xml.starts_with("<?xml"), "{xml}");
+        assert!(xml.contains(r#"<formatting palette="fx.blue">"#), "{xml}");
         assert!(
-            xml.contains(r#"<formatting palette="fx.blue" gridlines="dotted">"#),
+            xml.contains(
+                r##"<gridline line="Gantt Rows" type="dotted" color="#CC3333" interval="2" interval-type="solid"/>"##
+            ),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<gridline line="Sheet Rows" type="none"/>"#),
             "{xml}"
         );
         assert!(xml.contains(r##"font="Segoe UI &lt;&quot;&amp;&gt;" size="11.5" bold="1" italic="0" color="#1F3763""##), "{xml}");
@@ -606,11 +630,20 @@ mod tests {
             r##"{"palette":"fx.red","critical":true,
                  "text_styles":{"Critical Tasks":{"color":"#CC0000","bold":true},"All":{"size":9}},
                  "cells":[{"uid":2,"column":"Duration","italic":true}],
-                 "gridlines":"solid","link_style":"rectilinear"}"##,
+                 "gridlines":{"Gantt Rows":{"type":"dotted"}},"link_style":"rectilinear"}"##,
         )
         .unwrap();
         assert!(f.apply_view(&view).unwrap());
         assert_eq!(f.palette.as_deref(), Some("fx.red"));
+        assert_eq!(
+            f.gridlines.get(gridlines::Line::GanttRows).line_type,
+            LineType::Dotted
+        );
+        assert_eq!(
+            f.apply_view(&Json::parse(r#"{"gridlines":"solid"}"#).unwrap())
+                .unwrap_err(),
+            "view.gridlines is not an object or null"
+        );
         assert_eq!(f.category("Critical Tasks").unwrap().color, Some(0xCC0000));
         assert_eq!(f.category("All").unwrap().size, Some(9.0));
         assert_eq!(f.cell(2, "Duration").unwrap().italic, Some(true));
@@ -656,7 +689,7 @@ mod tests {
         assert!(f.apply_view(&clear).unwrap());
         assert_eq!(f.palette, None);
         assert_eq!(f.category("All"), None);
-        assert_eq!(f.gridlines, None);
+        assert!(f.gridlines.is_empty());
         assert!(
             !f.apply_view(&Json::parse(r#"{"critical":false}"#).unwrap())
                 .unwrap()

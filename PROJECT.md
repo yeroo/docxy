@@ -44,7 +44,7 @@ Built bottom-up, each a pure module:
 | `gantt` | export a scheduled project as a Markdown/Mermaid Gantt chart, with a task table (dates, Deadline with a missed-deadline `⚠`, duration, slack) |
 | `report` | Project's Report › View Reports as Markdown, from the plan's stored values |
 | `yppx` | the native `.yppx` OPC package (ZIP + `[Content_Types].xml` + `project.xml`, plus `formatting.xml` when the plan has formatting) |
-| `formatting` | the plan's formatting (#1532, #1390): bar palette id, text styles per category and per cell, gridline and link-line styles, and the named view switches a UI plugin owns (#1553, `<switch name on>`); `Project::formatting`, edited as one undo step by `Editor::edit_formatting`, saved in `formatting.xml`, never in MSPDI |
+| `formatting` | the plan's formatting (#1532, #1390): bar palette id, text styles per category and per cell, the gridlines (#1575, `formatting::gridlines`: Project's Gridlines dialog as data, a type, colour and interval per line, `<gridline line type color interval interval-type interval-color>`, only lines set away from their default stored) and link-line style, and the named view switches a UI plugin owns (#1553, `<switch name on>`); `Project::formatting`, edited as one undo step by `Editor::edit_formatting`, saved in `formatting.xml`, never in MSPDI |
 | `formats` | the `ProjectFormat` trait and the `Registry` of formats hosts open and save (built-in `.yppx` and `.xml`), and, behind the `plugins` feature, the format and UI plugin loader |
 | `plugin_abi` | the C ABI a format plugin implements, with the optional version-target and UI symbols (see [Format plugins](#format-plugins) and [UI plugins](#ui-plugins-1532)) |
 | `json` | the hand-written JSON value the plugin ABI's payloads use |
@@ -509,7 +509,10 @@ without one nothing changes.
   `resource.*`, `proj.set`, `level.all`, `cal.*`, ...) as `{verb, args}`, applied by `projctl::apply_ops` in one
   `Editor::batch`: one undo step, all or nothing, the refusal on the status
   line. `dialog` names a spec to open, whose OK sends the same id again with
-  `values`; `view` sets host view settings (the palette, flags). Code 1
+  `values`; `view` sets host view settings (the palette, flags, and
+  `gridlines`: an object of Project's line names, each `{type, color,
+  interval, interval_type, interval_color}` or null for its default, or null
+  for every default, #1575). Code 1
   (unsupported) means "not my command", so several plugins can coexist.
   A dialog spec may list buttons of its own (#1602: `{id, label, default?,
   cancel?}`; a press sends the command with `button: <id>` and the values,
@@ -562,7 +565,9 @@ without one nothing changes.
   `task-information` spec's pages in the Task Information dialog, a
   command's dialog with `multiline` and `grid` controls, the overlay's
   shapes over the chart after the bars, the palette the plan's formatting
-  names on the bars, and the formatting's text styles on the table. State
+  names on the bars, the formatting's text styles on the table, and its
+  gridlines (#1575) as the table's row and column rules, the chart's row
+  rules, tier columns and date lines and the timescale's title lines. State
   (enabled, checked, the checked swatch, dialog prefills) is asked when the
   plan's revision, the selection or the view changes, never per frame; a
   command's ops and `view` are one undo step. The harness marks what came

@@ -5057,3 +5057,68 @@ fn the_toolbar_reads_the_effective_style() {
     assert_eq!(own.bold, Some(false));
     assert!(!project_toolbar(v(&t), Some(uid))[2].entry.checked);
 }
+
+/// macOS (#1312): a ⌥ character types into an open cell and prompt as a
+/// plain key does; ⌥← and ⌘/⌃ chords stay as they were, and with no edit
+/// open the key is left alone.
+#[test]
+fn option_characters_type_into_the_cell_editor_and_prompt() {
+    let alt = Modifiers {
+        alt: true,
+        ..Modifiers::default()
+    };
+    let down = |key: &str, ch: Option<&str>, m: Modifiers| KeyDownEvent {
+        keystroke: Keystroke {
+            modifiers: m,
+            key: key.into(),
+            key_char: ch.map(Into::into),
+        },
+        is_held: false,
+        prefer_character_input: false,
+    };
+    let feed = |t: &mut DocTab, ev: &KeyDownEvent, open: bool| {
+        let k = project_stroke(ev, open, true);
+        project_input(
+            t,
+            k.key.as_str(),
+            k.key_char.as_deref(),
+            project_mods(k.modifiers, true),
+        );
+    };
+    let mut t = tab();
+    vm(&mut t).col = COL_NAME;
+    project_input(&mut t, "enter", None, Modifiers::default());
+    assert!(v(&t).cell.is_some());
+    let before = v(&t).cell.as_ref().unwrap().buf.clone();
+    feed(&mut t, &down("g", Some("©"), alt), true);
+    feed(&mut t, &down("2", Some("™"), alt), true);
+    assert_eq!(v(&t).cell.as_ref().unwrap().buf, format!("{before}©™"));
+    let now = v(&t).cell.as_ref().unwrap().buf.clone();
+    feed(&mut t, &down("left", None, alt), true);
+    feed(&mut t, &down("backspace", None, alt), true);
+    assert_eq!(v(&t).cell.as_ref().unwrap().buf, now);
+    // The stroke with no edit open is the key-down's own.
+    let g = down("g", Some("©"), alt);
+    assert_eq!(project_stroke(&g, false, true), g.keystroke);
+    assert_ne!(project_stroke(&g, true, true), g.keystroke);
+    project_input(&mut t, "escape", None, Modifiers::default());
+
+    apply_project_act(&mut t, ProjectAct::MoveTask);
+    let before = v(&t).prompt.as_ref().unwrap().buf.clone();
+    feed(&mut t, &down("g", Some("©"), alt), true);
+    let euro = Modifiers { shift: true, ..alt };
+    feed(&mut t, &down("2", Some("€"), euro), true);
+    feed(&mut t, &down("space", Some("\u{a0}"), alt), true);
+    assert_eq!(
+        v(&t).prompt.as_ref().unwrap().buf,
+        format!("{before}©€\u{a0}")
+    );
+    let now = v(&t).prompt.as_ref().unwrap().buf.clone();
+    feed(&mut t, &down("left", None, alt), true);
+    let cmd = Modifiers {
+        platform: true,
+        ..Modifiers::default()
+    };
+    feed(&mut t, &down("g", Some("g"), cmd), true);
+    assert_eq!(v(&t).prompt.as_ref().unwrap().buf, now);
+}

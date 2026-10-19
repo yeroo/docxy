@@ -1,5 +1,6 @@
 //! Day-scale geometry shared by the renderer and harness.
 use super::*;
+use projcore::formatting::gridlines::{Gridline, Gridlines, Line, LineType};
 
 /// The pixels one day is wide at the default zoom (the Days level); a view's live
 /// value is [`GanttScale::day_w`].
@@ -351,27 +352,129 @@ pub(crate) fn shaded_runs(
     runs
 }
 
-/// The left edge of each visible day, relative to the chart viewport.
-pub(crate) fn day_lines(scale: GanttScale, offset: f32, width: f32) -> Vec<f32> {
-    if scale.day_w < MIN_LINE_DAY_W {
-        return Vec::new();
-    }
-    scale
-        .visible(offset, width)
-        .map(|day| day as f32 * scale.day_w - offset)
-        .filter(|x| (0. ..width).contains(x))
+/// The bottom rule of each row in view, in body pixels, with its row (0 for
+/// the first row of the body) for a gridline's interval (#1575). `scroll_y`
+/// grows downward, so the rules follow the list's scroll phase whether a row
+/// holds a task or not.
+pub(crate) fn ruled_rows(body_h: f32, scroll_y: f32) -> Vec<(usize, f32)> {
+    let scroll_y = scroll_y.max(0.);
+    ((scroll_y / ROW_H).floor().max(0.) as usize..)
+        .map(|k| (k, (k + 1) as f32 * ROW_H - 1. - scroll_y))
+        .skip_while(|(_, y)| *y < 0.)
+        .take_while(|(_, y)| *y < body_h)
         .collect()
 }
 
-/// The bottom rule of each row in view, in body pixels. `scroll_y` grows downward, so the
-/// rules follow the list's scroll phase whether a row holds a task or not.
-pub(crate) fn row_rules(body_h: f32, scroll_y: f32) -> Vec<f32> {
-    let scroll_y = scroll_y.max(0.);
-    ((scroll_y / ROW_H).floor() as i64..)
-        .map(|k| (k + 1) as f32 * ROW_H - 1. - scroll_y)
-        .skip_while(|y| *y < 0.)
-        .take_while(|y| *y < body_h)
+/// A gridline's colour: its own, else the host's `automatic` for that line.
+pub(crate) fn gridline_color(color: Option<u32>, automatic: Hsla) -> Hsla {
+    color.map_or(automatic, crate::hsla_u)
+}
+
+/// Paint one rule of `line_type` from `origin`, `len` px long, 1 px thick,
+/// horizontal or vertical: the type's dash pattern as a run of quads
+/// (`LineType::segments`), a solid one as one. `None` paints nothing.
+pub(crate) fn paint_rule(
+    window: &mut Window,
+    origin: Point<Pixels>,
+    len: f32,
+    vertical: bool,
+    line_type: LineType,
+    color: Hsla,
+) {
+    for (start, seg) in line_type.segments(len) {
+        let (o, s) = if vertical {
+            (point(origin.x, origin.y + px(start)), size(px(1.), px(seg)))
+        } else {
+            (point(origin.x + px(start), origin.y), size(px(seg), px(1.)))
+        };
+        window.paint_quad(fill(Bounds { origin: o, size: s }, color));
+    }
+}
+
+/// The left edge of each visible cell of a timescale tier, relative to the
+/// chart viewport, with the cell's ordinal from the scale's origin (#1575):
+/// the Middle and Bottom Tier Column lines. The chart's header draws two
+/// tiers (`zoom::tiers`, Project's middle and bottom), so the middle tier is
+/// the major unit and the bottom the minor; the Top Tier Column has no tier
+/// to draw on and is kept in the model undrawn, like Bar Rows.
+pub(crate) fn tier_lines(
+    scale: GanttScale,
+    offset: f32,
+    width: f32,
+    minor: bool,
+) -> Vec<(usize, f32)> {
+    let level = &zoom::LEVELS[zoom::nearest(scale.day_w)];
+    let unit = if minor { level.minor } else { level.major };
+    // Within the viewport, and never past the scale's last day. The cells
+    // are consecutive unit starts, so the walk from the origin happens once,
+    // for the first, and the rest count up from it.
+    let cells: Vec<zoom::Cell> = zoom::tier(scale, unit, offset, width)
+        .into_iter()
+        .filter(|c| c.x < scale.width())
+        .collect();
+    let Some(first) = cells.first() else {
+        return Vec::new();
+    };
+    let base = zoom::tier_index(scale, unit, first.x);
+    cells
+        .into_iter()
+        .enumerate()
+        .map(|(k, c)| (base + k, c.x - offset))
+        .filter(|(_, x)| (0. ..width).contains(x))
         .collect()
+}
+
+/// The Bottom Tier Column's lines (#1575): the bottom tier's cells, so a
+/// line per day at the Days level and one per week at Weeks, as Project
+/// draws them. A bottom tier left at its default keeps the rule from before
+/// the model: nothing below [`MIN_LINE_DAY_W`] px per day, where day lines
+/// would be a wash.
+pub(crate) fn bottom_tier_lines(
+    scale: GanttScale,
+    offset: f32,
+    width: f32,
+    style: &Gridline,
+) -> Vec<(usize, f32)> {
+    let default = *style == Line::BottomTierColumn.default_style();
+    if !style.draws() || (default && scale.day_w < MIN_LINE_DAY_W) {
+        return Vec::new();
+    }
+    tier_lines(scale, offset, width, true)
+}
+
+/// The chart x of an instant, within its day, relative to the viewport.
+pub(crate) fn instant_x(scale: GanttScale, offset: f32, at: projcore::DateTime) -> f32 {
+    (at.minutes() - scale.origin_day * 1440) as f32 / 1440. * scale.day_w - offset
+}
+
+/// The chart's date lines (#1575): each line that draws, with its x in the
+/// viewport, in list order. The current date is Project's `CurrentDate`
+/// option, the status date the plan's `StatusDate` option (no fallback to
+/// the current date: a plan without a status date draws no Status Date
+/// line), the project start and finish the schedule's.
+pub(crate) fn date_lines(
+    ed: &projcore::editor::Editor,
+    grid: &Gridlines,
+    scale: GanttScale,
+    offset: f32,
+    width: f32,
+) -> Vec<(Line, Gridline, f32)> {
+    let proj = ed.project();
+    let sched = ed.schedule();
+    let date_option = |name: &str| proj.option(name).and_then(projcore::DateTime::parse_mspdi);
+    [
+        (Line::CurrentDate, date_option("CurrentDate")),
+        (Line::ProjectStart, Some(sched.project_start)),
+        (Line::ProjectFinish, Some(sched.project_finish)),
+        (Line::StatusDate, date_option("StatusDate")),
+    ]
+    .into_iter()
+    .filter_map(|(line, at)| {
+        let style = grid.get(line);
+        let x = instant_x(scale, offset, at?).floor();
+        (style.line_type != LineType::None && (0. ..width).contains(&x)).then_some((line, style, x))
+    })
+    .collect()
 }
 
 /// Ruled empty rows visible below the last task, counting a partly visible one.
@@ -419,6 +522,16 @@ fn backdrop(
 /// chart shading, day lines and rules. Painted once at full height so it fills the pane.
 pub(crate) fn body_grid(view: &ProjectView, pal: Pal) -> impl IntoElement {
     let cal = view.ed.project().project_shading_calendar();
+    // The plan's gridlines (#1575): each line's type, colour and interval;
+    // the defaults are the rules drawn before the model.
+    let grid = view.ed.project().formatting.gridlines.clone();
+    let dates = date_lines(
+        &view.ed,
+        &grid,
+        view.chart_scale(),
+        view.gantt_x.get(),
+        view.gantt_w,
+    );
     // The handle the list tracks, so the rules cannot drift from the rows.
     let scroll = view.scroll.clone();
     // The same widths and offsets the rows are drawn at this render.
@@ -444,41 +557,67 @@ pub(crate) fn body_grid(view: &ProjectView, pal: Pal) -> impl IntoElement {
             // Read at paint: the list's prepaint, which runs after this canvas's, settles the offset.
             let scroll_y = -f32::from(scroll.0.borrow().base_handle.offset().y);
             let body_h = f32::from(bounds.size.height);
-            let rules = row_rules(body_h, scroll_y);
-            let hline = |window: &mut Window, x: Pixels, w: Pixels, y: f32| {
-                window.paint_quad(fill(
-                    Bounds {
-                        origin: point(x, bounds.origin.y + px(y)),
-                        size: size(w, px(1.)),
-                    },
-                    rule,
-                ));
-            };
-            let vline = |window: &mut Window, x: Pixels, color: Hsla| {
-                window.paint_quad(fill(
-                    Bounds {
-                        origin: point(x, bounds.origin.y),
-                        size: size(px(1.), bounds.size.height),
-                    },
+            let rules = ruled_rows(body_h, scroll_y);
+            // A row rule of `line` across `w` from `x`: the row's interval
+            // style when the interval lands on it, else the normal one, in
+            // the line's colour or the host's `automatic`.
+            let hlines =
+                |window: &mut Window, x: Pixels, w: Pixels, line: Line, automatic: Hsla| {
+                    let style = grid.get(line);
+                    for &(row, y) in &rules {
+                        let (t, c) = style.style_at(row);
+                        paint_rule(
+                            window,
+                            point(x, bounds.origin.y + px(y)),
+                            f32::from(w),
+                            false,
+                            t,
+                            gridline_color(c, automatic),
+                        );
+                    }
+                };
+            let vline = |window: &mut Window, x: Pixels, t: LineType, color: Hsla| {
+                paint_rule(
+                    window,
+                    point(x, bounds.origin.y),
+                    f32::from(bounds.size.height),
+                    true,
+                    t,
                     color,
-                ));
+                );
             };
             let table = Bounds {
                 origin: bounds.origin,
                 size: size(px(table_w).min(bounds.size.width), bounds.size.height),
             };
             window.with_content_mask(Some(ContentMask { bounds: table }), |window| {
+                let columns = grid.get(Line::SheetColumns);
                 let mut edge = 0.;
-                for w in widths {
+                for (k, w) in widths.into_iter().enumerate() {
                     edge += w;
-                    vline(window, bounds.origin.x + px(edge - table_x - 1.), rule);
+                    let (t, c) = columns.style_at(k);
+                    vline(
+                        window,
+                        bounds.origin.x + px(edge - table_x - 1.),
+                        t,
+                        gridline_color(c, rule),
+                    );
                 }
-                for y in &rules {
-                    hline(window, bounds.origin.x, table.size.width, *y);
-                }
+                hlines(
+                    window,
+                    bounds.origin.x,
+                    table.size.width,
+                    Line::SheetRows,
+                    rule,
+                );
             });
             // The rows' inset divider, continued below the last task.
-            vline(window, bounds.origin.x + px(table_w), pal.border);
+            vline(
+                window,
+                bounds.origin.x + px(table_w),
+                LineType::Solid,
+                pal.border,
+            );
             let Some(chart) = gantt_viewport(bounds, table_w, gantt_w) else {
                 return;
             };
@@ -499,11 +638,45 @@ pub(crate) fn body_grid(view: &ProjectView, pal: Pal) -> impl IntoElement {
                         nonworking_fill(pal),
                     ));
                 }
-                for x in day_lines(scale, gantt_x, width) {
-                    vline(window, chart.origin.x + px(x), day_rule);
+                // The tier columns (#1575): each line's interval index counts
+                // from the scale's origin, so the pattern stays put as the
+                // chart scrolls.
+                let bottom = grid.get(Line::BottomTierColumn);
+                for (k, x) in bottom_tier_lines(scale, gantt_x, width, &bottom) {
+                    let (t, c) = bottom.style_at(k);
+                    vline(
+                        window,
+                        chart.origin.x + px(x),
+                        t,
+                        gridline_color(c, day_rule),
+                    );
                 }
-                for y in &rules {
-                    hline(window, chart.origin.x, chart.size.width, *y);
+                // The major tier is the header's upper tier, Project's
+                // middle; the Top Tier Column stays undrawn until a header
+                // with three tiers exists.
+                let middle = grid.get(Line::MiddleTierColumn);
+                if middle.draws() {
+                    for (k, x) in tier_lines(scale, gantt_x, width, false) {
+                        let (t, c) = middle.style_at(k);
+                        vline(window, chart.origin.x + px(x), t, gridline_color(c, rule));
+                    }
+                }
+                hlines(
+                    window,
+                    chart.origin.x,
+                    chart.size.width,
+                    Line::GanttRows,
+                    rule,
+                );
+                // The date lines (#1575): current and status date, project
+                // start and finish, over the rules.
+                for (_, style, x) in &dates {
+                    vline(
+                        window,
+                        chart.origin.x + px(*x),
+                        style.line_type,
+                        gridline_color(style.color, pal.dim),
+                    );
                 }
             });
         },
@@ -518,18 +691,27 @@ pub(crate) fn gantt_header(
     offset: f32,
     width: f32,
     pal: Pal,
+    grid: &Gridlines,
 ) -> impl IntoElement {
     div()
         .relative()
         .w(px(scale.width()))
         .h(px(ROW_H))
         .child(backdrop(scale, cal, offset, width, pal))
-        .children(header_cells(scale, offset, width, pal))
+        .children(header_cells(scale, offset, width, pal, grid))
 }
 
 /// The header's two tiers, 14 px each: the major unit over the minor, each
-/// cell ruled on its left and labelled when the label fits.
-fn header_cells(scale: GanttScale, offset: f32, width: f32, pal: Pal) -> Vec<Div> {
+/// cell ruled on its left (the Title Vertical gridline) and labelled when
+/// the label fits; the minor tier ruled on its top (Title Horizontal). A
+/// title line draws solid whatever its type, in its colour (#1575).
+fn header_cells(
+    scale: GanttScale,
+    offset: f32,
+    width: f32,
+    pal: Pal,
+    grid: &Gridlines,
+) -> Vec<Div> {
     let level = &zoom::LEVELS[zoom::nearest(scale.day_w)];
     let (major, minor) = zoom::tiers(scale, level, offset, width);
     let half = ROW_H / 2.;
@@ -537,6 +719,8 @@ fn header_cells(scale: GanttScale, offset: f32, width: f32, pal: Pal) -> Vec<Div
         a: pal.border.a * 0.6,
         ..pal.border
     };
+    let vertical = grid.get(Line::TitleVertical);
+    let horizontal = grid.get(Line::TitleHorizontal);
     let cell = |c: zoom::Cell, top: f32, bold: bool| {
         div()
             .absolute()
@@ -544,8 +728,10 @@ fn header_cells(scale: GanttScale, offset: f32, width: f32, pal: Pal) -> Vec<Div
             .top(px(top))
             .w(px(c.w))
             .h(px(half))
-            .border_l_1()
-            .border_color(rule)
+            .when(vertical.line_type != LineType::None, |d| {
+                d.border_l_1()
+                    .border_color(gridline_color(vertical.color, rule))
+            })
             .overflow_hidden()
             .whitespace_nowrap()
             .text_size(px(10.))
@@ -554,7 +740,22 @@ fn header_cells(scale: GanttScale, offset: f32, width: f32, pal: Pal) -> Vec<Div
             .child(div().absolute().left(px(c.at - c.x + 2.)).child(c.label))
     };
     let mut cells: Vec<Div> = major.into_iter().map(|c| cell(c, 0., true)).collect();
-    cells.extend(minor.into_iter().map(|c| cell(c, half, false).border_t_1()));
+    // The Title Horizontal rule is a child of its own: gpui's border colour
+    // is one value for all four sides, so a top border would recolour the
+    // cell's Title Vertical left rule.
+    cells.extend(minor.into_iter().map(|c| {
+        cell(c, half, false).when(horizontal.line_type != LineType::None, |d| {
+            d.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(1.))
+                    .bg(gridline_color(horizontal.color, rule)),
+            )
+        })
+    }));
     cells
 }
 

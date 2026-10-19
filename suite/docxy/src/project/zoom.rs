@@ -309,6 +309,20 @@ pub(crate) fn tier(scale: GanttScale, unit: Unit, offset: f32, width: f32) -> Ve
     cells
 }
 
+/// The ordinal of the `unit` cell starting at chart `x` px, counted from
+/// the cell at or before the scale's origin (0): a gridline's interval index
+/// (#1575), the same wherever the chart is scrolled.
+pub(crate) fn tier_index(scale: GanttScale, unit: Unit, x: f32) -> usize {
+    let target = scale.origin_day + (x / scale.day_w).round() as i64;
+    let mut day = unit.start_at_or_before(scale.origin_day);
+    let mut k = 0;
+    while day < target && k < 1 << 20 {
+        day = unit.next_start(day);
+        k += 1;
+    }
+    k
+}
+
 /// The major and minor tiers of `level` over the visible offsets.
 pub(crate) fn tiers(
     scale: GanttScale,
