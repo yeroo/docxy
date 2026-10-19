@@ -22,7 +22,10 @@ fn saved(document: &str) -> String {
             content_types.as_bytes().to_vec(),
         ),
         ("_rels/.rels".to_string(), root_rels.as_bytes().to_vec()),
-        ("word/document.xml".to_string(), document.as_bytes().to_vec()),
+        (
+            "word/document.xml".to_string(),
+            document.as_bytes().to_vec(),
+        ),
     ]);
     let mut pkg = load_package(&bytes).expect("fixture loads");
     pkg.document = pkg.document.clone();
@@ -187,4 +190,135 @@ fn prefixed_only_properties_get_no_default_declaration() {
         "<w:p><w:pPr><w:keepNext/></w:pPr><w:r><w:t>a</w:t></w:r></w:p>",
     );
     assert!(!saved(&src).contains("urn:vendor"));
+}
+
+/// The tokens of `mc:Ignorable` in effect at each element named `name`
+/// (declared on it or an ancestor), in document order.
+fn ignorable_at(xml: &str, name: &str) -> Vec<Vec<String>> {
+    let mut scopes: Vec<Vec<String>> = Vec::new();
+    let mut found = Vec::new();
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start => {
+                let own: Vec<String> = p
+                    .attrs()
+                    .iter()
+                    .filter(|a| a.name == "mc:Ignorable")
+                    .flat_map(|a| a.value.split_whitespace().map(str::to_string))
+                    .collect();
+                scopes.push(own);
+                if p.name() == name {
+                    let mut all: Vec<String> = scopes.iter().flatten().cloned().collect();
+                    all.sort();
+                    all.dedup();
+                    found.push(all);
+                }
+            }
+            Event::End => {
+                scopes.pop();
+            }
+            Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+    found
+}
+
+/// Prefix `ux` is still bound at each element named `name`.
+fn ux_bound_at(xml: &str, name: &str) -> bool {
+    namespaces_of_prefixed(xml, name, "ux") == Some(true)
+}
+
+fn namespaces_of_prefixed(xml: &str, name: &str, prefix: &str) -> Option<bool> {
+    let decl = format!("xmlns:{prefix}");
+    let mut scopes: Vec<bool> = Vec::new();
+    let mut result = None;
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start => {
+                scopes.push(p.attrs().iter().any(|a| a.name == decl));
+                if p.name() == name {
+                    result = Some(scopes.iter().any(|b| *b));
+                }
+            }
+            Event::End => {
+                scopes.pop();
+            }
+            Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+    result
+}
+
+fn assert_ignorable_survives(src: &str, element: &str) {
+    let want = vec!["ux".to_string()];
+    for (label, xml) in [("saved", saved(src))] {
+        assert_eq!(
+            ignorable_at(&xml, element),
+            [want.clone()],
+            "{label}: {xml}"
+        );
+        assert!(ux_bound_at(&xml, element), "{label}: {xml}");
+        // A second round neither loses nor changes it.
+        let again = saved(&xml);
+        assert_eq!(ignorable_at(&again, element), [want.clone()], "{again}");
+        assert_eq!(again, saved(&again), "stable: {again}");
+    }
+}
+
+#[test]
+fn mce_ignorable_from_body_reaches_paragraph_attr() {
+    let src = doc(
+        " xmlns:ux=\"urn:ux\" mc:Ignorable=\"ux\"",
+        "<w:p ux:label=\"x\"><w:r><w:t>a</w:t></w:r></w:p>",
+    );
+    assert_ignorable_survives(&src, "w:p");
+}
+
+#[test]
+fn mce_ignorable_from_tc_reaches_run_and_row() {
+    let src = doc(
+        "",
+        "<w:tbl><w:tblGrid><w:gridCol w:w=\"2000\"/></w:tblGrid>\
+         <w:tr><w:tc xmlns:ux=\"urn:ux\" mc:Ignorable=\"ux\"><w:p><w:r ux:label=\"x\">\
+         <w:t>a</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p/>",
+    );
+    assert_ignorable_survives(&src, "w:r");
+}
+
+#[test]
+fn mce_ignorable_from_rpr_reaches_shadow() {
+    let src = doc(
+        "",
+        "<w:p><w:r><w:rPr xmlns:ux=\"urn:ux\" mc:Ignorable=\"ux\"><w:b ux:label=\"x\"/></w:rPr>\
+         <w:t>a</w:t></w:r></w:p>",
+    );
+    let out = saved(&src);
+    assert_eq!(ignorable_at(&out, "w:b"), [vec!["ux".to_string()]], "{out}");
+    assert!(ux_bound_at(&out, "w:b"), "{out}");
+}
+
+#[test]
+fn mce_rule_redeclares_only_the_prefixes_the_element_uses() {
+    let src = doc(
+        " xmlns:ux=\"urn:ux\" xmlns:vy=\"urn:vy\" mc:Ignorable=\"ux vy\"",
+        "<w:p ux:label=\"x\"><w:r><w:t>a</w:t></w:r></w:p>",
+    );
+    let out = saved(&src);
+    assert_eq!(ignorable_at(&out, "w:p"), [vec!["ux".to_string()]], "{out}");
+    assert!(!out.contains("urn:vy"), "{out}");
+}
+
+#[test]
+fn mce_without_extension_attrs_is_byte_identical() {
+    let src = doc(
+        " xmlns:ux=\"urn:ux\" mc:Ignorable=\"ux\"",
+        "<w:p><w:r><w:t>a</w:t></w:r></w:p>",
+    );
+    let out = saved(&src);
+    assert!(!out.contains("Ignorable"), "{out}");
+    assert!(!out.contains("urn:ux"), "{out}");
 }

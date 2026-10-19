@@ -140,7 +140,7 @@ const PART_ROOTS: [&str; 6] = [
 /// bind the prefix to another namespace. The innermost binding of each
 /// prefix, as `(prefix, namespace)`; the default namespace is the empty
 /// prefix (`xmlns=""` is `("", "")`), declared below the root or reset there.
-fn rebuilt_bindings(p: &XmlParser) -> Vec<(String, String)> {
+fn rebuilt_bindings(p: &XmlParser) -> Rebuilt {
     let mut out: Vec<(String, String)> = Vec::new();
     for scoped in p.namespace_scoped_attrs() {
         let Some(prefix) = (scoped.attr.name == "xmlns")
@@ -162,7 +162,89 @@ fn rebuilt_bindings(p: &XmlParser) -> Vec<(String, String)> {
             out.push((prefix.to_string(), ns));
         }
     }
-    out
+    Rebuilt {
+        ns: out,
+        mce: inherited_markup_compatibility(p),
+    }
+}
+
+/// What a save does not keep of the scope at a captured element: namespace
+/// bindings (the default namespace is the empty prefix) and the
+/// markup-compatibility rules inherited from a rebuilt ancestor.
+#[derive(Default)]
+struct Rebuilt {
+    ns: Vec<(String, String)>,
+    mce: Vec<(String, String)>,
+}
+
+/// Elements whose start tags a save writes back as loaded: a rule declared on
+/// one stays in effect for what it holds. Part roots are the others.
+const WRITTEN_BACK: [&str; 4] = ["w:p", "w:r", "w:tr", "w:tbl"];
+
+/// The markup-compatibility rules in scope at the parser's current Start
+/// event that a save drops with the ancestor that declared them (`w:body`,
+/// `w:tc`, a `w:rPr`, …): `mc:Ignorable`, `ProcessContent`,
+/// `PreserveElements` and `PreserveAttributes`, tokens merged by attribute
+/// (`Requires` and `MustUnderstand` are per element and not inherited).
+fn inherited_markup_compatibility(p: &XmlParser) -> Vec<(String, String)> {
+    let mut merged: Vec<(String, String)> = Vec::new();
+    for scoped in p.markup_compatibility_attrs() {
+        let name = scoped.attr.name;
+        let local = name.split_once(':').map_or(name, |(_, local)| local);
+        if !matches!(
+            local,
+            "Ignorable" | "ProcessContent" | "PreserveElements" | "PreserveAttributes"
+        ) || !name.contains(':')
+            || PART_ROOTS.contains(&scoped.element_name)
+            || WRITTEN_BACK.contains(&scoped.element_name)
+        {
+            continue;
+        }
+        merge_rule(&mut merged, name, &decode_attr(scoped.attr.value));
+    }
+    merged
+}
+
+/// Add `value`'s tokens to the rule named like `name` in `merged` (matched by
+/// local name), or start it.
+fn merge_rule(merged: &mut Vec<(String, String)>, name: &str, value: &str) {
+    let local = name.split_once(':').map_or(name, |(_, local)| local);
+    let found = merged.iter_mut().find(|(existing, _)| {
+        existing
+            .split_once(':')
+            .map_or(existing.as_str(), |(_, l)| l)
+            == local
+    });
+    let Some((_, existing)) = found else {
+        merged.push((name.to_string(), value.to_string()));
+        return;
+    };
+    for token in value.split_whitespace() {
+        if !existing.split_whitespace().any(|item| item == token) {
+            if !existing.is_empty() {
+                existing.push(' ');
+            }
+            existing.push_str(token);
+        }
+    }
+}
+
+/// The inherited rules in `rules` cut to the tokens naming a prefix in
+/// `used`; a rule left with none is dropped.
+fn rules_for_prefixes(rules: &[(String, String)], used: &[String]) -> Vec<(String, String)> {
+    rules
+        .iter()
+        .filter_map(|(name, value)| {
+            let kept: Vec<&str> = value
+                .split_whitespace()
+                .filter(|token| {
+                    let prefix = token.split_once(':').map_or(*token, |(prefix, _)| prefix);
+                    used.iter().any(|u| u == prefix)
+                })
+                .collect();
+            (!kept.is_empty()).then(|| (name.clone(), kept.join(" ")))
+        })
+        .collect()
 }
 
 /// The prefixes a markup-compatibility attribute (`mc:Ignorable`,
@@ -238,13 +320,26 @@ fn prefixes_of(raw: &str) -> (Vec<String>, Vec<String>) {
 /// `raw` with a declaration on its start tag for each prefix it uses that is
 /// bound in `bindings` (see [`rebuilt_bindings`]) and not declared there
 /// already, so it stays well-formed wherever a save writes it (#1063).
-fn declare_rebuilt(raw: &str, bindings: &[(String, String)]) -> String {
-    if bindings.is_empty() {
+fn declare_rebuilt(raw: &str, rebuilt: &Rebuilt) -> String {
+    if rebuilt.ns.is_empty() && rebuilt.mce.is_empty() {
         return raw.to_string();
     }
-    let (used, own) = prefixes_of(raw);
+    let (mut used, own) = prefixes_of(raw);
+    let rules = rules_for_prefixes(&rebuilt.mce, &used);
     let mut decls = String::new();
-    for (prefix, ns) in bindings {
+    for (name, value) in &rules {
+        // The element's own rule of that name wins.
+        if own_attr(raw, name) {
+            continue;
+        }
+        decls.push_str(&format!(" {name}=\""));
+        crate::serialize::esc_attr(value, &mut decls);
+        decls.push('"');
+        if let Some((prefix, _)) = name.split_once(':') {
+            used.push(prefix.to_string());
+        }
+    }
+    for (prefix, ns) in &rebuilt.ns {
         if used.contains(prefix) && !own.contains(prefix) {
             let colon = if prefix.is_empty() { "" } else { ":" };
             decls.push_str(&format!(" xmlns{colon}{prefix}=\""));
@@ -261,6 +356,12 @@ fn declare_rebuilt(raw: &str, bindings: &[(String, String)]) -> String {
     format!("{}{decls}{}", &raw[..name_end], &raw[name_end..])
 }
 
+/// Whether `raw`'s own start tag has the attribute `name`.
+fn own_attr(raw: &str, name: &str) -> bool {
+    let mut q = XmlParser::new(raw);
+    q.next() == Event::Start && q.attrs().iter().any(|a| a.name == name)
+}
+
 /// The start tag's attributes at the parser's current Start event, decoded,
 /// with a declaration for each prefix they use that a save does not keep
 /// (see [`rebuilt_bindings`]).
@@ -270,7 +371,7 @@ fn element_attrs(p: &XmlParser) -> ElementAttrs {
         .iter()
         .map(|a| (a.name.to_string(), decode_attr(a.value)))
         .collect();
-    let prefixes: Vec<String> = attrs
+    let mut prefixes: Vec<String> = attrs
         .iter()
         .filter(|(name, _)| name != "xmlns" && !name.starts_with("xmlns:"))
         .flat_map(|(name, value)| {
@@ -283,13 +384,28 @@ fn element_attrs(p: &XmlParser) -> ElementAttrs {
         })
         .filter(|prefix| prefix != "xml")
         .collect();
-    let bindings = rebuilt_bindings(p);
+    let rebuilt = rebuilt_bindings(p);
+    // A rule a rebuilt ancestor declared, for the extension prefixes this
+    // start tag uses, so a consumer that does not know them still ignores
+    // them; it joins the tag's own rule of that name.
+    for (name, value) in rules_for_prefixes(&rebuilt.mce, &prefixes) {
+        if let Some((prefix, _)) = name.split_once(':') {
+            prefixes.push(prefix.to_string());
+        }
+        let own = attrs.iter().position(|(n, _)| *n == name);
+        let mut merged: Vec<(String, String)> = own.map(|i| attrs[i].clone()).into_iter().collect();
+        merge_rule(&mut merged, &name, &value);
+        match own {
+            Some(i) => attrs[i] = merged.remove(0),
+            None => attrs.push((name, value)),
+        }
+    }
     for prefix in prefixes {
         let decl = format!("xmlns:{prefix}");
         if attrs.iter().any(|(name, _)| *name == decl) {
             continue;
         }
-        if let Some((_, ns)) = bindings.iter().find(|(p, _)| *p == prefix) {
+        if let Some((_, ns)) = rebuilt.ns.iter().find(|(p, _)| *p == prefix) {
             attrs.push((decl, ns.clone()));
         }
     }
@@ -2577,23 +2693,7 @@ fn reconstructed_markup_compatibility_attrs(p: &XmlParser<'_>) -> Vec<(String, S
             }
         }
 
-        if let Some((_, existing)) = merged.iter_mut().find(|(existing_name, _)| {
-            existing_name
-                .split_once(':')
-                .map_or(existing_name.as_str(), |(_, local)| local)
-                == local_name
-        }) {
-            for token in value.split_whitespace() {
-                if !existing.split_whitespace().any(|item| item == token) {
-                    if !existing.is_empty() {
-                        existing.push(' ');
-                    }
-                    existing.push_str(token);
-                }
-            }
-        } else {
-            merged.push((name.to_string(), value));
-        }
+        merge_rule(&mut merged, name, &value);
     }
     merged
 }
