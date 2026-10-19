@@ -10,9 +10,10 @@ use std::collections::HashSet;
 use crate::xml::{Event, XmlParser};
 use crate::zip::ZipArchive;
 
-/// The most uncompressed bytes of a `[Content_Types].xml` or `.rels` entry
-/// that are read to find the names in it. A larger one names nothing, so a
-/// hostile package cannot make the classification inflate it (#1167).
+/// The most uncompressed bytes, in total, of the `[Content_Types].xml` and
+/// `.rels` entries that are read to find the names in them. An entry that
+/// would pass it names nothing, so a hostile package cannot make the
+/// classification inflate much, however many such entries it lists (#1167).
 pub const MAX_NAMING_PART: u64 = 8 << 20;
 
 /// For each entry of `zip`, in order, whether it is a part. `names` are the
@@ -55,6 +56,7 @@ fn is_directory_entry(
 /// cannot be read names nothing.
 fn named_parts(zip: &ZipArchive, names: &[String]) -> HashSet<String> {
     let mut named = HashSet::new();
+    let mut read = 0u64;
     for (e, name) in zip.entries().iter().zip(names) {
         let lower = name.to_ascii_lowercase();
         let source = match lower.rsplit_once('/') {
@@ -68,7 +70,8 @@ fn named_parts(zip: &ZipArchive, names: &[String]) -> HashSet<String> {
         if source.is_none() && lower != "[content_types].xml" {
             continue;
         }
-        if e.uncomp_size > MAX_NAMING_PART {
+        read = read.saturating_add(e.uncomp_size);
+        if read > MAX_NAMING_PART {
             continue;
         }
         let Some(bytes) = zip.extract(e) else {
@@ -158,7 +161,8 @@ mod tests {
     }
 
     /// A relationships part over [`MAX_NAMING_PART`] names nothing (it is not
-    /// even read); the same part under the limit names its target.
+    /// even read); the same part under the limit names its target. The limit
+    /// is a total: small parts name until their sizes pass it.
     #[test]
     fn an_oversize_naming_part_names_nothing() {
         let rels = |pad: usize| {
@@ -173,6 +177,28 @@ mod tests {
         assert!(is_part(&f, "x"), "named");
         let f = flags(&[("_rels/.rels", &big), ("x", "")]);
         assert!(!is_part(&f, "x"), "the oversize part names nothing");
+    }
+
+    #[test]
+    fn naming_parts_are_bounded_in_total() {
+        let rels = |target: &str, pad: usize| {
+            format!(
+                "<Relationships><Relationship Id=\"1\" Type=\"t\" Target=\"/{target}\"/>{}</Relationships>",
+                " ".repeat(pad)
+            )
+        };
+        let pad = MAX_NAMING_PART as usize / 2 - 200;
+        let (a, b, c) = (rels("a", pad), rels("b", pad), rels("c", pad));
+        let f = flags(&[
+            ("_rels/.rels", &a),
+            ("d1/_rels/x.rels", &b),
+            ("d2/_rels/x.rels", &c),
+            ("a", ""),
+            ("b", ""),
+            ("c", ""),
+        ]);
+        assert!(is_part(&f, "a") && is_part(&f, "b"), "within the total");
+        assert!(!is_part(&f, "c"), "past the total");
     }
 
     #[test]
