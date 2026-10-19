@@ -525,12 +525,15 @@ pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
             }
         }
         "sheet-tab-rename" => match &app.sheet_rename {
-            Some((_, buf)) => (
-                Json::Str(buf.clone()),
-                true,
-                num(buf.chars().count()),
-                Json::Null,
-            ),
+            Some(r) => {
+                let len = r.text.chars().count();
+                let sel = if r.sel && len > 0 {
+                    Json::Arr(vec![num(0), num(len)])
+                } else {
+                    Json::Null
+                };
+                (Json::Str(r.text.clone()), true, num(r.caret.min(len)), sel)
+            }
             None => {
                 let name = v.pkg.workbook.sheets.get(v.active).map(|s| s.name.clone());
                 (

@@ -92,6 +92,79 @@ pub(crate) fn apply(text: &mut String, caret: &mut usize, sel: &mut bool, op: Op
 
 #[cfg(test)]
 mod tests {
+    use super::{Op, apply};
+    use crate::SheetRename;
+
+    fn rename(r: &mut SheetRename, op: Op) {
+        apply(&mut r.text, &mut r.caret, &mut r.sel, op);
+    }
+
+    #[test]
+    fn sheet_rename_opens_with_the_whole_name_selected() {
+        let r = SheetRename::open(2, "Sheet1".into());
+        assert_eq!(
+            (r.idx, r.text.as_str(), r.caret, r.sel),
+            (2, "Sheet1", 6, true)
+        );
+        let empty = SheetRename::open(0, String::new());
+        assert_eq!((empty.caret, empty.sel), (0, false));
+    }
+
+    #[test]
+    fn sheet_rename_typing_replaces_the_selected_name() {
+        let mut r = SheetRename::open(0, "Sheet1".into());
+        rename(&mut r, Op::Insert("Ab1 "));
+        assert_eq!((r.text.as_str(), r.caret, r.sel), ("Ab1 ", 4, false));
+    }
+
+    #[test]
+    fn sheet_rename_backspaces_after_the_first_delete_nothing_more() {
+        let mut r = SheetRename::open(0, "Sheet1".into());
+        for _ in 0..6 {
+            rename(&mut r, Op::Backspace);
+        }
+        assert_eq!((r.text.as_str(), r.caret), ("", 0));
+    }
+
+    #[test]
+    fn sheet_rename_edits_at_a_caret() {
+        let mut r = SheetRename::open(0, "x".into());
+        rename(&mut r, Op::Insert("abcd"));
+        rename(&mut r, Op::Backspace);
+        assert_eq!(r.text, "abc");
+        rename(&mut r, Op::Home);
+        assert_eq!(r.caret, 0);
+        rename(&mut r, Op::Right);
+        rename(&mut r, Op::Delete);
+        assert_eq!(r.text, "ac");
+        rename(&mut r, Op::End);
+        rename(&mut r, Op::Left);
+        assert_eq!(r.caret, 1);
+        rename(&mut r, Op::Insert("X"));
+        assert_eq!((r.text.as_str(), r.caret), ("aXc", 2));
+    }
+
+    #[test]
+    fn sheet_rename_select_all_then_type_replaces() {
+        let mut r = SheetRename::open(0, "abcd".into());
+        rename(&mut r, Op::Home);
+        assert!(!r.sel);
+        rename(&mut r, Op::SelectAll);
+        assert!(r.sel);
+        assert_eq!(r.caret, 4);
+        rename(&mut r, Op::Insert("X"));
+        assert_eq!((r.text.as_str(), r.sel), ("X", false));
+    }
+
+    #[test]
+    fn sheet_rename_select_all_on_an_empty_name_selects_nothing() {
+        let mut r = SheetRename::open(0, String::new());
+        rename(&mut r, Op::SelectAll);
+        assert!(!r.sel);
+        rename(&mut r, Op::Delete);
+        assert_eq!(r.text, "");
+    }
+
     #[test]
     fn one_line_drops_line_breaks_and_control_characters() {
         assert_eq!(super::one_line("a\r\nb\nc"), "abc");

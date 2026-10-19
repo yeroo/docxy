@@ -5531,7 +5531,7 @@ struct Docxy {
     // Open sheet colour-swatch picker (fill or font), None = closed.
     sheet_pick: Option<SheetPick>,
     // Inline sheet-tab rename in progress: (tab index, edit buffer). None = idle.
-    sheet_rename: Option<(usize, String)>,
+    sheet_rename: Option<SheetRename>,
     /// The sheet's Name Box while it has the keyboard (#1343).
     name_box: Option<NameBoxEdit>,
     /// The Home ribbon's Font or Font Size box while it has the keyboard (#1344).
@@ -7413,6 +7413,29 @@ impl FontBox {
             (FontBox::Size, false) => "sheet-combo:font-size",
             (FontBox::Name, true) => "doc-combo:fontname",
             (FontBox::Size, true) => "doc-combo:fontsize",
+        }
+    }
+}
+
+/// The sheet tab's inline rename (#1202, #1365): a one-line field like the Name
+/// Box. It opens with the whole name selected, as Excel's does.
+#[derive(Clone)]
+struct SheetRename {
+    idx: usize,
+    text: String,
+    caret: usize,
+    sel: bool,
+}
+
+impl SheetRename {
+    /// Opens on `name`, all of it selected (nothing to select in an empty one).
+    fn open(idx: usize, name: String) -> Self {
+        let caret = name.chars().count();
+        SheetRename {
+            idx,
+            sel: caret > 0,
+            caret,
+            text: name,
         }
     }
 }
@@ -17806,7 +17829,7 @@ impl Docxy {
             .active_sheet()
             .and_then(|v| v.pkg.workbook.sheets.get(idx).map(|s| s.name.clone()));
         if let Some(name) = name {
-            self.sheet_rename = Some((idx, name));
+            self.sheet_rename = Some(SheetRename::open(idx, name));
             cx.notify();
         }
     }
@@ -17817,7 +17840,7 @@ impl Docxy {
     /// (`!enter`) leaves as the exit path does: an untouched buffer changes
     /// nothing and dirties nothing.
     fn sheet_rename_commit(&mut self, enter: bool, cx: &mut Context<Self>) {
-        let Some((idx, buf)) = self.sheet_rename.take() else {
+        let Some(SheetRename { idx, text: buf, .. }) = self.sheet_rename.take() else {
             return;
         };
         if self.protected_refused(cx) {
@@ -17834,25 +17857,71 @@ impl Docxy {
         }
     }
 
-    /// Route a keystroke into the active inline rename (char/backspace/enter/esc).
-    fn sheet_rename_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
-        let Some((idx, mut buf)) = self.sheet_rename.clone() else {
+    /// Route a keystroke into the active inline rename: edits at a caret like
+    /// the Name Box, Ctrl+A/C/X/V, Enter commits and Escape keeps the old name.
+    fn sheet_rename_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        ctrl: bool,
+        alt: bool,
+        key: &str,
+        cx: &mut Context<Self>,
+    ) {
+        use field_edit::Op;
+        let Some(r) = self.sheet_rename.as_mut() else {
             return;
         };
+        let edit = |r: &mut SheetRename, op: Op| {
+            field_edit::apply(&mut r.text, &mut r.caret, &mut r.sel, op);
+        };
+        // Ctrl+Alt is AltGr on Windows: its keys are text, not chords.
+        if ctrl && !alt {
+            match key {
+                "a" => edit(r, Op::SelectAll),
+                "c" | "x" => {
+                    let text = r.text.clone();
+                    if r.sel && !text.is_empty() {
+                        if key == "x" {
+                            edit(r, Op::Delete);
+                        }
+                        self.clipboard_write(text.clone(), cx);
+                        self.office_clip.push(&text);
+                    }
+                }
+                "v" => {
+                    // A one-line field: line breaks drop out.
+                    if let ClipRead::Text(text) = self.clipboard_read(cx) {
+                        let line: String =
+                            text.chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
+                        if !line.is_empty() {
+                            if let Some(r) = self.sheet_rename.as_mut() {
+                                edit(r, Op::Insert(&line));
+                            }
+                        }
+                    }
+                }
+                "enter" => self.sheet_rename_commit(true, cx),
+                // Any other chord is not text.
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
         match key {
             "escape" => self.sheet_rename = None,
             "enter" => self.sheet_rename_commit(true, cx),
-            "backspace" => {
-                buf.pop();
-                self.sheet_rename = Some((idx, buf));
-            }
+            "backspace" => edit(r, Op::Backspace),
+            "delete" => edit(r, Op::Delete),
+            "left" => edit(r, Op::Left),
+            "right" => edit(r, Op::Right),
+            "home" => edit(r, Op::Home),
+            "end" => edit(r, Op::End),
             _ => {
                 if let Some(c) = ev.keystroke.key_char.as_deref() {
                     if !c.is_empty() && !c.chars().next().unwrap().is_control() {
-                        buf.push_str(c);
+                        edit(r, Op::Insert(c));
                     }
                 }
-                self.sheet_rename = Some((idx, buf));
             }
         }
         cx.notify();
@@ -21959,7 +22028,7 @@ impl Docxy {
         }
         // An inline sheet-tab rename swallows all typing until Enter/Esc.
         if self.sheet_rename.is_some() {
-            return self.sheet_rename_key(ev, key, cx);
+            return self.sheet_rename_key(ev, ctrl, alt, key, cx);
         }
         // So does the focused Name Box (#1343).
         // Ctrl+S saves, as it does from the Find bar, and the box closes: a
@@ -42535,7 +42604,7 @@ fn chart_card(data: &gridcore::sheet::ChartData, chart_id: usize, w: f32, h: f32
 fn sheet_el(
     view: &SheetView,
     ent: &Entity<Docxy>,
-    rename: Option<(usize, String)>,
+    rename: Option<SheetRename>,
     comment_editing: bool,
     dv_values: Option<Vec<gridcore::validation::ListChoice>>,
     dv_open: bool,
@@ -42919,7 +42988,7 @@ fn sheet_el(
         .border_color(gridline);
     for (i, s) in view.pkg.workbook.sheets.iter().enumerate() {
         let active = i == view.active;
-        let renaming = rename.as_ref().is_some_and(|(ri, _)| *ri == i);
+        let renaming = rename.as_ref().is_some_and(|r| r.idx == i);
         let mut tab = div()
             .id(ElementId::Name(format!("sheet-tab-{i}").into()))
             .px_3()
@@ -42943,13 +43012,44 @@ fn sheet_el(
         if renaming {
             // Inline editor: show the live buffer + a caret bar; typing is routed
             // through sheet_rename_key (keyboard focus stays on the grid root).
-            let buf = rename.as_ref().map(|(_, b)| b.clone()).unwrap_or_default();
+            let (before, mid, after) = rename.as_ref().map_or_else(Default::default, |r| {
+                let at = |n: usize| {
+                    r.text
+                        .char_indices()
+                        .nth(n)
+                        .map_or(r.text.len(), |(b, _)| b)
+                };
+                if r.sel && !r.text.is_empty() {
+                    (String::new(), r.text.clone(), String::new())
+                } else {
+                    let b = at(r.caret);
+                    (
+                        r.text[..b].to_string(),
+                        String::new(),
+                        r.text[b..].to_string(),
+                    )
+                }
+            });
+            let selected = !mid.is_empty();
+            let mut field = div().flex().items_center().min_w(px(8.));
+            if selected {
+                field = field.child(
+                    div()
+                        .bg(hsla_u(BRAND))
+                        .text_color(hsla_u(0xffffff))
+                        .child(SharedString::from(mid)),
+                );
+            } else {
+                field = field
+                    .child(SharedString::from(before))
+                    .child(div().w(px(1.)).h(px(12.)).bg(hsla_u(BRAND)))
+                    .child(SharedString::from(after));
+            }
             tab = tab
                 .bg(hsla_u(0xffffff))
                 .border_1()
                 .border_color(hsla_u(BRAND))
-                .child(div().min_w(px(8.)).child(SharedString::from(buf)))
-                .child(div().w(px(1.)).h(px(12.)).bg(hsla_u(BRAND)));
+                .child(field);
         } else {
             let ent_sel = ent.clone();
             // The active tab's name is probed where `pointer-click {"input":
