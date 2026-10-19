@@ -1091,6 +1091,24 @@ impl Row {
         Vec::new()
     }
 
+    /// The cell the cell-level control opened at `(c, k)` (see
+    /// [`Self::cell_controls`]) closes on: the last cell of the row when an
+    /// edit left it open.
+    pub(crate) fn cell_control_end(&self, c: usize, k: usize) -> usize {
+        // Controls still open after the opening cell's opens, this one included.
+        let mut depth = self.cells[c].sdt_open.len() - k;
+        for (i, here) in self.cells.iter().enumerate().skip(c) {
+            if i > c {
+                depth += here.sdt_open.len();
+            }
+            if here.sdt_close.len() >= depth {
+                return i;
+            }
+            depth -= here.sdt_close.len();
+        }
+        self.cells.len() - 1
+    }
+
     /// Whether every cell-level content control opened in the row closes in
     /// it, and none closes before it opens.
     #[cfg(test)]
