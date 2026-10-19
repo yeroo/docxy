@@ -802,6 +802,8 @@ fn project_tab(
         tracked_comment_ids: Default::default(),
         comments_removed_all: false,
         used_comment_ids: Default::default(),
+        pictures: Default::default(),
+        run_styles: Default::default(),
         pkg: None,
         notes: vec![],
         markdown: false,

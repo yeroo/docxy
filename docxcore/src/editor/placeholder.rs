@@ -148,11 +148,9 @@ impl Editor {
             return;
         };
         let end = end.max(start + 1);
-        for i in inline_controls_over(&p.content, start, end) {
-            if let Inline::Raw(raw) = &mut p.content[i] {
-                if raw.contains(FLAG) {
-                    *raw = crate::sect::remove_element(raw, "w:showingPlcHdr");
-                }
+        for c in inline_controls(&p.content) {
+            if c.start < end && start < c.end {
+                clear_flag(&mut p.content, c.at);
             }
         }
     }
@@ -167,63 +165,107 @@ impl Editor {
         let Some(p) = super::para_mut(&mut self.doc.body, path) else {
             return;
         };
-        for i in inline_controls_inside(&p.content, at) {
-            if let Inline::Raw(raw) = &mut p.content[i] {
-                if raw.contains(FLAG) {
-                    *raw = crate::sect::remove_element(raw, "w:showingPlcHdr");
-                }
+        for c in inline_controls(&p.content) {
+            if c.start < at && at < c.end {
+                clear_flag(&mut p.content, c.at);
             }
         }
     }
 }
 
-/// The inline content controls whose content holds offset `at` strictly
-/// inside it, by the index of their opening boundary.
-fn inline_controls_inside(content: &[Inline], at: usize) -> Vec<usize> {
-    let mut open: Vec<(usize, usize)> = Vec::new();
-    let mut out = Vec::new();
-    let mut offset = 0;
-    for (i, inline) in content.iter().enumerate() {
-        match inline {
-            Inline::Raw(raw) if crate::hf::is_sdt_open(raw) => open.push((i, offset)),
-            Inline::Raw(raw) if crate::hf::is_sdt_close(raw) => {
-                if let Some((o, from)) = open.pop() {
-                    if from < at && at < offset {
-                        out.push(o);
+/// Where an inline control's opening boundary sits: an index into a
+/// paragraph's content, and, for one inside a hyperlink, the index into that
+/// link's `content`.
+type Loc = (usize, Option<usize>);
+
+/// An inline content control: its opening boundary and the offsets its
+/// content starts and ends at.
+struct Control {
+    at: Loc,
+    start: usize,
+    end: usize,
+}
+
+/// Every inline content control of a paragraph, those inside hyperlinks
+/// (`Hyperlink::content`) too, in the order they close (inner before outer),
+/// then those left open, innermost first.
+fn inline_controls(content: &[Inline]) -> Vec<Control> {
+    fn walk(
+        content: &[Inline],
+        link: Option<usize>,
+        offset: &mut usize,
+        open: &mut Vec<(Loc, usize)>,
+        out: &mut Vec<Control>,
+    ) {
+        for (i, inline) in content.iter().enumerate() {
+            let at = |i| match link {
+                Some(l) => (l, Some(i)),
+                None => (i, None),
+            };
+            match inline {
+                Inline::Raw(raw) if crate::hf::is_sdt_open(raw) => open.push((at(i), *offset)),
+                Inline::Raw(raw) if crate::hf::is_sdt_close(raw) => {
+                    if let Some((at, start)) = open.pop() {
+                        out.push(Control {
+                            at,
+                            start,
+                            end: *offset,
+                        });
                     }
                 }
+                Inline::Hyperlink(h) if link.is_none() && !h.content.is_empty() => {
+                    *offset += super::link_runs_len(h);
+                    walk(&h.content, Some(i), offset, open, out);
+                }
+                other => *offset += super::inline_len(other),
             }
-            other => offset += super::inline_len(other),
         }
+    }
+    let (mut offset, mut open, mut out) = (0, Vec::new(), Vec::new());
+    walk(content, None, &mut offset, &mut open, &mut out);
+    while let Some((at, start)) = open.pop() {
+        out.push(Control {
+            at,
+            start,
+            end: offset,
+        });
     }
     out
 }
 
-/// The inline content controls whose content overlaps `[start, end)`, by
-/// the index of their opening boundary.
-fn inline_controls_over(content: &[Inline], start: usize, end: usize) -> Vec<usize> {
-    let mut open: Vec<(usize, usize)> = Vec::new();
-    let mut out = Vec::new();
-    let mut offset = 0;
-    for (i, inline) in content.iter().enumerate() {
-        match inline {
-            Inline::Raw(raw) if crate::hf::is_sdt_open(raw) => open.push((i, offset)),
-            Inline::Raw(raw) if crate::hf::is_sdt_close(raw) => {
-                if let Some((o, from)) = open.pop() {
-                    if from < end && start < offset {
-                        out.push(o);
-                    }
-                }
+/// The boundary at `at`, when it is an inline content control's opening one.
+fn control_open(content: &[Inline], at: Loc) -> Option<&String> {
+    let inline = match at {
+        (i, None) => content.get(i)?,
+        (l, Some(i)) => match content.get(l)? {
+            Inline::Hyperlink(h) => h.content.get(i)?,
+            _ => return None,
+        },
+    };
+    match inline {
+        Inline::Raw(raw) => Some(raw),
+        _ => None,
+    }
+}
+
+/// Clear the placeholder flag of the control opened at `at`; a link holding
+/// it is saved from its children, not from its original XML.
+fn clear_flag(content: &mut [Inline], at: Loc) {
+    let inline = match at {
+        (i, None) => content.get_mut(i),
+        (l, Some(i)) => match content.get_mut(l) {
+            Some(Inline::Hyperlink(h)) => {
+                h.content_changed = true;
+                h.content.get_mut(i)
             }
-            other => offset += super::inline_len(other),
+            _ => None,
+        },
+    };
+    if let Some(Inline::Raw(raw)) = inline {
+        if raw.contains(FLAG) {
+            *raw = crate::sect::remove_element(raw, "w:showingPlcHdr");
         }
     }
-    out.extend(
-        open.into_iter()
-            .filter(|&(_, from)| from < end && start < offset)
-            .map(|(o, _)| o),
-    );
-    out
 }
 
 /// Where `path` goes next from the block at `path[at]` in `blocks`, if it
@@ -249,23 +291,6 @@ fn step(blocks: &[Block], path: &[usize], at: usize) -> Option<Step> {
     }
 }
 
-/// The cell a control opened at `(c, k)` closes on: the last cell of the row
-/// when an edit left it open.
-fn closing_cell(row: &Row, c: usize, k: usize) -> usize {
-    // Controls still open after the opening cell's opens, this one included.
-    let mut depth = row.cells[c].sdt_open.len() - k;
-    for (i, here) in row.cells.iter().enumerate().skip(c) {
-        if i > c {
-            depth += here.sdt_open.len();
-        }
-        if here.sdt_close.len() >= depth {
-            return i;
-        }
-        depth -= here.sdt_close.len();
-    }
-    row.cells.len() - 1
-}
-
 /// The innermost cell-level control around cell `cell` of the row at
 /// `row_path` showing its placeholder that the editor can select (see
 /// [`cell_control_range`]): its first cell's start to its last cell's end.
@@ -280,7 +305,7 @@ fn cell_placeholder(row: &Row, cell: usize, row_path: &[usize]) -> Option<(Caret
 /// The range of the cell-level control opened at `(c, k)`, when the editor
 /// can select exactly its content.
 fn cell_control_range(row: &Row, c: usize, k: usize, row_path: &[usize]) -> Option<(Caret, Caret)> {
-    let last = closing_cell(row, c, k);
+    let last = row.cell_control_end(c, k);
     // Over several cells the selection is a cell range, which grows over
     // vertical merges: then it would not be exactly the control's cells.
     if last > c
@@ -353,33 +378,15 @@ fn enclosing_block_opens(blocks: &[Block], idx: usize) -> Vec<usize> {
 }
 
 /// The innermost inline control around offset `at` showing its placeholder,
-/// as the offsets its content starts and ends at.
+/// as the offsets its content starts and ends at. Controls inside a
+/// hyperlink's children count.
 fn inline_placeholder(content: &[Inline], at: usize) -> Option<(usize, usize)> {
-    let mut open: Vec<(usize, usize)> = Vec::new();
-    let mut offset = 0;
-    let mut found = None;
-    let consider = |i: usize, start: usize, end: usize, found: &mut Option<(usize, usize)>| {
-        let flagged = matches!(&content[i], Inline::Raw(r) if shows_placeholder(r));
-        // Inner controls close first: the first found is the innermost.
-        if flagged && found.is_none() && start <= at && at <= end {
-            *found = Some((start, end));
-        }
-    };
-    for (i, inline) in content.iter().enumerate() {
-        match inline {
-            Inline::Raw(raw) if crate::hf::is_sdt_open(raw) => open.push((i, offset)),
-            Inline::Raw(raw) if crate::hf::is_sdt_close(raw) => {
-                if let Some((o, start)) = open.pop() {
-                    consider(o, start, offset, &mut found);
-                }
-            }
-            other => offset += super::inline_len(other),
-        }
-    }
-    while let Some((o, start)) = open.pop() {
-        consider(o, start, offset, &mut found);
-    }
-    found
+    // Inner controls close first: the first found is the innermost.
+    inline_controls(content)
+        .into_iter()
+        .filter(|c| control_open(content, c.at).is_some_and(|r| shows_placeholder(r)))
+        .find(|c| c.start <= at && at <= c.end)
+        .map(|c| (c.start, c.end))
 }
 
 /// The first (or with `last`, the last) paragraph in `blocks`, not counting

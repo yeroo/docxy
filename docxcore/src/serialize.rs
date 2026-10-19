@@ -2450,9 +2450,9 @@ mod tests {
         // Round-trips (the w:anchor survives).
         assert_eq!(roundtrip(&d, &Relationships::default()), d);
 
-        // A TOC entry (internal link carrying a tab) keeps the tab at top level
-        // (so its leader dots still render) AND stays navigable: the text on each
-        // side of the tab becomes a Hyperlink segment carrying the anchor.
+        // A TOC entry (internal link carrying a tab) stays ONE navigable
+        // Hyperlink holding its tab (#920), which the renderer still lays out
+        // as a leader-dot tab stop.
         let toc = "<w:document><w:body><w:p>\
             <w:hyperlink w:anchor=\"_Toc1\"><w:r><w:t>Intro</w:t></w:r>\
               <w:r><w:tab/></w:r><w:r><w:t>9</w:t></w:r></w:hyperlink>\
@@ -2461,21 +2461,27 @@ mod tests {
         match &d2.body[0] {
             Block::Paragraph(p) => {
                 assert!(
-                    p.content.iter().any(|i| matches!(i, Inline::Tab(_))),
-                    "TOC tab dropped"
+                    !p.content.iter().any(|i| matches!(i, Inline::Tab(_))),
+                    "the tab belongs inside the link"
                 );
-                let links = p
-                    .content
-                    .iter()
-                    .filter(|i| matches!(i, Inline::Hyperlink(h) if h.anchor.as_deref() == Some("_Toc1")))
-                    .count();
-                assert_eq!(
-                    links, 2,
-                    "TOC text should be navigable on both sides of the tab"
-                );
+                assert_eq!(p.content.len(), 1, "{:?}", p.content);
+                match &p.content[0] {
+                    Inline::Hyperlink(h) => {
+                        assert_eq!(h.anchor.as_deref(), Some("_Toc1"));
+                        assert!(h.content.iter().any(|i| matches!(i, Inline::Tab(_))));
+                    }
+                    other => panic!("expected one Hyperlink, got {other:?}"),
+                }
             }
             _ => panic!("no paragraph"),
         }
+        // Untouched, it saves byte-faithfully as one link around its tab.
+        let out = document_to_xml(&d2);
+        assert_eq!(out.matches("<w:hyperlink").count(), 1, "{out}");
+        assert!(
+            out.contains("<w:r><w:tab/></w:r><w:r><w:t>9</w:t></w:r></w:hyperlink>"),
+            "{out}"
+        );
         // Round-trips within the model.
         assert_eq!(roundtrip(&d2, &Relationships::default()), d2);
     }
@@ -2489,13 +2495,22 @@ mod tests {
 
     #[test]
     fn toc_web_hidden_runs_round_trip_without_vanish_916() {
-        // The entry is rebuilt from the model (split around its tab), so its
-        // webHidden runs must not come back as hidden text.
-        let d = parse_document_xml(TOC_ENTRY, &Relationships::default());
+        // Once edited, the entry is rebuilt from the model, so its webHidden
+        // runs must not come back as hidden text.
+        let mut d = parse_document_xml(TOC_ENTRY, &Relationships::default());
+        let Block::Paragraph(p) = &mut d.body[0] else {
+            panic!("no paragraph")
+        };
+        let Inline::Hyperlink(h) = &mut p.content[0] else {
+            panic!("expected one link, got {:?}", p.content)
+        };
+        h.content_changed = true;
         let xml = document_to_xml(&d);
+        assert_eq!(xml.matches("<w:hyperlink").count(), 1, "{xml}");
         assert!(!xml.contains("w:vanish"), "{xml}");
         assert_eq!(xml.matches("<w:webHidden/>").count(), 2, "{xml}");
-        assert_eq!(parse_document_xml(&xml, &Relationships::default()), d);
+        let again = parse_document_xml(&xml, &Relationships::default());
+        assert_eq!(document_to_xml(&again), xml);
     }
 
     #[test]

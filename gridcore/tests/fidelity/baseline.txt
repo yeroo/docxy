@@ -58,16 +58,6 @@ ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	l
 ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
 
 # formula text is re-serialized (spaces dropped, names upper-cased, _xlfn. added to newer functions; the sheet check finds the same formula otherwise): one entry per cell (#1096)
-ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/B10/formula-text
-ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/B43/formula-text
-ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/B44/formula-text
-ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/B45/formula-text
-ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/B46/formula-text
-ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/B75/formula-text
-ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/B76/formula-text
-ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/B77/formula-text
-ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/B78/formula-text
-ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/B79/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/C18/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/C19/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/C22/formula-text
@@ -174,14 +164,6 @@ ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/Q17/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/Q18/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/Q19/formula-text
-ext:libreoffice/sc/qa/unit/data/xlsx/ceiling-floor.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/C34/formula-text
-ext:libreoffice/sc/qa/unit/data/xlsx/ceiling-floor.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/C35/formula-text
-ext:libreoffice/sc/qa/unit/data/xlsx/ceiling-floor.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/C36/formula-text
-ext:libreoffice/sc/qa/unit/data/xlsx/ceiling-floor.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/C37/formula-text
-ext:libreoffice/sc/qa/unit/data/xlsx/ceiling-floor.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/D34/formula-text
-ext:libreoffice/sc/qa/unit/data/xlsx/ceiling-floor.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/D35/formula-text
-ext:libreoffice/sc/qa/unit/data/xlsx/ceiling-floor.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/D36/formula-text
-ext:libreoffice/sc/qa/unit/data/xlsx/ceiling-floor.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/D37/formula-text
 ext:libreoffice/sc/qa/unit/data/xlsx/tablerefsnamed.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/G4/formula-text
 ext:libreoffice/sc/qa/unit/data/xlsx/tablerefsnamed.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/G5/formula-text
 ext:libreoffice/sc/qa/unit/data/xlsx/tablerefsnamed.xlsx	xl/worksheets/sheet1.xml	changed-value	/cells/G6/formula-text
