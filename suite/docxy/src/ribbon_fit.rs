@@ -302,10 +302,11 @@ pub(crate) fn gallery_row(geom: GalleryGeom, n: usize, max_w: Option<f32>) -> (u
 
 // ---- the ribbonspec model (document and Project ribbons) ----
 
-/// `icon_btn`: a 16px icon between `px_2` and a 1px border each side; with
-/// its label, a `gap_1p5` and the label at 12px.
-fn model_icon_btn_w(label: Option<&str>, tw: TextWidth) -> f32 {
-    34.0 + label.map_or(0.0, |l| 6.0 + tw(l, 12.0))
+/// `icon_btn`: `px_2` and a 1px border each side around a 16px icon when the
+/// command has one; with its label, a `gap_1p5` and the label at 12px. A
+/// command with no icon draws its label alone (#1608).
+fn model_icon_btn_w(icon: bool, label: Option<&str>, tw: TextWidth) -> f32 {
+    18.0 + if icon { 16.0 } else { 0.0 } + label.map_or(0.0, |l| 6.0 + tw(l, 12.0))
 }
 
 /// One control's drawn width; a gallery wraps its tiles to `max_w` (a
@@ -319,7 +320,11 @@ pub(crate) fn model_control_w<A>(
     match c {
         // A toggle draws its icon alone, or its label when it has no icon
         // (#1608: a contributed toggle may name none).
-        Control::Toggle(cmd) => model_icon_btn_w(cmd.icon.0.is_empty().then_some(cmd.label), tw),
+        Control::Toggle(cmd) => model_icon_btn_w(
+            !cmd.icon.0.is_empty(),
+            cmd.icon.0.is_empty().then_some(cmd.label),
+            tw,
+        ),
         // `large_btn`: `px_2` around the 26px icon or the label's lines.
         Control::Large(cmd) => 16.0 + lines_w(cmd.label, 11.0, tw).max(26.0),
         // `split_btn` and `dropdown_btn`: `px_1` around the icon or the
@@ -333,7 +338,13 @@ pub(crate) fn model_control_w<A>(
                 .map(|chunk| {
                     chunk
                         .iter()
-                        .map(|c| model_icon_btn_w((!icon_only).then_some(c.label), tw))
+                        .map(|c| {
+                            model_icon_btn_w(
+                                !c.icon.0.is_empty(),
+                                (!icon_only).then_some(c.label),
+                                tw,
+                            )
+                        })
                         .fold(0.0, f32::max)
                 })
                 .collect();
@@ -348,7 +359,7 @@ pub(crate) fn model_control_w<A>(
                     .map(|cell| match cell {
                         rs::Cell::Combo { wide: true, .. } => 104.0,
                         rs::Cell::Combo { wide: false, .. } => 46.0,
-                        rs::Cell::Btn(_) => model_icon_btn_w(None, tw),
+                        rs::Cell::Btn(_) => model_icon_btn_w(true, None, tw),
                     })
                     .sum();
                 cells + row.len().saturating_sub(1) as f32
@@ -722,8 +733,9 @@ mod tests {
     }
 
     /// #1608: a toggle without an icon (a contributed one may name none)
-    /// draws its label, so it is estimated wider than one with an icon by
-    /// the label's width; the live fit counts it.
+    /// draws its label alone, no icon slot before it (r5), so it is
+    /// estimated as the padding, the gap and the label; the live fit counts
+    /// it.
     #[test]
     fn a_toggle_without_an_icon_is_estimated_with_its_label() {
         let with_icon = Control::Toggle(rs::cmd("plain", "bold", "Plain", Act::Paste));
@@ -731,7 +743,7 @@ mod tests {
         assert_eq!(model_control_w(&with_icon, false, None, &tw), 34.0);
         assert_eq!(
             model_control_w(&no_icon, false, None, &tw),
-            34.0 + 6.0 + tw("Plain", 12.0)
+            18.0 + 6.0 + tw("Plain", 12.0)
         );
     }
 

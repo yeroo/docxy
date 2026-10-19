@@ -37119,7 +37119,11 @@ impl Docxy {
             })
             .hover(|d| d.bg(pal.hover))
             .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
-            .child(icon_svg(cmd.icon.0, 16., pal.fg))
+            // A command with no icon draws its label alone: no empty 16 px
+            // slot and gap before it (#1608 r5).
+            .when(!cmd.icon.0.is_empty(), |d| {
+                d.child(icon_svg(cmd.icon.0, 16., pal.fg))
+            })
             .when(show_label, |d| {
                 d.child(
                     div()
