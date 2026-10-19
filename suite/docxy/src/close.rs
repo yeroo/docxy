@@ -713,6 +713,10 @@ pub(crate) fn remove_tab(tabs: &mut Vec<DocTab>, active: &mut usize, i: usize) -
 
 impl Docxy {
     pub(super) fn backstage_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // No tab to close: the Start screen stays (#806).
+        if self.tabs.is_empty() {
+            return;
+        }
         self.backstage = false;
         self.close_tab(self.active, window, cx);
     }
