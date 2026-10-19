@@ -506,9 +506,10 @@ without one nothing changes.
   never sent to the plugin and never the default. A tabbed dialog without a
   `size` sizes to the shown page, so switching pages may resize it: a stable
   size needs an explicit `size`. A `task-information` spec's pages take
-  `columns`, `group`, `span` and `min_rows`, and its `header` controls are
-  drawn above the built-in Name, Duration and Estimated row on every page,
-  first in the Tab order; `size`, `placement` and `fill` belong to a
+  `columns`, `group`, `span` and `min_rows` (the page's columns lay out the
+  plugin's controls; the built-in Name, Duration and Estimated row keeps its
+  one-column shape on every page), and its `header` controls are drawn
+  above that row on every page, first in the Tab order; `size`, `placement` and `fill` belong to a
   plugin's own dialog.
 - **Overlay** (`yppx_ui_overlay`): the rows in view (`uid`, `row_y`, the bar
   rectangle, kind flags, since #1548 `name`, `percent_complete`,

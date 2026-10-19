@@ -121,6 +121,7 @@ fn form() -> Dialog {
         size: None,
         buttons_right: false,
         page_columns: Vec::new(),
+        edits: 0,
         epoch: 0,
         calendar: None,
         popup: None,
@@ -1692,4 +1693,69 @@ fn a_pasted_or_set_date_closes_the_calendar_so_enter_cannot_overwrite_it() {
     let (mut d, _) = make();
     d.calendar_day(25).unwrap();
     assert_eq!(text_of_control(&d, "finish"), "2026-10-25");
+}
+
+/// #1609 r6: Task Information's shared built-in row (Name, then Duration
+/// with Estimated beside it) keeps its one-column shape on a plugin page of
+/// two columns; the plugin's controls take the page's columns in a band of
+/// their own.
+#[test]
+fn built_in_controls_keep_one_column_beside_a_plugin_page() {
+    let mut d = Dialog::message(
+        catalog::TEST_FORM,
+        "t",
+        String::new(),
+        &[],
+        DialogOwner::Test,
+    );
+    d.tabs = vec!["General".into(), "Plugin".into()];
+    d.tab = 1;
+    d.page_columns = vec![1, 2];
+    let shared = |name: &'static str, beside: bool| {
+        let mut c = Control::new(name, name, ControlKind::Text, Value::Text(String::new()));
+        c.page = None;
+        c.beside = beside;
+        c
+    };
+    let plugin = |name: &'static str| {
+        let mut c = Control::new(name, name, ControlKind::Text, Value::Text(String::new()));
+        c.page = Some(1);
+        c.plugin = true;
+        c
+    };
+    d.controls = vec![
+        shared("name", false),
+        shared("duration", false),
+        shared("estimated", true),
+        plugin("a"),
+        plugin("b"),
+        plugin("c"),
+    ];
+    let bands = d.layout_rows();
+    assert_eq!(bands.len(), 2, "{bands:?}");
+    assert_eq!(bands[0].columns, 1);
+    assert_eq!(bands[0].rows, vec![vec![(0, 0)], vec![(1, 0), (2, 0)]]);
+    assert_eq!(bands[1].columns, 2);
+    assert_eq!(bands[1].rows, vec![vec![(3, 0), (4, 1)], vec![(5, 0)]]);
+    // Without plugin controls the page's columns apply to everything.
+    d.controls.truncate(3);
+    let bands = d.layout_rows();
+    assert_eq!(bands.len(), 1);
+    assert_eq!(bands[0].columns, 2);
+}
+
+/// #1609 r6: every edit of a field counts, a Delete that leaves the caret
+/// where it was included, so a scroll following `edits` sees it.
+#[test]
+fn field_edits_are_counted() {
+    let mut d = form();
+    d.focus = Some(0);
+    d.caret = Some(0);
+    let before = d.edits;
+    d.type_char('x').unwrap();
+    assert_eq!(d.edits, before + 1);
+    d.move_caret_to(0, false);
+    d.delete().unwrap();
+    assert_eq!(d.edits, before + 2);
+    assert_eq!(d.caret_at(), 0, "Delete leaves the caret where it was");
 }

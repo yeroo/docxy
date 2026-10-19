@@ -1240,6 +1240,10 @@ pub(crate) struct Dialog {
     /// the next number, so the window's per-dialog state (list and grid
     /// scrolls) belongs to one opening and starts afresh on the next.
     pub epoch: u64,
+    /// How many edits the fields have taken (#1609 r6): with the caret, the
+    /// mark a filling multiline's scroll follows, so a Delete that leaves
+    /// the caret where it was still brings its line into view.
+    pub edits: u64,
 }
 
 /// The next dialog epoch (see [`Dialog::epoch`]).
@@ -1334,6 +1338,7 @@ impl Dialog {
             buttons_right: false,
             page_columns: Vec::new(),
             epoch: next_epoch(),
+            edits: 0,
             calendar: None,
             popup: None,
         }
@@ -1356,11 +1361,17 @@ impl Dialog {
     /// page's controls in rows of [`Dialog::columns`], a control's `span`
     /// taking that many columns (clamped to the row), consecutive controls
     /// of one `group` title in one band. A control marked `beside` (#1536)
-    /// joins the row of the control before it, whatever the columns.
+    /// joins the row of the control before it, whatever the columns. In a
+    /// dialog with plugin controls (Task Information with a plugin page,
+    /// #1609 r6) the built-in controls form bands of their own at one
+    /// column, so the shared Name, Duration and Estimated row keeps its
+    /// shape on every page; the page's `columns` apply to the plugin's
+    /// controls.
     pub fn layout_rows(&self) -> Vec<LayoutBand> {
         let mut shown = self.shown_indices();
         shown.sort_by_key(|&i| !self.controls[i].header);
         let page_columns = self.columns();
+        let mixed = self.controls.iter().any(|c| c.plugin);
         let header_columns = shown
             .iter()
             .filter(|&&i| self.controls[i].header)
@@ -1372,14 +1383,24 @@ impl Dialog {
         while k < shown.len() {
             let first = &self.controls[shown[k]];
             let header = first.header;
+            let builtin = mixed && !first.plugin;
             let title = if header { None } else { first.group.clone() };
-            let columns = if header { header_columns } else { page_columns };
+            let columns = if header {
+                header_columns
+            } else if builtin {
+                1
+            } else {
+                page_columns
+            };
             let mut rows: Vec<Vec<(usize, usize)>> = Vec::new();
             let mut row: Vec<(usize, usize)> = Vec::new();
             let mut used = 0;
             while k < shown.len() {
                 let c = &self.controls[shown[k]];
-                if c.header != header || (!header && c.group != title) {
+                if c.header != header
+                    || (!header && c.group != title)
+                    || (!header && mixed && !c.plugin != builtin)
+                {
                     break;
                 }
                 if c.beside {
@@ -2069,6 +2090,7 @@ impl Dialog {
         next.extend(&chars[to..]);
         let i = self.focus.unwrap_or_default();
         self.set_at(i, &Json::obj(vec![("value", Json::Str(next))]))?;
+        self.edits += 1;
         self.put_caret(from + with.chars().count());
         Ok(())
     }
@@ -2786,6 +2808,7 @@ mod tests_support {
             buttons_right: false,
             page_columns: Vec::new(),
             epoch: next_epoch(),
+            edits: 0,
             calendar: None,
             popup: None,
         }

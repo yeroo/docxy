@@ -24,8 +24,8 @@ pub(crate) type GridScrolls = std::collections::HashMap<(u64, &'static str), Gri
 pub(crate) struct GridScroll {
     handle: ScrollHandle,
     /// The row last brought into view, with the mark that asked for it (a
-    /// grid's row again; a multiline's caret).
-    seen: Option<(usize, usize)>,
+    /// grid's row again; a multiline's caret and the dialog's edit count).
+    seen: Option<(usize, u64)>,
     /// The row height it was drawn with.
     row_h: f32,
 }
@@ -45,16 +45,16 @@ pub(crate) fn first_visible(entry: &GridScroll) -> Option<usize> {
 
 /// The scroll for grid or multiline `name` of the dialog opening `epoch`,
 /// kept across frames; when `row` (the selected row, or the caret's line
-/// with the caret as its mark) is not the one last seen, the row is brought
-/// into view: the offset is set outright from the row height and the view's
-/// height (`view_h`, else the element's last bounds), the least that shows
-/// the row, as [`list_scroll`] does for a list. A wheel scroll that leaves
-/// the row and its mark alone is not undone; an edit that moves the caret
-/// along its line brings the line back.
+/// with the caret and edit count as its mark) is not the one last seen, the
+/// row is brought into view: the offset is set outright from the row height
+/// and the view's height (`view_h`, else the element's last bounds), the
+/// least that shows the row, as [`list_scroll`] does for a list. A wheel
+/// scroll that leaves the row and its mark alone is not undone; an edit on
+/// the line, the caret moved or not, brings the line back.
 fn grid_scroll(
     grids: &mut GridScrolls,
     key: (u64, &'static str),
-    row: Option<(usize, usize)>,
+    row: Option<(usize, u64)>,
     row_h: f32,
     view_h: Option<f32>,
 ) -> ScrollHandle {
@@ -1179,13 +1179,14 @@ impl Docxy {
                 // The lines are 16 px each; the box's height is the frame's.
                 // Only this box's own caret, while it is focused, drives the
                 // scroll (`caret_at` is the focused control's); unfocused it
-                // keeps its offset. The caret is the mark, so typing on a
-                // line a wheel scrolled away brings the line back.
+                // keeps its offset. The caret and the edit count are the
+                // mark, so typing on, or deleting from, a line a wheel
+                // scrolled away brings the line back.
                 let scroll = fill.then(|| {
                     grid_scroll(
                         &mut self.dialog_grids.borrow_mut(),
                         (d.epoch, c.name),
-                        focused.then_some((caret_line, caret)),
+                        focused.then_some((caret_line, (d.edits << 32) | caret as u64)),
                         16.,
                         None,
                     )
@@ -1361,7 +1362,7 @@ impl Docxy {
                     grid_scroll(
                         &mut self.dialog_grids.borrow_mut(),
                         (d.epoch, c.name),
-                        sel_row.map(|r| (r, r)),
+                        sel_row.map(|r| (r, r as u64)),
                         18.,
                         Some(body_h),
                     )
@@ -1801,7 +1802,11 @@ impl Docxy {
                 if row.len() == 1 && (columns == 1 || d.controls[row[0].0].span as usize >= columns)
                 {
                     let (i, _) = row[0];
-                    let el = self.dialog_widget(d, i, None, pal, cx);
+                    // A control spanning a page of several columns keeps the
+                    // first column's label width, so its field lines up with
+                    // the fields above and fills the row (#1609 r6).
+                    let w = (columns > 1).then(|| label_w[0]).filter(|w| *w > 0.);
+                    let el = self.dialog_widget(d, i, w, pal, cx);
                     drawn.push(if fills {
                         v_flex()
                             .flex_1()
@@ -2250,7 +2255,8 @@ mod tests {
     /// #1609 r5: a caret that moves along the line it is on (typing after a
     /// wheel scroll took the line out of view) brings the line back; a frame
     /// with the same caret keeps the wheel's offset, as a grid's unchanged
-    /// row does.
+    /// row does. r6: so does an edit that leaves the caret in place (Delete),
+    /// through the dialog's edit count in the mark.
     #[test]
     fn a_multiline_edit_on_the_same_line_brings_it_back_into_view() {
         let mut grids = GridScrolls::default();
@@ -2264,6 +2270,10 @@ mod tests {
         assert_eq!(f32::from(h.offset().y), 0.);
         // A character typed on line 9 moves the caret: the line comes back.
         let h = grid_scroll(&mut grids, key, Some((9, 41)), 16., Some(64.));
+        assert_eq!(f32::from(h.offset().y), -96.);
+        // A Delete keeps the caret at 41 but counts as an edit: back again.
+        h.set_offset(point(px(0.), px(0.)));
+        let h = grid_scroll(&mut grids, key, Some((9, (1 << 32) | 41)), 16., Some(64.));
         assert_eq!(f32::from(h.offset().y), -96.);
         // Nothing painted yet: the handle has nothing to scroll, so the
         // read-back reports no line until a frame has measured the box.
