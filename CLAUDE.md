@@ -882,3 +882,31 @@
   what the toolbar's ticks and combo values show. The lists are fixed (8 fonts, sizes 8 to 72, 8 colours): the
   suite has no font enumeration. The task buttons dispatch AddLink,
   UnlinkTasks, Outdent, Indent and Task Details (`Constraint`).
+
+## Suite inline pictures (#1432)
+
+- The suite's `paragraph_el` Raw arm draws an inline `w:drawing` picture as
+  `gpui::img` (`ObjectFit::Fill`) inside the same one-offset box #768 drew as a
+  frame; box size, offsets, caret and `block_height_est` are unchanged. The
+  border shows only when no pixels do: the rid does not resolve, or the bytes
+  are not PNG/JPEG/GIF/BMP by `docxcore::image::sniff` (WMF/EMF/SVG/TIFF keep
+  the frame). Pixels that sniff but fail to decode in gpui draw nothing.
+- `docxcore::image::inline_embed` is the rid (same inline-only guards as
+  `inline_extent`, and only when `a:graphicData` is a picture: a group or shape
+  holding blips is not one). `suite/docxy/src/pictures.rs` resolves it through
+  the story part's own relationships (`Package::part_rel_target`: relative to
+  the part's own folder, `..`, absolute; external or escaping targets none): the same rid names
+  different media in `document.xml.rels` and a header's, so `RenderCtx::pics` /
+  `pictures::Scope` carry the story's part name (the body's, the open
+  header/footer's `HfEdit::part_name`, or the page's header/footer part).
+- `DocTab::pictures` keeps the `Arc<gpui::Image>`s per (part, rid) across
+  frames, so only a miss reads, copies and hashes media. It is valid for one
+  `Package::parts_stamp` (a fresh value from a process-wide counter on every
+  mutable access to the parts, equal in an unchanged clone): any package change
+  empties it, so a header edit re-reads that tab's pictures once. Decoded
+  images stay in gpui's asset cache for the process (no `remove_asset`).
+  A run whose rid is missing from its story's relationships (pasted from
+  another story keeps its source rid) keeps its frame.
+- Out of scope: anchored pictures, `a:srcRect` cropping, rotation, alt text,
+  the flow view's non-inline cases, PDF export, wasm hosts. The harness reports
+  no pictures, so there is no `.uit` case.
