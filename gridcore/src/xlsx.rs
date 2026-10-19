@@ -2951,7 +2951,8 @@ fn parse_worksheet_with(
                     // The follower is a reprint of the master, which drops any
                     // `_xl` prefix: it is kept only when the master is kept
                     // and has none, so every prefix the master had is absent.
-                    let kept = !src.contains("_xl") && unchanged_f(Some(src)).is_some();
+                    let kept =
+                        !crate::formula::has_file_prefix(src) && unchanged_f(Some(src)).is_some();
                     if let Some(l) = unchanged_f(Some(f)).filter(|_| kept) {
                         cell.meta.get_or_insert_with(Default::default).loaded_f = Some(l);
                     }
@@ -14549,11 +14550,12 @@ b",
             r#"<row r="1"><c r="C1"><f t="shared" ref="C1:C3" si="0">_xlfn.XLOOKUP(A1,$A$1:$A$3,$A$1:$A$3)</f><v>1</v></c>"#,
             r#"<c r="D1"><f t="shared" ref="D1:D3" si="1">_xlfn.LET(_xlpm.x,A1,_xlpm.x+1)</f><v>2</v></c>"#,
             r#"<c r="E1"><f t="shared" ref="E1:E3" si="2">TEXTJOIN(",",TRUE,A1:B1)</f><v>1</v></c>"#,
-            r#"<c r="F1"><f t="shared" ref="F1:F3" si="3">TEXTJOIN(",",TRUE,A1)+_xlfn.IFS(TRUE,1)</f><v>2</v></c></row>"#,
+            r#"<c r="F1"><f t="shared" ref="F1:F3" si="3">TEXTJOIN(",",TRUE,A1)+_xlfn.IFS(TRUE,1)</f><v>2</v></c>"#,
+            r#"<c r="G1"><f t="shared" ref="G1:G3" si="4">TEXTJOIN("_xl",TRUE,A1:B1)</f><v>1</v></c></row>"#,
             r#"<row r="2"><c r="C2"><f t="shared" si="0"/><v>2</v></c><c r="D2"><f t="shared" si="1"/><v>3</v></c>"#,
-            r#"<c r="E2"><f t="shared" si="2"/><v>1</v></c><c r="F2"><f t="shared" si="3"/><v>2</v></c></row>"#,
+            r#"<c r="E2"><f t="shared" si="2"/><v>1</v></c><c r="F2"><f t="shared" si="3"/><v>2</v></c><c r="G2"><f t="shared" si="4"/><v>1</v></c></row>"#,
             r#"<row r="3"><c r="C3"><f t="shared" si="0"/><v>3</v></c><c r="D3"><f t="shared" si="1"/><v>4</v></c>"#,
-            r#"<c r="E3"><f t="shared" si="2"/><v>1</v></c><c r="F3"><f t="shared" si="3"/><v>3</v></c></row>"#
+            r#"<c r="E3"><f t="shared" si="2"/><v>1</v></c><c r="F3"><f t="shared" si="3"/><v>3</v></c><c r="G3"><f t="shared" si="4"/><v>1</v></c></row>"#
         );
         let pkg = book_with_rows(rows);
         let (_, ws) = resaved(&pkg);
@@ -14568,10 +14570,19 @@ b",
         ] {
             assert!(ws.contains(f), "{f} in {ws}");
         }
-        // A master mixing a bare UDF with a prefixed builtin: its followers
-        // are saved with the builtin prefixed and may not strip it.
-        assert!(!ws.contains("<f>TEXTJOIN(\",\",TRUE,A2)+IFS"), "{ws}");
-        assert!(ws.contains("_xlfn.IFS(TRUE,1)"), "{ws}");
+        // A master mixing a bare UDF with a prefixed builtin: it is kept as
+        // loaded, its followers are reprints and are saved prefixed whole.
+        for f in [
+            r#"<f>TEXTJOIN(",",TRUE,A1)+_xlfn.IFS(TRUE,1)</f>"#,
+            r#"<f>_xlfn.TEXTJOIN(",",TRUE,A2)+_xlfn.IFS(TRUE,1)</f>"#,
+            r#"<f>_xlfn.TEXTJOIN(",",TRUE,A3)+_xlfn.IFS(TRUE,1)</f>"#,
+            // `_xl` inside a string literal is no prefix: the group stays bare.
+            r#"<f>TEXTJOIN("_xl",TRUE,A1:B1)</f>"#,
+            r#"<f>TEXTJOIN("_xl",TRUE,A2:B2)</f>"#,
+            r#"<f>TEXTJOIN("_xl",TRUE,A3:B3)</f>"#,
+        ] {
+            assert!(ws.contains(f), "{f} in {ws}");
+        }
     }
 
     #[test]

@@ -167,7 +167,9 @@ pub struct CellMeta {
     /// The formula text as loaded, kept only when [`crate::formula::file_formula`]
     /// would change it by function prefixes alone (a bare post-2007 name: a UDF
     /// named like a builtin); text it must print again (`A1#`, `@x`, bare
-    /// LET/LAMBDA names) is repaired on save and keeps nothing.
+    /// LET/LAMBDA names) is repaired on save and keeps nothing. A shared
+    /// group's followers (reprints of the master) keep it only when the master
+    /// has no `_xlfn.`/`_xlws.`/`_xlpm.` name.
     /// Save writes it back while the cell still holds exactly that text; any
     /// edit or reprint changes the text and the save translates it again.
     pub loaded_f: Option<String>,

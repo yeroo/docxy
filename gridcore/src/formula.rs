@@ -1622,7 +1622,7 @@ pub fn to_string_display(e: &Expr) -> String {
     Printer::default().print(e)
 }
 
-/// [`to_string`] of `e`, and where in that text `target` (a node inside `e`,
+/// [`to_string_display`] of `e`, and where in that text `target` (a node inside `e`,
 /// found by address) is printed: the byte range of its own text, without any
 /// parentheses its parent put round it. Evaluate Formula underlines it.
 /// `None` when `target` is not a node of `e`.
@@ -6875,6 +6875,35 @@ pub(crate) fn future_prefix(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The tokens of `src` with their start offsets; `None` when it doesn't lex.
+fn lex_all(src: &str) -> Option<Vec<(usize, Tok)>> {
+    let mut lex = Lexer::new(src);
+    let mut toks = Vec::new();
+    loop {
+        while lex.pos < lex.src.len() && (lex.src[lex.pos] as char).is_whitespace() {
+            lex.pos += 1;
+        }
+        let start = lex.pos;
+        match lex.next_tok() {
+            Ok(Tok::Eof) => return Some(toks),
+            Ok(t) => toks.push((start, t)),
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Does `src` name a function or LET/LAMBDA parameter in file spelling
+/// (`_xlfn.`, `_xlws.`, `_xlpm.`)? Text that doesn't lex counts as one.
+pub fn has_file_prefix(src: &str) -> bool {
+    lex_all(src).is_none_or(|toks| {
+        toks.iter().any(|(_, t)| {
+            matches!(t, Tok::Ident(id) if ["_xlfn", "_xlws", "_xlpm"]
+                .iter()
+                .any(|p| id.get(..5).is_some_and(|h| h.eq_ignore_ascii_case(p))))
+        })
+    })
+}
+
 /// A function name's `(start, end, prefix)` in formula text.
 type Splice = (usize, usize, &'static str);
 
@@ -6882,19 +6911,7 @@ type Splice = (usize, usize, &'static str);
 /// again, and the `(start, end, prefix)` of each function name that needs a
 /// prefix. `None` when the text doesn't lex.
 fn file_scan(src: &str) -> Option<(bool, Vec<Splice>)> {
-    let mut lex = Lexer::new(src);
-    let mut toks: Vec<(usize, Tok)> = Vec::new();
-    loop {
-        while lex.pos < lex.src.len() && (lex.src[lex.pos] as char).is_whitespace() {
-            lex.pos += 1;
-        }
-        let start = lex.pos;
-        match lex.next_tok() {
-            Ok(Tok::Eof) => break,
-            Ok(t) => toks.push((start, t)),
-            Err(_) => return None,
-        }
-    }
+    let toks = lex_all(src)?;
     let mut reprint = false;
     // (start, end, prefix) of each function name that needs a prefix.
     let mut splices: Vec<Splice> = Vec::new();
@@ -6952,6 +6969,8 @@ pub fn only_prefixes_added(src: &str) -> bool {
 /// post-2007 name there may be a VBA function named `TEXTJOIN`. Defined
 /// names, conditional formatting, validation and table formulas are always
 /// run through this, so a bare post-2007 name in one is saved as the builtin.
+/// A shared group whose master already holds a prefixed name is not kept as
+/// loaded either (its followers are reprints, which drop the prefix).
 pub fn file_formula(src: &str) -> Cow<'_, str> {
     let Some((reprint, splices)) = file_scan(src) else {
         return Cow::Borrowed(src);
