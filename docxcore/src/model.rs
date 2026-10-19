@@ -1458,10 +1458,27 @@ impl Document {
         for block in &mut self.body {
             assign_tracked_insert_block(block, &mut next, &mut by_id);
         }
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = SeenTargets {
+            targets: Default::default(),
+            next_id: self.max_annotation_id().saturating_add(1),
+        };
         for block in &mut self.body {
             assign_block_revision_targets(block, &mut next, &mut seen);
         }
+    }
+
+    /// The highest numeric `w:id` of any revision or comment marker.
+    pub fn max_annotation_id(&self) -> u64 {
+        let numeric = |id: &str| id.parse::<u64>().ok();
+        let revisions = self
+            .revisions()
+            .into_iter()
+            .filter_map(|revision| revision.metadata.id.as_deref().and_then(numeric));
+        let markers = crate::inspect::comment_marker_ids(self);
+        revisions
+            .chain(markers.iter().filter_map(|id| numeric(id)))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Enumerate modeled and recognized-unsupported revisions in current source
@@ -1548,11 +1565,33 @@ fn assign_tracked_insert_block(
     }
 }
 
-fn assign_metadata_target(
-    metadata: &mut RevisionMetadata,
-    next: &mut u64,
-    seen: &mut std::collections::HashSet<RevisionTarget>,
-) {
+/// The revision targets given out so far, and the next free `w:id`: a
+/// property change cloned by a split keeps its raw XML, so the copy is given
+/// an id of its own (a save would otherwise write the id twice).
+struct SeenTargets {
+    targets: std::collections::HashSet<RevisionTarget>,
+    next_id: u64,
+}
+
+impl SeenTargets {
+    fn insert(&mut self, target: RevisionTarget) -> bool {
+        self.targets.insert(target)
+    }
+}
+
+/// `raw` with the first element's `w:id` attribute set to `id`.
+fn with_revision_id(raw: &str, id: &str) -> Option<String> {
+    let tag_end = raw.find('>')?;
+    let at = raw[..tag_end].find(" w:id=")? + " w:id=".len();
+    let quote = raw[..tag_end][at..]
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '"' | '\''))?;
+    let close = at + 1 + raw[at + 1..tag_end].find(quote)?;
+    Some(format!("{}{quote}{id}{}", &raw[..at], &raw[close..]))
+}
+
+fn assign_metadata_target(metadata: &mut RevisionMetadata, next: &mut u64, seen: &mut SeenTargets) {
     if !metadata.target.is_assigned() || !seen.insert(metadata.target) {
         metadata.target = RevisionTarget(*next);
         *next = next.saturating_add(1);
@@ -1563,18 +1602,24 @@ fn assign_metadata_target(
 fn assign_property_target(
     change: &mut Option<PropertyChange>,
     next: &mut u64,
-    seen: &mut std::collections::HashSet<RevisionTarget>,
+    seen: &mut SeenTargets,
 ) {
     if let Some(change) = change {
+        let clone =
+            change.metadata.target.is_assigned() && seen.targets.contains(&change.metadata.target);
         assign_metadata_target(&mut change.metadata, next, seen);
+        if clone && change.metadata.id.is_some() {
+            let id = seen.next_id.to_string();
+            if let Some(raw) = with_revision_id(&change.raw, &id) {
+                seen.next_id += 1;
+                change.raw = raw;
+                change.metadata.id = Some(id);
+            }
+        }
     }
 }
 
-fn assign_run_props_target(
-    props: &mut RunProps,
-    next: &mut u64,
-    seen: &mut std::collections::HashSet<RevisionTarget>,
-) {
+fn assign_run_props_target(props: &mut RunProps, next: &mut u64, seen: &mut SeenTargets) {
     assign_property_target(&mut props.property_change, next, seen);
     // The runs of one recorded insertion share its target on purpose (a
     // format change splits a run in two), so a repeat is not a clone to
@@ -1588,11 +1633,7 @@ fn assign_run_props_target(
     }
 }
 
-fn assign_inline_revision_targets(
-    inline: &mut Inline,
-    next: &mut u64,
-    seen: &mut std::collections::HashSet<RevisionTarget>,
-) {
+fn assign_inline_revision_targets(inline: &mut Inline, next: &mut u64, seen: &mut SeenTargets) {
     match inline {
         Inline::Run(run) => assign_run_props_target(&mut run.props, next, seen),
         Inline::Hyperlink(link) => {
@@ -1629,11 +1670,7 @@ fn assign_inline_revision_targets(
     }
 }
 
-fn assign_block_revision_targets(
-    block: &mut Block,
-    next: &mut u64,
-    seen: &mut std::collections::HashSet<RevisionTarget>,
-) {
+fn assign_block_revision_targets(block: &mut Block, next: &mut u64, seen: &mut SeenTargets) {
     match block {
         Block::Paragraph(paragraph) => {
             // sectPr precedes pPrChange in CT_PPr schema order.
