@@ -667,3 +667,18 @@ fn a_paste_over_a_placeholder_inside_a_hyperlink_stays_in_the_control() {
     assert!(inside.contains("pasted"), "{xml}");
     assert!(!xml.contains("showingPlcHdr"), "{xml}");
 }
+
+#[test]
+fn a_tab_over_a_placeholder_inside_a_hyperlink_goes_in_the_control() {
+    let mut ed = link_editor(true);
+    ed.set_caret(Caret::at(vec![0], 8));
+    assert!(ed.select_placeholder_at_caret());
+    ed.insert_tab();
+    let xml = document_to_xml(&ed.doc);
+    let inside = xml
+        .split("<w:sdtContent>")
+        .nth(1)
+        .and_then(|x| x.split("</w:sdtContent>").next())
+        .unwrap_or_default();
+    assert!(inside.contains("<w:tab/>"), "{xml}");
+}

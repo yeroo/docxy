@@ -1281,9 +1281,9 @@ impl Editor {
     ///
     /// The tab takes the formatting typing at the caret would (a tab typed in
     /// bold text is bold, as in Word), so text typed after it keeps that too,
-    /// except next to a hyperlink: the tab never lands inside the link, so it
-    /// takes the formatting before the link, not the link's style (see
-    /// `tab_props_at`).
+    /// except next to a hyperlink: the tab does not land inside the link (an
+    /// emptied content control in it aside), so it takes the formatting before
+    /// the link, not the link's style (see `tab_props_at`).
     pub fn insert_tab(&mut self) {
         let pending = self.pending_format().cloned();
         self.delete_selection_to_replace();
@@ -5329,13 +5329,17 @@ fn source_props_at(content: &[Inline], offset: usize) -> RunProps {
 }
 
 /// Run properties a tab (or a break) inserted at this caret takes: what typing
-/// there would give, except next to a hyperlink. The tab never lands inside
-/// the link, so it takes the nearest source before the link rather than the
+/// there would give, except next to a hyperlink. The tab does not land inside
+/// the link (an emptied content control in it aside), so it takes the nearest source before the link rather than the
 /// link's style.
 fn tab_props_at(content: &[Inline], offset: usize) -> RunProps {
     match locate(content, offset) {
         // A tab into an emptied content control goes inside it, as typing.
-        _ if empty_sdt_at(content, offset).is_some() => run_props_at(content, offset),
+        _ if empty_sdt_at(content, offset).is_some()
+            || empty_sdt_in_link(content, offset).is_some() =>
+        {
+            run_props_at(content, offset)
+        }
         Some((i, _)) if matches!(content[i], Inline::Hyperlink(_)) => source_before(content, i)
             .map(RunProps::continued)
             .unwrap_or_default(),
