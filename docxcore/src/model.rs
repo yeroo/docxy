@@ -1579,7 +1579,8 @@ impl SeenTargets {
     }
 }
 
-/// `raw` with the first element's `w:id` attribute set to `id`.
+/// `raw` with the first element's `w:id` attribute set to `id`; `None` when
+/// it has none, and the copy then keeps the raw and metadata as they were.
 fn with_revision_id(raw: &str, id: &str) -> Option<String> {
     let tag_end = raw.find('>')?;
     let at = raw[..tag_end].find(" w:id=")? + " w:id=".len();

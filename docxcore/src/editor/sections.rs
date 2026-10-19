@@ -1931,4 +1931,27 @@ mod tests {
         assert_eq!(props_of(&e, 0).section_break, None);
         assert_eq!(e.sections().len(), 2);
     }
+
+    #[test]
+    fn a_split_run_saves_distinct_rpr_change_ids_829() {
+        let xml = concat!(
+            "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">",
+            "<w:body><w:p><w:r><w:rPr><w:b/><w:rPrChange w:id=\"7\"><w:rPr/></w:rPrChange></w:rPr>",
+            "<w:t>abcd</w:t></w:r></w:p></w:body></w:document>"
+        );
+        let doc = crate::load::parse_document_xml(xml, &crate::load::Relationships::default());
+        let mut e = Editor::new(doc);
+        e.caret = Caret::top(0, 2);
+        e.insert_newline();
+        let out = crate::serialize::document_to_xml(&e.doc);
+        let mut ids: Vec<&str> = out
+            .split("<w:rPrChange w:id=\"")
+            .skip(1)
+            .map(|r| &r[..r.find('"').unwrap()])
+            .collect();
+        assert_eq!(ids.len(), 2, "{out}");
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 2, "{out}");
+    }
 }
