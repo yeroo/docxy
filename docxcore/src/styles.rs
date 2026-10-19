@@ -180,7 +180,7 @@ impl StyleSheet {
     /// paragraph style's `basedOn` chain, below the character style's, below
     /// the run's direct formatting. Unlike [`StyleSheet::effective_run`] it
     /// starts from nothing (no document defaults, no default paragraph
-    /// style), so an unstyled run comes back as it is, and a direct
+    /// style, unless a paragraph names it), so an unstyled run comes back as it is, and a direct
     /// explicit-off (`<w:b w:val="0"/>`, kept in `raw_props`) beats every
     /// style. The character style beats the paragraph style outright, the
     /// toggle-property XOR Word applies between them is not modelled. Only
@@ -199,7 +199,10 @@ impl StyleSheet {
             agg.italic = t.italic;
             table_color = t.color.clone();
         }
-        for s in [para_style, run_style].into_iter().flatten() {
+        if let Some(s) = para_style {
+            self.fold_paragraph(&mut agg, s);
+        }
+        if let Some(s) = run_style {
             self.fold(&mut agg, s, &mut HashSet::new());
         }
         let mut out = direct.clone();
@@ -211,13 +214,7 @@ impl StyleSheet {
         }
         out.underline = direct.underline || agg.underline.unwrap_or(false);
         out.strike = direct.strike || agg.strike.unwrap_or(false);
-        // An explicit `auto` colour loads as no colour, its element kept in
-        // the shadow: it beats the styles too.
-        let explicit_auto = direct.shadow.iter().any(|x| {
-            crate::table_props::element_name(x) == "w:color"
-                && crate::table_props::element_attr(x, "w:val")
-                    .is_none_or(|v| v.is_empty() || v == "auto")
-        });
+        let explicit_auto = crate::table_styles::explicit_auto_color(direct);
         if direct.color.is_none() && !explicit_auto {
             out.color = agg.color.clone().or(table_color.flatten());
         }
@@ -350,12 +347,32 @@ impl StyleSheet {
     }
 
     fn fold(&self, agg: &mut PartialRun, id: &str, seen: &mut HashSet<String>) {
+        self.fold_chain(agg, id, seen, false);
+    }
+
+    /// [`StyleSheet::fold`] for a paragraph style's chain, which leaves the
+    /// default paragraph style out when it is reached through `basedOn`
+    /// (nearly every style is based on Normal): [`StyleSheet::shown_run`]
+    /// applies it only to a paragraph that names it.
+    fn fold_paragraph(&self, agg: &mut PartialRun, id: &str) {
+        self.fold_chain(agg, id, &mut HashSet::new(), true);
+    }
+
+    fn fold_chain(
+        &self,
+        agg: &mut PartialRun,
+        id: &str,
+        seen: &mut HashSet<String>,
+        skip_default: bool,
+    ) {
         if !seen.insert(id.to_string()) {
             return;
         }
         if let Some(def) = self.styles.get(id) {
-            if let Some(b) = &def.based_on {
-                self.fold(agg, b, seen);
+            if let Some(b) = def.based_on.as_ref().filter(|b| {
+                !(skip_default && self.default_paragraph.as_deref() == Some(b.as_str()))
+            }) {
+                self.fold_chain(agg, b, seen, skip_default);
             }
             agg.merge(&def.run);
         }
@@ -864,6 +881,29 @@ mod tests {
             ss.shown_run(None, None, None, &RunProps::default()),
             RunProps::default()
         );
+    }
+
+    const NORMAL: &str = r#"<w:styles>
+        <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
+          <w:rPr><w:rFonts w:ascii="Calibri"/><w:sz w:val="24"/></w:rPr></w:style>
+        <w:style w:type="paragraph" w:styleId="Heading2"><w:basedOn w:val="Normal"/>
+          <w:rPr><w:b/></w:rPr></w:style></w:styles>"#;
+
+    #[test]
+    fn explicit_normal_pstyle_run_props_now_draw() {
+        let ss = parse_styles_xml(NORMAL);
+        let r = ss.shown_run(None, Some("Normal"), None, &RunProps::default());
+        assert_eq!(r.size_half_pts, Some(24));
+        assert_eq!(r.font.as_deref(), Some("Calibri"));
+    }
+
+    #[test]
+    fn normal_does_not_reach_a_style_through_basedon() {
+        let ss = parse_styles_xml(NORMAL);
+        let r = ss.shown_run(None, Some("Heading2"), None, &RunProps::default());
+        assert!(r.bold);
+        assert_eq!(r.size_half_pts, None, "the heading keeps the host's size");
+        assert_eq!(r.font, None);
     }
 
     #[test]

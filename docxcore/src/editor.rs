@@ -258,8 +258,10 @@ struct PendingFormat {
     /// The toggle's own undo step. Any later step, from whatever edit,
     /// leaves the toggles behind.
     serial: Option<u64>,
-    /// The value each property is toggled to, by [`ToggleProp`]: one slot
-    /// each, however often it is toggled.
+    /// The direct value each toggled property is set to, by [`ToggleProp`]:
+    /// one slot each, however often it is toggled. With a style context
+    /// (`styled`) `false` may mean "inherit the style's"; `explicit_off`
+    /// says when it means "off over it".
     toggles: [Option<bool>; ToggleProp::ALL.len()],
     /// Whether a style context decided the toggles (#1427): they were then
     /// set over what the styles give, so the property's explicit-off
@@ -274,9 +276,10 @@ impl PendingFormat {
     fn apply(&self, props: &mut RunProps) {
         for prop in ToggleProp::ALL {
             if let Some(value) = self.toggles[prop as usize] {
-                prop.set()(props, value);
                 if self.styled {
-                    prop.set_explicit_off(props, self.explicit_off[prop as usize]);
+                    prop.set_over_style(props, value, self.explicit_off[prop as usize]);
+                } else {
+                    prop.set()(props, value);
                 }
             }
         }
@@ -330,23 +333,42 @@ impl ToggleProp {
         }
     }
 
-    /// Write (or drop) the explicit `<w:b w:val="0"/>` that turns a style's
-    /// bold off, keeping at most that one element for the property.
-    fn set_explicit_off(self, props: &mut RunProps, off: bool) {
+    /// Set the property over the styles: `direct` is its direct value and
+    /// `off` writes the explicit `<w:b w:val="0"/>` that turns a style's
+    /// bold off. A run that already has both is left as it is, and a change
+    /// replaces the loaded primary and its complex-script twin together
+    /// (`w:b` with `w:bCs`: a lone twin would be written back for the
+    /// primary, #1063), writing the twin's explicit-off when it was there.
+    fn set_over_style(self, props: &mut RunProps, direct: bool, off: bool) {
         let Some(local) = self.local() else {
+            self.set()(props, direct);
             return;
         };
+        let (primary, twin) = (format!("w:{local}"), format!("w:{local}Cs"));
+        let raw_is = |r: &String, l: &str| {
+            crate::styles::has_raw_child(std::slice::from_ref(r), l.trim_start_matches("w:"))
+        };
+        let had_off = props.raw_props.iter().any(|r| raw_is(r, &primary));
+        if self.get()(props) == direct && had_off == off {
+            return;
+        }
+        self.set()(props, direct);
+        let had_twin = props
+            .shadow
+            .iter()
+            .any(|x| crate::table_props::element_name(x) == twin);
         props
             .raw_props
-            .retain(|r| !crate::styles::has_raw_child(std::slice::from_ref(r), local));
-        // A loaded explicit-off is in the shadow too, and would be written
-        // beside (or instead of) the model's choice.
-        let tag = format!("w:{local}");
-        props
-            .shadow
-            .retain(|x| crate::table_props::element_name(x) != tag);
+            .retain(|r| !raw_is(r, &primary) && !raw_is(r, &twin));
+        props.shadow.retain(|x| {
+            let name = crate::table_props::element_name(x);
+            name != primary && name != twin
+        });
         if off {
-            props.raw_props.push(format!("<w:{local} w:val=\"0\"/>"));
+            props.raw_props.push(format!("<{primary} w:val=\"0\"/>"));
+            if had_twin {
+                props.raw_props.push(format!("<{twin} w:val=\"0\"/>"));
+            }
         }
     }
 }
@@ -394,7 +416,26 @@ impl ShownBase {
 struct EditStyles {
     xml: Arc<str>,
     sheet: crate::styles::StyleSheet,
+    /// Table styles looked up so far, by id (`None`: no such style).
+    tables: std::sync::Mutex<
+        std::collections::HashMap<String, Option<crate::table_styles::TableStyle>>,
+    >,
 }
+
+impl EditStyles {
+    fn table_style(&self, id: &str) -> Option<crate::table_styles::TableStyle> {
+        self.tables
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(id.to_string())
+            .or_insert_with(|| crate::table_styles::lookup_style(Some(&self.xml), id))
+            .clone()
+    }
+}
+
+/// The resolved looks of the tables one edit has met, by table path, so a
+/// selection over many cells resolves each table once.
+type LookMemo = std::collections::HashMap<Vec<usize>, Vec<Vec<crate::table_styles::CellLook>>>;
 
 /// An undo step's name. Typing is named by its text as it coalesces; a host
 /// names a command's steps with [`Editor::name_command`]; anything else
@@ -3006,9 +3047,10 @@ impl Editor {
         // With a styles context, Bold and Italic are read and written over
         // what the table, paragraph and character styles give each run
         // (#1427); without one, over the direct formatting alone.
+        let mut memo = LookMemo::new();
         let bases: Vec<Option<ShownBase>> = spans
             .iter()
-            .map(|(path, _, _)| prop.local().and_then(|_| self.shown_base(path)))
+            .map(|(path, _, _)| prop.local().and_then(|_| self.shown_base(path, &mut memo)))
             .collect();
         self.checkpoint(EditKind::Structural);
         let mut all = true;
@@ -3031,8 +3073,7 @@ impl Editor {
                     Some(b) => edit_run_range(&mut p.content, *s, *e, &|text, props| {
                         let under = b.base(prop, props);
                         let mut p = props.clone();
-                        set(&mut p, value && !under);
-                        prop.set_explicit_off(&mut p, !value && under);
+                        prop.set_over_style(&mut p, value && !under, !value && under);
                         Run {
                             text: text.to_string(),
                             props: p,
@@ -3046,7 +3087,9 @@ impl Editor {
     }
 
     fn toggle_at_caret(&mut self, prop: ToggleProp) {
-        let base = prop.local().and_then(|_| self.shown_base(&self.caret.path));
+        let base = prop
+            .local()
+            .and_then(|_| self.shown_base(&self.caret.path, &mut LookMemo::new()));
         let (value, under) = match &base {
             Some(b) => (
                 !prop.get()(&b.shown(&self.caret_props())),
@@ -3097,7 +3140,11 @@ impl Editor {
             (Some(s), Some(x)) if Arc::ptr_eq(&s.xml, &x) || *s.xml == *x => {}
             (_, Some(x)) => {
                 let sheet = crate::styles::parse_styles_xml(&x);
-                self.styles = Some(Arc::new(EditStyles { xml: x, sheet }));
+                self.styles = Some(Arc::new(EditStyles {
+                    xml: x,
+                    sheet,
+                    tables: Default::default(),
+                }));
             }
             (_, None) => self.styles = None,
         }
@@ -3105,33 +3152,22 @@ impl Editor {
 
     /// What the styles lay below the runs of the paragraph `path` names; `None`
     /// without a styles context.
-    fn shown_base(&self, path: &[usize]) -> Option<ShownBase> {
+    fn shown_base(&self, path: &[usize], memo: &mut LookMemo) -> Option<ShownBase> {
         let styles = self.styles.clone()?;
         let para = resolve_para(&self.doc.body, path)?;
         // The innermost table around the paragraph decides the look.
-        let (mut blocks, mut rest) = (&self.doc.body[..], path);
-        let mut look = None;
-        while let Some(block) = rest.first().and_then(|i| blocks.get(*i)) {
-            match (block, &rest[1..]) {
-                (Block::Table(t), [row, cell, inner @ ..]) => {
-                    look = Some(crate::table_styles::cell_run_look(
-                        t,
-                        Some(&styles.xml),
-                        *row,
-                        *cell,
-                    ));
-                    let Some(c) = t.rows.get(*row).and_then(|r| r.cells.get(*cell)) else {
-                        break;
-                    };
-                    (blocks, rest) = (&c.blocks, inner);
-                }
-                (Block::Paragraph(p), [k, inner @ ..]) => match p.content.get(*k) {
-                    Some(Inline::TextBox { blocks: b, .. }) => (blocks, rest) = (b, inner),
-                    _ => break,
-                },
-                _ => break,
-            }
-        }
+        let look = tables::table_steps(&self.doc.body, path)
+            .last()
+            .and_then(|pos| {
+                let table = tables::table_at(&self.doc.body, &pos.table)?;
+                let looks = memo.entry(pos.table.clone()).or_insert_with(|| {
+                    let style = crate::table::table_props(table)
+                        .attr("w:tblStyle", "w:val")
+                        .and_then(|id| styles.table_style(&id));
+                    crate::table_styles::resolve(table, style.as_ref())
+                });
+                looks.get(pos.row)?.get(pos.cell).map(|c| c.run.clone())
+            });
         Some(ShownBase {
             styles,
             look,
@@ -3144,7 +3180,7 @@ impl Editor {
     /// on-states; the same as `caret_props` without one.
     pub fn caret_props_shown(&self) -> RunProps {
         let props = self.caret_props();
-        match self.shown_base(&self.caret.path) {
+        match self.shown_base(&self.caret.path, &mut LookMemo::new()) {
             Some(b) => b.shown(&props),
             None => props,
         }

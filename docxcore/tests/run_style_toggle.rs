@@ -247,3 +247,96 @@ fn direct_bold_in_bold_style_round_trips_off_and_on() {
         "inherits the style's bold again: {out}"
     );
 }
+
+fn reload(ed: &Editor) -> Editor {
+    let out = xml(ed);
+    let inner = out
+        .split("<w:body>")
+        .nth(1)
+        .unwrap()
+        .split("</w:body>")
+        .next()
+        .unwrap();
+    let mut back = Editor::new(parse(inner));
+    back.set_styles_xml(Some(Arc::from(STYLES)));
+    back
+}
+
+#[test]
+fn bold_over_a_run_with_a_twin_keeps_the_pair() {
+    let mut ed = editor(
+        "<w:p><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t>Hello</w:t></w:r><w:r><w:t>world</w:t></w:r></w:p>",
+        true,
+    );
+    select(&mut ed, &[0], 0, 10);
+    ed.toggle_bold();
+    let out = xml(&ed);
+    assert_eq!(out.matches("<w:b/>").count(), 2, "{out}");
+    assert_eq!(
+        out.matches("<w:bCs/>").count(),
+        1,
+        "Hello keeps its twin: {out}"
+    );
+    assert!(reload(&ed).caret_props_shown().bold);
+}
+
+#[test]
+fn bold_on_over_a_loaded_explicit_off_pair_leaves_no_stale_twin() {
+    let mut ed = editor(
+        "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr><w:r><w:rPr>\
+         <w:b w:val=\"0\"/><w:bCs w:val=\"0\"/><w:i w:val=\"0\"/><w:iCs w:val=\"0\"/></w:rPr>\
+         <w:t>Title</w:t></w:r></w:p>",
+        true,
+    );
+    select(&mut ed, &[0], 0, 5);
+    ed.toggle_bold();
+    ed.toggle_italic();
+    let out = xml(&ed);
+    assert!(!out.contains("w:val=\"0\""), "no stale off or twin: {out}");
+    assert!(!out.contains("Cs"), "{out}");
+}
+
+#[test]
+fn bold_off_over_a_style_writes_the_twin_off_when_it_was_there() {
+    let mut ed = editor(
+        "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr><w:r><w:rPr>\
+         <w:b/><w:bCs/><w:i/><w:iCs/></w:rPr><w:t>Title</w:t></w:r></w:p>",
+        true,
+    );
+    select(&mut ed, &[0], 0, 5);
+    ed.toggle_bold();
+    ed.toggle_italic();
+    let out = xml(&ed);
+    for tag in ["b", "bCs", "i", "iCs"] {
+        assert!(
+            out.contains(&format!("<w:{tag} w:val=\"0\"/>")),
+            "{tag}: {out}"
+        );
+    }
+    ed.toggle_bold();
+    ed.toggle_italic();
+    let out = xml(&ed);
+    assert!(
+        !out.contains("w:val=\"0\"") && !out.contains("Cs/>"),
+        "{out}"
+    );
+}
+
+#[test]
+fn caret_toggles_over_a_pair_keep_it_whole() {
+    let mut ed = editor(
+        "<w:p><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t>Hello</w:t></w:r></w:p>",
+        true,
+    );
+    ed.caret = Caret::at(vec![0], 5);
+    ed.toggle_bold();
+    ed.toggle_bold();
+    ed.insert_str("x");
+    let out = xml(&ed);
+    assert_eq!(
+        out.matches("<w:b/>").count(),
+        out.matches("<w:bCs/>").count(),
+        "no lone twin: {out}"
+    );
+    assert!(run_props(&ed, &[0], 'x').bold);
+}

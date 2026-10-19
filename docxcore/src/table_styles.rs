@@ -549,14 +549,7 @@ impl RunLook {
         {
             out.italic = i;
         }
-        // An explicit `auto` colour loads as no colour, its element kept in
-        // the shadow. A shadow entry is written back only while it still
-        // matches the model, so only an `auto` one counts with no colour.
-        let explicit_auto = run.shadow.iter().any(|x| {
-            crate::table_props::element_name(x) == "w:color"
-                && crate::table_props::element_attr(x, "w:val")
-                    .is_none_or(|v| v.is_empty() || v == "auto")
-        });
+        let explicit_auto = explicit_auto_color(run);
         if run.color.is_none() && !explicit_auto {
             if let Some(c) = &self.color {
                 out.color = c.clone();
@@ -699,18 +692,16 @@ pub fn parse_table_style(xml: &str) -> TableStyle {
     s
 }
 
-/// The run formatting `table`'s style lays below the text of its cell
-/// `cell` in row `row` (#1427), as the suite's table view resolves it; empty
-/// for a table with no style or a cell that is not there.
-pub fn cell_run_look(table: &Table, styles_xml: Option<&str>, row: usize, cell: usize) -> RunLook {
-    let style = table_props(table)
-        .attr("w:tblStyle", "w:val")
-        .and_then(|id| lookup_style(styles_xml, &id));
-    resolve(table, style.as_ref())
-        .get(row)
-        .and_then(|r| r.get(cell))
-        .map(|c| c.run.clone())
-        .unwrap_or_default()
+/// Whether a run's own `w:color` is an explicit `auto`: it loads as no
+/// colour, its element kept in the shadow, and a shadow entry is written
+/// back only while it still matches the model, so only an `auto` one counts
+/// with no colour. Such a run keeps automatic colour over every style.
+pub fn explicit_auto_color(run: &RunProps) -> bool {
+    run.shadow.iter().any(|x| {
+        crate::table_props::element_name(x) == "w:color"
+            && crate::table_props::element_attr(x, "w:val")
+                .is_none_or(|v| v.is_empty() || v == "auto")
+    })
 }
 
 /// The table style `id`, from `styles_xml` (following `w:basedOn`) or the
