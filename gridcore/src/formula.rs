@@ -6875,10 +6875,13 @@ pub(crate) fn future_prefix(name: &str) -> Option<&'static str> {
     }
 }
 
+/// A function name's `(start, end, prefix)` in formula text.
+type Splice = (usize, usize, &'static str);
+
 /// What [`file_formula`] has to do to `src`: whether the AST must be printed
 /// again, and the `(start, end, prefix)` of each function name that needs a
 /// prefix. `None` when the text doesn't lex.
-fn file_scan(src: &str) -> Option<(bool, Vec<(usize, usize, &'static str)>)> {
+fn file_scan(src: &str) -> Option<(bool, Vec<Splice>)> {
     let mut lex = Lexer::new(src);
     let mut toks: Vec<(usize, Tok)> = Vec::new();
     loop {
@@ -6894,7 +6897,7 @@ fn file_scan(src: &str) -> Option<(bool, Vec<(usize, usize, &'static str)>)> {
     }
     let mut reprint = false;
     // (start, end, prefix) of each function name that needs a prefix.
-    let mut splices: Vec<(usize, usize, &'static str)> = Vec::new();
+    let mut splices: Vec<Splice> = Vec::new();
     for (i, (start, t)) in toks.iter().enumerate() {
         match t {
             Tok::Hash | Tok::At => reprint = true,
