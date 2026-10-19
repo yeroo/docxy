@@ -896,6 +896,34 @@ mod tests {
         assert!(zip.find("customXml").is_none());
     }
 
+    /// #1167: classifying the entries reads no `.rels` over the naming limit,
+    /// whatever size it declares.
+    #[test]
+    fn a_huge_declared_rels_part_is_not_read_to_classify() {
+        let source = with_parts(
+            ORIGINAL_CONTENT_TYPES,
+            &[
+                ("_rels/.rels", b"<Relationships/>"),
+                ("media/one.bin", b"1"),
+            ],
+        );
+        let at = ZipArchive::open(&source)
+            .unwrap()
+            .entries()
+            .iter()
+            .position(|e| e.name == "_rels/.rels")
+            .unwrap();
+        let huge = declared_size(source, at, u32::MAX);
+        let project = read_yppx_within(&huge, u64::MAX).unwrap();
+        assert!(
+            project
+                .package
+                .parts
+                .iter()
+                .any(|(n, _)| n == "media/one.bin")
+        );
+    }
+
     #[test]
     fn unreadable_extra_parts_open_and_block_yppx_save() {
         let source = with_parts(

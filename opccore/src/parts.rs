@@ -10,6 +10,11 @@ use std::collections::HashSet;
 use crate::xml::{Event, XmlParser};
 use crate::zip::ZipArchive;
 
+/// The most uncompressed bytes of a `[Content_Types].xml` or `.rels` entry
+/// that are read to find the names in it. A larger one names nothing, so a
+/// hostile package cannot make the classification inflate it (#1167).
+pub const MAX_NAMING_PART: u64 = 8 << 20;
+
 /// For each entry of `zip`, in order, whether it is a part. `names` are the
 /// entries' names with `/` separators, one per entry.
 ///
@@ -61,6 +66,9 @@ fn named_parts(zip: &ZipArchive, names: &[String]) -> HashSet<String> {
             _ => None,
         };
         if source.is_none() && lower != "[content_types].xml" {
+            continue;
+        }
+        if e.uncomp_size > MAX_NAMING_PART {
             continue;
         }
         let Some(bytes) = zip.extract(e) else {
@@ -147,6 +155,24 @@ mod tests {
 
     fn is_part(flags: &[(String, bool)], name: &str) -> bool {
         flags.iter().find(|(n, _)| n == name).unwrap().1
+    }
+
+    /// A relationships part over [`MAX_NAMING_PART`] names nothing (it is not
+    /// even read); the same part under the limit names its target.
+    #[test]
+    fn an_oversize_naming_part_names_nothing() {
+        let rels = |pad: usize| {
+            format!(
+                "<Relationships><Relationship Id=\"1\" Type=\"t\" Target=\"x\"/>{}</Relationships>",
+                " ".repeat(pad)
+            )
+        };
+        let small = rels(0);
+        let big = rels(MAX_NAMING_PART as usize);
+        let f = flags(&[("_rels/.rels", &small), ("x", "")]);
+        assert!(is_part(&f, "x"), "named");
+        let f = flags(&[("_rels/.rels", &big), ("x", "")]);
+        assert!(!is_part(&f, "x"), "the oversize part names nothing");
     }
 
     #[test]
