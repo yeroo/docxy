@@ -5337,6 +5337,10 @@ struct Docxy {
     /// shown under the Recent heading until the backstage reopens: the tab
     /// status is hidden behind the backstage, and there may be no tab.
     recent_message: Option<String>,
+    /// The startup plugin notice said while no tab existed (#806): the first
+    /// tab to exist takes it if it still shows its initial status
+    /// ([`land_status`], each frame).
+    pending_status: Option<SharedString>,
     /// When the hot-exit state was last written by any `persist`, or an
     /// AutoRecover tick last found nothing to write: the timer's clock. A
     /// `Cell` because `persist` takes `&self`.
@@ -5532,8 +5536,8 @@ struct Docxy {
     clipboard: ClipboardStore,
     // Open sheet colour-swatch picker (fill or font), None = closed.
     sheet_pick: Option<SheetPick>,
-    // Inline sheet-tab rename in progress: (tab index, edit buffer). None = idle.
-    sheet_rename: Option<(usize, String)>,
+    /// The sheet tab's inline rename while it has the keyboard (#1202, #1365), None = idle.
+    sheet_rename: Option<SheetRename>,
     /// The sheet's Name Box while it has the keyboard (#1343).
     name_box: Option<NameBoxEdit>,
     /// The Home ribbon's Font or Font Size box while it has the keyboard (#1344).
@@ -7415,6 +7419,29 @@ impl FontBox {
             (FontBox::Size, false) => "sheet-combo:font-size",
             (FontBox::Name, true) => "doc-combo:fontname",
             (FontBox::Size, true) => "doc-combo:fontsize",
+        }
+    }
+}
+
+/// The sheet tab's inline rename (#1202, #1365): a one-line field like the Name
+/// Box. It opens with the whole name selected, as Excel's does.
+#[derive(Clone)]
+struct SheetRename {
+    idx: usize,
+    text: String,
+    caret: usize,
+    sel: bool,
+}
+
+impl SheetRename {
+    /// Opens on `name`, all of it selected (nothing to select in an empty one).
+    fn open(idx: usize, name: String) -> Self {
+        let caret = name.chars().count();
+        SheetRename {
+            idx,
+            sel: caret > 0,
+            caret,
+            text: name,
         }
     }
 }
@@ -12813,8 +12840,9 @@ fn reopens_from_file(t: &DocTab) -> bool {
 #[cfg(test)]
 mod session_union_tests {
     use super::{
-        DocTab, EditOptions, Kind, Prefs, Session, SessionWrite, ThemePref, sample_doc,
-        session_path_in, write_session_with,
+        DocTab, EditOptions, Kind, Prefs, Session, SessionWrite, SharedString, Startup, ThemePref,
+        land_status, restore_session_noting, sample_doc, session_path_in, startup_session,
+        startup_tabs, trusted, write_session_with,
     };
 
     #[test]
@@ -12902,6 +12930,69 @@ mod session_union_tests {
         for h in &hots {
             assert!(std::path::Path::new(h).exists(), "sidecar written: {h}");
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #806: nothing restored gives the Start screen in a product run and the
+    /// sample document in a harness instance; a restored session is kept.
+    #[test]
+    fn an_empty_start_is_the_start_screen_unless_a_harness_wants_the_sample() {
+        assert!(matches!(
+            startup_tabs(Vec::new(), false),
+            Startup::StartScreen
+        ));
+        match startup_tabs(Vec::new(), true) {
+            Startup::Tabs(tabs) => {
+                assert_eq!(tabs.len(), 1);
+                assert_eq!(tabs[0].title.as_ref(), "sample.docx");
+            }
+            Startup::StartScreen => panic!("the harness fallback is the sample"),
+        }
+        for fallback in [false, true] {
+            match startup_tabs(vec![doc_tab("one.docx", false)], fallback) {
+                Startup::Tabs(tabs) => assert_eq!(tabs.len(), 1),
+                Startup::StartScreen => panic!("a restored tab is never replaced"),
+            }
+        }
+    }
+
+    /// #806: a status said with no tab waits for the first one, once.
+    #[test]
+    fn the_startup_notice_lands_on_the_first_tab_unless_the_opener_spoke() {
+        let mut pending = Some(SharedString::from("Plugin not loaded: x"));
+        land_status(&mut pending, None);
+        assert!(pending.is_some(), "no tab yet: kept");
+        let mut status = SharedString::from("new");
+        land_status(&mut pending, Some(&mut status));
+        assert_eq!(status.as_ref(), "Plugin not loaded: x");
+        assert!(pending.is_none());
+        let mut later = SharedString::from("saved");
+        land_status(&mut pending, Some(&mut later));
+        assert_eq!(later.as_ref(), "saved");
+        // A tab with a status of its own keeps it; the notice is spent.
+        let mut pending = Some(SharedString::from("Plugin not loaded: x"));
+        let mut opened = SharedString::from("could not read x.docx");
+        land_status(&mut pending, Some(&mut opened));
+        assert_eq!(opened.as_ref(), "could not read x.docx");
+        assert!(pending.is_none());
+    }
+
+    /// #806: the window with no tab writes a session with none, and reading it
+    /// back restores none (the Start screen again), not a stale sample.
+    #[test]
+    fn a_window_with_no_tab_round_trips_to_the_start_screen() {
+        let root = fresh_root("start-screen");
+        write_session_with(&root, &[], 0, prefs(), SessionWrite::All, &[], 0);
+        let session = startup_session(&root, std::time::SystemTime::now());
+        assert!(session.tabs.is_empty());
+        let (tabs, recovered) = restore_session_noting(
+            &session,
+            false,
+            std::time::SystemTime::now(),
+            &trusted::TrustStore::default(),
+        );
+        assert!(recovered.is_empty());
+        assert!(matches!(startup_tabs(tabs, false), Startup::StartScreen));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -14012,8 +14103,83 @@ mod frame_border_tests {
     }
 }
 
+/// One card of File > New (and of the Start screen).
+struct NewCard {
+    id: &'static str,
+    name: &'static str,
+    sub: &'static str,
+    kind: Kind,
+}
+
+const NEW_CARDS: [NewCard; 4] = [
+    NewCard {
+        id: "new-doc-card",
+        name: "Document",
+        sub: "Blank .docx",
+        kind: Kind::Docx,
+    },
+    NewCard {
+        id: "new-xls-card",
+        name: "Spreadsheet",
+        sub: "Blank workbook",
+        kind: Kind::Xlsx,
+    },
+    NewCard {
+        id: "new-project-card",
+        name: "Project",
+        sub: "Blank schedule",
+        kind: Kind::Project,
+    },
+    NewCard {
+        id: "new-mail-card",
+        name: "Mail",
+        sub: "New message",
+        kind: Kind::Look,
+    },
+];
+
+/// Hand `pending` to the first tab's status (#806), once there is one, but
+/// only while that still shows the status it was made with: whatever its
+/// opener said (a read error, a draft, Protected View) wins, and `pending`
+/// is spent either way.
+fn land_status(pending: &mut Option<SharedString>, status: Option<&mut SharedString>) {
+    if let Some(status) = status
+        && let Some(msg) = pending.take()
+        && (status.is_empty() || status.as_ref() == "new")
+    {
+        *status = msg;
+    }
+}
+
+/// What the first window starts with (#806).
+enum Startup {
+    /// The restored tabs, or the sample document a harness instance falls back to.
+    Tabs(Vec<DocTab>),
+    /// Nothing to restore and no sample: no tab, the File > New page up.
+    StartScreen,
+}
+
+/// The tabs the first window starts with. A restored session is kept whole; an
+/// empty one gives the Start screen, except that a harness instance keeps the
+/// sample document its cases assume (`sample_fallback`, see
+/// [`harness::start_screen_requested`]).
+fn startup_tabs(restored: Vec<DocTab>, sample_fallback: bool) -> Startup {
+    if !restored.is_empty() {
+        Startup::Tabs(restored)
+    } else if sample_fallback {
+        Startup::Tabs(vec![sample_doc().into_tab(
+            Kind::Docx,
+            "sample.docx".into(),
+            None,
+            false,
+        )])
+    } else {
+        Startup::StartScreen
+    }
+}
+
 impl Docxy {
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn new(sample_fallback: bool, cx: &mut Context<Self>) -> Self {
         let root = config_root();
         let session = startup_session(&root, std::time::SystemTime::now());
         set_configured_identity(&session.user_name, &session.user_initials);
@@ -14022,13 +14188,17 @@ impl Docxy {
         recover::mark_running(&root);
 
         let now = std::time::SystemTime::now();
-        let (mut tabs, recovered) =
+        let (tabs, recovered) =
             restore_session_noting(&session, crashed, now, &trusted::TrustStore::load(&root));
-        if tabs.is_empty() {
-            tabs.push(sample_doc().into_tab(Kind::Docx, "sample.docx".into(), None, false));
-        }
+        let (tabs, start_screen) = match startup_tabs(tabs, sample_fallback) {
+            Startup::Tabs(tabs) => (tabs, false),
+            Startup::StartScreen => (Vec::new(), true),
+        };
         let active = session.active.min(tabs.len().saturating_sub(1));
         let mut this = Self::build(tabs, active, session.theme, session.ask_on_close, cx);
+        if start_screen {
+            this.show_start_screen(cx);
+        }
         // New documents continue past the restored ones (#631).
         // The untitled counter is the run's (#587 r2 m10): seed the shared
         // one from the restored titles, then every window mints from it.
@@ -14069,7 +14239,12 @@ impl Docxy {
         // A format plugin that did not load (`main` logged each one): the
         // first says so on the status line.
         if let Some(error) = project_formats::global().errors.first() {
-            this.set_status(format!("Plugin not loaded: {error}"));
+            let notice = format!("Plugin not loaded: {error}");
+            if this.tabs.is_empty() {
+                this.pending_status = Some(notice.into());
+            } else {
+                this.set_status(notice);
+            }
         }
         // win_id is 0 until the window registers: the write below behaves
         // exactly like the single-window write this was (no union, base 0).
@@ -14133,6 +14308,7 @@ impl Docxy {
             trusted_error: None,
             recent_files: Vec::new(),
             recent_message: None,
+            pending_status: None,
             last_persist: std::cell::Cell::new(std::time::Instant::now()),
             unregistered_own: Default::default(),
             applied: None,
@@ -14462,7 +14638,33 @@ impl Docxy {
         self.bs_scroll.set_offset(point(px(0.), px(0.)));
     }
 
+    /// File > New's page: the Document / Spreadsheet / Project / Mail cards.
+    fn show_backstage_new_page(&mut self) {
+        self.bs_new = true;
+        self.bs_export = false;
+        self.bs_templates = doc_templates::personal_templates(&doc_templates::templates_dir());
+        self.bs_account = false;
+        self.bs_info = false;
+        self.bs_info_status = None;
+        self.reset_backstage_scroll();
+    }
+
+    /// The Start screen (#806): the New page over a window with no tab.
+    /// Brought up as File is (drafts, recent files, trusted count), so Back
+    /// reaches the usual pages with their lists filled.
+    fn show_start_screen(&mut self, cx: &mut Context<Self>) {
+        self.open_backstage(cx);
+        self.show_backstage_new_page();
+    }
+
     fn backstage_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // With no tab there is no tab to go back to: File stays up, on its
+        // default page (Recent, Settings) instead of the New page (#806).
+        if self.tabs.is_empty() {
+            self.show_backstage_open_page();
+            cx.notify();
+            return self.refocus(window, cx);
+        }
         self.backstage = false;
         self.show_backstage_open_page();
         self.refocus(window, cx);
@@ -14525,14 +14727,7 @@ impl Docxy {
             }
             BackstageRailAction::Account => self.open_account(cx),
             BackstageRailAction::New => {
-                self.bs_new = true;
-                self.bs_export = false;
-                self.bs_templates =
-                    doc_templates::personal_templates(&doc_templates::templates_dir());
-                self.bs_account = false;
-                self.bs_info = false;
-                self.bs_info_status = None;
-                self.reset_backstage_scroll();
+                self.show_backstage_new_page();
                 cx.notify();
             }
             BackstageRailAction::Open => self.open_file(window, cx),
@@ -17809,7 +18004,7 @@ impl Docxy {
             .active_sheet()
             .and_then(|v| v.pkg.workbook.sheets.get(idx).map(|s| s.name.clone()));
         if let Some(name) = name {
-            self.sheet_rename = Some((idx, name));
+            self.sheet_rename = Some(SheetRename::open(idx, name));
             cx.notify();
         }
     }
@@ -17820,7 +18015,7 @@ impl Docxy {
     /// (`!enter`) leaves as the exit path does: an untouched buffer changes
     /// nothing and dirties nothing.
     fn sheet_rename_commit(&mut self, enter: bool, cx: &mut Context<Self>) {
-        let Some((idx, buf)) = self.sheet_rename.take() else {
+        let Some(SheetRename { idx, text: buf, .. }) = self.sheet_rename.take() else {
             return;
         };
         if self.protected_refused(cx) {
@@ -17837,25 +18032,71 @@ impl Docxy {
         }
     }
 
-    /// Route a keystroke into the active inline rename (char/backspace/enter/esc).
-    fn sheet_rename_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
-        let Some((idx, mut buf)) = self.sheet_rename.clone() else {
+    /// Route a keystroke into the active inline rename: edits at a caret like
+    /// the Name Box, Ctrl+A/C/X/V, Enter commits and Escape keeps the old name.
+    fn sheet_rename_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        ctrl: bool,
+        alt: bool,
+        key: &str,
+        cx: &mut Context<Self>,
+    ) {
+        use field_edit::Op;
+        let Some(r) = self.sheet_rename.as_mut() else {
             return;
         };
+        let edit = |r: &mut SheetRename, op: Op| {
+            field_edit::apply(&mut r.text, &mut r.caret, &mut r.sel, op);
+        };
+        // Ctrl+Alt is AltGr on Windows: its keys are text, not chords.
+        if ctrl && !alt {
+            match key {
+                "a" => edit(r, Op::SelectAll),
+                "c" | "x" => {
+                    let text = r.text.clone();
+                    if r.sel && !text.is_empty() {
+                        if key == "x" {
+                            edit(r, Op::Delete);
+                        }
+                        self.clipboard_write(text.clone(), cx);
+                        self.office_clip.push(&text);
+                    }
+                }
+                "v" => {
+                    // A one-line field: line breaks and tabs (a sheet copy's TSV)
+                    // drop out, as in the comment bar.
+                    if let ClipRead::Text(text) = self.clipboard_read(cx) {
+                        let line = field_edit::one_line(&text);
+                        if !line.is_empty() {
+                            if let Some(r) = self.sheet_rename.as_mut() {
+                                edit(r, Op::Insert(&line));
+                            }
+                        }
+                    }
+                }
+                "enter" => self.sheet_rename_commit(true, cx),
+                // Any other chord is not text.
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
         match key {
             "escape" => self.sheet_rename = None,
             "enter" => self.sheet_rename_commit(true, cx),
-            "backspace" => {
-                buf.pop();
-                self.sheet_rename = Some((idx, buf));
-            }
+            "backspace" => edit(r, Op::Backspace),
+            "delete" => edit(r, Op::Delete),
+            "left" => edit(r, Op::Left),
+            "right" => edit(r, Op::Right),
+            "home" => edit(r, Op::Home),
+            "end" => edit(r, Op::End),
             _ => {
                 if let Some(c) = ev.keystroke.key_char.as_deref() {
                     if !c.is_empty() && !c.chars().next().unwrap().is_control() {
-                        buf.push_str(c);
+                        edit(r, Op::Insert(c));
                     }
                 }
-                self.sheet_rename = Some((idx, buf));
             }
         }
         cx.notify();
@@ -21962,7 +22203,7 @@ impl Docxy {
         }
         // An inline sheet-tab rename swallows all typing until Enter/Esc.
         if self.sheet_rename.is_some() {
-            return self.sheet_rename_key(ev, key, cx);
+            return self.sheet_rename_key(ev, ctrl, alt, key, cx);
         }
         // So does the focused Name Box (#1343).
         // Ctrl+S saves, as it does from the Find bar, and the box closes: a
@@ -23015,6 +23256,10 @@ impl Docxy {
     }
 
     fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Nothing to save on the Start screen (#806).
+        if self.tabs.is_empty() {
+            return self.refocus(window, cx);
+        }
         if self.active_is_project() {
             return self.save_project(false, window, cx);
         }
@@ -23176,6 +23421,9 @@ impl Docxy {
             self.refocus(window, cx);
             return Err(self.tabs[self.active].status.to_string());
         }
+        if self.tabs.get(self.active).is_none() {
+            return Err("no tab is open".into());
+        }
         let prev = self.tabs[self.active].path.clone();
         let result = apply_save(&mut self.tabs[self.active], target);
         self.note_recent_if_moved(prev);
@@ -23190,6 +23438,10 @@ impl Docxy {
     }
 
     fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // No file dialog for nothing to write (#806).
+        if self.tabs.is_empty() {
+            return self.refocus(window, cx);
+        }
         if self.active_is_project() {
             return self.save_project(true, window, cx);
         }
@@ -23278,14 +23530,18 @@ impl Docxy {
             info_status: self.bs_info_status.take(),
         }
         .after_open_pick(path.as_deref());
-        if let Some(path) = path {
-            self.open_picked(&path, mode);
-        }
+        let failed = path.and_then(|path| self.open_picked(&path, mode));
         self.backstage = page.backstage;
         self.bs_new = page.new;
         self.bs_export = page.export;
         self.bs_info = page.info;
         self.bs_info_status = page.info_status;
+        // A pick that failed with no tab to say so on: File stays up and the
+        // Recent heading says why (#806).
+        if self.tabs.is_empty() {
+            self.backstage = true;
+            self.recent_message = failed;
+        }
         self.persist(cx);
         self.refocus(window, cx);
     }
@@ -23303,11 +23559,13 @@ impl Docxy {
 
     /// Open a path a person picked; a copy that could not be written says
     /// why on the tab that was active.
-    fn open_picked(&mut self, path: &std::path::Path, mode: OpenMode) {
-        if let Err(e) = self.open_path(path, mode, Reopen::Ask) {
-            self.set_status(e);
+    fn open_picked(&mut self, path: &std::path::Path, mode: OpenMode) -> Option<String> {
+        let failed = self.open_path(path, mode, Reopen::Ask).err();
+        if let Some(e) = &failed {
+            self.set_status(e.clone());
         }
         self.drop_grid_state();
+        failed
     }
 
     /// Open `path` in `mode`: the one way every open goes (#610), so the
@@ -37463,42 +37721,9 @@ impl Docxy {
                         .text_color(fg)
                         .child("New"),
                 )
-                .child(
-                    h_flex()
-                        .gap_4()
-                        .child(card(
-                            cx,
-                            "new-doc-card",
-                            Kind::Docx.glyph(),
-                            "Document",
-                            "Blank .docx",
-                            Kind::Docx,
-                        ))
-                        .child(card(
-                            cx,
-                            "new-xls-card",
-                            Kind::Xlsx.glyph(),
-                            "Spreadsheet",
-                            "Blank .xlsx",
-                            Kind::Xlsx,
-                        ))
-                        .child(card(
-                            cx,
-                            "new-project-card",
-                            Kind::Project.glyph(),
-                            "Project",
-                            "Blank schedule",
-                            Kind::Project,
-                        ))
-                        .child(card(
-                            cx,
-                            "new-mail-card",
-                            Kind::Look.glyph(),
-                            "Mail",
-                            "New message",
-                            Kind::Look,
-                        )),
-                )
+                .child(h_flex().gap_4().children(
+                    NEW_CARDS.map(|c| card(cx, c.id, c.kind.glyph(), c.name, c.sub, c.kind)),
+                ))
                 .child(self.personal_templates_section(fg, dim, cx))
                 .into_any_element()
         } else if let Some(page) = self.account_page(bg, fg, dim, cx) {
@@ -38179,6 +38404,10 @@ impl Render for Docxy {
         // (#1473); set it before any of them is built.
         self.drawn_accent = self.accent_now();
         accent::set(self.drawn_accent);
+        land_status(
+            &mut self.pending_status,
+            self.tabs.get_mut(self.active).map(|t| &mut t.status),
+        );
         HL_CURSOR.store(
             self.hl_mode.as_ref().is_some_and(|m| m.tab == self.active),
             std::sync::atomic::Ordering::Relaxed,
@@ -42538,7 +42767,7 @@ fn chart_card(data: &gridcore::sheet::ChartData, chart_id: usize, w: f32, h: f32
 fn sheet_el(
     view: &SheetView,
     ent: &Entity<Docxy>,
-    rename: Option<(usize, String)>,
+    rename: Option<SheetRename>,
     comment_editing: bool,
     dv_values: Option<Vec<gridcore::validation::ListChoice>>,
     dv_open: bool,
@@ -42922,7 +43151,7 @@ fn sheet_el(
         .border_color(gridline);
     for (i, s) in view.pkg.workbook.sheets.iter().enumerate() {
         let active = i == view.active;
-        let renaming = rename.as_ref().is_some_and(|(ri, _)| *ri == i);
+        let renaming = rename.as_ref().is_some_and(|r| r.idx == i);
         let mut tab = div()
             .id(ElementId::Name(format!("sheet-tab-{i}").into()))
             .px_3()
@@ -42946,13 +43175,44 @@ fn sheet_el(
         if renaming {
             // Inline editor: show the live buffer + a caret bar; typing is routed
             // through sheet_rename_key (keyboard focus stays on the grid root).
-            let buf = rename.as_ref().map(|(_, b)| b.clone()).unwrap_or_default();
+            let (before, mid, after) = rename.as_ref().map_or_else(Default::default, |r| {
+                let at = |n: usize| {
+                    r.text
+                        .char_indices()
+                        .nth(n)
+                        .map_or(r.text.len(), |(b, _)| b)
+                };
+                if r.sel && !r.text.is_empty() {
+                    (String::new(), r.text.clone(), String::new())
+                } else {
+                    let b = at(r.caret);
+                    (
+                        r.text[..b].to_string(),
+                        String::new(),
+                        r.text[b..].to_string(),
+                    )
+                }
+            });
+            let selected = !mid.is_empty();
+            let mut field = div().flex().items_center().min_w(px(8.));
+            if selected {
+                field = field.child(
+                    div()
+                        .bg(hsla_u(BRAND))
+                        .text_color(hsla_u(0xffffff))
+                        .child(SharedString::from(mid)),
+                );
+            } else {
+                field = field
+                    .child(SharedString::from(before))
+                    .child(div().w(px(1.)).h(px(12.)).bg(hsla_u(BRAND)))
+                    .child(SharedString::from(after));
+            }
             tab = tab
                 .bg(hsla_u(0xffffff))
                 .border_1()
                 .border_color(hsla_u(BRAND))
-                .child(div().min_w(px(8.)).child(SharedString::from(buf)))
-                .child(div().w(px(1.)).h(px(12.)).bg(hsla_u(BRAND)));
+                .child(field);
         } else {
             let ent_sel = ent.clone();
             // The active tab's name is probed where `pointer-click {"input":
@@ -43867,7 +44127,7 @@ fn open_docxy_window(
             startup_files,
             read_only,
         } => (
-            cx.new(Docxy::new),
+            cx.new(|cx| Docxy::new(want_harness && !harness::start_screen_requested(), cx)),
             ctl,
             want_harness,
             startup_files,

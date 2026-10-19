@@ -713,6 +713,10 @@ pub(crate) fn remove_tab(tabs: &mut Vec<DocTab>, active: &mut usize, i: usize) -
 
 impl Docxy {
     pub(super) fn backstage_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // No tab to close: the Start screen stays (#806).
+        if self.tabs.is_empty() {
+            return;
+        }
         self.backstage = false;
         self.close_tab(self.active, window, cx);
     }
@@ -744,9 +748,9 @@ impl Docxy {
     pub(crate) fn commit_dialog_buffers_for_exit(&mut self, cx: &mut Context<Self>) {
         // The bar's exit commit is the same leave a cell click does.
         self.sheet_comment_bar_leave();
-        if let Some((idx, buf)) = self.sheet_rename.take() {
+        if let Some(r) = self.sheet_rename.take() {
             if let Some(t) = self.tabs.get_mut(self.active) {
-                commit_rename_buffer_for_exit(t, idx, &buf);
+                commit_rename_buffer_for_exit(t, r.idx, &r.text);
             }
         }
         if let Some(f) = self.range_edit.take() {

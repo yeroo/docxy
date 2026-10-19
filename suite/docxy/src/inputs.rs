@@ -413,7 +413,8 @@ fn press_doc(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
 /// editor are one buffer, so both are focused while a cell is being edited:
 /// nothing records which one the edit began in. The sheet Find bar's fields
 /// keep a caret and a whole-field selection (#1342); the sheet tab's rename
-/// appends and pops only, so its caret is its end, and it reads the active sheet's name while it is closed. The
+/// keeps a caret and a whole-field selection too (it opens with the name
+/// selected, #1365), and it reads the active sheet's name while it is closed. The
 /// Name Box keeps a caret and a whole-field selection like them (#1343), and
 /// so do the Font and Font Size boxes (#1344), which read the active cell's
 /// font and size while unfocused.
@@ -525,12 +526,15 @@ pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
             }
         }
         "sheet-tab-rename" => match &app.sheet_rename {
-            Some((_, buf)) => (
-                Json::Str(buf.clone()),
-                true,
-                num(buf.chars().count()),
-                Json::Null,
-            ),
+            Some(r) => {
+                let len = r.text.chars().count();
+                let sel = if r.sel && len > 0 {
+                    Json::Arr(vec![num(0), num(len)])
+                } else {
+                    Json::Null
+                };
+                (Json::Str(r.text.clone()), true, num(r.caret.min(len)), sel)
+            }
             None => {
                 let name = v.pkg.workbook.sheets.get(v.active).map(|s| s.name.clone());
                 (

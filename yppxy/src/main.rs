@@ -2563,6 +2563,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
     let origin = gantt_origin_day(app);
     let cal = app.ed.project().project_shading_calendar();
     let start = DateTime::from_minutes(origin * 1440).parts();
+    let marks = gridline_marks(&app.ed, origin);
     let mut right_lines: Vec<Line> = Vec::new();
     right_lines.push(build_scale(gw, app.hscroll, origin));
     for &i in shown {
@@ -2595,6 +2596,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
             t.is_milestone(),
             rollup,
             t.summary && app.ed.summary_warning(t.uid),
+            &marks,
         );
         if i == app.ed.sel() {
             line.style = Style::default().bg(app.sel_bg());
@@ -2646,13 +2648,58 @@ fn build_scale(width: usize, hscroll: i64, base_day: i64) -> Line<'static> {
     ))
 }
 
+/// A date gridline the terminal chart draws (#1575): the day (an offset from
+/// the gantt origin), the glyph's colour, and whether the line is dotted or
+/// dashed (drawn `┆`) rather than solid (`│`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DateMark {
+    day: i64,
+    color: Color,
+    broken: bool,
+}
+
+/// The chart's date gridlines from the plan's formatting (#1575): the
+/// current date (Project's `CurrentDate` option), the project start and
+/// finish and the status date (the `StatusDate` option alone, no fallback to
+/// the current date), each when its line is not `none`, in the line's colour
+/// or the scale's. The row and column lines of the model are not drawn: a
+/// terminal cell is a day and a row is a task.
+fn gridline_marks(ed: &projcore::editor::Editor, origin: i64) -> Vec<DateMark> {
+    use projcore::formatting::{LineType, gridlines::Line};
+    let proj = ed.project();
+    let sched = ed.schedule();
+    let date_option = |name: &str| proj.option(name).and_then(projcore::DateTime::parse_mspdi);
+    [
+        (Line::CurrentDate, date_option("CurrentDate")),
+        (Line::ProjectStart, Some(sched.project_start)),
+        (Line::ProjectFinish, Some(sched.project_finish)),
+        (Line::StatusDate, date_option("StatusDate")),
+    ]
+    .into_iter()
+    .filter_map(|(line, at)| {
+        let style = proj.formatting.gridlines.get(line);
+        if style.line_type == LineType::None {
+            return None;
+        }
+        Some(DateMark {
+            day: at?.day_number() - origin,
+            color: style.color.map_or(WEEKEND, |c| {
+                Color::Rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
+            }),
+            broken: style.line_type != LineType::Solid,
+        })
+    })
+    .collect()
+}
+
 /// One task's bar across the visible day columns. `s_day`/`e_day` are day
 /// offsets from the gantt origin (the earliest displayed or project start day).
 /// `rollup` is a manual summary's rolled-up span in the same offsets: the days
 /// of it outside the summary's own span are marked, those past its finish in
 /// the warning colour. A `warning` with no rollup day past the finish (an
 /// overrun within the finish day, or a finish past a manual parent's) puts the
-/// finish day's cell in the warning colour instead.
+/// finish day's cell in the warning colour instead. A `marks` day with
+/// nothing of the task in it draws the date gridline's glyph (#1575).
 #[allow(clippy::too_many_arguments)]
 fn build_gantt_row(
     cal: Option<&projcore::WorkCalendar>,
@@ -2666,6 +2713,7 @@ fn build_gantt_row(
     milestone: bool,
     rollup: Option<(i64, i64)>,
     warning: bool,
+    marks: &[DateMark],
 ) -> Line<'static> {
     let mut spans: Vec<Span> = Vec::with_capacity(width);
     let warn_finish = warning && rollup.is_none_or(|(_, r_e)| r_e <= e_day);
@@ -2705,6 +2753,11 @@ fn build_gantt_row(
             spans.push(Span::styled("╍", style));
         } else if !milestone && in_span {
             spans.push(Span::styled("█", Style::default().fg(bar_color)));
+        } else if let Some(mark) = marks.iter().find(|m| m.day == day) {
+            spans.push(Span::styled(
+                if mark.broken { "┆" } else { "│" },
+                Style::default().fg(mark.color),
+            ));
         } else if nonworking {
             spans.push(Span::styled(
                 "·",
@@ -3575,8 +3628,35 @@ mod tests {
             false,
             None,
             false,
+            &[],
         );
         assert_eq!(row.spans[0].content, "█");
+        // A date gridline (#1575) marks an empty day, never the bar, as a
+        // solid or broken glyph in the line's colour.
+        let marks = [
+            DateMark {
+                day: 0,
+                color: Color::Red,
+                broken: false,
+            },
+            DateMark {
+                day: 3,
+                color: Color::Blue,
+                broken: true,
+            },
+        ];
+        let row = build_gantt_row(
+            None, 6, 0, origin, 0, 1, false, false, false, None, false, &marks,
+        );
+        assert_eq!(row.spans[0].content, "█", "the bar wins");
+        assert_eq!(row.spans[3].content, "┆");
+        assert_eq!(row.spans[3].style.fg, Some(Color::Blue));
+        assert_eq!(row.spans[4].content, " ");
+        let row = build_gantt_row(
+            None, 6, 0, origin, 2, 2, false, false, false, None, false, &marks,
+        );
+        assert_eq!(row.spans[0].content, "│");
+        assert_eq!(row.spans[0].style.fg, Some(Color::Red));
         let app = App::new(new_project(), None, false);
         assert_eq!(
             gantt_origin_day(&app),
@@ -3602,6 +3682,7 @@ mod tests {
             false,
             Some((1, 6)),
             true,
+            &[],
         );
         let cells: Vec<&str> = row.spans.iter().map(|s| &*s.content).collect();
         assert_eq!(cells, [" ", "╍", "▟", "▟", "╍", "╍", "╍", " ", " "]);
@@ -3625,6 +3706,7 @@ mod tests {
             false,
             None,
             false,
+            &[],
         );
         assert!(row.spans.iter().all(|s| s.style.fg != Some(WARNING)));
         // An overrun within the finish day warns on that day's cell.
@@ -3640,6 +3722,7 @@ mod tests {
             false,
             Some((2, 3)),
             true,
+            &[],
         );
         let warned: Vec<usize> = (0..9)
             .filter(|&col| row.spans[col].style.fg == Some(WARNING))
@@ -3659,6 +3742,7 @@ mod tests {
             false,
             Some((2, 3)),
             false,
+            &[],
         );
         assert!(row.spans.iter().all(|s| s.style.fg != Some(WARNING)));
     }
@@ -3694,6 +3778,7 @@ mod tests {
             false,
             None,
             false,
+            &[],
         );
         let cells: Vec<&str> = row.spans.iter().map(|s| &*s.content).collect();
         assert_eq!(cells[2], "·");
@@ -3723,6 +3808,7 @@ mod tests {
             false,
             None,
             false,
+            &[],
         );
         assert!(row.spans.iter().all(|span| span.content == " "));
     }

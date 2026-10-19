@@ -1433,8 +1433,10 @@ pub struct OverlayCtx {
     pub project_finish_x: Option<f32>,
     /// The view's switches (`critical`, `baseline`, `timeline`), the
     /// plan's `palette`, its formatting's `link_style` and `gridlines`
-    /// (#1548), the plugins' `switches` (#1553), and the formatting's
-    /// `text_styles` and the selected cells' `cells` (#1572), by key.
+    /// (#1548; since #1575 an object of every gridline as drawn, by
+    /// Project's name), the plugins' `switches` (#1553), and the
+    /// formatting's `text_styles` and the selected cells' `cells` (#1572),
+    /// by key.
     pub flags: Json,
 }
 

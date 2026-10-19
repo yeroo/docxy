@@ -495,6 +495,20 @@ fn dialog_press(tab: &mut DocTab, button: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Types `text` into the focused control one character at a time, as
+/// single keys would. Every character is tried: a refused one (the accent in
+/// a numeric field) does not stop the rest, and the first error is returned.
+fn type_text(d: &mut dialog::Dialog, text: &str) -> Result<(), String> {
+    let mut first = Ok(());
+    for c in text.chars() {
+        let typed = d.type_char(c);
+        if first.is_ok() {
+            first = typed;
+        }
+    }
+    first
+}
+
 /// [`dialog_key_with`] with nothing on the clipboard, for the tests.
 #[cfg(test)]
 pub(crate) fn dialog_key(tab: &mut DocTab, key: &str, typed: Option<&str>, m: Modifiers) -> bool {
@@ -508,7 +522,9 @@ pub(crate) fn dialog_key(tab: &mut DocTab, key: &str, typed: Option<&str>, m: Mo
 /// (Ctrl+C, which writes the clipboard, is `Docxy::dialog_takes_key`'s);
 /// Space toggles a checkbox, Up and Down step a radio group or dropdown.
 /// Every key (chords and Alt too) is swallowed, so nothing under the dialog
-/// sees it. `typed` is the character the key types, when it types one.
+/// sees it. `typed` is the text the key types, when it types one: several
+/// characters after a Windows dead key ("´x"), and Space with non-blank text
+/// types that text, not a blank (#1312).
 /// `false` when no dialog is open and the key should go on as usual.
 /// `clip` is the text Ctrl+V pastes.
 pub(crate) fn dialog_key_with(
@@ -628,17 +644,26 @@ pub(crate) fn edit_key(
             }
             Ok(())
         }
-        "space" => d.space(),
+        // A dead key's accent then Space arrives as Space with the accent as
+        // its text (#1312): that text, not a blank, is what was typed.
+        "space" => match typed
+            .as_deref()
+            .filter(|t| *t != " " && !t.chars().any(char::is_control))
+        {
+            Some(text) => type_text(d, text),
+            None => d.space(),
+        },
         // Enter reaches here only with a multiline field focused
         // (`DialogStack::key_button`): a new line (#1532).
         "enter" => d.insert_text("\n"),
         "up" => d.step_focused(false),
         "down" => d.step_focused(true),
-        _ => match typed
-            .as_deref()
-            .map(|t| (t.chars().next(), t.chars().count()))
-        {
-            Some((Some(c), 1)) if !c.is_control() => d.type_char(c),
+        // One character, or the several a dead key's accent composed with a
+        // letter makes ("´x"); each is tried (`type_text`).
+        _ => match typed.as_deref() {
+            Some(text) if !text.is_empty() && !text.chars().any(char::is_control) => {
+                type_text(d, text)
+            }
             _ => Ok(()),
         },
     }
@@ -2445,6 +2470,10 @@ mod tests {
     /// its WM_CHAR `wm_char`, if one comes at once.
     fn windows_key(t: &mut DocTab, ime: &mut ImeState, ev: &KeyDownEvent, wm_char: Option<&str>) {
         let open = t.dialogs.is_open();
+        // `route_key` never hands `on_key` a plain dead key (#1312).
+        if !crate::text_input::passes_to_on_key(ev, true) {
+            return;
+        }
         assert!(platform_key(t, ev, false));
         ime.typed_key(ev, std::time::Instant::now(), open);
         if let Some(text) = wm_char {
@@ -2583,6 +2612,55 @@ mod tests {
         assert_eq!(windows_char(&mut t, &mut ime, "@"), 0);
         // The tilde dead key's debt alone is left, to lapse.
         assert_eq!(ime.owed(), 1);
+    }
+
+    /// A composed "´5" in a numeric field: the refused accent does not stop
+    /// the 5 (#1312).
+    #[test]
+    fn a_refused_character_does_not_stop_the_rest_of_the_text() {
+        let mut t = tab_with_form();
+        assert!(key(&mut t, "tab", None));
+        assert!(dialog_key(&mut t, "5", Some("´5"), Modifiers::default()));
+        let Value::Text(top) = value(&t, "top") else {
+            panic!("text")
+        };
+        assert!(top.ends_with('5'), "{top}");
+    }
+
+    /// Windows (#1312): a plain dead key types no accent into a field; the
+    /// next key's composed text is the only text.
+    #[test]
+    fn a_plain_dead_key_types_nothing_into_a_dialog_field() {
+        let mut t = tab_with_form();
+        assert!(key(&mut t, "tab", None));
+        assert!(key(&mut t, "tab", None));
+        let mut ime = ImeState::default();
+        let dead = KeyDownEvent {
+            prefer_character_input: true,
+            ..key_down("´", Some("´"), Modifiers::default())
+        };
+        windows_key(&mut t, &mut ime, &dead, None);
+        assert_eq!(value(&t, "note"), Value::Text(String::new()));
+        let n = key_down("n", Some("ñ"), Modifiers::default());
+        windows_key(&mut t, &mut ime, &n, Some("ñ"));
+        assert_eq!(value(&t, "note"), Value::Text("ñ".into()));
+        // The accent then Space arrives as Space carrying "´"; then X as a
+        // two-character "´x": both type in full.
+        let space = key_down("space", Some("´"), Modifiers::default());
+        windows_key(&mut t, &mut ime, &dead, None);
+        windows_key(&mut t, &mut ime, &space, Some("´"));
+        let x = key_down("x", Some("´x"), Modifiers::default());
+        windows_key(&mut t, &mut ime, &dead, None);
+        windows_key(&mut t, &mut ime, &x, Some("´x"));
+        assert_eq!(value(&t, "note"), Value::Text("ñ´´x".into()));
+        // A plain Space still types a space.
+        windows_key(
+            &mut t,
+            &mut ime,
+            &key_down("space", Some(" "), Modifiers::default()),
+            Some(" "),
+        );
+        assert_eq!(value(&t, "note"), Value::Text("ñ´´x ".into()));
     }
 
     /// Ctrl+A selects the field's text and typing replaces it; Ctrl+V pastes

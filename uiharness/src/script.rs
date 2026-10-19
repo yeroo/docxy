@@ -69,6 +69,14 @@
 //! into the sandbox's `docxy/plugins/` before it launches the suite, which
 //! loads the format plugins there at start ([`crate::launch::install_plugins`]).
 //!
+//! ## Start screen
+//!
+//! A suite script may start with a `start screen` line (before its first
+//! case): the suite then starts with no tab and the File > New page up
+//! (#806) instead of the sample document every other script begins with. The
+//! runner puts a marker in the sandbox before it launches
+//! ([`crate::launch::request_start_screen`]).
+//!
 //! ## Assertions
 //!
 //! | Assertion | Reads |
@@ -101,6 +109,8 @@ pub struct Script {
     /// `plugin <name>` lines: the format plugins the suite starts with
     /// ([`crate::launch::install_plugins`]).
     pub plugins: Vec<String>,
+    /// A `start screen` line: the suite starts with no tab (#806).
+    pub start_screen: bool,
     pub cases: Vec<Case>,
 }
 
@@ -279,6 +289,7 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
     let mut cases: Vec<Case> = Vec::new();
     let mut terminal: Option<TerminalSpec> = None;
     let mut plugins: Vec<String> = Vec::new();
+    let mut start_screen = false;
     for (i, raw) in text.lines().enumerate() {
         let line = i + 1;
         let (head, rest) = split_word(raw.trim());
@@ -326,6 +337,20 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
                 return Err(err(line, format!("the plugin '{name}' is named twice")));
             }
             plugins.push(name);
+            continue;
+        }
+
+        if head.eq_ignore_ascii_case("start") {
+            if !rest.eq_ignore_ascii_case("screen") {
+                return Err(err(line, "the only 'start' line is 'start screen'"));
+            }
+            if !cases.is_empty() {
+                return Err(err(line, "'start screen' comes before the first case"));
+            }
+            if start_screen {
+                return Err(err(line, "'start screen' is named twice"));
+            }
+            start_screen = true;
             continue;
         }
 
@@ -381,6 +406,12 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
             "'plugin' installs a format plugin for the suite; a terminal script has none",
         ));
     }
+    if terminal.is_some() && start_screen {
+        return Err(err(
+            0,
+            "'start screen' is the suite's; a terminal script has none",
+        ));
+    }
     if terminal.is_some() {
         for step in cases.iter().flat_map(|c| &c.steps) {
             if !terminal_step(&step.action) {
@@ -397,6 +428,7 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
     Ok(Script {
         terminal,
         plugins,
+        start_screen,
         cases,
     })
 }
@@ -1769,6 +1801,19 @@ test t
             ));
             assert!(e.contains("needs the suite"), "{step}: {e}");
         }
+    }
+
+    #[test]
+    fn a_start_screen_line_asks_for_no_sample_tab() {
+        let s = parse_script(&format!("start screen\n{VALID}")).unwrap();
+        assert!(s.start_screen);
+        assert!(!parse_script(VALID).unwrap().start_screen);
+        let e = parse_script(&format!("{VALID}\nstart screen")).unwrap_err();
+        assert!(e.to_string().contains("before the first case"), "{e}");
+        let e = parse_script(&format!("start screen\nstart screen\n{VALID}")).unwrap_err();
+        assert!(e.to_string().contains("twice"), "{e}");
+        let e = parse_script(&format!("start now\n{VALID}")).unwrap_err();
+        assert!(e.to_string().contains("start screen"), "{e}");
     }
 
     #[test]

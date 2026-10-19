@@ -206,7 +206,9 @@ Open the sample `.docx` **and** `.xlsx` in tabs first.
 ### E7. Structural undo edge cases (reviews flagged these)
 - [ ] **E7.1 Sheet remove → restore** — Agent removes a data-bearing sheet
   (with comments and any pivot); Ctrl+Z restores its content, comments, and
-  the pivot — **appended at the end** of the tab order (documented).
+  the pivot, back at its **original index** in the tab order. Global names
+  that referred to the sheet read `#REF!` after the remove and have their
+  text back after the undo.
 - [ ] **E7.2 Double remove, double undo** — Agent removes two sheets in a row;
   press Ctrl+Z twice. The second undo **surfaces a warning** (single-slot
   restore) rather than silently doing the wrong thing.

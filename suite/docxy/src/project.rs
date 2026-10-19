@@ -673,6 +673,24 @@ fn project_region(
     }
 }
 
+/// The plan's set gridlines for the harness state (#1575).
+fn gridlines_json(grid: &projcore::formatting::Gridlines) -> ctlcore::json::Json {
+    let mut text = String::new();
+    projcore::json::Json::Arr(
+        grid.set_lines()
+            .map(|(line, style)| {
+                let mut pairs = vec![("line".to_string(), projcore::json::Json::str(line.name()))];
+                if let projcore::json::Json::Obj(fields) = style.to_json() {
+                    pairs.extend(fields);
+                }
+                projcore::json::Json::Obj(pairs)
+            })
+            .collect(),
+    )
+    .write(&mut text);
+    ctlcore::json::Json::parse(&text).unwrap_or(ctlcore::json::Json::Null)
+}
+
 /// `body_h` is the last frame's `project-body` height; `None` before the first layout.
 pub(super) fn project_state(
     v: &ProjectView,
@@ -730,6 +748,17 @@ pub(super) fn project_state(
             Json::Bool(v.table_total() <= v.table_w),
         ),
         ("gantt_w".into(), Json::Num(f64::from(v.gantt_w))),
+        // The gridlines set away from their default (#1575), in Project's
+        // list order, each `{line, type, color, interval, interval_type,
+        // interval_color}`; `gridlines_set` counts them.
+        (
+            "gridlines".into(),
+            gridlines_json(&v.ed.project().formatting.gridlines),
+        ),
+        (
+            "gridlines_set".into(),
+            Json::Num(v.ed.project().formatting.gridlines.set_lines().count() as f64),
+        ),
     ];
     // What the Gantt draws, after the Gantt Chart Format toggles.
     entries.extend(v.ed.project().tasks.iter().flat_map(|t| {
@@ -1600,6 +1629,7 @@ pub(super) fn project_el(
                                 gantt_x,
                                 gantt_w,
                                 pal,
+                                &view.ed.project().formatting.gridlines,
                             ),
                         ))
                         // Above the vertical scrollbar.

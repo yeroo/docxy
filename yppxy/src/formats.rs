@@ -261,10 +261,12 @@ impl Formats {
                 uids: ed.selected_uid().into_iter().collect(),
                 cols: vec!["Name".to_string()],
             },
-            view: projcore::json::Json::obj(vec![(
-                "switches",
-                ed.project().formatting.switches_json(),
-            )]),
+            // The view as the suite sends it: the switches and every
+            // gridline as drawn (#1575), so a command can toggle them.
+            view: projcore::json::Json::obj(vec![
+                ("switches", ed.project().formatting.switches_json()),
+                ("gridlines", ed.project().formatting.gridlines.to_json()),
+            ]),
             values,
             button: None,
             edit: None,

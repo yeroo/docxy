@@ -285,9 +285,10 @@ pub(crate) struct PluginCache {
 /// The view's switches as the plugins see them (`view` in every request),
 /// with the plan's formatting choices an overlay follows (#1548).
 /// The view JSON the state and overlay requests and a command carry: the
-/// view's switches, the plan's formatting (palette, link style, gridlines,
-/// the plugins' switches, every text style category, and the selected
-/// cells' styles, #1572) in the shape `Formatting::apply_view` reads.
+/// view's switches, the plan's formatting (palette, link style, every
+/// gridline as drawn by Project's name (#1575), the plugins' switches, every
+/// text style category, and the selected cells' styles, #1572) in the shape
+/// `Formatting::apply_view` reads.
 fn view_json(v: &ProjectView) -> Json {
     let formatting = &v.ed.project().formatting;
     let text = |s: &Option<String>| s.clone().map_or(Json::Null, Json::Str);
@@ -318,7 +319,7 @@ fn view_json(v: &ProjectView) -> Json {
         ("timeline", Json::Bool(v.timeline)),
         ("palette", text(&formatting.palette)),
         ("link_style", text(&formatting.link_style)),
-        ("gridlines", text(&formatting.gridlines)),
+        ("gridlines", formatting.gridlines.to_json()),
         ("switches", formatting.switches_json()),
         ("text_styles", Json::Obj(text_styles)),
         ("cells", Json::Arr(cells)),
@@ -1284,10 +1285,8 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
     let shown = ed.display_rows();
     let sched = ed.schedule();
     let reader = projcore::editor::FieldReader::new(ed);
-    // An instant's x in chart pixels, within its day.
-    let x_at = |d: projcore::DateTime| {
-        (d.minutes() - scale.origin_day * 1440) as f32 / 1440.0 * scale.day_w
-    };
+    // An instant's x in chart pixels, within its day: the chart's own rule.
+    let x_at = |d: projcore::DateTime| crate::project::instant_x(scale, 0., d);
     let stamp = |d: projcore::DateTime| {
         let p = d.parts();
         format!(

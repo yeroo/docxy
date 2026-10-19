@@ -325,6 +325,19 @@ fn instance_name_for(harness: bool, session_id: Option<&str>, pid: u32) -> Strin
     ctlcore::instance_name_from(CTL_APP, session_id, pid)
 }
 
+/// The marker a script's `start screen` line has the runner put in the
+/// sandbox's config root (#806): `<root>/docxy/start-screen`.
+pub fn start_screen_marker(root: &Path) -> PathBuf {
+    root.join("docxy").join("start-screen")
+}
+
+/// Whether this harness instance starts on the Start screen rather than the
+/// sample document its other cases assume. Asked only under `--harness`, and
+/// only of the config root the runner sandboxed, so a product run never reads it.
+pub fn start_screen_requested() -> bool {
+    start_screen_marker(&crate::config_root()).is_file()
+}
+
 /// Start the control server for a config root at `root`, named for the mode
 /// it serves (see [`instance_name`]).
 pub fn start(
@@ -4748,11 +4761,42 @@ fn dispatch_verb(
             let items = crate::backstage_rail_items(app.active_is_project(), app.active_is_doc());
             Done::ok(Json::obj(vec![
                 ("open", Json::Bool(app.backstage)),
+                ("new", Json::Bool(app.backstage && app.bs_new)),
                 (
                     "items",
                     Json::Arr(items.map(|item| Json::Str(item.display.into())).collect()),
                 ),
+                // The New page's cards (#806), in order.
+                (
+                    "cards",
+                    Json::Arr(
+                        crate::NEW_CARDS
+                            .iter()
+                            .map(|c| {
+                                Json::obj(vec![
+                                    ("id", Json::Str(c.id.into())),
+                                    ("name", Json::Str(c.name.into())),
+                                    ("sub", Json::Str(c.sub.into())),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
             ]))
+        }
+        // A click on a card of the New page (#806): `card` is its id
+        // (`new-xls-card`), the same handler as the real click.
+        "new-card" => {
+            if !(app.backstage && app.bs_new) {
+                return Err("the New page is not open (backstage-page new)".into());
+            }
+            app.refuse_under_dialog()?;
+            let id = arg_str(args, "card")?;
+            let Some(card) = crate::NEW_CARDS.iter().find(|c| c.id == id) else {
+                return Err(format!("no New card '{id}'"));
+            };
+            app.add_tab(card.kind, window, cx);
+            Done::ok(state(app, window, cx))
         }
         // File > Account and its About dialog (#1023). `open` is the rail item's
         // handler and `about` the page's About button; the dialog it opens is an
@@ -5781,7 +5825,11 @@ fn dispatch_verb(
                     app.backstage_rail_action(crate::BackstageRailAction::ExportDoc, window, cx)
                 }
                 "open" => app.show_backstage_open_page(),
-                _ => return Err("'page' must be new, info, account, export or open".into()),
+                // The rail's Close item (#806: with no tab it does nothing).
+                "close" => app.backstage_rail_action(crate::BackstageRailAction::Close, window, cx),
+                _ => {
+                    return Err("'page' must be new, info, account, export, open or close".into());
+                }
             }
             Done::ok(backstage_layout_json(app))
         }
