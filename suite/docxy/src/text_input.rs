@@ -55,13 +55,12 @@
 //! type its character, but a dialog field swallows ⌥ keys, so the dialog is
 //! handed the plain typed key ⌥ made instead ([`modifier_char`], #1162). A
 //! Windows AltGr key (Ctrl+Alt) is swallowed there too, and its key-down
-//! cannot tell a character from an AltGr dead key, so under a dialog or a Project edit its
-//! debt is the field's ([`dialog_altgr`]): the WM_CHAR, which an AltGr dead
-//! key never sends, types the character while a dialog is open, and nothing
-//! once none is. Under load that WM_CHAR may land after keys typed after it
+//! cannot tell a character from an AltGr dead key, so under a text field (a
+//! dialog, or a Project cell or prompt) its debt is the field's
+//! ([`dialog_altgr`]): the WM_CHAR, which an AltGr dead key never sends,
+//! types the character while the field is open, and nothing once it is not. Under load that WM_CHAR may land after keys typed after it
 //! ("a", AltGr+Q, "b" giving "ab@"), or in the next field after a Tab, as
-//! packet text may. A Project cell or prompt is such a field too (#1312). A
-//! plain dead key never reaches `on_key` ([`passes_to_on_key`]): the next
+//! packet text may (#1312). A plain dead key never reaches `on_key` ([`passes_to_on_key`]): the next
 //! key-down carries the composed text, whole, in its `key_char`.
 //!
 //! Linux registers no handler: it would hand it every unhandled printable
@@ -168,10 +167,8 @@ pub(crate) const WM_CHAR_MAX_DEBTS: usize = 4096;
 /// The WM_CHAR text a Windows key-down `on_key` has typed will send (#1139):
 /// its printable text, or none. Alt alone makes WM_SYSCHAR, not WM_CHAR
 /// (AltGr is Ctrl+Alt, which does). A Win chord the shell lets through is
-/// translated like any key, so it owes its text. A dead key makes
-/// WM_DEADCHAR, so it owes nothing: gpui flags a key whose ToUnicode is dead
-/// as preferring character input, and with no Ctrl, Alt or Win held nothing
-/// else sets that flag. Under AltGr the flag marks every character the
+/// translated like any key, so it owes its text. A plain dead key
+/// ([`plain_dead_key`]) makes WM_DEADCHAR, so it owes nothing. Under AltGr the flag marks every character the
 /// modifiers change too, so an AltGr dead key owes its accent ([`may_not_come`])
 /// until it lapses. "´" then X owes "´x", which comes as two WM_CHARs.
 pub(crate) fn owed_text(ev: &KeyDownEvent) -> Option<String> {
@@ -179,7 +176,7 @@ pub(crate) fn owed_text(ev: &KeyDownEvent) -> Option<String> {
     if m.alt && !m.control {
         return None;
     }
-    if ev.prefer_character_input && !m.control && !m.alt && !m.platform {
+    if plain_dead_key(ev) {
         return None;
     }
     let keystroke = &ev.keystroke;
@@ -193,7 +190,7 @@ pub(crate) fn owed_text(ev: &KeyDownEvent) -> Option<String> {
 /// key whose ToUnicode is dead as preferring character input, and with no
 /// Ctrl, Alt or Win held nothing else sets that flag. It owes no WM_CHAR
 /// ([`owed_text`]) and its accent is part of the next key's composed text,
-/// so `on_key` must not type it.
+/// so `on_key` must not type it. The accent must be there to type.
 pub(crate) fn plain_dead_key(ev: &KeyDownEvent) -> bool {
     let m = &ev.keystroke.modifiers;
     ev.prefer_character_input
@@ -205,6 +202,12 @@ pub(crate) fn plain_dead_key(ev: &KeyDownEvent) -> bool {
             .key_char
             .as_deref()
             .is_some_and(|c| !c.is_empty())
+}
+
+/// Whether a text field that swallows AltGr is open: a dialog, or the
+/// Project cell editor or prompt (#1312).
+pub(crate) fn field_open(dialog_open: bool, project_edit_open: bool) -> bool {
+    dialog_open || project_edit_open
 }
 
 /// Whether `route_key` hands a key-down to `on_key`: not a plain dead key on
@@ -370,11 +373,12 @@ impl ImeState {
         self.owe(ev, now, false);
     }
 
-    /// Windows: a key-down `on_key` typed at `now`, `field_open` when a dialog
-    /// or a Project cell or prompt was; its WM_CHAR is on the way, maybe behind the WM_CHARs of keys
-    /// before it. AltGr under a dialog, which `on_key` did not type
-    /// ([`dialog_altgr`]), owes the field: its WM_CHAR types the character
-    /// only while a dialog is still open.
+    /// Windows: a key-down `on_key` typed at `now`, `field_open` when a text
+    /// field (a dialog, or a Project cell or prompt) was open; its WM_CHAR is
+    /// on the way, maybe behind the WM_CHARs of keys before it. AltGr under
+    /// such a field, which `on_key` did not type ([`dialog_altgr`]), owes the
+    /// field: its WM_CHAR types the character only while a field is still
+    /// open.
     pub(crate) fn typed_key(&mut self, ev: &KeyDownEvent, now: Instant, field_open: bool) {
         self.owe(ev, now, dialog_altgr(ev, field_open));
     }
@@ -408,7 +412,7 @@ impl ImeState {
     /// of the WM_CHARs older debts still wait for (an older AltGr debt among
     /// them). A character no debt starts with (a packet's) is typed and
     /// leaves the debts as they are. A character that pays a dialog's
-    /// AltGr debt is typed when `field_open`, else dropped (#1162). Empty
+    /// AltGr debt is typed when a text field is open (`field_open`), else dropped (#1162). Empty
     /// text (an IME message gpui forwards) changes nothing.
     pub(crate) fn char_message(
         &mut self,
@@ -515,8 +519,8 @@ impl Docxy {
             }
             Route::AppPropagate => {
                 self.ime.forget_key();
-                // Whether a dialog took the key is decided before on_key,
-                // which may close it.
+                // Whether a text field (a dialog, a Project cell or prompt)
+                // took the key is decided before on_key, which may close it.
                 let field_open = self.text_field_open();
                 // A Windows dead key types nothing: the composed text comes
                 // with the next key (#1312).
@@ -553,7 +557,7 @@ impl Docxy {
     /// A text field that swallows AltGr is open: a dialog, or the Project
     /// cell editor or prompt (#1312).
     fn text_field_open(&self) -> bool {
-        self.dialog_open() || self.project_edit_open()
+        field_open(self.dialog_open(), self.project_edit_open())
     }
 
     fn dialog_open(&self) -> bool {
@@ -1051,6 +1055,13 @@ mod tests {
         assert_eq!(a_acute.and_then(|k| k.key_char).as_deref(), Some("Á"));
     }
 
+    #[test]
+    fn a_dialog_or_a_project_edit_is_a_text_field() {
+        assert!(field_open(true, false));
+        assert!(field_open(false, true));
+        assert!(!field_open(false, false));
+    }
+
     /// Windows only: `route_key` withholds a plain dead key from `on_key`.
     #[test]
     fn only_windows_withholds_a_plain_dead_key_from_on_key() {
@@ -1082,9 +1093,9 @@ mod tests {
         assert!(!plain_dead_key(&empty));
     }
 
-    /// Windows (#1312): the debt is the field's whatever the field is (a
-    /// dialog, a Project cell or prompt): typed once from the WM_CHAR, and
-    /// nothing once it closed.
+    /// Windows (#1312): the debt is the field's: typed once from the WM_CHAR
+    /// while `field_open`, and nothing once it closed. `field_open` is
+    /// decided by [`field_open`], tested below.
     #[test]
     fn altgr_under_any_text_field_is_typed_by_its_wm_char() {
         let at = t0();
