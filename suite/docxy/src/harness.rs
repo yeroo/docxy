@@ -1414,6 +1414,7 @@ fn dialog_field_point(
     app: &crate::Docxy,
     name: &str,
     x: Option<f64>,
+    y: Option<f64>,
 ) -> Result<Point<Pixels>, String> {
     if app.active_dialogs().is_none() {
         return Err(crate::dialog::NONE_OPEN.into());
@@ -1424,7 +1425,10 @@ fn dialog_field_point(
         .on_screen(&format!("dialog-field:{name}"))
         .ok_or_else(|| format!("no field '{name}' is drawn in the open dialog"))?;
     let at = x.map_or_else(|| b.center().x, |x| b.left() + px(x as f32));
-    Ok(point(at, b.center().y))
+    // A multiline's probe scrolls with its lines (#1609), so `y` counts from
+    // its first line and reaches a line of a scrolled box.
+    let down = y.map_or_else(|| b.center().y, |y| b.top() + px(y as f32));
+    Ok(point(at, down))
 }
 
 /// The centre of the open dialog's `{key}:{name}` probe: a tab, a button
@@ -1559,9 +1563,14 @@ fn pointer_button(args: &Json) -> Result<MouseButton, String> {
 }
 
 /// `pointer-click`'s optional `"x"`: pixels in from a dialog field's left edge.
-fn field_x(args: &Json) -> Result<Option<f64>, String> {
-    args.get("x")
-        .map(|v| v.as_f64().ok_or_else(|| "'x' must be a number".to_string()))
+/// The optional number `key` of a dialog-field click (`x` from the field's
+/// left edge, `y` from its top, #1609).
+fn field_num(args: &Json, key: &str) -> Result<Option<f64>, String> {
+    args.get(key)
+        .map(|v| {
+            v.as_f64()
+                .ok_or_else(|| format!("'{key}' must be a number"))
+        })
         .transpose()
 }
 
@@ -2330,7 +2339,11 @@ fn dialog_json(app: &mut crate::Docxy) -> Json {
         else {
             continue;
         };
-        let first = crate::dialog_host::first_visible(entry);
+        // A filling multiline whose lines fit its box scrolls nothing and
+        // reports no line (#1609 r5).
+        let Some(first) = crate::dialog_host::first_visible(entry) else {
+            continue;
+        };
         let key = if kind == "grid" {
             "first_visible_row"
         } else {
@@ -5477,7 +5490,8 @@ fn dispatch_verb(
                 let name = field
                     .as_str()
                     .ok_or("'dialog-field' must be a field name")?;
-                let p = dialog_field_point(app, name, field_x(args)?)?;
+                let p =
+                    dialog_field_point(app, name, field_num(args, "x")?, field_num(args, "y")?)?;
                 let mut done = Done::ok(Json::obj(vec![
                     ("x", Json::Num(f64::from(p.x))),
                     ("y", Json::Num(f64::from(p.y))),
@@ -9483,16 +9497,17 @@ mod tests {
         ));
     }
 
-    /// `pointer-click`'s `x` is optional, and a present one must be a number.
+    /// `pointer-click`'s `x` and `y` are optional, and a present one must
+    /// be a number.
     #[test]
-    fn field_x_is_an_optional_number() {
-        assert_eq!(field_x(&Json::obj(vec![])), Ok(None));
+    fn field_numbers_are_optional() {
+        assert_eq!(field_num(&Json::obj(vec![]), "x"), Ok(None));
         assert_eq!(
-            field_x(&Json::obj(vec![("x", Json::Num(5.))])),
+            field_num(&Json::obj(vec![("x", Json::Num(5.))]), "x"),
             Ok(Some(5.0))
         );
-        let bad = Json::obj(vec![("x", Json::Str("5".into()))]);
-        assert_eq!(field_x(&bad), Err("'x' must be a number".into()));
+        let bad = Json::obj(vec![("y", Json::Str("5".into()))]);
+        assert_eq!(field_num(&bad, "y"), Err("'y' must be a number".into()));
     }
 
     #[test]

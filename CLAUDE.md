@@ -439,7 +439,7 @@
   view; grids and filling multilines share `GridScrolls`, keyed by
   `Dialog::epoch` so a reopened dialog starts afresh, each entry with the
   row height it was drawn with; the dialog verbs report them as
-  `first_visible_row` / `first_visible_line`),
+  `first_visible_row` / `first_visible_line` while the control scrolls),
   `ControlKind::Sample` (a read-only box drawn by `plugin_ui::styled` from
   the formatting model's `TextStyle`) and `Control::header` (a spec's
   header control, listed last, drawn first on every page and first in the

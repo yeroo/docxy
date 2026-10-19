@@ -496,7 +496,8 @@ without one nothing changes.
   row, labels aligned per column); a control's `group` (a titled box
   around consecutive controls naming it), `span` (columns it takes),
   `min_rows` (a grid's visible rows, 1 to 64, empty rows drawn, more
-  scroll with a scrollbar; a plugin grid's default is 8), `fill` (a
+  scroll with a scrollbar, whose track appears only then; a plugin grid's
+  default is 8), `fill` (a
   multiline fills the remaining height of a dialog with a `size`), and the
   `sample` kind (a read-only box drawing `{text, font, size, bold, italic,
   underline, color, background}`, the formatting model's text style). A
@@ -505,8 +506,10 @@ without one nothing changes.
   never sent to the plugin and never the default. A tabbed dialog without a
   `size` sizes to the shown page, so switching pages may resize it: a stable
   size needs an explicit `size`. A `task-information` spec's pages take
-  `columns`, `group`, `span` and `min_rows`; `size`, `placement` and `fill`
-  belong to a plugin's own dialog.
+  `columns`, `group`, `span` and `min_rows`, and its `header` controls are
+  drawn above the built-in Name, Duration and Estimated row on every page,
+  first in the Tab order; `size`, `placement` and `fill` belong to a
+  plugin's own dialog.
 - **Overlay** (`yppx_ui_overlay`): the rows in view (`uid`, `row_y`, the bar
   rectangle, kind flags, since #1548 `name`, `percent_complete`,
   `deadline_x`, `constraint {type, x}` and `resource_names`, and since

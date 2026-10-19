@@ -17,41 +17,59 @@ pub(crate) type ListScrolls =
 /// line) last scrolled to, and the row height the offset counts in, so a
 /// read-back (`first_visible_row` / `first_visible_line`) divides by what
 /// the draw code laid out.
-pub(crate) type GridScrolls =
-    std::collections::HashMap<(u64, &'static str), (ScrollHandle, Option<usize>, f32)>;
+pub(crate) type GridScrolls = std::collections::HashMap<(u64, &'static str), GridScroll>;
 
-/// The first row (or line) a scrolling control shows, from its handle's
-/// offset and the row height it was drawn with (#1609).
-pub(crate) fn first_visible(entry: &(ScrollHandle, Option<usize>, f32)) -> usize {
-    let (handle, _, row_h) = entry;
-    (-f32::from(handle.offset().y) / row_h.max(1.))
-        .round()
-        .max(0.) as usize
+/// A scrolling grid's or filling multiline's scroll, kept across frames
+/// (#1609).
+pub(crate) struct GridScroll {
+    handle: ScrollHandle,
+    /// The row last brought into view, with the mark that asked for it (a
+    /// grid's row again; a multiline's caret).
+    seen: Option<(usize, usize)>,
+    /// The row height it was drawn with.
+    row_h: f32,
 }
 
-/// The scroll for grid or multiline `name` of dialog `id`, kept across
-/// frames; when `row` (the selected row, the caret's line) is not the one
-/// last seen it is brought into view: the offset is set outright from the
-/// row height and the view's height (`view_h`, else the element's last
-/// bounds), the least that shows the row, as [`list_scroll`] does for a
-/// list. A wheel scroll that leaves the row alone is not undone.
+/// The first row (or line) a scrolling control shows, from its handle's
+/// offset and the row height it was drawn with: the row nearest the top
+/// edge (#1609). `None` while the control has nothing to scroll (its
+/// content fits its box, as the handle's maximum offset after its last
+/// paint says), so a filling multiline whose lines fit reports no line.
+pub(crate) fn first_visible(entry: &GridScroll) -> Option<usize> {
+    (f32::from(entry.handle.max_offset().y) > 0.).then(|| {
+        (-f32::from(entry.handle.offset().y) / entry.row_h.max(1.))
+            .round()
+            .max(0.) as usize
+    })
+}
+
+/// The scroll for grid or multiline `name` of the dialog opening `epoch`,
+/// kept across frames; when `row` (the selected row, or the caret's line
+/// with the caret as its mark) is not the one last seen, the row is brought
+/// into view: the offset is set outright from the row height and the view's
+/// height (`view_h`, else the element's last bounds), the least that shows
+/// the row, as [`list_scroll`] does for a list. A wheel scroll that leaves
+/// the row and its mark alone is not undone; an edit that moves the caret
+/// along its line brings the line back.
 fn grid_scroll(
     grids: &mut GridScrolls,
     key: (u64, &'static str),
-    row: Option<usize>,
+    row: Option<(usize, usize)>,
     row_h: f32,
     view_h: Option<f32>,
 ) -> ScrollHandle {
-    let (handle, seen, stored_h) = grids
-        .entry(key)
-        .or_insert_with(|| (ScrollHandle::new(), None, row_h));
-    *stored_h = row_h;
-    if row != *seen {
-        if let Some(r) = row {
+    let entry = grids.entry(key).or_insert_with(|| GridScroll {
+        handle: ScrollHandle::new(),
+        seen: None,
+        row_h,
+    });
+    entry.row_h = row_h;
+    if row != entry.seen {
+        if let Some((r, _)) = row {
             let view = view_h
-                .unwrap_or_else(|| f32::from(handle.bounds().size.height))
+                .unwrap_or_else(|| f32::from(entry.handle.bounds().size.height))
                 .max(row_h);
-            let shown = -f32::from(handle.offset().y);
+            let shown = -f32::from(entry.handle.offset().y);
             let (top, bottom) = (r as f32 * row_h, (r + 1) as f32 * row_h);
             let next = if top < shown {
                 top
@@ -60,11 +78,11 @@ fn grid_scroll(
             } else {
                 shown
             };
-            handle.set_offset(point(px(0.), px(-next)));
+            entry.handle.set_offset(point(px(0.), px(-next)));
         }
-        *seen = row;
+        entry.seen = row;
     }
-    handle.clone()
+    entry.handle.clone()
 }
 
 /// A 12 px text's estimated width from its character count, for the label
@@ -1161,12 +1179,13 @@ impl Docxy {
                 // The lines are 16 px each; the box's height is the frame's.
                 // Only this box's own caret, while it is focused, drives the
                 // scroll (`caret_at` is the focused control's); unfocused it
-                // keeps its offset.
+                // keeps its offset. The caret is the mark, so typing on a
+                // line a wheel scrolled away brings the line back.
                 let scroll = fill.then(|| {
                     grid_scroll(
                         &mut self.dialog_grids.borrow_mut(),
                         (d.epoch, c.name),
-                        focused.then_some(caret_line),
+                        focused.then_some((caret_line, caret)),
                         16.,
                         None,
                     )
@@ -1342,7 +1361,7 @@ impl Docxy {
                     grid_scroll(
                         &mut self.dialog_grids.borrow_mut(),
                         (d.epoch, c.name),
-                        sel_row,
+                        sel_row.map(|r| (r, r)),
                         18.,
                         Some(body_h),
                     )
@@ -1447,16 +1466,13 @@ impl Docxy {
             // A sample box (#1609): the text in the style the state gives, the
             // formatting model's text style plus `text`.
             ControlKind::Sample => {
-                let (text, style) = match &c.value {
-                    dialog::Value::Text(raw) => match projcore::json::Json::parse(raw) {
-                        Ok(j @ projcore::json::Json::Obj(_)) => (
-                            j.get_str("text").unwrap_or("AaBbYyZz").to_string(),
-                            projcore::formatting::TextStyle::from_json(&j),
-                        ),
-                        _ => (raw.clone(), projcore::formatting::TextStyle::default()),
-                    },
-                    _ => (String::new(), projcore::formatting::TextStyle::default()),
-                };
+                // The one parse `dialog-read` reports too (`Control::sample`),
+                // re-read as the formatting model's JSON for its text style.
+                let sample = c.sample();
+                let text = sample.get_str("text").unwrap_or("AaBbYyZz").to_string();
+                let style = projcore::json::Json::parse(&sample.to_string())
+                    .map(|j| projcore::formatting::TextStyle::from_json(&j))
+                    .unwrap_or_default();
                 v_flex()
                     .id(("dialog-control", i))
                     .gap_1()
@@ -2229,6 +2245,29 @@ mod tests {
             "below the last line: its start"
         );
         assert_eq!(char_at_line_x("", 50., 50., width), 0);
+    }
+
+    /// #1609 r5: a caret that moves along the line it is on (typing after a
+    /// wheel scroll took the line out of view) brings the line back; a frame
+    /// with the same caret keeps the wheel's offset, as a grid's unchanged
+    /// row does.
+    #[test]
+    fn a_multiline_edit_on_the_same_line_brings_it_back_into_view() {
+        let mut grids = GridScrolls::default();
+        let key = (1, "memo");
+        // Line 9 of 16 px in a 64 px box: the least scroll that shows it.
+        let h = grid_scroll(&mut grids, key, Some((9, 40)), 16., Some(64.));
+        assert_eq!(f32::from(h.offset().y), -96.);
+        // The wheel scrolls back to the top; the same caret leaves it there.
+        h.set_offset(point(px(0.), px(0.)));
+        let h = grid_scroll(&mut grids, key, Some((9, 40)), 16., Some(64.));
+        assert_eq!(f32::from(h.offset().y), 0.);
+        // A character typed on line 9 moves the caret: the line comes back.
+        let h = grid_scroll(&mut grids, key, Some((9, 41)), 16., Some(64.));
+        assert_eq!(f32::from(h.offset().y), -96.);
+        // Nothing painted yet: the handle has nothing to scroll, so the
+        // read-back reports no line until a frame has measured the box.
+        assert_eq!(first_visible(&grids[&key]), None);
     }
 
     #[test]

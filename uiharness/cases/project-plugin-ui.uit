@@ -211,6 +211,15 @@ test the button's command opens the plugin's dialog, whose OK sends the values b
   shot window
   call dialog-read {}
   assert reply.controls.4.first_visible_line is 9
+  # A click on a line in view lands on it (r4): line 10, "eleven", starts
+  # at character 49. The field probe scrolls with the lines, so y counts
+  # from the first line; the box stays where it was.
+  call pointer-click {"dialog-field":"fixture.memo","x":1,"y":168}
+  shot window
+  call field-read {"dialog-field":"fixture.memo"}
+  assert reply.caret is 49
+  call dialog-read {}
+  assert reply.controls.4.first_visible_line is 9
   # The grid lists the plan's tasks with the selected one's row selected
   # (the state's name.selected_row).
   assert reply.controls.2.name is fixture.tasks
