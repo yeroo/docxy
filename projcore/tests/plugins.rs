@@ -474,7 +474,14 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
     assert_eq!(rows.line_type, projcore::formatting::LineType::Dotted);
     assert_eq!(rows.interval, 2);
     assert_eq!(rows.interval_color, Some(0x3366CC));
-    assert_eq!(formatting.gridlines.set_lines().count(), 3);
+    assert_eq!(formatting.gridlines.set_lines().count(), 4);
+    assert_eq!(
+        formatting
+            .gridlines
+            .get(projcore::formatting::gridlines::Line::SheetColumns)
+            .color,
+        Some(0x33AA33)
+    );
     let mut seen = cmd("fixture.format", vec![], None);
     seen.view = Json::obj(vec![("gridlines", formatting.gridlines.to_json())]);
     let cleared = ui.command(&seen).unwrap().unwrap();

@@ -22,8 +22,9 @@
 //!   `task-information` (the page's OK: a status with the note's length),
 //!   and `fixture.format` (#1575: sets the plan's gridlines through
 //!   `view.gridlines`: dotted red Gantt rows with every second one solid
-//!   blue, no sheet rows and a solid red project start line; a second press,
-//!   seeing the view's Gantt Rows dotted, clears them all with null).
+//!   blue, no sheet rows, solid green sheet columns and a solid red project
+//!   start line; a second press, seeing the view's Gantt Rows dotted, clears
+//!   them all with null).
 //! - Overlay: a polyline with an arrowhead from the first bar's end to the
 //!   second bar's start, a text label at the first bar, and a `selected N`
 //!   label at the selected task's bar when the request names one (#1565).
@@ -333,6 +334,7 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
                 r##"{"ops":[],"status":"Fixture: format","view":{"gridlines":{
                     "Gantt Rows":{"type":"dotted","color":"#CC3333","interval":2,"interval_type":"solid","interval_color":"#3366CC"},
                     "Sheet Rows":{"type":"none"},
+                    "Sheet Columns":{"type":"solid","color":"#33AA33"},
                     "Project Start":{"type":"solid","color":"#CC3333"}}}}"##
                     .to_string()
             }

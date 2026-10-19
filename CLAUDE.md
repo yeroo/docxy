@@ -851,10 +851,13 @@
 - yppxy draws the date lines only (`gridline_marks`: `│` or `┆` in an empty
   day cell, in the line's colour), as a terminal cell is a day and a row a
   task. The fixture's `fixture.format` sets dotted red Gantt rows (every
-  second solid blue), no sheet rows and a red project start line, and clears
-  them on the next press; `uiharness/cases/project-plugin-ui.uit` asserts the
-  state and shoots the rules (the default rules are too faint for a `border`
-  assertion, and a `#` colour cannot be written in a case: it starts a comment).
+  second solid blue), no sheet rows, green sheet columns and a red project
+  start line, and clears them on the next press;
+  `uiharness/cases/project-plugin-ui.uit` asserts the state, reads the green
+  Sheet Columns rule off an unselected cell's right edge with a `border`
+  assertion (the one step whose `#` colour is not a comment; an `is` value
+  cannot carry one, so the colours are pinned by `projcore/tests/plugins.rs`)
+  and shoots the rest (the default rules are too faint for a `border`).
 
 ## Project timescale and Timeline pane (#1535)
 
