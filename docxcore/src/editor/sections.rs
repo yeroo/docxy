@@ -1912,11 +1912,33 @@ mod tests {
         }
         // A reload keeps them apart.
         let again = crate::load::parse_document_xml(&xml, &crate::load::Relationships::default());
-        assert_eq!(
-            ppr_change_ids(&crate::serialize::document_to_xml(&again)).len(),
-            3
-        );
+        let mut reloaded = ppr_change_ids(&crate::serialize::document_to_xml(&again));
+        reloaded.sort();
+        ids.sort();
+        assert_eq!(reloaded, ids);
         assert!(e.undo());
+    }
+
+    #[test]
+    fn a_pr_change_id_is_found_whatever_the_spacing_829() {
+        use super::super::super::model::tests_with_revision_id as f;
+        assert_eq!(
+            f("<w:pPrChange\n  w:id=\"9\" w:author=\"A\"/>", "10").unwrap(),
+            "<w:pPrChange\n  w:id=\"10\" w:author=\"A\"/>"
+        );
+        assert_eq!(
+            f("<w:pPrChange w:id = '9'/>", "10").unwrap(),
+            "<w:pPrChange w:id = '10'/>"
+        );
+        assert_eq!(
+            f("<w:pPrChange w:author='Bob w:id=\"5\"' w:id=\"9\"/>", "10").unwrap(),
+            "<w:pPrChange w:author='Bob w:id=\"5\"' w:id=\"10\"/>"
+        );
+        assert_eq!(
+            f("<w:pPrChange w:author=\"A>B\" w:id=\"9\"/>", "10").unwrap(),
+            "<w:pPrChange w:author=\"A>B\" w:id=\"10\"/>"
+        );
+        assert_eq!(f("<w:pPrChange/>", "10"), None);
     }
 
     #[test]

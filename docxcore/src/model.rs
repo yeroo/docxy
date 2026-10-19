@@ -1579,17 +1579,30 @@ impl SeenTargets {
     }
 }
 
-/// `raw` with the first element's `w:id` attribute set to `id`; `None` when
-/// it has none, and the copy then keeps the raw and metadata as they were.
+/// `raw` with the first element's `w:id` attribute set to `id`, found by the
+/// parser so any spacing around the attribute or its `=` is handled; `None`
+/// when the element has none, and the copy then keeps the raw and metadata as
+/// they were.
 fn with_revision_id(raw: &str, id: &str) -> Option<String> {
-    let tag_end = raw.find('>')?;
-    let at = raw[..tag_end].find(" w:id=")? + " w:id=".len();
-    let quote = raw[..tag_end][at..]
-        .chars()
-        .next()
-        .filter(|c| matches!(c, '"' | '\''))?;
-    let close = at + 1 + raw[at + 1..tag_end].find(quote)?;
-    Some(format!("{}{quote}{id}{}", &raw[..at], &raw[close..]))
+    use opccore::xml::{Event, XmlParser};
+    let mut parser = XmlParser::new(raw);
+    if parser.next() != Event::Start {
+        return None;
+    }
+    let attr = parser.attrs().iter().find(|attr| attr.name == "w:id")?;
+    // The parser's values are slices of `raw`.
+    let start = (attr.value.as_ptr() as usize).wrapping_sub(raw.as_ptr() as usize);
+    let end = start.wrapping_add(attr.value.len());
+    if end > raw.len() || start > end || !raw.is_char_boundary(start) {
+        return None;
+    }
+    Some(format!("{}{id}{}", &raw[..start], &raw[end..]))
+}
+
+/// [`with_revision_id`] for the editor's tests.
+#[cfg(test)]
+pub(crate) fn tests_with_revision_id(raw: &str, id: &str) -> Option<String> {
+    with_revision_id(raw, id)
 }
 
 fn assign_metadata_target(metadata: &mut RevisionMetadata, next: &mut u64, seen: &mut SeenTargets) {
