@@ -1,0 +1,15 @@
+test paragraph, character and table styles show on runs, and Bold off over a style keeps it off (#1427)
+  open copy:../fixtures/run-styles.docx
+  key ctrl+home
+  assert run.shown_bold is true
+  assert run.bold is false
+  key down
+  assert run.shown_bold is true
+  assert run.bold is false
+  key down
+  assert run.shown_bold is true
+  key shift+end
+  key ctrl+b
+  assert run.shown_bold is false
+  key ctrl+b
+  assert run.shown_bold is true
