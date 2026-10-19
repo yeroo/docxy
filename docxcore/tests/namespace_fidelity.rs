@@ -27,8 +27,7 @@ fn saved(document: &str) -> String {
             document.as_bytes().to_vec(),
         ),
     ]);
-    let mut pkg = load_package(&bytes).expect("fixture loads");
-    pkg.document = pkg.document.clone();
+    let pkg = load_package(&bytes).expect("fixture loads");
     let out = save_package(&pkg);
     let archive = ZipArchive::open(&out).expect("saved package is a ZIP");
     String::from_utf8(archive.read("word/document.xml").expect("document part"))
@@ -255,18 +254,11 @@ fn namespaces_of_prefixed(xml: &str, name: &str, prefix: &str) -> Option<bool> {
 
 fn assert_ignorable_survives(src: &str, element: &str) {
     let want = vec!["ux".to_string()];
-    for (label, xml) in [("saved", saved(src))] {
-        assert_eq!(
-            ignorable_at(&xml, element),
-            [want.clone()],
-            "{label}: {xml}"
-        );
-        assert!(ux_bound_at(&xml, element), "{label}: {xml}");
-        // A second round neither loses nor changes it.
-        let again = saved(&xml);
-        assert_eq!(ignorable_at(&again, element), [want.clone()], "{again}");
-        assert_eq!(again, saved(&again), "stable: {again}");
-    }
+    let once = saved(src);
+    assert_eq!(ignorable_at(&once, element), [want], "saved: {once}");
+    assert!(ux_bound_at(&once, element), "saved: {once}");
+    // A second round neither loses nor changes it.
+    assert_eq!(once, saved(&once), "stable: {once}");
 }
 
 #[test]

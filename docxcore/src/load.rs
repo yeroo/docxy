@@ -250,7 +250,7 @@ fn rules_for_prefixes(rules: &[(String, String)], used: &[String]) -> Vec<(Strin
 /// The prefixes a markup-compatibility attribute (`mc:Ignorable`,
 /// `mc:ProcessContent`, …) names in its value: a list of prefixes, or of
 /// qualified names (`ux:*`). None for any other attribute.
-fn mce_value_prefixes<'a>(name: &str, value: &'a str) -> impl Iterator<Item = &'a str> {
+pub(crate) fn mce_value_prefixes<'a>(name: &str, value: &'a str) -> impl Iterator<Item = &'a str> {
     let local = name.rsplit(':').next().unwrap_or_default();
     // `Requires` is the unprefixed attribute of `mc:Choice`.
     let named = match local {

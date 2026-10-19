@@ -532,19 +532,77 @@ fn text_box_copies(raw: &str) -> Vec<TextBoxCopy> {
         }
         inners.push(inner);
     }
-    let Some(first) = inners.first().map(|r| &raw[r.clone()]) else {
+    if inners.is_empty() {
         return Vec::new();
-    };
+    }
     // A save may drop a repeated `w14:paraId` from one copy but not the other
     // (an id is never dropped in an `mc:Fallback`, #1063); that alone does not
     // make the copies differ.
-    let first = twin_key(first);
-    inners
-        .iter()
-        .map(|inner| TextBoxCopy {
-            twin: twin_key(&raw[inner.clone()]) == first,
-            inner: inner.clone(),
+    // Copies also differ when a prefix they use means another namespace.
+    let bound = bindings_used(raw, &inners);
+    let key = |i: usize| (twin_key(&raw[inners[i].clone()]), &bound[i]);
+    let first = key(0);
+    (0..inners.len())
+        .map(|i| TextBoxCopy {
+            twin: key(i) == first,
+            inner: inners[i].clone(),
         })
+        .collect()
+}
+
+/// For each of `inners` (ranges of `raw`), the namespaces its element and
+/// attribute names (not `w14:paraId`; and markup-compatibility values) resolve to: sorted
+/// `prefix=namespace` lines, the default namespace as the empty prefix,
+/// bindings inherited from outside the range included. An unbound prefix
+/// resolves to nothing.
+fn bindings_used(raw: &str, inners: &[Range<usize>]) -> Vec<String> {
+    let mut used: Vec<std::collections::BTreeSet<String>> = vec![Default::default(); inners.len()];
+    let mut p = XmlParser::new(raw);
+    loop {
+        match p.next() {
+            Event::Start => {
+                let at = p.start_pos();
+                let Some(i) = inners.iter().position(|r| r.contains(&at)) else {
+                    continue;
+                };
+                let resolve = |prefix: &str| {
+                    let decl = if prefix.is_empty() {
+                        "xmlns".to_string()
+                    } else {
+                        format!("xmlns:{prefix}")
+                    };
+                    let ns = p
+                        .namespace_attrs()
+                        .iter()
+                        .find(|a| a.name == decl)
+                        .map(|a| a.value)
+                        .unwrap_or_default();
+                    format!("{prefix}={ns}")
+                };
+                let name = p.name();
+                if !name.contains(':') {
+                    used[i].insert(resolve(""));
+                }
+                let mut prefixes: Vec<&str> =
+                    name.split_once(':').map(|(p, _)| p).into_iter().collect();
+                for a in p.attrs() {
+                    // `twin_key` cuts the ids a save may drop from one copy.
+                    if a.name == "w14:paraId" || a.name == "xmlns" || a.name.starts_with("xmlns:") {
+                        continue;
+                    }
+                    prefixes.extend(a.name.split_once(':').map(|(p, _)| p));
+                    prefixes.extend(crate::load::mce_value_prefixes(a.name, a.value));
+                }
+                for prefix in prefixes.into_iter().filter(|p| *p != "xml") {
+                    used[i].insert(resolve(prefix));
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    used.into_iter()
+        .map(|set| set.into_iter().collect::<Vec<_>>().join("\n"))
         .collect()
 }
 
@@ -1557,6 +1615,83 @@ mod tests {
         assert_eq!(
             twins(&raw(&attr("11111111"), &attr("22222222"))),
             [true, true]
+        );
+    }
+
+    fn twin_flags(raw: &str) -> Vec<bool> {
+        text_box_copies(raw).iter().map(|c| c.twin).collect()
+    }
+
+    /// Review r6: copies whose `ux:` prefix means different namespaces are
+    /// not twins, whatever their text.
+    #[test]
+    fn text_boxes_with_different_ux_bindings_are_not_twins() {
+        let copy = |ns: &str| {
+            format!(
+                "<w:txbxContent><w:p ux:label=\"1\" xmlns:ux=\"{ns}\"><w:r><w:t>Same</w:t></w:r></w:p></w:txbxContent>"
+            )
+        };
+        let raw = |a: &str, b: &str| format!("<v:group>{}{}</v:group>", copy(a), copy(b));
+        assert_eq!(twin_flags(&raw("urn:a", "urn:b")), [true, false]);
+        assert_eq!(twin_flags(&raw("urn:a", "urn:a")), [true, true]);
+    }
+
+    /// Declarations placed differently but resolving alike keep copies twins:
+    /// one copy declares the prefix itself, the other inherits it.
+    #[test]
+    fn text_boxes_with_the_same_resolution_are_twins_wherever_declared() {
+        let own = "<w:txbxContent><w:p xmlns:ux=\"urn:a\" ux:l=\"1\"><w:r><w:t>Same</w:t></w:r></w:p></w:txbxContent>";
+        let inherited =
+            "<w:txbxContent><w:p ux:l=\"1\"><w:r><w:t>Same</w:t></w:r></w:p></w:txbxContent>";
+        let wrap = |a: &str, b: &str| {
+            format!("<v:group xmlns:ux=\"urn:a\"><v:s>{a}</v:s><v:s>{b}</v:s></v:group>")
+        };
+        assert_eq!(twin_flags(&wrap(own, inherited)), [true, true]);
+        // The binding inherited from outside the copy counts.
+        let other = "<v:group xmlns:ux=\"urn:a\"><v:s>{a}</v:s></v:group>\
+            <v:group xmlns:ux=\"urn:b\"><v:s>{b}</v:s></v:group>"
+            .replace("{a}", inherited)
+            .replace("{b}", inherited);
+        assert_eq!(twin_flags(&other), [true, false]);
+    }
+
+    /// A default namespace an unprefixed name depends on counts too.
+    #[test]
+    fn text_boxes_with_different_default_namespaces_are_not_twins() {
+        let copy = |ns: &str| {
+            format!(
+                "<v:s xmlns=\"{ns}\"><w:txbxContent><w:p><x/><w:r><w:t>Same</w:t></w:r></w:p></w:txbxContent></v:s>"
+            )
+        };
+        assert_eq!(
+            twin_flags(&format!("<v:g>{}{}</v:g>", copy("urn:a"), copy("urn:b"))),
+            [true, false]
+        );
+    }
+
+    /// A text edit syncs the twins; the box in another namespace keeps its
+    /// own extension attribute.
+    #[test]
+    fn twin_sync_leaves_another_namespace_box_alone() {
+        let copy = |ns: &str| {
+            format!(
+                "<v:s xmlns:ux=\"{ns}\"><w:txbxContent><w:p ux:l=\"1\"><w:r><w:t>Same</w:t></w:r></w:p></w:txbxContent></v:s>"
+            )
+        };
+        let mut raw = format!(
+            "<v:g>{}{}{}</v:g>",
+            copy("urn:a"),
+            copy("urn:a"),
+            copy("urn:b")
+        );
+        let twins = twin_flags(&raw);
+        assert_eq!(twins, [true, true, false]);
+        let blocks = vec![Block::Paragraph(crate::model::Paragraph::default())];
+        sync_twin_copies(&mut raw, &blocks, &twins);
+        assert_eq!(raw.matches("ux:l=\"1\"").count(), 1, "{raw}");
+        assert!(
+            raw.contains("xmlns:ux=\"urn:b\"") && raw.contains("Same"),
+            "{raw}"
         );
     }
 
