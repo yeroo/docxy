@@ -1962,6 +1962,38 @@ struct WbSnapshot {
     /// renames the tables the *current* model names rather than putting back
     /// a copy, which would take later model edits with it.
     model_rename: Option<(String, String)>,
+    /// Edits to the data model's measures and relationships that a table
+    /// column rename or delete made, to replay when this snapshot is
+    /// restored (each applies only where the model still holds its `from`).
+    model_edits: Vec<ModelEdit>,
+}
+
+/// One change a table column edit made to the data model, replayed by undo
+/// (reversed) and redo on whatever the model holds then.
+#[derive(Clone, Debug, PartialEq)]
+enum ModelEdit {
+    Measure {
+        name: String,
+        from: String,
+        to: String,
+    },
+    Relationship {
+        from: Relationship,
+        to: Relationship,
+    },
+}
+
+impl ModelEdit {
+    fn reversed(&self) -> ModelEdit {
+        match self.clone() {
+            ModelEdit::Measure { name, from, to } => ModelEdit::Measure {
+                name,
+                from: to,
+                to: from,
+            },
+            ModelEdit::Relationship { from, to } => ModelEdit::Relationship { from: to, to: from },
+        }
+    }
 }
 
 /// Whether `wb` differs from the snapshot `before` in what a filter or sort
@@ -3461,8 +3493,9 @@ impl App {
                 renamed |= gridcore::edit::sync_table_headers(&mut self.pkg.workbook, *s, &cells);
             }
         }
-        if let (true, Some(before)) = (renamed || rewrote, wb_before) {
-            let after = self.wb_snapshot();
+        if let (true, Some(mut before)) = (renamed || rewrote, wb_before) {
+            let mut after = self.wb_snapshot();
+            self.follow_columns_in_model(&mut before, &mut after);
             // A write that rewrote formulas rebuilt the engine itself; a
             // header written back may have changed under it.
             if headers {
@@ -3703,6 +3736,7 @@ impl App {
             self.sync_written_headers(&before);
         }
         let mut after = self.wb_snapshot();
+        self.follow_columns_in_model(&mut before, &mut after);
         if let Some((old, new)) = model_rename {
             self.rename_table_in_model(old, new);
             before.model_rename = Some((new.to_string(), old.to_string()));
@@ -3762,6 +3796,103 @@ impl App {
         }
         for (s, cells) in written {
             gridcore::edit::sync_table_headers(&mut self.pkg.workbook, s, &cells);
+        }
+    }
+
+    /// The data model follows the table columns that `before` and `after`
+    /// (the snapshots around an edit) differ in: a renamed column is renamed
+    /// in the measures' formulas and the relationships' ends, a deleted one
+    /// reads `#REF!` there. The edits go on both snapshots, so undo and redo
+    /// replay them ([`Self::apply_model_edits`]).
+    fn follow_columns_in_model(&mut self, before: &mut WbSnapshot, after: &mut WbSnapshot) {
+        let mut edits: Vec<ModelEdit> = Vec::new();
+        for b in &before.tables {
+            let Some(a) = after.tables.iter().find(|a| a.part == b.part) else {
+                continue;
+            };
+            let same = |x: &String, y: &String| x.eq_ignore_ascii_case(y);
+            let renamed: Vec<(String, String)> = if a.columns.len() == b.columns.len() {
+                (b.columns.iter().zip(&a.columns))
+                    .filter(|(x, y)| x != y)
+                    .map(|(x, y)| (x.clone(), y.clone()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let deleted: Vec<bool> = if a.columns.len() < b.columns.len() {
+                (b.columns.iter())
+                    .map(|x| !a.columns.iter().any(|y| same(x, y)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if renamed.is_empty() && !deleted.contains(&true) {
+                continue;
+            }
+            for m in &self.model_measures {
+                let Ok(ast) = gridcore::formula::parse(&m.formula) else {
+                    continue;
+                };
+                let out = if deleted.is_empty() {
+                    gridcore::formula::rename_table_columns_in_expr(&ast, &b.name, false, &renamed)
+                } else {
+                    gridcore::formula::delete_table_columns_in_expr(
+                        &ast, &b.name, false, &b.columns, &deleted,
+                    )
+                };
+                if out != ast {
+                    edits.push(ModelEdit::Measure {
+                        name: m.name.clone(),
+                        from: m.formula.clone(),
+                        to: gridcore::formula::to_string(&out),
+                    });
+                }
+            }
+            for r in &self.model_rels {
+                let mut to = r.clone();
+                for end in [&mut to.from, &mut to.to] {
+                    if !end.0.eq_ignore_ascii_case(&b.name) {
+                        continue;
+                    }
+                    if let Some((_, new)) = renamed.iter().find(|(old, _)| same(old, &end.1)) {
+                        end.1 = new.clone();
+                    } else if let Some(j) = b.columns.iter().position(|x| same(x, &end.1)) {
+                        if deleted.get(j).copied().unwrap_or(false) {
+                            end.1 = "#REF!".to_string();
+                        }
+                    }
+                }
+                if to != *r {
+                    edits.push(ModelEdit::Relationship {
+                        from: r.clone(),
+                        to,
+                    });
+                }
+            }
+        }
+        self.apply_model_edits(&edits);
+        before.model_edits = edits.iter().rev().map(ModelEdit::reversed).collect();
+        after.model_edits = edits;
+    }
+
+    /// Apply data-model `edits`, each only where the model still holds the
+    /// text it replaces.
+    fn apply_model_edits(&mut self, edits: &[ModelEdit]) {
+        for e in edits {
+            match e {
+                ModelEdit::Measure { name, from, to } => {
+                    if let Some(m) = (self.model_measures.iter_mut())
+                        .find(|m| m.name == *name && m.formula == *from)
+                    {
+                        m.formula = to.clone();
+                    }
+                }
+                ModelEdit::Relationship { from, to } => {
+                    if let Some(r) = self.model_rels.iter_mut().find(|r| *r == from) {
+                        *r = to.clone();
+                    }
+                }
+            }
         }
     }
 
@@ -3851,6 +3982,7 @@ impl App {
             precision: None,
             pivot_sources: wb.pivots.iter().map(|p| p.source.clone()).collect(),
             model_rename: None,
+            model_edits: Vec::new(),
         }
     }
 
@@ -3886,6 +4018,7 @@ impl App {
         if let Some((old, new)) = &snap.model_rename {
             self.rename_table_in_model(old, new);
         }
+        self.apply_model_edits(&snap.model_edits);
         self.rebuild_engine();
         self.clamp_cursor();
         self.modified = true;
@@ -19098,6 +19231,55 @@ mod tests {
         app.apply_on(0, vec![(0, 1, Cell::default())]);
         assert_eq!(header_state(&app).0, "Column2");
         assert_eq!(header_state(&app).2, "SUM(Sales[Column2])");
+    }
+
+    /// #991 p4: `Sales` with a measure over `Sales[Qty]` and a relationship
+    /// from `Sales[Qty]`.
+    fn model_app() -> App {
+        let mut app = header_app();
+        app.model_measures.push(gridcore::model::Measure {
+            name: "Total".into(),
+            formula: "SUM(Sales[Qty])".into(),
+        });
+        app.model_rels.push(Relationship {
+            from: ("Sales".into(), "Qty".into()),
+            to: ("Qtys".into(), "Id".into()),
+        });
+        app
+    }
+
+    #[test]
+    fn a_header_rename_reaches_the_data_model_991() {
+        let mut app = model_app();
+        app.apply_on(0, vec![(0, 1, parse_input("Units"))]);
+        assert_eq!(app.model_measures[0].formula, "SUM(Sales[Units])");
+        assert_eq!(app.model_rels[0].from.1, "Units");
+        app.undo();
+        assert_eq!(app.model_measures[0].formula, "SUM(Sales[Qty])");
+        assert_eq!(app.model_rels[0].from.1, "Qty");
+        app.redo();
+        assert_eq!(app.model_measures[0].formula, "SUM(Sales[Units])");
+        assert_eq!(app.model_rels[0].from.1, "Units");
+    }
+
+    #[test]
+    fn a_column_delete_reaches_the_data_model_991() {
+        let mut app = model_app();
+        app.model_measures.push(gridcore::model::Measure {
+            name: "Items".into(),
+            formula: "COUNTA(Sales[Item])".into(),
+        });
+        app.cur = (0, 1);
+        app.anchor = None;
+        app.col_op(false); // the Qty column
+        assert!(app.model_measures[0].formula.contains("#REF!"));
+        assert_eq!(app.model_measures[1].formula, "COUNTA(Sales[Item])");
+        assert_eq!(app.model_rels[0].from.1, "#REF!");
+        app.undo();
+        assert_eq!(app.model_measures[0].formula, "SUM(Sales[Qty])");
+        assert_eq!(app.model_rels[0].from.1, "Qty");
+        app.redo();
+        assert!(app.model_measures[0].formula.contains("#REF!"));
     }
 
     #[test]
