@@ -477,6 +477,9 @@ fn level_arg(
 /// selection alone.
 pub(super) fn range_sort(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
+    if app.pkg.workbook.sheets[si].is_protected() {
+        return Err("range.sort: the sheet is protected".into());
+    }
     let wb = &app.pkg.workbook;
     let mut range = area(args.get_str("range").ok_or("range.sort needs a 'range'")?)?;
     let ltr = args.get_str("orientation") == Some("columns");
