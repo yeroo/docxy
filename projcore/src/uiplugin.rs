@@ -384,7 +384,9 @@ pub struct DialogSpec {
     pub placement: String,
     /// The page a Help button opens (#1609), a URL; empty for none (the host
     /// then says its documentation is coming). Help is the host's: it is
-    /// never sent to the plugin as a command.
+    /// never sent to the plugin as a command. A plugin's own dialog only:
+    /// Task Information's Help stays the host's whatever the
+    /// `task-information` spec names.
     pub help: String,
     /// Controls drawn above every page (#1609) as one row: Task Information's
     /// Name, Duration and Estimated. A header control's `span` widens it

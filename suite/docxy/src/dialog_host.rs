@@ -2172,8 +2172,11 @@ impl Docxy {
                                 }
                                 // A message box has no controls: no empty
                                 // container, so its button row keeps the gap
-                                // it always had (#1609 r7).
-                                let has_controls = !controls.is_empty();
+                                // it always had (#1609 r7). A sized dialog
+                                // keeps the container on an empty page too:
+                                // it is what holds the buttons at the bottom
+                                // (r10).
+                                let has_controls = !controls.is_empty() || sized;
                                 v_flex()
                                     .gap_3()
                                     .when(sized, |v| v.flex_1().min_h_0())

@@ -512,8 +512,9 @@ without one nothing changes.
   `columns`, `group`, `span` and `min_rows` (the page's columns lay out the
   plugin's controls; the built-in Name, Duration and Estimated row keeps its
   one-column shape on every page), and its `header` controls are drawn
-  above that row on every page, first in the Tab order; `size`, `placement` and `fill` belong to a
-  plugin's own dialog.
+  above that row on every page, first in the Tab order; `size`, `placement`,
+  `fill` and `help` belong to a plugin's own dialog (Task Information's Help
+  is the host's and says the documentation is coming).
 - **Overlay** (`yppx_ui_overlay`): the rows in view (`uid`, `row_y`, the bar
   rectangle, kind flags, since #1548 `name`, `percent_complete`,
   `deadline_x`, `constraint {type, x}` and `resource_names`, and since
