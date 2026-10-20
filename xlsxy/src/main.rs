@@ -3449,8 +3449,9 @@ impl App {
         }
         if let (true, Some(before)) = (renamed || rewrote, wb_before) {
             let after = self.wb_snapshot();
-            // A write that rewrote formulas rebuilt the engine itself.
-            if renamed {
+            // A write that rewrote formulas rebuilt the engine itself; a
+            // header written back may have changed under it.
+            if headers {
                 self.rebuild_engine();
             }
             // As every structural step does (`try_structural`): a pending
@@ -4702,30 +4703,20 @@ impl App {
                 };
                 // The block written from (r0, c0): rows and cells pushed off
                 // the grid's edge are dropped, so rows may differ in length.
-                // A cut writes the whole rectangle its references move over
-                // (`rules_from`, the selection), blank where the clip holds
-                // no cell, so the target is overwritten as they now read it.
-                let cut_dims = cut.then(|| {
-                    (
-                        (rules_from.2 - rules_from.0 + 1) as usize,
-                        (rules_from.3 - rules_from.1 + 1) as usize,
-                    )
-                });
                 let mut block = Vec::new();
                 let mut writes = Vec::new();
-                for dr in 0..cut_dims.map_or(clip.cells.len(), |d| d.0) {
+                for (dr, row) in clip.cells.iter().enumerate() {
                     let r = r0 + dr as u32;
                     if r >= MAX_ROWS {
                         break;
                     }
-                    let row = clip.cells.get(dr).map_or(&[][..], |row| row.as_slice());
                     let mut out = Vec::new();
-                    for dc in 0..cut_dims.map_or(row.len(), |d| d.1) {
+                    for (dc, cell) in row.iter().enumerate() {
                         let c = c0 + dc as u32;
                         if c >= MAX_COLS {
                             break;
                         }
-                        let mut new_cell = row.get(dc).cloned().flatten().unwrap_or_default();
+                        let mut new_cell = cell.clone().unwrap_or_default();
                         // Copies translate relative refs; cuts keep them, and
                         // so does a copy pasted where it came from (translating
                         // reprints the text, even by zero).
@@ -4760,14 +4751,41 @@ impl App {
                                 }
                             }
                         }
-                        // Overwrite position wins over source-clear on overlap.
-                        if same_sheet {
-                            clears.retain(|&(cr, cc, _)| (cr, cc) != (r, c));
-                        }
                         writes.push((r, c));
                         out.push(new_cell);
                     }
                     block.push(out);
+                }
+                // Overwrite position wins over source-clear on overlap.
+                let written: std::collections::HashSet<(u32, u32)> =
+                    writes.iter().copied().collect();
+                if same_sheet {
+                    clears.retain(|cell| !written.contains(&(cell.0, cell.1)));
+                }
+                // A cut's references move over the whole selection, empty
+                // cells too (`rules_from`), so the target cells there that
+                // hold something go blank, as the references now read them.
+                // Only existing cells: a whole row or column is no millions of
+                // writes (`clip.cells` is the used part of the selection).
+                let mut blanks = Vec::new();
+                if cut {
+                    let (fr, fc, lr, lc) = rules_from;
+                    let (dr, dc) = (dr_all, dc_all);
+                    let inside = |r: u32, c: u32| {
+                        (fr as i64 + dr..=lr as i64 + dr).contains(&(r as i64))
+                            && (fc as i64 + dc..=lc as i64 + dc).contains(&(c as i64))
+                    };
+                    let mut seen: std::collections::HashSet<(u32, u32)> =
+                        clears.iter().map(|cell| (cell.0, cell.1)).collect();
+                    for &(r, c) in self.pkg.workbook.sheets[here].cells.keys() {
+                        if inside(r, c) && !written.contains(&(r, c)) {
+                            if !same_sheet {
+                                blanks.push((r, c, Cell::default()));
+                            } else if seen.insert((r, c)) {
+                                clears.push((r, c, Cell::default()));
+                            }
+                        }
+                    }
                 }
                 // The cut's clears go first, then the block through
                 // `Engine::paste_block`: a pasted spilling array still spills,
@@ -4785,7 +4803,9 @@ impl App {
                         .refuses_paste(wb, here, (r0, c0), &block, &clears)
                 } else {
                     self.engine.refuses(wb, src, &clears)
-                        || self.engine.refuses_paste(wb, here, (r0, c0), &block, &[])
+                        || self
+                            .engine
+                            .refuses_paste(wb, here, (r0, c0), &block, &blanks)
                 };
                 if refused {
                     self.status = Some(PART_OF_ARRAY.to_string());
@@ -4795,10 +4815,12 @@ impl App {
                 // Undo and Redo select the block written, not a cut's source.
                 let block_rect = bbox(&writes);
                 let clear_keys: Vec<_> = clears.iter().map(|&(r, c, _)| (r, c)).collect();
+                let blank_keys: Vec<_> = blanks.iter().map(|&(r, c, _)| (r, c)).collect();
                 let keys = if same_sheet {
                     vec![(here, clear_keys.into_iter().chain(writes).collect())]
                 } else {
-                    vec![(src, clear_keys), (here, writes)]
+                    let written = writes.into_iter().chain(blank_keys).collect();
+                    vec![(src, clear_keys), (here, written)]
                 };
                 // The cut's source block: a table lying wholly inside it keeps
                 // its column names (it does not move with the cells).
@@ -4826,7 +4848,8 @@ impl App {
                             // References to the moved cells follow them, in
                             // formulas, names and rules on every sheet (a
                             // rule over the cut cells keeps its range here,
-                            // so it keeps its formula too); the
+                            // so it keeps its formula, even an absolute ref
+                            // in it to a cell that moved); the
                             // engine is rebuilt on them so the writes below
                             // recalculate what reads the cells where they land.
                             rewrote = gridcore::edit::move_refs_rules_stay(wb, src, &mv);
@@ -4852,6 +4875,7 @@ impl App {
                         // deciding again against what the clears recalculated.
                         let wb = &mut app.pkg.workbook;
                         app.engine.set_cells_prechecked(wb, src, clears);
+                        app.engine.set_cells_prechecked(wb, here, blanks);
                         app.engine
                             .paste_block_prechecked(wb, here, (r0, c0), &block);
                         app.engine.set_cells_prechecked(wb, src, late);
@@ -26434,6 +26458,74 @@ mod tests {
     }
 
     #[test]
+    fn a_whole_row_or_column_cut_writes_only_the_used_and_overwritten_cells() {
+        let mut app = repoint_app();
+        put_cells(
+            &mut app,
+            0,
+            &[(2, 0, "1"), (2, 5, "2"), (0, 20, "=SUM(A3:XFD3)")],
+        );
+        put_cells(&mut app, 1, &[(5, 3, "100"), (7, 0, "7")]);
+        // Row 3 (all 16384 columns) onto Sheet2 row 6.
+        cut_across(&mut app, 0, ((2, 0), (2, MAX_COLS - 1)), 1, (5, 0));
+        assert_eq!(
+            formula_at(&app, 0, 0, 20).as_deref(),
+            Some("SUM(Sheet2!A6:XFD6)")
+        );
+        // Sheet2!D6 lay in the cut's rectangle: blank, not 100.
+        assert!(app.pkg.workbook.sheets[1].cell(5, 3).is_none());
+        assert_eq!(number_at(&app, 1, 5, 5), Some(2.0));
+        let Some(UndoAction::Structural { before, after, .. }) = app.undo.last() else {
+            panic!("a re-pointing cut is a whole-workbook step");
+        };
+        assert!(before.sheets[1].cells.len() <= 3 && after.sheets[1].cells.len() <= 4);
+        app.undo();
+        assert_eq!(number_at(&app, 1, 5, 3), Some(100.0));
+        assert_eq!(number_at(&app, 0, 2, 5), Some(2.0));
+
+        // A whole column, with nothing reading it: a Cells step of the used part.
+        let mut app = repoint_app();
+        put_cells(&mut app, 0, &[(0, 0, "1"), (9, 0, "2")]);
+        put_cells(&mut app, 1, &[(3, 4, "100")]);
+        cut_across(&mut app, 0, ((0, 0), (MAX_ROWS - 1, 0)), 1, (0, 4));
+        assert!(app.pkg.workbook.sheets[1].cell(3, 4).is_none());
+        assert_eq!(number_at(&app, 1, 9, 4), Some(2.0));
+        let Some(UndoAction::Cells(groups)) = app.undo.last() else {
+            panic!("nothing was re-pointed");
+        };
+        // The used extent (10 rows) and the one overwritten cell, never the
+        // million rows of the selection.
+        assert!(groups.iter().all(|g| g.changes.len() <= 13));
+    }
+
+    #[test]
+    fn a_cut_onto_a_table_header_rewritten_back_rebuilds_the_engine() {
+        let mut app = repoint_app();
+        put_cells(&mut app, 0, &[(0, 0, "5"), (0, 1, "=A1")]);
+        app.pkg.workbook.sheets[0].set_cell(0, 4, Cell::text("5"));
+        app.pkg.workbook.tables.push(gridcore::sheet::Table {
+            name: "T".into(),
+            sheet: 0,
+            range: (0, 4, 3, 4),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["5".into()],
+            part: String::new(),
+            column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
+        });
+        put_cells(&mut app, 0, &[(0, 6, "=ISNUMBER(E1)")]);
+        cut_across(&mut app, 0, ((0, 0), (0, 0)), 0, (0, 4));
+        // The header is its column's name again, text, and G1 reads that.
+        let header = app.pkg.workbook.sheets[0].cell(0, 4).unwrap().value.clone();
+        assert_eq!(header, CellValue::Text("5".into()));
+        assert_eq!(
+            app.pkg.workbook.sheets[0].cell(0, 6).unwrap().value,
+            CellValue::Bool(false)
+        );
+    }
+
+    #[test]
     fn a_copy_and_an_external_paste_re_point_nothing() {
         let mut app = repoint_app();
         put_cells(&mut app, 0, &[(0, 0, "5"), (0, 1, "=A1*2")]);
@@ -26446,7 +26538,10 @@ mod tests {
         assert_eq!(formula_at(&app, 0, 0, 1).as_deref(), Some("A1*2"));
         assert_eq!(number_at(&app, 0, 0, 0), Some(5.0));
         assert!(matches!(app.undo.last(), Some(UndoAction::Cells(_))));
-        // Text from another app, after a cut, is values only.
+        // Text from another app, after a cut of a cell something reads, is
+        // values only: the cut neither happens nor re-points.
+        app.cur = (0, 0);
+        app.anchor = None;
         app.copy(true);
         app.cur = (6, 0);
         app.paste_from(Some("x\ty".into()));
