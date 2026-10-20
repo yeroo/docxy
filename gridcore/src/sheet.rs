@@ -457,6 +457,11 @@ pub struct ColDef {
     /// with no width as zero wide. A loaded `<col>` without a width loads
     /// as `Some(0.0)`, as Excel shows it (#1152).
     pub default_width: bool,
+    /// `width` is `Some` but the source `<col>` was not marked `customWidth`
+    /// (absent, `0` or `false`): the save leaves `customWidth` out, as the
+    /// source had it (#1093). A width the model makes is custom, so this is
+    /// false there, and always when `width` is `None`.
+    pub plain_width: bool,
 }
 
 /// Excel's default column width in character units.
@@ -1796,6 +1801,7 @@ impl Sheet {
                 width: None,
                 attrs: String::new(),
                 default_width: true,
+                plain_width: false,
             });
         }
         out.sort_by_key(|d| d.min);
@@ -1822,6 +1828,7 @@ impl Sheet {
                     if p.max + 1 == d.min
                         && p.width == d.width
                         && p.default_width == d.default_width
+                        && p.plain_width == d.plain_width
                         && same(&p.attrs, &d.attrs) =>
                 {
                     p.max = d.max;
@@ -1845,7 +1852,9 @@ impl Sheet {
 
     /// Set one column's width, splitting any range definition that covers it.
     pub fn set_col_width(&mut self, col: u32, width: f64) {
-        self.isolate_col(col).width = Some(width);
+        let def = self.isolate_col(col);
+        def.width = Some(width);
+        def.plain_width = false;
     }
 
     /// The merged region containing (row, col), if any.
@@ -3433,6 +3442,7 @@ mod tests {
             width: Some(12.0),
             attrs: String::new(),
             default_width: false,
+            plain_width: false,
         });
         s.set_col_width(2, 20.0);
         assert_eq!(s.col_width(1), 12.0);
@@ -3498,6 +3508,7 @@ mod tests {
             width: None,
             attrs: "hidden=\"1\"".into(),
             default_width: false,
+            plain_width: false,
         });
         assert!(s.col_hidden(2) && s.col_hidden(4));
         assert!(!s.col_hidden(1) && !s.col_hidden(5));

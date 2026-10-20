@@ -2578,6 +2578,7 @@ fn parse_worksheet_with(
                     let custom = matches!(p.attr("customWidth").trim(), "1" | "true");
                     let default_width = !custom && width == Some(sheet.default_col_file_width());
                     let width = if default_width { None } else { width };
+                    let plain_width = !custom && width.is_some();
                     let mut attrs = String::new();
                     for a in p.attrs() {
                         if !matches!(a.name, "min" | "max" | "width" | "customWidth") {
@@ -2594,6 +2595,7 @@ fn parse_worksheet_with(
                         width,
                         attrs,
                         default_width,
+                        plain_width,
                     });
                 }
                 "row" if in_sheet_data => {
@@ -4814,6 +4816,7 @@ fn splice_worksheet(
             // hide) is written at the sheet's default. A loaded one without
             // a width is 0 wide in the model.
             let width = match d.width {
+                Some(w) if d.plain_width => format!(" width=\"{w}\""),
                 Some(w) => format!(" width=\"{w}\" customWidth=\"1\""),
                 None => format!(" width=\"{}\"", sheet.default_col_file_width()),
             };
@@ -21441,6 +21444,7 @@ mod ct_worksheet_order_tests {
             width: None,
             attrs: "hidden=\"1\"".into(),
             default_width: false,
+            plain_width: false,
         });
         let ws = saved_sheet(&pkg);
         assert!(ws.contains(r#"<row r="1" hidden="1">"#), "{ws}");
@@ -21462,9 +21466,10 @@ mod ct_worksheet_order_tests {
             r#"<cols><col min="2" max="2" style="5"/></cols>{ROWS}{MARGINS}"#
         ));
         assert_eq!(pkg.workbook.sheets[0].col_width(1), 0.0);
-        assert!(saved_sheet(&pkg).contains(
-            r#"<cols><col min="2" max="2" width="0" customWidth="1" style="5"/></cols>"#
-        ));
+        assert!(
+            saved_sheet(&pkg)
+                .contains(r#"<cols><col min="2" max="2" width="0" style="5"/></cols>"#)
+        );
         // Grouping elsewhere doesn't touch it either.
         let mut pkg = pkg;
         crate::outline::group(
@@ -21476,9 +21481,95 @@ mod ct_worksheet_order_tests {
         .unwrap();
         let ws = saved_sheet(&pkg);
         assert!(
-            ws.contains(r#"<col min="2" max="2" width="0" customWidth="1" style="5"/><col min="5" max="5" width="9.140625" outlineLevel="1"/>"#),
+            ws.contains(r#"<col min="2" max="2" width="0" style="5"/><col min="5" max="5" width="9.140625" outlineLevel="1"/>"#),
             "{ws}"
         );
+    }
+
+    #[test]
+    fn a_col_width_not_marked_custom_saves_without_customwidth() {
+        // The model keeps whether the source said `customWidth` (#1093):
+        // absent, "0" and "false" save as they were, "1" and "true" as "1".
+        for flag in ["", r#" customWidth="0""#, r#" customWidth="false""#] {
+            let src =
+                format!(r#"<cols><col min="2" max="3" width="20"{flag}/></cols>{ROWS}{MARGINS}"#);
+            let pkg = loaded(&src);
+            assert_eq!(pkg.workbook.sheets[0].col_width(1), 20.0);
+            let ws = saved_sheet(&pkg);
+            assert!(
+                ws.contains(r#"<cols><col min="2" max="3" width="20"/></cols>"#),
+                "{flag}: {ws}"
+            );
+        }
+        for flag in [r#" customWidth="1""#, r#" customWidth="true""#] {
+            let src =
+                format!(r#"<cols><col min="2" max="3" width="20"{flag}/></cols>{ROWS}{MARGINS}"#);
+            let ws = saved_sheet(&loaded(&src));
+            assert!(
+                ws.contains(r#"<cols><col min="2" max="3" width="20" customWidth="1"/></cols>"#),
+                "{flag}: {ws}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_width_edit_makes_a_plain_col_custom() {
+        let mut pkg = loaded(&format!(
+            r#"<cols><col min="2" max="4" width="20"/></cols>{ROWS}{MARGINS}"#
+        ));
+        pkg.workbook.sheets[0].set_col_width(2, 30.0);
+        let ws = saved_sheet(&pkg);
+        assert!(
+            ws.contains(concat!(
+                r#"<cols><col min="2" max="2" width="20"/>"#,
+                r#"<col min="3" max="3" width="30" customWidth="1"/>"#,
+                r#"<col min="4" max="4" width="20"/></cols>"#
+            )),
+            "{ws}"
+        );
+        // Setting the same width as its neighbours' on it is still a custom one.
+        pkg.workbook.sheets[0].set_col_width(2, 20.0);
+        let ws = saved_sheet(&pkg);
+        assert!(
+            ws.contains(r#"<col min="3" max="3" width="20" customWidth="1"/>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn cols_differing_only_in_customwidth_are_not_merged() {
+        let src = concat!(
+            r#"<cols><col min="1" max="1" width="20" customWidth="1"/>"#,
+            r#"<col min="2" max="2" width="20"/>"#,
+            r#"<col min="3" max="3" width="20"/>"#,
+            r#"<col min="4" max="4" width="20" customWidth="1"/></cols>"#,
+        );
+        let mut pkg = loaded(&format!("{src}{ROWS}{MARGINS}"));
+        // Untouched: written as they were.
+        assert!(saved_sheet(&pkg).contains(src));
+        // An edit that coalesces merges the two plain ones only.
+        pkg.workbook.sheets[0].set_col_collapsed(6, true);
+        pkg.workbook.sheets[0].set_col_collapsed(6, false);
+        let ws = saved_sheet(&pkg);
+        assert!(
+            ws.contains(concat!(
+                r#"<cols><col min="1" max="1" width="20" customWidth="1"/>"#,
+                r#"<col min="2" max="3" width="20"/>"#,
+                r#"<col min="4" max="4" width="20" customWidth="1"/>"#,
+            )),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn the_source_cols_round_trip_without_a_customwidth_gain() {
+        // A plain 0-wide `<col>` and a plain width, unedited, save byte for byte.
+        let src = concat!(
+            r#"<cols><col min="1" max="1" width="0" style="5"/>"#,
+            r#"<col min="3" max="3" width="12.5" hidden="1"/></cols>"#,
+        );
+        let ws = saved_sheet(&loaded(&format!("{src}{ROWS}{MARGINS}")));
+        assert!(ws.contains(src), "{ws}");
     }
 
     /// A form control as Excel writes one: its anchor's `<xdr:col>` and
@@ -21589,6 +21680,7 @@ mod ct_worksheet_order_tests {
             width,
             attrs: attrs.into(),
             default_width: false,
+            plain_width: false,
         };
         let mut pkg = new_xlsx();
         let s = &mut pkg.workbook.sheets[0];
