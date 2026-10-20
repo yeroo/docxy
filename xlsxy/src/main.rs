@@ -3389,6 +3389,24 @@ impl App {
         if keys.is_empty() {
             return;
         }
+        // An edit of the cells a cut was taken from ends the cut, as in
+        // Excel; the cut's own paste (`cut_from`) is the one write that
+        // doesn't. The clip then pastes as a copy.
+        if cut_from.is_none() {
+            if let Some(clip) = self.clip.as_ref().filter(|c| c.cut) {
+                let (fr, fc) = clip.from;
+                let (lr, lc) = (fr + clip.span.0.max(1) - 1, fc + clip.span.1.max(1) - 1);
+                let hit = keys.iter().any(|(s, cells)| {
+                    *s == clip.sheet
+                        && cells
+                            .iter()
+                            .any(|&(r, c)| (fr..=lr).contains(&r) && (fc..=lc).contains(&c))
+                });
+                if hit {
+                    self.cancel_cut();
+                }
+            }
+        }
         // What each group selects on Undo and Redo: the cells asked for,
         // before the frozen spill keys widen them.
         let mut targets: Vec<Option<CellRect>> =
@@ -4875,9 +4893,12 @@ impl App {
                         // deciding again against what the clears recalculated.
                         let wb = &mut app.pkg.workbook;
                         app.engine.set_cells_prechecked(wb, src, clears);
+                        let (blanks, blanks_late) =
+                            app.engine.split_frozen_blanks(wb, here, blanks);
                         app.engine.set_cells_prechecked(wb, here, blanks);
                         app.engine
                             .paste_block_prechecked(wb, here, (r0, c0), &block);
+                        app.engine.set_cells_prechecked(wb, here, blanks_late);
                         app.engine.set_cells_prechecked(wb, src, late);
                         rewrote
                     })
@@ -26523,6 +26544,59 @@ mod tests {
             app.pkg.workbook.sheets[0].cell(0, 6).unwrap().value,
             CellValue::Bool(false)
         );
+    }
+
+    #[test]
+    fn typing_into_the_cut_cells_ends_the_cut_and_one_elsewhere_keeps_it() {
+        let mut app = repoint_app();
+        put_cells(&mut app, 0, &[(0, 0, "5"), (4, 1, "=A3")]);
+        app.sheet = 0;
+        app.cur = (0, 0);
+        app.anchor = Some((2, 0));
+        app.copy(true);
+        // An edit outside the cut's rectangle leaves it pending.
+        put_cells(&mut app, 0, &[(8, 8, "1")]);
+        assert!(app.clip.as_ref().unwrap().cut);
+        // A5 typed into the empty A3, which lies in the selection.
+        put_cells(&mut app, 0, &[(2, 0, "7")]);
+        assert!(!app.clip.as_ref().unwrap().cut);
+        app.cur = (0, 2);
+        app.paste_from(None);
+        // Pasted as a copy: the source keeps its cells, nothing is re-pointed.
+        assert_eq!(number_at(&app, 0, 0, 0), Some(5.0));
+        assert_eq!(number_at(&app, 0, 2, 0), Some(7.0));
+        assert_eq!(formula_at(&app, 0, 4, 1).as_deref(), Some("A3"));
+        assert_eq!(number_at(&app, 0, 0, 2), Some(5.0));
+    }
+
+    #[test]
+    fn a_cut_pasted_across_sheets_blanks_around_a_frozen_block_on_the_target() {
+        let n = |v: f64| CellValue::Number(v);
+        let mut app = repoint_app();
+        put_cells(&mut app, 0, &[(0, 0, "1")]);
+        let sheet = &mut app.pkg.workbook.sheets[1];
+        sheet.set_cell(
+            0,
+            4,
+            Cell {
+                value: n(7.0),
+                formula: Some("PIVOTBY(A1,4)".into()),
+                f_attrs: Some("t=\"array\" ref=\"E1:E3\"".to_string()),
+                spill: Some((3, 1)),
+                ..Cell::default()
+            },
+        );
+        sheet.set_cell(1, 4, Cell::number(8.0));
+        sheet.set_cell(2, 4, Cell::number(9.0));
+        app.rebuild_engine();
+        // Cut A1:A3 (A2, A3 empty) onto the block's middle.
+        cut_across(&mut app, 0, ((0, 0), (2, 0)), 1, (1, 4));
+        let at = |app: &App, r: u32| app.pkg.workbook.sheets[1].cell(r, 4).cloned();
+        // The block's anchor stays, E2 takes the cut cell and E3, inside
+        // the cut's rectangle, goes blank.
+        assert!(at(&app, 0).unwrap().formula.is_some());
+        assert_eq!(number_at(&app, 1, 1, 4), Some(1.0));
+        assert!(at(&app, 2).is_none());
     }
 
     #[test]
