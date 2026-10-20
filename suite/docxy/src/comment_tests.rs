@@ -740,3 +740,66 @@ fn delete_all_comments_removes_every_part_and_one_undo_restores() {
         [("1".to_string(), false), ("2".to_string(), true)]
     );
 }
+
+/// A loaded comment Word could have written: two paragraphs, a bold run, a
+/// `w14:paraId`. Finding it byte for byte in a save proves its XML was kept,
+/// not made again from the parsed record (#981).
+const RICH_COMMENT: &str = "<w:comment w:id=\"1\" w:author=\"Ann\" w:initials=\"A\" \
+    w:date=\"2020-01-02T03:04:05Z\" w14:paraId=\"1A2B\"><w:p><w:r><w:rPr><w:b/></w:rPr>\
+    <w:t>Bold</w:t></w:r></w:p><w:p><w:r><w:t>second</w:t></w:r></w:p></w:comment>";
+
+/// A converted tab (an RTF) whose package holds [`RICH_COMMENT`], anchored
+/// around the whole text, as a converted `.doc` with comments would.
+fn converted_tab_with_rich_comment(dir: &Scratch) -> DocTab {
+    let rtf = br"{\rtf1\ansi\pard The quick brown fox.\par}";
+    let mut tab = tab_from_path(&write(dir, "letter.rtf", rtf));
+    assert!(tab.access.converted.is_some(), "{}", tab.status);
+    let mut ed = docxcore::editor::Editor::new(docxcore::markdown::from_markdown(FOX));
+    ed.select_all();
+    assert!(ed.add_comment("1"));
+    let mut pkg = new_package(ed.doc.clone());
+    pkg.insert_comment_xml(RICH_COMMENT);
+    tab.comments = docxcore::comments::parse_comments(&pkg);
+    assert_eq!(tab.comments.len(), 1);
+    tab.surface = Surface::Doc(ed);
+    tab.pkg = Some(pkg);
+    crate::seed_used_comment_ids(&mut tab);
+    tab
+}
+
+/// #981 plan-conv: a converted tab rebases on the package its first save
+/// wrote, which no longer holds a deleted comment; the undo then writes the
+/// comment back with its original XML, not as one plain paragraph.
+#[test]
+fn converted_tab_delete_save_undo_save_keeps_the_comments_xml() {
+    let dir = Scratch::new();
+    let mut tab = converted_tab_with_rich_comment(&dir);
+    delete_doc_comment(&mut tab, "1");
+    let docx = dir.path("letter.docx");
+    assert!(save_doc_tab(&mut tab, Some(docx.clone())), "{}", tab.status);
+    let (doc, comments) = saved(&docx);
+    assert_eq!(markers(&doc, 1), 0, "{doc}");
+    assert!(!comments.contains("second"), "{comments}");
+    assert!(tab.access.converted.is_none(), "now that Word document");
+    assert!(editor(&mut tab).undo());
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    let (doc, comments) = saved(&docx);
+    assert_eq!(markers(&doc, 1), 3, "{doc}");
+    assert!(comments.contains(RICH_COMMENT), "{comments}");
+}
+
+/// #981 plan-conv: the same through Inspect Document's Remove All.
+#[test]
+fn converted_tab_remove_all_save_undo_save_keeps_the_comments_xml() {
+    let dir = Scratch::new();
+    let mut tab = converted_tab_with_rich_comment(&dir);
+    crate::inspector::inspect_remove(&mut tab, crate::inspector::InspectCategory::Comments)
+        .unwrap();
+    let docx = dir.path("letter.docx");
+    assert!(save_doc_tab(&mut tab, Some(docx.clone())), "{}", tab.status);
+    assert!(!saved(&docx).1.contains("second"));
+    assert!(editor(&mut tab).undo());
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    let (_, comments) = saved(&docx);
+    assert!(comments.contains(RICH_COMMENT), "{comments}");
+}
