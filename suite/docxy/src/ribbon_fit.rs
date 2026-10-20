@@ -735,9 +735,9 @@ mod tests {
     }
 
     /// #1608: a toggle without an icon (a contributed one may name none)
-    /// draws its label alone, no icon slot before it (r5), so it is
-    /// estimated as the padding, the gap and the label; the live fit counts
-    /// it.
+    /// draws its label alone, no icon slot before it (r5) and no gap (r6),
+    /// so it is estimated as the padding and the label only; the live fit
+    /// counts it.
     #[test]
     fn a_toggle_without_an_icon_is_estimated_with_its_label() {
         let with_icon = Control::Toggle(rs::cmd("plain", "bold", "Plain", Act::Paste));
