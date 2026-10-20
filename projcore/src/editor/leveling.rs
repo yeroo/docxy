@@ -7,7 +7,7 @@
 //! `LevelTarget::All` is the edit no host or verb constructs yet.
 use super::*;
 use crate::leveling::{LevelOptions, LevelOutcome, LevelTarget};
-use crate::schedule::{LevelScope, level_with, overbookings};
+use crate::schedule::{LevelScope, level_with, overallocation, overbookings};
 use std::collections::HashSet;
 
 /// MSPDI `LevelingDelayFormat` for elapsed days, the unit Project shows
@@ -61,10 +61,11 @@ impl Editor {
     /// are booked at the dates the plan gives them now; an automatic one
     /// still follows its links once the delays are written, so the pass
     /// repeats on the plan with its delays written while a round still
-    /// resolves something (fewer overbooked resources, or lower peaks, on
-    /// the committed schedule); a round that resolves nothing is dropped
-    /// (a follower moving in lockstep with its predecessor would ask for
-    /// more delay for ever), and a conflict that remains
+    /// changes the plan's overallocation (a smaller overbooked extent on the
+    /// committed schedule, or conflicts not seen before); a round that
+    /// leaves the same conflicts is dropped (a follower moving in lockstep
+    /// with its predecessor would ask for more delay for ever), and a
+    /// conflict that remains
     /// is reported as overallocated (a later pass resolves it only with the
     /// follower in its scope, or with `clear_first` off, since the default
     /// rebuilds the same cleared plan). An ALAP task is never delayed nor
@@ -129,29 +130,29 @@ impl Editor {
         // task's LevelingDelay 0). A follower outside the scope moves with
         // its links once the delays are written and may land on a targeted
         // task, so the pass repeats on the plan with its delays written,
-        // building on them, while a round still resolves something. A round
-        // that resolves nothing is dropped: a follower that moves in
-        // lockstep with its predecessor (Start-to-Start, say) would ask for
-        // one more step for ever (#1594 r6).
+        // building on them, while a round still changes the overallocation:
+        // a smaller overbooked extent, or conflicts the pass has not seen
+        // (one traded for another, which a later round may clear). A round
+        // that leaves the same conflicts, or ones seen before, is dropped: a
+        // follower that moves in lockstep with its predecessor
+        // (Start-to-Start, say) would ask for one more step for ever (#1594
+        // r6, r7). Bounded by the finite conflict states, not a count.
         let mut trial = self.proj.clone();
         for t in &mut trial.tasks {
             if in_scope(t.uid) && options.clear_first && !is_alap(t) {
                 t.leveling_delay = None;
             }
         }
-        // How far a plan is from clean on its committed schedule: the
-        // overbooked work resources and the sum of their peaks above
-        // capacity (in millionths, to compare exactly).
-        let pressure = |p: &crate::model::Project| -> (usize, i64) {
+        // The overallocation a plan holds on its committed schedule.
+        let pressure = |p: &crate::model::Project| {
             let sched = schedule(p);
-            let over = overbookings(p, |uid| {
+            overallocation(p, |uid| {
                 sched.get(uid).map(|r| (r.early_start, r.early_finish))
-            });
-            let excess: f64 = over.values().map(|o| (o.peak - 1.0).max(0.0)).sum();
-            (over.len(), (excess * 1_000_000.0).round() as i64)
+            })
         };
         let mut before = pressure(&trial);
-        for _ in 0..64 {
+        let mut seen = vec![before.conflicts.clone()];
+        loop {
             let leveled = level_with(
                 &trial,
                 &LevelScope {
@@ -178,12 +179,16 @@ impl Editor {
                 break;
             }
             let after = pressure(&round);
-            if after.0 < before.0 || after.1 < before.1 {
-                trial = round;
-                before = after;
-            } else {
+            let resolves = after.extent < before.extent - 1e-6;
+            let trades = after.extent <= before.extent + 1e-6
+                && after.conflicts != before.conflicts
+                && !seen.contains(&after.conflicts);
+            if !(resolves || trades) {
                 break;
             }
+            seen.push(after.conflicts.clone());
+            trial = round;
+            before = after;
         }
         // What the trial holds for each targeted leaf, against the plan.
         let mut plan: Vec<DelayEdit> = Vec::new();
@@ -933,6 +938,158 @@ mod tests {
                 i + 1
             );
         }
+    }
+
+    /// #1594 r7: a kept delay's own increment is measured so that the forward
+    /// pass's one snap lands on the placement. From Thursday the 5th of
+    /// March: B (one day on R2, no predecessor) keeps a stored two-elapsed-day
+    /// delay (Saturday, snapped to Monday); Y (unselected) holds R2 on Monday.
+    /// Level Selection B without clearing: B lands Tuesday with a delay of
+    /// five elapsed days, and nothing is overbooked.
+    #[test]
+    fn a_kept_delays_increment_lands_the_task_where_it_was_placed() {
+        let mut p = staffed().project().clone();
+        p.start_date = Some(DateTime::from_ymd_hm(2026, 3, 5, 8, 0));
+        p.tasks.truncate(2);
+        p.assignments.truncate(2);
+        for t in &mut p.tasks {
+            t.duration_min = 480;
+        }
+        // Build = B with its stored delay; Paint = Y, pinned to Monday.
+        p.tasks[0].leveling_delay = Some(2 * 1440 * 10);
+        p.tasks[0].leveling_delay_format = Some(8);
+        p.tasks[1].constraint = crate::model::ConstraintType::StartNoEarlierThan;
+        p.tasks[1].constraint_date = Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0));
+        let mut ed = Editor::new(p);
+        assert_eq!(
+            start(&ed, 1),
+            DateTime::from_ymd_hm(2026, 3, 9, 8, 0),
+            "Monday, on Y"
+        );
+        let out = ed
+            .level_tasks_with(
+                &LevelTarget::Selection(vec![1]),
+                Some(&LevelOptions {
+                    clear_first: false,
+                    ..LevelOptions::default()
+                }),
+            )
+            .unwrap();
+        assert_eq!((out.changed, out.delayed, out.overallocated), (1, 1, 0));
+        assert_eq!(
+            ed.project().task(1).unwrap().leveling_delay,
+            Some(5 * 1440 * 10),
+            "Thursday to Tuesday"
+        );
+        assert_eq!(
+            start(&ed, 1),
+            DateTime::from_ymd_hm(2026, 3, 10, 8, 0),
+            "Tuesday"
+        );
+    }
+
+    /// #1594 r7: a round that resolves the selected conflict is kept although
+    /// an untouched conflict elsewhere keeps the resource's peak: Ann on X
+    /// and A (Monday) and on U and V (Friday). Level Selection A moves A to
+    /// Tuesday; Friday's pair stays, reported.
+    #[test]
+    fn a_round_that_resolves_one_conflict_beside_another_is_kept() {
+        let mut p = staffed().project().clone();
+        for t in &mut p.tasks {
+            t.duration_min = 480;
+        }
+        // Build = X, Paint = A, Trim = U (Friday); V is new, Friday too.
+        let friday = DateTime::from_minutes(p.start_date.unwrap().minutes() + 4 * 1440);
+        p.tasks[2].constraint = crate::model::ConstraintType::StartNoEarlierThan;
+        p.tasks[2].constraint_date = Some(friday);
+        p.tasks.push(Task {
+            uid: 4,
+            id: 4,
+            name: "V".into(),
+            outline_level: 1,
+            duration_min: 480,
+            constraint: crate::model::ConstraintType::StartNoEarlierThan,
+            constraint_date: Some(friday),
+            ..Task::default()
+        });
+        p.assignments.push(Assignment {
+            uid: 4,
+            task_uid: 4,
+            resource_uid: 1,
+            units: 1.0,
+            ..Assignment::default()
+        });
+        let mut ed = Editor::new(p);
+        let anchor = start(&ed, 1);
+        let out = ed.level_tasks(&LevelTarget::Selection(vec![2])).unwrap();
+        assert_eq!((out.changed, out.delayed, out.overallocated), (1, 1, 1));
+        assert_eq!(
+            ed.project().task(2).unwrap().leveling_delay,
+            Some(1440 * 10)
+        );
+        assert_eq!(
+            start(&ed, 2),
+            DateTime::from_minutes(anchor.minutes() + 1440)
+        );
+        assert_eq!(start(&ed, 4), friday, "the Friday pair is untouched");
+    }
+
+    /// #1594 r7: a round that trades one conflict for another is kept, and
+    /// the next round clears it: X, A, H (after A, unselected) and B (Start
+    /// No Earlier Than Wednesday), one day each on Ann from Monday, Level
+    /// Selection A and B. Round one moves A to Wednesday and B to Thursday;
+    /// written, H follows A onto Thursday, over B; round two moves B to
+    /// Friday.
+    #[test]
+    fn a_round_that_trades_a_conflict_for_another_is_kept_and_the_next_clears_it() {
+        let mut p = staffed().project().clone();
+        for t in &mut p.tasks {
+            t.duration_min = 480;
+        }
+        let anchor = p.start_date.unwrap();
+        let wednesday = DateTime::from_minutes(anchor.minutes() + 2 * 1440);
+        // Build = X, Paint = A, Trim = H (after A); B is new.
+        p.tasks[2].predecessors.push(Predecessor::fs(2));
+        p.tasks.push(Task {
+            uid: 4,
+            id: 4,
+            name: "B".into(),
+            outline_level: 1,
+            duration_min: 480,
+            constraint: crate::model::ConstraintType::StartNoEarlierThan,
+            constraint_date: Some(wednesday),
+            ..Task::default()
+        });
+        p.assignments.push(Assignment {
+            uid: 4,
+            task_uid: 4,
+            resource_uid: 1,
+            units: 1.0,
+            ..Assignment::default()
+        });
+        let mut ed = Editor::new(p);
+        let out = ed.level_tasks(&LevelTarget::Selection(vec![2, 4])).unwrap();
+        assert_eq!((out.changed, out.delayed, out.overallocated), (2, 2, 0));
+        assert_eq!(
+            ed.project().task(2).unwrap().leveling_delay,
+            Some(2 * 1440 * 10),
+            "A: Wednesday"
+        );
+        assert_eq!(
+            ed.project().task(4).unwrap().leveling_delay,
+            Some(2 * 1440 * 10),
+            "B: a day in each round"
+        );
+        assert_eq!(
+            start(&ed, 3),
+            DateTime::from_minutes(anchor.minutes() + 3 * 1440),
+            "H Thursday"
+        );
+        assert_eq!(
+            start(&ed, 4),
+            DateTime::from_minutes(anchor.minutes() + 4 * 1440),
+            "B Friday"
+        );
     }
 
     /// #1594 r4: a follower whose own constraint already holds it takes no

@@ -483,11 +483,12 @@
   automatic task over each assignment's own window, a manual or tracked one
   its whole span; an automatic follower of a moved task still follows its
   links once the delays are written, so the pass repeats on the plan with
-  its delays written while a round still resolves something (fewer
-  overbooked resources, or lower peaks, on the committed schedule), drops a
-  round that resolves nothing (a follower moving in lockstep with its
-  predecessor would ask for more delay for ever), and reports a conflict
-  that remains as overallocated: a later pass resolves it only with the
+  its delays written while a round still changes the overallocation
+  (`schedule::overallocation`: a smaller overbooked extent on the committed
+  schedule, or conflicts not seen before, as when one is traded for
+  another), drops a round that leaves the same conflicts (a follower moving
+  in lockstep with its predecessor would ask for more delay for ever), and
+  reports a conflict that remains as overallocated: a later pass resolves it only with the
   follower in its scope or with `clear_first` off, the default rebuilding the
   same cleared plan); an ALAP task is neither delayed nor
   booked (Project 2024 refuses a delay on one, measured, so the schedule
@@ -503,10 +504,17 @@
   predecessors by its late start less the delay, the late finish following
   through the task's working span (`late_bounds_before_delay`, on direct and
   summary links alike), so they report the zero slack Project 2024 shows
-  them (measured). The leveler rebuilds a movable task's kept delay the same
-  way, from its shifted driven start (`Schedule::delay_driven`) plus the
-  delay, snapped, and a summary link's free-slack bound takes each
-  successor's delay before the group's minimum.
+  them (measured). The leveler places a task from where its links drive it
+  after its predecessors' moves (`Schedule::link_driven` shifted by the
+  largest predecessor delay), never before its constraints, so a Start No
+  Earlier Than that absorbs the move adds no delay; a kept delay is rebuilt
+  the same way from that start (`Schedule::delay_driven` when no
+  predecessor moved) plus the delay, snapped on the task's own calendar, and
+  its own increment is measured from the unsnapped delayed instant, so the
+  forward pass's one snap of driven + kept + own lands on the placement. A
+  summary link's free-slack bound takes each successor's delay before the
+  group's minimum; the timeline's horizon budgets stored delays; equal
+  priorities level in readiness order.
 - `Editor::level_tasks(&LevelTarget::{All, Selection, Resource})`
   (`level_tasks_with` takes `LevelOptions` for one pass) writes
   `leveling_delay` (format 8) and `pre_leveled_start/finish` (from the plan

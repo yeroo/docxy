@@ -39,7 +39,7 @@
 //! | `level.all` | `{}` | `{leveled: true, overallocated}` (#1589): show the plan leveled, as Resource > Level > Level All's display overlay; `overallocated` counts the work resources still booked past their capacity. Not an undo step: the overlay is a display setting |
 //! | `level.clear` | `{}` | `{leveled: false, overallocated}` (#1589): show the plan as scheduled again. With `{uids: [uid…]}` or `{all: true}` (#1594) it is Clear Leveling as a plan edit instead: the tasks' stored `LevelingDelay` and pre-leveled dates are removed, one undo step, replying `{cleared, overallocated}` |
 //! | `level.overallocations` | `{}` | `{count, resources: [{uid, name, max_units, peak_units, first}]}` (#1589): the work resources booked past their capacity on the plan as shown, each with its peak (1.0 = 100%) and the first overallocated instant, earliest first (Next Overallocation) |
-//! | `level.selection` | `{uids: [uid…], options?}` | `{changed, delayed, overallocated, tasks: [{uid, leveling_delay_min, start}]}` (#1594): Level Selection as a plan edit. The leveler runs over the plan with only these tasks (a summary stands for its subtasks) free to move, every other task taking no delay of its own and booked at the dates the plan gives it now (an automatic one still follows its links once the delays are written, so the pass repeats while a round still resolves something and drops a round that resolves nothing; a conflict that remains is reported as overallocated, and a later pass resolves it only with the follower in its scope or with `clear_first` off), and writes each moved task's own `LevelingDelay` (elapsed minutes from the start its leveled predecessors drive it to, stored in tenths of a minute as Project does) and pre-leveled dates, one undo step. `changed` counts the tasks whose stored values changed (0 records no step), `delayed` those left with a delay, `tasks` every targeted leaf with its delay and start after the pass. The plan's Leveling Options apply |
+//! | `level.selection` | `{uids: [uid…], options?}` | `{changed, delayed, overallocated, tasks: [{uid, leveling_delay_min, start}]}` (#1594): Level Selection as a plan edit. The leveler runs over the plan with only these tasks (a summary stands for its subtasks) free to move, every other task taking no delay of its own and booked at the dates the plan gives it now (an automatic one still follows its links once the delays are written, so the pass repeats while a round still changes the overallocation (a smaller overbooked extent, or conflicts not seen before) and drops a round that leaves the same conflicts; a conflict that remains is reported as overallocated, and a later pass resolves it only with the follower in its scope or with `clear_first` off), and writes each moved task's own `LevelingDelay` (elapsed minutes from the start its leveled predecessors drive it to, stored in tenths of a minute as Project does) and pre-leveled dates, one undo step. `changed` counts the tasks whose stored values changed (0 records no step), `delayed` those left with a delay, `tasks` every targeted leaf with its delay and start after the pass. The plan's Leveling Options apply |
 //! | `level.resource` | `{resource, options?}` | the same reply (#1594): Level Resource, over the tasks the resource (a uid or a name) is assigned to. `options` (both verbs) is a `level.options` object applied to this pass only; the plan's options stay as they are. A task that only follows a delayed predecessor records no delay of its own, as Project does |
 //! | `level.options` | `{order?, within_slack?, adjust_assignments?, split?, clear_first?}` | `{order, within_slack, adjust_assignments, split, clear_first}` (#1594): Project's Leveling Options as plan options, read with `{}`, set as one undo step (an unchanged setting records none). `order` is `ID`, `Standard` (the default: dependencies, then the plan's row order) or `Priority` (the highest priority first; priority 1000 is never leveled); `within_slack` never delays a task past its total slack; `clear_first` (default true) drops the targeted tasks' stored delays before a pass, else it builds on them; `adjust_assignments` and `split` are kept with the plan, the leveler delaying whole tasks |
 //! | `cal.list` | `{}` | `{count, calendars: [{uid, name, base: {uid, name} \| null, default, resources: [uid…], tasks: [uid…]}]}` (#1605), base calendars first |
@@ -3417,8 +3417,6 @@ it"
         j.get(key).and_then(Json::as_f64).unwrap()
     }
 
-    /// Task 1, "Build", 5 days, typed `kind`, with stored (zero) totals; Ann
-    /// (1) at $50/h and $80/h on rate table B, Bob (2) at $30/h.
     /// #1594 r6: a reply's `start` is the committed one after a second
     /// round. X, P, H (after P, not selected) and M, one day each on one
     /// resource from Monday; Level Selection P and M: H follows P onto M
@@ -3471,6 +3469,8 @@ it"
         );
     }
 
+    /// Task 1, "Build", 5 days, typed `kind`, with stored (zero) totals; Ann
+    /// (1) at $50/h and $80/h on rate table B, Bob (2) at $30/h.
     fn staffed(kind: projcore::model::TaskType, effort_driven: bool) -> Editor {
         use projcore::model::{RateEntry, Resource};
         let mut p = new_project();
