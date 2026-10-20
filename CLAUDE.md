@@ -545,12 +545,14 @@
   working-lag link's is its CPM demand shifted by that predecessor's own
   placement delay in the default calendar's index (the leveler's booking
   space), an elapsed lag's counts from the predecessor's leveled instant, a
-  summary's never pulls before its CPM demand; the latest wins, snapped on
-  the task's own calendar, and a same-calendar FS milestone keeps its
-  predecessor's finish instant. That demand goes through the task's own
-  constraint as the forward pass applies it: an honored Must Start/Finish On
-  keeps its date, an honored Start/Finish No Later Than takes the earlier of
-  demand and cap, every other constraint is a floor the demand may pass; so
+  summary's never pulls before its CPM demand; the latest wins (demands on
+  one index by instant), snapped on the task's own calendar, and a
+  same-calendar FS milestone keeps its predecessor's finish instant. That
+  demand goes through the task's own constraint as the forward pass applies
+  it: an honored Must Start/Finish On keeps its date, an honored Start/Finish
+  No Later Than takes the earlier of demand and cap (a binding cap holds a
+  milestone at the constraint's own instant), every other constraint is a
+  floor the demand may pass; so
   a Start No Earlier Than, a cap, or another predecessor that still drives
   later absorbs the move and the task takes no delay
   (`Schedule::delay_driven` holds the start a stored delay was added to). A
@@ -561,7 +563,10 @@
   moved is estimated at the default calendar's next working minute (its
   committed dates are the forward pass's), so its own delay there may need a
   further pass. `Schedule::start_before_delay` is what Move Task counts
-  from, so a saved delay is not added twice. A
+  from, an inactive task's included, so a saved delay is not added twice. A
+  delayed milestone's late bound keeps its predecessor's finish instant on an
+  FS link only; on a start-type link the inverse walks the forward pass's
+  snap back. A
   summary link's free-slack bound takes each successor's delay before the
   group's minimum; the timeline's horizon budgets stored delays; equal
   priorities level in readiness order.
