@@ -132,11 +132,12 @@ impl Editor {
         // task, so the pass repeats on the plan with its delays written,
         // building on them, while a round still changes the overallocation:
         // a smaller overbooked extent, or conflicts the pass has not seen
-        // (one traded for another, which a later round may clear). A round
-        // that leaves the same conflicts, or ones seen before, is dropped: a
-        // follower that moves in lockstep with its predecessor
-        // (Start-to-Start, say) would ask for one more step for ever (#1594
-        // r6, r7). Bounded by the finite conflict states, not a count.
+        // (one traded for another, heavier or not, which a later round may
+        // clear). A round that leaves the same conflicts, or ones seen
+        // before, is dropped: a follower that moves in lockstep with its
+        // predecessor (Start-to-Start, say) would ask for one more step for
+        // ever (#1594 r6 to r8). Bounded by the finite conflict states, not
+        // a count, and the pass ends on the lightest plan it reached.
         let mut trial = self.proj.clone();
         for t in &mut trial.tasks {
             if in_scope(t.uid) && options.clear_first && !is_alap(t) {
@@ -152,6 +153,10 @@ impl Editor {
         };
         let mut before = pressure(&trial);
         let mut seen = vec![before.conflicts.clone()];
+        // The lightest plan the rounds reach: a trade may leave a heavier
+        // conflict than it resolved, and the pass never ends worse than
+        // its best.
+        let mut best = (before.extent, trial.clone());
         loop {
             let leveled = level_with(
                 &trial,
@@ -180,15 +185,23 @@ impl Editor {
             }
             let after = pressure(&round);
             let resolves = after.extent < before.extent - 1e-6;
-            let trades = after.extent <= before.extent + 1e-6
-                && after.conflicts != before.conflicts
-                && !seen.contains(&after.conflicts);
+            // A trade goes on whatever its weight (#1594 r8): the follower
+            // it uncovers may be heavier or longer than the conflict it
+            // resolved, and the next round clears it; the unseen conflict
+            // states bound the loop.
+            let trades = after.conflicts != before.conflicts && !seen.contains(&after.conflicts);
             if !(resolves || trades) {
                 break;
             }
             seen.push(after.conflicts.clone());
             trial = round;
             before = after;
+            if before.extent < best.0 - 1e-6 {
+                best = (before.extent, trial.clone());
+            }
+        }
+        if before.extent > best.0 + 1e-6 {
+            trial = best.1;
         }
         // What the trial holds for each targeted leaf, against the plan.
         let mut plan: Vec<DelayEdit> = Vec::new();
@@ -1090,6 +1103,213 @@ mod tests {
             DateTime::from_minutes(anchor.minutes() + 4 * 1440),
             "B Friday"
         );
+    }
+
+    /// #1594 r8: a follower another predecessor still drives takes no
+    /// delay and starts where that predecessor drives it, with nothing
+    /// overbooked: X and A share Ann from Monday, B (three days, no
+    /// resource) runs beside them, T follows A and B on Bob, D holds Bob on
+    /// Friday. Level Selection X, A, B, T.
+    #[test]
+    fn a_follower_another_predecessor_still_drives_takes_no_delay() {
+        let mut p = staffed().project().clone();
+        for t in &mut p.tasks {
+            t.duration_min = 480;
+        }
+        let anchor = p.start_date.unwrap();
+        // Build = X, Paint = A, Trim = B (three days, no resource); T and D are new, on Bob.
+        p.tasks[2].duration_min = 3 * 480;
+        p.assignments.retain(|a| a.task_uid != 3);
+        p.resources.push(Resource {
+            uid: 2,
+            id: 2,
+            name: "Bob".into(),
+            max_units: 1.0,
+            ..Resource::default()
+        });
+        let mut t = Task {
+            uid: 4,
+            id: 4,
+            name: "T".into(),
+            outline_level: 1,
+            duration_min: 480,
+            ..Task::default()
+        };
+        t.predecessors.push(Predecessor::fs(2));
+        t.predecessors.push(Predecessor::fs(3));
+        p.tasks.push(t);
+        p.tasks.push(Task {
+            uid: 5,
+            id: 5,
+            name: "D".into(),
+            outline_level: 1,
+            duration_min: 480,
+            constraint: crate::model::ConstraintType::StartNoEarlierThan,
+            constraint_date: Some(DateTime::from_minutes(anchor.minutes() + 4 * 1440)),
+            ..Task::default()
+        });
+        for uid in [4, 5] {
+            p.assignments.push(Assignment {
+                uid,
+                task_uid: uid,
+                resource_uid: 2,
+                units: 1.0,
+                ..Assignment::default()
+            });
+        }
+        let mut ed = Editor::new(p);
+        let out = ed
+            .level_tasks(&LevelTarget::Selection(vec![1, 2, 3, 4]))
+            .unwrap();
+        assert_eq!((out.changed, out.delayed, out.overallocated), (1, 1, 0));
+        assert_eq!(
+            ed.project().task(2).unwrap().leveling_delay,
+            Some(1440 * 10),
+            "A: Tuesday"
+        );
+        assert_eq!(
+            ed.project().task(4).unwrap().leveling_delay,
+            None,
+            "T: B drives it"
+        );
+        assert_eq!(
+            start(&ed, 4),
+            DateTime::from_minutes(anchor.minutes() + 3 * 1440),
+            "Thursday"
+        );
+    }
+
+    /// #1594 r8: a trade that uncovers a heavier conflict is kept and the
+    /// next round clears it. X (50%) and A (100%), one hour each on Ann from
+    /// Monday 08:00; H (unselected) follows A on Bob for an hour; B
+    /// (selected) needs Bob for an hour from 10:00. A moves to 09:00; H
+    /// follows onto B at 10:00, a heavier conflict than the one resolved;
+    /// round two moves B to 11:00.
+    #[test]
+    fn a_trade_for_a_heavier_conflict_is_kept_and_cleared_next_round() {
+        let mut p = staffed().project().clone();
+        let anchor = p.start_date.unwrap();
+        // Build = X (50%), Paint = A, Trim = H (after A, on Bob); B is new, on Bob from 10:00.
+        for t in &mut p.tasks {
+            t.duration_min = 60;
+        }
+        p.assignments[0].units = 0.5;
+        p.tasks[2].predecessors.push(Predecessor::fs(2));
+        p.assignments[2].resource_uid = 2;
+        p.resources.push(Resource {
+            uid: 2,
+            id: 2,
+            name: "Bob".into(),
+            max_units: 1.0,
+            ..Resource::default()
+        });
+        p.tasks.push(Task {
+            uid: 4,
+            id: 4,
+            name: "B".into(),
+            outline_level: 1,
+            duration_min: 60,
+            constraint: crate::model::ConstraintType::StartNoEarlierThan,
+            constraint_date: Some(DateTime::from_minutes(anchor.minutes() + 120)),
+            ..Task::default()
+        });
+        p.assignments.push(Assignment {
+            uid: 4,
+            task_uid: 4,
+            resource_uid: 2,
+            units: 1.0,
+            ..Assignment::default()
+        });
+        let mut ed = Editor::new(p);
+        let out = ed.level_tasks(&LevelTarget::Selection(vec![2, 4])).unwrap();
+        assert_eq!((out.changed, out.delayed, out.overallocated), (2, 2, 0));
+        assert_eq!(
+            ed.project().task(2).unwrap().leveling_delay,
+            Some(60 * 10),
+            "A: 09:00"
+        );
+        assert_eq!(
+            ed.project().task(4).unwrap().leveling_delay,
+            Some(60 * 10),
+            "B: 11:00"
+        );
+        assert_eq!(
+            start(&ed, 3),
+            DateTime::from_minutes(anchor.minutes() + 120),
+            "H 10:00"
+        );
+        assert_eq!(
+            start(&ed, 4),
+            DateTime::from_minutes(anchor.minutes() + 180),
+            "B 11:00"
+        );
+    }
+
+    /// #1594 r8: an untouched conflict elsewhere does not hide a trade. U
+    /// and V (unselected) overlap on Ann on Monday; X (unselected) and A
+    /// (selected) start Tuesday; H (unselected) follows A; B (selected) is
+    /// held to Thursday. Round one moves A to Thursday and B to Friday,
+    /// where H lands on B; round two moves B past H. Monday's pair stays,
+    /// reported.
+    #[test]
+    fn an_untouched_conflict_does_not_hide_a_trade() {
+        let mut p = staffed().project().clone();
+        let anchor = p.start_date.unwrap();
+        let day = |n: i64| DateTime::from_minutes(anchor.minutes() + n * 1440);
+        for t in &mut p.tasks {
+            t.duration_min = 480;
+        }
+        // Build = U, Paint = V (both Monday), Trim = X (Tuesday); A, H, B are new.
+        p.tasks[2].constraint = crate::model::ConstraintType::StartNoEarlierThan;
+        p.tasks[2].constraint_date = Some(day(1));
+        let mut a = Task {
+            uid: 4,
+            id: 4,
+            name: "A".into(),
+            outline_level: 1,
+            duration_min: 480,
+            constraint: crate::model::ConstraintType::StartNoEarlierThan,
+            constraint_date: Some(day(1)),
+            ..Task::default()
+        };
+        a.predecessors.clear();
+        let mut h = Task {
+            uid: 5,
+            id: 5,
+            name: "H".into(),
+            outline_level: 1,
+            duration_min: 480,
+            ..Task::default()
+        };
+        h.predecessors.push(Predecessor::fs(4));
+        let b = Task {
+            uid: 6,
+            id: 6,
+            name: "B".into(),
+            outline_level: 1,
+            duration_min: 480,
+            constraint: crate::model::ConstraintType::StartNoEarlierThan,
+            constraint_date: Some(day(3)),
+            ..Task::default()
+        };
+        p.tasks.extend([a, h, b]);
+        for uid in [4, 5, 6] {
+            p.assignments.push(Assignment {
+                uid,
+                task_uid: uid,
+                resource_uid: 1,
+                units: 1.0,
+                ..Assignment::default()
+            });
+        }
+        let mut ed = Editor::new(p);
+        let out = ed.level_tasks(&LevelTarget::Selection(vec![4, 6])).unwrap();
+        assert_eq!((out.changed, out.delayed, out.overallocated), (2, 2, 1));
+        assert_eq!(start(&ed, 4), day(3), "A Thursday");
+        assert_eq!(start(&ed, 5), day(4), "H Friday");
+        assert_eq!(start(&ed, 6), day(7), "B the next Monday, past H");
+        assert_eq!(start(&ed, 1), anchor, "U untouched");
+        assert_eq!(start(&ed, 2), anchor, "V untouched");
     }
 
     /// #1594 r4: a follower whose own constraint already holds it takes no

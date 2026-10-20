@@ -1331,6 +1331,13 @@ impl<'a> Scheduler<'a> {
         if delay == 0 {
             return (sls, slf);
         }
+        if successor.duration_min == 0 {
+            // A milestone keeps its predecessor's finish instant and adds
+            // the delay from there (the forward pass's FS milestone rule), so
+            // the bound is that instant, a period's end included (#1594 r8).
+            let at = sls.saturating_sub(delay);
+            return (at, at);
+        }
         let tl = self.tl(successor);
         let span = tl.to_index(slf) - tl.to_index(sls);
         // The latest working start whose snapped delayed start is still at
@@ -3515,11 +3522,12 @@ pub fn overbooked(
 }
 
 /// The overallocation a plan holds, for the leveling pass's progress test
-/// (#1594 r7): the overbooked extent (over every stretch a work resource is
-/// booked past its capacity, the excess times its length, in units times
+/// (#1594 r7, r8): the overbooked extent (over every stretch a work resource
+/// is booked past its capacity, the excess times its length, in units times
 /// working minutes) and the conflicts themselves (each overbooked resource
-/// with the tasks booked at its first overbooked instant), so a round that
-/// only moves a conflict along is told from one that resolves or trades it.
+/// with the tasks booked over each of its overbooked stretches, dates left
+/// out), so a round that only moves a conflict along is told from one that
+/// resolves or trades it, also behind an untouched conflict elsewhere.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Overallocation {
     pub extent: f64,
@@ -4005,7 +4013,9 @@ impl Scheduler<'_> {
             let s_idx = tl.to_index(start.minutes());
             for &(rid, units, from, end) in res {
                 let (s, e) = if fixed(t) {
-                    (s_idx, tl.to_index(finish.minutes()))
+                    // As `book` books it: from the assignment's delay into
+                    // the task to the task's finish (#1594 r8).
+                    (s_idx + from, tl.to_index(finish.minutes()))
                 } else {
                     (s_idx + from, s_idx + end)
                 };
@@ -4023,7 +4033,6 @@ impl Scheduler<'_> {
                 .collect();
             points.sort_unstable();
             points.dedup();
-            let mut first: Option<Vec<i32>> = None;
             for pair in points.windows(2) {
                 let (p, next) = (pair[0], pair[1]);
                 let covering: Vec<&(i64, i64, f64, i32)> =
@@ -4032,17 +4041,11 @@ impl Scheduler<'_> {
                 let excess = load - capacity_at(cap, p);
                 if excess > 1e-9 {
                     out.extent += excess * (next - p) as f64;
-                    if first.is_none() {
-                        let mut tasks: Vec<i32> =
-                            covering.iter().map(|&&(_, _, _, uid)| uid).collect();
-                        tasks.sort_unstable();
-                        tasks.dedup();
-                        first = Some(tasks);
-                    }
+                    let mut tasks: Vec<i32> = covering.iter().map(|&&(_, _, _, uid)| uid).collect();
+                    tasks.sort_unstable();
+                    tasks.dedup();
+                    out.conflicts.insert((*rid, tasks));
                 }
-            }
-            if let Some(tasks) = first {
-                out.conflicts.insert((*rid, tasks));
             }
         }
         out
@@ -4202,40 +4205,123 @@ impl Scheduler<'_> {
                 .max()
                 .unwrap_or(0);
             // Where the task's links drive it once its predecessors have
-            // moved (#1594 r7): their CPM demand shifted by the largest
-            // predecessor delay, never before the start its constraints give
-            // it, which may absorb the move (a Start No Earlier Than later
-            // than the shifted link). With no predecessor moved the CPM start
-            // is exact.
-            let link_now = base.link_driven(t.uid).map(|at| tl.to_index(at) + floor);
+            // moved (#1594 r7, r8): each link's demand rebuilt as the forward
+            // pass builds it, on the task's own calendar, the latest winning,
+            // so another predecessor that still drives later absorbs a move.
+            // A working-lag link's demand is its CPM demand shifted by the
+            // predecessor's own placement delay, in the default timeline's
+            // index the leveler books in (a predecessor on another calendar
+            // has no exact leveled endpoint there); an elapsed lag counts
+            // wall-clock time from the leveled instant (#104); a summary's
+            // demand never pulls before its CPM one. With no predecessor
+            // moved this is the CPM start exactly.
+            let succ_tl = self.tl(t);
+            let link_span = self.scheduled_span(i);
+            let cand = |link: LinkType, ps_abs: i64, pf_abs: i64, lag: i64| -> i64 {
+                match link {
+                    LinkType::FinishStart if t.duration_min == 0 => {
+                        fs_milestone_instant(succ_tl, pf_abs, lag)
+                    }
+                    LinkType::FinishStart => succ_tl.abs_start(succ_tl.to_index(pf_abs) + lag),
+                    LinkType::StartStart => succ_tl.abs_start(succ_tl.to_index(ps_abs) + lag),
+                    LinkType::FinishFinish => {
+                        let cf = succ_tl.abs_finish(succ_tl.to_index(pf_abs) + lag);
+                        succ_tl.abs_start(succ_tl.to_index(cf) - link_span)
+                    }
+                    LinkType::StartFinish => {
+                        succ_tl.abs_start(sf_bound(succ_tl, ps_abs, lag).0 - link_span)
+                    }
+                }
+            };
+            let demand = |offset: Offset, link: LinkType, s: i64, f: i64| -> i64 {
+                let (f, lag) = offset.forward(f);
+                let (s, _) = offset.forward(s);
+                cand(link, s, f, lag)
+            };
+            // (the demand's index in the default timeline, its instant on
+            // the task's calendar), the latest link winning.
+            let link_now = graph
+                .incoming
+                .get(&t.uid)
+                .into_iter()
+                .flatten()
+                .filter_map(|p| {
+                    let pred_task = &self.proj.tasks[graph.by_uid[&p.uid]];
+                    let (now_start, now_finish) = if pred_task.summary {
+                        self.leveled_span(p.uid, &graph, &start, &finish)?
+                    } else {
+                        (start.get(&p.uid)?.minutes(), finish.get(&p.uid)?.minutes())
+                    };
+                    let pred = base.get(p.uid)?;
+                    let (was_start, was_finish) =
+                        (pred.early_start.minutes(), pred.early_finish.minutes());
+                    let now_offset =
+                        self.effective_offset(p, &graph, Some((now_start, now_finish)));
+                    let was_offset =
+                        self.effective_offset(p, &graph, Some((was_start, was_finish)));
+                    let was = demand(was_offset, p.link, was_start, was_finish);
+                    let now = demand(now_offset, p.link, now_start, now_finish);
+                    Some(if pred_task.summary {
+                        let at = if tl.to_index(now) > tl.to_index(was) {
+                            now
+                        } else {
+                            was
+                        };
+                        (tl.to_index(at), at)
+                    } else if matches!(now_offset, Offset::Elapsed(_)) {
+                        (tl.to_index(now), now)
+                    } else {
+                        let idx = tl.to_index(was) + delay.get(&p.uid).copied().unwrap_or(0);
+                        (idx, succ_tl.snap(tl.abs_start(idx)))
+                    })
+                })
+                .max_by_key(|(idx, _)| *idx);
             // The start before any stored delay: the one the forward pass
-            // added the delay to, else the CPM start.
-            let before_delay_idx = base
+            // added the delay to, else the CPM start; both on the task's own
+            // calendar, constraints included.
+            let before_delay_abs = base
                 .delay_driven(t.uid)
-                .map_or(cpm_start_idx, |at| tl.to_index(at));
-            let base_idx = match link_now {
-                Some(linked) if floor > 0 => linked.max(before_delay_idx),
-                _ => before_delay_idx,
+                .unwrap_or(cpm.early_start.minutes());
+            let before_delay_idx = tl.to_index(before_delay_abs);
+            // The driven start now. Where the links, or a floor constraint
+            // (Start No Earlier Than), set the CPM start, it is the later of
+            // the links' rebuilt demand and that start. Where a cap (Start or
+            // Finish No Later Than, Must Start or Finish On) or a milestone's
+            // instant pulled the CPM start before the links' demand, the
+            // start is shifted by the links' move instead, as before: the cap
+            // is the forward pass's to apply.
+            let cpm_link_idx = base.link_driven(t.uid).map(|at| tl.to_index(at));
+            let (driven_now_abs, base_idx) = match (link_now, cpm_link_idx) {
+                (Some((linked_idx, linked_abs)), Some(cpm_link))
+                    if cpm_link <= before_delay_idx =>
+                {
+                    if linked_idx > before_delay_idx {
+                        (linked_abs, linked_idx)
+                    } else {
+                        (before_delay_abs, before_delay_idx)
+                    }
+                }
+                (Some((linked_idx, _)), Some(cpm_link)) => {
+                    let shifted = before_delay_idx + (linked_idx - cpm_link).max(0);
+                    (tl.abs_start(shifted), shifted)
+                }
+                _ => (before_delay_abs, before_delay_idx),
             };
             // A movable task that carries a stored delay (a pass without
             // `clear_first`, or a later round of the editor's repeat) was
             // scheduled as its driven start plus the elapsed delay, snapped
-            // on its own calendar. Its predecessors' shift moves that driven
-            // start, not the delayed one, so the delayed start is rebuilt
-            // the same way (#1594 r6, r7); `delayed_abs` is the unsnapped
+            // on its own calendar; it is rebuilt the same way from the driven
+            // start now (#1594 r6 to r8). `delayed_abs` is the unsnapped
             // delayed instant the task's own delay is measured from.
             let stored_delay = base
                 .delay_driven(t.uid)
                 .filter(|_| !fixed(t))
-                .map(|at| (at, t.leveling_delay.unwrap_or(0).max(0) / 10))
-                .filter(|(_, delay)| *delay > 0);
+                .map(|_| t.leveling_delay.unwrap_or(0).max(0) / 10)
+                .filter(|delay| *delay > 0);
             let (earliest, delayed_abs) = match stored_delay {
-                Some((_, delay)) if floor > 0 => {
-                    let delayed = tl.abs_start(base_idx).saturating_add(delay);
-                    (tl.to_index(self.tl(t).snap(delayed)), Some(delayed))
-                }
-                Some((driven_was, delay)) => {
-                    (cpm_start_idx, Some(driven_was.saturating_add(delay)))
+                Some(delay) => {
+                    let delayed = driven_now_abs.saturating_add(delay);
+                    (tl.to_index(succ_tl.snap(delayed)), Some(delayed))
                 }
                 None => (base_idx, None),
             };
@@ -9702,6 +9788,150 @@ mod tests {
             "Thursday: Tuesday plus two days"
         );
         assert_eq!(sched.get(1).unwrap().free_slack_min, 0);
+    }
+
+    /// #1594 r8: a follower another predecessor still drives takes no
+    /// delay. X and A (one day each) share R1 from Monday; B (three days,
+    /// no resource) runs beside them; T (one day, R2) follows A and B; D
+    /// (unselected, R2) holds Friday. Levelling X, A, B and T moves A to
+    /// Tuesday, but B drives T to Thursday whatever A does, and Thursday is
+    /// free on R2: T stays there with no delay of its own.
+    #[test]
+    fn a_follower_another_predecessor_still_drives_takes_no_delay() {
+        let mut t = task(4, "T", 480);
+        t.predecessors.push(fs(2));
+        t.predecessors.push(fs(3));
+        let mut d = task(5, "D", 480);
+        d.constraint = ConstraintType::StartNoEarlierThan;
+        d.constraint_date = Some(at(6, 8));
+        let proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![
+                task(1, "X", 480),
+                task(2, "A", 480),
+                task(3, "B", 3 * 480),
+                t,
+                d,
+            ],
+            resources: vec![worker(1, "R1", 1.0), worker(2, "R2", 1.0)],
+            assignments: vec![
+                assign(1, 1, 1, 1.0),
+                assign(2, 2, 1, 1.0),
+                assign(4, 4, 2, 1.0),
+                assign(5, 5, 2, 1.0),
+            ],
+            ..Project::default()
+        };
+        let four: std::collections::HashSet<i32> = [1, 2, 3, 4].into_iter().collect();
+        let lv = level_with(
+            &proj,
+            &LevelScope {
+                movable: Some(&four),
+                ..LevelScope::default()
+            },
+        );
+        assert_eq!(lv.start(2), Some(at(3, 8)), "A Tuesday");
+        assert_eq!(lv.start(4), Some(at(5, 8)), "T Thursday, after B");
+        assert_eq!(lv.delay_min(4), Some(0));
+    }
+
+    /// #1594 r8: a kept delay follows a moved predecessor on the task's own
+    /// calendar. X and P (one day each) share R1 from Monday; T (24 Hours,
+    /// eight hours, R2) follows P with a stored eight-hour delay. P moves to
+    /// Tuesday, so T's driven start is Tuesday 17:00 on its own calendar and
+    /// its delay lands it Wednesday 01:00, where the forward pass puts it
+    /// once P's delay is written; T adds nothing of its own.
+    #[test]
+    fn a_kept_delay_follows_a_moved_predecessor_on_the_tasks_own_calendar() {
+        let mut cal = Calendar::standard(3);
+        cal.name = "24 Hours".into();
+        for day in cal.week.iter_mut().flatten() {
+            day.times = vec![WorkingTime { from: 0, to: 1440 }];
+        }
+        let mut t = task(3, "T", 480);
+        t.calendar_uid = Some(3);
+        t.predecessors.push(fs(2));
+        t.leveling_delay = Some(480 * 10);
+        t.leveling_delay_format = Some(8);
+        let proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![task(1, "X", 480), task(2, "P", 480), t],
+            calendars: vec![Calendar::standard(1), cal],
+            resources: vec![worker(1, "R1", 1.0), worker(2, "R2", 1.0)],
+            assignments: vec![
+                assign(1, 1, 1, 1.0),
+                assign(2, 2, 1, 1.0),
+                assign(3, 3, 2, 1.0),
+            ],
+            ..Project::default()
+        };
+        let p_and_t: std::collections::HashSet<i32> = [2, 3].into_iter().collect();
+        let lv = level_with(
+            &proj,
+            &LevelScope {
+                movable: Some(&p_and_t),
+                ..LevelScope::default()
+            },
+        );
+        assert_eq!(lv.start(2), Some(at(3, 8)), "P Tuesday");
+        // The leveler books in the default calendar's index space, so its
+        // estimate of T is that calendar's next working minute plus the kept
+        // delay (Wednesday 16:00), not the committed Wednesday 01:00; what
+        // matters is that it asks for no delay of T's own, and the committed
+        // plan below is the forward pass's.
+        assert_eq!(lv.start(3), Some(at(4, 16)));
+        assert_eq!(lv.delay_min(3), Some(0));
+        // The committed plan agrees once P's delay is written.
+        let mut written = proj.clone();
+        written.tasks[1].leveling_delay = Some(1440 * 10);
+        written.tasks[1].leveling_delay_format = Some(8);
+        assert_eq!(
+            schedule(&written).get(3).unwrap().early_start,
+            DateTime::from_ymd_hm(2026, 3, 4, 1, 0)
+        );
+    }
+
+    /// #1594 r8: the overallocation measure books a fixed task as `book`
+    /// does, from its assignment's delay: M is pinned Tuesday 08:00 to 12:00
+    /// with a two-hour assignment delay, so R is free until 10:00 and A
+    /// (Tuesday 08:00 to 09:00) conflicts with nothing.
+    #[test]
+    fn overallocation_books_a_fixed_task_from_its_assignment_delay() {
+        let mut a = task(1, "A", 60);
+        a.constraint = ConstraintType::StartNoEarlierThan;
+        a.constraint_date = Some(at(3, 8));
+        let mut m_assign = assign(2, 2, 1, 1.0);
+        m_assign.delay = Some(120 * 10);
+        let proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![a, manual(2, "M", 240, at(3, 8))],
+            resources: vec![worker(1, "R", 1.0)],
+            assignments: vec![assign(1, 1, 1, 1.0), m_assign],
+            ..Project::default()
+        };
+        let s = schedule(&proj);
+        let shown = |uid: i32| s.get(uid).map(|r| (r.early_start, r.early_finish));
+        assert!(overbookings(&proj, shown).is_empty());
+        let over = overallocation(&proj, shown);
+        assert_eq!(over.extent, 0.0);
+        assert!(over.conflicts.is_empty());
+    }
+
+    /// #1594 r8: a delayed milestone's bound is its predecessor's finish
+    /// instant: P, A (one day each) and M (a milestone after A with a
+    /// one-hour delay). A finishes Tuesday 17:00 and M is Wednesday 08:00;
+    /// A's slack is zero, not a minute negative.
+    #[test]
+    fn a_delayed_milestones_predecessor_keeps_zero_slack() {
+        let mut a = task(2, "A", 480);
+        a.predecessors.push(fs(1));
+        let mut m = task(3, "M", 0);
+        m.predecessors.push(fs(2));
+        m.leveling_delay = Some(60 * 10);
+        m.leveling_delay_format = Some(8);
+        let s = schedule(&march2(vec![task(1, "P", 480), a, m]));
+        assert_eq!(s.get(3).unwrap().early_start, at(4, 8), "Wednesday 08:00");
+        assert_eq!(s.get(2).unwrap().total_slack_min, 0);
     }
 
     /// #1594 r7: a kept delay on another calendar is rebuilt there. P

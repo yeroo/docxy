@@ -516,10 +516,12 @@
   links once the delays are written, so the pass repeats on the plan with
   its delays written while a round still changes the overallocation
   (`schedule::overallocation`: a smaller overbooked extent on the committed
-  schedule, or conflicts not seen before, as when one is traded for
-  another), drops a round that leaves the same conflicts (a follower moving
-  in lockstep with its predecessor would ask for more delay for ever), and
-  reports a conflict that remains as overallocated: a later pass resolves it only with the
+  schedule, or conflicts not seen before, as when one is traded for another,
+  heavier or not; every overbooked stretch's tasks make the signature, dates
+  left out), drops a round that leaves the same conflicts (a follower moving
+  in lockstep with its predecessor would ask for more delay for ever), ends
+  on the lightest plan it reached, and reports a conflict that remains as
+  overallocated: a later pass resolves it only with the
   follower in its scope or with `clear_first` off, the default rebuilding the
   same cleared plan); an ALAP task is neither delayed nor
   booked (Project 2024 refuses a delay on one, measured, so the schedule
@@ -535,14 +537,21 @@
   predecessors by its late start less the delay, the late finish following
   through the task's working span (`late_bounds_before_delay`, on direct and
   summary links alike), so they report the zero slack Project 2024 shows
-  them (measured). The leveler places a task from where its links drive it
-  after its predecessors' moves (`Schedule::link_driven` shifted by the
-  largest predecessor delay), never before its constraints, so a Start No
-  Earlier Than that absorbs the move adds no delay; a kept delay is rebuilt
-  the same way from that start (`Schedule::delay_driven` when no
-  predecessor moved) plus the delay, snapped on the task's own calendar, and
+  them (measured; a delayed milestone's bound is its predecessor's finish
+  instant). The leveler places a task from where its links drive it after
+  its predecessors' moves: each link's demand rebuilt from the predecessor's
+  leveled endpoint as the forward pass builds it, on the task's own
+  calendar, the latest winning, never before the constrained CPM start
+  (`Schedule::delay_driven` holds the start a stored delay was added to), so
+  a Start No Earlier Than or another predecessor that still drives later
+  absorbs the move and the task takes no delay; a kept delay is rebuilt from
+  that driven start plus the delay, snapped on the task's own calendar, and
   its own increment is measured from the unsnapped delayed instant, so the
-  forward pass's one snap of driven + kept + own lands on the placement. A
+  forward pass's one snap of driven + kept + own lands on the placement. The
+  leveler books in the default calendar's index: a task on another calendar
+  whose predecessor moved is estimated at that calendar's next working minute
+  (its committed dates are the forward pass's), so its own delay there may
+  need a further pass. A
   summary link's free-slack bound takes each successor's delay before the
   group's minimum; the timeline's horizon budgets stored delays; equal
   priorities level in readiness order.
