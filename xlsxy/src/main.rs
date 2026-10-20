@@ -3733,6 +3733,9 @@ impl App {
             return Ok(false);
         }
         if sync_headers {
+            // A formula written into a header names its column by its value,
+            // which only a recalculation has (Excel does the same).
+            self.rebuild_engine();
             self.sync_written_headers(&before);
         }
         let mut after = self.wb_snapshot();
@@ -3873,6 +3876,77 @@ impl App {
         self.apply_model_edits(&edits);
         before.model_edits = edits.iter().rev().map(ModelEdit::reversed).collect();
         after.model_edits = edits;
+        self.follow_tables_in_clip(before, after);
+    }
+
+    /// The pending copy's formulas follow the table renames, column renames
+    /// and column deletes that `before` and `after` differ in, as the cells'
+    /// do, so a paste after the edit names what exists. A copy naming a
+    /// table the edit removed (a delete of all its columns or rows, a
+    /// conversion) cannot be followed and is dropped. A cut the edit ended
+    /// is a copy by now ([`Self::cancel_cut`]) and follows the same way.
+    fn follow_tables_in_clip(&mut self, before: &WbSnapshot, after: &WbSnapshot) {
+        let Some(clip) = self.clip.as_mut() else {
+            return;
+        };
+        let same = |x: &String, y: &String| x.eq_ignore_ascii_case(y);
+        let mut dropped = false;
+        for b in &before.tables {
+            let a = after.tables.iter().find(|a| a.part == b.part);
+            let renamed: Vec<(String, String)> = match a {
+                Some(a) if a.columns.len() == b.columns.len() => (b.columns.iter().zip(&a.columns))
+                    .filter(|(x, y)| x != y)
+                    .map(|(x, y)| (x.clone(), y.clone()))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let deleted: Vec<bool> = match a {
+                Some(a) if a.columns.len() < b.columns.len() => (b.columns.iter())
+                    .map(|x| !a.columns.iter().any(|y| same(x, y)))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let table_rename = a
+                .filter(|a| a.name != b.name)
+                .map(|a| [(b.name.clone(), a.name.clone())]);
+            for (i, row) in clip.cells.iter_mut().enumerate() {
+                for (j, cell) in row.iter_mut().enumerate() {
+                    let Some(cell) = cell else { continue };
+                    let Some(src) = cell.formula.as_ref() else {
+                        continue;
+                    };
+                    let Ok(ast) = gridcore::formula::parse(src) else {
+                        continue;
+                    };
+                    let (r, c) = (clip.from.0 + i as u32, clip.from.1 + j as u32);
+                    let inside = b.contains(clip.sheet, r, c);
+                    let mut out = ast.clone();
+                    if a.is_none() {
+                        out = gridcore::formula::delete_table_in_expr(&out, &b.name, inside);
+                        dropped |= out != ast;
+                        continue;
+                    }
+                    if deleted.contains(&true) {
+                        out = gridcore::formula::delete_table_columns_in_expr(
+                            &out, &b.name, inside, &b.columns, &deleted,
+                        );
+                    } else if !renamed.is_empty() {
+                        out = gridcore::formula::rename_table_columns_in_expr(
+                            &out, &b.name, inside, &renamed,
+                        );
+                    }
+                    if let Some(map) = &table_rename {
+                        out = gridcore::formula::rename_tables_in_expr(&out, map);
+                    }
+                    if out != ast {
+                        cell.formula = Some(gridcore::formula::to_string(&out));
+                    }
+                }
+            }
+        }
+        if dropped {
+            self.clip = None;
+        }
     }
 
     /// Apply data-model `edits`, each only where the model still holds the
@@ -19280,6 +19354,61 @@ mod tests {
         assert_eq!(app.model_rels[0].from.1, "Qty");
         app.redo();
         assert!(app.model_measures[0].formula.contains("#REF!"));
+    }
+
+    #[test]
+    fn a_pending_copy_follows_a_table_and_column_rename_991() {
+        let mut app = header_app();
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.rename_table("Sales", "Revenue").unwrap();
+        app.apply_on(0, vec![(0, 1, parse_input("Units"))]);
+        app.cur = (4, 3);
+        app.paste();
+        let f = app.pkg.workbook.sheets[0].cell(4, 3).unwrap();
+        assert_eq!(f.formula.as_deref(), Some("SUM(Revenue[Units])"));
+        assert_eq!(f.value, CellValue::Number(7.0));
+    }
+
+    #[test]
+    fn a_pending_copy_follows_a_column_delete_and_drops_with_its_table_991() {
+        let mut app = header_app();
+        app.apply_on(0, vec![(0, 4, parse_input("=SUM(Sales[Item])"))]);
+        clip_range(&mut app, (0, 3), (0, 4), false);
+        app.cur = (0, 1);
+        app.anchor = None;
+        app.col_op(false); // the Qty column: D1:E1 moves to C1:D1
+        app.cur = (4, 3);
+        app.anchor = None;
+        app.paste();
+        let f = |c| {
+            app.pkg.workbook.sheets[0]
+                .cell(4, c)
+                .unwrap()
+                .formula
+                .clone()
+        };
+        assert!(f(3).unwrap().contains("#REF!"), "{:?}", f(3));
+        assert_eq!(f(4).as_deref(), Some("SUM(Sales[Item])"));
+        // Every column of the table deleted: the copy cannot name it.
+        let mut app = header_app();
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.cur = (0, 0);
+        app.anchor = Some((0, 1));
+        app.col_op(false);
+        assert!(app.clip.is_none());
+    }
+
+    #[test]
+    fn a_formula_replaced_into_a_header_names_the_column_by_its_value_991() {
+        let mut app = header_app();
+        app.structural_writing_cells(|wb| {
+            wb.sheets[0].set_cell(0, 1, Cell::formula("\"Units\"&1"));
+        });
+        assert_eq!(header_state(&app).1, ["Item", "Units1"]);
+        assert_eq!(header_state(&app).0, "Units1");
+        let b1 = app.pkg.workbook.sheets[0].cell(0, 1).unwrap();
+        assert!(b1.formula.is_none(), "the header is static text");
+        assert_eq!(header_state(&app).2, "SUM(Sales[Units1])");
     }
 
     #[test]
