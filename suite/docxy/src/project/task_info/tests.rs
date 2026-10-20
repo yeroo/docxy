@@ -1217,3 +1217,18 @@ fn a_row_with_a_type_or_lag_but_no_task_is_no_link() {
     dialog_click(&mut t, "OK").unwrap();
     assert!(preds(&t, 2).is_empty());
 }
+
+/// A dialog opens with the first control of its own page focused (#1314):
+/// Notes... lands in the note, not in the top row's Name (which is on every
+/// page), so typing a note cannot replace the task's name.
+#[test]
+fn the_dialog_opens_focused_on_its_own_page() {
+    let t = tab();
+    for (page, first) in [(InfoPage::General, "name"), (InfoPage::Notes, "notes")] {
+        let d = task_info_dialog(&v(&t).ed, 2, page).unwrap();
+        let mut stack = crate::dialog::DialogStack::default();
+        stack.push(d);
+        let d = stack.top().unwrap();
+        assert_eq!(d.focused().map(|c| c.name), Some(first));
+    }
+}

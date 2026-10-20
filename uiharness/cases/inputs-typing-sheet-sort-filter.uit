@@ -26,7 +26,7 @@ test sheet filter-menu/typed: focus by click
   call pointer-click {"region":"filter-button:A"}
   assert dialog is filter-menu
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"search"}
+  call real-key {"key":"tab","to-field":"search"}
   call field-read {"dialog-field":"typed"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"typed"}
@@ -66,7 +66,7 @@ test sheet filter-menu/search: focus by click
   call pointer-click {"region":"filter-button:A"}
   assert dialog is filter-menu
   call dialog-catalog-check {}
-  call pointer-click {"dialog-control":"typed"}
+  call real-key {"key":"tab","to-field":"typed"}
   call field-read {"dialog-field":"search"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"search"}
@@ -82,7 +82,7 @@ test sheet filter-menu/search: focus by Tab
   call pointer-click {"region":"filter-button:A"}
   assert dialog is filter-menu
   call dialog-catalog-check {}
-  call pointer-click {"dialog-control":"typed"}
+  call real-key {"key":"tab","to-field":"typed"}
   call field-read {"dialog-field":"search"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"search"}
@@ -234,7 +234,7 @@ test sheet custom-autofilter/op1: focus by click
   call dialog-click {"button":"Apply Filter"}
   assert dialog is custom-autofilter
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"val1"}
+  call real-key {"key":"tab","to-field":"val1"}
   call field-read {"dialog-field":"op1"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"op1"}
@@ -278,7 +278,7 @@ test sheet custom-autofilter/val1: focus by click
   call dialog-click {"button":"Apply Filter"}
   assert dialog is custom-autofilter
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"val2"}
+  call real-key {"key":"tab","to-field":"val2"}
   call field-read {"dialog-field":"val1"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"val1"}
@@ -296,7 +296,7 @@ test sheet custom-autofilter/val1: focus by Tab
   call dialog-click {"button":"Apply Filter"}
   assert dialog is custom-autofilter
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"val2"}
+  call real-key {"key":"tab","to-field":"val2"}
   call field-read {"dialog-field":"val1"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"val1"}
@@ -467,7 +467,7 @@ test sheet custom-autofilter/op2: focus by click
   call dialog-click {"button":"Apply Filter"}
   assert dialog is custom-autofilter
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"val1"}
+  call real-key {"key":"tab","to-field":"val1"}
   call field-read {"dialog-field":"op2"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"op2"}
@@ -511,7 +511,7 @@ test sheet custom-autofilter/val2: focus by click
   call dialog-click {"button":"Apply Filter"}
   assert dialog is custom-autofilter
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"val1"}
+  call real-key {"key":"tab","to-field":"val1"}
   call field-read {"dialog-field":"val2"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"val2"}
@@ -529,7 +529,7 @@ test sheet custom-autofilter/val2: focus by Tab
   call dialog-click {"button":"Apply Filter"}
   assert dialog is custom-autofilter
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"val1"}
+  call real-key {"key":"tab","to-field":"val1"}
   call field-read {"dialog-field":"val2"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"val2"}
@@ -695,7 +695,7 @@ test sheet top10-autofilter/which: focus by click
   call dialog-click {"button":"Apply Filter"}
   assert dialog is top10-autofilter
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"n"}
+  call real-key {"key":"tab","to-field":"n"}
   call field-read {"dialog-field":"which"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"which"}
@@ -739,7 +739,7 @@ test sheet top10-autofilter/n: focus by click
   call dialog-click {"button":"Apply Filter"}
   assert dialog is top10-autofilter
   call dialog-catalog-check {}
-  call pointer-click {"dialog-control":"which"}
+  call real-key {"key":"tab","to-field":"which"}
   call field-read {"dialog-field":"n"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"n"}
@@ -757,7 +757,7 @@ test sheet top10-autofilter/n: focus by Tab
   call dialog-click {"button":"Apply Filter"}
   assert dialog is top10-autofilter
   call dialog-catalog-check {}
-  call pointer-click {"dialog-control":"which"}
+  call real-key {"key":"tab","to-field":"which"}
   call field-read {"dialog-field":"n"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"n"}
@@ -946,7 +946,7 @@ test sheet top10-autofilter/unit: focus by click
   call dialog-click {"button":"Apply Filter"}
   assert dialog is top10-autofilter
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"n"}
+  call real-key {"key":"tab","to-field":"n"}
   call field-read {"dialog-field":"unit"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"unit"}
@@ -1006,9 +1006,6 @@ test sheet advanced-filter/list: focus by click
   call dialog-catalog-check {}
   call pointer-click {"dialog-field":"criteria"}
   call real-type {"text":"E1:E2"}
-  call pointer-click {"dialog-control":"action"}
-  call field-read {"dialog-field":"list"}
-  assert reply.focused is false
   call pointer-click {"dialog-field":"list"}
   call field-read {"dialog-field":"list"}
   assert reply.focused is true
@@ -1027,9 +1024,6 @@ test sheet advanced-filter/list: focus by Tab
   call dialog-catalog-check {}
   call pointer-click {"dialog-field":"criteria"}
   call real-type {"text":"E1:E2"}
-  call pointer-click {"dialog-control":"action"}
-  call field-read {"dialog-field":"list"}
-  assert reply.focused is false
   call real-key {"key":"tab","to-field":"list"}
   call field-read {"dialog-field":"list"}
   assert reply.focused is true
@@ -1225,7 +1219,7 @@ test sheet advanced-filter/criteria: focus by click
   call ribbon-click {"tab":"Data","command":"Advanced"}
   assert dialog is advanced-filter
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"copy"}
+  call real-key {"key":"tab","to-field":"copy"}
   call field-read {"dialog-field":"criteria"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"criteria"}
@@ -1244,7 +1238,7 @@ test sheet advanced-filter/criteria: focus by Tab
   call ribbon-click {"tab":"Data","command":"Advanced"}
   assert dialog is advanced-filter
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"copy"}
+  call real-key {"key":"tab","to-field":"copy"}
   call field-read {"dialog-field":"criteria"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"criteria"}
@@ -1426,7 +1420,7 @@ test sheet advanced-filter/copy: focus by click
   call ribbon-click {"tab":"Data","command":"Advanced"}
   assert dialog is advanced-filter
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"criteria"}
+  call real-key {"key":"tab","to-field":"criteria"}
   call field-read {"dialog-field":"copy"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"copy"}
@@ -1445,7 +1439,7 @@ test sheet advanced-filter/copy: focus by Tab
   call ribbon-click {"tab":"Data","command":"Advanced"}
   assert dialog is advanced-filter
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"criteria"}
+  call real-key {"key":"tab","to-field":"criteria"}
   call field-read {"dialog-field":"copy"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"copy"}
@@ -1612,7 +1606,7 @@ test sheet sort/by1: focus by click
   call ribbon-click {"tab":"Data","command":"Sort"}
   assert dialog is sort
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"with1"}
+  call real-key {"key":"tab","to-field":"with1"}
   call field-read {"dialog-field":"by1"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"by1"}
@@ -1648,7 +1642,7 @@ test sheet sort/on1: focus by click
   call ribbon-click {"tab":"Data","command":"Sort"}
   assert dialog is sort
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"with1"}
+  call real-key {"key":"tab","to-field":"with1"}
   call field-read {"dialog-field":"on1"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"on1"}
@@ -1684,7 +1678,7 @@ test sheet sort/order1: focus by click
   call ribbon-click {"tab":"Data","command":"Sort"}
   assert dialog is sort
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"with1"}
+  call real-key {"key":"tab","to-field":"with1"}
   call field-read {"dialog-field":"order1"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"order1"}
@@ -1720,7 +1714,7 @@ test sheet sort/with1: focus by click
   call ribbon-click {"tab":"Data","command":"Sort"}
   assert dialog is sort
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"with2"}
+  call real-key {"key":"tab","to-field":"with2"}
   call field-read {"dialog-field":"with1"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"with1"}
@@ -1734,7 +1728,7 @@ test sheet sort/with1: focus by Tab
   call ribbon-click {"tab":"Data","command":"Sort"}
   assert dialog is sort
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"with2"}
+  call real-key {"key":"tab","to-field":"with2"}
   call field-read {"dialog-field":"with1"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"with1"}
@@ -1858,7 +1852,7 @@ test sheet sort/by2: focus by click
   call ribbon-click {"tab":"Data","command":"Sort"}
   assert dialog is sort
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"with1"}
+  call real-key {"key":"tab","to-field":"with1"}
   call field-read {"dialog-field":"by2"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"by2"}
@@ -1894,7 +1888,7 @@ test sheet sort/on2: focus by click
   call ribbon-click {"tab":"Data","command":"Sort"}
   assert dialog is sort
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"with1"}
+  call real-key {"key":"tab","to-field":"with1"}
   call field-read {"dialog-field":"on2"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"on2"}
@@ -1930,7 +1924,7 @@ test sheet sort/order2: focus by click
   call ribbon-click {"tab":"Data","command":"Sort"}
   assert dialog is sort
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"with1"}
+  call real-key {"key":"tab","to-field":"with1"}
   call field-read {"dialog-field":"order2"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"order2"}
@@ -1966,7 +1960,7 @@ test sheet sort/with2: focus by click
   call ribbon-click {"tab":"Data","command":"Sort"}
   assert dialog is sort
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"with1"}
+  call real-key {"key":"tab","to-field":"with1"}
   call field-read {"dialog-field":"with2"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"with2"}
@@ -1980,7 +1974,7 @@ test sheet sort/with2: focus by Tab
   call ribbon-click {"tab":"Data","command":"Sort"}
   assert dialog is sort
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"with1"}
+  call real-key {"key":"tab","to-field":"with1"}
   call field-read {"dialog-field":"with2"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"with2"}
@@ -2104,7 +2098,7 @@ test sheet sort/by3: focus by click
   call ribbon-click {"tab":"Data","command":"Sort"}
   assert dialog is sort
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"with1"}
+  call real-key {"key":"tab","to-field":"with1"}
   call field-read {"dialog-field":"by3"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"by3"}
@@ -2140,7 +2134,7 @@ test sheet sort/on3: focus by click
   call ribbon-click {"tab":"Data","command":"Sort"}
   assert dialog is sort
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"with1"}
+  call real-key {"key":"tab","to-field":"with1"}
   call field-read {"dialog-field":"on3"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"on3"}
@@ -2176,7 +2170,7 @@ test sheet sort/order3: focus by click
   call ribbon-click {"tab":"Data","command":"Sort"}
   assert dialog is sort
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"with1"}
+  call real-key {"key":"tab","to-field":"with1"}
   call field-read {"dialog-field":"order3"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"order3"}
@@ -2212,7 +2206,7 @@ test sheet sort/with3: focus by click
   call ribbon-click {"tab":"Data","command":"Sort"}
   assert dialog is sort
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"with1"}
+  call real-key {"key":"tab","to-field":"with1"}
   call field-read {"dialog-field":"with3"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"with3"}
@@ -2226,7 +2220,7 @@ test sheet sort/with3: focus by Tab
   call ribbon-click {"tab":"Data","command":"Sort"}
   assert dialog is sort
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"with1"}
+  call real-key {"key":"tab","to-field":"with1"}
   call field-read {"dialog-field":"with3"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"with3"}

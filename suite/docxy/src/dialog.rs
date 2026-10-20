@@ -2064,12 +2064,17 @@ impl Dialog {
             (Some(i), false) => (i + 1) % order.len(),
             (Some(i), true) => (i + order.len() - 1) % order.len(),
         };
-        self.focus = Some(order[next]);
+        self.focus_control(order[next]);
+    }
+
+    /// Focus control `i` (one `focusable` lists). A single-line field that
+    /// takes the focus has its whole value selected, as in Word, so typing
+    /// replaces it (#1314).
+    fn focus_control(&mut self, i: usize) {
+        self.focus = Some(i);
         self.caret = None;
         self.anchor = None;
         self.calendar = None;
-        // A single-line field that takes the focus has its whole value
-        // selected, as in Word, so typing replaces it (#1314).
         if self
             .focused()
             .is_some_and(|c| c.kind.is_text() && c.kind != ControlKind::Multiline)
@@ -2088,7 +2093,20 @@ impl Dialog {
             && self.popup.is_none()
             && !matches!(self.owner, DialogOwner::Plugin { .. })
         {
-            self.focus_step(false);
+            // A dialog opened on a later page (Task Information's Notes)
+            // focuses that page's own first control, and keeps its top-row
+            // controls, which belong to every page, for after it.
+            let own = (self.tab != 0)
+                .then(|| {
+                    self.focusable()
+                        .into_iter()
+                        .find(|&i| self.controls[i].page == Some(self.tab))
+                })
+                .flatten();
+            match own {
+                Some(i) => self.focus_control(i),
+                None => self.focus_step(false),
+            }
         }
     }
 

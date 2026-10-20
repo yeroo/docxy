@@ -184,6 +184,14 @@ impl Test {
         )
     }
 
+    /// Tab (or Shift+Tab) as many times as it takes to focus `f`.
+    fn tab_to(&mut self, f: &Field) -> &mut Self {
+        self.call(
+            "real-key",
+            &format!("{{\"key\":\"tab\",\"to-field\":{}}}", js(f.name)),
+        )
+    }
+
     fn click(&mut self, f: &Field) -> &mut Self {
         let target = if f.kind.is_text() {
             "dialog-field"
@@ -304,21 +312,14 @@ fn text_tests(e: &Entry, f: &Field) -> Vec<Test> {
 
     tests.push(click_test(e, f));
 
-    // From another field a click focuses, when the field has a neighbour
-    // shown with it, so the Tabs have to move the focus: a field that
-    // already has it at open would pass on a whole round of ignored Tabs.
+    // The field may open focused (#1314), so the Tabs would pass on a whole
+    // round of ignored ones: leave it by Tab to a neighbour first.
     let mut t = Test::new(e, f, "focus by Tab");
     t.open(e, f);
     if let Some(other) = tab_start(e, f) {
-        t.click(other).read(f).assert("reply.focused is false");
+        t.tab_to(other).read(f).assert("reply.focused is false");
     }
-    t.call(
-        "real-key",
-        &format!("{{\"key\":\"tab\",\"to-field\":{}}}", js(f.name)),
-    )
-    .read(f)
-    .assert("reply.focused is true")
-    .close();
+    t.tab_to(f).read(f).assert("reply.focused is true").close();
     tests.push(t);
 
     let mut t = Test::new(e, f, "types");
@@ -456,21 +457,28 @@ fn text_tests(e: &Entry, f: &Field) -> Vec<Test> {
     tests
 }
 
-/// Another field of `e` on `f`'s tab, shown with it, to move the focus to
+/// Another field of `e` on `f`'s tab, shown by the same prep, to Tab to
 /// first: a dialog opens with its first control focused (#1314), so a case
-/// that never leaves the field would pass on a Tab or click that did nothing.
-/// A typed field shown by the same prep is preferred; else any field shown
-/// without a prep, or by the same one, as a radio gated on nothing is.
+/// that never leaves the field would pass on a click or Tab that did nothing.
+/// Leaving by the keyboard changes no value, so a typed field, dropdown,
+/// list or radio group will do (a typed one first). Not a checkbox: one the
+/// cases never touch may not be drawn in the dialog's opening state (Format
+/// Cells' Thousands under General), and Tab would never reach it. None:
+/// nothing to leave for.
 fn tab_start<'e>(e: &'e Entry, f: &Field) -> Option<&'e Field> {
-    let other = |o: &&Field| o.name != f.name && o.skip.is_none() && o.tab == f.tab;
+    let same =
+        |o: &&Field| o.name != f.name && o.skip.is_none() && o.tab == f.tab && o.prep == f.prep;
+    let driven = |o: &&Field| {
+        o.typed()
+            || matches!(
+                o.kind,
+                ControlKind::Dropdown | ControlKind::List | ControlKind::Radio
+            )
+    };
     e.fields
         .iter()
-        .find(|o| other(o) && o.typed() && o.prep == f.prep)
-        .or_else(|| {
-            e.fields
-                .iter()
-                .find(|o| other(o) && (o.prep.is_empty() || o.prep == f.prep))
-        })
+        .find(|o| same(o) && o.typed())
+        .or_else(|| e.fields.iter().find(|o| same(o) && driven(o)))
 }
 
 fn dropdown_tests(e: &Entry, f: &Field) -> Vec<Test> {
@@ -484,7 +492,7 @@ fn click_test(e: &Entry, f: &Field) -> Test {
     let mut t = Test::new(e, f, "focus by click");
     t.open(e, f);
     if let Some(other) = tab_start(e, f) {
-        t.click(other).read(f).assert("reply.focused is false");
+        t.tab_to(other).read(f).assert("reply.focused is false");
     }
     t.click(f).read(f).assert("reply.focused is true").close();
     t
@@ -495,14 +503,11 @@ fn click_test(e: &Entry, f: &Field) -> Test {
 /// gives it two items or more, by `prep` when the dialog opens with fewer.
 fn list_tests(e: &Entry, f: &Field) -> Vec<Test> {
     let mut t = Test::new(e, f, "focus by Tab");
-    t.open(e, f)
-        .call(
-            "real-key",
-            &format!("{{\"key\":\"tab\",\"to-field\":{}}}", js(f.name)),
-        )
-        .read(f)
-        .assert("reply.focused is true")
-        .close();
+    t.open(e, f);
+    if let Some(other) = tab_start(e, f) {
+        t.tab_to(other).read(f).assert("reply.focused is false");
+    }
+    t.tab_to(f).read(f).assert("reply.focused is true").close();
     vec![t, step_test(e, f)]
 }
 

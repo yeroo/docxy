@@ -492,10 +492,9 @@ mod tests {
         stack.top().unwrap().clone()
     }
 
-    /// Insert Table opens with Number of columns focused: Backspace and `3`
-    /// through the dialog's own key path make it 3, and Enter inserts a
-    /// three-column table (#1163). Before, no control had the focus and the
-    /// keys went nowhere.
+    /// Insert Table opens with Number of columns focused and its value
+    /// selected: `3` through the dialog's own key path replaces it, and Enter
+    /// inserts a three-column table (#1314).
     #[test]
     fn insert_table_opens_with_columns_focused() {
         use crate::dialog_host::dialog_key;

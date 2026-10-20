@@ -23,9 +23,6 @@ test sheet format-cells/category: focus by click
   assert dialog is format-cells
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Number"}
-  call pointer-click {"dialog-control":"thousands"}
-  call field-read {"dialog-field":"category"}
-  assert reply.focused is false
   call pointer-click {"dialog-control":"category"}
   call field-read {"dialog-field":"category"}
   assert reply.focused is true
@@ -63,7 +60,7 @@ test sheet format-cells/decimals: focus by click
   call real-key {"key":"tab","to-field":"category"}
   call real-key {"key":"down","times":1}
   call pointer-click {"dialog-tab":"Number"}
-  call pointer-click {"dialog-control":"category"}
+  call real-key {"key":"tab","to-field":"negative"}
   call field-read {"dialog-field":"decimals"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"decimals"}
@@ -80,7 +77,7 @@ test sheet format-cells/decimals: focus by Tab
   call real-key {"key":"tab","to-field":"category"}
   call real-key {"key":"down","times":1}
   call pointer-click {"dialog-tab":"Number"}
-  call pointer-click {"dialog-control":"category"}
+  call real-key {"key":"tab","to-field":"negative"}
   call field-read {"dialog-field":"decimals"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"decimals"}
@@ -272,9 +269,6 @@ test sheet format-cells/symbol: focus by click
   call real-key {"key":"tab","to-field":"category"}
   call real-key {"key":"down","times":2}
   call pointer-click {"dialog-tab":"Number"}
-  call pointer-click {"dialog-control":"category"}
-  call field-read {"dialog-field":"symbol"}
-  assert reply.focused is false
   call pointer-click {"dialog-control":"symbol"}
   call field-read {"dialog-field":"symbol"}
   assert reply.focused is true
@@ -314,7 +308,7 @@ test sheet format-cells/negative: focus by click
   call real-key {"key":"tab","to-field":"category"}
   call real-key {"key":"down","times":1}
   call pointer-click {"dialog-tab":"Number"}
-  call pointer-click {"dialog-field":"decimals"}
+  call real-key {"key":"tab","to-field":"decimals"}
   call field-read {"dialog-field":"negative"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"negative"}
@@ -356,9 +350,6 @@ test sheet format-cells/date-type: focus by click
   call real-key {"key":"tab","to-field":"category"}
   call real-key {"key":"down","times":4}
   call pointer-click {"dialog-tab":"Number"}
-  call pointer-click {"dialog-control":"category"}
-  call field-read {"dialog-field":"date-type"}
-  assert reply.focused is false
   call pointer-click {"dialog-control":"date-type"}
   call field-read {"dialog-field":"date-type"}
   assert reply.focused is true
@@ -398,9 +389,6 @@ test sheet format-cells/time-type: focus by click
   call real-key {"key":"tab","to-field":"category"}
   call real-key {"key":"down","times":5}
   call pointer-click {"dialog-tab":"Number"}
-  call pointer-click {"dialog-control":"category"}
-  call field-read {"dialog-field":"time-type"}
-  assert reply.focused is false
   call pointer-click {"dialog-control":"time-type"}
   call field-read {"dialog-field":"time-type"}
   assert reply.focused is true
@@ -440,9 +428,6 @@ test sheet format-cells/fraction-type: focus by click
   call real-key {"key":"tab","to-field":"category"}
   call real-key {"key":"down","times":7}
   call pointer-click {"dialog-tab":"Number"}
-  call pointer-click {"dialog-control":"category"}
-  call field-read {"dialog-field":"fraction-type"}
-  assert reply.focused is false
   call pointer-click {"dialog-control":"fraction-type"}
   call field-read {"dialog-field":"fraction-type"}
   assert reply.focused is true
@@ -482,7 +467,7 @@ test sheet format-cells/code: focus by click
   call real-key {"key":"tab","to-field":"category"}
   call real-key {"key":"down","times":10}
   call pointer-click {"dialog-tab":"Number"}
-  call pointer-click {"dialog-control":"category"}
+  call real-key {"key":"tab","to-field":"codes"}
   call field-read {"dialog-field":"code"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"code"}
@@ -499,7 +484,7 @@ test sheet format-cells/code: focus by Tab
   call real-key {"key":"tab","to-field":"category"}
   call real-key {"key":"down","times":10}
   call pointer-click {"dialog-tab":"Number"}
-  call pointer-click {"dialog-control":"category"}
+  call real-key {"key":"tab","to-field":"codes"}
   call field-read {"dialog-field":"code"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"code"}
@@ -674,7 +659,7 @@ test sheet format-cells/codes: focus by click
   call real-key {"key":"tab","to-field":"category"}
   call real-key {"key":"down","times":10}
   call pointer-click {"dialog-tab":"Number"}
-  call pointer-click {"dialog-field":"code"}
+  call real-key {"key":"tab","to-field":"code"}
   call field-read {"dialog-field":"codes"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"codes"}
@@ -749,9 +734,6 @@ test sheet format-cells/color: focus by click
   assert dialog is format-cells
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Font"}
-  call pointer-click {"dialog-control":"bold"}
-  call field-read {"dialog-field":"color"}
-  assert reply.focused is false
   call pointer-click {"dialog-control":"color"}
   call field-read {"dialog-field":"color"}
   assert reply.focused is true

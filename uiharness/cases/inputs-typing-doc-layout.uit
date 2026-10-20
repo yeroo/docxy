@@ -23,7 +23,7 @@ test doc page-setup/top: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Margins"}
-  call pointer-click {"dialog-field":"bottom"}
+  call real-key {"key":"tab","to-field":"bottom"}
   call field-read {"dialog-field":"top"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"top"}
@@ -38,7 +38,7 @@ test doc page-setup/top: focus by Tab
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Margins"}
-  call pointer-click {"dialog-field":"bottom"}
+  call real-key {"key":"tab","to-field":"bottom"}
   call field-read {"dialog-field":"top"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"top"}
@@ -206,7 +206,7 @@ test doc page-setup/bottom: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Margins"}
-  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"tab","to-field":"top"}
   call field-read {"dialog-field":"bottom"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"bottom"}
@@ -221,7 +221,7 @@ test doc page-setup/bottom: focus by Tab
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Margins"}
-  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"tab","to-field":"top"}
   call field-read {"dialog-field":"bottom"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"bottom"}
@@ -389,7 +389,7 @@ test doc page-setup/left: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Margins"}
-  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"tab","to-field":"top"}
   call field-read {"dialog-field":"left"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"left"}
@@ -404,7 +404,7 @@ test doc page-setup/left: focus by Tab
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Margins"}
-  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"tab","to-field":"top"}
   call field-read {"dialog-field":"left"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"left"}
@@ -572,7 +572,7 @@ test doc page-setup/right: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Margins"}
-  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"tab","to-field":"top"}
   call field-read {"dialog-field":"right"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"right"}
@@ -587,7 +587,7 @@ test doc page-setup/right: focus by Tab
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Margins"}
-  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"tab","to-field":"top"}
   call field-read {"dialog-field":"right"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"right"}
@@ -755,7 +755,7 @@ test doc page-setup/gutter: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Margins"}
-  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"tab","to-field":"top"}
   call field-read {"dialog-field":"gutter"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"gutter"}
@@ -770,7 +770,7 @@ test doc page-setup/gutter: focus by Tab
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Margins"}
-  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"tab","to-field":"top"}
   call field-read {"dialog-field":"gutter"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"gutter"}
@@ -938,7 +938,7 @@ test doc page-setup/multiple: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Margins"}
-  call pointer-click {"dialog-field":"top"}
+  call real-key {"key":"tab","to-field":"top"}
   call field-read {"dialog-field":"multiple"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"multiple"}
@@ -976,7 +976,7 @@ test doc page-setup/paper: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Paper"}
-  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"tab","to-field":"width"}
   call field-read {"dialog-field":"paper"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"paper"}
@@ -1014,7 +1014,7 @@ test doc page-setup/width: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Paper"}
-  call pointer-click {"dialog-field":"height"}
+  call real-key {"key":"tab","to-field":"height"}
   call field-read {"dialog-field":"width"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"width"}
@@ -1029,7 +1029,7 @@ test doc page-setup/width: focus by Tab
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Paper"}
-  call pointer-click {"dialog-field":"height"}
+  call real-key {"key":"tab","to-field":"height"}
   call field-read {"dialog-field":"width"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"width"}
@@ -1197,7 +1197,7 @@ test doc page-setup/height: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Paper"}
-  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"tab","to-field":"width"}
   call field-read {"dialog-field":"height"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"height"}
@@ -1212,7 +1212,7 @@ test doc page-setup/height: focus by Tab
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Paper"}
-  call pointer-click {"dialog-field":"width"}
+  call real-key {"key":"tab","to-field":"width"}
   call field-read {"dialog-field":"height"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"height"}
@@ -1380,7 +1380,7 @@ test doc page-setup/start: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Layout"}
-  call pointer-click {"dialog-field":"header"}
+  call real-key {"key":"tab","to-field":"header"}
   call field-read {"dialog-field":"start"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"start"}
@@ -1418,7 +1418,7 @@ test doc page-setup/header: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Layout"}
-  call pointer-click {"dialog-field":"footer"}
+  call real-key {"key":"tab","to-field":"footer"}
   call field-read {"dialog-field":"header"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"header"}
@@ -1433,7 +1433,7 @@ test doc page-setup/header: focus by Tab
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Layout"}
-  call pointer-click {"dialog-field":"footer"}
+  call real-key {"key":"tab","to-field":"footer"}
   call field-read {"dialog-field":"header"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"header"}
@@ -1601,7 +1601,7 @@ test doc page-setup/footer: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Layout"}
-  call pointer-click {"dialog-field":"header"}
+  call real-key {"key":"tab","to-field":"header"}
   call field-read {"dialog-field":"footer"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"footer"}
@@ -1616,7 +1616,7 @@ test doc page-setup/footer: focus by Tab
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Layout"}
-  call pointer-click {"dialog-field":"header"}
+  call real-key {"key":"tab","to-field":"header"}
   call field-read {"dialog-field":"footer"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"footer"}
@@ -1824,7 +1824,7 @@ test doc columns/num: focus by click
   call menu-click {"label":"More Columns..."}
   assert dialog is columns
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"width1"}
+  call real-key {"key":"tab","to-field":"width1"}
   call field-read {"dialog-field":"num"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"num"}
@@ -1838,7 +1838,7 @@ test doc columns/num: focus by Tab
   call menu-click {"label":"More Columns..."}
   assert dialog is columns
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"width1"}
+  call real-key {"key":"tab","to-field":"width1"}
   call field-read {"dialog-field":"num"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"num"}
@@ -1995,7 +1995,7 @@ test doc columns/width1: focus by click
   call menu-click {"label":"More Columns..."}
   assert dialog is columns
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"num"}
+  call real-key {"key":"tab","to-field":"num"}
   call field-read {"dialog-field":"width1"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"width1"}
@@ -2009,7 +2009,7 @@ test doc columns/width1: focus by Tab
   call menu-click {"label":"More Columns..."}
   assert dialog is columns
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"num"}
+  call real-key {"key":"tab","to-field":"num"}
   call field-read {"dialog-field":"width1"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"width1"}
@@ -2151,7 +2151,7 @@ test doc columns/space1: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"width2"}
+  call real-key {"key":"tab","to-field":"width2"}
   call field-read {"dialog-field":"space1"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"space1"}
@@ -2169,7 +2169,7 @@ test doc columns/space1: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"width2"}
+  call real-key {"key":"tab","to-field":"width2"}
   call field-read {"dialog-field":"space1"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"space1"}
@@ -2343,7 +2343,7 @@ test doc columns/width2: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width2"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"width2"}
@@ -2361,7 +2361,7 @@ test doc columns/width2: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width2"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"width2"}
@@ -2535,7 +2535,7 @@ test doc columns/space2: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"space2"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"space2"}
@@ -2553,7 +2553,7 @@ test doc columns/space2: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"space2"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"space2"}
@@ -2727,7 +2727,7 @@ test doc columns/width3: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width3"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"width3"}
@@ -2745,7 +2745,7 @@ test doc columns/width3: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width3"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"width3"}
@@ -2919,7 +2919,7 @@ test doc columns/space3: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"space3"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"space3"}
@@ -2937,7 +2937,7 @@ test doc columns/space3: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"space3"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"space3"}
@@ -3111,7 +3111,7 @@ test doc columns/width4: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width4"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"width4"}
@@ -3129,7 +3129,7 @@ test doc columns/width4: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width4"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"width4"}
@@ -3303,7 +3303,7 @@ test doc columns/space4: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"space4"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"space4"}
@@ -3321,7 +3321,7 @@ test doc columns/space4: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"space4"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"space4"}
@@ -3495,7 +3495,7 @@ test doc columns/width5: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width5"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"width5"}
@@ -3513,7 +3513,7 @@ test doc columns/width5: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width5"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"width5"}
@@ -3687,7 +3687,7 @@ test doc columns/space5: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"space5"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"space5"}
@@ -3705,7 +3705,7 @@ test doc columns/space5: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"space5"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"space5"}
@@ -3879,7 +3879,7 @@ test doc columns/width6: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width6"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"width6"}
@@ -3897,7 +3897,7 @@ test doc columns/width6: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width6"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"width6"}
@@ -4071,7 +4071,7 @@ test doc columns/space6: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"space6"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"space6"}
@@ -4089,7 +4089,7 @@ test doc columns/space6: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"space6"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"space6"}
@@ -4263,7 +4263,7 @@ test doc columns/width7: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width7"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"width7"}
@@ -4281,7 +4281,7 @@ test doc columns/width7: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width7"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"width7"}
@@ -4455,7 +4455,7 @@ test doc columns/space7: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"space7"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"space7"}
@@ -4473,7 +4473,7 @@ test doc columns/space7: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"space7"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"space7"}
@@ -4647,7 +4647,7 @@ test doc columns/width8: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width8"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"width8"}
@@ -4665,7 +4665,7 @@ test doc columns/width8: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width8"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"width8"}
@@ -4839,7 +4839,7 @@ test doc columns/space8: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"space8"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"space8"}
@@ -4857,7 +4857,7 @@ test doc columns/space8: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"space8"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"space8"}
@@ -5031,7 +5031,7 @@ test doc columns/width9: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width9"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"width9"}
@@ -5049,7 +5049,7 @@ test doc columns/width9: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width9"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"width9"}
@@ -5223,7 +5223,7 @@ test doc columns/space9: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"space9"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"space9"}
@@ -5241,7 +5241,7 @@ test doc columns/space9: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"space9"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"space9"}
@@ -5415,7 +5415,7 @@ test doc columns/width10: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width10"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"width10"}
@@ -5433,7 +5433,7 @@ test doc columns/width10: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width10"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"width10"}
@@ -5607,7 +5607,7 @@ test doc columns/space10: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"space10"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"space10"}
@@ -5625,7 +5625,7 @@ test doc columns/space10: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"space10"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"space10"}
@@ -5799,7 +5799,7 @@ test doc columns/width11: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width11"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"width11"}
@@ -5817,7 +5817,7 @@ test doc columns/width11: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width11"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"width11"}
@@ -5991,7 +5991,7 @@ test doc columns/space11: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"space11"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"space11"}
@@ -6009,7 +6009,7 @@ test doc columns/space11: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"space11"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"space11"}
@@ -6183,7 +6183,7 @@ test doc columns/width12: focus by click
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width12"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"width12"}
@@ -6201,7 +6201,7 @@ test doc columns/width12: focus by Tab
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"12"}
   call pointer-click {"dialog-control":"equal"}
-  call pointer-click {"dialog-field":"space1"}
+  call real-key {"key":"tab","to-field":"space1"}
   call field-read {"dialog-field":"width12"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"width12"}
@@ -6371,7 +6371,7 @@ test doc columns/apply: focus by click
   call menu-click {"label":"More Columns..."}
   assert dialog is columns
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"num"}
+  call real-key {"key":"tab","to-field":"num"}
   call field-read {"dialog-field":"apply"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"apply"}
@@ -6416,7 +6416,7 @@ test doc line-numbers/start: focus by click
   assert dialog is line-numbers
   call dialog-catalog-check {}
   call pointer-click {"dialog-control":"add"}
-  call pointer-click {"dialog-field":"by"}
+  call real-key {"key":"tab","to-field":"by"}
   call field-read {"dialog-field":"start"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"start"}
@@ -6431,7 +6431,7 @@ test doc line-numbers/start: focus by Tab
   assert dialog is line-numbers
   call dialog-catalog-check {}
   call pointer-click {"dialog-control":"add"}
-  call pointer-click {"dialog-field":"by"}
+  call real-key {"key":"tab","to-field":"by"}
   call field-read {"dialog-field":"start"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"start"}
@@ -6600,9 +6600,6 @@ test doc line-numbers/from: focus by click
   call dialog-catalog-check {}
   call pointer-click {"dialog-control":"add"}
   call pointer-click {"dialog-control":"auto"}
-  call pointer-click {"dialog-control":"add"}
-  call field-read {"dialog-field":"from"}
-  assert reply.focused is false
   call pointer-click {"dialog-field":"from"}
   call field-read {"dialog-field":"from"}
   assert reply.focused is true
@@ -6616,9 +6613,6 @@ test doc line-numbers/from: focus by Tab
   call dialog-catalog-check {}
   call pointer-click {"dialog-control":"add"}
   call pointer-click {"dialog-control":"auto"}
-  call pointer-click {"dialog-control":"add"}
-  call field-read {"dialog-field":"from"}
-  assert reply.focused is false
   call real-key {"key":"tab","to-field":"from"}
   call field-read {"dialog-field":"from"}
   assert reply.focused is true
@@ -6794,7 +6788,7 @@ test doc line-numbers/by: focus by click
   assert dialog is line-numbers
   call dialog-catalog-check {}
   call pointer-click {"dialog-control":"add"}
-  call pointer-click {"dialog-field":"start"}
+  call real-key {"key":"tab","to-field":"start"}
   call field-read {"dialog-field":"by"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"by"}
@@ -6809,7 +6803,7 @@ test doc line-numbers/by: focus by Tab
   assert dialog is line-numbers
   call dialog-catalog-check {}
   call pointer-click {"dialog-control":"add"}
-  call pointer-click {"dialog-field":"start"}
+  call real-key {"key":"tab","to-field":"start"}
   call field-read {"dialog-field":"by"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"by"}
@@ -6976,7 +6970,7 @@ test doc line-numbers/apply: focus by click
   call menu-click {"label":"Line Numbering Options..."}
   assert dialog is line-numbers
   call dialog-catalog-check {}
-  call pointer-click {"dialog-control":"add"}
+  call real-key {"key":"tab","to-field":"restart"}
   call field-read {"dialog-field":"apply"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"apply"}
@@ -7020,7 +7014,7 @@ test doc hyphenation/zone: focus by click
   call menu-click {"label":"Hyphenation Options..."}
   assert dialog is hyphenation
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"limit"}
+  call real-key {"key":"tab","to-field":"limit"}
   call field-read {"dialog-field":"zone"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"zone"}
@@ -7034,7 +7028,7 @@ test doc hyphenation/zone: focus by Tab
   call menu-click {"label":"Hyphenation Options..."}
   assert dialog is hyphenation
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"limit"}
+  call real-key {"key":"tab","to-field":"limit"}
   call field-read {"dialog-field":"zone"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"zone"}
@@ -7191,7 +7185,7 @@ test doc hyphenation/limit: focus by click
   call menu-click {"label":"Hyphenation Options..."}
   assert dialog is hyphenation
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"zone"}
+  call real-key {"key":"tab","to-field":"zone"}
   call field-read {"dialog-field":"limit"}
   assert reply.focused is false
   call pointer-click {"dialog-field":"limit"}
@@ -7205,7 +7199,7 @@ test doc hyphenation/limit: focus by Tab
   call menu-click {"label":"Hyphenation Options..."}
   assert dialog is hyphenation
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"zone"}
+  call real-key {"key":"tab","to-field":"zone"}
   call field-read {"dialog-field":"limit"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"limit"}
@@ -7710,9 +7704,6 @@ test doc hf-date-time/formats: focus by click
   call ribbon-click {"tab":"Header & Footer","command":"hf-datetime"}
   assert dialog is hf-date-time
   call dialog-catalog-check {}
-  call pointer-click {"dialog-control":"update"}
-  call field-read {"dialog-field":"formats"}
-  assert reply.focused is false
   call pointer-click {"dialog-control":"formats"}
   call field-read {"dialog-field":"formats"}
   assert reply.focused is true
@@ -7754,7 +7745,7 @@ test doc hf-alignment-tab/relative: focus by click
   call ribbon-click {"tab":"Header & Footer","command":"hf-align-tab"}
   assert dialog is hf-alignment-tab
   call dialog-catalog-check {}
-  call pointer-click {"dialog-control":"alignment"}
+  call real-key {"key":"tab","to-field":"alignment"}
   call field-read {"dialog-field":"relative"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"relative"}
@@ -7804,7 +7795,7 @@ test doc page-number-format/format: focus by click
   call ribbon-click {"tab":"Insert","command":"pn-format"}
   assert dialog is page-number-format
   call dialog-catalog-check {}
-  call pointer-click {"dialog-control":"chapter"}
+  call real-key {"key":"tab","to-field":"numbering"}
   call field-read {"dialog-field":"format"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"format"}
@@ -7839,7 +7830,7 @@ test doc page-number-format/chap_style: focus by click
   assert dialog is page-number-format
   call dialog-catalog-check {}
   call pointer-click {"dialog-control":"chapter"}
-  call pointer-click {"dialog-control":"format"}
+  call real-key {"key":"tab","to-field":"chap_sep"}
   call field-read {"dialog-field":"chap_style"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"chap_style"}
@@ -7875,7 +7866,7 @@ test doc page-number-format/chap_sep: focus by click
   assert dialog is page-number-format
   call dialog-catalog-check {}
   call pointer-click {"dialog-control":"chapter"}
-  call pointer-click {"dialog-control":"format"}
+  call real-key {"key":"tab","to-field":"chap_style"}
   call field-read {"dialog-field":"chap_sep"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"chap_sep"}
@@ -7912,9 +7903,6 @@ test doc page-number-format/start: focus by click
   call dialog-catalog-check {}
   call real-key {"key":"tab","to-field":"numbering"}
   call real-key {"key":"down","times":1}
-  call pointer-click {"dialog-control":"format"}
-  call field-read {"dialog-field":"start"}
-  assert reply.focused is false
   call pointer-click {"dialog-field":"start"}
   call field-read {"dialog-field":"start"}
   assert reply.focused is true
@@ -7927,9 +7915,6 @@ test doc page-number-format/start: focus by Tab
   call dialog-catalog-check {}
   call real-key {"key":"tab","to-field":"numbering"}
   call real-key {"key":"down","times":1}
-  call pointer-click {"dialog-control":"format"}
-  call field-read {"dialog-field":"start"}
-  assert reply.focused is false
   call real-key {"key":"tab","to-field":"start"}
   call field-read {"dialog-field":"start"}
   assert reply.focused is true
