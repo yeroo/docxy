@@ -2093,21 +2093,34 @@ impl Dialog {
             && self.popup.is_none()
             && !matches!(self.owner, DialogOwner::Plugin { .. })
         {
-            // A dialog opened on a later page (Task Information's Notes)
-            // focuses that page's own first control, and keeps its top-row
-            // controls, which belong to every page, for after it.
-            let own = (self.tab != 0)
-                .then(|| {
-                    self.focusable()
-                        .into_iter()
-                        .find(|&i| self.controls[i].page == Some(self.tab))
-                })
-                .flatten();
-            match own {
-                Some(i) => self.focus_control(i),
-                None => self.focus_step(false),
+            if !self.focus_own_page() {
+                self.focus_step(false);
             }
         }
+    }
+
+    /// On a later page, focus that page's own first control, the caret at the
+    /// end of a text field with nothing selected (opening a page to append a
+    /// note must not replace it); the top-row controls, which belong to every
+    /// page (Task Information's Name), come after. False on the first page or
+    /// when the page has none.
+    fn focus_own_page(&mut self) -> bool {
+        if self.tab == 0 {
+            return false;
+        }
+        let Some(i) = self
+            .focusable()
+            .into_iter()
+            .find(|&i| self.controls[i].page == Some(self.tab))
+        else {
+            return false;
+        };
+        self.focus_control(i);
+        if self.focused().is_some_and(|c| c.kind.is_text()) {
+            let len = self.focused_text().map_or(0, |t| t.chars().count());
+            self.put_caret(len);
+        }
+        true
     }
 
     /// The focused text field's text, when the focus is on one.
@@ -2510,6 +2523,7 @@ impl Dialog {
             return Err(format!("'{}' has no tabs", self.title));
         }
         self.commit_pending()?;
+        let was = self.tab;
         self.tab = self
             .tabs
             .iter()
@@ -2518,6 +2532,15 @@ impl Dialog {
         self.calendar = None;
         if self.focused().is_none() {
             self.focus = None;
+        } else if self.tab != was && self.focused().is_some_and(|c| c.page.is_none()) {
+            // A top-row control stays drawn on every page, but the keys
+            // belong to the page now shown (#1314): typing a note must not
+            // go into the task's still-selected Name.
+            if !self.focus_own_page() {
+                self.focus = None;
+                self.caret = None;
+                self.anchor = None;
+            }
         }
         Ok(())
     }

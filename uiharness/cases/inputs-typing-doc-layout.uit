@@ -6970,9 +6970,6 @@ test doc line-numbers/apply: focus by click
   call menu-click {"label":"Line Numbering Options..."}
   assert dialog is line-numbers
   call dialog-catalog-check {}
-  call real-key {"key":"tab","to-field":"restart"}
-  call field-read {"dialog-field":"apply"}
-  assert reply.focused is false
   call pointer-click {"dialog-control":"apply"}
   call field-read {"dialog-field":"apply"}
   assert reply.focused is true
@@ -7745,9 +7742,6 @@ test doc hf-alignment-tab/relative: focus by click
   call ribbon-click {"tab":"Header & Footer","command":"hf-align-tab"}
   assert dialog is hf-alignment-tab
   call dialog-catalog-check {}
-  call real-key {"key":"tab","to-field":"alignment"}
-  call field-read {"dialog-field":"relative"}
-  assert reply.focused is false
   call pointer-click {"dialog-control":"relative"}
   call field-read {"dialog-field":"relative"}
   assert reply.focused is true
@@ -7795,9 +7789,6 @@ test doc page-number-format/format: focus by click
   call ribbon-click {"tab":"Insert","command":"pn-format"}
   assert dialog is page-number-format
   call dialog-catalog-check {}
-  call real-key {"key":"tab","to-field":"numbering"}
-  call field-read {"dialog-field":"format"}
-  assert reply.focused is false
   call pointer-click {"dialog-control":"format"}
   call field-read {"dialog-field":"format"}
   assert reply.focused is true

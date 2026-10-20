@@ -460,21 +460,17 @@ fn text_tests(e: &Entry, f: &Field) -> Vec<Test> {
 /// Another field of `e` on `f`'s tab, shown by the same prep, to Tab to
 /// first: a dialog opens with its first control focused (#1314), so a case
 /// that never leaves the field would pass on a click or Tab that did nothing.
-/// Leaving by the keyboard changes no value, so a typed field, dropdown,
-/// list or radio group will do (a typed one first). Not a checkbox: one the
-/// cases never touch may not be drawn in the dialog's opening state (Format
-/// Cells' Thousands under General), and Tab would never reach it. None:
-/// nothing to leave for.
+/// Leaving by the keyboard changes no value, so a typed field, dropdown or
+/// list will do (a typed one first): the cases drive them, so their prep is
+/// known to show them. Not a checkbox or radio group, which nothing tests for
+/// being reachable: one may be undrawn or disabled at open (Format Cells'
+/// Thousands under General, Line Numbers' Restart), and Tab would never reach
+/// it. None: nothing to leave for.
 fn tab_start<'e>(e: &'e Entry, f: &Field) -> Option<&'e Field> {
     let same =
         |o: &&Field| o.name != f.name && o.skip.is_none() && o.tab == f.tab && o.prep == f.prep;
-    let driven = |o: &&Field| {
-        o.typed()
-            || matches!(
-                o.kind,
-                ControlKind::Dropdown | ControlKind::List | ControlKind::Radio
-            )
-    };
+    let driven =
+        |o: &&Field| o.typed() || matches!(o.kind, ControlKind::Dropdown | ControlKind::List);
     e.fields
         .iter()
         .find(|o| same(o) && o.typed())

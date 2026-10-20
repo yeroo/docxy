@@ -1232,3 +1232,38 @@ fn the_dialog_opens_focused_on_its_own_page() {
         assert_eq!(d.focused().map(|c| c.name), Some(first));
     }
 }
+
+/// Opening on Notes puts the caret after the existing note, nothing
+/// selected: typing appends (#1314).
+#[test]
+fn notes_open_with_the_caret_at_the_end_and_typing_appends() {
+    let t = tab();
+    let mut d = task_info_dialog(&v(&t).ed, 2, InfoPage::Notes).unwrap();
+    let notes = d.controls.iter().position(|c| c.name == "notes").unwrap();
+    d.controls[notes].value = Value::Text("abc".into());
+    let mut stack = crate::dialog::DialogStack::default();
+    stack.push(d);
+    let d = stack.top_dialog_mut().unwrap();
+    assert_eq!(d.selection(), None);
+    assert_eq!(d.caret_at(), 3);
+    d.type_char('d').unwrap();
+    assert_eq!(d.value("notes"), Some(&Value::Text("abcd".into())));
+}
+
+/// A click on the Notes tab while the top row's Name has the focus hands the
+/// keys to the page now shown: a typed note cannot replace the name (#1314).
+#[test]
+fn switching_to_notes_moves_the_focus_off_the_top_row() {
+    let t = tab();
+    let d = task_info_dialog(&v(&t).ed, 2, InfoPage::General).unwrap();
+    let mut stack = crate::dialog::DialogStack::default();
+    stack.push(d);
+    assert_eq!(stack.top().unwrap().focused().map(|c| c.name), Some("name"));
+    stack.select_tab("Notes").unwrap();
+    let d = stack.top_dialog_mut().unwrap();
+    assert_eq!(d.focused().map(|c| c.name), Some("notes"));
+    assert_eq!(d.selection(), None);
+    d.type_char('x').unwrap();
+    assert_eq!(d.value("name"), Some(&Value::Text("Second".into())));
+    assert_eq!(d.value("notes"), Some(&Value::Text("x".into())));
+}

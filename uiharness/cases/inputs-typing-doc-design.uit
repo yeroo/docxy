@@ -175,9 +175,6 @@ test doc fill-effects/color1: focus by click
   call menu-click {"label":"Fill Effects..."}
   assert dialog is fill-effects
   call dialog-catalog-check {}
-  call real-key {"key":"tab","to-field":"colors"}
-  call field-read {"dialog-field":"color1"}
-  assert reply.focused is false
   call pointer-click {"dialog-control":"color1"}
   call field-read {"dialog-field":"color1"}
   assert reply.focused is true
@@ -831,7 +828,7 @@ test doc page-borders/style: focus by click
   key alt g p b
   assert dialog is page-borders
   call dialog-catalog-check {}
-  call real-key {"key":"tab","to-field":"setting"}
+  call real-key {"key":"tab","to-field":"color"}
   call field-read {"dialog-field":"style"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"style"}
@@ -865,7 +862,7 @@ test doc page-borders/color: focus by click
   key alt g p b
   assert dialog is page-borders
   call dialog-catalog-check {}
-  call real-key {"key":"tab","to-field":"setting"}
+  call real-key {"key":"tab","to-field":"style"}
   call field-read {"dialog-field":"color"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"color"}
@@ -899,7 +896,7 @@ test doc page-borders/width: focus by click
   key alt g p b
   assert dialog is page-borders
   call dialog-catalog-check {}
-  call real-key {"key":"tab","to-field":"setting"}
+  call real-key {"key":"tab","to-field":"style"}
   call field-read {"dialog-field":"width"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"width"}
@@ -933,7 +930,7 @@ test doc page-borders/apply: focus by click
   key alt g p b
   assert dialog is page-borders
   call dialog-catalog-check {}
-  call real-key {"key":"tab","to-field":"setting"}
+  call real-key {"key":"tab","to-field":"style"}
   call field-read {"dialog-field":"apply"}
   assert reply.focused is false
   call pointer-click {"dialog-control":"apply"}
