@@ -1181,6 +1181,97 @@ mod tests {
         );
     }
 
+    /// #1594 r13: a milestone's kept delay ends at the delay's snap, not at
+    /// the evening it counts from. Build = X and Paint = A (one day each,
+    /// Ann); M (a kept hour) follows A; T (one hour, Bob) follows M an
+    /// elapsed hour later; Y (one hour, Bob, held) holds Wednesday 08:00. A
+    /// levels to Tuesday, M is Tuesday 17:00 plus the hour, snapped to
+    /// Wednesday 08:00, T starts at 09:00, after Y, with no delay of its own.
+    #[test]
+    fn a_kept_milestone_delay_ends_at_its_snap_in_the_plan() {
+        let mut p = staffed().project().clone();
+        for t in &mut p.tasks {
+            t.duration_min = 480;
+        }
+        p.tasks.remove(2);
+        p.assignments.retain(|a| a.task_uid != 3);
+        let anchor = p.start_date.unwrap();
+        let day = |n: i64, min: i64| DateTime::from_minutes(anchor.minutes() + n * 1440 + min);
+        p.resources.push(Resource {
+            uid: 2,
+            id: 2,
+            name: "Bob".into(),
+            max_units: 1.0,
+            ..Resource::default()
+        });
+        p.tasks.push(Task {
+            uid: 4,
+            id: 4,
+            name: "M".into(),
+            outline_level: 1,
+            duration_min: 0,
+            predecessors: vec![Predecessor::fs(2)],
+            leveling_delay: Some(60 * 10),
+            leveling_delay_format: Some(8),
+            ..Task::default()
+        });
+        p.tasks.push(Task {
+            uid: 5,
+            id: 5,
+            name: "T".into(),
+            outline_level: 1,
+            duration_min: 60,
+            predecessors: vec![Predecessor {
+                lag: 60,
+                lag_format: crate::model::LagFormat::from_code(8).unwrap(),
+                ..Predecessor::fs(4)
+            }],
+            ..Task::default()
+        });
+        p.tasks.push(Task {
+            uid: 6,
+            id: 6,
+            name: "Y".into(),
+            outline_level: 1,
+            duration_min: 60,
+            constraint: crate::model::ConstraintType::StartNoEarlierThan,
+            constraint_date: Some(day(2, 0)),
+            ..Task::default()
+        });
+        for uid in [5, 6] {
+            p.assignments.push(Assignment {
+                uid,
+                task_uid: uid,
+                resource_uid: 2,
+                units: 1.0,
+                ..Assignment::default()
+            });
+        }
+        let mut ed = Editor::new(p);
+        ed.set_level_options(&LevelOptions {
+            clear_first: false,
+            ..LevelOptions::default()
+        })
+        .unwrap();
+        let out = ed
+            .level_tasks(&LevelTarget::Selection(vec![2, 4, 5]))
+            .unwrap();
+        // A's new delay and M's kept one are the pass's two delays.
+        assert_eq!((out.changed, out.delayed, out.overallocated), (2, 2, 0));
+        assert_eq!(
+            ed.project().task(2).unwrap().leveling_delay,
+            Some(1440 * 10),
+            "A: Tuesday"
+        );
+        assert_eq!(
+            ed.project().task(5).unwrap().leveling_delay,
+            None,
+            "T: no delay of its own"
+        );
+        assert_eq!(start(&ed, 4), day(2, 0), "M Wednesday 08:00");
+        assert_eq!(start(&ed, 5), day(2, 60), "T Wednesday 09:00, after Y");
+    }
+
     /// #1594 r11: a kept delay on a milestone held at an evening instant.
     /// Build = X and Paint = A (one day each, Ann); Trim = Q (one day, no
     /// resource) follows A; M (a milestone, Start No Earlier Than Tuesday

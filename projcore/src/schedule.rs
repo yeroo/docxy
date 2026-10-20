@@ -910,6 +910,7 @@ impl<'a> Scheduler<'a> {
         &self,
         leaves: &[usize],
         linked: &std::collections::HashSet<i32>,
+        es_abs: &HashMap<i32, i64>,
     ) -> HashMap<i32, Timeline> {
         // Per calendar: earliest date, latest early start, longest duration.
         let mut spans: HashMap<i32, (i64, i64, i64)> = HashMap::new();
@@ -921,17 +922,15 @@ impl<'a> Scheduler<'a> {
             let Some(dates) = self.constraint_dates(t, false).filter(|d| d.clamped) else {
                 continue;
             };
-            // A stored delay (#1594 r12) puts the early start past the floor
-            // by that elapsed time: the window must reach it.
-            let delay = t
-                .leveling_delay
-                .filter(|d| *d > 0 && !self.schedulable_alap(t))
-                .map_or(0, |d| d / 10);
+            // A stored delay (#1594 r12) puts the early start past the floor:
+            // the window reaches the forward pass's early start, which the
+            // forward timeline has already held within the horizon (r13).
+            let early = es_abs.get(&t.uid).copied().unwrap_or(dates.floor);
             let span = spans
                 .entry(self.calendar_uid(t))
                 .or_insert((i64::MAX, i64::MIN, 0));
             span.0 = span.0.min(dates.raw);
-            span.1 = span.1.max(dates.floor.saturating_add(delay));
+            span.1 = span.1.max(dates.floor.max(early));
             span.2 = span.2.max(self.scheduled_span(i));
         }
         spans
@@ -1701,7 +1700,7 @@ impl<'a> Scheduler<'a> {
             .chain(self.manual_spans.values().map(|&(_, finish)| finish))
             .max()
             .unwrap_or(self.anchor);
-        let pre_start = self.pre_start_timelines(leaves, &linked_tasks);
+        let pre_start = self.pre_start_timelines(leaves, &linked_tasks, &es_abs);
         // The free-slack bounds of summary links: each successor's start
         // less its own stored delay (#1594 r6), before the group takes its
         // minimum, as the late pass does below.
@@ -4415,6 +4414,18 @@ impl Scheduler<'_> {
                     if tl.to_index(driven_now_abs) == placed {
                         s_abs = s_abs.max(driven_now_abs);
                     }
+                } else if t.duration_min == 0 && delayed_abs.is_some() && placed == earliest {
+                    // A kept delay put the milestone here: the start is the
+                    // snapped delayed instant `earliest` names, where the
+                    // forward pass puts it; the evening the delay counts
+                    // from is where it counts from, not the start (r13).
+                } else if t.duration_min == 0 && tl.to_index(driven_now_abs) == placed {
+                    // The links' demand the placement took, through the
+                    // task's own constraint: an FS predecessor's evening
+                    // kept, a binding cap's instant held, a start-type
+                    // demand already snapped, as the forward pass starts a
+                    // milestone (r13).
+                    s_abs = driven_now_abs;
                 } else if t.duration_min == 0 {
                     let mut fs_instant: Option<i64> = None;
                     let mut start_bound = cpm.early_start.minutes();
@@ -4451,9 +4462,6 @@ impl Scheduler<'_> {
                     // already carries the task's SNET/MSO start bounds.
                     if let Some(instant) = fs_instant {
                         s_abs = instant.max(start_bound);
-                    }
-                    if tl.to_index(driven_now_abs) == placed {
-                        s_abs = s_abs.max(driven_now_abs);
                     }
                 }
                 let bounds = graph
@@ -8144,7 +8152,7 @@ mod tests {
         // window runs back to the absolute cap on a timeline of its own.
         let anchor = proj.start_date.unwrap();
         let cap = (anchor.day_number() - HORIZON_DAYS) * 1440;
-        let pre_start = engine.pre_start_timelines(&[2], &Default::default());
+        let pre_start = engine.pre_start_timelines(&[2], &Default::default(), &Default::default());
         let side = &pre_start[&proj.default_calendar_uid];
         assert!(side.segs[0].start >= cap);
         let unlinked = sched.get(3).unwrap();
@@ -9955,6 +9963,124 @@ mod tests {
         }
     }
 
+    /// #1594 r13: a binding Finish No Later Than holds an undelayed milestone
+    /// at the constraint's own instant in the leveler too. X (three days)
+    /// and A (one day) share R1; M (FS after A, FNLT Wednesday 17:00) is
+    /// followed an elapsed hour later by T (one hour, R2); Z (held, R2)
+    /// holds Thursday 09:00. A levels to Thursday, the cap holds M at
+    /// Wednesday 17:00, T is Thursday 08:00 with no delay, as committed.
+    #[test]
+    fn a_capped_undelayed_milestone_is_held_at_the_caps_instant() {
+        let mut m = task(3, "M", 0);
+        m.predecessors.push(fs(2));
+        m.constraint = ConstraintType::FinishNoLaterThan;
+        m.constraint_date = Some(at(4, 17));
+        let mut t = task(4, "T", 60);
+        t.predecessors
+            .push(lag_link(3, LinkType::FinishStart, 60, 8));
+        let mut z = task(5, "Z", 60);
+        z.constraint = ConstraintType::StartNoEarlierThan;
+        z.constraint_date = Some(at(5, 9));
+        let proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![task(1, "X", 3 * 480), task(2, "A", 480), m, t, z],
+            resources: vec![worker(1, "R1", 1.0), worker(2, "R2", 1.0)],
+            assignments: vec![
+                assign(1, 1, 1, 1.0),
+                assign(2, 2, 1, 1.0),
+                assign(4, 4, 2, 1.0),
+                assign(5, 5, 2, 1.0),
+            ],
+            ..Project::default()
+        };
+        let movable: std::collections::HashSet<i32> = [2, 3, 4].into_iter().collect();
+        let lv = level_with(
+            &proj,
+            &LevelScope {
+                movable: Some(&movable),
+                ..LevelScope::default()
+            },
+        );
+        assert_eq!(lv.start(2), Some(at(5, 8)), "A Thursday");
+        assert_eq!(lv.start(3), Some(at(4, 17)), "M held at its cap");
+        assert_eq!(lv.start(4), Some(at(5, 8)), "T Thursday 08:00");
+        assert_eq!(lv.delay_min(4), Some(0), "T takes no delay");
+        let mut written = proj.clone();
+        written.tasks[1].leveling_delay = Some(3 * 1440 * 10);
+        written.tasks[1].leveling_delay_format = Some(8);
+        let sched = schedule(&written);
+        assert_eq!(sched.get(3).unwrap().early_start, at(4, 17));
+        assert_eq!(sched.get(4).unwrap().early_start, at(5, 8));
+    }
+
+    /// #1594 r13: the same for a Start No Later Than milestone whose
+    /// start-to-start predecessor levels onto the cap's index. X (two days)
+    /// and A (one day) share R1; M (SS after A, SNLT Tuesday 17:00) is
+    /// followed an elapsed hour later by T (one hour, R2); Y (held, R2)
+    /// holds Wednesday 09:00. A levels to Wednesday 08:00, the cap holds M
+    /// at Tuesday 17:00, T is Wednesday 08:00 with no delay.
+    #[test]
+    fn a_capped_undelayed_ss_milestone_is_held_at_the_caps_instant() {
+        let mut m = task(3, "M", 0);
+        m.predecessors.push(lag_link(2, LinkType::StartStart, 0, 8));
+        m.constraint = ConstraintType::StartNoLaterThan;
+        m.constraint_date = Some(at(3, 17));
+        let mut t = task(4, "T", 60);
+        t.predecessors
+            .push(lag_link(3, LinkType::FinishStart, 60, 8));
+        let mut y = task(5, "Y", 60);
+        y.constraint = ConstraintType::StartNoEarlierThan;
+        y.constraint_date = Some(at(4, 9));
+        let proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![task(1, "X", 960), task(2, "A", 480), m, t, y],
+            resources: vec![worker(1, "R1", 1.0), worker(2, "R2", 1.0)],
+            assignments: vec![
+                assign(1, 1, 1, 1.0),
+                assign(2, 2, 1, 1.0),
+                assign(4, 4, 2, 1.0),
+                assign(5, 5, 2, 1.0),
+            ],
+            ..Project::default()
+        };
+        let movable: std::collections::HashSet<i32> = [2, 3, 4].into_iter().collect();
+        let lv = level_with(
+            &proj,
+            &LevelScope {
+                movable: Some(&movable),
+                ..LevelScope::default()
+            },
+        );
+        assert_eq!(lv.start(2), Some(at(4, 8)), "A Wednesday");
+        assert_eq!(lv.start(3), Some(at(3, 17)), "M held at its cap");
+        assert_eq!(lv.start(4), Some(at(4, 8)), "T Wednesday 08:00");
+        assert_eq!(lv.delay_min(4), Some(0), "T takes no delay");
+        let mut written = proj.clone();
+        written.tasks[1].leveling_delay = Some(2880 * 10);
+        written.tasks[1].leveling_delay_format = Some(8);
+        let sched = schedule(&written);
+        assert_eq!(sched.get(3).unwrap().early_start, at(3, 17));
+        assert_eq!(sched.get(4).unwrap().early_start, at(4, 8));
+    }
+
+    /// #1594 r13: an absurd imported delay on an unlinked pre-start task
+    /// builds no timeline past the horizon: the window reaches the forward
+    /// pass's early start, which the horizon already bounds.
+    #[test]
+    fn an_oversized_stored_delay_on_a_pre_start_task_stays_within_the_horizon() {
+        let mut proj = unlinked_deadline(
+            ConstraintType::MustStartOn,
+            DateTime::from_ymd_hm(2026, 2, 27, 8, 0),
+            true,
+        );
+        proj.tasks[1].leveling_delay = Some(1_000_000_000_000);
+        proj.tasks[1].leveling_delay_format = Some(8);
+        let r = *schedule(&proj).get(2).unwrap();
+        assert!(r.early_start >= proj.start_date.unwrap());
+        assert_eq!(r.late_start, DateTime::from_ymd_hm(2026, 2, 27, 8, 0));
+        assert!(r.total_slack_min < 0);
+    }
+
     /// #1594 r12: without a stored delay a milestone placed on its CPM index
     /// keeps the instant the placement took. X (two days) and Q (one day)
     /// share R1; A (two days, no resource) ends Tuesday 17:00 and drives M
@@ -10489,6 +10615,11 @@ mod tests {
         };
         let lv = level(&proj);
         assert_eq!(lv.start(2), Some(at(3, 8)), "A Tuesday");
+        assert_eq!(
+            lv.start(3),
+            Some(at(4, 8)),
+            "M Wednesday 08:00, the delay's snap (r13)"
+        );
         assert_eq!(lv.start(4), Some(at(4, 8)), "T Wednesday 08:00");
         assert_eq!(lv.delay_min(3), Some(0));
         assert_eq!(lv.delay_min(4), Some(0));

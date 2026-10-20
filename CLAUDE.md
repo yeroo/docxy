@@ -553,15 +553,17 @@
   No Later Than takes the earlier of demand and cap (a binding cap holds a
   milestone at the constraint's own instant), every other constraint is a
   floor the demand may pass, two instants on one working index compared as
-  instants (a summary predecessor's demand and an undelayed milestone's
-  placed instant included); so
+  instants (a summary predecessor's demand included); so
   a Start No Earlier Than, a cap, or another predecessor that still drives
   later absorbs the move and the task takes no delay
   (`Schedule::delay_driven` holds the start a stored delay was added to). A
   kept delay is rebuilt from that driven start plus the delay, snapped on
   the task's own calendar, and its own increment is measured from the
   unsnapped delayed instant, so the forward pass's one snap of driven + kept
-  + own lands on the placement. A task on another calendar whose predecessor
+  + own lands on the placement. A milestone's reported start is that snap
+  when a kept delay put it there, else the demand the placement took (an FS
+  evening, a held cap instant, a snapped start-type demand), as the forward
+  pass starts it. A task on another calendar whose predecessor
   moved is estimated at the default calendar's next working minute (its
   committed dates are the forward pass's), so its own delay there may need a
   further pass. `Schedule::start_before_delay` is what Move Task counts
@@ -571,7 +573,7 @@
   snap back, a fixed successor's cap on its ALAP predecessors counts the
   intervening tasks' stored delays but never a summary successor's (the
   forward pass applies no summary's), and an unlinked task's pre-start
-  window reaches its delayed start. A
+  window reaches its early start as the forward pass bounded it. A
   summary link's free-slack bound takes each successor's delay before the
   group's minimum; the timeline's horizon budgets stored delays; equal
   priorities level in readiness order.
