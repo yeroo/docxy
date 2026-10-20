@@ -412,7 +412,7 @@ pub fn dedupe_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, has_header
         let dest = start + i as u32;
         for (c, cell) in row.into_iter().enumerate() {
             match cell {
-                Some(cl) => s.set_cell(dest, c as u32, cl),
+                Some(cl) => s.put_pinned(dest, c as u32, cl),
                 None => {
                     s.cells.remove(&(dest, c as u32));
                 }
@@ -3366,6 +3366,27 @@ mod tests {
         assert_eq!(row(&w, 2), vec![n(1.0), n(2.0), n(3.0)]);
         assert_eq!(row(&w, 0), vec![CellValue::Empty; 3]);
         assert_eq!(w.sheets[0].cell(2, 4).unwrap().spill, Some((1, 3)));
+    }
+
+    #[test]
+    fn dedupe_rows_moves_a_pinned_blank_onto_an_absent_slot() {
+        let mut w = wb(&[
+            ("A1", Cell::text("x")),
+            ("A2", Cell::text("x")), // dup, removed
+            ("A3", Cell::text("y")),
+        ]);
+        w.sheets[0].col_defs.push(crate::sheet::ColDef {
+            min: 1,
+            max: 1,
+            width: None,
+            attrs: r#"style="7""#.to_string(),
+            default_width: false,
+            plain_width: false,
+        });
+        w.sheets[0].put_pinned(2, 1, Cell::default()); // B3 pins, row 3 moves up
+        assert_eq!(dedupe_rows(&mut w, 0, 0, 2, false), 1);
+        assert!(w.sheets[0].cell(1, 1).is_some(), "the pin moved to B2");
+        assert!(w.sheets[0].cell(2, 1).is_none());
     }
 
     #[test]

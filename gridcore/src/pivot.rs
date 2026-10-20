@@ -568,15 +568,20 @@ pub fn refresh_pivots(wb: &mut Workbook) -> RefreshOutcome {
                     Value::Bool(b) => CellValue::Bool(b),
                     Value::Err(e) => CellValue::Error(e.code().to_string()),
                 };
-                sheet.set_cell(
-                    r,
-                    c,
-                    crate::sheet::Cell {
-                        value,
-                        style,
-                        ..crate::sheet::Cell::default()
-                    },
-                );
+                if value.is_empty() && style == 0 {
+                    // A vacated output cell: the engine's, not a pin.
+                    sheet.cells.remove(&(r, c));
+                } else {
+                    sheet.set_cell(
+                        r,
+                        c,
+                        crate::sheet::Cell {
+                            value,
+                            style,
+                            ..crate::sheet::Cell::default()
+                        },
+                    );
+                }
                 out.changed.push((p.sheet, r, c));
             }
         }
@@ -938,6 +943,70 @@ mod tests {
         let v = nums(&wb);
         assert!(v.contains(&40.0), "page-filtered East 40 missing: {v:?}");
         assert!(!v.contains(&60.0), "page filter leaked West: {v:?}");
+    }
+
+    /// #1097: the cells a smaller pivot vacates are the engine's own output,
+    /// not pins, whatever column style they sit under.
+    #[test]
+    fn a_shrinking_pivot_leaves_no_pin_under_a_column_style() {
+        use crate::sheet::{Cell, ColDef, Sheet};
+        let mut data = Sheet {
+            name: "Data".into(),
+            ..Sheet::default()
+        };
+        for (c, h) in ["Region", "Sales"].iter().enumerate() {
+            data.set_cell(0, c as u32, Cell::text(h));
+        }
+        for (i, (reg, v)) in [("East", 100.0), ("West", 50.0)].iter().enumerate() {
+            data.set_cell(i as u32 + 1, 0, Cell::text(reg));
+            data.set_cell(i as u32 + 1, 1, Cell::number(*v));
+        }
+        let mut wb = Workbook {
+            sheets: vec![data, Sheet::default()],
+            ..Workbook::default()
+        };
+        let mut piv = new_pivot();
+        piv.sheet = 1;
+        piv.location = (0, 0, 2, 1);
+        piv.source = PivotSource::Range {
+            sheet: "Data".into(),
+            rect: (0, 0, 2, 1),
+        };
+        piv.fields = vec!["Region".into(), "Sales".into()];
+        piv.row_fields = vec![0];
+        piv.data_fields = vec![DataField {
+            name: "Sales".into(),
+            field: 1,
+            agg: Agg::Sum,
+        }];
+        wb.pivots.push(piv);
+        assert_eq!(refresh_pivots(&mut wb).refreshed, 1);
+        let rows = wb.pivots[0].location.2;
+        for (min, max) in [(0, 0), (1, 1)] {
+            wb.sheets[1].col_defs.push(ColDef {
+                min,
+                max,
+                width: None,
+                attrs: r#"style="7""#.to_string(),
+                default_width: false,
+                plain_width: false,
+            });
+        }
+        // Drop West: the pivot loses a row, and its last row's cells go.
+        wb.sheets[0].cells.remove(&(2, 0));
+        wb.sheets[0].cells.remove(&(2, 1));
+        wb.pivots[0].source = PivotSource::Range {
+            sheet: "Data".into(),
+            rect: (0, 0, 1, 1),
+        };
+        assert_eq!(refresh_pivots(&mut wb).refreshed, 1);
+        let now = wb.pivots[0].location.2;
+        assert!(now < rows, "the pivot shrank");
+        for r in now + 1..=rows {
+            for c in 0..2 {
+                assert!(wb.sheets[1].cell(r, c).is_none(), "({r},{c}) is a pin");
+            }
+        }
     }
 
     #[test]

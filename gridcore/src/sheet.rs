@@ -1601,8 +1601,11 @@ impl Sheet {
     /// [`Sheet::clear_cell`] for a value the engine wrote itself (a spill's
     /// output over an absent slot): a style-0 cell goes, whatever its row or
     /// column style, so the engine never leaves a pin behind. A styled cell
-    /// keeps its style.
+    /// keeps its style. It cannot tell a cell the engine made from a
+    /// file-pinned blank a spill overwrote, so that pin goes too (as it did
+    /// before #1097); spill slots are not tracked.
     pub fn clear_cell_unpinned(&mut self, row: u32, col: u32) {
+        // Any style-0 cell, a file-pinned blank included (see above).
         if self.cells.get(&(row, col)).is_some_and(|c| c.style == 0) {
             self.cells.remove(&(row, col));
         } else {
