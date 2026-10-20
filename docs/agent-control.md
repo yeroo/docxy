@@ -82,8 +82,11 @@ working time and a finish its last; `null` clears) and `actual_duration` and
 and the task's other actuals consistent: an actual duration sets % Complete and
 the remaining duration, a remaining duration also sets the duration, an actual
 finish completes the task (100 %), and clearing the actual start clears every
-actual. A `percent_complete` given with one of them must equal the result, or
-the call is refused. They are refused on summaries and milestones, and not
+actual. A `percent_complete` given with an actual finish date, `actual_duration`
+or `remaining_duration` must equal the result, or the call is refused; with only
+`actual_start` or a cleared `actual_finish` it applies after them, and a started
+task takes that share of its duration as its actual duration. A `duration` given
+with `remaining_duration` must equal the actual plus the remaining. They are refused on summaries and milestones, and not
 measured against Project beyond its progress fixture. Every field given applies
 with the patch as one undo step, and a refused field applies nothing. `proj.get` reads the plan's settings as
 Project's Project Information dialog shows them (#1587): `title`, `start`,

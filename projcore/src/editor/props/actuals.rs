@@ -78,15 +78,20 @@ impl Editor {
             .ok_or_else(|| "The task has no start".into())
     }
 
-    /// Write `new` over task `i`; `Ok(false)` when it changes nothing.
+    /// Write `new` over task `i`, which was `old` before the edit began; `Ok(false)` when it changes nothing.
     /// `snapshotted` says the edit's undo step is already open. A change to
     /// the completed part (its start or the work done) drops `Stop`/`Resume`,
     /// which would otherwise end it where the old one did; a change that
     /// leaves it alone (the remaining duration) keeps them. A manual task's
     /// stored Start/Finish are restamped from the new progress, its pinned
     /// start kept.
-    fn store_progress(&mut self, i: usize, new: Progress, snapshotted: bool) -> bool {
-        let old = Progress::of(&self.proj.tasks[i]);
+    fn store_progress(
+        &mut self,
+        i: usize,
+        old: Progress,
+        new: Progress,
+        snapshotted: bool,
+    ) -> bool {
         if old == new && !snapshotted {
             return false;
         }
@@ -120,12 +125,21 @@ impl Editor {
     pub fn set_actual_start(&mut self, uid: i32, start: Option<DateTime>) -> Result<bool, String> {
         let i = self.progress_row(uid)?;
         let mut p = Progress::of(&self.proj.tasks[i]);
+        let old = p;
         match start {
             Some(start) => {
                 if p.finish.is_some_and(|finish| finish < start) {
                     return Err("Actual Start is after the actual finish".into());
                 }
                 p.start = Some(start);
+                // Work is now recorded: pin down the done share, so a stale
+                // stored RemainingDuration never becomes a scheduling input
+                // (`Task::tracked` reads it while no actual duration is).
+                if p.actual.is_none() && p.finish.is_none() {
+                    let done = p.done();
+                    p.actual = Some(done);
+                    p.remaining = Some(p.duration - done);
+                }
             }
             None => {
                 p.start = None;
@@ -135,7 +149,7 @@ impl Editor {
                 p.percent = 0;
             }
         }
-        Ok(self.store_progress(i, p, false))
+        Ok(self.store_progress(i, old, p, false))
     }
 
     /// Set the task's Actual Finish (`None` clears it). A finish completes the
@@ -151,6 +165,7 @@ impl Editor {
     ) -> Result<bool, String> {
         let i = self.progress_row(uid)?;
         let mut p = Progress::of(&self.proj.tasks[i]);
+        let old = p;
         match finish {
             Some(finish) => {
                 let start = match p.start {
@@ -183,7 +198,7 @@ impl Editor {
                 }
             }
         }
-        Ok(self.store_progress(i, p, false))
+        Ok(self.store_progress(i, old, p, false))
     }
 
     /// Set the task's Actual Duration in working minutes, 0 to its duration.
@@ -196,6 +211,7 @@ impl Editor {
     pub fn set_actual_duration(&mut self, uid: i32, minutes: i64) -> Result<bool, String> {
         let i = self.progress_row(uid)?;
         let mut p = Progress::of(&self.proj.tasks[i]);
+        let old = p;
         if minutes < 0 {
             return Err("Actual duration cannot be negative".into());
         }
@@ -214,7 +230,7 @@ impl Editor {
         p.actual = Some(minutes);
         p.remaining = p.finish.is_none().then(|| p.duration - minutes);
         p.percent = percent_of(minutes, p.duration);
-        Ok(self.store_progress(i, p, false))
+        Ok(self.store_progress(i, old, p, false))
     }
 
     /// Set the task's Remaining Duration in working minutes: the duration
@@ -226,6 +242,7 @@ impl Editor {
     pub fn set_remaining_duration(&mut self, uid: i32, minutes: i64) -> Result<bool, String> {
         let i = self.progress_row(uid)?;
         let mut p = Progress::of(&self.proj.tasks[i]);
+        let old = p;
         if minutes < 0 {
             return Err("Remaining duration cannot be negative".into());
         }
@@ -253,7 +270,7 @@ impl Editor {
             p.remaining = None;
         }
         if duration == old_duration {
-            return Ok(self.store_progress(i, p, false));
+            return Ok(self.store_progress(i, old, p, false));
         }
         // The duration goes through the same edit as a typed one (work
         // rescales, an estimate is committed, a pinned task restamps); its
@@ -264,7 +281,7 @@ impl Editor {
         };
         self.update_task(uid, patch)?;
         let i = self.index(uid)?;
-        self.store_progress(i, p, true);
+        self.store_progress(i, old, p, true);
         Ok(true)
     }
 }

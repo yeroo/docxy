@@ -18,7 +18,7 @@
 //! | `task.list` | `{fields?}` | `{count, tasks:[{uid, id, outline_number, name, level, manual, duration, start, finish, critical, …}]}` |
 //! | `task.get` | `{uid, fields?}` | one task |
 //! | `task.fields` | — | `{count, fields:[name…]}`: the field names `fields` can read |
-//! | `task.set` | `{uid, name?, duration?, level?, manual?, percent_complete?, actual_start?, actual_finish?, actual_duration?, remaining_duration?, priority?, deadline?, constraint?, task_type?, effort_driven?, notes?, milestone?, calendar?, ignore_resource_calendar?, wbs?, earned_value_method?, custom?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled). The Task Information fields (#1550): `percent_complete` 0–100, the Update Tasks fields (#1568) `actual_start` / `actual_finish` (a date as for `deadline`, an actual start taking the day's first working time and a finish its last, or `null` to clear) and `actual_duration` / `remaining_duration` (durations: setting one adjusts % Complete, the remaining duration also the task's duration; an actual finish completes the task; a `percent_complete` that contradicts them is refused), `priority` 0–1000, `deadline` a date (`YYYY-MM-DD`, the day's last working time, or `YYYY-MM-DDTHH:MM`) or `null`, `constraint` `{type, date?}` with the type `ASAP`/`ALAP`/`MSO`/`MFO`/`SNET`/`SNLT`/`FNET`/`FNLT`, `task_type` `fixed-units`/`fixed-duration`/`fixed-work`, `effort_driven` and `milestone` booleans, `notes` text (`\n` line breaks), `calendar` a base calendar's name or uid or `null`, `ignore_resource_calendar` a boolean, `wbs` text, `earned_value_method` `percent-complete`/`physical-percent-complete`. `custom` (#1554) is an object of Project custom field names to values as typed in the cell (`{"Text1": "Civil", "Flag3": true, "Date1": "2026-03-09", "Duration1": "3d", "Cost1": "$1,400", "Number1": null}`; `null` or `""` clears): the field needs a definition in the plan, a formula field is refused, a lookup-table field takes one of its values. Every argument is checked and all apply in one undo step, or none does |
+//! | `task.set` | `{uid, name?, duration?, level?, manual?, percent_complete?, actual_start?, actual_finish?, actual_duration?, remaining_duration?, priority?, deadline?, constraint?, task_type?, effort_driven?, notes?, milestone?, calendar?, ignore_resource_calendar?, wbs?, earned_value_method?, custom?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled). The Task Information fields (#1550): `percent_complete` 0–100, the Update Tasks fields (#1568) `actual_start` / `actual_finish` (a date as for `deadline`, an actual start taking the day's first working time and a finish its last, or `null` to clear) and `actual_duration` / `remaining_duration` (durations: setting one adjusts % Complete, the remaining duration also the task's duration; an actual finish completes the task; a `percent_complete` given with an actual finish date, `actual_duration` or `remaining_duration` must equal the % they make or is refused, and with only `actual_start` or a cleared finish it applies after them, a started task getting that share as its actual duration; a `duration` given with `remaining_duration` must equal the actual plus the remaining), `priority` 0–1000, `deadline` a date (`YYYY-MM-DD`, the day's last working time, or `YYYY-MM-DDTHH:MM`) or `null`, `constraint` `{type, date?}` with the type `ASAP`/`ALAP`/`MSO`/`MFO`/`SNET`/`SNLT`/`FNET`/`FNLT`, `task_type` `fixed-units`/`fixed-duration`/`fixed-work`, `effort_driven` and `milestone` booleans, `notes` text (`\n` line breaks), `calendar` a base calendar's name or uid or `null`, `ignore_resource_calendar` a boolean, `wbs` text, `earned_value_method` `percent-complete`/`physical-percent-complete`. `custom` (#1554) is an object of Project custom field names to values as typed in the cell (`{"Text1": "Civil", "Flag3": true, "Date1": "2026-03-09", "Duration1": "3d", "Cost1": "$1,400", "Number1": null}`; `null` or `""` clears): the field needs a definition in the plan, a formula field is refused, a lookup-table field takes one of its values. Every argument is checked and all apply in one undo step, or none does |
 //! | `task.add` | `{after?, name?, duration?}` | the new task (without `duration`, 1 day, estimated when the plan's `NewTasksEstimated` is; inserted `after` a task that a finish-to-start link joins to the next, it is linked into that chain when the plan's `Autolink` is on, as it is by default) |
 //! | `task.del` | `{uid}` | `{deleted, removed:[uid…]}` (a summary takes its subtree) |
 //! | `link.add` | `{uid, pred, type?, lag?}` | the updated task (`lag` uses Predecessors cell spellings such as `4h`, `2ed`, `50%`; other duration spellings such as `1 month` are read as working-days lags) |
@@ -915,6 +915,15 @@ impl TaskInfoArgs {
                     ));
                 }
             } else {
+                // A started task keeps its actual and remaining duration at
+                // the percent's share of the duration, as an actual duration
+                // would; a task with no actual start just takes the percent.
+                let t = ed.project().task(uid);
+                let started = t.is_some_and(|t| t.actual_start.is_some());
+                let duration = t.map_or(0, |t| t.duration_min);
+                if started && (1..100).contains(&p) {
+                    ed.set_actual_duration(uid, (duration * i64::from(p) + 50) / 100)?;
+                }
                 ed.set_percent_complete(uid, p)?;
             }
         }
@@ -3220,7 +3229,12 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(task(&a).percent_complete, Some(50));
+        let t = task(&a);
+        assert_eq!(
+            (t.percent_complete, t.actual_duration_min),
+            (Some(50), Some(t.duration_min / 2)),
+            "the recorded actual follows the percent"
+        );
         let err = set(
             &mut a,
             vec![
@@ -3252,8 +3266,36 @@ mod tests {
             ),
             (Some(9), Some(10))
         );
+        // A finished task cleared to 50 %: its actual is 50 % of the duration.
+        set(
+            &mut a,
+            vec![("actual_finish", Json::Str("2026-03-10".into()))],
+        )
+        .unwrap();
+        set(
+            &mut a,
+            vec![
+                ("actual_finish", Json::Null),
+                ("percent_complete", Json::Num(50.0)),
+            ],
+        )
+        .unwrap();
+        let t = task(&a);
+        assert_eq!(
+            (
+                t.percent_complete,
+                t.actual_duration_min,
+                t.remaining_duration_min
+            ),
+            (
+                Some(50),
+                Some(t.duration_min / 2),
+                Some(t.duration_min - t.duration_min / 2)
+            )
+        );
         // A duration beside a remaining duration must agree with it.
         set(&mut a, vec![("actual_finish", Json::Null)]).unwrap();
+        let before = a.project().clone();
         let err = set(
             &mut a,
             vec![
@@ -3263,7 +3305,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("contradicts"), "{err}");
-        assert_ne!(a.project().task(uid as i32).unwrap().duration_min, 9 * 480);
+        assert_eq!(*a.project(), before);
     }
 
     /// The Task Information fields (#1550): every argument applies in the

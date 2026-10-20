@@ -299,3 +299,51 @@ fn a_started_task_asked_for_its_percent_is_unchanged() {
             .contains("actual start")
     );
 }
+
+#[test]
+fn starting_a_task_pins_down_its_done_share() {
+    let with = |percent, remaining| {
+        let mut proj = editor().project().clone();
+        let t = proj.tasks.iter_mut().find(|t| t.uid == 2).unwrap();
+        t.percent_complete = percent;
+        t.remaining_duration_min = remaining;
+        Editor::new(proj)
+    };
+    // A stale stored remaining duration (the duration was edited since).
+    let mut ed = with(None, Some(480));
+    assert_eq!(ed.set_actual_start(2, Some(at(5, 8))), Ok(true));
+    let t = pour(&ed);
+    assert_eq!(
+        (t.actual_duration_min, t.remaining_duration_min),
+        (Some(0), Some(1920))
+    );
+    let Some(crate::model::Tracked::InProgress { remaining_min, .. }) = t.tracked() else {
+        panic!("in progress")
+    };
+    assert_eq!(remaining_min, 1920);
+    // A % Complete the actual start now makes real.
+    let mut ed = with(Some(50), Some(1920));
+    ed.set_actual_start(2, Some(at(5, 8))).unwrap();
+    let t = pour(&ed);
+    assert_eq!(
+        (t.actual_duration_min, t.remaining_duration_min),
+        (Some(960), Some(960))
+    );
+}
+
+#[test]
+fn the_stop_check_compares_with_the_task_before_the_duration_edit() {
+    let mut proj = editor().project().clone();
+    let t = proj.tasks.iter_mut().find(|t| t.uid == 2).unwrap();
+    t.actual_start = Some(at(5, 8));
+    t.percent_complete = Some(50);
+    t.stop = Some(at(6, 17));
+    t.resume = Some(at(8, 8));
+    let mut ed = Editor::new(proj);
+    assert_eq!(ed.set_remaining_duration(2, 480), Ok(true));
+    assert_eq!(
+        pour(&ed).resume,
+        Some(at(8, 8)),
+        "the work done is the same 960"
+    );
+}
