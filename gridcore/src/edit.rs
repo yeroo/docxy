@@ -1196,6 +1196,7 @@ pub fn remove_sheet_refs(wb: &mut Workbook, removed: &[String]) {
     if removed.is_empty() {
         return;
     }
+    remove_sheet_refs_in_rules(wb, removed);
     let mut rewritten = Vec::new();
     for (s, sheet) in wb.sheets.iter_mut().enumerate() {
         for (&(r, c), cell) in sheet.cells.iter_mut() {
@@ -1253,6 +1254,24 @@ pub fn remove_sheet_refs(wb: &mut Workbook, removed: &[String]) {
                 }
             }
         }
+    }
+}
+
+/// The rules' part of [`remove_sheet_refs`]: every conditional-formatting
+/// formula (a rule's, a threshold's, an Excel 2010 one's) and data-validation
+/// formula on any sheet that names a sheet in `removed` now reads `#REF!`, as
+/// a cell's does. Text that names none stays as loaded. Idempotent.
+pub fn remove_sheet_refs_in_rules(wb: &mut Workbook, removed: &[String]) {
+    if removed.is_empty() {
+        return;
+    }
+    for sheet in &mut wb.sheets {
+        for_each_rule_formula(sheet, true, |_, src| {
+            let rewrite = |e: &Expr| crate::formula::remove_sheet_refs_in_expr(e, removed);
+            if let Some(updated) = rewrite_if_changed(src, rewrite) {
+                *src = updated;
+            }
+        });
     }
 }
 
@@ -1789,8 +1808,9 @@ fn delete_table_columns(wb: &mut Workbook, idx: usize, shift: &EditShift) {
     }
 }
 
-/// Every conditional-formatting formula on `sheet`, and with `validations`
-/// every data-validation formula too.
+/// Every conditional-formatting formula on `sheet` (a rule's `<formula>`s, the
+/// `val`s of its `formula` thresholds, and the Excel 2010 `extLst` ones), and
+/// with `validations` every data-validation formula too.
 fn for_each_rule_formula(
     sheet: &mut Sheet,
     validations: bool,
@@ -1800,6 +1820,16 @@ fn for_each_rule_formula(
         for rule in &mut cf.rules {
             for src in rule.formulas_mut() {
                 f(&cf.ranges, src);
+            }
+            for src in rule.cfvo_formulas_mut() {
+                f(&cf.ranges, src);
+            }
+        }
+    }
+    for ext in &mut sheet.ext_rules {
+        if validations || ext.kind == crate::sheet::ExtKind::Cf {
+            for src in &mut ext.formulas {
+                f(&ext.ranges, src);
             }
         }
     }
@@ -1982,6 +2012,27 @@ fn shift_rules(sheet: &mut Sheet, home_is_target: bool, target: &str, shift: &Ed
             for f in rule.formulas_mut() {
                 shift_rule_formula(f, by, home_is_target, target, shift);
             }
+            for f in rule.cfvo_formulas_mut() {
+                shift_rule_formula(f, by, home_is_target, target, shift);
+            }
+        }
+        true
+    });
+    let removed = &mut sheet.ext_removed;
+    sheet.ext_rules.retain_mut(|ext| {
+        let by = if home_is_target {
+            match shift_rule_ranges(&mut ext.ranges, shift) {
+                Some(by) => by,
+                None => {
+                    removed.push((ext.kind, ext.ix));
+                    return false;
+                }
+            }
+        } else {
+            (0, 0)
+        };
+        for f in &mut ext.formulas {
+            shift_rule_formula(f, by, home_is_target, target, shift);
         }
         true
     });

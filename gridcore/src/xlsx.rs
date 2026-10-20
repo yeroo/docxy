@@ -2509,6 +2509,18 @@ fn parse_worksheet_with(
     let mut cf_icons: Option<(String, bool, Vec<crate::sheet::Cfvo>)> = None;
     let mut in_cf_formula = false;
     let mut cf_formula_buf = String::new();
+    // A colorScale's or dataBar's `<cfvo>` thresholds.
+    let mut cf_cfvos: Vec<crate::sheet::Cfvo> = Vec::new();
+    // Excel 2010 `extLst` conditional formatting and validation, read to be
+    // moved: how deep in `extLst`s the parser is, the element being read
+    // (with its x14 ordinal, from where `x14_spans` finds it), the text it is
+    // collecting (`sqref` or `f`) and where those elements stand.
+    let mut ext_depth = 0usize;
+    let mut cur_ext: Option<crate::sheet::ExtRule> = None;
+    let mut ext_text: Option<bool> = None; // Some(true) = sqref, Some(false) = f
+    let mut ext_buf = String::new();
+    let ext_cf_spans = x14_spans(xml, crate::sheet::ExtKind::Cf);
+    let ext_dv_spans = x14_spans(xml, crate::sheet::ExtKind::Dv);
 
     // Where the worksheet's top-level blocks stand, as the save finds them, so
     // each one loaded from there knows its element ([`crate::sheet::CondFormat::ix`]).
@@ -2561,8 +2573,41 @@ fn parse_worksheet_with(
             (Event::End, Some(d)) => cols_depth = Some(d - 1),
             _ => {}
         }
+        // The classic rule readers below skip anything inside an `extLst`
+        // (a classic rule's own nested one too); the x14 arms here read only
+        // the x14 elements in the worksheet's top-level `extLst`s.
+        let in_ext = ext_depth > 0;
         match event {
             Event::Start => match local(p.name()) {
+                "extLst" => ext_depth += 1,
+                "conditionalFormatting" | "dataValidation" if in_ext && cur_ext.is_none() => {
+                    let kind = if local(p.name()) == "conditionalFormatting" {
+                        crate::sheet::ExtKind::Cf
+                    } else {
+                        crate::sheet::ExtKind::Dv
+                    };
+                    let spans = match kind {
+                        crate::sheet::ExtKind::Cf => &ext_cf_spans,
+                        crate::sheet::ExtKind::Dv => &ext_dv_spans,
+                    };
+                    let start = p.start_pos();
+                    cur_ext = spans.iter().position(|&(s, _)| s == start).map(|ix| {
+                        crate::sheet::ExtRule {
+                            kind,
+                            ranges: Vec::new(),
+                            formulas: Vec::new(),
+                            ix,
+                        }
+                    });
+                }
+                "sqref" if cur_ext.is_some() => {
+                    ext_text = Some(true);
+                    ext_buf.clear();
+                }
+                "f" if cur_ext.is_some() => {
+                    ext_text = Some(false);
+                    ext_buf.clear();
+                }
                 "cols" if cols_depth.is_none() && cols_starts.contains(&p.start_pos()) => {
                     cols_depth = Some(0);
                 }
@@ -2746,7 +2791,7 @@ fn parse_worksheet_with(
                     }
                 }
                 // Conditional formatting: a block of rules over `sqref` ranges.
-                "conditionalFormatting" => {
+                "conditionalFormatting" if !in_ext => {
                     let mut ranges = Vec::new();
                     for tok in p.attr("sqref").split_whitespace() {
                         if let Some(r) = parse_sqref_token(tok) {
@@ -2760,7 +2805,7 @@ fn parse_worksheet_with(
                         ix: cf_spans.iter().position(|&(s, _)| s == start),
                     });
                 }
-                "cfRule" if cur_cf.is_some() => {
+                "cfRule" if cur_cf.is_some() && !in_ext => {
                     cf_rule = Some((
                         p.attr("type").to_string(),
                         p.attr("operator").to_string(),
@@ -2768,9 +2813,10 @@ fn parse_worksheet_with(
                         p.attr("priority").parse::<i32>().unwrap_or(0),
                     ));
                     cf_formulas.clear();
+                    cf_cfvos.clear();
                     cf_icons = None;
                 }
-                "iconSet" if cf_rule.is_some() => {
+                "iconSet" if cf_rule.is_some() && !in_ext => {
                     let set = match p.attr("iconSet") {
                         "" => "3TrafficLights1",
                         s => s,
@@ -2781,21 +2827,23 @@ fn parse_worksheet_with(
                         Vec::new(),
                     ));
                 }
-                "cfvo" if cf_icons.is_some() => {
-                    if let Some((_, _, cfvos)) = cf_icons.as_mut() {
-                        cfvos.push(crate::sheet::Cfvo {
-                            kind: p.attr("type").to_string(),
-                            val: decode(p.attr("val")),
-                            gte: !matches!(p.attr("gte"), "0" | "false"),
-                        });
+                "cfvo" if cf_rule.is_some() && !in_ext => {
+                    let cfvo = crate::sheet::Cfvo {
+                        kind: p.attr("type").to_string(),
+                        val: decode(p.attr("val")),
+                        gte: !matches!(p.attr("gte"), "0" | "false"),
+                    };
+                    match cf_icons.as_mut() {
+                        Some((_, _, cfvos)) => cfvos.push(cfvo),
+                        None => cf_cfvos.push(cfvo),
                     }
                 }
-                "formula" if cf_rule.is_some() => {
+                "formula" if cf_rule.is_some() && !in_ext => {
                     in_cf_formula = true;
                     cf_formula_buf.clear();
                 }
                 // Data validation: a constraint (list/number/date/…) over `sqref`.
-                "dataValidation" => {
+                "dataValidation" if !in_ext => {
                     let mut ranges = Vec::new();
                     for tok in p.attr("sqref").split_whitespace() {
                         if let Some(r) = parse_sqref_token(tok) {
@@ -2824,11 +2872,11 @@ fn parse_worksheet_with(
                         orig: None,
                     });
                 }
-                "formula1" if cur_dv.is_some() => {
+                "formula1" if cur_dv.is_some() && !in_ext => {
                     dv_formula = 1;
                     dv_buf.clear();
                 }
-                "formula2" if cur_dv.is_some() => {
+                "formula2" if cur_dv.is_some() && !in_ext => {
                     dv_formula = 2;
                     dv_buf.clear();
                 }
@@ -2841,8 +2889,35 @@ fn parse_worksheet_with(
                 if dv_formula > 0 {
                     dv_buf.push_str(p.text());
                 }
+                if ext_text.is_some() {
+                    ext_buf.push_str(p.text());
+                }
             }
             Event::End => match local(p.name()) {
+                "extLst" => ext_depth = ext_depth.saturating_sub(1),
+                "sqref" | "f" if ext_text.is_some() => {
+                    let text = decode(&std::mem::take(&mut ext_buf));
+                    if let Some(rule) = cur_ext.as_mut() {
+                        if ext_text == Some(true) {
+                            rule.ranges
+                                .extend(text.split_whitespace().filter_map(parse_sqref_token));
+                        } else {
+                            rule.formulas.push(text);
+                        }
+                    }
+                    ext_text = None;
+                }
+                "conditionalFormatting" | "dataValidation"
+                    if in_ext
+                        && cur_ext.as_ref().is_some_and(|r| {
+                            (r.kind == crate::sheet::ExtKind::Cf)
+                                == (local(p.name()) == "conditionalFormatting")
+                        }) =>
+                {
+                    if let Some(rule) = cur_ext.take().filter(|r| !r.ranges.is_empty()) {
+                        sheet.ext_rules.push(rule);
+                    }
+                }
                 "sheetData" => in_sheet_data = false,
                 "row" if in_sheet_data => cur_row += 1,
                 "rowBreaks" | "colBreaks" => in_breaks = None,
@@ -2876,6 +2951,7 @@ fn parse_worksheet_with(
                             _ => CfKind::Other {
                                 rule_type: ty.clone(),
                                 formulas: std::mem::take(&mut cf_formulas),
+                                cfvos: std::mem::take(&mut cf_cfvos),
                             },
                         };
                         cf.rules.push(CfRule {
@@ -4882,6 +4958,7 @@ fn splice_worksheet(
     // Conditional formatting and data validation: likewise.
     let out = set_cond_formats(out, sheet);
     let out = set_validations(out, sheet);
+    let out = set_ext_rules(out, sheet);
     // Ignore Error: kept while it matches the load, else regenerated.
     let out = set_ignored_errors(out, sheet);
     // Hyperlinks: a removed link's element goes.
@@ -5131,21 +5208,7 @@ fn held_formulas(element: &str, name: &str) -> Vec<HeldFormula> {
     element_children(element)
         .into_iter()
         .filter(|(n, _, _)| n == name)
-        .map(|(_, s, e)| {
-            let f = &element[s..e];
-            let open = start_tag_end(f).unwrap_or(f.len());
-            let close = f.rfind("</").filter(|&c| c >= open && !f.ends_with("/>"));
-            match close {
-                Some(c) if !f[open..c].contains('<') => HeldFormula {
-                    text: decode(&f[open..c]),
-                    content: Some((s + open, s + c)),
-                },
-                _ => HeldFormula {
-                    text: String::new(),
-                    content: None,
-                },
-            }
-        })
+        .map(|(_, s, e)| held_text_at(element, (s, e)))
         .collect()
 }
 
@@ -5261,6 +5324,11 @@ fn set_cond_formats(xml: String, sheet: &Sheet) -> String {
                     .into_iter()
                     .map(|(s, e, t)| (rs + s, rs + e, t)),
             );
+            inner.extend(
+                cfvo_edits(&element[rs..re], rule.cfvos())
+                    .into_iter()
+                    .map(|(s, e, t)| (rs + s, rs + e, t)),
+            );
         }
         if held == cf.ranges && inner.is_empty() {
             continue;
@@ -5270,6 +5338,264 @@ fn set_cond_formats(xml: String, sheet: &Sheet) -> String {
             block = set_tag_attr_in_place(block, "sqref", &sqref_of(&cf.ranges));
         }
         edits.push((start, end, block));
+    }
+    apply_edits(xml, edits)
+}
+
+/// The descendants of `element` (a fragment that starts with its start tag)
+/// named `name` (any prefix), as spans relative to it, in document order;
+/// with `skip_ext` not those inside an `extLst`.
+fn descendant_spans(element: &str, name: &str, skip_ext: bool) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut p = XmlParser::new(element);
+    // The start of each open element that is one wanted, per level.
+    let mut open: Vec<Option<usize>> = Vec::new();
+    let mut in_ext = 0usize;
+    loop {
+        match p.next() {
+            Event::Start => {
+                let n = local(p.name());
+                let wanted = n == name && !open.is_empty() && !(skip_ext && in_ext > 0);
+                open.push(wanted.then(|| p.start_pos()));
+                if n == "extLst" {
+                    in_ext += 1;
+                }
+            }
+            Event::End => {
+                if let Some(start) = open.pop() {
+                    if local(p.name()) == "extLst" {
+                        in_ext = in_ext.saturating_sub(1);
+                    }
+                    if let Some(start) = start {
+                        out.push((start, p.pos()));
+                    }
+                }
+                if open.is_empty() {
+                    break;
+                }
+            }
+            Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// A text-only element's content as [`held_formulas`] reads it, for the
+/// element held at `span` of `fragment`; spans stay relative to `fragment`.
+fn held_text_at(fragment: &str, span: (usize, usize)) -> HeldFormula {
+    let (s, e) = span;
+    let f = &fragment[s..e];
+    let open = start_tag_end(f).unwrap_or(f.len());
+    let close = f.rfind("</").filter(|&c| c >= open && !f.ends_with("/>"));
+    match close {
+        Some(c) if !f[open..c].contains('<') => HeldFormula {
+            text: decode(&f[open..c]),
+            content: Some((s + open, s + c)),
+        },
+        _ => HeldFormula {
+            text: String::new(),
+            content: None,
+        },
+    }
+}
+
+/// The edits, relative to `rule` (a `<cfRule>` fragment), that write the
+/// `val` of each `type="formula"` threshold in `model` whose held `<cfvo>`
+/// says otherwise, in place. A `<cfvo>` of a nested `extLst` is not one of
+/// the rule's. Counts that differ leave them as they are.
+fn cfvo_edits(rule: &str, model: &[crate::sheet::Cfvo]) -> Vec<(usize, usize, String)> {
+    if !model.iter().any(|v| v.kind == "formula") {
+        return Vec::new();
+    }
+    let spans = descendant_spans(rule, "cfvo", true);
+    if spans.len() != model.len() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (&(s, e), cfvo) in spans.iter().zip(model) {
+        if cfvo.kind != "formula" {
+            continue;
+        }
+        let frag = &rule[s..e];
+        let Some(tag) = start_tag(frag) else {
+            continue;
+        };
+        let held = tag
+            .attrs
+            .iter()
+            .find(|(name, _, _)| *name == "val")
+            .map(|&(_, vs, ve)| decode(&frag[vs..ve]))
+            .unwrap_or_default();
+        if same_formula(&held, &cfvo.val) {
+            continue;
+        }
+        let text = esc_attr(&file_formula(&cfvo.val)).replace('\'', "&apos;");
+        out.push((s, e, set_tag_attr_in_place(frag.to_string(), "val", &text)));
+    }
+    out
+}
+
+/// The Excel 2010 `<x14:conditionalFormatting>` (`Cf`) or
+/// `<x14:dataValidation>` (`Dv`) elements in the worksheet's top-level
+/// `extLst`s, in document order, as (start, end) in `xml`. An
+/// [`crate::sheet::ExtRule::ix`] is its position here, for the loader and
+/// the save alike.
+fn x14_spans(xml: &str, kind: crate::sheet::ExtKind) -> Vec<(usize, usize)> {
+    if !xml.contains("extLst") {
+        return Vec::new();
+    }
+    let name = match kind {
+        crate::sheet::ExtKind::Cf => "conditionalFormatting",
+        crate::sheet::ExtKind::Dv => "dataValidation",
+    };
+    worksheet_children(xml)
+        .children
+        .iter()
+        .filter(|c| c.local == "extLst")
+        .flat_map(|c| {
+            descendant_spans(&xml[c.start..c.end], name, false)
+                .into_iter()
+                .map(|(s, e)| (c.start + s, c.start + e))
+        })
+        .collect()
+}
+
+/// Sync the worksheet's Excel 2010 `extLst` conditional formatting and
+/// validation with the model ([`Sheet::ext_rules`]): an element is matched by
+/// its [`crate::sheet::ExtRule::ix`], and left byte-for-byte alone while it
+/// holds the rule's ranges and formulas. A moved one gets a new `<xm:sqref>`
+/// and its changed `<xm:f>` texts; one an edit deleted
+/// ([`Sheet::ext_removed`]) loses its element, and the wrapper, `<ext>` and
+/// `<extLst>` that held only it go too, `count` of a `dataValidations` kept
+/// right. An element two rules claim, or whose parts don't read, is left as
+/// it is.
+fn set_ext_rules(xml: String, sheet: &Sheet) -> String {
+    use crate::sheet::ExtKind;
+    if sheet.ext_rules.is_empty() && sheet.ext_removed.is_empty() {
+        return xml;
+    }
+    let mut edits = Vec::new();
+    for kind in [ExtKind::Cf, ExtKind::Dv] {
+        for (k, &(start, end)) in x14_spans(&xml, kind).iter().enumerate() {
+            let element = &xml[start..end];
+            // The ranges first, as for the classic blocks: an element whose
+            // `xm:sqref` is not one that reads is left as it is, even when
+            // an edit deleted its rule.
+            let [sq] = descendant_spans(element, "sqref", false)[..] else {
+                continue;
+            };
+            let held = held_text_at(element, sq);
+            let read: Option<Vec<_>> = held
+                .text
+                .split_whitespace()
+                .map(parse_sqref_token)
+                .collect();
+            let (Some(read), Some((cs, ce))) = (read, held.content) else {
+                continue;
+            };
+            let held_f: Vec<HeldFormula> = descendant_spans(element, "f", false)
+                .into_iter()
+                .map(|span| held_text_at(element, span))
+                .collect();
+            // An `xm:f` that can't be rewritten in place (CDATA, a comment,
+            // self-closing) keeps the whole element as it is, so its formulas
+            // and its ranges never disagree.
+            if held_f.iter().any(|h| h.content.is_none()) {
+                continue;
+            }
+            let rule = match sole_claim(&sheet.ext_rules, k, |r| (r.kind == kind).then_some(r.ix)) {
+                Err(()) => continue,
+                Ok(None) => {
+                    if sheet.ext_removed.contains(&(kind, k)) {
+                        edits.push((start, end, String::new()));
+                    }
+                    continue;
+                }
+                Ok(Some(rule)) => rule,
+            };
+            if held_f.len() != rule.formulas.len() {
+                continue;
+            }
+            let model: Vec<&String> = rule.formulas.iter().collect();
+            let mut inner = formula_edits(&held_f, &model);
+            if read != rule.ranges {
+                inner.push((cs, ce, sqref_of(&rule.ranges)));
+            }
+            if !inner.is_empty() {
+                edits.push((start, end, apply_edits(element.to_string(), inner)));
+            }
+        }
+    }
+    let removed = !sheet.ext_removed.is_empty();
+    let out = apply_edits(xml, edits);
+    if removed { prune_ext_lists(out) } else { out }
+}
+
+/// After x14 elements were struck: the `x14:conditionalFormattings` /
+/// `x14:dataValidations` wrappers in the worksheet's `extLst` that hold none
+/// go, with the `<ext>` that held only them and the `<extLst>` that held
+/// only those. A `dataValidations` keeps a `count` that is its children's.
+fn prune_ext_lists(xml: String) -> String {
+    let wrapper = |n: &str| matches!(n, "conditionalFormattings" | "dataValidations");
+    let mut edits = Vec::new();
+    for list in worksheet_children(&xml)
+        .children
+        .iter()
+        .filter(|c| c.local == "extLst")
+    {
+        let list_xml = &xml[list.start..list.end];
+        let exts: Vec<_> = element_children(list_xml);
+        let mut list_edits = Vec::new();
+        let mut gone = 0;
+        for (n, es, ee) in &exts {
+            if n != "ext" {
+                continue;
+            }
+            let ext_xml = &list_xml[*es..*ee];
+            let kids = element_children(ext_xml);
+            let mut ext_edits = Vec::new();
+            let mut empty = 0;
+            for (kn, ks, ke) in &kids {
+                if !wrapper(kn) {
+                    continue;
+                }
+                let frag = &ext_xml[*ks..*ke];
+                let items = element_children(frag).len();
+                if items == 0 {
+                    empty += 1;
+                    ext_edits.push((*ks, *ke, String::new()));
+                } else if kn == "dataValidations" {
+                    let held = start_tag(frag).and_then(|t| {
+                        t.attrs
+                            .iter()
+                            .find(|(a, _, _)| *a == "count")
+                            .map(|&(_, vs, ve)| frag[vs..ve].to_string())
+                    });
+                    if held.is_some_and(|h| h != items.to_string()) {
+                        let block =
+                            set_tag_attr_in_place(frag.to_string(), "count", &items.to_string());
+                        ext_edits.push((*ks, *ke, block));
+                    }
+                }
+            }
+            if empty > 0 && empty == kids.len() {
+                gone += 1;
+                list_edits.push((*es, *ee, String::new()));
+            } else if !ext_edits.is_empty() {
+                list_edits.push((*es, *ee, apply_edits(ext_xml.to_string(), ext_edits)));
+            }
+        }
+        if gone > 0 && gone == exts.len() {
+            edits.push((list.start, list.end, String::new()));
+        } else if !list_edits.is_empty() {
+            edits.push((
+                list.start,
+                list.end,
+                apply_edits(list_xml.to_string(), list_edits),
+            ));
+        }
     }
     apply_edits(xml, edits)
 }
@@ -10072,6 +10398,9 @@ impl SheetPackage {
         // Excel; the removed sheet's own scoped names are dropped below.
         // Cell formulas are left to the caller (`edit::remove_sheet_refs`).
         let gone = [self.workbook.sheets[idx].name.clone()];
+        // So do the conditional-formatting and data-validation formulas that
+        // name it.
+        crate::edit::remove_sheet_refs_in_rules(&mut self.workbook, &gone);
         for d in &mut self.workbook.defined_names {
             if d.scope == Some(idx) {
                 continue;
@@ -23465,9 +23794,29 @@ mod rule_shift_tests {
         assert!(ws.contains(dv), "{ws}");
     }
 
+    const X14_NS: &str = r#"xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main""#;
+
+    /// An `extLst` with one x14 conditional-formatting block over `sqref`
+    /// whose rule reads `f`.
+    fn x14_cf(sqref: &str, f: &str) -> String {
+        format!(
+            r#"<extLst><ext uri="{{78C0D931-6437-407d-A8EE-F0AAD7539E65}}" {X14_NS}><x14:conditionalFormattings><x14:conditionalFormatting><x14:cfRule type="expression" priority="2" id="{{X}}"><xm:f>{f}</xm:f></x14:cfRule><xm:sqref>{sqref}</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>"#
+        )
+    }
+
+    /// An `extLst` with one x14 validation over `sqref`.
+    fn x14_dv(sqref: &str, f1: &str, f2: Option<&str>) -> String {
+        let f2 = f2.map_or(String::new(), |f| {
+            format!("<x14:formula2><xm:f>{f}</xm:f></x14:formula2>")
+        });
+        format!(
+            r#"<extLst><ext uri="{{CCE6A557-97BC-4b89-ADB6-D9C93CAAB3DF}}" {X14_NS}><x14:dataValidations count="1"><x14:dataValidation type="list" allowBlank="1"><x14:formula1><xm:f>{f1}</xm:f></x14:formula1>{f2}<xm:sqref>{sqref}</xm:sqref></x14:dataValidation></x14:dataValidations></ext></extLst>"#
+        )
+    }
+
     #[test]
-    fn x14_cf_in_extlst_is_left_alone() {
-        let x14 = r#"<extLst><ext uri="{78C0D931-6437-407d-A8EE-F0AAD7539E65}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><x14:conditionalFormattings><x14:conditionalFormatting xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"><x14:cfRule type="expression" priority="2" id="{X}"><xm:f>A1&gt;1</xm:f></x14:cfRule><xm:sqref>A1:A5</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>"#;
+    fn x14_cf_in_extlst_follows_edits_and_goes_with_its_rows() {
+        let x14 = x14_cf("A1:A5", "A1&gt;1");
         let mut pkg = one(
             "S",
             &format!(
@@ -23475,17 +23824,292 @@ mod rule_shift_tests {
             ),
         );
         let s = &pkg.workbook.sheets[0];
-        assert_eq!(s.cond_formats.len(), 2);
-        assert_eq!(s.cond_formats[0].ix, Some(0));
-        assert_eq!(s.cond_formats[1].ix, None);
-        // A delete over the x14 block's (unread) cells doesn't drop it.
-        delete_rows(&mut pkg.workbook, 0, 0, 10);
-        insert_rows(&mut pkg.workbook, 0, 0, 1);
-        assert_eq!(pkg.workbook.sheets[0].cond_formats.len(), 1);
-        assert_eq!(pkg.workbook.sheets[0].cond_formats[0].ix, None);
+        // The x14 block is not a rule the sheet evaluates.
+        assert_eq!(s.cond_formats.len(), 1);
+        assert_eq!(s.ext_rules.len(), 1);
+        assert_eq!(s.ext_rules[0].ranges, vec![(0, 0, 4, 0)]);
+        assert_eq!(s.ext_rules[0].formulas, vec!["A1>1".to_string()]);
+        // An edit that doesn't reach it keeps its bytes.
+        insert_rows(&mut pkg.workbook, 0, 20, 1);
         let (_, ws) = saved(&pkg, SHEET1);
-        assert!(ws.contains(x14), "{ws}");
-        assert!(!ws.contains(r#"<conditionalFormatting sqref"#), "{ws}");
+        assert!(ws.contains(&x14), "{ws}");
+        // An insert above moves its range and its relative formula.
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains("<xm:sqref>A2:A6</xm:sqref>"), "{ws}");
+        assert!(ws.contains("<xm:f>A2&gt;1</xm:f>"), "{ws}");
+        assert_eq!(
+            re.workbook.sheets[0].ext_rules[0].ranges,
+            vec![(1, 0, 5, 0)]
+        );
+        // A delete over every row takes the block, its wrappers and the
+        // extLst with it.
+        delete_rows(&mut pkg.workbook, 0, 0, 10);
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(!ws.contains("x14:"), "{ws}");
+        assert!(!ws.contains("extLst"), "{ws}");
+        assert!(!ws.contains("conditionalFormatting"), "{ws}");
+        assert!(re.workbook.sheets[0].ext_rules.is_empty());
+    }
+
+    #[test]
+    fn x14_cf_edit_on_another_sheet_keeps_its_bytes() {
+        let x14 = x14_cf("A1:A5", "A1&gt;1");
+        let body = format!("{DATA}{MARGINS}{x14}");
+        let mut pkg = load_xlsx(&book("", &[("S", Some(&body)), ("T", Some(DATA))])).unwrap();
+        insert_rows(&mut pkg.workbook, 1, 0, 3);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(&x14), "{ws}");
+    }
+
+    #[test]
+    fn x14_cf_data_bar_cfvo_formulas_move_with_the_rule() {
+        let x14 = format!(
+            r#"<extLst><ext uri="{{78C0D931-6437-407d-A8EE-F0AAD7539E65}}" {X14_NS}><x14:conditionalFormattings><x14:conditionalFormatting><x14:cfRule type="dataBar" id="{{D}}"><x14:dataBar minLength="0" maxLength="100"><x14:cfvo type="formula"><xm:f>$B$1</xm:f></x14:cfvo><x14:cfvo type="autoMax"/></x14:dataBar></x14:cfRule><xm:sqref>A1:A5</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>"#
+        );
+        let mut pkg = one("S", &format!("{MARGINS}{x14}"));
+        assert_eq!(
+            pkg.workbook.sheets[0].ext_rules[0].formulas,
+            vec!["$B$1".to_string()]
+        );
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains("<xm:f>$B$2</xm:f>"), "{ws}");
+        assert!(ws.contains("<xm:sqref>A2:A6</xm:sqref>"), "{ws}");
+        assert!(ws.contains(r#"<x14:cfvo type="autoMax"/>"#), "{ws}");
+    }
+
+    #[test]
+    fn x14_dv_follows_edits_and_keeps_its_count() {
+        let x14 = x14_dv("C1:C5", "Sheet2!$A$1:$A$5", Some("D1"));
+        let body = format!("{MARGINS}{x14}");
+        let mut pkg = load_xlsx(&book(
+            "",
+            &[
+                ("S", Some(&format!("{DATA}{body}"))),
+                ("Sheet2", Some(DATA)),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(pkg.workbook.sheets[0].ext_rules.len(), 1);
+        assert_eq!(pkg.workbook.sheets[0].validations.len(), 0);
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains("<xm:sqref>C2:C6</xm:sqref>"), "{ws}");
+        // The other sheet's ref is not this sheet's rows; the same-sheet one is.
+        assert!(ws.contains("<xm:f>Sheet2!$A$1:$A$5</xm:f>"), "{ws}");
+        assert!(ws.contains("<xm:f>D2</xm:f>"), "{ws}");
+        // A rename follows into the formula.
+        crate::edit::rename_sheet(&mut pkg.workbook, 1, "Data");
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains("<xm:f>Data!$A$1:$A$5</xm:f>"), "{ws}");
+        // Deleting its rows drops it and the wrappers around it.
+        delete_rows(&mut pkg.workbook, 0, 0, 10);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(!ws.contains("x14:"), "{ws}");
+        assert!(!ws.contains("extLst"), "{ws}");
+    }
+
+    #[test]
+    fn x14_dv_count_follows_the_survivors_and_a_shared_ext_stays() {
+        let two = format!(
+            r#"<extLst><ext uri="{{CCE6A557-97BC-4b89-ADB6-D9C93CAAB3DF}}" {X14_NS}><x14:dataValidations count="2"><x14:dataValidation type="list"><x14:formula1><xm:f>Z1</xm:f></x14:formula1><xm:sqref>A1</xm:sqref></x14:dataValidation><x14:dataValidation type="list"><x14:formula1><xm:f>Z2</xm:f></x14:formula1><xm:sqref>A9</xm:sqref></x14:dataValidation></x14:dataValidations></ext><ext uri="{{05C60535-1F16-4fd2-B633-F4F36F0B64E0}}" {X14_NS}><x14:sparklineGroups><x14:sparklineGroup><x14:sparklines><x14:sparkline><xm:f>A1:A3</xm:f><xm:sqref>B1</xm:sqref></x14:sparkline></x14:sparklines></x14:sparklineGroup></x14:sparklineGroups></ext></extLst>"#
+        );
+        let mut pkg = one("S", &format!("{MARGINS}{two}"));
+        assert_eq!(pkg.workbook.sheets[0].ext_rules.len(), 2);
+        delete_rows(&mut pkg.workbook, 0, 0, 1);
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(r#"<x14:dataValidations count="1">"#), "{ws}");
+        // The survivor moved up a row, its relative formula with it.
+        assert!(!ws.contains("<xm:f>Z2</xm:f>"), "{ws}");
+        assert_eq!(count(&ws, "<xm:f>Z1</xm:f>"), 1, "{ws}");
+        assert!(ws.contains("<xm:sqref>A8</xm:sqref>"), "{ws}");
+        // The sparkline ext is not ours: untouched.
+        assert!(ws.contains("<x14:sparklineGroups>"), "{ws}");
+        assert!(ws.contains("<xm:sqref>B1</xm:sqref>"), "{ws}");
+        assert_eq!(re.workbook.sheets[0].ext_rules.len(), 1);
+        // The last one goes: the ext of validations with it, the sparkline
+        // ext (and so the extLst) stays.
+        delete_rows(&mut pkg.workbook, 0, 0, 20);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(!ws.contains("dataValidations"), "{ws}");
+        assert!(
+            ws.contains("<extLst>") && ws.contains("<x14:sparklineGroups>"),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn x14_cf_rename_and_sheet_delete_rewrite_its_formula() {
+        let x14 = x14_cf("A1:A5", "Other!$A$1&gt;1");
+        let body = format!("{DATA}{MARGINS}{x14}");
+        let mut pkg = load_xlsx(&book(
+            "",
+            &[("S", Some(&body)), ("Other", Some(DATA)), ("T", Some(DATA))],
+        ))
+        .unwrap();
+        crate::edit::rename_sheet(&mut pkg.workbook, 1, "Renamed");
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains("<xm:f>Renamed!$A$1&gt;1</xm:f>"), "{ws}");
+        assert!(pkg.remove_sheet(1));
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains("<xm:f>#REF!&gt;1</xm:f>"), "{ws}");
+    }
+
+    #[test]
+    fn x14_cf_with_an_unreadable_sqref_or_mismatched_formulas_is_left_alone() {
+        // A token that doesn't parse: neither moved nor struck.
+        let bad = x14_cf("A1:A5 X!B1", "A1&gt;1");
+        let mut pkg = one("S", &format!("{MARGINS}{bad}"));
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(&bad), "{ws}");
+        delete_rows(&mut pkg.workbook, 0, 0, 10);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(&bad), "{ws}");
+        // Two `xm:f` held where the model has one: the sqref isn't moved either.
+        let held = x14_cf("A1:A5", "A1&gt;1</xm:f><xm:f>B1");
+        let mut pkg = one("S", &format!("{MARGINS}{held}"));
+        pkg.workbook.sheets[0].ext_rules[0].formulas.pop();
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains("<xm:sqref>A1:A5</xm:sqref>"), "{ws}");
+    }
+
+    #[test]
+    fn x14_with_an_opaque_formula_is_left_alone_whole() {
+        for x14 in [
+            x14_cf("A1:A5", "<![CDATA[A1>1]]>"),
+            x14_dv("A1:A5", "<![CDATA[Z1]]>", None),
+        ] {
+            let mut pkg = one("S", &format!("{MARGINS}{x14}"));
+            assert_eq!(pkg.workbook.sheets[0].ext_rules.len(), 1);
+            insert_rows(&mut pkg.workbook, 0, 0, 1);
+            let (_, ws) = saved(&pkg, SHEET1);
+            assert!(ws.contains(&x14), "{ws}");
+        }
+        let x14 = x14_cf("A1:A5", "<![CDATA[A1>1]]>");
+        let mut pkg = one("S", &format!("{MARGINS}{x14}"));
+        delete_rows(&mut pkg.workbook, 0, 0, 10);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(&x14), "{ws}");
+    }
+
+    #[test]
+    fn a_single_quoted_cfvo_val_with_quotes_stays_well_formed() {
+        let rule = r#"<conditionalFormatting sqref="A1:A5"><cfRule type="dataBar" priority="1"><dataBar><cfvo type="min"/><cfvo type='formula' val='&apos;My Data&apos;!$A$1'/><color rgb="FF638EC6"/></dataBar></cfRule></conditionalFormatting>"#;
+        let body = format!("{DATA}{rule}{MARGINS}");
+        let mut pkg = load_xlsx(&book("", &[("S", Some(&body)), ("My Data", Some(DATA))])).unwrap();
+        crate::edit::rename_sheet(&mut pkg.workbook, 1, "Bob's Data");
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(
+            ws.contains("<cfvo type='formula' val='&apos;Bob&apos;&apos;s Data&apos;!$A$1'/>"),
+            "{ws}"
+        );
+        match &re.workbook.sheets[0].cond_formats[0].rules[0].kind {
+            CfKind::Other { cfvos, .. } => assert_eq!(cfvos[1].val, "'Bob''s Data'!$A$1"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn two_sheets(first_rest: &str) -> SheetPackage {
+        let body = format!("{DATA}{first_rest}");
+        load_xlsx(&book("", &[("S", Some(&body)), ("Lists", Some(DATA))])).expect("loads")
+    }
+
+    const CFVO_RULES: &str = r#"<conditionalFormatting sqref="A1:A5"><cfRule type="colorScale" priority="1"><colorScale><cfvo type="min"/><cfvo type="formula" val="$B$1"/><cfvo type="num" val="5"/><color rgb="FFFF0000"/><color rgb="FF00FF00"/><color rgb="FF0000FF"/></colorScale></cfRule></conditionalFormatting><conditionalFormatting sqref="C1:C5"><cfRule type="dataBar" priority="2"><dataBar><cfvo type="num" val="0"/><cfvo type="formula" val="Lists!$A$1"/><color rgb="FF638EC6"/></dataBar></cfRule></conditionalFormatting><conditionalFormatting sqref="D1:D5"><cfRule type="iconSet" priority="3"><iconSet iconSet="3Arrows"><cfvo type="percent" val="0"/><cfvo type="formula" val="$B$1"/><cfvo type="percent" val="67"/></iconSet></cfRule></conditionalFormatting>"#;
+
+    #[test]
+    fn cfvo_formulas_follow_insert_delete_and_rename() {
+        let mut pkg = two_sheets(&format!("{CFVO_RULES}{MARGINS}"));
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(r#"<cfvo type="formula" val="$B$2"/>"#), "{ws}");
+        assert!(ws.contains(r#"<cfvo type="min"/>"#), "{ws}");
+        assert!(ws.contains(r#"<cfvo type="num" val="5"/>"#), "{ws}");
+        assert!(ws.contains(r#"<cfvo type="percent" val="67"/>"#), "{ws}");
+        assert_eq!(count(&ws, r#"val="$B$2""#), 2, "{ws}");
+        // The other sheet's cell is not shifted by this sheet's rows.
+        assert!(ws.contains(r#"val="Lists!$A$1""#), "{ws}");
+        crate::edit::rename_sheet(&mut pkg.workbook, 1, "Data");
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(r#"val="Data!$A$1""#), "{ws}");
+        // Deleting the referenced row.
+        delete_rows(&mut pkg.workbook, 0, 1, 1);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(
+            ws.contains(r##"<cfvo type="formula" val="#REF!"/>"##),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn cfvo_untouched_edit_keeps_every_byte() {
+        let mut pkg = two_sheets(&format!("{CFVO_RULES}{MARGINS}"));
+        insert_rows(&mut pkg.workbook, 0, 50, 1);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(CFVO_RULES), "{ws}");
+    }
+
+    #[test]
+    fn a_classic_rules_nested_extlst_cfvo_is_not_the_rules() {
+        let rule = format!(
+            r#"<conditionalFormatting sqref="A1:A5"><cfRule type="dataBar" priority="1"><dataBar><cfvo type="min"/><cfvo type="formula" val="$B$1"/><color rgb="FF638EC6"/></dataBar><extLst><ext uri="{{B025F937-C7B1-47D3-B67F-A62EFF666E3E}}" {X14_NS}><x14:id>{{ID}}</x14:id></ext></extLst></cfRule></conditionalFormatting>"#
+        );
+        let mut pkg = one("S", &format!("{rule}{MARGINS}"));
+        match &pkg.workbook.sheets[0].cond_formats[0].rules[0].kind {
+            CfKind::Other { cfvos, .. } => assert_eq!(cfvos.len(), 2),
+            other => panic!("{other:?}"),
+        }
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(r#"<cfvo type="formula" val="$B$2"/>"#), "{ws}");
+        assert!(ws.contains("<x14:id>{ID}</x14:id>"), "{ws}");
+    }
+
+    #[test]
+    fn deleting_a_sheet_turns_rule_formulas_naming_it_into_ref_errors() {
+        let rules = concat!(
+            r#"<conditionalFormatting sqref="A1:A5"><cfRule type="expression" priority="1"><formula>Lists!$A$1&gt;0</formula></cfRule><cfRule type="cellIs" operator="between" priority="2"><formula>1</formula><formula>Lists!$B$1</formula></cfRule></conditionalFormatting>"#,
+            r#"<conditionalFormatting sqref="C1:C5"><cfRule type="dataBar" priority="3"><dataBar><cfvo type="num" val="0"/><cfvo type="formula" val="Lists!$A$1"/></dataBar></cfRule></conditionalFormatting>"#,
+            r#"<dataValidations count="2"><dataValidation type="list" sqref="E1"><formula1>Lists!$A$1:$A$5</formula1></dataValidation><dataValidation type="whole" operator="between" sqref="F1"><formula1>Lists!$A$1</formula1><formula2>9</formula2></dataValidation></dataValidations>"#,
+        );
+        let mut pkg = two_sheets(&format!("{rules}{MARGINS}"));
+        assert!(pkg.remove_sheet(1));
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(!ws.contains("Lists"), "{ws}");
+        assert!(ws.contains("<formula>#REF!&gt;0</formula>"), "{ws}");
+        assert!(
+            ws.contains("<formula>1</formula><formula>#REF!</formula>"),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r##"<cfvo type="formula" val="#REF!"/>"##),
+            "{ws}"
+        );
+        assert!(ws.contains("<formula1>#REF!</formula1>"), "{ws}");
+        assert!(
+            ws.contains("<formula1>#REF!</formula1><formula2>9</formula2>"),
+            "{ws}"
+        );
+        let s = &re.workbook.sheets[0];
+        assert_eq!(s.validations[0].formula1, "#REF!");
+        // The macro-sheet path rewrites cells as well; a second pass is a no-op.
+        let mut again = two_sheets(&format!("{rules}{MARGINS}"));
+        crate::edit::remove_sheet_refs(&mut again.workbook, &["Lists".to_string()]);
+        let before = again.workbook.sheets[0].validations[0].formula1.clone();
+        assert_eq!(before, "#REF!");
+        assert!(again.remove_sheet(1));
+        assert_eq!(again.workbook.sheets[0].validations[0].formula1, "#REF!");
+    }
+
+    #[test]
+    fn remove_sheet_refs_keeps_rules_that_name_nothing_removed() {
+        let rules = r#"<conditionalFormatting sqref="A1:A5"><cfRule type="expression" priority="1"><formula>_xlfn.XOR(A1,TRUE)</formula></cfRule></conditionalFormatting>"#;
+        let mut pkg = two_sheets(&format!("{rules}{MARGINS}"));
+        assert!(pkg.remove_sheet(1));
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(rules), "{ws}");
     }
 
     #[test]
