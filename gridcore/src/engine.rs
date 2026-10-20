@@ -2527,7 +2527,7 @@ impl CoverIndex {
 /// Clear the plain-value cells of a spill (keeping styles) outside the
 /// surviving extent `keep` (None = clear all but the anchor). Returns the
 /// cleared keys. Cells holding formulas are left alone.
-fn clear_spill(
+pub(crate) fn clear_spill(
     sheet: &mut Sheet,
     s: usize,
     anchor: (u32, u32),
