@@ -48,7 +48,7 @@ use gridcore::edit::{FillDir, fill_changes, replace_all_in_sheet};
 use gridcore::engine::{Engine, PART_OF_ARRAY};
 use gridcore::entry::{EntryCtx, entry_cell_ctx, entry_ctx, seed_text};
 use gridcore::fcomplete::Completions;
-use gridcore::formula::{qualify_sheet_in_formula, translate_formula};
+use gridcore::formula::{move_block_formula, qualify_sheet_in_formula, translate_formula};
 use gridcore::frame::Agg;
 use gridcore::legacy::{SourceFormat, open_workbook_ex as open_any};
 use gridcore::model::{
@@ -3366,6 +3366,24 @@ impl App {
         cut_from: Option<(usize, (u32, u32, u32, u32))>,
         write: impl FnOnce(&mut Self),
     ) {
+        self.record_groups_wide(keys, cut_from, false, |app| {
+            write(app);
+            false
+        });
+    }
+
+    /// [`Self::record_groups`] for a write that may rewrite formulas outside
+    /// its cells (a cut re-pointing what read the moved cells). With
+    /// `wide`, the workbook is snapshotted before `write`, which says whether
+    /// it did rewrite any: the step is then a whole-workbook one, as a table
+    /// header rename's is; else it stays the cells' own.
+    fn record_groups_wide(
+        &mut self,
+        keys: Vec<(usize, Vec<(u32, u32)>)>,
+        cut_from: Option<(usize, (u32, u32, u32, u32))>,
+        wide: bool,
+        write: impl FnOnce(&mut Self) -> bool,
+    ) {
         let explicit = self.undo_target.take();
         let keys: Vec<_> = keys.into_iter().filter(|(_, k)| !k.is_empty()).collect();
         if keys.is_empty() {
@@ -3404,9 +3422,9 @@ impl App {
         let headers = keys
             .iter()
             .any(|(s, cells)| self.hits_table_header(*s, cells));
-        let wb_before = headers.then(|| self.wb_snapshot());
+        let wb_before = (headers || wide).then(|| self.wb_snapshot());
         let befores = snapshot(self);
-        write(self);
+        let rewrote = write(self);
         let mut written = None;
         let mut renamed = false;
         if headers {
@@ -3429,7 +3447,7 @@ impl App {
                 renamed |= gridcore::edit::sync_table_headers(&mut self.pkg.workbook, *s, &cells);
             }
         }
-        if let (true, Some(before)) = (renamed, wb_before) {
+        if let (true, Some(before)) = (renamed || rewrote, wb_before) {
             let after = self.wb_snapshot();
             self.rebuild_engine();
             // As every structural step does (`try_structural`): a pending
@@ -4627,14 +4645,12 @@ impl App {
                         .get(clip.sheet)
                         .is_some_and(|s| s.is_protected());
                 let cut = clip.cut && clip.sheet < self.pkg.workbook.sheets.len() && !source_locked;
-                // A cut pasted on another sheet moves its formulas off the
-                // source sheet; their unqualified refs are qualified with it
-                // below, so a moved `=B1` keeps reading Sheet2!B1.
-                let src_name = if cut && !same_sheet {
-                    Some(self.pkg.workbook.sheets[clip.sheet].name.clone())
-                } else {
-                    None
+                let (src, here) = (clip.sheet, self.sheet);
+                let name = |s: usize| {
+                    let sheets = &self.pkg.workbook.sheets;
+                    sheets.get(s).map(|s| s.name.clone()).unwrap_or_default()
                 };
+                let names = (name(src), name(here));
                 let mut clears = Vec::new();
                 if cut {
                     let (fr, fc) = clip.from;
@@ -4653,6 +4669,34 @@ impl App {
                     r0 as i64 - clip.from.0 as i64,
                     c0 as i64 - clip.from.1 as i64,
                 );
+                // A copy's rules replace the target's (#688); a cut moves
+                // them with its cells, and every other rule cell keeps
+                // checking what it checked (#1050).
+                let rules_from = {
+                    let (fr, fc) = clip.from;
+                    // A cut moves the rules of the whole selection, cells or
+                    // not; a copy's rules are those of its cells.
+                    let (h, w) = if cut {
+                        clip.span
+                    } else {
+                        (
+                            clip.cells.len().max(1) as u32,
+                            clip.cells.iter().map(Vec::len).max().unwrap_or(1).max(1) as u32,
+                        )
+                    };
+                    // Only the part that fits the grid at the target is pasted.
+                    let (h, w) = (h.min(MAX_ROWS - r0), w.min(MAX_COLS - c0));
+                    (fr, fc, fr + h - 1, fc + w - 1)
+                };
+                // The cut as formulas see it: the cells of `rules_from` move by
+                // the offset, to `here`.
+                let mv = gridcore::formula::CellMove {
+                    src: &names.0,
+                    dst: &names.1,
+                    rect: rules_from,
+                    dr: dr_all,
+                    dc: dc_all,
+                };
                 // The block written from (r0, c0): rows and cells pushed off
                 // the grid's edge are dropped, so rows may differ in length.
                 let mut block = Vec::new();
@@ -4679,12 +4723,28 @@ impl App {
                                 }
                             }
                         }
-                        // A cut moved to another sheet keeps reading the
-                        // cells it read: qualify with the source sheet (an
-                        // unparseable formula keeps its text).
-                        if let (Some(f), Some(sheet)) = (&new_cell.formula, &src_name) {
-                            if let Some(t) = qualify_sheet_in_formula(f, sheet) {
-                                new_cell.formula = Some(t);
+                        // A cut's own formulas move with it: references to
+                        // cells of the cut follow them, the rest keep reading
+                        // what they read (qualified with the source sheet when
+                        // the cut changes sheets). An unparseable formula keeps
+                        // its text, and so does one held verbatim (shared),
+                        // which is only qualified, as before.
+                        if cut {
+                            if let Some(f) = &new_cell.formula {
+                                let verbatim = new_cell
+                                    .f_attrs
+                                    .as_deref()
+                                    .is_some_and(|a| !gridcore::sheet::is_array_f(a));
+                                let moved = if !verbatim {
+                                    move_block_formula(f, &mv)
+                                } else if !same_sheet {
+                                    qualify_sheet_in_formula(f, &names.0)
+                                } else {
+                                    None
+                                };
+                                if let Some(t) = moved {
+                                    new_cell.formula = Some(t);
+                                }
                             }
                         }
                         // Overwrite position wins over source-clear on overlap.
@@ -4703,7 +4763,6 @@ impl App {
                 // last (`Engine::split_frozen_blanks`): a no-op while the
                 // block is whole, it clears its cell once the paste has put
                 // content into the block. One undo step.
-                let (src, here) = (clip.sheet, self.sheet);
                 // Refused whole, before the cut's source is cleared, when the
                 // clears or the paste would change part of an array: the clip
                 // stays as it was, so it can still be pasted elsewhere.
@@ -4736,25 +4795,6 @@ impl App {
                     let w = clip.cells.iter().map(Vec::len).max().unwrap_or(1).max(1) as u32;
                     (src, (fr, fc, fr + h - 1, fc + w - 1))
                 });
-                // A copy's rules replace the target's (#688); a cut moves
-                // them with its cells, and every other rule cell keeps
-                // checking what it checked (#1050).
-                let rules_from = {
-                    let (fr, fc) = clip.from;
-                    // A cut moves the rules of the whole selection, cells or
-                    // not; a copy's rules are those of its cells.
-                    let (h, w) = if cut {
-                        clip.span
-                    } else {
-                        (
-                            clip.cells.len().max(1) as u32,
-                            clip.cells.iter().map(Vec::len).max().unwrap_or(1).max(1) as u32,
-                        )
-                    };
-                    // Only the part that fits the grid at the target is pasted.
-                    let (h, w) = (h.min(MAX_ROWS - r0), w.min(MAX_COLS - c0));
-                    (fr, fc, fr + h - 1, fc + w - 1)
-                };
                 let rules = clip.rules.clone();
                 // A part that can't hold `<dataValidations>` would lose them
                 // on save: leave the rules where they are and say so.
@@ -4762,25 +4802,22 @@ impl App {
                 let lost = !cut && !land && !rules.is_empty();
                 // A cut's rules stayed on its cells for want of a place.
                 let kept = std::cell::Cell::new(false);
-                let name = |s: usize| {
-                    let sheets = &self.pkg.workbook.sheets;
-                    sheets.get(s).map(|s| s.name.clone()).unwrap_or_default()
-                };
-                let names = (name(src), name(here));
                 let write = |app: &mut Self| {
-                    app.record_groups(keys, cut_from, |app| {
+                    app.record_groups_wide(keys, cut_from, cut, |app| {
+                        let mut rewrote = false;
                         if cut {
                             // Read before the cut: the cells only part of it
                             // moved, the rest where they were (`rules_from`).
-                            let mv = gridcore::formula::CellMove {
-                                src: &names.0,
-                                dst: &names.1,
-                                rect: rules_from,
-                                dr: dr_all,
-                                dc: dc_all,
-                            };
                             let wb = &mut app.pkg.workbook;
                             kept.set(gridcore::validation::cut_rules(wb, src, here, &mv, land));
+                            // References to the moved cells follow them, in
+                            // formulas, names and rules on every sheet; the
+                            // engine is rebuilt on them so the writes below
+                            // recalculate what reads the cells where they land.
+                            rewrote = gridcore::edit::move_refs(wb, src, &mv);
+                            if rewrote {
+                                app.rebuild_engine();
+                            }
                         } else if land {
                             gridcore::validation::paste_rules(
                                 &mut app.pkg.workbook.sheets[here],
@@ -4803,6 +4840,7 @@ impl App {
                         app.engine
                             .paste_block_prechecked(wb, here, (r0, c0), &block);
                         app.engine.set_cells_prechecked(wb, src, late);
+                        rewrote
                     })
                 };
                 // A cut can change a rule on any sheet.
@@ -26033,6 +26071,286 @@ mod tests {
         assert_eq!(cell_state(&app).1, None);
         press(&mut app, KeyCode::Enter);
         assert_eq!(text_at(&app, 0, 0), "abc");
+    }
+    // ---- #880: a cut re-points the references to the cells it moves ----
+
+    /// Sheet1, Sheet2 and "Third"; nothing is pending.
+    fn repoint_app() -> App {
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Sheet2");
+        pkg.add_sheet("Third");
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        app
+    }
+
+    fn put_cells(app: &mut App, sheet: usize, cells: &[(u32, u32, &str)]) {
+        let changes = cells
+            .iter()
+            .map(|&(r, c, t)| (r, c, parse_input(t)))
+            .collect();
+        app.apply_on(sheet, changes);
+    }
+
+    fn formula_at(app: &App, sheet: usize, r: u32, c: u32) -> Option<String> {
+        app.pkg.workbook.sheets[sheet]
+            .cell(r, c)
+            .and_then(|x| x.formula.clone())
+    }
+
+    fn number_at(app: &App, sheet: usize, r: u32, c: u32) -> Option<f64> {
+        match app.pkg.workbook.sheets[sheet].cell(r, c).map(|x| &x.value) {
+            Some(CellValue::Number(n)) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Cut `from` on `src` and paste at `to` on `dst`.
+    fn cut_across(
+        app: &mut App,
+        src: usize,
+        from: ((u32, u32), (u32, u32)),
+        dst: usize,
+        to: (u32, u32),
+    ) {
+        app.sheet = src;
+        cut_to(app, from, dst, to);
+    }
+
+    #[test]
+    fn a_cut_cell_is_followed_by_the_formulas_that_read_it() {
+        let mut app = repoint_app();
+        put_cells(&mut app, 0, &[(0, 0, "5"), (0, 1, "=A1*2")]);
+        cut_across(&mut app, 0, ((0, 0), (0, 0)), 0, (0, 2));
+        assert_eq!(formula_at(&app, 0, 0, 1).as_deref(), Some("C1*2"));
+        assert_eq!(number_at(&app, 0, 0, 1), Some(10.0));
+        assert!(app.pkg.workbook.sheets[0].cell(0, 0).is_none());
+    }
+
+    #[test]
+    fn a_cut_to_another_sheet_qualifies_the_formulas_that_read_it() {
+        let mut app = repoint_app();
+        put_cells(&mut app, 0, &[(0, 0, "5"), (0, 1, "=A1*2")]);
+        cut_across(&mut app, 0, ((0, 0), (0, 0)), 1, (0, 2));
+        assert_eq!(formula_at(&app, 0, 0, 1).as_deref(), Some("Sheet2!C1*2"));
+        assert_eq!(number_at(&app, 0, 0, 1), Some(10.0));
+    }
+
+    #[test]
+    fn a_range_follows_a_cut_only_when_both_corners_moved() {
+        let mut app = repoint_app();
+        put_cells(
+            &mut app,
+            0,
+            &[
+                (0, 0, "1"),
+                (0, 1, "2"),
+                (0, 3, "=SUM(A1:B1)"),
+                (0, 4, "=SUM(A1:C1)"),
+            ],
+        );
+        cut_across(&mut app, 0, ((0, 0), (0, 1)), 0, (4, 0));
+        assert_eq!(formula_at(&app, 0, 0, 3).as_deref(), Some("SUM(A5:B5)"));
+        // A range with a corner outside the cut stays where it was.
+        assert_eq!(formula_at(&app, 0, 0, 4).as_deref(), Some("SUM(A1:C1)"));
+    }
+
+    #[test]
+    fn a_cut_blocks_own_references_follow_it_to_another_sheet() {
+        let mut app = repoint_app();
+        put_cells(
+            &mut app,
+            1,
+            &[
+                (0, 0, "1"),
+                (0, 1, "=A1"),
+                (1, 0, "=C5"),
+                (1, 1, "=SUM(A1#)"),
+            ],
+        );
+        cut_across(&mut app, 1, ((0, 0), (1, 1)), 0, (0, 3));
+        // Inside the block: the moved cell. Outside: still the cell it read.
+        assert_eq!(formula_at(&app, 0, 0, 4).as_deref(), Some("D1"));
+        assert_eq!(formula_at(&app, 0, 1, 3).as_deref(), Some("Sheet2!C5"));
+        assert_eq!(formula_at(&app, 0, 1, 4).as_deref(), Some("SUM(D1#)"));
+        assert_eq!(number_at(&app, 0, 0, 4), Some(1.0));
+    }
+
+    #[test]
+    fn a_cut_blocks_own_references_follow_it_on_its_sheet() {
+        let mut app = repoint_app();
+        put_cells(&mut app, 0, &[(0, 0, "1"), (0, 1, "=A1+C5")]);
+        cut_across(&mut app, 0, ((0, 0), (0, 1)), 0, (0, 2));
+        assert_eq!(formula_at(&app, 0, 0, 3).as_deref(), Some("C1+C5"));
+        assert_eq!(number_at(&app, 0, 0, 2), Some(1.0));
+    }
+
+    /// Sheet1 A1 = 5, read by a formula on every sheet, a defined name, a
+    /// conditional-format rule and a table's calculated column.
+    fn dependents_app() -> App {
+        let mut app = repoint_app();
+        put_cells(&mut app, 0, &[(0, 0, "5"), (0, 1, "=A1*2"), (0, 6, "=C3")]);
+        put_cells(&mut app, 2, &[(0, 0, "=Sheet1!A1+1")]);
+        let wb = &mut app.pkg.workbook;
+        wb.sheets[0].set_cell(
+            1,
+            6,
+            Cell {
+                formula: Some("sum( z9 , 2 )".into()),
+                ..Cell::default()
+            },
+        );
+        wb.defined_names.push(gridcore::sheet::DefinedName {
+            name: "Base".into(),
+            scope: None,
+            formula: "Sheet1!$A$1".into(),
+        });
+        wb.sheets[0].cond_formats.push(gridcore::sheet::CondFormat {
+            ranges: vec![(3, 3, 5, 3)],
+            rules: vec![gridcore::sheet::CfRule {
+                kind: gridcore::sheet::CfKind::Expression {
+                    formula: "$A$1>1".into(),
+                },
+                dxf_id: None,
+                priority: 1,
+            }],
+            ix: None,
+        });
+        wb.tables.push(gridcore::sheet::Table {
+            name: "T".into(),
+            sheet: 0,
+            range: (9, 8, 11, 8),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["X".into()],
+            part: String::new(),
+            column_ids: Vec::new(),
+            calculated_formulas: vec![Some("A1".into())],
+        });
+        app.rebuild_engine();
+        app
+    }
+
+    fn cf_formula(app: &App) -> String {
+        match &app.pkg.workbook.sheets[0].cond_formats[0].rules[0].kind {
+            gridcore::sheet::CfKind::Expression { formula } => formula.clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn a_cut_re_points_formulas_names_rules_and_table_columns_and_leaves_the_rest() {
+        let mut app = dependents_app();
+        cut_across(&mut app, 0, ((0, 0), (0, 0)), 1, (4, 4));
+        assert_eq!(formula_at(&app, 0, 0, 1).as_deref(), Some("Sheet2!E5*2"));
+        assert_eq!(formula_at(&app, 2, 0, 0).as_deref(), Some("Sheet2!E5+1"));
+        assert_eq!(app.pkg.workbook.defined_names[0].formula, "Sheet2!$E$5");
+        assert_eq!(cf_formula(&app), "Sheet2!$E$5>1");
+        assert_eq!(
+            app.pkg.workbook.tables[0].calculated_formulas[0].as_deref(),
+            Some("Sheet2!E5")
+        );
+        // What the move does not reach keeps its text byte for byte.
+        assert_eq!(formula_at(&app, 0, 0, 6).as_deref(), Some("C3"));
+        assert_eq!(formula_at(&app, 0, 1, 6).as_deref(), Some("sum( z9 , 2 )"));
+        assert_eq!(number_at(&app, 2, 0, 0), Some(6.0));
+    }
+
+    #[test]
+    fn one_undo_puts_back_the_cells_and_every_re_pointed_formula_and_redo_reapplies() {
+        let mut app = dependents_app();
+        let depth = app.undo.len();
+        cut_across(&mut app, 0, ((0, 0), (0, 0)), 1, (4, 4));
+        assert_eq!(app.undo.len(), depth + 1);
+        app.goto_sheet(2);
+        away(&mut app);
+        app.undo();
+        assert_eq!(app.redo.len(), 1);
+        assert_eq!(number_at(&app, 0, 0, 0), Some(5.0));
+        assert!(app.pkg.workbook.sheets[1].cell(4, 4).is_none());
+        assert_eq!(formula_at(&app, 0, 0, 1).as_deref(), Some("A1*2"));
+        assert_eq!(number_at(&app, 0, 0, 1), Some(10.0));
+        assert_eq!(formula_at(&app, 2, 0, 0).as_deref(), Some("Sheet1!A1+1"));
+        assert_eq!(app.pkg.workbook.defined_names[0].formula, "Sheet1!$A$1");
+        assert_eq!(cf_formula(&app), "$A$1>1");
+        assert_eq!(
+            app.pkg.workbook.tables[0].calculated_formulas[0].as_deref(),
+            Some("A1")
+        );
+        // Undo selects the block the paste wrote.
+        assert_eq!((app.sheet, app.cur), (1, (4, 4)));
+        away(&mut app);
+        app.redo();
+        assert_eq!(formula_at(&app, 0, 0, 1).as_deref(), Some("Sheet2!E5*2"));
+        assert_eq!(number_at(&app, 1, 4, 4), Some(5.0));
+        assert!(app.pkg.workbook.sheets[0].cell(0, 0).is_none());
+        assert_eq!(app.pkg.workbook.defined_names[0].formula, "Sheet2!$E$5");
+        assert_eq!(cf_formula(&app), "Sheet2!$E$5>1");
+        assert_eq!((app.sheet, app.cur), (1, (4, 4)));
+    }
+
+    #[test]
+    fn a_cut_that_re_points_nothing_stays_a_cells_step() {
+        let mut app = repoint_app();
+        put_cells(&mut app, 0, &[(0, 0, "5"), (0, 1, "=C3")]);
+        cut_across(&mut app, 0, ((0, 0), (0, 0)), 0, (0, 2));
+        assert!(matches!(app.undo.last(), Some(UndoAction::Cells(_))));
+        app.undo();
+        assert_eq!(number_at(&app, 0, 0, 0), Some(5.0));
+        assert!(app.pkg.workbook.sheets[0].cell(0, 2).is_none());
+    }
+
+    #[test]
+    fn a_cut_that_re_points_a_formula_is_a_structural_step() {
+        let mut app = repoint_app();
+        put_cells(&mut app, 0, &[(0, 0, "5"), (0, 1, "=A1")]);
+        cut_across(&mut app, 0, ((0, 0), (0, 0)), 0, (0, 2));
+        assert!(matches!(
+            app.undo.last(),
+            Some(UndoAction::Structural { .. })
+        ));
+    }
+
+    #[test]
+    fn a_cut_clipped_at_the_grid_edge_re_points_only_the_cells_that_moved() {
+        let mut app = repoint_app();
+        put_cells(&mut app, 0, &[(0, 0, "1"), (0, 1, "2"), (2, 0, "=A1+B1")]);
+        cut_across(&mut app, 0, ((0, 0), (0, 1)), 0, (0, MAX_COLS - 1));
+        // B1 did not fit and stayed; the reference to it stays too.
+        assert_eq!(formula_at(&app, 0, 2, 0).as_deref(), Some("XFD1+B1"));
+        assert_eq!(number_at(&app, 0, 0, 1), Some(2.0));
+        assert_eq!(number_at(&app, 0, 0, MAX_COLS - 1), Some(1.0));
+    }
+
+    #[test]
+    fn a_cut_re_points_a_formula_and_moves_a_rule_in_one_undo_step() {
+        let mut app = cut_rule_app("A5>0");
+        put_cells(&mut app, 0, &[(0, 6, "=A5")]);
+        let depth = app.undo.len();
+        cut_to(&mut app, ((4, 0), (4, 0)), 0, (19, 0));
+        assert_eq!(app.undo.len(), depth + 1);
+        assert_eq!(formula_at(&app, 0, 0, 6).as_deref(), Some("A20"));
+        assert_ne!(app.pkg.workbook.sheets[0].validations[0].formula1, "A5>0");
+        app.undo();
+        assert_eq!(formula_at(&app, 0, 0, 6).as_deref(), Some("A5"));
+        assert_eq!(app.pkg.workbook.sheets[0].validations[0].formula1, "A5>0");
+        assert_eq!(number_at(&app, 0, 4, 0), Some(3.0));
+        assert_eq!(app.undo.len(), depth);
+    }
+
+    #[test]
+    fn a_copy_and_an_external_paste_re_point_nothing() {
+        let mut app = repoint_app();
+        put_cells(&mut app, 0, &[(0, 0, "5"), (0, 1, "=A1*2")]);
+        app.sheet = 0;
+        app.cur = (0, 0);
+        app.anchor = None;
+        app.copy(false);
+        app.cur = (3, 0);
+        app.paste_from(None);
+        assert_eq!(formula_at(&app, 0, 0, 1).as_deref(), Some("A1*2"));
+        assert_eq!(number_at(&app, 0, 0, 0), Some(5.0));
+        assert!(matches!(app.undo.last(), Some(UndoAction::Cells(_))));
     }
 }
 
