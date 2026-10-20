@@ -75,8 +75,17 @@ new line), `milestone`, `calendar` (a base calendar's name or UID, `null` or
 `"none"` to clear), `ignore_resource_calendar`, `wbs` and `earned_value_method`
 (`percent-complete|physical-percent-complete`). A date is `YYYY-MM-DD` (a
 deadline, FNLT or MFO date ends the working day, the other types start it) or
-`YYYY-MM-DDTHH:MM`. Every field given applies with the patch as one undo step,
-and a refused field applies nothing. `proj.get` reads the plan's settings as
+`YYYY-MM-DDTHH:MM`. The Update Tasks fields (#1568) are `actual_start` and
+`actual_finish` (a date as above, an actual start taking the day's first
+working time and a finish its last; `null` clears) and `actual_duration` and
+`remaining_duration` (Project's duration spellings). They keep `percent_complete`
+and the task's other actuals consistent: an actual duration sets % Complete and
+the remaining duration, a remaining duration also sets the duration, an actual
+finish completes the task (100 %), and clearing the actual start clears every
+actual. A `percent_complete` given with one of them must equal the result, or
+the call is refused. They are refused on summaries and milestones, and not
+measured against Project beyond its progress fixture. Every field given applies
+with the patch as one undo step, and a refused field applies nothing. `proj.get` reads the plan's settings as
 Project's Project Information dialog shows them (#1587): `title`, `start`,
 `finish` (the schedule's), `status_date` and `current_date` (`null` when
 unset), `calendar` and the base `calendars`; `proj.set` writes `title`,
