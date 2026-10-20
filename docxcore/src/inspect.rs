@@ -960,6 +960,22 @@ impl Stories {
         ids
     }
 
+    /// Strip the markers of the comments `only` names (all when `None`) from
+    /// the stories but `skip`'s, straight from each part's XML, one
+    /// [`StrippedPart`] per part changed.
+    pub fn strip_comment_markers(
+        &self,
+        pkg: &mut Package,
+        only: Option<&[&str]>,
+        skip: Option<&str>,
+    ) -> Vec<StrippedPart> {
+        self.parts
+            .iter()
+            .filter(|(part, _)| Some(part.as_str()) != skip)
+            .filter_map(|(part, _)| StrippedPart::strip(pkg, part, only))
+            .collect()
+    }
+
     /// Remove every comment marker from the stories, straight from each
     /// part's XML, not through the model: nothing else in the part changes
     /// but the run a `w:commentReference` leaves holding only its `w:rPr`,
@@ -1048,15 +1064,29 @@ pub fn count_story_blocks(blocks: &[Block], styles: Option<&StyleSheet>) -> Stor
 }
 
 /// `xml` (a whole part) without its comment markers, and how many there
-/// were. A run a marker leaves holding only its `w:rPr` goes too.
-fn strip_markers_in_part(xml: &str) -> (String, usize) {
+/// were: those of the comments `only` names, or every comment's when it is
+/// `None`. A run a marker leaves holding only its `w:rPr` goes too.
+pub fn strip_comment_markers_in_part(xml: &str, only: Option<&[&str]>) -> (String, usize) {
     const RUN_END: &str = "</w:r>";
     let mut out = xml.to_string();
     let mut removed = 0;
     for name in MARKER_TAGS {
-        while let Some((start, end, _)) = find_element_from(&out, name, 0) {
+        let mut from = 0;
+        while let Some((start, end, _)) = find_element_from(&out, name, from) {
+            if let Some(only) = only {
+                let id = tag_end(&out[start..end]).and_then(|head| {
+                    let mut p = XmlParser::new(&out[start..start + head]);
+                    (p.next() == Event::Start).then(|| p.attr("w:id").to_string())
+                });
+                if !id.is_some_and(|id| only.contains(&id.as_str())) {
+                    from = end;
+                    continue;
+                }
+            }
             out.replace_range(start..end, "");
             removed += 1;
+            // What follows may be a marker the skip passed over.
+            from = 0;
             if !out[start..].starts_with(RUN_END) {
                 continue;
             }
@@ -1075,6 +1105,65 @@ fn strip_markers_in_part(xml: &str) -> (String, usize) {
         }
     }
     (out, removed)
+}
+
+fn strip_markers_in_part(xml: &str) -> (String, usize) {
+    strip_comment_markers_in_part(xml, None)
+}
+
+/// A story part [`Stories::strip_comment_markers`] changed (or a host
+/// stripped itself with [`strip_comment_markers_in_part`]): its text before
+/// and after, and the comments whose markers went. A host keeps it to put
+/// the markers back when an undo brings the comments back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StrippedPart {
+    pub part: String,
+    pub before: String,
+    pub after: String,
+    pub ids: std::collections::BTreeSet<String>,
+}
+
+impl StrippedPart {
+    /// Strip the markers of `only` (all when `None`) from `part` of `pkg`;
+    /// `None` when it has none there.
+    pub fn strip(pkg: &mut Package, part: &str, only: Option<&[&str]>) -> Option<StrippedPart> {
+        let before = pkg.part_text(part)?;
+        let (after, n) = strip_comment_markers_in_part(&before, only);
+        if n == 0 {
+            return None;
+        }
+        let mut ids = comment_marker_ids_in_xml(&before);
+        if let Some(only) = only {
+            ids.retain(|id| only.contains(&id.as_str()));
+        }
+        pkg.set_part_text(part, &after);
+        Some(StrippedPart {
+            part: part.to_string(),
+            before,
+            after,
+            ids,
+        })
+    }
+
+    /// Put the markers back, but only while the part is as the strip left
+    /// it: a part edited since moved on and stays. Whether it did.
+    pub fn restore(&self, pkg: &mut Package) -> bool {
+        self.swap(pkg, &self.after, &self.before)
+    }
+
+    /// Strip them again after a [`StrippedPart::restore`], on the same
+    /// condition.
+    pub fn restrip(&self, pkg: &mut Package) -> bool {
+        self.swap(pkg, &self.before, &self.after)
+    }
+
+    fn swap(&self, pkg: &mut Package, from: &str, to: &str) -> bool {
+        if pkg.part_text(&self.part).as_deref() != Some(from) {
+            return false;
+        }
+        pkg.set_part_text(&self.part, to);
+        true
+    }
 }
 
 /// The byte length of the tag starting at `s[0] == '<'`, through its `>`,
@@ -2245,6 +2334,73 @@ mod tests {
         assert_eq!(
             stories(&pkg).count(&pkg, None, None),
             StoryCounts::default()
+        );
+    }
+
+    /// #981: one comment's markers leave a story part and nothing else's;
+    /// the strip is recorded and puts back only while the part is as left.
+    #[test]
+    fn strip_one_comment_from_stories_and_restore_it() {
+        let mut pkg = storied_docx();
+        let header = pkg.part_text("word/header1.xml").unwrap();
+        // A second comment (id 5) in the header too.
+        let two = header.replace(
+            "<w:r><w:rPr><w:vanish/>",
+            "<w:commentRangeStart w:id=\"5\"/><w:commentRangeEnd w:id=\"5\"/>\
+             <w:r><w:commentReference w:id=\"5\"/></w:r><w:r><w:rPr><w:vanish/>",
+        );
+        pkg.set_part_text("word/header1.xml", &two);
+
+        let stripped = stories(&pkg).strip_comment_markers(&mut pkg, Some(&["3"]), None);
+        let parts: Vec<&str> = stripped.iter().map(|s| s.part.as_str()).collect();
+        assert_eq!(parts, ["word/header1.xml"], "{parts:?}");
+        assert_eq!(stripped[0].before, two);
+        assert_eq!(stripped[0].ids.iter().cloned().collect::<Vec<_>>(), ["3"]);
+        let now = pkg.part_text("word/header1.xml").unwrap();
+        assert_eq!(now, stripped[0].after);
+        assert_eq!(
+            comment_marker_ids_in_xml(&now)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["5"],
+            "{now}"
+        );
+        assert!(!now.contains("CommentReference"), "{now}");
+        assert!(now.contains("<w:t>Head</w:t>"), "{now}");
+        // The notes' id 4 stays (not named).
+        assert!(stories(&pkg).comment_marker_ids(&pkg).contains("4"));
+
+        assert!(stripped[0].restore(&mut pkg));
+        assert_eq!(pkg.part_text("word/header1.xml").unwrap(), two);
+        assert!(stripped[0].restrip(&mut pkg));
+        assert_eq!(
+            pkg.part_text("word/header1.xml").unwrap(),
+            stripped[0].after
+        );
+
+        // A part that moved on is left alone.
+        pkg.set_part_text("word/header1.xml", &format!("{now}<!-- edited -->"));
+        assert!(!stripped[0].restore(&mut pkg));
+        assert!(
+            pkg.part_text("word/header1.xml")
+                .unwrap()
+                .ends_with("<!-- edited -->")
+        );
+    }
+
+    /// #981: `skip` leaves the open part alone; every comment goes with
+    /// `None`, one record per part, and a part without a marker has none.
+    #[test]
+    fn strip_all_comments_from_stories_skips_the_open_part() {
+        let mut pkg = storied_docx();
+        let stripped =
+            stories(&pkg).strip_comment_markers(&mut pkg, None, Some("word/header1.xml"));
+        let parts: Vec<&str> = stripped.iter().map(|s| s.part.as_str()).collect();
+        assert_eq!(parts, ["word/footnotes.xml", "word/endnotes.xml"]);
+        assert!(
+            pkg.part_text("word/header1.xml")
+                .unwrap()
+                .contains("commentReference")
         );
     }
 
