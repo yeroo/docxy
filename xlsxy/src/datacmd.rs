@@ -120,6 +120,19 @@ impl App {
         levels: &[SortLevel],
         opts: &SortOptions,
     ) -> Result<(usize, bool), String> {
+        // The funnel of every sort (prompt, ribbon, filter picker, verb): the
+        // sorted sheet's own protection, which need not be the active one.
+        if self
+            .pkg
+            .workbook
+            .sheets
+            .get(si)
+            .is_some_and(|s| s.is_protected())
+        {
+            let msg = "Sheet is protected — unprotect it to edit (Review ▸ Protect)".to_string();
+            self.status = Some(msg.clone());
+            return Err(msg);
+        }
         let mut n = 0;
         let changed = self
             .try_structural_if_changed(|wb| {
@@ -1064,6 +1077,39 @@ mod tests {
         a.commit_filter_by_cell("v");
         assert_eq!(a.status.as_deref(), Some("1 of 5 records found"));
         assert!(a.sheet().auto_filter.is_some());
+    }
+
+    /// #833: the drop-down's Sort A to Z / Z to A is a sort like any other.
+    #[test]
+    fn filter_picker_sort_is_refused_on_a_protected_sheet() {
+        for sel in [0, 1] {
+            let mut a = regions();
+            a.ribbon_act(crate::ribbon::Act::Filter);
+            a.cur = (0, 1); // Rep's button
+            assert!(a.open_filter_picker());
+            a.filter_picker.as_mut().unwrap().sel = sel;
+            a.pkg.workbook.sheets[0].set_protected(true);
+            let (before, undo_len, modified) = (col(&a, 1), a.undo.len(), a.modified);
+            a.filter_picker_key(KeyCode::Enter);
+            assert_eq!(col(&a, 1), before);
+            assert_eq!(a.undo.len(), undo_len);
+            assert_eq!(a.modified, modified);
+            assert_eq!(
+                a.status.as_deref(),
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)")
+            );
+        }
+    }
+
+    #[test]
+    fn filter_picker_sort_still_sorts_an_unprotected_sheet() {
+        let mut a = regions();
+        a.ribbon_act(crate::ribbon::Act::Filter);
+        a.cur = (0, 1);
+        assert!(a.open_filter_picker());
+        a.filter_picker.as_mut().unwrap().sel = 0;
+        a.filter_picker_key(KeyCode::Enter);
+        assert_eq!(col(&a, 1), ["Ann", "Bob", "Cara", "Dan", "Eve"]);
     }
 
     #[test]
