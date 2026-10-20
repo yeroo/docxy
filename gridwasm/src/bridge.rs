@@ -29,27 +29,25 @@ struct UndoGroup {
 }
 
 /// The `(row, col, style)` a restyle group puts back: the style of each
-/// change's `before` or `after` cell (picked by `side`), default if absent.
+/// change's `before` or `after` cell (picked by `side`), `None` if absent.
 fn group_styles(
     group: &UndoGroup,
     side: impl Fn(&(u32, u32, Option<Cell>, Option<Cell>)) -> &Option<Cell>,
-) -> Vec<(u32, u32, u32)> {
+) -> Vec<(u32, u32, Option<u32>)> {
     group
         .changes
         .iter()
-        .map(|ch| (ch.0, ch.1, side(ch).as_ref().map_or(0, |cl| cl.style)))
+        .map(|ch| (ch.0, ch.1, side(ch).as_ref().map(|cl| cl.style)))
         .collect()
 }
 
 /// The `(row, col, cell)` an undo or redo puts back: each change's `before`
-/// or `after` cell (picked by `side`), blank if absent.
+/// or `after` cell (picked by `side`), `None` if absent.
 fn group_cells<'a>(
     changes: impl Iterator<Item = &'a (u32, u32, Option<Cell>, Option<Cell>)>,
     side: impl Fn(&(u32, u32, Option<Cell>, Option<Cell>)) -> &Option<Cell>,
-) -> Vec<(u32, u32, Cell)> {
-    changes
-        .map(|ch| (ch.0, ch.1, side(ch).clone().unwrap_or_default()))
-        .collect()
+) -> Vec<(u32, u32, Option<Cell>)> {
+    changes.map(|ch| (ch.0, ch.1, side(ch).clone())).collect()
 }
 
 /// Sheets, defined names and tables — snapshotted around structural edits
@@ -643,11 +641,11 @@ impl Session {
                 if group.styles_only {
                     let styles = group_styles(&group, |ch| &ch.2);
                     self.engine
-                        .set_styles(&mut self.pkg.workbook, group.sheet, &styles);
+                        .set_styles_opt(&mut self.pkg.workbook, group.sheet, &styles);
                 } else {
                     let cells = group_cells(group.changes.iter().rev(), |ch| &ch.2);
                     self.engine
-                        .restore_cells(&mut self.pkg.workbook, group.sheet, &cells);
+                        .restore_snapshot(&mut self.pkg.workbook, group.sheet, &cells);
                 }
                 self.redo.push(UndoAction::Cells(group));
                 self.dirty = true;
@@ -676,11 +674,11 @@ impl Session {
                 if group.styles_only {
                     let styles = group_styles(&group, |ch| &ch.3);
                     self.engine
-                        .set_styles(&mut self.pkg.workbook, group.sheet, &styles);
+                        .set_styles_opt(&mut self.pkg.workbook, group.sheet, &styles);
                 } else {
                     let cells = group_cells(group.changes.iter(), |ch| &ch.3);
                     self.engine
-                        .restore_cells(&mut self.pkg.workbook, group.sheet, &cells);
+                        .restore_snapshot(&mut self.pkg.workbook, group.sheet, &cells);
                 }
                 self.undo.push(UndoAction::Cells(group));
                 self.dirty = true;

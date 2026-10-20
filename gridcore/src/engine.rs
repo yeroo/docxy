@@ -627,31 +627,92 @@ impl Engine {
     /// default style is dropped, as [`Sheet::set_cell`] does. One recalculation
     /// follows, so formulas that read a style (`CELL("format")`) see it.
     pub fn set_styles(&mut self, wb: &mut Workbook, sheet: usize, styles: &[(u32, u32, u32)]) {
+        let opt: Vec<(u32, u32, Option<u32>)> =
+            styles.iter().map(|&(r, c, st)| (r, c, Some(st))).collect();
+        self.set_styles_opt(wb, sheet, &opt);
+    }
+
+    /// [`Engine::set_styles`] where `None` is a cell that was absent (an
+    /// undo of a restyle): a blank one is removed, one holding content keeps
+    /// it with the default style. `Some(0)` on a blank cell keeps the cell
+    /// when its row or column pins the default ([`Sheet::pins_default`]),
+    /// which an absent cell never does.
+    pub fn set_styles_opt(
+        &mut self,
+        wb: &mut Workbook,
+        sheet: usize,
+        styles: &[(u32, u32, Option<u32>)],
+    ) {
         let Some(sh) = wb.sheets.get_mut(sheet) else {
             return;
         };
         for &(r, c, style) in styles {
+            let pinned = sh.pins_default(r, c);
             match sh.cells.get_mut(&(r, c)) {
                 Some(cell) => {
-                    cell.style = style;
-                    if cell.is_blank() && style == 0 {
+                    cell.style = style.unwrap_or(0);
+                    if cell.is_blank() && cell.style == 0 && (style.is_none() || !pinned) {
                         sh.cells.remove(&(r, c));
                     }
                 }
-                None if style != 0 => {
-                    sh.cells.insert(
-                        (r, c),
-                        Cell {
-                            style,
-                            ..Cell::default()
-                        },
-                    );
+                None => {
+                    if let Some(style @ 1..) = style {
+                        sh.cells.insert(
+                            (r, c),
+                            Cell {
+                                style,
+                                ..Cell::default()
+                            },
+                        );
+                    }
                 }
-                None => {}
             }
         }
         let keys: Vec<Key> = styles.iter().map(|&(r, c, _)| (sheet, r, c)).collect();
         self.recalc_from(wb, &keys);
+    }
+
+    /// [`Engine::restore_cells`] for an undo snapshot, where `None` is a
+    /// cell that was absent: it is put back absent, not as a blank default
+    /// cell that a row or column style would pin. A `Some` blank default
+    /// cell stays where its row or column pins the default, also onto a slot
+    /// that is empty now.
+    pub fn restore_snapshot(
+        &mut self,
+        wb: &mut Workbook,
+        s: usize,
+        cells: &[(u32, u32, Option<Cell>)],
+    ) {
+        let plain: Vec<(u32, u32, Cell)> = cells
+            .iter()
+            .map(|(r, c, cl)| (*r, *c, cl.clone().unwrap_or_default()))
+            .collect();
+        self.restore_cells(wb, s, &plain);
+        let Some(sh) = wb.sheets.get_mut(s) else {
+            return;
+        };
+        for (r, c, cell) in cells {
+            match cell {
+                None => {
+                    let blank = sh
+                        .cell(*r, *c)
+                        .is_some_and(|h| h.is_blank() && h.style == 0 && h.f_attrs.is_none());
+                    if blank {
+                        sh.cells.remove(&(*r, *c));
+                    }
+                }
+                // Only into an empty slot: a spill refilled that cell.
+                Some(cl)
+                    if cl.is_blank()
+                        && cl.style == 0
+                        && cl.f_attrs.is_none()
+                        && sh.cell(*r, *c).is_none() =>
+                {
+                    sh.put_pinned(*r, *c, cl.clone());
+                }
+                Some(_) => {}
+            }
+        }
     }
 
     /// Put one cell back exactly as it was: its `<f>` attributes and metadata
@@ -4583,6 +4644,116 @@ mod tests {
         set(&mut eng, &mut wb, "D2", Cell::number(2.0));
         assert_eq!(value_at(&wb, "D1"), CellValue::Error("#SPILL!".into()));
         assert_eq!(spill_of(&wb, "D1"), None);
+    }
+
+    /// A sheet whose column B has style 7 and whose row 3 has style 5
+    /// (`customFormat`), so B1 and anything in row 3 are pinned by a blank.
+    fn pinned_wb(cells: &[(&str, Cell)]) -> Workbook {
+        let mut wb = wb_one_sheet(cells);
+        let sh = &mut wb.sheets[0];
+        sh.col_defs.push(crate::sheet::ColDef {
+            min: 1,
+            max: 1,
+            width: None,
+            attrs: r#"style="7""#.to_string(),
+            default_width: false,
+            plain_width: false,
+        });
+        sh.row_attrs
+            .insert(2, r#"s="5" customFormat="1""#.to_string());
+        wb
+    }
+
+    fn has(wb: &Workbook, name: &str) -> bool {
+        let (r, c) = crate::sheet::parse_cell_name(name).unwrap();
+        wb.sheets[0].cell(r, c).is_some()
+    }
+
+    #[test]
+    fn pins_default_reads_the_row_and_column_style() {
+        let wb = pinned_wb(&[]);
+        let sh = &wb.sheets[0];
+        assert!(sh.pins_default(0, 1), "column style");
+        assert!(sh.pins_default(2, 0), "row style");
+        assert!(!sh.pins_default(0, 0));
+        assert!(!wb_one_sheet(&[]).sheets[0].pins_default(0, 1));
+    }
+
+    #[test]
+    fn undo_of_typing_keeps_a_pinned_blank_and_leaves_an_absent_cell_absent() {
+        let mut wb = pinned_wb(&[]);
+        let mut eng = Engine::new(&wb);
+        // B1 is pinned (a blank default cell the file carried); B2 is absent.
+        wb.sheets[0].put_pinned(0, 1, Cell::default());
+        assert!(has(&wb, "B1"));
+        set(&mut eng, &mut wb, "B1", Cell::number(1.0));
+        set(&mut eng, &mut wb, "B2", Cell::number(2.0));
+        eng.restore_snapshot(&mut wb, 0, &[(0, 1, Some(Cell::default())), (1, 1, None)]);
+        assert!(has(&wb, "B1") && wb.sheets[0].cell(0, 1).unwrap().is_blank());
+        assert!(!has(&wb, "B2"), "an absent cell is not pinned by undo");
+        // Row style too.
+        set(&mut eng, &mut wb, "A3", Cell::number(3.0));
+        eng.restore_snapshot(&mut wb, 0, &[(2, 0, None)]);
+        assert!(!has(&wb, "A3"));
+    }
+
+    #[test]
+    fn a_blank_written_over_an_absent_cell_invents_no_pin() {
+        let mut wb = pinned_wb(&[]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "B2", Cell::default());
+        assert!(!has(&wb, "B2"));
+        wb.sheets[0].clear_cell(3, 1);
+        assert!(!has(&wb, "B4"));
+        // A typed cell then deleted (blank over a present cell) stays pinned.
+        set(&mut eng, &mut wb, "B5", Cell::number(1.0));
+        set(&mut eng, &mut wb, "B5", Cell::default());
+        assert!(has(&wb, "B5"));
+        // Without a row or column style a blank default cell is dropped.
+        let mut plain = wb_one_sheet(&[("B1", Cell::number(1.0))]);
+        let mut eng = Engine::new(&plain);
+        set(&mut eng, &mut plain, "B1", Cell::default());
+        assert!(!has(&plain, "B1"));
+    }
+
+    #[test]
+    fn set_styles_keeps_a_pinned_blank_and_never_pins_an_absent_cell() {
+        let mut wb = pinned_wb(&[]);
+        let mut eng = Engine::new(&wb);
+        wb.sheets[0].put_pinned(0, 1, Cell::default());
+        eng.set_styles(&mut wb, 0, &[(0, 1, 9)]);
+        eng.set_styles(&mut wb, 0, &[(0, 1, 0)]);
+        assert!(has(&wb, "B1"), "format then undo keeps the pin");
+        // B2 was absent: styled, then undone as absent.
+        eng.set_styles(&mut wb, 0, &[(1, 1, 9)]);
+        assert!(has(&wb, "B2"));
+        eng.set_styles_opt(&mut wb, 0, &[(1, 1, None)]);
+        assert!(!has(&wb, "B2"));
+        // `set_styles` to 0 over a present blank, unpinned column: dropped.
+        eng.set_styles(&mut wb, 0, &[(0, 0, 9)]);
+        eng.set_styles(&mut wb, 0, &[(0, 0, 0)]);
+        assert!(!has(&wb, "A1"));
+        // Content survives a None restyle.
+        set(&mut eng, &mut wb, "B6", Cell::number(4.0));
+        eng.set_styles_opt(&mut wb, 0, &[(5, 1, None)]);
+        assert!(has(&wb, "B6"));
+    }
+
+    #[test]
+    fn undo_of_a_sort_puts_a_moved_pinned_blank_back() {
+        let mut wb = pinned_wb(&[("A1", Cell::number(2.0)), ("A2", Cell::number(1.0))]);
+        let mut eng = Engine::new(&wb);
+        wb.sheets[0].put_pinned(0, 1, Cell::default()); // B1 pinned, row 1
+        let before: Vec<(u32, u32, Option<Cell>)> = (0..2)
+            .flat_map(|r| (0..2).map(move |c| (r, c)))
+            .map(|(r, c)| (r, c, wb.sheets[0].cell(r, c).cloned()))
+            .collect();
+        crate::edit::sort_rows(&mut wb, 0, 0, 1, &[(0, true)]);
+        // The pin moved with its row to B2, still under the column style.
+        assert!(has(&wb, "B2") && !has(&wb, "B1"));
+        eng.restore_snapshot(&mut wb, 0, &before);
+        assert!(has(&wb, "B1"), "the pin is back at its source");
+        assert!(!has(&wb, "B2"));
     }
 
     #[test]

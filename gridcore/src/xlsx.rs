@@ -2662,20 +2662,8 @@ fn parse_worksheet_with(
                     // unless its row or column has a style: then the cell
                     // pins the default, and without it the cell would show
                     // the row's or column's format (#1064).
-                    let pins_default = || {
-                        let styled = |s: Option<&str>| s.is_some_and(|s| s.trim() != "0");
-                        sheet.row_attrs.get(&row).is_some_and(|a| {
-                            matches!(
-                                crate::sheet::xml_attr(a, "customFormat"),
-                                Some("1" | "true")
-                            ) && styled(crate::sheet::xml_attr(a, "s"))
-                        }) || sheet.col_defs.iter().any(|d| {
-                            (d.min..=d.max).contains(&col)
-                                && styled(crate::sheet::xml_attr(&d.attrs, "style"))
-                        })
-                    };
                     if !(cell.is_blank() && cell.style == 0 && cell.f_attrs.is_none())
-                        || pins_default()
+                        || sheet.pins_default(row, col)
                     {
                         sheet.cells.insert((row, col), cell);
                     }
@@ -12703,6 +12691,31 @@ mod tests {
         assert!(sheet.cells.contains_key(&(0, 0)), "under the row style");
         assert!(!sheet.cells.contains_key(&(1, 1)), "nothing to pin");
         assert!(sheet.cells.contains_key(&(1, 2)), "under the column style");
+    }
+
+    /// #1097: the edit paths keep what the reader kept: typing into a pinned
+    /// B1 and undoing it still saves `<c r="B1"`.
+    #[test]
+    fn a_pinned_blank_survives_type_undo_and_save() {
+        let mut pkg = new_xlsx();
+        let sh = &mut pkg.workbook.sheets[0];
+        sh.col_defs.push(crate::sheet::ColDef {
+            min: 1,
+            max: 1,
+            width: Some(9.0),
+            attrs: r#"style="7""#.to_string(),
+            default_width: false,
+            plain_width: false,
+        });
+        sh.put_pinned(0, 1, Cell::default());
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 1), Cell::number(1.0));
+        eng.restore_snapshot(&mut pkg.workbook, 0, &[(0, 1, Some(Cell::default()))]);
+        let back = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert!(back.workbook.sheets[0].cells.contains_key(&(0, 1)));
+        let part = back.sheet_parts[0].clone();
+        let xml = String::from_utf8(back.part(&part).unwrap().to_vec()).unwrap();
+        assert!(xml.contains(r#"<c r="B1""#), "{xml}");
     }
 
     /// #1064: Excel 2013+ writes `<x15:workbookPr chartTrackingRefBase>` in

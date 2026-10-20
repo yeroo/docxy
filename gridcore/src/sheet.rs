@@ -1546,9 +1546,39 @@ impl Sheet {
         self.cells.get(&(row, col))
     }
 
-    /// Set (or clear, when the cell is blank and unstyled) a cell.
+    /// Does an explicit default-style cell at `(row, col)` matter? True when
+    /// the row has a style (`customFormat` with an `s` other than 0) or a
+    /// `<col>` covering the column does: the cell then overrides what it
+    /// would inherit, so a save must keep it (#1064).
+    pub fn pins_default(&self, row: u32, col: u32) -> bool {
+        let styled = |s: Option<&str>| s.is_some_and(|s| s.trim() != "0");
+        self.row_attrs.get(&row).is_some_and(|a| {
+            matches!(xml_attr(a, "customFormat"), Some("1" | "true")) && styled(xml_attr(a, "s"))
+        }) || self
+            .col_defs
+            .iter()
+            .any(|d| (d.min..=d.max).contains(&col) && styled(xml_attr(&d.attrs, "style")))
+    }
+
+    /// Set (or clear, when the cell is blank and unstyled) a cell. A blank
+    /// default-style cell that is already there stays when its row or column
+    /// has a style ([`Sheet::pins_default`]); one written over an absent cell
+    /// never invents a pin.
     pub fn set_cell(&mut self, row: u32, col: u32, cell: Cell) {
         if cell.is_blank() && cell.style == 0 {
+            if !(self.cells.contains_key(&(row, col)) && self.pins_default(row, col)) {
+                self.cells.remove(&(row, col));
+                return;
+            }
+        }
+        self.cells.insert((row, col), cell);
+    }
+
+    /// Put a cell where a known state says it belongs (a sort moving a
+    /// pinned blank, an undo restoring one): a blank default-style cell is
+    /// kept iff the row or column pins the default, present there or not.
+    pub fn put_pinned(&mut self, row: u32, col: u32, cell: Cell) {
+        if cell.is_blank() && cell.style == 0 && !self.pins_default(row, col) {
             self.cells.remove(&(row, col));
         } else {
             self.cells.insert((row, col), cell);
