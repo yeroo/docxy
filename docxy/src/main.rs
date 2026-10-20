@@ -3687,9 +3687,10 @@ impl App {
             self.editor.remove_all_comment_markers();
         }
         let comments = std::mem::take(&mut self.comments);
-        // Each stored part once for all of its comments: the ones an undo
-        // reaches keep what was taken, the ones anchored only there lose
-        // it for good.
+        // Two passes over the stored parts, each strips a part once for all
+        // of its comments: first the ones anchored only there, for good
+        // (the recorded strips of the part take that in), then the ones an
+        // undo reaches, recorded.
         let (kept, gone): (Vec<&str>, Vec<&str>) = comments
             .iter()
             .map(|c| c.id.as_str())

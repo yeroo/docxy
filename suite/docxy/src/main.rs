@@ -13083,9 +13083,10 @@ struct CommentUndo {
     /// puts this back for one that is live again, instead of the plain
     /// paragraph [`doc_to_docx`] would make of its parsed record.
     raw: std::collections::HashMap<String, RawComment>,
-    /// The markers Remove All took out of the headers, footers and notes of
-    /// `pkg`, which no undo step covers ([`save_base`] puts a part's back
-    /// while all its comments are anchored again).
+    /// The markers Remove All (or Delete Comment on a converted tab) took out
+    /// of the headers, footers and notes of `pkg`, which no undo step covers
+    /// ([`save_base`] puts a part's back while all its comments are anchored
+    /// again).
     stripped: Vec<docxcore::inspect::StrippedPart>,
 }
 
@@ -13211,8 +13212,9 @@ fn save_base<'a>(
 /// - a comment that is live again but not in `base` (a converted tab's
 ///   rebased package no longer holds it) gets its original XML back, kept
 ///   when it was deleted, not a plain paragraph made from its record;
-/// - the markers Remove All took out of a header, footer or note come
-///   back while every comment they carry is anchored in the body again;
+/// - the markers Remove All (or Delete Comment on a converted tab) took out
+///   of a header, footer or note come back while every comment they carry
+///   is anchored in the body again;
 /// - a tracked comment that is not live has no marker left in any story,
 ///   so the file has no marker without a comment. The package itself is
 ///   untouched, so undo and redo need no bookkeeping there.

@@ -975,26 +975,6 @@ impl Stories {
             .filter_map(|(part, _)| StrippedPart::strip(pkg, part, only))
             .collect()
     }
-
-    /// Remove every comment marker from the stories, straight from each
-    /// part's XML, not through the model: nothing else in the part changes
-    /// but the run a `w:commentReference` leaves holding only its `w:rPr`,
-    /// which goes too. A part without a marker is not touched. Returns how
-    /// many markers were removed.
-    pub fn remove_comment_markers(&self, pkg: &mut Package) -> usize {
-        let mut removed = 0;
-        for (part, _) in &self.parts {
-            let Some(xml) = pkg.part_text(part) else {
-                continue;
-            };
-            let (out, n) = strip_comment_markers_in_part(&xml, None);
-            if n > 0 {
-                pkg.set_part_text(part, &out);
-                removed += n;
-            }
-        }
-        removed
-    }
 }
 
 /// [`Stories::remove_hidden_text`] of notes part `part`, whose notes are
@@ -2259,6 +2239,15 @@ mod tests {
     /// references it.
     const SECT: &str = "<w:sectPr><w:headerReference w:type=\"default\" r:id=\"rIdH\"/>        <w:headerReference w:type=\"first\" r:id=\"rIdH2\"/>        <w:footerReference w:type=\"default\" r:id=\"rIdF\"/></w:sectPr>";
 
+    /// Every comment marker out of the stories, and how many there were.
+    fn remove_story_markers(pkg: &mut Package) -> usize {
+        stories(pkg)
+            .strip_comment_markers(pkg, None, None)
+            .iter()
+            .map(|taken| count_markers(&taken.before, None))
+            .sum()
+    }
+
     fn stories(pkg: &Package) -> Stories {
         Stories::new(pkg, &pkg.document)
     }
@@ -2316,7 +2305,7 @@ mod tests {
         let rest = stories(&pkg).count(&pkg, None, Some("word/header1.xml"));
         assert_eq!((rest.hidden, rest.comment_markers), (2, 6));
 
-        assert_eq!(stories(&pkg).remove_comment_markers(&mut pkg), 9);
+        assert_eq!(remove_story_markers(&mut pkg), 9);
         let header = pkg.part_text("word/header1.xml").unwrap();
         assert_eq!(count_markers(&header, None), 0, "{header}");
         // The reference's run went with it; the rest is as it was.
@@ -2464,7 +2453,7 @@ mod tests {
             .map(|(part, element, _)| separators(&pkg, part, element))
             .collect();
         assert_eq!(stories(&pkg).remove_hidden_text(&mut pkg, None), 3);
-        assert_eq!(stories(&pkg).remove_comment_markers(&mut pkg), 9);
+        assert_eq!(remove_story_markers(&mut pkg), 9);
         for ((part, element, mark), before) in notes.iter().zip(before) {
             let xml = pkg.part_text(part).unwrap();
             assert_eq!(before.len(), 2, "{xml}");
@@ -2509,12 +2498,12 @@ mod tests {
         };
         let before = bytes(&pkg);
         assert_eq!(stories(&pkg).remove_hidden_text(&mut pkg, None), 1);
-        assert_eq!(stories(&pkg).remove_comment_markers(&mut pkg), 3);
+        assert_eq!(remove_story_markers(&mut pkg), 3);
         assert_eq!(bytes(&pkg), before);
         // And with nothing left anywhere, the header is not rewritten either.
         let header = pkg.part("word/header1.xml").unwrap().to_vec();
         assert_eq!(stories(&pkg).remove_hidden_text(&mut pkg, None), 0);
-        assert_eq!(stories(&pkg).remove_comment_markers(&mut pkg), 0);
+        assert_eq!(remove_story_markers(&mut pkg), 0);
         assert_eq!(pkg.part("word/header1.xml").unwrap(), header);
     }
 
@@ -2684,7 +2673,7 @@ mod tests {
         );
         assert!(stories(&pkg).comment_marker_ids(&pkg).is_empty());
         assert_eq!(stories(&pkg).remove_hidden_text(&mut pkg, None), 0);
-        assert_eq!(stories(&pkg).remove_comment_markers(&mut pkg), 0);
+        assert_eq!(remove_story_markers(&mut pkg), 0);
         assert_eq!(pkg.part_text("word/header9.xml").unwrap(), hidden);
         // Referenced from a section break, it is one.
         let sect = SECT.replace("rIdH2", "rIdH9");
