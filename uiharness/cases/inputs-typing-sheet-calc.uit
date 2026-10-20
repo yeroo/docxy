@@ -20,6 +20,9 @@ test sheet calc-options/max-iterations: focus by click
   call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
   assert dialog is calc-options
   call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"max-change"}
+  call field-read {"dialog-field":"max-iterations"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"max-iterations"}
   call field-read {"dialog-field":"max-iterations"}
   assert reply.focused is true
@@ -30,7 +33,7 @@ test sheet calc-options/max-iterations: focus by Tab
   call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
   assert dialog is calc-options
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"max-change"}
+  call real-key {"key":"tab","to-field":"max-change"}
   call field-read {"dialog-field":"max-iterations"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"max-iterations"}
@@ -176,6 +179,9 @@ test sheet calc-options/max-change: focus by click
   call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
   assert dialog is calc-options
   call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"max-iterations"}
+  call field-read {"dialog-field":"max-change"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"max-change"}
   call field-read {"dialog-field":"max-change"}
   assert reply.focused is true
@@ -186,7 +192,7 @@ test sheet calc-options/max-change: focus by Tab
   call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
   assert dialog is calc-options
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"max-iterations"}
+  call real-key {"key":"tab","to-field":"max-iterations"}
   call field-read {"dialog-field":"max-change"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"max-change"}
@@ -332,6 +338,9 @@ test sheet calc-options/threads: focus by click
   call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
   assert dialog is calc-options
   call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"max-iterations"}
+  call field-read {"dialog-field":"threads"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"threads"}
   call field-read {"dialog-field":"threads"}
   assert reply.focused is true
@@ -342,7 +351,7 @@ test sheet calc-options/threads: focus by Tab
   call ribbon-click {"tab":"Formulas","command":"More Calculation Options..."}
   assert dialog is calc-options
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"max-iterations"}
+  call real-key {"key":"tab","to-field":"max-iterations"}
   call field-read {"dialog-field":"threads"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"threads"}

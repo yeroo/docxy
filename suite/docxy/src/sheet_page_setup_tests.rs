@@ -654,3 +654,17 @@ fn the_dialog_refuses_row_zero_without_panicking() {
     assert_eq!(err, "Rows to repeat at top '$0:$1' is not a reference");
     assert_eq!(undo_len(&mut t), 0);
 }
+
+/// Custom Margins opens on its tab with the first margin focused and its
+/// value selected, so typing replaces it (#1314); only a note appends.
+#[test]
+fn custom_margins_opens_with_top_selected() {
+    let t = tab();
+    let d = dialog(&t, SetupTab::Margins).unwrap();
+    let mut stack = crate::dialog::DialogStack::default();
+    stack.push(d);
+    let d = stack.top().unwrap();
+    assert_eq!(d.focused().map(|c| c.name), Some("top"));
+    let len = d.focused().unwrap().text().chars().count();
+    assert_eq!(d.selection(), Some((0, len)));
+}

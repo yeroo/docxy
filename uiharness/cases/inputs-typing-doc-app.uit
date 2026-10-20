@@ -22,6 +22,9 @@ test doc save-on-close/file-name: focus by click
   key ctrl+w
   assert dialog is save-on-close
   call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"location"}
+  call field-read {"dialog-field":"file-name"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"file-name"}
   call field-read {"dialog-field":"file-name"}
   assert reply.focused is true
@@ -33,6 +36,9 @@ test doc save-on-close/file-name: focus by Tab
   key ctrl+w
   assert dialog is save-on-close
   call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"location"}
+  call field-read {"dialog-field":"file-name"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"file-name"}
   call field-read {"dialog-field":"file-name"}
   assert reply.focused is true
@@ -154,6 +160,9 @@ test doc save-on-close/location: focus by click
   key ctrl+w
   assert dialog is save-on-close
   call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"file-name"}
+  call field-read {"dialog-field":"location"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"location"}
   call field-read {"dialog-field":"location"}
   assert reply.focused is true
@@ -207,6 +216,9 @@ test doc user-name/user-name: focus by click
   call pointer-click {"at":"user-name-row"}
   assert dialog is user-name
   call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"initials"}
+  call field-read {"dialog-field":"user-name"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"user-name"}
   call field-read {"dialog-field":"user-name"}
   assert reply.focused is true
@@ -220,7 +232,7 @@ test doc user-name/user-name: focus by Tab
   call pointer-click {"at":"user-name-row"}
   assert dialog is user-name
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"initials"}
+  call real-key {"key":"tab","to-field":"initials"}
   call field-read {"dialog-field":"user-name"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"user-name"}
@@ -375,6 +387,9 @@ test doc user-name/initials: focus by click
   call pointer-click {"at":"user-name-row"}
   assert dialog is user-name
   call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"user-name"}
+  call field-read {"dialog-field":"initials"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"initials"}
   call field-read {"dialog-field":"initials"}
   assert reply.focused is true
@@ -388,7 +403,7 @@ test doc user-name/initials: focus by Tab
   call pointer-click {"at":"user-name-row"}
   assert dialog is user-name
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"user-name"}
+  call real-key {"key":"tab","to-field":"user-name"}
   call field-read {"dialog-field":"initials"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"initials"}
@@ -555,6 +570,9 @@ test doc autocorrect/replace: focus by click
   assert dialog is autocorrect
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"AutoCorrect"}
+  call real-key {"key":"tab","to-field":"with"}
+  call field-read {"dialog-field":"replace"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"replace"}
   call field-read {"dialog-field":"replace"}
   assert reply.focused is true
@@ -566,7 +584,7 @@ test doc autocorrect/replace: focus by Tab
   assert dialog is autocorrect
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"AutoCorrect"}
-  call pointer-click {"dialog-field":"with"}
+  call real-key {"key":"tab","to-field":"with"}
   call field-read {"dialog-field":"replace"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"replace"}
@@ -690,6 +708,9 @@ test doc autocorrect/with: focus by click
   assert dialog is autocorrect
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"AutoCorrect"}
+  call real-key {"key":"tab","to-field":"replace"}
+  call field-read {"dialog-field":"with"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"with"}
   call field-read {"dialog-field":"with"}
   assert reply.focused is true
@@ -701,7 +722,7 @@ test doc autocorrect/with: focus by Tab
   assert dialog is autocorrect
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"AutoCorrect"}
-  call pointer-click {"dialog-field":"replace"}
+  call real-key {"key":"tab","to-field":"replace"}
   call field-read {"dialog-field":"with"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"with"}
@@ -825,6 +846,9 @@ test doc autocorrect/entries: focus by Tab
   assert dialog is autocorrect
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"AutoCorrect"}
+  call real-key {"key":"tab","to-field":"replace"}
+  call field-read {"dialog-field":"entries"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"entries"}
   call field-read {"dialog-field":"entries"}
   assert reply.focused is true
@@ -867,6 +891,9 @@ test doc autocorrect-exceptions/first-word: focus by click
   assert dialog is autocorrect-exceptions
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"First Letter"}
+  call real-key {"key":"tab","to-field":"first-list"}
+  call field-read {"dialog-field":"first-word"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"first-word"}
   call field-read {"dialog-field":"first-word"}
   assert reply.focused is true
@@ -879,6 +906,9 @@ test doc autocorrect-exceptions/first-word: focus by Tab
   assert dialog is autocorrect-exceptions
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"First Letter"}
+  call real-key {"key":"tab","to-field":"first-list"}
+  call field-read {"dialog-field":"first-word"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"first-word"}
   call field-read {"dialog-field":"first-word"}
   assert reply.focused is true
@@ -1008,6 +1038,9 @@ test doc autocorrect-exceptions/first-list: focus by Tab
   assert dialog is autocorrect-exceptions
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"First Letter"}
+  call real-key {"key":"tab","to-field":"first-word"}
+  call field-read {"dialog-field":"first-list"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"first-list"}
   call field-read {"dialog-field":"first-list"}
   assert reply.focused is true

@@ -184,6 +184,14 @@ impl Test {
         )
     }
 
+    /// Tab (or Shift+Tab) as many times as it takes to focus `f`.
+    fn tab_to(&mut self, f: &Field) -> &mut Self {
+        self.call(
+            "real-key",
+            &format!("{{\"key\":\"tab\",\"to-field\":{}}}", js(f.name)),
+        )
+    }
+
     fn click(&mut self, f: &Field) -> &mut Self {
         let target = if f.kind.is_text() {
             "dialog-field"
@@ -302,29 +310,16 @@ fn text_tests(e: &Entry, f: &Field) -> Vec<Test> {
     let (edit, back, paste) = edit_text(f);
     let edit_chars: Vec<char> = edit.chars().collect();
 
-    let mut t = Test::new(e, f, "focus by click");
-    t.open(e, f)
-        .click(f)
-        .read(f)
-        .assert("reply.focused is true")
-        .close();
-    tests.push(t);
+    tests.push(click_test(e, f));
 
-    // From another field a click focuses, when the field has a neighbour
-    // shown with it, so the Tabs have to move the focus: a field that
-    // already has it at open would pass on a whole round of ignored Tabs.
+    // The field may open focused (#1314), so the Tabs would pass on a whole
+    // round of ignored ones: leave it by Tab to a neighbour first.
     let mut t = Test::new(e, f, "focus by Tab");
     t.open(e, f);
     if let Some(other) = tab_start(e, f) {
-        t.click(other).read(f).assert("reply.focused is false");
+        t.tab_to(other).read(f).assert("reply.focused is false");
     }
-    t.call(
-        "real-key",
-        &format!("{{\"key\":\"tab\",\"to-field\":{}}}", js(f.name)),
-    )
-    .read(f)
-    .assert("reply.focused is true")
-    .close();
+    t.tab_to(f).read(f).assert("reply.focused is true").close();
     tests.push(t);
 
     let mut t = Test::new(e, f, "types");
@@ -462,22 +457,44 @@ fn text_tests(e: &Entry, f: &Field) -> Vec<Test> {
     tests
 }
 
-/// Another typed field of `e` on `f`'s tab, shown by the same prep, to start
-/// the Tab case from.
+/// Another field of `e` on `f`'s tab, shown by the same prep, to Tab to
+/// first: a dialog opens with its first control focused (#1314), so a case
+/// that never leaves the field would pass on a click or Tab that did nothing.
+/// Leaving by the keyboard changes no value, so a typed field, dropdown or
+/// list will do (a typed one first): the cases drive them, so their prep is
+/// known to show them. Not a checkbox or radio group, which nothing tests for
+/// being reachable: one may be undrawn or disabled at open (Format Cells'
+/// Thousands under General, Line Numbers' Restart), and Tab would never reach
+/// it, unless the field names one (`Field::leave`). None: nothing to leave for.
 fn tab_start<'e>(e: &'e Entry, f: &Field) -> Option<&'e Field> {
+    let same =
+        |o: &&Field| o.name != f.name && o.skip.is_none() && o.tab == f.tab && o.prep == f.prep;
+    let driven =
+        |o: &&Field| o.typed() || matches!(o.kind, ControlKind::Dropdown | ControlKind::List);
+    if let Some(to) = f.leave {
+        return e.fields.iter().find(|o| o.name == to);
+    }
     e.fields
         .iter()
-        .find(|o| o.name != f.name && o.typed() && o.tab == f.tab && o.prep == f.prep)
+        .find(|o| same(o) && o.typed())
+        .or_else(|| e.fields.iter().find(|o| same(o) && driven(o)))
 }
 
 fn dropdown_tests(e: &Entry, f: &Field) -> Vec<Test> {
+    vec![click_test(e, f), step_test(e, f)]
+}
+
+/// A click focuses the field. A dialog opens with its first control focused
+/// (#1314), so when a neighbour is shown the click starts from it, and the
+/// field must have lost the focus before the click gives it back.
+fn click_test(e: &Entry, f: &Field) -> Test {
     let mut t = Test::new(e, f, "focus by click");
-    t.open(e, f)
-        .click(f)
-        .read(f)
-        .assert("reply.focused is true")
-        .close();
-    vec![t, step_test(e, f)]
+    t.open(e, f);
+    if let Some(other) = tab_start(e, f) {
+        t.tab_to(other).read(f).assert("reply.focused is false");
+    }
+    t.click(f).read(f).assert("reply.focused is true").close();
+    t
 }
 
 /// A list (#988): Tab focuses it (a click lands on an item, or on none in a
@@ -485,14 +502,11 @@ fn dropdown_tests(e: &Entry, f: &Field) -> Vec<Test> {
 /// gives it two items or more, by `prep` when the dialog opens with fewer.
 fn list_tests(e: &Entry, f: &Field) -> Vec<Test> {
     let mut t = Test::new(e, f, "focus by Tab");
-    t.open(e, f)
-        .call(
-            "real-key",
-            &format!("{{\"key\":\"tab\",\"to-field\":{}}}", js(f.name)),
-        )
-        .read(f)
-        .assert("reply.focused is true")
-        .close();
+    t.open(e, f);
+    if let Some(other) = tab_start(e, f) {
+        t.tab_to(other).read(f).assert("reply.focused is false");
+    }
+    t.tab_to(f).read(f).assert("reply.focused is true").close();
     vec![t, step_test(e, f)]
 }
 

@@ -22,6 +22,9 @@ test project task-information/name: focus by click
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"duration"}
+  call field-read {"dialog-field":"name"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"name"}
   call field-read {"dialog-field":"name"}
   assert reply.focused is true
@@ -33,7 +36,7 @@ test project task-information/name: focus by Tab
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"duration"}
+  call real-key {"key":"tab","to-field":"duration"}
   call field-read {"dialog-field":"name"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"name"}
@@ -177,6 +180,9 @@ test project task-information/duration: focus by click
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"name"}
+  call field-read {"dialog-field":"duration"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"duration"}
   call field-read {"dialog-field":"duration"}
   assert reply.focused is true
@@ -188,7 +194,7 @@ test project task-information/duration: focus by Tab
   key alt t c
   assert dialog is task-information
   call dialog-catalog-check {}
-  call pointer-click {"dialog-field":"name"}
+  call real-key {"key":"tab","to-field":"name"}
   call field-read {"dialog-field":"duration"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"duration"}
@@ -345,6 +351,9 @@ test project task-information/start: focus by click
   assert dialog is task-information
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"General"}
+  call real-key {"key":"tab","to-field":"finish"}
+  call field-read {"dialog-field":"start"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"start"}
   call field-read {"dialog-field":"start"}
   assert reply.focused is true
@@ -357,7 +366,7 @@ test project task-information/start: focus by Tab
   assert dialog is task-information
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"finish"}
+  call real-key {"key":"tab","to-field":"finish"}
   call field-read {"dialog-field":"start"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"start"}
@@ -524,6 +533,9 @@ test project task-information/finish: focus by click
   assert dialog is task-information
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"General"}
+  call real-key {"key":"tab","to-field":"start"}
+  call field-read {"dialog-field":"finish"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"finish"}
   call field-read {"dialog-field":"finish"}
   assert reply.focused is true
@@ -536,7 +548,7 @@ test project task-information/finish: focus by Tab
   assert dialog is task-information
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"start"}
+  call real-key {"key":"tab","to-field":"start"}
   call field-read {"dialog-field":"finish"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"finish"}
@@ -703,6 +715,9 @@ test project task-information/percent: focus by click
   assert dialog is task-information
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"General"}
+  call real-key {"key":"tab","to-field":"start"}
+  call field-read {"dialog-field":"percent"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"percent"}
   call field-read {"dialog-field":"percent"}
   assert reply.focused is true
@@ -715,7 +730,7 @@ test project task-information/percent: focus by Tab
   assert dialog is task-information
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"start"}
+  call real-key {"key":"tab","to-field":"start"}
   call field-read {"dialog-field":"percent"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"percent"}
@@ -883,6 +898,9 @@ test project task-information/priority: focus by click
   assert dialog is task-information
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"General"}
+  call real-key {"key":"tab","to-field":"start"}
+  call field-read {"dialog-field":"priority"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"priority"}
   call field-read {"dialog-field":"priority"}
   assert reply.focused is true
@@ -895,7 +913,7 @@ test project task-information/priority: focus by Tab
   assert dialog is task-information
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"General"}
-  call pointer-click {"dialog-field":"start"}
+  call real-key {"key":"tab","to-field":"start"}
   call field-read {"dialog-field":"priority"}
   assert reply.focused is false
   call real-key {"key":"tab","to-field":"priority"}
@@ -1063,6 +1081,9 @@ test project task-information/ctype: focus by click
   assert dialog is task-information
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Advanced"}
+  call real-key {"key":"tab","to-field":"deadline"}
+  call field-read {"dialog-field":"ctype"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"ctype"}
   call field-read {"dialog-field":"ctype"}
   assert reply.focused is true
@@ -1310,6 +1331,9 @@ test project task-information/deadline: focus by click
   assert dialog is task-information
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Advanced"}
+  call real-key {"key":"tab","to-field":"ctype"}
+  call field-read {"dialog-field":"deadline"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"deadline"}
   call field-read {"dialog-field":"deadline"}
   assert reply.focused is true
@@ -1322,6 +1346,9 @@ test project task-information/deadline: focus by Tab
   assert dialog is task-information
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Advanced"}
+  call real-key {"key":"tab","to-field":"ctype"}
+  call field-read {"dialog-field":"deadline"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"deadline"}
   call field-read {"dialog-field":"deadline"}
   assert reply.focused is true
@@ -1486,6 +1513,9 @@ test project task-information/ttype: focus by click
   assert dialog is task-information
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Advanced"}
+  call real-key {"key":"tab","to-field":"deadline"}
+  call field-read {"dialog-field":"ttype"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"ttype"}
   call field-read {"dialog-field":"ttype"}
   assert reply.focused is true

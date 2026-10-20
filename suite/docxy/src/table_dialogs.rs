@@ -26,9 +26,6 @@ fn form(id: DialogId, title: &str, owner: DialogOwner, controls: Vec<Control>) -
     d.controls = controls;
     d.buttons = ok_cancel();
     d.mark_opened();
-    // The first control has the focus, as in Word, so the first keys edit
-    // it at once instead of going nowhere (#1163).
-    d.focus_step(false);
     d
 }
 
@@ -488,10 +485,16 @@ mod tests {
         d.focused().map(|c| c.name)
     }
 
-    /// Insert Table opens with Number of columns focused: Backspace and `3`
-    /// through the dialog's own key path make it 3, and Enter inserts a
-    /// three-column table (#1163). Before, no control had the focus and the
-    /// keys went nowhere.
+    /// The dialog as a push leaves it, with its first control focused.
+    fn pushed(d: Dialog) -> Dialog {
+        let mut stack = crate::dialog::DialogStack::default();
+        stack.push(d);
+        stack.top().unwrap().clone()
+    }
+
+    /// Insert Table opens with Number of columns focused and its value
+    /// selected: `3` through the dialog's own key path replaces it, and Enter
+    /// inserts a three-column table (#1314).
     #[test]
     fn insert_table_opens_with_columns_focused() {
         use crate::dialog_host::dialog_key;
@@ -500,14 +503,16 @@ mod tests {
             body: vec![Block::Paragraph(Paragraph::default())],
         }))
         .unwrap();
+        let d = pushed(d);
         assert_eq!(focused(&d), Some("cols"));
+        assert_eq!(text(&d, "cols"), "5", "the default Word shows");
         let mut t = crate::tab_from_path(
             &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../uiharness/fixtures/basic.docx"),
         );
         t.dialogs.push(d);
         let plain = Modifiers::default();
-        assert!(dialog_key(&mut t, "backspace", None, plain));
+        // The value opens selected, so `3` replaces it with no Backspace (#1314).
         assert!(dialog_key(&mut t, "3", Some("3"), plain));
         assert_eq!(text(t.dialogs.top().unwrap(), "cols"), "3");
         // Tab order is unchanged; it just starts at Number of columns.
@@ -528,13 +533,26 @@ mod tests {
     #[test]
     fn table_dialogs_open_focused() {
         let ed = doc_with_table(2, 2);
-        assert_eq!(focused(&delete_cells_dialog(&ed).unwrap()), Some("shift"));
-        assert_eq!(focused(&split_cells_dialog(&ed).unwrap()), Some("cols"));
-        assert_eq!(focused(&sort_dialog(&ed).unwrap()), Some("sort1"));
-        assert_eq!(focused(&table_to_text_dialog(&ed).unwrap()), Some("sep"));
+        let focused = |d: Dialog| focused(&pushed(d)).map(str::to_string);
+        assert_eq!(
+            focused(delete_cells_dialog(&ed).unwrap()).as_deref(),
+            Some("shift")
+        );
+        assert_eq!(
+            focused(split_cells_dialog(&ed).unwrap()).as_deref(),
+            Some("cols")
+        );
+        assert_eq!(focused(sort_dialog(&ed).unwrap()).as_deref(), Some("sort1"));
+        assert_eq!(
+            focused(table_to_text_dialog(&ed).unwrap()).as_deref(),
+            Some("sep")
+        );
         let mut ed = doc_with_table(2, 2);
         let d = table_to_text_dialog(&ed).unwrap();
         apply_table_to_text(&mut ed, &d).unwrap();
-        assert_eq!(focused(&text_to_table_dialog(&ed).unwrap()), Some("cols"));
+        assert_eq!(
+            focused(text_to_table_dialog(&ed).unwrap()).as_deref(),
+            Some("cols")
+        );
     }
 }

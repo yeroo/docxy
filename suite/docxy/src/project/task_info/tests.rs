@@ -1217,3 +1217,77 @@ fn a_row_with_a_type_or_lag_but_no_task_is_no_link() {
     dialog_click(&mut t, "OK").unwrap();
     assert!(preds(&t, 2).is_empty());
 }
+
+/// A dialog opens with the first control of its own page focused (#1314):
+/// Notes... lands in the note, not in the top row's Name (which is on every
+/// page), so typing a note cannot replace the task's name.
+#[test]
+fn the_dialog_opens_focused_on_its_own_page() {
+    let t = tab();
+    for (page, first) in [(InfoPage::General, "name"), (InfoPage::Notes, "notes")] {
+        let d = task_info_dialog(&v(&t).ed, 2, page).unwrap();
+        let mut stack = crate::dialog::DialogStack::default();
+        stack.push(d);
+        let d = stack.top().unwrap();
+        assert_eq!(d.focused().map(|c| c.name), Some(first));
+    }
+}
+
+/// Opening on Notes puts the caret after the existing note, nothing
+/// selected: typing appends (#1314).
+#[test]
+fn notes_open_with_the_caret_at_the_end_and_typing_appends() {
+    let t = tab();
+    let mut d = task_info_dialog(&v(&t).ed, 2, InfoPage::Notes).unwrap();
+    let notes = d.controls.iter().position(|c| c.name == "notes").unwrap();
+    d.controls[notes].value = Value::Text("abc".into());
+    let mut stack = crate::dialog::DialogStack::default();
+    stack.push(d);
+    let d = stack.top_dialog_mut().unwrap();
+    assert_eq!(d.selection(), None);
+    assert_eq!(d.caret_at(), 3);
+    d.type_char('d').unwrap();
+    assert_eq!(d.value("notes"), Some(&Value::Text("abcd".into())));
+}
+
+/// A click on the Notes tab while the top row's Name has the focus hands the
+/// keys to the page now shown: a typed note cannot replace the name (#1314).
+#[test]
+fn switching_to_notes_moves_the_focus_off_the_top_row() {
+    let t = tab();
+    let d = task_info_dialog(&v(&t).ed, 2, InfoPage::General).unwrap();
+    let mut stack = crate::dialog::DialogStack::default();
+    stack.push(d);
+    assert_eq!(stack.top().unwrap().focused().map(|c| c.name), Some("name"));
+    stack.select_tab("Notes").unwrap();
+    let d = stack.top_dialog_mut().unwrap();
+    assert_eq!(d.focused().map(|c| c.name), Some("notes"));
+    assert_eq!(d.selection(), None);
+    d.type_char('x').unwrap();
+    assert_eq!(d.value("name"), Some(&Value::Text("Second".into())));
+    assert_eq!(d.value("notes"), Some(&Value::Text("x".into())));
+}
+
+/// Notes -> click Name -> General: the top-row Name is on the first page too,
+/// so it keeps the focus and what was typed in it (#1314).
+#[test]
+fn going_back_to_the_first_page_keeps_the_top_row_focus() {
+    let t = tab();
+    let d = task_info_dialog(&v(&t).ed, 2, InfoPage::Notes).unwrap();
+    let mut stack = crate::dialog::DialogStack::default();
+    stack.push(d);
+    let name = stack
+        .top()
+        .unwrap()
+        .controls
+        .iter()
+        .position(|c| c.name == "name")
+        .unwrap();
+    let d = stack.top_dialog_mut().unwrap();
+    d.click_control(name, None).unwrap();
+    d.type_char('!').unwrap();
+    stack.select_tab("General").unwrap();
+    let d = stack.top().unwrap();
+    assert_eq!(d.focused().map(|c| c.name), Some("name"));
+    assert_eq!(d.value("name"), Some(&Value::Text("Second!".into())));
+}
