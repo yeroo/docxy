@@ -475,6 +475,29 @@
   `uiharness/cases/project-plugin-ui.uit` drives
   the fixture through all of it; nothing changes without a UI plugin.
 
+## Ribbon fit per ribbon (#1020, #1608)
+
+- `ribbon_fit::fit_with(specs, width, policy)`: `Policy::LabelsFirst` (the
+  document's and the sheet's ribbons, Word's and Excel's way) lets groups
+  drop their labels one at a time, lowest priority first, before any
+  collapses; `Policy::WholeGroups` (the Project ribbon, Project's way) skips
+  that pass: a group keeps icon and label until it collapses whole into one
+  labelled button, lowest priority (rightmost among equals) first, only
+  while the tab overflows; the issue's "rightmost first" is read as the
+  tie rule, and Project 2024's own collapse order across its priorities is
+  not measured. `ribbon_fit_now` picks the policy from the
+  active tab's kind; `ribbon-layout` never reports `icon-only` on a
+  Project tab. A toggle with no icon (a contributed one may name none)
+  draws and is estimated with its label. `ribbon-read`'s group states fit
+  under the same policy (`Docxy::ribbon_policy`), so they agree with
+  `ribbon-layout`. `uiharness/cases/ribbon-fit.uit` pins the document and
+  sheet order, `project-plugin-ui.uit` the Project one with the fixture's
+  Task group at 1180 px only (the CI displays cannot show that tab in full,
+  so the widening back to full groups is pinned by `ribbon-fit.uit` and the
+  `ribbon_fit` unit tests) and the Gantt Chart Format tab, whose two groups
+  fit at every CI width, where the fixture's icon-less `fixture.flat` toggle
+  keeps `estimates_ok` true only while its label is drawn.
+
 ## Project table: resizable columns and AutoFilter (#1533)
 
 - Column widths are the plan's: `projcore::tableview::TableView` (px by field

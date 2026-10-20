@@ -3,8 +3,10 @@
 //! their plumbing is covered end to end without any real plugin.
 //!
 //! - Ribbon: on the Task tab a group "Fixture" with a large button
-//!   `fixture.hello`, a toggle `fixture.flag` and a gallery `fixture.palette`
-//!   of two swatches (`fixture.blue`, `fixture.red`).
+//!   `fixture.hello`, a toggle `fixture.flag`, a toggle `fixture.plain` with
+//!   no icon (its label is drawn, #1608; `fixture.flat` on the Gantt Chart
+//!   Format tab is the same) and a gallery `fixture.palette` of two swatches
+//!   (`fixture.blue`, `fixture.red`).
 //! - Menus: a row-menu item `fixture.rename` after "Notes...".
 //! - Dialogs: a Task Information page "Fixture" with a multiline and a grid,
 //!   and a dialog `fixture.options` (a number, a label the state fills from
@@ -15,8 +17,9 @@
 //!   values, Bump sends it with `button: "bump"` (one `task.set` op naming
 //!   the task "Bumped by fixture", the dialog kept open).
 //! - Commands: `fixture.hello` (the dialog, then a status with its number),
-//!   `fixture.flag` (flips the toggle: a view switch of the same name the
-//!   host stores in the plan's formatting, #1553), the swatches (set the palette,
+//!   `fixture.flag`, `fixture.plain` and `fixture.flat` (each flips its
+//!   toggle: a view switch of its own name the host stores in the plan's
+//!   formatting, #1553), the swatches (set the palette,
 //!   returned as `view.palette`), `fixture.rename` (one `task.set` op
 //!   renaming the first selected task to "Renamed by fixture"), and
 //!   `task-information` (the page's OK: a status with the note's length),
@@ -40,13 +43,15 @@ const MANIFEST: &str = r##"{
   "ribbon":[{"tab":"Task","groups":[{"title":"Fixture","controls":[
     {"id":"fixture.hello","kind":"button","label":"Hello","tip":"Say hello from the fixture","keytip":"XH","icon":"comment","large":true},
     {"id":"fixture.flag","kind":"toggle","label":"Flag","tip":"A toggle the fixture keeps","keytip":"XF","icon":"lock"},
+    {"id":"fixture.plain","kind":"toggle","label":"Plain","tip":"A toggle with no icon: its label is drawn (#1608)","keytip":"XP","icon":""},
     {"id":"fixture.palette","kind":"gallery","label":"Palette","tip":"Bar palettes","swatches":[
       {"id":"fixture.blue","label":"Blue","color":"#3366CC","preview":"fixture.blue"},
       {"id":"fixture.red","label":"Red","color":"#CC3333","preview":"fixture.red"}]},
     {"id":"fixture.bold","kind":"toggle","label":"Bold","tip":"Bold on the selected cells (the view's cells)","keytip":"XB","icon":"bold"},
-    {"id":"fixture.sheet","kind":"button","label":"Sheet (fixture)","tip":"A modeless dialog with a grid and buttons of its own","keytip":"XS","icon":"numbers"}]}]},
+    {"id":"fixture.sheet","kind":"button","label":"Sheet (fixture)","tip":"A modeless dialog with a grid and buttons of its own","keytip":"XS","icon":"table"}]}]},
     {"tab":"Gantt Chart Format","groups":[{"title":"Fixture Format","before":"Bar Styles","controls":[
-    {"id":"fixture.format","kind":"button","label":"Format (fixture)","tip":"A group placed before Bar Styles; sets or clears the plan's gridlines","icon":"font"}]}]}],
+    {"id":"fixture.format","kind":"button","label":"Format (fixture)","tip":"A group placed before Bar Styles; sets or clears the plan's gridlines","icon":"font-name"},
+    {"id":"fixture.flat","kind":"toggle","label":"Flat","tip":"A toggle with no icon on a tab that fits: its drawn label is measured (#1608)","icon":""}]}]}],
   "menus":[{"menu":"row","items":[{"id":"fixture.rename","label":"Rename (fixture)","icon":"comment","after":"Notes..."}]}],
   "dialogs":[
     {"id":"task-information","pages":[{"name":"Fixture","controls":[
@@ -99,9 +104,14 @@ fn bold(req: &Json) -> bool {
 
 /// The toggle's state: the `fixture.flag` switch of the request's view.
 fn flag(req: &Json) -> bool {
+    switch_on(req, "fixture.flag")
+}
+
+/// A named switch of the request's view (#1553); off when absent.
+fn switch_on(req: &Json, name: &str) -> bool {
     req.get("view")
         .and_then(|v| v.get("switches"))
-        .and_then(|s| s.get("fixture.flag"))
+        .and_then(|s| s.get(name))
         .and_then(Json::bool)
         .unwrap_or(false)
 }
@@ -245,8 +255,10 @@ pub unsafe extern "C" fn yppx_ui_state(input: *const u8, len: usize, out: *mut Y
     };
     let selected = first_uid(&req).is_some();
     let mut reply = format!(
-        r#"{{"controls":{{"fixture.flag":{{"enabled":true,"checked":{}}},"fixture.bold":{{"enabled":{selected},"checked":{}}},"fixture.rename":{{"enabled":{selected}}}}},"gallery":{{"fixture.palette":{}}}"#,
+        r#"{{"controls":{{"fixture.flag":{{"enabled":true,"checked":{}}},"fixture.plain":{{"enabled":true,"checked":{}}},"fixture.flat":{{"enabled":true,"checked":{}}},"fixture.bold":{{"enabled":{selected},"checked":{}}},"fixture.rename":{{"enabled":{selected}}}}},"gallery":{{"fixture.palette":{}}}"#,
         flag(&req),
+        switch_on(&req, "fixture.plain"),
+        switch_on(&req, "fixture.flat"),
         bold(&req),
         quote(&palette())
     );
@@ -442,10 +454,15 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
             }
             Some(_) => r#"{"ops":[],"status":"Fixture: cleared","close":true}"#.to_string(),
         },
-        "fixture.flag" => {
-            let on = !flag(&req);
+        "fixture.flag" | "fixture.plain" | "fixture.flat" => {
+            let on = !switch_on(&req, id);
+            let word = match id {
+                "fixture.flag" => "flag",
+                "fixture.plain" => "plain",
+                _ => "flat",
+            };
             format!(
-                r#"{{"ops":[],"status":"Fixture: flag {}","view":{{"switches":{{"fixture.flag":{on}}}}}}}"#,
+                r#"{{"ops":[],"status":"Fixture: {word} {}","view":{{"switches":{{"{id}":{on}}}}}}}"#,
                 if on { "on" } else { "off" }
             )
         }

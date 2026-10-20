@@ -51,6 +51,69 @@ test a contributed group goes before the built-in group its manifest names
   call ribbon-click {"tab":"Gantt Chart Format","command":"fixture.format"}
   assert status is Fixture: format
 
+test the Task tab with a contributed group collapses whole groups, never a label
+  # #1608: at 1180 px the tab overflows, so the lowest-priority group (the
+  # fixture's, priority 50) collapses into one labelled button while every
+  # built-in keeps icon and label. A toggle with no icon draws its label.
+  # (The width estimates and the widening back to full groups are pinned by
+  # ribbon-fit.uit and the ribbon_fit unit tests: the CI displays cannot
+  # show a window wide enough for this tab with the fixture's group. A frame
+  # right after a tab switch may still be settling.)
+  open copy:../fixtures/project-clipboard.xml
+  call window-size {"w":1180,"h":800}
+  call ribbon-layout {"tab":"Task"}
+  shot window
+  shot window
+  call ribbon-layout {"tab":"Task"}
+  assert reply.settled is true
+  assert reply.any_clipped is false
+  assert reply.groups.0.title is Clipboard
+  assert reply.groups.0.state is full
+  assert reply.groups.1.state is full
+  assert reply.groups.2.state is full
+  assert reply.groups.3.state is full
+  assert reply.groups.4.state is full
+  # Editing (priority 60) is the next to collapse after the fixture's group;
+  # whether 1180 px reaches it depends on the display's text widths (the CI
+  # Linux display collapses it, Windows does not), so the order is pinned by
+  # the ribbon_fit unit tests, not here.
+  assert reply.groups.5.title is Editing
+  assert reply.groups.-1.title is Fixture
+  assert reply.groups.-1.state is collapsed
+  shot ribbon
+  call ribbon-read {}
+  assert reply.tabs.1.groups.-1.commands.2.id is fixture.plain
+  assert reply.tabs.1.groups.-1.commands.2.label is Plain
+  # ribbon-read's states fit under the same policy as the drawn ribbon.
+  assert reply.tabs.1.groups.0.state is full
+  assert reply.tabs.1.groups.4.state is full
+  assert reply.tabs.1.groups.-1.state is collapsed
+  # The collapsed group's flyout shows the icon-less toggle with its label.
+  call ribbon-flyout {"action":"open","group":"Fixture"}
+  shot window
+  call ribbon-flyout {}
+  assert reply.open is true
+  assert reply.group is Fixture
+  shot window
+  call ribbon-flyout {"action":"close"}
+  # The Gantt Chart Format tab holds the fixture's other group and fits at
+  # every CI width: its icon-less toggle draws with its label, so the drawn
+  # widths match the estimates (a label dropped in the renderer would not).
+  call ribbon-layout {"tab":"Gantt Chart Format"}
+  shot window
+  call ribbon-layout {"tab":"Gantt Chart Format"}
+  assert reply.settled is true
+  assert reply.estimates_ok is true
+  assert reply.groups.0.title is Fixture Format
+  assert reply.groups.0.state is full
+  assert reply.groups.1.title is Bar Styles
+  assert reply.groups.1.state is full
+  shot ribbon
+  call ribbon-click {"tab":"Task","command":"Plain"}
+  assert status is Fixture: plain on
+  call ribbon-read {}
+  assert reply.tabs.1.groups.-1.commands.2.checked is true
+
 test a command's view.gridlines draws the table and chart rules from the plan (#1575)
   # A plan without gridlines draws as before. The fixture's Format sets dotted
   # red Gantt rows with every second one solid blue, no Sheet Rows, green
@@ -141,15 +204,15 @@ test a swatch sets the plan's palette (an edit) and the gallery follows
   open copy:../fixtures/project-clipboard.xml
   assert dirty is false
   call ribbon-read {}
-  assert reply.tabs.1.groups.-1.commands.2.id is fixture.palette:Blue
-  assert reply.tabs.1.groups.-1.commands.2.checked is true
+  assert reply.tabs.1.groups.-1.commands.3.id is fixture.palette:Blue
+  assert reply.tabs.1.groups.-1.commands.3.checked is true
   call ribbon-click {"tab":"Task","command":"fixture.palette:Red"}
   assert status is Fixture: palette fixture.red
   assert dirty is true
   call ribbon-read {}
-  assert reply.tabs.1.groups.-1.commands.3.id is fixture.palette:Red
-  assert reply.tabs.1.groups.-1.commands.3.checked is true
-  assert reply.tabs.1.groups.-1.commands.2.checked is false
+  assert reply.tabs.1.groups.-1.commands.4.id is fixture.palette:Red
+  assert reply.tabs.1.groups.-1.commands.4.checked is true
+  assert reply.tabs.1.groups.-1.commands.3.checked is false
 
 test the button's command opens the plugin's dialog, whose OK sends the values back
   open copy:../fixtures/project-clipboard.xml

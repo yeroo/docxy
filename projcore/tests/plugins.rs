@@ -159,13 +159,18 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         [
             ("fixture.hello", ControlKind::Button),
             ("fixture.flag", ControlKind::Toggle),
+            ("fixture.plain", ControlKind::Toggle),
             ("fixture.palette", ControlKind::Gallery),
             ("fixture.bold", ControlKind::Toggle),
             ("fixture.sheet", ControlKind::Button),
         ]
     );
     assert!(group.controls[0].large && group.controls[0].keytip == "XH");
-    assert_eq!(group.controls[2].swatches[0].color, Some(0x3366CC));
+    assert_eq!(group.controls[3].swatches[0].color, Some(0x3366CC));
+    assert!(
+        group.controls[2].icon.is_empty(),
+        "the Plain toggle names no icon"
+    );
     assert_eq!(m.menus[0].menu, "row");
     assert_eq!(m.menus[0].items[0].id, "fixture.rename");
     assert_eq!(m.menus[0].items[0].after, "Notes...");

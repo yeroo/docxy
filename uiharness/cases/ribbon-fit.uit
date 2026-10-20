@@ -368,15 +368,20 @@ test Project Task tab narrow
   assert reply.settled is true
   assert reply.any_clipped is false
   assert reply.estimates_ok is true
+  # Project's ribbon never strips a label (#1608): Clipboard, the highest
+  # priority, keeps its labels while the lower groups collapse whole.
   assert reply.groups.0.title is Clipboard
-  assert reply.groups.0.state is icon-only
+  assert reply.groups.0.state is full
+  assert reply.groups.-1.title is Editing
+  assert reply.groups.-1.state is collapsed
   call window-size {"w":460,"h":800}
   shot window
   call ribbon-layout {}
   assert reply.settled is true
   assert reply.any_clipped is false
   assert reply.estimates_ok is true
-  assert reply.groups.0.state is icon-only
+  assert reply.groups.0.state is full
+  assert reply.groups.-1.state is collapsed
 
 test widening restores full groups
   open ../fixtures/basic.xlsx
