@@ -1958,24 +1958,53 @@ fn write_row(s: &mut String, row: &Row) {
     // close with nothing open or an open never closed: the first is dropped
     // and the second closed at the row's end, so the row stays well-formed.
     // Row-level markers go where they were between the cells (#1215).
-    let mut open_controls = Vec::new();
+    let mut open_controls: Vec<Wrapper> = Vec::new();
     for cell in &row.cells {
         for raw in &cell.sdt_open {
-            open_controls.push(write_sdt_open(s, raw, false));
+            open_controls.push(write_wrapper_open(s, raw));
         }
         s.extend(cell.raw_before.iter().map(String::as_str));
         write_cell(s, cell);
         for raw in &cell.sdt_close {
-            if let Some(content_needs_close) = open_controls.pop() {
-                write_sdt_close(s, raw, content_needs_close);
+            if let Some(open) = open_controls.pop() {
+                write_wrapper_close(s, raw, open);
             }
         }
     }
     s.extend(row.raw_end.iter().map(String::as_str));
-    while let Some(content_needs_close) = open_controls.pop() {
-        write_sdt_close(s, "", content_needs_close);
+    while let Some(open) = open_controls.pop() {
+        write_wrapper_close(s, "", open);
     }
     s.push_str("</w:tr>");
+}
+
+/// What a row-level wrapper around cells opened: a content control (whether
+/// its `w:sdtContent` still needs a close) or a `w:customXml` (#1393).
+#[derive(Clone, Copy)]
+enum Wrapper {
+    Sdt { content_needs_close: bool },
+    CustomXml,
+}
+
+fn write_wrapper_open(s: &mut String, raw: &str) -> Wrapper {
+    if local_name(raw) == "customXml" {
+        s.push_str(raw);
+        Wrapper::CustomXml
+    } else {
+        Wrapper::Sdt {
+            content_needs_close: write_sdt_open(s, raw, false),
+        }
+    }
+}
+
+/// A `w:customXml` closes with its own end tag whatever the model holds.
+fn write_wrapper_close(s: &mut String, raw: &str, open: Wrapper) {
+    match open {
+        Wrapper::Sdt {
+            content_needs_close,
+        } => write_sdt_close(s, raw, content_needs_close),
+        Wrapper::CustomXml => s.push_str(crate::load::CUSTOM_XML_CLOSE),
+    }
 }
 
 /// `raw` (a cell's verbatim tcPr) with `w:gridSpan`/`w:vMerge` set from the

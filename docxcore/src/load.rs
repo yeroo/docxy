@@ -1087,6 +1087,9 @@ fn parse_sdt_block(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Block>
     }
 }
 
+/// The close of a row-level `w:customXml` (#1393).
+pub(crate) const CUSTOM_XML_CLOSE: &str = "</w:customXml>";
+
 /// The closing boundary for a preserved block-level content control.
 pub(crate) const SDT_BLOCK_CLOSE: &str = "</w:sdtContent></w:sdt>";
 
@@ -3093,7 +3096,8 @@ fn parse_row(p: &mut XmlParser, rels: &Relationships) -> Row {
 /// properties (`w:trPr`/`w:tblPrEx`) are captured verbatim into `raw`. Any
 /// other row-level child (a comment range end between cells, a bookmark, …)
 /// is captured verbatim into `pending`, which the next cell takes as its
-/// `raw_before` (#1215). `w:customXml` is still skipped: it can wrap cells.
+/// `raw_before` (#1215). A `w:customXml` wrapping cells is unwrapped like a
+/// cell-level control ([`parse_custom_xml_cells`], #1393).
 fn parse_cells_into(
     p: &mut XmlParser,
     rels: &Relationships,
@@ -3121,7 +3125,11 @@ fn parse_cells_into(
                 }
                 "w:tblPrEx" => capture_element(p, raw),
                 "w:sdt" => parse_sdt_cells(p, rels, cells, raw, property_change, pending),
-                "w:customXml" => p.skip_element(),
+                "w:customXml" => {
+                    parse_custom_xml_cells(p, rels, cells, raw, property_change, pending)
+                }
+                // Only the first child of a `w:customXml`, taken with its opening.
+                "w:customXmlPr" => p.skip_element(),
                 _ => capture_element(p, pending),
             },
             Event::End | Event::Eof => break,
@@ -3182,6 +3190,52 @@ fn parse_sdt_cells(
             Event::Text => {}
         }
     }
+}
+
+/// Parse a row-level `<w:customXml>` wrapping `<w:tc>` cells (#1393): like a
+/// cell-level content control, its cells join the row, the first takes the
+/// exact opening source (the start tag and a leading `w:customXmlPr`) in front
+/// of any it opens itself, the last a `</w:customXml>` after any it closes
+/// itself, so `Row::remove_cell` keeps the wrapper balanced. One holding no
+/// cell is dropped; one cut short is closed after its last cell.
+fn parse_custom_xml_cells(
+    p: &mut XmlParser,
+    rels: &Relationships,
+    cells: &mut Vec<Cell>,
+    raw: &mut Vec<String>,
+    property_change: &mut Option<PropertyChange>,
+    pending: &mut Vec<String>,
+) {
+    let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
+    let content = p.pos();
+    let first = cells.len();
+    parse_cells_into(p, rels, cells, raw, property_change, pending);
+    if cells.len() == first {
+        return;
+    }
+    // The properties, when present, are the first child.
+    let mut head = content;
+    let mut q = XmlParser::new(p.raw_slice(content, p.pos()));
+    loop {
+        match q.next() {
+            Event::Start => {
+                if q.name() == "w:customXmlPr" {
+                    q.skip_element();
+                    head = content + q.pos();
+                }
+                break;
+            }
+            Event::Text => {}
+            Event::End | Event::Eof => break,
+        }
+    }
+    let open = declare_rebuilt(p.raw_slice(start, head), &bindings);
+    cells[first].sdt_open.insert(0, open);
+    cells
+        .last_mut()
+        .unwrap()
+        .sdt_close
+        .push(CUSTOM_XML_CLOSE.to_string());
 }
 
 fn parse_cell(p: &mut XmlParser, rels: &Relationships) -> Cell {

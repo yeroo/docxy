@@ -342,6 +342,28 @@ fn drop_continued_rows(t: &mut Table, from: usize, to: usize) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dropping_a_continued_row_keeps_its_markers_on_the_row_above() {
+        let mut doc = grid_doc(2, 2);
+        let Block::Table(tb) = &mut doc.body[0] else {
+            panic!()
+        };
+        for c in &mut tb.rows[1].cells {
+            c.v_merge = VMerge::Continue;
+        }
+        tb.rows[1].cells[0].raw_before = vec!["<w:bookmarkEnd w:id=\"1\"/>".into()];
+        tb.rows[1].raw_end = vec!["<w:commentRangeEnd w:id=\"2\"/>".into()];
+        drop_continued_rows(tb, 1, 1);
+        assert_eq!(tb.rows.len(), 1);
+        assert_eq!(
+            tb.rows[0].raw_end,
+            vec![
+                "<w:bookmarkEnd w:id=\"1\"/>".to_string(),
+                "<w:commentRangeEnd w:id=\"2\"/>".to_string()
+            ]
+        );
+    }
+
     use super::super::tables::tests::{cell_text, grid_doc, para};
     use super::super::{Caret, Editor};
     use super::*;

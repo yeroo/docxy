@@ -1324,11 +1324,29 @@ impl Table {
     /// preceding gap. Deleting a control's first or last row leaves every
     /// remaining group row under the same boundaries; deleting its final visible
     /// row retains a balanced empty control rather than discarding its definition.
+    /// The row-level markers between its cells and after them (#1215) move to
+    /// the row before it, or in front of the row that took its place when it
+    /// was the first, so a comment range's end is not lost with the row (#1393).
     pub fn remove_row(&mut self, index: usize) -> Option<Row> {
         if index >= self.rows.len() {
             return None;
         }
-        let row = self.rows.remove(index);
+        let mut row = self.rows.remove(index);
+        let mut markers: Vec<String> = Vec::new();
+        for cell in &mut row.cells {
+            markers.append(&mut cell.raw_before);
+        }
+        markers.append(&mut row.raw_end);
+        if !markers.is_empty() {
+            if let Some(prev) = index.checked_sub(1).and_then(|p| self.rows.get_mut(p)) {
+                prev.raw_end.extend(markers);
+            } else if let Some(next) = self.rows.get_mut(index) {
+                match next.cells.first_mut() {
+                    Some(cell) => cell.raw_before.splice(0..0, markers),
+                    None => next.raw_end.splice(0..0, markers),
+                };
+            }
+        }
         for boundary in &mut self.row_boundaries {
             if boundary.at > index {
                 boundary.at -= 1;
