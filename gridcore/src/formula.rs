@@ -15537,7 +15537,7 @@ mod tests {
             );
             assert_eq!(
                 to_string(&qualify_sheet_in_expr(&ast, "S")),
-                qualified.replace("S!", "S!"),
+                qualified,
                 "{src}"
             );
         }
