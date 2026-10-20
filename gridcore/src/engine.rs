@@ -624,7 +624,9 @@ impl Engine {
     /// cell's style index. Value, formula, spill and metadata are untouched,
     /// so restyling a spilled cell leaves the spill whole (an edit through
     /// [`Engine::set_cell`] would break it). A blank cell restyled to the
-    /// default style is dropped, as [`Sheet::set_cell`] does. One recalculation
+    /// default style is dropped unless its row or column pins the default
+    /// ([`Sheet::pins_default`]), as [`Sheet::set_cell`] does; see
+    /// [`Engine::set_styles_opt`] for cells that were absent. One recalculation
     /// follows, so formulas that read a style (`CELL("format")`) see it.
     pub fn set_styles(&mut self, wb: &mut Workbook, sheet: usize, styles: &[(u32, u32, u32)]) {
         let opt: Vec<(u32, u32, Option<u32>)> =
@@ -2044,7 +2046,7 @@ impl Engine {
                         .cell(rr, cc)
                         .is_some_and(|cl| cl.formula.is_none() && !cl.value.is_empty())
                     {
-                        sheet.clear_cell(rr, cc);
+                        sheet.clear_cell_unpinned(rr, cc);
                         changed.push((s, rr, cc));
                     }
                 }
@@ -2544,7 +2546,7 @@ fn clear_spill(
                 .cell(rr, cc)
                 .is_some_and(|cl| cl.formula.is_none() && !cl.value.is_empty())
             {
-                sheet.clear_cell(rr, cc);
+                sheet.clear_cell_unpinned(rr, cc);
                 out.push((s, rr, cc));
             }
         }
@@ -4705,7 +4707,8 @@ mod tests {
         assert!(!has(&wb, "B2"));
         wb.sheets[0].clear_cell(3, 1);
         assert!(!has(&wb, "B4"));
-        // A typed cell then deleted (blank over a present cell) stays pinned.
+        // A typed cell then deleted (blank over a present cell) stays pinned:
+        // typing made an explicit style-0 cell, which Delete keeps showing.
         set(&mut eng, &mut wb, "B5", Cell::number(1.0));
         set(&mut eng, &mut wb, "B5", Cell::default());
         assert!(has(&wb, "B5"));
@@ -4754,6 +4757,30 @@ mod tests {
         eng.restore_snapshot(&mut wb, 0, &before);
         assert!(has(&wb, "B1"), "the pin is back at its source");
         assert!(!has(&wb, "B2"));
+    }
+
+    #[test]
+    fn a_spill_leaves_no_pin_behind_under_a_column_style() {
+        let mut wb = pinned_wb(&[]);
+        // Column A carries style 7 as well: the spill lands in it.
+        wb.sheets[0].col_defs.push(crate::sheet::ColDef {
+            min: 0,
+            max: 0,
+            width: None,
+            attrs: r#"style="7""#.to_string(),
+            default_width: false,
+            plain_width: false,
+        });
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "A1", array_formula("SEQUENCE(3)"));
+        assert!(has(&wb, "A2") && has(&wb, "A3"));
+        // Replacing the anchor clears the spill: the engine's own cells go.
+        set(&mut eng, &mut wb, "A1", Cell::number(1.0));
+        assert!(!has(&wb, "A2") && !has(&wb, "A3"));
+        // A spill that shrinks leaves nothing behind either.
+        set(&mut eng, &mut wb, "A1", array_formula("SEQUENCE(3)"));
+        set(&mut eng, &mut wb, "A1", array_formula("SEQUENCE(1)"));
+        assert!(!has(&wb, "A2") && !has(&wb, "A3"));
     }
 
     #[test]

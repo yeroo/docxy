@@ -1598,6 +1598,18 @@ impl Sheet {
         );
     }
 
+    /// [`Sheet::clear_cell`] for a value the engine wrote itself (a spill's
+    /// output over an absent slot): a style-0 cell goes, whatever its row or
+    /// column style, so the engine never leaves a pin behind. A styled cell
+    /// keeps its style.
+    pub fn clear_cell_unpinned(&mut self, row: u32, col: u32) {
+        if self.cells.get(&(row, col)).is_some_and(|c| c.style == 0) {
+            self.cells.remove(&(row, col));
+        } else {
+            self.clear_cell(row, col);
+        }
+    }
+
     /// (rows, cols) of the used range — the smallest grid containing all cells.
     pub fn used_size(&self) -> (u32, u32) {
         let mut rows = 0;
