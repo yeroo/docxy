@@ -300,8 +300,9 @@ Leveling as a plan edit (#1594): `level.selection {uids: [uid…], options?}`
 {resource, options?}` (Level Resource, a uid or a name) run the leveler with
 only those tasks free to move, every other task taking no delay of its own
 and booked at its current dates (an automatic one still follows its links
-once the delays are written, so the pass repeats until no targeted task
-needs more; a conflict with such a follower that remains is reported as
+once the delays are written, so the pass repeats while a round still
+resolves something and drops a round that resolves nothing; a conflict that
+remains is reported as
 overallocated, and a later pass resolves it only with the follower in its
 scope or with `clear_first` off),
 and write each moved task's own `LevelingDelay`

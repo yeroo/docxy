@@ -583,7 +583,7 @@ impl Docxy {
         }
         // A control client reads and saves the plan: never half-leveled.
         self.flush_project_passes(cx);
-        if let Err(e) = crate::close::close_prompt_refusal(&self.tabs, verb) {
+        if let Err(e) = crate::close::close_prompt_refusal(&self.tabs, verb, args) {
             return Some(Err(e));
         }
         // A plan opened or saved under a new name here is a recent file

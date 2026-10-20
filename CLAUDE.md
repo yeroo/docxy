@@ -483,10 +483,13 @@
   automatic task over each assignment's own window, a manual or tracked one
   its whole span; an automatic follower of a moved task still follows its
   links once the delays are written, so the pass repeats on the plan with
-  its delays written until no targeted task needs more, and a conflict with
-  a follower that remains is reported as overallocated: a later pass
-  resolves it only with the follower in its scope or with `clear_first` off,
-  the default rebuilding the same cleared plan); an ALAP task is neither delayed nor
+  its delays written while a round still resolves something (fewer
+  overbooked resources, or lower peaks, on the committed schedule), drops a
+  round that resolves nothing (a follower moving in lockstep with its
+  predecessor would ask for more delay for ever), and reports a conflict
+  that remains as overallocated: a later pass resolves it only with the
+  follower in its scope or with `clear_first` off, the default rebuilding the
+  same cleared plan); an ALAP task is neither delayed nor
   booked (Project 2024 refuses a delay on one, measured, so the schedule
   ignores a stored one, and its late dates float with the finish);
   `within_slack` leaves a task that would start past its CPM late start at
@@ -500,7 +503,10 @@
   predecessors by its late start less the delay, the late finish following
   through the task's working span (`late_bounds_before_delay`, on direct and
   summary links alike), so they report the zero slack Project 2024 shows
-  them (measured).
+  them (measured). The leveler rebuilds a movable task's kept delay the same
+  way, from its shifted driven start (`Schedule::delay_driven`) plus the
+  delay, snapped, and a summary link's free-slack bound takes each
+  successor's delay before the group's minimum.
 - `Editor::level_tasks(&LevelTarget::{All, Selection, Resource})`
   (`level_tasks_with` takes `LevelOptions` for one pass) writes
   `leveling_delay` (format 8) and `pre_leveled_start/finish` (from the plan

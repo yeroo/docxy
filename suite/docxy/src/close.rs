@@ -10,6 +10,7 @@ use super::*;
 use crate::dialog::DialogId;
 use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
+use ctlcore::json::Json;
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1294,9 +1295,10 @@ pub(crate) fn quit_prompt_live(tabs: &[DocTab]) -> bool {
 /// a reload) or move the focus (an open) is refused while a close prompt is
 /// open: the prompt would vanish under the question it asks, or the tabs
 /// change under a window close's questions (#630).
-pub(crate) fn close_prompt_refusal(tabs: &[DocTab], verb: &str) -> Result<(), String> {
-    let drops = matches!(verb, "proj.open" | "proj.save" | "proj.reload")
-        || projctl::MUTATING.contains(&verb);
+pub(crate) fn close_prompt_refusal(tabs: &[DocTab], verb: &str, args: &Json) -> Result<(), String> {
+    // A bare `level.options` reads (#1594 r6) and drops nothing.
+    let drops =
+        matches!(verb, "proj.open" | "proj.save" | "proj.reload") || projctl::mutates(verb, args);
     let open = tabs.iter().find_map(|t| {
         t.dialogs
             .top()

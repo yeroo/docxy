@@ -290,8 +290,9 @@ minute with `LevelingDelayFormat` 8, as Project 2024 stores it) and
 delays the leveler asks for are written, so a task a constraint or another
 predecessor already holds takes none, as Project leaves it. An automatic
 task outside the scope still follows its links once the delays are written,
-so the pass repeats on the plan with its delays written until no targeted
-task needs more; a conflict with such a follower that remains is reported as
+so the pass repeats on the plan with its delays written while a round still
+resolves something (fewer overbooked resources, or lower peaks) and drops a
+round that resolves nothing; a conflict that remains is reported as
 overallocated, and a later pass resolves it only with the follower in its
 scope or with `clear_first` off (the default rebuilds the same cleared
 plan); an ALAP task is neither delayed nor

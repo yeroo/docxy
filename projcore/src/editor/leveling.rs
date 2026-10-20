@@ -60,8 +60,11 @@ impl Editor {
     /// undo step. Tasks outside the target take no delay of their own and
     /// are booked at the dates the plan gives them now; an automatic one
     /// still follows its links once the delays are written, so the pass
-    /// repeats on the plan with its delays written until no targeted task
-    /// needs a further delay, and a conflict with a follower that remains
+    /// repeats on the plan with its delays written while a round still
+    /// resolves something (fewer overbooked resources, or lower peaks, on
+    /// the committed schedule); a round that resolves nothing is dropped
+    /// (a follower moving in lockstep with its predecessor would ask for
+    /// more delay for ever), and a conflict that remains
     /// is reported as overallocated (a later pass resolves it only with the
     /// follower in its scope, or with `clear_first` off, since the default
     /// rebuilds the same cleared plan). An ALAP task is never delayed nor
@@ -126,15 +129,29 @@ impl Editor {
         // task's LevelingDelay 0). A follower outside the scope moves with
         // its links once the delays are written and may land on a targeted
         // task, so the pass repeats on the plan with its delays written,
-        // building on them, until no targeted leaf needs a further delay (a
-        // few rounds at most).
+        // building on them, while a round still resolves something. A round
+        // that resolves nothing is dropped: a follower that moves in
+        // lockstep with its predecessor (Start-to-Start, say) would ask for
+        // one more step for ever (#1594 r6).
         let mut trial = self.proj.clone();
         for t in &mut trial.tasks {
             if in_scope(t.uid) && options.clear_first && !is_alap(t) {
                 t.leveling_delay = None;
             }
         }
-        for _ in 0..6 {
+        // How far a plan is from clean on its committed schedule: the
+        // overbooked work resources and the sum of their peaks above
+        // capacity (in millionths, to compare exactly).
+        let pressure = |p: &crate::model::Project| -> (usize, i64) {
+            let sched = schedule(p);
+            let over = overbookings(p, |uid| {
+                sched.get(uid).map(|r| (r.early_start, r.early_finish))
+            });
+            let excess: f64 = over.values().map(|o| (o.peak - 1.0).max(0.0)).sum();
+            (over.len(), (excess * 1_000_000.0).round() as i64)
+        };
+        let mut before = pressure(&trial);
+        for _ in 0..64 {
             let leveled = level_with(
                 &trial,
                 &LevelScope {
@@ -143,8 +160,9 @@ impl Editor {
                     within_slack: options.within_slack,
                 },
             );
+            let mut round = trial.clone();
             let mut moved = false;
-            for t in &mut trial.tasks {
+            for t in &mut round.tasks {
                 if !is_leaf(t) || !in_scope(t.uid) || is_alap(t) || t.priority == Some(1000) {
                     continue;
                 }
@@ -157,6 +175,13 @@ impl Editor {
                 moved = true;
             }
             if !moved {
+                break;
+            }
+            let after = pressure(&round);
+            if after.0 < before.0 || after.1 < before.1 {
+                trial = round;
+                before = after;
+            } else {
                 break;
             }
         }
@@ -304,7 +329,7 @@ impl Editor {
     /// Work resources booked past their capacity on the plan as committed
     /// (the schedule, not the display overlay, #1594 r4): what an edit's
     /// reply reports.
-    fn committed_overallocated(&self) -> usize {
+    pub fn committed_overallocated(&self) -> usize {
         let sched = self.schedule();
         overbookings(&self.proj, |uid| {
             sched.get(uid).map(|r| (r.early_start, r.early_finish))
@@ -317,7 +342,7 @@ impl Editor {
 mod tests {
     use super::*;
     use crate::leveling::{LevelOptions, LevelOrder, LevelTarget};
-    use crate::model::{Assignment, Predecessor, Resource, Task};
+    use crate::model::{Assignment, LinkType, Predecessor, Resource, Task};
 
     /// Ann on three parallel two-day tasks: Build (1), Paint (2), Trim (3).
     fn staffed() -> Editor {
@@ -768,6 +793,146 @@ mod tests {
             start(&ed, 3),
             DateTime::from_minutes(anchor.minutes() + 3 * 1440)
         );
+    }
+
+    /// #1594 r6: a held follower that lands on a targeted task once the
+    /// delays are written takes a second round: X, P, H (after P, outside
+    /// the selection) and M, one day each on Ann from Monday, Level
+    /// Selection P and M. Round one puts P on Wednesday (past X and H's
+    /// Tuesday) and M on Thursday; written, H follows P to Thursday, onto
+    /// M, and round two moves M to Friday. Nothing is double-booked.
+    #[test]
+    fn a_held_follower_landing_on_a_targeted_task_takes_a_second_round() {
+        let mut p = staffed().project().clone();
+        for t in &mut p.tasks {
+            t.duration_min = 480;
+        }
+        // X = Build (1), P = Paint (2), H = Trim (3, after P); M is new.
+        p.tasks[2].predecessors.push(Predecessor::fs(2));
+        p.tasks.push(Task {
+            uid: 4,
+            id: 4,
+            name: "M".into(),
+            outline_level: 1,
+            duration_min: 480,
+            ..Task::default()
+        });
+        p.assignments.push(Assignment {
+            uid: 4,
+            task_uid: 4,
+            resource_uid: 1,
+            units: 1.0,
+            ..Assignment::default()
+        });
+        let mut ed = Editor::new(p);
+        let anchor = start(&ed, 1);
+        let out = ed.level_tasks(&LevelTarget::Selection(vec![2, 4])).unwrap();
+        assert_eq!((out.changed, out.delayed, out.overallocated), (2, 2, 0));
+        assert_eq!(
+            ed.project().task(2).unwrap().leveling_delay,
+            Some(2 * 1440 * 10)
+        );
+        assert_eq!(
+            ed.project().task(4).unwrap().leveling_delay,
+            Some(4 * 1440 * 10),
+            "M: three days in round one, one more in round two"
+        );
+        assert_eq!(
+            start(&ed, 3),
+            DateTime::from_minutes(anchor.minutes() + 3 * 1440)
+        );
+        assert_eq!(
+            start(&ed, 4),
+            DateTime::from_minutes(anchor.minutes() + 4 * 1440)
+        );
+    }
+
+    /// #1594 r6: a follower that moves in lockstep with its predecessor
+    /// keeps asking for more delay: M and H (one day each on Ann from
+    /// Monday), H Start-to-Start after M, Level Selection M. A round would
+    /// move M a day and H with it, resolving nothing; the pass sees that,
+    /// writes no delay and reports the overallocation.
+    #[test]
+    fn a_lockstep_follower_ends_the_pass_without_a_useless_delay() {
+        let mut p = staffed().project().clone();
+        p.tasks.truncate(2);
+        p.assignments.truncate(2);
+        for t in &mut p.tasks {
+            t.duration_min = 480;
+        }
+        p.tasks[1]
+            .predecessors
+            .push(Predecessor::working(1, LinkType::StartStart, 0));
+        let mut ed = Editor::new(p);
+        let depth = ed.undo_depth();
+        let out = ed.level_tasks(&LevelTarget::Selection(vec![1])).unwrap();
+        assert_eq!((out.changed, out.delayed, out.overallocated), (0, 0, 1));
+        assert_eq!(ed.project().task(1).unwrap().leveling_delay, None);
+        assert_eq!(ed.undo_depth(), depth, "nothing to record");
+    }
+
+    /// #1594 r6: a pass takes as many rounds as keep resolving something: P1
+    /// to P7 (half an hour each, on R1 to R7) are selected; X (half an hour,
+    /// R1) holds the project start, and each Hi (half an hour, R(i+1),
+    /// outside the selection) starts with Pi. Every round settles one more
+    /// stage and the seventh leaves nothing double-booked.
+    #[test]
+    fn the_pass_keeps_going_while_a_round_resolves_something() {
+        let mut p = untitled_project();
+        for r in 1..=7 {
+            p.resources.push(Resource {
+                uid: r,
+                id: r,
+                name: format!("R{r}"),
+                max_units: 1.0,
+                ..Resource::default()
+            });
+        }
+        let mut next = 0;
+        let mut add = |p: &mut crate::model::Project, name: &str, res: i32, pred: Option<i32>| {
+            next += 1;
+            let mut t = Task {
+                uid: next,
+                id: next,
+                name: name.into(),
+                outline_level: 1,
+                duration_min: 30,
+                ..Task::default()
+            };
+            if let Some(pr) = pred {
+                t.predecessors
+                    .push(Predecessor::working(pr, LinkType::StartStart, 0));
+            }
+            p.tasks.push(t);
+            p.assignments.push(Assignment {
+                uid: next,
+                task_uid: next,
+                resource_uid: res,
+                units: 1.0,
+                ..Assignment::default()
+            });
+            next
+        };
+        let x = add(&mut p, "X", 1, None);
+        let ps: Vec<i32> = (1..=7)
+            .map(|i| add(&mut p, &format!("P{i}"), i, None))
+            .collect();
+        for i in 1..=6 {
+            add(&mut p, &format!("H{i}"), i + 1, Some(ps[i as usize - 1]));
+        }
+        let mut ed = Editor::new(p);
+        let anchor = start(&ed, x);
+        let out = ed.level_tasks(&LevelTarget::Selection(ps.clone())).unwrap();
+        assert_eq!((out.changed, out.delayed, out.overallocated), (7, 7, 0));
+        for (i, &uid) in ps.iter().enumerate() {
+            let steps = i as i64 + 1;
+            assert_eq!(
+                start(&ed, uid),
+                DateTime::from_minutes(anchor.minutes() + steps * 30),
+                "P{} after {steps} rounds",
+                i + 1
+            );
+        }
     }
 
     /// #1594 r4: a follower whose own constraint already holds it takes no

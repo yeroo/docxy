@@ -39,7 +39,7 @@
 //! | `level.all` | `{}` | `{leveled: true, overallocated}` (#1589): show the plan leveled, as Resource > Level > Level All's display overlay; `overallocated` counts the work resources still booked past their capacity. Not an undo step: the overlay is a display setting |
 //! | `level.clear` | `{}` | `{leveled: false, overallocated}` (#1589): show the plan as scheduled again. With `{uids: [uid…]}` or `{all: true}` (#1594) it is Clear Leveling as a plan edit instead: the tasks' stored `LevelingDelay` and pre-leveled dates are removed, one undo step, replying `{cleared, overallocated}` |
 //! | `level.overallocations` | `{}` | `{count, resources: [{uid, name, max_units, peak_units, first}]}` (#1589): the work resources booked past their capacity on the plan as shown, each with its peak (1.0 = 100%) and the first overallocated instant, earliest first (Next Overallocation) |
-//! | `level.selection` | `{uids: [uid…], options?}` | `{changed, delayed, overallocated, tasks: [{uid, leveling_delay_min, start}]}` (#1594): Level Selection as a plan edit. The leveler runs over the plan with only these tasks (a summary stands for its subtasks) free to move, every other task taking no delay of its own and booked at the dates the plan gives it now (an automatic one still follows its links once the delays are written, so the pass repeats until no targeted task needs more; a conflict with such a follower that remains is reported as overallocated, and a later pass resolves it only with the follower in its scope or with `clear_first` off), and writes each moved task's own `LevelingDelay` (elapsed minutes from the start its leveled predecessors drive it to, stored in tenths of a minute as Project does) and pre-leveled dates, one undo step. `changed` counts the tasks whose stored values changed (0 records no step), `delayed` those left with a delay, `tasks` every targeted leaf with its delay and start after the pass. The plan's Leveling Options apply |
+//! | `level.selection` | `{uids: [uid…], options?}` | `{changed, delayed, overallocated, tasks: [{uid, leveling_delay_min, start}]}` (#1594): Level Selection as a plan edit. The leveler runs over the plan with only these tasks (a summary stands for its subtasks) free to move, every other task taking no delay of its own and booked at the dates the plan gives it now (an automatic one still follows its links once the delays are written, so the pass repeats while a round still resolves something and drops a round that resolves nothing; a conflict that remains is reported as overallocated, and a later pass resolves it only with the follower in its scope or with `clear_first` off), and writes each moved task's own `LevelingDelay` (elapsed minutes from the start its leveled predecessors drive it to, stored in tenths of a minute as Project does) and pre-leveled dates, one undo step. `changed` counts the tasks whose stored values changed (0 records no step), `delayed` those left with a delay, `tasks` every targeted leaf with its delay and start after the pass. The plan's Leveling Options apply |
 //! | `level.resource` | `{resource, options?}` | the same reply (#1594): Level Resource, over the tasks the resource (a uid or a name) is assigned to. `options` (both verbs) is a `level.options` object applied to this pass only; the plan's options stay as they are. A task that only follows a delayed predecessor records no delay of its own, as Project does |
 //! | `level.options` | `{order?, within_slack?, adjust_assignments?, split?, clear_first?}` | `{order, within_slack, adjust_assignments, split, clear_first}` (#1594): Project's Leveling Options as plan options, read with `{}`, set as one undo step (an unchanged setting records none). `order` is `ID`, `Standard` (the default: dependencies, then the plan's row order) or `Priority` (the highest priority first; priority 1000 is never leveled); `within_slack` never delays a task past its total slack; `clear_first` (default true) drops the targeted tasks' stored delays before a pass, else it builds on them; `adjust_assignments` and `split` are kept with the plan, the leveler delaying whole tasks |
 //! | `cal.list` | `{}` | `{count, calendars: [{uid, name, base: {uid, name} \| null, default, resources: [uid…], tasks: [uid…]}]}` (#1605), base calendars first |
@@ -146,12 +146,24 @@ pub const MUTATING: &[&str] = &[
     "cal.del",
 ];
 
-/// Whether a call changes the plan (#1594 r4): a [`MUTATING`] verb, except
-/// `level.options` with no setting named, which only reads the options.
+/// The settings `level.options` may set; anything else in its arguments
+/// (`tab`, say) routes the call and changes nothing.
+const LEVEL_OPTION_KEYS: [&str; 5] = [
+    "order",
+    "within_slack",
+    "adjust_assignments",
+    "split",
+    "clear_first",
+];
+
+/// Whether a call changes the plan (#1594 r4, r6): a [`MUTATING`] verb,
+/// except `level.options` naming no setting, which only reads the options.
 pub fn mutates(verb: &str, args: &Json) -> bool {
     MUTATING.contains(&verb)
-        && !(verb == "level.options" && matches!(args, Json::Obj(pairs) if pairs.is_empty())
-            || verb == "level.options" && matches!(args, Json::Null))
+        && (verb != "level.options"
+            || LEVEL_OPTION_KEYS
+                .iter()
+                .any(|k| args.get(k).is_some_and(|v| !matches!(v, Json::Null))))
 }
 
 /// Recognize editor verbs before a host resolves its target document.
@@ -368,11 +380,13 @@ fn level_clear(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         return Ok(level_set(ed, false));
     }
     let cleared = ed.clear_leveling(uids.as_deref().filter(|_| !all))?;
+    // The committed plan's conflicts (#1594 r6), not the overlay's: the
+    // overlay re-levels what the edit just uncovered.
     Ok(Json::obj(vec![
         ("cleared", Json::Num(cleared as f64)),
         (
             "overallocated",
-            Json::Num(shown_overbookings(ed).len() as f64),
+            Json::Num(ed.committed_overallocated() as f64),
         ),
     ]))
 }
@@ -3405,6 +3419,58 @@ it"
 
     /// Task 1, "Build", 5 days, typed `kind`, with stored (zero) totals; Ann
     /// (1) at $50/h and $80/h on rate table B, Bob (2) at $30/h.
+    /// #1594 r6: a reply's `start` is the committed one after a second
+    /// round. X, P, H (after P, not selected) and M, one day each on one
+    /// resource from Monday; Level Selection P and M: H follows P onto M
+    /// once the first round's delays are written, and the second round
+    /// moves M to Friday.
+    #[test]
+    fn a_second_round_reply_reports_the_committed_start() {
+        use projcore::model::{Assignment, Predecessor, Resource, Task};
+        let mut p = projcore::editor::untitled_project();
+        p.resources.push(Resource {
+            uid: 1,
+            id: 1,
+            name: "Ann".into(),
+            max_units: 1.0,
+            ..Resource::default()
+        });
+        for (uid, name) in [(1, "X"), (2, "P"), (3, "H"), (4, "M")] {
+            let mut t = Task {
+                uid,
+                id: uid,
+                name: name.into(),
+                outline_level: 1,
+                duration_min: 480,
+                ..Task::default()
+            };
+            if uid == 3 {
+                t.predecessors.push(Predecessor::fs(2));
+            }
+            p.tasks.push(t);
+            p.assignments.push(Assignment {
+                uid,
+                task_uid: uid,
+                resource_uid: 1,
+                units: 1.0,
+                ..Assignment::default()
+            });
+        }
+        let mut ed = Editor::new(p);
+        let anchor = ed.schedule().get(1).unwrap().early_start;
+        let out = run(&mut ed, "level.selection", r#"{"uids":[2,4]}"#).unwrap();
+        assert_eq!(num(&out, "changed"), 2.0);
+        assert_eq!(num(&out, "overallocated"), 0.0);
+        let tasks = out.get("tasks").and_then(Json::as_array).unwrap();
+        let m = tasks.iter().find(|t| num(t, "uid") == 4.0).unwrap();
+        assert_eq!(num(m, "leveling_delay_min"), 4.0 * 1440.0);
+        assert_eq!(
+            m.get_str("start"),
+            Some(dt_str(DateTime::from_minutes(anchor.minutes() + 4 * 1440)).as_str()),
+            "Friday, the committed start"
+        );
+    }
+
     fn staffed(kind: projcore::model::TaskType, effort_driven: bool) -> Editor {
         use projcore::model::{RateEntry, Resource};
         let mut p = new_project();
@@ -3784,6 +3850,15 @@ it"
             &Json::obj(vec![("within_slack", Json::Bool(true))])
         ));
         assert!(mutates("level.selection", &Json::obj(vec![])));
+        // Routing fields are not settings (#1594 r6).
+        assert!(!mutates(
+            "level.options",
+            &Json::obj(vec![("tab", Json::Num(0.0))])
+        ));
+        assert!(!mutates(
+            "level.options",
+            &Json::obj(vec![("order", Json::Null)])
+        ));
         let mut ed = staffed(projcore::model::TaskType::FixedUnits, false);
         run(&mut ed, "task.add", r#"{"name":"Paint","duration":"2d"}"#).unwrap();
         run(&mut ed, "assign.add", r#"{"task":1,"resource":1}"#).unwrap();
@@ -3827,12 +3902,21 @@ it"
         assert!(!ed.leveled(), "the overlay is not switched");
         let paint = run(&mut ed, "task.get", r#"{"uid":2}"#).unwrap();
         assert!(num(&paint, "leveling_delay_min") > 0.0);
-        // Clear Leveling as an edit: the delay goes, the dates come back.
+        // Clear Leveling as an edit: the delay goes, the dates come back, and
+        // the reply counts the committed plan's conflicts, not the overlay's
+        // (#1594 r6), which is on here and would re-level them away.
+        run(&mut ed, "level.all", "{}").unwrap();
         let cleared = run(&mut ed, "level.clear", r#"{"uids":[2]}"#).unwrap();
         assert_eq!(num(&cleared, "cleared"), 1.0);
-        assert_eq!(num(&cleared, "overallocated"), 1.0);
+        assert_eq!(
+            num(&cleared, "overallocated"),
+            1.0,
+            "committed, not the overlay"
+        );
         assert_eq!(ed.undo_depth(), depth + 4);
         assert!(ed.schedule().get(2).unwrap().early_start < build_finish);
+        run(&mut ed, "level.clear", "{}").unwrap();
+        assert!(!ed.leveled());
         // Level Resource by name, then clear all; refusals name the problem.
         let out = run(&mut ed, "level.resource", r#"{"resource":"ann"}"#).unwrap();
         assert_eq!(num(&out, "delayed"), 1.0);

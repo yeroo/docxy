@@ -135,6 +135,9 @@ pub struct Schedule {
     results: HashMap<i32, TaskResult>,
     /// Each summary's rolled-up span, see [`Schedule::rolled_up`].
     rollups: HashMap<i32, (DateTime, DateTime)>,
+    /// The snapped driven start each applied `LevelingDelay` was added to
+    /// (#1594 r6), for the leveler to rebuild a kept delay from.
+    delay_driven: HashMap<i32, i64>,
     /// Project start snapped on the default calendar. An unlinked task on
     /// another calendar may start earlier.
     pub project_start: DateTime,
@@ -142,6 +145,12 @@ pub struct Schedule {
 }
 
 impl Schedule {
+    /// The snapped driven start the task's stored `LevelingDelay` was added
+    /// to, when the forward pass applied one (#1594 r6).
+    fn delay_driven(&self, uid: i32) -> Option<i64> {
+        self.delay_driven.get(&uid).copied()
+    }
+
     pub fn get(&self, uid: i32) -> Option<&TaskResult> {
         self.results.get(&uid)
     }
@@ -1354,6 +1363,7 @@ impl<'a> Scheduler<'a> {
         let mut ef_abs: HashMap<i32, i64> = HashMap::new();
         let mut es_abs: HashMap<i32, i64> = HashMap::new();
         let mut driven_es: HashMap<i32, i64> = HashMap::new();
+        let mut delay_driven: HashMap<i32, i64> = HashMap::new();
         // Where each in-progress task's remaining work resumes, and the
         // finish its FF/SF links drive for a tracked task (indices).
         let mut resume_idx: HashMap<i32, i64> = HashMap::new();
@@ -1604,6 +1614,7 @@ impl<'a> Scheduler<'a> {
             // over COM), so a stored one is ignored.
             let s_abs = match t.leveling_delay.filter(|d| *d > 0) {
                 Some(tenths) if !self.schedulable_alap(t) => {
+                    delay_driven.insert(t.uid, s_abs);
                     tl.snap(s_abs.saturating_add(tenths / 10))
                 }
                 _ => s_abs,
@@ -1630,10 +1641,18 @@ impl<'a> Scheduler<'a> {
             .max()
             .unwrap_or(self.anchor);
         let pre_start = self.pre_start_timelines(leaves, &linked_tasks);
+        // The free-slack bounds of summary links: each successor's start
+        // less its own stored delay (#1594 r6), before the group takes its
+        // minimum, as the late pass does below.
         let group_early: Vec<Vec<SuccessorAggregate>> = (0..graph.groups.len())
             .map(|id| {
                 self.aggregate_targets(graph, id, |uid| {
-                    es_abs.get(&uid).copied().zip(ef_abs.get(&uid).copied())
+                    let target = &self.proj.tasks[graph.by_uid[&uid]];
+                    es_abs
+                        .get(&uid)
+                        .copied()
+                        .zip(ef_abs.get(&uid).copied())
+                        .map(|(es, ef)| self.late_bounds_before_delay(target, es, ef))
                 })
             })
             .collect();
@@ -2170,6 +2189,7 @@ impl<'a> Scheduler<'a> {
         Schedule {
             results,
             rollups,
+            delay_driven,
             project_start: DateTime::from_minutes(self.anchor),
             project_finish: DateTime::from_minutes(project_finish_abs),
         }
@@ -2238,11 +2258,7 @@ impl<'a> Scheduler<'a> {
                     .and_then(|p| self.absolute_span(p.uid, graph, es_abs, ef_abs)),
             );
             for target in &group_early[group_id] {
-                let succ = &self.proj.tasks[graph.by_uid[&target.uid]];
-                let start = self
-                    .late_bounds_before_delay(succ, target.start, target.start)
-                    .0;
-                bounds.push((target.uid, offset, start, target.milestone));
+                bounds.push((target.uid, offset, target.start, target.milestone));
             }
         }
         for (suid, offset, start, milestone) in bounds {
@@ -4052,7 +4068,20 @@ impl Scheduler<'_> {
                 })
                 .max()
                 .unwrap_or(0);
-            let earliest = cpm_start_idx + floor;
+            // A movable task that carries a stored delay (a pass without
+            // `clear_first`, or a later round of the editor's repeat) was
+            // scheduled as its snapped driven start plus the elapsed delay,
+            // snapped again. Its predecessors' shift moves that driven
+            // start, not the delayed one, so the delayed start is rebuilt
+            // the same way across nonworking time (#1594 r6).
+            let earliest = match base.delay_driven(t.uid) {
+                Some(driven_was) if !fixed(t) => {
+                    let delay = t.leveling_delay.unwrap_or(0).max(0) / 10;
+                    let driven_now = tl.abs_start(tl.to_index(driven_was) + floor);
+                    tl.to_index(tl.snap(driven_now.saturating_add(delay)))
+                }
+                _ => cpm_start_idx + floor,
+            };
             let res = assign.get(&t.uid).cloned().unwrap_or_default();
             // Finish with the span CPM scheduled — a delayed assignment's
             // work past the stored Duration moves with the task — but each
@@ -9414,6 +9443,100 @@ mod tests {
         assert_eq!((b.total_slack_min, b.critical), (0, true));
         assert_eq!((c.total_slack_min, c.critical), (2 * 480, false));
         assert_eq!(s.project_finish, at(4, 17));
+    }
+
+    /// #1594 r6: a movable task that keeps a stored delay is rebuilt from its
+    /// shifted driven start, not shifted by working minutes. From Thursday
+    /// the 5th: X and A (one day each) share R1; B (one day, R2) follows A
+    /// with a two-elapsed-day delay; Y (R2) is pinned to Tuesday the 10th;
+    /// an unresourced five-day Z ends Wednesday the 11th. Within slack,
+    /// selecting A and B: A moves to Friday, B's driven start to Monday,
+    /// and its delay lands it Wednesday (Monday plus two days), clear of Y,
+    /// so it keeps the delay as it is and the finish holds.
+    #[test]
+    fn a_kept_delay_is_rebuilt_from_the_shifted_driven_start() {
+        let mut b = task(3, "B", 480);
+        b.predecessors.push(fs(2));
+        b.leveling_delay = Some(2 * 1440 * 10);
+        b.leveling_delay_format = Some(8);
+        let mut y = task(4, "Y", 480);
+        y.constraint = ConstraintType::StartNoEarlierThan;
+        y.constraint_date = Some(at(10, 8));
+        let proj = Project {
+            start_date: Some(at(5, 8)),
+            tasks: vec![
+                task(1, "X", 480),
+                task(2, "A", 480),
+                b,
+                y,
+                task(5, "Z", 5 * 480),
+            ],
+            resources: vec![worker(1, "R1", 1.0), worker(2, "R2", 1.0)],
+            assignments: vec![
+                assign(1, 1, 1, 1.0),
+                assign(2, 2, 1, 1.0),
+                assign(3, 3, 2, 1.0),
+                assign(4, 4, 2, 1.0),
+            ],
+            ..Project::default()
+        };
+        let s = schedule(&proj);
+        assert_eq!(s.get(3).unwrap().early_start, at(9, 8), "Monday");
+        assert_eq!(s.get(2).unwrap().total_slack_min, 480, "A: one day");
+        assert_eq!(s.project_finish, at(11, 17));
+        let a_and_b: std::collections::HashSet<i32> = [2, 3].into_iter().collect();
+        let lv = level_with(
+            &proj,
+            &LevelScope {
+                movable: Some(&a_and_b),
+                within_slack: true,
+                ..LevelScope::default()
+            },
+        );
+        assert_eq!(lv.start(2), Some(at(6, 8)), "A moves to Friday");
+        assert_eq!(
+            lv.start(3),
+            Some(at(11, 8)),
+            "B: Monday driven plus two days"
+        );
+        assert_eq!(
+            lv.delay_min(3),
+            Some(0),
+            "B keeps its stored delay, nothing added"
+        );
+        assert_eq!(lv.project_finish, at(11, 17));
+    }
+
+    /// #1594 r6: the free-slack bound of a summary link takes each
+    /// successor's own delay before the group's minimum: S {A} precedes
+    /// T {C pinned to Wednesday, B delayed two elapsed days}. B starts
+    /// Thursday, driven from Tuesday, so A has no free slack although C's
+    /// Wednesday is the group's earliest start.
+    #[test]
+    fn summary_free_slack_bounds_take_each_successors_delay() {
+        let mut s_sum = summary_task(10, 1);
+        s_sum.name = "S".into();
+        let mut a = task(1, "A", 480);
+        a.outline_level = 2;
+        let mut t_sum = summary_task(20, 1);
+        t_sum.name = "T".into();
+        t_sum.predecessors.push(fs(10));
+        let mut c = task(3, "C", 480);
+        c.outline_level = 2;
+        c.constraint = ConstraintType::StartNoEarlierThan;
+        c.constraint_date = Some(at(4, 8));
+        let mut b = task(2, "B", 480);
+        b.outline_level = 2;
+        b.leveling_delay = Some(2 * 1440 * 10);
+        b.leveling_delay_format = Some(8);
+        let sched = schedule(&march2(vec![s_sum, a, t_sum, c, b]));
+        assert_eq!(sched.get(3).unwrap().early_start, at(4, 8), "Wednesday");
+        assert_eq!(
+            sched.get(2).unwrap().early_start,
+            at(5, 8),
+            "Thursday: Tuesday plus two days"
+        );
+        assert_eq!(sched.get(1).unwrap().free_slack_min, 0);
     }
 
     /// #1594 r4: the bound inverts the snap too. From Thursday the 5th, X and
