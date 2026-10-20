@@ -314,7 +314,9 @@ undo step. Leveling Options (`LevelOptions`) are plan options
 the order is `Standard` (the topological order above), `ID` (the lowest ID
 first among the ready tasks) or `Priority` (the highest priority first);
 within slack never delays a task past its CPM late start (the slack a
-leveled predecessor used counts); clear-first (the default) drops the
+leveled predecessor used counts) nor moves the project finish (a task whose
+delay would, through a summary's percentage lag, stays put, overallocated);
+clear-first (the default) drops the
 scope's stored delays before the pass, a priority-1000 task's too (measured
 on Project 2024: it then holds at its unleveled start), else the pass builds
 on them. Adjusting assignments and splitting are kept as settings
