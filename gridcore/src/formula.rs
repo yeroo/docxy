@@ -3121,14 +3121,55 @@ pub fn rename_sheet_in_formula(src: &str, old: &str, new: &str) -> Option<String
 
 /// [`rename_sheet_in_formula`] on a parsed formula.
 pub fn rename_sheet_in_expr(e: &Expr, old: &str, new: &str) -> Expr {
-    fn walk(e: &Expr, old: &str, new: &str) -> Expr {
-        let fix = |s: &Option<String>| -> Option<String> {
-            match s {
-                Some(n) if n.eq_ignore_ascii_case(old) => Some(new.to_string()),
-                other => other.clone(),
-            }
+    let fix = |s: &Option<String>| -> Option<String> {
+        match s {
+            Some(n) if n.eq_ignore_ascii_case(old) => Some(new.to_string()),
+            other => other.clone(),
+        }
+    };
+    // A span that *is* the old name: a sheet whose own name holds a `:` (an
+    // imported `A:B`, #603), which the parser reads as the span A..B.
+    // Renamed, it is the one sheet it always meant.
+    let whole_name = |x: &Expr| -> Option<Expr> {
+        let Expr::Ref3D { first, last, a, b } = x else {
+            return None;
         };
-        match e {
+        if !format!("{first}:{last}").eq_ignore_ascii_case(old) {
+            return None;
+        }
+        let a = CellRef {
+            sheet: Some(new.to_string()),
+            ..a.clone()
+        };
+        Some(
+            if a.row == b.row && a.col == b.col && a.abs_row == b.abs_row && a.abs_col == b.abs_col
+            {
+                Expr::Ref(a)
+            } else {
+                Expr::Range(a, b.clone())
+            },
+        )
+    };
+    map_sheet_qualifiers(e, &fix, &whole_name)
+}
+
+/// Rebuild `e` with every sheet qualifier `fix` maps: a reference's, a
+/// range's first corner's (the second takes the first's sheet), a column or
+/// row range's, and a 3-D span's two end sheets (through `fix(&Some(name))`).
+/// `special` sees each node first and, returning `Some`, replaces it whole.
+/// The one walker behind [`rename_sheet_in_expr`] and
+/// [`qualify_sheet_in_expr`], so a new qualified `Expr` variant is learned by
+/// both or neither.
+fn map_sheet_qualifiers(
+    e: &Expr,
+    fix: &dyn Fn(&Option<String>) -> Option<String>,
+    special: &dyn Fn(&Expr) -> Option<Expr>,
+) -> Expr {
+    map_expr(e, &|x| {
+        if let Some(r) = special(x) {
+            return Some(r);
+        }
+        Some(match x {
             Expr::Ref(r) => Expr::Ref(CellRef {
                 sheet: fix(&r.sheet),
                 ..r.clone()
@@ -3137,42 +3178,11 @@ pub fn rename_sheet_in_expr(e: &Expr, old: &str, new: &str) -> Expr {
                 sheet: fix(&r.sheet),
                 ..r.clone()
             }),
-            Expr::ArrayLit(rows) => Expr::ArrayLit(
-                rows.iter()
-                    .map(|row| row.iter().map(|x| walk(x, old, new)).collect())
-                    .collect(),
-            ),
-            // A span that *is* the old name: a sheet whose own name holds a
-            // `:` (an imported `A:B`, #603), which the parser reads as the
-            // span A..B. Renamed, it is the one sheet it always meant.
-            Expr::Ref3D { first, last, a, b }
-                if format!("{first}:{last}").eq_ignore_ascii_case(old) =>
-            {
-                let a = CellRef {
-                    sheet: Some(new.to_string()),
-                    ..a.clone()
-                };
-                if a.row == b.row
-                    && a.col == b.col
-                    && a.abs_row == b.abs_row
-                    && a.abs_col == b.abs_col
-                {
-                    Expr::Ref(a)
-                } else {
-                    Expr::Range(a, b.clone())
-                }
-            }
             Expr::Ref3D { first, last, a, b } => {
-                let ren = |n: &String| -> String {
-                    if n.eq_ignore_ascii_case(old) {
-                        new.to_string()
-                    } else {
-                        n.clone()
-                    }
-                };
+                let end = |n: &String| fix(&Some(n.clone())).unwrap_or_else(|| n.clone());
                 Expr::Ref3D {
-                    first: ren(first),
-                    last: ren(last),
+                    first: end(first),
+                    last: end(last),
                     a: a.clone(),
                     b: b.clone(),
                 }
@@ -3210,23 +3220,9 @@ pub fn rename_sheet_in_expr(e: &Expr, old: &str, new: &str) -> Expr {
                 abs1: *abs1,
                 abs2: *abs2,
             },
-            Expr::Func(n, args) => {
-                Expr::Func(n.clone(), args.iter().map(|a| walk(a, old, new)).collect())
-            }
-            Expr::Call(callee, args) => Expr::Call(
-                Box::new(walk(callee, old, new)),
-                args.iter().map(|a| walk(a, old, new)).collect(),
-            ),
-            Expr::Un(op, x) => Expr::Un(*op, Box::new(walk(x, old, new))),
-            Expr::Bin(op, l, r) => Expr::Bin(
-                *op,
-                Box::new(walk(l, old, new)),
-                Box::new(walk(r, old, new)),
-            ),
-            other => other.clone(),
-        }
-    }
-    walk(e, old, new)
+            _ => return None,
+        })
+    })
 }
 
 /// `e` with its bare structured references (`[@Qty]`, `[Qty]`) qualified
@@ -3528,77 +3524,13 @@ fn span_ends_reparse(e: &Expr) -> Expr {
 /// moved off Sheet2 as `=Sheet2!B1`). Qualified references, 3-D spans, names
 /// and structured references are left alone.
 pub fn qualify_sheet_in_expr(e: &Expr, sheet: &str) -> Expr {
-    fn walk(e: &Expr, sheet: &str) -> Expr {
-        let fix = |s: &Option<String>| -> Option<String> {
-            match s {
-                None => Some(sheet.to_string()),
-                other => other.clone(),
-            }
-        };
-        match e {
-            Expr::Ref(r) => Expr::Ref(CellRef {
-                sheet: fix(&r.sheet),
-                ..r.clone()
-            }),
-            Expr::SpillRef(r) => Expr::SpillRef(CellRef {
-                sheet: fix(&r.sheet),
-                ..r.clone()
-            }),
-            Expr::ArrayLit(rows) => Expr::ArrayLit(
-                rows.iter()
-                    .map(|row| row.iter().map(|x| walk(x, sheet)).collect())
-                    .collect(),
-            ),
-            // A 3-D span is always sheet-qualified; leave it alone.
-            Expr::Ref3D { .. } => e.clone(),
-            Expr::Range(a, b) => Expr::Range(
-                CellRef {
-                    sheet: fix(&a.sheet),
-                    ..a.clone()
-                },
-                b.clone(),
-            ),
-            Expr::ColRange {
-                sheet: s,
-                c1,
-                c2,
-                abs1,
-                abs2,
-            } => Expr::ColRange {
-                sheet: fix(s),
-                c1: *c1,
-                c2: *c2,
-                abs1: *abs1,
-                abs2: *abs2,
-            },
-            Expr::RowRange {
-                sheet: s,
-                r1,
-                r2,
-                abs1,
-                abs2,
-            } => Expr::RowRange {
-                sheet: fix(s),
-                r1: *r1,
-                r2: *r2,
-                abs1: *abs1,
-                abs2: *abs2,
-            },
-            Expr::Func(n, args) => {
-                Expr::Func(n.clone(), args.iter().map(|a| walk(a, sheet)).collect())
-            }
-            Expr::Call(callee, args) => Expr::Call(
-                Box::new(walk(callee, sheet)),
-                args.iter().map(|a| walk(a, sheet)).collect(),
-            ),
-            Expr::Un(op, x) => Expr::Un(*op, Box::new(walk(x, sheet))),
-            Expr::Bin(op, l, r) => {
-                Expr::Bin(*op, Box::new(walk(l, sheet)), Box::new(walk(r, sheet)))
-            }
+    let fix = |s: &Option<String>| -> Option<String> {
+        match s {
+            None => Some(sheet.to_string()),
             other => other.clone(),
         }
-    }
-    walk(e, sheet)
+    };
+    map_sheet_qualifiers(e, &fix, &|_| None)
 }
 
 /// Parse–qualify–print in one step; `None` when the source doesn't parse.
@@ -15575,6 +15507,40 @@ mod tests {
             qualify_sheet_in_formula("B1", "My Data").unwrap(),
             "'My Data'!B1"
         );
+    }
+
+    /// Rename and qualify share one walker (`map_sheet_qualifiers`): every
+    /// qualifier-carrying shape is mapped by both.
+    #[test]
+    fn rename_and_qualify_map_every_qualifier_shape() {
+        for (src, renamed, qualified) in [
+            ("Old!A1", "New!A1", "Old!A1"),
+            ("Old!A1#", "New!A1#", "Old!A1#"),
+            ("Old!A1:B2", "New!A1:B2", "Old!A1:B2"),
+            ("Old!C:D", "New!C:D", "Old!C:D"),
+            ("Old!3:4", "New!3:4", "Old!3:4"),
+            ("SUM(Old!A1,1)", "SUM(New!A1,1)", "SUM(Old!A1,1)"),
+            ("-Old!A1", "-New!A1", "-Old!A1"),
+            ("{Old!A1}", "{New!A1}", "{Old!A1}"),
+            ("SUM(Old:Last!A1)", "SUM(New:Last!A1)", "SUM(Old:Last!A1)"),
+            (
+                "A1+B1:C2+D:D+3:3+E1#",
+                "A1+B1:C2+D:D+3:3+E1#",
+                "S!A1+S!B1:C2+S!D:D+S!3:3+S!E1#",
+            ),
+        ] {
+            let ast = parse(src).unwrap();
+            assert_eq!(
+                to_string(&rename_sheet_in_expr(&ast, "Old", "New")),
+                renamed,
+                "{src}"
+            );
+            assert_eq!(
+                to_string(&qualify_sheet_in_expr(&ast, "S")),
+                qualified.replace("S!", "S!"),
+                "{src}"
+            );
+        }
     }
 
     #[test]

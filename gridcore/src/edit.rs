@@ -2352,13 +2352,15 @@ impl FormulaSite<'_> {
 /// conditional-format rules `rules` takes (given the rule's sheet and
 /// ranges), and with `validations` the data-validation rules it takes too.
 /// A formula `f` leaves unchanged keeps its text exactly; one held verbatim
-/// (a shared or data-table formula) is left alone.
+/// (a shared or data-table formula) is left alone. Whether any formula was
+/// rewritten.
 fn rewrite_workbook_formulas(
     wb: &mut Workbook,
     rules: impl Fn(usize, &[Area]) -> bool,
     validations: bool,
     f: impl Fn(&Expr, FormulaSite<'_>) -> Expr,
-) {
+) -> bool {
+    let mut changed = false;
     let at = |sheet, cell| FormulaSite {
         sheet,
         cell,
@@ -2374,6 +2376,7 @@ fn rewrite_workbook_formulas(
             }
             if let Some(updated) = rewrite_if_changed(src, |e| f(e, at(Some(s), Some((r, c))))) {
                 cell.formula = Some(updated);
+                changed = true;
             }
         }
         for_each_rule_formula(sheet, validations, |ranges, src| {
@@ -2382,6 +2385,7 @@ fn rewrite_workbook_formulas(
             }
             if let Some(updated) = rewrite_if_changed(src, |e| f(e, at(Some(s), None))) {
                 *src = updated;
+                changed = true;
             }
         });
     }
@@ -2390,6 +2394,7 @@ fn rewrite_workbook_formulas(
             crate::formula::rewrite_defined_name(text, |e| f(e, at(None, None)), None)
         {
             *text = updated;
+            changed = true;
         }
     });
     // A table's calculated-column formulas sit in its first data row (one
@@ -2409,9 +2414,11 @@ fn rewrite_workbook_formulas(
             };
             if let Some(updated) = rewrite_if_changed(src, |e| f(e, site)) {
                 *slot = Some(updated);
+                changed = true;
             }
         }
     }
+    changed
 }
 
 fn table_index(wb: &Workbook, name: &str) -> Result<usize, String> {
