@@ -428,3 +428,50 @@ fn a_synced_percent_records_the_actual_of_a_started_task_only() {
         "started, not 0%"
     );
 }
+
+#[test]
+fn an_external_task_takes_no_progress() {
+    let mut proj = editor().project().clone();
+    let t = proj.tasks.iter_mut().find(|t| t.uid == 2).unwrap();
+    t.external_task = Some(true);
+    t.actual_start = Some(at(5, 8));
+    let mut ed = Editor::new(proj);
+    assert_eq!(
+        ed.set_actual_start(2, Some(at(6, 8))).unwrap_err(),
+        EXTERNAL_TASK_DATES
+    );
+    assert!(ed.set_actual_finish(2, Some(at(7, 17))).is_err());
+    assert!(ed.set_actual_duration(2, 480).is_err());
+    assert!(ed.set_remaining_duration(2, 480).is_err());
+    assert!(ed.set_percent_complete_synced(2, 40).is_err());
+    assert_eq!(ed.undo_depth(), 0);
+}
+
+#[test]
+fn a_synced_percent_follows_a_duration_that_moved() {
+    // 4 d task at 50 % with 2 d done, whose duration is then made 6 d.
+    let mut proj = editor().project().clone();
+    let t = proj.tasks.iter_mut().find(|t| t.uid == 2).unwrap();
+    t.duration_min = 1920 * 3 / 2;
+    t.actual_start = Some(at(5, 8));
+    t.actual_duration_min = Some(960);
+    t.remaining_duration_min = Some(960);
+    t.percent_complete = Some(33);
+    let mut ed = Editor::new(proj);
+    assert_eq!(ed.set_percent_complete_synced(2, 50), Ok(true));
+    let t = pour(&ed);
+    assert_eq!(
+        (t.actual_duration_min, t.percent_complete),
+        (Some(1440), Some(50))
+    );
+    // The same 50 % on a task whose actual is stale for it (percent already 50).
+    let mut proj = ed.project().clone();
+    proj.tasks
+        .iter_mut()
+        .find(|t| t.uid == 2)
+        .unwrap()
+        .actual_duration_min = Some(960);
+    let mut ed = Editor::new(proj);
+    assert_eq!(ed.set_percent_complete_synced(2, 50), Ok(true));
+    assert_eq!(pour(&ed).actual_duration_min, Some(1440));
+}

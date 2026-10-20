@@ -3318,6 +3318,18 @@ mod tests {
             ),
             (Some(t.duration_min), Some(0), None)
         );
+        // The same 50 % again, with the duration made longer first: the
+        // actual follows the new duration.
+        set(
+            &mut a,
+            vec![
+                ("duration", Json::Str("8d".into())),
+                ("percent_complete", Json::Num(50.0)),
+            ],
+        )
+        .unwrap();
+        let t = task(&a);
+        assert_eq!((t.duration_min, t.actual_duration_min), (3840, Some(1920)));
         // A duration beside a remaining duration must agree with it.
         set(&mut a, vec![("actual_finish", Json::Null)]).unwrap();
         let before = a.project().clone();

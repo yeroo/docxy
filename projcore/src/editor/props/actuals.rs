@@ -64,6 +64,9 @@ impl Editor {
         if task.is_milestone() {
             return Err("A milestone has no duration to record progress against".into());
         }
+        if task.is_external_leaf() {
+            return Err(EXTERNAL_TASK_DATES.into());
+        }
         Ok(i)
     }
 
@@ -222,10 +225,7 @@ impl Editor {
             return Err("Actual duration cannot be negative".into());
         }
         if minutes > p.duration {
-            return Err(
-                "Actual duration exceeds the duration; set remaining_duration or duration first"
-                    .into(),
-            );
+            return Err("Actual duration exceeds the duration; set duration first".into());
         }
         if p.finish.is_some() && minutes != p.duration {
             return Err("The task has an actual finish; clear it first".into());
@@ -312,9 +312,16 @@ impl Editor {
             .filter(|p| *p <= 100)
             .ok_or("% Complete is 0 to 100")?;
         let old = Progress::of(task);
-        if old.percent == percent && old.actual.is_some() {
+        // Only a recorded actual that already gives this percent of the
+        // current duration is left alone (the duration may have moved since).
+        if old.percent == percent
+            && old
+                .actual
+                .is_some_and(|a| percent_of(a, old.duration) == percent)
+        {
             return Ok(false);
         }
+        self.progress_row(uid)?;
         if old.finish.is_some() && percent < 100 {
             return Err("The task has an actual finish, so it is 100% complete".into());
         }
