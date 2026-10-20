@@ -30,6 +30,12 @@ fn editor() -> Editor {
                 milestone: true,
                 ..Task::default()
             },
+            Task {
+                uid: 4,
+                id: 4,
+                is_null: true,
+                ..Task::default()
+            },
         ],
         ..Project::default()
     })
@@ -218,7 +224,7 @@ fn a_stale_stop_is_dropped_with_the_actual() {
 #[test]
 fn summaries_blank_rows_and_milestones_are_refused() {
     let mut ed = editor();
-    for uid in [1, 3] {
+    for uid in [1, 3, 4] {
         assert!(ed.set_actual_start(uid, Some(at(5, 8))).is_err());
         assert!(ed.set_actual_finish(uid, Some(at(5, 8))).is_err());
         assert!(ed.set_actual_duration(uid, 0).is_err());
@@ -226,4 +232,70 @@ fn summaries_blank_rows_and_milestones_are_refused() {
     }
     assert!(ed.set_actual_start(9, None).is_err());
     assert_eq!(ed.undo_depth(), 0);
+}
+
+#[test]
+fn a_remaining_duration_keeps_the_stop_and_resume() {
+    let mut proj = editor().project().clone();
+    let t = proj.tasks.iter_mut().find(|t| t.uid == 2).unwrap();
+    t.actual_start = Some(at(5, 8));
+    t.actual_duration_min = Some(960);
+    t.stop = Some(at(6, 17));
+    t.resume = Some(at(8, 8));
+    let mut ed = Editor::new(proj);
+    assert_eq!(ed.set_remaining_duration(2, 480), Ok(true));
+    assert_eq!(
+        (pour(&ed).stop, pour(&ed).resume),
+        (Some(at(6, 17)), Some(at(8, 8)))
+    );
+    assert_eq!(ed.set_actual_duration(2, 480), Ok(true));
+    assert_eq!(pour(&ed).stop, None, "the completed part moved");
+}
+
+#[test]
+fn the_whole_duration_on_a_finished_task_is_a_no_op() {
+    let mut ed = editor();
+    ed.set_actual_finish(2, Some(at(8, 17))).unwrap();
+    let depth = ed.undo_depth();
+    assert_eq!(ed.set_actual_duration(2, 1920), Ok(false));
+    assert_eq!(ed.set_remaining_duration(2, 0), Ok(false));
+    assert_eq!(ed.undo_depth(), depth);
+    assert_eq!(pour(&ed).remaining_duration_min, None);
+}
+
+#[test]
+fn a_manual_task_restamps_its_saved_dates() {
+    let mut ed = editor();
+    ed.set_manual(2, true).unwrap();
+    ed.set_actual_finish(2, Some(at(12, 17))).unwrap();
+    assert_eq!(pour(&ed).stored_finish, Some(at(12, 17)));
+    assert_eq!(
+        round_trip(&ed).task(2).unwrap().stored_finish,
+        Some(at(12, 17))
+    );
+}
+
+#[test]
+fn a_remaining_duration_too_long_is_refused() {
+    let mut ed = editor();
+    ed.set_actual_duration(2, 480).unwrap();
+    let depth = ed.undo_depth();
+    let err = ed.set_remaining_duration(2, i64::MAX).unwrap_err();
+    assert!(err.contains("too long"), "{err}");
+    assert_eq!(ed.undo_depth(), depth);
+}
+
+#[test]
+fn a_started_task_asked_for_its_percent_is_unchanged() {
+    let mut ed = editor();
+    ed.set_actual_start(2, Some(at(5, 8))).unwrap();
+    let depth = ed.undo_depth();
+    assert_eq!(ed.set_percent_complete(2, 0), Ok(false));
+    assert_eq!(ed.undo_depth(), depth);
+    ed.set_percent_complete(2, 30).unwrap();
+    assert!(
+        ed.set_percent_complete(2, 0)
+            .unwrap_err()
+            .contains("actual start")
+    );
 }

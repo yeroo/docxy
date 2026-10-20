@@ -79,11 +79,15 @@ impl Editor {
     }
 
     /// Write `new` over task `i`; `Ok(false)` when it changes nothing.
-    /// `snapshotted` says the edit's undo step is already open. A changed
-    /// actual drops `Stop`/`Resume`, which would otherwise end the completed
-    /// part where the old actual did.
+    /// `snapshotted` says the edit's undo step is already open. A change to
+    /// the completed part (its start or the work done) drops `Stop`/`Resume`,
+    /// which would otherwise end it where the old one did; a change that
+    /// leaves it alone (the remaining duration) keeps them. A manual task's
+    /// stored Start/Finish are restamped from the new progress, its pinned
+    /// start kept.
     fn store_progress(&mut self, i: usize, new: Progress, snapshotted: bool) -> bool {
-        if Progress::of(&self.proj.tasks[i]) == new && !snapshotted {
+        let old = Progress::of(&self.proj.tasks[i]);
+        if old == new && !snapshotted {
             return false;
         }
         if !snapshotted {
@@ -98,10 +102,14 @@ impl Editor {
         if new.percent != task.percent_complete.unwrap_or(0) {
             task.percent_complete = Some(new.percent);
         }
-        task.stop = None;
-        task.resume = None;
-        task.resume_valid = None;
+        if old.start != new.start || old.done() != new.done() {
+            task.stop = None;
+            task.resume = None;
+            task.resume_valid = None;
+        }
+        let uid = task.uid;
         self.changed();
+        self.stamp_pinned_dates(uid);
         true
     }
 
@@ -204,7 +212,7 @@ impl Editor {
             p.start = Some(self.scheduled_start(i)?);
         }
         p.actual = Some(minutes);
-        p.remaining = Some(p.duration - minutes);
+        p.remaining = p.finish.is_none().then(|| p.duration - minutes);
         p.percent = percent_of(minutes, p.duration);
         Ok(self.store_progress(i, p, false))
     }
@@ -225,7 +233,9 @@ impl Editor {
             return Err("The task has an actual finish; clear it first".into());
         }
         let done = p.done();
-        let duration = done + minutes;
+        let duration = done
+            .checked_add(minutes)
+            .ok_or("Remaining duration is too long")?;
         if duration == 0 {
             return Err(
                 "Remaining duration 0 with no work done would leave a zero duration".into(),

@@ -875,14 +875,26 @@ impl TaskInfoArgs {
         if let Some(on) = self.milestone {
             ed.set_milestone(uid, on)?;
         }
-        let actuals = self.actual_start.is_some()
-            || self.actual_finish.is_some()
+        // A finish, an actual duration or a remaining duration derive
+        // % Complete; a start alone, or clearing the finish, leave it to
+        // `percent_complete`.
+        let derives = matches!(self.actual_finish, Some(Some(_)))
             || self.actual_duration.is_some()
             || self.remaining_duration.is_some();
+        // Moving both dates later: the start is checked against the stored
+        // finish, so the finish goes first.
+        let stored_finish = ed.project().task(uid).and_then(|t| t.actual_finish);
+        let finish_first = match (self.actual_start, self.actual_finish) {
+            (Some(Some(start)), Some(_)) => stored_finish.is_some_and(|f| start > f),
+            _ => false,
+        };
+        if finish_first && let Some(finish) = self.actual_finish {
+            ed.set_actual_finish(uid, finish)?;
+        }
         if let Some(start) = self.actual_start {
             ed.set_actual_start(uid, start)?;
         }
-        if let Some(finish) = self.actual_finish {
+        if !finish_first && let Some(finish) = self.actual_finish {
             ed.set_actual_finish(uid, finish)?;
         }
         if let Some(minutes) = self.actual_duration {
@@ -892,7 +904,7 @@ impl TaskInfoArgs {
             ed.set_remaining_duration(uid, minutes)?;
         }
         if let Some(p) = self.percent_complete {
-            if actuals {
+            if derives {
                 // The actuals say how far the task is; a different
                 // percent_complete is a contradiction, never an override.
                 let now = ed.project().task(uid).and_then(|t| t.percent_complete);
@@ -983,7 +995,18 @@ fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         if has_patch {
             ed.update_task(uid, patch)?;
         }
-        info.apply(ed, uid)
+        info.apply(ed, uid)?;
+        // A remaining duration sets the duration; a different one typed
+        // beside it is a contradiction.
+        if let (Some(typed), Some(_)) = (duration, info.remaining_duration) {
+            let now = ed.project().task(uid).map_or(typed.0, |t| t.duration_min);
+            if now != typed.0 {
+                return Err(format!(
+                    "'duration' contradicts 'remaining_duration', which makes the duration {now} minutes"
+                ));
+            }
+        }
+        Ok(())
     })?;
     task_reply(ed, uid, asked.as_deref())
 }
@@ -3187,6 +3210,60 @@ mod tests {
             (None, None, Some(0))
         );
         set(&mut a, vec![("actual_start", Json::Str("later".into()))]).unwrap_err();
+
+        // A start alone leaves % Complete to percent_complete.
+        set(
+            &mut a,
+            vec![
+                ("actual_start", Json::Str("2026-03-02".into())),
+                ("percent_complete", Json::Num(50.0)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(task(&a).percent_complete, Some(50));
+        let err = set(
+            &mut a,
+            vec![
+                ("actual_start", Json::Str("2026-03-03".into())),
+                ("percent_complete", Json::Num(0.0)),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("more than 0%"), "{err}");
+        // Both dates moved later in one call.
+        set(
+            &mut a,
+            vec![("actual_finish", Json::Str("2026-03-04".into()))],
+        )
+        .unwrap();
+        set(
+            &mut a,
+            vec![
+                ("actual_start", Json::Str("2026-03-09".into())),
+                ("actual_finish", Json::Str("2026-03-10".into())),
+            ],
+        )
+        .unwrap();
+        let t = task(&a);
+        assert_eq!(
+            (
+                t.actual_start.map(|d| d.parts().day),
+                t.actual_finish.map(|d| d.parts().day)
+            ),
+            (Some(9), Some(10))
+        );
+        // A duration beside a remaining duration must agree with it.
+        set(&mut a, vec![("actual_finish", Json::Null)]).unwrap();
+        let err = set(
+            &mut a,
+            vec![
+                ("duration", Json::Str("9d".into())),
+                ("remaining_duration", Json::Str("1d".into())),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("contradicts"), "{err}");
+        assert_ne!(a.project().task(uid as i32).unwrap().duration_min, 9 * 480);
     }
 
     /// The Task Information fields (#1550): every argument applies in the
