@@ -1254,6 +1254,11 @@ impl<'a> Scheduler<'a> {
                 else {
                     continue;
                 };
+                // The successor's cap is its start before its own stored
+                // delay (#1594 r11), as the backward pass bounds it.
+                let successor = &self.proj.tasks[graph.by_uid[&successor_uid]];
+                let (start, finish) =
+                    self.late_bounds_before_delay(successor, start, finish, edge.link);
                 let offset = self.percent_offset(
                     edge.offset,
                     edge.percent_summary.as_ref(),
@@ -1270,7 +1275,12 @@ impl<'a> Scheduler<'a> {
                     continue;
                 }
                 let targets = group_caps.entry(group_id).or_insert_with(|| {
-                    self.aggregate_targets(graph, group_id, |uid| caps.get(&uid).copied())
+                    self.aggregate_targets(graph, group_id, |uid| {
+                        let target = &self.proj.tasks[graph.by_uid[&uid]];
+                        caps.get(&uid).map(|&(start, finish)| {
+                            self.late_bounds_before_delay(target, start, finish, group.link)
+                        })
+                    })
                 });
                 let offset = self.percent_offset(
                     group.offset,
@@ -4256,8 +4266,9 @@ impl Scheduler<'_> {
             // Start or Finish No Later Than takes the earlier of the links'
             // demand and its cap; every other constraint (and each of them
             // when constraints are not honored) is a floor the links' demand
-            // may pass. A milestone's kept instant shares the index of the
-            // next working minute, so it stays where the links leave it.
+            // may pass. Two instants on one working index (a milestone's
+            // evening and the next morning) are compared as instants, as
+            // the forward pass compares them (r11).
             let honored = self.proj.honor_constraints;
             let (driven_now_abs, base_idx) = match (link_now, t.constraint) {
                 (_, ConstraintType::MustStartOn | ConstraintType::MustFinishOn) if honored => {
@@ -4267,35 +4278,40 @@ impl Scheduler<'_> {
                     Some((linked_idx, linked_abs)),
                     ConstraintType::StartNoLaterThan | ConstraintType::FinishNoLaterThan,
                 ) if honored => {
-                    // The cap's index: a finish cap less the task's working
-                    // span.
+                    // The cap: a finish cap's index less the task's working
+                    // span, and its instant, which for a milestone is the
+                    // constraint's own (an evening, not the next morning that
+                    // shares its index), as the forward pass holds it (r10).
                     let cap = t.constraint_date.map(|date| {
                         let span = if t.constraint == ConstraintType::FinishNoLaterThan {
                             link_span
                         } else {
                             0
                         };
-                        tl.to_index(date.minutes()) - span
+                        let idx = tl.to_index(date.minutes()) - span;
+                        let at = if t.duration_min == 0 {
+                            self.constraint_dates(t, true)
+                                .map_or(tl.abs_start(idx), |dates| dates.milestone)
+                        } else {
+                            tl.abs_start(idx)
+                        };
+                        (idx, at)
                     });
-                    let capped = cap.map_or(linked_idx, |cap| linked_idx.min(cap));
-                    if capped <= before_delay_idx {
+                    // The earlier of the links' demand and the cap, by
+                    // instant where the indices tie (r11).
+                    let capped = match cap {
+                        Some(cap) if cap < (linked_idx, linked_abs) => cap,
+                        _ => (linked_idx, linked_abs),
+                    };
+                    if capped <= (before_delay_idx, before_delay_abs) {
                         (before_delay_abs, before_delay_idx)
-                    } else if capped == linked_idx {
-                        (linked_abs, linked_idx)
-                    } else if t.duration_min == 0 {
-                        // A binding cap holds a milestone at the constraint's
-                        // own instant (an evening, not the next morning that
-                        // shares its index), as the forward pass does, so a
-                        // kept delay counts from there (r10).
-                        let at = self
-                            .constraint_dates(t, true)
-                            .map_or(tl.abs_start(capped), |dates| dates.milestone);
-                        (at, capped)
                     } else {
-                        (tl.abs_start(capped), capped)
+                        (capped.1, capped.0)
                     }
                 }
-                (Some((linked_idx, linked_abs)), _) if linked_idx > before_delay_idx => {
+                (Some((linked_idx, linked_abs)), _)
+                    if (linked_idx, linked_abs) > (before_delay_idx, before_delay_abs) =>
+                {
                     (linked_abs, linked_idx)
                 }
                 _ => (before_delay_abs, before_delay_idx),
@@ -6235,7 +6251,10 @@ mod tests {
 
     #[test]
     fn fixed_successor_cap_propagates_through_an_intermediate_task() {
-        for middle_alap in [false, true] {
+        // (middle task ALAP, middle task with a stored one-day delay): the
+        // delay (#1594 r11) is counted in the cap, so A ends a day earlier
+        // and C's driven Wednesday plus the delay is Thursday, before B.
+        for (middle_alap, delayed) in [(false, false), (true, false), (false, true)] {
             let mut a = task(1, "A", 960);
             a.constraint = ConstraintType::AsLateAsPossible;
             let mut c = task(3, "C", 480);
@@ -6243,13 +6262,22 @@ mod tests {
             if middle_alap {
                 c.constraint = ConstraintType::AsLateAsPossible;
             }
+            if delayed {
+                c.leveling_delay = Some(1440 * 10);
+                c.leveling_delay_format = Some(8);
+            }
             let mut b = manual(2, "B", 960, at(6, 8));
             b.predecessors.push(fs(3));
             let sched = schedule(&march2(vec![a, c, b, task(4, "Long", 4800)]));
             let a = sched.get(1).unwrap();
             let c = sched.get(3).unwrap();
             let b = sched.get(2).unwrap();
-            assert_eq!((a.early_start, a.early_finish), (at(3, 8), at(4, 17)));
+            let a_days = if delayed {
+                (at(2, 8), at(3, 17))
+            } else {
+                (at(3, 8), at(4, 17))
+            };
+            assert_eq!((a.early_start, a.early_finish), a_days, "delayed={delayed}");
             assert_eq!((c.early_start, c.early_finish), (at(5, 8), at(5, 17)));
             assert_eq!((b.early_start, b.early_finish), (at(6, 8), at(9, 17)));
             assert!(b.total_slack_min >= 0, "middle_alap={middle_alap}");
@@ -9801,6 +9829,120 @@ mod tests {
             "Thursday: Tuesday plus two days"
         );
         assert_eq!(sched.get(1).unwrap().free_slack_min, 0);
+    }
+
+    /// #1594 r11: the cap arm decides by instant where the cap's index and
+    /// the link's tie. As the r10 case, with M start-to-start after A: the
+    /// link's demand is Wednesday 08:00, the cap Tuesday 17:00, one index;
+    /// the cap's instant is the earlier and holds M, so the kept hour counts
+    /// from Tuesday 17:00 and T starts Wednesday 08:00 with no delay.
+    #[test]
+    fn a_capped_milestones_cap_wins_a_tie_on_one_index_by_instant() {
+        for constraint in [
+            ConstraintType::FinishNoLaterThan,
+            ConstraintType::StartNoLaterThan,
+        ] {
+            let mut m = task(3, "M", 0);
+            m.predecessors.push(lag_link(2, LinkType::StartStart, 0, 8));
+            m.constraint = constraint;
+            m.constraint_date = Some(at(3, 17));
+            m.leveling_delay = Some(60 * 10);
+            m.leveling_delay_format = Some(8);
+            let mut t = task(4, "T", 60);
+            t.predecessors.push(fs(3));
+            let mut y = task(5, "Y", 60);
+            y.constraint = ConstraintType::StartNoEarlierThan;
+            y.constraint_date = Some(at(4, 9));
+            let proj = Project {
+                start_date: Some(at(2, 8)),
+                tasks: vec![task(1, "X", 960), task(2, "A", 480), m, t, y],
+                resources: vec![worker(1, "R1", 1.0), worker(2, "R2", 1.0)],
+                assignments: vec![
+                    assign(1, 1, 1, 1.0),
+                    assign(2, 2, 1, 1.0),
+                    assign(4, 4, 2, 1.0),
+                    assign(5, 5, 2, 1.0),
+                ],
+                ..Project::default()
+            };
+            assert_eq!(
+                schedule(&proj).get(3).unwrap().early_start,
+                at(2, 9),
+                "M before"
+            );
+            let three: std::collections::HashSet<i32> = [2, 3, 4].into_iter().collect();
+            let lv = level_with(
+                &proj,
+                &LevelScope {
+                    movable: Some(&three),
+                    ..LevelScope::default()
+                },
+            );
+            assert_eq!(lv.start(2), Some(at(4, 8)), "A Wednesday ({constraint:?})");
+            assert_eq!(
+                lv.start(3),
+                Some(at(4, 8)),
+                "M Wednesday 08:00 ({constraint:?})"
+            );
+            assert_eq!(
+                lv.start(4),
+                Some(at(4, 8)),
+                "T Wednesday 08:00 ({constraint:?})"
+            );
+            assert_eq!(
+                lv.delay_min(4),
+                Some(0),
+                "T takes no delay ({constraint:?})"
+            );
+            let mut written = proj.clone();
+            written.tasks[1].leveling_delay = Some(2880 * 10);
+            written.tasks[1].leveling_delay_format = Some(8);
+            let sched = schedule(&written);
+            assert_eq!(
+                sched.get(3).unwrap().early_start,
+                at(4, 8),
+                "{constraint:?}"
+            );
+            assert_eq!(
+                sched.get(4).unwrap().early_start,
+                at(4, 8),
+                "{constraint:?}"
+            );
+        }
+    }
+
+    /// #1594 r11: the floor comparison decides by instant where the links'
+    /// demand and the pre-delay start share an index. A (two days, no
+    /// resource) ends Tuesday 17:00, where its FS milestone M (a kept hour)
+    /// is held; Q (one day) shares R1 with X (two days) and drives M
+    /// start-to-start. Q levels to Wednesday 08:00, one index with Tuesday
+    /// 17:00 and the later instant: M is Wednesday 08:00 plus the hour in
+    /// the leveler as in the committed plan.
+    #[test]
+    fn a_later_link_demand_on_the_pre_delay_starts_index_passes_the_floor() {
+        let mut m = task(4, "M", 0);
+        m.predecessors = vec![fs(3), lag_link(2, LinkType::StartStart, 0, 8)];
+        m.leveling_delay = Some(60 * 10);
+        m.leveling_delay_format = Some(8);
+        let proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![task(1, "X", 960), task(2, "Q", 480), task(3, "A", 960), m],
+            resources: vec![worker(1, "R1", 1.0)],
+            assignments: vec![assign(1, 1, 1, 1.0), assign(2, 2, 1, 1.0)],
+            ..Project::default()
+        };
+        assert_eq!(
+            schedule(&proj).get(4).unwrap().early_start,
+            at(4, 8),
+            "M before: Tuesday 17:00 plus the hour"
+        );
+        let lv = level(&proj);
+        assert_eq!(lv.start(2), Some(at(4, 8)), "Q Wednesday");
+        assert_eq!(lv.start(4), Some(at(4, 9)), "M Wednesday 09:00");
+        let mut written = proj.clone();
+        written.tasks[1].leveling_delay = Some(2880 * 10);
+        written.tasks[1].leveling_delay_format = Some(8);
+        assert_eq!(schedule(&written).get(4).unwrap().early_start, at(4, 9));
     }
 
     /// #1594 r10: a binding Finish or Start No Later Than holds a milestone
