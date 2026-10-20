@@ -2047,7 +2047,39 @@ fn span(a: u32, b: u32, shift: &EditShift) -> Option<(u32, u32)> {
     (lo <= hi).then_some((lo, hi))
 }
 
+/// A delete that removes a spilling anchor's own row/column removes its spill
+/// too, as in Excel: the spilled cells are plain values with no link to the
+/// anchor, so they would survive the shift as orphan constants. Clear the ones
+/// that are values (not formulas, as `engine::clear_spill`); styles stay.
+fn clear_orphaned_spills(sheet: &mut Sheet, shift: &EditShift) {
+    let gone: Vec<_> = sheet
+        .cells
+        .iter()
+        .filter_map(|(&(r, c), cell)| {
+            let (h, w) = cell.spill?;
+            let at = if shift.rows { r } else { c };
+            point(at, shift).is_none().then_some((r, c, h, w))
+        })
+        .collect();
+    for (r, c, h, w) in gone {
+        for rr in r..r + h {
+            for cc in c..c + w {
+                if (rr, cc) != (r, c)
+                    && sheet
+                        .cell(rr, cc)
+                        .is_some_and(|cl| cl.formula.is_none() && !cl.value.is_empty())
+                {
+                    sheet.clear_cell_unpinned(rr, cc);
+                }
+            }
+        }
+    }
+}
+
 fn shift_grid(sheet: &mut Sheet, shift: &EditShift) {
+    if shift.delta < 0 {
+        clear_orphaned_spills(sheet, shift);
+    }
     // Cells.
     let cells = std::mem::take(&mut sheet.cells);
     sheet.cells = cells
@@ -4667,6 +4699,95 @@ mod tests {
         assert_eq!(value_at(&w, "A3"), CellValue::Number(2.0));
         assert_eq!(value_at(&w, "B3"), CellValue::Number(6.0));
         assert_eq!(value_at(&w, "C3"), CellValue::Number(99.0));
+    }
+
+    fn dynamic_column_block() -> Workbook {
+        let mut typed = Cell::formula("A1:A3*2");
+        typed.meta = Some(Box::new(crate::sheet::CellMeta {
+            modern: true,
+            ..Default::default()
+        }));
+        let mut w = wb(&[
+            ("A1", Cell::number(1.0)),
+            ("A2", Cell::number(2.0)),
+            ("A3", Cell::number(3.0)),
+            ("D1", typed),
+            ("D4", Cell::number(99.0)),
+        ]);
+        Engine::new(&w).recalc_all(&mut w);
+        assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((3, 1)));
+        w
+    }
+
+    #[test]
+    fn deleting_a_spill_anchors_row_clears_its_orphaned_values() {
+        // #818: the spill goes with its anchor, dynamic or legacy CSE alike;
+        // the user's 99 below the block only moves up.
+        for mut w in [dynamic_column_block(), cse_column_block(0)] {
+            delete_rows(&mut w, 0, 0, 1);
+            Engine::new(&w).recalc_all(&mut w);
+            assert!(w.sheets[0].cell(0, 3).is_none_or(|c| c.value.is_empty()));
+            assert!(w.sheets[0].cell(1, 3).is_none_or(|c| c.value.is_empty()));
+            assert_eq!(value_at(&w, "D3"), CellValue::Number(99.0));
+        }
+    }
+
+    #[test]
+    fn deleting_a_spill_anchors_column_clears_its_orphaned_values() {
+        let mut typed = Cell::formula("D1:F1*2");
+        typed.meta = Some(Box::new(crate::sheet::CellMeta {
+            modern: true,
+            ..Default::default()
+        }));
+        let mut w = wb(&[
+            ("D1", Cell::number(1.0)),
+            ("E1", Cell::number(2.0)),
+            ("F1", Cell::number(3.0)),
+            ("A3", typed),
+            ("D3", Cell::number(99.0)),
+        ]);
+        Engine::new(&w).recalc_all(&mut w);
+        assert_eq!(w.sheets[0].cell(2, 0).unwrap().spill, Some((1, 3)));
+        delete_cols(&mut w, 0, 0, 1);
+        Engine::new(&w).recalc_all(&mut w);
+        assert!(w.sheets[0].cell(2, 0).is_none_or(|c| c.value.is_empty()));
+        assert!(w.sheets[0].cell(2, 1).is_none_or(|c| c.value.is_empty()));
+        assert_eq!(value_at(&w, "C3"), CellValue::Number(99.0));
+    }
+
+    #[test]
+    fn deleting_the_anchor_row_keeps_formula_cells_and_styles_in_the_extent() {
+        let mut w = cse_column_block(0);
+        w.sheets[0].cells.insert((1, 3), Cell::formula("7"));
+        let mut styled = w.sheets[0].cell(2, 3).unwrap().clone();
+        styled.style = 5;
+        w.sheets[0].cells.insert((2, 3), styled);
+        delete_rows(&mut w, 0, 0, 1);
+        assert_eq!(formula_at(&w, "D1"), "7");
+        let d2 = w.sheets[0].cell(1, 3).unwrap();
+        assert!(d2.value.is_empty() && d2.style == 5);
+        assert_eq!(value_at(&w, "D3"), CellValue::Number(99.0));
+    }
+
+    #[test]
+    fn a_delete_covering_the_anchor_and_part_of_the_extent_clears_the_rest() {
+        let mut w = cse_column_block(0);
+        delete_rows(&mut w, 0, 0, 2);
+        assert!(w.sheets[0].cell(0, 3).is_none_or(|c| c.value.is_empty()));
+        assert_eq!(value_at(&w, "D2"), CellValue::Number(99.0));
+    }
+
+    #[test]
+    fn deleting_an_anchor_row_on_another_sheet_leaves_a_spill_alone() {
+        let mut w = dynamic_column_block();
+        w.sheets.push(Sheet {
+            name: "Sheet2".to_string(),
+            ..Sheet::default()
+        });
+        delete_rows(&mut w, 1, 0, 1);
+        assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((3, 1)));
+        assert_eq!(value_at(&w, "D2"), CellValue::Number(4.0));
+        assert_eq!(value_at(&w, "D3"), CellValue::Number(6.0));
     }
 
     #[test]
