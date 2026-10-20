@@ -36,7 +36,7 @@ pub use repair::{Repairs, load_xlsx_repair};
 
 use std::borrow::Cow;
 
-use crate::formula::{file_formula, translate_formula};
+use crate::formula::{file_formula, translate_formula, translate_formula_spaced};
 use crate::sheet::{
     CalcMode, CalcSettings, Cell, CellMeta, CellValue, ColDef, DefinedName, NumFmt, Sheet, Styles,
     Table, Workbook, Xf, cell_name, classify_builtin, classify_format_code, is_array_f,
@@ -2940,7 +2940,7 @@ fn parse_worksheet_with(
         }
         let dr = row as i64 - *mr as i64;
         let dc = col as i64 - *mc as i64;
-        let translated = translate_formula(src, dr, dc);
+        let translated = translate_formula_spaced(src, dr, dc);
         if let Some(cell) = sheet.cells.get_mut(&(row, col)) {
             match &translated {
                 Some(f) => {
@@ -3305,6 +3305,23 @@ fn saved_formula<'a>(cell: &Cell, src: &'a str) -> Cow<'a, str> {
         Some(l) if l == src => Cow::Borrowed(src),
         _ => file_formula(src),
     }
+}
+
+/// Does the `<f ...>text</f>` in `f_xml` have XML whitespace (a CR is written
+/// as `&#13;`) at either end of its text, with no `xml:space` of its own?
+fn f_text_needs_preserve(f_xml: &str) -> bool {
+    let Some((open, rest)) = f_xml.split_once('>') else {
+        return false;
+    };
+    let Some(text) = rest.strip_suffix("</f>") else {
+        return false;
+    };
+    let space = |c: char| matches!(c, ' ' | '\t' | '\n');
+    !open.contains(" xml:space=")
+        && (text.starts_with(space)
+            || text.ends_with(space)
+            || text.starts_with("&#13;")
+            || text.ends_with("&#13;"))
 }
 
 /// The `<f>` the parser is on, its attributes re-serialised verbatim.
@@ -4695,6 +4712,12 @@ fn cell_xml(
                 }
             }
         }
+    }
+
+    // A reader trims the XML whitespace around an element's text unless told
+    // to keep it: a formula typed with a space at either end says so.
+    if f_xml.starts_with("<f") && f_text_needs_preserve(&f_xml) {
+        f_xml.insert_str(2, " xml:space=\"preserve\"");
     }
 
     // Schema order after `t`: cm, vm, ph. `cm` marks a dynamic array, so it
@@ -14903,6 +14926,101 @@ b",
             let cell = pkg.workbook.sheets[0].cell(0, c).unwrap();
             assert!(cell.meta.as_ref().is_none_or(|m| m.loaded_f.is_none()));
         }
+    }
+
+    fn formula_at(pkg: &SheetPackage, row: u32, col: u32) -> String {
+        pkg.workbook.sheets[0]
+            .cell(row, col)
+            .and_then(|c| c.formula.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn an_unedited_save_keeps_the_spacing_typed_in_a_plain_formula() {
+        // #1155: Excel keeps the whitespace a person typed inside a formula.
+        let rows = concat!(
+            r#"<row r="1"><c r="C1"><f>IF($A7 = $F7, TRUE, FALSE)</f><v>1</v></c>"#,
+            r#"<c r="D1"><f>AGGREGATE( L$14,$A25,$C$1:$C$11)</f><v>1</v></c>"#,
+            r#"<c r="E1"><f xml:space="preserve"> Sheet!A1</f><v>1</v></c></row>"#,
+        );
+        let (re, ws) = resaved(&book_with_rows(rows));
+        assert!(ws.contains("<f>IF($A7 = $F7, TRUE, FALSE)</f>"), "{ws}");
+        assert!(
+            ws.contains("<f>AGGREGATE( L$14,$A25,$C$1:$C$11)</f>"),
+            "{ws}"
+        );
+        assert_eq!(formula_at(&re, 0, 4), " Sheet!A1");
+    }
+
+    #[test]
+    fn a_shared_follower_keeps_the_spacing_of_its_master() {
+        let rows = concat!(
+            r#"<row r="3"><c r="G3"><f t="shared" ref="G3:G5" si="0">IF($A3 = $F3, TRUE, FALSE)</f><v>1</v></c></row>"#,
+            r#"<row r="4"><c r="G4"><f t="shared" si="0"/><v>1</v></c></row>"#,
+            r#"<row r="5"><c r="G5"><f t="shared" si="0"/><v>1</v></c></row>"#,
+        );
+        let pkg = book_with_rows(rows);
+        assert_eq!(formula_at(&pkg, 4, 6), "IF($A5 = $F5, TRUE, FALSE)");
+        let (re, ws) = resaved(&pkg);
+        assert!(ws.contains("<f>IF($A5 = $F5, TRUE, FALSE)</f>"), "{ws}");
+        assert_eq!(formula_at(&re, 3, 6), "IF($A4 = $F4, TRUE, FALSE)");
+    }
+
+    #[test]
+    fn a_prefixed_shared_master_gives_spaced_followers_and_saves_the_prefix() {
+        // forcepoint97: `_xlfn.AGGREGATE( C$14,...)`, relative column shifts.
+        let rows = concat!(
+            r#"<row r="17"><c r="C17"><f t="shared" ref="C17:D17" si="3">_xlfn.AGGREGATE( C$14,$A17,$C$1:$C$11)</f><v>1</v></c>"#,
+            r#"<c r="D17"><f t="shared" si="3"/><v>1</v></c></row>"#,
+        );
+        let pkg = book_with_rows(rows);
+        assert_eq!(formula_at(&pkg, 16, 3), "AGGREGATE( D$14,$A17,$C$1:$C$11)");
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains("<f>_xlfn.AGGREGATE( D$14,$A17,$C$1:$C$11)</f>"),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn a_follower_whose_texts_do_not_align_is_the_printed_text() {
+        // The printer drops the redundant parentheses: no alignment, so the
+        // follower is what it was before spacing was kept.
+        let rows = concat!(
+            r#"<row r="2"><c r="B2"><f t="shared" ref="B2:B3" si="0">(A1) + 2</f><v>1</v></c></row>"#,
+            r#"<row r="3"><c r="B3"><f t="shared" si="0"/><v>1</v></c></row>"#,
+        );
+        let pkg = book_with_rows(rows);
+        assert_eq!(
+            formula_at(&pkg, 2, 1),
+            crate::formula::translate_formula("(A1) + 2", 1, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_formula_with_an_outer_space_is_saved_with_xml_space_preserve() {
+        let rows = concat!(
+            r#"<row r="1"><c r="C1"><f xml:space="preserve"> Sheet!A1</f><v>1</v></c>"#,
+            r#"<c r="D1"><f xml:space="preserve">A1+1 </f><v>1</v></c>"#,
+            r#"<c r="E1"><f>A1 + 1</f><v>1</v></c>"#,
+            r#"<c r="F1"><f t="array" ref="F1" xml:space="preserve"> 1+1</f><v>2</v></c></row>"#,
+        );
+        let (re, ws) = resaved(&book_with_rows(rows));
+        assert!(
+            ws.contains(r#"<f xml:space="preserve"> Sheet!A1</f>"#),
+            "{ws}"
+        );
+        // An array `<f>` keeps its raw attributes: the attribute is not doubled.
+        let array_f = &ws[ws.find(r#"<c r="F1""#).unwrap()..];
+        let array_f = &array_f[..array_f.find("</f>").unwrap()];
+        assert_eq!(array_f.matches("xml:space").count(), 1, "{ws}");
+        assert!(ws.contains(r#"<f xml:space="preserve">A1+1 </f>"#), "{ws}");
+        assert!(ws.contains("<f>A1 + 1</f>"), "{ws}");
+        assert_eq!(formula_at(&re, 0, 2), " Sheet!A1");
+        assert_eq!(formula_at(&re, 0, 3), "A1+1 ");
+        // A second save is stable and never doubles the attribute.
+        let (_, ws2) = resaved(&re);
+        assert_eq!(ws2.matches("xml:space").count(), 3, "{ws2}");
     }
 
     #[test]

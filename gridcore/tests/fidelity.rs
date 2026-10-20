@@ -51,7 +51,7 @@ const CLASSES: &[LossClass] = &[
         matches: |e| e.kind == Kind::LoadError && e.file.ends_with("/forcepoint107.xlsx"),
     },
     LossClass {
-        name: "formula text is re-serialized (spaces dropped, names upper-cased, _xlfn. \
+        name: "formula text is re-serialized (spaces dropped when a formula is reprinted, names upper-cased, _xlfn. \
                added to newer functions; the sheet check finds the same formula \
                otherwise): one entry per cell",
         issue: "#1096",
