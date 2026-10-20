@@ -1267,3 +1267,27 @@ fn switching_to_notes_moves_the_focus_off_the_top_row() {
     assert_eq!(d.value("name"), Some(&Value::Text("Second".into())));
     assert_eq!(d.value("notes"), Some(&Value::Text("x".into())));
 }
+
+/// Notes -> click Name -> General: the top-row Name is on the first page too,
+/// so it keeps the focus and what was typed in it (#1314).
+#[test]
+fn going_back_to_the_first_page_keeps_the_top_row_focus() {
+    let t = tab();
+    let d = task_info_dialog(&v(&t).ed, 2, InfoPage::Notes).unwrap();
+    let mut stack = crate::dialog::DialogStack::default();
+    stack.push(d);
+    let name = stack
+        .top()
+        .unwrap()
+        .controls
+        .iter()
+        .position(|c| c.name == "name")
+        .unwrap();
+    let d = stack.top_dialog_mut().unwrap();
+    d.click_control(name, None).unwrap();
+    d.type_char('!').unwrap();
+    stack.select_tab("General").unwrap();
+    let d = stack.top().unwrap();
+    assert_eq!(d.focused().map(|c| c.name), Some("name"));
+    assert_eq!(d.value("name"), Some(&Value::Text("Second!".into())));
+}

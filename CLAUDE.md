@@ -224,7 +224,12 @@
   dialog; message boxes, modeless, popup and plugin dialogs and a dialog built
   with a focus are left as they are), and `Dialog::focus_step` (open, Tab,
   Shift+Tab) selects a single-line field's whole value, so typing replaces it
-  as in Word; a click places the caret (#1314). A generated "focus by click" /
+  as in Word; a click places the caret (#1314). A dialog opened on a later
+  page focuses that page's own first control (`focus_own_page`) ahead of the
+  top-row ones that belong to every page, and a tab switch from a top-row
+  control does the same (the first page keeps it); only Task Information's
+  Notes (`Control::append_on_open`) opens with the caret at the end to append,
+  the others select. A generated "focus by click" /
   "focus by Tab" case first moves the focus to a neighbour field
   (`cases.rs` `tab_start`: a typed, dropdown or list neighbour shown by the same
   prep, or the control an entry names with `Field::leave`), as the field may
