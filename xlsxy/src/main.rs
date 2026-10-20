@@ -1978,8 +1978,9 @@ struct WbSnapshot {
 }
 
 /// A change to the pending copy that undo or redo replays: the copy is
-/// replaced (when none is pending or the pending one has the same source) or
-/// dropped (when the pending one has this sheet, origin and span).
+/// replaced (when the pending one has the same source, or none is pending and
+/// the text clipboard is still what the step saw) or dropped (when the
+/// pending one has this sheet, origin and span).
 #[derive(Clone)]
 enum ClipEdit {
     /// The copy, and the text clipboard when the step saw it.
@@ -4278,10 +4279,15 @@ impl App {
         // A copy taken after the step names the tables as they are now: it
         // follows the way back like the cells do. The copy the step itself
         // found or left is then put back as it was (`clip_edit`).
-        let current = self.wb_snapshot();
+        let current = (self.clip.is_some() && !snap.resize).then(|| self.wb_snapshot());
         self.put_back(snap);
-        if !snap.resize {
-            self.rewrite_clip(&column_changes(&current, snap));
+        if let Some(current) = current {
+            // Renames and column deletes only: a copy naming a table the
+            // replay removes is left alone, as the step's own `clip_edit`
+            // handles the drop (and its undo).
+            let mut changes = column_changes(&current, snap);
+            changes.retain(|c| c.removed.is_none());
+            self.rewrite_clip(&changes);
         }
         if let Some((old, new)) = &snap.model_rename {
             self.rename_table_in_model(old, new);
@@ -19805,7 +19811,7 @@ mod tests {
 
     #[test]
     fn undo_and_redo_keep_a_newer_text_field_copy_991() {
-        // Copy, rename a header, Ctrl+C in a text field, then Undo and Redo.
+        // Undo: copy, rename a header, Ctrl+C in a text field, Undo, paste.
         let mut app = header_app();
         clip_range(&mut app, (0, 3), (0, 3), false);
         app.apply_on(0, vec![(0, 1, parse_input("Units"))]);
@@ -19817,9 +19823,18 @@ mod tests {
         let v = app.pkg.workbook.sheets[0].cell(4, 3).unwrap();
         assert_eq!(v.value, CellValue::Text("field text".into()));
         assert!(v.formula.is_none());
+        // Redo, with nothing between that ends the redo stack.
+        let mut app = header_app();
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.apply_on(0, vec![(0, 1, parse_input("Units"))]);
+        app.undo();
         app.field_copy("again", false);
         app.redo();
         assert!(app.clip.is_none());
+        app.cur = (4, 3);
+        app.paste();
+        let v = app.pkg.workbook.sheets[0].cell(4, 3).unwrap();
+        assert_eq!(v.value, CellValue::Text("again".into()));
         // A copy dropped by a table-removing step, then a field copy.
         let mut app = header_app();
         clip_range(&mut app, (0, 3), (0, 3), false);
@@ -19830,6 +19845,40 @@ mod tests {
         app.field_copy("field text", false);
         app.undo();
         assert!(app.clip.is_none());
+    }
+
+    #[test]
+    fn a_replay_that_removes_a_table_never_drops_a_newer_copy_991() {
+        // Delete A:B (Sales goes), undo, copy D1, redo, undo, paste.
+        let mut app = header_app();
+        app.cur = (0, 0);
+        app.anchor = Some((0, 1));
+        app.col_op(false);
+        app.undo();
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.redo();
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Qty])"));
+        app.undo();
+        app.cur = (4, 3);
+        app.anchor = None;
+        app.paste();
+        let f = app.pkg.workbook.sheets[0].cell(4, 3).unwrap();
+        assert_eq!(f.formula.as_deref(), Some("SUM(Sales[Qty])"));
+        // Another copy before the step, this one after the undo.
+        let mut app = header_app();
+        clip_range(&mut app, (0, 0), (0, 0), false);
+        app.cur = (0, 0);
+        app.anchor = Some((0, 1));
+        app.col_op(false);
+        app.undo();
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.redo();
+        app.undo();
+        app.cur = (4, 3);
+        app.anchor = None;
+        app.paste();
+        let f = app.pkg.workbook.sheets[0].cell(4, 3).unwrap();
+        assert_eq!(f.formula.as_deref(), Some("SUM(Sales[Qty])"));
     }
 
     #[test]
