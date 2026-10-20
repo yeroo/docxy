@@ -14628,7 +14628,7 @@ b",
 
     /// A one-sheet workbook with the standard dynamic-array `xl/metadata.xml`
     /// (`cm="1"` is XLDAPR `fDynamic`); `rows` is the `<sheetData>` content.
-    fn cell_meta_fixture(rows: &str) -> Vec<u8> {
+    pub(super) fn cell_meta_fixture(rows: &str) -> Vec<u8> {
         let sheet = format!(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{rows}</sheetData></worksheet>"#
@@ -24525,6 +24525,41 @@ mod table_command_tests {
             saved.contains("<totalsRowFormula>COUNTA(#REF!)+SUM(Table1[Qty])</totalsRowFormula>"),
             "{saved}"
         );
+    }
+
+    /// #991 p7: a shared group over a structured reference is expanded into
+    /// plain formulas by the load (only a group whose master does not parse
+    /// keeps its marker, and no rewrite can read that text), so a table
+    /// rename, a header rename and a column delete reach every cell of it.
+    #[test]
+    fn a_shared_group_over_a_table_follows_renames_and_deletes() {
+        let rows = concat!(
+            r#"<row r="1"><c r="D1"><f t="shared" ref="D1:D3" si="0">SUM(Table1[Qty])+ROW()</f><v>0</v></c></row>"#,
+            r#"<row r="2"><c r="D2"><f t="shared" si="0"/><v>0</v></c></row>"#,
+            r#"<row r="3"><c r="D3"><f t="shared" si="0"/><v>0</v></c></row>"#,
+        );
+        let mut pkg = load_xlsx(&super::tests::cell_meta_fixture(rows)).unwrap();
+        let s = &mut pkg.workbook.sheets[0];
+        s.set_cell(0, 0, Cell::text("Item"));
+        s.set_cell(0, 1, Cell::text("Qty"));
+        pkg.add_table(0, (0, 0, 2, 1), true, "TableStyleMedium2")
+            .unwrap();
+        let f = |pkg: &SheetPackage, r, c| {
+            let c = pkg.workbook.sheets[0].cell(r, c).unwrap();
+            assert!(c.f_attrs.is_none(), "expanded at load");
+            c.formula.clone().unwrap()
+        };
+        assert_eq!(f(&pkg, 2, 3), "SUM(Table1[Qty])+ROW()");
+        crate::edit::rename_table(&mut pkg.workbook, "Table1", "Sales").unwrap();
+        pkg.workbook.sheets[0].set_cell(0, 1, Cell::text("Units"));
+        crate::edit::sync_table_headers(&mut pkg.workbook, 0, &[(0, 1)]);
+        for r in 0..3 {
+            assert_eq!(f(&pkg, r, 3), "SUM(Sales[Units])+ROW()");
+        }
+        crate::edit::delete_cols(&mut pkg.workbook, 0, 1, 1);
+        for r in 0..3 {
+            assert!(f(&pkg, r, 2).contains("#REF!"), "{}", f(&pkg, r, 2));
+        }
     }
 
     #[test]
