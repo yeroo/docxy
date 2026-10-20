@@ -65,6 +65,12 @@ to switch a task between Manually and Auto Scheduled: a task that becomes manual
 is pinned at its shown start and finish, one that becomes auto is placed by its
 links and constraints again. It may be combined with `name`, `duration` and
 `level` in one undo step; every task in `task.list`/`task.get` reports `manual`.
+`task.set` takes `start` and `finish` (#1570) as typed in the Start and Finish
+cells: `YYYY-MM-DD` (the task calendar's first working time for a start, its
+last for a finish) or `YYYY-MM-DDTHH:MM`. An auto task gains a Start or Finish
+No Earlier Than constraint, a manual one is pinned; both on an auto task, or
+either on an auto summary, are refused. They apply after `manual` and before a
+given `constraint`.
 `task.set` also takes the Task Information dialog's fields (#1550):
 `percent_complete` (0 to 100), `priority` (0 to 1000), `deadline` (a date or
 `null`), `constraint` (`{"type": "FNLT", "date": "2026-03-04"}`, the type by its
