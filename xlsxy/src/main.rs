@@ -4109,7 +4109,7 @@ impl App {
             ClipEdit::Set(c, text) => {
                 let key = (c.sheet, c.from, c.span);
                 let fits = match &self.clip {
-                    Some(cur) => same(cur, key),
+                    Some(cur) => same(cur, key) && self.clip_text == *text,
                     None => self.clip_text == *text,
                 };
                 if fits {
@@ -19916,6 +19916,33 @@ mod tests {
         assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Qty])"));
         app.redo();
         assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Units])"));
+    }
+
+    #[test]
+    fn undo_keeps_a_newer_copy_of_the_same_range_991() {
+        // Copy D1, delete column B (E1's "hello" shifts into D1), copy D1
+        // again, undo: the newer copy stays and pastes.
+        let mut app = header_app();
+        app.apply_on(0, vec![(0, 4, parse_input("hello"))]);
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.cur = (0, 1);
+        app.anchor = None;
+        app.col_op(false);
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        assert_eq!(
+            app.clip.as_ref().unwrap().cells[0][0]
+                .as_ref()
+                .unwrap()
+                .value,
+            CellValue::Text("hello".into())
+        );
+        app.undo();
+        app.cur = (4, 3);
+        app.anchor = None;
+        app.paste();
+        let v = app.pkg.workbook.sheets[0].cell(4, 3).unwrap();
+        assert_eq!(v.value, CellValue::Text("hello".into()));
+        assert!(v.formula.is_none());
     }
 
     #[test]

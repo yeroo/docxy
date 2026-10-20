@@ -2135,7 +2135,8 @@ pub struct Workbook {
     pub defined_names: Vec<DefinedName>,
     pub tables: Vec<Table>,
     /// Tables converted to a range ([`crate::edit::convert_table_to_range`])
-    /// or deleted with all their columns ([`crate::edit::delete_cols`]) whose
+    /// or deleted (all their columns, their whole range or their header
+    /// row: [`crate::edit::delete_cols`], [`crate::edit::delete_rows`]) whose
     /// parts are still in the package: a save drops each part that no
     /// table in [`Self::tables`] uses any more, together with its
     /// relationship, `<tablePart>` and content type. Only parts named here

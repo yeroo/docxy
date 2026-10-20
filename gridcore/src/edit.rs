@@ -1678,7 +1678,8 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
             if nc2 < MAX_COLS as i64 {
                 t.range = (r1, (c1 as i64 + d) as u32, r2, nc2 as u32);
             }
-        } else if shift.at <= c2 {
+        } else if shift.at <= c2 && t.columns.len() == (c2 - c1 + 1) as usize {
+            // (A part whose `ref` is wider than its columns is left alone.)
             let nc2 = c2 as i64 + shift.delta;
             if nc2 < MAX_COLS as i64 {
                 t.range = (r1, c1, r2, nc2 as u32);
@@ -1777,8 +1778,8 @@ fn shift_calculated_formulas(
 
 /// Delete table `i`: every reference to it goes `#REF!`, in the cells and,
 /// at the next save, in the other table parts' column formulas, and its part
-/// leaves the file then (the table is kept in [`Workbook::removed_tables`]
-/// until, marked deleted).
+/// leaves the file then (the table is kept in [`Workbook::removed_tables`],
+/// marked deleted, until a save drops its part).
 fn delete_table(wb: &mut Workbook, i: usize) {
     let t = wb.tables[i].clone();
     rewrite_workbook_formulas(
@@ -5100,6 +5101,16 @@ mod table_tests {
         assert_eq!(header(3), CellValue::Text("Qty".into()));
         assert_eq!(formula(&wb, 0, "H1"), "SUM(Sales[Qty])");
         assert_eq!(value(&mut wb, 0, "H1"), CellValue::Number(12.0));
+    }
+
+    #[test]
+    fn column_insert_in_a_table_wider_than_its_columns_leaves_it_alone_991() {
+        // A part whose `ref` is wider than its tableColumn list.
+        let mut wb = sales();
+        wb.tables[0].columns.truncate(2);
+        insert_cols(&mut wb, 0, 2, 1); // inside A:C, past the two columns
+        assert_eq!(wb.tables[0].range, (0, 0, 3, 2));
+        assert_eq!(wb.tables[0].columns.len(), 2);
     }
 
     #[test]

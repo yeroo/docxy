@@ -7903,9 +7903,10 @@ struct ColumnDeletes {
 
 /// The formulas a table part holds in its columns (`calculatedColumnFormula`,
 /// `totalsRowFormula`) with table columns renamed (`columns`: qualified
-/// references in every part, unqualified ones in the table's own), tables
-/// renamed (`renames`, old → new, applied at once) and converted tables'
-/// references turned into cells. `own_sheet` and `own_part` are the sheet
+/// references in every part, unqualified ones in the table's own), deleted
+/// columns' references `#REF!` (`deletes`), tables renamed (`renames`, old →
+/// new, applied at once), and removed tables' references: a deleted table's
+/// `#REF!`, a converted one's turned into cells. `own_sheet` and `own_part` are the sheet
 /// and part of the table whose part this is. A formula that doesn't parse,
 /// or that nothing touches, keeps its text.
 fn rewrite_column_formulas(
@@ -8198,8 +8199,8 @@ fn part_column_names(t: &Table, xml: &str) -> Vec<String> {
 /// and columns (renamed ones by id, deleted ones dropped), the column
 /// formulas of every part (renamed tables and columns, deleted columns,
 /// converted tables),
-/// and the parts of tables converted to a range or deleted with all their
-/// columns dropped.
+/// and the parts of tables converted to a range or deleted (all their
+/// columns, their whole range or their header row) dropped.
 fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
     let part_xml = |parts: &[(String, Vec<u8>)], name: &str| {
         parts
