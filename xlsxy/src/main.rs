@@ -19578,6 +19578,193 @@ mod tests {
         assert_eq!(header_state(&app).2, "SUM(Sales[Units1])");
     }
 
+    /// #991 r1: `Sales` over A1:B3 (Id, Qty) and `Costs` over F1:G3 (Id,
+    /// Cost), a measure over both and a relationship between them.
+    fn two_table_app() -> App {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        let sh = &mut app.pkg.workbook.sheets[0];
+        for (c, h) in [(0, "Id"), (1, "Qty"), (5, "Id"), (6, "Cost")] {
+            sh.set_cell(0, c, Cell::text(h));
+            sh.set_cell(1, c, Cell::number(1.0));
+            sh.set_cell(2, c, Cell::number(2.0));
+        }
+        app.pkg
+            .add_table(0, (0, 0, 2, 1), true, "TableStyleMedium2")
+            .unwrap();
+        app.pkg
+            .add_table(0, (0, 5, 2, 6), true, "TableStyleMedium2")
+            .unwrap();
+        gridcore::edit::rename_table(&mut app.pkg.workbook, "Table1", "Sales").unwrap();
+        gridcore::edit::rename_table(&mut app.pkg.workbook, "Table2", "Costs").unwrap();
+        app.rebuild_engine();
+        app.model_measures.push(gridcore::model::Measure {
+            name: "Both".into(),
+            formula: "SUM(Sales[Qty])+SUM(Costs[Cost])+COUNTA(Sales[Id])".into(),
+        });
+        app.model_rels.push(Relationship {
+            from: ("Sales".into(), "Id".into()),
+            to: ("Costs".into(), "Id".into()),
+        });
+        app
+    }
+
+    #[test]
+    fn one_step_over_two_tables_rewrites_the_model_through_both_991() {
+        let mut app = two_table_app();
+        app.replace_all("Id", "Key"); // both headers
+        assert_eq!(app.pkg.workbook.tables[0].columns, ["Key", "Qty"]);
+        assert_eq!(app.pkg.workbook.tables[1].columns, ["Key", "Cost"]);
+        assert_eq!(app.model_rels[0].from, ("Sales".into(), "Key".into()));
+        assert_eq!(app.model_rels[0].to, ("Costs".into(), "Key".into()));
+        assert_eq!(
+            app.model_measures[0].formula,
+            "SUM(Sales[Qty])+SUM(Costs[Cost])+COUNTA(Sales[Key])"
+        );
+        app.undo();
+        assert_eq!(app.model_rels[0].to.1, "Id");
+        assert_eq!(app.model_rels[0].from.1, "Id");
+        assert!(app.model_measures[0].formula.ends_with("COUNTA(Sales[Id])"));
+        app.redo();
+        assert_eq!(app.model_rels[0].to.1, "Key");
+        assert_eq!(app.model_rels[0].from.1, "Key");
+    }
+
+    #[test]
+    fn a_delete_over_two_tables_rewrites_the_model_through_both_991() {
+        let mut app = two_table_app();
+        // B:G: Sales loses Qty, Costs loses everything but the F column's Id.
+        app.cur = (0, 1);
+        app.anchor = Some((0, 6));
+        app.col_op(false);
+        let f = app.model_measures[0].formula.clone();
+        assert!(!f.contains("Qty") && !f.contains("Cost"), "{f}");
+        assert_eq!(f.matches("#REF!").count(), 2, "{f}");
+        app.undo();
+        assert_eq!(
+            app.model_measures[0].formula,
+            "SUM(Sales[Qty])+SUM(Costs[Cost])+COUNTA(Sales[Id])"
+        );
+        assert_eq!(app.model_rels[0].to, ("Costs".into(), "Id".into()));
+    }
+
+    #[test]
+    fn deleting_a_table_whole_reaches_the_model_and_undo_restores_it_991() {
+        let mut app = two_table_app();
+        app.cur = (0, 0);
+        app.anchor = Some((2, 0));
+        app.row_op(false); // rows 1-3: both tables whole
+        assert!(app.pkg.workbook.tables.is_empty());
+        let f = app.model_measures[0].formula.clone();
+        assert!(!f.contains("Sales[") && !f.contains("Costs["), "{f}");
+        assert_eq!(app.model_rels[0].from.1, "#REF!");
+        assert_eq!(app.model_rels[0].to.1, "#REF!");
+        app.undo();
+        assert_eq!(
+            app.model_measures[0].formula,
+            "SUM(Sales[Qty])+SUM(Costs[Cost])+COUNTA(Sales[Id])"
+        );
+        assert_eq!(app.model_rels[0].from, ("Sales".into(), "Id".into()));
+        app.redo();
+        assert_eq!(app.model_rels[0].to.1, "#REF!");
+    }
+
+    #[test]
+    fn resize_table_leaves_the_model_and_the_clip_alone_991() {
+        let mut app = two_table_app();
+        app.apply_on(0, vec![(5, 3, parse_input("=SUM(Sales[Qty])"))]);
+        clip_range(&mut app, (5, 3), (5, 3), false);
+        // A:B -> B:C: Id leaves, a new column comes.
+        app.resize_table("Sales", "B1:C3").unwrap();
+        assert_eq!(app.pkg.workbook.tables[0].columns[0], "Qty");
+        assert_eq!(
+            app.model_measures[0].formula,
+            "SUM(Sales[Qty])+SUM(Costs[Cost])+COUNTA(Sales[Id])"
+        );
+        assert_eq!(app.model_rels[0].from, ("Sales".into(), "Id".into()));
+        let f = app.clip.as_ref().unwrap().cells[0][0]
+            .as_ref()
+            .unwrap()
+            .formula
+            .clone();
+        assert_eq!(f.as_deref(), Some("SUM(Sales[Qty])"));
+    }
+
+    #[test]
+    fn undoing_a_table_delete_makes_its_pivot_refreshable_again_991() {
+        let mut app = header_app();
+        let frame = gridcore::frame::Frame::from_range(&app.pkg.workbook, 0, (0, 0, 2, 1));
+        let dest = app.pkg.add_sheet("Pivot");
+        app.pkg
+            .add_pivot(
+                gridcore::pivot::PivotSource::Table("Sales".into()),
+                frame.names.clone(),
+                gridcore::pivot::DataField {
+                    name: "Sum of Qty".into(),
+                    field: 1,
+                    agg: gridcore::frame::Agg::Sum,
+                },
+                dest,
+                (2, 0),
+            )
+            .unwrap();
+        app.rebuild_engine();
+        app.sheet = 0;
+        app.cur = (0, 0);
+        app.anchor = Some((2, 0));
+        app.row_op(false); // the table's whole range
+        assert!(app.pkg.workbook.tables.is_empty());
+        assert!(app.pkg.workbook.pivots[0].unsupported);
+        app.undo();
+        assert_eq!(app.pkg.workbook.tables.len(), 1);
+        assert!(!app.pkg.workbook.pivots[0].unsupported);
+        app.redo();
+        assert!(app.pkg.workbook.pivots[0].unsupported);
+    }
+
+    fn clip_formula(app: &App) -> Option<String> {
+        app.clip.as_ref()?.cells[0][0].as_ref()?.formula.clone()
+    }
+
+    #[test]
+    fn undo_and_redo_put_the_pending_copy_back_991() {
+        let mut app = header_app();
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.apply_on(0, vec![(0, 1, parse_input("Units"))]);
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Units])"));
+        app.undo();
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Qty])"));
+        app.redo();
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Units])"));
+        app.undo();
+        app.cur = (4, 3);
+        app.paste();
+        let f = app.pkg.workbook.sheets[0].cell(4, 3).unwrap();
+        assert_eq!(f.formula.as_deref(), Some("SUM(Sales[Qty])"));
+    }
+
+    #[test]
+    fn undo_of_a_column_delete_restores_the_pending_copy_991() {
+        let mut app = header_app();
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.cur = (0, 1);
+        app.anchor = None;
+        app.col_op(false); // Qty
+        assert!(clip_formula(&app).unwrap().contains("#REF!"));
+        app.undo();
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Qty])"));
+        // Every column: the copy is dropped, and undo brings it back.
+        app.cur = (0, 0);
+        app.anchor = Some((0, 1));
+        app.col_op(false);
+        assert!(app.clip.is_none());
+        app.undo();
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Qty])"));
+        assert!(!app.clip.as_ref().unwrap().cut);
+        app.redo();
+        assert!(app.clip.is_none());
+    }
+
     #[test]
     fn text_to_columns_over_a_header_renames_the_columns_683() {
         // A1 `Item;Units` split on `;` writes B1, the Qty header.
