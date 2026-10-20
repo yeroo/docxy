@@ -18,7 +18,7 @@
 //! | `task.list` | `{fields?}` | `{count, tasks:[{uid, id, outline_number, name, level, manual, duration, start, finish, critical, …}]}` |
 //! | `task.get` | `{uid, fields?}` | one task |
 //! | `task.fields` | — | `{count, fields:[name…]}`: the field names `fields` can read |
-//! | `task.set` | `{uid, name?, duration?, level?, manual?, start?, finish?, percent_complete?, actual_start?, actual_finish?, actual_duration?, remaining_duration?, priority?, deadline?, constraint?, task_type?, effort_driven?, notes?, milestone?, calendar?, ignore_resource_calendar?, wbs?, earned_value_method?, custom?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled). The Task Information fields (#1550): `start` and `finish` (#1570) are set as typed in the Start and Finish cells: `YYYY-MM-DD` (the task calendar's first working time for a start, its last for a finish) or `YYYY-MM-DDTHH:MM`; an auto task gains a Start or Finish No Earlier Than constraint, a manual one is pinned (keeping its duration for a start, the duration following a finish), after `manual`, `duration`, `milestone` and the calendar are applied, and before the actuals and a given `constraint`; both on an auto task, or either on an auto summary, are refused, and `null` is not accepted. `percent_complete` 0–100, the Update Tasks fields (#1568) `actual_start` / `actual_finish` (a date as for `deadline`, an actual start taking the day's first working time and a finish its last, or `null` to clear) and `actual_duration` / `remaining_duration` (durations: setting one adjusts % Complete, the remaining duration also the task's duration; an actual finish completes the task; a `percent_complete` given with an actual finish date, `actual_duration` or `remaining_duration` must equal the % they make or is refused, and with only `actual_start` or a cleared finish it applies after them, a started task getting that share as its actual duration; a `duration` given with `remaining_duration` must equal the actual plus the remaining), `priority` 0–1000, `deadline` a date (`YYYY-MM-DD`, the day's last working time, or `YYYY-MM-DDTHH:MM`) or `null`, `constraint` `{type, date?}` with the type `ASAP`/`ALAP`/`MSO`/`MFO`/`SNET`/`SNLT`/`FNET`/`FNLT`, `task_type` `fixed-units`/`fixed-duration`/`fixed-work`, `effort_driven` and `milestone` booleans, `notes` text (`\n` line breaks), `calendar` a base calendar's name or uid or `null`, `ignore_resource_calendar` a boolean, `wbs` text, `earned_value_method` `percent-complete`/`physical-percent-complete`. `custom` (#1554) is an object of Project custom field names to values as typed in the cell (`{"Text1": "Civil", "Flag3": true, "Date1": "2026-03-09", "Duration1": "3d", "Cost1": "$1,400", "Number1": null}`; `null` or `""` clears): the field needs a definition in the plan, a formula field is refused, a lookup-table field takes one of its values. Every argument is checked and all apply in one undo step, or none does |
+//! | `task.set` | `{uid, name?, duration?, level?, manual?, start?, finish?, percent_complete?, actual_start?, actual_finish?, actual_duration?, remaining_duration?, priority?, deadline?, constraint?, task_type?, effort_driven?, notes?, milestone?, calendar?, ignore_resource_calendar?, wbs?, earned_value_method?, custom?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled). The Task Information fields (#1550): `start` and `finish` (#1570) are set as typed in the Start and Finish cells: `YYYY-MM-DD` (the task calendar's first working time for a start, its last for a finish) or `YYYY-MM-DDTHH:MM`; an auto task gains a Start or Finish No Earlier Than constraint, a manual one is pinned (keeping its duration for a start, the duration following a finish), after `manual`, `duration`, `milestone` and the calendar are applied, and before the actuals and a given `constraint`; only these see the call's calendar, as a bare `actual_*`, `deadline` or `constraint.date` day resolves on the task's calendar before a `calendar` in the same call; both on an auto task, or either on an auto summary, are refused, and `null` is not accepted. `percent_complete` 0–100, the Update Tasks fields (#1568) `actual_start` / `actual_finish` (a date as for `deadline`, an actual start taking the day's first working time and a finish its last, or `null` to clear) and `actual_duration` / `remaining_duration` (durations: setting one adjusts % Complete, the remaining duration also the task's duration; an actual finish completes the task; a `percent_complete` given with an actual finish date, `actual_duration` or `remaining_duration` must equal the % they make or is refused, and with only `actual_start` or a cleared finish it applies after them, a started task getting that share as its actual duration; a `duration` given with `remaining_duration` must equal the actual plus the remaining), `priority` 0–1000, `deadline` a date (`YYYY-MM-DD`, the day's last working time, or `YYYY-MM-DDTHH:MM`) or `null`, `constraint` `{type, date?}` with the type `ASAP`/`ALAP`/`MSO`/`MFO`/`SNET`/`SNLT`/`FNET`/`FNLT`, `task_type` `fixed-units`/`fixed-duration`/`fixed-work`, `effort_driven` and `milestone` booleans, `notes` text (`\n` line breaks), `calendar` a base calendar's name or uid or `null`, `ignore_resource_calendar` a boolean, `wbs` text, `earned_value_method` `percent-complete`/`physical-percent-complete`. `custom` (#1554) is an object of Project custom field names to values as typed in the cell (`{"Text1": "Civil", "Flag3": true, "Date1": "2026-03-09", "Duration1": "3d", "Cost1": "$1,400", "Number1": null}`; `null` or `""` clears): the field needs a definition in the plan, a formula field is refused, a lookup-table field takes one of its values. Every argument is checked and all apply in one undo step, or none does |
 //! | `task.add` | `{after?, name?, duration?}` | the new task (without `duration`, 1 day, estimated when the plan's `NewTasksEstimated` is; inserted `after` a task that a finish-to-start link joins to the next, it is linked into that chain when the plan's `Autolink` is on, as it is by default) |
 //! | `task.del` | `{uid}` | `{deleted, removed:[uid…]}` (a summary takes its subtree) |
 //! | `link.add` | `{uid, pred, type?, lag?}` | the updated task (`lag` uses Predecessors cell spellings such as `4h`, `2ed`, `50%`; other duration spellings such as `1 month` are read as working-days lags) |
@@ -623,7 +623,8 @@ struct TaskInfoArgs {
     /// Start and Finish as typed in the cell (#1570): resolved by the
     /// editor's setters against the task as the call leaves it, applied after
     /// `manual`, `duration`, `milestone` and the calendar, before the actuals
-    /// and `constraint`.
+    /// and `constraint`. Bare days of the other date fields resolve on the
+    /// task's calendar before a `calendar` in the same call.
     start: Option<Typed>,
     finish: Option<Typed>,
     percent_complete: Option<i32>,
@@ -647,6 +648,13 @@ struct TaskInfoArgs {
     earned_value_method: Option<i32>,
     /// Custom fields by Project's name, as typed (#1554).
     custom: Vec<(Field, String)>,
+}
+
+/// `YYYY-MM-DDTHH:MM` as typed. `parse_mspdi` alone rolls 2026-02-30 over to
+/// March 2, so the date half must be a real calendar date.
+fn instant(text: &str) -> Option<DateTime> {
+    parse_cell_date(text.split_once('T')?.0).ok()?;
+    DateTime::parse_mspdi(text)
 }
 
 /// A typed Start or Finish: a bare day, which the cell's setter resolves to
@@ -724,7 +732,7 @@ impl TaskInfoArgs {
         let stamp = |key: &str, s: &str, ends_day: bool| -> Result<DateTime, String> {
             let bad = || format!("'{key}' must be a date, YYYY-MM-DD or YYYY-MM-DDTHH:MM");
             if s.contains('T') {
-                return DateTime::parse_mspdi(s).ok_or_else(bad);
+                return instant(s).ok_or_else(bad);
             }
             let day = parse_cell_date(s).map_err(|_| bad())?;
             Ok(if ends_day {
@@ -752,12 +760,8 @@ impl TaskInfoArgs {
             };
             let bad = || format!("'{key}' must be a date, YYYY-MM-DD or YYYY-MM-DDTHH:MM");
             let s = v.as_str().ok_or_else(bad)?.trim();
-            if let Some((day, _)) = s.split_once('T') {
-                // `parse_mspdi` rolls 2026-02-30 over to March 2.
-                parse_cell_date(day).map_err(|_| bad())?;
-                return DateTime::parse_mspdi(s)
-                    .map(|d| Some(Typed::At(d)))
-                    .ok_or_else(bad);
+            if s.contains('T') {
+                return instant(s).map(|d| Some(Typed::At(d))).ok_or_else(bad);
             }
             parse_cell_date(s)
                 .map(|d| Some(Typed::Day(d)))
@@ -905,27 +909,18 @@ impl TaskInfoArgs {
         })
     }
 
-    /// Apply the fields, in the dialog's order: type and effort driven
-    /// first (a resource added later rescales by them), the constraint after
-    /// the dates.
-    fn apply(&self, ed: &mut Editor, uid: i32) -> Result<(), String> {
-        if let Some(kind) = self.task_type {
-            ed.set_task_type(uid, kind)?;
-        }
-        if let Some(on) = self.effort_driven {
-            ed.set_effort_driven(uid, on)?;
-        }
-        if let Some(on) = self.milestone {
-            ed.set_milestone(uid, on)?;
-        }
+    fn apply_calendar(&self, ed: &mut Editor, uid: i32) -> Result<(), String> {
         if let Some(cal) = self.calendar {
             ed.set_task_calendar(uid, cal)?;
         }
         if let Some(on) = self.ignore_resource_calendar {
             ed.set_ignore_resource_calendar(uid, on)?;
         }
-        // Start and Finish, as the cell sets them, after `manual` and the
-        // calendar are applied.
+        Ok(())
+    }
+
+    /// Start and Finish, as the cell sets them.
+    fn apply_dates(&self, ed: &mut Editor, uid: i32) -> Result<(), String> {
         if self.start.is_some() || self.finish.is_some() {
             let task = ed
                 .project()
@@ -950,6 +945,32 @@ impl TaskInfoArgs {
             Some(Typed::Day(day)) => ed.set_finish(uid, day)?,
             Some(Typed::At(at)) => ed.set_finish_at(uid, at)?,
             None => {}
+        }
+        Ok(())
+    }
+
+    /// Apply the fields, in the dialog's order: type and effort driven
+    /// first (a resource added later rescales by them), the constraint after
+    /// the dates.
+    fn apply(&self, ed: &mut Editor, uid: i32) -> Result<(), String> {
+        if let Some(kind) = self.task_type {
+            ed.set_task_type(uid, kind)?;
+        }
+        if let Some(on) = self.effort_driven {
+            ed.set_effort_driven(uid, on)?;
+        }
+        if let Some(on) = self.milestone {
+            ed.set_milestone(uid, on)?;
+        }
+        // The calendar first, so a bare day resolves on the one the call ends
+        // with; a blank row has no properties until a date makes it a task.
+        let blank = ed.project().task(uid).is_some_and(|t| t.is_null);
+        if !blank {
+            self.apply_calendar(ed, uid)?;
+        }
+        self.apply_dates(ed, uid)?;
+        if blank {
+            self.apply_calendar(ed, uid)?;
         }
         // A finish, an actual duration or a remaining duration derive
         // % Complete; a start alone, or clearing the finish, leave it to
@@ -3656,6 +3677,54 @@ mod tests {
             t.constraint_date.map(|d| (d.parts().day, d.parts().hour)),
             Some((9, 10))
         );
+    }
+
+    #[test]
+    fn task_set_start_with_a_calendar_works_on_a_blank_row() {
+        let mut p = new_project();
+        p.tasks.push(Task {
+            uid: 2,
+            id: 2,
+            is_null: true,
+            ..Task::default()
+        });
+        let cal = p.calendars[0].uid;
+        let mut a = Editor::new(p);
+        let args = Json::obj(vec![
+            ("uid", Json::Num(2.0)),
+            ("start", Json::Str("2026-03-09".into())),
+            ("calendar", Json::Num(f64::from(cal))),
+        ]);
+        dispatch_editor(&mut a, "task.set", &args).unwrap().unwrap();
+        let t = a.project().task(2).unwrap();
+        assert!(!t.is_null);
+        assert_eq!(t.calendar_uid, Some(cal));
+        assert_eq!(t.constraint, ConstraintType::StartNoEarlierThan);
+    }
+
+    #[test]
+    fn task_set_refuses_an_impossible_date_in_every_instant() {
+        let mut a = app();
+        let before = a.project().clone();
+        for args in [
+            vec![("deadline", Json::Str("2026-02-30T10:00".into()))],
+            vec![("actual_start", Json::Str("2026-02-30T10:00".into()))],
+            vec![(
+                "constraint",
+                Json::obj(vec![
+                    ("type", Json::Str("SNET".into())),
+                    ("date", Json::Str("2026-02-30T10:00".into())),
+                ]),
+            )],
+        ] {
+            let mut all = vec![("uid", Json::Num(1.0))];
+            all.extend(args);
+            let err = dispatch_editor(&mut a, "task.set", &Json::obj(all))
+                .unwrap()
+                .unwrap_err();
+            assert!(err.contains("must be a date"), "{err}");
+            assert_eq!(*a.project(), before);
+        }
     }
 
     #[test]
