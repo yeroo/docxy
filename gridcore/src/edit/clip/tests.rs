@@ -198,6 +198,32 @@ fn a_move_to_another_sheet_qualifies_the_references_that_follow() {
 }
 
 #[test]
+fn move_refs_reports_whether_it_rewrote_a_formula() {
+    let mut wb = book(&[("Sheet1", &[("H1", f("A1+1")), ("H2", f("C1"))])]);
+    assert!(move_refs(&mut wb, 0, &cut_a1_b1_to_a10("Sheet1", "Sheet1")));
+    // Nothing reads the moved cells any more.
+    assert!(!move_refs(
+        &mut wb,
+        0,
+        &cut_a1_b1_to_a10("Sheet1", "Sheet1")
+    ));
+    let mut wb = book(&[("Sheet1", &[("H1", f("sum( c1 , 2 )"))])]);
+    assert!(!move_refs(
+        &mut wb,
+        0,
+        &cut_a1_b1_to_a10("Sheet1", "Sheet1")
+    ));
+    // A defined name alone counts.
+    let mut wb = book(&[("Sheet1", &[("H1", f("C1"))])]);
+    wb.defined_names.push(DefinedName {
+        name: "Base".into(),
+        scope: None,
+        formula: "Sheet1!$A$1".into(),
+    });
+    assert!(move_refs(&mut wb, 0, &cut_a1_b1_to_a10("Sheet1", "Sheet1")));
+}
+
+#[test]
 fn a_move_leaves_formulas_it_does_not_reach_byte_for_byte() {
     let mut wb = book(&[("Sheet1", &[("H1", f("sum( c1 , 2 )"))])]);
     move_refs(&mut wb, 0, &cut_a1_b1_to_a10("Sheet1", "Sheet1"));
