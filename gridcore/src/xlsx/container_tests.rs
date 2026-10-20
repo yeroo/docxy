@@ -256,6 +256,32 @@ fn latin1_sheet_text_survives_a_save() {
     latin1_round_trip(&pkg);
 }
 
+/// #1116: a part declaring windows-1252 keeps its euro sign and curly
+/// quotes (`0x80..0x9F`, which ISO-8859-1 proper has as controls) through a
+/// load and a save, which writes UTF-8.
+#[test]
+fn windows_1252_sheet_text_survives_a_save() {
+    let mut sheet = format!(
+        "<?xml version=\"1.0\" encoding=\"windows-1252\"?><worksheet xmlns=\"{SML}\"><sheetData><row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>"
+    )
+    .into_bytes();
+    sheet.extend_from_slice(b"\x80 \x93x\x94</t></is></c></row></sheetData></worksheet>");
+    let mut parts = package("\\");
+    for (name, bytes) in &mut parts {
+        if name == "xl\\sheet1.xml" {
+            *bytes = sheet.clone();
+        }
+    }
+    let pkg = load_xlsx(&write_zip(&parts)).expect("loads");
+    let text = CellValue::Text("\u{20ac} \u{201c}x\u{201d}".into());
+    assert_eq!(a1(&pkg), &text);
+    let saved = save_xlsx(&pkg);
+    let zip = ZipArchive::open(&saved).unwrap();
+    let sheet = String::from_utf8(zip.read("xl/sheet1.xml").unwrap()).expect("UTF-8");
+    assert!(!sheet.contains("1252"), "{sheet}");
+    assert_eq!(a1(&load_xlsx(&saved).expect("reloads")), &text);
+}
+
 /// The same through repair's own path: one entry damaged.
 #[test]
 fn latin1_sheet_text_survives_a_repair() {

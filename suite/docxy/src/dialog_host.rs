@@ -7,24 +7,98 @@ use crate::dialog::{self, ControlKind, Dialog, DialogOwner, DialogStack, NONE_OP
 use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Each list of the top dialog: its scroll, and the choice last scrolled to.
-pub(crate) type ListScrolls = std::collections::HashMap<
-    (&'static str, &'static str),
-    (UniformListScrollHandle, Option<usize>),
->;
+/// Each list of the top dialog, by the dialog's epoch and the control's
+/// name: its scroll, and the choice last scrolled to.
+pub(crate) type ListScrolls =
+    std::collections::HashMap<(u64, &'static str), (UniformListScrollHandle, Option<usize>)>;
 
-/// Forget every list but those of dialog `open` (none: all of them).
-fn prune_lists(lists: &mut ListScrolls, open: Option<&str>) {
-    lists.retain(|(id, _), _| Some(*id) == open);
+/// Each scrolling grid or filling multiline of the top dialog (#1609), by the
+/// dialog's epoch and the control's name: its scroll, the row (or caret
+/// line) last scrolled to, and the row height the offset counts in, so a
+/// read-back (`first_visible_row` / `first_visible_line`) divides by what
+/// the draw code laid out.
+pub(crate) type GridScrolls = std::collections::HashMap<(u64, &'static str), GridScroll>;
+
+/// A scrolling grid's or filling multiline's scroll, kept across frames
+/// (#1609).
+pub(crate) struct GridScroll {
+    handle: ScrollHandle,
+    /// The row last brought into view, with the mark that asked for it (a
+    /// grid's row again; a multiline's caret and the dialog's edit count).
+    seen: Option<(usize, u64)>,
+    /// The row height it was drawn with.
+    row_h: f32,
 }
 
-/// The scroll for list `name` of dialog `id`, kept across frames. When the
-/// choice is not the one last seen it is scrolled into view (only if it is
-/// out of it), so a key that moves it past the shown rows brings it back,
-/// while a wheel scroll that leaves the choice alone is not undone.
+/// The first row (or line) a scrolling control shows, from its handle's
+/// offset and the row height it was drawn with: the row nearest the top
+/// edge (#1609). `None` while the control has nothing to scroll (its
+/// content fits its box, as the handle's maximum offset after its last
+/// paint says), so a filling multiline whose lines fit reports no line.
+pub(crate) fn first_visible(entry: &GridScroll) -> Option<usize> {
+    (f32::from(entry.handle.max_offset().y) > 0.).then(|| {
+        (-f32::from(entry.handle.offset().y) / entry.row_h.max(1.))
+            .round()
+            .max(0.) as usize
+    })
+}
+
+/// The scroll for grid or multiline `name` of the dialog opening `epoch`,
+/// kept across frames; when `row` (the selected row, or the caret's line
+/// with the caret and edit count as its mark) is not the one last seen, the
+/// row is brought into view: the offset is set outright from the row height
+/// and the view's height (`view_h`, else the element's last bounds), the
+/// least that shows the row, as [`list_scroll`] does for a list. A wheel
+/// scroll that leaves the row and its mark alone is not undone; an edit on
+/// the line, the caret moved or not, brings the line back.
+fn grid_scroll(
+    grids: &mut GridScrolls,
+    key: (u64, &'static str),
+    row: Option<(usize, u64)>,
+    row_h: f32,
+    view_h: Option<f32>,
+) -> ScrollHandle {
+    let entry = grids.entry(key).or_insert_with(|| GridScroll {
+        handle: ScrollHandle::new(),
+        seen: None,
+        row_h,
+    });
+    entry.row_h = row_h;
+    if row != entry.seen {
+        if let Some((r, _)) = row {
+            let view = view_h
+                .unwrap_or_else(|| f32::from(entry.handle.bounds().size.height))
+                .max(row_h);
+            let shown = -f32::from(entry.handle.offset().y);
+            let (top, bottom) = (r as f32 * row_h, (r + 1) as f32 * row_h);
+            let next = if top < shown {
+                top
+            } else if bottom > shown + view {
+                bottom - view
+            } else {
+                shown
+            };
+            entry.handle.set_offset(point(px(0.), px(-next)));
+        }
+        entry.seen = row;
+    }
+    entry.handle.clone()
+}
+
+/// A 12 px text's estimated width from its character count, for the label
+/// columns and the grid columns alike (#1609).
+fn est_text_w(chars: usize) -> f32 {
+    chars as f32 * 7. + 12.
+}
+
+/// The scroll for list `name` of the dialog opening `epoch`, kept across
+/// frames. When the choice is not the one last seen it is scrolled into view
+/// (only if it is out of it), so a key that moves it past the shown rows
+/// brings it back, while a wheel scroll that leaves the choice alone is not
+/// undone.
 fn list_scroll(
     lists: &mut ListScrolls,
-    key: (&'static str, &'static str),
+    key: (u64, &'static str),
     chosen: Option<usize>,
 ) -> UniformListScrollHandle {
     let (handle, seen) = lists
@@ -674,6 +748,11 @@ impl Docxy {
         if let Some(done) = self.user_name_click(button, cx) {
             return done;
         }
+        // A plugin dialog's Help is the host's (#1609): it opens the spec's
+        // help page, or says the documentation is coming; the dialog stays.
+        if let Some(done) = self.plugin_help_click(button, cx) {
+            return done;
+        }
         // So is Document Recovery, which replaces tabs (#1225).
         if let Some(done) = self.document_recovery_click(button, cx) {
             return done;
@@ -819,6 +898,34 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    /// The top dialog's Help pressed on a plugin dialog (#1609): the spec's
+    /// `help` URL opens (recorded for `last-url`), else the status line says
+    /// the documentation is coming, as the Help tab does. `None` for any
+    /// other dialog or button.
+    fn plugin_help_click(
+        &mut self,
+        button: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<Result<(), String>> {
+        let dialogs = self.active_dialogs()?;
+        let top = dialogs.top()?;
+        let DialogOwner::Plugin { spec, .. } = top.owner else {
+            return None;
+        };
+        let pressed = top.find_button(button)?;
+        if !pressed.is_help() {
+            return None;
+        }
+        if let Err(e) = Dialog::refuse_disabled(pressed) {
+            return Some(Err(e));
+        }
+        match crate::plugin_ui::help_url(spec) {
+            Some(url) => self.open_help_url(url, cx),
+            None => self.set_status(crate::help_tab::DOCS_COMING.to_string()),
+        }
+        Some(Ok(()))
+    }
+
     /// A press on one of the top dialog's widgets: see [`Dialog::click_control`].
     fn dialog_control_click(&mut self, index: usize, item: Option<usize>, cx: &mut Context<Self>) {
         let done = self
@@ -859,6 +966,10 @@ impl Docxy {
         };
         // The probe is already inside the border: the text starts a padding in.
         let x = f32::from(at.x - bounds.left()) - FIELD_INSET;
+        // A multiline's probe is its first line's neighbour and scrolls with
+        // the lines (#1609), so the distance down from it is the line, the
+        // scroll already counted.
+        let y = f32::from(at.y - bounds.top());
         let measurer = Measurer::new(window);
         if let Some(d) = self
             .active_dialogs_mut()
@@ -866,8 +977,15 @@ impl Docxy {
             .ok()
             .filter(|d| d.focus == Some(index))
         {
-            let text = d.focused().map(|c| c.text()).unwrap_or_default();
-            let to = char_at_x(&text, x, |s| measurer.width(s, 12., false, false));
+            let (text, multiline) = d
+                .focused()
+                .map(|c| (c.text(), c.kind == ControlKind::Multiline))
+                .unwrap_or_default();
+            let to = if multiline {
+                char_at_line_x(&text, y, x, |s| measurer.width(s, 12., false, false))
+            } else {
+                char_at_x(&text, x, |s| measurer.width(s, 12., false, false))
+            };
             d.move_caret_to(to, false);
         }
         cx.notify();
@@ -986,12 +1104,38 @@ impl Docxy {
     }
 
     /// One control's widget: a field, checkbox, radio group, dropdown or list
-    /// that takes the pointer, or a grid or label drawn as text.
-    fn dialog_widget(&self, d: &Dialog, i: usize, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+    /// that takes the pointer, a grid, a label drawn as text, or a sample box
+    /// drawn in the style its value names (#1609). `label_w` is the label's
+    /// width when the page's columns align labels, `None` for its natural
+    /// width.
+    fn dialog_widget(
+        &self,
+        d: &Dialog,
+        i: usize,
+        label_w: Option<f32>,
+        pal: Pal,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let c = &d.controls[i];
         let focused = d.focus == Some(i) && d.focused().is_some();
         let fg = if c.enabled { pal.fg } else { pal.dim };
         let label = SharedString::from(c.label.replace('&', ""));
+        // On a page of several columns the labels of one column share a
+        // width, so the fields line up (#1609).
+        let aligned = |label: SharedString| -> AnyElement {
+            match label_w {
+                Some(w) => div()
+                    .w(px(w))
+                    .flex_none()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(label)
+                    .into_any_element(),
+                None => label.into_any_element(),
+            }
+        };
+        // A multiline that fills the page (#1609) in a dialog of fixed size.
+        let fill = d.fills(c);
         let editable = c.enabled && c.kind.is_editable();
         let row = h_flex()
             .id(("dialog-control", i))
@@ -1021,15 +1165,17 @@ impl Docxy {
                 let (from, to) = d.selection().unwrap_or((caret, caret));
                 let mut lines: Vec<AnyElement> = Vec::new();
                 let mut start = 0;
+                let mut caret_line = 0;
                 let line_count = text.split('\n').count();
                 for (n, line) in text.split('\n').enumerate() {
                     let len = line.chars().count();
                     let end = start + len;
-                    let shown: AnyElement = if focused
-                        && caret >= start
-                        && caret <= end
-                        && (n + 1 == line_count || caret < end + 1)
-                    {
+                    let on_line =
+                        caret >= start && caret <= end && (n + 1 == line_count || caret < end + 1);
+                    if on_line {
+                        caret_line = n;
+                    }
+                    let shown: AnyElement = if focused && on_line {
                         let part = |a: usize, b: usize| {
                             SharedString::from(
                                 chars[a.min(end)..b.min(end)].iter().collect::<String>(),
@@ -1055,31 +1201,90 @@ impl Docxy {
                     lines.push(shown);
                     start = end + 1;
                 }
+                // The lines are 16 px each; the box's height is the frame's.
+                // Only this box's own caret, while it is focused, drives the
+                // scroll (`caret_at` is the focused control's); unfocused it
+                // keeps its offset. The caret and the edit count are the
+                // mark, so typing on, or deleting from, a line a wheel
+                // scrolled away brings the line back.
+                let scroll = fill.then(|| {
+                    grid_scroll(
+                        &mut self.dialog_grids.borrow_mut(),
+                        (d.epoch, c.name),
+                        focused.then_some((caret_line, (d.edits << 32) | caret as u64)),
+                        16.,
+                        None,
+                    )
+                });
+                if !fill {
+                    self.dialog_grids.borrow_mut().remove(&(d.epoch, c.name));
+                }
                 v_flex()
                     .id(("dialog-control", i))
                     .gap_1()
                     .text_size(px(12.))
                     .text_color(fg)
+                    .when(fill, |v| v.flex_1().min_h_0().w_full())
                     .child(probe(&self.probes, format!("dialog-control:{}", c.name)))
-                    .child(label)
+                    .when(!label.is_empty(), |v| v.child(label))
                     .child(
-                        v_flex()
-                            .id(("dialog-multiline", i))
+                        div()
                             .relative()
-                            .min_w(px(240.))
-                            .min_h(px(16. * 3. + 4.))
-                            .px_1()
-                            .border_1()
-                            .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
-                            .bg(pal.panel)
-                            .child(probe(&self.probes, format!("dialog-field:{name}")))
-                            .children(lines)
-                            .when(editable, |r| {
-                                r.cursor_text().on_click(cx.listener(
-                                    move |this, ev: &ClickEvent, window, cx| {
-                                        this.dialog_field_click(i, ev.position(), window, cx)
-                                    },
-                                ))
+                            .when(fill, |v| v.flex_1().min_h_0().w_full())
+                            // The box as a person sees it (#1609 r7): the
+                            // field probe inside scrolls with the lines, so a
+                            // click aimed at "the box" takes this one.
+                            .child(probe(&self.probes, format!("dialog-field-box:{name}")))
+                            .child(
+                                v_flex()
+                                    .id(("dialog-multiline", i))
+                                    .relative()
+                                    // A built-in dialog's box keeps its
+                                    // width; in a cell of several columns
+                                    // (#1609 r9) it is the cell's width.
+                                    .when(d.cell_columns(c) == 1, |v| v.min_w(px(240.)))
+                                    .when(d.cell_columns(c) > 1, |v| v.w_full())
+                                    .min_h(px(16. * 3. + 4.))
+                                    // A filling box scrolls its lines, the
+                                    // caret's kept in view (#1609).
+                                    .when_some(scroll.clone(), |v, h| {
+                                        v.h_full().w_full().overflow_y_scroll().track_scroll(&h)
+                                    })
+                                    .px_1()
+                                    .border_1()
+                                    .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
+                                    .bg(pal.panel)
+                                    .child(probe(&self.probes, format!("dialog-field:{name}")))
+                                    .children(lines)
+                                    .when(editable, |r| {
+                                        r.cursor_text().on_click(cx.listener(
+                                            move |this, ev: &ClickEvent, window, cx| {
+                                                this.dialog_field_click(
+                                                    i,
+                                                    ev.position(),
+                                                    window,
+                                                    cx,
+                                                )
+                                            },
+                                        ))
+                                    }),
+                            )
+                            .when_some(scroll, |b, h| {
+                                b.child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .right_0()
+                                        .bottom_0()
+                                        .w(px(8.))
+                                        .child(
+                                            Scrollbar::vertical(&h)
+                                                .id(SharedString::from(format!(
+                                                    "dialog-multiline-scroll:{name}"
+                                                )))
+                                                .scrollbar_show(ScrollbarShow::Always),
+                                        ),
+                                )
                             }),
                     )
                     .into_any_element()
@@ -1104,7 +1309,7 @@ impl Docxy {
                             .max()
                             .unwrap_or(1);
                         let floor = if c.editable_grid { 56. } else { 40. };
-                        (longest as f32 * 7. + 12.).clamp(floor, 220.)
+                        est_text_w(longest).clamp(floor, 220.)
                     })
                     .collect();
                 let cell = |content: AnyElement, w: f32, head: bool, active: bool| {
@@ -1127,6 +1332,16 @@ impl Docxy {
                     h_flex().children(c.columns.iter().enumerate().map(|(col, name)| {
                         cell(text_cell(name.clone()), widths[col], true, false)
                     }));
+                // At least `min_rows` rows are drawn, empty ones filling
+                // in; more rows scroll (#1609). A built-in dialog's grid
+                // keeps its own height unless it asks.
+                let min_rows = c.min_rows.unwrap_or(if c.plugin { 8 } else { rows.len() });
+                let fillers = (rows.len()..min_rows).map(|r| {
+                    h_flex().id(("dialog-grid-filler", i * 1024 + r)).children(
+                        (0..c.columns.len())
+                            .map(|col| cell(text_cell(String::new()), widths[col], false, false)),
+                    )
+                });
                 let body = rows.iter().enumerate().map(|(r, row)| {
                     let selected = sel_row == Some(r);
                     h_flex()
@@ -1174,6 +1389,22 @@ impl Docxy {
                                 })
                         }))
                 });
+                let scrolls = rows.len() > min_rows;
+                let body_h = 18. * min_rows as f32;
+                let scroll = scrolls.then(|| {
+                    grid_scroll(
+                        &mut self.dialog_grids.borrow_mut(),
+                        (d.epoch, c.name),
+                        sel_row.map(|r| (r, r as u64)),
+                        18.,
+                        Some(body_h),
+                    )
+                });
+                // A grid that stopped scrolling (rows deleted under it) reports
+                // no scroll.
+                if !scrolls {
+                    self.dialog_grids.borrow_mut().remove(&(d.epoch, c.name));
+                }
                 // The items a combo cell being typed into offers (#1536).
                 let suggestions = c.suggestions();
                 let offered = c.column_items.get(sel_col).cloned().unwrap_or_default();
@@ -1192,7 +1423,39 @@ impl Docxy {
                             .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
                             .bg(pal.panel)
                             .child(header)
-                            .children(body),
+                            .child(
+                                div()
+                                    .relative()
+                                    .child(
+                                        v_flex()
+                                            .id(("dialog-grid-body", i))
+                                            .when_some(scroll.clone(), |b, h| {
+                                                b.h(px(body_h)).overflow_y_scroll().track_scroll(&h)
+                                            })
+                                            .children(body)
+                                            .children(fillers),
+                                    )
+                                    // The scrollbar Project draws beside a grid
+                                    // that holds more rows than it shows.
+                                    .when_some(scroll, |b, h| {
+                                        b.child(
+                                            div()
+                                                .absolute()
+                                                .top_0()
+                                                .right_0()
+                                                .h(px(body_h))
+                                                .w(px(8.))
+                                                .child(
+                                                    Scrollbar::vertical(&h)
+                                                        .id(SharedString::from(format!(
+                                                            "dialog-grid-scroll:{}",
+                                                            c.name
+                                                        )))
+                                                        .scrollbar_show(ScrollbarShow::Always),
+                                                ),
+                                        )
+                                    }),
+                            ),
                     )
                     .when(!suggestions.is_empty(), |v| {
                         v.child(
@@ -1234,6 +1497,39 @@ impl Docxy {
                     })
                     .into_any_element()
             }
+            // A sample box (#1609): the text in the style the state gives, the
+            // formatting model's text style plus `text`.
+            ControlKind::Sample => {
+                // The one parse `dialog-read` reports too (`Control::sample`),
+                // re-read as the formatting model's JSON for its text style.
+                let sample = c.sample();
+                let text = sample.get_str("text").unwrap_or("AaBbYyZz").to_string();
+                let style = projcore::json::Json::parse(&sample.to_string())
+                    .map(|j| projcore::formatting::TextStyle::from_json(&j))
+                    .unwrap_or_default();
+                v_flex()
+                    .id(("dialog-control", i))
+                    .gap_1()
+                    .text_size(px(12.))
+                    .text_color(fg)
+                    .w_full()
+                    .child(probe(&self.probes, format!("dialog-control:{}", c.name)))
+                    .when(!label.is_empty(), |v| v.child(label))
+                    .child(
+                        div()
+                            .min_h(px(48.))
+                            .w_full()
+                            .p_2()
+                            .border_1()
+                            .border_color(pal.dim)
+                            .bg(pal.panel)
+                            .child(
+                                crate::plugin_ui::styled(div(), &style)
+                                    .child(SharedString::from(text)),
+                            ),
+                    )
+                    .into_any_element()
+            }
             k if k.is_text() => {
                 let name = c.name;
                 // The text, with the caret in it and the selection shaded.
@@ -1261,10 +1557,11 @@ impl Docxy {
                 let combo = k == ControlKind::DateCombo;
                 let calendar = d.calendar.filter(|k| k.control == i);
                 let field = row
-                    .child(label)
+                    .child(aligned(label))
                     .child(
                         boxed_with(shown)
                             .relative()
+                            .when(label_w.is_some(), |b| b.flex_1())
                             .child(probe(&self.probes, format!("dialog-field:{name}"))),
                     )
                     .when(combo, |r| {
@@ -1334,14 +1631,16 @@ impl Docxy {
                             el.cursor_pointer().on_click(on_widget(cx, i, Some(k)))
                         })
                 });
-                row.child(label)
+                row.child(aligned(label))
                     .when(focused, |r| r.border_b_1().border_color(hsla_u(BRAND)))
                     .children(items)
                     .into_any_element()
             }
             ControlKind::Dropdown => row
-                .child(label)
-                .child(boxed(format!("{} \u{25BE}", c.text())))
+                .child(aligned(label))
+                .child(
+                    boxed(format!("{} \u{25BE}", c.text())).when(label_w.is_some(), |b| b.flex_1()),
+                )
                 .when(editable, |r| {
                     r.cursor_pointer().on_click(on_widget(cx, i, None))
                 })
@@ -1349,11 +1648,8 @@ impl Docxy {
             ControlKind::CheckList => {
                 // Virtualised: an AutoFilter list holds up to 10,000 values.
                 let n = c.items.len();
-                let scroll = list_scroll(
-                    &mut self.dialog_lists.borrow_mut(),
-                    (d.id.as_str(), c.name),
-                    None,
-                );
+                let scroll =
+                    list_scroll(&mut self.dialog_lists.borrow_mut(), (d.epoch, c.name), None);
                 let list = uniform_list(
                     ("dialog-checklist", i),
                     n,
@@ -1434,7 +1730,7 @@ impl Docxy {
                 };
                 let scroll = list_scroll(
                     &mut self.dialog_lists.borrow_mut(),
-                    (d.id.as_str(), c.name),
+                    (d.epoch, c.name),
                     chosen,
                 );
                 let list = uniform_list(
@@ -1482,7 +1778,13 @@ impl Docxy {
                     .child(label)
                     .child(
                         div()
-                            .min_w(px(160.))
+                            // A built-in dialog's list keeps its width; in a
+                            // cell of several columns (#1609 r8, the header
+                            // band's own count since r9) the list is its
+                            // cell's width, so side-by-side pickers do not
+                            // overflow into each other.
+                            .when(d.cell_columns(c) == 1, |l| l.min_w(px(160.)))
+                            .when(d.cell_columns(c) > 1, |l| l.w_full())
                             .border_1()
                             .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
                             .bg(pal.panel)
@@ -1490,25 +1792,148 @@ impl Docxy {
                     )
                     .into_any_element()
             }
+            // A plugin label with no caption draws its text alone; a built-in
+            // one keeps the empty caption's indent.
             _ => row
-                .child(label)
+                .when(!(c.plugin && label.is_empty()), |r| r.child(aligned(label)))
                 .child(SharedString::from(c.text()))
                 .into_any_element(),
         }
+    }
+
+    /// The controls of the top dialog drawn as [`Dialog::layout_rows`] lays
+    /// them out (#1609): the header band first, each titled group in a box,
+    /// a row of several controls side by side with the labels of a column
+    /// sharing a width, a filling multiline's row and band growing.
+    fn dialog_body(&self, d: &Dialog, pal: Pal, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut out: Vec<AnyElement> = Vec::new();
+        for band in d.layout_rows() {
+            let columns = band.columns;
+            // The label width per column: the longest label in it.
+            let mut label_w = vec![0f32; columns];
+            if columns > 1 {
+                for row in &band.rows {
+                    for &(i, col) in row {
+                        let c = &d.controls[i];
+                        if !matches!(
+                            c.kind,
+                            ControlKind::Multiline
+                                | ControlKind::Grid
+                                | ControlKind::List
+                                | ControlKind::Sample
+                                | ControlKind::CheckList
+                                | ControlKind::Checkbox
+                        ) {
+                            let w = est_text_w(c.label.replace('&', "").chars().count()) - 8.;
+                            label_w[col] = label_w[col].max(w);
+                        }
+                    }
+                }
+            }
+            let band_fills = band
+                .rows
+                .iter()
+                .flatten()
+                .any(|&(i, _)| d.fills(&d.controls[i]));
+            let mut drawn: Vec<AnyElement> = Vec::new();
+            for row in band.rows {
+                let fills = row.iter().any(|&(i, _)| d.fills(&d.controls[i]));
+                if row.len() == 1 && (columns == 1 || d.controls[row[0].0].span as usize >= columns)
+                {
+                    let (i, _) = row[0];
+                    // A control spanning a page of several columns keeps the
+                    // first column's label width, so its field lines up with
+                    // the fields above and fills the row (#1609 r6).
+                    let w = (columns > 1).then(|| label_w[0]).filter(|w| *w > 0.);
+                    let el = self.dialog_widget(d, i, w, pal, cx);
+                    drawn.push(if fills {
+                        v_flex()
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .child(el)
+                            .into_any_element()
+                    } else {
+                        el
+                    });
+                    continue;
+                }
+                if row.len() > columns {
+                    // Controls marked `beside` share the row of the one before
+                    // them (#1536): Duration with Estimated, Start with Finish.
+                    let widgets: Vec<AnyElement> = row
+                        .into_iter()
+                        .map(|(i, _)| self.dialog_widget(d, i, None, pal, cx))
+                        .collect();
+                    drawn.push(
+                        h_flex()
+                            .gap_3()
+                            .items_center()
+                            .children(widgets)
+                            .into_any_element(),
+                    );
+                    continue;
+                }
+                // Each cell is its share of the row with its own right
+                // padding and no flex gap, so a row with a spanning control
+                // puts its columns where a row of singles does (#1609 r7).
+                let cells = row.into_iter().map(|(i, col)| {
+                    let span = (d.controls[i].span as usize).clamp(1, columns);
+                    let w = Some(label_w[col]).filter(|w| *w > 0.);
+                    v_flex()
+                        .w(relative(span as f32 / columns as f32))
+                        .flex_shrink_0()
+                        .pr_2()
+                        .when(fills, |c| c.h_full())
+                        .child(self.dialog_widget(d, i, w, pal, cx))
+                });
+                drawn.push(
+                    h_flex()
+                        .w_full()
+                        .items_start()
+                        .when(fills, |r| r.flex_1().min_h_0())
+                        .children(cells)
+                        .into_any_element(),
+                );
+            }
+            match band.title {
+                Some(t) => out.push(
+                    v_flex()
+                        .w_full()
+                        .gap_2()
+                        .p_2()
+                        .border_1()
+                        .border_color(pal.border)
+                        .rounded_sm()
+                        .when(band_fills, |g| g.flex_1().min_h_0())
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(pal.dim)
+                                .child(SharedString::from(t.replace('&', ""))),
+                        )
+                        .children(drawn)
+                        .into_any_element(),
+                ),
+                None => out.extend(drawn),
+            }
+        }
+        out
     }
 
     /// The top dialog, centred over a backdrop that covers the whole window,
     /// so the pointer cannot reach anything under it. A popup (#1607) is
     /// placed at its [`dialog::Popup`] instead, over an undimmed backdrop.
     pub(crate) fn dialog_overlay(&self, pal: Pal, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let top = self.active_dialogs().and_then(|s| s.top());
-        // Another dialog's lists start again at the top when it next shows,
-        // and so do all of them once no dialog is open.
-        prune_lists(
-            &mut self.dialog_lists.borrow_mut(),
-            top.map(|d| d.id.as_str()),
-        );
-        let d = top?;
+        let d = self.active_dialogs()?.top()?;
+        // The scrolls belong to this opening of this dialog (#1609: every
+        // plugin dialog shares one id, and a reopened dialog starts afresh).
+        self.dialog_lists
+            .borrow_mut()
+            .retain(|(epoch, _), _| *epoch == d.epoch);
+        self.dialog_grids
+            .borrow_mut()
+            .retain(|(epoch, _), _| *epoch == d.epoch);
         let tabs = (!d.tabs.is_empty()).then(|| {
             h_flex()
                 .gap_3()
@@ -1527,36 +1952,19 @@ impl Docxy {
                         )
                 }))
         });
-        // A control marked `beside` shares the row of the one before it
-        // (#1536): Duration with Estimated, Start with Finish.
-        let mut groups: Vec<Vec<AnyElement>> = Vec::new();
-        for i in d.shown_indices() {
-            let widget = self.dialog_widget(d, i, pal, cx);
-            match groups.last_mut() {
-                Some(group) if d.controls[i].beside => group.push(widget),
-                _ => groups.push(vec![widget]),
-            }
-        }
-        let controls: Vec<AnyElement> = groups
-            .into_iter()
-            .map(|mut g| {
-                if g.len() == 1 {
-                    g.remove(0)
-                } else {
-                    h_flex()
-                        .gap_3()
-                        .items_center()
-                        .children(g)
-                        .into_any_element()
-                }
-            })
-            .collect();
+        let controls = self.dialog_body(d, pal, cx);
+        // Project's button places (#1609): Help bottom left, the rest bottom
+        // right; or every button down the right side.
+        let buttons_right = d.buttons_right;
+        let is_help = |b: &dialog::Button| b.is_help();
+        let help_count = d.buttons.iter().filter(|b| is_help(b)).count();
         let button = |i: usize, b: &dialog::Button| {
             let label = b.label.clone();
             div()
                 .id(("dialog-button", i))
                 .relative()
                 .min_w(px(72.))
+                .when(buttons_right, |el| el.w(px(96.)))
                 .px_3()
                 .py_1()
                 .flex()
@@ -1668,17 +2076,17 @@ impl Docxy {
                 .into_any_element(),
             );
         }
-        // A Help button (#1536) sits at the bottom left.
-        let (help, buttons): (Vec<_>, Vec<_>) = d
+        let buttons: Vec<_> = d
             .buttons
             .iter()
             .enumerate()
-            .partition(|(_, b)| b.id == "help");
-        let help: Vec<_> = help.into_iter().map(|(i, b)| button(i, b)).collect();
-        let buttons: Vec<_> = buttons.into_iter().map(|(i, b)| button(i, b)).collect();
+            .map(|(i, b)| button(i, b))
+            .collect();
         // A modeless dialog (#1602) has no backdrop: the pointer reaches the
         // document, and a press in the panel gives the dialog the keyboard.
         let modeless = d.modeless;
+        // A fixed size (#1609) shared by every page.
+        let sized = d.size.is_some();
         Some(
             deferred(
                 div()
@@ -1698,8 +2106,8 @@ impl Docxy {
                         v_flex()
                             .id("dialog")
                             .relative()
-                            .min_w(px(320.))
-                            .max_w(px(560.))
+                            .when(!sized, |p| p.min_w(px(320.)).max_w(px(560.)))
+                            .when_some(d.size, |p, (w, h)| p.w(px(w)).h(px(h)).overflow_hidden())
                             .p_4()
                             .gap_3()
                             .bg(pal.panel)
@@ -1735,14 +2143,64 @@ impl Docxy {
                                         .child(SharedString::from(text)),
                                 )
                             })
-                            .children(controls)
-                            .child(
+                            .child(if buttons_right {
+                                // The page on the left, the buttons stacked
+                                // on the right, as Assign Resources'.
                                 h_flex()
-                                    .gap_2()
-                                    .children(help)
-                                    .child(div().flex_1())
-                                    .children(buttons),
-                            ),
+                                    .gap_4()
+                                    .items_start()
+                                    .when(sized, |r| r.flex_1().min_h_0())
+                                    .child(
+                                        v_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .gap_3()
+                                            .when(sized, |v| v.min_h_0().h_full())
+                                            .children(controls),
+                                    )
+                                    .child(v_flex().flex_none().gap_2().children(buttons))
+                                    .into_any_element()
+                            } else {
+                                let mut helps: Vec<AnyElement> = Vec::new();
+                                let mut rest: Vec<AnyElement> = Vec::new();
+                                for (b, el) in d.buttons.iter().zip(buttons) {
+                                    if is_help(b) {
+                                        helps.push(el.into_any_element());
+                                    } else {
+                                        rest.push(el.into_any_element());
+                                    }
+                                }
+                                // A message box has no controls: no empty
+                                // container, so its button row keeps the gap
+                                // it always had (#1609 r7). A sized dialog
+                                // keeps the container on an empty page too:
+                                // it is what holds the buttons at the bottom
+                                // (r10).
+                                let has_controls = !controls.is_empty() || sized;
+                                v_flex()
+                                    .gap_3()
+                                    .when(sized, |v| v.flex_1().min_h_0())
+                                    .when(has_controls, |v| {
+                                        v.child(
+                                            v_flex()
+                                                .gap_3()
+                                                .when(sized, |v| v.flex_1().min_h_0())
+                                                .children(controls),
+                                        )
+                                    })
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .gap_2()
+                                            .when(help_count > 0, |r| {
+                                                r.justify_between()
+                                                    .child(h_flex().gap_2().children(helps))
+                                            })
+                                            .when(help_count == 0, |r| r.justify_end())
+                                            .child(h_flex().gap_2().children(rest)),
+                                    )
+                                    .into_any_element()
+                            }),
                     ),
             )
             .with_priority(2)
@@ -1766,6 +2224,16 @@ enum CalendarAct {
 /// starts: the box's `px_1` padding. The probe is absolutely positioned inside
 /// the box's border, so the one-pixel border is already outside it.
 const FIELD_INSET: f32 = 4.;
+
+/// The character gap of a multiline's `text` nearest to `x` pixels along
+/// the line `y` pixels down from its first line (lines are 16 px, #1609):
+/// the gaps of the lines above plus [`char_at_x`] on that line.
+fn char_at_line_x(text: &str, y: f32, x: f32, width: impl Fn(&str) -> f32) -> usize {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let line = ((y / 16.).floor().max(0.) as usize).min(lines.len().saturating_sub(1));
+    let before: usize = lines[..line].iter().map(|l| l.chars().count() + 1).sum();
+    before + char_at_x(lines[line], x, width)
+}
 
 /// The character gap nearest to `x` pixels along `text` (a gap is between
 /// characters, i.e. grapheme clusters, never inside one), whose prefixes
@@ -1808,10 +2276,65 @@ mod tests {
     /// #988 r1: a list's choice that moves is scrolled into view once; a
     /// frame with the same choice asks for no scroll (a wheel scroll stays),
     /// and the handle is the same one frame to frame.
+    /// #1609: a click in a multiline lands on the line under the pointer,
+    /// the gaps of the lines above counted, however far the box scrolled
+    /// (the distance is measured from the first line, which scrolls too).
+    #[test]
+    fn a_multiline_click_lands_on_its_line() {
+        let width = |s: &str| s.chars().count() as f32 * 7.;
+        let text = "one\ntwo\nthree";
+        assert_eq!(char_at_line_x(text, 0., 0., width), 0);
+        assert_eq!(
+            char_at_line_x(text, 20., 0., width),
+            4,
+            "line 1 starts after 'one' and its break"
+        );
+        assert_eq!(
+            char_at_line_x(text, 20., 100., width),
+            7,
+            "past the end of 'two'"
+        );
+        assert_eq!(char_at_line_x(text, 40., 10., width), 9, "'th|ree'");
+        assert_eq!(
+            char_at_line_x(text, 400., 0., width),
+            8,
+            "below the last line: its start"
+        );
+        assert_eq!(char_at_line_x("", 50., 50., width), 0);
+    }
+
+    /// #1609 r5: a caret that moves along the line it is on (typing after a
+    /// wheel scroll took the line out of view) brings the line back; a frame
+    /// with the same caret keeps the wheel's offset, as a grid's unchanged
+    /// row does. r6: so does an edit that leaves the caret in place (Delete),
+    /// through the dialog's edit count in the mark.
+    #[test]
+    fn a_multiline_edit_on_the_same_line_brings_it_back_into_view() {
+        let mut grids = GridScrolls::default();
+        let key = (1, "memo");
+        // Line 9 of 16 px in a 64 px box: the least scroll that shows it.
+        let h = grid_scroll(&mut grids, key, Some((9, 40)), 16., Some(64.));
+        assert_eq!(f32::from(h.offset().y), -96.);
+        // The wheel scrolls back to the top; the same caret leaves it there.
+        h.set_offset(point(px(0.), px(0.)));
+        let h = grid_scroll(&mut grids, key, Some((9, 40)), 16., Some(64.));
+        assert_eq!(f32::from(h.offset().y), 0.);
+        // A character typed on line 9 moves the caret: the line comes back.
+        let h = grid_scroll(&mut grids, key, Some((9, 41)), 16., Some(64.));
+        assert_eq!(f32::from(h.offset().y), -96.);
+        // A Delete keeps the caret at 41 but counts as an edit: back again.
+        h.set_offset(point(px(0.), px(0.)));
+        let h = grid_scroll(&mut grids, key, Some((9, (1 << 32) | 41)), 16., Some(64.));
+        assert_eq!(f32::from(h.offset().y), -96.);
+        // Nothing painted yet: the handle has nothing to scroll, so the
+        // read-back reports no line until a frame has measured the box.
+        assert_eq!(first_visible(&grids[&key]), None);
+    }
+
     #[test]
     fn a_list_scrolls_a_changed_choice_into_view_once() {
         let mut lists = ListScrolls::default();
-        let key = ("consolidate", "refs");
+        let key = (1, "refs");
         let pending = |h: &UniformListScrollHandle| {
             h.0.borrow_mut()
                 .deferred_scroll_to_item
@@ -1827,20 +2350,8 @@ mod tests {
         assert_eq!(pending(&again), None, "the same choice: left alone");
         let h = list_scroll(&mut lists, key, Some(0));
         assert_eq!(pending(&h), Some(0));
-        let other = list_scroll(&mut lists, ("goto", "names"), Some(3));
+        let other = list_scroll(&mut lists, (2, "names"), Some(3));
         assert!(!std::rc::Rc::ptr_eq(&h.0, &other.0));
-    }
-
-    /// A closed dialog's lists are forgotten, so the next one opens at the top.
-    #[test]
-    fn lists_are_forgotten_when_their_dialog_closes() {
-        let mut lists = ListScrolls::default();
-        list_scroll(&mut lists, ("project-filter-menu", "values"), None);
-        list_scroll(&mut lists, ("goto", "names"), None);
-        prune_lists(&mut lists, Some("goto"));
-        assert_eq!(lists.len(), 1);
-        prune_lists(&mut lists, None);
-        assert!(lists.is_empty());
     }
 
     /// A document tab with a two-field form open: Top (a number) and Note.

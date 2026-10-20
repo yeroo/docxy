@@ -692,7 +692,7 @@ pub fn consolidate(
         .filter(|&(_, c)| (c1..=c2).contains(&c))
         .collect();
     for (r, c) in stale {
-        s.clear_cell(r, c);
+        s.clear_cell_unpinned(r, c);
     }
     for r in r1..=r2 {
         s.set_row_outline(r, 0);
@@ -1485,6 +1485,24 @@ mod tests {
         let bad = opts(&["Nowhere!A1"], true, true);
         assert!(consolidate(&mut w, 2, at(0, 0), &bad).is_err());
         assert_eq!(area_name(&w, 2).as_deref(), Some("Summary!$A$1:$C$3"));
+    }
+
+    #[test]
+    fn clearing_the_area_leaves_no_pin_under_a_column_style() {
+        let mut w = east_west();
+        // Summary's A1 (the output's blank corner) holds an old value.
+        w.sheets[2].set_cell(0, 0, t("old"));
+        w.sheets[2].col_defs.push(crate::sheet::ColDef {
+            min: 0,
+            max: 0,
+            width: None,
+            attrs: r#"style="7""#.to_string(),
+            default_width: false,
+            plain_width: false,
+        });
+        let o = opts(&["East!A1:C4", "West!A1:C4"], true, true);
+        consolidate(&mut w, 2, (0, 0, 3, 3), &o).unwrap();
+        assert!(w.sheets[2].cell(0, 0).is_none(), "cleared, not pinned");
     }
 
     #[test]

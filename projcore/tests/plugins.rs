@@ -159,13 +159,18 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         [
             ("fixture.hello", ControlKind::Button),
             ("fixture.flag", ControlKind::Toggle),
+            ("fixture.plain", ControlKind::Toggle),
             ("fixture.palette", ControlKind::Gallery),
             ("fixture.bold", ControlKind::Toggle),
             ("fixture.sheet", ControlKind::Button),
         ]
     );
     assert!(group.controls[0].large && group.controls[0].keytip == "XH");
-    assert_eq!(group.controls[2].swatches[0].color, Some(0x3366CC));
+    assert_eq!(group.controls[3].swatches[0].color, Some(0x3366CC));
+    assert!(
+        group.controls[2].icon.is_empty(),
+        "the Plain toggle names no icon"
+    );
     assert_eq!(m.menus[0].menu, "row");
     assert_eq!(m.menus[0].items[0].id, "fixture.rename");
     assert_eq!(m.menus[0].items[0].after, "Notes...");
@@ -189,7 +194,8 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         [
             ("apply", true, false),
             ("clear", false, false),
-            ("close", false, true)
+            ("close", false, true),
+            ("help", false, false)
         ]
     );
     assert_eq!(sheet.pages[0].controls[0].columns[0].kind, "check");
@@ -519,7 +525,7 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
     let state = ui.state(&options).unwrap();
     assert_eq!(
         state.value("fixture.echo"),
-        Some(&Json::str("Number 7 for Phase"))
+        Some(&Json::str("Number 7 for Phase (?)"))
     );
     let bumped = ui
         .command(&Command {
@@ -532,6 +538,46 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
     assert_eq!(bumped.ops[0].verb, "task.set");
     assert_eq!(bumped.status.as_deref(), Some("Fixture: bumped task 1"));
     assert!(!bumped.close);
+    // The layout hints (#1609) and Help.
+    let opts = ui.manifest().dialog("fixture.options").unwrap();
+    assert_eq!(opts.size, Some((460, 400)));
+    assert_eq!(opts.pages[0].columns, 2);
+    assert_eq!(opts.pages[0].controls[0].group, "Numbers");
+    assert!(opts.pages[0].controls[4].fill);
+    assert_eq!(
+        ui.manifest().dialog("fixture.sheet").unwrap().placement,
+        "right"
+    );
+    assert_eq!(
+        ui.manifest().dialog("task-information").unwrap().header[0].name,
+        "fixture.head"
+    );
+    assert_eq!(
+        state.value("fixture.sample").and_then(|v| v.get("bold")),
+        Some(&Json::Bool(true))
+    );
+    assert_eq!(opts.header[0].name, "fixture.title");
+    assert_eq!(opts.header[0].span, 2);
+    assert_eq!(opts.help, "");
+    let sheet = ui.manifest().dialog("fixture.sheet").unwrap();
+    assert_eq!(sheet.help, "https://example.test/fixture-help");
+    assert_eq!(sheet.buttons.last().map(|b| b.id.as_str()), Some("help"));
+    assert_eq!(
+        ui.manifest().dialog("task-information").unwrap().pages[0].columns,
+        2
+    );
+    // The header's declared value reaches the echo label.
+    let with_title = StateCtx {
+        dialog_values: Some(Json::obj(vec![
+            ("n", Json::Num(7.0)),
+            ("fixture.title", Json::str("Plan")),
+        ])),
+        ..ctx(vec![1], Some(("fixture.options".into(), None)))
+    };
+    assert_eq!(
+        ui.state(&with_title).unwrap().value("fixture.echo"),
+        Some(&Json::str("Number 7 for Phase (Plan)"))
+    );
 
     // The overlay: a label at the first bar, a link from the first bar's
     // end to the second bar's start.

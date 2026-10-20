@@ -617,3 +617,45 @@ fn a_left_to_right_sort_moves_a_cse_blocks_ref_with_its_column() {
     assert_eq!(anchor.formula.as_deref(), Some("ROW(A1:A3)"));
     assert_eq!(anchor.f_attrs.as_deref(), Some(r#" t="array" ref="A1:A3""#));
 }
+
+fn col_b_style() -> crate::sheet::ColDef {
+    crate::sheet::ColDef {
+        min: 1,
+        max: 1,
+        width: None,
+        attrs: r#"style="7""#.to_string(),
+        default_width: false,
+        plain_width: false,
+    }
+}
+
+/// #1097: a blank default cell under a row or column style pins the default
+/// and the range sort (what the hosts call) keeps it; the destination decides.
+#[test]
+fn sort_range_keeps_a_pinned_blank_where_its_destination_pins() {
+    let plain = SortOptions {
+        header: false,
+        ..HEADER
+    };
+    let by_a = [SortLevel { key: 0, on: asc() }];
+    // Already sorted: B1 stays.
+    let mut wb = book(&[("A1", n(1.0)), ("A2", n(2.0))]);
+    wb.sheets[0].col_defs.push(col_b_style());
+    wb.sheets[0].put_pinned(0, 1, Cell::default());
+    sort_range(&mut wb, 0, area("A1:B2"), &by_a, &plain).unwrap();
+    assert!(wb.sheets[0].cell(0, 1).is_some());
+    // Moved to row 2: the column style pins there too.
+    let mut wb = book(&[("A1", n(2.0)), ("A2", n(1.0))]);
+    wb.sheets[0].col_defs.push(col_b_style());
+    wb.sheets[0].put_pinned(0, 1, Cell::default());
+    sort_range(&mut wb, 0, area("A1:B2"), &by_a, &plain).unwrap();
+    assert!(wb.sheets[0].cell(1, 1).is_some() && wb.sheets[0].cell(0, 1).is_none());
+    // A row style: the destination row has none, so nothing is kept.
+    let mut wb = book(&[("A1", n(2.0)), ("A2", n(1.0))]);
+    wb.sheets[0]
+        .row_attrs
+        .insert(0, r#"s="5" customFormat="1""#.to_string());
+    wb.sheets[0].put_pinned(0, 1, Cell::default());
+    sort_range(&mut wb, 0, area("A1:B2"), &by_a, &plain).unwrap();
+    assert!(wb.sheets[0].cell(1, 1).is_none() && wb.sheets[0].cell(0, 1).is_none());
+}

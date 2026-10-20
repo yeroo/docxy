@@ -390,6 +390,16 @@ pub(crate) struct Popup {
 }
 
 impl Button {
+    /// The host's Help button (#1609): the one id every path tests, here.
+    pub fn is_help(&self) -> bool {
+        Self::is_help_id(&self.id)
+    }
+
+    /// Whether a button id (a spec's, before it becomes a [`Button`]) is Help.
+    pub fn is_help_id(id: &str) -> bool {
+        id.eq_ignore_ascii_case("help")
+    }
+
     pub fn new(label: &str, role: ButtonRole) -> Self {
         Self {
             id: fold(label),
@@ -439,6 +449,10 @@ pub(crate) enum ControlKind {
     /// ([`Dialog::commit_pending`]).
     Grid,
     Label,
+    /// A read-only preview box (#1609): the value is the sample's JSON
+    /// (`{text, font, size, bold, italic, underline, color, background}`, or
+    /// a bare text), drawn in that style. Never edited, never focused.
+    Sample,
     /// A text field of several lines: Enter is a new line, not OK (#1532).
     Multiline,
     /// Items each checked or not, a tree by `Control::depths`: checking an
@@ -463,6 +477,7 @@ impl ControlKind {
             Self::List => "list",
             Self::Grid => "grid",
             Self::Label => "label",
+            Self::Sample => "sample",
             Self::Multiline => "multiline",
             Self::CheckList => "checklist",
         }
@@ -562,6 +577,20 @@ pub(crate) struct Control {
     /// A plugin grid whose cell commits send the dialog's command at once
     /// (#1602): see [`Dialog::committed`].
     pub commit_command: bool,
+    /// The titled group box the control is drawn in (#1609): consecutive
+    /// controls of one page with the same title share one box.
+    pub group: Option<String>,
+    /// Columns the control takes on a page of several (#1609); at least 1.
+    pub span: u8,
+    /// A grid's visible rows (#1609): the body is at least this tall, empty
+    /// rows drawn, more rows scroll. `None` is the kind's default (8 for a
+    /// plugin's grid, the rows themselves for a built-in dialog's).
+    pub min_rows: Option<usize>,
+    /// A multiline that fills the page's remaining height (#1609) in a
+    /// dialog with a fixed `size`.
+    pub fill: bool,
+    /// Drawn above every page (#1609): a plugin spec's `header` control.
+    pub header: bool,
     /// Drawn on the same row as the control before it (#1536): Duration and
     /// its Estimated box, Start and Finish.
     pub beside: bool,
@@ -608,6 +637,23 @@ impl Control {
             column_items: Vec::new(),
             pick: None,
             picked: None,
+            group: None,
+            span: 1,
+            min_rows: None,
+            fill: false,
+            header: false,
+        }
+    }
+
+    /// A sample's style (#1609): the value's JSON object, or a bare text as
+    /// `{text}`.
+    pub fn sample(&self) -> Json {
+        match &self.value {
+            Value::Text(s) => match Json::parse(s) {
+                Ok(j @ Json::Obj(_)) => j,
+                _ => Json::obj(vec![("text", Json::Str(s.clone()))]),
+            },
+            _ => Json::Obj(Vec::new()),
         }
     }
 
@@ -802,6 +848,25 @@ impl Control {
         if self.plugin {
             out.push(("plugin", Json::Bool(true)));
         }
+        // The layout hints (#1609), reported only when set.
+        if let Some(g) = &self.group {
+            out.push(("group", Json::Str(g.clone())));
+        }
+        if self.span > 1 {
+            out.push(("span", Json::Num(f64::from(self.span))));
+        }
+        if let Some(n) = self.min_rows {
+            out.push(("min_rows", Json::Num(n as f64)));
+        }
+        if self.fill {
+            out.push(("fill", Json::Bool(true)));
+        }
+        if self.header {
+            out.push(("header", Json::Bool(true)));
+        }
+        if self.kind == ControlKind::Sample {
+            out.push(("sample", self.sample()));
+        }
         if self.kind == ControlKind::CheckList {
             out.push(("items", strs(&self.items)));
             out.push((
@@ -838,6 +903,9 @@ impl Control {
         };
         self.value = match self.kind {
             ControlKind::Label => return Err(format!("'{label}' is a label; it cannot be set")),
+            ControlKind::Sample => {
+                return Err(format!("'{label}' is a sample; it cannot be set"));
+            }
             ControlKind::Combo => return Err(format!("'{label}' is a grid column kind")),
             ControlKind::Text
             | ControlKind::Date
@@ -1096,6 +1164,18 @@ fn fold(label: &str) -> String {
         .to_lowercase()
 }
 
+/// One band of a laid-out dialog page (#1609, [`Dialog::layout_rows`]): the
+/// header, a titled group box, or ungrouped controls; its rows hold
+/// (control index, first column) and `columns` is the band's width in
+/// columns.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LayoutBand {
+    pub header: bool,
+    pub title: Option<String>,
+    pub columns: usize,
+    pub rows: Vec<Vec<(usize, usize)>>,
+}
+
 /// [`fold`], for the dialogs' owners outside this module.
 pub(crate) fn fold_label(label: &str) -> String {
     fold(label)
@@ -1158,6 +1238,28 @@ pub(crate) struct Dialog {
     /// (#1607): no title, an undimmed backdrop that still blocks the window
     /// (a press outside closes it as Cancel).
     pub popup: Option<Popup>,
+    /// A fixed size in logical pixels (#1609), shared by every page; `None`
+    /// sizes the dialog to its content.
+    pub size: Option<(f32, f32)>,
+    /// The buttons go down the right side (#1609); else along the bottom
+    /// (Help bottom left, the rest bottom right).
+    pub buttons_right: bool,
+    /// Controls per row, per page (#1609): a page not listed has one.
+    pub page_columns: Vec<u8>,
+    /// Which opening of a dialog this is (#1609): every dialog built gets
+    /// the next number, so the window's per-dialog state (list and grid
+    /// scrolls) belongs to one opening and starts afresh on the next.
+    pub epoch: u64,
+    /// How many edits the fields have taken (#1609 r6): with the caret, the
+    /// mark a filling multiline's scroll follows, so a Delete that leaves
+    /// the caret where it was still brings its line into view.
+    pub edits: u64,
+}
+
+/// The next dialog epoch (see [`Dialog::epoch`]).
+fn next_epoch() -> u64 {
+    static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// See [`Dialog::react`]. Two dialogs compare equal whatever their
@@ -1242,9 +1344,125 @@ impl Dialog {
             stale: false,
             seen: None,
             committed: None,
+            size: None,
+            buttons_right: false,
+            page_columns: Vec::new(),
+            epoch: next_epoch(),
+            edits: 0,
             calendar: None,
             popup: None,
         }
+    }
+
+    /// Controls per row on the current page (#1609), at least 1.
+    pub fn columns(&self) -> usize {
+        self.page_columns.get(self.tab).copied().unwrap_or(1).max(1) as usize
+    }
+
+    /// The header band's columns (#1609): the sum of the header controls'
+    /// spans, at least 1; the same on every page.
+    pub fn header_columns(&self) -> usize {
+        self.controls
+            .iter()
+            .filter(|c| c.header && c.visible)
+            .map(|c| (c.span as usize).max(1))
+            .sum::<usize>()
+            .max(1)
+    }
+
+    /// The columns of the band `c` sits in (#1609 r9): the header's for a
+    /// header control, else the current page's. A control in a band of one
+    /// column keeps its built-in minimum width; in a cell of several it is
+    /// the cell's width.
+    pub fn cell_columns(&self, c: &Control) -> usize {
+        if c.header {
+            self.header_columns()
+        } else {
+            self.columns()
+        }
+    }
+
+    /// Whether `c` fills the page's remaining height (#1609): a `fill`
+    /// multiline in a dialog with a fixed size.
+    pub fn fills(&self, c: &Control) -> bool {
+        c.fill && c.kind == ControlKind::Multiline && self.size.is_some()
+    }
+
+    /// The shown controls laid out as Project's (#1609): the header first
+    /// (one band of one row holding every header control, as wide as the
+    /// sum of their spans; a header control's `group` is ignored), then the
+    /// page's controls in rows of [`Dialog::columns`], a control's `span`
+    /// taking that many columns (clamped to the row), consecutive controls
+    /// of one `group` title in one band. A control marked `beside` (#1536)
+    /// joins the row of the control before it, whatever the columns. In a
+    /// dialog with plugin controls (Task Information with a plugin page,
+    /// #1609 r6) the built-in controls form bands of their own at one
+    /// column, so the shared Name, Duration and Estimated row keeps its
+    /// shape on every page; the page's `columns` apply to the plugin's
+    /// controls.
+    pub fn layout_rows(&self) -> Vec<LayoutBand> {
+        let mut shown = self.shown_indices();
+        shown.sort_by_key(|&i| !self.controls[i].header);
+        let page_columns = self.columns();
+        let mixed = self.controls.iter().any(|c| c.plugin);
+        let header_columns = self.header_columns();
+        let mut bands: Vec<LayoutBand> = Vec::new();
+        let mut k = 0;
+        while k < shown.len() {
+            let first = &self.controls[shown[k]];
+            let header = first.header;
+            let builtin = mixed && !first.plugin;
+            let title = if header { None } else { first.group.clone() };
+            let columns = if header {
+                header_columns
+            } else if builtin {
+                1
+            } else {
+                page_columns
+            };
+            let mut rows: Vec<Vec<(usize, usize)>> = Vec::new();
+            let mut row: Vec<(usize, usize)> = Vec::new();
+            let mut used = 0;
+            while k < shown.len() {
+                let c = &self.controls[shown[k]];
+                if c.header != header
+                    || (!header && c.group != title)
+                    || (!header && mixed && !c.plugin != builtin)
+                {
+                    break;
+                }
+                if c.beside {
+                    match rows.last_mut().filter(|_| row.is_empty()) {
+                        Some(last) => last.push((shown[k], last.len().min(columns - 1))),
+                        None => row.push((shown[k], used.min(columns - 1))),
+                    }
+                    k += 1;
+                    continue;
+                }
+                let span = (c.span as usize).clamp(1, columns);
+                if used + span > columns && !row.is_empty() {
+                    rows.push(std::mem::take(&mut row));
+                    used = 0;
+                }
+                row.push((shown[k], used));
+                used += span;
+                if used >= columns {
+                    rows.push(std::mem::take(&mut row));
+                    used = 0;
+                }
+                k += 1;
+            }
+            if !row.is_empty() {
+                rows.push(row);
+            }
+            bands.push(LayoutBand {
+                header,
+                title,
+                columns,
+                rows,
+            });
+        }
+        bands
     }
 
     /// The controls on the current tab, as a person sees them.
@@ -1788,12 +2006,17 @@ impl Dialog {
 
     /// The controls Tab steps through on the current tab, in order.
     fn focusable(&self) -> Vec<usize> {
-        (0..self.controls.len())
+        // A plugin spec's header controls are drawn first and come first
+        // in the Tab order too (#1609); they are listed last so the pages'
+        // controls keep their indices.
+        let mut order: Vec<usize> = (0..self.controls.len())
             .filter(|&i| {
                 let c = &self.controls[i];
                 self.on_page(c) && c.visible && c.enabled && c.interactive()
             })
-            .collect()
+            .collect();
+        order.sort_by_key(|&i| !self.controls[i].header);
+        order
     }
 
     /// How many Tab presses move the focus from where it is now to control
@@ -1895,6 +2118,7 @@ impl Dialog {
         next.extend(&chars[to..]);
         let i = self.focus.unwrap_or_default();
         self.set_at(i, &Json::obj(vec![("value", Json::Str(next))]))?;
+        self.edits += 1;
         self.put_caret(from + with.chars().count());
         Ok(())
     }
@@ -2258,18 +2482,36 @@ impl Dialog {
         Ok(())
     }
 
-    fn button_index(&self, want: &str) -> Result<usize, String> {
-        let i = self
-            .buttons
+    /// The button `want` names (#1602): its label as a person reads it,
+    /// `&` and case aside, or its id.
+    pub fn find_button(&self, want: &str) -> Option<&Button> {
+        self.find_button_index(want)
+            .and_then(|i| self.buttons.get(i))
+    }
+
+    /// The index of the button named `want` (its label as drawn, `&` and
+    /// case aside, or its id).
+    fn find_button_index(&self, want: &str) -> Option<usize> {
+        self.buttons
             .iter()
             .position(|b| fold(&b.label) == fold(want) || b.id.eq_ignore_ascii_case(want.trim()))
-            .ok_or_else(|| {
-                let labels: Vec<String> = self.buttons.iter().map(|b| shown(&b.label)).collect();
-                format!("no button '{want}'; buttons: {}", labels.join(", "))
-            })?;
-        if !self.buttons[i].enabled {
-            return Err(format!("'{}' is disabled", shown(&self.buttons[i].label)));
+    }
+
+    /// The one refusal a disabled button gives, whatever pressed it.
+    pub fn refuse_disabled(b: &Button) -> Result<(), String> {
+        if b.enabled {
+            Ok(())
+        } else {
+            Err(format!("'{}' is disabled", shown(&b.label)))
         }
+    }
+
+    fn button_index(&self, want: &str) -> Result<usize, String> {
+        let i = self.find_button_index(want).ok_or_else(|| {
+            let labels: Vec<String> = self.buttons.iter().map(|b| shown(&b.label)).collect();
+            format!("no button '{want}'; buttons: {}", labels.join(", "))
+        })?;
+        Self::refuse_disabled(&self.buttons[i])?;
         Ok(i)
     }
 
@@ -2329,6 +2571,25 @@ impl Dialog {
             ("modeless", Json::Bool(self.modeless)),
             ("popup", Json::Bool(self.popup.is_some())),
             ("active", Json::Bool(self.active)),
+            // The layout hints (#1609).
+            (
+                "size",
+                self.size.map_or(Json::Null, |(w, h)| {
+                    Json::Arr(vec![Json::Num(f64::from(w)), Json::Num(f64::from(h))])
+                }),
+            ),
+            (
+                "placement",
+                Json::Str(
+                    if self.buttons_right {
+                        "right"
+                    } else {
+                        "bottom"
+                    }
+                    .into(),
+                ),
+            ),
+            ("columns", Json::Num(self.columns() as f64)),
             ("calendar_open", Json::Bool(self.calendar.is_some())),
             (
                 "calendar",
@@ -2574,6 +2835,11 @@ mod tests_support {
             stale: false,
             seen: None,
             committed: None,
+            size: None,
+            buttons_right: false,
+            page_columns: Vec::new(),
+            epoch: next_epoch(),
+            edits: 0,
             calendar: None,
             popup: None,
         }

@@ -41,7 +41,9 @@ const TRACKED: &[&str] = &[
 ];
 
 /// Every class of known loss and the issue that owns its fix, first match
-/// wins. A baseline entry no class claims fails the gate.
+/// wins. The worksheet classes key on the entry's path (the root `worksheet`,
+/// or the sheet check's `/cells/`), not on the part's name, so they hold for
+/// a worksheet wherever the package keeps it (#1116). A baseline entry no class claims fails the gate.
 const CLASSES: &[LossClass] = &[
     LossClass {
         name: "corrupt input (fuzzed: bad CRCs, an invalid deflate stream) is refused",
@@ -49,16 +51,7 @@ const CLASSES: &[LossClass] = &[
         matches: |e| e.kind == Kind::LoadError && e.file.ends_with("/forcepoint107.xlsx"),
     },
     LossClass {
-        name: "formula calculation flags are dropped (f/@ca, f/@aca when true)",
-        issue: "#1092",
-        matches: |e| {
-            in_sheet_data(e)
-                && e.kind == Kind::LostAttr
-                && ends_with_any(e, &["/c/f/@ca", "/c/f/@aca"])
-        },
-    },
-    LossClass {
-        name: "formula text is re-serialized (spaces dropped, names upper-cased, _xlfn. \
+        name: "formula text is re-serialized (spaces dropped when a formula is reprinted, names upper-cased, _xlfn. \
                added to newer functions; the sheet check finds the same formula \
                otherwise): one entry per cell",
         issue: "#1096",
@@ -76,26 +69,7 @@ const CLASSES: &[LossClass] = &[
         name: "the dimension is recomputed from the cells the model keeps (a source \
                dimension covering dropped empty cells, or a wrong one, changes)",
         issue: "#1096",
-        matches: |e| {
-            e.part.starts_with("xl/worksheets/")
-                && e.kind == Kind::ChangedValue
-                && local(&e.path) == "/worksheet/dimension/@ref"
-        },
-    },
-    LossClass {
-        name: "customWidth=\"1\" is written on every column with an explicit width, \
-               also where the source said false or nothing: one entry per column",
-        issue: "#1093",
-        matches: |e| {
-            e.part.starts_with("xl/worksheets/")
-                && e.kind == Kind::ChangedValue
-                && e.path.strip_prefix("/cols/").is_some_and(|p| {
-                    p.split_once('/').is_some_and(|(span, a)| {
-                        let (lo, hi) = span.split_once(':').unwrap_or((span, span));
-                        col_number(lo).is_some() && col_number(hi).is_some() && a == "customWidth"
-                    })
-                })
-        },
+        matches: |e| e.kind == Kind::ChangedValue && local(&e.path) == "/worksheet/dimension/@ref",
     },
     LossClass {
         name: "docProps/app.xml sheet titles follow the workbook's sheets (a stale \
@@ -142,22 +116,16 @@ fn local(path: &str) -> String {
 }
 
 fn in_sheet_data(e: &Entry) -> bool {
-    e.part.starts_with("xl/worksheets/") && local(&e.path).starts_with("/worksheet/sheetData/")
+    local(&e.path).starts_with("/worksheet/sheetData/")
 }
 
 /// A cell check entry: `/cells/<ref>/<what>`.
 fn is_cell(e: &Entry, what: &str) -> bool {
-    e.part.starts_with("xl/worksheets/")
-        && e.kind == Kind::ChangedValue
+    e.kind == Kind::ChangedValue
         && e.path
             .strip_prefix("/cells/")
             .and_then(|p| p.split_once('/'))
             .is_some_and(|(cell, w)| parse_ref(cell).is_some() && w == what)
-}
-
-fn ends_with_any(e: &Entry, tails: &[&str]) -> bool {
-    let path = local(&e.path);
-    tails.iter().any(|t| path.ends_with(t))
 }
 
 // ---------------------------------------------------------------------------
@@ -2104,6 +2072,117 @@ fn a_backslash_latin1_package_is_compared_by_part_and_cell() {
         not_allowed(found),
         vec![(Kind::PartExtra, "xl/sharedStrings.xml".to_string())]
     );
+}
+
+/// A package whose only worksheet `ws` is the part `name`, found through
+/// the workbook's relationships.
+fn sheet_at(name: &str, ws: Vec<u8>) -> Vec<u8> {
+    const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const RELS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+    let types = format!(
+        r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/{name}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#
+    );
+    let root = format!(
+        r#"<Relationships xmlns="{RELS}"><Relationship Id="rId1" Type="{R}/officeDocument" Target="/xl/workbook.xml"/></Relationships>"#
+    );
+    let wb = format!(
+        r#"<workbook xmlns="{MAIN}" xmlns:r="{R}"><sheets><sheet name="Plan1" sheetId="1" r:id="rId1"/></sheets></workbook>"#
+    );
+    let wb_rels = format!(
+        r#"<Relationships xmlns="{RELS}"><Relationship Id="rId1" Type="{R}/worksheet" Target="/{name}"/></Relationships>"#
+    );
+    package(&[
+        ("[Content_Types].xml", types.into_bytes()),
+        ("_rels/.rels", root.into_bytes()),
+        ("xl/workbook.xml", wb.into_bytes()),
+        ("xl/_rels/workbook.xml.rels", wb_rels.into_bytes()),
+        (name, ws),
+    ])
+}
+
+/// #1116: a worksheet outside xl/worksheets/ gets the same loss classes as
+/// one inside it: a stale dimension, a `<row>` with no `r`, an inline string
+/// moved to the shared strings. The baseline entries of both are claimed.
+#[test]
+fn a_worksheet_outside_xl_worksheets_has_the_sheet_loss_classes() {
+    let ws = format!(
+        r#"<worksheet xmlns="{MAIN}"><dimension ref="A1"/><sheetData><row><c r="A1" t="inlineStr"><is><t>x</t></is></c><c r="B2"><v>7</v></c></row></sheetData></worksheet>"#
+    );
+    let unclaimed = |name: &str, bytes: Vec<u8>| {
+        let mut covered = 0;
+        let found = round_trip(&bytes, Path::new("book.xlsx"), &mut covered);
+        assert!(covered > 0, "the sheet check reads the worksheet");
+        let entries: Vec<Entry> = found.iter().map(|f| Entry::of("book.xlsx", f)).collect();
+        let claimed = |e: &Entry| CLASSES.iter().any(|c| (c.matches)(e));
+        // The findings the classes are for are there in both layouts.
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.path == "/worksheet/dimension/@ref"),
+            "{entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| e.path.ends_with("/row/@r")),
+            "{entries:?}"
+        );
+        // The package's other findings (an added override, a relationship)
+        // are not what the sheet classes are for.
+        let ours = |e: &Entry| e.part == name || e.part.starts_with("xl/sharedStrings");
+        entries
+            .into_iter()
+            .filter(|e| ours(e) && !claimed(e))
+            .collect::<Vec<_>>()
+    };
+    for name in ["xl/worksheets/sheet1.xml", "xl/sheet1.xml"] {
+        assert_eq!(
+            unclaimed(name, sheet_at(name, ws.clone().into_bytes())),
+            vec![],
+            "{name}"
+        );
+    }
+}
+
+/// #1116: the worksheet classes follow the entry's path, not its part name:
+/// a worksheet at xl/sheet1.xml is claimed like one in xl/worksheets/, and
+/// the same path shapes under another root are still a loss.
+#[test]
+fn the_sheet_loss_classes_follow_the_path_not_the_part() {
+    let entry = |part: &str, path: &str, kind| Entry {
+        file: "book.xlsx".into(),
+        part: part.into(),
+        kind,
+        path: path.into(),
+    };
+    let claimed = |e: &Entry| CLASSES.iter().any(|c| (c.matches)(e));
+    for part in [
+        "xl/worksheets/sheet1.xml",
+        "xl/sheet1.xml",
+        "xl/sheet 1.xml",
+    ] {
+        for (kind, path) in [
+            (Kind::ChangedValue, "/worksheet/dimension/@ref"),
+            (Kind::ExtraAttr, "/x:worksheet/x:sheetData/x:row/@r"),
+            (Kind::ChangedValue, "/cells/A1/formula-text"),
+        ] {
+            assert!(claimed(&entry(part, path, kind)), "{part} {path}");
+        }
+    }
+    for (part, kind, path) in [
+        (
+            "xl/styles.xml",
+            Kind::ChangedValue,
+            "/styleSheet/dimension/@ref",
+        ),
+        ("xl/sheet1.xml", Kind::ExtraAttr, "/sst/sheetData/row/@r"),
+        (
+            "xl/sheet1.xml",
+            Kind::ChangedValue,
+            "/worksheetX/dimension/@ref",
+        ),
+        ("xl/sheet1.xml", Kind::ChangedValue, "/cells/A1/style"),
+    ] {
+        assert!(!claimed(&entry(part, path, kind)), "{part} {path}");
+    }
 }
 
 /// #1108 r1: a directory entry written with `\` is a directory too, not a

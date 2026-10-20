@@ -5378,9 +5378,11 @@ struct Docxy {
     /// The open menu's scroll: Up/Down scroll the highlighted row into view,
     /// and each menu (or submenu) starts at the top.
     menu_scroll: ScrollHandle,
-    /// The top dialog's lists' scrolls, by (dialog, control): a choice that
-    /// changes (Up/Down/Home/End) is scrolled into view (#988).
+    /// The top dialog's lists' scrolls, by (dialog opening epoch, control):
+    /// a choice that changes (Up/Down/Home/End) is scrolled into view (#988).
     dialog_lists: std::cell::RefCell<dialog_host::ListScrolls>,
+    /// The top dialog's scrolling grids (#1609), kept like the lists.
+    dialog_grids: std::cell::RefCell<dialog_host::GridScrolls>,
     // New-comment entry bar (Review ▸ New comment); routes keys while open.
     comment_open: bool,
     /// The comment the Review tab's Resolve acts on: the one last clicked in
@@ -14324,6 +14326,7 @@ impl Docxy {
             doc_scroll: ScrollHandle::new(),
             menu_scroll: ScrollHandle::new(),
             dialog_lists: Default::default(),
+            dialog_grids: Default::default(),
             comment_open: false,
             selected_comment: None,
             markup: Default::default(),
@@ -34978,6 +34981,17 @@ impl Docxy {
         self.active_is_doc() || self.active_is_project()
     }
 
+    /// How the active ribbon fits (#1608): Project's collapses whole groups,
+    /// the document's and the sheet's drop labels first (#1020). The live
+    /// fit and `ribbon-read`'s group states both ask this, so they agree.
+    pub(crate) fn ribbon_policy(&self) -> ribbon_fit::Policy {
+        if self.active_is_project() {
+            ribbon_fit::Policy::WholeGroups
+        } else {
+            ribbon_fit::Policy::LabelsFirst
+        }
+    }
+
     /// The active ribbon tab fitted to the window now (#1020): each group's
     /// widths and where it went. The ribbon draws from this, and
     /// `ribbon-read`, `ribbon-layout` and `ribbon-click` ask it too, so a verb
@@ -35007,7 +35021,7 @@ impl Docxy {
             });
             multiunzip(rows)
         };
-        let fit = ribbon_fit::fit(&specs, width);
+        let fit = ribbon_fit::fit_with(&specs, width, self.ribbon_policy());
         RibbonFitNow {
             width,
             titles,
@@ -35122,9 +35136,11 @@ impl Docxy {
     }
 
     /// The ribbon body for the active tab, rendered from the shared ribbonspec
-    /// model with Fluent icons, fitted to the window (#1020): groups drop their
-    /// labels, then collapse to a button whose flyout holds the whole group,
-    /// lowest `priority` first; what still does not fit goes in the chevron.
+    /// model with Fluent icons, fitted to the window under `ribbon_policy`
+    /// (#1020): the document's groups drop their labels, then collapse to a
+    /// button whose flyout holds the whole group; Project's collapse whole
+    /// (#1608); lowest `priority` first, and what still does not fit goes in
+    /// the chevron.
     fn ribbon_body(&self, window: &Window, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let tab = &self.active_ribbon_tab_def();
         let now = self.ribbon_fit_now(window);
@@ -36716,7 +36732,8 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match c {
-            Control::Toggle(cmd) => self.icon_btn(cmd, false, pal, cx),
+            // A toggle with no icon draws its label (#1608).
+            Control::Toggle(cmd) => self.icon_btn(cmd, cmd.icon.0.is_empty(), pal, cx),
             Control::Large(cmd) => self.large_btn(cmd, pal, cx),
             Control::Split { primary, .. } => self.split_btn(primary, pal, cx),
             Control::Dropdown { cmd, .. } => self.dropdown_btn(cmd, pal, cx),
@@ -37363,7 +37380,11 @@ impl Docxy {
             })
             .hover(|d| d.bg(pal.hover))
             .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
-            .child(icon_svg(cmd.icon.0, 16., pal.fg))
+            // A command with no icon draws its label alone: no empty 16 px
+            // slot and gap before it (#1608 r5).
+            .when(!cmd.icon.0.is_empty(), |d| {
+                d.child(icon_svg(cmd.icon.0, 16., pal.fg))
+            })
             .when(show_label, |d| {
                 d.child(
                     div()

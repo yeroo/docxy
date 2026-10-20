@@ -3,20 +3,31 @@
 //! their plumbing is covered end to end without any real plugin.
 //!
 //! - Ribbon: on the Task tab a group "Fixture" with a large button
-//!   `fixture.hello`, a toggle `fixture.flag` and a gallery `fixture.palette`
-//!   of two swatches (`fixture.blue`, `fixture.red`).
+//!   `fixture.hello`, a toggle `fixture.flag`, a toggle `fixture.plain` with
+//!   no icon (its label is drawn, #1608; `fixture.flat` on the Gantt Chart
+//!   Format tab is the same) and a gallery `fixture.palette` of two swatches
+//!   (`fixture.blue`, `fixture.red`).
 //! - Menus: a row-menu item `fixture.rename` after "Notes...".
-//! - Dialogs: a Task Information page "Fixture" with a multiline and a grid,
-//!   and a dialog `fixture.options` (a number, a label the state fills from
-//!   the number and the first selected task's name, a grid of the plan's
-//!   task names whose selected row the state keeps on the selected task,
-//!   and a Bump button, #1610)
-//!   that `fixture.hello` opens; OK sends `fixture.hello` again with the
-//!   values, Bump sends it with `button: "bump"` (one `task.set` op naming
-//!   the task "Bumped by fixture", the dialog kept open).
+//! - Dialogs: a Task Information page "Fixture" with a multiline and a grid
+//!   (and a header label drawn above every page, #1609), and a dialog
+//!   `fixture.options` (a number and a label the state fills from the number
+//!   and the first selected task's name in a `Numbers` group box, a grid of
+//!   the plan's task names whose selected row the state keeps on the
+//!   selected task (#1610), a sample box the state styles, a filling memo; a
+//!   fixed size, two columns, Help bottom left, #1609; a Bump button) that
+//!   `fixture.hello` opens; OK sends `fixture.hello` again with the values,
+//!   Bump sends it with `button: "bump"` (one `task.set` op naming the task
+//!   "Bumped by fixture", the dialog kept open), Help is the host's (#1609: the
+//!   dialog names no `help` URL, so the host says its documentation is
+//!   coming). A header text `fixture.title` sits above the page and the
+//!   echo label repeats its value, which the state sees at open; the header
+//!   text spans two columns beside a tag field. The modeless `fixture.sheet`
+//!   has its buttons down the right (Help last, opening its `help` page) and
+//!   a grid of six rows.
 //! - Commands: `fixture.hello` (the dialog, then a status with its number),
-//!   `fixture.flag` (flips the toggle: a view switch of the same name the
-//!   host stores in the plan's formatting, #1553), the swatches (set the palette,
+//!   `fixture.flag`, `fixture.plain` and `fixture.flat` (each flips its
+//!   toggle: a view switch of its own name the host stores in the plan's
+//!   formatting, #1553), the swatches (set the palette,
 //!   returned as `view.palette`), `fixture.rename` (one `task.set` op
 //!   renaming the first selected task to "Renamed by fixture"), and
 //!   `task-information` (the page's OK: a status with the note's length),
@@ -40,27 +51,37 @@ const MANIFEST: &str = r##"{
   "ribbon":[{"tab":"Task","groups":[{"title":"Fixture","controls":[
     {"id":"fixture.hello","kind":"button","label":"Hello","tip":"Say hello from the fixture","keytip":"XH","icon":"comment","large":true},
     {"id":"fixture.flag","kind":"toggle","label":"Flag","tip":"A toggle the fixture keeps","keytip":"XF","icon":"lock"},
+    {"id":"fixture.plain","kind":"toggle","label":"Plain","tip":"A toggle with no icon: its label is drawn (#1608)","keytip":"XP","icon":""},
     {"id":"fixture.palette","kind":"gallery","label":"Palette","tip":"Bar palettes","swatches":[
       {"id":"fixture.blue","label":"Blue","color":"#3366CC","preview":"fixture.blue"},
       {"id":"fixture.red","label":"Red","color":"#CC3333","preview":"fixture.red"}]},
     {"id":"fixture.bold","kind":"toggle","label":"Bold","tip":"Bold on the selected cells (the view's cells)","keytip":"XB","icon":"bold"},
-    {"id":"fixture.sheet","kind":"button","label":"Sheet (fixture)","tip":"A modeless dialog with a grid and buttons of its own","keytip":"XS","icon":"numbers"}]}]},
+    {"id":"fixture.sheet","kind":"button","label":"Sheet (fixture)","tip":"A modeless dialog with a grid and buttons of its own","keytip":"XS","icon":"table"}]}]},
     {"tab":"Gantt Chart Format","groups":[{"title":"Fixture Format","before":"Bar Styles","controls":[
-    {"id":"fixture.format","kind":"button","label":"Format (fixture)","tip":"A group placed before Bar Styles; sets or clears the plan's gridlines","icon":"font"}]}]}],
+    {"id":"fixture.format","kind":"button","label":"Format (fixture)","tip":"A group placed before Bar Styles; sets or clears the plan's gridlines","icon":"font-name"},
+    {"id":"fixture.flat","kind":"toggle","label":"Flat","tip":"A toggle with no icon on a tab that fits: its drawn label is measured (#1608)","icon":""}]}]}],
   "menus":[{"menu":"row","items":[{"id":"fixture.rename","label":"Rename (fixture)","icon":"comment","after":"Notes..."}]}],
   "dialogs":[
-    {"id":"task-information","pages":[{"name":"Fixture","controls":[
+    {"id":"task-information","header":[{"name":"fixture.head","label":"Fixture head:","kind":"label","value":"on every page"}],
+     "pages":[{"name":"Fixture","columns":2,"controls":[
       {"name":"fixture.note","label":"Fixture &note:","kind":"multiline","value":""},
       {"name":"fixture.grid","label":"Fixture items","kind":"grid","columns":[{"name":"Name","kind":"text"},{"name":"Done","kind":"checkbox"}],"value":[["a","false"],["b","true"]]},
       {"name":"fixture.pick","label":"Fixture p&ick:","kind":"dropdown","items":["none"],"value":"none"},
       {"name":"fixture.locked","label":"Fixture locked","kind":"checkbox","value":true}]}]},
-    {"id":"fixture.options","title":"Fixture Options","pages":[{"name":"General","controls":[
-      {"name":"n","label":"&Number:","kind":"number","value":"1"},
-      {"name":"fixture.echo","label":"","kind":"label","value":""},
-      {"name":"fixture.tasks","label":"Tasks","kind":"grid","columns":[{"name":"Name","kind":"text"}],"value":[]}]}],"buttons":["OK","Cancel",{"id":"bump","label":"&Bump"}]},
-    {"id":"fixture.sheet","title":"Fixture Sheet","modeless":true,"pages":[{"name":"Sheet","controls":[
-      {"name":"fixture.rows","label":"Tasks","kind":"grid","commit_command":true,"columns":[{"name":"Pick","kind":"check"},{"name":"Name","kind":"text"},{"name":"Units","kind":"number"}],"value":[]}]}],
-     "buttons":[{"id":"apply","label":"&Apply","default":true},{"id":"clear","label":"Clear"},{"id":"close","label":"Close","cancel":true}]}],
+    {"id":"fixture.options","title":"Fixture Options","size":[460,400],"header":[{"name":"fixture.title","label":"&Title:","kind":"text","value":"Fixture","span":2},{"name":"fixture.tag","label":"Ta&g:","kind":"text","value":""}],"pages":[{"name":"General","columns":2,"controls":[
+      {"name":"n","label":"&Number:","kind":"number","value":"1","group":"Numbers"},
+      {"name":"fixture.echo","label":"","kind":"label","value":"","group":"Numbers"},
+      {"name":"fixture.tasks","label":"Tasks","kind":"grid","columns":[{"name":"Name","kind":"text"}],"value":[],"min_rows":3},
+      {"name":"fixture.sample","label":"Sample","kind":"sample","value":{"text":"AaBbYyZz"}},
+      {"name":"fixture.memo","label":"&Memo:","kind":"multiline","value":"","span":2,"fill":true}]},
+      {"name":"Styles","columns":3,"controls":[
+      {"name":"fixture.font","label":"&Font:","kind":"list","items":["Calibri","Segoe UI","Times New Roman"],"value":"Segoe UI"},
+      {"name":"fixture.style","label":"Font st&yle:","kind":"list","items":["Regular","Italic","Bold","Bold Italic"],"value":"Regular"},
+      {"name":"fixture.size","label":"&Size:","kind":"list","items":["8","9","10","11","12","14"],"value":"11"}]}],
+     "buttons":["OK","Cancel",{"id":"help","label":"Help","cancel":true},{"id":"bump","label":"&Bump"}]},
+    {"id":"fixture.sheet","title":"Fixture Sheet","modeless":true,"placement":"right","help":"https://example.test/fixture-help","pages":[{"name":"Sheet","controls":[
+      {"name":"fixture.rows","label":"Tasks","kind":"grid","commit_command":true,"min_rows":6,"columns":[{"name":"Pick","kind":"check"},{"name":"Name","kind":"text"},{"name":"Units","kind":"number"}],"value":[]}]}],
+     "buttons":[{"id":"apply","label":"&Apply","default":true},{"id":"clear","label":"Clear"},{"id":"close","label":"Close","cancel":true},"Help"]}],
   "palettes":[
     {"id":"fixture.blue","label":"Blue","bars":[{"kind":"on-track","color":"#3366CC","shape":"bar"},{"kind":"critical","color":"#1F3763","shape":"bar"}]},
     {"id":"fixture.red","label":"Red","bars":[{"kind":"on-track","color":"#CC3333","shape":"bar"},{"kind":"critical","color":"#7F0000","shape":"bar"}]}],
@@ -99,9 +120,14 @@ fn bold(req: &Json) -> bool {
 
 /// The toggle's state: the `fixture.flag` switch of the request's view.
 fn flag(req: &Json) -> bool {
+    switch_on(req, "fixture.flag")
+}
+
+/// A named switch of the request's view (#1553); off when absent.
+fn switch_on(req: &Json, name: &str) -> bool {
     req.get("view")
         .and_then(|v| v.get("switches"))
-        .and_then(|s| s.get("fixture.flag"))
+        .and_then(|s| s.get(name))
         .and_then(Json::bool)
         .unwrap_or(false)
 }
@@ -245,8 +271,10 @@ pub unsafe extern "C" fn yppx_ui_state(input: *const u8, len: usize, out: *mut Y
     };
     let selected = first_uid(&req).is_some();
     let mut reply = format!(
-        r#"{{"controls":{{"fixture.flag":{{"enabled":true,"checked":{}}},"fixture.bold":{{"enabled":{selected},"checked":{}}},"fixture.rename":{{"enabled":{selected}}}}},"gallery":{{"fixture.palette":{}}}"#,
+        r#"{{"controls":{{"fixture.flag":{{"enabled":true,"checked":{}}},"fixture.plain":{{"enabled":true,"checked":{}}},"fixture.flat":{{"enabled":true,"checked":{}}},"fixture.bold":{{"enabled":{selected},"checked":{}}},"fixture.rename":{{"enabled":{selected}}}}},"gallery":{{"fixture.palette":{}}}"#,
         flag(&req),
+        switch_on(&req, "fixture.plain"),
+        switch_on(&req, "fixture.flat"),
         bold(&req),
         quote(&palette())
     );
@@ -271,11 +299,18 @@ pub unsafe extern "C" fn yppx_ui_state(input: *const u8, len: usize, out: *mut Y
                 .get("values")
                 .and_then(|v| v.get("n"))
                 .map_or_else(String::new, number_text);
+            // The header's declared value reaches the state at open (#1609).
+            let title = dialog
+                .get("values")
+                .and_then(|v| v.get("fixture.title"))
+                .and_then(Json::str)
+                .unwrap_or("?");
             let name = first_uid(&req)
                 .and_then(|uid| task_name_of(&req, uid))
                 .unwrap_or_default();
             // The grid: one row per task, the selected task's row selected
-            // (a modal dialog's grid follows the plan, #1610).
+            // (a modal dialog's grid follows the plan, #1610); the sample
+            // follows the number (odd: bold; size 12 + n, #1609).
             let names = task_names(&req);
             let rows: Vec<String> = names.iter().map(|n| format!("[{}]", quote(n))).collect();
             let selected = first_uid(&req)
@@ -285,10 +320,16 @@ pub unsafe extern "C" fn yppx_ui_state(input: *const u8, len: usize, out: *mut Y
                         .position(|u| u.trim() == uid.to_string())
                 })
                 .map_or("null".to_string(), |i| i.to_string());
+            let n_val: f64 = n.parse().unwrap_or(0.0);
+            // Help is greyed while the number is 0 (#1609: the host refuses a
+            // disabled Help like any button).
             reply.push_str(&format!(
-                r#","values":{{"fixture.echo":{},"fixture.tasks":[{}],"fixture.tasks.selected_row":{selected}}}"#,
-                quote(&format!("Number {n} for {name}")),
-                rows.join(",")
+                r#","values":{{"fixture.echo":{},"fixture.tasks":[{}],"fixture.tasks.selected_row":{selected},"fixture.sample":{{"text":"AaBbYyZz","bold":{},"size":{}}}}},"enabled":{{"help":{}}}"#,
+                quote(&format!("Number {n} for {name} ({title})")),
+                rows.join(","),
+                n_val as i64 % 2 == 1,
+                12 + (n_val as i64).clamp(0, 12),
+                n_val != 0.0
             ));
         }
         if dialog.get("id").and_then(Json::str) == Some("task-information") {
@@ -442,10 +483,15 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
             }
             Some(_) => r#"{"ops":[],"status":"Fixture: cleared","close":true}"#.to_string(),
         },
-        "fixture.flag" => {
-            let on = !flag(&req);
+        "fixture.flag" | "fixture.plain" | "fixture.flat" => {
+            let on = !switch_on(&req, id);
+            let word = match id {
+                "fixture.flag" => "flag",
+                "fixture.plain" => "plain",
+                _ => "flat",
+            };
             format!(
-                r#"{{"ops":[],"status":"Fixture: flag {}","view":{{"switches":{{"fixture.flag":{on}}}}}}}"#,
+                r#"{{"ops":[],"status":"Fixture: {word} {}","view":{{"switches":{{"{id}":{on}}}}}}}"#,
                 if on { "on" } else { "off" }
             )
         }

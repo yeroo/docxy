@@ -331,8 +331,11 @@ cargo test -p gridcore --test fidelity -- --nocapture
   read the way a spreadsheet reads it. A worksheet is any part under
   `xl/worksheets/` or one the workbook's worksheet relationships name. Parts
   are keyed by their OPC name (an entry written `xl\sheet1.xml` is
-  `xl/sheet1.xml`), and a part declaring ISO-8859-1 is read by its
-  declaration, as the loaders read it (#1108).
+  `xl/sheet1.xml`), and a part declaring windows-1252 or ISO-8859-1
+  is read by its declaration, as the loaders read it (#1108, #1116). The loss
+  classes for a worksheet's `sheetData`, `dimension` and cells match the
+  entry's path (the root `worksheet`, or `/cells/`), so they apply to a
+  worksheet wherever the package keeps it.
 
   **Per cell** either side lists, it compares three things:
   - the **value**. Shared strings are found through the workbook's
@@ -387,8 +390,7 @@ cargo test -p gridcore --test fidelity -- --nocapture
   - rows carrying nothing but `r` and `spans`.
 
   Everything else stays structural. That includes other row attributes,
-  other cell attributes (`vm`, `cm`, `ph`), other formula attributes (`ca`,
-  `aca`), phonetic runs, and a lost cell that carried any of them. Those
+  other cell attributes (`vm`, `cm`, `ph`), other formula attributes, phonetic runs, and a lost cell that carried any of them. Those
   baseline lines are index-free like docx's, so one line covers every
   occurrence in that sheet. The test prints how many findings the check
   covered.

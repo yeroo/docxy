@@ -184,6 +184,12 @@ pub struct CellMeta {
     /// gives it a `cm` naming an `fDynamic` entry in `xl/metadata.xml`. Sticky,
     /// like a loaded `cm`: a later scalar result (`FILTER` → `#CALC!`) keeps it.
     pub dynamic: bool,
+    /// The `<f>` `ca` (always calculate) attribute as the file spelled it
+    /// (`1`, `true`, `0`); written back on the cell's `<f>`. Kept off
+    /// `Cell::f_attrs`, which marks a non-array formula as preserved.
+    pub f_ca: Option<String>,
+    /// The `<f>` `aca` (array always calculate) attribute, as `f_ca`.
+    pub f_aca: Option<String>,
 }
 
 /// Do preserved `<f>` attributes (see [`Cell::f_attrs`]) mark an array
@@ -451,6 +457,11 @@ pub struct ColDef {
     /// with no width as zero wide. A loaded `<col>` without a width loads
     /// as `Some(0.0)`, as Excel shows it (#1152).
     pub default_width: bool,
+    /// `width` is `Some` but the source `<col>` was not marked `customWidth`
+    /// (absent, `0` or `false`): the save leaves `customWidth` out, as the
+    /// source had it (#1093). A width the model makes is custom, so this is
+    /// false there, and always when `width` is `None`.
+    pub plain_width: bool,
 }
 
 /// Excel's default column width in character units.
@@ -1535,9 +1546,39 @@ impl Sheet {
         self.cells.get(&(row, col))
     }
 
-    /// Set (or clear, when the cell is blank and unstyled) a cell.
+    /// Does an explicit default-style cell at `(row, col)` matter? True when
+    /// the row has a style (`customFormat` with an `s` other than 0) or a
+    /// `<col>` covering the column does: the cell then overrides what it
+    /// would inherit, so a save must keep it (#1064).
+    pub fn pins_default(&self, row: u32, col: u32) -> bool {
+        let styled = |s: Option<&str>| s.is_some_and(|s| s.trim() != "0");
+        self.row_attrs.get(&row).is_some_and(|a| {
+            matches!(xml_attr(a, "customFormat"), Some("1" | "true")) && styled(xml_attr(a, "s"))
+        }) || self
+            .col_defs
+            .iter()
+            .any(|d| (d.min..=d.max).contains(&col) && styled(xml_attr(&d.attrs, "style")))
+    }
+
+    /// Set (or clear, when the cell is blank and unstyled) a cell. A blank
+    /// default-style cell that is already there stays when its row or column
+    /// has a style ([`Sheet::pins_default`]); one written over an absent cell
+    /// never invents a pin.
     pub fn set_cell(&mut self, row: u32, col: u32, cell: Cell) {
         if cell.is_blank() && cell.style == 0 {
+            if !(self.cells.contains_key(&(row, col)) && self.pins_default(row, col)) {
+                self.cells.remove(&(row, col));
+                return;
+            }
+        }
+        self.cells.insert((row, col), cell);
+    }
+
+    /// Put a cell where a known state says it belongs (a sort moving a
+    /// pinned blank, an undo restoring one): a blank default-style cell is
+    /// kept iff the row or column pins the default, present there or not.
+    pub fn put_pinned(&mut self, row: u32, col: u32, cell: Cell) {
+        if cell.is_blank() && cell.style == 0 && !self.pins_default(row, col) {
             self.cells.remove(&(row, col));
         } else {
             self.cells.insert((row, col), cell);
@@ -1555,6 +1596,19 @@ impl Sheet {
                 ..Cell::default()
             },
         );
+    }
+
+    /// [`Sheet::clear_cell`] for an area the engine owns (a spill's old
+    /// extent, a consolidation's output area): a style-0 cell goes whatever
+    /// its row or column style, a file-pinned blank included, so the engine
+    /// never leaves a pin behind. A styled cell keeps its style.
+    pub fn clear_cell_unpinned(&mut self, row: u32, col: u32) {
+        // Any style-0 cell, a file-pinned blank included (see above).
+        if self.cells.get(&(row, col)).is_some_and(|c| c.style == 0) {
+            self.cells.remove(&(row, col));
+        } else {
+            self.clear_cell(row, col);
+        }
     }
 
     /// (rows, cols) of the used range — the smallest grid containing all cells.
@@ -1790,6 +1844,7 @@ impl Sheet {
                 width: None,
                 attrs: String::new(),
                 default_width: true,
+                plain_width: false,
             });
         }
         out.sort_by_key(|d| d.min);
@@ -1816,6 +1871,7 @@ impl Sheet {
                     if p.max + 1 == d.min
                         && p.width == d.width
                         && p.default_width == d.default_width
+                        && p.plain_width == d.plain_width
                         && same(&p.attrs, &d.attrs) =>
                 {
                     p.max = d.max;
@@ -1839,7 +1895,9 @@ impl Sheet {
 
     /// Set one column's width, splitting any range definition that covers it.
     pub fn set_col_width(&mut self, col: u32, width: f64) {
-        self.isolate_col(col).width = Some(width);
+        let def = self.isolate_col(col);
+        def.width = Some(width);
+        def.plain_width = false;
     }
 
     /// The merged region containing (row, col), if any.
@@ -3427,6 +3485,7 @@ mod tests {
             width: Some(12.0),
             attrs: String::new(),
             default_width: false,
+            plain_width: false,
         });
         s.set_col_width(2, 20.0);
         assert_eq!(s.col_width(1), 12.0);
@@ -3492,6 +3551,7 @@ mod tests {
             width: None,
             attrs: "hidden=\"1\"".into(),
             default_width: false,
+            plain_width: false,
         });
         assert!(s.col_hidden(2) && s.col_hidden(4));
         assert!(!s.col_hidden(1) && !s.col_hidden(5));

@@ -707,6 +707,7 @@ mod tests {
             width: Some(12.0),
             attrs: " style=\"3\"".into(),
             default_width: false,
+            plain_width: false,
         });
         group(&mut s, Axis::Cols, 2, 4).unwrap();
         assert_eq!(

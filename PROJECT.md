@@ -500,7 +500,7 @@ without one nothing changes.
   `chart`, `heading-filter` menu with an `after` label hint), `dialogs`
   (specs by id: pages of controls with kinds `text`, `number`, `date`,
   `duration`, `checkbox`, `radio`, `dropdown`, `list`, `grid` with per-column
-  kinds, `multiline`, `label`, `color`, `font`; the `task-information` spec's
+  kinds, `multiline`, `label`, `sample` (a read-only preview box the state feeds, #1609), `color`, `font`; the `task-information` spec's
   pages add to the host's Task Information dialog, one named like a built-in
   page replacing it), `palettes` (bar colours and shapes per kind) and
   `text_style_categories`. A contributed control, menu item or page whose id
@@ -538,6 +538,29 @@ without one nothing changes.
   the plan or the selection moved since the dialog last saw them (under a
   modal dialog, through its own command) every value the state gives
   applies, so a modal dialog's grid shows the rows its ops made.
+  Layout hints (#1609), all optional: a dialog's `size: [w, h]` (fixed,
+  shared by every page), `placement: "bottom" | "right"` (Help bottom left
+  and the rest bottom right, or a column down the right), `header: [...]`
+  (controls drawn above every page); a page's `columns: n` (controls per
+  row, labels aligned per column); a control's `group` (a titled box
+  around consecutive controls naming it), `span` (columns it takes),
+  `min_rows` (a grid's visible rows, 1 to 64, empty rows drawn, more
+  scroll with a scrollbar, whose track appears only then; a plugin grid's
+  default is 8), `fill` (a
+  multiline fills the remaining height of a dialog with a `size`), and the
+  `sample` kind (a read-only box drawing `{text, font, size, bold, italic,
+  underline, color, background}`, the formatting model's text style). A
+  `Help` button is the host's: it opens the spec's `help` URL (recorded for
+  the harness's `last-url`), else says the documentation is coming; it is
+  never sent to the plugin and never the default. A tabbed dialog without a
+  `size` sizes to the shown page, so switching pages may resize it: a stable
+  size needs an explicit `size`. A `task-information` spec's pages take
+  `columns`, `group`, `span` and `min_rows` (the page's columns lay out the
+  plugin's controls; the built-in Name, Duration and Estimated row keeps its
+  one-column shape on every page), and its `header` controls are drawn
+  above that row on every page, first in the Tab order; `size`, `placement`,
+  `fill` and `help` belong to a plugin's own dialog (Task Information's Help
+  is the host's and says the documentation is coming).
 - **Overlay** (`yppx_ui_overlay`): the rows in view (`uid`, `row_y`, the bar
   rectangle, kind flags, since #1548 `name`, `percent_complete`,
   `deadline_x`, `constraint {type, x}` and `resource_names`, and since

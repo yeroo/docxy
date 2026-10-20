@@ -36,7 +36,7 @@ pub use repair::{Repairs, load_xlsx_repair};
 
 use std::borrow::Cow;
 
-use crate::formula::{file_formula, translate_formula};
+use crate::formula::{file_formula, translate_formula, translate_formula_spaced};
 use crate::sheet::{
     CalcMode, CalcSettings, Cell, CellMeta, CellValue, ColDef, DefinedName, NumFmt, Sheet, Styles,
     Table, Workbook, Xf, cell_name, classify_builtin, classify_format_code, is_array_f,
@@ -252,11 +252,12 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
     load_parts(parts)
 }
 
-/// A part as the loader reads it: UTF-8. A part declaring ISO-8859-1 is
-/// transcoded and then declares UTF-8, so its text survives and a save
-/// writes what it declares (#1108); any other part is kept as it is.
+/// A part as the loader reads it: UTF-8. A part declaring windows-1252 or
+/// ISO-8859-1 is transcoded and then declares UTF-8, so its text survives
+/// and a save writes what it declares (#1108, #1116); any other part
+/// (UTF-16 too) is kept as it is.
 fn utf8_part(bytes: Vec<u8>) -> Vec<u8> {
-    match opccore::xml::latin1_to_utf8(&bytes) {
+    match opccore::xml::declared_to_utf8(&bytes) {
         Some(text) => text.into_bytes(),
         None => bytes,
     }
@@ -2578,6 +2579,7 @@ fn parse_worksheet_with(
                     let custom = matches!(p.attr("customWidth").trim(), "1" | "true");
                     let default_width = !custom && width == Some(sheet.default_col_file_width());
                     let width = if default_width { None } else { width };
+                    let plain_width = !custom && width.is_some();
                     let mut attrs = String::new();
                     for a in p.attrs() {
                         if !matches!(a.name, "min" | "max" | "width" | "customWidth") {
@@ -2594,6 +2596,7 @@ fn parse_worksheet_with(
                         width,
                         attrs,
                         default_width,
+                        plain_width,
                     });
                 }
                 "row" if in_sheet_data => {
@@ -2642,8 +2645,11 @@ fn parse_worksheet_with(
                     // `cm` is the dynamic-array marker: meaningless (and never
                     // written) on anything but an array `<f>`.
                     let array_f = cell.f_attrs.as_deref().is_some_and(is_array_f);
+                    let loaded = cell.meta.take();
                     let meta = CellMeta {
-                        sst: cell.meta.take().and_then(|m| m.sst),
+                        sst: loaded.as_ref().and_then(|m| m.sst),
+                        f_ca: loaded.as_ref().and_then(|m| m.f_ca.clone()),
+                        f_aca: loaded.and_then(|m| m.f_aca),
                         cm: (!cm.is_empty() && array_f).then_some(cm),
                         vm: (!vm.is_empty()).then(|| (vm, cell.value.clone())),
                         ph,
@@ -2657,20 +2663,8 @@ fn parse_worksheet_with(
                     // unless its row or column has a style: then the cell
                     // pins the default, and without it the cell would show
                     // the row's or column's format (#1064).
-                    let pins_default = || {
-                        let styled = |s: Option<&str>| s.is_some_and(|s| s.trim() != "0");
-                        sheet.row_attrs.get(&row).is_some_and(|a| {
-                            matches!(
-                                crate::sheet::xml_attr(a, "customFormat"),
-                                Some("1" | "true")
-                            ) && styled(crate::sheet::xml_attr(a, "s"))
-                        }) || sheet.col_defs.iter().any(|d| {
-                            (d.min..=d.max).contains(&col)
-                                && styled(crate::sheet::xml_attr(&d.attrs, "style"))
-                        })
-                    };
                     if !(cell.is_blank() && cell.style == 0 && cell.f_attrs.is_none())
-                        || pins_default()
+                        || sheet.pins_default(row, col)
                     {
                         sheet.cells.insert((row, col), cell);
                     }
@@ -2946,7 +2940,7 @@ fn parse_worksheet_with(
         }
         let dr = row as i64 - *mr as i64;
         let dc = col as i64 - *mc as i64;
-        let translated = translate_formula(src, dr, dc);
+        let translated = translate_formula_spaced(src, dr, dc);
         if let Some(cell) = sheet.cells.get_mut(&(row, col)) {
             match &translated {
                 Some(f) => {
@@ -3128,6 +3122,7 @@ fn parse_cell_body(
     let mut is_text: Option<String> = None; // inline string content
     let mut formula: Option<String> = None;
     let mut f_attrs: Option<String> = None;
+    let (mut f_ca, mut f_aca) = (None, None);
     let mut depth = 1;
     let mut in_v = false;
     let mut in_f = false;
@@ -3147,6 +3142,14 @@ fn parse_cell_body(
                         let t = p.attr("t").to_string();
                         let si = p.attr("si").to_string();
                         let ref_attr = p.attr("ref").to_string();
+                        let flag = |name: &str| {
+                            p.attrs()
+                                .iter()
+                                .any(|a| a.name == name)
+                                .then(|| p.attr(name).to_string())
+                        };
+                        f_ca = flag("ca");
+                        f_aca = flag("aca");
                         match t.as_str() {
                             "shared" => {
                                 // Master carries text (captured below);
@@ -3277,9 +3280,11 @@ fn parse_cell_body(
         f_attrs,
         style,
         spill,
-        meta: sst.map(|i| {
+        meta: (sst.is_some() || f_ca.is_some() || f_aca.is_some()).then(|| {
             Box::new(CellMeta {
-                sst: Some(i),
+                sst,
+                f_ca,
+                f_aca,
                 ..CellMeta::default()
             })
         }),
@@ -3300,6 +3305,23 @@ fn saved_formula<'a>(cell: &Cell, src: &'a str) -> Cow<'a, str> {
         Some(l) if l == src => Cow::Borrowed(src),
         _ => file_formula(src),
     }
+}
+
+/// Does the `<f ...>text</f>` in `f_xml` have XML whitespace (a CR is written
+/// as `&#13;`) at either end of its text, with no `xml:space` of its own?
+fn f_text_needs_preserve(f_xml: &str) -> bool {
+    let Some((open, rest)) = f_xml.split_once('>') else {
+        return false;
+    };
+    let Some(text) = rest.strip_suffix("</f>") else {
+        return false;
+    };
+    let space = |c: char| matches!(c, ' ' | '\t' | '\n');
+    !open.contains(" xml:space=")
+        && (text.starts_with(space)
+            || text.ends_with(space)
+            || text.starts_with("&#13;")
+            || text.ends_with("&#13;"))
 }
 
 /// The `<f>` the parser is on, its attributes re-serialised verbatim.
@@ -4678,6 +4700,26 @@ fn cell_xml(
         (None, _) => (String::new(), false),
     };
 
+    // `ca`/`aca` ride on any formula's `<f>`; an array or unparsed shared
+    // `<f>` already carries its own in the raw attributes.
+    let mut f_xml = f_xml;
+    if let Some(m) = &cell.meta {
+        for (name, v) in [("ca", &m.f_ca), ("aca", &m.f_aca)] {
+            if let Some(v) = v.as_deref().filter(|_| f_xml.starts_with("<f")) {
+                let start = f_xml.find('>').map_or(f_xml.len(), |i| i + 1);
+                if !f_xml[..start].contains(&format!(" {name}=\"")) {
+                    f_xml.insert_str(2, &format!(" {name}=\"{}\"", esc_raw_attr(v)));
+                }
+            }
+        }
+    }
+
+    // A reader trims the XML whitespace around an element's text unless told
+    // to keep it: a formula typed with a space at either end says so.
+    if f_xml.starts_with("<f") && f_text_needs_preserve(&f_xml) {
+        f_xml.insert_str(2, " xml:space=\"preserve\"");
+    }
+
     // Schema order after `t`: cm, vm, ph. `cm` marks a dynamic array, so it
     // only belongs on an array `<f>`; `vm` describes the loaded value.
     let mut tail = String::new();
@@ -4786,6 +4828,7 @@ fn splice_worksheet(
             // hide) is written at the sheet's default. A loaded one without
             // a width is 0 wide in the model.
             let width = match d.width {
+                Some(w) if d.plain_width => format!(" width=\"{w}\""),
                 Some(w) => format!(" width=\"{w}\" customWidth=\"1\""),
                 None => format!(" width=\"{}\"", sheet.default_col_file_width()),
             };
@@ -12674,6 +12717,31 @@ mod tests {
         assert!(sheet.cells.contains_key(&(1, 2)), "under the column style");
     }
 
+    /// #1097: the edit paths keep what the reader kept: typing into a pinned
+    /// B1 and undoing it still saves `<c r="B1"`.
+    #[test]
+    fn a_pinned_blank_survives_type_undo_and_save() {
+        let mut pkg = new_xlsx();
+        let sh = &mut pkg.workbook.sheets[0];
+        sh.col_defs.push(crate::sheet::ColDef {
+            min: 1,
+            max: 1,
+            width: Some(9.0),
+            attrs: r#"style="7""#.to_string(),
+            default_width: false,
+            plain_width: false,
+        });
+        sh.put_pinned(0, 1, Cell::default());
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 1), Cell::number(1.0));
+        eng.restore_snapshot(&mut pkg.workbook, 0, &[(0, 1, Some(Cell::default()))]);
+        let back = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert!(back.workbook.sheets[0].cells.contains_key(&(0, 1)));
+        let part = back.sheet_parts[0].clone();
+        let xml = String::from_utf8(back.part(&part).unwrap().to_vec()).unwrap();
+        assert!(xml.contains(r#"<c r="B1""#), "{xml}");
+    }
+
     /// #1064: Excel 2013+ writes `<x15:workbookPr chartTrackingRefBase>` in
     /// extLst; it must not reset the date system the real workbookPr set.
     #[test]
@@ -14860,6 +14928,101 @@ b",
         }
     }
 
+    fn formula_at(pkg: &SheetPackage, row: u32, col: u32) -> String {
+        pkg.workbook.sheets[0]
+            .cell(row, col)
+            .and_then(|c| c.formula.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn an_unedited_save_keeps_the_spacing_typed_in_a_plain_formula() {
+        // #1155: Excel keeps the whitespace a person typed inside a formula.
+        let rows = concat!(
+            r#"<row r="1"><c r="C1"><f>IF($A7 = $F7, TRUE, FALSE)</f><v>1</v></c>"#,
+            r#"<c r="D1"><f>AGGREGATE( L$14,$A25,$C$1:$C$11)</f><v>1</v></c>"#,
+            r#"<c r="E1"><f xml:space="preserve"> Sheet!A1</f><v>1</v></c></row>"#,
+        );
+        let (re, ws) = resaved(&book_with_rows(rows));
+        assert!(ws.contains("<f>IF($A7 = $F7, TRUE, FALSE)</f>"), "{ws}");
+        assert!(
+            ws.contains("<f>AGGREGATE( L$14,$A25,$C$1:$C$11)</f>"),
+            "{ws}"
+        );
+        assert_eq!(formula_at(&re, 0, 4), " Sheet!A1");
+    }
+
+    #[test]
+    fn a_shared_follower_keeps_the_spacing_of_its_master() {
+        let rows = concat!(
+            r#"<row r="3"><c r="G3"><f t="shared" ref="G3:G5" si="0">IF($A3 = $F3, TRUE, FALSE)</f><v>1</v></c></row>"#,
+            r#"<row r="4"><c r="G4"><f t="shared" si="0"/><v>1</v></c></row>"#,
+            r#"<row r="5"><c r="G5"><f t="shared" si="0"/><v>1</v></c></row>"#,
+        );
+        let pkg = book_with_rows(rows);
+        assert_eq!(formula_at(&pkg, 4, 6), "IF($A5 = $F5, TRUE, FALSE)");
+        let (re, ws) = resaved(&pkg);
+        assert!(ws.contains("<f>IF($A5 = $F5, TRUE, FALSE)</f>"), "{ws}");
+        assert_eq!(formula_at(&re, 3, 6), "IF($A4 = $F4, TRUE, FALSE)");
+    }
+
+    #[test]
+    fn a_prefixed_shared_master_gives_spaced_followers_and_saves_the_prefix() {
+        // forcepoint97: `_xlfn.AGGREGATE( C$14,...)`, relative column shifts.
+        let rows = concat!(
+            r#"<row r="17"><c r="C17"><f t="shared" ref="C17:D17" si="3">_xlfn.AGGREGATE( C$14,$A17,$C$1:$C$11)</f><v>1</v></c>"#,
+            r#"<c r="D17"><f t="shared" si="3"/><v>1</v></c></row>"#,
+        );
+        let pkg = book_with_rows(rows);
+        assert_eq!(formula_at(&pkg, 16, 3), "AGGREGATE( D$14,$A17,$C$1:$C$11)");
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains("<f>_xlfn.AGGREGATE( D$14,$A17,$C$1:$C$11)</f>"),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn a_follower_whose_texts_do_not_align_is_the_printed_text() {
+        // The printer drops the redundant parentheses: no alignment, so the
+        // follower is what it was before spacing was kept.
+        let rows = concat!(
+            r#"<row r="2"><c r="B2"><f t="shared" ref="B2:B3" si="0">(A1) + 2</f><v>1</v></c></row>"#,
+            r#"<row r="3"><c r="B3"><f t="shared" si="0"/><v>1</v></c></row>"#,
+        );
+        let pkg = book_with_rows(rows);
+        assert_eq!(
+            formula_at(&pkg, 2, 1),
+            crate::formula::translate_formula("(A1) + 2", 1, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_formula_with_an_outer_space_is_saved_with_xml_space_preserve() {
+        let rows = concat!(
+            r#"<row r="1"><c r="C1"><f xml:space="preserve"> Sheet!A1</f><v>1</v></c>"#,
+            r#"<c r="D1"><f xml:space="preserve">A1+1 </f><v>1</v></c>"#,
+            r#"<c r="E1"><f>A1 + 1</f><v>1</v></c>"#,
+            r#"<c r="F1"><f t="array" ref="F1" xml:space="preserve"> 1+1</f><v>2</v></c></row>"#,
+        );
+        let (re, ws) = resaved(&book_with_rows(rows));
+        assert!(
+            ws.contains(r#"<f xml:space="preserve"> Sheet!A1</f>"#),
+            "{ws}"
+        );
+        // An array `<f>` keeps its raw attributes: the attribute is not doubled.
+        let array_f = &ws[ws.find(r#"<c r="F1""#).unwrap()..];
+        let array_f = &array_f[..array_f.find("</f>").unwrap()];
+        assert_eq!(array_f.matches("xml:space").count(), 1, "{ws}");
+        assert!(ws.contains(r#"<f xml:space="preserve">A1+1 </f>"#), "{ws}");
+        assert!(ws.contains("<f>A1 + 1</f>"), "{ws}");
+        assert_eq!(formula_at(&re, 0, 2), " Sheet!A1");
+        assert_eq!(formula_at(&re, 0, 3), "A1+1 ");
+        // A second save is stable and never doubles the attribute.
+        let (_, ws2) = resaved(&re);
+        assert_eq!(ws2.matches("xml:space").count(), 3, "{ws2}");
+    }
+
     #[test]
     fn typed_xlookup_saves_with_xlfn_prefix() {
         // #776: a post-2007 function goes to the file with its prefix, or
@@ -16593,6 +16756,76 @@ b",
         assert!(pkg.workbook.sheets[0].cell(0, 1).unwrap().meta.is_none());
         let ws = saved_sheet1(&pkg);
         assert!(ws.contains(r#"<c r="B1"><f>A1+1</f><v>2</v></c>"#), "{ws}");
+    }
+
+    /// The `<f ...>` start tag of cell `name` in a saved sheet.
+    fn f_tag(ws: &str, name: &str) -> String {
+        let c = ws.find(&format!(r#"<c r="{name}""#)).expect(name);
+        let f = c + ws[c..].find("<f").expect("<f");
+        ws[f..f + ws[f..].find('>').unwrap() + 1].to_string()
+    }
+
+    #[test]
+    fn calc_flags_on_a_plain_formula_survive_save() {
+        let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f ca="1">A1+1</f><v>2</v></c><c r="C1"><f aca="true" ca="0">A1+2</f><v>3</v></c><c r="D1"><f>A1+3</f><v>4</v></c></row>"#;
+        let pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let ws = saved_sheet1(&pkg);
+        assert_eq!(f_tag(&ws, "B1"), r#"<f ca="1">"#, "{ws}");
+        let c1 = f_tag(&ws, "C1");
+        assert!(
+            c1.contains(r#" ca="0""#) && c1.contains(r#" aca="true""#),
+            "{c1}"
+        );
+        assert!(ws.contains(r#"<c r="D1"><f>A1+3</f><v>4</v></c>"#), "{ws}");
+        assert!(pkg.workbook.sheets[0].cell(0, 3).unwrap().meta.is_none());
+    }
+
+    #[test]
+    fn calc_flags_on_shared_master_and_followers_survive_save() {
+        let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f t="shared" ref="B1:B3" si="0" ca="1">A1+1</f><v>2</v></c></row><row r="2"><c r="A2"><v>2</v></c><c r="B2"><f t="shared" si="0" ca="1"/><v>3</v></c></row><row r="3"><c r="A3"><v>3</v></c><c r="B3"><f t="shared" si="0"/><v>4</v></c></row>"#;
+        let pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let ws = saved_sheet1(&pkg);
+        assert_eq!(f_tag(&ws, "B1"), r#"<f ca="1">"#, "{ws}");
+        assert_eq!(f_tag(&ws, "B2"), r#"<f ca="1">"#, "{ws}");
+        assert_eq!(f_tag(&ws, "B3"), "<f>", "{ws}");
+    }
+
+    #[test]
+    fn calc_flags_on_arrays_are_written_once() {
+        let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f t="array" ref="B1:B2" ca="1" aca="1">A1+1</f><v>2</v></c><c r="D1"><f t="array" ref="D1" ca="1">A1+1</f><v>2</v></c></row><row r="2"><c r="B2"><v>5</v></c></row>"#;
+        let pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let ws = saved_sheet1(&pkg);
+        for name in ["B1", "D1"] {
+            let tag = f_tag(&ws, name);
+            assert_eq!(tag.matches(" ca=\"").count(), 1, "{tag}");
+        }
+        assert_eq!(f_tag(&ws, "B1").matches(" aca=\"").count(), 1, "{ws}");
+    }
+
+    #[test]
+    fn recommitting_the_same_formula_keeps_its_calc_flags() {
+        let rows =
+            r#"<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f ca="1">A1+1</f><v>2</v></c></row>"#;
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 1), Cell::formula("A1+1"));
+        let ws = saved_sheet1(&pkg);
+        assert_eq!(f_tag(&ws, "B1"), r#"<f ca="1">"#, "{ws}");
+    }
+
+    #[test]
+    fn a_calc_flag_cell_still_recalculates() {
+        let rows =
+            r#"<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f ca="1">A1+1</f><v>2</v></c></row>"#;
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 0), Cell::number(10.0));
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(0, 1).unwrap().value,
+            CellValue::Number(11.0)
+        );
     }
 
     #[test]
@@ -21343,6 +21576,7 @@ mod ct_worksheet_order_tests {
             width: None,
             attrs: "hidden=\"1\"".into(),
             default_width: false,
+            plain_width: false,
         });
         let ws = saved_sheet(&pkg);
         assert!(ws.contains(r#"<row r="1" hidden="1">"#), "{ws}");
@@ -21364,9 +21598,10 @@ mod ct_worksheet_order_tests {
             r#"<cols><col min="2" max="2" style="5"/></cols>{ROWS}{MARGINS}"#
         ));
         assert_eq!(pkg.workbook.sheets[0].col_width(1), 0.0);
-        assert!(saved_sheet(&pkg).contains(
-            r#"<cols><col min="2" max="2" width="0" customWidth="1" style="5"/></cols>"#
-        ));
+        assert!(
+            saved_sheet(&pkg)
+                .contains(r#"<cols><col min="2" max="2" width="0" style="5"/></cols>"#)
+        );
         // Grouping elsewhere doesn't touch it either.
         let mut pkg = pkg;
         crate::outline::group(
@@ -21378,9 +21613,95 @@ mod ct_worksheet_order_tests {
         .unwrap();
         let ws = saved_sheet(&pkg);
         assert!(
-            ws.contains(r#"<col min="2" max="2" width="0" customWidth="1" style="5"/><col min="5" max="5" width="9.140625" outlineLevel="1"/>"#),
+            ws.contains(r#"<col min="2" max="2" width="0" style="5"/><col min="5" max="5" width="9.140625" outlineLevel="1"/>"#),
             "{ws}"
         );
+    }
+
+    #[test]
+    fn a_col_width_not_marked_custom_saves_without_customwidth() {
+        // The model keeps whether the source said `customWidth` (#1093):
+        // absent, "0" and "false" save as they were, "1" and "true" as "1".
+        for flag in ["", r#" customWidth="0""#, r#" customWidth="false""#] {
+            let src =
+                format!(r#"<cols><col min="2" max="3" width="20"{flag}/></cols>{ROWS}{MARGINS}"#);
+            let pkg = loaded(&src);
+            assert_eq!(pkg.workbook.sheets[0].col_width(1), 20.0);
+            let ws = saved_sheet(&pkg);
+            assert!(
+                ws.contains(r#"<cols><col min="2" max="3" width="20"/></cols>"#),
+                "{flag}: {ws}"
+            );
+        }
+        for flag in [r#" customWidth="1""#, r#" customWidth="true""#] {
+            let src =
+                format!(r#"<cols><col min="2" max="3" width="20"{flag}/></cols>{ROWS}{MARGINS}"#);
+            let ws = saved_sheet(&loaded(&src));
+            assert!(
+                ws.contains(r#"<cols><col min="2" max="3" width="20" customWidth="1"/></cols>"#),
+                "{flag}: {ws}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_width_edit_makes_a_plain_col_custom() {
+        let mut pkg = loaded(&format!(
+            r#"<cols><col min="2" max="4" width="20"/></cols>{ROWS}{MARGINS}"#
+        ));
+        pkg.workbook.sheets[0].set_col_width(2, 30.0);
+        let ws = saved_sheet(&pkg);
+        assert!(
+            ws.contains(concat!(
+                r#"<cols><col min="2" max="2" width="20"/>"#,
+                r#"<col min="3" max="3" width="30" customWidth="1"/>"#,
+                r#"<col min="4" max="4" width="20"/></cols>"#
+            )),
+            "{ws}"
+        );
+        // Setting the same width as its neighbours' on it is still a custom one.
+        pkg.workbook.sheets[0].set_col_width(2, 20.0);
+        let ws = saved_sheet(&pkg);
+        assert!(
+            ws.contains(r#"<col min="3" max="3" width="20" customWidth="1"/>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn cols_differing_only_in_customwidth_are_not_merged() {
+        let src = concat!(
+            r#"<cols><col min="1" max="1" width="20" customWidth="1"/>"#,
+            r#"<col min="2" max="2" width="20"/>"#,
+            r#"<col min="3" max="3" width="20"/>"#,
+            r#"<col min="4" max="4" width="20" customWidth="1"/></cols>"#,
+        );
+        let mut pkg = loaded(&format!("{src}{ROWS}{MARGINS}"));
+        // Untouched: written as they were.
+        assert!(saved_sheet(&pkg).contains(src));
+        // An edit that coalesces merges the two plain ones only.
+        pkg.workbook.sheets[0].set_col_collapsed(6, true);
+        pkg.workbook.sheets[0].set_col_collapsed(6, false);
+        let ws = saved_sheet(&pkg);
+        assert!(
+            ws.contains(concat!(
+                r#"<cols><col min="1" max="1" width="20" customWidth="1"/>"#,
+                r#"<col min="2" max="3" width="20"/>"#,
+                r#"<col min="4" max="4" width="20" customWidth="1"/>"#,
+            )),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn the_source_cols_round_trip_without_a_customwidth_gain() {
+        // A plain 0-wide `<col>` and a plain width, unedited, save byte for byte.
+        let src = concat!(
+            r#"<cols><col min="1" max="1" width="0" style="5"/>"#,
+            r#"<col min="3" max="3" width="12.5" hidden="1"/></cols>"#,
+        );
+        let ws = saved_sheet(&loaded(&format!("{src}{ROWS}{MARGINS}")));
+        assert!(ws.contains(src), "{ws}");
     }
 
     /// A form control as Excel writes one: its anchor's `<xdr:col>` and
@@ -21491,6 +21812,7 @@ mod ct_worksheet_order_tests {
             width,
             attrs: attrs.into(),
             default_width: false,
+            plain_width: false,
         };
         let mut pkg = new_xlsx();
         let s = &mut pkg.workbook.sheets[0];

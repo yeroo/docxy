@@ -118,6 +118,11 @@ fn form() -> Dialog {
         stale: false,
         seen: None,
         committed: None,
+        size: None,
+        buttons_right: false,
+        page_columns: Vec::new(),
+        edits: 0,
+        epoch: 0,
         calendar: None,
         popup: None,
     };
@@ -1065,6 +1070,166 @@ fn a_modeless_dialog_keeps_the_keys_only_while_active_and_survives_clear_modal()
     assert!(!s.is_open());
 }
 
+#[test]
+fn layout_hints_are_read_back_and_a_sample_cannot_be_set() {
+    // The layout hints of #1609: a fixed size, the buttons' side, the
+    // columns per page, a control's group, span, min_rows and fill, and a
+    // sample's parsed style; a header control is one on every page.
+    let mut d = form();
+    d.size = Some((460., 340.));
+    d.buttons_right = true;
+    d.page_columns = vec![2, 1];
+    let mut sample = Control::new(
+        "look",
+        "Sample",
+        ControlKind::Sample,
+        Value::Text(r#"{"text":"Aa","bold":true,"size":14}"#.into()),
+    );
+    sample.group = Some("Numbers".into());
+    sample.span = 2;
+    sample.plugin = true;
+    sample.header = true;
+    d.controls.push(sample);
+    let mut grid = Control::new("rows", "", ControlKind::Grid, Value::Rows(Vec::new()));
+    grid.min_rows = Some(6);
+    grid.page = Some(0);
+    d.controls.push(grid);
+    let mut memo = Control::new(
+        "memo",
+        "Memo",
+        ControlKind::Multiline,
+        Value::Text(String::new()),
+    );
+    memo.fill = true;
+    memo.page = Some(0);
+    d.controls.push(memo);
+    assert_eq!(d.columns(), 2);
+    let mut s = DialogStack::default();
+    s.push(d);
+    let json = s.to_json();
+    assert_eq!(
+        json.get("size"),
+        Some(&Json::Arr(vec![Json::Num(460.), Json::Num(340.)]))
+    );
+    assert_eq!(json.get_str("placement"), Some("right"));
+    assert_eq!(json.get_usize("columns"), Some(2));
+    let controls = json.get("controls").unwrap().as_array().unwrap();
+    let by = |n: &str| {
+        controls
+            .iter()
+            .find(|c| c.get_str("name") == Some(n))
+            .unwrap()
+    };
+    assert_eq!(by("look").get_str("kind"), Some("sample"));
+    assert_eq!(by("look").get_str("group"), Some("Numbers"));
+    assert_eq!(by("look").get_usize("span"), Some(2));
+    assert_eq!(by("look").get("header"), Some(&Json::Bool(true)));
+    assert_eq!(
+        by("look").get("sample").and_then(|s| s.get("bold")),
+        Some(&Json::Bool(true))
+    );
+    assert_eq!(by("rows").get_usize("min_rows"), Some(6));
+    assert_eq!(by("rows").get("header"), None);
+    assert_eq!(by("memo").get("fill"), Some(&Json::Bool(true)));
+    assert_eq!(by("locked").get("span"), None);
+    assert!(s.set("look", &args(r#"{"value":"x"}"#)).is_err());
+    s.select_tab("Predecessors").unwrap();
+    assert_eq!(s.to_json().get_usize("columns"), Some(1));
+}
+
+#[test]
+fn layout_rows_put_the_header_first_then_groups_and_spans_in_columns() {
+    // Dialog::layout_rows (#1609): the header is its own band of one row,
+    // groups are bands, a span wider than the row is clamped, a span that
+    // does not fit starts a new row.
+    let mut d = form();
+    d.page_columns = vec![2];
+    let mut ctl = |name: &'static str, group: Option<&str>, span: u8, header: bool| {
+        let mut c = Control::new(name, name, ControlKind::Text, Value::Text(String::new()));
+        c.page = Some(0);
+        c.plugin = true;
+        c.group = group.map(str::to_string);
+        c.span = span;
+        c.header = header;
+        if header {
+            c.page = None;
+        }
+        d.controls.push(c);
+    };
+    // The header: a span-2 control and a grouped one still make one row.
+    ctl("h1", None, 2, true);
+    ctl("h2", Some("ignored"), 1, true);
+    ctl("h3", None, 1, true);
+    ctl("a", Some("G"), 1, false);
+    ctl("b", Some("G"), 1, false);
+    ctl("c", Some("G"), 3, false);
+    ctl("d", None, 1, false);
+    // A span that does not fit the rest of the row starts a new one.
+    ctl("e", Some("H"), 1, false);
+    ctl("f", Some("H"), 2, false);
+    let bands = d.layout_rows();
+    let name = |i: usize| d.controls[i].name;
+    let header = &bands[0];
+    assert!(header.header && header.title.is_none());
+    assert_eq!(header.columns, 4, "the spans' sum");
+    assert_eq!(header.rows.len(), 1);
+    assert_eq!(
+        header.rows[0]
+            .iter()
+            .map(|&(i, col)| (name(i), col))
+            .collect::<Vec<_>>(),
+        [("h1", 0), ("h2", 2), ("h3", 3)]
+    );
+    let h = bands
+        .iter()
+        .find(|b| b.title.as_deref() == Some("H"))
+        .unwrap();
+    assert_eq!(h.rows.len(), 2, "a span of 2 does not fit beside e");
+    assert_eq!(
+        h.rows[0]
+            .iter()
+            .map(|&(i, col)| (name(i), col))
+            .collect::<Vec<_>>(),
+        [("e", 0)]
+    );
+    assert_eq!(
+        h.rows[1]
+            .iter()
+            .map(|&(i, col)| (name(i), col))
+            .collect::<Vec<_>>(),
+        [("f", 0)]
+    );
+    // Tab reaches the header first.
+    let order = d.focusable();
+    assert_eq!(name(order[0]), "h1");
+    assert_eq!(name(order[2]), "h3");
+    // The form's own controls on page 0 come next, ungrouped, two a row.
+    let group = bands
+        .iter()
+        .find(|b| b.title.as_deref() == Some("G"))
+        .unwrap();
+    assert!(!group.header);
+    assert_eq!(group.columns, 2);
+    assert_eq!(group.rows.len(), 2, "a and b share a row; c spans the next");
+    assert_eq!(
+        group.rows[0]
+            .iter()
+            .map(|&(i, _)| name(i))
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    assert_eq!(
+        group.rows[1],
+        vec![(d.controls.iter().position(|c| c.name == "c").unwrap(), 0)]
+    );
+    let d_band = bands
+        .iter()
+        .find(|b| b.rows.iter().flatten().any(|&(i, _)| name(i) == "d"))
+        .unwrap();
+    assert!(d_band.title.is_none() && !d_band.header);
+    assert!(!d.fills(&d.controls[0]));
+}
+
 /// A grid the person edits (#1536): a combo column offering items, a
 /// dropdown column, and a free one.
 fn link_grid() -> Dialog {
@@ -1528,4 +1693,69 @@ fn a_pasted_or_set_date_closes_the_calendar_so_enter_cannot_overwrite_it() {
     let (mut d, _) = make();
     d.calendar_day(25).unwrap();
     assert_eq!(text_of_control(&d, "finish"), "2026-10-25");
+}
+
+/// #1609 r6: Task Information's shared built-in row (Name, then Duration
+/// with Estimated beside it) keeps its one-column shape on a plugin page of
+/// two columns; the plugin's controls take the page's columns in a band of
+/// their own.
+#[test]
+fn built_in_controls_keep_one_column_beside_a_plugin_page() {
+    let mut d = Dialog::message(
+        catalog::TEST_FORM,
+        "t",
+        String::new(),
+        &[],
+        DialogOwner::Test,
+    );
+    d.tabs = vec!["General".into(), "Plugin".into()];
+    d.tab = 1;
+    d.page_columns = vec![1, 2];
+    let shared = |name: &'static str, beside: bool| {
+        let mut c = Control::new(name, name, ControlKind::Text, Value::Text(String::new()));
+        c.page = None;
+        c.beside = beside;
+        c
+    };
+    let plugin = |name: &'static str| {
+        let mut c = Control::new(name, name, ControlKind::Text, Value::Text(String::new()));
+        c.page = Some(1);
+        c.plugin = true;
+        c
+    };
+    d.controls = vec![
+        shared("name", false),
+        shared("duration", false),
+        shared("estimated", true),
+        plugin("a"),
+        plugin("b"),
+        plugin("c"),
+    ];
+    let bands = d.layout_rows();
+    assert_eq!(bands.len(), 2, "{bands:?}");
+    assert_eq!(bands[0].columns, 1);
+    assert_eq!(bands[0].rows, vec![vec![(0, 0)], vec![(1, 0), (2, 0)]]);
+    assert_eq!(bands[1].columns, 2);
+    assert_eq!(bands[1].rows, vec![vec![(3, 0), (4, 1)], vec![(5, 0)]]);
+    // Without plugin controls the page's columns apply to everything.
+    d.controls.truncate(3);
+    let bands = d.layout_rows();
+    assert_eq!(bands.len(), 1);
+    assert_eq!(bands[0].columns, 2);
+}
+
+/// #1609 r6: every edit of a field counts, a Delete that leaves the caret
+/// where it was included, so a scroll following `edits` sees it.
+#[test]
+fn field_edits_are_counted() {
+    let mut d = form();
+    d.focus = Some(0);
+    d.caret = Some(0);
+    let before = d.edits;
+    d.type_char('x').unwrap();
+    assert_eq!(d.edits, before + 1);
+    d.move_caret_to(0, false);
+    d.delete().unwrap();
+    assert_eq!(d.edits, before + 2);
+    assert_eq!(d.caret_at(), 0, "Delete leaves the caret where it was");
 }

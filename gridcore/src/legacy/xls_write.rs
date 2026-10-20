@@ -2505,6 +2505,7 @@ mod tests {
             width: Some(12.0),
             attrs: " style=\"1\"".into(),
             default_width: false,
+            plain_width: false,
         });
         assert_eq!(write_xls(&pkg).lost, ["column and row formats"]);
         let mut pkg = book(&[(0, 0, Cell::number(1.0))]);

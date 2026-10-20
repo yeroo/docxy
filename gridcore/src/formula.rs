@@ -6875,8 +6875,9 @@ pub(crate) fn future_prefix(name: &str) -> Option<&'static str> {
     }
 }
 
-/// The tokens of `src` with their start offsets; `None` when it doesn't lex.
-fn lex_all(src: &str) -> Option<Vec<(usize, Tok)>> {
+/// The tokens of `src` with their start and end offsets; `None` when it
+/// doesn't lex.
+fn lex_spans(src: &str) -> Option<Vec<(usize, usize, Tok)>> {
     let mut lex = Lexer::new(src);
     let mut toks = Vec::new();
     loop {
@@ -6886,10 +6887,64 @@ fn lex_all(src: &str) -> Option<Vec<(usize, Tok)>> {
         let start = lex.pos;
         match lex.next_tok() {
             Ok(Tok::Eof) => return Some(toks),
-            Ok(t) => toks.push((start, t)),
+            Ok(t) => toks.push((start, lex.pos, t)),
             Err(_) => return None,
         }
     }
+}
+
+/// The tokens of `src` with their start offsets; `None` when it doesn't lex.
+fn lex_all(src: &str) -> Option<Vec<(usize, Tok)>> {
+    Some(
+        lex_spans(src)?
+            .into_iter()
+            .map(|(start, _, t)| (start, t))
+            .collect(),
+    )
+}
+
+/// [`translate_formula`] that keeps the spacing `src` was typed with: the
+/// printer emits none, so the source's whitespace between tokens is put back
+/// around the printed ones. Only when both texts lex to the same tokens (same
+/// kinds, and equal punctuation, strings, errors and brackets) and the
+/// printer added no space of its own; otherwise the printed text, exactly as
+/// `translate_formula` gives it.
+pub fn translate_formula_spaced(src: &str, dr: i64, dc: i64) -> Option<String> {
+    let printed = translate_formula(src, dr, dc)?;
+    Some(respace(src, &printed).unwrap_or(printed))
+}
+
+fn respace(src: &str, printed: &str) -> Option<String> {
+    let from = lex_spans(src)?;
+    let to = lex_spans(printed)?;
+    if from.len() != to.len() {
+        return None;
+    }
+    let same = |a: &Tok, b: &Tok| match (a, b) {
+        (Tok::Ident(_), Tok::Ident(_))
+        | (Tok::Num(_), Tok::Num(_))
+        | (Tok::Quoted(_), Tok::Quoted(_)) => true,
+        _ => a == b,
+    };
+    if !from.iter().zip(&to).all(|(a, b)| same(&a.2, &b.2)) {
+        return None;
+    }
+    let mut out = String::with_capacity(src.len() + 8);
+    let (mut at_src, mut at_out) = (0, 0);
+    for ((s, e, _), (ps, pe, _)) in from.iter().zip(&to) {
+        let gap = src.get(at_src..*s)?;
+        // The printer's own space (the intersection operator) has no
+        // counterpart in a source that had none.
+        if gap.is_empty() && !printed.get(at_out..*ps)?.is_empty() {
+            return None;
+        }
+        out.push_str(gap);
+        out.push_str(printed.get(*ps..*pe)?);
+        at_src = *e;
+        at_out = *pe;
+    }
+    out.push_str(src.get(at_src..)?);
+    Some(out)
 }
 
 /// Does `src` name a function or LET/LAMBDA parameter in file spelling
@@ -13856,7 +13911,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn spaced_translate_keeps_the_typed_spacing() {
+        let sp = translate_formula_spaced;
+        assert_eq!(
+            sp("IF($A3 = $F3, TRUE, FALSE)", 2, 0).unwrap(),
+            "IF($A5 = $F5, TRUE, FALSE)"
+        );
+        assert_eq!(
+            sp("AGGREGATE( L$14,$A25,$C$1:$C$11)", 0, 1).unwrap(),
+            "AGGREGATE( M$14,$A25,$C$1:$C$11)"
+        );
+        assert_eq!(
+            sp("COUNTIFS(A1:A9, E3, $F$2:$F$19,F3)", 3, 0).unwrap(),
+            "COUNTIFS(A4:A12, E6, $F$2:$F$19,F6)"
+        );
+        assert_eq!(sp(" A1 +\tB1  ", 1, 1).unwrap(), " B2 +\tC2  ");
+        assert_eq!(sp("A1 B1", 1, 0).unwrap(), "A2 B2");
+        assert_eq!(
+            sp("Sales[Amount] + A1", 1, 0).unwrap(),
+            "Sales[Amount] + A2"
+        );
+    }
+
+    #[test]
+    fn spaced_translate_is_the_printed_text_when_nothing_aligns() {
+        for (src, dr, dc) in [
+            // Space-free: identical to translate_formula.
+            ("A1+B2", 1, 0),
+            ("SUM(A1:A10)", 0, 2),
+            ("A1", -1, 0),
+            ("SUM(A1#)", 1, 1),
+            // Off the grid, and dropped parentheses.
+            ("A1 + 1", -1, 0),
+            ("(A1) + 2", 1, 0),
+        ] {
+            let printed = translate_formula(src, dr, dc);
+            let spaced = translate_formula_spaced(src, dr, dc);
+            assert!(printed.is_some(), "{src}");
+            assert_eq!(spaced, printed, "{src}");
+        }
+        assert_eq!(translate_formula_spaced("1+", 1, 0), None);
+    }
+
     // #972: a text result longer than a cell holds (32,767 UTF-16 units) is #VALUE!.
+
     #[test]
     fn concat_over_cell_limit_is_value_error() {
         let g = empty();
