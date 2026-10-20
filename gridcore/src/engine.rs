@@ -397,6 +397,11 @@ impl Engine {
                     let m = cell.meta.get_or_insert_default();
                     ((m.cm, m.vm, m.vm_body), m.modern, m.dynamic) = kind_of(&pm);
                 }
+                // The calculation flags describe the formula the cell keeps.
+                if pm.f_ca.is_some() || pm.f_aca.is_some() {
+                    let m = cell.meta.get_or_insert_default();
+                    (m.f_ca, m.f_aca) = (pm.f_ca, pm.f_aca);
+                }
             }
             None if cell.formula.is_some() => {
                 cell.f_attrs = None;

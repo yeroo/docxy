@@ -387,8 +387,7 @@ cargo test -p gridcore --test fidelity -- --nocapture
   - rows carrying nothing but `r` and `spans`.
 
   Everything else stays structural. That includes other row attributes,
-  other cell attributes (`vm`, `cm`, `ph`), other formula attributes (`ca`,
-  `aca`), phonetic runs, and a lost cell that carried any of them. Those
+  other cell attributes (`vm`, `cm`, `ph`), other formula attributes, phonetic runs, and a lost cell that carried any of them. Those
   baseline lines are index-free like docx's, so one line covers every
   occurrence in that sheet. The test prints how many findings the check
   covered.
