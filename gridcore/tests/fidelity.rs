@@ -41,7 +41,9 @@ const TRACKED: &[&str] = &[
 ];
 
 /// Every class of known loss and the issue that owns its fix, first match
-/// wins. A baseline entry no class claims fails the gate.
+/// wins. The worksheet classes key on the entry's path (the root `worksheet`,
+/// or the sheet check's `/cells/`), not on the part's name, so they hold for
+/// a worksheet wherever the package keeps it (#1116). A baseline entry no class claims fails the gate.
 const CLASSES: &[LossClass] = &[
     LossClass {
         name: "corrupt input (fuzzed: bad CRCs, an invalid deflate stream) is refused",
@@ -67,11 +69,7 @@ const CLASSES: &[LossClass] = &[
         name: "the dimension is recomputed from the cells the model keeps (a source \
                dimension covering dropped empty cells, or a wrong one, changes)",
         issue: "#1096",
-        matches: |e| {
-            is_sheet_part(e)
-                && e.kind == Kind::ChangedValue
-                && local(&e.path) == "/worksheet/dimension/@ref"
-        },
+        matches: |e| e.kind == Kind::ChangedValue && local(&e.path) == "/worksheet/dimension/@ref",
     },
     LossClass {
         name: "docProps/app.xml sheet titles follow the workbook's sheets (a stale \
@@ -115,14 +113,6 @@ fn local(path: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
-}
-
-/// An entry of a worksheet, wherever the package keeps it (`xl/worksheets/`
-/// or, by the workbook's relationships, `xl/sheet1.xml`, #1116): a structural
-/// finding under the root `worksheet`, or one of the sheet check's cells.
-fn is_sheet_part(e: &Entry) -> bool {
-    let path = local(&e.path);
-    path == "/worksheet" || path.starts_with("/worksheet/") || e.path.starts_with("/cells/")
 }
 
 fn in_sheet_data(e: &Entry) -> bool {
@@ -2152,36 +2142,46 @@ fn a_worksheet_outside_xl_worksheets_has_the_sheet_loss_classes() {
     }
 }
 
-/// #1116: the classes follow the entry's path, not its part name, but only a
-/// `worksheet` root or a cell: the same dimension finding in a part that is
-/// not a worksheet is still a loss.
+/// #1116: the worksheet classes follow the entry's path, not its part name:
+/// a worksheet at xl/sheet1.xml is claimed like one in xl/worksheets/, and
+/// the same path shapes under another root are still a loss.
 #[test]
-fn the_sheet_loss_classes_do_not_cover_other_parts() {
+fn the_sheet_loss_classes_follow_the_path_not_the_part() {
     let entry = |part: &str, path: &str, kind| Entry {
         file: "book.xlsx".into(),
         part: part.into(),
         kind,
         path: path.into(),
     };
-    let allowed = |e: &Entry| CLASSES.iter().any(|c| (c.matches)(e));
+    let claimed = |e: &Entry| CLASSES.iter().any(|c| (c.matches)(e));
     for part in [
         "xl/worksheets/sheet1.xml",
         "xl/sheet1.xml",
         "xl/sheet 1.xml",
     ] {
-        let e = entry(part, "/worksheet/dimension/@ref", Kind::ChangedValue);
-        assert!(allowed(&e), "{part}");
-        let e = entry(part, "/x:worksheet/sheetData/row/@r", Kind::ExtraAttr);
-        assert!(is_sheet_part(&e) && in_sheet_data(&e), "{part}");
-    }
-    for part in ["xl/workbook.xml", "xl/charts/chart1.xml", "xl/styles.xml"] {
-        for path in [
-            "/chartSpace/dimension/@ref",
-            "/workbook/sheets/dimension/@ref",
+        for (kind, path) in [
+            (Kind::ChangedValue, "/worksheet/dimension/@ref"),
+            (Kind::ExtraAttr, "/x:worksheet/x:sheetData/x:row/@r"),
+            (Kind::ChangedValue, "/cells/A1/formula-text"),
         ] {
-            let e = entry(part, path, Kind::ChangedValue);
-            assert!(!allowed(&e), "{part} {path}");
+            assert!(claimed(&entry(part, path, kind)), "{part} {path}");
         }
+    }
+    for (part, kind, path) in [
+        (
+            "xl/styles.xml",
+            Kind::ChangedValue,
+            "/styleSheet/dimension/@ref",
+        ),
+        ("xl/sheet1.xml", Kind::ExtraAttr, "/sst/sheetData/row/@r"),
+        (
+            "xl/sheet1.xml",
+            Kind::ChangedValue,
+            "/worksheetX/dimension/@ref",
+        ),
+        ("xl/sheet1.xml", Kind::ChangedValue, "/cells/A1/style"),
+    ] {
+        assert!(!claimed(&entry(part, path, kind)), "{part} {path}");
     }
 }
 

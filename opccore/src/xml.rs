@@ -627,8 +627,7 @@ fn utf8_len(b: u8) -> usize {
 /// purpose: no known xlsx writer emits it, and parts kept as they were
 /// (docProps, #1116) rely on it. Some writers emit the single-byte ones
 /// (LibreOffice's tdf76115.xlsx), and Excel reads them by their declaration
-/// (#1108, #1116). gridcore's `textio` has a table of its own; this crate
-/// cannot depend on it.
+/// (#1108, #1116). The table is [`crate::codepage`]'s.
 pub fn declared_to_utf8(bytes: &[u8]) -> Option<String> {
     if !bytes.starts_with(b"<?xml") || (!bytes.is_ascii() && std::str::from_utf8(bytes).is_ok()) {
         return None;
@@ -651,20 +650,10 @@ pub fn declared_to_utf8(bytes: &[u8]) -> Option<String> {
     Some(text(&bytes[..start]) + "UTF-8" + &text(&bytes[end..]))
 }
 
-/// The windows-1252 character of a byte; the five bytes it leaves undefined
-/// are the C1 control of the same number.
+/// The windows-1252 character of a byte ([`crate::codepage`]'s table); the
+/// five bytes it leaves undefined are the C1 control of the same number.
 fn cp1252(b: u8) -> char {
-    const HIGH: [char; 32] = [
-        '\u{20AC}', '\u{81}', '\u{201A}', '\u{192}', '\u{201E}', '\u{2026}', '\u{2020}',
-        '\u{2021}', '\u{2C6}', '\u{2030}', '\u{160}', '\u{2039}', '\u{152}', '\u{8D}', '\u{17D}',
-        '\u{8F}', '\u{90}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}', '\u{2013}',
-        '\u{2014}', '\u{2DC}', '\u{2122}', '\u{161}', '\u{203A}', '\u{153}', '\u{9D}', '\u{17E}',
-        '\u{178}',
-    ];
-    match b {
-        0x80..=0x9F => HIGH[(b - 0x80) as usize],
-        _ => b as char,
-    }
+    crate::codepage::decode(1252, b).unwrap_or(b as char)
 }
 
 /// The byte range and bytes of the encoding name in the XML declaration at
