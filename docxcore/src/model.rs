@@ -993,13 +993,16 @@ pub struct Cell {
     /// `raw_tcpr`, but modeled separately so review can enumerate and reject
     /// actions against them explicitly.
     pub unsupported_revisions: Vec<UnsupportedPropertyRevision>,
-    /// Cell-level content controls (`<w:sdt>` wrapping `<w:tc>`, such as the
-    /// cover page's Abstract and Year, #1102) opening right before this cell:
-    /// the exact source from `<w:sdt` through the `<w:sdtContent>` start tag,
-    /// outermost first. A control wrapping several cells opens on its first.
+    /// Row-level wrappers around cells opening right before this cell
+    /// (outermost first), each the exact source of either a cell-level
+    /// content control (`<w:sdt>` wrapping `<w:tc>`, such as the cover page's
+    /// Abstract and Year, #1102: from `<w:sdt` through the `<w:sdtContent>`
+    /// start tag) or a `w:customXml` (its start tag and a leading
+    /// `w:customXmlPr`, #1393). One wrapping several cells opens on its first.
     pub sdt_open: Vec<String>,
-    /// The `</w:sdtContent>`…`</w:sdt>` suffixes of the cell-level controls
-    /// closing right after this cell, innermost first.
+    /// The suffixes of the wrappers closing right after this cell, innermost
+    /// first: `</w:sdtContent></w:sdt>` for a content control,
+    /// `</w:customXml>` for a custom XML wrapper.
     pub sdt_close: Vec<String>,
     /// Row-level children other than cells that come right before this
     /// cell, verbatim in source order: a `w:commentRangeEnd` between two
@@ -1044,8 +1047,8 @@ pub struct Row {
 }
 
 impl Row {
-    /// Remove cell `i`, keeping the row's cell-level content controls where
-    /// they were: a control opening and closing on the removed cell goes with
+    /// Remove cell `i`, keeping the row's wrappers around cells (content
+    /// controls and `w:customXml`) where they were: a control opening and closing on the removed cell goes with
     /// it, one it opened now opens on the next cell, and one it closed now
     /// closes on the previous cell. So deleting the second cell of a control
     /// over two cells does not stretch the control over the third. The
@@ -1074,7 +1077,7 @@ impl Row {
         cell
     }
 
-    /// The cell-level content controls around cell `cell`, outermost first,
+    /// The cell wrappers (content controls, `w:customXml`) around cell `cell`, outermost first,
     /// each as (the cell it opens on, its index in that cell's `sdt_open`).
     /// Empty when no control wraps the cell.
     pub(crate) fn cell_controls(&self, cell: usize) -> Vec<(usize, usize)> {
@@ -1324,11 +1327,29 @@ impl Table {
     /// preceding gap. Deleting a control's first or last row leaves every
     /// remaining group row under the same boundaries; deleting its final visible
     /// row retains a balanced empty control rather than discarding its definition.
+    /// The row-level markers between its cells and after them (#1215) move to
+    /// the row before it, or in front of the row that took its place when it
+    /// was the first, so a comment range's end is not lost with the row (#1393).
     pub fn remove_row(&mut self, index: usize) -> Option<Row> {
         if index >= self.rows.len() {
             return None;
         }
-        let row = self.rows.remove(index);
+        let mut row = self.rows.remove(index);
+        let mut markers: Vec<String> = Vec::new();
+        for cell in &mut row.cells {
+            markers.append(&mut cell.raw_before);
+        }
+        markers.append(&mut row.raw_end);
+        if !markers.is_empty() {
+            if let Some(prev) = index.checked_sub(1).and_then(|p| self.rows.get_mut(p)) {
+                prev.raw_end.extend(markers);
+            } else if let Some(next) = self.rows.get_mut(index) {
+                match next.cells.first_mut() {
+                    Some(cell) => cell.raw_before.splice(0..0, markers),
+                    None => next.raw_end.splice(0..0, markers),
+                };
+            }
+        }
         for boundary in &mut self.row_boundaries {
             if boundary.at > index {
                 boundary.at -= 1;
