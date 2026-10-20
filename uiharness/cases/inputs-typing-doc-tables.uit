@@ -1249,6 +1249,9 @@ test doc convert-text-to-table/cols: focus by click
   call menu-click {"label":"Convert Text to Table..."}
   assert dialog is convert-text-to-table
   call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"cols"}
   call field-read {"dialog-field":"cols"}
   assert reply.focused is true
@@ -1262,6 +1265,9 @@ test doc convert-text-to-table/cols: focus by Tab
   call menu-click {"label":"Convert Text to Table..."}
   assert dialog is convert-text-to-table
   call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"sep"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"cols"}
   call field-read {"dialog-field":"cols"}
   assert reply.focused is true

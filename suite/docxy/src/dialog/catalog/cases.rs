@@ -465,12 +465,15 @@ fn text_tests(e: &Entry, f: &Field) -> Vec<Test> {
 /// known to show them. Not a checkbox or radio group, which nothing tests for
 /// being reachable: one may be undrawn or disabled at open (Format Cells'
 /// Thousands under General, Line Numbers' Restart), and Tab would never reach
-/// it. None: nothing to leave for.
+/// it, unless the field names one (`Field::leave`). None: nothing to leave for.
 fn tab_start<'e>(e: &'e Entry, f: &Field) -> Option<&'e Field> {
     let same =
         |o: &&Field| o.name != f.name && o.skip.is_none() && o.tab == f.tab && o.prep == f.prep;
     let driven =
         |o: &&Field| o.typed() || matches!(o.kind, ControlKind::Dropdown | ControlKind::List);
+    if let Some(to) = f.leave {
+        return e.fields.iter().find(|o| o.name == to);
+    }
     e.fields
         .iter()
         .find(|o| same(o) && o.typed())

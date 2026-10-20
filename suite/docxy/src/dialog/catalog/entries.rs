@@ -465,7 +465,7 @@ dialogs! {
         // The text is "one/two<Tab>three": the dialog opens on 2 columns,
         // split at the Tab.
         fields: &[
-            Field::number("cols", "3").applied(&[
+            Field::number("cols", "3").leave("sep").applied(&[
                 "assert table.columns is 3",
                 "assert table.cells.0.1.0 is three",
             ]),

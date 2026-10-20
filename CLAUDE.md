@@ -226,7 +226,9 @@
   Shift+Tab) selects a single-line field's whole value, so typing replaces it
   as in Word; a click places the caret (#1314). A generated "focus by click" /
   "focus by Tab" case first moves the focus to a neighbour field
-  (`cases.rs` `tab_start`), as the field may open focused.
+  (`cases.rs` `tab_start`: a typed, dropdown or list neighbour shown by the same
+  prep, or the control an entry names with `Field::leave`), as the field may
+  open focused.
 - The generated cases type with `real-key`/`real-type` and focus by real click
   or Tab only. An input outside dialogs goes in `suite/docxy/src/inputs.rs` with
   the issue that covers it. See `qa/inputs-typing.md`.
