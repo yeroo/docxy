@@ -4915,6 +4915,10 @@ struct DocTab {
     /// holds), and redo goes the other way. Saves keep the set; a load
     /// starts it empty.
     tracked_comment_ids: std::collections::HashSet<String>,
+    /// What a deleted comment needs to come back whole with an undo: its
+    /// original XML, and the markers taken from other stories (#981).
+    /// Reseeded wherever `tracked_comment_ids` is cleared.
+    comment_undo: CommentUndo,
     /// Remove All took every comment since the tab loaded: each save then
     /// also drops the base comments a per-id save can't see (an id like
     /// `03`, a comments.xml the parser can't read), unless an undo brought
@@ -8843,6 +8847,7 @@ fn blank_docx_tab(title: &str) -> DocTab {
         status: "new".into(),
         comments: vec![],
         tracked_comment_ids: Default::default(),
+        comment_undo: Default::default(),
         comments_removed_all: false,
         used_comment_ids: Default::default(),
         pictures: Default::default(),
@@ -8920,6 +8925,7 @@ impl Loaded {
             status: self.status,
             comments: self.comments,
             tracked_comment_ids: Default::default(),
+            comment_undo: Default::default(),
             comments_removed_all: false,
             used_comment_ids: Default::default(),
             pictures: Default::default(),
@@ -9141,10 +9147,10 @@ fn finish_pending_conversion(tab: &mut DocTab) {
     tab.comments = l.comments;
     tab.tracked_comment_ids.clear();
     tab.comments_removed_all = false;
-    seed_used_comment_ids(tab);
     tab.notes = l.notes;
     tab.mail = mailings_tab::MailState::from_pkg(l.pkg.as_ref());
     tab.pkg = l.pkg;
+    seed_used_comment_ids(tab);
     tab.status = l.status;
     tab.load_failed = l.load_failed;
     tab.converted_docx = l.converted_docx;
@@ -9401,6 +9407,7 @@ fn sheet_tab_from_path(path: &PathBuf, repair: bool) -> DocTab {
         status,
         comments: vec![],
         tracked_comment_ids: Default::default(),
+        comment_undo: Default::default(),
         comments_removed_all: false,
         used_comment_ids: Default::default(),
         pictures: Default::default(),
@@ -12360,11 +12367,11 @@ fn protected_rollback(tab: &mut DocTab) {
             tab.comments = l.comments;
             tab.tracked_comment_ids.clear();
             tab.comments_removed_all = false;
-            seed_used_comment_ids(tab);
             tab.notes = l.notes;
             tab.mail = mailings_tab::MailState::from_pkg(l.pkg.as_ref());
             tab.access.marked_final = l.pkg.as_ref().is_some_and(Package::marked_final);
             tab.pkg = l.pkg;
+            seed_used_comment_ids(tab);
             tab.markdown = l.markdown;
             tab.bundle_html = l.bundle_html;
             tab.load_failed = l.load_failed;
@@ -13056,16 +13063,76 @@ fn autorecover_prepare(tabs: &mut [DocTab]) -> bool {
     tabs.iter().any(|t| t.dirty)
 }
 
+/// A comment's `<w:comment>` as the package held it when Delete Comment or
+/// Remove All took its markers (#981).
+#[derive(Clone, Debug)]
+struct RawComment {
+    xml: String,
+    /// Its `commentsExtended` / `commentsIds` / `commentsExtensible` entries.
+    extras: Vec<docxcore::package::CommentExtra>,
+    /// `comments.xml`'s root start tag then.
+    root: Option<String>,
+}
+
+/// What a tab keeps so an undo of Delete Comment or Remove All brings a
+/// comment back whole (#981).
+#[derive(Clone, Debug, Default)]
+struct CommentUndo {
+    /// The comments' XML by id. A save rebases a converted tab on the
+    /// package it wrote, which no longer holds a deleted comment: [`save_base`]
+    /// puts this back for one that is live again, instead of the plain
+    /// paragraph [`doc_to_docx`] would make of its parsed record.
+    raw: std::collections::HashMap<String, RawComment>,
+    /// The markers Remove All took out of the headers, footers and notes of
+    /// `pkg`, which no undo step covers ([`save_base`] puts a part's back
+    /// while all its comments are anchored again).
+    stripped: Vec<docxcore::inspect::StrippedPart>,
+}
+
+impl CommentUndo {
+    /// Keep the XML `pkg` holds for comment `id`, if it holds any.
+    fn keep_raw(&mut self, pkg: Option<&Package>, id: &str) {
+        let Some(pkg) = pkg else { return };
+        if let Some(xml) = pkg.comment_xml(id) {
+            self.raw.insert(
+                id.to_string(),
+                RawComment {
+                    xml,
+                    extras: pkg.comment_extras(id),
+                    root: pkg.comments_root_tag(),
+                },
+            );
+        }
+    }
+}
+
+/// The comment ids with a marker in a header, footer or note of `tab`'s
+/// package, or in the header or footer being edited (#981).
+fn story_comment_ids(tab: &DocTab, doc: &Document) -> std::collections::BTreeSet<String> {
+    let mut ids = tab.pkg.as_ref().map_or_else(Default::default, |pkg| {
+        docxcore::inspect::Stories::new(pkg, doc).comment_marker_ids(pkg)
+    });
+    if let Some(hf) = &tab.hf_edit {
+        ids.extend(docxcore::inspect::comment_marker_ids_in_blocks(
+            &hf.editor.doc.body,
+        ));
+    }
+    ids
+}
+
 /// Start `tab`'s used comment ids afresh from what it holds now: its
-/// comments' ids and the ids of the comment markers in its body. Called
-/// wherever a document is loaded into the tab (#620).
+/// comments' ids and the ids of the comment markers in its body, headers,
+/// footers and notes. Called wherever a document is loaded into the tab
+/// (#620), so it also drops what the last document kept for undo (#981).
 fn seed_used_comment_ids(tab: &mut DocTab) {
     let mut used: std::collections::HashSet<String> =
         tab.comments.iter().map(|c| c.id.clone()).collect();
     if let Surface::Doc(ed) = &tab.surface {
         used.extend(docxcore::inspect::comment_marker_ids(&ed.doc));
+        used.extend(story_comment_ids(tab, &ed.doc));
     }
     tab.used_comment_ids = used;
+    tab.comment_undo = CommentUndo::default();
 }
 
 /// The comments `tab` lists and saves (#620): each untracked one, and each
@@ -13113,6 +13180,7 @@ fn save_base<'a>(
     if base.track_revisions() != track {
         base.to_mut().set_track_revisions(track);
     }
+    follow_comment_undo(tab, doc, live, &mut base);
     if !tab.comments_removed_all {
         return Some(base);
     }
@@ -13137,6 +13205,69 @@ fn save_base<'a>(
     let authors: Vec<&str> = live.iter().map(|c| c.author.as_str()).collect();
     pruned.prune_people(doc, &authors);
     Some(base)
+}
+
+/// Make `base` agree with what an undo of a comment delete does (#981):
+/// - a comment that is live again but not in `base` (a converted tab's
+///   rebased package no longer holds it) gets its original XML back, kept
+///   when it was deleted, not a plain paragraph made from its record;
+/// - the markers Remove All took out of a header, footer or note come
+///   back while every comment they carry is anchored in the body again;
+/// - a tracked comment that is not live has no marker left in any story,
+///   so the file has no marker without a comment. The package itself is
+///   untouched, so undo and redo need no bookkeeping there.
+fn follow_comment_undo(
+    tab: &DocTab,
+    doc: &Document,
+    live: &[Comment],
+    base: &mut Cow<'_, Package>,
+) {
+    use std::collections::HashSet;
+    let live_ids: HashSet<&str> = live.iter().map(|c| c.id.as_str()).collect();
+    if !tab.comment_undo.raw.is_empty() {
+        let held: HashSet<String> = docxcore::comments::parse_comments(base)
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        for c in live {
+            let raw = tab.comment_undo.raw.get(&c.id);
+            if let (true, false, Some(raw)) = (
+                tab.tracked_comment_ids.contains(&c.id),
+                held.contains(&c.id),
+                raw,
+            ) {
+                let pkg = base.to_mut();
+                pkg.insert_comment_xml_rooted(&raw.xml, raw.root.as_deref());
+                pkg.restore_comment_extras(&raw.extras);
+            }
+        }
+    }
+    let anchored = docxcore::inspect::comment_marker_ids(doc);
+    let editing = tab.hf_edit.as_ref().map(|h| h.part_name.as_str());
+    for taken in tab.comment_undo.stripped.iter().rev() {
+        let as_left = base.part_text(&taken.part).as_deref() == Some(taken.after.as_str());
+        if as_left && Some(taken.part.as_str()) != editing && taken.ids.is_subset(&anchored) {
+            taken.restore(base.to_mut());
+        }
+    }
+    let dead: Vec<&str> = tab
+        .tracked_comment_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !live_ids.contains(id))
+        .collect();
+    if dead.is_empty() {
+        return;
+    }
+    let stories = docxcore::inspect::Stories::new(base, doc);
+    let present = stories.comment_marker_ids(base);
+    let dead: Vec<&str> = dead
+        .into_iter()
+        .filter(|id| present.contains(*id))
+        .collect();
+    if !dead.is_empty() {
+        stories.strip_comment_markers(base.to_mut(), Some(&dead), None);
+    }
 }
 
 /// The package a new document is saved into (what [`doc_to_docx_styled`]
@@ -13164,7 +13295,10 @@ fn add_doc_comment(tab: &mut DocTab, text: String, identity: (String, String)) -
     let Surface::Doc(ed) = &tab.surface else {
         return None;
     };
-    let in_body = docxcore::inspect::comment_marker_ids(&ed.doc);
+    let mut in_body = docxcore::inspect::comment_marker_ids(&ed.doc);
+    // And any other story's: a marker there with no comment (or a deleted
+    // one's) would take the new comment's text and outlive its undo.
+    in_body.extend(story_comment_ids(tab, &ed.doc));
     let base: Vec<String> = tab
         .pkg
         .as_ref()
@@ -13210,8 +13344,11 @@ fn add_doc_comment(tab: &mut DocTab, text: String, identity: (String, String)) -
 
 /// Delete comment `id` from `tab`: its markers leave the body as one undo
 /// step, and its record stays, tracked, so it is unlisted and unsaved now
-/// ([`live_comments`]) and an undo brings it back whole (#971).
+/// ([`live_comments`]) and an undo brings it back whole (#971). Its markers
+/// in the headers, footers and notes leave the saved file with it
+/// ([`save_base`]), and come back with the body's.
 fn delete_doc_comment(tab: &mut DocTab, id: &str) {
+    tab.comment_undo.keep_raw(tab.pkg.as_ref(), id);
     if let Surface::Doc(ed) = &mut tab.surface {
         ed.remove_comment_markers(id);
     }
@@ -13617,6 +13754,7 @@ fn restore_tab_content(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 status: status.into(),
                 comments: vec![],
                 tracked_comment_ids: Default::default(),
+                comment_undo: Default::default(),
                 comments_removed_all: false,
                 used_comment_ids: Default::default(),
                 pictures: Default::default(),
@@ -13665,6 +13803,7 @@ fn restore_tab_content(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 status,
                 comments,
                 tracked_comment_ids: Default::default(),
+                comment_undo: Default::default(),
                 comments_removed_all: false,
                 used_comment_ids: Default::default(),
                 pictures: Default::default(),
@@ -15229,6 +15368,7 @@ impl Docxy {
             status: "new".into(),
             comments: vec![],
             tracked_comment_ids: Default::default(),
+            comment_undo: Default::default(),
             comments_removed_all: false,
             used_comment_ids: Default::default(),
             pictures: Default::default(),
@@ -27924,6 +28064,7 @@ mod sheet_save_tests {
             status: "new".into(),
             comments: vec![],
             tracked_comment_ids: Default::default(),
+            comment_undo: Default::default(),
             comments_removed_all: false,
             used_comment_ids: Default::default(),
             pictures: Default::default(),
