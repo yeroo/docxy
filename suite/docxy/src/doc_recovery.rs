@@ -99,8 +99,6 @@ pub(crate) fn dialog(items: &[Candidate]) -> Dialog {
     d.controls = vec![list];
     d.buttons = ok_cancel();
     d.mark_opened();
-    // The list, the only control, has the focus.
-    d.focus_step(false);
     d
 }
 
@@ -326,7 +324,13 @@ mod tests {
             items().iter().map(|c| c.label.clone()).collect::<Vec<_>>()
         );
         assert_eq!(list.value, Value::Checks(vec![true, true]));
-        assert_eq!(d.focused().map(|c| c.name), Some("documents"));
+        let mut stack = crate::dialog::DialogStack::default();
+        stack.push(d.clone());
+        assert_eq!(
+            stack.top().unwrap().focused().map(|c| c.name),
+            Some("documents"),
+            "the list, the only control, has the focus once pushed"
+        );
         let ok = d.buttons.iter().find(|b| b.default).unwrap();
         assert_eq!((ok.label.as_str(), ok.role), ("OK", ButtonRole::Accept));
         assert!(d.buttons.iter().any(|b| b.role == ButtonRole::Cancel));

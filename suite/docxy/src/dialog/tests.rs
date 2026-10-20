@@ -132,7 +132,17 @@ fn form() -> Dialog {
     d
 }
 
+/// The form as most tests need it: open, with nothing focused (a push focuses
+/// the first control, #1314; `opened()` is that).
 fn stack() -> DialogStack {
+    let mut s = opened();
+    s.top_dialog_mut().unwrap().focus = None;
+    s.top_dialog_mut().unwrap().anchor = None;
+    s
+}
+
+/// The form as a push leaves it.
+fn opened() -> DialogStack {
     let mut s = DialogStack::default();
     s.push(form());
     s
@@ -756,6 +766,8 @@ fn focused_on_name() -> DialogStack {
     let mut s = stack();
     s.top_dialog_mut().unwrap().focus_step(false);
     assert_eq!(focused_name(&s), Some("name"));
+    // Arriving by focus selects the value; these tests start from a caret.
+    s.top_dialog_mut().unwrap().anchor = None;
     s
 }
 
@@ -965,7 +977,7 @@ fn the_focus_moving_resets_the_caret() {
     d.focus_step(false);
     assert_eq!(focused_name(&s), Some("percent"));
     let d = s.top().unwrap();
-    assert_eq!(d.selection(), None);
+    assert_eq!(d.selection(), Some((0, 1)), "arriving selects the value");
     assert_eq!(d.caret_at(), 1, "the end of '0'");
 }
 
@@ -1758,4 +1770,104 @@ fn field_edits_are_counted() {
     d.delete().unwrap();
     assert_eq!(d.edits, before + 2);
     assert_eq!(d.caret_at(), 0, "Delete leaves the caret where it was");
+}
+
+/// A pushed plain form has its first control focused, with the value
+/// selected, so the first keys edit it (#1314).
+#[test]
+fn a_push_focuses_the_first_control_and_selects_its_value() {
+    let mut s = opened();
+    assert_eq!(focused_name(&s), Some("name"));
+    let d = s.top().unwrap();
+    assert_eq!(d.selection(), Some((0, 6)), "'Design' is selected");
+    let d = s.top_dialog_mut().unwrap();
+    d.type_char('X').unwrap();
+    assert_eq!(text(&s, "name"), "X", "typing replaces the value");
+}
+
+/// Message boxes, modeless, popup and plugin dialogs, and a dialog built
+/// with a focus keep exactly what they had (#1314).
+#[test]
+fn a_push_leaves_other_dialogs_as_built() {
+    let mut s = DialogStack::default();
+    s.push(Dialog::message(
+        catalog::TEST_T,
+        "T",
+        "text".into(),
+        &[("OK", ButtonRole::Accept)],
+        DialogOwner::Test,
+    ));
+    assert_eq!(s.top().unwrap().focus, None, "a message box");
+    let pushed = |tweak: &dyn Fn(&mut Dialog)| {
+        let mut d = form();
+        tweak(&mut d);
+        let mut s = DialogStack::default();
+        s.push(d);
+        s.top().unwrap().focus
+    };
+    assert_eq!(pushed(&|d| d.modeless = true), None, "modeless");
+    assert_eq!(
+        pushed(&|d| {
+            d.popup = Some(Popup {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                list_h: 1.0,
+            })
+        }),
+        None,
+        "a popup"
+    );
+    assert_eq!(
+        pushed(&|d| d.owner = DialogOwner::Plugin {
+            command: "c",
+            spec: "s"
+        }),
+        None,
+        "a plugin dialog"
+    );
+    assert_eq!(pushed(&|d| d.focus = Some(1)), Some(1), "a focus as built");
+}
+
+/// A child dialog a button opens is focused too (#1314).
+#[test]
+fn a_child_dialog_opens_focused() {
+    let mut s = opened();
+    s.click("Details...", |_| panic!("opening a child is not an apply"))
+        .unwrap();
+    assert_eq!(s.depth(), 2);
+    assert!(
+        s.top().unwrap().focused().is_some(),
+        "the child's first control"
+    );
+}
+
+/// Tab and Shift+Tab select the value of the field they land on; a click
+/// places the caret; an empty field selects nothing (#1314).
+#[test]
+fn tab_selects_the_value_and_a_click_does_not() {
+    let mut s = opened();
+    let d = s.top_dialog_mut().unwrap();
+    d.focus_step(false);
+    assert_eq!(focused_name(&s), Some("percent"));
+    assert_eq!(s.top().unwrap().selection(), Some((0, 1)));
+    s.top_dialog_mut().unwrap().type_char('7').unwrap();
+    assert_eq!(text(&s, "percent"), "7", "replaced '0'");
+    // Shift+Tab back onto the name selects it.
+    s.top_dialog_mut().unwrap().focus_step(true);
+    assert_eq!(focused_name(&s), Some("name"));
+    assert_eq!(s.top().unwrap().selection(), Some((0, 6)));
+    // A click on the field places the caret and selects nothing.
+    let name = index(&s, "name");
+    let percent = index(&s, "percent");
+    let d = s.top_dialog_mut().unwrap();
+    d.click_control(percent, None).unwrap();
+    d.click_control(name, None).unwrap();
+    assert_eq!(s.top().unwrap().selection(), None);
+    // An empty field has nothing to select.
+    let d = s.top_dialog_mut().unwrap();
+    d.controls[percent].value = Value::Text(String::new());
+    d.focus_step(false);
+    assert_eq!(focused_name(&s), Some("percent"));
+    assert_eq!(s.top().unwrap().selection(), None);
 }

@@ -302,13 +302,7 @@ fn text_tests(e: &Entry, f: &Field) -> Vec<Test> {
     let (edit, back, paste) = edit_text(f);
     let edit_chars: Vec<char> = edit.chars().collect();
 
-    let mut t = Test::new(e, f, "focus by click");
-    t.open(e, f)
-        .click(f)
-        .read(f)
-        .assert("reply.focused is true")
-        .close();
-    tests.push(t);
+    tests.push(click_test(e, f));
 
     // From another field a click focuses, when the field has a neighbour
     // shown with it, so the Tabs have to move the focus: a field that
@@ -462,22 +456,38 @@ fn text_tests(e: &Entry, f: &Field) -> Vec<Test> {
     tests
 }
 
-/// Another typed field of `e` on `f`'s tab, shown by the same prep, to start
-/// the Tab case from.
+/// Another field of `e` on `f`'s tab, shown with it, to move the focus to
+/// first: a dialog opens with its first control focused (#1314), so a case
+/// that never leaves the field would pass on a Tab or click that did nothing.
+/// A typed field shown by the same prep is preferred; else any field shown
+/// without a prep, or by the same one, as a radio gated on nothing is.
 fn tab_start<'e>(e: &'e Entry, f: &Field) -> Option<&'e Field> {
+    let other = |o: &&Field| o.name != f.name && o.skip.is_none() && o.tab == f.tab;
     e.fields
         .iter()
-        .find(|o| o.name != f.name && o.typed() && o.tab == f.tab && o.prep == f.prep)
+        .find(|o| other(o) && o.typed() && o.prep == f.prep)
+        .or_else(|| {
+            e.fields
+                .iter()
+                .find(|o| other(o) && (o.prep.is_empty() || o.prep == f.prep))
+        })
 }
 
 fn dropdown_tests(e: &Entry, f: &Field) -> Vec<Test> {
+    vec![click_test(e, f), step_test(e, f)]
+}
+
+/// A click focuses the field. A dialog opens with its first control focused
+/// (#1314), so when a neighbour is shown the click starts from it, and the
+/// field must have lost the focus before the click gives it back.
+fn click_test(e: &Entry, f: &Field) -> Test {
     let mut t = Test::new(e, f, "focus by click");
-    t.open(e, f)
-        .click(f)
-        .read(f)
-        .assert("reply.focused is true")
-        .close();
-    vec![t, step_test(e, f)]
+    t.open(e, f);
+    if let Some(other) = tab_start(e, f) {
+        t.click(other).read(f).assert("reply.focused is false");
+    }
+    t.click(f).read(f).assert("reply.focused is true").close();
+    t
 }
 
 /// A list (#988): Tab focuses it (a click lands on an item, or on none in a

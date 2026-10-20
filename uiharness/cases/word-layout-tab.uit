@@ -98,9 +98,8 @@ test Custom Margins opens Page Setup, which takes typed keys
   assert reply.controls.0.name is top
   assert reply.controls.0.value is 1
   shot window
-  # Tab focuses Top; Backspace and typing edit it through the widget.
-  key tab
-  key backspace
+  # The dialog opens with Top focused and its value selected (#1314); typing
+  # replaces it through the widget.
   type 1.5
   call dialog-read {}
   assert reply.controls.0.value is 1.5

@@ -22,6 +22,9 @@ test doc insert-table/cols: focus by click
   call menu-click {"label":"Insert Table..."}
   assert dialog is insert-table
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"rows"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"cols"}
   call field-read {"dialog-field":"cols"}
   assert reply.focused is true
@@ -184,6 +187,9 @@ test doc insert-table/rows: focus by click
   call menu-click {"label":"Insert Table..."}
   assert dialog is insert-table
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"rows"}
   call field-read {"dialog-field":"rows"}
   assert reply.focused is true
@@ -346,6 +352,9 @@ test doc insert-table/width: focus by click
   call menu-click {"label":"Insert Table..."}
   assert dialog is insert-table
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call field-read {"dialog-field":"width"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"width"}
   call field-read {"dialog-field":"width"}
   assert reply.focused is true
@@ -497,6 +506,9 @@ test doc split-cells/cols: focus by click
   call ribbon-click {"tab":"Table Layout","command":"split-cells"}
   assert dialog is split-cells
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"rows"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"cols"}
   call field-read {"dialog-field":"cols"}
   assert reply.focused is true
@@ -659,6 +671,9 @@ test doc split-cells/rows: focus by click
   call ribbon-click {"tab":"Table Layout","command":"split-cells"}
   assert dialog is split-cells
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"cols"}
+  call field-read {"dialog-field":"rows"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"rows"}
   call field-read {"dialog-field":"rows"}
   assert reply.focused is true
@@ -829,6 +844,9 @@ test doc sort/sort1: focus by click
   call ribbon-click {"tab":"Home","command":"sort"}
   assert dialog is sort
   call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"type1"}
+  call field-read {"dialog-field":"sort1"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"sort1"}
   call field-read {"dialog-field":"sort1"}
   assert reply.focused is true
@@ -862,6 +880,9 @@ test doc sort/type1: focus by click
   call ribbon-click {"tab":"Home","command":"sort"}
   assert dialog is sort
   call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"sort1"}
+  call field-read {"dialog-field":"type1"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"type1"}
   call field-read {"dialog-field":"type1"}
   assert reply.focused is true
@@ -895,6 +916,9 @@ test doc sort/sort2: focus by click
   call ribbon-click {"tab":"Home","command":"sort"}
   assert dialog is sort
   call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"sort1"}
+  call field-read {"dialog-field":"sort2"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"sort2"}
   call field-read {"dialog-field":"sort2"}
   assert reply.focused is true
@@ -928,6 +952,9 @@ test doc sort/type2: focus by click
   call ribbon-click {"tab":"Home","command":"sort"}
   assert dialog is sort
   call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"sort1"}
+  call field-read {"dialog-field":"type2"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"type2"}
   call field-read {"dialog-field":"type2"}
   assert reply.focused is true
@@ -961,6 +988,9 @@ test doc sort/sort3: focus by click
   call ribbon-click {"tab":"Home","command":"sort"}
   assert dialog is sort
   call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"sort1"}
+  call field-read {"dialog-field":"sort3"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"sort3"}
   call field-read {"dialog-field":"sort3"}
   assert reply.focused is true
@@ -994,6 +1024,9 @@ test doc sort/type3: focus by click
   call ribbon-click {"tab":"Home","command":"sort"}
   assert dialog is sort
   call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"sort1"}
+  call field-read {"dialog-field":"type3"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"type3"}
   call field-read {"dialog-field":"type3"}
   assert reply.focused is true
@@ -1037,6 +1070,9 @@ test doc convert-to-text/other: focus by click
   call dialog-catalog-check {}
   call real-key {"key":"tab","to-field":"sep"}
   call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-control":"sep"}
+  call field-read {"dialog-field":"other"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"other"}
   call field-read {"dialog-field":"other"}
   assert reply.focused is true
@@ -1050,6 +1086,9 @@ test doc convert-to-text/other: focus by Tab
   call dialog-catalog-check {}
   call real-key {"key":"tab","to-field":"sep"}
   call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-control":"sep"}
+  call field-read {"dialog-field":"other"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"other"}
   call field-read {"dialog-field":"other"}
   assert reply.focused is true
@@ -1216,6 +1255,9 @@ test doc convert-text-to-table/cols: focus by click
   call menu-click {"label":"Convert Text to Table..."}
   assert dialog is convert-text-to-table
   call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"sep"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"cols"}
   call field-read {"dialog-field":"cols"}
   assert reply.focused is true
@@ -1229,6 +1271,9 @@ test doc convert-text-to-table/cols: focus by Tab
   call menu-click {"label":"Convert Text to Table..."}
   assert dialog is convert-text-to-table
   call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"sep"}
+  call field-read {"dialog-field":"cols"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"cols"}
   call field-read {"dialog-field":"cols"}
   assert reply.focused is true
@@ -1400,6 +1445,9 @@ test doc convert-text-to-table/other: focus by click
   call dialog-catalog-check {}
   call real-key {"key":"tab","to-field":"sep"}
   call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"cols"}
+  call field-read {"dialog-field":"other"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"other"}
   call field-read {"dialog-field":"other"}
   assert reply.focused is true
@@ -1415,6 +1463,9 @@ test doc convert-text-to-table/other: focus by Tab
   call dialog-catalog-check {}
   call real-key {"key":"tab","to-field":"sep"}
   call real-key {"key":"down","times":2}
+  call pointer-click {"dialog-field":"cols"}
+  call field-read {"dialog-field":"other"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"other"}
   call field-read {"dialog-field":"other"}
   assert reply.focused is true

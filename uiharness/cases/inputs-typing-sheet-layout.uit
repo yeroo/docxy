@@ -21,6 +21,9 @@ test sheet page-setup/scale: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"fit-width"}
+  call field-read {"dialog-field":"scale"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"scale"}
   call field-read {"dialog-field":"scale"}
   assert reply.focused is true
@@ -189,6 +192,9 @@ test sheet page-setup/fit-width: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"scale"}
+  call field-read {"dialog-field":"fit-width"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"fit-width"}
   call field-read {"dialog-field":"fit-width"}
   assert reply.focused is true
@@ -357,6 +363,9 @@ test sheet page-setup/fit-height: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"scale"}
+  call field-read {"dialog-field":"fit-height"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"fit-height"}
   call field-read {"dialog-field":"fit-height"}
   assert reply.focused is true
@@ -525,6 +534,9 @@ test sheet page-setup/paper: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Page"}
+  call pointer-click {"dialog-field":"scale"}
+  call field-read {"dialog-field":"paper"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"paper"}
   call field-read {"dialog-field":"paper"}
   assert reply.focused is true
@@ -558,6 +570,9 @@ test sheet page-setup/top: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"bottom"}
+  call field-read {"dialog-field":"top"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"top"}
   call field-read {"dialog-field":"top"}
   assert reply.focused is true
@@ -726,6 +741,9 @@ test sheet page-setup/bottom: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"top"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"bottom"}
   call field-read {"dialog-field":"bottom"}
   assert reply.focused is true
@@ -894,6 +912,9 @@ test sheet page-setup/left: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"top"}
+  call field-read {"dialog-field":"left"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"left"}
   call field-read {"dialog-field":"left"}
   assert reply.focused is true
@@ -1062,6 +1083,9 @@ test sheet page-setup/right: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"top"}
+  call field-read {"dialog-field":"right"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"right"}
   call field-read {"dialog-field":"right"}
   assert reply.focused is true
@@ -1230,6 +1254,9 @@ test sheet page-setup/header: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"top"}
+  call field-read {"dialog-field":"header"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"header"}
   call field-read {"dialog-field":"header"}
   assert reply.focused is true
@@ -1398,6 +1425,9 @@ test sheet page-setup/footer: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Margins"}
+  call pointer-click {"dialog-field":"top"}
+  call field-read {"dialog-field":"footer"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"footer"}
   call field-read {"dialog-field":"footer"}
   assert reply.focused is true
@@ -1566,6 +1596,9 @@ test sheet page-setup/print-area: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"title-rows"}
+  call field-read {"dialog-field":"print-area"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"print-area"}
   call field-read {"dialog-field":"print-area"}
   assert reply.focused is true
@@ -1720,6 +1753,9 @@ test sheet page-setup/title-rows: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"print-area"}
+  call field-read {"dialog-field":"title-rows"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"title-rows"}
   call field-read {"dialog-field":"title-rows"}
   assert reply.focused is true
@@ -1874,6 +1910,9 @@ test sheet page-setup/title-cols: focus by click
   assert dialog is page-setup
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Sheet"}
+  call pointer-click {"dialog-field":"print-area"}
+  call field-read {"dialog-field":"title-cols"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"title-cols"}
   call field-read {"dialog-field":"title-cols"}
   assert reply.focused is true

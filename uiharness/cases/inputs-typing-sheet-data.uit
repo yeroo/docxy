@@ -22,6 +22,9 @@ test sheet consolidate/function: focus by click
   call ribbon-click {"tab":"Data","command":"Consolidate"}
   assert dialog is consolidate
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"reference"}
+  call field-read {"dialog-field":"function"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"function"}
   call field-read {"dialog-field":"function"}
   assert reply.focused is true
@@ -55,6 +58,9 @@ test sheet consolidate/reference: focus by click
   call ribbon-click {"tab":"Data","command":"Consolidate"}
   assert dialog is consolidate
   call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"function"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"reference"}
   call field-read {"dialog-field":"reference"}
   assert reply.focused is true
@@ -66,6 +72,9 @@ test sheet consolidate/reference: focus by Tab
   call ribbon-click {"tab":"Data","command":"Consolidate"}
   assert dialog is consolidate
   call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"function"}
+  call field-read {"dialog-field":"reference"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"reference"}
   call field-read {"dialog-field":"reference"}
   assert reply.focused is true
@@ -271,6 +280,9 @@ test sheet series/step: focus by click
   call menu-click {"label":"Series…"}
   assert dialog is series
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"stop"}
+  call field-read {"dialog-field":"step"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"step"}
   call field-read {"dialog-field":"step"}
   assert reply.focused is true
@@ -470,6 +482,9 @@ test sheet series/stop: focus by click
   call menu-click {"label":"Series…"}
   assert dialog is series
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"step"}
+  call field-read {"dialog-field":"stop"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"stop"}
   call field-read {"dialog-field":"stop"}
   assert reply.focused is true
@@ -725,6 +740,9 @@ test sheet custom-lists/entries: focus by click
   call pointer-click {"at":"custom-lists-row"}
   assert dialog is custom-lists
   call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"lists"}
+  call field-read {"dialog-field":"entries"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"entries"}
   call field-read {"dialog-field":"entries"}
   assert reply.focused is true
@@ -738,6 +756,9 @@ test sheet custom-lists/entries: focus by Tab
   call pointer-click {"at":"custom-lists-row"}
   assert dialog is custom-lists
   call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"lists"}
+  call field-read {"dialog-field":"entries"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"entries"}
   call field-read {"dialog-field":"entries"}
   assert reply.focused is true
@@ -1060,6 +1081,9 @@ test sheet subtotal/group: focus by click
   call ribbon-click {"tab":"Data","command":"Subtotal"}
   assert dialog is subtotal
   call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"function"}
+  call field-read {"dialog-field":"group"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"group"}
   call field-read {"dialog-field":"group"}
   assert reply.focused is true
@@ -1093,6 +1117,9 @@ test sheet subtotal/function: focus by click
   call ribbon-click {"tab":"Data","command":"Subtotal"}
   assert dialog is subtotal
   call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"group"}
+  call field-read {"dialog-field":"function"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"function"}
   call field-read {"dialog-field":"function"}
   assert reply.focused is true
@@ -1152,6 +1179,9 @@ test sheet data-validation/allow: focus by click
   assert dialog is data-validation
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Settings"}
+  call pointer-click {"dialog-control":"ignore-blank"}
+  call field-read {"dialog-field":"allow"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"allow"}
   call field-read {"dialog-field":"allow"}
   assert reply.focused is true
@@ -1189,6 +1219,9 @@ test sheet data-validation/operator: focus by click
   call real-key {"key":"tab","to-field":"allow"}
   call real-key {"key":"down","times":1}
   call pointer-click {"dialog-tab":"Settings"}
+  call pointer-click {"dialog-control":"allow"}
+  call field-read {"dialog-field":"operator"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"operator"}
   call field-read {"dialog-field":"operator"}
   assert reply.focused is true
@@ -1230,6 +1263,9 @@ test sheet data-validation/first: focus by click
   call pointer-click {"dialog-field":"second"}
   call real-type {"text":"90"}
   call pointer-click {"dialog-tab":"Settings"}
+  call pointer-click {"dialog-control":"allow"}
+  call field-read {"dialog-field":"first"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"first"}
   call field-read {"dialog-field":"first"}
   assert reply.focused is true
@@ -1246,6 +1282,9 @@ test sheet data-validation/first: focus by Tab
   call pointer-click {"dialog-field":"second"}
   call real-type {"text":"90"}
   call pointer-click {"dialog-tab":"Settings"}
+  call pointer-click {"dialog-control":"allow"}
+  call field-read {"dialog-field":"first"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"first"}
   call field-read {"dialog-field":"first"}
   assert reply.focused is true
@@ -1437,6 +1476,9 @@ test sheet data-validation/second: focus by click
   call pointer-click {"dialog-field":"first"}
   call real-type {"text":"10"}
   call pointer-click {"dialog-tab":"Settings"}
+  call pointer-click {"dialog-control":"allow"}
+  call field-read {"dialog-field":"second"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"second"}
   call field-read {"dialog-field":"second"}
   assert reply.focused is true
@@ -1453,6 +1495,9 @@ test sheet data-validation/second: focus by Tab
   call pointer-click {"dialog-field":"first"}
   call real-type {"text":"10"}
   call pointer-click {"dialog-tab":"Settings"}
+  call pointer-click {"dialog-control":"allow"}
+  call field-read {"dialog-field":"second"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"second"}
   call field-read {"dialog-field":"second"}
   assert reply.focused is true
@@ -1640,6 +1685,9 @@ test sheet data-validation/input-title: focus by click
   assert dialog is data-validation
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Input Message"}
+  call pointer-click {"dialog-field":"input-message"}
+  call field-read {"dialog-field":"input-title"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"input-title"}
   call field-read {"dialog-field":"input-title"}
   assert reply.focused is true
@@ -1806,6 +1854,9 @@ test sheet data-validation/input-message: focus by click
   assert dialog is data-validation
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Input Message"}
+  call pointer-click {"dialog-field":"input-title"}
+  call field-read {"dialog-field":"input-message"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"input-message"}
   call field-read {"dialog-field":"input-message"}
   assert reply.focused is true
@@ -1972,6 +2023,9 @@ test sheet data-validation/error-style: focus by click
   assert dialog is data-validation
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Error Alert"}
+  call pointer-click {"dialog-field":"error-title"}
+  call field-read {"dialog-field":"error-style"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"error-style"}
   call field-read {"dialog-field":"error-style"}
   assert reply.focused is true
@@ -2007,6 +2061,9 @@ test sheet data-validation/error-title: focus by click
   assert dialog is data-validation
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Error Alert"}
+  call pointer-click {"dialog-field":"error-message"}
+  call field-read {"dialog-field":"error-title"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"error-title"}
   call field-read {"dialog-field":"error-title"}
   assert reply.focused is true
@@ -2173,6 +2230,9 @@ test sheet data-validation/error-message: focus by click
   assert dialog is data-validation
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Error Alert"}
+  call pointer-click {"dialog-field":"error-title"}
+  call field-read {"dialog-field":"error-message"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"error-message"}
   call field-read {"dialog-field":"error-message"}
   assert reply.focused is true
@@ -2368,6 +2428,9 @@ test sheet text-to-columns/other_char: focus by click
   assert dialog is text-to-columns
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"tab"}
+  call field-read {"dialog-field":"other_char"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"other_char"}
   call field-read {"dialog-field":"other_char"}
   assert reply.focused is true
@@ -2383,6 +2446,9 @@ test sheet text-to-columns/other_char: focus by Tab
   assert dialog is text-to-columns
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"tab"}
+  call field-read {"dialog-field":"other_char"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"other_char"}
   call field-read {"dialog-field":"other_char"}
   assert reply.focused is true
@@ -2536,6 +2602,9 @@ test sheet text-to-columns/qualifier: focus by click
   assert dialog is text-to-columns
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-field":"other_char"}
+  call field-read {"dialog-field":"qualifier"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"qualifier"}
   call field-read {"dialog-field":"qualifier"}
   assert reply.focused is true
@@ -2579,6 +2648,9 @@ test sheet text-to-columns/breaks: focus by click
   call real-key {"key":"tab","to-field":"kind"}
   call real-key {"key":"down","times":1}
   call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"tab"}
+  call field-read {"dialog-field":"breaks"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"breaks"}
   call field-read {"dialog-field":"breaks"}
   assert reply.focused is true
@@ -2596,6 +2668,9 @@ test sheet text-to-columns/breaks: focus by Tab
   call real-key {"key":"tab","to-field":"kind"}
   call real-key {"key":"down","times":1}
   call pointer-click {"dialog-tab":"Step 2: Delimiters"}
+  call pointer-click {"dialog-control":"tab"}
+  call field-read {"dialog-field":"breaks"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"breaks"}
   call field-read {"dialog-field":"breaks"}
   assert reply.focused is true
@@ -2785,6 +2860,9 @@ test sheet text-to-columns/column: focus by click
   call pointer-click {"dialog-tab":"Step 2: Delimiters"}
   call pointer-click {"dialog-control":"comma"}
   call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"formats"}
+  call field-read {"dialog-field":"column"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"column"}
   call field-read {"dialog-field":"column"}
   assert reply.focused is true
@@ -2828,6 +2906,9 @@ test sheet text-to-columns/date_order: focus by click
   assert dialog is text-to-columns
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"destination"}
+  call field-read {"dialog-field":"date_order"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"date_order"}
   call field-read {"dialog-field":"date_order"}
   assert reply.focused is true
@@ -2871,6 +2952,9 @@ test sheet text-to-columns/formats: focus by click
   call pointer-click {"dialog-tab":"Step 2: Delimiters"}
   call pointer-click {"dialog-control":"comma"}
   call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-control":"column"}
+  call field-read {"dialog-field":"formats"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"formats"}
   call field-read {"dialog-field":"formats"}
   assert reply.focused is true
@@ -2888,6 +2972,9 @@ test sheet text-to-columns/formats: focus by Tab
   call pointer-click {"dialog-tab":"Step 2: Delimiters"}
   call pointer-click {"dialog-control":"comma"}
   call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-control":"column"}
+  call field-read {"dialog-field":"formats"}
+  assert reply.focused is false
   call real-key {"key":"tab","to-field":"formats"}
   call field-read {"dialog-field":"formats"}
   assert reply.focused is true
@@ -3075,6 +3162,9 @@ test sheet text-to-columns/destination: focus by click
   assert dialog is text-to-columns
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"decimal"}
+  call field-read {"dialog-field":"destination"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"destination"}
   call field-read {"dialog-field":"destination"}
   assert reply.focused is true
@@ -3263,6 +3353,9 @@ test sheet text-to-columns/decimal: focus by click
   assert dialog is text-to-columns
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"destination"}
+  call field-read {"dialog-field":"decimal"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"decimal"}
   call field-read {"dialog-field":"decimal"}
   assert reply.focused is true
@@ -3434,6 +3527,9 @@ test sheet text-to-columns/thousands: focus by click
   assert dialog is text-to-columns
   call dialog-catalog-check {}
   call pointer-click {"dialog-tab":"Step 3: Column data format"}
+  call pointer-click {"dialog-field":"destination"}
+  call field-read {"dialog-field":"thousands"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"thousands"}
   call field-read {"dialog-field":"thousands"}
   assert reply.focused is true

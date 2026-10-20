@@ -2068,6 +2068,28 @@ impl Dialog {
         self.caret = None;
         self.anchor = None;
         self.calendar = None;
+        // A single-line field that takes the focus has its whole value
+        // selected, as in Word, so typing replaces it (#1314).
+        if self
+            .focused()
+            .is_some_and(|c| c.kind.is_text() && c.kind != ControlKind::Multiline)
+        {
+            self.select_all();
+        }
+    }
+
+    /// A plain modal form opens with its first editable control focused, as
+    /// in Word, so the first keys are not lost (#1314). Message boxes have no
+    /// editable control; modeless, popup and plugin dialogs route keys their
+    /// own way and keep their focus as built.
+    pub fn focus_on_open(&mut self) {
+        if self.focus.is_none()
+            && !self.modeless
+            && self.popup.is_none()
+            && !matches!(self.owner, DialogOwner::Plugin { .. })
+        {
+            self.focus_step(false);
+        }
     }
 
     /// The focused text field's text, when the focus is on one.
@@ -2622,7 +2644,8 @@ impl DialogStack {
     pub fn depth(&self) -> usize {
         self.0.len()
     }
-    pub fn push(&mut self, dialog: Dialog) {
+    pub fn push(&mut self, mut dialog: Dialog) {
+        dialog.focus_on_open();
         self.0.push(dialog);
     }
     /// The dialog under the top one (a message box's parent).
@@ -2728,7 +2751,8 @@ impl DialogStack {
                 self.0.pop();
             }
             ButtonRole::Open(child) => {
-                let child = child.build(top);
+                let mut child = child.build(top);
+                child.focus_on_open();
                 self.0.push(child);
             }
             ButtonRole::Accept if depth > 1 && ChildDialog::writing_back(top.owner).is_some() => {

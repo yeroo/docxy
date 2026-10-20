@@ -175,6 +175,9 @@ test doc fill-effects/color1: focus by click
   call menu-click {"label":"Fill Effects..."}
   assert dialog is fill-effects
   call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"colors"}
+  call field-read {"dialog-field":"color1"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"color1"}
   call field-read {"dialog-field":"color1"}
   assert reply.focused is true
@@ -210,6 +213,9 @@ test doc fill-effects/color2: focus by click
   call dialog-catalog-check {}
   call real-key {"key":"tab","to-field":"colors"}
   call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-control":"colors"}
+  call field-read {"dialog-field":"color2"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"color2"}
   call field-read {"dialog-field":"color2"}
   assert reply.focused is true
@@ -255,6 +261,9 @@ test doc watermark/text: focus by click
   call dialog-catalog-check {}
   call real-key {"key":"tab","to-field":"kind"}
   call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"font"}
+  call field-read {"dialog-field":"text"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"text"}
   call field-read {"dialog-field":"text"}
   assert reply.focused is true
@@ -423,6 +432,9 @@ test doc watermark/font: focus by click
   call dialog-catalog-check {}
   call real-key {"key":"tab","to-field":"kind"}
   call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"text"}
+  call field-read {"dialog-field":"font"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"font"}
   call field-read {"dialog-field":"font"}
   assert reply.focused is true
@@ -599,6 +611,9 @@ test doc watermark/size: focus by click
   call dialog-catalog-check {}
   call real-key {"key":"tab","to-field":"kind"}
   call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"text"}
+  call field-read {"dialog-field":"size"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"size"}
   call field-read {"dialog-field":"size"}
   assert reply.focused is true
@@ -775,6 +790,9 @@ test doc watermark/color: focus by click
   call dialog-catalog-check {}
   call real-key {"key":"tab","to-field":"kind"}
   call real-key {"key":"down","times":1}
+  call pointer-click {"dialog-field":"text"}
+  call field-read {"dialog-field":"color"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"color"}
   call field-read {"dialog-field":"color"}
   assert reply.focused is true
@@ -816,6 +834,9 @@ test doc page-borders/style: focus by click
   key alt g p b
   assert dialog is page-borders
   call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"setting"}
+  call field-read {"dialog-field":"style"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"style"}
   call field-read {"dialog-field":"style"}
   assert reply.focused is true
@@ -847,6 +868,9 @@ test doc page-borders/color: focus by click
   key alt g p b
   assert dialog is page-borders
   call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"setting"}
+  call field-read {"dialog-field":"color"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"color"}
   call field-read {"dialog-field":"color"}
   assert reply.focused is true
@@ -878,6 +902,9 @@ test doc page-borders/width: focus by click
   key alt g p b
   assert dialog is page-borders
   call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"setting"}
+  call field-read {"dialog-field":"width"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"width"}
   call field-read {"dialog-field":"width"}
   assert reply.focused is true
@@ -909,6 +936,9 @@ test doc page-borders/apply: focus by click
   key alt g p b
   assert dialog is page-borders
   call dialog-catalog-check {}
+  call pointer-click {"dialog-control":"setting"}
+  call field-read {"dialog-field":"apply"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"apply"}
   call field-read {"dialog-field":"apply"}
   assert reply.focused is true
@@ -949,6 +979,9 @@ test doc page-border-options/top: focus by click
   call dialog-click {"button":"Options..."}
   assert dialog is page-border-options
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"left"}
+  call field-read {"dialog-field":"top"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"top"}
   call field-read {"dialog-field":"top"}
   assert reply.focused is true
@@ -1115,6 +1148,9 @@ test doc page-border-options/left: focus by click
   call dialog-click {"button":"Options..."}
   assert dialog is page-border-options
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"top"}
+  call field-read {"dialog-field":"left"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"left"}
   call field-read {"dialog-field":"left"}
   assert reply.focused is true
@@ -1281,6 +1317,9 @@ test doc page-border-options/bottom: focus by click
   call dialog-click {"button":"Options..."}
   assert dialog is page-border-options
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"top"}
+  call field-read {"dialog-field":"bottom"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"bottom"}
   call field-read {"dialog-field":"bottom"}
   assert reply.focused is true
@@ -1447,6 +1486,9 @@ test doc page-border-options/right: focus by click
   call dialog-click {"button":"Options..."}
   assert dialog is page-border-options
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"top"}
+  call field-read {"dialog-field":"right"}
+  assert reply.focused is false
   call pointer-click {"dialog-field":"right"}
   call field-read {"dialog-field":"right"}
   assert reply.focused is true
@@ -1613,6 +1655,9 @@ test doc page-border-options/from: focus by click
   call dialog-click {"button":"Options..."}
   assert dialog is page-border-options
   call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"top"}
+  call field-read {"dialog-field":"from"}
+  assert reply.focused is false
   call pointer-click {"dialog-control":"from"}
   call field-read {"dialog-field":"from"}
   assert reply.focused is true
