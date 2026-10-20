@@ -259,7 +259,7 @@ pub(crate) fn inspect_remove(
                     .partition(|id| anchored.contains(*id) || has_record(id));
                 stripped = tab
                     .comment_undo
-                    .strip_stories(pkg, stories, &gone, &recorded, None);
+                    .strip_stories(pkg, stories, &gone, &recorded);
             }
             let markers = editor.remove_all_comment_markers() + stripped;
             for c in &tab.comments {

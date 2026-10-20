@@ -13106,7 +13106,7 @@ impl CommentUndo {
         }
     }
 
-    /// Take comment markers out of the stories of `pkg` (but part `skip`):
+    /// Take comment markers out of the stories of `pkg`:
     /// those of `gone` for good, since nothing can bring them back (orphans
     /// with no comment); those of `recorded` kept, for [`save_base`] to put
     /// back with their comments: a comment is out of the stories while it is
@@ -13119,13 +13119,9 @@ impl CommentUndo {
         stories: &docxcore::inspect::Stories,
         gone: &[&str],
         recorded: &[&str],
-        skip: Option<&str>,
     ) -> usize {
         let mut parts = 0;
         for part in stories.part_names() {
-            if Some(part) == skip {
-                continue;
-            }
             let a = self.stripped.strip_for_good(pkg, part, gone);
             let b = self.stripped.strip(pkg, part, recorded);
             parts += usize::from(a || b);
@@ -13296,7 +13292,7 @@ fn follow_comment_undo(
         .filter(|id| present.contains(*id))
         .collect();
     if !dead.is_empty() {
-        stories.strip_comment_markers(base.to_mut(), &dead, None);
+        stories.strip_comment_markers(base.to_mut(), &dead);
     }
 }
 

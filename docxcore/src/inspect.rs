@@ -960,19 +960,11 @@ impl Stories {
         ids
     }
 
-    /// Strip the markers of the comments `only` names from the stories but
-    /// `skip`'s, straight from each part's XML. How many parts changed.
-    pub fn strip_comment_markers(
-        &self,
-        pkg: &mut Package,
-        only: &[&str],
-        skip: Option<&str>,
-    ) -> usize {
+    /// Strip the markers of the comments `only` names from the stories,
+    /// straight from each part's XML. How many parts changed.
+    pub fn strip_comment_markers(&self, pkg: &mut Package, only: &[&str]) -> usize {
         let mut changed = 0;
         for (part, _) in &self.parts {
-            if Some(part.as_str()) == skip {
-                continue;
-            }
             let Some(xml) = pkg.part_text(part) else {
                 continue;
             };
@@ -1102,8 +1094,8 @@ fn strip_comment_markers_in_part(xml: &str, only: Option<&[&str]>) -> (String, u
 /// time follows from those and from which comments are anchored: the
 /// markers of every comment that is not anchored are out, the others in, in
 /// whatever order undo and redo bring them.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StrippedPart {
+#[derive(Clone, Debug)]
+struct StrippedPart {
     part: String,
     original: String,
     ids: std::collections::BTreeSet<String>,
@@ -1137,7 +1129,8 @@ impl StrippedPart {
 }
 
 /// The story parts a host took comment markers out of, one record per part
-/// ([`StrippedPart`]); the host's undo and redo then call [`StripLog::sync`]
+/// (the part's original text and the comments whose markers went); the
+/// host's undo and redo then call [`StripLog::sync`]
 /// with the comments anchored in the body, and the markers follow them.
 #[derive(Clone, Debug, Default)]
 pub struct StripLog {
@@ -2354,7 +2347,7 @@ mod tests {
             .sum();
         let ids = stories.comment_marker_ids(pkg);
         let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
-        stories.strip_comment_markers(pkg, &ids, None);
+        stories.strip_comment_markers(pkg, &ids);
         before
     }
 
@@ -2535,10 +2528,10 @@ mod tests {
         assert!(log.plan(&pkg, &set(&["3"]), Some(part)).is_empty(), "open");
         assert!(log.sync(&mut pkg, &set(&["3"]), None));
         assert_eq!(pkg.part_text(part).unwrap(), before);
-        // The strip the stories do themselves skips the open part too.
-        let n = stories(&pkg).strip_comment_markers(&mut pkg, &["3", "4"], Some(part));
-        assert_eq!(n, 2, "the footnotes' and the endnotes'");
-        assert!(pkg.part_text(part).unwrap().contains("commentReference"));
+        // The strip the stories do themselves: the header, footnotes, endnotes.
+        let n = stories(&pkg).strip_comment_markers(&mut pkg, &["3", "4"]);
+        assert_eq!(n, 3);
+        assert!(!pkg.part_text(part).unwrap().contains("commentReference"));
     }
 
     /// #918: a footnote's and an endnote's hidden run and comment markers go;

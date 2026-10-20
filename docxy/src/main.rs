@@ -1614,11 +1614,11 @@ struct App {
     /// document and its undo history), clears it.
     tracked_comments: std::collections::BTreeMap<String, TrackedComment>,
     /// The markers Delete Comment (or Delete All) took out of the header and
-    /// footer parts of `pkg` that were not being edited, in the order they
-    /// were taken (#981): each part's text before and after, with the ids
-    /// it covers. [`App::sync_stripped_hf`] puts a part's markers back when
-    /// every one of its comments is anchored again (an undo), and takes them
-    /// again when one is not (a redo). Cleared with `tracked_comments`.
+    /// footer parts of `pkg` that were not being edited (#981): one record
+    /// per part, its original text and the comments whose markers went.
+    /// [`App::sync_stripped_hf`] keeps each comment's markers in while it is
+    /// anchored and out while it is not, in whatever order undo and redo
+    /// come. Cleared with `tracked_comments`.
     stripped_hf: docxcore::inspect::StripLog,
     /// Every comment id the document has had since it loaded: those of its
     /// comments and body markers then ([`used_comment_ids`]), and each one
@@ -3667,10 +3667,9 @@ impl App {
             self.editor.remove_all_comment_markers();
         }
         let comments = std::mem::take(&mut self.comments);
-        // Two passes over the stored parts, each strips a part once for all
-        // of its comments: first the ones anchored only there, for good
-        // (the recorded strips of the part take that in), then the ones an
-        // undo reaches, recorded.
+        // Two passes over the stored parts: the comments anchored only there
+        // go for good (the log forgets them), then the ones an undo reaches
+        // are taken and recorded.
         let (kept, gone): (Vec<&str>, Vec<&str>) = comments
             .iter()
             .map(|c| c.id.as_str())
