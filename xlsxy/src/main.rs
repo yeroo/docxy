@@ -1972,6 +1972,9 @@ struct WbSnapshot {
     clip_edit: Option<ClipEdit>,
     /// Each PivotTable's `unsupported` flag: deleting its table sets it.
     pivot_unsupported: Vec<bool>,
+    /// A Resize Table step: undo and redo leave the model and the pending
+    /// copy alone, as the step did.
+    resize: bool,
 }
 
 /// A change to the pending copy that undo or redo replays: the copy is
@@ -1979,7 +1982,8 @@ struct WbSnapshot {
 /// dropped (when the pending one has this sheet, origin and span).
 #[derive(Clone)]
 enum ClipEdit {
-    Set(ClipData),
+    /// The copy, and the text clipboard when the step saw it.
+    Set(ClipData, Option<String>),
     Drop(usize, (u32, u32), (u32, u32)),
 }
 
@@ -3975,6 +3979,8 @@ impl App {
     /// and so the model.
     fn follow_table_edits(&mut self, before: &mut WbSnapshot, after: &mut WbSnapshot) {
         if self.resizing_table {
+            before.resize = true;
+            after.resize = true;
             return;
         }
         let changes = column_changes(before, after);
@@ -4036,9 +4042,26 @@ impl App {
         before: &mut WbSnapshot,
         after: &mut WbSnapshot,
     ) {
-        let Some(orig) = self.clip.clone() else {
+        let text = self.clip_text.clone();
+        let Some((orig, now)) = self.rewrite_clip(changes) else {
             return;
         };
+        let kept = |mut c: ClipData| {
+            c.cut = false;
+            c
+        };
+        before.clip_edit = Some(ClipEdit::Set(kept(orig.clone()), text.clone()));
+        after.clip_edit = Some(match now {
+            Some(clip) => ClipEdit::Set(kept(clip), text),
+            None => ClipEdit::Drop(orig.sheet, orig.from, orig.span),
+        });
+    }
+
+    /// Rewrite the pending copy's formulas through `changes`: the copy as it
+    /// was and as it is now (`None` when it names a removed table and is
+    /// dropped), or `None` when nothing changed.
+    fn rewrite_clip(&mut self, changes: &[TableChange]) -> Option<(ClipData, Option<ClipData>)> {
+        let orig = self.clip.clone()?;
         let mut clip = orig.clone();
         let (mut changed, mut dropped) = (false, false);
         for ch in changes {
@@ -4063,30 +4086,32 @@ impl App {
             }
         }
         if !changed {
-            return;
+            return None;
         }
-        let kept = |mut c: ClipData| {
-            c.cut = false;
-            c
-        };
-        before.clip_edit = Some(ClipEdit::Set(kept(orig.clone())));
         if dropped {
-            after.clip_edit = Some(ClipEdit::Drop(orig.sheet, orig.from, orig.span));
             self.clip = None;
+            Some((orig, None))
         } else {
-            after.clip_edit = Some(ClipEdit::Set(kept(clip.clone())));
-            self.clip = Some(clip);
+            self.clip = Some(clip.clone());
+            Some((orig, Some(clip)))
         }
     }
 
-    /// Undo or redo's side of [`Self::follow_tables_in_clip`].
+    /// Undo or redo's side of [`Self::follow_tables_in_clip`]. A copy comes
+    /// back over another with the same source, or into an empty slot only
+    /// while the text clipboard is still what it was at the step: a text
+    /// field's copy (`field_copy`) also empties the slot, and is the newer.
     fn apply_clip_edit(&mut self, edit: &ClipEdit) {
         let same =
             |c: &ClipData, key: (usize, (u32, u32), (u32, u32))| (c.sheet, c.from, c.span) == key;
         match edit {
-            ClipEdit::Set(c) => {
+            ClipEdit::Set(c, text) => {
                 let key = (c.sheet, c.from, c.span);
-                if self.clip.as_ref().is_none_or(|cur| same(cur, key)) {
+                let fits = match &self.clip {
+                    Some(cur) => same(cur, key),
+                    None => self.clip_text == *text,
+                };
+                if fits {
                     self.clip = Some(c.clone());
                 }
             }
@@ -4212,6 +4237,7 @@ impl App {
             model_edits: Vec::new(),
             clip_edit: None,
             pivot_unsupported: wb.pivots.iter().map(|p| p.unsupported).collect(),
+            resize: false,
         }
     }
 
@@ -4249,7 +4275,14 @@ impl App {
     fn restore(&mut self, snap: &WbSnapshot) {
         self.circles.clear();
         self.cancel_cut();
+        // A copy taken after the step names the tables as they are now: it
+        // follows the way back like the cells do. The copy the step itself
+        // found or left is then put back as it was (`clip_edit`).
+        let current = self.wb_snapshot();
         self.put_back(snap);
+        if !snap.resize {
+            self.rewrite_clip(&column_changes(&current, snap));
+        }
         if let Some((old, new)) = &snap.model_rename {
             self.rename_table_in_model(old, new);
         }
@@ -19633,13 +19666,18 @@ mod tests {
     #[test]
     fn a_delete_over_two_tables_rewrites_the_model_through_both_991() {
         let mut app = two_table_app();
-        // B:G: Sales loses Qty, Costs loses everything but the F column's Id.
+        // B:F: Sales loses Qty and Costs loses Id, and both survive.
         app.cur = (0, 1);
-        app.anchor = Some((0, 6));
+        app.anchor = Some((0, 5));
         app.col_op(false);
-        let f = app.model_measures[0].formula.clone();
-        assert!(!f.contains("Qty") && !f.contains("Cost"), "{f}");
-        assert_eq!(f.matches("#REF!").count(), 2, "{f}");
+        assert_eq!(app.pkg.workbook.tables[0].columns, ["Id"]);
+        assert_eq!(app.pkg.workbook.tables[1].columns, ["Cost"]);
+        assert_eq!(
+            app.model_measures[0].formula,
+            "SUM(#REF!)+SUM(Costs[Cost])+COUNTA(Sales[Id])"
+        );
+        assert_eq!(app.model_rels[0].from, ("Sales".into(), "Id".into()));
+        assert_eq!(app.model_rels[0].to, ("Costs".into(), "#REF!".into()));
         app.undo();
         assert_eq!(
             app.model_measures[0].formula,
@@ -19763,6 +19801,47 @@ mod tests {
         assert!(!app.clip.as_ref().unwrap().cut);
         app.redo();
         assert!(app.clip.is_none());
+    }
+
+    #[test]
+    fn undo_and_redo_keep_a_newer_text_field_copy_991() {
+        // Copy, rename a header, Ctrl+C in a text field, then Undo and Redo.
+        let mut app = header_app();
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.apply_on(0, vec![(0, 1, parse_input("Units"))]);
+        app.field_copy("field text", false);
+        app.undo();
+        assert!(app.clip.is_none(), "the field's copy is the newer");
+        app.cur = (4, 3);
+        app.paste();
+        let v = app.pkg.workbook.sheets[0].cell(4, 3).unwrap();
+        assert_eq!(v.value, CellValue::Text("field text".into()));
+        assert!(v.formula.is_none());
+        app.field_copy("again", false);
+        app.redo();
+        assert!(app.clip.is_none());
+        // A copy dropped by a table-removing step, then a field copy.
+        let mut app = header_app();
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.cur = (0, 0);
+        app.anchor = Some((0, 1));
+        app.col_op(false);
+        assert!(app.clip.is_none());
+        app.field_copy("field text", false);
+        app.undo();
+        assert!(app.clip.is_none());
+    }
+
+    #[test]
+    fn a_copy_taken_after_the_step_follows_the_undo_991() {
+        let mut app = header_app();
+        app.apply_on(0, vec![(0, 1, parse_input("Units"))]);
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Units])"));
+        app.undo();
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Qty])"));
+        app.redo();
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Units])"));
     }
 
     #[test]
