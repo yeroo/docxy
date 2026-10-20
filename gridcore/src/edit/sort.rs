@@ -301,7 +301,7 @@ pub fn sort_range(
                 let (r, c) = at(to, p);
                 // An array anchor takes its block's `ref` along, either way.
                 move_own_array_ref(&mut cl, at(src, p), (r, c));
-                s.set_cell(r, c, cl);
+                s.put_pinned(r, c, cl);
             }
         }
     }

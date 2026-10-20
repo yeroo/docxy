@@ -412,7 +412,7 @@ pub fn dedupe_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, has_header
         let dest = start + i as u32;
         for (c, cell) in row.into_iter().enumerate() {
             match cell {
-                Some(cl) => s.set_cell(dest, c as u32, cl),
+                Some(cl) => s.put_pinned(dest, c as u32, cl),
                 None => {
                     s.cells.remove(&(dest, c as u32));
                 }
@@ -544,7 +544,9 @@ pub fn sort_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, keys: &[(u32
             match cell {
                 Some(mut cl) => {
                     move_own_array_ref(&mut cl, (from, c as u32), (r, c as u32));
-                    s.set_cell(r, c as u32, cl)
+                    // A moved pinned blank keeps its pin where its new row
+                    // or column pins the default.
+                    s.put_pinned(r, c as u32, cl)
                 }
                 None => {
                     s.cells.remove(&(r, c as u32));
@@ -3246,6 +3248,39 @@ mod tests {
     }
 
     #[test]
+    fn sort_keeps_a_pinned_blank_under_a_column_or_row_style() {
+        use crate::sheet::ColDef;
+        let col_style = || ColDef {
+            min: 1,
+            max: 1,
+            width: None,
+            attrs: r#"style="7""#.to_string(),
+            default_width: false,
+            plain_width: false,
+        };
+        // Already sorted: the pinned blank B1 stays.
+        let mut w = wb(&[("A1", Cell::number(1.0)), ("A2", Cell::number(2.0))]);
+        w.sheets[0].col_defs.push(col_style());
+        w.sheets[0].put_pinned(0, 1, Cell::default());
+        sort_rows(&mut w, 0, 0, 1, &[(0, true)]);
+        assert!(w.sheets[0].cell(0, 1).is_some());
+        // Moved: B1 goes to row 2, where the column still pins it.
+        sort_rows(&mut w, 0, 0, 1, &[(0, false)]);
+        assert!(w.sheets[0].cell(1, 1).is_some() && w.sheets[0].cell(0, 1).is_none());
+        // A row style pins by destination row: the blank moves out of the
+        // styled row and is dropped there, an unstyled row pins nothing.
+        let mut w = wb(&[("A1", Cell::number(2.0)), ("A2", Cell::number(1.0))]);
+        w.sheets[0]
+            .row_attrs
+            .insert(0, r#"s="5" customFormat="1""#.to_string());
+        w.sheets[0].put_pinned(0, 1, Cell::default());
+        assert!(w.sheets[0].cell(0, 1).is_some());
+        sort_rows(&mut w, 0, 0, 1, &[(0, true)]);
+        assert!(w.sheets[0].cell(1, 1).is_none(), "row 2 has no style");
+        assert!(w.sheets[0].cell(0, 1).is_none(), "nothing moved onto B1");
+    }
+
+    #[test]
     fn sort_rows_puts_blanks_last_both_directions() {
         let mut w = wb(&[
             ("A1", Cell::number(3.0)),
@@ -3331,6 +3366,27 @@ mod tests {
         assert_eq!(row(&w, 2), vec![n(1.0), n(2.0), n(3.0)]);
         assert_eq!(row(&w, 0), vec![CellValue::Empty; 3]);
         assert_eq!(w.sheets[0].cell(2, 4).unwrap().spill, Some((1, 3)));
+    }
+
+    #[test]
+    fn dedupe_rows_moves_a_pinned_blank_onto_an_absent_slot() {
+        let mut w = wb(&[
+            ("A1", Cell::text("x")),
+            ("A2", Cell::text("x")), // dup, removed
+            ("A3", Cell::text("y")),
+        ]);
+        w.sheets[0].col_defs.push(crate::sheet::ColDef {
+            min: 1,
+            max: 1,
+            width: None,
+            attrs: r#"style="7""#.to_string(),
+            default_width: false,
+            plain_width: false,
+        });
+        w.sheets[0].put_pinned(2, 1, Cell::default()); // B3 pins, row 3 moves up
+        assert_eq!(dedupe_rows(&mut w, 0, 0, 2, false), 1);
+        assert!(w.sheets[0].cell(1, 1).is_some(), "the pin moved to B2");
+        assert!(w.sheets[0].cell(2, 1).is_none());
     }
 
     #[test]
