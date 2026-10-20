@@ -1954,7 +1954,7 @@ fn write_row(s: &mut String, row: &Row) {
             s.push_str(&format!("<w:trPr>{}</w:trPr>", change.raw));
         }
     }
-    // Cell-level content controls around the cells. An edit can leave a
+    // Wrappers around the cells (content controls, `w:customXml`). An edit can leave a
     // close with nothing open or an open never closed: the first is dropped
     // and the second closed at the row's end, so the row stays well-formed.
     // Row-level markers go where they were between the cells (#1215).

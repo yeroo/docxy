@@ -121,7 +121,7 @@ impl Editor {
     }
 
     /// Select from the start of cell `a` to the end of cell `b`.
-    pub(crate) fn select_cells(&mut self, table: &[usize], a: (usize, usize), b: (usize, usize)) {
+    fn select_cells(&mut self, table: &[usize], a: (usize, usize), b: (usize, usize)) {
         if a == b {
             self.select_cell_content(table, a.0, a.1);
             return;

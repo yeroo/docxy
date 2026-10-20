@@ -103,6 +103,15 @@ fn a_marker_in_a_control_without_cells_is_kept() {
 const XOPEN: &str = "<w:customXml w:uri=\"urn:x\" w:element=\"x\"><w:customXmlPr><w:attr w:name=\"a\" w:val=\"1\"/></w:customXmlPr>";
 const XCLOSE: &str = "</w:customXml>";
 
+/// Select from cell `a` to cell `b` (row, cell) of the first table.
+fn select(ed: &mut crate::editor::Editor, a: (usize, usize), b: (usize, usize)) {
+    use crate::editor::Caret;
+    if a != b {
+        ed.anchor = Some(Caret::at(vec![0, a.0, a.1, 0], 0));
+    }
+    ed.caret = Caret::at(vec![0, b.0, b.1, 0], 0);
+}
+
 fn custom_xml_row(inner: &str) -> String {
     format!("<w:tr>{XOPEN}{inner}{XCLOSE}</w:tr>")
 }
@@ -251,21 +260,25 @@ fn merge_and_shift_up_stay_refused_over_a_custom_xml_cell() {
     let row = custom_xml_row(&format!("{}{}", cell("A"), cell("B")));
     let mut ed = Editor::new(load(&table(&row)));
     ed.caret = Caret::at(vec![0, 0, 0, 0], 0);
-    ed.select_cells(&[0], (0, 0), (0, 1));
+    select(&mut ed, (0, 0), (0, 1));
     let before = ed.doc.clone();
     assert!(ed.merge_cells().is_err());
     assert_eq!(ed.doc, before);
 }
 
 #[test]
-fn custom_xml_mentioning_the_placeholder_flag_round_trips_untouched() {
-    let row = format!(
-        "<w:tr><w:customXml w:element=\"x\" w:showingPlcHdr=\"1\">{}</w:customXml></w:tr>",
-        cell("A")
-    );
-    let doc = load(&table(&row));
-    let saved = document_to_xml(&doc);
-    assert!(saved.contains(&row), "{saved}");
+fn typing_in_a_custom_xml_cell_leaves_its_opening_alone() {
+    use crate::editor::{Caret, Editor};
+    // The flag a content control's placeholder carries means nothing here.
+    let open = "<w:customXml w:element=\"x\"><w:customXmlPr><w:showingPlcHdr/></w:customXmlPr>";
+    let row = format!("<w:tr>{open}{}{XCLOSE}</w:tr>", cell("A"));
+    let mut ed = Editor::new(load(&table(&row)));
+    ed.caret = Caret::at(vec![0, 0, 0, 0], 1);
+    ed.insert_str("z");
+    let saved = document_to_xml(&ed.doc);
+    assert!(saved.contains(&format!("<w:tr>{open}")), "{saved}");
+    assert!(saved.contains("Az"), "{saved}");
+    assert_eq!(saved.matches("showingPlcHdr").count(), 1, "{saved}");
 }
 
 #[test]
@@ -349,7 +362,7 @@ fn delete_rows_of(n: usize, top: usize, bottom: usize) -> crate::editor::Editor 
     use crate::editor::{Caret, Editor};
     let mut ed = Editor::new(load(&table(&marked_rows(n))));
     ed.caret = Caret::at(vec![0, top, 0, 0], 0);
-    ed.select_cells(&[0], (top, 0), (bottom, 1));
+    select(&mut ed, (top, 0), (bottom, 1));
     ed.delete_rows().unwrap();
     ed
 }
@@ -415,7 +428,7 @@ fn delete_cells_shift_left_over_every_cell_of_a_row_keeps_the_markers() {
     use crate::editor::{Caret, DeleteShift, Editor};
     let mut ed = Editor::new(load(&table(&marked_rows(3))));
     ed.caret = Caret::at(vec![0, 1, 0, 0], 0);
-    ed.select_cells(&[0], (1, 0), (1, 1));
+    select(&mut ed, (1, 0), (1, 1));
     ed.delete_cells(DeleteShift::ShiftLeft).unwrap();
     assert_eq!(first_table(&ed.doc).rows.len(), 2);
     let saved = document_to_xml(&ed.doc);
@@ -433,7 +446,7 @@ fn delete_column_that_empties_a_row_keeps_its_markers() {
     t.rows[1].remove_cell(1);
     let mut ed = Editor::new(doc);
     ed.caret = Caret::at(vec![0, 1, 0, 0], 0);
-    ed.select_cells(&[0], (1, 0), (1, 0));
+    select(&mut ed, (1, 0), (1, 0));
     ed.delete_columns().unwrap();
     let saved = document_to_xml(&ed.doc);
     assert_eq!(marker_ids(&saved), ["0", "1", "2"], "{saved}");
@@ -463,7 +476,7 @@ fn inserting_columns_splitting_the_table_and_splitting_cells_never_repeat_a_mark
     ed.split_table().unwrap();
     assert_eq!(count(&ed), (2, 2));
     let mut ed = fresh();
-    ed.select_cells(&[0], (0, 0), (1, 1));
+    select(&mut ed, (0, 0), (1, 1));
     ed.merge_cells().unwrap();
     assert_eq!(count(&ed), (2, 2));
     ed.split_cells(2, 2, false).unwrap();

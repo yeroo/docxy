@@ -342,6 +342,13 @@ fn drop_continued_rows(t: &mut Table, from: usize, to: usize) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tables::tests::{cell_text, grid_doc, para};
+    use super::super::{Caret, Editor};
+    use super::*;
+    use crate::load::{Relationships, parse_document_xml};
+    use crate::model::{Block, Document};
+    use crate::serialize::document_to_xml;
+
     #[test]
     fn dropping_a_continued_row_keeps_its_markers_on_the_row_above() {
         let mut doc = grid_doc(2, 2);
@@ -363,13 +370,6 @@ mod tests {
             ]
         );
     }
-
-    use super::super::tables::tests::{cell_text, grid_doc, para};
-    use super::super::{Caret, Editor};
-    use super::*;
-    use crate::load::{Relationships, parse_document_xml};
-    use crate::model::{Block, Document};
-    use crate::serialize::document_to_xml;
 
     fn t(ed: &Editor) -> &Table {
         ed.table(&[0]).expect("table")

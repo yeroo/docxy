@@ -14,7 +14,8 @@ const FLAG: &str = "<w:showingPlcHdr";
 /// placeholder: a `w:showingPlcHdr` that is on (`ST_OnOff`: `w:val` absent,
 /// or anything but `false`, `0` and `off`).
 fn shows_placeholder(open: &str) -> bool {
-    crate::sect::has_flag(open, "w:showingPlcHdr")
+    // A `w:customXml` wrapper around cells (#1393) is not a content control.
+    crate::serialize::local_name(open) == "sdt" && crate::sect::has_flag(open, "w:showingPlcHdr")
 }
 
 /// One step down a caret path: into a table cell, or into a text box.
@@ -114,7 +115,7 @@ impl Editor {
                     let row = &mut t.rows[row];
                     for (c, k) in row.cell_controls(cell) {
                         let raw = &mut row.cells[c].sdt_open[k];
-                        if raw.contains(FLAG) {
+                        if shows_placeholder(raw) {
                             *raw = crate::sect::remove_element(raw, "w:showingPlcHdr");
                         }
                     }
