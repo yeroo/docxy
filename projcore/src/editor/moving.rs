@@ -15,9 +15,11 @@ impl Editor {
     /// default); zero, anything else, or more than the scheduling horizon is
     /// refused. An auto task gets a Start-No-Earlier-Than constraint there
     /// and a manual task's pinned start moves (see [`Self::set_start_at`]);
-    /// one undo step. The base is the unleveled start: leveling is
-    /// recomputed on every edit, so a base that included its delay would
-    /// drift on each move. Returns the start the task is shown at afterwards,
+    /// one undo step. The base is the unleveled start, before the display
+    /// overlay's and before a saved `LevelingDelay` (#1594): leveling is
+    /// recomputed on every edit and a saved delay is added to the moved-to
+    /// start again, so a base that included its delay would drift on each
+    /// move. Returns the start the task is shown at afterwards,
     /// which links or leveling can hold later than the moved-to date.
     pub fn move_task(&mut self, uid: i32, text: &str) -> Result<DateTime, String> {
         let task = &self.proj.tasks[self.index(uid)?];
@@ -34,7 +36,7 @@ impl Editor {
         let base = task
             .pinned_dates()
             .map(|(start, _)| start)
-            .or_else(|| self.sched.get(uid).map(|r| r.early_start))
+            .or_else(|| self.sched.start_before_delay(uid))
             .ok_or("The row has no task to move")?;
         let calendar = cells::task_calendar(&self.proj, task);
         let (day, last) = shift_working_days(&calendar, base, days)?;

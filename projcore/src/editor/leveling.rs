@@ -64,7 +64,9 @@ impl Editor {
     /// changes the plan's overallocation (a smaller overbooked extent on the
     /// committed schedule, or conflicts not seen before); a round that
     /// leaves the same conflicts is dropped (a follower moving in lockstep
-    /// with its predecessor would ask for more delay for ever), and a
+    /// with its predecessor would ask for more delay for ever; a round that
+    /// would carry such a pair into a later stretch of more capacity is
+    /// dropped the same way, a known limit: select the follower too), and a
     /// conflict that remains
     /// is reported as overallocated (a later pass resolves it only with the
     /// follower in its scope, or with `clear_first` off, since the default
