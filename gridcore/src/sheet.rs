@@ -608,6 +608,12 @@ pub struct Sheet {
     /// [`DataValidation::ix`] of rules an edit deleted (a row or column
     /// delete, a paste of validation over them), likewise.
     pub dv_removed: Vec<usize>,
+    /// The Excel 2010 conditional formatting and validation in the part's
+    /// `extLst`, read only to be moved (never evaluated).
+    pub ext_rules: Vec<ExtRule>,
+    /// [`ExtRule::ix`] of the ones an edit deleted, per kind: the part still
+    /// holds them, so a save strikes them.
+    pub ext_removed: Vec<(ExtKind, usize)>,
     /// Sheet protection: `Some(attrs)` holds the raw attribute string of the
     /// worksheet's `<sheetProtection>` element (e.g. `sheet="1" objects="1"`),
     /// serialized verbatim so any existing password hash / flag set round-trips.
@@ -2366,8 +2372,8 @@ pub enum CfKind {
     /// `iconSet`: the icon of a cell is picked by its value against the
     /// `<cfvo>` thresholds (see [`crate::cf::cell_icon`]). It sets no format,
     /// and the rule saves as the file had it; `formulas` are its `<formula>`
-    /// children (it normally has none), moved like any rule's. A `cfvo`'s
-    /// `val` is read only.
+    /// children (it normally has none), moved like any rule's, as are the
+    /// `val`s of its `formula` thresholds.
     IconSet {
         set: String,
         reverse: bool,
@@ -2380,6 +2386,9 @@ pub enum CfKind {
     Other {
         rule_type: String,
         formulas: Vec<String>,
+        /// A colorScale's or dataBar's `<cfvo>` thresholds (not evaluated;
+        /// kept so a `formula` one moves with an edit like a `<formula>`).
+        cfvos: Vec<Cfvo>,
     },
 }
 
@@ -2404,6 +2413,35 @@ impl CfRule {
         }
     }
 
+    /// The rule's `<cfvo>` thresholds in document order.
+    pub fn cfvos(&self) -> &[Cfvo] {
+        match &self.kind {
+            CfKind::IconSet { cfvos, .. } | CfKind::Other { cfvos, .. } => cfvos,
+            CfKind::CellIs { .. } | CfKind::Expression { .. } => &[],
+        }
+    }
+
+    /// The rule's `<cfvo>` thresholds, mutably: an icon set's, a color
+    /// scale's or a data bar's.
+    pub fn cfvos_mut(&mut self) -> Vec<&mut Cfvo> {
+        match &mut self.kind {
+            CfKind::IconSet { cfvos, .. } | CfKind::Other { cfvos, .. } => {
+                cfvos.iter_mut().collect()
+            }
+            CfKind::CellIs { .. } | CfKind::Expression { .. } => Vec::new(),
+        }
+    }
+
+    /// The `val` of each `type="formula"` threshold, mutably: the ones that
+    /// hold a formula and move with an edit.
+    pub fn cfvo_formulas_mut(&mut self) -> Vec<&mut String> {
+        self.cfvos_mut()
+            .into_iter()
+            .filter(|v| v.kind == "formula")
+            .map(|v| &mut v.val)
+            .collect()
+    }
+
     /// [`Self::formulas`], mutably.
     pub fn formulas_mut(&mut self) -> Vec<&mut String> {
         match &mut self.kind {
@@ -2425,6 +2463,31 @@ pub struct CondFormat {
     /// edit's move back to it. `None` for a block the part doesn't hold (an
     /// x14 one in `extLst`, one built in memory).
     pub ix: Option<usize>,
+}
+
+/// Which Excel 2010 extension a [`ExtRule`] came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtKind {
+    /// `<x14:conditionalFormatting>`.
+    Cf,
+    /// `<x14:dataValidation>`.
+    Dv,
+}
+
+/// An Excel 2010 conditional-formatting or data-validation element in the
+/// worksheet's `extLst`: it is not evaluated, only moved with the edits that
+/// move its ranges and formulas, so a save can write them back.
+#[derive(Clone, Debug)]
+pub struct ExtRule {
+    pub kind: ExtKind,
+    /// Its `<xm:sqref>`.
+    pub ranges: Vec<(u32, u32, u32, u32)>,
+    /// Every `<xm:f>` inside it, in document order (rule formulas, `x14:cfvo`
+    /// thresholds, validation formulas), relative to the ranges' anchor.
+    pub formulas: Vec<String>,
+    /// The ordinal of its element among the part's x14 elements of that
+    /// kind (all `extLst`s, document order).
+    pub ix: usize,
 }
 
 #[derive(Clone, Debug, Default)]

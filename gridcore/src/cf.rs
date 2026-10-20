@@ -757,6 +757,7 @@ mod tests {
                 kind: CfKind::Other {
                     rule_type: "dataBar".into(),
                     formulas: vec![],
+                    cfvos: vec![],
                 },
                 dxf_id: Some(0),
                 priority: 1,
