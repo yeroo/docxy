@@ -1413,7 +1413,8 @@ pub struct DataValidation {
     /// The ordinal of this rule's element among the `<dataValidation>`
     /// children of the worksheet's top-level `<dataValidations>`, so a save
     /// can write a structural edit's move back to it. `None` for a rule the
-    /// part doesn't hold (an x14 one in `extLst`, one built in memory).
+    /// part doesn't hold (one built in memory). An Excel 2010 one in
+    /// `extLst` is a [`Sheet::ext_rules`] entry.
     pub ix: Option<usize>,
     /// The rule as the part held it, so a save rewrites only the attributes
     /// that differ and leaves an untouched element byte for byte. `None` for
@@ -2392,7 +2393,7 @@ pub enum CfKind {
     },
 }
 
-/// One `<cfvo>` of an icon set: a threshold of type `num`, `percent`,
+/// One `<cfvo>` of an icon set, color scale or data bar: a threshold of type `num`, `percent`,
 /// `percentile` or `formula` (`min`/`max` for the first), compared with `>=`
 /// unless `gte` is off.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -2460,8 +2461,9 @@ pub struct CondFormat {
     pub rules: Vec<CfRule>,
     /// The ordinal of this block's element among the worksheet's top-level
     /// `<conditionalFormatting>` children, so a save can write a structural
-    /// edit's move back to it. `None` for a block the part doesn't hold (an
-    /// x14 one in `extLst`, one built in memory).
+    /// edit's move back to it. `None` for a block the part doesn't hold (one
+    /// built in memory). An Excel 2010 one in `extLst` is a
+    /// [`Sheet::ext_rules`] entry.
     pub ix: Option<usize>,
 }
 
@@ -2485,8 +2487,8 @@ pub struct ExtRule {
     /// Every `<xm:f>` inside it, in document order (rule formulas, `x14:cfvo`
     /// thresholds, validation formulas), relative to the ranges' anchor.
     pub formulas: Vec<String>,
-    /// The ordinal of its element among the part's x14 elements of that
-    /// kind (all `extLst`s, document order).
+    /// The ordinal of its element among the x14 elements of that kind in the
+    /// worksheet's top-level `extLst`s (document order).
     pub ix: usize,
 }
 

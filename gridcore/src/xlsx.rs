@@ -2513,14 +2513,14 @@ fn parse_worksheet_with(
     let mut cf_cfvos: Vec<crate::sheet::Cfvo> = Vec::new();
     // Excel 2010 `extLst` conditional formatting and validation, read to be
     // moved: how deep in `extLst`s the parser is, the element being read
-    // (with its x14 ordinal), the text it is collecting (`sqref` or `f`) and
-    // the ordinals counted so far.
+    // (with its x14 ordinal, from where `x14_spans` finds it), the text it is
+    // collecting (`sqref` or `f`) and where those elements stand.
     let mut ext_depth = 0usize;
     let mut cur_ext: Option<crate::sheet::ExtRule> = None;
     let mut ext_text: Option<bool> = None; // Some(true) = sqref, Some(false) = f
     let mut ext_buf = String::new();
-    let mut ext_cf_seen = 0usize;
-    let mut ext_dv_seen = 0usize;
+    let ext_cf_spans = x14_spans(xml, crate::sheet::ExtKind::Cf);
+    let ext_dv_spans = x14_spans(xml, crate::sheet::ExtKind::Dv);
 
     // Where the worksheet's top-level blocks stand, as the save finds them, so
     // each one loaded from there knows its element ([`crate::sheet::CondFormat::ix`]).
@@ -2581,23 +2581,24 @@ fn parse_worksheet_with(
             Event::Start => match local(p.name()) {
                 "extLst" => ext_depth += 1,
                 "conditionalFormatting" | "dataValidation" if in_ext && cur_ext.is_none() => {
-                    let cf = local(p.name()) == "conditionalFormatting";
-                    let seen = if cf {
-                        &mut ext_cf_seen
+                    let kind = if local(p.name()) == "conditionalFormatting" {
+                        crate::sheet::ExtKind::Cf
                     } else {
-                        &mut ext_dv_seen
+                        crate::sheet::ExtKind::Dv
                     };
-                    cur_ext = Some(crate::sheet::ExtRule {
-                        kind: if cf {
-                            crate::sheet::ExtKind::Cf
-                        } else {
-                            crate::sheet::ExtKind::Dv
-                        },
-                        ranges: Vec::new(),
-                        formulas: Vec::new(),
-                        ix: *seen,
+                    let spans = match kind {
+                        crate::sheet::ExtKind::Cf => &ext_cf_spans,
+                        crate::sheet::ExtKind::Dv => &ext_dv_spans,
+                    };
+                    let start = p.start_pos();
+                    cur_ext = spans.iter().position(|&(s, _)| s == start).map(|ix| {
+                        crate::sheet::ExtRule {
+                            kind,
+                            ranges: Vec::new(),
+                            formulas: Vec::new(),
+                            ix,
+                        }
                     });
-                    *seen += 1;
                 }
                 "sqref" if cur_ext.is_some() => {
                     ext_text = Some(true);
@@ -5207,21 +5208,7 @@ fn held_formulas(element: &str, name: &str) -> Vec<HeldFormula> {
     element_children(element)
         .into_iter()
         .filter(|(n, _, _)| n == name)
-        .map(|(_, s, e)| {
-            let f = &element[s..e];
-            let open = start_tag_end(f).unwrap_or(f.len());
-            let close = f.rfind("</").filter(|&c| c >= open && !f.ends_with("/>"));
-            match close {
-                Some(c) if !f[open..c].contains('<') => HeldFormula {
-                    text: decode(&f[open..c]),
-                    content: Some((s + open, s + c)),
-                },
-                _ => HeldFormula {
-                    text: String::new(),
-                    content: None,
-                },
-            }
-        })
+        .map(|(_, s, e)| held_text_at(element, (s, e)))
         .collect()
 }
 
@@ -5444,7 +5431,7 @@ fn cfvo_edits(rule: &str, model: &[crate::sheet::Cfvo]) -> Vec<(usize, usize, St
         if same_formula(&held, &cfvo.val) {
             continue;
         }
-        let text = esc_attr(&file_formula(&cfvo.val));
+        let text = esc_attr(&file_formula(&cfvo.val)).replace('\'', "&apos;");
         out.push((s, e, set_tag_attr_in_place(frag.to_string(), "val", &text)));
     }
     out
@@ -5493,40 +5480,42 @@ fn set_ext_rules(xml: String, sheet: &Sheet) -> String {
     for kind in [ExtKind::Cf, ExtKind::Dv] {
         for (k, &(start, end)) in x14_spans(&xml, kind).iter().enumerate() {
             let element = &xml[start..end];
-            let claims: Vec<&crate::sheet::ExtRule> = sheet
-                .ext_rules
-                .iter()
-                .filter(|r| r.kind == kind && r.ix == k)
+            // The ranges first, as for the classic blocks: an element whose
+            // `xm:sqref` is not one that reads is left as it is, even when
+            // an edit deleted its rule.
+            let [sq] = descendant_spans(element, "sqref", false)[..] else {
+                continue;
+            };
+            let held = held_text_at(element, sq);
+            let read: Option<Vec<_>> = held
+                .text
+                .split_whitespace()
+                .map(parse_sqref_token)
                 .collect();
-            let rule = match claims.as_slice() {
-                [] => {
+            let (Some(read), Some((cs, ce))) = (read, held.content) else {
+                continue;
+            };
+            let rule = match sole_claim(&sheet.ext_rules, k, |r| (r.kind == kind).then_some(r.ix)) {
+                Err(()) => continue,
+                Ok(None) => {
                     if sheet.ext_removed.contains(&(kind, k)) {
                         edits.push((start, end, String::new()));
                     }
                     continue;
                 }
-                [rule] => *rule,
-                _ => continue,
+                Ok(Some(rule)) => rule,
             };
-            let mut inner = Vec::new();
             let held_f: Vec<HeldFormula> = descendant_spans(element, "f", false)
                 .into_iter()
                 .map(|span| held_text_at(element, span))
                 .collect();
+            if held_f.len() != rule.formulas.len() {
+                continue;
+            }
             let model: Vec<&String> = rule.formulas.iter().collect();
-            inner.extend(formula_edits(&held_f, &model));
-            if let [span] = descendant_spans(element, "sqref", false).as_slice() {
-                let held = held_text_at(element, *span);
-                let read: Option<Vec<_>> = held
-                    .text
-                    .split_whitespace()
-                    .map(parse_sqref_token)
-                    .collect();
-                if let (Some(read), Some((s, e))) = (read, held.content) {
-                    if read != rule.ranges {
-                        inner.push((s, e, sqref_of(&rule.ranges)));
-                    }
-                }
+            let mut inner = formula_edits(&held_f, &model);
+            if read != rule.ranges {
+                inner.push((cs, ce, sqref_of(&rule.ranges)));
             }
             if !inner.is_empty() {
                 edits.push((start, end, apply_edits(element.to_string(), inner)));
@@ -23959,6 +23948,43 @@ mod rule_shift_tests {
         assert!(pkg.remove_sheet(1));
         let (_, ws) = saved(&pkg, SHEET1);
         assert!(ws.contains("<xm:f>#REF!&gt;1</xm:f>"), "{ws}");
+    }
+
+    #[test]
+    fn x14_cf_with_an_unreadable_sqref_or_mismatched_formulas_is_left_alone() {
+        // A token that doesn't parse: neither moved nor struck.
+        let bad = x14_cf("A1:A5 X!B1", "A1&gt;1");
+        let mut pkg = one("S", &format!("{MARGINS}{bad}"));
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(&bad), "{ws}");
+        delete_rows(&mut pkg.workbook, 0, 0, 10);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(&bad), "{ws}");
+        // Two `xm:f` held where the model has one: the sqref isn't moved either.
+        let held = x14_cf("A1:A5", "A1&gt;1</xm:f><xm:f>B1");
+        let mut pkg = one("S", &format!("{MARGINS}{held}"));
+        pkg.workbook.sheets[0].ext_rules[0].formulas.pop();
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains("<xm:sqref>A1:A5</xm:sqref>"), "{ws}");
+    }
+
+    #[test]
+    fn a_single_quoted_cfvo_val_with_quotes_stays_well_formed() {
+        let rule = r#"<conditionalFormatting sqref="A1:A5"><cfRule type="dataBar" priority="1"><dataBar><cfvo type="min"/><cfvo type='formula' val='&apos;My Data&apos;!$A$1'/><color rgb="FF638EC6"/></dataBar></cfRule></conditionalFormatting>"#;
+        let body = format!("{DATA}{rule}{MARGINS}");
+        let mut pkg = load_xlsx(&book("", &[("S", Some(&body)), ("My Data", Some(DATA))])).unwrap();
+        crate::edit::rename_sheet(&mut pkg.workbook, 1, "Bob's Data");
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(
+            ws.contains("<cfvo type='formula' val='&apos;Bob&apos;&apos;s Data&apos;!$A$1'/>"),
+            "{ws}"
+        );
+        match &re.workbook.sheets[0].cond_formats[0].rules[0].kind {
+            CfKind::Other { cfvos, .. } => assert_eq!(cfvos[1].val, "'Bob''s Data'!$A$1"),
+            other => panic!("{other:?}"),
+        }
     }
 
     fn two_sheets(first_rest: &str) -> SheetPackage {
