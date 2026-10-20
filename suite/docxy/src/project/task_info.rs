@@ -246,13 +246,18 @@ pub(crate) fn task_info_dialog(
             c.page = Some(3);
             c
         },
-        field(
-            "notes",
-            "&Notes (\\n = new line):",
-            ControlKind::Text,
-            projcore::text::notes_to_line(task.notes.as_deref().unwrap_or("")),
-            4,
-        ),
+        {
+            let mut c = field(
+                "notes",
+                "&Notes (\\n = new line):",
+                ControlKind::Text,
+                projcore::text::notes_to_line(task.notes.as_deref().unwrap_or("")),
+                4,
+            );
+            // Opening on Notes to add to a note must not replace it.
+            c.append_on_open = true;
+            c
+        },
     ];
     let enabled = |d: &mut Dialog, name: &str, on: bool| {
         if let Some(c) = d.controls.iter_mut().find(|c| c.name == name) {

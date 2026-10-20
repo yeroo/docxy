@@ -1687,6 +1687,9 @@ fn sheet_import_text(app: &mut App, args: &Json) -> Result<Json, String> {
 /// true. One undo step.
 fn range_text_to_columns(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
+    if app.pkg.workbook.sheets[si].is_protected() {
+        return Err("range.text-to-columns: the sheet is protected".into());
+    }
     let rg = args
         .get_str("range")
         .ok_or("range.text-to-columns needs a 'range'")?;
@@ -4095,6 +4098,97 @@ mod tests {
         a.pkg.workbook.sheets[0].set_protected(true);
         let err = dispatch(&mut a, "range.flash-fill", &c1).unwrap_err();
         assert!(err.contains("protected"), "{err}");
+    }
+
+    /// #833: `range.sort` and `range.text-to-columns` refuse a protected
+    /// active sheet and change nothing (the named, non-active sheet is the
+    /// next test).
+    #[test]
+    fn range_sort_and_text_to_columns_refuse_a_protected_sheet() {
+        let mut a = app();
+        for (r, t) in [("A1", "b"), ("A2", "a"), ("A3", "c,d")] {
+            set(&mut a, r, t);
+        }
+        let dump = |a: &App| format!("{:?}", a.pkg.workbook.sheets[0].cell(1, 0));
+        let sort = Json::obj(vec![
+            ("range", Json::Str("A1:A3".into())),
+            (
+                "keys",
+                Json::Arr(vec![Json::obj(vec![("col", Json::Str("A".into()))])]),
+            ),
+        ]);
+        let ttc = Json::obj(vec![
+            ("range", Json::Str("A3".into())),
+            ("options", opts(vec![("delimiters", strs(&["comma"]))])),
+        ]);
+        a.pkg.workbook.sheets[0].set_protected(true);
+        a.modified = false;
+        let (before, undo_len) = (dump(&a), a.undo.len());
+        assert_eq!(
+            dispatch(&mut a, "range.sort", &sort).unwrap_err(),
+            "range.sort: the sheet is protected"
+        );
+        assert_eq!(
+            dispatch(&mut a, "range.text-to-columns", &ttc).unwrap_err(),
+            "range.text-to-columns: the sheet is protected"
+        );
+        assert_eq!(dump(&a), before);
+        assert_eq!(a.sheet().cell(2, 1), None);
+        assert_eq!(a.undo.len(), undo_len);
+        assert!(!a.modified);
+        a.pkg.workbook.sheets[0].set_protected(false);
+        dispatch(&mut a, "range.sort", &sort).unwrap();
+        dispatch(&mut a, "range.text-to-columns", &ttc).unwrap();
+        assert_eq!(
+            a.sheet().cell(2, 1).map(|c| c.value.clone()),
+            Some(CellValue::Text("d".into()))
+        );
+    }
+
+    /// #833: the sheet named by `sheet` decides, not the active one: a
+    /// protected Sheet2 refuses both verbs while Sheet1 is active and open.
+    #[test]
+    fn range_sort_and_text_to_columns_refuse_a_protected_named_sheet() {
+        let mut a = app();
+        dispatch(&mut a, "sheet.add", &Json::Null).unwrap();
+        for (r, t) in [("A1", "b"), ("A2", "a"), ("A3", "c,d")] {
+            let args = Json::obj(vec![
+                ("sheet", Json::Num(1.0)),
+                ("ref", Json::Str(r.into())),
+                ("text", Json::Str(t.into())),
+            ]);
+            cell_set(&mut a, &args).unwrap();
+        }
+        a.sheet = 0;
+        a.pkg.workbook.sheets[1].set_protected(true);
+        a.modified = false;
+        let dump = |a: &App| format!("{:?}", a.pkg.workbook.sheets[1].cell(1, 0));
+        let (before, undo_len) = (dump(&a), a.undo.len());
+        let sort = Json::obj(vec![
+            ("sheet", Json::Num(1.0)),
+            ("range", Json::Str("A1:A3".into())),
+            (
+                "keys",
+                Json::Arr(vec![Json::obj(vec![("col", Json::Str("A".into()))])]),
+            ),
+        ]);
+        let ttc = Json::obj(vec![
+            ("sheet", Json::Num(1.0)),
+            ("range", Json::Str("A3".into())),
+            ("options", opts(vec![("delimiters", strs(&["comma"]))])),
+        ]);
+        assert_eq!(
+            dispatch(&mut a, "range.sort", &sort).unwrap_err(),
+            "range.sort: the sheet is protected"
+        );
+        assert_eq!(
+            dispatch(&mut a, "range.text-to-columns", &ttc).unwrap_err(),
+            "range.text-to-columns: the sheet is protected"
+        );
+        assert_eq!(dump(&a), before);
+        assert_eq!(a.pkg.workbook.sheets[1].cell(2, 1), None);
+        assert_eq!(a.undo.len(), undo_len);
+        assert!(!a.modified);
     }
 
     /// #667, ENT-CASE-056: `app.autocorrect` adds, replaces (only when told

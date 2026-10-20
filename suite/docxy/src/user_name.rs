@@ -38,8 +38,6 @@ pub(crate) fn dialog(user_name: &str, user_initials: &str) -> Dialog {
     ];
     d.buttons = ok_cancel();
     d.mark_opened();
-    // The first field has the focus, so typing edits it at once (#1027).
-    d.focus_step(false);
     d
 }
 
@@ -135,7 +133,10 @@ mod tests {
     #[test]
     fn backspace_on_an_nfd_name_stores_no_dangling_letter() {
         let mut stack = opened("Jose\u{301}", "JD");
-        stack.top_dialog_mut().unwrap().backspace().unwrap();
+        // The name opens selected (#1314); End puts the caret after it.
+        let d = stack.top_dialog_mut().unwrap();
+        d.move_caret_edge(true, false);
+        d.backspace().unwrap();
         let (done, accepted) = click(&mut stack, "OK").expect("ours");
         done.unwrap();
         assert_eq!(accepted, Some(("Jos".into(), "JD".into())));
@@ -193,9 +194,9 @@ mod tests {
         }
         crate::dialog_host::edit_key(&mut stack, "tab", None, none, None).unwrap();
         crate::dialog_host::edit_key(&mut stack, "v", None, ctrl, Some("DOE")).unwrap();
-        // The second field was "J": the paste goes after it.
+        // Tab selects the second field's "J": the paste replaces it (#1314).
         let (done, accepted) = click(&mut stack, "OK").expect("ours");
         done.unwrap();
-        assert_eq!(accepted, Some(("Doe".into(), "JDOE".into())));
+        assert_eq!(accepted, Some(("Doe".into(), "DOE".into())));
     }
 }

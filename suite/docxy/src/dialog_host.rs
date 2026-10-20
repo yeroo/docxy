@@ -2385,6 +2385,9 @@ mod tests {
             Button::new("Cancel", ButtonRole::Cancel),
         ];
         t.dialogs.push(d);
+        // A push focuses the first control (#1314); these tests walk Tab from
+        // nothing focused.
+        t.dialogs.top_dialog_mut().unwrap().focus = None;
         t
     }
 
@@ -2423,7 +2426,8 @@ mod tests {
         assert_eq!(value(&t, "note"), Value::Text("Hi ".into()));
         assert!(dialog_key(&mut t, "tab", None, shift));
         assert!(key(&mut t, "3", Some("3")));
-        assert_eq!(value(&t, "top"), Value::Text("2.53".into()));
+        // Shift+Tab selected "2.5" (#1314), so the 3 replaced it.
+        assert_eq!(value(&t, "top"), Value::Text("3".into()));
         assert!(key(&mut t, "tab", None));
         assert!(key(&mut t, "tab", None));
         assert!(key(&mut t, "space", Some(" ")));

@@ -92,7 +92,6 @@ pub(crate) fn dialog(instr: &str) -> Dialog {
     )];
     d.buttons = ok_cancel();
     d.mark_opened();
-    d.focus_step(false);
     d
 }
 

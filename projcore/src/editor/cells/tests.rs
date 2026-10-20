@@ -3481,3 +3481,31 @@ fn a_negative_dangling_uid_re_enters_too() {
         }
     );
 }
+
+#[test]
+fn typed_finish_at_takes_the_exact_instant_and_set_finish_goes_through_it() {
+    let at = |s: &str| DateTime::parse_mspdi(s).unwrap();
+    // Auto: FNET at the instant, which a day's `set_finish` resolves to the
+    // calendar's last working time.
+    let mut ed = manual_editor();
+    ed.set_manual(20, false).unwrap();
+    ed.set_finish_at(20, at("2026-01-07T12:00:00")).unwrap();
+    let task = ed.project().task(20).unwrap();
+    assert_eq!(task.constraint, ConstraintType::FinishNoEarlierThan);
+    assert_eq!(mspdi(task.constraint_date).unwrap(), "2026-01-07T12:00:00");
+    ed.set_finish(20, parse_cell_date("2026-01-07").unwrap())
+        .unwrap();
+    let task = ed.project().task(20).unwrap();
+    assert_eq!(mspdi(task.constraint_date).unwrap(), "2026-01-07T17:00:00");
+    // Manual: the finish is pinned there and the duration follows.
+    let mut ed = manual_editor();
+    ed.set_finish_at(20, at("2026-01-07T12:00:00")).unwrap();
+    let task = ed.project().task(20).unwrap();
+    assert_eq!(mspdi(task.manual_finish).unwrap(), "2026-01-07T12:00:00");
+    assert_eq!(task.constraint, ConstraintType::AsSoonAsPossible);
+    // A finish before the start and an out-of-range instant are refused.
+    let before = ed.project().clone();
+    assert!(ed.set_finish_at(20, at("2025-01-01T08:00:00")).is_err());
+    assert!(ed.set_finish_at(20, at("2500-01-01T08:00:00")).is_err());
+    assert_eq!(ed.project(), &before);
+}

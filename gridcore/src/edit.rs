@@ -31,7 +31,9 @@ pub(crate) use clear::apply_clear;
 pub use clear::{ClearPlan, ClearWhat, apply_clear_sheet, clear_plan};
 pub use goto_special::{GoSpecial, NO_CELLS, Types, go_to_special, resolve_reference};
 mod series;
-pub use clip::{MAX_PASTE_CELLS, PASTE_SHAPE, move_refs, paste_tiles, tiled_block};
+pub use clip::{
+    MAX_PASTE_CELLS, PASTE_SHAPE, move_refs, move_refs_rules_stay, paste_tiles, tiled_block,
+};
 pub use series::{
     FillDir, FillKind, FillTarget, JUSTIFY_NUMBERS, JUSTIFY_OVERFLOW, SeriesSpec, SeriesType,
     builtin_lists, fill_down_to, fill_target, justify_lines, series_rows_for,
@@ -1196,6 +1198,7 @@ pub fn remove_sheet_refs(wb: &mut Workbook, removed: &[String]) {
     if removed.is_empty() {
         return;
     }
+    remove_sheet_refs_in_rules(wb, removed);
     let mut rewritten = Vec::new();
     for (s, sheet) in wb.sheets.iter_mut().enumerate() {
         for (&(r, c), cell) in sheet.cells.iter_mut() {
@@ -1253,6 +1256,24 @@ pub fn remove_sheet_refs(wb: &mut Workbook, removed: &[String]) {
                 }
             }
         }
+    }
+}
+
+/// The rules' part of [`remove_sheet_refs`]: every conditional-formatting
+/// formula (a rule's, a threshold's, an Excel 2010 one's) and data-validation
+/// formula on any sheet that names a sheet in `removed` now reads `#REF!`, as
+/// a cell's does. Text that names none stays as loaded. Idempotent.
+pub fn remove_sheet_refs_in_rules(wb: &mut Workbook, removed: &[String]) {
+    if removed.is_empty() {
+        return;
+    }
+    for sheet in &mut wb.sheets {
+        for_each_rule_formula(sheet, true, |_, src| {
+            let rewrite = |e: &Expr| crate::formula::remove_sheet_refs_in_expr(e, removed);
+            if let Some(updated) = rewrite_if_changed(src, rewrite) {
+                *src = updated;
+            }
+        });
     }
 }
 
@@ -1789,8 +1810,9 @@ fn delete_table_columns(wb: &mut Workbook, idx: usize, shift: &EditShift) {
     }
 }
 
-/// Every conditional-formatting formula on `sheet`, and with `validations`
-/// every data-validation formula too.
+/// Every conditional-formatting formula on `sheet` (a rule's `<formula>`s, the
+/// `val`s of its `formula` thresholds, and the Excel 2010 `extLst` ones), and
+/// with `validations` every data-validation formula too.
 fn for_each_rule_formula(
     sheet: &mut Sheet,
     validations: bool,
@@ -1800,6 +1822,16 @@ fn for_each_rule_formula(
         for rule in &mut cf.rules {
             for src in rule.formulas_mut() {
                 f(&cf.ranges, src);
+            }
+            for src in rule.cfvo_formulas_mut() {
+                f(&cf.ranges, src);
+            }
+        }
+    }
+    for ext in &mut sheet.ext_rules {
+        if validations || ext.kind == crate::sheet::ExtKind::Cf {
+            for src in &mut ext.formulas {
+                f(&ext.ranges, src);
             }
         }
     }
@@ -1982,6 +2014,27 @@ fn shift_rules(sheet: &mut Sheet, home_is_target: bool, target: &str, shift: &Ed
             for f in rule.formulas_mut() {
                 shift_rule_formula(f, by, home_is_target, target, shift);
             }
+            for f in rule.cfvo_formulas_mut() {
+                shift_rule_formula(f, by, home_is_target, target, shift);
+            }
+        }
+        true
+    });
+    let removed = &mut sheet.ext_removed;
+    sheet.ext_rules.retain_mut(|ext| {
+        let by = if home_is_target {
+            match shift_rule_ranges(&mut ext.ranges, shift) {
+                Some(by) => by,
+                None => {
+                    removed.push((ext.kind, ext.ix));
+                    return false;
+                }
+            }
+        } else {
+            (0, 0)
+        };
+        for f in &mut ext.formulas {
+            shift_rule_formula(f, by, home_is_target, target, shift);
         }
         true
     });
@@ -2047,7 +2100,31 @@ fn span(a: u32, b: u32, shift: &EditShift) -> Option<(u32, u32)> {
     (lo <= hi).then_some((lo, hi))
 }
 
+/// A delete that removes a spilling anchor's own row/column removes its spill
+/// too, as in Excel: the spilled cells are plain values with no link to the
+/// anchor, so they would survive the shift as orphan constants. Clear the ones
+/// that are values (not formulas, `engine::clear_spill`'s rule); styles stay.
+fn clear_orphaned_spills(sheet: &mut Sheet, shift: &EditShift) {
+    let gone: Vec<_> = sheet
+        .cells
+        .iter()
+        .filter_map(|(&(r, c), cell)| {
+            let (h, w) = cell.spill?;
+            let at = if shift.rows { r } else { c };
+            point(at, shift).is_none().then_some((r, c, h, w))
+        })
+        .collect();
+    for (r, c, h, w) in gone {
+        // The engine keys and sheet index are unused: hosts rebuild the
+        // engine after a structural edit.
+        crate::engine::clear_spill(sheet, 0, (r, c), (h, w), None);
+    }
+}
+
 fn shift_grid(sheet: &mut Sheet, shift: &EditShift) {
+    if shift.delta < 0 {
+        clear_orphaned_spills(sheet, shift);
+    }
     // Cells.
     let cells = std::mem::take(&mut sheet.cells);
     sheet.cells = cells
@@ -2277,13 +2354,15 @@ impl FormulaSite<'_> {
 /// conditional-format rules `rules` takes (given the rule's sheet and
 /// ranges), and with `validations` the data-validation rules it takes too.
 /// A formula `f` leaves unchanged keeps its text exactly; one held verbatim
-/// (a shared or data-table formula) is left alone.
+/// (a shared or data-table formula) is left alone. Whether any formula was
+/// rewritten.
 fn rewrite_workbook_formulas(
     wb: &mut Workbook,
     rules: impl Fn(usize, &[Area]) -> bool,
     validations: bool,
     f: impl Fn(&Expr, FormulaSite<'_>) -> Expr,
-) {
+) -> bool {
+    let mut changed = false;
     let at = |sheet, cell| FormulaSite {
         sheet,
         cell,
@@ -2299,6 +2378,7 @@ fn rewrite_workbook_formulas(
             }
             if let Some(updated) = rewrite_if_changed(src, |e| f(e, at(Some(s), Some((r, c))))) {
                 cell.formula = Some(updated);
+                changed = true;
             }
         }
         for_each_rule_formula(sheet, validations, |ranges, src| {
@@ -2307,6 +2387,7 @@ fn rewrite_workbook_formulas(
             }
             if let Some(updated) = rewrite_if_changed(src, |e| f(e, at(Some(s), None))) {
                 *src = updated;
+                changed = true;
             }
         });
     }
@@ -2315,6 +2396,7 @@ fn rewrite_workbook_formulas(
             crate::formula::rewrite_defined_name(text, |e| f(e, at(None, None)), None)
         {
             *text = updated;
+            changed = true;
         }
     });
     // A table's calculated-column formulas sit in its first data row (one
@@ -2334,9 +2416,11 @@ fn rewrite_workbook_formulas(
             };
             if let Some(updated) = rewrite_if_changed(src, |e| f(e, site)) {
                 *slot = Some(updated);
+                changed = true;
             }
         }
     }
+    changed
 }
 
 fn table_index(wb: &Workbook, name: &str) -> Result<usize, String> {
@@ -4667,6 +4751,95 @@ mod tests {
         assert_eq!(value_at(&w, "A3"), CellValue::Number(2.0));
         assert_eq!(value_at(&w, "B3"), CellValue::Number(6.0));
         assert_eq!(value_at(&w, "C3"), CellValue::Number(99.0));
+    }
+
+    fn dynamic_column_block() -> Workbook {
+        let mut typed = Cell::formula("A1:A3*2");
+        typed.meta = Some(Box::new(crate::sheet::CellMeta {
+            modern: true,
+            ..Default::default()
+        }));
+        let mut w = wb(&[
+            ("A1", Cell::number(1.0)),
+            ("A2", Cell::number(2.0)),
+            ("A3", Cell::number(3.0)),
+            ("D1", typed),
+            ("D4", Cell::number(99.0)),
+        ]);
+        Engine::new(&w).recalc_all(&mut w);
+        assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((3, 1)));
+        w
+    }
+
+    #[test]
+    fn deleting_a_spill_anchors_row_clears_its_orphaned_values() {
+        // #818: the spill goes with its anchor, dynamic or legacy CSE alike;
+        // the user's 99 below the block only moves up.
+        for mut w in [dynamic_column_block(), cse_column_block(0)] {
+            delete_rows(&mut w, 0, 0, 1);
+            Engine::new(&w).recalc_all(&mut w);
+            assert!(w.sheets[0].cell(0, 3).is_none_or(|c| c.value.is_empty()));
+            assert!(w.sheets[0].cell(1, 3).is_none_or(|c| c.value.is_empty()));
+            assert_eq!(value_at(&w, "D3"), CellValue::Number(99.0));
+        }
+    }
+
+    #[test]
+    fn deleting_a_spill_anchors_column_clears_its_orphaned_values() {
+        let mut typed = Cell::formula("D1:F1*2");
+        typed.meta = Some(Box::new(crate::sheet::CellMeta {
+            modern: true,
+            ..Default::default()
+        }));
+        let mut w = wb(&[
+            ("D1", Cell::number(1.0)),
+            ("E1", Cell::number(2.0)),
+            ("F1", Cell::number(3.0)),
+            ("A3", typed),
+            ("D3", Cell::number(99.0)),
+        ]);
+        Engine::new(&w).recalc_all(&mut w);
+        assert_eq!(w.sheets[0].cell(2, 0).unwrap().spill, Some((1, 3)));
+        delete_cols(&mut w, 0, 0, 1);
+        Engine::new(&w).recalc_all(&mut w);
+        assert!(w.sheets[0].cell(2, 0).is_none_or(|c| c.value.is_empty()));
+        assert!(w.sheets[0].cell(2, 1).is_none_or(|c| c.value.is_empty()));
+        assert_eq!(value_at(&w, "C3"), CellValue::Number(99.0));
+    }
+
+    #[test]
+    fn deleting_the_anchor_row_keeps_formula_cells_and_styles_in_the_extent() {
+        let mut w = cse_column_block(0);
+        w.sheets[0].cells.insert((1, 3), Cell::formula("7"));
+        let mut styled = w.sheets[0].cell(2, 3).unwrap().clone();
+        styled.style = 5;
+        w.sheets[0].cells.insert((2, 3), styled);
+        delete_rows(&mut w, 0, 0, 1);
+        assert_eq!(formula_at(&w, "D1"), "7");
+        let d2 = w.sheets[0].cell(1, 3).unwrap();
+        assert!(d2.value.is_empty() && d2.style == 5);
+        assert_eq!(value_at(&w, "D3"), CellValue::Number(99.0));
+    }
+
+    #[test]
+    fn a_delete_covering_the_anchor_and_part_of_the_extent_clears_the_rest() {
+        let mut w = cse_column_block(0);
+        delete_rows(&mut w, 0, 0, 2);
+        assert!(w.sheets[0].cell(0, 3).is_none_or(|c| c.value.is_empty()));
+        assert_eq!(value_at(&w, "D2"), CellValue::Number(99.0));
+    }
+
+    #[test]
+    fn deleting_an_anchor_row_on_another_sheet_leaves_a_spill_alone() {
+        let mut w = dynamic_column_block();
+        w.sheets.push(Sheet {
+            name: "Sheet2".to_string(),
+            ..Sheet::default()
+        });
+        delete_rows(&mut w, 1, 0, 1);
+        assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((3, 1)));
+        assert_eq!(value_at(&w, "D2"), CellValue::Number(4.0));
+        assert_eq!(value_at(&w, "D3"), CellValue::Number(6.0));
     }
 
     #[test]

@@ -150,9 +150,27 @@ pub fn tiled_block(
 /// partly inside the cut, so its formula, written once for its anchor, is
 /// rewritten part by part (#1050). A formula the move doesn't reach keeps
 /// its text exactly, and a shared formula held verbatim is left alone, as an
-/// insert or delete leaves it.
-pub fn move_refs(wb: &mut Workbook, src: usize, mv: &CellMove) {
-    move_refs_with(wb, src, mv, |_, _| true, false);
+/// insert or delete leaves it. Whether any formula was rewritten.
+pub fn move_refs(wb: &mut Workbook, src: usize, mv: &CellMove) -> bool {
+    move_refs_with(wb, src, mv, |_, _| true, false)
+}
+
+/// [`move_refs`] for a host whose cut leaves the conditional-format rules'
+/// ranges where they are: a rule over cells of `mv.rect` is left whole, so
+/// (its formula being relative to its range) it keeps checking what it
+/// checked, as the data form's Delete leaves such rules; every other rule is
+/// re-pointed. Limit: a fully absolute reference (`$F$1`) in a left rule to a
+/// moved cell does not follow it. Whether any formula was rewritten.
+pub fn move_refs_rules_stay(wb: &mut Workbook, src: usize, mv: &CellMove) -> bool {
+    let (r0, c0, r1, c1) = mv.rect;
+    let meets = |a: &Area| a.0 <= r1 && r0 <= a.2 && a.1 <= c1 && c0 <= a.3;
+    move_refs_with(
+        wb,
+        src,
+        mv,
+        |s, ranges| !(s == src && ranges.iter().any(meets)),
+        false,
+    )
 }
 
 /// Rewrite every formula in the workbook for the move `mv` of the cells in
@@ -167,7 +185,7 @@ pub(super) fn move_refs_with(
     mv: &CellMove,
     rules: impl Fn(usize, &[Area]) -> bool,
     validations: bool,
-) {
+) -> bool {
     let names: Vec<String> = wb.sheets.iter().map(|s| s.name.clone()).collect();
     let (r0, c0, r1, c1) = mv.rect;
     rewrite_workbook_formulas(wb, rules, validations, |e, site| {
@@ -178,7 +196,7 @@ pub(super) fn move_refs_with(
             return e.clone();
         }
         move_ref_expr(e, sheet.map(|s| names[s].as_str()), mv)
-    });
+    })
 }
 
 #[cfg(test)]

@@ -104,6 +104,11 @@ pub(crate) struct Field {
     /// Why the cases do not type into it at all (a hidden control); `None`
     /// when they do.
     pub skip: Option<&'static str>,
+    /// A control of the entry to Tab to, to leave this field when the dialog
+    /// opens on it (#1314), for a field whose only neighbour is one the
+    /// generic search never picks (a radio group, enabled at open). The
+    /// entry vouches that Tab reaches it; `None` searches.
+    pub leave: Option<&'static str>,
 }
 
 impl Field {
@@ -120,6 +125,7 @@ impl Field {
             kept: None,
             skip_ok: None,
             skip: None,
+            leave: None,
         }
     }
 
@@ -173,6 +179,13 @@ impl Field {
     pub const fn on(self, tab: &'static str) -> Self {
         Self {
             tab: Some(tab),
+            ..self
+        }
+    }
+
+    pub const fn leave(self, to: &'static str) -> Self {
+        Self {
+            leave: Some(to),
             ..self
         }
     }

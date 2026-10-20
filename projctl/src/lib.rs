@@ -18,7 +18,7 @@
 //! | `task.list` | `{fields?}` | `{count, tasks:[{uid, id, outline_number, name, level, manual, duration, start, finish, critical, …}]}` |
 //! | `task.get` | `{uid, fields?}` | one task |
 //! | `task.fields` | — | `{count, fields:[name…]}`: the field names `fields` can read |
-//! | `task.set` | `{uid, name?, duration?, level?, manual?, percent_complete?, priority?, deadline?, constraint?, task_type?, effort_driven?, notes?, milestone?, calendar?, ignore_resource_calendar?, wbs?, earned_value_method?, custom?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled). The Task Information fields (#1550): `percent_complete` 0–100, `priority` 0–1000, `deadline` a date (`YYYY-MM-DD`, the day's last working time, or `YYYY-MM-DDTHH:MM`) or `null`, `constraint` `{type, date?}` with the type `ASAP`/`ALAP`/`MSO`/`MFO`/`SNET`/`SNLT`/`FNET`/`FNLT`, `task_type` `fixed-units`/`fixed-duration`/`fixed-work`, `effort_driven` and `milestone` booleans, `notes` text (`\n` line breaks), `calendar` a base calendar's name or uid or `null`, `ignore_resource_calendar` a boolean, `wbs` text, `earned_value_method` `percent-complete`/`physical-percent-complete`. `custom` (#1554) is an object of Project custom field names to values as typed in the cell (`{"Text1": "Civil", "Flag3": true, "Date1": "2026-03-09", "Duration1": "3d", "Cost1": "$1,400", "Number1": null}`; `null` or `""` clears): the field needs a definition in the plan, a formula field is refused, a lookup-table field takes one of its values. Every argument is checked and all apply in one undo step, or none does |
+//! | `task.set` | `{uid, name?, duration?, level?, manual?, start?, finish?, percent_complete?, actual_start?, actual_finish?, actual_duration?, remaining_duration?, priority?, deadline?, constraint?, task_type?, effort_driven?, notes?, milestone?, calendar?, ignore_resource_calendar?, wbs?, earned_value_method?, custom?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled). The Task Information fields (#1550): `start` and `finish` (#1570) are set as typed in the Start and Finish cells: `YYYY-MM-DD` (the task calendar's first working time for a start, its last for a finish) or `YYYY-MM-DDTHH:MM`; an auto task gains a Start or Finish No Earlier Than constraint, a manual one is pinned (keeping its duration for a start, the duration following a finish), after `manual`, `duration`, `milestone` and the calendar are applied, and before the actuals and a given `constraint`; only these see the call's calendar, as a bare `actual_*`, `deadline` or `constraint.date` day resolves on the task's calendar before a `calendar` in the same call; both on an auto task, or either on an auto summary, are refused, and `null` is not accepted. `percent_complete` 0–100, the Update Tasks fields (#1568) `actual_start` / `actual_finish` (a date as for `deadline`, an actual start taking the day's first working time and a finish its last, or `null` to clear) and `actual_duration` / `remaining_duration` (durations: setting one adjusts % Complete, the remaining duration also the task's duration; an actual finish completes the task; a `percent_complete` given with an actual finish date, `actual_duration` or `remaining_duration` must equal the % they make or is refused, and with only `actual_start` or a cleared finish it applies after them, a started task getting that share as its actual duration; a `duration` given with `remaining_duration` must equal the actual plus the remaining), `priority` 0–1000, `deadline` a date (`YYYY-MM-DD`, the day's last working time, or `YYYY-MM-DDTHH:MM`) or `null`, `constraint` `{type, date?}` with the type `ASAP`/`ALAP`/`MSO`/`MFO`/`SNET`/`SNLT`/`FNET`/`FNLT`, `task_type` `fixed-units`/`fixed-duration`/`fixed-work`, `effort_driven` and `milestone` booleans, `notes` text (`\n` line breaks), `calendar` a base calendar's name or uid or `null`, `ignore_resource_calendar` a boolean, `wbs` text, `earned_value_method` `percent-complete`/`physical-percent-complete`. `custom` (#1554) is an object of Project custom field names to values as typed in the cell (`{"Text1": "Civil", "Flag3": true, "Date1": "2026-03-09", "Duration1": "3d", "Cost1": "$1,400", "Number1": null}`; `null` or `""` clears): the field needs a definition in the plan, a formula field is refused, a lookup-table field takes one of its values. Every argument is checked and all apply in one undo step, or none does |
 //! | `task.add` | `{after?, name?, duration?}` | the new task (without `duration`, 1 day, estimated when the plan's `NewTasksEstimated` is; inserted `after` a task that a finish-to-start link joins to the next, it is linked into that chain when the plan's `Autolink` is on, as it is by default) |
 //! | `task.del` | `{uid}` | `{deleted, removed:[uid…]}` (a summary takes its subtree) |
 //! | `link.add` | `{uid, pred, type?, lag?}` | the updated task (`lag` uses Predecessors cell spellings such as `4h`, `2ed`, `50%`; other duration spellings such as `1 month` are read as working-days lags) |
@@ -765,7 +765,19 @@ fn task_reply(ed: &Editor, uid: i32, asked: Option<&[(String, Field)]>) -> Resul
 /// parsed before anything is applied.
 #[derive(Default)]
 struct TaskInfoArgs {
+    /// Start and Finish as typed in the cell (#1570): resolved by the
+    /// editor's setters against the task as the call leaves it, applied after
+    /// `manual`, `duration`, `milestone` and the calendar, before the actuals
+    /// and `constraint`. Bare days of the other date fields resolve on the
+    /// task's calendar before a `calendar` in the same call.
+    start: Option<Typed>,
+    finish: Option<Typed>,
     percent_complete: Option<i32>,
+    /// The Update Tasks fields (#1568); `Some(None)` clears a date.
+    actual_start: Option<Option<DateTime>>,
+    actual_finish: Option<Option<DateTime>>,
+    actual_duration: Option<i64>,
+    remaining_duration: Option<i64>,
     priority: Option<i32>,
     /// `Some(None)` clears the deadline.
     deadline: Option<Option<DateTime>>,
@@ -783,9 +795,35 @@ struct TaskInfoArgs {
     custom: Vec<(Field, String)>,
 }
 
+/// `YYYY-MM-DDTHH:MM` as typed. `parse_mspdi` alone rolls 2026-02-30 over to
+/// March 2, so the date half must be a real calendar date.
+fn instant(text: &str) -> Option<DateTime> {
+    parse_cell_date(text.split_once('T')?.0).ok()?;
+    DateTime::parse_mspdi(text)
+}
+
+/// A typed Start or Finish: a bare day, which the cell's setter resolves to
+/// the task calendar's first or last working time, or an exact instant.
+#[derive(Clone, Copy)]
+enum Typed {
+    Day(DateTime),
+    At(DateTime),
+}
+
+/// The refusals of the Entry table's cells and the Task Information dialog.
+const SUMMARY_DATES_READ_ONLY: &str = "Summary dates and duration are read-only";
+const START_OR_FINISH: &str =
+    "Change Start or Finish, not both, on an auto-scheduled task; change Duration for the span";
+
 impl TaskInfoArgs {
     fn any(&self) -> bool {
-        self.percent_complete.is_some()
+        self.start.is_some()
+            || self.finish.is_some()
+            || self.percent_complete.is_some()
+            || self.actual_start.is_some()
+            || self.actual_finish.is_some()
+            || self.actual_duration.is_some()
+            || self.remaining_duration.is_some()
             || self.priority.is_some()
             || self.deadline.is_some()
             || self.constraint.is_some()
@@ -839,7 +877,7 @@ impl TaskInfoArgs {
         let stamp = |key: &str, s: &str, ends_day: bool| -> Result<DateTime, String> {
             let bad = || format!("'{key}' must be a date, YYYY-MM-DD or YYYY-MM-DDTHH:MM");
             if s.contains('T') {
-                return DateTime::parse_mspdi(s).ok_or_else(bad);
+                return instant(s).ok_or_else(bad);
             }
             let day = parse_cell_date(s).map_err(|_| bad())?;
             Ok(if ends_day {
@@ -848,12 +886,47 @@ impl TaskInfoArgs {
                 day_start(proj, task, day)
             })
         };
-        let deadline = match args.get("deadline") {
-            None => None,
-            Some(Json::Null) => Some(None),
-            Some(Json::Str(s)) if s.trim().is_empty() => Some(None),
-            Some(Json::Str(s)) => Some(Some(stamp("deadline", s.trim(), true)?)),
-            Some(_) => return Err("'deadline' must be a date or null".into()),
+        // A date or null; an actual start is the day's first working time, an
+        // actual finish and a deadline its last.
+        let date_or_null =
+            |key: &str, ends_day: bool| -> Result<Option<Option<DateTime>>, String> {
+                match args.get(key) {
+                    None => Ok(None),
+                    Some(Json::Null) => Ok(Some(None)),
+                    Some(Json::Str(s)) if s.trim().is_empty() => Ok(Some(None)),
+                    Some(Json::Str(s)) => Ok(Some(Some(stamp(key, s.trim(), ends_day)?))),
+                    Some(_) => Err(format!("'{key}' must be a date or null")),
+                }
+            };
+        // Start and Finish are a date, never null: the cell cannot clear one.
+        let typed = |key: &str| -> Result<Option<Typed>, String> {
+            let Some(v) = args.get(key) else {
+                return Ok(None);
+            };
+            let bad = || format!("'{key}' must be a date, YYYY-MM-DD or YYYY-MM-DDTHH:MM");
+            let s = v.as_str().ok_or_else(bad)?.trim();
+            if s.contains('T') {
+                return instant(s).map(|d| Some(Typed::At(d))).ok_or_else(bad);
+            }
+            parse_cell_date(s)
+                .map(|d| Some(Typed::Day(d)))
+                .map_err(|_| bad())
+        };
+        let start = typed("start")?;
+        let finish = typed("finish")?;
+        let deadline = date_or_null("deadline", true)?;
+        let actual_start = date_or_null("actual_start", false)?;
+        let actual_finish = date_or_null("actual_finish", true)?;
+        let duration_arg = |key: &str| -> Result<Option<i64>, String> {
+            args.get(key)
+                .map(|v| {
+                    let text = v
+                        .as_str()
+                        .ok_or_else(|| format!("'{key}' must be a duration"))?;
+                    parse_duration(text, proj)
+                        .ok_or_else(|| format!("Couldn't read {key} '{text}' ({DURATION_HINT})"))
+                })
+                .transpose()
         };
         let constraint = match args.get("constraint") {
             None => None,
@@ -959,7 +1032,13 @@ impl TaskInfoArgs {
             }),
         };
         Ok(TaskInfoArgs {
+            start,
+            finish,
             percent_complete: whole("percent_complete")?,
+            actual_start,
+            actual_finish,
+            actual_duration: duration_arg("actual_duration")?,
+            remaining_duration: duration_arg("remaining_duration")?,
             priority: whole("priority")?,
             deadline,
             constraint,
@@ -975,6 +1054,46 @@ impl TaskInfoArgs {
         })
     }
 
+    fn apply_calendar(&self, ed: &mut Editor, uid: i32) -> Result<(), String> {
+        if let Some(cal) = self.calendar {
+            ed.set_task_calendar(uid, cal)?;
+        }
+        if let Some(on) = self.ignore_resource_calendar {
+            ed.set_ignore_resource_calendar(uid, on)?;
+        }
+        Ok(())
+    }
+
+    /// Start and Finish, as the cell sets them.
+    fn apply_dates(&self, ed: &mut Editor, uid: i32) -> Result<(), String> {
+        if self.start.is_some() || self.finish.is_some() {
+            let task = ed
+                .project()
+                .task(uid)
+                .ok_or_else(|| format!("no task with uid {uid}"))?;
+            if task.summary && !task.manual {
+                return Err(SUMMARY_DATES_READ_ONLY.into());
+            }
+            // Judged as the setters do: typing into a blank row of a plan
+            // whose new tasks are manual makes it manual.
+            let manual = task.manual || (task.is_null && ed.project().new_tasks_are_manual);
+            if self.start.is_some() && self.finish.is_some() && !manual {
+                return Err(START_OR_FINISH.into());
+            }
+        }
+        match self.start {
+            Some(Typed::Day(day)) => ed.set_start(uid, day)?,
+            Some(Typed::At(at)) => ed.set_start_at(uid, at)?,
+            None => {}
+        }
+        match self.finish {
+            Some(Typed::Day(day)) => ed.set_finish(uid, day)?,
+            Some(Typed::At(at)) => ed.set_finish_at(uid, at)?,
+            None => {}
+        }
+        Ok(())
+    }
+
     /// Apply the fields, in the dialog's order: type and effort driven
     /// first (a resource added later rescales by them), the constraint after
     /// the dates.
@@ -988,8 +1107,60 @@ impl TaskInfoArgs {
         if let Some(on) = self.milestone {
             ed.set_milestone(uid, on)?;
         }
+        // The calendar first, so a bare day resolves on the one the call ends
+        // with; a blank row has no properties until a date makes it a task.
+        let blank = ed.project().task(uid).is_some_and(|t| t.is_null);
+        if !blank {
+            self.apply_calendar(ed, uid)?;
+        }
+        self.apply_dates(ed, uid)?;
+        if blank {
+            self.apply_calendar(ed, uid)?;
+        }
+        // A finish, an actual duration or a remaining duration derive
+        // % Complete; a start alone, or clearing the finish, leave it to
+        // `percent_complete`.
+        let derives = matches!(self.actual_finish, Some(Some(_)))
+            || self.actual_duration.is_some()
+            || self.remaining_duration.is_some();
+        // Moving both dates later: the start is checked against the stored
+        // finish, so the finish goes first.
+        let stored_finish = ed.project().task(uid).and_then(|t| t.actual_finish);
+        let finish_first = match (self.actual_start, self.actual_finish) {
+            (Some(Some(start)), Some(_)) => stored_finish.is_some_and(|f| start > f),
+            _ => false,
+        };
+        if finish_first && let Some(finish) = self.actual_finish {
+            ed.set_actual_finish(uid, finish)?;
+        }
+        if let Some(start) = self.actual_start {
+            ed.set_actual_start(uid, start)?;
+        }
+        if !finish_first && let Some(finish) = self.actual_finish {
+            ed.set_actual_finish(uid, finish)?;
+        }
+        if let Some(minutes) = self.actual_duration {
+            ed.set_actual_duration(uid, minutes)?;
+        }
+        if let Some(minutes) = self.remaining_duration {
+            ed.set_remaining_duration(uid, minutes)?;
+        }
         if let Some(p) = self.percent_complete {
-            ed.set_percent_complete(uid, p)?;
+            if derives {
+                // The actuals say how far the task is; a different
+                // percent_complete is a contradiction, never an override.
+                let now = ed.project().task(uid).and_then(|t| t.percent_complete);
+                if i32::from(now.unwrap_or(0)) != p {
+                    return Err(format!(
+                        "percent_complete {p} contradicts the actuals, which make it {}",
+                        now.unwrap_or(0)
+                    ));
+                }
+            } else {
+                // A started task keeps its actual and remaining duration at
+                // the percent's share of the duration; see the method.
+                ed.set_percent_complete_synced(uid, p)?;
+            }
         }
         if let Some(p) = self.priority {
             ed.set_priority(uid, p)?;
@@ -999,12 +1170,6 @@ impl TaskInfoArgs {
         }
         if let Some(d) = self.deadline {
             ed.set_deadline(uid, d)?;
-        }
-        if let Some(cal) = self.calendar {
-            ed.set_task_calendar(uid, cal)?;
-        }
-        if let Some(on) = self.ignore_resource_calendar {
-            ed.set_ignore_resource_calendar(uid, on)?;
         }
         if let Some(wbs) = &self.wbs {
             ed.set_wbs(uid, wbs)?;
@@ -1059,7 +1224,7 @@ fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         || patch.manual.is_some();
     if !has_patch && !info.any() {
         return Err(
-            "task.set needs at least one of 'name', 'duration', 'level', 'manual' or a Task Information field"
+            "task.set needs at least one of 'name', 'duration', 'level', 'manual', 'start', 'finish' or a Task Information field"
                 .into(),
         );
     }
@@ -1068,7 +1233,18 @@ fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         if has_patch {
             ed.update_task(uid, patch)?;
         }
-        info.apply(ed, uid)
+        info.apply(ed, uid)?;
+        // A remaining duration sets the duration; a different one typed
+        // beside it is a contradiction.
+        if let (Some(typed), Some(_)) = (duration, info.remaining_duration) {
+            let now = ed.project().task(uid).map_or(typed.0, |t| t.duration_min);
+            if now != typed.0 {
+                return Err(format!(
+                    "'duration' contradicts 'remaining_duration', which makes the duration {now} minutes"
+                ));
+            }
+        }
+        Ok(())
     })?;
     task_reply(ed, uid, asked.as_deref())
 }
@@ -3188,6 +3364,545 @@ mod tests {
             assert!(!ed.dirty());
         }
     }
+    /// The Update Tasks fields (#1568), one undo step with the rest.
+    #[test]
+    fn task_set_takes_the_update_tasks_fields() {
+        let mut a = app();
+        let uid = add(&mut a, "Pour", "4d");
+        let set = |a: &mut Editor, extra: Vec<(&str, Json)>| {
+            let mut args = vec![("uid", Json::Num(uid as f64))];
+            args.extend(extra);
+            dispatch_editor(a, "task.set", &Json::obj(args)).unwrap()
+        };
+        let task = |a: &Editor| a.project().task(uid as i32).unwrap().clone();
+        let depth = a.undo_depth();
+        set(
+            &mut a,
+            vec![
+                ("actual_start", Json::Str("2026-03-02".into())),
+                ("actual_duration", Json::Str("2d".into())),
+                ("priority", Json::Num(700.0)),
+                ("percent_complete", Json::Num(50.0)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(a.undo_depth(), depth + 1);
+        let t = task(&a);
+        assert_eq!(
+            t.actual_start.map(|d| (d.parts().day, d.parts().hour)),
+            Some((2, 8))
+        );
+        assert_eq!(
+            (
+                t.actual_duration_min,
+                t.remaining_duration_min,
+                t.percent_complete,
+                t.priority
+            ),
+            (Some(960), Some(960), Some(50), Some(700))
+        );
+        // A conflicting percent_complete is refused, not overridden, and
+        // takes the other fields with it.
+        let before = a.project().clone();
+        let err = set(
+            &mut a,
+            vec![
+                ("priority", Json::Num(100.0)),
+                ("remaining_duration", Json::Str("1d".into())),
+                ("percent_complete", Json::Num(50.0)),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("contradicts"), "{err}");
+        assert_eq!(*a.project(), before);
+        // A bad remaining duration leaves the priority alone.
+        for bad in [Json::Str("soon".into()), Json::Num(3.0)] {
+            assert!(
+                set(
+                    &mut a,
+                    vec![("priority", Json::Num(100.0)), ("remaining_duration", bad)]
+                )
+                .is_err()
+            );
+            assert_eq!(*a.project(), before);
+        }
+        set(&mut a, vec![("remaining_duration", Json::Str("1d".into()))]).unwrap();
+        let t = task(&a);
+        assert_eq!((t.duration_min, t.percent_complete), (1440, Some(67)));
+        set(
+            &mut a,
+            vec![("actual_finish", Json::Str("2026-03-04".into()))],
+        )
+        .unwrap();
+        let t = task(&a);
+        assert_eq!(
+            t.actual_finish.map(|d| (d.parts().day, d.parts().hour)),
+            Some((4, 17))
+        );
+        assert_eq!(t.percent_complete, Some(100));
+        // null clears.
+        set(&mut a, vec![("actual_start", Json::Null)]).unwrap();
+        let t = task(&a);
+        assert_eq!(
+            (t.actual_start, t.actual_finish, t.percent_complete),
+            (None, None, Some(0))
+        );
+        set(&mut a, vec![("actual_start", Json::Str("later".into()))]).unwrap_err();
+        let fresh = add(&mut a, "Wall", "2d");
+        dispatch_editor(
+            &mut a,
+            "task.set",
+            &Json::obj(vec![
+                ("uid", Json::Num(fresh as f64)),
+                ("actual_start", Json::Str("2026-03-02".into())),
+                ("percent_complete", Json::Num(100.0)),
+            ]),
+        )
+        .unwrap()
+        .unwrap();
+        let w = a.project().task(fresh as i32).unwrap();
+        assert_eq!(
+            (
+                w.actual_duration_min,
+                w.remaining_duration_min,
+                w.percent_complete
+            ),
+            (Some(w.duration_min), Some(0), Some(100))
+        );
+
+        // A start alone leaves % Complete to percent_complete.
+        set(
+            &mut a,
+            vec![
+                ("actual_start", Json::Str("2026-03-02".into())),
+                ("percent_complete", Json::Num(50.0)),
+            ],
+        )
+        .unwrap();
+        let t = task(&a);
+        assert_eq!(
+            (t.percent_complete, t.actual_duration_min),
+            (Some(50), Some(t.duration_min / 2)),
+            "the recorded actual follows the percent"
+        );
+        let err = set(
+            &mut a,
+            vec![
+                ("actual_start", Json::Str("2026-03-03".into())),
+                ("percent_complete", Json::Num(0.0)),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("more than 0%"), "{err}");
+        // Both dates moved later in one call.
+        set(
+            &mut a,
+            vec![("actual_finish", Json::Str("2026-03-04".into()))],
+        )
+        .unwrap();
+        set(
+            &mut a,
+            vec![
+                ("actual_start", Json::Str("2026-03-09".into())),
+                ("actual_finish", Json::Str("2026-03-10".into())),
+            ],
+        )
+        .unwrap();
+        let t = task(&a);
+        assert_eq!(
+            (
+                t.actual_start.map(|d| d.parts().day),
+                t.actual_finish.map(|d| d.parts().day)
+            ),
+            (Some(9), Some(10))
+        );
+        // A finished task cleared to 50 %: its actual is 50 % of the duration.
+        set(
+            &mut a,
+            vec![("actual_finish", Json::Str("2026-03-10".into()))],
+        )
+        .unwrap();
+        set(
+            &mut a,
+            vec![
+                ("actual_finish", Json::Null),
+                ("percent_complete", Json::Num(50.0)),
+            ],
+        )
+        .unwrap();
+        let t = task(&a);
+        assert_eq!(
+            (
+                t.percent_complete,
+                t.actual_duration_min,
+                t.remaining_duration_min
+            ),
+            (
+                Some(50),
+                Some(t.duration_min / 2),
+                Some(t.duration_min - t.duration_min / 2)
+            )
+        );
+        // 100 % on a started task completes its actual duration, with no finish.
+        set(&mut a, vec![("percent_complete", Json::Num(100.0))]).unwrap();
+        let t = task(&a);
+        assert_eq!(
+            (
+                t.actual_duration_min,
+                t.remaining_duration_min,
+                t.actual_finish
+            ),
+            (Some(t.duration_min), Some(0), None)
+        );
+        // The same 50 % again, with the duration made longer first: the
+        // actual follows the new duration.
+        set(
+            &mut a,
+            vec![
+                ("duration", Json::Str("8d".into())),
+                ("percent_complete", Json::Num(50.0)),
+            ],
+        )
+        .unwrap();
+        let t = task(&a);
+        assert_eq!((t.duration_min, t.actual_duration_min), (3840, Some(1920)));
+        // A duration beside a remaining duration must agree with it.
+        set(&mut a, vec![("actual_finish", Json::Null)]).unwrap();
+        let before = a.project().clone();
+        let err = set(
+            &mut a,
+            vec![
+                ("duration", Json::Str("9d".into())),
+                ("remaining_duration", Json::Str("1d".into())),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("contradicts"), "{err}");
+        assert_eq!(*a.project(), before);
+    }
+
+    #[test]
+    fn task_set_takes_start_and_finish_as_typed_in_the_cell() {
+        let call = |a: &mut Editor, uid: i64, extra: Vec<(&str, Json)>| {
+            let mut args = vec![("uid", Json::Num(uid as f64))];
+            args.extend(extra);
+            dispatch_editor(a, "task.set", &Json::obj(args)).unwrap()
+        };
+        let text = |s: &str| Json::Str(s.into());
+        let day = |s: &str| parse_cell_date(s).unwrap();
+        let mut a = app();
+        let uid = add(&mut a, "Pour", "4d");
+        let id = uid as i32;
+        // A twin edited through the cell's own setters is the reference.
+        let mut twin = Editor::new(a.project().clone());
+        let depth = a.undo_depth();
+        call(&mut a, uid, vec![("start", text("2026-03-09"))]).unwrap();
+        twin.set_start(id, day("2026-03-09")).unwrap();
+        assert_eq!(a.undo_depth(), depth + 1);
+        let t = a.project().task(id).unwrap();
+        assert_eq!(t.constraint, ConstraintType::StartNoEarlierThan);
+        assert_eq!((t.constraint, t.constraint_date), {
+            let r = twin.project().task(id).unwrap();
+            (r.constraint, r.constraint_date)
+        });
+        assert_eq!(t.constraint_date.map(|d| d.parts().hour), Some(8));
+        call(&mut a, uid, vec![("finish", text("2026-03-20"))]).unwrap();
+        twin.set_finish(id, day("2026-03-20")).unwrap();
+        let (t, r) = (
+            a.project().task(id).unwrap(),
+            twin.project().task(id).unwrap(),
+        );
+        assert_eq!(t.constraint, ConstraintType::FinishNoEarlierThan);
+        assert_eq!(
+            (t.constraint, t.constraint_date),
+            (r.constraint, r.constraint_date)
+        );
+        assert_eq!(t.constraint_date.map(|d| d.parts().hour), Some(17));
+        // A non-working day is refused as the cell refuses it.
+        let before = a.project().clone();
+        let err = call(&mut a, uid, vec![("finish", text("2026-03-14"))]).unwrap_err();
+        assert!(err.contains("non-working"), "{err}");
+        assert_eq!(*a.project(), before);
+        // An exact instant is taken as typed.
+        call(&mut a, uid, vec![("start", text("2026-03-10T10:00"))]).unwrap();
+        let t = a.project().task(id).unwrap();
+        assert_eq!(
+            (
+                t.constraint,
+                t.constraint_date.map(|d| (d.parts().day, d.parts().hour))
+            ),
+            (ConstraintType::StartNoEarlierThan, Some((10, 10)))
+        );
+        call(&mut a, uid, vec![("finish", text("2026-03-18T12:00"))]).unwrap();
+        let t = a.project().task(id).unwrap();
+        assert_eq!(
+            (
+                t.constraint,
+                t.constraint_date.map(|d| (d.parts().day, d.parts().hour))
+            ),
+            (ConstraintType::FinishNoEarlierThan, Some((18, 12)))
+        );
+        // Both on an auto task: refused, and the name beside them is not kept.
+        let before = a.project().clone();
+        let depth = a.undo_depth();
+        let err = call(
+            &mut a,
+            uid,
+            vec![
+                ("name", text("Renamed")),
+                ("start", text("2026-03-09")),
+                ("finish", text("2026-03-13")),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("not both"), "{err}");
+        assert_eq!(*a.project(), before);
+        assert_eq!(a.undo_depth(), depth);
+        // Bad text, null and "" name the key and change nothing.
+        for (key, bad) in [
+            ("start", text("soon")),
+            ("start", Json::Null),
+            ("finish", text("")),
+            ("finish", Json::Num(5.0)),
+            ("start", text("2026-02-30")),
+            ("start", text("2026-03-10Tnoon")),
+            ("start", text("2026-02-30T10:00")),
+            ("finish", text("2026-13-01T10:00")),
+        ] {
+            let err = call(&mut a, uid, vec![("name", text("X")), (key, bad)]).unwrap_err();
+            assert!(err.contains(&format!("'{key}' must be a date")), "{err}");
+            assert_eq!(*a.project(), before);
+        }
+        // Manual: the start is pinned keeping the duration, in one undo step
+        // with the switch and the duration.
+        let manual = add(&mut a, "Wall", "2d");
+        let mid = manual as i32;
+        let depth = a.undo_depth();
+        call(
+            &mut a,
+            manual,
+            vec![
+                ("manual", Json::Bool(true)),
+                ("duration", text("3d")),
+                ("start", text("2026-03-16")),
+            ],
+        )
+        .unwrap();
+        assert_eq!(a.undo_depth(), depth + 1);
+        let t = a.project().task(mid).unwrap();
+        assert!(t.manual);
+        assert_eq!(
+            (t.manual_start.map(|d| d.parts().day), t.duration_min),
+            (Some(16), 3 * 480)
+        );
+        // Both apply on a manual task, start first, as the dialog does.
+        call(
+            &mut a,
+            manual,
+            vec![
+                ("start", text("2026-03-17")),
+                ("finish", text("2026-03-19")),
+            ],
+        )
+        .unwrap();
+        let t = a.project().task(mid).unwrap();
+        assert_eq!(
+            (
+                t.manual_start.map(|d| d.parts().day),
+                t.manual_finish.map(|d| d.parts().day),
+                t.duration_min
+            ),
+            (Some(17), Some(19), 3 * 480)
+        );
+        // A finish before the start is refused and rolls everything back.
+        let before = a.project().clone();
+        let err = call(
+            &mut a,
+            manual,
+            vec![
+                ("name", text("Nope")),
+                ("start", text("2026-03-24")),
+                ("finish", text("2026-03-20")),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("before"), "{err}");
+        assert_eq!(*a.project(), before);
+        // An instant finish on a manual task sets the span up to it.
+        call(&mut a, manual, vec![("finish", text("2026-03-18T12:00"))]).unwrap();
+        let t = a.project().task(mid).unwrap();
+        assert_eq!(
+            t.manual_finish.map(|d| (d.parts().day, d.parts().hour)),
+            Some((18, 12))
+        );
+        // An explicit constraint beside a start wins, applied after it.
+        call(
+            &mut a,
+            uid,
+            vec![
+                ("start", text("2026-03-09")),
+                (
+                    "constraint",
+                    Json::obj(vec![("type", text("ASAP")), ("date", Json::Null)]),
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            a.project().task(id).unwrap().constraint,
+            ConstraintType::AsSoonAsPossible
+        );
+    }
+
+    #[test]
+    fn task_set_start_and_finish_judge_a_blank_row_as_the_setters_do() {
+        let blank = |manual: bool| {
+            let mut p = new_project();
+            p.new_tasks_are_manual = manual;
+            p.tasks.push(Task {
+                uid: 2,
+                id: 2,
+                is_null: true,
+                ..Task::default()
+            });
+            Editor::new(p)
+        };
+        let args = Json::obj(vec![
+            ("uid", Json::Num(2.0)),
+            ("start", Json::Str("2026-03-09".into())),
+            ("finish", Json::Str("2026-03-11".into())),
+        ]);
+        // New tasks are manual: typing into the blank row makes it manual,
+        // so both dates apply, as two cell edits would.
+        let mut a = blank(true);
+        dispatch_editor(&mut a, "task.set", &args).unwrap().unwrap();
+        let t = a.project().task(2).unwrap();
+        assert!(t.manual);
+        assert_eq!(
+            (
+                t.manual_start.map(|d| d.parts().day),
+                t.manual_finish.map(|d| d.parts().day)
+            ),
+            (Some(9), Some(11))
+        );
+        // New tasks are auto: refused, the row stays blank.
+        let mut a = blank(false);
+        let err = dispatch_editor(&mut a, "task.set", &args)
+            .unwrap()
+            .unwrap_err();
+        assert!(err.contains("not both"), "{err}");
+        assert!(a.project().task(2).unwrap().is_null);
+    }
+
+    #[test]
+    fn task_set_start_resolves_a_day_on_the_calendar_the_call_ends_with() {
+        use projcore::model::WorkingTime;
+        let mut p = new_project();
+        let mut late = p.calendars[0].clone();
+        late.uid = 99;
+        late.name = "Late".into();
+        late.base_calendar_uid = None;
+        late.week = std::array::from_fn(|_| {
+            Some(DayWorking {
+                times: vec![WorkingTime { from: 600, to: 840 }],
+            })
+        });
+        p.calendars.push(late);
+        let mut a = Editor::new(p);
+        let args = Json::obj(vec![
+            ("uid", Json::Num(1.0)),
+            ("start", Json::Str("2026-03-09".into())),
+            ("calendar", Json::Num(99.0)),
+        ]);
+        dispatch_editor(&mut a, "task.set", &args).unwrap().unwrap();
+        let t = a.project().task(1).unwrap();
+        assert_eq!(t.calendar_uid, Some(99));
+        assert_eq!(t.constraint, ConstraintType::StartNoEarlierThan);
+        assert_eq!(
+            t.constraint_date.map(|d| (d.parts().day, d.parts().hour)),
+            Some((9, 10))
+        );
+    }
+
+    #[test]
+    fn task_set_start_with_a_calendar_works_on_a_blank_row() {
+        let mut p = new_project();
+        p.tasks.push(Task {
+            uid: 2,
+            id: 2,
+            is_null: true,
+            ..Task::default()
+        });
+        let cal = p.calendars[0].uid;
+        let mut a = Editor::new(p);
+        let args = Json::obj(vec![
+            ("uid", Json::Num(2.0)),
+            ("start", Json::Str("2026-03-09".into())),
+            ("calendar", Json::Num(f64::from(cal))),
+        ]);
+        dispatch_editor(&mut a, "task.set", &args).unwrap().unwrap();
+        let t = a.project().task(2).unwrap();
+        assert!(!t.is_null);
+        assert_eq!(t.calendar_uid, Some(cal));
+        assert_eq!(t.constraint, ConstraintType::StartNoEarlierThan);
+    }
+
+    #[test]
+    fn task_set_refuses_an_impossible_date_in_every_instant() {
+        let mut a = app();
+        let before = a.project().clone();
+        for args in [
+            vec![("deadline", Json::Str("2026-02-30T10:00".into()))],
+            vec![("actual_start", Json::Str("2026-02-30T10:00".into()))],
+            vec![(
+                "constraint",
+                Json::obj(vec![
+                    ("type", Json::Str("SNET".into())),
+                    ("date", Json::Str("2026-02-30T10:00".into())),
+                ]),
+            )],
+        ] {
+            let mut all = vec![("uid", Json::Num(1.0))];
+            all.extend(args);
+            let err = dispatch_editor(&mut a, "task.set", &Json::obj(all))
+                .unwrap()
+                .unwrap_err();
+            assert!(err.contains("must be a date"), "{err}");
+            assert_eq!(*a.project(), before);
+        }
+    }
+
+    #[test]
+    fn task_set_start_refuses_auto_summaries() {
+        let mut p = new_project();
+        p.tasks[0].name = "Phase".into();
+        for uid in [2, 3] {
+            p.tasks.push(Task {
+                uid,
+                id: uid,
+                name: format!("Sub {uid}"),
+                outline_level: 2,
+                duration_min: 480,
+                ..Task::default()
+            });
+        }
+        let mut a = Editor::new(p);
+        let summary = a.project().tasks.iter().find(|t| t.summary).unwrap().uid;
+        for key in ["start", "finish"] {
+            let before = a.project().clone();
+            let args = Json::obj(vec![
+                ("uid", Json::Num(summary as f64)),
+                ("name", Json::Str("X".into())),
+                (key, Json::Str("2026-03-09".into())),
+            ]);
+            let err = dispatch_editor(&mut a, "task.set", &args)
+                .unwrap()
+                .unwrap_err();
+            assert!(err.contains("read-only"), "{err}");
+            assert_eq!(*a.project(), before);
+        }
+    }
+
     /// The Task Information fields (#1550): every argument applies in the
     /// one undo step, and a refused one undoes them all.
     #[test]

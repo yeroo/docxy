@@ -600,6 +600,10 @@ pub(crate) struct Control {
     /// an editable grid resolves a dropdown or combo column against its items
     /// and keeps a label column read-only; a plugin's grid stores what is typed.
     pub editable_grid: bool,
+    /// A text field that takes the focus on a page opened on (not by Tab)
+    /// keeps its text and puts the caret after it, so typing appends: a note
+    /// (#1314). Other fields open selected.
+    pub append_on_open: bool,
     /// A grid's items per column. A [`ControlKind::Dropdown`] or
     /// [`ControlKind::Combo`] column's are what it offers (only the column's
     /// kind decides that); another column's may hold the owner's data lined up
@@ -634,6 +638,7 @@ impl Control {
             commit_command: false,
             beside: false,
             editable_grid: false,
+            append_on_open: false,
             column_items: Vec::new(),
             pick: None,
             picked: None,
@@ -2064,10 +2069,62 @@ impl Dialog {
             (Some(i), false) => (i + 1) % order.len(),
             (Some(i), true) => (i + order.len() - 1) % order.len(),
         };
-        self.focus = Some(order[next]);
+        self.focus_control(order[next]);
+    }
+
+    /// Focus control `i` (one `focusable` lists). A single-line field that
+    /// takes the focus has its whole value selected, as in Word, so typing
+    /// replaces it (#1314).
+    fn focus_control(&mut self, i: usize) {
+        self.focus = Some(i);
         self.caret = None;
         self.anchor = None;
         self.calendar = None;
+        if self
+            .focused()
+            .is_some_and(|c| c.kind.is_text() && c.kind != ControlKind::Multiline)
+        {
+            self.select_all();
+        }
+    }
+
+    /// A plain modal form opens with its first editable control focused, as
+    /// in Word, so the first keys are not lost (#1314). Message boxes have no
+    /// editable control; modeless, popup and plugin dialogs route keys their
+    /// own way and keep their focus as built.
+    pub fn focus_on_open(&mut self) {
+        if self.focus.is_none() && self.takes_initial_focus() && !self.focus_own_page() {
+            self.focus_step(false);
+        }
+    }
+
+    /// A plain modal form: not modeless, a popup or a plugin's dialog, whose
+    /// keys route their own way (#1314).
+    fn takes_initial_focus(&self) -> bool {
+        !self.modeless && self.popup.is_none() && !matches!(self.owner, DialogOwner::Plugin { .. })
+    }
+
+    /// On a later page, focus that page's own first control (its value
+    /// selected, or the caret after it for an `append_on_open` field); the
+    /// top-row controls, which belong to every page (Task Information's
+    /// Name), come after. False on the first page or when the page has none.
+    fn focus_own_page(&mut self) -> bool {
+        if self.tab == 0 {
+            return false;
+        }
+        let Some(i) = self
+            .focusable()
+            .into_iter()
+            .find(|&i| self.controls[i].page == Some(self.tab))
+        else {
+            return false;
+        };
+        self.focus_control(i);
+        if self.controls[i].append_on_open && self.controls[i].kind.is_text() {
+            let len = self.focused_text().map_or(0, |t| t.chars().count());
+            self.put_caret(len);
+        }
+        true
     }
 
     /// The focused text field's text, when the focus is on one.
@@ -2470,6 +2527,7 @@ impl Dialog {
             return Err(format!("'{}' has no tabs", self.title));
         }
         self.commit_pending()?;
+        let was = self.tab;
         self.tab = self
             .tabs
             .iter()
@@ -2478,6 +2536,15 @@ impl Dialog {
         self.calendar = None;
         if self.focused().is_none() {
             self.focus = None;
+        } else if self.tab != was
+            && self.takes_initial_focus()
+            && self.focused().is_some_and(|c| c.page.is_none())
+        {
+            // A top-row control stays drawn on every page, but the keys
+            // belong to the page now shown (#1314): typing a note must not
+            // go into the task's still-selected Name. A page with no control
+            // of its own (or the first page) keeps the top-row focus.
+            self.focus_own_page();
         }
         Ok(())
     }
@@ -2622,7 +2689,8 @@ impl DialogStack {
     pub fn depth(&self) -> usize {
         self.0.len()
     }
-    pub fn push(&mut self, dialog: Dialog) {
+    pub fn push(&mut self, mut dialog: Dialog) {
+        dialog.focus_on_open();
         self.0.push(dialog);
     }
     /// The dialog under the top one (a message box's parent).
@@ -2728,7 +2796,8 @@ impl DialogStack {
                 self.0.pop();
             }
             ButtonRole::Open(child) => {
-                let child = child.build(top);
+                let mut child = child.build(top);
+                child.focus_on_open();
                 self.0.push(child);
             }
             ButtonRole::Accept if depth > 1 && ChildDialog::writing_back(top.owner).is_some() => {
