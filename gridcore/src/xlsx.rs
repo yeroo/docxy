@@ -16668,6 +16668,18 @@ b",
     }
 
     #[test]
+    fn recommitting_the_same_formula_keeps_its_calc_flags() {
+        let rows =
+            r#"<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f ca="1">A1+1</f><v>2</v></c></row>"#;
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 1), Cell::formula("A1+1"));
+        let ws = saved_sheet1(&pkg);
+        assert_eq!(f_tag(&ws, "B1"), r#"<f ca="1">"#, "{ws}");
+    }
+
+    #[test]
     fn a_calc_flag_cell_still_recalculates() {
         let rows =
             r#"<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f ca="1">A1+1</f><v>2</v></c></row>"#;
