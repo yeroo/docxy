@@ -31,7 +31,9 @@ pub(crate) use clear::apply_clear;
 pub use clear::{ClearPlan, ClearWhat, apply_clear_sheet, clear_plan};
 pub use goto_special::{GoSpecial, NO_CELLS, Types, go_to_special, resolve_reference};
 mod series;
-pub use clip::{MAX_PASTE_CELLS, PASTE_SHAPE, move_refs, paste_tiles, tiled_block};
+pub use clip::{
+    MAX_PASTE_CELLS, PASTE_SHAPE, move_refs, move_refs_rules_stay, paste_tiles, tiled_block,
+};
 pub use series::{
     FillDir, FillKind, FillTarget, JUSTIFY_NUMBERS, JUSTIFY_OVERFLOW, SeriesSpec, SeriesType,
     builtin_lists, fill_down_to, fill_target, justify_lines, series_rows_for,

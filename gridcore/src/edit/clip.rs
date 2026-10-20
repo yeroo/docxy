@@ -155,6 +155,23 @@ pub fn move_refs(wb: &mut Workbook, src: usize, mv: &CellMove) -> bool {
     move_refs_with(wb, src, mv, |_, _| true, false)
 }
 
+/// [`move_refs`] for a host whose cut leaves the conditional-format rules'
+/// ranges where they are: a rule over cells of `mv.rect` keeps its formula
+/// (relative to its range, it keeps checking what it checked), as the data
+/// form's Delete leaves them; every other rule is re-pointed. Whether any
+/// formula was rewritten.
+pub fn move_refs_rules_stay(wb: &mut Workbook, src: usize, mv: &CellMove) -> bool {
+    let (r0, c0, r1, c1) = mv.rect;
+    let meets = |a: &Area| a.0 <= r1 && r0 <= a.2 && a.1 <= c1 && c0 <= a.3;
+    move_refs_with(
+        wb,
+        src,
+        mv,
+        |s, ranges| !(s == src && ranges.iter().any(meets)),
+        false,
+    )
+}
+
 /// Rewrite every formula in the workbook for the move `mv` of the cells in
 /// `mv.rect` on sheet `src`, as [`move_refs`] does, but of the
 /// conditional-format rules (and, with `validations`, the validation rules)
