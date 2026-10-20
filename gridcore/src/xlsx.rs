@@ -15002,20 +15002,25 @@ b",
         let rows = concat!(
             r#"<row r="1"><c r="C1"><f xml:space="preserve"> Sheet!A1</f><v>1</v></c>"#,
             r#"<c r="D1"><f xml:space="preserve">A1+1 </f><v>1</v></c>"#,
-            r#"<c r="E1"><f>A1 + 1</f><v>1</v></c></row>"#,
+            r#"<c r="E1"><f>A1 + 1</f><v>1</v></c>"#,
+            r#"<c r="F1"><f t="array" ref="F1" xml:space="preserve"> 1+1</f><v>2</v></c></row>"#,
         );
         let (re, ws) = resaved(&book_with_rows(rows));
         assert!(
             ws.contains(r#"<f xml:space="preserve"> Sheet!A1</f>"#),
             "{ws}"
         );
+        // An array `<f>` keeps its raw attributes: the attribute is not doubled.
+        let array_f = &ws[ws.find(r#"<c r="F1""#).unwrap()..];
+        let array_f = &array_f[..array_f.find("</f>").unwrap()];
+        assert_eq!(array_f.matches("xml:space").count(), 1, "{ws}");
         assert!(ws.contains(r#"<f xml:space="preserve">A1+1 </f>"#), "{ws}");
         assert!(ws.contains("<f>A1 + 1</f>"), "{ws}");
         assert_eq!(formula_at(&re, 0, 2), " Sheet!A1");
         assert_eq!(formula_at(&re, 0, 3), "A1+1 ");
         // A second save is stable and never doubles the attribute.
         let (_, ws2) = resaved(&re);
-        assert_eq!(ws2.matches("xml:space").count(), 2, "{ws2}");
+        assert_eq!(ws2.matches("xml:space").count(), 3, "{ws2}");
     }
 
     #[test]

@@ -13911,8 +13911,6 @@ mod tests {
         }
     }
 
-    // #972: a text result longer than a cell holds (32,767 UTF-16 units) is #VALUE!.
-
     #[test]
     fn spaced_translate_keeps_the_typed_spacing() {
         let sp = translate_formula_spaced;
@@ -13955,6 +13953,8 @@ mod tests {
         }
         assert_eq!(translate_formula_spaced("1+", 1, 0), None);
     }
+
+    // #972: a text result longer than a cell holds (32,767 UTF-16 units) is #VALUE!.
 
     #[test]
     fn concat_over_cell_limit_is_value_error() {
