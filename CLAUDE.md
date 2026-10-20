@@ -553,7 +553,8 @@
   No Later Than takes the earlier of demand and cap (a binding cap holds a
   milestone at the constraint's own instant), every other constraint is a
   floor the demand may pass, two instants on one working index compared as
-  instants; so
+  instants (a summary predecessor's demand and an undelayed milestone's
+  placed instant included); so
   a Start No Earlier Than, a cap, or another predecessor that still drives
   later absorbs the move and the task takes no delay
   (`Schedule::delay_driven` holds the start a stored delay was added to). A
@@ -567,8 +568,10 @@
   from, an inactive task's included, so a saved delay is not added twice. A
   delayed milestone's late bound keeps its predecessor's finish instant on an
   FS link only; on a start-type link the inverse walks the forward pass's
-  snap back, and a fixed successor's cap on its ALAP predecessors counts the
-  intervening tasks' stored delays. A
+  snap back, a fixed successor's cap on its ALAP predecessors counts the
+  intervening tasks' stored delays but never a summary successor's (the
+  forward pass applies no summary's), and an unlinked task's pre-start
+  window reaches its delayed start. A
   summary link's free-slack bound takes each successor's delay before the
   group's minimum; the timeline's horizon budgets stored delays; equal
   priorities level in readiness order.

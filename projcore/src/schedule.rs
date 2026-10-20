@@ -921,11 +921,17 @@ impl<'a> Scheduler<'a> {
             let Some(dates) = self.constraint_dates(t, false).filter(|d| d.clamped) else {
                 continue;
             };
+            // A stored delay (#1594 r12) puts the early start past the floor
+            // by that elapsed time: the window must reach it.
+            let delay = t
+                .leveling_delay
+                .filter(|d| *d > 0 && !self.schedulable_alap(t))
+                .map_or(0, |d| d / 10);
             let span = spans
                 .entry(self.calendar_uid(t))
                 .or_insert((i64::MAX, i64::MIN, 0));
             span.0 = span.0.min(dates.raw);
-            span.1 = span.1.max(dates.floor);
+            span.1 = span.1.max(dates.floor.saturating_add(delay));
             span.2 = span.2.max(self.scheduled_span(i));
         }
         spans
@@ -1333,7 +1339,9 @@ impl<'a> Scheduler<'a> {
     /// span on its own calendar (an elapsed subtraction from the finish
     /// would misbound an FF predecessor). Project 2024 reports zero slack on
     /// the FS predecessor of a task with a typed delay (measured over COM).
-    /// A fixed or ALAP successor carries no delay. `link` is the link the
+    /// A fixed or ALAP successor carries no delay, nor does a summary (the
+    /// forward pass applies no summary's; a manual summary is a fixed bound
+    /// `fixed` does not name, r12). `link` is the link the
     /// bound is for: a milestone keeps its predecessor's finish instant on a
     /// finish-to-start link only; on the others the forward pass snaps it
     /// to working time, and the inverse walks that snap back (r10).
@@ -1346,7 +1354,12 @@ impl<'a> Scheduler<'a> {
     ) -> (i64, i64) {
         let delay = successor
             .leveling_delay
-            .filter(|d| *d > 0 && !fixed(successor) && !self.schedulable_alap(successor))
+            .filter(|d| {
+                *d > 0
+                    && !fixed(successor)
+                    && !successor.summary
+                    && !self.schedulable_alap(successor)
+            })
             .map_or(0, |d| d / 10);
         if delay == 0 {
             return (sls, slf);
@@ -2042,9 +2055,10 @@ impl<'a> Scheduler<'a> {
             let (early, driven) = (tl.to_index(e_s), driven_es[&t.uid]);
             let late = late_tl.get(&t.uid);
             let mut total = match late {
-                // Unlinked, so nothing but the anchor drives its start.
+                // Unlinked, so nothing but the anchor drives its start, past
+                // which only a stored delay holds it.
                 Some(pre) => {
-                    debug_assert_eq!(early, driven);
+                    debug_assert!(early >= driven, "{early} < {driven}");
                     pre.to_index(l_s) - pre.to_index(e_s)
                 }
                 None => tl.to_index(l_s) - early.max(driven),
@@ -4227,7 +4241,9 @@ impl Scheduler<'_> {
                     let was = demand(was_offset, p.link, was_start, was_finish);
                     let now = demand(now_offset, p.link, now_start, now_finish);
                     Some(if pred_task.summary {
-                        let at = if tl.to_index(now) > tl.to_index(was) {
+                        // Never before the CPM demand; on one working index
+                        // the later instant (r12).
+                        let at = if (tl.to_index(now), now) > (tl.to_index(was), was) {
                             now
                         } else {
                             was
@@ -4392,6 +4408,13 @@ impl Scheduler<'_> {
                         .flatten()
                         .any(|p| self.leveled_span(p.uid, &graph, &start, &finish).is_some());
                     s_abs = self.releveled_milestone(t, tl, cpm, &graph, (&start, &finish), linked);
+                    // The demand the placement took, where it shares the
+                    // index: a start-type link's snapped morning after an FS
+                    // predecessor's evening, which the FS relevel alone would
+                    // miss (r12).
+                    if tl.to_index(driven_now_abs) == placed {
+                        s_abs = s_abs.max(driven_now_abs);
+                    }
                 } else if t.duration_min == 0 {
                     let mut fs_instant: Option<i64> = None;
                     let mut start_bound = cpm.early_start.minutes();
@@ -4428,6 +4451,9 @@ impl Scheduler<'_> {
                     // already carries the task's SNET/MSO start bounds.
                     if let Some(instant) = fs_instant {
                         s_abs = instant.max(start_bound);
+                    }
+                    if tl.to_index(driven_now_abs) == placed {
+                        s_abs = s_abs.max(driven_now_abs);
                     }
                 }
                 let bounds = graph
@@ -6283,6 +6309,24 @@ mod tests {
             assert!(b.total_slack_min >= 0, "middle_alap={middle_alap}");
             assert_eq!(sched.project_finish, at(13, 17));
         }
+    }
+
+    /// #1594 r12: a manual summary successor is a fixed bound whose stored
+    /// delay the forward pass never applies, so the cap on its ALAP
+    /// predecessor does not subtract it: A ends the day before the summary.
+    #[test]
+    fn a_manual_summary_successors_stored_delay_does_not_move_its_predecessors_cap() {
+        let mut a = task(1, "A", 480);
+        a.constraint = ConstraintType::AsLateAsPossible;
+        let mut s = msum(2, 1, at(6, 8), Some(at(6, 17)));
+        s.predecessors.push(fs(1));
+        s.leveling_delay = Some(1440 * 10);
+        s.leveling_delay_format = Some(8);
+        let sched = schedule(&march2(vec![a, s, task(4, "Long", 4800)]));
+        let a = sched.get(1).unwrap();
+        assert_eq!((a.early_start, a.early_finish), (at(5, 8), at(5, 17)));
+        let s = sched.get(2).unwrap();
+        assert_eq!((s.early_start, s.early_finish), (at(6, 8), at(6, 17)));
     }
 
     #[test]
@@ -9909,6 +9953,158 @@ mod tests {
                 "{constraint:?}"
             );
         }
+    }
+
+    /// #1594 r12: without a stored delay a milestone placed on its CPM index
+    /// keeps the instant the placement took. X (two days) and Q (one day)
+    /// share R1; A (two days, no resource) ends Tuesday 17:00 and drives M
+    /// finish-to-start, Q start-to-start. Q levels to Wednesday 08:00, the
+    /// later instant on M's index, so M is Wednesday 08:00 (not the FS
+    /// evening the relevel alone keeps), T (one hour, an elapsed hour after
+    /// M, R2) is 09:00, after held Y, with no delay; the committed plan
+    /// agrees.
+    #[test]
+    fn an_undelayed_milestone_keeps_the_later_link_instant_the_placement_took() {
+        let mut m = task(4, "M", 0);
+        m.predecessors = vec![fs(3), lag_link(2, LinkType::StartStart, 0, 8)];
+        let mut t = task(5, "T", 60);
+        t.predecessors
+            .push(lag_link(4, LinkType::FinishStart, 60, 8));
+        let mut y = task(6, "Y", 60);
+        y.constraint = ConstraintType::StartNoEarlierThan;
+        y.constraint_date = Some(at(4, 8));
+        let proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![
+                task(1, "X", 960),
+                task(2, "Q", 480),
+                task(3, "A", 960),
+                m,
+                t,
+                y,
+            ],
+            resources: vec![worker(1, "R1", 1.0), worker(2, "R2", 1.0)],
+            assignments: vec![
+                assign(1, 1, 1, 1.0),
+                assign(2, 2, 1, 1.0),
+                assign(5, 5, 2, 1.0),
+                assign(6, 6, 2, 1.0),
+            ],
+            ..Project::default()
+        };
+        assert_eq!(
+            schedule(&proj).get(4).unwrap().early_start,
+            at(3, 17),
+            "M before: Tuesday 17:00"
+        );
+        let movable: std::collections::HashSet<i32> = [2, 4, 5].into_iter().collect();
+        let lv = level_with(
+            &proj,
+            &LevelScope {
+                movable: Some(&movable),
+                ..LevelScope::default()
+            },
+        );
+        assert_eq!(lv.start(2), Some(at(4, 8)), "Q Wednesday");
+        assert_eq!(lv.start(4), Some(at(4, 8)), "M Wednesday 08:00");
+        assert_eq!(lv.start(5), Some(at(4, 9)), "T Wednesday 09:00");
+        assert_eq!(lv.delay_min(5), Some(0), "T takes no delay");
+        let mut written = proj.clone();
+        written.tasks[1].leveling_delay = Some(2880 * 10);
+        written.tasks[1].leveling_delay_format = Some(8);
+        let sched = schedule(&written);
+        assert_eq!(sched.get(4).unwrap().early_start, at(4, 8));
+        assert_eq!(sched.get(5).unwrap().early_start, at(4, 9));
+    }
+
+    /// #1594 r12: a summary predecessor's demand ties by instant too. X and
+    /// Q (one day each) share R1; summary S holds A (one day, Start No
+    /// Earlier Than Monday 08:00, start-to-finish after Q); M (a kept hour)
+    /// follows S; T (one hour, R2) follows M; Y (held, R2) holds Tuesday
+    /// 08:00. Q levels to Tuesday, so A's finish and S's become Tuesday
+    /// 08:00, one index with Monday 17:00 and the later instant: M is
+    /// Tuesday 09:00 in the leveler as in the committed plan, and T takes no
+    /// delay.
+    #[test]
+    fn a_summary_predecessors_later_finish_on_the_same_index_drives_the_demand() {
+        let mut a = task(4, "A", 480);
+        a.outline_level = 2;
+        a.constraint = ConstraintType::StartNoEarlierThan;
+        a.constraint_date = Some(at(2, 8));
+        a.predecessors
+            .push(lag_link(2, LinkType::StartFinish, 0, 8));
+        let mut m = task(5, "M", 0);
+        m.predecessors.push(fs(3));
+        m.leveling_delay = Some(60 * 10);
+        m.leveling_delay_format = Some(8);
+        let mut t = task(6, "T", 60);
+        t.predecessors.push(fs(5));
+        let mut y = task(7, "Y", 60);
+        y.constraint = ConstraintType::StartNoEarlierThan;
+        y.constraint_date = Some(at(3, 8));
+        let proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![task(1, "X", 480), task(2, "Q", 480), asum(3, 1), a, m, t, y],
+            resources: vec![worker(1, "R1", 1.0), worker(2, "R2", 1.0)],
+            assignments: vec![
+                assign(1, 1, 1, 1.0),
+                assign(2, 2, 1, 1.0),
+                assign(6, 6, 2, 1.0),
+                assign(7, 7, 2, 1.0),
+            ],
+            ..Project::default()
+        };
+        let before = schedule(&proj);
+        assert_eq!(
+            before.get(5).unwrap().early_start,
+            at(3, 8),
+            "M before: Monday 17:00 plus the hour"
+        );
+        let movable: std::collections::HashSet<i32> = [2, 4, 5, 6].into_iter().collect();
+        let lv = level_with(
+            &proj,
+            &LevelScope {
+                movable: Some(&movable),
+                ..LevelScope::default()
+            },
+        );
+        assert_eq!(lv.start(2), Some(at(3, 8)), "Q Tuesday");
+        assert_eq!(lv.start(5), Some(at(3, 9)), "M Tuesday 09:00");
+        assert_eq!(lv.start(6), Some(at(3, 9)), "T Tuesday 09:00");
+        assert_eq!(lv.delay_min(6), Some(0), "T takes no delay");
+        let mut written = proj.clone();
+        written.tasks[1].leveling_delay = Some(1440 * 10);
+        written.tasks[1].leveling_delay_format = Some(8);
+        let sched = schedule(&written);
+        assert_eq!(
+            sched.get(4).unwrap().early_finish,
+            at(3, 8),
+            "A ends Tuesday 08:00"
+        );
+        assert_eq!(sched.get(5).unwrap().early_start, at(3, 9));
+        assert_eq!(sched.get(6).unwrap().early_start, at(3, 9));
+    }
+
+    /// #1594 r12: a stored delay on an unlinked task whose Must Start On lies
+    /// before the project start: the early start is the floor plus the delay,
+    /// the pre-start window reaches it, and the slack counts it.
+    #[test]
+    fn a_stored_delay_on_an_unlinked_pre_start_constraint_counts_in_its_slack() {
+        let mut proj = unlinked_deadline(
+            ConstraintType::MustStartOn,
+            DateTime::from_ymd_hm(2026, 2, 27, 8, 0),
+            true,
+        );
+        proj.tasks[1].leveling_delay = Some(5 * 1440 * 10);
+        proj.tasks[1].leveling_delay_format = Some(8);
+        let r = *schedule(&proj).get(2).unwrap();
+        assert_eq!(
+            r.early_start,
+            at(9, 8),
+            "Monday 2 plus five elapsed days, snapped"
+        );
+        assert_eq!(r.late_start, DateTime::from_ymd_hm(2026, 2, 27, 8, 0));
+        assert_eq!(r.total_slack_min, -6 * 480);
     }
 
     /// #1594 r11: the floor comparison decides by instant where the links'
