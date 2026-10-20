@@ -18,7 +18,7 @@
 //! | `task.list` | `{fields?}` | `{count, tasks:[{uid, id, outline_number, name, level, manual, duration, start, finish, critical, …}]}` |
 //! | `task.get` | `{uid, fields?}` | one task |
 //! | `task.fields` | — | `{count, fields:[name…]}`: the field names `fields` can read |
-//! | `task.set` | `{uid, name?, duration?, level?, manual?, percent_complete?, priority?, deadline?, constraint?, task_type?, effort_driven?, notes?, milestone?, calendar?, ignore_resource_calendar?, wbs?, earned_value_method?, custom?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled). The Task Information fields (#1550): `percent_complete` 0–100, `priority` 0–1000, `deadline` a date (`YYYY-MM-DD`, the day's last working time, or `YYYY-MM-DDTHH:MM`) or `null`, `constraint` `{type, date?}` with the type `ASAP`/`ALAP`/`MSO`/`MFO`/`SNET`/`SNLT`/`FNET`/`FNLT`, `task_type` `fixed-units`/`fixed-duration`/`fixed-work`, `effort_driven` and `milestone` booleans, `notes` text (`\n` line breaks), `calendar` a base calendar's name or uid or `null`, `ignore_resource_calendar` a boolean, `wbs` text, `earned_value_method` `percent-complete`/`physical-percent-complete`. `custom` (#1554) is an object of Project custom field names to values as typed in the cell (`{"Text1": "Civil", "Flag3": true, "Date1": "2026-03-09", "Duration1": "3d", "Cost1": "$1,400", "Number1": null}`; `null` or `""` clears): the field needs a definition in the plan, a formula field is refused, a lookup-table field takes one of its values. Every argument is checked and all apply in one undo step, or none does |
+//! | `task.set` | `{uid, name?, duration?, level?, manual?, percent_complete?, actual_start?, actual_finish?, actual_duration?, remaining_duration?, priority?, deadline?, constraint?, task_type?, effort_driven?, notes?, milestone?, calendar?, ignore_resource_calendar?, wbs?, earned_value_method?, custom?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled). The Task Information fields (#1550): `percent_complete` 0–100, the Update Tasks fields (#1568) `actual_start` / `actual_finish` (a date as for `deadline`, an actual start taking the day's first working time and a finish its last, or `null` to clear) and `actual_duration` / `remaining_duration` (durations: setting one adjusts % Complete, the remaining duration also the task's duration; an actual finish completes the task; a `percent_complete` given with an actual finish date, `actual_duration` or `remaining_duration` must equal the % they make or is refused, and with only `actual_start` or a cleared finish it applies after them, a started task getting that share as its actual duration; a `duration` given with `remaining_duration` must equal the actual plus the remaining), `priority` 0–1000, `deadline` a date (`YYYY-MM-DD`, the day's last working time, or `YYYY-MM-DDTHH:MM`) or `null`, `constraint` `{type, date?}` with the type `ASAP`/`ALAP`/`MSO`/`MFO`/`SNET`/`SNLT`/`FNET`/`FNLT`, `task_type` `fixed-units`/`fixed-duration`/`fixed-work`, `effort_driven` and `milestone` booleans, `notes` text (`\n` line breaks), `calendar` a base calendar's name or uid or `null`, `ignore_resource_calendar` a boolean, `wbs` text, `earned_value_method` `percent-complete`/`physical-percent-complete`. `custom` (#1554) is an object of Project custom field names to values as typed in the cell (`{"Text1": "Civil", "Flag3": true, "Date1": "2026-03-09", "Duration1": "3d", "Cost1": "$1,400", "Number1": null}`; `null` or `""` clears): the field needs a definition in the plan, a formula field is refused, a lookup-table field takes one of its values. Every argument is checked and all apply in one undo step, or none does |
 //! | `task.add` | `{after?, name?, duration?}` | the new task (without `duration`, 1 day, estimated when the plan's `NewTasksEstimated` is; inserted `after` a task that a finish-to-start link joins to the next, it is linked into that chain when the plan's `Autolink` is on, as it is by default) |
 //! | `task.del` | `{uid}` | `{deleted, removed:[uid…]}` (a summary takes its subtree) |
 //! | `link.add` | `{uid, pred, type?, lag?}` | the updated task (`lag` uses Predecessors cell spellings such as `4h`, `2ed`, `50%`; other duration spellings such as `1 month` are read as working-days lags) |
@@ -621,6 +621,11 @@ fn task_reply(ed: &Editor, uid: i32, asked: Option<&[(String, Field)]>) -> Resul
 #[derive(Default)]
 struct TaskInfoArgs {
     percent_complete: Option<i32>,
+    /// The Update Tasks fields (#1568); `Some(None)` clears a date.
+    actual_start: Option<Option<DateTime>>,
+    actual_finish: Option<Option<DateTime>>,
+    actual_duration: Option<i64>,
+    remaining_duration: Option<i64>,
     priority: Option<i32>,
     /// `Some(None)` clears the deadline.
     deadline: Option<Option<DateTime>>,
@@ -641,6 +646,10 @@ struct TaskInfoArgs {
 impl TaskInfoArgs {
     fn any(&self) -> bool {
         self.percent_complete.is_some()
+            || self.actual_start.is_some()
+            || self.actual_finish.is_some()
+            || self.actual_duration.is_some()
+            || self.remaining_duration.is_some()
             || self.priority.is_some()
             || self.deadline.is_some()
             || self.constraint.is_some()
@@ -703,12 +712,31 @@ impl TaskInfoArgs {
                 day_start(proj, task, day)
             })
         };
-        let deadline = match args.get("deadline") {
-            None => None,
-            Some(Json::Null) => Some(None),
-            Some(Json::Str(s)) if s.trim().is_empty() => Some(None),
-            Some(Json::Str(s)) => Some(Some(stamp("deadline", s.trim(), true)?)),
-            Some(_) => return Err("'deadline' must be a date or null".into()),
+        // A date or null; an actual start is the day's first working time, an
+        // actual finish and a deadline its last.
+        let date_or_null =
+            |key: &str, ends_day: bool| -> Result<Option<Option<DateTime>>, String> {
+                match args.get(key) {
+                    None => Ok(None),
+                    Some(Json::Null) => Ok(Some(None)),
+                    Some(Json::Str(s)) if s.trim().is_empty() => Ok(Some(None)),
+                    Some(Json::Str(s)) => Ok(Some(Some(stamp(key, s.trim(), ends_day)?))),
+                    Some(_) => Err(format!("'{key}' must be a date or null")),
+                }
+            };
+        let deadline = date_or_null("deadline", true)?;
+        let actual_start = date_or_null("actual_start", false)?;
+        let actual_finish = date_or_null("actual_finish", true)?;
+        let duration_arg = |key: &str| -> Result<Option<i64>, String> {
+            args.get(key)
+                .map(|v| {
+                    let text = v
+                        .as_str()
+                        .ok_or_else(|| format!("'{key}' must be a duration"))?;
+                    parse_duration(text, proj)
+                        .ok_or_else(|| format!("Couldn't read {key} '{text}' ({DURATION_HINT})"))
+                })
+                .transpose()
         };
         let constraint = match args.get("constraint") {
             None => None,
@@ -815,6 +843,10 @@ impl TaskInfoArgs {
         };
         Ok(TaskInfoArgs {
             percent_complete: whole("percent_complete")?,
+            actual_start,
+            actual_finish,
+            actual_duration: duration_arg("actual_duration")?,
+            remaining_duration: duration_arg("remaining_duration")?,
             priority: whole("priority")?,
             deadline,
             constraint,
@@ -843,8 +875,50 @@ impl TaskInfoArgs {
         if let Some(on) = self.milestone {
             ed.set_milestone(uid, on)?;
         }
+        // A finish, an actual duration or a remaining duration derive
+        // % Complete; a start alone, or clearing the finish, leave it to
+        // `percent_complete`.
+        let derives = matches!(self.actual_finish, Some(Some(_)))
+            || self.actual_duration.is_some()
+            || self.remaining_duration.is_some();
+        // Moving both dates later: the start is checked against the stored
+        // finish, so the finish goes first.
+        let stored_finish = ed.project().task(uid).and_then(|t| t.actual_finish);
+        let finish_first = match (self.actual_start, self.actual_finish) {
+            (Some(Some(start)), Some(_)) => stored_finish.is_some_and(|f| start > f),
+            _ => false,
+        };
+        if finish_first && let Some(finish) = self.actual_finish {
+            ed.set_actual_finish(uid, finish)?;
+        }
+        if let Some(start) = self.actual_start {
+            ed.set_actual_start(uid, start)?;
+        }
+        if !finish_first && let Some(finish) = self.actual_finish {
+            ed.set_actual_finish(uid, finish)?;
+        }
+        if let Some(minutes) = self.actual_duration {
+            ed.set_actual_duration(uid, minutes)?;
+        }
+        if let Some(minutes) = self.remaining_duration {
+            ed.set_remaining_duration(uid, minutes)?;
+        }
         if let Some(p) = self.percent_complete {
-            ed.set_percent_complete(uid, p)?;
+            if derives {
+                // The actuals say how far the task is; a different
+                // percent_complete is a contradiction, never an override.
+                let now = ed.project().task(uid).and_then(|t| t.percent_complete);
+                if i32::from(now.unwrap_or(0)) != p {
+                    return Err(format!(
+                        "percent_complete {p} contradicts the actuals, which make it {}",
+                        now.unwrap_or(0)
+                    ));
+                }
+            } else {
+                // A started task keeps its actual and remaining duration at
+                // the percent's share of the duration; see the method.
+                ed.set_percent_complete_synced(uid, p)?;
+            }
         }
         if let Some(p) = self.priority {
             ed.set_priority(uid, p)?;
@@ -923,7 +997,18 @@ fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         if has_patch {
             ed.update_task(uid, patch)?;
         }
-        info.apply(ed, uid)
+        info.apply(ed, uid)?;
+        // A remaining duration sets the duration; a different one typed
+        // beside it is a contradiction.
+        if let (Some(typed), Some(_)) = (duration, info.remaining_duration) {
+            let now = ed.project().task(uid).map_or(typed.0, |t| t.duration_min);
+            if now != typed.0 {
+                return Err(format!(
+                    "'duration' contradicts 'remaining_duration', which makes the duration {now} minutes"
+                ));
+            }
+        }
+        Ok(())
     })?;
     task_reply(ed, uid, asked.as_deref())
 }
@@ -3043,6 +3128,223 @@ mod tests {
             assert!(!ed.dirty());
         }
     }
+    /// The Update Tasks fields (#1568), one undo step with the rest.
+    #[test]
+    fn task_set_takes_the_update_tasks_fields() {
+        let mut a = app();
+        let uid = add(&mut a, "Pour", "4d");
+        let set = |a: &mut Editor, extra: Vec<(&str, Json)>| {
+            let mut args = vec![("uid", Json::Num(uid as f64))];
+            args.extend(extra);
+            dispatch_editor(a, "task.set", &Json::obj(args)).unwrap()
+        };
+        let task = |a: &Editor| a.project().task(uid as i32).unwrap().clone();
+        let depth = a.undo_depth();
+        set(
+            &mut a,
+            vec![
+                ("actual_start", Json::Str("2026-03-02".into())),
+                ("actual_duration", Json::Str("2d".into())),
+                ("priority", Json::Num(700.0)),
+                ("percent_complete", Json::Num(50.0)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(a.undo_depth(), depth + 1);
+        let t = task(&a);
+        assert_eq!(
+            t.actual_start.map(|d| (d.parts().day, d.parts().hour)),
+            Some((2, 8))
+        );
+        assert_eq!(
+            (
+                t.actual_duration_min,
+                t.remaining_duration_min,
+                t.percent_complete,
+                t.priority
+            ),
+            (Some(960), Some(960), Some(50), Some(700))
+        );
+        // A conflicting percent_complete is refused, not overridden, and
+        // takes the other fields with it.
+        let before = a.project().clone();
+        let err = set(
+            &mut a,
+            vec![
+                ("priority", Json::Num(100.0)),
+                ("remaining_duration", Json::Str("1d".into())),
+                ("percent_complete", Json::Num(50.0)),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("contradicts"), "{err}");
+        assert_eq!(*a.project(), before);
+        // A bad remaining duration leaves the priority alone.
+        for bad in [Json::Str("soon".into()), Json::Num(3.0)] {
+            assert!(
+                set(
+                    &mut a,
+                    vec![("priority", Json::Num(100.0)), ("remaining_duration", bad)]
+                )
+                .is_err()
+            );
+            assert_eq!(*a.project(), before);
+        }
+        set(&mut a, vec![("remaining_duration", Json::Str("1d".into()))]).unwrap();
+        let t = task(&a);
+        assert_eq!((t.duration_min, t.percent_complete), (1440, Some(67)));
+        set(
+            &mut a,
+            vec![("actual_finish", Json::Str("2026-03-04".into()))],
+        )
+        .unwrap();
+        let t = task(&a);
+        assert_eq!(
+            t.actual_finish.map(|d| (d.parts().day, d.parts().hour)),
+            Some((4, 17))
+        );
+        assert_eq!(t.percent_complete, Some(100));
+        // null clears.
+        set(&mut a, vec![("actual_start", Json::Null)]).unwrap();
+        let t = task(&a);
+        assert_eq!(
+            (t.actual_start, t.actual_finish, t.percent_complete),
+            (None, None, Some(0))
+        );
+        set(&mut a, vec![("actual_start", Json::Str("later".into()))]).unwrap_err();
+        let fresh = add(&mut a, "Wall", "2d");
+        dispatch_editor(
+            &mut a,
+            "task.set",
+            &Json::obj(vec![
+                ("uid", Json::Num(fresh as f64)),
+                ("actual_start", Json::Str("2026-03-02".into())),
+                ("percent_complete", Json::Num(100.0)),
+            ]),
+        )
+        .unwrap()
+        .unwrap();
+        let w = a.project().task(fresh as i32).unwrap();
+        assert_eq!(
+            (
+                w.actual_duration_min,
+                w.remaining_duration_min,
+                w.percent_complete
+            ),
+            (Some(w.duration_min), Some(0), Some(100))
+        );
+
+        // A start alone leaves % Complete to percent_complete.
+        set(
+            &mut a,
+            vec![
+                ("actual_start", Json::Str("2026-03-02".into())),
+                ("percent_complete", Json::Num(50.0)),
+            ],
+        )
+        .unwrap();
+        let t = task(&a);
+        assert_eq!(
+            (t.percent_complete, t.actual_duration_min),
+            (Some(50), Some(t.duration_min / 2)),
+            "the recorded actual follows the percent"
+        );
+        let err = set(
+            &mut a,
+            vec![
+                ("actual_start", Json::Str("2026-03-03".into())),
+                ("percent_complete", Json::Num(0.0)),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("more than 0%"), "{err}");
+        // Both dates moved later in one call.
+        set(
+            &mut a,
+            vec![("actual_finish", Json::Str("2026-03-04".into()))],
+        )
+        .unwrap();
+        set(
+            &mut a,
+            vec![
+                ("actual_start", Json::Str("2026-03-09".into())),
+                ("actual_finish", Json::Str("2026-03-10".into())),
+            ],
+        )
+        .unwrap();
+        let t = task(&a);
+        assert_eq!(
+            (
+                t.actual_start.map(|d| d.parts().day),
+                t.actual_finish.map(|d| d.parts().day)
+            ),
+            (Some(9), Some(10))
+        );
+        // A finished task cleared to 50 %: its actual is 50 % of the duration.
+        set(
+            &mut a,
+            vec![("actual_finish", Json::Str("2026-03-10".into()))],
+        )
+        .unwrap();
+        set(
+            &mut a,
+            vec![
+                ("actual_finish", Json::Null),
+                ("percent_complete", Json::Num(50.0)),
+            ],
+        )
+        .unwrap();
+        let t = task(&a);
+        assert_eq!(
+            (
+                t.percent_complete,
+                t.actual_duration_min,
+                t.remaining_duration_min
+            ),
+            (
+                Some(50),
+                Some(t.duration_min / 2),
+                Some(t.duration_min - t.duration_min / 2)
+            )
+        );
+        // 100 % on a started task completes its actual duration, with no finish.
+        set(&mut a, vec![("percent_complete", Json::Num(100.0))]).unwrap();
+        let t = task(&a);
+        assert_eq!(
+            (
+                t.actual_duration_min,
+                t.remaining_duration_min,
+                t.actual_finish
+            ),
+            (Some(t.duration_min), Some(0), None)
+        );
+        // The same 50 % again, with the duration made longer first: the
+        // actual follows the new duration.
+        set(
+            &mut a,
+            vec![
+                ("duration", Json::Str("8d".into())),
+                ("percent_complete", Json::Num(50.0)),
+            ],
+        )
+        .unwrap();
+        let t = task(&a);
+        assert_eq!((t.duration_min, t.actual_duration_min), (3840, Some(1920)));
+        // A duration beside a remaining duration must agree with it.
+        set(&mut a, vec![("actual_finish", Json::Null)]).unwrap();
+        let before = a.project().clone();
+        let err = set(
+            &mut a,
+            vec![
+                ("duration", Json::Str("9d".into())),
+                ("remaining_duration", Json::Str("1d".into())),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("contradicts"), "{err}");
+        assert_eq!(*a.project(), before);
+    }
+
     /// The Task Information fields (#1550): every argument applies in the
     /// one undo step, and a refused one undoes them all.
     #[test]

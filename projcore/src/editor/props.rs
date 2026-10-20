@@ -6,6 +6,8 @@
 //! when the value is already the task's.
 use super::*;
 
+mod actuals;
+
 /// Project's earned value methods (MSPDI `EarnedValueMethod`).
 pub const EV_PERCENT_COMPLETE: i32 = 0;
 pub const EV_PHYSICAL_PERCENT_COMPLETE: i32 = 1;
@@ -37,16 +39,16 @@ impl Editor {
         if task.summary {
             return Err("Summary % Complete is computed from its subtasks".into());
         }
-        // The task's actuals say how far it is: a lower value would contradict
-        // them.
+        if task.percent_complete.unwrap_or(0) == percent {
+            return Ok(false);
+        }
+        // The task's actuals say how far it is: a different value would
+        // contradict them.
         if task.actual_finish.is_some() && percent < 100 {
             return Err("The task has an actual finish, so it is 100% complete".into());
         }
         if task.actual_start.is_some() && percent == 0 {
             return Err("The task has an actual start, so it is more than 0% complete".into());
-        }
-        if task.percent_complete.unwrap_or(0) == percent {
-            return Ok(false);
         }
         self.snapshot();
         self.proj.tasks[i].percent_complete = Some(percent);
@@ -282,5 +284,7 @@ impl Editor {
     }
 }
 
+#[cfg(test)]
+mod actuals_tests;
 #[cfg(test)]
 mod tests;

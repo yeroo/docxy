@@ -59,11 +59,14 @@ fn percent_complete_cannot_contradict_the_actuals() {
         Editor::new(proj)
     };
     let mut started = with(Some(day), None);
+    // Asked for the 0 % it already has: nothing to change (#1568). Lowering
+    // a started task to 0 % is the refusal.
+    assert_eq!(started.set_percent_complete(2, 0), Ok(false));
+    assert_eq!(started.set_percent_complete(2, 10), Ok(true));
     assert!(
         started.set_percent_complete(2, 0).is_err(),
         "started, not 0%"
     );
-    assert_eq!(started.set_percent_complete(2, 10), Ok(true));
     let mut finished = with(Some(day), Some(day));
     assert!(
         finished.set_percent_complete(2, 50).is_err(),
