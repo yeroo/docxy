@@ -570,7 +570,7 @@ pub fn refresh_pivots(wb: &mut Workbook) -> RefreshOutcome {
                 };
                 if value.is_empty() && style == 0 {
                     // A vacated output cell: the engine's, not a pin.
-                    sheet.cells.remove(&(r, c));
+                    sheet.clear_cell_unpinned(r, c);
                 } else {
                     sheet.set_cell(
                         r,
