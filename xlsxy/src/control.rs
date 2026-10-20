@@ -7608,13 +7608,17 @@ mod table_verb_tests {
     }
 
     #[test]
-    fn col_insert_inside_a_table_renames_nothing_683() {
+    fn col_insert_inside_a_table_widens_it_and_renames_nothing_683() {
         let mut a = app_683("Sales", &["Item", "Qty", "Price", "Region"], 4);
         put(&mut a, "F2", "=SUM(Sales[Price])");
         put(&mut a, "G2", "=COUNTA(Sales[Region])");
         let args = Json::obj(vec![("at", Json::Num(2.0))]);
         dispatch(&mut a, "col.insert", &args).unwrap();
-        assert_eq!(table_columns(&mut a), ["Item", "Qty", "Price", "Region"]);
+        // #991 p1: the table widens, the new column named `Column<n>`.
+        assert_eq!(
+            table_columns(&mut a),
+            ["Item", "Qty", "Column3", "Price", "Region"]
+        );
         assert_eq!(
             formula_value(&mut a, "G2").0.as_deref(),
             Some("=SUM(Sales[Price])")
