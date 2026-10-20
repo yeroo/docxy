@@ -987,7 +987,7 @@ impl Stories {
             let Some(xml) = pkg.part_text(part) else {
                 continue;
             };
-            let (out, n) = strip_markers_in_part(&xml);
+            let (out, n) = strip_comment_markers_in_part(&xml, None);
             if n > 0 {
                 pkg.set_part_text(part, &out);
                 removed += n;
@@ -1066,7 +1066,7 @@ pub fn count_story_blocks(blocks: &[Block], styles: Option<&StyleSheet>) -> Stor
 /// `xml` (a whole part) without its comment markers, and how many there
 /// were: those of the comments `only` names, or every comment's when it is
 /// `None`. A run a marker leaves holding only its `w:rPr` goes too.
-pub fn strip_comment_markers_in_part(xml: &str, only: Option<&[&str]>) -> (String, usize) {
+fn strip_comment_markers_in_part(xml: &str, only: Option<&[&str]>) -> (String, usize) {
     const RUN_END: &str = "</w:r>";
     let mut out = xml.to_string();
     let mut removed = 0;
@@ -1107,14 +1107,10 @@ pub fn strip_comment_markers_in_part(xml: &str, only: Option<&[&str]>) -> (Strin
     (out, removed)
 }
 
-fn strip_markers_in_part(xml: &str) -> (String, usize) {
-    strip_comment_markers_in_part(xml, None)
-}
-
-/// A story part [`Stories::strip_comment_markers`] changed (or a host
-/// stripped itself with [`strip_comment_markers_in_part`]): its text before
-/// and after, and the comments whose markers went. A host keeps it to put
-/// the markers back when an undo brings the comments back.
+/// A story part [`StrippedPart::strip`] or [`Stories::strip_comment_markers`]
+/// changed: its text before and after, and the comments whose markers went.
+/// A host keeps it to put the markers back when an undo brings the comments
+/// back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StrippedPart {
     pub part: String,
@@ -1143,6 +1139,14 @@ impl StrippedPart {
             after,
             ids,
         })
+    }
+
+    /// The markers of comments `only` are gone from the part for good (a
+    /// strip nobody can undo): take them out of both texts too, so the
+    /// record still matches the part as it is now.
+    pub fn forget(&mut self, only: &[&str]) {
+        self.before = strip_comment_markers_in_part(&self.before, Some(only)).0;
+        self.after = strip_comment_markers_in_part(&self.after, Some(only)).0;
     }
 
     /// Put the markers back, but only while the part is as the strip left
@@ -2385,6 +2389,34 @@ mod tests {
             pkg.part_text("word/header1.xml")
                 .unwrap()
                 .ends_with("<!-- edited -->")
+        );
+    }
+
+    /// #981: a strip nobody can undo, applied to a recorded one, keeps its
+    /// guard: the part is still as the record says, and a restore leaves
+    /// the forgotten comment's markers out.
+    #[test]
+    fn forgetting_a_comment_keeps_a_recorded_strip_restorable() {
+        let mut pkg = storied_docx();
+        let header = pkg.part_text("word/header1.xml").unwrap();
+        let two = header.replace(
+            "<w:r><w:rPr><w:vanish/>",
+            "<w:commentRangeStart w:id=\"5\"/><w:commentRangeEnd w:id=\"5\"/>\
+             <w:r><w:commentReference w:id=\"5\"/></w:r><w:r><w:rPr><w:vanish/>",
+        );
+        pkg.set_part_text("word/header1.xml", &two);
+        let mut kept = StrippedPart::strip(&mut pkg, "word/header1.xml", Some(&["3"])).unwrap();
+        // Comment 5 goes for good.
+        StrippedPart::strip(&mut pkg, "word/header1.xml", Some(&["5"])).unwrap();
+        kept.forget(&["5"]);
+        assert!(kept.restore(&mut pkg));
+        let now = pkg.part_text("word/header1.xml").unwrap();
+        assert_eq!(
+            comment_marker_ids_in_xml(&now)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["3"],
+            "{now}"
         );
     }
 

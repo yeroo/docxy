@@ -1249,4 +1249,23 @@ mod tests {
         let id = crate::add_doc_comment(&mut tab, "new".into(), ("Jo".into(), "J".into()));
         assert_eq!(id, Some(5));
     }
+
+    /// #981 FIX r1: a converted tab saved while a comment is deleted rebases
+    /// on a package without the header's markers; the undo still brings them
+    /// back with the comment.
+    #[test]
+    fn converted_tab_delete_save_undo_save_restores_the_header_markers() {
+        let (path, mut tab) = open_parts("hf-converted", &shared_parts());
+        tab.access.converted = Some(crate::open_mode::Converted::Rtf);
+        crate::delete_doc_comment(&mut tab, "3");
+        let path = path.with_file_name("converted.docx");
+        assert!(save_doc_tab(&mut tab, Some(path.clone())), "{}", tab.status);
+        assert_eq!(saved_ids(&path, "word/header1.xml"), 0);
+        assert!(tab.access.converted.is_none(), "now that Word document");
+        undo(&mut tab);
+        assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+        assert_eq!(saved_ids(&path, "word/header1.xml"), 3);
+        assert_eq!(saved_ids(&path, "word/document.xml"), 3);
+        assert!(part(&path, "word/comments.xml").contains(">head<"));
+    }
 }

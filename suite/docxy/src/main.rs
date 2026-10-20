@@ -13349,6 +13349,17 @@ fn add_doc_comment(tab: &mut DocTab, text: String, identity: (String, String)) -
 /// ([`save_base`]), and come back with the body's.
 fn delete_doc_comment(tab: &mut DocTab, id: &str) {
     tab.comment_undo.keep_raw(tab.pkg.as_ref(), id);
+    // A converted tab's first save rebases it on the package it wrote, with
+    // the markers [`save_base`] left out of that copy; so it keeps them
+    // here instead, as Remove All does, for the undo to put back.
+    if tab.access.converted.is_some() {
+        if let (Surface::Doc(ed), Some(pkg)) = (&tab.surface, tab.pkg.as_mut()) {
+            let editing = tab.hf_edit.as_ref().map(|h| h.part_name.as_str());
+            let stories = docxcore::inspect::Stories::new(pkg, &ed.doc);
+            let taken = stories.strip_comment_markers(pkg, Some(&[id]), editing);
+            tab.comment_undo.stripped.extend(taken);
+        }
+    }
     if let Surface::Doc(ed) = &mut tab.surface {
         ed.remove_comment_markers(id);
     }

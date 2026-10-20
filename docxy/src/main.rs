@@ -3384,20 +3384,39 @@ impl App {
 
     /// Take the markers of comments `ids` out of the stored header and
     /// footer parts; `record` keeps what was taken for an undo
-    /// ([`App::stripped_hf`]), else they are gone for good.
+    /// ([`App::stripped_hf`]). Without it they are gone for good, which the
+    /// recorded strips of those parts take in (`forget`), so they still
+    /// match the part and an undo does not bring these back.
     fn strip_stored_hf(&mut self, ids: &[&str], record: bool) {
         if ids.is_empty() {
             return;
         }
+        let mut changed = false;
         for name in self.stored_hf_parts() {
-            if let Some(taken) =
+            let Some(taken) =
                 docxcore::inspect::StrippedPart::strip(&mut self.pkg, &name, Some(ids))
-            {
-                if record {
-                    self.stripped_hf.push(taken);
+            else {
+                continue;
+            };
+            changed = true;
+            if record {
+                self.stripped_hf.push(taken);
+            } else {
+                for earlier in self.stripped_hf.iter_mut().filter(|e| e.part == name) {
+                    earlier.forget(ids);
                 }
             }
         }
+        if changed {
+            self.rederive_page_parts();
+        }
+    }
+
+    /// The page view's and the header editor's copy of the headers and
+    /// footers, read from `pkg` again after a strip or restore changed it.
+    fn rederive_page_parts(&mut self) {
+        self.page_parts_sect.clear();
+        self.sync_page_parts();
     }
 
     /// Follow the body's undo and redo in the stored header and footer
@@ -3414,15 +3433,19 @@ impl App {
         let editing = self.hf_edit.as_ref().map(|hf| hf.part.clone());
         let anchored =
             |t: &docxcore::inspect::StrippedPart| t.ids.iter().all(|id| anchor.contains(id));
+        let mut changed = false;
         for taken in self.stripped_hf.iter().rev() {
             if Some(&taken.part) != editing.as_ref() && anchored(taken) {
-                taken.restore(&mut self.pkg);
+                changed |= taken.restore(&mut self.pkg);
             }
         }
         for taken in &self.stripped_hf {
             if Some(&taken.part) != editing.as_ref() && !anchored(taken) {
-                taken.restrip(&mut self.pkg);
+                changed |= taken.restrip(&mut self.pkg);
             }
+        }
+        if changed {
+            self.rederive_page_parts();
         }
     }
 
@@ -3564,9 +3587,11 @@ impl App {
 
     /// Delete the navigation-selected comment: its markers (one undo step)
     /// and its panel entry. Its record stays, tracked, so the save leaves it
-    /// out and an undo brings it back whole (#971); one with markers left
-    /// in a header or footer not being edited is removed from `pkg` now,
-    /// as before, since nothing could take those markers.
+    /// out and an undo brings it back whole (#971). Its markers in the
+    /// headers and footers not being edited are taken too, and come back
+    /// with the body's undo ([`App::sync_stripped_hf`]); a comment anchored
+    /// only in such a part has no step to undo, so it is removed from `pkg`
+    /// now.
     fn delete_comment(&mut self) {
         if self.comments.is_empty() {
             self.status = Some("No comments to delete".to_string());
@@ -3670,8 +3695,8 @@ impl App {
             .map(|c| c.id.as_str())
             .filter(|id| stored.contains(*id))
             .partition(|id| anchored.contains(*id));
-        self.strip_stored_hf(&kept, true);
         self.strip_stored_hf(&gone, false);
+        self.strip_stored_hf(&kept, true);
         for (idx, c) in comments.iter().enumerate() {
             let outright = stored.contains(&c.id) && !anchored.contains(&c.id);
             self.keep_deleted_comment(c, idx, outright);
@@ -14247,6 +14272,12 @@ mod tests {
             &open[tag_end..]
         );
         assert!(app.pkg.set_part_text(&part, &marked));
+        // As the file opens: the page view reads the header with its markers.
+        let mut pkg = app.pkg.clone();
+        pkg.document = app.body_editor().doc.clone();
+        let mut app = App::new(pkg, "test.docx", false);
+        app.os_clip = None;
+        assert!(app.header_part.is_some(), "the header is referenced");
         app
     }
 
@@ -14335,6 +14366,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         assert!(!header.contains("w:id=\"9\""), "{header}");
         assert!(!comments.contains("in the header"), "{comments}");
+    }
+
+    /// [`with_header_markers`] with comment 9 (Cy) anchored in the header
+    /// only, listed and written in comments.xml.
+    fn with_header_only_comment(app: App, ids: &[&str]) -> App {
+        let mut app = with_header_markers(app, ids);
+        app.comments.push(docxcore::comments::Comment {
+            id: "9".into(),
+            author: "Cy".into(),
+            ..Default::default()
+        });
+        app.pkg
+            .add_comment(9, "Cy", "C", "2020-01-02T03:04:05Z", "in the header");
+        app
+    }
+
+    /// #981 FIX r1: Delete All with a header holding a body-anchored comment
+    /// and a header-only one: undo brings the first one's markers back, the
+    /// second stays gone, and redo takes the first's again.
+    #[test]
+    fn delete_all_with_a_header_only_comment_still_restores_the_other() {
+        let mut app = with_header_only_comment(app_with_rich_comments(2), &["1", "9"]);
+        app.run_act(ribbon::Act::DeleteAllComments);
+        let path = save_to_temp(&mut app, "cmt-hf-mixed-all");
+        assert!(!saved_header(&app, &path).contains("comment"));
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(comment_ids(&app), ["1", "2"]);
+        app.save();
+        let header = saved_header(&app, &path);
+        assert_eq!(header.matches("w:id=\"1\"").count(), 3, "{header}");
+        assert!(!header.contains("w:id=\"9\""), "{header}");
+        app.on_key(ctrl(KeyCode::Char('y')));
+        app.save();
+        let header = saved_header(&app, &path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert!(!header.contains("comment"), "{header}");
+    }
+
+    /// #981 FIX r1: the same across two Delete Comments: the header-only one
+    /// goes second, and the first one's undo still finds its part as recorded.
+    #[test]
+    fn deleting_a_header_only_comment_after_another_keeps_the_first_restorable() {
+        let mut app = with_header_only_comment(app_with_rich_comments(2), &["1", "9"]);
+        app.comment_sel = 0;
+        app.run_act(ribbon::Act::DeleteComment);
+        assert_eq!(comment_ids(&app), ["2", "9"]);
+        app.comment_sel = 1;
+        app.run_act(ribbon::Act::DeleteComment);
+        assert_eq!(comment_ids(&app), ["2"]);
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(comment_ids(&app), ["1", "2"]);
+        let path = save_to_temp(&mut app, "cmt-hf-mixed-two");
+        let header = saved_header(&app, &path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert_eq!(header.matches("w:id=\"1\"").count(), 3, "{header}");
+        assert!(!header.contains("w:id=\"9\""), "{header}");
+    }
+
+    /// #981 FIX r1: editing the header after Delete Comment starts from the
+    /// part as stripped, so the markers do not come back with the edit.
+    #[test]
+    fn editing_a_header_after_delete_comment_does_not_bring_the_markers_back() {
+        let mut app = with_header_only_comment(app_with_rich_comments(2), &["1", "9"]);
+        app.comment_sel = 0;
+        app.run_act(ribbon::Act::DeleteComment);
+        app.comment_sel = 1;
+        app.run_act(ribbon::Act::DeleteComment);
+        app.run_act(ribbon::Act::EditHeader);
+        for c in "More".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.run_act(ribbon::Act::EditDocument);
+        assert_eq!(comment_ids(&app), ["2"], "no comment came back");
+        let path = save_to_temp(&mut app, "cmt-hf-edit-after");
+        let header = saved_header(&app, &path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert!(header.contains("More"), "{header}");
+        assert!(
+            !header.contains("w:id=\"1\"") && !header.contains("w:id=\"9\""),
+            "{header}"
+        );
     }
 
     /// #981: deleting while header A is edited leaves that editor's own
