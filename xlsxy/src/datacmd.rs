@@ -389,6 +389,9 @@ impl App {
     /// Sort what is selected, or the list around the cursor. A selection
     /// inside a wider list asks first (the Sort Warning prompt).
     fn sort_flow(&mut self, levels: Vec<SortLevel>, mut opts: SortOptions, header: Option<bool>) {
+        if self.refuse_protected_sheet() {
+            return;
+        }
         let si = self.sheet;
         let sel = self.selection();
         let wb = &self.pkg.workbook;
@@ -443,6 +446,9 @@ impl App {
         let Some(p) = self.pending_sort.take() else {
             return;
         };
+        if self.refuse_protected_sheet() {
+            return;
+        }
         let mut opts = p.opts;
         let area = match text.trim().to_lowercase().chars().next() {
             Some('e') => {

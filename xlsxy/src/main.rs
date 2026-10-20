@@ -2839,6 +2839,17 @@ impl App {
         self.sheet().is_protected()
     }
 
+    /// The edit guard of a command that writes or moves cells (not
+    /// Protected View's `refuse_protected`): on a protected active sheet it
+    /// says why and returns true, and the caller changes nothing (#833).
+    fn refuse_protected_sheet(&mut self) -> bool {
+        if !self.protected() {
+            return false;
+        }
+        self.status = Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+        true
+    }
+
     /// Toggle protection on the active sheet. Goes through `structural` so it's
     /// undoable; protecting uses Excel's default flag set. It moves no cells,
     /// so a pending cut stays a cut: a paste refused on a protected sheet
@@ -4510,6 +4521,9 @@ impl App {
     // --- clipboard -----------------------------------------------------------
 
     fn copy(&mut self, cut: bool) {
+        if cut && self.refuse_protected_sheet() {
+            return;
+        }
         let (r1, c1, r2, c2) = self.iter_selection();
         let sheet = self.sheet();
         let mut rows = Vec::new();
@@ -6888,7 +6902,11 @@ impl App {
             DeleteCol => self.col_op(false),
             SortAsc => self.quick_sort(true),
             SortDesc => self.quick_sort(false),
-            CustomSort => self.open_prompt(PromptKind::SortKeys),
+            CustomSort => {
+                if !self.refuse_protected_sheet() {
+                    self.open_prompt(PromptKind::SortKeys);
+                }
+            }
             AutoSum => self.autosum(),
             InsertChart(kind) => self.insert_chart(kind),
             AddSheet => self.open_prompt(PromptKind::AddSheet),
@@ -8307,6 +8325,9 @@ impl App {
     /// directly above (else to the left).
     fn autosum(&mut self) {
         use gridcore::sheet::{Cell, CellValue, cell_name};
+        if self.refuse_protected_sheet() {
+            return;
+        }
         let s = self.sheet;
         let (r, c) = self.cur;
         let range = {
@@ -8351,6 +8372,9 @@ impl App {
     /// Data › Text to Columns: the Convert Text to Columns Wizard over the
     /// selected column. More than one column is refused, as Excel does.
     fn open_text_to_columns(&mut self) {
+        if self.refuse_protected_sheet() {
+            return;
+        }
         let src = match gridcore::edit::TtcSource::new(self.sheet, self.selection()) {
             Ok(src) => src,
             Err(msg) => {
@@ -8482,6 +8506,9 @@ impl App {
     /// (header-aware), keeping the first occurrence.
     fn remove_duplicates(&mut self) {
         use gridcore::sheet::CellValue;
+        if self.refuse_protected_sheet() {
+            return;
+        }
         let s = self.sheet;
         let sc = self.cur.1;
         let cur_r = self.cur.0;
@@ -8737,6 +8764,9 @@ impl App {
     /// Subtotal…: the dialog over the region around the cursor, grouping at
     /// the cursor's column, with its numeric columns checked.
     fn subtotal(&mut self) {
+        if self.refuse_protected_sheet() {
+            return;
+        }
         let (r, c) = self.cur;
         let sh = self.sheet();
         let Some((area, header)) = gridcore::edit::subtotal_region(sh, r, c) else {
@@ -18738,6 +18768,171 @@ mod tests {
             .collect();
         app.apply_on(0, changes);
         app
+    }
+
+    /// #833: a protected sheet with a data column A1:A4 (Hdr, 3, 1, 1)
+    /// and a number run for AutoSum, plus an earlier Copy on the clip.
+    fn guarded_app() -> App {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        let sh = &mut app.pkg.workbook.sheets[0];
+        sh.set_cell(0, 0, Cell::text("Hdr"));
+        for (i, n) in [3.0, 1.0, 1.0].iter().enumerate() {
+            sh.set_cell(i as u32 + 1, 0, Cell::number(*n));
+        }
+        sh.set_cell(1, 1, Cell::number(7.0));
+        app.rebuild_engine();
+        app.cur = (3, 0);
+        app.anchor = None;
+        clip_range(&mut app, (1, 1), (1, 1), false);
+        app.modified = false;
+        app.pkg.workbook.sheets[0].set_protected(true);
+        app.status = None;
+        app
+    }
+
+    fn cells_dump(app: &App) -> String {
+        let sh = app.sheet();
+        let mut out = String::new();
+        for r in 0..8 {
+            for c in 0..4 {
+                out.push_str(&format!("{:?}|", sh.cell(r, c)));
+            }
+        }
+        out
+    }
+
+    /// Run `f` on a protected sheet: nothing changes, no undo step, the
+    /// protected status shows.
+    fn assert_sheet_refused(f: impl FnOnce(&mut App)) {
+        let mut app = guarded_app();
+        let before = cells_dump(&app);
+        let undo_len = app.undo.len();
+        f(&mut app);
+        assert_eq!(cells_dump(&app), before);
+        assert_eq!(app.undo.len(), undo_len);
+        assert!(!app.modified);
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+        assert!(app.text_dialog.is_none());
+        assert!(app.outline_dialog.is_none());
+        assert!(app.prompt.is_none());
+        assert!(app.pending_sort.is_none());
+    }
+
+    #[test]
+    fn cut_is_refused_on_a_protected_sheet_and_keeps_the_clip() {
+        assert_sheet_refused(|app| {
+            let clip = app.clip.as_ref().map(|c| (c.from, c.cut));
+            app.anchor = Some((1, 0));
+            app.ribbon_act(ribbon::Act::Cut);
+            assert_eq!(app.clip.as_ref().map(|c| (c.from, c.cut)), clip);
+            assert_eq!(clip, Some(((1, 1), false)));
+        });
+    }
+
+    #[test]
+    fn refused_cut_leaves_no_cut_to_paste_after_unprotecting() {
+        let mut app = guarded_app();
+        app.cur = (1, 0);
+        app.copy(true);
+        app.toggle_protection();
+        app.cur = (6, 2);
+        app.paste();
+        // The earlier copy of B2 (7) pastes; the source stays.
+        assert_eq!(
+            app.sheet().cell(6, 2).map(|c| c.value.clone()),
+            Some(CellValue::Number(7.0))
+        );
+        assert_eq!(
+            app.sheet().cell(1, 1).map(|c| c.value.clone()),
+            Some(CellValue::Number(7.0))
+        );
+        assert_eq!(
+            app.sheet().cell(1, 0).map(|c| c.value.clone()),
+            Some(CellValue::Number(3.0))
+        );
+    }
+
+    #[test]
+    fn copy_still_works_on_a_protected_sheet() {
+        let mut app = guarded_app();
+        app.cur = (1, 0);
+        app.copy(false);
+        assert_eq!(app.status.as_deref(), Some("Copied"));
+    }
+
+    #[test]
+    fn autosum_is_refused_on_a_protected_sheet() {
+        assert_sheet_refused(|app| app.ribbon_act(ribbon::Act::AutoSum));
+    }
+
+    #[test]
+    fn remove_duplicates_is_refused_on_a_protected_sheet() {
+        assert_sheet_refused(|app| app.ribbon_act(ribbon::Act::RemoveDuplicates));
+    }
+
+    #[test]
+    fn text_to_columns_does_not_open_on_a_protected_sheet() {
+        assert_sheet_refused(|app| app.ribbon_act(ribbon::Act::TextToColumns));
+    }
+
+    #[test]
+    fn subtotal_does_not_open_on_a_protected_sheet() {
+        assert_sheet_refused(|app| app.ribbon_act(ribbon::Act::Subtotal));
+    }
+
+    #[test]
+    fn sort_is_refused_on_a_protected_sheet() {
+        assert_sheet_refused(|app| app.ribbon_act(ribbon::Act::SortAsc));
+        assert_sheet_refused(|app| app.ribbon_act(ribbon::Act::SortDesc));
+        assert_sheet_refused(|app| app.commit_sort_text("A asc"));
+    }
+
+    #[test]
+    fn custom_sort_does_not_open_on_a_protected_sheet() {
+        assert_sheet_refused(|app| app.ribbon_act(ribbon::Act::CustomSort));
+    }
+
+    #[test]
+    fn sort_warning_answer_is_refused_on_a_protected_sheet() {
+        let mut app = guarded_app();
+        app.pending_sort = Some(datacmd::PendingSort {
+            selection: (1, 0, 2, 0),
+            region: (0, 0, 3, 0),
+            region_header: true,
+            levels: Vec::new(),
+            opts: Default::default(),
+            header_given: false,
+        });
+        let before = cells_dump(&app);
+        app.answer_sort_warning("e");
+        assert_eq!(cells_dump(&app), before);
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+    }
+
+    #[test]
+    fn unprotected_sheet_runs_the_guarded_commands() {
+        let mut app = guarded_app();
+        app.toggle_protection();
+        app.cur = (3, 0);
+        app.ribbon_act(ribbon::Act::AutoSum);
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.starts_with("AutoSum"))
+        );
+        app.ribbon_act(ribbon::Act::TextToColumns);
+        assert!(app.text_dialog.is_some());
+        app.text_dialog = None;
+        app.ribbon_act(ribbon::Act::Subtotal);
+        assert!(app.outline_dialog.is_some());
+        app.outline_dialog = None;
+        app.ribbon_act(ribbon::Act::CustomSort);
+        assert!(app.prompt.is_some());
+        app.prompt = None;
+        app.cur = (1, 0);
+        app.copy(true);
+        assert_eq!(app.status.as_deref(), Some("Cut"));
     }
 
     /// Select `from..=to` on the active sheet and cut or copy it.
