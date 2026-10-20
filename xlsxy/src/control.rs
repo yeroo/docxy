@@ -7617,7 +7617,7 @@ mod table_verb_tests {
         // #991 p1: the table widens, the new column named `Column<n>`.
         assert_eq!(
             table_columns(&mut a),
-            ["Item", "Qty", "Column3", "Price", "Region"]
+            ["Item", "Qty", "Column1", "Price", "Region"]
         );
         assert_eq!(
             formula_value(&mut a, "G2").0.as_deref(),

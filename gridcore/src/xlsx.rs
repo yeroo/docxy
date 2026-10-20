@@ -7870,11 +7870,11 @@ fn table_children(xml: &str, name: &str) -> Vec<(usize, usize)> {
     child_spans(xml, (root, root + p.pos()), name)
 }
 
-/// A table converted to a range, or deleted with all its columns, whose part
-/// a save drops: the name other table parts' formulas know it by, and where
-/// its cells are (a deleted table's went with its delete, so those formulas
-/// go `#REF!`).
+/// A table converted to a range or deleted, whose part a save drops: the name
+/// other table parts' formulas know it by, and where its cells are (a deleted
+/// table's formulas go `#REF!`, as its cell formulas did).
 struct ConvertedTable {
+    deleted: bool,
     part: String,
     loaded_name: String,
     edits: Vec<crate::formula::EditShift>,
@@ -7941,6 +7941,10 @@ fn rewrite_column_formulas(
                 };
                 let mut out = ast.clone();
                 for c in converted {
+                    if c.deleted {
+                        out = crate::formula::delete_table_in_expr(&out, &c.loaded_name, false);
+                        continue;
+                    }
                     let target = crate::formula::TableToRange {
                         name: &c.loaded_name,
                         sheet_name: &c.sheet_name,
@@ -8270,6 +8274,7 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
             let mut info = r.info();
             info.columns = part_column_names(r, &xml);
             Some(ConvertedTable {
+                deleted: removed.deleted,
                 part: r.part.clone(),
                 loaded_name,
                 edits: removed.edits.clone(),
@@ -24560,6 +24565,34 @@ mod table_command_tests {
         for r in 0..3 {
             assert!(f(&pkg, r, 2).contains("#REF!"), "{}", f(&pkg, r, 2));
         }
+    }
+
+    /// #991 r1: a table deleted by a header-row delete is no conversion: the
+    /// other parts' formulas naming it read `#REF!`, as the cells' did, not
+    /// the cells that stay.
+    #[test]
+    fn a_header_row_delete_saves_other_parts_formulas_as_ref_error() {
+        let mut pkg = one_table();
+        let s = &mut pkg.workbook.sheets[0];
+        s.set_cell(5, 0, Cell::text("A"));
+        s.set_cell(5, 1, Cell::text("B"));
+        pkg.add_table(0, (5, 0, 7, 1), true, "TableStyleMedium2")
+            .unwrap();
+        let part = pkg.workbook.tables[1].part.clone();
+        let xml = text(&pkg, &part);
+        let at = xml.find("name=\"B\"/>").unwrap();
+        let end = at + "name=\"B\"/>".len();
+        let el = "name=\"B\" totalsRowFunction=\"custom\"><totalsRowFormula>SUM(Table1[Qty])</totalsRowFormula></tableColumn>";
+        let xml = format!("{}{el}{}", &xml[..at], &xml[end..]);
+        pkg.parts.iter_mut().find(|(n, _)| *n == part).unwrap().1 = xml.into_bytes();
+        let mut pkg = reload(&pkg);
+        crate::edit::delete_rows(&mut pkg.workbook, 0, 0, 1); // Table1's header
+        assert_eq!(pkg.workbook.tables.len(), 1);
+        let saved = text(&reload(&pkg), &part);
+        assert!(
+            saved.contains("<totalsRowFormula>SUM(#REF!)</totalsRowFormula>"),
+            "{saved}"
+        );
     }
 
     #[test]
