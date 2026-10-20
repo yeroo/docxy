@@ -1619,7 +1619,7 @@ struct App {
     /// it covers. [`App::sync_stripped_hf`] puts a part's markers back when
     /// every one of its comments is anchored again (an undo), and takes them
     /// again when one is not (a redo). Cleared with `tracked_comments`.
-    stripped_hf: Vec<docxcore::inspect::StrippedPart>,
+    stripped_hf: docxcore::inspect::StripLog,
     /// Every comment id the document has had since it loaded: those of its
     /// comments and body markers then ([`used_comment_ids`]), and each one
     /// allocated since. It never shrinks, not on Delete Comment, since an
@@ -1856,7 +1856,7 @@ impl App {
             auto_hide_ribbon: false,
             comments,
             tracked_comments: Default::default(),
-            stripped_hf: Vec::new(),
+            stripped_hf: Default::default(),
             used_comment_ids,
             show_comments: false,
             markup: Default::default(),
@@ -3383,29 +3383,20 @@ impl App {
     }
 
     /// Take the markers of comments `ids` out of the stored header and
-    /// footer parts; `record` keeps what was taken for an undo
-    /// ([`App::stripped_hf`]). Without it they are gone for good, which the
-    /// recorded strips of those parts take in (`forget`), so they still
-    /// match the part and an undo does not bring these back.
+    /// footer parts; `record` keeps them for [`App::sync_stripped_hf`]. Without
+    /// it they are gone for good (no undo brings them back), which the log
+    /// takes in so its other comments still come back.
     fn strip_stored_hf(&mut self, ids: &[&str], record: bool) {
         if ids.is_empty() {
             return;
         }
         let mut changed = false;
         for name in self.stored_hf_parts() {
-            let Some(taken) =
-                docxcore::inspect::StrippedPart::strip(&mut self.pkg, &name, Some(ids))
-            else {
-                continue;
-            };
-            changed = true;
-            if record {
-                self.stripped_hf.push(taken);
+            changed |= if record {
+                self.stripped_hf.strip(&mut self.pkg, &name, ids)
             } else {
-                for earlier in self.stripped_hf.iter_mut().filter(|e| e.part == name) {
-                    earlier.forget(ids);
-                }
-            }
+                self.stripped_hf.strip_for_good(&mut self.pkg, &name, ids)
+            };
         }
         if changed {
             self.rederive_page_parts();
@@ -3420,31 +3411,20 @@ impl App {
     }
 
     /// Follow the body's undo and redo in the stored header and footer
-    /// parts: a strip whose comments are all anchored again is put back
-    /// (last taken first), one with a comment that is not is taken again
-    /// (first taken first). A part that moved on since, or is being edited
-    /// now, stays as it is: the comment then has no markers there, and no
-    /// marker is left without its comment.
+    /// parts: a comment's markers are in while it is anchored, out while it
+    /// is not, whatever order the steps come in. A part that moved on since,
+    /// or is being edited now, stays as it is: the comment then has no
+    /// markers there, and no marker is left without its comment.
     fn sync_stripped_hf(&mut self) {
         if self.stripped_hf.is_empty() {
             return;
         }
         let anchor = self.anchor_marker_ids();
         let editing = self.hf_edit.as_ref().map(|hf| hf.part.clone());
-        let anchored =
-            |t: &docxcore::inspect::StrippedPart| t.ids.iter().all(|id| anchor.contains(id));
-        let mut changed = false;
-        for taken in self.stripped_hf.iter().rev() {
-            if Some(&taken.part) != editing.as_ref() && anchored(taken) {
-                changed |= taken.restore(&mut self.pkg);
-            }
-        }
-        for taken in &self.stripped_hf {
-            if Some(&taken.part) != editing.as_ref() && !anchored(taken) {
-                changed |= taken.restrip(&mut self.pkg);
-            }
-        }
-        if changed {
+        if self
+            .stripped_hf
+            .sync(&mut self.pkg, &anchor, editing.as_deref())
+        {
             self.rederive_page_parts();
         }
     }

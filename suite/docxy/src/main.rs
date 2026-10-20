@@ -13083,11 +13083,11 @@ struct CommentUndo {
     /// puts this back for one that is live again, instead of the plain
     /// paragraph [`doc_to_docx`] would make of its parsed record.
     raw: std::collections::HashMap<String, RawComment>,
-    /// The markers Remove All (or Delete Comment on a converted tab) took out
-    /// of the headers, footers and notes of `pkg`, which no undo step covers
-    /// ([`save_base`] puts a part's back while all its comments are anchored
-    /// again).
-    stripped: Vec<docxcore::inspect::StrippedPart>,
+    /// The markers Remove All took out of the headers, footers and notes of
+    /// `pkg`, and those a converted tab's save left out of the package it
+    /// rebased on ([`note_dead_story_markers`]): no undo step covers them.
+    /// [`save_base`] puts a comment's back while it is anchored in the body.
+    stripped: docxcore::inspect::StripLog,
 }
 
 impl CommentUndo {
@@ -13107,30 +13107,29 @@ impl CommentUndo {
     }
 
     /// Take comment markers out of the stories of `pkg` (but part `skip`):
-    /// those of `gone` for good, which the recorded strips of those parts
-    /// take in (`forget`) so they still match the part; those of `kept`
-    /// recorded, for [`save_base`] to put back while an undo has their
-    /// comments anchored again. `gone` is only for ids no undo can bring
-    /// back: a comment whose Delete Comment step is still on the undo stack
-    /// is neither (its markers wait in `pkg`, and the save leaves them out
-    /// while it is not live). How many parts changed.
+    /// those of `gone` for good, since nothing can bring them back (orphans
+    /// with no comment); those of `recorded` kept, for [`save_base`] to put
+    /// back with their comments: a comment is out of the stories while it is
+    /// not anchored in the body, in while it is, in whatever order undo and
+    /// redo bring them (the log, [`docxcore::inspect::StripLog`]). How many
+    /// parts changed.
     fn strip_stories(
         &mut self,
         pkg: &mut Package,
         stories: &docxcore::inspect::Stories,
         gone: &[&str],
-        kept: &[&str],
+        recorded: &[&str],
         skip: Option<&str>,
     ) -> usize {
-        let forgotten = stories.strip_comment_markers(pkg, Some(gone), skip);
-        for earlier in &mut self.stripped {
-            if forgotten.iter().any(|f| f.part == earlier.part) {
-                earlier.forget(gone);
+        let mut parts = 0;
+        for part in stories.part_names() {
+            if Some(part) == skip {
+                continue;
             }
+            let a = self.stripped.strip_for_good(pkg, part, gone);
+            let b = self.stripped.strip(pkg, part, recorded);
+            parts += usize::from(a || b);
         }
-        let taken = stories.strip_comment_markers(pkg, Some(kept), skip);
-        let parts = forgotten.len() + taken.len();
-        self.stripped.extend(taken);
         parts
     }
 }
@@ -13240,9 +13239,9 @@ fn save_base<'a>(
 /// - a comment that is live again but not in `base` (a converted tab's
 ///   rebased package no longer holds it) gets its original XML back, kept
 ///   when it was deleted, not a plain paragraph made from its record;
-/// - the markers Remove All (or Delete Comment on a converted tab) took out
-///   of a header, footer or note come back while every comment they carry
-///   is anchored in the body again;
+/// - the markers of a comment that Remove All (or the rebase of a converted
+///   tab) took out of a header, footer or note come back while it is
+///   anchored in the body again;
 /// - a tracked comment that is not live has no marker left in any story,
 ///   so the file has no marker without a comment. The package itself is
 ///   untouched, so undo and redo need no bookkeeping there.
@@ -13274,10 +13273,11 @@ fn follow_comment_undo(
     }
     let anchored = docxcore::inspect::comment_marker_ids(doc);
     let editing = tab.hf_edit.as_ref().map(|h| h.part_name.as_str());
-    for taken in tab.comment_undo.stripped.iter().rev() {
-        let as_left = base.part_text(&taken.part).as_deref() == Some(taken.after.as_str());
-        if as_left && Some(taken.part.as_str()) != editing && taken.ids.is_subset(&anchored) {
-            taken.restore(base.to_mut());
+    let plan = tab.comment_undo.stripped.plan(base, &anchored, editing);
+    if !plan.is_empty() {
+        let pkg = base.to_mut();
+        for (part, text) in &plan {
+            pkg.set_part_text(part, text);
         }
     }
     let dead: Vec<&str> = tab
@@ -13296,7 +13296,40 @@ fn follow_comment_undo(
         .filter(|id| present.contains(*id))
         .collect();
     if !dead.is_empty() {
-        stories.strip_comment_markers(base.to_mut(), Some(&dead), None);
+        stories.strip_comment_markers(base.to_mut(), &dead, None);
+    }
+}
+
+/// A save rebases a converted tab on the package it wrote, which has none
+/// of the markers [`save_base`] left out for the tracked comments that are
+/// not live: note them, as they stand in the package it replaces, in the
+/// tab's strip log, so an undo of the delete puts them back (#981).
+fn note_dead_story_markers(tab: &mut DocTab) {
+    let (Surface::Doc(ed), Some(pkg)) = (&tab.surface, tab.pkg.as_ref()) else {
+        return;
+    };
+    let live: std::collections::HashSet<String> = live_comments(tab, &ed.doc)
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    let dead: Vec<String> = tab
+        .tracked_comment_ids
+        .iter()
+        .filter(|id| !live.contains(*id))
+        .cloned()
+        .collect();
+    if dead.is_empty() {
+        return;
+    }
+    let dead: Vec<&str> = dead.iter().map(String::as_str).collect();
+    let stories = docxcore::inspect::Stories::new(pkg, &ed.doc);
+    let before: Vec<(String, String)> = stories
+        .part_names()
+        .into_iter()
+        .filter_map(|part| Some((part.to_string(), pkg.part_text(part)?)))
+        .collect();
+    for (part, text) in &before {
+        tab.comment_undo.stripped.note_strip(part, text, &dead);
     }
 }
 
@@ -13379,22 +13412,6 @@ fn add_doc_comment(tab: &mut DocTab, text: String, identity: (String, String)) -
 /// ([`save_base`]), and come back with the body's.
 fn delete_doc_comment(tab: &mut DocTab, id: &str) {
     tab.comment_undo.keep_raw(tab.pkg.as_ref(), id);
-    // A converted tab's first save rebases it on the package it wrote, with
-    // the markers [`save_base`] left out of that copy; so it keeps them
-    // here instead, as Remove All does, for the undo to put back.
-    if tab.access.converted.is_some() {
-        if let (Surface::Doc(ed), Some(pkg)) = (&tab.surface, tab.pkg.as_mut()) {
-            let editing = tab.hf_edit.as_ref().map(|h| h.part_name.as_str());
-            let stories = docxcore::inspect::Stories::new(pkg, &ed.doc);
-            // One anchored in the body comes back with its undo; any other
-            // has no step to undo.
-            let anchored = docxcore::inspect::comment_marker_ids(&ed.doc).contains(id);
-            let (kept, gone): (&[&str], &[&str]) =
-                if anchored { (&[id], &[]) } else { (&[], &[id]) };
-            tab.comment_undo
-                .strip_stories(pkg, &stories, gone, kept, editing);
-        }
-    }
     if let Surface::Doc(ed) = &mut tab.surface {
         ed.remove_comment_markers(id);
     }
@@ -23370,6 +23387,10 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
             // conversion made stays the base of later Word saves.
             if tab.access.converted.take().is_some() {
                 if let Some(pkg) = package.and_then(|p| docxcore::package::load_package(&p).ok()) {
+                    // The package written has none of the markers of the
+                    // comments deleted since the load: keep them from the
+                    // one it replaces, for an undo to bring back (#981).
+                    note_dead_story_markers(tab);
                     tab.pkg = Some(pkg);
                 }
             }

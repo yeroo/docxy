@@ -240,31 +240,26 @@ pub(crate) fn inspect_remove(
         .map(|pkg| Stories::new(pkg, &editor.doc));
     let (status, changed) = match category {
         InspectCategory::Comments => {
-            // What the headers, footers and notes lose: the markers of
-            // comments no undo can bring back (header-only, orphans) are
-            // gone for good; those anchored in the body are kept, so the
-            // save can put them back while an undo has the comments
-            // anchored again. A comment deleted earlier is neither: its
-            // Delete Comment step is still on the undo stack, and the save
-            // leaves its markers out while it is not live (#981).
+            // What the headers, footers and notes lose. Only the markers of
+            // a true orphan (no body anchor, no comment record) are gone for
+            // good. Every other comment's are kept: a comment is out of the
+            // stories while it is not anchored in the body, in while it is,
+            // so an undo of this brings back the comments it anchors, and
+            // an undo of an earlier Delete Comment one more (#981).
             let anchored = docxcore::inspect::comment_marker_ids(&editor.doc);
             let mut stripped = 0;
             if let Some((pkg, stories)) = tab.pkg.as_mut().zip(stories.as_ref()) {
                 let present = stories.comment_marker_ids(pkg);
-                let tracked = &tab.tracked_comment_ids;
-                let kept: Vec<&str> = present
+                let has_record = |id: &str| {
+                    tab.tracked_comment_ids.contains(id) || tab.comments.iter().any(|c| c.id == id)
+                };
+                let (recorded, gone): (Vec<&str>, Vec<&str>) = present
                     .iter()
                     .map(String::as_str)
-                    .filter(|id| anchored.contains(*id))
-                    .collect();
-                let gone: Vec<&str> = present
-                    .iter()
-                    .map(String::as_str)
-                    .filter(|id| !anchored.contains(*id) && !tracked.contains(*id))
-                    .collect();
+                    .partition(|id| anchored.contains(*id) || has_record(id));
                 stripped = tab
                     .comment_undo
-                    .strip_stories(pkg, stories, &gone, &kept, None);
+                    .strip_stories(pkg, stories, &gone, &recorded, None);
             }
             let markers = editor.remove_all_comment_markers() + stripped;
             for c in &tab.comments {
@@ -1285,20 +1280,29 @@ mod tests {
         assert!(part(&path, "word/comments.xml").contains(">head<"));
     }
 
-    /// [`shared_parts`] with comment 3 deleted first, and a second header
-    /// comment (7) anchored in the header only.
-    fn header_with_shared_and_orphan_parts() -> Vec<(&'static str, String)> {
-        let mut parts = shared_parts();
+    /// `parts` with the markers of comment `id` added to the header too.
+    fn with_header_marker(
+        mut parts: Vec<(&'static str, String)>,
+        id: &str,
+    ) -> Vec<(&'static str, String)> {
         for (name, xml) in &mut parts {
             if *name == "word/header1.xml" {
                 *xml = xml.replace(
                     "<w:r><w:rPr><w:vanish/>",
-                    "<w:commentRangeStart w:id=\"7\"/><w:commentRangeEnd w:id=\"7\"/>\
-                     <w:r><w:commentReference w:id=\"7\"/></w:r><w:r><w:rPr><w:vanish/>",
+                    &format!(
+                        "<w:commentRangeStart w:id=\"{id}\"/><w:commentRangeEnd w:id=\"{id}\"/>\
+                         <w:r><w:commentReference w:id=\"{id}\"/></w:r><w:r><w:rPr><w:vanish/>"
+                    ),
                 );
             }
         }
         parts
+    }
+
+    /// [`shared_parts`] with a second header comment (7) anchored in the
+    /// header only.
+    fn header_with_shared_and_orphan_parts() -> Vec<(&'static str, String)> {
+        with_header_marker(shared_parts(), "7")
     }
 
     /// #981 FIX r2: Remove All with a header holding a body-anchored comment
@@ -1319,17 +1323,7 @@ mod tests {
     /// 1's markers in the header are back (comment 3 stays deleted).
     #[test]
     fn delete_comment_then_remove_all_then_undo_restores_the_other_header_markers() {
-        let mut parts = shared_parts();
-        for (name, xml) in &mut parts {
-            // Comment 0 anchored in the header too.
-            if *name == "word/header1.xml" {
-                *xml = xml.replace(
-                    "<w:r><w:rPr><w:vanish/>",
-                    "<w:commentRangeStart w:id=\"0\"/><w:commentRangeEnd w:id=\"0\"/>\
-                     <w:r><w:commentReference w:id=\"0\"/></w:r><w:r><w:rPr><w:vanish/>",
-                );
-            }
-        }
+        let parts = parts_with_zero_in_the_header();
         let (path, mut tab) = open_parts("hf-delete-then-all", &parts);
         crate::delete_doc_comment(&mut tab, "3");
         inspect_remove(&mut tab, InspectCategory::Comments).unwrap();
@@ -1343,17 +1337,7 @@ mod tests {
 
     /// [`shared_parts`] with comment 0 anchored in the header too.
     fn parts_with_zero_in_the_header() -> Vec<(&'static str, String)> {
-        let mut parts = shared_parts();
-        for (name, xml) in &mut parts {
-            if *name == "word/header1.xml" {
-                *xml = xml.replace(
-                    "<w:r><w:rPr><w:vanish/>",
-                    "<w:commentRangeStart w:id=\"0\"/><w:commentRangeEnd w:id=\"0\"/>\
-                     <w:r><w:commentReference w:id=\"0\"/></w:r><w:r><w:rPr><w:vanish/>",
-                );
-            }
-        }
-        parts
+        with_header_marker(shared_parts(), "0")
     }
 
     /// #981 FIX r3: Delete Comment 3, Remove All, then both undone: the
@@ -1381,16 +1365,7 @@ mod tests {
     /// a body-anchored one leaves the first one's record matching its part.
     #[test]
     fn converted_tab_deleting_a_header_only_comment_keeps_the_other_restorable() {
-        let mut parts = parts_with_zero_in_the_header();
-        for (name, xml) in &mut parts {
-            if *name == "word/header1.xml" {
-                *xml = xml.replace(
-                    "<w:r><w:rPr><w:vanish/>",
-                    "<w:commentRangeStart w:id=\"7\"/><w:commentRangeEnd w:id=\"7\"/>\
-                     <w:r><w:commentReference w:id=\"7\"/></w:r><w:r><w:rPr><w:vanish/>",
-                );
-            }
-        }
+        let parts = with_header_marker(parts_with_zero_in_the_header(), "7");
         let (path, mut tab) = open_parts("hf-converted-two", &parts);
         tab.access.converted = Some(crate::open_mode::Converted::Rtf);
         crate::delete_doc_comment(&mut tab, "0");
@@ -1401,5 +1376,65 @@ mod tests {
         let header = part(&path, "word/header1.xml");
         assert_eq!(header.matches("w:id=\"0\"").count(), 3, "{header}");
         assert!(!header.contains("w:id=\"7\""), "{header}");
+    }
+
+    /// #981 FIX r4: after Remove All nothing is left to find, though a
+    /// comment was deleted before (body and header, or the header only).
+    #[test]
+    fn remove_all_after_a_delete_leaves_nothing_to_find() {
+        for (tag, id, parts) in [
+            ("found-shared", "3", shared_parts()),
+            ("found-header-only", "3", storied_parts()),
+        ] {
+            let (_, mut tab) = open_parts(tag, &parts);
+            crate::delete_doc_comment(&mut tab, id);
+            inspect_remove(&mut tab, InspectCategory::Comments).unwrap();
+            let found = inspect_doc_tab(&tab).unwrap();
+            assert!(!found.found(InspectCategory::Comments), "{tag}: {found:?}");
+            // And a second Remove All has nothing to say "(0)" about.
+            let status = inspect_remove(&mut tab, InspectCategory::Comments).unwrap();
+            assert!(status.contains("nothing to remove"), "{tag}: {status}");
+        }
+    }
+
+    /// #981 FIX r4: an untracked loaded comment whose body anchor an
+    /// undoable edit took: Remove All, then both undone, brings its header
+    /// markers back.
+    #[test]
+    fn remove_all_after_the_body_anchor_was_edited_away_is_undoable() {
+        let (path, mut tab) = open_parts("hf-edited-away", &shared_parts());
+        let Surface::Doc(ed) = &mut tab.surface else {
+            unreachable!()
+        };
+        assert!(ed.remove_comment_markers("3") > 0);
+        inspect_remove(&mut tab, InspectCategory::Comments).unwrap();
+        undo(&mut tab);
+        undo(&mut tab);
+        assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+        assert_eq!(saved_ids(&path, "word/header1.xml"), 3);
+        assert_eq!(saved_ids(&path, "word/document.xml"), 3);
+    }
+
+    /// #981 FIX r4: a converted tab with the header open when Delete Comment
+    /// runs: the header's markers still come back with the undo.
+    #[test]
+    fn converted_tab_delete_with_the_header_open_restores_its_markers() {
+        let (path, mut tab) = open_parts("hf-converted-open", &shared_parts());
+        tab.access.converted = Some(crate::open_mode::Converted::Rtf);
+        assert!(crate::hf::open(
+            &mut tab,
+            0,
+            true,
+            docxcore::package::HeaderVariant::Default
+        ));
+        crate::delete_doc_comment(&mut tab, "3");
+        crate::exit_hf_tab(&mut tab);
+        let path = path.with_file_name("converted3.docx");
+        assert!(save_doc_tab(&mut tab, Some(path.clone())), "{}", tab.status);
+        assert_eq!(saved_ids(&path, "word/header1.xml"), 0);
+        undo(&mut tab);
+        assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+        assert_eq!(saved_ids(&path, "word/header1.xml"), 3);
+        assert_eq!(saved_ids(&path, "word/document.xml"), 3);
     }
 }
