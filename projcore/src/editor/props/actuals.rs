@@ -192,8 +192,12 @@ impl Editor {
                         p.remaining = Some((p.duration - actual).max(0));
                     }
                     None => {
+                        // Pin the share down, so the stored remaining duration
+                        // (or none) is never what `Task::tracked` schedules by.
+                        let done = share(p.duration, 99);
                         p.percent = 99;
-                        p.remaining = Some(p.duration - share(p.duration, 99));
+                        p.actual = Some(done);
+                        p.remaining = Some(p.duration - done);
                     }
                 }
             }

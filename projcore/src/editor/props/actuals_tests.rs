@@ -347,3 +347,23 @@ fn the_stop_check_compares_with_the_task_before_the_duration_edit() {
         "the work done is the same 960"
     );
 }
+
+#[test]
+fn clearing_the_finish_of_an_import_with_no_actual_duration_pins_the_share() {
+    let mut proj = editor().project().clone();
+    let t = proj.tasks.iter_mut().find(|t| t.uid == 2).unwrap();
+    t.actual_start = Some(at(5, 8));
+    t.actual_finish = Some(at(8, 17));
+    t.percent_complete = Some(100);
+    let mut ed = Editor::new(proj);
+    assert_eq!(ed.set_actual_finish(2, None), Ok(true));
+    let t = pour(&ed);
+    assert_eq!(
+        (t.percent_complete, t.actual_duration_min),
+        (Some(99), Some(1901))
+    );
+    let Some(crate::model::Tracked::InProgress { remaining_min, .. }) = t.tracked() else {
+        panic!("in progress")
+    };
+    assert_eq!(remaining_min, 1920 - 1901);
+}

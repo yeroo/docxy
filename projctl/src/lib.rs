@@ -921,7 +921,7 @@ impl TaskInfoArgs {
                 let t = ed.project().task(uid);
                 let started = t.is_some_and(|t| t.actual_start.is_some());
                 let duration = t.map_or(0, |t| t.duration_min);
-                if started && (1..100).contains(&p) {
+                if started && (1..=100).contains(&p) {
                     ed.set_actual_duration(uid, (duration * i64::from(p) + 50) / 100)?;
                 }
                 ed.set_percent_complete(uid, p)?;
@@ -3219,6 +3219,27 @@ mod tests {
             (None, None, Some(0))
         );
         set(&mut a, vec![("actual_start", Json::Str("later".into()))]).unwrap_err();
+        let fresh = add(&mut a, "Wall", "2d");
+        dispatch_editor(
+            &mut a,
+            "task.set",
+            &Json::obj(vec![
+                ("uid", Json::Num(fresh as f64)),
+                ("actual_start", Json::Str("2026-03-02".into())),
+                ("percent_complete", Json::Num(100.0)),
+            ]),
+        )
+        .unwrap()
+        .unwrap();
+        let w = a.project().task(fresh as i32).unwrap();
+        assert_eq!(
+            (
+                w.actual_duration_min,
+                w.remaining_duration_min,
+                w.percent_complete
+            ),
+            (Some(w.duration_min), Some(0), Some(100))
+        );
 
         // A start alone leaves % Complete to percent_complete.
         set(
@@ -3292,6 +3313,17 @@ mod tests {
                 Some(t.duration_min / 2),
                 Some(t.duration_min - t.duration_min / 2)
             )
+        );
+        // 100 % on a started task completes its actual duration, with no finish.
+        set(&mut a, vec![("percent_complete", Json::Num(100.0))]).unwrap();
+        let t = task(&a);
+        assert_eq!(
+            (
+                t.actual_duration_min,
+                t.remaining_duration_min,
+                t.actual_finish
+            ),
+            (Some(t.duration_min), Some(0), None)
         );
         // A duration beside a remaining duration must agree with it.
         set(&mut a, vec![("actual_finish", Json::Null)]).unwrap();
