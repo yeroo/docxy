@@ -65,6 +65,8 @@ struct WbSnapshot {
     /// kept), only in the snapshots of the step that switches it on
     /// ([`Session::ctl_calc_set`]); every other step leaves the setting alone.
     precision: Option<(bool, bool)>,
+    /// Each PivotTable's `unsupported` flag: deleting its table sets it.
+    pivot_unsupported: Vec<bool>,
 }
 
 impl WbSnapshot {
@@ -75,6 +77,7 @@ impl WbSnapshot {
             tables: wb.tables.clone(),
             removed_tables: wb.removed_tables.clone(),
             precision: None,
+            pivot_unsupported: wb.pivots.iter().map(|p| p.unsupported).collect(),
         }
     }
 }
@@ -783,6 +786,13 @@ impl Session {
         wb.removed_tables = snap.removed_tables.clone();
         if let Some((on, file_off)) = snap.precision {
             (wb.calc.precision_as_displayed, wb.calc.precision_file_off) = (on, file_off);
+        }
+        // Pivots aren't added or removed by a structural edit; if their count
+        // changed since, the flags no longer line up and stay as they are.
+        if wb.pivots.len() == snap.pivot_unsupported.len() {
+            for (p, &unsupported) in wb.pivots.iter_mut().zip(&snap.pivot_unsupported) {
+                p.unsupported = unsupported;
+            }
         }
         self.rebuild_engine();
         self.dirty = true;
@@ -3573,6 +3583,35 @@ mod tests {
             cell_value(&s, 5, 5),
             Some(gridcore::sheet::CellValue::Number(3.0))
         );
+    }
+
+    #[test]
+    fn undoing_a_table_delete_makes_its_pivot_refreshable_again_991() {
+        let mut s = table_session();
+        let frame = gridcore::frame::Frame::from_range(&s.pkg.workbook, 0, (0, 0, 3, 2));
+        let dest = s.pkg.add_sheet("Pivot");
+        s.pkg
+            .add_pivot(
+                gridcore::pivot::PivotSource::Table("Calc".into()),
+                frame.names.clone(),
+                gridcore::pivot::DataField {
+                    name: "Sum of Qty".into(),
+                    field: 0,
+                    agg: gridcore::frame::Agg::Sum,
+                },
+                dest,
+                (2, 0),
+            )
+            .unwrap();
+        s.rebuild_engine();
+        s.dispatch("delrow\t0\t4"); // the table's whole range
+        assert!(s.pkg.workbook.tables.is_empty());
+        assert!(s.pkg.workbook.pivots[0].unsupported);
+        s.dispatch("undo");
+        assert_eq!(s.pkg.workbook.tables.len(), 1);
+        assert!(!s.pkg.workbook.pivots[0].unsupported);
+        s.dispatch("redo");
+        assert!(s.pkg.workbook.pivots[0].unsupported);
     }
 
     #[test]
