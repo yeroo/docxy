@@ -1966,6 +1966,164 @@ struct WbSnapshot {
     /// column rename or delete made, to replay when this snapshot is
     /// restored (each applies only where the model still holds its `from`).
     model_edits: Vec<ModelEdit>,
+    /// The pending copy as a step that rewrote or dropped it left it (the
+    /// step's `after`) or found it (its `before`), for undo and redo to put
+    /// back.
+    clip_edit: Option<ClipEdit>,
+    /// Each PivotTable's `unsupported` flag: deleting its table sets it.
+    pivot_unsupported: Vec<bool>,
+}
+
+/// A change to the pending copy that undo or redo replays: the copy is
+/// replaced (when none is pending or the pending one has the same source) or
+/// dropped (when the pending one has this sheet, origin and span).
+#[derive(Clone)]
+enum ClipEdit {
+    Set(ClipData),
+    Drop(usize, (u32, u32), (u32, u32)),
+}
+
+/// What an edit did to one table, from the snapshots around it
+/// ([`column_changes`]).
+struct TableChange {
+    /// The table as it was.
+    table: gridcore::sheet::Table,
+    /// Its new name, when the edit renamed it.
+    renamed_to: Option<String>,
+    /// Columns renamed, (old, new).
+    renamed: Vec<(String, String)>,
+    /// Which of `table.columns` the edit deleted (empty when none).
+    deleted: Vec<bool>,
+    /// The table is gone: `Some(true)` deleted, `Some(false)` converted.
+    removed: Option<bool>,
+}
+
+impl TableChange {
+    /// `e` as the edit left it. `inside` says the formula sits in the table
+    /// (its bare references name it); `table_name` also follows a table
+    /// rename (the data model has its own, `rename_table_in_model`). A
+    /// formula naming a removed table goes `#REF!`, converted or not, unless
+    /// `table_name` is off and the table was converted.
+    fn apply(
+        &self,
+        e: &gridcore::formula::Expr,
+        inside: bool,
+        table_name: bool,
+    ) -> gridcore::formula::Expr {
+        use gridcore::formula as f;
+        let name = &self.table.name;
+        if let Some(deleted) = self.removed {
+            if deleted || table_name {
+                return f::delete_table_in_expr(e, name, inside);
+            }
+            return e.clone();
+        }
+        let mut out = e.clone();
+        if self.deleted.contains(&true) {
+            out = f::delete_table_columns_in_expr(
+                &out,
+                name,
+                inside,
+                &self.table.columns,
+                &self.deleted,
+            );
+        } else if !self.renamed.is_empty() {
+            out = f::rename_table_columns_in_expr(&out, name, inside, &self.renamed);
+        }
+        match (&self.renamed_to, table_name) {
+            (Some(new), true) => f::rename_tables_in_expr(&out, &[(name.clone(), new.clone())]),
+            _ => out,
+        }
+    }
+
+    /// What a relationship end on column `col` of this table reads after the
+    /// edit, when it changed.
+    fn column_after(&self, col: &str) -> Option<String> {
+        let same = |x: &str| x.eq_ignore_ascii_case(col);
+        if self.removed == Some(true) {
+            return Some("#REF!".to_string());
+        }
+        if let Some((_, new)) = self.renamed.iter().find(|(old, _)| same(old)) {
+            return Some(new.clone());
+        }
+        let j = self.table.columns.iter().position(|x| same(x))?;
+        self.deleted
+            .get(j)
+            .copied()
+            .unwrap_or(false)
+            .then(|| "#REF!".to_string())
+    }
+}
+
+/// The tables `before` and `after` (snapshots around an edit) differ in, by
+/// part. Columns are paired by `Table::column_ids` when both sides know every
+/// column's, else by position (a rename, the same count) or name (a delete,
+/// fewer columns). A table that is not in `after` was removed: deleted when
+/// `after` keeps it in `removed_tables` as such.
+fn column_changes(before: &WbSnapshot, after: &WbSnapshot) -> Vec<TableChange> {
+    let mut out = Vec::new();
+    for b in &before.tables {
+        let a = after.tables.iter().find(|a| a.part == b.part);
+        let mut ch = TableChange {
+            table: b.clone(),
+            renamed_to: None,
+            renamed: Vec::new(),
+            deleted: Vec::new(),
+            removed: None,
+        };
+        match a {
+            None => {
+                ch.removed = Some(
+                    after
+                        .removed_tables
+                        .iter()
+                        .any(|r| r.table.part == b.part && r.deleted),
+                );
+            }
+            Some(a) => {
+                ch.renamed_to = (a.name != b.name).then(|| a.name.clone());
+                let known = |t: &gridcore::sheet::Table| {
+                    t.column_ids.len() == t.columns.len() && !t.column_ids.contains(&0)
+                };
+                if known(b) && known(a) {
+                    let mut deleted = vec![false; b.columns.len()];
+                    for (j, id) in b.column_ids.iter().enumerate() {
+                        match a.column_ids.iter().position(|x| x == id) {
+                            Some(k) if a.columns[k] != b.columns[j] => {
+                                ch.renamed
+                                    .push((b.columns[j].clone(), a.columns[k].clone()));
+                            }
+                            Some(_) => {}
+                            None => deleted[j] = true,
+                        }
+                    }
+                    if deleted.contains(&true) {
+                        ch.deleted = deleted;
+                    }
+                } else if a.columns.len() == b.columns.len() {
+                    ch.renamed = (b.columns.iter().zip(&a.columns))
+                        .filter(|(x, y)| x != y)
+                        .map(|(x, y)| (x.clone(), y.clone()))
+                        .collect();
+                } else if a.columns.len() < b.columns.len() {
+                    let deleted: Vec<bool> = (b.columns.iter())
+                        .map(|x| !a.columns.iter().any(|y| y.eq_ignore_ascii_case(x)))
+                        .collect();
+                    if deleted.contains(&true) {
+                        ch.deleted = deleted;
+                    }
+                }
+            }
+        }
+        if ch.removed.is_some()
+            || ch.renamed_to.is_some()
+            || !ch.renamed.is_empty()
+            || !ch.deleted.is_empty()
+        {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// One change a table column edit made to the data model, replayed by undo
@@ -2564,6 +2722,10 @@ struct App {
     model_view: Option<(usize, usize)>,
     model_rels: Vec<Relationship>,
     model_measures: Vec<gridcore::model::Measure>,
+    /// Resize Table is running: it moves a table's columns without
+    /// renaming or deleting them, so the model and the pending copy stay
+    /// as they are ([`App::follow_table_edits`]).
+    resizing_table: bool,
     last_find: Option<String>,
     // Review comments + the side panel that shows them.
     ribbon: ribbon::Ribbon,
@@ -2755,6 +2917,7 @@ impl App {
             prompt: None,
             pivot_edit: None,
             model_view: None,
+            resizing_table: false,
             model_rels,
             model_measures,
             last_find: None,
@@ -3495,7 +3658,7 @@ impl App {
         }
         if let (true, Some(mut before)) = (renamed || rewrote, wb_before) {
             let mut after = self.wb_snapshot();
-            self.follow_columns_in_model(&mut before, &mut after);
+            self.follow_table_edits(&mut before, &mut after);
             // A write that rewrote formulas rebuilt the engine itself; a
             // header written back may have changed under it.
             if headers {
@@ -3739,7 +3902,7 @@ impl App {
             self.sync_written_headers(&before);
         }
         let mut after = self.wb_snapshot();
-        self.follow_columns_in_model(&mut before, &mut after);
+        self.follow_table_edits(&mut before, &mut after);
         if let Some((old, new)) = model_rename {
             self.rename_table_in_model(old, new);
             before.model_rename = Some((new.to_string(), old.to_string()));
@@ -3802,113 +3965,83 @@ impl App {
         }
     }
 
-    /// The data model follows the table columns that `before` and `after`
-    /// (the snapshots around an edit) differ in: a renamed column is renamed
-    /// in the measures' formulas and the relationships' ends, a deleted one
-    /// reads `#REF!` there. The edits go on both snapshots, so undo and redo
-    /// replay them ([`Self::apply_model_edits`]).
-    fn follow_columns_in_model(&mut self, before: &mut WbSnapshot, after: &mut WbSnapshot) {
+    /// The data model and the pending copy follow what an edit did to the
+    /// tables' columns (`before` and `after` are the snapshots around it, see
+    /// [`column_changes`]): a renamed column is renamed in the measures'
+    /// formulas and the relationships' ends, a deleted one (or a deleted
+    /// table) reads `#REF!` there. The model's edits go on both snapshots,
+    /// so undo and redo replay them ([`Self::apply_model_edits`]). Resize
+    /// Table is no such edit: it leaves the cells' formulas as they were,
+    /// and so the model.
+    fn follow_table_edits(&mut self, before: &mut WbSnapshot, after: &mut WbSnapshot) {
+        if self.resizing_table {
+            return;
+        }
+        let changes = column_changes(before, after);
+        if changes.is_empty() {
+            return;
+        }
+        // Chained per measure and relationship: a step that changes two
+        // tables rewrites each item through both, into one edit.
         let mut edits: Vec<ModelEdit> = Vec::new();
-        for b in &before.tables {
-            let Some(a) = after.tables.iter().find(|a| a.part == b.part) else {
+        for m in &self.model_measures {
+            let Ok(ast) = gridcore::formula::parse(&m.formula) else {
                 continue;
             };
-            let same = |x: &String, y: &String| x.eq_ignore_ascii_case(y);
-            let renamed: Vec<(String, String)> = if a.columns.len() == b.columns.len() {
-                (b.columns.iter().zip(&a.columns))
-                    .filter(|(x, y)| x != y)
-                    .map(|(x, y)| (x.clone(), y.clone()))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let deleted: Vec<bool> = if a.columns.len() < b.columns.len() {
-                (b.columns.iter())
-                    .map(|x| !a.columns.iter().any(|y| same(x, y)))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            if renamed.is_empty() && !deleted.contains(&true) {
-                continue;
+            let out = changes
+                .iter()
+                .fold(ast.clone(), |e, ch| ch.apply(&e, false, false));
+            if out != ast {
+                edits.push(ModelEdit::Measure {
+                    name: m.name.clone(),
+                    from: m.formula.clone(),
+                    to: gridcore::formula::to_string(&out),
+                });
             }
-            for m in &self.model_measures {
-                let Ok(ast) = gridcore::formula::parse(&m.formula) else {
-                    continue;
-                };
-                let out = if deleted.is_empty() {
-                    gridcore::formula::rename_table_columns_in_expr(&ast, &b.name, false, &renamed)
-                } else {
-                    gridcore::formula::delete_table_columns_in_expr(
-                        &ast, &b.name, false, &b.columns, &deleted,
-                    )
-                };
-                if out != ast {
-                    edits.push(ModelEdit::Measure {
-                        name: m.name.clone(),
-                        from: m.formula.clone(),
-                        to: gridcore::formula::to_string(&out),
-                    });
-                }
-            }
-            for r in &self.model_rels {
-                let mut to = r.clone();
+        }
+        for r in &self.model_rels {
+            let mut to = r.clone();
+            for ch in &changes {
                 for end in [&mut to.from, &mut to.to] {
-                    if !end.0.eq_ignore_ascii_case(&b.name) {
-                        continue;
-                    }
-                    if let Some((_, new)) = renamed.iter().find(|(old, _)| same(old, &end.1)) {
-                        end.1 = new.clone();
-                    } else if let Some(j) = b.columns.iter().position(|x| same(x, &end.1)) {
-                        if deleted.get(j).copied().unwrap_or(false) {
-                            end.1 = "#REF!".to_string();
+                    if end.0.eq_ignore_ascii_case(&ch.table.name) {
+                        if let Some(col) = ch.column_after(&end.1) {
+                            end.1 = col;
                         }
                     }
                 }
-                if to != *r {
-                    edits.push(ModelEdit::Relationship {
-                        from: r.clone(),
-                        to,
-                    });
-                }
+            }
+            if to != *r {
+                edits.push(ModelEdit::Relationship {
+                    from: r.clone(),
+                    to,
+                });
             }
         }
         self.apply_model_edits(&edits);
         before.model_edits = edits.iter().rev().map(ModelEdit::reversed).collect();
         after.model_edits = edits;
-        self.follow_tables_in_clip(before, after);
+        self.follow_tables_in_clip(&changes, before, after);
     }
 
-    /// The pending copy's formulas follow the table renames, column renames
-    /// and column deletes that `before` and `after` differ in, as the cells'
-    /// do, so a paste after the edit names what exists. A copy naming a
-    /// table the edit removed (a delete of all its columns or rows, a
-    /// conversion) cannot be followed and is dropped. A cut the edit ended
-    /// is a copy by now ([`Self::cancel_cut`]) and follows the same way.
-    fn follow_tables_in_clip(&mut self, before: &WbSnapshot, after: &WbSnapshot) {
-        let Some(clip) = self.clip.as_mut() else {
+    /// The pending copy's formulas follow `changes` (table renames, column
+    /// renames and deletes), as the cells' do, so a paste after the edit
+    /// names what exists. A copy naming a table the edit removed (a delete
+    /// of all its columns or rows, a conversion) cannot be followed and is
+    /// dropped. A pending cut follows the same way; the step ends it right
+    /// after ([`Self::cancel_cut`]). Both snapshots keep the copy as it was
+    /// and as it became, so undo and redo put it back ([`Self::restore`]).
+    fn follow_tables_in_clip(
+        &mut self,
+        changes: &[TableChange],
+        before: &mut WbSnapshot,
+        after: &mut WbSnapshot,
+    ) {
+        let Some(orig) = self.clip.clone() else {
             return;
         };
-        let same = |x: &String, y: &String| x.eq_ignore_ascii_case(y);
-        let mut dropped = false;
-        for b in &before.tables {
-            let a = after.tables.iter().find(|a| a.part == b.part);
-            let renamed: Vec<(String, String)> = match a {
-                Some(a) if a.columns.len() == b.columns.len() => (b.columns.iter().zip(&a.columns))
-                    .filter(|(x, y)| x != y)
-                    .map(|(x, y)| (x.clone(), y.clone()))
-                    .collect(),
-                _ => Vec::new(),
-            };
-            let deleted: Vec<bool> = match a {
-                Some(a) if a.columns.len() < b.columns.len() => (b.columns.iter())
-                    .map(|x| !a.columns.iter().any(|y| same(x, y)))
-                    .collect(),
-                _ => Vec::new(),
-            };
-            let table_rename = a
-                .filter(|a| a.name != b.name)
-                .map(|a| [(b.name.clone(), a.name.clone())]);
+        let mut clip = orig.clone();
+        let (mut changed, mut dropped) = (false, false);
+        for ch in changes {
             for (i, row) in clip.cells.iter_mut().enumerate() {
                 for (j, cell) in row.iter_mut().enumerate() {
                     let Some(cell) = cell else { continue };
@@ -3919,33 +4052,53 @@ impl App {
                         continue;
                     };
                     let (r, c) = (clip.from.0 + i as u32, clip.from.1 + j as u32);
-                    let inside = b.contains(clip.sheet, r, c);
-                    let mut out = ast.clone();
-                    if a.is_none() {
-                        out = gridcore::formula::delete_table_in_expr(&out, &b.name, inside);
-                        dropped |= out != ast;
-                        continue;
-                    }
-                    if deleted.contains(&true) {
-                        out = gridcore::formula::delete_table_columns_in_expr(
-                            &out, &b.name, inside, &b.columns, &deleted,
-                        );
-                    } else if !renamed.is_empty() {
-                        out = gridcore::formula::rename_table_columns_in_expr(
-                            &out, &b.name, inside, &renamed,
-                        );
-                    }
-                    if let Some(map) = &table_rename {
-                        out = gridcore::formula::rename_tables_in_expr(&out, map);
-                    }
+                    let inside = ch.table.contains(clip.sheet, r, c);
+                    let out = ch.apply(&ast, inside, true);
                     if out != ast {
+                        changed = true;
+                        dropped |= ch.removed.is_some();
                         cell.formula = Some(gridcore::formula::to_string(&out));
                     }
                 }
             }
         }
+        if !changed {
+            return;
+        }
+        let kept = |mut c: ClipData| {
+            c.cut = false;
+            c
+        };
+        before.clip_edit = Some(ClipEdit::Set(kept(orig.clone())));
         if dropped {
+            after.clip_edit = Some(ClipEdit::Drop(orig.sheet, orig.from, orig.span));
             self.clip = None;
+        } else {
+            after.clip_edit = Some(ClipEdit::Set(kept(clip.clone())));
+            self.clip = Some(clip);
+        }
+    }
+
+    /// Undo or redo's side of [`Self::follow_tables_in_clip`].
+    fn apply_clip_edit(&mut self, edit: &ClipEdit) {
+        let same =
+            |c: &ClipData, key: (usize, (u32, u32), (u32, u32))| (c.sheet, c.from, c.span) == key;
+        match edit {
+            ClipEdit::Set(c) => {
+                let key = (c.sheet, c.from, c.span);
+                if self.clip.as_ref().is_none_or(|cur| same(cur, key)) {
+                    self.clip = Some(c.clone());
+                }
+            }
+            ClipEdit::Drop(sheet, from, span) => {
+                if self
+                    .clip
+                    .as_ref()
+                    .is_some_and(|c| same(c, (*sheet, *from, *span)))
+                {
+                    self.clip = None;
+                }
+            }
         }
     }
 
@@ -4057,6 +4210,8 @@ impl App {
             pivot_sources: wb.pivots.iter().map(|p| p.source.clone()).collect(),
             model_rename: None,
             model_edits: Vec::new(),
+            clip_edit: None,
+            pivot_unsupported: wb.pivots.iter().map(|p| p.unsupported).collect(),
         }
     }
 
@@ -4079,8 +4234,14 @@ impl App {
         // Pivots aren't added or removed by a structural edit; if their count
         // changed since, the sources no longer line up and stay as they are.
         if wb.pivots.len() == snap.pivot_sources.len() {
-            for (p, source) in wb.pivots.iter_mut().zip(&snap.pivot_sources) {
+            for ((p, source), &unsupported) in wb
+                .pivots
+                .iter_mut()
+                .zip(&snap.pivot_sources)
+                .zip(&snap.pivot_unsupported)
+            {
                 p.source = source.clone();
+                p.unsupported = unsupported;
             }
         }
     }
@@ -4093,6 +4254,9 @@ impl App {
             self.rename_table_in_model(old, new);
         }
         self.apply_model_edits(&snap.model_edits);
+        if let Some(edit) = &snap.clip_edit {
+            self.apply_clip_edit(edit);
+        }
         self.rebuild_engine();
         self.clamp_cursor();
         self.modified = true;
@@ -9792,7 +9956,10 @@ impl App {
     fn resize_table(&mut self, name: &str, range: &str) -> Result<(), String> {
         let rect = gridcore::sheet::parse_range_name(&range.replace('$', ""))
             .ok_or_else(|| format!("\"{range}\" isn't a range"))?;
-        self.try_structural(None, |wb| gridcore::edit::resize_table(wb, name, rect))
+        self.resizing_table = true;
+        let done = self.try_structural(None, |wb| gridcore::edit::resize_table(wb, name, rect));
+        self.resizing_table = false;
+        done
     }
 
     /// Convert to Range: table `name` becomes plain cells. Refused while the
