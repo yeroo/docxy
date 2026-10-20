@@ -5378,9 +5378,11 @@ struct Docxy {
     /// The open menu's scroll: Up/Down scroll the highlighted row into view,
     /// and each menu (or submenu) starts at the top.
     menu_scroll: ScrollHandle,
-    /// The top dialog's lists' scrolls, by (dialog, control): a choice that
-    /// changes (Up/Down/Home/End) is scrolled into view (#988).
+    /// The top dialog's lists' scrolls, by (dialog opening epoch, control):
+    /// a choice that changes (Up/Down/Home/End) is scrolled into view (#988).
     dialog_lists: std::cell::RefCell<dialog_host::ListScrolls>,
+    /// The top dialog's scrolling grids (#1609), kept like the lists.
+    dialog_grids: std::cell::RefCell<dialog_host::GridScrolls>,
     // New-comment entry bar (Review ▸ New comment); routes keys while open.
     comment_open: bool,
     /// The comment the Review tab's Resolve acts on: the one last clicked in
@@ -14324,6 +14326,7 @@ impl Docxy {
             doc_scroll: ScrollHandle::new(),
             menu_scroll: ScrollHandle::new(),
             dialog_lists: Default::default(),
+            dialog_grids: Default::default(),
             comment_open: false,
             selected_comment: None,
             markup: Default::default(),

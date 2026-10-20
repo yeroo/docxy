@@ -672,6 +672,7 @@ fn kind_of(kind: &str) -> dialog::ControlKind {
         "list" => K::List,
         "grid" => K::Grid,
         "label" => K::Label,
+        "sample" => K::Sample,
         // `color` and `font` are typed as text until the host has pickers.
         _ => K::Text,
     }
@@ -681,6 +682,12 @@ fn kind_of(kind: &str) -> dialog::ControlKind {
 fn value_of(kind: dialog::ControlKind, items: &[String], value: &Json) -> dialog::Value {
     use dialog::{ControlKind as K, Value};
     match kind {
+        // A sample's style travels as its JSON (#1609).
+        K::Sample => Value::Text(match value {
+            Json::Obj(_) => value.to_string(),
+            Json::Str(s) => s.clone(),
+            _ => String::new(),
+        }),
         K::Checkbox | K::Check => Value::Bool(value.as_bool().unwrap_or(false)),
         K::Radio | K::Dropdown | K::List => Value::Choice(match value {
             Json::Num(n) => Some(*n as usize).filter(|i| *i < items.len()),
@@ -746,7 +753,11 @@ fn value_back(c: &dialog::Control) -> Json {
 /// (#1602).
 pub(crate) fn values_of(d: &Dialog) -> Json {
     let mut out = Vec::new();
-    for c in d.controls.iter().filter(|c| c.plugin) {
+    for c in d
+        .controls
+        .iter()
+        .filter(|c| c.plugin && c.kind != dialog::ControlKind::Sample)
+    {
         out.push((c.name.to_string(), value_back(c)));
         if c.kind == dialog::ControlKind::Grid {
             out.push((
@@ -783,8 +794,40 @@ fn control_of_spec(
     out.commit_command = c.commit_command;
     out.page = page;
     out.plugin = true;
+    // The layout hints (#1609).
+    out.group = (!c.group.is_empty()).then(|| c.group.clone());
+    out.span = u8::try_from(c.span.max(1)).unwrap_or(u8::MAX);
+    // projcore bounds min_rows (64) when it parses the spec.
+    out.min_rows = (c.min_rows > 0).then_some(c.min_rows as usize);
+    out.fill = c.fill;
     apply_selected_row(&mut out, prefill);
     out
+}
+
+/// A spec's header control (#1609): on every page, drawn first.
+fn header_control_of_spec(c: &ui::DialogControl, prefill: &Prefill) -> dialog::Control {
+    let mut out = control_of_spec(c, None, prefill);
+    out.header = true;
+    out
+}
+
+/// The spec's declared values as the state sees them at open (#1610,
+/// #1609): the header's and every page's controls.
+fn declared_values(spec: &ui::DialogSpec) -> Json {
+    Json::Obj(
+        spec.header
+            .iter()
+            .chain(spec.pages.iter().flat_map(|p| p.controls.iter()))
+            .map(|c| (c.name.clone(), c.value.clone()))
+            .collect(),
+    )
+}
+
+/// The URL a plugin dialog's Help opens (#1609), when its spec names one.
+pub(crate) fn help_url(spec_id: &str) -> Option<String> {
+    spec(spec_id)
+        .map(|s| s.help.clone())
+        .filter(|u| !u.is_empty())
 }
 
 /// A grid's selected row as the plugin's state gives it under
@@ -807,6 +850,24 @@ fn apply_selected_row(c: &mut dialog::Control, prefill: &Prefill) {
     };
 }
 
+/// A spec's button as the dialog holds it (#1602): a `help` button is the
+/// host's, never the default and never the cancel button, so neither Enter
+/// nor Escape can name it (#1609); the spec's `default` and `cancel` on it
+/// are ignored.
+fn button_of_spec(b: &ui::DialogButton, role: dialog::ButtonRole) -> dialog::Button {
+    let help = crate::dialog::Button::is_help_id(&b.id);
+    let role = if help {
+        dialog::ButtonRole::Apply
+    } else {
+        role
+    };
+    dialog::Button {
+        id: b.id.clone(),
+        default: b.default && !help,
+        ..dialog::Button::new(&b.label, role)
+    }
+}
+
 /// The dialog spec `spec_id` of any loaded plugin.
 fn spec(spec_id: &str) -> Option<&'static ui::DialogSpec> {
     manifests().iter().find_map(|m| m.dialog(spec_id))
@@ -818,14 +879,7 @@ fn open_dialog(v: &ProjectView, spec_id: &str, command: &str) -> Result<Dialog, 
     let spec = spec(spec_id).ok_or_else(|| format!("No plugin declares the dialog '{spec_id}'"))?;
     // The state sees the spec's declared values as the dialog's, so a label
     // that follows another control reads right from the start (#1610).
-    let declared = Json::Obj(
-        spec.pages
-            .iter()
-            .flat_map(|p| p.controls.iter())
-            .map(|c| (c.name.clone(), c.value.clone()))
-            .collect(),
-    );
-    let values = prefill_with(v, spec_id, v.selected_uid(), Some(declared));
+    let values = prefill_with(v, spec_id, v.selected_uid(), Some(declared_values(spec)));
     let values = &values;
     let mut d = Dialog::message(
         catalog::PLUGIN,
@@ -844,10 +898,21 @@ fn open_dialog(v: &ProjectView, spec_id: &str, command: &str) -> Result<Dialog, 
     d.text = None;
     d.modeless = spec.modeless;
     d.seen = Some((v.ed.revision(), v.selected_uid()));
+    // The layout hints (#1609): a fixed size, the buttons' side, the
+    // columns per page, the header drawn above every page.
+    d.size = spec.size.map(|(w, h)| (w as f32, h as f32));
+    d.buttons_right = spec.placement == "right";
+    d.page_columns = spec
+        .pages
+        .iter()
+        .map(|p| u8::try_from(p.columns.max(1)).unwrap_or(u8::MAX))
+        .collect();
     let tabbed = spec.pages.len() > 1;
     if tabbed {
         d.tabs = spec.pages.iter().map(|p| p.name.clone()).collect();
     }
+    // The pages' controls, then the header's (drawn first, listed last so
+    // the pages' controls keep their places, as Task Information's do).
     d.controls = spec
         .pages
         .iter()
@@ -858,18 +923,24 @@ fn open_dialog(v: &ProjectView, spec_id: &str, command: &str) -> Result<Dialog, 
                 .iter()
                 .map(move |c| control_of_spec(c, page, values))
         })
+        .chain(
+            spec.header
+                .iter()
+                .map(|c| header_control_of_spec(c, values)),
+        )
         .collect();
     // OK and Cancel, or the spec's own buttons (#1602): `ok` accepts (the
     // command gets the values and the dialog closes), a cancel button
     // closes, any other sends the command with its id and stays open
-    // unless the reply closes it. Help is not drawn: the host has no help
-    // pages for a plugin. The state greys a button by its id.
+    // unless the reply closes it. `help` is the host's (#1609): drawn
+    // bottom left as Project's, it opens the spec's `help` URL (else says
+    // the documentation is coming) and never reaches the plugin. The state
+    // greys a button by its id.
     let mut buttons = if spec.buttons.is_empty() {
         ok_cancel()
     } else {
         spec.buttons
             .iter()
-            .filter(|b| !b.id.eq_ignore_ascii_case("help"))
             .map(|b| {
                 let role = if b.cancel {
                     dialog::ButtonRole::Cancel
@@ -878,11 +949,7 @@ fn open_dialog(v: &ProjectView, spec_id: &str, command: &str) -> Result<Dialog, 
                 } else {
                     dialog::ButtonRole::Apply
                 };
-                dialog::Button {
-                    id: b.id.clone(),
-                    default: b.default,
-                    ..dialog::Button::new(&b.label, role)
-                }
+                button_of_spec(b, role)
             })
             .collect()
     };
@@ -899,9 +966,9 @@ fn open_dialog(v: &ProjectView, spec_id: &str, command: &str) -> Result<Dialog, 
 /// Ask the plugin's state again for the top dialog when a plugin control
 /// changed since (#1567) or the plan or the selection moved under it
 /// (#1602, modal or not since #1610), and apply the reply: items, enabled
-/// flags, label values and `name.selected_row` always (a chosen item that
-/// is still there stays chosen), every value when the plan or selection
-/// moved (a grid keeps the cell being typed into). Called before a frame is
+/// flags, label and sample values and `name.selected_row` always (a chosen
+/// item that is still there stays chosen), every value when the plan or
+/// selection moved (a grid keeps the cell being typed into). Called before a frame is
 /// drawn or a reply is written, so a read sees the state the plugin would
 /// show.
 pub(crate) fn refresh_dialog(tab: &mut DocTab) {
@@ -982,10 +1049,15 @@ pub(crate) fn refresh_dialog(tab: &mut DocTab) {
                 );
             }
         }
-        // The state's values: every control when the plan moved, a label
-        // (display only) on any refresh, so one may follow another control
-        // (#1610); an editable control keeps what it holds otherwise.
-        let follows = moved || c.kind == dialog::ControlKind::Label;
+        // The state's values: every control when the plan moved, a label or
+        // a sample (display only) on any refresh, so one may follow another
+        // control (#1610, #1609); an editable control keeps what it holds
+        // otherwise.
+        let follows = moved
+            || matches!(
+                c.kind,
+                dialog::ControlKind::Label | dialog::ControlKind::Sample
+            );
         if follows && let Some(value) = p.value(c.name) {
             c.value = value_of(c.kind, &c.items, value);
             if c.kind == dialog::ControlKind::Grid {
@@ -1018,16 +1090,14 @@ pub(crate) fn extend_task_info(d: &mut Dialog, v: &ProjectView, uid: i32) {
     let Some(spec) = spec("task-information") else {
         return;
     };
-    // The state sees the pages' declared values as the dialog's, as a
-    // plugin's own dialog does at open (#1610).
-    let declared = Json::Obj(
-        spec.pages
-            .iter()
-            .flat_map(|p| p.controls.iter())
-            .map(|c| (c.name.clone(), c.value.clone()))
-            .collect(),
+    // The state sees the header's and the pages' declared values as the
+    // dialog's, as a plugin's own dialog does at open (#1610).
+    let values = prefill_with(
+        v,
+        "task-information",
+        Some(uid),
+        Some(declared_values(spec)),
     );
-    let values = prefill_with(v, "task-information", Some(uid), Some(declared));
     extend_task_info_with(d, spec, &values);
     // The dialog has seen this plan: a control change applies the state's
     // items, enabled flags and labels, not its values (#1610).
@@ -1056,7 +1126,21 @@ pub(crate) fn extend_task_info_with(d: &mut Dialog, spec: &ui::DialogSpec, value
                 .iter()
                 .map(|c| control_of_spec(c, Some(index), values)),
         );
+        // The plugin page's columns (#1609); built-in pages keep one.
+        if d.page_columns.len() < d.tabs.len() {
+            d.page_columns.resize(d.tabs.len(), 1);
+        }
+        if let Some(slot) = d.page_columns.get_mut(index) {
+            *slot = u8::try_from(page.columns.max(1)).unwrap_or(u8::MAX);
+        }
     }
+    // The spec's header controls draw above every page (#1609); they come
+    // last in the list, so the pages' controls keep their places.
+    d.controls.extend(
+        spec.header
+            .iter()
+            .map(|c| header_control_of_spec(c, values)),
+    );
 }
 
 /// A press on a dialog with plugin controls: a plugin's own dialog
@@ -1071,10 +1155,21 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Option<Result<(), 
         DialogOwner::TaskInfo { .. } if top.controls.iter().any(|c| c.plugin) => None,
         _ => return None,
     };
-    let pressed = top.buttons.iter().find(|b| {
-        crate::dialog::fold_label(&b.label) == crate::dialog::fold_label(button)
-            || b.id.eq_ignore_ascii_case(button.trim())
-    });
+    let pressed = top.find_button(button);
+    // Help is the host's (#1609): the window's press, which the harness's
+    // `dialog-click` goes through too, opens the spec's page first
+    // (`Docxy::plugin_help_click`), and Help is never the default or the
+    // cancel button, so no key reaches here. A direct press that still does
+    // says the documentation is coming and never becomes a command.
+    if let Some(b) = pressed
+        && b.is_help()
+    {
+        if let Err(e) = Dialog::refuse_disabled(b) {
+            return Some(Err(e));
+        }
+        tab.status = crate::help_tab::DOCS_COMING.into();
+        return Some(Ok(()));
+    }
     let (is_accept, own) = match pressed {
         Some(b) => (
             matches!(

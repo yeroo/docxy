@@ -227,12 +227,133 @@ test the button's command opens the plugin's dialog, whose OK sends the values b
   assert reply.controls.0.plugin is true
   assert reply.buttons.0.label is OK
   assert reply.buttons.1.label is Cancel
-  assert reply.buttons.2.id is bump
+  assert reply.buttons.2.id is help
+  assert reply.buttons.3.id is bump
+  # The layout hints (#1609): a fixed size, two columns, the Numbers group,
+  # a sample the state styles, a memo that fills, Help bottom left.
+  assert reply.size.0 is 460
+  assert reply.size.1 is 400
+  assert reply.placement is bottom
+  assert reply.columns is 2
+  assert reply.controls.0.group is Numbers
+  assert reply.controls.1.group is Numbers
+  assert reply.controls.3.name is fixture.sample
+  assert reply.controls.3.kind is sample
+  assert reply.controls.3.sample.bold is true
+  assert reply.controls.3.sample.size is 13
+  assert reply.controls.4.name is fixture.memo
+  assert reply.controls.4.fill is true
+  shot window
+  # The Styles page (#1609 r8): three side-by-side lists in three columns,
+  # the dialog's size unchanged across the switch.
+  call dialog-tab {"tab":"Styles"}
+  call dialog-read {}
+  # `tab` is the page's name and `controls` the page's own (the header's
+  # two last), so the lists are the first three.
+  assert reply.tab is Styles
+  assert reply.columns is 3
+  assert reply.size.0 is 460
+  assert reply.size.1 is 400
+  assert reply.controls.0.name is fixture.font
+  assert reply.controls.0.kind is list
+  assert reply.controls.0.items.1 is Segoe UI
+  assert reply.controls.1.name is fixture.style
+  assert reply.controls.1.items.3 is Bold Italic
+  assert reply.controls.2.name is fixture.size
+  assert reply.controls.2.items.5 is 14
+  assert reply.controls.-1.name is fixture.tag
+  shot window
+  call dialog-tab {"tab":"General"}
+  call dialog-read {}
+  assert reply.columns is 2
+  # Help is the host's: this spec names no page, so the status says so and
+  # the dialog stays. The state greys Help while the number is 0, and the
+  # press is refused like any disabled button.
+  call dialog-set {"control":"n","value":0}
+  call dialog-read {}
+  assert reply.buttons.2.enabled is false
+  call-error dialog-click {"button":"Help"} => 'Help' is disabled
+  call last-url {}
+  assert reply.url is null
+  call dialog-set {"control":"n","value":1}
+  call dialog-click {"button":"Help"}
+  assert dialog is plugin
+  assert status is Help: the documentation is coming soon
+  call dialog-read {}
   # The label follows the number: a control change applies the state's
   # labels (#1610), and the task's name from the plan.
   assert reply.controls.1.name is fixture.echo
   assert reply.controls.1.kind is label
-  assert reply.controls.1.value is Number 1 for A
+  # The header text's declared value reached the state at open (#1609).
+  assert reply.controls.1.value is Number 1 for A (Fixture)
+  assert reply.controls.-2.name is fixture.title
+  assert reply.controls.-2.header is true
+  assert reply.controls.-2.span is 2
+  assert reply.controls.-2.value is Fixture
+  assert reply.controls.-1.name is fixture.tag
+  # Tab from the opened dialog reaches the header first.
+  call real-key {"key":"tab"}
+  call field-read {"dialog-field":"fixture.title"}
+  assert reply.focused is true
+  # A filling memo scrolls: more lines than fit keep the caret in view.
+  call pointer-click {"dialog-field":"fixture.memo"}
+  call real-type {"text":"one"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"two"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"three"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"four"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"five"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"six"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"seven"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"eight"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"nine"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"ten"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"eleven"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"twelve"}
+  shot window
+  call dialog-read {}
+  # Twelve lines of 16 px in a box of about four: the caret's line is in
+  # view (a grid's 18 px divisor would say 8).
+  assert reply.controls.4.first_visible_line is 9
+  # Focus elsewhere leaves the box's scroll alone, and coming back keeps it.
+  call real-key {"key":"tab"}
+  shot window
+  call dialog-read {}
+  assert reply.controls.4.first_visible_line is 9
+  call real-key {"key":"shift+tab"}
+  shot window
+  call dialog-read {}
+  assert reply.controls.4.first_visible_line is 9
+  # A click on a line in view lands on it (r4): line 10, "eleven", starts
+  # at character 49. The field probe scrolls with the lines, so y counts
+  # from the first line; the box stays where it was.
+  call pointer-click {"dialog-field":"fixture.memo","x":1,"y":168}
+  shot window
+  call field-read {"dialog-field":"fixture.memo"}
+  assert reply.caret is 49
+  call dialog-read {}
+  assert reply.controls.4.first_visible_line is 9
+  # A click without y lands mid-height of the box as drawn, so a scrolled
+  # memo is refocused by a plain click (r7); the box stays where it was.
+  call real-key {"key":"tab"}
+  call field-read {"dialog-field":"fixture.memo"}
+  assert reply.focused is false
+  call pointer-click {"dialog-field":"fixture.memo"}
+  shot window
+  call field-read {"dialog-field":"fixture.memo"}
+  assert reply.focused is true
+  call dialog-read {}
+  assert reply.controls.4.first_visible_line is 9
   # The grid lists the plan's tasks with the selected one's row selected
   # (the state's name.selected_row).
   assert reply.controls.2.name is fixture.tasks
@@ -240,7 +361,9 @@ test the button's command opens the plugin's dialog, whose OK sends the values b
   assert reply.controls.2.selected_row is 0
   call dialog-set {"control":"n","value":7}
   call dialog-read {}
-  assert reply.controls.1.value is Number 7 for A
+  assert reply.controls.1.value is Number 7 for A (Fixture)
+  # The sample follows the number too (odd: bold, size 12 + n).
+  assert reply.controls.3.sample.size is 19
   # Bump renames the task under the modal dialog: the plan moved, so the
   # state's values apply (the label), while the typed number stays.
   call dialog-click {"button":"Bump"}
@@ -248,7 +371,7 @@ test the button's command opens the plugin's dialog, whose OK sends the values b
   assert status is Fixture: bumped task 1
   call dialog-read {}
   assert reply.controls.0.value is 7
-  assert reply.controls.1.value is Number 7 for Bumped by fixture
+  assert reply.controls.1.value is Number 7 for Bumped by fixture (Fixture)
   # The modal dialog's grid shows the renamed task and keeps its row.
   assert reply.controls.2.rows.0.0 is Bumped by fixture
   assert reply.controls.2.selected_row is 0
@@ -258,10 +381,16 @@ test the button's command opens the plugin's dialog, whose OK sends the values b
   assert selected_name is Bumped by fixture
   key ctrl+z
   assert selected_name is A
-  # Cancel sends nothing.
+  # Cancel sends nothing. Escape closes through Cancel: the spec marks Help
+  # `cancel` too, which the host ignores.
   call ribbon-click {"tab":"Task","command":"Hello"}
   assert dialog is plugin
   call dialog-click {"button":"Cancel"}
+  assert dialog is none
+  assert status is Fixture: asking
+  call ribbon-click {"tab":"Task","command":"Hello"}
+  assert dialog is plugin
+  key escape
   assert dialog is none
   assert status is Fixture: asking
 
@@ -320,10 +449,21 @@ test Task Information gains the plugin's page, prefilled, with a multiline and a
   click C2
   key alt t c
   assert dialog is task-information
+  # The spec's header control draws above every page (#1609).
+  call dialog-read {}
+  assert reply.controls.-1.name is fixture.head
+  assert reply.controls.-1.header is true
+  assert reply.controls.-1.value is on every page
+  assert reply.columns is 1
+  shot window
   call dialog-read {}
   assert reply.tabs.5 is Fixture
   call dialog-tab {"tab":"Fixture"}
   call dialog-read {}
+  # The plugin page's two columns (#1609); the built-in pages keep one.
+  assert reply.columns is 2
+  assert reply.controls.-1.header is true
+  shot window
   # The top row (Name, Duration, Estimated) is on every page, so the page's
   # own controls follow it (#1536).
   assert reply.controls.0.name is name
@@ -423,6 +563,9 @@ test a modeless dialog with a grid and buttons of its own follows the plan and r
   assert reply.active is true
   assert reply.buttons.0.id is apply
   assert reply.buttons.0.label is Apply
+  assert reply.placement is right
+  assert reply.controls.0.min_rows is 6
+  shot window
   assert reply.buttons.0.default is true
   assert reply.buttons.1.id is clear
   assert reply.buttons.1.enabled is false
@@ -496,3 +639,39 @@ test a modeless dialog with a grid and buttons of its own follows the plan and r
   call dialog-click {"button":"Clear"}
   assert dialog is none
   assert status is Fixture: cleared
+
+test a plugin grid with more rows than it shows scrolls and keeps the selected row in view
+  # Fixture Sheet's grid asks for six rows (#1609); a plan of ten tasks
+  # (corpus/mspdi/27-manual-summary.xml, copied beside the fixtures)
+  # fills more, so the body scrolls with a scrollbar and a row picked past
+  # the fold is scrolled into view.
+  open copy:../fixtures/project-ten-tasks.xml
+  click C1
+  call ribbon-click {"tab":"Task","command":"Sheet (fixture)"}
+  assert dialog is plugin
+  call dialog-read {}
+  assert reply.controls.0.min_rows is 6
+  assert reply.controls.0.rows.9.1 is Z
+  call dialog-select {"control":"fixture.rows","row":9}
+  call dialog-read {}
+  assert reply.controls.0.selected_row is 9
+  shot window
+  # The scroll lands at the next frame: settle one more before reading it.
+  shot window
+  call dialog-read {}
+  assert reply.controls.0.first_visible_row is 4
+  call dialog-select {"control":"fixture.rows","row":0}
+  call dialog-read {}
+  assert reply.controls.0.selected_row is 0
+  shot window
+  shot window
+  call dialog-read {}
+  assert reply.controls.0.first_visible_row is 0
+  # The sheet's Help opens the spec's page (recorded, no browser in a
+  # harness run) and the dialog stays.
+  call dialog-click {"button":"Help"}
+  assert dialog is plugin
+  call last-url {}
+  assert reply.url is https://example.test/fixture-help
+  call dialog-click {"button":"Close"}
+  assert dialog is none
