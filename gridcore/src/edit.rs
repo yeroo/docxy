@@ -3891,6 +3891,7 @@ mod tests {
             width: Some(20.0),
             attrs: String::new(),
             default_width: false,
+            plain_width: false,
         });
         insert_cols(&mut w, 0, 3, 1);
         let d = &w.sheets[0].col_defs[0];

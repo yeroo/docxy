@@ -74,21 +74,6 @@ const CLASSES: &[LossClass] = &[
         },
     },
     LossClass {
-        name: "customWidth=\"1\" is written on every column with an explicit width, \
-               also where the source said false or nothing: one entry per column",
-        issue: "#1093",
-        matches: |e| {
-            e.part.starts_with("xl/worksheets/")
-                && e.kind == Kind::ChangedValue
-                && e.path.strip_prefix("/cols/").is_some_and(|p| {
-                    p.split_once('/').is_some_and(|(span, a)| {
-                        let (lo, hi) = span.split_once(':').unwrap_or((span, span));
-                        col_number(lo).is_some() && col_number(hi).is_some() && a == "customWidth"
-                    })
-                })
-        },
-    },
-    LossClass {
         name: "docProps/app.xml sheet titles follow the workbook's sheets (a stale \
                source list is corrected; named-range titles in it are dropped)",
         issue: "#1096",

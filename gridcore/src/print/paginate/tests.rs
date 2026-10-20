@@ -54,6 +54,7 @@ fn column_widths_follow_ecma_pixels() {
         width: Some(20.0),
         attrs: String::new(),
         default_width: false,
+        plain_width: false,
     });
     assert_eq!(col_points(&s, 1), 105.0);
     s.col_defs.push(ColDef {
@@ -62,6 +63,7 @@ fn column_widths_follow_ecma_pixels() {
         width: None,
         attrs: " hidden=\"1\"".into(),
         default_width: false,
+        plain_width: false,
     });
     assert_eq!(col_points(&s, 2), 0.0);
 }
@@ -212,6 +214,7 @@ fn hidden_rows_and_columns_are_skipped() {
         width: None,
         attrs: " hidden=\"1\"".into(),
         default_width: false,
+        plain_width: false,
     });
     let p = active(&wb);
     assert_eq!(p.pages.len(), 1);

@@ -530,6 +530,7 @@ impl BookIn {
                         String::new()
                     },
                     default_width: width.is_none(),
+                    plain_width: false,
                 });
             }
             for (row, height, hidden) in sheet.rows {
