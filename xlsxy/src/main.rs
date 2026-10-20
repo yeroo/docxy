@@ -3342,7 +3342,7 @@ impl App {
             .collect();
         // Decided once above, for every group: written without deciding
         // again against what the earlier groups recalculated.
-        self.record_groups(keys, None, |app| {
+        self.record_groups(keys, |app| {
             for (sheet_idx, changes) in groups {
                 app.engine
                     .set_cells_prechecked(&mut app.pkg.workbook, sheet_idx, changes);
@@ -3356,55 +3356,51 @@ impl App {
     /// its after once the last is done, so each group is one snapshot of its
     /// cells, as [`Engine::restore_cells`] needs: taken cell by cell, a spill
     /// anchor's after could still claim a cell a later write blocked it with.
-    ///
-    /// `cut_from` is a cut's source (sheet, rect) when `write` pastes one: a
-    /// table lying wholly inside it was cut whole, so clearing its headers
-    /// renames none of its columns.
     fn record_groups(
         &mut self,
         keys: Vec<(usize, Vec<(u32, u32)>)>,
-        cut_from: Option<(usize, (u32, u32, u32, u32))>,
         write: impl FnOnce(&mut Self),
     ) {
-        self.record_groups_wide(keys, cut_from, false, |app| {
+        self.record_groups_wide(keys, None, |app| {
             write(app);
             false
         });
     }
 
     /// [`Self::record_groups`] for a write that may rewrite formulas outside
-    /// its cells (a cut re-pointing what read the moved cells). With
-    /// `wide`, the workbook is snapshotted before `write`, which says whether
-    /// it did rewrite any: the step is then a whole-workbook one, as a table
-    /// header rename's is; else it stays the cells' own.
+    /// its cells. `cut_from` is a cut's source (sheet, rect) when `write`
+    /// pastes one: a table lying wholly inside it was cut whole, so clearing
+    /// its headers renames none of its columns, and the workbook is
+    /// snapshotted before `write`, which says whether it rewrote any formula
+    /// (a cut re-pointing what read the moved cells): the step is then a
+    /// whole-workbook one, as a table header rename's is; else it stays the
+    /// cells' own.
     fn record_groups_wide(
         &mut self,
         keys: Vec<(usize, Vec<(u32, u32)>)>,
         cut_from: Option<(usize, (u32, u32, u32, u32))>,
-        wide: bool,
         write: impl FnOnce(&mut Self) -> bool,
     ) {
+        let wide = cut_from.is_some();
         let explicit = self.undo_target.take();
         let keys: Vec<_> = keys.into_iter().filter(|(_, k)| !k.is_empty()).collect();
         if keys.is_empty() {
             return;
         }
         // An edit of the cells a cut was taken from ends the cut, as in
-        // Excel; the cut's own paste (`cut_from`) is the one write that
-        // doesn't. The clip then pastes as a copy.
-        if cut_from.is_none() {
-            if let Some(clip) = self.clip.as_ref().filter(|c| c.cut) {
-                let (fr, fc) = clip.from;
-                let (lr, lc) = (fr + clip.span.0.max(1) - 1, fc + clip.span.1.max(1) - 1);
-                let hit = keys.iter().any(|(s, cells)| {
-                    *s == clip.sheet
-                        && cells
-                            .iter()
-                            .any(|&(r, c)| (fr..=lr).contains(&r) && (fc..=lc).contains(&c))
-                });
-                if hit {
-                    self.cancel_cut();
-                }
+        // Excel; the clip then pastes as a copy. (A cut's own paste has
+        // already ended it, `paste_from`.)
+        if let Some(clip) = self.clip.as_ref().filter(|c| c.cut) {
+            let (fr, fc) = clip.from;
+            let (lr, lc) = (fr + clip.span.0.max(1) - 1, fc + clip.span.1.max(1) - 1);
+            let hit = keys.iter().any(|(s, cells)| {
+                *s == clip.sheet
+                    && cells
+                        .iter()
+                        .any(|&(r, c)| (fr..=lr).contains(&r) && (fc..=lc).contains(&c))
+            });
+            if hit {
+                self.cancel_cut();
             }
         }
         // What each group selects on Undo and Redo: the cells asked for,
@@ -4455,6 +4451,7 @@ impl App {
                 }
                 self.show_undo_groups(&groups);
                 self.redo.push(UndoAction::Cells(groups));
+                self.cancel_cut();
                 self.modified = true;
                 self.prune_circles();
                 self.status = Some("Undid".to_string());
@@ -4534,6 +4531,7 @@ impl App {
                 }
                 self.show_undo_groups(&groups);
                 self.push_undo(UndoAction::Cells(groups));
+                self.cancel_cut();
                 self.modified = true;
                 self.prune_circles();
                 self.status = Some("Redid".to_string());
@@ -4856,7 +4854,7 @@ impl App {
                 // A cut's rules stayed on its cells for want of a place.
                 let kept = std::cell::Cell::new(false);
                 let write = |app: &mut Self| {
-                    app.record_groups_wide(keys, cut_from, cut, |app| {
+                    app.record_groups_wide(keys, cut_from, |app| {
                         let mut rewrote = false;
                         if cut {
                             // Read before the cut: the cells only part of it
@@ -10402,7 +10400,9 @@ impl App {
     /// Make a pending cut a copy: a later paste clears nothing. Removing a
     /// sheet does this, since it can take or renumber the cut's source sheet,
     /// and so does any structural edit and the undo/redo of one, since most
-    /// of them move cells under the cut's recorded coordinates. A protection
+    /// of them move cells under the cut's recorded coordinates; an edit of
+    /// the cells it was taken from (`record_groups`) and the undo or redo of
+    /// a cell edit (the cells it restores may be the cut's). A protection
     /// toggle moves none and keeps the cut (`toggle_protection`).
     fn cancel_cut(&mut self) {
         if let Some(clip) = &mut self.clip {
@@ -26567,6 +26567,45 @@ mod tests {
         assert_eq!(number_at(&app, 0, 2, 0), Some(7.0));
         assert_eq!(formula_at(&app, 0, 4, 1).as_deref(), Some("A3"));
         assert_eq!(number_at(&app, 0, 0, 2), Some(5.0));
+    }
+
+    #[test]
+    fn undo_and_redo_of_a_cell_edit_end_a_pending_cut() {
+        // Undo puts A3 back into the cut's rectangle.
+        let mut app = repoint_app();
+        put_cells(&mut app, 0, &[(0, 0, "5"), (2, 0, "7"), (4, 1, "=A3")]);
+        app.apply(vec![(2, 0, Cell::default())]);
+        app.sheet = 0;
+        app.cur = (0, 0);
+        app.anchor = Some((2, 0));
+        app.copy(true);
+        app.undo();
+        assert!(!app.clip.as_ref().unwrap().cut);
+        assert_eq!(number_at(&app, 0, 2, 0), Some(7.0));
+        app.anchor = None;
+        app.cur = (0, 2);
+        app.paste_from(None);
+        // A copy: the 7 is not orphaned and nothing is re-pointed.
+        assert_eq!(number_at(&app, 0, 2, 0), Some(7.0));
+        assert_eq!(formula_at(&app, 0, 4, 1).as_deref(), Some("A3"));
+        assert_eq!(number_at(&app, 0, 0, 0), Some(5.0));
+
+        // Redo too.
+        let mut app = repoint_app();
+        put_cells(&mut app, 0, &[(0, 0, "5"), (4, 1, "=A3")]);
+        put_cells(&mut app, 0, &[(2, 0, "7")]);
+        app.undo();
+        app.sheet = 0;
+        app.cur = (0, 0);
+        app.anchor = Some((2, 0));
+        app.copy(true);
+        app.redo();
+        assert!(!app.clip.as_ref().unwrap().cut);
+        app.anchor = None;
+        app.cur = (0, 2);
+        app.paste_from(None);
+        assert_eq!(number_at(&app, 0, 2, 0), Some(7.0));
+        assert_eq!(formula_at(&app, 0, 4, 1).as_deref(), Some("A3"));
     }
 
     #[test]
