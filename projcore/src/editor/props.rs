@@ -6,6 +6,8 @@
 //! when the value is already the task's.
 use super::*;
 
+mod actuals;
+
 /// Project's earned value methods (MSPDI `EarnedValueMethod`).
 pub const EV_PERCENT_COMPLETE: i32 = 0;
 pub const EV_PHYSICAL_PERCENT_COMPLETE: i32 = 1;
@@ -282,5 +284,7 @@ impl Editor {
     }
 }
 
+#[cfg(test)]
+mod actuals_tests;
 #[cfg(test)]
 mod tests;
