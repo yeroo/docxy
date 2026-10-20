@@ -408,12 +408,15 @@ pub fn refresh_pivots(wb: &mut Workbook) -> RefreshOutcome {
             },
         };
         // Cache-field index → frame column, by name first (robust when the
-        // source grew), cache order as fallback.
+        // source grew), cache order as fallback for a range (a renamed
+        // header). A table's columns are named, so a missing name is a
+        // deleted column: the field has none, and the next column is not it.
+        let by_table = matches!(p.source, PivotSource::Table(_));
         let col_of = |fi: usize| -> Option<usize> {
             p.fields
                 .get(fi)
                 .and_then(|n| frame.col_index(n))
-                .or_else(|| (fi < frame.cols.len()).then_some(fi))
+                .or_else(|| (!by_table && fi < frame.cols.len()).then_some(fi))
         };
         let map_fields =
             |fs: &[usize]| -> Option<Vec<usize>> { fs.iter().map(|&f| col_of(f)).collect() };
@@ -1099,6 +1102,54 @@ mod tests {
             part: String::new(),
             cache_part: String::new(),
         }
+    }
+
+    #[test]
+    fn a_deleted_table_column_is_not_read_from_its_neighbour() {
+        use crate::sheet::{Cell, Sheet, Table};
+        let mut data = Sheet {
+            name: "Data".into(),
+            ..Sheet::default()
+        };
+        for (c, h) in ["Region", "Price", "Qty"].iter().enumerate() {
+            data.set_cell(0, c as u32, Cell::text(h));
+        }
+        data.set_cell(1, 0, Cell::text("East"));
+        data.set_cell(1, 1, Cell::number(5.0));
+        data.set_cell(1, 2, Cell::number(7.0));
+        let mut wb = Workbook {
+            sheets: vec![data, Sheet::default()],
+            ..Workbook::default()
+        };
+        wb.tables.push(Table {
+            name: "T".into(),
+            sheet: 0,
+            range: (0, 0, 1, 2),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["Region".into(), "Price".into(), "Qty".into()],
+            part: "xl/tables/table1.xml".into(),
+            column_ids: Vec::new(),
+            calculated_formulas: Vec::new(),
+        });
+        let mut piv = new_pivot();
+        piv.sheet = 1;
+        piv.location = (0, 0, 2, 1);
+        piv.source = PivotSource::Table("T".into());
+        piv.fields = vec!["Region".into(), "Price".into(), "Qty".into()];
+        piv.row_fields = vec![0];
+        piv.data_fields = vec![DataField {
+            name: "Sum of Price".into(),
+            field: 1,
+            agg: Agg::Sum,
+        }];
+        wb.pivots.push(piv);
+        // The Price column goes: field 1 would fall back to position 1 (Qty).
+        crate::edit::delete_cols(&mut wb, 0, 1, 1);
+        assert_eq!(wb.tables[0].columns, ["Region", "Qty"]);
+        let out = refresh_pivots(&mut wb);
+        assert_eq!((out.refreshed, out.skipped), (0, 1));
+        assert!(wb.sheets[1].cell(1, 1).is_none(), "no Qty aggregate drawn");
     }
 
     #[test]
