@@ -303,10 +303,12 @@ pub(crate) fn gallery_row(geom: GalleryGeom, n: usize, max_w: Option<f32>) -> (u
 // ---- the ribbonspec model (document and Project ribbons) ----
 
 /// `icon_btn`: `px_2` and a 1px border each side around a 16px icon when the
-/// command has one; with its label, a `gap_1p5` and the label at 12px. A
-/// command with no icon draws its label alone (#1608).
+/// command has one and its label at 12px when shown, a `gap_1p5` between the
+/// two only when both are there. A command with no icon draws its label
+/// alone, no gap (#1608).
 fn model_icon_btn_w(icon: bool, label: Option<&str>, tw: TextWidth) -> f32 {
-    18.0 + if icon { 16.0 } else { 0.0 } + label.map_or(0.0, |l| 6.0 + tw(l, 12.0))
+    let gap = if icon { 6.0 } else { 0.0 };
+    18.0 + if icon { 16.0 } else { 0.0 } + label.map_or(0.0, |l| gap + tw(l, 12.0))
 }
 
 /// One control's drawn width; a gallery wraps its tiles to `max_w` (a
@@ -359,7 +361,7 @@ pub(crate) fn model_control_w<A>(
                     .map(|cell| match cell {
                         rs::Cell::Combo { wide: true, .. } => 104.0,
                         rs::Cell::Combo { wide: false, .. } => 46.0,
-                        rs::Cell::Btn(_) => model_icon_btn_w(true, None, tw),
+                        rs::Cell::Btn(cmd) => model_icon_btn_w(!cmd.icon.0.is_empty(), None, tw),
                     })
                     .sum();
                 cells + row.len().saturating_sub(1) as f32
@@ -743,7 +745,8 @@ mod tests {
         assert_eq!(model_control_w(&with_icon, false, None, &tw), 34.0);
         assert_eq!(
             model_control_w(&no_icon, false, None, &tw),
-            18.0 + 6.0 + tw("Plain", 12.0)
+            18.0 + tw("Plain", 12.0),
+            "the label alone, no icon slot and no gap"
         );
     }
 
