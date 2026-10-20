@@ -482,8 +482,11 @@
   never delayed and are booked at the dates the plan gives them now (a held
   automatic task over each assignment's own window, a manual or tracked one
   its whole span; an automatic follower of a moved task still follows its
-  links once the delays are written, so a conflict that leaves is reported
-  as overallocated for a further pass); an ALAP task is neither delayed nor
+  links once the delays are written, so the pass repeats on the plan with
+  its delays written until no targeted task needs more, and a conflict with
+  a follower that remains is reported as overallocated: a later pass
+  resolves it only with the follower in its scope or with `clear_first` off,
+  the default rebuilding the same cleared plan); an ALAP task is neither delayed nor
   booked (Project 2024 refuses a delay on one, measured, so the schedule
   ignores a stored one, and its late dates float with the finish);
   `within_slack` leaves a task that would start past its CPM late start at
@@ -502,10 +505,12 @@
   (`level_tasks_with` takes `LevelOptions` for one pass) writes
   `leveling_delay` (format 8) and `pre_leveled_start/finish` (from the plan
   without the scope's delays, whatever `clear_first` says, so a repeated
-  pass records no step) as one undo step, every targeted leaf that can
-  carry a delay (not ALAP, not priority 1000) settled against a rescheduled
-  trial so the committed dates equal the leveled ones exactly (a plan that
-  does not settle is refused with nothing changed). With
+  pass records no step) as one undo step: only the delays the leveler asks
+  for, so a task a constraint or another predecessor already holds takes
+  none (as Project leaves it), and the reply (`delayed`, `overallocated`,
+  the tasks' starts) reports the committed schedule, not the display
+  overlay. `projctl::mutates(verb, args)` is the hosts' edit test: a bare
+  `level.options {}` is a read. With
   `clear_first` a priority-1000 task's stored delay is cleared too and the
   task holds at its unleveled start (measured). `clear_leveling(uids | all)`
   is one step. `LevelOptions` are the plan options `LevelingOrder`,

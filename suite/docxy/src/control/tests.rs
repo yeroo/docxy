@@ -319,6 +319,7 @@ fn reads_and_rejected_edits_preserve_prompt_selection_history_and_scroll() {
         ("resource.list", Json::Null),
         ("resource.get", args(r#"{"uid":1}"#)),
         ("level.overallocations", Json::Null),
+        ("level.options", args("{}")),
         ("cal.list", Json::Null),
         ("cal.get", args(r#"{"calendar":"Standard"}"#)),
         (

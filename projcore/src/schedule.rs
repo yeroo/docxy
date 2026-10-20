@@ -1303,8 +1303,17 @@ impl<'a> Scheduler<'a> {
         }
         let tl = self.tl(successor);
         let span = tl.to_index(slf) - tl.to_index(sls);
-        let start = sls - delay;
-        (start, tl.abs_start(tl.to_index(start) + span))
+        // The latest working start whose snapped delayed start is still at
+        // or before the bound: the delay counts from a snapped start, so a
+        // start just before a weekend can reach past the bound (r4).
+        let mut k = tl.to_index(sls - delay);
+        let mut guard = 0;
+        while k > 0 && guard < 10_000 && tl.snap(tl.abs_start(k).saturating_add(delay)) > sls {
+            k -= 1;
+            guard += 1;
+        }
+        let start = tl.abs_start(k);
+        (start, tl.abs_start(k + span))
     }
 
     fn fixed_successor_cap(
@@ -2195,6 +2204,9 @@ impl<'a> Scheduler<'a> {
                 .fixed
                 .map(|span| span.0)
                 .or_else(|| es_abs.get(&suid).copied())
+                // Less the successor's stored delay (#1594 r4): the
+                // predecessor cannot slip into it.
+                .map(|es| self.late_bounds_before_delay(succ, es, es).0)
             else {
                 continue;
             };
@@ -2226,7 +2238,11 @@ impl<'a> Scheduler<'a> {
                     .and_then(|p| self.absolute_span(p.uid, graph, es_abs, ef_abs)),
             );
             for target in &group_early[group_id] {
-                bounds.push((target.uid, offset, target.start, target.milestone));
+                let succ = &self.proj.tasks[graph.by_uid[&target.uid]];
+                let start = self
+                    .late_bounds_before_delay(succ, target.start, target.start)
+                    .0;
+                bounds.push((target.uid, offset, start, target.milestone));
             }
         }
         for (suid, offset, start, milestone) in bounds {
@@ -9394,9 +9410,54 @@ mod tests {
             "Tuesday 08:00 plus one elapsed day"
         );
         assert_eq!((a.total_slack_min, a.critical), (0, true));
+        assert_eq!(a.free_slack_min, 0, "A cannot slip into B's delay");
         assert_eq!((b.total_slack_min, b.critical), (0, true));
         assert_eq!((c.total_slack_min, c.critical), (2 * 480, false));
         assert_eq!(s.project_finish, at(4, 17));
+    }
+
+    /// #1594 r4: the bound inverts the snap too. From Thursday the 5th, X and
+    /// A share R, B follows A with a two-elapsed-day delay: B's Friday driven
+    /// start plus two days snaps from Sunday to Monday. A has less than a
+    /// day of slack: a Friday A would drive B from Monday, two days later.
+    #[test]
+    fn a_delayed_successor_over_a_weekend_leaves_under_a_day_of_slack() {
+        let mut b = task(3, "B", 480);
+        b.predecessors.push(fs(2));
+        b.leveling_delay = Some(2 * 1440 * 10);
+        b.leveling_delay_format = Some(8);
+        let proj = Project {
+            start_date: Some(at(5, 8)),
+            tasks: vec![task(1, "X", 480), task(2, "A", 480), b],
+            resources: vec![worker(1, "R", 1.0)],
+            assignments: vec![assign(1, 1, 1, 1.0), assign(2, 2, 1, 1.0)],
+            ..Project::default()
+        };
+        let s = schedule(&proj);
+        assert_eq!(s.get(3).unwrap().early_start, at(9, 8), "Monday");
+        let a = s.get(2).unwrap();
+        // A may finish up to the last minute of Friday (B then starts
+        // Monday still), not a whole day later: under a day of slack,
+        // where the bound without the walk-back would give it a full one.
+        assert!(
+            a.total_slack_min > 0 && a.total_slack_min < 480,
+            "{}",
+            a.total_slack_min
+        );
+        assert_eq!(a.free_slack_min, a.total_slack_min);
+        // Within slack, selecting A alone, a whole day is too far: nothing
+        // moves and the finish holds.
+        let only_a: std::collections::HashSet<i32> = [2].into_iter().collect();
+        let lv = level_with(
+            &proj,
+            &LevelScope {
+                movable: Some(&only_a),
+                within_slack: true,
+                ..LevelScope::default()
+            },
+        );
+        assert_eq!(lv.start(2), Some(at(5, 8)));
+        assert_eq!(lv.delay_min(2), Some(0));
     }
 
     /// #1594 r2: an ALAP task takes no leveling delay (Project 2024 refuses

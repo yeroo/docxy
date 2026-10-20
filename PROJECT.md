@@ -286,11 +286,15 @@ each leveled task's own `LevelingDelay` (elapsed minutes from the start its
 links, constraints and leveled predecessors drive it to, so a task that only
 follows a delayed predecessor records none, as Project does; in tenths of a
 minute with `LevelingDelayFormat` 8, as Project 2024 stores it) and
-`PreLeveledStart`/`Finish` (its unleveled dates), one undo step, settled so
-the stored delays reproduce the leveled dates exactly (a plan that cannot be
-reproduced is refused). An automatic task outside the scope still follows
-its links once the delays are written, so a conflict that leaves is reported
-as overallocated for a further pass; an ALAP task is neither delayed nor
+`PreLeveledStart`/`Finish` (its unleveled dates), one undo step; only the
+delays the leveler asks for are written, so a task a constraint or another
+predecessor already holds takes none, as Project leaves it. An automatic
+task outside the scope still follows its links once the delays are written,
+so the pass repeats on the plan with its delays written until no targeted
+task needs more; a conflict with such a follower that remains is reported as
+overallocated, and a later pass resolves it only with the follower in its
+scope or with `clear_first` off (the default rebuilds the same cleared
+plan); an ALAP task is neither delayed nor
 booked (Project 2024 refuses a delay on one, and its late dates float with
 the finish, so an overallocation it causes stays); a delayed task's
 predecessors have the zero slack

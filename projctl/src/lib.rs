@@ -39,7 +39,7 @@
 //! | `level.all` | `{}` | `{leveled: true, overallocated}` (#1589): show the plan leveled, as Resource > Level > Level All's display overlay; `overallocated` counts the work resources still booked past their capacity. Not an undo step: the overlay is a display setting |
 //! | `level.clear` | `{}` | `{leveled: false, overallocated}` (#1589): show the plan as scheduled again. With `{uids: [uid…]}` or `{all: true}` (#1594) it is Clear Leveling as a plan edit instead: the tasks' stored `LevelingDelay` and pre-leveled dates are removed, one undo step, replying `{cleared, overallocated}` |
 //! | `level.overallocations` | `{}` | `{count, resources: [{uid, name, max_units, peak_units, first}]}` (#1589): the work resources booked past their capacity on the plan as shown, each with its peak (1.0 = 100%) and the first overallocated instant, earliest first (Next Overallocation) |
-//! | `level.selection` | `{uids: [uid…], options?}` | `{changed, delayed, overallocated, tasks: [{uid, leveling_delay_min, start}]}` (#1594): Level Selection as a plan edit. The leveler runs over the plan with only these tasks (a summary stands for its subtasks) free to move, every other task taking no delay of its own and booked at the dates the plan gives it now (an automatic one still follows its links once the delays are written; a conflict that leaves is reported as overallocated for a further pass), and writes each moved task's own `LevelingDelay` (elapsed minutes from the start its leveled predecessors drive it to, stored in tenths of a minute as Project does) and pre-leveled dates, one undo step. `changed` counts the tasks whose stored values changed (0 records no step), `delayed` those left with a delay, `tasks` every targeted leaf with its delay and start after the pass. The plan's Leveling Options apply |
+//! | `level.selection` | `{uids: [uid…], options?}` | `{changed, delayed, overallocated, tasks: [{uid, leveling_delay_min, start}]}` (#1594): Level Selection as a plan edit. The leveler runs over the plan with only these tasks (a summary stands for its subtasks) free to move, every other task taking no delay of its own and booked at the dates the plan gives it now (an automatic one still follows its links once the delays are written, so the pass repeats until no targeted task needs more; a conflict with such a follower that remains is reported as overallocated, and a later pass resolves it only with the follower in its scope or with `clear_first` off), and writes each moved task's own `LevelingDelay` (elapsed minutes from the start its leveled predecessors drive it to, stored in tenths of a minute as Project does) and pre-leveled dates, one undo step. `changed` counts the tasks whose stored values changed (0 records no step), `delayed` those left with a delay, `tasks` every targeted leaf with its delay and start after the pass. The plan's Leveling Options apply |
 //! | `level.resource` | `{resource, options?}` | the same reply (#1594): Level Resource, over the tasks the resource (a uid or a name) is assigned to. `options` (both verbs) is a `level.options` object applied to this pass only; the plan's options stay as they are. A task that only follows a delayed predecessor records no delay of its own, as Project does |
 //! | `level.options` | `{order?, within_slack?, adjust_assignments?, split?, clear_first?}` | `{order, within_slack, adjust_assignments, split, clear_first}` (#1594): Project's Leveling Options as plan options, read with `{}`, set as one undo step (an unchanged setting records none). `order` is `ID`, `Standard` (the default: dependencies, then the plan's row order) or `Priority` (the highest priority first; priority 1000 is never leveled); `within_slack` never delays a task past its total slack; `clear_first` (default true) drops the targeted tasks' stored delays before a pass, else it builds on them; `adjust_assignments` and `split` are kept with the plan, the leveler delaying whole tasks |
 //! | `cal.list` | `{}` | `{count, calendars: [{uid, name, base: {uid, name} \| null, default, resources: [uid…], tasks: [uid…]}]}` (#1605), base calendars first |
@@ -145,6 +145,14 @@ pub const MUTATING: &[&str] = &[
     "cal.workweek.del",
     "cal.del",
 ];
+
+/// Whether a call changes the plan (#1594 r4): a [`MUTATING`] verb, except
+/// `level.options` with no setting named, which only reads the options.
+pub fn mutates(verb: &str, args: &Json) -> bool {
+    MUTATING.contains(&verb)
+        && !(verb == "level.options" && matches!(args, Json::Obj(pairs) if pairs.is_empty())
+            || verb == "level.options" && matches!(args, Json::Null))
+}
 
 /// Recognize editor verbs before a host resolves its target document.
 pub fn is_editor_verb(verb: &str) -> bool {
@@ -428,8 +436,11 @@ fn level_edit(ed: &mut Editor, args: &Json, by_resource: bool) -> Result<Json, S
                 ),
                 (
                     "start",
-                    ed.disp_start(uid)
-                        .map_or(Json::Null, |d| Json::Str(dt_str(d))),
+                    // The committed schedule's start (#1594 r4), not the
+                    // display overlay's.
+                    ed.schedule()
+                        .get(uid)
+                        .map_or(Json::Null, |r| Json::Str(dt_str(r.early_start))),
                 ),
             ]))
         })
@@ -3766,6 +3777,13 @@ it"
         for verb in ["level.selection", "level.resource", "level.options"] {
             assert!(is_editor_verb(verb) && MUTATING.contains(&verb), "{verb}");
         }
+        // A bare `level.options` reads; one naming a setting edits (#1594 r4).
+        assert!(!mutates("level.options", &Json::obj(vec![])));
+        assert!(mutates(
+            "level.options",
+            &Json::obj(vec![("within_slack", Json::Bool(true))])
+        ));
+        assert!(mutates("level.selection", &Json::obj(vec![])));
         let mut ed = staffed(projcore::model::TaskType::FixedUnits, false);
         run(&mut ed, "task.add", r#"{"name":"Paint","duration":"2d"}"#).unwrap();
         run(&mut ed, "assign.add", r#"{"task":1,"resource":1}"#).unwrap();

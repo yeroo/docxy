@@ -153,15 +153,14 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         other => projctl::dispatch_editor(&mut app.ed, other, args)
             .unwrap_or_else(|| Err(format!("unknown verb '{other}'"))),
     };
-    if out.is_ok()
-        && (projctl::MUTATING.contains(&verb) || matches!(verb, "proj.open" | "proj.reload"))
+    if out.is_ok() && (projctl::mutates(verb, args) || matches!(verb, "proj.open" | "proj.reload"))
     {
         app.refresh_confirm();
     }
     if out.is_ok() {
         // An agent edit flashes this pane's status dot, so a watcher sees the
         // plan being worked on.
-        if projctl::MUTATING.contains(&verb) {
+        if projctl::mutates(verb, args) {
             ctlcore::signal_activity();
         }
     }

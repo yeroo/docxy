@@ -265,7 +265,7 @@ pub(crate) fn project_verb(
                 let result = projctl::dispatch_editor(&mut v.ed, verb, args)
                     .expect("recognized editor verb")?;
                 let mut effect = Effect::default();
-                if projctl::MUTATING.contains(&verb) {
+                if projctl::mutates(verb, args) {
                     tab.dirty = v.ed.dirty();
                     crate::bump_edit_generation();
                     v.cancel_prompt();
