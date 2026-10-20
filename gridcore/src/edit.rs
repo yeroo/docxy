@@ -2050,7 +2050,7 @@ fn span(a: u32, b: u32, shift: &EditShift) -> Option<(u32, u32)> {
 /// A delete that removes a spilling anchor's own row/column removes its spill
 /// too, as in Excel: the spilled cells are plain values with no link to the
 /// anchor, so they would survive the shift as orphan constants. Clear the ones
-/// that are values (not formulas, as `engine::clear_spill`); styles stay.
+/// that are values (not formulas, `engine::clear_spill`'s rule); styles stay.
 fn clear_orphaned_spills(sheet: &mut Sheet, shift: &EditShift) {
     let gone: Vec<_> = sheet
         .cells
@@ -2062,17 +2062,9 @@ fn clear_orphaned_spills(sheet: &mut Sheet, shift: &EditShift) {
         })
         .collect();
     for (r, c, h, w) in gone {
-        for rr in r..r + h {
-            for cc in c..c + w {
-                if (rr, cc) != (r, c)
-                    && sheet
-                        .cell(rr, cc)
-                        .is_some_and(|cl| cl.formula.is_none() && !cl.value.is_empty())
-                {
-                    sheet.clear_cell_unpinned(rr, cc);
-                }
-            }
-        }
+        // The engine keys and sheet index are unused: hosts rebuild the
+        // engine after a structural edit.
+        crate::engine::clear_spill(sheet, 0, (r, c), (h, w), None);
     }
 }
 
