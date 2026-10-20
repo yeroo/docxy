@@ -3500,8 +3500,12 @@ impl Leveled {
 
 /// Resource-level a project: run CPM, then delay tasks so that no work resource
 /// is booked beyond its capacity, never scheduling a task before its CPM early
-/// start and never breaking a dependency (a predecessor's leveling delay is
-/// propagated to its successors, preserving every local link's gap).
+/// start and never breaking a dependency among the tasks it may move (a
+/// predecessor's leveling delay is propagated to its movable successors,
+/// preserving every local link's gap; a held successor, priority 1000, ALAP or
+/// outside the scope, keeps its CPM dates here, so a link into it may be
+/// broken in this overlay until the delays are committed and the forward pass
+/// moves it).
 /// Inactive tasks book no resource capacity and report their CPM dates; an
 /// active predecessor's leveling delay does not propagate to an inactive one.
 /// External leaves, their links, and their assignments are excluded. A dated

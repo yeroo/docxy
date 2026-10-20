@@ -540,8 +540,8 @@
   on the lightest plan it reached (within slack a task whose own delay would
   move the project finish, a written delay stretching a summary's span and a
   percentage lag on the summary's link with it, is held at its earliest
-  start and the round rerun without it; a move no single task explains drops
-  the round), and reports a conflict that remains as
+  start and the round rerun without it; a move no task explains alone or by
+  its restoration drops the round), and reports a conflict that remains as
   overallocated: a later pass resolves it only with the
   follower in its scope or with `clear_first` off, the default rebuilding the
   same cleared plan); an ALAP task is neither delayed nor

@@ -74,8 +74,8 @@ impl Editor {
     /// would move the project finish (a written delay stretches its
     /// summary's span, and a percentage lag on the summary's link grows
     /// with it) is held at its earliest start, overallocated, and the round
-    /// runs again without it; a move no single task explains drops the
-    /// round. An ALAP task is never delayed nor
+    /// runs again without it; a move no task explains alone or by its
+    /// restoration drops the round. An ALAP task is never delayed nor
     /// booked (Project 2024 refuses a delay on one; its late dates float
     /// with the finish), so an overallocation it causes stays. Only the
     /// delays the leveler asks for are written: a task a constraint or
@@ -215,18 +215,31 @@ impl Editor {
             // written delay stretches its summary's span, and a percentage
             // lag on the summary's link grows with it, past the slack the
             // leaf alone had. The tasks whose delay did it (each one whose
-            // kept delay, restored, brings the finish back) are held and the
-            // round runs again without them (r15); a move no single task
-            // explains drops the round, and the held tasks stay at their
-            // earliest start, overallocated, as the option promises.
+            // kept delay, restored, brings the finish back, or whose delay
+            // alone moves it) are held and the round runs again without them
+            // (r15, r16); a move no task explains alone or by its restoration
+            // drops the round, and the held tasks stay at their earliest
+            // start, overallocated, as the option promises.
             if options.within_slack && finish > finish_at_start {
                 let culprits: Vec<i32> = moved
                     .iter()
                     .filter_map(|&i| {
-                        let mut probe = round.clone();
-                        probe.tasks[i].leveling_delay = trial.tasks[i].leveling_delay;
-                        probe.tasks[i].leveling_delay_format = trial.tasks[i].leveling_delay_format;
-                        (pressure(&probe).1 <= finish_at_start).then_some(round.tasks[i].uid)
+                        // Two probes (r16): restored to its kept delay, does
+                        // the finish come back (the delay was the one move)?
+                        // Applied alone to the pass's plan, does its delay
+                        // move the finish (one of several moves)? Either
+                        // holds the task, so two tasks that each move the
+                        // finish are both held and the rest still level.
+                        let mut restored = round.clone();
+                        restored.tasks[i].leveling_delay = trial.tasks[i].leveling_delay;
+                        restored.tasks[i].leveling_delay_format =
+                            trial.tasks[i].leveling_delay_format;
+                        let mut alone = trial.clone();
+                        alone.tasks[i].leveling_delay = round.tasks[i].leveling_delay;
+                        alone.tasks[i].leveling_delay_format = round.tasks[i].leveling_delay_format;
+                        (pressure(&restored).1 <= finish_at_start
+                            || pressure(&alone).1 > finish_at_start)
+                            .then_some(round.tasks[i].uid)
                     })
                     .collect();
                 if culprits.is_empty() {
@@ -1230,6 +1243,100 @@ mod tests {
         );
     }
 
+    /// #1594 r16: two tasks whose delays each move the finish are both held,
+    /// and the conflict that moves nothing still levels. The r15 plan
+    /// doubled: S1 {A, B} (Ann) with C after S1 at a 100% lag, S2 {X, Y}
+    /// (Bob) with Z after S2 at a 100% lag, D setting Thursday, and W, V
+    /// (Carol, unlinked). Within slack V takes its day; B and Y (and A and X
+    /// in their turn) are held; the finish stays Thursday.
+    #[test]
+    fn within_slack_holds_every_task_whose_delay_moves_the_finish() {
+        let mut p = untitled_project();
+        let anchor = p.start_date.unwrap();
+        let day = |n: i64, min: i64| DateTime::from_minutes(anchor.minutes() + n * 1440 + min);
+        let leaf = |uid: i32, name: &str, level: u32, minutes: i64| Task {
+            uid,
+            id: uid,
+            name: name.into(),
+            outline_level: level,
+            duration_min: minutes,
+            ..Task::default()
+        };
+        let percent_after = |uid: i32, name: &str, summary: i32| {
+            let mut t = leaf(uid, name, 1, 480);
+            t.predecessors.push(Predecessor {
+                lag: 100,
+                lag_format: crate::model::LagFormat::from_code(19).unwrap(),
+                ..Predecessor::fs(summary)
+            });
+            t
+        };
+        p.tasks.push(Task {
+            summary: true,
+            ..leaf(1, "S1", 1, 0)
+        });
+        p.tasks.push(leaf(2, "A", 2, 480));
+        p.tasks.push(leaf(3, "B", 2, 480));
+        p.tasks.push(percent_after(4, "C", 1));
+        p.tasks.push(Task {
+            summary: true,
+            ..leaf(5, "S2", 1, 0)
+        });
+        p.tasks.push(leaf(6, "X", 2, 480));
+        p.tasks.push(leaf(7, "Y", 2, 480));
+        p.tasks.push(percent_after(8, "Z", 5));
+        p.tasks.push(leaf(9, "D", 1, 4 * 480));
+        p.tasks.push(leaf(10, "W", 1, 480));
+        p.tasks.push(leaf(11, "V", 1, 480));
+        for (uid, name) in [(1, "Ann"), (2, "Bob"), (3, "Carol")] {
+            p.resources.push(Resource {
+                uid,
+                id: uid,
+                name: name.into(),
+                max_units: 1.0,
+                ..Resource::default()
+            });
+        }
+        for (uid, res) in [(2, 1), (3, 1), (6, 2), (7, 2), (10, 3), (11, 3)] {
+            p.assignments.push(Assignment {
+                uid,
+                task_uid: uid,
+                resource_uid: res,
+                units: 1.0,
+                ..Assignment::default()
+            });
+        }
+        let thursday = day(3, 9 * 60);
+        let mut ed = Editor::new(p);
+        assert_eq!(ed.schedule().project_finish, thursday);
+        ed.set_level_options(&LevelOptions {
+            within_slack: true,
+            ..LevelOptions::default()
+        })
+        .unwrap();
+        let out = ed
+            .level_tasks(&LevelTarget::Selection(vec![2, 3, 6, 7, 10, 11]))
+            .unwrap();
+        assert_eq!((out.changed, out.delayed, out.overallocated), (1, 1, 2));
+        assert_eq!(
+            ed.project().task(11).unwrap().leveling_delay,
+            Some(1440 * 10),
+            "V takes its day"
+        );
+        for uid in [2, 3, 6, 7] {
+            assert_eq!(
+                ed.project().task(uid).unwrap().leveling_delay,
+                None,
+                "{uid} is held"
+            );
+        }
+        assert_eq!(
+            ed.schedule().project_finish,
+            thursday,
+            "the finish stays Thursday"
+        );
+    }
+
     /// #1594 r15: the task that moves the finish is held, the others still
     /// level. The r14 plan plus X and Y (one day each, Bob, unlinked):
     /// within slack B is held (its delay would move the finish through C's
@@ -1314,8 +1421,9 @@ mod tests {
     /// holds A and B (one day each, Ann); C follows S with a 100% lag; D
     /// (four days) ends the project Thursday. B has a day of slack, but its
     /// delay would stretch S to two days, double C's lag and end the project
-    /// Friday: the round is dropped and B stays, overallocated. Without the
-    /// option the same pass moves the finish.
+    /// Friday: B is held, A is held in turn when the rerun moves it instead,
+    /// and both stay, overallocated. Without the option the same pass moves
+    /// the finish.
     #[test]
     fn within_slack_never_moves_the_project_finish_through_a_summarys_percent_lag() {
         let mut p = untitled_project();

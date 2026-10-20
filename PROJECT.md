@@ -267,8 +267,11 @@ finish; a stored `LevelingDelay`, Project's last leveling, is not added. A
 resource that is free and available somewhere takes a task above its capacity
 there, and one with no capacity anywhere later is left overallocated: the task
 goes where every other resource fits, or keeps its earliest start when it has
-no other. An active predecessor's leveling delay propagates to active
-successors, preserving their link gaps. Inactive tasks book no capacity and
+no other. An active predecessor's leveling delay propagates to the active
+successors the leveler may move, preserving their link gaps; a held successor
+(priority 1000, ALAP, outside the scope) keeps its CPM dates in this overlay
+and follows only once the delays are committed and the forward pass moves
+it. Inactive tasks book no capacity and
 keep their CPM dates, even when an active predecessor is delayed by leveling.
 v1 is single-calendar and delay-only,
 and treats a task's occupation as its wall-clock span; multi-calendar leveling
@@ -315,7 +318,8 @@ the order is `Standard` (the topological order above), `ID` (the lowest ID
 first among the ready tasks) or `Priority` (the highest priority first);
 within slack never delays a task past its CPM late start (the slack a
 leveled predecessor used counts) nor moves the project finish (a task whose
-delay would, through a summary's percentage lag, stays put, overallocated);
+delay would move it through a summary's percentage lag stays put,
+overallocated);
 clear-first (the default) drops the
 scope's stored delays before the pass, a priority-1000 task's too (measured
 on Project 2024: it then holds at its unleveled start), else the pass builds
