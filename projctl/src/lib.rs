@@ -916,15 +916,8 @@ impl TaskInfoArgs {
                 }
             } else {
                 // A started task keeps its actual and remaining duration at
-                // the percent's share of the duration, as an actual duration
-                // would; a task with no actual start just takes the percent.
-                let t = ed.project().task(uid);
-                let started = t.is_some_and(|t| t.actual_start.is_some());
-                let duration = t.map_or(0, |t| t.duration_min);
-                if started && (1..=100).contains(&p) {
-                    ed.set_actual_duration(uid, (duration * i64::from(p) + 50) / 100)?;
-                }
-                ed.set_percent_complete(uid, p)?;
+                // the percent's share of the duration; see the method.
+                ed.set_percent_complete_synced(uid, p)?;
             }
         }
         if let Some(p) = self.priority {

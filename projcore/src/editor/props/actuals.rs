@@ -78,8 +78,9 @@ impl Editor {
             .ok_or_else(|| "The task has no start".into())
     }
 
-    /// Write `new` over task `i`, which was `old` before the edit began; `Ok(false)` when it changes nothing.
-    /// `snapshotted` says the edit's undo step is already open. A change to
+    /// Write `new` over task `i`, which was `old` before the edit began.
+    /// Returns `false` when it changes nothing and no step is open
+    /// (`snapshotted` false), else `true`. `snapshotted` says the edit's undo step is already open. A change to
     /// the completed part (its start or the work done) drops `Stop`/`Resume`,
     /// which would otherwise end it where the old one did; a change that
     /// leaves it alone (the remaining duration) keeps them. A manual task's
@@ -156,8 +157,9 @@ impl Editor {
     /// task: 100 %, actual duration = duration, no remaining duration, and an
     /// actual start from the task's scheduled start when it has none. A
     /// finish before the actual start is refused. Clearing it keeps the actual
-    /// start and duration: % Complete is their share (99 when no actual
-    /// duration is recorded) and the remaining duration what is left.
+    /// start and duration: % Complete is their share and the remaining duration
+    /// what is left. With no actual duration recorded it records 99 % of the
+    /// duration as the actual and the rest as remaining.
     pub fn set_actual_finish(
         &mut self,
         uid: i32,
@@ -287,5 +289,42 @@ impl Editor {
         let i = self.index(uid)?;
         self.store_progress(i, old, p, true);
         Ok(true)
+    }
+
+    /// Set the task's % Complete and keep a started task's actual and
+    /// remaining duration at that share of its duration (the rule an Update
+    /// Tasks edit of % Complete follows), as one undo step. An unstarted task,
+    /// and 0 %, take [`Self::set_percent_complete`] alone. A started task
+    /// records the actual duration `percent` of its duration (no actual finish
+    /// is invented at 100 %), and is left untouched (`Ok(false)`, `Stop` and
+    /// `Resume` kept) when it already has that percent and an actual
+    /// duration: the stored percent is what is compared, so a recorded actual
+    /// that rounds differently is not rewritten. Refused as
+    /// [`Self::set_percent_complete`] refuses.
+    pub fn set_percent_complete_synced(&mut self, uid: i32, percent: i32) -> Result<bool, String> {
+        let i = self.property_row(uid)?;
+        let task = &self.proj.tasks[i];
+        if task.actual_start.is_none() || percent <= 0 || task.summary {
+            return self.set_percent_complete(uid, percent);
+        }
+        let percent = u8::try_from(percent)
+            .ok()
+            .filter(|p| *p <= 100)
+            .ok_or("% Complete is 0 to 100")?;
+        let old = Progress::of(task);
+        if old.percent == percent && old.actual.is_some() {
+            return Ok(false);
+        }
+        if old.finish.is_some() && percent < 100 {
+            return Err("The task has an actual finish, so it is 100% complete".into());
+        }
+        let mut new = old;
+        new.percent = percent;
+        new.actual = Some(share(old.duration, i64::from(percent)));
+        new.remaining = old
+            .finish
+            .is_none()
+            .then(|| old.duration - share(old.duration, i64::from(percent)));
+        Ok(self.store_progress(i, old, new, false))
     }
 }

@@ -11,6 +11,7 @@ fn editor() -> Editor {
                 id: 1,
                 name: "S".into(),
                 outline_level: 1,
+                duration_min: 1920,
                 ..Task::default()
             },
             Task {
@@ -224,6 +225,8 @@ fn a_stale_stop_is_dropped_with_the_actual() {
 #[test]
 fn summaries_blank_rows_and_milestones_are_refused() {
     let mut ed = editor();
+    let err = ed.set_actual_duration(1, 480).unwrap_err();
+    assert!(err.contains("summary"), "the summary guard refuses: {err}");
     for uid in [1, 3, 4] {
         assert!(ed.set_actual_start(uid, Some(at(5, 8))).is_err());
         assert!(ed.set_actual_finish(uid, Some(at(5, 8))).is_err());
@@ -366,4 +369,62 @@ fn clearing_the_finish_of_an_import_with_no_actual_duration_pins_the_share() {
         panic!("in progress")
     };
     assert_eq!(remaining_min, 1920 - 1901);
+}
+
+#[test]
+fn a_synced_percent_leaves_a_matching_started_task_alone() {
+    let mut proj = editor().project().clone();
+    let t = proj.tasks.iter_mut().find(|t| t.uid == 2).unwrap();
+    t.actual_start = Some(at(5, 8));
+    t.actual_duration_min = Some(1000);
+    t.remaining_duration_min = Some(920);
+    t.percent_complete = Some(52);
+    t.stop = Some(at(6, 17));
+    t.resume = Some(at(8, 8));
+    let mut ed = Editor::new(proj);
+    assert_eq!(ed.set_percent_complete_synced(2, 52), Ok(false));
+    assert_eq!(ed.undo_depth(), 0);
+    let t = pour(&ed);
+    assert_eq!(
+        (t.actual_duration_min, t.resume),
+        (Some(1000), Some(at(8, 8)))
+    );
+    // Another percent moves the actual with it, in one step.
+    assert_eq!(ed.set_percent_complete_synced(2, 50), Ok(true));
+    assert_eq!(ed.undo_depth(), 1);
+    let t = pour(&ed);
+    assert_eq!(
+        (t.actual_duration_min, t.remaining_duration_min),
+        (Some(960), Some(960))
+    );
+    assert_eq!(t.resume, None);
+    assert!(ed.undo());
+    assert_eq!(pour(&ed).percent_complete, Some(52));
+}
+
+#[test]
+fn a_synced_percent_records_the_actual_of_a_started_task_only() {
+    let mut ed = editor();
+    assert_eq!(ed.set_percent_complete_synced(2, 30), Ok(true));
+    let t = pour(&ed);
+    assert_eq!(
+        (t.percent_complete, t.actual_duration_min, t.actual_start),
+        (Some(30), None, None)
+    );
+    ed.set_actual_start(2, Some(at(5, 8))).unwrap();
+    assert_eq!(ed.set_percent_complete_synced(2, 100), Ok(true));
+    let t = pour(&ed);
+    assert_eq!(
+        (
+            t.actual_duration_min,
+            t.remaining_duration_min,
+            t.actual_finish
+        ),
+        (Some(1920), Some(0), None)
+    );
+    assert!(ed.set_percent_complete_synced(2, 101).is_err());
+    assert!(
+        ed.set_percent_complete_synced(2, 0).is_err(),
+        "started, not 0%"
+    );
 }
