@@ -614,19 +614,64 @@ fn utf8_len(b: u8) -> usize {
     }
 }
 
-/// A document whose XML declaration names ISO-8859-1 (or `latin1`), as
-/// UTF-8 text: each byte is the character of that code point, and the
-/// declaration then says `UTF-8`, so the text matches what it declares, also
-/// after a save adds non-ASCII text to it. `None` for any other declared
-/// encoding, and for non-ASCII input that is valid UTF-8 (UTF-8 under a
-/// wrong declaration, kept as it is); pure ASCII reads the same either way.
-/// Some writers emit such parts (LibreOffice's tdf76115.xlsx), and Excel
-/// reads them by their declaration (#1108).
-pub fn latin1_to_utf8(bytes: &[u8]) -> Option<String> {
+/// A document whose XML declaration names windows-1252 (`cp1252`) or
+/// ISO-8859-1 (`latin1`, `latin-1`), as UTF-8 text declaring `UTF-8`, so the
+/// text matches what it declares, also after a save adds non-ASCII text to
+/// it. Both read through the windows-1252 table, as Excel reads ISO-8859-1
+/// (its `0x80..0x9F` are the euro sign, curly quotes and the like, not C1
+/// controls).
+///
+/// `None` for any other declared encoding, for non-ASCII input that is valid
+/// UTF-8 (UTF-8 under a wrong declaration, kept as it is), and for no
+/// declaration; pure ASCII reads the same either way. UTF-16 is left alone on
+/// purpose: no known xlsx writer emits it, and parts kept as they were
+/// (docProps, #1116) rely on it. Some writers emit the single-byte ones
+/// (LibreOffice's tdf76115.xlsx), and Excel reads them by their declaration
+/// (#1108, #1116). gridcore's `textio` has a table of its own; this crate
+/// cannot depend on it.
+pub fn declared_to_utf8(bytes: &[u8]) -> Option<String> {
     if !bytes.starts_with(b"<?xml") || (!bytes.is_ascii() && std::str::from_utf8(bytes).is_ok()) {
         return None;
     }
-    let decl = &bytes[..bytes.windows(2).position(|w| w == b"?>")?];
+    let (start, end, name) = declared_encoding(bytes)?;
+    if ![
+        "windows-1252",
+        "cp1252",
+        "windows1252",
+        "iso-8859-1",
+        "latin1",
+        "latin-1",
+    ]
+    .iter()
+    .any(|n| name.eq_ignore_ascii_case(n.as_bytes()))
+    {
+        return None;
+    }
+    let text = |b: &[u8]| b.iter().map(|&b| cp1252(b)).collect::<String>();
+    Some(text(&bytes[..start]) + "UTF-8" + &text(&bytes[end..]))
+}
+
+/// The windows-1252 character of a byte; the five bytes it leaves undefined
+/// are the C1 control of the same number.
+fn cp1252(b: u8) -> char {
+    const HIGH: [char; 32] = [
+        '\u{20AC}', '\u{81}', '\u{201A}', '\u{192}', '\u{201E}', '\u{2026}', '\u{2020}',
+        '\u{2021}', '\u{2C6}', '\u{2030}', '\u{160}', '\u{2039}', '\u{152}', '\u{8D}', '\u{17D}',
+        '\u{8F}', '\u{90}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}', '\u{2013}',
+        '\u{2014}', '\u{2DC}', '\u{2122}', '\u{161}', '\u{203A}', '\u{153}', '\u{9D}', '\u{17E}',
+        '\u{178}',
+    ];
+    match b {
+        0x80..=0x9F => HIGH[(b - 0x80) as usize],
+        _ => b as char,
+    }
+}
+
+/// The byte range and bytes of the encoding name in the XML declaration at
+/// the start of `bytes`, if it has a well-formed one.
+fn declared_encoding(bytes: &[u8]) -> Option<(usize, usize, &[u8])> {
+    let decl = bytes.strip_prefix(b"<?xml")?;
+    let decl = &bytes[..5 + decl.windows(2).position(|w| w == b"?>")?];
     let key = decl.windows(8).position(|w| w == b"encoding")? + 8;
     let skip_ws = |mut i: usize| {
         while decl.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
@@ -642,12 +687,7 @@ pub fn latin1_to_utf8(bytes: &[u8]) -> Option<String> {
     let quote = *decl.get(open).filter(|q| matches!(q, b'"' | b'\''))?;
     let start = open + 1;
     let end = start + decl[start..].iter().position(|&b| b == quote)?;
-    let name = &decl[start..end];
-    if !(name.eq_ignore_ascii_case(b"ISO-8859-1") || name.eq_ignore_ascii_case(b"latin1")) {
-        return None;
-    }
-    let latin1 = |b: &[u8]| b.iter().map(|&b| b as char).collect::<String>();
-    Some(latin1(&bytes[..start]) + "UTF-8" + &latin1(&bytes[end..]))
+    Some((start, end, &decl[start..end]))
 }
 
 #[cfg(test)]
@@ -1030,32 +1070,30 @@ mod tests {
     fn latin1_documents_become_utf8() {
         let doc = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><t>S\xe9rie \xba</t>";
         assert_eq!(
-            latin1_to_utf8(doc).as_deref(),
+            declared_to_utf8(doc).as_deref(),
             Some("<?xml version=\"1.0\" encoding=\"UTF-8\"?><t>S\u{e9}rie \u{ba}</t>")
         );
         let spaced = b"<?xml version='1.0' encoding = 'latin1' ?><t>\xe3</t>";
         assert_eq!(
-            latin1_to_utf8(spaced).as_deref(),
+            declared_to_utf8(spaced).as_deref(),
             Some("<?xml version='1.0' encoding = 'UTF-8' ?><t>\u{e3}</t>")
         );
         // UTF-8 as declared, or a declaration that says so wrongly: kept.
-        assert_eq!(
-            latin1_to_utf8(
-                "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><t>\u{e9}</t>".as_bytes()
-            ),
-            None
-        );
+        for enc in ["ISO-8859-1", "windows-1252"] {
+            let doc = format!("<?xml version=\"1.0\" encoding=\"{enc}\"?><t>\u{e9}\u{20ac}</t>");
+            assert_eq!(declared_to_utf8(doc.as_bytes()), None, "{enc}");
+        }
         // Pure ASCII under a Latin-1 declaration: the declaration says UTF-8,
         // so text a save adds to the part is what it declares.
         assert_eq!(
-            latin1_to_utf8(b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><t>a</t>").as_deref(),
+            declared_to_utf8(b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><t>a</t>").as_deref(),
             Some("<?xml version=\"1.0\" encoding=\"UTF-8\"?><t>a</t>")
         );
         // Another encoding, no encoding, no declaration: not ours to decode.
         // A declaration that never ends, or whose encoding's quote never
         // closes, is not read (and does not panic).
         for doc in [
-            &b"<?xml version=\"1.0\" encoding=\"windows-1252\"?><t>\x80</t>"[..],
+            &b"<?xml version=\"1.0\" encoding=\"shift_jis\"?><t>\x80</t>"[..],
             b"<?xml version=\"1.0\"?><t>\xe9</t>",
             b"<?xml version=\"1.0\"?><t>a</t>",
             b"<t>\xe9</t>",
@@ -1064,8 +1102,45 @@ mod tests {
             b"<?xml encoding?>\xe9",
             b"<?xml encoding=?>\xe9",
             b"<?xml encoding=\"?>\xe9",
+            b"<\0?\0x\0",
         ] {
-            assert_eq!(latin1_to_utf8(doc), None, "{doc:?}");
+            assert_eq!(declared_to_utf8(doc), None, "{doc:?}");
         }
+    }
+
+    /// #1116: windows-1252 (and ISO-8859-1, as Excel reads it) maps
+    /// `0x80..0x9F` to the euro sign, curly quotes and the like.
+    #[test]
+    fn windows_1252_documents_become_utf8() {
+        for enc in [
+            "windows-1252",
+            "WINDOWS-1252",
+            "cp1252",
+            "windows1252",
+            "ISO-8859-1",
+            "latin-1",
+        ] {
+            let doc = format!("<?xml version=\"1.0\" encoding=\"{enc}\"?><t>");
+            let mut bytes = doc.into_bytes();
+            bytes.extend(b"\x80 \x93x\x94 \x81\x8d\x8f\x90\x9d \xe9</t>");
+            assert_eq!(
+                declared_to_utf8(&bytes).as_deref(),
+                Some(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?><t>\u{20ac} \u{201c}x\u{201d} \
+                     \u{81}\u{8d}\u{8f}\u{90}\u{9d} \u{e9}</t>"
+                ),
+                "{enc}"
+            );
+        }
+    }
+
+    /// UTF-16 is not transcoded: such a part stays as it was.
+    #[test]
+    fn utf16_documents_are_left_alone() {
+        let text = "<?xml version=\"1.0\" encoding=\"UTF-16\"?><t>\u{20ac}</t>";
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+        assert_eq!(declared_to_utf8(&bytes), None);
+        assert_eq!(declared_to_utf8(&bytes[2..]), None);
     }
 }

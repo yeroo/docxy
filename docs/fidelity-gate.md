@@ -331,8 +331,11 @@ cargo test -p gridcore --test fidelity -- --nocapture
   read the way a spreadsheet reads it. A worksheet is any part under
   `xl/worksheets/` or one the workbook's worksheet relationships name. Parts
   are keyed by their OPC name (an entry written `xl\sheet1.xml` is
-  `xl/sheet1.xml`), and a part declaring ISO-8859-1 is read by its
-  declaration, as the loaders read it (#1108).
+  `xl/sheet1.xml`), and a part declaring windows-1252 or ISO-8859-1
+  is read by its declaration, as the loaders read it (#1108, #1116). The loss
+  classes for a worksheet's `sheetData`, `dimension` and cells match the
+  entry's path (the root `worksheet`, or `/cells/`), so they apply to a
+  worksheet wherever the package keeps it.
 
   **Per cell** either side lists, it compares three things:
   - the **value**. Shared strings are found through the workbook's

@@ -68,7 +68,7 @@ const CLASSES: &[LossClass] = &[
                dimension covering dropped empty cells, or a wrong one, changes)",
         issue: "#1096",
         matches: |e| {
-            e.part.starts_with("xl/worksheets/")
+            is_sheet_part(e)
                 && e.kind == Kind::ChangedValue
                 && local(&e.path) == "/worksheet/dimension/@ref"
         },
@@ -117,14 +117,21 @@ fn local(path: &str) -> String {
         .join("/")
 }
 
+/// An entry of a worksheet, wherever the package keeps it (`xl/worksheets/`
+/// or, by the workbook's relationships, `xl/sheet1.xml`, #1116): a structural
+/// finding under the root `worksheet`, or one of the sheet check's cells.
+fn is_sheet_part(e: &Entry) -> bool {
+    let path = local(&e.path);
+    path == "/worksheet" || path.starts_with("/worksheet/") || e.path.starts_with("/cells/")
+}
+
 fn in_sheet_data(e: &Entry) -> bool {
-    e.part.starts_with("xl/worksheets/") && local(&e.path).starts_with("/worksheet/sheetData/")
+    local(&e.path).starts_with("/worksheet/sheetData/")
 }
 
 /// A cell check entry: `/cells/<ref>/<what>`.
 fn is_cell(e: &Entry, what: &str) -> bool {
-    e.part.starts_with("xl/worksheets/")
-        && e.kind == Kind::ChangedValue
+    e.kind == Kind::ChangedValue
         && e.path
             .strip_prefix("/cells/")
             .and_then(|p| p.split_once('/'))
@@ -2075,6 +2082,107 @@ fn a_backslash_latin1_package_is_compared_by_part_and_cell() {
         not_allowed(found),
         vec![(Kind::PartExtra, "xl/sharedStrings.xml".to_string())]
     );
+}
+
+/// A package whose only worksheet `ws` is the part `name`, found through
+/// the workbook's relationships.
+fn sheet_at(name: &str, ws: Vec<u8>) -> Vec<u8> {
+    const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const RELS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+    let types = format!(
+        r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/{name}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#
+    );
+    let root = format!(
+        r#"<Relationships xmlns="{RELS}"><Relationship Id="rId1" Type="{R}/officeDocument" Target="/xl/workbook.xml"/></Relationships>"#
+    );
+    let wb = format!(
+        r#"<workbook xmlns="{MAIN}" xmlns:r="{R}"><sheets><sheet name="Plan1" sheetId="1" r:id="rId1"/></sheets></workbook>"#
+    );
+    let wb_rels = format!(
+        r#"<Relationships xmlns="{RELS}"><Relationship Id="rId1" Type="{R}/worksheet" Target="/{name}"/></Relationships>"#
+    );
+    package(&[
+        ("[Content_Types].xml", types.into_bytes()),
+        ("_rels/.rels", root.into_bytes()),
+        ("xl/workbook.xml", wb.into_bytes()),
+        ("xl/_rels/workbook.xml.rels", wb_rels.into_bytes()),
+        (name, ws),
+    ])
+}
+
+/// #1116: a worksheet outside xl/worksheets/ gets the same loss classes as
+/// one inside it: a stale dimension, a `<row>` with no `r`, an inline string
+/// moved to the shared strings. The baseline entries of both are claimed.
+#[test]
+fn a_worksheet_outside_xl_worksheets_has_the_sheet_loss_classes() {
+    let ws = format!(
+        r#"<worksheet xmlns="{MAIN}"><dimension ref="A1"/><sheetData><row><c r="A1" t="inlineStr"><is><t>x</t></is></c><c r="B2"><v>7</v></c></row></sheetData></worksheet>"#
+    );
+    let unclaimed = |name: &str, bytes: Vec<u8>| {
+        let mut covered = 0;
+        let found = round_trip(&bytes, Path::new("book.xlsx"), &mut covered);
+        assert!(covered > 0, "the sheet check reads the worksheet");
+        let entries: Vec<Entry> = found.iter().map(|f| Entry::of("book.xlsx", f)).collect();
+        let claimed = |e: &Entry| CLASSES.iter().any(|c| (c.matches)(e));
+        // The findings the classes are for are there in both layouts.
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.path == "/worksheet/dimension/@ref"),
+            "{entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| e.path.ends_with("/row/@r")),
+            "{entries:?}"
+        );
+        // The package's other findings (an added override, a relationship)
+        // are not what the sheet classes are for.
+        let ours = |e: &Entry| e.part == name || e.part.starts_with("xl/sharedStrings");
+        entries
+            .into_iter()
+            .filter(|e| ours(e) && !claimed(e))
+            .collect::<Vec<_>>()
+    };
+    for name in ["xl/worksheets/sheet1.xml", "xl/sheet1.xml"] {
+        assert_eq!(
+            unclaimed(name, sheet_at(name, ws.clone().into_bytes())),
+            vec![],
+            "{name}"
+        );
+    }
+}
+
+/// #1116: the classes follow the entry's path, not its part name, but only a
+/// `worksheet` root or a cell: the same dimension finding in a part that is
+/// not a worksheet is still a loss.
+#[test]
+fn the_sheet_loss_classes_do_not_cover_other_parts() {
+    let entry = |part: &str, path: &str, kind| Entry {
+        file: "book.xlsx".into(),
+        part: part.into(),
+        kind,
+        path: path.into(),
+    };
+    let allowed = |e: &Entry| CLASSES.iter().any(|c| (c.matches)(e));
+    for part in [
+        "xl/worksheets/sheet1.xml",
+        "xl/sheet1.xml",
+        "xl/sheet 1.xml",
+    ] {
+        let e = entry(part, "/worksheet/dimension/@ref", Kind::ChangedValue);
+        assert!(allowed(&e), "{part}");
+        let e = entry(part, "/x:worksheet/sheetData/row/@r", Kind::ExtraAttr);
+        assert!(is_sheet_part(&e) && in_sheet_data(&e), "{part}");
+    }
+    for part in ["xl/workbook.xml", "xl/charts/chart1.xml", "xl/styles.xml"] {
+        for path in [
+            "/chartSpace/dimension/@ref",
+            "/workbook/sheets/dimension/@ref",
+        ] {
+            let e = entry(part, path, Kind::ChangedValue);
+            assert!(!allowed(&e), "{part} {path}");
+        }
+    }
 }
 
 /// #1108 r1: a directory entry written with `\` is a directory too, not a
