@@ -13105,6 +13105,34 @@ impl CommentUndo {
             );
         }
     }
+
+    /// Take comment markers out of the stories of `pkg` (but part `skip`):
+    /// those of `gone` for good, which the recorded strips of those parts
+    /// take in (`forget`) so they still match the part; those of `kept`
+    /// recorded, for [`save_base`] to put back while an undo has their
+    /// comments anchored again. `gone` is only for ids no undo can bring
+    /// back: a comment whose Delete Comment step is still on the undo stack
+    /// is neither (its markers wait in `pkg`, and the save leaves them out
+    /// while it is not live). How many parts changed.
+    fn strip_stories(
+        &mut self,
+        pkg: &mut Package,
+        stories: &docxcore::inspect::Stories,
+        gone: &[&str],
+        kept: &[&str],
+        skip: Option<&str>,
+    ) -> usize {
+        let forgotten = stories.strip_comment_markers(pkg, Some(gone), skip);
+        for earlier in &mut self.stripped {
+            if forgotten.iter().any(|f| f.part == earlier.part) {
+                earlier.forget(gone);
+            }
+        }
+        let taken = stories.strip_comment_markers(pkg, Some(kept), skip);
+        let parts = forgotten.len() + taken.len();
+        self.stripped.extend(taken);
+        parts
+    }
 }
 
 /// The comment ids with a marker in a header, footer or note of `tab`'s
@@ -13358,8 +13386,13 @@ fn delete_doc_comment(tab: &mut DocTab, id: &str) {
         if let (Surface::Doc(ed), Some(pkg)) = (&tab.surface, tab.pkg.as_mut()) {
             let editing = tab.hf_edit.as_ref().map(|h| h.part_name.as_str());
             let stories = docxcore::inspect::Stories::new(pkg, &ed.doc);
-            let taken = stories.strip_comment_markers(pkg, Some(&[id]), editing);
-            tab.comment_undo.stripped.extend(taken);
+            // One anchored in the body comes back with its undo; any other
+            // has no step to undo.
+            let anchored = docxcore::inspect::comment_marker_ids(&ed.doc).contains(id);
+            let (kept, gone): (&[&str], &[&str]) =
+                if anchored { (&[id], &[]) } else { (&[], &[id]) };
+            tab.comment_undo
+                .strip_stories(pkg, &stories, gone, kept, editing);
         }
     }
     if let Surface::Doc(ed) = &mut tab.surface {
