@@ -4276,17 +4276,20 @@ impl App {
     fn restore(&mut self, snap: &WbSnapshot) {
         self.circles.clear();
         self.cancel_cut();
-        // A copy taken after the step names the tables as they are now: it
-        // follows the way back like the cells do. The copy the step itself
-        // found or left is then put back as it was (`clip_edit`).
+        // A copy taken after the step is rewritten only by renames (table
+        // and column), which the next replay undoes. A table removal or a
+        // column delete in a replay leaves it as it is: dropping it or
+        // turning a reference to `#REF!` could not be undone, and nothing
+        // records it. Only the copy the step itself found is dropped or
+        // rewritten, and put back through `clip_edit`.
         let current = (self.clip.is_some() && !snap.resize).then(|| self.wb_snapshot());
         self.put_back(snap);
         if let Some(current) = current {
-            // Renames and column deletes only: a copy naming a table the
-            // replay removes is left alone, as the step's own `clip_edit`
-            // handles the drop (and its undo).
             let mut changes = column_changes(&current, snap);
             changes.retain(|c| c.removed.is_none());
+            for c in &mut changes {
+                c.deleted.clear();
+            }
             self.rewrite_clip(&changes);
         }
         if let Some((old, new)) = &snap.model_rename {
@@ -19864,9 +19867,11 @@ mod tests {
         app.paste();
         let f = app.pkg.workbook.sheets[0].cell(4, 3).unwrap();
         assert_eq!(f.formula.as_deref(), Some("SUM(Sales[Qty])"));
-        // Another copy before the step, this one after the undo.
+        // A formula naming Sales copied before the step, another after the
+        // undo: the step's guarded Set must not put the first back.
         let mut app = header_app();
-        clip_range(&mut app, (0, 0), (0, 0), false);
+        app.apply_on(0, vec![(0, 4, parse_input("=COUNT(Sales[Qty])"))]);
+        clip_range(&mut app, (0, 4), (0, 4), false);
         app.cur = (0, 0);
         app.anchor = Some((0, 1));
         app.col_op(false);
@@ -19874,6 +19879,26 @@ mod tests {
         clip_range(&mut app, (0, 3), (0, 3), false);
         app.redo();
         app.undo();
+        app.cur = (4, 3);
+        app.anchor = None;
+        app.paste();
+        let f = app.pkg.workbook.sheets[0].cell(4, 3).unwrap();
+        assert_eq!(f.formula.as_deref(), Some("SUM(Sales[Qty])"));
+    }
+
+    #[test]
+    fn a_replay_that_deletes_a_column_never_turns_a_newer_copy_to_ref_error_991() {
+        // Delete column B only, undo, copy D1, redo, undo, paste.
+        let mut app = header_app();
+        app.cur = (0, 1);
+        app.anchor = None;
+        app.col_op(false);
+        app.undo();
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.redo();
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Qty])"));
+        app.undo();
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Qty])"));
         app.cur = (4, 3);
         app.anchor = None;
         app.paste();
