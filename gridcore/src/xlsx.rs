@@ -2573,9 +2573,9 @@ fn parse_worksheet_with(
             (Event::End, Some(d)) => cols_depth = Some(d - 1),
             _ => {}
         }
-        // The classic rule readers below are for the worksheet's own blocks;
-        // those in an `extLst` (and a classic rule's own nested `extLst`) are
-        // read by the x14 arms here.
+        // The classic rule readers below skip anything inside an `extLst`
+        // (a classic rule's own nested one too); the x14 arms here read only
+        // the x14 elements in the worksheet's top-level `extLst`s.
         let in_ext = ext_depth > 0;
         match event {
             Event::Start => match local(p.name()) {
@@ -5495,6 +5495,16 @@ fn set_ext_rules(xml: String, sheet: &Sheet) -> String {
             let (Some(read), Some((cs, ce))) = (read, held.content) else {
                 continue;
             };
+            let held_f: Vec<HeldFormula> = descendant_spans(element, "f", false)
+                .into_iter()
+                .map(|span| held_text_at(element, span))
+                .collect();
+            // An `xm:f` that can't be rewritten in place (CDATA, a comment,
+            // self-closing) keeps the whole element as it is, so its formulas
+            // and its ranges never disagree.
+            if held_f.iter().any(|h| h.content.is_none()) {
+                continue;
+            }
             let rule = match sole_claim(&sheet.ext_rules, k, |r| (r.kind == kind).then_some(r.ix)) {
                 Err(()) => continue,
                 Ok(None) => {
@@ -5505,10 +5515,6 @@ fn set_ext_rules(xml: String, sheet: &Sheet) -> String {
                 }
                 Ok(Some(rule)) => rule,
             };
-            let held_f: Vec<HeldFormula> = descendant_spans(element, "f", false)
-                .into_iter()
-                .map(|span| held_text_at(element, span))
-                .collect();
             if held_f.len() != rule.formulas.len() {
                 continue;
             }
@@ -23968,6 +23974,25 @@ mod rule_shift_tests {
         insert_rows(&mut pkg.workbook, 0, 0, 1);
         let (_, ws) = saved(&pkg, SHEET1);
         assert!(ws.contains("<xm:sqref>A1:A5</xm:sqref>"), "{ws}");
+    }
+
+    #[test]
+    fn x14_with_an_opaque_formula_is_left_alone_whole() {
+        for x14 in [
+            x14_cf("A1:A5", "<![CDATA[A1>1]]>"),
+            x14_dv("A1:A5", "<![CDATA[Z1]]>", None),
+        ] {
+            let mut pkg = one("S", &format!("{MARGINS}{x14}"));
+            assert_eq!(pkg.workbook.sheets[0].ext_rules.len(), 1);
+            insert_rows(&mut pkg.workbook, 0, 0, 1);
+            let (_, ws) = saved(&pkg, SHEET1);
+            assert!(ws.contains(&x14), "{ws}");
+        }
+        let x14 = x14_cf("A1:A5", "<![CDATA[A1>1]]>");
+        let mut pkg = one("S", &format!("{MARGINS}{x14}"));
+        delete_rows(&mut pkg.workbook, 0, 0, 10);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(&x14), "{ws}");
     }
 
     #[test]
