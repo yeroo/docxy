@@ -2642,8 +2642,11 @@ fn parse_worksheet_with(
                     // `cm` is the dynamic-array marker: meaningless (and never
                     // written) on anything but an array `<f>`.
                     let array_f = cell.f_attrs.as_deref().is_some_and(is_array_f);
+                    let loaded = cell.meta.take();
                     let meta = CellMeta {
-                        sst: cell.meta.take().and_then(|m| m.sst),
+                        sst: loaded.as_ref().and_then(|m| m.sst),
+                        f_ca: loaded.as_ref().and_then(|m| m.f_ca.clone()),
+                        f_aca: loaded.and_then(|m| m.f_aca),
                         cm: (!cm.is_empty() && array_f).then_some(cm),
                         vm: (!vm.is_empty()).then(|| (vm, cell.value.clone())),
                         ph,
@@ -3128,6 +3131,7 @@ fn parse_cell_body(
     let mut is_text: Option<String> = None; // inline string content
     let mut formula: Option<String> = None;
     let mut f_attrs: Option<String> = None;
+    let (mut f_ca, mut f_aca) = (None, None);
     let mut depth = 1;
     let mut in_v = false;
     let mut in_f = false;
@@ -3147,6 +3151,14 @@ fn parse_cell_body(
                         let t = p.attr("t").to_string();
                         let si = p.attr("si").to_string();
                         let ref_attr = p.attr("ref").to_string();
+                        let flag = |name: &str| {
+                            p.attrs()
+                                .iter()
+                                .any(|a| a.name == name)
+                                .then(|| p.attr(name).to_string())
+                        };
+                        f_ca = flag("ca");
+                        f_aca = flag("aca");
                         match t.as_str() {
                             "shared" => {
                                 // Master carries text (captured below);
@@ -3277,9 +3289,11 @@ fn parse_cell_body(
         f_attrs,
         style,
         spill,
-        meta: sst.map(|i| {
+        meta: (sst.is_some() || f_ca.is_some() || f_aca.is_some()).then(|| {
             Box::new(CellMeta {
-                sst: Some(i),
+                sst,
+                f_ca,
+                f_aca,
                 ..CellMeta::default()
             })
         }),
@@ -4677,6 +4691,20 @@ fn cell_xml(
         ),
         (None, _) => (String::new(), false),
     };
+
+    // `ca`/`aca` ride on any formula's `<f>`; an array or unparsed shared
+    // `<f>` already carries its own in the raw attributes.
+    let mut f_xml = f_xml;
+    if let Some(m) = &cell.meta {
+        for (name, v) in [("ca", &m.f_ca), ("aca", &m.f_aca)] {
+            if let Some(v) = v.as_deref().filter(|_| f_xml.starts_with("<f")) {
+                let start = f_xml.find('>').map_or(f_xml.len(), |i| i + 1);
+                if !f_xml[..start].contains(&format!(" {name}=\"")) {
+                    f_xml.insert_str(2, &format!(" {name}=\"{}\"", esc_raw_attr(v)));
+                }
+            }
+        }
+    }
 
     // Schema order after `t`: cm, vm, ph. `cm` marks a dynamic array, so it
     // only belongs on an array `<f>`; `vm` describes the loaded value.
@@ -16593,6 +16621,64 @@ b",
         assert!(pkg.workbook.sheets[0].cell(0, 1).unwrap().meta.is_none());
         let ws = saved_sheet1(&pkg);
         assert!(ws.contains(r#"<c r="B1"><f>A1+1</f><v>2</v></c>"#), "{ws}");
+    }
+
+    /// The `<f ...>` start tag of cell `name` in a saved sheet.
+    fn f_tag(ws: &str, name: &str) -> String {
+        let c = ws.find(&format!(r#"<c r="{name}""#)).expect(name);
+        let f = c + ws[c..].find("<f").expect("<f");
+        ws[f..f + ws[f..].find('>').unwrap() + 1].to_string()
+    }
+
+    #[test]
+    fn calc_flags_on_a_plain_formula_survive_save() {
+        let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f ca="1">A1+1</f><v>2</v></c><c r="C1"><f aca="true" ca="0">A1+2</f><v>3</v></c><c r="D1"><f>A1+3</f><v>4</v></c></row>"#;
+        let pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let ws = saved_sheet1(&pkg);
+        assert_eq!(f_tag(&ws, "B1"), r#"<f ca="1">"#, "{ws}");
+        let c1 = f_tag(&ws, "C1");
+        assert!(
+            c1.contains(r#" ca="0""#) && c1.contains(r#" aca="true""#),
+            "{c1}"
+        );
+        assert!(ws.contains(r#"<c r="D1"><f>A1+3</f><v>4</v></c>"#), "{ws}");
+        assert!(pkg.workbook.sheets[0].cell(0, 3).unwrap().meta.is_none());
+    }
+
+    #[test]
+    fn calc_flags_on_shared_master_and_followers_survive_save() {
+        let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f t="shared" ref="B1:B3" si="0" ca="1">A1+1</f><v>2</v></c></row><row r="2"><c r="A2"><v>2</v></c><c r="B2"><f t="shared" si="0" ca="1"/><v>3</v></c></row><row r="3"><c r="A3"><v>3</v></c><c r="B3"><f t="shared" si="0"/><v>4</v></c></row>"#;
+        let pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let ws = saved_sheet1(&pkg);
+        assert_eq!(f_tag(&ws, "B1"), r#"<f ca="1">"#, "{ws}");
+        assert_eq!(f_tag(&ws, "B2"), r#"<f ca="1">"#, "{ws}");
+        assert_eq!(f_tag(&ws, "B3"), "<f>", "{ws}");
+    }
+
+    #[test]
+    fn calc_flags_on_arrays_are_written_once() {
+        let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f t="array" ref="B1:B2" ca="1" aca="1">A1+1</f><v>2</v></c><c r="D1"><f t="array" ref="D1" ca="1">A1+1</f><v>2</v></c></row><row r="2"><c r="B2"><v>5</v></c></row>"#;
+        let pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let ws = saved_sheet1(&pkg);
+        for name in ["B1", "D1"] {
+            let tag = f_tag(&ws, name);
+            assert_eq!(tag.matches(" ca=\"").count(), 1, "{tag}");
+        }
+        assert_eq!(f_tag(&ws, "B1").matches(" aca=\"").count(), 1, "{ws}");
+    }
+
+    #[test]
+    fn a_calc_flag_cell_still_recalculates() {
+        let rows =
+            r#"<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f ca="1">A1+1</f><v>2</v></c></row>"#;
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 0), Cell::number(10.0));
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(0, 1).unwrap().value,
+            CellValue::Number(11.0)
+        );
     }
 
     #[test]

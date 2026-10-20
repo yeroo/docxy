@@ -184,6 +184,12 @@ pub struct CellMeta {
     /// gives it a `cm` naming an `fDynamic` entry in `xl/metadata.xml`. Sticky,
     /// like a loaded `cm`: a later scalar result (`FILTER` → `#CALC!`) keeps it.
     pub dynamic: bool,
+    /// The `<f>` `ca` (always calculate) attribute as the file spelled it
+    /// (`1`, `true`, `0`); written back on the cell's `<f>`. Kept off
+    /// `Cell::f_attrs`, which marks a non-array formula as preserved.
+    pub f_ca: Option<String>,
+    /// The `<f>` `aca` (array always calculate) attribute, as `f_ca`.
+    pub f_aca: Option<String>,
 }
 
 /// Do preserved `<f>` attributes (see [`Cell::f_attrs`]) mark an array

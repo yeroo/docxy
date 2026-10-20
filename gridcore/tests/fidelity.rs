@@ -49,15 +49,6 @@ const CLASSES: &[LossClass] = &[
         matches: |e| e.kind == Kind::LoadError && e.file.ends_with("/forcepoint107.xlsx"),
     },
     LossClass {
-        name: "formula calculation flags are dropped (f/@ca, f/@aca when true)",
-        issue: "#1092",
-        matches: |e| {
-            in_sheet_data(e)
-                && e.kind == Kind::LostAttr
-                && ends_with_any(e, &["/c/f/@ca", "/c/f/@aca"])
-        },
-    },
-    LossClass {
         name: "formula text is re-serialized (spaces dropped, names upper-cased, _xlfn. \
                added to newer functions; the sheet check finds the same formula \
                otherwise): one entry per cell",
@@ -153,11 +144,6 @@ fn is_cell(e: &Entry, what: &str) -> bool {
             .strip_prefix("/cells/")
             .and_then(|p| p.split_once('/'))
             .is_some_and(|(cell, w)| parse_ref(cell).is_some() && w == what)
-}
-
-fn ends_with_any(e: &Entry, tails: &[&str]) -> bool {
-    let path = local(&e.path);
-    tails.iter().any(|t| path.ends_with(t))
 }
 
 // ---------------------------------------------------------------------------

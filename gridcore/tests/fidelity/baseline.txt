@@ -6,57 +6,6 @@
 # corrupt input (fuzzed: bad CRCs, an invalid deflate stream) is refused (by design: XlsxError::CorruptPart)
 ext:libreoffice/sc/qa/unit/data/xlsx/forcepoint107.xlsx		load-error	
 
-# formula calculation flags are dropped (f/@ca, f/@aca when true) (#1092)
-ext:libreoffice/sc/qa/unit/data/functions/dynamic_array/xlsx/DynamicArrayFixture.xlsx	xl/worksheets/sheet1.xml	lost-attr	/worksheet/sheetData/row/c/f/@aca
-ext:libreoffice/sc/qa/unit/data/functions/dynamic_array/xlsx/DynamicArrayFixture.xlsx	xl/worksheets/sheet1.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/functions/dynamic_array/xlsx/DynamicArrayFixture.xlsx	xl/worksheets/sheet2.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/functions/dynamic_array/xlsx/DynamicArrayFixture.xlsx	xl/worksheets/sheet3.xml	lost-attr	/worksheet/sheetData/row/c/f/@aca
-ext:libreoffice/sc/qa/unit/data/functions/dynamic_array/xlsx/DynamicArrayFixture.xlsx	xl/worksheets/sheet3.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/xlsx/LambdaAndRelatedFunctions.xlsx	xl/worksheets/sheet2.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/xlsx/LambdaAndRelatedFunctions.xlsx	xl/worksheets/sheet3.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/xlsx/LambdaAndRelatedFunctions.xlsx	xl/worksheets/sheet4.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/xlsx/LambdaAndRelatedFunctions.xlsx	xl/worksheets/sheet5.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/xlsx/LambdaAndRelatedFunctions.xlsx	xl/worksheets/sheet6.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/xlsx/LambdaAndRelatedFunctions.xlsx	xl/worksheets/sheet7.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/xlsx/LambdaAndRelatedFunctions.xlsx	xl/worksheets/sheet8.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/xlsx/LambdaAndRelatedFunctions.xlsx	xl/worksheets/sheet9.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/xlsx/SimpleSpillOperatorFixture.xlsx	xl/worksheets/sheet1.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/xlsx/XlStartupExternal.xlsx	xl/worksheets/sheet1.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/xlsx/empty_ext_defined_name.xlsx	xl/worksheets/sheet1.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/xlsx/forum-mso-en4-145327.xlsx	xl/worksheets/sheet2.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/xlsx/forum-mso-en4-145327.xlsx	xl/worksheets/sheet3.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/xlsx/ref_string.xlsx	xl/worksheets/sheet1.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/xlsx/tablerefsnamed.xlsx	xl/worksheets/sheet1.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/xlsx/tdf134769.xlsx	xl/worksheets/sheet1.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/xlsx/tdf155402.xlsx	xl/worksheets/sheet1.xml	lost-attr	/worksheet/sheetData/row/c/f/@aca
-ext:libreoffice/sc/qa/unit/data/xlsx/tdf162093.xlsx	xl/worksheets/sheet1.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/xlsx/tdf164895.xlsx	xl/worksheets/sheet1.xml	lost-attr	/worksheet/sheetData/row/c/f/@aca
-ext:libreoffice/sc/qa/unit/data/xlsx/tdf167019.xlsx	xl/worksheets/sheet1.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/xlsx/tdf167689_x15_namespace.xlsx	xl/worksheets/sheet1.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/data/xlsx/tdf70455.xlsx	xl/worksheets/sheet1.xml	lost-attr	/worksheet/sheetData/row/c/f/@aca
-ext:libreoffice/sc/qa/unit/data/xlsx/user_defined_function.xlsx	xl/worksheets/sheet1.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:libreoffice/sc/qa/unit/uicalc/data/tdf124816.xlsx	xl/worksheets/sheet1.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet10.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet11.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet12.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet13.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet14.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet15.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet16.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet17.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet18.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet19.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet2.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet24.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet29.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet3.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet4.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet5.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet6.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet7.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet8.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-ext:openoffice/test/testgui/data/pvt/complex_29s.xlsx	xl/worksheets/sheet9.xml	lost-attr	/worksheet/sheetData/row/c/f/@ca
-
 # formula text is re-serialized (spaces dropped, names upper-cased, _xlfn. added to newer functions; the sheet check finds the same formula otherwise): one entry per cell (#1096)
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/C18/formula-text
 ext:libreoffice/sc/qa/extras/testdocuments/forcepoint97.xlsx	xl/worksheets/sheet2.xml	changed-value	/cells/C19/formula-text
