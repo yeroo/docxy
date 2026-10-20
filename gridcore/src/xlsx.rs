@@ -252,11 +252,12 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
     load_parts(parts)
 }
 
-/// A part as the loader reads it: UTF-8. A part declaring ISO-8859-1 is
-/// transcoded and then declares UTF-8, so its text survives and a save
-/// writes what it declares (#1108); any other part is kept as it is.
+/// A part as the loader reads it: UTF-8. A part declaring windows-1252 or
+/// ISO-8859-1 is transcoded and then declares UTF-8, so its text survives
+/// and a save writes what it declares (#1108, #1116); any other part
+/// (UTF-16 too) is kept as it is.
 fn utf8_part(bytes: Vec<u8>) -> Vec<u8> {
-    match opccore::xml::latin1_to_utf8(&bytes) {
+    match opccore::xml::declared_to_utf8(&bytes) {
         Some(text) => text.into_bytes(),
         None => bytes,
     }

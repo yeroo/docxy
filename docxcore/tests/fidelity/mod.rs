@@ -342,16 +342,17 @@ fn finish(mut b: Building) -> Elem {
 }
 
 /// Parse an XML part into its canonical DOM. `None` when the part is neither
-/// UTF-8 nor declared ISO-8859-1 (read by its declaration, #1108), or is
+/// UTF-8 nor declared windows-1252 or ISO-8859-1 (read by its
+/// declaration, #1108, #1116), or is
 /// malformed: mismatched or unclosed tags, a duplicate attribute,
 /// an ill-formed reference or a `<` in an attribute value, or content other
 /// than whitespace outside the root. The caller then compares bytes instead.
 /// Line ends normalize to LF first, as an XML processor's do.
 pub fn parse_xml(bytes: &[u8]) -> Option<Elem> {
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    // A document declaring ISO-8859-1 is read by its declaration, as the
+    // A document declaring windows-1252 or ISO-8859-1 is read by its declaration, as the
     // xlsx loaders read it (#1108).
-    let latin1 = opccore::xml::latin1_to_utf8(bytes);
+    let latin1 = opccore::xml::declared_to_utf8(bytes);
     let text = match &latin1 {
         Some(text) => text.as_str(),
         None => std::str::from_utf8(bytes).ok()?,
