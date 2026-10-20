@@ -149,11 +149,12 @@ impl Editor {
         // The overallocation a plan holds on its committed schedule.
         let pressure = |p: &crate::model::Project| {
             let sched = schedule(p);
-            overallocation(p, |uid| {
+            let over = overallocation(p, |uid| {
                 sched.get(uid).map(|r| (r.early_start, r.early_finish))
-            })
+            });
+            (over, sched.project_finish)
         };
-        let mut before = pressure(&trial);
+        let (mut before, finish_at_start) = pressure(&trial);
         let mut seen = vec![before.conflicts.clone()];
         // The lightest plan the rounds reach: a trade may leave a heavier
         // conflict than it resolved, and the pass never ends worse than
@@ -185,7 +186,15 @@ impl Editor {
             if !moved {
                 break;
             }
-            let after = pressure(&round);
+            let (after, finish) = pressure(&round);
+            // Within slack the project finish never moves (#1594 r14): a
+            // written delay stretches its summary's span, and a percentage
+            // lag on the summary's link grows with it, past the slack the
+            // leaf alone had. Such a round is dropped: the plan stays at its
+            // earliest start, overallocated, as the option promises.
+            if options.within_slack && finish > finish_at_start {
+                break;
+            }
             let resolves = after.extent < before.extent - 1e-6;
             // A trade goes on whatever its weight (#1594 r8): the follower
             // it uncovers may be heavier or longer than the conflict it
@@ -1179,6 +1188,82 @@ mod tests {
             DateTime::from_minutes(anchor.minutes() + 3 * 1440),
             "Thursday"
         );
+    }
+
+    /// #1594 r14: within slack the project finish never moves. Summary S
+    /// holds A and B (one day each, Ann); C follows S with a 100% lag; D
+    /// (four days) ends the project Thursday. B has a day of slack, but its
+    /// delay would stretch S to two days, double C's lag and end the project
+    /// Friday: the round is dropped and B stays, overallocated. Without the
+    /// option the same pass moves the finish.
+    #[test]
+    fn within_slack_never_moves_the_project_finish_through_a_summarys_percent_lag() {
+        let mut p = untitled_project();
+        let anchor = p.start_date.unwrap();
+        let day = |n: i64, min: i64| DateTime::from_minutes(anchor.minutes() + n * 1440 + min);
+        let leaf = |uid: i32, name: &str, level: u32, minutes: i64| Task {
+            uid,
+            id: uid,
+            name: name.into(),
+            outline_level: level,
+            duration_min: minutes,
+            ..Task::default()
+        };
+        p.tasks.push(Task {
+            summary: true,
+            ..leaf(1, "S", 1, 0)
+        });
+        p.tasks.push(leaf(2, "A", 2, 480));
+        p.tasks.push(leaf(3, "B", 2, 480));
+        let mut c = leaf(4, "C", 1, 480);
+        c.predecessors.push(Predecessor {
+            lag: 100,
+            lag_format: crate::model::LagFormat::from_code(19).unwrap(),
+            ..Predecessor::fs(1)
+        });
+        p.tasks.push(c);
+        p.tasks.push(leaf(5, "D", 1, 4 * 480));
+        p.resources.push(Resource {
+            uid: 1,
+            id: 1,
+            name: "Ann".into(),
+            max_units: 1.0,
+            ..Resource::default()
+        });
+        for uid in [2, 3] {
+            p.assignments.push(Assignment {
+                uid,
+                task_uid: uid,
+                resource_uid: 1,
+                units: 1.0,
+                ..Assignment::default()
+            });
+        }
+        let thursday = day(3, 9 * 60);
+        let mut ed = Editor::new(p.clone());
+        assert_eq!(ed.schedule().project_finish, thursday);
+        ed.set_level_options(&LevelOptions {
+            within_slack: true,
+            ..LevelOptions::default()
+        })
+        .unwrap();
+        let out = ed.level_tasks(&LevelTarget::Selection(vec![2, 3])).unwrap();
+        assert_eq!((out.changed, out.delayed, out.overallocated), (0, 0, 1));
+        assert_eq!(
+            ed.project().task(3).unwrap().leveling_delay,
+            None,
+            "B stays"
+        );
+        assert_eq!(
+            ed.schedule().project_finish,
+            thursday,
+            "the finish stays Thursday"
+        );
+        // Without the option the pass moves B and the finish.
+        let mut ed = Editor::new(p);
+        let out = ed.level_tasks(&LevelTarget::Selection(vec![2, 3])).unwrap();
+        assert_eq!((out.changed, out.delayed, out.overallocated), (1, 1, 0));
+        assert_eq!(ed.schedule().project_finish, day(4, 9 * 60), "Friday");
     }
 
     /// #1594 r13: a milestone's kept delay ends at the delay's snap, not at
