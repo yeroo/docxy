@@ -169,19 +169,36 @@ impl Editor {
         if self.proj.tasks[i].is_external_leaf() {
             return Err(EXTERNAL_TASK_DATES.into());
         }
+        let task = self.row_as_edited(i);
+        if !task.manual {
+            let finish = day_finish(&self.proj, &task, day)?;
+            return self.set_finish_at(uid, finish);
+        }
+        self.validate_pinned_day(day)?;
+        // Like a typed start, a manual finish may fall on a non-working day.
+        let finish = day_end(&self.proj, &task, day);
+        self.set_finish_at(uid, finish)
+    }
+
+    /// Set a task's finish to an exact instant, as [`Self::set_finish`] does
+    /// for a day: an auto task gets a Finish-No-Earlier-Than constraint
+    /// there; a manual task keeps its start and its duration becomes the
+    /// working time up to the instant.
+    pub fn set_finish_at(&mut self, uid: i32, finish: DateTime) -> Result<(), String> {
+        let i = self.index(uid)?;
+        if self.proj.tasks[i].is_external_leaf() {
+            return Err(EXTERNAL_TASK_DATES.into());
+        }
         let blank = self.proj.tasks[i].is_null;
         let task = &self.row_as_edited(i);
         if !task.manual {
-            let finish = day_finish(&self.proj, task, day)?;
             return self.set_constraint_typed(
                 uid,
                 ConstraintType::FinishNoEarlierThan,
                 Some(finish),
             );
         }
-        self.validate_pinned_day(day)?;
-        // Like a typed start, a manual finish may fall on a non-working day.
-        let finish = day_end(&self.proj, task, day);
+        self.validate_pinned_day(finish)?;
         let start = match task.pinned_dates().or_else(|| task.manual_summary_dates()) {
             Some((start, _)) => start,
             None => self.disp_start(uid).ok_or("The task has no start")?,

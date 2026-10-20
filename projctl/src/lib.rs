@@ -18,7 +18,7 @@
 //! | `task.list` | `{fields?}` | `{count, tasks:[{uid, id, outline_number, name, level, manual, duration, start, finish, critical, …}]}` |
 //! | `task.get` | `{uid, fields?}` | one task |
 //! | `task.fields` | — | `{count, fields:[name…]}`: the field names `fields` can read |
-//! | `task.set` | `{uid, name?, duration?, level?, manual?, percent_complete?, actual_start?, actual_finish?, actual_duration?, remaining_duration?, priority?, deadline?, constraint?, task_type?, effort_driven?, notes?, milestone?, calendar?, ignore_resource_calendar?, wbs?, earned_value_method?, custom?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled). The Task Information fields (#1550): `percent_complete` 0–100, the Update Tasks fields (#1568) `actual_start` / `actual_finish` (a date as for `deadline`, an actual start taking the day's first working time and a finish its last, or `null` to clear) and `actual_duration` / `remaining_duration` (durations: setting one adjusts % Complete, the remaining duration also the task's duration; an actual finish completes the task; a `percent_complete` given with an actual finish date, `actual_duration` or `remaining_duration` must equal the % they make or is refused, and with only `actual_start` or a cleared finish it applies after them, a started task getting that share as its actual duration; a `duration` given with `remaining_duration` must equal the actual plus the remaining), `priority` 0–1000, `deadline` a date (`YYYY-MM-DD`, the day's last working time, or `YYYY-MM-DDTHH:MM`) or `null`, `constraint` `{type, date?}` with the type `ASAP`/`ALAP`/`MSO`/`MFO`/`SNET`/`SNLT`/`FNET`/`FNLT`, `task_type` `fixed-units`/`fixed-duration`/`fixed-work`, `effort_driven` and `milestone` booleans, `notes` text (`\n` line breaks), `calendar` a base calendar's name or uid or `null`, `ignore_resource_calendar` a boolean, `wbs` text, `earned_value_method` `percent-complete`/`physical-percent-complete`. `custom` (#1554) is an object of Project custom field names to values as typed in the cell (`{"Text1": "Civil", "Flag3": true, "Date1": "2026-03-09", "Duration1": "3d", "Cost1": "$1,400", "Number1": null}`; `null` or `""` clears): the field needs a definition in the plan, a formula field is refused, a lookup-table field takes one of its values. Every argument is checked and all apply in one undo step, or none does |
+//! | `task.set` | `{uid, name?, duration?, level?, manual?, start?, finish?, percent_complete?, actual_start?, actual_finish?, actual_duration?, remaining_duration?, priority?, deadline?, constraint?, task_type?, effort_driven?, notes?, milestone?, calendar?, ignore_resource_calendar?, wbs?, earned_value_method?, custom?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled). The Task Information fields (#1550): `start` and `finish` (#1570) are set as typed in the Start and Finish cells: `YYYY-MM-DD` (the task calendar's first working time for a start, its last for a finish) or `YYYY-MM-DDTHH:MM`; an auto task gains a Start or Finish No Earlier Than constraint, a manual one is pinned (keeping its duration for a start, the duration following a finish), after `manual` is applied and before a given `constraint`; both on an auto task, or either on an auto summary, are refused, and `null` is not accepted. `percent_complete` 0–100, the Update Tasks fields (#1568) `actual_start` / `actual_finish` (a date as for `deadline`, an actual start taking the day's first working time and a finish its last, or `null` to clear) and `actual_duration` / `remaining_duration` (durations: setting one adjusts % Complete, the remaining duration also the task's duration; an actual finish completes the task; a `percent_complete` given with an actual finish date, `actual_duration` or `remaining_duration` must equal the % they make or is refused, and with only `actual_start` or a cleared finish it applies after them, a started task getting that share as its actual duration; a `duration` given with `remaining_duration` must equal the actual plus the remaining), `priority` 0–1000, `deadline` a date (`YYYY-MM-DD`, the day's last working time, or `YYYY-MM-DDTHH:MM`) or `null`, `constraint` `{type, date?}` with the type `ASAP`/`ALAP`/`MSO`/`MFO`/`SNET`/`SNLT`/`FNET`/`FNLT`, `task_type` `fixed-units`/`fixed-duration`/`fixed-work`, `effort_driven` and `milestone` booleans, `notes` text (`\n` line breaks), `calendar` a base calendar's name or uid or `null`, `ignore_resource_calendar` a boolean, `wbs` text, `earned_value_method` `percent-complete`/`physical-percent-complete`. `custom` (#1554) is an object of Project custom field names to values as typed in the cell (`{"Text1": "Civil", "Flag3": true, "Date1": "2026-03-09", "Duration1": "3d", "Cost1": "$1,400", "Number1": null}`; `null` or `""` clears): the field needs a definition in the plan, a formula field is refused, a lookup-table field takes one of its values. Every argument is checked and all apply in one undo step, or none does |
 //! | `task.add` | `{after?, name?, duration?}` | the new task (without `duration`, 1 day, estimated when the plan's `NewTasksEstimated` is; inserted `after` a task that a finish-to-start link joins to the next, it is linked into that chain when the plan's `Autolink` is on, as it is by default) |
 //! | `task.del` | `{uid}` | `{deleted, removed:[uid…]}` (a summary takes its subtree) |
 //! | `link.add` | `{uid, pred, type?, lag?}` | the updated task (`lag` uses Predecessors cell spellings such as `4h`, `2ed`, `50%`; other duration spellings such as `1 month` are read as working-days lags) |
@@ -620,6 +620,10 @@ fn task_reply(ed: &Editor, uid: i32, asked: Option<&[(String, Field)]>) -> Resul
 /// parsed before anything is applied.
 #[derive(Default)]
 struct TaskInfoArgs {
+    /// Start and Finish as typed in the cell (#1570): resolved by the
+    /// editor's setters against the task as the call leaves it.
+    start: Option<Typed>,
+    finish: Option<Typed>,
     percent_complete: Option<i32>,
     /// The Update Tasks fields (#1568); `Some(None)` clears a date.
     actual_start: Option<Option<DateTime>>,
@@ -643,9 +647,24 @@ struct TaskInfoArgs {
     custom: Vec<(Field, String)>,
 }
 
+/// A typed Start or Finish: a bare day, which the cell's setter resolves to
+/// the task calendar's first or last working time, or an exact instant.
+#[derive(Clone, Copy)]
+enum Typed {
+    Day(DateTime),
+    At(DateTime),
+}
+
+/// The refusals of the Entry table's cells and the Task Information dialog.
+const SUMMARY_DATES_READ_ONLY: &str = "Summary dates and duration are read-only";
+const START_OR_FINISH: &str =
+    "Change Start or Finish, not both, on an auto-scheduled task; change Duration for the span";
+
 impl TaskInfoArgs {
     fn any(&self) -> bool {
-        self.percent_complete.is_some()
+        self.start.is_some()
+            || self.finish.is_some()
+            || self.percent_complete.is_some()
             || self.actual_start.is_some()
             || self.actual_finish.is_some()
             || self.actual_duration.is_some()
@@ -724,6 +743,24 @@ impl TaskInfoArgs {
                     Some(_) => Err(format!("'{key}' must be a date or null")),
                 }
             };
+        // Start and Finish are a date, never null: the cell cannot clear one.
+        let typed = |key: &str| -> Result<Option<Typed>, String> {
+            let Some(v) = args.get(key) else {
+                return Ok(None);
+            };
+            let bad = || format!("'{key}' must be a date, YYYY-MM-DD or YYYY-MM-DDTHH:MM");
+            let s = v.as_str().ok_or_else(bad)?.trim();
+            if s.contains('T') {
+                return DateTime::parse_mspdi(s)
+                    .map(|d| Some(Typed::At(d)))
+                    .ok_or_else(bad);
+            }
+            parse_cell_date(s)
+                .map(|d| Some(Typed::Day(d)))
+                .map_err(|_| bad())
+        };
+        let start = typed("start")?;
+        let finish = typed("finish")?;
         let deadline = date_or_null("deadline", true)?;
         let actual_start = date_or_null("actual_start", false)?;
         let actual_finish = date_or_null("actual_finish", true)?;
@@ -842,6 +879,8 @@ impl TaskInfoArgs {
             }),
         };
         Ok(TaskInfoArgs {
+            start,
+            finish,
             percent_complete: whole("percent_complete")?,
             actual_start,
             actual_finish,
@@ -874,6 +913,29 @@ impl TaskInfoArgs {
         }
         if let Some(on) = self.milestone {
             ed.set_milestone(uid, on)?;
+        }
+        // Start and Finish, as the cell sets them, after `manual` is applied.
+        if self.start.is_some() || self.finish.is_some() {
+            let task = ed
+                .project()
+                .task(uid)
+                .ok_or_else(|| format!("no task with uid {uid}"))?;
+            if task.summary && !task.manual {
+                return Err(SUMMARY_DATES_READ_ONLY.into());
+            }
+            if self.start.is_some() && self.finish.is_some() && !task.manual {
+                return Err(START_OR_FINISH.into());
+            }
+        }
+        match self.start {
+            Some(Typed::Day(day)) => ed.set_start(uid, day)?,
+            Some(Typed::At(at)) => ed.set_start_at(uid, at)?,
+            None => {}
+        }
+        match self.finish {
+            Some(Typed::Day(day)) => ed.set_finish(uid, day)?,
+            Some(Typed::At(at)) => ed.set_finish_at(uid, at)?,
+            None => {}
         }
         // A finish, an actual duration or a remaining duration derive
         // % Complete; a start alone, or clearing the finish, leave it to
@@ -988,7 +1050,7 @@ fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         || patch.manual.is_some();
     if !has_patch && !info.any() {
         return Err(
-            "task.set needs at least one of 'name', 'duration', 'level', 'manual' or a Task Information field"
+            "task.set needs at least one of 'name', 'duration', 'level', 'manual', 'start', 'finish' or a Task Information field"
                 .into(),
         );
     }
@@ -3343,6 +3405,208 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("contradicts"), "{err}");
         assert_eq!(*a.project(), before);
+    }
+
+    #[test]
+    fn task_set_takes_start_and_finish_as_typed_in_the_cell() {
+        let call = |a: &mut Editor, uid: i64, extra: Vec<(&str, Json)>| {
+            let mut args = vec![("uid", Json::Num(uid as f64))];
+            args.extend(extra);
+            dispatch_editor(a, "task.set", &Json::obj(args)).unwrap()
+        };
+        let text = |s: &str| Json::Str(s.into());
+        let day = |s: &str| parse_cell_date(s).unwrap();
+        let mut a = app();
+        let uid = add(&mut a, "Pour", "4d");
+        let id = uid as i32;
+        // A twin edited through the cell's own setters is the reference.
+        let mut twin = Editor::new(a.project().clone());
+        let depth = a.undo_depth();
+        call(&mut a, uid, vec![("start", text("2026-03-09"))]).unwrap();
+        twin.set_start(id, day("2026-03-09")).unwrap();
+        assert_eq!(a.undo_depth(), depth + 1);
+        let t = a.project().task(id).unwrap();
+        assert_eq!(t.constraint, ConstraintType::StartNoEarlierThan);
+        assert_eq!((t.constraint, t.constraint_date), {
+            let r = twin.project().task(id).unwrap();
+            (r.constraint, r.constraint_date)
+        });
+        assert_eq!(t.constraint_date.map(|d| d.parts().hour), Some(8));
+        call(&mut a, uid, vec![("finish", text("2026-03-20"))]).unwrap();
+        twin.set_finish(id, day("2026-03-20")).unwrap();
+        let (t, r) = (
+            a.project().task(id).unwrap(),
+            twin.project().task(id).unwrap(),
+        );
+        assert_eq!(t.constraint, ConstraintType::FinishNoEarlierThan);
+        assert_eq!(
+            (t.constraint, t.constraint_date),
+            (r.constraint, r.constraint_date)
+        );
+        assert_eq!(t.constraint_date.map(|d| d.parts().hour), Some(17));
+        // A non-working day is refused as the cell refuses it.
+        let before = a.project().clone();
+        let err = call(&mut a, uid, vec![("finish", text("2026-03-14"))]).unwrap_err();
+        assert!(err.contains("non-working"), "{err}");
+        assert_eq!(*a.project(), before);
+        // An exact instant is taken as typed.
+        call(&mut a, uid, vec![("start", text("2026-03-10T10:00"))]).unwrap();
+        let t = a.project().task(id).unwrap();
+        assert_eq!(
+            (
+                t.constraint,
+                t.constraint_date.map(|d| (d.parts().day, d.parts().hour))
+            ),
+            (ConstraintType::StartNoEarlierThan, Some((10, 10)))
+        );
+        call(&mut a, uid, vec![("finish", text("2026-03-18T12:00"))]).unwrap();
+        let t = a.project().task(id).unwrap();
+        assert_eq!(
+            (
+                t.constraint,
+                t.constraint_date.map(|d| (d.parts().day, d.parts().hour))
+            ),
+            (ConstraintType::FinishNoEarlierThan, Some((18, 12)))
+        );
+        // Both on an auto task: refused, and the name beside them is not kept.
+        let before = a.project().clone();
+        let depth = a.undo_depth();
+        let err = call(
+            &mut a,
+            uid,
+            vec![
+                ("name", text("Renamed")),
+                ("start", text("2026-03-09")),
+                ("finish", text("2026-03-13")),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("not both"), "{err}");
+        assert_eq!(*a.project(), before);
+        assert_eq!(a.undo_depth(), depth);
+        // Bad text, null and "" name the key and change nothing.
+        for (key, bad) in [
+            ("start", text("soon")),
+            ("start", Json::Null),
+            ("finish", text("")),
+            ("finish", Json::Num(5.0)),
+            ("start", text("2026-02-30")),
+            ("start", text("2026-03-10Tnoon")),
+        ] {
+            let err = call(&mut a, uid, vec![("name", text("X")), (key, bad)]).unwrap_err();
+            assert!(err.contains(&format!("'{key}' must be a date")), "{err}");
+            assert_eq!(*a.project(), before);
+        }
+        // Manual: the start is pinned keeping the duration, in one undo step
+        // with the switch and the duration.
+        let manual = add(&mut a, "Wall", "2d");
+        let mid = manual as i32;
+        let depth = a.undo_depth();
+        call(
+            &mut a,
+            manual,
+            vec![
+                ("manual", Json::Bool(true)),
+                ("duration", text("3d")),
+                ("start", text("2026-03-16")),
+            ],
+        )
+        .unwrap();
+        assert_eq!(a.undo_depth(), depth + 1);
+        let t = a.project().task(mid).unwrap();
+        assert!(t.manual);
+        assert_eq!(
+            (t.manual_start.map(|d| d.parts().day), t.duration_min),
+            (Some(16), 3 * 480)
+        );
+        // Both apply on a manual task, start first, as the dialog does.
+        call(
+            &mut a,
+            manual,
+            vec![
+                ("start", text("2026-03-17")),
+                ("finish", text("2026-03-19")),
+            ],
+        )
+        .unwrap();
+        let t = a.project().task(mid).unwrap();
+        assert_eq!(
+            (
+                t.manual_start.map(|d| d.parts().day),
+                t.manual_finish.map(|d| d.parts().day),
+                t.duration_min
+            ),
+            (Some(17), Some(19), 3 * 480)
+        );
+        // A finish before the start is refused and rolls everything back.
+        let before = a.project().clone();
+        let err = call(
+            &mut a,
+            manual,
+            vec![
+                ("name", text("Nope")),
+                ("start", text("2026-03-24")),
+                ("finish", text("2026-03-20")),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("before"), "{err}");
+        assert_eq!(*a.project(), before);
+        // An instant finish on a manual task sets the span up to it.
+        call(&mut a, manual, vec![("finish", text("2026-03-18T12:00"))]).unwrap();
+        let t = a.project().task(mid).unwrap();
+        assert_eq!(
+            t.manual_finish.map(|d| (d.parts().day, d.parts().hour)),
+            Some((18, 12))
+        );
+        // An explicit constraint beside a start wins, applied after it.
+        call(
+            &mut a,
+            uid,
+            vec![
+                ("start", text("2026-03-09")),
+                (
+                    "constraint",
+                    Json::obj(vec![("type", text("ASAP")), ("date", Json::Null)]),
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            a.project().task(id).unwrap().constraint,
+            ConstraintType::AsSoonAsPossible
+        );
+    }
+
+    #[test]
+    fn task_set_start_refuses_auto_summaries() {
+        let mut p = new_project();
+        p.tasks[0].name = "Phase".into();
+        for uid in [2, 3] {
+            p.tasks.push(Task {
+                uid,
+                id: uid,
+                name: format!("Sub {uid}"),
+                outline_level: 2,
+                duration_min: 480,
+                ..Task::default()
+            });
+        }
+        let mut a = Editor::new(p);
+        let summary = a.project().tasks.iter().find(|t| t.summary).unwrap().uid;
+        for key in ["start", "finish"] {
+            let before = a.project().clone();
+            let args = Json::obj(vec![
+                ("uid", Json::Num(summary as f64)),
+                ("name", Json::Str("X".into())),
+                (key, Json::Str("2026-03-09".into())),
+            ]);
+            let err = dispatch_editor(&mut a, "task.set", &args)
+                .unwrap()
+                .unwrap_err();
+            assert!(err.contains("read-only"), "{err}");
+            assert_eq!(*a.project(), before);
+        }
     }
 
     /// The Task Information fields (#1550): every argument applies in the
