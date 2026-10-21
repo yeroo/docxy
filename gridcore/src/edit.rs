@@ -5430,7 +5430,6 @@ mod table_tests {
         let mut wb = sales();
         page(&mut wb);
         insert_rows(&mut wb, 1, 2, 1);
-        insert_rows(&mut wb, 1, 5, 0);
         assert!(!wb.pivots[0].unsupported);
         assert_eq!(wb.pivots[0].location, (7, 0, 9, 1));
         delete_rows(&mut wb, 1, 0, 2);

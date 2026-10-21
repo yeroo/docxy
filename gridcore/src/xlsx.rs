@@ -8607,7 +8607,7 @@ fn patch_worksheet_source_ref(xml: &str, rect: (u32, u32, u32, u32)) -> String {
     }
     let (r1, c1, r2, c2) = rect;
     let full = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
-    patch_ref_attr(xml, "<worksheetSource", &full)
+    set_tag_attr(xml, el, "ref", Some(&full))
 }
 
 /// Replace the `ref="…"` attribute value of the first `prefix` element.
@@ -17907,6 +17907,22 @@ b",
         let saved = save_xlsx(&pkg);
         let def = saved_part(&saved, "xl/pivotTables/pivotTable1.xml");
         assert!(def.contains(r#"<location ref="A5:B7""#), "{def}");
+    }
+
+    /// A single-quoted `ref='…'` is patched in place, not duplicated.
+    #[test]
+    fn a_single_quoted_source_ref_is_patched_after_a_row_insert() {
+        let pivot_table = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="PivotTable1" cacheId="1"><location ref="A3:B5" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/><pivotFields count="3"><pivotField axis="axisRow" showAll="0"><items count="3"><item x="0"/><item x="1"/><item t="default"/></items></pivotField><pivotField showAll="0"/><pivotField dataField="1" showAll="0"/></pivotFields><rowFields count="1"><field x="0"/></rowFields><dataFields count="1"><dataField name="Sum of Sales" fld="2" baseField="0" baseItem="0"/></dataFields></pivotTableDefinition>"#;
+        let cache = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"><cacheSource type="worksheet"><worksheetSource ref='A1:C5' sheet="Data"/></cacheSource><cacheFields count="3"><cacheField name="Region" numFmtId="0"/><cacheField name="Product" numFmtId="0"/><cacheField name="Sales" numFmtId="0"/></cacheFields></pivotCacheDefinition>"#;
+        let mut pkg = load_xlsx(&pivot_fixture_with("Data", pivot_table, cache)).unwrap();
+        crate::edit::insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let saved = save_xlsx(&pkg);
+        let saved_cache = saved_part(&saved, "xl/pivotCache/pivotCacheDefinition1.xml");
+        assert!(saved_cache.contains(r#"ref="A2:C6""#), "{saved_cache}");
+        assert_eq!(saved_cache.matches("ref=").count(), 1, "{saved_cache}");
+        assert!(!saved_cache.contains("ref='"), "{saved_cache}");
     }
 
     /// A source in another workbook (`r:id` on `worksheetSource`) is not a
