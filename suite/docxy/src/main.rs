@@ -6525,9 +6525,9 @@ fn page_needs_scroll(probe: &RulerProbe, page: usize) -> bool {
 }
 
 /// The section and geometry of the page the ruler currently tracks, from
-/// the shown body's flow (#745): the page's owning section drives the
-/// margin handles' refusal, the drag starts from the final section's raw
-/// margins (see `PageFlow::drag_geom`). The refusing section is the followed
+/// the shown body's flow (#745): the sheet size comes from the page's owning
+/// section, the drag starts from the final section's raw margins (see
+/// `PageFlow::drag_geom`). The section the margin handles' refusal checks is the followed
 /// band's (`ruler_band`: the caret's band on its page, else the first; the
 /// first while a header/footer is open); the sheet size stays the page
 /// owner's. `None` when nothing is tracked yet
@@ -6603,6 +6603,16 @@ fn ruler_text_rect(probe: &RulerProbe, page: usize) -> Option<ScreenRect> {
         .or(probe.contents.get(page).copied().flatten())
 }
 
+/// `content_y`/`content_bottom` follow the first band (`contents`), like the
+/// vertical ruler, while `content_x`/`content_right` follow the band the
+/// ruler tracks.
+fn pin_vertical_to_owner(g: &mut HRulerGeom, probe: &RulerProbe, page: Option<usize>) {
+    if let Some(owner) = page.and_then(|i| probe.contents.get(i).copied().flatten()) {
+        g.content_y = owner.y;
+        g.content_bottom = owner.y + owner.h;
+    }
+}
+
 fn tracked_page(probe: &RulerProbe) -> Option<usize> {
     let viewport = probe.viewport?;
     let visible = |i: usize| {
@@ -6644,8 +6654,9 @@ mod ruler_geom_tests {
         Paragraph, RulerChange, RulerDrag, RulerHandle, RulerProbe, ScreenRect, Surface,
         doc_to_docx, dragged_left_marker, eff_indent, hruler_geom, hruler_hit, leading_items,
         next_tab_stop, page_flow, page_needs_scroll, page_of_block, paragraph_indent_layout,
-        print_caret_page, px_tw, ruler_band, ruler_colors, ruler_drag_result, ruler_text_rect,
-        tab_from_path, tab_page_flow, tracked_page, tracked_page_geom, tw_px, vruler_geom,
+        pin_vertical_to_owner, print_caret_page, px_tw, ruler_band, ruler_colors,
+        ruler_drag_result, ruler_text_rect, tab_from_path, tab_page_flow, tracked_page,
+        tracked_page_geom, tw_px, vruler_geom,
     };
     use docxcore::model::{
         PageGeom, ParProps, RevisionKind, RevisionMetadata, Run, TabAlign, TabLeader, TabStop,
@@ -7225,6 +7236,22 @@ mod ruler_geom_tests {
         let (_, p) = two_band_probe(Some(1));
         assert_eq!(ruler_band(&p, 0), 1);
         assert_eq!(ruler_text_rect(&p, 0).unwrap().x, 50.0);
+        // The horizontal extent follows band 1; the vertical one stays band 0's.
+        let rect = ruler_text_rect(&p, 0).unwrap();
+        let view = p.viewport.unwrap();
+        let mut g = hruler_geom(
+            p.pages[0].unwrap(),
+            rect,
+            view,
+            1.0,
+            Default::default(),
+            &[],
+            false,
+        );
+        assert_eq!(g.content_x, 50.0);
+        pin_vertical_to_owner(&mut g, &p, Some(0));
+        assert_eq!((g.content_x, g.content_y), (50.0, 0.0));
+        assert_eq!(g.content_bottom, 100.0);
         let (_, p) = two_band_probe(Some(0));
         assert_eq!(ruler_band(&p, 0), 0);
         assert_eq!(ruler_text_rect(&p, 0).unwrap().x, 100.0);
@@ -25189,6 +25216,7 @@ impl Docxy {
                     &tabs,
                     state.draft,
                 );
+                pin_vertical_to_owner(&mut g, &state, tracked);
                 g.strip_y = b.origin.y.into();
                 g.tracked_page = tracked;
                 state.painted = Some(g.clone());
@@ -39473,10 +39501,7 @@ impl Render for Docxy {
                         // page an odd/even start inserts) takes the previous block,
                         // so the filler shows the previous section's header/footer,
                         // like the PDF exporter (export.rs new_page(i-1, false, true)).
-                        let first_blocks = page_flow::first_blocks(&pages);
-                        let mut slots = hf::page_slots(editor, &first_blocks, even_odd);
-                        // A filler sheet never takes a section's First variant.
-                        hf::demote_filler_firsts(&mut slots, &pf.fillers(), even_odd);
+                        let slots = hf::slots_of(editor, &pf, even_odd);
                         let mut part_blocks: std::collections::HashMap<&str, Vec<Block>> =
                             std::collections::HashMap::new();
                         if let Some(p) = pkg {

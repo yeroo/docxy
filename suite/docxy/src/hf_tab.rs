@@ -24,7 +24,6 @@ use super::*;
 use crate::dialog::catalog;
 use crate::dialog::{Control as Field, ControlKind, Dialog, DialogOwner, Value};
 use crate::hf::PageSlot;
-use crate::page_flow;
 use crate::page_setup::{ok_cancel, text_of, twips_of};
 use ctlcore::json::Json;
 use docxcore::sdt::BoundProp;
@@ -857,14 +856,9 @@ pub(crate) fn tab_page_slots(tab: &DocTab, markup: MarkupView) -> Vec<PageSlot> 
     };
     let even_odd = tab.pkg.as_ref().is_some_and(|p| p.has_even_odd());
     // The flow the render draws: the shown markup view's body, which can
-    // paginate differently from the live one under Simple Markup (#1254). A
-    // page's first body block; an empty range (a blank odd/even filler) takes
-    // the previous block, and a filler never takes a section's First variant.
+    // paginate differently from the live one under Simple Markup (#1254).
     let pf = crate::tab_page_flow(tab, &ed.doc.markup_view(markup).body);
-    let firsts = page_flow::first_blocks(&pf.ranges());
-    let mut slots = crate::hf::page_slots(ed, &firsts, even_odd);
-    hf::demote_filler_firsts(&mut slots, &pf.fillers(), even_odd);
-    slots
+    crate::hf::slots_of(ed, &pf, even_odd)
 }
 
 /// The navigation order Previous and Next walk: each (section, variant) slot
