@@ -142,8 +142,9 @@ pub struct Schedule {
     /// another calendar may start earlier.
     pub project_start: DateTime,
     /// The anchor before snapping: what a plan with no start date counts
-    /// from (the earliest stored start of its scheduled tasks, else
-    /// 2020-01-06 08:00; of its inactive tasks when none is active). Stating
+    /// from (the earliest stored, pinned (manual) or actual start of its
+    /// scheduled tasks, else 2020-01-06 08:00; of its inactive tasks when none
+    /// is active). Stating
     /// it as the start date gives the same anchor to every pass.
     pub raw_project_start: DateTime,
     pub project_finish: DateTime,

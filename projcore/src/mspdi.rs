@@ -1534,7 +1534,8 @@ pub(crate) fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// elapsed task `DurationFormat`, or a work resource whose calendar differs
 /// from its task's. See `scheduled_dates` and `schedule_reproduces`.
 ///
-/// A plan with no `StartDate` is scheduled from its earliest stored start, so
+/// A plan with no `StartDate` is scheduled from the earliest stored, pinned
+/// (manual) or actual start of its scheduled tasks, else 2020-01-06 08:00, so
 /// a save that writes any scheduled date also writes `<StartDate>` as the
 /// anchor it scheduled from: otherwise the written dates would move the
 /// anchor, and the plan, on reload. A plan that states one keeps it, and a
@@ -1569,8 +1570,8 @@ pub fn write_mspdi(proj: &Project) -> String {
     s.push_str("<Project xmlns=\"http://schemas.microsoft.com/project\">\n");
     let sched = crate::schedule::schedule(proj);
     let dates = scheduled_dates(proj, &sched);
-    // A plan with no StartDate schedules from its earliest stored start, and
-    // a save that writes dates moves that: it pins the anchor it scheduled
+    // A plan with no StartDate schedules from the earliest stored, pinned or
+    // actual start of its tasks, and a save that writes dates moves that: it pins the anchor it scheduled
     // from, as Project always states one (#701).
     let anchor = pinned_start_date(proj, &sched, &dates);
     for &name in PROJECT_HEADER {
@@ -5039,7 +5040,8 @@ mod tests {
     /// Asserts a plan with no `StartDate` saves stably (#701): the saved file
     /// reloads to the same schedule (every task and the anchor) and a second
     /// save writes the same file. Without a `StartDate` the schedule anchors on
-    /// the earliest stored start, so the save must pin the anchor it used.
+    /// the earliest stored, pinned or actual start of its tasks (else 2020-01-06
+    /// 08:00), so the save must pin the anchor it used.
     fn assert_save_is_stable(tasks: &str, calendars: &str) {
         let source = format!("<Project><Tasks>{tasks}</Tasks>{calendars}</Project>");
         let proj = read_mspdi(&source).unwrap();
