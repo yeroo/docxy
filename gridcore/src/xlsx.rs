@@ -4306,13 +4306,17 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
             // need), so this is the only place the persisted source-sheet name
             // gets corrected.
             match &piv.source {
-                crate::pivot::PivotSource::Range { sheet, .. } => {
+                crate::pivot::PivotSource::Range { sheet, rect } => {
                     xml = patch_worksheet_source_sheet(&xml, sheet);
+                    xml = patch_worksheet_source_ref(&xml, *rect);
                 }
-                // A renamed source table: the cache names it.
-                crate::pivot::PivotSource::Table(name) => {
+                // A renamed source table: the cache names it. The empty name
+                // is the placeholder of a source we did not parse (external
+                // workbook): its element stays as loaded.
+                crate::pivot::PivotSource::Table(name) if !name.is_empty() => {
                     xml = patch_worksheet_source_name(&xml, name);
                 }
+                crate::pivot::PivotSource::Table(_) => {}
             }
             if piv.edited || piv.refreshed {
                 xml = set_refresh_on_load(&xml);
@@ -8586,6 +8590,24 @@ fn patch_pivot_location(xml: &str, rect: (u32, u32, u32, u32)) -> String {
     let (r1, c1, r2, c2) = rect;
     let full = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
     patch_ref_attr(xml, "<location", &full)
+}
+
+/// Point a pivot cache's `<worksheetSource ref>` at `rect` (a row/column edit
+/// moved the source range); a no-op when it already names that rect, so
+/// `$A$1:$C$5` keeps its spelling, or when the element has no `ref`.
+fn patch_worksheet_source_ref(xml: &str, rect: (u32, u32, u32, u32)) -> String {
+    let Some(el) = xml.find("<worksheetSource") else {
+        return xml.to_string();
+    };
+    let Some(current) = attr_at(xml, el, "ref").map(crate::sheet::parse_range_name) else {
+        return xml.to_string();
+    };
+    if current == Some(rect) {
+        return xml.to_string();
+    }
+    let (r1, c1, r2, c2) = rect;
+    let full = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
+    set_tag_attr(xml, el, "ref", Some(&full))
 }
 
 /// Replace the `ref="…"` attribute value of the first `prefix` element.
@@ -17839,6 +17861,119 @@ b",
             saved_part(&saved, "xl/pivotCache/pivotCacheDefinition1.xml"),
             cache
         );
+    }
+
+    /// A row inserted above the source (#1191) moves the pivot's source
+    /// range; the cache's `<worksheetSource ref>` follows, and so does the
+    /// total after a reload and refresh.
+    #[test]
+    fn inserting_a_row_above_the_source_moves_its_saved_ref() {
+        let pivot_table = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="PivotTable1" cacheId="1"><location ref="A3:B5" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/><pivotFields count="3"><pivotField axis="axisRow" showAll="0"><items count="3"><item x="0"/><item x="1"/><item t="default"/></items></pivotField><pivotField showAll="0"/><pivotField dataField="1" showAll="0"/></pivotFields><rowFields count="1"><field x="0"/></rowFields><dataFields count="1"><dataField name="Sum of Sales" fld="2" baseField="0" baseItem="0"/></dataFields></pivotTableDefinition>"#;
+        let cache = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"><cacheSource type="worksheet"><worksheetSource ref="$A$1:$C$5" sheet="Data"/></cacheSource><cacheFields count="3"><cacheField name="Region" numFmtId="0"/><cacheField name="Product" numFmtId="0"/><cacheField name="Sales" numFmtId="0"/></cacheFields></pivotCacheDefinition>"#;
+        let mut pkg = load_xlsx(&pivot_fixture_with("Data", pivot_table, cache)).unwrap();
+        // Untouched: no edit, no patch.
+        let same = save_xlsx(&pkg);
+        assert_eq!(
+            saved_part(&same, "xl/pivotCache/pivotCacheDefinition1.xml"),
+            cache
+        );
+        crate::edit::insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let saved = save_xlsx(&pkg);
+        let saved_cache = saved_part(&saved, "xl/pivotCache/pivotCacheDefinition1.xml");
+        assert!(saved_cache.contains(r#"ref="A2:C6""#), "{saved_cache}");
+
+        let mut again = load_xlsx(&saved).unwrap();
+        assert_eq!(
+            again.workbook.pivots[0].source,
+            crate::pivot::PivotSource::Range {
+                sheet: "Data".into(),
+                rect: (1, 0, 5, 2)
+            }
+        );
+        let out = crate::pivot::refresh_pivots(&mut again.workbook);
+        assert_eq!(out.refreshed, 1);
+        // Rows: header, East, West, Grand Total from row 3 (index 2).
+        let total = again.workbook.sheets[1].cell(5, 1).unwrap();
+        assert_eq!(total.value, CellValue::Number(100.0));
+    }
+
+    /// Inserting a row above the pivot's own output moves its saved location.
+    #[test]
+    fn inserting_a_row_above_the_output_moves_its_saved_location() {
+        let mut pkg = load_xlsx(&pivot_fixture()).unwrap();
+        crate::edit::insert_rows(&mut pkg.workbook, 1, 0, 2);
+        let saved = save_xlsx(&pkg);
+        let def = saved_part(&saved, "xl/pivotTables/pivotTable1.xml");
+        assert!(def.contains(r#"<location ref="A5:B7""#), "{def}");
+    }
+
+    /// A single-quoted `ref='…'` is patched in place, not duplicated.
+    #[test]
+    fn a_single_quoted_source_ref_is_patched_after_a_row_insert() {
+        let pivot_table = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="PivotTable1" cacheId="1"><location ref="A3:B5" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/><pivotFields count="3"><pivotField axis="axisRow" showAll="0"><items count="3"><item x="0"/><item x="1"/><item t="default"/></items></pivotField><pivotField showAll="0"/><pivotField dataField="1" showAll="0"/></pivotFields><rowFields count="1"><field x="0"/></rowFields><dataFields count="1"><dataField name="Sum of Sales" fld="2" baseField="0" baseItem="0"/></dataFields></pivotTableDefinition>"#;
+        let cache = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"><cacheSource type="worksheet"><worksheetSource ref='A1:C5' sheet="Data"/></cacheSource><cacheFields count="3"><cacheField name="Region" numFmtId="0"/><cacheField name="Product" numFmtId="0"/><cacheField name="Sales" numFmtId="0"/></cacheFields></pivotCacheDefinition>"#;
+        let mut pkg = load_xlsx(&pivot_fixture_with("Data", pivot_table, cache)).unwrap();
+        crate::edit::insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let saved = save_xlsx(&pkg);
+        let saved_cache = saved_part(&saved, "xl/pivotCache/pivotCacheDefinition1.xml");
+        assert!(saved_cache.contains(r#"ref="A2:C6""#), "{saved_cache}");
+        assert_eq!(saved_cache.matches("ref=").count(), 1, "{saved_cache}");
+        assert!(!saved_cache.contains("ref='"), "{saved_cache}");
+    }
+
+    /// A source in another workbook (`r:id` on `worksheetSource`) is not a
+    /// local range: a row inserted on a same-named local sheet leaves its
+    /// saved ref alone, and the pivot keeps its cache only.
+    #[test]
+    fn an_external_source_range_is_not_shifted_by_a_local_edit() {
+        let pivot_table = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="PivotTable1" cacheId="1"><location ref="A3:B5" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/><pivotFields count="3"><pivotField axis="axisRow" showAll="0"><items count="3"><item x="0"/><item x="1"/><item t="default"/></items></pivotField><pivotField showAll="0"/><pivotField dataField="1" showAll="0"/></pivotFields><rowFields count="1"><field x="0"/></rowFields><dataFields count="1"><dataField name="Sum of Sales" fld="2" baseField="0" baseItem="0"/></dataFields></pivotTableDefinition>"#;
+        let cache = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"><cacheSource type="worksheet"><worksheetSource ref="A1:C5" sheet="Data" r:id="rId1"/></cacheSource><cacheFields count="3"><cacheField name="Region" numFmtId="0"/><cacheField name="Product" numFmtId="0"/><cacheField name="Sales" numFmtId="0"/></cacheFields></pivotCacheDefinition>"#;
+        let mut pkg = load_xlsx(&pivot_fixture_with("Data", pivot_table, cache)).unwrap();
+        assert!(pkg.workbook.pivots[0].unsupported);
+        crate::edit::insert_rows(&mut pkg.workbook, 0, 0, 1);
+        crate::edit::rename_sheet(&mut pkg.workbook, 0, "Facts");
+        let saved = save_xlsx(&pkg);
+        let saved_cache = saved_part(&saved, "xl/pivotCache/pivotCacheDefinition1.xml");
+        assert!(
+            saved_cache.contains(r#"ref="A1:C5" sheet="Data""#),
+            "{saved_cache}"
+        );
+    }
+
+    /// A named external table source (`name` + `r:id`) loads as the
+    /// placeholder: an unedited save keeps the cache byte for byte.
+    #[test]
+    fn a_named_external_source_saves_byte_identical() {
+        let pivot_table = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="PivotTable1" cacheId="1"><location ref="A3:B5" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/><pivotFields count="3"><pivotField axis="axisRow" showAll="0"><items count="3"><item x="0"/><item x="1"/><item t="default"/></items></pivotField><pivotField showAll="0"/><pivotField dataField="1" showAll="0"/></pivotFields><rowFields count="1"><field x="0"/></rowFields><dataFields count="1"><dataField name="Sum of Sales" fld="2" baseField="0" baseItem="0"/></dataFields></pivotTableDefinition>"#;
+        let cache = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"><cacheSource type="worksheet"><worksheetSource name="Table1" r:id="rId1"/></cacheSource><cacheFields count="3"><cacheField name="Region" numFmtId="0"/><cacheField name="Product" numFmtId="0"/><cacheField name="Sales" numFmtId="0"/></cacheFields></pivotCacheDefinition>"#;
+        let pkg = load_xlsx(&pivot_fixture_with("Data", pivot_table, cache)).unwrap();
+        assert!(pkg.workbook.pivots[0].unsupported);
+        let saved = save_xlsx(&pkg);
+        assert_eq!(
+            saved_part(&saved, "xl/pivotCache/pivotCacheDefinition1.xml"),
+            cache
+        );
+    }
+
+    /// A row inserted inside the output would change its size, which the
+    /// saved row items cannot follow: the pivot keeps its cache only and its
+    /// `<location ref>` stays as loaded.
+    #[test]
+    fn inserting_a_row_inside_the_output_keeps_the_saved_location() {
+        let mut pkg = load_xlsx(&pivot_fixture()).unwrap();
+        crate::edit::insert_rows(&mut pkg.workbook, 1, 3, 1);
+        assert!(pkg.workbook.pivots[0].unsupported);
+        let saved = save_xlsx(&pkg);
+        let def = saved_part(&saved, "xl/pivotTables/pivotTable1.xml");
+        assert!(def.contains(r#"<location ref="A3:B5""#), "{def}");
     }
 
     /// A refreshed pivot asks Excel to rebuild it, but a refresh that keeps

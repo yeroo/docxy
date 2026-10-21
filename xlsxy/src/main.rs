@@ -1955,8 +1955,11 @@ struct WbSnapshot {
     /// kept), only in the snapshots of the step that switches it on
     /// ([`App::precision_on`]); every other step leaves the setting alone.
     precision: Option<(bool, bool)>,
-    /// Each PivotTable's source: a table rename moves it.
+    /// Each PivotTable's source: a table or sheet rename, or a row/column
+    /// edit (a range's rect), moves it.
     pivot_sources: Vec<gridcore::pivot::PivotSource>,
+    /// Each PivotTable's output region: a row/column edit shifts it.
+    pivot_locations: Vec<(u32, u32, u32, u32)>,
     /// A table rename (from, to) to replay on the data model when this
     /// snapshot is restored. Model edits are not on the undo stack, so undo
     /// renames the tables the *current* model names rather than putting back
@@ -1970,7 +1973,9 @@ struct WbSnapshot {
     /// step's `after`) or found it (its `before`), for undo and redo to put
     /// back.
     clip_edit: Option<ClipEdit>,
-    /// Each PivotTable's `unsupported` flag: deleting its table sets it.
+    /// Each PivotTable's `unsupported` flag: deleting its table, or a
+    /// row/column edit that deletes or cuts through its output or source,
+    /// sets it.
     pivot_unsupported: Vec<bool>,
     /// A Resize Table step: undo and redo leave the model and the pending
     /// copy alone, as the step did.
@@ -4241,6 +4246,7 @@ impl App {
             removed_tables: wb.removed_tables.clone(),
             precision: None,
             pivot_sources: wb.pivots.iter().map(|p| p.source.clone()).collect(),
+            pivot_locations: wb.pivots.iter().map(|p| p.location).collect(),
             model_rename: None,
             model_edits: Vec::new(),
             clip_edit: None,
@@ -4268,14 +4274,16 @@ impl App {
         // Pivots aren't added or removed by a structural edit; if their count
         // changed since, the sources no longer line up and stay as they are.
         if wb.pivots.len() == snap.pivot_sources.len() {
-            for ((p, source), &unsupported) in wb
+            for (((p, source), &unsupported), &location) in wb
                 .pivots
                 .iter_mut()
                 .zip(&snap.pivot_sources)
                 .zip(&snap.pivot_unsupported)
+                .zip(&snap.pivot_locations)
             {
                 p.source = source.clone();
                 p.unsupported = unsupported;
+                p.location = location;
             }
         }
     }
@@ -19777,6 +19785,37 @@ mod tests {
         assert!(!app.pkg.workbook.pivots[0].unsupported);
         app.redo();
         assert!(app.pkg.workbook.pivots[0].unsupported);
+    }
+
+    #[test]
+    fn undoing_a_row_insert_restores_the_pivot_location_1191() {
+        let mut app = header_app();
+        let frame = gridcore::frame::Frame::from_range(&app.pkg.workbook, 0, (0, 0, 2, 1));
+        let dest = app.pkg.add_sheet("Pivot");
+        app.pkg
+            .add_pivot(
+                gridcore::pivot::PivotSource::Table("Sales".into()),
+                frame.names.clone(),
+                gridcore::pivot::DataField {
+                    name: "Sum of Qty".into(),
+                    field: 1,
+                    agg: gridcore::frame::Agg::Sum,
+                },
+                dest,
+                (2, 0),
+            )
+            .unwrap();
+        app.rebuild_engine();
+        let loc = app.pkg.workbook.pivots[0].location;
+        app.sheet = dest;
+        app.cur = (0, 0);
+        app.anchor = None;
+        app.row_op(true);
+        assert_eq!(app.pkg.workbook.pivots[0].location.0, loc.0 + 1);
+        app.undo();
+        assert_eq!(app.pkg.workbook.pivots[0].location, loc);
+        app.redo();
+        assert_eq!(app.pkg.workbook.pivots[0].location.0, loc.0 + 1);
     }
 
     fn clip_formula(app: &App) -> Option<String> {
