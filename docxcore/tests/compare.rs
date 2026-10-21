@@ -987,6 +987,10 @@ fn a_smart_tag_inside_a_changed_word_nests_properly_1220() {
         xml.find("</w:smartTag>").unwrap(),
     );
     let span = &xml[open..close];
+    assert!(
+        span.contains("<w:ins ") && span.contains(">ot</w:t>"),
+        "the tag wraps an insertion holding 'ot': {xml}"
+    );
     assert_eq!(
         span.matches("<w:ins ").count(),
         span.matches("</w:ins>").count(),
@@ -1028,4 +1032,47 @@ fn a_word_does_not_join_across_a_hyperlink_edge_1220() {
     );
     let result = compare(&original, &revised);
     assert!(result.insertions + result.deletions > 0);
+}
+
+#[test]
+fn a_marker_in_an_inserted_word_splits_the_insertion_at_its_place_1220() {
+    let original = pkg(&p("cat dog"));
+    let revised = marked(
+        "<w:r><w:t>c</w:t></w:r><w:bookmarkStart w:id=\"3\" w:name=\"b\"/>\
+         <w:r><w:t xml:space=\"preserve\">ot dog</w:t></w:r><w:bookmarkEnd w:id=\"3\"/>",
+    );
+    let xml = document_to_xml(&compare(&original, &revised).package.document);
+    let start = xml.find("<w:bookmarkStart").expect(&xml);
+    let before = &xml[..start];
+    assert!(
+        before.ends_with("</w:ins>") && before.contains(">c</w:t></w:r></w:ins>"),
+        "'c' is inserted before the marker: {xml}"
+    );
+    assert!(
+        xml[start..].contains("/><w:ins ") && xml[start..].contains(">ot</w:t>"),
+        "'ot' after it, in an insertion of its own: {xml}"
+    );
+}
+
+#[test]
+fn markers_in_a_wholly_inserted_paragraph_keep_their_offsets_1220() {
+    let original = pkg(&p(""));
+    let revised = marked(
+        "<w:r><w:t>c</w:t></w:r><w:bookmarkStart w:id=\"3\" w:name=\"b\"/>\
+         <w:r><w:t>o</w:t></w:r><w:bookmarkEnd w:id=\"3\"/><w:r><w:t>t</w:t></w:r>",
+    );
+    let xml = document_to_xml(&compare(&original, &revised).package.document);
+    let (s, e) = (
+        xml.find("<w:bookmarkStart").expect(&xml),
+        xml.find("<w:bookmarkEnd").expect(&xml),
+    );
+    assert!(
+        xml[..s].contains(">c</w:t>") && !xml[..s].contains(">o</w:t>"),
+        "{xml}"
+    );
+    assert!(
+        xml[s..e].contains(">o</w:t>"),
+        "'o' between start and end: {xml}"
+    );
+    assert!(xml[e..].contains(">t</w:t>"), "{xml}");
 }

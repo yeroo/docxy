@@ -651,7 +651,7 @@ impl<'o> Compare<'o> {
                 end += 1;
             }
             let mut content = Vec::new();
-            // Markers inside inserted words: (index in `content`, marker).
+            // Where `content` holds a marker from inside an inserted word.
             let mut marks = Vec::new();
             for step in &steps[k..end] {
                 match step {
@@ -668,12 +668,12 @@ impl<'o> Compare<'o> {
                     // A marker stays outside the revision, as an anchor does:
                     // rejecting the insertion must not drop half a pair.
                     let mut from = 0;
-                    for (at, marker) in marks {
+                    for at in marks {
                         if at > from {
                             out.push(self.revision(kind, content[from..at].to_vec()));
                         }
-                        out.push(marker);
-                        from = at;
+                        out.push(content[at].clone());
+                        from = at + 1;
                     }
                     if from < content.len() {
                         out.push(self.revision(kind, content[from..].to_vec()));
@@ -1214,14 +1214,10 @@ fn tokenize(segments: &[Segment], link: Option<usize>, out: &mut Vec<Atom>) {
 }
 
 /// Append a revised atom; `in_revision` when it goes inside a `w:ins`, where
-/// the markers inside a word are not put in `content` but noted in `marks` with
-/// the index they would take, for the caller to place outside the revision.
-fn push_atom(
-    content: &mut Vec<Inline>,
-    atom: &Atom,
-    in_revision: bool,
-    marks: &mut Vec<(usize, Inline)>,
-) {
+/// the index of each marker inside a word is noted in `marks`, for the caller
+/// to lift it out of the revision. The marker itself is in `content`, which
+/// keeps the text on either side in runs of their own.
+fn push_atom(content: &mut Vec<Inline>, atom: &Atom, in_revision: bool, marks: &mut Vec<usize>) {
     match &atom.kind {
         AtomKind::Object(Inline::Field { raw, text }) if in_revision => {
             content.push(Inline::Field {
@@ -1246,10 +1242,9 @@ fn push_atom(
                                 push_text(content, &rest[..cut], props.clone());
                             }
                             if in_revision {
-                                marks.push((content.len(), inline.clone()));
-                            } else {
-                                content.push(inline.clone());
+                                marks.push(content.len());
                             }
+                            content.push(inline.clone());
                             at = *offset;
                             rest = &rest[cut..];
                         }
