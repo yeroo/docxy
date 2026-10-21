@@ -870,3 +870,243 @@ fn a_dropped_tables_index_counts_paired_paragraphs() {
         "M, the table cell, Q"
     );
 }
+
+fn marked(runs: &str) -> Package {
+    pkg(&format!("<w:p>{runs}</w:p>"))
+}
+
+#[test]
+fn a_word_split_by_a_marker_is_unchanged_1220() {
+    let original = pkg(&p("cat dog"));
+    for marker in [
+        "<w:bookmarkStart w:id=\"3\" w:name=\"b\"/>",
+        "<w:proofErr w:type=\"spellStart\"/>",
+    ] {
+        let revised = marked(&format!(
+            "<w:r><w:t>ca</w:t></w:r>{marker}<w:r><w:t xml:space=\"preserve\">t dog</w:t></w:r>"
+        ));
+        let result = compare(&original, &revised);
+        assert_eq!((result.insertions, result.deletions), (0, 0), "{marker}");
+        let xml = document_to_xml(&result.package.document);
+        let at = xml
+            .find(marker)
+            .unwrap_or_else(|| panic!("{marker}: {xml}"));
+        assert_eq!(xml.matches(marker).count(), 1, "{xml}");
+        assert!(
+            xml[..at].ends_with("ca</w:t></w:r>"),
+            "marker stays between 'ca' and 't': {xml}"
+        );
+    }
+}
+
+#[test]
+fn a_marker_at_a_word_boundary_stays_where_it_was_1220() {
+    let original = pkg(&p("cat dog"));
+    let revised = marked(
+        "<w:r><w:t>cat</w:t></w:r><w:bookmarkStart w:id=\"3\" w:name=\"b\"/>\
+         <w:r><w:t xml:space=\"preserve\"> dog</w:t></w:r>",
+    );
+    let result = compare(&original, &revised);
+    assert_eq!((result.insertions, result.deletions), (0, 0));
+    let xml = document_to_xml(&result.package.document);
+    assert!(xml.contains("cat</w:t></w:r><w:bookmarkStart"), "{xml}");
+}
+
+#[test]
+fn a_marker_inside_a_changed_word_is_kept_outside_the_revision_1220() {
+    let original = pkg(&p("cat dog"));
+    // Only the start is inside the changed word; its end is after `dog`.
+    let revised = marked(
+        "<w:r><w:t>c</w:t></w:r><w:bookmarkStart w:id=\"3\" w:name=\"b\"/>\
+         <w:r><w:t xml:space=\"preserve\">ot dog</w:t></w:r><w:bookmarkEnd w:id=\"3\"/>",
+    );
+    let result = compare(&original, &revised);
+    assert!(result.insertions > 0);
+    for accept in [true, false] {
+        let xml = document_to_xml(&resolved(&result.package.document, accept));
+        assert_eq!(
+            xml.matches("<w:bookmarkStart").count(),
+            1,
+            "{accept}: {xml}"
+        );
+        assert_eq!(xml.matches("<w:bookmarkEnd").count(), 1, "{accept}: {xml}");
+    }
+    assert_eq!(
+        texts(&resolved(&result.package.document, true)),
+        ["cot dog"]
+    );
+    assert_eq!(
+        texts(&resolved(&result.package.document, false)),
+        ["cat dog"]
+    );
+    let xml = document_to_xml(&result.package.document);
+    let start = xml.find("<w:bookmarkStart").unwrap();
+    let ins_open = xml[..start].rfind("<w:ins ");
+    let ins_close = xml[..start].rfind("</w:ins>");
+    assert!(
+        ins_open.is_none() || ins_close > ins_open,
+        "outside w:ins: {xml}"
+    );
+}
+
+#[test]
+fn a_content_control_half_still_splits_a_word_1220() {
+    let original = pkg(&p("FY2023 report"));
+    let revised = marked(
+        "<w:r><w:t>FY</w:t></w:r><w:sdt><w:sdtPr/><w:sdtContent><w:r><w:t>2024</w:t></w:r>\
+         </w:sdtContent></w:sdt><w:r><w:t xml:space=\"preserve\"> report</w:t></w:r>",
+    );
+    let result = compare(&original, &revised);
+    let xml = document_to_xml(&result.package.document);
+    assert!(result.insertions > 0, "{xml}");
+    // Well formed and nested: reload it and write it again.
+    let again = document_to_xml(&parse_document_xml(&xml, &Relationships::default()));
+    assert_eq!(xml.matches("<w:sdt>").count(), 1, "{xml}");
+    assert_eq!(xml.matches("</w:sdt>").count(), 1, "{xml}");
+    assert_eq!(again.matches("<w:sdtContent>").count(), 1, "{again}");
+    let (sdt, end) = (xml.find("<w:sdt>").unwrap(), xml.find("</w:sdt>").unwrap());
+    let ins_inside =
+        xml[sdt..end].matches("<w:ins ").count() == xml[sdt..end].matches("</w:ins>").count();
+    assert!(ins_inside, "no w:ins crosses the control: {xml}");
+}
+
+#[test]
+fn a_smart_tag_inside_a_changed_word_nests_properly_1220() {
+    let original = pkg(&p("cat"));
+    let revised = marked(
+        "<w:r><w:t>c</w:t></w:r><w:smartTag w:uri=\"u\" w:element=\"e\">\
+         <w:r><w:t>ot</w:t></w:r></w:smartTag>",
+    );
+    let result = compare(&original, &revised);
+    assert!(result.insertions > 0);
+    let xml = document_to_xml(&result.package.document);
+    assert_eq!(xml.matches("<w:smartTag ").count(), 1, "{xml}");
+    assert_eq!(xml.matches("</w:smartTag>").count(), 1, "{xml}");
+    let (open, close) = (
+        xml.find("<w:smartTag ").unwrap(),
+        xml.find("</w:smartTag>").unwrap(),
+    );
+    let span = &xml[open..close];
+    assert!(
+        span.contains("<w:ins ") && span.contains(">ot</w:t>"),
+        "the tag wraps an insertion holding 'ot': {xml}"
+    );
+    assert_eq!(
+        span.matches("<w:ins ").count(),
+        span.matches("</w:ins>").count(),
+        "{xml}"
+    );
+    for accept in [true, false] {
+        let xml = document_to_xml(&resolved(&result.package.document, accept));
+        assert_eq!(xml.matches("<w:smartTag ").count(), 1, "{xml}");
+        assert_eq!(xml.matches("</w:smartTag>").count(), 1, "{xml}");
+    }
+}
+
+#[test]
+fn a_marker_between_differently_formatted_runs_keeps_both_formats_1220() {
+    let original =
+        pkg("<w:p><w:r><w:t>ca</w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>t</w:t></w:r></w:p>");
+    let revised = marked(
+        "<w:r><w:t>ca</w:t></w:r><w:bookmarkStart w:id=\"3\" w:name=\"b\"/>\
+         <w:r><w:rPr><w:b/></w:rPr><w:t>t</w:t></w:r>",
+    );
+    let result = compare(&original, &revised);
+    assert_eq!((result.insertions, result.deletions), (0, 0));
+    let xml = document_to_xml(&result.package.document);
+    assert!(
+        xml.contains("ca</w:t></w:r><w:bookmarkStart")
+            && xml.contains("<w:b/></w:rPr><w:t xml:space=\"preserve\">t</w:t>")
+            && !xml.contains("<w:t xml:space=\"preserve\"></w:t>")
+            && !xml.contains("<w:t/>"),
+        "{xml}"
+    );
+}
+
+#[test]
+fn a_word_does_not_join_across_a_hyperlink_edge_1220() {
+    let original = pkg(&p("cat"));
+    let revised = marked(
+        "<w:r><w:t>ca</w:t></w:r><w:hyperlink w:anchor=\"x\"><w:bookmarkStart w:id=\"3\" w:name=\"b\"/>\
+         <w:r><w:t>t</w:t></w:r></w:hyperlink>",
+    );
+    let result = compare(&original, &revised);
+    assert!(result.insertions + result.deletions > 0);
+}
+
+#[test]
+fn a_marker_in_an_inserted_word_splits_the_insertion_at_its_place_1220() {
+    let original = pkg(&p("cat dog"));
+    let revised = marked(
+        "<w:r><w:t>c</w:t></w:r><w:bookmarkStart w:id=\"3\" w:name=\"b\"/>\
+         <w:r><w:t xml:space=\"preserve\">ot dog</w:t></w:r><w:bookmarkEnd w:id=\"3\"/>",
+    );
+    let xml = document_to_xml(&compare(&original, &revised).package.document);
+    let start = xml.find("<w:bookmarkStart").expect(&xml);
+    let before = &xml[..start];
+    assert!(
+        before.ends_with("</w:ins>") && before.contains(">c</w:t></w:r></w:ins>"),
+        "'c' is inserted before the marker: {xml}"
+    );
+    assert!(
+        xml[start..].contains("/><w:ins ") && xml[start..].contains(">ot</w:t>"),
+        "'ot' after it, in an insertion of its own: {xml}"
+    );
+}
+
+#[test]
+fn markers_in_a_paragraph_diffed_against_an_empty_one_keep_their_offsets_1220() {
+    let original = pkg(&p(""));
+    let revised = marked(
+        "<w:r><w:t>c</w:t></w:r><w:bookmarkStart w:id=\"3\" w:name=\"b\"/>\
+         <w:r><w:t>o</w:t></w:r><w:bookmarkEnd w:id=\"3\"/><w:r><w:t>t</w:t></w:r>",
+    );
+    let xml = document_to_xml(&compare(&original, &revised).package.document);
+    let (s, e) = (
+        xml.find("<w:bookmarkStart").expect(&xml),
+        xml.find("<w:bookmarkEnd").expect(&xml),
+    );
+    assert!(
+        xml[..s].contains(">c</w:t>") && !xml[..s].contains(">o</w:t>"),
+        "{xml}"
+    );
+    assert!(
+        xml[s..e].contains(">o</w:t>"),
+        "'o' between start and end: {xml}"
+    );
+    assert!(xml[e..].contains(">t</w:t>"), "{xml}");
+}
+
+#[test]
+fn markers_in_a_wholly_inserted_paragraph_keep_their_offsets_1220() {
+    // An inserted paragraph between matched ones goes through
+    // `whole_paragraph`, not the word diff.
+    let original = pkg(&paras(&["A", "B"]));
+    let revised = pkg(&format!(
+        "{}<w:p><w:r><w:t>c</w:t></w:r><w:bookmarkStart w:id=\"3\" w:name=\"b\"/>\
+         <w:r><w:t>o</w:t></w:r><w:bookmarkEnd w:id=\"3\"/><w:r><w:t>t</w:t></w:r></w:p>{}",
+        p("A"),
+        p("B")
+    ));
+    let result = compare(&original, &revised);
+    assert_eq!(result.deletions, 0);
+    let xml = document_to_xml(&result.package.document);
+    let (s, e) = (
+        xml.find("<w:bookmarkStart").expect(&xml),
+        xml.find("<w:bookmarkEnd").expect(&xml),
+    );
+    assert!(
+        xml[..s].contains(">c</w:t>") && !xml[..s].contains(">o</w:t>"),
+        "{xml}"
+    );
+    assert!(
+        xml[s..e].contains(">o</w:t>"),
+        "'o' between start and end: {xml}"
+    );
+    assert!(xml[e..].contains(">t</w:t>"), "{xml}");
+    for accept in [true, false] {
+        let xml = document_to_xml(&resolved(&result.package.document, accept));
+        assert_eq!(xml.matches("<w:bookmarkStart").count(), 1, "{xml}");
+        assert_eq!(xml.matches("<w:bookmarkEnd").count(), 1, "{xml}");
+    }
+}

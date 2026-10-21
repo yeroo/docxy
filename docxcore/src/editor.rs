@@ -4423,7 +4423,7 @@ pub(crate) fn drop_emptied_link(content: &mut Vec<Inline>, i: usize) {
 /// A zero-width child that shows nothing: a bookmark, proofing or permission
 /// mark, a comment range, a smart tag's boundary, or an empty `w:r` (#1217).
 /// These may leave a link whose text is all deleted.
-fn is_marker(inline: &Inline) -> bool {
+pub(crate) fn is_marker(inline: &Inline) -> bool {
     if let Inline::Raw(raw) = inline {
         if crate::hf::is_smart_tag_open(raw)
             || crate::hf::is_smart_tag_close(raw)
