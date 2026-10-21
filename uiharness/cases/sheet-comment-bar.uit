@@ -1,7 +1,7 @@
 # The sheet comment bar (#1292): Excel commits a note being edited when the
 # selection moves off it. A grid click (plain, Shift, Ctrl, double), a
-# right-click, a row/column insert or delete and Review › Previous/Next
-# Comment all leave the bar first: a changed buffer commits to the cell the
+# right-click, a row/column insert or delete, Go To / Go To Special (as the
+# dialog opens) and Review › Previous/Next Comment all leave the bar first: a changed buffer commits to the cell the
 # bar opened on (the anchor, `comment_cell`), an untouched one writes nothing,
 # and the bar closes. basic.xlsx has no notes; A1 holds Region.
 
@@ -85,10 +85,10 @@ test next comment leaves the bar before moving
   assert sel is A1
   assert comment is N
 
-# Go To is a move that leaves the bar open: the selection goes to C9 while
-# the anchor stays A1, and the later click's leave still writes the note to
-# the anchor, not the live selection.
-test go to moves the selection but the note lands on the anchor
+# Go To leaves the bar as a cell click does, as the dialog opens: the note
+# is written to the anchor A1 then, and the selection that follows (C9) does
+# not carry it.
+test go to leaves the bar and the note lands on the anchor
   open copy:../fixtures/basic.xlsx
   click A1
   call ribbon-click {"tab":"Review","command":"New Comment"}
@@ -96,13 +96,23 @@ test go to moves the selection but the note lands on the anchor
   call menu-open {"target":{"ribbon":["Home","Editing","Find & Select"]}}
   call menu-click {"label":"Go To…"}
   assert dialog is goto
+  assert comment_cell is null
   call dialog-set {"control":"reference","value":"C9"}
   call dialog-click {"button":"OK"}
   assert sel is C9
-  assert comment_cell is A1
-  assert comment_edit is G
-  click C5
   assert comment_cell is null
-  assert comment is null
   click A1
   assert comment is G
+
+test go to with an untouched bar writes nothing
+  open copy:../fixtures/basic.xlsx
+  click A1
+  call ribbon-click {"tab":"Review","command":"New Comment"}
+  call menu-open {"target":{"ribbon":["Home","Editing","Find & Select"]}}
+  call menu-click {"label":"Go To…"}
+  assert dialog is goto
+  assert comment_cell is null
+  assert dirty is false
+  call dialog-click {"button":"Cancel"}
+  click A1
+  assert comment is null

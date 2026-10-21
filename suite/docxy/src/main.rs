@@ -5571,9 +5571,10 @@ struct Docxy {
     sheet_comment_seed: Option<String>,
     // The cell (sheet index, row, col) the bar opened on: the label, Enter,
     // Save and the exit commit all target it. A cell click, right-click, a
-    // Name Box click, Previous/Next Comment or a row/column insert/delete commits a changed
+    // Name Box click, Go To / Go To Special (as the dialog opens),
+    // Previous/Next Comment or a row/column insert/delete commits a changed
     // buffer to it and closes the bar first; the anchor still matters for
-    // moves that leave the bar open (header clicks, Go To) and
+    // moves that leave the bar open (header clicks) and
     // for the exit commit. Set with the seed, cleared with it.
     sheet_comment_cell: Option<(usize, u32, u32)>,
     // Whether the data-validation list dropdown is open on the selected cell.
@@ -19730,9 +19731,10 @@ impl Docxy {
     /// remembers the cell it opened on — the anchor — alongside the seed:
     /// the label, Enter and an exit commit all target the anchor, not the
     /// live selection, and a cell click, right-click, Name Box click,
+    /// Go To / Go To Special (as the dialog opens),
     /// Previous/Next Comment or a row/column insert/delete commits a changed buffer to the anchor
     /// and closes the bar first. Selection moves that leave the bar open
-    /// (header clicks, Go To) still never move the note.
+    /// (header clicks) still never move the note.
     fn sheet_new_comment(&mut self, cx: &mut Context<Self>) {
         if let Some(v) = self.active_sheet() {
             let cell = (v.active, v.sel.0, v.sel.1);
@@ -19757,7 +19759,8 @@ impl Docxy {
     /// anchor cell (the exit commit's rules — an untouched bar, or one whose
     /// text the anchor's note already holds, writes nothing), then the bar
     /// closes. No-op when the bar is closed. A cell click, right-click, a
-    /// Name Box click, Previous/Next Comment and a row/column insert/delete all leave it;
+    /// Name Box click, Go To / Go To Special (as the dialog opens),
+    /// Previous/Next Comment and a row/column insert/delete all leave it;
     /// the window-close exit commit (`commit_dialog_buffers_for_exit`) is
     /// this same leave.
     pub(crate) fn sheet_comment_bar_leave(&mut self) {
@@ -22563,15 +22566,24 @@ impl Docxy {
             SheetAct::Clear(gridcore::edit::ClearWhat::Contents) => self.sheet_clear(cx),
             SheetAct::Clear(what) => self.sheet_clear_what(what, cx),
             SheetAct::GoTo | SheetAct::GoToSpecial => {
-                if let Some(tab) = self.tabs.get_mut(self.active) {
-                    let d = if act == SheetAct::GoTo {
+                let built = self.tabs.get_mut(self.active).map(|tab| {
+                    if act == SheetAct::GoTo {
                         sheet_goto::goto_dialog(tab)
                     } else {
                         sheet_goto::special_dialog(tab)
-                    };
-                    match d {
-                        Ok(d) => tab.dialogs.push(d),
-                        Err(e) => tab.status = e.into(),
+                    }
+                });
+                // Go To moves the selection when it is confirmed: the bar
+                // leaves as a cell click does, but only once the dialog really
+                // opens, so a refused Go To keeps the typed text.
+                if matches!(built, Some(Ok(_))) {
+                    self.sheet_comment_bar_leave();
+                }
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    match built {
+                        Some(Ok(d)) => tab.dialogs.push(d),
+                        Some(Err(e)) => tab.status = e.into(),
+                        None => {}
                     }
                 }
                 cx.notify();
