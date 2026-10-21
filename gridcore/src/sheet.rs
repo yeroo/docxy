@@ -92,6 +92,20 @@ pub fn parse_range_name(s: &str) -> Option<(u32, u32, u32, u32)> {
 
 /// A computed / stored cell value. For formula cells this is the *cached*
 /// result (what Excel last computed, or what our engine recomputed).
+/// A range hyperlink of the loaded file ([`Sheet::hyperlink_refs`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkRef {
+    /// The element's `ref` as the loaded file has it (r1, c1, r2, c2).
+    pub loaded: (u32, u32, u32, u32),
+    /// Where the range is now, after row and column edits.
+    pub now: (u32, u32, u32, u32),
+}
+
+/// A range link over more cells than this applies only to its anchor in
+/// [`Sheet::hyperlinks`] (a whole-column link would otherwise spread over a
+/// million cells).
+pub const HYPERLINK_SPREAD_LIMIT: u64 = 4096;
+
 #[derive(Clone, Debug, PartialEq, Default)]
 pub enum CellValue {
     #[default]
@@ -574,12 +588,17 @@ pub struct Sheet {
     /// or an in-workbook location as `#Sheet!A1`. Rendered underlined; a click
     /// opens the URL (external) or jumps (internal).
     pub hyperlinks: std::collections::BTreeMap<(u32, u32), String>,
-    /// The `ref` each loaded `<hyperlink>` covers, keyed by its top-left
-    /// cell: a link over a range spreads over its cells in `hyperlinks`, and
-    /// removing it from one cell removes it from all of them (#671).
-    pub hyperlink_refs: std::collections::BTreeMap<(u32, u32), (u32, u32, u32, u32)>,
-    /// The `ref`s of loaded `<hyperlink>` elements whose link was removed: the
-    /// worksheet part still holds them, so a save strikes them.
+    /// The loaded `<hyperlink>` elements that cover a range, keyed by the
+    /// range's current top-left cell: a link over a range spreads over its
+    /// cells in `hyperlinks`, and removing it from one cell removes it from
+    /// all of them (#671). A row or column edit moves the range with its
+    /// cells ([`LinkRef::now`]) while [`LinkRef::loaded`] stays the `ref` the
+    /// file holds, so the save can rewrite that element in place; an edit
+    /// that cuts a range that is spread cell by cell forgets it.
+    pub hyperlink_refs: std::collections::BTreeMap<(u32, u32), LinkRef>,
+    /// The `ref`s, as the loaded file has them, of `<hyperlink>` elements
+    /// whose link was removed: the worksheet part still holds them, so a
+    /// save strikes them. Never shifted by an edit.
     pub hyperlinks_removed: Vec<(u32, u32, u32, u32)>,
     /// Error Checking's Ignore Error: the rules hidden over ranges of this
     /// sheet (`<ignoredErrors>`).

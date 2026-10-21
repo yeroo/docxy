@@ -13,7 +13,13 @@ fn book(links: &[(u32, u32)], refs: &[Area]) -> Workbook {
             .insert(rc, format!("https://e.example/{}/{}", rc.0, rc.1));
     }
     for &rect in refs {
-        s.hyperlink_refs.insert((rect.0, rect.1), rect);
+        s.hyperlink_refs.insert(
+            (rect.0, rect.1),
+            crate::sheet::LinkRef {
+                loaded: rect,
+                now: rect,
+            },
+        );
     }
     let mut wb = Workbook::default();
     wb.sheets.push(s);
@@ -74,17 +80,12 @@ fn an_unchanged_range_link_is_translated() {
     let mut wb = book(&[(0, 0), (1, 0), (2, 0)], &[(0, 0, 2, 0)]);
     insert_rows(&mut wb, 0, 0, 2);
     assert_eq!(keys(&wb), vec![(2, 0), (3, 0), (4, 0)]);
-    assert_eq!(
-        wb.sheets[0].hyperlink_refs.get(&(2, 0)),
-        Some(&(2, 0, 4, 0))
-    );
+    let l = wb.sheets[0].hyperlink_refs[&(2, 0)];
+    assert_eq!((l.loaded, l.now), ((0, 0, 2, 0), (2, 0, 4, 0)));
     assert_eq!(wb.sheets[0].hyperlink_refs.len(), 1);
     let mut wb = book(&[(0, 1), (0, 2)], &[(0, 1, 0, 2)]);
     delete_cols(&mut wb, 0, 0, 1);
-    assert_eq!(
-        wb.sheets[0].hyperlink_refs.get(&(0, 0)),
-        Some(&(0, 0, 0, 1))
-    );
+    assert_eq!(wb.sheets[0].hyperlink_refs[&(0, 0)].now, (0, 0, 0, 1));
 }
 
 #[test]
@@ -107,13 +108,25 @@ fn a_stretched_or_cut_range_link_is_forgotten_but_its_cells_stay() {
 }
 
 #[test]
-fn a_range_link_too_big_to_spread_is_forgotten_by_an_insert_inside() {
+fn a_range_link_too_big_to_spread_stretches_and_re_anchors() {
     // Only the anchor is in `hyperlinks`, as the loader spreads no more than
     // its limit.
-    let mut wb = book(&[(0, 0)], &[(0, 0, 9999, 0)]);
+    let big = (0, 0, 9999, 3);
+    let mut wb = book(&[(0, 0)], &[big]);
     insert_rows(&mut wb, 0, 5, 1);
+    assert_eq!(wb.sheets[0].hyperlink_refs[&(0, 0)].now, (0, 0, 10000, 3));
+    assert_eq!(wb.sheets[0].hyperlink_refs[&(0, 0)].loaded, big);
+    insert_rows(&mut wb, 0, 0, 1);
+    assert_eq!(wb.sheets[0].hyperlink_refs[&(1, 0)].now, (1, 0, 10001, 3));
+    assert_eq!(keys(&wb), vec![(1, 0)]);
+    // The anchor's row deleted: the link stays on what is left.
+    delete_rows(&mut wb, 0, 1, 1);
+    assert_eq!(wb.sheets[0].hyperlink_refs[&(1, 0)].now, (1, 0, 10000, 3));
+    assert_eq!(keys(&wb), vec![(1, 0)]);
+    // Deleted whole: gone.
+    delete_rows(&mut wb, 0, 0, 20000);
     assert!(wb.sheets[0].hyperlink_refs.is_empty());
-    assert_eq!(keys(&wb), vec![(0, 0)]);
+    assert!(wb.sheets[0].hyperlinks.is_empty());
 }
 
 #[test]

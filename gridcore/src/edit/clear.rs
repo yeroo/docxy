@@ -138,7 +138,7 @@ pub fn clear_plan(
         // link is found by its own key), built once: no per-link scan of
         // every link (#707 r6 M2).
         let mut spread: std::collections::HashMap<(u32, u32), Area> = Default::default();
-        for &rect in sheet.hyperlink_refs.values() {
+        for rect in sheet.hyperlink_refs.values().map(|l| l.now) {
             if (rect.0, rect.1) == (rect.2, rect.3) {
                 continue;
             }
@@ -154,8 +154,8 @@ pub fn clear_plan(
             // The loaded link this cell belongs to goes whole.
             if let Some(&rect) = spread.get(&(r, c)) {
                 refs.insert(rect);
-            } else if let Some(&rect) = sheet.hyperlink_refs.get(&(r, c)) {
-                refs.insert(rect);
+            } else if let Some(l) = sheet.hyperlink_refs.get(&(r, c)) {
+                refs.insert(l.now);
             }
         }
         for &rect in &refs {
@@ -235,9 +235,14 @@ pub fn apply_clear_sheet(sheet: &mut Sheet, plan: &ClearPlan) {
     let mut removed: std::collections::HashSet<Area> =
         sheet.hyperlinks_removed.iter().copied().collect();
     for &rect in &plan.unlinked_refs {
-        sheet.hyperlink_refs.remove(&(rect.0, rect.1));
-        if removed.insert(rect) {
-            sheet.hyperlinks_removed.push(rect);
+        // The worksheet part names the element by its loaded `ref`, which an
+        // edit since the load may have moved the range away from.
+        let loaded = sheet
+            .hyperlink_refs
+            .remove(&(rect.0, rect.1))
+            .map_or(rect, |l| l.loaded);
+        if removed.insert(loaded) {
+            sheet.hyperlinks_removed.push(loaded);
         }
     }
 }

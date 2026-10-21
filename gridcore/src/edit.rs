@@ -2269,13 +2269,61 @@ fn shift_grid(sheet: &mut Sheet, shift: &EditShift) {
 }
 
 /// Cell hyperlinks follow their cells (#1455): a link on a deleted or
-/// pushed-off cell goes. A loaded range link ([`Sheet::hyperlink_refs`])
-/// moves with its rectangle when the edit leaves it the same size; one the
-/// edit stretches, shrinks or removes is forgotten, and its cells carry on as
-/// the single-cell links they already are in `hyperlinks`.
-/// `hyperlinks_removed` names elements of the loaded file, so it stays.
+/// pushed-off cell goes. A loaded range link ([`Sheet::hyperlink_refs`]) moves
+/// with its rectangle when the edit leaves it the same size; a range spread
+/// cell by cell that the edit stretches, shrinks or removes is forgotten, and
+/// its cells carry on as the single-cell links they already are in
+/// `hyperlinks`. A range too big to spread is held by its anchor alone, so it
+/// stretches and re-anchors with the edit instead. `hyperlinks_removed` names
+/// elements of the loaded file, so it stays.
 fn shift_hyperlinks(sheet: &mut Sheet, shift: &EditShift) {
     let axis = |r: u32, c: u32| if shift.rows { r } else { c };
+    let with_axis = |rect: Area, lo: u32, hi: u32| {
+        if shift.rows {
+            (lo, rect.1, hi, rect.3)
+        } else {
+            (rect.0, lo, rect.2, hi)
+        }
+    };
+    let cells = |r: Area| (r.2 - r.0 + 1) as u64 * (r.3 - r.1 + 1) as u64;
+    let big = |r: Area| cells(r) > crate::sheet::HYPERLINK_SPREAD_LIMIT;
+
+    let refs = std::mem::take(&mut sheet.hyperlink_refs);
+    let mut kept = BTreeMap::new();
+    // A big range's anchor may be the deleted cell: its link lands on the new
+    // anchor below.
+    let mut reanchored: Vec<(Area, String)> = Vec::new();
+    for l in refs.into_values() {
+        let now = l.now;
+        let (a, b) = (axis(now.0, now.1), axis(now.2, now.3));
+        let moved = if big(now) {
+            // Pushed off by an insert, or deleted whole: gone.
+            let Some((lo, hi)) =
+                span(a, b, shift).filter(|_| point(a, shift).is_some() || shift.delta < 0)
+            else {
+                continue;
+            };
+            let rect = with_axis(now, lo, hi);
+            if let Some(target) = sheet.hyperlinks.get(&(now.0, now.1)) {
+                reanchored.push((rect, target.clone()));
+            }
+            rect
+        } else {
+            let (Some(lo), Some(hi)) = (point(a, shift), point(b, shift)) else {
+                continue;
+            };
+            if hi - lo != b - a {
+                continue;
+            }
+            with_axis(now, lo, hi)
+        };
+        kept.insert(
+            (moved.0, moved.1),
+            crate::sheet::LinkRef { now: moved, ..l },
+        );
+    }
+    sheet.hyperlink_refs = kept;
+
     let links = std::mem::take(&mut sheet.hyperlinks);
     sheet.hyperlinks = links
         .into_iter()
@@ -2284,22 +2332,20 @@ fn shift_hyperlinks(sheet: &mut Sheet, shift: &EditShift) {
             Some((if shift.rows { (moved, c) } else { (r, moved) }, target))
         })
         .collect();
-    let refs = std::mem::take(&mut sheet.hyperlink_refs);
-    sheet.hyperlink_refs = refs
-        .into_values()
-        .filter_map(|(r1, c1, r2, c2)| {
-            let (lo, hi) = (point(axis(r1, c1), shift)?, point(axis(r2, c2), shift)?);
-            if hi - lo != axis(r2, c2) - axis(r1, c1) {
-                return None;
-            }
-            let rect = if shift.rows {
-                (lo, c1, hi, c2)
-            } else {
-                (r1, lo, r2, hi)
-            };
-            Some(((rect.0, rect.1), rect))
-        })
-        .collect();
+    for (rect, target) in reanchored {
+        // A range that shrank to what spreads gets all its cells, as a load
+        // would give it.
+        let spread = if big(rect) {
+            vec![(rect.0, rect.1)]
+        } else {
+            (rect.0..=rect.2)
+                .flat_map(|r| (rect.1..=rect.3).map(move |c| (r, c)))
+                .collect()
+        };
+        for rc in spread {
+            sheet.hyperlinks.entry(rc).or_insert_with(|| target.clone());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

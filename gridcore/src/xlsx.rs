@@ -2783,7 +2783,13 @@ fn parse_worksheet_with(
                         p.attr("location"),
                         hlink_targets,
                     ) {
-                        sheet.hyperlink_refs.insert((rect.0, rect.1), rect);
+                        sheet.hyperlink_refs.insert(
+                            (rect.0, rect.1),
+                            crate::sheet::LinkRef {
+                                loaded: rect,
+                                now: rect,
+                            },
+                        );
                         // A whole-column hyperlink applies only to its anchor.
                         for cell in hyperlinks::link_cells(rect) {
                             sheet.hyperlinks.insert(cell, t.clone());

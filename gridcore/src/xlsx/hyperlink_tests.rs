@@ -520,3 +520,99 @@ fn a_removed_link_stays_removed_after_a_structural_edit() {
     });
     assert_eq!(got, vec![at("B4")]);
 }
+
+/// The saved worksheet's `<hyperlinks>` block after `edit` on a sheet loaded
+/// with `links`.
+fn block_after(links: &str, edit: impl FnOnce(&mut Workbook)) -> String {
+    let ws = format!(
+        "<worksheet xmlns=\"{SML}\" xmlns:r=\"{RNS}\"><sheetData></sheetData><hyperlinks>{links}</hyperlinks></worksheet>"
+    );
+    let rels = rels_part(&format!(
+        "<Relationship Id=\"rId1\" Type=\"{RNS}/hyperlink\" Target=\"https://one.example\" TargetMode=\"External\"/>"
+    ));
+    let mut pkg = book(&ws, Some(&rels));
+    edit(&mut pkg.workbook);
+    let xml = text(&resaved(&pkg), SHEET);
+    let start = xml.find("<hyperlinks>").expect("block kept");
+    let end = xml.find("</hyperlinks>").expect("block closed");
+    xml[start + "<hyperlinks>".len()..end].to_string()
+}
+
+#[test]
+fn a_big_range_link_moves_in_place_with_an_insert_above() {
+    let got = block_after("<hyperlink ref=\"A1:D2000\" r:id=\"rId1\"/>", |wb| {
+        crate::edit::insert_rows(wb, 0, 0, 1)
+    });
+    assert_eq!(got, "<hyperlink ref=\"A2:D2001\" r:id=\"rId1\"/>");
+}
+
+#[test]
+fn a_big_range_link_stretches_over_an_insert_inside() {
+    let got = block_after("<hyperlink ref=\"A1:A5000\" r:id=\"rId1\"/>", |wb| {
+        crate::edit::insert_rows(wb, 0, 100, 2)
+    });
+    assert_eq!(got, "<hyperlink ref=\"A1:A5002\" r:id=\"rId1\"/>");
+}
+
+#[test]
+fn a_big_range_link_survives_the_delete_of_its_anchor_row() {
+    let got = block_after("<hyperlink ref=\"A1:A5000\" r:id=\"rId1\"/>", |wb| {
+        crate::edit::delete_rows(wb, 0, 0, 1)
+    });
+    assert_eq!(got, "<hyperlink ref=\"A1:A4999\" r:id=\"rId1\"/>");
+}
+
+#[test]
+fn a_moved_link_keeps_its_display_tooltip_and_id() {
+    let got = block_after(
+        "<hyperlink ref=\"A1\" r:id=\"rId1\" display=\"Example\" tooltip=\"Go\"/>",
+        |wb| crate::edit::insert_rows(wb, 0, 0, 1),
+    );
+    assert_eq!(
+        got,
+        "<hyperlink ref=\"A2\" r:id=\"rId1\" display=\"Example\" tooltip=\"Go\"/>"
+    );
+    let got = block_after(
+        "<hyperlink ref=\"B2:C3\" location=\"Sheet1!A1\" display=\"Here\"/>",
+        |wb| crate::edit::delete_cols(wb, 0, 0, 1),
+    );
+    assert_eq!(
+        got,
+        "<hyperlink ref=\"A2:B3\" location=\"Sheet1!A1\" display=\"Here\"/>"
+    );
+}
+
+#[test]
+fn a_moved_link_that_was_retargeted_is_written_afresh() {
+    let got = block_after(
+        "<hyperlink ref=\"A1\" r:id=\"rId1\" display=\"Example\"/>",
+        |wb| {
+            crate::edit::insert_rows(wb, 0, 0, 1);
+            wb.sheets[0]
+                .hyperlinks
+                .insert((1, 0), "https://two.example".into());
+        },
+    );
+    assert!(!got.contains("display"), "{got}");
+    assert!(got.contains("ref=\"A2\""), "{got}");
+}
+
+#[test]
+fn removing_a_moved_link_strikes_its_own_element_only() {
+    // Element B at A4:B4 is unreadable (no target): never touched.
+    let links = "<hyperlink ref=\"A3:B3\" r:id=\"rId1\"/><hyperlink ref=\"A4:B4\"/>";
+    let got = block_after(links, |wb| {
+        crate::edit::insert_rows(wb, 0, 0, 1);
+        let s = &mut wb.sheets[0];
+        let plan = crate::edit::clear_plan(
+            s,
+            &[(3, 0, 3, 0)],
+            crate::edit::ClearWhat::RemoveHyperlinks,
+            &[],
+        )
+        .unwrap();
+        crate::edit::apply_clear_sheet(s, &plan);
+        assert_eq!(s.hyperlinks_removed, vec![(2, 0, 2, 1)]);
+    });
+    assert_eq!(got, "<hyperlink ref=\"A4:B4\"/>");
+}
