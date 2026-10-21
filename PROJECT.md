@@ -59,8 +59,9 @@ It keeps the stored dates where they are not docxy's to compute (manual tasks,
 blank rows, external placeholders, tasks the schedule skips, auto summaries with
 nothing scheduled below them), and for every task of a plan with an input
 Project schedules by and docxy's schedule ignores, whose effect reaches every
-task downstream: `ScheduleFromStart` 0, a non-zero task or assignment
-`LevelingDelay`, an elapsed task `DurationFormat`, or a
+task downstream: `ScheduleFromStart` 0, a non-zero assignment
+`LevelingDelay` (a task's is part of docxy's schedule since #1594), an
+elapsed task `DurationFormat`, or a
 work resource whose calendar has other working time than its task's (a
 resource calendar that states nothing of its own and derives from the task's
 calendar, as Project makes one per resource, does not count). Known limits no
@@ -266,14 +267,67 @@ finish; a stored `LevelingDelay`, Project's last leveling, is not added. A
 resource that is free and available somewhere takes a task above its capacity
 there, and one with no capacity anywhere later is left overallocated: the task
 goes where every other resource fits, or keeps its earliest start when it has
-no other. An active predecessor's leveling delay propagates to active
-successors, preserving their link gaps. Inactive tasks book no capacity and
+no other. An active predecessor's leveling delay propagates to the active
+successors the leveler may move, preserving their link gaps, except where a
+successor's own honored constraint (a Must Start/Finish On date, a No Later
+Than cap) holds it earlier, which breaks the link as the forward pass does; a
+held successor (priority 1000, ALAP, outside the scope) keeps its CPM dates
+in this overlay and follows only once the delays are committed and the
+forward pass moves it. Inactive tasks book no capacity and
 keep their CPM dates, even when an active predecessor is delayed by leveling.
 v1 is single-calendar and delay-only,
 and treats a task's occupation as its wall-clock span; multi-calendar leveling
 and task splitting are future work. Leveling never moves a manual
 task: its bookings are placed first, and auto tasks level around them.
 `yppxy` toggles the overlay with `L` (View ▸ Level).
+
+Leveling is also a plan edit (#1594, `projcore::leveling`, `Editor::level_tasks`):
+Level Selection (a summary stands for its subtasks) and Level Resource run
+the leveler over a scope (`schedule::level_with`: the tasks outside it take
+no delay of their own and are booked at the dates the plan gives them now,
+an automatic one over each assignment's own window; a task of priority 1000
+is never leveled) and write
+each leveled task's own `LevelingDelay` (elapsed minutes from the start its
+links, constraints and leveled predecessors drive it to, so a task that only
+follows a delayed predecessor records none, as Project does; in tenths of a
+minute with `LevelingDelayFormat` 8, as Project 2024 stores it) and
+`PreLeveledStart`/`Finish` (its unleveled dates), one undo step; only the
+delays the leveler asks for are written, so a task a constraint or another
+predecessor already holds takes none, as Project leaves it. An automatic
+task outside the scope still follows its links once the delays are written,
+so the pass repeats on the plan with its delays written while a round still
+changes the overallocation (a smaller overbooked extent, or conflicts not
+seen before) and drops a round that leaves the same conflicts; a conflict
+that remains is reported as
+overallocated, and a later pass resolves it only with the follower in its
+scope or with `clear_first` off (the default rebuilds the same cleared
+plan); an ALAP task is neither delayed nor
+booked (Project 2024 refuses a delay on one, and its late dates float with
+the finish, so an overallocation it causes stays); a delayed task's
+predecessors have the zero slack
+Project shows them. Level All stays the display overlay (no `level.all` edit
+yet). The scheduler honours a
+stored `LevelingDelay` (the task starts that much elapsed time after its
+links and constraints allow, snapped to working time; measured against
+Project 2024 over COM: a delay typed by hand moves Start, and Level All's
+delay is the elapsed gap), so the leveled dates are the plan's dates, a
+save writes them, and `schedule_reproduces` no longer treats a task delay
+as an input the schedule ignores. Clear Leveling removes the delays, one
+undo step. Leveling Options (`LevelOptions`) are plan options
+(`LevelingOrder`, `LevelWithinSlack`, `LevelAdjustAssignments`,
+`LevelCanSplit`, `LevelClearBeforeLeveling`, a default stored as nothing):
+the order is `Standard` (the topological order above), `ID` (the lowest ID
+first among the ready tasks) or `Priority` (the highest priority first);
+within slack never delays a task past its CPM late start (the slack a
+leveled predecessor used counts) nor moves the project finish or turns a
+task's total slack negative (a task whose delay would do either, through a
+summary's percentage lag, stays put, overallocated);
+clear-first (the default) drops the
+scope's stored delays before the pass, a priority-1000 task's too (measured
+on Project 2024: it then holds at its unleveled start), else the pass builds
+on them. Adjusting assignments and splitting are kept as settings
+only. The display overlay stays for the display-only mode; `level.*`
+control verbs drive both (docs/agent-control.md).
 
 ## Formats
 

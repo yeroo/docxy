@@ -40,6 +40,7 @@ pub mod formats;
 pub mod formatting;
 pub mod gantt;
 pub mod json;
+pub mod leveling;
 pub mod model;
 pub mod mspdi;
 pub mod plugin_abi;

@@ -3395,7 +3395,9 @@ mod tests {
         let (above, blank) = (app.list_y0 + 1, app.list_y0 + 2);
         assert_eq!(
             row(above, 1..45).split_whitespace().collect::<Vec<_>>(),
-            // Excavate is saved `Estimated` (#159).
+            // Excavate is saved `Estimated` (#159); Pour's stored leveling
+            // delay is no slack of Excavate's (#1594 r2, as Project 2024
+            // reports it), so it stays critical.
             ["•", "Excavate", "2d?", "0d"]
         );
         assert_eq!(row(blank, 1..45).trim(), "");
@@ -3430,6 +3432,8 @@ mod tests {
                 .unwrap();
         let sched = projcore::schedule::schedule(&proj);
         let lines = project_preview(&proj, &sched, None);
+        // Pour's stored leveling delay keeps Excavate critical: a delayed
+        // task's predecessor has no slack (#1594 r2, measured on Project 2024).
         assert!(
             lines.contains(&"Tasks:   3 (2 critical)".to_string()),
             "{lines:?}"

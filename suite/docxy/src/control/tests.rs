@@ -319,6 +319,8 @@ fn reads_and_rejected_edits_preserve_prompt_selection_history_and_scroll() {
         ("resource.list", Json::Null),
         ("resource.get", args(r#"{"uid":1}"#)),
         ("level.overallocations", Json::Null),
+        ("level.options", args("{}")),
+        ("level.options", args(r#"{"tab":0}"#)),
         ("cal.list", Json::Null),
         ("cal.get", args(r#"{"calendar":"Standard"}"#)),
         (
@@ -377,7 +379,7 @@ fn reads_and_rejected_edits_preserve_prompt_selection_history_and_scroll() {
 
 /// Level All and Clear Leveling switch the target tab's overlay (#1589): a
 /// repaint and agent activity, no undo step, the plan clean, the other tab
-/// untouched; the rest of Project's Level group is refused by name.
+/// untouched; `level.options {}` reads the plan's Leveling Options (#1594).
 #[test]
 fn level_verbs_switch_the_overlay_of_their_target_tab_only() {
     let mut tabs = vec![tab(), tab()];
@@ -396,8 +398,10 @@ fn level_verbs_switch_the_overlay_of_their_target_tab_only() {
     assert!(!view(&tabs[1]).ed.leveled());
     let (info, _) = call(&mut tabs, 0, "proj.path", args(r#"{"tab":1}"#)).unwrap();
     assert_eq!(info.get("leveled"), Some(&Json::Bool(false)));
-    let err = call(&mut tabs, 0, "level.options", args(r#"{"tab":1}"#)).unwrap_err();
-    assert!(err.contains("whole plan"), "{err}");
+    let (options, effect) = call(&mut tabs, 0, "level.options", args(r#"{"tab":1}"#)).unwrap();
+    assert_eq!(options.get("order"), Some(&Json::Str("Standard".into())));
+    assert_eq!(view(&tabs[1]).ed.undo_depth(), depth, "a read is no step");
+    assert_eq!(effect, Effect::default(), "a read is no edit (#1594 r6)");
 }
 
 #[test]

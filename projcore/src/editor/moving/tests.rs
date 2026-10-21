@@ -119,6 +119,66 @@ fn move_ignores_leveling_delay() {
     );
 }
 
+/// #1594 r9: a saved leveling delay is not added twice. Levelled as a plan
+/// edit, the second task carries a one-day delay and starts Tuesday; Move
+/// forward one day counts from its unleveled Monday, so the constraint is
+/// Tuesday's (as with the overlay) and the task shows on Wednesday, the
+/// constraint plus its kept delay.
+#[test]
+fn move_counts_from_the_start_before_a_saved_leveling_delay() {
+    let mut ed = editor();
+    ed.assign_resource(10, "Crew").unwrap();
+    ed.assign_resource(20, "Crew").unwrap();
+    ed.level_tasks(&crate::leveling::LevelTarget::All).unwrap();
+    assert_eq!(
+        ed.schedule().get(20).unwrap().early_start,
+        at(1, 8),
+        "delayed a day"
+    );
+    assert_eq!(ed.move_task(20, "1d"), Ok(at(2, 8)));
+    let t = ed.project().task(20).unwrap();
+    assert_eq!(t.constraint, ConstraintType::StartNoEarlierThan);
+    assert_eq!(
+        t.constraint_date,
+        Some(at(1, 8)),
+        "from the unleveled Monday"
+    );
+    assert_eq!(
+        ed.schedule().get(20).unwrap().early_start,
+        at(2, 8),
+        "the constraint plus the kept delay"
+    );
+}
+
+/// #1594 r10: the same for an inactive task, whose dates come from the
+/// dormant pass: the start before its saved delay is merged with them.
+#[test]
+fn move_counts_from_the_start_before_a_saved_delay_on_an_inactive_task() {
+    let mut ed = editor();
+    ed.assign_resource(10, "Crew").unwrap();
+    ed.assign_resource(20, "Crew").unwrap();
+    ed.level_tasks(&crate::leveling::LevelTarget::All).unwrap();
+    ed.set_active(20, false).unwrap();
+    assert_eq!(
+        ed.schedule().get(20).unwrap().early_start,
+        at(1, 8),
+        "still delayed a day"
+    );
+    assert_eq!(ed.move_task(20, "1d"), Ok(at(2, 8)));
+    let t = ed.project().task(20).unwrap();
+    assert_eq!(t.constraint, ConstraintType::StartNoEarlierThan);
+    assert_eq!(
+        t.constraint_date,
+        Some(at(1, 8)),
+        "from the unleveled Monday"
+    );
+    assert_eq!(
+        ed.schedule().get(20).unwrap().early_start,
+        at(2, 8),
+        "the constraint plus the kept delay"
+    );
+}
+
 #[test]
 fn move_shifts_a_manual_tasks_pinned_start_keeping_time_and_duration() {
     let mut ed = editor();

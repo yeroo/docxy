@@ -265,7 +265,7 @@ pub(crate) fn project_verb(
                 let result = projctl::dispatch_editor(&mut v.ed, verb, args)
                     .expect("recognized editor verb")?;
                 let mut effect = Effect::default();
-                if projctl::MUTATING.contains(&verb) {
+                if projctl::mutates(verb, args) {
                     tab.dirty = v.ed.dirty();
                     crate::bump_edit_generation();
                     v.cancel_prompt();
@@ -583,7 +583,7 @@ impl Docxy {
         }
         // A control client reads and saves the plan: never half-leveled.
         self.flush_project_passes(cx);
-        if let Err(e) = crate::close::close_prompt_refusal(&self.tabs, verb) {
+        if let Err(e) = crate::close::close_prompt_refusal(&self.tabs, verb, args) {
             return Some(Err(e));
         }
         // A plan opened or saved under a new name here is a recent file

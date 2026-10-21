@@ -521,6 +521,101 @@
   `uiharness/cases/project-plugin-ui.uit` drives
   the fixture through all of it; nothing changes without a UI plugin.
 
+## Project leveling as a plan edit (#1594)
+
+- `projcore::schedule::level_with(proj, &LevelScope {movable, order,
+  within_slack})` levels a scope: tasks outside it, and priority 1000, are
+  never delayed and are booked at the dates the plan gives them now (a held
+  automatic task over each assignment's own window, a manual or tracked one
+  its whole span; an automatic follower of a moved task still follows its
+  links once the delays are written, so the pass repeats on the plan with
+  its delays written while a round still changes the overallocation
+  (`schedule::overallocation`: a smaller overbooked extent on the committed
+  schedule, or conflicts not seen before, as when one is traded for another,
+  heavier or not; every overbooked stretch's tasks make the signature, dates
+  left out), drops a round that leaves the same conflicts (a follower moving
+  in lockstep with its predecessor would ask for more delay for ever; one
+  that would carry the pair into a later stretch of more capacity is dropped
+  the same way, a known limit: select the follower too), ends
+  on the lightest plan it reached (within slack a task whose own delay would
+  move the project finish or turn a task's total slack negative, a written
+  delay stretching a summary's span and a percentage lag on the summary's
+  link with it, is held at its earliest start and the round rerun without
+  it; a break no task explains alone or by its restoration drops the round),
+  and reports a conflict that remains as
+  overallocated: a later pass resolves it only with the
+  follower in its scope or with `clear_first` off, the default rebuilding the
+  same cleared plan); an ALAP task is neither delayed nor
+  booked (Project 2024 refuses a delay on one, measured, so the schedule
+  ignores a stored one, and its late dates float with the finish);
+  `within_slack` leaves a task that would start past its CPM late start at
+  its earliest start, overallocated. `Leveled::delay_min`
+  is each leaf's own delay in elapsed minutes, from the start its leveled
+  predecessors drive it to, so a task that only follows a delayed
+  predecessor records none (Project 2024 over COM: the FS successor of a
+  leveled task keeps LevelingDelay 0). The CPM forward pass adds a stored
+  task `LevelingDelay` (tenths of a minute, elapsed) to the snapped driven
+  start and snaps again; the backward pass bounds a delayed task's
+  predecessors by its late start less the delay, the late finish following
+  through the task's working span (`late_bounds_before_delay`, on direct and
+  summary links alike), so they report the zero slack Project 2024 shows
+  them (measured; a delayed milestone's bound is its predecessor's finish
+  instant). The leveler places a task from where its links drive it after
+  its predecessors' moves, each link's demand rebuilt per predecessor: a
+  working-lag link's is its CPM demand shifted by that predecessor's own
+  placement delay in the default calendar's index (the leveler's booking
+  space), an elapsed lag's counts from the predecessor's leveled instant, a
+  summary's never pulls before its CPM demand; the latest wins (demands on
+  one index by instant), snapped on the task's own calendar, and a
+  same-calendar FS milestone keeps its predecessor's finish instant. That
+  demand goes through the task's own constraint as the forward pass applies
+  it: an honored Must Start/Finish On keeps its date, an honored Start/Finish
+  No Later Than takes the earlier of demand and cap (a binding cap holds a
+  milestone at the constraint's own instant), every other constraint is a
+  floor the demand may pass, two instants on one working index compared as
+  instants (a summary predecessor's demand included); so
+  a Start No Earlier Than, a cap, or another predecessor that still drives
+  later absorbs the move and the task takes no delay
+  (`Schedule::delay_driven` holds the start a stored delay was added to). A
+  kept delay is rebuilt from that driven start plus the delay, snapped on
+  the task's own calendar, and its own increment is measured from the
+  unsnapped delayed instant, so the forward pass's one snap of driven + kept
+  + own lands on the placement. A milestone's reported start is that snap
+  when a kept delay put it there, else the demand the placement took (an FS
+  evening, a held cap instant, a snapped start-type demand), as the forward
+  pass starts it. A task on another calendar whose predecessor
+  moved is estimated at the default calendar's next working minute (its
+  committed dates are the forward pass's), so its own delay there may need a
+  further pass. `Schedule::start_before_delay` is what Move Task counts
+  from, an inactive task's included, so a saved delay is not added twice. A
+  delayed milestone's late bound keeps its predecessor's finish instant on an
+  FS link only; on a start-type link the inverse walks the forward pass's
+  snap back, a fixed successor's cap on its ALAP predecessors counts the
+  intervening tasks' stored delays but never a summary successor's (the
+  forward pass applies no summary's), and an unlinked task's pre-start
+  window reaches its early start as the forward pass bounded it. A
+  summary link's free-slack bound takes each successor's delay before the
+  group's minimum; the timeline's horizon budgets stored delays; equal
+  priorities level in readiness order.
+- `Editor::level_tasks(&LevelTarget::{All, Selection, Resource})`
+  (`level_tasks_with` takes `LevelOptions` for one pass) writes
+  `leveling_delay` (format 8) and `pre_leveled_start/finish` (from the plan
+  without the scope's delays, whatever `clear_first` says, so a repeated
+  pass records no step) as one undo step: only the delays the leveler asks
+  for, so a task a constraint or another predecessor already holds takes
+  none (as Project leaves it), and the reply (`delayed`, `overallocated`,
+  the tasks' starts) reports the committed schedule, not the display
+  overlay. `projctl::mutates(verb, args)` is the hosts' edit test: a bare
+  `level.options {}` is a read. With
+  `clear_first` a priority-1000 task's stored delay is cleared too and the
+  task holds at its unleveled start (measured). `clear_leveling(uids | all)`
+  is one step. `LevelOptions` are the plan options `LevelingOrder`,
+  `LevelWithinSlack`, `LevelAdjustAssignments`, `LevelCanSplit`,
+  `LevelClearBeforeLeveling`. Level All stays the display overlay in both
+  hosts; the edits are `projctl`'s `level.selection {uids, options?}`,
+  `level.resource {resource, options?}`, `level.options` and `level.clear
+  {uids | all}`; `LevelOutcome::targeted` lists the leaves a reply reports.
+
 ## Ribbon fit per ribbon (#1020, #1608)
 
 - `ribbon_fit::fit_with(specs, width, policy)`: `Policy::LabelsFirst` (the

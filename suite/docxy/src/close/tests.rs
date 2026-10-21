@@ -2885,7 +2885,11 @@ fn project_verbs_that_would_drop_a_close_prompt_are_refused() {
         projctl::MUTATING[0],
         "proj.path",
     ] {
-        assert_eq!(close_prompt_refusal(&tabs, verb), Ok(()), "{verb}");
+        assert_eq!(
+            close_prompt_refusal(&tabs, verb, &Json::Null),
+            Ok(()),
+            "{verb}"
+        );
     }
     let p = close_prompt(&tabs[1], true, &known());
     tabs[1].dialogs.push(p);
@@ -2896,13 +2900,29 @@ fn project_verbs_that_would_drop_a_close_prompt_are_refused() {
         projctl::MUTATING[0],
     ] {
         assert_eq!(
-            close_prompt_refusal(&tabs, verb),
+            close_prompt_refusal(&tabs, verb, &Json::Null),
             Err("a dialog is open: docxy".into()),
             "{verb}"
         );
     }
-    // Reads still answer.
-    assert_eq!(close_prompt_refusal(&tabs, "proj.path"), Ok(()));
+    // Reads still answer: a bare `level.options` is one (#1594 r6), one
+    // naming a setting is not.
+    assert_eq!(
+        close_prompt_refusal(&tabs, "proj.path", &Json::Null),
+        Ok(())
+    );
+    assert_eq!(
+        close_prompt_refusal(&tabs, "level.options", &Json::obj(vec![])),
+        Ok(())
+    );
+    assert_eq!(
+        close_prompt_refusal(
+            &tabs,
+            "level.options",
+            &Json::obj(vec![("within_slack", Json::Bool(true))])
+        ),
+        Err("a dialog is open: docxy".into())
+    );
 }
 
 #[test]
